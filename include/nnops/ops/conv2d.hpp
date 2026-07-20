@@ -43,6 +43,11 @@ struct Conv2DAttributes {
 
     /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
+
+    /// If true, add result to existing output buffer instead of overwriting.
+    /// Enables residual connections without a separate add kernel:
+    ///   output += Conv(input)  rather than  output = Conv(input)
+    bool add_to = false;
 };
 
 /// Conv2D operator (class-based API).

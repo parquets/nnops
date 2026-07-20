@@ -60,7 +60,8 @@ void rms_norm_ref(const RMSNormAttributes& attrs,
         float inv_rms = 1.0f / rms;
         for (int64_t i = 0; i < norm_size; ++i) {
             float s = scale_is_scalar ? s_ptr[0] : s_ptr[i];
-            y_ptr[row_start + i] = x_ptr[row_start + i] * inv_rms * s;
+            float val = x_ptr[row_start + i] * inv_rms * s;
+            y_ptr[row_start + i] = attrs.add_to ? y_ptr[row_start + i] + val : val;
         }
     };
 

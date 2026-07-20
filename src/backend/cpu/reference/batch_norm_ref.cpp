@@ -66,7 +66,8 @@ void batch_norm_ref(const BatchNormAttributes& attrs,
         const int64_t spatial_total = N * C * sample_size;
         const auto body = [&](int64_t i) {
             int64_t c = (i / sample_size) % C;
-            y_ptr[i] = x_ptr[i] * new_scale[static_cast<size_t>(c)] + new_bias[static_cast<size_t>(c)];
+            float val = x_ptr[i] * new_scale[static_cast<size_t>(c)] + new_bias[static_cast<size_t>(c)];
+            y_ptr[i] = attrs.add_to ? y_ptr[i] + val : val;
         };
 
         if (ctx.cpu_parallel_for) {
@@ -81,7 +82,8 @@ void batch_norm_ref(const BatchNormAttributes& attrs,
             float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
             float ns = inv_std * s_ptr[i];
             float nb = b_ptr[i] - m_ptr[i] * ns;
-            y_ptr[i] = x_ptr[i] * ns + nb;
+            float val = x_ptr[i] * ns + nb;
+            y_ptr[i] = attrs.add_to ? y_ptr[i] + val : val;
         };
 
         if (ctx.cpu_parallel_for) {

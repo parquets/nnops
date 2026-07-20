@@ -22,6 +22,9 @@ struct BatchNormAttributes {
     /// The scale/bias/mean/var have shape [C].
     /// If false, statistics are per-element (spatial=0).
     bool spatial = true;
+
+    /// If true, add result to existing output buffer instead of overwriting.
+    bool add_to = false;
 };
 
 /// BatchNorm operator (class-based API, inference only).

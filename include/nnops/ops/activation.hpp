@@ -30,6 +30,9 @@ struct ActivationAttributes {
     ActivationType type = ActivationType::Relu;
     float alpha = 0.0f;  ///< Slope for LeakyRelu, alpha for Elu
     float beta  = 1.0f;  ///< Parameter for HardSwish
+
+    /// If true, add result to existing output buffer instead of overwriting.
+    bool add_to = false;
 };
 
 /// Activation operator (class-based API).

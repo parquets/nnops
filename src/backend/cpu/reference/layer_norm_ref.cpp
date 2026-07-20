@@ -81,7 +81,8 @@ void layer_norm_ref(const LayerNormAttributes& attrs,
             int64_t s_idx = compute_scale_idx(row_start, i);
             float s = s_ptr[s_idx];
             float b = b_ptr ? b_ptr[s_idx] : 0.0f;
-            y_ptr[row_start + i] = (x_ptr[row_start + i] - mean_val) * inv_std * s + b;
+            float val = (x_ptr[row_start + i] - mean_val) * inv_std * s + b;
+            y_ptr[row_start + i] = attrs.add_to ? y_ptr[row_start + i] + val : val;
         }
     };
 

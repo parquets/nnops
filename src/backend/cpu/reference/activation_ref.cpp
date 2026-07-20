@@ -19,34 +19,23 @@ template <typename F>
 static void element_wise_compute(const TensorView& output,
                                   const TensorView& input,
                                   const ComputeContext& ctx,
-                                  F func)
+                                  F func,
+                                  bool add_to)
 {
     const int64_t N = input.numel();
     const auto* in_ptr  = input.data_as<float>();
     auto* out_ptr = output.data_as<float>();
 
-    const auto body = [&](int64_t i) {
-        out_ptr[i] = func(i);
-    };
-    const auto ranged = [&](int64_t start, int64_t end) {
-        for (int64_t i = start; i < end; ++i) {
-            out_ptr[i] = in_ptr[i];  // dummy to enable lambda capture
-        }
-    };
-
-    // Using the ranged approach with explicit loop body
-    const auto compute_range = [&](int64_t start, int64_t end) {
-        for (int64_t i = start; i < end; ++i) {
-            out_ptr[i] = func(in_ptr[i]);
-        }
+    const auto write = [&](int64_t i, float v) {
+        out_ptr[i] = add_to ? out_ptr[i] + v : v;
     };
 
     if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, N,
-            [&](int64_t idx) { out_ptr[idx] = func(in_ptr[idx]); });
+            [&](int64_t idx) { write(idx, func(in_ptr[idx])); });
     } else {
         for (int64_t i = 0; i < N; ++i) {
-            out_ptr[i] = func(in_ptr[i]);
+            write(i, func(in_ptr[i]));
         }
     }
 }
@@ -58,15 +47,12 @@ void activation_ref(const ActivationAttributes& attrs,
                     void* /*workspace*/)
 {
     const auto& input = inputs[0];
-    const int64_t N = input.numel();
-    const auto* in_ptr  = input.data_as<float>();
-    auto* out_ptr = output.data_as<float>();
 
     // Select the activation function at runtime
     switch (attrs.type) {
     case ActivationType::Relu: {
         const auto fn = [](float x) -> float { return x > 0.0f ? x : 0.0f; };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::LeakyRelu: {
@@ -74,21 +60,21 @@ void activation_ref(const ActivationAttributes& attrs,
         const auto fn = [alpha](float x) -> float {
             return x > 0.0f ? x : alpha * x;
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::Sigmoid: {
         const auto fn = [](float x) -> float {
             return 1.0f / (1.0f + std::exp(-x));
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::Tanh: {
         const auto fn = [](float x) -> float {
             return std::tanh(x);
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::Gelu: {
@@ -98,14 +84,14 @@ void activation_ref(const ActivationAttributes& attrs,
             const float c = 0.7978845608028654f;  // sqrt(2/pi)
             return 0.5f * x * (1.0f + std::tanh(c * (x + 0.044715f * x * x * x)));
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::Silu: {
         const auto fn = [](float x) -> float {
             return x / (1.0f + std::exp(-x));  // x * sigmoid(x)
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::HardSwish: {
@@ -114,7 +100,7 @@ void activation_ref(const ActivationAttributes& attrs,
             float relu6 = std::min(std::max(x + 3.0f, 0.0f), 6.0f);
             return x * relu6 * (beta / 6.0f);
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     case ActivationType::Elu: {
@@ -122,7 +108,7 @@ void activation_ref(const ActivationAttributes& attrs,
         const auto fn = [alpha](float x) -> float {
             return x > 0.0f ? x : alpha * (std::exp(x) - 1.0f);
         };
-        element_wise_compute(output, input, ctx, fn);
+        element_wise_compute(output, input, ctx, fn, attrs.add_to);
         break;
     }
     }

@@ -54,6 +54,9 @@ struct PoolingAttributes {
     };
     AutoPad auto_pad = AutoPad::NOTSET;
 
+    /// If true, add result to existing output buffer instead of overwriting.
+    bool add_to = false;
+
     /// Returns the spatial rank (2 or 3) inferred from the input tensor rank.
     /// For a 4D input (NCHW), returns 2. For a 5D input (NCDHW), returns 3.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {

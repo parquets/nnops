@@ -95,7 +95,8 @@ void conv3d_ref(const Conv3DAttributes& attrs,
                             const int64_t out_idx =
                                 (((n * OC + oc_global) * OD + od)
                                  * OH + oh) * OW + ow;
-                            out_ptr[out_idx] = apply_epilogue(attrs.epilogue, sum, oc_global);
+                            float val = apply_epilogue(attrs.epilogue, sum, oc_global);
+                            out_ptr[out_idx] = attrs.add_to ? out_ptr[out_idx] + val : val;
                         }
                     }
                 }

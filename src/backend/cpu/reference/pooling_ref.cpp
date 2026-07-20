@@ -145,7 +145,7 @@ void pooling_ref(const PoolingAttributes& attrs,
 
                 const int64_t out_idx =
                     nchw_offset(n, c, od, oh, ow, C, OD, OH, OW);
-                out_ptr[out_idx] = result;
+                out_ptr[out_idx] = attrs.add_to ? out_ptr[out_idx] + result : result;
             }}}
         }
     };

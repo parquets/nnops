@@ -89,11 +89,10 @@ void attention_ref(const AttentionAttributes& attrs,
 
     auto write_elem = [&](float* ptr, int64_t b, int64_t h,
                           int64_t s, int64_t d, float val, bool merged) {
-        if (merged) {
-            ptr[(b * Sq + s) * H * D + h * D + d] = val;
-        } else {
-            ptr[((b * H + h) * Sq + s) * D + d] = val;
-        }
+        int64_t idx = merged
+            ? (b * Sq + s) * H * D + h * D + d
+            : ((b * H + h) * Sq + s) * D + d;
+        ptr[idx] = attrs.add_to ? ptr[idx] + val : val;
     };
 
     // Per-head compute lambda

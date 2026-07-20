@@ -54,27 +54,23 @@ void cumsum_ref(const CumSumAttributes& attrs,
 
             if (attrs.exclusive) {
                 // exclusive: out[0] = 0, out[i] = in[i-1] + out[i-1]
-                for (int64_t s = 0; s < lower_dim_size; ++s) {
-                    out_ptr[slice_start + s] = 0.0f;
-                }
-                for (int64_t k = 1; k < dim; ++k) {
+                float running = 0.0f;
+                for (int64_t k = 0; k < dim; ++k) {
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx_cur = slice_start + k * axis_stride + s;
-                        int64_t idx_prev = slice_start + (k - 1) * axis_stride + s;
-                        out_ptr[idx_cur] = in_ptr[idx_prev] + out_ptr[idx_prev];
+                        int64_t idx = slice_start + k * axis_stride + s;
+                        float val = running;  // exclusive: result does not include current
+                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + val : val;
+                        running += in_ptr[idx];  // update after writing
                     }
                 }
             } else {
                 // inclusive: out[0] = in[0], out[i] = in[i] + out[i-1]
-                for (int64_t s = 0; s < lower_dim_size; ++s) {
-                    int64_t idx = slice_start + s;
-                    out_ptr[idx] = in_ptr[idx];
-                }
-                for (int64_t k = 1; k < dim; ++k) {
+                float running = 0.0f;
+                for (int64_t k = 0; k < dim; ++k) {
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx_cur = slice_start + k * axis_stride + s;
-                        int64_t idx_prev = slice_start + (k - 1) * axis_stride + s;
-                        out_ptr[idx_cur] = in_ptr[idx_cur] + out_ptr[idx_prev];
+                        int64_t idx = slice_start + k * axis_stride + s;
+                        running += in_ptr[idx];
+                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + running : running;
                     }
                 }
             }
@@ -94,27 +90,23 @@ void cumsum_ref(const CumSumAttributes& attrs,
 
             if (attrs.exclusive) {
                 // exclusive reverse: out[dim-1] = 0, out[i] = in[i+1] + out[i+1]
-                for (int64_t s = 0; s < lower_dim_size; ++s) {
-                    out_ptr[slice_start + (dim - 1) * axis_stride + s] = 0.0f;
-                }
-                for (int64_t k = dim - 2; k >= 0; --k) {
+                float running = 0.0f;
+                for (int64_t k = dim - 1; k >= 0; --k) {
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx_cur = slice_start + k * axis_stride + s;
-                        int64_t idx_next = slice_start + (k + 1) * axis_stride + s;
-                        out_ptr[idx_cur] = in_ptr[idx_next] + out_ptr[idx_next];
+                        int64_t idx = slice_start + k * axis_stride + s;
+                        float val = running;  // exclusive: result does not include current
+                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + val : val;
+                        running += in_ptr[idx];  // update after writing
                     }
                 }
             } else {
                 // inclusive reverse: out[dim-1] = in[dim-1], out[i] = in[i] + out[i+1]
-                for (int64_t s = 0; s < lower_dim_size; ++s) {
-                    int64_t idx = slice_start + (dim - 1) * axis_stride + s;
-                    out_ptr[idx] = in_ptr[idx];
-                }
-                for (int64_t k = dim - 2; k >= 0; --k) {
+                float running = 0.0f;
+                for (int64_t k = dim - 1; k >= 0; --k) {
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
-                        int64_t idx_cur = slice_start + k * axis_stride + s;
-                        int64_t idx_next = slice_start + (k + 1) * axis_stride + s;
-                        out_ptr[idx_cur] = in_ptr[idx_cur] + out_ptr[idx_next];
+                        int64_t idx = slice_start + k * axis_stride + s;
+                        running += in_ptr[idx];
+                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + running : running;
                     }
                 }
             }

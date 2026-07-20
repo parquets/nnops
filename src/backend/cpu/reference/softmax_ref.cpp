@@ -69,14 +69,18 @@ void softmax_ref(const SoftmaxAttributes& attrs,
                 float log_sum = std::log(sum_exp);
                 for (int64_t k = 0; k < D; ++k) {
                     float v = in_ptr[base + k * inner_size + s];
-                    out_ptr[base + k * inner_size + s] = (v - max_val) - log_sum;
+                    float val = (v - max_val) - log_sum;
+                    out_ptr[base + k * inner_size + s] =
+                        attrs.add_to ? out_ptr[base + k * inner_size + s] + val : val;
                 }
             } else {
                 // softmax = exp(x - max) / sum_exp
                 float inv_sum = 1.0f / sum_exp;
                 for (int64_t k = 0; k < D; ++k) {
                     float v = in_ptr[base + k * inner_size + s];
-                    out_ptr[base + k * inner_size + s] = std::exp(v - max_val) * inv_sum;
+                    float val = std::exp(v - max_val) * inv_sum;
+                    out_ptr[base + k * inner_size + s] =
+                        attrs.add_to ? out_ptr[base + k * inner_size + s] + val : val;
                 }
             }
         }

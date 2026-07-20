@@ -18,6 +18,9 @@ namespace nnops {
 struct LinearAttributes {
     /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
+
+    /// If true, add result to existing output buffer instead of overwriting.
+    bool add_to = false;
 };
 
 /// Linear / fully-connected operator (class-based API).

@@ -76,27 +76,48 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                 const float nb = new_bias[static_cast<size_t>(c)];
                 const int64_t base = (n * C + c) * sample_size;
 
-                const v_fp32x8 scale8 = set1_fp32x8(ns);
-                const v_fp32x8 bias8  = set1_fp32x8(nb);
                 int64_t i = 0;
 
-                // 8-wide SIMD (AVX2 native, or 2×SSE/NEON, or scalar fallback)
-                for (; i + 8 <= sample_size; i += 8) {
-                    const v_fp32x8 x8 = load_fp32x8(x_ptr + base + i);
-                    store(y_ptr + base + i, fmadd(scale8, x8, bias8));
-                }
+                if (attrs.add_to) {
+                    // add_to path: load existing output, accumulate
+                    const v_fp32x8 scale8 = set1_fp32x8(ns);
+                    const v_fp32x8 bias8  = set1_fp32x8(nb);
+                    for (; i + 8 <= sample_size; i += 8) {
+                        const v_fp32x8 x8 = load_fp32x8(x_ptr + base + i);
+                        const v_fp32x8 y8 = load_fp32x8(y_ptr + base + i);
+                        store(y_ptr + base + i, add(y8, fmadd(scale8, x8, bias8)));
+                    }
 
-                // 4-wide tail (SSE / NEON native, or scalar fallback)
-                const v_fp32x4 scale4 = set1_fp32x4(ns);
-                const v_fp32x4 bias4  = set1_fp32x4(nb);
-                for (; i + 4 <= sample_size; i += 4) {
-                    const v_fp32x4 x4 = load_fp32x4(x_ptr + base + i);
-                    store(y_ptr + base + i, fmadd(scale4, x4, bias4));
-                }
+                    const v_fp32x4 scale4 = set1_fp32x4(ns);
+                    const v_fp32x4 bias4  = set1_fp32x4(nb);
+                    for (; i + 4 <= sample_size; i += 4) {
+                        const v_fp32x4 x4 = load_fp32x4(x_ptr + base + i);
+                        const v_fp32x4 y4 = load_fp32x4(y_ptr + base + i);
+                        store(y_ptr + base + i, add(y4, fmadd(scale4, x4, bias4)));
+                    }
 
-                // Scalar tail
-                for (; i < sample_size; ++i) {
-                    y_ptr[base + i] = x_ptr[base + i] * ns + nb;
+                    for (; i < sample_size; ++i) {
+                        y_ptr[base + i] += x_ptr[base + i] * ns + nb;
+                    }
+                } else {
+                    // Overwrite path (original)
+                    const v_fp32x8 scale8 = set1_fp32x8(ns);
+                    const v_fp32x8 bias8  = set1_fp32x8(nb);
+                    for (; i + 8 <= sample_size; i += 8) {
+                        const v_fp32x8 x8 = load_fp32x8(x_ptr + base + i);
+                        store(y_ptr + base + i, fmadd(scale8, x8, bias8));
+                    }
+
+                    const v_fp32x4 scale4 = set1_fp32x4(ns);
+                    const v_fp32x4 bias4  = set1_fp32x4(nb);
+                    for (; i + 4 <= sample_size; i += 4) {
+                        const v_fp32x4 x4 = load_fp32x4(x_ptr + base + i);
+                        store(y_ptr + base + i, fmadd(scale4, x4, bias4));
+                    }
+
+                    for (; i < sample_size; ++i) {
+                        y_ptr[base + i] = x_ptr[base + i] * ns + nb;
+                    }
                 }
             }
         };
@@ -110,50 +131,98 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
         // ---- Non-spatial mode: per-element statistics ----
         // Scale/bias/mean/var have the same shape as X.
         const int64_t total = X.numel();
-        const v_fp32x8 eps8 = set1_fp32x8(epsilon);
-        const v_fp32x8 one8 = set1_fp32x8(1.0f);
-        const v_fp32x4 eps4 = set1_fp32x4(epsilon);
-        const v_fp32x4 one4 = set1_fp32x4(1.0f);
 
         // Use a block-based body for single-threaded execution.
         // When parallel_for is active, we chunk at a coarser granularity.
         const auto process_block = [&](int64_t i_begin, int64_t i_end) {
             int64_t i = i_begin;
 
-            // 8-wide SIMD
-            for (; i + 8 <= i_end; i += 8) {
-                const v_fp32x8 x8 = load_fp32x8(x_ptr + i);
-                const v_fp32x8 s8 = load_fp32x8(s_ptr + i);
-                const v_fp32x8 b8 = load_fp32x8(b_ptr + i);
-                const v_fp32x8 m8 = load_fp32x8(m_ptr + i);
-                const v_fp32x8 v8 = load_fp32x8(v_ptr + i);
+            if (attrs.add_to) {
+                // add_to path: load existing output, accumulate
+                const v_fp32x8 eps8 = set1_fp32x8(epsilon);
+                const v_fp32x8 one8 = set1_fp32x8(1.0f);
+                const v_fp32x4 eps4 = set1_fp32x4(epsilon);
+                const v_fp32x4 one4 = set1_fp32x4(1.0f);
 
-                const v_fp32x8 inv_std = div(one8, sqrt(add(v8, eps8)));
-                const v_fp32x8 ns = mul(inv_std, s8);
-                const v_fp32x8 nb = sub(b8, mul(m8, ns));
-                store(y_ptr + i, fmadd(ns, x8, nb));
-            }
+                // 8-wide SIMD
+                for (; i + 8 <= i_end; i += 8) {
+                    const v_fp32x8 x8 = load_fp32x8(x_ptr + i);
+                    const v_fp32x8 s8 = load_fp32x8(s_ptr + i);
+                    const v_fp32x8 b8 = load_fp32x8(b_ptr + i);
+                    const v_fp32x8 m8 = load_fp32x8(m_ptr + i);
+                    const v_fp32x8 v8 = load_fp32x8(v_ptr + i);
 
-            // 4-wide tail
-            for (; i + 4 <= i_end; i += 4) {
-                const v_fp32x4 x4 = load_fp32x4(x_ptr + i);
-                const v_fp32x4 s4 = load_fp32x4(s_ptr + i);
-                const v_fp32x4 b4 = load_fp32x4(b_ptr + i);
-                const v_fp32x4 m4 = load_fp32x4(m_ptr + i);
-                const v_fp32x4 v4 = load_fp32x4(v_ptr + i);
+                    const v_fp32x8 inv_std = div(one8, sqrt(add(v8, eps8)));
+                    const v_fp32x8 ns = mul(inv_std, s8);
+                    const v_fp32x8 nb = sub(b8, mul(m8, ns));
+                    const v_fp32x8 y8 = load_fp32x8(y_ptr + i);
+                    store(y_ptr + i, add(y8, fmadd(ns, x8, nb)));
+                }
 
-                const v_fp32x4 inv_std = div(one4, sqrt(add(v4, eps4)));
-                const v_fp32x4 ns = mul(inv_std, s4);
-                const v_fp32x4 nb = sub(b4, mul(m4, ns));
-                store(y_ptr + i, fmadd(ns, x4, nb));
-            }
+                // 4-wide tail
+                for (; i + 4 <= i_end; i += 4) {
+                    const v_fp32x4 x4 = load_fp32x4(x_ptr + i);
+                    const v_fp32x4 s4 = load_fp32x4(s_ptr + i);
+                    const v_fp32x4 b4 = load_fp32x4(b_ptr + i);
+                    const v_fp32x4 m4 = load_fp32x4(m_ptr + i);
+                    const v_fp32x4 v4 = load_fp32x4(v_ptr + i);
 
-            // Scalar tail
-            for (; i < i_end; ++i) {
-                float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
-                float ns = inv_std * s_ptr[i];
-                float nb = b_ptr[i] - m_ptr[i] * ns;
-                y_ptr[i] = x_ptr[i] * ns + nb;
+                    const v_fp32x4 inv_std = div(one4, sqrt(add(v4, eps4)));
+                    const v_fp32x4 ns = mul(inv_std, s4);
+                    const v_fp32x4 nb = sub(b4, mul(m4, ns));
+                    const v_fp32x4 y4 = load_fp32x4(y_ptr + i);
+                    store(y_ptr + i, add(y4, fmadd(ns, x4, nb)));
+                }
+
+                // Scalar tail
+                for (; i < i_end; ++i) {
+                    float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
+                    float ns = inv_std * s_ptr[i];
+                    float nb = b_ptr[i] - m_ptr[i] * ns;
+                    y_ptr[i] += x_ptr[i] * ns + nb;
+                }
+            } else {
+                // Overwrite path (original)
+                const v_fp32x8 eps8 = set1_fp32x8(epsilon);
+                const v_fp32x8 one8 = set1_fp32x8(1.0f);
+                const v_fp32x4 eps4 = set1_fp32x4(epsilon);
+                const v_fp32x4 one4 = set1_fp32x4(1.0f);
+
+                // 8-wide SIMD
+                for (; i + 8 <= i_end; i += 8) {
+                    const v_fp32x8 x8 = load_fp32x8(x_ptr + i);
+                    const v_fp32x8 s8 = load_fp32x8(s_ptr + i);
+                    const v_fp32x8 b8 = load_fp32x8(b_ptr + i);
+                    const v_fp32x8 m8 = load_fp32x8(m_ptr + i);
+                    const v_fp32x8 v8 = load_fp32x8(v_ptr + i);
+
+                    const v_fp32x8 inv_std = div(one8, sqrt(add(v8, eps8)));
+                    const v_fp32x8 ns = mul(inv_std, s8);
+                    const v_fp32x8 nb = sub(b8, mul(m8, ns));
+                    store(y_ptr + i, fmadd(ns, x8, nb));
+                }
+
+                // 4-wide tail
+                for (; i + 4 <= i_end; i += 4) {
+                    const v_fp32x4 x4 = load_fp32x4(x_ptr + i);
+                    const v_fp32x4 s4 = load_fp32x4(s_ptr + i);
+                    const v_fp32x4 b4 = load_fp32x4(b_ptr + i);
+                    const v_fp32x4 m4 = load_fp32x4(m_ptr + i);
+                    const v_fp32x4 v4 = load_fp32x4(v_ptr + i);
+
+                    const v_fp32x4 inv_std = div(one4, sqrt(add(v4, eps4)));
+                    const v_fp32x4 ns = mul(inv_std, s4);
+                    const v_fp32x4 nb = sub(b4, mul(m4, ns));
+                    store(y_ptr + i, fmadd(ns, x4, nb));
+                }
+
+                // Scalar tail
+                for (; i < i_end; ++i) {
+                    float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
+                    float ns = inv_std * s_ptr[i];
+                    float nb = b_ptr[i] - m_ptr[i] * ns;
+                    y_ptr[i] = x_ptr[i] * ns + nb;
+                }
             }
         };
 

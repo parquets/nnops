@@ -21,6 +21,9 @@ struct RMSNormAttributes {
 
     /// Small constant for numerical stability.
     float epsilon = 1e-5f;
+
+    /// If true, add result to existing output buffer instead of overwriting.
+    bool add_to = false;
 };
 
 /// RMSNorm operator (class-based API).

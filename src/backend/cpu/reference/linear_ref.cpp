@@ -41,7 +41,8 @@ void linear_ref(const LinearAttributes& attrs,
             if (has_bias) {
                 sum += b_ptr[n];
             }
-            out_ptr[m * N + n] = apply_epilogue(attrs.epilogue, sum, n);
+            float val = apply_epilogue(attrs.epilogue, sum, n);
+            out_ptr[m * N + n] = attrs.add_to ? out_ptr[m * N + n] + val : val;
         }
     };
 

@@ -24,6 +24,9 @@ struct AttentionAttributes {
 
     /// If true, apply a causal (lower-triangular) mask.
     bool use_causal_mask = false;
+
+    /// If true, add result to existing output buffer instead of overwriting.
+    bool add_to = false;
 };
 
 /// Multi-head scaled dot-product Attention operator (class-based API).
