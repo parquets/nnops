@@ -11,6 +11,11 @@ set(NNOPS_CPU_SOURCES
     ops/linear.cpp
     ops/matmul.cpp
     ops/attention.cpp
+    ops/softmax.cpp
+    ops/cumsum.cpp
+    ops/batch_norm.cpp
+    ops/layer_norm.cpp
+    ops/rms_norm.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -22,6 +27,11 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/linear_ref.cpp
     backend/cpu/reference/matmul_ref.cpp
     backend/cpu/reference/attention_ref.cpp
+    backend/cpu/reference/softmax_ref.cpp
+    backend/cpu/reference/cumsum_ref.cpp
+    backend/cpu/reference/batch_norm_ref.cpp
+    backend/cpu/reference/layer_norm_ref.cpp
+    backend/cpu/reference/rms_norm_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

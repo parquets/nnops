@@ -14,6 +14,11 @@ enum class OpType : uint8_t {
     Linear      = 3,
     MatMul      = 4,
     Attention   = 5,
+    Softmax     = 6,
+    CumSum      = 7,
+    BatchNorm   = 8,
+    LayerNorm   = 9,
+    RMSNorm     = 10,
 };
 
 }  // namespace nnops

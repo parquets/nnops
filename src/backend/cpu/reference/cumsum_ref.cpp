@@ -1,0 +1,133 @@
+/// @file cumsum_ref.cpp
+/// @brief Naive CPU reference implementation of cumulative sum.
+///
+/// Decomposes the tensor along axis into upper/lower dims and applies
+/// recurrence: out[i] = in[i-1] + out[i-1] (exclusive) or + in[i] (inclusive).
+
+#include "nnops/ops/cumsum.hpp"
+#include "nnops/core/parallel_for.hpp"
+#include "nnops/detail/assert.hpp"
+
+#include <numeric>
+
+namespace nnops::backend::cpu::reference {
+
+void cumsum_ref(const CumSumAttributes& attrs,
+                const TensorView& output,
+                std::span<const TensorView> inputs,
+                const ComputeContext& ctx,
+                void* /*workspace*/)
+{
+    const auto& input = inputs[0];
+    const int64_t rank = input.rank();
+    NNOPS_ASSERT(rank >= 1);
+
+    // Normalize axis
+    int64_t axis = attrs.axis;
+    if (axis < 0) axis += rank;
+    NNOPS_ASSERT(axis >= 0 && axis < rank);
+
+    const int64_t dim = input.shape(axis);
+
+    // Number of slices before the axis
+    int64_t upper_dim_count = 1;
+    for (int64_t i = 0; i < axis; ++i) {
+        upper_dim_count *= input.shape(i);
+    }
+
+    // Size of the contiguous tail after the axis (treated as 1D vectors)
+    int64_t lower_dim_size = 1;
+    for (int64_t i = axis + 1; i < rank; ++i) {
+        lower_dim_size *= input.shape(i);
+    }
+
+    const auto* in_ptr  = input.data_as<float>();
+    auto* out_ptr = output.data_as<float>();
+
+    // Stride between consecutive elements along the cumulative axis
+    const int64_t axis_stride = lower_dim_size;
+
+    if (!attrs.reverse) {
+        // Forward cumulative sum
+        const auto process_slice = [&](int64_t outer) {
+            const int64_t slice_start = outer * dim * lower_dim_size;
+
+            if (attrs.exclusive) {
+                // exclusive: out[0] = 0, out[i] = in[i-1] + out[i-1]
+                for (int64_t s = 0; s < lower_dim_size; ++s) {
+                    out_ptr[slice_start + s] = 0.0f;
+                }
+                for (int64_t k = 1; k < dim; ++k) {
+                    for (int64_t s = 0; s < lower_dim_size; ++s) {
+                        int64_t idx_cur = slice_start + k * axis_stride + s;
+                        int64_t idx_prev = slice_start + (k - 1) * axis_stride + s;
+                        out_ptr[idx_cur] = in_ptr[idx_prev] + out_ptr[idx_prev];
+                    }
+                }
+            } else {
+                // inclusive: out[0] = in[0], out[i] = in[i] + out[i-1]
+                for (int64_t s = 0; s < lower_dim_size; ++s) {
+                    int64_t idx = slice_start + s;
+                    out_ptr[idx] = in_ptr[idx];
+                }
+                for (int64_t k = 1; k < dim; ++k) {
+                    for (int64_t s = 0; s < lower_dim_size; ++s) {
+                        int64_t idx_cur = slice_start + k * axis_stride + s;
+                        int64_t idx_prev = slice_start + (k - 1) * axis_stride + s;
+                        out_ptr[idx_cur] = in_ptr[idx_cur] + out_ptr[idx_prev];
+                    }
+                }
+            }
+        };
+
+        if (ctx.cpu_parallel_for) {
+            ctx.cpu_parallel_for(0, upper_dim_count, process_slice);
+        } else {
+            for (int64_t i = 0; i < upper_dim_count; ++i) {
+                process_slice(i);
+            }
+        }
+    } else {
+        // Reverse cumulative sum (start from the end)
+        const auto process_slice = [&](int64_t outer) {
+            const int64_t slice_start = outer * dim * lower_dim_size;
+
+            if (attrs.exclusive) {
+                // exclusive reverse: out[dim-1] = 0, out[i] = in[i+1] + out[i+1]
+                for (int64_t s = 0; s < lower_dim_size; ++s) {
+                    out_ptr[slice_start + (dim - 1) * axis_stride + s] = 0.0f;
+                }
+                for (int64_t k = dim - 2; k >= 0; --k) {
+                    for (int64_t s = 0; s < lower_dim_size; ++s) {
+                        int64_t idx_cur = slice_start + k * axis_stride + s;
+                        int64_t idx_next = slice_start + (k + 1) * axis_stride + s;
+                        out_ptr[idx_cur] = in_ptr[idx_next] + out_ptr[idx_next];
+                    }
+                }
+            } else {
+                // inclusive reverse: out[dim-1] = in[dim-1], out[i] = in[i] + out[i+1]
+                for (int64_t s = 0; s < lower_dim_size; ++s) {
+                    int64_t idx = slice_start + (dim - 1) * axis_stride + s;
+                    out_ptr[idx] = in_ptr[idx];
+                }
+                for (int64_t k = dim - 2; k >= 0; --k) {
+                    for (int64_t s = 0; s < lower_dim_size; ++s) {
+                        int64_t idx_cur = slice_start + k * axis_stride + s;
+                        int64_t idx_next = slice_start + (k + 1) * axis_stride + s;
+                        out_ptr[idx_cur] = in_ptr[idx_cur] + out_ptr[idx_next];
+                    }
+                }
+            }
+        };
+
+        if (ctx.cpu_parallel_for) {
+            ctx.cpu_parallel_for(0, upper_dim_count, process_slice);
+        } else {
+            for (int64_t i = 0; i < upper_dim_count; ++i) {
+                process_slice(i);
+            }
+        }
+    }
+}
+
+}  // namespace nnops::backend::cpu::reference

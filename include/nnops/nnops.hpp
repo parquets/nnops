@@ -19,3 +19,8 @@
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
 #include "nnops/ops/attention.hpp"
+#include "nnops/ops/softmax.hpp"
+#include "nnops/ops/cumsum.hpp"
+#include "nnops/ops/batch_norm.hpp"
+#include "nnops/ops/layer_norm.hpp"
+#include "nnops/ops/rms_norm.hpp"

@@ -8,6 +8,11 @@ set(TEST_SOURCES
     test_linear.cpp
     test_matmul.cpp
     test_attention.cpp
+    test_softmax.cpp
+    test_cumsum.cpp
+    test_batch_norm.cpp
+    test_layer_norm.cpp
+    test_rms_norm.cpp
     test_simd.cpp
 )
 

@@ -29,7 +29,7 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 |---|---|
 | OpBase hierarchy | Flat virtual base (pure virtual) |
 | TensorView storage | `SmallVector<int64_t, 8>` for shape/stride (zero heap for <= 8D) |
-| Backend dispatch | `switch(backend_)` in compute() |
+| Backend dispatch | `struct Impl` (Pimpl) with `KernelFn` bound at ctor time, no switch in compute() |
 | CPU parallelism | `std::function` passed via `ComputeContext::cpu_parallel_for` |
 | Memory | User owns all buffers; workspace passed as `void*` |
 | Functional API | Free function wrapping create+compute |
