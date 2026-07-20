@@ -16,6 +16,37 @@ namespace backend::cpu::reference {
 }
 
 // ============================================================
+// Impl — holds the backend-bound kernel function pointer
+// ============================================================
+struct Conv2D::Impl {
+    using KernelFn = void (*)(const Conv2DAttributes&,
+                               const TensorView&,
+                               std::span<const TensorView>,
+                               const ComputeContext&,
+                               void*);
+    KernelFn kernel_fn = nullptr;
+};
+
+namespace {
+auto resolve_conv2d_kernel(Backend backend) -> Conv2D::Impl::KernelFn
+{
+    switch (backend) {
+    case Backend::CPU:
+        return backend::cpu::reference::conv2d_ref;
+#ifdef NNOPS_HAS_CUDA
+    case Backend::CUDA:
+        return nullptr;  // backend::cuda::conv2d_cuda
+#endif
+#ifdef NNOPS_HAS_VULKAN
+    case Backend::Vulkan:
+        return nullptr;  // backend::vulkan::conv2d_vulkan
+#endif
+    }
+    return nullptr;
+}
+}  // anonymous namespace
+
+// ============================================================
 // Factory
 // ============================================================
 std::unique_ptr<Conv2D> Conv2D::create(const Conv2DAttributes& attrs,
@@ -28,8 +59,9 @@ std::unique_ptr<Conv2D> Conv2D::create(const Conv2DAttributes& attrs,
 // Constructor
 // ============================================================
 Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
-    : attrs_(attrs), backend_(backend)
+    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
+    impl_->kernel_fn = resolve_conv2d_kernel(backend);
 }
 
 // ============================================================
@@ -56,21 +88,7 @@ void Conv2D::compute(const TensorView& output,
     NNOPS_ASSERT(inputs[0].data() != nullptr);
     NNOPS_ASSERT(inputs[1].data() != nullptr);
 
-    switch (backend_) {
-    case Backend::CPU:
-        backend::cpu::reference::conv2d_ref(attrs_, output, inputs, ctx, workspace);
-        break;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        // backend::cuda::conv2d_cuda(attrs_, output, inputs, ctx, workspace);
-        break;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        // backend::vulkan::conv2d_vulkan(attrs_, output, inputs, ctx, workspace);
-        break;
-#endif
-    }
+    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
 // ============================================================

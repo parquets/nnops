@@ -89,8 +89,12 @@ public:
 
     const PoolingAttributes& attributes() const noexcept { return attrs_; }
 
+    struct Impl;  // defined in pooling.cpp (Pimpl pattern)
+
 private:
     Pooling(const PoolingAttributes& attrs, Backend backend);
+
+    std::unique_ptr<Impl> impl_;
     PoolingAttributes attrs_;
     Backend backend_;
 };

@@ -67,8 +67,12 @@ public:
 
     const AttentionAttributes& attributes() const noexcept { return attrs_; }
 
+    struct Impl;  // defined in attention.cpp (Pimpl pattern)
+
 private:
     Attention(const AttentionAttributes& attrs, Backend backend);
+
+    std::unique_ptr<Impl> impl_;
     AttentionAttributes attrs_;
     Backend backend_;
 };

@@ -42,8 +42,12 @@ public:
     OpType  getOpType()  const override { return OpType::Linear; }
     Backend getBackend() const override { return backend_; }
 
+    struct Impl;  // defined in linear.cpp (Pimpl pattern)
+
 private:
     explicit Linear(Backend backend);
+
+    std::unique_ptr<Impl> impl_;
     Backend backend_;
 };
 

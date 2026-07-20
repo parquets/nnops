@@ -34,6 +34,7 @@ public:
         NNOPS_ASSERT(shape.size() <= kMaxRank);
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
+        stride_.resize(shape.size());
         compute_dense_strides();
     }
 

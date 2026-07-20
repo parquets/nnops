@@ -14,6 +14,37 @@ namespace backend::cpu::reference {
                     void* workspace);
 }
 
+// ============================================================
+// Impl
+// ============================================================
+struct MatMul::Impl {
+    using KernelFn = void (*)(const MatMulAttributes&,
+                               const TensorView&,
+                               std::span<const TensorView>,
+                               const ComputeContext&,
+                               void*);
+    KernelFn kernel_fn = nullptr;
+};
+
+namespace {
+auto resolve_matmul_kernel(Backend backend) -> MatMul::Impl::KernelFn
+{
+    switch (backend) {
+    case Backend::CPU:
+        return backend::cpu::reference::matmul_ref;
+#ifdef NNOPS_HAS_CUDA
+    case Backend::CUDA:
+        return nullptr;
+#endif
+#ifdef NNOPS_HAS_VULKAN
+    case Backend::Vulkan:
+        return nullptr;
+#endif
+    }
+    return nullptr;
+}
+}  // anonymous namespace
+
 std::unique_ptr<MatMul> MatMul::create(const MatMulAttributes& attrs,
                                         Backend backend)
 {
@@ -21,8 +52,9 @@ std::unique_ptr<MatMul> MatMul::create(const MatMulAttributes& attrs,
 }
 
 MatMul::MatMul(const MatMulAttributes& attrs, Backend backend)
-    : attrs_(attrs), backend_(backend)
+    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
+    impl_->kernel_fn = resolve_matmul_kernel(backend);
 }
 
 void MatMul::compute(const TensorView& output,
@@ -35,19 +67,7 @@ void MatMul::compute(const TensorView& output,
     NNOPS_ASSERT(inputs[0].data() != nullptr);
     NNOPS_ASSERT(inputs[1].data() != nullptr);
 
-    switch (backend_) {
-    case Backend::CPU:
-        backend::cpu::reference::matmul_ref(attrs_, output, inputs, ctx, workspace);
-        break;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        break;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        break;
-#endif
-    }
+    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
 // Functional API

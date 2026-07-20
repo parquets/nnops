@@ -14,6 +14,37 @@ namespace backend::cpu::reference {
                      void* workspace);
 }
 
+// ============================================================
+// Impl
+// ============================================================
+struct Pooling::Impl {
+    using KernelFn = void (*)(const PoolingAttributes&,
+                               const TensorView&,
+                               std::span<const TensorView>,
+                               const ComputeContext&,
+                               void*);
+    KernelFn kernel_fn = nullptr;
+};
+
+namespace {
+auto resolve_pooling_kernel(Backend backend) -> Pooling::Impl::KernelFn
+{
+    switch (backend) {
+    case Backend::CPU:
+        return backend::cpu::reference::pooling_ref;
+#ifdef NNOPS_HAS_CUDA
+    case Backend::CUDA:
+        return nullptr;
+#endif
+#ifdef NNOPS_HAS_VULKAN
+    case Backend::Vulkan:
+        return nullptr;
+#endif
+    }
+    return nullptr;
+}
+}  // anonymous namespace
+
 std::unique_ptr<Pooling> Pooling::create(const PoolingAttributes& attrs,
                                           Backend backend)
 {
@@ -21,8 +52,9 @@ std::unique_ptr<Pooling> Pooling::create(const PoolingAttributes& attrs,
 }
 
 Pooling::Pooling(const PoolingAttributes& attrs, Backend backend)
-    : attrs_(attrs), backend_(backend)
+    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
+    impl_->kernel_fn = resolve_pooling_kernel(backend);
 }
 
 void Pooling::compute(const TensorView& output,
@@ -34,19 +66,7 @@ void Pooling::compute(const TensorView& output,
     NNOPS_ASSERT(output.data() != nullptr);
     NNOPS_ASSERT(inputs[0].data() != nullptr);
 
-    switch (backend_) {
-    case Backend::CPU:
-        backend::cpu::reference::pooling_ref(attrs_, output, inputs, ctx, workspace);
-        break;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        break;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        break;
-#endif
-    }
+    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
 // Functional API

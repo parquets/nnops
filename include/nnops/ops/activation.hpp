@@ -60,8 +60,12 @@ public:
 
     const ActivationAttributes& attributes() const noexcept { return attrs_; }
 
+    struct Impl;  // defined in activation.cpp (Pimpl pattern)
+
 private:
     Activation(const ActivationAttributes& attrs, Backend backend);
+
+    std::unique_ptr<Impl> impl_;
     ActivationAttributes attrs_;
     Backend backend_;
 };

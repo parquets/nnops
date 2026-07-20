@@ -72,8 +72,12 @@ public:
     /// Access the convolution attributes.
     const Conv2DAttributes& attributes() const noexcept { return attrs_; }
 
+    struct Impl;  // defined in conv2d.cpp (Pimpl pattern)
+
 private:
     Conv2D(const Conv2DAttributes& attrs, Backend backend);
+
+    std::unique_ptr<Impl> impl_;
     Conv2DAttributes attrs_;
     Backend backend_;
 };

@@ -44,8 +44,12 @@ public:
 
     const MatMulAttributes& attributes() const noexcept { return attrs_; }
 
+    struct Impl;  // defined in matmul.cpp (Pimpl pattern)
+
 private:
     MatMul(const MatMulAttributes& attrs, Backend backend);
+
+    std::unique_ptr<Impl> impl_;
     MatMulAttributes attrs_;
     Backend backend_;
 };
