@@ -59,6 +59,51 @@ See also [[pooling-upgrade]] for the 2D→3D pattern that could apply to Conv3D 
 - **CPU Reference:** Per-head parallel → QK^T → scale → mask → softmax → weighted V sum
 - **Added:** 2026-07-20
 
+## Softmax
+
+- **Files:** `include/nnops/ops/softmax.hpp`, `src/ops/softmax.cpp`, `src/backend/cpu/reference/softmax_ref.cpp`
+- **Attributes:** `SoftmaxAttributes` — axis (int64_t, default -1), log_softmax (bool)
+- **Input:** `[*]` (any rank >= 1)
+- **Output:** `[*]` same shape as input
+- **Numerical:** max-subtraction before exp for stability; supports log-softmax mode
+- **Added:** 2026-07-21
+
+## CumSum
+
+- **Files:** `include/nnops/ops/cumsum.hpp`, `src/ops/cumsum.cpp`, `src/backend/cpu/reference/cumsum_ref.cpp`
+- **Attributes:** `CumSumAttributes` — exclusive (bool), reverse (bool), axis (int64_t, default 0)
+- **Input:** `[*]` (rank >= 1)
+- **Output:** `[*]` same shape as input
+- **Algorithm:** Decomposes tensor into upper/lower dims along axis; recurrence `out[i] = in[i-1] + out[i-1]` (exclusive) or `out[i] = in[i] + out[i-1]` (inclusive)
+- **Added:** 2026-07-21
+
+## BatchNorm
+
+- **Files:** `include/nnops/ops/batch_norm.hpp`, `src/ops/batch_norm.cpp`, `src/backend/cpu/reference/batch_norm_ref.cpp`
+- **Attributes:** `BatchNormAttributes` — epsilon (float, 1e-5), spatial (bool, true)
+- **Input:** X `[N,C,*]`, scale `[C]`, bias `[C]`, mean `[C]`, var `[C]`
+- **Output:** Y `[N,C,*]`
+- **Inference only:** No training mode. Fused formula: `y = x * (inv_std * scale) + (bias - mean * inv_std * scale)`
+- **Added:** 2026-07-21
+
+## LayerNorm
+
+- **Files:** `include/nnops/ops/layer_norm.hpp`, `src/ops/layer_norm.cpp`, `src/backend/cpu/reference/layer_norm_ref.cpp`
+- **Attributes:** `LayerNormAttributes` — axis (int64_t, default -1), epsilon (float, 1e-5)
+- **Input:** X `[*]`, scale broadcastable to `X.shape[axis:]`, optional bias
+- **Output:** Y `[*]`
+- **Algorithm:** Welford's online algorithm for numerically stable mean/variance; normalizes over `X.shape[axis:]`
+- **Added:** 2026-07-21
+
+## RMSNorm
+
+- **Files:** `include/nnops/ops/rms_norm.hpp`, `src/ops/rms_norm.cpp`, `src/backend/cpu/reference/rms_norm_ref.cpp`
+- **Attributes:** `RMSNormAttributes` — axis (int64_t, default -1), epsilon (float, 1e-5)
+- **Input:** X `[*]`, scale broadcastable to `X.shape[axis:]`
+- **Output:** Y `[*]`
+- **Formula:** `y = x / sqrt(mean(x^2) + eps) * scale` — no mean subtraction, no bias
+- **Added:** 2026-07-21
+
 ## Operator Implementation Pattern
 
 Every operator follows this recipe:

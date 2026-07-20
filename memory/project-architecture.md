@@ -40,7 +40,7 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 
 ```
 include/nnops/core/     — DataType, TensorView, OpBase, Backend, ComputeContext
-include/nnops/ops/      — Operator headers (Conv2D, Activation, Pooling, Linear, MatMul, Attention)
+include/nnops/ops/      — Operator headers (Conv2D, Activation, Pooling, Linear, MatMul, Attention, Softmax, CumSum, BatchNorm, LayerNorm, RMSNorm)
 include/nnops/detail/   — SmallVector, SIMD abstraction layer, assertions
 src/ops/                — Operator dispatch (one .cpp per op)
 src/detail/             — CPU feature detection implementation

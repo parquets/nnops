@@ -72,4 +72,4 @@ Also referenced onnxruntime's approach for runtime CPU detection:
 | Thread pool | Internal | Internal | External `parallel_for` hook |
 | Dependencies | Eigen, MLAS, etc. | None (self-contained) | None (self-contained) |
 | Type dispatch | Runtime macros | Templates + heuristics | `switch` + functors (simple) |
-| Backend model | ExecutionProvider plugins | CPU/GPU split in src | `switch(backend_)` in compute() |
+| Backend model | ExecutionProvider plugins | CPU/GPU split in src | `struct Impl` (Pimpl) with `KernelFn` bound at ctor |
