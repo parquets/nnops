@@ -16,6 +16,7 @@ set(NNOPS_CPU_SOURCES
     ops/batch_norm.cpp
     ops/layer_norm.cpp
     ops/rms_norm.cpp
+    ops/conv3d.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -32,6 +33,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/batch_norm_ref.cpp
     backend/cpu/reference/layer_norm_ref.cpp
     backend/cpu/reference/rms_norm_ref.cpp
+    backend/cpu/reference/conv3d_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

@@ -28,8 +28,8 @@ void conv2d_ref(const Conv2DAttributes& attrs,
     // Weight: [OC, IC/G, KH, KW]
     const int64_t OC = weight.shape(0);
     const int64_t KC = weight.shape(1);  // IC / groups
-    const int64_t KH = weight.shape(2);
-    const int64_t KW = weight.shape(3);
+    const int64_t KH = attrs.kernel_size[0];
+    const int64_t KW = attrs.kernel_size[1];
 
     // Output: [N, OC, OH, OW]
     const int64_t OH = output.shape(2);
@@ -81,7 +81,7 @@ void conv2d_ref(const Conv2DAttributes& attrs,
                         }
                         const int64_t out_idx =
                             ((n * OC + oc_global) * OH + oh) * OW + ow;
-                        out_ptr[out_idx] = sum;
+                        out_ptr[out_idx] = apply_epilogue(attrs.epilogue, sum, oc_global);
                     }
                 }
             }

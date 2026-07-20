@@ -7,17 +7,19 @@
 namespace nnops {
 
 namespace backend::cpu::reference {
-    void linear_ref(const TensorView& output,
+    void linear_ref(const LinearAttributes& attrs,
+                    const TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* workspace);
 }
 
 // ============================================================
-// Impl — Linear has no attributes, so KernelFn is simpler
+// Impl — holds the backend-bound kernel function pointer
 // ============================================================
 struct Linear::Impl {
-    using KernelFn = void (*)(const TensorView&,
+    using KernelFn = void (*)(const LinearAttributes&,
+                               const TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -43,13 +45,14 @@ auto resolve_linear_kernel(Backend backend) -> Linear::Impl::KernelFn
 }
 }  // anonymous namespace
 
-std::unique_ptr<Linear> Linear::create(Backend backend)
+std::unique_ptr<Linear> Linear::create(const LinearAttributes& attrs,
+                                        Backend backend)
 {
-    return std::unique_ptr<Linear>(new Linear(backend));
+    return std::unique_ptr<Linear>(new Linear(attrs, backend));
 }
 
-Linear::Linear(Backend backend)
-    : impl_(std::make_unique<Impl>()), backend_(backend)
+Linear::Linear(const LinearAttributes& attrs, Backend backend)
+    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_linear_kernel(backend);
 }
@@ -65,16 +68,16 @@ void Linear::compute(const TensorView& output,
     NNOPS_ASSERT(inputs[0].data() != nullptr);
     NNOPS_ASSERT(inputs[1].data() != nullptr);
 
-    impl_->kernel_fn(output, inputs, ctx, workspace);
+    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
+// Functional API — no attributes (backward-compatible)
 void linear(const TensorView& input,
             const TensorView& weight,
             const TensorView& output,
             const ComputeContext& ctx)
 {
-    auto op = Linear::create(Backend::CPU);
+    auto op = Linear::create({}, Backend::CPU);
     const TensorView ins[] = {input, weight};
     op->compute(output, ins, ctx, nullptr);
 }
@@ -85,7 +88,31 @@ void linear(const TensorView& input,
             const TensorView& output,
             const ComputeContext& ctx)
 {
-    auto op = Linear::create(Backend::CPU);
+    auto op = Linear::create({}, Backend::CPU);
+    const TensorView ins[] = {input, weight, bias};
+    op->compute(output, ins, ctx, nullptr);
+}
+
+// Functional API — with attributes (epilogue support)
+void linear(const TensorView& input,
+            const TensorView& weight,
+            const TensorView& output,
+            const LinearAttributes& attrs,
+            const ComputeContext& ctx)
+{
+    auto op = Linear::create(attrs, Backend::CPU);
+    const TensorView ins[] = {input, weight};
+    op->compute(output, ins, ctx, nullptr);
+}
+
+void linear(const TensorView& input,
+            const TensorView& weight,
+            const TensorView& bias,
+            const TensorView& output,
+            const LinearAttributes& attrs,
+            const ComputeContext& ctx)
+{
+    auto op = Linear::create(attrs, Backend::CPU);
     const TensorView ins[] = {input, weight, bias};
     op->compute(output, ins, ctx, nullptr);
 }

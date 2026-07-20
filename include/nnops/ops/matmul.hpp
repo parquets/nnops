@@ -6,6 +6,7 @@
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
+#include "nnops/core/epilogue.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -17,6 +18,9 @@ namespace nnops {
 struct MatMulAttributes {
     bool transpose_a = false;
     bool transpose_b = false;
+
+    /// Post-processing applied during output write-back (default: identity).
+    Epilogue epilogue{};
 };
 
 /// Matrix multiplication operator (class-based API).

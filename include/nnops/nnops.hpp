@@ -11,6 +11,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/op_base.hpp"
+#include "nnops/core/epilogue.hpp"
 
 // Operators
 #include "nnops/ops/conv2d.hpp"
@@ -24,3 +25,4 @@
 #include "nnops/ops/batch_norm.hpp"
 #include "nnops/ops/layer_norm.hpp"
 #include "nnops/ops/rms_norm.hpp"
+#include "nnops/ops/conv3d.hpp"

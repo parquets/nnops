@@ -9,7 +9,8 @@
 
 namespace nnops::backend::cpu::reference {
 
-void linear_ref(const TensorView& output,
+void linear_ref(const LinearAttributes& attrs,
+                const TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
@@ -40,7 +41,7 @@ void linear_ref(const TensorView& output,
             if (has_bias) {
                 sum += b_ptr[n];
             }
-            out_ptr[m * N + n] = sum;
+            out_ptr[m * N + n] = apply_epilogue(attrs.epilogue, sum, n);
         }
     };
 

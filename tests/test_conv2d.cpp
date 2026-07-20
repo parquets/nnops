@@ -30,6 +30,7 @@ NNOPS_TEST(conv2d_basic_no_pad) {
     TensorView output(oshape, DataType::f32, out_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
     attrs.stride  = {1, 1};
     attrs.padding = {0, 0};
 
@@ -58,6 +59,7 @@ NNOPS_TEST(conv2d_with_bias) {
     TensorView output(oshape, DataType::f32, out_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
     attrs.stride  = {1, 1};
     attrs.padding = {0, 0};
 
@@ -85,6 +87,7 @@ NNOPS_TEST(conv2d_stride_2) {
     TensorView output(oshape, DataType::f32, out_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
     attrs.stride  = {2, 2};
     attrs.padding = {0, 0};
 
@@ -111,6 +114,7 @@ NNOPS_TEST(conv2d_padding_1) {
     TensorView output(oshape, DataType::f32, out_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
     attrs.stride  = {1, 1};
     attrs.padding = {1, 1};
 
@@ -139,6 +143,7 @@ NNOPS_TEST(conv2d_grouped) {
     TensorView output(oshape, DataType::f32, out_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {2, 2};
     attrs.stride  = {1, 1};
     attrs.padding = {0, 0};
     attrs.groups  = 2;
@@ -164,6 +169,7 @@ NNOPS_TEST(conv2d_random_small) {
     TensorView output(oshape, DataType::f32, out_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
     attrs.stride  = {1, 1};
     attrs.padding = {0, 0};
 
@@ -193,6 +199,7 @@ NNOPS_TEST(conv2d_class_api) {
     TensorView out2(oshape, DataType::f32, out2_buf.data());
 
     Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
     attrs.stride  = {1, 1};
     attrs.padding = {0, 0};
 

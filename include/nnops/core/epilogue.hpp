@@ -1,0 +1,137 @@
+#pragma once
+/// @file epilogue.hpp
+/// @brief Epilogue type for operator fusion — apply activation functions
+///        or other post-processing during output write-back.
+///
+/// This is intentionally separate from activation.hpp (ActivationType /
+/// ActivationAttributes) so that:
+///   - The standalone Activation operator stays clean (no "None" sentinel).
+///   - Future epilogue types (quantize/dequantize, clamp, etc.) have a
+///     natural home without polluting the activation concept.
+
+#include <cstdint>
+#include <cmath>
+#include <algorithm>
+
+namespace nnops {
+
+/// Types of activation post-processing that can be fused into an operator's
+/// output write-back step.
+enum class EpilogueActivateType : uint8_t {
+    None       = 0,   ///< Identity — no epilogue (default)
+    Relu       = 1,   ///< f(x) = max(0, x)
+    Gelu       = 2,   ///< f(x) = x * Phi(x) (Gaussian error linear unit)
+    Sigmoid    = 3,   ///< f(x) = 1 / (1 + exp(-x))
+    Tanh       = 4,   ///< f(x) = tanh(x)
+    LeakyRelu  = 5,   ///< f(x) = x > 0 ? x : alpha * x
+    Silu       = 6,   ///< f(x) = x * sigmoid(x) (Swish)
+    HardSwish  = 7,   ///< f(x) = x * relu6(x + 3) / 6
+    Elu        = 8,   ///< f(x) = x > 0 ? x : alpha * (exp(x) - 1)
+
+    // ---- Quantize / Dequantize (future) ----
+    // Dequantize  = 9,   ///< y = (x - zp[c]) * scale[c]  (per-channel or per-tensor)
+    // Requantize  = 10,  ///< y = round(x / scale[c]) + zp[c]
+};
+
+/// Epilogue descriptor — bundled into operator attributes.
+///
+/// Covers two categories of post-processing:
+///   1. Activation functions (Relu, Gelu, …) — stateless, applied per-element.
+///   2. Quantize / Dequantize — per-channel scales and zero-points.
+///
+/// When type == EpilogueActivateType::None, the epilogue is identity and
+/// has zero runtime cost beyond a predictable branch.
+struct Epilogue {
+    EpilogueActivateType type  = EpilogueActivateType::None;
+    float                alpha = 0.0f;   ///< Slope for LeakyRelu, alpha for Elu
+    float                beta  = 1.0f;   ///< Parameter for HardSwish
+
+    // ---- Per-channel quantization parameters (for Dequantize / Requantize) ----
+    /// Per-channel quantization scales.
+    /// Size: quant_param_count. Indexed by the channel axis.
+    const float* quant_scales = nullptr;
+
+    /// Per-channel zero points (optional — may be nullptr for symmetric quantization).
+    /// Size: quant_param_count (same as scales). Type depends on quant_dtype.
+    const int32_t* quant_zero_points = nullptr;
+
+    /// Number of quantization parameters (== number of channels along quant_axis).
+    /// 0 means per-tensor quantization (use quant_scales[0] / quant_zero_points[0]).
+    /// > 0 means per-channel quantization with quant_param_count channels.
+    int64_t quant_param_count = 0;
+
+    /// Axis along which per-channel quantization is applied.
+    /// For NCHW / NCDHW convolution output: axis 1 (output channels).
+    /// For MatMul / Linear output [M, N]: axis 1 (N dimension).
+    int64_t quant_axis = 1;
+};
+
+/// Apply an epilogue to a single scalar output value (activation types).
+/// Returns the value unchanged when type == None (identity).
+///
+/// Formulas match activation_ref.cpp exactly.
+inline float apply_epilogue(const Epilogue& ep, float x) {
+    switch (ep.type) {
+    case EpilogueActivateType::None:
+        return x;
+    case EpilogueActivateType::Relu:
+        return x > 0.0f ? x : 0.0f;
+    case EpilogueActivateType::LeakyRelu:
+        return x > 0.0f ? x : ep.alpha * x;
+    case EpilogueActivateType::Sigmoid:
+        return 1.0f / (1.0f + std::exp(-x));
+    case EpilogueActivateType::Tanh:
+        return std::tanh(x);
+    case EpilogueActivateType::Gelu: {
+        constexpr float c = 0.7978845608028654f;  // sqrt(2/pi)
+        return 0.5f * x * (1.0f + std::tanh(c * (x + 0.044715f * x * x * x)));
+    }
+    case EpilogueActivateType::Silu:
+        return x / (1.0f + std::exp(-x));  // x * sigmoid(x)
+    case EpilogueActivateType::HardSwish: {
+        float relu6 = std::min(std::max(x + 3.0f, 0.0f), 6.0f);
+        return x * relu6 * (ep.beta / 6.0f);
+    }
+    case EpilogueActivateType::Elu:
+        return x > 0.0f ? x : ep.alpha * (std::exp(x) - 1.0f);
+    }
+    return x;
+}
+
+/// Apply an epilogue to a single scalar output value at a given channel index.
+///
+/// For activation types: delegates to the scalar overload (channel is ignored).
+/// For dequantize / requantize (future): uses per-channel or per-tensor
+/// quantization parameters.
+///
+/// @param ep       Epilogue descriptor
+/// @param x        Output value to transform
+/// @param channel  Channel index along quant_axis (0-based). Only meaningful
+///                 for quantization epilogues; ignored for activation types.
+inline float apply_epilogue(const Epilogue& ep, float x, int64_t channel) {
+    switch (ep.type) {
+    case EpilogueActivateType::None:
+    case EpilogueActivateType::Relu:
+    case EpilogueActivateType::Gelu:
+    case EpilogueActivateType::Sigmoid:
+    case EpilogueActivateType::Tanh:
+    case EpilogueActivateType::LeakyRelu:
+    case EpilogueActivateType::Silu:
+    case EpilogueActivateType::HardSwish:
+    case EpilogueActivateType::Elu:
+        return apply_epilogue(ep, x);
+
+    // Future quantize / dequantize types go here:
+    // case EpilogueActivateType::Dequantize: {
+    //     int64_t idx = (ep.quant_param_count > 0)
+    //         ? std::min(channel, ep.quant_param_count - 1) : 0;
+    //     float scale = ep.quant_scales[idx];
+    //     float zp = ep.quant_zero_points
+    //         ? static_cast<float>(ep.quant_zero_points[idx]) : 0.0f;
+    //     return (x - zp) * scale;
+    // }
+    }
+    return x;
+}
+
+}  // namespace nnops
