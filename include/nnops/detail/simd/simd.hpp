@@ -9,15 +9,17 @@
 ///
 ///   simd.hpp  (this file)
 ///   ├── cpu_features.hpp   — runtime CPU detection (CpuFeatures singleton)
-///   ├── vec_f32x4.hpp      — 128-bit float vector (SSE / NEON / scalar)
-///   ├── vec_f32x8.hpp      — 256-bit float vector (AVX2 / emulated SSE / emulated NEON / scalar)
+///   ├── vec_f32x4.hpp      — 128-bit float32 vector (SSE / NEON / scalar)
+///   ├── vec_f32x8.hpp      — 256-bit float32 vector (AVX2 / emulated / scalar)
+///   ├── vec_f16x4.hpp      — 64-bit float16 vector (NEON FP16 / scalar)
+///   ├── vec_f16x8.hpp      — 128-bit float16 vector (NEON FP16 / scalar)
 ///   └── arch/
-///       ├── scalar.hpp     — scalar C++ fallback
+///       ├── scalar.hpp     — scalar C++ fallback (f32 + f16)
 ///       ├── x86/
 ///       │   ├── sse.hpp    — SSE4.1 backend
 ///       │   └── avx2.hpp   — AVX2+FMA backend
 ///       └── arm/
-///           └── neon.hpp   — ARM NEON backend
+///           └── neon.hpp   — ARM NEON backend (f32 + f16)
 ///
 /// ## Usage
 ///
@@ -27,19 +29,19 @@
 ///
 /// // Compile-time optimal (SSE or NEON depending on target):
 /// void relu_128(const float* in, float* out, int64_t n) {
-///     VecF32x4 zero = vec_zero_f32x4();
+///     v_fp32x4 zero = zero_fp32x4();
 ///     for (int64_t i = 0; i + 4 <= n; i += 4) {
-///         VecF32x4 v = vec_load_f32x4(in + i);
-///         vec_store_f32x4(out + i, vec_max_f32x4(v, zero));
+///         v_fp32x4 v = load_fp32x4(in + i);
+///         store(out + i, max(v, zero));
 ///     }
 /// }
 ///
 /// // Runtime-dispatch for AVX2 (compile with /arch:AVX2):
 /// if (cpu_has_avx2()) {
-///     VecF32x8 zero = vec_zero_f32x8();
+///     v_fp32x8 zero = zero_fp32x8();
 ///     for (int64_t i = 0; i + 8 <= n; i += 8) {
-///         VecF32x8 v = vec_load_f32x8(in + i);
-///         vec_store_f32x8(out + i, vec_max_f32x8(v, zero));
+///         v_fp32x8 v = load_fp32x8(in + i);
+///         store(out + i, max(v, zero));
 ///     }
 /// }
 /// ```
@@ -54,11 +56,15 @@
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/simd/vec_f32x4.hpp"
 #include "nnops/detail/simd/vec_f32x8.hpp"
+#include "nnops/detail/simd/vec_f16x4.hpp"
+#include "nnops/detail/simd/vec_f16x8.hpp"
 
-/// @brief Convenience: number of floats in a 128-bit / 256-bit register.
+/// @brief Convenience: number of elements in each vector register.
 namespace nnops {
 namespace simd {
-inline constexpr int simd_len_f32x4 = 4;
-inline constexpr int simd_len_f32x8 = 8;
+inline constexpr int simd_len_fp32x4 = 4;
+inline constexpr int simd_len_fp32x8 = 8;
+inline constexpr int simd_len_fp16x4 = 4;
+inline constexpr int simd_len_fp16x8 = 8;
 } // namespace simd
 } // namespace nnops
