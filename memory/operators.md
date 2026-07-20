@@ -1,11 +1,11 @@
 ---
 name: operators
 description: "List of implemented operators with their attributes, input/output specs, and implementation patterns"
-metadata: 
+metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-20T15:07:03.002Z
+  modified: 2026-07-20T17:20:21.477Z
 ---
 
 # Implemented Operators
@@ -13,15 +13,33 @@ metadata:
 All operators support: class API (`Op::create()` → `op->compute()`) and functional API (free function).
 Reference project patterns from onnxruntime (OpKernel + attributes struct), ComputeLibrary (IOperator + kernel dispatch), and TensorRT (plugin capability interfaces).
 
+## Epilogue (Core Type)
+
+- **File:** `include/nnops/core/epilogue.hpp`
+- **Purpose:** Post-processing applied during output write-back, enabling operator fusion without a separate kernel launch. Intentionally separate from [[#Activation]] — keeps the standalone Activation operator clean (no None sentinel) and allows future non-activation types (quantize/dequantize).
+- **Types:** `EpilogueActivateType` enum — None, Relu, Gelu, Sigmoid, Tanh, LeakyRelu, Silu, HardSwish, Elu
+- **Struct:** `Epilogue` — `type` (default None=identity), `alpha` (LeakyRelu/Elu), `beta` (HardSwish), plus per-channel quantization fields (`quant_scales`, `quant_zero_points`, `quant_param_count`, `quant_axis` — reserved for future Dequantize/Requantize)
+- **API:** Two `apply_epilogue()` overloads — scalar `apply_epilogue(ep, x)` for activation types, and channel-aware `apply_epilogue(ep, x, channel)` for future per-channel quantization (activation types delegate to scalar overload)
+- **Users:** Conv2D, Conv3D, MatMul, Linear — each holds `Epilogue epilogue{};` in their attributes and applies it at the output write-back site
+- **Added:** 2026-07-21
+
 ## Conv2D
 
 - **Files:** `include/nnops/ops/conv2d.hpp`, `src/ops/conv2d.cpp`, `src/backend/cpu/reference/conv2d_ref.cpp`
-- **Attributes:** `Conv2DAttributes` — stride[2], dilation[2], padding[2], groups, auto_pad
+- **Attributes:** `Conv2DAttributes` — kernel_size[2], stride[2], dilation[2], padding[2], groups, auto_pad, epilogue
 - **Input:** `[N, IC, IH, IW]`, weight `[OC, IC/G, KH, KW]`, optional bias `[OC]`
 - **Output:** `[N, OC, OH, OW]`
-- **CPU Reference:** 7-level nested loop, per-sample parallel via `parallel_for`
+- **CPU Reference:** 7-level nested loop, per-sample parallel via `parallel_for`; output write: `apply_epilogue(attrs.epilogue, sum, oc_global)`
 
-See also [[pooling-upgrade]] for the 2D→3D pattern that could apply to Conv3D in the future.
+## Conv3D
+
+- **Files:** `include/nnops/ops/conv3d.hpp`, `src/ops/conv3d.cpp`, `src/backend/cpu/reference/conv3d_ref.cpp`
+- **Attributes:** `Conv3DAttributes` — kernel_size[3], stride[3], dilation[3], padding[3], groups, auto_pad, epilogue
+- **Input:** `[N, IC, ID, IH, IW]`, weight `[OC, IC/G, KD, KH, KW]`, optional bias `[OC]`
+- **Output:** `[N, OC, OD, OH, OW]` (NCDHW layout)
+- **CPU Reference:** 9-level nested loop, per-sample parallel via `parallel_for`; output write: `apply_epilogue(attrs.epilogue, sum, oc_global)`
+- **Added:** 2026-07-21
+- **Note:** Same Impl/Pimpl pattern as Conv2D. Follows the 2D→3D upgrade pattern established by [[#Pooling]].
 
 ## Activation
 
@@ -29,6 +47,7 @@ See also [[pooling-upgrade]] for the 2D→3D pattern that could apply to Conv3D 
 - **Types:** Relu, LeakyRelu, Sigmoid, Tanh, Gelu, Silu, HardSwish, Elu
 - **Attributes:** `ActivationAttributes` — type, alpha, beta
 - **Pattern:** Element-wise functor dispatched via `switch(ActivationType)`, parallel_for over flat range
+- **Note:** Standalone operator — distinct from [[#Epilogue (Core Type)]] which fuses activation into Conv/MatMul output write-back.
 
 ## Pooling
 
@@ -41,15 +60,17 @@ See also [[pooling-upgrade]] for the 2D→3D pattern that could apply to Conv3D 
 ## Linear
 
 - **Files:** `include/nnops/ops/linear.hpp`, `src/ops/linear.cpp`, `src/backend/cpu/reference/linear_ref.cpp`
+- **Attributes:** `LinearAttributes` — epilogue (added 2026-07-21; previously Linear had no attributes struct)
 - **Formula:** `output = input × weight^T + bias`
 - **Shapes:** input `[M, K]`, weight `[N, K]`, bias `[N]`, output `[M, N]`
-- **CPU Reference:** Triple-nested GEMM, per-row parallel
+- **CPU Reference:** Triple-nested GEMM, per-row parallel; output write: `apply_epilogue(attrs.epilogue, sum, n)`
+- **Convenience:** `Linear::create(Backend::CPU)` still works (defaults to empty `LinearAttributes{}`)
 
 ## MatMul
 
 - **Files:** `include/nnops/ops/matmul.hpp`, `src/ops/matmul.cpp`, `src/backend/cpu/reference/matmul_ref.cpp`
-- **Attributes:** `MatMulAttributes` — transpose_a, transpose_b
-- **CPU Reference:** Triple-nested GEMM with transpose handling, per-row parallel
+- **Attributes:** `MatMulAttributes` — transpose_a, transpose_b, epilogue
+- **CPU Reference:** Triple-nested GEMM with transpose handling, per-row parallel; output write: `apply_epilogue(attrs.epilogue, sum, n)`
 
 ## Attention
 
@@ -59,51 +80,6 @@ See also [[pooling-upgrade]] for the 2D→3D pattern that could apply to Conv3D 
 - **CPU Reference:** Per-head parallel → QK^T → scale → mask → softmax → weighted V sum
 - **Added:** 2026-07-20
 
-## Softmax
-
-- **Files:** `include/nnops/ops/softmax.hpp`, `src/ops/softmax.cpp`, `src/backend/cpu/reference/softmax_ref.cpp`
-- **Attributes:** `SoftmaxAttributes` — axis (int64_t, default -1), log_softmax (bool)
-- **Input:** `[*]` (any rank >= 1)
-- **Output:** `[*]` same shape as input
-- **Numerical:** max-subtraction before exp for stability; supports log-softmax mode
-- **Added:** 2026-07-21
-
-## CumSum
-
-- **Files:** `include/nnops/ops/cumsum.hpp`, `src/ops/cumsum.cpp`, `src/backend/cpu/reference/cumsum_ref.cpp`
-- **Attributes:** `CumSumAttributes` — exclusive (bool), reverse (bool), axis (int64_t, default 0)
-- **Input:** `[*]` (rank >= 1)
-- **Output:** `[*]` same shape as input
-- **Algorithm:** Decomposes tensor into upper/lower dims along axis; recurrence `out[i] = in[i-1] + out[i-1]` (exclusive) or `out[i] = in[i] + out[i-1]` (inclusive)
-- **Added:** 2026-07-21
-
-## BatchNorm
-
-- **Files:** `include/nnops/ops/batch_norm.hpp`, `src/ops/batch_norm.cpp`, `src/backend/cpu/reference/batch_norm_ref.cpp`
-- **Attributes:** `BatchNormAttributes` — epsilon (float, 1e-5), spatial (bool, true)
-- **Input:** X `[N,C,*]`, scale `[C]`, bias `[C]`, mean `[C]`, var `[C]`
-- **Output:** Y `[N,C,*]`
-- **Inference only:** No training mode. Fused formula: `y = x * (inv_std * scale) + (bias - mean * inv_std * scale)`
-- **Added:** 2026-07-21
-
-## LayerNorm
-
-- **Files:** `include/nnops/ops/layer_norm.hpp`, `src/ops/layer_norm.cpp`, `src/backend/cpu/reference/layer_norm_ref.cpp`
-- **Attributes:** `LayerNormAttributes` — axis (int64_t, default -1), epsilon (float, 1e-5)
-- **Input:** X `[*]`, scale broadcastable to `X.shape[axis:]`, optional bias
-- **Output:** Y `[*]`
-- **Algorithm:** Welford's online algorithm for numerically stable mean/variance; normalizes over `X.shape[axis:]`
-- **Added:** 2026-07-21
-
-## RMSNorm
-
-- **Files:** `include/nnops/ops/rms_norm.hpp`, `src/ops/rms_norm.cpp`, `src/backend/cpu/reference/rms_norm_ref.cpp`
-- **Attributes:** `RMSNormAttributes` — axis (int64_t, default -1), epsilon (float, 1e-5)
-- **Input:** X `[*]`, scale broadcastable to `X.shape[axis:]`
-- **Output:** Y `[*]`
-- **Formula:** `y = x / sqrt(mean(x^2) + eps) * scale` — no mean subtraction, no bias
-- **Added:** 2026-07-21
-
 ## Operator Implementation Pattern
 
 Every operator follows this recipe:
@@ -112,3 +88,20 @@ Every operator follows this recipe:
 2. **Dispatch** (`src/ops/<name>.cpp`): `create()` factory, `compute()` with `switch(backend_)`, functional wrappers
 3. **CPU Reference** (`src/backend/cpu/reference/<name>_ref.cpp`): Naive implementation in `nnops::backend::cpu::reference` namespace
 4. **Tests** (`tests/test_<name>.cpp`): Hand-verified small tests + random data tests + class/functional parity tests
+
+## add_to (Output Accumulation)
+
+All operators support `bool add_to{false}` in their Attributes. When true, the kernel adds its result to the existing output buffer instead of overwriting:
+
+```
+add_to=false (default):  output[i]  = result
+add_to=true:             output[i] += result
+```
+
+**Purpose:** Enables residual connections and skip connections without a separate add kernel. For example, `Conv(input, output, {.add_to=true})` performs `output += Conv(input)` in a single kernel launch.
+
+**Implementation pattern:**
+- Scalar: `out[i] = attrs.add_to ? out[i] + val : val;`
+- SIMD: branch-hoisted outside the loop; add_to path does `store(y, add(load(y), computed))` (one extra load per vector)
+
+**Added:** 2026-07-21

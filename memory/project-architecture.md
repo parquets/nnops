@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-20T15:21:13.265Z
+  modified: 2026-07-20T17:02:55.382Z
 ---
 
 # nnops Project Architecture
@@ -29,7 +29,7 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 |---|---|
 | OpBase hierarchy | Flat virtual base (pure virtual) |
 | TensorView storage | `SmallVector<int64_t, 8>` for shape/stride (zero heap for <= 8D) |
-| Backend dispatch | `struct Impl` (Pimpl) with `KernelFn` bound at ctor time, no switch in compute() |
+| Backend dispatch | `switch(backend_)` in compute() |
 | CPU parallelism | `std::function` passed via `ComputeContext::cpu_parallel_for` |
 | Memory | User owns all buffers; workspace passed as `void*` |
 | Functional API | Free function wrapping create+compute |
@@ -39,8 +39,8 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 ## Directory Structure
 
 ```
-include/nnops/core/     — DataType, TensorView, OpBase, Backend, ComputeContext
-include/nnops/ops/      — Operator headers (Conv2D, Activation, Pooling, Linear, MatMul, Attention, Softmax, CumSum, BatchNorm, LayerNorm, RMSNorm)
+include/nnops/core/     — DataType, TensorView, OpBase, Backend, ComputeContext, Epilogue
+include/nnops/ops/      — Operator headers (Conv2D, Conv3D, Activation, Pooling, Linear, MatMul, Attention)
 include/nnops/detail/   — SmallVector, SIMD abstraction layer, assertions
 src/ops/                — Operator dispatch (one .cpp per op)
 src/detail/             — CPU feature detection implementation
