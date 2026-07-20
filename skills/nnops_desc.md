@@ -69,6 +69,7 @@ tests/
 + onnxruntime: 如果没有，请询问 onnxruntime 项目的目录
 + TensorRT: 如果没有，请询问 TensorRT 项目的目录
 + ComputeLibrary: 如果没有，请询问 ComputeLibrary 项目的目录
++ OpenCV: 如果没有，请询问 OpenCV 项目的目录。主要参考 OpenCV 的 Universal Intrinsics (modules/core/include/opencv2/core/hal/intrin*.hpp) — 一套跨平台的 SIMD 指令封装，将 SSE/AVX/NEON 等不同 ISA 统一为类型安全的 vector 类型 (v_float32x4, v_float32x8 等)，提供 load/store/arithmetic/comparison/FMA 等通用操作。nnops 的 SIMD 抽象层（include/nnops/detail/simd/）借鉴了 OpenCV 的这一设计模式。
 
 如果不能准确的获取上面的目录，不要开始写代码或者重构项目。额外的，需要确保算子能够很方便的接入 onnxruntime 和 TensorRT 的自定义算子。
 

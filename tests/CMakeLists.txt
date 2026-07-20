@@ -8,6 +8,7 @@ set(TEST_SOURCES
     test_linear.cpp
     test_matmul.cpp
     test_attention.cpp
+    test_simd.cpp
 )
 
 add_executable(nnops_test ${TEST_SOURCES})

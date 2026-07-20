@@ -1,0 +1,5 @@
+- [Project Architecture](project-architecture.md) — overall design, directory structure, key decisions
+- [SIMD Infrastructure](simd-infrastructure.md) — cross-platform SIMD abstraction layer (SSE, AVX2, NEON, scalar)
+- [Operators](operators.md) — all implemented operators, attributes, shapes, implementation patterns
+- [Reference Projects](reference-projects.md) — patterns adopted from onnxruntime, TensorRT, ComputeLibrary, OpenCV
+- [Test Infrastructure](test-infrastructure.md) — test harness, random data generation, benchmarks

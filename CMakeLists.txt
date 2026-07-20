@@ -46,6 +46,9 @@ set(NNOPS_CPU_SOURCES
     src/ops/matmul.cpp
     src/ops/attention.cpp
 
+    # CPU feature detection (runtime CPUID / NEON probing)
+    src/detail/cpu_features.cpp
+
     # CPU reference kernels (always compiled — correctness baseline)
     src/backend/cpu/reference/conv2d_ref.cpp
     src/backend/cpu/reference/activation_ref.cpp
