@@ -21,6 +21,9 @@ set(NNOPS_CPU_SOURCES
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
 
+    # CPU optimized kernels (SIMD-accelerated)
+    backend/cpu/batch_norm.cpp
+
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp
     backend/cpu/reference/activation_ref.cpp

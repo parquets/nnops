@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <vector>
 
 namespace nnops::backend::cpu::reference {
 
