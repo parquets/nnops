@@ -17,12 +17,15 @@ set(NNOPS_CPU_SOURCES
     ops/layer_norm.cpp
     ops/rms_norm.cpp
     ops/conv3d.cpp
+    ops/depthwise_conv2d.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/batch_norm.cpp
+    backend/cpu/depthwise_conv2d.cpp
+    backend/cpu/pooling.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp
@@ -37,6 +40,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/layer_norm_ref.cpp
     backend/cpu/reference/rms_norm_ref.cpp
     backend/cpu/reference/conv3d_ref.cpp
+    backend/cpu/reference/depthwise_conv2d_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

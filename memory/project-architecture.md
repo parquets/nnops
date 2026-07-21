@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-20T17:02:55.382Z
+  modified: 2026-07-21T14:20:48.756Z
 ---
 
 # nnops Project Architecture
@@ -44,8 +44,14 @@ include/nnops/ops/      — Operator headers (Conv2D, Conv3D, Activation, Poolin
 include/nnops/detail/   — SmallVector, SIMD abstraction layer, assertions
 src/ops/                — Operator dispatch (one .cpp per op)
 src/detail/             — CPU feature detection implementation
-src/backend/cpu/reference/ — Naive CPU kernels (correctness baseline)
+src/backend/cpu/
+  ├── common/           — Shared CPU utilities (restrict.hpp, half.hpp)
+  ├── reference/        — Naive CPU kernels (correctness baseline, all operators)
+  ├── x86_64/           — x86_64 GEMM micro-kernels (transpose.hpp, pack_f32/f16, mma_pack_f32/f16)
+  │                       using AVX2+FMA for f32, F16C+FMA for fp16
+  └── aarch64/          — AArch64 GEMM micro-kernels (transpose.hpp, pack_f32/f16, mma_pack_f32/f16)
+                          using NEON for f32, NEON FP16 for fp16 (ARMv8.2+)
 src/backend/cuda/       — CUDA kernels (optional)
 src/backend/vulkan/     — Vulkan kernels (optional)
-tests/                  — Unit tests + common test utilities
+tests/                  — Unit tests (14 files, 116 tests) + common test utilities
 ```

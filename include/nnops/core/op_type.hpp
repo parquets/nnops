@@ -19,7 +19,8 @@ enum class OpType : uint8_t {
     BatchNorm   = 8,
     LayerNorm   = 9,
     RMSNorm     = 10,
-    Conv3D      = 11,
+    Conv3D          = 11,
+    DepthwiseConv2D = 12,
 };
 
 }  // namespace nnops

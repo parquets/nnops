@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-21T00:00:00.000Z
+  modified: 2026-07-21T14:21:00.717Z
 ---
 
 # SIMD Abstraction Layer
@@ -15,6 +15,16 @@ Cross-platform SIMD intrinsic wrappers for x86_64 and AArch64, with automatic sc
 **Why:** Zero-dependency operator library needs a uniform SIMD API across platforms. Raw intrinsics are ISA-specific and unportable. A thin type-safe wrapper allows writing kernels once that compile to SSE, AVX2+FMA, NEON, or scalar C++ depending on the target.
 
 **How to apply:** Include `"nnops/detail/simd/simd.hpp"` in optimized kernel files. Use `v_fp32x4` for 128-bit operations and `v_fp32x8` for 256-bit operations. Guard AVX2 code paths with `cpu_has_avx2()` at runtime and compile the file with `/arch:AVX2` (MSVC) or `-mavx2 -mfma` (GCC/Clang).
+
+## Relationship to GEMM Micro-Kernels
+
+The SIMD abstraction layer (`include/nnops/detail/simd/`) serves platform-independent operator code (e.g., element-wise ops like Relu, BatchNorm). In contrast, the GEMM micro-kernels in `src/backend/cpu/{x86_64,aarch64}/` use **raw architecture-specific intrinsics directly** (NEON `float32x4_t`/`float16x8_t`, AVX `__m256`, SSE `__m128`) — not the SIMD wrappers. This is intentional:
+
+- Micro-kernels are hand-tuned for a specific ISA and tile size; portability is not a goal
+- The dispatch layer selects the right micro-kernel at compile time (`#ifdef __x86_64__` / `#ifdef __aarch64__`)
+- The SIMD abstraction layer is for writing portable kernels that compile once per operator; the micro-kernels are per-ISA specializations of the GEMM primitive
+
+The `NNOPS_RESTRICT` macro (`src/backend/cpu/common/restrict.hpp`) is the only shared utility used by both the SIMD abstraction and the raw micro-kernels.
 
 ## Naming Convention
 

@@ -14,6 +14,14 @@ namespace backend::cpu::reference {
                      void* workspace);
 }
 
+namespace backend::cpu {
+    void pooling_cpu(const PoolingAttributes& attrs,
+                      const TensorView& output,
+                      std::span<const TensorView> inputs,
+                      const ComputeContext& ctx,
+                      void* workspace);
+}
+
 // ============================================================
 // Impl
 // ============================================================
@@ -31,7 +39,7 @@ auto resolve_pooling_kernel(Backend backend) -> Pooling::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::pooling_ref;
+        return backend::cpu::pooling_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;

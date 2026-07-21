@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: reference
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-20T15:20:24.720Z
+  modified: 2026-07-21T14:21:17.346Z
 ---
 
 # Reference Project Insights
@@ -72,4 +72,21 @@ Also referenced onnxruntime's approach for runtime CPU detection:
 | Thread pool | Internal | Internal | External `parallel_for` hook |
 | Dependencies | Eigen, MLAS, etc. | None (self-contained) | None (self-contained) |
 | Type dispatch | Runtime macros | Templates + heuristics | `switch` + functors (simple) |
-| Backend model | ExecutionProvider plugins | CPU/GPU split in src | `struct Impl` (Pimpl) with `KernelFn` bound at ctor |
+| Backend model | ExecutionProvider plugins | CPU/GPU split in src | `switch(backend_)` in compute() |
+
+## nn_compute (GEMM Micro-Kernel Reference)
+
+**Location:** `D:\vscode\nn_compute`
+
+Key patterns adopted for GEMM micro-kernels:
+
+- **Three-layer kernel hierarchy**: `transpose.hpp` (register-level transpose primitives) → `pack.hpp` (LHS transpose pack + RHS copy pack) → `mma.hpp` (matrix micro-accumulate inner loop)
+- **Architecture-specific tile sizes**: AArch64 f32: mr={8,4,1}/nr={12,4,1}, AArch64 f16: mr={8,4,1}/nr={24,8,1}; x86_64 f32+f16: mr={6,4,1}/nr={16,8,1}
+- **Panel constant naming**: `mr_<dtype>[3]` and `nr_<dtype>[3]` for LHS/RHS micro-panel sizes
+- **K step tuning**: x86_64 pack uses K step of 8 (__m256 width), aarch64 uses K step of 4 (float32x4_t width)
+- **Pack transforms**: `pack_trans_nN` (LHS: transpose + scale), `pack_copy_nN` (RHS: contiguous copy + scale)
+- **MMA micro-kernel signature**: `C(mr,nr) += A(mr,K) × B_packed(nr,K)` then clamp to [clamp_min, clamp_max]
+- **FP16 approach (x86_64)**: F16C intrinsics for fp16↔fp32 conversion, fp32 FMA accumulators, fp16 storage via `half` struct with `uint16_t` bits
+- **FP16 approach (AArch64)**: Native NEON fp16 arithmetic (`float16_t`, `vfmaq_lane_f16`) on ARMv8.2-A+
+
+All 10 micro-kernel files (5 aarch64 + 5 x86_64) were ported from nn_compute with modern C++ improvements: `noexcept` on all functions, `constexpr` panel sizes, `NNOPS_RESTRICT` for pointer aliasing, lambda clamp helpers, Doxygen documentation. Bugs in the reference code were corrected during porting (unreachable scalar tails, pointer-offset typos, out-of-bounds broadcasts in f16 MMA).

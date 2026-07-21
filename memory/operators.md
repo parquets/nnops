@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-20T17:20:21.477Z
+  modified: 2026-07-21T14:32:59.172Z
 ---
 
 # Implemented Operators
@@ -51,11 +51,19 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## Pooling
 
-- **Files:** `include/nnops/ops/pooling.hpp`, `src/ops/pooling.cpp`, `src/backend/cpu/reference/pooling_ref.cpp`
+- **Files:** `include/nnops/ops/pooling.hpp`, `src/ops/pooling.cpp`, `src/backend/cpu/reference/pooling_ref.cpp`, `src/backend/cpu/pooling.cpp`
 - **Types:** Max, Average, AverageExcludePad, Lp
-- **Attributes:** `PoolingAttributes` — `std::array<int64_t, 3>` for kernel/stride/padding/dilation (layout: `[KD, KH, KW]`)
+- **Attributes:** `PoolingAttributes` — `std::array<int64_t, 3>` for kernel/stride/padding/dilation (layout: `[KD, KH, KW]`), `p_norm`, `auto_pad`, `add_to`
 - **Input:** 2D `[N, C, IH, IW]` or 3D `[N, C, ID, IH, IW]`
-- **Note:** Upgraded from 2D-only to 2D/3D on 2026-07-20. Spatial rank auto-detected from input tensor rank (4→2D, 5→3D).
+- **CPU Reference:** Triple-nested (2D) / quadruple-nested (3D) loop per output position, with full bounds checking per kernel element. All 4 pool types supported.
+- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_fp32x8 SIMD over output width dimension. Design combines best practices from nn_compute (pre-positioned pointers, trust boundary — no per-element bounds checks in SIMD kernels, region splitting) and onnxruntime MLAS (two-phase reduction noted for future).
+  - **Pre-positioned pointer passing** (nn_compute pattern): Caller pre-positions input+output pointers to (id, ih, iw_start), SIMD kernels use only relative offsets — eliminates positional computation bugs (depth-off-by-oh_start, ow_start-vs-ow confusion).
+  - **Trust boundary**: SIMD kernels called only for interior valid region (od/oh/ow within `[beg, end)` where every kernel element maps to valid input). No per-element `vd0`/`vh0` validity checks inside SIMD kernels.
+  - **Region splitting**: pad-depth front/back → scalar, pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder).
+  - **SIMD gating**: Only active when `SW == 1` && type is Max or Average. AverageExcludePad and Lp use scalar path (per-element counting required). stride > 1 uses all-scalar fallback (nnops SIMD has no gather operations).
+  - **add_to**: Branch-hoisted inside SIMD kernels; one extra `load + add` before `store` when enabled.
+  - **Unified 2D/3D**: Single code path; 2D is KD=1/SD=1/DD=1/PD=0/ID=1/OD=1 degenerate case.
+- **Note:** Upgraded from 2D-only to 2D/3D on 2026-07-20. SIMD kernel added 2026-07-21. Reference sources: `d:\vscode\nn_compute\src\cpu\kernel\pooling\` and `d:\git\onnxruntime\onnxruntime\core\mlas\lib\pooling.cpp`.
 
 ## Linear
 
@@ -88,6 +96,52 @@ Every operator follows this recipe:
 2. **Dispatch** (`src/ops/<name>.cpp`): `create()` factory, `compute()` with `switch(backend_)`, functional wrappers
 3. **CPU Reference** (`src/backend/cpu/reference/<name>_ref.cpp`): Naive implementation in `nnops::backend::cpu::reference` namespace
 4. **Tests** (`tests/test_<name>.cpp`): Hand-verified small tests + random data tests + class/functional parity tests
+
+## GEMM Micro-Kernels (Backend Infrastructure)
+
+Not an operator per se, but the low-level building block for future optimized MatMul/Linear/Conv GEMM dispatch. Three layers organized per-ISA:
+
+| Layer | Files (per arch) | Purpose |
+|---|---|---|
+| Transpose | `src/backend/cpu/{x86_64,aarch64}/transpose.hpp` | Register-level matrix transpose (2/4/6/8/12/16/24-way) |
+| Pack | `src/backend/cpu/{x86_64,aarch64}/pack_f32.hpp`, `pack_f16.hpp` | LHS transpose pack + RHS copy pack for GEMM data layout |
+| MMA Pack | `src/backend/cpu/{x86_64,aarch64}/mma_pack_f32.hpp`, `mma_pack_f16.hpp` | C[mr][nr] += A_packed[mr][K] × B_packed[nr][K] with clamp |
+| MMA Direct | `src/backend/cpu/{x86_64,aarch64}/mma_direct_f32.hpp`, `mma_direct_f16.hpp` | C[mr][nr] += A[mr][K] × B[K][nr] from strided row-major (no pack) |
+
+**Panel sizes (tuned per ISA):**
+
+| Arch | dtype | mr[] (LHS heights) | nr[] (RHS widths) |
+|---|---|---|---|
+| AArch64 | f32 | {8, 4, 1} | {12, 4, 1} |
+| AArch64 | f16 | {8, 4, 1} | {24, 8, 1} |
+| x86_64 | f32 | {6, 4, 1} | {16, 8, 1} |
+| x86_64 | f16 | {6, 4, 1} | {16, 8, 1} |
+
+**K step:** x86_64 = 8 (__m256 width), AArch64 = 4 (float32x4_t width for f32, 8 for f16 using float16x8_t)
+
+**FP16 approach divergence:**
+- **x86_64**: Data stored as `half` (uint16_t). F16C `_mm256_cvtph_ps`/`_mm256_cvtps_ph` for convert, fp32 FMA accumulators, clamp in fp32 then round-to-nearest to fp16 on store
+- **AArch64**: Native NEON fp16 arithmetic (`float16_t` type, `vfmaq_lane_f16` intrinsics) — requires ARMv8.2-A+
+
+**Shared utilities:**
+- `src/backend/cpu/common/restrict.hpp` — cross-platform `NNOPS_RESTRICT` macro (MSVC `__restrict`, GCC/Clang `__restrict__`)
+- `src/backend/cpu/common/half.hpp` — `half` struct (uint16_t storage) + `half_to_float`/`float_to_half` converters for x86_64 fp16 kernels
+
+**Porting reference:** `D:\vscode\nn_compute` — all 10 kernel files ported with modern C++ improvements (noexcept, constexpr, lambda helpers, Doxygen). See [[reference-projects]].
+
+**Added:** 2026-07-21 (aarch64) and 2026-07-21 (x86_64)
+
+## DepthwiseConv2D
+
+- **Files:** `include/nnops/ops/depthwise_conv2d.hpp`, `src/ops/depthwise_conv2d.cpp`, `src/backend/cpu/reference/depthwise_conv2d_ref.cpp`, `src/backend/cpu/depthwise_conv2d.cpp`
+- **Attributes:** `DepthwiseConv2DAttributes` — kernel_size[2], stride[2], dilation[2], padding[2], epilogue, add_to
+- **Input:** `[N, C, IH, IW]`, weight `[C, 1, KH, KW]`, optional bias `[C]`
+- **Output:** `[N, C, OH, OW]` (same channels as input — no channel change in depthwise)
+- **Formula:** Each channel is convolved independently with its own KH×KW filter — no cross-channel mixing
+- **CPU Reference:** 6-level nested loop (N, C, OH, OW, KH, KW), per-sample parallel via `parallel_for`; pad handling via bounds check
+- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_fp32x8 SIMD over output W dimension. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder). Design informed by nn_compute (height blocking + region dispatch) and onnxruntime MLAS (3×3 depthwise kernel specialization, edge handling).
+- **SIMD gating:** Only active when stride_w == 1 (contiguous input reads); stride > 1 falls back to scalar path automatically.
+- **Added:** 2026-07-21
 
 ## add_to (Output Accumulation)
 
