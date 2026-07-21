@@ -53,7 +53,9 @@ public:
     // ---- OpBase interface ----
     size_t getWorkspace() const override { return 0; }  // Element-wise: no workspace needed
 
-    void compute(const TensorView& output,
+    using OpBase::compute;
+
+    void compute(std::span<const TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

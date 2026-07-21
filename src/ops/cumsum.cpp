@@ -57,12 +57,14 @@ CumSum::CumSum(const CumSumAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_cumsum_kernel(backend);
 }
 
-void CumSum::compute(const TensorView& output,
+void CumSum::compute(std::span<const TensorView> outputs,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 1);
+    NNOPS_ASSERT(outputs.size() == 1);
+    const auto& output = outputs[0];
     NNOPS_ASSERT(output.data() != nullptr);
     NNOPS_ASSERT(inputs[0].data() != nullptr);
 

@@ -57,13 +57,15 @@ LayerNorm::LayerNorm(const LayerNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_layer_norm_kernel(backend);
 }
 
-void LayerNorm::compute(const TensorView& output,
+void LayerNorm::compute(std::span<const TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
                          void* workspace)
 {
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(inputs.size() <= 3);  // x, scale [, bias]
+    NNOPS_ASSERT(outputs.size() == 1);
+    const auto& output = outputs[0];
     NNOPS_ASSERT(output.data() != nullptr);
     NNOPS_ASSERT(inputs[0].data() != nullptr);  // X
     NNOPS_ASSERT(inputs[1].data() != nullptr);  // scale

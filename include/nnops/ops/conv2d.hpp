@@ -73,7 +73,9 @@ public:
     /// inputs[0] = input tensor (NCHW)
     /// inputs[1] = weight tensor (OIHW or GOIHW for grouped)
     /// inputs[2] = bias tensor [OC] (optional)
-    void compute(const TensorView& output,
+    using OpBase::compute;
+
+    void compute(std::span<const TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

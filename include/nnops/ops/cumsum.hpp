@@ -53,7 +53,9 @@ public:
     size_t getWorkspace() const override { return 0; }
 
     /// inputs[0] = input tensor (rank >= 1)
-    void compute(const TensorView& output,
+    using OpBase::compute;
+
+    void compute(std::span<const TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

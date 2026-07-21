@@ -52,7 +52,9 @@ public:
 
     /// inputs[0] = X [*]
     /// inputs[1] = scale, broadcastable to X.shape[axis:]
-    void compute(const TensorView& output,
+    using OpBase::compute;
+
+    void compute(std::span<const TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

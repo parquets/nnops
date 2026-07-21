@@ -57,7 +57,9 @@ public:
     /// inputs[2] = bias [C] (or [C, D1...] if !spatial)
     /// inputs[3] = mean [C] (or [C, D1...] if !spatial)
     /// inputs[4] = var [C] (or [C, D1...] if !spatial)
-    void compute(const TensorView& output,
+    using OpBase::compute;
+
+    void compute(std::span<const TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

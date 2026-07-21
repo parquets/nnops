@@ -72,7 +72,9 @@ public:
     /// inputs[0] = input tensor  [N, C, IH, IW]
     /// inputs[1] = weight tensor [C, 1, KH, KW]
     /// inputs[2] = bias tensor   [C] (optional)
-    void compute(const TensorView& output,
+    using OpBase::compute;
+
+    void compute(std::span<const TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

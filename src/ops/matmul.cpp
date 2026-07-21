@@ -57,12 +57,14 @@ MatMul::MatMul(const MatMulAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_matmul_kernel(backend);
 }
 
-void MatMul::compute(const TensorView& output,
+void MatMul::compute(std::span<const TensorView> outputs,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 2);
+    NNOPS_ASSERT(outputs.size() == 1);
+    const auto& output = outputs[0];
     NNOPS_ASSERT(output.data() != nullptr);
     NNOPS_ASSERT(inputs[0].data() != nullptr);
     NNOPS_ASSERT(inputs[1].data() != nullptr);
