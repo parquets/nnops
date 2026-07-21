@@ -8,7 +8,7 @@
 ///
 /// Key optimizations:
 ///   1. Height blocking: process 4 output rows simultaneously to reuse kernel weights
-///   2. Width SIMD: process 8 output columns with v_fp32x8 within each height block
+///   2. Width SIMD: process 8 output columns with v_f32x8 within each height block
 ///   3. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar,
 ///      interior → SIMD (h4 for aligned rows, h1 for remainder)
 ///   4. Kernel weight pre-load into registers within inner loop (reused across 4 rows)
@@ -88,10 +88,10 @@ inline void dwconv_h4_simd(float* output,
 {
     for (int64_t ow = ow_start; ow < ow_end; ow += 8) {
         // Accumulators for 4 rows × 8 columns
-        v_fp32x8 vacc0 = set1_fp32x8(bias_val);
-        v_fp32x8 vacc1 = set1_fp32x8(bias_val);
-        v_fp32x8 vacc2 = set1_fp32x8(bias_val);
-        v_fp32x8 vacc3 = set1_fp32x8(bias_val);
+        v_f32x8 vacc0 = v_set1_f32x8(bias_val);
+        v_f32x8 vacc1 = v_set1_f32x8(bias_val);
+        v_f32x8 vacc2 = v_set1_f32x8(bias_val);
+        v_f32x8 vacc3 = v_set1_f32x8(bias_val);
 
         for (int64_t kh = 0; kh < KH; ++kh) {
             const int64_t ih0 = (oh_start + 0) * SH + kh * DH - PH;
@@ -107,25 +107,25 @@ inline void dwconv_h4_simd(float* output,
             for (int64_t kw = 0; kw < KW; ++kw) {
                 // Broadcast kernel weight to all 8 lanes
                 const float kval = weight[kh * KW + kw];
-                const v_fp32x8 vk = set1_fp32x8(kval);
+                const v_f32x8 vk = v_set1_f32x8(kval);
 
                 const int64_t iw_base = ow * SW + kw * DW - PW;
 
                 if (valid0) {
-                    const v_fp32x8 vin0 = load_fp32x8(input + ih0 * in_h_stride + iw_base * in_w_stride);
-                    vacc0 = fmadd(vin0, vk, vacc0);
+                    const v_f32x8 vin0 = v_load_f32x8(input + ih0 * in_h_stride + iw_base * in_w_stride);
+                    vacc0 = v_fmadd(vin0, vk, vacc0);
                 }
                 if (valid1) {
-                    const v_fp32x8 vin1 = load_fp32x8(input + ih1 * in_h_stride + iw_base * in_w_stride);
-                    vacc1 = fmadd(vin1, vk, vacc1);
+                    const v_f32x8 vin1 = v_load_f32x8(input + ih1 * in_h_stride + iw_base * in_w_stride);
+                    vacc1 = v_fmadd(vin1, vk, vacc1);
                 }
                 if (valid2) {
-                    const v_fp32x8 vin2 = load_fp32x8(input + ih2 * in_h_stride + iw_base * in_w_stride);
-                    vacc2 = fmadd(vin2, vk, vacc2);
+                    const v_f32x8 vin2 = v_load_f32x8(input + ih2 * in_h_stride + iw_base * in_w_stride);
+                    vacc2 = v_fmadd(vin2, vk, vacc2);
                 }
                 if (valid3) {
-                    const v_fp32x8 vin3 = load_fp32x8(input + ih3 * in_h_stride + iw_base * in_w_stride);
-                    vacc3 = fmadd(vin3, vk, vacc3);
+                    const v_f32x8 vin3 = v_load_f32x8(input + ih3 * in_h_stride + iw_base * in_w_stride);
+                    vacc3 = v_fmadd(vin3, vk, vacc3);
                 }
             }
         }
@@ -137,16 +137,16 @@ inline void dwconv_h4_simd(float* output,
         float* out_row3 = output + (oh_start + 3) * out_h_stride + ow * out_w_stride;
 
         if (add_to) {
-            vacc0 = add(vacc0, load_fp32x8(out_row0));
-            vacc1 = add(vacc1, load_fp32x8(out_row1));
-            vacc2 = add(vacc2, load_fp32x8(out_row2));
-            vacc3 = add(vacc3, load_fp32x8(out_row3));
+            vacc0 = v_add(vacc0, v_load_f32x8(out_row0));
+            vacc1 = v_add(vacc1, v_load_f32x8(out_row1));
+            vacc2 = v_add(vacc2, v_load_f32x8(out_row2));
+            vacc3 = v_add(vacc3, v_load_f32x8(out_row3));
         }
 
-        store(out_row0, vacc0);
-        store(out_row1, vacc1);
-        store(out_row2, vacc2);
-        store(out_row3, vacc3);
+        v_store(out_row0, vacc0);
+        v_store(out_row1, vacc1);
+        v_store(out_row2, vacc2);
+        v_store(out_row3, vacc3);
     }
 }
 
@@ -169,7 +169,7 @@ inline void dwconv_h1_simd(float* output,
                             bool add_to)
 {
     for (int64_t ow = ow_start; ow < ow_end; ow += 8) {
-        v_fp32x8 vacc = set1_fp32x8(bias_val);
+        v_f32x8 vacc = v_set1_f32x8(bias_val);
 
         for (int64_t kh = 0; kh < KH; ++kh) {
             const int64_t ih = oh * SH + kh * DH - PH;
@@ -177,21 +177,21 @@ inline void dwconv_h1_simd(float* output,
 
             for (int64_t kw = 0; kw < KW; ++kw) {
                 const float kval = weight[kh * KW + kw];
-                const v_fp32x8 vk = set1_fp32x8(kval);
+                const v_f32x8 vk = v_set1_f32x8(kval);
                 const int64_t iw_base = ow * SW + kw * DW - PW;
 
-                const v_fp32x8 vin = load_fp32x8(input + ih * in_h_stride + iw_base * in_w_stride);
-                vacc = fmadd(vin, vk, vacc);
+                const v_f32x8 vin = v_load_f32x8(input + ih * in_h_stride + iw_base * in_w_stride);
+                vacc = v_fmadd(vin, vk, vacc);
             }
         }
 
         float* out_row = output + oh * out_h_stride + ow * out_w_stride;
 
         if (add_to) {
-            vacc = add(vacc, load_fp32x8(out_row));
+            vacc = v_add(vacc, v_load_f32x8(out_row));
         }
 
-        store(out_row, vacc);
+        v_store(out_row, vacc);
     }
 }
 
@@ -276,7 +276,7 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
 
     // SIMD is only valid when stride_w == 1:
     //   For stride > 1, consecutive output columns map to strided input columns,
-    //   and we cannot use contiguous load_fp32x8. Use scalar path instead.
+    //   and we cannot use contiguous v_load_f32x8. Use scalar path instead.
     //   (Dilation is fine — it affects spacing between kernel iterations, not
     //    within a single SIMD load.)
     const bool use_simd = (SW == 1);

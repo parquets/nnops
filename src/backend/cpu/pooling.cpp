@@ -19,11 +19,11 @@
 /// Key design decisions for nnops:
 ///   1. SIMD kernels accept pre-positioned pointers, use only relative offsets
 ///   2. No per-element validity checks in SIMD — caller guarantees valid interior region
-///   3. Width-8 SIMD via v_fp32x8 (AVX2 native, SSE emulated, NEON emulated)
+///   3. Width-8 SIMD via v_f32x8 (AVX2 native, SSE emulated, NEON emulated)
 ///   4. SIMD gated on stride_w == 1 (nnops SIMD has no gather; contiguous loads required)
 ///   5. AverageExcludePad and Lp pooling: scalar-only (per-element counting needed)
 ///   6. Unified 2D/3D code path: KD=1/SD=1/DD=1/PD=0/ID=1/OD=1 for 2D
-///   7. add_to support: branch-hoisted; one extra load per store when enabled
+///   7. add_to support: branch-hoisted; one extra load per v_store when enabled
 ///   8. Per-sample parallel dispatch via parallel_for
 
 #include "nnops/ops/pooling.hpp"
@@ -164,7 +164,7 @@ inline void pooling_scalar_row(
 //   Height: (r * SH + kh * DH) * in_h_stride    (r = 0..3 for h4, 0 for h1)
 //   Width:  (ow - ow_start) + kw * DW           (SW == 1, in_w_stride == 1, ow loops)
 
-/// Process 4 output rows × up to `ow_simd_count * 8` output columns with element-wise max.
+/// Process 4 output rows × up to `ow_simd_count * 8` output columns with element-wise v_max.
 /// Called only for interior valid region (SW == 1 required).
 inline void maxpool_h4_simd(
     float* output, const float* input,
@@ -181,10 +181,10 @@ inline void maxpool_h4_simd(
     for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
         const int64_t w_off = blk * 8;  // relative width offset from ow_start
 
-        v_fp32x8 vacc0 = set1_fp32x8(neg_inf);
-        v_fp32x8 vacc1 = set1_fp32x8(neg_inf);
-        v_fp32x8 vacc2 = set1_fp32x8(neg_inf);
-        v_fp32x8 vacc3 = set1_fp32x8(neg_inf);
+        v_f32x8 vacc0 = v_set1_f32x8(neg_inf);
+        v_f32x8 vacc1 = v_set1_f32x8(neg_inf);
+        v_f32x8 vacc2 = v_set1_f32x8(neg_inf);
+        v_f32x8 vacc3 = v_set1_f32x8(neg_inf);
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
@@ -195,10 +195,10 @@ inline void maxpool_h4_simd(
                 const int64_t h_off3 = (3 * SH + kh * DH) * in_h_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
-                    vacc0 = max(vacc0, load_fp32x8(input + d_off + h_off0 + kw_off));
-                    vacc1 = max(vacc1, load_fp32x8(input + d_off + h_off1 + kw_off));
-                    vacc2 = max(vacc2, load_fp32x8(input + d_off + h_off2 + kw_off));
-                    vacc3 = max(vacc3, load_fp32x8(input + d_off + h_off3 + kw_off));
+                    vacc0 = v_max(vacc0, v_load_f32x8(input + d_off + h_off0 + kw_off));
+                    vacc1 = v_max(vacc1, v_load_f32x8(input + d_off + h_off1 + kw_off));
+                    vacc2 = v_max(vacc2, v_load_f32x8(input + d_off + h_off2 + kw_off));
+                    vacc3 = v_max(vacc3, v_load_f32x8(input + d_off + h_off3 + kw_off));
                 }
             }
         }
@@ -210,20 +210,20 @@ inline void maxpool_h4_simd(
         float* out3 = output + 3 * out_h_stride + w_off * out_w_stride;
 
         if (add_to) {
-            vacc0 = add(vacc0, load_fp32x8(out0));
-            vacc1 = add(vacc1, load_fp32x8(out1));
-            vacc2 = add(vacc2, load_fp32x8(out2));
-            vacc3 = add(vacc3, load_fp32x8(out3));
+            vacc0 = v_add(vacc0, v_load_f32x8(out0));
+            vacc1 = v_add(vacc1, v_load_f32x8(out1));
+            vacc2 = v_add(vacc2, v_load_f32x8(out2));
+            vacc3 = v_add(vacc3, v_load_f32x8(out3));
         }
 
-        store(out0, vacc0);
-        store(out1, vacc1);
-        store(out2, vacc2);
-        store(out3, vacc3);
+        v_store(out0, vacc0);
+        v_store(out1, vacc1);
+        v_store(out2, vacc2);
+        v_store(out3, vacc3);
     }
 }
 
-/// Process 1 output row × up to `ow_simd_count * 8` output columns with element-wise max.
+/// Process 1 output row × up to `ow_simd_count * 8` output columns with element-wise v_max.
 /// Called only for interior valid region (SW == 1 required).
 inline void maxpool_h1_simd(
     float* output, const float* input,
@@ -239,7 +239,7 @@ inline void maxpool_h1_simd(
 
     for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
         const int64_t w_off = blk * 8;
-        v_fp32x8 vacc = set1_fp32x8(neg_inf);
+        v_f32x8 vacc = v_set1_f32x8(neg_inf);
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
@@ -247,7 +247,7 @@ inline void maxpool_h1_simd(
                 const int64_t h_off = kh * DH * in_h_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
-                    vacc = max(vacc, load_fp32x8(input + d_off + h_off + kw_off));
+                    vacc = v_max(vacc, v_load_f32x8(input + d_off + h_off + kw_off));
                 }
             }
         }
@@ -255,10 +255,10 @@ inline void maxpool_h1_simd(
         float* out_r = output + w_off * out_w_stride;
 
         if (add_to) {
-            vacc = add(vacc, load_fp32x8(out_r));
+            vacc = v_add(vacc, v_load_f32x8(out_r));
         }
 
-        store(out_r, vacc);
+        v_store(out_r, vacc);
     }
 }
 
@@ -278,15 +278,15 @@ inline void avgpool_h4_simd(
     int64_t in_d_stride, int64_t in_h_stride,
     float scale, bool add_to)
 {
-    const v_fp32x8 vscale = set1_fp32x8(scale);
+    const v_f32x8 vscale = v_set1_f32x8(scale);
 
     for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
         const int64_t w_off = blk * 8;
 
-        v_fp32x8 vacc0 = zero_fp32x8();
-        v_fp32x8 vacc1 = zero_fp32x8();
-        v_fp32x8 vacc2 = zero_fp32x8();
-        v_fp32x8 vacc3 = zero_fp32x8();
+        v_f32x8 vacc0 = v_zero_f32x8();
+        v_f32x8 vacc1 = v_zero_f32x8();
+        v_f32x8 vacc2 = v_zero_f32x8();
+        v_f32x8 vacc3 = v_zero_f32x8();
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
@@ -297,10 +297,10 @@ inline void avgpool_h4_simd(
                 const int64_t h_off3 = (3 * SH + kh * DH) * in_h_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
-                    vacc0 = fmadd(load_fp32x8(input + d_off + h_off0 + kw_off), vscale, vacc0);
-                    vacc1 = fmadd(load_fp32x8(input + d_off + h_off1 + kw_off), vscale, vacc1);
-                    vacc2 = fmadd(load_fp32x8(input + d_off + h_off2 + kw_off), vscale, vacc2);
-                    vacc3 = fmadd(load_fp32x8(input + d_off + h_off3 + kw_off), vscale, vacc3);
+                    vacc0 = v_fmadd(v_load_f32x8(input + d_off + h_off0 + kw_off), vscale, vacc0);
+                    vacc1 = v_fmadd(v_load_f32x8(input + d_off + h_off1 + kw_off), vscale, vacc1);
+                    vacc2 = v_fmadd(v_load_f32x8(input + d_off + h_off2 + kw_off), vscale, vacc2);
+                    vacc3 = v_fmadd(v_load_f32x8(input + d_off + h_off3 + kw_off), vscale, vacc3);
                 }
             }
         }
@@ -311,16 +311,16 @@ inline void avgpool_h4_simd(
         float* out3 = output + 3 * out_h_stride + w_off * out_w_stride;
 
         if (add_to) {
-            vacc0 = add(vacc0, load_fp32x8(out0));
-            vacc1 = add(vacc1, load_fp32x8(out1));
-            vacc2 = add(vacc2, load_fp32x8(out2));
-            vacc3 = add(vacc3, load_fp32x8(out3));
+            vacc0 = v_add(vacc0, v_load_f32x8(out0));
+            vacc1 = v_add(vacc1, v_load_f32x8(out1));
+            vacc2 = v_add(vacc2, v_load_f32x8(out2));
+            vacc3 = v_add(vacc3, v_load_f32x8(out3));
         }
 
-        store(out0, vacc0);
-        store(out1, vacc1);
-        store(out2, vacc2);
-        store(out3, vacc3);
+        v_store(out0, vacc0);
+        v_store(out1, vacc1);
+        v_store(out2, vacc2);
+        v_store(out3, vacc3);
     }
 }
 
@@ -336,11 +336,11 @@ inline void avgpool_h1_simd(
     int64_t in_d_stride, int64_t in_h_stride,
     float scale, bool add_to)
 {
-    const v_fp32x8 vscale = set1_fp32x8(scale);
+    const v_f32x8 vscale = v_set1_f32x8(scale);
 
     for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
         const int64_t w_off = blk * 8;
-        v_fp32x8 vacc = zero_fp32x8();
+        v_f32x8 vacc = v_zero_f32x8();
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
@@ -348,7 +348,7 @@ inline void avgpool_h1_simd(
                 const int64_t h_off = kh * DH * in_h_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
-                    vacc = fmadd(load_fp32x8(input + d_off + h_off + kw_off), vscale, vacc);
+                    vacc = v_fmadd(v_load_f32x8(input + d_off + h_off + kw_off), vscale, vacc);
                 }
             }
         }
@@ -356,10 +356,10 @@ inline void avgpool_h1_simd(
         float* out_r = output + w_off * out_w_stride;
 
         if (add_to) {
-            vacc = add(vacc, load_fp32x8(out_r));
+            vacc = v_add(vacc, v_load_f32x8(out_r));
         }
 
-        store(out_r, vacc);
+        v_store(out_r, vacc);
     }
 }
 
@@ -439,7 +439,7 @@ void pooling_cpu(const PoolingAttributes& attrs,
     // Formula: first output position where kernel start is >= 0 (after padding)
     //   beg = ceil(P / S)
     // Last output position where kernel end is within input
-    //   end = max(ceil((I + P - ((K-1)*D + 1)) / S), beg)
+    //   end = v_max(ceil((I + P - ((K-1)*D + 1)) / S), beg)
 
     auto compute_beg = [](int64_t pad, int64_t stride) -> int64_t {
         if (stride <= 0) return 0;

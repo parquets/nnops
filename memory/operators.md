@@ -56,12 +56,12 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Attributes:** `PoolingAttributes` — `std::array<int64_t, 3>` for kernel/stride/padding/dilation (layout: `[KD, KH, KW]`), `p_norm`, `auto_pad`, `add_to`
 - **Input:** 2D `[N, C, IH, IW]` or 3D `[N, C, ID, IH, IW]`
 - **CPU Reference:** Triple-nested (2D) / quadruple-nested (3D) loop per output position, with full bounds checking per kernel element. All 4 pool types supported.
-- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_fp32x8 SIMD over output width dimension. Design combines best practices from nn_compute (pre-positioned pointers, trust boundary — no per-element bounds checks in SIMD kernels, region splitting) and onnxruntime MLAS (two-phase reduction noted for future).
+- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_f32x8 SIMD over output width dimension. Design combines best practices from nn_compute (pre-positioned pointers, trust boundary — no per-element bounds checks in SIMD kernels, region splitting) and onnxruntime MLAS (two-phase reduction noted for future).
   - **Pre-positioned pointer passing** (nn_compute pattern): Caller pre-positions input+output pointers to (id, ih, iw_start), SIMD kernels use only relative offsets — eliminates positional computation bugs (depth-off-by-oh_start, ow_start-vs-ow confusion).
   - **Trust boundary**: SIMD kernels called only for interior valid region (od/oh/ow within `[beg, end)` where every kernel element maps to valid input). No per-element `vd0`/`vh0` validity checks inside SIMD kernels.
   - **Region splitting**: pad-depth front/back → scalar, pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder).
   - **SIMD gating**: Only active when `SW == 1` && type is Max or Average. AverageExcludePad and Lp use scalar path (per-element counting required). stride > 1 uses all-scalar fallback (nnops SIMD has no gather operations).
-  - **add_to**: Branch-hoisted inside SIMD kernels; one extra `load + add` before `store` when enabled.
+  - **add_to**: Branch-hoisted inside SIMD kernels; one extra `load + v_add` before `v_store` when enabled.
   - **Unified 2D/3D**: Single code path; 2D is KD=1/SD=1/DD=1/PD=0/ID=1/OD=1 degenerate case.
 - **Note:** Upgraded from 2D-only to 2D/3D on 2026-07-20. SIMD kernel added 2026-07-21. Reference sources: `d:\vscode\nn_compute\src\cpu\kernel\pooling\` and `d:\git\onnxruntime\onnxruntime\core\mlas\lib\pooling.cpp`.
 
@@ -83,7 +83,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 ## Attention
 
 - **Files:** `include/nnops/ops/attention.hpp`, `src/ops/attention.cpp`, `src/backend/cpu/reference/attention_ref.cpp`
-- **Attributes:** `AttentionAttributes` — num_heads, scale (0=auto `1/sqrt(d)`), use_causal_mask
+- **Attributes:** `AttentionAttributes` — num_heads, scale (0=auto `1/v_sqrt(d)`), use_causal_mask
 - **Input:** Q/K/V — merged `[B, S, H*D]` or explicit `[B, H, S, D]`, optional mask
 - **CPU Reference:** Per-head parallel → QK^T → scale → mask → softmax → weighted V sum
 - **Added:** 2026-07-20
@@ -120,7 +120,7 @@ Not an operator per se, but the low-level building block for future optimized Ma
 **K step:** x86_64 = 8 (__m256 width), AArch64 = 4 (float32x4_t width for f32, 8 for f16 using float16x8_t)
 
 **FP16 approach divergence:**
-- **x86_64**: Data stored as `half` (uint16_t). F16C `_mm256_cvtph_ps`/`_mm256_cvtps_ph` for convert, fp32 FMA accumulators, clamp in fp32 then round-to-nearest to fp16 on store
+- **x86_64**: Data stored as `half` (uint16_t). F16C `_mm256_cvtph_ps`/`_mm256_cvtps_ph` for convert, fp32 FMA accumulators, clamp in fp32 then round-to-nearest to fp16 on v_store
 - **AArch64**: Native NEON fp16 arithmetic (`float16_t` type, `vfmaq_lane_f16` intrinsics) — requires ARMv8.2-A+
 
 **Shared utilities:**
@@ -139,7 +139,7 @@ Not an operator per se, but the low-level building block for future optimized Ma
 - **Output:** `[N, C, OH, OW]` (same channels as input — no channel change in depthwise)
 - **Formula:** Each channel is convolved independently with its own KH×KW filter — no cross-channel mixing
 - **CPU Reference:** 6-level nested loop (N, C, OH, OW, KH, KW), per-sample parallel via `parallel_for`; pad handling via bounds check
-- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_fp32x8 SIMD over output W dimension. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder). Design informed by nn_compute (height blocking + region dispatch) and onnxruntime MLAS (3×3 depthwise kernel specialization, edge handling).
+- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_f32x8 SIMD over output W dimension. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder). Design informed by nn_compute (height blocking + region dispatch) and onnxruntime MLAS (3×3 depthwise kernel specialization, edge handling).
 - **SIMD gating:** Only active when stride_w == 1 (contiguous input reads); stride > 1 falls back to scalar path automatically.
 - **Added:** 2026-07-21
 
@@ -152,10 +152,10 @@ add_to=false (default):  output[i]  = result
 add_to=true:             output[i] += result
 ```
 
-**Purpose:** Enables residual connections and skip connections without a separate add kernel. For example, `Conv(input, output, {.add_to=true})` performs `output += Conv(input)` in a single kernel launch.
+**Purpose:** Enables residual connections and skip connections without a separate v_add kernel. For example, `Conv(input, output, {.add_to=true})` performs `output += Conv(input)` in a single kernel launch.
 
 **Implementation pattern:**
 - Scalar: `out[i] = attrs.add_to ? out[i] + val : val;`
-- SIMD: branch-hoisted outside the loop; add_to path does `store(y, add(load(y), computed))` (one extra load per vector)
+- SIMD: branch-hoisted outside the loop; add_to path does `v_store(y, v_add(load(y), computed))` (one extra load per vector)
 
 **Added:** 2026-07-21

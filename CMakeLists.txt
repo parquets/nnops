@@ -17,8 +17,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # MSVC: use UTF-8 source encoding, no deprecation warnings for std::span use
+# Also enable AVX2+F16C (assumed baseline on x86_64 target platforms)
 if(MSVC)
-    add_compile_options(/utf-8 /bigobj)
+    add_compile_options(/utf-8 /bigobj /arch:AVX2)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64)|(amd64)|(i686)")
+    add_compile_options(-mavx2 -mfma -mf16c)
 endif()
 
 # ---- Export compile commands (for IDE support) ----

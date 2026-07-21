@@ -80,20 +80,20 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
 
                 if (attrs.add_to) {
                     // add_to path: load existing output, accumulate
-                    const v_fp32x8 scale8 = set1_fp32x8(ns);
-                    const v_fp32x8 bias8  = set1_fp32x8(nb);
+                    const v_f32x8 scale8 = v_set1_f32x8(ns);
+                    const v_f32x8 bias8  = v_set1_f32x8(nb);
                     for (; i + 8 <= sample_size; i += 8) {
-                        const v_fp32x8 x8 = load_fp32x8(x_ptr + base + i);
-                        const v_fp32x8 y8 = load_fp32x8(y_ptr + base + i);
-                        store(y_ptr + base + i, add(y8, fmadd(scale8, x8, bias8)));
+                        const v_f32x8 x8 = v_load_f32x8(x_ptr + base + i);
+                        const v_f32x8 y8 = v_load_f32x8(y_ptr + base + i);
+                        v_store(y_ptr + base + i, v_add(y8, v_fmadd(scale8, x8, bias8)));
                     }
 
-                    const v_fp32x4 scale4 = set1_fp32x4(ns);
-                    const v_fp32x4 bias4  = set1_fp32x4(nb);
+                    const v_f32x4 scale4 = v_set1_f32x4(ns);
+                    const v_f32x4 bias4  = v_set1_f32x4(nb);
                     for (; i + 4 <= sample_size; i += 4) {
-                        const v_fp32x4 x4 = load_fp32x4(x_ptr + base + i);
-                        const v_fp32x4 y4 = load_fp32x4(y_ptr + base + i);
-                        store(y_ptr + base + i, add(y4, fmadd(scale4, x4, bias4)));
+                        const v_f32x4 x4 = v_load_f32x4(x_ptr + base + i);
+                        const v_f32x4 y4 = v_load_f32x4(y_ptr + base + i);
+                        v_store(y_ptr + base + i, v_add(y4, v_fmadd(scale4, x4, bias4)));
                     }
 
                     for (; i < sample_size; ++i) {
@@ -101,18 +101,18 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                     }
                 } else {
                     // Overwrite path (original)
-                    const v_fp32x8 scale8 = set1_fp32x8(ns);
-                    const v_fp32x8 bias8  = set1_fp32x8(nb);
+                    const v_f32x8 scale8 = v_set1_f32x8(ns);
+                    const v_f32x8 bias8  = v_set1_f32x8(nb);
                     for (; i + 8 <= sample_size; i += 8) {
-                        const v_fp32x8 x8 = load_fp32x8(x_ptr + base + i);
-                        store(y_ptr + base + i, fmadd(scale8, x8, bias8));
+                        const v_f32x8 x8 = v_load_f32x8(x_ptr + base + i);
+                        v_store(y_ptr + base + i, v_fmadd(scale8, x8, bias8));
                     }
 
-                    const v_fp32x4 scale4 = set1_fp32x4(ns);
-                    const v_fp32x4 bias4  = set1_fp32x4(nb);
+                    const v_f32x4 scale4 = v_set1_f32x4(ns);
+                    const v_f32x4 bias4  = v_set1_f32x4(nb);
                     for (; i + 4 <= sample_size; i += 4) {
-                        const v_fp32x4 x4 = load_fp32x4(x_ptr + base + i);
-                        store(y_ptr + base + i, fmadd(scale4, x4, bias4));
+                        const v_f32x4 x4 = v_load_f32x4(x_ptr + base + i);
+                        v_store(y_ptr + base + i, v_fmadd(scale4, x4, bias4));
                     }
 
                     for (; i < sample_size; ++i) {
@@ -139,39 +139,39 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
 
             if (attrs.add_to) {
                 // add_to path: load existing output, accumulate
-                const v_fp32x8 eps8 = set1_fp32x8(epsilon);
-                const v_fp32x8 one8 = set1_fp32x8(1.0f);
-                const v_fp32x4 eps4 = set1_fp32x4(epsilon);
-                const v_fp32x4 one4 = set1_fp32x4(1.0f);
+                const v_f32x8 eps8 = v_set1_f32x8(epsilon);
+                const v_f32x8 one8 = v_set1_f32x8(1.0f);
+                const v_f32x4 eps4 = v_set1_f32x4(epsilon);
+                const v_f32x4 one4 = v_set1_f32x4(1.0f);
 
                 // 8-wide SIMD
                 for (; i + 8 <= i_end; i += 8) {
-                    const v_fp32x8 x8 = load_fp32x8(x_ptr + i);
-                    const v_fp32x8 s8 = load_fp32x8(s_ptr + i);
-                    const v_fp32x8 b8 = load_fp32x8(b_ptr + i);
-                    const v_fp32x8 m8 = load_fp32x8(m_ptr + i);
-                    const v_fp32x8 v8 = load_fp32x8(v_ptr + i);
+                    const v_f32x8 x8 = v_load_f32x8(x_ptr + i);
+                    const v_f32x8 s8 = v_load_f32x8(s_ptr + i);
+                    const v_f32x8 b8 = v_load_f32x8(b_ptr + i);
+                    const v_f32x8 m8 = v_load_f32x8(m_ptr + i);
+                    const v_f32x8 v8 = v_load_f32x8(v_ptr + i);
 
-                    const v_fp32x8 inv_std = div(one8, sqrt(add(v8, eps8)));
-                    const v_fp32x8 ns = mul(inv_std, s8);
-                    const v_fp32x8 nb = sub(b8, mul(m8, ns));
-                    const v_fp32x8 y8 = load_fp32x8(y_ptr + i);
-                    store(y_ptr + i, add(y8, fmadd(ns, x8, nb)));
+                    const v_f32x8 inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
+                    const v_f32x8 ns = v_mul(inv_std, s8);
+                    const v_f32x8 nb = v_sub(b8, v_mul(m8, ns));
+                    const v_f32x8 y8 = v_load_f32x8(y_ptr + i);
+                    v_store(y_ptr + i, v_add(y8, v_fmadd(ns, x8, nb)));
                 }
 
                 // 4-wide tail
                 for (; i + 4 <= i_end; i += 4) {
-                    const v_fp32x4 x4 = load_fp32x4(x_ptr + i);
-                    const v_fp32x4 s4 = load_fp32x4(s_ptr + i);
-                    const v_fp32x4 b4 = load_fp32x4(b_ptr + i);
-                    const v_fp32x4 m4 = load_fp32x4(m_ptr + i);
-                    const v_fp32x4 v4 = load_fp32x4(v_ptr + i);
+                    const v_f32x4 x4 = v_load_f32x4(x_ptr + i);
+                    const v_f32x4 s4 = v_load_f32x4(s_ptr + i);
+                    const v_f32x4 b4 = v_load_f32x4(b_ptr + i);
+                    const v_f32x4 m4 = v_load_f32x4(m_ptr + i);
+                    const v_f32x4 v4 = v_load_f32x4(v_ptr + i);
 
-                    const v_fp32x4 inv_std = div(one4, sqrt(add(v4, eps4)));
-                    const v_fp32x4 ns = mul(inv_std, s4);
-                    const v_fp32x4 nb = sub(b4, mul(m4, ns));
-                    const v_fp32x4 y4 = load_fp32x4(y_ptr + i);
-                    store(y_ptr + i, add(y4, fmadd(ns, x4, nb)));
+                    const v_f32x4 inv_std = v_div(one4, v_sqrt(v_add(v4, eps4)));
+                    const v_f32x4 ns = v_mul(inv_std, s4);
+                    const v_f32x4 nb = v_sub(b4, v_mul(m4, ns));
+                    const v_f32x4 y4 = v_load_f32x4(y_ptr + i);
+                    v_store(y_ptr + i, v_add(y4, v_fmadd(ns, x4, nb)));
                 }
 
                 // Scalar tail
@@ -183,37 +183,37 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                 }
             } else {
                 // Overwrite path (original)
-                const v_fp32x8 eps8 = set1_fp32x8(epsilon);
-                const v_fp32x8 one8 = set1_fp32x8(1.0f);
-                const v_fp32x4 eps4 = set1_fp32x4(epsilon);
-                const v_fp32x4 one4 = set1_fp32x4(1.0f);
+                const v_f32x8 eps8 = v_set1_f32x8(epsilon);
+                const v_f32x8 one8 = v_set1_f32x8(1.0f);
+                const v_f32x4 eps4 = v_set1_f32x4(epsilon);
+                const v_f32x4 one4 = v_set1_f32x4(1.0f);
 
                 // 8-wide SIMD
                 for (; i + 8 <= i_end; i += 8) {
-                    const v_fp32x8 x8 = load_fp32x8(x_ptr + i);
-                    const v_fp32x8 s8 = load_fp32x8(s_ptr + i);
-                    const v_fp32x8 b8 = load_fp32x8(b_ptr + i);
-                    const v_fp32x8 m8 = load_fp32x8(m_ptr + i);
-                    const v_fp32x8 v8 = load_fp32x8(v_ptr + i);
+                    const v_f32x8 x8 = v_load_f32x8(x_ptr + i);
+                    const v_f32x8 s8 = v_load_f32x8(s_ptr + i);
+                    const v_f32x8 b8 = v_load_f32x8(b_ptr + i);
+                    const v_f32x8 m8 = v_load_f32x8(m_ptr + i);
+                    const v_f32x8 v8 = v_load_f32x8(v_ptr + i);
 
-                    const v_fp32x8 inv_std = div(one8, sqrt(add(v8, eps8)));
-                    const v_fp32x8 ns = mul(inv_std, s8);
-                    const v_fp32x8 nb = sub(b8, mul(m8, ns));
-                    store(y_ptr + i, fmadd(ns, x8, nb));
+                    const v_f32x8 inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
+                    const v_f32x8 ns = v_mul(inv_std, s8);
+                    const v_f32x8 nb = v_sub(b8, v_mul(m8, ns));
+                    v_store(y_ptr + i, v_fmadd(ns, x8, nb));
                 }
 
                 // 4-wide tail
                 for (; i + 4 <= i_end; i += 4) {
-                    const v_fp32x4 x4 = load_fp32x4(x_ptr + i);
-                    const v_fp32x4 s4 = load_fp32x4(s_ptr + i);
-                    const v_fp32x4 b4 = load_fp32x4(b_ptr + i);
-                    const v_fp32x4 m4 = load_fp32x4(m_ptr + i);
-                    const v_fp32x4 v4 = load_fp32x4(v_ptr + i);
+                    const v_f32x4 x4 = v_load_f32x4(x_ptr + i);
+                    const v_f32x4 s4 = v_load_f32x4(s_ptr + i);
+                    const v_f32x4 b4 = v_load_f32x4(b_ptr + i);
+                    const v_f32x4 m4 = v_load_f32x4(m_ptr + i);
+                    const v_f32x4 v4 = v_load_f32x4(v_ptr + i);
 
-                    const v_fp32x4 inv_std = div(one4, sqrt(add(v4, eps4)));
-                    const v_fp32x4 ns = mul(inv_std, s4);
-                    const v_fp32x4 nb = sub(b4, mul(m4, ns));
-                    store(y_ptr + i, fmadd(ns, x4, nb));
+                    const v_f32x4 inv_std = v_div(one4, v_sqrt(v_add(v4, eps4)));
+                    const v_f32x4 ns = v_mul(inv_std, s4);
+                    const v_f32x4 nb = v_sub(b4, v_mul(m4, ns));
+                    v_store(y_ptr + i, v_fmadd(ns, x4, nb));
                 }
 
                 // Scalar tail
