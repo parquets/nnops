@@ -85,7 +85,7 @@ void activation(const TensorView& input,
                 const ActivationAttributes& attrs,
                 const ComputeContext& ctx)
 {
-    auto op = Activation::create(attrs, Backend::CPU);
+    auto op = Activation::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input};
     op->compute(output, ins, ctx, nullptr);
 }

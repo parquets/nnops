@@ -85,7 +85,7 @@ void pooling(const TensorView& input,
              const PoolingAttributes& attrs,
              const ComputeContext& ctx)
 {
-    auto op = Pooling::create(attrs, Backend::CPU);
+    auto op = Pooling::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input};
     op->compute(output, ins, ctx, nullptr);
 }

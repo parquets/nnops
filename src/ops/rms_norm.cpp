@@ -79,7 +79,7 @@ void rms_norm(const TensorView& x,
               const RMSNormAttributes& attrs,
               const ComputeContext& ctx)
 {
-    auto op = RMSNorm::create(attrs, Backend::CPU);
+    auto op = RMSNorm::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {x, scale};
     op->compute(output, ins, ctx, nullptr);
 }

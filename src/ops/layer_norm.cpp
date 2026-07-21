@@ -80,7 +80,7 @@ void layer_norm(const TensorView& x,
                 const LayerNormAttributes& attrs,
                 const ComputeContext& ctx)
 {
-    auto op = LayerNorm::create(attrs, Backend::CPU);
+    auto op = LayerNorm::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {x, scale};
     op->compute(output, ins, ctx, nullptr);
 }
@@ -93,7 +93,7 @@ void layer_norm(const TensorView& x,
                 const LayerNormAttributes& attrs,
                 const ComputeContext& ctx)
 {
-    auto op = LayerNorm::create(attrs, Backend::CPU);
+    auto op = LayerNorm::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {x, scale, bias};
     op->compute(output, ins, ctx, nullptr);
 }

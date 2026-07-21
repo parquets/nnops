@@ -79,7 +79,7 @@ void matmul(const TensorView& a,
             const MatMulAttributes& attrs,
             const ComputeContext& ctx)
 {
-    auto op = MatMul::create(attrs, Backend::CPU);
+    auto op = MatMul::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {a, b};
     op->compute(c, ins, ctx, nullptr);
 }

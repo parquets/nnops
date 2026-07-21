@@ -93,7 +93,7 @@ void batch_norm(const TensorView& x,
                 const BatchNormAttributes& attrs,
                 const ComputeContext& ctx)
 {
-    auto op = BatchNorm::create(attrs, Backend::CPU);
+    auto op = BatchNorm::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {x, scale, bias, mean, var};
     op->compute(output, ins, ctx, nullptr);
 }

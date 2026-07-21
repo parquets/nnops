@@ -103,7 +103,7 @@ void conv2d(const TensorView& input,
             const ComputeContext& ctx,
             void* workspace)
 {
-    auto op = Conv2D::create(attrs, Backend::CPU);
+    auto op = Conv2D::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input, weight};
     op->compute(output, ins, ctx, workspace);
 }
@@ -116,7 +116,7 @@ void conv2d(const TensorView& input,
             const ComputeContext& ctx,
             void* workspace)
 {
-    auto op = Conv2D::create(attrs, Backend::CPU);
+    auto op = Conv2D::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input, weight, bias};
     op->compute(output, ins, ctx, workspace);
 }

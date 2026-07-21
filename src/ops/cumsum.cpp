@@ -77,7 +77,7 @@ void cumsum(const TensorView& input,
             const CumSumAttributes& attrs,
             const ComputeContext& ctx)
 {
-    auto op = CumSum::create(attrs, Backend::CPU);
+    auto op = CumSum::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input};
     op->compute(output, ins, ctx, nullptr);
 }

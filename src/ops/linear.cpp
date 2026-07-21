@@ -79,7 +79,7 @@ void linear(const TensorView& input,
             const TensorView& output,
             const ComputeContext& ctx)
 {
-    auto op = Linear::create({}, Backend::CPU);
+    auto op = Linear::create({}, ctx.expected_backend);
     const TensorView ins[] = {input, weight};
     op->compute(output, ins, ctx, nullptr);
 }
@@ -90,7 +90,7 @@ void linear(const TensorView& input,
             const TensorView& output,
             const ComputeContext& ctx)
 {
-    auto op = Linear::create({}, Backend::CPU);
+    auto op = Linear::create({}, ctx.expected_backend);
     const TensorView ins[] = {input, weight, bias};
     op->compute(output, ins, ctx, nullptr);
 }
@@ -102,7 +102,7 @@ void linear(const TensorView& input,
             const LinearAttributes& attrs,
             const ComputeContext& ctx)
 {
-    auto op = Linear::create(attrs, Backend::CPU);
+    auto op = Linear::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input, weight};
     op->compute(output, ins, ctx, nullptr);
 }
@@ -114,7 +114,7 @@ void linear(const TensorView& input,
             const LinearAttributes& attrs,
             const ComputeContext& ctx)
 {
-    auto op = Linear::create(attrs, Backend::CPU);
+    auto op = Linear::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input, weight, bias};
     op->compute(output, ins, ctx, nullptr);
 }

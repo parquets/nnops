@@ -93,7 +93,7 @@ void attention(const TensorView& query,
                const ComputeContext& ctx,
                void* workspace)
 {
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = Attention::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {query, key, value};
     op->compute(output, ins, ctx, workspace);
 }
@@ -108,7 +108,7 @@ void attention(const TensorView& query,
                const ComputeContext& ctx,
                void* workspace)
 {
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = Attention::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {query, key, value, mask};
     op->compute(output, ins, ctx, workspace);
 }

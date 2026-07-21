@@ -77,7 +77,7 @@ void softmax(const TensorView& input,
              const SoftmaxAttributes& attrs,
              const ComputeContext& ctx)
 {
-    auto op = Softmax::create(attrs, Backend::CPU);
+    auto op = Softmax::create(attrs, ctx.expected_backend);
     const TensorView ins[] = {input};
     op->compute(output, ins, ctx, nullptr);
 }
