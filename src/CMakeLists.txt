@@ -40,6 +40,7 @@ set(NNOPS_CPU_SOURCES
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})
+target_include_directories(nnops_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ---- CUDA backend (optional) ----
 if(NNOPS_BUILD_CUDA)
