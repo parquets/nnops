@@ -6,6 +6,14 @@
 
 namespace nnops {
 
+namespace backend::cpu {
+    void activation_cpu(const ActivationAttributes& attrs,
+                         const TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx,
+                         void* workspace);
+}
+
 namespace backend::cpu::reference {
     void activation_ref(const ActivationAttributes& attrs,
                         const TensorView& output,
@@ -31,7 +39,7 @@ auto resolve_activation_kernel(Backend backend) -> Activation::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::activation_ref;
+        return backend::cpu::activation_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;

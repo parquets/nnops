@@ -23,6 +23,7 @@ set(NNOPS_CPU_SOURCES
     detail/cpu_features.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
+    backend/cpu/activation.cpp
     backend/cpu/batch_norm.cpp
     backend/cpu/depthwise_conv2d.cpp
     backend/cpu/pooling.cpp
