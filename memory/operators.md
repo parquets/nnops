@@ -43,10 +43,15 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## Activation
 
-- **Files:** `include/nnops/ops/activation.hpp`, `src/ops/activation.cpp`, `src/backend/cpu/reference/activation_ref.cpp`
+- **Files:** `include/nnops/ops/activation.hpp`, `src/ops/activation.cpp`, `src/backend/cpu/activation.cpp`, `src/backend/cpu/reference/activation_ref.cpp`
 - **Types:** Relu, LeakyRelu, Sigmoid, Tanh, Gelu, Silu, HardSwish, Elu
 - **Attributes:** `ActivationAttributes` — type, alpha, beta
-- **Pattern:** Element-wise functor dispatched via `switch(ActivationType)`, parallel_for over flat range
+- **SIMD Kernel** (`src/backend/cpu/activation.cpp`): 8-wide SIMD (v_f32x8) + scalar tail，v_f32x4 已删除以简化代码。8 种激活函数全部向量化。
+- **Design Decisions:**
+  1. 无需 blend/select — 所有条件分支通过 v_max/v_min 分解消除：LeakyRelu = `max(x,0) + α*min(x,0)`，ELU = `max(x,0) + α*(exp(min(x,0))-1)`，Relu = `max(x,0)`
+  2. 8-wide SIMD → scalar tail，无需 4-wide 中间阶段（AVX2 原生 256-bit，SSE 模拟为两个 __m128）
+  3. add_to 支持：load + accumulate + store 替代 plain store
+- **Dispatch:** `Backend::CPU` → `activation_cpu`（SIMD 优化），reference 保留用于正确性基线
 - **Note:** Standalone operator — distinct from [[#Epilogue (Core Type)]] which fuses activation into Conv/MatMul output write-back.
 
 ## Pooling
