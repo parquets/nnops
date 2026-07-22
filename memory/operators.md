@@ -60,8 +60,8 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Types:** Max, Average, AverageExcludePad, Lp
 - **Attributes:** `PoolingAttributes` — `std::array<int64_t, 3>` for kernel/stride/padding/dilation (layout: `[KD, KH, KW]`), `p_norm`, `auto_pad`, `add_to`
 - **Input:** 2D `[N, C, IH, IW]` or 3D `[N, C, ID, IH, IW]`
-- **CPU Reference:** Triple-nested (2D) / quadruple-nested (3D) loop per output position, with full bounds checking per kernel element. All 4 pool types supported.
-- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_f32x8 SIMD over output width dimension. Design combines best practices from nn_compute (pre-positioned pointers, trust boundary — no per-element bounds checks in SIMD kernels, region splitting) and onnxruntime MLAS (two-phase reduction noted for future).
+- **CPU Reference:** Triple-nested (2D) / quadruple-nested (3D) loop per output position, with full bounds checking per kernel element. All 4 pool types supported. N*C parallel dispatch (per sample+channel tasks) for better thread utilization.
+- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_f32x8 SIMD over output width dimension. N*C parallel dispatch. Design combines best practices from nn_compute (pre-positioned pointers, trust boundary — no per-element bounds checks in SIMD kernels, region splitting) and onnxruntime MLAS (two-phase reduction noted for future).
   - **Pre-positioned pointer passing** (nn_compute pattern): Caller pre-positions input+output pointers to (id, ih, iw_start), SIMD kernels use only relative offsets — eliminates positional computation bugs (depth-off-by-oh_start, ow_start-vs-ow confusion).
   - **Trust boundary**: SIMD kernels called only for interior valid region (od/oh/ow within `[beg, end)` where every kernel element maps to valid input). No per-element `vd0`/`vh0` validity checks inside SIMD kernels.
   - **Region splitting**: pad-depth front/back → scalar, pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder).
@@ -134,7 +134,7 @@ Not an operator per se, but the low-level building block for future optimized Ma
 
 **Shared utilities:**
 - `src/backend/cpu/common/restrict.hpp` — cross-platform `NNOPS_RESTRICT` macro (MSVC `__restrict`, GCC/Clang `__restrict__`)
-- `src/backend/cpu/common/half.hpp` — `half` struct (uint16_t storage) + `half_to_float`/`float_to_half` converters for x86_64 fp16 kernels
+- `include/nnops/detail/half.hpp` — `half` struct (uint16_t storage) + `half_to_float`/`float_to_half` converters for x86_64 fp16 kernels
 
 **Porting reference:** `D:\vscode\nn_compute` — all 10 kernel files ported with modern C++ improvements (noexcept, constexpr, lambda helpers, Doxygen). See [[reference-projects]].
 
@@ -147,10 +147,10 @@ Not an operator per se, but the low-level building block for future optimized Ma
 - **Input:** `[N, C, IH, IW]`, weight `[C, 1, KH, KW]`, optional bias `[C]`
 - **Output:** `[N, C, OH, OW]` (same channels as input — no channel change in depthwise)
 - **Formula:** Each channel is convolved independently with its own KH×KW filter — no cross-channel mixing
-- **CPU Reference:** 6-level nested loop (N, C, OH, OW, KH, KW), per-sample parallel via `parallel_for`; pad handling via bounds check
-- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide v_f32x8 SIMD over output W dimension. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder). Design informed by nn_compute (height blocking + region dispatch) and onnxruntime MLAS (3×3 depthwise kernel specialization, edge handling).
+- **CPU Reference:** 5-level nested loop (OH, OW, KH, KW), N*C parallel via `parallel_for` (per sample+channel tasks); pad handling via bounds check. Supports fp32 and fp16 (weight/bias dtype matches input dtype).
+- **CPU SIMD:** Height-4 blocking (process 4 output rows simultaneously) + 8-wide SIMD (v_f32x8/v_f16x8) over output W dimension. N*C parallel dispatch. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar, interior → SIMD (h4 for aligned blocks, h1 for remainder). Supports fp32 and fp16 data types (all tensors match input dtype). Design informed by nn_compute (height blocking + region dispatch) and onnxruntime MLAS (3×3 depthwise kernel specialization, edge handling).
 - **SIMD gating:** Only active when stride_w == 1 (contiguous input reads); stride > 1 falls back to scalar path automatically.
-- **Added:** 2026-07-21
+- **Added:** 2026-07-21. fp16 support (including weight/bias) added 2026-07-22.
 
 ## add_to (Output Accumulation)
 

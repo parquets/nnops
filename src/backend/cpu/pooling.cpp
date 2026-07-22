@@ -24,9 +24,10 @@
 ///   5. AverageExcludePad and Lp pooling: scalar-only (per-element counting needed)
 ///   6. Unified 2D/3D code path: KD=1/SD=1/DD=1/PD=0/ID=1/OD=1 for 2D
 ///   7. add_to support: branch-hoisted; one extra load per v_store when enabled
-///   8. Per-sample parallel dispatch via parallel_for
+///   8. Per-(sample,channel) parallel dispatch via parallel_for (N*C tasks)
 
 #include "nnops/ops/pooling.hpp"
+#include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
@@ -39,7 +40,6 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 namespace {
-
 // ============================================================
 // Unified scalar row processor (all pool types, 2D + 3D, pad + interior)
 // ============================================================
@@ -48,9 +48,11 @@ namespace {
 /// Handles all 4 pool types with full 3D bounds checking.
 /// Called for: pad-depth regions, pad-height regions, pad-width edges,
 ///             non-SIMD types (AvgExcludePad, Lp), and stride_w != 1 fallback.
+/// Templated on T (float for f32, half for f16).
+template <typename T>
 inline void pooling_scalar_row(
-    float* output,          // output row pointer: out_d + oh * out_row_stride
-    const float* input,     // channel base pointer: in_ch
+    T* output,              // output row pointer: out_d + oh * out_row_stride
+    const T* input,         // channel base pointer: in_ch
     int64_t ID, int64_t IH, int64_t IW,
     int64_t od, int64_t oh,
     int64_t ow_start, int64_t ow_end,
@@ -79,7 +81,7 @@ inline void pooling_scalar_row(
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         const int64_t iw = ow * SW + kw * DW - PW;
                         if (iw < 0 || iw >= IW) continue;
-                        const float val = input[id * in_d_stride + ih * in_row_stride + iw];
+                        const float val = s_load(&input[id * in_d_stride + ih * in_row_stride + iw]);
                         if (val > max_val) max_val = val;
                         any = true;
                     }
@@ -106,7 +108,7 @@ inline void pooling_scalar_row(
                             ++pad_count;
                             continue;
                         }
-                        sum += input[id * in_d_stride + ih * in_row_stride + iw];
+                        sum += s_load(&input[id * in_d_stride + ih * in_row_stride + iw]);
                     }
                 }
             }
@@ -133,7 +135,7 @@ inline void pooling_scalar_row(
                         const int64_t iw = ow * SW + kw * DW - PW;
                         if (iw < 0 || iw >= IW) continue;
                         sum += std::pow(
-                            std::abs(input[id * in_d_stride + ih * in_row_stride + iw]), fp);
+                            std::abs(s_load(&input[id * in_d_stride + ih * in_row_stride + iw])), fp);
                     }
                 }
             }
@@ -144,7 +146,11 @@ inline void pooling_scalar_row(
 
         // Write back
         const int64_t out_idx = ow * out_w_stride;
-        output[out_idx] = add_to ? output[out_idx] + result : result;
+        if (add_to) {
+            s_store(&output[out_idx], s_load(&output[out_idx]) + result);
+        } else {
+            s_store(&output[out_idx], result);
+        }
     }
 }
 
@@ -164,27 +170,29 @@ inline void pooling_scalar_row(
 //   Height: (r * SH + kh * DH) * in_row_stride    (r = 0..3 for h4, 0 for h1)
 //   Width:  (ow - ow_start) + kw * DW           (SW == 1, in_w_stride == 1, ow loops)
 
-/// Process 4 output rows × up to `ow_simd_count * 8` output columns with element-wise v_max.
+/// Process 4 output rows × ow_count output columns with element-wise v_max.
+/// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
 /// Called only for interior valid region (SW == 1 required).
+template <typename T>
 inline void maxpool_h4_simd(
-    float* output, const float* input,
+    T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
-    int64_t ow_simd_count,
+    int64_t ow_count,
     int64_t out_row_stride, int64_t out_w_stride,
     int64_t in_d_stride, int64_t in_row_stride,
     bool add_to)
 {
+
     constexpr float neg_inf = -std::numeric_limits<float>::infinity();
+    const auto vinit = v_set1(input, neg_inf);
 
-    for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
-        const int64_t w_off = blk * 8;  // relative width offset from ow_start
-
-        v_f32x8 vacc0 = v_set1_f32x8(neg_inf);
-        v_f32x8 vacc1 = v_set1_f32x8(neg_inf);
-        v_f32x8 vacc2 = v_set1_f32x8(neg_inf);
-        v_f32x8 vacc3 = v_set1_f32x8(neg_inf);
+    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+        auto vacc0 = vinit;
+        auto vacc1 = vinit;
+        auto vacc2 = vinit;
+        auto vacc3 = vinit;
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
@@ -194,26 +202,25 @@ inline void maxpool_h4_simd(
                 const int64_t h_off2 = (2 * SH + kh * DH) * in_row_stride;
                 const int64_t h_off3 = (3 * SH + kh * DH) * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = w_off + kw * DW;
-                    vacc0 = v_max(vacc0, v_load_f32x8(input + d_off + h_off0 + kw_off));
-                    vacc1 = v_max(vacc1, v_load_f32x8(input + d_off + h_off1 + kw_off));
-                    vacc2 = v_max(vacc2, v_load_f32x8(input + d_off + h_off2 + kw_off));
-                    vacc3 = v_max(vacc3, v_load_f32x8(input + d_off + h_off3 + kw_off));
+                    const int64_t kw_off = ow + kw * DW;
+                    vacc0 = v_max(vacc0, v_load(input + d_off + h_off0 + kw_off));
+                    vacc1 = v_max(vacc1, v_load(input + d_off + h_off1 + kw_off));
+                    vacc2 = v_max(vacc2, v_load(input + d_off + h_off2 + kw_off));
+                    vacc3 = v_max(vacc3, v_load(input + d_off + h_off3 + kw_off));
                 }
             }
         }
 
-        // Write back
-        float* out0 = output + 0 * out_row_stride + w_off * out_w_stride;
-        float* out1 = output + 1 * out_row_stride + w_off * out_w_stride;
-        float* out2 = output + 2 * out_row_stride + w_off * out_w_stride;
-        float* out3 = output + 3 * out_row_stride + w_off * out_w_stride;
+        T* out0 = output + 0 * out_row_stride + ow * out_w_stride;
+        T* out1 = output + 1 * out_row_stride + ow * out_w_stride;
+        T* out2 = output + 2 * out_row_stride + ow * out_w_stride;
+        T* out3 = output + 3 * out_row_stride + ow * out_w_stride;
 
         if (add_to) {
-            vacc0 = v_add(vacc0, v_load_f32x8(out0));
-            vacc1 = v_add(vacc1, v_load_f32x8(out1));
-            vacc2 = v_add(vacc2, v_load_f32x8(out2));
-            vacc3 = v_add(vacc3, v_load_f32x8(out3));
+            vacc0 = v_add(vacc0, v_load(out0));
+            vacc1 = v_add(vacc1, v_load(out1));
+            vacc2 = v_add(vacc2, v_load(out2));
+            vacc3 = v_add(vacc3, v_load(out3));
         }
 
         v_store(out0, vacc0);
@@ -223,39 +230,42 @@ inline void maxpool_h4_simd(
     }
 }
 
-/// Process 1 output row × up to `ow_simd_count * 8` output columns with element-wise v_max.
+/// Process 1 output row × ow_count output columns with element-wise v_max.
+/// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
 /// Called only for interior valid region (SW == 1 required).
+template <typename T>
 inline void maxpool_h1_simd(
-    float* output, const float* input,
+    T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
-    int64_t ow_simd_count,
+    int64_t ow_count,
     int64_t out_row_stride, int64_t out_w_stride,
     int64_t in_d_stride, int64_t in_row_stride,
     bool add_to)
 {
-    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
 
-    for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
-        const int64_t w_off = blk * 8;
-        v_f32x8 vacc = v_set1_f32x8(neg_inf);
+    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
+    const auto vinit = v_set1(input, neg_inf);
+
+    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+        auto vacc = vinit;
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 const int64_t h_off = kh * DH * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = w_off + kw * DW;
-                    vacc = v_max(vacc, v_load_f32x8(input + d_off + h_off + kw_off));
+                    const int64_t kw_off = ow + kw * DW;
+                    vacc = v_max(vacc, v_load(input + d_off + h_off + kw_off));
                 }
             }
         }
 
-        float* out_r = output + w_off * out_w_stride;
+        T* out_r = output + ow * out_w_stride;
 
         if (add_to) {
-            vacc = v_add(vacc, v_load_f32x8(out_r));
+            vacc = v_add(vacc, v_load(out_r));
         }
 
         v_store(out_r, vacc);
@@ -266,27 +276,29 @@ inline void maxpool_h1_simd(
 // AvgPooling SIMD kernels (Average — includes padding in denominator)
 // ============================================================
 
-/// Process 4 output rows × 8 output columns with FMA accumulation + scale by 1/kernel_area.
+/// Process 4 output rows × ow_count output columns with FMA accumulation + scale by 1/kernel_area.
+/// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
 /// Called only for interior valid region (SW == 1 required).
+template <typename T>
 inline void avgpool_h4_simd(
-    float* output, const float* input,
+    T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
-    int64_t ow_simd_count,
+    int64_t ow_count,
     int64_t out_row_stride, int64_t out_w_stride,
     int64_t in_d_stride, int64_t in_row_stride,
     float scale, bool add_to)
 {
-    const v_f32x8 vscale = v_set1_f32x8(scale);
 
-    for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
-        const int64_t w_off = blk * 8;
+    const auto vscale = v_set1(input, scale);
+    const auto vzero = v_set1(input, 0.0f);
 
-        v_f32x8 vacc0 = v_zero_f32x8();
-        v_f32x8 vacc1 = v_zero_f32x8();
-        v_f32x8 vacc2 = v_zero_f32x8();
-        v_f32x8 vacc3 = v_zero_f32x8();
+    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+        auto vacc0 = vzero;
+        auto vacc1 = vzero;
+        auto vacc2 = vzero;
+        auto vacc3 = vzero;
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
@@ -296,25 +308,25 @@ inline void avgpool_h4_simd(
                 const int64_t h_off2 = (2 * SH + kh * DH) * in_row_stride;
                 const int64_t h_off3 = (3 * SH + kh * DH) * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = w_off + kw * DW;
-                    vacc0 = v_fmadd(v_load_f32x8(input + d_off + h_off0 + kw_off), vscale, vacc0);
-                    vacc1 = v_fmadd(v_load_f32x8(input + d_off + h_off1 + kw_off), vscale, vacc1);
-                    vacc2 = v_fmadd(v_load_f32x8(input + d_off + h_off2 + kw_off), vscale, vacc2);
-                    vacc3 = v_fmadd(v_load_f32x8(input + d_off + h_off3 + kw_off), vscale, vacc3);
+                    const int64_t kw_off = ow + kw * DW;
+                    vacc0 = v_fmadd(v_load(input + d_off + h_off0 + kw_off), vscale, vacc0);
+                    vacc1 = v_fmadd(v_load(input + d_off + h_off1 + kw_off), vscale, vacc1);
+                    vacc2 = v_fmadd(v_load(input + d_off + h_off2 + kw_off), vscale, vacc2);
+                    vacc3 = v_fmadd(v_load(input + d_off + h_off3 + kw_off), vscale, vacc3);
                 }
             }
         }
 
-        float* out0 = output + 0 * out_row_stride + w_off * out_w_stride;
-        float* out1 = output + 1 * out_row_stride + w_off * out_w_stride;
-        float* out2 = output + 2 * out_row_stride + w_off * out_w_stride;
-        float* out3 = output + 3 * out_row_stride + w_off * out_w_stride;
+        T* out0 = output + 0 * out_row_stride + ow * out_w_stride;
+        T* out1 = output + 1 * out_row_stride + ow * out_w_stride;
+        T* out2 = output + 2 * out_row_stride + ow * out_w_stride;
+        T* out3 = output + 3 * out_row_stride + ow * out_w_stride;
 
         if (add_to) {
-            vacc0 = v_add(vacc0, v_load_f32x8(out0));
-            vacc1 = v_add(vacc1, v_load_f32x8(out1));
-            vacc2 = v_add(vacc2, v_load_f32x8(out2));
-            vacc3 = v_add(vacc3, v_load_f32x8(out3));
+            vacc0 = v_add(vacc0, v_load(out0));
+            vacc1 = v_add(vacc1, v_load(out1));
+            vacc2 = v_add(vacc2, v_load(out2));
+            vacc3 = v_add(vacc3, v_load(out3));
         }
 
         v_store(out0, vacc0);
@@ -324,39 +336,42 @@ inline void avgpool_h4_simd(
     }
 }
 
-/// Process 1 output row × 8 output columns with FMA accumulation + scale.
+/// Process 1 output row × ow_count output columns with FMA accumulation + scale.
+/// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
 /// Called only for interior valid region (SW == 1 required).
+template <typename T>
 inline void avgpool_h1_simd(
-    float* output, const float* input,
+    T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
-    int64_t ow_simd_count,
+    int64_t ow_count,
     int64_t out_row_stride, int64_t out_w_stride,
     int64_t in_d_stride, int64_t in_row_stride,
     float scale, bool add_to)
 {
-    const v_f32x8 vscale = v_set1_f32x8(scale);
 
-    for (int64_t blk = 0; blk < ow_simd_count; ++blk) {
-        const int64_t w_off = blk * 8;
-        v_f32x8 vacc = v_zero_f32x8();
+    const auto vscale = v_set1(input, scale);
+    const auto vzero = v_set1(input, 0.0f);
+
+    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+        auto vacc = vzero;
 
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 const int64_t h_off = kh * DH * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = w_off + kw * DW;
-                    vacc = v_fmadd(v_load_f32x8(input + d_off + h_off + kw_off), vscale, vacc);
+                    const int64_t kw_off = ow + kw * DW;
+                    vacc = v_fmadd(v_load(input + d_off + h_off + kw_off), vscale, vacc);
                 }
             }
         }
 
-        float* out_r = output + w_off * out_w_stride;
+        T* out_r = output + ow * out_w_stride;
 
         if (add_to) {
-            vacc = v_add(vacc, v_load_f32x8(out_r));
+            vacc = v_add(vacc, v_load(out_r));
         }
 
         v_store(out_r, vacc);
@@ -366,14 +381,14 @@ inline void avgpool_h1_simd(
 }  // anonymous namespace
 
 // ============================================================
-// Main entry point
+// Main pooling implementation (templated on data type T)
 // ============================================================
 
-void pooling_cpu(const PoolingAttributes& attrs,
+template <typename T>
+void pooling_impl(const PoolingAttributes& attrs,
                   const TensorView& output,
                   std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* /*workspace*/)
+                  const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
@@ -394,7 +409,6 @@ void pooling_cpu(const PoolingAttributes& attrs,
     const int64_t OW = output.shape(srank + 1);
 
     // ----- Kernel / stride / padding / dilation -----
-    // Layout [KD, KH, KW]; KH always at [1], KW always at [2].
     const int64_t KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
     const int64_t KH = attrs.kernel_shape[1];
     const int64_t KW = attrs.kernel_shape[2];
@@ -411,8 +425,8 @@ void pooling_cpu(const PoolingAttributes& attrs,
     const int64_t PH = attrs.padding[1];
     const int64_t PW = attrs.padding[2];
 
-    auto* out_ptr = output.data_as<float>();
-    const auto* in_ptr = input.data_as<float>();
+    auto* out_ptr = output.data_as<T>();
+    const auto* in_ptr = input.data_as<T>();
 
     // ----- Strides derived from pitch (row pitch in bytes → element stride) -----
     const int64_t in_row_stride   = input.row_stride_elems();   // elements per input row (>= IW)
@@ -485,196 +499,184 @@ void pooling_cpu(const PoolingAttributes& attrs,
     // AvgPool scale (pre-computed for SIMD kernel)
     const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
 
-    // ----- Per-sample compute lambda -----
-    const auto compute_sample = [&](int64_t n) {
-        for (int64_t c = 0; c < C; ++c) {
-            const float* in_ch  = in_ptr + n * C * in_ch_stride + c * in_ch_stride;
-            float* out_ch = out_ptr + n * C * out_ch_stride + c * out_ch_stride;
+    // ----- Per-channel compute lambda (N*C parallel) -----
+    const auto compute_channel = [&](int64_t n, int64_t c) {
+        const T* in_ch  = in_ptr + n * C * in_ch_stride + c * in_ch_stride;
+        T* out_ch = out_ptr + n * C * out_ch_stride + c * out_ch_stride;
 
-            // ================================================
-            // Pad-Depth Front (3D only; empty for 2D)
-            // ================================================
-            for (int64_t od = 0; od < od_beg_c; ++od) {
-                float* out_d = out_ch + od * out_d_stride;
-                for (int64_t oh = 0; oh < OH; ++oh) {
-                    pooling_scalar_row(
-                        out_d + oh * out_row_stride, in_ch,
-                        ID, IH, IW, od, oh, 0, OW,
-                        KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_row_stride,
-                        attrs.type, attrs.add_to, attrs.p_norm);
-                }
+        // ================================================
+        // Pad-Depth Front (3D only; empty for 2D)
+        // ================================================
+        for (int64_t od = 0; od < od_beg_c; ++od) {
+            T* out_d = out_ch + od * out_d_stride;
+            for (int64_t oh = 0; oh < OH; ++oh) {
+                pooling_scalar_row(
+                    out_d + oh * out_row_stride, in_ch,
+                    ID, IH, IW, od, oh, 0, OW,
+                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                    out_w_stride, in_d_stride, in_row_stride,
+                    attrs.type, attrs.add_to, attrs.p_norm);
+            }
+        }
+
+        // ================================================
+        // Interior Depth (SIMD-eligible for Max/Avg with SW==1)
+        // ================================================
+        for (int64_t od = od_beg_c; od < od_end_c; ++od) {
+            T* out_d = out_ch + od * out_d_stride;
+
+            // Base depth position in input (valid in interior region)
+            const int64_t id_base = od * SD - PD;
+
+            // ---- Pad-Top (scalar) ----
+            for (int64_t oh = 0; oh < oh_beg_c; ++oh) {
+                pooling_scalar_row(
+                    out_d + oh * out_row_stride, in_ch,
+                    ID, IH, IW, od, oh, 0, OW,
+                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                    out_w_stride, in_d_stride, in_row_stride,
+                    attrs.type, attrs.add_to, attrs.p_norm);
             }
 
-            // ================================================
-            // Interior Depth (SIMD-eligible for Max/Avg with SW==1)
-            // ================================================
-            for (int64_t od = od_beg_c; od < od_end_c; ++od) {
-                float* out_d = out_ch + od * out_d_stride;
+            // ---- Interior Height ----
+            if (use_simd) {
+                // --- h4 blocks (4 rows at a time) ---
+                int64_t oh = oh_beg_c;
+                for (; oh + 3 < oh_end_c; oh += 4) {
+                    const int64_t ih_base = oh * SH - PH;  // valid in interior
 
-                // Base depth position in input (valid in interior region)
-                const int64_t id_base = od * SD - PD;
+                    // Pad-left (per-row scalar)
+                    if (ow_beg_c > 0) {
+                        for (int64_t r = 0; r < 4; ++r) {
+                            pooling_scalar_row(
+                                out_d + (oh + r) * out_row_stride, in_ch,
+                                ID, IH, IW, od, oh + r, 0, ow_beg_c,
+                                KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                                out_w_stride, in_d_stride, in_row_stride,
+                                attrs.type, attrs.add_to, attrs.p_norm);
+                        }
+                    }
 
-                // ---- Pad-Top (scalar) ----
-                for (int64_t oh = 0; oh < oh_beg_c; ++oh) {
-                    pooling_scalar_row(
-                        out_d + oh * out_row_stride, in_ch,
-                        ID, IH, IW, od, oh, 0, OW,
-                        KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_row_stride,
-                        attrs.type, attrs.add_to, attrs.p_norm);
+                    // SIMD h4 interior (8-wide blocks)
+                    const int64_t ow_simd_elems = ow_simd_end - ow_simd_beg;
+                    if (ow_simd_elems > 0) {
+                        T* out_simd = out_d + oh * out_row_stride
+                                    + ow_simd_beg * out_w_stride;
+                        const T* in_simd = in_ch
+                            + id_base * in_d_stride
+                            + ih_base * in_row_stride
+                            + (ow_simd_beg - PW);
+
+                        if (attrs.type == PoolingType::Max) {
+                            maxpool_h4_simd(out_simd, in_simd,
+                                            KD, KH, KW, SH,
+                                            DD_, DH, DW,
+                                            ow_simd_elems,
+                                            out_row_stride, out_w_stride,
+                                            in_d_stride, in_row_stride,
+                                            attrs.add_to);
+                        } else {
+                            avgpool_h4_simd(out_simd, in_simd,
+                                            KD, KH, KW, SH,
+                                            DD_, DH, DW,
+                                            ow_simd_elems,
+                                            out_row_stride, out_w_stride,
+                                            in_d_stride, in_row_stride,
+                                            avg_scale, attrs.add_to);
+                        }
+                    }
+
+                    // SIMD tail (interior columns not 8-aligned)
+                    if (ow_simd_end < ow_end_c) {
+                        for (int64_t r = 0; r < 4; ++r) {
+                            pooling_scalar_row(
+                                out_d + (oh + r) * out_row_stride, in_ch,
+                                ID, IH, IW, od, oh + r, ow_simd_end, ow_end_c,
+                                KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                                out_w_stride, in_d_stride, in_row_stride,
+                                attrs.type, attrs.add_to, attrs.p_norm);
+                        }
+                    }
+
+                    // Pad-right (per-row scalar)
+                    if (ow_end_c < OW) {
+                        for (int64_t r = 0; r < 4; ++r) {
+                            pooling_scalar_row(
+                                out_d + (oh + r) * out_row_stride, in_ch,
+                                ID, IH, IW, od, oh + r, ow_end_c, OW,
+                                KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                                out_w_stride, in_d_stride, in_row_stride,
+                                attrs.type, attrs.add_to, attrs.p_norm);
+                        }
+                    }
                 }
 
-                // ---- Interior Height ----
-                if (use_simd) {
-                    // --- h4 blocks (4 rows at a time) ---
-                    int64_t oh = oh_beg_c;
-                    for (; oh + 3 < oh_end_c; oh += 4) {
-                        const int64_t ih_base = oh * SH - PH;  // valid in interior
+                // --- h1 blocks (remaining interior rows) ---
+                for (; oh < oh_end_c; ++oh) {
+                    const int64_t ih_base = oh * SH - PH;
 
-                        // Pad-left (per-row scalar)
-                        if (ow_beg_c > 0) {
-                            for (int64_t r = 0; r < 4; ++r) {
-                                pooling_scalar_row(
-                                    out_d + (oh + r) * out_row_stride, in_ch,
-                                    ID, IH, IW, od, oh + r, 0, ow_beg_c,
-                                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                    out_w_stride, in_d_stride, in_row_stride,
-                                    attrs.type, attrs.add_to, attrs.p_norm);
-                            }
-                        }
-
-                        // SIMD h4 interior (8-wide blocks)
-                        const int64_t ow_simd_cnt = (ow_simd_end - ow_simd_beg) / 8;
-                        if (ow_simd_cnt > 0) {
-                            float* out_simd = out_d + oh * out_row_stride
-                                            + ow_simd_beg * out_w_stride;
-                            const float* in_simd = in_ch
-                                + id_base * in_d_stride
-                                + ih_base * in_row_stride
-                                + (ow_simd_beg - PW);
-
-                            if (attrs.type == PoolingType::Max) {
-                                maxpool_h4_simd(out_simd, in_simd,
-                                                KD, KH, KW, SH,
-                                                DD_, DH, DW,
-                                                ow_simd_cnt,
-                                                out_row_stride, out_w_stride,
-                                                in_d_stride, in_row_stride,
-                                                attrs.add_to);
-                            } else {
-                                avgpool_h4_simd(out_simd, in_simd,
-                                                KD, KH, KW, SH,
-                                                DD_, DH, DW,
-                                                ow_simd_cnt,
-                                                out_row_stride, out_w_stride,
-                                                in_d_stride, in_row_stride,
-                                                avg_scale, attrs.add_to);
-                            }
-                        }
-
-                        // SIMD tail (interior columns not 8-aligned)
-                        if (ow_simd_end < ow_end_c) {
-                            for (int64_t r = 0; r < 4; ++r) {
-                                pooling_scalar_row(
-                                    out_d + (oh + r) * out_row_stride, in_ch,
-                                    ID, IH, IW, od, oh + r, ow_simd_end, ow_end_c,
-                                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                    out_w_stride, in_d_stride, in_row_stride,
-                                    attrs.type, attrs.add_to, attrs.p_norm);
-                            }
-                        }
-
-                        // Pad-right (per-row scalar)
-                        if (ow_end_c < OW) {
-                            for (int64_t r = 0; r < 4; ++r) {
-                                pooling_scalar_row(
-                                    out_d + (oh + r) * out_row_stride, in_ch,
-                                    ID, IH, IW, od, oh + r, ow_end_c, OW,
-                                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                    out_w_stride, in_d_stride, in_row_stride,
-                                    attrs.type, attrs.add_to, attrs.p_norm);
-                            }
-                        }
-                    }
-
-                    // --- h1 blocks (remaining interior rows) ---
-                    for (; oh < oh_end_c; ++oh) {
-                        const int64_t ih_base = oh * SH - PH;
-
-                        // Pad-left
-                        if (ow_beg_c > 0) {
-                            pooling_scalar_row(
-                                out_d + oh * out_row_stride, in_ch,
-                                ID, IH, IW, od, oh, 0, ow_beg_c,
-                                KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                out_w_stride, in_d_stride, in_row_stride,
-                                attrs.type, attrs.add_to, attrs.p_norm);
-                        }
-
-                        // SIMD h1 interior
-                        const int64_t ow_simd_cnt = (ow_simd_end - ow_simd_beg) / 8;
-                        if (ow_simd_cnt > 0) {
-                            float* out_simd = out_d + oh * out_row_stride
-                                            + ow_simd_beg * out_w_stride;
-                            const float* in_simd = in_ch
-                                + id_base * in_d_stride
-                                + ih_base * in_row_stride
-                                + (ow_simd_beg - PW);
-
-                            if (attrs.type == PoolingType::Max) {
-                                maxpool_h1_simd(out_simd, in_simd,
-                                                KD, KH, KW, SH,
-                                                DD_, DH, DW,
-                                                ow_simd_cnt,
-                                                out_row_stride, out_w_stride,
-                                                in_d_stride, in_row_stride,
-                                                attrs.add_to);
-                            } else {
-                                avgpool_h1_simd(out_simd, in_simd,
-                                                KD, KH, KW, SH,
-                                                DD_, DH, DW,
-                                                ow_simd_cnt,
-                                                out_row_stride, out_w_stride,
-                                                in_d_stride, in_row_stride,
-                                                avg_scale, attrs.add_to);
-                            }
-                        }
-
-                        // SIMD tail
-                        if (ow_simd_end < ow_end_c) {
-                            pooling_scalar_row(
-                                out_d + oh * out_row_stride, in_ch,
-                                ID, IH, IW, od, oh, ow_simd_end, ow_end_c,
-                                KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                out_w_stride, in_d_stride, in_row_stride,
-                                attrs.type, attrs.add_to, attrs.p_norm);
-                        }
-
-                        // Pad-right
-                        if (ow_end_c < OW) {
-                            pooling_scalar_row(
-                                out_d + oh * out_row_stride, in_ch,
-                                ID, IH, IW, od, oh, ow_end_c, OW,
-                                KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                out_w_stride, in_d_stride, in_row_stride,
-                                attrs.type, attrs.add_to, attrs.p_norm);
-                        }
-                    }
-                } else {
-                    // ---- Non-SIMD interior: all-scalar fallback ----
-                    for (int64_t oh = oh_beg_c; oh < oh_end_c; ++oh) {
+                    // Pad-left
+                    if (ow_beg_c > 0) {
                         pooling_scalar_row(
                             out_d + oh * out_row_stride, in_ch,
-                            ID, IH, IW, od, oh, 0, OW,
+                            ID, IH, IW, od, oh, 0, ow_beg_c,
+                            KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                            out_w_stride, in_d_stride, in_row_stride,
+                            attrs.type, attrs.add_to, attrs.p_norm);
+                    }
+
+                    // SIMD h1 interior
+                    const int64_t ow_simd_elems = ow_simd_end - ow_simd_beg;
+                    if (ow_simd_elems > 0) {
+                        T* out_simd = out_d + oh * out_row_stride
+                                    + ow_simd_beg * out_w_stride;
+                        const T* in_simd = in_ch
+                            + id_base * in_d_stride
+                            + ih_base * in_row_stride
+                            + (ow_simd_beg - PW);
+
+                        if (attrs.type == PoolingType::Max) {
+                            maxpool_h1_simd(out_simd, in_simd,
+                                            KD, KH, KW, SH,
+                                            DD_, DH, DW,
+                                            ow_simd_elems,
+                                            out_row_stride, out_w_stride,
+                                            in_d_stride, in_row_stride,
+                                            attrs.add_to);
+                        } else {
+                            avgpool_h1_simd(out_simd, in_simd,
+                                            KD, KH, KW, SH,
+                                            DD_, DH, DW,
+                                            ow_simd_elems,
+                                            out_row_stride, out_w_stride,
+                                            in_d_stride, in_row_stride,
+                                            avg_scale, attrs.add_to);
+                        }
+                    }
+
+                    // SIMD tail
+                    if (ow_simd_end < ow_end_c) {
+                        pooling_scalar_row(
+                            out_d + oh * out_row_stride, in_ch,
+                            ID, IH, IW, od, oh, ow_simd_end, ow_end_c,
+                            KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                            out_w_stride, in_d_stride, in_row_stride,
+                            attrs.type, attrs.add_to, attrs.p_norm);
+                    }
+
+                    // Pad-right
+                    if (ow_end_c < OW) {
+                        pooling_scalar_row(
+                            out_d + oh * out_row_stride, in_ch,
+                            ID, IH, IW, od, oh, ow_end_c, OW,
                             KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
                             out_w_stride, in_d_stride, in_row_stride,
                             attrs.type, attrs.add_to, attrs.p_norm);
                     }
                 }
-
-                // ---- Pad-Bottom (scalar) ----
-                for (int64_t oh = oh_end_c; oh < OH; ++oh) {
+            } else {
+                // ---- Non-SIMD interior: all-scalar fallback ----
+                for (int64_t oh = oh_beg_c; oh < oh_end_c; ++oh) {
                     pooling_scalar_row(
                         out_d + oh * out_row_stride, in_ch,
                         ID, IH, IW, od, oh, 0, OW,
@@ -684,31 +686,71 @@ void pooling_cpu(const PoolingAttributes& attrs,
                 }
             }
 
-            // ================================================
-            // Pad-Depth Back (3D only; empty for 2D)
-            // ================================================
-            for (int64_t od = od_end_c; od < OD; ++od) {
-                float* out_d = out_ch + od * out_d_stride;
-                for (int64_t oh = 0; oh < OH; ++oh) {
-                    pooling_scalar_row(
-                        out_d + oh * out_row_stride, in_ch,
-                        ID, IH, IW, od, oh, 0, OW,
-                        KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_row_stride,
-                        attrs.type, attrs.add_to, attrs.p_norm);
-                }
+            // ---- Pad-Bottom (scalar) ----
+            for (int64_t oh = oh_end_c; oh < OH; ++oh) {
+                pooling_scalar_row(
+                    out_d + oh * out_row_stride, in_ch,
+                    ID, IH, IW, od, oh, 0, OW,
+                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                    out_w_stride, in_d_stride, in_row_stride,
+                    attrs.type, attrs.add_to, attrs.p_norm);
+            }
+        }
+
+        // ================================================
+        // Pad-Depth Back (3D only; empty for 2D)
+        // ================================================
+        for (int64_t od = od_end_c; od < OD; ++od) {
+            T* out_d = out_ch + od * out_d_stride;
+            for (int64_t oh = 0; oh < OH; ++oh) {
+                pooling_scalar_row(
+                    out_d + oh * out_row_stride, in_ch,
+                    ID, IH, IW, od, oh, 0, OW,
+                    KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
+                    out_w_stride, in_d_stride, in_row_stride,
+                    attrs.type, attrs.add_to, attrs.p_norm);
             }
         }
     };
 
-    // ----- Parallel dispatch (per batch sample) -----
+    // ----- Parallel dispatch (N*C parallel — per sample+channel) -----
+    const int64_t NC = N * C;
     if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N,
-            [&](int64_t n) { compute_sample(n); });
+        ctx.cpu_parallel_for(0, NC,
+            [&](int64_t tid) {
+                int64_t n = tid / C;
+                int64_t c = tid % C;
+                compute_channel(n, c);
+            });
     } else {
         for (int64_t n = 0; n < N; ++n) {
-            compute_sample(n);
+            for (int64_t c = 0; c < C; ++c) {
+                compute_channel(n, c);
+            }
         }
+    }
+}
+
+// ============================================================
+// Entry point with dtype dispatch
+// ============================================================
+
+void pooling_cpu(const PoolingAttributes& attrs,
+                  const TensorView& output,
+                  std::span<const TensorView> inputs,
+                  const ComputeContext& ctx,
+                  void* /*workspace*/)
+{
+    const auto dtype = inputs[0].data_type();
+    switch (dtype) {
+    case DataType::f32:
+        pooling_impl<float>(attrs, output, inputs, ctx);
+        return;
+    case DataType::f16:
+        pooling_impl<half>(attrs, output, inputs, ctx);
+        return;
+    default:
+        NNOPS_ASSERT(!"pooling_cpu: unsupported data type (only f32 and f16)");
     }
 }
 

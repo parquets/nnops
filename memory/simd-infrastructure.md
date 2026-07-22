@@ -36,19 +36,21 @@ The `NNOPS_RESTRICT` macro (`src/backend/cpu/common/restrict.hpp`) is the only s
 ## File Layout
 
 ```
-include/nnops/detail/simd/
-├── simd.hpp              — main entry point (includes cpu_features + unified wrappers)
-├── cpu_features.hpp      — runtime CPU detection (CpuFeatures singleton, CpuIsa enum)
-├── vec_f32x4.hpp         — unified 128-bit float32 vector (selects arch at compile time)
-├── vec_f32x8.hpp         — unified 256-bit float32 vector (selects arch at compile time)
-├── vec_f16x8.hpp         — unified 128-bit float16 vector (NEON FP16 or scalar)
-├── arch/
-│   ├── scalar.hpp        — pure C++ fallback (f32 + f16, correctness reference)
-│   ├── x86/
-│   │   ├── sse.hpp       — SSE4.1 backend (__m128), v_f32x8 emulated with two lanes
-│   │   └── avx2.hpp      — AVX2 + FMA3 backend (__m256), includes v_f32x4 via low 128
-│   └── arm/
-│       └── neon.hpp      — ARM NEON backend (f32 + f16, native FP16 on ARMv8.2+)
+include/nnops/detail/
+├── half.hpp              — IEEE 754 binary16 type + conversion (used by SIMD layer and GEMM)
+└── simd/
+    ├── simd.hpp              — main entry point (includes cpu_features + unified wrappers)
+    ├── cpu_features.hpp      — runtime CPU detection (CpuFeatures singleton, CpuIsa enum)
+    ├── vec_f32x4.hpp         — unified 128-bit float32 vector (selects arch at compile time)
+    ├── vec_f32x8.hpp         — unified 256-bit float32 vector (selects arch at compile time)
+    ├── vec_f16x8.hpp         — unified 128-bit float16 vector (NEON FP16 or scalar)
+    ├── arch/
+    │   ├── scalar.hpp        — pure C++ fallback (f32 + f16, correctness reference)
+    │   ├── x86/
+    │   │   ├── sse.hpp       — SSE4.1 backend (__m128), v_f32x8 emulated with two lanes
+    │   │   └── avx2.hpp      — AVX2 + FMA3 backend (__m256), includes v_f32x4 via low 128
+    │   └── arm/
+    │       └── neon.hpp      — ARM NEON backend (f32 + f16, native FP16 on ARMv8.2+)
 
 src/detail/
 └── cpu_features.cpp      — CPU detection implementation (CPUID / getauxval / Win32 API)

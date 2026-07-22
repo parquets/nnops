@@ -13,7 +13,7 @@
 
 #include <immintrin.h>
 #include <algorithm>
-#include "backend/cpu/common/half.hpp"
+#include "nnops/detail/half.hpp"
 #include "backend/cpu/common/restrict.hpp"
 
 namespace nnops::backend::cpu::x86_64 {

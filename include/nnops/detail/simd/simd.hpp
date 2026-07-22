@@ -56,6 +56,7 @@
 #include "nnops/detail/simd/vec_f32x4.hpp"
 #include "nnops/detail/simd/vec_f32x8.hpp"
 #include "nnops/detail/simd/vec_f16x8.hpp"
+#include "nnops/detail/half.hpp"
 
 /// @brief Convenience: number of elements in each vector register.
 namespace nnops {
@@ -63,5 +64,65 @@ namespace simd {
 inline constexpr int simd_len_f32x4 = 4;
 inline constexpr int simd_len_f32x8 = 8;
 inline constexpr int simd_len_f16x8 = 8;
+} // namespace simd
+} // namespace nnops
+
+// ============================================================
+// Generic load / store / broadcast / zero helpers
+//
+// Overloaded on pointer type so kernel code is type-generic:
+//   float*  → v_f32x8  (v_load_f32x8 / v_store / v_set1_f32x8 / v_zero_f32x8)
+//   half*   → v_f16x8  (v_load_f16x8 / v_store / v_set1_f16x8 / v_zero_f16x8)
+//
+// v_store is provided by each backend (float* and uint16_t*); we add a
+// half* overload that reinterpret_cast's to uint16_t* internally.
+// s_load / s_store handle scalar access with fp16↔fp32 conversion.
+//
+// Usage:
+//   using namespace nnops::simd;
+//   auto vacc = v_set1(ptr, init_val);
+//   auto vin  = v_load(ptr);
+//   auto vz   = v_zero(ptr);
+//   float s   = s_load(ptr);
+//   s_store(ptr, s);
+//   v_store(ptr, vacc);
+// ============================================================
+
+namespace nnops {
+namespace simd {
+
+using ::nnops::backend::cpu::half;
+
+// Generic vector load
+inline v_f32x8 v_load(const float* p) { return v_load_f32x8(p); }
+inline v_f16x8 v_load(const half* p) {
+    return v_load_f16x8(reinterpret_cast<const uint16_t*>(p));
+}
+
+// Generic vector broadcast (dummy first arg for overload resolution)
+inline v_f32x8 v_set1(const float*, float s) { return v_set1_f32x8(s); }
+inline v_f16x8 v_set1(const half*, float s) { return v_set1_f16x8(s); }
+
+// Generic zero vector (dummy first arg for overload resolution)
+inline v_f32x8 v_zero(const float*) { return v_zero_f32x8(); }
+inline v_f16x8 v_zero(const half*) { return v_zero_f16x8(); }
+
+// Generic vector store — backend provides float*; add half* overload
+inline void v_store(half* p, const v_f16x8& v) {
+    v_store(reinterpret_cast<uint16_t*>(p), v);
+}
+
+// Scalar load — always returns float
+inline float s_load(const float* p) { return *p; }
+inline float s_load(const half* p) {
+    return ::nnops::backend::cpu::half_to_float(*p);
+}
+
+// Scalar store — converts float to native element type
+inline void s_store(float* p, float v) { *p = v; }
+inline void s_store(half* p, float v) {
+    *p = ::nnops::backend::cpu::float_to_half(v);
+}
+
 } // namespace simd
 } // namespace nnops

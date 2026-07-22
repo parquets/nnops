@@ -9,7 +9,7 @@
 /// Reference: nn_compute/src/cpu/kernel/pack/x86_64/pack_f16.hpp
 
 #include <immintrin.h>
-#include "backend/cpu/common/half.hpp"
+#include "nnops/detail/half.hpp"
 #include "backend/cpu/common/restrict.hpp"
 #include "transpose.hpp"
 
