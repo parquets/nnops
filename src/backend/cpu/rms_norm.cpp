@@ -195,33 +195,27 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
 
         const auto v_inv_rms = v_set1(x_ptr, inv_rms);
 
-        if (add_to) {
-            for (; i + L <= norm_size; i += L) {
-                auto x = v_load(x_ptr + row_off + i);
-                auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-                // y = x * inv_rms * scale
-                auto result = v_mul(v_mul(x, v_inv_rms), vs);
-                auto existing = v_load(y_ptr + row_off + i);
-                v_store(y_ptr + row_off + i, v_add(existing, result));
+        for (; i + L <= norm_size; i += L) {
+            auto x = v_load(x_ptr + row_off + i);
+            auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
+            auto rv = v_mul(v_mul(x, v_inv_rms), vs);
+            if (add_to) {
+                v_store(y_ptr + row_off + i,
+                        v_add(v_load(y_ptr + row_off + i), rv));
+            } else {
+                v_store(y_ptr + row_off + i, rv);
             }
-            for (; i < norm_size; ++i) {
-                int64_t s_idx = scale_is_scalar ? 0 : i;
-                float x = s_load(&x_ptr[row_off + i]);
-                float s = s_load(&s_ptr[s_idx]);
-                float val = x * inv_rms * s;
-                s_store(&y_ptr[row_off + i], s_load(&y_ptr[row_off + i]) + val);
-            }
-        } else {
-            for (; i + L <= norm_size; i += L) {
-                auto x = v_load(x_ptr + row_off + i);
-                auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-                v_store(y_ptr + row_off + i, v_mul(v_mul(x, v_inv_rms), vs));
-            }
-            for (; i < norm_size; ++i) {
-                int64_t s_idx = scale_is_scalar ? 0 : i;
-                float x = s_load(&x_ptr[row_off + i]);
-                float s = s_load(&s_ptr[s_idx]);
-                s_store(&y_ptr[row_off + i], x * inv_rms * s);
+        }
+        for (; i < norm_size; ++i) {
+            int64_t s_idx = scale_is_scalar ? 0 : i;
+            float x = s_load(&x_ptr[row_off + i]);
+            float s = s_load(&s_ptr[s_idx]);
+            float rv = x * inv_rms * s;
+            if (add_to) {
+                s_store(&y_ptr[row_off + i],
+                        s_load(&y_ptr[row_off + i]) + rv);
+            } else {
+                s_store(&y_ptr[row_off + i], rv);
             }
         }
     };

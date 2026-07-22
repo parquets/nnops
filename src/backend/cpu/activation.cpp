@@ -12,7 +12,8 @@
 ///   1. No blend/select needed — all conditionals are decomposed via v_max/v_min
 ///   2. Row-by-row processing respects pitch (non-contiguous tensors supported)
 ///   3. simd_lane_for<T> selects lane count (8 for both f32 and f16)
-///   4. add_to support: load + accumulate + store instead of plain store
+///   4. add_to is checked inside the loop body to avoid duplicating the entire
+///      row-processing structure (branch predictor handles the invariant branch).
 
 #include "nnops/ops/activation.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -56,33 +57,25 @@ void activation_impl(const ActivationAttributes& attrs,
 
     // ---- Relu: max(x, 0) ----
     case ActivationType::Relu: {
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    auto rv = v_max(x, vzero);
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto rv = v_max(v_load(in_row + i), vzero);
+                if (add_to) {
                     v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) + (v > 0.0f ? v : 0.0f));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_max(x, vzero));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], (v > 0.0f ? v : 0.0f));
+            for (; i < last_dim; ++i) {
+                float v = s_load(&in_row[i]);
+                float rv = (v > 0.0f ? v : 0.0f);
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -94,36 +87,27 @@ void activation_impl(const ActivationAttributes& attrs,
         const float alpha = attrs.alpha;
         const auto a8 = v_set1(in_ptr, alpha);
 
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    auto rv = v_add(v_max(x, vzero),
-                                  v_mul(a8, v_min(x, vzero)));
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto x = v_load(in_row + i);
+                auto rv = v_add(v_max(x, vzero),
+                              v_mul(a8, v_min(x, vzero)));
+                if (add_to) {
                     v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) + (v > 0.0f ? v : alpha * v));
-                }
-            }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    auto rv = v_add(v_max(x, vzero),
-                                  v_mul(a8, v_min(x, vzero)));
+                } else {
                     v_store(out_row + i, rv);
                 }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], (v > 0.0f ? v : alpha * v));
+            }
+            for (; i < last_dim; ++i) {
+                float v = s_load(&in_row[i]);
+                float rv = (v > 0.0f ? v : alpha * v);
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -134,33 +118,26 @@ void activation_impl(const ActivationAttributes& attrs,
     case ActivationType::Sigmoid: {
         const auto one8 = v_set1(in_ptr, 1.0f);
 
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    auto rv = v_div(one8, v_add(one8, v_exp(v_neg(x))));
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto x = v_load(in_row + i);
+                auto rv = v_div(one8, v_add(one8, v_exp(v_neg(x))));
+                if (add_to) {
                     v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) + 1.0f / (1.0f + std::exp(-v)));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_div(one8, v_add(one8, v_exp(v_neg(x)))));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], 1.0f / (1.0f + std::exp(-v)));
+            for (; i < last_dim; ++i) {
+                float v = s_load(&in_row[i]);
+                float rv = 1.0f / (1.0f + std::exp(-v));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -169,33 +146,24 @@ void activation_impl(const ActivationAttributes& attrs,
 
     // ---- Tanh ----
     case ActivationType::Tanh: {
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    auto rv = v_tanh(x);
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto rv = v_tanh(v_load(in_row + i));
+                if (add_to) {
                     v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) + std::tanh(v));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_tanh(x));
-                }
-                for (; i < last_dim; ++i) {
-                    float v = s_load(&in_row[i]);
-                    s_store(&out_row[i], std::tanh(v));
+            for (; i < last_dim; ++i) {
+                float rv = std::tanh(s_load(&in_row[i]));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -203,7 +171,7 @@ void activation_impl(const ActivationAttributes& attrs,
     }
 
     // ---- GELU: 0.5 * x * (1 + tanh(c * (x + 0.044715 * x^3)))
-    //       where c = sqrt(2/pi)
+    //       where c = sqrt(2/pi) ----
     case ActivationType::Gelu: {
         const auto half8  = v_set1(in_ptr, 0.5f);
         const auto one8   = v_set1(in_ptr, 1.0f);
@@ -216,33 +184,25 @@ void activation_impl(const ActivationAttributes& attrs,
             return v_mul(v_mul(half8, x), v_add(one8, v_tanh(inner)));
         };
 
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_add(v_load(out_row + i), simd(x)));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) +
-                        0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))));
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto rv = simd(v_load(in_row + i));
+                if (add_to) {
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    v_store(out_row + i, simd(v_load(in_row + i)));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i],
-                        0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))));
+            for (; i < last_dim; ++i) {
+                float x = s_load(&in_row[i]);
+                float rv = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -253,33 +213,26 @@ void activation_impl(const ActivationAttributes& attrs,
     case ActivationType::Silu: {
         const auto one8 = v_set1(in_ptr, 1.0f);
 
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    auto rv = v_div(x, v_add(one8, v_exp(v_neg(x))));
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto x = v_load(in_row + i);
+                auto rv = v_div(x, v_add(one8, v_exp(v_neg(x))));
+                if (add_to) {
                     v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) + x / (1.0f + std::exp(-x)));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_div(x, v_add(one8, v_exp(v_neg(x)))));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i], x / (1.0f + std::exp(-x)));
+            for (; i < last_dim; ++i) {
+                float x = s_load(&in_row[i]);
+                float rv = x / (1.0f + std::exp(-x));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -287,7 +240,7 @@ void activation_impl(const ActivationAttributes& attrs,
     }
 
     // ---- HardSwish: x * relu6(x+3) * (beta/6)
-    //       relu6(y) = min(max(y, 0), 6)
+    //       relu6(y) = min(max(y, 0), 6) ----
     case ActivationType::HardSwish: {
         const float bd6 = attrs.beta / 6.0f;
         const auto three8 = v_set1(in_ptr, 3.0f);
@@ -299,33 +252,25 @@ void activation_impl(const ActivationAttributes& attrs,
             return v_mul(v_mul(x, relu6), scale8);
         };
 
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_add(v_load(out_row + i), simd(x)));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) +
-                        x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6);
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto rv = simd(v_load(in_row + i));
+                if (add_to) {
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    v_store(out_row + i, simd(v_load(in_row + i)));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i],
-                        x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6);
+            for (; i < last_dim; ++i) {
+                float x = s_load(&in_row[i]);
+                float rv = x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6;
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }
@@ -343,33 +288,25 @@ void activation_impl(const ActivationAttributes& attrs,
             return v_add(v_max(x, vzero), neg_part);
         };
 
-        if (add_to) {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    auto x = v_load(in_row + i);
-                    v_store(out_row + i, v_add(v_load(out_row + i), simd(x)));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i], s_load(&out_row[i]) +
-                        (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f)));
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_row_stride;
+            T* out_row = out_ptr + r * out_row_stride;
+            int64_t i = 0;
+            for (; i + L <= last_dim; i += L) {
+                auto rv = simd(v_load(in_row + i));
+                if (add_to) {
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                } else {
+                    v_store(out_row + i, rv);
                 }
             }
-        } else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                const T* in_row = in_ptr + r * in_row_stride;
-                T* out_row = out_ptr + r * out_row_stride;
-                int64_t i = 0;
-                for (; i + L <= last_dim; i += L) {
-                    v_store(out_row + i, simd(v_load(in_row + i)));
-                }
-                for (; i < last_dim; ++i) {
-                    float x = s_load(&in_row[i]);
-                    s_store(&out_row[i],
-                        (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f)));
+            for (; i < last_dim; ++i) {
+                float x = s_load(&in_row[i]);
+                float rv = (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
                 }
             }
         }

@@ -99,28 +99,25 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
                     const int64_t y_off = y_ch_base + hh * y_row_stride;
                     int64_t i = 0;
 
-                    if (attrs.add_to) {
-                        const auto scale8 = v_set1(x_ptr, ns);
-                        const auto bias8  = v_set1(x_ptr, nb);
-                        for (; i + L <= last_dim; i += L) {
-                            const auto x8 = v_load(x_ptr + x_off + i);
-                            const auto y8 = v_load(y_ptr + y_off + i);
-                            v_store(y_ptr + y_off + i, v_add(y8, v_fmadd(scale8, x8, bias8)));
+                    const auto scale8 = v_set1(x_ptr, ns);
+                    const auto bias8  = v_set1(x_ptr, nb);
+                    for (; i + L <= last_dim; i += L) {
+                        const auto x8 = v_load(x_ptr + x_off + i);
+                        auto rv = v_fmadd(scale8, x8, bias8);
+                        if (attrs.add_to) {
+                            v_store(y_ptr + y_off + i,
+                                    v_add(v_load(y_ptr + y_off + i), rv));
+                        } else {
+                            v_store(y_ptr + y_off + i, rv);
                         }
-                        for (; i < last_dim; ++i) {
+                    }
+                    for (; i < last_dim; ++i) {
+                        float rv = s_load(&x_ptr[x_off + i]) * ns + nb;
+                        if (attrs.add_to) {
                             s_store(&y_ptr[y_off + i],
-                                    s_load(&y_ptr[y_off + i]) + s_load(&x_ptr[x_off + i]) * ns + nb);
-                        }
-                    } else {
-                        const auto scale8 = v_set1(x_ptr, ns);
-                        const auto bias8  = v_set1(x_ptr, nb);
-                        for (; i + L <= last_dim; i += L) {
-                            const auto x8 = v_load(x_ptr + x_off + i);
-                            v_store(y_ptr + y_off + i, v_fmadd(scale8, x8, bias8));
-                        }
-                        for (; i < last_dim; ++i) {
-                            s_store(&y_ptr[y_off + i],
-                                    s_load(&x_ptr[x_off + i]) * ns + nb);
+                                    s_load(&y_ptr[y_off + i]) + rv);
+                        } else {
+                            s_store(&y_ptr[y_off + i], rv);
                         }
                     }
                 }
@@ -139,52 +136,36 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
         const auto process_block = [&](int64_t i_begin, int64_t i_end) {
             int64_t i = i_begin;
 
-            if (attrs.add_to) {
-                const auto eps8 = v_set1(x_ptr, epsilon);
-                const auto one8 = v_set1(x_ptr, 1.0f);
+            const auto eps8 = v_set1(x_ptr, epsilon);
+            const auto one8 = v_set1(x_ptr, 1.0f);
 
-                for (; i + L <= i_end; i += L) {
-                    const auto x8 = v_load(x_ptr + i);
-                    const auto s8 = v_load(s_ptr + i);
-                    const auto b8 = v_load(b_ptr + i);
-                    const auto m8 = v_load(m_ptr + i);
-                    const auto v8 = v_load(v_ptr + i);
+            for (; i + L <= i_end; i += L) {
+                const auto x8 = v_load(x_ptr + i);
+                const auto s8 = v_load(s_ptr + i);
+                const auto b8 = v_load(b_ptr + i);
+                const auto m8 = v_load(m_ptr + i);
+                const auto v8 = v_load(v_ptr + i);
 
-                    const auto inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
-                    const auto ns = v_mul(inv_std, s8);
-                    const auto nb = v_sub(b8, v_mul(m8, ns));
-                    const auto y8 = v_load(y_ptr + i);
-                    v_store(y_ptr + i, v_add(y8, v_fmadd(ns, x8, nb)));
+                const auto inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
+                const auto ns = v_mul(inv_std, s8);
+                const auto nb = v_sub(b8, v_mul(m8, ns));
+                auto rv = v_fmadd(ns, x8, nb);
+                if (attrs.add_to) {
+                    v_store(y_ptr + i, v_add(v_load(y_ptr + i), rv));
+                } else {
+                    v_store(y_ptr + i, rv);
                 }
+            }
 
-                for (; i < i_end; ++i) {
-                    float inv_std_val = 1.0f / std::sqrt(s_load(&v_ptr[i]) + epsilon);
-                    float ns = inv_std_val * s_load(&s_ptr[i]);
-                    float nb = s_load(&b_ptr[i]) - s_load(&m_ptr[i]) * ns;
-                    s_store(&y_ptr[i], s_load(&y_ptr[i]) + s_load(&x_ptr[i]) * ns + nb);
-                }
-            } else {
-                const auto eps8 = v_set1(x_ptr, epsilon);
-                const auto one8 = v_set1(x_ptr, 1.0f);
-
-                for (; i + L <= i_end; i += L) {
-                    const auto x8 = v_load(x_ptr + i);
-                    const auto s8 = v_load(s_ptr + i);
-                    const auto b8 = v_load(b_ptr + i);
-                    const auto m8 = v_load(m_ptr + i);
-                    const auto v8 = v_load(v_ptr + i);
-
-                    const auto inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
-                    const auto ns = v_mul(inv_std, s8);
-                    const auto nb = v_sub(b8, v_mul(m8, ns));
-                    v_store(y_ptr + i, v_fmadd(ns, x8, nb));
-                }
-
-                for (; i < i_end; ++i) {
-                    float inv_std_val = 1.0f / std::sqrt(s_load(&v_ptr[i]) + epsilon);
-                    float ns = inv_std_val * s_load(&s_ptr[i]);
-                    float nb = s_load(&b_ptr[i]) - s_load(&m_ptr[i]) * ns;
-                    s_store(&y_ptr[i], s_load(&x_ptr[i]) * ns + nb);
+            for (; i < i_end; ++i) {
+                float inv_std_val = 1.0f / std::sqrt(s_load(&v_ptr[i]) + epsilon);
+                float ns = inv_std_val * s_load(&s_ptr[i]);
+                float nb = s_load(&b_ptr[i]) - s_load(&m_ptr[i]) * ns;
+                float rv = s_load(&x_ptr[i]) * ns + nb;
+                if (attrs.add_to) {
+                    s_store(&y_ptr[i], s_load(&y_ptr[i]) + rv);
+                } else {
+                    s_store(&y_ptr[i], rv);
                 }
             }
         };

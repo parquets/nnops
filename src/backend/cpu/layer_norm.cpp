@@ -293,72 +293,34 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
 
         const auto v_mean    = v_set1(x_ptr, mean_val);
         const auto v_inv_std = v_set1(x_ptr, inv_std);
+        const auto v_zero_b  = v_zero(x_ptr);  // bias fallback when no bias
 
-        if (has_bias && b_ptr) {
+        for (; i + L <= norm_size; i += L) {
+            auto x = v_load(x_ptr + row_off + i);
+            auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
+            auto vb = (has_bias && b_ptr)
+                ? v_load(b_ptr + (scale_is_scalar ? 0 : i))
+                : v_zero_b;
+            auto rv = v_fmadd(v_mul(v_sub(x, v_mean), v_inv_std), vs, vb);
             if (add_to) {
-                for (; i + L <= norm_size; i += L) {
-                    auto x = v_load(x_ptr + row_off + i);
-                    auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-                    auto vb = v_load(b_ptr + (scale_is_scalar ? 0 : i));
-                    // y = (x - mean) * inv_std * scale + bias
-                    auto result = v_fmadd(v_mul(v_sub(x, v_mean), v_inv_std), vs, vb);
-                    v_store(y_ptr + row_off + i, v_add(v_load(y_ptr + row_off + i), result));
-                }
-                for (; i < norm_size; ++i) {
-                    int64_t s_idx = scale_is_scalar ? 0 : i;
-                    int64_t b_idx = scale_is_scalar ? 0 : i;
-                    float x = s_load(&x_ptr[row_off + i]);
-                    float s = s_load(&s_ptr[s_idx]);
-                    float b = s_load(&b_ptr[b_idx]);
-                    float val = (x - mean_val) * inv_std * s + b;
-                    s_store(&y_ptr[row_off + i], s_load(&y_ptr[row_off + i]) + val);
-                }
+                v_store(y_ptr + row_off + i,
+                        v_add(v_load(y_ptr + row_off + i), rv));
             } else {
-                for (; i + L <= norm_size; i += L) {
-                    auto x = v_load(x_ptr + row_off + i);
-                    auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-                    auto vb = v_load(b_ptr + (scale_is_scalar ? 0 : i));
-                    v_store(y_ptr + row_off + i,
-                            v_fmadd(v_mul(v_sub(x, v_mean), v_inv_std), vs, vb));
-                }
-                for (; i < norm_size; ++i) {
-                    int64_t s_idx = scale_is_scalar ? 0 : i;
-                    int64_t b_idx = scale_is_scalar ? 0 : i;
-                    float x = s_load(&x_ptr[row_off + i]);
-                    float s = s_load(&s_ptr[s_idx]);
-                    float b = s_load(&b_ptr[b_idx]);
-                    s_store(&y_ptr[row_off + i], (x - mean_val) * inv_std * s + b);
-                }
+                v_store(y_ptr + row_off + i, rv);
             }
-        } else {
-            // No bias
+        }
+        for (; i < norm_size; ++i) {
+            int64_t s_idx = scale_is_scalar ? 0 : i;
+            int64_t b_idx = scale_is_scalar ? 0 : i;
+            float x = s_load(&x_ptr[row_off + i]);
+            float s = s_load(&s_ptr[s_idx]);
+            float b = (has_bias && b_ptr) ? s_load(&b_ptr[b_idx]) : 0.0f;
+            float rv = (x - mean_val) * inv_std * s + b;
             if (add_to) {
-                for (; i + L <= norm_size; i += L) {
-                    auto x = v_load(x_ptr + row_off + i);
-                    auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-                    auto result = v_mul(v_mul(v_sub(x, v_mean), v_inv_std), vs);
-                    v_store(y_ptr + row_off + i, v_add(v_load(y_ptr + row_off + i), result));
-                }
-                for (; i < norm_size; ++i) {
-                    int64_t s_idx = scale_is_scalar ? 0 : i;
-                    float x = s_load(&x_ptr[row_off + i]);
-                    float s = s_load(&s_ptr[s_idx]);
-                    float val = (x - mean_val) * inv_std * s;
-                    s_store(&y_ptr[row_off + i], s_load(&y_ptr[row_off + i]) + val);
-                }
+                s_store(&y_ptr[row_off + i],
+                        s_load(&y_ptr[row_off + i]) + rv);
             } else {
-                for (; i + L <= norm_size; i += L) {
-                    auto x = v_load(x_ptr + row_off + i);
-                    auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-                    v_store(y_ptr + row_off + i,
-                            v_mul(v_mul(v_sub(x, v_mean), v_inv_std), vs));
-                }
-                for (; i < norm_size; ++i) {
-                    int64_t s_idx = scale_is_scalar ? 0 : i;
-                    float x = s_load(&x_ptr[row_off + i]);
-                    float s = s_load(&s_ptr[s_idx]);
-                    s_store(&y_ptr[row_off + i], (x - mean_val) * inv_std * s);
-                }
+                s_store(&y_ptr[row_off + i], rv);
             }
         }
     };

@@ -289,26 +289,22 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
             auto v_bias = v_set1(x_ptr, bias);
 
-            if (add_to) {
-                for (; i + L <= D; i += L) {
-                    auto x = v_load(x_ptr + row_off + i);
-                    auto result = v_add(x, v_bias);
+            for (; i + L <= D; i += L) {
+                auto rv = v_add(v_load(x_ptr + row_off + i), v_bias);
+                if (add_to) {
                     v_store(y_ptr + row_off + i,
-                            v_add(v_load(y_ptr + row_off + i), result));
+                            v_add(v_load(y_ptr + row_off + i), rv));
+                } else {
+                    v_store(y_ptr + row_off + i, rv);
                 }
-                for (; i < D; ++i) {
-                    float val = s_load(&x_ptr[row_off + i]) + bias;
+            }
+            for (; i < D; ++i) {
+                float rv = s_load(&x_ptr[row_off + i]) + bias;
+                if (add_to) {
                     s_store(&y_ptr[row_off + i],
-                            s_load(&y_ptr[row_off + i]) + val);
-                }
-            } else {
-                for (; i + L <= D; i += L) {
-                    auto x = v_load(x_ptr + row_off + i);
-                    v_store(y_ptr + row_off + i, v_add(x, v_bias));
-                }
-                for (; i < D; ++i) {
-                    s_store(&y_ptr[row_off + i],
-                            s_load(&x_ptr[row_off + i]) + bias);
+                            s_load(&y_ptr[row_off + i]) + rv);
+                } else {
+                    s_store(&y_ptr[row_off + i], rv);
                 }
             }
         } else {
