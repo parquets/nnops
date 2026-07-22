@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T14:15:52.981Z
+  modified: 2026-07-22T15:02:48.661Z
 ---
 
 # Implemented Operators
@@ -46,13 +46,16 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Files:** `include/nnops/ops/activation.hpp`, `src/ops/activation.cpp`, `src/backend/cpu/activation.cpp`, `src/backend/cpu/reference/activation_ref.cpp`
 - **Types:** Relu, LeakyRelu, Sigmoid, Tanh, Gelu, Silu, HardSwish, Elu
 - **Attributes:** `ActivationAttributes` — type, alpha, beta
-- **SIMD Kernel** (`src/backend/cpu/activation.cpp`): 8-wide SIMD (v_f32x8) + scalar tail, v_f32x4 已删除以简化代码。8 种激活函数全部向量化。
+- **Data types:** f32 (v_f32x8) and f16 (v_f16x8) via single templated implementation `activation_impl<T>`
+- **SIMD Kernel** (`src/backend/cpu/activation.cpp`): row-by-row pitch-aware processing with `simd_lane_for<T>` (8) wide SIMD + scalar tail. Uses generic API (`v_load`/`v_store`/`v_set1`/`s_load`/`s_store`) to support both float and half in one code path. All 8 activation types vectorized.
 - **Design Decisions:**
   1. 无需 blend/select — 所有条件分支通过 v_max/v_min 分解消除：LeakyRelu = `max(x,0) + α*min(x,0)`，ELU = `max(x,0) + α*(exp(min(x,0))-1)`，Relu = `max(x,0)`
-  2. 8-wide SIMD → scalar tail，无需 4-wide 中间阶段（AVX2 原生 256-bit，SSE 模拟为两个 __m128）
-  3. add_to 支持：load + accumulate + store 替代 plain store
-- **Dispatch:** `Backend::CPU` → `activation_cpu`（SIMD 优化），reference 保留用于正确性基线
+  2. `simd_lane_for<T>` (f32→8, f16→8) — SIMD width selected at compile time by data type, all SIMD backends support lane=8
+  3. Row-by-row processing via `row_stride_elems()` respects pitch padding — no contiguous-tensor assumption
+  4. add_to 支持：load + accumulate + store 替代 plain store
+- **Dispatch:** `Backend::CPU` → `activation_cpu` → `activation_impl<float>` / `activation_impl<half>`（SIMD 优化），reference 保留用于正确性基线
 - **Note:** Standalone operator — distinct from [[#Epilogue (Core Type)]] which fuses activation into Conv/MatMul output write-back.
+- **Updated:** 2026-07-22 — templated for f16 support, pitch-aware rows, `simd_lane_for<T>`
 
 ## Pooling
 

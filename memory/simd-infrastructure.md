@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T14:15:46.869Z
+  modified: 2026-07-22T14:52:26.357Z
 ---
 
 # SIMD Abstraction Layer
@@ -31,7 +31,7 @@ The `NNOPS_RESTRICT` macro (`src/backend/cpu/common/restrict.hpp`) is the only s
 - **Types**: `v_f32x4`, `v_f32x8`, `v_f16x8` (lowercase; `v_` prefix for vector types)
 - **Overloaded ops** (return type deduced from arg types): `v_add(a,b)`, `v_mul(a,b)`, `v_fmadd(a,b,c)`, `v_min(a,b)`, `v_sqrt(a)`, `v_reduce_sum(a)`, `v_store(p,a)`, `v_cvt_f16_to_f32(a)`, etc.
 - **Generic ops** (overloaded on pointer type, 2026-07-22): `v_load(p)`, `v_set1(p, s)`, `v_zero(p)` dispatch on pointer type → `v_f32x8` or `v_f16x8`. `v_store(p, v)` was already overloaded. Scalar: `sload(p)` → float, `sstore(p, v)` — all in `nnops::simd`.
-- **Constants**: `simd_len_f32x4`, `simd_len_f32x8`, `simd_len_f16x8`
+- **Constants**: `simd_lane_f32x4` (=4), `simd_lane_f32x8` (=8), `simd_lane_f16x8` (=8), `simd_default_lane_f32` (=8), `simd_default_lane_f16` (=8), `simd_lane_for<T>` (template → 8 for both float and half)
 
 ## File Layout
 
