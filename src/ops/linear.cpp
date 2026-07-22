@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void linear_ref(const LinearAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* workspace);
@@ -19,7 +19,7 @@ namespace backend::cpu::reference {
 // ============================================================
 struct Linear::Impl {
     using KernelFn = void (*)(const LinearAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -57,7 +57,7 @@ Linear::Linear(const LinearAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_linear_kernel(backend);
 }
 
-void Linear::compute(std::span<const TensorView> outputs,
+void Linear::compute(std::span<TensorView> outputs,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace)
@@ -65,10 +65,10 @@ void Linear::compute(std::span<const TensorView> outputs,
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(inputs.size() <= 3);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
-    NNOPS_ASSERT(inputs[1].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
+    NNOPS_ASSERT(!inputs[1].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -76,7 +76,7 @@ void Linear::compute(std::span<const TensorView> outputs,
 // Functional API — no attributes (backward-compatible)
 void linear(const TensorView& input,
             const TensorView& weight,
-            const TensorView& output,
+            TensorView& output,
             const ComputeContext& ctx)
 {
     auto op = Linear::create({}, ctx.expected_backend);
@@ -87,7 +87,7 @@ void linear(const TensorView& input,
 void linear(const TensorView& input,
             const TensorView& weight,
             const TensorView& bias,
-            const TensorView& output,
+            TensorView& output,
             const ComputeContext& ctx)
 {
     auto op = Linear::create({}, ctx.expected_backend);
@@ -98,7 +98,7 @@ void linear(const TensorView& input,
 // Functional API — with attributes (epilogue support)
 void linear(const TensorView& input,
             const TensorView& weight,
-            const TensorView& output,
+            TensorView& output,
             const LinearAttributes& attrs,
             const ComputeContext& ctx)
 {
@@ -110,7 +110,7 @@ void linear(const TensorView& input,
 void linear(const TensorView& input,
             const TensorView& weight,
             const TensorView& bias,
-            const TensorView& output,
+            TensorView& output,
             const LinearAttributes& attrs,
             const ComputeContext& ctx)
 {

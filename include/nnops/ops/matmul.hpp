@@ -43,7 +43,7 @@ public:
 
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -66,7 +66,7 @@ private:
 /// Functional matmul.
 void matmul(const TensorView& a,
             const TensorView& b,
-            const TensorView& c,
+            TensorView& c,
             const MatMulAttributes& attrs = {},
             const ComputeContext& ctx = {});
 

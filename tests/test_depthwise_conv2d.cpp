@@ -305,9 +305,9 @@ NNOPS_TEST(dwconv_simd_vs_ref_small) {
     const int64_t N = 1, C = 3, IH = 8, IW = 8;
     const int64_t OH = 6, OW = 6;
     const int64_t KH = 3, KW = 3;
-    const auto* in_ptr  = input.data_as<float>();
-    const auto* w_ptr   = weight.data_as<float>();
-    auto* ref_ptr = out_ref.data_as<float>();
+    const auto* in_ptr  = input.ptr<float>();
+    const auto* w_ptr   = weight.ptr<float>();
+    auto* ref_ptr = out_ref.ptr<float>();
 
     for (int64_t c = 0; c < C; ++c) {
         for (int64_t oh = 0; oh < OH; ++oh) {
@@ -358,9 +358,9 @@ NNOPS_TEST(dwconv_simd_vs_ref_with_pad) {
     const int64_t OH = 7, OW = 7;
     const int64_t KH = 3, KW = 3;
     const int64_t PH = 1, PW = 1;
-    const auto* in_ptr = input.data_as<float>();
-    const auto* w_ptr  = weight.data_as<float>();
-    auto* ref_ptr = out_ref.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
+    const auto* w_ptr  = weight.ptr<float>();
+    auto* ref_ptr = out_ref.ptr<float>();
 
     for (int64_t c = 0; c < C; ++c) {
         for (int64_t oh = 0; oh < OH; ++oh) {
@@ -532,9 +532,9 @@ NNOPS_TEST(dwconv_batch_multichannel) {
     depthwise_conv2d(input, weight, output, attrs);
 
     // Manual check: re-compute sample 0, channel 0
-    const auto* in_ptr = input.data_as<float>();
-    const auto* w_ptr  = weight.data_as<float>();
-    const auto* out_ptr = output.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
+    const auto* w_ptr  = weight.ptr<float>();
+    const auto* out_ptr = output.ptr<float>();
 
     const int64_t IH = 8, IW = 8, OH = 6, OW = 6;
     const int64_t KH = 3, KW = 3;

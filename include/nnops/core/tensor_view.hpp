@@ -100,19 +100,27 @@ public:
     /// Memory layout.
     TensorLayout layout() const noexcept { return layout_; }
 
-    /// Raw data pointer (mutable).
-    void* data() noexcept { return data_; }
-
-    /// Raw data pointer (const).
-    const void* data() const noexcept { return data_; }
-
     /// Typed data pointer (mutable).
     template <typename T>
-    T* data_as() noexcept { return static_cast<T*>(data_); }
+    T* ptr() noexcept { return static_cast<T*>(data_); }
 
-    /// Typed data pointer (mutable, even when TensorView is const).
+    /// Typed data pointer (const).
     template <typename T>
-    T* data_as() const noexcept { return static_cast<T*>(data_); }
+    const T* ptr() const noexcept { return static_cast<const T*>(data_); }
+
+    /// Typed data pointer for a specific row (mutable).
+    /// Returns a pointer to the first element of the given row.
+    /// row_id selects the row; pitch_ (in bytes) determines the row stride.
+    template <typename T>
+    T* ptr(size_t row_id) noexcept {
+        return static_cast<T*>(static_cast<char*>(data_) + row_id * static_cast<size_t>(pitch_));
+    }
+
+    /// Typed data pointer for a specific row (const).
+    template <typename T>
+    const T* ptr(size_t row_id) const noexcept {
+        return static_cast<const T*>(static_cast<const char*>(data_) + row_id * static_cast<size_t>(pitch_));
+    }
 
     /// Total number of elements (product of all dimensions).
     int64_t numel() const noexcept {

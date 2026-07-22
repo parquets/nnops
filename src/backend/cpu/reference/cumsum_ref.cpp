@@ -13,7 +13,7 @@
 namespace nnops::backend::cpu::reference {
 
 void cumsum_ref(const CumSumAttributes& attrs,
-                const TensorView& output,
+                TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
@@ -41,8 +41,8 @@ void cumsum_ref(const CumSumAttributes& attrs,
         lower_dim_size *= input.shape(i);
     }
 
-    const auto* in_ptr  = input.data_as<float>();
-    auto* out_ptr = output.data_as<float>();
+    const auto* in_ptr  = input.ptr<float>();
+    auto* out_ptr = output.ptr<float>();
 
     // Stride between consecutive elements along the cumulative axis
     // Uses stride_elems(axis) which accounts for pitch padding.

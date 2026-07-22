@@ -98,8 +98,8 @@ NNOPS_TEST(rmsnorm_random) {
     for (int r = 0; r < 3; ++r) {
         float sum_sq = 0.0f;
         for (int c = 0; c < 6; ++c) {
-            sum_sq += y.data_as<float>()[r * 6 + c] *
-                      y.data_as<float>()[r * 6 + c];
+            sum_sq += y.ptr<float>()[r * 6 + c] *
+                      y.ptr<float>()[r * 6 + c];
         }
         float rms = std::sqrt(sum_sq / 6.0f);
         NNOPS_EXPECT_NEAR(rms, 1.0f, 0.1f);

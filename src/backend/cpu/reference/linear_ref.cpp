@@ -10,7 +10,7 @@
 namespace nnops::backend::cpu::reference {
 
 void linear_ref(const LinearAttributes& attrs,
-                const TensorView& output,
+                TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
@@ -26,10 +26,10 @@ void linear_ref(const LinearAttributes& attrs,
     // Weight: [N, K]
     const int64_t N = weight.shape(0);
 
-    const auto* in_ptr = input.data_as<float>();
-    const auto* w_ptr  = weight.data_as<float>();
-    const auto* b_ptr  = has_bias ? inputs[2].data_as<float>() : nullptr;
-    auto* out_ptr = output.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
+    const auto* w_ptr  = weight.ptr<float>();
+    const auto* b_ptr  = has_bias ? inputs[2].ptr<float>() : nullptr;
+    auto* out_ptr = output.ptr<float>();
 
     // Row strides in elements (from pitch)
     const int64_t in_row_stride  = input.row_stride_elems();   // >= K

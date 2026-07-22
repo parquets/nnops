@@ -13,14 +13,14 @@
 namespace nnops::backend::cpu::reference {
 
 void layer_norm_ref(const LayerNormAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* /*workspace*/)
 {
     const auto& X     = inputs[0];
     const auto& scale = inputs[1];
-    const bool has_bias = (inputs.size() >= 3 && inputs[2].data() != nullptr);
+    const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
 
     const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
@@ -40,10 +40,10 @@ void layer_norm_ref(const LayerNormAttributes& attrs,
         norm_size *= X.shape(i);
     }
 
-    const auto* x_ptr  = X.data_as<float>();
-    const auto* s_ptr  = scale.data_as<float>();
-    const auto* b_ptr  = has_bias ? inputs[2].data_as<float>() : nullptr;
-    auto* y_ptr = output.data_as<float>();
+    const auto* x_ptr  = X.ptr<float>();
+    const auto* s_ptr  = scale.ptr<float>();
+    const auto* b_ptr  = has_bias ? inputs[2].ptr<float>() : nullptr;
+    auto* y_ptr = output.ptr<float>();
 
     // Compute the element stride of the axis dimension (accounts for pitch).
     // For [B, C, H, W] with axis=1: stride_elems(1) = H * row_stride.

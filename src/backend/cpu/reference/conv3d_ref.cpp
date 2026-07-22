@@ -10,7 +10,7 @@
 namespace nnops::backend::cpu::reference {
 
 void conv3d_ref(const Conv3DAttributes& attrs,
-                const TensorView& output,
+                TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
@@ -55,10 +55,10 @@ void conv3d_ref(const Conv3DAttributes& attrs,
     const int64_t PH = attrs.padding[1];
     const int64_t PW = attrs.padding[2];
 
-    auto* out_ptr = output.data_as<float>();
-    const auto* in_ptr  = input.data_as<float>();
-    const auto* w_ptr   = weight.data_as<float>();
-    const auto* b_ptr   = has_bias ? inputs[2].data_as<float>() : nullptr;
+    auto* out_ptr = output.ptr<float>();
+    const auto* in_ptr  = input.ptr<float>();
+    const auto* w_ptr   = weight.ptr<float>();
+    const auto* b_ptr   = has_bias ? inputs[2].ptr<float>() : nullptr;
 
     // Per-sample compute lambda
     const auto compute_sample = [&](int64_t n) {

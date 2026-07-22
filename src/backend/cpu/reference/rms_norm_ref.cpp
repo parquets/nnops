@@ -12,7 +12,7 @@
 namespace nnops::backend::cpu::reference {
 
 void rms_norm_ref(const RMSNormAttributes& attrs,
-                  const TensorView& output,
+                  TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
                   void* /*workspace*/)
@@ -38,9 +38,9 @@ void rms_norm_ref(const RMSNormAttributes& attrs,
         norm_size *= X.shape(i);
     }
 
-    const auto* x_ptr = X.data_as<float>();
-    const auto* s_ptr = scale.data_as<float>();
-    auto* y_ptr = output.data_as<float>();
+    const auto* x_ptr = X.ptr<float>();
+    const auto* s_ptr = scale.ptr<float>();
+    auto* y_ptr = output.ptr<float>();
 
     // Compute the element stride of the axis dimension (accounts for pitch)
     const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;

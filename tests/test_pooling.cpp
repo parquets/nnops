@@ -322,7 +322,7 @@ NNOPS_TEST(pooling_simd_max_vs_ref_small) {
 
     // Reference
     const int64_t N = 1, C = 3, IH = 16, IW = 16, OH = 14, OW = 14;
-    ref_pooling_2d_max(input.data_as<float>(), out_ref.data(),
+    ref_pooling_2d_max(input.ptr<float>(), out_ref.data(),
                        N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -347,7 +347,7 @@ NNOPS_TEST(pooling_simd_max_vs_ref_with_pad) {
     pooling(input, out_s, attrs);
 
     const int64_t N = 1, C = 4, IH = 15, IW = 15, OH = 15, OW = 15;
-    ref_pooling_2d_max(input.data_as<float>(), out_ref.data(),
+    ref_pooling_2d_max(input.ptr<float>(), out_ref.data(),
                        N, C, IH, IW, OH, OW, 3, 3, 1, 1, 1, 1);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -371,7 +371,7 @@ NNOPS_TEST(pooling_simd_max_stride_2) {
     pooling(input, out_s, attrs);
 
     const int64_t N = 1, C = 2, IH = 16, IW = 16, OH = 8, OW = 8;
-    ref_pooling_2d_max(input.data_as<float>(), ref_buf.data(),
+    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
                        N, C, IH, IW, OH, OW, 2, 2, 2, 2, 0, 0);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -396,7 +396,7 @@ NNOPS_TEST(pooling_simd_avg_vs_ref) {
     pooling(input, out_s, attrs);
 
     const int64_t N = 1, C = 2, IH = 16, IW = 16, OH = 14, OW = 14;
-    ref_pooling_2d_avg(input.data_as<float>(), out_ref.data(),
+    ref_pooling_2d_avg(input.ptr<float>(), out_ref.data(),
                        N, C, IH, IW, OH, OW, 3, 3, 1, 1, 1, 1);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -431,7 +431,7 @@ NNOPS_TEST(pooling_simd_max_add_to) {
     attrs_no_add.add_to = false;
 
     const int64_t N = 1, C = 2, IH = 8, IW = 8, OH = 6, OW = 6;
-    ref_pooling_2d_max(input.data_as<float>(), ref_buf.data(),
+    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
                        N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
     for (int64_t i = 0; i < N * C * OH * OW; ++i) {
         ref_buf[i] = initial_buf[i] + ref_buf[i];
@@ -458,7 +458,7 @@ NNOPS_TEST(pooling_simd_large_input) {
     pooling(input, out_s, attrs);
 
     const int64_t N = 2, C = 3, IH = 64, IW = 64, OH = 62, OW = 62;
-    ref_pooling_2d_max(input.data_as<float>(), ref_buf.data(),
+    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
                        N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -482,7 +482,7 @@ NNOPS_TEST(pooling_simd_odd_width) {
     pooling(input, out_s, attrs);
 
     const int64_t N = 1, C = 2, IH = 10, IW = 10, OH = 8, OW = 7;
-    ref_pooling_2d_max(input.data_as<float>(), ref_buf.data(),
+    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
                        N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -506,7 +506,7 @@ NNOPS_TEST(pooling_simd_avg_stride_2_no_simd) {
     pooling(input, out_s, attrs);
 
     const int64_t N = 1, C = 2, IH = 16, IW = 16, OH = 8, OW = 8;
-    ref_pooling_2d_avg(input.data_as<float>(), ref_buf.data(),
+    ref_pooling_2d_avg(input.ptr<float>(), ref_buf.data(),
                        N, C, IH, IW, OH, OW, 2, 2, 2, 2, 0, 0);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
@@ -533,7 +533,7 @@ NNOPS_TEST(pooling_simd_3d_max_vs_ref) {
     const int64_t N = 1, C = 2, ID = 8, IH = 12, IW = 12;
     const int64_t OD = 6, OH = 10, OW = 10;
     const int64_t KD = 3, KH = 3, KW = 3;
-    const auto* in_ptr = input.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
     auto* ref_ptr = ref_buf.data();
     const int64_t in_ch_s = ID * IH * IW;
     const int64_t out_ch_s = OD * OH * OW;
@@ -591,7 +591,7 @@ NNOPS_TEST(pooling_simd_3d_avg_vs_ref) {
     const int64_t OD = 6, OH = 10, OW = 10;
     const int64_t KD = 3, KH = 3, KW = 3;
     const float scale = 1.0f / static_cast<float>(KD * KH * KW);
-    const auto* in_ptr = input.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
     auto* ref_ptr = ref_buf.data();
     const int64_t in_ch_s = ID * IH * IW;
     const int64_t out_ch_s = OD * OH * OW;
@@ -645,7 +645,7 @@ NNOPS_TEST(pooling_simd_avg_exclude_pad_vs_ref) {
     // Inline reference
     const int64_t N = 1, C = 2, IH = 4, IW = 4, OH = 4, OW = 4;
     const int64_t KH = 3, KW = 3, K_TOTAL = 9;
-    const auto* in_ptr = input.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
     auto* ref_ptr = ref_buf.data();
 
     for (int64_t n = 0; n < N; ++n) {
@@ -694,7 +694,7 @@ NNOPS_TEST(pooling_simd_lp_vs_ref) {
     // Inline reference
     const int64_t N = 1, C = 1, IH = 4, IW = 4, OH = 2, OW = 2;
     const int64_t KH = 3, KW = 3, P = 2;
-    const auto* in_ptr = input.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
     auto* ref_ptr = ref_buf.data();
 
     for (int64_t n = 0; n < N; ++n) {
@@ -742,7 +742,7 @@ NNOPS_TEST(pooling_simd_3d_padding) {
     const int64_t N = 1, C = 1, ID = 4, IH = 8, IW = 8;
     const int64_t OD = 4, OH = 6, OW = 6;
     const int64_t KD = 3, KH = 3, KW = 3;
-    const auto* in_ptr = input.data_as<float>();
+    const auto* in_ptr = input.ptr<float>();
     auto* ref_ptr = ref_buf.data();
 
     for (int64_t n = 0; n < N; ++n) {

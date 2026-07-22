@@ -36,7 +36,7 @@ inline int64_t nchw_offset(int64_t n, int64_t c,
 
 template <typename T>
 void pooling_impl_ref(const PoolingAttributes& attrs,
-                      const TensorView& output,
+                      TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx)
 {
@@ -67,8 +67,8 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
     const int64_t PH = attrs.padding[1];
     const int64_t PW = attrs.padding[2];
 
-    const auto* in_ptr  = input.data_as<T>();
-    auto* out_ptr = output.data_as<T>();
+    const auto* in_ptr  = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
 
     const int64_t in_row_stride  = input.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
@@ -180,7 +180,7 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
 }
 
 void pooling_ref(const PoolingAttributes& attrs,
-                 const TensorView& output,
+                 TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
                  void* /*workspace*/)

@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void matmul_ref(const MatMulAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* workspace);
@@ -19,7 +19,7 @@ namespace backend::cpu::reference {
 // ============================================================
 struct MatMul::Impl {
     using KernelFn = void (*)(const MatMulAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -57,17 +57,17 @@ MatMul::MatMul(const MatMulAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_matmul_kernel(backend);
 }
 
-void MatMul::compute(std::span<const TensorView> outputs,
+void MatMul::compute(std::span<TensorView> outputs,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 2);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
-    NNOPS_ASSERT(inputs[1].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
+    NNOPS_ASSERT(!inputs[1].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -75,7 +75,7 @@ void MatMul::compute(std::span<const TensorView> outputs,
 // Functional API
 void matmul(const TensorView& a,
             const TensorView& b,
-            const TensorView& c,
+            TensorView& c,
             const MatMulAttributes& attrs,
             const ComputeContext& ctx)
 {

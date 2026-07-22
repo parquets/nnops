@@ -62,7 +62,7 @@ public:
 
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -86,7 +86,7 @@ private:
 void attention(const TensorView& query,
                const TensorView& key,
                const TensorView& value,
-               const TensorView& output,
+               TensorView& output,
                const AttentionAttributes& attrs,
                const ComputeContext& ctx = {},
                void* workspace = nullptr);
@@ -96,7 +96,7 @@ void attention(const TensorView& query,
                const TensorView& key,
                const TensorView& value,
                const TensorView& mask,
-               const TensorView& output,
+               TensorView& output,
                const AttentionAttributes& attrs,
                const ComputeContext& ctx = {},
                void* workspace = nullptr);

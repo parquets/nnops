@@ -52,7 +52,7 @@ public:
     /// inputs[2] = bias tensor [N] (optional)
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -78,20 +78,20 @@ private:
 /// Functional linear without bias (default attributes).
 void linear(const TensorView& input,
             const TensorView& weight,
-            const TensorView& output,
+            TensorView& output,
             const ComputeContext& ctx = {});
 
 /// Functional linear with bias (default attributes).
 void linear(const TensorView& input,
             const TensorView& weight,
             const TensorView& bias,
-            const TensorView& output,
+            TensorView& output,
             const ComputeContext& ctx = {});
 
 /// Functional linear without bias, with epilogue support.
 void linear(const TensorView& input,
             const TensorView& weight,
-            const TensorView& output,
+            TensorView& output,
             const LinearAttributes& attrs,
             const ComputeContext& ctx = {});
 
@@ -99,7 +99,7 @@ void linear(const TensorView& input,
 void linear(const TensorView& input,
             const TensorView& weight,
             const TensorView& bias,
-            const TensorView& output,
+            TensorView& output,
             const LinearAttributes& attrs,
             const ComputeContext& ctx = {});
 

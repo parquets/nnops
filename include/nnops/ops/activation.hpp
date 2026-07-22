@@ -55,7 +55,7 @@ public:
 
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -77,7 +77,7 @@ private:
 
 /// Functional activation.
 void activation(const TensorView& input,
-                const TensorView& output,
+                TensorView& output,
                 const ActivationAttributes& attrs,
                 const ComputeContext& ctx = {});
 

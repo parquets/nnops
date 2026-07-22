@@ -19,8 +19,8 @@ inline bool allclose(const TensorView& a, const TensorView& b,
     if (a.data_type() != b.data_type()) return false;
 
     const int64_t N = a.numel();
-    const auto* ap = a.data_as<float>();
-    const auto* bp = b.data_as<float>();
+    const auto* ap = a.ptr<float>();
+    const auto* bp = b.ptr<float>();
 
     for (int64_t i = 0; i < N; ++i) {
         float diff = std::abs(ap[i] - bp[i]);
@@ -39,8 +39,8 @@ inline float max_diff(const TensorView& a, const TensorView& b)
     if (a.data_type() != b.data_type()) return std::numeric_limits<float>::infinity();
 
     const int64_t N = a.numel();
-    const auto* ap = a.data_as<float>();
-    const auto* bp = b.data_as<float>();
+    const auto* ap = a.ptr<float>();
+    const auto* bp = b.ptr<float>();
 
     float max_d = 0.0f;
     for (int64_t i = 0; i < N; ++i) {

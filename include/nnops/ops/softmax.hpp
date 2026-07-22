@@ -53,7 +53,7 @@ public:
     /// inputs[0] = input tensor (any rank >= 1)
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -79,7 +79,7 @@ private:
 
 /// Functional softmax.
 void softmax(const TensorView& input,
-             const TensorView& output,
+             TensorView& output,
              const SoftmaxAttributes& attrs = {},
              const ComputeContext& ctx = {});
 

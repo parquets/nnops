@@ -25,7 +25,7 @@ NNOPS_TEST(tensor_view_dense_construction) {
     NNOPS_EXPECT_EQ(tv.stride_elems(0), 12);
     NNOPS_EXPECT_EQ(tv.numel(), 24);
     NNOPS_EXPECT_FALSE(tv.is_empty());
-    NNOPS_EXPECT_EQ(tv.data(), static_cast<void*>(data));
+    NNOPS_EXPECT_EQ(tv.ptr<void>(), static_cast<void*>(data));
     NNOPS_EXPECT_EQ(tv.data_type(), DataType::f32);
     NNOPS_EXPECT_EQ(tv.layout(), TensorLayout::NCHW);
 }
@@ -51,7 +51,7 @@ NNOPS_TEST(tensor_view_explicit_pitch) {
 NNOPS_TEST(tensor_view_default_empty) {
     TensorView tv;
     NNOPS_EXPECT_EQ(tv.rank(), 0);
-    NNOPS_EXPECT_EQ(tv.data(), nullptr);
+    NNOPS_EXPECT_EQ(tv.ptr<void>(), nullptr);
     NNOPS_EXPECT_TRUE(tv.is_empty());
     NNOPS_EXPECT_EQ(tv.numel(), 0);
 }
@@ -63,12 +63,12 @@ NNOPS_TEST(tensor_view_nbytes) {
     NNOPS_EXPECT_EQ(static_cast<int64_t>(tv.nbytes()), 24 * 4);  // 24 floats * 4 bytes
 }
 
-NNOPS_TEST(tensor_view_data_as) {
+NNOPS_TEST(tensor_view_ptr) {
     const int64_t shape[] = {4};
     float data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
 
     TensorView tv(shape, DataType::f32, data);
-    auto* fp = tv.data_as<float>();
+    auto* fp = tv.ptr<float>();
     NNOPS_EXPECT_EQ(fp[0], 1.0f);
     NNOPS_EXPECT_EQ(fp[3], 4.0f);
 }

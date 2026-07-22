@@ -386,7 +386,7 @@ inline void avgpool_h1_simd(
 
 template <typename T>
 void pooling_impl(const PoolingAttributes& attrs,
-                  const TensorView& output,
+                  TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx)
 {
@@ -425,8 +425,8 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t PH = attrs.padding[1];
     const int64_t PW = attrs.padding[2];
 
-    auto* out_ptr = output.data_as<T>();
-    const auto* in_ptr = input.data_as<T>();
+    auto* out_ptr = output.ptr<T>();
+    const auto* in_ptr = input.ptr<T>();
 
     // ----- Strides derived from pitch (row pitch in bytes → element stride) -----
     const int64_t in_row_stride   = input.row_stride_elems();   // elements per input row (>= IW)
@@ -736,7 +736,7 @@ void pooling_impl(const PoolingAttributes& attrs,
 // ============================================================
 
 void pooling_cpu(const PoolingAttributes& attrs,
-                  const TensorView& output,
+                  TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
                   void* /*workspace*/)

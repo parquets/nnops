@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void pooling_ref(const PoolingAttributes& attrs,
-                     const TensorView& output,
+                     TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace);
@@ -16,7 +16,7 @@ namespace backend::cpu::reference {
 
 namespace backend::cpu {
     void pooling_cpu(const PoolingAttributes& attrs,
-                      const TensorView& output,
+                      TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
                       void* workspace);
@@ -27,7 +27,7 @@ namespace backend::cpu {
 // ============================================================
 struct Pooling::Impl {
     using KernelFn = void (*)(const PoolingAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -65,23 +65,23 @@ Pooling::Pooling(const PoolingAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_pooling_kernel(backend);
 }
 
-void Pooling::compute(std::span<const TensorView> outputs,
+void Pooling::compute(std::span<TensorView> outputs,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 1);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
 // Functional API
 void pooling(const TensorView& input,
-             const TensorView& output,
+             TensorView& output,
              const PoolingAttributes& attrs,
              const ComputeContext& ctx)
 {

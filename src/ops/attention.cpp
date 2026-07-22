@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void attention_ref(const AttentionAttributes& attrs,
-                       const TensorView& output,
+                       TensorView& output,
                        std::span<const TensorView> inputs,
                        const ComputeContext& ctx,
                        void* workspace);
@@ -19,7 +19,7 @@ namespace backend::cpu::reference {
 // ============================================================
 struct Attention::Impl {
     using KernelFn = void (*)(const AttentionAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -67,7 +67,7 @@ size_t Attention::getWorkspace() const
     return 0;
 }
 
-void Attention::compute(std::span<const TensorView> outputs,
+void Attention::compute(std::span<TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
                          void* workspace)
@@ -75,11 +75,11 @@ void Attention::compute(std::span<const TensorView> outputs,
     NNOPS_ASSERT(inputs.size() >= 3);
     NNOPS_ASSERT(inputs.size() <= 4);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
-    NNOPS_ASSERT(inputs[1].data() != nullptr);
-    NNOPS_ASSERT(inputs[2].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
+    NNOPS_ASSERT(!inputs[1].is_empty());
+    NNOPS_ASSERT(!inputs[2].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -88,7 +88,7 @@ void Attention::compute(std::span<const TensorView> outputs,
 void attention(const TensorView& query,
                const TensorView& key,
                const TensorView& value,
-               const TensorView& output,
+               TensorView& output,
                const AttentionAttributes& attrs,
                const ComputeContext& ctx,
                void* workspace)
@@ -103,7 +103,7 @@ void attention(const TensorView& query,
                const TensorView& key,
                const TensorView& value,
                const TensorView& mask,
-               const TensorView& output,
+               TensorView& output,
                const AttentionAttributes& attrs,
                const ComputeContext& ctx,
                void* workspace)

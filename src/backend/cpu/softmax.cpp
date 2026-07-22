@@ -141,7 +141,7 @@ void softmax_general_scalar(
 
 template <typename T>
 void softmax_impl(const SoftmaxAttributes& attrs,
-                   const TensorView& output,
+                   TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx)
 {
@@ -168,8 +168,8 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         norm_size *= X.shape(i);
     }
 
-    const auto* x_ptr = X.data_as<T>();
-    auto* y_ptr = output.data_as<T>();
+    const auto* x_ptr = X.ptr<T>();
+    auto* y_ptr = output.ptr<T>();
 
     // ============================================================
     // Fast path: axis is the innermost contiguous dimension
@@ -361,7 +361,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 // ============================================================
 
 void softmax_cpu(const SoftmaxAttributes& attrs,
-                  const TensorView& output,
+                  TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
                   void* /*workspace*/)

@@ -39,7 +39,7 @@ void softmax_last_dim(float* data, int64_t rows, int64_t cols) {
 }  // namespace
 
 void attention_ref(const AttentionAttributes& attrs,
-                   const TensorView& output,
+                   TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,
                    void* /*workspace*/)
@@ -71,11 +71,11 @@ void attention_ref(const AttentionAttributes& attrs,
         ? (1.0f / std::sqrt(static_cast<float>(D)))
         : attrs.scale;
 
-    const auto* q_ptr = Q.data_as<float>();
-    const auto* k_ptr = K.data_as<float>();
-    const auto* v_ptr = V.data_as<float>();
-    const auto* mask_ptr = has_mask ? inputs[3].data_as<float>() : nullptr;
-    auto* out_ptr = output.data_as<float>();
+    const auto* q_ptr = Q.ptr<float>();
+    const auto* k_ptr = K.ptr<float>();
+    const auto* v_ptr = V.ptr<float>();
+    const auto* mask_ptr = has_mask ? inputs[3].ptr<float>() : nullptr;
+    auto* out_ptr = output.ptr<float>();
 
     // Row strides in elements (from pitch, accounts for padding)
     const int64_t q_row_stride = Q.row_stride_elems();  // merged: >= H*D, explicit: >= D

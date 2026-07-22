@@ -9,7 +9,7 @@ namespace nnops {
 // Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void conv2d_ref(const Conv2DAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* workspace);
@@ -20,7 +20,7 @@ namespace backend::cpu::reference {
 // ============================================================
 struct Conv2D::Impl {
     using KernelFn = void (*)(const Conv2DAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -77,7 +77,7 @@ size_t Conv2D::getWorkspace() const
 // ============================================================
 // compute
 // ============================================================
-void Conv2D::compute(std::span<const TensorView> outputs,
+void Conv2D::compute(std::span<TensorView> outputs,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace)
@@ -85,10 +85,10 @@ void Conv2D::compute(std::span<const TensorView> outputs,
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(inputs.size() <= 3);  // input, weight [, bias]
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
-    NNOPS_ASSERT(inputs[1].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
+    NNOPS_ASSERT(!inputs[1].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -98,7 +98,7 @@ void Conv2D::compute(std::span<const TensorView> outputs,
 // ============================================================
 void conv2d(const TensorView& input,
             const TensorView& weight,
-            const TensorView& output,
+            TensorView& output,
             const Conv2DAttributes& attrs,
             const ComputeContext& ctx,
             void* workspace)
@@ -111,7 +111,7 @@ void conv2d(const TensorView& input,
 void conv2d(const TensorView& input,
             const TensorView& weight,
             const TensorView& bias,
-            const TensorView& output,
+            TensorView& output,
             const Conv2DAttributes& attrs,
             const ComputeContext& ctx,
             void* workspace)

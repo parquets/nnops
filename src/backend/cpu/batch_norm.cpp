@@ -27,7 +27,7 @@ using namespace nnops::simd;
 
 template <typename T>
 void batch_norm_impl(const BatchNormAttributes& attrs,
-                      const TensorView& output,
+                      TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx)
 {
@@ -55,12 +55,12 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
         }
     }
 
-    const auto* x_ptr  = X.data_as<T>();
-    const auto* s_ptr  = scale.data_as<T>();
-    const auto* b_ptr  = bias.data_as<T>();
-    const auto* m_ptr  = mean.data_as<T>();
-    const auto* v_ptr  = var.data_as<T>();
-    auto* y_ptr = output.data_as<T>();
+    const auto* x_ptr  = X.ptr<T>();
+    const auto* s_ptr  = scale.ptr<T>();
+    const auto* b_ptr  = bias.ptr<T>();
+    const auto* m_ptr  = mean.ptr<T>();
+    const auto* v_ptr  = var.ptr<T>();
+    auto* y_ptr = output.ptr<T>();
 
     constexpr int L = simd_lane_for<T>;
 
@@ -179,7 +179,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
 // ============================================================
 
 void batch_norm_cpu(const BatchNormAttributes& attrs,
-                     const TensorView& output,
+                     TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* /*workspace*/)

@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void batch_norm_ref(const BatchNormAttributes& attrs,
-                        const TensorView& output,
+                        TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
                         void* workspace);
@@ -16,7 +16,7 @@ namespace backend::cpu::reference {
 
 namespace backend::cpu {
     void batch_norm_cpu(const BatchNormAttributes& attrs,
-                        const TensorView& output,
+                        TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
                         void* workspace);
@@ -27,7 +27,7 @@ namespace backend::cpu {
 // ============================================================
 struct BatchNorm::Impl {
     using KernelFn = void (*)(const BatchNormAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -65,20 +65,20 @@ BatchNorm::BatchNorm(const BatchNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_batch_norm_kernel(backend);
 }
 
-void BatchNorm::compute(std::span<const TensorView> outputs,
+void BatchNorm::compute(std::span<TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
                          void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 5);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);  // X
-    NNOPS_ASSERT(inputs[1].data() != nullptr);  // scale
-    NNOPS_ASSERT(inputs[2].data() != nullptr);  // bias
-    NNOPS_ASSERT(inputs[3].data() != nullptr);  // mean
-    NNOPS_ASSERT(inputs[4].data() != nullptr);  // var
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());  // X
+    NNOPS_ASSERT(!inputs[1].is_empty());  // scale
+    NNOPS_ASSERT(!inputs[2].is_empty());  // bias
+    NNOPS_ASSERT(!inputs[3].is_empty());  // mean
+    NNOPS_ASSERT(!inputs[4].is_empty());  // var
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -89,7 +89,7 @@ void batch_norm(const TensorView& x,
                 const TensorView& bias,
                 const TensorView& mean,
                 const TensorView& var,
-                const TensorView& output,
+                TensorView& output,
                 const BatchNormAttributes& attrs,
                 const ComputeContext& ctx)
 {

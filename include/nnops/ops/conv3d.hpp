@@ -73,7 +73,7 @@ public:
     /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -101,7 +101,7 @@ private:
 /// Functional conv3d without bias.
 void conv3d(const TensorView& input,
             const TensorView& weight,
-            const TensorView& output,
+            TensorView& output,
             const Conv3DAttributes& attrs,
             const ComputeContext& ctx = {},
             void* workspace = nullptr);
@@ -110,7 +110,7 @@ void conv3d(const TensorView& input,
 void conv3d(const TensorView& input,
             const TensorView& weight,
             const TensorView& bias,
-            const TensorView& output,
+            TensorView& output,
             const Conv3DAttributes& attrs,
             const ComputeContext& ctx = {},
             void* workspace = nullptr);

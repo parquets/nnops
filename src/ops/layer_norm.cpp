@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void layer_norm_ref(const LayerNormAttributes& attrs,
-                        const TensorView& output,
+                        TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
                         void* workspace);
@@ -16,7 +16,7 @@ namespace backend::cpu::reference {
 
 namespace backend::cpu {
     void layer_norm_cpu(const LayerNormAttributes& attrs,
-                        const TensorView& output,
+                        TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
                         void* workspace);
@@ -27,7 +27,7 @@ namespace backend::cpu {
 // ============================================================
 struct LayerNorm::Impl {
     using KernelFn = void (*)(const LayerNormAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -65,7 +65,7 @@ LayerNorm::LayerNorm(const LayerNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_layer_norm_kernel(backend);
 }
 
-void LayerNorm::compute(std::span<const TensorView> outputs,
+void LayerNorm::compute(std::span<TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
                          void* workspace)
@@ -73,10 +73,10 @@ void LayerNorm::compute(std::span<const TensorView> outputs,
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(inputs.size() <= 3);  // x, scale [, bias]
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);  // X
-    NNOPS_ASSERT(inputs[1].data() != nullptr);  // scale
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());  // X
+    NNOPS_ASSERT(!inputs[1].is_empty());  // scale
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -84,7 +84,7 @@ void LayerNorm::compute(std::span<const TensorView> outputs,
 // Functional API (without bias)
 void layer_norm(const TensorView& x,
                 const TensorView& scale,
-                const TensorView& output,
+                TensorView& output,
                 const LayerNormAttributes& attrs,
                 const ComputeContext& ctx)
 {
@@ -97,7 +97,7 @@ void layer_norm(const TensorView& x,
 void layer_norm(const TensorView& x,
                 const TensorView& scale,
                 const TensorView& bias,
-                const TensorView& output,
+                TensorView& output,
                 const LayerNormAttributes& attrs,
                 const ComputeContext& ctx)
 {

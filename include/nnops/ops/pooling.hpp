@@ -84,7 +84,7 @@ public:
 
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -106,7 +106,7 @@ private:
 
 /// Functional pooling.
 void pooling(const TensorView& input,
-             const TensorView& output,
+             TensorView& output,
              const PoolingAttributes& attrs,
              const ComputeContext& ctx = {});
 

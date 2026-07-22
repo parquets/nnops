@@ -94,7 +94,7 @@ inline void fill_random_float(TensorView& tensor,
                                uint64_t seed = 12345)
 {
     XorShift128 rng(seed);
-    rng.fill_float(tensor.data_as<float>(), tensor.numel(), min, max);
+    rng.fill_float(tensor.ptr<float>(), tensor.numel(), min, max);
 }
 
 }  // namespace nnops::test

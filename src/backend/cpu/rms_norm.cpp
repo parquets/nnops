@@ -108,7 +108,7 @@ void rms_norm_general_scalar(
 
 template <typename T>
 void rms_norm_impl(const RMSNormAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx)
 {
@@ -133,9 +133,9 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
         norm_size *= X.shape(i);
     }
 
-    const auto* x_ptr = X.data_as<T>();
-    const auto* s_ptr = scale.data_as<T>();
-    auto* y_ptr = output.data_as<T>();
+    const auto* x_ptr = X.ptr<T>();
+    const auto* s_ptr = scale.ptr<T>();
+    auto* y_ptr = output.ptr<T>();
 
     const bool add_to = attrs.add_to;
 
@@ -235,7 +235,7 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
 // ============================================================
 
 void rms_norm_cpu(const RMSNormAttributes& attrs,
-                   const TensorView& output,
+                   TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,
                    void* /*workspace*/)

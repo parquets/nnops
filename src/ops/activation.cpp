@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu {
     void activation_cpu(const ActivationAttributes& attrs,
-                         const TensorView& output,
+                         TensorView& output,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
                          void* workspace);
@@ -16,7 +16,7 @@ namespace backend::cpu {
 
 namespace backend::cpu::reference {
     void activation_ref(const ActivationAttributes& attrs,
-                        const TensorView& output,
+                        TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
                         void* workspace);
@@ -27,7 +27,7 @@ namespace backend::cpu::reference {
 // ============================================================
 struct Activation::Impl {
     using KernelFn = void (*)(const ActivationAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -65,23 +65,23 @@ Activation::Activation(const ActivationAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_activation_kernel(backend);
 }
 
-void Activation::compute(std::span<const TensorView> outputs,
+void Activation::compute(std::span<TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
                          void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 1);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
 // Functional API
 void activation(const TensorView& input,
-                const TensorView& output,
+                TensorView& output,
                 const ActivationAttributes& attrs,
                 const ComputeContext& ctx)
 {

@@ -54,7 +54,7 @@ public:
     /// inputs[1] = scale, broadcastable to X.shape[axis:]
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -81,7 +81,7 @@ private:
 /// Functional rms_norm.
 void rms_norm(const TensorView& x,
               const TensorView& scale,
-              const TensorView& output,
+              TensorView& output,
               const RMSNormAttributes& attrs = {},
               const ComputeContext& ctx = {});
 

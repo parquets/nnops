@@ -13,7 +13,7 @@
 namespace nnops::backend::cpu::reference {
 
 void softmax_ref(const SoftmaxAttributes& attrs,
-                 const TensorView& output,
+                 TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
                  void* /*workspace*/)
@@ -36,8 +36,8 @@ void softmax_ref(const SoftmaxAttributes& attrs,
     const int64_t axis_elems = input.stride_elems(axis);  // element stride along axis (accounts for pitch)
     const int64_t inner_elems = input.stride_elems(rank - 1);  // always 1
 
-    const auto* in_ptr  = input.data_as<float>();
-    auto* out_ptr = output.data_as<float>();
+    const auto* in_ptr  = input.ptr<float>();
+    auto* out_ptr = output.ptr<float>();
     const bool log_softmax = attrs.log_softmax;
 
     // Process each row of size D

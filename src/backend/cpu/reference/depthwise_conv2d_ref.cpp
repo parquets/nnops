@@ -20,7 +20,7 @@ using nnops::simd::s_store;
 
 template <typename T>
 void dwconv_impl_ref(const DepthwiseConv2DAttributes& attrs,
-                      const TensorView& output,
+                      TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx)
 {
@@ -48,10 +48,10 @@ void dwconv_impl_ref(const DepthwiseConv2DAttributes& attrs,
     const int64_t PH = attrs.padding[0];
     const int64_t PW = attrs.padding[1];
 
-    auto* out_ptr = output.data_as<T>();
-    const auto* in_ptr  = input.data_as<T>();
-    const auto* w_ptr   = weight.data_as<T>();
-    const auto* b_ptr   = has_bias ? inputs[2].data_as<T>() : nullptr;
+    auto* out_ptr = output.ptr<T>();
+    const auto* in_ptr  = input.ptr<T>();
+    const auto* w_ptr   = weight.ptr<T>();
+    const auto* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     // Per-channel compute lambda (N*C parallel)
     const auto compute_channel = [&](int64_t n, int64_t c) {
@@ -110,7 +110,7 @@ void dwconv_impl_ref(const DepthwiseConv2DAttributes& attrs,
 }
 
 void depthwise_conv2d_ref(const DepthwiseConv2DAttributes& attrs,
-                           const TensorView& output,
+                           TensorView& output,
                            std::span<const TensorView> inputs,
                            const ComputeContext& ctx,
                            void* /*workspace*/)

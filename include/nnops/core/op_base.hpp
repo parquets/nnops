@@ -39,20 +39,20 @@ public:
     /// @param ctx       Backend-specific execution context (stream, thread pool, etc.)
     /// @param workspace Optional pre-allocated scratch buffer of at least
     ///                  getWorkspace() bytes. May be nullptr if getWorkspace() == 0.
-    virtual void compute(std::span<const TensorView> outputs,
+    virtual void compute(std::span<TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx = {},
                          void* workspace = nullptr) = 0;
 
     /// Convenience overload for single-output operators.
     /// Calls the span-based virtual above — no override needed in subclasses.
-    void compute(const TensorView& output,
+    void compute(TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr)
     {
-        const TensorView outputs[] = {output};
-        compute(std::span<const TensorView>(outputs), inputs, ctx, workspace);
+        TensorView outputs[] = {output};
+        compute(std::span<TensorView>(outputs), inputs, ctx, workspace);
     }
 
     /// Returns the ONNX-style operation type identifier.

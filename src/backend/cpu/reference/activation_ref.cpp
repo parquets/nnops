@@ -16,15 +16,15 @@ namespace nnops::backend::cpu::reference {
 // ============================================================
 
 template <typename F>
-static void element_wise_compute(const TensorView& output,
+static void element_wise_compute(TensorView& output,
                                   const TensorView& input,
                                   const ComputeContext& ctx,
                                   F func,
                                   bool add_to)
 {
     const int64_t N = input.numel();
-    const auto* in_ptr  = input.data_as<float>();
-    auto* out_ptr = output.data_as<float>();
+    const auto* in_ptr  = input.ptr<float>();
+    auto* out_ptr = output.ptr<float>();
 
     const auto write = [&](int64_t i, float v) {
         out_ptr[i] = add_to ? out_ptr[i] + v : v;
@@ -41,7 +41,7 @@ static void element_wise_compute(const TensorView& output,
 }
 
 void activation_ref(const ActivationAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* /*workspace*/)

@@ -74,7 +74,7 @@ public:
     /// inputs[2] = bias tensor   [C] (optional)
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -102,7 +102,7 @@ private:
 /// Functional depthwise_conv2d without bias.
 void depthwise_conv2d(const TensorView& input,
                        const TensorView& weight,
-                       const TensorView& output,
+                       TensorView& output,
                        const DepthwiseConv2DAttributes& attrs,
                        const ComputeContext& ctx = {},
                        void* workspace = nullptr);
@@ -111,7 +111,7 @@ void depthwise_conv2d(const TensorView& input,
 void depthwise_conv2d(const TensorView& input,
                        const TensorView& weight,
                        const TensorView& bias,
-                       const TensorView& output,
+                       TensorView& output,
                        const DepthwiseConv2DAttributes& attrs,
                        const ComputeContext& ctx = {},
                        void* workspace = nullptr);

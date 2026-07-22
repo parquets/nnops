@@ -59,7 +59,7 @@ public:
     /// inputs[4] = var [C] (or [C, D1...] if !spatial)
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -89,7 +89,7 @@ void batch_norm(const TensorView& x,
                 const TensorView& bias,
                 const TensorView& mean,
                 const TensorView& var,
-                const TensorView& output,
+                TensorView& output,
                 const BatchNormAttributes& attrs = {},
                 const ComputeContext& ctx = {});
 

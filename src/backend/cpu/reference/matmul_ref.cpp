@@ -9,7 +9,7 @@
 namespace nnops::backend::cpu::reference {
 
 void matmul_ref(const MatMulAttributes& attrs,
-                const TensorView& output,
+                TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
@@ -21,9 +21,9 @@ void matmul_ref(const MatMulAttributes& attrs,
     const int64_t K = attrs.transpose_a ? a.shape(0) : a.shape(1);
     const int64_t N = attrs.transpose_b ? b.shape(0) : b.shape(1);
 
-    const auto* a_ptr = a.data_as<float>();
-    const auto* b_ptr = b.data_as<float>();
-    auto* c_ptr = output.data_as<float>();
+    const auto* a_ptr = a.ptr<float>();
+    const auto* b_ptr = b.ptr<float>();
+    auto* c_ptr = output.ptr<float>();
 
     // Row strides in elements (from pitch, >= innermost dim size)
     const int64_t a_row_stride = a.row_stride_elems();

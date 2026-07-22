@@ -16,7 +16,7 @@
 namespace nnops::backend::cpu::reference {
 
 void batch_norm_ref(const BatchNormAttributes& attrs,
-                    const TensorView& output,
+                    TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
                     void* /*workspace*/)
@@ -45,12 +45,12 @@ void batch_norm_ref(const BatchNormAttributes& attrs,
         }
     }
 
-    const auto* x_ptr  = X.data_as<float>();
-    const auto* s_ptr  = scale.data_as<float>();
-    const auto* b_ptr  = bias.data_as<float>();
-    const auto* m_ptr  = mean.data_as<float>();
-    const auto* v_ptr  = var.data_as<float>();
-    auto* y_ptr = output.data_as<float>();
+    const auto* x_ptr  = X.ptr<float>();
+    const auto* s_ptr  = scale.ptr<float>();
+    const auto* b_ptr  = bias.ptr<float>();
+    const auto* m_ptr  = mean.ptr<float>();
+    const auto* v_ptr  = var.ptr<float>();
+    auto* y_ptr = output.ptr<float>();
 
     if (attrs.spatial) {
         // Spatial mode: per-channel statistics

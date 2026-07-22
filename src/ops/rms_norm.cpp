@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu::reference {
     void rms_norm_ref(const RMSNormAttributes& attrs,
-                      const TensorView& output,
+                      TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
                       void* workspace);
@@ -16,7 +16,7 @@ namespace backend::cpu::reference {
 
 namespace backend::cpu {
     void rms_norm_cpu(const RMSNormAttributes& attrs,
-                      const TensorView& output,
+                      TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
                       void* workspace);
@@ -27,7 +27,7 @@ namespace backend::cpu {
 // ============================================================
 struct RMSNorm::Impl {
     using KernelFn = void (*)(const RMSNormAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -65,17 +65,17 @@ RMSNorm::RMSNorm(const RMSNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_rms_norm_kernel(backend);
 }
 
-void RMSNorm::compute(std::span<const TensorView> outputs,
+void RMSNorm::compute(std::span<TensorView> outputs,
                        std::span<const TensorView> inputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 2);  // x, scale
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);  // X
-    NNOPS_ASSERT(inputs[1].data() != nullptr);  // scale
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());  // X
+    NNOPS_ASSERT(!inputs[1].is_empty());  // scale
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
@@ -83,7 +83,7 @@ void RMSNorm::compute(std::span<const TensorView> outputs,
 // Functional API
 void rms_norm(const TensorView& x,
               const TensorView& scale,
-              const TensorView& output,
+              TensorView& output,
               const RMSNormAttributes& attrs,
               const ComputeContext& ctx)
 {

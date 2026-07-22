@@ -58,7 +58,7 @@ public:
     /// inputs[2] = bias (optional), same broadcast rules as scale
     using OpBase::compute;
 
-    void compute(std::span<const TensorView> outputs,
+    void compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -85,7 +85,7 @@ private:
 /// Functional layernorm (2 inputs: x + scale, no bias).
 void layer_norm(const TensorView& x,
                 const TensorView& scale,
-                const TensorView& output,
+                TensorView& output,
                 const LayerNormAttributes& attrs = {},
                 const ComputeContext& ctx = {});
 
@@ -93,7 +93,7 @@ void layer_norm(const TensorView& x,
 void layer_norm(const TensorView& x,
                 const TensorView& scale,
                 const TensorView& bias,
-                const TensorView& output,
+                TensorView& output,
                 const LayerNormAttributes& attrs = {},
                 const ComputeContext& ctx = {});
 

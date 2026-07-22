@@ -30,7 +30,7 @@ using namespace nnops::simd;
 
 template <typename T>
 void activation_impl(const ActivationAttributes& attrs,
-                     const TensorView& output,
+                     TensorView& output,
                      std::span<const TensorView> inputs)
 {
     const auto& input = inputs[0];
@@ -46,8 +46,8 @@ void activation_impl(const ActivationAttributes& attrs,
     const int64_t in_row_stride = input.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
 
-    const auto* in_ptr  = input.data_as<T>();
-    auto* out_ptr = output.data_as<T>();
+    const auto* in_ptr  = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
     const bool add_to = attrs.add_to;
 
     constexpr int L = simd_lane_for<T>;
@@ -321,7 +321,7 @@ void activation_impl(const ActivationAttributes& attrs,
 // ============================================================
 
 void activation_cpu(const ActivationAttributes& attrs,
-                     const TensorView& output,
+                     TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& /*ctx*/,
                      void* /*workspace*/)

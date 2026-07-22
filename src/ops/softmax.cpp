@@ -8,7 +8,7 @@ namespace nnops {
 
 namespace backend::cpu {
     void softmax_cpu(const SoftmaxAttributes& attrs,
-                     const TensorView& output,
+                     TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace);
@@ -16,7 +16,7 @@ namespace backend::cpu {
 
 namespace backend::cpu::reference {
     void softmax_ref(const SoftmaxAttributes& attrs,
-                     const TensorView& output,
+                     TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace);
@@ -27,7 +27,7 @@ namespace backend::cpu::reference {
 // ============================================================
 struct Softmax::Impl {
     using KernelFn = void (*)(const SoftmaxAttributes&,
-                               const TensorView&,
+                               TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
                                void*);
@@ -65,23 +65,23 @@ Softmax::Softmax(const SoftmaxAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_softmax_kernel(backend);
 }
 
-void Softmax::compute(std::span<const TensorView> outputs,
+void Softmax::compute(std::span<TensorView> outputs,
                        std::span<const TensorView> inputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
     NNOPS_ASSERT(inputs.size() == 1);
     NNOPS_ASSERT(outputs.size() == 1);
-    const auto& output = outputs[0];
-    NNOPS_ASSERT(output.data() != nullptr);
-    NNOPS_ASSERT(inputs[0].data() != nullptr);
+    auto& output = outputs[0];
+    NNOPS_ASSERT(!output.is_empty());
+    NNOPS_ASSERT(!inputs[0].is_empty());
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
 // Functional API
 void softmax(const TensorView& input,
-             const TensorView& output,
+             TensorView& output,
              const SoftmaxAttributes& attrs,
              const ComputeContext& ctx)
 {
