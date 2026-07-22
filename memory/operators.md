@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T15:02:48.661Z
+  modified: 2026-07-22T15:49:14.148Z
 ---
 
 # Implemented Operators
@@ -87,6 +87,57 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Input:** Q/K/V — merged `[B, S, H*D]` or explicit `[B, H, S, D]`, optional mask
 - **CPU Reference:** Per-head parallel → QK^T → scale → mask → softmax → weighted V sum
 - **Added:** 2026-07-20
+
+## BatchNorm
+
+- **Files:** `include/nnops/ops/batch_norm.hpp`, `src/ops/batch_norm.cpp`, `src/backend/cpu/batch_norm.cpp`, `src/backend/cpu/reference/batch_norm_ref.cpp`
+- **Attributes:** `BatchNormAttributes` — epsilon (1e-5), spatial (true=per-channel shape [C], false=per-element), add_to
+- **Input (5):** X `[N, C, D1...]`, scale `[C]`, bias `[C]`, mean `[C]`, var `[C]`
+- **Output:** Y `[N, C, D1...]`
+- **Formula (fused):** `y = x * (inv_std * scale) + (bias - mean * inv_std * scale)`
+- **SIMD Kernel** (`src/backend/cpu/batch_norm.cpp`): Templated `batch_norm_impl<T>` using generic SIMD API (`v_load`/`v_store`/`v_set1`/`s_load`/`s_store`). Two-code paths: spatial mode (row-by-row SIMD over spatial dims) and non-spatial mode (flat vectorized). Pitch-aware via `row_stride_elems()` / `stride_elems()`.
+- **Data types:** f32 and f16 via dtype dispatch at entry point
+- **Updated:** 2026-07-22 — templated for fp16 support with generic SIMD API, pitch-aware strides
+
+## LayerNorm
+
+- **Files:** `include/nnops/ops/layer_norm.hpp`, `src/ops/layer_norm.cpp`, `src/backend/cpu/layer_norm.cpp`, `src/backend/cpu/reference/layer_norm_ref.cpp`
+- **Attributes:** `LayerNormAttributes` — axis (-1), epsilon (1e-5), add_to
+- **Input (2-3):** X `[*]`, scale `[norm_shape]`, optional bias `[norm_shape]`
+- **Output:** Y `[*]`
+- **Formula:** `y = (x - mean) / sqrt(var + epsilon) * scale + bias`
+- **Algorithm:** Two-pass SIMD: Pass 1 — SIMD reduction (sum, sum_sq) using typed SIMD API, then scalar tail uses Welford's online algorithm for numerical stability, merged via parallel Welford formula (Chan et al.); Pass 2 — normalize with scale/bias using typed SIMD + scalar tail. Fast path for contiguous tail (axis == rank-1, the 99% LLM case); general axis falls back to full Welford scalar pass with pre-computed inner offsets.
+- **SIMD Kernel** (`src/backend/cpu/layer_norm.cpp`): Templated `layer_norm_impl<T>`, dtype dispatch at entry. Both passes use the generic typed API. Parallel dispatch over num_rows via `cpu_parallel_for`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
+- **Data types:** f32 and f16
+- **Reference:** onnxruntime `MlasLayerNormF32` / `ComputeJobGenericShared`
+- **Added:** 2026-07-22
+
+## RMSNorm
+
+- **Files:** `include/nnops/ops/rms_norm.hpp`, `src/ops/rms_norm.cpp`, `src/backend/cpu/rms_norm.cpp`, `src/backend/cpu/reference/rms_norm_ref.cpp`
+- **Attributes:** `RMSNormAttributes` — axis (-1), epsilon (1e-5), add_to
+- **Input (2):** X `[*]`, scale `[norm_shape]`
+- **Output:** Y `[*]`
+- **Formula:** `rms = sqrt(mean(x^2) + epsilon)`, `y = x / rms * scale`
+- **Note:** Unlike LayerNorm, no mean subtraction and no bias.
+- **Algorithm:** Two-pass SIMD (same pattern as LayerNorm): Pass 1 — SIMD reduction of sum_sq; Pass 2 — apply `x * inv_rms * scale`. Fast path for axis == rank-1, general scalar fallback for other axes.
+- **SIMD Kernel** (`src/backend/cpu/rms_norm.cpp`): Templated `rms_norm_impl<T>`, dtype dispatch. Same SIMD patterns as LayerNorm.
+- **Data types:** f32 and f16
+- **Reference:** onnxruntime `ComputeJob` with `simplified=true`
+- **Added:** 2026-07-22
+
+## Softmax
+
+- **Files:** `include/nnops/ops/softmax.hpp`, `src/ops/softmax.cpp`, `src/backend/cpu/softmax.cpp`, `src/backend/cpu/reference/softmax_ref.cpp`
+- **Attributes:** `SoftmaxAttributes` — axis (-1), log_softmax (false), add_to
+- **Input (1):** X `[*]` (any rank >= 1)
+- **Output:** Y `[*]` (same shape as input)
+- **Formula:** `softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))`, `log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))`
+- **Algorithm (per row, mirrors onnxruntime):** Three-stage pipeline — (1) ReduceMax: SIMD `v_max` reduction + scalar tail → max_val; (2) ComputeSumExp: SIMD `v_exp` on `(x - max)` + reduce sum, with exp values stored to output for reuse (avoids recomputing exp in softmax non-add_to path); (3) Normalize: softmax = exp/sum via SIMD multiply, or log_softmax = `(x - max) - log(sum)`. Fast path for axis == rank-1 (contiguous last dim, the 99% LLM attention case); general axis falls back to scalar path with pre-computed inner offsets.
+- **SIMD Kernel** (`src/backend/cpu/softmax.cpp`): Templated `softmax_impl<T>`, dtype dispatch at entry. All three passes use the generic typed API (`v_load`/`v_store`/`v_max`/`v_exp`/`v_add`/`v_mul`/`v_set1`/`v_reduce_sum`/`s_load`/`s_store`). `reduce_max_vec` helper reduces SIMD max vector to scalar via temp store+scan (the SIMD layer has `v_reduce_sum` but no `v_reduce_max`). Parallel dispatch over num_rows via `cpu_parallel_for`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
+- **Data types:** f32 and f16
+- **Reference:** onnxruntime `MlasComputeSoftmax` / `MlasReduceMaximumF32Kernel` / `MlasComputeSumExpF32Kernel` / `MlasComputeSoftmaxOutputF32Kernel`
+- **Added:** 2026-07-22
 
 ## Operator Implementation Pattern
 

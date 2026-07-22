@@ -26,7 +26,10 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/activation.cpp
     backend/cpu/batch_norm.cpp
     backend/cpu/depthwise_conv2d.cpp
+    backend/cpu/layer_norm.cpp
     backend/cpu/pooling.cpp
+    backend/cpu/rms_norm.cpp
+    backend/cpu/softmax.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp

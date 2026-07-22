@@ -14,6 +14,14 @@ namespace backend::cpu::reference {
                       void* workspace);
 }
 
+namespace backend::cpu {
+    void rms_norm_cpu(const RMSNormAttributes& attrs,
+                      const TensorView& output,
+                      std::span<const TensorView> inputs,
+                      const ComputeContext& ctx,
+                      void* workspace);
+}
+
 // ============================================================
 // Impl
 // ============================================================
@@ -31,7 +39,7 @@ auto resolve_rms_norm_kernel(Backend backend) -> RMSNorm::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::rms_norm_ref;
+        return backend::cpu::rms_norm_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;

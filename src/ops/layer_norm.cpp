@@ -14,6 +14,14 @@ namespace backend::cpu::reference {
                         void* workspace);
 }
 
+namespace backend::cpu {
+    void layer_norm_cpu(const LayerNormAttributes& attrs,
+                        const TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx,
+                        void* workspace);
+}
+
 // ============================================================
 // Impl
 // ============================================================
@@ -31,7 +39,7 @@ auto resolve_layer_norm_kernel(Backend backend) -> LayerNorm::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::layer_norm_ref;
+        return backend::cpu::layer_norm_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;

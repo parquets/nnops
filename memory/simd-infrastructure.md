@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T14:52:26.357Z
+  modified: 2026-07-22T15:37:14.105Z
 ---
 
 # SIMD Abstraction Layer
@@ -18,7 +18,7 @@ Cross-platform SIMD intrinsic wrappers for x86_64 and AArch64, with automatic sc
 
 ## Relationship to GEMM Micro-Kernels
 
-The SIMD abstraction layer (`include/nnops/detail/simd/`) serves platform-independent operator code (e.g., element-wise ops like Relu, BatchNorm). In contrast, the GEMM micro-kernels in `src/backend/cpu/{x86_64,aarch64}/` use **raw architecture-specific intrinsics directly** (NEON `float32x4_t`/`float16x8_t`, AVX `__m256`, SSE `__m128`) — not the SIMD wrappers. This is intentional:
+The SIMD abstraction layer (`include/nnops/detail/simd/`) serves platform-independent operator code (e.g., element-wise ops like Relu, BatchNorm, LayerNorm, RMSNorm). In contrast, the GEMM micro-kernels in `src/backend/cpu/{x86_64,aarch64}/` use **raw architecture-specific intrinsics directly** (NEON `float32x4_t`/`float16x8_t`, AVX `__m256`, SSE `__m128`) — not the SIMD wrappers. This is intentional:
 
 - Micro-kernels are hand-tuned for a specific ISA and tile size; portability is not a goal
 - The dispatch layer selects the right micro-kernel at compile time (`#ifdef __x86_64__` / `#ifdef __aarch64__`)
@@ -171,6 +171,33 @@ removed — everything is now part of the SIMD layer.
 |---|---|---|
 | `s_load(ptr)` | `return *p` | `half_to_float(*p)` |
 | `s_store(ptr, v)` | `*p = v` | `*p = float_to_half(v)` |
+
+### Two-pass SIMD Reduction Pattern (2026-07-22)
+
+Used by LayerNorm and RMSNorm for per-row statistics computation:
+
+```cpp
+// Pass 1: accumulate sum and sum_sq in typed vectors (f32-accumulated internally)
+auto v_sum = v_zero(ptr);
+auto v_sum_sq = v_zero(ptr);
+for (; i + L <= norm_size; i += L) {
+    auto v = v_load(ptr + i);
+    v_sum = v_add(v_sum, v);
+    v_sum_sq = v_fmadd(v, v, v_sum_sq);
+}
+float sum = v_reduce_sum(v_sum);      // horizontal reduce → float
+float sum_sq = v_reduce_sum(v_sum_sq);
+
+// Pass 2: normalize with typed vectors
+auto v_inv_std = v_set1(ptr, 1.0f / std::sqrt(var + eps));
+for (; i + L <= norm_size; i += L) {
+    auto v = v_load(ptr + i);
+    auto vs = v_load(scale_ptr + i);
+    v_store(out_ptr + i, v_mul(v_mul(v, v_inv_std), vs));
+}
+```
+
+This pattern avoids the architecture-type mismatch that would occur from mixing `v_cvt_f16_to_f32` (returns `arch::sse::v_f32x8`) with the `v_f32x8` alias (which is `arch::avx2::v_f32x8` on AVX builds). The typed API's `v_f16x8` operations internally compute in f32 on x86 (convert→compute→convert) and ARM NEON, so accumulation precision is maintained.
 
 ### Usage
 

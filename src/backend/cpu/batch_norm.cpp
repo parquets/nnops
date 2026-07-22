@@ -1,9 +1,9 @@
 /// @file batch_norm.cpp
 /// @brief SIMD-optimized CPU implementation of batch normalization (inference only).
 ///
-/// Vectorized with the nnops SIMD abstraction layer. On x86_64 this compiles to
-/// AVX2+FMA (8-wide) by default; on AArch64 to NEON (v_f32x8 emulated); on RISC-V
-/// to V extension.  simd_default_lane_f32 replaces hardcoded width for portability.
+/// Supports both f32 and f16 via a single templated implementation that uses the
+/// generic v_load/v_store/v_set1/s_load/s_store SIMD API. Respects pitch through
+/// row_stride_elems() and stride_elems().
 ///
 /// Fused formula:
 ///   new_scale = inv_std * scale
@@ -19,11 +19,17 @@
 
 namespace nnops::backend::cpu {
 
-void batch_norm_cpu(const BatchNormAttributes& attrs,
-                    const TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* /*workspace*/)
+using namespace nnops::simd;
+
+// ============================================================
+// Templated implementation (f32 and f16)
+// ============================================================
+
+template <typename T>
+void batch_norm_impl(const BatchNormAttributes& attrs,
+                      const TensorView& output,
+                      std::span<const TensorView> inputs,
+                      const ComputeContext& ctx)
 {
     const auto& X     = inputs[0];
     const auto& scale = inputs[1];
@@ -49,26 +55,24 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
         }
     }
 
-    const auto* x_ptr  = X.data_as<float>();
-    const auto* s_ptr  = scale.data_as<float>();
-    const auto* b_ptr  = bias.data_as<float>();
-    const auto* m_ptr  = mean.data_as<float>();
-    const auto* v_ptr  = var.data_as<float>();
-    auto* y_ptr = output.data_as<float>();
+    const auto* x_ptr  = X.data_as<T>();
+    const auto* s_ptr  = scale.data_as<T>();
+    const auto* b_ptr  = bias.data_as<T>();
+    const auto* m_ptr  = mean.data_as<T>();
+    const auto* v_ptr  = var.data_as<T>();
+    auto* y_ptr = output.data_as<T>();
 
-    using namespace nnops::simd;
-
-    constexpr int L = simd_default_lane_f32;  // 8
+    constexpr int L = simd_lane_for<T>;
 
     if (attrs.spatial) {
         // ---- Spatial mode: per-channel statistics ----
-        // Precompute new_scale and new_bias per channel.
+        // Precompute new_scale and new_bias per channel (in float for precision).
         std::vector<float> new_scale(static_cast<size_t>(C));
         std::vector<float> new_bias(static_cast<size_t>(C));
         for (int64_t c = 0; c < C; ++c) {
-            float inv_std = 1.0f / std::sqrt(v_ptr[c] + epsilon);
-            new_scale[static_cast<size_t>(c)] = inv_std * s_ptr[c];
-            new_bias[static_cast<size_t>(c)]  = b_ptr[c] - m_ptr[c] * new_scale[static_cast<size_t>(c)];
+            float inv_std = 1.0f / std::sqrt(s_load(&v_ptr[c]) + epsilon);
+            new_scale[static_cast<size_t>(c)] = inv_std * s_load(&s_ptr[c]);
+            new_bias[static_cast<size_t>(c)]  = s_load(&b_ptr[c]) - s_load(&m_ptr[c]) * new_scale[static_cast<size_t>(c)];
         }
 
         const int64_t x_n_stride = X.stride_elems(0);
@@ -96,25 +100,27 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                     int64_t i = 0;
 
                     if (attrs.add_to) {
-                        const v_f32x8 scale8 = v_set1_f32x8(ns);
-                        const v_f32x8 bias8  = v_set1_f32x8(nb);
+                        const auto scale8 = v_set1(x_ptr, ns);
+                        const auto bias8  = v_set1(x_ptr, nb);
                         for (; i + L <= last_dim; i += L) {
-                            const v_f32x8 x8 = v_load_f32x8(x_ptr + x_off + i);
-                            const v_f32x8 y8 = v_load_f32x8(y_ptr + y_off + i);
+                            const auto x8 = v_load(x_ptr + x_off + i);
+                            const auto y8 = v_load(y_ptr + y_off + i);
                             v_store(y_ptr + y_off + i, v_add(y8, v_fmadd(scale8, x8, bias8)));
                         }
                         for (; i < last_dim; ++i) {
-                            y_ptr[y_off + i] += x_ptr[x_off + i] * ns + nb;
+                            s_store(&y_ptr[y_off + i],
+                                    s_load(&y_ptr[y_off + i]) + s_load(&x_ptr[x_off + i]) * ns + nb);
                         }
                     } else {
-                        const v_f32x8 scale8 = v_set1_f32x8(ns);
-                        const v_f32x8 bias8  = v_set1_f32x8(nb);
+                        const auto scale8 = v_set1(x_ptr, ns);
+                        const auto bias8  = v_set1(x_ptr, nb);
                         for (; i + L <= last_dim; i += L) {
-                            const v_f32x8 x8 = v_load_f32x8(x_ptr + x_off + i);
+                            const auto x8 = v_load(x_ptr + x_off + i);
                             v_store(y_ptr + y_off + i, v_fmadd(scale8, x8, bias8));
                         }
                         for (; i < last_dim; ++i) {
-                            y_ptr[y_off + i] = x_ptr[x_off + i] * ns + nb;
+                            s_store(&y_ptr[y_off + i],
+                                    s_load(&x_ptr[x_off + i]) * ns + nb);
                         }
                     }
                 }
@@ -134,56 +140,79 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
             int64_t i = i_begin;
 
             if (attrs.add_to) {
-                const v_f32x8 eps8 = v_set1_f32x8(epsilon);
-                const v_f32x8 one8 = v_set1_f32x8(1.0f);
+                const auto eps8 = v_set1(x_ptr, epsilon);
+                const auto one8 = v_set1(x_ptr, 1.0f);
 
                 for (; i + L <= i_end; i += L) {
-                    const v_f32x8 x8 = v_load_f32x8(x_ptr + i);
-                    const v_f32x8 s8 = v_load_f32x8(s_ptr + i);
-                    const v_f32x8 b8 = v_load_f32x8(b_ptr + i);
-                    const v_f32x8 m8 = v_load_f32x8(m_ptr + i);
-                    const v_f32x8 v8 = v_load_f32x8(v_ptr + i);
+                    const auto x8 = v_load(x_ptr + i);
+                    const auto s8 = v_load(s_ptr + i);
+                    const auto b8 = v_load(b_ptr + i);
+                    const auto m8 = v_load(m_ptr + i);
+                    const auto v8 = v_load(v_ptr + i);
 
-                    const v_f32x8 inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
-                    const v_f32x8 ns = v_mul(inv_std, s8);
-                    const v_f32x8 nb = v_sub(b8, v_mul(m8, ns));
-                    const v_f32x8 y8 = v_load_f32x8(y_ptr + i);
+                    const auto inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
+                    const auto ns = v_mul(inv_std, s8);
+                    const auto nb = v_sub(b8, v_mul(m8, ns));
+                    const auto y8 = v_load(y_ptr + i);
                     v_store(y_ptr + i, v_add(y8, v_fmadd(ns, x8, nb)));
                 }
 
                 for (; i < i_end; ++i) {
-                    float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
-                    float ns = inv_std * s_ptr[i];
-                    float nb = b_ptr[i] - m_ptr[i] * ns;
-                    y_ptr[i] += x_ptr[i] * ns + nb;
+                    float inv_std_val = 1.0f / std::sqrt(s_load(&v_ptr[i]) + epsilon);
+                    float ns = inv_std_val * s_load(&s_ptr[i]);
+                    float nb = s_load(&b_ptr[i]) - s_load(&m_ptr[i]) * ns;
+                    s_store(&y_ptr[i], s_load(&y_ptr[i]) + s_load(&x_ptr[i]) * ns + nb);
                 }
             } else {
-                const v_f32x8 eps8 = v_set1_f32x8(epsilon);
-                const v_f32x8 one8 = v_set1_f32x8(1.0f);
+                const auto eps8 = v_set1(x_ptr, epsilon);
+                const auto one8 = v_set1(x_ptr, 1.0f);
 
                 for (; i + L <= i_end; i += L) {
-                    const v_f32x8 x8 = v_load_f32x8(x_ptr + i);
-                    const v_f32x8 s8 = v_load_f32x8(s_ptr + i);
-                    const v_f32x8 b8 = v_load_f32x8(b_ptr + i);
-                    const v_f32x8 m8 = v_load_f32x8(m_ptr + i);
-                    const v_f32x8 v8 = v_load_f32x8(v_ptr + i);
+                    const auto x8 = v_load(x_ptr + i);
+                    const auto s8 = v_load(s_ptr + i);
+                    const auto b8 = v_load(b_ptr + i);
+                    const auto m8 = v_load(m_ptr + i);
+                    const auto v8 = v_load(v_ptr + i);
 
-                    const v_f32x8 inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
-                    const v_f32x8 ns = v_mul(inv_std, s8);
-                    const v_f32x8 nb = v_sub(b8, v_mul(m8, ns));
+                    const auto inv_std = v_div(one8, v_sqrt(v_add(v8, eps8)));
+                    const auto ns = v_mul(inv_std, s8);
+                    const auto nb = v_sub(b8, v_mul(m8, ns));
                     v_store(y_ptr + i, v_fmadd(ns, x8, nb));
                 }
 
                 for (; i < i_end; ++i) {
-                    float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
-                    float ns = inv_std * s_ptr[i];
-                    float nb = b_ptr[i] - m_ptr[i] * ns;
-                    y_ptr[i] = x_ptr[i] * ns + nb;
+                    float inv_std_val = 1.0f / std::sqrt(s_load(&v_ptr[i]) + epsilon);
+                    float ns = inv_std_val * s_load(&s_ptr[i]);
+                    float nb = s_load(&b_ptr[i]) - s_load(&m_ptr[i]) * ns;
+                    s_store(&y_ptr[i], s_load(&x_ptr[i]) * ns + nb);
                 }
             }
         };
 
         process_block(0, total);
+    }
+}
+
+// ============================================================
+// Entry point with dtype dispatch
+// ============================================================
+
+void batch_norm_cpu(const BatchNormAttributes& attrs,
+                     const TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* /*workspace*/)
+{
+    const auto dtype = inputs[0].data_type();
+    switch (dtype) {
+    case DataType::f32:
+        batch_norm_impl<float>(attrs, output, inputs, ctx);
+        return;
+    case DataType::f16:
+        batch_norm_impl<half>(attrs, output, inputs, ctx);
+        return;
+    default:
+        NNOPS_ASSERT(!"batch_norm_cpu: unsupported data type (only f32 and f16)");
     }
 }
 

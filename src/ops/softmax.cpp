@@ -6,6 +6,14 @@
 
 namespace nnops {
 
+namespace backend::cpu {
+    void softmax_cpu(const SoftmaxAttributes& attrs,
+                     const TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* workspace);
+}
+
 namespace backend::cpu::reference {
     void softmax_ref(const SoftmaxAttributes& attrs,
                      const TensorView& output,
@@ -31,7 +39,7 @@ auto resolve_softmax_kernel(Backend backend) -> Softmax::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::softmax_ref;
+        return backend::cpu::softmax_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;
