@@ -58,12 +58,31 @@
 #include "nnops/detail/simd/vec_f16x8.hpp"
 #include "nnops/detail/half.hpp"
 
-/// @brief Convenience: number of elements in each vector register.
+#include <type_traits>
+
+/// @brief Number of lanes (elements) in each vector register type.
 namespace nnops {
 namespace simd {
-inline constexpr int simd_len_f32x4 = 4;
-inline constexpr int simd_len_f32x8 = 8;
-inline constexpr int simd_len_f16x8 = 8;
+inline constexpr int simd_lane_f32x4 = 4;
+inline constexpr int simd_lane_f32x8 = 8;
+inline constexpr int simd_lane_f16x8 = 8;
+
+/// @brief Recommended default SIMD lane count for f32 kernels.
+/// On all hardware SIMD backends this is 8 (AVX2 __m256 native;
+/// NEON two float32x4_t emulated; RISC-V V vsetivli LMUL=2).
+inline constexpr int simd_default_lane_f32 = 8;
+
+/// @brief Recommended default SIMD lane count for f16 kernels.
+/// On x86 F16C+AVX2 this is 8 (cvt→compute→cvt); on ARM NEON native fp16
+/// (float16x8_t) this is 8; on RISC-V V with LMUL=2 this is 8.
+inline constexpr int simd_default_lane_f16 = 8;
+
+/// @brief Compile-time SIMD lane count for a given data type T.
+/// Usage: simd_lane_for<T> — yields 8 for both float and half on all backends.
+template <typename T>
+inline constexpr int simd_lane_for = std::is_same_v<T, float>
+    ? simd_default_lane_f32
+    : simd_default_lane_f16;
 } // namespace simd
 } // namespace nnops
 

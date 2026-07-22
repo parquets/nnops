@@ -19,7 +19,7 @@
 /// Key design decisions for nnops:
 ///   1. SIMD kernels accept pre-positioned pointers, use only relative offsets
 ///   2. No per-element validity checks in SIMD — caller guarantees valid interior region
-///   3. Width-8 SIMD via v_f32x8 (AVX2 native, SSE emulated, NEON emulated)
+///   3. Width-SIMD via v_f32x8/v_f16x8 (simd_lane_for<T>-wide; AVX2 native, SSE/NEON emulated)
 ///   4. SIMD gated on stride_w == 1 (nnops SIMD has no gather; contiguous loads required)
 ///   5. AverageExcludePad and Lp pooling: scalar-only (per-element counting needed)
 ///   6. Unified 2D/3D code path: KD=1/SD=1/DD=1/PD=0/ID=1/OD=1 for 2D
@@ -188,7 +188,7 @@ inline void maxpool_h4_simd(
     constexpr float neg_inf = -std::numeric_limits<float>::infinity();
     const auto vinit = v_set1(input, neg_inf);
 
-    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+    for (int64_t ow = 0; ow < ow_count; ow += simd_lane_for<T>) {
         auto vacc0 = vinit;
         auto vacc1 = vinit;
         auto vacc2 = vinit;
@@ -248,7 +248,7 @@ inline void maxpool_h1_simd(
     constexpr float neg_inf = -std::numeric_limits<float>::infinity();
     const auto vinit = v_set1(input, neg_inf);
 
-    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+    for (int64_t ow = 0; ow < ow_count; ow += simd_lane_for<T>) {
         auto vacc = vinit;
 
         for (int64_t kd = 0; kd < KD; ++kd) {
@@ -294,7 +294,7 @@ inline void avgpool_h4_simd(
     const auto vscale = v_set1(input, scale);
     const auto vzero = v_set1(input, 0.0f);
 
-    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+    for (int64_t ow = 0; ow < ow_count; ow += simd_lane_for<T>) {
         auto vacc0 = vzero;
         auto vacc1 = vzero;
         auto vacc2 = vzero;
@@ -354,7 +354,7 @@ inline void avgpool_h1_simd(
     const auto vscale = v_set1(input, scale);
     const auto vzero = v_set1(input, 0.0f);
 
-    for (int64_t ow = 0; ow < ow_count; ow += 8) {
+    for (int64_t ow = 0; ow < ow_count; ow += simd_lane_for<T>) {
         auto vacc = vzero;
 
         for (int64_t kd = 0; kd < KD; ++kd) {
@@ -490,10 +490,10 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t ow_beg_c = std::max<int64_t>(0, std::min(ow_beg, OW));
     const int64_t ow_end_c = std::max<int64_t>(ow_beg_c, std::min(ow_end, OW));
 
-    // SIMD-aligned interior OW range (8-wide)
+    // SIMD-aligned interior OW range (simd_lane_for<T>-wide)
     const int64_t ow_simd_beg = ow_beg_c;
     const int64_t ow_simd_end = use_simd
-        ? ow_simd_beg + ((ow_end_c - ow_simd_beg) / 8) * 8
+        ? ow_simd_beg + ((ow_end_c - ow_simd_beg) / simd_lane_for<T>) * simd_lane_for<T>
         : ow_beg_c;
 
     // AvgPool scale (pre-computed for SIMD kernel)
@@ -557,7 +557,7 @@ void pooling_impl(const PoolingAttributes& attrs,
                         }
                     }
 
-                    // SIMD h4 interior (8-wide blocks)
+                    // SIMD h4 interior (simd_lane_for<T>-wide blocks)
                     const int64_t ow_simd_elems = ow_simd_end - ow_simd_beg;
                     if (ow_simd_elems > 0) {
                         T* out_simd = out_d + oh * out_row_stride

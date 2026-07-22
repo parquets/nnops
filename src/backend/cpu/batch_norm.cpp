@@ -2,8 +2,8 @@
 /// @brief SIMD-optimized CPU implementation of batch normalization (inference only).
 ///
 /// Vectorized with the nnops SIMD abstraction layer. On x86_64 this compiles to
-/// SSE4.1 by default; compile with /arch:AVX2 (MSVC) or -mavx2 -mfma (GCC/Clang)
-/// to enable native AVX2+FMA 8-wide processing.
+/// AVX2+FMA (8-wide) by default; on AArch64 to NEON (v_f32x8 emulated); on RISC-V
+/// to V extension.  simd_default_lane_f32 replaces hardcoded width for portability.
 ///
 /// Fused formula:
 ///   new_scale = inv_std * scale
@@ -58,6 +58,8 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
 
     using namespace nnops::simd;
 
+    constexpr int L = simd_default_lane_f32;  // 8
+
     if (attrs.spatial) {
         // ---- Spatial mode: per-channel statistics ----
         // Precompute new_scale and new_bias per channel.
@@ -69,9 +71,6 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
             new_bias[static_cast<size_t>(c)]  = b_ptr[c] - m_ptr[c] * new_scale[static_cast<size_t>(c)];
         }
 
-        // Use stride_elems to compute offsets (accounts for pitch).
-        // For [N, C]: offset(n,c) = n*stride(0) + c*stride(1)
-        // For [N, C, H, W]: offset(n,c,h,w) = n*stride(0) + c*stride(1) + h*stride(2) + w
         const int64_t x_n_stride = X.stride_elems(0);
         const int64_t x_c_stride = (rank >= 2) ? X.stride_elems(1) : 1;
         const int64_t y_n_stride = output.stride_elems(0);
@@ -91,7 +90,6 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                 const int64_t x_ch_base = n * x_n_stride + c * x_c_stride;
                 const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
 
-                // Process each row within the channel
                 for (int64_t hh = 0; hh < num_rows; ++hh) {
                     const int64_t x_off = x_ch_base + hh * x_row_stride;
                     const int64_t y_off = y_ch_base + hh * y_row_stride;
@@ -100,38 +98,21 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                     if (attrs.add_to) {
                         const v_f32x8 scale8 = v_set1_f32x8(ns);
                         const v_f32x8 bias8  = v_set1_f32x8(nb);
-                        for (; i + 8 <= last_dim; i += 8) {
+                        for (; i + L <= last_dim; i += L) {
                             const v_f32x8 x8 = v_load_f32x8(x_ptr + x_off + i);
                             const v_f32x8 y8 = v_load_f32x8(y_ptr + y_off + i);
                             v_store(y_ptr + y_off + i, v_add(y8, v_fmadd(scale8, x8, bias8)));
                         }
-
-                        const v_f32x4 scale4 = v_set1_f32x4(ns);
-                        const v_f32x4 bias4  = v_set1_f32x4(nb);
-                        for (; i + 4 <= last_dim; i += 4) {
-                            const v_f32x4 x4 = v_load_f32x4(x_ptr + x_off + i);
-                            const v_f32x4 y4 = v_load_f32x4(y_ptr + y_off + i);
-                            v_store(y_ptr + y_off + i, v_add(y4, v_fmadd(scale4, x4, bias4)));
-                        }
-
                         for (; i < last_dim; ++i) {
                             y_ptr[y_off + i] += x_ptr[x_off + i] * ns + nb;
                         }
                     } else {
                         const v_f32x8 scale8 = v_set1_f32x8(ns);
                         const v_f32x8 bias8  = v_set1_f32x8(nb);
-                        for (; i + 8 <= last_dim; i += 8) {
+                        for (; i + L <= last_dim; i += L) {
                             const v_f32x8 x8 = v_load_f32x8(x_ptr + x_off + i);
                             v_store(y_ptr + y_off + i, v_fmadd(scale8, x8, bias8));
                         }
-
-                        const v_f32x4 scale4 = v_set1_f32x4(ns);
-                        const v_f32x4 bias4  = v_set1_f32x4(nb);
-                        for (; i + 4 <= last_dim; i += 4) {
-                            const v_f32x4 x4 = v_load_f32x4(x_ptr + x_off + i);
-                            v_store(y_ptr + y_off + i, v_fmadd(scale4, x4, bias4));
-                        }
-
                         for (; i < last_dim; ++i) {
                             y_ptr[y_off + i] = x_ptr[x_off + i] * ns + nb;
                         }
@@ -147,23 +128,16 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
         }
     } else {
         // ---- Non-spatial mode: per-element statistics ----
-        // Scale/bias/mean/var have the same shape as X.
         const int64_t total = X.numel();
 
-        // Use a block-based body for single-threaded execution.
-        // When parallel_for is active, we chunk at a coarser granularity.
         const auto process_block = [&](int64_t i_begin, int64_t i_end) {
             int64_t i = i_begin;
 
             if (attrs.add_to) {
-                // add_to path: load existing output, accumulate
                 const v_f32x8 eps8 = v_set1_f32x8(epsilon);
                 const v_f32x8 one8 = v_set1_f32x8(1.0f);
-                const v_f32x4 eps4 = v_set1_f32x4(epsilon);
-                const v_f32x4 one4 = v_set1_f32x4(1.0f);
 
-                // 8-wide SIMD
-                for (; i + 8 <= i_end; i += 8) {
+                for (; i + L <= i_end; i += L) {
                     const v_f32x8 x8 = v_load_f32x8(x_ptr + i);
                     const v_f32x8 s8 = v_load_f32x8(s_ptr + i);
                     const v_f32x8 b8 = v_load_f32x8(b_ptr + i);
@@ -177,22 +151,6 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                     v_store(y_ptr + i, v_add(y8, v_fmadd(ns, x8, nb)));
                 }
 
-                // 4-wide tail
-                for (; i + 4 <= i_end; i += 4) {
-                    const v_f32x4 x4 = v_load_f32x4(x_ptr + i);
-                    const v_f32x4 s4 = v_load_f32x4(s_ptr + i);
-                    const v_f32x4 b4 = v_load_f32x4(b_ptr + i);
-                    const v_f32x4 m4 = v_load_f32x4(m_ptr + i);
-                    const v_f32x4 v4 = v_load_f32x4(v_ptr + i);
-
-                    const v_f32x4 inv_std = v_div(one4, v_sqrt(v_add(v4, eps4)));
-                    const v_f32x4 ns = v_mul(inv_std, s4);
-                    const v_f32x4 nb = v_sub(b4, v_mul(m4, ns));
-                    const v_f32x4 y4 = v_load_f32x4(y_ptr + i);
-                    v_store(y_ptr + i, v_add(y4, v_fmadd(ns, x4, nb)));
-                }
-
-                // Scalar tail
                 for (; i < i_end; ++i) {
                     float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
                     float ns = inv_std * s_ptr[i];
@@ -200,14 +158,10 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                     y_ptr[i] += x_ptr[i] * ns + nb;
                 }
             } else {
-                // Overwrite path (original)
                 const v_f32x8 eps8 = v_set1_f32x8(epsilon);
                 const v_f32x8 one8 = v_set1_f32x8(1.0f);
-                const v_f32x4 eps4 = v_set1_f32x4(epsilon);
-                const v_f32x4 one4 = v_set1_f32x4(1.0f);
 
-                // 8-wide SIMD
-                for (; i + 8 <= i_end; i += 8) {
+                for (; i + L <= i_end; i += L) {
                     const v_f32x8 x8 = v_load_f32x8(x_ptr + i);
                     const v_f32x8 s8 = v_load_f32x8(s_ptr + i);
                     const v_f32x8 b8 = v_load_f32x8(b_ptr + i);
@@ -220,21 +174,6 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
                     v_store(y_ptr + i, v_fmadd(ns, x8, nb));
                 }
 
-                // 4-wide tail
-                for (; i + 4 <= i_end; i += 4) {
-                    const v_f32x4 x4 = v_load_f32x4(x_ptr + i);
-                    const v_f32x4 s4 = v_load_f32x4(s_ptr + i);
-                    const v_f32x4 b4 = v_load_f32x4(b_ptr + i);
-                    const v_f32x4 m4 = v_load_f32x4(m_ptr + i);
-                    const v_f32x4 v4 = v_load_f32x4(v_ptr + i);
-
-                    const v_f32x4 inv_std = v_div(one4, v_sqrt(v_add(v4, eps4)));
-                    const v_f32x4 ns = v_mul(inv_std, s4);
-                    const v_f32x4 nb = v_sub(b4, v_mul(m4, ns));
-                    v_store(y_ptr + i, v_fmadd(ns, x4, nb));
-                }
-
-                // Scalar tail
                 for (; i < i_end; ++i) {
                     float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
                     float ns = inv_std * s_ptr[i];
@@ -244,9 +183,6 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
             }
         };
 
-        // Single-threaded SIMD: per-element statistics diverge across elements,
-        // making the per-element parallel_for API a poor fit for SIMD chunking.
-        // Non-spatial mode is rare in practice; spatial mode is the hot path.
         process_block(0, total);
     }
 }

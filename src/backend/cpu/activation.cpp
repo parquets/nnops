@@ -2,13 +2,17 @@
 /// @brief SIMD-optimized CPU implementation of activation functions.
 ///
 /// All 8 activation types are vectorized with the nnops SIMD abstraction layer.
-/// On x86_64 this compiles to AVX2+FMA by default (/arch:AVX2); 8-wide SIMD
-/// with scalar tail handles arbitrary element counts.
+/// Supports both f32 (v_f32x8) and f16 (v_f16x8) via a single templated implementation
+/// that uses the generic v_load/v_store/v_set1/s_load/s_store API.
+///
+/// On x86_64 this compiles to AVX2+FMA (f32) or F16C+AVX2 (f16); on AArch64 to
+/// NEON (v_f32x8 emulated, v_f16x8 native on ARMv8.2+); on RISC-V to V extension.
 ///
 /// Design decisions:
 ///   1. No blend/select needed — all conditionals are decomposed via v_max/v_min
-///   2. 8-wide SIMD + scalar tail for maximum throughput with minimal code
-///   3. add_to support: load + accumulate + store instead of plain store
+///   2. Row-by-row processing respects pitch (non-contiguous tensors supported)
+///   3. simd_lane_for<T> selects lane count (8 for both f32 and f16)
+///   4. add_to support: load + accumulate + store instead of plain store
 
 #include "nnops/ops/activation.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -20,45 +24,66 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 // ============================================================
-// Main entry point
+// Templated implementation (f32 and f16)
 // ============================================================
 
-void activation_cpu(const ActivationAttributes& attrs,
+template <typename T>
+void activation_impl(const ActivationAttributes& attrs,
                      const TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& /*ctx*/,
-                     void* /*workspace*/)
+                     std::span<const TensorView> inputs)
 {
     const auto& input = inputs[0];
-    const int64_t N = input.numel();
-    const auto* in_ptr  = input.data_as<float>();
-    auto* out_ptr = output.data_as<float>();
+    const int64_t total = input.numel();
+    if (total == 0) return;
+
+    const int64_t rank = input.rank();
+
+    // Layout: treat the innermost dimension as contiguous "row" elements,
+    // and advance by row_stride_elems between rows (accounts for pitch padding).
+    const int64_t last_dim = (rank >= 1) ? input.shape(rank - 1) : 1;
+    const int64_t num_rows = total / last_dim;
+    const int64_t in_row_stride = input.row_stride_elems();
+    const int64_t out_row_stride = output.row_stride_elems();
+
+    const auto* in_ptr  = input.data_as<T>();
+    auto* out_ptr = output.data_as<T>();
     const bool add_to = attrs.add_to;
 
-    int64_t i = 0;
+    constexpr int L = simd_lane_for<T>;
+    const auto vzero = v_zero(in_ptr);
 
     switch (attrs.type) {
 
     // ---- Relu: max(x, 0) ----
     case ActivationType::Relu: {
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_f32x8 r = v_max(x, v_zero_f32x8());
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), r));
-            }
-            for (; i < N; ++i) {
-                float v = in_ptr[i];
-                out_ptr[i] += (v > 0.0f ? v : 0.0f);
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    auto rv = v_max(x, vzero);
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) + (v > 0.0f ? v : 0.0f));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_max(x, v_zero_f32x8()));
-            }
-            for (; i < N; ++i) {
-                float v = in_ptr[i];
-                out_ptr[i] = (v > 0.0f ? v : 0.0f);
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_max(x, vzero));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], (v > 0.0f ? v : 0.0f));
+                }
             }
         }
         break;
@@ -67,29 +92,39 @@ void activation_cpu(const ActivationAttributes& attrs,
     // ---- LeakyRelu: max(x,0) + alpha * min(x,0) ----
     case ActivationType::LeakyRelu: {
         const float alpha = attrs.alpha;
-        const v_f32x8 a8 = v_set1_f32x8(alpha);
+        const auto a8 = v_set1(in_ptr, alpha);
 
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_f32x8 r = v_add(v_max(x, v_zero_f32x8()),
-                                  v_mul(a8, v_min(x, v_zero_f32x8())));
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), r));
-            }
-            for (; i < N; ++i) {
-                float v = in_ptr[i];
-                out_ptr[i] += (v > 0.0f ? v : alpha * v);
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    auto rv = v_add(v_max(x, vzero),
+                                  v_mul(a8, v_min(x, vzero)));
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) + (v > 0.0f ? v : alpha * v));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_f32x8 r = v_add(v_max(x, v_zero_f32x8()),
-                                  v_mul(a8, v_min(x, v_zero_f32x8())));
-                v_store(out_ptr + i, r);
-            }
-            for (; i < N; ++i) {
-                float v = in_ptr[i];
-                out_ptr[i] = (v > 0.0f ? v : alpha * v);
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    auto rv = v_add(v_max(x, vzero),
+                                  v_mul(a8, v_min(x, vzero)));
+                    v_store(out_row + i, rv);
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], (v > 0.0f ? v : alpha * v));
+                }
             }
         }
         break;
@@ -97,24 +132,36 @@ void activation_cpu(const ActivationAttributes& attrs,
 
     // ---- Sigmoid: 1 / (1 + exp(-x)) ----
     case ActivationType::Sigmoid: {
-        const v_f32x8 one8 = v_set1_f32x8(1.0f);
+        const auto one8 = v_set1(in_ptr, 1.0f);
 
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_f32x8 r = v_div(one8, v_add(one8, v_exp(v_neg(x))));
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), r));
-            }
-            for (; i < N; ++i) {
-                out_ptr[i] += 1.0f / (1.0f + std::exp(-in_ptr[i]));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    auto rv = v_div(one8, v_add(one8, v_exp(v_neg(x))));
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) + 1.0f / (1.0f + std::exp(-v)));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_div(one8, v_add(one8, v_exp(v_neg(x)))));
-            }
-            for (; i < N; ++i) {
-                out_ptr[i] = 1.0f / (1.0f + std::exp(-in_ptr[i]));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_div(one8, v_add(one8, v_exp(v_neg(x)))));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], 1.0f / (1.0f + std::exp(-v)));
+                }
             }
         }
         break;
@@ -123,21 +170,33 @@ void activation_cpu(const ActivationAttributes& attrs,
     // ---- Tanh ----
     case ActivationType::Tanh: {
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_f32x8 r = v_tanh(x);
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), r));
-            }
-            for (; i < N; ++i) {
-                out_ptr[i] += std::tanh(in_ptr[i]);
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    auto rv = v_tanh(x);
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) + std::tanh(v));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_tanh(x));
-            }
-            for (; i < N; ++i) {
-                out_ptr[i] = std::tanh(in_ptr[i]);
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_tanh(x));
+                }
+                for (; i < last_dim; ++i) {
+                    float v = s_load(&in_row[i]);
+                    s_store(&out_row[i], std::tanh(v));
+                }
             }
         }
         break;
@@ -146,33 +205,45 @@ void activation_cpu(const ActivationAttributes& attrs,
     // ---- GELU: 0.5 * x * (1 + tanh(c * (x + 0.044715 * x^3)))
     //       where c = sqrt(2/pi)
     case ActivationType::Gelu: {
-        const v_f32x8 half8  = v_set1_f32x8(0.5f);
-        const v_f32x8 one8   = v_set1_f32x8(1.0f);
-        const v_f32x8 c8     = v_set1_f32x8(0.7978845608028654f);
-        const v_f32x8 coeff8 = v_set1_f32x8(0.044715f);
+        const auto half8  = v_set1(in_ptr, 0.5f);
+        const auto one8   = v_set1(in_ptr, 1.0f);
+        const auto c8     = v_set1(in_ptr, 0.7978845608028654f);
+        const auto coeff8 = v_set1(in_ptr, 0.044715f);
 
-        auto simd8 = [&](v_f32x8 x) {
-            v_f32x8 x3 = v_mul(v_mul(x, x), x);
-            v_f32x8 inner = v_mul(c8, v_add(x, v_mul(coeff8, x3)));
+        auto simd = [&](auto x) {
+            auto x3 = v_mul(v_mul(x, x), x);
+            auto inner = v_mul(c8, v_add(x, v_mul(coeff8, x3)));
             return v_mul(v_mul(half8, x), v_add(one8, v_tanh(inner)));
         };
 
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), simd8(x)));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] += 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_add(v_load(out_row + i), simd(x)));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) +
+                        0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_store(out_ptr + i, simd8(v_load_f32x8(in_ptr + i)));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    v_store(out_row + i, simd(v_load(in_row + i)));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i],
+                        0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))));
+                }
             }
         }
         break;
@@ -180,26 +251,36 @@ void activation_cpu(const ActivationAttributes& attrs,
 
     // ---- SiLU (Swish): x / (1 + exp(-x)) ----
     case ActivationType::Silu: {
-        const v_f32x8 one8 = v_set1_f32x8(1.0f);
+        const auto one8 = v_set1(in_ptr, 1.0f);
 
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_f32x8 r = v_div(x, v_add(one8, v_exp(v_neg(x))));
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), r));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] += x / (1.0f + std::exp(-x));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    auto rv = v_div(x, v_add(one8, v_exp(v_neg(x))));
+                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) + x / (1.0f + std::exp(-x)));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_div(x, v_add(one8, v_exp(v_neg(x)))));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] = x / (1.0f + std::exp(-x));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_div(x, v_add(one8, v_exp(v_neg(x)))));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i], x / (1.0f + std::exp(-x)));
+                }
             }
         }
         break;
@@ -209,31 +290,43 @@ void activation_cpu(const ActivationAttributes& attrs,
     //       relu6(y) = min(max(y, 0), 6)
     case ActivationType::HardSwish: {
         const float bd6 = attrs.beta / 6.0f;
-        const v_f32x8 three8 = v_set1_f32x8(3.0f);
-        const v_f32x8 six8   = v_set1_f32x8(6.0f);
-        const v_f32x8 scale8 = v_set1_f32x8(bd6);
+        const auto three8 = v_set1(in_ptr, 3.0f);
+        const auto six8   = v_set1(in_ptr, 6.0f);
+        const auto scale8 = v_set1(in_ptr, bd6);
 
-        auto simd8 = [&](v_f32x8 x) {
-            v_f32x8 relu6 = v_min(v_max(v_add(x, three8), v_zero_f32x8()), six8);
+        auto simd = [&](auto x) {
+            auto relu6 = v_min(v_max(v_add(x, three8), vzero), six8);
             return v_mul(v_mul(x, relu6), scale8);
         };
 
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), simd8(x)));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] += x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6;
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_add(v_load(out_row + i), simd(x)));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) +
+                        x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6);
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_store(out_ptr + i, simd8(v_load_f32x8(in_ptr + i)));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] = x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6;
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    v_store(out_row + i, simd(v_load(in_row + i)));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i],
+                        x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6);
+                }
             }
         }
         break;
@@ -242,36 +335,71 @@ void activation_cpu(const ActivationAttributes& attrs,
     // ---- ELU: max(x,0) + alpha * (exp(min(x,0)) - 1) ----
     case ActivationType::Elu: {
         const float alpha = attrs.alpha;
-        const v_f32x8 a8   = v_set1_f32x8(alpha);
-        const v_f32x8 one8 = v_set1_f32x8(1.0f);
+        const auto a8   = v_set1(in_ptr, alpha);
+        const auto one8 = v_set1(in_ptr, 1.0f);
 
-        auto simd8 = [&](v_f32x8 x) {
-            v_f32x8 neg_part = v_mul(a8, v_sub(v_exp(v_min(x, v_zero_f32x8())), one8));
-            return v_add(v_max(x, v_zero_f32x8()), neg_part);
+        auto simd = [&](auto x) {
+            auto neg_part = v_mul(a8, v_sub(v_exp(v_min(x, vzero)), one8));
+            return v_add(v_max(x, vzero), neg_part);
         };
 
         if (add_to) {
-            for (; i + 8 <= N; i += 8) {
-                v_f32x8 x = v_load_f32x8(in_ptr + i);
-                v_store(out_ptr + i, v_add(v_load_f32x8(out_ptr + i), simd8(x)));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] += (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    auto x = v_load(in_row + i);
+                    v_store(out_row + i, v_add(v_load(out_row + i), simd(x)));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i], s_load(&out_row[i]) +
+                        (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f)));
+                }
             }
         } else {
-            for (; i + 8 <= N; i += 8) {
-                v_store(out_ptr + i, simd8(v_load_f32x8(in_ptr + i)));
-            }
-            for (; i < N; ++i) {
-                float x = in_ptr[i];
-                out_ptr[i] = (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f));
+            for (int64_t r = 0; r < num_rows; ++r) {
+                const T* in_row = in_ptr + r * in_row_stride;
+                T* out_row = out_ptr + r * out_row_stride;
+                int64_t i = 0;
+                for (; i + L <= last_dim; i += L) {
+                    v_store(out_row + i, simd(v_load(in_row + i)));
+                }
+                for (; i < last_dim; ++i) {
+                    float x = s_load(&in_row[i]);
+                    s_store(&out_row[i],
+                        (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f)));
+                }
             }
         }
         break;
     }
 
     }  // switch
+}
+
+// ============================================================
+// Main entry point with dtype dispatch
+// ============================================================
+
+void activation_cpu(const ActivationAttributes& attrs,
+                     const TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& /*ctx*/,
+                     void* /*workspace*/)
+{
+    const auto dtype = inputs[0].data_type();
+    switch (dtype) {
+    case DataType::f32:
+        activation_impl<float>(attrs, output, inputs);
+        return;
+    case DataType::f16:
+        activation_impl<half>(attrs, output, inputs);
+        return;
+    default:
+        NNOPS_ASSERT(!"activation_cpu: unsupported data type (only f32 and f16)");
+    }
 }
 
 }  // namespace nnops::backend::cpu

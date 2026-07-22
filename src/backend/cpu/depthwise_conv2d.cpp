@@ -13,7 +13,7 @@
 ///
 /// Key optimizations:
 ///   1. Height blocking: process 4 output rows simultaneously to reuse kernel weights
-///   2. Width SIMD: process 8 output columns with v_f32x8/v_f16x8 within each height block
+///   2. Width SIMD: process simd_lane_for<T> output columns with v_f32x8/v_f16x8
 ///   3. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar,
 ///      interior → SIMD (h4 for aligned rows, h1 for remainder)
 ///   4. Kernel weight pre-load into registers within inner loop (reused across 4 rows)
@@ -83,7 +83,7 @@ inline void dwconv_h4_simd(T* output,
 {
 
 
-    for (int64_t ow = ow_start; ow < ow_end; ow += 8) {
+    for (int64_t ow = ow_start; ow < ow_end; ow += simd_lane_for<T>) {
         auto vacc0 = v_set1(input, bias_val);
         auto vacc1 = v_set1(input, bias_val);
         auto vacc2 = v_set1(input, bias_val);
@@ -164,7 +164,7 @@ inline void dwconv_h1_simd(T* output,
 {
 
 
-    for (int64_t ow = ow_start; ow < ow_end; ow += 8) {
+    for (int64_t ow = ow_start; ow < ow_end; ow += simd_lane_for<T>) {
         auto vacc = v_set1(input, bias_val);
 
         for (int64_t kh = 0; kh < KH; ++kh) {
@@ -291,7 +291,7 @@ void dwconv_impl(const DepthwiseConv2DAttributes& attrs,
 
     const int64_t ow_simd_beg = ow_beg;
     const int64_t ow_simd_end = use_simd
-        ? ow_simd_beg + ((ow_end - ow_simd_beg) / 8) * 8
+        ? ow_simd_beg + ((ow_end - ow_simd_beg) / simd_lane_for<T>) * simd_lane_for<T>
         : ow_beg;
 
     // Per-channel compute lambda (N*C parallel)

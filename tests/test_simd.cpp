@@ -582,10 +582,20 @@ NNOPS_TEST(simd_f16_edge_subnormal) {
 }
 
 NNOPS_TEST(simd_f16_lane_count_constants) {
-    NNOPS_EXPECT_EQ(simd_len_f16x8, 8);
+    NNOPS_EXPECT_EQ(simd_lane_f16x8, 8);
 }
 
 NNOPS_TEST(simd_lane_count_constants) {
-    NNOPS_EXPECT_EQ(simd_len_f32x4, 4);
-    NNOPS_EXPECT_EQ(simd_len_f32x8, 8);
+    NNOPS_EXPECT_EQ(simd_lane_f32x4, 4);
+    NNOPS_EXPECT_EQ(simd_lane_f32x8, 8);
+}
+
+NNOPS_TEST(simd_default_lane_constants) {
+    NNOPS_EXPECT_EQ(simd_default_lane_f32, 8);
+    NNOPS_EXPECT_EQ(simd_default_lane_f16, 8);
+}
+
+NNOPS_TEST(simd_lane_for_template) {
+    NNOPS_EXPECT_EQ((simd_lane_for<float>), 8);
+    NNOPS_EXPECT_EQ((simd_lane_for<half>), 8);
 }

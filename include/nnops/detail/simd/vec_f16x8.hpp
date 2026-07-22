@@ -96,6 +96,8 @@
   using arch::scalar::v_fmadd;
   using arch::scalar::v_min;
   using arch::scalar::v_max;
+  using arch::scalar::v_abs;
+  using arch::scalar::v_neg;
   using arch::scalar::v_sqrt;
   using arch::scalar::v_exp;
   using arch::scalar::v_log;

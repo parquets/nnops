@@ -470,6 +470,18 @@ inline v_f16x8 v_max(const v_f16x8& a, const v_f16x8& b) {
         r.bits[i] = f32_to_f16(std::max(f16_to_f32(a.bits[i]), f16_to_f32(b.bits[i])));
     return r;
 }
+inline v_f16x8 v_abs(const v_f16x8& a) {
+    v_f16x8 r;
+    for (int i = 0; i < 8; ++i)
+        r.bits[i] = a.bits[i] & 0x7FFFu;  // clear sign bit
+    return r;
+}
+inline v_f16x8 v_neg(const v_f16x8& a) {
+    v_f16x8 r;
+    for (int i = 0; i < 8; ++i)
+        r.bits[i] = a.bits[i] ^ 0x8000u;  // flip sign bit
+    return r;
+}
 inline v_f16x8 v_sqrt(const v_f16x8& a) {
     v_f16x8 r;
     for (int i = 0; i < 8; ++i)
