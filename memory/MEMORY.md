@@ -4,3 +4,5 @@
 - [Operators](operators.md) — all implemented operators, attributes, shapes, implementation patterns
 - [Reference Projects](reference-projects.md) — patterns adopted from onnxruntime, TensorRT, ComputeLibrary, OpenCV, nn_compute
 - [Test Infrastructure](test-infrastructure.md) — test harness, random data generation, benchmarks
+- [x86 CPU Assumptions](x86-cpu-assumptions.md) — x86_64 baseline ISA (F16C, SSE4.1, AVX2, FMA3 all guaranteed)
+- [Pitch Design](pitch-design.md) — pitch-based row stride model replacing multi-dimensional strides (2026-07-22)

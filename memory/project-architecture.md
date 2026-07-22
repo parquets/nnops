@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-21T14:20:48.756Z
+  modified: 2026-07-22T13:08:48.178Z
 ---
 
 # nnops Project Architecture
@@ -28,7 +28,7 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 | Decision | Choice |
 |---|---|
 | OpBase hierarchy | Flat virtual base (pure virtual) |
-| TensorView storage | `SmallVector<int64_t, 8>` for shape/stride (zero heap for <= 8D) |
+| TensorView storage | `SmallVector<int64_t, 8>` for shape (zero heap for <= 8D); `int64_t pitch_` for row pitch in bytes |
 | Backend dispatch | `switch(backend_)` in compute() |
 | CPU parallelism | `std::function` passed via `ComputeContext::cpu_parallel_for` |
 | Memory | User owns all buffers; workspace passed as `void*` |
