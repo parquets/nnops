@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T13:08:48.178Z
+  modified: 2026-07-22T16:20:48.367Z
 ---
 
 # nnops Project Architecture
@@ -29,6 +29,7 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 |---|---|
 | OpBase hierarchy | Flat virtual base (pure virtual) |
 | TensorView storage | `SmallVector<int64_t, 8>` for shape (zero heap for <= 8D); `int64_t pitch_` for row pitch in bytes |
+| TensorView data access | `ptr<T>()` / `ptr<T>(row_id)` (typed, OpenCV-style) — replaces old `data()` and `data_as<T>()`; `is_empty()` for null checks |
 | Backend dispatch | `switch(backend_)` in compute() |
 | CPU parallelism | `std::function` passed via `ComputeContext::cpu_parallel_for` |
 | Memory | User owns all buffers; workspace passed as `void*` |
@@ -53,5 +54,5 @@ src/backend/cpu/
                           using NEON for f32, NEON FP16 for fp16 (ARMv8.2+)
 src/backend/cuda/       — CUDA kernels (optional)
 src/backend/vulkan/     — Vulkan kernels (optional)
-tests/                  — Unit tests (14 files, 116 tests) + common test utilities
+tests/                  — Unit tests (14 files, 135 tests) + common test utilities
 ```

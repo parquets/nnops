@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 5974f579-b7c9-444a-a957-4b2b9fe094ad
-  modified: 2026-07-22T13:08:58.009Z
+  modified: 2026-07-22T16:20:22.624Z
 ---
 
 # Pitch Design
@@ -32,6 +32,8 @@ For NCHWC8 uint8: `pitch >= W * 8`. With 32-byte alignment: `pitch = align_up(W*
 | `pitch()` | `int64_t` | Row pitch in bytes |
 | `row_stride_elems()` | `int64_t` | `pitch / elem_size` (elements per row, ≥ last_dim) |
 | `stride_elems(dim)` | `int64_t` | Element stride for any dimension (accounts for pitch) |
+| `ptr<T>()` | `T*` / `const T*` | Typed pointer to first element (replaces `data_as<T>()`) |
+| `ptr<T>(row_id)` | `T*` / `const T*` | Typed pointer to first element of given row, offset by `row_id * pitch_` bytes (like OpenCV `cv::Mat::ptr<T>(row)`). `is_empty()` replaces `data() != nullptr` checks. |
 
 ## Construction
 

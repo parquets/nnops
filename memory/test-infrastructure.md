@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-21T14:21:35.008Z
+  modified: 2026-07-22T16:20:59.559Z
 ---
 
 # Test Infrastructure
@@ -36,7 +36,7 @@ Each operator has a corresponding `tests/test_<op>.cpp` with tests in three cate
 cd build && cmake --build . --config Release --target nnops_test && ctest -C Release
 ```
 
-Tests are registered via CTest. Currently 116 tests across 14 test files (activation, attention, batch_norm, conv2d, cumsum, layer_norm, linear, matmul, pooling, rms_norm, simd, softmax, tensor_view, plus common harness).
+Tests are registered via CTest. Currently 135 tests across 14 test files (activation, attention, batch_norm, conv2d, cumsum, layer_norm, linear, matmul, pooling, rms_norm, simd, softmax, tensor_view, plus common harness).
 
 ## Benchmark Pattern
 

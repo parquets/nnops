@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T15:49:14.148Z
+  modified: 2026-07-22T16:20:36.782Z
 ---
 
 # Implemented Operators
@@ -144,13 +144,13 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 Every operator follows this recipe:
 
 1. **Header** (`include/nnops/ops/<name>.hpp`): Attributes struct + Op class (inherits OpBase) + functional free function declarations. Class includes `using OpBase::compute;` to expose single-output convenience overload alongside the span-based override.
-2. **Dispatch** (`src/ops/<name>.cpp`): `create()` factory, `compute()` with `switch(backend_)`, functional wrappers. Dispatch layer asserts `outputs.size() == 1` and extracts `outputs[0]` before calling backend kernels (which keep `const TensorView& output` parameter).
+2. **Dispatch** (`src/ops/<name>.cpp`): `create()` factory, `compute()` with `switch(backend_)`, functional wrappers. Dispatch layer asserts `outputs.size() == 1` and extracts `outputs[0]` before calling backend kernels (which keep `TensorView& output` parameter).
 3. **CPU Reference** (`src/backend/cpu/reference/<name>_ref.cpp`): Naive implementation in `nnops::backend::cpu::reference` namespace
 4. **Tests** (`tests/test_<name>.cpp`): Hand-verified small tests + random data tests + class/functional parity tests
 
 ### Multi-Output Support (2026-07-22)
 
-`OpBase::compute()` primary virtual takes `std::span<const TensorView> outputs` (matching the span-based inputs). A non-virtual convenience overload `compute(const TensorView& output, ...)` delegates to the span version for single-output callers. Kernel functions are unchanged — they receive `outputs[0]` extracted by the dispatch layer. Future multi-output operators (Split, TopK, etc.) can iterate `outputs[i]` directly.
+`OpBase::compute()` primary virtual takes `std::span<TensorView> outputs` (mutable, matching the span-based inputs). A non-virtual convenience overload `compute(TensorView& output, ...)` delegates to the span version for single-output callers. Output tensors are writable — only input tensors are `const`. Kernel functions receive `outputs[0]` extracted by the dispatch layer. Future multi-output operators (Split, TopK, etc.) can iterate `outputs[i]` directly.
 
 ## GEMM Micro-Kernels (Backend Infrastructure)
 

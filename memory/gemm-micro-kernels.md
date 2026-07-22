@@ -4,7 +4,7 @@ description: "GEMM micro-kernel infrastructure — transpose, pack, and MMA prim
 metadata: 
   node_type: memory
   type: project
-  modified: 2026-07-21T14:32:51.762Z
+  modified: 2026-07-22T16:20:52.348Z
   originSessionId: 5c3ed336-1c64-4cbc-aea8-a232e6df9151
 ---
 
@@ -20,8 +20,10 @@ Low-level CPU GEMM building blocks ported from nn_compute. Four file types per I
 
 ```
 src/backend/cpu/common/
-├── restrict.hpp         — cross-platform NNOPS_RESTRICT macro
-└── half.hpp             — half type (uint16_t) + f16↔f32 conversion
+└── restrict.hpp         — cross-platform NNOPS_RESTRICT macro
+
+include/nnops/detail/
+└── half.hpp             — half type (uint16_t) + f16↔f32 conversion (shared by SIMD and GEMM)
 
 src/backend/cpu/x86_64/
 ├── transpose.hpp        — __m128 (4×f32), __m256 (8×f32), __m128i (8×i16) transposes
