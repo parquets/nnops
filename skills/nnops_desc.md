@@ -59,7 +59,7 @@ tests/
 
 # 相关数据结构
 
-+ TensorView 类，不持有数据的所有权，但是包含张量数据的描述、数据指针，描述包含 shape 、stride、layout、data_type 等基本信息
++ TensorView 类，不持有数据的所有权，但是包含张量数据的描述、数据指针，描述包含 shape、pitch（行字节跨度，类似 OpenCV cv::Mat::step[0]）、layout、data_type 等基本信息。行内元素连续存储；高维 stride 通过 stride_elems(dim) 从 pitch 推导。不再支持显式多维 strides 传入。
 + OpBase 类：算子的基类
 
 # 参考项目 

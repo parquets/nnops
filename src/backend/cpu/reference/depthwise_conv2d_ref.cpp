@@ -25,6 +25,7 @@ void depthwise_conv2d_ref(const DepthwiseConv2DAttributes& attrs,
     const int64_t C  = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
+    const int64_t in_row_stride  = input.row_stride_elems();   // >= IW
 
     // Weight: [C, 1, KH, KW]
     const int64_t KH = attrs.kernel_size[0];
@@ -33,6 +34,7 @@ void depthwise_conv2d_ref(const DepthwiseConv2DAttributes& attrs,
     // Output: [N, C, OH, OW]
     const int64_t OH = output.shape(2);
     const int64_t OW = output.shape(3);
+    const int64_t out_row_stride = output.row_stride_elems();  // >= OW
 
     const int64_t SH = attrs.stride[0];
     const int64_t SW = attrs.stride[1];
@@ -63,7 +65,7 @@ void depthwise_conv2d_ref(const DepthwiseConv2DAttributes& attrs,
                             if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
                                 // input: [N, C, IH, IW]
                                 const int64_t in_idx =
-                                    ((n * C + c) * IH + ih) * IW + iw;
+                                    ((n * C + c) * IH + ih) * in_row_stride + iw;
                                 // weight: [C, 1, KH, KW] → per-channel weight
                                 const int64_t w_idx =
                                     (c * KH + kh) * KW + kw;
@@ -77,7 +79,7 @@ void depthwise_conv2d_ref(const DepthwiseConv2DAttributes& attrs,
                     }
 
                     const int64_t out_idx =
-                        ((n * C + c) * OH + oh) * OW + ow;
+                        ((n * C + c) * OH + oh) * out_row_stride + ow;
                     float val = apply_epilogue(attrs.epilogue, sum, c);
                     out_ptr[out_idx] = attrs.add_to
                         ? out_ptr[out_idx] + val

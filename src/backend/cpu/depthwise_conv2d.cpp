@@ -82,8 +82,8 @@ inline void dwconv_h4_simd(float* output,
                             int64_t SH, int64_t SW,
                             int64_t DH, int64_t DW,
                             int64_t PH, int64_t PW,
-                            int64_t out_h_stride, int64_t out_w_stride,
-                            int64_t in_h_stride,  int64_t in_w_stride,
+                            int64_t out_row_stride, int64_t out_w_stride,
+                            int64_t in_row_stride,  int64_t in_w_stride,
                             bool add_to)
 {
     for (int64_t ow = ow_start; ow < ow_end; ow += 8) {
@@ -112,29 +112,29 @@ inline void dwconv_h4_simd(float* output,
                 const int64_t iw_base = ow * SW + kw * DW - PW;
 
                 if (valid0) {
-                    const v_f32x8 vin0 = v_load_f32x8(input + ih0 * in_h_stride + iw_base * in_w_stride);
+                    const v_f32x8 vin0 = v_load_f32x8(input + ih0 * in_row_stride + iw_base * in_w_stride);
                     vacc0 = v_fmadd(vin0, vk, vacc0);
                 }
                 if (valid1) {
-                    const v_f32x8 vin1 = v_load_f32x8(input + ih1 * in_h_stride + iw_base * in_w_stride);
+                    const v_f32x8 vin1 = v_load_f32x8(input + ih1 * in_row_stride + iw_base * in_w_stride);
                     vacc1 = v_fmadd(vin1, vk, vacc1);
                 }
                 if (valid2) {
-                    const v_f32x8 vin2 = v_load_f32x8(input + ih2 * in_h_stride + iw_base * in_w_stride);
+                    const v_f32x8 vin2 = v_load_f32x8(input + ih2 * in_row_stride + iw_base * in_w_stride);
                     vacc2 = v_fmadd(vin2, vk, vacc2);
                 }
                 if (valid3) {
-                    const v_f32x8 vin3 = v_load_f32x8(input + ih3 * in_h_stride + iw_base * in_w_stride);
+                    const v_f32x8 vin3 = v_load_f32x8(input + ih3 * in_row_stride + iw_base * in_w_stride);
                     vacc3 = v_fmadd(vin3, vk, vacc3);
                 }
             }
         }
 
         // Write back 4 rows × 8 columns
-        float* out_row0 = output + (oh_start + 0) * out_h_stride + ow * out_w_stride;
-        float* out_row1 = output + (oh_start + 1) * out_h_stride + ow * out_w_stride;
-        float* out_row2 = output + (oh_start + 2) * out_h_stride + ow * out_w_stride;
-        float* out_row3 = output + (oh_start + 3) * out_h_stride + ow * out_w_stride;
+        float* out_row0 = output + (oh_start + 0) * out_row_stride + ow * out_w_stride;
+        float* out_row1 = output + (oh_start + 1) * out_row_stride + ow * out_w_stride;
+        float* out_row2 = output + (oh_start + 2) * out_row_stride + ow * out_w_stride;
+        float* out_row3 = output + (oh_start + 3) * out_row_stride + ow * out_w_stride;
 
         if (add_to) {
             vacc0 = v_add(vacc0, v_load_f32x8(out_row0));
@@ -164,8 +164,8 @@ inline void dwconv_h1_simd(float* output,
                             int64_t SH, int64_t SW,
                             int64_t DH, int64_t DW,
                             int64_t PH, int64_t PW,
-                            int64_t out_h_stride, int64_t out_w_stride,
-                            int64_t in_h_stride,  int64_t in_w_stride,
+                            int64_t out_row_stride, int64_t out_w_stride,
+                            int64_t in_row_stride,  int64_t in_w_stride,
                             bool add_to)
 {
     for (int64_t ow = ow_start; ow < ow_end; ow += 8) {
@@ -180,12 +180,12 @@ inline void dwconv_h1_simd(float* output,
                 const v_f32x8 vk = v_set1_f32x8(kval);
                 const int64_t iw_base = ow * SW + kw * DW - PW;
 
-                const v_f32x8 vin = v_load_f32x8(input + ih * in_h_stride + iw_base * in_w_stride);
+                const v_f32x8 vin = v_load_f32x8(input + ih * in_row_stride + iw_base * in_w_stride);
                 vacc = v_fmadd(vin, vk, vacc);
             }
         }
 
-        float* out_row = output + oh * out_h_stride + ow * out_w_stride;
+        float* out_row = output + oh * out_row_stride + ow * out_w_stride;
 
         if (add_to) {
             vacc = v_add(vacc, v_load_f32x8(out_row));
@@ -209,8 +209,8 @@ inline void dwconv_scalar_row(float* output,
                                int64_t SH, int64_t SW,
                                int64_t DH, int64_t DW,
                                int64_t PH, int64_t PW,
-                               int64_t out_h_stride, int64_t out_w_stride,
-                               int64_t in_h_stride,  int64_t in_w_stride,
+                               int64_t out_row_stride, int64_t out_w_stride,
+                               int64_t in_row_stride,  int64_t in_w_stride,
                                bool add_to,
                                const Epilogue& epilogue, int64_t channel)
 {
@@ -218,9 +218,9 @@ inline void dwconv_scalar_row(float* output,
         float sum = depthwise_elem(input, weight, bias_val,
                                     IH, IW, oh, ow,
                                     KH, KW, SH, SW, DH, DW, PH, PW,
-                                    in_h_stride, in_w_stride);
+                                    in_row_stride, in_w_stride);
         float val = apply_epilogue(epilogue, sum, channel);
-        const int64_t out_idx = oh * out_h_stride + ow * out_w_stride;
+        const int64_t out_idx = oh * out_row_stride + ow * out_w_stride;
         output[out_idx] = add_to ? output[out_idx] + val : val;
     }
 }
@@ -266,13 +266,13 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
     const auto* w_ptr   = weight.data_as<float>();
     const auto* b_ptr   = has_bias ? inputs[2].data_as<float>() : nullptr;
 
-    // Strides for dense NCHW layout
-    const int64_t in_ch_stride  = IH * IW;
-    const int64_t in_h_stride   = IW;
-    const int64_t in_w_stride   = 1;
-    const int64_t out_ch_stride = OH * OW;
-    const int64_t out_h_stride  = OW;
-    const int64_t out_w_stride  = 1;
+    // Strides derived from pitch (row pitch in bytes → element stride)
+    const int64_t in_row_stride   = input.row_stride_elems();   // elements per input row (>= IW)
+    const int64_t in_w_stride     = 1;
+    const int64_t in_ch_stride    = IH * in_row_stride;          // elements per input channel
+    const int64_t out_row_stride  = output.row_stride_elems();   // elements per output row (>= OW)
+    const int64_t out_w_stride    = 1;
+    const int64_t out_ch_stride   = OH * out_row_stride;         // elements per output channel
 
     // SIMD is only valid when stride_w == 1:
     //   For stride > 1, consecutive output columns map to strided input columns,
@@ -319,8 +319,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                 dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                    IH, IW, oh, 0, OW,
                                    KH, KW, SH, SW, DH, DW, PH, PW,
-                                   out_h_stride, out_w_stride,
-                                   in_h_stride, in_w_stride,
+                                   out_row_stride, out_w_stride,
+                                   in_row_stride, in_w_stride,
                                    attrs.add_to, attrs.epilogue, c);
             }
 
@@ -334,8 +334,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                             dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                                IH, IW, oh + d, 0, ow_beg,
                                                KH, KW, SH, SW, DH, DW, PH, PW,
-                                               out_h_stride, out_w_stride,
-                                               in_h_stride, in_w_stride,
+                                               out_row_stride, out_w_stride,
+                                               in_row_stride, in_w_stride,
                                                attrs.add_to, attrs.epilogue, c);
                         }
                     }
@@ -345,8 +345,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                                     IH, IW,
                                     oh, ow_simd_beg, ow_simd_end,
                                     KH, KW, SH, SW, DH, DW, PH, PW,
-                                    out_h_stride, out_w_stride,
-                                    in_h_stride, in_w_stride,
+                                    out_row_stride, out_w_stride,
+                                    in_row_stride, in_w_stride,
                                     attrs.add_to);
 
                     // SIMD scalar tail: remaining elements after SIMD blocks
@@ -355,8 +355,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                             dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                                IH, IW, oh + d, ow_simd_end, ow_end,
                                                KH, KW, SH, SW, DH, DW, PH, PW,
-                                               out_h_stride, out_w_stride,
-                                               in_h_stride, in_w_stride,
+                                               out_row_stride, out_w_stride,
+                                               in_row_stride, in_w_stride,
                                                attrs.add_to, attrs.epilogue, c);
                         }
                     }
@@ -367,8 +367,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                             dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                                IH, IW, oh + d, ow_end, OW,
                                                KH, KW, SH, SW, DH, DW, PH, PW,
-                                               out_h_stride, out_w_stride,
-                                               in_h_stride, in_w_stride,
+                                               out_row_stride, out_w_stride,
+                                               in_row_stride, in_w_stride,
                                                attrs.add_to, attrs.epilogue, c);
                         }
                     }
@@ -381,8 +381,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                         dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                            IH, IW, oh, 0, ow_beg,
                                            KH, KW, SH, SW, DH, DW, PH, PW,
-                                           out_h_stride, out_w_stride,
-                                           in_h_stride, in_w_stride,
+                                           out_row_stride, out_w_stride,
+                                           in_row_stride, in_w_stride,
                                            attrs.add_to, attrs.epilogue, c);
                     }
 
@@ -390,8 +390,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                     dwconv_h1_simd(out_ch, in_ch, w_ch, bias_val,
                                     IH, IW, oh, ow_simd_beg, ow_simd_end,
                                     KH, KW, SH, SW, DH, DW, PH, PW,
-                                    out_h_stride, out_w_stride,
-                                    in_h_stride, in_w_stride,
+                                    out_row_stride, out_w_stride,
+                                    in_row_stride, in_w_stride,
                                     attrs.add_to);
 
                     // SIMD scalar tail
@@ -399,8 +399,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                         dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                            IH, IW, oh, ow_simd_end, ow_end,
                                            KH, KW, SH, SW, DH, DW, PH, PW,
-                                           out_h_stride, out_w_stride,
-                                           in_h_stride, in_w_stride,
+                                           out_row_stride, out_w_stride,
+                                           in_row_stride, in_w_stride,
                                            attrs.add_to, attrs.epilogue, c);
                     }
 
@@ -409,8 +409,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                         dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                            IH, IW, oh, ow_end, OW,
                                            KH, KW, SH, SW, DH, DW, PH, PW,
-                                           out_h_stride, out_w_stride,
-                                           in_h_stride, in_w_stride,
+                                           out_row_stride, out_w_stride,
+                                           in_row_stride, in_w_stride,
                                            attrs.add_to, attrs.epilogue, c);
                     }
                 }
@@ -420,8 +420,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                     dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                        IH, IW, oh, 0, OW,
                                        KH, KW, SH, SW, DH, DW, PH, PW,
-                                       out_h_stride, out_w_stride,
-                                       in_h_stride, in_w_stride,
+                                       out_row_stride, out_w_stride,
+                                       in_row_stride, in_w_stride,
                                        attrs.add_to, attrs.epilogue, c);
                 }
             }
@@ -431,8 +431,8 @@ void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
                 dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,
                                    IH, IW, oh, 0, OW,
                                    KH, KW, SH, SW, DH, DW, PH, PW,
-                                   out_h_stride, out_w_stride,
-                                   in_h_stride, in_w_stride,
+                                   out_row_stride, out_w_stride,
+                                   in_row_stride, in_w_stride,
                                    attrs.add_to, attrs.epilogue, c);
             }
         }

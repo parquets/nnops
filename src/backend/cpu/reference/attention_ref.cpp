@@ -77,21 +77,27 @@ void attention_ref(const AttentionAttributes& attrs,
     const auto* mask_ptr = has_mask ? inputs[3].data_as<float>() : nullptr;
     auto* out_ptr = output.data_as<float>();
 
+    // Row strides in elements (from pitch, accounts for padding)
+    const int64_t q_row_stride = Q.row_stride_elems();  // merged: >= H*D, explicit: >= D
+    const int64_t k_row_stride = K.row_stride_elems();
+    const int64_t v_row_stride = V.row_stride_elems();
+    const int64_t o_row_stride = output.row_stride_elems();
+
     // Helper to read Q/K/V elements accounting for merged vs. explicit layout
     auto read_elem = [&](const float* ptr, int64_t b, int64_t h,
-                         int64_t s, int64_t d, bool merged) -> float {
+                         int64_t s, int64_t d, int64_t row_stride, bool merged) -> float {
         if (merged) {
-            return ptr[(b * Sq + s) * H * D + h * D + d];
+            return ptr[(b * Sq + s) * row_stride + h * D + d];
         } else {
-            return ptr[((b * H + h) * Sq + s) * D + d];
+            return ptr[((b * H + h) * Sq + s) * row_stride + d];
         }
     };
 
     auto write_elem = [&](float* ptr, int64_t b, int64_t h,
-                          int64_t s, int64_t d, float val, bool merged) {
+                          int64_t s, int64_t d, float val, int64_t row_stride, bool merged) {
         int64_t idx = merged
-            ? (b * Sq + s) * H * D + h * D + d
-            : ((b * H + h) * Sq + s) * D + d;
+            ? (b * Sq + s) * row_stride + h * D + d
+            : ((b * H + h) * Sq + s) * row_stride + d;
         ptr[idx] = attrs.add_to ? ptr[idx] + val : val;
     };
 
@@ -108,8 +114,8 @@ void attention_ref(const AttentionAttributes& attrs,
             for (int64_t j = 0; j < Sk; ++j) {
                 float dot = 0.0f;
                 for (int64_t d = 0; d < D; ++d) {
-                    float qv = read_elem(q_ptr, b, h, i, d, merged_heads);
-                    float kv = read_elem(k_ptr, b, h, j, d, merged_heads);
+                    float qv = read_elem(q_ptr, b, h, i, d, q_row_stride, merged_heads);
+                    float kv = read_elem(k_ptr, b, h, j, d, k_row_stride, merged_heads);
                     dot += qv * kv;
                 }
                 scores[i * Sk + j] = dot * scale;
@@ -144,10 +150,10 @@ void attention_ref(const AttentionAttributes& attrs,
                 for (int64_t j = 0; j < Sk; ++j) {
                     float attn = scores[i * Sk + j];
                     if (std::isinf(attn) || std::isnan(attn)) continue;
-                    float vv = read_elem(v_ptr, b, h, j, d, merged_heads);
+                    float vv = read_elem(v_ptr, b, h, j, d, v_row_stride, merged_heads);
                     sum += attn * vv;
                 }
-                write_elem(out_ptr, b, h, i, d, sum, merged_heads);
+                write_elem(out_ptr, b, h, i, d, sum, o_row_stride, merged_heads);
             }
         }
     };

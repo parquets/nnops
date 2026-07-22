@@ -24,6 +24,7 @@ void conv2d_ref(const Conv2DAttributes& attrs,
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
+    const int64_t in_row_stride  = input.row_stride_elems();   // elements per input row (>= IW)
 
     // Weight: [OC, IC/G, KH, KW]
     const int64_t OC = weight.shape(0);
@@ -34,6 +35,7 @@ void conv2d_ref(const Conv2DAttributes& attrs,
     // Output: [N, OC, OH, OW]
     const int64_t OH = output.shape(2);
     const int64_t OW = output.shape(3);
+    const int64_t out_row_stride = output.row_stride_elems();  // elements per output row (>= OW)
 
     const int64_t G  = attrs.groups;
     const int64_t OC_per_G = OC / G;
@@ -67,7 +69,7 @@ void conv2d_ref(const Conv2DAttributes& attrs,
                                     const int64_t iw = ow * SW + kw * DW - PW;
                                     if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
                                         const int64_t in_idx =
-                                            ((n * IC + ic) * IH + ih) * IW + iw;
+                                            ((n * IC + ic) * IH + ih) * in_row_stride + iw;
                                         const int64_t w_idx =
                                             (((oc_global * KC) + (ic - ic_start))
                                              * KH + kh) * KW + kw;
@@ -80,7 +82,7 @@ void conv2d_ref(const Conv2DAttributes& attrs,
                             sum += b_ptr[oc_global];
                         }
                         const int64_t out_idx =
-                            ((n * OC + oc_global) * OH + oh) * OW + ow;
+                            ((n * OC + oc_global) * OH + oh) * out_row_stride + ow;
                         float val = apply_epilogue(attrs.epilogue, sum, oc_global);
                         out_ptr[out_idx] = attrs.add_to ? out_ptr[out_idx] + val : val;
                     }

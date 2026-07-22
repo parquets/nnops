@@ -25,21 +25,26 @@ void matmul_ref(const MatMulAttributes& attrs,
     const auto* b_ptr = b.data_as<float>();
     auto* c_ptr = output.data_as<float>();
 
+    // Row strides in elements (from pitch, >= innermost dim size)
+    const int64_t a_row_stride = a.row_stride_elems();
+    const int64_t b_row_stride = b.row_stride_elems();
+    const int64_t c_row_stride = output.row_stride_elems();
+
     // Parallel over M
     const auto compute_row = [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             float sum = 0.0f;
             for (int64_t k = 0; k < K; ++k) {
                 const float a_val = attrs.transpose_a
-                    ? a_ptr[k * M + m]
-                    : a_ptr[m * K + k];
+                    ? a_ptr[k * a_row_stride + m]
+                    : a_ptr[m * a_row_stride + k];
                 const float b_val = attrs.transpose_b
-                    ? b_ptr[n * K + k]
-                    : b_ptr[k * N + n];
+                    ? b_ptr[n * b_row_stride + k]
+                    : b_ptr[k * b_row_stride + n];
                 sum += a_val * b_val;
             }
             float val = apply_epilogue(attrs.epilogue, sum, n);
-            c_ptr[m * N + n] = attrs.add_to ? c_ptr[m * N + n] + val : val;
+            c_ptr[m * c_row_stride + n] = attrs.add_to ? c_ptr[m * c_row_stride + n] + val : val;
         }
     };
 

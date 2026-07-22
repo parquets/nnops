@@ -69,54 +69,72 @@ void batch_norm_cpu(const BatchNormAttributes& attrs,
             new_bias[static_cast<size_t>(c)]  = b_ptr[c] - m_ptr[c] * new_scale[static_cast<size_t>(c)];
         }
 
-        // Per-sample compute: for each (n, c), SIMD over the spatial block.
+        // Use stride_elems to compute offsets (accounts for pitch).
+        // For [N, C]: offset(n,c) = n*stride(0) + c*stride(1)
+        // For [N, C, H, W]: offset(n,c,h,w) = n*stride(0) + c*stride(1) + h*stride(2) + w
+        const int64_t x_n_stride = X.stride_elems(0);
+        const int64_t x_c_stride = (rank >= 2) ? X.stride_elems(1) : 1;
+        const int64_t y_n_stride = output.stride_elems(0);
+        const int64_t y_c_stride = (rank >= 2) ? output.stride_elems(1) : 1;
+
+        // Spatial dims (for rank >= 3)
+        const int64_t last_dim = (rank >= 3) ? X.shape(rank - 1) : 1;
+        const int64_t num_rows = (rank >= 3) ? sample_size / last_dim : 1;
+        const int64_t x_row_stride = X.row_stride_elems();
+        const int64_t y_row_stride = output.row_stride_elems();
+
+        // Per-sample compute: process each (n, c), row-by-row SIMD over spatial dims.
         const auto compute_sample = [&](int64_t n) {
             for (int64_t c = 0; c < C; ++c) {
                 const float ns = new_scale[static_cast<size_t>(c)];
                 const float nb = new_bias[static_cast<size_t>(c)];
-                const int64_t base = (n * C + c) * sample_size;
+                const int64_t x_ch_base = n * x_n_stride + c * x_c_stride;
+                const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
 
-                int64_t i = 0;
+                // Process each row within the channel
+                for (int64_t hh = 0; hh < num_rows; ++hh) {
+                    const int64_t x_off = x_ch_base + hh * x_row_stride;
+                    const int64_t y_off = y_ch_base + hh * y_row_stride;
+                    int64_t i = 0;
 
-                if (attrs.add_to) {
-                    // add_to path: load existing output, accumulate
-                    const v_f32x8 scale8 = v_set1_f32x8(ns);
-                    const v_f32x8 bias8  = v_set1_f32x8(nb);
-                    for (; i + 8 <= sample_size; i += 8) {
-                        const v_f32x8 x8 = v_load_f32x8(x_ptr + base + i);
-                        const v_f32x8 y8 = v_load_f32x8(y_ptr + base + i);
-                        v_store(y_ptr + base + i, v_add(y8, v_fmadd(scale8, x8, bias8)));
-                    }
+                    if (attrs.add_to) {
+                        const v_f32x8 scale8 = v_set1_f32x8(ns);
+                        const v_f32x8 bias8  = v_set1_f32x8(nb);
+                        for (; i + 8 <= last_dim; i += 8) {
+                            const v_f32x8 x8 = v_load_f32x8(x_ptr + x_off + i);
+                            const v_f32x8 y8 = v_load_f32x8(y_ptr + y_off + i);
+                            v_store(y_ptr + y_off + i, v_add(y8, v_fmadd(scale8, x8, bias8)));
+                        }
 
-                    const v_f32x4 scale4 = v_set1_f32x4(ns);
-                    const v_f32x4 bias4  = v_set1_f32x4(nb);
-                    for (; i + 4 <= sample_size; i += 4) {
-                        const v_f32x4 x4 = v_load_f32x4(x_ptr + base + i);
-                        const v_f32x4 y4 = v_load_f32x4(y_ptr + base + i);
-                        v_store(y_ptr + base + i, v_add(y4, v_fmadd(scale4, x4, bias4)));
-                    }
+                        const v_f32x4 scale4 = v_set1_f32x4(ns);
+                        const v_f32x4 bias4  = v_set1_f32x4(nb);
+                        for (; i + 4 <= last_dim; i += 4) {
+                            const v_f32x4 x4 = v_load_f32x4(x_ptr + x_off + i);
+                            const v_f32x4 y4 = v_load_f32x4(y_ptr + y_off + i);
+                            v_store(y_ptr + y_off + i, v_add(y4, v_fmadd(scale4, x4, bias4)));
+                        }
 
-                    for (; i < sample_size; ++i) {
-                        y_ptr[base + i] += x_ptr[base + i] * ns + nb;
-                    }
-                } else {
-                    // Overwrite path (original)
-                    const v_f32x8 scale8 = v_set1_f32x8(ns);
-                    const v_f32x8 bias8  = v_set1_f32x8(nb);
-                    for (; i + 8 <= sample_size; i += 8) {
-                        const v_f32x8 x8 = v_load_f32x8(x_ptr + base + i);
-                        v_store(y_ptr + base + i, v_fmadd(scale8, x8, bias8));
-                    }
+                        for (; i < last_dim; ++i) {
+                            y_ptr[y_off + i] += x_ptr[x_off + i] * ns + nb;
+                        }
+                    } else {
+                        const v_f32x8 scale8 = v_set1_f32x8(ns);
+                        const v_f32x8 bias8  = v_set1_f32x8(nb);
+                        for (; i + 8 <= last_dim; i += 8) {
+                            const v_f32x8 x8 = v_load_f32x8(x_ptr + x_off + i);
+                            v_store(y_ptr + y_off + i, v_fmadd(scale8, x8, bias8));
+                        }
 
-                    const v_f32x4 scale4 = v_set1_f32x4(ns);
-                    const v_f32x4 bias4  = v_set1_f32x4(nb);
-                    for (; i + 4 <= sample_size; i += 4) {
-                        const v_f32x4 x4 = v_load_f32x4(x_ptr + base + i);
-                        v_store(y_ptr + base + i, v_fmadd(scale4, x4, bias4));
-                    }
+                        const v_f32x4 scale4 = v_set1_f32x4(ns);
+                        const v_f32x4 bias4  = v_set1_f32x4(nb);
+                        for (; i + 4 <= last_dim; i += 4) {
+                            const v_f32x4 x4 = v_load_f32x4(x_ptr + x_off + i);
+                            v_store(y_ptr + y_off + i, v_fmadd(scale4, x4, bias4));
+                        }
 
-                    for (; i < sample_size; ++i) {
-                        y_ptr[base + i] = x_ptr[base + i] * ns + nb;
+                        for (; i < last_dim; ++i) {
+                            y_ptr[y_off + i] = x_ptr[x_off + i] * ns + nb;
+                        }
                     }
                 }
             }

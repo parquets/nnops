@@ -25,6 +25,8 @@ void conv3d_ref(const Conv3DAttributes& attrs,
     const int64_t ID = input.shape(2);
     const int64_t IH = input.shape(3);
     const int64_t IW = input.shape(4);
+    const int64_t in_row_stride = input.row_stride_elems();   // elements per row (>= IW)
+    const int64_t in_d_stride   = IH * in_row_stride;          // elements per depth slice
 
     // Weight: [OC, IC/G, KD, KH, KW]
     const int64_t OC = weight.shape(0);
@@ -37,6 +39,8 @@ void conv3d_ref(const Conv3DAttributes& attrs,
     const int64_t OD = output.shape(2);
     const int64_t OH = output.shape(3);
     const int64_t OW = output.shape(4);
+    const int64_t out_row_stride = output.row_stride_elems();  // elements per row (>= OW)
+    const int64_t out_d_stride   = OH * out_row_stride;         // elements per depth slice
 
     const int64_t G  = attrs.groups;
     const int64_t OC_per_G = OC / G;
@@ -79,7 +83,7 @@ void conv3d_ref(const Conv3DAttributes& attrs,
                                                 iw >= 0 && iw < IW) {
                                                 const int64_t in_idx =
                                                     (((n * IC + ic) * ID + id)
-                                                     * IH + ih) * IW + iw;
+                                                     * IH + ih) * in_row_stride + iw;
                                                 const int64_t w_idx =
                                                     ((((oc_global * KC) + (ic - ic_start))
                                                       * KD + kd) * KH + kh) * KW + kw;
@@ -94,7 +98,7 @@ void conv3d_ref(const Conv3DAttributes& attrs,
                             }
                             const int64_t out_idx =
                                 (((n * OC + oc_global) * OD + od)
-                                 * OH + oh) * OW + ow;
+                                 * OH + oh) * out_row_stride + ow;
                             float val = apply_epilogue(attrs.epilogue, sum, oc_global);
                             out_ptr[out_idx] = attrs.add_to ? out_ptr[out_idx] + val : val;
                         }

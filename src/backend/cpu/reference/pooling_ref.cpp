@@ -12,11 +12,13 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Compute the NCHW offset for a 4D or 5D tensor.
+/// Compute the NCHW offset for a 4D or 5D tensor using pitch.
+/// row_stride is the element stride between rows (>= W for padded data).
 inline int64_t nchw_offset(int64_t n, int64_t c,
                            int64_t d, int64_t h, int64_t w,
-                           int64_t C, int64_t D, int64_t H, int64_t W) {
-    return (((n * C + c) * D + d) * H + h) * W + w;
+                           int64_t C, int64_t D, int64_t H,
+                           int64_t row_stride) {
+    return (((n * C + c) * D + d) * H + h) * row_stride + w;
 }
 
 }  // namespace
@@ -63,6 +65,9 @@ void pooling_ref(const PoolingAttributes& attrs,
     const auto* in_ptr  = input.data_as<float>();
     auto* out_ptr = output.data_as<float>();
 
+    const int64_t in_row_stride  = input.row_stride_elems();   // >= IW
+    const int64_t out_row_stride = output.row_stride_elems();  // >= OW
+
     const int64_t K_total = KD * KH * KW;
 
     // Per-sample compute lambda (handles both 2D and 3D via D loops)
@@ -87,7 +92,7 @@ void pooling_ref(const PoolingAttributes& attrs,
                         const int64_t iw = ow * SW + kw - PW;
                         if (iw < 0 || iw >= IW) continue;
                         const int64_t in_idx =
-                            nchw_offset(n, c, id, ih, iw, C, ID, IH, IW);
+                            nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                         max_val = std::max(max_val, in_ptr[in_idx]);
                         any = true;
                     }}}
@@ -110,7 +115,7 @@ void pooling_ref(const PoolingAttributes& attrs,
                             continue;
                         }
                         const int64_t in_idx =
-                            nchw_offset(n, c, id, ih, iw, C, ID, IH, IW);
+                            nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                         sum += in_ptr[in_idx];
                     }}}
                     if (attrs.type == PoolingType::AverageExcludePad) {
@@ -134,7 +139,7 @@ void pooling_ref(const PoolingAttributes& attrs,
                         const int64_t iw = ow * SW + kw - PW;
                         if (iw < 0 || iw >= IW) continue;
                         const int64_t in_idx =
-                            nchw_offset(n, c, id, ih, iw, C, ID, IH, IW);
+                            nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                         sum += std::pow(std::abs(in_ptr[in_idx]),
                                         static_cast<float>(p));
                     }}}
@@ -144,7 +149,7 @@ void pooling_ref(const PoolingAttributes& attrs,
                 }
 
                 const int64_t out_idx =
-                    nchw_offset(n, c, od, oh, ow, C, OD, OH, OW);
+                    nchw_offset(n, c, od, oh, ow, C, OD, OH, out_row_stride);
                 out_ptr[out_idx] = attrs.add_to ? out_ptr[out_idx] + result : result;
             }}}
         }

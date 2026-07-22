@@ -31,18 +31,23 @@ void linear_ref(const LinearAttributes& attrs,
     const auto* b_ptr  = has_bias ? inputs[2].data_as<float>() : nullptr;
     auto* out_ptr = output.data_as<float>();
 
+    // Row strides in elements (from pitch)
+    const int64_t in_row_stride  = input.row_stride_elems();   // >= K
+    const int64_t w_row_stride   = weight.row_stride_elems();  // >= K
+    const int64_t out_row_stride = output.row_stride_elems();  // >= N
+
     // Parallel over M (batch dimension)
     const auto compute_row = [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             float sum = 0.0f;
             for (int64_t k = 0; k < K; ++k) {
-                sum += in_ptr[m * K + k] * w_ptr[n * K + k];  // weight^T access
+                sum += in_ptr[m * in_row_stride + k] * w_ptr[n * w_row_stride + k];
             }
             if (has_bias) {
                 sum += b_ptr[n];
             }
             float val = apply_epilogue(attrs.epilogue, sum, n);
-            out_ptr[m * N + n] = attrs.add_to ? out_ptr[m * N + n] + val : val;
+            out_ptr[m * out_row_stride + n] = attrs.add_to ? out_ptr[m * out_row_stride + n] + val : val;
         }
     };
 

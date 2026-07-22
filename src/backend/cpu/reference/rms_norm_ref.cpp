@@ -42,16 +42,33 @@ void rms_norm_ref(const RMSNormAttributes& attrs,
     const auto* s_ptr = scale.data_as<float>();
     auto* y_ptr = output.data_as<float>();
 
+    // Compute the element stride of the axis dimension (accounts for pitch)
+    const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
+
+    // Convert a flat index within the normalized tail (dims axis..rank-1)
+    // to an element offset from the start of the normalization group.
+    auto inner_offset = [&](int64_t flat_idx) -> int64_t {
+        int64_t off = 0;
+        int64_t rem = flat_idx;
+        for (int64_t i = rank - 1; i >= axis; --i) {
+            int64_t dim = X.shape(i);
+            off += (rem % dim) * X.stride_elems(i);
+            rem /= dim;
+        }
+        return off;
+    };
+
     // Scale is typically the same shape as norm_shape (last dims)
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
-        int64_t row_start = row * norm_size;
+        int64_t row_base = row * outer_stride;
 
         // Compute sum of squares
         float sum_sq = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
-            float x = x_ptr[row_start + i];
+            int64_t off = row_base + inner_offset(i);
+            float x = x_ptr[off];
             sum_sq += x * x;
         }
         float rms = std::sqrt(sum_sq / static_cast<float>(norm_size) + epsilon);
@@ -59,9 +76,10 @@ void rms_norm_ref(const RMSNormAttributes& attrs,
         // Apply RMS normalization with scale
         float inv_rms = 1.0f / rms;
         for (int64_t i = 0; i < norm_size; ++i) {
+            int64_t off = row_base + inner_offset(i);
             float s = scale_is_scalar ? s_ptr[0] : s_ptr[i];
-            float val = x_ptr[row_start + i] * inv_rms * s;
-            y_ptr[row_start + i] = attrs.add_to ? y_ptr[row_start + i] + val : val;
+            float val = x_ptr[off] * inv_rms * s;
+            y_ptr[off] = attrs.add_to ? y_ptr[off] + val : val;
         }
     };
 

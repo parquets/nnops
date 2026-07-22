@@ -49,7 +49,7 @@ namespace {
 /// Called for: pad-depth regions, pad-height regions, pad-width edges,
 ///             non-SIMD types (AvgExcludePad, Lp), and stride_w != 1 fallback.
 inline void pooling_scalar_row(
-    float* output,          // output row pointer: out_d + oh * out_h_stride
+    float* output,          // output row pointer: out_d + oh * out_row_stride
     const float* input,     // channel base pointer: in_ch
     int64_t ID, int64_t IH, int64_t IW,
     int64_t od, int64_t oh,
@@ -59,7 +59,7 @@ inline void pooling_scalar_row(
     int64_t DD, int64_t DH, int64_t DW,
     int64_t PD, int64_t PH, int64_t PW,
     int64_t out_w_stride,
-    int64_t in_d_stride, int64_t in_h_stride,
+    int64_t in_d_stride, int64_t in_row_stride,
     PoolingType type, bool add_to, int64_t p_norm)
 {
     for (int64_t ow = ow_start; ow < ow_end; ++ow) {
@@ -79,7 +79,7 @@ inline void pooling_scalar_row(
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         const int64_t iw = ow * SW + kw * DW - PW;
                         if (iw < 0 || iw >= IW) continue;
-                        const float val = input[id * in_d_stride + ih * in_h_stride + iw];
+                        const float val = input[id * in_d_stride + ih * in_row_stride + iw];
                         if (val > max_val) max_val = val;
                         any = true;
                     }
@@ -106,7 +106,7 @@ inline void pooling_scalar_row(
                             ++pad_count;
                             continue;
                         }
-                        sum += input[id * in_d_stride + ih * in_h_stride + iw];
+                        sum += input[id * in_d_stride + ih * in_row_stride + iw];
                     }
                 }
             }
@@ -133,7 +133,7 @@ inline void pooling_scalar_row(
                         const int64_t iw = ow * SW + kw * DW - PW;
                         if (iw < 0 || iw >= IW) continue;
                         sum += std::pow(
-                            std::abs(input[id * in_d_stride + ih * in_h_stride + iw]), fp);
+                            std::abs(input[id * in_d_stride + ih * in_row_stride + iw]), fp);
                     }
                 }
             }
@@ -153,15 +153,15 @@ inline void pooling_scalar_row(
 // ============================================================
 //
 // Pointer conventions (PRE-POSITIONED by caller):
-//   output: out_d + oh_start * out_h_stride + ow_start * out_w_stride
+//   output: out_d + oh_start * out_row_stride + ow_start * out_w_stride
 //   input:  in_ch
 //           + (od * SD - PD) * in_d_stride     ← base depth position
-//           + (oh_start * SH - PH) * in_h_stride ← base height position
+//           + (oh_start * SH - PH) * in_row_stride ← base height position
 //           + (ow_start - PW)                   ← base width position (SW == 1)
 //
 // Relative offsets used inside the kernel (caller guarantees validity):
 //   Depth:  kd * DD * in_d_stride
-//   Height: (r * SH + kh * DH) * in_h_stride    (r = 0..3 for h4, 0 for h1)
+//   Height: (r * SH + kh * DH) * in_row_stride    (r = 0..3 for h4, 0 for h1)
 //   Width:  (ow - ow_start) + kw * DW           (SW == 1, in_w_stride == 1, ow loops)
 
 /// Process 4 output rows × up to `ow_simd_count * 8` output columns with element-wise v_max.
@@ -172,8 +172,8 @@ inline void maxpool_h4_simd(
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
     int64_t ow_simd_count,
-    int64_t out_h_stride, int64_t out_w_stride,
-    int64_t in_d_stride, int64_t in_h_stride,
+    int64_t out_row_stride, int64_t out_w_stride,
+    int64_t in_d_stride, int64_t in_row_stride,
     bool add_to)
 {
     constexpr float neg_inf = -std::numeric_limits<float>::infinity();
@@ -189,10 +189,10 @@ inline void maxpool_h4_simd(
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
             for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t h_off0 = (0 * SH + kh * DH) * in_h_stride;
-                const int64_t h_off1 = (1 * SH + kh * DH) * in_h_stride;
-                const int64_t h_off2 = (2 * SH + kh * DH) * in_h_stride;
-                const int64_t h_off3 = (3 * SH + kh * DH) * in_h_stride;
+                const int64_t h_off0 = (0 * SH + kh * DH) * in_row_stride;
+                const int64_t h_off1 = (1 * SH + kh * DH) * in_row_stride;
+                const int64_t h_off2 = (2 * SH + kh * DH) * in_row_stride;
+                const int64_t h_off3 = (3 * SH + kh * DH) * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
                     vacc0 = v_max(vacc0, v_load_f32x8(input + d_off + h_off0 + kw_off));
@@ -204,10 +204,10 @@ inline void maxpool_h4_simd(
         }
 
         // Write back
-        float* out0 = output + 0 * out_h_stride + w_off * out_w_stride;
-        float* out1 = output + 1 * out_h_stride + w_off * out_w_stride;
-        float* out2 = output + 2 * out_h_stride + w_off * out_w_stride;
-        float* out3 = output + 3 * out_h_stride + w_off * out_w_stride;
+        float* out0 = output + 0 * out_row_stride + w_off * out_w_stride;
+        float* out1 = output + 1 * out_row_stride + w_off * out_w_stride;
+        float* out2 = output + 2 * out_row_stride + w_off * out_w_stride;
+        float* out3 = output + 3 * out_row_stride + w_off * out_w_stride;
 
         if (add_to) {
             vacc0 = v_add(vacc0, v_load_f32x8(out0));
@@ -231,8 +231,8 @@ inline void maxpool_h1_simd(
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
     int64_t ow_simd_count,
-    int64_t out_h_stride, int64_t out_w_stride,
-    int64_t in_d_stride, int64_t in_h_stride,
+    int64_t out_row_stride, int64_t out_w_stride,
+    int64_t in_d_stride, int64_t in_row_stride,
     bool add_to)
 {
     constexpr float neg_inf = -std::numeric_limits<float>::infinity();
@@ -244,7 +244,7 @@ inline void maxpool_h1_simd(
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
             for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t h_off = kh * DH * in_h_stride;
+                const int64_t h_off = kh * DH * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
                     vacc = v_max(vacc, v_load_f32x8(input + d_off + h_off + kw_off));
@@ -274,8 +274,8 @@ inline void avgpool_h4_simd(
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
     int64_t ow_simd_count,
-    int64_t out_h_stride, int64_t out_w_stride,
-    int64_t in_d_stride, int64_t in_h_stride,
+    int64_t out_row_stride, int64_t out_w_stride,
+    int64_t in_d_stride, int64_t in_row_stride,
     float scale, bool add_to)
 {
     const v_f32x8 vscale = v_set1_f32x8(scale);
@@ -291,10 +291,10 @@ inline void avgpool_h4_simd(
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
             for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t h_off0 = (0 * SH + kh * DH) * in_h_stride;
-                const int64_t h_off1 = (1 * SH + kh * DH) * in_h_stride;
-                const int64_t h_off2 = (2 * SH + kh * DH) * in_h_stride;
-                const int64_t h_off3 = (3 * SH + kh * DH) * in_h_stride;
+                const int64_t h_off0 = (0 * SH + kh * DH) * in_row_stride;
+                const int64_t h_off1 = (1 * SH + kh * DH) * in_row_stride;
+                const int64_t h_off2 = (2 * SH + kh * DH) * in_row_stride;
+                const int64_t h_off3 = (3 * SH + kh * DH) * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
                     vacc0 = v_fmadd(v_load_f32x8(input + d_off + h_off0 + kw_off), vscale, vacc0);
@@ -305,10 +305,10 @@ inline void avgpool_h4_simd(
             }
         }
 
-        float* out0 = output + 0 * out_h_stride + w_off * out_w_stride;
-        float* out1 = output + 1 * out_h_stride + w_off * out_w_stride;
-        float* out2 = output + 2 * out_h_stride + w_off * out_w_stride;
-        float* out3 = output + 3 * out_h_stride + w_off * out_w_stride;
+        float* out0 = output + 0 * out_row_stride + w_off * out_w_stride;
+        float* out1 = output + 1 * out_row_stride + w_off * out_w_stride;
+        float* out2 = output + 2 * out_row_stride + w_off * out_w_stride;
+        float* out3 = output + 3 * out_row_stride + w_off * out_w_stride;
 
         if (add_to) {
             vacc0 = v_add(vacc0, v_load_f32x8(out0));
@@ -332,8 +332,8 @@ inline void avgpool_h1_simd(
     int64_t SH,
     int64_t DD, int64_t DH, int64_t DW,
     int64_t ow_simd_count,
-    int64_t out_h_stride, int64_t out_w_stride,
-    int64_t in_d_stride, int64_t in_h_stride,
+    int64_t out_row_stride, int64_t out_w_stride,
+    int64_t in_d_stride, int64_t in_row_stride,
     float scale, bool add_to)
 {
     const v_f32x8 vscale = v_set1_f32x8(scale);
@@ -345,7 +345,7 @@ inline void avgpool_h1_simd(
         for (int64_t kd = 0; kd < KD; ++kd) {
             const int64_t d_off = kd * DD * in_d_stride;
             for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t h_off = kh * DH * in_h_stride;
+                const int64_t h_off = kh * DH * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     const int64_t kw_off = w_off + kw * DW;
                     vacc = v_fmadd(v_load_f32x8(input + d_off + h_off + kw_off), vscale, vacc);
@@ -414,14 +414,14 @@ void pooling_cpu(const PoolingAttributes& attrs,
     auto* out_ptr = output.data_as<float>();
     const auto* in_ptr = input.data_as<float>();
 
-    // ----- Strides for dense NCHW/NCDHW layout -----
-    const int64_t in_ch_stride  = ID * IH * IW;
-    const int64_t in_d_stride   = IH * IW;
-    const int64_t in_h_stride   = IW;
-    const int64_t out_ch_stride = OD * OH * OW;
-    const int64_t out_d_stride  = OH * OW;
-    const int64_t out_h_stride  = OW;
-    const int64_t out_w_stride  = 1;
+    // ----- Strides derived from pitch (row pitch in bytes → element stride) -----
+    const int64_t in_row_stride   = input.row_stride_elems();   // elements per input row (>= IW)
+    const int64_t in_d_stride     = IH * in_row_stride;          // elements per depth slice
+    const int64_t in_ch_stride    = ID * in_d_stride;            // elements per channel
+    const int64_t out_row_stride  = output.row_stride_elems();   // elements per output row (>= OW)
+    const int64_t out_d_stride    = OH * out_row_stride;         // elements per output depth slice
+    const int64_t out_ch_stride   = OD * out_d_stride;           // elements per output channel
+    const int64_t out_w_stride    = 1;
 
     // ----- SIMD gating -----
     // Max and Average (includes pad) support SIMD via contiguous load.
@@ -498,10 +498,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                 float* out_d = out_ch + od * out_d_stride;
                 for (int64_t oh = 0; oh < OH; ++oh) {
                     pooling_scalar_row(
-                        out_d + oh * out_h_stride, in_ch,
+                        out_d + oh * out_row_stride, in_ch,
                         ID, IH, IW, od, oh, 0, OW,
                         KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_h_stride,
+                        out_w_stride, in_d_stride, in_row_stride,
                         attrs.type, attrs.add_to, attrs.p_norm);
                 }
             }
@@ -518,10 +518,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                 // ---- Pad-Top (scalar) ----
                 for (int64_t oh = 0; oh < oh_beg_c; ++oh) {
                     pooling_scalar_row(
-                        out_d + oh * out_h_stride, in_ch,
+                        out_d + oh * out_row_stride, in_ch,
                         ID, IH, IW, od, oh, 0, OW,
                         KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_h_stride,
+                        out_w_stride, in_d_stride, in_row_stride,
                         attrs.type, attrs.add_to, attrs.p_norm);
                 }
 
@@ -536,10 +536,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                         if (ow_beg_c > 0) {
                             for (int64_t r = 0; r < 4; ++r) {
                                 pooling_scalar_row(
-                                    out_d + (oh + r) * out_h_stride, in_ch,
+                                    out_d + (oh + r) * out_row_stride, in_ch,
                                     ID, IH, IW, od, oh + r, 0, ow_beg_c,
                                     KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                    out_w_stride, in_d_stride, in_h_stride,
+                                    out_w_stride, in_d_stride, in_row_stride,
                                     attrs.type, attrs.add_to, attrs.p_norm);
                             }
                         }
@@ -547,11 +547,11 @@ void pooling_cpu(const PoolingAttributes& attrs,
                         // SIMD h4 interior (8-wide blocks)
                         const int64_t ow_simd_cnt = (ow_simd_end - ow_simd_beg) / 8;
                         if (ow_simd_cnt > 0) {
-                            float* out_simd = out_d + oh * out_h_stride
+                            float* out_simd = out_d + oh * out_row_stride
                                             + ow_simd_beg * out_w_stride;
                             const float* in_simd = in_ch
                                 + id_base * in_d_stride
-                                + ih_base * in_h_stride
+                                + ih_base * in_row_stride
                                 + (ow_simd_beg - PW);
 
                             if (attrs.type == PoolingType::Max) {
@@ -559,16 +559,16 @@ void pooling_cpu(const PoolingAttributes& attrs,
                                                 KD, KH, KW, SH,
                                                 DD_, DH, DW,
                                                 ow_simd_cnt,
-                                                out_h_stride, out_w_stride,
-                                                in_d_stride, in_h_stride,
+                                                out_row_stride, out_w_stride,
+                                                in_d_stride, in_row_stride,
                                                 attrs.add_to);
                             } else {
                                 avgpool_h4_simd(out_simd, in_simd,
                                                 KD, KH, KW, SH,
                                                 DD_, DH, DW,
                                                 ow_simd_cnt,
-                                                out_h_stride, out_w_stride,
-                                                in_d_stride, in_h_stride,
+                                                out_row_stride, out_w_stride,
+                                                in_d_stride, in_row_stride,
                                                 avg_scale, attrs.add_to);
                             }
                         }
@@ -577,10 +577,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                         if (ow_simd_end < ow_end_c) {
                             for (int64_t r = 0; r < 4; ++r) {
                                 pooling_scalar_row(
-                                    out_d + (oh + r) * out_h_stride, in_ch,
+                                    out_d + (oh + r) * out_row_stride, in_ch,
                                     ID, IH, IW, od, oh + r, ow_simd_end, ow_end_c,
                                     KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                    out_w_stride, in_d_stride, in_h_stride,
+                                    out_w_stride, in_d_stride, in_row_stride,
                                     attrs.type, attrs.add_to, attrs.p_norm);
                             }
                         }
@@ -589,10 +589,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                         if (ow_end_c < OW) {
                             for (int64_t r = 0; r < 4; ++r) {
                                 pooling_scalar_row(
-                                    out_d + (oh + r) * out_h_stride, in_ch,
+                                    out_d + (oh + r) * out_row_stride, in_ch,
                                     ID, IH, IW, od, oh + r, ow_end_c, OW,
                                     KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                    out_w_stride, in_d_stride, in_h_stride,
+                                    out_w_stride, in_d_stride, in_row_stride,
                                     attrs.type, attrs.add_to, attrs.p_norm);
                             }
                         }
@@ -605,21 +605,21 @@ void pooling_cpu(const PoolingAttributes& attrs,
                         // Pad-left
                         if (ow_beg_c > 0) {
                             pooling_scalar_row(
-                                out_d + oh * out_h_stride, in_ch,
+                                out_d + oh * out_row_stride, in_ch,
                                 ID, IH, IW, od, oh, 0, ow_beg_c,
                                 KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                out_w_stride, in_d_stride, in_h_stride,
+                                out_w_stride, in_d_stride, in_row_stride,
                                 attrs.type, attrs.add_to, attrs.p_norm);
                         }
 
                         // SIMD h1 interior
                         const int64_t ow_simd_cnt = (ow_simd_end - ow_simd_beg) / 8;
                         if (ow_simd_cnt > 0) {
-                            float* out_simd = out_d + oh * out_h_stride
+                            float* out_simd = out_d + oh * out_row_stride
                                             + ow_simd_beg * out_w_stride;
                             const float* in_simd = in_ch
                                 + id_base * in_d_stride
-                                + ih_base * in_h_stride
+                                + ih_base * in_row_stride
                                 + (ow_simd_beg - PW);
 
                             if (attrs.type == PoolingType::Max) {
@@ -627,16 +627,16 @@ void pooling_cpu(const PoolingAttributes& attrs,
                                                 KD, KH, KW, SH,
                                                 DD_, DH, DW,
                                                 ow_simd_cnt,
-                                                out_h_stride, out_w_stride,
-                                                in_d_stride, in_h_stride,
+                                                out_row_stride, out_w_stride,
+                                                in_d_stride, in_row_stride,
                                                 attrs.add_to);
                             } else {
                                 avgpool_h1_simd(out_simd, in_simd,
                                                 KD, KH, KW, SH,
                                                 DD_, DH, DW,
                                                 ow_simd_cnt,
-                                                out_h_stride, out_w_stride,
-                                                in_d_stride, in_h_stride,
+                                                out_row_stride, out_w_stride,
+                                                in_d_stride, in_row_stride,
                                                 avg_scale, attrs.add_to);
                             }
                         }
@@ -644,20 +644,20 @@ void pooling_cpu(const PoolingAttributes& attrs,
                         // SIMD tail
                         if (ow_simd_end < ow_end_c) {
                             pooling_scalar_row(
-                                out_d + oh * out_h_stride, in_ch,
+                                out_d + oh * out_row_stride, in_ch,
                                 ID, IH, IW, od, oh, ow_simd_end, ow_end_c,
                                 KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                out_w_stride, in_d_stride, in_h_stride,
+                                out_w_stride, in_d_stride, in_row_stride,
                                 attrs.type, attrs.add_to, attrs.p_norm);
                         }
 
                         // Pad-right
                         if (ow_end_c < OW) {
                             pooling_scalar_row(
-                                out_d + oh * out_h_stride, in_ch,
+                                out_d + oh * out_row_stride, in_ch,
                                 ID, IH, IW, od, oh, ow_end_c, OW,
                                 KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                                out_w_stride, in_d_stride, in_h_stride,
+                                out_w_stride, in_d_stride, in_row_stride,
                                 attrs.type, attrs.add_to, attrs.p_norm);
                         }
                     }
@@ -665,10 +665,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                     // ---- Non-SIMD interior: all-scalar fallback ----
                     for (int64_t oh = oh_beg_c; oh < oh_end_c; ++oh) {
                         pooling_scalar_row(
-                            out_d + oh * out_h_stride, in_ch,
+                            out_d + oh * out_row_stride, in_ch,
                             ID, IH, IW, od, oh, 0, OW,
                             KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                            out_w_stride, in_d_stride, in_h_stride,
+                            out_w_stride, in_d_stride, in_row_stride,
                             attrs.type, attrs.add_to, attrs.p_norm);
                     }
                 }
@@ -676,10 +676,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                 // ---- Pad-Bottom (scalar) ----
                 for (int64_t oh = oh_end_c; oh < OH; ++oh) {
                     pooling_scalar_row(
-                        out_d + oh * out_h_stride, in_ch,
+                        out_d + oh * out_row_stride, in_ch,
                         ID, IH, IW, od, oh, 0, OW,
                         KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_h_stride,
+                        out_w_stride, in_d_stride, in_row_stride,
                         attrs.type, attrs.add_to, attrs.p_norm);
                 }
             }
@@ -691,10 +691,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
                 float* out_d = out_ch + od * out_d_stride;
                 for (int64_t oh = 0; oh < OH; ++oh) {
                     pooling_scalar_row(
-                        out_d + oh * out_h_stride, in_ch,
+                        out_d + oh * out_row_stride, in_ch,
                         ID, IH, IW, od, oh, 0, OW,
                         KD, KH, KW, SD, SH, SW, DD_, DH, DW, PD, PH, PW,
-                        out_w_stride, in_d_stride, in_h_stride,
+                        out_w_stride, in_d_stride, in_row_stride,
                         attrs.type, attrs.add_to, attrs.p_norm);
                 }
             }

@@ -40,34 +40,46 @@ void layer_norm_ref(const LayerNormAttributes& attrs,
         norm_size *= X.shape(i);
     }
 
-    // Scale/bias broadcast strides within the normalized shape
-    const int64_t scale_rank = scale.rank();
-    // scale.shape should match the last (rank - axis) dims of X
-    // For simple broadcasting: compute scale offset from position within norm
-    auto compute_scale_idx = [&](int64_t row_start, int64_t elem_offset) -> int64_t {
-        // Given a linear offset within the normalized dims, compute scale index
-        if (scale_rank == 1 && norm_size == scale.shape(0)) {
-            return elem_offset;
-        }
-        // For now, handle the common case: scale shape == last dims of X
-        // More complex broadcasting can be added later
-        if (scale.numel() == 1) return 0;
-        return elem_offset;  // assume same shape
-    };
-
     const auto* x_ptr  = X.data_as<float>();
     const auto* s_ptr  = scale.data_as<float>();
     const auto* b_ptr  = has_bias ? inputs[2].data_as<float>() : nullptr;
     auto* y_ptr = output.data_as<float>();
 
+    // Compute the element stride of the axis dimension (accounts for pitch).
+    // For [B, C, H, W] with axis=1: stride_elems(1) = H * row_stride.
+    const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
+
+    // Convert a flat index within the normalized tail (dims axis..rank-1)
+    // to an element offset from the start of the normalization group.
+    auto inner_offset = [&](int64_t flat_idx) -> int64_t {
+        int64_t off = 0;
+        int64_t rem = flat_idx;
+        for (int64_t i = rank - 1; i >= axis; --i) {
+            int64_t dim = X.shape(i);
+            off += (rem % dim) * X.stride_elems(i);
+            rem /= dim;
+        }
+        return off;
+    };
+
+    // Scale/bias offset: for now handle the common case where scale shape
+    // matches the normalized dims.
+    auto scale_offset = [&](int64_t flat_idx) -> int64_t {
+        if (scale.numel() == 1) return 0;
+        if (scale.rank() == 1 && norm_size == scale.shape(0)) return flat_idx;
+        // Default: assume matching shape
+        return flat_idx;
+    };
+
     const auto process_row = [&](int64_t row) {
-        int64_t row_start = row * norm_size;
+        int64_t row_base = row * outer_stride;
 
         // Welford's online algorithm for mean and variance
         float mean_val = 0.0f;
         float M2 = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
-            float x = x_ptr[row_start + i];
+            int64_t off = row_base + inner_offset(i);
+            float x = x_ptr[off];
             float delta = x - mean_val;
             mean_val += delta / static_cast<float>(i + 1);
             float delta2 = x - mean_val;
@@ -78,11 +90,12 @@ void layer_norm_ref(const LayerNormAttributes& attrs,
 
         // Apply normalization with scale and bias
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t s_idx = compute_scale_idx(row_start, i);
+            int64_t off = row_base + inner_offset(i);
+            int64_t s_idx = scale_offset(i);
             float s = s_ptr[s_idx];
             float b = b_ptr ? b_ptr[s_idx] : 0.0f;
-            float val = (x_ptr[row_start + i] - mean_val) * inv_std * s + b;
-            y_ptr[row_start + i] = attrs.add_to ? y_ptr[row_start + i] + val : val;
+            float val = (x_ptr[off] - mean_val) * inv_std * s + b;
+            y_ptr[off] = attrs.add_to ? y_ptr[off] + val : val;
         }
     };
 

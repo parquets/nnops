@@ -45,7 +45,8 @@ void cumsum_ref(const CumSumAttributes& attrs,
     auto* out_ptr = output.data_as<float>();
 
     // Stride between consecutive elements along the cumulative axis
-    const int64_t axis_stride = lower_dim_size;
+    // Uses stride_elems(axis) which accounts for pitch padding.
+    const int64_t axis_stride = input.stride_elems(axis);
 
     if (!attrs.reverse) {
         // Forward cumulative sum
