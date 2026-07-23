@@ -28,10 +28,21 @@ struct MatMulAttributes {
 
 /// Matrix multiplication operator (class-based API).
 ///
-/// Computes: C = A × B
-///   A: [M, K] (or [K, M] if transpose_a)
-///   B: [K, N] (or [N, K] if transpose_b)
-///   C: [M, N]
+/// Supports N-D batch matmul with numpy-style broadcasting:
+///   A: [..., M, K]  (or [..., K, M] if transpose_a)
+///   B: [..., K, N]  (or [..., N, K] if transpose_b)
+///   C: [..., M, N]
+///
+/// Leading batch dimensions are broadcast-compatible: each dim must be equal,
+/// or one of them must be 1 (broadcast to the other), or one tensor may have
+/// fewer dimensions (missing dims are treated as 1).
+///
+/// Examples:
+///   - 2D × 2D:    [M,K] × [K,N] → [M,N]
+///   - 3D × 3D:    [B,M,K] × [B,K,N] → [B,M,N]
+///   - 2D × 3D:    [M,K] × [B,K,N] → [B,M,N]   (broadcast A across batch)
+///   - 3D × 2D:    [B,M,K] × [K,N] → [B,M,N]   (broadcast B across batch)
+///   - 4D × 3D:    [2,1,M,K] × [3,K,N] → [2,3,M,N]
 class MatMul : public OpBase {
 public:
     /// Create a MatMul operator for the specified backend.
@@ -63,7 +74,7 @@ private:
     Backend backend_;
 };
 
-/// Functional matmul.
+/// Functional matmul (supports N-D batch with broadcasting).
 void matmul(const TensorView& a,
             const TensorView& b,
             TensorView& c,

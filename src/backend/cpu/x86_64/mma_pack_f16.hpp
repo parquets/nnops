@@ -15,6 +15,7 @@
 #include <algorithm>
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/common/restrict.hpp"
+#include "pack_f16.hpp"  // for load_f16x8, store_f16x8, mul_scale_f16x8
 
 namespace nnops::backend::cpu::x86_64 {
 
@@ -24,18 +25,7 @@ using nnops::backend::cpu::float_to_half;
 
 namespace {
 
-// Load 8 fp16 values → __m256 (fp32)
-inline __m256 load_f16x8(const half* NNOPS_RESTRICT p) noexcept {
-    return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
-}
-
-// Convert __m256 fp32 → 8 fp16 values and store
-inline void store_f16x8(half* NNOPS_RESTRICT p, __m256 v) noexcept {
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(p),
-                     _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
-}
-
-// Load 8 fp16, convert to fp32, then clamp → fp16 and store
+// Load 8 fp16, convert to fp32, add to accumulator, clamp → fp16 and store
 inline void load_clamp_store_f16x8(half* NNOPS_RESTRICT p, __m256 v_acc,
                                     float clamp_min, float clamp_max) noexcept {
     v_acc = _mm256_add_ps(v_acc, load_f16x8(p));
@@ -58,8 +48,7 @@ inline void mma_pack_1x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     float c0 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        c0 += half_to_float(A[0]) * half_to_float(B[0]);
-        A += 1;
+        c0 += half_to_float(*A++) * half_to_float(B[0]);
         B += ldb;
     }
     c0 += half_to_float(C[0 * ldc]);
@@ -73,11 +62,9 @@ inline void mma_pack_1x8_f16(half* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     __m256 v_c0 = _mm256_setzero_ps();
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[0].bits)));
-        const __m256 v_b0 = load_f16x8(B);
+        const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>((*A++).bits)));
+        const __m256 v_b0 = load_f16x8(B); B += ldb;
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
-        A += 1;
-        B += ldb;
     }
     load_clamp_store_f16x8(C, v_c0, clamp_min, clamp_max);
 }
@@ -90,13 +77,12 @@ inline void mma_pack_1x16_f16(half* NNOPS_RESTRICT C, int ldc,
     __m256 v_c0 = _mm256_setzero_ps();
     __m256 v_c1 = _mm256_setzero_ps();
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[0].bits)));
+        const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>((*A++).bits)));
         const __m256 v_b0 = load_f16x8(B + 0 * 8);
         const __m256 v_b1 = load_f16x8(B + 1 * 8);
+        B += ldb;
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
         v_c1 = _mm256_fmadd_ps(v_a0, v_b1, v_c1);
-        A += 1;
-        B += ldb;
     }
     load_clamp_store_f16x8(C + 0 * 8, v_c0, clamp_min, clamp_max);
     load_clamp_store_f16x8(C + 1 * 8, v_c1, clamp_min, clamp_max);
@@ -113,13 +99,12 @@ inline void mma_pack_4x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        const float b = half_to_float(B[0]);
+        const float b = half_to_float(*B); B += ldb;
         c0 += half_to_float(A[0]) * b;
         c1 += half_to_float(A[1]) * b;
         c2 += half_to_float(A[2]) * b;
         c3 += half_to_float(A[3]) * b;
         A += 4;
-        B += ldb;
     }
     auto clamp = [=](float v) noexcept {
         return std::min(std::max(v, clamp_min), clamp_max);
@@ -141,13 +126,12 @@ inline void mma_pack_4x8_f16(half* NNOPS_RESTRICT C, int ldc,
     __m256 v_c3 = _mm256_setzero_ps();
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = load_f16x8(B);
+        const __m256 v_b0 = load_f16x8(B); B += ldb;
         v_c0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[0].bits))), v_b0, v_c0);
         v_c1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[1].bits))), v_b0, v_c1);
         v_c2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[2].bits))), v_b0, v_c2);
         v_c3 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[3].bits))), v_b0, v_c3);
         A += 4;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * ldc, v_c0, clamp_min, clamp_max);
@@ -169,6 +153,7 @@ inline void mma_pack_4x16_f16(half* NNOPS_RESTRICT C, int ldc,
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = load_f16x8(B + 0 * 8);
         const __m256 v_b1 = load_f16x8(B + 1 * 8);
+        B += ldb;
 
         __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[0].bits)));
         __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[1].bits)));
@@ -185,7 +170,6 @@ inline void mma_pack_4x16_f16(half* NNOPS_RESTRICT C, int ldc,
         v_c31 = _mm256_fmadd_ps(v_a1, v_b1, v_c31);
 
         A += 4;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * ldc + 0, v_c00, clamp_min, clamp_max);
@@ -209,7 +193,7 @@ inline void mma_pack_6x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f, c4 = 0.0f, c5 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        const float b = half_to_float(B[0]);
+        const float b = half_to_float(*B); B += ldb;
         c0 += half_to_float(A[0]) * b;
         c1 += half_to_float(A[1]) * b;
         c2 += half_to_float(A[2]) * b;
@@ -217,7 +201,6 @@ inline void mma_pack_6x1_f16(half* NNOPS_RESTRICT C, int ldc,
         c4 += half_to_float(A[4]) * b;
         c5 += half_to_float(A[5]) * b;
         A += 6;
-        B += ldb;
     }
     auto clamp = [=](float v) noexcept {
         return std::min(std::max(v, clamp_min), clamp_max);
@@ -243,7 +226,7 @@ inline void mma_pack_6x8_f16(half* NNOPS_RESTRICT C, int ldc,
     __m256 v_c5 = _mm256_setzero_ps();
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = load_f16x8(B);
+        const __m256 v_b0 = load_f16x8(B); B += ldb;
         v_c0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[0].bits))), v_b0, v_c0);
         v_c1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[1].bits))), v_b0, v_c1);
         v_c2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[2].bits))), v_b0, v_c2);
@@ -251,7 +234,6 @@ inline void mma_pack_6x8_f16(half* NNOPS_RESTRICT C, int ldc,
         v_c4 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[4].bits))), v_b0, v_c4);
         v_c5 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[5].bits))), v_b0, v_c5);
         A += 6;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * ldc, v_c0, clamp_min, clamp_max);
@@ -277,6 +259,7 @@ inline void mma_pack_6x16_f16(half* NNOPS_RESTRICT C, int ldc,
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = load_f16x8(B + 0 * 8);
         const __m256 v_b1 = load_f16x8(B + 1 * 8);
+        B += ldb;
 
         __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[0].bits)));
         __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A[1].bits)));
@@ -300,7 +283,6 @@ inline void mma_pack_6x16_f16(half* NNOPS_RESTRICT C, int ldc,
         v_c51 = _mm256_fmadd_ps(v_a1, v_b1, v_c51);
 
         A += 6;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * ldc + 0, v_c00, clamp_min, clamp_max);

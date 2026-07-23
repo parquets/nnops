@@ -106,26 +106,52 @@ inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output,
                                int ir_step, int K, float scale) noexcept {
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float32x4_t v[12];
-        for (int i = 0; i < 12; ++i) {
-            v[i] = vld1q_f32(input + i * ir_step);
-        }
+        float32x4_t v0  = vld1q_f32(input + 0 * ir_step);
+        float32x4_t v1  = vld1q_f32(input + 1 * ir_step);
+        float32x4_t v2  = vld1q_f32(input + 2 * ir_step);
+        float32x4_t v3  = vld1q_f32(input + 3 * ir_step);
+        float32x4_t v4  = vld1q_f32(input + 4 * ir_step);
+        float32x4_t v5  = vld1q_f32(input + 5 * ir_step);
+        float32x4_t v6  = vld1q_f32(input + 6 * ir_step);
+        float32x4_t v7  = vld1q_f32(input + 7 * ir_step);
+        float32x4_t v8  = vld1q_f32(input + 8 * ir_step);
+        float32x4_t v9  = vld1q_f32(input + 9 * ir_step);
+        float32x4_t v10 = vld1q_f32(input + 10 * ir_step);
+        float32x4_t v11 = vld1q_f32(input + 11 * ir_step);
 
-        transpose_12x4_f32(v[0], v[1], v[2], v[3], v[4], v[5],
-                           v[6], v[7], v[8], v[9], v[10], v[11]);
+        transpose_12x4_f32(v0, v1, v2, v3, v4, v5,
+                           v6, v7, v8, v9, v10, v11);
 
         const float32x4_t s = vdupq_n_f32(scale);
-        for (int i = 0; i < 12; ++i) {
-            vst1q_f32(output + i * 4, vmulq_f32(v[i], s));
-        }
+        vst1q_f32(output + 0 * 4,  vmulq_f32(v0,  s));
+        vst1q_f32(output + 1 * 4,  vmulq_f32(v1,  s));
+        vst1q_f32(output + 2 * 4,  vmulq_f32(v2,  s));
+        vst1q_f32(output + 3 * 4,  vmulq_f32(v3,  s));
+        vst1q_f32(output + 4 * 4,  vmulq_f32(v4,  s));
+        vst1q_f32(output + 5 * 4,  vmulq_f32(v5,  s));
+        vst1q_f32(output + 6 * 4,  vmulq_f32(v6,  s));
+        vst1q_f32(output + 7 * 4,  vmulq_f32(v7,  s));
+        vst1q_f32(output + 8 * 4,  vmulq_f32(v8,  s));
+        vst1q_f32(output + 9 * 4,  vmulq_f32(v9,  s));
+        vst1q_f32(output + 10 * 4, vmulq_f32(v10, s));
+        vst1q_f32(output + 11 * 4, vmulq_f32(v11, s));
 
         output += 12 * 4;
         input  += 4;
     }
     for (; k < K; ++k) {
-        for (int i = 0; i < 12; ++i) {
-            *output++ = input[i * ir_step] * scale;
-        }
+        *output++ = input[0 * ir_step] * scale;
+        *output++ = input[1 * ir_step] * scale;
+        *output++ = input[2 * ir_step] * scale;
+        *output++ = input[3 * ir_step] * scale;
+        *output++ = input[4 * ir_step] * scale;
+        *output++ = input[5 * ir_step] * scale;
+        *output++ = input[6 * ir_step] * scale;
+        *output++ = input[7 * ir_step] * scale;
+        *output++ = input[8 * ir_step] * scale;
+        *output++ = input[9 * ir_step] * scale;
+        *output++ = input[10 * ir_step] * scale;
+        *output++ = input[11 * ir_step] * scale;
         input += 1;
     }
 }
@@ -135,26 +161,64 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
                                int ir_step, int K, float scale) noexcept {
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float32x4_t v[16];
-        for (int i = 0; i < 16; ++i) {
-            v[i] = vld1q_f32(input + i * ir_step);
-        }
+        float32x4_t v0  = vld1q_f32(input + 0 * ir_step);
+        float32x4_t v1  = vld1q_f32(input + 1 * ir_step);
+        float32x4_t v2  = vld1q_f32(input + 2 * ir_step);
+        float32x4_t v3  = vld1q_f32(input + 3 * ir_step);
+        float32x4_t v4  = vld1q_f32(input + 4 * ir_step);
+        float32x4_t v5  = vld1q_f32(input + 5 * ir_step);
+        float32x4_t v6  = vld1q_f32(input + 6 * ir_step);
+        float32x4_t v7  = vld1q_f32(input + 7 * ir_step);
+        float32x4_t v8  = vld1q_f32(input + 8 * ir_step);
+        float32x4_t v9  = vld1q_f32(input + 9 * ir_step);
+        float32x4_t v10 = vld1q_f32(input + 10 * ir_step);
+        float32x4_t v11 = vld1q_f32(input + 11 * ir_step);
+        float32x4_t v12 = vld1q_f32(input + 12 * ir_step);
+        float32x4_t v13 = vld1q_f32(input + 13 * ir_step);
+        float32x4_t v14 = vld1q_f32(input + 14 * ir_step);
+        float32x4_t v15 = vld1q_f32(input + 15 * ir_step);
 
-        transpose_16x4_f32(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                           v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+        transpose_16x4_f32(v0, v1, v2, v3, v4, v5, v6, v7,
+                           v8, v9, v10, v11, v12, v13, v14, v15);
 
         const float32x4_t s = vdupq_n_f32(scale);
-        for (int i = 0; i < 16; ++i) {
-            vst1q_f32(output + i * 4, vmulq_f32(v[i], s));
-        }
+        vst1q_f32(output + 0 * 4,  vmulq_f32(v0,  s));
+        vst1q_f32(output + 1 * 4,  vmulq_f32(v1,  s));
+        vst1q_f32(output + 2 * 4,  vmulq_f32(v2,  s));
+        vst1q_f32(output + 3 * 4,  vmulq_f32(v3,  s));
+        vst1q_f32(output + 4 * 4,  vmulq_f32(v4,  s));
+        vst1q_f32(output + 5 * 4,  vmulq_f32(v5,  s));
+        vst1q_f32(output + 6 * 4,  vmulq_f32(v6,  s));
+        vst1q_f32(output + 7 * 4,  vmulq_f32(v7,  s));
+        vst1q_f32(output + 8 * 4,  vmulq_f32(v8,  s));
+        vst1q_f32(output + 9 * 4,  vmulq_f32(v9,  s));
+        vst1q_f32(output + 10 * 4, vmulq_f32(v10, s));
+        vst1q_f32(output + 11 * 4, vmulq_f32(v11, s));
+        vst1q_f32(output + 12 * 4, vmulq_f32(v12, s));
+        vst1q_f32(output + 13 * 4, vmulq_f32(v13, s));
+        vst1q_f32(output + 14 * 4, vmulq_f32(v14, s));
+        vst1q_f32(output + 15 * 4, vmulq_f32(v15, s));
 
         output += 16 * 4;
         input  += 4;
     }
     for (; k < K; ++k) {
-        for (int i = 0; i < 16; ++i) {
-            *output++ = input[i * ir_step] * scale;
-        }
+        *output++ = input[0 * ir_step] * scale;
+        *output++ = input[1 * ir_step] * scale;
+        *output++ = input[2 * ir_step] * scale;
+        *output++ = input[3 * ir_step] * scale;
+        *output++ = input[4 * ir_step] * scale;
+        *output++ = input[5 * ir_step] * scale;
+        *output++ = input[6 * ir_step] * scale;
+        *output++ = input[7 * ir_step] * scale;
+        *output++ = input[8 * ir_step] * scale;
+        *output++ = input[9 * ir_step] * scale;
+        *output++ = input[10 * ir_step] * scale;
+        *output++ = input[11 * ir_step] * scale;
+        *output++ = input[12 * ir_step] * scale;
+        *output++ = input[13 * ir_step] * scale;
+        *output++ = input[14 * ir_step] * scale;
+        *output++ = input[15 * ir_step] * scale;
         input += 1;
     }
 }

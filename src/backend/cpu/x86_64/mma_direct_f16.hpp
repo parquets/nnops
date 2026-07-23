@@ -18,37 +18,13 @@
 #include <algorithm>
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/common/restrict.hpp"
+#include "mma_pack_f16.hpp"  // for load_f16x8, store_f16x8, load_clamp_store_f16x8
 
 namespace nnops::backend::cpu::x86_64 {
 
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
-
-namespace {
-
-// Load 8 fp16 values → __m256 (fp32)
-inline __m256 load_f16x8(const half* NNOPS_RESTRICT p) noexcept {
-    return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
-}
-
-// Convert __m256 fp32 → 8 fp16 values and store
-inline void store_f16x8(half* NNOPS_RESTRICT p, __m256 v) noexcept {
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(p),
-                     _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
-}
-
-// Accumulate C, clamp, store (8 fp16 values)
-inline void load_clamp_store_f16x8(half* NNOPS_RESTRICT p, __m256 v_acc,
-                                    float clamp_min, float clamp_max) noexcept {
-    v_acc = _mm256_add_ps(v_acc, load_f16x8(p));
-    const __m256 v_min = _mm256_set1_ps(clamp_min);
-    const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_acc = _mm256_max_ps(_mm256_min_ps(v_acc, v_max), v_min);
-    store_f16x8(p, v_acc);
-}
-
-}  // anonymous namespace
 
 // =========================================================================
 //  mr=1  kernels
@@ -64,8 +40,8 @@ inline void mma_direct_1x1_f16(
 
     float c0 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        c0 += half_to_float(A_ptr0[0]) * half_to_float(B[0]);
-        A_ptr0 += 1;
+        const float b0 = half_to_float(B[0]);
+        c0 += half_to_float(*A_ptr0++) * b0;
         B += ldb;
     }
     c0 += half_to_float(C[0]);
@@ -83,11 +59,9 @@ inline void mma_direct_1x8_f16(
     __m256 v_c0 = _mm256_setzero_ps();
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits)));
-        const __m256 v_b0 = load_f16x8(B);
+        const __m256 v_b0 = load_f16x8(B); B += ldb;
+        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))); A_ptr0 += 1;
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
-        A_ptr0 += 1;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C, v_c0, clamp_min, clamp_max);
@@ -105,15 +79,13 @@ inline void mma_direct_1x16_f16(
     __m256 v_c01 = v_c00;
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits)));
         const __m256 v_b0 = load_f16x8(B + 0 * 8);
         const __m256 v_b1 = load_f16x8(B + 1 * 8);
+        B += ldb;
 
+        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))); A_ptr0 += 1;
         v_c00 = _mm256_fmadd_ps(v_a0, v_b0, v_c00);
         v_c01 = _mm256_fmadd_ps(v_a0, v_b1, v_c01);
-
-        A_ptr0 += 1;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * 8, v_c00, clamp_min, clamp_max);
@@ -139,12 +111,10 @@ inline void mma_direct_4x1_f16(
 
     for (int k = 0; k < K; ++k) {
         const float b0 = half_to_float(B[0]);
-        c0 += half_to_float(A_ptr0[0]) * b0;
-        c1 += half_to_float(A_ptr1[0]) * b0;
-        c2 += half_to_float(A_ptr2[0]) * b0;
-        c3 += half_to_float(A_ptr3[0]) * b0;
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1; A_ptr3 += 1;
+        c0 += half_to_float(*A_ptr0++) * b0;
+        c1 += half_to_float(*A_ptr1++) * b0;
+        c2 += half_to_float(*A_ptr2++) * b0;
+        c3 += half_to_float(*A_ptr3++) * b0;
         B += ldb;
     }
 
@@ -175,19 +145,16 @@ inline void mma_direct_4x8_f16(
     __m256 v_c3 = v_c0;
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = load_f16x8(B);
+        const __m256 v_b0 = load_f16x8(B); B += ldb;
 
-        v_c0 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))), v_b0, v_c0);
-        v_c1 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits))), v_b0, v_c1);
-        v_c2 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits))), v_b0, v_c2);
-        v_c3 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits))), v_b0, v_c3);
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1; A_ptr3 += 1;
-        B += ldb;
+        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))); A_ptr0 += 1;
+        v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
+        __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits))); A_ptr1 += 1;
+        v_c1 = _mm256_fmadd_ps(v_a1, v_b0, v_c1);
+        __m256 v_a2 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits))); A_ptr2 += 1;
+        v_c2 = _mm256_fmadd_ps(v_a2, v_b0, v_c2);
+        __m256 v_a3 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits))); A_ptr3 += 1;
+        v_c3 = _mm256_fmadd_ps(v_a3, v_b0, v_c3);
     }
 
     load_clamp_store_f16x8(C + 0 * ldc, v_c0, clamp_min, clamp_max);
@@ -219,25 +186,23 @@ inline void mma_direct_4x16_f16(
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = load_f16x8(B + 0 * 8);
         const __m256 v_b1 = load_f16x8(B + 1 * 8);
+        B += ldb;
 
-        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits)));
+        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))); A_ptr0 += 1;
         v_c00 = _mm256_fmadd_ps(v_a0, v_b0, v_c00);
         v_c01 = _mm256_fmadd_ps(v_a0, v_b1, v_c01);
 
-        __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits)));
+        __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits))); A_ptr1 += 1;
         v_c10 = _mm256_fmadd_ps(v_a1, v_b0, v_c10);
         v_c11 = _mm256_fmadd_ps(v_a1, v_b1, v_c11);
 
-        __m256 v_a2 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits)));
+        __m256 v_a2 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits))); A_ptr2 += 1;
         v_c20 = _mm256_fmadd_ps(v_a2, v_b0, v_c20);
         v_c21 = _mm256_fmadd_ps(v_a2, v_b1, v_c21);
 
-        __m256 v_a3 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits)));
+        __m256 v_a3 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits))); A_ptr3 += 1;
         v_c30 = _mm256_fmadd_ps(v_a3, v_b0, v_c30);
         v_c31 = _mm256_fmadd_ps(v_a3, v_b1, v_c31);
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1; A_ptr3 += 1;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * ldc + 0 * 8, v_c00, clamp_min, clamp_max);
@@ -272,15 +237,12 @@ inline void mma_direct_6x1_f16(
 
     for (int k = 0; k < K; ++k) {
         const float b0 = half_to_float(B[0]);
-        acc0 += half_to_float(A_ptr0[0]) * b0;
-        acc1 += half_to_float(A_ptr1[0]) * b0;
-        acc2 += half_to_float(A_ptr2[0]) * b0;
-        acc3 += half_to_float(A_ptr3[0]) * b0;
-        acc4 += half_to_float(A_ptr4[0]) * b0;
-        acc5 += half_to_float(A_ptr5[0]) * b0;
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1;
-        A_ptr3 += 1; A_ptr4 += 1; A_ptr5 += 1;
+        acc0 += half_to_float(*A_ptr0++) * b0;
+        acc1 += half_to_float(*A_ptr1++) * b0;
+        acc2 += half_to_float(*A_ptr2++) * b0;
+        acc3 += half_to_float(*A_ptr3++) * b0;
+        acc4 += half_to_float(*A_ptr4++) * b0;
+        acc5 += half_to_float(*A_ptr5++) * b0;
         B += ldb;
     }
 
@@ -317,24 +279,20 @@ inline void mma_direct_6x8_f16(
     __m256 v_c5 = v_c0;
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = load_f16x8(B);
+        const __m256 v_b0 = load_f16x8(B); B += ldb;
 
-        v_c0 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))), v_b0, v_c0);
-        v_c1 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits))), v_b0, v_c1);
-        v_c2 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits))), v_b0, v_c2);
-        v_c3 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits))), v_b0, v_c3);
-        v_c4 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr4[0].bits))), v_b0, v_c4);
-        v_c5 = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr5[0].bits))), v_b0, v_c5);
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1;
-        A_ptr3 += 1; A_ptr4 += 1; A_ptr5 += 1;
-        B += ldb;
+        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))); A_ptr0 += 1;
+        v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
+        __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits))); A_ptr1 += 1;
+        v_c1 = _mm256_fmadd_ps(v_a1, v_b0, v_c1);
+        __m256 v_a2 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits))); A_ptr2 += 1;
+        v_c2 = _mm256_fmadd_ps(v_a2, v_b0, v_c2);
+        __m256 v_a3 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits))); A_ptr3 += 1;
+        v_c3 = _mm256_fmadd_ps(v_a3, v_b0, v_c3);
+        __m256 v_a4 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr4[0].bits))); A_ptr4 += 1;
+        v_c4 = _mm256_fmadd_ps(v_a4, v_b0, v_c4);
+        __m256 v_a5 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr5[0].bits))); A_ptr5 += 1;
+        v_c5 = _mm256_fmadd_ps(v_a5, v_b0, v_c5);
     }
 
     load_clamp_store_f16x8(C + 0 * ldc, v_c0, clamp_min, clamp_max);
@@ -374,34 +332,31 @@ inline void mma_direct_6x16_f16(
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = load_f16x8(B + 0 * 8);
         const __m256 v_b1 = load_f16x8(B + 1 * 8);
+        B += ldb;
 
-        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits)));
+        __m256 v_a0 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr0[0].bits))); A_ptr0 += 1;
         v_c00 = _mm256_fmadd_ps(v_a0, v_b0, v_c00);
         v_c01 = _mm256_fmadd_ps(v_a0, v_b1, v_c01);
 
-        __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits)));
+        __m256 v_a1 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr1[0].bits))); A_ptr1 += 1;
         v_c10 = _mm256_fmadd_ps(v_a1, v_b0, v_c10);
         v_c11 = _mm256_fmadd_ps(v_a1, v_b1, v_c11);
 
-        __m256 v_a2 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits)));
+        __m256 v_a2 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr2[0].bits))); A_ptr2 += 1;
         v_c20 = _mm256_fmadd_ps(v_a2, v_b0, v_c20);
         v_c21 = _mm256_fmadd_ps(v_a2, v_b1, v_c21);
 
-        __m256 v_a3 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits)));
+        __m256 v_a3 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr3[0].bits))); A_ptr3 += 1;
         v_c30 = _mm256_fmadd_ps(v_a3, v_b0, v_c30);
         v_c31 = _mm256_fmadd_ps(v_a3, v_b1, v_c31);
 
-        __m256 v_a4 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr4[0].bits)));
+        __m256 v_a4 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr4[0].bits))); A_ptr4 += 1;
         v_c40 = _mm256_fmadd_ps(v_a4, v_b0, v_c40);
         v_c41 = _mm256_fmadd_ps(v_a4, v_b1, v_c41);
 
-        __m256 v_a5 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr5[0].bits)));
+        __m256 v_a5 = _mm256_cvtph_ps(_mm_set1_epi16(static_cast<short>(A_ptr5[0].bits))); A_ptr5 += 1;
         v_c50 = _mm256_fmadd_ps(v_a5, v_b0, v_c50);
         v_c51 = _mm256_fmadd_ps(v_a5, v_b1, v_c51);
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1;
-        A_ptr3 += 1; A_ptr4 += 1; A_ptr5 += 1;
-        B += ldb;
     }
 
     load_clamp_store_f16x8(C + 0 * ldc + 0 * 8, v_c00, clamp_min, clamp_max);

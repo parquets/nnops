@@ -35,8 +35,8 @@ inline void mma_direct_1x1_f32(
 
     float c0 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        c0 += A_ptr0[0] * B[0];
-        A_ptr0 += 1;
+        const float b0 = B[0];
+        c0 += *A_ptr0++ * b0;
         B += ldb;
     }
     c0 += C[0];
@@ -54,11 +54,9 @@ inline void mma_direct_1x8_f32(
     __m256 v_c0 = _mm256_setzero_ps();
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_broadcast_ss(A_ptr0);
-        const __m256 v_b0 = _mm256_loadu_ps(B);
+        const __m256 v_b0 = _mm256_loadu_ps(B); B += ldb;
+        __m256 v_a0 = _mm256_broadcast_ss(A_ptr0); A_ptr0 += 1;
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
-        A_ptr0 += 1;
-        B += ldb;
     }
 
     v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C));
@@ -83,15 +81,13 @@ inline void mma_direct_1x16_f32(
     __m256 v_c01 = v_c00;
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_broadcast_ss(A_ptr0);
         const __m256 v_b0 = _mm256_loadu_ps(B + 0 * 8);
         const __m256 v_b1 = _mm256_loadu_ps(B + 1 * 8);
+        B += ldb;
 
+        __m256 v_a0 = _mm256_broadcast_ss(A_ptr0); A_ptr0 += 1;
         v_c00 = _mm256_fmadd_ps(v_a0, v_b0, v_c00);
         v_c01 = _mm256_fmadd_ps(v_a0, v_b1, v_c01);
-
-        A_ptr0 += 1;
-        B += ldb;
     }
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
@@ -123,12 +119,10 @@ inline void mma_direct_4x1_f32(
 
     for (int k = 0; k < K; ++k) {
         const float b0 = B[0];
-        c0 += A_ptr0[0] * b0;
-        c1 += A_ptr1[0] * b0;
-        c2 += A_ptr2[0] * b0;
-        c3 += A_ptr3[0] * b0;
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1; A_ptr3 += 1;
+        c0 += *A_ptr0++ * b0;
+        c1 += *A_ptr1++ * b0;
+        c2 += *A_ptr2++ * b0;
+        c3 += *A_ptr3++ * b0;
         B += ldb;
     }
 
@@ -159,15 +153,16 @@ inline void mma_direct_4x8_f32(
     __m256 v_c3 = v_c0;
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = _mm256_loadu_ps(B);
+        const __m256 v_b0 = _mm256_loadu_ps(B); B += ldb;
 
-        v_c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr0), v_b0, v_c0);
-        v_c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr1), v_b0, v_c1);
-        v_c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr2), v_b0, v_c2);
-        v_c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr3), v_b0, v_c3);
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1; A_ptr3 += 1;
-        B += ldb;
+        __m256 v_a0 = _mm256_broadcast_ss(A_ptr0); A_ptr0 += 1;
+        v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
+        __m256 v_a1 = _mm256_broadcast_ss(A_ptr1); A_ptr1 += 1;
+        v_c1 = _mm256_fmadd_ps(v_a1, v_b0, v_c1);
+        __m256 v_a2 = _mm256_broadcast_ss(A_ptr2); A_ptr2 += 1;
+        v_c2 = _mm256_fmadd_ps(v_a2, v_b0, v_c2);
+        __m256 v_a3 = _mm256_broadcast_ss(A_ptr3); A_ptr3 += 1;
+        v_c3 = _mm256_fmadd_ps(v_a3, v_b0, v_c3);
     }
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
@@ -207,6 +202,7 @@ inline void mma_direct_4x16_f32(
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = _mm256_loadu_ps(B + 0 * 8);
         const __m256 v_b1 = _mm256_loadu_ps(B + 1 * 8);
+        B += ldb;
 
         __m256 v_a0 = _mm256_broadcast_ss(A_ptr0); A_ptr0 += 1;
         v_c00 = _mm256_fmadd_ps(v_a0, v_b0, v_c00);
@@ -223,8 +219,6 @@ inline void mma_direct_4x16_f32(
         __m256 v_a3 = _mm256_broadcast_ss(A_ptr3); A_ptr3 += 1;
         v_c30 = _mm256_fmadd_ps(v_a3, v_b0, v_c30);
         v_c31 = _mm256_fmadd_ps(v_a3, v_b1, v_c31);
-
-        B += ldb;
     }
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
@@ -271,15 +265,12 @@ inline void mma_direct_6x1_f32(
 
     for (int k = 0; k < K; ++k) {
         const float b0 = B[0];
-        acc0 += A_ptr0[0] * b0;
-        acc1 += A_ptr1[0] * b0;
-        acc2 += A_ptr2[0] * b0;
-        acc3 += A_ptr3[0] * b0;
-        acc4 += A_ptr4[0] * b0;
-        acc5 += A_ptr5[0] * b0;
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1;
-        A_ptr3 += 1; A_ptr4 += 1; A_ptr5 += 1;
+        acc0 += *A_ptr0++ * b0;
+        acc1 += *A_ptr1++ * b0;
+        acc2 += *A_ptr2++ * b0;
+        acc3 += *A_ptr3++ * b0;
+        acc4 += *A_ptr4++ * b0;
+        acc5 += *A_ptr5++ * b0;
         B += ldb;
     }
 
@@ -316,18 +307,20 @@ inline void mma_direct_6x8_f32(
     __m256 v_c5 = v_c0;
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = _mm256_loadu_ps(B);
+        const __m256 v_b0 = _mm256_loadu_ps(B); B += ldb;
 
-        v_c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr0), v_b0, v_c0);
-        v_c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr1), v_b0, v_c1);
-        v_c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr2), v_b0, v_c2);
-        v_c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr3), v_b0, v_c3);
-        v_c4 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr4), v_b0, v_c4);
-        v_c5 = _mm256_fmadd_ps(_mm256_broadcast_ss(A_ptr5), v_b0, v_c5);
-
-        A_ptr0 += 1; A_ptr1 += 1; A_ptr2 += 1;
-        A_ptr3 += 1; A_ptr4 += 1; A_ptr5 += 1;
-        B += ldb;
+        __m256 v_a0 = _mm256_broadcast_ss(A_ptr0); A_ptr0 += 1;
+        v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
+        __m256 v_a1 = _mm256_broadcast_ss(A_ptr1); A_ptr1 += 1;
+        v_c1 = _mm256_fmadd_ps(v_a1, v_b0, v_c1);
+        __m256 v_a2 = _mm256_broadcast_ss(A_ptr2); A_ptr2 += 1;
+        v_c2 = _mm256_fmadd_ps(v_a2, v_b0, v_c2);
+        __m256 v_a3 = _mm256_broadcast_ss(A_ptr3); A_ptr3 += 1;
+        v_c3 = _mm256_fmadd_ps(v_a3, v_b0, v_c3);
+        __m256 v_a4 = _mm256_broadcast_ss(A_ptr4); A_ptr4 += 1;
+        v_c4 = _mm256_fmadd_ps(v_a4, v_b0, v_c4);
+        __m256 v_a5 = _mm256_broadcast_ss(A_ptr5); A_ptr5 += 1;
+        v_c5 = _mm256_fmadd_ps(v_a5, v_b0, v_c5);
     }
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
@@ -377,6 +370,7 @@ inline void mma_direct_6x16_f32(
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = _mm256_loadu_ps(B + 0 * 8);
         const __m256 v_b1 = _mm256_loadu_ps(B + 1 * 8);
+        B += ldb;
 
         __m256 v_a0 = _mm256_broadcast_ss(A_ptr0); A_ptr0 += 1;
         v_c00 = _mm256_fmadd_ps(v_a0, v_b0, v_c00);
@@ -401,8 +395,6 @@ inline void mma_direct_6x16_f32(
         __m256 v_a5 = _mm256_broadcast_ss(A_ptr5); A_ptr5 += 1;
         v_c50 = _mm256_fmadd_ps(v_a5, v_b0, v_c50);
         v_c51 = _mm256_fmadd_ps(v_a5, v_b1, v_c51);
-
-        B += ldb;
     }
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);

@@ -26,8 +26,7 @@ inline void mma_pack_1x1_f32(float* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     float c0 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        c0 += A[0] * B[0];
-        A += 1;
+        c0 += (*A++) * B[0];
         B += ldb;
     }
     c0 += C[0 * ldc];
@@ -41,11 +40,9 @@ inline void mma_pack_1x8_f32(float* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     __m256 v_c0 = _mm256_setzero_ps();
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_broadcast_ss(A);
-        const __m256 v_b0 = _mm256_loadu_ps(B);
+        const __m256 v_a0 = _mm256_broadcast_ss(A++);
+        const __m256 v_b0 = _mm256_loadu_ps(B); B += ldb;
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
-        A += 1;
-        B += ldb;
     }
     v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C));
 
@@ -65,13 +62,12 @@ inline void mma_pack_1x16_f32(float* NNOPS_RESTRICT C, int ldc,
     __m256 v_c0 = _mm256_setzero_ps();
     __m256 v_c1 = _mm256_setzero_ps();
     for (int k = 0; k < K; ++k) {
-        const __m256 v_a0 = _mm256_broadcast_ss(A);
+        const __m256 v_a0 = _mm256_broadcast_ss(A++);
         const __m256 v_b0 = _mm256_loadu_ps(B + 0 * 8);
         const __m256 v_b1 = _mm256_loadu_ps(B + 1 * 8);
+        B += ldb;
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
         v_c1 = _mm256_fmadd_ps(v_a0, v_b1, v_c1);
-        A += 1;
-        B += ldb;
     }
     v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * 8));
     v_c1 = _mm256_add_ps(v_c1, _mm256_loadu_ps(C + 1 * 8));
@@ -96,13 +92,12 @@ inline void mma_pack_4x1_f32(float* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        const float b = B[0];
+        const float b = *B; B += ldb;
         c0 += A[0] * b;
         c1 += A[1] * b;
         c2 += A[2] * b;
         c3 += A[3] * b;
         A += 4;
-        B += ldb;
     }
     auto clamp = [=](float v) noexcept {
         return std::min(std::max(v, clamp_min), clamp_max);
@@ -124,13 +119,12 @@ inline void mma_pack_4x8_f32(float* NNOPS_RESTRICT C, int ldc,
     __m256 v_c3 = _mm256_setzero_ps();
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = _mm256_loadu_ps(B);
+        const __m256 v_b0 = _mm256_loadu_ps(B); B += ldb;
         v_c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 0), v_b0, v_c0);
         v_c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 1), v_b0, v_c1);
         v_c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 2), v_b0, v_c2);
         v_c3 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 3), v_b0, v_c3);
         A += 4;
-        B += ldb;
     }
 
     v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * ldc));
@@ -164,6 +158,7 @@ inline void mma_pack_4x16_f32(float* NNOPS_RESTRICT C, int ldc,
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = _mm256_loadu_ps(B + 0 * 8);
         const __m256 v_b1 = _mm256_loadu_ps(B + 1 * 8);
+        B += ldb;
 
         __m256 v_a0 = _mm256_broadcast_ss(A + 0);
         __m256 v_a1 = _mm256_broadcast_ss(A + 1);
@@ -180,7 +175,6 @@ inline void mma_pack_4x16_f32(float* NNOPS_RESTRICT C, int ldc,
         v_c31 = _mm256_fmadd_ps(v_a1, v_b1, v_c31);
 
         A += 4;
-        B += ldb;
     }
 
     v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * ldc + 0));
@@ -220,7 +214,7 @@ inline void mma_pack_6x1_f32(float* NNOPS_RESTRICT C, int ldc,
                              float clamp_min, float clamp_max) noexcept {
     float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f, c4 = 0.0f, c5 = 0.0f;
     for (int k = 0; k < K; ++k) {
-        const float b = B[0];
+        const float b = *B; B += ldb;
         c0 += A[0] * b;
         c1 += A[1] * b;
         c2 += A[2] * b;
@@ -228,7 +222,6 @@ inline void mma_pack_6x1_f32(float* NNOPS_RESTRICT C, int ldc,
         c4 += A[4] * b;
         c5 += A[5] * b;
         A += 6;
-        B += ldb;
     }
     auto clamp = [=](float v) noexcept {
         return std::min(std::max(v, clamp_min), clamp_max);
@@ -254,7 +247,7 @@ inline void mma_pack_6x8_f32(float* NNOPS_RESTRICT C, int ldc,
     __m256 v_c5 = _mm256_setzero_ps();
 
     for (int k = 0; k < K; ++k) {
-        const __m256 v_b0 = _mm256_loadu_ps(B);
+        const __m256 v_b0 = _mm256_loadu_ps(B); B += ldb;
         v_c0 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 0), v_b0, v_c0);
         v_c1 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 1), v_b0, v_c1);
         v_c2 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 2), v_b0, v_c2);
@@ -262,7 +255,6 @@ inline void mma_pack_6x8_f32(float* NNOPS_RESTRICT C, int ldc,
         v_c4 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 4), v_b0, v_c4);
         v_c5 = _mm256_fmadd_ps(_mm256_broadcast_ss(A + 5), v_b0, v_c5);
         A += 6;
-        B += ldb;
     }
 
     v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * ldc));
@@ -302,6 +294,7 @@ inline void mma_pack_6x16_f32(float* NNOPS_RESTRICT C, int ldc,
     for (int k = 0; k < K; ++k) {
         const __m256 v_b0 = _mm256_loadu_ps(B + 0 * 8);
         const __m256 v_b1 = _mm256_loadu_ps(B + 1 * 8);
+        B += ldb;
 
         __m256 v_a0 = _mm256_broadcast_ss(A + 0);
         __m256 v_a1 = _mm256_broadcast_ss(A + 1);
@@ -325,7 +318,6 @@ inline void mma_pack_6x16_f32(float* NNOPS_RESTRICT C, int ldc,
         v_c51 = _mm256_fmadd_ps(v_a1, v_b1, v_c51);
 
         A += 6;
-        B += ldb;
     }
 
     v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * ldc + 0));

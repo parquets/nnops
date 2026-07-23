@@ -4,7 +4,7 @@
 ///
 /// These use native NEON fp16 arithmetic (ARMv8.2-A+).
 /// Tile sizes (AArch64-optimised):
-///   M ∈ {8, 4, 1}    N ∈ {24, 8, 1}
+///   M ∈ {8, 4, 1}    N ∈ {16, 8, 1}
 ///
 /// Reference: nn_compute/src/cpu/kernel/mma/aarch64/mma_pack_f16.hpp
 
@@ -22,62 +22,55 @@ inline void mma_pack_1x1_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                              const float16_t* NNOPS_RESTRICT A,
                              const float16_t* NNOPS_RESTRICT B,
                              int ldb, int K,
-                             float16_t clamp_min, float16_t clamp_max) noexcept {
+                             float clamp_min, float clamp_max) noexcept {
     float16_t c0 = 0.0f16;
     for (int k = 0; k < K; ++k) {
-        c0 = vaddh_f16(c0, vmulh_f16(A[0], B[0]));
-        A += 1;
+        c0 = vaddh_f16(c0, vmulh_f16(*A++, B[0]));
         B += ldb;
     }
     c0 = vaddh_f16(c0, C[0 * ldc]);
-    C[0 * ldc] = std::min(std::max(c0, clamp_min), clamp_max);
+    C[0 * ldc] = std::min(std::max(c0, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
 }
 
 inline void mma_pack_1x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                              const float16_t* NNOPS_RESTRICT A,
                              const float16_t* NNOPS_RESTRICT B,
                              int ldb, int K,
-                             float16_t clamp_min, float16_t clamp_max) noexcept {
+                             float clamp_min, float clamp_max) noexcept {
     float16x8_t c0 = vdupq_n_f16(0.0f16);
     for (int k = 0; k < K; ++k) {
-        c0 = vfmaq_n_f16(c0, vld1q_f16(B), A[0]);
-        A += 1;
+        c0 = vfmaq_n_f16(c0, vld1q_f16(B), *A++);
         B += ldb;
     }
     c0 = vaddq_f16(c0, vld1q_f16(C));
-    const float16x8_t vmin = vdupq_n_f16(clamp_min);
-    const float16x8_t vmax = vdupq_n_f16(clamp_max);
+    const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
+    const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
     vst1q_f16(C, vminq_f16(vmaxq_f16(c0, vmin), vmax));
 }
 
-inline void mma_pack_1x24_f16(float16_t* NNOPS_RESTRICT C, int ldc,
+inline void mma_pack_1x16_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                               const float16_t* NNOPS_RESTRICT A,
                               const float16_t* NNOPS_RESTRICT B,
                               int ldb, int K,
-                              float16_t clamp_min, float16_t clamp_max) noexcept {
+                              float clamp_min, float clamp_max) noexcept {
     float16x8_t c0 = vdupq_n_f16(0.0f16);
     float16x8_t c1 = vdupq_n_f16(0.0f16);
-    float16x8_t c2 = vdupq_n_f16(0.0f16);
 
     for (int k = 0; k < K; ++k) {
-        const float16_t a = A[0];
+        const float16_t a = *A++;
         c0 = vfmaq_n_f16(c0, vld1q_f16(B + 0 * 8), a);
         c1 = vfmaq_n_f16(c1, vld1q_f16(B + 1 * 8), a);
-        c2 = vfmaq_n_f16(c2, vld1q_f16(B + 2 * 8), a);
-        A += 1;
         B += ldb;
     }
 
-    const float16x8_t vmin = vdupq_n_f16(clamp_min);
-    const float16x8_t vmax = vdupq_n_f16(clamp_max);
+    const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
+    const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
     c0 = vaddq_f16(c0, vld1q_f16(C + 0 * 8));
     c1 = vaddq_f16(c1, vld1q_f16(C + 1 * 8));
-    c2 = vaddq_f16(c2, vld1q_f16(C + 2 * 8));
 
     vst1q_f16(C + 0 * 8, vminq_f16(vmaxq_f16(c0, vmin), vmax));
     vst1q_f16(C + 1 * 8, vminq_f16(vmaxq_f16(c1, vmin), vmax));
-    vst1q_f16(C + 2 * 8, vminq_f16(vmaxq_f16(c2, vmin), vmax));
 }
 
 // =========================================================================
@@ -88,48 +81,44 @@ inline void mma_pack_4x1_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                              const float16_t* NNOPS_RESTRICT A,
                              const float16_t* NNOPS_RESTRICT B,
                              int ldb, int K,
-                             float16_t clamp_min, float16_t clamp_max) noexcept {
+                             float clamp_min, float clamp_max) noexcept {
     float16_t c0 = 0.0f16, c1 = 0.0f16, c2 = 0.0f16, c3 = 0.0f16;
     for (int k = 0; k < K; ++k) {
-        const float16_t b = B[0];
+        const float16_t b = B[0]; B += ldb;
         c0 = vaddh_f16(c0, vmulh_f16(A[0], b));
         c1 = vaddh_f16(c1, vmulh_f16(A[1], b));
         c2 = vaddh_f16(c2, vmulh_f16(A[2], b));
         c3 = vaddh_f16(c3, vmulh_f16(A[3], b));
         A += 4;
-        B += ldb;
     }
-    c0 = std::min(std::max(vaddh_f16(c0, C[0 * ldc]), clamp_min), clamp_max); C[0 * ldc] = c0;
-    c1 = std::min(std::max(vaddh_f16(c1, C[1 * ldc]), clamp_min), clamp_max); C[1 * ldc] = c1;
-    c2 = std::min(std::max(vaddh_f16(c2, C[2 * ldc]), clamp_min), clamp_max); C[2 * ldc] = c2;
-    c3 = std::min(std::max(vaddh_f16(c3, C[3 * ldc]), clamp_min), clamp_max); C[3 * ldc] = c3;
+    c0 = std::min(std::max(vaddh_f16(c0, C[0 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[0 * ldc] = c0;
+    c1 = std::min(std::max(vaddh_f16(c1, C[1 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[1 * ldc] = c1;
+    c2 = std::min(std::max(vaddh_f16(c2, C[2 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[2 * ldc] = c2;
+    c3 = std::min(std::max(vaddh_f16(c3, C[3 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[3 * ldc] = c3;
 }
 
 inline void mma_pack_4x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                              const float16_t* NNOPS_RESTRICT A,
                              const float16_t* NNOPS_RESTRICT B,
                              int ldb, int K,
-                             float16_t clamp_min, float16_t clamp_max) noexcept {
+                             float clamp_min, float clamp_max) noexcept {
     float16x8_t c0 = vdupq_n_f16(0.0f16);
     float16x8_t c1 = vdupq_n_f16(0.0f16);
     float16x8_t c2 = vdupq_n_f16(0.0f16);
     float16x8_t c3 = vdupq_n_f16(0.0f16);
 
     for (int k = 0; k < K; ++k) {
-        const float16x4_t a = vld1_f16(A);
-        const float16x8_t b = vld1q_f16(B);
+        const float16x4_t a = vld1_f16(A); A += 4;
+        const float16x8_t b = vld1q_f16(B); B += ldb;
 
         c0 = vfmaq_lane_f16(c0, b, a, 0);
         c1 = vfmaq_lane_f16(c1, b, a, 1);
         c2 = vfmaq_lane_f16(c2, b, a, 2);
         c3 = vfmaq_lane_f16(c3, b, a, 3);
-
-        A += 4;
-        B += ldb;
     }
 
-    const float16x8_t vmin = vdupq_n_f16(clamp_min);
-    const float16x8_t vmax = vdupq_n_f16(clamp_max);
+    const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
+    const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
     c0 = vaddq_f16(c0, vld1q_f16(C + 0 * ldc));
     c1 = vaddq_f16(c1, vld1q_f16(C + 1 * ldc));
@@ -142,46 +131,54 @@ inline void mma_pack_4x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     vst1q_f16(C + 3 * ldc, vminq_f16(vmaxq_f16(c3, vmin), vmax));
 }
 
-inline void mma_pack_4x24_f16(float16_t* NNOPS_RESTRICT C, int ldc,
+inline void mma_pack_4x16_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                               const float16_t* NNOPS_RESTRICT A,
                               const float16_t* NNOPS_RESTRICT B,
                               int ldb, int K,
-                              float16_t clamp_min, float16_t clamp_max) noexcept {
-    float16x8_t c[4][3];
-    for (int i = 0; i < 4; ++i) {
-        c[i][0] = vdupq_n_f16(0.0f16);
-        c[i][1] = vdupq_n_f16(0.0f16);
-        c[i][2] = vdupq_n_f16(0.0f16);
-    }
+                              float clamp_min, float clamp_max) noexcept {
+    float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = vdupq_n_f16(0.0f16);
+    float16x8_t c10 = vdupq_n_f16(0.0f16), c11 = vdupq_n_f16(0.0f16);
+    float16x8_t c20 = vdupq_n_f16(0.0f16), c21 = vdupq_n_f16(0.0f16);
+    float16x8_t c30 = vdupq_n_f16(0.0f16), c31 = vdupq_n_f16(0.0f16);
 
     for (int k = 0; k < K; ++k) {
-        const float16x4_t a = vld1_f16(A);
+        const float16x4_t a = vld1_f16(A); A += 4;
         const float16x8_t b0 = vld1q_f16(B + 0 * 8);
         const float16x8_t b1 = vld1q_f16(B + 1 * 8);
-        const float16x8_t b2 = vld1q_f16(B + 2 * 8);
-
-        for (int i = 0; i < 4; ++i) {
-            c[i][0] = vfmaq_lane_f16(c[i][0], b0, a, i);
-            c[i][1] = vfmaq_lane_f16(c[i][1], b1, a, i);
-            c[i][2] = vfmaq_lane_f16(c[i][2], b2, a, i);
-        }
-
-        A += 4;
         B += ldb;
+
+        c00 = vfmaq_lane_f16(c00, b0, a, 0);
+        c01 = vfmaq_lane_f16(c01, b1, a, 0);
+        c10 = vfmaq_lane_f16(c10, b0, a, 1);
+        c11 = vfmaq_lane_f16(c11, b1, a, 1);
+        c20 = vfmaq_lane_f16(c20, b0, a, 2);
+        c21 = vfmaq_lane_f16(c21, b1, a, 2);
+        c30 = vfmaq_lane_f16(c30, b0, a, 3);
+        c31 = vfmaq_lane_f16(c31, b1, a, 3);
     }
 
-    const float16x8_t vmin = vdupq_n_f16(clamp_min);
-    const float16x8_t vmax = vdupq_n_f16(clamp_max);
+    const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
+    const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    for (int i = 0; i < 4; ++i) {
-        c[i][0] = vaddq_f16(c[i][0], vld1q_f16(C + i * ldc + 0 * 8));
-        c[i][1] = vaddq_f16(c[i][1], vld1q_f16(C + i * ldc + 1 * 8));
-        c[i][2] = vaddq_f16(c[i][2], vld1q_f16(C + i * ldc + 2 * 8));
+    c00 = vaddq_f16(c00, vld1q_f16(C + 0 * ldc + 0 * 8));
+    c01 = vaddq_f16(c01, vld1q_f16(C + 0 * ldc + 1 * 8));
+    vst1q_f16(C + 0 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+    vst1q_f16(C + 0 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
 
-        vst1q_f16(C + i * ldc + 0 * 8, vminq_f16(vmaxq_f16(c[i][0], vmin), vmax));
-        vst1q_f16(C + i * ldc + 1 * 8, vminq_f16(vmaxq_f16(c[i][1], vmin), vmax));
-        vst1q_f16(C + i * ldc + 2 * 8, vminq_f16(vmaxq_f16(c[i][2], vmin), vmax));
-    }
+    c10 = vaddq_f16(c10, vld1q_f16(C + 1 * ldc + 0 * 8));
+    c11 = vaddq_f16(c11, vld1q_f16(C + 1 * ldc + 1 * 8));
+    vst1q_f16(C + 1 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+    vst1q_f16(C + 1 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c11, vmin), vmax));
+
+    c20 = vaddq_f16(c20, vld1q_f16(C + 2 * ldc + 0 * 8));
+    c21 = vaddq_f16(c21, vld1q_f16(C + 2 * ldc + 1 * 8));
+    vst1q_f16(C + 2 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+    vst1q_f16(C + 2 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c21, vmin), vmax));
+
+    c30 = vaddq_f16(c30, vld1q_f16(C + 3 * ldc + 0 * 8));
+    c31 = vaddq_f16(c31, vld1q_f16(C + 3 * ldc + 1 * 8));
+    vst1q_f16(C + 3 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+    vst1q_f16(C + 3 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c31, vmin), vmax));
 }
 
 // =========================================================================
@@ -192,91 +189,161 @@ inline void mma_pack_8x1_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                              const float16_t* NNOPS_RESTRICT A,
                              const float16_t* NNOPS_RESTRICT B,
                              int ldb, int K,
-                             float16_t clamp_min, float16_t clamp_max) noexcept {
-    float16_t c[8] = {};
+                             float clamp_min, float clamp_max) noexcept {
+    float16_t c0 = 0.0f16, c1 = 0.0f16, c2 = 0.0f16, c3 = 0.0f16;
+    float16_t c4 = 0.0f16, c5 = 0.0f16, c6 = 0.0f16, c7 = 0.0f16;
     for (int k = 0; k < K; ++k) {
-        const float16_t b = B[0];
-        for (int i = 0; i < 8; ++i) {
-            c[i] = vaddh_f16(c[i], vmulh_f16(A[i], b));
-        }
+        const float16_t b = B[0]; B += ldb;
+        c0 = vaddh_f16(c0, vmulh_f16(A[0], b));
+        c1 = vaddh_f16(c1, vmulh_f16(A[1], b));
+        c2 = vaddh_f16(c2, vmulh_f16(A[2], b));
+        c3 = vaddh_f16(c3, vmulh_f16(A[3], b));
+        c4 = vaddh_f16(c4, vmulh_f16(A[4], b));
+        c5 = vaddh_f16(c5, vmulh_f16(A[5], b));
+        c6 = vaddh_f16(c6, vmulh_f16(A[6], b));
+        c7 = vaddh_f16(c7, vmulh_f16(A[7], b));
         A += 8;
-        B += ldb;
     }
-    for (int i = 0; i < 8; ++i) {
-        c[i] = std::min(std::max(vaddh_f16(c[i], C[i * ldc]), clamp_min), clamp_max);
-        C[i * ldc] = c[i];
-    }
+    c0 = std::min(std::max(vaddh_f16(c0, C[0 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[0 * ldc] = c0;
+    c1 = std::min(std::max(vaddh_f16(c1, C[1 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[1 * ldc] = c1;
+    c2 = std::min(std::max(vaddh_f16(c2, C[2 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[2 * ldc] = c2;
+    c3 = std::min(std::max(vaddh_f16(c3, C[3 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[3 * ldc] = c3;
+    c4 = std::min(std::max(vaddh_f16(c4, C[4 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[4 * ldc] = c4;
+    c5 = std::min(std::max(vaddh_f16(c5, C[5 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[5 * ldc] = c5;
+    c6 = std::min(std::max(vaddh_f16(c6, C[6 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[6 * ldc] = c6;
+    c7 = std::min(std::max(vaddh_f16(c7, C[7 * ldc]), static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[7 * ldc] = c7;
 }
 
 inline void mma_pack_8x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                              const float16_t* NNOPS_RESTRICT A,
                              const float16_t* NNOPS_RESTRICT B,
                              int ldb, int K,
-                             float16_t clamp_min, float16_t clamp_max) noexcept {
-    float16x8_t c[8];
-    for (int i = 0; i < 8; ++i) { c[i] = vdupq_n_f16(0.0f16); }
+                             float clamp_min, float clamp_max) noexcept {
+    float16x8_t c0 = vdupq_n_f16(0.0f16);
+    float16x8_t c1 = vdupq_n_f16(0.0f16);
+    float16x8_t c2 = vdupq_n_f16(0.0f16);
+    float16x8_t c3 = vdupq_n_f16(0.0f16);
+    float16x8_t c4 = vdupq_n_f16(0.0f16);
+    float16x8_t c5 = vdupq_n_f16(0.0f16);
+    float16x8_t c6 = vdupq_n_f16(0.0f16);
+    float16x8_t c7 = vdupq_n_f16(0.0f16);
 
     for (int k = 0; k < K; ++k) {
-        const float16x8_t a = vld1q_f16(A);
-        const float16x8_t b = vld1q_f16(B);
+        const float16x8_t a = vld1q_f16(A); A += 8;
+        const float16x8_t b = vld1q_f16(B); B += ldb;
 
-        for (int i = 0; i < 8; ++i) {
-            c[i] = vfmaq_laneq_f16(c[i], b, a, i);
-        }
-
-        A += 8;
-        B += ldb;
+        c0 = vfmaq_laneq_f16(c0, b, a, 0);
+        c1 = vfmaq_laneq_f16(c1, b, a, 1);
+        c2 = vfmaq_laneq_f16(c2, b, a, 2);
+        c3 = vfmaq_laneq_f16(c3, b, a, 3);
+        c4 = vfmaq_laneq_f16(c4, b, a, 4);
+        c5 = vfmaq_laneq_f16(c5, b, a, 5);
+        c6 = vfmaq_laneq_f16(c6, b, a, 6);
+        c7 = vfmaq_laneq_f16(c7, b, a, 7);
     }
 
-    const float16x8_t vmin = vdupq_n_f16(clamp_min);
-    const float16x8_t vmax = vdupq_n_f16(clamp_max);
+    const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
+    const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    for (int i = 0; i < 8; ++i) {
-        c[i] = vaddq_f16(c[i], vld1q_f16(C + i * ldc));
-        vst1q_f16(C + i * ldc, vminq_f16(vmaxq_f16(c[i], vmin), vmax));
-    }
+    c0 = vaddq_f16(c0, vld1q_f16(C + 0 * ldc));
+    c1 = vaddq_f16(c1, vld1q_f16(C + 1 * ldc));
+    c2 = vaddq_f16(c2, vld1q_f16(C + 2 * ldc));
+    c3 = vaddq_f16(c3, vld1q_f16(C + 3 * ldc));
+    c4 = vaddq_f16(c4, vld1q_f16(C + 4 * ldc));
+    c5 = vaddq_f16(c5, vld1q_f16(C + 5 * ldc));
+    c6 = vaddq_f16(c6, vld1q_f16(C + 6 * ldc));
+    c7 = vaddq_f16(c7, vld1q_f16(C + 7 * ldc));
+
+    vst1q_f16(C + 0 * ldc, vminq_f16(vmaxq_f16(c0, vmin), vmax));
+    vst1q_f16(C + 1 * ldc, vminq_f16(vmaxq_f16(c1, vmin), vmax));
+    vst1q_f16(C + 2 * ldc, vminq_f16(vmaxq_f16(c2, vmin), vmax));
+    vst1q_f16(C + 3 * ldc, vminq_f16(vmaxq_f16(c3, vmin), vmax));
+    vst1q_f16(C + 4 * ldc, vminq_f16(vmaxq_f16(c4, vmin), vmax));
+    vst1q_f16(C + 5 * ldc, vminq_f16(vmaxq_f16(c5, vmin), vmax));
+    vst1q_f16(C + 6 * ldc, vminq_f16(vmaxq_f16(c6, vmin), vmax));
+    vst1q_f16(C + 7 * ldc, vminq_f16(vmaxq_f16(c7, vmin), vmax));
 }
 
-inline void mma_pack_8x24_f16(float16_t* NNOPS_RESTRICT C, int ldc,
+inline void mma_pack_8x16_f16(float16_t* NNOPS_RESTRICT C, int ldc,
                               const float16_t* NNOPS_RESTRICT A,
                               const float16_t* NNOPS_RESTRICT B,
                               int ldb, int K,
-                              float16_t clamp_min, float16_t clamp_max) noexcept {
-    float16x8_t c[8][3];
-    for (int i = 0; i < 8; ++i) {
-        c[i][0] = vdupq_n_f16(0.0f16);
-        c[i][1] = vdupq_n_f16(0.0f16);
-        c[i][2] = vdupq_n_f16(0.0f16);
-    }
+                              float clamp_min, float clamp_max) noexcept {
+    float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = vdupq_n_f16(0.0f16);
+    float16x8_t c10 = vdupq_n_f16(0.0f16), c11 = vdupq_n_f16(0.0f16);
+    float16x8_t c20 = vdupq_n_f16(0.0f16), c21 = vdupq_n_f16(0.0f16);
+    float16x8_t c30 = vdupq_n_f16(0.0f16), c31 = vdupq_n_f16(0.0f16);
+    float16x8_t c40 = vdupq_n_f16(0.0f16), c41 = vdupq_n_f16(0.0f16);
+    float16x8_t c50 = vdupq_n_f16(0.0f16), c51 = vdupq_n_f16(0.0f16);
+    float16x8_t c60 = vdupq_n_f16(0.0f16), c61 = vdupq_n_f16(0.0f16);
+    float16x8_t c70 = vdupq_n_f16(0.0f16), c71 = vdupq_n_f16(0.0f16);
 
     for (int k = 0; k < K; ++k) {
-        const float16x8_t a = vld1q_f16(A);
+        const float16x8_t a = vld1q_f16(A); A += 8;
         const float16x8_t b0 = vld1q_f16(B + 0 * 8);
         const float16x8_t b1 = vld1q_f16(B + 1 * 8);
-        const float16x8_t b2 = vld1q_f16(B + 2 * 8);
-
-        for (int i = 0; i < 8; ++i) {
-            c[i][0] = vfmaq_laneq_f16(c[i][0], b0, a, i);
-            c[i][1] = vfmaq_laneq_f16(c[i][1], b1, a, i);
-            c[i][2] = vfmaq_laneq_f16(c[i][2], b2, a, i);
-        }
-
-        A += 8;
         B += ldb;
+
+        c00 = vfmaq_laneq_f16(c00, b0, a, 0);
+        c01 = vfmaq_laneq_f16(c01, b1, a, 0);
+        c10 = vfmaq_laneq_f16(c10, b0, a, 1);
+        c11 = vfmaq_laneq_f16(c11, b1, a, 1);
+        c20 = vfmaq_laneq_f16(c20, b0, a, 2);
+        c21 = vfmaq_laneq_f16(c21, b1, a, 2);
+        c30 = vfmaq_laneq_f16(c30, b0, a, 3);
+        c31 = vfmaq_laneq_f16(c31, b1, a, 3);
+        c40 = vfmaq_laneq_f16(c40, b0, a, 4);
+        c41 = vfmaq_laneq_f16(c41, b1, a, 4);
+        c50 = vfmaq_laneq_f16(c50, b0, a, 5);
+        c51 = vfmaq_laneq_f16(c51, b1, a, 5);
+        c60 = vfmaq_laneq_f16(c60, b0, a, 6);
+        c61 = vfmaq_laneq_f16(c61, b1, a, 6);
+        c70 = vfmaq_laneq_f16(c70, b0, a, 7);
+        c71 = vfmaq_laneq_f16(c71, b1, a, 7);
     }
 
-    const float16x8_t vmin = vdupq_n_f16(clamp_min);
-    const float16x8_t vmax = vdupq_n_f16(clamp_max);
+    const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
+    const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    for (int i = 0; i < 8; ++i) {
-        c[i][0] = vaddq_f16(c[i][0], vld1q_f16(C + i * ldc + 0 * 8));
-        c[i][1] = vaddq_f16(c[i][1], vld1q_f16(C + i * ldc + 1 * 8));
-        c[i][2] = vaddq_f16(c[i][2], vld1q_f16(C + i * ldc + 2 * 8));
+    c00 = vaddq_f16(c00, vld1q_f16(C + 0 * ldc + 0 * 8));
+    c01 = vaddq_f16(c01, vld1q_f16(C + 0 * ldc + 1 * 8));
+    vst1q_f16(C + 0 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+    vst1q_f16(C + 0 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
 
-        vst1q_f16(C + i * ldc + 0 * 8, vminq_f16(vmaxq_f16(c[i][0], vmin), vmax));
-        vst1q_f16(C + i * ldc + 1 * 8, vminq_f16(vmaxq_f16(c[i][1], vmin), vmax));
-        vst1q_f16(C + i * ldc + 2 * 8, vminq_f16(vmaxq_f16(c[i][2], vmin), vmax));
-    }
+    c10 = vaddq_f16(c10, vld1q_f16(C + 1 * ldc + 0 * 8));
+    c11 = vaddq_f16(c11, vld1q_f16(C + 1 * ldc + 1 * 8));
+    vst1q_f16(C + 1 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c10, vmin), vmax));
+    vst1q_f16(C + 1 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c11, vmin), vmax));
+
+    c20 = vaddq_f16(c20, vld1q_f16(C + 2 * ldc + 0 * 8));
+    c21 = vaddq_f16(c21, vld1q_f16(C + 2 * ldc + 1 * 8));
+    vst1q_f16(C + 2 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c20, vmin), vmax));
+    vst1q_f16(C + 2 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c21, vmin), vmax));
+
+    c30 = vaddq_f16(c30, vld1q_f16(C + 3 * ldc + 0 * 8));
+    c31 = vaddq_f16(c31, vld1q_f16(C + 3 * ldc + 1 * 8));
+    vst1q_f16(C + 3 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c30, vmin), vmax));
+    vst1q_f16(C + 3 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c31, vmin), vmax));
+
+    c40 = vaddq_f16(c40, vld1q_f16(C + 4 * ldc + 0 * 8));
+    c41 = vaddq_f16(c41, vld1q_f16(C + 4 * ldc + 1 * 8));
+    vst1q_f16(C + 4 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c40, vmin), vmax));
+    vst1q_f16(C + 4 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c41, vmin), vmax));
+
+    c50 = vaddq_f16(c50, vld1q_f16(C + 5 * ldc + 0 * 8));
+    c51 = vaddq_f16(c51, vld1q_f16(C + 5 * ldc + 1 * 8));
+    vst1q_f16(C + 5 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c50, vmin), vmax));
+    vst1q_f16(C + 5 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c51, vmin), vmax));
+
+    c60 = vaddq_f16(c60, vld1q_f16(C + 6 * ldc + 0 * 8));
+    c61 = vaddq_f16(c61, vld1q_f16(C + 6 * ldc + 1 * 8));
+    vst1q_f16(C + 6 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c60, vmin), vmax));
+    vst1q_f16(C + 6 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c61, vmin), vmax));
+
+    c70 = vaddq_f16(c70, vld1q_f16(C + 7 * ldc + 0 * 8));
+    c71 = vaddq_f16(c71, vld1q_f16(C + 7 * ldc + 1 * 8));
+    vst1q_f16(C + 7 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c70, vmin), vmax));
+    vst1q_f16(C + 7 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c71, vmin), vmax));
 }
 
 }  // namespace nnops::backend::cpu::aarch64

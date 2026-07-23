@@ -138,7 +138,7 @@ inline void pack_trans_n6_f16(half* NNOPS_RESTRICT output,
 inline void pack_trans_n8_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale) noexcept {
-    const auto* NNOPS_RESTRICT p[8];
+    const __m128i* NNOPS_RESTRICT p[8];
     for (int i = 0; i < 8; ++i) {
         p[i] = reinterpret_cast<const __m128i*>(input + i * ir_step);
     }
@@ -171,7 +171,7 @@ inline void pack_trans_n8_f16(half* NNOPS_RESTRICT output,
 inline void pack_trans_n16_f16(half* NNOPS_RESTRICT output,
                                const half* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale) noexcept {
-    const auto* NNOPS_RESTRICT p[16];
+    const __m128i* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
         p[i] = reinterpret_cast<const __m128i*>(input + i * ir_step);
     }

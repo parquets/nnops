@@ -31,6 +31,9 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/rms_norm.cpp
     backend/cpu/softmax.cpp
 
+    # CPU tiled GEMM dispatch (platform-abstracted over x86_64 / aarch64 micro-kernels)
+    backend/cpu/imatmul.cpp
+
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp
     backend/cpu/reference/activation_ref.cpp

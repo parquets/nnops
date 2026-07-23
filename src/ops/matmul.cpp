@@ -4,6 +4,8 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
 
+#include "backend/cpu/imatmul.h"
+
 namespace nnops {
 
 namespace backend::cpu::reference {
@@ -31,7 +33,12 @@ auto resolve_matmul_kernel(Backend backend) -> MatMul::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
+#if defined(NNOPS_ARCH_X86_64) || defined(__x86_64__) || defined(_M_X64) || defined(__amd64) \
+    || defined(__aarch64__) || defined(NNOPS_ARCH_AARCH64)
+        return backend::cpu::matmul_tiled_kernel;
+#else
         return backend::cpu::reference::matmul_ref;
+#endif
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;
@@ -68,6 +75,18 @@ void MatMul::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!output.is_empty());
     NNOPS_ASSERT(!inputs[0].is_empty());
     NNOPS_ASSERT(!inputs[1].is_empty());
+
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+    const int64_t a_rank = a.rank();
+    const int64_t b_rank = b.rank();
+    NNOPS_ASSERT(a_rank >= 2);
+    NNOPS_ASSERT(b_rank >= 2);
+
+    // Validate K dimensions match (with optional transpose)
+    const int64_t Ka = attrs_.transpose_a ? a.shape(a_rank - 2) : a.shape(a_rank - 1);
+    const int64_t Kb = attrs_.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
+    NNOPS_ASSERT(Ka == Kb);
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }

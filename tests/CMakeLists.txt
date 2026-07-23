@@ -6,7 +6,7 @@ set(TEST_SOURCES
     test_activation.cpp
     test_pooling.cpp
     test_linear.cpp
-    test_matmul.cpp
+    test_pack_mma.cpp
     test_attention.cpp
     test_softmax.cpp
     test_cumsum.cpp
@@ -19,7 +19,7 @@ set(TEST_SOURCES
 
 add_executable(nnops_test ${TEST_SOURCES})
 target_link_libraries(nnops_test PRIVATE nnops_cpu)
-target_include_directories(nnops_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(nnops_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 
 # Register with CTest
 add_test(NAME nnops_test COMMAND nnops_test)
