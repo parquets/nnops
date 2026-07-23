@@ -397,23 +397,18 @@ inline void mma_direct_4x12_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    auto clamp_store = [&](float32x4_t& v, float* dst) {
-        v = vaddq_f32(v, vld1q_f32(dst));
-        vst1q_f32(dst, vminq_f32(vmaxq_f32(v, v_min), v_max));
-    };
-
-    clamp_store(v_c00, C + 0 * ldc + 0 * 4);
-    clamp_store(v_c01, C + 0 * ldc + 1 * 4);
-    clamp_store(v_c02, C + 0 * ldc + 2 * 4);
-    clamp_store(v_c10, C + 1 * ldc + 0 * 4);
-    clamp_store(v_c11, C + 1 * ldc + 1 * 4);
-    clamp_store(v_c12, C + 1 * ldc + 2 * 4);
-    clamp_store(v_c20, C + 2 * ldc + 0 * 4);
-    clamp_store(v_c21, C + 2 * ldc + 1 * 4);
-    clamp_store(v_c22, C + 2 * ldc + 2 * 4);
-    clamp_store(v_c30, C + 3 * ldc + 0 * 4);
-    clamp_store(v_c31, C + 3 * ldc + 1 * 4);
-    clamp_store(v_c32, C + 3 * ldc + 2 * 4);
+    v_c00 = vaddq_f32(v_c00, vld1q_f32(C + 0 * ldc + 0 * 4)); vst1q_f32(C + 0 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c00, v_min), v_max));
+    v_c01 = vaddq_f32(v_c01, vld1q_f32(C + 0 * ldc + 1 * 4)); vst1q_f32(C + 0 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c01, v_min), v_max));
+    v_c02 = vaddq_f32(v_c02, vld1q_f32(C + 0 * ldc + 2 * 4)); vst1q_f32(C + 0 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c02, v_min), v_max));
+    v_c10 = vaddq_f32(v_c10, vld1q_f32(C + 1 * ldc + 0 * 4)); vst1q_f32(C + 1 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c10, v_min), v_max));
+    v_c11 = vaddq_f32(v_c11, vld1q_f32(C + 1 * ldc + 1 * 4)); vst1q_f32(C + 1 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c11, v_min), v_max));
+    v_c12 = vaddq_f32(v_c12, vld1q_f32(C + 1 * ldc + 2 * 4)); vst1q_f32(C + 1 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c12, v_min), v_max));
+    v_c20 = vaddq_f32(v_c20, vld1q_f32(C + 2 * ldc + 0 * 4)); vst1q_f32(C + 2 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c20, v_min), v_max));
+    v_c21 = vaddq_f32(v_c21, vld1q_f32(C + 2 * ldc + 1 * 4)); vst1q_f32(C + 2 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c21, v_min), v_max));
+    v_c22 = vaddq_f32(v_c22, vld1q_f32(C + 2 * ldc + 2 * 4)); vst1q_f32(C + 2 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c22, v_min), v_max));
+    v_c30 = vaddq_f32(v_c30, vld1q_f32(C + 3 * ldc + 0 * 4)); vst1q_f32(C + 3 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c30, v_min), v_max));
+    v_c31 = vaddq_f32(v_c31, vld1q_f32(C + 3 * ldc + 1 * 4)); vst1q_f32(C + 3 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c31, v_min), v_max));
+    v_c32 = vaddq_f32(v_c32, vld1q_f32(C + 3 * ldc + 2 * 4)); vst1q_f32(C + 3 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c32, v_min), v_max));
 }
 
 // =========================================================================
@@ -558,19 +553,14 @@ inline void mma_direct_8x4_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    auto clamp_store = [&](float32x4_t& v, float* dst) {
-        v = vaddq_f32(v, vld1q_f32(dst));
-        vst1q_f32(dst, vminq_f32(vmaxq_f32(v, v_min), v_max));
-    };
-
-    clamp_store(v_c0, C + 0 * ldc);
-    clamp_store(v_c1, C + 1 * ldc);
-    clamp_store(v_c2, C + 2 * ldc);
-    clamp_store(v_c3, C + 3 * ldc);
-    clamp_store(v_c4, C + 4 * ldc);
-    clamp_store(v_c5, C + 5 * ldc);
-    clamp_store(v_c6, C + 6 * ldc);
-    clamp_store(v_c7, C + 7 * ldc);
+    v_c0 = vaddq_f32(v_c0, vld1q_f32(C + 0 * ldc)); vst1q_f32(C + 0 * ldc, vminq_f32(vmaxq_f32(v_c0, v_min), v_max));
+    v_c1 = vaddq_f32(v_c1, vld1q_f32(C + 1 * ldc)); vst1q_f32(C + 1 * ldc, vminq_f32(vmaxq_f32(v_c1, v_min), v_max));
+    v_c2 = vaddq_f32(v_c2, vld1q_f32(C + 2 * ldc)); vst1q_f32(C + 2 * ldc, vminq_f32(vmaxq_f32(v_c2, v_min), v_max));
+    v_c3 = vaddq_f32(v_c3, vld1q_f32(C + 3 * ldc)); vst1q_f32(C + 3 * ldc, vminq_f32(vmaxq_f32(v_c3, v_min), v_max));
+    v_c4 = vaddq_f32(v_c4, vld1q_f32(C + 4 * ldc)); vst1q_f32(C + 4 * ldc, vminq_f32(vmaxq_f32(v_c4, v_min), v_max));
+    v_c5 = vaddq_f32(v_c5, vld1q_f32(C + 5 * ldc)); vst1q_f32(C + 5 * ldc, vminq_f32(vmaxq_f32(v_c5, v_min), v_max));
+    v_c6 = vaddq_f32(v_c6, vld1q_f32(C + 6 * ldc)); vst1q_f32(C + 6 * ldc, vminq_f32(vmaxq_f32(v_c6, v_min), v_max));
+    v_c7 = vaddq_f32(v_c7, vld1q_f32(C + 7 * ldc)); vst1q_f32(C + 7 * ldc, vminq_f32(vmaxq_f32(v_c7, v_min), v_max));
 }
 
 inline void mma_direct_8x12_f32(

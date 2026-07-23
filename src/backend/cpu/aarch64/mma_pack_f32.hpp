@@ -180,17 +180,15 @@ inline void mma_pack_4x12_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    auto clamp = [&](float32x4_t& v) { v = vminq_f32(vmaxq_f32(v, vmin), vmax); };
-
     c00 = vaddq_f32(c00, vld1q_f32(C + 0 * 4)); c01 = vaddq_f32(c01, vld1q_f32(C + 1 * 4)); c02 = vaddq_f32(c02, vld1q_f32(C + 2 * 4));
     c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4));
     c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4));
     c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4)); c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4)); c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4));
 
-    clamp(c00); clamp(c01); clamp(c02);
-    clamp(c10); clamp(c11); clamp(c12);
-    clamp(c20); clamp(c21); clamp(c22);
-    clamp(c30); clamp(c31); clamp(c32);
+    c00 = vminq_f32(vmaxq_f32(c00, vmin), vmax); c01 = vminq_f32(vmaxq_f32(c01, vmin), vmax); c02 = vminq_f32(vmaxq_f32(c02, vmin), vmax);
+    c10 = vminq_f32(vmaxq_f32(c10, vmin), vmax); c11 = vminq_f32(vmaxq_f32(c11, vmin), vmax); c12 = vminq_f32(vmaxq_f32(c12, vmin), vmax);
+    c20 = vminq_f32(vmaxq_f32(c20, vmin), vmax); c21 = vminq_f32(vmaxq_f32(c21, vmin), vmax); c22 = vminq_f32(vmaxq_f32(c22, vmin), vmax);
+    c30 = vminq_f32(vmaxq_f32(c30, vmin), vmax); c31 = vminq_f32(vmaxq_f32(c31, vmin), vmax); c32 = vminq_f32(vmaxq_f32(c32, vmin), vmax);
 
     vst1q_f32(C + 0 * 4, c00); vst1q_f32(C + 1 * 4, c01); vst1q_f32(C + 2 * 4, c02);
     vst1q_f32(C + 1 * ldc + 0 * 4, c10); vst1q_f32(C + 1 * ldc + 1 * 4, c11); vst1q_f32(C + 1 * ldc + 2 * 4, c12);
@@ -332,8 +330,6 @@ inline void mma_pack_8x12_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    auto clamp = [&](float32x4_t& v) { v = vminq_f32(vmaxq_f32(v, vmin), vmax); };
-
     c00 = vaddq_f32(c00, vld1q_f32(C + 0 * 4)); c01 = vaddq_f32(c01, vld1q_f32(C + 1 * 4)); c02 = vaddq_f32(c02, vld1q_f32(C + 2 * 4));
     c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4));
     c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4));
@@ -343,14 +339,14 @@ inline void mma_pack_8x12_f32(float* NNOPS_RESTRICT C, int ldc,
     c60 = vaddq_f32(c60, vld1q_f32(C + 6 * ldc + 0 * 4)); c61 = vaddq_f32(c61, vld1q_f32(C + 6 * ldc + 1 * 4)); c62 = vaddq_f32(c62, vld1q_f32(C + 6 * ldc + 2 * 4));
     c70 = vaddq_f32(c70, vld1q_f32(C + 7 * ldc + 0 * 4)); c71 = vaddq_f32(c71, vld1q_f32(C + 7 * ldc + 1 * 4)); c72 = vaddq_f32(c72, vld1q_f32(C + 7 * ldc + 2 * 4));
 
-    clamp(c00); clamp(c01); clamp(c02);
-    clamp(c10); clamp(c11); clamp(c12);
-    clamp(c20); clamp(c21); clamp(c22);
-    clamp(c30); clamp(c31); clamp(c32);
-    clamp(c40); clamp(c41); clamp(c42);
-    clamp(c50); clamp(c51); clamp(c52);
-    clamp(c60); clamp(c61); clamp(c62);
-    clamp(c70); clamp(c71); clamp(c72);
+    c00 = vminq_f32(vmaxq_f32(c00, vmin), vmax); c01 = vminq_f32(vmaxq_f32(c01, vmin), vmax); c02 = vminq_f32(vmaxq_f32(c02, vmin), vmax);
+    c10 = vminq_f32(vmaxq_f32(c10, vmin), vmax); c11 = vminq_f32(vmaxq_f32(c11, vmin), vmax); c12 = vminq_f32(vmaxq_f32(c12, vmin), vmax);
+    c20 = vminq_f32(vmaxq_f32(c20, vmin), vmax); c21 = vminq_f32(vmaxq_f32(c21, vmin), vmax); c22 = vminq_f32(vmaxq_f32(c22, vmin), vmax);
+    c30 = vminq_f32(vmaxq_f32(c30, vmin), vmax); c31 = vminq_f32(vmaxq_f32(c31, vmin), vmax); c32 = vminq_f32(vmaxq_f32(c32, vmin), vmax);
+    c40 = vminq_f32(vmaxq_f32(c40, vmin), vmax); c41 = vminq_f32(vmaxq_f32(c41, vmin), vmax); c42 = vminq_f32(vmaxq_f32(c42, vmin), vmax);
+    c50 = vminq_f32(vmaxq_f32(c50, vmin), vmax); c51 = vminq_f32(vmaxq_f32(c51, vmin), vmax); c52 = vminq_f32(vmaxq_f32(c52, vmin), vmax);
+    c60 = vminq_f32(vmaxq_f32(c60, vmin), vmax); c61 = vminq_f32(vmaxq_f32(c61, vmin), vmax); c62 = vminq_f32(vmaxq_f32(c62, vmin), vmax);
+    c70 = vminq_f32(vmaxq_f32(c70, vmin), vmax); c71 = vminq_f32(vmaxq_f32(c71, vmin), vmax); c72 = vminq_f32(vmaxq_f32(c72, vmin), vmax);
 
     vst1q_f32(C + 0 * 4, c00); vst1q_f32(C + 1 * 4, c01); vst1q_f32(C + 2 * 4, c02);
     vst1q_f32(C + 1 * ldc + 0 * 4, c10); vst1q_f32(C + 1 * ldc + 1 * 4, c11); vst1q_f32(C + 1 * ldc + 2 * 4, c12);
