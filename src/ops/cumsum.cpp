@@ -14,6 +14,16 @@ namespace backend::cpu::reference {
                     void* workspace);
 }
 
+#ifdef NNOPS_HAS_CUDA
+namespace backend::cuda {
+    void cumsum_cuda(const CumSumAttributes& attrs,
+                     TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* workspace);
+}
+#endif
+
 // ============================================================
 // Impl
 // ============================================================
@@ -34,7 +44,7 @@ auto resolve_cumsum_kernel(Backend backend) -> CumSum::Impl::KernelFn
         return backend::cpu::reference::cumsum_ref;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;
+        return backend::cuda::cumsum_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:

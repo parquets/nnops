@@ -22,6 +22,16 @@ namespace backend::cpu::reference {
                      void* workspace);
 }
 
+#ifdef NNOPS_HAS_CUDA
+namespace backend::cuda {
+    void softmax_cuda(const SoftmaxAttributes& attrs,
+                      TensorView& output,
+                      std::span<const TensorView> inputs,
+                      const ComputeContext& ctx,
+                      void* workspace);
+}
+#endif
+
 // ============================================================
 // Impl
 // ============================================================
@@ -42,7 +52,7 @@ auto resolve_softmax_kernel(Backend backend) -> Softmax::Impl::KernelFn
         return backend::cpu::softmax_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;
+        return backend::cuda::softmax_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:

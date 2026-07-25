@@ -23,6 +23,16 @@ namespace backend::cpu {
                                void* workspace);
 }
 
+#ifdef NNOPS_HAS_CUDA
+namespace backend::cuda {
+    void depthwise_conv2d_cuda(const DepthwiseConv2DAttributes& attrs,
+                                TensorView& output,
+                                std::span<const TensorView> inputs,
+                                const ComputeContext& ctx,
+                                void* workspace);
+}
+#endif
+
 // ============================================================
 // Impl — holds the backend-bound kernel function pointer
 // ============================================================
@@ -43,7 +53,7 @@ auto resolve_depthwise_conv2d_kernel(Backend backend) -> DepthwiseConv2D::Impl::
         return backend::cpu::depthwise_conv2d_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;  // backend::cuda::depthwise_conv2d_cuda
+        return backend::cuda::depthwise_conv2d_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
@@ -73,9 +83,10 @@ DepthwiseConv2D::DepthwiseConv2D(const DepthwiseConv2DAttributes& attrs, Backend
 }
 
 // ============================================================
-// getWorkspace
+// getWorkspaceSize
 // ============================================================
-size_t DepthwiseConv2D::getWorkspace() const
+size_t DepthwiseConv2D::getWorkspaceSize(std::span<const TensorDesc>,
+                                         std::span<const TensorDesc>) const
 {
     return 0;
 }

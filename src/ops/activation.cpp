@@ -22,6 +22,16 @@ namespace backend::cpu::reference {
                         void* workspace);
 }
 
+#ifdef NNOPS_HAS_CUDA
+namespace backend::cuda {
+    void activation_cuda(const ActivationAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx,
+                         void* workspace);
+}
+#endif
+
 // ============================================================
 // Impl
 // ============================================================
@@ -42,7 +52,7 @@ auto resolve_activation_kernel(Backend backend) -> Activation::Impl::KernelFn
         return backend::cpu::activation_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;
+        return backend::cuda::activation_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:

@@ -22,6 +22,16 @@ namespace backend::cpu {
                         void* workspace);
 }
 
+#ifdef NNOPS_HAS_CUDA
+namespace backend::cuda {
+    void layer_norm_cuda(const LayerNormAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx,
+                         void* workspace);
+}
+#endif
+
 // ============================================================
 // Impl
 // ============================================================
@@ -42,7 +52,7 @@ auto resolve_layer_norm_kernel(Backend backend) -> LayerNorm::Impl::KernelFn
         return backend::cpu::layer_norm_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;
+        return backend::cuda::layer_norm_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
