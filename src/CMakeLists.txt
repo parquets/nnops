@@ -114,7 +114,7 @@ if(NNOPS_BUILD_VULKAN)
     set(VULKAN_SHADER_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
 
     # List of shaders to compile
-    set(VULKAN_SHADERS eltwise_f32 unary_f32)
+    set(VULKAN_SHADERS eltwise_f32 unary_f32 eltwise_f16 unary_f16)
     set(VULKAN_SPV_FILES "")
     set(VULKAN_SPV_HEADERS "")
 
@@ -125,7 +125,7 @@ if(NNOPS_BUILD_VULKAN)
 
         add_custom_command(
             OUTPUT ${SHADER_SPV}
-            COMMAND ${GLSLC_EXECUTABLE} -o ${SHADER_SPV} ${SHADER_SRC}
+            COMMAND ${GLSLC_EXECUTABLE} --target-env=vulkan1.2 -o ${SHADER_SPV} ${SHADER_SRC}
             DEPENDS ${SHADER_SRC}
             COMMENT "Compiling Vulkan shader: ${shader}.comp → ${shader}.spv"
         )

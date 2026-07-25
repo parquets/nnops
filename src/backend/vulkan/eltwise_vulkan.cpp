@@ -4,11 +4,13 @@
 /// Uses pre-compiled SPIR-V compute shaders and specialization constants
 /// for the operation type (Add/Sub/Mul/Div) and add_to flag.
 ///
+/// Supports f32 and f16 (requires VK_KHR_16bit_storage for f16).
+///
 /// Design:
-///   - One compute pipeline per (op_type, add_to) combination.
+///   - One compute pipeline per (dtype, op_type, add_to) combination.
 ///   - Pipelines are lazily created and cached via VulkanPipelineCache.
 ///   - Per-call descriptor set allocated from user-provided pool.
-///   - Supports f32 only (f16 support requires VK_KHR_16bit_storage).
+///   - All arithmetic is performed in fp32; fp16 loads widen and stores narrow.
 ///
 /// Requires ComputeContext fields:
 ///   - vulkan_cmd_buffer:      VkCommandBuffer to record into
@@ -18,6 +20,7 @@
 
 #include "vulkan_common.hpp"
 #include "eltwise_f32_spv.h"
+#include "eltwise_f16_spv.h"
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -54,6 +57,25 @@ void eltwise_vulkan(
     if (total == 0) return;
     NNOPS_ASSERT(A.numel() == B.numel());
 
+    // ---- Select SPIR-V blob based on data type ----
+    const auto dtype = A.data_type();
+    const uint32_t* spirv_data = nullptr;
+    size_t spirv_size = 0;
+
+    switch (dtype) {
+    case DataType::f32:
+        spirv_data = g_eltwise_f32_spv;
+        spirv_size = g_eltwise_f32_spv_len;
+        break;
+    case DataType::f16:
+        spirv_data = g_eltwise_f16_spv;
+        spirv_size = g_eltwise_f16_spv_len;
+        break;
+    default:
+        NNOPS_ASSERT(!"unsupported data type (only f32 and f16)");
+        return;
+    }
+
     // ---- Extract Vulkan resources from context ----
     VkCommandBuffer  cmd    = static_cast<VkCommandBuffer>(ctx.vulkan_cmd_buffer);
     VkDevice         device = static_cast<VkDevice>(ctx.vulkan_device);
@@ -69,8 +91,8 @@ void eltwise_vulkan(
     auto& cache = VulkanPipelineCache::instance();
     PipelineKey key = {};
     key.device       = device;
-    key.spirv_data   = g_eltwise_f32_spv;
-    key.spirv_size   = g_eltwise_f32_spv_len;
+    key.spirv_data   = spirv_data;
+    key.spirv_size   = spirv_size;
     key.spec_op      = eltwise_op_to_spec(attrs.type);
     key.spec_add_to  = attrs.add_to ? 1u : 0u;
     key.num_bindings = 3;  // A, B, C

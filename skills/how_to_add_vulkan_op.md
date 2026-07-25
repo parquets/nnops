@@ -27,6 +27,8 @@ src/backend/vulkan/shaders/<op>_f32.comp  # GLSL 计算着色器
 
 ## 2. 计算着色器 (GLSL)
 
+> 💡 **详细语法参考**：本文仅给出 nnops 项目中的标准模板。完整的 GLSL compute shader 语法（扩展声明、数据类型、shared memory、barrier、subgroup、原子操作等）请见 [Vulkan Compute Shader 语法参考](vulkan_compute_shader_grammar.md)。
+
 ### 2.1 基础模板
 
 ```glsl
@@ -509,3 +511,223 @@ NNOPS_TEST(eltwise_vulkan_add_1d) {
 ### Q: 程序退出时崩溃 (Segfault)
 - 确保 `VulkanTestEnv` 析构函数在 `vkDestroyDevice` 之前调用了 pipeline cache cleanup
 - 确保 VkDescriptorSet 不在 command buffer 还在录制时被释放
+
+---
+
+## 11. fp16 (半精度浮点) 支持
+
+### 11.1 设计原则
+
+遵循与 CPU/CUDA 后端一致的 **"f16 加载 → f32 计算 → f16 存储"** 模式：
+
+```text
+GPU Shader 内部流程:
+  float16_t v = buf[gid];       // 1. 从 SSBO 以 fp16 加载
+  float v32  = float(v);        // 2. 隐式扩展为 fp32（零成本）
+  float r    = v32 + ...;       // 3. fp32 计算（exp, log, +, -, *, /...）
+  buf[gid]   = float16_t(r);    // 4. 窄化为 fp16 存储
+```
+
+只需要 **VK_KHR_16bit_storage**（`storageBuffer16BitAccess`），不需要 `shaderFloat16`。因为所有计算都在 fp32 执行，GPU 不需要支持 fp16 原生运算单元。绝大多数 Vulkan 1.1+ GPU 都满足此条件。
+
+### 11.2 fp16 Shader 模板
+
+```glsl
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_16bit_storage : require    // ← 启用 float16_t 在 SSBO 中
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const int OP = 0;
+layout(constant_id = 1) const int ADD_TO = 0;
+
+// SSBO 类型声明为 float16_t 而非 float
+layout(set = 0, binding = 0) readonly buffer BufA { float16_t a[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float16_t b[]; };
+layout(set = 0, binding = 2) buffer BufC { float16_t c[]; };
+
+layout(push_constant) uniform PushConstants {
+    int total;
+} pc;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= pc.total) return;
+
+    // 加载为 fp16，隐式扩展为 fp32
+    float va = float(a[gid]);
+    float vb = float(b[gid]);
+    float result;
+
+    if (OP == 0)      result = va + vb;
+    else if (OP == 1) result = va - vb;
+    else if (OP == 2) result = va * vb;
+    else              result = va / vb;
+
+    // 写入时窄化回 fp16
+    if (ADD_TO == 1) {
+        c[gid] = float16_t(float(c[gid]) + result);
+    } else {
+        c[gid] = float16_t(result);
+    }
+}
+```
+
+**关键 GLSL 语法**：
+
+| 元素 | f32 shader | f16 shader |
+|------|------------|------------|
+| 扩展声明 | 无 | `#extension GL_EXT_shader_16bit_storage : require` |
+| SSBO 类型 | `float a[]` | `float16_t a[]` |
+| 加载 | `float va = a[gid]` | `float va = float(a[gid])` (隐式) |
+| 计算 | `float` | `float` (同 f32) |
+| 存储 | `c[gid] = result` | `c[gid] = float16_t(result)` |
+| `add_to` 读取 | `c[gid] += result` | `float(c[gid]) + result` → `float16_t(...)` |
+
+`float16_t` ↔ `float` 转换在 GLSL 中是隐式的，无需显式 `float()` / `float16_t()` 转换——但显式写出有助于代码可读性。
+
+### 11.3 C++ 后端 dtype 分发
+
+在算子入口点添加 dtype 判断，选择对应的 SPIR-V blob：
+
+```cpp
+#include "my_op_f32_spv.h"
+#include "my_op_f16_spv.h"
+
+void my_op_vulkan(...) {
+    const auto dtype = inputs[0].data_type();
+
+    // 根据 dtype 选择 SPIR-V
+    const uint32_t* spirv_data = nullptr;
+    size_t spirv_size = 0;
+    switch (dtype) {
+    case DataType::f32:
+        spirv_data = g_my_op_f32_spv;
+        spirv_size = g_my_op_f32_spv_len;
+        break;
+    case DataType::f16:
+        spirv_data = g_my_op_f16_spv;
+        spirv_size = g_my_op_f16_spv_len;
+        break;
+    default:
+        NNOPS_ASSERT(!"unsupported data type");
+        return;
+    }
+
+    // PipelineKey 无需改动——spirv_data 指针天然区分 f32/f16
+    PipelineKey key = {};
+    key.spirv_data = spirv_data;
+    key.spirv_size = spirv_size;
+    // ...
+}
+```
+
+**不需要修改**：
+- `PipelineKey` — `spirv_data` 指针已能区分 f32 和 f16
+- `VulkanPipelineCache` — 缓存逻辑对 dtype 无感知
+- `vulkan_record_dispatch` — descriptor set 分配与 buffer 类型无关
+- `ComputeContext` — `VkBuffer` 句柄与元素类型无关
+
+### 11.4 Device 侧要求
+
+测试环境的 device 创建需启用 `VK_KHR_16bit_storage` 和 `storageBuffer16BitAccess` 特性：
+
+```cpp
+// 1. 查询物理设备是否支持该扩展
+uint32_t ext_count = 0;
+vkEnumerateDeviceExtensionProperties(phys_device, nullptr, &ext_count, nullptr);
+std::vector<VkExtensionProperties> exts(ext_count);
+vkEnumerateDeviceExtensionProperties(phys_device, nullptr, &ext_count, exts.data());
+bool supports_16bit = false;
+for (auto& ext : exts) {
+    if (strcmp(ext.extensionName, VK_KHR_16BIT_STORAGE_EXTENSION_NAME) == 0) {
+        supports_16bit = true;
+        break;
+    }
+}
+
+// 2. 条件启用扩展和特性
+VkPhysicalDevice16BitStorageFeatures storage_features = {};
+storage_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+storage_features.storageBuffer16BitAccess = VK_TRUE;
+
+VkDeviceCreateInfo dci = {};
+// ... queue info ...
+dci.pNext = supports_16bit ? &storage_features : nullptr;
+
+const char* enabled_exts[] = { VK_KHR_16BIT_STORAGE_EXTENSION_NAME };
+dci.enabledExtensionCount = supports_16bit ? 1 : 0;
+dci.ppEnabledExtensionNames = supports_16bit ? enabled_exts : nullptr;
+```
+
+### 11.5 CMake 配置
+
+在 `src/CMakeLists.txt` 中：
+
+```cmake
+# glslc 需要 --target-env=vulkan1.2 以支持 16bit storage SPIR-V 特性
+COMMAND ${GLSLC_EXECUTABLE} --target-env=vulkan1.2 -o ${SHADER_SPV} ${SHADER_SRC}
+
+# 将 fp16 shader 名称加入列表
+set(VULKAN_SHADERS eltwise_f32 unary_f32 eltwise_f16 unary_f16)
+```
+
+### 11.6 fp16 测试要点
+
+1. **缓冲区大小**：`numel * sizeof(uint16_t)` = `numel * 2`（不是 `sizeof(float)`）
+
+2. **TensorView dtype**：`DataType::f16`
+
+3. **参考值计算**：CPU 参考值也必须走 fp16 往返（float→f16→float），确保对比双方都在 fp16 精度下
+
+4. **精度容差**：
+   - 直接算术 (Add/Sub/Mul/Div/Abs/Neg): `1e-3f`
+   - 超越函数 (Exp/Log/Sin/Cos/Tan/Sqrt): `1e-3f + 5e-3f * |expected|`
+   - fp16 仅有 ~3.3 位十进制有效数字，比 f32 宽松约 100 倍
+
+5. **输入范围约束**：fp16 最大值为 65504，最小正规数为 ~6.1e-5。尤其是 `exp` 测试要控制输入在 [-10, 10] 范围内
+
+6. **fp16 转换工具**：复用 `nnops/detail/half.hpp` 中的 `float_to_half()` / `half_to_float()`
+
+```cpp
+#include "nnops/detail/half.hpp"
+using nnops::backend::cpu::half;
+using nnops::backend::cpu::half_to_float;
+using nnops::backend::cpu::float_to_half;
+
+// float 数组 → fp16 数组
+std::vector<uint16_t> f16_bits(n);
+for (size_t i = 0; i < n; ++i)
+    f16_bits[i] = float_to_half(float_data[i]).bits;
+
+// 创建 DataType::f16 的 TensorView
+TensorView view(shape, DataType::f16, f16_bits.data());
+```
+
+### 11.7 检查清单：添加 fp16 支持
+
+1. **编写 `_f16.comp` shader**
+   - [ ] 添加 `#extension GL_EXT_shader_16bit_storage : require`
+   - [ ] SSBO 类型改为 `float16_t[]`
+   - [ ] 加载时隐式转换 `float va = float(a[gid])`
+   - [ ] 存储时显式转换 `c[gid] = float16_t(result)`
+   - [ ] `add_to` 路径先将 `float16_t` 转为 `float` 再运算
+
+2. **更新 CMake**
+   - [ ] 将 shader 名称加入 `VULKAN_SHADERS` 列表
+   - [ ] 确保 glslc 使用 `--target-env=vulkan1.2`
+
+3. **更新 C++ 后端**
+   - [ ] `#include "xxx_f16_spv.h"`
+   - [ ] 在入口点添加 `switch (dtype)` 选择 SPIR-V
+
+4. **启用设备特性**
+   - [ ] 查询 `VK_KHR_16bit_storage` 扩展
+   - [ ] 链入 `VkPhysicalDevice16BitStorageFeatures`
+
+5. **编写测试**
+   - [ ] 缓冲区大小使用 `sizeof(uint16_t) * numel`
+   - [ ] TensorView 使用 `DataType::f16`
+   - [ ] 参考值走 fp16 往返
+   - [ ] 使用 fp16 级别容差

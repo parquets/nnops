@@ -73,6 +73,7 @@ public:
     VkDescriptorPool descriptor_pool() const { return desc_pool_; }
     VkQueue          queue()           const { return queue_; }
     VkCommandPool    cmd_pool()        const { return cmd_pool_; }
+    bool             supports_fp16()   const { return supports_16bit_storage_; }
 
     // ---- Buffer helpers ----
 
@@ -220,6 +221,18 @@ private:
             }
         }
         physical_device_ = devices[0]; // fallback
+
+        // Query device extension support for fp16 storage
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> exts(ext_count);
+        vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &ext_count, exts.data());
+        for (const auto& ext : exts) {
+            if (strcmp(ext.extensionName, VK_KHR_16BIT_STORAGE_EXTENSION_NAME) == 0) {
+                supports_16bit_storage_ = true;
+                break;
+            }
+        }
     }
 
     void create_device() {
@@ -244,10 +257,24 @@ private:
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
 
+        // Conditionally enable 16-bit storage for fp16 support
+        VkPhysicalDevice16BitStorageFeatures storage_features = {};
+        storage_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        storage_features.storageBuffer16BitAccess = VK_TRUE;
+
+        const char* device_exts[16];
+        uint32_t dev_ext_count = 0;
+        if (supports_16bit_storage_) {
+            device_exts[dev_ext_count++] = VK_KHR_16BIT_STORAGE_EXTENSION_NAME;
+        }
+
         VkDeviceCreateInfo dci = {};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = dev_ext_count;
+        dci.ppEnabledExtensionNames = dev_ext_count ? device_exts : nullptr;
+        dci.pNext = supports_16bit_storage_ ? &storage_features : nullptr;
 
         VK_CHECK(vkCreateDevice(physical_device_, &dci, nullptr, &device_));
         vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
@@ -299,14 +326,15 @@ private:
         }
     }
 
-    VkInstance       instance_       = VK_NULL_HANDLE;
-    VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
-    VkDevice         device_         = VK_NULL_HANDLE;
-    VkQueue          queue_          = VK_NULL_HANDLE;
-    VkCommandPool    cmd_pool_       = VK_NULL_HANDLE;
-    VkCommandBuffer  cmd_buf_        = VK_NULL_HANDLE;
-    VkDescriptorPool desc_pool_      = VK_NULL_HANDLE;
-    uint32_t         queue_family_   = 0;
+    VkInstance       instance_               = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device_         = VK_NULL_HANDLE;
+    VkDevice         device_                 = VK_NULL_HANDLE;
+    VkQueue          queue_                  = VK_NULL_HANDLE;
+    VkCommandPool    cmd_pool_               = VK_NULL_HANDLE;
+    VkCommandBuffer  cmd_buf_                = VK_NULL_HANDLE;
+    VkDescriptorPool desc_pool_              = VK_NULL_HANDLE;
+    uint32_t         queue_family_           = 0;
+    bool             supports_16bit_storage_ = false;
 };
 
 }  // namespace nnops::test
