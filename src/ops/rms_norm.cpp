@@ -3,6 +3,7 @@
 
 #include "nnops/ops/rms_norm.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -73,6 +74,12 @@ RMSNorm::RMSNorm(const RMSNormAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_rms_norm_kernel(backend);
+}
+
+std::vector<TensorDesc> RMSNorm::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {identity_output_shape(inputs)};
 }
 
 void RMSNorm::compute(std::span<TensorView> outputs,

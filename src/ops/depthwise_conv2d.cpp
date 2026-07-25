@@ -3,6 +3,7 @@
 
 #include "nnops/ops/depthwise_conv2d.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -83,12 +84,14 @@ DepthwiseConv2D::DepthwiseConv2D(const DepthwiseConv2DAttributes& attrs, Backend
 }
 
 // ============================================================
-// getWorkspaceSize
+// getOutputShapes
 // ============================================================
-size_t DepthwiseConv2D::getWorkspaceSize(std::span<const TensorDesc>,
-                                         std::span<const TensorDesc>) const
+std::vector<TensorDesc> DepthwiseConv2D::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
 {
-    return 0;
+    return {depthwise_conv2d_output_shape(
+        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+        0 /* NOTSET */, inputs)};
 }
 
 // ============================================================

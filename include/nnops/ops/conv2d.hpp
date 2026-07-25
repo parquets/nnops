@@ -7,7 +7,6 @@
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/epilogue.hpp"
-
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -68,8 +67,8 @@ public:
     }
 
     // ---- OpBase interface ----
-    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
-                            std::span<const TensorDesc> outputs) const override;
+    std::vector<TensorDesc> getOutputShapes(
+        std::span<const TensorDesc> inputs) const override;
 
     /// inputs[0] = input tensor (NCHW)
     /// inputs[1] = weight tensor (OIHW or GOIHW for grouped)

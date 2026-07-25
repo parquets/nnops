@@ -7,7 +7,6 @@
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/epilogue.hpp"
-
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -45,8 +44,8 @@ public:
     }
 
     // ---- OpBase interface ----
-    size_t getWorkspaceSize(std::span<const TensorDesc>,
-                            std::span<const TensorDesc>) const override { return 0; }
+    std::vector<TensorDesc> getOutputShapes(
+        std::span<const TensorDesc> inputs) const override;
 
     /// inputs[0] = input tensor [M, K] (or broadcastable to 2D)
     /// inputs[1] = weight tensor [N, K]

@@ -3,6 +3,7 @@
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -73,6 +74,14 @@ Pooling::Pooling(const PoolingAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_pooling_kernel(backend);
+}
+
+std::vector<TensorDesc> Pooling::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {pooling_output_shape(
+        attrs_.kernel_shape, attrs_.stride, attrs_.dilation, attrs_.padding,
+        static_cast<int>(attrs_.auto_pad), inputs)};
 }
 
 void Pooling::compute(std::span<TensorView> outputs,

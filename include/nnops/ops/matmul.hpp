@@ -7,7 +7,6 @@
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/epilogue.hpp"
-
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -57,6 +56,9 @@ public:
                                           Backend backend = Backend::CPU);
 
     // ---- OpBase interface ----
+    std::vector<TensorDesc> getOutputShapes(
+        std::span<const TensorDesc> inputs) const override;
+
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 

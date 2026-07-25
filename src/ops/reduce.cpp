@@ -3,6 +3,7 @@
 
 #include "nnops/ops/reduce.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -73,6 +74,12 @@ Reduce::Reduce(const ReduceAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_reduce_kernel(backend);
+}
+
+std::vector<TensorDesc> Reduce::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {reduce_output_shape(attrs_.axis, attrs_.keepdims, inputs)};
 }
 
 void Reduce::compute(std::span<TensorView> outputs,

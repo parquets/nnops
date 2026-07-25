@@ -18,6 +18,7 @@ set(TEST_SOURCES
     test_eltwise.cpp
     test_unary.cpp
     test_reduce.cpp
+    test_shape_inference.cpp
 )
 
 # Vulkan tests (only when Vulkan backend is enabled)

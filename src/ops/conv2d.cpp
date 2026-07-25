@@ -3,6 +3,7 @@
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -65,14 +66,14 @@ Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
 }
 
 // ============================================================
-// getWorkspaceSize
+// getOutputShapes
 // ============================================================
-size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc>,
-                                std::span<const TensorDesc>) const
+std::vector<TensorDesc> Conv2D::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
 {
-    // Reference CPU implementation uses no workspace.
-    // Optimized GEMM-based implementations may need im2col buffer.
-    return 0;
+    return {conv2d_output_shape(
+        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs)};
 }
 
 // ============================================================

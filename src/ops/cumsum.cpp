@@ -3,6 +3,7 @@
 
 #include "nnops/ops/cumsum.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -65,6 +66,12 @@ CumSum::CumSum(const CumSumAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_cumsum_kernel(backend);
+}
+
+std::vector<TensorDesc> CumSum::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {identity_output_shape(inputs)};
 }
 
 void CumSum::compute(std::span<TensorView> outputs,

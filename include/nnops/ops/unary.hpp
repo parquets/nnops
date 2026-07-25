@@ -6,7 +6,6 @@
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
-
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -62,8 +61,8 @@ public:
     }
 
     // ---- OpBase interface ----
-    size_t getWorkspaceSize(std::span<const TensorDesc>,
-                            std::span<const TensorDesc>) const override { return 0; }
+    std::vector<TensorDesc> getOutputShapes(
+        std::span<const TensorDesc> inputs) const override;
 
     /// inputs[0] = X tensor [*]
     using OpBase::compute;

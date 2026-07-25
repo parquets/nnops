@@ -3,6 +3,7 @@
 
 #include "nnops/ops/activation.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -73,6 +74,12 @@ Activation::Activation(const ActivationAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_activation_kernel(backend);
+}
+
+std::vector<TensorDesc> Activation::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {identity_output_shape(inputs)};
 }
 
 void Activation::compute(std::span<TensorView> outputs,

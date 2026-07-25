@@ -3,6 +3,7 @@
 
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -84,6 +85,12 @@ Eltwise::Eltwise(const EltwiseAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_eltwise_kernel(backend);
+}
+
+std::vector<TensorDesc> Eltwise::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {identity_output_shape(inputs)};
 }
 
 void Eltwise::compute(std::span<TensorView> outputs,

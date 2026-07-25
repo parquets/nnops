@@ -3,6 +3,7 @@
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -55,6 +56,12 @@ Linear::Linear(const LinearAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_linear_kernel(backend);
+}
+
+std::vector<TensorDesc> Linear::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {linear_output_shape(inputs)};
 }
 
 void Linear::compute(std::span<TensorView> outputs,

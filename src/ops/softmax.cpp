@@ -3,6 +3,7 @@
 
 #include "nnops/ops/softmax.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -73,6 +74,12 @@ Softmax::Softmax(const SoftmaxAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_softmax_kernel(backend);
+}
+
+std::vector<TensorDesc> Softmax::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {identity_output_shape(inputs)};
 }
 
 void Softmax::compute(std::span<TensorView> outputs,

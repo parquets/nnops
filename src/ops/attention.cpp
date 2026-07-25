@@ -3,6 +3,7 @@
 
 #include "nnops/ops/attention.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -57,15 +58,10 @@ Attention::Attention(const AttentionAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_attention_kernel(backend);
 }
 
-size_t Attention::getWorkspaceSize(std::span<const TensorDesc>,
-                                   std::span<const TensorDesc>) const
+std::vector<TensorDesc> Attention::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
 {
-    // Reference implementation uses a per-head scratch buffer for scores:
-    // max size = Sq * Sk * sizeof(float)
-    // We don't know the shapes here, so return 0 — user must provide
-    // sufficient workspace or the implementation allocates internally.
-    // For CPU reference, we use std::vector internally.
-    return 0;
+    return {attention_output_shape(inputs)};
 }
 
 void Attention::compute(std::span<TensorView> outputs,

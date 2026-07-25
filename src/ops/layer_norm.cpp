@@ -3,6 +3,7 @@
 
 #include "nnops/ops/layer_norm.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -73,6 +74,12 @@ LayerNorm::LayerNorm(const LayerNormAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_layer_norm_kernel(backend);
+}
+
+std::vector<TensorDesc> LayerNorm::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {identity_output_shape(inputs)};
 }
 
 void LayerNorm::compute(std::span<TensorView> outputs,

@@ -3,6 +3,7 @@
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
 
 #include "backend/cpu/matmul.h"
 
@@ -65,6 +66,12 @@ size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(outputs.size() >= 1);
     return backend::cpu::matmul_get_workspace_size(attrs_, inputs[0], inputs[1], outputs[0]);
+}
+
+std::vector<TensorDesc> MatMul::getOutputShapes(
+    std::span<const TensorDesc> inputs) const
+{
+    return {matmul_output_shape(attrs_.transpose_a, attrs_.transpose_b, inputs)};
 }
 
 void MatMul::compute(std::span<TensorView> outputs,
