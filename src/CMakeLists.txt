@@ -18,6 +18,8 @@ set(NNOPS_CPU_SOURCES
     ops/rms_norm.cpp
     ops/conv3d.cpp
     ops/depthwise_conv2d.cpp
+    ops/eltwise.cpp
+    ops/unary.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -30,9 +32,14 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/pooling.cpp
     backend/cpu/rms_norm.cpp
     backend/cpu/softmax.cpp
+    backend/cpu/eltwise.cpp
+    backend/cpu/unary.cpp
 
     # CPU tiled GEMM dispatch (platform-abstracted over x86_64 / aarch64 micro-kernels)
     backend/cpu/imatmul.cpp
+
+    # CPU tiled matmul kernel (NKM loop with pack + MMA)
+    backend/cpu/matmul.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp
@@ -48,6 +55,8 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/rms_norm_ref.cpp
     backend/cpu/reference/conv3d_ref.cpp
     backend/cpu/reference/depthwise_conv2d_ref.cpp
+    backend/cpu/reference/eltwise_ref.cpp
+    backend/cpu/reference/unary_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})
@@ -56,13 +65,20 @@ target_include_directories(nnops_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # ---- CUDA backend (optional) ----
 if(NNOPS_BUILD_CUDA)
     enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
     set(NNOPS_CUDA_SOURCES
-        backend/cuda/conv2d_cuda.cu
-        backend/cuda/activation_cuda.cu
-        backend/cuda/pooling_cuda.cu
+        backend/cuda/softmax.cu
+        backend/cuda/layer_norm.cu
+        backend/cuda/rms_norm.cu
+        backend/cuda/activation.cu
+        backend/cuda/batch_norm.cu
+        backend/cuda/pooling.cu
+        backend/cuda/cumsum.cu
+        backend/cuda/depthwise_conv2d.cu
+        backend/cuda/eltwise.cu
+        backend/cuda/unary.cu
     )
 
     add_library(nnops_cuda STATIC ${NNOPS_CUDA_SOURCES})

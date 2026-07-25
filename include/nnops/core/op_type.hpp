@@ -21,6 +21,8 @@ enum class OpType : uint8_t {
     RMSNorm     = 10,
     Conv3D          = 11,
     DepthwiseConv2D = 12,
+    Eltwise         = 13,
+    Unary           = 14,
 };
 
 }  // namespace nnops

@@ -19,6 +19,10 @@ set(TEST_SOURCES
 
 add_executable(nnops_test ${TEST_SOURCES})
 target_link_libraries(nnops_test PRIVATE nnops_cpu)
+if(NNOPS_BUILD_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(nnops_test PRIVATE CUDA::cudart)
+endif()
 target_include_directories(nnops_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 
 # Register with CTest
