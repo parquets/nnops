@@ -96,7 +96,7 @@ void rms_norm_general_scalar(
     if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_rows, process_row);
     } else {
-        for (int64_t i = 0; i < num_rows; ++i) process_row(i);
+        for (int64_t i = 0; i < num_rows; ++i) { process_row(i); }
     }
 }
 
@@ -120,7 +120,7 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     // Number of rows and norm_size per row

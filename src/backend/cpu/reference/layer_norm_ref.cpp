@@ -27,7 +27,7 @@ void layer_norm_ref(const LayerNormAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     // Number of rows and norm_size per row
@@ -65,8 +65,8 @@ void layer_norm_ref(const LayerNormAttributes& attrs,
     // Scale/bias offset: for now handle the common case where scale shape
     // matches the normalized dims.
     auto scale_offset = [&](int64_t flat_idx) -> int64_t {
-        if (scale.numel() == 1) return 0;
-        if (scale.rank() == 1 && norm_size == scale.shape(0)) return flat_idx;
+        if (scale.numel() == 1) { return 0; }
+        if (scale.rank() == 1 && norm_size == scale.shape(0)) { return flat_idx; }
         // Default: assume matching shape
         return flat_idx;
     };

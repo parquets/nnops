@@ -110,7 +110,7 @@ NNOPS_TEST(layernorm_random) {
     // With scale=1: each row should have mean ≈ 0, std ≈ 1
     for (int r = 0; r < 4; ++r) {
         float row_mean = 0.0f;
-        for (int c = 0; c < 8; ++c) row_mean += out_buf[r * 8 + c];
+        for (int c = 0; c < 8; ++c) { row_mean += out_buf[r * 8 + c]; }
         row_mean /= 8.0f;
         NNOPS_EXPECT_NEAR(row_mean, 0.0f, 1e-3f);
 

@@ -187,7 +187,7 @@ NNOPS_TEST(reduce_2d_axis0_mean) {
 NNOPS_TEST(reduce_2d_keepdims) {
     const int64_t shape[] = {3, 4};
     float in_data[12] = {};
-    for (int i = 0; i < 12; ++i) in_data[i] = static_cast<float>(i + 1);
+    for (int i = 0; i < 12; ++i) { in_data[i] = static_cast<float>(i + 1); }
     const int64_t out_shape[] = {3, 1};
     float out_data[3] = {0};
 
@@ -234,8 +234,9 @@ NNOPS_TEST(reduce_negative_axis) {
     reduce(input, output2, attrs2);
 
     // Results should be identical
-    for (int i = 0; i < 12; ++i)
+    for (int i = 0; i < 12; ++i) {
         NNOPS_EXPECT_NEAR(out1[i], out2[i], 1e-6f);
+    }
 }
 
 // ============================================================
@@ -283,7 +284,7 @@ NNOPS_TEST(reduce_random_sum) {
 
     for (int r = 0; r < 5; ++r) {
         float expected = 0.0f;
-        for (int c = 0; c < 8; ++c) expected += in_vec[r * 8 + c];
+        for (int c = 0; c < 8; ++c) { expected += in_vec[r * 8 + c]; }
         NNOPS_EXPECT_NEAR(out_buf[r], expected, 1e-4f);
     }
 }
@@ -301,8 +302,9 @@ NNOPS_TEST(reduce_random_max) {
 
     for (int c = 0; c < 10; ++c) {
         float expected = -std::numeric_limits<float>::infinity();
-        for (int r = 0; r < 3; ++r)
-            if (in_vec[r * 10 + c] > expected) expected = in_vec[r * 10 + c];
+        for (int r = 0; r < 3; ++r) {
+            if (in_vec[r * 10 + c] > expected) { expected = in_vec[r * 10 + c]; }
+        }
         NNOPS_EXPECT_NEAR(out_buf[c], expected, 1e-6f);
     }
 }
@@ -320,8 +322,9 @@ NNOPS_TEST(reduce_random_min) {
 
     for (int c = 0; c < 7; ++c) {
         float expected = std::numeric_limits<float>::infinity();
-        for (int r = 0; r < 4; ++r)
-            if (in_vec[r * 7 + c] < expected) expected = in_vec[r * 7 + c];
+        for (int r = 0; r < 4; ++r) {
+            if (in_vec[r * 7 + c] < expected) { expected = in_vec[r * 7 + c]; }
+        }
         NNOPS_EXPECT_NEAR(out_buf[c], expected, 1e-6f);
     }
 }
@@ -339,7 +342,7 @@ NNOPS_TEST(reduce_random_mean) {
 
     for (int r = 0; r < 6; ++r) {
         float sum = 0.0f;
-        for (int c = 0; c < 5; ++c) sum += in_vec[r * 5 + c];
+        for (int c = 0; c < 5; ++c) { sum += in_vec[r * 5 + c]; }
         NNOPS_EXPECT_NEAR(out_buf[r], sum / 5.0f, 1e-4f);
     }
 }
@@ -364,8 +367,9 @@ NNOPS_TEST(reduce_3d_middle_axis) {
     for (int i = 0; i < 2; ++i) {
         for (int k = 0; k < 4; ++k) {
             float expected = 0.0f;
-            for (int j = 0; j < 3; ++j)
+            for (int j = 0; j < 3; ++j) {
                 expected += in_vec[i * 12 + j * 4 + k];
+            }
             NNOPS_EXPECT_NEAR(out_buf[i * 4 + k], expected, 1e-4f);
         }
     }
@@ -387,8 +391,9 @@ NNOPS_TEST(reduce_3d_first_axis) {
     for (int j = 0; j < 2; ++j) {
         for (int k = 0; k < 5; ++k) {
             float sum = 0.0f;
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < 3; ++i) {
                 sum += in_vec[i * 10 + j * 5 + k];
+            }
             NNOPS_EXPECT_NEAR(out_buf[j * 5 + k], sum / 3.0f, 1e-4f);
         }
     }

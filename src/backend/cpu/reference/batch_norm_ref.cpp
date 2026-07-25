@@ -97,7 +97,7 @@ void batch_norm_ref(const BatchNormAttributes& attrs,
         if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, spatial_total, body);
         } else {
-            for (int64_t i = 0; i < spatial_total; ++i) body(i);
+            for (int64_t i = 0; i < spatial_total; ++i) { body(i); }
         }
     } else {
         // Non-spatial: per-element statistics (scale/bias/mean/var have same shape as X)
@@ -113,7 +113,7 @@ void batch_norm_ref(const BatchNormAttributes& attrs,
         if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, total, body);
         } else {
-            for (int64_t i = 0; i < total; ++i) body(i);
+            for (int64_t i = 0; i < total; ++i) { body(i); }
         }
     }
 }

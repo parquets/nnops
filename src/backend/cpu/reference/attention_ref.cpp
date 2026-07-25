@@ -149,7 +149,7 @@ void attention_ref(const AttentionAttributes& attrs,
                 float sum = 0.0f;
                 for (int64_t j = 0; j < Sk; ++j) {
                     float attn = scores[i * Sk + j];
-                    if (std::isinf(attn) || std::isnan(attn)) continue;
+                    if (std::isinf(attn) || std::isnan(attn)) { continue; }
                     float vv = read_elem(v_ptr, b, h, j, d, v_row_stride, merged_heads);
                     sum += attn * vv;
                 }

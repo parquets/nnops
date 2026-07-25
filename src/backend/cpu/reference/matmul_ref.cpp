@@ -56,10 +56,12 @@ void matmul_ref(const MatMulAttributes& attrs,
     std::vector<int64_t> batch_b_shape(batch_ndim, 1);
     std::vector<int64_t> batch_out_shape(batch_ndim, 1);
 
-    for (int64_t i = 0; i < batch_a_dims; ++i)
+    for (int64_t i = 0; i < batch_a_dims; ++i) {
         batch_a_shape[batch_ndim - batch_a_dims + i] = a.shape(i);
-    for (int64_t i = 0; i < batch_b_dims; ++i)
+    }
+    for (int64_t i = 0; i < batch_b_dims; ++i) {
         batch_b_shape[batch_ndim - batch_b_dims + i] = b.shape(i);
+    }
 
     int64_t total_batch = 1;
     for (int64_t i = 0; i < batch_ndim; ++i) {

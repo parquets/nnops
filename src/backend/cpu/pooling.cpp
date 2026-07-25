@@ -74,15 +74,15 @@ inline void pooling_scalar_row(
             bool any = false;
             for (int64_t kd = 0; kd < KD; ++kd) {
                 const int64_t id = od * SD + kd * DD - PD;
-                if (id < 0 || id >= ID) continue;
+                if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
                     const int64_t ih = oh * SH + kh * DH - PH;
-                    if (ih < 0 || ih >= IH) continue;
+                    if (ih < 0 || ih >= IH) { continue; }
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         const int64_t iw = ow * SW + kw * DW - PW;
-                        if (iw < 0 || iw >= IW) continue;
+                        if (iw < 0 || iw >= IW) { continue; }
                         const float val = s_load(&input[id * in_d_stride + ih * in_row_stride + iw]);
-                        if (val > max_val) max_val = val;
+                        if (val > max_val) { max_val = val; }
                         any = true;
                     }
                 }
@@ -127,13 +127,13 @@ inline void pooling_scalar_row(
             const float fp = static_cast<float>(p_norm);
             for (int64_t kd = 0; kd < KD; ++kd) {
                 const int64_t id = od * SD + kd * DD - PD;
-                if (id < 0 || id >= ID) continue;
+                if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
                     const int64_t ih = oh * SH + kh * DH - PH;
-                    if (ih < 0 || ih >= IH) continue;
+                    if (ih < 0 || ih >= IH) { continue; }
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         const int64_t iw = ow * SW + kw * DW - PW;
-                        if (iw < 0 || iw >= IW) continue;
+                        if (iw < 0 || iw >= IW) { continue; }
                         sum += std::pow(
                             std::abs(s_load(&input[id * in_d_stride + ih * in_row_stride + iw])), fp);
                     }
@@ -456,14 +456,14 @@ void pooling_impl(const PoolingAttributes& attrs,
     //   end = v_max(ceil((I + P - ((K-1)*D + 1)) / S), beg)
 
     auto compute_beg = [](int64_t pad, int64_t stride) -> int64_t {
-        if (stride <= 0) return 0;
+        if (stride <= 0) { return 0; }
         return static_cast<int64_t>(
             std::ceil(static_cast<float>(pad) / static_cast<float>(stride)));
     };
 
     auto compute_end = [](int64_t input_extent, int64_t pad, int64_t kernel_extent,
                            int64_t stride, int64_t beg) -> int64_t {
-        if (stride <= 0) return input_extent;
+        if (stride <= 0) { return input_extent; }
         const float kernel_span = static_cast<float>(kernel_extent);
         const float num = static_cast<float>(input_extent) + static_cast<float>(pad) - kernel_span;
         return std::max(static_cast<int64_t>(

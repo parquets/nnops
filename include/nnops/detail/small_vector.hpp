@@ -110,9 +110,9 @@ public:
 
     // ---- Comparison ----
     constexpr bool operator==(const SmallVector& other) const noexcept {
-        if (size_ != other.size_) return false;
+        if (size_ != other.size_) { return false; }
         for (size_t i = 0; i < size_; ++i) {
-            if (storage_[i] != other.storage_[i]) return false;
+            if (storage_[i] != other.storage_[i]) { return false; }
         }
         return true;
     }

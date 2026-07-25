@@ -22,7 +22,7 @@ void unary_impl_ref(const UnaryAttributes& attrs,
 {
     const auto& input = inputs[0];
     const int64_t total = input.numel();
-    if (total == 0) return;
+    if (total == 0) { return; }
     NNOPS_ASSERT(output.numel() == total);
 
     const auto* in_ptr  = input.ptr<T>();

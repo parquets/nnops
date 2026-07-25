@@ -24,7 +24,7 @@ void softmax_ref(const SoftmaxAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     // Compute outer size and axis stride
@@ -73,7 +73,7 @@ void softmax_ref(const SoftmaxAttributes& attrs,
             float max_val = -FLT_MAX;
             for (int64_t k = 0; k < D; ++k) {
                 float v = in_ptr[base + k * axis_elems + inner_off];
-                if (v > max_val) max_val = v;
+                if (v > max_val) { max_val = v; }
             }
 
             // Step 2: Compute sum of exp(x - max)

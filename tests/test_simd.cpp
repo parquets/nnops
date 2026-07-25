@@ -73,8 +73,9 @@ NNOPS_TEST(simd_scalar_f32x4_load_store) {
     scal::v_f32x4 v = scal::v_load_f32x4(in);
     scal::v_store(out, v);
 
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_NEAR(out[i], in[i], 1e-6f);
+    }
 
     // Unaligned load/v_store (offset by 1 float from aligned boundary)
     float buf[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -82,16 +83,17 @@ NNOPS_TEST(simd_scalar_f32x4_load_store) {
     scal::v_f32x4 vu = scal::v_load_f32x4(buf + 1);
     float out2[4] = {0};
     scal::v_store(out2, vu);
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_NEAR(out2[i], in[i], 1e-6f);
+    }
 }
 
 NNOPS_TEST(simd_scalar_f32x4_set_constants) {
     scal::v_f32x4 z = scal::v_zero_f32x4();
-    for (int i = 0; i < 4; ++i) NNOPS_EXPECT_NEAR(z[i], 0.0f, 1e-6f);
+    for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_NEAR(z[i], 0.0f, 1e-6f); }
 
     scal::v_f32x4 s = scal::v_set1_f32x4(3.14f);
-    for (int i = 0; i < 4; ++i) NNOPS_EXPECT_NEAR(s[i], 3.14f, 1e-6f);
+    for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_NEAR(s[i], 3.14f, 1e-6f); }
 }
 
 NNOPS_TEST(simd_scalar_f32x4_arithmetic) {
@@ -206,8 +208,9 @@ NNOPS_TEST(simd_scalar_f32x8_load_store) {
     float out[8] = {0};
     scal::v_f32x8 v = scal::v_load_f32x8(in);
     scal::v_store(out, v);
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(out[i], float(i+1), 1e-6f);
+    }
 }
 
 NNOPS_TEST(simd_scalar_f32x8_arithmetic) {
@@ -332,8 +335,9 @@ NNOPS_TEST(simd_platform_f32x4_sqrt_matches_scalar) {
     v_store(plat, v_sqrt(pv));
     scal::v_store(scal_out, scal::v_sqrt(sv));
 
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_NEAR(plat[i], scal_out[i], 1e-3f);  // SIMD v_sqrt may use approximations
+    }
 }
 
 NNOPS_TEST(simd_platform_f32x4_reduce_matches_scalar) {
@@ -363,20 +367,23 @@ NNOPS_TEST(simd_platform_f32x8_matches_scalar) {
     // v_add
     v_store(plat, v_add(pa, pb));
     scal::v_store(scal_out, scal::v_add(sa, sb));
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(plat[i], scal_out[i], 1e-5f);
+    }
 
     // v_mul
     v_store(plat, v_mul(pa, pb));
     scal::v_store(scal_out, scal::v_mul(sa, sb));
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(plat[i], scal_out[i], 1e-5f);
+    }
 
     // v_fmadd
     v_store(plat, v_fmadd(pa, pb, pa));
     scal::v_store(scal_out, scal::v_fmadd(sa, sb, sa));
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(plat[i], scal_out[i], 1e-5f);
+    }
 }
 
 // ============================================================
@@ -425,8 +432,9 @@ NNOPS_TEST(simd_edge_subnormal) {
     NNOPS_EXPECT_NEAR(v_mul[0], 2.0e-40f, 1e-45f);
 
     scal::v_f32x4 v_sub = scal::v_sub(a, a);
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_NEAR(v_sub[i], 0.0f, 1e-45f);
+    }
 }
 
 // ============================================================
@@ -475,19 +483,20 @@ NNOPS_TEST(simd_f16_conversion_special_values) {
 
 NNOPS_TEST(simd_scalar_f16x8_load_store) {
     uint16_t in[8];
-    for (int i = 0; i < 8; ++i) in[i] = scal::f32_to_f16(float(i + 1));
+    for (int i = 0; i < 8; ++i) { in[i] = scal::f32_to_f16(float(i + 1)); }
     uint16_t out[8] = {0};
 
     scal::v_f16x8 v = scal::v_load_f16x8(in);
     scal::v_store(out, v);
 
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_EQ(out[i], in[i]);
+    }
 }
 
 NNOPS_TEST(simd_scalar_f16x8_arithmetic) {
     uint16_t raw[8];
-    for (int i = 0; i < 8; ++i) raw[i] = scal::f32_to_f16(float(i + 1));
+    for (int i = 0; i < 8; ++i) { raw[i] = scal::f32_to_f16(float(i + 1)); }
     scal::v_f16x8 a = scal::v_load_f16x8(raw);
     scal::v_f16x8 b = scal::v_set1_f16x8(2.0f);
 
@@ -506,13 +515,14 @@ NNOPS_TEST(simd_scalar_f16x8_fma) {
     scal::v_f16x8 c = scal::v_set1_f16x8(1.0f);
 
     scal::v_f32x8 r_f32 = scal::v_cvt_f16_to_f32(scal::v_fmadd(a, b, c));
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(r_f32[i], 7.0f, 0.01f);
+    }
 }
 
 NNOPS_TEST(simd_scalar_f16x8_reduce_sum) {
     uint16_t raw[8];
-    for (int i = 0; i < 8; ++i) raw[i] = scal::f32_to_f16(float(i + 1));
+    for (int i = 0; i < 8; ++i) { raw[i] = scal::f32_to_f16(float(i + 1)); }
     scal::v_f16x8 a = scal::v_load_f16x8(raw);
 
     float sum = scal::v_reduce_sum(a);
@@ -537,23 +547,23 @@ NNOPS_TEST(simd_platform_f16x8_matches_scalar) {
     // v_add
     v_store(plat, v_add(pa, pb));
     scal::v_store(sbuf, scal::v_add(sa, sb));
-    for (int i = 0; i < 8; ++i) NNOPS_EXPECT_EQ(plat[i], sbuf[i]);
+    for (int i = 0; i < 8; ++i) { NNOPS_EXPECT_EQ(plat[i], sbuf[i]); }
 
     // v_mul
     v_store(plat, v_mul(pa, pb));
     scal::v_store(sbuf, scal::v_mul(sa, sb));
-    for (int i = 0; i < 8; ++i) NNOPS_EXPECT_EQ(plat[i], sbuf[i]);
+    for (int i = 0; i < 8; ++i) { NNOPS_EXPECT_EQ(plat[i], sbuf[i]); }
 
     // v_fmadd
     v_store(plat, v_fmadd(pa, pb, pa));
     scal::v_store(sbuf, scal::v_fmadd(sa, sb, sa));
-    for (int i = 0; i < 8; ++i) NNOPS_EXPECT_EQ(plat[i], sbuf[i]);
+    for (int i = 0; i < 8; ++i) { NNOPS_EXPECT_EQ(plat[i], sbuf[i]); }
 }
 
 NNOPS_TEST(simd_platform_f16x8_cvt_matches_scalar) {
     float a_vals[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
     uint16_t ah[8];
-    for (int i = 0; i < 8; ++i) ah[i] = scal::f32_to_f16(a_vals[i]);
+    for (int i = 0; i < 8; ++i) { ah[i] = scal::f32_to_f16(a_vals[i]); }
 
     v_f16x8 pv = v_load_f16x8(ah);
     scal::v_f16x8 sv = scal::v_load_f16x8(ah);
@@ -562,8 +572,9 @@ NNOPS_TEST(simd_platform_f16x8_cvt_matches_scalar) {
     float plat[8], scal_out[8];
     v_store(plat, v_cvt_f16_to_f32(pv));
     scal::v_store(scal_out, scal::v_cvt_f16_to_f32(sv));
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(plat[i], scal_out[i], 1e-5f);
+    }
 }
 
 // ============================================================

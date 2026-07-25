@@ -87,7 +87,7 @@ static void naive_gemm_packed(T* C, int ldc,
 /// Fill an array with a linear ramp: v[i] = T(start + i).
 template <typename T>
 static void fill_ramp(T* data, int n, float start = 0.0f) {
-    for (int i = 0; i < n; ++i) data[i] = T(start + float(i));
+    for (int i = 0; i < n; ++i) { data[i] = T(start + float(i)); }
 }
 
 /// Convert f16_t to float (platform-neutral).
@@ -163,48 +163,60 @@ NNOPS_TEST(pack_f32_trans_n6_n8_smoke) {
 NNOPS_TEST(pack_f32_copy_n4) {
     constexpr int N = 4, ir_step = 6, K = 13;  // covers SIMD (K/4) + scalar tail
     std::vector<float> input(K * ir_step);
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < ir_step; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < ir_step; ++n) {
             input[k * ir_step + n] = float(k * 100 + n);
+        }
+    }
 
     std::vector<float> output(N * K);
     pack_copy_n4_f32(output.data(), input.data(), ir_step, K, 1.0f);
 
     // Copy layout: output[k * N + n] = input[k * ir_step + n]
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
             NNOPS_EXPECT_NEAR(output[k * N + n], input[k * ir_step + n], 1e-6f);
+        }
+    }
 }
 
 NNOPS_TEST(pack_f32_copy_n8_scale) {
     constexpr int N = 8, ir_step = 12, K = 9;
     float scale = 2.0f;
     std::vector<float> input(K * ir_step);
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < ir_step; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < ir_step; ++n) {
             input[k * ir_step + n] = float(k * 100 + n);
+        }
+    }
 
     std::vector<float> output(N * K);
     pack_copy_n8_f32(output.data(), input.data(), ir_step, K, scale);
 
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
             NNOPS_EXPECT_NEAR(output[k * N + n], input[k * ir_step + n] * scale, 1e-6f);
+        }
+    }
 }
 
 NNOPS_TEST(pack_f32_copy_n16) {
     constexpr int N = 16, ir_step = 20, K = 5;
     std::vector<float> input(K * ir_step);
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < ir_step; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < ir_step; ++n) {
             input[k * ir_step + n] = float(k * 100 + n);
+        }
+    }
 
     std::vector<float> output(N * K);
     pack_copy_n16_f32(output.data(), input.data(), ir_step, K, 1.0f);
 
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
             NNOPS_EXPECT_NEAR(output[k * N + n], input[k * ir_step + n], 1e-6f);
+        }
+    }
 }
 
 // =========================================================================
@@ -228,8 +240,9 @@ static void test_mma_pack_f32(
     mma(C_mma.data(), N, A.data(), B_packed.data(), N, K, clamp_min, clamp_max);
     naive_gemm_packed(C_ref.data(), N, A.data(), B_packed.data(), N, M, N, K);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C_mma[i], C_ref[i], 1e-4f);
+    }
 }
 
 NNOPS_TEST(mma_pack_f32_1x1)  { test_mma_pack_f32(mma_pack_1x1_f32,  1, 1,  7); }
@@ -252,14 +265,15 @@ NNOPS_TEST(mma_pack_f32_clamp) {
     float B_packed[K * N];
     float C[M * N] = {};
 
-    for (int i = 0; i < M * K; ++i) A[i] = 2.0f;
-    for (int i = 0; i < K * N; ++i) B_packed[i] = 1.0f;
+    for (int i = 0; i < M * K; ++i) { A[i] = 2.0f; }
+    for (int i = 0; i < K * N; ++i) { B_packed[i] = 1.0f; }
 
     mma_pack_4x8_f32(C, N, A, B_packed, N, K, 2.0f, 5.0f);
 
     // A×B = 2*1+2*1+2*1 = 6 per element → clamped to 5.0
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], 5.0f, 1e-4f);
+    }
 }
 
 // =========================================================================
@@ -283,8 +297,9 @@ static void test_mma_direct_f32(
     mma(C_mma.data(), N, A.data(), K, B.data(), N, K, clamp_min, clamp_max);
     naive_gemm(C_ref.data(), N, A.data(), K, B.data(), N, M, N, K);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C_mma[i], C_ref[i], 1e-4f);
+    }
 }
 
 NNOPS_TEST(mma_direct_f32_1x1)  { test_mma_direct_f32(mma_direct_1x1_f32,  1, 1,  7); }
@@ -314,9 +329,11 @@ NNOPS_TEST(mma_f32_pack_vs_direct) {
 
     // Fill B identically
     fill_ramp(B.data(), K * N, 0.5f);
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
             B_packed[k * N + n] = B[k * N + n];
+        }
+    }
 
     // Fill A with same values in both layouts
     for (int m = 0; m < M; ++m) {
@@ -330,8 +347,9 @@ NNOPS_TEST(mma_f32_pack_vs_direct) {
     mma_pack_4x8_f32(C_pack.data(), N, A_pack.data(), B_packed.data(), N, K, -1e9f, 1e9f);
     mma_direct_4x8_f32(C_direct.data(), N, A_direct.data(), K, B.data(), N, K, -1e9f, 1e9f);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C_pack[i], C_direct[i], 1e-4f);
+    }
 }
 
 // =========================================================================
@@ -342,7 +360,7 @@ NNOPS_TEST(pack_f16_trans_smoke) {
     constexpr int N = 4, ir_step = 16, K = 13;
     constexpr int buf_size = (K - 1) * ir_step + N;
     std::vector<f16_t> input(buf_size);
-    for (int i = 0; i < buf_size; ++i) input[i] = f_to_f16(1.0f);
+    for (int i = 0; i < buf_size; ++i) { input[i] = f_to_f16(1.0f); }
     std::vector<f16_t> output(N * K);
 
     pack_trans_n4_f16(output.data(), input.data(), ir_step, K, 1.0f);
@@ -359,15 +377,18 @@ NNOPS_TEST(pack_f16_copy_n8) {
     std::vector<f16_t> input(K * ir_step);
     std::vector<f16_t> output(N * K);
 
-    for (int i = 0; i < K * ir_step; ++i)
+    for (int i = 0; i < K * ir_step; ++i) {
         input[i] = f_to_f16(float(i) * 0.1f);
+    }
 
     pack_copy_n8_f16(output.data(), input.data(), ir_step, K, 1.0f);
 
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
             NNOPS_EXPECT_NEAR(f16_to_f(output[k * N + n]),
                               f16_to_f(input[k * ir_step + n]), 0.01f);
+        }
+    }
 }
 
 // =========================================================================
@@ -384,19 +405,20 @@ static void test_mma_pack_f16(
     std::vector<f16_t> C_mma(M * N);
     std::vector<float>  C_ref_f32(M * N);
 
-    for (int i = 0; i < M * K; ++i) A[i] = f_to_f16(1.0f + 0.1f * float(i));
-    for (int i = 0; i < K * N; ++i) B_packed[i] = f_to_f16(0.5f + 0.1f * float(i));
+    for (int i = 0; i < M * K; ++i) { A[i] = f_to_f16(1.0f + 0.1f * float(i)); }
+    for (int i = 0; i < K * N; ++i) { B_packed[i] = f_to_f16(0.5f + 0.1f * float(i)); }
 
     mma(C_mma.data(), N, A.data(), B_packed.data(), N, K, -1e4f, 1e4f);
 
     // Build float versions and compute reference
     std::vector<float> A_f32(M * K), B_f32(K * N);
-    for (int i = 0; i < M * K; ++i) A_f32[i] = f16_to_f(A[i]);
-    for (int i = 0; i < K * N; ++i) B_f32[i] = f16_to_f(B_packed[i]);
+    for (int i = 0; i < M * K; ++i) { A_f32[i] = f16_to_f(A[i]); }
+    for (int i = 0; i < K * N; ++i) { B_f32[i] = f16_to_f(B_packed[i]); }
     naive_gemm_packed(C_ref_f32.data(), N, A_f32.data(), B_f32.data(), N, M, N, K);
 
-    for (int i = 0; i < M * N; ++i)
-        NNOPS_EXPECT_NEAR(f16_to_f(C_mma[i]), C_ref_f32[i], 0.5f);  // f16 tolerance
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(f16_to_f(C_mma[i]), C_ref_f32[i], 0.5f);
+    }  // f16 tolerance
 }
 
 NNOPS_TEST(mma_pack_f16_1x1)  { test_mma_pack_f16(mma_pack_1x1_f16,  1, 1,  7); }
@@ -418,8 +440,9 @@ NNOPS_TEST(mma_pack_f16_clamp) {
     mma_pack_4x8_f16(C.data(), N, A.data(), B_packed.data(), N, K, 2.0f, 5.0f);
 
     // 2*1+2*1+2*1 = 6 → clamped to 5.0
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(f16_to_f(C[i]), 5.0f, 0.1f);
+    }
 }
 
 // =========================================================================
@@ -436,18 +459,19 @@ static void test_mma_direct_f16(
     std::vector<f16_t> C_mma(M * N);
     std::vector<float>  C_ref_f32(M * N);
 
-    for (int i = 0; i < M * K; ++i) A[i] = f_to_f16(1.0f + 0.1f * float(i));
-    for (int i = 0; i < K * N; ++i) B[i] = f_to_f16(0.5f + 0.1f * float(i));
+    for (int i = 0; i < M * K; ++i) { A[i] = f_to_f16(1.0f + 0.1f * float(i)); }
+    for (int i = 0; i < K * N; ++i) { B[i] = f_to_f16(0.5f + 0.1f * float(i)); }
 
     mma(C_mma.data(), N, A.data(), K, B.data(), N, K, -1e4f, 1e4f);
 
     std::vector<float> A_f32(M * K), B_f32(K * N);
-    for (int i = 0; i < M * K; ++i) A_f32[i] = f16_to_f(A[i]);
-    for (int i = 0; i < K * N; ++i) B_f32[i] = f16_to_f(B[i]);
+    for (int i = 0; i < M * K; ++i) { A_f32[i] = f16_to_f(A[i]); }
+    for (int i = 0; i < K * N; ++i) { B_f32[i] = f16_to_f(B[i]); }
     naive_gemm(C_ref_f32.data(), N, A_f32.data(), K, B_f32.data(), N, M, N, K);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(f16_to_f(C_mma[i]), C_ref_f32[i], 0.5f);
+    }
 }
 
 NNOPS_TEST(mma_direct_f16_1x1)  { test_mma_direct_f16(mma_direct_1x1_f16,  1, 1,  7); }
@@ -474,10 +498,12 @@ NNOPS_TEST(mma_f16_pack_vs_direct) {
     std::vector<f16_t> C_direct(M * N);
 
     // Fill B identically
-    for (int i = 0; i < K * N; ++i) B[i] = f_to_f16(0.5f + 0.1f * float(i));
-    for (int k = 0; k < K; ++k)
-        for (int n = 0; n < N; ++n)
+    for (int i = 0; i < K * N; ++i) { B[i] = f_to_f16(0.5f + 0.1f * float(i)); }
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
             B_packed[k * N + n] = B[k * N + n];
+        }
+    }
 
     // Fill A with same values in both layouts
     for (int m = 0; m < M; ++m) {
@@ -491,8 +517,9 @@ NNOPS_TEST(mma_f16_pack_vs_direct) {
     mma_pack_4x8_f16(C_pack.data(), N, A_pack.data(), B_packed.data(), N, K, -1e4f, 1e4f);
     mma_direct_4x8_f16(C_direct.data(), N, A_direct.data(), K, B.data(), N, K, -1e4f, 1e4f);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(f16_to_f(C_pack[i]), f16_to_f(C_direct[i]), 0.1f);
+    }
 }
 
 // =========================================================================
@@ -517,8 +544,9 @@ NNOPS_TEST(mma_f32_accumulation) {
     std::vector<float> C_expected = C_init;
     naive_gemm_packed(C_expected.data(), N, A, B_packed, N, M, N, K);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_expected[i], 1e-4f);
+    }
 }
 
 // =========================================================================
@@ -537,6 +565,7 @@ NNOPS_TEST(mma_f32_zero_a) {
 
     mma_pack_4x8_f32(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
 
-    for (int i = 0; i < M * N; ++i)
+    for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_saved[i], 1e-6f);
+    }
 }

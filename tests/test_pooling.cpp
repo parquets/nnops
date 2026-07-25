@@ -161,7 +161,7 @@ NNOPS_TEST(pooling_3d_max_basic) {
 
     // Two depth slices, each 4x4
     std::vector<float> in_buf(2 * 4 * 4);
-    for (int i = 0; i < 32; ++i) in_buf[i] = static_cast<float>(i + 1);
+    for (int i = 0; i < 32; ++i) { in_buf[i] = static_cast<float>(i + 1); }
     std::vector<float> out_buf(4, 0.0f);
 
     TensorView input(ishape, DataType::f32, in_buf.data());
@@ -255,12 +255,12 @@ static void ref_pooling_2d_max(
             bool any = false;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 int64_t ih = oh * SH + kh - PH;
-                if (ih < 0 || ih >= IH) continue;
+                if (ih < 0 || ih >= IH) { continue; }
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     int64_t iw = ow * SW + kw - PW;
-                    if (iw < 0 || iw >= IW) continue;
+                    if (iw < 0 || iw >= IW) { continue; }
                     float val = in_ch[ih * IW + iw];
-                    if (val > max_val) max_val = val;
+                    if (val > max_val) { max_val = val; }
                     any = true;
                 }
             }
@@ -290,10 +290,10 @@ static void ref_pooling_2d_avg(
             float sum = 0.0f;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 int64_t ih = oh * SH + kh - PH;
-                if (ih < 0 || ih >= IH) continue;
+                if (ih < 0 || ih >= IH) { continue; }
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     int64_t iw = ow * SW + kw - PW;
-                    if (iw < 0 || iw >= IW) continue;
+                    if (iw < 0 || iw >= IW) { continue; }
                     sum += in_ch[ih * IW + iw];
                 }
             }
@@ -411,7 +411,7 @@ NNOPS_TEST(pooling_simd_max_add_to) {
     std::vector<float> ref_buf(1 * 2 * 6 * 6);
 
     // Fill initial output with known values
-    for (auto& v : initial_buf) v = 0.5f;
+    for (auto& v : initial_buf) { v = 0.5f; }
     out_buf = initial_buf;
     ref_buf = initial_buf;
 
@@ -549,15 +549,15 @@ NNOPS_TEST(pooling_simd_3d_max_vs_ref) {
             bool any = false;
             for (int64_t kd = 0; kd < KD; ++kd) {
                 int64_t id = od + kd;
-                if (id < 0 || id >= ID) continue;
+                if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
                     int64_t ih = oh + kh;
-                    if (ih < 0 || ih >= IH) continue;
+                    if (ih < 0 || ih >= IH) { continue; }
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         int64_t iw = ow + kw;
-                        if (iw < 0 || iw >= IW) continue;
+                        if (iw < 0 || iw >= IW) { continue; }
                         float val = in_ch[id * IH * IW + ih * IW + iw];
-                        if (val > max_val) max_val = val;
+                        if (val > max_val) { max_val = val; }
                         any = true;
                     }
                 }
@@ -606,13 +606,13 @@ NNOPS_TEST(pooling_simd_3d_avg_vs_ref) {
             float sum = 0.0f;
             for (int64_t kd = 0; kd < KD; ++kd) {
                 int64_t id = od + kd;
-                if (id < 0 || id >= ID) continue;
+                if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
                     int64_t ih = oh + kh;
-                    if (ih < 0 || ih >= IH) continue;
+                    if (ih < 0 || ih >= IH) { continue; }
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         int64_t iw = ow + kw;
-                        if (iw < 0 || iw >= IW) continue;
+                        if (iw < 0 || iw >= IW) { continue; }
                         sum += in_ch[id * IH * IW + ih * IW + iw];
                     }
                 }
@@ -706,10 +706,10 @@ NNOPS_TEST(pooling_simd_lp_vs_ref) {
             float sum = 0.0f;
             for (int64_t kh = 0; kh < KH; ++kh) {
                 int64_t ih = oh * 2 + kh;
-                if (ih < 0 || ih >= IH) continue;
+                if (ih < 0 || ih >= IH) { continue; }
                 for (int64_t kw = 0; kw < KW; ++kw) {
                     int64_t iw = ow * 2 + kw;
-                    if (iw < 0 || iw >= IW) continue;
+                    if (iw < 0 || iw >= IW) { continue; }
                     sum += std::pow(std::abs(in_ch[ih * IW + iw]), static_cast<float>(P));
                 }
             }
@@ -756,15 +756,15 @@ NNOPS_TEST(pooling_simd_3d_padding) {
             bool any = false;
             for (int64_t kd = 0; kd < KD; ++kd) {
                 int64_t id = od + kd - 1;  // PD=1
-                if (id < 0 || id >= ID) continue;
+                if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
                     int64_t ih = oh + kh;
-                    if (ih < 0 || ih >= IH) continue;
+                    if (ih < 0 || ih >= IH) { continue; }
                     for (int64_t kw = 0; kw < KW; ++kw) {
                         int64_t iw = ow + kw;
-                        if (iw < 0 || iw >= IW) continue;
+                        if (iw < 0 || iw >= IW) { continue; }
                         float val = in_ch[id * IH * IW + ih * IW + iw];
-                        if (val > max_val) max_val = val;
+                        if (val > max_val) { max_val = val; }
                         any = true;
                     }
                 }

@@ -34,7 +34,7 @@ void unary_impl(const UnaryAttributes& attrs,
 {
     const auto& input = inputs[0];
     const int64_t total = input.numel();
-    if (total == 0) return;
+    if (total == 0) { return; }
 
     const int64_t rank = input.rank();
     NNOPS_ASSERT(output.numel() == total);

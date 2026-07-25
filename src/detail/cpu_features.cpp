@@ -118,7 +118,7 @@ void CpuFeatures::detect() {
                        static_cast<int>(ecx), static_cast<int>(edx)};
     #endif
         int cache_type = info[0] & 0x1F;
-        if (cache_type == 0) break;  // no more caches
+        if (cache_type == 0) { break; }  // no more caches
 
         int cache_level = (info[0] >> 5) & 0x7;
         // type 1 = data cache, type 3 = unified cache
@@ -178,12 +178,13 @@ void CpuFeatures::detect() {
                     char* end = nullptr;
                     unsigned long val = std::strtoul(buf, &end, 10);
                     if (end != buf && val > 0) {
-                        if (*end == 'K' || *end == 'k')
+                        if (*end == 'K' || *end == 'k') {
                             val *= 1024;
-                        else if (*end == 'M' || *end == 'm')
+                        } else if (*end == 'M' || *end == 'm') {
                             val *= 1024 * 1024;
-                        else if (*end == 'G' || *end == 'g')
+                        } else if (*end == 'G' || *end == 'g') {
                             val *= 1024 * 1024 * 1024;
+                        }
                         l2_cache_size_ = static_cast<size_t>(val);
                     }
                 }

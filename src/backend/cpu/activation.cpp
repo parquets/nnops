@@ -35,7 +35,7 @@ void activation_impl(const ActivationAttributes& attrs,
 {
     const auto& input = inputs[0];
     const int64_t total = input.numel();
-    if (total == 0) return;
+    if (total == 0) { return; }
 
     const int64_t rank = input.rank();
 

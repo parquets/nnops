@@ -24,7 +24,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t dim = input.shape(axis);

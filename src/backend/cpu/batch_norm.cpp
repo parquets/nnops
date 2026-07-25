@@ -127,7 +127,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
         if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, N, compute_sample);
         } else {
-            for (int64_t n = 0; n < N; ++n) compute_sample(n);
+            for (int64_t n = 0; n < N; ++n) { compute_sample(n); }
         }
     } else {
         // ---- Non-spatial mode: per-element statistics ----

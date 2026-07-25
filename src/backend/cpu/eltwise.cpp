@@ -33,7 +33,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
     const auto& A = inputs[0];
     const auto& B = inputs[1];
     const int64_t total = A.numel();
-    if (total == 0) return;
+    if (total == 0) { return; }
 
     const int64_t rank = A.rank();
     NNOPS_ASSERT(A.numel() == B.numel());

@@ -51,7 +51,7 @@ struct WelfordStats {
 };
 
 inline void welford_merge(WelfordStats& a, const WelfordStats& b) {
-    if (b.n == 0) return;
+    if (b.n == 0) { return; }
     if (a.n == 0) { a = b; return; }
     const int64_t total = a.n + b.n;
     const float delta = b.mean - a.mean;
@@ -136,7 +136,7 @@ void layer_norm_general_scalar(
     if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_rows, process_row);
     } else {
-        for (int64_t i = 0; i < num_rows; ++i) process_row(i);
+        for (int64_t i = 0; i < num_rows; ++i) { process_row(i); }
     }
 }
 
@@ -161,7 +161,7 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     // Number of rows and norm_size per row
@@ -256,7 +256,7 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
                 stats.mean = simd_sum / static_cast<float>(simd_count);
                 stats.M2 = simd_sum_sq - simd_sum * simd_sum / static_cast<float>(simd_count);
                 // Guard against tiny negative M2 from rounding
-                if (stats.M2 < 0.0f) stats.M2 = 0.0f;
+                if (stats.M2 < 0.0f) { stats.M2 = 0.0f; }
             }
         }
 

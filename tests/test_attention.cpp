@@ -89,9 +89,9 @@ NNOPS_TEST(attention_multi_head) {
     std::vector<float> out_buf(8);
 
     // Identity-like Q and K (each head gets its own subspace)
-    for (int i = 0; i < 8; ++i) q_buf[i] = (i % 3 == 0) ? 1.0f : 0.0f;
-    for (int i = 0; i < 8; ++i) k_buf[i] = q_buf[i];
-    for (int i = 0; i < 8; ++i) v_buf[i] = static_cast<float>(i + 1);
+    for (int i = 0; i < 8; ++i) { q_buf[i] = (i % 3 == 0) ? 1.0f : 0.0f; }
+    for (int i = 0; i < 8; ++i) { k_buf[i] = q_buf[i]; }
+    for (int i = 0; i < 8; ++i) { v_buf[i] = static_cast<float>(i + 1); }
 
     TensorView Q(qshape, DataType::f32, q_buf.data());
     TensorView K(kshape, DataType::f32, k_buf.data());

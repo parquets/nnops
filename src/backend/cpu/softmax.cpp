@@ -45,7 +45,7 @@ float reduce_max_vec(const T* type_tag, const auto& vmax) {
     float best = -std::numeric_limits<float>::infinity();
     for (int k = 0; k < simd_lane_for<T>; ++k) {
         float x = s_load(&tmp[k]);
-        if (x > best) best = x;
+        if (x > best) { best = x; }
     }
     (void)type_tag; // used only for overload resolution
     return best;
@@ -89,7 +89,7 @@ void softmax_general_scalar(
         for (int64_t i = 0; i < norm_size; ++i) {
             int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
             float x = s_load(&x_ptr[off]);
-            if (x > max_val) max_val = x;
+            if (x > max_val) { max_val = x; }
         }
 
         // ---- Pass 2: sum of exp(x - max) ----
@@ -121,7 +121,7 @@ void softmax_general_scalar(
     if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_rows, process_row);
     } else {
-        for (int64_t i = 0; i < num_rows; ++i) process_row(i);
+        for (int64_t i = 0; i < num_rows; ++i) { process_row(i); }
     }
 }
 
@@ -146,7 +146,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     // Number of rows and norm_size per row
@@ -215,7 +215,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         // Scalar tail for max reduction
         for (; i < D; ++i) {
             float x = s_load(&x_ptr[row_off + i]);
-            if (x > max_val) max_val = x;
+            if (x > max_val) { max_val = x; }
         }
 
         const float neg_max = -max_val;

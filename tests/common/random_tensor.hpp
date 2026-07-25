@@ -68,7 +68,7 @@ make_random_tensor(std::span<const int64_t> shape,
                    uint64_t seed = 12345)
 {
     int64_t numel = 1;
-    for (int64_t d : shape) numel *= d;
+    for (int64_t d : shape) { numel *= d; }
 
     std::vector<float> data(static_cast<size_t>(numel));
     XorShift128 rng(seed);

@@ -194,10 +194,11 @@ void matmul_kernel(const MatMulAttributes& attrs,
         return;
     }
 
-    if (a.data_type() == DataType::f16)
+    if (a.data_type() == DataType::f16) {
         matmul_kernel_f16(attrs, output, inputs, workspace);
-    else
+    } else {
         matmul_kernel_f32(attrs, output, inputs, workspace);
+    }
 }
 
 }  // namespace nnops::backend::cpu

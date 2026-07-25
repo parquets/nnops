@@ -163,95 +163,95 @@ inline v_f32x8 v_load_f32x8(const float* p) {
     return v_f32x8(p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
 }
 inline void v_store(float* p, const v_f32x8& a) {
-    for (int i = 0; i < 8; ++i) p[i] = a[i];
+    for (int i = 0; i < 8; ++i) { p[i] = a[i]; }
 }
 inline v_f32x8 v_set1_f32x8(float s)  { return v_f32x8(s); }
 inline v_f32x8 v_zero_f32x8()         { return v_f32x8(0.0f); }
 
 inline v_f32x8 v_add(const v_f32x8& a, const v_f32x8& b) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = a[i] + b[i];
+    for (int i = 0; i < 8; ++i) { r[i] = a[i] + b[i]; }
     return r;
 }
 inline v_f32x8 v_sub(const v_f32x8& a, const v_f32x8& b) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = a[i] - b[i];
+    for (int i = 0; i < 8; ++i) { r[i] = a[i] - b[i]; }
     return r;
 }
 inline v_f32x8 v_mul(const v_f32x8& a, const v_f32x8& b) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = a[i] * b[i];
+    for (int i = 0; i < 8; ++i) { r[i] = a[i] * b[i]; }
     return r;
 }
 inline v_f32x8 v_div(const v_f32x8& a, const v_f32x8& b) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = a[i] / b[i];
+    for (int i = 0; i < 8; ++i) { r[i] = a[i] / b[i]; }
     return r;
 }
 inline v_f32x8 v_fmadd(const v_f32x8& a, const v_f32x8& b, const v_f32x8& c) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = a[i] * b[i] + c[i];
+    for (int i = 0; i < 8; ++i) { r[i] = a[i] * b[i] + c[i]; }
     return r;
 }
 
 inline v_f32x8 v_min(const v_f32x8& a, const v_f32x8& b) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::min(a[i], b[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::min(a[i], b[i]); }
     return r;
 }
 inline v_f32x8 v_max(const v_f32x8& a, const v_f32x8& b) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::max(a[i], b[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::max(a[i], b[i]); }
     return r;
 }
 inline v_f32x8 v_sqrt(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::sqrt(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::sqrt(a[i]); }
     return r;
 }
 inline v_f32x8 v_exp(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::exp(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::exp(a[i]); }
     return r;
 }
 inline v_f32x8 v_log(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::log(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::log(a[i]); }
     return r;
 }
 inline v_f32x8 v_sin(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::sin(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::sin(a[i]); }
     return r;
 }
 inline v_f32x8 v_cos(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::cos(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::cos(a[i]); }
     return r;
 }
 inline v_f32x8 v_tan(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::tan(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::tan(a[i]); }
     return r;
 }
 inline v_f32x8 v_tanh(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::tanh(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::tanh(a[i]); }
     return r;
 }
 inline v_f32x8 v_abs(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = std::abs(a[i]);
+    for (int i = 0; i < 8; ++i) { r[i] = std::abs(a[i]); }
     return r;
 }
 inline v_f32x8 v_neg(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = -a[i];
+    for (int i = 0; i < 8; ++i) { r[i] = -a[i]; }
     return r;
 }
 inline v_f32x8 v_rcp(const v_f32x8& a) {
     v_f32x8 r;
-    for (int i = 0; i < 8; ++i) r[i] = 1.0f / a[i];
+    for (int i = 0; i < 8; ++i) { r[i] = 1.0f / a[i]; }
     return r;
 }
 inline v_f32x8 v_and(const v_f32x8& a, const v_f32x8& b) {
@@ -279,7 +279,7 @@ inline v_f32x8 v_or(const v_f32x8& a, const v_f32x8& b) {
 
 inline float v_reduce_sum(const v_f32x8& a) {
     float s = 0.0f;
-    for (int i = 0; i < 8; ++i) s += a[i];
+    for (int i = 0; i < 8; ++i) { s += a[i]; }
     return s;
 }
 
@@ -402,7 +402,7 @@ inline v_f16x8 v_load_f16x8(const uint16_t* p) {
     return v_f16x8(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
 }
 inline void v_store(uint16_t* p, const v_f16x8& a) {
-    for (int i = 0; i < 8; ++i) p[i] = a.bits[i];
+    for (int i = 0; i < 8; ++i) { p[i] = a.bits[i]; }
 }
 inline v_f16x8 v_set1_f16x8(float s) {
     uint16_t h = f32_to_f16(s);
@@ -430,106 +430,122 @@ inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
 
 inline v_f16x8 v_add(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(f16_to_f32(a.bits[i]) + f16_to_f32(b.bits[i]));
+    }
     return r;
 }
 inline v_f16x8 v_sub(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(f16_to_f32(a.bits[i]) - f16_to_f32(b.bits[i]));
+    }
     return r;
 }
 inline v_f16x8 v_mul(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(f16_to_f32(a.bits[i]) * f16_to_f32(b.bits[i]));
+    }
     return r;
 }
 inline v_f16x8 v_div(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(f16_to_f32(a.bits[i]) / f16_to_f32(b.bits[i]));
+    }
     return r;
 }
 inline v_f16x8 v_fmadd(const v_f16x8& a, const v_f16x8& b, const v_f16x8& c) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(f16_to_f32(a.bits[i]) * f16_to_f32(b.bits[i]) + f16_to_f32(c.bits[i]));
+    }
     return r;
 }
 inline v_f16x8 v_min(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::min(f16_to_f32(a.bits[i]), f16_to_f32(b.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_max(const v_f16x8& a, const v_f16x8& b) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::max(f16_to_f32(a.bits[i]), f16_to_f32(b.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_abs(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = a.bits[i] & 0x7FFFu;  // clear sign bit
+    }
     return r;
 }
 inline v_f16x8 v_neg(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = a.bits[i] ^ 0x8000u;  // flip sign bit
+    }
     return r;
 }
 inline v_f16x8 v_sqrt(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::sqrt(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 
 inline float v_reduce_sum(const v_f16x8& a) {
     float s = 0.0f;
-    for (int i = 0; i < 8; ++i) s += f16_to_f32(a.bits[i]);
+    for (int i = 0; i < 8; ++i) { s += f16_to_f32(a.bits[i]); }
     return s;
 }
 
 // Transcendental math for v_f16x8
 inline v_f16x8 v_exp(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::exp(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_log(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::log(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_sin(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::sin(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_cos(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::cos(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_tan(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::tan(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 inline v_f16x8 v_tanh(const v_f16x8& a) {
     v_f16x8 r;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         r.bits[i] = f32_to_f16(std::tanh(f16_to_f32(a.bits[i])));
+    }
     return r;
 }
 

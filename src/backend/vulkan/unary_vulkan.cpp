@@ -58,7 +58,7 @@ void unary_vulkan(
 {
     const auto& input = inputs[0];
     const int64_t total = input.numel();
-    if (total == 0) return;
+    if (total == 0) { return; }
 
     // ---- Select SPIR-V blob based on data type ----
     const auto dtype = input.data_type();

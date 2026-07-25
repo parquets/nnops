@@ -52,10 +52,10 @@ inline float depthwise_elem(const T* input,
     float sum = bias_val;
     for (int64_t kh = 0; kh < KH; ++kh) {
         const int64_t ih = oh * SH + kh * DH - PH;
-        if (ih < 0 || ih >= IH) continue;
+        if (ih < 0 || ih >= IH) { continue; }
         for (int64_t kw = 0; kw < KW; ++kw) {
             const int64_t iw = ow * SW + kw * DW - PW;
-            if (iw < 0 || iw >= IW) continue;
+            if (iw < 0 || iw >= IW) { continue; }
             sum += s_load(&input[ih * ih_step + iw * iw_step]) * s_load(&weight[kh * KW + kw]);
         }
     }
@@ -169,7 +169,7 @@ inline void dwconv_h1_simd(T* output,
 
         for (int64_t kh = 0; kh < KH; ++kh) {
             const int64_t ih = oh * SH + kh * DH - PH;
-            if (ih < 0 || ih >= IH) continue;
+            if (ih < 0 || ih >= IH) { continue; }
 
             for (int64_t kw = 0; kw < KW; ++kw) {
                 const float kval = s_load(&weight[kh * KW + kw]);

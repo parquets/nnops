@@ -44,7 +44,7 @@ float reduce_max_vec(const T* /*type_tag*/, const auto& vmax) {
     float best = -std::numeric_limits<float>::infinity();
     for (int k = 0; k < simd_lane_for<T>; ++k) {
         float x = s_load(&tmp[k]);
-        if (x > best) best = x;
+        if (x > best) { best = x; }
     }
     return best;
 }
@@ -57,7 +57,7 @@ float reduce_min_vec(const T* /*type_tag*/, const auto& vmin) {
     float best = std::numeric_limits<float>::infinity();
     for (int k = 0; k < simd_lane_for<T>; ++k) {
         float x = s_load(&tmp[k]);
-        if (x < best) best = x;
+        if (x < best) { best = x; }
     }
     return best;
 }
@@ -74,7 +74,7 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
 
     const int64_t num_rows = [&]() {
         int64_t n = 1;
-        for (int64_t d = 0; d < axis; ++d) n *= input.shape(d);
+        for (int64_t d = 0; d < axis; ++d) { n *= input.shape(d); }
         return n;
     }();
     const int64_t norm_size = input.shape(axis);
@@ -95,36 +95,41 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
         case ReduceType::Sum:
         case ReduceType::Mean: {
             auto v_sum = v_zero(x_ptr);
-            for (; i + L <= norm_size; i += L)
+            for (; i + L <= norm_size; i += L) {
                 v_sum = v_add(v_sum, v_load(x_row + i));
+            }
             float sum = v_reduce_sum(v_sum);
-            for (; i < norm_size; ++i)
+            for (; i < norm_size; ++i) {
                 sum += s_load(&x_row[i]);
-            if (attrs.type == ReduceType::Mean)
+            }
+            if (attrs.type == ReduceType::Mean) {
                 sum /= static_cast<float>(norm_size);
+            }
             s_store(&y_ptr[row], sum);
             break;
         }
         case ReduceType::Max: {
             auto v_best = v_set1(x_ptr, -std::numeric_limits<float>::infinity());
-            for (; i + L <= norm_size; i += L)
+            for (; i + L <= norm_size; i += L) {
                 v_best = v_max(v_best, v_load(x_row + i));
+            }
             float best = reduce_max_vec(x_ptr, v_best);
             for (; i < norm_size; ++i) {
                 float x = s_load(&x_row[i]);
-                if (x > best) best = x;
+                if (x > best) { best = x; }
             }
             s_store(&y_ptr[row], best);
             break;
         }
         case ReduceType::Min: {
             auto v_best = v_set1(x_ptr, std::numeric_limits<float>::infinity());
-            for (; i + L <= norm_size; i += L)
+            for (; i + L <= norm_size; i += L) {
                 v_best = v_min(v_best, v_load(x_row + i));
+            }
             float best = reduce_min_vec(x_ptr, v_best);
             for (; i < norm_size; ++i) {
                 float x = s_load(&x_row[i]);
-                if (x < best) best = x;
+                if (x < best) { best = x; }
             }
             s_store(&y_ptr[row], best);
             break;
@@ -132,10 +137,11 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_rows, process_row);
-    else
-        for (int64_t row = 0; row < num_rows; ++row) process_row(row);
+    } else {
+        for (int64_t row = 0; row < num_rows; ++row) { process_row(row); }
+    }
 }
 
 }  // anonymous namespace
@@ -155,7 +161,7 @@ void reduce_cpu(const ReduceAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
 
     // Only handle contiguous tail (axis == rank-1) in SIMD.
     // Non-contiguous axis → reference.

@@ -54,7 +54,7 @@ void eltwise_vulkan(
     const auto& A = inputs[0];
     const auto& B = inputs[1];
     const int64_t total = A.numel();
-    if (total == 0) return;
+    if (total == 0) { return; }
     NNOPS_ASSERT(A.numel() == B.numel());
 
     // ---- Select SPIR-V blob based on data type ----

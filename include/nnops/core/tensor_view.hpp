@@ -137,7 +137,7 @@ public:
 
     /// Total number of elements (product of all dimensions).
     int64_t numel() const noexcept {
-        if (rank_ == 0) return 0;
+        if (rank_ == 0) { return 0; }
         int64_t n = 1;
         for (int64_t i = 0; i < rank_; ++i) {
             n *= shape_[static_cast<size_t>(i)];
@@ -175,11 +175,11 @@ public:
     int64_t stride_elems(int64_t dim) const noexcept {
         NNOPS_ASSERT(dim >= 0 && dim < rank_);
         // Innermost dimension: always contiguous (stride = 1 element)
-        if (dim == rank_ - 1) return 1;
+        if (dim == rank_ - 1) { return 1; }
         // Second-innermost: stride comes from pitch (may be > shape[rank-1] if padded)
         const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype_));
         int64_t s = pitch_ / elem_size;
-        if (dim == rank_ - 2) return s;
+        if (dim == rank_ - 2) { return s; }
         // Outer dimensions: accumulate via shape[i+1] * stride(i+1)
         for (int64_t i = rank_ - 3; i >= dim; --i) {
             s = shape_[static_cast<size_t>(i + 1)] * s;
@@ -190,7 +190,7 @@ public:
     /// Convenience: number of elements per row (stride of the 2nd-innermost dim).
     /// Equivalent to stride_elems(rank() - 2) for rank >= 2, or 1 for rank < 2.
     int64_t row_stride_elems() const noexcept {
-        if (rank_ < 2) return 1;
+        if (rank_ < 2) { return 1; }
         return pitch_ / static_cast<int64_t>(data_type_size(dtype_));
     }
 

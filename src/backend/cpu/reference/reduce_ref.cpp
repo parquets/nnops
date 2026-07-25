@@ -27,7 +27,7 @@ void reduce_ref(const ReduceAttributes& attrs,
 
     // Normalize axis
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t norm_size = in_shape[axis];
@@ -37,12 +37,12 @@ void reduce_ref(const ReduceAttributes& attrs,
     // Number of independent output elements (outer dims only)
     const int64_t num_outer = [&]() {
         int64_t n = 1;
-        for (int64_t d = 0; d < axis; ++d) n *= in_shape[d];
+        for (int64_t d = 0; d < axis; ++d) { n *= in_shape[d]; }
         return n;
     }();
     const int64_t num_inner = [&]() {
         int64_t n = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) n *= in_shape[d];
+        for (int64_t d = axis + 1; d < rank; ++d) { n *= in_shape[d]; }
         return n;
     }();
 
@@ -79,7 +79,7 @@ void reduce_ref(const ReduceAttributes& attrs,
                 float best = -std::numeric_limits<float>::infinity();
                 for (int64_t k = 0; k < norm_size; ++k) {
                     float v = x_outer[inner + k * axis_stride];
-                    if (v > best) best = v;
+                    if (v > best) { best = v; }
                 }
                 result = best;
                 break;
@@ -88,7 +88,7 @@ void reduce_ref(const ReduceAttributes& attrs,
                 float best = std::numeric_limits<float>::infinity();
                 for (int64_t k = 0; k < norm_size; ++k) {
                     float v = x_outer[inner + k * axis_stride];
-                    if (v < best) best = v;
+                    if (v < best) { best = v; }
                 }
                 result = best;
                 break;
@@ -102,7 +102,7 @@ void reduce_ref(const ReduceAttributes& attrs,
     if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_outer, process_outer);
     } else {
-        for (int64_t i = 0; i < num_outer; ++i) process_outer(i);
+        for (int64_t i = 0; i < num_outer; ++i) { process_outer(i); }
     }
 }
 
