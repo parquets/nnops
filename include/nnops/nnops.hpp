@@ -26,3 +26,4 @@
 #include "nnops/ops/layer_norm.hpp"
 #include "nnops/ops/rms_norm.hpp"
 #include "nnops/ops/conv3d.hpp"
+#include "nnops/ops/resize.hpp"

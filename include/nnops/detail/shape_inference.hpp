@@ -413,4 +413,34 @@ inline std::vector<TensorDesc> reduce_output_shape(
     return {out};
 }
 
+/// Resize shape inference (2D / 3D auto-detected from input rank).
+/// inputs[0] = input [N, C, (D,) H, W]
+/// Returns: [N, C, (OD,) OH, OW]
+/// output_size has 3 elements [OD, OH, OW]; for 2D (rank=4), only [OH, OW] are used.
+inline std::vector<TensorDesc> resize_output_shape(
+    std::span<const int64_t> output_size,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+    const int64_t rank = in.rank;
+    const int64_t srank = rank - 2;  // spatial rank: 2 or 3
+
+    TensorDesc out;
+    out.rank   = rank;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(static_cast<size_t>(rank));
+    out.dims[0] = in.dims[0];  // N
+    out.dims[1] = in.dims[1];  // C
+
+    // output_size is [OD, OH, OW]; for 2D, skip the first element
+    const int64_t os_offset = (srank == 2) ? 1 : 0;
+    for (int64_t d = 0; d < srank; ++d) {
+        out.dims[static_cast<size_t>(2 + d)] = output_size[static_cast<size_t>(os_offset + d)];
+    }
+
+    return {out};
+}
+
 }  // namespace nnops

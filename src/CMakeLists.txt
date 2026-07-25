@@ -21,6 +21,7 @@ set(NNOPS_CPU_SOURCES
     ops/eltwise.cpp
     ops/unary.cpp
     ops/reduce.cpp
+    ops/resize.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -36,6 +37,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/eltwise.cpp
     backend/cpu/unary.cpp
     backend/cpu/reduce.cpp
+    backend/cpu/resize.cpp
 
     # CPU tiled GEMM dispatch (platform-abstracted over x86_64 / aarch64 micro-kernels)
     backend/cpu/imatmul.cpp
@@ -60,6 +62,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/eltwise_ref.cpp
     backend/cpu/reference/unary_ref.cpp
     backend/cpu/reference/reduce_ref.cpp
+    backend/cpu/reference/resize_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

@@ -24,6 +24,7 @@ enum class OpType : uint8_t {
     Eltwise         = 13,
     Unary           = 14,
     Reduce          = 15,
+    Resize          = 16,
 };
 
 }  // namespace nnops
