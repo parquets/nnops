@@ -172,7 +172,7 @@ void reduce_cuda_impl(
     const ComputeContext& ctx)
 {
     const int64_t rank = input.rank();
-    int64_t axis = attrs.axes[0];
+    int64_t axis = attrs.axis;
     if (axis < 0) axis += rank;
 
     const int64_t outer_dim_count = [&]() {
@@ -243,8 +243,6 @@ void reduce_cuda(const ReduceAttributes& attrs,
     const auto& input = inputs[0];
 
     // CUDA supports single-axis reduction only
-    NNOPS_ASSERT(attrs.axes.size() == 1);
-
     switch (input.data_type()) {
     case DataType::f32:
         reduce_cuda_impl<float>(attrs, output, input, ctx);

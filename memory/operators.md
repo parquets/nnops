@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-22T16:20:36.782Z
+  modified: 2026-07-25T02:45:03.094Z
 ---
 
 # Implemented Operators
@@ -41,9 +41,46 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Added:** 2026-07-21
 - **Note:** Same Impl/Pimpl pattern as Conv2D. Follows the 2D→3D upgrade pattern established by [[#Pooling]].
 
-## Activation
+## DepthwiseConv2D
 
-- **Files:** `include/nnops/ops/activation.hpp`, `src/ops/activation.cpp`, `src/backend/cpu/activation.cpp`, `src/backend/cpu/reference/activation_ref.cpp`
+- **Files:** `include/nnops/ops/depthwise_conv2d.hpp`, `src/ops/depthwise_conv2d.cpp`, `src/backend/cpu/depthwise_conv2d.cpp`, `src/backend/cpu/reference/depthwise_conv2d_ref.cpp`, `src/backend/cuda/depthwise_conv2d.cu`
+- **Attributes:** `DepthwiseConv2DAttributes` — kernel_size[2], stride[2], dilation[2], padding[2], epilogue, add_to
+- **Input:** `[N, C, IH, IW]`, weight `[C, 1, KH, KW]`, optional bias `[C]`
+- **Output:** `[N, C, OH, OW]` (NCHW layout)
+- **Formula:** Per-channel convolution — each input channel is convolved with its own independent KH×KW filter. No cross-channel mixing.
+- **CPU SIMD Kernel** (`src/backend/cpu/depthwise_conv2d.cpp`): Height-4 blocking (process 4 output rows simultaneously to reuse kernel weights), width SIMD via `simd_lane_for<T>` (8 lanes), region splitting (pad regions → scalar, interior → SIMD), kernel weight pre-load into registers, N×C parallel via `cpu_parallel_for`. Falls back to reference when SIMD unavailable.
+- **Data types:** f32 and f16 (templated `depthwise_conv2d_impl<T>`, dtype dispatch at entry)
+- **CUDA Kernel** ([depthwise_conv2d.cu](src/backend/cuda/depthwise_conv2d.cu)): Grid = N×C blocks, one per (sample, channel). Epilogue fusion via `device_apply_epilogue()` supporting all 8 activation types. Handles stride, dilation, padding. Optional bias. Supports add_to.
+- **Design reference:** nn_compute depthwise_conv (h4 blocking + w8 SIMD), onnxruntime MLAS sconv_nchw_depthwise (3×3 kernel specialization), ARM ComputeLibrary NEDepthwiseConvolutionLayer (stride/dilation handling)
+- **Added:** 2026-07-20 (CPU reference), 2026-07-23 (CPU SIMD + CUDA)
+
+## Eltwise
+
+- **Files:** `include/nnops/ops/eltwise.hpp`, `src/ops/eltwise.cpp`, `src/backend/cpu/eltwise.cpp`, `src/backend/cpu/reference/eltwise_ref.cpp`, `src/backend/cuda/eltwise.cu`
+- **Types:** Add, Sub, Mul, Div
+- **Attributes:** `EltwiseAttributes` — type, add_to
+- **Input (2):** A `[*]`, B `[*]` (same shape and dtype)
+- **Output:** C `[*]` (same shape and dtype)
+- **Formula:** `C[i] = A[i] op B[i]` for op ∈ {+, −, ×, ÷}
+- **SIMD Kernel** (`src/backend/cpu/eltwise.cpp`): Row-by-row pitch-aware processing with `simd_lane_for<T>` (8) wide SIMD + scalar tail. Uses generic API (`v_load`/`v_store`/`s_load`/`s_store`) to support both float and half in one code path. All 4 operations vectorized. Branch on op type hoisted outside row loop; add_to checked inside loop body.
+- **Data types:** f32 and f16 (templated `eltwise_impl<T>`, dtype dispatch at entry)
+- **CUDA Kernel** ([eltwise.cu](src/backend/cuda/eltwise.cu)): Flat grid-stride loop, single kernel with `switch` on `EltwiseType` containing the inner loop for each operation. Supports add_to.
+- **Added:** 2026-07-24
+
+## Unary
+
+- **Files:** `include/nnops/ops/unary.hpp`, `src/ops/unary.cpp`, `src/backend/cpu/unary.cpp`, `src/backend/cpu/reference/unary_ref.cpp`, `src/backend/cuda/unary.cu`
+- **Types:** Exp, Log, Sin, Cos, Tan, Tanh, Abs, Neg, Sqrt
+- **Attributes:** `UnaryAttributes` — type (default: Exp), add_to
+- **Input (1):** X `[*]` (any shape)
+- **Output:** Y `[*]` (same shape and dtype)
+- **Formula:** `Y[i] = op(X[i])` for op ∈ {exp, ln, sin, cos, tan, tanh, abs, −, sqrt}
+- **SIMD Kernel** (`src/backend/cpu/unary.cpp`): Row-by-row pitch-aware processing with `simd_lane_for<T>` (8) wide SIMD + scalar tail. Uses generic API (`v_load`/`v_store`/`s_load`/`s_store`) to support both float and half. All 9 operations vectorized — transcendental ops (exp/log/sin/cos/tan/tanh) use SIMD intrinsics; algebraic ops (abs/neg/sqrt) use direct SIMD instructions. Branch on op type hoisted outside row loop; add_to checked inside loop body.
+- **Data types:** f32 and f16 (templated `unary_impl<T>`, dtype dispatch at entry)
+- **CUDA Kernel** ([unary.cu](src/backend/cuda/unary.cu)): Device function pointer dispatch via `get_unary_fn(UnaryType)` — returns `float (*)(float)` for each operation. Two launch strategies: `unary_flat_kernel` (grid-stride loop for rank ≤ 1) and `unary_kernel` (row-by-row pitch-aware for rank ≥ 2). Supports add_to.
+- **Added:** 2026-07-24 (CPU SIMD + CUDA); 2026-07-20 (CPU reference)
+
+## Activation
 - **Types:** Relu, LeakyRelu, Sigmoid, Tanh, Gelu, Silu, HardSwish, Elu
 - **Attributes:** `ActivationAttributes` — type, alpha, beta
 - **Data types:** f32 (v_f32x8) and f16 (v_f16x8) via single templated implementation `activation_impl<T>`
@@ -59,7 +96,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## Pooling
 
-- **Files:** `include/nnops/ops/pooling.hpp`, `src/ops/pooling.cpp`, `src/backend/cpu/reference/pooling_ref.cpp`
+- **Files:** `include/nnops/ops/pooling.hpp`, `src/ops/pooling.cpp`, `src/backend/cpu/reference/pooling_ref.cpp`, `src/backend/cuda/pooling.cu`
 - **Types:** Max, Average, AverageExcludePad, Lp
 - **Attributes:** `PoolingAttributes` — `std::array<int64_t, 3>` for kernel/stride/padding/dilation (layout: `[KD, KH, KW]`)
 - **Input:** 2D `[N, C, IH, IW]` or 3D `[N, C, ID, IH, IW]`
@@ -90,7 +127,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## BatchNorm
 
-- **Files:** `include/nnops/ops/batch_norm.hpp`, `src/ops/batch_norm.cpp`, `src/backend/cpu/batch_norm.cpp`, `src/backend/cpu/reference/batch_norm_ref.cpp`
+- **Files:** `include/nnops/ops/batch_norm.hpp`, `src/ops/batch_norm.cpp`, `src/backend/cpu/batch_norm.cpp`, `src/backend/cpu/reference/batch_norm_ref.cpp`, `src/backend/cuda/batch_norm.cu`
 - **Attributes:** `BatchNormAttributes` — epsilon (1e-5), spatial (true=per-channel shape [C], false=per-element), add_to
 - **Input (5):** X `[N, C, D1...]`, scale `[C]`, bias `[C]`, mean `[C]`, var `[C]`
 - **Output:** Y `[N, C, D1...]`
@@ -101,7 +138,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## LayerNorm
 
-- **Files:** `include/nnops/ops/layer_norm.hpp`, `src/ops/layer_norm.cpp`, `src/backend/cpu/layer_norm.cpp`, `src/backend/cpu/reference/layer_norm_ref.cpp`
+- **Files:** `include/nnops/ops/layer_norm.hpp`, `src/ops/layer_norm.cpp`, `src/backend/cpu/layer_norm.cpp`, `src/backend/cpu/reference/layer_norm_ref.cpp`, `src/backend/cuda/layer_norm.cu`
 - **Attributes:** `LayerNormAttributes` — axis (-1), epsilon (1e-5), add_to
 - **Input (2-3):** X `[*]`, scale `[norm_shape]`, optional bias `[norm_shape]`
 - **Output:** Y `[*]`
@@ -114,7 +151,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## RMSNorm
 
-- **Files:** `include/nnops/ops/rms_norm.hpp`, `src/ops/rms_norm.cpp`, `src/backend/cpu/rms_norm.cpp`, `src/backend/cpu/reference/rms_norm_ref.cpp`
+- **Files:** `include/nnops/ops/rms_norm.hpp`, `src/ops/rms_norm.cpp`, `src/backend/cpu/rms_norm.cpp`, `src/backend/cpu/reference/rms_norm_ref.cpp`, `src/backend/cuda/rms_norm.cu`
 - **Attributes:** `RMSNormAttributes` — axis (-1), epsilon (1e-5), add_to
 - **Input (2):** X `[*]`, scale `[norm_shape]`
 - **Output:** Y `[*]`
@@ -128,16 +165,43 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 
 ## Softmax
 
-- **Files:** `include/nnops/ops/softmax.hpp`, `src/ops/softmax.cpp`, `src/backend/cpu/softmax.cpp`, `src/backend/cpu/reference/softmax_ref.cpp`
-- **Attributes:** `SoftmaxAttributes` — axis (-1), log_softmax (false), add_to
+- **Files:** `include/nnops/ops/softmax.hpp`, `src/ops/softmax.cpp`, `src/backend/cpu/softmax.cpp`, `src/backend/cpu/reference/softmax_ref.cpp`, `src/backend/cuda/softmax.cu`
+- **Attributes:** `SoftmaxAttributes` — axis (-1), log_softmax (false)
 - **Input (1):** X `[*]` (any rank >= 1)
 - **Output:** Y `[*]` (same shape as input)
 - **Formula:** `softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))`, `log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))`
-- **Algorithm (per row, mirrors onnxruntime):** Three-stage pipeline — (1) ReduceMax: SIMD `v_max` reduction + scalar tail → max_val; (2) ComputeSumExp: SIMD `v_exp` on `(x - max)` + reduce sum, with exp values stored to output for reuse (avoids recomputing exp in softmax non-add_to path); (3) Normalize: softmax = exp/sum via SIMD multiply, or log_softmax = `(x - max) - log(sum)`. Fast path for axis == rank-1 (contiguous last dim, the 99% LLM attention case); general axis falls back to scalar path with pre-computed inner offsets.
+- **Algorithm (per row, mirrors onnxruntime):** Three-stage pipeline — (1) ReduceMax: SIMD `v_max` reduction + scalar tail → max_val; (2) ComputeSumExp: SIMD `v_exp` on `(x - max)` + reduce sum, with exp values stored to output for reuse (avoids recomputing exp in normalization pass); (3) Normalize: softmax = exp/sum via SIMD multiply, or log_softmax = `(x - max) - log(sum)`. Fast path for axis == rank-1 (contiguous last dim, the 99% LLM attention case); general axis falls back to scalar path with pre-computed inner offsets.
 - **SIMD Kernel** (`src/backend/cpu/softmax.cpp`): Templated `softmax_impl<T>`, dtype dispatch at entry. All three passes use the generic typed API (`v_load`/`v_store`/`v_max`/`v_exp`/`v_add`/`v_mul`/`v_set1`/`v_reduce_sum`/`s_load`/`s_store`). `reduce_max_vec` helper reduces SIMD max vector to scalar via temp store+scan (the SIMD layer has `v_reduce_sum` but no `v_reduce_max`). Parallel dispatch over num_rows via `cpu_parallel_for`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
 - **Data types:** f32 and f16
 - **Reference:** onnxruntime `MlasComputeSoftmax` / `MlasReduceMaximumF32Kernel` / `MlasComputeSumExpF32Kernel` / `MlasComputeSoftmaxOutputF32Kernel`
 - **Added:** 2026-07-22
+
+## CumSum
+
+- **Files:** `include/nnops/ops/cumsum.hpp`, `src/ops/cumsum.cpp`, `src/backend/cpu/reference/cumsum_ref.cpp`, `src/backend/cuda/cumsum.cu`
+- **Attributes:** `CumSumAttributes` — exclusive (false), reverse (false), axis (0)
+- **Input (1):** X `[*]` (any rank >= 1)
+- **Output:** Y `[*]` (same shape as input)
+- **Formula:** Inclusive: `output[i] = sum(input[0..i])`, Exclusive: `output[0] = 0, output[i] = sum(input[0..i-1])`. Reverse: sum from last element backward.
+- **Algorithm:** Tensor decomposed along axis into upper/lower dim groups. Each independent scan vector runs sequentially along axis. CPU reference uses `cpu_parallel_for` over upper slices. CUDA kernel uses one block per upper slice, one thread per lower-dim position, sequential scan per thread.
+- **Data types:** f32 and f16 (CPU reference f32 only; CUDA supports both)
+- **add_to:** Removed 2026-07-25 — this operator no longer supports output accumulation.
+- **Added:** 2026-07-20 (CPU reference), 2026-07-23 (CUDA)
+
+## Reduce
+
+- **Files:** `include/nnops/ops/reduce.hpp`, `src/ops/reduce.cpp`, `src/backend/cpu/reduce.cpp`, `src/backend/cpu/reference/reduce_ref.cpp`, `src/backend/cuda/reduce.cu`
+- **Types:** Sum, Min, Max, Mean
+- **Attributes:** `ReduceAttributes` — type (default: Sum), axis (int64_t, default: 0, negative wraps from end), keepdims (false)
+- **Input (1):** X `[*]` (any rank >= 1)
+- **Output:** Y `[*]` (axis collapsed, or size-1 if keepdims)
+- **Formula:** Sum=Σx, Mean=Σx/N, Max=max(x), Min=min(x) over specified axis
+- **Single-axis only.** No multi-axis or reduce-all support (2026-07-25 simplification).
+- **CPU SIMD** (`src/backend/cpu/reduce.cpp`): Fast path for contiguous tail (axis == rank-1). Sum/Mean via `v_reduce_sum`; Max/Min via `v_max`/`v_min` + store-scan. Non-contiguous axis → reference. Templated for f32/f16.
+- **CPU Reference** (`src/backend/cpu/reference/reduce_ref.cpp`): Outer/inner loop decomposition with axis stride. Handles any single axis including non-contiguous.
+- **CUDA** ([reduce.cu](src/backend/cuda/reduce.cu)): Single-axis, two-kernel pattern (fast contiguous + general with pre-computed offsets). Reuses `block_reduce_sum`/`block_reduce_max` plus `block_reduce_min` in [cuda_common.cuh](src/backend/cuda/cuda_common.cuh). Shared memory: block_size × sizeof(float). Mean = sum/N computed once per block.
+- **Data types:** f32 and f16 (SIMD + CUDA); f32 only (reference)
+- **Added:** 2026-07-25
 
 ## Operator Implementation Pattern
 
@@ -188,7 +252,8 @@ Not an operator per se, but the low-level building block for future optimized Ma
 
 ## add_to (Output Accumulation)
 
-All operators support `bool add_to{false}` in their Attributes. When true, the kernel adds its result to the existing output buffer instead of overwriting:
+Most operators support `bool add_to{false}` in their Attributes. When true, the kernel adds its result to the existing output buffer instead of overwriting.
+**Exceptions (removed 2026-07-25):** Softmax and CumSum no longer support add_to — their semantics don't benefit from output accumulation.
 
 ```
 add_to=false (default):  output[i]  = result

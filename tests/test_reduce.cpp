@@ -25,7 +25,7 @@ NNOPS_TEST(reduce_1d_sum) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     NNOPS_EXPECT_NEAR(out_data[0], 15.0f, 1e-6f);
@@ -41,7 +41,7 @@ NNOPS_TEST(reduce_1d_max) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Max;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     NNOPS_EXPECT_NEAR(out_data[0], 5.0f, 1e-6f);
@@ -57,7 +57,7 @@ NNOPS_TEST(reduce_1d_min) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Min;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     NNOPS_EXPECT_NEAR(out_data[0], 1.0f, 1e-6f);
@@ -73,7 +73,7 @@ NNOPS_TEST(reduce_1d_mean) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Mean;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     NNOPS_EXPECT_NEAR(out_data[0], 3.0f, 1e-6f);
@@ -90,7 +90,7 @@ NNOPS_TEST(reduce_1d_keepdims) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {0};
+    attrs.axis = 0;
     attrs.keepdims = true;
     reduce(input, output, attrs);
 
@@ -115,7 +115,7 @@ NNOPS_TEST(reduce_2d_axis0_sum) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     // Column sums: 1+5+9=15, 2+6+10=18, 3+7+11=21, 4+8+12=24
@@ -137,7 +137,7 @@ NNOPS_TEST(reduce_2d_axis1_max) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Max;
-    attrs.axes = {1};
+    attrs.axis = 1;
     reduce(input, output, attrs);
 
     NNOPS_EXPECT_NEAR(out_data[0], 5.0f, 1e-6f);
@@ -156,7 +156,7 @@ NNOPS_TEST(reduce_2d_axis1_min) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Min;
-    attrs.axes = {1};
+    attrs.axis = 1;
     reduce(input, output, attrs);
 
     NNOPS_EXPECT_NEAR(out_data[0], 1.0f, 1e-6f);
@@ -175,7 +175,7 @@ NNOPS_TEST(reduce_2d_axis0_mean) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Mean;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     // (1+4)/2=2.5, (2+5)/2=3.5, (3+6)/2=4.5
@@ -196,7 +196,7 @@ NNOPS_TEST(reduce_2d_keepdims) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {1};
+    attrs.axis = 1;
     attrs.keepdims = true;
     reduce(input, output, attrs);
 
@@ -207,74 +207,6 @@ NNOPS_TEST(reduce_2d_keepdims) {
     NNOPS_EXPECT_NEAR(out_data[0], 10.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(out_data[1], 26.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(out_data[2], 42.0f, 1e-6f);
-}
-
-// ============================================================
-// All-axes reduction (axes = empty)
-// ============================================================
-
-NNOPS_TEST(reduce_all_axes_sum) {
-    const int64_t shape[] = {2, 3, 4};
-    auto [in_vec, input] = test::make_random_tensor(shape, -1.0f, 1.0f, 42);
-
-    float out_data[1] = {0};
-    const int64_t out_shape[] = {1};
-    TensorView output(out_shape, DataType::f32, out_data);
-
-    ReduceAttributes attrs;
-    attrs.type = ReduceType::Sum;
-    // empty axes → reduce all
-    reduce(input, output, attrs);
-
-    // Compute expected sum
-    float expected = 0.0f;
-    for (float v : in_vec) expected += v;
-    NNOPS_EXPECT_NEAR(out_data[0], expected, 1e-4f);
-}
-
-NNOPS_TEST(reduce_all_axes_max) {
-    const int64_t shape[] = {2, 5};
-    auto [in_vec, input] = test::make_random_tensor(shape, -10.0f, 10.0f, 123);
-
-    float out_data[1] = {0};
-    const int64_t out_shape[] = {1};
-    TensorView output(out_shape, DataType::f32, out_data);
-
-    ReduceAttributes attrs;
-    attrs.type = ReduceType::Max;
-    reduce(input, output, attrs);
-
-    float expected = -std::numeric_limits<float>::infinity();
-    for (float v : in_vec) if (v > expected) expected = v;
-    NNOPS_EXPECT_NEAR(out_data[0], expected, 1e-6f);
-}
-
-// ============================================================
-// Multi-axis reduction
-// ============================================================
-
-NNOPS_TEST(reduce_multi_axis) {
-    const int64_t shape[] = {2, 3, 4};
-    auto [in_vec, input] = test::make_random_tensor(shape, -1.0f, 1.0f, 77);
-
-    // Reduce axes 0 and 2 → output shape = {3}
-    const int64_t out_shape[] = {3};
-    std::vector<float> out_buf(3);
-    TensorView output(out_shape, DataType::f32, out_buf.data());
-
-    ReduceAttributes attrs;
-    attrs.type = ReduceType::Sum;
-    attrs.axes = {0, 2};
-    reduce(input, output, attrs);
-
-    // Manual verification: for each middle dim, sum over first and last
-    for (int j = 0; j < 3; ++j) {
-        float expected = 0.0f;
-        for (int i = 0; i < 2; ++i)
-            for (int k = 0; k < 4; ++k)
-                expected += in_vec[i * 12 + j * 4 + k];
-        NNOPS_EXPECT_NEAR(out_buf[j], expected, 1e-4f);
-    }
 }
 
 // ============================================================
@@ -293,12 +225,12 @@ NNOPS_TEST(reduce_negative_axis) {
 
     ReduceAttributes attrs1;
     attrs1.type = ReduceType::Sum;
-    attrs1.axes = {2};  // last axis (positive)
+    attrs1.axis = 2;  // last axis (positive)
     reduce(input, output1, attrs1);
 
     ReduceAttributes attrs2;
     attrs2.type = ReduceType::Sum;
-    attrs2.axes = {-1};  // last axis (negative)
+    attrs2.axis = -1;  // last axis (negative)
     reduce(input, output2, attrs2);
 
     // Results should be identical
@@ -321,7 +253,7 @@ NNOPS_TEST(reduce_class_api) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Mean;
-    attrs.axes = {1};
+    attrs.axis = 1;
 
     // Functional API
     reduce(input, output1, attrs);
@@ -346,7 +278,7 @@ NNOPS_TEST(reduce_random_sum) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {1};
+    attrs.axis = 1;
     reduce(input, output, attrs);
 
     for (int r = 0; r < 5; ++r) {
@@ -364,7 +296,7 @@ NNOPS_TEST(reduce_random_max) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Max;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     for (int c = 0; c < 10; ++c) {
@@ -383,7 +315,7 @@ NNOPS_TEST(reduce_random_min) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Min;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     for (int c = 0; c < 7; ++c) {
@@ -402,7 +334,7 @@ NNOPS_TEST(reduce_random_mean) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Mean;
-    attrs.axes = {1};
+    attrs.axis = 1;
     reduce(input, output, attrs);
 
     for (int r = 0; r < 6; ++r) {
@@ -426,7 +358,7 @@ NNOPS_TEST(reduce_3d_middle_axis) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axes = {1};
+    attrs.axis = 1;
     reduce(input, output, attrs);
 
     for (int i = 0; i < 2; ++i) {
@@ -449,7 +381,7 @@ NNOPS_TEST(reduce_3d_first_axis) {
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Mean;
-    attrs.axes = {0};
+    attrs.axis = 0;
     reduce(input, output, attrs);
 
     for (int j = 0; j < 2; ++j) {

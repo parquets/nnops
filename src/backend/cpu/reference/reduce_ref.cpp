@@ -1,7 +1,7 @@
 /// @file reduce_ref.cpp
 /// @brief Reference (scalar) CPU implementation of the Reduce operator.
 ///
-/// Handles any number of axes (including empty = reduce all).
+/// Handles single-axis reduction only.
 /// Supports Sum, Min, Max, and Mean reduction types.
 /// Serves as the correctness baseline for SIMD and CUDA kernels.
 
@@ -15,36 +15,6 @@
 
 namespace nnops::backend::cpu::reference {
 
-namespace {
-
-/// Normalize negative axes to positive, sort ascending, and validate + deduplicate.
-void normalize_axes(detail::SmallVector<int64_t, 4>& axes, int64_t rank)
-{
-    for (auto& a : axes) {
-        if (a < 0) a += rank;
-        NNOPS_ASSERT(a >= 0 && a < rank);
-    }
-    std::sort(axes.begin(), axes.end());
-    // Deduplicate
-    size_t j = 0;
-    for (size_t i = 0; i < axes.size(); ++i) {
-        if (i == 0 || axes[i] != axes[i - 1])
-            axes[j++] = axes[i];
-    }
-    axes.resize(j);
-}
-
-/// Count total number of elements being reduced (for Mean).
-int64_t count_reduced_elements(std::span<const int64_t> input_shape,
-                                const detail::SmallVector<int64_t, 4>& axes)
-{
-    int64_t count = 1;
-    for (auto a : axes) count *= input_shape[a];
-    return count;
-}
-
-}  // anonymous namespace
-
 void reduce_ref(const ReduceAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
@@ -54,136 +24,85 @@ void reduce_ref(const ReduceAttributes& attrs,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
     const auto& in_shape = input.shape_span();
+
+    // Normalize axis
+    int64_t axis = attrs.axis;
+    if (axis < 0) axis += rank;
+    NNOPS_ASSERT(axis >= 0 && axis < rank);
+
+    const int64_t norm_size = in_shape[axis];
     const float* in_ptr = input.ptr<float>();
     float* out_ptr = output.ptr<float>();
 
-    // Normalize axes
-    auto axes = attrs.axes;
-    if (axes.empty()) {
-        axes.resize(rank);
-        for (int64_t d = 0; d < rank; ++d) axes[d] = d;
-    }
-    normalize_axes(axes, rank);
-
-    const int64_t num_reduced = static_cast<int64_t>(axes.size());
-    const int64_t reduced_count = count_reduced_elements(in_shape, axes);
-
-    // Compute the output shape and dimension mapping.
-    // Output layout: for each output flat index, expand to full-rank base
-    // index (reduced dims set to 0), then iterate over reduced dims.
-    const auto& out_shape = output.shape_span();
-    const int64_t out_rank = static_cast<int64_t>(out_shape.size());
-    const int64_t out_total = [&]() {
+    // Number of independent output elements (outer dims only)
+    const int64_t num_outer = [&]() {
         int64_t n = 1;
-        for (int64_t i = 0; i < out_rank; ++i) n *= out_shape[i];
+        for (int64_t d = 0; d < axis; ++d) n *= in_shape[d];
+        return n;
+    }();
+    const int64_t num_inner = [&]() {
+        int64_t n = 1;
+        for (int64_t d = axis + 1; d < rank; ++d) n *= in_shape[d];
         return n;
     }();
 
-    // Build input strides
-    std::vector<int64_t> in_strides(rank);
-    for (int64_t d = 0; d < rank; ++d)
-        in_strides[d] = input.stride_elems(d);
+    const int64_t outer_stride = input.stride_elems(axis > 0 ? axis - 1 : 0);
 
-    // Build "keepdims" mask: for each axis, is it reduced?
-    std::vector<bool> is_reduced(rank, false);
-    for (auto a : axes) is_reduced[a] = true;
+    // For non-contiguous axis where axis > 0: outer_stride accounts for axis dim.
+    // Inner elements are contiguous (axis is a single dim), so inner_stride = 1 for
+    // the elements within the inner dimension group.
 
-    // Build normalized strides (treat reduced dims as stride 1 for
-    // keepdims output) and shapes for the full-rank output representation.
-    std::vector<int64_t> full_out_strides(rank);
-    std::vector<int64_t> full_out_shape(rank);
-    for (int64_t d = 0; d < rank; ++d) {
-        full_out_shape[d] = is_reduced[d] ? int64_t(1) : in_shape[d];
-    }
-    full_out_strides[rank - 1] = 1;
-    for (int64_t d = rank - 2; d >= 0; --d)
-        full_out_strides[d] = full_out_strides[d + 1] * full_out_shape[d + 1];
+    auto process_outer = [&](int64_t outer) {
+        const float* x_outer = in_ptr + outer * outer_stride;
+        float* y_outer = out_ptr + outer * num_inner;
 
-    // For each output element (expanded to full rank with reduced dims = size 1),
-    // iterate over the Cartesian product of reduced axes.
-    auto process_out = [&](int64_t out_linear) {
-        // Decompose out_linear to full-rank index
-        std::vector<int64_t> base_idx(rank);
-        int64_t rem = out_linear;
-        for (int64_t d = 0; d < rank; ++d) {
-            base_idx[d] = (is_reduced[d]) ? int64_t(0) : rem / full_out_strides[d];
-            rem %= full_out_strides[d];
-        }
+        for (int64_t inner = 0; inner < num_inner; ++inner) {
+            // Stride along the reduction axis: distance between consecutive
+            // elements being reduced. For axis == rank-1 this is 1.
+            // For non-contiguous axes: inner dims stride = 1, axis dim stride
+            // needs to skip inner dims.
+            const int64_t axis_stride = num_inner;  // stride along the reduction axis
 
-        // Iterate over Cartesian product of reduced dims
-        std::vector<int64_t> counter(num_reduced, 0);
-        bool done = (num_reduced == 0);
-
-        float result;
-        switch (attrs.type) {
-        case ReduceType::Sum:
-        case ReduceType::Mean: {
-            double sum = 0.0;
-            while (!done) {
-                for (int64_t i = 0; i < num_reduced; ++i)
-                    base_idx[axes[i]] = counter[i];
-                int64_t off = 0;
-                for (int64_t d = 0; d < rank; ++d)
-                    off += base_idx[d] * in_strides[d];
-                sum += static_cast<double>(in_ptr[off]);
-                // Increment
-                done = true;
-                for (int64_t i = 0; i < num_reduced; ++i) {
-                    if (++counter[i] < in_shape[axes[i]]) { done = false; break; }
-                    counter[i] = 0;
+            float result;
+            switch (attrs.type) {
+            case ReduceType::Sum:
+            case ReduceType::Mean: {
+                double sum = 0.0;
+                for (int64_t k = 0; k < norm_size; ++k) {
+                    sum += static_cast<double>(x_outer[inner + k * axis_stride]);
                 }
+                result = static_cast<float>(
+                    attrs.type == ReduceType::Mean ? sum / static_cast<double>(norm_size) : sum);
+                break;
             }
-            result = static_cast<float>(
-                attrs.type == ReduceType::Mean ? sum / static_cast<double>(reduced_count) : sum);
-            break;
-        }
-        case ReduceType::Max: {
-            float best = -std::numeric_limits<float>::infinity();
-            while (!done) {
-                for (int64_t i = 0; i < num_reduced; ++i)
-                    base_idx[axes[i]] = counter[i];
-                int64_t off = 0;
-                for (int64_t d = 0; d < rank; ++d)
-                    off += base_idx[d] * in_strides[d];
-                float v = in_ptr[off];
-                if (v > best) best = v;
-                done = true;
-                for (int64_t i = 0; i < num_reduced; ++i) {
-                    if (++counter[i] < in_shape[axes[i]]) { done = false; break; }
-                    counter[i] = 0;
+            case ReduceType::Max: {
+                float best = -std::numeric_limits<float>::infinity();
+                for (int64_t k = 0; k < norm_size; ++k) {
+                    float v = x_outer[inner + k * axis_stride];
+                    if (v > best) best = v;
                 }
+                result = best;
+                break;
             }
-            result = best;
-            break;
-        }
-        case ReduceType::Min: {
-            float best = std::numeric_limits<float>::infinity();
-            while (!done) {
-                for (int64_t i = 0; i < num_reduced; ++i)
-                    base_idx[axes[i]] = counter[i];
-                int64_t off = 0;
-                for (int64_t d = 0; d < rank; ++d)
-                    off += base_idx[d] * in_strides[d];
-                float v = in_ptr[off];
-                if (v < best) best = v;
-                done = true;
-                for (int64_t i = 0; i < num_reduced; ++i) {
-                    if (++counter[i] < in_shape[axes[i]]) { done = false; break; }
-                    counter[i] = 0;
+            case ReduceType::Min: {
+                float best = std::numeric_limits<float>::infinity();
+                for (int64_t k = 0; k < norm_size; ++k) {
+                    float v = x_outer[inner + k * axis_stride];
+                    if (v < best) best = v;
                 }
+                result = best;
+                break;
             }
-            result = best;
-            break;
-        }
-        }
+            }
 
-        out_ptr[out_linear] = result;
+            y_outer[inner] = result;
+        }
     };
 
     if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, out_total, process_out);
+        ctx.cpu_parallel_for(0, num_outer, process_outer);
     } else {
-        for (int64_t i = 0; i < out_total; ++i) process_out(i);
+        for (int64_t i = 0; i < num_outer; ++i) process_outer(i);
     }
 }
 

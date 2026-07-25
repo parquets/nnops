@@ -153,16 +153,12 @@ void reduce_cpu(const ReduceAttributes& attrs,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
 
-    // Only handle single-axis, contiguous tail (axis == rank-1) in SIMD.
-    // Everything else (multi-axis, non-contiguous axis) → reference.
-    if (attrs.axes.size() != 1) {
-        reference::reduce_ref(attrs, output, inputs, ctx, workspace);
-        return;
-    }
-
-    int64_t axis = attrs.axes[0];
+    // Normalize axis
+    int64_t axis = attrs.axis;
     if (axis < 0) axis += rank;
 
+    // Only handle contiguous tail (axis == rank-1) in SIMD.
+    // Non-contiguous axis → reference.
     if (axis != rank - 1) {
         reference::reduce_ref(attrs, output, inputs, ctx, workspace);
         return;

@@ -1,12 +1,11 @@
 #pragma once
 /// @file reduce.hpp
-/// @brief Reduce operator — reduce a tensor along specified axes (sum, min, max, mean).
+/// @brief Reduce operator — reduce a tensor along a single axis (sum, min, max, mean).
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
-#include "nnops/detail/small_vector.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -27,25 +26,25 @@ struct ReduceAttributes {
     /// Reduction operation type.
     ReduceType type = ReduceType::Sum;
 
-    /// Axes to reduce over. Empty = reduce all axes to a scalar.
-    detail::SmallVector<int64_t, 4> axes;
+    /// Axis to reduce over (negative values wrap from the end).
+    int64_t axis = 0;
 
-    /// If true, reduced axes are kept as size-1 dimensions.
+    /// If true, the reduced axis is kept as a size-1 dimension.
     bool keepdims = false;
 };
 
 /// Reduce operator (class-based API).
 ///
-/// Reduces input tensor along specified axes using one of four reduction
+/// Reduces input tensor along a single axis using one of four reduction
 /// operations: Sum, Min, Max, or Mean.
 ///
-///   Sum:  output = Σ input over axes
-///   Min:  output = min(input) over axes
-///   Max:  output = max(input) over axes
-///   Mean: output = mean(input) over axes
+///   Sum:  output = Σ input over axis
+///   Min:  output = min(input) over axis
+///   Max:  output = max(input) over axis
+///   Mean: output = mean(input) over axis
 ///
 /// Input:  X [*]
-/// Output: Y [*]  (reduced shape: axes removed or kept as 1 if keepdims)
+/// Output: Y [*]  (reduced shape: axis removed or kept as 1 if keepdims)
 class Reduce : public OpBase {
 public:
     /// Create a Reduce operator for the specified backend.
