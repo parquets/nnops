@@ -129,6 +129,36 @@ __device__ inline float block_reduce_max(float val, float* shared) noexcept {
     return val;
 }
 
+/// Block-level min reduction.
+__device__ inline float block_reduce_min(float val, float* shared) noexcept {
+    const int lane = threadIdx.x % kCudaWarpSize;
+    const int wid  = threadIdx.x / kCudaWarpSize;
+
+    #pragma unroll
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, val, offset);
+        val = fminf(val, other);
+    }
+
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads();
+
+    const int num_warps = ceil_div(blockDim.x, kCudaWarpSize);
+    if (wid == 0) {
+        val = (lane < num_warps) ? shared[lane] : 1e30f;
+        // warp_reduce_min inline
+        #pragma unroll
+        for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+            val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
+        }
+    }
+    __syncthreads();
+
+    return val;
+}
+
 // ============================================================
 // CUDA error check helper
 // ============================================================

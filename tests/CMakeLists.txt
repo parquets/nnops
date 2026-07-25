@@ -15,6 +15,7 @@ set(TEST_SOURCES
     test_rms_norm.cpp
     test_simd.cpp
     test_depthwise_conv2d.cpp
+    test_reduce.cpp
 )
 
 add_executable(nnops_test ${TEST_SOURCES})

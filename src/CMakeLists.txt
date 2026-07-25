@@ -20,6 +20,7 @@ set(NNOPS_CPU_SOURCES
     ops/depthwise_conv2d.cpp
     ops/eltwise.cpp
     ops/unary.cpp
+    ops/reduce.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -34,6 +35,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
     backend/cpu/unary.cpp
+    backend/cpu/reduce.cpp
 
     # CPU tiled GEMM dispatch (platform-abstracted over x86_64 / aarch64 micro-kernels)
     backend/cpu/imatmul.cpp
@@ -57,6 +59,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/depthwise_conv2d_ref.cpp
     backend/cpu/reference/eltwise_ref.cpp
     backend/cpu/reference/unary_ref.cpp
+    backend/cpu/reference/reduce_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})
@@ -79,6 +82,7 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/depthwise_conv2d.cu
         backend/cuda/eltwise.cu
         backend/cuda/unary.cu
+        backend/cuda/reduce.cu
     )
 
     add_library(nnops_cuda STATIC ${NNOPS_CUDA_SOURCES})

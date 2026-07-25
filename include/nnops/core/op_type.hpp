@@ -23,6 +23,7 @@ enum class OpType : uint8_t {
     DepthwiseConv2D = 12,
     Eltwise         = 13,
     Unary           = 14,
+    Reduce          = 15,
 };
 
 }  // namespace nnops
