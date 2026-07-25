@@ -21,8 +21,23 @@ struct ComputeContext {
     /// CUDA stream (cudaStream_t), opaque pointer.
     void* cuda_stream = nullptr;
 
-    /// Vulkan command buffer (VkCommandBuffer), opaque pointer.
+    // ---- Vulkan backend fields ----
+    /// VkCommandBuffer to record dispatch commands into.
     void* vulkan_cmd_buffer = nullptr;
+
+    /// VkDevice handle, used for pipeline creation and descriptor set allocation.
+    void* vulkan_device = nullptr;
+
+    /// VkDescriptorPool for allocating per-call descriptor sets.
+    /// Must be created with VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT.
+    void* vulkan_descriptor_pool = nullptr;
+
+    /// Array of VkBuffer handles, one per tensor (inputs first, then outputs).
+    /// For eltwise: [A, B, output]; for unary: [input, output].
+    const void* vulkan_buffers = nullptr;
+
+    /// Number of entries in vulkan_buffers array.
+    int vulkan_buffers_count = 0;
 };
 
 }  // namespace nnops

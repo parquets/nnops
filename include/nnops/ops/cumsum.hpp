@@ -24,8 +24,6 @@ struct CumSumAttributes {
     /// Axis along which to compute the cumulative sum.
     int64_t axis = 0;
 
-    /// If true, add result to existing output buffer instead of overwriting.
-    bool add_to = false;
 };
 
 /// CumSum operator (class-based API).

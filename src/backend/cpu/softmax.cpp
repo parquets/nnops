@@ -61,7 +61,7 @@ void softmax_general_scalar(
     T* y_ptr,
     int64_t num_rows, int64_t norm_size,
     int64_t axis, const TensorView& X,
-    bool log_softmax, bool add_to,
+    bool log_softmax,
     const ComputeContext& ctx)
 {
     const int64_t rank = X.rank();
@@ -106,22 +106,14 @@ void softmax_general_scalar(
             for (int64_t i = 0; i < norm_size; ++i) {
                 int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
                 float val = s_load(&x_ptr[off]) - max_val - log_sum;
-                if (add_to) {
-                    s_store(&y_ptr[off], s_load(&y_ptr[off]) + val);
-                } else {
-                    s_store(&y_ptr[off], val);
-                }
+                s_store(&y_ptr[off], val);
             }
         } else {
             float inv_sum = 1.0f / sum_exp;
             for (int64_t i = 0; i < norm_size; ++i) {
                 int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
                 float val = std::exp(s_load(&x_ptr[off]) - max_val) * inv_sum;
-                if (add_to) {
-                    s_store(&y_ptr[off], s_load(&y_ptr[off]) + val);
-                } else {
-                    s_store(&y_ptr[off], val);
-                }
+                s_store(&y_ptr[off], val);
             }
         }
     };
@@ -151,7 +143,6 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(rank >= 1);
 
     const bool log_softmax = attrs.log_softmax;
-    const bool add_to = attrs.add_to;
 
     // Normalize axis
     int64_t axis = attrs.axis;
@@ -189,7 +180,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         softmax_general_scalar<T>(
             x_ptr, y_ptr,
             num_rows, norm_size, axis, X,
-            log_softmax, add_to, ctx);
+            log_softmax, ctx);
         return;
     }
 
@@ -245,7 +236,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         float sum_exp = 0.0f;
         i = 0;
 
-        const bool store_exp_to_output = !log_softmax && !add_to;
+        const bool store_exp_to_output = !log_softmax;
 
         {
             auto v_sum = v_zero(x_ptr);
@@ -291,57 +282,25 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
             for (; i + L <= D; i += L) {
                 auto rv = v_add(v_load(x_ptr + row_off + i), v_bias);
-                if (add_to) {
-                    v_store(y_ptr + row_off + i,
-                            v_add(v_load(y_ptr + row_off + i), rv));
-                } else {
-                    v_store(y_ptr + row_off + i, rv);
-                }
+                v_store(y_ptr + row_off + i, rv);
             }
             for (; i < D; ++i) {
                 float rv = s_load(&x_ptr[row_off + i]) + bias;
-                if (add_to) {
-                    s_store(&y_ptr[row_off + i],
-                            s_load(&y_ptr[row_off + i]) + rv);
-                } else {
-                    s_store(&y_ptr[row_off + i], rv);
-                }
+                s_store(&y_ptr[row_off + i], rv);
             }
         } else {
             // softmax = exp(x - max) / sum_exp
+            // Exp values already stored in output — just multiply by 1/sum
             const float inv_sum = 1.0f / sum_exp;
+            auto v_inv = v_set1(x_ptr, inv_sum);
 
-            if (store_exp_to_output) {
-                // Exp values already stored in output — just multiply by 1/sum
-                auto v_inv = v_set1(x_ptr, inv_sum);
-
-                for (; i + L <= D; i += L) {
-                    auto v = v_load(y_ptr + row_off + i);
-                    v_store(y_ptr + row_off + i, v_mul(v, v_inv));
-                }
-                for (; i < D; ++i) {
-                    s_store(&y_ptr[row_off + i],
-                            s_load(&y_ptr[row_off + i]) * inv_sum);
-                }
-            } else {
-                // add_to path: recompute exp(x - max), multiply by inv_sum,
-                // and add to existing output
-                auto v_inv = v_set1(x_ptr, inv_sum);
-                auto v_neg_max = v_set1(x_ptr, neg_max);
-
-                for (; i + L <= D; i += L) {
-                    auto v = v_load(x_ptr + row_off + i);
-                    v = v_add(v, v_neg_max);      // x - max
-                    v = v_exp(v);
-                    v = v_mul(v, v_inv);          // exp / sum
-                    v_store(y_ptr + row_off + i,
-                            v_add(v_load(y_ptr + row_off + i), v));
-                }
-                for (; i < D; ++i) {
-                    float val = std::exp(s_load(&x_ptr[row_off + i]) - max_val) * inv_sum;
-                    s_store(&y_ptr[row_off + i],
-                            s_load(&y_ptr[row_off + i]) + val);
-                }
+            for (; i + L <= D; i += L) {
+                auto v = v_load(y_ptr + row_off + i);
+                v_store(y_ptr + row_off + i, v_mul(v, v_inv));
+            }
+            for (; i < D; ++i) {
+                s_store(&y_ptr[row_off + i],
+                        s_load(&y_ptr[row_off + i]) * inv_sum);
             }
         }
     };

@@ -60,7 +60,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
                         float val = running;  // exclusive: result does not include current
-                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + val : val;
+                        out_ptr[idx] = val;
                         running += in_ptr[idx];  // update after writing
                     }
                 }
@@ -71,7 +71,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
                         running += in_ptr[idx];
-                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + running : running;
+                        out_ptr[idx] = running;
                     }
                 }
             }
@@ -96,7 +96,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
                         float val = running;  // exclusive: result does not include current
-                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + val : val;
+                        out_ptr[idx] = val;
                         running += in_ptr[idx];  // update after writing
                     }
                 }
@@ -107,7 +107,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
                         running += in_ptr[idx];
-                        out_ptr[idx] = attrs.add_to ? out_ptr[idx] + running : running;
+                        out_ptr[idx] = running;
                     }
                 }
             }

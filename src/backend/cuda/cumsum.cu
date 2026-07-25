@@ -33,8 +33,7 @@ __global__ void cumsum_kernel(
     int64_t lower_dim_size,     // elements after axis (treated as vector tail)
     int64_t axis_stride,        // stride_elems(axis)
     bool exclusive,
-    bool reverse,
-    bool add_to)
+    bool reverse)
 {
     // Each block: one outer slice
     // Each thread: one lower-dim position
@@ -53,11 +52,7 @@ __global__ void cumsum_kernel(
             for (int64_t k = 0; k < dim; ++k) {
                 int64_t idx = slice_start + k * axis_stride + lower;
                 float val = running;  // exclusive: does not include current element
-                if (add_to) {
-                    s_store(&output[idx], s_load(&output[idx]) + val);
-                } else {
-                    s_store(&output[idx], val);
-                }
+                s_store(&output[idx], val);
                 running += s_load(&input[idx]);  // add current to running sum
             }
         } else {
@@ -66,11 +61,7 @@ __global__ void cumsum_kernel(
             for (int64_t k = 0; k < dim; ++k) {
                 int64_t idx = slice_start + k * axis_stride + lower;
                 running += s_load(&input[idx]);
-                if (add_to) {
-                    s_store(&output[idx], s_load(&output[idx]) + running);
-                } else {
-                    s_store(&output[idx], running);
-                }
+                s_store(&output[idx], running);
             }
         }
     } else {
@@ -81,11 +72,7 @@ __global__ void cumsum_kernel(
             for (int64_t k = dim - 1; k >= 0; --k) {
                 int64_t idx = slice_start + k * axis_stride + lower;
                 float val = running;  // exclusive: does not include current element
-                if (add_to) {
-                    s_store(&output[idx], s_load(&output[idx]) + val);
-                } else {
-                    s_store(&output[idx], val);
-                }
+                s_store(&output[idx], val);
                 running += s_load(&input[idx]);  // add current to running sum
             }
         } else {
@@ -94,11 +81,7 @@ __global__ void cumsum_kernel(
             for (int64_t k = dim - 1; k >= 0; --k) {
                 int64_t idx = slice_start + k * axis_stride + lower;
                 running += s_load(&input[idx]);
-                if (add_to) {
-                    s_store(&output[idx], s_load(&output[idx]) + running);
-                } else {
-                    s_store(&output[idx], running);
-                }
+                s_store(&output[idx], running);
             }
         }
     }
@@ -147,7 +130,7 @@ void cumsum_cuda_impl(
     cumsum_kernel<<<grid_size, block_size, 0, stream>>>(
         input.ptr<T>(), output.ptr<T>(),
         dim, lower_dim_size, axis_stride,
-        attrs.exclusive, attrs.reverse, attrs.add_to);
+        attrs.exclusive, attrs.reverse);
 }
 
 // ============================================================

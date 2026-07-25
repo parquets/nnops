@@ -15,14 +15,29 @@ set(TEST_SOURCES
     test_rms_norm.cpp
     test_simd.cpp
     test_depthwise_conv2d.cpp
+    test_eltwise.cpp
+    test_unary.cpp
     test_reduce.cpp
 )
+
+# Vulkan tests (only when Vulkan backend is enabled)
+if(NNOPS_BUILD_VULKAN)
+    find_package(Vulkan REQUIRED)
+    list(APPEND TEST_SOURCES
+        common/vulkan_test_helper.cpp
+        test_eltwise_vulkan.cpp
+        test_unary_vulkan.cpp
+    )
+endif()
 
 add_executable(nnops_test ${TEST_SOURCES})
 target_link_libraries(nnops_test PRIVATE nnops_cpu)
 if(NNOPS_BUILD_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(nnops_test PRIVATE CUDA::cudart)
+endif()
+if(NNOPS_BUILD_VULKAN)
+    target_link_libraries(nnops_test PRIVATE Vulkan::Vulkan)
 endif()
 target_include_directories(nnops_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 

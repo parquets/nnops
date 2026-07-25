@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: reference
   originSessionId: 2c7fb42c-b26c-4d7e-a6dd-2de30d713ad8
-  modified: 2026-07-21T14:21:17.346Z
+  modified: 2026-07-24T13:51:30.214Z
 ---
 
 # Reference Project Insights
@@ -81,7 +81,7 @@ Also referenced onnxruntime's approach for runtime CPU detection:
 Key patterns adopted for GEMM micro-kernels:
 
 - **Three-layer kernel hierarchy**: `transpose.hpp` (register-level transpose primitives) → `pack.hpp` (LHS transpose pack + RHS copy pack) → `mma.hpp` (matrix micro-accumulate inner loop)
-- **Architecture-specific tile sizes**: AArch64 f32: mr={8,4,1}/nr={12,4,1}, AArch64 f16: mr={8,4,1}/nr={24,8,1}; x86_64 f32+f16: mr={6,4,1}/nr={16,8,1}
+- **Architecture-specific tile sizes**: AArch64 f32: mr={8,4,1}/nr={12,4,1}, AArch64 f16: mr={8,4,1}/nr={16,8,1}; x86_64 f32+f16: mr={6,4,1}/nr={16,8,1}
 - **Panel constant naming**: `mr_<dtype>[3]` and `nr_<dtype>[3]` for LHS/RHS micro-panel sizes
 - **K step tuning**: x86_64 pack uses K step of 8 (__m256 width), aarch64 uses K step of 4 (float32x4_t width)
 - **Pack transforms**: `pack_trans_nN` (LHS: transpose + scale), `pack_copy_nN` (RHS: contiguous copy + scale)

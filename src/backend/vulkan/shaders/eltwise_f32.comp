@@ -1,0 +1,50 @@
+/// @file eltwise_f32.comp
+/// @brief GLSL compute shader for element-wise binary operations (f32).
+///
+/// Specialization constants:
+///   OP     = 0 (Add), 1 (Sub), 2 (Mul), 3 (Div)
+///   ADD_TO = 0 (overwrite), 1 (accumulate)
+///
+/// Dispatch: ceil(total / 256) workgroups in X dimension.
+
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const int OP = 0;
+layout(constant_id = 1) const int ADD_TO = 0;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    int total;
+} pc;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= pc.total) return;
+
+    float va = a[gid];
+    float vb = b[gid];
+    float result;
+
+    // OP is a specialization constant — branch is resolved at pipeline creation time
+    if (OP == 0) {
+        result = va + vb;
+    } else if (OP == 1) {
+        result = va - vb;
+    } else if (OP == 2) {
+        result = va * vb;
+    } else {
+        result = va / vb;
+    }
+
+    if (ADD_TO == 1) {
+        c[gid] += result;
+    } else {
+        c[gid] = result;
+    }
+}

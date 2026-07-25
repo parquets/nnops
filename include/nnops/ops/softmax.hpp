@@ -22,8 +22,6 @@ struct SoftmaxAttributes {
     /// If true, compute log-softmax instead of softmax.
     bool log_softmax = false;
 
-    /// If true, add result to existing output buffer instead of overwriting.
-    bool add_to = false;
 };
 
 /// Softmax operator (class-based API).

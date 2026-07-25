@@ -4,7 +4,7 @@ description: "GEMM micro-kernel infrastructure — transpose, pack, and MMA prim
 metadata: 
   node_type: memory
   type: project
-  modified: 2026-07-22T16:20:52.348Z
+  modified: 2026-07-24T13:51:29.030Z
   originSessionId: 5c3ed336-1c64-4cbc-aea8-a232e6df9151
 ---
 
@@ -39,9 +39,9 @@ src/backend/cpu/aarch64/
 ├── pack_f32.hpp         — LHS/RHS f32 pack kernels (K step=4 via float32x4_t)
 ├── pack_f16.hpp         — LHS/RHS f16 pack kernels (native NEON fp16, K step=8 via float16x8_t)
 ├── mma_pack_f32.hpp     — 9 f32 MMA pack kernels (1/4/8 × 1/4/12), NEON FMA
-├── mma_pack_f16.hpp     — 9 f16 MMA pack kernels (1/4/8 × 1/8/24), native NEON fp16 FMA
+├── mma_pack_f16.hpp     — 9 f16 MMA pack kernels (1/4/8 × 1/8/16), native NEON fp16 FMA
 ├── mma_direct_f32.hpp   — 9 f32 MMA direct kernels (1/4/8 × 1/4/12), NEON FMA
-└── mma_direct_f16.hpp   — 9 f16 MMA direct kernels (1/4/8 × 1/8/24), native NEON fp16 FMA
+├── mma_direct_f16.hpp   — 9 f16 MMA direct kernels (1/4/8 × 1/8/16), native NEON fp16 FMA
 ```
 
 ## Three-Layer Architecture
@@ -63,7 +63,7 @@ Register-to-register matrix transpose primitives. Called by pack to reorder load
 | 12-way | `transpose_12x4_f32` | `transpose_12x4` | `transpose_12x8` |
 | 16-way | `transpose_16x4_f32` | `transpose_16x4` | `transpose_16x8` |
 
-f16 (AArch64): 2x4, 2x8, 4x4, 4x8, 8x8, 12x8, 16x8, 24x8
+f16 (AArch64): 2x4, 2x8, 4x4, 4x8, 8x8, 12x8, 16x8
 f16 (x86_64 __m128i): 4x8, 6x8, 8x8, 12x8, 16x8
 
 ### 2. Pack (data layout)
@@ -84,7 +84,7 @@ The innermost GEMM loop: `C[mr][nr] += A[mr][K] × B_packed[nr][K]` with post-ac
 | Arch | dtype | mr values (M) | nr values (N) | Total kernels |
 |---|---|---|---|---|
 | AArch64 | f32 | 8, 4, 1 | 12, 4, 1 | 9 (3×3) |
-| AArch64 | f16 | 8, 4, 1 | 24, 8, 1 | 9 (3×3) |
+| AArch64 | f16 | 8, 4, 1 | 16, 8, 1 | 9 (3×3) |
 | x86_64 | f32 | 6, 4, 1 | 16, 8, 1 | 9 (3×3) |
 | x86_64 | f16 | 6, 4, 1 | 16, 8, 1 | 9 (3×3) |
 

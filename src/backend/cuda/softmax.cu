@@ -28,8 +28,7 @@ __global__ void softmax_kernel(
     int64_t num_rows,
     int64_t norm_size,
     int64_t row_stride,       // in elements
-    bool log_softmax,
-    bool add_to)
+    bool log_softmax)
 {
     extern __shared__ float shared_buf[];  // shared memory for reductions: float[norm_size] or float[blockDim.x]
     float* smem = shared_buf;
@@ -74,7 +73,7 @@ __global__ void softmax_kernel(
     // Pass 2 — Sum of exp(x - max)
     // ============================================================
 
-    const bool store_exp_to_output = !log_softmax && !add_to;
+    const bool store_exp_to_output = !log_softmax;
 
     float sum_exp = 0.0f;
 
@@ -113,27 +112,14 @@ __global__ void softmax_kernel(
 
         for (int i = tid; i < norm_size; i += blockDim.x) {
             float rv = s_load(&x_row[i]) + bias;
-            if (add_to) {
-                s_store(&y_row[i], s_load(&y_row[i]) + rv);
-            } else {
-                s_store(&y_row[i], rv);
-            }
+            s_store(&y_row[i], rv);
         }
     } else {
         // softmax = exp(x - max) / sum_exp
+        // exp already in output — just multiply by inv_sum
         const float inv_sum = 1.0f / sum_exp;
-
-        if (store_exp_to_output) {
-            // exp already in output — just multiply by inv_sum
-            for (int i = tid; i < norm_size; i += blockDim.x) {
-                s_store(&y_row[i], s_load(&y_row[i]) * inv_sum);
-            }
-        } else {
-            // add_to path: recompute exp, multiply by inv_sum, add to output
-            for (int i = tid; i < norm_size; i += blockDim.x) {
-                float val = expf(s_load(&x_row[i]) - max_val) * inv_sum;
-                s_store(&y_row[i], s_load(&y_row[i]) + val);
-            }
+        for (int i = tid; i < norm_size; i += blockDim.x) {
+            s_store(&y_row[i], s_load(&y_row[i]) * inv_sum);
         }
     }
 }
@@ -151,8 +137,7 @@ __global__ void softmax_general_kernel(
     int64_t norm_size,
     const int64_t* __restrict__ inner_offsets,  // pre-computed offsets for each norm element
     int64_t outer_stride,    // element distance between rows
-    bool log_softmax,
-    bool add_to)
+    bool log_softmax)
 {
     extern __shared__ float shared_buf[];
     float* smem = shared_buf;
@@ -209,22 +194,14 @@ __global__ void softmax_general_kernel(
         for (int i = tid; i < norm_size; i += blockDim.x) {
             int64_t off = row_base + inner_offsets[i];
             float val = s_load(&input[off]) - max_val - log_sum;
-            if (add_to) {
-                s_store(&output[off], s_load(&output[off]) + val);
-            } else {
-                s_store(&output[off], val);
-            }
+            s_store(&output[off], val);
         }
     } else {
         float inv_sum = 1.0f / sum_exp;
         for (int i = tid; i < norm_size; i += blockDim.x) {
             int64_t off = row_base + inner_offsets[i];
             float val = expf(s_load(&input[off]) - max_val) * inv_sum;
-            if (add_to) {
-                s_store(&output[off], s_load(&output[off]) + val);
-            } else {
-                s_store(&output[off], val);
-            }
+            s_store(&output[off], val);
         }
     }
 }
@@ -245,7 +222,6 @@ void softmax_cuda_impl(
     NNOPS_ASSERT(rank >= 1);
 
     const bool log_softmax = attrs.log_softmax;
-    const bool add_to = attrs.add_to;
 
     int64_t axis = attrs.axis;
     if (axis < 0) axis += rank;
@@ -276,7 +252,7 @@ void softmax_cuda_impl(
         softmax_kernel<<<num_rows, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr,
             num_rows, norm_size, x_row_stride,
-            log_softmax, add_to);
+            log_softmax);
     } else {
         // General axis: pre-compute inner offsets on host, copy to device
         std::vector<int64_t> inner_offsets(static_cast<size_t>(norm_size));
@@ -305,7 +281,7 @@ void softmax_cuda_impl(
         softmax_general_kernel<<<num_rows, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr,
             num_rows, norm_size, d_offsets, outer_stride,
-            log_softmax, add_to);
+            log_softmax);
 
         CUDA_CHECK(cudaFree(d_offsets));
     }

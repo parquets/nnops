@@ -96,15 +96,75 @@ endif()
 if(NNOPS_BUILD_VULKAN)
     find_package(Vulkan REQUIRED)
 
+    # Find Python for the SPIR-V → header conversion script (needed early)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+    # ---- Find glslc for shader compilation ----
+    find_program(GLSLC_EXECUTABLE glslc
+        HINTS "${Vulkan_GLSLC_EXECUTABLE}"
+              "$ENV{VULKAN_SDK}/Bin"
+              "$ENV{VK_SDK_PATH}/Bin")
+    if(NOT GLSLC_EXECUTABLE)
+        message(FATAL_ERROR "glslc not found (part of Vulkan SDK shaderc tools). "
+                            "Set VULKAN_SDK or VK_SDK_PATH environment variable.")
+    endif()
+
+    # ---- Shader compilation: .comp → .spv ----
+    set(VULKAN_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan/shaders")
+    set(VULKAN_SHADER_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
+
+    # List of shaders to compile
+    set(VULKAN_SHADERS eltwise_f32 unary_f32)
+    set(VULKAN_SPV_FILES "")
+    set(VULKAN_SPV_HEADERS "")
+
+    foreach(shader ${VULKAN_SHADERS})
+        set(SHADER_SRC  "${VULKAN_SHADER_DIR}/${shader}.comp")
+        set(SHADER_SPV  "${VULKAN_SHADER_OUT_DIR}/${shader}.spv")
+        set(SHADER_HDR  "${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan/${shader}_spv.h")
+
+        add_custom_command(
+            OUTPUT ${SHADER_SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SHADER_SPV} ${SHADER_SRC}
+            DEPENDS ${SHADER_SRC}
+            COMMENT "Compiling Vulkan shader: ${shader}.comp → ${shader}.spv"
+        )
+
+        # Generate C header from SPIR-V (runs after .spv is produced)
+        add_custom_command(
+            OUTPUT ${SHADER_HDR}
+            COMMAND Python3::Interpreter
+                "${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan/spv_to_header.py"
+                --name "g_${shader}" --spv ${SHADER_SPV} --out ${SHADER_HDR}
+            DEPENDS ${SHADER_SPV} "${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan/spv_to_header.py"
+            COMMENT "Generating SPIR-V header: ${shader}_spv.h"
+        )
+
+        list(APPEND VULKAN_SPV_FILES ${SHADER_SPV})
+        list(APPEND VULKAN_SPV_HEADERS ${SHADER_HDR})
+    endforeach()
+
+    # Custom target to ensure shaders are built before the library
+    add_custom_target(vulkan_shaders DEPENDS ${VULKAN_SPV_HEADERS})
+
+    # ---- Vulkan backend sources ----
     set(NNOPS_VULKAN_SOURCES
-        backend/vulkan/conv2d_vulkan.cpp
-        backend/vulkan/activation_vulkan.cpp
-        backend/vulkan/pooling_vulkan.cpp
+        backend/vulkan/vulkan_common.cpp
+        backend/vulkan/eltwise_vulkan.cpp
+        backend/vulkan/unary_vulkan.cpp
     )
 
-    add_library(nnops_vulkan STATIC ${NNOPS_VULKAN_SOURCES})
+    add_library(nnops_vulkan STATIC
+        ${NNOPS_VULKAN_SOURCES}
+        ${VULKAN_SPV_FILES}
+    )
+    add_dependencies(nnops_vulkan vulkan_shaders)
+
     target_link_libraries(nnops_vulkan PUBLIC nnops Vulkan::Vulkan)
-    target_include_directories(nnops_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_include_directories(nnops_vulkan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+    )
     target_compile_definitions(nnops_cpu PUBLIC NNOPS_HAS_VULKAN)
     target_link_libraries(nnops_cpu PUBLIC nnops_vulkan)
 endif()

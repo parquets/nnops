@@ -33,6 +33,16 @@ namespace backend::cuda {
 }
 #endif
 
+#ifdef NNOPS_HAS_VULKAN
+namespace backend::vulkan {
+    void eltwise_vulkan(const EltwiseAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx,
+                         void* workspace);
+}
+#endif
+
 // ============================================================
 // Impl
 // ============================================================
@@ -57,7 +67,7 @@ auto resolve_eltwise_kernel(Backend backend) -> Eltwise::Impl::KernelFn
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
-        return nullptr;
+        return backend::vulkan::eltwise_vulkan;
 #endif
     }
     return nullptr;
