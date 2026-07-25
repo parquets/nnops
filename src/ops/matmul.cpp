@@ -4,7 +4,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
 
-#include "backend/cpu/imatmul.h"
+#include "backend/cpu/matmul.h"
 
 namespace nnops {
 
@@ -33,12 +33,7 @@ auto resolve_matmul_kernel(Backend backend) -> MatMul::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-#if defined(NNOPS_ARCH_X86_64) || defined(__x86_64__) || defined(_M_X64) || defined(__amd64) \
-    || defined(__aarch64__) || defined(NNOPS_ARCH_AARCH64)
-        return backend::cpu::matmul_tiled_kernel;
-#else
         return backend::cpu::reference::matmul_ref;
-#endif
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;
@@ -64,12 +59,20 @@ MatMul::MatMul(const MatMulAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_matmul_kernel(backend);
 }
 
+size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
+                                std::span<const TensorDesc> outputs) const
+{
+    NNOPS_ASSERT(inputs.size() >= 2);
+    NNOPS_ASSERT(outputs.size() >= 1);
+    return backend::cpu::matmul_get_workspace_size(attrs_, inputs[0], inputs[1], outputs[0]);
+}
+
 void MatMul::compute(std::span<TensorView> outputs,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
                      void* workspace)
 {
-    NNOPS_ASSERT(inputs.size() == 2);
+    NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);  // A, B, [bias]
     NNOPS_ASSERT(outputs.size() == 1);
     auto& output = outputs[0];
     NNOPS_ASSERT(!output.is_empty());
