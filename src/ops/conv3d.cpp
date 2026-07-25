@@ -65,9 +65,10 @@ Conv3D::Conv3D(const Conv3DAttributes& attrs, Backend backend)
 }
 
 // ============================================================
-// getWorkspace
+// getWorkspaceSize
 // ============================================================
-size_t Conv3D::getWorkspace() const
+size_t Conv3D::getWorkspaceSize(std::span<const TensorDesc>,
+                                std::span<const TensorDesc>) const
 {
     // Reference CPU implementation uses no workspace.
     // Optimized GEMM-based implementations may need im2col buffer.

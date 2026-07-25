@@ -64,8 +64,12 @@ bool os_avx512_support() {
 #ifndef HWCAP_ASIMDDP
 #define HWCAP_ASIMDDP (1 << 20)
 #endif
+#include <cstdio>
+#include <cstdlib>
 #elif defined(_WIN32)
 #include <Windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 
 #endif  // NNOPS_ARCH_AARCH64
@@ -102,6 +106,32 @@ void CpuFeatures::detect() {
         }
     }
 
+    // ---- L2 cache size via CPUID leaf 4 (deterministic cache parameters) ----
+    for (int subleaf = 0; ; ++subleaf) {
+    #if defined(_MSC_VER)
+        int info[4] = {0};
+        __cpuidex(info, 4, subleaf);
+    #else
+        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+        __cpuid_count(4, subleaf, eax, ebx, ecx, edx);
+        int info[4] = {static_cast<int>(eax), static_cast<int>(ebx),
+                       static_cast<int>(ecx), static_cast<int>(edx)};
+    #endif
+        int cache_type = info[0] & 0x1F;
+        if (cache_type == 0) break;  // no more caches
+
+        int cache_level = (info[0] >> 5) & 0x7;
+        // type 1 = data cache, type 3 = unified cache
+        if (cache_level == 2 && (cache_type == 1 || cache_type == 3)) {
+            int line_size  = (info[1] & 0xFFF) + 1;
+            int partitions = ((info[1] >> 12) & 0x3FF) + 1;
+            int ways       = ((info[1] >> 22) & 0x3FF) + 1;
+            int sets       = info[2] + 1;
+            l2_cache_size_ = static_cast<size_t>(ways) * partitions * line_size * sets;
+            break;
+        }
+    }
+
 #elif defined(NNOPS_ARCH_AARCH64)
     // NEON (ASIMD) is mandatory on AArch64
     features_ |= static_cast<uint32_t>(CpuIsa::NEON);
@@ -125,6 +155,67 @@ void CpuFeatures::detect() {
     // Dot-product: check PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
     if (IsProcessorFeaturePresent(43)) {  // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_DOT);
+    }
+#endif
+
+    // ---- L2 cache size detection ----
+#if defined(__linux__)
+    {
+        // Try getauxval(AT_L2_CACHESIZE) first (available since Linux 6.6)
+        #ifndef AT_L2_CACHESIZE
+        #define AT_L2_CACHESIZE 43
+        #endif
+        long aux_l2 = getauxval(AT_L2_CACHESIZE);
+        if (aux_l2 > 0) {
+            l2_cache_size_ = static_cast<size_t>(aux_l2);
+        } else {
+            // Fallback: read Linux sysfs for per-CPU L2 cache
+            std::FILE* fp = std::fopen(
+                "/sys/devices/system/cpu/cpu0/cache/index2/size", "r");
+            if (fp) {
+                char buf[32] = {};
+                if (std::fgets(buf, sizeof(buf), fp)) {
+                    char* end = nullptr;
+                    unsigned long val = std::strtoul(buf, &end, 10);
+                    if (end != buf && val > 0) {
+                        if (*end == 'K' || *end == 'k')
+                            val *= 1024;
+                        else if (*end == 'M' || *end == 'm')
+                            val *= 1024 * 1024;
+                        else if (*end == 'G' || *end == 'g')
+                            val *= 1024 * 1024 * 1024;
+                        l2_cache_size_ = static_cast<size_t>(val);
+                    }
+                }
+                std::fclose(fp);
+            }
+        }
+    }
+#elif defined(_WIN32)
+    {
+        // Windows ARM64: use GetLogicalProcessorInformation
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION buf[256];
+        DWORD len = sizeof(buf);
+        if (GetLogicalProcessorInformation(buf, &len)) {
+            DWORD count = len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+            for (DWORD i = 0; i < count; ++i) {
+                if (buf[i].Relationship == RelationCache &&
+                    buf[i].Cache.Level == 2) {
+                    l2_cache_size_ = buf[i].Cache.Size;
+                    break;
+                }
+            }
+        }
+    }
+#elif defined(__APPLE__)
+    {
+        // macOS Apple Silicon: use sysctl
+        int64_t l2_size = 0;
+        size_t len = sizeof(l2_size);
+        if (sysctlbyname("hw.l2cachesize", &l2_size, &len, nullptr, 0) == 0 &&
+            l2_size > 0) {
+            l2_cache_size_ = static_cast<size_t>(l2_size);
+        }
     }
 #endif
 

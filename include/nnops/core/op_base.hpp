@@ -17,7 +17,7 @@ namespace nnops {
 ///
 /// Each operator:
 ///   - Is created via a static create() factory method.
-///   - Reports its workspace requirements via getWorkspace().
+///   - Reports its workspace requirements via getWorkspaceSize().
 ///   - Executes via compute(), which takes pre-allocated output tensors,
 ///     input tensors, a compute context, and a user-provided workspace buffer.
 ///   - Does NOT internally allocate memory — the user manages all buffers.
@@ -26,9 +26,11 @@ public:
     virtual ~OpBase() = default;
 
     /// Returns the workspace size in bytes required by this operator.
-    /// For CPU backends, this may depend on the parallel_for grain size.
-    /// Call after create() to allocate workspace before calling compute().
-    virtual size_t getWorkspace() const = 0;
+    /// Receives input/output tensor descriptors (shapes + dtype, no data) to
+    /// compute workspace from actual dimensions. Analogous to TensorRT's
+    /// IPluginV2DynamicExt::getWorkspaceSize.
+    virtual size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
+                                    std::span<const TensorDesc> outputs) const = 0;
 
     /// Execute the operator (primary virtual — multi-output).
     ///
@@ -38,7 +40,7 @@ public:
     ///                  meaning depend on the specific operator.
     /// @param ctx       Backend-specific execution context (stream, thread pool, etc.)
     /// @param workspace Optional pre-allocated scratch buffer of at least
-    ///                  getWorkspace() bytes. May be nullptr if getWorkspace() == 0.
+    ///                  getWorkspaceSize() bytes. May be nullptr if size == 0.
     virtual void compute(std::span<TensorView> outputs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx = {},

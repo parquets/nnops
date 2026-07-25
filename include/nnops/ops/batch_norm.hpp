@@ -50,7 +50,8 @@ public:
     }
 
     // ---- OpBase interface ----
-    size_t getWorkspace() const override { return 0; }
+    size_t getWorkspaceSize(std::span<const TensorDesc>,
+                            std::span<const TensorDesc>) const override { return 0; }
 
     /// inputs[0] = X [N, C, D1...]
     /// inputs[1] = scale [C] (or [C, D1...] if !spatial)

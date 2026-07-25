@@ -27,6 +27,19 @@
 
 namespace nnops {
 
+/// Lightweight tensor metadata descriptor (no data pointer, no ownership).
+/// Analogous to TensorRT's nvinfer1::PluginTensorDesc.
+/// Used by getWorkspaceSize() to compute workspace requirements from shapes
+/// and data types without exposing full TensorView data pointers.
+struct TensorDesc {
+    static constexpr int64_t kMaxRank = 8;
+
+    detail::SmallVector<int64_t, kMaxRank> dims;
+    int64_t rank = 0;
+    DataType dtype = DataType::f32;
+    TensorLayout layout = TensorLayout::NCHW;
+};
+
 class TensorView {
 public:
     static constexpr int64_t kMaxRank = 8;
@@ -141,6 +154,16 @@ public:
 
     /// Whether this is an empty view.
     bool is_empty() const noexcept { return data_ == nullptr || rank_ == 0; }
+
+    /// Return a lightweight TensorDesc (no data pointer) for workspace queries.
+    TensorDesc desc() const noexcept {
+        TensorDesc d;
+        d.rank = rank_;
+        d.dims = shape_;
+        d.dtype = dtype_;
+        d.layout = layout_;
+        return d;
+    }
 
     // ---- Derived stride helpers (element counts, not bytes) ----
 

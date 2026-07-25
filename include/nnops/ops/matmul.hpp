@@ -15,15 +15,22 @@
 namespace nnops {
 
 /// Attributes for matrix multiplication.
+///
+/// Semantics: C = alpha × (A × B) + beta × bias
+/// where bias is an optional third input broadcast over M rows.
 struct MatMulAttributes {
     bool transpose_a = false;
     bool transpose_b = false;
 
+    /// Scale factor for the A×B matrix product (fused into pack — zero overhead).
+    float alpha = 1.0f;
+
+    /// Scale factor for old C values: C_out = alpha×A×B + bias + beta×C_old.
+    /// beta=0 (default) overwrites C; beta=1 adds A×B to existing C.
+    float beta = 0.0f;
+
     /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
-
-    /// If true, add result to existing output buffer instead of overwriting.
-    bool add_to = false;
 };
 
 /// Matrix multiplication operator (class-based API).
@@ -50,7 +57,8 @@ public:
                                           Backend backend = Backend::CPU);
 
     // ---- OpBase interface ----
-    size_t getWorkspace() const override { return 0; }
+    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const override;
 
     using OpBase::compute;
 

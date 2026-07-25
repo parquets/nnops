@@ -57,11 +57,16 @@ public:
     /// Raw feature bitmask.
     uint32_t raw() const { return features_; }
 
+    /// L2 cache size in bytes (per-core). Detected via CPUID on x86_64;
+    /// returns 262144 (256KB) as safe fallback on other architectures.
+    size_t l2_cache_size() const { return l2_cache_size_; }
+
 private:
     CpuFeatures() { detect(); }
     void detect();
 
     uint32_t features_ = 0;
+    size_t l2_cache_size_ = 262144;  // 256KB default (Haswell baseline)
 };
 
 // ============================================================

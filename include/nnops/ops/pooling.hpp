@@ -80,7 +80,8 @@ public:
     }
 
     // ---- OpBase interface ----
-    size_t getWorkspace() const override { return 0; }
+    size_t getWorkspaceSize(std::span<const TensorDesc>,
+                            std::span<const TensorDesc>) const override { return 0; }
 
     using OpBase::compute;
 

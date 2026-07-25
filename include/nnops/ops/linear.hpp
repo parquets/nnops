@@ -45,7 +45,8 @@ public:
     }
 
     // ---- OpBase interface ----
-    size_t getWorkspace() const override { return 0; }
+    size_t getWorkspaceSize(std::span<const TensorDesc>,
+                            std::span<const TensorDesc>) const override { return 0; }
 
     /// inputs[0] = input tensor [M, K] (or broadcastable to 2D)
     /// inputs[1] = weight tensor [N, K]

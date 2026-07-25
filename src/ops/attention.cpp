@@ -57,7 +57,8 @@ Attention::Attention(const AttentionAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_attention_kernel(backend);
 }
 
-size_t Attention::getWorkspace() const
+size_t Attention::getWorkspaceSize(std::span<const TensorDesc>,
+                                   std::span<const TensorDesc>) const
 {
     // Reference implementation uses a per-head scratch buffer for scores:
     // max size = Sq * Sk * sizeof(float)

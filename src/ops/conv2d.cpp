@@ -65,9 +65,10 @@ Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
 }
 
 // ============================================================
-// getWorkspace
+// getWorkspaceSize
 // ============================================================
-size_t Conv2D::getWorkspace() const
+size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc>,
+                                std::span<const TensorDesc>) const
 {
     // Reference CPU implementation uses no workspace.
     // Optimized GEMM-based implementations may need im2col buffer.
