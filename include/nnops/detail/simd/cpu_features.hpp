@@ -11,10 +11,16 @@
 
 #include <cstdint>
 
+// NNOPS_ARCH_X86_64 / NNOPS_ARCH_AARCH64 are defined by simd.hpp.
+// Re-detect here to avoid circular include (simd/simd.hpp → cpu_features.hpp).
 #if defined(__x86_64__) || defined(_M_X64) || defined(__amd64)
-  #define NNOPS_ARCH_X86_64 1
+  #if !defined(NNOPS_ARCH_X86_64)
+    #define NNOPS_ARCH_X86_64 1
+  #endif
 #elif defined(__aarch64__) || defined(_M_ARM64)
-  #define NNOPS_ARCH_AARCH64 1
+  #if !defined(NNOPS_ARCH_AARCH64)
+    #define NNOPS_ARCH_AARCH64 1
+  #endif
 #endif
 
 namespace nnops {

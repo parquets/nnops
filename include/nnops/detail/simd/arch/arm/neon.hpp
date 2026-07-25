@@ -282,15 +282,8 @@ inline float v_reduce_sum(const v_f32x8& a) {
 }
 
 // ============================================================
-// FP16 support (ARMv8.2-A+ with __ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-//
-// On AArch64 with the FP16 vector arithmetic feature, we get native
-// float16x8_t (128-bit) operations. fp16x4 is not provided — use
-// v_f16x8 and ignore the upper 4 lanes for 4-wide needs.
-// When the feature is not available at compile time, vec_f16x8.hpp
-// falls back to the scalar emulation.
+// FP16 support — always available on AArch64
 // ============================================================
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 
 // ============================================================
 // v_f16x8 — 128-bit float16 vector, backed by float16x8_t
@@ -436,8 +429,6 @@ inline v_f16x8 v_tanh(const v_f16x8& a) {
     v_f32x8 fr = v_f32x8(tanh_ps(fa.lo), tanh_ps(fa.hi));
     return v_cvt_f32_to_f16(fr);
 }
-
-#endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 
 } // namespace neon
 } // namespace arch

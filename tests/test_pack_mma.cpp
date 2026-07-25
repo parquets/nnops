@@ -13,8 +13,9 @@
 
 #include "common/test_harness.hpp"
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/simd.hpp"
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64)
   #include "backend/cpu/x86_64/pack_f32.hpp"
   #include "backend/cpu/x86_64/pack_f16.hpp"
   #include "backend/cpu/x86_64/mma_pack_f32.hpp"
@@ -24,7 +25,7 @@
   using namespace nnops::backend::cpu::x86_64;
   using f16_t = nnops::backend::cpu::half;  // x86_64: struct half { uint16_t bits; }
   #define NNOPS_PACK_MMA_ARCH "x86_64"
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(NNOPS_ARCH_AARCH64)
+#elif defined(NNOPS_ARCH_AARCH64)
   #include "backend/cpu/aarch64/pack_f32.hpp"
   #include "backend/cpu/aarch64/pack_f16.hpp"
   #include "backend/cpu/aarch64/mma_pack_f32.hpp"
@@ -91,7 +92,7 @@ static void fill_ramp(T* data, int n, float start = 0.0f) {
 
 /// Convert f16_t to float (platform-neutral).
 static float f16_to_f(f16_t v) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64)
     return nnops::backend::cpu::half_to_float(v);
 #else
     return static_cast<float>(v);
@@ -100,7 +101,7 @@ static float f16_to_f(f16_t v) {
 
 /// Convert float to f16_t (platform-neutral).
 static f16_t f_to_f16(float v) {
-#if defined(__x86_64__) || defined(_M_X64) || defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64)
     return nnops::backend::cpu::float_to_half(v);
 #else
     return static_cast<float16_t>(v);

@@ -3,7 +3,7 @@
 /// @brief Unified 128-bit float16 vector type and operations (8 half floats).
 ///
 /// At compile time, selects the best available backend:
-///   - AArch64 + __ARM_FEATURE_FP16_VECTOR_ARITHMETIC:  native NEON (float16x8_t)
+///   - AArch64:   native NEON (float16x8_t)
 ///   - x86_64 + __F16C__:                               F16C/AVX2 (__m128i + convert→compute→convert)
 ///   - everything else:                                 scalar fallback (uint16_t[8])
 ///
@@ -17,7 +17,7 @@
 ///   v_f32x8 fa = v_cvt_f16_to_f32(a);   // widen to f32x8 for compute
 ///   v_f16x8 r = v_cvt_f32_to_f16(fa);   // narrow back to f16
 
-#if defined(NNOPS_ARCH_AARCH64) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#if defined(NNOPS_ARCH_AARCH64)
   #include "nnops/detail/simd/arch/arm/neon.hpp"
   namespace nnops { namespace simd {
   using v_f16x8 = arch::neon::v_f16x8;

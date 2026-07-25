@@ -31,7 +31,7 @@ extern void matmul_ref(const MatMulAttributes& attrs,
 // Duplicates the arch block from imatmul.cpp — these are ISA facts,
 // not implementation details of imatmul.
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64)
   #define F16_PTR  half*
   #define F16_CPTR const half*
   // f32
@@ -44,7 +44,7 @@ extern void matmul_ref(const MatMulAttributes& attrs,
   #define F16_MR1 4
   #define F16_NR0 16
   #define F16_NR1 8
-#elif defined(__aarch64__) || defined(_M_ARM64) || defined(NNOPS_ARCH_AARCH64)
+#elif defined(NNOPS_ARCH_AARCH64)
   #define F16_PTR  float16_t*
   #define F16_CPTR const float16_t*
   // f32
