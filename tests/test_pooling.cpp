@@ -354,7 +354,7 @@ NNOPS_TEST(pooling_simd_max_vs_ref_with_pad) {
 }
 
 NNOPS_TEST(pooling_simd_max_stride_2) {
-    // stride=2 → SIMD disabled (needs gather), falls back to scalar path
+    // stride=2 → v_load_even SIMD (stride-2 gather via LD2/UNPCK)
     auto [in_vec, input] = test::make_random_tensor({1, 2, 16, 16});
     const int64_t oshape[] = {1, 2, 8, 8};
     std::vector<float> out_buf(1 * 2 * 8 * 8);
@@ -489,7 +489,7 @@ NNOPS_TEST(pooling_simd_odd_width) {
 }
 
 NNOPS_TEST(pooling_simd_avg_stride_2_no_simd) {
-    // AvgPool with stride=2 — SIMD disabled but result must match reference
+    // AvgPool with stride=2 — v_load_even SIMD (stride-2 gather)
     auto [in_vec, input] = test::make_random_tensor({1, 2, 16, 16});
     const int64_t oshape[] = {1, 2, 8, 8};
     std::vector<float> out_buf(1 * 2 * 8 * 8);

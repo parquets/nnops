@@ -166,5 +166,59 @@ inline void s_store_add(Ptr ptr, float val, bool add_to) {
     }
 }
 
+// ============================================================
+// Deinterleave (stride-2 gather) — generic overloads
+//
+// Three API styles (方案 A / B / C), type-dispatched on pointer type:
+//   float* → v_f32x8 / v_f32x8x2_t
+//   half*  → v_f16x8 / v_f16x8x2_t  (via uint16_t*)
+//
+// v_deinterleave loads 2×N elements and returns {even, odd}.
+// v_load_even / v_load_odd return a single vector with every other element.
+// v_load_stride2_even / v_load_stride2_odd are explicit-named aliases.
+// ============================================================
+
+// Pair types (v_f32x8x2_t, v_f16x8x2_t) are re-exported from the arch
+// namespaces via vec_f32x8.hpp / vec_f16x8.hpp using-declarations.
+
+// ---- 方案 A: v_deinterleave (full pair result) --------------------------
+
+inline v_f32x8x2_t v_deinterleave(const float* p) {
+    return v_deinterleave_f32x8(p);
+}
+inline v_f16x8x2_t v_deinterleave(const half* p) {
+    return v_deinterleave_f16x8(reinterpret_cast<const uint16_t*>(p));
+}
+
+// ---- 方案 B: v_load_even / v_load_odd -----------------------------------
+
+inline v_f32x8 v_load_even(const float* p) {
+    return v_load_even_f32x8(p);
+}
+inline v_f32x8 v_load_odd(const float* p) {
+    return v_load_odd_f32x8(p);
+}
+inline v_f16x8 v_load_even(const half* p) {
+    return v_load_even_f16x8(reinterpret_cast<const uint16_t*>(p));
+}
+inline v_f16x8 v_load_odd(const half* p) {
+    return v_load_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
+}
+
+// ---- 方案 C: v_load_stride2_even / v_load_stride2_odd -------------------
+
+inline v_f32x8 v_load_stride2_even(const float* p) {
+    return v_load_stride2_even_f32x8(p);
+}
+inline v_f32x8 v_load_stride2_odd(const float* p) {
+    return v_load_stride2_odd_f32x8(p);
+}
+inline v_f16x8 v_load_stride2_even(const half* p) {
+    return v_load_stride2_even_f16x8(reinterpret_cast<const uint16_t*>(p));
+}
+inline v_f16x8 v_load_stride2_odd(const half* p) {
+    return v_load_stride2_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
+}
+
 } // namespace simd
 } // namespace nnops

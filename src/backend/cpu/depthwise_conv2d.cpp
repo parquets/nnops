@@ -14,6 +14,7 @@
 /// Key optimizations:
 ///   1. Height blocking: process 4 output rows simultaneously to reuse kernel weights
 ///   2. Width SIMD: process simd_lane_for<T> output columns with v_f32x8/v_f16x8
+///      SW == 1: v_load (contiguous). SW == 2: v_load_even (stride-2 gather via LD2/UNPCK).
 ///   3. Region splitting: pad-top/bottom → scalar, pad-left/right → scalar,
 ///      interior → SIMD (h4 for aligned rows, h1 for remainder)
 ///   4. Kernel weight pre-load into registers within inner loop (reused across 4 rows)
@@ -67,15 +68,14 @@ inline float depthwise_elem(const T* input,
 // SIMD h4 kernel: process 4 output rows × 8 output columns.
 // Uses type-deduced vector V = v_f32x8 or v_f16x8.
 // ============================================================
-template <typename T>
+template <typename T, int SW_val>
 inline void dwconv_h4_simd(T* output,
                             const T* input,
                             const T* weight,
                             float bias_val,
-                            int64_t IH, int64_t IW,
                             int64_t oh_start, int64_t ow_start, int64_t ow_end,
                             int64_t KH, int64_t KW,
-                            int64_t SH, int64_t SW,
+                            int64_t SH,
                             int64_t DH, int64_t DW,
                             int64_t PH, int64_t PW,
                             int64_t out_row_stride, int64_t out_w_stride,
@@ -96,32 +96,22 @@ inline void dwconv_h4_simd(T* output,
             const int64_t ih2 = (oh_start + 2) * SH + kh * DH - PH;
             const int64_t ih3 = (oh_start + 3) * SH + kh * DH - PH;
 
-            const bool valid0 = (ih0 >= 0 && ih0 < IH);
-            const bool valid1 = (ih1 >= 0 && ih1 < IH);
-            const bool valid2 = (ih2 >= 0 && ih2 < IH);
-            const bool valid3 = (ih3 >= 0 && ih3 < IH);
-
             for (int64_t kw = 0; kw < KW; ++kw) {
                 const float kval = s_load(&weight[kh * KW + kw]);
                 const auto vk = v_set1(input, kval);
 
-                const int64_t iw_base = ow * SW + kw * DW - PW;
+                const int64_t iw_base = ow * SW_val + kw * DW - PW;
 
-                if (valid0) {
-                    const auto vin0 = v_load(input + ih0 * in_row_stride + iw_base * in_w_stride);
-                    vacc0 = v_fmadd(vin0, vk, vacc0);
-                }
-                if (valid1) {
-                    const auto vin1 = v_load(input + ih1 * in_row_stride + iw_base * in_w_stride);
-                    vacc1 = v_fmadd(vin1, vk, vacc1);
-                }
-                if (valid2) {
-                    const auto vin2 = v_load(input + ih2 * in_row_stride + iw_base * in_w_stride);
-                    vacc2 = v_fmadd(vin2, vk, vacc2);
-                }
-                if (valid3) {
-                    const auto vin3 = v_load(input + ih3 * in_row_stride + iw_base * in_w_stride);
-                    vacc3 = v_fmadd(vin3, vk, vacc3);
+                if constexpr (SW_val == 2) {
+                    vacc0 = v_fmadd(v_load_even(input + ih0 * in_row_stride + iw_base * in_w_stride), vk, vacc0);
+                    vacc1 = v_fmadd(v_load_even(input + ih1 * in_row_stride + iw_base * in_w_stride), vk, vacc1);
+                    vacc2 = v_fmadd(v_load_even(input + ih2 * in_row_stride + iw_base * in_w_stride), vk, vacc2);
+                    vacc3 = v_fmadd(v_load_even(input + ih3 * in_row_stride + iw_base * in_w_stride), vk, vacc3);
+                } else {
+                    vacc0 = v_fmadd(v_load(input + ih0 * in_row_stride + iw_base * in_w_stride), vk, vacc0);
+                    vacc1 = v_fmadd(v_load(input + ih1 * in_row_stride + iw_base * in_w_stride), vk, vacc1);
+                    vacc2 = v_fmadd(v_load(input + ih2 * in_row_stride + iw_base * in_w_stride), vk, vacc2);
+                    vacc3 = v_fmadd(v_load(input + ih3 * in_row_stride + iw_base * in_w_stride), vk, vacc3);
                 }
             }
         }
@@ -148,15 +138,14 @@ inline void dwconv_h4_simd(T* output,
 // ============================================================
 // SIMD h1 kernel: process 1 output row × 8 output columns.
 // ============================================================
-template <typename T>
+template <typename T, int SW_val>
 inline void dwconv_h1_simd(T* output,
                             const T* input,
                             const T* weight,
                             float bias_val,
-                            int64_t IH, int64_t IW,
                             int64_t oh, int64_t ow_start, int64_t ow_end,
                             int64_t KH, int64_t KW,
-                            int64_t SH, int64_t SW,
+                            int64_t SH,
                             int64_t DH, int64_t DW,
                             int64_t PH, int64_t PW,
                             int64_t out_row_stride, int64_t out_w_stride,
@@ -170,15 +159,19 @@ inline void dwconv_h1_simd(T* output,
 
         for (int64_t kh = 0; kh < KH; ++kh) {
             const int64_t ih = oh * SH + kh * DH - PH;
-            if (ih < 0 || ih >= IH) { continue; }
 
             for (int64_t kw = 0; kw < KW; ++kw) {
                 const float kval = s_load(&weight[kh * KW + kw]);
                 const auto vk = v_set1(input, kval);
-                const int64_t iw_base = ow * SW + kw * DW - PW;
+                const int64_t iw_base = ow * SW_val + kw * DW - PW;
 
-                const auto vin = v_load(input + ih * in_row_stride + iw_base * in_w_stride);
-                vacc = v_fmadd(vin, vk, vacc);
+                if constexpr (SW_val == 2) {
+                    const auto vin = v_load_even(input + ih * in_row_stride + iw_base * in_w_stride);
+                    vacc = v_fmadd(vin, vk, vacc);
+                } else {
+                    const auto vin = v_load(input + ih * in_row_stride + iw_base * in_w_stride);
+                    vacc = v_fmadd(vin, vk, vacc);
+                }
             }
         }
 
@@ -272,7 +265,7 @@ void dwconv_impl(const DepthwiseConv2DAttributes& attrs,
     const int64_t out_w_stride    = 1;
     const int64_t out_ch_stride   = OH * out_row_stride;
 
-    const bool use_simd = (SW == 1);
+    const bool use_simd = (SW == 1 || SW == 2);
 
     const int64_t oh_beg = static_cast<int64_t>(
         std::ceil(static_cast<float>(PH) / static_cast<float>(SH)));
@@ -294,6 +287,16 @@ void dwconv_impl(const DepthwiseConv2DAttributes& attrs,
     const int64_t ow_simd_end = use_simd
         ? ow_simd_beg + ((ow_end - ow_simd_beg) / simd_lane_for<T>) * simd_lane_for<T>
         : ow_beg;
+
+    // ----- Function pointer selection: hoist SW dispatch out of hot loops -----
+    using DwConvFn = void (*)(T*, const T*, const T*, float,
+        int64_t, int64_t, int64_t, int64_t, int64_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t,
+        int64_t, int64_t, int64_t, int64_t,
+        bool);
+
+    DwConvFn dwconv_h4_fn = (SW == 2) ? dwconv_h4_simd<T, 2> : dwconv_h4_simd<T, 1>;
+    DwConvFn dwconv_h1_fn = (SW == 2) ? dwconv_h1_simd<T, 2> : dwconv_h1_simd<T, 1>;
 
     // Per-channel compute lambda (N*C parallel)
     const auto compute_channel = [&](int64_t n, int64_t c) {
@@ -325,13 +328,12 @@ void dwconv_impl(const DepthwiseConv2DAttributes& attrs,
                     }
                 }
 
-                dwconv_h4_simd(out_ch, in_ch, w_ch, bias_val,
-                                IH, IW,
-                                oh, ow_simd_beg, ow_simd_end,
-                                KH, KW, SH, SW, DH, DW, PH, PW,
-                                out_row_stride, out_w_stride,
-                                in_row_stride, in_w_stride,
-                                attrs.add_to);
+                dwconv_h4_fn(out_ch, in_ch, w_ch, bias_val,
+                             oh, ow_simd_beg, ow_simd_end,
+                             KH, KW, SH, DH, DW, PH, PW,
+                             out_row_stride, out_w_stride,
+                             in_row_stride, in_w_stride,
+                             attrs.add_to);
 
                 if (ow_simd_end < ow_end) {
                     for (int64_t d = 0; d < 4; ++d) {
@@ -366,12 +368,12 @@ void dwconv_impl(const DepthwiseConv2DAttributes& attrs,
                                        attrs.add_to, attrs.epilogue, c);
                 }
 
-                dwconv_h1_simd(out_ch, in_ch, w_ch, bias_val,
-                                IH, IW, oh, ow_simd_beg, ow_simd_end,
-                                KH, KW, SH, SW, DH, DW, PH, PW,
-                                out_row_stride, out_w_stride,
-                                in_row_stride, in_w_stride,
-                                attrs.add_to);
+                dwconv_h1_fn(out_ch, in_ch, w_ch, bias_val,
+                             oh, ow_simd_beg, ow_simd_end,
+                             KH, KW, SH, DH, DW, PH, PW,
+                             out_row_stride, out_w_stride,
+                             in_row_stride, in_w_stride,
+                             attrs.add_to);
 
                 if (ow_simd_end < ow_end) {
                     dwconv_scalar_row(out_ch, in_ch, w_ch, bias_val,

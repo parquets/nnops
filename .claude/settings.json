@@ -74,7 +74,13 @@
       "Bash(grep -v '{$')",
       "Bash(grep -v '//')",
       "Read(//d/tmp/**)",
-      "Bash(cmake --build build --target nnops_test --config Debug)"
+      "Bash(cmake --build build --target nnops_test --config Debug)",
+      "Bash(bash build.sh)",
+      "Bash(./tests/Release/nnops_test.exe --gtest_filter=\"*simd*\")",
+      "Bash(cmake --build build --target nnops_test -j 16)",
+      "Bash(cmake --build build --config Release --target test_depthwise_conv2d)",
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*dwconv*\")",
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*pooling*\")"
     ],
     "additionalDirectories": [
       "d:\\vscode\\nnops\\src\\backend\\cpu",

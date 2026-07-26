@@ -445,6 +445,140 @@ inline float v_reduce_min(const v_f16x8& a) {
 
 #endif  // defined(__F16C__)
 
+// ============================================================
+// Deinterleave (stride-2 gather) — pair types
+// ============================================================
+
+struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
+struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
+
+// ============================================================
+// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
+// ============================================================
+
+/// @brief Load 8 contiguous f32s, return {a0,a2,a4,a6}, {a1,a3,a5,a7}.
+inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
+    __m128 lo   = _mm_loadu_ps(src);       // a0, a1, a2, a3
+    __m128 hi   = _mm_loadu_ps(src + 4);   // a4, a5, a6, a7
+    __m128 t0   = _mm_unpacklo_ps(lo, hi); // a0, a4, a1, a5
+    __m128 t1   = _mm_unpackhi_ps(lo, hi); // a2, a6, a3, a7
+    return {v_f32x4(_mm_unpacklo_ps(t0, t1)),   // a0, a2, a4, a6
+            v_f32x4(_mm_unpackhi_ps(t0, t1))};  // a1, a3, a5, a7
+}
+
+/// @brief Load 16 contiguous f32s, return {even}, {odd} — each v_f32x8.
+inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
+    v_f32x4x2_t lo = v_deinterleave_f32x4(src);
+    v_f32x4x2_t hi = v_deinterleave_f32x4(src + 8);
+    return {v_f32x8(lo.even.val, hi.even.val),
+            v_f32x8(lo.odd.val,  hi.odd.val)};
+}
+
+// ============================================================
+// 方案 B: v_load_even_* / v_load_odd_*
+// ============================================================
+
+inline v_f32x4 v_load_even_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).even;
+}
+inline v_f32x4 v_load_odd_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).odd;
+}
+inline v_f32x8 v_load_even_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).even;
+}
+inline v_f32x8 v_load_odd_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).odd;
+}
+
+// ============================================================
+// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_*
+// ============================================================
+
+inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).even;
+}
+inline v_f32x4 v_load_stride2_odd_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).odd;
+}
+inline v_f32x8 v_load_stride2_even_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).even;
+}
+inline v_f32x8 v_load_stride2_odd_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).odd;
+}
+
+// ============================================================
+// FP16 deinterleave (F16C path)
+// ============================================================
+#if defined(__F16C__)
+
+/// @brief Pair of v_f16x8 registers: even- and odd-indexed half elements.
+struct v_f16x8x2_t { v_f16x8 even; v_f16x8 odd; };
+
+/// @brief Load 16 contiguous f16s, return {h0,h2,...,h14}, {h1,h3,...,h15}.
+///
+/// Strategy: convert to f32, deinterleave with UNPCK cascade, convert back.
+/// The stack buffer (16 f32 = 64 B) stays in L1; overhead is negligible.
+inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
+    // Load 2×8 f16 → convert to 2×8 f32
+    __m256 flo = _mm256_cvtph_ps(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(src)));
+    __m256 fhi = _mm256_cvtph_ps(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 8)));
+
+    // Deinterleave each 128-bit half of flo/fhi via UNPCK cascade
+    __m128 flo_lo = _mm256_castps256_ps128(flo);       // f0,f1,f2,f3
+    __m128 flo_hi = _mm256_extractf128_ps(flo, 1);      // f4,f5,f6,f7
+    __m128 fhi_lo = _mm256_castps256_ps128(fhi);        // f8,f9,f10,f11
+    __m128 fhi_hi = _mm256_extractf128_ps(fhi, 1);       // f12,f13,f14,f15
+
+    // Low pair: deinterleave flo_lo (f0..f3) × fhi_lo (f8..f11)
+    __m128 t0 = _mm_unpacklo_ps(flo_lo, fhi_lo);  // f0,f8, f1,f9
+    __m128 t1 = _mm_unpackhi_ps(flo_lo, fhi_lo);  // f2,f10,f3,f11
+    __m128 even_lo = _mm_unpacklo_ps(t0, t1);      // f0,f2, f8,f10
+    __m128 odd_lo  = _mm_unpackhi_ps(t0, t1);      // f1,f3, f9,f11
+
+    // High pair: deinterleave flo_hi (f4..f7) × fhi_hi (f12..f15)
+    t0 = _mm_unpacklo_ps(flo_hi, fhi_hi);  // f4,f12, f5,f13
+    t1 = _mm_unpackhi_ps(flo_hi, fhi_hi);  // f6,f14, f7,f15
+    __m128 even_hi = _mm_unpacklo_ps(t0, t1);  // f4,f6, f12,f14
+    __m128 odd_hi  = _mm_unpackhi_ps(t0, t1);  // f5,f7, f13,f15
+
+    // Recombine: even = f0,f2,f4,f6, f8,f10,f12,f14
+    __m128 ev_lo = _mm_shuffle_ps(even_lo, even_hi, _MM_SHUFFLE(1,0,1,0));
+    __m128 ev_hi = _mm_shuffle_ps(even_lo, even_hi, _MM_SHUFFLE(3,2,3,2));
+    __m256 even_f = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(ev_lo), ev_hi, 1);
+
+    // Recombine: odd = f1,f3,f5,f7, f9,f11,f13,f15
+    __m128 od_lo = _mm_shuffle_ps(odd_lo, odd_hi, _MM_SHUFFLE(1,0,1,0));
+    __m128 od_hi = _mm_shuffle_ps(odd_lo, odd_hi, _MM_SHUFFLE(3,2,3,2));
+    __m256 odd_f = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(od_lo), od_hi, 1);
+
+    return {v_f16x8(_mm256_cvtps_ph(even_f, 0)),
+            v_f16x8(_mm256_cvtps_ph(odd_f,  0))};
+}
+
+// 方案 B — f16
+inline v_f16x8 v_load_even_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).even;
+}
+inline v_f16x8 v_load_odd_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).odd;
+}
+
+// 方案 C — f16
+inline v_f16x8 v_load_stride2_even_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).even;
+}
+inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).odd;
+}
+
+#endif  // defined(__F16C__)
+
 } // namespace sse
 } // namespace arch
 } // namespace simd

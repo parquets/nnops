@@ -469,6 +469,92 @@ inline v_f16x8 v_tanh(const v_f16x8& a) {
     return v_cvt_f32_to_f16(fr);
 }
 
+// ============================================================
+// Deinterleave (stride-2 gather) — pair types
+// ============================================================
+
+/// @brief Pair of v_f32x4 registers: even- and odd-indexed elements.
+struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
+
+/// @brief Pair of v_f32x8 registers: even- and odd-indexed elements.
+struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
+
+/// @brief Pair of v_f16x8 registers: even- and odd-indexed half elements.
+struct v_f16x8x2_t { v_f16x8 even; v_f16x8 odd; };
+
+// ============================================================
+// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
+// ============================================================
+
+/// @brief Load 8 contiguous f32s, return {a0,a2,a4,a6}, {a1,a3,a5,a7}.
+/// Uses native NEON LD2 (load 2-element structures → deinterleave).
+inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
+    float32x4x2_t v = vld2q_f32(src);
+    return {v_f32x4(v.val[0]), v_f32x4(v.val[1])};
+}
+
+/// @brief Load 16 contiguous f32s, return {even}, {odd} — each v_f32x8.
+inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
+    v_f32x4x2_t lo = v_deinterleave_f32x4(src);
+    v_f32x4x2_t hi = v_deinterleave_f32x4(src + 8);
+    return {v_f32x8(lo.even.val, hi.even.val),
+            v_f32x8(lo.odd.val,  hi.odd.val)};
+}
+
+/// @brief Load 16 contiguous f16s, return {h0,h2,...,h14}, {h1,h3,...,h15}.
+/// Uses native NEON LD2 on float16x8_t.
+inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
+    float16x8x2_t v = vld2q_f16(
+        reinterpret_cast<const float16_t*>(src));
+    return {v_f16x8(v.val[0]), v_f16x8(v.val[1])};
+}
+
+// ============================================================
+// 方案 B: v_load_even_* / v_load_odd_*
+// ============================================================
+
+inline v_f32x4 v_load_even_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).even;
+}
+inline v_f32x4 v_load_odd_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).odd;
+}
+inline v_f32x8 v_load_even_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).even;
+}
+inline v_f32x8 v_load_odd_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).odd;
+}
+inline v_f16x8 v_load_even_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).even;
+}
+inline v_f16x8 v_load_odd_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).odd;
+}
+
+// ============================================================
+// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_*
+// ============================================================
+
+inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).even;
+}
+inline v_f32x4 v_load_stride2_odd_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).odd;
+}
+inline v_f32x8 v_load_stride2_even_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).even;
+}
+inline v_f32x8 v_load_stride2_odd_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).odd;
+}
+inline v_f16x8 v_load_stride2_even_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).even;
+}
+inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
+    return v_deinterleave_f16x8(src).odd;
+}
+
 } // namespace neon
 } // namespace arch
 } // namespace simd

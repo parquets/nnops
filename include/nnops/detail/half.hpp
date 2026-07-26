@@ -2,12 +2,51 @@
 /// @file half.hpp
 /// @brief IEEE 754 binary16 (half-precision) type and conversion utilities.
 ///
-/// Portable implementation using bit manipulation. For x86_64 with F16C
-/// support, conversion can use _mm_cvtss_sh / _mm_cvtph_ps intrinsics
-/// directly in the micro-kernel files; this header provides the scalar
-/// fallback and the type definition.
+/// On x86_64 this is a custom uint16_t wrapper with software conversion
+/// routines (used with F16C intrinsics in micro-kernels).
+///
+/// On AArch64, half is the native __fp16 type and conversions are trivial
+/// (the compiler handles fp16↔fp32 natively).
 
 #include <cstdint>
+
+// =========================================================================
+//  Architecture dispatch: native __fp16 (AArch64) vs uint16_t wrapper
+// =========================================================================
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(NNOPS_ARCH_AARCH64)
+
+namespace nnops::backend::cpu {
+
+/// @brief Half-precision floating-point value — native __fp16 on AArch64.
+using half = __fp16;
+
+/// @brief Convert a binary16 value to float32.
+inline float half_to_float(half h) noexcept {
+    return static_cast<float>(h);
+}
+
+/// @brief Convert a float32 value to binary16.
+inline half float_to_half(float f) noexcept {
+    return static_cast<__fp16>(f);
+}
+
+/// @brief Convert array of fp16 to fp32 / fp32 to fp16.
+inline void convert_half_to_float(float* dst, const half* src, int n) noexcept {
+    for (int i = 0; i < n; ++i) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+}
+
+inline void convert_float_to_half(half* dst, const float* src, int n) noexcept {
+    for (int i = 0; i < n; ++i) {
+        dst[i] = static_cast<__fp16>(src[i]);
+    }
+}
+
+}  // namespace nnops::backend::cpu
+
+#else  // x86_64 / generic — uint16_t wrapper with software conversion
 
 namespace nnops::backend::cpu {
 
@@ -103,3 +142,5 @@ inline void convert_float_to_half(half* dst, const float* src, int n) noexcept {
 /// @}
 
 }  // namespace nnops::backend::cpu
+
+#endif  // AArch64 vs x86_64

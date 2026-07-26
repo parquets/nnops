@@ -48,6 +48,13 @@
   using arch::neon::v_reduce_sum;
   using arch::neon::v_reduce_max;
   using arch::neon::v_reduce_min;
+  // deinterleave
+  using arch::neon::v_f16x8x2_t;
+  using arch::neon::v_deinterleave_f16x8;
+  using arch::neon::v_load_even_f16x8;
+  using arch::neon::v_load_odd_f16x8;
+  using arch::neon::v_load_stride2_even_f16x8;
+  using arch::neon::v_load_stride2_odd_f16x8;
   }} // namespace nnops::simd
 #elif defined(NNOPS_ARCH_X86_64) && defined(__F16C__)
   // x86_64: F16C + AVX2 (__m128i storage, convert→compute→convert via _mm256_cvtph_ps / _mm256_cvtps_ph)
@@ -81,6 +88,13 @@
   using arch::sse::v_reduce_sum;
   using arch::sse::v_reduce_max;
   using arch::sse::v_reduce_min;
+  // deinterleave
+  using arch::sse::v_f16x8x2_t;
+  using arch::sse::v_deinterleave_f16x8;
+  using arch::sse::v_load_even_f16x8;
+  using arch::sse::v_load_odd_f16x8;
+  using arch::sse::v_load_stride2_even_f16x8;
+  using arch::sse::v_load_stride2_odd_f16x8;
   }} // namespace nnops::simd
 #else
   // Scalar fallback
@@ -112,5 +126,12 @@
   using arch::scalar::v_reduce_sum;
   using arch::scalar::v_reduce_max;
   using arch::scalar::v_reduce_min;
+  // deinterleave
+  using arch::scalar::v_f16x8x2_t;
+  using arch::scalar::v_deinterleave_f16x8;
+  using arch::scalar::v_load_even_f16x8;
+  using arch::scalar::v_load_odd_f16x8;
+  using arch::scalar::v_load_stride2_even_f16x8;
+  using arch::scalar::v_load_stride2_odd_f16x8;
   }} // namespace nnops::simd
 #endif

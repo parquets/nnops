@@ -20,7 +20,7 @@
 ///   1. SIMD kernels accept pre-positioned pointers, use only relative offsets
 ///   2. No per-element validity checks in SIMD — caller guarantees valid interior region
 ///   3. Width-SIMD via v_f32x8/v_f16x8 (simd_lane_for<T>-wide; AVX2 native, SSE/NEON emulated)
-///   4. SIMD gated on stride_w == 1 (nnops SIMD has no gather; contiguous loads required)
+///   4. SW == 1: v_load (contiguous). SW == 2: v_load_even (stride-2 gather via LD2/UNPCK).
 ///   5. AverageExcludePad and Lp pooling: scalar-only (per-element counting needed)
 ///   6. Unified 2D/3D code path: KD=1/SD=1/DD=1/PD=0/ID=1/OD=1 for 2D
 ///   7. add_to support: branch-hoisted; one extra load per v_store when enabled
@@ -172,8 +172,8 @@ inline void pooling_scalar_row(
 
 /// Process 4 output rows × ow_count output columns with element-wise v_max.
 /// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
-/// Called only for interior valid region (SW == 1 required).
-template <typename T>
+/// SW_val: 1 = v_load contiguous; 2 = v_load_even stride-2 gather.
+template <typename T, int SW_val>
 inline void maxpool_h4_simd(
     T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
@@ -182,6 +182,7 @@ inline void maxpool_h4_simd(
     int64_t ow_count,
     int64_t out_row_stride, int64_t out_w_stride,
     int64_t in_d_stride, int64_t in_row_stride,
+    float /*scale*/,
     bool add_to)
 {
 
@@ -202,11 +203,18 @@ inline void maxpool_h4_simd(
                 const int64_t h_off2 = (2 * SH + kh * DH) * in_row_stride;
                 const int64_t h_off3 = (3 * SH + kh * DH) * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = ow + kw * DW;
-                    vacc0 = v_max(vacc0, v_load(input + d_off + h_off0 + kw_off));
-                    vacc1 = v_max(vacc1, v_load(input + d_off + h_off1 + kw_off));
-                    vacc2 = v_max(vacc2, v_load(input + d_off + h_off2 + kw_off));
-                    vacc3 = v_max(vacc3, v_load(input + d_off + h_off3 + kw_off));
+                    const int64_t kw_off = ow * SW_val + kw * DW;
+                    if constexpr (SW_val == 2) {
+                        vacc0 = v_max(vacc0, v_load_even(input + d_off + h_off0 + kw_off));
+                        vacc1 = v_max(vacc1, v_load_even(input + d_off + h_off1 + kw_off));
+                        vacc2 = v_max(vacc2, v_load_even(input + d_off + h_off2 + kw_off));
+                        vacc3 = v_max(vacc3, v_load_even(input + d_off + h_off3 + kw_off));
+                    } else {
+                        vacc0 = v_max(vacc0, v_load(input + d_off + h_off0 + kw_off));
+                        vacc1 = v_max(vacc1, v_load(input + d_off + h_off1 + kw_off));
+                        vacc2 = v_max(vacc2, v_load(input + d_off + h_off2 + kw_off));
+                        vacc3 = v_max(vacc3, v_load(input + d_off + h_off3 + kw_off));
+                    }
                 }
             }
         }
@@ -232,8 +240,8 @@ inline void maxpool_h4_simd(
 
 /// Process 1 output row × ow_count output columns with element-wise v_max.
 /// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
-/// Called only for interior valid region (SW == 1 required).
-template <typename T>
+/// SW_val: 1 = v_load contiguous; 2 = v_load_even stride-2 gather.
+template <typename T, int SW_val>
 inline void maxpool_h1_simd(
     T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
@@ -242,6 +250,7 @@ inline void maxpool_h1_simd(
     int64_t ow_count,
     int64_t out_row_stride, int64_t out_w_stride,
     int64_t in_d_stride, int64_t in_row_stride,
+    float /*scale*/,
     bool add_to)
 {
 
@@ -256,8 +265,12 @@ inline void maxpool_h1_simd(
             for (int64_t kh = 0; kh < KH; ++kh) {
                 const int64_t h_off = kh * DH * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = ow + kw * DW;
-                    vacc = v_max(vacc, v_load(input + d_off + h_off + kw_off));
+                    const int64_t kw_off = ow * SW_val + kw * DW;
+                    if constexpr (SW_val == 2) {
+                        vacc = v_max(vacc, v_load_even(input + d_off + h_off + kw_off));
+                    } else {
+                        vacc = v_max(vacc, v_load(input + d_off + h_off + kw_off));
+                    }
                 }
             }
         }
@@ -278,8 +291,8 @@ inline void maxpool_h1_simd(
 
 /// Process 4 output rows × ow_count output columns with FMA accumulation + scale by 1/kernel_area.
 /// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
-/// Called only for interior valid region (SW == 1 required).
-template <typename T>
+/// SW_val: 1 = v_load contiguous; 2 = v_load_even stride-2 gather.
+template <typename T, int SW_val>
 inline void avgpool_h4_simd(
     T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
@@ -308,11 +321,18 @@ inline void avgpool_h4_simd(
                 const int64_t h_off2 = (2 * SH + kh * DH) * in_row_stride;
                 const int64_t h_off3 = (3 * SH + kh * DH) * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = ow + kw * DW;
-                    vacc0 = v_fmadd(v_load(input + d_off + h_off0 + kw_off), vscale, vacc0);
-                    vacc1 = v_fmadd(v_load(input + d_off + h_off1 + kw_off), vscale, vacc1);
-                    vacc2 = v_fmadd(v_load(input + d_off + h_off2 + kw_off), vscale, vacc2);
-                    vacc3 = v_fmadd(v_load(input + d_off + h_off3 + kw_off), vscale, vacc3);
+                    const int64_t kw_off = ow * SW_val + kw * DW;
+                    if constexpr (SW_val == 2) {
+                        vacc0 = v_fmadd(v_load_even(input + d_off + h_off0 + kw_off), vscale, vacc0);
+                        vacc1 = v_fmadd(v_load_even(input + d_off + h_off1 + kw_off), vscale, vacc1);
+                        vacc2 = v_fmadd(v_load_even(input + d_off + h_off2 + kw_off), vscale, vacc2);
+                        vacc3 = v_fmadd(v_load_even(input + d_off + h_off3 + kw_off), vscale, vacc3);
+                    } else {
+                        vacc0 = v_fmadd(v_load(input + d_off + h_off0 + kw_off), vscale, vacc0);
+                        vacc1 = v_fmadd(v_load(input + d_off + h_off1 + kw_off), vscale, vacc1);
+                        vacc2 = v_fmadd(v_load(input + d_off + h_off2 + kw_off), vscale, vacc2);
+                        vacc3 = v_fmadd(v_load(input + d_off + h_off3 + kw_off), vscale, vacc3);
+                    }
                 }
             }
         }
@@ -338,8 +358,8 @@ inline void avgpool_h4_simd(
 
 /// Process 1 output row × ow_count output columns with FMA accumulation + scale.
 /// ow_count must be a multiple of 8 (caller guarantees SIMD-aligned interior region).
-/// Called only for interior valid region (SW == 1 required).
-template <typename T>
+/// SW_val: 1 = v_load contiguous; 2 = v_load_even stride-2 gather.
+template <typename T, int SW_val>
 inline void avgpool_h1_simd(
     T* output, const T* input,
     int64_t KD, int64_t KH, int64_t KW,
@@ -362,8 +382,12 @@ inline void avgpool_h1_simd(
             for (int64_t kh = 0; kh < KH; ++kh) {
                 const int64_t h_off = kh * DH * in_row_stride;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t kw_off = ow + kw * DW;
-                    vacc = v_fmadd(v_load(input + d_off + h_off + kw_off), vscale, vacc);
+                    const int64_t kw_off = ow * SW_val + kw * DW;
+                    if constexpr (SW_val == 2) {
+                        vacc = v_fmadd(v_load_even(input + d_off + h_off + kw_off), vscale, vacc);
+                    } else {
+                        vacc = v_fmadd(v_load(input + d_off + h_off + kw_off), vscale, vacc);
+                    }
                 }
             }
         }
@@ -440,10 +464,11 @@ void pooling_impl(const PoolingAttributes& attrs,
     // ----- SIMD gating -----
     // Max and Average (includes pad) support SIMD via contiguous load.
     // AverageExcludePad and Lp require per-element counting → scalar only.
-    // stride_w == 1 is required for contiguous input loads (nnops has no gather ops).
+    // SW == 1: v_load reads 8 consecutive input elements.
+    // SW == 2: v_load_even reads 8 even-indexed input elements (16-span, stride-2).
     const bool pool_supports_simd =
         (attrs.type == PoolingType::Max || attrs.type == PoolingType::Average);
-    const bool use_simd = pool_supports_simd && (SW == 1);
+    const bool use_simd = pool_supports_simd && (SW == 1 || SW == 2);
 
     // ----- Interior valid region computation -----
     // The "interior" output region is where every kernel element maps to a valid
@@ -498,6 +523,22 @@ void pooling_impl(const PoolingAttributes& attrs,
 
     // AvgPool scale (pre-computed for SIMD kernel)
     const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
+
+    // ----- Function pointer selection: hoist SW+type dispatch out of hot loops -----
+    // Max and Avg kernels share the same signature (Max ignores the scale parameter).
+    using PoolingFn = void (*)(T*, const T*,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t,
+        float, bool);
+
+    PoolingFn pool_h4_fn, pool_h1_fn;
+    if (attrs.type == PoolingType::Max) {
+        pool_h4_fn = (SW == 2) ? maxpool_h4_simd<T, 2> : maxpool_h4_simd<T, 1>;
+        pool_h1_fn = (SW == 2) ? maxpool_h1_simd<T, 2> : maxpool_h1_simd<T, 1>;
+    } else {
+        pool_h4_fn = (SW == 2) ? avgpool_h4_simd<T, 2> : avgpool_h4_simd<T, 1>;
+        pool_h1_fn = (SW == 2) ? avgpool_h1_simd<T, 2> : avgpool_h1_simd<T, 1>;
+    }
 
     // ----- Per-channel compute lambda (N*C parallel) -----
     const auto compute_channel = [&](int64_t n, int64_t c) {
@@ -565,25 +606,15 @@ void pooling_impl(const PoolingAttributes& attrs,
                         const T* in_simd = in_ch
                             + id_base * in_d_stride
                             + ih_base * in_row_stride
-                            + (ow_simd_beg - PW);
+                            + (ow_simd_beg * SW - PW);   // ow * SW for general stride
 
-                        if (attrs.type == PoolingType::Max) {
-                            maxpool_h4_simd(out_simd, in_simd,
-                                            KD, KH, KW, SH,
-                                            DD_, DH, DW,
-                                            ow_simd_elems,
-                                            out_row_stride, out_w_stride,
-                                            in_d_stride, in_row_stride,
-                                            attrs.add_to);
-                        } else {
-                            avgpool_h4_simd(out_simd, in_simd,
-                                            KD, KH, KW, SH,
-                                            DD_, DH, DW,
-                                            ow_simd_elems,
-                                            out_row_stride, out_w_stride,
-                                            in_d_stride, in_row_stride,
-                                            avg_scale, attrs.add_to);
-                        }
+                        pool_h4_fn(out_simd, in_simd,
+                                   KD, KH, KW, SH,
+                                   DD_, DH, DW,
+                                   ow_simd_elems,
+                                   out_row_stride, out_w_stride,
+                                   in_d_stride, in_row_stride,
+                                   avg_scale, attrs.add_to);
                     }
 
                     // SIMD tail (interior columns not 8-aligned)
@@ -633,25 +664,15 @@ void pooling_impl(const PoolingAttributes& attrs,
                         const T* in_simd = in_ch
                             + id_base * in_d_stride
                             + ih_base * in_row_stride
-                            + (ow_simd_beg - PW);
+                            + (ow_simd_beg * SW - PW);   // ow * SW for general stride
 
-                        if (attrs.type == PoolingType::Max) {
-                            maxpool_h1_simd(out_simd, in_simd,
-                                            KD, KH, KW, SH,
-                                            DD_, DH, DW,
-                                            ow_simd_elems,
-                                            out_row_stride, out_w_stride,
-                                            in_d_stride, in_row_stride,
-                                            attrs.add_to);
-                        } else {
-                            avgpool_h1_simd(out_simd, in_simd,
-                                            KD, KH, KW, SH,
-                                            DD_, DH, DW,
-                                            ow_simd_elems,
-                                            out_row_stride, out_w_stride,
-                                            in_d_stride, in_row_stride,
-                                            avg_scale, attrs.add_to);
-                        }
+                        pool_h1_fn(out_simd, in_simd,
+                                   KD, KH, KW, SH,
+                                   DD_, DH, DW,
+                                   ow_simd_elems,
+                                   out_row_stride, out_w_stride,
+                                   in_d_stride, in_row_stride,
+                                   avg_scale, attrs.add_to);
                     }
 
                     // SIMD tail

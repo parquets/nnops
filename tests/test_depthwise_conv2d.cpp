@@ -384,7 +384,7 @@ NNOPS_TEST(dwconv_simd_vs_ref_with_pad) {
 }
 
 NNOPS_TEST(dwconv_simd_vs_ref_stride_2) {
-    // Stride=2 uses scalar path in the optimized kernel
+    // Stride=2 uses v_load_even SIMD (stride-2 gather via LD2/UNPCK)
     auto [in_vec, input]   = test::make_random_tensor({1, 3, 8, 8});
     auto [w_vec, weight]   = test::make_random_tensor({3, 1, 3, 3});
     std::vector<float> out_buf(1 * 3 * 3 * 3);

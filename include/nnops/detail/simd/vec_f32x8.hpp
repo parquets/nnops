@@ -49,6 +49,13 @@
     using arch::avx2::v_reduce_sum;
     using arch::avx2::v_reduce_max;
     using arch::avx2::v_reduce_min;
+    // deinterleave
+    using arch::avx2::v_f32x8x2_t;
+    using arch::avx2::v_deinterleave_f32x8;
+    using arch::avx2::v_load_even_f32x8;
+    using arch::avx2::v_load_odd_f32x8;
+    using arch::avx2::v_load_stride2_even_f32x8;
+    using arch::avx2::v_load_stride2_odd_f32x8;
     }} // namespace nnops::simd
   #else
     // x86_64 without AVX: emulate with two SSE registers
@@ -83,6 +90,13 @@
     using arch::sse::v_reduce_sum;
     using arch::sse::v_reduce_max;
     using arch::sse::v_reduce_min;
+    // deinterleave
+    using arch::sse::v_f32x8x2_t;
+    using arch::sse::v_deinterleave_f32x8;
+    using arch::sse::v_load_even_f32x8;
+    using arch::sse::v_load_odd_f32x8;
+    using arch::sse::v_load_stride2_even_f32x8;
+    using arch::sse::v_load_stride2_odd_f32x8;
     }} // namespace nnops::simd
   #endif  // __AVX__
 
@@ -118,6 +132,13 @@
   using arch::neon::v_reduce_sum;
   using arch::neon::v_reduce_max;
   using arch::neon::v_reduce_min;
+  // deinterleave
+  using arch::neon::v_f32x8x2_t;
+  using arch::neon::v_deinterleave_f32x8;
+  using arch::neon::v_load_even_f32x8;
+  using arch::neon::v_load_odd_f32x8;
+  using arch::neon::v_load_stride2_even_f32x8;
+  using arch::neon::v_load_stride2_odd_f32x8;
   }} // namespace nnops::simd
 
 #else
@@ -150,5 +171,12 @@
   using arch::scalar::v_reduce_sum;
   using arch::scalar::v_reduce_max;
   using arch::scalar::v_reduce_min;
+  // deinterleave
+  using arch::scalar::v_f32x8x2_t;
+  using arch::scalar::v_deinterleave_f32x8;
+  using arch::scalar::v_load_even_f32x8;
+  using arch::scalar::v_load_odd_f32x8;
+  using arch::scalar::v_load_stride2_even_f32x8;
+  using arch::scalar::v_load_stride2_odd_f32x8;
   }} // namespace nnops::simd
 #endif

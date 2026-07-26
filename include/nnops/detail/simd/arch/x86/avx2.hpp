@@ -237,6 +237,75 @@ inline float v_reduce_min(const v_f32x8& a) {
     return v_reduce_min(v_f32x4(min128));
 }
 
+// ============================================================
+// Deinterleave (stride-2 gather) — pair types
+// ============================================================
+
+/// @brief Pair of v_f32x4 registers: even- and odd-indexed elements.
+struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
+
+/// @brief Pair of v_f32x8 registers: even- and odd-indexed elements.
+struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
+
+// ============================================================
+// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
+// ============================================================
+
+/// @brief Load 8 contiguous f32s, return {a0,a2,a4,a6}, {a1,a3,a5,a7}.
+inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
+    __m128 lo   = _mm_loadu_ps(src);       // a0, a1, a2, a3
+    __m128 hi   = _mm_loadu_ps(src + 4);   // a4, a5, a6, a7
+    __m128 t0   = _mm_unpacklo_ps(lo, hi); // a0, a4, a1, a5
+    __m128 t1   = _mm_unpackhi_ps(lo, hi); // a2, a6, a3, a7
+    return {v_f32x4(_mm_unpacklo_ps(t0, t1)),   // a0, a2, a4, a6
+            v_f32x4(_mm_unpackhi_ps(t0, t1))};  // a1, a3, a5, a7
+}
+
+/// @brief Load 16 contiguous f32s, return {even}, {odd} — each v_f32x8.
+inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
+    v_f32x4x2_t lo = v_deinterleave_f32x4(src);
+    v_f32x4x2_t hi = v_deinterleave_f32x4(src + 8);
+    __m256 even = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(lo.even.val), hi.even.val, 1);
+    __m256 odd  = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(lo.odd.val),  hi.odd.val,  1);
+    return {v_f32x8(even), v_f32x8(odd)};
+}
+
+// ============================================================
+// 方案 B: v_load_even_* / v_load_odd_* — single-result convenience
+// ============================================================
+
+inline v_f32x4 v_load_even_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).even;
+}
+inline v_f32x4 v_load_odd_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).odd;
+}
+inline v_f32x8 v_load_even_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).even;
+}
+inline v_f32x8 v_load_odd_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).odd;
+}
+
+// ============================================================
+// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_* — explicit names
+// ============================================================
+
+inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).even;
+}
+inline v_f32x4 v_load_stride2_odd_f32x4(const float* src) {
+    return v_deinterleave_f32x4(src).odd;
+}
+inline v_f32x8 v_load_stride2_even_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).even;
+}
+inline v_f32x8 v_load_stride2_odd_f32x8(const float* src) {
+    return v_deinterleave_f32x8(src).odd;
+}
+
 } // namespace avx2
 } // namespace arch
 } // namespace simd

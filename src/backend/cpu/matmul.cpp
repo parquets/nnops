@@ -26,43 +26,16 @@ extern void matmul_ref(const MatMulAttributes& attrs,
 }
 
 // =========================================================================
-//  Architecture-conditional: f16 pointer types, panel sizes
+//  Panel-size compile-time constants from the active arch namespace.
 // =========================================================================
-// Duplicates the arch block from imatmul.cpp — these are ISA facts,
-// not implementation details of imatmul.
+// These come from imatmul.h — arch::mr_f32 / arch::nr_f32 etc. are
+// defined in the arch-specific pack_f32.hpp / pack_f16.hpp headers and
+// exposed through the `arch` namespace alias.
 
-#if defined(NNOPS_ARCH_X86_64)
-  #define F16_PTR  half*
-  #define F16_CPTR const half*
-  // f32
-  #define F32_MR0 6
-  #define F32_MR1 4
-  #define F32_NR0 16
-  #define F32_NR1 8
-  // f16
-  #define F16_MR0 6
-  #define F16_MR1 4
-  #define F16_NR0 16
-  #define F16_NR1 8
-#elif defined(NNOPS_ARCH_AARCH64)
-  #define F16_PTR  float16_t*
-  #define F16_CPTR const float16_t*
-  // f32
-  #define F32_MR0 8
-  #define F32_MR1 4
-  #define F32_NR0 12
-  #define F32_NR1 4
-  // f16
-  #define F16_MR0 8
-  #define F16_MR1 4
-  #define F16_NR0 16
-  #define F16_NR1 8
-#endif
-
-#define F32_MR2 1
-#define F32_NR2 1
-#define F16_MR2 1
-#define F16_NR2 1
+// arch::mr_f32 = {8,4,1} (aarch64) or {6,4,1} (x86_64)
+// arch::nr_f32 = {12,4,1} (aarch64) or {16,8,1} (x86_64)
+// arch::mr_f16 = {8,4,1} (aarch64) or {6,4,1} (x86_64)
+// arch::nr_f16 = {16,8,1} (aarch64) or {16,8,1} (x86_64)
 
 namespace nnops::backend::cpu {
 namespace {
@@ -71,20 +44,20 @@ namespace {
 //  Tiling constants
 // =========================================================================
 
-constexpr int KC_F32 = 128;
-constexpr int KC_F16 = 256;
+constexpr int KC_F32   = 128;
+constexpr int KC_F16   = 256;
+constexpr int KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
+constexpr int KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
+
 constexpr int MC_TARGET = 192;  // 192/6=32 (x86), 192/8=24 (aarch64)
 
-// Panel size arrays (largest-first decomposition)
-constexpr int MR_F32[3] = {F32_MR0, F32_MR1, F32_MR2};
-constexpr int NR_F32[3] = {F32_NR0, F32_NR1, F32_NR2};
-constexpr int MR_F16[3] = {F16_MR0, F16_MR1, F16_MR2};
-constexpr int NR_F16[3] = {F16_NR0, F16_NR1, F16_NR2};
+// Placeholder max panel sizes for integer kernels (no SIMD kernels yet).
+// MR_MAX_F32 / NR_MAX_F32 / MR_MAX_F16 / NR_MAX_F16 are in imatmul.h.
+constexpr int MR_MAX_I8    = 4;
+constexpr int NR_MAX_I8    = 4;
+constexpr int MR_MAX_F16I4 = 4;
+constexpr int NR_MAX_F16I4 = 4;
 
-constexpr int MR_MAX_F32 = F32_MR0;
-constexpr int NR_MAX_F32 = F32_NR0;
-constexpr int MR_MAX_F16 = F16_MR0;
-constexpr int NR_MAX_F16 = F16_NR0;
 
 // =========================================================================
 //  Nc from L2 constraint
@@ -92,16 +65,11 @@ constexpr int NR_MAX_F16 = F16_NR0;
 // From: (mr × Kc + Nc × Kc + mr × Nc) × 2 × elem_size < L2_SIZE
 // → Nc < (L2_SIZE / (2 × elem_size) - mr × Kc) / (Kc + mr)
 
-inline int compute_nc_f32(int mr_max, size_t l2_size) noexcept {
-    int rhs   = static_cast<int>(l2_size / 8) - mr_max * KC_F32;
-    int denom = KC_F32 + mr_max;
+inline int compute_nc(int mr_max, int kc, int elem_bytes, size_t l2_size) noexcept {
+    int denom = 2 * elem_bytes;
+    int rhs   = static_cast<int>(l2_size / denom) - mr_max * kc;
+    denom = kc + mr_max;
     return (rhs / denom) - 1;  // -1 for safety margin
-}
-
-inline int compute_nc_f16(int mr_max, size_t l2_size) noexcept {
-    int rhs   = static_cast<int>(l2_size / 4) - mr_max * KC_F16;
-    int denom = KC_F16 + mr_max;
-    return (rhs / denom) - 1;
 }
 
 inline int round_down_nc(int nc, int nr_max) noexcept {
@@ -114,21 +82,56 @@ inline size_t workspace_bytes(int mc, int nc, int kc, size_t elem) noexcept {
 }
 
 
-void matmul_kernel_f32(const MatMulAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       void* workspace)
-{
+// =========================================================================
+//  Kernel stubs — dispatched by (A_dtype, B_dtype) pair
+// =========================================================================
 
+void matmul_kernel_f32(const MatMulAttributes& /*attrs*/,
+                       TensorView& /*output*/,
+                       std::span<const TensorView> /*inputs*/,
+                       void* /*workspace*/)
+{
+    // TODO: NKM tiled loop over Mc×Nc×Kc with imatmul pack + mma_pack
+}
+
+void matmul_kernel_f16(const MatMulAttributes& /*attrs*/,
+                       TensorView& /*output*/,
+                       std::span<const TensorView> /*inputs*/,
+                       void* /*workspace*/)
+{
+    // TODO: NKM tiled loop with imatmul f16 pack + mma_pack
 }
 
 
-void matmul_kernel_f16(const MatMulAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       void* workspace)
-{
+// ---- int8 kernels ----------------------------------------------------------
+// A (activation) may be u8 or i8; B (weight) is typically i8.
+// Output is i32 accumulator → stored as output dtype after epilogue.
 
+void matmul_kernel_u8i8(const MatMulAttributes& /*attrs*/,
+                        TensorView& /*output*/,
+                        std::span<const TensorView> /*inputs*/,
+                        void* /*workspace*/)
+{
+    // TODO: u8 activation × i8 weight → i32 accumulator
+}
+
+void matmul_kernel_i8i8(const MatMulAttributes& /*attrs*/,
+                        TensorView& /*output*/,
+                        std::span<const TensorView> /*inputs*/,
+                        void* /*workspace*/)
+{
+    // TODO: i8 activation × i8 weight → i32 accumulator
+}
+
+
+// ---- fp16×int4 kernel (future hardware) -----------------------------------
+
+void matmul_kernel_f16i4(const MatMulAttributes& /*attrs*/,
+                         TensorView& /*output*/,
+                         std::span<const TensorView> /*inputs*/,
+                         void* /*workspace*/)
+{
+    // TODO: fp16 activation × i4 weight (sub-byte packing required)
 }
 
 }  // anonymous namespace
@@ -153,17 +156,45 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
 
     size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
 
-    if (a_desc.dtype == DataType::f16) {
-        int nc = round_down_nc(compute_nc_f16(MR_MAX_F16, l2_size), NR_MAX_F16);
+    auto dtype_a = a_desc.dtype;
+    auto dtype_b = b_desc.dtype;
+
+    // ---- f16 ----------------------------------------------------------
+    if (dtype_a == DataType::f16 && dtype_b == DataType::f16) {
+        int nc = round_down_nc(compute_nc(MR_MAX_F16, KC_F16, 2, l2_size), NR_MAX_F16);
         int mc = std::min(MC_TARGET, static_cast<int>(M));
         nc = std::min(nc, static_cast<int>(N));
         return workspace_bytes(mc, nc, KC_F16, 2);
-    } else {
-        int nc = round_down_nc(compute_nc_f32(MR_MAX_F32, l2_size), NR_MAX_F32);
+    }
+
+    // ---- f32 ----------------------------------------------------------
+    if (dtype_a == DataType::f32 && dtype_b == DataType::f32) {
+        int nc = round_down_nc(compute_nc(MR_MAX_F32, KC_F32, 4, l2_size), NR_MAX_F32);
         int mc = std::min(MC_TARGET, static_cast<int>(M));
         nc = std::min(nc, static_cast<int>(N));
         return workspace_bytes(mc, nc, KC_F32, 4);
     }
+
+    // ---- int8 variants (u8×i8, i8×i8) ---------------------------------
+    if ((dtype_a == DataType::u8 || dtype_a == DataType::i8) && dtype_b == DataType::i8) {
+        // Placeholder: use MR_MAX_I8 / NR_MAX_I8 until SIMD kernels define real panels.
+        int nc = round_down_nc(compute_nc(MR_MAX_I8, KC_I8, 1, l2_size), NR_MAX_I8);
+        int mc = std::min(MC_TARGET, static_cast<int>(M));
+        nc = std::min(nc, static_cast<int>(N));
+        return workspace_bytes(mc, nc, KC_I8, 1);  // 1 byte per element
+    }
+
+    // ---- fp16×int4 (future) ------------------------------------------
+    if (dtype_a == DataType::f16 && dtype_b == DataType::i8) {
+        // i4 weights are packed 2× per i8 byte — placeholder sizing.
+        int nc = round_down_nc(compute_nc(MR_MAX_F16I4, KC_F16I4, 2, l2_size), NR_MAX_F16I4);
+        int mc = std::min(MC_TARGET, static_cast<int>(M));
+        nc = std::min(nc, static_cast<int>(N));
+        return workspace_bytes(mc, nc, KC_F16I4, 2);  // fp16 = 2 bytes per element
+    }
+
+    // ---- unsupported combination — fallback won't pack, just return minimal ----
+    return 0;
 }
 
 void matmul_kernel(const MatMulAttributes& attrs,
@@ -185,29 +216,44 @@ void matmul_kernel(const MatMulAttributes& attrs,
         return;
     }
 
-    if (a.data_type() == DataType::f16) {
-        matmul_kernel_f16(attrs, output, inputs, workspace);
-    } else {
+    const auto dt_a = a.data_type();
+    const auto dt_b = b.data_type();
+
+    // ---- f32 × f32 ----------------------------------------------------
+    if (dt_a == DataType::f32 && dt_b == DataType::f32) {
         matmul_kernel_f32(attrs, output, inputs, workspace);
+        return;
     }
+
+    // ---- f16 × f16 ----------------------------------------------------
+    if (dt_a == DataType::f16 && dt_b == DataType::f16) {
+        matmul_kernel_f16(attrs, output, inputs, workspace);
+        return;
+    }
+
+    // ---- u8 × i8 (unsigned activation, signed weight) -----------------
+    if (dt_a == DataType::u8 && dt_b == DataType::i8) {
+        matmul_kernel_u8i8(attrs, output, inputs, workspace);
+        return;
+    }
+
+    // ---- i8 × i8 ------------------------------------------------------
+    if (dt_a == DataType::i8 && dt_b == DataType::i8) {
+        matmul_kernel_i8i8(attrs, output, inputs, workspace);
+        return;
+    }
+
+    // ---- fp16 × int4 (future: i4 weights packed 2× per byte) -----------
+    // B dtype is i8 (container for packed i4) — distinction TBD when i4
+    // becomes a first-class DataType.
+    if (dt_a == DataType::f16 && dt_b == DataType::i8) {
+        matmul_kernel_f16i4(attrs, output, inputs, workspace);
+        return;
+    }
+
+    // Unsupported dtype combination — fall back to reference.
+    reference::matmul_ref(attrs, output, inputs, ctx, workspace);
 }
 
 }  // namespace nnops::backend::cpu
 
-// =========================================================================
-//  Clean up file-scoped macros
-// =========================================================================
-#undef F16_PTR
-#undef F16_CPTR
-#undef F32_MR0
-#undef F32_MR1
-#undef F32_MR2
-#undef F32_NR0
-#undef F32_NR1
-#undef F32_NR2
-#undef F16_MR0
-#undef F16_MR1
-#undef F16_MR2
-#undef F16_NR0
-#undef F16_NR1
-#undef F16_NR2
