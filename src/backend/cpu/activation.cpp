@@ -26,6 +26,40 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 // ============================================================
+// Shared row-processing helper — eliminates the identical
+// row-loop + SIMD/scalar + add_to boilerplate across all 8
+// activation types. Each case now passes just its SIMD kernel
+// and scalar formula as lambdas.
+// ============================================================
+
+template <typename T, typename SimdK, typename ScalarK>
+inline void process_activation_rows(
+    const T* in_ptr, T* out_ptr,
+    int64_t num_rows, int64_t last_dim,
+    int64_t in_row_stride, int64_t out_row_stride,
+    bool add_to,
+    SimdK&& simd_kernel,
+    ScalarK&& scalar_kernel)
+{
+    constexpr int L = simd_lane_for<T>;
+    for (int64_t r = 0; r < num_rows; ++r) {
+        const T* in_row = in_ptr + r * in_row_stride;
+        T* out_row = out_ptr + r * out_row_stride;
+        int64_t i = 0;
+        for (; i + L <= last_dim; i += L) {
+            auto rv = simd_kernel(v_load(in_row + i));
+            if (add_to) { rv = v_add(v_load(out_row + i), rv); }
+            v_store(out_row + i, rv);
+        }
+        for (; i < last_dim; ++i) {
+            float rv = scalar_kernel(s_load(&in_row[i]));
+            if (add_to) { rv += s_load(&out_row[i]); }
+            s_store(&out_row[i], rv);
+        }
+    }
+}
+
+// ============================================================
 // Templated implementation (f32 and f16)
 // ============================================================
 
@@ -51,233 +85,80 @@ void activation_impl(const ActivationAttributes& attrs,
     auto* out_ptr = output.ptr<T>();
     const bool add_to = attrs.add_to;
 
-    constexpr int L = simd_lane_for<T>;
+    // Pre-computed constants used by multiple cases.
     const auto vzero = v_zero(in_ptr);
+    const auto vone  = v_set1(in_ptr, 1.0f);
 
     switch (attrs.type) {
 
-    // ---- Relu: max(x, 0) ----
-    case ActivationType::Relu: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = kernel_relu(v_load(in_row + i), vzero); 
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float v = s_load(&in_row[i]);
-                float rv = (v > 0.0f ? v : 0.0f);
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+    case ActivationType::Relu:
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_relu(x, vzero); },
+            [](float v) { return v > 0.0f ? v : 0.0f; });
         break;
-    }
 
-    // ---- LeakyRelu: max(x,0) + alpha * min(x,0) ----
     case ActivationType::LeakyRelu: {
-        const float alpha = attrs.alpha;
-        const auto a8 = v_set1(in_ptr, alpha);
-
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto x = v_load(in_row + i);
-                auto rv = kernel_leaky_relu(x, vzero, a8);
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float v = s_load(&in_row[i]);
-                float rv = (v > 0.0f ? v : alpha * v);
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+        const auto a8 = v_set1(in_ptr, attrs.alpha);
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_leaky_relu(x, vzero, a8); },
+            [&](float v) { return v > 0.0f ? v : attrs.alpha * v; });
         break;
     }
 
-    // ---- Sigmoid: 1 / (1 + exp(-x)) ----
-    case ActivationType::Sigmoid: {
-        const auto one8 = v_set1(in_ptr, 1.0f);
-
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto x = v_load(in_row + i);
-                auto rv = kernel_sigmoid(x, one8);
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float v = s_load(&in_row[i]);
-                float rv = 1.0f / (1.0f + std::exp(-v));
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+    case ActivationType::Sigmoid:
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_sigmoid(x, vone); },
+            [](float v) { return 1.0f / (1.0f + std::exp(-v)); });
         break;
-    }
 
-    // ---- Tanh ----
-    case ActivationType::Tanh: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = kernel_tanh(v_load(in_row + i));
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::tanh(s_load(&in_row[i]));
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+    case ActivationType::Tanh:
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_tanh(x); },
+            [](float v) { return std::tanh(v); });
         break;
-    }
 
-    // ---- GELU: 0.5 * x * (1 + tanh(c * (x + 0.044715 * x^3)))
-    //       where c = sqrt(2/pi) ----
     case ActivationType::Gelu: {
         const auto half8  = v_set1(in_ptr, 0.5f);
-        const auto one8   = v_set1(in_ptr, 1.0f);
         const auto c8     = v_set1(in_ptr, 0.7978845608028654f);
         const auto coeff8 = v_set1(in_ptr, 0.044715f);
-
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = kernel_gelu(v_load(in_row + i), half8, one8, c8, coeff8);
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float x = s_load(&in_row[i]);
-                float rv = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_gelu(x, half8, vone, c8, coeff8); },
+            [](float x) {
+                return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+            });
         break;
     }
 
-    // ---- SiLU (Swish): x / (1 + exp(-x)) ----
-    case ActivationType::Silu: {
-        const auto one8 = v_set1(in_ptr, 1.0f);
-
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto x = v_load(in_row + i);
-                auto rv = kernel_silu(x, one8);
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float x = s_load(&in_row[i]);
-                float rv = x / (1.0f + std::exp(-x));
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+    case ActivationType::Silu:
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_silu(x, vone); },
+            [](float x) { return x / (1.0f + std::exp(-x)); });
         break;
-    }
 
-    // ---- HardSwish: x * relu6(x+3) * (beta/6)
-    //       relu6(y) = min(max(y, 0), 6) ----
     case ActivationType::HardSwish: {
         const float bd6 = attrs.beta / 6.0f;
         const auto three8 = v_set1(in_ptr, 3.0f);
         const auto six8   = v_set1(in_ptr, 6.0f);
         const auto scale8 = v_set1(in_ptr, bd6);
-
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = kernel_hard_swish(v_load(in_row + i), vzero, three8, six8, scale8);
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float x = s_load(&in_row[i]);
-                float rv = x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6;
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_hard_swish(x, vzero, three8, six8, scale8); },
+            [bd6](float x) { return x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6; });
         break;
     }
 
-    // ---- ELU: max(x,0) + alpha * (exp(min(x,0)) - 1) ----
     case ActivationType::Elu: {
-        const float alpha = attrs.alpha;
-        const auto a8   = v_set1(in_ptr, alpha);
-        const auto one8 = v_set1(in_ptr, 1.0f);
-
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = kernel_elu(v_load(in_row + i), vzero, a8, one8);
-                if (add_to) {
-                    rv = v_add(v_load(out_row + i), rv);
-                }
-                v_store(out_row + i, rv);
-            }
-            for (; i < last_dim; ++i) {
-                float x = s_load(&in_row[i]);
-                float rv = (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f));
-                if (add_to) {
-                    rv += s_load(&out_row[i]);
-                }
-                s_store(&out_row[i], rv);
-            }
-        }
+        const auto a8 = v_set1(in_ptr, attrs.alpha);
+        process_activation_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [&](auto x) { return kernel_elu(x, vzero, a8, vone); },
+            [&](float x) { return x > 0.0f ? x : attrs.alpha * (std::exp(x) - 1.0f); });
         break;
     }
 

@@ -76,111 +76,62 @@ inline float apply_epilogue(const Epilogue& ep, float x, int64_t /*channel*/) {
 }  // namespace nnops
 
 // ============================================================
-// SIMD vector apply_epilogue
+// SIMD vector apply_epilogue — unified template
 // ============================================================
 
 namespace nnops::backend::cpu {
 
 using namespace simd;
 
-// ============================================================
-// apply_epilogue for v_f32x8 — fully vectorized activation
-// ============================================================
+/// Deduce the SIMD vector type for a given data pointer type T*.
+/// v_load(float*) → v_f32x8, v_load(half*) → v_f16x8.
+template <typename T>
+using vec_for = decltype(v_load(std::declval<const T*>()));
 
-/// Apply epilogue to an 8-wide f32 SIMD vector.
+/// Apply epilogue to a SIMD vector (unified f32/f16 via type tag dispatch).
 ///
-/// Uses native SIMD operations for each activation type.
-/// Comparison + bitwise-AND blend pattern:
-///   result = (mask_pos & vx) | (mask_neg & v_alt)
-/// where mask_pos = cmpgt(vx, 0) and mask_neg = cmplt(vx, 0).
-/// At x==0 both masks are 0 so result is 0, which is correct for
-/// Relu/LeakyRelu/Elu (0 maps to 0 in all branches).
-inline v_f32x8 apply_epilogue_f32x8(const Epilogue& ep, v_f32x8 vx) {
+/// The type_tag pointer is used for v_set1/v_zero overload resolution,
+/// matching the pattern in activation.cpp. No per-type duplication needed.
+///
+/// All activation types use min/max decomposition (no comparison+blend),
+/// so the kernel works uniformly across f32x8, f16x8, and all backends.
+template <typename T>
+inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
+                                      const T* type_tag,
+                                      vec_for<T> vx) {
     switch (ep.type) {
     case EpilogueActivateType::None:
         return vx;
     case EpilogueActivateType::Relu:
-        return kernel_relu(vx, v_zero_f32x8());
+        return kernel_relu(vx, v_zero(type_tag));
     case EpilogueActivateType::LeakyRelu:
-        return kernel_leaky_relu(vx, v_zero_f32x8(), v_set1_f32x8(ep.alpha));
+        return kernel_leaky_relu(vx, v_zero(type_tag),
+                                 v_set1(type_tag, ep.alpha));
     case EpilogueActivateType::Sigmoid:
-        return kernel_sigmoid(vx, v_set1_f32x8(1.0f));
+        return kernel_sigmoid(vx, v_set1(type_tag, 1.0f));
     case EpilogueActivateType::Tanh:
         return kernel_tanh(vx);
     case EpilogueActivateType::Gelu: {
         constexpr float c = 0.7978845608028654f;
         return kernel_gelu(vx,
-            v_set1_f32x8(0.5f),
-            v_set1_f32x8(1.0f),
-            v_set1_f32x8(c),
-            v_set1_f32x8(0.044715f));
+            v_set1(type_tag, 0.5f),
+            v_set1(type_tag, 1.0f),
+            v_set1(type_tag, c),
+            v_set1(type_tag, 0.044715f));
     }
     case EpilogueActivateType::Silu:
-        return kernel_silu(vx, v_set1_f32x8(1.0f));
+        return kernel_silu(vx, v_set1(type_tag, 1.0f));
     case EpilogueActivateType::HardSwish:
         return kernel_hard_swish(vx,
-            v_zero_f32x8(),
-            v_set1_f32x8(3.0f),
-            v_set1_f32x8(6.0f),
-            v_set1_f32x8(ep.beta / 6.0f));
+            v_zero(type_tag),
+            v_set1(type_tag, 3.0f),
+            v_set1(type_tag, 6.0f),
+            v_set1(type_tag, ep.beta / 6.0f));
     case EpilogueActivateType::Elu:
         return kernel_elu(vx,
-            v_zero_f32x8(),
-            v_set1_f32x8(ep.alpha),
-            v_set1_f32x8(1.0f));
-    }
-    return vx;
-}
-
-// ============================================================
-// apply_epilogue for v_f16x8 — native f16x8 SIMD with
-//   min/max decomposition to avoid comparison ops
-// ============================================================
-
-/// Apply epilogue to an 8-wide f16 SIMD vector.
-///
-/// Uses native f16x8 SIMD operations directly (no f16→f32→f16 conversion).
-///
-/// LeakyRelu and Elu use a min/max decomposition that avoids the need for
-/// v_cmpgt/v_cmplt/v_and (which are not available on all f16x8 backends):
-///   LeakyRelu(x) = max(0, x) + min(0, alpha * x)
-///   Elu(x)      = max(0, x) + min(0, alpha * (exp(x) - 1))
-///
-/// This is mathematically equivalent to the branch-based formula and works
-/// on all platforms (NEON native fp16, x86 F16C, and scalar fallback).
-inline v_f16x8 apply_epilogue_f16x8(const Epilogue& ep, v_f16x8 vx) {
-    switch (ep.type) {
-    case EpilogueActivateType::None:
-        return vx;
-    case EpilogueActivateType::Relu:
-        return kernel_relu(vx, v_set1_f16x8(0.0f));
-    case EpilogueActivateType::LeakyRelu:
-        return kernel_leaky_relu(vx, v_set1_f16x8(0.0f), v_set1_f16x8(ep.alpha));
-    case EpilogueActivateType::Sigmoid:
-        return kernel_sigmoid(vx, v_set1_f16x8(1.0f));
-    case EpilogueActivateType::Tanh:
-        return kernel_tanh(vx);
-    case EpilogueActivateType::Gelu: {
-        constexpr float c = 0.7978845608028654f;
-        return kernel_gelu(vx,
-            v_set1_f16x8(0.5f),
-            v_set1_f16x8(1.0f),
-            v_set1_f16x8(c),
-            v_set1_f16x8(0.044715f));
-    }
-    case EpilogueActivateType::Silu:
-        return kernel_silu(vx, v_set1_f16x8(1.0f));
-    case EpilogueActivateType::HardSwish:
-        return kernel_hard_swish(vx,
-            v_set1_f16x8(0.0f),
-            v_set1_f16x8(3.0f),
-            v_set1_f16x8(6.0f),
-            v_set1_f16x8(ep.beta / 6.0f));
-    case EpilogueActivateType::Elu:
-        return kernel_elu(vx,
-            v_set1_f16x8(0.0f),
-            v_set1_f16x8(ep.alpha),
-            v_set1_f16x8(1.0f));
+            v_zero(type_tag),
+            v_set1(type_tag, ep.alpha),
+            v_set1(type_tag, 1.0f));
     }
     return vx;
 }
@@ -222,12 +173,8 @@ void matmul_epilogue_inplace(int M, int N, T* data, int ld,
                 v_data = v_add(v_data, v_bias);
             }
 
-            // Epilogue activation (compile-time type deduction)
-            if constexpr (std::is_same_v<T, float>) {
-                v_data = apply_epilogue_f32x8(epilogue, v_data);
-            } else {
-                v_data = apply_epilogue_f16x8(epilogue, v_data);
-            }
+            // Epilogue activation (type dispatched via pointer overload)
+            v_data = apply_epilogue_vec(epilogue, row + n, v_data);
 
             v_store(row + n, v_data);
         }

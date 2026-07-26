@@ -23,6 +23,10 @@ src/backend/vulkan/shaders/<op>_f32.comp  # GLSL 计算着色器
 - **Push Constants** — 传递 `total` 元素数量等运行时参数
 - **Specialization Constants** — 在管线创建时固化操作类型（Add/Sub/...），允许编译器优化分支
 
+> 💡 **相关参考文档**：
+> - [Vulkan Compute Shader 语法参考](vulkan_compute_shader_grammar.md) — 完整的 GLSL 计算着色器语法（13 节 + Vulkan 1.4/Roadmap 2026 新特性）
+> - [Vulkan 线程模型与内存模型](vulkan_threading_memory_model.md) — Host 端多线程、GPU 执行层次、SPIR-V 内存模型、Synchronization2、Timeline Semaphore 深度解析
+
 ---
 
 ## 2. 计算着色器 (GLSL)

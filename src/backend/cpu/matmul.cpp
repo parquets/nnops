@@ -108,17 +108,11 @@ inline int round_down_nc(int nc, int nr_max) noexcept {
     return (nc / nr_max) * nr_max;
 }
 
-// =========================================================================
-//  Workspace
-// =========================================================================
 
 inline size_t workspace_bytes(int mc, int nc, int kc, size_t elem) noexcept {
     return static_cast<size_t>(mc + nc) * static_cast<size_t>(kc) * elem;
 }
 
-// =========================================================================
-//  matmul_kernel_f32
-// =========================================================================
 
 void matmul_kernel_f32(const MatMulAttributes& attrs,
                        TensorView& output,
@@ -128,9 +122,6 @@ void matmul_kernel_f32(const MatMulAttributes& attrs,
 
 }
 
-// =========================================================================
-//  matmul_kernel_f16
-// =========================================================================
 
 void matmul_kernel_f16(const MatMulAttributes& attrs,
                        TensorView& output,

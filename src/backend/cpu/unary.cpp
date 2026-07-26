@@ -23,6 +23,40 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 // ============================================================
+// Shared row-processing helper — eliminates the identical
+// row-loop + SIMD/scalar + add_to boilerplate across all 9
+// unary operations. Each case passes just its SIMD intrinsic
+// and scalar formula as lambdas.
+// ============================================================
+
+template <typename T, typename SimdK, typename ScalarK>
+inline void process_unary_rows(
+    const T* in_ptr, T* out_ptr,
+    int64_t num_rows, int64_t last_dim,
+    int64_t in_row_stride, int64_t out_row_stride,
+    bool add_to,
+    SimdK&& simd_kernel,
+    ScalarK&& scalar_kernel)
+{
+    constexpr int L = simd_lane_for<T>;
+    for (int64_t r = 0; r < num_rows; ++r) {
+        const T* in_row = in_ptr + r * in_row_stride;
+        T* out_row = out_ptr + r * out_row_stride;
+        int64_t i = 0;
+        for (; i + L <= last_dim; i += L) {
+            auto rv = simd_kernel(v_load(in_row + i));
+            if (add_to) { rv = v_add(v_load(out_row + i), rv); }
+            v_store(out_row + i, rv);
+        }
+        for (; i < last_dim; ++i) {
+            float rv = scalar_kernel(s_load(&in_row[i]));
+            if (add_to) { rv += s_load(&out_row[i]); }
+            s_store(&out_row[i], rv);
+        }
+    }
+}
+
+// ============================================================
 // Templated implementation (f32 and f16)
 // ============================================================
 
@@ -49,244 +83,70 @@ void unary_impl(const UnaryAttributes& attrs,
     auto*       out_ptr = output.ptr<T>();
     const bool add_to = attrs.add_to;
 
-    constexpr int L = simd_lane_for<T>;
-
     switch (attrs.type) {
 
-    // ---- Exp: y = exp(x) ----
-    case UnaryType::Exp: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_exp(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::exp(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Exp:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_exp(x); },
+            [](float v) { return std::exp(v); });
         break;
-    }
 
-    // ---- Log: y = ln(x) ----
-    case UnaryType::Log: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_log(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::log(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Log:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_log(x); },
+            [](float v) { return std::log(v); });
         break;
-    }
 
-    // ---- Sin: y = sin(x) ----
-    case UnaryType::Sin: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_sin(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::sin(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Sin:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_sin(x); },
+            [](float v) { return std::sin(v); });
         break;
-    }
 
-    // ---- Cos: y = cos(x) ----
-    case UnaryType::Cos: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_cos(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::cos(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Cos:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_cos(x); },
+            [](float v) { return std::cos(v); });
         break;
-    }
 
-    // ---- Tan: y = tan(x) ----
-    case UnaryType::Tan: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_tan(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::tan(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Tan:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_tan(x); },
+            [](float v) { return std::tan(v); });
         break;
-    }
 
-    // ---- Tanh: y = tanh(x) ----
-    case UnaryType::Tanh: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_tanh(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::tanh(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Tanh:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_tanh(x); },
+            [](float v) { return std::tanh(v); });
         break;
-    }
 
-    // ---- Abs: y = |x| ----
-    case UnaryType::Abs: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_abs(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float v = s_load(&in_row[i]);
-                float rv = (v < 0.0f ? -v : v);
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Abs:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_abs(x); },
+            [](float v) { return v < 0.0f ? -v : v; });
         break;
-    }
 
-    // ---- Neg: y = -x ----
-    case UnaryType::Neg: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_neg(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = -s_load(&in_row[i]);
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Neg:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_neg(x); },
+            [](float v) { return -v; });
         break;
-    }
 
-    // ---- Sqrt: y = sqrt(x) ----
-    case UnaryType::Sqrt: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* in_row = in_ptr + r * in_row_stride;
-            T* out_row = out_ptr + r * out_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_sqrt(v_load(in_row + i));
-                if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = std::sqrt(s_load(&in_row[i]));
-                if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
-                }
-            }
-        }
+    case UnaryType::Sqrt:
+        process_unary_rows(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](auto x) { return v_sqrt(x); },
+            [](float v) { return std::sqrt(v); });
         break;
-    }
 
     }  // switch
 }

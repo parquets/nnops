@@ -21,6 +21,41 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 // ============================================================
+// Shared row-processing helper — eliminates the identical
+// row-loop + SIMD/scalar + add_to boilerplate across all 4
+// binary operations. Each case passes just its SIMD op and
+// scalar formula as lambdas.
+// ============================================================
+
+template <typename T, typename SimdK, typename ScalarK>
+inline void process_eltwise_rows(
+    const T* a_ptr, const T* b_ptr, T* o_ptr,
+    int64_t num_rows, int64_t last_dim,
+    int64_t a_row_stride, int64_t b_row_stride, int64_t o_row_stride,
+    bool add_to,
+    SimdK&& simd_kernel,
+    ScalarK&& scalar_kernel)
+{
+    constexpr int L = simd_lane_for<T>;
+    for (int64_t r = 0; r < num_rows; ++r) {
+        const T* a_row = a_ptr + r * a_row_stride;
+        const T* b_row = b_ptr + r * b_row_stride;
+        T* o_row = o_ptr + r * o_row_stride;
+        int64_t i = 0;
+        for (; i + L <= last_dim; i += L) {
+            auto rv = simd_kernel(v_load(a_row + i), v_load(b_row + i));
+            if (add_to) { rv = v_add(v_load(o_row + i), rv); }
+            v_store(o_row + i, rv);
+        }
+        for (; i < last_dim; ++i) {
+            float rv = scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i]));
+            if (add_to) { rv += s_load(&o_row[i]); }
+            s_store(&o_row[i], rv);
+        }
+    }
+}
+
+// ============================================================
 // Templated implementation (f32 and f16)
 // ============================================================
 
@@ -51,117 +86,35 @@ void eltwise_impl(const EltwiseAttributes& attrs,
     auto*       o_ptr = output.ptr<T>();
     const bool add_to = attrs.add_to;
 
-    constexpr int L = simd_lane_for<T>;
-
     switch (attrs.type) {
 
-    // ---- Add: C = A + B ----
-    case EltwiseType::Add: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* a_row = a_ptr + r * a_row_stride;
-            const T* b_row = b_ptr + r * b_row_stride;
-            T* o_row = o_ptr + r * o_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_add(v_load(a_row + i), v_load(b_row + i));
-                if (add_to) {
-                    v_store(o_row + i, v_add(v_load(o_row + i), rv));
-                } else {
-                    v_store(o_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = s_load(&a_row[i]) + s_load(&b_row[i]);
-                if (add_to) {
-                    s_store(&o_row[i], s_load(&o_row[i]) + rv);
-                } else {
-                    s_store(&o_row[i], rv);
-                }
-            }
-        }
+    case EltwiseType::Add:
+        process_eltwise_rows(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](auto va, auto vb) { return v_add(va, vb); },
+            [](float a, float b) { return a + b; });
         break;
-    }
 
-    // ---- Sub: C = A - B ----
-    case EltwiseType::Sub: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* a_row = a_ptr + r * a_row_stride;
-            const T* b_row = b_ptr + r * b_row_stride;
-            T* o_row = o_ptr + r * o_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_sub(v_load(a_row + i), v_load(b_row + i));
-                if (add_to) {
-                    v_store(o_row + i, v_add(v_load(o_row + i), rv));
-                } else {
-                    v_store(o_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = s_load(&a_row[i]) - s_load(&b_row[i]);
-                if (add_to) {
-                    s_store(&o_row[i], s_load(&o_row[i]) + rv);
-                } else {
-                    s_store(&o_row[i], rv);
-                }
-            }
-        }
+    case EltwiseType::Sub:
+        process_eltwise_rows(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](auto va, auto vb) { return v_sub(va, vb); },
+            [](float a, float b) { return a - b; });
         break;
-    }
 
-    // ---- Mul: C = A * B ----
-    case EltwiseType::Mul: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* a_row = a_ptr + r * a_row_stride;
-            const T* b_row = b_ptr + r * b_row_stride;
-            T* o_row = o_ptr + r * o_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_mul(v_load(a_row + i), v_load(b_row + i));
-                if (add_to) {
-                    v_store(o_row + i, v_add(v_load(o_row + i), rv));
-                } else {
-                    v_store(o_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = s_load(&a_row[i]) * s_load(&b_row[i]);
-                if (add_to) {
-                    s_store(&o_row[i], s_load(&o_row[i]) + rv);
-                } else {
-                    s_store(&o_row[i], rv);
-                }
-            }
-        }
+    case EltwiseType::Mul:
+        process_eltwise_rows(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](auto va, auto vb) { return v_mul(va, vb); },
+            [](float a, float b) { return a * b; });
         break;
-    }
 
-    // ---- Div: C = A / B ----
-    case EltwiseType::Div: {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const T* a_row = a_ptr + r * a_row_stride;
-            const T* b_row = b_ptr + r * b_row_stride;
-            T* o_row = o_ptr + r * o_row_stride;
-            int64_t i = 0;
-            for (; i + L <= last_dim; i += L) {
-                auto rv = v_div(v_load(a_row + i), v_load(b_row + i));
-                if (add_to) {
-                    v_store(o_row + i, v_add(v_load(o_row + i), rv));
-                } else {
-                    v_store(o_row + i, rv);
-                }
-            }
-            for (; i < last_dim; ++i) {
-                float rv = s_load(&a_row[i]) / s_load(&b_row[i]);
-                if (add_to) {
-                    s_store(&o_row[i], s_load(&o_row[i]) + rv);
-                } else {
-                    s_store(&o_row[i], rv);
-                }
-            }
-        }
+    case EltwiseType::Div:
+        process_eltwise_rows(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](auto va, auto vb) { return v_div(va, vb); },
+            [](float a, float b) { return a / b; });
         break;
-    }
 
     }  // switch
 }
