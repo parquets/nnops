@@ -43,14 +43,10 @@ inline void process_eltwise_rows(
         T* o_row = o_ptr + r * o_row_stride;
         int64_t i = 0;
         for (; i + L <= last_dim; i += L) {
-            auto rv = simd_kernel(v_load(a_row + i), v_load(b_row + i));
-            if (add_to) { rv = v_add(v_load(o_row + i), rv); }
-            v_store(o_row + i, rv);
+            v_store_add(o_row + i, simd_kernel(v_load(a_row + i), v_load(b_row + i)), add_to);
         }
         for (; i < last_dim; ++i) {
-            float rv = scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i]));
-            if (add_to) { rv += s_load(&o_row[i]); }
-            s_store(&o_row[i], rv);
+            s_store_add(&o_row[i], scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i])), add_to);
         }
     }
 }

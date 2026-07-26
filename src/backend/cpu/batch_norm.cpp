@@ -101,24 +101,30 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
 
                     const auto scale8 = v_set1(x_ptr, ns);
                     const auto bias8  = v_set1(x_ptr, nb);
+
+                    // 4-wide unrolling: independent load/compute/store chains
+                    for (; i + 4 * L <= last_dim; i += 4 * L) {
+                        auto x0 = v_load(x_ptr + x_off + i);
+                        auto x1 = v_load(x_ptr + x_off + i + L);
+                        auto x2 = v_load(x_ptr + x_off + i + 2 * L);
+                        auto x3 = v_load(x_ptr + x_off + i + 3 * L);
+                        v_store_add(y_ptr + y_off + i,
+                                    v_fmadd(scale8, x0, bias8), attrs.add_to);
+                        v_store_add(y_ptr + y_off + i + L,
+                                    v_fmadd(scale8, x1, bias8), attrs.add_to);
+                        v_store_add(y_ptr + y_off + i + 2 * L,
+                                    v_fmadd(scale8, x2, bias8), attrs.add_to);
+                        v_store_add(y_ptr + y_off + i + 3 * L,
+                                    v_fmadd(scale8, x3, bias8), attrs.add_to);
+                    }
+                    // Single remainder
                     for (; i + L <= last_dim; i += L) {
-                        const auto x8 = v_load(x_ptr + x_off + i);
-                        auto rv = v_fmadd(scale8, x8, bias8);
-                        if (attrs.add_to) {
-                            v_store(y_ptr + y_off + i,
-                                    v_add(v_load(y_ptr + y_off + i), rv));
-                        } else {
-                            v_store(y_ptr + y_off + i, rv);
-                        }
+                        auto rv = v_fmadd(scale8, v_load(x_ptr + x_off + i), bias8);
+                        v_store_add(y_ptr + y_off + i, rv, attrs.add_to);
                     }
                     for (; i < last_dim; ++i) {
                         float rv = s_load(&x_ptr[x_off + i]) * ns + nb;
-                        if (attrs.add_to) {
-                            s_store(&y_ptr[y_off + i],
-                                    s_load(&y_ptr[y_off + i]) + rv);
-                        } else {
-                            s_store(&y_ptr[y_off + i], rv);
-                        }
+                        s_store_add(&y_ptr[y_off + i], rv, attrs.add_to);
                     }
                 }
             }
@@ -139,6 +145,22 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
             const auto eps8 = v_set1(x_ptr, epsilon);
             const auto one8 = v_set1(x_ptr, 1.0f);
 
+            // 4-wide unrolling
+            for (; i + 4 * L <= i_end; i += 4 * L) {
+                for (int k = 0; k < 4; ++k) {
+                    int64_t off = i + k * L;
+                    auto xv  = v_load(x_ptr + off);
+                    auto sv  = v_load(s_ptr + off);
+                    auto bv  = v_load(b_ptr + off);
+                    auto mv  = v_load(m_ptr + off);
+                    auto vv  = v_load(v_ptr + off);
+                    auto inv = v_div(one8, v_sqrt(v_add(vv, eps8)));
+                    auto ns  = v_mul(inv, sv);
+                    auto nb  = v_sub(bv, v_mul(mv, ns));
+                    v_store_add(y_ptr + off, v_fmadd(ns, xv, nb), attrs.add_to);
+                }
+            }
+            // Single remainder
             for (; i + L <= i_end; i += L) {
                 const auto x8 = v_load(x_ptr + i);
                 const auto s8 = v_load(s_ptr + i);
@@ -150,11 +172,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
                 const auto ns = v_mul(inv_std, s8);
                 const auto nb = v_sub(b8, v_mul(m8, ns));
                 auto rv = v_fmadd(ns, x8, nb);
-                if (attrs.add_to) {
-                    v_store(y_ptr + i, v_add(v_load(y_ptr + i), rv));
-                } else {
-                    v_store(y_ptr + i, rv);
-                }
+                v_store_add(y_ptr + i, rv, attrs.add_to);
             }
 
             for (; i < i_end; ++i) {
@@ -162,11 +180,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
                 float ns = inv_std_val * s_load(&s_ptr[i]);
                 float nb = s_load(&b_ptr[i]) - s_load(&m_ptr[i]) * ns;
                 float rv = s_load(&x_ptr[i]) * ns + nb;
-                if (attrs.add_to) {
-                    s_store(&y_ptr[i], s_load(&y_ptr[i]) + rv);
-                } else {
-                    s_store(&y_ptr[i], rv);
-                }
+                s_store_add(&y_ptr[i], rv, attrs.add_to);
             }
         };
 

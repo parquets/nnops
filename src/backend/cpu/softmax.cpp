@@ -35,22 +35,6 @@ using namespace nnops::simd;
 
 namespace {
 
-/// @brief Reduce a typed SIMD vector (v_f32x8 or v_f16x8) to its maximum
-/// scalar value.  The SIMD layer has v_reduce_sum but not v_reduce_max, so
-/// we store to a temp buffer and scan.
-template <typename T>
-float reduce_max_vec(const T* type_tag, const auto& vmax) {
-    T tmp[simd_lane_for<T>];
-    v_store(tmp, vmax);
-    float best = -std::numeric_limits<float>::infinity();
-    for (int k = 0; k < simd_lane_for<T>; ++k) {
-        float x = s_load(&tmp[k]);
-        if (x > best) { best = x; }
-    }
-    (void)type_tag; // used only for overload resolution
-    return best;
-}
-
 // ============================================================
 // Scalar normalization for general axis (non-contiguous tail)
 // ============================================================
@@ -209,7 +193,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 v_max_val = v_max(v_max_val, v_load(x_ptr + row_off + i));
             }
 
-            max_val = reduce_max_vec(x_ptr, v_max_val);
+            max_val = v_reduce_max(v_max_val);
         }
 
         // Scalar tail for max reduction

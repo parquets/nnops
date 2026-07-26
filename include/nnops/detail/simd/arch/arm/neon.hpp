@@ -169,11 +169,21 @@ inline v_f32x4 v_tanh(const v_f32x4& a) {
     return v_f32x4(tanh_ps(a.val));
 }
 
+// Horizontal reductions — pairwise shuffle tree (same pattern for sum/max/min)
 inline float v_reduce_sum(const v_f32x4& a) {
-    // vpadd (pairwise v_add) — two steps reduces from 4 to 1
     float32x2_t sum2 = vadd_f32(vget_low_f32(a.val), vget_high_f32(a.val));
     sum2 = vpadd_f32(sum2, sum2);
     return vget_lane_f32(sum2, 0);
+}
+inline float v_reduce_max(const v_f32x4& a) {
+    float32x2_t max2 = vpmax_f32(vget_low_f32(a.val), vget_high_f32(a.val));
+    max2 = vpmax_f32(max2, max2);
+    return vget_lane_f32(max2, 0);
+}
+inline float v_reduce_min(const v_f32x4& a) {
+    float32x2_t min2 = vpmin_f32(vget_low_f32(a.val), vget_high_f32(a.val));
+    min2 = vpmin_f32(min2, min2);
+    return vget_lane_f32(min2, 0);
 }
 
 // ============================================================
@@ -279,6 +289,16 @@ inline v_f32x8 v_tanh(const v_f32x8& a) {
 inline float v_reduce_sum(const v_f32x8& a) {
     return v_reduce_sum(v_f32x4(a.lo))
          + v_reduce_sum(v_f32x4(a.hi));
+}
+inline float v_reduce_max(const v_f32x8& a) {
+    float lo = v_reduce_max(v_f32x4(a.lo));
+    float hi = v_reduce_max(v_f32x4(a.hi));
+    return lo > hi ? lo : hi;
+}
+inline float v_reduce_min(const v_f32x8& a) {
+    float lo = v_reduce_min(v_f32x4(a.lo));
+    float hi = v_reduce_min(v_f32x4(a.hi));
+    return lo < hi ? lo : hi;
 }
 
 // ============================================================
@@ -389,6 +409,25 @@ inline float v_reduce_sum(const v_f16x8& a) {
     // Approach: reduce low and high halves, accumulate as float32
     float sum = static_cast<float>(vaddvq_f16(a.val));
     return sum;
+}
+
+// Horizontal max/min — pairwise reduction tree (same pattern as v_reduce_sum
+// for v_f32x4, adapted for fp16 via vpmax_f16 / vpmin_f16 on halves)
+inline float v_reduce_max(const v_f16x8& a) {
+    float16x4_t lo = vget_low_f16(a.val);
+    float16x4_t hi = vget_high_f16(a.val);
+    float16x4_t max4 = vpmax_f16(lo, hi);    // 4 pairwise maxes across 8 lanes
+    max4 = vpmax_f16(max4, max4);             // 2 pairwise maxes → 2 values
+    max4 = vpmax_f16(max4, max4);             // final max → 1 value
+    return static_cast<float>(vget_lane_f16(max4, 0));
+}
+inline float v_reduce_min(const v_f16x8& a) {
+    float16x4_t lo = vget_low_f16(a.val);
+    float16x4_t hi = vget_high_f16(a.val);
+    float16x4_t min4 = vpmin_f16(lo, hi);
+    min4 = vpmin_f16(min4, min4);
+    min4 = vpmin_f16(min4, min4);
+    return static_cast<float>(vget_lane_f16(min4, 0));
 }
 
 // ============================================================

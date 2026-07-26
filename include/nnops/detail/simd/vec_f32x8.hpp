@@ -47,6 +47,8 @@
     using arch::avx2::v_tan;
     using arch::avx2::v_tanh;
     using arch::avx2::v_reduce_sum;
+    using arch::avx2::v_reduce_max;
+    using arch::avx2::v_reduce_min;
     }} // namespace nnops::simd
   #else
     // x86_64 without AVX: emulate with two SSE registers
@@ -79,6 +81,8 @@
     using arch::sse::v_tan;
     using arch::sse::v_tanh;
     using arch::sse::v_reduce_sum;
+    using arch::sse::v_reduce_max;
+    using arch::sse::v_reduce_min;
     }} // namespace nnops::simd
   #endif  // __AVX__
 
@@ -112,6 +116,8 @@
   using arch::neon::v_tan;
   using arch::neon::v_tanh;
   using arch::neon::v_reduce_sum;
+  using arch::neon::v_reduce_max;
+  using arch::neon::v_reduce_min;
   }} // namespace nnops::simd
 
 #else
@@ -142,5 +148,7 @@
   using arch::scalar::v_and;
   using arch::scalar::v_or;
   using arch::scalar::v_reduce_sum;
+  using arch::scalar::v_reduce_max;
+  using arch::scalar::v_reduce_min;
   }} // namespace nnops::simd
 #endif

@@ -5,12 +5,11 @@
 ///
 /// Reference: onnxruntime MlasLayerNormF32 + ComputeJob / ComputeJobGenericShared.
 ///
-/// Algorithm (mirrors onnxruntime):
+/// Algorithm:
 ///   – SIMD fast path (axis == rank-1, contiguous tail):
-///       1. SIMD reduce sum/sum_sq in typed vectors (v_f32x8 or v_f16x8).
-///       2. Scalar tail uses Welford's online algorithm for numerical stability.
-///       3. Merge SIMD partial stats with Welford tail via parallel Welford formula.
-///       4. Compute inv_std and normalize with typed SIMD + scalar tail.
+///       1. 4-wide multi-accumulator SIMD reduce sum/sum_sq + scalar tail.
+///       2. Compute mean = sum/N, var = sum_sq/N - mean², inv_std = 1/sqrt(var+eps).
+///       3. SIMD normalize: y = (x - mean) * inv_std * scale + bias.
 ///   – General scalar fallback (arbitrary axis):
 ///       Welford's single-pass algorithm for mean and variance, then normalize.
 ///
@@ -37,30 +36,6 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 namespace {
-
-// ============================================================
-// Welford merge: combine two partial statistics.
-//
-// Given (n1, mean1, M2_1) and (n2, mean2, M2_2), compute the
-// merged (n, mean, M2).  This is Chan et al.'s parallel formula.
-// ============================================================
-struct WelfordStats {
-    int64_t n = 0;
-    float mean = 0.0f;
-    float M2 = 0.0f;  // sum of squared differences from mean
-};
-
-inline void welford_merge(WelfordStats& a, const WelfordStats& b) {
-    if (b.n == 0) { return; }
-    if (a.n == 0) { a = b; return; }
-    const int64_t total = a.n + b.n;
-    const float delta = b.mean - a.mean;
-    const float na = static_cast<float>(a.n);
-    const float nb = static_cast<float>(b.n);
-    a.mean = (na * a.mean + nb * b.mean) / static_cast<float>(total);
-    a.M2 = a.M2 + b.M2 + delta * delta * na * nb / static_cast<float>(total);
-    a.n = total;
-}
 
 // ============================================================
 // Scalar normalization for general axis (non-contiguous tail)
@@ -125,11 +100,7 @@ void layer_norm_general_scalar(
             float s = s_load(&s_ptr[s_idx]);
             float b = (has_bias && b_ptr) ? s_load(&b_ptr[s_idx]) : 0.0f;
             float val = (s_load(&x_ptr[off]) - mean_val) * inv_std * s + b;
-            if (add_to) {
-                s_store(&y_ptr[off], s_load(&y_ptr[off]) + val);
-            } else {
-                s_store(&y_ptr[off], val);
-            }
+            s_store_add(&y_ptr[off], val, add_to);
         }
     };
 
@@ -217,74 +188,85 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
         int64_t i = 0;
 
         // ================================================================
-        // Pass 1 — Hybrid statistics: SIMD reduce + Welford scalar tail
+        // Pass 1 — 4-wide multi-accumulator SIMD reduction + scalar tail.
         //
-        // SIMD portion: accumulate sum and sum_sq in typed vectors.
-        // Welford tail:  handle remaining elements with online algorithm.
-        // Then merge both partial results via parallel Welford formula.
-        //
-        // This mirrors onnxruntime: MlasLayerNormF32 (SIMD) for the bulk,
-        // Welford fallback for correctness on the tail.
+        // Multi-accumulator unrolling breaks the v_add/v_fmadd dependency
+        // chain, same pattern as reduce.cpp Sum/Mean path.
         // ================================================================
 
-        WelfordStats stats;
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
 
-        // -- SIMD block: reduce sum and sum_sq --
         {
-            float simd_sum = 0.0f;
-            float simd_sum_sq = 0.0f;
-            int64_t simd_count = 0;
+            // 4-wide accumulator unrolling
+            auto v_sum0 = v_zero(x_ptr);
+            auto v_sum_sq0 = v_zero(x_ptr);
+            auto v_sum1 = v_zero(x_ptr);
+            auto v_sum_sq1 = v_zero(x_ptr);
+            auto v_sum2 = v_zero(x_ptr);
+            auto v_sum_sq2 = v_zero(x_ptr);
+            auto v_sum3 = v_zero(x_ptr);
+            auto v_sum_sq3 = v_zero(x_ptr);
 
-            {
-                auto v_sum = v_zero(x_ptr);
-                auto v_sum_sq = v_zero(x_ptr);
+            for (; i + 4 * L <= norm_size; i += 4 * L) {
+                auto v0 = v_load(x_ptr + row_off + i);
+                auto v1 = v_load(x_ptr + row_off + i + L);
+                auto v2 = v_load(x_ptr + row_off + i + 2 * L);
+                auto v3 = v_load(x_ptr + row_off + i + 3 * L);
+                v_sum0 = v_add(v_sum0, v0);
+                v_sum_sq0 = v_fmadd(v0, v0, v_sum_sq0);
+                v_sum1 = v_add(v_sum1, v1);
+                v_sum_sq1 = v_fmadd(v1, v1, v_sum_sq1);
+                v_sum2 = v_add(v_sum2, v2);
+                v_sum_sq2 = v_fmadd(v2, v2, v_sum_sq2);
+                v_sum3 = v_add(v_sum3, v3);
+                v_sum_sq3 = v_fmadd(v3, v3, v_sum_sq3);
+            }
+            // Merge 4 accumulators
+            auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
+            auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
+                                  v_add(v_sum_sq2, v_sum_sq3));
 
-                for (; i + L <= norm_size; i += L) {
-                    auto v = v_load(x_ptr + row_off + i);
-                    v_sum = v_add(v_sum, v);
-                    v_sum_sq = v_fmadd(v, v, v_sum_sq);
-                    simd_count += L;
-                }
+            // 2-wide remainder
+            auto v_sum4 = v_zero(x_ptr);
+            auto v_sum_sq4 = v_zero(x_ptr);
+            auto v_sum5 = v_zero(x_ptr);
+            auto v_sum_sq5 = v_zero(x_ptr);
+            for (; i + 2 * L <= norm_size; i += 2 * L) {
+                auto v4 = v_load(x_ptr + row_off + i);
+                auto v5 = v_load(x_ptr + row_off + i + L);
+                v_sum4 = v_add(v_sum4, v4);
+                v_sum_sq4 = v_fmadd(v4, v4, v_sum_sq4);
+                v_sum5 = v_add(v_sum5, v5);
+                v_sum_sq5 = v_fmadd(v5, v5, v_sum_sq5);
+            }
+            v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
+            v_sum_sq = v_add(v_sum_sq, v_add(v_sum_sq4, v_sum_sq5));
 
-                simd_sum = v_reduce_sum(v_sum);
-                simd_sum_sq = v_reduce_sum(v_sum_sq);
+            // Single-accumulator remainder
+            for (; i + L <= norm_size; i += L) {
+                auto v = v_load(x_ptr + row_off + i);
+                v_sum = v_add(v_sum, v);
+                v_sum_sq = v_fmadd(v, v, v_sum_sq);
             }
 
-            // Convert SIMD (count, sum, sum_sq) to WelfordStats
-            if (simd_count > 0) {
-                stats.n = simd_count;
-                stats.mean = simd_sum / static_cast<float>(simd_count);
-                stats.M2 = simd_sum_sq - simd_sum * simd_sum / static_cast<float>(simd_count);
-                // Guard against tiny negative M2 from rounding
-                if (stats.M2 < 0.0f) { stats.M2 = 0.0f; }
-            }
+            sum = v_reduce_sum(v_sum);
+            sum_sq = v_reduce_sum(v_sum_sq);
         }
 
-        // -- Scalar tail: Welford's online algorithm --
-        {
-            WelfordStats tail;
-            tail.n = norm_size - i;  // remaining elements
-            if (tail.n > 0) {
-                float mean_val = 0.0f;
-                float M2_val = 0.0f;
-                int64_t j = 0;
-                for (; i < norm_size; ++i, ++j) {
-                    float x = s_load(&x_ptr[row_off + i]);
-                    float delta = x - mean_val;
-                    mean_val += delta / static_cast<float>(j + 1);
-                    float delta2 = x - mean_val;
-                    M2_val += delta * delta2;
-                }
-                tail.mean = mean_val;
-                tail.M2 = M2_val;
-            }
-            welford_merge(stats, tail);
+        // Scalar tail
+        for (; i < norm_size; ++i) {
+            float x = s_load(&x_ptr[row_off + i]);
+            sum += x;
+            sum_sq += x * x;
         }
 
-        // ---- Compute statistics from merged Welford result ----
-        const float var_val = stats.M2 / static_cast<float>(stats.n);
+        // ---- Compute statistics ----
+        const float inv_n = 1.0f / static_cast<float>(norm_size);
+        const float mean_val = sum * inv_n;
+        float var_val = sum_sq * inv_n - mean_val * mean_val;
+        if (var_val < 0.0f) { var_val = 0.0f; }  // guard against rounding
         const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
-        const float mean_val = stats.mean;
 
         // ================================================================
         // Pass 2 — SIMD normalize
@@ -302,12 +284,7 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
                 ? v_load(b_ptr + (scale_is_scalar ? 0 : i))
                 : v_zero_b;
             auto rv = v_fmadd(v_mul(v_sub(x, v_mean), v_inv_std), vs, vb);
-            if (add_to) {
-                v_store(y_ptr + row_off + i,
-                        v_add(v_load(y_ptr + row_off + i), rv));
-            } else {
-                v_store(y_ptr + row_off + i, rv);
-            }
+            v_store_add(y_ptr + row_off + i, rv, add_to);
         }
         for (; i < norm_size; ++i) {
             int64_t s_idx = scale_is_scalar ? 0 : i;
@@ -316,12 +293,7 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
             float s = s_load(&s_ptr[s_idx]);
             float b = (has_bias && b_ptr) ? s_load(&b_ptr[b_idx]) : 0.0f;
             float rv = (x - mean_val) * inv_std * s + b;
-            if (add_to) {
-                s_store(&y_ptr[row_off + i],
-                        s_load(&y_ptr[row_off + i]) + rv);
-            } else {
-                s_store(&y_ptr[row_off + i], rv);
-            }
+            s_store_add(&y_ptr[row_off + i], rv, add_to);
         }
     };
 

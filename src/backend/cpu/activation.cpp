@@ -47,14 +47,10 @@ inline void process_activation_rows(
         T* out_row = out_ptr + r * out_row_stride;
         int64_t i = 0;
         for (; i + L <= last_dim; i += L) {
-            auto rv = simd_kernel(v_load(in_row + i));
-            if (add_to) { rv = v_add(v_load(out_row + i), rv); }
-            v_store(out_row + i, rv);
+            v_store_add(out_row + i, simd_kernel(v_load(in_row + i)), add_to);
         }
         for (; i < last_dim; ++i) {
-            float rv = scalar_kernel(s_load(&in_row[i]));
-            if (add_to) { rv += s_load(&out_row[i]); }
-            s_store(&out_row[i], rv);
+            s_store_add(&out_row[i], scalar_kernel(s_load(&in_row[i])), add_to);
         }
     }
 }

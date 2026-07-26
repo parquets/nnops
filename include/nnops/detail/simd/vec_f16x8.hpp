@@ -46,6 +46,8 @@
   using arch::neon::v_tan;
   using arch::neon::v_tanh;
   using arch::neon::v_reduce_sum;
+  using arch::neon::v_reduce_max;
+  using arch::neon::v_reduce_min;
   }} // namespace nnops::simd
 #elif defined(NNOPS_ARCH_X86_64) && defined(__F16C__)
   // x86_64: F16C + AVX2 (__m128i storage, convert→compute→convert via _mm256_cvtph_ps / _mm256_cvtps_ph)
@@ -77,6 +79,8 @@
   using arch::sse::v_tan;
   using arch::sse::v_tanh;
   using arch::sse::v_reduce_sum;
+  using arch::sse::v_reduce_max;
+  using arch::sse::v_reduce_min;
   }} // namespace nnops::simd
 #else
   // Scalar fallback
@@ -106,5 +110,7 @@
   using arch::scalar::v_tan;
   using arch::scalar::v_tanh;
   using arch::scalar::v_reduce_sum;
+  using arch::scalar::v_reduce_max;
+  using arch::scalar::v_reduce_min;
   }} // namespace nnops::simd
 #endif

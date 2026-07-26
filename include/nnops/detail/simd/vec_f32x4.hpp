@@ -48,6 +48,8 @@
   using arch::sse::v_tan;
   using arch::sse::v_tanh;
   using arch::sse::v_reduce_sum;
+  using arch::sse::v_reduce_max;
+  using arch::sse::v_reduce_min;
   }} // namespace nnops::simd
 
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -83,6 +85,8 @@
   using arch::neon::v_tan;
   using arch::neon::v_tanh;
   using arch::neon::v_reduce_sum;
+  using arch::neon::v_reduce_max;
+  using arch::neon::v_reduce_min;
   }} // namespace nnops::simd
 
 #else
@@ -115,5 +119,7 @@
   using arch::scalar::v_tan;
   using arch::scalar::v_tanh;
   using arch::scalar::v_reduce_sum;
+  using arch::scalar::v_reduce_max;
+  using arch::scalar::v_reduce_min;
   }} // namespace nnops::simd
 #endif

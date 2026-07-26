@@ -151,9 +151,15 @@ inline v_f32x4 v_tanh(const v_f32x4& a) {
     return v_f32x4(std::tanh(a[0]), std::tanh(a[1]), std::tanh(a[2]), std::tanh(a[3]));
 }
 
-// Horizontal sum
+// Horizontal reductions
 inline float v_reduce_sum(const v_f32x4& a) {
     return a[0] + a[1] + a[2] + a[3];
+}
+inline float v_reduce_max(const v_f32x4& a) {
+    return std::max({a[0], a[1], a[2], a[3]});
+}
+inline float v_reduce_min(const v_f32x4& a) {
+    return std::min({a[0], a[1], a[2], a[3]});
 }
 
 // ============================================================
@@ -281,6 +287,16 @@ inline float v_reduce_sum(const v_f32x8& a) {
     float s = 0.0f;
     for (int i = 0; i < 8; ++i) { s += a[i]; }
     return s;
+}
+inline float v_reduce_max(const v_f32x8& a) {
+    float best = a[0];
+    for (int i = 1; i < 8; ++i) { if (a[i] > best) best = a[i]; }
+    return best;
+}
+inline float v_reduce_min(const v_f32x8& a) {
+    float best = a[0];
+    for (int i = 1; i < 8; ++i) { if (a[i] < best) best = a[i]; }
+    return best;
 }
 
 // ============================================================
@@ -503,6 +519,22 @@ inline float v_reduce_sum(const v_f16x8& a) {
     float s = 0.0f;
     for (int i = 0; i < 8; ++i) { s += f16_to_f32(a.bits[i]); }
     return s;
+}
+inline float v_reduce_max(const v_f16x8& a) {
+    float best = f16_to_f32(a.bits[0]);
+    for (int i = 1; i < 8; ++i) {
+        float x = f16_to_f32(a.bits[i]);
+        if (x > best) { best = x; }
+    }
+    return best;
+}
+inline float v_reduce_min(const v_f16x8& a) {
+    float best = f16_to_f32(a.bits[0]);
+    for (int i = 1; i < 8; ++i) {
+        float x = f16_to_f32(a.bits[i]);
+        if (x < best) { best = x; }
+    }
+    return best;
 }
 
 // Transcendental math for v_f16x8

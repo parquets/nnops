@@ -143,5 +143,28 @@ inline void s_store(half* p, float v) {
     *p = ::nnops::backend::cpu::float_to_half(v);
 }
 
+// ============================================================
+// Store-with-accumulate helpers — SIMD/scalar equivalents of
+// *ptr += val, combining load+add+store into one call.
+// Eliminates the v_add(v_load(ptr), val) / v_store(ptr, ...)
+// if/else boilerplate that was duplicated across 6+ operators.
+// ============================================================
+template <typename Ptr, typename Vec>
+inline void v_store_add(Ptr ptr, const Vec& val, bool add_to) {
+    if (add_to) {
+        v_store(ptr, v_add(v_load(ptr), val));
+    } else {
+        v_store(ptr, val);
+    }
+}
+template <typename Ptr>
+inline void s_store_add(Ptr ptr, float val, bool add_to) {
+    if (add_to) {
+        s_store(ptr, s_load(ptr) + val);
+    } else {
+        s_store(ptr, val);
+    }
+}
+
 } // namespace simd
 } // namespace nnops

@@ -124,6 +124,18 @@ inline float v_reduce_sum(const v_f32x4& a) {
     return _mm_cvtss_f32(t);
 }
 
+// Horizontal max/min — same pairwise shuffle reduction as v_reduce_sum
+inline float v_reduce_max(const v_f32x4& a) {
+    __m128 t = _mm_max_ps(a.val, _mm_movehl_ps(a.val, a.val));
+    t = _mm_max_ps(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t);
+}
+inline float v_reduce_min(const v_f32x4& a) {
+    __m128 t = _mm_min_ps(a.val, _mm_movehl_ps(a.val, a.val));
+    t = _mm_min_ps(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t);
+}
+
 // ============================================================
 // v_f32x8 operations (native 256-bit AVX2, FMA3)
 // ============================================================
@@ -207,6 +219,22 @@ inline float v_reduce_sum(const v_f32x8& a) {
     __m128 hi = _mm256_extractf128_ps(a.val, 1);
     __m128 sum128 = _mm_add_ps(lo, hi);
     return v_reduce_sum(v_f32x4(sum128));
+}
+
+// Horizontal max — pairwise shuffle reduction
+inline float v_reduce_max(const v_f32x8& a) {
+    __m128 lo = _mm256_castps256_ps128(a.val);
+    __m128 hi = _mm256_extractf128_ps(a.val, 1);
+    __m128 max128 = _mm_max_ps(lo, hi);
+    return v_reduce_max(v_f32x4(max128));
+}
+
+// Horizontal min — pairwise shuffle reduction
+inline float v_reduce_min(const v_f32x8& a) {
+    __m128 lo = _mm256_castps256_ps128(a.val);
+    __m128 hi = _mm256_extractf128_ps(a.val, 1);
+    __m128 min128 = _mm_min_ps(lo, hi);
+    return v_reduce_min(v_f32x4(min128));
 }
 
 } // namespace avx2

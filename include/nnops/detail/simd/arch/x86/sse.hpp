@@ -11,6 +11,7 @@
 
 #include <smmintrin.h>  // SSE4.1
 #include <cstdint>
+#include <algorithm>
 #include "sse_mathfunc.hpp"
 
 namespace nnops {
@@ -157,6 +158,18 @@ inline float v_reduce_sum(const v_f32x4& a) {
     return _mm_cvtss_f32(t);
 }
 
+// Horizontal max/min — same pairwise shuffle reduction as v_reduce_sum
+inline float v_reduce_max(const v_f32x4& a) {
+    __m128 t = _mm_max_ps(a.val, _mm_movehl_ps(a.val, a.val));
+    t = _mm_max_ps(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t);
+}
+inline float v_reduce_min(const v_f32x4& a) {
+    __m128 t = _mm_min_ps(a.val, _mm_movehl_ps(a.val, a.val));
+    t = _mm_min_ps(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t);
+}
+
 // ============================================================
 // v_f32x8 operations (emulated with two 128-bit lanes)
 // ============================================================
@@ -254,6 +267,14 @@ inline v_f32x8 v_tanh(const v_f32x8& a) {
 inline float v_reduce_sum(const v_f32x8& a) {
     v_f32x4 lo(a.lo), hi(a.hi);
     return v_reduce_sum(lo) + v_reduce_sum(hi);
+}
+inline float v_reduce_max(const v_f32x8& a) {
+    v_f32x4 lo(a.lo), hi(a.hi);
+    return std::max(v_reduce_max(lo), v_reduce_max(hi));
+}
+inline float v_reduce_min(const v_f32x8& a) {
+    v_f32x4 lo(a.lo), hi(a.hi);
+    return std::min(v_reduce_min(lo), v_reduce_min(hi));
 }
 
 // ============================================================
@@ -393,7 +414,7 @@ inline v_f16x8 v_tanh(const v_f16x8& a) {
     return v_f16x8(_mm256_cvtps_ph(avx2::tanh256_ps(f32), 0));
 }
 
-// Horizontal sum — widen to fp32, then horizontal v_add
+// Horizontal reductions — widen to fp32, then pairwise reduce
 inline float v_reduce_sum(const v_f16x8& a) {
     __m256 f32 = _mm256_cvtph_ps(a.val);
     __m128 lo = _mm256_castps256_ps128(f32);
@@ -401,6 +422,24 @@ inline float v_reduce_sum(const v_f16x8& a) {
     __m128 sum128 = _mm_add_ps(lo, hi);
     __m128 t = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
     t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t);
+}
+inline float v_reduce_max(const v_f16x8& a) {
+    __m256 f32 = _mm256_cvtph_ps(a.val);
+    __m128 lo = _mm256_castps256_ps128(f32);
+    __m128 hi = _mm256_extractf128_ps(f32, 1);
+    __m128 max128 = _mm_max_ps(lo, hi);
+    __m128 t = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+    t = _mm_max_ps(t, _mm_shuffle_ps(t, t, 1));
+    return _mm_cvtss_f32(t);
+}
+inline float v_reduce_min(const v_f16x8& a) {
+    __m256 f32 = _mm256_cvtph_ps(a.val);
+    __m128 lo = _mm256_castps256_ps128(f32);
+    __m128 hi = _mm256_extractf128_ps(f32, 1);
+    __m128 min128 = _mm_min_ps(lo, hi);
+    __m128 t = _mm_min_ps(min128, _mm_movehl_ps(min128, min128));
+    t = _mm_min_ps(t, _mm_shuffle_ps(t, t, 1));
     return _mm_cvtss_f32(t);
 }
 

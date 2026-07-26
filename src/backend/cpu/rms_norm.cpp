@@ -85,11 +85,7 @@ void rms_norm_general_scalar(
             int64_t s_idx = scale_is_scalar ? 0 : i;
             float s = s_load(&s_ptr[s_idx]);
             float val = s_load(&x_ptr[off]) * inv_rms * s;
-            if (add_to) {
-                s_store(&y_ptr[off], s_load(&y_ptr[off]) + val);
-            } else {
-                s_store(&y_ptr[off], val);
-            }
+            s_store_add(&y_ptr[off], val, add_to);
         }
     };
 
@@ -163,15 +159,41 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
 
-        // ---- Pass 1: SIMD reduction (typed API, f32-accumulated internally) ----
+        // ---- Pass 1: 4-wide multi-accumulator SIMD reduction + scalar tail ----
         float sum_sq = 0.0f;
         int64_t i = 0;
 
-        // Use typed SIMD API: v_f32x8 for float, v_f16x8 for half.
-        // Both accumulate in f32 internally (x86 converts f16→f32→compute→f16).
         {
-            auto v_sum_sq = v_zero(x_ptr);
+            // 4-wide accumulator unrolling
+            auto v_sq0 = v_zero(x_ptr);
+            auto v_sq1 = v_zero(x_ptr);
+            auto v_sq2 = v_zero(x_ptr);
+            auto v_sq3 = v_zero(x_ptr);
 
+            for (; i + 4 * L <= norm_size; i += 4 * L) {
+                auto v0 = v_load(x_ptr + row_off + i);
+                auto v1 = v_load(x_ptr + row_off + i + L);
+                auto v2 = v_load(x_ptr + row_off + i + 2 * L);
+                auto v3 = v_load(x_ptr + row_off + i + 3 * L);
+                v_sq0 = v_fmadd(v0, v0, v_sq0);
+                v_sq1 = v_fmadd(v1, v1, v_sq1);
+                v_sq2 = v_fmadd(v2, v2, v_sq2);
+                v_sq3 = v_fmadd(v3, v3, v_sq3);
+            }
+            auto v_sum_sq = v_add(v_add(v_sq0, v_sq1), v_add(v_sq2, v_sq3));
+
+            // 2-wide remainder
+            auto v_sq4 = v_zero(x_ptr);
+            auto v_sq5 = v_zero(x_ptr);
+            for (; i + 2 * L <= norm_size; i += 2 * L) {
+                auto v4 = v_load(x_ptr + row_off + i);
+                auto v5 = v_load(x_ptr + row_off + i + L);
+                v_sq4 = v_fmadd(v4, v4, v_sq4);
+                v_sq5 = v_fmadd(v5, v5, v_sq5);
+            }
+            v_sum_sq = v_add(v_sum_sq, v_add(v_sq4, v_sq5));
+
+            // Single-accumulator remainder
             for (; i + L <= norm_size; i += L) {
                 auto v = v_load(x_ptr + row_off + i);
                 v_sum_sq = v_fmadd(v, v, v_sum_sq);
@@ -199,24 +221,14 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
             auto x = v_load(x_ptr + row_off + i);
             auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
             auto rv = v_mul(v_mul(x, v_inv_rms), vs);
-            if (add_to) {
-                v_store(y_ptr + row_off + i,
-                        v_add(v_load(y_ptr + row_off + i), rv));
-            } else {
-                v_store(y_ptr + row_off + i, rv);
-            }
+            v_store_add(y_ptr + row_off + i, rv, add_to);
         }
         for (; i < norm_size; ++i) {
             int64_t s_idx = scale_is_scalar ? 0 : i;
             float x = s_load(&x_ptr[row_off + i]);
             float s = s_load(&s_ptr[s_idx]);
             float rv = x * inv_rms * s;
-            if (add_to) {
-                s_store(&y_ptr[row_off + i],
-                        s_load(&y_ptr[row_off + i]) + rv);
-            } else {
-                s_store(&y_ptr[row_off + i], rv);
-            }
+            s_store_add(&y_ptr[row_off + i], rv, add_to);
         }
     };
 
