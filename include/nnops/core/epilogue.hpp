@@ -8,10 +8,12 @@
 ///   - The standalone Activation operator stays clean (no "None" sentinel).
 ///   - Future epilogue types (quantize/dequantize, clamp, etc.) have a
 ///     natural home without polluting the activation concept.
+///
+/// The Epilogue struct is defined here so operator headers can embed it.
+/// Implementations of apply_epilogue (scalar and SIMD) live in the CPU
+/// backend at src/backend/cpu/epilogue_impl.hpp.
 
 #include <cstdint>
-#include <cmath>
-#include <algorithm>
 
 namespace nnops {
 
@@ -66,37 +68,12 @@ struct Epilogue {
     int64_t quant_axis = 1;
 };
 
+// ---- Scalar apply_epilogue (declarations only) ----
+// Implementations live in src/backend/cpu/epilogue_impl.hpp.
+
 /// Apply an epilogue to a single scalar output value (activation types).
 /// Returns the value unchanged when type == None (identity).
-///
-/// Formulas match activation_ref.cpp exactly.
-inline float apply_epilogue(const Epilogue& ep, float x) {
-    switch (ep.type) {
-    case EpilogueActivateType::None:
-        return x;
-    case EpilogueActivateType::Relu:
-        return x > 0.0f ? x : 0.0f;
-    case EpilogueActivateType::LeakyRelu:
-        return x > 0.0f ? x : ep.alpha * x;
-    case EpilogueActivateType::Sigmoid:
-        return 1.0f / (1.0f + std::exp(-x));
-    case EpilogueActivateType::Tanh:
-        return std::tanh(x);
-    case EpilogueActivateType::Gelu: {
-        constexpr float c = 0.7978845608028654f;  // sqrt(2/pi)
-        return 0.5f * x * (1.0f + std::tanh(c * (x + 0.044715f * x * x * x)));
-    }
-    case EpilogueActivateType::Silu:
-        return x / (1.0f + std::exp(-x));  // x * sigmoid(x)
-    case EpilogueActivateType::HardSwish: {
-        float relu6 = std::min(std::max(x + 3.0f, 0.0f), 6.0f);
-        return x * relu6 * (ep.beta / 6.0f);
-    }
-    case EpilogueActivateType::Elu:
-        return x > 0.0f ? x : ep.alpha * (std::exp(x) - 1.0f);
-    }
-    return x;
-}
+float apply_epilogue(const Epilogue& ep, float x);
 
 /// Apply an epilogue to a single scalar output value at a given channel index.
 ///
@@ -108,30 +85,6 @@ inline float apply_epilogue(const Epilogue& ep, float x) {
 /// @param x        Output value to transform
 /// @param channel  Channel index along quant_axis (0-based). Only meaningful
 ///                 for quantization epilogues; ignored for activation types.
-inline float apply_epilogue(const Epilogue& ep, float x, int64_t channel) {
-    switch (ep.type) {
-    case EpilogueActivateType::None:
-    case EpilogueActivateType::Relu:
-    case EpilogueActivateType::Gelu:
-    case EpilogueActivateType::Sigmoid:
-    case EpilogueActivateType::Tanh:
-    case EpilogueActivateType::LeakyRelu:
-    case EpilogueActivateType::Silu:
-    case EpilogueActivateType::HardSwish:
-    case EpilogueActivateType::Elu:
-        return apply_epilogue(ep, x);
-
-    // Future quantize / dequantize types go here:
-    // case EpilogueActivateType::Dequantize: {
-    //     int64_t idx = (ep.quant_param_count > 0)
-    //         ? std::min(channel, ep.quant_param_count - 1) : 0;
-    //     float scale = ep.quant_scales[idx];
-    //     float zp = ep.quant_zero_points
-    //         ? static_cast<float>(ep.quant_zero_points[idx]) : 0.0f;
-    //     return (x - zp) * scale;
-    // }
-    }
-    return x;
-}
+float apply_epilogue(const Epilogue& ep, float x, int64_t channel);
 
 }  // namespace nnops

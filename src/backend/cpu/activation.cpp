@@ -17,6 +17,7 @@
 
 #include "nnops/ops/activation.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "activation_kernels.hpp"
 
 #include <cmath>
 
@@ -62,21 +63,19 @@ void activation_impl(const ActivationAttributes& attrs,
             T* out_row = out_ptr + r * out_row_stride;
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
-                auto rv = v_max(v_load(in_row + i), vzero);
+                auto rv = kernel_relu(v_load(in_row + i), vzero); 
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float v = s_load(&in_row[i]);
                 float rv = (v > 0.0f ? v : 0.0f);
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -93,22 +92,19 @@ void activation_impl(const ActivationAttributes& attrs,
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
                 auto x = v_load(in_row + i);
-                auto rv = v_add(v_max(x, vzero),
-                              v_mul(a8, v_min(x, vzero)));
+                auto rv = kernel_leaky_relu(x, vzero, a8);
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float v = s_load(&in_row[i]);
                 float rv = (v > 0.0f ? v : alpha * v);
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -124,21 +120,19 @@ void activation_impl(const ActivationAttributes& attrs,
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
                 auto x = v_load(in_row + i);
-                auto rv = v_div(one8, v_add(one8, v_exp(v_neg(x))));
+                auto rv = kernel_sigmoid(x, one8);
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float v = s_load(&in_row[i]);
                 float rv = 1.0f / (1.0f + std::exp(-v));
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -151,20 +145,18 @@ void activation_impl(const ActivationAttributes& attrs,
             T* out_row = out_ptr + r * out_row_stride;
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
-                auto rv = v_tanh(v_load(in_row + i));
+                auto rv = kernel_tanh(v_load(in_row + i));
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float rv = std::tanh(s_load(&in_row[i]));
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -178,32 +170,24 @@ void activation_impl(const ActivationAttributes& attrs,
         const auto c8     = v_set1(in_ptr, 0.7978845608028654f);
         const auto coeff8 = v_set1(in_ptr, 0.044715f);
 
-        auto simd = [&](auto x) {
-            auto x3 = v_mul(v_mul(x, x), x);
-            auto inner = v_mul(c8, v_add(x, v_mul(coeff8, x3)));
-            return v_mul(v_mul(half8, x), v_add(one8, v_tanh(inner)));
-        };
-
         for (int64_t r = 0; r < num_rows; ++r) {
             const T* in_row = in_ptr + r * in_row_stride;
             T* out_row = out_ptr + r * out_row_stride;
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
-                auto rv = simd(v_load(in_row + i));
+                auto rv = kernel_gelu(v_load(in_row + i), half8, one8, c8, coeff8);
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float x = s_load(&in_row[i]);
                 float rv = 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -219,21 +203,19 @@ void activation_impl(const ActivationAttributes& attrs,
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
                 auto x = v_load(in_row + i);
-                auto rv = v_div(x, v_add(one8, v_exp(v_neg(x))));
+                auto rv = kernel_silu(x, one8);
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float x = s_load(&in_row[i]);
                 float rv = x / (1.0f + std::exp(-x));
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -247,31 +229,24 @@ void activation_impl(const ActivationAttributes& attrs,
         const auto six8   = v_set1(in_ptr, 6.0f);
         const auto scale8 = v_set1(in_ptr, bd6);
 
-        auto simd = [&](auto x) {
-            auto relu6 = v_min(v_max(v_add(x, three8), vzero), six8);
-            return v_mul(v_mul(x, relu6), scale8);
-        };
-
         for (int64_t r = 0; r < num_rows; ++r) {
             const T* in_row = in_ptr + r * in_row_stride;
             T* out_row = out_ptr + r * out_row_stride;
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
-                auto rv = simd(v_load(in_row + i));
+                auto rv = kernel_hard_swish(v_load(in_row + i), vzero, three8, six8, scale8);
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float x = s_load(&in_row[i]);
                 float rv = x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * bd6;
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;
@@ -283,31 +258,24 @@ void activation_impl(const ActivationAttributes& attrs,
         const auto a8   = v_set1(in_ptr, alpha);
         const auto one8 = v_set1(in_ptr, 1.0f);
 
-        auto simd = [&](auto x) {
-            auto neg_part = v_mul(a8, v_sub(v_exp(v_min(x, vzero)), one8));
-            return v_add(v_max(x, vzero), neg_part);
-        };
-
         for (int64_t r = 0; r < num_rows; ++r) {
             const T* in_row = in_ptr + r * in_row_stride;
             T* out_row = out_ptr + r * out_row_stride;
             int64_t i = 0;
             for (; i + L <= last_dim; i += L) {
-                auto rv = simd(v_load(in_row + i));
+                auto rv = kernel_elu(v_load(in_row + i), vzero, a8, one8);
                 if (add_to) {
-                    v_store(out_row + i, v_add(v_load(out_row + i), rv));
-                } else {
-                    v_store(out_row + i, rv);
+                    rv = v_add(v_load(out_row + i), rv);
                 }
+                v_store(out_row + i, rv);
             }
             for (; i < last_dim; ++i) {
                 float x = s_load(&in_row[i]);
                 float rv = (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f));
                 if (add_to) {
-                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
-                } else {
-                    s_store(&out_row[i], rv);
+                    rv += s_load(&out_row[i]);
                 }
+                s_store(&out_row[i], rv);
             }
         }
         break;

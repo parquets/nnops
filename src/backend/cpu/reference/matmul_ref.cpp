@@ -10,6 +10,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
+#include "../epilogue_impl.hpp"
 
 #include <vector>
 #include <algorithm>

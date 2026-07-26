@@ -6,6 +6,7 @@
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/core/parallel_for.hpp"
+#include "../epilogue_impl.hpp"
 
 namespace nnops::backend::cpu::reference {
 

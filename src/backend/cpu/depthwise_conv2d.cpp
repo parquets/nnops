@@ -25,6 +25,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "epilogue_impl.hpp"
 
 #include <algorithm>
 #include <cmath>
