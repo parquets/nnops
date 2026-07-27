@@ -79,3 +79,4 @@ void tile_mma_direct(int Mc, int nc, int kc, half* c, int ldc, const half* a, in
 
 
 }  // namrspace nnops::backend::cpu
+
