@@ -306,6 +306,49 @@ inline v_f32x8 v_load_stride2_odd_f32x8(const float* src) {
     return v_deinterleave_f32x8(src).odd;
 }
 
+// ============================================================
+// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
+// ============================================================
+
+/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
+/// On entry, r0..r7 are rows 0..7 of the matrix. On exit, they are
+/// the transposed rows (= original columns).
+inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
+                             v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
+    __m256 t0, t1, t2, t3, t4, t5, t6, t7;
+    __m256 s0, s1, s2, s3, s4, s5, s6, s7;
+
+    // Phase 1: interleave 32-bit lanes across pairs
+    t0 = _mm256_unpacklo_ps(r0.val, r1.val);
+    t1 = _mm256_unpackhi_ps(r0.val, r1.val);
+    t2 = _mm256_unpacklo_ps(r2.val, r3.val);
+    t3 = _mm256_unpackhi_ps(r2.val, r3.val);
+    t4 = _mm256_unpacklo_ps(r4.val, r5.val);
+    t5 = _mm256_unpackhi_ps(r4.val, r5.val);
+    t6 = _mm256_unpacklo_ps(r6.val, r7.val);
+    t7 = _mm256_unpackhi_ps(r6.val, r7.val);
+
+    // Phase 2: shuffle within 128-bit lanes
+    s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1,0,1,0));  // a0,a2,b0,b2 | ...
+    s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3,2,3,2));  // a1,a3,b1,b3 | ...
+    s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1,0,1,0));
+    s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3,2,3,2));
+    s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1,0,1,0));
+    s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3,2,3,2));
+    s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1,0,1,0));
+    s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3,2,3,2));
+
+    // Phase 3: permute 128-bit lanes
+    r0.val = _mm256_permute2f128_ps(s0, s4, 0x20);
+    r1.val = _mm256_permute2f128_ps(s1, s5, 0x20);
+    r2.val = _mm256_permute2f128_ps(s2, s6, 0x20);
+    r3.val = _mm256_permute2f128_ps(s3, s7, 0x20);
+    r4.val = _mm256_permute2f128_ps(s0, s4, 0x31);
+    r5.val = _mm256_permute2f128_ps(s1, s5, 0x31);
+    r6.val = _mm256_permute2f128_ps(s2, s6, 0x31);
+    r7.val = _mm256_permute2f128_ps(s3, s7, 0x31);
+}
+
 } // namespace avx2
 } // namespace arch
 } // namespace simd

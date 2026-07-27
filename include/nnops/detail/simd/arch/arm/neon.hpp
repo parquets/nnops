@@ -555,6 +555,53 @@ inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).odd;
 }
 
+// ============================================================
+// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
+//
+// Decomposes into four 4×4 transposes on the lo/hi float32x4_t halves.
+// ============================================================
+
+namespace {
+
+/// 4×4 transpose of four float32x4_t vectors in-place.
+inline void transpose_4x4_f32(float32x4_t& r0, float32x4_t& r1,
+                               float32x4_t& r2, float32x4_t& r3) {
+    float32x4x2_t t01 = vtrnq_f32(r0, r1);   // {a0,b0,a2,b2}, {a1,b1,a3,b3}
+    float32x4x2_t t23 = vtrnq_f32(r2, r3);   // {c0,d0,c2,d2}, {c1,d1,c3,d3}
+    r0 = vcombine_f32(vget_low_f32(t01.val[0]), vget_low_f32(t23.val[0]));
+    r1 = vcombine_f32(vget_low_f32(t01.val[1]), vget_low_f32(t23.val[1]));
+    r2 = vcombine_f32(vget_high_f32(t01.val[0]), vget_high_f32(t23.val[0]));
+    r3 = vcombine_f32(vget_high_f32(t01.val[1]), vget_high_f32(t23.val[1]));
+}
+
+}  // anonymous namespace
+
+/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
+inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
+                             v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
+    float32x4_t t0, t1, t2, t3;
+
+    // r{0..3}.lo → r{0..3}.lo
+    t0 = r0.lo; t1 = r1.lo; t2 = r2.lo; t3 = r3.lo;
+    transpose_4x4_f32(t0, t1, t2, t3);
+    r0.lo = t0; r1.lo = t1; r2.lo = t2; r3.lo = t3;
+
+    // r{0..3}.hi → r{4..7}.lo
+    t0 = r0.hi; t1 = r1.hi; t2 = r2.hi; t3 = r3.hi;
+    transpose_4x4_f32(t0, t1, t2, t3);
+    r4.lo = t0; r5.lo = t1; r6.lo = t2; r7.lo = t3;
+
+    // r{4..7}.lo → r{0..3}.hi
+    t0 = r4.lo; t1 = r5.lo; t2 = r6.lo; t3 = r7.lo;
+    transpose_4x4_f32(t0, t1, t2, t3);
+    r0.hi = t0; r1.hi = t1; r2.hi = t2; r3.hi = t3;
+
+    // r{4..7}.hi → r{4..7}.hi
+    t0 = r4.hi; t1 = r5.hi; t2 = r6.hi; t3 = r7.hi;
+    transpose_4x4_f32(t0, t1, t2, t3);
+    r4.hi = t0; r5.hi = t1; r6.hi = t2; r7.hi = t3;
+}
+
 } // namespace neon
 } // namespace arch
 } // namespace simd

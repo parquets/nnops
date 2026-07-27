@@ -579,6 +579,36 @@ inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
 
 #endif  // defined(__F16C__)
 
+// ============================================================
+// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
+//
+// Decomposes into four 4×4 transposes on the lo/hi halves.
+// ============================================================
+
+/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
+inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
+                             v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
+    // 4×4 transpose of r{0..3}.lo → results go to r{0..3}.lo
+    __m128 a0 = r0.lo, a1 = r1.lo, a2 = r2.lo, a3 = r3.lo;
+    _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
+    r0.lo = a0; r1.lo = a1; r2.lo = a2; r3.lo = a3;
+
+    // 4×4 transpose of r{0..3}.hi → results go to r{4..7}.lo
+    a0 = r0.hi; a1 = r1.hi; a2 = r2.hi; a3 = r3.hi;
+    _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
+    r4.lo = a0; r5.lo = a1; r6.lo = a2; r7.lo = a3;
+
+    // 4×4 transpose of r{4..7}.lo → results go to r{0..3}.hi
+    a0 = r4.lo; a1 = r5.lo; a2 = r6.lo; a3 = r7.lo;
+    _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
+    r0.hi = a0; r1.hi = a1; r2.hi = a2; r3.hi = a3;
+
+    // 4×4 transpose of r{4..7}.hi → results go to r{4..7}.hi
+    a0 = r4.hi; a1 = r5.hi; a2 = r6.hi; a3 = r7.hi;
+    _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
+    r4.hi = a0; r5.hi = a1; r6.hi = a2; r7.hi = a3;
+}
+
 } // namespace sse
 } // namespace arch
 } // namespace simd

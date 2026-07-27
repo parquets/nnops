@@ -56,6 +56,7 @@
     using arch::avx2::v_load_odd_f32x8;
     using arch::avx2::v_load_stride2_even_f32x8;
     using arch::avx2::v_load_stride2_odd_f32x8;
+    using arch::avx2::v_transpose_8x8;
     }} // namespace nnops::simd
   #else
     // x86_64 without AVX: emulate with two SSE registers
@@ -97,6 +98,7 @@
     using arch::sse::v_load_odd_f32x8;
     using arch::sse::v_load_stride2_even_f32x8;
     using arch::sse::v_load_stride2_odd_f32x8;
+    using arch::sse::v_transpose_8x8;
     }} // namespace nnops::simd
   #endif  // __AVX__
 
@@ -139,6 +141,7 @@
   using arch::neon::v_load_odd_f32x8;
   using arch::neon::v_load_stride2_even_f32x8;
   using arch::neon::v_load_stride2_odd_f32x8;
+  using arch::neon::v_transpose_8x8;
   }} // namespace nnops::simd
 
 #else
@@ -178,5 +181,6 @@
   using arch::scalar::v_load_odd_f32x8;
   using arch::scalar::v_load_stride2_even_f32x8;
   using arch::scalar::v_load_stride2_odd_f32x8;
+  using arch::scalar::v_transpose_8x8;
   }} // namespace nnops::simd
 #endif

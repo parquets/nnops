@@ -658,6 +658,32 @@ inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).odd;
 }
 
+// ============================================================
+// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
+// ============================================================
+
+/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
+inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
+                             v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
+    float tmp[8][8];
+    for (int i = 0; i < 8; ++i) tmp[0][i] = r0[i];
+    for (int i = 0; i < 8; ++i) tmp[1][i] = r1[i];
+    for (int i = 0; i < 8; ++i) tmp[2][i] = r2[i];
+    for (int i = 0; i < 8; ++i) tmp[3][i] = r3[i];
+    for (int i = 0; i < 8; ++i) tmp[4][i] = r4[i];
+    for (int i = 0; i < 8; ++i) tmp[5][i] = r5[i];
+    for (int i = 0; i < 8; ++i) tmp[6][i] = r6[i];
+    for (int i = 0; i < 8; ++i) tmp[7][i] = r7[i];
+    for (int i = 0; i < 8; ++i) r0[i] = tmp[i][0];
+    for (int i = 0; i < 8; ++i) r1[i] = tmp[i][1];
+    for (int i = 0; i < 8; ++i) r2[i] = tmp[i][2];
+    for (int i = 0; i < 8; ++i) r3[i] = tmp[i][3];
+    for (int i = 0; i < 8; ++i) r4[i] = tmp[i][4];
+    for (int i = 0; i < 8; ++i) r5[i] = tmp[i][5];
+    for (int i = 0; i < 8; ++i) r6[i] = tmp[i][6];
+    for (int i = 0; i < 8; ++i) r7[i] = tmp[i][7];
+}
+
 } // namespace scalar
 } // namespace arch
 } // namespace simd

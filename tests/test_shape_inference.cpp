@@ -475,10 +475,10 @@ NNOPS_TEST(shape_reduce_negative_axis) {
 
 NNOPS_TEST(shape_dtype_propagation) {
     auto op = Activation::create(Backend::CPU);
-    auto inputs = std::vector<TensorDesc>{td({2, 4}, DataType::f16, TensorLayout::NHWC)};
+    auto inputs = std::vector<TensorDesc>{td({2, 4}, DataType::f16, TensorLayout::NCHWC8)};
     auto outs = op->getOutputShapes(inputs);
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f16);
-    NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NHWC);
+    NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NCHWC8);
 }
 
 // ============================================================

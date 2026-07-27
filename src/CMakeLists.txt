@@ -23,9 +23,13 @@ set(NNOPS_CPU_SOURCES
     ops/reduce.cpp
     ops/resize.cpp
     ops/grid_sample.cpp
+    ops/layout_convert.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
+
+    # Layout conversion utilities (pack/unpack between NCHW and NCHWC8)
+    backend/cpu/layout_convert.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp

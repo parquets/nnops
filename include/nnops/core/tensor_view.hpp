@@ -38,6 +38,21 @@ struct TensorDesc {
     int64_t rank = 0;
     DataType dtype = DataType::f32;
     TensorLayout layout = TensorLayout::NCHW;
+
+    /// Total number of logical elements (product of all dimensions).
+    int64_t numel() const noexcept {
+        if (rank == 0) return 0;
+        int64_t n = 1;
+        for (int64_t i = 0; i < rank; ++i) {
+            n *= dims[static_cast<size_t>(i)];
+        }
+        return n;
+    }
+
+    /// Total size in bytes (numel * elem_size).
+    size_t nbytes() const noexcept {
+        return static_cast<size_t>(numel()) * data_type_size(dtype);
+    }
 };
 
 class TensorView {
@@ -81,6 +96,15 @@ public:
         NNOPS_ASSERT(shape.size() <= kMaxRank);
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
+        // Validate pitch for packed layouts: must hold at least
+        // last_dim * pack_size elements per row.
+        const int64_t pack = layout_channel_pack(layout);
+        if (pack > 1 && rank_ >= 2) {
+            const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
+            const int64_t min_pitch = shape_[static_cast<size_t>(rank_ - 1)]
+                                    * pack * elem_size;
+            NNOPS_ASSERT(pitch_ >= min_pitch);
+        }
     }
 
     // ---- Accessors ----
@@ -174,15 +198,24 @@ public:
     /// For higher dims: shape[dim+1] * stride(dim+1).
     int64_t stride_elems(int64_t dim) const noexcept {
         NNOPS_ASSERT(dim >= 0 && dim < rank_);
-        // Innermost dimension: always contiguous (stride = 1 element)
-        if (dim == rank_ - 1) { return 1; }
+        // Innermost dimension: for packed layouts, each logical step spans
+        // the pack lane (e.g., 8 for NCHWC8); for planar, stride is 1.
+        if (dim == rank_ - 1) {
+            return channel_pack_size();
+        }
         // Second-innermost: stride comes from pitch (may be > shape[rank-1] if padded)
         const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype_));
         int64_t s = pitch_ / elem_size;
         if (dim == rank_ - 2) { return s; }
-        // Outer dimensions: accumulate via shape[i+1] * stride(i+1)
+        // Outer dimensions: accumulate via shape[i+1] * stride(i+1).
+        // For channel-packed layouts, the physical size of the C dimension
+        // is the number of channel blocks, not the logical channel count.
         for (int64_t i = rank_ - 3; i >= dim; --i) {
-            s = shape_[static_cast<size_t>(i + 1)] * s;
+            int64_t inner_size = shape_[static_cast<size_t>(i + 1)];
+            if (i + 1 == 1 && channel_pack_size() > 1) {
+                inner_size = num_channel_blocks();
+            }
+            s = inner_size * s;
         }
         return s;
     }
@@ -192,6 +225,51 @@ public:
     int64_t row_stride_elems() const noexcept {
         if (rank_ < 2) { return 1; }
         return pitch_ / static_cast<int64_t>(data_type_size(dtype_));
+    }
+
+    // ---- Layout-aware accessors ----
+
+    /// Channel pack size (1 for NCHW/NCDHW, 8 for NCHWC8/NCDHWC8, etc.).
+    int64_t channel_pack_size() const noexcept {
+        return layout_channel_pack(layout_);
+    }
+
+    /// Number of channel blocks: ceil(C / pack_size).
+    /// For NCHWC8 with C=20: returns 3 (two full C8 blocks + one partial).
+    int64_t num_channel_blocks() const noexcept {
+        if (rank_ < 2) return 1;
+        int64_t pack = channel_pack_size();
+        if (pack <= 1) return shape_[1];  // planar: each channel is its own "block"
+        return (shape_[1] + pack - 1) / pack;
+    }
+
+    /// Element stride between consecutive channel blocks.
+    /// For NCHWC8 [N,C,H,W]: H * row_stride_elems() = H * W * 8.
+    /// For NCDHWC8 [N,C,D,H,W]: D * H * row_stride_elems() = D * H * W * 8.
+    int64_t channel_block_stride_elems() const noexcept {
+        if (rank_ < 3) return row_stride_elems();
+        int64_t s = row_stride_elems();
+        // Multiply by all spatial dimensions between C and the row
+        for (int64_t d = 2; d < rank_ - 1; ++d) {
+            s *= shape_[static_cast<size_t>(d)];
+        }
+        return s;
+    }
+
+    /// Total number of rows for flat row-by-row processing.
+    /// NCHW:  N * C * H.
+    /// NCHWC8: N * ceil(C/8) * H.
+    /// NCDHWC8: N * ceil(C/8) * D * H.
+    int64_t total_rows() const noexcept {
+        if (rank_ < 1) return 0;
+        int64_t rows = shape_[0];  // N
+        if (rank_ >= 2) {
+            rows *= num_channel_blocks();
+        }
+        for (int64_t d = 2; d < rank_ - 1; ++d) {
+            rows *= shape_[static_cast<size_t>(d)];
+        }
+        return rows;
     }
 
 private:

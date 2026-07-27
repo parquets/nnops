@@ -26,6 +26,7 @@ enum class OpType : uint8_t {
     Reduce          = 15,
     Resize          = 16,
     GridSample      = 17,
+    LayoutConvert   = 18,
 };
 
 }  // namespace nnops

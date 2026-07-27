@@ -83,19 +83,110 @@ NNOPS_TEST(tensor_view_1d_pitch) {
     NNOPS_EXPECT_EQ(tv.stride_elems(0), 1);
 }
 
-NNOPS_TEST(tensor_view_nchwc8_pitch) {
-    // Simulate NCHWC8 uint8, W=7, 32-byte aligned pitch = 72
-    // Shape: [N, C/8, H, W, 8] but for simplicity test a 3D case
-    // Actually, test a 4D tensor with external pitch
-    const int64_t shape[] = {1, 2, 7, 8};  // N=1, C8=2, H=7, Cx=8
-    uint8_t data[1 * 2 * 7 * 10] = {};  // padded buffer
-    const int64_t pitch = 80;  // 10 bytes per row (8 uint8 + 2 padding)
+// ============================================================
+// NCHWC8 layout-aware accessors
+// ============================================================
 
-    TensorView tv(shape, DataType::u8, data, pitch);
-    NNOPS_EXPECT_EQ(tv.pitch(), 80);
-    NNOPS_EXPECT_EQ(tv.row_stride_elems(), 80);  // u8: pitch/elem_size = 80/1
-    NNOPS_EXPECT_EQ(tv.stride_elems(3), 1);      // innermost: W*C8 dimension
-    NNOPS_EXPECT_EQ(tv.stride_elems(2), 80);     // H dimension
-    NNOPS_EXPECT_EQ(tv.stride_elems(1), 560);    // C8 dimension: 7 * 80
-    NNOPS_EXPECT_EQ(tv.stride_elems(0), 1120);   // N dimension: 2 * 560
+NNOPS_TEST(nchwc8_dense_construction) {
+    // Logical: [N=2, C=16, H=3, W=4], NCHWC8
+    // Physical row: W * 8 = 32 elements, pitch = 32 * 4 = 128 bytes
+    const int64_t shape[] = {2, 16, 3, 4};
+    float data[2 * 2 * 3 * 4 * 8] = {};  // N * C8 * H * W * 8
+    const int64_t pitch = 4 * 8 * 4;  // W * C8 * sizeof(float)
+
+    TensorView tv(shape, DataType::f32, data, pitch, TensorLayout::NCHWC8);
+    NNOPS_EXPECT_EQ(tv.rank(), 4);
+    NNOPS_EXPECT_EQ(tv.layout(), TensorLayout::NCHWC8);
+    NNOPS_EXPECT_EQ(tv.channel_pack_size(), 8);
+    NNOPS_EXPECT_EQ(tv.num_channel_blocks(), 2);  // ceil(16/8)
+    NNOPS_EXPECT_EQ(tv.pitch(), 128);
+    NNOPS_EXPECT_EQ(tv.row_stride_elems(), 32);   // 128/4 = 32 = W * 8
+    // stride_elems: innermost = pack_size = 8 (NOT 1)
+    NNOPS_EXPECT_EQ(tv.stride_elems(3), 8);
+    NNOPS_EXPECT_EQ(tv.stride_elems(2), 32);      // H: row_stride = 32
+    NNOPS_EXPECT_EQ(tv.stride_elems(1), 96);      // C: H * row_stride = 3 * 32
+    NNOPS_EXPECT_EQ(tv.stride_elems(0), 192);     // N: C8 * H * row_stride = 2 * 96
+    NNOPS_EXPECT_EQ(tv.numel(), 2 * 16 * 3 * 4);  // logical numel
+}
+
+NNOPS_TEST(nchwc8_partial_channel_block) {
+    // C=20, not divisible by 8 → 3 blocks (2 full + 1 partial)
+    const int64_t shape[] = {1, 20, 2, 3};
+    float data[1 * 3 * 2 * 3 * 8] = {};
+    const int64_t pitch = 3 * 8 * 4;  // W * C8 * sizeof(float)
+
+    TensorView tv(shape, DataType::f32, data, pitch, TensorLayout::NCHWC8);
+    NNOPS_EXPECT_EQ(tv.channel_pack_size(), 8);
+    NNOPS_EXPECT_EQ(tv.num_channel_blocks(), 3);  // ceil(20/8) = 3
+    NNOPS_EXPECT_EQ(tv.channel_block_stride_elems(), 2 * 3 * 8);  // H * W * 8 = 48
+    NNOPS_EXPECT_EQ(tv.total_rows(), 1 * 3 * 2);  // N * C8 * H = 6
+}
+
+NNOPS_TEST(nchwc8_total_rows) {
+    // N=2, C=8, H=4, W=5 → NCHWC8: rows = N * C8 * H = 2 * 1 * 4 = 8
+    const int64_t shape[] = {2, 8, 4, 5};
+    float data[2 * 1 * 4 * 5 * 8] = {};
+    const int64_t pitch = 5 * 8 * 4;
+    TensorView tv(shape, DataType::f32, data, pitch, TensorLayout::NCHWC8);
+    NNOPS_EXPECT_EQ(tv.total_rows(), 2 * 1 * 4);
+    // Compare with NCHW: rows = N * C * H = 2 * 8 * 4 = 64
+    TensorView tv_nchw(shape, DataType::f32, data, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(tv_nchw.total_rows(), 2 * 8 * 4);
+}
+
+NNOPS_TEST(nchwc8_pitch_validation) {
+    // pitch must be >= W * pack_size * elem_size
+    const int64_t shape[] = {1, 8, 2, 3};
+    std::vector<float> data(1 * 1 * 2 * 3 * 8);
+    // Valid: pitch = W * 8 * 4 = 96
+    const int64_t valid_pitch = 3 * 8 * static_cast<int64_t>(sizeof(float));
+    TensorView tv(shape, DataType::f32, data.data(), valid_pitch, TensorLayout::NCHWC8);
+    NNOPS_EXPECT_EQ(tv.pitch(), 96);
+}
+
+NNOPS_TEST(nchwc32_dense_construction) {
+    const int64_t shape[] = {1, 64, 2, 3};
+    float data[1 * 2 * 2 * 3 * 32] = {};
+    const int64_t pitch = 3 * 32 * 4;
+    TensorView tv(shape, DataType::f32, data, pitch, TensorLayout::NCHWC32);
+    NNOPS_EXPECT_EQ(tv.channel_pack_size(), 32);
+    NNOPS_EXPECT_EQ(tv.num_channel_blocks(), 2);  // ceil(64/32)
+    NNOPS_EXPECT_EQ(tv.stride_elems(3), 32);      // innermost = pack_size
+}
+
+// ============================================================
+// NCDHWC8 (3D) accessors
+// ============================================================
+
+NNOPS_TEST(ncdhwc8_dense_construction) {
+    // Logical: [N=1, C=16, D=2, H=3, W=4]
+    const int64_t shape[] = {1, 16, 2, 3, 4};
+    float data[1 * 2 * 2 * 3 * 4 * 8] = {};
+    const int64_t pitch = 4 * 8 * 4;
+
+    TensorView tv(shape, DataType::f32, data, pitch, TensorLayout::NCDHWC8);
+    NNOPS_EXPECT_EQ(tv.rank(), 5);
+    NNOPS_EXPECT_EQ(tv.layout(), TensorLayout::NCDHWC8);
+    NNOPS_EXPECT_EQ(tv.channel_pack_size(), 8);
+    NNOPS_EXPECT_EQ(tv.num_channel_blocks(), 2);
+    NNOPS_EXPECT_EQ(tv.row_stride_elems(), 32);
+    NNOPS_EXPECT_EQ(tv.stride_elems(4), 8);       // W: pack_size
+    NNOPS_EXPECT_EQ(tv.stride_elems(3), 32);      // H: row_stride
+    NNOPS_EXPECT_EQ(tv.stride_elems(2), 96);      // D: H * row_stride = 3 * 32
+    NNOPS_EXPECT_EQ(tv.channel_block_stride_elems(), 2 * 3 * 32);  // D * H * W * 8
+    NNOPS_EXPECT_EQ(tv.total_rows(), 1 * 2 * 2 * 3);  // N * C8 * D * H
+}
+
+// ============================================================
+// TensorDesc numel/nbytes
+// ============================================================
+
+NNOPS_TEST(tensor_desc_numel) {
+    TensorDesc d;
+    d.rank = 3;
+    d.dims.resize(3);
+    d.dims[0] = 2; d.dims[1] = 3; d.dims[2] = 4;
+    d.dtype = DataType::f32;
+    NNOPS_EXPECT_EQ(d.numel(), 24);
+    NNOPS_EXPECT_EQ(static_cast<int64_t>(d.nbytes()), 24 * 4);
 }

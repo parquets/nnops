@@ -377,6 +377,24 @@ inline std::vector<TensorDesc> identity_output_shape(
     return {out};
 }
 
+/// LayoutConvert shape inference.
+/// Output has the same logical shape and dtype as input;
+/// only the layout field changes to target_layout.
+inline std::vector<TensorDesc> layout_convert_output_shape(
+    std::span<const TensorDesc> inputs,
+    TensorLayout target_layout)
+{
+    const auto& in = inputs[0];
+
+    TensorDesc out;
+    out.rank   = in.rank;
+    out.layout = target_layout;
+    out.dtype  = in.dtype;
+    out.dims   = in.dims;
+
+    return {out};
+}
+
 /// Reduce shape inference.
 /// Axis removed (or kept as size-1 if keepdims).
 inline std::vector<TensorDesc> reduce_output_shape(
