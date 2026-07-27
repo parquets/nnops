@@ -20,6 +20,7 @@ set(TEST_SOURCES
     test_reduce.cpp
     test_shape_inference.cpp
     test_resize.cpp
+    test_grid_sample.cpp
 )
 
 # Vulkan tests (only when Vulkan backend is enabled)

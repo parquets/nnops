@@ -22,6 +22,7 @@ set(NNOPS_CPU_SOURCES
     ops/unary.cpp
     ops/reduce.cpp
     ops/resize.cpp
+    ops/grid_sample.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -38,12 +39,11 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/unary.cpp
     backend/cpu/reduce.cpp
     backend/cpu/resize.cpp
-
-    # CPU tiled GEMM dispatch (platform-abstracted over x86_64 / aarch64 micro-kernels)
-    backend/cpu/imatmul.cpp
+    backend/cpu/grid_sample.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA)
     backend/cpu/matmul.cpp
+    backend/cpu/matmul_impl.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp

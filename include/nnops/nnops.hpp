@@ -27,3 +27,4 @@
 #include "nnops/ops/rms_norm.hpp"
 #include "nnops/ops/conv3d.hpp"
 #include "nnops/ops/resize.hpp"
+#include "nnops/ops/grid_sample.hpp"

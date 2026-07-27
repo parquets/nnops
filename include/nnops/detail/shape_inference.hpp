@@ -443,4 +443,36 @@ inline std::vector<TensorDesc> resize_output_shape(
     return {out};
 }
 
+/// GridSample shape inference (2D / 3D auto-detected from input rank).
+/// inputs[0] = input  [N, C, (D,) H, W]
+/// inputs[1] = grid   [N, (OD,) OH, OW, 2|3]
+/// Returns: [N, C, (OD,) OH, OW]
+inline std::vector<TensorDesc> grid_sample_output_shape(
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];    // [N, C, (D,) H, W]
+    const auto& grid = inputs[1];  // [N, (D_out,) H_out, W_out, 2|3]
+    const int64_t irank = in.rank;
+    const int64_t srank = irank - 2;  // spatial rank: 2 or 3
+
+    TensorDesc out;
+    out.rank   = irank;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(static_cast<size_t>(irank));
+    out.dims[0] = in.dims[0];  // N
+    out.dims[1] = in.dims[1];  // C
+
+    // Grid spatial dims: grid rank = srank + 3 (N + spatial + coordinate)
+    // For 2D: grid = [N, OH, OW, 2], spatial dims at indices 1,2
+    // For 3D: grid = [N, OD, OH, OW, 3], spatial dims at indices 1,2,3
+    for (int64_t d = 0; d < srank; ++d) {
+        out.dims[static_cast<size_t>(2 + d)] =
+            grid.dims[static_cast<size_t>(1 + d)];
+    }
+
+    return {out};
+}
+
 }  // namespace nnops

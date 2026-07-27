@@ -7,7 +7,7 @@
 /// is in the L2 working set during MMA).
 
 #include "matmul.h"
-#include "imatmul.h"
+#include "matmul_impl.h"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/assert.hpp"

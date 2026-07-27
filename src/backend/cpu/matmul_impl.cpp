@@ -1,4 +1,4 @@
-#include "imatmul.h"
+#include "matmul_impl.h"
 
 #include <array>
 
