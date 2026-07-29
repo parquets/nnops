@@ -5,12 +5,10 @@
 /// share a single pack kernel and a single unpack kernel. The only
 /// difference between 2D and 3D is num_spatial_rows (H vs D*H).
 ///
-/// For f32 with full C8 blocks: uses an 8×8 SIMD transpose to vectorize
-/// both loads AND stores — 8 v_f32x8 loads + transpose + 8 v_f32x8 stores
-/// processes 8 W-positions at once (64 elements per iteration).
-///
-/// For f16: uses SIMD loads/stores with raw half bits to eliminate the
-/// float↔half conversion roundtrip that s_load/s_store incur.
+/// Uses an 8×8 SIMD transpose to vectorize both loads AND stores —
+/// 8 vector loads + transpose + 8 vector stores processes 8 W-positions
+/// at once (64 elements per iteration). Works for both f32 and f16 via
+/// generic auto-deduction (v_load/v_store dispatch to the correct SIMD type).
 /// Partial (trailing) C8 blocks are zero-padded on pack and truncated on unpack.
 ///
 /// Parallelism: flattens N * ceil(C/8) * [D] * H into a single loop of
@@ -23,7 +21,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <type_traits>
 
 namespace nnops {
 
@@ -50,7 +47,7 @@ template <typename T>
 inline void unpack_one_w(const T* in_row, T* out_row,
                           int64_t w, int64_t c_base, int64_t ch_stride,
                           int64_t valid_lanes) {
-    T tmp[8];
+    T tmp[8] = {};
     v_store(tmp, v_load(&in_row[w * 8]));
     for (int64_t lane = 0; lane < valid_lanes; ++lane) {
         out_row[(c_base + lane) * ch_stride + w] = tmp[lane];
@@ -98,42 +95,31 @@ void pack_impl(const TensorView& src, TensorView& dst,
         const T* in_row = in_ptr + n * C * ch_stride + sr * in_row_stride;
         T* out_row = out_ptr + (n * C8 * num_spatial_rows + c8 * num_spatial_rows + sr) * out_row_stride;
 
-        if constexpr (std::is_same_v<T, float>) {
-            if (valid_lanes == 8) {
-                // Full C8: 8×8 transpose — process 8 w at a time
-                int64_t w = 0;
-                for (; w + 8 <= W; w += 8) {
-                    v_f32x8 c0 = v_load(&in_row[(c_base + 0) * ch_stride + w]);
-                    v_f32x8 c1 = v_load(&in_row[(c_base + 1) * ch_stride + w]);
-                    v_f32x8 c2 = v_load(&in_row[(c_base + 2) * ch_stride + w]);
-                    v_f32x8 c3 = v_load(&in_row[(c_base + 3) * ch_stride + w]);
-                    v_f32x8 c4 = v_load(&in_row[(c_base + 4) * ch_stride + w]);
-                    v_f32x8 c5 = v_load(&in_row[(c_base + 5) * ch_stride + w]);
-                    v_f32x8 c6 = v_load(&in_row[(c_base + 6) * ch_stride + w]);
-                    v_f32x8 c7 = v_load(&in_row[(c_base + 7) * ch_stride + w]);
+        auto vzero = v_set1(in_row, 0);
+        int64_t w = 0;
+        for (; w + 8 <= W; w += 8) {
+            auto c0 = c_base + 0 < C ? v_load(&in_row[(c_base + 0) * ch_stride + w]) : vzero;
+            auto c1 = c_base + 1 < C ? v_load(&in_row[(c_base + 1) * ch_stride + w]) : vzero;
+            auto c2 = c_base + 2 < C ? v_load(&in_row[(c_base + 2) * ch_stride + w]) : vzero;
+            auto c3 = c_base + 3 < C ? v_load(&in_row[(c_base + 3) * ch_stride + w]) : vzero;
+            auto c4 = c_base + 4 < C ? v_load(&in_row[(c_base + 4) * ch_stride + w]) : vzero;
+            auto c5 = c_base + 5 < C ? v_load(&in_row[(c_base + 5) * ch_stride + w]) : vzero;
+            auto c6 = c_base + 6 < C ? v_load(&in_row[(c_base + 6) * ch_stride + w]) : vzero;
+            auto c7 = c_base + 7 < C ? v_load(&in_row[(c_base + 7) * ch_stride + w]) : vzero;
 
-                    v_transpose_8x8(c0, c1, c2, c3, c4, c5, c6, c7);
+            v_transpose_8x8(c0, c1, c2, c3, c4, c5, c6, c7);
 
-                    v_store(&out_row[(w + 0) * 8], c0);
-                    v_store(&out_row[(w + 1) * 8], c1);
-                    v_store(&out_row[(w + 2) * 8], c2);
-                    v_store(&out_row[(w + 3) * 8], c3);
-                    v_store(&out_row[(w + 4) * 8], c4);
-                    v_store(&out_row[(w + 5) * 8], c5);
-                    v_store(&out_row[(w + 6) * 8], c6);
-                    v_store(&out_row[(w + 7) * 8], c7);
-                }
-                for (; w < W; ++w) {
-                    pack_one_w<T>(in_row, out_row, w, c_base,
-                                  ch_stride, valid_lanes);
-                }
-                return;
-            }
+            v_store(&out_row[(w + 0) * 8], c0);
+            v_store(&out_row[(w + 1) * 8], c1);
+            v_store(&out_row[(w + 2) * 8], c2);
+            v_store(&out_row[(w + 3) * 8], c3);
+            v_store(&out_row[(w + 4) * 8], c4);
+            v_store(&out_row[(w + 5) * 8], c5);
+            v_store(&out_row[(w + 6) * 8], c6);
+            v_store(&out_row[(w + 7) * 8], c7);
         }
-        // f16 or partial C8
-        for (int64_t w = 0; w < W; ++w) {
-            pack_one_w<T>(in_row, out_row, w, c_base,
-                          ch_stride, valid_lanes);
+        for (; w < W; ++w) {
+            pack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
         }
     };
 
@@ -183,39 +169,32 @@ void unpack_impl(const TensorView& src, TensorView& dst,
         const T* in_row = in_ptr + (n * C8 * num_spatial_rows + c8 * num_spatial_rows + sr) * in_row_stride;
         T* out_row = out_ptr + n * C * ch_stride + sr * out_row_stride;
 
-        if constexpr (std::is_same_v<T, float>) {
-            if (valid_lanes == 8) {
-                int64_t w = 0;
-                for (; w + 8 <= W; w += 8) {
-                    v_f32x8 r0 = v_load(&in_row[(w + 0) * 8]);
-                    v_f32x8 r1 = v_load(&in_row[(w + 1) * 8]);
-                    v_f32x8 r2 = v_load(&in_row[(w + 2) * 8]);
-                    v_f32x8 r3 = v_load(&in_row[(w + 3) * 8]);
-                    v_f32x8 r4 = v_load(&in_row[(w + 4) * 8]);
-                    v_f32x8 r5 = v_load(&in_row[(w + 5) * 8]);
-                    v_f32x8 r6 = v_load(&in_row[(w + 6) * 8]);
-                    v_f32x8 r7 = v_load(&in_row[(w + 7) * 8]);
+        // Full SIMD transpose: 8 w at a time (works for f32, f16, partial C8)
+        int64_t w = 0;
+        for (; w + 8 <= W; w += 8) {
+            auto r0 = v_load(&in_row[(w + 0) * 8]);
+            auto r1 = v_load(&in_row[(w + 1) * 8]);
+            auto r2 = v_load(&in_row[(w + 2) * 8]);
+            auto r3 = v_load(&in_row[(w + 3) * 8]);
+            auto r4 = v_load(&in_row[(w + 4) * 8]);
+            auto r5 = v_load(&in_row[(w + 5) * 8]);
+            auto r6 = v_load(&in_row[(w + 6) * 8]);
+            auto r7 = v_load(&in_row[(w + 7) * 8]);
 
-                    v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
+            v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
 
-                    v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
-                    v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
-                    v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
-                    v_store(&out_row[(c_base + 3) * ch_stride + w], r3);
-                    v_store(&out_row[(c_base + 4) * ch_stride + w], r4);
-                    v_store(&out_row[(c_base + 5) * ch_stride + w], r5);
-                    v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
-                    v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
-                }
-                for (; w < W; ++w) {
-                    unpack_one_w<T>(in_row, out_row, w, c_base,
-                                    ch_stride, valid_lanes);
-                }
-                return;
-            }
+            // Store only valid channels (skip pad channels for partial C8)
+            if (c_base + 0 < C) v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
+            if (c_base + 1 < C) v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
+            if (c_base + 2 < C) v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
+            if (c_base + 3 < C) v_store(&out_row[(c_base + 3) * ch_stride + w], r3);
+            if (c_base + 4 < C) v_store(&out_row[(c_base + 4) * ch_stride + w], r4);
+            if (c_base + 5 < C) v_store(&out_row[(c_base + 5) * ch_stride + w], r5);
+            if (c_base + 6 < C) v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
+            if (c_base + 7 < C) v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
         }
-        // f16 or partial C8
-        for (int64_t w = 0; w < W; ++w) {
+        // Remainder: per-w-element fallback
+        for (; w < W; ++w) {
             unpack_one_w<T>(in_row, out_row, w, c_base,
                             ch_stride, valid_lanes);
         }

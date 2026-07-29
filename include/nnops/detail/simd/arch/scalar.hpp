@@ -684,6 +684,29 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     for (int i = 0; i < 8; ++i) r7[i] = tmp[i][7];
 }
 
+/// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
+inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
+                             v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
+    // Scalar: read 8×8 into temp, write back transposed
+    uint16_t tmp[8][8];
+    for (int i = 0; i < 8; ++i) tmp[0][i] = r0.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[1][i] = r1.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[2][i] = r2.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[3][i] = r3.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[4][i] = r4.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[5][i] = r5.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[6][i] = r6.bits[i];
+    for (int i = 0; i < 8; ++i) tmp[7][i] = r7.bits[i];
+    for (int i = 0; i < 8; ++i) r0.bits[i] = tmp[i][0];
+    for (int i = 0; i < 8; ++i) r1.bits[i] = tmp[i][1];
+    for (int i = 0; i < 8; ++i) r2.bits[i] = tmp[i][2];
+    for (int i = 0; i < 8; ++i) r3.bits[i] = tmp[i][3];
+    for (int i = 0; i < 8; ++i) r4.bits[i] = tmp[i][4];
+    for (int i = 0; i < 8; ++i) r5.bits[i] = tmp[i][5];
+    for (int i = 0; i < 8; ++i) r6.bits[i] = tmp[i][6];
+    for (int i = 0; i < 8; ++i) r7.bits[i] = tmp[i][7];
+}
+
 } // namespace scalar
 } // namespace arch
 } // namespace simd

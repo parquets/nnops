@@ -16,9 +16,7 @@ namespace nnops {
 /// Supported pooling types.
 enum class PoolingType : uint8_t {
     Max,                 ///< Maximum value in window
-    Average,             ///< Average of values in window (including padding)
-    AverageExcludePad,   ///< Average excluding padded positions
-    Lp,                  ///< Lp-norm pooling
+    Average,             ///< Average of values in window
 };
 
 /// Attributes for the Pooling operator (supports both 2D and 3D).
@@ -42,7 +40,9 @@ struct PoolingAttributes {
     /// Dilation: [DD, DH, DW]. For 2D, only DH/DW are used.
     std::array<int64_t, 3> dilation = {1, 1, 1};
 
-    int64_t p_norm = 2;  ///< p value for Lp pooling
+    /// If true, exclude padded positions from average computation
+    /// (only meaningful when type == Average).
+    bool exclude_pad = false;
 
     /// Auto-padding mode.
     enum class AutoPad : uint8_t {

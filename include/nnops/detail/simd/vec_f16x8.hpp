@@ -55,6 +55,8 @@
   using arch::neon::v_load_odd_f16x8;
   using arch::neon::v_load_stride2_even_f16x8;
   using arch::neon::v_load_stride2_odd_f16x8;
+  // transpose
+  using arch::neon::v_transpose_8x8;
   }} // namespace nnops::simd
 #elif defined(NNOPS_ARCH_X86_64) && defined(__F16C__)
   // x86_64: F16C + AVX2 (__m128i storage, convert→compute→convert via _mm256_cvtph_ps / _mm256_cvtps_ph)
@@ -95,6 +97,8 @@
   using arch::sse::v_load_odd_f16x8;
   using arch::sse::v_load_stride2_even_f16x8;
   using arch::sse::v_load_stride2_odd_f16x8;
+  // transpose
+  using arch::sse::v_transpose_8x8;
   }} // namespace nnops::simd
 #else
   // Scalar fallback
@@ -133,5 +137,7 @@
   using arch::scalar::v_load_odd_f16x8;
   using arch::scalar::v_load_stride2_even_f16x8;
   using arch::scalar::v_load_stride2_odd_f16x8;
+  // transpose
+  using arch::scalar::v_transpose_8x8;
   }} // namespace nnops::simd
 #endif

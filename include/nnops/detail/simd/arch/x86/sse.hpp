@@ -609,6 +609,43 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     r4.hi = a0; r5.hi = a1; r6.hi = a2; r7.hi = a3;
 }
 
+#if defined(__F16C__)
+/// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
+/// Uses _mm_unpacklo_epi16 / _mm_unpackhi_epi16 (equiv to NEON ZIP1/ZIP2).
+inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
+                             v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
+    // Step 1: pairwise interchange (2×2 blocks)
+    __m128i t0 = _mm_unpacklo_epi16(r0.val, r1.val);
+    __m128i t1 = _mm_unpackhi_epi16(r0.val, r1.val);
+    __m128i t2 = _mm_unpacklo_epi16(r2.val, r3.val);
+    __m128i t3 = _mm_unpackhi_epi16(r2.val, r3.val);
+    __m128i t4 = _mm_unpacklo_epi16(r4.val, r5.val);
+    __m128i t5 = _mm_unpackhi_epi16(r4.val, r5.val);
+    __m128i t6 = _mm_unpacklo_epi16(r6.val, r7.val);
+    __m128i t7 = _mm_unpackhi_epi16(r6.val, r7.val);
+
+    // Step 2: interchange pairs into quads (4×4 blocks)
+    __m128i u0 = _mm_unpacklo_epi16(t0, t2);
+    __m128i u2 = _mm_unpackhi_epi16(t0, t2);
+    __m128i u1 = _mm_unpacklo_epi16(t1, t3);
+    __m128i u3 = _mm_unpackhi_epi16(t1, t3);
+    __m128i u4 = _mm_unpacklo_epi16(t4, t6);
+    __m128i u6 = _mm_unpackhi_epi16(t4, t6);
+    __m128i u5 = _mm_unpacklo_epi16(t5, t7);
+    __m128i u7 = _mm_unpackhi_epi16(t5, t7);
+
+    // Step 3: interchange quads into full 8×8 transpose
+    r0.val = _mm_unpacklo_epi16(u0, u4);  // col 0
+    r1.val = _mm_unpackhi_epi16(u0, u4);  // col 1
+    r2.val = _mm_unpacklo_epi16(u2, u6);  // col 2
+    r3.val = _mm_unpackhi_epi16(u2, u6);  // col 3
+    r4.val = _mm_unpacklo_epi16(u1, u5);  // col 4
+    r5.val = _mm_unpackhi_epi16(u1, u5);  // col 5
+    r6.val = _mm_unpacklo_epi16(u3, u7);  // col 6
+    r7.val = _mm_unpackhi_epi16(u3, u7);  // col 7
+}
+#endif  // defined(__F16C__)
+
 } // namespace sse
 } // namespace arch
 } // namespace simd

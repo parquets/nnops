@@ -80,7 +80,19 @@
       "Bash(cmake --build build --target nnops_test -j 16)",
       "Bash(cmake --build build --config Release --target test_depthwise_conv2d)",
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*dwconv*\")",
-      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*pooling*\")"
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*pooling*\")",
+      "Bash(git status *)",
+      "Bash(git rm *)",
+      "Bash(timeout 10 ./build/tests/Release/nnops_test.exe --gtest_filter=\"*nchwc8*\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(echo '#include \"nnops/detail/simd/cpu_features.hpp\"')",
+      "Bash(echo '#ifndef NNOPS_ARCH_X86_64')",
+      "Bash(echo '#error NOT_DEFINED')",
+      "Bash(echo '#endif')",
+      "Bash(echo 'int main\\(\\) { return 0; }')",
+      "Bash(./build/tests/Release/nnops_test.exe --filter=\"pooling*\")",
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"pooling*\")",
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"pooling_nchwc8_max_stride2:pooling_nchwc8_avg_padding\")"
     ],
     "additionalDirectories": [
       "d:\\vscode\\nnops\\src\\backend\\cpu",

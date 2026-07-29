@@ -103,8 +103,7 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                 result = any ? max_val : 0.0f;
                 break;
             }
-            case PoolingType::Average:
-            case PoolingType::AverageExcludePad: {
+            case PoolingType::Average: {
                 float sum = 0.0f;
                 int64_t pad_count = 0;
                 for (int64_t kd = 0; kd < KD; ++kd) {
@@ -122,32 +121,12 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                         nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                     sum += s_load(&in_ptr[in_idx]);
                 }}}
-                if (attrs.type == PoolingType::AverageExcludePad) {
+                if (attrs.exclude_pad) {
                     const int64_t valid = K_total - pad_count;
                     result = valid > 0 ? sum / static_cast<float>(valid) : 0.0f;
                 } else {
                     result = sum / static_cast<float>(K_total);
                 }
-                break;
-            }
-            case PoolingType::Lp: {
-                float sum = 0.0f;
-                const int64_t p = attrs.p_norm;
-                for (int64_t kd = 0; kd < KD; ++kd) {
-                const int64_t id = od * SD + kd - PD;
-                if (id < 0 || id >= ID) { continue; }
-                for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t ih = oh * SH + kh - PH;
-                if (ih < 0 || ih >= IH) { continue; }
-                for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t iw = ow * SW + kw - PW;
-                    if (iw < 0 || iw >= IW) { continue; }
-                    const int64_t in_idx =
-                        nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
-                    sum += std::pow(std::abs(s_load(&in_ptr[in_idx])),
-                                    static_cast<float>(p));
-                }}}
-                result = std::pow(sum, 1.0f / static_cast<float>(p));
                 break;
             }
             }

@@ -602,6 +602,41 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     r4.hi = t0; r5.hi = t1; r6.hi = t2; r7.hi = t3;
 }
 
+/// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
+/// Uses ZIP1/ZIP2 to interchange in 3 steps (2→4→8).
+inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
+                             v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
+    // Step 1: pairwise interchange (2×2 blocks)
+    float16x8_t t0 = vzip1q_f16(r0.val, r1.val);
+    float16x8_t t1 = vzip2q_f16(r0.val, r1.val);
+    float16x8_t t2 = vzip1q_f16(r2.val, r3.val);
+    float16x8_t t3 = vzip2q_f16(r2.val, r3.val);
+    float16x8_t t4 = vzip1q_f16(r4.val, r5.val);
+    float16x8_t t5 = vzip2q_f16(r4.val, r5.val);
+    float16x8_t t6 = vzip1q_f16(r6.val, r7.val);
+    float16x8_t t7 = vzip2q_f16(r6.val, r7.val);
+
+    // Step 2: interchange pairs into quads (4×4 blocks)
+    float16x8_t u0 = vzip1q_f16(t0, t2);
+    float16x8_t u2 = vzip2q_f16(t0, t2);
+    float16x8_t u1 = vzip1q_f16(t1, t3);
+    float16x8_t u3 = vzip2q_f16(t1, t3);
+    float16x8_t u4 = vzip1q_f16(t4, t6);
+    float16x8_t u6 = vzip2q_f16(t4, t6);
+    float16x8_t u5 = vzip1q_f16(t5, t7);
+    float16x8_t u7 = vzip2q_f16(t5, t7);
+
+    // Step 3: interchange quads into full 8×8 transpose
+    r0.val = vzip1q_f16(u0, u4);  // col 0
+    r1.val = vzip2q_f16(u0, u4);  // col 1
+    r2.val = vzip1q_f16(u2, u6);  // col 2
+    r3.val = vzip2q_f16(u2, u6);  // col 3
+    r4.val = vzip1q_f16(u1, u5);  // col 4
+    r5.val = vzip2q_f16(u1, u5);  // col 5
+    r6.val = vzip1q_f16(u3, u7);  // col 6
+    r7.val = vzip2q_f16(u3, u7);  // col 7
+}
+
 } // namespace neon
 } // namespace arch
 } // namespace simd

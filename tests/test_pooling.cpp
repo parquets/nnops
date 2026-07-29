@@ -1,4 +1,9 @@
-/// Unit tests for Pooling operator (CPU reference) — 2D and 3D.
+/// Unit tests for Pooling operator — NCHWC8 only.
+///
+/// All tests explicitly go through the NCHWC8 path:
+///   NCHW input → pack_nchw_to_nchwc8 → pooling(NCHWC8) → unpack_nchwc8_to_nchw → compare
+///
+/// NCHW inline reference functions are used as the ground truth for comparison.
 
 #include "nnops/ops/pooling.hpp"
 #include "backend/cpu/layout_convert.hpp"
@@ -8,834 +13,112 @@
 
 #include <vector>
 #include <cmath>
+#include <limits>
 
 using namespace nnops;
 
-// ============================================================
-// 2D Pooling tests
-// ============================================================
-
-NNOPS_TEST(pooling_2d_max_basic) {
-    // 1x1x4x4 input, 2x2 kernel, stride=2, pad=0
-    const int64_t ishape[] = {1, 1, 4, 4};
-    const int64_t oshape[] = {1, 1, 2, 2};
-    float in_data[16] = {
-        1, 2, 3, 4,
-        5, 6, 7, 8,
-        9, 10, 11, 12,
-        13, 14, 15, 16,
-    };
-    float out_data[4] = {};
-
-    TensorView input(ishape, DataType::f32, in_data);
-    TensorView output(oshape, DataType::f32, out_data);
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 2, 2};  // KD=1, KH=2, KW=2
-    attrs.stride       = {1, 2, 2};
-    attrs.padding      = {0, 0, 0};
-
-    pooling(input, output, attrs);
-
-    NNOPS_EXPECT_NEAR(out_data[0], 6.0f, 1e-6f);
-    NNOPS_EXPECT_NEAR(out_data[1], 8.0f, 1e-6f);
-    NNOPS_EXPECT_NEAR(out_data[2], 14.0f, 1e-6f);
-    NNOPS_EXPECT_NEAR(out_data[3], 16.0f, 1e-6f);
-}
-
-NNOPS_TEST(pooling_2d_average_basic) {
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t oshape[] = {1, 1, 2, 2};
-    float in_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float out_data[4] = {};
-
-    TensorView input(ishape, DataType::f32, in_data);
-    TensorView output(oshape, DataType::f32, out_data);
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Average;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {0, 1, 1};
-
-    pooling(input, output, attrs);
-
-    NNOPS_EXPECT_NEAR(out_data[0], 10.0f / 9.0f, 1e-4f);
-}
-
-NNOPS_TEST(pooling_2d_average_exclude_pad) {
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t oshape[] = {1, 1, 2, 2};
-    float in_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float out_data[4] = {};
-
-    TensorView input(ishape, DataType::f32, in_data);
-    TensorView output(oshape, DataType::f32, out_data);
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::AverageExcludePad;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {0, 1, 1};
-
-    pooling(input, output, attrs);
-
-    NNOPS_EXPECT_NEAR(out_data[0], 2.5f, 1e-4f);
-}
-
-NNOPS_TEST(pooling_2d_lp) {
-    const int64_t ishape[] = {1, 1, 2, 2};
-    const int64_t oshape[] = {1, 1, 1, 1};
-    float in_data[4] = {3.0f, 4.0f, 0.0f, 0.0f};
-    float out_data[1] = {};
-
-    TensorView input(ishape, DataType::f32, in_data);
-    TensorView output(oshape, DataType::f32, out_data);
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Lp;
-    attrs.kernel_shape = {1, 2, 2};
-    attrs.stride       = {1, 2, 2};
-    attrs.padding      = {0, 0, 0};
-    attrs.p_norm = 2;
-
-    pooling(input, output, attrs);
-
-    NNOPS_EXPECT_NEAR(out_data[0], 5.0f, 1e-4f);
-}
-
-NNOPS_TEST(pooling_2d_random) {
-    auto [in_vec, input] = test::make_random_tensor({1, 3, 16, 16});
-    std::vector<float> out_buf(1 * 3 * 8 * 8);
-    const int64_t oshape[] = {1, 3, 8, 8};
-    TensorView output(oshape, DataType::f32, out_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 2, 2};
-    attrs.stride       = {1, 2, 2};
-
-    pooling(input, output, attrs);
-
-    for (size_t i = 0; i < out_buf.size(); ++i) {
-        NNOPS_EXPECT_TRUE(!std::isnan(out_buf[i]));
-        NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
-    }
-}
-
-NNOPS_TEST(pooling_2d_class_api) {
-    const int64_t ishape[] = {1, 1, 4, 4};
-    const int64_t oshape[] = {1, 1, 2, 2};
-    float in_data[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
-    float out1_data[4] = {};
-    float out2_data[4] = {};
-
-    TensorView input(ishape, DataType::f32, in_data);
-    TensorView out1(oshape, DataType::f32, out1_data);
-    TensorView out2(oshape, DataType::f32, out2_data);
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 2, 2};
-    attrs.stride       = {1, 2, 2};
-
-    // Functional
-    pooling(input, out1, attrs);
-    // Class
-    auto op = Pooling::create(attrs, Backend::CPU);
-    const TensorView ins[] = {input};
-    op->compute(out2, ins);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out1, out2));
+// Forward declare the reference pooling kernel (NCHW scalar, ground truth).
+namespace nnops::backend::cpu::reference {
+    void pooling_ref(const PoolingAttributes& attrs,
+                     TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* workspace);
 }
 
 // ============================================================
-// 3D Pooling tests
+// Helpers
 // ============================================================
 
-NNOPS_TEST(pooling_3d_max_basic) {
-    // 1x1x2x4x4 input, 2x2x2 kernel, stride=2, pad=0
-    // Output: 1x1x1x2x2
-    const int64_t ishape[] = {1, 1, 2, 4, 4};
-    const int64_t oshape[] = {1, 1, 1, 2, 2};
-
-    // Two depth slices, each 4x4
-    std::vector<float> in_buf(2 * 4 * 4);
-    for (int i = 0; i < 32; ++i) { in_buf[i] = static_cast<float>(i + 1); }
-    std::vector<float> out_buf(4, 0.0f);
-
-    TensorView input(ishape, DataType::f32, in_buf.data());
-    TensorView output(oshape, DataType::f32, out_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {2, 2, 2};   // KD=2, KH=2, KW=2
-    attrs.stride       = {2, 2, 2};
-    attrs.padding      = {0, 0, 0};
-
-    pooling(input, output, attrs);
-
-    // Output[0,0]: max of depth[0,0:2,0:2] + depth[1,0:2,0:2]
-    // depth0[0:2,0:2] = {1,2,5,6}, depth1[0:2,0:2] = {17,18,21,22}, max = 22
-    NNOPS_EXPECT_NEAR(out_buf[0], 22.0f, 1e-6f);
-    // Output[0,1]: max of depth0[0:2,2:4] + depth1[0:2,2:4]
-    // depth0 = {3,4,7,8}, depth1 = {19,20,23,24}, max = 24
-    NNOPS_EXPECT_NEAR(out_buf[1], 24.0f, 1e-6f);
-    // Output[1,0]: max from rows 2:4 of both depths
-    // depth0 rows 2:4 cols 0:2 = {9,10,13,14}, depth1 = {25,26,29,30}, max = 30
-    NNOPS_EXPECT_NEAR(out_buf[2], 30.0f, 1e-6f);
-    // Output[1,1]: max from rows 2:4 cols 2:4 of both depths
-    NNOPS_EXPECT_NEAR(out_buf[3], 32.0f, 1e-6f);
+/// Compute 32-byte-aligned pitch in bytes for NCHWC8 row stride.
+inline int64_t nchwc8_pitch(int64_t W, int64_t elem_size = 4) {
+    return ((W * 8 * elem_size + 31) / 32) * 32;
 }
 
-NNOPS_TEST(pooling_3d_average) {
-    // 1x1x2x2x2 input, 2x2x2 kernel, stride=1, pad=0 -> output 1x1x1x1x1
-    const int64_t ishape[] = {1, 1, 2, 2, 2};
-    const int64_t oshape[] = {1, 1, 1, 1, 1};
-    float in_data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    float out_data[1] = {};
-
-    TensorView input(ishape, DataType::f32, in_data);
-    TensorView output(oshape, DataType::f32, out_data);
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Average;
-    attrs.kernel_shape = {2, 2, 2};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {0, 0, 0};
-
-    pooling(input, output, attrs);
-
-    // Average of all 8 elements = (1+2+3+4+5+6+7+8)/8 = 4.5
-    NNOPS_EXPECT_NEAR(out_data[0], 4.5f, 1e-4f);
+/// Compute output spatial dims for 2D pooling.
+inline std::pair<int64_t, int64_t> pool_out_2d(int64_t H, int64_t W,
+                                                 int64_t KH, int64_t KW,
+                                                 int64_t SH, int64_t SW,
+                                                 int64_t PH, int64_t PW,
+                                                 int64_t DH = 1, int64_t DW = 1) {
+    int64_t OH = (H + 2*PH - DH*(KH-1) - 1) / SH + 1;
+    int64_t OW = (W + 2*PW - DW*(KW-1) - 1) / SW + 1;
+    return {OH, OW};
 }
 
-NNOPS_TEST(pooling_3d_random) {
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 8, 8, 8});
-    std::vector<float> out_buf(1 * 2 * 4 * 4 * 4);
-    const int64_t oshape[] = {1, 2, 4, 4, 4};
-    TensorView output(oshape, DataType::f32, out_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {2, 2, 2};
-    attrs.stride       = {2, 2, 2};
-
-    pooling(input, output, attrs);
-
-    for (size_t i = 0; i < out_buf.size(); ++i) {
-        NNOPS_EXPECT_TRUE(!std::isnan(out_buf[i]));
-        NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
-    }
+/// Compute output spatial dims for 3D pooling.
+inline std::tuple<int64_t, int64_t, int64_t> pool_out_3d(
+    int64_t D, int64_t H, int64_t W,
+    int64_t KD, int64_t KH, int64_t KW,
+    int64_t SD, int64_t SH, int64_t SW,
+    int64_t PD, int64_t PH, int64_t PW) {
+    int64_t OD = (D + 2*PD - (KD-1) - 1) / SD + 1;
+    int64_t OH = (H + 2*PH - (KH-1) - 1) / SH + 1;
+    int64_t OW = (W + 2*PW - (KW-1) - 1) / SW + 1;
+    return {OD, OH, OW};
 }
 
 // ============================================================
-// SIMD vs Reference correctness tests (stride=1, Max/Avg)
+// Generic NCHWC8 roundtrip test helpers
 // ============================================================
 
-/// Inline reference for max pooling (NCHW, 2D).
-/// Used to validate the SIMD-optimized kernel against a known-correct scalar path.
-static void ref_pooling_2d_max(
-    const float* input, float* output,
-    int64_t N, int64_t C, int64_t IH, int64_t IW,
-    int64_t OH, int64_t OW,
-    int64_t KH, int64_t KW,
-    int64_t SH, int64_t SW,
-    int64_t PH, int64_t PW)
-{
-    const int64_t in_ch_stride = IH * IW;
-    const int64_t out_ch_stride = OH * OW;
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = input + n * C * in_ch_stride + c * in_ch_stride;
-        float* out_ch = output + n * C * out_ch_stride + c * out_ch_stride;
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float max_val = -std::numeric_limits<float>::infinity();
-            bool any = false;
-            for (int64_t kh = 0; kh < KH; ++kh) {
-                int64_t ih = oh * SH + kh - PH;
-                if (ih < 0 || ih >= IH) { continue; }
-                for (int64_t kw = 0; kw < KW; ++kw) {
-                    int64_t iw = ow * SW + kw - PW;
-                    if (iw < 0 || iw >= IW) { continue; }
-                    float val = in_ch[ih * IW + iw];
-                    if (val > max_val) { max_val = val; }
-                    any = true;
-                }
-            }
-            out_ch[oh * OW + ow] = any ? max_val : 0.0f;
-        }}
-    }}
-}
-
-/// Inline reference for average pooling (includes pad) (NCHW, 2D).
-static void ref_pooling_2d_avg(
-    const float* input, float* output,
-    int64_t N, int64_t C, int64_t IH, int64_t IW,
-    int64_t OH, int64_t OW,
-    int64_t KH, int64_t KW,
-    int64_t SH, int64_t SW,
-    int64_t PH, int64_t PW)
-{
-    const float scale = 1.0f / static_cast<float>(KH * KW);
-    const int64_t in_ch_stride = IH * IW;
-    const int64_t out_ch_stride = OH * OW;
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = input + n * C * in_ch_stride + c * in_ch_stride;
-        float* out_ch = output + n * C * out_ch_stride + c * out_ch_stride;
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float sum = 0.0f;
-            for (int64_t kh = 0; kh < KH; ++kh) {
-                int64_t ih = oh * SH + kh - PH;
-                if (ih < 0 || ih >= IH) { continue; }
-                for (int64_t kw = 0; kw < KW; ++kw) {
-                    int64_t iw = ow * SW + kw - PW;
-                    if (iw < 0 || iw >= IW) { continue; }
-                    sum += in_ch[ih * IW + iw];
-                }
-            }
-            out_ch[oh * OW + ow] = sum * scale;
-        }}
-    }}
-}
-
-NNOPS_TEST(pooling_simd_max_vs_ref_small) {
-    // Small tensor with no padding — exercises h4/h1 SIMD interior
-    auto [in_vec, input] = test::make_random_tensor({1, 3, 16, 16});
-    const int64_t oshape[] = {1, 3, 14, 14};
-    std::vector<float> out_simd(1 * 3 * 14 * 14);
-    std::vector<float> out_ref(1 * 3 * 14 * 14);
-
-    TensorView out_s(oshape, DataType::f32, out_simd.data());
-    TensorView out_r(oshape, DataType::f32, out_ref.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-
-    // SIMD path
-    pooling(input, out_s, attrs);
-
-    // Reference
-    const int64_t N = 1, C = 3, IH = 16, IW = 16, OH = 14, OW = 14;
-    ref_pooling_2d_max(input.ptr<float>(), out_ref.data(),
-                       N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_max_vs_ref_with_pad) {
-    // Padding exercises left/right/top/bottom scalar regions + SIMD interior
-    auto [in_vec, input] = test::make_random_tensor({1, 4, 15, 15});
-    const int64_t oshape[] = {1, 4, 15, 15};
-    std::vector<float> out_simd(1 * 4 * 15 * 15);
-    std::vector<float> out_ref(1 * 4 * 15 * 15);
-
-    TensorView out_s(oshape, DataType::f32, out_simd.data());
-    TensorView out_r(oshape, DataType::f32, out_ref.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {0, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    const int64_t N = 1, C = 4, IH = 15, IW = 15, OH = 15, OW = 15;
-    ref_pooling_2d_max(input.ptr<float>(), out_ref.data(),
-                       N, C, IH, IW, OH, OW, 3, 3, 1, 1, 1, 1);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_max_stride_2) {
-    // stride=2 → v_load_even SIMD (stride-2 gather via LD2/UNPCK)
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 16, 16});
-    const int64_t oshape[] = {1, 2, 8, 8};
-    std::vector<float> out_buf(1 * 2 * 8 * 8);
-    std::vector<float> ref_buf(1 * 2 * 8 * 8);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 2, 2};
-    attrs.stride       = {1, 2, 2};
-
-    pooling(input, out_s, attrs);
-
-    const int64_t N = 1, C = 2, IH = 16, IW = 16, OH = 8, OW = 8;
-    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
-                       N, C, IH, IW, OH, OW, 2, 2, 2, 2, 0, 0);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_avg_vs_ref) {
-    // Average pooling with padding — SIMD h4/h1 interior, scalar pad regions
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 16, 16});
-    const int64_t oshape[] = {1, 2, 14, 14};
-    std::vector<float> out_simd(1 * 2 * 14 * 14);
-    std::vector<float> out_ref(1 * 2 * 14 * 14);
-
-    TensorView out_s(oshape, DataType::f32, out_simd.data());
-    TensorView out_r(oshape, DataType::f32, out_ref.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Average;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {0, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    const int64_t N = 1, C = 2, IH = 16, IW = 16, OH = 14, OW = 14;
-    ref_pooling_2d_avg(input.ptr<float>(), out_ref.data(),
-                       N, C, IH, IW, OH, OW, 3, 3, 1, 1, 1, 1);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_max_add_to) {
-    // add_to: output += pooling(input)
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 8, 8});
-    const int64_t oshape[] = {1, 2, 6, 6};
-    std::vector<float> initial_buf(1 * 2 * 6 * 6);
-    std::vector<float> out_buf(1 * 2 * 6 * 6);
-    std::vector<float> ref_buf(1 * 2 * 6 * 6);
-
-    // Fill initial output with known values
-    for (auto& v : initial_buf) { v = 0.5f; }
-    out_buf = initial_buf;
-    ref_buf = initial_buf;
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.add_to = true;
-
-    pooling(input, out_s, attrs);
-
-    // Reference: compute maxpool without add_to, then add initial values
-    PoolingAttributes attrs_no_add = attrs;
-    attrs_no_add.add_to = false;
-
-    const int64_t N = 1, C = 2, IH = 8, IW = 8, OH = 6, OW = 6;
-    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
-                       N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
-    for (int64_t i = 0; i < N * C * OH * OW; ++i) {
-        ref_buf[i] = initial_buf[i] + ref_buf[i];
-    }
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_large_input) {
-    // Large input to thoroughly exercise SIMD h4/h1 and block processing
-    auto [in_vec, input] = test::make_random_tensor({2, 3, 64, 64});
-    const int64_t oshape[] = {2, 3, 62, 62};
-    std::vector<float> out_buf(2 * 3 * 62 * 62);
-    std::vector<float> ref_buf(2 * 3 * 62 * 62);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    const int64_t N = 2, C = 3, IH = 64, IW = 64, OH = 62, OW = 62;
-    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
-                       N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_odd_width) {
-    // Odd output width tests SIMD tail (ow_simd_end < ow_end) scalar path
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 10, 10});
-    const int64_t oshape[] = {1, 2, 8, 7};  // 7 = odd width
-    std::vector<float> out_buf(1 * 2 * 8 * 7);
-    std::vector<float> ref_buf(1 * 2 * 8 * 7);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    const int64_t N = 1, C = 2, IH = 10, IW = 10, OH = 8, OW = 7;
-    ref_pooling_2d_max(input.ptr<float>(), ref_buf.data(),
-                       N, C, IH, IW, OH, OW, 3, 3, 1, 1, 0, 0);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_avg_stride_2_no_simd) {
-    // AvgPool with stride=2 — v_load_even SIMD (stride-2 gather)
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 16, 16});
-    const int64_t oshape[] = {1, 2, 8, 8};
-    std::vector<float> out_buf(1 * 2 * 8 * 8);
-    std::vector<float> ref_buf(1 * 2 * 8 * 8);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Average;
-    attrs.kernel_shape = {1, 2, 2};
-    attrs.stride       = {1, 2, 2};
-
-    pooling(input, out_s, attrs);
-
-    const int64_t N = 1, C = 2, IH = 16, IW = 16, OH = 8, OW = 8;
-    ref_pooling_2d_avg(input.ptr<float>(), ref_buf.data(),
-                       N, C, IH, IW, OH, OW, 2, 2, 2, 2, 0, 0);
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_3d_max_vs_ref) {
-    // 3D MaxPool with stride=1 — SIMD h4/h1 for interior depth
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 8, 12, 12});
-    const int64_t oshape[] = {1, 2, 6, 10, 10};
-    std::vector<float> out_buf(1 * 2 * 6 * 10 * 10);
-    std::vector<float> ref_buf(1 * 2 * 6 * 10 * 10);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {3, 3, 3};
-    attrs.stride       = {1, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    // Inline 3D reference
-    const int64_t N = 1, C = 2, ID = 8, IH = 12, IW = 12;
-    const int64_t OD = 6, OH = 10, OW = 10;
-    const int64_t KD = 3, KH = 3, KW = 3;
-    const auto* in_ptr = input.ptr<float>();
-    auto* ref_ptr = ref_buf.data();
-    const int64_t in_ch_s = ID * IH * IW;
-    const int64_t out_ch_s = OD * OH * OW;
-
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = in_ptr + n * C * in_ch_s + c * in_ch_s;
-        float* out_ch = ref_ptr + n * C * out_ch_s + c * out_ch_s;
-        for (int64_t od = 0; od < OD; ++od) {
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float max_val = -std::numeric_limits<float>::infinity();
-            bool any = false;
-            for (int64_t kd = 0; kd < KD; ++kd) {
-                int64_t id = od + kd;
-                if (id < 0 || id >= ID) { continue; }
-                for (int64_t kh = 0; kh < KH; ++kh) {
-                    int64_t ih = oh + kh;
-                    if (ih < 0 || ih >= IH) { continue; }
-                    for (int64_t kw = 0; kw < KW; ++kw) {
-                        int64_t iw = ow + kw;
-                        if (iw < 0 || iw >= IW) { continue; }
-                        float val = in_ch[id * IH * IW + ih * IW + iw];
-                        if (val > max_val) { max_val = val; }
-                        any = true;
-                    }
-                }
-            }
-            out_ch[od * OH * OW + oh * OW + ow] = any ? max_val : 0.0f;
-        }}}
-    }}
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_3d_avg_vs_ref) {
-    // 3D AvgPool including pad — SIMD path
-    auto [in_vec, input] = test::make_random_tensor({1, 1, 8, 12, 12});
-    const int64_t oshape[] = {1, 1, 6, 10, 10};
-    std::vector<float> out_buf(1 * 1 * 6 * 10 * 10);
-    std::vector<float> ref_buf(1 * 1 * 6 * 10 * 10);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Average;
-    attrs.kernel_shape = {3, 3, 3};
-    attrs.stride       = {1, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    // Inline 3D reference
-    const int64_t N = 1, C = 1, ID = 8, IH = 12, IW = 12;
-    const int64_t OD = 6, OH = 10, OW = 10;
-    const int64_t KD = 3, KH = 3, KW = 3;
-    const float scale = 1.0f / static_cast<float>(KD * KH * KW);
-    const auto* in_ptr = input.ptr<float>();
-    auto* ref_ptr = ref_buf.data();
-    const int64_t in_ch_s = ID * IH * IW;
-    const int64_t out_ch_s = OD * OH * OW;
-
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = in_ptr + n * C * in_ch_s + c * in_ch_s;
-        float* out_ch = ref_ptr + n * C * out_ch_s + c * out_ch_s;
-        for (int64_t od = 0; od < OD; ++od) {
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float sum = 0.0f;
-            for (int64_t kd = 0; kd < KD; ++kd) {
-                int64_t id = od + kd;
-                if (id < 0 || id >= ID) { continue; }
-                for (int64_t kh = 0; kh < KH; ++kh) {
-                    int64_t ih = oh + kh;
-                    if (ih < 0 || ih >= IH) { continue; }
-                    for (int64_t kw = 0; kw < KW; ++kw) {
-                        int64_t iw = ow + kw;
-                        if (iw < 0 || iw >= IW) { continue; }
-                        sum += in_ch[id * IH * IW + ih * IW + iw];
-                    }
-                }
-            }
-            out_ch[od * OH * OW + oh * OW + ow] = sum * scale;
-        }}}
-    }}
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_avg_exclude_pad_vs_ref) {
-    // AverageExcludePad — scalar-only path
-    auto [in_vec, input] = test::make_random_tensor({1, 2, 4, 4});
-    const int64_t oshape[] = {1, 2, 4, 4};
-    std::vector<float> out_buf(1 * 2 * 4 * 4);
-    std::vector<float> ref_buf(1 * 2 * 4 * 4);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::AverageExcludePad;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {0, 1, 1};
-
-    pooling(input, out_s, attrs);
-
-    // Inline reference
-    const int64_t N = 1, C = 2, IH = 4, IW = 4, OH = 4, OW = 4;
-    const int64_t KH = 3, KW = 3, K_TOTAL = 9;
-    const auto* in_ptr = input.ptr<float>();
-    auto* ref_ptr = ref_buf.data();
-
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = in_ptr + n * C * IH * IW + c * IH * IW;
-        float* out_ch = ref_ptr + n * C * OH * OW + c * OH * OW;
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float sum = 0.0f;
-            int valid = 0;
-            for (int64_t kh = 0; kh < KH; ++kh) {
-                int64_t ih = oh + kh - 1;
-                for (int64_t kw = 0; kw < KW; ++kw) {
-                    int64_t iw = ow + kw - 1;
-                    if (ih >= 0 && ih < IH && iw >= 0 && iw < IW) {
-                        sum += in_ch[ih * IW + iw];
-                        ++valid;
-                    }
-                }
-            }
-            out_ch[oh * OW + ow] = valid > 0 ? sum / static_cast<float>(valid) : 0.0f;
-        }}
-    }}
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_lp_vs_ref) {
-    // Lp pooling — scalar-only path
-    auto [in_vec, input] = test::make_random_tensor({1, 1, 4, 4}, 0.0f, 2.0f);
-    const int64_t oshape[] = {1, 1, 2, 2};
-    std::vector<float> out_buf(1 * 1 * 2 * 2);
-    std::vector<float> ref_buf(1 * 1 * 2 * 2);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Lp;
-    attrs.kernel_shape = {1, 3, 3};
-    attrs.stride       = {1, 2, 2};
-    attrs.p_norm = 2;
-
-    pooling(input, out_s, attrs);
-
-    // Inline reference
-    const int64_t N = 1, C = 1, IH = 4, IW = 4, OH = 2, OW = 2;
-    const int64_t KH = 3, KW = 3, P = 2;
-    const auto* in_ptr = input.ptr<float>();
-    auto* ref_ptr = ref_buf.data();
-
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = in_ptr + n * C * IH * IW + c * IH * IW;
-        float* out_ch = ref_ptr + n * C * OH * OW + c * OH * OW;
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float sum = 0.0f;
-            for (int64_t kh = 0; kh < KH; ++kh) {
-                int64_t ih = oh * 2 + kh;
-                if (ih < 0 || ih >= IH) { continue; }
-                for (int64_t kw = 0; kw < KW; ++kw) {
-                    int64_t iw = ow * 2 + kw;
-                    if (iw < 0 || iw >= IW) { continue; }
-                    sum += std::pow(std::abs(in_ch[ih * IW + iw]), static_cast<float>(P));
-                }
-            }
-            out_ch[oh * OW + ow] = std::pow(sum, 1.0f / static_cast<float>(P));
-        }}
-    }}
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-NNOPS_TEST(pooling_simd_3d_padding) {
-    // 3D pooling with depth padding — exercises pad-depth front/back scalar regions
-    auto [in_vec, input] = test::make_random_tensor({1, 1, 4, 8, 8});
-    const int64_t oshape[] = {1, 1, 4, 6, 6};
-    std::vector<float> out_buf(1 * 1 * 4 * 6 * 6);
-    std::vector<float> ref_buf(1 * 1 * 4 * 6 * 6);
-
-    TensorView out_s(oshape, DataType::f32, out_buf.data());
-    TensorView out_r(oshape, DataType::f32, ref_buf.data());
-
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {3, 3, 3};
-    attrs.stride       = {1, 1, 1};
-    attrs.padding      = {1, 0, 0};
-
-    pooling(input, out_s, attrs);
-
-    // Inline 3D reference with padding
-    const int64_t N = 1, C = 1, ID = 4, IH = 8, IW = 8;
-    const int64_t OD = 4, OH = 6, OW = 6;
-    const int64_t KD = 3, KH = 3, KW = 3;
-    const auto* in_ptr = input.ptr<float>();
-    auto* ref_ptr = ref_buf.data();
-
-    for (int64_t n = 0; n < N; ++n) {
-    for (int64_t c = 0; c < C; ++c) {
-        const float* in_ch = in_ptr + n * C * ID * IH * IW + c * ID * IH * IW;
-        float* out_ch = ref_ptr + n * C * OD * OH * OW + c * OD * OH * OW;
-        for (int64_t od = 0; od < OD; ++od) {
-        for (int64_t oh = 0; oh < OH; ++oh) {
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float max_val = -std::numeric_limits<float>::infinity();
-            bool any = false;
-            for (int64_t kd = 0; kd < KD; ++kd) {
-                int64_t id = od + kd - 1;  // PD=1
-                if (id < 0 || id >= ID) { continue; }
-                for (int64_t kh = 0; kh < KH; ++kh) {
-                    int64_t ih = oh + kh;
-                    if (ih < 0 || ih >= IH) { continue; }
-                    for (int64_t kw = 0; kw < KW; ++kw) {
-                        int64_t iw = ow + kw;
-                        if (iw < 0 || iw >= IW) { continue; }
-                        float val = in_ch[id * IH * IW + ih * IW + iw];
-                        if (val > max_val) { max_val = val; }
-                        any = true;
-                    }
-                }
-            }
-            out_ch[od * OH * OW + oh * OW + ow] = any ? max_val : 0.0f;
-        }}}
-    }}
-
-    NNOPS_EXPECT_TRUE(test::allclose(out_s, out_r, 1e-4f, 1e-4f));
-}
-
-// ============================================================
-// NCHWC8 Pooling tests — pack→pool→unpack vs NCHW reference
-// ============================================================
-
-/// Helper: run NCHW pooling as reference and compare against NCHWC8 path.
-static void test_pooling_nchwc8_vs_nchw(
+/// 2D: pack NCHW → pool on NCHWC8 → unpack → compare with NCHW reference.
+static void test_nchwc8_vs_nchw(
     const std::vector<int64_t>& shape,
-    PoolingType type,
-    int64_t KH, int64_t KW,
-    int64_t SH = 1, int64_t SW = 1,
-    int64_t PH = 0, int64_t PW = 0,
-    int64_t DH = 1, int64_t DW = 1)
+    PoolingAttributes attrs)
 {
-    const int64_t N = shape[0], C = shape[1], IH = shape[2], IW = shape[3];
+    const int64_t N = shape[0], C = shape[1], H = shape[2], W = shape[3];
     const int64_t C8 = (C + 7) / 8;
-    const int64_t OH = (IH + 2*PH - DH*(KH-1) - 1) / SH + 1;
-    const int64_t OW = (IW + 2*PW - DW*(KW-1) - 1) / SW + 1;
 
-    std::vector<float> nchw_in(N * C * IH * IW);
-    for (size_t i = 0; i < nchw_in.size(); ++i) {
-        nchw_in[i] = static_cast<float>((i * 1103515245u + 12345u) & 0x7FFFFFFFu) / 1e9f;
-    }
-    TensorView in_nchw(shape, DataType::f32, nchw_in.data(), TensorLayout::NCHW);
+    const int64_t KH = attrs.kernel_shape[1], KW = attrs.kernel_shape[2];
+    const int64_t SH = attrs.stride[1], SW = attrs.stride[2];
+    const int64_t PH = attrs.padding[1], PW = attrs.padding[2];
+    const int64_t DH = attrs.dilation[1], DW = attrs.dilation[2];
+    auto [OH, OW] = pool_out_2d(H, W, KH, KW, SH, SW, PH, PW, DH, DW);
 
-    // NCHW reference
+    // Random NCHW input
+    auto [in_vec, in_nchw] = test::make_random_tensor(shape);
+
+    // NCHW scalar reference (ground truth)
     std::vector<float> ref_out(N * C * OH * OW);
     const std::vector<int64_t> oshape_ref = {N, C, OH, OW};
     TensorView out_nchw(oshape_ref, DataType::f32, ref_out.data(), TensorLayout::NCHW);
+    if (attrs.add_to) {
+        for (auto& v : ref_out) v = 1.0f;
+    }
     {
-        PoolingAttributes attrs;
-        attrs.type = type;
-        attrs.kernel_shape = {1, KH, KW};
-        attrs.stride       = {1, SH, SW};
-        attrs.padding      = {0, PH, PW};
-        attrs.dilation     = {1, DH, DW};
-        pooling(in_nchw, out_nchw, attrs);
+        ComputeContext ctx;
+        backend::cpu::reference::pooling_ref(attrs, out_nchw, {&in_nchw, 1}, ctx, nullptr);
     }
 
-    // Pack input to NCHWC8 (pitch in bytes, aligned to 32)
-    const int64_t in_pitch_bytes = ((IW * 8 * 4 + 31) / 32) * 32;
-    const int64_t in_pitch_elems = in_pitch_bytes / static_cast<int64_t>(sizeof(float));
-    std::vector<float> packed_in(N * C8 * IH * in_pitch_elems);
-    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch_bytes, TensorLayout::NCHWC8);
+    // Pack input to NCHWC8
+    int64_t in_pitch = nchwc8_pitch(W);
+    int64_t in_pitch_elems = in_pitch / 4;
+    std::vector<float> packed_in(N * C8 * H * in_pitch_elems);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
-    // NCHWC8 pooling (use correct output shape)
-    const int64_t out_pitch_bytes = ((OW * 8 * 4 + 31) / 32) * 32;
-    const int64_t out_pitch_elems = out_pitch_bytes / static_cast<int64_t>(sizeof(float));
+    // Pool on NCHWC8
+    int64_t out_pitch = nchwc8_pitch(OW);
+    int64_t out_pitch_elems = out_pitch / 4;
     std::vector<float> packed_out(N * C8 * OH * out_pitch_elems);
-    TensorView out_c8(oshape_ref, DataType::f32, packed_out.data(), out_pitch_bytes, TensorLayout::NCHWC8);
-    {
-        PoolingAttributes attrs;
-        attrs.type = type;
-        attrs.kernel_shape = {1, KH, KW};
-        attrs.stride       = {1, SH, SW};
-        attrs.padding      = {0, PH, PW};
-        attrs.dilation     = {1, DH, DW};
-        pooling(in_c8, out_c8, attrs);
+    TensorView out_c8(oshape_ref, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+
+    // For add_to: pre-fill output with 1.0
+    if (attrs.add_to) {
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t c8 = 0; c8 < C8; ++c8) {
+                for (int64_t oh = 0; oh < OH; ++oh) {
+                    float* row = packed_out.data() + ((n * C8 + c8) * OH + oh) * out_pitch_elems;
+                    for (int64_t ow = 0; ow < OW; ++ow)
+                        for (int64_t l = 0; l < 8; ++l)
+                            row[ow * 8 + l] = 1.0f;
+                }
+            }
+        }
     }
+
+    pooling(in_c8, out_c8, attrs);
 
     // Unpack and compare
     std::vector<float> result(N * C * OH * OW);
@@ -844,88 +127,454 @@ static void test_pooling_nchwc8_vs_nchw(
     NNOPS_EXPECT_TRUE(test::allclose(res_nchw, out_nchw, 1e-4f, 1e-4f));
 }
 
-NNOPS_TEST(pooling_nchwc8_max_basic) {
-    test_pooling_nchwc8_vs_nchw({1, 16, 16, 16}, PoolingType::Max, 3, 3);
+/// 3D: pack NCDHW → pool on NCDHWC8 → unpack → compare with NCDHW reference.
+static void test_nchwc8_3d_vs_nchw(
+    const std::vector<int64_t>& shape,
+    PoolingAttributes attrs)
+{
+    const int64_t N = shape[0], C = shape[1], D = shape[2], H = shape[3], W = shape[4];
+    const int64_t C8 = (C + 7) / 8;
+
+    const int64_t KD = attrs.kernel_shape[0], KH = attrs.kernel_shape[1], KW = attrs.kernel_shape[2];
+    const int64_t SD = attrs.stride[0], SH = attrs.stride[1], SW = attrs.stride[2];
+    const int64_t PD = attrs.padding[0], PH = attrs.padding[1], PW = attrs.padding[2];
+    auto [OD, OH, OW] = pool_out_3d(D, H, W, KD, KH, KW, SD, SH, SW, PD, PH, PW);
+
+    // Random NCDHW input
+    auto [in_vec, in_ncdhw] = test::make_random_tensor(shape);
+
+    // NCDHW scalar reference (ground truth)
+    std::vector<float> ref_out(N * C * OD * OH * OW);
+    const std::vector<int64_t> oshape = {N, C, OD, OH, OW};
+    TensorView out_ncdhw(oshape, DataType::f32, ref_out.data(), TensorLayout::NCDHW);
+    {
+        ComputeContext ctx;
+        backend::cpu::reference::pooling_ref(attrs, out_ncdhw, {&in_ncdhw, 1}, ctx, nullptr);
+    }
+
+    // Pack input to NCDHWC8
+    int64_t in_pitch = nchwc8_pitch(W);
+    int64_t in_pitch_elems = in_pitch / 4;
+    std::vector<float> packed_in(N * C8 * D * H * in_pitch_elems);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCDHWC8);
+    pack_ncdhw_to_ncdhwc8(in_ncdhw, in_c8);
+
+    // Pool on NCDHWC8
+    int64_t out_pitch = nchwc8_pitch(OW);
+    int64_t out_pitch_elems = out_pitch / 4;
+    std::vector<float> packed_out(N * C8 * OD * OH * out_pitch_elems);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCDHWC8);
+    pooling(in_c8, out_c8, attrs);
+
+    // Unpack and compare
+    std::vector<float> result(N * C * OD * OH * OW);
+    TensorView res_ncdhw(oshape, DataType::f32, result.data(), TensorLayout::NCDHW);
+    unpack_ncdhwc8_to_ncdhw(out_c8, res_ncdhw);
+    NNOPS_EXPECT_TRUE(test::allclose(res_ncdhw, out_ncdhw, 1e-4f, 1e-4f));
 }
 
-NNOPS_TEST(pooling_nchwc8_avg_basic) {
-    test_pooling_nchwc8_vs_nchw({1, 8, 8, 8}, PoolingType::Average, 2, 2, 2, 2);
+// ============================================================
+// 2D Basic deterministic tests (hardcoded values)
+// ============================================================
+
+NNOPS_TEST(pooling_2d_max_basic) {
+    // 1x1x4x4 input, 2x2 kernel, stride=2, pad=0 → 1x1x2x2
+    const int64_t shape[] = {1, 1, 4, 4};
+    float in_data[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    TensorView in_nchw(shape, DataType::f32, in_data, TensorLayout::NCHW);
+
+    // Pack to NCHWC8
+    int64_t in_pitch = nchwc8_pitch(4);
+    std::vector<float> packed_in(1 * 1 * 4 * (in_pitch / 4), 0.0f);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    pack_nchw_to_nchwc8(in_nchw, in_c8);
+
+    // Pool
+    int64_t out_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_out(1 * 1 * 2 * (out_pitch / 4), 0.0f);
+    const int64_t oshape[] = {1, 1, 2, 2};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    attrs.padding      = {0, 0, 0};
+
+    pooling(in_c8, out_c8, attrs);
+
+    // Unpack and check
+    float result[4] = {};
+    TensorView res_nchw(oshape, DataType::f32, result, TensorLayout::NCHW);
+    unpack_nchwc8_to_nchw(out_c8, res_nchw);
+
+    NNOPS_EXPECT_NEAR(result[0], 6.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(result[1], 8.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(result[2], 14.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(result[3], 16.0f, 1e-6f);
 }
 
-NNOPS_TEST(pooling_nchwc8_max_stride2) {
-    test_pooling_nchwc8_vs_nchw({2, 16, 32, 32}, PoolingType::Max, 3, 3, 1, 2);
+NNOPS_TEST(pooling_2d_average_basic) {
+    // 1x1x2x2 input, 3x3 kernel, stride=1, pad=1 → 1x1x2x2
+    const int64_t shape[] = {1, 1, 2, 2};
+    float in_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    TensorView in_nchw(shape, DataType::f32, in_data, TensorLayout::NCHW);
+
+    int64_t in_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_in(1 * 1 * 2 * (in_pitch / 4), 0.0f);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    pack_nchw_to_nchwc8(in_nchw, in_c8);
+
+    int64_t out_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_out(1 * 1 * 2 * (out_pitch / 4), 0.0f);
+    const int64_t oshape[] = {1, 1, 2, 2};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+
+    pooling(in_c8, out_c8, attrs);
+
+    float result[4] = {};
+    TensorView res_nchw(oshape, DataType::f32, result, TensorLayout::NCHW);
+    unpack_nchwc8_to_nchw(out_c8, res_nchw);
+
+    // sum=1+2+3+4=10, K_total=9, avg=10/9
+    NNOPS_EXPECT_NEAR(result[0], 10.0f / 9.0f, 1e-4f);
+}
+
+NNOPS_TEST(pooling_2d_average_exclude_pad) {
+    const int64_t shape[] = {1, 1, 2, 2};
+    float in_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    TensorView in_nchw(shape, DataType::f32, in_data, TensorLayout::NCHW);
+
+    int64_t in_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_in(1 * 1 * 2 * (in_pitch / 4), 0.0f);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    pack_nchw_to_nchwc8(in_nchw, in_c8);
+
+    int64_t out_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_out(1 * 1 * 2 * (out_pitch / 4), 0.0f);
+    const int64_t oshape[] = {1, 1, 2, 2};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.exclude_pad = true;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+
+    pooling(in_c8, out_c8, attrs);
+
+    float result[4] = {};
+    TensorView res_nchw(oshape, DataType::f32, result, TensorLayout::NCHW);
+    unpack_nchwc8_to_nchw(out_c8, res_nchw);
+
+    // 2x2 input, 3x3 kernel, pad=1, exclude_pad:
+    // At every output position, the kernel covers all 4 input elements.
+    // sum=1+2+3+4=10, valid=4, avg=2.5
+    NNOPS_EXPECT_NEAR(result[0], 2.5f, 1e-4f);
+    NNOPS_EXPECT_NEAR(result[1], 2.5f, 1e-4f);
+    NNOPS_EXPECT_NEAR(result[2], 2.5f, 1e-4f);
+    NNOPS_EXPECT_NEAR(result[3], 2.5f, 1e-4f);
+}
+
+NNOPS_TEST(pooling_2d_class_api) {
+    const int64_t shape[] = {1, 1, 4, 4};
+    const int64_t oshape[] = {1, 1, 2, 2};
+    float in_data[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    TensorView in_nchw(shape, DataType::f32, in_data, TensorLayout::NCHW);
+
+    // Functional API (auto-converts)
+    float out1_data[4] = {};
+    TensorView out1(oshape, DataType::f32, out1_data, TensorLayout::NCHW);
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    pooling(in_nchw, out1, attrs);
+
+    // Class API (NCHWC8)
+    int64_t in_pitch = nchwc8_pitch(4);
+    std::vector<float> packed_in(1 * 1 * 4 * (in_pitch / 4), 0.0f);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    pack_nchw_to_nchwc8(in_nchw, in_c8);
+
+    int64_t out_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_out(1 * 1 * 2 * (out_pitch / 4), 0.0f);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+
+    auto op = Pooling::create(attrs, Backend::CPU);
+    const TensorView ins[] = {in_c8};
+    op->compute(out_c8, ins);
+
+    float out2_data[4] = {};
+    TensorView out2(oshape, DataType::f32, out2_data, TensorLayout::NCHW);
+    unpack_nchwc8_to_nchw(out_c8, out2);
+
+    NNOPS_EXPECT_TRUE(test::allclose(out1, out2, 1e-6f, 1e-6f));
+}
+
+// ============================================================
+// 2D NCHWC8 roundtrip tests (pack→pool→unpack vs NCHW ref)
+// ============================================================
+
+NNOPS_TEST(pooling_nchwc8_max_small) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_vs_nchw({1, 3, 16, 16}, attrs);
 }
 
 NNOPS_TEST(pooling_nchwc8_max_padding) {
-    test_pooling_nchwc8_vs_nchw({1, 8, 16, 16}, PoolingType::Max, 3, 3, 1, 1, 1, 1);
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+    test_nchwc8_vs_nchw({1, 4, 15, 15}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_max_stride2) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 2};
+    test_nchwc8_vs_nchw({2, 16, 32, 32}, attrs);
 }
 
 NNOPS_TEST(pooling_nchwc8_avg_padding) {
-    test_pooling_nchwc8_vs_nchw({1, 8, 12, 12}, PoolingType::Average, 3, 3, 1, 1, 1, 1);
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+    test_nchwc8_vs_nchw({1, 8, 12, 12}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_avg_stride2) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    test_nchwc8_vs_nchw({1, 2, 16, 16}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_large_input) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_vs_nchw({2, 3, 64, 64}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_odd_width) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_vs_nchw({1, 2, 10, 10}, attrs);
 }
 
 NNOPS_TEST(pooling_nchwc8_partial_c8) {
-    test_pooling_nchwc8_vs_nchw({1, 20, 8, 8}, PoolingType::Max, 3, 3);
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_vs_nchw({1, 20, 8, 8}, attrs);
 }
 
 NNOPS_TEST(pooling_nchwc8_single_channel) {
-    test_pooling_nchwc8_vs_nchw({1, 1, 4, 4}, PoolingType::Max, 2, 2);
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_vs_nchw({1, 1, 4, 4}, attrs);
 }
 
-NNOPS_TEST(pooling_nchwc8_max_add_to) {
-    const int64_t shape[] = {1, 8, 16, 16};
-    const int64_t C8 = 1;
-    const int64_t N = 1, IH = 16, IW = 16, OH = 14, OW = 14;
-    const int64_t in_pitch_bytes = ((IW * 8 * 4 + 31) / 32) * 32;
-    const int64_t in_pitch_elems = in_pitch_bytes / static_cast<int64_t>(sizeof(float));
-    const int64_t out_pitch_bytes = ((OW * 8 * 4 + 31) / 32) * 32;
-    const int64_t out_pitch_elems = out_pitch_bytes / static_cast<int64_t>(sizeof(float));
+NNOPS_TEST(pooling_nchwc8_exclude_pad) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.exclude_pad = true;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+    test_nchwc8_vs_nchw({1, 2, 4, 4}, attrs);
+}
 
-    std::vector<float> nchw_in(N * 8 * IH * IW);
-    for (size_t i = 0; i < nchw_in.size(); ++i) {
-        nchw_in[i] = static_cast<float>((i * 1103515245u + 12345u) & 0x7FFFFFFFu) / 1e9f;
-    }
-    TensorView in_nchw(shape, DataType::f32, nchw_in.data(), TensorLayout::NCHW);
+NNOPS_TEST(pooling_nchwc8_add_to) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.add_to = true;
+    test_nchwc8_vs_nchw({1, 8, 8, 8}, attrs);
+}
 
-    std::vector<float> init_out(N * 8 * OH * OW);
-    for (auto& v : init_out) v = 1.0f;
-    std::vector<float> ref_out = init_out;
-    const std::vector<int64_t> oshape_ref = {N, 8, OH, OW};
-    TensorView out_nchw(oshape_ref, DataType::f32, ref_out.data(), TensorLayout::NCHW);
-    {
-        PoolingAttributes attrs;
-        attrs.type = PoolingType::Max;
-        attrs.kernel_shape = {1, 3, 3};
-        attrs.add_to = true;
-        pooling(in_nchw, out_nchw, attrs);
-    }
+// ============================================================
+// 2D Random tests (no NaN/Inf)
+// ============================================================
 
-    std::vector<float> packed_in(N * C8 * IH * in_pitch_elems);
-    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch_bytes, TensorLayout::NCHWC8);
+NNOPS_TEST(pooling_nchwc8_random_2d) {
+    auto [in_vec, in_nchw] = test::make_random_tensor({1, 3, 16, 16});
+    int64_t W = 16, C = 3;
+    int64_t C8 = (C + 7) / 8;
+
+    int64_t in_pitch = nchwc8_pitch(W);
+    std::vector<float> packed_in(1 * C8 * 16 * (in_pitch / 4));
+    const int64_t shape[] = {1, 3, 16, 16};
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
-    std::vector<float> packed_out(N * C8 * OH * out_pitch_elems, 0.0f);
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t oh = 0; oh < OH; ++oh) {
-            float* row = packed_out.data() + n * C8 * OH * out_pitch_elems + oh * out_pitch_elems;
-            for (int64_t ow = 0; ow < OW; ++ow) {
-                for (int64_t lane = 0; lane < 8; ++lane) {
-                    row[ow * 8 + lane] = 1.0f;
-                }
-            }
-        }
-    }
-    TensorView out_c8(oshape_ref, DataType::f32, packed_out.data(), out_pitch_bytes, TensorLayout::NCHWC8);
-    {
-        PoolingAttributes attrs;
-        attrs.type = PoolingType::Max;
-        attrs.kernel_shape = {1, 3, 3};
-        attrs.add_to = true;
-        pooling(in_c8, out_c8, attrs);
-    }
+    int64_t OW = 8;
+    int64_t out_pitch = nchwc8_pitch(OW);
+    std::vector<float> packed_out(1 * C8 * 8 * (out_pitch / 4));
+    const int64_t oshape[] = {1, 3, 8, 8};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    std::vector<float> result(N * 8 * OH * OW);
-    TensorView res_nchw(oshape_ref, DataType::f32, result.data(), TensorLayout::NCHW);
-    unpack_nchwc8_to_nchw(out_c8, res_nchw);
-    NNOPS_EXPECT_TRUE(test::allclose(res_nchw, out_nchw, 1e-4f, 1e-4f));
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+
+    pooling(in_c8, out_c8, attrs);
+
+    for (size_t i = 0; i < packed_out.size(); ++i) {
+        NNOPS_EXPECT_TRUE(!std::isnan(packed_out[i]));
+        NNOPS_EXPECT_TRUE(!std::isinf(packed_out[i]));
+    }
+}
+
+// ============================================================
+// 3D Basic deterministic tests
+// ============================================================
+
+NNOPS_TEST(pooling_3d_max_basic) {
+    // 1x1x2x4x4 input, 2x2x2 kernel, stride=2, pad=0 → 1x1x1x2x2
+    const int64_t shape[] = {1, 1, 2, 4, 4};
+    std::vector<float> in_buf(2 * 4 * 4);
+    for (int i = 0; i < 32; ++i) in_buf[i] = static_cast<float>(i + 1);
+    TensorView in_ncdhw(shape, DataType::f32, in_buf.data(), TensorLayout::NCDHW);
+
+    int64_t in_pitch = nchwc8_pitch(4);
+    std::vector<float> packed_in(1 * 1 * 2 * 4 * (in_pitch / 4));
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCDHWC8);
+    pack_ncdhw_to_ncdhwc8(in_ncdhw, in_c8);
+
+    int64_t out_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_out(1 * 1 * 1 * 2 * (out_pitch / 4));
+    const int64_t oshape[] = {1, 1, 1, 2, 2};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCDHWC8);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {2, 2, 2};
+    attrs.stride       = {2, 2, 2};
+    attrs.padding      = {0, 0, 0};
+
+    pooling(in_c8, out_c8, attrs);
+
+    float result[4] = {};
+    TensorView res_ncdhw(oshape, DataType::f32, result, TensorLayout::NCDHW);
+    unpack_ncdhwc8_to_ncdhw(out_c8, res_ncdhw);
+
+    NNOPS_EXPECT_NEAR(result[0], 22.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(result[1], 24.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(result[2], 30.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(result[3], 32.0f, 1e-6f);
+}
+
+NNOPS_TEST(pooling_3d_average) {
+    // 1x1x2x2x2 input, 2x2x2 kernel, stride=1, pad=0 → 1x1x1x1x1
+    const int64_t shape[] = {1, 1, 2, 2, 2};
+    float in_data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    TensorView in_ncdhw(shape, DataType::f32, in_data, TensorLayout::NCDHW);
+
+    int64_t in_pitch = nchwc8_pitch(2);
+    std::vector<float> packed_in(1 * 1 * 2 * 2 * (in_pitch / 4), 0.0f);
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCDHWC8);
+    pack_ncdhw_to_ncdhwc8(in_ncdhw, in_c8);
+
+    int64_t out_pitch = nchwc8_pitch(1);
+    std::vector<float> packed_out(1 * 1 * 1 * 1 * (out_pitch / 4), 0.0f);
+    const int64_t oshape[] = {1, 1, 1, 1, 1};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCDHWC8);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {2, 2, 2};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 0, 0};
+
+    pooling(in_c8, out_c8, attrs);
+
+    float result[1] = {};
+    TensorView res_ncdhw(oshape, DataType::f32, result, TensorLayout::NCDHW);
+    unpack_ncdhwc8_to_ncdhw(out_c8, res_ncdhw);
+
+    NNOPS_EXPECT_NEAR(result[0], 4.5f, 1e-4f);
+}
+
+// ============================================================
+// 3D NCHWC8 roundtrip tests
+// ============================================================
+
+NNOPS_TEST(pooling_nchwc8_3d_max) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {3, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_3d_vs_nchw({1, 2, 8, 12, 12}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_3d_avg) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {3, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    test_nchwc8_3d_vs_nchw({1, 1, 8, 12, 12}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_3d_padding) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {3, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {1, 0, 0};
+    test_nchwc8_3d_vs_nchw({1, 1, 4, 8, 8}, attrs);
+}
+
+NNOPS_TEST(pooling_nchwc8_3d_random) {
+    auto [in_vec, in_ncdhw] = test::make_random_tensor({1, 2, 8, 8, 8});
+    int64_t D = 8, H = 8, W = 8, C = 2;
+    int64_t C8 = (C + 7) / 8;
+
+    int64_t in_pitch = nchwc8_pitch(W);
+    std::vector<float> packed_in(1 * C8 * D * H * (in_pitch / 4));
+    const int64_t shape[] = {1, 2, 8, 8, 8};
+    TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCDHWC8);
+    pack_ncdhw_to_ncdhwc8(in_ncdhw, in_c8);
+
+    int64_t OW = 4, OH = 4, OD = 4;
+    int64_t out_pitch = nchwc8_pitch(OW);
+    std::vector<float> packed_out(1 * C8 * OD * OH * (out_pitch / 4));
+    const int64_t oshape[] = {1, 2, 4, 4, 4};
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCDHWC8);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {2, 2, 2};
+    attrs.stride       = {2, 2, 2};
+
+    pooling(in_c8, out_c8, attrs);
+
+    for (size_t i = 0; i < packed_out.size(); ++i) {
+        NNOPS_EXPECT_TRUE(!std::isnan(packed_out[i]));
+        NNOPS_EXPECT_TRUE(!std::isinf(packed_out[i]));
+    }
 }

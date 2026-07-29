@@ -1,7 +1,7 @@
 /// @file pooling.cu
 /// @brief CUDA implementation of 2D/3D spatial pooling (NCHW/NCDHW layout).
 ///
-/// Pooling types: Max, Average, AverageExcludePad, Lp.
+/// Pooling types: Max, Average.
 /// Supports 2D (rank=4, NCHW) and 3D (rank=5, NCDHW) via unified code path.
 ///
 /// Algorithm:
@@ -43,7 +43,7 @@ __global__ void pooling_kernel(
     int64_t out_row_stride,
     // Attributes
     PoolingType pool_type,
-    int64_t p_norm,
+    bool exclude_pad,
     bool add_to)
 {
     // Each block handles one (n, c) pair; threads map to output spatial positions
@@ -93,9 +93,8 @@ __global__ void pooling_kernel(
             break;
         }
 
-        // ---- Average / AverageExcludePad ----
-        case PoolingType::Average:
-        case PoolingType::AverageExcludePad: {
+        // ---- Average ----
+        case PoolingType::Average: {
             float sum = 0.0f;
             int64_t pad_count = 0;
             const int64_t K_total = KD * KH * KW;
@@ -113,33 +112,12 @@ __global__ void pooling_kernel(
                     }
                 }
             }
-            if (pool_type == PoolingType::AverageExcludePad) {
+            if (exclude_pad) {
                 const int64_t valid = K_total - pad_count;
                 result = (valid > 0) ? sum / static_cast<float>(valid) : 0.0f;
             } else {
                 result = sum / static_cast<float>(K_total);
             }
-            break;
-        }
-
-        // ---- Lp Pooling ----
-        case PoolingType::Lp: {
-            float sum = 0.0f;
-            const float fp = static_cast<float>(p_norm);
-            for (int64_t kd = 0; kd < KD; ++kd) {
-                const int64_t id = od * SD + kd * DD - PD;
-                if (id < 0 || id >= ID) continue;
-                for (int64_t kh = 0; kh < KH; ++kh) {
-                    const int64_t ih = oh * SH + kh * DH - PH;
-                    if (ih < 0 || ih >= IH) continue;
-                    for (int64_t kw = 0; kw < KW; ++kw) {
-                        const int64_t iw = ow * SW + kw * DW - PW;
-                        if (iw < 0 || iw >= IW) continue;
-                        sum += powf(fabsf(s_load(&in_ch[id * in_d_stride + ih * in_row_stride + iw])), fp);
-                    }
-                }
-            }
-            result = powf(sum, 1.0f / fp);
             break;
         }
         }
@@ -226,7 +204,7 @@ void pooling_cuda_impl(
         PD, PH, PW,
         in_ch_stride, in_d_stride, in_row_stride,
         out_ch_stride, out_d_stride, out_row_stride,
-        attrs.type, attrs.p_norm, attrs.add_to);
+        attrs.type, attrs.exclude_pad, attrs.add_to);
 }
 
 // ============================================================
