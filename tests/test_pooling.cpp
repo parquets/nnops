@@ -289,32 +289,38 @@ NNOPS_TEST(pooling_2d_class_api) {
     float in_data[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
     TensorView in_nchw(shape, DataType::f32, in_data, TensorLayout::NCHW);
 
-    // Functional API (auto-converts)
-    float out1_data[4] = {};
-    TensorView out1(oshape, DataType::f32, out1_data, TensorLayout::NCHW);
-    PoolingAttributes attrs;
-    attrs.type = PoolingType::Max;
-    attrs.kernel_shape = {1, 2, 2};
-    attrs.stride       = {1, 2, 2};
-    pooling(in_nchw, out1, attrs);
-
-    // Class API (NCHWC8)
+    // Pack input to NCHWC8 (both APIs require NCHWC8)
     int64_t in_pitch = nchwc8_pitch(4);
     std::vector<float> packed_in(1 * 1 * 4 * (in_pitch / 4), 0.0f);
     TensorView in_c8(shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+
+    // Functional API (NCHWC8 in, NCHWC8 out)
     int64_t out_pitch = nchwc8_pitch(2);
-    std::vector<float> packed_out(1 * 1 * 2 * (out_pitch / 4), 0.0f);
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    std::vector<float> packed_out1(1 * 1 * 2 * (out_pitch / 4), 0.0f);
+    TensorView out1_c8(oshape, DataType::f32, packed_out1.data(), out_pitch, TensorLayout::NCHWC8);
+    pooling(in_c8, out1_c8, attrs);
+
+    float out1_data[4] = {};
+    TensorView out1(oshape, DataType::f32, out1_data, TensorLayout::NCHW);
+    unpack_nchwc8_to_nchw(out1_c8, out1);
+
+    // Class API (NCHWC8 in, NCHWC8 out)
+    std::vector<float> packed_out2(1 * 1 * 2 * (out_pitch / 4), 0.0f);
+    TensorView out2_c8(oshape, DataType::f32, packed_out2.data(), out_pitch, TensorLayout::NCHWC8);
 
     auto op = Pooling::create(attrs, Backend::CPU);
     const TensorView ins[] = {in_c8};
-    op->compute(out_c8, ins);
+    op->compute(out2_c8, ins);
 
     float out2_data[4] = {};
     TensorView out2(oshape, DataType::f32, out2_data, TensorLayout::NCHW);
-    unpack_nchwc8_to_nchw(out_c8, out2);
+    unpack_nchwc8_to_nchw(out2_c8, out2);
 
     NNOPS_EXPECT_TRUE(test::allclose(out1, out2, 1e-6f, 1e-6f));
 }

@@ -2,12 +2,10 @@
 /// @brief SIMD-optimized CPU implementation of 2D/3D spatial pooling (NCHWC8 only).
 ///
 /// Key design decisions:
-///   1. Full C8 -> SIMD h4/h1 kernels (all types). SIMD kernels handle exclude_pad
-///      via in-kernel per-position valid_count.
-///   2. Partial C8 -> scalar fallback (valid_lanes only).
-///      SIMD kernels ARE correct for partial C8 (nchwc8 tests prove it), but
-///      the NCHW->NCHWC8 auto-conversion path has a subtle interaction — the
-///      valid_lanes==8 gate keeps both paths correct. TODO: fix auto-conversion.
+///   1. All C8 blocks (including partial) use SIMD h4/h1 kernels — pad channels in
+///      NCHWC8 input are zero, so SIMD operates correctly on all 8 lanes
+///      (max ignores pad zeros, avg accumulates zero = no contribution).
+///   2. SIMD kernels handle exclude_pad via in-kernel per-position valid_count.
 ///   3. Height-4 blocking: process 4 output rows at once (h4), remainder with h1.
 ///   4. In-kernel bounds checking for all kernel positions — no pre-splitting.
 ///   5. All SW values supported — offset math is just integer arithmetic.
@@ -22,7 +20,6 @@
 #include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
-#include <algorithm>
 #include <limits>
 
 namespace nnops::backend::cpu {
@@ -304,7 +301,6 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
     const int64_t N  = input.shape(0);
-    const int64_t C  = input.shape(1);
     const int64_t C8 = input.num_channel_blocks();
 
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
@@ -351,8 +347,7 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t out_ch_stride = output.channel_block_stride_elems();
     const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
 
-    // Select SIMD kernels (all C8 blocks; partial C8 also correct but auto-
-    // conversion path has subtle interaction — keep valid_lanes==8 gate for now)
+    // Select SIMD kernels (all C8 blocks use SIMD)
     using PoolingFn = void (*)(T*, const T*, const PoolingKernelParams&,
                                 float, bool);
     const PoolingFn pool_h4_fn = (attrs.type == PoolingType::Max)
@@ -360,109 +355,25 @@ void pooling_impl(const PoolingAttributes& attrs,
     const PoolingFn pool_h1_fn = (attrs.type == PoolingType::Max)
         ? maxpool_h1_simd<T> : avgpool_h1_simd<T>;
 
-    // Per-C8-block compute lambda
+    // Per-C8-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
     const auto compute_c8 = [&](int64_t n, int64_t c8) {
-        const int64_t c_base = c8 * 8;
-        const int64_t valid_lanes = std::min<int64_t>(8, C - c_base);
-
         const T* in_base  = in_ptr + n * C8 * in_ch_stride + c8 * in_ch_stride;
         T* out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
 
-        if (valid_lanes == 8) {
-            // SIMD path: full C8, all types
-            for (int64_t od = 0; od < OD; ++od) {
-                T* out_d = out_base + od * p.out_row_stride * OH;
+        for (int64_t od = 0; od < OD; ++od) {
+            T* out_d = out_base + od * p.out_row_stride * OH;
 
-                int64_t oh = 0;
-                for (; oh + 3 < OH; oh += 4) {
-                    p.od = od;
-                    p.oh = oh;
-                    pool_h4_fn(out_d + oh * p.out_row_stride, in_base, p, avg_scale, attrs.add_to);
-                }
-                for (; oh < OH; ++oh) {
-                    p.od = od;
-                    p.oh = oh;
-                    pool_h1_fn(out_d + oh * p.out_row_stride, in_base,
-                               p, avg_scale, attrs.add_to);
-                }
+            int64_t oh = 0;
+            for (; oh + 3 < OH; oh += 4) {
+                p.od = od;
+                p.oh = oh;
+                pool_h4_fn(out_d + oh * p.out_row_stride, in_base, p, avg_scale, attrs.add_to);
             }
-        } else {
-            // Scalar path: partial C8 — same SIMD kernel logic but per-lane
-            constexpr int64_t ws = 8;
-            const bool is_max  = (attrs.type == PoolingType::Max);
-            const bool excl_pad = attrs.exclude_pad;
-            const float inv_k = 1.0f / static_cast<float>(KD * KH * KW);
-            const int64_t K_total = KD * KH * KW;
-
-            for (int64_t od = 0; od < OD; ++od) {
-                T* out_d = out_base + od * p.out_row_stride * OH;
-                for (int64_t oh = 0; oh < OH; ++oh) {
-                    p.od = od;
-                    p.oh = oh;
-                    T* out_row = out_d + oh * p.out_row_stride;
-
-                    for (int64_t ow = 0; ow < p.OW; ++ow) {
-                        float result[8], pad_count[8] = {};
-                        bool any_valid[8] = {};
-                        if (is_max) {
-                            for (int l = 0; l < valid_lanes; ++l)
-                                result[l] = -std::numeric_limits<float>::infinity();
-                        } else {
-                            for (int l = 0; l < valid_lanes; ++l)
-                                result[l] = 0.0f;
-                        }
-
-                        for (int64_t kd = 0; kd < p.KD; ++kd) {
-                            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-                            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                                    if (id < 0 || id >= p.ID
-                                        || ih < 0 || ih >= p.IH
-                                        || iw < 0 || iw >= p.IW) {
-                                        for (int l = 0; l < valid_lanes; ++l) pad_count[l] += 1;
-                                        continue;
-                                    }
-                                    int64_t w_off = iw * ws;
-                                    if (is_max) {
-                                        for (int l = 0; l < valid_lanes; ++l) {
-                                            float val = s_load(&in_base[id * p.in_d_stride
-                                                + ih * p.in_row_stride + w_off + l]);
-                                            if (val > result[l]) result[l] = val;
-                                            any_valid[l] = true;
-                                        }
-                                    } else {
-                                        for (int l = 0; l < valid_lanes; ++l)
-                                            result[l] += s_load(&in_base[id * p.in_d_stride
-                                                + ih * p.in_row_stride + w_off + l]);
-                                    }
-                                }
-                            }
-                        }
-
-                        if (is_max) {
-                            for (int l = 0; l < valid_lanes; ++l)
-                                if (!any_valid[l]) result[l] = 0.0f;
-                        } else if (excl_pad) {
-                            for (int l = 0; l < valid_lanes; ++l) {
-                                int64_t vc = K_total - static_cast<int64_t>(pad_count[l]);
-                                result[l] = (vc > 0) ? result[l] / static_cast<float>(vc) : 0.0f;
-                            }
-                        } else {
-                            for (int l = 0; l < valid_lanes; ++l)
-                                result[l] *= inv_k;
-                        }
-
-                        for (int l = 0; l < valid_lanes; ++l) {
-                            const int64_t out_idx = ow * ws + l;
-                            if (attrs.add_to)
-                                s_store(&out_row[out_idx], s_load(&out_row[out_idx]) + result[l]);
-                            else
-                                s_store(&out_row[out_idx], result[l]);
-                        }
-                    }
-                }
+            for (; oh < OH; ++oh) {
+                p.od = od;
+                p.oh = oh;
+                pool_h1_fn(out_d + oh * p.out_row_stride, in_base,
+                           p, avg_scale, attrs.add_to);
             }
         }
     };
