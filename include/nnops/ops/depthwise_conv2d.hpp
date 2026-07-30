@@ -79,6 +79,10 @@ public:
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
 
+    void prepackWeights(std::span<const TensorView> inputs,
+                        std::span<TensorView> outputs,
+                        const ComputeContext& ctx = {}) override;
+
     OpType  getOpType()  const override { return OpType::DepthwiseConv2D; }
     Backend getBackend() const override { return backend_; }
 

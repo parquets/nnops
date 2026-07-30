@@ -81,6 +81,31 @@ public:
         compute(std::span<TensorView>(outputs), inputs, ctx, workspace);
     }
 
+    /// Prepack weights into an optimized format for the target backend.
+    ///
+    /// Dual-behavior API — the caller discovers the required buffer, then
+    /// fills it, in two steps:
+    ///
+    ///   Step 1 — query shape/size: pass an empty outputs[0] (is_empty()
+    ///   returns true). The function fills outputs[0] with shape, dtype,
+    ///   layout, and pitch so the caller can allocate the exact buffer.
+    ///
+    ///   Step 2 — perform prepack: pass an outputs[0] whose data pointer
+    ///   points to a buffer of at least the size described in step 1.
+    ///   The function writes the prepacked weight data into that buffer.
+    ///
+    /// @param inputs   Raw weight tensor(s) in standard layout (e.g. NCHW).
+    /// @param outputs  outputs[0] — empty (query) or pre-allocated (prepack).
+    /// @param ctx      Compute context (may be unused).
+    virtual void prepackWeights(std::span<const TensorView> inputs,
+                                std::span<TensorView> outputs,
+                                const ComputeContext& ctx = {})
+    {
+        (void)inputs;
+        (void)outputs;
+        (void)ctx;
+    }
+
     /// Returns the ONNX-style operation type identifier.
     virtual OpType getOpType() const = 0;
 
