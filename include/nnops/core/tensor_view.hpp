@@ -39,19 +39,42 @@ struct TensorDesc {
     DataType dtype = DataType::f32;
     TensorLayout layout = TensorLayout::NCHW;
 
-    /// Total number of logical elements (product of all dimensions).
+    /// Total number of logical elements.
+    /// For packed layouts (NCHWC8, etc.), counts storage elements
+    /// including channel block rounding: ceil(C/pack) × pack instead of C.
     int64_t numel() const noexcept {
         if (rank == 0) return 0;
         int64_t n = 1;
         for (int64_t i = 0; i < rank; ++i) {
-            n *= dims[static_cast<size_t>(i)];
+            int64_t d = dims[static_cast<size_t>(i)];
+            if (i == 1) {
+                int64_t pack = layout_channel_pack(layout);
+                if (pack > 1) d = ((d + pack - 1) / pack) * pack;
+            }
+            n *= d;
         }
         return n;
     }
 
-    /// Total size in bytes (numel * elem_size).
+    /// Total storage size in bytes (numel × elem_size, with channel rounding).
+    /// Does NOT include per-row pitch padding — call storage_bytes() for that.
     size_t nbytes() const noexcept {
         return static_cast<size_t>(numel()) * data_type_size(dtype);
+    }
+
+    /// Actual storage size including default-aligned row pitch (32B).
+    size_t storage_bytes(int64_t alignment = 32) const noexcept {
+        if (rank < 2) return nbytes();
+        int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
+        int64_t W = dims[static_cast<size_t>(rank - 1)];
+        int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
+        int64_t row_bytes = W * pack * elem_size;
+        int64_t aligned_row = ((row_bytes + alignment - 1) / alignment) * alignment;
+        int64_t rows = dims[0];
+        if (rank >= 2) rows *= ((dims[1] + pack - 1) / pack);
+        for (int64_t d = 2; d < rank - 1; ++d)
+            rows *= dims[static_cast<size_t>(d)];
+        return static_cast<size_t>(rows * aligned_row);
     }
 };
 
@@ -159,7 +182,9 @@ public:
         return static_cast<const T*>(static_cast<const char*>(data_) + row_id * static_cast<size_t>(pitch_));
     }
 
-    /// Total number of elements (product of all dimensions).
+    /// Total number of logical elements (product of all dimensions).
+    /// For packed layouts this is the logical count (N×C×H×W), not the storage
+    /// count (which includes channel block rounding and row padding).
     int64_t numel() const noexcept {
         if (rank_ == 0) { return 0; }
         int64_t n = 1;
@@ -169,11 +194,20 @@ public:
         return n;
     }
 
-    /// Total size in bytes of the logical tensor (NOT including pitch padding).
-    /// This is numel() * elem_size. The actual buffer may be larger due to
-    /// pitch padding at the end of each row.
+    /// Total buffer size in bytes including row pitch padding.
+    /// For planar layouts this equals numel × elem_size.
+    /// For packed layouts this accounts for channel block rounding
+    /// and aligned row pitch padding.
     size_t nbytes() const noexcept {
-        return static_cast<size_t>(numel()) * data_type_size(dtype_);
+        return storage_bytes();
+    }
+
+    /// Actual storage size in bytes: total_rows × pitch.
+    /// For planar layouts equals numel × elem_size.
+    /// For packed layouts accounts for channel block rounding and row alignment.
+    size_t storage_bytes() const noexcept {
+        if (rank_ < 2) return static_cast<size_t>(numel()) * data_type_size(dtype_);
+        return static_cast<size_t>(total_rows()) * static_cast<size_t>(pitch_);
     }
 
     /// Whether this is an empty view.

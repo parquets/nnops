@@ -317,14 +317,14 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
         if (srank == 3) {
             // Packed weight: [C8, KD, KH, KW, 8]
             const int64_t w_shape[] = {C8, KD, KH, KW, 8};
-            const int64_t w_pitch = KW * 8 * elem_size;
+            const int64_t w_pitch = 8 * elem_size;  // innermost dim = 8 lanes
             outputs[0] = TensorView(
                 std::span<const int64_t>(w_shape, 5), dtype,
                 nullptr, w_pitch, TensorLayout::PackedWeight);
         } else {
             // Packed weight: [C8, KH, KW, 8]
             const int64_t w_shape[] = {C8, KH, KW, 8};
-            const int64_t w_pitch = KW * 8 * elem_size;
+            const int64_t w_pitch = 8 * elem_size;
             outputs[0] = TensorView(
                 std::span<const int64_t>(w_shape, 4), dtype,
                 nullptr, w_pitch, TensorLayout::PackedWeight);
