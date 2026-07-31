@@ -74,7 +74,8 @@ make_random_tensor(std::span<const int64_t> shape,
     XorShift128 rng(seed);
     rng.fill_float(data.data(), numel, min, max);
 
-    TensorView view(shape, DataType::f32, data.data());
+    auto layout = (shape.size() == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    TensorView view(shape, DataType::f32, data.data(), layout);
     return {std::move(data), view};
 }
 

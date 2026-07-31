@@ -2,6 +2,7 @@
 set(TEST_SOURCES
     common/test_harness.cpp
     test_tensor_view.cpp
+    test_matmul.cpp
     test_conv2d.cpp
     test_activation.cpp
     test_pooling.cpp

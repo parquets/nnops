@@ -96,9 +96,8 @@ void matmul_ref(const MatMulAttributes& attrs,
                         : b_ptr[k * ldb + n];
                     sum += a_val * b_val;
                 }
-                float val = apply_epilogue(attrs.epilogue, sum, n);
                 float* dst = c_ptr + m * ldc + n;
-                *dst = val + attrs.beta * (*dst);
+                *dst = apply_epilogue(attrs.epilogue, sum + attrs.beta * (*dst), n);
             }
         };
 

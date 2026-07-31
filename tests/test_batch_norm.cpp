@@ -2,6 +2,7 @@
 
 #include "nnops/ops/batch_norm.hpp"
 #include "common/test_harness.hpp"
+#include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 
@@ -27,9 +28,30 @@ NNOPS_TEST(batchnorm_simple_1d) {
     TensorView b(shape_c, DataType::f32, bias_data);
     TensorView m(shape_c, DataType::f32, mean_data);
     TensorView v(shape_c, DataType::f32, var_data);
-    TensorView y(shape_x, DataType::f32, out_data);
 
-    batch_norm(x, s, b, m, v, y);
+    // Class API
+    BatchNormAttributes attrs;
+    auto op = BatchNorm::create(attrs, Backend::CPU);
+
+    auto dx = x.desc();
+    auto ds = s.desc();
+    auto db = b.desc();
+    auto dm = m.desc();
+    auto dv = v.desc();
+    const TensorDesc desc_arr[] = {dx, ds, db, dm, dv};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    // Validate output descriptor
+    NNOPS_EXPECT_EQ(descs[0].rank, 1);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    auto out = test::make_planar(descs[0], out_data);
+
+    const TensorView ins[] = {x, s, b, m, v};
+    TensorView outs[] = {out};
+    op->compute(outs, ins);
 
     // Manual: (x - 2.5) / sqrt(1.25 + 1e-5) * 1.0 + 0.0
     float eps = 1e-5f;
@@ -58,9 +80,31 @@ NNOPS_TEST(batchnorm_2d_with_scale_bias) {
     TensorView b(shape_c, DataType::f32, bias_data);
     TensorView m(shape_c, DataType::f32, mean_data);
     TensorView v(shape_c, DataType::f32, var_data);
-    TensorView y(shape_x, DataType::f32, out_data);
 
-    batch_norm(x, s, b, m, v, y);
+    // Class API
+    BatchNormAttributes attrs;
+    auto op = BatchNorm::create(attrs, Backend::CPU);
+
+    auto dx = x.desc();
+    auto ds = s.desc();
+    auto db = b.desc();
+    auto dm = m.desc();
+    auto dv = v.desc();
+    const TensorDesc desc_arr[] = {dx, ds, db, dm, dv};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    // Validate output descriptor
+    NNOPS_EXPECT_EQ(descs[0].rank, 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[1], 2);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    auto out = test::make_planar(descs[0], out_data);
+
+    const TensorView ins[] = {x, s, b, m, v};
+    TensorView outs[] = {out};
+    op->compute(outs, ins);
 
     float eps = 1e-5f;
     float inv_std = 1.0f / std::sqrt(1.0f + eps);
@@ -91,38 +135,33 @@ NNOPS_TEST(batchnorm_random) {
     TensorView b(shape_c, DataType::f32, bias_buf.data());
     TensorView m(shape_c, DataType::f32, mean_buf.data());
     TensorView v(shape_c, DataType::f32, var_buf.data());
-    TensorView y(shape_x, DataType::f32, out_buf.data());
 
-    batch_norm(x, s, b, m, v, y);
+    // Class API
+    BatchNormAttributes attrs;
+    auto op = BatchNorm::create(attrs, Backend::CPU);
+
+    auto dx = x.desc();
+    auto ds = s.desc();
+    auto db = b.desc();
+    auto dm = m.desc();
+    auto dv = v.desc();
+    const TensorDesc desc_arr[] = {dx, ds, db, dm, dv};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    // Validate output descriptor
+    NNOPS_EXPECT_EQ(descs[0].rank, 3);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[1], 4);
+    NNOPS_EXPECT_EQ(descs[0].dims[2], 3);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {x, s, b, m, v};
+    TensorView outs[] = {out};
+    op->compute(outs, ins);
 
     // With mean=0, var=1, scale=1, bias=0: output should equal input
-    NNOPS_EXPECT_TRUE(test::allclose(x, y, 1e-3f, 1e-3f));
-}
-
-NNOPS_TEST(batchnorm_class_api) {
-    const int64_t shape_x[] = {2, 1};
-    const int64_t shape_c[] = {1};
-
-    float x_data[]  = {1.0f, 2.0f};
-    float s_data[]  = {1.0f};
-    float b_data[]  = {0.0f};
-    float m_data[]  = {0.0f};
-    float v_data[]  = {1.0f};
-    float out1[2] = {}, out2[2] = {};
-
-    TensorView x(shape_x, DataType::f32, x_data);
-    TensorView s(shape_c, DataType::f32, s_data);
-    TensorView b(shape_c, DataType::f32, b_data);
-    TensorView m(shape_c, DataType::f32, m_data);
-    TensorView v(shape_c, DataType::f32, v_data);
-    TensorView y1(shape_x, DataType::f32, out1);
-    TensorView y2(shape_x, DataType::f32, out2);
-
-    batch_norm(x, s, b, m, v, y1);
-
-    auto op = BatchNorm::create(Backend::CPU);
-    const TensorView ins[] = {x, s, b, m, v};
-    op->compute(y2, ins);
-
-    NNOPS_EXPECT_TRUE(test::allclose(y1, y2));
+    NNOPS_EXPECT_TRUE(test::allclose(x, out, 1e-3f, 1e-3f));
 }

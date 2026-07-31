@@ -43,7 +43,7 @@ struct TensorDesc {
     /// For packed layouts (NCHWC8, etc.), counts storage elements
     /// including channel block rounding: ceil(C/pack) × pack instead of C.
     int64_t numel() const noexcept {
-        if (rank == 0) return 0;
+        if (rank == 0) return 1;  // scalar = 1 element
         int64_t n = 1;
         for (int64_t i = 0; i < rank; ++i) {
             int64_t d = dims[static_cast<size_t>(i)];
@@ -60,6 +60,18 @@ struct TensorDesc {
     /// Does NOT include per-row pitch padding — call storage_bytes() for that.
     size_t nbytes() const noexcept {
         return static_cast<size_t>(numel()) * data_type_size(dtype);
+    }
+
+    /// Row pitch (byte stride between consecutive rows).
+    /// For rank < 2, returns elem_size.
+    /// For packed layouts, pitch = align_up(W × pack × elem_size, alignment).
+    int64_t row_pitch(int64_t alignment = 32) const noexcept {
+        if (rank < 2) return static_cast<int64_t>(data_type_size(dtype));
+        int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
+        int64_t W = dims[static_cast<size_t>(rank - 1)];
+        int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
+        int64_t row_bytes = W * pack * elem_size;
+        return ((row_bytes + alignment - 1) / alignment) * alignment;
     }
 
     /// Actual storage size including default-aligned row pitch (32B).
@@ -173,20 +185,20 @@ public:
     /// row_id selects the row; pitch_ (in bytes) determines the row stride.
     template <typename T>
     T* ptr(size_t row_id) noexcept {
-        return static_cast<T*>(static_cast<char*>(data_) + row_id * static_cast<size_t>(pitch_));
+        return reinterpret_cast<T*>(static_cast<char*>(data_) + row_id * static_cast<size_t>(pitch_));
     }
 
     /// Typed data pointer for a specific row (const).
     template <typename T>
     const T* ptr(size_t row_id) const noexcept {
-        return static_cast<const T*>(static_cast<const char*>(data_) + row_id * static_cast<size_t>(pitch_));
+        return reinterpret_cast<const T*>(static_cast<const char*>(data_) + row_id * static_cast<size_t>(pitch_));
     }
 
     /// Total number of logical elements (product of all dimensions).
     /// For packed layouts this is the logical count (N×C×H×W), not the storage
     /// count (which includes channel block rounding and row padding).
     int64_t numel() const noexcept {
-        if (rank_ == 0) { return 0; }
+        if (rank_ == 0) { return data_ != nullptr ? 1 : 0; }  // scalar=1, empty=0
         int64_t n = 1;
         for (int64_t i = 0; i < rank_; ++i) {
             n *= shape_[static_cast<size_t>(i)];
@@ -211,7 +223,7 @@ public:
     }
 
     /// Whether this is an empty view.
-    bool is_empty() const noexcept { return data_ == nullptr || rank_ == 0; }
+    bool is_empty() const noexcept { return data_ == nullptr; }
 
     /// Return a lightweight TensorDesc (no data pointer) for workspace queries.
     TensorDesc desc() const noexcept {
