@@ -328,7 +328,7 @@ NNOPS_TEST(layout_convert_op_shape_inference) {
     input.layout = TensorLayout::NCHW;
 
     auto op = LayoutConvert::create(TensorLayout::NCHWC8);
-    auto outputs = op->getOutputShapes({&input, 1});
+    auto outputs = op->getOutputTensorDesc({&input, 1});
 
     NNOPS_EXPECT_EQ(outputs.size(), 1u);
     NNOPS_EXPECT_EQ(outputs[0].rank, 4);

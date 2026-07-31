@@ -58,7 +58,7 @@ Linear::Linear(const LinearAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_linear_kernel(backend);
 }
 
-std::vector<TensorDesc> Linear::getOutputShapes(
+std::vector<TensorDesc> Linear::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {linear_output_shape(inputs)};

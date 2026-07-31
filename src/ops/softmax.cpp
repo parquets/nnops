@@ -76,7 +76,7 @@ Softmax::Softmax(const SoftmaxAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_softmax_kernel(backend);
 }
 
-std::vector<TensorDesc> Softmax::getOutputShapes(
+std::vector<TensorDesc> Softmax::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

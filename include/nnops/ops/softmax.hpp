@@ -45,7 +45,7 @@ public:
     }
 
     // ---- OpBase interface ----
-    std::vector<TensorDesc> getOutputShapes(
+    std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
     /// inputs[0] = input tensor (any rank >= 1)

@@ -66,9 +66,9 @@ Conv3D::Conv3D(const Conv3DAttributes& attrs, Backend backend)
 }
 
 // ============================================================
-// getOutputShapes
+// getOutputTensorDesc
 // ============================================================
-std::vector<TensorDesc> Conv3D::getOutputShapes(
+std::vector<TensorDesc> Conv3D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {conv3d_output_shape(

@@ -58,7 +58,7 @@ Attention::Attention(const AttentionAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_attention_kernel(backend);
 }
 
-std::vector<TensorDesc> Attention::getOutputShapes(
+std::vector<TensorDesc> Attention::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {attention_output_shape(inputs)};

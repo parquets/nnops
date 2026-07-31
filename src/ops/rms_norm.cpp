@@ -76,7 +76,7 @@ RMSNorm::RMSNorm(const RMSNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_rms_norm_kernel(backend);
 }
 
-std::vector<TensorDesc> RMSNorm::getOutputShapes(
+std::vector<TensorDesc> RMSNorm::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

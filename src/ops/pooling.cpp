@@ -68,7 +68,7 @@ Pooling::Pooling(const PoolingAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_pooling_kernel(backend);
 }
 
-std::vector<TensorDesc> Pooling::getOutputShapes(
+std::vector<TensorDesc> Pooling::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {pooling_output_shape(

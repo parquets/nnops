@@ -58,7 +58,7 @@ GridSample::GridSample(const GridSampleAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_grid_sample_kernel(backend);
 }
 
-std::vector<TensorDesc> GridSample::getOutputShapes(
+std::vector<TensorDesc> GridSample::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return grid_sample_output_shape(inputs);

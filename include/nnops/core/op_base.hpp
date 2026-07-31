@@ -22,7 +22,7 @@ namespace nnops {
 ///   - Executes via compute(), which takes pre-allocated output tensors,
 ///     input tensors, a compute context, and a user-provided workspace buffer.
 ///   - Does NOT internally allocate memory — the user manages all buffers.
-///   - Provides shape inference via getOutputShapes() — given input
+///   - Provides shape and layout inference via getOutputTensorDesc() — given input
 ///     TensorDescs (shapes + dtype, no data), returns the expected output
 ///     TensorDescs. This enables graph-level shape propagation and memory
 ///     planning before execution.
@@ -42,7 +42,7 @@ public:
     ///
     /// @param inputs  Input tensor descriptors (shapes + dtype + layout).
     /// @return        Output tensor descriptors. Size is typically 1.
-    virtual std::vector<TensorDesc> getOutputShapes(
+    virtual std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const = 0;
 
     /// Returns the workspace size in bytes required by this operator.

@@ -76,7 +76,7 @@ Activation::Activation(const ActivationAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_activation_kernel(backend);
 }
 
-std::vector<TensorDesc> Activation::getOutputShapes(
+std::vector<TensorDesc> Activation::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

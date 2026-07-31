@@ -76,7 +76,7 @@ BatchNorm::BatchNorm(const BatchNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_batch_norm_kernel(backend);
 }
 
-std::vector<TensorDesc> BatchNorm::getOutputShapes(
+std::vector<TensorDesc> BatchNorm::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

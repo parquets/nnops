@@ -64,7 +64,7 @@ NNOPS_TEST(shape_conv2d_basic) {
         td({1, 3, 224, 224}),   // input
         td({64, 3, 3, 3})       // weight
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs.size(), size_t(1));
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(4));
@@ -85,7 +85,7 @@ NNOPS_TEST(shape_conv2d_stride2) {
         td({1, 3, 224, 224}),
         td({64, 3, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(112));  // OH = (224+2-3)/2+1
     NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t(112));
@@ -102,7 +102,7 @@ NNOPS_TEST(shape_conv2d_same_upper) {
         td({1, 3, 224, 224}),
         td({64, 3, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(224));  // ceil(224/1)
     NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t(224));
 }
@@ -118,7 +118,7 @@ NNOPS_TEST(shape_conv2d_valid) {
         td({1, 3, 224, 224}),
         td({64, 3, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(222));  // (224-3)/1+1
 }
 
@@ -134,7 +134,7 @@ NNOPS_TEST(shape_conv2d_grouped) {
         td({2, 128, 56, 56}),     // IC=128
         td({128, 32, 3, 3})       // OC=128, IC/G=32
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(128));  // OC
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(54));   // OH=(56-3)/1+1
@@ -155,7 +155,7 @@ NNOPS_TEST(shape_conv3d_basic) {
         td({1, 3, 16, 224, 224}),
         td({64, 3, 3, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs.size(), size_t(1));
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(5));
@@ -181,7 +181,7 @@ NNOPS_TEST(shape_depthwise_conv_2d) {
         td({1, 32, 112, 112}),
         td({32, 1, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(32));   // C unchanged
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(56));   // OH = (112+2-3)/2+1
@@ -199,7 +199,7 @@ NNOPS_TEST(shape_depthwise_conv_3d) {
         td({1, 32, 16, 112, 112}),
         td({32, 1, 3, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(5));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));     // N
@@ -221,7 +221,7 @@ NNOPS_TEST(shape_pooling_2d) {
     attrs.padding  = {0, 0, 0};
 
     auto inputs = std::vector<TensorDesc>{td({1, 64, 112, 112})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(64));
@@ -237,7 +237,7 @@ NNOPS_TEST(shape_pooling_3d) {
     attrs.padding  = {0, 0, 0};
 
     auto inputs = std::vector<TensorDesc>{td({1, 16, 8, 56, 56})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(5));
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(7));   // OD = (8-2)/1+1
@@ -255,7 +255,7 @@ NNOPS_TEST(shape_linear_2d) {
         td({32, 768}),    // [M, K]
         td({3072, 768})   // [N, K]
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(32));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(3072));
@@ -267,7 +267,7 @@ NNOPS_TEST(shape_linear_batched) {
         td({2, 4, 128}),    // [B, M, K]
         td({512, 128})      // [N, K]
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(3));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(4));
@@ -284,7 +284,7 @@ NNOPS_TEST(shape_matmul_2d) {
         td({4, 256}),   // A: [M, K]
         td({256, 128})  // B: [K, N]
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(4));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(128));
@@ -299,7 +299,7 @@ NNOPS_TEST(shape_matmul_transpose_a) {
         td({256, 4}),    // [K, M] — after transpose: [M, K]
         td({256, 128})   // [K, N]
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(4));    // M from A's last dim
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(128));
 }
@@ -313,7 +313,7 @@ NNOPS_TEST(shape_matmul_transpose_b) {
         td({4, 256}),    // [M, K]
         td({128, 256})   // [N, K] — after transpose: [K, N]
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(4));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(128));
 }
@@ -324,7 +324,7 @@ NNOPS_TEST(shape_matmul_batched) {
         td({2, 3, 4, 256}),    // [B1, B2, M, K]
         td({2, 1, 256, 128})   // [B1, 1, K, N] — broadcast B2
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(4));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(3));   // broadcast
@@ -343,7 +343,7 @@ NNOPS_TEST(shape_attention_merged_heads) {
         td({1, 128, 768}),  // K
         td({1, 128, 768})   // V
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(3));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(128));
@@ -357,7 +357,7 @@ NNOPS_TEST(shape_attention_per_head) {
         td({1, 12, 128, 64}),  // K
         td({1, 12, 128, 64})   // V
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(12));
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(128));
@@ -371,7 +371,7 @@ NNOPS_TEST(shape_attention_per_head) {
 NNOPS_TEST(shape_activation_identity) {
     auto op = Activation::create(Backend::CPU);
     auto inputs = std::vector<TensorDesc>{td({1, 3, 224, 224})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(4));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t(224));
@@ -380,7 +380,7 @@ NNOPS_TEST(shape_activation_identity) {
 NNOPS_TEST(shape_softmax_identity) {
     auto op = Softmax::create(Backend::CPU);
     auto inputs = std::vector<TensorDesc>{td({32, 10})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(32));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(10));
 }
@@ -388,7 +388,7 @@ NNOPS_TEST(shape_softmax_identity) {
 NNOPS_TEST(shape_cumsum_identity) {
     auto op = CumSum::create(Backend::CPU);
     auto inputs = std::vector<TensorDesc>{td({5, 8})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(5));
 }
 
@@ -398,7 +398,7 @@ NNOPS_TEST(shape_batch_norm_identity) {
         td({1, 64, 56, 56}),
         td({64}), td({64}), td({64}), td({64})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(64));
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(56));
@@ -411,7 +411,7 @@ NNOPS_TEST(shape_layer_norm_identity) {
         td({2, 128, 768}),
         td({768})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(768));
 }
@@ -422,7 +422,7 @@ NNOPS_TEST(shape_rms_norm_identity) {
         td({2, 128, 768}),
         td({768})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(3));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(128));
 }
@@ -433,7 +433,7 @@ NNOPS_TEST(shape_eltwise_identity) {
         td({4, 8, 16}),
         td({4, 8, 16})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(4));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(8));
 }
@@ -441,7 +441,7 @@ NNOPS_TEST(shape_eltwise_identity) {
 NNOPS_TEST(shape_unary_identity) {
     auto op = Unary::create(Backend::CPU);
     auto inputs = std::vector<TensorDesc>{td({7, 7, 1024})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(1024));
 }
 
@@ -456,7 +456,7 @@ NNOPS_TEST(shape_reduce_sum_axis0) {
     attrs.axis = 0;
 
     auto inputs = std::vector<TensorDesc>{td({3, 4, 5})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(4));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(5));
@@ -470,7 +470,7 @@ NNOPS_TEST(shape_reduce_keepdims) {
     attrs.keepdims = true;
 
     auto inputs = std::vector<TensorDesc>{td({3, 4, 5})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(3));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(3));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(1));   // kept as 1
@@ -484,7 +484,7 @@ NNOPS_TEST(shape_reduce_negative_axis) {
     attrs.axis = -1;  // last dim
 
     auto inputs = std::vector<TensorDesc>{td({3, 4, 5})};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].rank, int64_t(2));
     NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(3));
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(4));
@@ -497,7 +497,7 @@ NNOPS_TEST(shape_reduce_negative_axis) {
 NNOPS_TEST(shape_dtype_propagation) {
     auto op = Activation::create(Backend::CPU);
     auto inputs = std::vector<TensorDesc>{td({2, 4}, DataType::f16, TensorLayout::NCHWC8)};
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f16);
     NNOPS_EXPECT_EQ(outs[0].layout, TensorLayout::NCHWC8);
 }
@@ -507,7 +507,7 @@ NNOPS_TEST(shape_dtype_propagation) {
 // ============================================================
 
 NNOPS_TEST(shape_workspace_consistent) {
-    // getWorkspaceSize should accept TensorDesc from getOutputShapes
+    // getWorkspaceSize should accept TensorDesc from getOutputTensorDesc
     auto op = Conv2D::create(Backend::CPU);
     auto& attrs = const_cast<Conv2DAttributes&>(op->attributes());
     attrs.kernel_size = {3, 3};
@@ -518,7 +518,7 @@ NNOPS_TEST(shape_workspace_consistent) {
         td({1, 3, 224, 224}),
         td({64, 3, 3, 3})
     };
-    auto outs = op->getOutputShapes(inputs);
+    auto outs = op->getOutputTensorDesc(inputs);
 
     // getWorkspaceSize takes input + output descriptors
     auto ws = op->getWorkspaceSize(inputs, outs);

@@ -66,7 +66,7 @@ Resize::Resize(const ResizeAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_resize_kernel(backend);
 }
 
-std::vector<TensorDesc> Resize::getOutputShapes(
+std::vector<TensorDesc> Resize::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     std::array<int64_t, 3> os = attrs_.output_size;

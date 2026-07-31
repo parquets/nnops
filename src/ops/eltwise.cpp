@@ -87,7 +87,7 @@ Eltwise::Eltwise(const EltwiseAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_eltwise_kernel(backend);
 }
 
-std::vector<TensorDesc> Eltwise::getOutputShapes(
+std::vector<TensorDesc> Eltwise::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

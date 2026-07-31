@@ -56,7 +56,7 @@ public:
                                           Backend backend = Backend::CPU);
 
     // ---- OpBase interface ----
-    std::vector<TensorDesc> getOutputShapes(
+    std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,

@@ -277,9 +277,9 @@ DepthwiseConv::DepthwiseConv(const DepthwiseConvAttributes& attrs, Backend backe
 }
 
 // ============================================================
-// getOutputShapes
+// getOutputTensorDesc
 // ============================================================
-std::vector<TensorDesc> DepthwiseConv::getOutputShapes(
+std::vector<TensorDesc> DepthwiseConv::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {depthwise_conv_output_shape(

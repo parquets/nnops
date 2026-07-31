@@ -76,7 +76,7 @@ LayerNorm::LayerNorm(const LayerNormAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_layer_norm_kernel(backend);
 }
 
-std::vector<TensorDesc> LayerNorm::getOutputShapes(
+std::vector<TensorDesc> LayerNorm::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

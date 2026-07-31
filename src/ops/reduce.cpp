@@ -76,7 +76,7 @@ Reduce::Reduce(const ReduceAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_reduce_kernel(backend);
 }
 
-std::vector<TensorDesc> Reduce::getOutputShapes(
+std::vector<TensorDesc> Reduce::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {reduce_output_shape(attrs_.axis, attrs_.keepdims, inputs)};

@@ -68,7 +68,7 @@ size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
     return backend::cpu::matmul_get_workspace_size(attrs_, inputs[0], inputs[1], outputs[0]);
 }
 
-std::vector<TensorDesc> MatMul::getOutputShapes(
+std::vector<TensorDesc> MatMul::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {matmul_output_shape(attrs_.transpose_a, attrs_.transpose_b, inputs)};

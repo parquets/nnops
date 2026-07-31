@@ -68,7 +68,7 @@ CumSum::CumSum(const CumSumAttributes& attrs, Backend backend)
     impl_->kernel_fn = resolve_cumsum_kernel(backend);
 }
 
-std::vector<TensorDesc> CumSum::getOutputShapes(
+std::vector<TensorDesc> CumSum::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {identity_output_shape(inputs)};

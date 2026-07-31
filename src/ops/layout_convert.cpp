@@ -78,7 +78,7 @@ LayoutConvert::LayoutConvert(const LayoutConvertAttributes& attrs,
     impl_->kernel_fn = resolve_layout_convert_kernel(backend);
 }
 
-std::vector<TensorDesc> LayoutConvert::getOutputShapes(
+std::vector<TensorDesc> LayoutConvert::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     NNOPS_ASSERT(inputs.size() == 1);
