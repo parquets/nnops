@@ -74,7 +74,7 @@ static void prepack_dwconv_weight(
         const int64_t w_shape[] = {C8, KH, KW, 8};
         packed_buf.resize(static_cast<size_t>(C8 * KH * KW * 8));
         packed_view = TensorView(std::span<const int64_t>(w_shape, 4), dtype,
-                                  packed_buf.data(), TensorLayout::NCHW);
+                                  packed_buf.data(), TensorLayout::PackedWeight);
     }
 
     // Packed bias
@@ -149,7 +149,7 @@ static void test_nchwc8_vs_ref(
     int64_t in_pitch = nchwc8_pitch(IW);
     int64_t in_pitch_elems = in_pitch / 4;
     std::vector<float> packed_in(static_cast<size_t>(N * C8 * IH * in_pitch_elems));
-    TensorView in_c8(in_shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(in_shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     // Prepack weight + bias
@@ -163,7 +163,7 @@ static void test_nchwc8_vs_ref(
     int64_t out_pitch = nchwc8_pitch(OW);
     int64_t out_pitch_elems = out_pitch / 4;
     std::vector<float> packed_out(static_cast<size_t>(N * C8 * OH * out_pitch_elems));
-    TensorView out_c8(oshape_ref, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape_ref, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     // For add_to: pre-fill output with 1.0
     if (attrs.add_to) {
@@ -218,7 +218,7 @@ NNOPS_TEST(dwconv_basic_no_pad) {
     // Pack input → NCHWC8
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     // Prepack weight
@@ -237,7 +237,7 @@ NNOPS_TEST(dwconv_basic_no_pad) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 1, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -274,7 +274,7 @@ NNOPS_TEST(dwconv_stride_2) {
 
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -291,7 +291,7 @@ NNOPS_TEST(dwconv_stride_2) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 1, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -328,7 +328,7 @@ NNOPS_TEST(dwconv_padding_1) {
 
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -345,7 +345,7 @@ NNOPS_TEST(dwconv_padding_1) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 1, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -386,7 +386,7 @@ NNOPS_TEST(dwconv_with_bias) {
     // Pack input
     int64_t in_pitch = nchwc8_pitch(4);
     std::vector<float> packed_in(static_cast<size_t>(C8 * 4 * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     // Prepack
@@ -409,7 +409,7 @@ NNOPS_TEST(dwconv_with_bias) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 1, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -446,7 +446,7 @@ NNOPS_TEST(dwconv_dilation) {
 
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -463,7 +463,7 @@ NNOPS_TEST(dwconv_dilation) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 1, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -497,7 +497,7 @@ NNOPS_TEST(dwconv_add_to) {
 
     int64_t in_pitch = nchwc8_pitch(4);
     std::vector<float> packed_in(static_cast<size_t>(C8 * 4 * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -516,7 +516,7 @@ NNOPS_TEST(dwconv_add_to) {
     int64_t out_pitch_elems = out_pitch / 4;
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch_elems), 1.0f);
     const int64_t oshape[] = {1, 1, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -558,7 +558,7 @@ NNOPS_TEST(dwconv_relu_epilogue) {
 
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -575,7 +575,7 @@ NNOPS_TEST(dwconv_relu_epilogue) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 2, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -627,7 +627,7 @@ NNOPS_TEST(dwconv_multi_channel) {
 
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -644,7 +644,7 @@ NNOPS_TEST(dwconv_multi_channel) {
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     const int64_t oshape[] = {1, 2, OH, OW};
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
@@ -710,7 +710,7 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
     // NCHWC8 path
     int64_t in_pitch = nchwc8_pitch(IW);
     std::vector<float> packed_in(static_cast<size_t>(C8 * IH * in_pitch / 4));
-    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCHWC8);
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::PackedWeightC8);
     pack_nchw_to_nchwc8(in_nchw, in_c8);
 
     std::vector<float> pw_buf(static_cast<size_t>(C8 * KH * KW * 8));
@@ -726,7 +726,7 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
 
     int64_t out_pitch = nchwc8_pitch(OW);
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
-    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::PackedWeightC8);
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 2, 2};
@@ -989,7 +989,7 @@ static void prepack_dwconv_weight_3d(
         const int64_t w_shape[] = {C8, KD, KH, KW, 8};
         packed_buf.resize(static_cast<size_t>(C8 * KD * KH * KW * 8));
         packed_view = TensorView(std::span<const int64_t>(w_shape, 5), dtype,
-                                  packed_buf.data(), TensorLayout::NCHW);
+                                  packed_buf.data(), TensorLayout::PackedWeight);
     }
 
     // Packed bias

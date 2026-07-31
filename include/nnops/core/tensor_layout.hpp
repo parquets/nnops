@@ -39,6 +39,9 @@ enum class TensorLayout : uint8_t {
     NCDHWC8   = 5,  ///< [N, ceil(C/8),  D, H, W, 8]
     NCDHWC16  = 6,  ///< [N, ceil(C/16), D, H, W, 16]  (int8 quant)
     NCDHWC32  = 7,  ///< [N, ceil(C/32), D, H, W, 32]  (AVX-512)
+
+    // ---- Prepacked weight (dense, last dim = 8 lanes) ----
+    PackedWeight = 8,  ///< [C8, (KD,) KH, KW, 8] — prepacked depthwise/conv weights
 };
 
 /// Returns the channel pack size for packed layouts, or 1 for planar layouts.
@@ -52,6 +55,7 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::NCDHWC16: return 16;
     case TensorLayout::NCHWC32:  return 32;
     case TensorLayout::NCDHWC32: return 32;
+    case TensorLayout::PackedWeight: return 1;
     }
     return 1;
 }
@@ -69,6 +73,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::NCHWC8:
     case TensorLayout::NCHWC16:
     case TensorLayout::NCHWC32:
+    case TensorLayout::PackedWeight:
         return 2;
     case TensorLayout::NCDHW:
     case TensorLayout::NCDHWC8:

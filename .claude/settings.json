@@ -99,6 +99,8 @@
       "Bash(grep -v '//\\\\|=\\\\|ins\\\\[')",
       "Bash(git mv *)",
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*dwconv_3d*\")",
+      "Bash(awk ' *)",
+      "Bash(mv tests/test_depthwise_conv_tmp.cpp tests/test_depthwise_conv.cpp)",
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*dwconv*:*depthwise*\")"
     ],
     "additionalDirectories": [

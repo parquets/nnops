@@ -262,14 +262,14 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
             const int64_t w_pitch = KW * 8 * elem_size;
             outputs[0] = TensorView(
                 std::span<const int64_t>(w_shape, 5), dtype,
-                nullptr, w_pitch, TensorLayout::NCHW);
+                nullptr, w_pitch, TensorLayout::PackedWeight);
         } else {
             // Packed weight: [C8, KH, KW, 8]
             const int64_t w_shape[] = {C8, KH, KW, 8};
             const int64_t w_pitch = KW * 8 * elem_size;
             outputs[0] = TensorView(
                 std::span<const int64_t>(w_shape, 4), dtype,
-                nullptr, w_pitch, TensorLayout::NCHW);
+                nullptr, w_pitch, TensorLayout::PackedWeight);
         }
 
         // Packed bias: [C8, 8]
@@ -278,7 +278,7 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
             const int64_t b_pitch = 8 * elem_size;
             outputs[1] = TensorView(
                 std::span<const int64_t>(b_shape, 2), dtype,
-                nullptr, b_pitch, TensorLayout::NCHW);
+                nullptr, b_pitch, TensorLayout::PackedWeight);
         }
     } else {
         // ---- Pack mode: fill the buffer ----
