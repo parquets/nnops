@@ -12,12 +12,12 @@
 #include "nnops/detail/shape_inference.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace nnops {
 
-using nnops::simd::s_load;
-using nnops::simd::s_store;
+using namespace simd;
 
 // Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
@@ -77,8 +77,13 @@ auto resolve_depthwise_conv_kernel(Backend backend) -> DepthwiseConv::Impl::Kern
 }
 
 // ============================================================
-// Prepack helpers — dtype-dispatched weight & bias packing (2D + 3D)
+// Prepack helpers — SIMD-optimized weight & bias packing (2D + 3D)
 // ============================================================
+//
+// Uses 8×8 SIMD transpose (same pattern as layout_convert.cpp):
+//   For each C8 block, process 8 kw positions at once:
+//     v_load 8 consecutive kw from each of 8 channels → v_transpose_8x8 → v_store.
+//   Partial C8 / remainder kw fall back to scalar per-position.
 
 template <typename T>
 void prepack_dwconv_weight_2d(const TensorView& weight_nchw,
@@ -88,22 +93,46 @@ void prepack_dwconv_weight_2d(const TensorView& weight_nchw,
     const int64_t KH = weight_nchw.shape(2);
     const int64_t KW = weight_nchw.shape(3);
     const int64_t C8 = (C + 7) / 8;
+    const int64_t ch_stride = KH * KW;
 
     const auto* src = weight_nchw.ptr<T>();
     auto* dst = packed_out.ptr<T>();
+    auto vzero = v_set1(src, 0);
 
     for (int64_t c8 = 0; c8 < C8; ++c8) {
+        int64_t c_base = c8 * 8;
         for (int64_t kh = 0; kh < KH; ++kh) {
-            for (int64_t kw = 0; kw < KW; ++kw) {
-                int64_t dst_base = (c8 * KH * KW + kh * KW + kw) * 8;
-                int64_t c_base = c8 * 8;
+            int64_t kw = 0;
+            // Process 8 kw at a time with 8×8 transpose
+            for (; kw + 8 <= KW; kw += 8) {
+                auto c0 = c_base + 0 < C ? v_load(&src[(c_base + 0) * ch_stride + kh * KW + kw]) : vzero;
+                auto c1 = c_base + 1 < C ? v_load(&src[(c_base + 1) * ch_stride + kh * KW + kw]) : vzero;
+                auto c2 = c_base + 2 < C ? v_load(&src[(c_base + 2) * ch_stride + kh * KW + kw]) : vzero;
+                auto c3 = c_base + 3 < C ? v_load(&src[(c_base + 3) * ch_stride + kh * KW + kw]) : vzero;
+                auto c4 = c_base + 4 < C ? v_load(&src[(c_base + 4) * ch_stride + kh * KW + kw]) : vzero;
+                auto c5 = c_base + 5 < C ? v_load(&src[(c_base + 5) * ch_stride + kh * KW + kw]) : vzero;
+                auto c6 = c_base + 6 < C ? v_load(&src[(c_base + 6) * ch_stride + kh * KW + kw]) : vzero;
+                auto c7 = c_base + 7 < C ? v_load(&src[(c_base + 7) * ch_stride + kh * KW + kw]) : vzero;
+
+                v_transpose_8x8(c0, c1, c2, c3, c4, c5, c6, c7);
+
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 0) * 8], c0);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 1) * 8], c1);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 2) * 8], c2);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 3) * 8], c3);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 4) * 8], c4);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 5) * 8], c5);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 6) * 8], c6);
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw + 7) * 8], c7);
+            }
+            // Remainder kw: scalar per-position
+            for (; kw < KW; ++kw) {
+                T tmp[8] = {};
                 for (int64_t lane = 0; lane < 8; ++lane) {
                     int64_t c = c_base + lane;
-                    float val = (c < C)
-                        ? s_load(&src[c * KH * KW + kh * KW + kw])
-                        : 0.0f;
-                    s_store(&dst[dst_base + lane], val);
+                    if (c < C) tmp[lane] = src[c * ch_stride + kh * KW + kw];
                 }
+                v_store(&dst[(c8 * KH * KW + kh * KW + kw) * 8], v_load(tmp));
             }
         }
     }
@@ -118,23 +147,45 @@ void prepack_dwconv_weight_3d(const TensorView& weight_ncdhw,
     const int64_t KH = weight_ncdhw.shape(3);
     const int64_t KW = weight_ncdhw.shape(4);
     const int64_t C8 = (C + 7) / 8;
+    const int64_t ch_stride = KD * KH * KW;
 
     const auto* src = weight_ncdhw.ptr<T>();
     auto* dst = packed_out.ptr<T>();
+    auto vzero = v_set1(src, 0);
 
     for (int64_t c8 = 0; c8 < C8; ++c8) {
+        int64_t c_base = c8 * 8;
         for (int64_t kd = 0; kd < KD; ++kd) {
             for (int64_t kh = 0; kh < KH; ++kh) {
-                for (int64_t kw = 0; kw < KW; ++kw) {
-                    int64_t dst_base = (c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw) * 8;
-                    int64_t c_base = c8 * 8;
+                int64_t kw = 0;
+                for (; kw + 8 <= KW; kw += 8) {
+                    auto c0 = c_base + 0 < C ? v_load(&src[(c_base + 0) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c1 = c_base + 1 < C ? v_load(&src[(c_base + 1) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c2 = c_base + 2 < C ? v_load(&src[(c_base + 2) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c3 = c_base + 3 < C ? v_load(&src[(c_base + 3) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c4 = c_base + 4 < C ? v_load(&src[(c_base + 4) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c5 = c_base + 5 < C ? v_load(&src[(c_base + 5) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c6 = c_base + 6 < C ? v_load(&src[(c_base + 6) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+                    auto c7 = c_base + 7 < C ? v_load(&src[(c_base + 7) * ch_stride + kd * KH * KW + kh * KW + kw]) : vzero;
+
+                    v_transpose_8x8(c0, c1, c2, c3, c4, c5, c6, c7);
+
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 0) * 8], c0);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 1) * 8], c1);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 2) * 8], c2);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 3) * 8], c3);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 4) * 8], c4);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 5) * 8], c5);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 6) * 8], c6);
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw + 7) * 8], c7);
+                }
+                for (; kw < KW; ++kw) {
+                    T tmp[8] = {};
                     for (int64_t lane = 0; lane < 8; ++lane) {
                         int64_t c = c_base + lane;
-                        float val = (c < C)
-                            ? s_load(&src[c * KD * KH * KW + kd * KH * KW + kh * KW + kw])
-                            : 0.0f;
-                        s_store(&dst[dst_base + lane], val);
+                        if (c < C) tmp[lane] = src[c * ch_stride + kd * KH * KW + kh * KW + kw];
                     }
+                    v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw) * 8], v_load(tmp));
                 }
             }
         }
@@ -153,10 +204,17 @@ void prepack_dwconv_bias_impl(const TensorView& bias_nchw,
 
     for (int64_t c8 = 0; c8 < C8; ++c8) {
         int64_t c_base = c8 * 8;
-        for (int64_t lane = 0; lane < 8; ++lane) {
-            int64_t c = c_base + lane;
-            float val = (c < C) ? s_load(&src[c]) : 0.0f;
-            s_store(&dst[c8 * 8 + lane], val);
+        int64_t valid = std::min<int64_t>(8, C - c_base);
+        if (valid == 8) {
+            // Full C8: single vector load/store
+            auto v = v_load(&src[c_base]);
+            v_store(&dst[c8 * 8], v);
+        } else {
+            // Partial C8: scalar fallback
+            T tmp[8] = {};
+            for (int64_t lane = 0; lane < valid; ++lane)
+                tmp[lane] = src[c_base + lane];
+            v_store(&dst[c8 * 8], v_load(tmp));
         }
     }
 }
