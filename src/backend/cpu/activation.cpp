@@ -72,8 +72,10 @@ void activation_impl(const ActivationAttributes& attrs,
 
     // Layout: treat the innermost dimension as contiguous "row" elements,
     // and advance by row_stride_elems between rows (accounts for pitch padding).
-    const int64_t last_dim = (rank >= 1) ? input.shape(rank - 1) : 1;
-    const int64_t num_rows = total / last_dim;
+    // For packed layouts (NCHWC8 etc.), last_dim = W * pack covers all C8 lanes
+    // and num_rows = total_rows() accounts for channel block rounding.
+    const int64_t last_dim = (rank >= 1) ? input.shape(rank - 1) * input.channel_pack_size() : 1;
+    const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;
     const int64_t in_row_stride = input.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
 

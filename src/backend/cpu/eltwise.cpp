@@ -70,9 +70,11 @@ void eltwise_impl(const EltwiseAttributes& attrs,
     NNOPS_ASSERT(A.numel() == B.numel());
     NNOPS_ASSERT(output.numel() == total);
 
-    // Row-by-row layout (pitch-aware)
-    const int64_t last_dim = (rank >= 1) ? A.shape(rank - 1) : 1;
-    const int64_t num_rows = total / last_dim;
+    // Row-by-row layout (pitch-aware).
+    // For packed layouts (NCHWC8 etc.), last_dim = W * pack covers all C8 lanes
+    // and num_rows = total_rows() accounts for channel block rounding.
+    const int64_t last_dim = (rank >= 1) ? A.shape(rank - 1) * A.channel_pack_size() : 1;
+    const int64_t num_rows = (rank >= 2) ? A.total_rows() : total / last_dim;
     const int64_t a_row_stride = A.row_stride_elems();
     const int64_t b_row_stride = B.row_stride_elems();
     const int64_t o_row_stride = output.row_stride_elems();

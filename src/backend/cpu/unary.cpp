@@ -69,9 +69,11 @@ void unary_impl(const UnaryAttributes& attrs,
     const int64_t rank = input.rank();
     NNOPS_ASSERT(output.numel() == total);
 
-    // Row-by-row layout (pitch-aware)
-    const int64_t last_dim = (rank >= 1) ? input.shape(rank - 1) : 1;
-    const int64_t num_rows = total / last_dim;
+    // Row-by-row layout (pitch-aware).
+    // For packed layouts (NCHWC8 etc.), last_dim = W * pack covers all C8 lanes
+    // and num_rows = total_rows() accounts for channel block rounding.
+    const int64_t last_dim = (rank >= 1) ? input.shape(rank - 1) * input.channel_pack_size() : 1;
+    const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;
     const int64_t in_row_stride = input.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
 

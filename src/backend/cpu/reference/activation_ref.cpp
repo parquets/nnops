@@ -22,20 +22,52 @@ static void element_wise_compute(TensorView& output,
                                   F func,
                                   bool add_to)
 {
-    const int64_t N = input.numel();
+    const int64_t rank = input.rank();
+
+    // Rank 0 (scalar) or rank 1 (flat): use direct indexing
+    if (rank < 2) {
+        const int64_t N = (rank == 0) ? 1 : input.numel();
+        const auto* in_ptr  = input.ptr<float>();
+        auto* out_ptr = output.ptr<float>();
+        const auto write = [&](int64_t i, float v) {
+            out_ptr[i] = add_to ? out_ptr[i] + v : v;
+        };
+        if (ctx.cpu_parallel_for) {
+            ctx.cpu_parallel_for(0, N,
+                [&](int64_t idx) { write(idx, func(in_ptr[idx])); });
+        } else {
+            for (int64_t i = 0; i < N; ++i) {
+                write(i, func(in_ptr[i]));
+            }
+        }
+        return;
+    }
+
+    // Rank >= 2: row-by-row iteration, respecting pitch for packed layouts
+    const int64_t num_rows = input.total_rows();
+    const int64_t last_dim = input.shape(rank - 1) * input.channel_pack_size();
+    const int64_t in_rs = input.row_stride_elems();
+    const int64_t out_rs = output.row_stride_elems();
     const auto* in_ptr  = input.ptr<float>();
     auto* out_ptr = output.ptr<float>();
 
-    const auto write = [&](int64_t i, float v) {
-        out_ptr[i] = add_to ? out_ptr[i] + v : v;
-    };
-
     if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N,
-            [&](int64_t idx) { write(idx, func(in_ptr[idx])); });
+        ctx.cpu_parallel_for(0, num_rows, [&](int64_t r) {
+            const float* in_row = in_ptr + r * in_rs;
+            float* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float v = func(in_row[i]);
+                out_row[i] = add_to ? out_row[i] + v : v;
+            }
+        });
     } else {
-        for (int64_t i = 0; i < N; ++i) {
-            write(i, func(in_ptr[i]));
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const float* in_row = in_ptr + r * in_rs;
+            float* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float v = func(in_row[i]);
+                out_row[i] = add_to ? out_row[i] + v : v;
+            }
         }
     }
 }
