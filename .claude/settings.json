@@ -94,7 +94,9 @@
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"pooling*\")",
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"pooling_nchwc8_max_stride2:pooling_nchwc8_avg_padding\")",
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*full_c8*\")",
-      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*direct_nchwc8*\")"
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*direct_nchwc8*\")",
+      "Bash(grep -n 'TensorView.*{.*,' d:/vscode/nnops/tests/test_grid_sample.cpp)",
+      "Bash(grep -v '//\\\\|=\\\\|ins\\\\[')"
     ],
     "additionalDirectories": [
       "d:\\vscode\\nnops\\src\\backend\\cpu",
