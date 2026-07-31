@@ -2,7 +2,7 @@
 /// @brief Tests for shape inference across all 16 operator types.
 ///
 /// Covers:
-///   - Conv2D / Conv3D / DepthwiseConv2D: NOTSET, SAME_UPPER, VALID, grouped, strided
+///   - Conv2D / Conv3D / DepthwiseConv: NOTSET, SAME_UPPER, VALID, grouped, strided
 ///   - Pooling: 2D/3D, auto_pad modes
 ///   - Linear / MatMul: basic 2D, batched, broadcast, transposed
 ///   - Attention: merged-heads and per-head layouts
@@ -14,7 +14,7 @@
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/conv3d.hpp"
-#include "nnops/ops/depthwise_conv2d.hpp"
+#include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/ops/pooling.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
@@ -167,15 +167,15 @@ NNOPS_TEST(shape_conv3d_basic) {
 }
 
 // ============================================================
-// DepthwiseConv2D
+// DepthwiseConv
 // ============================================================
 
-NNOPS_TEST(shape_depthwise_conv2d) {
-    auto op = DepthwiseConv2D::create(Backend::CPU);
-    auto& attrs = const_cast<DepthwiseConv2DAttributes&>(op->attributes());
-    attrs.kernel_size = {3, 3};
-    attrs.stride  = {2, 2};
-    attrs.padding = {1, 1};
+NNOPS_TEST(shape_depthwise_conv_2d) {
+    auto op = DepthwiseConv::create(Backend::CPU);
+    auto& attrs = const_cast<DepthwiseConvAttributes&>(op->attributes());
+    attrs.kernel_size = {1, 3, 3};
+    attrs.stride  = {1, 2, 2};
+    attrs.padding = {1, 1, 1};
 
     auto inputs = std::vector<TensorDesc>{
         td({1, 32, 112, 112}),
@@ -186,6 +186,27 @@ NNOPS_TEST(shape_depthwise_conv2d) {
     NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(32));   // C unchanged
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(56));   // OH = (112+2-3)/2+1
     NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t(56));
+}
+
+NNOPS_TEST(shape_depthwise_conv_3d) {
+    auto op = DepthwiseConv::create(Backend::CPU);
+    auto& attrs = const_cast<DepthwiseConvAttributes&>(op->attributes());
+    attrs.kernel_size = {3, 3, 3};
+    attrs.stride  = {1, 2, 2};
+    attrs.padding = {1, 1, 1};
+
+    auto inputs = std::vector<TensorDesc>{
+        td({1, 32, 16, 112, 112}),
+        td({32, 1, 3, 3, 3})
+    };
+    auto outs = op->getOutputShapes(inputs);
+
+    NNOPS_EXPECT_EQ(outs[0].rank, int64_t(5));
+    NNOPS_EXPECT_EQ(outs[0].dims[0], int64_t(1));     // N
+    NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(32));    // C unchanged
+    NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t(16));    // OD = (16+2-3)/1+1
+    NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t(56));    // OH = (112+2-3)/2+1
+    NNOPS_EXPECT_EQ(outs[0].dims[4], int64_t(56));    // OW = (112+2-3)/2+1
 }
 
 // ============================================================

@@ -1,11 +1,11 @@
-/// Unit tests for DepthwiseConv2D operator — NCHWC8 only.
+/// Unit tests for DepthwiseConv operator — NCHWC8 only.
 ///
 /// All tests explicitly go through the NCHWC8 path:
 ///   NCHW in → pack_nchw_to_nchwc8 → dwconv(NCHWC8, prepacked_w) → unpack → compare
 ///
-/// The NCHW scalar reference (depthwise_conv2d_ref) is the golden ground truth.
+/// The NCHW scalar reference (depthwise_conv_ref) is the golden ground truth.
 
-#include "nnops/ops/depthwise_conv2d.hpp"
+#include "nnops/ops/depthwise_conv.hpp"
 #include "backend/cpu/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
@@ -18,14 +18,14 @@ using namespace nnops;
 
 // Forward declare the reference kernel (NCHW scalar, ground truth).
 namespace nnops::backend::cpu::reference {
-    void depthwise_conv2d_ref(const DepthwiseConv2DAttributes& attrs,
+    void depthwise_conv_ref(const DepthwiseConvAttributes& attrs,
                                TensorView& output,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,
                                void* workspace);
 }
 namespace nnops::backend::cpu {
-    void depthwise_conv2d_cpu(const DepthwiseConv2DAttributes& attrs,
+    void depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
                                TensorView& output,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,
@@ -86,7 +86,7 @@ static void prepack_dwconv_weight(
     }
 
     // Use operator's prepack interface
-    auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+    auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
     if (has_bias) {
         const TensorView w_arr[] = {weight_nchw, *bias_nchw};
         TensorView pw_arr[] = {packed_view, bias_view};
@@ -103,15 +103,15 @@ static void prepack_dwconv_weight(
 static void test_nchwc8_vs_ref(
     const std::vector<int64_t>& in_shape,
     const std::vector<int64_t>& w_shape,
-    DepthwiseConv2DAttributes attrs,
+    DepthwiseConvAttributes attrs,
     bool has_bias = false)
 {
     const int64_t N = in_shape[0], C = in_shape[1], IH = in_shape[2], IW = in_shape[3];
     const int64_t C8 = (C + 7) / 8;
-    const int64_t KH = attrs.kernel_size[0], KW = attrs.kernel_size[1];
-    const int64_t SH = attrs.stride[0], SW = attrs.stride[1];
-    const int64_t DH = attrs.dilation[0], DW = attrs.dilation[1];
-    const int64_t PH = attrs.padding[0], PW = attrs.padding[1];
+    const int64_t KH = attrs.kernel_size[1], KW = attrs.kernel_size[2];
+    const int64_t SH = attrs.stride[1], SW = attrs.stride[2];
+    const int64_t DH = attrs.dilation[1], DW = attrs.dilation[2];
+    const int64_t PH = attrs.padding[1], PW = attrs.padding[2];
     auto [OH, OW] = dwconv_out_2d(IH, IW, KH, KW, SH, SW, PH, PW, DH, DW);
 
     // Random NCHW input + weight
@@ -136,11 +136,11 @@ static void test_nchwc8_vs_ref(
         ComputeContext ctx;
         if (has_bias) {
             const TensorView ref_arr[] = {in_nchw, w_nchw, b_nchw};
-            backend::cpu::reference::depthwise_conv2d_ref(
+            backend::cpu::reference::depthwise_conv_ref(
                 attrs, out_ref, ref_arr, ctx, nullptr);
         } else {
             const TensorView ref_arr[] = {in_nchw, w_nchw};
-            backend::cpu::reference::depthwise_conv2d_ref(
+            backend::cpu::reference::depthwise_conv_ref(
                 attrs, out_ref, ref_arr, ctx, nullptr);
         }
     }
@@ -184,10 +184,10 @@ static void test_nchwc8_vs_ref(
         ComputeContext ctx;
         if (has_bias) {
             const TensorView ins_arr[] = {in_c8, pw_view, pb_view};
-            backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
+            backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
         } else {
             const TensorView ins_arr[] = {in_c8, pw_view};
-            backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
+            backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
         }
     }
 
@@ -227,7 +227,7 @@ NNOPS_TEST(dwconv_basic_no_pad) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -239,15 +239,15 @@ NNOPS_TEST(dwconv_basic_no_pad) {
     const int64_t oshape[] = {1, 1, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {1, 0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     // Unpack
@@ -282,7 +282,7 @@ NNOPS_TEST(dwconv_stride_2) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -293,15 +293,15 @@ NNOPS_TEST(dwconv_stride_2) {
     const int64_t oshape[] = {1, 1, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {2, 2};
-    attrs.padding = {0, 0};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
+    attrs.stride = {1, 2, 2};
+    attrs.padding = {1, 0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(4);
@@ -336,7 +336,7 @@ NNOPS_TEST(dwconv_padding_1) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -347,15 +347,15 @@ NNOPS_TEST(dwconv_padding_1) {
     const int64_t oshape[] = {1, 1, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {1, 1};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {1, 1, 1};
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(4);
@@ -399,7 +399,7 @@ NNOPS_TEST(dwconv_with_bias) {
     TensorView pb_view(std::span<const int64_t>(pb_shape, 2), DataType::f32,
                         pb_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw, b_nchw};
         TensorView pw_arr[] = {pw_view, pb_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -411,15 +411,15 @@ NNOPS_TEST(dwconv_with_bias) {
     const int64_t oshape[] = {1, 1, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {1, 0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view, pb_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(4);
@@ -454,7 +454,7 @@ NNOPS_TEST(dwconv_dilation) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -465,16 +465,16 @@ NNOPS_TEST(dwconv_dilation) {
     const int64_t oshape[] = {1, 1, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
     attrs.stride   = {1, 1};
-    attrs.dilation = {2, 2};
+    attrs.dilation = {1, 2, 2};
     attrs.padding  = {0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(1);
@@ -505,7 +505,7 @@ NNOPS_TEST(dwconv_add_to) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -518,16 +518,16 @@ NNOPS_TEST(dwconv_add_to) {
     const int64_t oshape[] = {1, 1, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {1, 0, 0};
     attrs.add_to = true;
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(4);
@@ -566,7 +566,7 @@ NNOPS_TEST(dwconv_relu_epilogue) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -577,16 +577,16 @@ NNOPS_TEST(dwconv_relu_epilogue) {
     const int64_t oshape[] = {1, 2, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
     attrs.stride  = {1, 1};
-    attrs.padding = {0, 0};
+    attrs.padding = {1, 0, 0};
     attrs.epilogue.type = EpilogueActivateType::Relu;
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(8);
@@ -635,7 +635,7 @@ NNOPS_TEST(dwconv_multi_channel) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -646,15 +646,15 @@ NNOPS_TEST(dwconv_multi_channel) {
     const int64_t oshape[] = {1, 2, OH, OW};
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {3, 3};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 3, 3};
     attrs.stride  = {1, 1};
-    attrs.padding = {0, 0};
+    attrs.padding = {1, 0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
     }
 
     std::vector<float> result(2);
@@ -702,8 +702,8 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
     {
         ComputeContext ctx;
         const TensorView ref_arr[] = {in_nchw, w_nchw};
-        backend::cpu::reference::depthwise_conv2d_ref(
-            DepthwiseConv2DAttributes{{2, 2}, {1, 1}, {1, 1}, {0, 0}},
+        backend::cpu::reference::depthwise_conv_ref(
+            DepthwiseConvAttributes{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}},
             out_ref, ref_arr, ctx, nullptr);
     }
 
@@ -718,7 +718,7 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
     TensorView pw_view(std::span<const int64_t>(pw_shape, 4), DataType::f32,
                         pw_buf.data(), TensorLayout::NCHW);
     {
-        auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
         const TensorView w_arr[] = {w_nchw};
         TensorView pw_arr[] = {pw_view};
         op->prepackWeights(w_arr, pw_arr);
@@ -728,15 +728,15 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
     std::vector<float> packed_out(static_cast<size_t>(C8 * OH * out_pitch / 4));
     TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {2, 2};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 2, 2};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {0, 0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins_arr[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
     }
 
     std::vector<float> result(32);
@@ -755,36 +755,36 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_basic) {
     test_nchwc8_vs_ref({2, 8, 16, 16}, {8, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_stride2) {
     test_nchwc8_vs_ref({1, 8, 12, 12}, {8, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_stride2_odd) {
     test_nchwc8_vs_ref({1, 4, 7, 7}, {4, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {2, 2}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_padding) {
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {1, 1}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_dilation) {
     test_nchwc8_vs_ref({1, 4, 10, 10}, {4, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {2, 2}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_bias) {
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}}, true);
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}}, true);
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_add_to) {
-    DepthwiseConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {0, 0}};
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}};
     attrs.add_to = true;
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 3, 3}, attrs);
 }
@@ -792,43 +792,43 @@ NNOPS_TEST(dwconv_nchwc8_vs_ref_add_to) {
 NNOPS_TEST(dwconv_nchwc8_vs_ref_partial_c8) {
     // C=3 → partial C8 (valid_lanes=3)
     test_nchwc8_vs_ref({1, 3, 8, 8}, {3, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_partial_c8_bias) {
     test_nchwc8_vs_ref({1, 5, 8, 8}, {5, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}}, true);
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}}, true);
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_single_channel) {
     test_nchwc8_vs_ref({1, 1, 8, 8}, {1, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_multi_c8) {
     // C=17 → 3 C8 blocks (2 full + 1 partial)
     test_nchwc8_vs_ref({1, 17, 8, 8}, {17, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_small_kernel) {
     test_nchwc8_vs_ref({1, 8, 16, 16}, {8, 1, 1, 1},
-        DepthwiseConv2DAttributes{{1, 1}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_batch) {
     test_nchwc8_vs_ref({4, 8, 16, 16}, {8, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_large) {
     test_nchwc8_vs_ref({1, 16, 32, 32}, {16, 1, 3, 3},
-        DepthwiseConv2DAttributes{{3, 3}, {1, 1}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_1x1_kernel_stride2) {
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 1, 1},
-        DepthwiseConv2DAttributes{{1, 1}, {2, 2}, {1, 1}, {0, 0}});
+        DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {1, 0, 0}});
 }
 
 // ============================================================
@@ -872,15 +872,15 @@ NNOPS_TEST(dwconv_direct_nchwc8_data) {
     int64_t out_pitch = ROW * 4;
     TensorView out_c8(oshape, DataType::f32, out_c8_buf.data(), out_pitch, TensorLayout::NCHWC8);
 
-    DepthwiseConv2DAttributes attrs;
-    attrs.kernel_size = {1, 1};
-    attrs.stride = {1, 1};
-    attrs.padding = {0, 0};
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {1, 1, 1};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {0, 0, 0};
 
     {
         ComputeContext ctx;
         const TensorView ins_arr[] = {in_c8, pw_view};
-        backend::cpu::depthwise_conv2d_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
     }
 
     // Manual check: result for channel c at (oh, ow) = in[oh][ow][c] * w[c][0][0]
@@ -907,7 +907,7 @@ NNOPS_TEST(dwconv_prepack_query) {
     std::vector<float> w_buf(45);
     TensorView weight(wshape, DataType::f32, w_buf.data());
 
-    auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+    auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
     TensorView packed_w;
     {
         const TensorView w_arr[] = {weight};
@@ -933,7 +933,7 @@ NNOPS_TEST(dwconv_prepack_query_bias) {
     TensorView weight(wshape, DataType::f32, w_buf.data());
     TensorView bias(bshape, DataType::f32, b_buf.data());
 
-    auto op = DepthwiseConv2D::create(DepthwiseConv2DAttributes{});
+    auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
     TensorView packed_w, packed_b;
     {
         const TensorView w_arr[] = {weight, bias};
@@ -947,4 +947,294 @@ NNOPS_TEST(dwconv_prepack_query_bias) {
     NNOPS_EXPECT_EQ(packed_w.shape(0), 2);
     NNOPS_EXPECT_EQ(packed_b.shape(0), 2);
     NNOPS_EXPECT_EQ(packed_b.shape(1), 8);
+}
+
+// ============================================================
+// 3D helpers
+// ============================================================
+
+/// Compute output spatial dims for 3D depthwise convolution.
+inline std::tuple<int64_t, int64_t, int64_t> dwconv_out_3d(
+    int64_t ID, int64_t IH, int64_t IW,
+    int64_t KD, int64_t KH, int64_t KW,
+    int64_t SD, int64_t SH, int64_t SW,
+    int64_t PD, int64_t PH, int64_t PW,
+    int64_t DD = 1, int64_t DH = 1, int64_t DW = 1)
+{
+    int64_t OD = (ID + 2 * PD - DD * (KD - 1) - 1) / SD + 1;
+    int64_t OH = (IH + 2 * PH - DH * (KH - 1) - 1) / SH + 1;
+    int64_t OW = (IW + 2 * PW - DW * (KW - 1) - 1) / SW + 1;
+    return {OD, OH, OW};
+}
+
+/// Prepack NCDHW weight [C, 1, KD, KH, KW] → dense [C8, KD, KH, KW, 8].
+static void prepack_dwconv_weight_3d(
+    const TensorView& weight_ncdhw,
+    std::vector<float>& packed_buf,
+    TensorView& packed_view,
+    bool has_bias,
+    const TensorView* bias_nchw,
+    std::vector<float>& bias_buf,
+    TensorView& bias_view)
+{
+    const int64_t C  = weight_ncdhw.shape(0);
+    const int64_t KD = weight_ncdhw.shape(2);
+    const int64_t KH = weight_ncdhw.shape(3);
+    const int64_t KW = weight_ncdhw.shape(4);
+    const int64_t C8 = (C + 7) / 8;
+    const DataType dtype = weight_ncdhw.data_type();
+
+    // Packed weight
+    {
+        const int64_t w_shape[] = {C8, KD, KH, KW, 8};
+        packed_buf.resize(static_cast<size_t>(C8 * KD * KH * KW * 8));
+        packed_view = TensorView(std::span<const int64_t>(w_shape, 5), dtype,
+                                  packed_buf.data(), TensorLayout::NCHW);
+    }
+
+    // Packed bias
+    if (has_bias) {
+        const int64_t b_shape[] = {C8, 8};
+        bias_buf.resize(static_cast<size_t>(C8 * 8));
+        bias_view = TensorView(std::span<const int64_t>(b_shape, 2), dtype,
+                                bias_buf.data(), TensorLayout::NCHW);
+    }
+
+    // Use operator's prepack interface
+    auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
+    if (has_bias) {
+        const TensorView w_arr[] = {weight_ncdhw, *bias_nchw};
+        TensorView pw_arr[] = {packed_view, bias_view};
+        op->prepackWeights(w_arr, pw_arr);
+    } else {
+        const TensorView w_arr[] = {weight_ncdhw};
+        TensorView pw_arr[] = {packed_view};
+        op->prepackWeights(w_arr, pw_arr);
+    }
+}
+
+/// Generic 3D NCDHWC8 roundtrip test.
+static void test_ncdhwc8_vs_ref(
+    const std::vector<int64_t>& in_shape,
+    const std::vector<int64_t>& w_shape,
+    DepthwiseConvAttributes attrs,
+    bool has_bias = false)
+{
+    const int64_t N = in_shape[0], C = in_shape[1];
+    const int64_t ID = in_shape[2], IH = in_shape[3], IW = in_shape[4];
+    const int64_t C8 = (C + 7) / 8;
+    const int64_t KD = attrs.kernel_size[0], KH = attrs.kernel_size[1], KW = attrs.kernel_size[2];
+    const int64_t SD = attrs.stride[0], SH = attrs.stride[1], SW = attrs.stride[2];
+    const int64_t DD = attrs.dilation[0], DH = attrs.dilation[1], DW = attrs.dilation[2];
+    const int64_t PD = attrs.padding[0], PH = attrs.padding[1], PW = attrs.padding[2];
+    auto [OD, OH, OW] = dwconv_out_3d(ID, IH, IW, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW);
+
+    // Random NCDHW input + weight
+    auto [in_vec, in_ncdhw] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_ncdhw]  = test::make_random_tensor(w_shape);
+    std::vector<float> b_vec;
+    TensorView b_nchw;
+    if (has_bias) {
+        auto p = test::make_random_tensor({C});
+        b_vec = std::move(p.first);
+        b_nchw = p.second;
+    }
+
+    // NCDHW scalar reference (golden)
+    std::vector<float> ref_out(static_cast<size_t>(N * C * OD * OH * OW));
+    const std::vector<int64_t> oshape_ref = {N, C, OD, OH, OW};
+    TensorView out_ref(oshape_ref, DataType::f32, ref_out.data(), TensorLayout::NCDHW);
+    if (attrs.add_to) {
+        for (auto& v : ref_out) v = 1.0f;
+    }
+    {
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ref_arr[] = {in_ncdhw, w_ncdhw, b_nchw};
+            backend::cpu::reference::depthwise_conv_ref(
+                attrs, out_ref, ref_arr, ctx, nullptr);
+        } else {
+            const TensorView ref_arr[] = {in_ncdhw, w_ncdhw};
+            backend::cpu::reference::depthwise_conv_ref(
+                attrs, out_ref, ref_arr, ctx, nullptr);
+        }
+    }
+
+    // Pack input to NCDHWC8
+    int64_t in_pitch = nchwc8_pitch(IW);
+    int64_t in_pitch_elems = in_pitch / 4;
+    int64_t in_d_elems = IH * in_pitch_elems;
+    std::vector<float> packed_in(static_cast<size_t>(N * C8 * ID * in_d_elems));
+    TensorView in_c8(in_shape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCDHWC8);
+    pack_ncdhw_to_ncdhwc8(in_ncdhw, in_c8);
+
+    // Prepack weight + bias
+    std::vector<float> pw_buf, pb_buf;
+    TensorView pw_view, pb_view;
+    prepack_dwconv_weight_3d(w_ncdhw, pw_buf, pw_view,
+                               has_bias, has_bias ? &b_nchw : nullptr,
+                               pb_buf, pb_view);
+
+    // NCDHWC8 output
+    int64_t out_pitch = nchwc8_pitch(OW);
+    int64_t out_pitch_elems = out_pitch / 4;
+    int64_t out_d_elems = OH * out_pitch_elems;
+    std::vector<float> packed_out(static_cast<size_t>(N * C8 * OD * out_d_elems));
+    TensorView out_c8(oshape_ref, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCDHWC8);
+
+    // For add_to: pre-fill output with 1.0
+    if (attrs.add_to) {
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t c8i = 0; c8i < C8; ++c8i) {
+                for (int64_t od = 0; od < OD; ++od) {
+                    for (int64_t oh = 0; oh < OH; ++oh) {
+                        float* row = packed_out.data() + ((n * C8 + c8i) * OD + od) * out_d_elems + oh * out_pitch_elems;
+                        for (int64_t ow = 0; ow < OW; ++ow)
+                            for (int64_t l = 0; l < 8; ++l)
+                                row[ow * 8 + l] = 1.0f;
+                    }
+                }
+            }
+        }
+    }
+
+    // Run backend
+    {
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ins_arr[] = {in_c8, pw_view, pb_view};
+            backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
+        } else {
+            const TensorView ins_arr[] = {in_c8, pw_view};
+            backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins_arr, ctx, nullptr);
+        }
+    }
+
+    // Unpack and compare
+    std::vector<float> result(static_cast<size_t>(N * C * OD * OH * OW));
+    TensorView res_ncdhw(oshape_ref, DataType::f32, result.data(), TensorLayout::NCDHW);
+    unpack_ncdhwc8_to_ncdhw(out_c8, res_ncdhw);
+    NNOPS_EXPECT_TRUE(test::allclose(res_ncdhw, out_ref, 1e-4f, 1e-4f));
+}
+
+// ============================================================
+// 3D hand-verified small test
+// ============================================================
+
+NNOPS_TEST(dwconv_3d_basic) {
+    // 1x2x3x3x3 input, 1x2x2x2x2 kernel (KD=2, KH=2, KW=2)
+    // C=2, all-ones input, all-0.5 kernel, stride=1, pad=0
+    // Each output = 2*2*2 * 1.0 * 0.5 = 8 * 0.5 = 4.0
+    const int64_t ishape[] = {1, 2, 3, 3, 3};
+    const int64_t wshape[] = {2, 1, 2, 2, 2};
+    const int64_t C = 2, C8 = 1, ID = 3, IH = 3, IW = 3;
+    const int64_t KD = 2, KH = 2, KW = 2;
+    const int64_t OD = 2, OH = 2, OW = 2;  // (3-2)/1+1 = 2
+
+    std::vector<float> in_buf(54, 1.0f);   // 1*2*3*3*3
+    std::vector<float> w_buf(16, 0.5f);     // 2*1*2*2*2
+
+    TensorView in_ncdhw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCDHW);
+    TensorView w_ncdhw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCDHW);
+
+    // NCDHW reference
+    std::vector<float> ref_buf(16);  // 1*2*2*2*2
+    const int64_t oshape[] = {1, 2, OD, OH, OW};
+    TensorView out_ref(oshape, DataType::f32, ref_buf.data(), TensorLayout::NCDHW);
+    {
+        ComputeContext ctx;
+        DepthwiseConvAttributes attrs;
+        attrs.kernel_size = {KD, KH, KW};
+        attrs.stride = {1, 1, 1};
+        attrs.padding = {0, 0, 0};
+        const TensorView ref_arr[] = {in_ncdhw, w_ncdhw};
+        backend::cpu::reference::depthwise_conv_ref(attrs, out_ref, ref_arr, ctx, nullptr);
+    }
+
+    // Pack input → NCDHWC8
+    int64_t in_pitch = nchwc8_pitch(IW);
+    int64_t in_pitch_elems = in_pitch / 4;
+    int64_t in_d_elems = IH * in_pitch_elems;
+    std::vector<float> packed_in(static_cast<size_t>(C8 * ID * in_d_elems));
+    TensorView in_c8(ishape, DataType::f32, packed_in.data(), in_pitch, TensorLayout::NCDHWC8);
+    pack_ncdhw_to_ncdhwc8(in_ncdhw, in_c8);
+
+    // Prepack weight
+    std::vector<float> pw_buf(static_cast<size_t>(C8 * KD * KH * KW * 8));
+    const int64_t pw_shape[] = {C8, KD, KH, KW, 8};
+    TensorView pw_view(std::span<const int64_t>(pw_shape, 5), DataType::f32,
+                        pw_buf.data(), TensorLayout::NCHW);
+    {
+        auto op = DepthwiseConv::create(DepthwiseConvAttributes{});
+        const TensorView w_arr[] = {w_ncdhw};
+        TensorView pw_arr[] = {pw_view};
+        op->prepackWeights(w_arr, pw_arr);
+    }
+
+    // Run
+    int64_t out_pitch = nchwc8_pitch(OW);
+    int64_t out_pitch_elems = out_pitch / 4;
+    int64_t out_d_elems = OH * out_pitch_elems;
+    std::vector<float> packed_out(static_cast<size_t>(C8 * OD * out_d_elems));
+    TensorView out_c8(oshape, DataType::f32, packed_out.data(), out_pitch, TensorLayout::NCDHWC8);
+
+    DepthwiseConvAttributes attrs;
+    attrs.kernel_size = {KD, KH, KW};
+    attrs.stride = {1, 1, 1};
+    attrs.padding = {0, 0, 0};
+
+    {
+        ComputeContext ctx;
+        const TensorView ins[] = {in_c8, pw_view};
+        backend::cpu::depthwise_conv_cpu(attrs, out_c8, ins, ctx, nullptr);
+    }
+
+    // Unpack
+    std::vector<float> result(16);
+    TensorView res_ncdhw(oshape, DataType::f32, result.data(), TensorLayout::NCDHW);
+    unpack_ncdhwc8_to_ncdhw(out_c8, res_ncdhw);
+
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_NEAR(result[i], 4.0f, 1e-4f);
+    }
+}
+
+// ============================================================
+// 3D NCDHWC8 vs Reference random tests
+// ============================================================
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_basic) {
+    test_ncdhwc8_vs_ref({1, 8, 8, 8, 8}, {8, 1, 3, 3, 3},
+        DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_stride) {
+    test_ncdhwc8_vs_ref({1, 4, 6, 6, 6}, {4, 1, 2, 2, 2},
+        DepthwiseConvAttributes{{2, 2, 2}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_padding) {
+    test_ncdhwc8_vs_ref({1, 8, 4, 4, 4}, {8, 1, 2, 2, 2},
+        DepthwiseConvAttributes{{2, 2, 2}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}});
+}
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_bias) {
+    test_ncdhwc8_vs_ref({1, 4, 4, 4, 4}, {4, 1, 2, 2, 2},
+        DepthwiseConvAttributes{{2, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}}, true);
+}
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_partial_c8) {
+    test_ncdhwc8_vs_ref({1, 3, 4, 4, 4}, {3, 1, 2, 2, 2},
+        DepthwiseConvAttributes{{2, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_small_kernel) {
+    test_ncdhwc8_vs_ref({1, 8, 6, 6, 6}, {8, 1, 1, 1, 1},
+        DepthwiseConvAttributes{{1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_add_to) {
+    DepthwiseConvAttributes attrs{{2, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    attrs.add_to = true;
+    test_ncdhwc8_vs_ref({1, 4, 4, 4, 4}, {4, 1, 2, 2, 2}, attrs);
 }

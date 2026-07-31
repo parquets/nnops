@@ -20,7 +20,7 @@ enum class OpType : uint8_t {
     LayerNorm   = 9,
     RMSNorm     = 10,
     Conv3D          = 11,
-    DepthwiseConv2D = 12,
+    DepthwiseConv = 12,
     Eltwise         = 13,
     Unary           = 14,
     Reduce          = 15,

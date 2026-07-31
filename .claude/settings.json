@@ -96,7 +96,9 @@
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*full_c8*\")",
       "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*direct_nchwc8*\")",
       "Bash(grep -n 'TensorView.*{.*,' d:/vscode/nnops/tests/test_grid_sample.cpp)",
-      "Bash(grep -v '//\\\\|=\\\\|ins\\\\[')"
+      "Bash(grep -v '//\\\\|=\\\\|ins\\\\[')",
+      "Bash(git mv *)",
+      "Bash(./build/tests/Release/nnops_test.exe --gtest_filter=\"*dwconv_3d*\")"
     ],
     "additionalDirectories": [
       "d:\\vscode\\nnops\\src\\backend\\cpu",

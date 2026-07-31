@@ -182,12 +182,12 @@ inline std::vector<TensorDesc> conv3d_output_shape(
     return {out};
 }
 
-/// DepthwiseConv2D shape inference.
-/// inputs[0] = input  [N, C, IH, IW]
-/// inputs[1] = weight [C, 1, KH, KW]
+/// DepthwiseConv shape inference (2D / 3D auto-detected from input rank).
+/// inputs[0] = input  [N, C, (D,) H, W]
+/// inputs[1] = weight [C, 1, (KD,) KH, KW]
 /// inputs[2] = bias   [C] (optional)
-/// Returns: [N, C, OH, OW]
-inline std::vector<TensorDesc> depthwise_conv2d_output_shape(
+/// Returns: [N, C, (OD,) OH, OW]
+inline std::vector<TensorDesc> depthwise_conv_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
     std::span<const int64_t> dilation,
@@ -195,21 +195,34 @@ inline std::vector<TensorDesc> depthwise_conv2d_output_shape(
     int auto_pad,
     std::span<const TensorDesc> inputs)
 {
-    const auto& in = inputs[0];  // [N, C, IH, IW]
+    const auto& in = inputs[0];
+    const int64_t rank = in.rank;
+    const int64_t srank = rank - 2;  // spatial rank: 2 or 3
 
     TensorDesc out;
-    out.rank   = 4;
+    out.rank   = rank;
     out.layout = in.layout;
     out.dtype  = in.dtype;
 
-    out.dims.resize(4);
+    out.dims.resize(static_cast<size_t>(rank));
     out.dims[0] = in.dims[0];  // N
     out.dims[1] = in.dims[1];  // C (same as input channels)
 
-    out.dims[2] = compute_spatial_output_size(
-        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
-    out.dims[3] = compute_spatial_output_size(
-        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], auto_pad);
+    // Spatial dimensions start at index 2
+    // kernel_size/stride/dilation/padding are [KD, KH, KW]; for 2D, skip KD
+    const int64_t k_offset = (srank == 2) ? 1 : 0;
+
+    for (int64_t d = 0; d < srank; ++d) {
+        const int64_t in_dim   = in.dims[static_cast<size_t>(2 + d)];
+        const int64_t k_idx    = static_cast<size_t>(k_offset + d);
+        const int64_t k_size   = kernel_size[k_idx];
+        const int64_t k_stride = stride[k_idx];
+        const int64_t k_dil    = dilation[k_idx];
+        const int64_t k_pad    = padding[k_idx];
+
+        out.dims[static_cast<size_t>(2 + d)] = compute_spatial_output_size(
+            in_dim, k_size, k_stride, k_dil, k_pad, auto_pad);
+    }
 
     return {out};
 }

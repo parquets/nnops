@@ -17,7 +17,7 @@ set(NNOPS_CPU_SOURCES
     ops/layer_norm.cpp
     ops/rms_norm.cpp
     ops/conv3d.cpp
-    ops/depthwise_conv2d.cpp
+    ops/depthwise_conv.cpp
     ops/eltwise.cpp
     ops/unary.cpp
     ops/reduce.cpp
@@ -34,7 +34,7 @@ set(NNOPS_CPU_SOURCES
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp
     backend/cpu/batch_norm.cpp
-    backend/cpu/depthwise_conv2d.cpp
+    backend/cpu/depthwise_conv.cpp
     backend/cpu/layer_norm.cpp
     backend/cpu/pooling.cpp
     backend/cpu/rms_norm.cpp
@@ -62,7 +62,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/layer_norm_ref.cpp
     backend/cpu/reference/rms_norm_ref.cpp
     backend/cpu/reference/conv3d_ref.cpp
-    backend/cpu/reference/depthwise_conv2d_ref.cpp
+    backend/cpu/reference/depthwise_conv_ref.cpp
     backend/cpu/reference/eltwise_ref.cpp
     backend/cpu/reference/unary_ref.cpp
     backend/cpu/reference/reduce_ref.cpp
@@ -86,7 +86,7 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/batch_norm.cu
         backend/cuda/pooling.cu
         backend/cuda/cumsum.cu
-        backend/cuda/depthwise_conv2d.cu
+        backend/cuda/depthwise_conv.cu
         backend/cuda/eltwise.cu
         backend/cuda/unary.cu
         backend/cuda/reduce.cu

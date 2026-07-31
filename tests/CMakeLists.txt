@@ -14,7 +14,7 @@ set(TEST_SOURCES
     test_layer_norm.cpp
     test_rms_norm.cpp
     test_simd.cpp
-    test_depthwise_conv2d.cpp
+    test_depthwise_conv.cpp
     test_eltwise.cpp
     test_unary.cpp
     test_reduce.cpp

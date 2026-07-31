@@ -26,5 +26,6 @@
 #include "nnops/ops/layer_norm.hpp"
 #include "nnops/ops/rms_norm.hpp"
 #include "nnops/ops/conv3d.hpp"
+#include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/ops/resize.hpp"
 #include "nnops/ops/grid_sample.hpp"
