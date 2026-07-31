@@ -242,7 +242,7 @@ NNOPS_TEST(dwconv_basic_no_pad) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride = {1, 1, 1};
-    attrs.padding = {1, 0, 0};
+    attrs.padding = {0, 0, 0};
 
     {
         ComputeContext ctx;
@@ -296,7 +296,7 @@ NNOPS_TEST(dwconv_stride_2) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride = {1, 2, 2};
-    attrs.padding = {1, 0, 0};
+    attrs.padding = {0, 0, 0};
 
     {
         ComputeContext ctx;
@@ -350,7 +350,7 @@ NNOPS_TEST(dwconv_padding_1) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride = {1, 1, 1};
-    attrs.padding = {1, 1, 1};
+    attrs.padding = {0, 1, 1};
 
     {
         ComputeContext ctx;
@@ -414,7 +414,7 @@ NNOPS_TEST(dwconv_with_bias) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride = {1, 1, 1};
-    attrs.padding = {1, 0, 0};
+    attrs.padding = {0, 0, 0};
 
     {
         ComputeContext ctx;
@@ -467,9 +467,9 @@ NNOPS_TEST(dwconv_dilation) {
 
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
-    attrs.stride   = {1, 1};
+    attrs.stride   = {1, 1, 1};
     attrs.dilation = {1, 2, 2};
-    attrs.padding  = {0, 0};
+    attrs.padding  = {0, 0, 0};
 
     {
         ComputeContext ctx;
@@ -521,7 +521,7 @@ NNOPS_TEST(dwconv_add_to) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride = {1, 1, 1};
-    attrs.padding = {1, 0, 0};
+    attrs.padding = {0, 0, 0};
     attrs.add_to = true;
 
     {
@@ -580,7 +580,7 @@ NNOPS_TEST(dwconv_relu_epilogue) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride  = {1, 1};
-    attrs.padding = {1, 0, 0};
+    attrs.padding = {0, 0, 0};
     attrs.epilogue.type = EpilogueActivateType::Relu;
 
     {
@@ -649,7 +649,7 @@ NNOPS_TEST(dwconv_multi_channel) {
     DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, 3, 3};
     attrs.stride  = {1, 1};
-    attrs.padding = {1, 0, 0};
+    attrs.padding = {0, 0, 0};
 
     {
         ComputeContext ctx;
@@ -703,7 +703,7 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
         ComputeContext ctx;
         const TensorView ref_arr[] = {in_nchw, w_nchw};
         backend::cpu::reference::depthwise_conv_ref(
-            DepthwiseConvAttributes{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}},
+            DepthwiseConvAttributes{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}},
             out_ref, ref_arr, ctx, nullptr);
     }
 
@@ -755,36 +755,36 @@ NNOPS_TEST(dwconv_full_c8_hand_check) {
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_basic) {
     test_nchwc8_vs_ref({2, 8, 16, 16}, {8, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_stride2) {
     test_nchwc8_vs_ref({1, 8, 12, 12}, {8, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_stride2_odd) {
     test_nchwc8_vs_ref({1, 4, 7, 7}, {4, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_padding) {
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_dilation) {
     test_nchwc8_vs_ref({1, 4, 10, 10}, {4, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_bias) {
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}}, true);
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}}, true);
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_add_to) {
-    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}};
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
     attrs.add_to = true;
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 3, 3}, attrs);
 }
@@ -792,43 +792,43 @@ NNOPS_TEST(dwconv_nchwc8_vs_ref_add_to) {
 NNOPS_TEST(dwconv_nchwc8_vs_ref_partial_c8) {
     // C=3 → partial C8 (valid_lanes=3)
     test_nchwc8_vs_ref({1, 3, 8, 8}, {3, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_partial_c8_bias) {
     test_nchwc8_vs_ref({1, 5, 8, 8}, {5, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}}, true);
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}}, true);
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_single_channel) {
     test_nchwc8_vs_ref({1, 1, 8, 8}, {1, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_multi_c8) {
     // C=17 → 3 C8 blocks (2 full + 1 partial)
     test_nchwc8_vs_ref({1, 17, 8, 8}, {17, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_small_kernel) {
     test_nchwc8_vs_ref({1, 8, 16, 16}, {8, 1, 1, 1},
-        DepthwiseConvAttributes{{1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_batch) {
     test_nchwc8_vs_ref({4, 8, 16, 16}, {8, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_large) {
     test_nchwc8_vs_ref({1, 16, 32, 32}, {16, 1, 3, 3},
-        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_nchwc8_vs_ref_1x1_kernel_stride2) {
     test_nchwc8_vs_ref({1, 8, 8, 8}, {8, 1, 1, 1},
-        DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {1, 0, 0}});
+        DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
 }
 
 // ============================================================
