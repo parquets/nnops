@@ -8,6 +8,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <random>
 
 using namespace nnops;
 
@@ -154,5 +155,207 @@ NNOPS_TEST(softmax_random) {
             NNOPS_EXPECT_TRUE(out_buf[r * 8 + c] >= 0.0f);
         }
         NNOPS_EXPECT_NEAR(row_sum, 1.0f, 1e-4f);
+    }
+}
+
+// ============================================================
+// Packed layout tests (NCHWC8)
+// NCHWC8 is rank 4: [N, C, H, W] where C is the LOGICAL channel count.
+// Physical row layout: [w0_l0..w0_l7, w1_l0..w1_l7, ...]
+// num_channel_blocks = ceil(C / 8), row_stride = W * 8 elements.
+// total_rows = N * num_channel_blocks * H.
+// ============================================================
+
+/// Helper: create NCHWC8 TensorView with correct pitch, plus buffer.
+static std::pair<std::vector<float>, TensorView>
+make_nchwc8(int64_t N, int64_t C, int64_t H, int64_t W)
+{
+    TensorDesc desc;
+    desc.rank = 4;
+    desc.dims = {N, C, H, W};
+    desc.dtype = DataType::f32;
+    desc.layout = TensorLayout::NCHWC8;
+
+    size_t nbytes = desc.storage_bytes();
+    std::vector<float> buf(nbytes / sizeof(float));
+    TensorView tv = test::make_packed(desc, buf.data());
+    return {std::move(buf), tv};
+}
+
+/// Helper: fill NCHWC8 data with sequential values.
+/// num_c8 = ceil(C/8), row_stride = W*8.
+static void fill_nchwc8(float* data,
+                         int64_t N, int64_t C, int64_t H, int64_t W,
+                         float base_val, float step)
+{
+    int64_t num_c8 = (C + 7) / 8;
+    int64_t row_stride = W * 8;
+    int64_t c8_stride = H * row_stride;
+    int64_t n_stride = num_c8 * c8_stride;
+    float val = base_val;
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c8 = 0; c8 < num_c8; ++c8) {
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t w = 0; w < W; ++w) {
+                    for (int64_t l = 0; l < 8; ++l) {
+                        int64_t off = n * n_stride + c8 * c8_stride
+                                      + h * row_stride + w * 8 + l;
+                        data[off] = val;
+                        val += step;
+                    }
+                }
+            }
+        }
+    }
+}
+
+NNOPS_TEST(softmax_nchwc8_axis_w) {
+    // NCHWC8 [1, 8, 1, 3] — one full C8 block (C=8), W=3
+    // Softmax over W (axis=-1). Each C lane is independently normalized.
+    const int64_t N = 1, C = 8, H = 1, W = 3;
+    const int64_t row_stride = W * 8;  // 24
+
+    auto [in_data, input] = make_nchwc8(N, C, H, W);
+    fill_nchwc8(in_data.data(), N, C, H, W, 1.0f, 1.0f);
+
+    auto d_in = input.desc();
+
+    SoftmaxAttributes attrs;
+    attrs.axis = -1;  // W dimension (rank-1)
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    const TensorDesc in_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].rank, 4);
+    NNOPS_EXPECT_EQ(descs[0].dims[3], 3);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHWC8);
+
+    auto [out_buf, output] = make_nchwc8(N, C, H, W);
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // Verify: for each C lane, the 3 W positions sum to 1.
+    for (int lane = 0; lane < 8; ++lane) {
+        float row_sum = 0.0f;
+        for (int w = 0; w < 3; ++w) {
+            float v = out_buf[w * 8 + lane];
+            NNOPS_EXPECT_TRUE(v >= 0.0f);
+            row_sum += v;
+        }
+        NNOPS_EXPECT_NEAR(row_sum, 1.0f, 1e-4f);
+    }
+}
+
+NNOPS_TEST(softmax_nchwc8_axis_w_log) {
+    // Same as above but log_softmax.
+    const int64_t N = 1, C = 8, H = 1, W = 3;
+
+    auto [in_data, input] = make_nchwc8(N, C, H, W);
+    fill_nchwc8(in_data.data(), N, C, H, W, 1.0f, 1.0f);
+    auto d_in = input.desc();
+
+    SoftmaxAttributes attrs;
+    attrs.axis = -1;
+    attrs.log_softmax = true;
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    auto [out_buf, output] = make_nchwc8(N, C, H, W);
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // log_softmax values should be <= 0 and exp-sum to 1
+    for (int lane = 0; lane < 8; ++lane) {
+        float sum_exp = 0.0f;
+        for (int w = 0; w < 3; ++w) {
+            float v = out_buf[w * 8 + lane];
+            NNOPS_EXPECT_TRUE(v <= 0.0f + 1e-5f);
+            sum_exp += std::exp(v);
+        }
+        NNOPS_EXPECT_NEAR(sum_exp, 1.0f, 1e-4f);
+    }
+}
+
+NNOPS_TEST(softmax_nchwc8_random) {
+    // Random NCHWC8 [2, 16, 3, 4] — two full C8 blocks (C=16).
+    const int64_t N = 2, C = 16, H = 3, W = 4;
+    const int64_t num_c8 = (C + 7) / 8;
+    const int64_t row_stride = W * 8;
+
+    auto [in_data, input] = make_nchwc8(N, C, H, W);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+    for (auto& v : in_data) v = dist(rng);
+
+    SoftmaxAttributes attrs;
+    attrs.axis = -1;
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    auto [out_buf, output] = make_nchwc8(N, C, H, W);
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // For each (n, c8, h, lane), the W values should sum to 1.
+    int64_t n_stride = num_c8 * H * row_stride;
+    int64_t c8_stride = H * row_stride;
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c8 = 0; c8 < num_c8; ++c8) {
+            for (int64_t h = 0; h < H; ++h) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    float sum = 0.0f;
+                    for (int64_t w = 0; w < W; ++w) {
+                        int64_t off = n * n_stride + c8 * c8_stride
+                                      + h * row_stride + w * 8 + lane;
+                        sum += out_buf[off];
+                        NNOPS_EXPECT_TRUE(out_buf[off] >= 0.0f);
+                    }
+                    NNOPS_EXPECT_NEAR(sum, 1.0f, 1e-4f);
+                }
+            }
+        }
+    }
+}
+
+NNOPS_TEST(softmax_nchw_axis_first) {
+    // NCHW [3, 4, 2, 2] — softmax over axis=0 (batch dimension).
+    // Uses the general scalar path. Verifies the decomposition is correct.
+    const int64_t shape[] = {3, 4, 2, 2};
+    const int64_t N = 3, C = 4, H = 2, W = 2;
+    const int64_t total = N * C * H * W;  // 48
+
+    std::vector<float> in_data(static_cast<size_t>(total));
+    for (size_t i = 0; i < in_data.size(); ++i)
+        in_data[i] = static_cast<float>(i) * 0.1f;
+
+    TensorView input(shape, DataType::f32, in_data.data(), TensorLayout::NCHW);
+    auto d_in = input.desc();
+
+    SoftmaxAttributes attrs;
+    attrs.axis = 0;  // batch dim
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    const TensorDesc in_desc_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(in_desc_arr);
+    std::vector<float> out_buf(static_cast<size_t>(total));
+    TensorView output(shape, DataType::f32, out_buf.data(), TensorLayout::NCHW);
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // For each (c, h, w) position, the 3 batch values should sum to 1.
+    for (int c = 0; c < C; ++c) {
+        for (int h = 0; h < H; ++h) {
+            for (int w = 0; w < W; ++w) {
+                float sum = 0.0f;
+                for (int n = 0; n < N; ++n) {
+                    int off = n * 16 + c * 4 + h * 2 + w;
+                    sum += out_buf[off];
+                    NNOPS_EXPECT_TRUE(out_buf[off] >= 0.0f);
+                }
+                NNOPS_EXPECT_NEAR(sum, 1.0f, 1e-4f);
+            }
+        }
     }
 }
