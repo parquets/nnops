@@ -175,6 +175,8 @@ void reduce_cuda_impl(
     int64_t axis = attrs.axis;
     if (axis < 0) axis += rank;
 
+    const int64_t pack = input.channel_pack_size();
+
     const int64_t outer_dim_count = [&]() {
         int64_t n = 1;
         for (int64_t d = 0; d < axis; ++d) n *= input.shape(d);
@@ -195,13 +197,15 @@ void reduce_cuda_impl(
     const int shared_bytes = block_size * sizeof(float);
     const int grid = std::min(static_cast<int>(outer_dim_count), 65535);
 
-    if (axis == rank - 1) {
-        // Contiguous tail fast path
+    if (axis == rank - 1 && pack == 1) {
+        // Contiguous tail fast path (planar only; packed uses general path)
         const int64_t row_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
         reduce_fast_kernel<T><<<grid, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr, norm_size, row_stride, reduce_type);
     } else {
-        // General axis: pre-compute inner offsets, upload to device
+        // General axis: pre-compute inner offsets, upload to device.
+        // stride_elems() returns physical strides (pack-aware), so no extra
+        // pack multiplication is needed.
         std::vector<int64_t> h_offsets(norm_size);
         for (int64_t flat = 0; flat < norm_size; ++flat) {
             int64_t off = 0;

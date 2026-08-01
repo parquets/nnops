@@ -1,23 +1,25 @@
 /// @file reduce.cpp
 /// @brief SIMD-optimized CPU implementation of the Reduce operator.
 ///
-/// Supports both f32 and f16 via a single templated implementation.
+/// Supports f32 and f16. Supports planar (NCHW/NCDHW) and packed (NCHWC8/NCDHWC8)
+/// layouts.
 ///
-/// Three dispatch paths:
-///   1. Contiguous tail (axis == rank-1): SIMD reduction per row with
-///      multi-accumulator unrolling (4-wide for Sum/Mean, 2-wide for
-///      Max/Min). Each row produces one scalar output after horizontal
-///      reduction (v_reduce_sum / v_reduce_max / v_reduce_min).
-///   2. Inner-contiguous general axis (axis < rank-1, inner dims
+/// Four dispatch paths:
+///   1. Packed SIMD (axis == rank-1, pack > 1): per-lane SIMD reduction
+///      within each physical row. For NCHWC8 [N,C,H,W] with axis=W,
+///      processes all 8 C lanes simultaneously over the W dimension.
+///      No horizontal reduction — each lane independently accumulates.
+///   2. Contiguous tail (axis == rank-1, pack == 1): SIMD reduction
+///      per row with multi-accumulator unrolling (4-wide for Sum/Mean,
+///      2-wide for Max/Min). Each row produces one scalar after
+///      horizontal reduction (v_reduce_sum / v_reduce_max / v_reduce_min).
+///   3. Inner-contiguous general axis (axis < rank-1, inner dims
 ///      contiguous): SIMD reduction across the axis dimension for groups
-///      of L inner elements simultaneously. Each SIMD lane holds one
-///      inner position's accumulated result — no horizontal reduction
-///      needed, making this path more efficient per element than path 1.
-///      Multi-accumulator unrolling in the reduce direction (4-wide for
-///      Sum/Mean, 2-wide for Max/Min).
-///   3. General scalar (non-contiguous inner dims): pre-computed offset
-///      vectors for both input and output, matching the softmax/layer_norm
-///      pattern.
+///      of L inner elements simultaneously. Multi-accumulator unrolling
+///      in the reduce direction.
+///   4. General scalar (non-contiguous inner dims or packed layout):
+///      pre-computed offset vectors for input/output. Correct for all
+///      layouts including packed (uses physical stride_elems).
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems().
 
@@ -37,11 +39,85 @@ using namespace nnops::simd;
 namespace {
 
 // ============================================================
-// Path 1: Contiguous tail (axis == rank-1)
+// Path 1: Packed SIMD — axis == rank-1, pack > 1
 //
-// Fast path for the common LLM case: reduce over the last dimension.
-// Multi-accumulator unrolling breaks the v_add/v_max/v_min dependency
-// chain, allowing the CPU to pipeline multiple independent operations.
+// For NCHWC8 [N,C,H,W] with axis=W, the physical row layout is:
+//   [w0_l0..w0_l7, w1_l0..w1_l7, ..., w_{D-1}_l0..w_{D-1}_l7]
+//
+// Each of the `pack` C lanes is an independent reduction over D
+// spatial positions. Process all lanes simultaneously with
+// per-lane SIMD vector accumulation — no horizontal reduction.
+// Output is densely packed: each physical position stores `pack`
+// result elements (one per lane).
+// ============================================================
+
+template <typename T>
+void reduce_packed_simd(const ReduceAttributes& attrs,
+                         TensorView& output,
+                         const TensorView& input,
+                         int64_t axis,
+                         const ComputeContext& ctx)
+{
+    const int64_t rank = input.rank();
+    NNOPS_ASSERT(axis == rank - 1);
+
+    const int64_t pack = input.channel_pack_size();
+    const int64_t D = input.shape(axis);
+    const int64_t num_rows = input.total_rows();
+    const int64_t x_rs = input.row_stride_elems();
+
+    const T* x_ptr = input.ptr<T>();
+    T* y_ptr = output.ptr<T>();
+    const float inv_D = 1.0f / static_cast<float>(D);
+
+    const auto process_row = [&](int64_t r) {
+        const T* x_row = x_ptr + r * x_rs;
+        // Output positions are densely packed: pack elements per position
+        T* y_pos = y_ptr + r * pack;
+
+        switch (attrs.type) {
+        case ReduceType::Sum:
+        case ReduceType::Mean: {
+            auto v_sum = v_zero(x_ptr);
+            for (int64_t d = 0; d < D; ++d)
+                v_sum = v_add(v_sum, v_load(x_row + d * pack));
+            if (attrs.type == ReduceType::Mean) {
+                auto v_inv = v_set1(x_ptr, inv_D);
+                v_sum = v_mul(v_sum, v_inv);
+            }
+            v_store(y_pos, v_sum);
+            break;
+        }
+        case ReduceType::Max: {
+            auto v_best = v_set1(x_ptr, -std::numeric_limits<float>::infinity());
+            for (int64_t d = 0; d < D; ++d)
+                v_best = v_max(v_best, v_load(x_row + d * pack));
+            v_store(y_pos, v_best);
+            break;
+        }
+        case ReduceType::Min: {
+            auto v_best = v_set1(x_ptr, std::numeric_limits<float>::infinity());
+            for (int64_t d = 0; d < D; ++d)
+                v_best = v_min(v_best, v_load(x_row + d * pack));
+            v_store(y_pos, v_best);
+            break;
+        }
+        }
+    };
+
+    if (ctx.cpu_parallel_for)
+        ctx.cpu_parallel_for(0, num_rows, process_row);
+    else
+        for (int64_t r = 0; r < num_rows; ++r) process_row(r);
+}
+
+// ============================================================
+// Path 2: Contiguous tail (axis == rank-1, pack == 1)
+//
+// Fast path for planar layouts: reduce over the last dimension.
+// Multi-accumulator unrolling breaks the v_add/v_max/v_min
+// dependency chain, allowing the CPU to pipeline multiple
+// independent operations.
 // ============================================================
 
 template <typename T>
@@ -175,17 +251,15 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
 }
 
 // ============================================================
-// Path 2: Inner-contiguous general axis (axis < rank-1, inner
-// dims contiguous in both input and output).
+// Path 3: Inner-contiguous general axis (axis < rank-1,
+// pack == 1, inner dims contiguous in both input and output).
 //
 // For each outer position, process L inner elements simultaneously.
 // The reduction loop accumulates across reduce_size steps using SIMD,
 // producing L results per inner block — no horizontal reduction needed.
-// This makes the path more efficient per element than path 1 for
-// multi-dim inner blocks (L results per SIMD operation vs 1).
 //
-// Multi-accumulator unrolling in the reduce direction (the hot loop)
-// breaks the dependency chain, matching the GEMM micro-kernel pattern.
+// Multi-accumulator unrolling in the reduce direction breaks the
+// dependency chain, matching the GEMM micro-kernel pattern.
 // ============================================================
 
 template <typename T>
@@ -352,12 +426,12 @@ void reduce_inner_contiguous_simd(const ReduceAttributes& attrs,
 }
 
 // ============================================================
-// Path 3: General scalar (non-contiguous inner dims)
+// Path 4: General scalar (non-contiguous inner dims or packed
+// layouts where inner-contiguous SIMD doesn't apply).
 //
 // Pre-computed offset vectors for both input and output, matching
 // the softmax/layer_norm pattern. Handles arbitrary strides and
-// pitch padding. Supports f32 and f16 (the reference only handles
-// f32, so this path closes the f16 gap).
+// pitch padding. Correct for all layouts including packed.
 // ============================================================
 
 template <typename T>
@@ -373,7 +447,9 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
     const int64_t rank = input.rank();
     const int64_t rank_out = output.rank();
 
-    // Pre-compute inner offsets for input (dims axis+1..rank-1)
+    // Pre-compute inner offsets for input (dims axis+1..rank-1).
+    // stride_elems() returns physical strides (pack-aware), so no
+    // extra pack multiplication is needed.
     std::vector<int64_t> inner_offsets(static_cast<size_t>(num_inner));
     for (int64_t flat = 0; flat < num_inner; ++flat) {
         int64_t off = 0;
@@ -400,6 +476,7 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
         y_inner_offsets[static_cast<size_t>(flat)] = off;
     }
 
+    // stride_elems() returns physical strides including pack interleave.
     const int64_t x_outer_stride = (axis > 0) ? input.stride_elems(axis - 1) : 0;
     const int64_t y_outer_stride = (axis > 0) ? output.stride_elems(axis - 1) : 0;
     const int64_t axis_stride = input.stride_elems(axis);
@@ -409,6 +486,8 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
     const float inv_reduce = 1.0f / static_cast<float>(reduce_size);
 
     auto process_outer = [&](int64_t outer) {
+        // Use physical outer stride directly instead of outer * D * axis_stride,
+        // which would be incorrect for packed layouts where ceil(C/pack) ≠ C/pack.
         const int64_t x_row_base = outer * x_outer_stride;
         const int64_t y_row_base = outer * y_outer_stride;
 
@@ -477,7 +556,15 @@ void reduce_impl(const ReduceAttributes& attrs,
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
-    // ---- Path 1: Contiguous tail (axis == rank-1) ----
+    const int64_t pack = input.channel_pack_size();
+
+    // ---- Path 1: Packed SIMD (axis == rank-1, pack > 1) ----
+    if (axis == rank - 1 && pack > 1) {
+        reduce_packed_simd<T>(attrs, output, input, axis, ctx);
+        return;
+    }
+
+    // ---- Path 2: Contiguous tail (axis == rank-1, pack == 1) ----
     if (axis == rank - 1) {
         reduce_contiguous_simd<T>(attrs, output, input, axis, ctx);
         return;
@@ -492,12 +579,13 @@ void reduce_impl(const ReduceAttributes& attrs,
     int64_t num_inner = 1;
     for (int64_t d = axis + 1; d < rank; ++d) { num_inner *= input.shape(d); }
 
-    // ---- Path 2: Inner-contiguous SIMD ----
-    // Inner dims are contiguous iff stride along the axis equals the
-    // inner block size (stride_elems(axis) == num_inner).
-    // Output inner dims are contiguous iff the output row stride matches
-    // the innermost dim size (no pitch padding in output).
-    const bool input_inner_contiguous = (input.stride_elems(axis) == num_inner);
+    // ---- Path 3: Inner-contiguous SIMD (pack == 1, contiguous inner) ----
+    // For packed layouts (pack > 1), inner elements are interleaved with
+    // the C8 lane dimension — skip to the general scalar path.
+    // stride_elems() returns physical strides; for planar layouts,
+    // stride_elems(axis) == num_inner when inner dims are contiguous.
+    const bool input_inner_contiguous = (pack == 1) &&
+        (input.stride_elems(axis) == num_inner);
     const bool output_inner_contiguous = (output.rank() <= 1) ||
         (output.row_stride_elems() == output.shape(output.rank() - 1));
 
@@ -507,7 +595,7 @@ void reduce_impl(const ReduceAttributes& attrs,
         return;
     }
 
-    // ---- Path 3: General scalar ----
+    // ---- Path 4: General scalar ----
     reduce_general_scalar<T>(attrs, output, input, axis,
                               num_outer, reduce_size, num_inner, ctx);
 }
