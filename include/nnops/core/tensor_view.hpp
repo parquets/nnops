@@ -18,6 +18,7 @@
 
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_layout.hpp"
+#include "nnops/core/quant_params.hpp"
 #include "nnops/detail/small_vector.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -102,8 +103,9 @@ public:
     /// Construct a dense (contiguous) TensorView.
     /// The row pitch is computed as last_dim * elem_size (no alignment padding).
     TensorView(std::span<const int64_t> shape, DataType dtype,
-               void* data, TensorLayout layout = TensorLayout::NCHW)
-        : dtype_(dtype), layout_(layout), data_(data)
+               void* data, TensorLayout layout = TensorLayout::NCHW,
+               QuantParams qp = {})
+        : dtype_(dtype), layout_(layout), data_(data), quant_params_(qp)
     {
         NNOPS_ASSERT(shape.size() <= kMaxRank);
         rank_ = static_cast<int64_t>(shape.size());
@@ -125,8 +127,9 @@ public:
     /// last_dim * elem_size.
     TensorView(std::span<const int64_t> shape, DataType dtype,
                void* data, int64_t pitch,
-               TensorLayout layout = TensorLayout::NCHW)
-        : dtype_(dtype), layout_(layout), data_(data), pitch_(pitch)
+               TensorLayout layout = TensorLayout::NCHW,
+               QuantParams qp = {})
+        : dtype_(dtype), layout_(layout), data_(data), pitch_(pitch), quant_params_(qp)
     {
         NNOPS_ASSERT(shape.size() <= kMaxRank);
         rank_ = static_cast<int64_t>(shape.size());
@@ -171,6 +174,15 @@ public:
 
     /// Memory layout.
     TensorLayout layout() const noexcept { return layout_; }
+
+    /// Quantization parameters (scale, zero_point, granularity).
+    const QuantParams& quant_params() const noexcept { return quant_params_; }
+
+    /// Whether the tensor holds quantized integer data that should be
+    /// dequantized (i8/u8 with active scale/zp; extensible to i4/u4).
+    bool is_quantized() const noexcept {
+        return is_quantized_dtype(dtype_) && quant_params_.is_active();
+    }
 
     /// Typed data pointer (mutable).
     template <typename T>
@@ -324,6 +336,7 @@ private:
     int64_t pitch_ = 0;  // row pitch in bytes
     DataType dtype_ = DataType::f32;
     TensorLayout layout_ = TensorLayout::NCHW;
+    QuantParams quant_params_;  // scale / zero_point / granularity
     int64_t rank_ = 0;
 };
 

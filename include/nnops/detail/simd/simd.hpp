@@ -220,5 +220,91 @@ inline v_f16x8 v_load_stride2_odd(const half* p) {
     return v_load_stride2_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
 
+// ============================================================
+// int8 / uint8 → float32 conversion (8 lanes → v_f32x8)
+// ============================================================
+
+#if defined(NNOPS_ARCH_X86_64) && defined(__AVX__)
+inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+    __m128i i8  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    __m128i i16 = _mm_cvtepi8_epi16(i8);
+    __m128i i32_lo = _mm_cvtepi16_epi32(i16);
+    __m128i i32_hi = _mm_cvtepi16_epi32(_mm_unpackhi_epi64(i16, i16));
+    __m256 f32 = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(_mm_cvtepi32_ps(i32_lo)),
+        _mm_cvtepi32_ps(i32_hi), 1);
+    return v_f32x8(f32);
+}
+inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
+    __m128i u8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    __m128i z  = _mm_setzero_si128();
+    __m128i u16     = _mm_unpacklo_epi8(u8, z);
+    __m128i u32_lo  = _mm_unpacklo_epi16(u16, z);
+    __m128i u32_hi  = _mm_unpackhi_epi16(u16, z);
+    __m256 f32 = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(_mm_cvtepi32_ps(u32_lo)),
+        _mm_cvtepi32_ps(u32_hi), 1);
+    return v_f32x8(f32);
+}
+
+#elif defined(NNOPS_ARCH_X86_64)
+inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+    __m128i i8  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    __m128i i16 = _mm_cvtepi8_epi16(i8);
+    __m128i i32_lo = _mm_cvtepi16_epi32(i16);
+    __m128i i32_hi = _mm_cvtepi16_epi32(_mm_unpackhi_epi64(i16, i16));
+    return v_f32x8(_mm_cvtepi32_ps(i32_lo), _mm_cvtepi32_ps(i32_hi));
+}
+inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
+    __m128i u8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    __m128i z  = _mm_setzero_si128();
+    __m128i u16     = _mm_unpacklo_epi8(u8, z);
+    __m128i u32_lo  = _mm_unpacklo_epi16(u16, z);
+    __m128i u32_hi  = _mm_unpackhi_epi16(u16, z);
+    return v_f32x8(_mm_cvtepi32_ps(u32_lo), _mm_cvtepi32_ps(u32_hi));
+}
+
+#elif defined(NNOPS_ARCH_AARCH64)
+#include <arm_neon.h>
+inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+    int8x8_t   i8     = vld1_s8(p);
+    int16x8_t  i16    = vmovl_s8(i8);
+    int32x4_t  i32_lo = vmovl_s16(vget_low_s16(i16));
+    int32x4_t  i32_hi = vmovl_s16(vget_high_s16(i16));
+    return v_f32x8(vcvtq_f32_s32(i32_lo), vcvtq_f32_s32(i32_hi));
+}
+inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
+    uint8x8_t  u8     = vld1_u8(p);
+    uint16x8_t u16    = vmovl_u8(u8);
+    uint32x4_t u32_lo = vmovl_u16(vget_low_u16(u16));
+    uint32x4_t u32_hi = vmovl_u16(vget_high_u16(u16));
+    return v_f32x8(vcvtq_f32_u32(u32_lo), vcvtq_f32_u32(u32_hi));
+}
+
+#else
+inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+    float buf[8];
+    for (int i = 0; i < 8; ++i) buf[i] = static_cast<float>(p[i]);
+    return v_load(buf);
+}
+inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
+    float buf[8];
+    for (int i = 0; i < 8; ++i) buf[i] = static_cast<float>(p[i]);
+    return v_load(buf);
+}
+#endif
+
+// int8/uint8 → f16: direct per-element conversion (8 lanes)
+inline v_f16x8 v_cvt_i8_to_f16(const int8_t* p) {
+    half buf[8];
+    for (int i = 0; i < 8; ++i) buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
+    return v_load(buf);
+}
+inline v_f16x8 v_cvt_u8_to_f16(const uint8_t* p) {
+    half buf[8];
+    for (int i = 0; i < 8; ++i) buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
+    return v_load(buf);
+}
+
 } // namespace simd
 } // namespace nnops

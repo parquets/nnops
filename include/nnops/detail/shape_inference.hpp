@@ -506,4 +506,107 @@ inline std::vector<TensorDesc> grid_sample_output_shape(
     return {out};
 }
 
+/// QuantizeLinear shape inference.
+/// inputs[0] = x (f32/f16), inputs[1] = scale (f32), inputs[2] = zero_point (i8/u8)
+/// Returns: same shape as x, dtype = attrs.output_dtype (i8 or u8)
+inline std::vector<TensorDesc> quantize_linear_output_shape(
+    std::span<const TensorDesc> inputs,
+    DataType output_dtype = DataType::i8)
+{
+    const auto& x = inputs[0];
+
+    TensorDesc out;
+    out.rank   = x.rank;
+    out.layout = x.layout;
+    out.dtype  = output_dtype;  // i8 or u8, from attributes
+    out.dims   = x.dims;
+
+    return {out};
+}
+
+/// DequantizeLinear shape inference.
+/// inputs[0] = x (i8/u8), inputs[1] = scale (f32), inputs[2] = zero_point (i8/u8)
+/// Returns: same shape as x, dtype = f32 (or attr.output_dtype if available)
+inline std::vector<TensorDesc> dequantize_linear_output_shape(
+    std::span<const TensorDesc> inputs,
+    DataType output_dtype = DataType::f32)
+{
+    const auto& x = inputs[0];
+
+    TensorDesc out;
+    out.rank   = x.rank;
+    out.layout = x.layout;
+    out.dtype  = output_dtype;  // f32 or f16
+    out.dims   = x.dims;
+
+    return {out};
+}
+
+/// Concat shape inference.
+/// Concatenates N tensors along the specified axis.
+/// All inputs must have the same rank, dtype, and layout.
+/// All dimensions except axis must match.
+inline std::vector<TensorDesc> concat_output_shape(
+    int64_t axis,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in0 = inputs[0];
+    const int64_t rank = in0.rank;
+    const int64_t ax = resolve_axis(axis, rank);
+
+    // Sum the axis dimension across all inputs
+    int64_t axis_sum = 0;
+    for (const auto& in : inputs) {
+        axis_sum += in.dims[static_cast<size_t>(ax)];
+    }
+
+    TensorDesc out;
+    out.rank   = rank;
+    out.layout = in0.layout;
+    out.dtype  = in0.dtype;
+    out.dims.resize(static_cast<size_t>(rank));
+    for (int64_t i = 0; i < rank; ++i) {
+        out.dims[static_cast<size_t>(i)] =
+            (i == ax) ? axis_sum : in0.dims[static_cast<size_t>(i)];
+    }
+
+    return {out};
+}
+
+/// ArgMax / ArgMin shape inference.
+/// Reduces along an axis and outputs int64 indices.
+inline std::vector<TensorDesc> argminmax_output_shape(
+    int64_t axis,
+    bool keepdims,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+    const int64_t rank = in.rank;
+    const int64_t ax = resolve_axis(axis, rank);
+
+    TensorDesc out;
+    out.layout = in.layout;
+    out.dtype  = DataType::i64;
+
+    if (keepdims) {
+        out.rank = rank;
+        out.dims.resize(static_cast<size_t>(rank));
+        for (int64_t i = 0; i < rank; ++i) {
+            out.dims[static_cast<size_t>(i)] = (i == ax)
+                ? int64_t(1)
+                : in.dims[static_cast<size_t>(i)];
+        }
+    } else {
+        out.rank = rank - 1;
+        out.dims.resize(static_cast<size_t>(rank - 1));
+        for (int64_t i = 0, o = 0; i < rank; ++i) {
+            if (i != ax) {
+                out.dims[static_cast<size_t>(o++)] = in.dims[static_cast<size_t>(i)];
+            }
+        }
+    }
+
+    return {out};
+}
+
 }  // namespace nnops

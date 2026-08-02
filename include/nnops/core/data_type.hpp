@@ -18,6 +18,9 @@ enum class DataType : uint8_t {
     i64     = 6,  ///< signed 64-bit integer
     f8_e4m3 = 7,  ///< 8-bit float E4M3 (4 exponent, 3 mantissa) — precision
     f8_e5m2 = 8,  ///< 8-bit float E5M2 (5 exponent, 2 mantissa) — range
+    // ---- Reserved for future quantized types ----
+    // i4      = 9,  ///< signed 4-bit integer (2 values per byte)
+    // u4      = 10, ///< unsigned 4-bit integer (2 values per byte)
 };
 
 /// Compile-time traits for each DataType.
@@ -99,8 +102,27 @@ constexpr size_t data_type_size(DataType dt) noexcept {
     case DataType::i64:     return 8;
     case DataType::f8_e4m3: return 1;
     case DataType::f8_e5m2: return 1;
+    // case DataType::i4:   return 0;  // sub-byte: 0.5 elems/byte (use packed helpers)
+    // case DataType::u4:   return 0;
     }
     return 0;
+}
+
+/// Whether a DataType represents quantized integer storage that uses
+/// scale/zero_point dequantization (i8, u8, and future i4/u4).
+///
+/// FP8 types (f8_e4m3, f8_e5m2) are NOT included here — they are
+/// floating-point formats that don't use integer zero_point semantics.
+constexpr bool is_quantized_dtype(DataType dt) noexcept {
+    switch (dt) {
+    case DataType::i8:
+    case DataType::u8:
+    // case DataType::i4:   // future
+    // case DataType::u4:   // future
+        return true;
+    default:
+        return false;
+    }
 }
 
 }  // namespace nnops

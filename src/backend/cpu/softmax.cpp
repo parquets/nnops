@@ -122,6 +122,7 @@ void softmax_general_scalar(
         for (int64_t i = 0; i < outer_size; ++i) process_row(i);
 }
 
+
 }  // anonymous namespace
 
 // ============================================================

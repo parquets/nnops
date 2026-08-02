@@ -23,6 +23,9 @@ set(TEST_SOURCES
     test_resize.cpp
     test_grid_sample.cpp
     test_layout_convert.cpp
+    test_quant_linear.cpp
+    test_concat.cpp
+    test_argminmax.cpp
 )
 
 # Vulkan tests (only when Vulkan backend is enabled)
