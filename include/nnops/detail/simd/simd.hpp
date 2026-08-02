@@ -224,7 +224,7 @@ inline v_f16x8 v_load_stride2_odd(const half* p) {
 // int8 / uint8 → float32 conversion (8 lanes → v_f32x8)
 // ============================================================
 
-#if defined(NNOPS_ARCH_X86_64) && defined(__AVX__)
+#if defined(NNOPS_ARCH_X86_64)
 inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
     __m128i i8  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
     __m128i i16 = _mm_cvtepi8_epi16(i8);
@@ -247,25 +247,7 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
     return v_f32x8(f32);
 }
 
-#elif defined(NNOPS_ARCH_X86_64)
-inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
-    __m128i i8  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
-    __m128i i16 = _mm_cvtepi8_epi16(i8);
-    __m128i i32_lo = _mm_cvtepi16_epi32(i16);
-    __m128i i32_hi = _mm_cvtepi16_epi32(_mm_unpackhi_epi64(i16, i16));
-    return v_f32x8(_mm_cvtepi32_ps(i32_lo), _mm_cvtepi32_ps(i32_hi));
-}
-inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
-    __m128i u8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
-    __m128i z  = _mm_setzero_si128();
-    __m128i u16     = _mm_unpacklo_epi8(u8, z);
-    __m128i u32_lo  = _mm_unpacklo_epi16(u16, z);
-    __m128i u32_hi  = _mm_unpackhi_epi16(u16, z);
-    return v_f32x8(_mm_cvtepi32_ps(u32_lo), _mm_cvtepi32_ps(u32_hi));
-}
-
 #elif defined(NNOPS_ARCH_AARCH64)
-#include <arm_neon.h>
 inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
     int8x8_t   i8     = vld1_s8(p);
     int16x8_t  i16    = vmovl_s8(i8);

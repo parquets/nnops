@@ -339,17 +339,6 @@ inline v_f16x8 v_zero_f16x8() {
 
 // FP16 <-> FP32 conversion
 inline v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
-    // vcvt_f32_f16 on float16x8_t → two float32x4_t results
-    float32x4_t lo = vcvt_f32_f16(vget_low_f16(a.val));
-    float32x4_t hi = vcvt_high_f32_f16(lo, a.val);  // overwrites lo, computes from upper half
-    // Actually vcvt_high_f32_f16 takes two inputs and returns different format:
-    //   vcvt_high_f32_f16(float32x4_t, float16x8_t) → float32x4_t (upper 4 lanes)
-    // So the correct usage is:
-    //   lo = vcvt_f32_f16(vget_low_f16(a.val));
-    //   hi = vcvt_high_f32_f16(lo, a.val);  // but this clobbers...
-    // The ARM convention: vcvt_high_f32_f16 returns a new float32x4_t for the upper half
-    // and takes a "passthru" arg that it ignores. Better to be explicit:
-
     // Correct approach for NEON f16x8 → f32x8:
     float32x4_t f32_lo = vcvt_f32_f16(vget_low_f16(a.val));
     float32x4_t f32_hi = vcvt_f32_f16(vget_high_f16(a.val));
