@@ -707,6 +707,56 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
     for (int i = 0; i < 8; ++i) r7.bits[i] = tmp[i][7];
 }
 
+// ============================================================
+// v_i8x16 — 128-bit signed int8 vector (16 bytes), scalar emulation
+// ============================================================
+struct v_i8x16 {
+    int8_t v[16];
+
+    v_i8x16() = default;
+    explicit v_i8x16(int8_t s) {
+        for (int i = 0; i < 16; ++i) v[i] = s;
+    }
+    int8_t operator[](int i) const { return v[i]; }
+    int8_t& operator[](int i) { return v[i]; }
+};
+
+inline v_i8x16 v_load_i8x16(const int8_t* p) {
+    v_i8x16 r;
+    for (int i = 0; i < 16; ++i) r[i] = p[i];
+    return r;
+}
+inline void v_store(int8_t* p, const v_i8x16& a) {
+    for (int i = 0; i < 16; ++i) p[i] = a[i];
+}
+inline v_i8x16 v_set1_i8x16(int8_t s)  { return v_i8x16(s); }
+inline v_i8x16 v_zero_i8x16()         { return v_i8x16(0); }
+
+// ============================================================
+// v_u8x16 — 128-bit unsigned int8 vector (16 bytes), scalar emulation
+// ============================================================
+struct v_u8x16 {
+    uint8_t v[16];
+
+    v_u8x16() = default;
+    explicit v_u8x16(uint8_t s) {
+        for (int i = 0; i < 16; ++i) v[i] = s;
+    }
+    uint8_t operator[](int i) const { return v[i]; }
+    uint8_t& operator[](int i) { return v[i]; }
+};
+
+inline v_u8x16 v_load_u8x16(const uint8_t* p) {
+    v_u8x16 r;
+    for (int i = 0; i < 16; ++i) r[i] = p[i];
+    return r;
+}
+inline void v_store(uint8_t* p, const v_u8x16& a) {
+    for (int i = 0; i < 16; ++i) p[i] = a[i];
+}
+inline v_u8x16 v_set1_u8x16(uint8_t s)  { return v_u8x16(s); }
+inline v_u8x16 v_zero_u8x16()         { return v_u8x16(0); }
+
 } // namespace scalar
 } // namespace arch
 } // namespace simd

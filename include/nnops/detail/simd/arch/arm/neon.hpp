@@ -626,6 +626,46 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
     r7.val = vzip2q_f16(u3, u7);  // col 7
 }
 
+// ============================================================
+// v_i8x16 — 128-bit signed int8 vector, backed by int8x16_t
+// ============================================================
+struct v_i8x16 {
+    int8x16_t val;
+
+    v_i8x16() = default;
+    explicit v_i8x16(int8x16_t v) : val(v) {}
+    explicit v_i8x16(int8_t s) : val(vdupq_n_s8(s)) {}
+};
+
+inline v_i8x16 v_load_i8x16(const int8_t* p) {
+    return v_i8x16(vld1q_s8(p));
+}
+inline void v_store(int8_t* p, const v_i8x16& a) {
+    vst1q_s8(p, a.val);
+}
+inline v_i8x16 v_set1_i8x16(int8_t s)  { return v_i8x16(vdupq_n_s8(s)); }
+inline v_i8x16 v_zero_i8x16()         { return v_i8x16(vdupq_n_s8(0)); }
+
+// ============================================================
+// v_u8x16 — 128-bit unsigned int8 vector, backed by uint8x16_t
+// ============================================================
+struct v_u8x16 {
+    uint8x16_t val;
+
+    v_u8x16() = default;
+    explicit v_u8x16(uint8x16_t v) : val(v) {}
+    explicit v_u8x16(uint8_t s) : val(vdupq_n_u8(s)) {}
+};
+
+inline v_u8x16 v_load_u8x16(const uint8_t* p) {
+    return v_u8x16(vld1q_u8(p));
+}
+inline void v_store(uint8_t* p, const v_u8x16& a) {
+    vst1q_u8(p, a.val);
+}
+inline v_u8x16 v_set1_u8x16(uint8_t s)  { return v_u8x16(vdupq_n_u8(s)); }
+inline v_u8x16 v_zero_u8x16()         { return v_u8x16(vdupq_n_u8(0)); }
+
 } // namespace neon
 } // namespace arch
 } // namespace simd
