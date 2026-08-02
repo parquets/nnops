@@ -114,6 +114,20 @@ void eltwise_impl(const EltwiseAttributes& attrs,
             [](float a, float b) { return a / b; });
         break;
 
+    case EltwiseType::Min:
+        process_eltwise_rows(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](auto va, auto vb) { return v_min(va, vb); },
+            [](float a, float b) { return a < b ? a : b; });
+        break;
+
+    case EltwiseType::Max:
+        process_eltwise_rows(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](auto va, auto vb) { return v_max(va, vb); },
+            [](float a, float b) { return a > b ? a : b; });
+        break;
+
     }  // switch
 }
 

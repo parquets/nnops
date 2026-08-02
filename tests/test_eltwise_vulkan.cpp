@@ -299,6 +299,8 @@ static std::vector<float> compute_eltwise_f16_ref(
         case EltwiseType::Sub: r = va - vb; break;
         case EltwiseType::Mul: r = va * vb; break;
         case EltwiseType::Div: r = va / vb; break;
+        case EltwiseType::Min: r = va < vb ? va : vb; break;
+        case EltwiseType::Max: r = va > vb ? va : vb; break;
         default: r = 0;
         }
         if (add_to && init) {

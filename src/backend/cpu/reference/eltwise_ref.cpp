@@ -104,6 +104,42 @@ void eltwise_impl_ref(const EltwiseAttributes& attrs,
         }
         break;
     }
+    case EltwiseType::Min: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* a_row = a_ptr + r * a_rs;
+            const T* b_row = b_ptr + r * b_rs;
+            T* o_row = o_ptr + r * o_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float av = s_load(&a_row[i]);
+                float bv = s_load(&b_row[i]);
+                float rv = av < bv ? av : bv;
+                if (add_to) {
+                    s_store(&o_row[i], s_load(&o_row[i]) + rv);
+                } else {
+                    s_store(&o_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+    case EltwiseType::Max: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* a_row = a_ptr + r * a_rs;
+            const T* b_row = b_ptr + r * b_rs;
+            T* o_row = o_ptr + r * o_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float av = s_load(&a_row[i]);
+                float bv = s_load(&b_row[i]);
+                float rv = av > bv ? av : bv;
+                if (add_to) {
+                    s_store(&o_row[i], s_load(&o_row[i]) + rv);
+                } else {
+                    s_store(&o_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
     }
 }
 

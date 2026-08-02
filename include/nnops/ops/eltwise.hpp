@@ -18,6 +18,8 @@ enum class EltwiseType : uint8_t {
     Sub,   ///< C = A - B
     Mul,   ///< C = A * B
     Div,   ///< C = A / B
+    Min,   ///< C = element-wise min(A, B)
+    Max,   ///< C = element-wise max(A, B)
 };
 
 /// Attributes for the Eltwise operator.
@@ -36,6 +38,8 @@ struct EltwiseAttributes {
 ///   Sub: output[i] = A[i] - B[i]
 ///   Mul: output[i] = A[i] * B[i]
 ///   Div: output[i] = A[i] / B[i]
+///   Min: output[i] = min(A[i], B[i])
+///   Max: output[i] = max(A[i], B[i])
 ///
 /// Input:  A [*], B [*]  (same shape and dtype)
 /// Output: C [*]          (same shape and dtype)
