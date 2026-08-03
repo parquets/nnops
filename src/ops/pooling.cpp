@@ -88,6 +88,7 @@ void Pooling::compute(std::span<TensorView> outputs,
     auto& input = inputs[0];
     NNOPS_ASSERT(!output.is_empty());
     NNOPS_ASSERT(!input.is_empty());
+    NNOPS_ASSERT(is_layout_supported(input.layout(), LayoutSupport::PackedOnly));
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, nullptr);
 }

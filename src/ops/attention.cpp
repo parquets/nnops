@@ -77,6 +77,7 @@ void Attention::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!inputs[0].is_empty());
     NNOPS_ASSERT(!inputs[1].is_empty());
     NNOPS_ASSERT(!inputs[2].is_empty());
+    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }

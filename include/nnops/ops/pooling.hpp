@@ -91,6 +91,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Pooling; }
     Backend getBackend() const override { return backend_; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
 
     const PoolingAttributes& attributes() const noexcept { return attrs_; }
 

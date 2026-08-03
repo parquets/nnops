@@ -77,6 +77,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Resize; }
     Backend getBackend() const override { return backend_; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
 
     const ResizeAttributes& attributes() const noexcept { return attrs_; }
 

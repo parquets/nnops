@@ -94,6 +94,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::DepthwiseConv; }
     Backend getBackend() const override { return backend_; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
 
     /// Access the depthwise convolution attributes.
     const DepthwiseConvAttributes& attributes() const noexcept { return attrs_; }

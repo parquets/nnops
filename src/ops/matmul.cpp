@@ -85,6 +85,7 @@ void MatMul::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!output.is_empty());
     NNOPS_ASSERT(!inputs[0].is_empty());
     NNOPS_ASSERT(!inputs[1].is_empty());
+    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
     const auto& a = inputs[0];
     const auto& b = inputs[1];

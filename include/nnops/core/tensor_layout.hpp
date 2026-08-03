@@ -89,4 +89,33 @@ constexpr int64_t layout_channel_block(TensorLayout layout) noexcept {
     return layout_channel_pack(layout);
 }
 
+// ============================================================
+// LayoutSupport — per-operator layout capability declaration
+// ============================================================
+
+/// Categories of layout support for an operator.
+///
+/// Mirrors OpenCV DNN's C/A/B classification:
+///   PlanarOnly — C operations: can only handle non-packed layouts (NCHW, NCDHW)
+///   PackedOnly — B operations: can only handle channel-packed layouts (NCHWC8, etc.)
+///   Any       — A operations: pitch-aware, handles any layout transparently
+enum class LayoutSupport : uint8_t {
+    PlanarOnly,   ///< Only planar (non-packed) layouts: NCHW, NCDHW
+    PackedOnly,   ///< Only channel-packed layouts: NCHWC8/16/32, NCDHWC8/16/32
+    Any,          ///< All layouts supported (pitch-aware row processing)
+};
+
+/// Check whether a single TensorLayout satisfies a LayoutSupport constraint.
+inline bool is_layout_supported(TensorLayout layout, LayoutSupport support) noexcept {
+    switch (support) {
+    case LayoutSupport::PlanarOnly:
+        return !is_channel_packed(layout);
+    case LayoutSupport::PackedOnly:
+        return is_channel_packed(layout);
+    case LayoutSupport::Any:
+        return true;
+    }
+    return false;
+}
+
 }  // namespace nnops

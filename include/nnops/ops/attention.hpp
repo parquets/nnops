@@ -69,6 +69,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Attention; }
     Backend getBackend() const override { return backend_; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
 
     const AttentionAttributes& attributes() const noexcept { return attrs_; }
 

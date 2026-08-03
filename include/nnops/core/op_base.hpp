@@ -106,6 +106,17 @@ public:
         (void)ctx;
     }
 
+    /// Returns the layout support category for this operator instance.
+    ///
+    /// Tells graph compilers and runtime validators which layouts this operator
+    /// can handle. The value is specific to the backend this instance was created
+    /// for — the same operator type may return different LayoutSupport for
+    /// different backends (e.g. CPU SIMD = PackedOnly, CPU Reference = PlanarOnly).
+    ///
+    /// Default: LayoutSupport::Any (most operators handle any layout transparently
+    /// via pitch-aware row processing).
+    virtual LayoutSupport getLayoutSupport() const noexcept { return LayoutSupport::Any; }
+
     /// Returns the ONNX-style operation type identifier.
     virtual OpType getOpType() const = 0;
 

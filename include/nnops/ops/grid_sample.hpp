@@ -84,6 +84,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::GridSample; }
     Backend getBackend() const override { return backend_; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
 
     const GridSampleAttributes& attributes() const noexcept { return attrs_; }
 
