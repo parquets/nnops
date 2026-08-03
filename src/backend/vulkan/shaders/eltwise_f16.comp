@@ -5,7 +5,7 @@
 /// Requires VK_KHR_16bit_storage with storageBuffer16BitAccess.
 ///
 /// Specialization constants:
-///   OP     = 0 (Add), 1 (Sub), 2 (Mul), 3 (Div), 4 (Min), 5 (Max)
+///   OP     = 0 (Add), 1 (Sub), 2 (Mul), 3 (Div), 4 (Min), 5 (Max), 6 (Pow)
 ///   ADD_TO = 0 (overwrite), 1 (accumulate)
 ///
 /// Dispatch: ceil(total / 256) workgroups in X dimension.
@@ -45,8 +45,10 @@ void main() {
         result = va / vb;
     } else if (OP == 4) {
         result = min(va, vb);
-    } else {
+    } else if (OP == 5) {
         result = max(va, vb);
+    } else {
+        result = pow(va, vb);
     }
 
     if (ADD_TO == 1) {

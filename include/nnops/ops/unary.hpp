@@ -23,6 +23,12 @@ enum class UnaryType : uint8_t {
     Abs,    ///< f(x) = |x|
     Neg,    ///< f(x) = -x
     Sqrt,   ///< f(x) = sqrt(x)
+    Erf,    ///< f(x) = erf(x)  (Gauss error function)
+    Round,  ///< f(x) = round(x) (nearest integer, ties to even)
+    Ceil,   ///< f(x) = ceil(x)
+    Floor,  ///< f(x) = floor(x)
+    Recip,  ///< f(x) = 1/x
+    Sign,   ///< f(x) = sign(x)  (-1, 0, or 1)
 };
 
 /// Attributes for the Unary operator.

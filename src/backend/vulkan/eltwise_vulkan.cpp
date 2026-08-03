@@ -38,6 +38,7 @@ static constexpr uint32_t eltwise_op_to_spec(EltwiseType type) noexcept {
     case EltwiseType::Div: return 3;
     case EltwiseType::Min: return 4;
     case EltwiseType::Max: return 5;
+    case EltwiseType::Pow: return 6;
     }
     return 0;
 }

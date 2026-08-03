@@ -53,6 +53,29 @@ inline void process_unary_rows(
 }
 
 // ============================================================
+// Scalar-only row-processing helper for ops without SIMD intrinsics
+// (e.g. Erf, Round, Sign). Same row-loop structure as process_unary_rows
+// but scalar-only — no SIMD loop, no tail.
+// ============================================================
+
+template <typename T, typename ScalarK>
+inline void process_unary_rows_scalar(
+    const T* in_ptr, T* out_ptr,
+    int64_t num_rows, int64_t last_dim,
+    int64_t in_row_stride, int64_t out_row_stride,
+    bool add_to,
+    ScalarK&& scalar_kernel)
+{
+    for (int64_t r = 0; r < num_rows; ++r) {
+        const T* in_row = in_ptr + r * in_row_stride;
+        T* out_row = out_ptr + r * out_row_stride;
+        for (int64_t i = 0; i < last_dim; ++i) {
+            s_store_add(&out_row[i], scalar_kernel(s_load(&in_row[i])), add_to);
+        }
+    }
+}
+
+// ============================================================
 // Templated implementation (f32 and f16)
 // ============================================================
 
@@ -144,6 +167,48 @@ void unary_impl(const UnaryAttributes& attrs,
             in_row_stride, out_row_stride, add_to,
             [](auto x) { return v_sqrt(x); },
             [](float v) { return std::sqrt(v); });
+        break;
+
+    case UnaryType::Erf:
+        // No SIMD intrinsic — scalar-only path
+        process_unary_rows_scalar(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](float v) { return std::erf(v); });
+        break;
+
+    case UnaryType::Round:
+        // No SIMD intrinsic — scalar-only path
+        process_unary_rows_scalar(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](float v) { return std::round(v); });
+        break;
+
+    case UnaryType::Ceil:
+        // No SIMD intrinsic — scalar-only path
+        process_unary_rows_scalar(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](float v) { return std::ceil(v); });
+        break;
+
+    case UnaryType::Floor:
+        // No SIMD intrinsic — scalar-only path
+        process_unary_rows_scalar(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](float v) { return std::floor(v); });
+        break;
+
+    case UnaryType::Recip:
+        // No SIMD intrinsic — scalar-only path
+        process_unary_rows_scalar(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](float v) { return 1.0f / v; });
+        break;
+
+    case UnaryType::Sign:
+        // No SIMD intrinsic — scalar-only path
+        process_unary_rows_scalar(in_ptr, out_ptr, num_rows, last_dim,
+            in_row_stride, out_row_stride, add_to,
+            [](float v) { return (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f); });
         break;
 
     }  // switch

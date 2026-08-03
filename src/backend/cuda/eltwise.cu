@@ -110,6 +110,17 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    case EltwiseType::Pow: {
+        for (int i = tid; i < last_dim; i += blockDim.x) {
+            float rv = powf(s_load(&a_row[i]), s_load(&b_row[i]));
+            if (add_to) {
+                s_store(&o_row[i], s_load(&o_row[i]) + rv);
+            } else {
+                s_store(&o_row[i], rv);
+            }
+        }
+        break;
+    }
     }
 }
 
@@ -192,6 +203,17 @@ __global__ void eltwise_flat_kernel(
             float av = s_load(&a[i]);
             float bv = s_load(&b[i]);
             float rv = av > bv ? av : bv;
+            if (add_to) {
+                s_store(&output[i], s_load(&output[i]) + rv);
+            } else {
+                s_store(&output[i], rv);
+            }
+        }
+        break;
+    }
+    case EltwiseType::Pow: {
+        for (int i = tid; i < total; i += stride) {
+            float rv = powf(s_load(&a[i]), s_load(&b[i]));
             if (add_to) {
                 s_store(&output[i], s_load(&output[i]) + rv);
             } else {

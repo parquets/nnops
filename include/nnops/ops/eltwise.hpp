@@ -20,6 +20,7 @@ enum class EltwiseType : uint8_t {
     Div,   ///< C = A / B
     Min,   ///< C = element-wise min(A, B)
     Max,   ///< C = element-wise max(A, B)
+    Pow,   ///< C = A ^ B  (pow(A, B))
 };
 
 /// Attributes for the Eltwise operator.

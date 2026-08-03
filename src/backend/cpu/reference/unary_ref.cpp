@@ -184,6 +184,103 @@ void unary_impl_ref(const UnaryAttributes& attrs,
         break;
     }
 
+    case UnaryType::Erf: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_rs;
+            T* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float rv = std::erf(s_load(&in_row[i]));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+
+    case UnaryType::Round: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_rs;
+            T* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float rv = std::round(s_load(&in_row[i]));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+
+    case UnaryType::Ceil: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_rs;
+            T* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float rv = std::ceil(s_load(&in_row[i]));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+
+    case UnaryType::Floor: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_rs;
+            T* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float rv = std::floor(s_load(&in_row[i]));
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+
+    case UnaryType::Recip: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_rs;
+            T* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float rv = 1.0f / s_load(&in_row[i]);
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+
+    case UnaryType::Sign: {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            const T* in_row = in_ptr + r * in_rs;
+            T* out_row = out_ptr + r * out_rs;
+            for (int64_t i = 0; i < last_dim; ++i) {
+                float v = s_load(&in_row[i]);
+                float rv = (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f);
+                if (add_to) {
+                    s_store(&out_row[i], s_load(&out_row[i]) + rv);
+                } else {
+                    s_store(&out_row[i], rv);
+                }
+            }
+        }
+        break;
+    }
+
     }  // switch
 }
 

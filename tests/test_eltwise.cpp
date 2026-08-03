@@ -424,6 +424,95 @@ NNOPS_TEST(eltwise_random_max) {
     }
 }
 
+// ============================================================
+// Pow tests
+// ============================================================
+
+NNOPS_TEST(eltwise_pow_1d) {
+    const int64_t shape[] = {4};
+    float a_data[]  = {2.0f, 3.0f, 4.0f, 5.0f};
+    float b_data[]  = {2.0f, 3.0f, 2.0f, 0.0f};
+    float out_data[4] = {};
+
+    TensorView a(shape, DataType::f32, a_data);
+    TensorView b(shape, DataType::f32, b_data);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Pow;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    auto d_a = a.desc();
+    auto d_b = b.desc();
+    const TensorDesc desc_arr[] = {d_a, d_b};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].rank, 1);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
+
+    auto output = test::make_planar(descs[0], out_data);
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_data[0], 4.0f, 1e-5f);    // 2^2
+    NNOPS_EXPECT_NEAR(out_data[1], 27.0f, 1e-5f);   // 3^3
+    NNOPS_EXPECT_NEAR(out_data[2], 16.0f, 1e-5f);   // 4^2
+    NNOPS_EXPECT_NEAR(out_data[3], 1.0f, 1e-5f);    // 5^0
+}
+
+NNOPS_TEST(eltwise_pow_add_to) {
+    const int64_t shape[] = {3};
+    float a_data[]  = {2.0f, 3.0f, 4.0f};
+    float b_data[]  = {2.0f, 2.0f, 2.0f};
+    float out_data[] = {10.0f, 20.0f, 30.0f};
+
+    TensorView a(shape, DataType::f32, a_data);
+    TensorView b(shape, DataType::f32, b_data);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Pow;
+    attrs.add_to = true;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    auto d_a = a.desc();
+    auto d_b = b.desc();
+    const TensorDesc desc_arr[] = {d_a, d_b};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    auto output = test::make_planar(descs[0], out_data);
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_data[0], 10.0f + 4.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_data[1], 20.0f + 9.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_data[2], 30.0f + 16.0f, 1e-5f);
+}
+
+NNOPS_TEST(eltwise_random_pow) {
+    auto [a_vec, a] = test::make_random_tensor({1000}, 0.1f, 3.0f, 42);
+    auto [b_vec, b] = test::make_random_tensor({1000}, 0.1f, 2.0f, 99);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Pow;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    auto d_a = a.desc();
+    auto d_b = b.desc();
+    const TensorDesc desc_arr[] = {d_a, d_b};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    std::vector<float> out_buf(1000);
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    for (int i = 0; i < 1000; ++i) {
+        float expected = std::pow(a_vec[i], b_vec[i]);
+        NNOPS_EXPECT_NEAR(out_buf[i], expected, 1e-4f);
+    }
+}
+
 NNOPS_TEST(eltwise_min_max_2d) {
     const int64_t shape[] = {2, 3};
     float a_data[] = {1, 5, 3, 9, 2, 7};

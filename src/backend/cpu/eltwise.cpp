@@ -16,6 +16,8 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
+#include <cmath>
+
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
@@ -46,6 +48,30 @@ inline void process_eltwise_rows(
             v_store_add(o_row + i, simd_kernel(v_load(a_row + i), v_load(b_row + i)), add_to);
         }
         for (; i < last_dim; ++i) {
+            s_store_add(&o_row[i], scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i])), add_to);
+        }
+    }
+}
+
+// ============================================================
+// Scalar-only row-processing helper for ops without SIMD intrinsics
+// (e.g. Pow). Same row-loop structure as process_eltwise_rows but
+// scalar-only — no SIMD loop, no tail.
+// ============================================================
+
+template <typename T, typename ScalarK>
+inline void process_eltwise_rows_scalar(
+    const T* a_ptr, const T* b_ptr, T* o_ptr,
+    int64_t num_rows, int64_t last_dim,
+    int64_t a_row_stride, int64_t b_row_stride, int64_t o_row_stride,
+    bool add_to,
+    ScalarK&& scalar_kernel)
+{
+    for (int64_t r = 0; r < num_rows; ++r) {
+        const T* a_row = a_ptr + r * a_row_stride;
+        const T* b_row = b_ptr + r * b_row_stride;
+        T* o_row = o_ptr + r * o_row_stride;
+        for (int64_t i = 0; i < last_dim; ++i) {
             s_store_add(&o_row[i], scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i])), add_to);
         }
     }
@@ -126,6 +152,13 @@ void eltwise_impl(const EltwiseAttributes& attrs,
             a_row_stride, b_row_stride, o_row_stride, add_to,
             [](auto va, auto vb) { return v_max(va, vb); },
             [](float a, float b) { return a > b ? a : b; });
+        break;
+
+    case EltwiseType::Pow:
+        // No SIMD intrinsic for pow — scalar-only path
+        process_eltwise_rows_scalar(a_ptr, b_ptr, o_ptr, num_rows, last_dim,
+            a_row_stride, b_row_stride, o_row_stride, add_to,
+            [](float a, float b) { return std::pow(a, b); });
         break;
 
     }  // switch

@@ -26,6 +26,12 @@ __device__ inline float unary_tanh(float x)  { return tanhf(x); }
 __device__ inline float unary_abs(float x)   { return fabsf(x); }
 __device__ inline float unary_neg(float x)   { return -x; }
 __device__ inline float unary_sqrt(float x)  { return sqrtf(x); }
+__device__ inline float unary_erf(float x)   { return erff(x); }
+__device__ inline float unary_round(float x) { return rintf(x); }
+__device__ inline float unary_ceil(float x)  { return ceilf(x); }
+__device__ inline float unary_floor(float x) { return floorf(x); }
+__device__ inline float unary_recip(float x) { return 1.0f / x; }
+__device__ inline float unary_sign(float x)  { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
 
 // ============================================================
 // Function pointer type for unary
