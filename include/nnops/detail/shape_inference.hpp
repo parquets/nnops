@@ -609,4 +609,35 @@ inline std::vector<TensorDesc> argminmax_output_shape(
     return {out};
 }
 
+/// TopK shape inference.
+/// Replaces the axis dimension with k. Returns two outputs: values and indices.
+/// values: same dtype as input, axis dim replaced by k.
+/// indices: int64, same shape as values.
+inline std::vector<TensorDesc> topk_output_shape(
+    int64_t axis,
+    int64_t k,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+    const int64_t rank = in.rank;
+    const int64_t ax = resolve_axis(axis, rank);
+
+    // Values output: same dtype, axis dim replaced by k
+    TensorDesc values;
+    values.rank   = rank;
+    values.layout = in.layout;
+    values.dtype  = in.dtype;
+    values.dims.resize(static_cast<size_t>(rank));
+    for (int64_t i = 0; i < rank; ++i) {
+        values.dims[static_cast<size_t>(i)] =
+            (i == ax) ? k : in.dims[static_cast<size_t>(i)];
+    }
+
+    // Indices output: int64, same shape as values
+    TensorDesc indices = values;
+    indices.dtype = DataType::i64;
+
+    return {values, indices};
+}
+
 }  // namespace nnops

@@ -33,3 +33,4 @@
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/argminmax.hpp"
+#include "nnops/ops/topk.hpp"

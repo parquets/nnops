@@ -26,6 +26,7 @@ set(TEST_SOURCES
     test_quant_linear.cpp
     test_concat.cpp
     test_argminmax.cpp
+    test_topk.cpp
 )
 
 # Vulkan tests (only when Vulkan backend is enabled)

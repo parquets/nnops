@@ -321,7 +321,10 @@ public:
     int64_t total_rows() const noexcept {
         if (rank_ < 1) return 0;
         int64_t rows = shape_[0];  // N
-        if (rank_ >= 2) {
+        // Channel blocks only matter when there are spatial dims (rank >= 3).
+        // For rank-2 [N, C], shape_[1] IS the last dim, not a separate channel
+        // dimension — each "row" is the whole C-contiguous block.
+        if (rank_ >= 3) {
             rows *= num_channel_blocks();
         }
         for (int64_t d = 2; d < rank_ - 1; ++d) {
