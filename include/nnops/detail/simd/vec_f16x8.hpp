@@ -39,6 +39,7 @@
   using arch::neon::v_cmplt;
   using arch::neon::v_cmpgt;
   using arch::neon::v_sqrt;
+  using arch::neon::v_rcp;
   using arch::neon::v_exp;
   using arch::neon::v_log;
   using arch::neon::v_sin;
@@ -81,6 +82,7 @@
   using arch::sse::v_cmplt;
   using arch::sse::v_cmpgt;
   using arch::sse::v_sqrt;
+  using arch::sse::v_rcp;
   using arch::sse::v_exp;
   using arch::sse::v_log;
   using arch::sse::v_sin;
@@ -121,6 +123,7 @@
   using arch::scalar::v_abs;
   using arch::scalar::v_neg;
   using arch::scalar::v_sqrt;
+  using arch::scalar::v_rcp;
   using arch::scalar::v_exp;
   using arch::scalar::v_log;
   using arch::scalar::v_sin;

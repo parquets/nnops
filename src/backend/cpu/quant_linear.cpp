@@ -13,6 +13,7 @@
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "simd_kernel/simd_quant.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,24 +26,7 @@ using namespace nnops::simd;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
-
-namespace {
-
-constexpr int L = 8;
-
-inline int32_t int_min(DataType dt) { return (dt == DataType::i8) ? -128 : 0; }
-inline int32_t int_max(DataType dt) { return (dt == DataType::i8) ? 127 : 255; }
-
-inline void write_int8(void* ptr, DataType dt, int64_t off, int32_t val) {
-    int32_t lo = int_min(dt), hi = int_max(dt);
-    val = std::max(lo, std::min(hi, val));
-    if (dt == DataType::i8)
-        static_cast<int8_t*>(ptr)[off] = static_cast<int8_t>(val);
-    else
-        static_cast<uint8_t*>(ptr)[off] = static_cast<uint8_t>(val);
-}
-
-}  // anonymous namespace
+namespace k = nnops::kernel::quant;
 
 // ============================================================
 // QuantizeLinear: float → integer
@@ -79,20 +63,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
 
     const int64_t pack = X.channel_pack_size();
 
-    // Helper: load a float32 vector from input (f32 or f16 → f32)
-    auto load_input8 = [](const T* p) -> v_f32x8 {
-        if constexpr (std::is_same_v<T, half>) {
-            // v_f16x8 → v_f32x8 conversion via scalar buffer (avoid ADL ambiguity)
-            alignas(16) half htmp[8];
-            v_store(htmp, v_load(p));
-            float fbuf[8];
-            for (int i = 0; i < 8; ++i) fbuf[i] = half_to_float(htmp[i]);
-            return v_load(fbuf);
-        } else {
-            return v_load(p);
-        }
-    };
-
     if (pack > 1 && axis == rank - 1) {
         // ---- Packed SIMD: axis == last dim (W), per-lane processing ----
         const int64_t num_rows = X.total_rows();
@@ -108,18 +78,12 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
 
             for (int64_t w = 0; w < D; ++w) {
                 int64_t off = w * pack;
-                auto vx = load_input8(x_row + off);
+                auto vx = k::load_input8(x_row + off);
                 float inv_s = is_per_channel ? (1.0f / s_f32[static_cast<size_t>(w)]) : (1.0f / s_val);
                 auto vs = v_set1_f32x8(inv_s);
                 auto vzp = v_set1_f32x8(is_per_channel ? z_f32[static_cast<size_t>(w)] : z_val);
                 auto vr = v_add(v_mul(vx, vs), vzp);
-
-                alignas(32) float ftmp[8];
-                v_store(ftmp, vr);
-                for (int lane = 0; lane < pack; ++lane) {
-                    int32_t q = static_cast<int32_t>(std::lround(ftmp[lane]));
-                    write_int8(y_row, out_dtype, off + lane, q);
-                }
+                k::quantize_store(vr, y_row, off, pack, out_dtype);
             }
         };
 
@@ -163,7 +127,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                     else
                         xv = static_cast<float>(x_base[inner_off + k * x_axis_stride]);
                     float q = std::round(xv / s_f32[static_cast<size_t>(k)]) + z_f32[static_cast<size_t>(k)];
-                    write_int8(y_base, out_dtype, inner_off + k * x_axis_stride, static_cast<int32_t>(q));
+                    k::write_int8(y_base, out_dtype, inner_off + k * x_axis_stride, static_cast<int32_t>(q));
                 }
             }
         };
@@ -190,15 +154,10 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                 float inv_s = 1.0f / s_f32[0];
                 auto vs = v_set1_f32x8(inv_s);
                 auto vzp = v_set1_f32x8(z_f32[0]);
-                for (; i + L <= base + D * stride_after_axis; i += L) {
-                    auto vx = load_input8(X.ptr<T>() + i);
+                for (; i + k::L <= base + D * stride_after_axis; i += k::L) {
+                    auto vx = k::load_input8(X.ptr<T>() + i);
                     auto vr = v_add(v_mul(vx, vs), vzp);
-                    alignas(32) float ftmp[8];
-                    v_store(ftmp, vr);
-                    for (int lane = 0; lane < L; ++lane) {
-                        int32_t q = static_cast<int32_t>(std::lround(ftmp[lane]));
-                        write_int8(output.ptr<void>(), out_dtype, i + lane, q);
-                    }
+                    k::quantize_store(vr, output.ptr<void>(), i, k::L, out_dtype);
                 }
                 for (; i < base + D * stride_after_axis; ++i) {
                     float xv;
@@ -207,7 +166,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                     else
                         xv = X.ptr<float>()[i];
                     float q = std::round(xv * inv_s) + z_f32[0];
-                    write_int8(output.ptr<void>(), out_dtype, i, static_cast<int32_t>(q));
+                    k::write_int8(output.ptr<void>(), out_dtype, i, static_cast<int32_t>(q));
                 }
             } else {
                 // Per-channel or non-contiguous: scalar loop with per-k scale/zp
@@ -218,15 +177,10 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                     auto vzp = v_set1_f32x8(z);
                     int64_t ks = base + k * X.stride_elems(axis);
                     int64_t i = 0;
-                    for (; i + L <= stride_after_axis; i += L) {
-                        auto vx = load_input8(X.ptr<T>() + ks + i);
+                    for (; i + k::L <= stride_after_axis; i += k::L) {
+                        auto vx = k::load_input8(X.ptr<T>() + ks + i);
                         auto vr = v_add(v_mul(vx, vs), vzp);
-                        alignas(32) float ftmp[8];
-                        v_store(ftmp, vr);
-                        for (int lane = 0; lane < L; ++lane) {
-                            int32_t q = static_cast<int32_t>(std::lround(ftmp[lane]));
-                            write_int8(output.ptr<void>(), out_dtype, ks + i + lane, q);
-                        }
+                        k::quantize_store(vr, output.ptr<void>(), ks + i, k::L, out_dtype);
                     }
                     for (; i < stride_after_axis; ++i) {
                         float xv;
@@ -235,7 +189,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                         else
                             xv = X.ptr<float>()[ks + i];
                         float q = std::round(xv * inv_s) + z;
-                        write_int8(output.ptr<void>(), out_dtype, ks + i, static_cast<int32_t>(q));
+                        k::write_int8(output.ptr<void>(), out_dtype, ks + i, static_cast<int32_t>(q));
                     }
                 }
             }
@@ -283,25 +237,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
 
     const int64_t pack = X.channel_pack_size();
 
-    // Helper: load 8 int8/uint8 values and widen to v_f32x8
-    auto load_int8_to_f32 = [in_is_i8](const void* p) -> v_f32x8 {
-        if (in_is_i8)
-            return v_cvt_i8_to_f32(static_cast<const int8_t*>(p));
-        else
-            return v_cvt_u8_to_f32(static_cast<const uint8_t*>(p));
-    };
-
-    // Helper: store v_f32x8 to output (f32 or f16)
-    auto store_output8 = [](T* dest, const v_f32x8& vy) {
-        if constexpr (std::is_same_v<T, half>) {
-            alignas(32) float fbuf[8];
-            v_store(fbuf, vy);
-            for (int i = 0; i < 8; ++i) dest[i] = float_to_half(fbuf[i]);
-        } else {
-            v_store(dest, vy);
-        }
-    };
-
     if (pack > 1 && axis == rank - 1) {
         // ---- Packed SIMD: axis == last dim (W), per-lane processing ----
         const int64_t num_rows = X.total_rows();
@@ -318,13 +253,13 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
 
             for (int64_t w = 0; w < W; ++w) {
                 int64_t off = w * pack;
-                auto vx = load_int8_to_f32(static_cast<const char*>(x_row) + off);
+                auto vx = k::load_int8_to_f32(static_cast<const char*>(x_row) + off, in_is_i8);
                 float s = is_per_channel ? s_f32[static_cast<size_t>(w)] : s_val;
                 float z = is_per_channel ? z_f32[static_cast<size_t>(w)] : z_val;
                 auto vs = v_set1_f32x8(s);
                 auto vz = v_set1_f32x8(z);
                 auto vy = v_mul(v_sub(vx, vz), vs);
-                store_output8(y_row + off, vy);
+                k::dequant_store(vy, y_row + off);
             }
         };
 
@@ -399,10 +334,10 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                 int64_t i = base;
                 auto vs = v_set1_f32x8(s);
                 auto vz = v_set1_f32x8(z);
-                for (; i + L <= base + total; i += L) {
-                    auto vx = load_int8_to_f32(static_cast<const char*>(X.ptr<void>()) + i);
+                for (; i + k::L <= base + total; i += k::L) {
+                    auto vx = k::load_int8_to_f32(static_cast<const char*>(X.ptr<void>()) + i, in_is_i8);
                     auto vy = v_mul(v_sub(vx, vz), vs);
-                    store_output8(output.ptr<T>() + i, vy);
+                    k::dequant_store(vy, output.ptr<T>() + i);
                 }
                 for (; i < base + total; ++i) {
                     int32_t iv = in_is_i8
@@ -423,10 +358,10 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                     int64_t i = 0;
                     auto vs = v_set1_f32x8(s);
                     auto vz = v_set1_f32x8(z);
-                    for (; i + L <= stride_after_axis; i += L) {
-                        auto vx = load_int8_to_f32(static_cast<const char*>(X.ptr<void>()) + ks + i);
+                    for (; i + k::L <= stride_after_axis; i += k::L) {
+                        auto vx = k::load_int8_to_f32(static_cast<const char*>(X.ptr<void>()) + ks + i, in_is_i8);
                         auto vy = v_mul(v_sub(vx, vz), vs);
-                        store_output8(output.ptr<T>() + ks + i, vy);
+                        k::dequant_store(vy, output.ptr<T>() + ks + i);
                     }
                     for (; i < stride_after_axis; ++i) {
                         int32_t iv = in_is_i8

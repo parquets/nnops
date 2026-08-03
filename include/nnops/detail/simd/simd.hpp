@@ -179,6 +179,18 @@ inline void s_store_add(Ptr ptr, float val, bool add_to) {
 }
 
 // ============================================================
+// v_pow — composed from existing SIMD primitives:
+//   pow(a, b) = exp(b * log(a))
+// Works for all vector types (v_f32x4, v_f32x8, v_f16x8) and
+// all backends — no arch-specific intrinsics needed.
+// ============================================================
+
+template <typename V>
+inline V v_pow(V a, V b) {
+    return v_exp(v_mul(b, v_log(a)));
+}
+
+// ============================================================
 // Deinterleave (stride-2 gather) — generic overloads
 //
 // Three API styles (方案 A / B / C), type-dispatched on pointer type:

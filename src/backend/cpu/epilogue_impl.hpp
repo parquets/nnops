@@ -11,7 +11,7 @@
 
 #include "nnops/core/epilogue.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "activation_kernels.hpp"
+#include "simd_kernel/activation_kernels.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -81,7 +81,8 @@ inline float apply_epilogue(const Epilogue& ep, float x, int64_t /*channel*/) {
 
 namespace nnops::backend::cpu {
 
-using namespace simd;
+using namespace simd;  // v_load, v_zero, v_set1, etc.
+using namespace nnops::kernel;  // pure SIMD kernels: relu, gelu, sigmoid, ...
 
 /// Deduce the SIMD vector type for a given data pointer type T*.
 /// v_load(float*) → v_f32x8, v_load(half*) → v_f16x8.
@@ -103,32 +104,32 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
     case EpilogueActivateType::None:
         return vx;
     case EpilogueActivateType::Relu:
-        return kernel_relu(vx, v_zero(type_tag));
+        return relu(vx, v_zero(type_tag));
     case EpilogueActivateType::LeakyRelu:
-        return kernel_leaky_relu(vx, v_zero(type_tag),
+        return leaky_relu(vx, v_zero(type_tag),
                                  v_set1(type_tag, ep.alpha));
     case EpilogueActivateType::Sigmoid:
-        return kernel_sigmoid(vx, v_set1(type_tag, 1.0f));
+        return sigmoid(vx, v_set1(type_tag, 1.0f));
     case EpilogueActivateType::Tanh:
-        return kernel_tanh(vx);
+        return tanh(vx);
     case EpilogueActivateType::Gelu: {
         constexpr float c = 0.7978845608028654f;
-        return kernel_gelu(vx,
+        return gelu(vx,
             v_set1(type_tag, 0.5f),
             v_set1(type_tag, 1.0f),
             v_set1(type_tag, c),
             v_set1(type_tag, 0.044715f));
     }
     case EpilogueActivateType::Silu:
-        return kernel_silu(vx, v_set1(type_tag, 1.0f));
+        return silu(vx, v_set1(type_tag, 1.0f));
     case EpilogueActivateType::HardSwish:
-        return kernel_hard_swish(vx,
+        return hard_swish(vx,
             v_zero(type_tag),
             v_set1(type_tag, 3.0f),
             v_set1(type_tag, 6.0f),
             v_set1(type_tag, ep.beta / 6.0f));
     case EpilogueActivateType::Elu:
-        return kernel_elu(vx,
+        return elu(vx,
             v_zero(type_tag),
             v_set1(type_tag, ep.alpha),
             v_set1(type_tag, 1.0f));

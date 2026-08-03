@@ -387,6 +387,10 @@ inline v_f16x8 v_sqrt(const v_f16x8& a) {
     __m256 f32 = _mm256_cvtph_ps(a.val);
     return v_f16x8(_mm256_cvtps_ph(_mm256_sqrt_ps(f32), 0));
 }
+inline v_f16x8 v_rcp(const v_f16x8& a) {
+    __m256 f32 = _mm256_cvtph_ps(a.val);
+    return v_f16x8(_mm256_cvtps_ph(_mm256_rcp_ps(f32), 0));
+}
 
 // Transcendental math — widen to fp32, use AVX2 math functions, narrow back
 inline v_f16x8 v_exp(const v_f16x8& a) {

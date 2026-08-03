@@ -392,6 +392,9 @@ inline v_f16x8 v_cmpgt(const v_f16x8& a, const v_f16x8& b) {
 inline v_f16x8 v_sqrt(const v_f16x8& a) {
     return v_f16x8(vsqrtq_f16(a.val));
 }
+inline v_f16x8 v_rcp(const v_f16x8& a) {
+    return v_f16x8(vrecpeq_f16(a.val));
+}
 
 inline float v_reduce_sum(const v_f16x8& a) {
     // Horizontal v_add across all 8 lanes

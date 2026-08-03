@@ -7,10 +7,7 @@
 ///
 /// Algorithm (mirrors onnxruntime):
 ///   – SIMD fast path (axis == rank-1, contiguous tail):
-///       1. SIMD reduce sum_sq in typed vectors.
-///       2. Scalar tail accumulation (no Welford needed — RMSNorm has no mean).
-///       3. Compute rms = sqrt(sum_sq / N + eps), inv_rms = 1 / rms.
-///       4. Normalize with typed SIMD + scalar tail: y = x * inv_rms * scale.
+///       Uses kernel::rms_norm::process_row for SIMD reduction + normalize.
 ///   – General scalar fallback (arbitrary axis):
 ///       Simple sum of squares accumulation, then normalize.
 ///
@@ -24,6 +21,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "simd_kernel/simd_rms_norm.hpp"
 
 #include <cmath>
 
@@ -135,9 +133,7 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
 
     const bool add_to = attrs.add_to;
 
-    // ============================================================
     // Fast path: axis is the innermost contiguous dimension
-    // ============================================================
     const bool is_contiguous_tail = (axis == rank - 1);
 
     if (!is_contiguous_tail) {
@@ -148,88 +144,17 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
         return;
     }
 
-    // Fast path: contiguous tail
-    const int64_t last_dim = norm_size;
+    // Fast path: contiguous tail — delegate to SIMD kernel
     const int64_t x_row_stride = X.row_stride_elems();
-
     const bool scale_is_scalar = (scale.numel() == 1);
-
-    constexpr int L = simd_lane_for<T>;
 
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
-
-        // ---- Pass 1: 4-wide multi-accumulator SIMD reduction + scalar tail ----
-        float sum_sq = 0.0f;
-        int64_t i = 0;
-
-        {
-            // 4-wide accumulator unrolling
-            auto v_sq0 = v_zero(x_ptr);
-            auto v_sq1 = v_zero(x_ptr);
-            auto v_sq2 = v_zero(x_ptr);
-            auto v_sq3 = v_zero(x_ptr);
-
-            for (; i + 4 * L <= norm_size; i += 4 * L) {
-                auto v0 = v_load(x_ptr + row_off + i);
-                auto v1 = v_load(x_ptr + row_off + i + L);
-                auto v2 = v_load(x_ptr + row_off + i + 2 * L);
-                auto v3 = v_load(x_ptr + row_off + i + 3 * L);
-                v_sq0 = v_fmadd(v0, v0, v_sq0);
-                v_sq1 = v_fmadd(v1, v1, v_sq1);
-                v_sq2 = v_fmadd(v2, v2, v_sq2);
-                v_sq3 = v_fmadd(v3, v3, v_sq3);
-            }
-            auto v_sum_sq = v_add(v_add(v_sq0, v_sq1), v_add(v_sq2, v_sq3));
-
-            // 2-wide remainder
-            auto v_sq4 = v_zero(x_ptr);
-            auto v_sq5 = v_zero(x_ptr);
-            for (; i + 2 * L <= norm_size; i += 2 * L) {
-                auto v4 = v_load(x_ptr + row_off + i);
-                auto v5 = v_load(x_ptr + row_off + i + L);
-                v_sq4 = v_fmadd(v4, v4, v_sq4);
-                v_sq5 = v_fmadd(v5, v5, v_sq5);
-            }
-            v_sum_sq = v_add(v_sum_sq, v_add(v_sq4, v_sq5));
-
-            // Single-accumulator remainder
-            for (; i + L <= norm_size; i += L) {
-                auto v = v_load(x_ptr + row_off + i);
-                v_sum_sq = v_fmadd(v, v, v_sum_sq);
-            }
-
-            sum_sq = v_reduce_sum(v_sum_sq);
-        }
-
-        // Scalar tail for reduction
-        for (; i < norm_size; ++i) {
-            float x = s_load(&x_ptr[row_off + i]);
-            sum_sq += x * x;
-        }
-
-        // ---- Compute RMS ----
-        const float rms = std::sqrt(sum_sq / static_cast<float>(norm_size) + epsilon);
-        const float inv_rms = 1.0f / rms;
-
-        // ---- Pass 2: SIMD normalize ----
-        i = 0;
-
-        const auto v_inv_rms = v_set1(x_ptr, inv_rms);
-
-        for (; i + L <= norm_size; i += L) {
-            auto x = v_load(x_ptr + row_off + i);
-            auto vs = v_load(s_ptr + (scale_is_scalar ? 0 : i));
-            auto rv = v_mul(v_mul(x, v_inv_rms), vs);
-            v_store_add(y_ptr + row_off + i, rv, add_to);
-        }
-        for (; i < norm_size; ++i) {
-            int64_t s_idx = scale_is_scalar ? 0 : i;
-            float x = s_load(&x_ptr[row_off + i]);
-            float s = s_load(&s_ptr[s_idx]);
-            float rv = x * inv_rms * s;
-            s_store_add(&y_ptr[row_off + i], rv, add_to);
-        }
+        kernel::rms_norm::process_row<T>(
+            x_ptr + row_off, y_ptr + row_off,
+            s_ptr,
+            norm_size, epsilon,
+            scale_is_scalar, add_to);
     };
 
     // ---- Parallel dispatch ----

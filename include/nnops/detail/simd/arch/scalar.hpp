@@ -514,6 +514,13 @@ inline v_f16x8 v_sqrt(const v_f16x8& a) {
     }
     return r;
 }
+inline v_f16x8 v_rcp(const v_f16x8& a) {
+    v_f16x8 r;
+    for (int i = 0; i < 8; ++i) {
+        r.bits[i] = f32_to_f16(1.0f / f16_to_f32(a.bits[i]));
+    }
+    return r;
+}
 
 inline float v_reduce_sum(const v_f16x8& a) {
     float s = 0.0f;
