@@ -8,7 +8,7 @@
 #include <vector>
 #include <random>
 
-using namespace nnops::kernel::eltwise;
+using namespace nnops::kernel;
 
 // ------------------------------------------------------------------
 // Helpers

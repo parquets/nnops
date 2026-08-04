@@ -7,7 +7,7 @@
 ///
 /// Algorithm:
 ///   – SIMD fast path (axis == rank-1, contiguous tail):
-///       Uses kernel::layer_norm::process_row for SIMD reduction + normalize.
+///       Uses kernel::layer_norm_process_row for SIMD reduction + normalize.
 ///   – General scalar fallback (arbitrary axis):
 ///       Welford's single-pass algorithm for mean and variance, then normalize.
 ///
@@ -156,7 +156,7 @@ void layer_norm_impl(const LayerNormAttributes& attrs,
 
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
-        kernel::layer_norm::process_row<T>(
+        kernel::layer_norm_process_row<T>(
             x_ptr + row_off, y_ptr + row_off,
             s_ptr, b_ptr,
             norm_size, epsilon,

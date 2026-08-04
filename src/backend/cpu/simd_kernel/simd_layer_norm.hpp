@@ -13,7 +13,7 @@
 
 #include <cmath>
 
-namespace nnops::kernel::layer_norm {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -21,19 +21,8 @@ using namespace simd;
 ///
 /// Performs: sum/sum_sq SIMD reduction → compute stats → SIMD normalize.
 /// The row is contiguous (axis == rank-1, pack == 1).
-///
-/// @tparam T      Data type (float or half)
-/// @param x       Input row pointer
-/// @param y       Output row pointer
-/// @param scale   Scale (gamma) array (scalar or full-size)
-/// @param bias    Bias (beta) array (nullptr if no bias), may be scalar or full-size
-/// @param n       Number of elements in the row
-/// @param epsilon Epsilon for numerical stability
-/// @param scale_is_scalar  If true, scale[0] applies to all elements
-/// @param has_bias         If false, bias is treated as zero
-/// @param add_to  If true, accumulate into output; if false, overwrite
 template <typename T>
-inline void process_row(
+inline void layer_norm_process_row(
     const T* x, T* y,
     const T* scale, const T* bias,
     int64_t n, float epsilon,
@@ -42,15 +31,11 @@ inline void process_row(
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    // ================================================================
     // Pass 1 — 4-wide multi-accumulator SIMD reduction + scalar tail
-    // ================================================================
-
     float sum = 0.0f;
     float sum_sq = 0.0f;
 
     {
-        // 4-wide accumulator unrolling
         auto v_sum0 = v_zero(x);
         auto v_sum_sq0 = v_zero(x);
         auto v_sum1 = v_zero(x);
@@ -74,12 +59,10 @@ inline void process_row(
             v_sum3 = v_add(v_sum3, v3);
             v_sum_sq3 = v_fmadd(v3, v3, v_sum_sq3);
         }
-        // Merge 4 accumulators
         auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
         auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
                               v_add(v_sum_sq2, v_sum_sq3));
 
-        // 2-wide remainder
         auto v_sum4 = v_zero(x);
         auto v_sum_sq4 = v_zero(x);
         auto v_sum5 = v_zero(x);
@@ -95,7 +78,6 @@ inline void process_row(
         v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
         v_sum_sq = v_add(v_sum_sq, v_add(v_sum_sq4, v_sum_sq5));
 
-        // Single-accumulator remainder
         for (; i + L <= n; i += L) {
             auto v = v_load(x + i);
             v_sum = v_add(v_sum, v);
@@ -106,28 +88,24 @@ inline void process_row(
         sum_sq = v_reduce_sum(v_sum_sq);
     }
 
-    // Scalar tail
     for (; i < n; ++i) {
         float xv = s_load(&x[i]);
         sum += xv;
         sum_sq += xv * xv;
     }
 
-    // ---- Compute statistics ----
     const float inv_n = 1.0f / static_cast<float>(n);
     const float mean_val = sum * inv_n;
     float var_val = sum_sq * inv_n - mean_val * mean_val;
-    if (var_val < 0.0f) { var_val = 0.0f; }  // guard against rounding
+    if (var_val < 0.0f) { var_val = 0.0f; }
     const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
 
-    // ================================================================
     // Pass 2 — SIMD normalize
-    // ================================================================
     i = 0;
 
     const auto v_mean    = v_set1(x, mean_val);
     const auto v_inv_std = v_set1(x, inv_std);
-    const auto v_zero_b  = v_zero(x);  // bias fallback when no bias
+    const auto v_zero_b  = v_zero(x);
 
     for (; i + L <= n; i += L) {
         auto xv = v_load(x + i);
@@ -149,4 +127,4 @@ inline void process_row(
     }
 }
 
-}  // namespace nnops::kernel::layer_norm
+}  // namespace nnops::kernel

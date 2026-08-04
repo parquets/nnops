@@ -10,7 +10,7 @@
 ///
 /// Usage:
 ///   #include "simd_kernel/simd_activation.hpp"
-///   using namespace nnops::kernel::activation;
+///   using namespace nnops::kernel;
 ///   relu<float>(in, out, m, n, in_pitch, out_pitch, add_to);
 
 #include "nnops/detail/simd/simd.hpp"
@@ -20,12 +20,9 @@
 #include <algorithm>
 #include <cmath>
 
-namespace nnops::kernel::activation {
+namespace nnops::kernel {
 
 using namespace simd;
-// Pure SIMD kernels live in nnops::kernel (parent namespace).
-// Use fully-qualified names to avoid shadowing by same-name tiled wrappers.
-namespace k = nnops::kernel;
 
 // ============================================================
 // Tiled activation kernels — one per activation type
@@ -39,8 +36,8 @@ inline void relu(
     bool add_to = false)
 {
     auto vzero = v_zero(in);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vzero](auto x) { return k::relu(x, vzero); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vzero](auto x) { return v_relu(x, vzero); },
         [](float v) { return v > 0.0f ? v : 0.0f; });
 }
 
@@ -53,8 +50,8 @@ inline void leaky_relu(
 {
     auto vzero  = v_zero(in);
     auto valpha = v_set1(in, alpha);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vzero, valpha](auto x) { return k::leaky_relu(x, vzero, valpha); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vzero, valpha](auto x) { return v_leaky_relu(x, vzero, valpha); },
         [alpha](float v) { return v > 0.0f ? v : alpha * v; });
 }
 
@@ -66,21 +63,9 @@ inline void sigmoid(
     bool add_to = false)
 {
     auto vone = v_set1(in, 1.0f);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vone](auto x) { return k::sigmoid(x, vone); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vone](auto x) { return v_sigmoid(x, vone); },
         [](float v) { return 1.0f / (1.0f + std::exp(-v)); });
-}
-
-template <typename T>
-inline void tanh(
-    const T* in, T* out,
-    int64_t m, int64_t n,
-    int64_t in_pitch, int64_t out_pitch,
-    bool add_to = false)
-{
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [](auto x) { return k::tanh(x); },
-        [](float v) { return std::tanh(v); });
 }
 
 template <typename T>
@@ -94,8 +79,8 @@ inline void gelu(
     auto vone   = v_set1(in, 1.0f);
     auto vc     = v_set1(in, 0.7978845608028654f);
     auto vcoeff = v_set1(in, 0.044715f);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vhalf, vone, vc, vcoeff](auto x) { return k::gelu(x, vhalf, vone, vc, vcoeff); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vhalf, vone, vc, vcoeff](auto x) { return v_gelu(x, vhalf, vone, vc, vcoeff); },
         [](float x) {
             return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
         });
@@ -109,8 +94,8 @@ inline void silu(
     bool add_to = false)
 {
     auto vone = v_set1(in, 1.0f);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vone](auto x) { return k::silu(x, vone); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vone](auto x) { return v_silu(x, vone); },
         [](float x) { return x / (1.0f + std::exp(-x)); });
 }
 
@@ -125,8 +110,8 @@ inline void hard_swish(
     auto v3     = v_set1(in, 3.0f);
     auto v6     = v_set1(in, 6.0f);
     auto vscale = v_set1(in, beta / 6.0f);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vzero, v3, v6, vscale](auto x) { return k::hard_swish(x, vzero, v3, v6, vscale); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vzero, v3, v6, vscale](auto x) { return v_hard_swish(x, vzero, v3, v6, vscale); },
         [beta](float x) { return x * std::min(std::max(x + 3.0f, 0.0f), 6.0f) * (beta / 6.0f); });
 }
 
@@ -140,9 +125,9 @@ inline void elu(
     auto vzero  = v_zero(in);
     auto valpha = v_set1(in, alpha);
     auto vone   = v_set1(in, 1.0f);
-    unary::tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
-        [vzero, valpha, vone](auto x) { return k::elu(x, vzero, valpha, vone); },
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vzero, valpha, vone](auto x) { return v_elu(x, vzero, valpha, vone); },
         [alpha](float x) { return x > 0.0f ? x : alpha * (std::exp(x) - 1.0f); });
 }
 
-}  // namespace nnops::kernel::activation
+}  // namespace nnops::kernel

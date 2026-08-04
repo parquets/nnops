@@ -10,7 +10,7 @@
 
 #include <algorithm>
 
-namespace nnops::kernel::layout_convert {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -19,9 +19,9 @@ using namespace simd;
 // ============================================================
 
 template <typename T>
-inline void pack_one_w(const T* in_row, T* out_row,
-                        int64_t w, int64_t c_base, int64_t ch_stride,
-                        int64_t valid_lanes) {
+inline void layout_pack_one_w(const T* in_row, T* out_row,
+                               int64_t w, int64_t c_base, int64_t ch_stride,
+                               int64_t valid_lanes) {
     T tmp[8] = {};
     for (int64_t lane = 0; lane < valid_lanes; ++lane) {
         tmp[lane] = in_row[(c_base + lane) * ch_stride + w];
@@ -30,9 +30,9 @@ inline void pack_one_w(const T* in_row, T* out_row,
 }
 
 template <typename T>
-inline void unpack_one_w(const T* in_row, T* out_row,
-                          int64_t w, int64_t c_base, int64_t ch_stride,
-                          int64_t valid_lanes) {
+inline void layout_unpack_one_w(const T* in_row, T* out_row,
+                                 int64_t w, int64_t c_base, int64_t ch_stride,
+                                 int64_t valid_lanes) {
     T tmp[8] = {};
     v_store(tmp, v_load(&in_row[w * 8]));
     for (int64_t lane = 0; lane < valid_lanes; ++lane) {
@@ -45,7 +45,7 @@ inline void unpack_one_w(const T* in_row, T* out_row,
 // ============================================================
 
 template <typename T>
-inline void pack_row(
+inline void layout_pack_row(
     const T* in_row, T* out_row,
     int64_t W, int64_t c_base, int64_t ch_stride,
     int64_t valid_lanes, int64_t C)
@@ -74,7 +74,7 @@ inline void pack_row(
         v_store(&out_row[(w + 7) * 8], c7);
     }
     for (; w < W; ++w) {
-        pack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
+        layout_pack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
     }
 }
 
@@ -83,7 +83,7 @@ inline void pack_row(
 // ============================================================
 
 template <typename T>
-inline void unpack_row(
+inline void layout_unpack_row(
     const T* in_row, T* out_row,
     int64_t W, int64_t c_base, int64_t ch_stride,
     int64_t valid_lanes, int64_t C)
@@ -101,7 +101,6 @@ inline void unpack_row(
 
         v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
 
-        // Store only valid channels (skip pad channels for partial C8)
         if (c_base + 0 < C) v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
         if (c_base + 1 < C) v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
         if (c_base + 2 < C) v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
@@ -111,10 +110,9 @@ inline void unpack_row(
         if (c_base + 6 < C) v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
         if (c_base + 7 < C) v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
     }
-    // Remainder: per-w-element fallback
     for (; w < W; ++w) {
-        unpack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
+        layout_unpack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
     }
 }
 
-}  // namespace nnops::kernel::layout_convert
+}  // namespace nnops::kernel

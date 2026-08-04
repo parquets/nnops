@@ -72,56 +72,56 @@ void activation_impl(const ActivationAttributes& attrs,
     case ActivationType::Relu:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::activation::relu<T>(in, out, m, n, ip, op, at);
+            kernel::relu<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case ActivationType::LeakyRelu:
         tiled_for_each([alpha = attrs.alpha](const T* in, T* out, int64_t m, int64_t n,
                                               int64_t ip, int64_t op, bool at) {
-            kernel::activation::leaky_relu<T>(in, out, m, n, ip, op, at, alpha);
+            kernel::leaky_relu<T>(in, out, m, n, ip, op, at, alpha);
         });
         break;
 
     case ActivationType::Sigmoid:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::activation::sigmoid<T>(in, out, m, n, ip, op, at);
+            kernel::sigmoid<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case ActivationType::Tanh:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::activation::tanh<T>(in, out, m, n, ip, op, at);
+            kernel::tanh<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case ActivationType::Gelu:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::activation::gelu<T>(in, out, m, n, ip, op, at);
+            kernel::gelu<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case ActivationType::Silu:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::activation::silu<T>(in, out, m, n, ip, op, at);
+            kernel::silu<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case ActivationType::HardSwish:
         tiled_for_each([beta = attrs.beta](const T* in, T* out, int64_t m, int64_t n,
                                             int64_t ip, int64_t op, bool at) {
-            kernel::activation::hard_swish<T>(in, out, m, n, ip, op, at, beta);
+            kernel::hard_swish<T>(in, out, m, n, ip, op, at, beta);
         });
         break;
 
     case ActivationType::Elu:
         tiled_for_each([alpha = attrs.alpha](const T* in, T* out, int64_t m, int64_t n,
                                               int64_t ip, int64_t op, bool at) {
-            kernel::activation::elu<T>(in, out, m, n, ip, op, at, alpha);
+            kernel::elu<T>(in, out, m, n, ip, op, at, alpha);
         });
         break;
 

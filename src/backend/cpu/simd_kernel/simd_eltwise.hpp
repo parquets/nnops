@@ -12,14 +12,14 @@
 ///
 /// Usage:
 ///   #include "nnops/backend/cpu/simd_kernel/simd_eltwise.hpp"
-///   using namespace nnops::kernel::eltwise;
+///   using namespace nnops::kernel;
 ///   add(a_ptr, b_ptr, out_ptr, m, n, a_pitch, b_pitch, out_pitch, add_to);
 
 #include "nnops/detail/simd/simd.hpp"
 
 #include <cmath>
 
-namespace nnops::kernel::eltwise {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -166,4 +166,4 @@ inline void pow(
         [](float fa, float fb) { return std::pow(fa, fb); });
 }
 
-}  // namespace nnops::kernel::eltwise
+}  // namespace nnops::kernel

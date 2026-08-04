@@ -26,7 +26,7 @@
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
-namespace k = nnops::kernel::pooling;
+namespace k = nnops::kernel;
 
 namespace {
 

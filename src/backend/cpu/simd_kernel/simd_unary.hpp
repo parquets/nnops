@@ -11,8 +11,8 @@
 /// simd_lane_for<T> = 8 convention used throughout the CPU backend.
 ///
 /// Usage:
-///   #include "nnops/backend/cpu/simd_kernel/simd_unary.hpp"
-///   using namespace nnops::kernel::unary;
+///   #include "simd_kernel/simd_unary.hpp"
+///   using namespace nnops::kernel;
 ///   exp(in_ptr, out_ptr, m, n, in_pitch, out_pitch, add_to);
 ///
 /// All kernels support the `add_to` flag: when true, the result is
@@ -23,7 +23,7 @@
 
 #include <cmath>
 
-namespace nnops::kernel::unary {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -257,4 +257,4 @@ inline void sign(
         [](float v) { return (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f); });
 }
 
-}  // namespace nnops::kernel::unary
+}  // namespace nnops::kernel

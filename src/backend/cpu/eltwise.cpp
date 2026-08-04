@@ -80,7 +80,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::add<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::add<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 
@@ -88,7 +88,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::sub<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::sub<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 
@@ -96,7 +96,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::mul<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::mul<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 
@@ -104,7 +104,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::div<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::div<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 
@@ -112,7 +112,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::min<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::min<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 
@@ -120,7 +120,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::max<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::max<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 
@@ -128,7 +128,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         tiled_for_each([](const T* a, const T* b, T* out,
                           int64_t m, int64_t n,
                           int64_t ap, int64_t bp, int64_t op, bool at) {
-            kernel::eltwise::pow<T>(a, b, out, m, n, ap, bp, op, at);
+            kernel::pow<T>(a, b, out, m, n, ap, bp, op, at);
         });
         break;
 

@@ -5,9 +5,9 @@
 /// layouts.
 ///
 /// Four dispatch paths:
-///   1. Packed SIMD (axis == rank-1, pack > 1): delegates to kernel::reduce::process_packed_row.
-///   2. Contiguous tail (axis == rank-1, pack == 1): delegates to kernel::reduce::process_contiguous_row.
-///   3. Inner-contiguous general axis: delegates to kernel::reduce::process_inner_contiguous_block.
+///   1. Packed SIMD (axis == rank-1, pack > 1): delegates to kernel::reduce_process_packed_row.
+///   2. Contiguous tail (axis == rank-1, pack == 1): delegates to kernel::reduce_process_contiguous_row.
+///   3. Inner-contiguous general axis: delegates to kernel::reduce_process_inner_contiguous_block.
 ///   4. General scalar (non-contiguous inner dims or packed layout).
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems().
@@ -52,7 +52,7 @@ void reduce_packed_simd(const ReduceAttributes& attrs,
     const float inv_D = 1.0f / static_cast<float>(D);
 
     const auto process_row = [&](int64_t r) {
-        kernel::reduce::process_packed_row<T>(
+        kernel::reduce_process_packed_row<T>(
             x_ptr + r * x_rs, y_ptr + r * pack, D, pack, attrs.type, inv_D);
     };
 
@@ -89,7 +89,7 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
 
     auto process_row = [&](int64_t row) {
         float result = 0.0f;
-        kernel::reduce::process_contiguous_row<T>(
+        kernel::reduce_process_contiguous_row<T>(
             x_ptr + row * row_stride, &result, norm_size, attrs.type);
         s_store(&y_ptr[row], result);
     };
@@ -133,7 +133,7 @@ void reduce_inner_contiguous_simd(const ReduceAttributes& attrs,
         int64_t inner = 0;
 
         // SIMD inner blocks
-        kernel::reduce::process_inner_contiguous_block<T>(
+        kernel::reduce_process_inner_contiguous_block<T>(
             x_base, y_base, 0, num_inner, reduce_size, axis_stride,
             attrs.type, inv_reduce);
 

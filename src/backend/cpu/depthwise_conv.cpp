@@ -29,7 +29,7 @@
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
-namespace k = nnops::kernel::depthwise_conv;
+namespace k = nnops::kernel;
 
 // ============================================================
 // Main depthwise conv implementation (unified 2D/3D)

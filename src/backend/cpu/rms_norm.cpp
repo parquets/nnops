@@ -7,7 +7,7 @@
 ///
 /// Algorithm (mirrors onnxruntime):
 ///   – SIMD fast path (axis == rank-1, contiguous tail):
-///       Uses kernel::rms_norm::process_row for SIMD reduction + normalize.
+///       Uses kernel::rms_norm_process_row for SIMD reduction + normalize.
 ///   – General scalar fallback (arbitrary axis):
 ///       Simple sum of squares accumulation, then normalize.
 ///
@@ -150,7 +150,7 @@ void rms_norm_impl(const RMSNormAttributes& attrs,
 
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
-        kernel::rms_norm::process_row<T>(
+        kernel::rms_norm_process_row<T>(
             x_ptr + row_off, y_ptr + row_off,
             s_ptr,
             norm_size, epsilon,

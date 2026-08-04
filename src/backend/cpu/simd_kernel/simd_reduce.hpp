@@ -3,11 +3,9 @@
 /// @brief SIMD kernel functions for the Reduce operator.
 ///
 /// Three SIMD dispatch paths:
-///   1. Packed SIMD (axis == rank-1, pack > 1): per-lane SIMD reduction.
-///   2. Contiguous tail (axis == rank-1, pack == 1): SIMD reduction
-///      per row with multi-accumulator unrolling.
-///   3. Inner-contiguous general axis (axis < rank-1, pack == 1):
-///      SIMD reduction across axis for groups of L inner elements.
+///   1. Packed: per-lane SIMD reduction.
+///   2. Contiguous: multi-accumulator unrolling per row.
+///   3. Inner-contiguous: SIMD across axis for L inner elements.
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
@@ -16,19 +14,13 @@
 
 #include <cfloat>
 
-namespace nnops::kernel::reduce {
+namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Path 1: Packed SIMD — axis == rank-1, pack > 1
-//
-// Per-lane SIMD reduction over D spatial positions.
-// No horizontal reduction — each lane independently accumulates.
-// ============================================================
-
+/// Packed SIMD: per-lane reduction over D spatial positions.
 template <typename T>
-inline void process_packed_row(
+inline void reduce_process_packed_row(
     const T* x_row, T* y_pos,
     int64_t D, int64_t pack,
     ReduceType type, float inv_D)
@@ -63,14 +55,9 @@ inline void process_packed_row(
     }
 }
 
-// ============================================================
-// Path 2: Contiguous tail (axis == rank-1, pack == 1)
-//
-// Multi-accumulator unrolling for dependency chain breaking.
-// ============================================================
-
+/// Contiguous tail: multi-accumulator unrolling per row.
 template <typename T>
-inline void process_contiguous_row(
+inline void reduce_process_contiguous_row(
     const T* x_row, float* out_scalar,
     int64_t norm_size, ReduceType type)
 {
@@ -80,7 +67,6 @@ inline void process_contiguous_row(
     switch (type) {
     case ReduceType::Sum:
     case ReduceType::Mean: {
-        // 4-wide accumulator unrolling
         auto v_sum0 = v_zero(x_row);
         auto v_sum1 = v_zero(x_row);
         auto v_sum2 = v_zero(x_row);
@@ -94,7 +80,6 @@ inline void process_contiguous_row(
         }
         auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
 
-        // 2-wide remainder
         auto v_sum4 = v_zero(x_row);
         auto v_sum5 = v_zero(x_row);
         for (; i + 2 * L <= norm_size; i += 2 * L) {
@@ -103,24 +88,20 @@ inline void process_contiguous_row(
         }
         v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
 
-        // Single-accumulator remainder
         for (; i + L <= norm_size; i += L) {
             v_sum = v_add(v_sum, v_load(x_row + i));
         }
         float sum = v_reduce_sum(v_sum);
 
-        // Scalar tail
         for (; i < norm_size; ++i) {
             sum += s_load(&x_row[i]);
         }
-        float result = (type == ReduceType::Mean)
+        *out_scalar = (type == ReduceType::Mean)
             ? sum / static_cast<float>(norm_size) : sum;
-        *out_scalar = result;
         break;
     }
 
     case ReduceType::Max: {
-        // 2-wide accumulator unrolling
         auto v_best0 = v_set1(x_row, -std::numeric_limits<float>::infinity());
         auto v_best1 = v_set1(x_row, -std::numeric_limits<float>::infinity());
 
@@ -130,13 +111,11 @@ inline void process_contiguous_row(
         }
         auto v_best = v_max(v_best0, v_best1);
 
-        // Single-accumulator remainder
         for (; i + L <= norm_size; i += L) {
             v_best = v_max(v_best, v_load(x_row + i));
         }
         float best = v_reduce_max(v_best);
 
-        // Scalar tail
         for (; i < norm_size; ++i) {
             float xv = s_load(&x_row[i]);
             if (xv > best) { best = xv; }
@@ -146,7 +125,6 @@ inline void process_contiguous_row(
     }
 
     case ReduceType::Min: {
-        // 2-wide accumulator unrolling
         auto v_best0 = v_set1(x_row, std::numeric_limits<float>::infinity());
         auto v_best1 = v_set1(x_row, std::numeric_limits<float>::infinity());
 
@@ -156,13 +134,11 @@ inline void process_contiguous_row(
         }
         auto v_best = v_min(v_best0, v_best1);
 
-        // Single-accumulator remainder
         for (; i + L <= norm_size; i += L) {
             v_best = v_min(v_best, v_load(x_row + i));
         }
         float best = v_reduce_min(v_best);
 
-        // Scalar tail
         for (; i < norm_size; ++i) {
             float xv = s_load(&x_row[i]);
             if (xv < best) { best = xv; }
@@ -173,15 +149,9 @@ inline void process_contiguous_row(
     }
 }
 
-// ============================================================
-// Path 3: Inner-contiguous general axis (axis < rank-1, pack == 1)
-//
-// For each outer position, process L inner elements simultaneously.
-// Multi-accumulator unrolling in the reduce direction.
-// ============================================================
-
+/// Inner-contiguous: SIMD across axis for L inner elements.
 template <typename T>
-inline void process_inner_contiguous_block(
+inline void reduce_process_inner_contiguous_block(
     const T* x_base, T* y_base,
     int64_t inner_start, int64_t inner_end,
     int64_t reduce_size, int64_t axis_stride,
@@ -194,7 +164,6 @@ inline void process_inner_contiguous_block(
     case ReduceType::Sum:
     case ReduceType::Mean: {
         for (; inner + L <= inner_end; inner += L) {
-            // 4-wide accumulator unrolling in reduce direction
             auto v_sum0 = v_zero(x_base);
             auto v_sum1 = v_zero(x_base);
             auto v_sum2 = v_zero(x_base);
@@ -209,7 +178,6 @@ inline void process_inner_contiguous_block(
             }
             auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
 
-            // 2-wide remainder
             auto v_sum4 = v_zero(x_base);
             auto v_sum5 = v_zero(x_base);
             for (; k + 2 <= reduce_size; k += 2) {
@@ -218,7 +186,6 @@ inline void process_inner_contiguous_block(
             }
             v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
 
-            // Single-step remainder
             for (; k < reduce_size; ++k) {
                 v_sum = v_add(v_sum, v_load(x_base + k * axis_stride + inner));
             }
@@ -277,4 +244,4 @@ inline void process_inner_contiguous_block(
     }
 }
 
-}  // namespace nnops::kernel::reduce
+}  // namespace nnops::kernel

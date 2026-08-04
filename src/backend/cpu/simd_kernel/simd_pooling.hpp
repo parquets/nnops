@@ -16,7 +16,7 @@
 
 #include <limits>
 
-namespace nnops::kernel::pooling {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -276,4 +276,4 @@ inline void avgpool_h1(
     }
 }
 
-}  // namespace nnops::kernel::pooling
+}  // namespace nnops::kernel

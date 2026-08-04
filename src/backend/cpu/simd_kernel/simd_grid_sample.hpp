@@ -20,7 +20,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace nnops::kernel::grid_sample {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -28,7 +28,7 @@ using namespace simd;
 // Coordinate helpers
 // ============================================================
 
-inline float grid_to_pixel(float coord, int64_t size, bool align_corners) {
+inline float gridsample_grid_to_pixel(float coord, int64_t size, bool align_corners) {
     if (align_corners) {
         return (coord + 1.0f) * static_cast<float>(size - 1) * 0.5f;
     } else {
@@ -36,7 +36,7 @@ inline float grid_to_pixel(float coord, int64_t size, bool align_corners) {
     }
 }
 
-inline float reflect_coord(float x, int64_t size) {
+inline float gridsample_reflect_coord(float x, int64_t size) {
     if (size <= 1) return 0.0f;
     float max_val = static_cast<float>(size - 1);
     float r = std::fmod(std::abs(x), 2.0f * max_val);
@@ -46,43 +46,43 @@ inline float reflect_coord(float x, int64_t size) {
     return r;
 }
 
-inline float apply_padding(float pixel, int64_t size, GridSamplePaddingMode padding) {
+inline float gridsample_apply_padding(float pixel, int64_t size, GridSamplePaddingMode padding) {
     switch (padding) {
     case GridSamplePaddingMode::Border:
         return std::max(0.0f, std::min(pixel, static_cast<float>(size - 1)));
     case GridSamplePaddingMode::Reflection:
-        return reflect_coord(pixel, size);
+        return gridsample_reflect_coord(pixel, size);
     case GridSamplePaddingMode::Zeros:
     default:
         return pixel;
     }
 }
 
-inline bool in_bounds(float pixel, int64_t size) {
+inline bool gridsample_in_bounds(float pixel, int64_t size) {
     return pixel >= 0.0f && pixel <= static_cast<float>(size - 1);
 }
 
-inline int64_t clamp_idx(int64_t idx, int64_t size) {
+inline int64_t gridsample_clamp_idx(int64_t idx, int64_t size) {
     return std::max<int64_t>(0, std::min(idx, size - 1));
 }
 
 /// Check if all 4 corners of a bilinear region are in bounds.
-inline bool bilinear_bounds_ok(float py, float pz, int64_t IH, int64_t IW) {
-    return in_bounds(std::floor(py), IH) &&
-           in_bounds(std::ceil(py),  IH) &&
-           in_bounds(std::floor(pz), IW) &&
-           in_bounds(std::ceil(pz),  IW);
+inline bool gridsample_bilinear_bounds_ok(float py, float pz, int64_t IH, int64_t IW) {
+    return gridsample_in_bounds(std::floor(py), IH) &&
+           gridsample_in_bounds(std::ceil(py),  IH) &&
+           gridsample_in_bounds(std::floor(pz), IW) &&
+           gridsample_in_bounds(std::ceil(pz),  IW);
 }
 
 /// Check if all 8 corners of a trilinear region are in bounds.
-inline bool trilinear_bounds_ok(float px, float py, float pz,
-                                 int64_t ID, int64_t IH, int64_t IW) {
-    return in_bounds(std::floor(px), ID) &&
-           in_bounds(std::ceil(px),  ID) &&
-           in_bounds(std::floor(py), IH) &&
-           in_bounds(std::ceil(py),  IH) &&
-           in_bounds(std::floor(pz), IW) &&
-           in_bounds(std::ceil(pz),  IW);
+inline bool gridsample_trilinear_bounds_ok(float px, float py, float pz,
+                                            int64_t ID, int64_t IH, int64_t IW) {
+    return gridsample_in_bounds(std::floor(px), ID) &&
+           gridsample_in_bounds(std::ceil(px),  ID) &&
+           gridsample_in_bounds(std::floor(py), IH) &&
+           gridsample_in_bounds(std::ceil(py),  IH) &&
+           gridsample_in_bounds(std::floor(pz), IW) &&
+           gridsample_in_bounds(std::ceil(pz),  IW);
 }
 
 // ============================================================
@@ -90,7 +90,7 @@ inline bool trilinear_bounds_ok(float px, float py, float pz,
 // ============================================================
 
 template <typename T>
-void bilinear_2d(
+void gridsample_bilinear_2d(
     T* output, const T* input, const float* grid_n,
     int64_t IH, int64_t IW, int64_t OH, int64_t OW,
     int64_t in_row_stride, int64_t out_row_stride,
@@ -105,23 +105,23 @@ void bilinear_2d(
 
         for (int64_t ow = 0; ow < OW; ++ow) {
             const float* g_pos = g_row + ow * 2;  // 2D: (y, x)
-            float py = grid_to_pixel(g_pos[0], IH, align_corners);
-            float pz = grid_to_pixel(g_pos[1], IW, align_corners);
+            float py = gridsample_grid_to_pixel(g_pos[0], IH, align_corners);
+            float pz = gridsample_grid_to_pixel(g_pos[1], IW, align_corners);
 
-            if (zeros_pad && !bilinear_bounds_ok(py, pz, IH, IW)) {
+            if (zeros_pad && !gridsample_bilinear_bounds_ok(py, pz, IH, IW)) {
                 if (!add_to) {
                     v_store(output + ow * 8, v_zero(type_tag));
                 }
                 continue;
             }
 
-            py = apply_padding(py, IH, padding);
-            pz = apply_padding(pz, IW, padding);
+            py = gridsample_apply_padding(py, IH, padding);
+            pz = gridsample_apply_padding(pz, IW, padding);
 
             int64_t y0 = static_cast<int64_t>(std::floor(py));
             int64_t z0 = static_cast<int64_t>(std::floor(pz));
-            int64_t y1 = clamp_idx(y0 + 1, IH);
-            int64_t z1 = clamp_idx(z0 + 1, IW);
+            int64_t y1 = gridsample_clamp_idx(y0 + 1, IH);
+            int64_t z1 = gridsample_clamp_idx(z0 + 1, IW);
 
             float wy = py - static_cast<float>(y0);
             float wz = pz - static_cast<float>(z0);
@@ -155,7 +155,7 @@ void bilinear_2d(
 // ============================================================
 
 template <typename T>
-void nearest_2d(
+void gridsample_nearest_2d(
     T* output, const T* input, const float* grid_n,
     int64_t IH, int64_t IW, int64_t OH, int64_t OW,
     int64_t in_row_stride, int64_t out_row_stride,
@@ -170,21 +170,21 @@ void nearest_2d(
 
         for (int64_t ow = 0; ow < OW; ++ow) {
             const float* g_pos = g_row + ow * 2;
-            float py = grid_to_pixel(g_pos[0], IH, align_corners);
-            float pz = grid_to_pixel(g_pos[1], IW, align_corners);
+            float py = gridsample_grid_to_pixel(g_pos[0], IH, align_corners);
+            float pz = gridsample_grid_to_pixel(g_pos[1], IW, align_corners);
 
             float py_r = std::round(py);
             float pz_r = std::round(pz);
 
-            if (zeros_pad && (!in_bounds(py_r, IH) || !in_bounds(pz_r, IW))) {
+            if (zeros_pad && (!gridsample_in_bounds(py_r, IH) || !gridsample_in_bounds(pz_r, IW))) {
                 if (!add_to) {
                     v_store(output + ow * 8, v_zero(type_tag));
                 }
                 continue;
             }
 
-            py = apply_padding(py, IH, padding);
-            pz = apply_padding(pz, IW, padding);
+            py = gridsample_apply_padding(py, IH, padding);
+            pz = gridsample_apply_padding(pz, IW, padding);
             int64_t iy = static_cast<int64_t>(std::round(py));
             int64_t iz = static_cast<int64_t>(std::round(pz));
 
@@ -200,7 +200,7 @@ void nearest_2d(
 // ============================================================
 
 template <typename T>
-void trilinear_3d(
+void gridsample_trilinear_3d(
     T* output, const T* input, const float* grid_n,
     int64_t ID, int64_t IH, int64_t IW,
     int64_t OD, int64_t OH, int64_t OW,
@@ -219,28 +219,28 @@ void trilinear_3d(
             const float* g_pos = grid_n + (od * OH + oh) * grid_row_stride;
 
             for (int64_t ow = 0; ow < OW; ++ow) {
-                float px = grid_to_pixel(g_pos[0], ID, align_corners);
-                float py = grid_to_pixel(g_pos[1], IH, align_corners);
-                float pz = grid_to_pixel(g_pos[2], IW, align_corners);
+                float px = gridsample_grid_to_pixel(g_pos[0], ID, align_corners);
+                float py = gridsample_grid_to_pixel(g_pos[1], IH, align_corners);
+                float pz = gridsample_grid_to_pixel(g_pos[2], IW, align_corners);
                 g_pos += 3;  // coord_dim = 3
 
-                if (zeros_pad && !trilinear_bounds_ok(px, py, pz, ID, IH, IW)) {
+                if (zeros_pad && !gridsample_trilinear_bounds_ok(px, py, pz, ID, IH, IW)) {
                     if (!add_to) {
                         v_store(out_d + oh * out_row_stride + ow * 8, v_zero(type_tag));
                     }
                     continue;
                 }
 
-                px = apply_padding(px, ID, padding);
-                py = apply_padding(py, IH, padding);
-                pz = apply_padding(pz, IW, padding);
+                px = gridsample_apply_padding(px, ID, padding);
+                py = gridsample_apply_padding(py, IH, padding);
+                pz = gridsample_apply_padding(pz, IW, padding);
 
                 int64_t x0 = static_cast<int64_t>(std::floor(px));
                 int64_t y0 = static_cast<int64_t>(std::floor(py));
                 int64_t z0 = static_cast<int64_t>(std::floor(pz));
-                int64_t x1 = clamp_idx(x0 + 1, ID);
-                int64_t y1 = clamp_idx(y0 + 1, IH);
-                int64_t z1 = clamp_idx(z0 + 1, IW);
+                int64_t x1 = gridsample_clamp_idx(x0 + 1, ID);
+                int64_t y1 = gridsample_clamp_idx(y0 + 1, IH);
+                int64_t z1 = gridsample_clamp_idx(z0 + 1, IW);
 
                 float wx = px - static_cast<float>(x0);
                 float wy = py - static_cast<float>(y0);
@@ -288,7 +288,7 @@ void trilinear_3d(
 // ============================================================
 
 template <typename T>
-void nearest_3d(
+void gridsample_nearest_3d(
     T* output, const T* input, const float* grid_n,
     int64_t ID, int64_t IH, int64_t IW,
     int64_t OD, int64_t OH, int64_t OW,
@@ -307,9 +307,9 @@ void nearest_3d(
             const float* g_pos = grid_n + (od * OH + oh) * grid_row_stride;
 
             for (int64_t ow = 0; ow < OW; ++ow) {
-                float px = grid_to_pixel(g_pos[0], ID, align_corners);
-                float py = grid_to_pixel(g_pos[1], IH, align_corners);
-                float pz = grid_to_pixel(g_pos[2], IW, align_corners);
+                float px = gridsample_grid_to_pixel(g_pos[0], ID, align_corners);
+                float py = gridsample_grid_to_pixel(g_pos[1], IH, align_corners);
+                float pz = gridsample_grid_to_pixel(g_pos[2], IW, align_corners);
                 g_pos += 3;
 
                 float px_r = std::round(px);
@@ -317,16 +317,16 @@ void nearest_3d(
                 float pz_r = std::round(pz);
 
                 if (zeros_pad &&
-                    (!in_bounds(px_r, ID) || !in_bounds(py_r, IH) || !in_bounds(pz_r, IW))) {
+                    (!gridsample_in_bounds(px_r, ID) || !gridsample_in_bounds(py_r, IH) || !gridsample_in_bounds(pz_r, IW))) {
                     if (!add_to) {
                         v_store(out_d + oh * out_row_stride + ow * 8, v_zero(type_tag));
                     }
                     continue;
                 }
 
-                px = apply_padding(px, ID, padding);
-                py = apply_padding(py, IH, padding);
-                pz = apply_padding(pz, IW, padding);
+                px = gridsample_apply_padding(px, ID, padding);
+                py = gridsample_apply_padding(py, IH, padding);
+                pz = gridsample_apply_padding(pz, IW, padding);
                 int64_t ix = static_cast<int64_t>(std::round(px));
                 int64_t iy = static_cast<int64_t>(std::round(py));
                 int64_t iz = static_cast<int64_t>(std::round(pz));
@@ -338,4 +338,4 @@ void nearest_3d(
     }
 }
 
-}  // namespace nnops::kernel::grid_sample
+}  // namespace nnops::kernel

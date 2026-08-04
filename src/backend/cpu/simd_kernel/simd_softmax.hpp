@@ -2,11 +2,9 @@
 /// @file simd_softmax.hpp
 /// @brief SIMD kernel functions for softmax / log-softmax.
 ///
-/// Three paths:
-///   - Packed SIMD (axis == rank-1, pack > 1): per-lane SIMD reduction
-///     within each physical row.
-///   - Standard SIMD fast path (axis == rank-1, pack == 1): contiguous
-///     tail, SIMD max/sum reduction.
+/// Two SIMD paths:
+///   - Packed: per-lane SIMD reduction within each physical row.
+///   - Standard: contiguous tail, SIMD max/sum reduction.
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
@@ -15,28 +13,22 @@
 #include <cmath>
 #include <cfloat>
 
-namespace nnops::kernel::softmax {
+namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Packed SIMD path: per-lane reduction within each physical row
-//
-// For NCHWC8 [N,C8,H,W] with axis=W, each of the `pack` C lanes
-// is an independent softmax over D=W spatial positions.
-// ============================================================
-
+/// Packed SIMD path: per-lane reduction within each physical row.
+/// For NCHWC8 [N,C8,H,W] with axis=W, each of the `pack` C lanes
+/// is an independent softmax over D=W spatial positions.
 template <typename T>
-inline void process_packed_row(
+inline void softmax_process_packed_row(
     const T* x_row, T* y_row,
     int64_t D, int64_t pack, bool log_softmax)
 {
-    // ---- Pass 1: per-lane max ----
     auto v_max_vec = v_set1(x_row, -std::numeric_limits<float>::infinity());
     for (int64_t w = 0; w < D; ++w)
         v_max_vec = v_max(v_max_vec, v_load(x_row + w * pack));
 
-    // ---- Pass 2: per-lane sum of exp(x - max) ----
     auto v_sum_vec = v_zero(x_row);
     auto v_neg_max = v_neg(v_max_vec);
     for (int64_t w = 0; w < D; ++w) {
@@ -46,7 +38,6 @@ inline void process_packed_row(
         v_sum_vec = v_add(v_sum_vec, v);
     }
 
-    // ---- Pass 3: per-lane normalize ----
     if (log_softmax) {
         auto v_bias = v_sub(v_neg(v_max_vec), v_log(v_sum_vec));
         for (int64_t w = 0; w < D; ++w)
@@ -58,19 +49,16 @@ inline void process_packed_row(
     }
 }
 
-// ============================================================
-// Standard SIMD fast path: contiguous tail, pack == 1
-// ============================================================
-
+/// Standard SIMD fast path: contiguous tail, pack == 1.
 template <typename T>
-inline void process_standard_row(
+inline void softmax_process_standard_row(
     const T* x, T* y,
     int64_t D, bool log_softmax)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    // ---- Pass 1: Max reduction ----
+    // Pass 1: Max reduction
     float max_val = -std::numeric_limits<float>::infinity();
     {
         auto v_max_val = v_set1(x, max_val);
@@ -85,7 +73,7 @@ inline void process_standard_row(
 
     const float neg_max = -max_val;
 
-    // ---- Pass 2: Sum of exp(x - max) ----
+    // Pass 2: Sum of exp(x - max)
     float sum_exp = 0.0f;
     i = 0;
     const bool store_exp = !log_softmax;
@@ -107,7 +95,7 @@ inline void process_standard_row(
         sum_exp += val;
     }
 
-    // ---- Pass 3: Normalize ----
+    // Pass 3: Normalize
     i = 0;
     if (log_softmax) {
         const float bias = neg_max - std::log(sum_exp);
@@ -125,4 +113,4 @@ inline void process_standard_row(
     }
 }
 
-}  // namespace nnops::kernel::softmax
+}  // namespace nnops::kernel

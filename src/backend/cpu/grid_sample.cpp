@@ -29,7 +29,7 @@
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
-namespace k = nnops::kernel::grid_sample;
+namespace k = nnops::kernel;
 
 // ============================================================
 // Main grid_sample implementation — N*C8 parallel dispatch
@@ -92,7 +92,7 @@ void grid_sample_impl_nchwc8(const GridSampleAttributes& attrs,
 
         if (srank == 3) {
             if (mode == GridSampleMode::Nearest) {
-                k::nearest_3d<T>(
+                k::gridsample_nearest_3d<T>(
                     out_base, in_base, grid_n,
                     ID, IH, IW, OD, OH, OW,
                     in_d_stride, in_row_stride,
@@ -100,7 +100,7 @@ void grid_sample_impl_nchwc8(const GridSampleAttributes& attrs,
                     grid_row_stride, grid_d_elems,
                     align, padding_mode, add_to);
             } else {
-                k::trilinear_3d<T>(
+                k::gridsample_trilinear_3d<T>(
                     out_base, in_base, grid_n,
                     ID, IH, IW, OD, OH, OW,
                     in_d_stride, in_row_stride,
@@ -110,14 +110,14 @@ void grid_sample_impl_nchwc8(const GridSampleAttributes& attrs,
             }
         } else {
             if (mode == GridSampleMode::Nearest) {
-                k::nearest_2d<T>(
+                k::gridsample_nearest_2d<T>(
                     out_base, in_base, grid_n,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,
                     grid_row_stride,
                     align, padding_mode, add_to);
             } else {
-                k::bilinear_2d<T>(
+                k::gridsample_bilinear_2d<T>(
                     out_base, in_base, grid_n,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,

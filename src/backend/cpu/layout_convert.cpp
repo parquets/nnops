@@ -26,7 +26,7 @@
 namespace nnops {
 
 using namespace nnops::simd;
-namespace k = nnops::kernel::layout_convert;
+namespace k = nnops::kernel;
 
 namespace {
 
@@ -71,7 +71,7 @@ void pack_impl(const TensorView& src, TensorView& dst,
         const T* in_row = in_ptr + n * C * ch_stride + sr * in_row_stride;
         T* out_row = out_ptr + (n * C8 * num_spatial_rows + c8 * num_spatial_rows + sr) * out_row_stride;
 
-        k::pack_row<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
+        k::layout_pack_row<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
     };
 
     if (ctx.cpu_parallel_for) {
@@ -120,7 +120,7 @@ void unpack_impl(const TensorView& src, TensorView& dst,
         const T* in_row = in_ptr + (n * C8 * num_spatial_rows + c8 * num_spatial_rows + sr) * in_row_stride;
         T* out_row = out_ptr + n * C * ch_stride + sr * out_row_stride;
 
-        k::unpack_row<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
+        k::layout_unpack_row<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
     };
 
     if (ctx.cpu_parallel_for) {

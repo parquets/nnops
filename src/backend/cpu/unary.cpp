@@ -74,105 +74,105 @@ void unary_impl(const UnaryAttributes& attrs,
     case UnaryType::Exp:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::exp<T>(in, out, m, n, ip, op, at);
+            kernel::exp<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Log:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::log<T>(in, out, m, n, ip, op, at);
+            kernel::log<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Sin:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::sin<T>(in, out, m, n, ip, op, at);
+            kernel::sin<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Cos:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::cos<T>(in, out, m, n, ip, op, at);
+            kernel::cos<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Tan:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::tan<T>(in, out, m, n, ip, op, at);
+            kernel::tan<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Tanh:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::tanh<T>(in, out, m, n, ip, op, at);
+            kernel::tanh<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Abs:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::abs<T>(in, out, m, n, ip, op, at);
+            kernel::abs<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Neg:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::neg<T>(in, out, m, n, ip, op, at);
+            kernel::neg<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Sqrt:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::sqrt<T>(in, out, m, n, ip, op, at);
+            kernel::sqrt<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Erf:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::erf<T>(in, out, m, n, ip, op, at);
+            kernel::erf<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Round:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::round<T>(in, out, m, n, ip, op, at);
+            kernel::round<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Ceil:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::ceil<T>(in, out, m, n, ip, op, at);
+            kernel::ceil<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Floor:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::floor<T>(in, out, m, n, ip, op, at);
+            kernel::floor<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Recip:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::recip<T>(in, out, m, n, ip, op, at);
+            kernel::recip<T>(in, out, m, n, ip, op, at);
         });
         break;
 
     case UnaryType::Sign:
         tiled_for_each([](const T* in, T* out, int64_t m, int64_t n,
                           int64_t ip, int64_t op, bool at) {
-            kernel::unary::sign<T>(in, out, m, n, ip, op, at);
+            kernel::sign<T>(in, out, m, n, ip, op, at);
         });
         break;
 

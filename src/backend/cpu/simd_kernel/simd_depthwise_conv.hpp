@@ -16,7 +16,7 @@
 #include "nnops/core/epilogue.hpp"
 #include "../epilogue_impl.hpp"
 
-namespace nnops::kernel::depthwise_conv {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -145,4 +145,4 @@ inline void dwconv_h1(
     }
 }
 
-}  // namespace nnops::kernel::depthwise_conv
+}  // namespace nnops::kernel

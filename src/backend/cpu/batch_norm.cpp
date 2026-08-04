@@ -4,10 +4,10 @@
 /// Supports f32 and f16. Respects pitch via row_stride_elems().
 ///
 /// Spatial mode (per-channel statistics):
-///   Planar layouts (NCHW/NCDHW): delegates to kernel::batch_norm::process_planar_row.
-///   Packed layouts (NCHWC8/NCDHWC8): delegates to kernel::batch_norm::process_packed_row.
+///   Planar layouts (NCHW/NCDHW): delegates to kernel::batch_norm_process_planar_row.
+///   Packed layouts (NCHWC8/NCDHWC8): delegates to kernel::batch_norm_process_packed_row.
 ///
-/// Non-spatial mode: delegates to kernel::batch_norm::process_nonspatial_block.
+/// Non-spatial mode: delegates to kernel::batch_norm_process_nonspatial_block.
 ///
 /// Fused formula: new_scale = inv_std * scale, new_bias = bias - mean * new_scale,
 ///                y = x * new_scale + new_bias
@@ -89,7 +89,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
 
             const auto process_row = [&](int64_t r) {
                 const int64_t c8 = (r / rows_per_c8) % c8_blocks;
-                kernel::batch_norm::process_packed_row<T>(
+                kernel::batch_norm_process_packed_row<T>(
                     x_ptr + r * x_rs, y_ptr + r * y_rs,
                     ns_packed.data(), nb_packed.data(),
                     c8, pack, last_dim, attrs.add_to);
@@ -125,7 +125,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
                     const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
 
                     for (int64_t hh = 0; hh < num_rows; ++hh) {
-                        kernel::batch_norm::process_planar_row<T>(
+                        kernel::batch_norm_process_planar_row<T>(
                             x_ptr + x_ch_base + hh * x_row_stride,
                             y_ptr + y_ch_base + hh * y_row_stride,
                             last_dim, ns, nb, attrs.add_to);
@@ -142,7 +142,7 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
     } else {
         // ---- Non-spatial mode: per-element statistics ----
         const int64_t total = X.numel();
-        kernel::batch_norm::process_nonspatial_block<T>(
+        kernel::batch_norm_process_nonspatial_block<T>(
             x_ptr, y_ptr, s_ptr, b_ptr, m_ptr, v_ptr,
             0, total, epsilon, attrs.add_to);
     }

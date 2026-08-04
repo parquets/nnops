@@ -28,7 +28,7 @@
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
-namespace k = nnops::kernel::resize;
+namespace k = nnops::kernel;
 
 // ============================================================
 // Main resize implementation — N*C8 parallel dispatch
@@ -79,14 +79,14 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
         if (srank == 3) {
             // 3D
             if (mode == ResizeMode::Nearest) {
-                k::nearest_3d<T>(
+                k::resize_nearest_3d<T>(
                     out_base, in_base,
                     ID, IH, IW, OD, OH, OW,
                     in_d_stride, in_row_stride,
                     out_d_stride, out_row_stride,
                     coord_mode, add_to);
             } else {
-                k::trilinear_3d<T>(
+                k::resize_trilinear_3d<T>(
                     out_base, in_base,
                     ID, IH, IW, OD, OH, OW,
                     in_d_stride, in_row_stride,
@@ -96,13 +96,13 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
         } else {
             // 2D
             if (mode == ResizeMode::Nearest) {
-                k::nearest_2d<T>(
+                k::resize_nearest_2d<T>(
                     out_base, in_base,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,
                     coord_mode, add_to);
             } else {
-                k::bilinear_2d<T>(
+                k::resize_bilinear_2d<T>(
                     out_base, in_base,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,

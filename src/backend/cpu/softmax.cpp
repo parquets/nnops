@@ -10,9 +10,9 @@
 ///
 /// Three paths:
 ///   - Packed SIMD (axis == rank-1, pack > 1): per-lane SIMD reduction
-///     within each physical row. Delegates to kernel::softmax::process_packed_row.
+///     within each physical row. Delegates to kernel::softmax_process_packed_row.
 ///   - Standard SIMD fast path (axis == rank-1, pack == 1): contiguous
-///     tail. Delegates to kernel::softmax::process_standard_row.
+///     tail. Delegates to kernel::softmax_process_standard_row.
 ///   - General scalar path: reference-style outer/D/inner decomposition
 ///     with strided access, correct for all layouts and axes.
 ///
@@ -146,7 +146,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         const int64_t y_rs = output.row_stride_elems();
 
         const auto process_row = [&](int64_t r) {
-            kernel::softmax::process_packed_row<T>(
+            kernel::softmax_process_packed_row<T>(
                 x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax);
         };
 
@@ -171,7 +171,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         const int64_t group_stride = (axis > 0) ? X.stride_elems(axis - 1) : D;
 
         const auto process_row = [&](int64_t row) {
-            kernel::softmax::process_standard_row<T>(
+            kernel::softmax_process_standard_row<T>(
                 x_ptr + row * group_stride, y_ptr + row * group_stride, D, log_softmax);
         };
 

@@ -6,23 +6,18 @@
 ///                y = x * new_scale + new_bias
 ///
 /// Supports planar (NCHW/NCDHW) and packed (NCHWC8/NCDHWC8) layouts.
-///
-/// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
 #include "nnops/detail/simd/simd.hpp"
 
 #include <cmath>
 
-namespace nnops::kernel::batch_norm {
+namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Packed layout: per-row SIMD fmadd with per-C8-block scale/bias
-// ============================================================
-
+/// Packed layout: per-row SIMD fmadd with per-C8-block scale/bias.
 template <typename T>
-inline void process_packed_row(
+inline void batch_norm_process_packed_row(
     const T* x_row, T* y_row,
     const T* ns_packed, const T* nb_packed,
     int64_t c8, int64_t pack,
@@ -36,12 +31,9 @@ inline void process_packed_row(
     }
 }
 
-// ============================================================
-// Planar layout: 4-wide unrolled SIMD fmadd per row
-// ============================================================
-
+/// Planar layout: 4-wide unrolled SIMD fmadd per row.
 template <typename T>
-inline void process_planar_row(
+inline void batch_norm_process_planar_row(
     const T* x_row, T* y_row,
     int64_t last_dim,
     float ns, float nb, bool add_to)
@@ -52,7 +44,6 @@ inline void process_planar_row(
     const auto scale8 = v_set1(x_row, ns);
     const auto bias8  = v_set1(x_row, nb);
 
-    // 4-wide unrolling
     for (; i + 4 * L <= last_dim; i += 4 * L) {
         auto x0 = v_load(x_row + i);
         auto x1 = v_load(x_row + i + L);
@@ -63,24 +54,19 @@ inline void process_planar_row(
         v_store_add(y_row + i + 2 * L, v_fmadd(scale8, x2, bias8), add_to);
         v_store_add(y_row + i + 3 * L, v_fmadd(scale8, x3, bias8), add_to);
     }
-    // Single remainder
     for (; i + L <= last_dim; i += L) {
         auto rv = v_fmadd(scale8, v_load(x_row + i), bias8);
         v_store_add(y_row + i, rv, add_to);
     }
-    // Scalar tail
     for (; i < last_dim; ++i) {
         float rv = s_load(&x_row[i]) * ns + nb;
         s_store_add(&y_row[i], rv, add_to);
     }
 }
 
-// ============================================================
-// Non-spatial mode: per-element SIMD processing
-// ============================================================
-
+/// Non-spatial mode: per-element SIMD processing.
 template <typename T>
-inline void process_nonspatial_block(
+inline void batch_norm_process_nonspatial_block(
     const T* x, T* y,
     const T* scale, const T* bias,
     const T* mean, const T* var,
@@ -92,7 +78,6 @@ inline void process_nonspatial_block(
     const auto eps8 = v_set1(x, epsilon);
     const auto one8 = v_set1(x, 1.0f);
 
-    // 4-wide unrolling
     for (; i + 4 * L <= i_end; i += 4 * L) {
         for (int k = 0; k < 4; ++k) {
             int64_t off = i + k * L;
@@ -107,7 +92,6 @@ inline void process_nonspatial_block(
             v_store_add(y + off, v_fmadd(ns, xv, nb), add_to);
         }
     }
-    // Single remainder
     for (; i + L <= i_end; i += L) {
         const auto x8 = v_load(x + i);
         const auto s8 = v_load(scale + i);
@@ -120,7 +104,6 @@ inline void process_nonspatial_block(
         auto rv = v_fmadd(ns, x8, nb);
         v_store_add(y + i, rv, add_to);
     }
-    // Scalar tail
     for (; i < i_end; ++i) {
         float inv_std_val = 1.0f / std::sqrt(s_load(&var[i]) + epsilon);
         float ns = inv_std_val * s_load(&scale[i]);
@@ -130,4 +113,4 @@ inline void process_nonspatial_block(
     }
 }
 
-}  // namespace nnops::kernel::batch_norm
+}  // namespace nnops::kernel

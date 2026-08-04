@@ -18,7 +18,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace nnops::kernel::resize {
+namespace nnops::kernel {
 
 using namespace simd;
 
@@ -26,12 +26,12 @@ using namespace simd;
 // Coordinate helpers
 // ============================================================
 
-inline int64_t clamp_idx(int64_t idx, int64_t src_size) {
+inline int64_t resize_clamp_idx(int64_t idx, int64_t src_size) {
     return std::max<int64_t>(0, std::min(idx, src_size - 1));
 }
 
-inline float compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_size,
-                               CoordinateTransformMode mode) {
+inline float resize_compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_size,
+                                      CoordinateTransformMode mode) {
     if (dst_size == src_size) {
         return static_cast<float>(dst_idx);
     }
@@ -59,20 +59,20 @@ inline float compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_si
 // ============================================================
 
 template <typename T>
-void nearest_2d(
+void resize_nearest_2d(
     T* output, const T* input,
     int64_t IH, int64_t IW, int64_t OH, int64_t OW,
     int64_t in_row_stride, int64_t out_row_stride,
     CoordinateTransformMode coord_mode, bool add_to)
 {
     for (int64_t oh = 0; oh < OH; ++oh) {
-        float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-        int64_t ih = clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
+        float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
+        int64_t ih = resize_clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
         const T* in_row = input + ih * in_row_stride;
 
         for (int64_t ow = 0; ow < OW; ++ow) {
-            float src_w = compute_src_coord(ow, IW, OW, coord_mode);
-            int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
+            float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
+            int64_t iw = resize_clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
 
             auto val = v_load(&in_row[iw * 8]);
             v_store_add(output + ow * 8, val, add_to);
@@ -86,7 +86,7 @@ void nearest_2d(
 // ============================================================
 
 template <typename T>
-void bilinear_2d(
+void resize_bilinear_2d(
     T* output, const T* input,
     int64_t IH, int64_t IW, int64_t OH, int64_t OW,
     int64_t in_row_stride, int64_t out_row_stride,
@@ -95,9 +95,9 @@ void bilinear_2d(
     const T* type_tag = output;
 
     for (int64_t oh = 0; oh < OH; ++oh) {
-        float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-        int64_t y0 = clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
-        int64_t y1 = clamp_idx(y0 + 1, IH);
+        float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
+        int64_t y0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
+        int64_t y1 = resize_clamp_idx(y0 + 1, IH);
         float wy = src_h - std::floor(src_h);
         float wy0 = 1.0f - wy;
         auto v_wy  = v_set1(type_tag, wy);
@@ -107,9 +107,9 @@ void bilinear_2d(
         const T* in_row1 = input + y1 * in_row_stride;
 
         for (int64_t ow = 0; ow < OW; ++ow) {
-            float src_w = compute_src_coord(ow, IW, OW, coord_mode);
-            int64_t x0 = clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
-            int64_t x1 = clamp_idx(x0 + 1, IW);
+            float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
+            int64_t x0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
+            int64_t x1 = resize_clamp_idx(x0 + 1, IW);
             float wx = src_w - std::floor(src_w);
             float wx0 = 1.0f - wx;
             auto v_wx  = v_set1(type_tag, wx);
@@ -137,7 +137,7 @@ void bilinear_2d(
 // ============================================================
 
 template <typename T>
-void nearest_3d(
+void resize_nearest_3d(
     T* output, const T* input,
     int64_t ID, int64_t IH, int64_t IW,
     int64_t OD, int64_t OH, int64_t OW,
@@ -146,19 +146,19 @@ void nearest_3d(
     CoordinateTransformMode coord_mode, bool add_to)
 {
     for (int64_t od = 0; od < OD; ++od) {
-        float src_d = compute_src_coord(od, ID, OD, coord_mode);
-        int64_t id = clamp_idx(static_cast<int64_t>(std::round(src_d)), ID);
+        float src_d = resize_compute_src_coord(od, ID, OD, coord_mode);
+        int64_t id = resize_clamp_idx(static_cast<int64_t>(std::round(src_d)), ID);
         const T* in_d = input + id * in_d_stride;
         T* out_d = output + od * out_d_stride;
 
         for (int64_t oh = 0; oh < OH; ++oh) {
-            float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-            int64_t ih = clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
+            float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
+            int64_t ih = resize_clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
             const T* in_row = in_d + ih * in_row_stride;
 
             for (int64_t ow = 0; ow < OW; ++ow) {
-                float src_w = compute_src_coord(ow, IW, OW, coord_mode);
-                int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
+                float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
+                int64_t iw = resize_clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
 
                 auto val = v_load(&in_row[iw * 8]);
                 v_store_add(out_d + oh * out_row_stride + ow * 8, val, add_to);
@@ -172,7 +172,7 @@ void nearest_3d(
 // ============================================================
 
 template <typename T>
-void trilinear_3d(
+void resize_trilinear_3d(
     T* output, const T* input,
     int64_t ID, int64_t IH, int64_t IW,
     int64_t OD, int64_t OH, int64_t OW,
@@ -183,9 +183,9 @@ void trilinear_3d(
     const T* type_tag = output;
 
     for (int64_t od = 0; od < OD; ++od) {
-        float src_d = compute_src_coord(od, ID, OD, coord_mode);
-        int64_t z0 = clamp_idx(static_cast<int64_t>(std::floor(src_d)), ID);
-        int64_t z1 = clamp_idx(z0 + 1, ID);
+        float src_d = resize_compute_src_coord(od, ID, OD, coord_mode);
+        int64_t z0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_d)), ID);
+        int64_t z1 = resize_clamp_idx(z0 + 1, ID);
         float wz   = src_d - std::floor(src_d);
         float wz0  = 1.0f - wz;
         auto v_wz  = v_set1(type_tag, wz);
@@ -196,9 +196,9 @@ void trilinear_3d(
         T* out_d = output + od * out_d_stride;
 
         for (int64_t oh = 0; oh < OH; ++oh) {
-            float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-            int64_t y0 = clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
-            int64_t y1 = clamp_idx(y0 + 1, IH);
+            float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
+            int64_t y0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
+            int64_t y1 = resize_clamp_idx(y0 + 1, IH);
             float wy   = src_h - std::floor(src_h);
             float wy0  = 1.0f - wy;
             auto v_wy  = v_set1(type_tag, wy);
@@ -210,9 +210,9 @@ void trilinear_3d(
             const T* in_d1_r1 = in_d1 + y1 * in_row_stride;
 
             for (int64_t ow = 0; ow < OW; ++ow) {
-                float src_w = compute_src_coord(ow, IW, OW, coord_mode);
-                int64_t x0 = clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
-                int64_t x1 = clamp_idx(x0 + 1, IW);
+                float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
+                int64_t x0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
+                int64_t x1 = resize_clamp_idx(x0 + 1, IW);
                 float wx   = src_w - std::floor(src_w);
                 float wx0  = 1.0f - wx;
                 auto v_wx  = v_set1(type_tag, wx);
@@ -245,4 +245,4 @@ void trilinear_3d(
     }
 }
 
-}  // namespace nnops::kernel::resize
+}  // namespace nnops::kernel
