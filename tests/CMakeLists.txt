@@ -27,6 +27,7 @@ set(TEST_SOURCES
     test_concat.cpp
     test_argminmax.cpp
     test_topk.cpp
+    test_rope.cpp
     test_simd_unary.cpp
     test_simd_eltwise.cpp
 )

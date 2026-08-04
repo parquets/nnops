@@ -28,6 +28,7 @@ set(NNOPS_CPU_SOURCES
     ops/concat.cpp
     ops/argminmax.cpp
     ops/topk.cpp
+    ops/rope.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -52,6 +53,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/concat.cpp
     backend/cpu/argminmax.cpp
     backend/cpu/topk.cpp
+    backend/cpu/rope.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA)
     backend/cpu/matmul.cpp
@@ -79,6 +81,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/concat_ref.cpp
     backend/cpu/reference/argminmax_ref.cpp
     backend/cpu/reference/topk_ref.cpp
+    backend/cpu/reference/rope_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

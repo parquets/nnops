@@ -33,6 +33,7 @@ enum class OpType : uint8_t {
     ArgMax          = 22,
     ArgMin          = 23,
     TopK            = 24,
+    RoPE            = 25,
 };
 
 }  // namespace nnops

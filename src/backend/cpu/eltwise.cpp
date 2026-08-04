@@ -53,7 +53,7 @@ void eltwise_impl(const EltwiseAttributes& attrs,
     auto*       o_ptr = output.ptr<T>();
     const bool  add_to = attrs.add_to;
 
-    constexpr int64_t TILE_M = 8;
+    constexpr int64_t TILE_M = 32;
     const int64_t num_tiles = (num_rows + TILE_M - 1) / TILE_M;
 
     // Shared tiled dispatch: splits rows into tiles of ≤8, then invokes
