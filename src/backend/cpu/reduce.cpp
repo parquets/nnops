@@ -305,6 +305,57 @@ void reduce_impl(const ReduceAttributes& attrs,
         return;
     }
 
+    // ---- Path 1b: Packed channel SIMD (axis == 1, pack > 1, NCHWC8) ----
+    if (axis == 1 && pack > 1) {
+        const int64_t C8 = input.shape(1);
+        const int64_t chan_stride = input.stride_elems(1);
+        const float inv_C8 = 1.0f / static_cast<float>(C8);
+
+        const T* x_ptr = input.ptr<T>();
+        T* y_ptr = output.ptr<T>();
+
+        // Count spatial positions: product of all dims except C8 (axis=1)
+        int64_t num_spatial = 1;
+        for (int64_t d = 0; d < rank; ++d)
+            if (d != 1) num_spatial *= input.shape(d);
+
+        const int64_t rank_out = output.rank();
+        const bool keepdims = attrs.keepdims;
+
+        const auto process_pos = [&](int64_t s) {
+            // Input offset: decompose flat index → element offset (c8=0)
+            int64_t in_off = 0;
+            int64_t rem = s;
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                if (d == 1) continue;
+                int64_t dim = input.shape(d);
+                in_off += (rem % dim) * input.stride_elems(d);
+                rem /= dim;
+            }
+
+            // Output offset: same decomposition on output tensor
+            int64_t out_off = 0;
+            rem = s;
+            for (int64_t d = rank_out - 1; d >= 0; --d) {
+                if (keepdims && d == 1) continue;  // collapsed C8 dim
+                int64_t dim = output.shape(d);
+                out_off += (rem % dim) * output.stride_elems(d);
+                rem /= dim;
+            }
+
+            kernel::reduce_process_packed_channel<T>(
+                x_ptr + in_off, y_ptr + out_off,
+                chan_stride, C8, pack, attrs.type, inv_C8);
+        };
+
+        if (ctx.cpu_parallel_for)
+            ctx.cpu_parallel_for(0, num_spatial, process_pos);
+        else
+            for (int64_t i = 0; i < num_spatial; ++i) process_pos(i);
+
+        return;
+    }
+
     // ---- Path 2: Contiguous tail (axis == rank-1, pack == 1) ----
     if (axis == rank - 1) {
         reduce_contiguous_simd<T>(attrs, output, input, axis, ctx);

@@ -159,6 +159,43 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     }
 
     // ============================================================
+    // Path 1b — Packed channel SIMD: axis == 1, pack > 1 (NCHWC8)
+    // ============================================================
+
+    if (axis == 1 && pack > 1) {
+        const int64_t C8 = X.shape(1);          // number of channel blocks
+        const int64_t chan_stride = X.stride_elems(1); // H*W*pack between C8 blocks
+
+        // Count spatial positions: product of all dims except C8 (axis=1)
+        int64_t num_spatial = 1;
+        for (int64_t d = 0; d < rank; ++d)
+            if (d != 1) num_spatial *= X.shape(d);
+
+        const auto process_pos = [&](int64_t s) {
+            // Map flat spatial index → tensor offset (skipping C8 dim)
+            int64_t off = 0;
+            int64_t rem = s;
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                if (d == 1) continue;
+                int64_t dim = X.shape(d);
+                off += (rem % dim) * X.stride_elems(d);
+                rem /= dim;
+            }
+            kernel::softmax_process_packed_channel<T>(
+                x_ptr + off, y_ptr + off,
+                chan_stride, chan_stride,
+                C8, pack, log_softmax);
+        };
+
+        if (ctx.cpu_parallel_for)
+            ctx.cpu_parallel_for(0, num_spatial, process_pos);
+        else
+            for (int64_t i = 0; i < num_spatial; ++i) process_pos(i);
+
+        return;
+    }
+
+    // ============================================================
     // Path 2 — Standard SIMD fast path: axis == rank-1, pack == 1
     // ============================================================
 

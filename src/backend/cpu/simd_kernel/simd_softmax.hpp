@@ -49,6 +49,88 @@ inline void softmax_process_packed_row(
     }
 }
 
+template <typename T>
+inline void softmax_process_packed_col(
+    const T* x_col, T* y_col,
+    int x_pitch, int y_pitch,
+    int64_t D, // number of rows
+    int64_t pack, // number of lanes
+    bool log_softmax
+)
+{
+    auto v_max_vec = v_set1(x_col, -std::numeric_limits<float>::infinity());
+    for (int64_t h = 0; h < D; ++h) {
+        v_max_vec = v_max(v_max_vec, v_load(x_col + h * x_pitch));
+    }
+
+    auto v_sum_vec = v_zero(x_col);
+    auto v_neg_max = v_neg(v_max_vec);
+    for (int64_t h = 0; h < D; ++h) {
+        auto v = v_add(v_load(x_col + h * x_pitch), v_neg_max);
+        v = v_exp(v);
+        if (!log_softmax) { v_store(y_col + h * y_pitch, v); }
+        v_sum_vec = v_add(v_sum_vec, v);
+    }
+
+    if (log_softmax) {
+        auto v_bias = v_sub(v_neg(v_max_vec), v_log(v_sum_vec));
+        for (int64_t h = 0; h < D; ++h) {
+            v_store(y_col + h * y_pitch, v_add(v_load(x_col + h * x_pitch), v_bias));
+        }
+    } else {
+        auto v_inv = v_div(v_set1(x_col, 1.0f), v_sum_vec);
+        for (int64_t h = 0; h < D; ++h) {
+            v_store(y_col + h * y_pitch, v_mul(v_load(y_col + h * y_pitch), v_inv));
+        }
+    }
+}
+
+/// Channel-wise softmax for NCHWC8 / NCDHWC8 packed layout.
+///
+/// At each spatial position (n, h, w) or (n, d, h, w), D = C8 channel
+/// blocks are traversed via chan_stride.  Each of the `pack` SIMD lanes
+/// is an independent softmax across the C8 dimension.
+///
+/// x_chan_stride / y_chan_stride: element stride between consecutive C8
+/// blocks at the same spatial position, i.e. stride_elems(1) in NCHWC8.
+template <typename T>
+inline void softmax_process_packed_channel(
+    const T* x_chan, T* y_chan,
+    int64_t x_chan_stride, int64_t y_chan_stride,
+    int64_t D, // number of C8 blocks (= C/8, rounded up)
+    int64_t pack, // number of SIMD lanes (8)
+    bool log_softmax
+) {
+    // Pass 1 — per-lane max across all C8 blocks
+    auto v_max_vec = v_set1(x_chan, -std::numeric_limits<float>::infinity());
+    for (int64_t c = 0; c < D; ++c)
+        v_max_vec = v_max(v_max_vec, v_load(x_chan + c * x_chan_stride));
+
+    // Pass 2 — exp(x - max) + sum
+    auto v_sum_vec = v_zero(x_chan);
+    auto v_neg_max = v_neg(v_max_vec);
+    for (int64_t c = 0; c < D; ++c) {
+        auto v = v_add(v_load(x_chan + c * x_chan_stride), v_neg_max);
+        v = v_exp(v);
+        if (!log_softmax) { v_store(y_chan + c * y_chan_stride, v); }
+        v_sum_vec = v_add(v_sum_vec, v);
+    }
+
+    // Pass 3 — normalize
+    if (log_softmax) {
+        auto v_bias = v_sub(v_neg(v_max_vec), v_log(v_sum_vec));
+        for (int64_t c = 0; c < D; ++c)
+            v_store(y_chan + c * y_chan_stride,
+                    v_add(v_load(x_chan + c * x_chan_stride), v_bias));
+    } else {
+        auto v_inv = v_div(v_set1(x_chan, 1.0f), v_sum_vec);
+        for (int64_t c = 0; c < D; ++c)
+            v_store(y_chan + c * y_chan_stride,
+                    v_mul(v_load(y_chan + c * y_chan_stride), v_inv));
+    }
+}
+
+
 /// Standard SIMD fast path: contiguous tail, pack == 1.
 template <typename T>
 inline void softmax_process_standard_row(

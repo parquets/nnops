@@ -55,6 +55,46 @@ inline void reduce_process_packed_row(
     }
 }
 
+/// Packed channel SIMD: per-lane reduction over D C8 blocks at a single
+/// spatial position.  x_chan_stride is the element stride between consecutive
+/// C8 blocks (= stride_elems(1) in NCHWC8).
+template <typename T>
+inline void reduce_process_packed_channel(
+    const T* x_chan, T* y_pos,
+    int64_t x_chan_stride,
+    int64_t D, int64_t pack,
+    ReduceType type, float inv_D)
+{
+    switch (type) {
+    case ReduceType::Sum:
+    case ReduceType::Mean: {
+        auto v_sum = v_zero(x_chan);
+        for (int64_t c = 0; c < D; ++c)
+            v_sum = v_add(v_sum, v_load(x_chan + c * x_chan_stride));
+        if (type == ReduceType::Mean) {
+            auto v_inv = v_set1(x_chan, inv_D);
+            v_sum = v_mul(v_sum, v_inv);
+        }
+        v_store(y_pos, v_sum);
+        break;
+    }
+    case ReduceType::Max: {
+        auto v_best = v_set1(x_chan, -std::numeric_limits<float>::infinity());
+        for (int64_t c = 0; c < D; ++c)
+            v_best = v_max(v_best, v_load(x_chan + c * x_chan_stride));
+        v_store(y_pos, v_best);
+        break;
+    }
+    case ReduceType::Min: {
+        auto v_best = v_set1(x_chan, std::numeric_limits<float>::infinity());
+        for (int64_t c = 0; c < D; ++c)
+            v_best = v_min(v_best, v_load(x_chan + c * x_chan_stride));
+        v_store(y_pos, v_best);
+        break;
+    }
+    }
+}
+
 /// Contiguous tail: multi-accumulator unrolling per row.
 template <typename T>
 inline void reduce_process_contiguous_row(
