@@ -163,8 +163,10 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     // ============================================================
 
     if (axis == 1 && pack > 1) {
-        const int64_t C8 = X.shape(1);          // number of channel blocks
-        const int64_t chan_stride = X.stride_elems(1); // H*W*pack between C8 blocks
+        const int64_t C = X.shape(1);                    // logical channel count
+        const int64_t C8 = X.num_channel_blocks();        // ceil(C / pack)
+        const int64_t chan_stride = X.stride_elems(1);    // stride between C8 blocks
+        const int64_t valid_lanes = (C % pack == 0) ? pack : (C % pack);
 
         // Count spatial positions: product of all dims except C8 (axis=1)
         int64_t num_spatial = 1;
@@ -184,7 +186,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
             kernel::softmax_process_packed_channel<T>(
                 x_ptr + off, y_ptr + off,
                 chan_stride, chan_stride,
-                C8, pack, log_softmax);
+                C8, pack, valid_lanes, log_softmax);
         };
 
         if (ctx.cpu_parallel_for)
