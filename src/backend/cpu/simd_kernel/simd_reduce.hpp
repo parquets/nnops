@@ -18,7 +18,8 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Packed SIMD: per-lane reduction over D spatial positions.
+/// Packed SIMD: per-lane reduction over D spatial positions,
+/// contiguous pack-wide strides (axis == rank-1).
 template <typename T>
 inline void reduce_process_packed_row(
     const T* x_row, T* y_pos,
@@ -49,6 +50,48 @@ inline void reduce_process_packed_row(
         auto v_best = v_set1(x_row, std::numeric_limits<float>::infinity());
         for (int64_t d = 0; d < D; ++d)
             v_best = v_min(v_best, v_load(x_row + d * pack));
+        v_store(y_pos, v_best);
+        break;
+    }
+    }
+}
+
+/// Packed column SIMD: per-lane reduction over D pitch-strided rows
+/// (axis < rank-1, pack > 1).  Each row holds `pack` SIMD lanes at a
+/// fixed (outer, inner) position; x_pitch strides to the next row
+/// along the reduce axis.
+/// Output is pack-wide (v_store) — each lane independently reduced.
+template <typename T>
+inline void reduce_process_packed_col(
+    const T* x_col, T* y_pos,
+    int64_t x_pitch,
+    int64_t D, int64_t pack,
+    ReduceType type, float inv_D)
+{
+    switch (type) {
+    case ReduceType::Sum:
+    case ReduceType::Mean: {
+        auto v_sum = v_zero(x_col);
+        for (int64_t d = 0; d < D; ++d)
+            v_sum = v_add(v_sum, v_load(x_col + d * x_pitch));
+        if (type == ReduceType::Mean) {
+            auto v_inv = v_set1(x_col, inv_D);
+            v_sum = v_mul(v_sum, v_inv);
+        }
+        v_store(y_pos, v_sum);
+        break;
+    }
+    case ReduceType::Max: {
+        auto v_best = v_set1(x_col, -std::numeric_limits<float>::infinity());
+        for (int64_t d = 0; d < D; ++d)
+            v_best = v_max(v_best, v_load(x_col + d * x_pitch));
+        v_store(y_pos, v_best);
+        break;
+    }
+    case ReduceType::Min: {
+        auto v_best = v_set1(x_col, std::numeric_limits<float>::infinity());
+        for (int64_t d = 0; d < D; ++d)
+            v_best = v_min(v_best, v_load(x_col + d * x_pitch));
         v_store(y_pos, v_best);
         break;
     }

@@ -358,6 +358,57 @@ void reduce_impl(const ReduceAttributes& attrs,
         return;
     }
 
+    // ---- Path 1c: Packed column SIMD (pack > 1, general non-channel axis) ----
+    if (pack > 1) {
+        const int64_t D = input.shape(axis);
+        const int64_t axis_stride = input.stride_elems(axis);
+        const float inv_D = 1.0f / static_cast<float>(D);
+
+        const T* x_ptr = input.ptr<T>();
+        T* y_ptr = output.ptr<T>();
+
+        // Count (outer, inner) positions excluding the reduce axis
+        int64_t num_positions = 1;
+        for (int64_t d = 0; d < rank; ++d)
+            if (d != axis) num_positions *= input.shape(d);
+
+        const int64_t rank_out = output.rank();
+        const bool keepdims = attrs.keepdims;
+
+        const auto process_pos = [&](int64_t s) {
+            // Input offset at first row along reduce axis
+            int64_t in_off = 0;
+            int64_t rem = s;
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                if (d == axis) continue;
+                int64_t dim = input.shape(d);
+                in_off += (rem % dim) * input.stride_elems(d);
+                rem /= dim;
+            }
+
+            // Output offset
+            int64_t out_off = 0;
+            rem = s;
+            for (int64_t d_out = rank_out - 1; d_out >= 0; --d_out) {
+                if (keepdims && d_out == axis) continue;
+                int64_t dim = output.shape(d_out);
+                out_off += (rem % dim) * output.stride_elems(d_out);
+                rem /= dim;
+            }
+
+            kernel::reduce_process_packed_col<T>(
+                x_ptr + in_off, y_ptr + out_off,
+                axis_stride, D, pack, attrs.type, inv_D);
+        };
+
+        if (ctx.cpu_parallel_for)
+            ctx.cpu_parallel_for(0, num_positions, process_pos);
+        else
+            for (int64_t i = 0; i < num_positions; ++i) process_pos(i);
+
+        return;
+    }
+
     // ---- Path 2: Contiguous tail (axis == rank-1, pack == 1) ----
     if (axis == rank - 1) {
         reduce_contiguous_simd<T>(attrs, output, input, axis, ctx);

@@ -53,7 +53,7 @@ inline void softmax_process_packed_row(
 template <typename T>
 inline void softmax_process_packed_col(
     const T* x_col, T* y_col,
-    int x_pitch, int y_pitch,
+    int64_t x_pitch, int64_t y_pitch,
     int64_t D, // number of rows
     int64_t pack, // number of lanes
     bool log_softmax

@@ -198,6 +198,42 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     }
 
     // ============================================================
+    // Path 1c — Packed column SIMD (pack > 1, general non-channel axis)
+    //           Covers NCHWC8 H, NCDHWC8 D/H, and axis=0 for all.
+    // ============================================================
+
+    if (pack > 1) {
+        const int64_t D = X.shape(axis);
+        const int64_t axis_stride = X.stride_elems(axis);
+
+        int64_t num_positions = 1;
+        for (int64_t d = 0; d < rank; ++d)
+            if (d != axis) num_positions *= X.shape(d);
+
+        const auto process_pos = [&](int64_t s) {
+            int64_t off = 0;
+            int64_t rem = s;
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                if (d == axis) continue;
+                int64_t dim = X.shape(d);
+                off += (rem % dim) * X.stride_elems(d);
+                rem /= dim;
+            }
+            kernel::softmax_process_packed_col<T>(
+                x_ptr + off, y_ptr + off,
+                axis_stride, axis_stride,
+                D, pack, log_softmax);
+        };
+
+        if (ctx.cpu_parallel_for)
+            ctx.cpu_parallel_for(0, num_positions, process_pos);
+        else
+            for (int64_t i = 0; i < num_positions; ++i) process_pos(i);
+
+        return;
+    }
+
+    // ============================================================
     // Path 2 — Standard SIMD fast path: axis == rank-1, pack == 1
     // ============================================================
 
