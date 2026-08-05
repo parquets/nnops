@@ -42,6 +42,27 @@ struct ResizeAttributes {
     /// If true, add result to existing output buffer instead of overwriting.
     bool add_to = false;
 
+    /// Crop region in input pixel coordinates.
+    /// crop_start = {start_d, start_h, start_w} — inclusive start.
+    /// crop_end   = {end_d,   end_h,   end_w}   — exclusive end.
+    ///
+    /// When crop_end[d] == 0, no crop is applied for that dimension
+    /// (the full input spatial extent is used).
+    ///
+    /// For 2D input (NCHW/NCHWC8, rank=4), index 0 (D) is ignored
+    ///   — only crop_start[1]/[2] and crop_end[1]/[2] (H, W) are used.
+    /// For 3D input (NCDHW/NCDHWC8, rank=5), all three indices are used.
+    ///
+    /// Example: input [N,C,8,16,16], crop_start={2,4,4}, crop_end={6,12,12}
+    ///   → crops region d=[2,6), h=[4,12), w=[4,12), then resizes to output_size.
+    std::array<int64_t, 3> crop_start = {0, 0, 0};
+    std::array<int64_t, 3> crop_end   = {0, 0, 0};
+
+    /// Returns true if any crop dimension is active (crop_end > 0).
+    bool has_crop() const noexcept {
+        return crop_end[0] > 0 || crop_end[1] > 0 || crop_end[2] > 0;
+    }
+
     /// Returns the spatial rank (2 or 3) inferred from the input tensor rank.
     /// For a 4D input (NCHW), returns 2. For a 5D input (NCDHW), returns 3.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {

@@ -447,3 +447,295 @@ NNOPS_TEST(resize_multi_c8_nearest) {
     attrs.output_size = {0, 8, 8};
     test_nchwc8_vs_nchw({2, 17, 16, 16}, attrs);
 }
+
+// ============================================================
+// Crop + resize tests — crop a sub-region then resize to output
+// ============================================================
+
+NNOPS_TEST(resize_2d_crop_nearest_upsample) {
+    // 1x1x8x8 input, crop center 4x4 region [2:6, 2:6], resize to 8x8
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {0, 8, 8};
+    attrs.crop_start = {0, 2, 2};
+    attrs.crop_end   = {0, 6, 6};
+    test_nchwc8_vs_nchw({1, 3, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_nearest_downsample) {
+    // Crop a 8x8 sub-region from 16x16, then nearest-downsample to 4x4
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {0, 4, 4};
+    attrs.crop_start = {0, 4, 4};
+    attrs.crop_end   = {0, 12, 12};
+    test_nchwc8_vs_nchw({1, 3, 16, 16}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
+    // Crop center 4x4 from 10x10, bilinear upsample to 12x12
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 12, 12};
+    attrs.crop_start = {0, 3, 3};
+    attrs.crop_end   = {0, 7, 7};
+    test_nchwc8_vs_nchw({1, 3, 10, 10}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_bilinear_align_corners) {
+    // Crop + bilinear with AlignCorners coordinate mode
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::AlignCorners;
+    attrs.output_size = {0, 8, 8};
+    attrs.crop_start = {0, 1, 1};
+    attrs.crop_end   = {0, 5, 5};
+    test_nchwc8_vs_nchw({1, 1, 6, 6}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_full_image) {
+    // Crop equals full image — should produce same result as no-crop
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 16, 16};
+    attrs.crop_start = {0, 0, 0};
+    attrs.crop_end   = {0, 8, 8};
+    test_nchwc8_vs_nchw({1, 3, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_single_pixel_output) {
+    // Crop a thin 2x2 strip, resize down to 1x1 (single pixel)
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 1, 1};
+    attrs.crop_start = {0, 3, 5};
+    attrs.crop_end   = {0, 5, 7};
+    test_nchwc8_vs_nchw({1, 3, 8, 12}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
+    // Crop includes top-left corner (start at origin, partial end)
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {0, 8, 8};
+    attrs.crop_start = {0, 0, 0};
+    attrs.crop_end   = {0, 6, 6};
+    test_nchwc8_vs_nchw({1, 3, 10, 10}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
+    // Crop includes bottom-right corner
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 8, 8};
+    attrs.crop_start = {0, 6, 6};
+    attrs.crop_end   = {0, 12, 12};
+    test_nchwc8_vs_nchw({1, 3, 12, 12}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_multichannel) {
+    // Multi-channel crop + resize
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 8, 8};
+    attrs.crop_start = {0, 4, 4};
+    attrs.crop_end   = {0, 12, 12};
+    test_nchwc8_vs_nchw({2, 7, 16, 16}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_partial_c8) {
+    // Crop with partial C8 channels (3 channels → 1 C8 block, zero-padded)
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 16, 16};
+    attrs.crop_start = {0, 2, 2};
+    attrs.crop_end   = {0, 10, 10};
+    test_nchwc8_vs_nchw({1, 3, 12, 12}, attrs);
+}
+
+NNOPS_TEST(resize_2d_crop_add_to) {
+    // Crop + add_to mode
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {0, 8, 8};
+    attrs.add_to = true;
+    attrs.crop_start = {0, 3, 3};
+    attrs.crop_end   = {0, 9, 9};
+    test_nchwc8_vs_nchw({1, 3, 12, 12}, attrs);
+}
+
+// ============================================================
+// 3D crop + resize tests
+// ============================================================
+
+NNOPS_TEST(resize_3d_crop_nearest) {
+    // Crop D=[1:3), H=[2:6), W=[2:6) from 4x8x8, then nearest to 4x4x4
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {4, 4, 4};
+    attrs.crop_start = {1, 2, 2};
+    attrs.crop_end   = {3, 6, 6};
+    test_nchwc8_vs_nchw({1, 3, 4, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_3d_crop_trilinear) {
+    // Crop center region from 8x12x12, trilinear to 4x6x6
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {4, 6, 6};
+    attrs.crop_start = {2, 2, 2};
+    attrs.crop_end   = {6, 10, 10};
+    test_nchwc8_vs_nchw({1, 3, 8, 12, 12}, attrs);
+}
+
+NNOPS_TEST(resize_3d_crop_full_volume) {
+    // Crop equals entire 3D volume — same as no-crop
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {4, 8, 8};
+    attrs.crop_start = {0, 0, 0};
+    attrs.crop_end   = {4, 8, 8};
+    test_nchwc8_vs_nchw({1, 1, 4, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_3d_crop_partial_c8) {
+    // 3D crop with partial C8 channels
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {4, 8, 8};
+    attrs.crop_start = {1, 2, 2};
+    attrs.crop_end   = {5, 10, 10};
+    test_nchwc8_vs_nchw({1, 5, 6, 12, 12}, attrs);
+}
+
+NNOPS_TEST(resize_3d_crop_align_corners) {
+    // 3D crop + trilinear with AlignCorners
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::AlignCorners;
+    attrs.output_size = {4, 6, 6};
+    attrs.crop_start = {1, 1, 1};
+    attrs.crop_end   = {5, 7, 7};
+    test_nchwc8_vs_nchw({1, 2, 6, 8, 8}, attrs);
+}
+
+// ============================================================
+// Hand-verified crop + resize: known input → known output
+// ============================================================
+
+NNOPS_TEST(resize_2d_crop_nearest_hand_verified) {
+    // 1x1x4x4 input:
+    //   1   2   3   4
+    //   5   6   7   8
+    //   9  10  11  12
+    //  13  14  15  16
+    //
+    // Crop [1:3, 1:3) = {6,7; 10,11}, nearest-upsample Asymmetric to 4x4.
+    //
+    // scale = 2/4 = 0.5.  Asymmetric: src = dst * scale.
+    //   dst=0 → src=0.0, round=0
+    //   dst=1 → src=0.5, round=1  (std::round half-away-from-zero)
+    //   dst=2 → src=1.0, round=1
+    //   dst=3 → src=1.5, round=2 → clamp(2,2)=1
+    //
+    // Expected output (4x4):
+    //   6   7   7   7
+    //  10  11  11  11
+    //  10  11  11  11
+    //  10  11  11  11
+    const std::vector<int64_t> ishape = {1, 1, 4, 4};
+    const std::vector<float> in_data = {
+        1,  2,  3,  4,
+        5,  6,  7,  8,
+        9, 10, 11, 12,
+       13, 14, 15, 16
+    };
+
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Nearest;
+    attrs.coord_mode = CoordinateTransformMode::Asymmetric;
+    attrs.output_size = {0, 4, 4};
+    attrs.crop_start = {0, 1, 1};
+    attrs.crop_end   = {0, 3, 3};
+
+    run_resize_roundtrip(ishape, {1, 1, 4, 4}, in_data, attrs, [](const TensorView& result) {
+        const float* r = result.ptr<float>();
+        NNOPS_EXPECT_NEAR(r[0],  6.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[1],  7.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[2],  7.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[3],  7.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[4], 10.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[5], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[6], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[7], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[8], 10.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[9], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[10], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[11], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[12], 10.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[13], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[14], 11.0f, 1e-6f);
+        NNOPS_EXPECT_NEAR(r[15], 11.0f, 1e-6f);
+    });
+}
+
+NNOPS_TEST(resize_2d_crop_bilinear_hand_verified) {
+    // 1x1x3x3 input:
+    //   1  2  3
+    //   4  5  6
+    //   7  8  9
+    //
+    // Crop [0:2, 0:2) = {1,2; 4,5}, bilinear-upsample AlignCorners to 3x3
+    // src_h = dst * (2-1)/(3-1) = dst * 0.5
+    // dst_h=0 -> src_h=0.0 (row 0, col 0), dst_h=2 -> src_h=1.0 (row 1, col 1)
+    // dst_h=1 -> src_h=0.5 (interpolate row 0/1)
+    //
+    // Output:
+    //   1.0   1.5   2.0
+    //   2.5   3.0   3.5
+    //   4.0   4.5   5.0
+    const std::vector<int64_t> ishape = {1, 1, 3, 3};
+    const std::vector<float> in_data = {
+        1, 2, 3,
+        4, 5, 6,
+        7, 8, 9
+    };
+
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Linear;
+    attrs.coord_mode = CoordinateTransformMode::AlignCorners;
+    attrs.output_size = {0, 3, 3};
+    attrs.crop_start = {0, 0, 0};
+    attrs.crop_end   = {0, 2, 2};
+
+    run_resize_roundtrip(ishape, {1, 1, 3, 3}, in_data, attrs, [](const TensorView& result) {
+        const float* r = result.ptr<float>();
+        NNOPS_EXPECT_NEAR(r[0], 1.0f, 1e-5f);  // (0,0): v00=1
+        NNOPS_EXPECT_NEAR(r[1], 1.5f, 1e-5f);  // (0,1): h=0,w=0.5 → 0.5*1+0.5*2=1.5
+        NNOPS_EXPECT_NEAR(r[2], 2.0f, 1e-5f);  // (0,2): v01=2
+        NNOPS_EXPECT_NEAR(r[3], 2.5f, 1e-5f);  // (1,0): h=0.5,w=0 → 0.5*1+0.5*4=2.5
+        NNOPS_EXPECT_NEAR(r[4], 3.0f, 1e-5f);  // (1,1): center interp of all 4
+        NNOPS_EXPECT_NEAR(r[5], 3.5f, 1e-5f);  // (1,2): h=0.5,w=1 → 0.5*2+0.5*5=3.5
+        NNOPS_EXPECT_NEAR(r[6], 4.0f, 1e-5f);  // (2,0): v10=4
+        NNOPS_EXPECT_NEAR(r[7], 4.5f, 1e-5f);  // (2,1): h=1,w=0.5 → 0.5*4+0.5*5=4.5
+        NNOPS_EXPECT_NEAR(r[8], 5.0f, 1e-5f);  // (2,2): v11=5
+        for (int64_t i = 0; i < result.numel(); ++i) {
+            NNOPS_EXPECT_TRUE(!std::isnan(r[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(r[i]));
+        }
+    });
+}

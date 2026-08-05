@@ -70,10 +70,39 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     const int64_t N = input.shape(0);
     const int64_t C = input.shape(1);
 
-    // Input spatial dims
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
+    // Input spatial dims (raw — physical memory layout)
+    const int64_t raw_ID = (srank == 3) ? input.shape(2) : 1;
+    const int64_t raw_IH = input.shape(srank);
+    const int64_t raw_IW = input.shape(srank + 1);
+
+    // ---- Crop: compute effective input region ----
+    // When crop_end[d] > 0, use crop region; otherwise use full input.
+    const bool has_crop = attrs.has_crop();
+
+    int64_t eff_ID = raw_ID, eff_IH = raw_IH, eff_IW = raw_IW;
+    int64_t crop_off = 0;  // in elements, planar layout (no pack factor)
+
+    if (has_crop) {
+        // Validate crop bounds
+        if (srank == 3 && attrs.crop_end[0] > 0) {
+            NNOPS_ASSERT(attrs.crop_start[0] >= 0 && attrs.crop_start[0] < raw_ID);
+            NNOPS_ASSERT(attrs.crop_end[0] > attrs.crop_start[0] && attrs.crop_end[0] <= raw_ID);
+            eff_ID = attrs.crop_end[0] - attrs.crop_start[0];
+            crop_off += attrs.crop_start[0] * raw_IH * input.row_stride_elems();
+        }
+        if (attrs.crop_end[1] > 0) {
+            NNOPS_ASSERT(attrs.crop_start[1] >= 0 && attrs.crop_start[1] < raw_IH);
+            NNOPS_ASSERT(attrs.crop_end[1] > attrs.crop_start[1] && attrs.crop_end[1] <= raw_IH);
+            eff_IH = attrs.crop_end[1] - attrs.crop_start[1];
+            crop_off += attrs.crop_start[1] * input.row_stride_elems();
+        }
+        if (attrs.crop_end[2] > 0) {
+            NNOPS_ASSERT(attrs.crop_start[2] >= 0 && attrs.crop_start[2] < raw_IW);
+            NNOPS_ASSERT(attrs.crop_end[2] > attrs.crop_start[2] && attrs.crop_end[2] <= raw_IW);
+            eff_IW = attrs.crop_end[2] - attrs.crop_start[2];
+            crop_off += attrs.crop_start[2];  // W has no pack factor in planar
+        }
+    }
 
     // Output spatial dims
     const int64_t OD = (srank == 3) ? output.shape(2) : 1;
@@ -83,9 +112,10 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     const auto* in_ptr  = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
 
+    // Strides use raw input dims (physical layout doesn't change with crop)
     const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_d_stride    = IH * in_row_stride;
-    const int64_t in_ch_stride   = ID * in_d_stride;
+    const int64_t in_d_stride    = raw_IH * in_row_stride;
+    const int64_t in_ch_stride   = raw_ID * in_d_stride;
     const int64_t out_row_stride = output.row_stride_elems();
     const int64_t out_d_stride   = OH * out_row_stride;
     const int64_t out_ch_stride  = OD * out_d_stride;
@@ -96,7 +126,7 @@ void resize_impl_ref(const ResizeAttributes& attrs,
 
     // Per-channel compute lambda (N*C parallel)
     const auto compute_channel = [&](int64_t n, int64_t c) {
-        const T* in_ch  = in_ptr + n * C * in_ch_stride + c * in_ch_stride;
+        const T* in_ch  = in_ptr + n * C * in_ch_stride + c * in_ch_stride + crop_off;
         T* out_ch = out_ptr + n * C * out_ch_stride + c * out_ch_stride;
 
         for (int64_t od = 0; od < OD; ++od) {
@@ -107,34 +137,34 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                     if (mode == ResizeMode::Nearest) {
                         // ---- Nearest-neighbor ----
                         if (srank == 3) {
-                            float src_d = compute_src_coord(od, ID, OD, coord_mode);
-                            float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-                            float src_w = compute_src_coord(ow, IW, OW, coord_mode);
-                            int64_t id = clamp_idx(static_cast<int64_t>(std::round(src_d)), ID);
-                            int64_t ih = clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
-                            int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
+                            float src_d = compute_src_coord(od, eff_ID, OD, coord_mode);
+                            float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
+                            float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
+                            int64_t id = clamp_idx(static_cast<int64_t>(std::round(src_d)), eff_ID);
+                            int64_t ih = clamp_idx(static_cast<int64_t>(std::round(src_h)), eff_IH);
+                            int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), eff_IW);
                             result = s_load(&in_ch[id * in_d_stride + ih * in_row_stride + iw]);
                         } else {
-                            float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-                            float src_w = compute_src_coord(ow, IW, OW, coord_mode);
-                            int64_t ih = clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
-                            int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
+                            float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
+                            float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
+                            int64_t ih = clamp_idx(static_cast<int64_t>(std::round(src_h)), eff_IH);
+                            int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), eff_IW);
                             result = s_load(&in_ch[ih * in_row_stride + iw]);
                         }
                     } else {
                         // ---- Linear (bilinear / trilinear) ----
                         if (srank == 3) {
                             // Trilinear: 8 neighbors in 3D
-                            float src_d = compute_src_coord(od, ID, OD, coord_mode);
-                            float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-                            float src_w = compute_src_coord(ow, IW, OW, coord_mode);
+                            float src_d = compute_src_coord(od, eff_ID, OD, coord_mode);
+                            float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
+                            float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
 
-                            int64_t z0 = clamp_idx(static_cast<int64_t>(std::floor(src_d)), ID);
-                            int64_t y0 = clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
-                            int64_t x0 = clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
-                            int64_t z1 = clamp_idx(z0 + 1, ID);
-                            int64_t y1 = clamp_idx(y0 + 1, IH);
-                            int64_t x1 = clamp_idx(x0 + 1, IW);
+                            int64_t z0 = clamp_idx(static_cast<int64_t>(std::floor(src_d)), eff_ID);
+                            int64_t y0 = clamp_idx(static_cast<int64_t>(std::floor(src_h)), eff_IH);
+                            int64_t x0 = clamp_idx(static_cast<int64_t>(std::floor(src_w)), eff_IW);
+                            int64_t z1 = clamp_idx(z0 + 1, eff_ID);
+                            int64_t y1 = clamp_idx(y0 + 1, eff_IH);
+                            int64_t x1 = clamp_idx(x0 + 1, eff_IW);
 
                             float wz = src_d - std::floor(src_d);
                             float wy = src_h - std::floor(src_h);
@@ -163,13 +193,13 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                             result = wz0 * r0 + wz * r1;
                         } else {
                             // Bilinear: 4 neighbors in 2D
-                            float src_h = compute_src_coord(oh, IH, OH, coord_mode);
-                            float src_w = compute_src_coord(ow, IW, OW, coord_mode);
+                            float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
+                            float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
 
-                            int64_t y0 = clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
-                            int64_t x0 = clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
-                            int64_t y1 = clamp_idx(y0 + 1, IH);
-                            int64_t x1 = clamp_idx(x0 + 1, IW);
+                            int64_t y0 = clamp_idx(static_cast<int64_t>(std::floor(src_h)), eff_IH);
+                            int64_t x0 = clamp_idx(static_cast<int64_t>(std::floor(src_w)), eff_IW);
+                            int64_t y1 = clamp_idx(y0 + 1, eff_IH);
+                            int64_t x1 = clamp_idx(x0 + 1, eff_IW);
 
                             float wy = src_h - std::floor(src_h);
                             float wx = src_w - std::floor(src_w);

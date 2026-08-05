@@ -48,9 +48,43 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
     const int64_t C8  = input.num_channel_blocks();
 
     // Input spatial dims
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
+    const int64_t raw_ID = (srank == 3) ? input.shape(2) : 1;
+    const int64_t raw_IH = input.shape(srank);
+    const int64_t raw_IW = input.shape(srank + 1);
+
+    // ---- Crop: compute effective input region ----
+    // When crop_end[d] > 0, use crop region; otherwise use full input.
+    // crop_start / crop_end use {D, H, W} indexing matching output_size.
+    const int64_t pack = input.channel_pack_size();  // 8 for NCHWC8
+
+    const bool has_crop = attrs.has_crop();
+
+    // Effective source sizes (what the kernel sees as its "input")
+    int64_t eff_ID = raw_ID, eff_IH = raw_IH, eff_IW = raw_IW;
+    // Offset added to in_base to skip crop_start region (in elements)
+    int64_t crop_off = 0;
+
+    if (has_crop) {
+        // Validate crop bounds
+        if (srank == 3 && attrs.crop_end[0] > 0) {
+            NNOPS_ASSERT(attrs.crop_start[0] >= 0 && attrs.crop_start[0] < raw_ID);
+            NNOPS_ASSERT(attrs.crop_end[0] > attrs.crop_start[0] && attrs.crop_end[0] <= raw_ID);
+            eff_ID = attrs.crop_end[0] - attrs.crop_start[0];
+            crop_off += attrs.crop_start[0] * raw_IH * input.row_stride_elems();
+        }
+        if (attrs.crop_end[1] > 0) {
+            NNOPS_ASSERT(attrs.crop_start[1] >= 0 && attrs.crop_start[1] < raw_IH);
+            NNOPS_ASSERT(attrs.crop_end[1] > attrs.crop_start[1] && attrs.crop_end[1] <= raw_IH);
+            eff_IH = attrs.crop_end[1] - attrs.crop_start[1];
+            crop_off += attrs.crop_start[1] * input.row_stride_elems();
+        }
+        if (attrs.crop_end[2] > 0) {
+            NNOPS_ASSERT(attrs.crop_start[2] >= 0 && attrs.crop_start[2] < raw_IW);
+            NNOPS_ASSERT(attrs.crop_end[2] > attrs.crop_start[2] && attrs.crop_end[2] <= raw_IW);
+            eff_IW = attrs.crop_end[2] - attrs.crop_start[2];
+            crop_off += attrs.crop_start[2] * pack;  // W pixels × 8 channels
+        }
+    }
 
     // Output spatial dims
     const int64_t OD = (srank == 3) ? output.shape(2) : 1;
@@ -60,8 +94,9 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
     auto*       out_ptr = output.ptr<T>();
     const auto* in_ptr  = input.ptr<T>();
 
+    // Strides use raw input dims (physical layout doesn't change with crop)
     const int64_t in_row_stride  = input.row_stride_elems();
-    const int64_t in_d_stride    = IH * in_row_stride;
+    const int64_t in_d_stride    = raw_IH * in_row_stride;
     const int64_t in_ch_stride   = input.channel_block_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
     const int64_t out_d_stride   = OH * out_row_stride;
@@ -73,7 +108,7 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
 
     // Per-C8-block compute lambda (all C8 blocks use SIMD)
     const auto compute_c8 = [&](int64_t n, int64_t c8) {
-        const T* in_base  = in_ptr  + n * C8 * in_ch_stride  + c8 * in_ch_stride;
+        const T* in_base  = in_ptr  + n * C8 * in_ch_stride  + c8 * in_ch_stride + crop_off;
         T*       out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
 
         if (srank == 3) {
@@ -81,14 +116,14 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
             if (mode == ResizeMode::Nearest) {
                 k::resize_nearest_3d<T>(
                     out_base, in_base,
-                    ID, IH, IW, OD, OH, OW,
+                    eff_ID, eff_IH, eff_IW, OD, OH, OW,
                     in_d_stride, in_row_stride,
                     out_d_stride, out_row_stride,
                     coord_mode, add_to);
             } else {
                 k::resize_trilinear_3d<T>(
                     out_base, in_base,
-                    ID, IH, IW, OD, OH, OW,
+                    eff_ID, eff_IH, eff_IW, OD, OH, OW,
                     in_d_stride, in_row_stride,
                     out_d_stride, out_row_stride,
                     coord_mode, add_to);
@@ -98,13 +133,13 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
             if (mode == ResizeMode::Nearest) {
                 k::resize_nearest_2d<T>(
                     out_base, in_base,
-                    IH, IW, OH, OW,
+                    eff_IH, eff_IW, OH, OW,
                     in_row_stride, out_row_stride,
                     coord_mode, add_to);
             } else {
                 k::resize_bilinear_2d<T>(
                     out_base, in_base,
-                    IH, IW, OH, OW,
+                    eff_IH, eff_IW, OH, OW,
                     in_row_stride, out_row_stride,
                     coord_mode, add_to);
             }
