@@ -307,9 +307,11 @@ void reduce_impl(const ReduceAttributes& attrs,
 
     // ---- Path 1b: Packed channel SIMD (axis == 1, pack > 1, NCHWC8) ----
     if (axis == 1 && pack > 1) {
-        const int64_t C8 = input.shape(1);
+        const int64_t C = input.shape(1);                // logical channel count
+        const int64_t C8 = input.num_channel_blocks();   // ceil(C / pack)
         const int64_t chan_stride = input.stride_elems(1);
-        const float inv_total = 1.0f / static_cast<float>(C8 * pack);
+        const int64_t valid_lanes = (C % pack == 0) ? pack : (C % pack);
+        const float inv_total = 1.0f / static_cast<float>(C);
 
         const T* x_ptr = input.ptr<T>();
         T* y_ptr = output.ptr<T>();
@@ -345,7 +347,7 @@ void reduce_impl(const ReduceAttributes& attrs,
 
             kernel::reduce_process_packed_channel<T>(
                 x_ptr + in_off, y_ptr + out_off,
-                chan_stride, C8, pack, attrs.type, inv_total);
+                chan_stride, C8, pack, valid_lanes, attrs.type, inv_total);
         };
 
         if (ctx.cpu_parallel_for)

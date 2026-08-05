@@ -55,49 +55,86 @@ inline void reduce_process_packed_row(
     }
 }
 
-/// Packed channel SIMD: reduction over D C8 blocks, then horizontal
-/// reduction across all `pack` SIMD lanes to produce a single scalar
-/// per spatial position.
+/// Packed channel SIMD: reduction over D C8 blocks at a single spatial
+/// position, with a horizontal reduction across SIMD lanes to produce
+/// a single scalar.
 ///
-/// Unlike per-lane packed_row (where each lane is a different channel
-/// independently reduced), channel reduction merges ALL channels:
-///   — Per-lane reduction across C8 stride-strided blocks
-///   — v_reduce_sum / v_reduce_max / v_reduce_min to collapse lanes
-///   — s_store a single scalar to y_pos
+/// Unlike per-lane packed_row (each lane = different channel, independent
+/// reduction), channel reduction merges ALL channels:
+///   1. Per-lane SIMD accumulation over full C8 blocks (0..D-2, or 0..D-1
+///      when valid_lanes == pack).
+///   2. Scalar accumulation for the partial last block (valid_lanes < pack).
+///   3. Horizontal reduction: v_reduce on the SIMD accumulator, then
+///      combine with partial scalar contributions via std::max/std::min/+.
+///   4. s_store a single scalar to y_pos.
 ///
-/// inv_total: 1.0f / total_valid_channels (C8 * pack, adjusted for
-/// padding in the last block).
+/// valid_lanes: number of valid channels in the last C8 block
+///   (= C % pack, or pack when C % pack == 0).
+/// inv_total: 1.0f / logical_C (used only by Mean).
 template <typename T>
 inline void reduce_process_packed_channel(
     const T* x_chan, T* y_pos,
     int64_t x_chan_stride,
-    int64_t D, int64_t pack,
+    int64_t D, int64_t pack, int64_t valid_lanes,
     ReduceType type, float inv_total)
 {
+    // Full blocks: all lanes contain real channel data
+    int64_t full_blocks = (valid_lanes == pack || D == 0) ? D : D - 1;
+
     switch (type) {
     case ReduceType::Sum:
     case ReduceType::Mean: {
         auto v_sum = v_zero(x_chan);
-        for (int64_t c = 0; c < D; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c)
             v_sum = v_add(v_sum, v_load(x_chan + c * x_chan_stride));
-        float result = v_reduce_sum(v_sum);
-        if (type == ReduceType::Mean)
-            result *= inv_total;
+
+        float sum = v_reduce_sum(v_sum);
+
+        // Partial last block: scalar accumulate valid lanes only
+        if (valid_lanes < pack) {
+            const T* last_row = x_chan + (D - 1) * x_chan_stride;
+            for (int64_t l = 0; l < valid_lanes; ++l)
+                sum += s_load(&last_row[l]);
+        }
+
+        float result = (type == ReduceType::Mean) ? sum * inv_total : sum;
         s_store(y_pos, result);
         break;
     }
     case ReduceType::Max: {
         auto v_best = v_set1(x_chan, -std::numeric_limits<float>::infinity());
-        for (int64_t c = 0; c < D; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c)
             v_best = v_max(v_best, v_load(x_chan + c * x_chan_stride));
-        s_store(y_pos, v_reduce_max(v_best));
+
+        float best = v_reduce_max(v_best);
+
+        if (valid_lanes < pack) {
+            const T* last_row = x_chan + (D - 1) * x_chan_stride;
+            for (int64_t l = 0; l < valid_lanes; ++l) {
+                float v = s_load(&last_row[l]);
+                if (v > best) best = v;
+            }
+        }
+
+        s_store(y_pos, best);
         break;
     }
     case ReduceType::Min: {
         auto v_best = v_set1(x_chan, std::numeric_limits<float>::infinity());
-        for (int64_t c = 0; c < D; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c)
             v_best = v_min(v_best, v_load(x_chan + c * x_chan_stride));
-        s_store(y_pos, v_reduce_min(v_best));
+
+        float best = v_reduce_min(v_best);
+
+        if (valid_lanes < pack) {
+            const T* last_row = x_chan + (D - 1) * x_chan_stride;
+            for (int64_t l = 0; l < valid_lanes; ++l) {
+                float v = s_load(&last_row[l]);
+                if (v < best) best = v;
+            }
+        }
+
+        s_store(y_pos, best);
         break;
     }
     }
