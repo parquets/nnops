@@ -309,7 +309,7 @@ void reduce_impl(const ReduceAttributes& attrs,
     if (axis == 1 && pack > 1) {
         const int64_t C8 = input.shape(1);
         const int64_t chan_stride = input.stride_elems(1);
-        const float inv_C8 = 1.0f / static_cast<float>(C8);
+        const float inv_total = 1.0f / static_cast<float>(C8 * pack);
 
         const T* x_ptr = input.ptr<T>();
         T* y_ptr = output.ptr<T>();
@@ -345,7 +345,7 @@ void reduce_impl(const ReduceAttributes& attrs,
 
             kernel::reduce_process_packed_channel<T>(
                 x_ptr + in_off, y_ptr + out_off,
-                chan_stride, C8, pack, attrs.type, inv_C8);
+                chan_stride, C8, pack, attrs.type, inv_total);
         };
 
         if (ctx.cpu_parallel_for)
