@@ -21,6 +21,19 @@ struct SoftmaxAttributes {
     /// If true, compute log-softmax instead of softmax.
     bool log_softmax = false;
 
+    /// Temperature scaling factor (T > 0).
+    ///
+    /// softmax(x_i, T) = exp(x_i / T) / sum(exp(x_j / T))
+    ///
+    /// T = 1.0  → standard softmax
+    /// T > 1.0  → softer / more uniform distribution
+    /// T < 1.0  → sharper / more peaked distribution
+    ///
+    /// The max-subtraction trick still applies:
+    ///   softmax(x_i, T) = exp((x_i - max) / T) / sum(exp((x_j - max) / T))
+    ///
+    /// Must be > 0. Default 1.0 (standard softmax).
+    float temperature = 1.0f;
 };
 
 /// Softmax operator (class-based API).

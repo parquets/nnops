@@ -43,7 +43,7 @@ void softmax_general_scalar(
     const T* x_ptr, T* y_ptr,
     const TensorView& X,
     int64_t axis, int64_t outer_size, int64_t D, int64_t inner_total,
-    bool log_softmax,
+    bool log_softmax, float inv_T,
     const ComputeContext& ctx)
 {
     const int64_t rank = X.rank();
@@ -76,23 +76,23 @@ void softmax_general_scalar(
                 if (v > max_val) max_val = v;
             }
 
-            // ---- Pass 2: sum of exp(x - max) ----
+            // ---- Pass 2: sum of exp((x - max) / T) ----
             float sum_exp = 0.0f;
             for (int64_t k = 0; k < D; ++k) {
-                sum_exp += std::exp(s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val);
+                sum_exp += std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T);
             }
 
             // ---- Pass 3: normalize ----
             if (log_softmax) {
                 float log_sum = std::log(sum_exp);
                 for (int64_t k = 0; k < D; ++k) {
-                    float val = s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val - log_sum;
+                    float val = (s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T - log_sum;
                     s_store(&y_ptr[base + inner_off + k * axis_stride], val);
                 }
             } else {
                 float inv_sum = 1.0f / sum_exp;
                 for (int64_t k = 0; k < D; ++k) {
-                    float val = std::exp(s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_sum;
+                    float val = std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T) * inv_sum;
                     s_store(&y_ptr[base + inner_off + k * axis_stride], val);
                 }
             }
@@ -124,6 +124,9 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(rank >= 1);
 
     const bool log_softmax = attrs.log_softmax;
+    const float temperature = attrs.temperature;
+    NNOPS_ASSERT(temperature > 0.0f);
+    const float inv_T = 1.0f / temperature;
 
     // Normalize axis
     int64_t axis = attrs.axis;
@@ -147,7 +150,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
         const auto process_row = [&](int64_t r) {
             kernel::softmax_process_packed_row<T>(
-                x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax);
+                x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax, inv_T);
         };
 
         if (ctx.cpu_parallel_for)
@@ -186,7 +189,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
             kernel::softmax_process_packed_channel<T>(
                 x_ptr + off, y_ptr + off,
                 chan_stride, chan_stride,
-                C8, pack, valid_lanes, log_softmax);
+                C8, pack, valid_lanes, log_softmax, inv_T);
         };
 
         if (ctx.cpu_parallel_for)
@@ -222,7 +225,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
             kernel::softmax_process_packed_col<T>(
                 x_ptr + off, y_ptr + off,
                 axis_stride, axis_stride,
-                D, pack, log_softmax);
+                D, pack, log_softmax, inv_T);
         };
 
         if (ctx.cpu_parallel_for)
@@ -247,7 +250,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
         const auto process_row = [&](int64_t row) {
             kernel::softmax_process_standard_row<T>(
-                x_ptr + row * group_stride, y_ptr + row * group_stride, D, log_softmax);
+                x_ptr + row * group_stride, y_ptr + row * group_stride, D, log_softmax, inv_T);
         };
 
         if (ctx.cpu_parallel_for)
@@ -276,7 +279,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         softmax_general_scalar<T>(
             x_ptr, y_ptr, X,
             axis, outer_size, D, inner_total,
-            log_softmax, ctx);
+            log_softmax, inv_T, ctx);
     }
 }
 

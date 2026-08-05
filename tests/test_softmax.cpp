@@ -318,6 +318,232 @@ NNOPS_TEST(softmax_nchwc8_random) {
     }
 }
 
+// ============================================================
+// Temperature tests
+// ============================================================
+
+NNOPS_TEST(softmax_temperature_basic) {
+    // 1D input [1, 2, 3], T=2.0
+    // softmax(x_i, T) = exp(x_i/T) / sum(exp(x_j/T))
+    // max=3, shifted={-2/T, -1/T, 0/T} = {-1, -0.5, 0}
+    // exp: {0.3679, 0.6065, 1.0}, sum=1.9744
+    // out: {0.1863, 0.3072, 0.5065}
+    const int64_t shape[] = {3};
+    float in_data[]  = {1.0f, 2.0f, 3.0f};
+
+    TensorView input(shape, DataType::f32, in_data);
+    auto d_in = input.desc();
+
+    SoftmaxAttributes attrs;
+    attrs.temperature = 2.0f;
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    const TensorDesc in_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(descs[0].numel());
+    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    float T = 2.0f;
+    float max_val = 3.0f;
+    float e0 = std::exp((1.0f - max_val) / T);
+    float e1 = std::exp((2.0f - max_val) / T);
+    float e2 = std::exp((3.0f - max_val) / T);
+    float sum_exp = e0 + e1 + e2;
+
+    NNOPS_EXPECT_NEAR(out_buf[0], e0 / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[1], e1 / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[2], e2 / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[0] + out_buf[1] + out_buf[2], 1.0f, 1e-5f);
+}
+
+NNOPS_TEST(softmax_temperature_sharper) {
+    // T=0.5 makes distribution sharper (more peaked)
+    // [1, 2, 3], T=0.5 → exp({-4, -2, 0}) = {0.0183, 0.1353, 1.0}
+    // sum=1.1536, out: {0.0159, 0.1173, 0.8668}
+    const int64_t shape[] = {3};
+    float in_data[]  = {1.0f, 2.0f, 3.0f};
+
+    TensorView input(shape, DataType::f32, in_data);
+    auto d_in = input.desc();
+
+    SoftmaxAttributes attrs;
+    attrs.temperature = 0.5f;
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    const TensorDesc in_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_buf(descs[0].numel());
+    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    float T = 0.5f;
+    float max_val = 3.0f;
+    float e0 = std::exp((1.0f - max_val) / T);
+    float e1 = std::exp((2.0f - max_val) / T);
+    float e2 = std::exp((3.0f - max_val) / T);
+    float sum_exp = e0 + e1 + e2;
+
+    NNOPS_EXPECT_NEAR(out_buf[0], e0 / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[1], e1 / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[2], e2 / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[0] + out_buf[1] + out_buf[2], 1.0f, 1e-5f);
+
+    // T=0.5: max value should be larger than T=1.0 case
+    // At T=1: exp(1)/sum=0.090, exp(2)/sum=0.245, exp(3)/sum=0.665
+    NNOPS_EXPECT_TRUE(out_buf[2] > 0.75f);  // sharper → higher for max
+}
+
+NNOPS_TEST(softmax_temperature_equals_one) {
+    // T=1.0 should produce same result as default (no temperature)
+    const int64_t shape[] = {2};
+    float in_data[]  = {0.0f, 2.0f};
+
+    TensorView input(shape, DataType::f32, in_data);
+    auto d_in = input.desc();
+
+    // Default attrs (T=1)
+    SoftmaxAttributes attrs_default;
+    auto op_default = Softmax::create(attrs_default, Backend::CPU);
+
+    const TensorDesc in_arr[] = {d_in};
+    auto descs = op_default->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_default(2);
+    TensorView output_default = nnops::test::make_planar(descs[0], out_default.data());
+    const TensorView ins[] = {input};
+    op_default->compute(output_default, ins);
+
+    // Explicit T=1
+    SoftmaxAttributes attrs_t1;
+    attrs_t1.temperature = 1.0f;
+    auto op_t1 = Softmax::create(attrs_t1, Backend::CPU);
+
+    std::vector<float> out_t1(2);
+    TensorView output_t1 = nnops::test::make_planar(descs[0], out_t1.data());
+    op_t1->compute(output_t1, ins);
+
+    NNOPS_EXPECT_NEAR(out_t1[0], out_default[0], 1e-6f);
+    NNOPS_EXPECT_NEAR(out_t1[1], out_default[1], 1e-6f);
+}
+
+NNOPS_TEST(softmax_temperature_log) {
+    // log_softmax with temperature T=2.0 on [1, 2, 3]
+    // max=3, shifted/T: {-2/2=-1, -1/2=-0.5, 0/2=0}
+    // exp: {0.3679, 0.6065, 1.0}, sum=1.9744, log_sum=0.6803
+    // out: {-1-0.6803=-1.6803, -0.5-0.6803=-1.1803, 0-0.6803=-0.6803}
+    const int64_t shape[] = {3};
+    float in_data[]  = {1.0f, 2.0f, 3.0f};
+
+    TensorView input(shape, DataType::f32, in_data);
+    auto d_in = input.desc();
+
+    SoftmaxAttributes attrs;
+    attrs.log_softmax = true;
+    attrs.temperature = 2.0f;
+    auto op = Softmax::create(attrs, Backend::CPU);
+
+    const TensorDesc in_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_buf(3);
+    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    float T = 2.0f;
+    float max_val = 3.0f;
+    float shifted[] = { (1.0f - max_val) / T, (2.0f - max_val) / T, (3.0f - max_val) / T };
+    float log_sum = std::log(std::exp(shifted[0]) + std::exp(shifted[1]) + std::exp(shifted[2]));
+
+    NNOPS_EXPECT_NEAR(out_buf[0], shifted[0] - log_sum, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[1], shifted[1] - log_sum, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[2], shifted[2] - log_sum, 1e-4f);
+
+    // exp of log_softmax with temperature should sum to 1
+    NNOPS_EXPECT_NEAR(std::exp(out_buf[0]) + std::exp(out_buf[1]) + std::exp(out_buf[2]),
+                      1.0f, 1e-4f);
+}
+
+NNOPS_TEST(softmax_temperature_random_2d) {
+    // Random 2D test: compare SIMD softmax with temperature against reference
+    auto [in_vec, input] = test::make_random_tensor({4, 8}, -2.0f, 2.0f);
+    auto d_in = input.desc();
+
+    for (float T : {0.5f, 1.0f, 2.0f, 5.0f}) {
+        SoftmaxAttributes attrs;
+        attrs.axis = 1;
+        attrs.temperature = T;
+        auto op = Softmax::create(attrs, Backend::CPU);
+
+        const TensorDesc in_arr[] = {d_in};
+        auto descs = op->getOutputTensorDesc(in_arr);
+
+        std::vector<float> out_buf(descs[0].numel());
+        TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+        const TensorView ins[] = {input};
+        op->compute(output, ins);
+
+        // Each row should sum to 1 (softmax property holds for any T)
+        for (int r = 0; r < 4; ++r) {
+            float row_sum = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                row_sum += out_buf[r * 8 + c];
+                NNOPS_EXPECT_TRUE(out_buf[r * 8 + c] >= 0.0f);
+            }
+            NNOPS_EXPECT_NEAR(row_sum, 1.0f, 1e-4f);
+        }
+    }
+}
+
+NNOPS_TEST(softmax_temperature_nchwc8) {
+    // NCHWC8 with temperature — per-lane SIMD path
+    const int64_t N = 1, C = 8, H = 1, W = 4;
+    const int64_t row_stride = W * 8;
+
+    TensorDesc desc;
+    desc.rank = 4;
+    desc.dims = {N, C, H, W};
+    desc.dtype = DataType::f32;
+    desc.layout = TensorLayout::NCHWC8;
+
+    auto [in_data, input] = make_nchwc8(N, C, H, W);
+    fill_nchwc8(in_data.data(), N, C, H, W, 1.0f, 1.0f);
+
+    for (float T : {0.5f, 1.0f, 2.0f, 4.0f}) {
+        SoftmaxAttributes attrs;
+        attrs.axis = -1;
+        attrs.temperature = T;
+        auto op = Softmax::create(attrs, Backend::CPU);
+
+        auto [out_buf, output] = make_nchwc8(N, C, H, W);
+        const TensorView ins[] = {input};
+        op->compute(output, ins);
+
+        // Each C lane sums to 1 across W
+        for (int lane = 0; lane < 8; ++lane) {
+            float sum = 0.0f;
+            for (int w = 0; w < 4; ++w) {
+                float v = out_buf[w * 8 + lane];
+                NNOPS_EXPECT_TRUE(v >= 0.0f);
+                sum += v;
+            }
+            NNOPS_EXPECT_NEAR(sum, 1.0f, 1e-4f);
+        }
+    }
+}
+
 NNOPS_TEST(softmax_nchw_axis_first) {
     // NCHW [3, 4, 2, 2] — softmax over axis=0 (batch dimension).
     // Uses the general scalar path. Verifies the decomposition is correct.

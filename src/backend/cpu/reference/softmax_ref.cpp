@@ -39,6 +39,9 @@ void softmax_ref(const SoftmaxAttributes& attrs,
     const auto* in_ptr  = input.ptr<float>();
     auto* out_ptr = output.ptr<float>();
     const bool log_softmax = attrs.log_softmax;
+    const float temperature = attrs.temperature;
+    NNOPS_ASSERT(temperature > 0.0f);
+    const float inv_T = 1.0f / temperature;
 
     // Process each row of size D
     const auto process_row = [&](int64_t outer) {
@@ -76,27 +79,27 @@ void softmax_ref(const SoftmaxAttributes& attrs,
                 if (v > max_val) { max_val = v; }
             }
 
-            // Step 2: Compute sum of exp(x - max)
+            // Step 2: Compute sum of exp((x - max) / T)
             float sum_exp = 0.0f;
             for (int64_t k = 0; k < D; ++k) {
                 float v = in_ptr[base + k * axis_elems + inner_off];
-                sum_exp += std::exp(v - max_val);
+                sum_exp += std::exp((v - max_val) * inv_T);
             }
 
             if (log_softmax) {
-                // log_softmax = (x - max) - log(sum_exp)
+                // log_softmax = (x - max) / T - log(sum_exp)
                 float log_sum = std::log(sum_exp);
                 for (int64_t k = 0; k < D; ++k) {
                     float v = in_ptr[base + k * axis_elems + inner_off];
-                    float val = (v - max_val) - log_sum;
+                    float val = (v - max_val) * inv_T - log_sum;
                     out_ptr[base + k * axis_elems + inner_off] = val;
                 }
             } else {
-                // softmax = exp(x - max) / sum_exp
+                // softmax = exp((x - max) / T) / sum_exp
                 float inv_sum = 1.0f / sum_exp;
                 for (int64_t k = 0; k < D; ++k) {
                     float v = in_ptr[base + k * axis_elems + inner_off];
-                    float val = std::exp(v - max_val) * inv_sum;
+                    float val = std::exp((v - max_val) * inv_T) * inv_sum;
                     out_ptr[base + k * axis_elems + inner_off] = val;
                 }
             }
