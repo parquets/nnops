@@ -5,6 +5,7 @@ target_link_libraries(nnops_cpu PUBLIC nnops)
 # Gather CPU sources explicitly (no file(GLOB))
 set(NNOPS_CPU_SOURCES
     # Operator dispatch layer
+    ops/causal_attention.cpp
     ops/conv2d.cpp
     ops/activation.cpp
     ops/pooling.cpp
@@ -39,6 +40,7 @@ set(NNOPS_CPU_SOURCES
 
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp
+    backend/cpu/causal_attention.cpp
     backend/cpu/batch_norm.cpp
     backend/cpu/depthwise_conv.cpp
     backend/cpu/layer_norm.cpp
@@ -68,6 +70,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/linear_ref.cpp
     backend/cpu/reference/matmul_ref.cpp
     backend/cpu/reference/attention_ref.cpp
+    backend/cpu/reference/causal_attention_ref.cpp
     backend/cpu/reference/softmax_ref.cpp
     backend/cpu/reference/cumsum_ref.cpp
     backend/cpu/reference/batch_norm_ref.cpp

@@ -74,6 +74,7 @@ enum class QuantGranularity : uint8_t {
     PerTensor  = 0,  ///< single (scale, zero_point) for the whole tensor
     PerToken   = 1,  ///< one (scale, zero_point) per row (token-level)
     PerChannel = 2,  ///< one (scale, zero_point) per channel (axis=1)
+    PerBlock   = 3,  ///< one (scale, zero_point) per physical block (used by KV-cache block quantization)
 };
 
 /// Lightweight quantization metadata (non-owning, like TensorView).

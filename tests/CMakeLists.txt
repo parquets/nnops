@@ -9,6 +9,7 @@ set(TEST_SOURCES
     test_linear.cpp
     test_pack_mma.cpp
     test_attention.cpp
+    test_causal_attention.cpp
     test_softmax.cpp
     test_cumsum.cpp
     test_batch_norm.cpp

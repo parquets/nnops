@@ -390,6 +390,23 @@ inline std::vector<TensorDesc> identity_output_shape(
     return {out};
 }
 
+/// CausalAttention shape inference.
+/// Q: [B, H, Sq, D]
+/// Returns: same shape as Q (output shape == Q shape)
+inline std::vector<TensorDesc> causal_attention_output_shape(
+    std::span<const TensorDesc> inputs)
+{
+    const auto& q = inputs[0];
+
+    TensorDesc out;
+    out.rank   = q.rank;
+    out.layout = q.layout;
+    out.dtype  = q.dtype;
+    out.dims   = q.dims;
+
+    return {out};
+}
+
 /// LayoutConvert shape inference.
 /// Output has the same logical shape and dtype as input;
 /// only the layout field changes to target_layout.

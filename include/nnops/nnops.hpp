@@ -18,6 +18,7 @@
 #include "nnops/ops/activation.hpp"
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/ops/attention.hpp"
+#include "nnops/ops/causal_attention.hpp"
 #include "nnops/ops/batch_norm.hpp"
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/conv2d.hpp"
