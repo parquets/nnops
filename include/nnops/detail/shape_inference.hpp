@@ -657,4 +657,32 @@ inline std::vector<TensorDesc> topk_output_shape(
     return {values, indices};
 }
 
+/// Embed shape inference.
+/// inputs[0] = weight  [vocab_size, dim]
+/// inputs[1] = indices [*] int64
+/// Returns: [*indices_shape..., dim]
+inline std::vector<TensorDesc> embed_output_shape(
+    std::span<const TensorDesc> inputs)
+{
+    const auto& weight  = inputs[0];  // [V, D] or [V, ...]
+    const auto& indices = inputs[1];  // [*] int64
+
+    TensorDesc out;
+    out.layout = weight.layout;
+    out.dtype  = weight.dtype;
+
+    const int64_t w_extra = weight.rank - 1;  // embedding dim(s)
+    out.rank = indices.rank + w_extra;
+    out.dims.resize(static_cast<size_t>(out.rank));
+
+    for (int64_t i = 0; i < indices.rank; ++i)
+        out.dims[static_cast<size_t>(i)] = indices.dims[static_cast<size_t>(i)];
+
+    for (int64_t i = 0; i < w_extra; ++i)
+        out.dims[static_cast<size_t>(indices.rank + i)] =
+            weight.dims[static_cast<size_t>(1 + i)];
+
+    return {out};
+}
+
 }  // namespace nnops

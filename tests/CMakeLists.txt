@@ -10,6 +10,7 @@ set(TEST_SOURCES
     test_pack_mma.cpp
     test_attention.cpp
     test_causal_attention.cpp
+    test_clamp.cpp
     test_softmax.cpp
     test_cumsum.cpp
     test_batch_norm.cpp
@@ -18,6 +19,7 @@ set(TEST_SOURCES
     test_simd.cpp
     test_depthwise_conv.cpp
     test_eltwise.cpp
+    test_embed.cpp
     test_unary.cpp
     test_reduce.cpp
     test_shape_inference.cpp

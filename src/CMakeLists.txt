@@ -6,6 +6,7 @@ target_link_libraries(nnops_cpu PUBLIC nnops)
 set(NNOPS_CPU_SOURCES
     # Operator dispatch layer
     ops/causal_attention.cpp
+    ops/clamp.cpp
     ops/conv2d.cpp
     ops/activation.cpp
     ops/pooling.cpp
@@ -20,6 +21,7 @@ set(NNOPS_CPU_SOURCES
     ops/conv3d.cpp
     ops/depthwise_conv.cpp
     ops/eltwise.cpp
+    ops/embed.cpp
     ops/unary.cpp
     ops/reduce.cpp
     ops/resize.cpp
@@ -41,6 +43,7 @@ set(NNOPS_CPU_SOURCES
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp
     backend/cpu/causal_attention.cpp
+    backend/cpu/clamp.cpp
     backend/cpu/batch_norm.cpp
     backend/cpu/depthwise_conv.cpp
     backend/cpu/layer_norm.cpp
@@ -48,6 +51,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/rms_norm.cpp
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
+    backend/cpu/embed.cpp
     backend/cpu/unary.cpp
     backend/cpu/reduce.cpp
     backend/cpu/resize.cpp
@@ -71,6 +75,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/matmul_ref.cpp
     backend/cpu/reference/attention_ref.cpp
     backend/cpu/reference/causal_attention_ref.cpp
+    backend/cpu/reference/clamp_ref.cpp
     backend/cpu/reference/softmax_ref.cpp
     backend/cpu/reference/cumsum_ref.cpp
     backend/cpu/reference/batch_norm_ref.cpp
@@ -79,6 +84,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/conv3d_ref.cpp
     backend/cpu/reference/depthwise_conv_ref.cpp
     backend/cpu/reference/eltwise_ref.cpp
+    backend/cpu/reference/embed_ref.cpp
     backend/cpu/reference/unary_ref.cpp
     backend/cpu/reference/reduce_ref.cpp
     backend/cpu/reference/resize_ref.cpp

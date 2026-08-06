@@ -36,6 +36,8 @@ enum class OpType : uint8_t {
     RoPE            = 25,
     Flatten         = 26,
     CausalAttention = 27,
+    Clamp           = 28,
+    Embed           = 29,
 };
 
 }  // namespace nnops
