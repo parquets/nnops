@@ -34,6 +34,7 @@ enum class OpType : uint8_t {
     ArgMin          = 23,
     TopK            = 24,
     RoPE            = 25,
+    Flatten         = 26,
 };
 
 }  // namespace nnops
