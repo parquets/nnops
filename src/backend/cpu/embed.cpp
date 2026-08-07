@@ -7,13 +7,14 @@
 /// The core operation is copying (f32/f16) or dequantizing (int8) embedding
 /// rows, parallelized over indices via cpu_parallel_for.
 ///
-/// For int8 dequantization, the inner loop uses v_cvt_i8_to_f32 to convert
-/// 8 int8 values to 8 float values at a time.
+/// For int8 dequantization, SIMD vector types are fully encapsulated in
+/// simd_quant.hpp helpers (dequant_i8_store / dequant_i8_scalar). The
+/// embed kernel itself is type-agnostic — pointer-type overloads handle
+/// the f32 vs f16 dispatch at compile time.
 
 #include "nnops/ops/embed.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
-#include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_quant.hpp"
 
 #include <algorithm>
@@ -22,13 +23,7 @@
 
 namespace nnops::backend::cpu {
 
-using namespace nnops::simd;
-
 namespace {
-
-// ============================================================
-// Direct lookup (f32/f16 weight)
-// ============================================================
 
 // ============================================================
 // Direct lookup (f32/f16 weight)
@@ -84,6 +79,11 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
 // ============================================================
 // Int8 lookup with SIMD per-row dequantization → f32 or f16
 // ============================================================
+//
+// The inner loop uses kernel::dequant_i8_store / dequant_i8_scalar
+// which are overloaded on output pointer type (float* / half*).
+// Template parameter Tout is only needed for typed pointer access
+// from TensorView; the loop body is otherwise type-agnostic.
 
 template <typename Tout>
 void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
@@ -136,27 +136,19 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
             ? static_cast<float>(per_token ? qp.zero_point_data[idx] : qp.zero_point)
             : 0.0f;
 
-        // Dequantize with SIMD: output[j] = (weight[j] - zp) * scale
-        // Arithmetic is always in f32; only the final store converts to Tout
         int64_t j = 0;
 
-        const auto v_s  = v_set1(static_cast<const float*>(nullptr), s_val);
-        const auto v_zp = v_set1(static_cast<const float*>(nullptr), zp_val);
-
         for (; j + L <= dim; j += L) {
-            auto v_w = kernel::quant_load_int8_to_f32(
-                static_cast<const uint8_t*>(w_row) + j, in_is_i8);
-            auto v_r = v_mul(v_sub(v_w, v_zp), v_s);
-            kernel::quant_store_f32(out_row + j, v_r);
+            kernel::dequant_i8_store(
+                static_cast<const uint8_t*>(w_row) + j, in_is_i8,
+                s_val, zp_val, out_row + j);
         }
 
         // Scalar tail
         for (; j < dim; ++j) {
-            float w = in_is_i8
-                ? static_cast<float>(static_cast<const int8_t*>(w_row)[j])
-                : static_cast<float>(static_cast<const uint8_t*>(w_row)[j]);
-            float r = (w - zp_val) * s_val;
-            s_store(&out_row[j], r);
+            kernel::dequant_i8_scalar(
+                static_cast<const uint8_t*>(w_row) + j, in_is_i8,
+                s_val, zp_val, out_row + j);
         }
     };
 

@@ -253,7 +253,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
 
             for (int64_t w = 0; w < W; ++w) {
                 int64_t off = w * pack;
-                auto vx = k::quant_load_int8_to_f32(static_cast<const char*>(x_row) + off, in_is_i8);
+                auto vx = k::load_i8_to_f32(static_cast<const char*>(x_row) + off, in_is_i8);
                 float s = is_per_channel ? s_f32[static_cast<size_t>(w)] : s_val;
                 float z = is_per_channel ? z_f32[static_cast<size_t>(w)] : z_val;
                 auto vs = v_set1_f32x8(s);
@@ -335,7 +335,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                 auto vs = v_set1_f32x8(s);
                 auto vz = v_set1_f32x8(z);
                 for (; i + k::kQuantLane <= base + total; i += k::kQuantLane) {
-                    auto vx = k::quant_load_int8_to_f32(static_cast<const char*>(X.ptr<void>()) + i, in_is_i8);
+                    auto vx = k::load_i8_to_f32(static_cast<const char*>(X.ptr<void>()) + i, in_is_i8);
                     auto vy = v_mul(v_sub(vx, vz), vs);
                     k::quant_store_f32(output.ptr<T>() + i, vy);
                 }
@@ -359,7 +359,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                     auto vs = v_set1_f32x8(s);
                     auto vz = v_set1_f32x8(z);
                     for (; i + k::kQuantLane <= stride_after_axis; i += k::kQuantLane) {
-                        auto vx = k::quant_load_int8_to_f32(static_cast<const char*>(X.ptr<void>()) + ks + i, in_is_i8);
+                        auto vx = k::load_i8_to_f32(static_cast<const char*>(X.ptr<void>()) + ks + i, in_is_i8);
                         auto vy = v_mul(v_sub(vx, vz), vs);
                         k::quant_store_f32(output.ptr<T>() + ks + i, vy);
                     }

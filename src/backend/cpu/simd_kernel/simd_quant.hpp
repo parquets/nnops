@@ -2,13 +2,15 @@
 /// @file simd_quant.hpp
 /// @brief SIMD kernel functions for QuantizeLinear / DequantizeLinear.
 ///
-/// All arithmetic is in f32 (v_f32x8). For f16 input/output, conversion
-/// happens at the boundary. int8/uint8 → f32 uses v_cvt_i8_to_f32 /
-/// v_cvt_u8_to_f32.
+/// All arithmetic is in f32 (v_f32x8) or f16 (v_f16x8) depending on the
+/// output type. For f16, the full pipeline runs in f16 vectors when possible.
+/// int8/uint8 → f32 uses v_cvt_i8_to_f32 / v_cvt_u8_to_f32.
+/// int8/uint8 → f16 uses v_cvt_i8_to_f16 / v_cvt_u8_to_f16.
 ///
-/// quant_store_f32 / quant_load_f32 are overloaded on pointer type:
-///   float* → direct v_f32x8 load/store
-///   half*  → SIMD v_f16x8 load/store with element-wise f16↔f32 conversion
+/// Key interface (overloaded on pointer type so callers stay type-agnostic):
+///   load_i8_to_f32 / load_i8_to_f16     — widen int8/uint8 to SIMD vectors
+///   quant_store_f32 / quant_load_f32    — f32/f16 boundary load/store
+///   dequant_i8_store / dequant_i8_scalar — full load→dequant→store pipeline
 ///
 /// Reference: include/nnops/detail/simd/simd.hpp — v_load/v_store for half*
 
@@ -23,7 +25,7 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-constexpr int kQuantLane = 8;  // v_f32x8 lane width
+constexpr int kQuantLane = 8;  // v_f32x8 / v_f16x8 lane width
 
 // ============================================================
 // QuantizeLinear helpers
@@ -53,15 +55,23 @@ inline void quant_store_int8(v_f32x8 vr, void* y_row, int64_t off,
 }
 
 // ============================================================
-// DequantizeLinear helpers
+// DequantizeLinear: int8/uint8 → floating-point SIMD vectors
 // ============================================================
 
 /// Load 8 int8/uint8 values and widen to v_f32x8.
-inline v_f32x8 quant_load_int8_to_f32(const void* p, bool in_is_i8) {
+inline v_f32x8 load_i8_to_f32(const void* p, bool in_is_i8) {
     if (in_is_i8)
         return v_cvt_i8_to_f32(static_cast<const int8_t*>(p));
     else
         return v_cvt_u8_to_f32(static_cast<const uint8_t*>(p));
+}
+
+/// Load 8 int8/uint8 values and widen to v_f16x8.
+inline v_f16x8 load_i8_to_f16(const void* p, bool in_is_i8) {
+    if (in_is_i8)
+        return v_cvt_i8_to_f16(static_cast<const int8_t*>(p));
+    else
+        return v_cvt_u8_to_f16(static_cast<const uint8_t*>(p));
 }
 
 // ============================================================
@@ -103,6 +113,52 @@ inline v_f32x8 quant_load_f32(const half* p) {
     for (int i = 0; i < 8; ++i)
         fbuf[i] = ::nnops::backend::cpu::half_to_float(hbuf[i]);
     return v_load(fbuf);          // SIMD load of 8 float values
+}
+
+// ============================================================
+// Combined dequant+store pipeline: load i8, dequantize, store
+// ============================================================
+// Overloaded on output pointer type so callers (e.g. embed) can
+// be type-agnostic — no SIMD vector types exposed in the caller.
+
+/// Load 8 int8/uint8, dequantize in f32, store to float*.
+inline void dequant_i8_store(const void* src, bool is_i8,
+                              float scale, float zp, float* dst) {
+    auto vw = load_i8_to_f32(src, is_i8);
+    auto vs = v_set1_f32x8(scale);
+    auto vz = v_set1_f32x8(zp);
+    v_store(dst, v_mul(v_sub(vw, vz), vs));
+}
+
+/// Load 8 int8/uint8, dequantize in f16, store to half*.
+inline void dequant_i8_store(const void* src, bool is_i8,
+                              float scale, float zp, half* dst) {
+    auto vw = load_i8_to_f16(src, is_i8);
+    auto vs = v_set1_f16x8(scale);
+    auto vz = v_set1_f16x8(zp);
+    v_store(dst, v_mul(v_sub(vw, vz), vs));
+}
+
+// ============================================================
+// Scalar dequant+store — for tail elements (< kQuantLane)
+// ============================================================
+
+/// Scalar dequantize and store to float*.
+inline void dequant_i8_scalar(const void* src, bool is_i8,
+                               float scale, float zp, float* dst) {
+    float w = is_i8
+        ? static_cast<float>(*static_cast<const int8_t*>(src))
+        : static_cast<float>(*static_cast<const uint8_t*>(src));
+    *dst = (w - zp) * scale;
+}
+
+/// Scalar dequantize and store to half*.
+inline void dequant_i8_scalar(const void* src, bool is_i8,
+                               float scale, float zp, half* dst) {
+    float w = is_i8
+        ? static_cast<float>(*static_cast<const int8_t*>(src))
+        : static_cast<float>(*static_cast<const uint8_t*>(src));
+    *dst = ::nnops::backend::cpu::float_to_half((w - zp) * scale);
 }
 
 }  // namespace nnops::kernel
