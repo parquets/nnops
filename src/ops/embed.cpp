@@ -96,8 +96,8 @@ void Embed::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!indices.is_empty());
 
     // Validate indices dtype
-    NNOPS_ASSERT(indices.data_type() == DataType::i64 ||
-                 indices.data_type() == DataType::i32);
+    NNOPS_ASSERT(indices.data_type() == DataType::s64 ||
+                 indices.data_type() == DataType::s32);
 
     // Validate weight rank >= 2
     NNOPS_ASSERT(weight.rank() >= 2);
@@ -110,7 +110,7 @@ void Embed::compute(std::span<TensorView> outputs,
 
     if (w_dtype == DataType::f32 || w_dtype == DataType::f16) {
         NNOPS_ASSERT(output.data_type() == w_dtype);
-    } else if (w_dtype == DataType::i8 || w_dtype == DataType::u8) {
+    } else if (w_dtype == DataType::s8 || w_dtype == DataType::u8) {
         // Int8 weight: dequant params come from weight.quant_params()
         NNOPS_ASSERT(weight.is_quantized());
         NNOPS_ASSERT(output.data_type() == DataType::f32 ||

@@ -4,7 +4,7 @@
 ///
 /// Designed for autoregressive LLM decoding with external KV-cache storage.
 /// Supports chunk prefill (Sq >= 1), block-level KV-cache (PagedAttention),
-/// and multi-dtype cache (f32/f16/bf16/i8/u8).
+/// and multi-dtype cache (f32/f16/bf16/s8/u8).
 ///
 /// The operator is stateless: all cache memory is owned by the caller.
 /// Intermediate scores are stored in a caller-provided workspace buffer.

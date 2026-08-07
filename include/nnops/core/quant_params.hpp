@@ -61,7 +61,7 @@
 /// - `scale_data` / `zero_point_data` are non-owning pointers matching
 ///   TensorView's lifetime model. The user manages the buffer memory.
 ///
-/// - The storage DataType (i8/u8/future i4/u4) is held by
+/// - The storage DataType (s8/u8/future s4/u4) is held by
 ///   TensorView::data_type(), NOT by QuantParams. This separation lets
 ///   operators dispatch on dtype while QuantParams handles the mapping.
 
@@ -83,7 +83,7 @@ enum class QuantGranularity : uint8_t {
 /// For PerToken / PerChannel, `scale_data` and `zero_point_data` point to
 /// external buffers of length `num_scales` (user-managed lifetime).
 ///
-/// The storage DataType (i8/u8; future i4/u4) is held by TensorView::data_type() —
+/// The storage DataType (s8/u8; future s4/u4) is held by TensorView::data_type() —
 /// this struct only holds the mapping parameters.
 ///
 /// Extensibility:

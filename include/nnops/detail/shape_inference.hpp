@@ -524,25 +524,25 @@ inline std::vector<TensorDesc> grid_sample_output_shape(
 }
 
 /// QuantizeLinear shape inference.
-/// inputs[0] = x (f32/f16), inputs[1] = scale (f32), inputs[2] = zero_point (i8/u8)
-/// Returns: same shape as x, dtype = attrs.output_dtype (i8 or u8)
+/// inputs[0] = x (f32/f16), inputs[1] = scale (f32), inputs[2] = zero_point (s8/u8)
+/// Returns: same shape as x, dtype = attrs.output_dtype (s8 or u8)
 inline std::vector<TensorDesc> quantize_linear_output_shape(
     std::span<const TensorDesc> inputs,
-    DataType output_dtype = DataType::i8)
+    DataType output_dtype = DataType::s8)
 {
     const auto& x = inputs[0];
 
     TensorDesc out;
     out.rank   = x.rank;
     out.layout = x.layout;
-    out.dtype  = output_dtype;  // i8 or u8, from attributes
+    out.dtype  = output_dtype;  // s8 or u8, from attributes
     out.dims   = x.dims;
 
     return {out};
 }
 
 /// DequantizeLinear shape inference.
-/// inputs[0] = x (i8/u8), inputs[1] = scale (f32), inputs[2] = zero_point (i8/u8)
+/// inputs[0] = x (s8/u8), inputs[1] = scale (f32), inputs[2] = zero_point (s8/u8)
 /// Returns: same shape as x, dtype = f32 (or attr.output_dtype if available)
 inline std::vector<TensorDesc> dequantize_linear_output_shape(
     std::span<const TensorDesc> inputs,
@@ -603,7 +603,7 @@ inline std::vector<TensorDesc> argminmax_output_shape(
 
     TensorDesc out;
     out.layout = in.layout;
-    out.dtype  = DataType::i64;
+    out.dtype  = DataType::s64;
 
     if (keepdims) {
         out.rank = rank;
@@ -652,7 +652,7 @@ inline std::vector<TensorDesc> topk_output_shape(
 
     // Indices output: int64, same shape as values
     TensorDesc indices = values;
-    indices.dtype = DataType::i64;
+    indices.dtype = DataType::s64;
 
     return {values, indices};
 }
@@ -672,7 +672,7 @@ inline std::vector<TensorDesc> embed_output_shape(
     out.layout = weight.layout;
 
     // When weight is quantized (int8), output is dequantized float32
-    if (weight.dtype == DataType::i8 || weight.dtype == DataType::u8)
+    if (weight.dtype == DataType::s8 || weight.dtype == DataType::u8)
         out.dtype = DataType::f32;
     else
         out.dtype = weight.dtype;

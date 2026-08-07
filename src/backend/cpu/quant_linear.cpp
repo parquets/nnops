@@ -4,7 +4,7 @@
 /// Strategy:
 ///   - All arithmetic is in f32 (v_f32x8). For f16 input/output, conversion
 ///     happens at the boundary via v_cvt_f16_to_f32 / v_cvt_f32_to_f16.
-///   - int8/uint8 → f32 uses v_cvt_i8_to_f32 / v_cvt_u8_to_f32 (8 lanes).
+///   - int8/uint8 → f32 uses v_cvt_s8_to_f32 / v_cvt_u8_to_f32 (8 lanes).
 ///   - Packed layouts (NCHWC8/NCDHWC8): per-lane processing — each physical
 ///     row of W×8 elements has 8 independent lanes processed with float SIMD.
 ///   - PerTensor scale/zp: broadcast to all SIMD lanes.
@@ -55,7 +55,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
     std::vector<float> z_f32(static_cast<size_t>(D));
     for (int64_t k = 0; k < D; ++k) {
         s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[is_per_channel ? k : 0];
-        int32_t z = (zp.data_type() == DataType::i8)
+        int32_t z = (zp.data_type() == DataType::s8)
             ? static_cast<int32_t>(zp.ptr<int8_t>()[is_per_channel ? k : 0])
             : static_cast<int32_t>(zp.ptr<uint8_t>()[is_per_channel ? k : 0]);
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
@@ -212,9 +212,9 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                             std::span<const TensorView> inputs,
                             const ComputeContext& ctx)
 {
-    const auto& X     = inputs[0];  // i8 or u8
+    const auto& X     = inputs[0];  // s8 or u8
     const auto& scale = inputs[1];  // f32
-    const auto& zp    = inputs[2];  // i8 or u8
+    const auto& zp    = inputs[2];  // s8 or u8
 
     const int64_t rank = X.rank();
     int64_t axis = attrs.axis;
@@ -223,13 +223,13 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
     const int64_t D = X.shape(axis);
     const bool is_per_channel = (scale.numel() > 1);
     const DataType in_dtype = X.data_type();
-    const bool in_is_i8 = (in_dtype == DataType::i8);
+    const bool in_is_i8 = (in_dtype == DataType::s8);
 
     std::vector<float> s_f32(static_cast<size_t>(D));
     std::vector<float> z_f32(static_cast<size_t>(D));
     for (int64_t k = 0; k < D; ++k) {
         s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[is_per_channel ? k : 0];
-        int32_t z = (zp.data_type() == DataType::i8)
+        int32_t z = (zp.data_type() == DataType::s8)
             ? static_cast<int32_t>(zp.ptr<int8_t>()[is_per_channel ? k : 0])
             : static_cast<int32_t>(zp.ptr<uint8_t>()[is_per_channel ? k : 0]);
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);

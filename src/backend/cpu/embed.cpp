@@ -49,7 +49,7 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
 
     T* out_ptr = output.ptr<T>();
     const int64_t out_row_stride = output.row_stride_elems();
-    const bool is_i64 = (indices.data_type() == DataType::i64);
+    const bool is_i64 = (indices.data_type() == DataType::s64);
     const size_t row_bytes = static_cast<size_t>(dim) * sizeof(T);
 
     auto body = [&](int64_t n) {
@@ -95,7 +95,7 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
     const auto& indices = inputs[1];
 
     const auto& qp = weight.quant_params();
-    const bool in_is_i8 = (weight.data_type() == DataType::i8);
+    const bool in_is_i8 = (weight.data_type() == DataType::s8);
     const bool per_token = (qp.granularity == QuantGranularity::PerToken);
     const bool has_zp   = (qp.zero_point_data != nullptr);
 
@@ -111,7 +111,7 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
 
     Tout* out_ptr = output.ptr<Tout>();
     const int64_t out_row_stride = output.row_stride_elems();
-    const bool is_i64 = (indices.data_type() == DataType::i64);
+    const bool is_i64 = (indices.data_type() == DataType::s64);
 
     constexpr int L = kernel::kQuantLane;  // 8
 

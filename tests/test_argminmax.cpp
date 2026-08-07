@@ -34,7 +34,7 @@ NNOPS_TEST(argmax_1d_basic) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     NNOPS_EXPECT_EQ(descs[0].rank, 0);  // scalar
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::i64);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s64);
 
     auto output = test::make_planar(descs[0], &out_data);
     const TensorView ins[] = {in};
@@ -62,7 +62,7 @@ NNOPS_TEST(argmax_1d_with_keepdims) {
 
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1);
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::i64);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s64);
 
     auto output = test::make_planar(descs[0], out_data);
     const TensorView ins[] = {in};
@@ -159,7 +159,7 @@ NNOPS_TEST(argmin_1d_basic) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     NNOPS_EXPECT_EQ(descs[0].rank, 0);  // scalar
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::i64);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s64);
 
     auto output = test::make_planar(descs[0], &out_data);
     const TensorView ins[] = {in};

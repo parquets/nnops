@@ -43,7 +43,7 @@ void embed_direct_ref_impl(const EmbedAttributes& /*attrs*/,
     const int64_t out_row_stride = output.row_stride_elems();
 
     // Handle both int64 and int32 indices
-    const bool is_i64 = (indices.data_type() == DataType::i64);
+    const bool is_i64 = (indices.data_type() == DataType::s64);
 
     for (int64_t n = 0; n < num_indices; ++n) {
         int64_t idx;
@@ -77,7 +77,7 @@ void embed_int8_dequant_ref_impl(const EmbedAttributes& /*attrs*/,
     const auto& indices = inputs[1];
 
     const auto& qp = weight.quant_params();
-    const bool in_is_i8 = (weight.data_type() == DataType::i8);
+    const bool in_is_i8 = (weight.data_type() == DataType::s8);
     const bool per_token = (qp.granularity == QuantGranularity::PerToken);
     const bool has_zp   = (qp.zero_point_data != nullptr);
 
@@ -93,7 +93,7 @@ void embed_int8_dequant_ref_impl(const EmbedAttributes& /*attrs*/,
 
     Tout* out_ptr = output.ptr<Tout>();
     const int64_t out_row_stride = output.row_stride_elems();
-    const bool is_i64 = (indices.data_type() == DataType::i64);
+    const bool is_i64 = (indices.data_type() == DataType::s64);
 
     for (int64_t n = 0; n < num_indices; ++n) {
         int64_t idx;

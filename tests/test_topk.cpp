@@ -43,7 +43,7 @@ NNOPS_TEST(topk_1d_max_basic) {
     // Indices output
     NNOPS_EXPECT_EQ(descs[1].rank, 1);
     NNOPS_EXPECT_EQ(descs[1].dims[0], 3);
-    NNOPS_EXPECT_EQ(descs[1].dtype, DataType::i64);
+    NNOPS_EXPECT_EQ(descs[1].dtype, DataType::s64);
 
     auto val_out = test::make_planar(descs[0], val_buf);
     auto idx_out = test::make_planar(descs[1], idx_buf);

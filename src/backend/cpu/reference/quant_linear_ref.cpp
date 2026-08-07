@@ -2,8 +2,8 @@
 /// @brief Reference (scalar) CPU implementation of QuantizeLinear / DequantizeLinear.
 ///
 /// Handles:
-///   - QuantizeLinear:  f32/f16 → i8/u8
-///   - DequantizeLinear: i8/u8 → f32
+///   - QuantizeLinear:  f32/f16 → s8/u8
+///   - DequantizeLinear: s8/u8 → f32
 ///   - All layouts: NCHW, NCDHW, NCHWC8, NCDHWC8
 ///   - PerTensor and PerChannel granularities
 ///
@@ -33,14 +33,14 @@ using nnops::backend::cpu::float_to_half;
 namespace {
 
 /// Load a float value from a scale/zp tensor at a flat index.
-/// The scale tensor is always f32; zp tensor is i8/u8.
+/// The scale tensor is always f32; zp tensor is s8/u8.
 inline float load_scale(const TensorView& scale_tensor, int64_t idx) {
     return scale_tensor.ptr<float>()[idx];
 }
 
 inline int32_t load_zero_point(const TensorView& zp_tensor, int64_t idx) {
     DataType zdt = zp_tensor.data_type();
-    if (zdt == DataType::i8) {
+    if (zdt == DataType::s8) {
         return static_cast<int32_t>(zp_tensor.ptr<int8_t>()[idx]);
     } else {
         return static_cast<int32_t>(zp_tensor.ptr<uint8_t>()[idx]);
@@ -55,9 +55,9 @@ inline float read_float_input(const TensorView& input, int64_t off) {
     return input.ptr<float>()[off];
 }
 
-/// Read an integer value from input (i8 or u8), returned as int32.
+/// Read an integer value from input (s8 or u8), returned as int32.
 inline int32_t read_int_input(const TensorView& input, int64_t off) {
-    if (input.data_type() == DataType::i8) {
+    if (input.data_type() == DataType::s8) {
         return static_cast<int32_t>(input.ptr<int8_t>()[off]);
     } else {
         return static_cast<int32_t>(input.ptr<uint8_t>()[off]);
@@ -69,9 +69,9 @@ inline void write_float_output(TensorView& output, int64_t off, float val) {
     output.ptr<float>()[off] = val;
 }
 
-/// Write an integer to output (i8 or u8), clamped to type range.
+/// Write an integer to output (s8 or u8), clamped to type range.
 inline void write_int_output(TensorView& output, int64_t off, int32_t val) {
-    if (output.data_type() == DataType::i8) {
+    if (output.data_type() == DataType::s8) {
         val = std::max<int32_t>(-128, std::min<int32_t>(127, val));
         output.ptr<int8_t>()[off] = static_cast<int8_t>(val);
     } else {
@@ -82,10 +82,10 @@ inline void write_int_output(TensorView& output, int64_t off, int32_t val) {
 
 /// Get integer type range for clamping.
 inline int32_t int_min_for(DataType dt) {
-    return (dt == DataType::i8) ? -128 : 0;
+    return (dt == DataType::s8) ? -128 : 0;
 }
 inline int32_t int_max_for(DataType dt) {
-    return (dt == DataType::i8) ? 127 : 255;
+    return (dt == DataType::s8) ? 127 : 255;
 }
 
 }  // anonymous namespace
@@ -102,7 +102,7 @@ void quantize_linear_ref(const QuantLinearAttributes& attrs,
 {
     const auto& x     = inputs[0];  // f32 or f16
     const auto& scale = inputs[1];  // f32
-    const auto& zp    = inputs[2];  // i8 or u8
+    const auto& zp    = inputs[2];  // s8 or u8
 
     const int64_t rank = x.rank();
     int64_t axis = attrs.axis;
@@ -161,9 +161,9 @@ void dequantize_linear_ref(const QuantLinearAttributes& attrs,
                            const ComputeContext& ctx,
                            void* /*workspace*/)
 {
-    const auto& x     = inputs[0];  // i8 or u8
+    const auto& x     = inputs[0];  // s8 or u8
     const auto& scale = inputs[1];  // f32
-    const auto& zp    = inputs[2];  // i8 or u8
+    const auto& zp    = inputs[2];  // s8 or u8
 
     const int64_t rank = x.rank();
     int64_t axis = attrs.axis;

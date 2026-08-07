@@ -2,10 +2,10 @@
 /// @file quant_linear.hpp
 /// @brief QuantizeLinear / DequantizeLinear operators.
 ///
-/// QuantizeLinear:  float (f32/f16) → integer (i8/u8)
+/// QuantizeLinear:  float (f32/f16) → integer (s8/u8)
 ///   y = clamp(round(x / scale) + zero_point, type_min, type_max)
 ///
-/// DequantizeLinear: integer (i8/u8) → float (f32)
+/// DequantizeLinear: integer (s8/u8) → float (f32)
 ///   y = (x - zero_point) * scale
 ///
 /// Both support three quantization granularities via scale/zero_point shape:
@@ -15,7 +15,7 @@
 ///
 /// Supported layouts: NCHW, NCDHW, NCHWC8, NCDHWC8
 /// Supported float types: f32, f16
-/// Supported integer types: i8, u8
+/// Supported integer types: s8, u8
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -33,9 +33,9 @@ struct QuantLinearAttributes {
     /// -1 = last axis (default). Set to 1 for per-channel weight quantization.
     int64_t axis = -1;
 
-    /// For QuantizeLinear: output integer type (i8 or u8).
+    /// For QuantizeLinear: output integer type (s8 or u8).
     /// For DequantizeLinear: output float type (f32 or f16).
-    DataType output_dtype = DataType::i8;
+    DataType output_dtype = DataType::s8;
 };
 
 // ============================================================
@@ -47,10 +47,10 @@ struct QuantLinearAttributes {
 /// Inputs:
 ///   [0] x:           input tensor (f32 or f16)
 ///   [1] y_scale:     scale tensor (f32, scalar or 1D per-channel)
-///   [2] y_zero_point: zero_point tensor (i8 or u8, same shape as y_scale)
+///   [2] y_zero_point: zero_point tensor (s8 or u8, same shape as y_scale)
 ///
 /// Output:
-///   y: quantized tensor (i8 or u8, same shape as x)
+///   y: quantized tensor (s8 or u8, same shape as x)
 class QuantizeLinear : public OpBase {
 public:
     static std::unique_ptr<QuantizeLinear> create(
@@ -94,9 +94,9 @@ private:
 /// DequantizeLinear operator.
 ///
 /// Inputs:
-///   [0] x:            input tensor (i8 or u8)
+///   [0] x:            input tensor (s8 or u8)
 ///   [1] x_scale:      scale tensor (f32, scalar or 1D per-channel)
-///   [2] x_zero_point:  zero_point tensor (i8 or u8, same shape as x_scale)
+///   [2] x_zero_point:  zero_point tensor (s8 or u8, same shape as x_scale)
 ///
 /// Output:
 ///   y: dequantized tensor (f32 or f16, same shape as x)

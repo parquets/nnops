@@ -968,12 +968,12 @@ NNOPS_TEST(shape_storage_bytes_packed_exceeds_nbytes) {
 NNOPS_TEST(shape_nchwc16_layout_propagation) {
     auto op = Activation::create(Backend::CPU);
 
-    TensorDesc in_desc = td({1, 32, 14, 14}, DataType::i8, TensorLayout::NCHWC16);
+    TensorDesc in_desc = td({1, 32, 14, 14}, DataType::s8, TensorLayout::NCHWC16);
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHWC16));
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::i8);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s8);
     check_storage_consistent(descs[0]);
 }
 
@@ -984,12 +984,12 @@ NNOPS_TEST(shape_ncdhwc16_layout_propagation) {
     attrs.stride   = {1, 1, 1};
     attrs.padding  = {0, 0, 0};
 
-    TensorDesc in_desc = td({1, 16, 4, 28, 28}, DataType::i8, TensorLayout::NCDHWC16);
+    TensorDesc in_desc = td({1, 16, 4, 28, 28}, DataType::s8, TensorLayout::NCDHWC16);
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCDHWC16));
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::i8);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s8);
     check_storage_consistent(descs[0]);
 }
 

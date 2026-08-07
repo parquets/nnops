@@ -628,7 +628,7 @@ NNOPS_TEST(simd_scalar_i8x16_load_store) {
     int8_t in[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     int8_t out[16] = {};
 
-    scal::v_i8x16 v = scal::v_load_i8x16(in);
+    scal::v_s8x16 v = scal::v_load_s8x16(in);
     scal::v_store(out, v);
 
     for (int i = 0; i < 16; ++i)
@@ -636,11 +636,11 @@ NNOPS_TEST(simd_scalar_i8x16_load_store) {
 }
 
 NNOPS_TEST(simd_scalar_i8x16_set1_zero) {
-    scal::v_i8x16 z = scal::v_zero_i8x16();
+    scal::v_s8x16 z = scal::v_zero_s8x16();
     for (int i = 0; i < 16; ++i)
         NNOPS_EXPECT_EQ(z[i], 0);
 
-    scal::v_i8x16 s = scal::v_set1_i8x16(42);
+    scal::v_s8x16 s = scal::v_set1_s8x16(42);
     for (int i = 0; i < 16; ++i)
         NNOPS_EXPECT_EQ(s[i], 42);
 }
@@ -674,8 +674,8 @@ NNOPS_TEST(simd_platform_i8x16_matches_scalar) {
     int8_t in[16];
     for (int i = 0; i < 16; ++i) in[i] = static_cast<int8_t>((i - 4) * 7);
 
-    v_i8x16 pv = v_load_i8x16(in);
-    scal::v_i8x16 sv = scal::v_load_i8x16(in);
+    v_s8x16 pv = v_load_s8x16(in);
+    scal::v_s8x16 sv = scal::v_load_s8x16(in);
 
     int8_t plat[16], scal_out[16];
     v_store(plat, pv);
@@ -701,16 +701,16 @@ NNOPS_TEST(simd_platform_u8x16_matches_scalar) {
 }
 
 NNOPS_TEST(simd_platform_i8x16_zero_set1_matches_scalar) {
-    v_i8x16 pz = v_zero_i8x16();
-    scal::v_i8x16 sz = scal::v_zero_i8x16();
+    v_s8x16 pz = v_zero_s8x16();
+    scal::v_s8x16 sz = scal::v_zero_s8x16();
     int8_t pz_out[16], sz_out[16];
     v_store(pz_out, pz);
     scal::v_store(sz_out, sz);
     for (int i = 0; i < 16; ++i)
         NNOPS_EXPECT_EQ(pz_out[i], sz_out[i]);
 
-    v_i8x16 ps = v_set1_i8x16(-7);
-    scal::v_i8x16 ss = scal::v_set1_i8x16(-7);
+    v_s8x16 ps = v_set1_s8x16(-7);
+    scal::v_s8x16 ss = scal::v_set1_s8x16(-7);
     int8_t ps_out[16], ss_out[16];
     v_store(ps_out, ps);
     scal::v_store(ss_out, ss);

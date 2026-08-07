@@ -36,8 +36,8 @@ struct EmbedAttributes {
 /// (single scale/zp for all rows) and PerToken (per-row scale/zp).
 ///
 /// Inputs (2):
-///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, i8, u8)
-///   inputs[1] = indices  [*]                (i64 or i32)
+///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, s8, u8)
+///   inputs[1] = indices  [*]                (s64 or s32)
 ///
 /// Outputs (1):
 ///   outputs[0] = output  [*indices_shape..., dim]

@@ -31,7 +31,7 @@ NNOPS_TEST(embed_basic) {
     // Indices: [2] → lookup tokens {1, 3}
     int64_t idx_data[] = {1, 3};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
 
@@ -70,7 +70,7 @@ NNOPS_TEST(embed_out_of_bounds) {
     // Out-of-range indices: -1 → 0, 5 → 2
     int64_t idx_data[] = {-1, 5};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -102,7 +102,7 @@ NNOPS_TEST(embed_random_f32) {
     for (int64_t i = 0; i < N; ++i)
         idx_vec[i] = static_cast<int64_t>(i * 7 % V);  // deterministic spread
     const int64_t idx_shape[] = {N};
-    TensorView indices(idx_shape, DataType::i64, idx_vec.data());
+    TensorView indices(idx_shape, DataType::s64, idx_vec.data());
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -143,7 +143,7 @@ NNOPS_TEST(embed_random_f16) {
     std::vector<int64_t> idx_vec(N);
     for (int64_t i = 0; i < N; ++i) idx_vec[i] = static_cast<int64_t>(i % V);
     const int64_t idx_shape[] = {N};
-    TensorView indices(idx_shape, DataType::i64, idx_vec.data());
+    TensorView indices(idx_shape, DataType::s64, idx_vec.data());
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -177,7 +177,7 @@ NNOPS_TEST(embed_batch_indices) {
     // 2D indices: [B, S]
     int64_t idx_data[] = {0, 1, 2, 3,  4, 5, 6, 7};
     const int64_t idx_shape[] = {B, S};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -217,7 +217,7 @@ NNOPS_TEST(embed_zero_dim) {
 
     int64_t idx_data[] = {0, 2};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -242,7 +242,7 @@ NNOPS_TEST(embed_shape_inference) {
     float w_dummy[1] = {};
     int64_t i_dummy[1] = {};
     TensorView weight(w_shape, DataType::f32, w_dummy);
-    TensorView indices(i_shape, DataType::i64, i_dummy);
+    TensorView indices(i_shape, DataType::s64, i_dummy);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -271,7 +271,7 @@ NNOPS_TEST(embed_functional_api) {
 
     int64_t idx_data[] = {1, 0};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     // Class API
     std::vector<float> out_class(6);
@@ -315,11 +315,11 @@ NNOPS_TEST(embed_int8_per_tensor_f32) {
     qp.zero_point = 0;
     qp.granularity = QuantGranularity::PerTensor;
 
-    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
     int64_t idx_data[] = {0, 2};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -362,11 +362,11 @@ NNOPS_TEST(embed_int8_per_token_f32) {
     qp.scale_data = scale_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
     int64_t idx_data[] = {0, 1, 0};
     const int64_t idx_shape[] = {3};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -411,11 +411,11 @@ NNOPS_TEST(embed_int8_with_zero_point) {
     qp.zero_point_data = zp_data;
     qp.num_scales = V;
 
-    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -449,11 +449,11 @@ NNOPS_TEST(embed_int8_output_f16) {
     qp.zero_point = 0;
     qp.granularity = QuantGranularity::PerTensor;
 
-    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
 
@@ -492,12 +492,12 @@ NNOPS_TEST(embed_int8_out_of_bounds) {
     QuantParams qp;
     qp.scale = 2.0f;
 
-    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
     // -1 → 0, 10 → 2
     int64_t idx_data[] = {-1, 10};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -530,7 +530,7 @@ NNOPS_TEST(embed_int8_uint8_weight) {
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
@@ -560,11 +560,11 @@ NNOPS_TEST(embed_int8_functional_api) {
     QuantParams qp;
     qp.scale = 0.1f;
 
-    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
     int64_t idx_data[] = {0, 1};
     const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::i64, idx_data);
+    TensorView indices(idx_shape, DataType::s64, idx_data);
 
     // Class API
     auto op = Embed::create(EmbedAttributes{}, Backend::CPU);

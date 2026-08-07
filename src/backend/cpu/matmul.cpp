@@ -104,15 +104,15 @@ void matmul_kernel_f16(const MatMulAttributes& /*attrs*/,
 
 
 // ---- int8 kernels ----------------------------------------------------------
-// A (activation) may be u8 or i8; B (weight) is typically i8.
-// Output is i32 accumulator → stored as output dtype after epilogue.
+// A (activation) may be u8 or s8; B (weight) is typically s8.
+// Output is s32 accumulator → stored as output dtype after epilogue.
 
 void matmul_kernel_u8i8(const MatMulAttributes& /*attrs*/,
                         TensorView& /*output*/,
                         std::span<const TensorView> /*inputs*/,
                         void* /*workspace*/)
 {
-    // TODO: u8 activation × i8 weight → i32 accumulator
+    // TODO: u8 activation × s8 weight → s32 accumulator
 }
 
 void matmul_kernel_i8i8(const MatMulAttributes& /*attrs*/,
@@ -120,7 +120,7 @@ void matmul_kernel_i8i8(const MatMulAttributes& /*attrs*/,
                         std::span<const TensorView> /*inputs*/,
                         void* /*workspace*/)
 {
-    // TODO: i8 activation × i8 weight → i32 accumulator
+    // TODO: s8 activation × s8 weight → s32 accumulator
 }
 
 
@@ -131,7 +131,7 @@ void matmul_kernel_f16i4(const MatMulAttributes& /*attrs*/,
                          std::span<const TensorView> /*inputs*/,
                          void* /*workspace*/)
 {
-    // TODO: fp16 activation × i4 weight (sub-byte packing required)
+    // TODO: fp16 activation × s4 weight (sub-byte packing required)
 }
 
 }  // anonymous namespace
@@ -175,8 +175,8 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
         return workspace_bytes(mc, nc, KC_F32, 4);
     }
 
-    // ---- int8 variants (u8×i8, i8×i8) ---------------------------------
-    if ((dtype_a == DataType::u8 || dtype_a == DataType::i8) && dtype_b == DataType::i8) {
+    // ---- int8 variants (u8×s8, i8×s8) ---------------------------------
+    if ((dtype_a == DataType::u8 || dtype_a == DataType::s8) && dtype_b == DataType::s8) {
         // Placeholder: use MR_MAX_I8 / NR_MAX_I8 until SIMD kernels define real panels.
         int nc = round_down_nc(compute_nc(MR_MAX_I8, KC_I8, 1, l2_size), NR_MAX_I8);
         int mc = std::min(MC_TARGET, static_cast<int>(M));
@@ -185,8 +185,8 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
     }
 
     // ---- fp16×int4 (future) ------------------------------------------
-    if (dtype_a == DataType::f16 && dtype_b == DataType::i8) {
-        // i4 weights are packed 2× per i8 byte — placeholder sizing.
+    if (dtype_a == DataType::f16 && dtype_b == DataType::s8) {
+        // s4 weights are packed 2× per s8 byte — placeholder sizing.
         int nc = round_down_nc(compute_nc(MR_MAX_F16I4, KC_F16I4, 2, l2_size), NR_MAX_F16I4);
         int mc = std::min(MC_TARGET, static_cast<int>(M));
         nc = std::min(nc, static_cast<int>(N));
@@ -231,22 +231,22 @@ void matmul_kernel(const MatMulAttributes& attrs,
         return;
     }
 
-    // ---- u8 × i8 (unsigned activation, signed weight) -----------------
-    if (dt_a == DataType::u8 && dt_b == DataType::i8) {
+    // ---- u8 × s8 (unsigned activation, signed weight) -----------------
+    if (dt_a == DataType::u8 && dt_b == DataType::s8) {
         matmul_kernel_u8i8(attrs, output, inputs, workspace);
         return;
     }
 
-    // ---- i8 × i8 ------------------------------------------------------
-    if (dt_a == DataType::i8 && dt_b == DataType::i8) {
+    // ---- s8 × s8 ------------------------------------------------------
+    if (dt_a == DataType::s8 && dt_b == DataType::s8) {
         matmul_kernel_i8i8(attrs, output, inputs, workspace);
         return;
     }
 
-    // ---- fp16 × int4 (future: i4 weights packed 2× per byte) -----------
-    // B dtype is i8 (container for packed i4) — distinction TBD when i4
+    // ---- fp16 × int4 (future: s4 weights packed 2× per byte) -----------
+    // B dtype is s8 (container for packed s4) — distinction TBD when s4
     // becomes a first-class DataType.
-    if (dt_a == DataType::f16 && dt_b == DataType::i8) {
+    if (dt_a == DataType::f16 && dt_b == DataType::s8) {
         matmul_kernel_f16i4(attrs, output, inputs, workspace);
         return;
     }

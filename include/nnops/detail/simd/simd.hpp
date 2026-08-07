@@ -56,7 +56,7 @@
 #include "nnops/detail/simd/vec_f32x4.hpp"
 #include "nnops/detail/simd/vec_f32x8.hpp"
 #include "nnops/detail/simd/vec_f16x8.hpp"
-#include "nnops/detail/simd/vec_i8x16.hpp"
+#include "nnops/detail/simd/vec_s8x16.hpp"
 #include "nnops/detail/simd/vec_u8x16.hpp"
 #include "nnops/detail/half.hpp"
 
@@ -96,7 +96,7 @@ inline constexpr int simd_lane_for = std::is_same_v<T, float>
 // Overloaded on pointer type so kernel code is type-generic:
 //   float*   → v_f32x8   (v_load_f32x8 / v_store / v_set1_f32x8 / v_zero_f32x8)
 //   half*    → v_f16x8   (v_load_f16x8 / v_store / v_set1_f16x8 / v_zero_f16x8)
-//   int8_t*  → v_i8x16   (v_load_i8x16 / v_store / v_set1_i8x16 / v_zero_i8x16)
+//   int8_t*  → v_s8x16   (v_load_s8x16 / v_store / v_set1_s8x16 / v_zero_s8x16)
 //   uint8_t* → v_u8x16   (v_load_u8x16 / v_store / v_set1_u8x16 / v_zero_u8x16)
 //
 // v_store is overloaded by each backend for all pointer types;
@@ -123,19 +123,19 @@ inline v_f32x8 v_load(const float* p) { return v_load_f32x8(p); }
 inline v_f16x8 v_load(const half* p) {
     return v_load_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
-inline v_i8x16 v_load(const int8_t* p) { return v_load_i8x16(p); }
+inline v_s8x16 v_load(const int8_t* p) { return v_load_s8x16(p); }
 inline v_u8x16 v_load(const uint8_t* p) { return v_load_u8x16(p); }
 
 // Generic vector broadcast (first arg for overload resolution)
 inline v_f32x8 v_set1(const float*, float s) { return v_set1_f32x8(s); }
 inline v_f16x8 v_set1(const half*, float s) { return v_set1_f16x8(s); }
-inline v_i8x16 v_set1(const int8_t*, int8_t s) { return v_set1_i8x16(s); }
+inline v_s8x16 v_set1(const int8_t*, int8_t s) { return v_set1_s8x16(s); }
 inline v_u8x16 v_set1(const uint8_t*, uint8_t s) { return v_set1_u8x16(s); }
 
 // Generic zero vector (first arg for overload resolution)
 inline v_f32x8 v_zero(const float*) { return v_zero_f32x8(); }
 inline v_f16x8 v_zero(const half*) { return v_zero_f16x8(); }
-inline v_i8x16 v_zero(const int8_t*) { return v_zero_i8x16(); }
+inline v_s8x16 v_zero(const int8_t*) { return v_zero_s8x16(); }
 inline v_u8x16 v_zero(const uint8_t*) { return v_zero_u8x16(); }
 
 // Generic vector store — backend provides float*; add half* overload
@@ -249,7 +249,7 @@ inline v_f16x8 v_load_stride2_odd(const half* p) {
 // ============================================================
 
 #if defined(NNOPS_ARCH_X86_64)
-inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+inline v_f32x8 v_cvt_s8_to_f32(const int8_t* p) {
     __m128i i8  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
     __m128i i16 = _mm_cvtepi8_epi16(i8);
     __m128i i32_lo = _mm_cvtepi16_epi32(i16);
@@ -272,7 +272,7 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 }
 
 #elif defined(NNOPS_ARCH_AARCH64)
-inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+inline v_f32x8 v_cvt_s8_to_f32(const int8_t* p) {
     int8x8_t   i8     = vld1_s8(p);
     int16x8_t  i16    = vmovl_s8(i8);
     int32x4_t  i32_lo = vmovl_s16(vget_low_s16(i16));
@@ -288,7 +288,7 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 }
 
 #else
-inline v_f32x8 v_cvt_i8_to_f32(const int8_t* p) {
+inline v_f32x8 v_cvt_s8_to_f32(const int8_t* p) {
     float buf[8];
     for (int i = 0; i < 8; ++i) buf[i] = static_cast<float>(p[i]);
     return v_load(buf);
@@ -301,7 +301,7 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 #endif
 
 // int8/uint8 → f16: direct per-element conversion (8 lanes)
-inline v_f16x8 v_cvt_i8_to_f16(const int8_t* p) {
+inline v_f16x8 v_cvt_s8_to_f16(const int8_t* p) {
     half buf[8];
     for (int i = 0; i < 8; ++i) buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
     return v_load(buf);

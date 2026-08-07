@@ -22,23 +22,23 @@ NNOPS_TEST(quantize_linear_i8_basic) {
     TensorView input(shape, DataType::f32, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.output_dtype = DataType::i8;
+    attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
     const TensorDesc in_arr[] = {input.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::i8);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s8);
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
 
     std::vector<int8_t> out_buf(3);
-    TensorView output(shape, DataType::i8, out_buf.data());
+    TensorView output(shape, DataType::s8, out_buf.data());
 
     float scale_data[] = {1.0f};
     int8_t zp_data[] = {0};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -54,17 +54,17 @@ NNOPS_TEST(quantize_linear_i8_scale) {
     TensorView input(shape, DataType::f32, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.output_dtype = DataType::i8;
+    attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
     std::vector<int8_t> out_buf(3);
-    TensorView output(shape, DataType::i8, out_buf.data());
+    TensorView output(shape, DataType::s8, out_buf.data());
 
     float scale_data[] = {2.0f};
     int8_t zp_data[] = {0};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -80,17 +80,17 @@ NNOPS_TEST(quantize_linear_i8_zero_point) {
     TensorView input(shape, DataType::f32, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.output_dtype = DataType::i8;
+    attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
     std::vector<int8_t> out_buf(3);
-    TensorView output(shape, DataType::i8, out_buf.data());
+    TensorView output(shape, DataType::s8, out_buf.data());
 
     float scale_data[] = {1.0f};
     int8_t zp_data[] = {100};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -106,17 +106,17 @@ NNOPS_TEST(quantize_linear_i8_clamp) {
     TensorView input(shape, DataType::f32, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.output_dtype = DataType::i8;
+    attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
     std::vector<int8_t> out_buf(3);
-    TensorView output(shape, DataType::i8, out_buf.data());
+    TensorView output(shape, DataType::s8, out_buf.data());
 
     float scale_data[] = {1.0f};
     int8_t zp_data[] = {0};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -186,17 +186,17 @@ NNOPS_TEST(quantize_linear_2d_per_channel) {
 
     QuantLinearAttributes attrs;
     attrs.axis = 1;
-    attrs.output_dtype = DataType::i8;
+    attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
     std::vector<int8_t> out_buf(6);
-    TensorView output(shape, DataType::i8, out_buf.data());
+    TensorView output(shape, DataType::s8, out_buf.data());
 
     float scale_data[] = {1.0f, 2.0f, 3.0f};
     int8_t zp_data[] = {0, 0, 0};
     const int64_t s_shape[] = {3};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -213,18 +213,18 @@ NNOPS_TEST(quantize_linear_random) {
     auto [in_vec, input] = test::make_random_tensor({4, 8}, -10.0f, 10.0f);
 
     QuantLinearAttributes attrs;
-    attrs.output_dtype = DataType::i8;
+    attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
     std::vector<int8_t> out_buf(32);
     const int64_t shape[] = {4, 8};
-    TensorView output(shape, DataType::i8, out_buf.data());
+    TensorView output(shape, DataType::s8, out_buf.data());
 
     float scale_data[] = {0.5f};
     int8_t zp_data[] = {0};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -243,7 +243,7 @@ NNOPS_TEST(quantize_linear_random) {
 NNOPS_TEST(dequantize_linear_i8_basic) {
     const int64_t shape[] = {3};
     int8_t in_data[] = {0, 1, -1};
-    TensorView input(shape, DataType::i8, in_data);
+    TensorView input(shape, DataType::s8, in_data);
 
     QuantLinearAttributes attrs;
     attrs.output_dtype = DataType::f32;
@@ -256,7 +256,7 @@ NNOPS_TEST(dequantize_linear_i8_basic) {
     int8_t zp_data[] = {0};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -269,7 +269,7 @@ NNOPS_TEST(dequantize_linear_i8_basic) {
 NNOPS_TEST(dequantize_linear_i8_scale_zp) {
     const int64_t shape[] = {3};
     int8_t in_data[] = {100, 101, 102};
-    TensorView input(shape, DataType::i8, in_data);
+    TensorView input(shape, DataType::s8, in_data);
 
     QuantLinearAttributes attrs;
     attrs.output_dtype = DataType::f32;
@@ -282,7 +282,7 @@ NNOPS_TEST(dequantize_linear_i8_scale_zp) {
     int8_t zp_data[] = {100};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -321,7 +321,7 @@ NNOPS_TEST(dequantize_linear_u8_basic) {
 NNOPS_TEST(dequantize_linear_2d_per_channel) {
     const int64_t shape[] = {2, 3};
     int8_t in_data[] = {0, 0, 1, 10, 5, 4};
-    TensorView input(shape, DataType::i8, in_data);
+    TensorView input(shape, DataType::s8, in_data);
 
     QuantLinearAttributes attrs;
     attrs.axis = 1;
@@ -335,7 +335,7 @@ NNOPS_TEST(dequantize_linear_2d_per_channel) {
     int8_t zp_data[] = {0, 0, 0};
     const int64_t s_shape[] = {3};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -355,7 +355,7 @@ NNOPS_TEST(dequantize_linear_random) {
     const int64_t shape[] = {4, 8};
     std::vector<int8_t> in_buf(32);
     for (auto& v : in_buf) v = static_cast<int8_t>(dist(rng));
-    TensorView input(shape, DataType::i8, in_buf.data());
+    TensorView input(shape, DataType::s8, in_buf.data());
 
     QuantLinearAttributes attrs;
     attrs.output_dtype = DataType::f32;
@@ -368,7 +368,7 @@ NNOPS_TEST(dequantize_linear_random) {
     int8_t zp_data[] = {-3};
     const int64_t s_shape[] = {1};
     TensorView scale(s_shape, DataType::f32, scale_data);
-    TensorView zp(s_shape, DataType::i8, zp_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
 
     const TensorView ins[] = {input, scale, zp};
     op->compute(output, ins);
@@ -391,18 +391,18 @@ NNOPS_TEST(quant_dequant_roundtrip_i8) {
 
     // Quantize
     QuantLinearAttributes q_attrs;
-    q_attrs.output_dtype = DataType::i8;
+    q_attrs.output_dtype = DataType::s8;
     auto q_op = QuantizeLinear::create(q_attrs, Backend::CPU);
 
     std::vector<int8_t> q_buf(32);
     const int64_t shape[] = {4, 8};
-    TensorView q_out(shape, DataType::i8, q_buf.data());
+    TensorView q_out(shape, DataType::s8, q_buf.data());
 
     float q_scale_data[] = {scale_val};
     int8_t q_zp_data[] = {zp_val};
     const int64_t s_shape[] = {1};
     TensorView q_scale(s_shape, DataType::f32, q_scale_data);
-    TensorView q_zp(s_shape, DataType::i8, q_zp_data);
+    TensorView q_zp(s_shape, DataType::s8, q_zp_data);
     const TensorView q_ins[] = {input, q_scale, q_zp};
     q_op->compute(q_out, q_ins);
 

@@ -24,7 +24,7 @@ namespace {
 
 inline TensorView make_scalar_i64(int64_t& val) {
     const int64_t shape[] = {1};
-    return TensorView(shape, DataType::i64, &val);
+    return TensorView(shape, DataType::s64, &val);
 }
 
 /// Create cache tensor from f32 data with specified dtype.
@@ -84,7 +84,7 @@ TensorView make_i8_cache(const std::vector<int64_t>& shape,
     QuantParams qp;
     qp.scale = scale;
     qp.zero_point = zp;
-    return TensorView(shape, DataType::i8, storage.data(), TensorLayout::NCHW, qp);
+    return TensorView(shape, DataType::s8, storage.data(), TensorLayout::NCHW, qp);
 }
 
 /// Helpers to create dense float TensorViews

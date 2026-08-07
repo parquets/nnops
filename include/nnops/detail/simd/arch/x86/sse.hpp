@@ -450,14 +450,14 @@ inline float v_reduce_min(const v_f16x8& a) {
 #endif  // defined(__F16C__)
 
 // ============================================================
-// v_i8x16 — 128-bit signed int8 vector, backed by __m128i
+// v_s8x16 — 128-bit signed int8 vector, backed by __m128i
 // ============================================================
-struct v_i8x16 {
+struct v_s8x16 {
     __m128i val;
 
-    v_i8x16() = default;
-    explicit v_i8x16(__m128i v) : val(v) {}
-    explicit v_i8x16(int8_t s) : val(_mm_set1_epi8(s)) {}
+    v_s8x16() = default;
+    explicit v_s8x16(__m128i v) : val(v) {}
+    explicit v_s8x16(int8_t s) : val(_mm_set1_epi8(s)) {}
 
     int8_t operator[](int i) const {
         int8_t tmp[16];
@@ -466,14 +466,14 @@ struct v_i8x16 {
     }
 };
 
-inline v_i8x16 v_load_i8x16(const int8_t* p) {
-    return v_i8x16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+inline v_s8x16 v_load_s8x16(const int8_t* p) {
+    return v_s8x16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
 }
-inline void v_store(int8_t* p, const v_i8x16& a) {
+inline void v_store(int8_t* p, const v_s8x16& a) {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(p), a.val);
 }
-inline v_i8x16 v_set1_i8x16(int8_t s)  { return v_i8x16(_mm_set1_epi8(s)); }
-inline v_i8x16 v_zero_i8x16()         { return v_i8x16(_mm_setzero_si128()); }
+inline v_s8x16 v_set1_s8x16(int8_t s)  { return v_s8x16(_mm_set1_epi8(s)); }
+inline v_s8x16 v_zero_s8x16()         { return v_s8x16(_mm_setzero_si128()); }
 
 // ============================================================
 // v_u8x16 — 128-bit unsigned int8 vector, backed by __m128i

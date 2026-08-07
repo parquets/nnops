@@ -312,13 +312,13 @@ Pipeline 创建时，驱动编译器将特化常量替换为实际值，然后�
 | `float` | 32 | `DataType::f32` | 标准单精度 |
 | `double` | 64 | — | 需要 `GL_EXT_shader_explicit_arithmetic_types_float64` |
 | `float16_t` | 16 | `DataType::f16` | 需要 `GL_EXT_shader_16bit_storage`（存储）或 `GL_EXT_shader_explicit_arithmetic_types_float16`（算术） |
-| `int` | 32 | `DataType::i32` | 有符号 32-bit |
+| `int` | 32 | `DataType::s32` | 有符号 32-bit |
 | `uint` | 32 | — | 无符号 32-bit |
 | `int16_t` | 16 | — | 有符号 16-bit，需要 `GL_EXT_shader_explicit_arithmetic_types_int16` |
 | `uint16_t` | 16 | `DataType::f16` (bits) | 无符号 16-bit（fp16 的比特表示） |
-| `int8_t` | 8 | `DataType::i8` | 需要 `GL_EXT_shader_explicit_arithmetic_types_int8` |
+| `int8_t` | 8 | `DataType::s8` | 需要 `GL_EXT_shader_explicit_arithmetic_types_int8` |
 | `uint8_t` | 8 | `DataType::u8` | 同上 |
-| `int64_t` | 64 | `DataType::i64` | 需要 `GL_EXT_shader_explicit_arithmetic_types_int64` |
+| `int64_t` | 64 | `DataType::s64` | 需要 `GL_EXT_shader_explicit_arithmetic_types_int64` |
 | `bool` | ~ | — | 条件值 |
 
 ### 5.2 向量类型

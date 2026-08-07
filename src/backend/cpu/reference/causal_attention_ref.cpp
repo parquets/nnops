@@ -4,7 +4,7 @@
 /// Handles:
 ///   - Decode (Sq=1) and chunk prefill (Sq>=1)
 ///   - Contiguous and block-level (PagedAttention) KV-cache
-///   - Multi-dtype cache: f32, f16, bf16, i8, u8
+///   - Multi-dtype cache: f32, f16, bf16, s8, u8
 ///   - PerBlock, PerTensor, PerChannel quantization for int8/uint8 cache
 
 #include "nnops/ops/causal_attention.hpp"
@@ -42,7 +42,7 @@ inline float cache_load_f32(const void* cache_ptr, int64_t offset,
         uint16_t v = static_cast<const uint16_t*>(cache_ptr)[offset];
         return bf16_to_float(v);
     }
-    case DataType::i8: {
+    case DataType::s8: {
         int8_t iv = static_cast<const int8_t*>(cache_ptr)[offset];
         float scale = (qp.granularity == QuantGranularity::PerTensor) ? qp.scale : qp.scale_data[qp_idx];
         int32_t zp  = (qp.granularity == QuantGranularity::PerTensor) ? qp.zero_point : qp.zero_point_data[qp_idx];
@@ -76,7 +76,7 @@ inline void cache_store_f32(void* cache_ptr, int64_t offset, float val,
         static_cast<uint16_t*>(cache_ptr)[offset] = float_to_bf16(val);
         break;
     }
-    case DataType::i8: {
+    case DataType::s8: {
         float scale = (qp.granularity == QuantGranularity::PerTensor) ? qp.scale : qp.scale_data[qp_idx];
         int32_t zp  = (qp.granularity == QuantGranularity::PerTensor) ? qp.zero_point : qp.zero_point_data[qp_idx];
         float iv = std::round(val / scale) + static_cast<float>(zp);

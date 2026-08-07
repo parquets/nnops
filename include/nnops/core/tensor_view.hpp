@@ -179,7 +179,7 @@ public:
     const QuantParams& quant_params() const noexcept { return quant_params_; }
 
     /// Whether the tensor holds quantized integer data that should be
-    /// dequantized (i8/u8 with active scale/zp; extensible to i4/u4).
+    /// dequantized (s8/u8 with active scale/zp; extensible to s4/u4).
     bool is_quantized() const noexcept {
         return is_quantized_dtype(dtype_) && quant_params_.is_active();
     }
