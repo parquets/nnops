@@ -16,76 +16,12 @@
 #include "nnops/ops/permute.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
-#include "nnops/detail/simd/simd.hpp"
+#include "simd_kernel/simd_permute.hpp"
 
 #include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu {
-
-// ============================================================
-// Core 2D tiled transpose (pointer + strides, no shape knowledge).
-//
-// Transposes [M × K] at in_ptr (row stride = in_ld) to
-//             [K × M] at out_ptr (row stride = out_ld).
-//
-// Uses v_transpose_8x8 for in-register 8×8 matrix transpose.
-// Handles partial tiles at edges with scalar fallback.
-// ============================================================
-template <typename T>
-void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
-                        int64_t M, int64_t K,
-                        int64_t in_ld, int64_t out_ld,
-                        const ComputeContext& ctx)
-{
-    constexpr int64_t TILE = 8;  // SIMD lane width for both f32/f16
-    const int64_t num_tile_rows = (M + TILE - 1) / TILE;
-
-    auto body = [&](int64_t ti) {
-        const int64_t i = ti * TILE;          // start row in input
-        const int64_t tile_m = std::min(TILE, M - i);
-
-        for (int64_t j = 0; j < K; j += TILE) {
-            const int64_t tile_k = std::min(TILE, K - j);
-
-            if (tile_m == TILE && tile_k == TILE) {
-                // Full 8×8 tile: load 8 rows, transpose, store 8 rows
-                auto r0 = simd::v_load(&in_ptr[(i + 0) * in_ld + j]);
-                auto r1 = simd::v_load(&in_ptr[(i + 1) * in_ld + j]);
-                auto r2 = simd::v_load(&in_ptr[(i + 2) * in_ld + j]);
-                auto r3 = simd::v_load(&in_ptr[(i + 3) * in_ld + j]);
-                auto r4 = simd::v_load(&in_ptr[(i + 4) * in_ld + j]);
-                auto r5 = simd::v_load(&in_ptr[(i + 5) * in_ld + j]);
-                auto r6 = simd::v_load(&in_ptr[(i + 6) * in_ld + j]);
-                auto r7 = simd::v_load(&in_ptr[(i + 7) * in_ld + j]);
-
-                simd::v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
-
-                simd::v_store(&out_ptr[(j + 0) * out_ld + i], r0);
-                simd::v_store(&out_ptr[(j + 1) * out_ld + i], r1);
-                simd::v_store(&out_ptr[(j + 2) * out_ld + i], r2);
-                simd::v_store(&out_ptr[(j + 3) * out_ld + i], r3);
-                simd::v_store(&out_ptr[(j + 4) * out_ld + i], r4);
-                simd::v_store(&out_ptr[(j + 5) * out_ld + i], r5);
-                simd::v_store(&out_ptr[(j + 6) * out_ld + i], r6);
-                simd::v_store(&out_ptr[(j + 7) * out_ld + i], r7);
-            } else {
-                // Partial tile at edge: scalar copy
-                for (int64_t mi = 0; mi < tile_m; ++mi) {
-                    for (int64_t kj = 0; kj < tile_k; ++kj) {
-                        out_ptr[(j + kj) * out_ld + (i + mi)] =
-                            in_ptr[(i + mi) * in_ld + (j + kj)];
-                    }
-                }
-            }
-        }
-    };
-
-    if (ctx.cpu_parallel_for)
-        ctx.cpu_parallel_for(0, num_tile_rows, body);
-    else
-        for (int64_t t = 0; t < num_tile_rows; ++t) body(t);
-}
 
 // ============================================================
 // Batched last-2-dims swap: rank >= 2, only dims (rank-2, rank-1) swapped.
@@ -125,13 +61,12 @@ void permute_last_two_swap_impl(TensorView& output,
     // in_ld = K (row stride in elements), out_ld = M
 
     auto body = [&](int64_t b) {
-        tiled_transpose_2d<T>(
+        kernel::tiled_transpose_2d<T>(
             in_ptr  + b * in_batch_stride,
             out_ptr + b * out_batch_stride,
             M, K,
             K,   // in_ld: elements between input rows
-            M,   // out_ld: elements between output rows
-            ctx);
+            M);  // out_ld: elements between output rows
     };
 
     if (ctx.cpu_parallel_for)
