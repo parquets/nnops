@@ -40,6 +40,7 @@
 #include "nnops/ops/resize.hpp"
 #include "nnops/ops/rms_norm.hpp"
 #include "nnops/ops/rope.hpp"
+#include "nnops/ops/slice.hpp"
 #include "nnops/ops/softmax.hpp"
 #include "nnops/ops/topk.hpp"
 #include "nnops/ops/unary.hpp"

@@ -39,6 +39,7 @@ enum class OpType : uint8_t {
     Clamp           = 28,
     Embed           = 29,
     Permute         = 30,
+    Slice           = 31,
 };
 
 }  // namespace nnops

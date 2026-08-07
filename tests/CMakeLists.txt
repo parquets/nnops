@@ -21,6 +21,7 @@ set(TEST_SOURCES
     test_eltwise.cpp
     test_embed.cpp
     test_permute.cpp
+    test_slice.cpp
     test_unary.cpp
     test_reduce.cpp
     test_shape_inference.cpp

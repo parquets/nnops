@@ -710,4 +710,49 @@ inline std::vector<TensorDesc> permute_output_shape(
     return {out};
 }
 
+/// Slice shape inference.
+/// inputs[0] = input [*]
+/// For each axis in @p axes, the output dim is derived from
+/// starts/ends/steps. Axes not listed are kept in full.
+inline std::vector<TensorDesc> slice_output_shape(
+    std::span<const int64_t> starts,
+    std::span<const int64_t> ends,
+    std::span<const int64_t> axes,
+    std::span<const int64_t> steps,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+    const int64_t rank = in.rank;
+
+    // Default: copy all dims from input
+    TensorDesc out;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+    out.rank   = rank;
+    out.dims.resize(static_cast<size_t>(rank));
+    for (int64_t i = 0; i < rank; ++i)
+        out.dims[static_cast<size_t>(i)] = in.dims[static_cast<size_t>(i)];
+
+    // Apply slicing for each specified axis
+    for (size_t a = 0; a < axes.size(); ++a) {
+        int64_t ax = axes[a];
+        if (ax < 0) ax += rank;
+        int64_t dim = in.dims[static_cast<size_t>(ax)];
+        int64_t s = starts[a];
+        int64_t e = ends[a];
+        int64_t step = (a < steps.size()) ? steps[a] : int64_t(1);
+
+        // Clamp to valid range (ONNX-style: negative values wrap)
+        if (s < 0) s += dim;
+        if (e < 0) e += dim;
+        s = std::max<int64_t>(0, std::min(s, dim));
+        e = std::max<int64_t>(0, std::min(e, dim));
+
+        int64_t out_dim = (e > s) ? (e - s + step - 1) / step : int64_t(0);
+        out.dims[static_cast<size_t>(ax)] = out_dim;
+    }
+
+    return {out};
+}
+
 }  // namespace nnops
