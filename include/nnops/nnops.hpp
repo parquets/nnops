@@ -29,6 +29,7 @@
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/ops/embed.hpp"
 #include "nnops/ops/grid_sample.hpp"
+#include "nnops/ops/group_norm.hpp"
 #include "nnops/ops/layer_norm.hpp"
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/linear.hpp"

@@ -27,12 +27,21 @@ struct EmbedAttributes {
 /// Computes: output[...] = weight[clamp(indices[...], 0, V-1)]
 /// where V = weight.shape(0).
 ///
+/// Supports direct lookup (f32/f16 weight) and int8/uint8 quantized weight
+/// with per-row dequantization via weight.quant_params():
+///   output[j] = (weight[idx, j] - zero_point[idx]) * scale[idx]
+///
+/// Quantization parameters (scale, zero_point, granularity) are stored in
+/// the weight tensor via TensorView::QuantParams. Supports PerTensor
+/// (single scale/zp for all rows) and PerToken (per-row scale/zp).
+///
 /// Inputs (2):
-///   inputs[0] = weight   [vocab_size, dim]  (f32 or f16, planar)
-///   inputs[1] = indices  [*]                (int64, planar)
+///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, i8, u8)
+///   inputs[1] = indices  [*]                (i64 or i32)
 ///
 /// Outputs (1):
-///   outputs[0] = output  [*indices_shape..., dim]  (same dtype as weight)
+///   outputs[0] = output  [*indices_shape..., dim]
+///                dtype = weight dtype (f32/f16), or f32/f16 when weight is int8
 class Embed : public OpBase {
 public:
     /// Create an Embed operator for the specified backend.
@@ -79,6 +88,8 @@ private:
 // ============================================================
 
 /// Functional embedding lookup.
+/// For int8 weight, quantization params (scale/zero_point) are read from
+/// weight.quant_params() via TensorView.
 void embed(const TensorView& weight,
            const TensorView& indices,
            TensorView& output,

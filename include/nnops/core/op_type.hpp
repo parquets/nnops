@@ -40,6 +40,7 @@ enum class OpType : uint8_t {
     Embed           = 29,
     Permute         = 30,
     Slice           = 31,
+    GroupNorm       = 32,
 };
 
 }  // namespace nnops

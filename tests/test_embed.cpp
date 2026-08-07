@@ -298,3 +298,289 @@ NNOPS_TEST(embed_functional_api) {
         NNOPS_EXPECT_NEAR(out_class[i], out_func[i], 1e-5f);
     }
 }
+
+// ============================================================
+// Int8 weight with per-tensor dequantization
+// ============================================================
+
+NNOPS_TEST(embed_int8_per_tensor_f32) {
+    // Weight [3, 4] int8, quantized with scale=0.5, zp=0
+    // Values: [0,10,20,30], [40,50,60,70], [80,90,100,110]
+    const int64_t V = 3, D = 4;
+    int8_t w_data[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110};
+    const int64_t w_shape[] = {V, D};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.zero_point = 0;
+    qp.granularity = QuantGranularity::PerTensor;
+
+    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 2};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+    NNOPS_EXPECT_EQ(descs[0].rank, 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
+    NNOPS_EXPECT_EQ(descs[0].dims[1], D);
+
+    std::vector<float> out_buf(static_cast<size_t>(2 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: values [0,10,20,30] * 0.5 = [0,5,10,15]
+    NNOPS_EXPECT_NEAR(out_buf[0], 0.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 10.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 15.0f, 1e-5f);
+    // Index 2: values [80,90,100,110] * 0.5 = [40,45,50,55]
+    NNOPS_EXPECT_NEAR(out_buf[4], 40.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 45.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[6], 50.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[7], 55.0f, 1e-5f);
+}
+
+NNOPS_TEST(embed_int8_per_token_f32) {
+    // Weight [2, 4] int8, per-token scale, no zp
+    // Row 0: values with scale=0.25
+    // Row 1: values with scale=1.0
+    const int64_t V = 2, D = 4;
+    int8_t w_data[] = {10, 20, 30, 40, 5, 10, 15, 20};
+    const int64_t w_shape[] = {V, D};
+
+    float scale_data[] = {0.25f, 1.0f};
+
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = V;
+
+    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1, 0};
+    const int64_t idx_shape[] = {3};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_buf(static_cast<size_t>(3 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: [10,20,30,40] * 0.25 = [2.5, 5, 7.5, 10]
+    NNOPS_EXPECT_NEAR(out_buf[0], 2.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 7.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 10.0f, 1e-5f);
+    // Index 1: [5,10,15,20] * 1.0 = [5,10,15,20]
+    NNOPS_EXPECT_NEAR(out_buf[4], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 10.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[6], 15.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[7], 20.0f, 1e-5f);
+    // Index 0 again
+    NNOPS_EXPECT_NEAR(out_buf[8], 2.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[9], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[10], 7.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[11], 10.0f, 1e-5f);
+}
+
+NNOPS_TEST(embed_int8_with_zero_point) {
+    // Asymmetric quantization: w_int = round(w_float/scale) + zp
+    // Row 0: scale=0.5, zp=10
+    // Row 1: scale=1.0, zp=5
+    const int64_t V = 2, D = 3;
+    int8_t w_data[] = {10, 20, 30, 5, 15, 25};
+    const int64_t w_shape[] = {V, D};
+
+    float scale_data[] = {0.5f, 1.0f};
+    int32_t zp_data[] = {10, 5};
+
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.zero_point_data = zp_data;
+    qp.num_scales = V;
+
+    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_buf(static_cast<size_t>(2 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: (w - 10) * 0.5
+    // [10,20,30] → [0,5,10]
+    NNOPS_EXPECT_NEAR(out_buf[0], 0.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 10.0f, 1e-5f);
+    // Index 1: (w - 5) * 1.0
+    // [5,15,25] → [0,10,20]
+    NNOPS_EXPECT_NEAR(out_buf[3], 0.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[4], 10.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 20.0f, 1e-5f);
+}
+
+NNOPS_TEST(embed_int8_output_f16) {
+    // Per-tensor int8 → f16 output
+    const int64_t V = 2, D = 4;
+    int8_t w_data[] = {0, 20, 40, 60, -10, 10, 30, 50};
+    const int64_t w_shape[] = {V, D};
+
+    QuantParams qp;
+    qp.scale = 0.1f;
+    qp.zero_point = 0;
+    qp.granularity = QuantGranularity::PerTensor;
+
+    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+
+    // Manually construct output descriptors with f16 dtype
+    auto dw = weight.desc();
+    auto di = indices.desc();
+    const TensorDesc in_arr[] = {dw, di};
+    auto descs = op->getOutputTensorDesc(in_arr);
+    // Override output dtype to f16
+    descs[0].dtype = DataType::f16;
+
+    using nnops::backend::cpu::half;
+    std::vector<half> out_buf(static_cast<size_t>(2 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: [0,20,40,60] * 0.1 = [0,2,4,6]
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[0]), 0.0f, 1e-3f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[1]), 2.0f, 1e-3f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[2]), 4.0f, 1e-3f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[3]), 6.0f, 1e-3f);
+    // Index 1: [-10,10,30,50] * 0.1 = [-1,1,3,5]
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[4]), -1.0f, 1e-3f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[5]), 1.0f, 1e-3f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[6]), 3.0f, 1e-3f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[7]), 5.0f, 1e-3f);
+}
+
+NNOPS_TEST(embed_int8_out_of_bounds) {
+    // Verify out-of-bounds clamping works with int8 weight
+    const int64_t V = 3, D = 2;
+    int8_t w_data[] = {1, 2, 3, 4, 5, 6};
+    const int64_t w_shape[] = {V, D};
+
+    QuantParams qp;
+    qp.scale = 2.0f;
+
+    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+
+    // -1 → 0, 10 → 2
+    int64_t idx_data[] = {-1, 10};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_buf(static_cast<size_t>(2 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // -1 clamped to 0 → [1,2] * 2.0 = [2,4]
+    NNOPS_EXPECT_NEAR(out_buf[0], 2.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 4.0f, 1e-5f);
+    // 10 clamped to 2 → [5,6] * 2.0 = [10,12]
+    NNOPS_EXPECT_NEAR(out_buf[2], 10.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 12.0f, 1e-5f);
+}
+
+NNOPS_TEST(embed_int8_uint8_weight) {
+    // uint8 weight with per-tensor scale
+    const int64_t V = 2, D = 3;
+    uint8_t w_data[] = {0, 128, 255, 50, 100, 200};
+    const int64_t w_shape[] = {V, D};
+
+    QuantParams qp;
+    qp.scale = 0.02f;
+    qp.zero_point = 0;
+
+    TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    std::vector<float> out_buf(static_cast<size_t>(2 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: [0,128,255] * 0.02 = [0, 2.56, 5.1]
+    NNOPS_EXPECT_NEAR(out_buf[0], 0.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 2.56f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 5.1f, 1e-5f);
+    // Index 1: [50,100,200] * 0.02 = [1.0, 2.0, 4.0]
+    NNOPS_EXPECT_NEAR(out_buf[3], 1.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[4], 2.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 4.0f, 1e-5f);
+}
+
+NNOPS_TEST(embed_int8_functional_api) {
+    // Verify functional API works with int8 weight
+    const int64_t V = 2, D = 2;
+    int8_t w_data[] = {10, 20, 30, 40};
+    const int64_t w_shape[] = {V, D};
+
+    QuantParams qp;
+    qp.scale = 0.1f;
+
+    TensorView weight(w_shape, DataType::i8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::i64, idx_data);
+
+    // Class API
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+    std::vector<float> out_class(static_cast<size_t>(descs[0].numel()));
+    TensorView out1 = test::make_planar(descs[0], out_class.data());
+    const TensorView ins1[] = {weight, indices};
+    op->compute(out1, ins1);
+
+    // Functional API
+    std::vector<float> out_func(static_cast<size_t>(descs[0].numel()));
+    TensorView out2 = test::make_planar(descs[0], out_func.data());
+    embed(weight, indices, out2);
+
+    for (size_t i = 0; i < out_class.size(); ++i) {
+        NNOPS_EXPECT_NEAR(out_class[i], out_func[i], 1e-5f);
+    }
+}

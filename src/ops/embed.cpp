@@ -84,14 +84,14 @@ void Embed::compute(std::span<TensorView> outputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
-    NNOPS_ASSERT(inputs.size() == 2);
-    NNOPS_ASSERT(outputs.size() == 1);
     auto& output = outputs[0];
+    NNOPS_ASSERT(outputs.size() == 1);
+    NNOPS_ASSERT(inputs.size() == 2);
+    NNOPS_ASSERT(!output.is_empty());
 
     const auto& weight  = inputs[0];
     const auto& indices = inputs[1];
 
-    NNOPS_ASSERT(!output.is_empty());
     NNOPS_ASSERT(!weight.is_empty());
     NNOPS_ASSERT(!indices.is_empty());
 
@@ -102,16 +102,22 @@ void Embed::compute(std::span<TensorView> outputs,
     // Validate weight rank >= 2
     NNOPS_ASSERT(weight.rank() >= 2);
 
-    // Validate weight dtype is f32 or f16
-    NNOPS_ASSERT(weight.data_type() == DataType::f32 ||
-                 weight.data_type() == DataType::f16);
-
     // Validate planar layout
     NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOnly));
     NNOPS_ASSERT(is_layout_supported(indices.layout(), LayoutSupport::PlanarOnly));
 
-    // Validate output dtype matches weight
-    NNOPS_ASSERT(output.data_type() == weight.data_type());
+    const auto w_dtype = weight.data_type();
+
+    if (w_dtype == DataType::f32 || w_dtype == DataType::f16) {
+        NNOPS_ASSERT(output.data_type() == w_dtype);
+    } else if (w_dtype == DataType::i8 || w_dtype == DataType::u8) {
+        // Int8 weight: dequant params come from weight.quant_params()
+        NNOPS_ASSERT(weight.is_quantized());
+        NNOPS_ASSERT(output.data_type() == DataType::f32 ||
+                     output.data_type() == DataType::f16);
+    } else {
+        NNOPS_ASSERT(!"embed: unsupported weight dtype");
+    }
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }

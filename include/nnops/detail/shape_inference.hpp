@@ -658,8 +658,9 @@ inline std::vector<TensorDesc> topk_output_shape(
 }
 
 /// Embed shape inference.
-/// inputs[0] = weight  [vocab_size, dim]
+/// inputs[0] = weight  [vocab_size, dim]  (f32, f16, or int8)
 /// inputs[1] = indices [*] int64
+/// When weight is int8, output is f32 (dequantized result).
 /// Returns: [*indices_shape..., dim]
 inline std::vector<TensorDesc> embed_output_shape(
     std::span<const TensorDesc> inputs)
@@ -669,7 +670,12 @@ inline std::vector<TensorDesc> embed_output_shape(
 
     TensorDesc out;
     out.layout = weight.layout;
-    out.dtype  = weight.dtype;
+
+    // When weight is quantized (int8), output is dequantized float32
+    if (weight.dtype == DataType::i8 || weight.dtype == DataType::u8)
+        out.dtype = DataType::f32;
+    else
+        out.dtype = weight.dtype;
 
     const int64_t w_extra = weight.rank - 1;  // embedding dim(s)
     out.rank = indices.rank + w_extra;

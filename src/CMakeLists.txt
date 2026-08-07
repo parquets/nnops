@@ -28,6 +28,7 @@ set(NNOPS_CPU_SOURCES
     ops/reduce.cpp
     ops/resize.cpp
     ops/grid_sample.cpp
+    ops/group_norm.cpp
     ops/layout_convert.cpp
     ops/quant_linear.cpp
     ops/concat.cpp
@@ -60,6 +61,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reduce.cpp
     backend/cpu/resize.cpp
     backend/cpu/grid_sample.cpp
+    backend/cpu/group_norm.cpp
     backend/cpu/quant_linear.cpp
     backend/cpu/concat.cpp
     backend/cpu/argminmax.cpp
@@ -100,6 +102,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/topk_ref.cpp
     backend/cpu/reference/rope_ref.cpp
     backend/cpu/reference/flatten_ref.cpp
+    backend/cpu/reference/group_norm_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

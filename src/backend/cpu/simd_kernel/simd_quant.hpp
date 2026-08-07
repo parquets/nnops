@@ -3,7 +3,14 @@
 /// @brief SIMD kernel functions for QuantizeLinear / DequantizeLinear.
 ///
 /// All arithmetic is in f32 (v_f32x8). For f16 input/output, conversion
-/// happens at the boundary. int8/uint8 → f32 uses v_cvt_i8_to_f32 / v_cvt_u8_to_f32.
+/// happens at the boundary. int8/uint8 → f32 uses v_cvt_i8_to_f32 /
+/// v_cvt_u8_to_f32.
+///
+/// quant_store_f32 / quant_load_f32 are overloaded on pointer type:
+///   float* → direct v_f32x8 load/store
+///   half*  → SIMD v_f16x8 load/store with element-wise f16↔f32 conversion
+///
+/// Reference: include/nnops/detail/simd/simd.hpp — v_load/v_store for half*
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
@@ -57,30 +64,45 @@ inline v_f32x8 quant_load_int8_to_f32(const void* p, bool in_is_i8) {
         return v_cvt_u8_to_f32(static_cast<const uint8_t*>(p));
 }
 
-/// Store v_f32x8 to output (f32 or f16).
-template <typename T>
-inline void quant_store_f32(T* dest, v_f32x8 vy) {
-    if constexpr (std::is_same_v<T, half>) {
-        alignas(32) float fbuf[8];
-        v_store(fbuf, vy);
-        for (int i = 0; i < 8; ++i) dest[i] = ::nnops::backend::cpu::float_to_half(fbuf[i]);
-    } else {
-        v_store(dest, vy);
-    }
+// ============================================================
+// Store v_f32x8 to output (overloaded on pointer type)
+// ============================================================
+
+/// Store v_f32x8 directly to float* — no conversion needed.
+inline void quant_store_f32(float* dest, v_f32x8 vy) {
+    v_store(dest, vy);
 }
 
-/// Load f32/f16 → v_f32x8.
-template <typename T>
-inline v_f32x8 quant_load_f32(const T* p) {
-    if constexpr (std::is_same_v<T, half>) {
-        alignas(16) ::nnops::backend::cpu::half htmp[8];
-        v_store(htmp, v_load(p));
-        float fbuf[8];
-        for (int i = 0; i < 8; ++i) fbuf[i] = ::nnops::backend::cpu::half_to_float(htmp[i]);
-        return v_load(fbuf);
-    } else {
-        return v_load(p);
-    }
+/// Store v_f32x8 to half*: extract to f32 buffer, convert each lane
+/// to half, then SIMD store as v_f16x8 (v_load + v_store).
+inline void quant_store_f32(half* dest, v_f32x8 vy) {
+    alignas(32) float fbuf[8];
+    v_store(fbuf, vy);
+    half hbuf[8];
+    for (int i = 0; i < 8; ++i)
+        hbuf[i] = ::nnops::backend::cpu::float_to_half(fbuf[i]);
+    v_store(dest, v_load(hbuf));  // SIMD store of 8 half values
+}
+
+// ============================================================
+// Load f32/f16 → v_f32x8 (overloaded on pointer type)
+// ============================================================
+
+/// Load float* → v_f32x8 directly — no conversion needed.
+inline v_f32x8 quant_load_f32(const float* p) {
+    return v_load(p);
+}
+
+/// Load half* → v_f32x8: SIMD load as v_f16x8, extract each lane,
+/// convert to float, then load back as v_f32x8.
+inline v_f32x8 quant_load_f32(const half* p) {
+    v_f16x8 vh = v_load(p);      // SIMD load of 8 half values
+    half hbuf[8];
+    v_store(hbuf, vh);
+    float fbuf[8];
+    for (int i = 0; i < 8; ++i)
+        fbuf[i] = ::nnops::backend::cpu::half_to_float(hbuf[i]);
+    return v_load(fbuf);          // SIMD load of 8 float values
 }
 
 }  // namespace nnops::kernel

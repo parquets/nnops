@@ -36,6 +36,7 @@ set(TEST_SOURCES
     test_simd_unary.cpp
     test_simd_eltwise.cpp
     test_flatten.cpp
+    test_group_norm.cpp
 )
 
 # Vulkan tests (only when Vulkan backend is enabled)
