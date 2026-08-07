@@ -685,4 +685,29 @@ inline std::vector<TensorDesc> embed_output_shape(
     return {out};
 }
 
+/// Permute shape inference.
+/// inputs[0] = input [*]
+/// Returns: permuted shape according to perm order.
+/// perm[i] specifies which input dimension maps to output dimension i.
+inline std::vector<TensorDesc> permute_output_shape(
+    std::span<const int64_t> perm,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+    const int64_t rank = in.rank;
+
+    TensorDesc out;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+    out.rank   = rank;
+    out.dims.resize(static_cast<size_t>(rank));
+
+    for (int64_t i = 0; i < rank; ++i) {
+        int64_t src = perm[static_cast<size_t>(i)];
+        out.dims[static_cast<size_t>(i)] = in.dims[static_cast<size_t>(src)];
+    }
+
+    return {out};
+}
+
 }  // namespace nnops

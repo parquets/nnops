@@ -33,6 +33,7 @@
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
+#include "nnops/ops/permute.hpp"
 #include "nnops/ops/pooling.hpp"
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/ops/reduce.hpp"

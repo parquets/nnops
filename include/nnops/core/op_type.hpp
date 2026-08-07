@@ -38,6 +38,7 @@ enum class OpType : uint8_t {
     CausalAttention = 27,
     Clamp           = 28,
     Embed           = 29,
+    Permute         = 30,
 };
 
 }  // namespace nnops

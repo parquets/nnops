@@ -22,6 +22,7 @@ set(NNOPS_CPU_SOURCES
     ops/depthwise_conv.cpp
     ops/eltwise.cpp
     ops/embed.cpp
+    ops/permute.cpp
     ops/unary.cpp
     ops/reduce.cpp
     ops/resize.cpp
@@ -52,6 +53,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
     backend/cpu/embed.cpp
+    backend/cpu/permute.cpp
     backend/cpu/unary.cpp
     backend/cpu/reduce.cpp
     backend/cpu/resize.cpp
@@ -85,6 +87,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/depthwise_conv_ref.cpp
     backend/cpu/reference/eltwise_ref.cpp
     backend/cpu/reference/embed_ref.cpp
+    backend/cpu/reference/permute_ref.cpp
     backend/cpu/reference/unary_ref.cpp
     backend/cpu/reference/reduce_ref.cpp
     backend/cpu/reference/resize_ref.cpp
