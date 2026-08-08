@@ -15,7 +15,7 @@
 #include "nnops/ops/batch_norm.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "simd_kernel/simd_batch_norm.hpp"
+#include "simd_kernel/simd_norm.hpp"
 
 #include <cmath>
 #include <vector>

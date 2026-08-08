@@ -19,7 +19,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "simd_kernel/simd_group_norm.hpp"
+#include "simd_kernel/simd_norm.hpp"
 
 #include <cmath>
 
@@ -93,7 +93,7 @@ void group_norm_impl(const GroupNormAttributes& attrs,
 
         for (int64_t row = 0; row < total_rows_per_group; ++row) {
             const int64_t row_off = group_offset + row * row_stride;
-            auto [s, sq] = kernel::reduce_sum_sq<T>(x_ptr + row_off, W);
+            auto [s, sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, W);
             sum += s;
             sum_sq += sq;
         }
@@ -111,7 +111,7 @@ void group_norm_impl(const GroupNormAttributes& attrs,
             const float s = s_load(&s_ptr[c_global]);
             const float b = (has_bias && b_ptr) ? s_load(&b_ptr[c_global]) : 0.0f;
 
-            kernel::apply_row<T>(x_ptr + row_off, y_ptr + row_off, W,
+            kernel::norm_apply_affine_row<T>(x_ptr + row_off, y_ptr + row_off, W,
                                   mean_val, inv_std, s, b, add_to);
         }
     };

@@ -17,7 +17,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "simd_kernel/simd_layer_norm.hpp"
+#include "simd_kernel/simd_norm.hpp"
 
 #include <cmath>
 
