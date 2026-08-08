@@ -369,3 +369,67 @@ NNOPS_TEST(unary_2d_sqrt) {
         NNOPS_EXPECT_NEAR(out_buf[i], std::sqrt(in_data[i]), 1e-5f);
     }
 }
+
+// ============================================================
+// f16 tests — exercise the SIMD f16 code path
+// ============================================================
+
+NNOPS_TEST(unary_random_exp_f16) {
+    auto [f32_vec, _] = test::make_random_tensor({400}, -2.0f, 2.0f, 900);
+
+    auto f16_vec = test::f32_to_f16(f32_vec);
+
+    const int64_t shape[] = {400};
+    TensorView input(shape, DataType::f16, f16_vec.data());
+
+    UnaryAttributes attrs;
+    attrs.type = UnaryType::Exp;
+    auto op = Unary::create(attrs, Backend::CPU);
+
+    auto d = input.desc();
+    const TensorDesc in_arr[] = {d};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(400);
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    for (int i = 0; i < 400; ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(std::isfinite(result));
+        NNOPS_EXPECT_NEAR(result, std::exp(f32_vec[i]), 1e-2f);
+    }
+}
+
+NNOPS_TEST(unary_random_abs_f16) {
+    auto [f32_vec, _] = test::make_random_tensor({400}, -10.0f, 10.0f, 901);
+
+    auto f16_vec = test::f32_to_f16(f32_vec);
+
+    const int64_t shape[] = {400};
+    TensorView input(shape, DataType::f16, f16_vec.data());
+
+    UnaryAttributes attrs;
+    attrs.type = UnaryType::Abs;
+    auto op = Unary::create(attrs, Backend::CPU);
+
+    auto d = input.desc();
+    const TensorDesc in_arr[] = {d};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(400);
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    for (int i = 0; i < 400; ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(result >= 0.0f);
+        NNOPS_EXPECT_NEAR(result, std::abs(f32_vec[i]), 1e-2f);
+    }
+}

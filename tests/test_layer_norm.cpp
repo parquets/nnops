@@ -188,3 +188,48 @@ NNOPS_TEST(layernorm_random) {
         NNOPS_EXPECT_NEAR(row_var, 1.0f, 0.1f);
     }
 }
+
+// ============================================================
+// f16 tests
+// ============================================================
+
+NNOPS_TEST(layernorm_random_f16) {
+    // Planar 2D f16: 4x8, with bias
+    auto [x_f32_vec, _] = test::make_random_tensor({4, 8}, -1.0f, 1.0f, 400);
+    auto [s_f32_vec, __] = test::make_random_tensor({8}, 0.5f, 2.0f, 401);
+    auto [b_f32_vec, ___] = test::make_random_tensor({8}, -0.5f, 0.5f, 402);
+
+    auto x_f16 = test::f32_to_f16(x_f32_vec);
+    auto s_f16 = test::f32_to_f16(s_f32_vec);
+    auto b_f16 = test::f32_to_f16(b_f32_vec);
+
+    const int64_t x_shape[] = {4, 8};
+    const int64_t c_shape[] = {8};
+    TensorView x(x_shape, DataType::f16, x_f16.data());
+    TensorView s(c_shape, DataType::f16, s_f16.data());
+    TensorView b(c_shape, DataType::f16, b_f16.data());
+
+    LayerNormAttributes attrs;
+    auto op = LayerNorm::create(attrs, Backend::CPU);
+
+    auto dx = x.desc();
+    auto ds = s.desc();
+    auto db = b.desc();
+    const TensorDesc desc_arr[] = {dx, ds, db};
+    auto outs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(outs[0].numel()));
+    auto out = test::make_planar(outs[0], out_buf.data());
+
+    const TensorView ins[] = {x, s, b};
+    op->compute(out, ins);
+
+    // Verify all outputs are finite and reasonable
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        float v = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(std::isfinite(v));
+        NNOPS_EXPECT_TRUE(std::abs(v) < 100.0f);  // shouldn't blow up
+    }
+}

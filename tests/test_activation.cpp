@@ -229,3 +229,39 @@ NNOPS_TEST(activation_random_relu) {
         NNOPS_EXPECT_TRUE(out_buf[i] >= 0.0f);
     }
 }
+
+// ============================================================
+// f16 tests — exercise the SIMD f16 code path
+// ============================================================
+
+NNOPS_TEST(activation_random_relu_f16) {
+    auto [f32_vec, _] = test::make_random_tensor({500}, -5.0f, 5.0f, 800);
+
+    auto f16_vec = test::f32_to_f16(f32_vec);
+
+    const int64_t shape[] = {500};
+    TensorView input(shape, DataType::f16, f16_vec.data());
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::Relu;
+    auto op = Activation::create(attrs, Backend::CPU);
+
+    auto d = input.desc();
+    const TensorDesc arr[] = {d};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(500);
+    auto out = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {input};
+    op->compute(out, ins);
+
+    for (int i = 0; i < 500; ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(result >= -1e-5f);  // ReLU: >= 0
+        float expected = f32_vec[i] > 0.0f ? f32_vec[i] : 0.0f;
+        NNOPS_EXPECT_NEAR(result, expected, 1e-2f);
+    }
+}

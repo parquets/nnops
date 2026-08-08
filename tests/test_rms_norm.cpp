@@ -174,3 +174,48 @@ NNOPS_TEST(rmsnorm_random) {
         NNOPS_EXPECT_NEAR(rms, 1.0f, 0.1f);
     }
 }
+
+// ============================================================
+// f16 tests
+// ============================================================
+
+NNOPS_TEST(rmsnorm_random_f16) {
+    // Planar f16: 3x6 with per-element scale
+    auto [x_f32_vec, _] = test::make_random_tensor({3, 6}, -1.0f, 1.0f, 500);
+    auto [s_f32_vec, __] = test::make_random_tensor({6}, 0.5f, 2.0f, 501);
+
+    auto x_f16 = test::f32_to_f16(x_f32_vec);
+    auto s_f16 = test::f32_to_f16(s_f32_vec);
+
+    const int64_t x_shape[] = {3, 6};
+    const int64_t s_shape[] = {6};
+    TensorView x(x_shape, DataType::f16, x_f16.data());
+    TensorView s(s_shape, DataType::f16, s_f16.data());
+
+    auto op = RMSNorm::create(Backend::CPU);
+
+    auto d_x = x.desc();
+    auto d_s = s.desc();
+    const TensorDesc desc_arr[] = {d_x, d_s};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto y = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {x, s};
+    op->compute(y, ins);
+
+    // Each row's RMS should be ≈ its scale factor (since input ~ N(0,1))
+    for (int r = 0; r < 3; ++r) {
+        float sum_sq = 0.0f;
+        for (int c = 0; c < 6; ++c) {
+            float v = simd::s_load(&out_buf[static_cast<size_t>(r * 6 + c)]);
+            NNOPS_EXPECT_TRUE(std::isfinite(v));
+            sum_sq += v * v;
+        }
+        float rms = std::sqrt(sum_sq / 6.0f);
+        NNOPS_EXPECT_TRUE(rms > 0.01f && rms < 100.0f);
+    }
+}

@@ -573,3 +573,76 @@ NNOPS_TEST(eltwise_min_max_2d) {
     NNOPS_EXPECT_NEAR(max_out[4], 8.0f, 1e-6f);  // max(2, 8)
     NNOPS_EXPECT_NEAR(max_out[5], 7.0f, 1e-6f);  // max(7, 3)
 }
+
+// ============================================================
+// f16 tests — exercise the SIMD f16 code path
+// ============================================================
+
+NNOPS_TEST(eltwise_random_add_f16) {
+    auto [a_f32_vec, _a] = test::make_random_tensor({500}, -10.0f, 10.0f, 600);
+    auto [b_f32_vec, _b] = test::make_random_tensor({500}, -10.0f, 10.0f, 601);
+
+    auto a_f16 = test::f32_to_f16(a_f32_vec);
+    auto b_f16 = test::f32_to_f16(b_f32_vec);
+
+    const int64_t shape[] = {500};
+    TensorView a(shape, DataType::f16, a_f16.data());
+    TensorView b(shape, DataType::f16, b_f16.data());
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Add;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    auto d_a = a.desc();
+    auto d_b = b.desc();
+    const TensorDesc desc_arr[] = {d_a, d_b};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(500);
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    for (int i = 0; i < 500; ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(std::isfinite(result));
+        float expected = a_f32_vec[i] + b_f32_vec[i];
+        NNOPS_EXPECT_NEAR(result, expected, 5e-2f);
+    }
+}
+
+NNOPS_TEST(eltwise_random_mul_f16) {
+    auto [a_f32_vec, _a] = test::make_random_tensor({300}, -2.0f, 2.0f, 700);
+    auto [b_f32_vec, _b] = test::make_random_tensor({300}, -2.0f, 2.0f, 701);
+
+    auto a_f16 = test::f32_to_f16(a_f32_vec);
+    auto b_f16 = test::f32_to_f16(b_f32_vec);
+
+    const int64_t shape[] = {300};
+    TensorView a(shape, DataType::f16, a_f16.data());
+    TensorView b(shape, DataType::f16, b_f16.data());
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Mul;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    auto d_a = a.desc();
+    auto d_b = b.desc();
+    const TensorDesc desc_arr[] = {d_a, d_b};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(300);
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    for (int i = 0; i < 300; ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(std::isfinite(result));
+        NNOPS_EXPECT_NEAR(result, a_f32_vec[i] * b_f32_vec[i], 3e-2f);
+    }
+}

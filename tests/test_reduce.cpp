@@ -951,3 +951,74 @@ NNOPS_TEST(reduce_nchwc8_keepdims) {
         }
     }
 }
+
+// ============================================================
+// f16 tests — exercise the SIMD f16 code path
+// ============================================================
+
+NNOPS_TEST(reduce_random_f16) {
+    // Planar 2D f16: test all 4 reduce types
+    auto [f32_vec, _f32] = test::make_random_tensor({5, 10}, -2.0f, 2.0f, 888);
+    auto f16_vec = test::f32_to_f16(f32_vec);
+
+    const int64_t shape[] = {5, 10};
+    TensorView input(shape, DataType::f16, f16_vec.data());
+
+    struct TestCase { ReduceType type; };
+    TestCase cases[] = {
+        {ReduceType::Sum}, {ReduceType::Max},
+        {ReduceType::Min}, {ReduceType::Mean},
+    };
+
+    for (const auto& tc : cases) {
+        ReduceAttributes attrs;
+        attrs.type = tc.type;
+        attrs.axis = 1;
+        auto op = Reduce::create(attrs, Backend::CPU);
+
+        auto d = input.desc();
+        const TensorDesc arr[] = {d};
+        auto descs = op->getOutputTensorDesc(arr);
+
+        NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+        std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
+        auto output = test::make_planar(descs[0], out_buf.data());
+        const TensorView ins[] = {input};
+        op->compute(output, ins);
+
+        // Verify against f32 reference for each row
+        for (int r = 0; r < 5; ++r) {
+            float expected = 0.0f;
+            switch (tc.type) {
+            case ReduceType::Sum:
+            case ReduceType::Mean:
+                expected = 0.0f;
+                for (int c = 0; c < 10; ++c) {
+                    expected += f32_vec[static_cast<size_t>(r * 10 + c)];
+                }
+                if (tc.type == ReduceType::Mean) { expected /= 10.0f; }
+                break;
+            case ReduceType::Max:
+                expected = -std::numeric_limits<float>::infinity();
+                for (int c = 0; c < 10; ++c) {
+                    if (f32_vec[static_cast<size_t>(r * 10 + c)] > expected) {
+                        expected = f32_vec[static_cast<size_t>(r * 10 + c)];
+                    }
+                }
+                break;
+            case ReduceType::Min:
+                expected = std::numeric_limits<float>::infinity();
+                for (int c = 0; c < 10; ++c) {
+                    if (f32_vec[static_cast<size_t>(r * 10 + c)] < expected) {
+                        expected = f32_vec[static_cast<size_t>(r * 10 + c)];
+                    }
+                }
+                break;
+            }
+            float result = simd::s_load(&out_buf[static_cast<size_t>(r)]);
+            NNOPS_EXPECT_TRUE(std::isfinite(result));
+            NNOPS_EXPECT_NEAR(result, expected, 5e-2f);
+        }
+    }
+}

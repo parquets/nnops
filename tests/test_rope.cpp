@@ -515,3 +515,46 @@ NNOPS_TEST(rope_op_type) {
     NNOPS_EXPECT_EQ(op->getOpType(), OpType::RoPE);
     NNOPS_EXPECT_EQ(op->getBackend(), Backend::CPU);
 }
+
+// ============================================================
+// f16 test — exercise the SIMD f16 code path
+// ============================================================
+
+NNOPS_TEST(rope_random_interleaved_f16) {
+    const int64_t seq_len = 6;
+    const int64_t head_dim = 16;
+    const int64_t shape[] = {seq_len, head_dim};
+    const int N = seq_len * head_dim;
+
+    auto [f32_vec, _] = test::make_random_tensor(shape, -2.0f, 2.0f, 1000);
+    auto f16_vec = test::f32_to_f16(f32_vec);
+
+    TensorView x(shape, DataType::f16, f16_vec.data());
+
+    RoPEAttributes attrs;
+    attrs.base = 10000.0f;
+    attrs.interleaved = true;
+    auto op = RoPE::create(attrs, Backend::CPU);
+
+    auto d_x = x.desc();
+    const TensorDesc da[] = {d_x};
+    auto descs = op->getOutputTensorDesc(da);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto y = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {x};
+    op->compute(y, ins);
+
+    // Compute f32 reference
+    std::vector<float> ref(static_cast<size_t>(N), 0.0f);
+    compute_rope_ref(f32_vec.data(), ref.data(), seq_len, head_dim,
+                     10000.0f, true);
+
+    for (int i = 0; i < N; ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(std::isfinite(result));
+        NNOPS_EXPECT_NEAR(result, ref[i], 5e-2f);
+    }
+}

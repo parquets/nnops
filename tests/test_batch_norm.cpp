@@ -165,3 +165,151 @@ NNOPS_TEST(batchnorm_random) {
     // With mean=0, var=1, scale=1, bias=0: output should equal input
     NNOPS_EXPECT_TRUE(test::allclose(x, out, 1e-3f, 1e-3f));
 }
+
+// ============================================================
+// f16 test
+// ============================================================
+
+NNOPS_TEST(batchnorm_random_f16) {
+    // 2D f16 spatial: N=2, C=4
+    auto [x_f32_vec, _] = test::make_random_tensor({2, 4, 3}, -1.0f, 1.0f, 200);
+    std::vector<float> scale_buf(4, 1.0f);
+    std::vector<float> bias_buf(4, 0.0f);
+    std::vector<float> mean_buf(4, 0.0f);
+    std::vector<float> var_buf(4, 1.0f);
+
+    auto x_f16 = test::f32_to_f16(x_f32_vec);
+    auto s_f16 = test::f32_to_f16(scale_buf);
+    auto b_f16 = test::f32_to_f16(bias_buf);
+    auto m_f16 = test::f32_to_f16(mean_buf);
+    auto v_f16 = test::f32_to_f16(var_buf);
+
+    const int64_t shape_x[] = {2, 4, 3};
+    const int64_t shape_c[] = {4};
+    TensorView x(shape_x, DataType::f16, x_f16.data());
+    TensorView s(shape_c, DataType::f16, s_f16.data());
+    TensorView b(shape_c, DataType::f16, b_f16.data());
+    TensorView m(shape_c, DataType::f16, m_f16.data());
+    TensorView v(shape_c, DataType::f16, v_f16.data());
+
+    BatchNormAttributes attrs;
+    auto op = BatchNorm::create(attrs, Backend::CPU);
+
+    auto dx = x.desc();
+    auto ds = s.desc();
+    auto db = b.desc();
+    auto dm = m.desc();
+    auto dv = v.desc();
+    const TensorDesc desc_arr[] = {dx, ds, db, dm, dv};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {x, s, b, m, v};
+    TensorView outs[] = {out};
+    op->compute(outs, ins);
+
+    // With mean=0, var=1, scale=1, bias=0: output should ≈ input
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        float result = simd::s_load(&out_buf[i]);
+        NNOPS_EXPECT_TRUE(std::isfinite(result));
+        NNOPS_EXPECT_NEAR(result, x_f32_vec[i], 1e-2f);
+    }
+}
+
+// ============================================================
+// Packed NCHWC8 test
+// ============================================================
+
+NNOPS_TEST(batchnorm_nchwc8_spatial) {
+    // NCHWC8 [2, 8, 3, 4] — packed spatial batch norm
+    // This exercises the pack > 1 path
+    const int64_t N = 2, C = 8, H = 3, W = 4;
+
+    // Create NCHW f32 reference data and pack to NCHWC8
+    auto [f32_buf, _] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 300);
+
+    const int64_t num_c8 = (C + 7) / 8;
+    const int64_t row_stride = W * 8;
+    size_t total = static_cast<size_t>(N * num_c8 * H * row_stride);
+    std::vector<float> in_data(total, 0.0f);
+
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            int64_t c8 = c / 8;
+            int64_t lane = c % 8;
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t w = 0; w < W; ++w) {
+                    int64_t planar_idx = n * (C * H * W) + c * (H * W) + h * W + w;
+                    int64_t packed_off = n * (num_c8 * H * row_stride)
+                                         + c8 * (H * row_stride)
+                                         + h * row_stride + w * 8 + lane;
+                    in_data[static_cast<size_t>(packed_off)] = f32_buf[static_cast<size_t>(planar_idx)];
+                }
+            }
+        }
+    }
+
+    TensorDesc desc;
+    desc.rank = 4;
+    desc.dims = {N, C, H, W};
+    desc.dtype = DataType::f32;
+    desc.layout = TensorLayout::NCHWC8;
+    TensorView x = test::make_packed(desc, in_data.data());
+
+    // Scale/bias/mean/var: one per channel
+    std::vector<float> scale(C, 1.0f);
+    std::vector<float> bias(C, 0.0f);
+    std::vector<float> mean(C, 0.0f);
+    std::vector<float> var(C, 1.0f);
+
+    const int64_t shape_c[] = {C};
+    TensorView s(shape_c, DataType::f32, scale.data());
+    TensorView b(shape_c, DataType::f32, bias.data());
+    TensorView m(shape_c, DataType::f32, mean.data());
+    TensorView v(shape_c, DataType::f32, var.data());
+
+    BatchNormAttributes attrs;
+    attrs.spatial = true;
+    auto op = BatchNorm::create(attrs, Backend::CPU);
+
+    auto dx = x.desc();
+    auto ds = s.desc();
+    auto db = b.desc();
+    auto dm = m.desc();
+    auto dv = v.desc();
+    const TensorDesc desc_arr[] = {dx, ds, db, dm, dv};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHWC8);
+
+    std::vector<float> out_buf(total, 0.0f);
+    auto out = test::make_packed(descs[0], out_buf.data());
+
+    const TensorView ins[] = {x, s, b, m, v};
+    TensorView outs[] = {out};
+    op->compute(outs, ins);
+
+    // Verify all values are finite and close to input (mean=0, var=1, scale=1, bias=0)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            int64_t c8 = c / 8;
+            int64_t lane = c % 8;
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t w = 0; w < W; ++w) {
+                    int64_t planar_idx = n * (C * H * W) + c * (H * W) + h * W + w;
+                    int64_t packed_off = n * (num_c8 * H * row_stride)
+                                         + c8 * (H * row_stride)
+                                         + h * row_stride + w * 8 + lane;
+                    float expected = f32_buf[static_cast<size_t>(planar_idx)];
+                    float result = out_buf[static_cast<size_t>(packed_off)];
+                    NNOPS_EXPECT_TRUE(std::isfinite(result));
+                    NNOPS_EXPECT_NEAR(result, expected, 1e-3f);
+                }
+            }
+        }
+    }
+}
