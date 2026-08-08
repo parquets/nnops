@@ -673,22 +673,54 @@ inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
     float tmp[8][8];
-    for (int i = 0; i < 8; ++i) tmp[0][i] = r0[i];
-    for (int i = 0; i < 8; ++i) tmp[1][i] = r1[i];
-    for (int i = 0; i < 8; ++i) tmp[2][i] = r2[i];
-    for (int i = 0; i < 8; ++i) tmp[3][i] = r3[i];
-    for (int i = 0; i < 8; ++i) tmp[4][i] = r4[i];
-    for (int i = 0; i < 8; ++i) tmp[5][i] = r5[i];
-    for (int i = 0; i < 8; ++i) tmp[6][i] = r6[i];
-    for (int i = 0; i < 8; ++i) tmp[7][i] = r7[i];
-    for (int i = 0; i < 8; ++i) r0[i] = tmp[i][0];
-    for (int i = 0; i < 8; ++i) r1[i] = tmp[i][1];
-    for (int i = 0; i < 8; ++i) r2[i] = tmp[i][2];
-    for (int i = 0; i < 8; ++i) r3[i] = tmp[i][3];
-    for (int i = 0; i < 8; ++i) r4[i] = tmp[i][4];
-    for (int i = 0; i < 8; ++i) r5[i] = tmp[i][5];
-    for (int i = 0; i < 8; ++i) r6[i] = tmp[i][6];
-    for (int i = 0; i < 8; ++i) r7[i] = tmp[i][7];
+    for (int i = 0; i < 8; ++i) {
+        tmp[0][i] = r0[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[1][i] = r1[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[2][i] = r2[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[3][i] = r3[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[4][i] = r4[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[5][i] = r5[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[6][i] = r6[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[7][i] = r7[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r0[i] = tmp[i][0];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r1[i] = tmp[i][1];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r2[i] = tmp[i][2];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r3[i] = tmp[i][3];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r4[i] = tmp[i][4];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r5[i] = tmp[i][5];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r6[i] = tmp[i][6];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r7[i] = tmp[i][7];
+    }
 }
 
 /// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
@@ -696,22 +728,54 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
                              v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
     // Scalar: read 8×8 into temp, write back transposed
     uint16_t tmp[8][8];
-    for (int i = 0; i < 8; ++i) tmp[0][i] = r0.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[1][i] = r1.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[2][i] = r2.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[3][i] = r3.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[4][i] = r4.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[5][i] = r5.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[6][i] = r6.bits[i];
-    for (int i = 0; i < 8; ++i) tmp[7][i] = r7.bits[i];
-    for (int i = 0; i < 8; ++i) r0.bits[i] = tmp[i][0];
-    for (int i = 0; i < 8; ++i) r1.bits[i] = tmp[i][1];
-    for (int i = 0; i < 8; ++i) r2.bits[i] = tmp[i][2];
-    for (int i = 0; i < 8; ++i) r3.bits[i] = tmp[i][3];
-    for (int i = 0; i < 8; ++i) r4.bits[i] = tmp[i][4];
-    for (int i = 0; i < 8; ++i) r5.bits[i] = tmp[i][5];
-    for (int i = 0; i < 8; ++i) r6.bits[i] = tmp[i][6];
-    for (int i = 0; i < 8; ++i) r7.bits[i] = tmp[i][7];
+    for (int i = 0; i < 8; ++i) {
+        tmp[0][i] = r0.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[1][i] = r1.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[2][i] = r2.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[3][i] = r3.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[4][i] = r4.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[5][i] = r5.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[6][i] = r6.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        tmp[7][i] = r7.bits[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r0.bits[i] = tmp[i][0];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r1.bits[i] = tmp[i][1];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r2.bits[i] = tmp[i][2];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r3.bits[i] = tmp[i][3];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r4.bits[i] = tmp[i][4];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r5.bits[i] = tmp[i][5];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r6.bits[i] = tmp[i][6];
+    }
+    for (int i = 0; i < 8; ++i) {
+        r7.bits[i] = tmp[i][7];
+    }
 }
 
 // ============================================================
@@ -722,7 +786,9 @@ struct v_s8x16 {
 
     v_s8x16() = default;
     explicit v_s8x16(int8_t s) {
-        for (int i = 0; i < 16; ++i) v[i] = s;
+        for (int i = 0; i < 16; ++i) {
+            v[i] = s;
+        }
     }
     int8_t operator[](int i) const { return v[i]; }
     int8_t& operator[](int i) { return v[i]; }
@@ -730,11 +796,15 @@ struct v_s8x16 {
 
 inline v_s8x16 v_load_s8x16(const int8_t* p) {
     v_s8x16 r;
-    for (int i = 0; i < 16; ++i) r[i] = p[i];
+    for (int i = 0; i < 16; ++i) {
+        r[i] = p[i];
+    }
     return r;
 }
 inline void v_store(int8_t* p, const v_s8x16& a) {
-    for (int i = 0; i < 16; ++i) p[i] = a[i];
+    for (int i = 0; i < 16; ++i) {
+        p[i] = a[i];
+    }
 }
 inline v_s8x16 v_set1_s8x16(int8_t s)  { return v_s8x16(s); }
 inline v_s8x16 v_zero_s8x16()         { return v_s8x16(0); }
@@ -747,7 +817,9 @@ struct v_u8x16 {
 
     v_u8x16() = default;
     explicit v_u8x16(uint8_t s) {
-        for (int i = 0; i < 16; ++i) v[i] = s;
+        for (int i = 0; i < 16; ++i) {
+            v[i] = s;
+        }
     }
     uint8_t operator[](int i) const { return v[i]; }
     uint8_t& operator[](int i) { return v[i]; }
@@ -755,11 +827,15 @@ struct v_u8x16 {
 
 inline v_u8x16 v_load_u8x16(const uint8_t* p) {
     v_u8x16 r;
-    for (int i = 0; i < 16; ++i) r[i] = p[i];
+    for (int i = 0; i < 16; ++i) {
+        r[i] = p[i];
+    }
     return r;
 }
 inline void v_store(uint8_t* p, const v_u8x16& a) {
-    for (int i = 0; i < 16; ++i) p[i] = a[i];
+    for (int i = 0; i < 16; ++i) {
+        p[i] = a[i];
+    }
 }
 inline v_u8x16 v_set1_u8x16(uint8_t s)  { return v_u8x16(s); }
 inline v_u8x16 v_zero_u8x16()         { return v_u8x16(0); }

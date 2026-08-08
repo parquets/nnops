@@ -84,8 +84,9 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
             const int64_t y_rs = output.row_stride_elems();
 
             int64_t rows_per_c8 = 1;
-            for (int64_t d = 2; d < rank - 1; ++d)
+            for (int64_t d = 2; d < rank - 1; ++d) {
                 rows_per_c8 *= X.shape(d);
+            }
 
             const auto process_row = [&](int64_t r) {
                 const int64_t c8 = (r / rows_per_c8) % c8_blocks;
@@ -95,16 +96,22 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
                     c8, pack, last_dim, attrs.add_to);
             };
 
-            if (ctx.cpu_parallel_for)
+            if (ctx.cpu_parallel_for) {
                 ctx.cpu_parallel_for(0, num_rows, process_row);
-            else
-                for (int64_t r = 0; r < num_rows; ++r) process_row(r);
+            }
+            else {
+                for (int64_t r = 0; r < num_rows; ++r) {
+                    process_row(r);
+                }
+            }
 
         } else {
             // ---- Planar layout path (NCHW, NCDHW) ----
             int64_t sample_size = 1;
             if (rank >= 2) {
-                for (int64_t i = 2; i < rank; ++i) sample_size *= X.shape(i);
+                for (int64_t i = 2; i < rank; ++i) {
+                    sample_size *= X.shape(i);
+                }
             }
 
             const int64_t x_n_stride = X.stride_elems(0);
@@ -133,10 +140,14 @@ void batch_norm_impl(const BatchNormAttributes& attrs,
                 }
             };
 
-            if (ctx.cpu_parallel_for)
+            if (ctx.cpu_parallel_for) {
                 ctx.cpu_parallel_for(0, N, compute_sample);
-            else
-                for (int64_t n = 0; n < N; ++n) compute_sample(n);
+            }
+            else {
+                for (int64_t n = 0; n < N; ++n) {
+                    compute_sample(n);
+                }
+            }
         }
 
     } else {

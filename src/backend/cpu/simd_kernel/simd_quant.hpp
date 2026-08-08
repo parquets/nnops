@@ -37,10 +37,12 @@ inline int32_t quant_int_max(DataType dt) { return (dt == DataType::s8) ? 127 : 
 inline void quant_write_int8(void* ptr, DataType dt, int64_t off, int32_t val) {
     int32_t lo = quant_int_min(dt), hi = quant_int_max(dt);
     val = std::max(lo, std::min(hi, val));
-    if (dt == DataType::s8)
+    if (dt == DataType::s8) {
         static_cast<int8_t*>(ptr)[off] = static_cast<int8_t>(val);
-    else
+    }
+    else {
         static_cast<uint8_t*>(ptr)[off] = static_cast<uint8_t>(val);
+    }
 }
 
 /// Quantize a v_f32x8 vector to int8 and write to output.
@@ -60,18 +62,22 @@ inline void quant_store_int8(v_f32x8 vr, void* y_row, int64_t off,
 
 /// Load 8 int8/uint8 values and widen to v_f32x8.
 inline v_f32x8 load_i8_to_f32(const void* p, bool in_is_i8) {
-    if (in_is_i8)
+    if (in_is_i8) {
         return v_cvt_s8_to_f32(static_cast<const int8_t*>(p));
-    else
+    }
+    else {
         return v_cvt_u8_to_f32(static_cast<const uint8_t*>(p));
+    }
 }
 
 /// Load 8 int8/uint8 values and widen to v_f16x8.
 inline v_f16x8 load_i8_to_f16(const void* p, bool in_is_i8) {
-    if (in_is_i8)
+    if (in_is_i8) {
         return v_cvt_s8_to_f16(static_cast<const int8_t*>(p));
-    else
+    }
+    else {
         return v_cvt_u8_to_f16(static_cast<const uint8_t*>(p));
+    }
 }
 
 // ============================================================
@@ -89,8 +95,9 @@ inline void quant_store_f32(half* dest, v_f32x8 vy) {
     alignas(32) float fbuf[8];
     v_store(fbuf, vy);
     half hbuf[8];
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         hbuf[i] = ::nnops::backend::cpu::float_to_half(fbuf[i]);
+    }
     v_store(dest, v_load(hbuf));  // SIMD store of 8 half values
 }
 
@@ -110,8 +117,9 @@ inline v_f32x8 quant_load_f32(const half* p) {
     half hbuf[8];
     v_store(hbuf, vh);
     float fbuf[8];
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 8; ++i) {
         fbuf[i] = ::nnops::backend::cpu::half_to_float(hbuf[i]);
+    }
     return v_load(fbuf);          // SIMD load of 8 float values
 }
 

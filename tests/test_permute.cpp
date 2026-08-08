@@ -156,8 +156,9 @@ NNOPS_TEST(permute_identity) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     NNOPS_EXPECT_EQ(descs[0].rank, 4);
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_EQ(descs[0].dims[i], shape[i]);
+    }
 
     std::vector<float> out_buf(in_vec.size());
     TensorView output = test::make_planar(descs[0], out_buf.data());
@@ -295,8 +296,9 @@ NNOPS_TEST(permute_last_two_swap_f16) {
     auto [in_vec, _] = test::make_random_tensor({B, M, K}, -1.0f, 1.0f, 999);
 
     std::vector<nnops::backend::cpu::half> in_half(B * M * K);
-    for (size_t i = 0; i < in_half.size(); ++i)
+    for (size_t i = 0; i < in_half.size(); ++i) {
         simd::s_store(&in_half[i], in_vec[i]);
+    }
 
     const int64_t in_shape[] = {B, M, K};
     TensorView input(in_shape, DataType::f16, in_half.data());
@@ -409,8 +411,9 @@ NNOPS_TEST(permute_random_f16) {
     auto [in_vec, _] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 555);
 
     std::vector<nnops::backend::cpu::half> in_half(M * K);
-    for (size_t i = 0; i < in_half.size(); ++i)
+    for (size_t i = 0; i < in_half.size(); ++i) {
         simd::s_store(&in_half[i], in_vec[i]);
+    }
 
     const int64_t in_shape[] = {M, K};
     TensorView input(in_shape, DataType::f16, in_half.data());

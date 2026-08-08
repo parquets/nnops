@@ -56,10 +56,14 @@ void reduce_packed_simd(const ReduceAttributes& attrs,
             x_ptr + r * x_rs, y_ptr + r * pack, D, pack, attrs.type, inv_D);
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_rows, process_row);
-    else
-        for (int64_t r = 0; r < num_rows; ++r) process_row(r);
+    }
+    else {
+        for (int64_t r = 0; r < num_rows; ++r) {
+            process_row(r);
+        }
+    }
 }
 
 // ============================================================
@@ -318,8 +322,11 @@ void reduce_impl(const ReduceAttributes& attrs,
 
         // Count spatial positions: product of all dims except C8 (axis=1)
         int64_t num_spatial = 1;
-        for (int64_t d = 0; d < rank; ++d)
-            if (d != 1) num_spatial *= input.shape(d);
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d != 1) {
+                num_spatial *= input.shape(d);
+            }
+        }
 
         const int64_t rank_out = output.rank();
         const bool keepdims = attrs.keepdims;
@@ -329,7 +336,9 @@ void reduce_impl(const ReduceAttributes& attrs,
             int64_t in_off = 0;
             int64_t rem = s;
             for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == 1) continue;
+                if (d == 1) {
+                    continue;
+                }
                 int64_t dim = input.shape(d);
                 in_off += (rem % dim) * input.stride_elems(d);
                 rem /= dim;
@@ -339,7 +348,9 @@ void reduce_impl(const ReduceAttributes& attrs,
             int64_t out_off = 0;
             rem = s;
             for (int64_t d = rank_out - 1; d >= 0; --d) {
-                if (keepdims && d == 1) continue;  // collapsed C8 dim
+                if (keepdims && d == 1) {
+                    continue; // collapsed C8 dim
+                }
                 int64_t dim = output.shape(d);
                 out_off += (rem % dim) * output.stride_elems(d);
                 rem /= dim;
@@ -350,10 +361,14 @@ void reduce_impl(const ReduceAttributes& attrs,
                 chan_stride, C8, pack, valid_lanes, attrs.type, inv_total);
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_spatial, process_pos);
-        else
-            for (int64_t i = 0; i < num_spatial; ++i) process_pos(i);
+        }
+        else {
+            for (int64_t i = 0; i < num_spatial; ++i) {
+                process_pos(i);
+            }
+        }
 
         return;
     }
@@ -369,8 +384,11 @@ void reduce_impl(const ReduceAttributes& attrs,
 
         // Count (outer, inner) positions excluding the reduce axis
         int64_t num_positions = 1;
-        for (int64_t d = 0; d < rank; ++d)
-            if (d != axis) num_positions *= input.shape(d);
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d != axis) {
+                num_positions *= input.shape(d);
+            }
+        }
 
         const int64_t rank_out = output.rank();
         const bool keepdims = attrs.keepdims;
@@ -380,7 +398,9 @@ void reduce_impl(const ReduceAttributes& attrs,
             int64_t in_off = 0;
             int64_t rem = s;
             for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == axis) continue;
+                if (d == axis) {
+                    continue;
+                }
                 int64_t dim = input.shape(d);
                 in_off += (rem % dim) * input.stride_elems(d);
                 rem /= dim;
@@ -390,7 +410,9 @@ void reduce_impl(const ReduceAttributes& attrs,
             int64_t out_off = 0;
             rem = s;
             for (int64_t d_out = rank_out - 1; d_out >= 0; --d_out) {
-                if (keepdims && d_out == axis) continue;
+                if (keepdims && d_out == axis) {
+                    continue;
+                }
                 int64_t dim = output.shape(d_out);
                 out_off += (rem % dim) * output.stride_elems(d_out);
                 rem /= dim;
@@ -401,10 +423,14 @@ void reduce_impl(const ReduceAttributes& attrs,
                 axis_stride, D, pack, attrs.type, inv_D);
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_positions, process_pos);
-        else
-            for (int64_t i = 0; i < num_positions; ++i) process_pos(i);
+        }
+        else {
+            for (int64_t i = 0; i < num_positions; ++i) {
+                process_pos(i);
+            }
+        }
 
         return;
     }

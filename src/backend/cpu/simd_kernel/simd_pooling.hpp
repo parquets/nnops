@@ -58,7 +58,9 @@ inline void maxpool_h4(
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) continue;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
             int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
@@ -73,7 +75,9 @@ inline void maxpool_h4(
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
                     int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) continue;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
                     int64_t w_off = iw * 8;
 
                     if (v0) { vacc0 = v_max(vacc0, v_load(input + d_off + ih0 * p.in_row_stride + w_off)); any0 = true; }
@@ -84,29 +88,45 @@ inline void maxpool_h4(
             }
         }
 
-        if (!any0) vacc0 = vzero;
-        if (!any1) vacc1 = vzero;
-        if (!any2) vacc2 = vzero;
-        if (!any3) vacc3 = vzero;
+        if (!any0) {
+            vacc0 = vzero;
+        }
+        if (!any1) {
+            vacc1 = vzero;
+        }
+        if (!any2) {
+            vacc2 = vzero;
+        }
+        if (!any3) {
+            vacc3 = vzero;
+        }
 
         if (p.oh + 0 < p.OH) {
             T* out0 = output + 0 * p.out_row_stride + ow * 8;
-            if (add_to) vacc0 = v_add(vacc0, v_load(out0));
+            if (add_to) {
+                vacc0 = v_add(vacc0, v_load(out0));
+            }
             v_store(out0, vacc0);
         }
         if (p.oh + 1 < p.OH) {
             T* out1 = output + 1 * p.out_row_stride + ow * 8;
-            if (add_to) vacc1 = v_add(vacc1, v_load(out1));
+            if (add_to) {
+                vacc1 = v_add(vacc1, v_load(out1));
+            }
             v_store(out1, vacc1);
         }
         if (p.oh + 2 < p.OH) {
             T* out2 = output + 2 * p.out_row_stride + ow * 8;
-            if (add_to) vacc2 = v_add(vacc2, v_load(out2));
+            if (add_to) {
+                vacc2 = v_add(vacc2, v_load(out2));
+            }
             v_store(out2, vacc2);
         }
         if (p.oh + 3 < p.OH) {
             T* out3 = output + 3 * p.out_row_stride + ow * 8;
-            if (add_to) vacc3 = v_add(vacc3, v_load(out3));
+            if (add_to) {
+                vacc3 = v_add(vacc3, v_load(out3));
+            }
             v_store(out3, vacc3);
         }
     }
@@ -128,26 +148,36 @@ inline void maxpool_h1(
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) continue;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
             int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) continue;
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
                     int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) continue;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
                     vacc = v_max(vacc, v_load(input + d_off + ih * p.in_row_stride + iw * 8));
                     any = true;
                 }
             }
         }
 
-        if (!any) vacc = vzero;
+        if (!any) {
+            vacc = vzero;
+        }
 
         T* out_r = output + ow * 8;
-        if (add_to) vacc = v_add(vacc, v_load(out_r));
+        if (add_to) {
+            vacc = v_add(vacc, v_load(out_r));
+        }
         v_store(out_r, vacc);
     }
 }
@@ -171,7 +201,9 @@ inline void avgpool_h4(
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) continue;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
             int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
@@ -186,7 +218,9 @@ inline void avgpool_h4(
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
                     int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) continue;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
                     int64_t w_off = iw * 8;
 
                     if (v0) { vacc0 = v_add(vacc0, v_load(input + d_off + ih0 * p.in_row_stride + w_off)); cnt0++; }
@@ -199,10 +233,18 @@ inline void avgpool_h4(
 
         // Apply scale: exclude_pad → divide by valid count; else use fixed scale
         if (p.exclude_pad) {
-            if (cnt0 > 0) vacc0 = v_mul(vacc0, v_set1(input, 1.0f / static_cast<float>(cnt0)));
-            if (cnt1 > 0) vacc1 = v_mul(vacc1, v_set1(input, 1.0f / static_cast<float>(cnt1)));
-            if (cnt2 > 0) vacc2 = v_mul(vacc2, v_set1(input, 1.0f / static_cast<float>(cnt2)));
-            if (cnt3 > 0) vacc3 = v_mul(vacc3, v_set1(input, 1.0f / static_cast<float>(cnt3)));
+            if (cnt0 > 0) {
+                vacc0 = v_mul(vacc0, v_set1(input, 1.0f / static_cast<float>(cnt0)));
+            }
+            if (cnt1 > 0) {
+                vacc1 = v_mul(vacc1, v_set1(input, 1.0f / static_cast<float>(cnt1)));
+            }
+            if (cnt2 > 0) {
+                vacc2 = v_mul(vacc2, v_set1(input, 1.0f / static_cast<float>(cnt2)));
+            }
+            if (cnt3 > 0) {
+                vacc3 = v_mul(vacc3, v_set1(input, 1.0f / static_cast<float>(cnt3)));
+            }
         } else {
             vacc0 = v_mul(vacc0, vscale);
             vacc1 = v_mul(vacc1, vscale);
@@ -212,22 +254,30 @@ inline void avgpool_h4(
 
         if (p.oh + 0 < p.OH) {
             T* out0 = output + 0 * p.out_row_stride + ow * 8;
-            if (add_to) vacc0 = v_add(vacc0, v_load(out0));
+            if (add_to) {
+                vacc0 = v_add(vacc0, v_load(out0));
+            }
             v_store(out0, vacc0);
         }
         if (p.oh + 1 < p.OH) {
             T* out1 = output + 1 * p.out_row_stride + ow * 8;
-            if (add_to) vacc1 = v_add(vacc1, v_load(out1));
+            if (add_to) {
+                vacc1 = v_add(vacc1, v_load(out1));
+            }
             v_store(out1, vacc1);
         }
         if (p.oh + 2 < p.OH) {
             T* out2 = output + 2 * p.out_row_stride + ow * 8;
-            if (add_to) vacc2 = v_add(vacc2, v_load(out2));
+            if (add_to) {
+                vacc2 = v_add(vacc2, v_load(out2));
+            }
             v_store(out2, vacc2);
         }
         if (p.oh + 3 < p.OH) {
             T* out3 = output + 3 * p.out_row_stride + ow * 8;
-            if (add_to) vacc3 = v_add(vacc3, v_load(out3));
+            if (add_to) {
+                vacc3 = v_add(vacc3, v_load(out3));
+            }
             v_store(out3, vacc3);
         }
     }
@@ -248,16 +298,22 @@ inline void avgpool_h1(
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) continue;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
             int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) continue;
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
                     int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) continue;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
                     vacc = v_add(vacc, v_load(input + d_off + ih * p.in_row_stride + iw * 8));
                     valid_count++;
                 }
@@ -271,7 +327,9 @@ inline void avgpool_h1(
         }
 
         T* out_r = output + ow * 8;
-        if (add_to) vacc = v_add(vacc, v_load(out_r));
+        if (add_to) {
+            vacc = v_add(vacc, v_load(out_r));
+        }
         v_store(out_r, vacc);
     }
 }

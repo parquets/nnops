@@ -34,7 +34,9 @@ TensorView make_cache(const std::vector<int64_t>& shape,
                       DataType cache_dtype)
 {
     int64_t total = 1;
-    for (auto d : shape) total *= d;
+    for (auto d : shape) {
+        total *= d;
+    }
 
     switch (cache_dtype) {
     case DataType::f32:
@@ -46,8 +48,9 @@ TensorView make_cache(const std::vector<int64_t>& shape,
         storage.resize(total * sizeof(uint16_t));
         {
             auto* p = reinterpret_cast<uint16_t*>(storage.data());
-            for (int64_t i = 0; i < total; ++i)
+            for (int64_t i = 0; i < total; ++i) {
                 p[i] = float_to_half(f32_data[i]).bits;
+            }
         }
         return TensorView(shape, DataType::f16, storage.data(), TensorLayout::NCHW);
 
@@ -55,8 +58,9 @@ TensorView make_cache(const std::vector<int64_t>& shape,
         storage.resize(total * sizeof(uint16_t));
         {
             auto* p = reinterpret_cast<uint16_t*>(storage.data());
-            for (int64_t i = 0; i < total; ++i)
+            for (int64_t i = 0; i < total; ++i) {
                 p[i] = float_to_bf16(f32_data[i]);
+            }
         }
         return TensorView(shape, DataType::bf16, storage.data(), TensorLayout::NCHW);
 
@@ -72,7 +76,9 @@ TensorView make_i8_cache(const std::vector<int64_t>& shape,
                           float scale, int32_t zp)
 {
     int64_t total = 1;
-    for (auto d : shape) total *= d;
+    for (auto d : shape) {
+        total *= d;
+    }
 
     storage.resize(total * sizeof(int8_t));
     auto* p = reinterpret_cast<int8_t*>(storage.data());
@@ -189,8 +195,9 @@ NNOPS_TEST(causal_attention_two_steps_f32) {
         TensorView outs[] = {output, k_cache, v_cache};
         op->compute(outs, ins, {}, workspace.data());
     }
-    for (int64_t d = 0; d < D; ++d)
+    for (int64_t d = 0; d < D; ++d) {
         NNOPS_EXPECT_NEAR(out[d], v1_v[d], 1e-5f);
+    }
 
     // Step 2
     pos_buf = 1; len_buf = 1;
@@ -284,8 +291,12 @@ NNOPS_TEST(causal_attention_f16_cache) {
     auto k_cache_f32 = make_f32tv(cache_sh, kc_f32);
     std::vector<float> vc_f32;
     auto v_cache_f32 = make_f32tv(cache_sh, vc_f32);
-    for (auto& x : kc_f32) x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
-    for (auto& x : vc_f32) x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+    for (auto& x : kc_f32) {
+        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+    }
+    for (auto& x : vc_f32) {
+        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+    }
 
     std::vector<char> kc_f16_st, vc_f16_st;
     auto k_cache_f16 = make_cache(cache_sh, kc_f32, kc_f16_st, DataType::f16);
@@ -516,8 +527,9 @@ NNOPS_TEST(causal_attention_auto_scale) {
         op_e->compute(outs, ins, {}, workspace.data());
     }
 
-    for (size_t i = 0; i < out1.size(); ++i)
+    for (size_t i = 0; i < out1.size(); ++i) {
         NNOPS_EXPECT_NEAR(out1[i], out2[i], 1e-5f);
+    }
 }
 
 // ============================================================
@@ -537,8 +549,12 @@ NNOPS_TEST(causal_attention_int8_cache) {
     auto kc_f32_tv = make_f32tv(cache_sh, kc_f32);
     std::vector<float> vc_f32;
     auto vc_f32_tv = make_f32tv(cache_sh, vc_f32);
-    for (auto& x : kc_f32) x = static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f;
-    for (auto& x : vc_f32) x = static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f;
+    for (auto& x : kc_f32) {
+        x = static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f;
+    }
+    for (auto& x : vc_f32) {
+        x = static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f;
+    }
 
     float scale = 0.01f;
     int32_t zp = 0;
@@ -574,8 +590,9 @@ NNOPS_TEST(causal_attention_int8_cache) {
         op->compute(outs, ins, {}, workspace.data());
     }
 
-    for (size_t i = 0; i < out_f32.size(); ++i)
+    for (size_t i = 0; i < out_f32.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_i8[i], out_f32[i], 5e-2f);
+    }
 }
 
 // ============================================================
@@ -595,8 +612,12 @@ NNOPS_TEST(causal_attention_bf16_cache) {
     auto kc_f32_tv = make_f32tv(cache_sh, kc_f32);
     std::vector<float> vc_f32;
     auto vc_f32_tv = make_f32tv(cache_sh, vc_f32);
-    for (auto& x : kc_f32) x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
-    for (auto& x : vc_f32) x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+    for (auto& x : kc_f32) {
+        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+    }
+    for (auto& x : vc_f32) {
+        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+    }
 
     std::vector<char> kc_bf16_st, vc_bf16_st;
     auto kc_bf16 = make_cache(cache_sh, kc_f32, kc_bf16_st, DataType::bf16);
@@ -630,8 +651,9 @@ NNOPS_TEST(causal_attention_bf16_cache) {
         op->compute(outs, ins, {}, workspace.data());
     }
 
-    for (size_t i = 0; i < out_f32.size(); ++i)
+    for (size_t i = 0; i < out_f32.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_bf16[i], out_f32[i], 5e-2f);
+    }
 }
 
 // ============================================================
@@ -692,7 +714,9 @@ NNOPS_TEST(causal_attention_add_to) {
     auto o_pure = make_f32tv(qk_sh, out_pure);
 
     // Pre-fill o2 with initial values
-    for (auto& x : out2) x = 0.5f;
+    for (auto& x : out2) {
+        x = 0.5f;
+    }
 
     int64_t pos_buf = 0, len_buf = 0;
     auto cache_pos = make_scalar_i64(pos_buf);
@@ -724,8 +748,9 @@ NNOPS_TEST(causal_attention_add_to) {
         op_add->compute(outs, ins, {}, workspace.data());
     }
 
-    for (size_t i = 0; i < out1.size(); ++i)
+    for (size_t i = 0; i < out1.size(); ++i) {
         NNOPS_EXPECT_NEAR(out2[i], 0.5f + out_pure[i], 1e-5f);
+    }
 }
 
 // ============================================================

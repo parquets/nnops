@@ -99,8 +99,9 @@ NNOPS_TEST(embed_random_f32) {
 
     // Random indices in [0, V-1]
     std::vector<int64_t> idx_vec(N);
-    for (int64_t i = 0; i < N; ++i)
+    for (int64_t i = 0; i < N; ++i) {
         idx_vec[i] = static_cast<int64_t>(i * 7 % V);  // deterministic spread
+    }
     const int64_t idx_shape[] = {N};
     TensorView indices(idx_shape, DataType::s64, idx_vec.data());
 
@@ -134,14 +135,17 @@ NNOPS_TEST(embed_random_f16) {
 
     // Convert weight to f16
     std::vector<nnops::backend::cpu::half> w_half(static_cast<size_t>(V * D));
-    for (size_t i = 0; i < w_half.size(); ++i)
+    for (size_t i = 0; i < w_half.size(); ++i) {
         simd::s_store(&w_half[i], w_vec[i]);
+    }
 
     const int64_t w_shape[] = {V, D};
     TensorView weight(w_shape, DataType::f16, w_half.data());
 
     std::vector<int64_t> idx_vec(N);
-    for (int64_t i = 0; i < N; ++i) idx_vec[i] = static_cast<int64_t>(i % V);
+    for (int64_t i = 0; i < N; ++i) {
+        idx_vec[i] = static_cast<int64_t>(i % V);
+    }
     const int64_t idx_shape[] = {N};
     TensorView indices(idx_shape, DataType::s64, idx_vec.data());
 

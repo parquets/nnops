@@ -30,14 +30,17 @@ inline void softmax_process_packed_row(
     auto v_inv_T = v_set1(x_row, inv_T);
 
     auto v_max_vec = v_set1(x_row, -std::numeric_limits<float>::infinity());
-    for (int64_t w = 0; w < D; ++w)
+    for (int64_t w = 0; w < D; ++w) {
         v_max_vec = v_max(v_max_vec, v_load(x_row + w * pack));
+    }
 
     auto v_sum_vec = v_zero(x_row);
     auto v_neg_max = v_neg(v_max_vec);
     for (int64_t w = 0; w < D; ++w) {
         auto v = v_add(v_load(x_row + w * pack), v_neg_max);
-        if (inv_T != 1.0f) v = v_mul(v, v_inv_T);
+        if (inv_T != 1.0f) {
+            v = v_mul(v, v_inv_T);
+        }
         v = v_exp(v);
         if (!log_softmax) { v_store(y_row + w * pack, v); }
         v_sum_vec = v_add(v_sum_vec, v);
@@ -47,13 +50,15 @@ inline void softmax_process_packed_row(
         // log_softmax = (x - max) / T - log(sum)
         //             = x * inv_T - max * inv_T - log(sum)
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
-        for (int64_t w = 0; w < D; ++w)
+        for (int64_t w = 0; w < D; ++w) {
             v_store(y_row + w * pack,
                     v_add(v_mul(v_load(x_row + w * pack), v_inv_T), v_bias));
+        }
     } else {
         auto v_inv = v_div(v_set1(x_row, 1.0f), v_sum_vec);
-        for (int64_t w = 0; w < D; ++w)
+        for (int64_t w = 0; w < D; ++w) {
             v_store(y_row + w * pack, v_mul(v_load(y_row + w * pack), v_inv));
+        }
     }
 }
 
@@ -78,7 +83,9 @@ inline void softmax_process_packed_col(
     auto v_neg_max = v_neg(v_max_vec);
     for (int64_t h = 0; h < D; ++h) {
         auto v = v_add(v_load(x_col + h * x_pitch), v_neg_max);
-        if (inv_T != 1.0f) v = v_mul(v, v_inv_T);
+        if (inv_T != 1.0f) {
+            v = v_mul(v, v_inv_T);
+        }
         v = v_exp(v);
         if (!log_softmax) { v_store(y_col + h * y_pitch, v); }
         v_sum_vec = v_add(v_sum_vec, v);
@@ -132,8 +139,9 @@ inline void softmax_process_packed_channel(
     // Pass 1 — per-lane max (temperature doesn't affect max)
     // ============================================================
     auto v_max_vec = v_set1(x_chan, -std::numeric_limits<float>::infinity());
-    for (int64_t c = 0; c < full_blocks; ++c)
+    for (int64_t c = 0; c < full_blocks; ++c) {
         v_max_vec = v_max(v_max_vec, v_load(x_chan + c * x_chan_stride));
+    }
 
     if (valid_lanes < pack) {
         T tmp[16];
@@ -141,7 +149,9 @@ inline void softmax_process_packed_channel(
         const T* last = x_chan + (D - 1) * x_chan_stride;
         for (int64_t l = 0; l < valid_lanes; ++l) {
             float v = s_load(&last[l]);
-            if (v > s_load(&tmp[l])) s_store(&tmp[l], v);
+            if (v > s_load(&tmp[l])) {
+                s_store(&tmp[l], v);
+            }
         }
         v_max_vec = v_load(tmp);
     }
@@ -154,7 +164,9 @@ inline void softmax_process_packed_channel(
 
     for (int64_t c = 0; c < full_blocks; ++c) {
         auto v = v_add(v_load(x_chan + c * x_chan_stride), v_neg_max);
-        if (inv_T != 1.0f) v = v_mul(v, v_inv_T);
+        if (inv_T != 1.0f) {
+            v = v_mul(v, v_inv_T);
+        }
         v = v_exp(v);
         if (!log_softmax) { v_store(y_chan + c * y_chan_stride, v); }
         v_sum_vec = v_add(v_sum_vec, v);
@@ -184,11 +196,12 @@ inline void softmax_process_packed_channel(
         // log_softmax = (x - max) / T - log(sum)
         //             = x * inv_T - max * inv_T - log(sum)
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
-        for (int64_t c = 0; c < full_blocks; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c) {
             v_store(y_chan + c * y_chan_stride,
                     v_add(v_mul(v_load(x_chan + c * x_chan_stride), v_inv_T), v_bias));
 
         // Partial last block
+        }
         if (valid_lanes < pack) {
             const T* last_x = x_chan + (D - 1) * x_chan_stride;
             T*       last_y = y_chan + (D - 1) * y_chan_stride;
@@ -200,12 +213,13 @@ inline void softmax_process_packed_channel(
         }
     } else {
         auto v_inv = v_div(v_set1(x_chan, 1.0f), v_sum_vec);
-        for (int64_t c = 0; c < full_blocks; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c) {
             v_store(y_chan + c * y_chan_stride,
                     v_mul(v_load(y_chan + c * y_chan_stride), v_inv));
 
         // Partial last block: exp values were already computed with temperature
         // in pass 2, just multiply by inverse sum.
+        }
         if (valid_lanes < pack) {
             T* last_y = y_chan + (D - 1) * y_chan_stride;
             for (int64_t l = 0; l < valid_lanes; ++l) {
@@ -232,8 +246,9 @@ inline void softmax_process_standard_row(
     float max_val = -std::numeric_limits<float>::infinity();
     {
         auto v_max_val = v_set1(x, max_val);
-        for (; i + L <= D; i += L)
+        for (; i + L <= D; i += L) {
             v_max_val = v_max(v_max_val, v_load(x + i));
+        }
         max_val = v_reduce_max(v_max_val);
     }
     for (; i < D; ++i) {
@@ -254,7 +269,9 @@ inline void softmax_process_standard_row(
         auto v_inv_T = v_set1(x, inv_T);
         for (; i + L <= D; i += L) {
             auto v = v_add(v_load(x + i), v_neg_max);
-            if (inv_T != 1.0f) v = v_mul(v, v_inv_T);
+            if (inv_T != 1.0f) {
+                v = v_mul(v, v_inv_T);
+            }
             v = v_exp(v);
             if (store_exp) { v_store(y + i, v); }
             v_sum = v_add(v_sum, v);
@@ -274,22 +291,28 @@ inline void softmax_process_standard_row(
         auto v_bias = v_set1(x, bias);
         if (inv_T != 1.0f) {
             auto v_inv_T = v_set1(x, inv_T);
-            for (; i + L <= D; i += L)
+            for (; i + L <= D; i += L) {
                 v_store(y + i, v_add(v_mul(v_load(x + i), v_inv_T), v_bias));
-            for (; i < D; ++i)
+            }
+            for (; i < D; ++i) {
                 s_store(&y[i], s_load(&x[i]) * inv_T + bias);
+            }
         } else {
-            for (; i + L <= D; i += L)
+            for (; i + L <= D; i += L) {
                 v_store(y + i, v_add(v_load(x + i), v_bias));
-            for (; i < D; ++i)
+            }
+            for (; i < D; ++i) {
                 s_store(&y[i], s_load(&x[i]) + bias);
+            }
         }
     } else {
         auto v_inv = v_set1(x, 1.0f / sum_exp);
-        for (; i + L <= D; i += L)
+        for (; i + L <= D; i += L) {
             v_store(y + i, v_mul(v_load(y + i), v_inv));
-        for (; i < D; ++i)
+        }
+        for (; i < D; ++i) {
             s_store(&y[i], s_load(&y[i]) / sum_exp);
+        }
     }
 }
 

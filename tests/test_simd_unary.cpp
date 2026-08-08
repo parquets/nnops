@@ -19,7 +19,9 @@ static std::mt19937 rng(42);
 static std::vector<float> random_f32(int64_t n, float lo = -5.0f, float hi = 5.0f) {
     std::vector<float> v(n);
     std::uniform_real_distribution<float> dist(lo, hi);
-    for (int64_t i = 0; i < n; ++i) v[i] = dist(rng);
+    for (int64_t i = 0; i < n; ++i) {
+        v[i] = dist(rng);
+    }
     return v;
 }
 
@@ -36,7 +38,9 @@ static void verify_kernel(const char* test_name,
 
     std::vector<float> out(out_size, add_to ? 0.1f : 0.0f);
     std::vector<float> expected(out_size);
-    for (int64_t i = 0; i < out_size; ++i) expected[i] = out[i];
+    for (int64_t i = 0; i < out_size; ++i) {
+        expected[i] = out[i];
+    }
 
     // Reference: scalar row-by-row
     for (int64_t r = 0; r < m; ++r) {
@@ -44,10 +48,12 @@ static void verify_kernel(const char* test_name,
         float*       out_row = expected.data() + r * out_pitch;
         for (int64_t j = 0; j < n; ++j) {
             float val = ref_fn(in_row[j]);
-            if (add_to)
+            if (add_to) {
                 out_row[j] += val;
-            else
+            }
+            else {
                 out_row[j] = val;
+            }
         }
     }
 

@@ -169,17 +169,23 @@ void dwconv_impl_3d_ref(const DepthwiseConvAttributes& attrs,
                     for (int64_t kd = 0; kd < KD; ++kd) {
                         const int64_t id = static_cast<int64_t>(od) * SD
                                          + static_cast<int64_t>(kd) * DD - PD;
-                        if (id < 0 || id >= ID) continue;
+                        if (id < 0 || id >= ID) {
+                            continue;
+                        }
 
                         for (int64_t kh = 0; kh < KH; ++kh) {
                             const int64_t ih = static_cast<int64_t>(oh) * SH
                                              + static_cast<int64_t>(kh) * DH - PH;
-                            if (ih < 0 || ih >= IH) continue;
+                            if (ih < 0 || ih >= IH) {
+                                continue;
+                            }
 
                             for (int64_t kw = 0; kw < KW; ++kw) {
                                 const int64_t iw = static_cast<int64_t>(ow) * SW
                                                  + static_cast<int64_t>(kw) * DW - PW;
-                                if (iw < 0 || iw >= IW) continue;
+                                if (iw < 0 || iw >= IW) {
+                                    continue;
+                                }
 
                                 const int64_t in_idx =
                                     ((n * C + c) * ID + id) * in_d_stride
@@ -243,16 +249,20 @@ void depthwise_conv_ref(const DepthwiseConvAttributes& attrs,
     const auto dtype = input.data_type();
     switch (dtype) {
     case DataType::f32:
-        if (srank == 3)
+        if (srank == 3) {
             dwconv_impl_3d_ref<float>(attrs, output, inputs, ctx);
-        else
+        }
+        else {
             dwconv_impl_2d_ref<float>(attrs, output, inputs, ctx);
+        }
         return;
     case DataType::f16:
-        if (srank == 3)
+        if (srank == 3) {
             dwconv_impl_3d_ref<half>(attrs, output, inputs, ctx);
-        else
+        }
+        else {
             dwconv_impl_2d_ref<half>(attrs, output, inputs, ctx);
+        }
         return;
     default:
         NNOPS_ASSERT(!"depthwise_conv_ref: unsupported data type (only f32 and f16)");

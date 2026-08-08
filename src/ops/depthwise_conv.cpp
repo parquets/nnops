@@ -130,7 +130,9 @@ void prepack_dwconv_weight_2d(const TensorView& weight_nchw,
                 T tmp[8] = {};
                 for (int64_t lane = 0; lane < 8; ++lane) {
                     int64_t c = c_base + lane;
-                    if (c < C) tmp[lane] = src[c * ch_stride + kh * KW + kw];
+                    if (c < C) {
+                        tmp[lane] = src[c * ch_stride + kh * KW + kw];
+                    }
                 }
                 v_store(&dst[(c8 * KH * KW + kh * KW + kw) * 8], v_load(tmp));
             }
@@ -183,7 +185,9 @@ void prepack_dwconv_weight_3d(const TensorView& weight_ncdhw,
                     T tmp[8] = {};
                     for (int64_t lane = 0; lane < 8; ++lane) {
                         int64_t c = c_base + lane;
-                        if (c < C) tmp[lane] = src[c * ch_stride + kd * KH * KW + kh * KW + kw];
+                        if (c < C) {
+                            tmp[lane] = src[c * ch_stride + kd * KH * KW + kh * KW + kw];
+                        }
                     }
                     v_store(&dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw) * 8], v_load(tmp));
                 }
@@ -212,8 +216,9 @@ void prepack_dwconv_bias_impl(const TensorView& bias_nchw,
         } else {
             // Partial C8: scalar fallback
             T tmp[8] = {};
-            for (int64_t lane = 0; lane < valid; ++lane)
+            for (int64_t lane = 0; lane < valid; ++lane) {
                 tmp[lane] = src[c_base + lane];
+            }
             v_store(&dst[c8 * 8], v_load(tmp));
         }
     }
@@ -225,16 +230,20 @@ void prepack_dwconv_weight(const TensorView& weight,
 {
     switch (weight.data_type()) {
     case DataType::f32:
-        if (srank == 3)
+        if (srank == 3) {
             prepack_dwconv_weight_3d<float>(weight, packed_out);
-        else
+        }
+        else {
             prepack_dwconv_weight_2d<float>(weight, packed_out);
+        }
         return;
     case DataType::f16:
-        if (srank == 3)
+        if (srank == 3) {
             prepack_dwconv_weight_3d<backend::cpu::half>(weight, packed_out);
-        else
+        }
+        else {
             prepack_dwconv_weight_2d<backend::cpu::half>(weight, packed_out);
+        }
         return;
     default:
         NNOPS_ASSERT(!"prepack_dwconv_weight: unsupported dtype");

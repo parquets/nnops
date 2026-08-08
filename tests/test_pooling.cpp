@@ -79,7 +79,9 @@ static void test_nchwc8_vs_nchw(
     const std::vector<int64_t> oshape_ref = {N, C, OH, OW};
     TensorView out_nchw(oshape_ref, DataType::f32, ref_out.data(), TensorLayout::NCHW);
     if (attrs.add_to) {
-        for (auto& v : ref_out) v = 1.0f;
+        for (auto& v : ref_out) {
+            v = 1.0f;
+        }
     }
     {
         ComputeContext ctx;
@@ -111,8 +113,9 @@ static void test_nchwc8_vs_nchw(
             int64_t row_elems = out_c8.row_stride_elems();
             for (int64_t r = 0; r < rows; ++r) {
                 float* row = out_c8.ptr<float>(r);
-                for (int64_t e = 0; e < row_elems; ++e)
+                for (int64_t e = 0; e < row_elems; ++e) {
                     row[e] = 1.0f;
+                }
             }
         }
 
@@ -556,7 +559,9 @@ NNOPS_TEST(pooling_3d_max_basic) {
     // 1x1x2x4x4 input, 2x2x2 kernel, stride=2, pad=0 → 1x1x1x2x2
     const int64_t shape[] = {1, 1, 2, 4, 4};
     std::vector<float> in_buf(2 * 4 * 4);
-    for (int i = 0; i < 32; ++i) in_buf[i] = static_cast<float>(i + 1);
+    for (int i = 0; i < 32; ++i) {
+        in_buf[i] = static_cast<float>(i + 1);
+    }
     TensorView in_ncdhw(shape, DataType::f32, in_buf.data(), TensorLayout::NCDHW);
 
     PoolingAttributes attrs;

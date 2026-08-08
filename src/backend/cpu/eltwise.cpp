@@ -67,10 +67,14 @@ void eltwise_impl(const EltwiseAttributes& attrs,
                    o_ptr + r * o_row_stride,
                    m, last_dim, a_row_stride, b_row_stride, o_row_stride, add_to);
         };
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_tiles, body);
-        else
-            for (int64_t t = 0; t < num_tiles; ++t) body(t);
+        }
+        else {
+            for (int64_t t = 0; t < num_tiles; ++t) {
+                body(t);
+            }
+        }
     };
 
     // Dispatch to the appropriate tiled_eltwise kernel

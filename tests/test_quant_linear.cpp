@@ -354,7 +354,9 @@ NNOPS_TEST(dequantize_linear_random) {
 
     const int64_t shape[] = {4, 8};
     std::vector<int8_t> in_buf(32);
-    for (auto& v : in_buf) v = static_cast<int8_t>(dist(rng));
+    for (auto& v : in_buf) {
+        v = static_cast<int8_t>(dist(rng));
+    }
     TensorView input(shape, DataType::s8, in_buf.data());
 
     QuantLinearAttributes attrs;

@@ -191,8 +191,9 @@ inline void store_f32(void* ptr, int64_t offset, float val, DataType dtype, bool
 /// Softmax over a row, in-place, with max-subtraction for numerical stability.
 inline void softmax_row(float* row, int64_t n, float inv_T) {
     float max_val = -std::numeric_limits<float>::infinity();
-    for (int64_t i = 0; i < n; ++i)
+    for (int64_t i = 0; i < n; ++i) {
         max_val = std::max(max_val, row[i]);
+    }
 
     float sum = 0.0f;
     for (int64_t i = 0; i < n; ++i) {
@@ -201,8 +202,9 @@ inline void softmax_row(float* row, int64_t n, float inv_T) {
     }
 
     float inv_sum = 1.0f / sum;
-    for (int64_t i = 0; i < n; ++i)
+    for (int64_t i = 0; i < n; ++i) {
         row[i] *= inv_sum;
+    }
 }
 
 }  // anonymous namespace
@@ -346,7 +348,9 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
                 // Past cache values
                 for (int64_t j = 0; j < cache_len; ++j) {
                     float s = scores[i * Sk + j];
-                    if (std::isinf(s) || std::isnan(s)) continue;
+                    if (std::isinf(s) || std::isnan(s)) {
+                        continue;
+                    }
                     int64_t phys_block = 0;
                     int64_t v_row_off = cache_row_offset(b, h, j, V_cache,
                                                           attrs.block_size, block_table,
@@ -358,7 +362,9 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
                 // Current chunk values
                 for (int64_t j = 0; j < Sq; ++j) {
                     float s = scores[i * Sk + cache_len + j];
-                    if (std::isinf(s) || std::isnan(s)) continue;
+                    if (std::isinf(s) || std::isnan(s)) {
+                        continue;
+                    }
                     sum += s * load_f32(vn_ptr, comp_offset(V_new, b, h, j, d, vn_row_stride), comp_dtype);
                 }
 

@@ -537,7 +537,9 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
     const int64_t gshape[] = {1, 2, 2, 2, 3};
 
     std::vector<float> in_buf(8);
-    for (int i = 0; i < 8; ++i) in_buf[i] = static_cast<float>(i + 1);
+    for (int i = 0; i < 8; ++i) {
+        in_buf[i] = static_cast<float>(i + 1);
+    }
 
     TensorView in_ncdhw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCDHW);
 
@@ -715,8 +717,9 @@ NNOPS_TEST(grid_sample_add_to) {
         int64_t row_elems = out_c8.row_stride_elems();
         for (int64_t r = 0; r < rows; ++r) {
             float* row = out_c8.ptr<float>(r);
-            for (int64_t e = 0; e < row_elems; ++e)
+            for (int64_t e = 0; e < row_elems; ++e) {
                 row[e] = 0.5f;
+            }
         }
 
         const TensorView gs_ins[] = {in_c8, grid};

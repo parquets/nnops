@@ -631,18 +631,21 @@ NNOPS_TEST(simd_scalar_i8x16_load_store) {
     scal::v_s8x16 v = scal::v_load_s8x16(in);
     scal::v_store(out, v);
 
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(out[i], in[i]);
+    }
 }
 
 NNOPS_TEST(simd_scalar_i8x16_set1_zero) {
     scal::v_s8x16 z = scal::v_zero_s8x16();
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(z[i], 0);
+    }
 
     scal::v_s8x16 s = scal::v_set1_s8x16(42);
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(s[i], 42);
+    }
 }
 
 NNOPS_TEST(simd_scalar_u8x16_load_store) {
@@ -652,18 +655,21 @@ NNOPS_TEST(simd_scalar_u8x16_load_store) {
     scal::v_u8x16 v = scal::v_load_u8x16(in);
     scal::v_store(out, v);
 
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(out[i], in[i]);
+    }
 }
 
 NNOPS_TEST(simd_scalar_u8x16_set1_zero) {
     scal::v_u8x16 z = scal::v_zero_u8x16();
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(z[i], 0u);
+    }
 
     scal::v_u8x16 s = scal::v_set1_u8x16(200);
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(s[i], 200u);
+    }
 }
 
 // ============================================================
@@ -672,7 +678,9 @@ NNOPS_TEST(simd_scalar_u8x16_set1_zero) {
 
 NNOPS_TEST(simd_platform_i8x16_matches_scalar) {
     int8_t in[16];
-    for (int i = 0; i < 16; ++i) in[i] = static_cast<int8_t>((i - 4) * 7);
+    for (int i = 0; i < 16; ++i) {
+        in[i] = static_cast<int8_t>((i - 4) * 7);
+    }
 
     v_s8x16 pv = v_load_s8x16(in);
     scal::v_s8x16 sv = scal::v_load_s8x16(in);
@@ -681,13 +689,16 @@ NNOPS_TEST(simd_platform_i8x16_matches_scalar) {
     v_store(plat, pv);
     scal::v_store(scal_out, sv);
 
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(plat[i], scal_out[i]);
+    }
 }
 
 NNOPS_TEST(simd_platform_u8x16_matches_scalar) {
     uint8_t in[16];
-    for (int i = 0; i < 16; ++i) in[i] = static_cast<uint8_t>(i * 17);
+    for (int i = 0; i < 16; ++i) {
+        in[i] = static_cast<uint8_t>(i * 17);
+    }
 
     v_u8x16 pv = v_load_u8x16(in);
     scal::v_u8x16 sv = scal::v_load_u8x16(in);
@@ -696,8 +707,9 @@ NNOPS_TEST(simd_platform_u8x16_matches_scalar) {
     v_store(plat, pv);
     scal::v_store(scal_out, sv);
 
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(plat[i], scal_out[i]);
+    }
 }
 
 NNOPS_TEST(simd_platform_i8x16_zero_set1_matches_scalar) {
@@ -706,16 +718,18 @@ NNOPS_TEST(simd_platform_i8x16_zero_set1_matches_scalar) {
     int8_t pz_out[16], sz_out[16];
     v_store(pz_out, pz);
     scal::v_store(sz_out, sz);
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(pz_out[i], sz_out[i]);
+    }
 
     v_s8x16 ps = v_set1_s8x16(-7);
     scal::v_s8x16 ss = scal::v_set1_s8x16(-7);
     int8_t ps_out[16], ss_out[16];
     v_store(ps_out, ps);
     scal::v_store(ss_out, ss);
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 16; ++i) {
         NNOPS_EXPECT_EQ(ps_out[i], ss_out[i]);
+    }
 }
 
 // ============================================================
@@ -724,7 +738,9 @@ NNOPS_TEST(simd_platform_i8x16_zero_set1_matches_scalar) {
 
 NNOPS_TEST(simd_generic_i8x16_load_zero_set1) {
     int8_t in[16];
-    for (int i = 0; i < 16; ++i) in[i] = static_cast<int8_t>(i - 8);
+    for (int i = 0; i < 16; ++i) {
+        in[i] = static_cast<int8_t>(i - 8);
+    }
 
     auto v  = v_load(in);
     auto vz = v_zero(in);
@@ -735,14 +751,22 @@ NNOPS_TEST(simd_generic_i8x16_load_zero_set1) {
     v_store(zbuf, vz);
     v_store(sbuf, vs);
 
-    for (int i = 0; i < 16; ++i) NNOPS_EXPECT_EQ(buf[i], in[i]);
-    for (int i = 0; i < 16; ++i) NNOPS_EXPECT_EQ(zbuf[i], 0);
-    for (int i = 0; i < 16; ++i) NNOPS_EXPECT_EQ(sbuf[i], 55);
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_EQ(buf[i], in[i]);
+    }
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_EQ(zbuf[i], 0);
+    }
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_EQ(sbuf[i], 55);
+    }
 }
 
 NNOPS_TEST(simd_generic_u8x16_load_zero_set1) {
     uint8_t in[16];
-    for (int i = 0; i < 16; ++i) in[i] = static_cast<uint8_t>(i * 16);
+    for (int i = 0; i < 16; ++i) {
+        in[i] = static_cast<uint8_t>(i * 16);
+    }
 
     auto v  = v_load(in);
     auto vz = v_zero(in);
@@ -753,7 +777,13 @@ NNOPS_TEST(simd_generic_u8x16_load_zero_set1) {
     v_store(zbuf, vz);
     v_store(sbuf, vs);
 
-    for (int i = 0; i < 16; ++i) NNOPS_EXPECT_EQ(buf[i], in[i]);
-    for (int i = 0; i < 16; ++i) NNOPS_EXPECT_EQ(zbuf[i], 0u);
-    for (int i = 0; i < 16; ++i) NNOPS_EXPECT_EQ(sbuf[i], 128u);
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_EQ(buf[i], in[i]);
+    }
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_EQ(zbuf[i], 0u);
+    }
+    for (int i = 0; i < 16; ++i) {
+        NNOPS_EXPECT_EQ(sbuf[i], 128u);
+    }
 }

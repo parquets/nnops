@@ -121,9 +121,15 @@ public:
     }
 
     void destroy_buffer(Buffer& buf) {
-        if (buf.mapped) vkUnmapMemory(device_, buf.memory);
-        if (buf.buffer) vkDestroyBuffer(device_, buf.buffer, nullptr);
-        if (buf.memory) vkFreeMemory(device_, buf.memory, nullptr);
+        if (buf.mapped) {
+            vkUnmapMemory(device_, buf.memory);
+        }
+        if (buf.buffer) {
+            vkDestroyBuffer(device_, buf.buffer, nullptr);
+        }
+        if (buf.memory) {
+            vkFreeMemory(device_, buf.memory, nullptr);
+        }
         buf = {};
     }
 
@@ -207,7 +213,9 @@ private:
     void pick_physical_device() {
         uint32_t count = 0;
         vkEnumeratePhysicalDevices(instance_, &count, nullptr);
-        if (count == 0) throw std::runtime_error("No Vulkan physical devices");
+        if (count == 0) {
+            throw std::runtime_error("No Vulkan physical devices");
+        }
         std::vector<VkPhysicalDevice> devices(count);
         vkEnumeratePhysicalDevices(instance_, &count, devices.data());
 

@@ -44,7 +44,9 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
 
     const int64_t rank = X.rank();
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) {
+        axis += rank;
+    }
 
     const int64_t D = X.shape(axis);
     const bool is_per_channel = (scale.numel() > 1);
@@ -87,21 +89,29 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
             }
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_rows, process_row);
-        else
-            for (int64_t r = 0; r < num_rows; ++r) process_row(r);
+        }
+        else {
+            for (int64_t r = 0; r < num_rows; ++r) {
+                process_row(r);
+            }
+        }
 
     } else if (pack > 1) {
         // ---- Packed general axis: scalar ----
         const int64_t num_outer = [&]() {
             int64_t n = 1;
-            for (int64_t d = 0; d < axis; ++d) n *= X.shape(d);
+            for (int64_t d = 0; d < axis; ++d) {
+                n *= X.shape(d);
+            }
             return n;
         }();
         const int64_t num_inner = [&]() {
             int64_t n = 1;
-            for (int64_t d = axis + 1; d < rank; ++d) n *= X.shape(d);
+            for (int64_t d = axis + 1; d < rank; ++d) {
+                n *= X.shape(d);
+            }
             return n;
         }();
         const int64_t x_outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
@@ -122,28 +132,38 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                 }
                 for (int64_t k = 0; k < D; ++k) {
                     float xv;
-                    if constexpr (std::is_same_v<T, half>)
+                    if constexpr (std::is_same_v<T, half>) {
                         xv = half_to_float(x_base[inner_off + k * x_axis_stride]);
-                    else
+                    }
+                    else {
                         xv = static_cast<float>(x_base[inner_off + k * x_axis_stride]);
+                    }
                     float q = std::round(xv / s_f32[static_cast<size_t>(k)]) + z_f32[static_cast<size_t>(k)];
                     k::quant_write_int8(y_base, out_dtype, inner_off + k * x_axis_stride, static_cast<int32_t>(q));
                 }
             }
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_outer, process_outer);
-        else
-            for (int64_t o = 0; o < num_outer; ++o) process_outer(o);
+        }
+        else {
+            for (int64_t o = 0; o < num_outer; ++o) {
+                process_outer(o);
+            }
+        }
 
     } else {
         // ---- Planar layout (NCHW/NCDHW) ----
         int64_t stride_before_axis = 1;
-        for (int64_t d = 0; d < axis; ++d) stride_before_axis *= X.shape(d);
+        for (int64_t d = 0; d < axis; ++d) {
+            stride_before_axis *= X.shape(d);
+        }
 
         int64_t stride_after_axis = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) stride_after_axis *= X.shape(d);
+        for (int64_t d = axis + 1; d < rank; ++d) {
+            stride_after_axis *= X.shape(d);
+        }
 
         const auto process_outer = [&](int64_t outer) {
             int64_t base = outer * D * stride_after_axis;
@@ -161,10 +181,12 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                 }
                 for (; i < base + D * stride_after_axis; ++i) {
                     float xv;
-                    if constexpr (std::is_same_v<T, half>)
+                    if constexpr (std::is_same_v<T, half>) {
                         xv = half_to_float(X.ptr<T>()[i]);
-                    else
+                    }
+                    else {
                         xv = X.ptr<float>()[i];
+                    }
                     float q = std::round(xv * inv_s) + z_f32[0];
                     k::quant_write_int8(output.ptr<void>(), out_dtype, i, static_cast<int32_t>(q));
                 }
@@ -184,10 +206,12 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                     }
                     for (; i < stride_after_axis; ++i) {
                         float xv;
-                        if constexpr (std::is_same_v<T, half>)
+                        if constexpr (std::is_same_v<T, half>) {
                             xv = half_to_float(X.ptr<T>()[ks + i]);
-                        else
+                        }
+                        else {
                             xv = X.ptr<float>()[ks + i];
+                        }
                         float q = std::round(xv * inv_s) + z;
                         k::quant_write_int8(output.ptr<void>(), out_dtype, ks + i, static_cast<int32_t>(q));
                     }
@@ -195,10 +219,14 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
             }
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, stride_before_axis, process_outer);
-        else
-            for (int64_t o = 0; o < stride_before_axis; ++o) process_outer(o);
+        }
+        else {
+            for (int64_t o = 0; o < stride_before_axis; ++o) {
+                process_outer(o);
+            }
+        }
     }
 }
 
@@ -218,7 +246,9 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
 
     const int64_t rank = X.rank();
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) {
+        axis += rank;
+    }
 
     const int64_t D = X.shape(axis);
     const bool is_per_channel = (scale.numel() > 1);
@@ -263,21 +293,29 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
             }
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_rows, process_row);
-        else
-            for (int64_t r = 0; r < num_rows; ++r) process_row(r);
+        }
+        else {
+            for (int64_t r = 0; r < num_rows; ++r) {
+                process_row(r);
+            }
+        }
 
     } else if (pack > 1) {
         // ---- Packed general axis: scalar ----
         const int64_t num_outer = [&]() {
             int64_t n = 1;
-            for (int64_t d = 0; d < axis; ++d) n *= X.shape(d);
+            for (int64_t d = 0; d < axis; ++d) {
+                n *= X.shape(d);
+            }
             return n;
         }();
         const int64_t num_inner = [&]() {
             int64_t n = 1;
-            for (int64_t d = axis + 1; d < rank; ++d) n *= X.shape(d);
+            for (int64_t d = axis + 1; d < rank; ++d) {
+                n *= X.shape(d);
+            }
             return n;
         }();
         const int64_t x_outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
@@ -302,26 +340,36 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                         ? static_cast<int32_t>(static_cast<const int8_t*>(x_base)[off])
                         : static_cast<int32_t>(static_cast<const uint8_t*>(x_base)[off]);
                     float yv = (static_cast<float>(iv) - z_f32[static_cast<size_t>(k)]) * s_f32[static_cast<size_t>(k)];
-                    if constexpr (std::is_same_v<T, half>)
+                    if constexpr (std::is_same_v<T, half>) {
                         y_base[off] = float_to_half(yv);
-                    else
+                    }
+                    else {
                         y_base[off] = yv;
+                    }
                 }
             }
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_outer, process_outer);
-        else
-            for (int64_t o = 0; o < num_outer; ++o) process_outer(o);
+        }
+        else {
+            for (int64_t o = 0; o < num_outer; ++o) {
+                process_outer(o);
+            }
+        }
 
     } else {
         // ---- Planar layout (NCHW/NCDHW) ----
         int64_t stride_before_axis = 1;
-        for (int64_t d = 0; d < axis; ++d) stride_before_axis *= X.shape(d);
+        for (int64_t d = 0; d < axis; ++d) {
+            stride_before_axis *= X.shape(d);
+        }
 
         int64_t stride_after_axis = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) stride_after_axis *= X.shape(d);
+        for (int64_t d = axis + 1; d < rank; ++d) {
+            stride_after_axis *= X.shape(d);
+        }
 
         const auto process_outer = [&](int64_t outer) {
             int64_t base = outer * D * stride_after_axis;
@@ -344,10 +392,12 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                         ? static_cast<int32_t>(X.ptr<int8_t>()[i])
                         : static_cast<int32_t>(X.ptr<uint8_t>()[i]);
                     float yv = (static_cast<float>(iv) - z) * s;
-                    if constexpr (std::is_same_v<T, half>)
+                    if constexpr (std::is_same_v<T, half>) {
                         output.ptr<T>()[i] = float_to_half(yv);
-                    else
+                    }
+                    else {
                         output.ptr<float>()[i] = yv;
+                    }
                 }
             } else {
                 // Per-channel or non-contiguous: iterate per axis element
@@ -368,19 +418,25 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                             ? static_cast<int32_t>(X.ptr<int8_t>()[ks + i])
                             : static_cast<int32_t>(X.ptr<uint8_t>()[ks + i]);
                         float yv = (static_cast<float>(iv) - z) * s;
-                        if constexpr (std::is_same_v<T, half>)
+                        if constexpr (std::is_same_v<T, half>) {
                             output.ptr<T>()[ks + i] = float_to_half(yv);
-                        else
+                        }
+                        else {
                             output.ptr<float>()[ks + i] = yv;
+                        }
                     }
                 }
             }
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, stride_before_axis, process_outer);
-        else
-            for (int64_t o = 0; o < stride_before_axis; ++o) process_outer(o);
+        }
+        else {
+            for (int64_t o = 0; o < stride_before_axis; ++o) {
+                process_outer(o);
+            }
+        }
     }
 }
 

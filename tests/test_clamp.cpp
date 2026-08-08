@@ -126,7 +126,9 @@ NNOPS_TEST(clamp_random_f16) {
     auto [in_vec, _] = test::make_random_tensor({500}, -5.0f, 5.0f, 333);
 
     std::vector<nnops::backend::cpu::half> in_half(500);
-    for (int i = 0; i < 500; ++i) simd::s_store(&in_half[i], in_vec[i]);
+    for (int i = 0; i < 500; ++i) {
+        simd::s_store(&in_half[i], in_vec[i]);
+    }
 
     const int64_t shape[] = {500};
     TensorView input(shape, DataType::f16, in_half.data());
@@ -197,8 +199,9 @@ NNOPS_TEST(clamp_packed_layout) {
     auto lc_descs = lc->getOutputTensorDesc(lc_in);
 
     int64_t packed_elems = 1;
-    for (int i = 0; i < lc_descs[0].rank; ++i)
+    for (int i = 0; i < lc_descs[0].rank; ++i) {
         packed_elems *= lc_descs[0].dims[i];
+    }
     std::vector<float> packed_in_buf(static_cast<size_t>(packed_elems), 0.0f);
     auto input_packed = test::make_packed(lc_descs[0], packed_in_buf.data());
     const TensorView lc_inputs[] = {input_planar};

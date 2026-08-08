@@ -39,8 +39,9 @@ void permute_last_two_swap_impl(TensorView& output,
 
     // Batch = product of all leading dims
     int64_t batch = 1;
-    for (int64_t i = 0; i < rank - 2; ++i)
+    for (int64_t i = 0; i < rank - 2; ++i) {
         batch *= input.shape(i);
+    }
 
     const int64_t M = input.shape(rank - 2);  // rows per slice
     const int64_t K = input.shape(rank - 1);  // cols per slice
@@ -69,10 +70,14 @@ void permute_last_two_swap_impl(TensorView& output,
             M);  // out_ld: elements between output rows
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, batch, body);
-    else
-        for (int64_t b = 0; b < batch; ++b) body(b);
+    }
+    else {
+        for (int64_t b = 0; b < batch; ++b) {
+            body(b);
+        }
+    }
 }
 
 // ============================================================
@@ -152,10 +157,14 @@ void permute_impl(const PermuteAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, outer_total, body);
-    else
-        for (int64_t o = 0; o < outer_total; ++o) body(o);
+    }
+    else {
+        for (int64_t o = 0; o < outer_total; ++o) {
+            body(o);
+        }
+    }
 }
 
 // ============================================================

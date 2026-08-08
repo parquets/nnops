@@ -153,8 +153,9 @@ void CpuFeatures::detect() {
 #elif defined(_WIN32)
     // ARM64 Windows: NEON is always available.
     // Dot-product: check PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
-    if (IsProcessorFeaturePresent(43)) {  // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
+    if (IsProcessorFeaturePresent(43)) {  // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_DOT);
+    }
     }
 #endif
 

@@ -72,10 +72,14 @@ void clamp_impl(const ClampAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_tiles, body);
-    else
-        for (int64_t t = 0; t < num_tiles; ++t) body(t);
+    }
+    else {
+        for (int64_t t = 0; t < num_tiles; ++t) {
+            body(t);
+        }
+    }
 }
 
 void clamp_cpu(const ClampAttributes& attrs,

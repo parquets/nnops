@@ -290,12 +290,16 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 #else
 inline v_f32x8 v_cvt_s8_to_f32(const int8_t* p) {
     float buf[8];
-    for (int i = 0; i < 8; ++i) buf[i] = static_cast<float>(p[i]);
+    for (int i = 0; i < 8; ++i) {
+        buf[i] = static_cast<float>(p[i]);
+    }
     return v_load(buf);
 }
 inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
     float buf[8];
-    for (int i = 0; i < 8; ++i) buf[i] = static_cast<float>(p[i]);
+    for (int i = 0; i < 8; ++i) {
+        buf[i] = static_cast<float>(p[i]);
+    }
     return v_load(buf);
 }
 #endif
@@ -303,12 +307,16 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 // int8/uint8 → f16: direct per-element conversion (8 lanes)
 inline v_f16x8 v_cvt_s8_to_f16(const int8_t* p) {
     half buf[8];
-    for (int i = 0; i < 8; ++i) buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
+    for (int i = 0; i < 8; ++i) {
+        buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
+    }
     return v_load(buf);
 }
 inline v_f16x8 v_cvt_u8_to_f16(const uint8_t* p) {
     half buf[8];
-    for (int i = 0; i < 8; ++i) buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
+    for (int i = 0; i < 8; ++i) {
+        buf[i] = ::nnops::backend::cpu::float_to_half(static_cast<float>(p[i]));
+    }
     return v_load(buf);
 }
 

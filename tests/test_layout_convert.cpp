@@ -24,13 +24,16 @@ inline void fill_sequential_f32(TensorView& tv) {
     const int64_t ch = tv.stride_elems(1);
     const int64_t row = tv.row_stride_elems();
     float val = 1.0f;
-    for (int64_t n = 0; n < N; ++n)
-        for (int64_t c = 0; c < C; ++c)
-            for (int64_t hh = 0; hh < H; ++hh)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t hh = 0; hh < H; ++hh) {
                 for (int64_t w = 0; w < W; ++w) {
                     p[(n * C + c) * ch + hh * row + w] = val;
                     val += 1.0f;
                 }
+            }
+        }
+    }
 }
 
 /// Fill a planar NCHW f16 tensor with deterministic sequential values.
@@ -40,9 +43,9 @@ inline void fill_sequential_f16(TensorView& tv) {
     const int64_t ch = tv.stride_elems(1);
     const int64_t row = tv.row_stride_elems();
     float val = 1.0f;
-    for (int64_t n = 0; n < N; ++n)
-        for (int64_t c = 0; c < C; ++c)
-            for (int64_t hh = 0; hh < H; ++hh)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t hh = 0; hh < H; ++hh) {
                 for (int64_t w = 0; w < W; ++w) {
                     uint16_t* p = tv.ptr<uint16_t>()
                                   + (n * C + c) * ch + hh * row + w;
@@ -50,6 +53,9 @@ inline void fill_sequential_f16(TensorView& tv) {
                     *p = h.bits;
                     val += 1.0f;
                 }
+            }
+        }
+    }
 }
 
 /// Fill a planar NCDHW f32 tensor with deterministic sequential values.
@@ -61,23 +67,31 @@ inline void fill_sequential_3d_f32(TensorView& tv) {
     const int64_t depth_stride = tv.stride_elems(2);
     const int64_t row = tv.row_stride_elems();
     float val = 1.0f;
-    for (int64_t n = 0; n < N; ++n)
-        for (int64_t c = 0; c < C; ++c)
-            for (int64_t d = 0; d < D; ++d)
-                for (int64_t hh = 0; hh < H; ++hh)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t d = 0; d < D; ++d) {
+                for (int64_t hh = 0; hh < H; ++hh) {
                     for (int64_t w = 0; w < W; ++w) {
                         p[(n * C + c) * ch_stride + d * depth_stride + hh * row + w] = val;
                         val += 1.0f;
                     }
+                }
+            }
+        }
+    }
 }
 
 /// Compare two planar tensors element-by-element (bit-exact).
 /// Both tensors must be densely packed (as from make_planar).
 template <typename T>
 bool tensors_equal(const TensorView& a, const TensorView& b) {
-    if (a.rank() != b.rank()) return false;
+    if (a.rank() != b.rank()) {
+        return false;
+    }
     for (int64_t d = 0; d < a.rank(); ++d) {
-        if (a.shape(d) != b.shape(d)) return false;
+        if (a.shape(d) != b.shape(d)) {
+            return false;
+        }
     }
     int64_t total = 1;
     for (int64_t d = 0; d < a.rank(); ++d) {
@@ -86,7 +100,9 @@ bool tensors_equal(const TensorView& a, const TensorView& b) {
     const T* ap = a.ptr<T>();
     const T* bp = b.ptr<T>();
     for (int64_t i = 0; i < total; ++i) {
-        if (ap[i] != bp[i]) return false;
+        if (ap[i] != bp[i]) {
+            return false;
+        }
     }
     return true;
 }

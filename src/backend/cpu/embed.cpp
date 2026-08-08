@@ -61,8 +61,12 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
         }
 
         // Clamp to valid range
-        if (idx < 0) idx = 0;
-        if (idx >= V) idx = V - 1;
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx >= V) {
+            idx = V - 1;
+        }
 
         // Copy weight[idx, :] to output[n, :]
         std::memcpy(out_ptr + n * out_row_stride,
@@ -70,10 +74,14 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
                     row_bytes);
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_indices, body);
-    else
-        for (int64_t n = 0; n < num_indices; ++n) body(n);
+    }
+    else {
+        for (int64_t n = 0; n < num_indices; ++n) {
+            body(n);
+        }
+    }
 }
 
 // ============================================================
@@ -124,8 +132,12 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
         }
 
         // Clamp to valid range
-        if (idx < 0) idx = 0;
-        if (idx >= V) idx = V - 1;
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx >= V) {
+            idx = V - 1;
+        }
 
         const void* w_row = static_cast<const uint8_t*>(weight_ptr) + idx * w_row_bytes;
         Tout* out_row = out_ptr + n * out_row_stride;
@@ -152,10 +164,14 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
         }
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_indices, body);
-    else
-        for (int64_t n = 0; n < num_indices; ++n) body(n);
+    }
+    else {
+        for (int64_t n = 0; n < num_indices; ++n) {
+            body(n);
+        }
+    }
 }
 
 }  // anonymous namespace

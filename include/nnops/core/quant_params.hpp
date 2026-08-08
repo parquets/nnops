@@ -119,7 +119,9 @@ struct QuantParams {
     /// Whether these parameters represent an active quantization.
     /// Returns true when the tensor data should be dequantized before use.
     bool is_active() const noexcept {
-        if (scale_data != nullptr || zero_point_data != nullptr) return true;
+        if (scale_data != nullptr || zero_point_data != nullptr) {
+            return true;
+        }
         return scale != 1.0f || zero_point != 0;
     }
 };

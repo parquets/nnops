@@ -30,8 +30,9 @@ inline void reduce_process_packed_row(
     case ReduceType::Sum:
     case ReduceType::Mean: {
         auto v_sum = v_zero(x_row);
-        for (int64_t d = 0; d < D; ++d)
+        for (int64_t d = 0; d < D; ++d) {
             v_sum = v_add(v_sum, v_load(x_row + d * pack));
+        }
         if (type == ReduceType::Mean) {
             auto v_inv = v_set1(x_row, inv_D);
             v_sum = v_mul(v_sum, v_inv);
@@ -41,15 +42,17 @@ inline void reduce_process_packed_row(
     }
     case ReduceType::Max: {
         auto v_best = v_set1(x_row, -std::numeric_limits<float>::infinity());
-        for (int64_t d = 0; d < D; ++d)
+        for (int64_t d = 0; d < D; ++d) {
             v_best = v_max(v_best, v_load(x_row + d * pack));
+        }
         v_store(y_pos, v_best);
         break;
     }
     case ReduceType::Min: {
         auto v_best = v_set1(x_row, std::numeric_limits<float>::infinity());
-        for (int64_t d = 0; d < D; ++d)
+        for (int64_t d = 0; d < D; ++d) {
             v_best = v_min(v_best, v_load(x_row + d * pack));
+        }
         v_store(y_pos, v_best);
         break;
     }
@@ -72,8 +75,9 @@ inline void reduce_process_packed_col(
     case ReduceType::Sum:
     case ReduceType::Mean: {
         auto v_sum = v_zero(x_col);
-        for (int64_t d = 0; d < D; ++d)
+        for (int64_t d = 0; d < D; ++d) {
             v_sum = v_add(v_sum, v_load(x_col + d * x_pitch));
+        }
         if (type == ReduceType::Mean) {
             auto v_inv = v_set1(x_col, inv_D);
             v_sum = v_mul(v_sum, v_inv);
@@ -83,15 +87,17 @@ inline void reduce_process_packed_col(
     }
     case ReduceType::Max: {
         auto v_best = v_set1(x_col, -std::numeric_limits<float>::infinity());
-        for (int64_t d = 0; d < D; ++d)
+        for (int64_t d = 0; d < D; ++d) {
             v_best = v_max(v_best, v_load(x_col + d * x_pitch));
+        }
         v_store(y_pos, v_best);
         break;
     }
     case ReduceType::Min: {
         auto v_best = v_set1(x_col, std::numeric_limits<float>::infinity());
-        for (int64_t d = 0; d < D; ++d)
+        for (int64_t d = 0; d < D; ++d) {
             v_best = v_min(v_best, v_load(x_col + d * x_pitch));
+        }
         v_store(y_pos, v_best);
         break;
     }
@@ -128,16 +134,18 @@ inline void reduce_process_packed_channel(
     case ReduceType::Sum:
     case ReduceType::Mean: {
         auto v_sum = v_zero(x_chan);
-        for (int64_t c = 0; c < full_blocks; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c) {
             v_sum = v_add(v_sum, v_load(x_chan + c * x_chan_stride));
+        }
 
         float sum = v_reduce_sum(v_sum);
 
         // Partial last block: scalar accumulate valid lanes only
         if (valid_lanes < pack) {
             const T* last_row = x_chan + (D - 1) * x_chan_stride;
-            for (int64_t l = 0; l < valid_lanes; ++l)
+            for (int64_t l = 0; l < valid_lanes; ++l) {
                 sum += s_load(&last_row[l]);
+            }
         }
 
         float result = (type == ReduceType::Mean) ? sum * inv_total : sum;
@@ -146,8 +154,9 @@ inline void reduce_process_packed_channel(
     }
     case ReduceType::Max: {
         auto v_best = v_set1(x_chan, -std::numeric_limits<float>::infinity());
-        for (int64_t c = 0; c < full_blocks; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c) {
             v_best = v_max(v_best, v_load(x_chan + c * x_chan_stride));
+        }
 
         float best = v_reduce_max(v_best);
 
@@ -155,7 +164,9 @@ inline void reduce_process_packed_channel(
             const T* last_row = x_chan + (D - 1) * x_chan_stride;
             for (int64_t l = 0; l < valid_lanes; ++l) {
                 float v = s_load(&last_row[l]);
-                if (v > best) best = v;
+                if (v > best) {
+                    best = v;
+                }
             }
         }
 
@@ -164,8 +175,9 @@ inline void reduce_process_packed_channel(
     }
     case ReduceType::Min: {
         auto v_best = v_set1(x_chan, std::numeric_limits<float>::infinity());
-        for (int64_t c = 0; c < full_blocks; ++c)
+        for (int64_t c = 0; c < full_blocks; ++c) {
             v_best = v_min(v_best, v_load(x_chan + c * x_chan_stride));
+        }
 
         float best = v_reduce_min(v_best);
 
@@ -173,7 +185,9 @@ inline void reduce_process_packed_channel(
             const T* last_row = x_chan + (D - 1) * x_chan_stride;
             for (int64_t l = 0; l < valid_lanes; ++l) {
                 float v = s_load(&last_row[l]);
-                if (v < best) best = v;
+                if (v < best) {
+                    best = v;
+                }
             }
         }
 

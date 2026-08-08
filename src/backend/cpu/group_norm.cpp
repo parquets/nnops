@@ -45,7 +45,9 @@ void group_norm_impl(const GroupNormAttributes& attrs,
     const int64_t N = X.shape(0);
     const int64_t C = X.shape(1);
     int64_t G = attrs.num_groups;
-    if (G <= 0) G = 1;
+    if (G <= 0) {
+        G = 1;
+    }
     NNOPS_ASSERT(C % G == 0);
 
     const int64_t channels_per_group = C / G;

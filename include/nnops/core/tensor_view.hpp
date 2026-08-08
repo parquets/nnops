@@ -44,13 +44,17 @@ struct TensorDesc {
     /// For packed layouts (NCHWC8, etc.), counts storage elements
     /// including channel block rounding: ceil(C/pack) × pack instead of C.
     int64_t numel() const noexcept {
-        if (rank == 0) return 1;  // scalar = 1 element
+        if (rank == 0) {
+            return 1; // scalar = 1 element
+        }
         int64_t n = 1;
         for (int64_t i = 0; i < rank; ++i) {
             int64_t d = dims[static_cast<size_t>(i)];
             if (i == 1) {
                 int64_t pack = layout_channel_pack(layout);
-                if (pack > 1) d = ((d + pack - 1) / pack) * pack;
+                if (pack > 1) {
+                    d = ((d + pack - 1) / pack) * pack;
+                }
             }
             n *= d;
         }
@@ -67,7 +71,9 @@ struct TensorDesc {
     /// For rank < 2, returns elem_size.
     /// For packed layouts, pitch = align_up(W × pack × elem_size, alignment).
     int64_t row_pitch(int64_t alignment = 32) const noexcept {
-        if (rank < 2) return static_cast<int64_t>(data_type_size(dtype));
+        if (rank < 2) {
+            return static_cast<int64_t>(data_type_size(dtype));
+        }
         int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
         int64_t W = dims[static_cast<size_t>(rank - 1)];
         int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
@@ -77,16 +83,21 @@ struct TensorDesc {
 
     /// Actual storage size including default-aligned row pitch (32B).
     size_t storage_bytes(int64_t alignment = 32) const noexcept {
-        if (rank < 2) return nbytes();
+        if (rank < 2) {
+            return nbytes();
+        }
         int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
         int64_t W = dims[static_cast<size_t>(rank - 1)];
         int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
         int64_t row_bytes = W * pack * elem_size;
         int64_t aligned_row = ((row_bytes + alignment - 1) / alignment) * alignment;
         int64_t rows = dims[0];
-        if (rank >= 2) rows *= ((dims[1] + pack - 1) / pack);
-        for (int64_t d = 2; d < rank - 1; ++d)
+        if (rank >= 2) {
+            rows *= ((dims[1] + pack - 1) / pack);
+        }
+        for (int64_t d = 2; d < rank - 1; ++d) {
             rows *= dims[static_cast<size_t>(d)];
+        }
         return static_cast<size_t>(rows * aligned_row);
     }
 };
@@ -230,7 +241,9 @@ public:
     /// For planar layouts equals numel × elem_size.
     /// For packed layouts accounts for channel block rounding and row alignment.
     size_t storage_bytes() const noexcept {
-        if (rank_ < 2) return static_cast<size_t>(numel()) * data_type_size(dtype_);
+        if (rank_ < 2) {
+            return static_cast<size_t>(numel()) * data_type_size(dtype_);
+        }
         return static_cast<size_t>(total_rows()) * static_cast<size_t>(pitch_);
     }
 
@@ -295,9 +308,13 @@ public:
     /// Number of channel blocks: ceil(C / pack_size).
     /// For NCHWC8 with C=20: returns 3 (two full C8 blocks + one partial).
     int64_t num_channel_blocks() const noexcept {
-        if (rank_ < 2) return 1;
+        if (rank_ < 2) {
+            return 1;
+        }
         int64_t pack = channel_pack_size();
-        if (pack <= 1) return shape_[1];  // planar: each channel is its own "block"
+        if (pack <= 1) {
+            return shape_[1]; // planar: each channel is its own "block"
+        }
         return (shape_[1] + pack - 1) / pack;
     }
 
@@ -305,7 +322,9 @@ public:
     /// For NCHWC8 [N,C,H,W]: H * row_stride_elems() = H * W * 8.
     /// For NCDHWC8 [N,C,D,H,W]: D * H * row_stride_elems() = D * H * W * 8.
     int64_t channel_block_stride_elems() const noexcept {
-        if (rank_ < 3) return row_stride_elems();
+        if (rank_ < 3) {
+            return row_stride_elems();
+        }
         int64_t s = row_stride_elems();
         // Multiply by all spatial dimensions between C and the row
         for (int64_t d = 2; d < rank_ - 1; ++d) {
@@ -319,7 +338,9 @@ public:
     /// NCHWC8: N * ceil(C/8) * H.
     /// NCDHWC8: N * ceil(C/8) * D * H.
     int64_t total_rows() const noexcept {
-        if (rank_ < 1) return 0;
+        if (rank_ < 1) {
+            return 0;
+        }
         int64_t rows = shape_[0];  // N
         // Channel blocks only matter when there are spatial dims (rank >= 3).
         // For rank-2 [N, C], shape_[1] IS the last dim, not a separate channel

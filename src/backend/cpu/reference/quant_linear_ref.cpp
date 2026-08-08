@@ -106,7 +106,9 @@ void quantize_linear_ref(const QuantLinearAttributes& attrs,
 
     const int64_t rank = x.rank();
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) {
+        axis += rank;
+    }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t D = x.shape(axis);
@@ -131,13 +133,17 @@ void quantize_linear_ref(const QuantLinearAttributes& attrs,
                 } else {
                     coord = rem % dim;
                 }
-                if (d == axis) ax_idx = coord;
+                if (d == axis) {
+                    ax_idx = coord;
+                }
                 rem = rem;
             }
             // Simpler approach: build coordinate and read axis
             int64_t tmp = flat;
             int64_t stride_after_axis = 1;
-            for (int64_t d = axis + 1; d < rank; ++d) stride_after_axis *= x.shape(d);
+            for (int64_t d = axis + 1; d < rank; ++d) {
+                stride_after_axis *= x.shape(d);
+            }
             ax_idx = (flat / stride_after_axis) % D;
         }
 
@@ -167,7 +173,9 @@ void dequantize_linear_ref(const QuantLinearAttributes& attrs,
 
     const int64_t rank = x.rank();
     int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
+    if (axis < 0) {
+        axis += rank;
+    }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t D = x.shape(axis);
@@ -176,7 +184,9 @@ void dequantize_linear_ref(const QuantLinearAttributes& attrs,
 
     for (int64_t flat = 0; flat < n_total; ++flat) {
         int64_t stride_after_axis = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) stride_after_axis *= x.shape(d);
+        for (int64_t d = axis + 1; d < rank; ++d) {
+            stride_after_axis *= x.shape(d);
+        }
         int64_t ax_idx = (flat / stride_after_axis) % D;
 
         int64_t s_idx = is_per_channel ? ax_idx : 0;

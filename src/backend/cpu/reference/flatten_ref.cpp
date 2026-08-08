@@ -36,8 +36,9 @@ void flatten_impl_ref(const FlattenAttributes& /*attrs*/,
     // Total logical rows in the output (product of all dims except innermost):
     // N * C * (D) * H  — same for planar and packed logical view.
     int64_t num_logical_rows = 1;
-    for (int64_t d = 0; d < rank - 1; ++d)
+    for (int64_t d = 0; d < rank - 1; ++d) {
         num_logical_rows *= output.shape(d);
+    }
 
     // Within-row element stride for the input.
     const int64_t i_w_stride = input.stride_elems(rank - 1);  // 1 planar, pack for packed

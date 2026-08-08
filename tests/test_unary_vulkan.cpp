@@ -95,7 +95,9 @@ static std::vector<float> run_unary_vulkan(
 NNOPS_TEST(unary_vulkan_exp) {
     const int N = 256;
     float in[256];
-    for (int i = 0; i < N; ++i) in[i] = (i - 128) * 0.05f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 128) * 0.05f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Exp);
 
@@ -111,7 +113,9 @@ NNOPS_TEST(unary_vulkan_exp) {
 NNOPS_TEST(unary_vulkan_log) {
     const int N = 128;
     float in[128];
-    for (int i = 0; i < N; ++i) in[i] = 1.0f + i * 0.1f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = 1.0f + i * 0.1f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Log);
 
@@ -123,7 +127,9 @@ NNOPS_TEST(unary_vulkan_log) {
 NNOPS_TEST(unary_vulkan_sin) {
     const int N = 100;
     float in[100];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.1f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.1f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Sin);
 
@@ -135,7 +141,9 @@ NNOPS_TEST(unary_vulkan_sin) {
 NNOPS_TEST(unary_vulkan_cos) {
     const int N = 100;
     float in[100];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.1f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.1f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Cos);
 
@@ -147,7 +155,9 @@ NNOPS_TEST(unary_vulkan_cos) {
 NNOPS_TEST(unary_vulkan_tan) {
     const int N = 50;
     float in[50];
-    for (int i = 0; i < N; ++i) in[i] = (i - 25) * 0.04f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 25) * 0.04f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Tan);
 
@@ -159,7 +169,9 @@ NNOPS_TEST(unary_vulkan_tan) {
 NNOPS_TEST(unary_vulkan_tanh) {
     const int N = 128;
     float in[128];
-    for (int i = 0; i < N; ++i) in[i] = (i - 64) * 0.05f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 64) * 0.05f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Tanh);
 
@@ -171,7 +183,9 @@ NNOPS_TEST(unary_vulkan_tanh) {
 NNOPS_TEST(unary_vulkan_abs) {
     const int N = 256;
     float in[256];
-    for (int i = 0; i < N; ++i) in[i] = (i - 128) * 0.5f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 128) * 0.5f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Abs);
 
@@ -183,7 +197,9 @@ NNOPS_TEST(unary_vulkan_abs) {
 NNOPS_TEST(unary_vulkan_neg) {
     const int N = 128;
     float in[128];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.5f - 32.0f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.5f - 32.0f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Neg);
 
@@ -195,7 +211,9 @@ NNOPS_TEST(unary_vulkan_neg) {
 NNOPS_TEST(unary_vulkan_sqrt) {
     const int N = 256;
     float in[256];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.1f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.1f;
+    }
 
     auto result = run_unary_vulkan(in, N, UnaryType::Sqrt);
 
@@ -356,7 +374,9 @@ static std::vector<float> compute_unary_f16_ref(
 NNOPS_TEST(unary_vulkan_f16_exp) {
     const int N = 256;
     float in[256];
-    for (int i = 0; i < N; ++i) in[i] = (i - 128) * 0.02f;  // safe range for exp
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 128) * 0.02f; // safe range for exp
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Exp);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Exp);
@@ -370,7 +390,9 @@ NNOPS_TEST(unary_vulkan_f16_exp) {
 NNOPS_TEST(unary_vulkan_f16_log) {
     const int N = 128;
     float in[128];
-    for (int i = 0; i < N; ++i) in[i] = 0.5f + i * 0.05f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = 0.5f + i * 0.05f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Log);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Log);
@@ -384,7 +406,9 @@ NNOPS_TEST(unary_vulkan_f16_log) {
 NNOPS_TEST(unary_vulkan_f16_sin) {
     const int N = 100;
     float in[100];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.1f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.1f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Sin);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Sin);
@@ -397,7 +421,9 @@ NNOPS_TEST(unary_vulkan_f16_sin) {
 NNOPS_TEST(unary_vulkan_f16_cos) {
     const int N = 100;
     float in[100];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.1f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.1f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Cos);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Cos);
@@ -410,7 +436,9 @@ NNOPS_TEST(unary_vulkan_f16_cos) {
 NNOPS_TEST(unary_vulkan_f16_tanh) {
     const int N = 128;
     float in[128];
-    for (int i = 0; i < N; ++i) in[i] = (i - 64) * 0.05f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 64) * 0.05f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Tanh);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Tanh);
@@ -423,7 +451,9 @@ NNOPS_TEST(unary_vulkan_f16_tanh) {
 NNOPS_TEST(unary_vulkan_f16_abs) {
     const int N = 256;
     float in[256];
-    for (int i = 0; i < N; ++i) in[i] = (i - 128) * 0.5f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = (i - 128) * 0.5f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Abs);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Abs);
@@ -436,7 +466,9 @@ NNOPS_TEST(unary_vulkan_f16_abs) {
 NNOPS_TEST(unary_vulkan_f16_neg) {
     const int N = 128;
     float in[128];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.5f - 32.0f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.5f - 32.0f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Neg);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Neg);
@@ -449,7 +481,9 @@ NNOPS_TEST(unary_vulkan_f16_neg) {
 NNOPS_TEST(unary_vulkan_f16_sqrt) {
     const int N = 256;
     float in[256];
-    for (int i = 0; i < N; ++i) in[i] = i * 0.1f + 0.01f;
+    for (int i = 0; i < N; ++i) {
+        in[i] = i * 0.1f + 0.01f;
+    }
 
     auto result = run_unary_vulkan_f16(in, N, UnaryType::Sqrt);
     auto expected = compute_unary_f16_ref(in, N, UnaryType::Sqrt);

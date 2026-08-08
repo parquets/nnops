@@ -58,16 +58,18 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     // Compute output shape
     auto op_ref = Concat::create(attrs, Backend::CPU);
     std::vector<TensorDesc> planar_descs(N);
-    for (int64_t i = 0; i < N; ++i)
+    for (int64_t i = 0; i < N; ++i) {
         planar_descs[static_cast<size_t>(i)] = in_planars[static_cast<size_t>(i)].desc();
+    }
     auto ref_out_descs = op_ref->getOutputTensorDesc(planar_descs);
 
     std::vector<float> ref_out(static_cast<size_t>(ref_out_descs[0].numel()));
     TensorView out_ref = test::make_planar(ref_out_descs[0], ref_out.data());
 
     std::vector<TensorView> ref_ins(N);
-    for (int64_t i = 0; i < N; ++i)
+    for (int64_t i = 0; i < N; ++i) {
         ref_ins[static_cast<size_t>(i)] = in_planars[static_cast<size_t>(i)];
+    }
 
     {
         ComputeContext ctx;
@@ -95,8 +97,9 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     // Concat on packed
     auto concat_op = Concat::create(attrs, Backend::CPU);
     std::vector<TensorDesc> packed_descs(N);
-    for (int64_t i = 0; i < N; ++i)
+    for (int64_t i = 0; i < N; ++i) {
         packed_descs[static_cast<size_t>(i)] = in_packeds[static_cast<size_t>(i)].desc();
+    }
     auto concat_descs = concat_op->getOutputTensorDesc(packed_descs);
 
     NNOPS_EXPECT_EQ(concat_descs[0].rank, rank);
@@ -107,8 +110,9 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     auto out_packed = test::make_packed(concat_descs[0], concat_buf.data());
 
     std::vector<TensorView> concat_ins(N);
-    for (int64_t i = 0; i < N; ++i)
+    for (int64_t i = 0; i < N; ++i) {
         concat_ins[static_cast<size_t>(i)] = in_packeds[static_cast<size_t>(i)];
+    }
     concat_op->compute(out_packed, concat_ins);
 
     // Unpack

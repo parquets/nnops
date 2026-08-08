@@ -24,7 +24,9 @@ void slice_impl_ref(const SliceAttributes& attrs,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
     const int64_t total = output.numel();
-    if (total == 0) return;
+    if (total == 0) {
+        return;
+    }
 
     const size_t n_axes = attrs.axes.size();
 
@@ -37,7 +39,9 @@ void slice_impl_ref(const SliceAttributes& attrs,
     }
     for (size_t a = 0; a < n_axes; ++a) {
         int64_t ax = attrs.axes[a];
-        if (ax < 0) ax += rank;
+        if (ax < 0) {
+            ax += rank;
+        }
         eff_start[static_cast<size_t>(ax)] = attrs.starts[a];
         eff_step[static_cast<size_t>(ax)]  =
             (a < attrs.steps.size()) ? attrs.steps[a] : int64_t(1);
@@ -46,14 +50,16 @@ void slice_impl_ref(const SliceAttributes& attrs,
     // Input strides in elements (planar → contiguous innermost)
     int64_t in_strides[TensorDesc::kMaxRank];
     in_strides[rank - 1] = 1;
-    for (int64_t i = rank - 2; i >= 0; --i)
+    for (int64_t i = rank - 2; i >= 0; --i) {
         in_strides[i] = in_strides[i + 1] * input.shape(i + 1);
+    }
 
     // Output strides in elements (planar)
     int64_t out_strides[TensorDesc::kMaxRank];
     out_strides[rank - 1] = 1;
-    for (int64_t i = rank - 2; i >= 0; --i)
+    for (int64_t i = rank - 2; i >= 0; --i) {
         out_strides[i] = out_strides[i + 1] * output.shape(i + 1);
+    }
 
     const T* in_ptr  = input.ptr<T>();
     T*       out_ptr = output.ptr<T>();

@@ -62,10 +62,14 @@ void unary_impl(const UnaryAttributes& attrs,
                    out_ptr + r * out_row_stride,
                    m, last_dim, in_row_stride, out_row_stride, add_to);
         };
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_tiles, body);
-        else
-            for (int64_t t = 0; t < num_tiles; ++t) body(t);
+        }
+        else {
+            for (int64_t t = 0; t < num_tiles; ++t) {
+                body(t);
+            }
+        }
     };
 
     // Dispatch to the appropriate tiled_unary kernel

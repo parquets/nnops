@@ -122,7 +122,9 @@ void dispatch_layout(const LayoutDispatch& ld,
 inline size_t layout_dispatch_workspace(const TensorDesc& input,
                                          const TensorDesc& output) {
     LayoutDispatch ld(input.layout, output.layout);
-    if (!ld.needs_workspace()) return 0;
+    if (!ld.needs_workspace()) {
+        return 0;
+    }
 
     const auto elem_size = data_type_size(input.dtype);
     size_t ws = 0;

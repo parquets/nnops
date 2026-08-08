@@ -46,8 +46,9 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
     // ---- General path: row-by-row SIMD copy ----
 
     int64_t num_logical_rows = 1;
-    for (int64_t d = 0; d < rank - 1; ++d)
+    for (int64_t d = 0; d < rank - 1; ++d) {
         num_logical_rows *= output.shape(d);
+    }
 
     for (int64_t row = 0; row < num_logical_rows; ++row) {
         T* o_row = o_ptr + row * o_row_stride;
@@ -73,20 +74,23 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
         int64_t w = 0;
         if (i_w_stride == 1 && pack == 1) {
             // Planar input: contiguous row → SIMD vector copy
-            for (; w + L <= oW; w += L)
+            for (; w + L <= oW; w += L) {
                 v_store(o_row + w, v_load(i_ptr + i_off + w));
+            }
         } else {
             // Packed input: strided element access
             for (; w + L <= oW; w += L) {
                 T tmp[16];  // max simd lane width
-                for (int k = 0; k < L; ++k)
+                for (int k = 0; k < L; ++k) {
                     s_store(&tmp[k], s_load(&i_ptr[i_off + (w + k) * i_w_stride]));
+                }
                 v_store(o_row + w, v_load(tmp));
             }
         }
         // Scalar tail
-        for (; w < oW; ++w)
+        for (; w < oW; ++w) {
             s_store(&o_row[w], s_load(&i_ptr[i_off + w * i_w_stride]));
+        }
     }
 }
 

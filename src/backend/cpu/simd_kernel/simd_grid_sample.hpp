@@ -37,7 +37,9 @@ inline float gridsample_grid_to_pixel(float coord, int64_t size, bool align_corn
 }
 
 inline float gridsample_reflect_coord(float x, int64_t size) {
-    if (size <= 1) return 0.0f;
+    if (size <= 1) {
+        return 0.0f;
+    }
     float max_val = static_cast<float>(size - 1);
     float r = std::fmod(std::abs(x), 2.0f * max_val);
     if (r > max_val) {

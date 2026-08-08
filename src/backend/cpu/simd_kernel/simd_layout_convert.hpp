@@ -101,14 +101,30 @@ inline void layout_unpack_row(
 
         v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
 
-        if (c_base + 0 < C) v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
-        if (c_base + 1 < C) v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
-        if (c_base + 2 < C) v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
-        if (c_base + 3 < C) v_store(&out_row[(c_base + 3) * ch_stride + w], r3);
-        if (c_base + 4 < C) v_store(&out_row[(c_base + 4) * ch_stride + w], r4);
-        if (c_base + 5 < C) v_store(&out_row[(c_base + 5) * ch_stride + w], r5);
-        if (c_base + 6 < C) v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
-        if (c_base + 7 < C) v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
+        if (c_base + 0 < C) {
+            v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
+        }
+        if (c_base + 1 < C) {
+            v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
+        }
+        if (c_base + 2 < C) {
+            v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
+        }
+        if (c_base + 3 < C) {
+            v_store(&out_row[(c_base + 3) * ch_stride + w], r3);
+        }
+        if (c_base + 4 < C) {
+            v_store(&out_row[(c_base + 4) * ch_stride + w], r4);
+        }
+        if (c_base + 5 < C) {
+            v_store(&out_row[(c_base + 5) * ch_stride + w], r5);
+        }
+        if (c_base + 6 < C) {
+            v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
+        }
+        if (c_base + 7 < C) {
+            v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
+        }
     }
     for (; w < W; ++w) {
         layout_unpack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);

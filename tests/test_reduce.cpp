@@ -805,7 +805,9 @@ NNOPS_TEST(reduce_nchwc8_random) {
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
-    for (auto& v : in_data) v = dist(rng);
+    for (auto& v : in_data) {
+        v = dist(rng);
+    }
 
     int64_t n_stride = num_c8 * H * row_stride;
     int64_t c8_stride = H * row_stride;
@@ -858,7 +860,9 @@ NNOPS_TEST(reduce_nchwc8_random) {
                     for (int64_t w = 0; w < W; ++w) {
                         int64_t off = n * n_stride + c8 * c8_stride
                                       + h * row_stride + w * 8 + lane;
-                        if (in_data[off] > best) best = in_data[off];
+                        if (in_data[off] > best) {
+                            best = in_data[off];
+                        }
                     }
                     result = best;
                     break;
@@ -868,7 +872,9 @@ NNOPS_TEST(reduce_nchwc8_random) {
                     for (int64_t w = 0; w < W; ++w) {
                         int64_t off = n * n_stride + c8 * c8_stride
                                       + h * row_stride + w * 8 + lane;
-                        if (in_data[off] < best) best = in_data[off];
+                        if (in_data[off] < best) {
+                            best = in_data[off];
+                        }
                     }
                     result = best;
                     break;

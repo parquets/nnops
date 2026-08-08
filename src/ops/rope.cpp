@@ -101,7 +101,9 @@ void RoPE::compute(std::span<TensorView> outputs,
     // Validate mRoPE section dims if present
     if (!attrs_.mrope_section_dims.empty()) {
         int64_t total = 0;
-        for (auto d : attrs_.mrope_section_dims) total += d;
+        for (auto d : attrs_.mrope_section_dims) {
+            total += d;
+        }
         NNOPS_ASSERT(total == X.shape(rank - 1));
         if (!attrs_.mrope_section_bases.empty()) {
             NNOPS_ASSERT(attrs_.mrope_section_bases.size() == attrs_.mrope_section_dims.size());

@@ -672,22 +672,26 @@ inline std::vector<TensorDesc> embed_output_shape(
     out.layout = weight.layout;
 
     // When weight is quantized (int8), output is dequantized float32
-    if (weight.dtype == DataType::s8 || weight.dtype == DataType::u8)
+    if (weight.dtype == DataType::s8 || weight.dtype == DataType::u8) {
         out.dtype = DataType::f32;
-    else
+    }
+    else {
         out.dtype = weight.dtype;
+    }
 
     const int64_t w_extra = weight.rank - 1;  // embedding dim(s)
     out.rank = indices.rank + w_extra;
     out.dims.resize(static_cast<size_t>(out.rank));
 
-    for (int64_t i = 0; i < indices.rank; ++i)
+    for (int64_t i = 0; i < indices.rank; ++i) {
         out.dims[static_cast<size_t>(i)] = indices.dims[static_cast<size_t>(i)];
+    }
 
-    for (int64_t i = 0; i < w_extra; ++i)
+    for (int64_t i = 0; i < w_extra; ++i) {
         out.dims[static_cast<size_t>(indices.rank + i)] =
             weight.dims[static_cast<size_t>(1 + i)];
 
+    }
     return {out};
 }
 
@@ -736,21 +740,28 @@ inline std::vector<TensorDesc> slice_output_shape(
     out.dtype  = in.dtype;
     out.rank   = rank;
     out.dims.resize(static_cast<size_t>(rank));
-    for (int64_t i = 0; i < rank; ++i)
+    for (int64_t i = 0; i < rank; ++i) {
         out.dims[static_cast<size_t>(i)] = in.dims[static_cast<size_t>(i)];
+    }
 
     // Apply slicing for each specified axis
     for (size_t a = 0; a < axes.size(); ++a) {
         int64_t ax = axes[a];
-        if (ax < 0) ax += rank;
+        if (ax < 0) {
+            ax += rank;
+        }
         int64_t dim = in.dims[static_cast<size_t>(ax)];
         int64_t s = starts[a];
         int64_t e = ends[a];
         int64_t step = (a < steps.size()) ? steps[a] : int64_t(1);
 
         // Clamp to valid range (ONNX-style: negative values wrap)
-        if (s < 0) s += dim;
-        if (e < 0) e += dim;
+        if (s < 0) {
+            s += dim;
+        }
+        if (e < 0) {
+            e += dim;
+        }
         s = std::max<int64_t>(0, std::min(s, dim));
         e = std::max<int64_t>(0, std::min(e, dim));
 

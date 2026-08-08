@@ -65,7 +65,9 @@ static void test_nchwc8_vs_ref(
     std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
     auto out_ref = test::make_planar(ref_descs[0], ref_buf.data());
     if (attrs.add_to) {
-        for (auto& v : ref_buf) v = 1.0f;
+        for (auto& v : ref_buf) {
+            v = 1.0f;
+        }
     }
     {
         ComputeContext ctx;
@@ -1281,7 +1283,9 @@ static void test_ncdhwc8_vs_ref(
     std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
     auto out_ref = test::make_planar(ref_descs[0], ref_buf.data());
     if (attrs.add_to) {
-        for (auto& v : ref_buf) v = 1.0f;
+        for (auto& v : ref_buf) {
+            v = 1.0f;
+        }
     }
     {
         ComputeContext ctx;

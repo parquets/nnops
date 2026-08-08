@@ -62,7 +62,9 @@ void topk_impl_ref(const TopKAttributes& attrs,
     const int64_t v_inner_stride = k;
 
     const int64_t total = outer_dims * inner_size;
-    if (total == 0) return;
+    if (total == 0) {
+        return;
+    }
 
     // Per-position: maintain a small array of top-k (value, index) pairs.
     struct Pair {

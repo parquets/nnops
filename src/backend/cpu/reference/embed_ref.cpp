@@ -54,8 +54,12 @@ void embed_direct_ref_impl(const EmbedAttributes& /*attrs*/,
         }
 
         // Clamp to valid range
-        if (idx < 0) idx = 0;
-        if (idx >= V) idx = V - 1;
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx >= V) {
+            idx = V - 1;
+        }
 
         // Copy weight[idx, :] to output[n, :]
         std::memcpy(out_ptr + n * out_row_stride,
@@ -103,8 +107,12 @@ void embed_int8_dequant_ref_impl(const EmbedAttributes& /*attrs*/,
             idx = static_cast<const int32_t*>(indices.ptr<void>())[n];
         }
 
-        if (idx < 0) idx = 0;
-        if (idx >= V) idx = V - 1;
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx >= V) {
+            idx = V - 1;
+        }
 
         const float s_val = per_token ? qp.scale_data[idx] : per_tensor_scale;
         const float zp_val = has_zp

@@ -73,7 +73,9 @@ void softmax_general_scalar(
             float max_val = -std::numeric_limits<float>::infinity();
             for (int64_t k = 0; k < D; ++k) {
                 float v = s_load(&x_ptr[base + inner_off + k * axis_stride]);
-                if (v > max_val) max_val = v;
+                if (v > max_val) {
+                    max_val = v;
+                }
             }
 
             // ---- Pass 2: sum of exp((x - max) / T) ----
@@ -99,10 +101,14 @@ void softmax_general_scalar(
         }
     };
 
-    if (ctx.cpu_parallel_for)
+    if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, outer_size, process_row);
-    else
-        for (int64_t i = 0; i < outer_size; ++i) process_row(i);
+    }
+    else {
+        for (int64_t i = 0; i < outer_size; ++i) {
+            process_row(i);
+        }
+    }
 }
 
 
@@ -153,10 +159,14 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_rows, process_row);
-        else
-            for (int64_t r = 0; r < num_rows; ++r) process_row(r);
+        }
+        else {
+            for (int64_t r = 0; r < num_rows; ++r) {
+                process_row(r);
+            }
+        }
 
         return;
     }
@@ -173,15 +183,20 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
         // Count spatial positions: product of all dims except C8 (axis=1)
         int64_t num_spatial = 1;
-        for (int64_t d = 0; d < rank; ++d)
-            if (d != 1) num_spatial *= X.shape(d);
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d != 1) {
+                num_spatial *= X.shape(d);
+            }
+        }
 
         const auto process_pos = [&](int64_t s) {
             // Map flat spatial index → tensor offset (skipping C8 dim)
             int64_t off = 0;
             int64_t rem = s;
             for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == 1) continue;
+                if (d == 1) {
+                    continue;
+                }
                 int64_t dim = X.shape(d);
                 off += (rem % dim) * X.stride_elems(d);
                 rem /= dim;
@@ -192,10 +207,14 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 C8, pack, valid_lanes, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_spatial, process_pos);
-        else
-            for (int64_t i = 0; i < num_spatial; ++i) process_pos(i);
+        }
+        else {
+            for (int64_t i = 0; i < num_spatial; ++i) {
+                process_pos(i);
+            }
+        }
 
         return;
     }
@@ -210,14 +229,19 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         const int64_t axis_stride = X.stride_elems(axis);
 
         int64_t num_positions = 1;
-        for (int64_t d = 0; d < rank; ++d)
-            if (d != axis) num_positions *= X.shape(d);
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d != axis) {
+                num_positions *= X.shape(d);
+            }
+        }
 
         const auto process_pos = [&](int64_t s) {
             int64_t off = 0;
             int64_t rem = s;
             for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == axis) continue;
+                if (d == axis) {
+                    continue;
+                }
                 int64_t dim = X.shape(d);
                 off += (rem % dim) * X.stride_elems(d);
                 rem /= dim;
@@ -228,10 +252,14 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 D, pack, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_positions, process_pos);
-        else
-            for (int64_t i = 0; i < num_positions; ++i) process_pos(i);
+        }
+        else {
+            for (int64_t i = 0; i < num_positions; ++i) {
+                process_pos(i);
+            }
+        }
 
         return;
     }
@@ -242,8 +270,9 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
     if (axis == rank - 1) {
         int64_t num_rows = 1;
-        for (int64_t i = 0; i < axis; ++i)
+        for (int64_t i = 0; i < axis; ++i) {
             num_rows *= X.shape(i);
+        }
 
         const int64_t D = X.shape(axis);
         const int64_t group_stride = (axis > 0) ? X.stride_elems(axis - 1) : D;
@@ -253,10 +282,14 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 x_ptr + row * group_stride, y_ptr + row * group_stride, D, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for)
+        if (ctx.cpu_parallel_for) {
             ctx.cpu_parallel_for(0, num_rows, process_row);
-        else
-            for (int64_t row = 0; row < num_rows; ++row) process_row(row);
+        }
+        else {
+            for (int64_t row = 0; row < num_rows; ++row) {
+                process_row(row);
+            }
+        }
 
         return;
     }
@@ -267,14 +300,16 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
     {
         int64_t outer_size = 1;
-        for (int64_t i = 0; i < axis; ++i)
+        for (int64_t i = 0; i < axis; ++i) {
             outer_size *= X.shape(i);
+        }
 
         const int64_t D = X.shape(axis);
 
         int64_t inner_total = 1;
-        for (int64_t i = axis + 1; i < rank; ++i)
+        for (int64_t i = axis + 1; i < rank; ++i) {
             inner_total *= X.shape(i);
+        }
 
         softmax_general_scalar<T>(
             x_ptr, y_ptr, X,

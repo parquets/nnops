@@ -106,7 +106,9 @@ void GroupNorm::compute(std::span<TensorView> outputs,
     // Validate groups
     const int64_t C = input.shape(1);
     int64_t G = attrs_.num_groups;
-    if (G <= 0) G = 1;
+    if (G <= 0) {
+        G = 1;
+    }
     NNOPS_ASSERT(C % G == 0);  // C must be divisible by num_groups
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);

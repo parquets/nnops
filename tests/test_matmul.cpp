@@ -475,7 +475,9 @@ NNOPS_TEST(matmul_broadcast_multi_dim) {
     b_data[8+4+0] = 1.0f;   // B[0,1,2,0] = 1
     b_data[8+6+1] = 1.0f;   // B[0,1,3,1] = 1
     // B[0,3,:,:]: all ones
-    for (int i = 0; i < 8; ++i) b_data[24 + i] = 1.0f;
+    for (int i = 0; i < 8; ++i) {
+        b_data[24 + i] = 1.0f;
+    }
 
     TensorView a(ashape, DataType::f32, a_data.data());
     TensorView b(bshape, DataType::f32, b_data.data());
@@ -610,7 +612,9 @@ NNOPS_TEST(matmul_beta_add_to_output) {
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
     // Pre-fill C_old with 10.0
-    for (auto& v : out_buf) v = 10.0f;
+    for (auto& v : out_buf) {
+        v = 10.0f;
+    }
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
@@ -655,7 +659,9 @@ NNOPS_TEST(matmul_beta_zero_overwrite) {
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
     // Pre-fill with garbage: should be ignored since beta=0
-    for (auto& v : out_buf) v = 999.0f;
+    for (auto& v : out_buf) {
+        v = 999.0f;
+    }
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
@@ -754,7 +760,9 @@ NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
     // Pre-fill C_old with 10.0
-    for (auto& v : out_buf) v = 10.0f;
+    for (auto& v : out_buf) {
+        v = 10.0f;
+    }
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};

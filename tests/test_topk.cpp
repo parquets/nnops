@@ -127,9 +127,15 @@ NNOPS_TEST(topk_1d_unsorted) {
     // Check each expected value appears
     bool has_10 = false, has_8 = false, has_6 = false;
     for (int i = 0; i < 3; ++i) {
-        if (found_vals[i] == 10.0f) has_10 = true;
-        if (found_vals[i] == 8.0f) has_8 = true;
-        if (found_vals[i] == 6.0f) has_6 = true;
+        if (found_vals[i] == 10.0f) {
+            has_10 = true;
+        }
+        if (found_vals[i] == 8.0f) {
+            has_8 = true;
+        }
+        if (found_vals[i] == 6.0f) {
+            has_6 = true;
+        }
     }
     NNOPS_EXPECT_TRUE(has_10);
     NNOPS_EXPECT_TRUE(has_8);

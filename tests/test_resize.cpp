@@ -56,13 +56,17 @@ void test_nchwc8_vs_nchw(const std::vector<int64_t>& in_shape,
     }
 
     size_t ref_elems = 1;
-    for (auto d : oshape_ref) ref_elems *= static_cast<size_t>(d);
+    for (auto d : oshape_ref) {
+        ref_elems *= static_cast<size_t>(d);
+    }
     std::vector<float> ref_out(ref_elems);
     TensorView out_ref(oshape_ref, DataType::f32, ref_out.data(), planar_layout);
 
     const float prefill_val = 0.5f;
     if (attrs.add_to) {
-        for (auto& v : ref_out) v = prefill_val;
+        for (auto& v : ref_out) {
+            v = prefill_val;
+        }
     }
 
     {

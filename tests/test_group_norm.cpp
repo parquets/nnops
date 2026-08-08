@@ -354,7 +354,9 @@ NNOPS_TEST(group_norm_rank3_ncw) {
     // mean over all 12 elements = 6.5
     float mean = 6.5f;
     float var = 0.0f;
-    for (int i = 0; i < 12; ++i) var += (x_data[i] - mean) * (x_data[i] - mean);
+    for (int i = 0; i < 12; ++i) {
+        var += (x_data[i] - mean) * (x_data[i] - mean);
+    }
     var /= 12.0f;
     float eps = 1e-5f;
     float inv_std = 1.0f / std::sqrt(var + eps);

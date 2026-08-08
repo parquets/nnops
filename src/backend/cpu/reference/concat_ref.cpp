@@ -63,8 +63,9 @@ void concat_packed_c_axis_ref(TensorView& output,
             }
             // Find which input provides this logical channel
             int64_t in_idx = 0;
-            while (in_idx < N - 1 && o_lc >= ch_start[static_cast<size_t>(in_idx + 1)])
+            while (in_idx < N - 1 && o_lc >= ch_start[static_cast<size_t>(in_idx + 1)]) {
                 ++in_idx;
+            }
             int64_t in_lc = o_lc - ch_start[static_cast<size_t>(in_idx)];
             lane_map[static_cast<size_t>(c8)][static_cast<size_t>(lane)] = {
                 in_idx,
@@ -81,7 +82,9 @@ void concat_packed_c_axis_ref(TensorView& output,
         const auto& map = lane_map[static_cast<size_t>(c8)];
         int64_t src_idx = map[0].input_idx;
         int64_t src_c8  = map[0].c8_block;
-        if (src_idx < 0) continue;
+        if (src_idx < 0) {
+            continue;
+        }
         bool is_full = true;
         for (int64_t l = 0; l < pack; ++l) {
             if (map[static_cast<size_t>(l)].input_idx != src_idx ||
@@ -91,7 +94,9 @@ void concat_packed_c_axis_ref(TensorView& output,
                 break;
             }
         }
-        if (is_full) full_copy_src[static_cast<size_t>(c8)] = src_idx;
+        if (is_full) {
+            full_copy_src[static_cast<size_t>(c8)] = src_idx;
+        }
     }
 
     // Iterate over all spatial positions and fill C8 blocks
@@ -157,7 +162,9 @@ void concat_impl_ref(const ConcatAttributes& attrs,
                       std::span<const TensorView> inputs)
 {
     const int64_t N = static_cast<int64_t>(inputs.size());
-    if (N == 0) return;
+    if (N == 0) {
+        return;
+    }
 
     const int64_t rank = inputs[0].rank();
     const int64_t ax = (attrs.axis < 0) ? attrs.axis + rank : attrs.axis;
@@ -229,10 +236,12 @@ void concat_impl_ref(const ConcatAttributes& attrs,
             std::vector<int64_t> pre_sizes(static_cast<size_t>(n_pre));
             std::vector<int64_t> pre_strides(static_cast<size_t>(n_pre));
             for (int64_t d = 0; d < n_pre; ++d) {
-                if (d == 1 && pack > 1)
+                if (d == 1 && pack > 1) {
                     pre_sizes[static_cast<size_t>(d)] = output.num_channel_blocks();
-                else
+                }
+                else {
                     pre_sizes[static_cast<size_t>(d)] = output.shape(d);
+                }
                 pre_strides[static_cast<size_t>(d)] = output.stride_elems(d);
             }
 
@@ -241,10 +250,11 @@ void concat_impl_ref(const ConcatAttributes& attrs,
             do {
                 // Compute output base offset for this outer position
                 int64_t o_base = 0;
-                for (int64_t d = 0; d < n_pre; ++d)
+                for (int64_t d = 0; d < n_pre; ++d) {
                     o_base += idx[static_cast<size_t>(d)]
                             * pre_strides[static_cast<size_t>(d)];
 
+                }
                 for (int64_t n = 0; n < N; ++n) {
                     const auto& in = inputs[static_cast<size_t>(n)];
                     const int64_t in_axis_dim = in.shape(ax);
@@ -253,10 +263,11 @@ void concat_impl_ref(const ConcatAttributes& attrs,
 
                     // Compute input base offset
                     int64_t i_base = 0;
-                    for (int64_t d = 0; d < n_pre; ++d)
+                    for (int64_t d = 0; d < n_pre; ++d) {
                         i_base += idx[static_cast<size_t>(d)]
                                 * in.stride_elems(d);
 
+                    }
                     int64_t o_pos = o_base
                         + axis_offset[static_cast<size_t>(n)] * phys_inner;
                     int64_t i_pos = i_base;
@@ -273,7 +284,9 @@ void concat_impl_ref(const ConcatAttributes& attrs,
                 while (d >= 0 && ++idx[static_cast<size_t>(d)]
                                   == pre_sizes[static_cast<size_t>(d)])
                     idx[static_cast<size_t>(d--)] = 0;
-                if (d < 0) break;
+                if (d < 0) {
+                    break;
+                }
             } while (true);
         }
     }

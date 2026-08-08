@@ -335,8 +335,9 @@ NNOPS_TEST(slice_random_f16) {
     // Convert to f16
     const int64_t numel = 3 * 8 * 4;
     std::vector<nnops::backend::cpu::half> in_half(static_cast<size_t>(numel));
-    for (int64_t i = 0; i < numel; ++i)
+    for (int64_t i = 0; i < numel; ++i) {
         simd::s_store(&in_half[static_cast<size_t>(i)], f32_vec[static_cast<size_t>(i)]);
+    }
 
     TensorView input(in_shape, DataType::f16, in_half.data());
 

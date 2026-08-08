@@ -39,7 +39,9 @@ NNOPS_TEST(softmax_last_axis) {
 
     // exp(1)=2.718, exp(2)=7.389, exp(3)=20.086 → sum=30.193
     float sum_exp = 0.0f;
-    for (int i = 0; i < 3; ++i) sum_exp += std::exp(in_data[i]);
+    for (int i = 0; i < 3; ++i) {
+        sum_exp += std::exp(in_data[i]);
+    }
     NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum_exp, 1e-4f);
@@ -77,7 +79,9 @@ NNOPS_TEST(softmax_2d_axis_1) {
 
     // Row 0: same as 1D test
     float sum0 = 0.0f;
-    for (int i = 0; i < 3; ++i) sum0 += std::exp(in_data[i]);
+    for (int i = 0; i < 3; ++i) {
+        sum0 += std::exp(in_data[i]);
+    }
     NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum0, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum0, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum0, 1e-4f);
@@ -287,7 +291,9 @@ NNOPS_TEST(softmax_nchwc8_random) {
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
-    for (auto& v : in_data) v = dist(rng);
+    for (auto& v : in_data) {
+        v = dist(rng);
+    }
 
     SoftmaxAttributes attrs;
     attrs.axis = -1;
@@ -552,8 +558,9 @@ NNOPS_TEST(softmax_nchw_axis_first) {
     const int64_t total = N * C * H * W;  // 48
 
     std::vector<float> in_data(static_cast<size_t>(total));
-    for (size_t i = 0; i < in_data.size(); ++i)
+    for (size_t i = 0; i < in_data.size(); ++i) {
         in_data[i] = static_cast<float>(i) * 0.1f;
+    }
 
     TensorView input(shape, DataType::f32, in_data.data(), TensorLayout::NCHW);
     auto d_in = input.desc();
