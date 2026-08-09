@@ -44,4 +44,5 @@
 #include "nnops/ops/slice.hpp"
 #include "nnops/ops/softmax.hpp"
 #include "nnops/ops/topk.hpp"
+#include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/ops/unary.hpp"

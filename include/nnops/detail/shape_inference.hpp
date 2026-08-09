@@ -182,6 +182,48 @@ inline std::vector<TensorDesc> conv3d_output_shape(
     return {out};
 }
 
+/// TransposeConv2D shape inference.
+/// inputs[0] = input  [N, IC, IH, IW]
+/// inputs[1] = weight [IC, OC/G, KH, KW]
+/// inputs[2] = bias   [OC] (optional)
+/// Returns: [N, OC, OH, OW]
+/// Output formula: OH = (IH-1)*SH - 2*PH + DH*(KH-1) + output_padding_H + 1
+inline std::vector<TensorDesc> transpose_conv2d_output_shape(
+    std::span<const int64_t> kernel_size,
+    std::span<const int64_t> stride,
+    std::span<const int64_t> dilation,
+    std::span<const int64_t> padding,
+    std::span<const int64_t> output_padding,
+    int64_t groups,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];  // [N, IC, IH, IW]
+    const auto& wt = inputs[1];  // [IC, OC/G, KH, KW]
+
+    TensorDesc out;
+    out.rank   = 4;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(4);
+    out.dims[0] = in.dims[0];              // N
+    out.dims[1] = wt.dims[1] * groups;     // OC = (OC/G) * groups
+
+    // Transpose conv output formula per spatial dimension:
+    //   O = (I - 1) * S - 2*P + D*(K - 1) + output_padding + 1
+    auto compute_output = [](int64_t I, int64_t K, int64_t S,
+                              int64_t D, int64_t P, int64_t OP) {
+        return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
+    };
+
+    out.dims[2] = compute_output(
+        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
+    out.dims[3] = compute_output(
+        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
+
+    return {out};
+}
+
 /// DepthwiseConv shape inference (2D / 3D auto-detected from input rank).
 /// inputs[0] = input  [N, C, (D,) H, W]
 /// inputs[1] = weight [C, 1, (KD,) KH, KW]

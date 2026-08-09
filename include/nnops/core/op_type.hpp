@@ -41,6 +41,7 @@ enum class OpType : uint8_t {
     Permute         = 30,
     Slice           = 31,
     GroupNorm       = 32,
+    TransposeConv2D = 33,
 };
 
 }  // namespace nnops
