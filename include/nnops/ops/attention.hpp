@@ -21,18 +21,16 @@ struct AttentionAttributes {
     /// If 0, auto-computed as 1/sqrt(head_dim).
     float scale = 0.0f;
 
-    /// If true, apply a causal (lower-triangular) mask.
-    bool use_causal_mask = false;
-
-    /// If true, add result to existing output buffer instead of overwriting.
-    bool add_to = false;
+    /// Number of key-value head groups for GQA (Grouped Query Attention).
+    /// When 0 (default), equals num_heads (standard MHA).
+    /// When < num_heads, KV heads are shared across query head groups.
+    int64_t num_group = 0;
 };
 
 /// Multi-head scaled dot-product Attention operator (class-based API).
 ///
 /// Computes:
 ///   scores = Q @ K^T * scale
-///   if causal: scores += causal_mask
 ///   if mask provided: scores += mask
 ///   attn_weights = softmax(scores, dim=-1)
 ///   output = attn_weights @ V

@@ -176,15 +176,14 @@ inline float load_f32(const void* ptr, int64_t offset, DataType dtype) {
     }
 }
 
-inline void store_f32(void* ptr, int64_t offset, float val, DataType dtype, bool add_to) {
+inline void store_f32(void* ptr, int64_t offset, float val, DataType dtype) {
     float* dst = static_cast<float*>(ptr);
     if (dtype == DataType::f32) {
-        dst[offset] = add_to ? dst[offset] + val : val;
+        dst[offset] = val;
     } else {
         // f16 compute dtype
         uint16_t* dst16 = static_cast<uint16_t*>(ptr);
-        float existing = add_to ? half_to_float(half(dst16[offset])) : 0.0f;
-        dst16[offset] = float_to_half(existing + val).bits;
+        dst16[offset] = float_to_half(val).bits;
     }
 }
 
@@ -369,7 +368,7 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
                 }
 
                 store_f32(o_ptr, comp_offset(output, b, h, i, d, o_row_stride),
-                          sum, comp_dtype, attrs.add_to);
+                          sum, comp_dtype);
             }
         }
     };

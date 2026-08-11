@@ -692,69 +692,7 @@ NNOPS_TEST(causal_attention_op_type) {
 }
 
 // ============================================================
-// Test 13: add_to
-// ============================================================
-
-NNOPS_TEST(causal_attention_add_to) {
-    const int64_t B = 1, H = 1, D = 4, max_len = 4;
-    const std::vector<int64_t> qk_sh = {B, H, 1, D};
-    const std::vector<int64_t> cache_sh = {B, H, max_len, D};
-
-    auto [q_vec, q_tv] = test::make_random_tensor(qk_sh, -1.0f, 1.0f, 800);
-    auto [k_vec, k_tv] = test::make_random_tensor(qk_sh, -1.0f, 1.0f, 801);
-    auto [v_vec, v_tv] = test::make_random_tensor(qk_sh, -1.0f, 1.0f, 802);
-
-    std::vector<float> kc1, vc1, out1, kc2, vc2, out2, out_pure;
-    auto kc_tv1 = make_f32tv(cache_sh, kc1);
-    auto vc_tv1 = make_f32tv(cache_sh, vc1);
-    auto o1 = make_f32tv(qk_sh, out1);
-    auto kc_tv2 = make_f32tv(cache_sh, kc2);
-    auto vc_tv2 = make_f32tv(cache_sh, vc2);
-    auto o2 = make_f32tv(qk_sh, out2);
-    auto o_pure = make_f32tv(qk_sh, out_pure);
-
-    // Pre-fill o2 with initial values
-    for (auto& x : out2) {
-        x = 0.5f;
-    }
-
-    int64_t pos_buf = 0, len_buf = 0;
-    auto cache_pos = make_scalar_i64(pos_buf);
-    auto cache_len = make_scalar_i64(len_buf);
-
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
-    CausalAttentionAttributes attrs_plain;
-    attrs_plain.num_heads = H;
-    attrs_plain.max_cache_seq_len = max_len;
-    attrs_plain.max_chunk_size = 1;
-    auto op_plain = CausalAttention::create(attrs_plain, Backend::CPU);
-
-    // Pure result (no add_to)
-    {
-        const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
-        TensorView outs[] = {o_pure, kc_tv1, vc_tv1};
-        op_plain->compute(outs, ins, {}, workspace.data());
-    }
-
-    // add_to result
-    CausalAttentionAttributes attrs_add = attrs_plain;
-    attrs_add.add_to = true;
-    auto op_add = CausalAttention::create(attrs_add, Backend::CPU);
-    {
-        const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
-        TensorView outs[] = {o2, kc_tv2, vc_tv2};
-        op_add->compute(outs, ins, {}, workspace.data());
-    }
-
-    for (size_t i = 0; i < out1.size(); ++i) {
-        NNOPS_EXPECT_NEAR(out2[i], 0.5f + out_pure[i], 1e-5f);
-    }
-}
-
-// ============================================================
-// Test 14: Chunk prefill with past cache
+// Test 13: Chunk prefill with past cache
 // ============================================================
 
 NNOPS_TEST(causal_attention_chunk_with_past) {

@@ -58,8 +58,7 @@ void reduce_packed_simd(const ReduceAttributes& attrs,
 
     if (ctx.cpu_parallel_for) {
         ctx.cpu_parallel_for(0, num_rows, process_row);
-    }
-    else {
+    } else {
         for (int64_t r = 0; r < num_rows; ++r) {
             process_row(r);
         }

@@ -98,7 +98,7 @@ void attention_ref(const AttentionAttributes& attrs,
         int64_t idx = merged
             ? (b * Sq + s) * row_stride + h * D + d
             : ((b * H + h) * Sq + s) * row_stride + d;
-        ptr[idx] = attrs.add_to ? ptr[idx] + val : val;
+        ptr[idx] = val;
     };
 
     // Per-head compute lambda
@@ -122,16 +122,7 @@ void attention_ref(const AttentionAttributes& attrs,
             }
         }
 
-        // Step 2: Apply causal mask if requested
-        if (attrs.use_causal_mask) {
-            for (int64_t i = 0; i < Sq; ++i) {
-                for (int64_t j = i + 1; j < Sk; ++j) {
-                    scores[i * Sk + j] = -std::numeric_limits<float>::infinity();
-                }
-            }
-        }
-
-        // Step 3: Apply explicit mask if provided
+        // Step 2: Apply explicit mask if provided
         if (has_mask) {
             for (int64_t i = 0; i < Sq; ++i) {
                 for (int64_t j = 0; j < Sk; ++j) {

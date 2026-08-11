@@ -49,8 +49,16 @@ struct CausalAttentionAttributes {
     /// Softmax temperature (T > 0). T=1.0 is standard softmax.
     float temperature = 1.0f;
 
-    /// If true, add result to existing output buffer instead of overwriting.
-    bool add_to = false;
+    /// Number of key-value head groups for GQA (Grouped Query Attention).
+    /// When 0 (default), equals num_heads (standard MHA).
+    /// When < num_heads, KV heads are shared across query head groups.
+    int64_t num_group = 0;
+
+    /// Data type for KV-cache storage (f32/f16).
+    DataType kv_cache_dtype = DataType::f32;
+
+    /// If true, apply QK normalization (QK-norm) before softmax.
+    bool qk_norm = false;
 };
 
 /// Causal self-attention with KV-cache (class-based API).
