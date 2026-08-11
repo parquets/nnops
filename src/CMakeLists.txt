@@ -30,6 +30,7 @@ set(NNOPS_CPU_SOURCES
     ops/grid_sample.cpp
     ops/group_norm.cpp
     ops/layout_convert.cpp
+    ops/linear_attention.cpp
     ops/quant_linear.cpp
     ops/concat.cpp
     ops/argminmax.cpp
@@ -43,6 +44,7 @@ set(NNOPS_CPU_SOURCES
 
     # Layout conversion utilities (pack/unpack between NCHW and NCHWC8)
     backend/cpu/layout_convert.cpp
+    backend/cpu/linear_attention.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp

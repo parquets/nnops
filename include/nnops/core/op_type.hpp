@@ -42,6 +42,7 @@ enum class OpType : uint8_t {
     Slice           = 31,
     GroupNorm       = 32,
     TransposeConv2D = 33,
+    LinearAttention = 34,
 };
 
 }  // namespace nnops

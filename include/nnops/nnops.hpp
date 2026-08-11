@@ -33,6 +33,7 @@
 #include "nnops/ops/layer_norm.hpp"
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/ops/linear.hpp"
+#include "nnops/ops/linear_attention.hpp"
 #include "nnops/ops/matmul.hpp"
 #include "nnops/ops/permute.hpp"
 #include "nnops/ops/pooling.hpp"
