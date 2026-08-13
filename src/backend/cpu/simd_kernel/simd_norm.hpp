@@ -2,7 +2,7 @@
 /// @file simd_norm.hpp
 /// @brief SIMD kernel functions for normalization operators.
 ///
-/// Covers BatchNorm, LayerNorm, GroupNorm, and RMSNorm.
+/// Covers BatchNorm, LayerNorm, GroupNorm, RMSNorm, and L2Norm.
 ///
 /// Shared primitives:
 ///   - norm_reduce_sum_sq<T>: 4-wide SIMD reduction of sum + sum_sq over contiguous data,
@@ -13,6 +13,7 @@
 /// High-level kernels (consume the shared primitives):
 ///   - layer_norm_process_row<T>: full LN: norm_reduce_sum_sq → stats → per-element normalize
 ///   - rms_norm_process_row<T>:   full RMS: norm_reduce_sum_sq → rms stats → per-element normalize
+///   - l2_norm_process_row<T>:    full L2: norm_reduce_sum_sq → l2 norm → per-element normalize
 ///
 /// BatchNorm kernels (fused fmadd formula, structurally different):
 ///   - batch_norm_process_packed_row<T>
@@ -242,6 +243,43 @@ inline void batch_norm_process_nonspatial_block(
         float ns = inv_std_val * s_load(&scale[i]);
         float nb_val = s_load(&bias[i]) - s_load(&mean[i]) * ns;
         float rv = s_load(&x[i]) * ns + nb_val;
+        s_store_add(&y[i], rv, add_to);
+    }
+}
+
+// ============================================================
+// L2Norm kernel
+// ============================================================
+
+/// Process one row of L2 normalization using SIMD fast path.
+///
+/// y = x / sqrt(sum(x^2) + epsilon) — no mean subtraction, no scale/bias.
+template <typename T>
+inline void l2_norm_process_row(
+    const T* x, T* y,
+    int64_t n, float epsilon, bool add_to)
+{
+    constexpr int L = simd_lane_for<T>;
+
+    // Pass 1 — SIMD sum_sq reduction via shared primitive (ignore sum)
+    auto sum_sq_pair = norm_reduce_sum_sq<T>(x, n);
+    float sum_sq = sum_sq_pair.second;
+    (void)sum_sq_pair.first;
+
+    const float norm_val = std::sqrt(sum_sq + epsilon);
+    const float inv_norm = 1.0f / norm_val;
+
+    // Pass 2 — SIMD normalize
+    int64_t i = 0;
+    const auto v_inv = v_set1(x, inv_norm);
+
+    for (; i + L <= n; i += L) {
+        auto xv = v_load(x + i);
+        auto rv = v_mul(xv, v_inv);
+        v_store_add(y + i, rv, add_to);
+    }
+    for (; i < n; ++i) {
+        float rv = s_load(&x[i]) * inv_norm;
         s_store_add(&y[i], rv, add_to);
     }
 }

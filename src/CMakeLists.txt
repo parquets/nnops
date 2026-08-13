@@ -15,9 +15,7 @@ set(NNOPS_CPU_SOURCES
     ops/attention.cpp
     ops/softmax.cpp
     ops/cumsum.cpp
-    ops/batch_norm.cpp
-    ops/layer_norm.cpp
-    ops/rms_norm.cpp
+    ops/norm.cpp
     ops/conv3d.cpp
     ops/depthwise_conv.cpp
     ops/eltwise.cpp
@@ -28,7 +26,6 @@ set(NNOPS_CPU_SOURCES
     ops/reduce.cpp
     ops/resize.cpp
     ops/grid_sample.cpp
-    ops/group_norm.cpp
     ops/layout_convert.cpp
     ops/linear_attention.cpp
     ops/quant_linear.cpp
@@ -50,11 +47,9 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/activation.cpp
     backend/cpu/causal_attention.cpp
     backend/cpu/clamp.cpp
-    backend/cpu/batch_norm.cpp
+    backend/cpu/norm.cpp
     backend/cpu/depthwise_conv.cpp
-    backend/cpu/layer_norm.cpp
     backend/cpu/pooling.cpp
-    backend/cpu/rms_norm.cpp
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
     backend/cpu/embed.cpp
@@ -64,7 +59,6 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reduce.cpp
     backend/cpu/resize.cpp
     backend/cpu/grid_sample.cpp
-    backend/cpu/group_norm.cpp
     backend/cpu/quant_linear.cpp
     backend/cpu/concat.cpp
     backend/cpu/argminmax.cpp
@@ -88,9 +82,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/clamp_ref.cpp
     backend/cpu/reference/softmax_ref.cpp
     backend/cpu/reference/cumsum_ref.cpp
-    backend/cpu/reference/batch_norm_ref.cpp
-    backend/cpu/reference/layer_norm_ref.cpp
-    backend/cpu/reference/rms_norm_ref.cpp
+    backend/cpu/reference/norm_ref.cpp
     backend/cpu/reference/conv3d_ref.cpp
     backend/cpu/reference/depthwise_conv_ref.cpp
     backend/cpu/reference/eltwise_ref.cpp
@@ -106,7 +98,6 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/topk_ref.cpp
     backend/cpu/reference/rope_ref.cpp
     backend/cpu/reference/flatten_ref.cpp
-    backend/cpu/reference/group_norm_ref.cpp
     backend/cpu/reference/transpose_conv2d_ref.cpp
 )
 

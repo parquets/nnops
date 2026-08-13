@@ -19,9 +19,7 @@
 #include "nnops/ops/activation.hpp"
 #include "nnops/ops/softmax.hpp"
 #include "nnops/ops/cumsum.hpp"
-#include "nnops/ops/batch_norm.hpp"
-#include "nnops/ops/layer_norm.hpp"
-#include "nnops/ops/rms_norm.hpp"
+#include "nnops/ops/norm.hpp"
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/ops/unary.hpp"
 #include "nnops/ops/reduce.hpp"
@@ -667,7 +665,9 @@ NNOPS_TEST(shape_cumsum_3d) {
 // ============================================================
 
 NNOPS_TEST(shape_batch_norm_identity) {
-    auto op = BatchNorm::create(Backend::CPU);
+    NormAttributes attrs;
+    attrs.type = NormType::BatchNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
 
     TensorDesc in_desc   = td({1, 64, 56, 56});
     TensorDesc sc_desc   = td({64});
@@ -681,7 +681,9 @@ NNOPS_TEST(shape_batch_norm_identity) {
 }
 
 NNOPS_TEST(shape_batch_norm_3d) {
-    auto op = BatchNorm::create(Backend::CPU);
+    NormAttributes attrs;
+    attrs.type = NormType::BatchNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
 
     TensorDesc in_desc   = td({1, 16, 8, 56, 56});
     TensorDesc sc_desc   = td({16});
@@ -699,7 +701,9 @@ NNOPS_TEST(shape_batch_norm_3d) {
 // ============================================================
 
 NNOPS_TEST(shape_layer_norm_identity) {
-    auto op = LayerNorm::create(Backend::CPU);
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
 
     TensorDesc in_desc = td({2, 128, 768});
     TensorDesc sc_desc = td({768});
@@ -710,7 +714,9 @@ NNOPS_TEST(shape_layer_norm_identity) {
 }
 
 NNOPS_TEST(shape_layer_norm_2d) {
-    auto op = LayerNorm::create(Backend::CPU);
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
 
     TensorDesc in_desc = td({4, 256}, DataType::f16, TensorLayout::NCHW);
     TensorDesc sc_desc = td({256}, DataType::f16);
@@ -726,7 +732,9 @@ NNOPS_TEST(shape_layer_norm_2d) {
 // ============================================================
 
 NNOPS_TEST(shape_rms_norm_identity) {
-    auto op = RMSNorm::create(Backend::CPU);
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
 
     TensorDesc in_desc = td({2, 128, 768});
     TensorDesc sc_desc = td({768});
@@ -737,7 +745,9 @@ NNOPS_TEST(shape_rms_norm_identity) {
 }
 
 NNOPS_TEST(shape_rms_norm_4d) {
-    auto op = RMSNorm::create(Backend::CPU);
+    NormAttributes attrs;
+    attrs.type = NormType::RMSNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
 
     TensorDesc in_desc = td({1, 12, 64, 64}, DataType::f32, TensorLayout::NCHW);
     TensorDesc sc_desc = td({64});

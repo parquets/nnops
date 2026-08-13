@@ -13,9 +13,7 @@ set(TEST_SOURCES
     test_clamp.cpp
     test_softmax.cpp
     test_cumsum.cpp
-    test_batch_norm.cpp
-    test_layer_norm.cpp
-    test_rms_norm.cpp
+    test_norm.cpp
     test_simd.cpp
     test_depthwise_conv.cpp
     test_eltwise.cpp
@@ -36,7 +34,6 @@ set(TEST_SOURCES
     test_simd_unary.cpp
     test_simd_eltwise.cpp
     test_flatten.cpp
-    test_group_norm.cpp
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
 )
