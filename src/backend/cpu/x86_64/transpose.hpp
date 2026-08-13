@@ -342,6 +342,23 @@ inline void transpose_16x8_f32(
 //  Used by the floating-point f16 pack pipelines.
 // =========================================================================
 
+/// @brief 4×16 int8 register transpose (byte-level, for the int8 dp4a pack).
+///
+/// Transposes four __m128i registers each holding 16 int8 elements. Unlike
+/// transpose_4x8_i16 (which treats elements as 16-bit), this operates on raw
+/// bytes and is used by the int8 pack_copy_n16 pipeline.
+inline void transpose_4x16_i8(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3) noexcept {
+    const __m128i plo01 = _mm_unpacklo_epi8(v_r0, v_r1);
+    const __m128i phi01 = _mm_unpackhi_epi8(v_r0, v_r1);
+    const __m128i plo23 = _mm_unpacklo_epi8(v_r2, v_r3);
+    const __m128i phi23 = _mm_unpackhi_epi8(v_r2, v_r3);
+
+    v_r0 = _mm_unpacklo_epi16(plo01, plo23);
+    v_r1 = _mm_unpackhi_epi16(plo01, plo23);
+    v_r2 = _mm_unpacklo_epi16(phi01, phi23);
+    v_r3 = _mm_unpackhi_epi16(phi01, phi23);
+}
+
 inline void transpose_4x8_i16(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3) noexcept {
     const __m128i tmp0 = _mm_unpacklo_epi16(v_r0, v_r1);
     const __m128i tmp1 = _mm_unpackhi_epi16(v_r0, v_r1);
