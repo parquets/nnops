@@ -203,7 +203,7 @@ NNOPS_TEST(quantize_linear_2d_per_channel) {
 
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 0);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[3]), 10);
-    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 1);  // round(0.5)=1
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 0);  // round(0.5)=0 (half-to-even)
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[4]), 6);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[2]), 1);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[5]), 4);

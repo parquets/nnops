@@ -2,31 +2,73 @@
 /// @brief SIMD-accelerated CPU implementation of QuantizeLinear / DequantizeLinear.
 ///
 /// Strategy:
-///   - All arithmetic is in f32 (v_f32x8). For f16 input/output, conversion
-///     happens at the boundary via v_cvt_f16_to_f32 / v_cvt_f32_to_f16.
-///   - int8/uint8 → f32 uses v_cvt_s8_to_f32 / v_cvt_u8_to_f32 (8 lanes).
-///   - Packed layouts (NCHWC8/NCDHWC8): per-lane processing — each physical
-///     row of W×8 elements has 8 independent lanes processed with float SIMD.
-///   - PerTensor scale/zp: broadcast to all SIMD lanes.
-///   - PerChannel scale/zp: index per-axis-dimension element.
+///   - The per-row f32→s8/u8 and s8/u8→f32 arithmetic is delegated to the raw
+///     intrinsic arch kernels in `x86_64/quant.hpp` (AVX2+FMA) and
+///     `aarch64/quant.hpp` (NEON) — `quantization<T>` / `dequantization<T>`,
+///     which round half-to-even (ONNX default).
+///   - Every tensor is treated as a flat row-major `numel()` array; packed and
+///     planar layouts are NOT distinguished.
+///   - Per-channel scale/zp maps the `axis` dimension to the kernel's per-row
+///     `M`. The dimensions before `axis` are parallelized over (the `outer`
+///     groups); the dimensions after `axis` form the contiguous per-row `N`.
+///   - f16 input/output is converted to/from f32 at the boundary (the arch
+///     kernels operate on f32 only).
 
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/detail/simd/simd.hpp"
-#include "simd_kernel/simd_quant.hpp"
+#include "nnops/detail/simd/cpu_features.hpp"
+#include "nnops/detail/half.hpp"
 
-#include <algorithm>
-#include <cmath>
+#if defined(NNOPS_ARCH_X86_64)
+#include "x86_64/quant.hpp"
+#elif defined(NNOPS_ARCH_AARCH64)
+#include "aarch64/quant.hpp"
+#else
+#error "quant_linear: unsupported architecture"
+#endif
+
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 namespace nnops::backend::cpu {
 
-using namespace nnops::simd;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
-namespace k = nnops::kernel;
+using nnops::backend::cpu::convert_half_to_float;
+using nnops::backend::cpu::convert_float_to_half;
+
+#if defined(NNOPS_ARCH_X86_64)
+namespace quant_kernel = nnops::backend::cpu::x86_64;
+#elif defined(NNOPS_ARCH_AARCH64)
+namespace quant_kernel = nnops::backend::cpu::aarch64;
+#endif
+
+namespace {
+
+/// Decompose the tensor along `axis` into outer × D × inner element counts.
+/// Dimensions before `axis` collapse into `outer`; after `axis` into `inner`.
+struct AxisDecomp {
+    int64_t outer = 1;
+    int64_t D = 1;
+    int64_t inner = 1;
+};
+
+inline AxisDecomp decompose_axis(const TensorView& x, int64_t axis) {
+    AxisDecomp r;
+    const int64_t rank = x.rank();
+    r.D = x.shape(axis);
+    for (int64_t d = 0; d < axis; ++d) {
+        r.outer *= x.shape(d);
+    }
+    for (int64_t d = axis + 1; d < rank; ++d) {
+        r.inner *= x.shape(d);
+    }
+    return r;
+}
+
+}  // anonymous namespace
 
 // ============================================================
 // QuantizeLinear: float → integer
@@ -48,11 +90,13 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         axis += rank;
     }
 
-    const int64_t D = X.shape(axis);
+    const AxisDecomp dec = decompose_axis(X, axis);
+    const int64_t D = dec.D;
     const bool is_per_channel = (scale.numel() > 1);
     const DataType out_dtype = output.data_type();
+    const int64_t numel = X.numel();
 
-    // Pre-load scale/zp as float
+    // Pre-load scale/zp as float (per-tensor: single value; per-channel: D values).
     std::vector<float> s_f32(static_cast<size_t>(D));
     std::vector<float> z_f32(static_cast<size_t>(D));
     for (int64_t k = 0; k < D; ++k) {
@@ -63,170 +107,49 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
-    const int64_t pack = X.channel_pack_size();
-
-    if (pack > 1 && axis == rank - 1) {
-        // ---- Packed SIMD: axis == last dim (W), per-lane processing ----
-        const int64_t num_rows = X.total_rows();
-        const int64_t x_rs = X.row_stride_elems();
-        const int64_t y_rs = output.row_stride_elems();
-
-        const float s_val = s_f32[0];
-        const float z_val = z_f32[0];
-
-        const auto process_row = [&](int64_t r) {
-            const T* x_row = X.ptr<T>() + r * x_rs;
-            void* y_row = static_cast<char*>(output.ptr<void>()) + r * y_rs;
-
-            for (int64_t w = 0; w < D; ++w) {
-                int64_t off = w * pack;
-                auto vx = k::quant_load_f32(x_row + off);
-                float inv_s = is_per_channel ? (1.0f / s_f32[static_cast<size_t>(w)]) : (1.0f / s_val);
-                auto vs = v_set1_f32x8(inv_s);
-                auto vzp = v_set1_f32x8(is_per_channel ? z_f32[static_cast<size_t>(w)] : z_val);
-                auto vr = v_add(v_mul(vx, vs), vzp);
-                k::quant_store_int8(vr, y_row, off, pack, out_dtype);
-            }
-        };
-
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_rows, process_row);
-        }
-        else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                process_row(r);
-            }
-        }
-
-    } else if (pack > 1) {
-        // ---- Packed general axis: scalar ----
-        const int64_t num_outer = [&]() {
-            int64_t n = 1;
-            for (int64_t d = 0; d < axis; ++d) {
-                n *= X.shape(d);
-            }
-            return n;
-        }();
-        const int64_t num_inner = [&]() {
-            int64_t n = 1;
-            for (int64_t d = axis + 1; d < rank; ++d) {
-                n *= X.shape(d);
-            }
-            return n;
-        }();
-        const int64_t x_outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
-        const int64_t x_axis_stride = X.stride_elems(axis);
-
-        const auto process_outer = [&](int64_t outer) {
-            const T* x_base = X.ptr<T>() + outer * x_outer_stride;
-            void* y_base = static_cast<char*>(output.ptr<void>()) + outer * x_outer_stride;
-
-            for (int64_t inner = 0; inner < num_inner; ++inner) {
-                int64_t inner_off = 0;
-                {
-                    int64_t rem = inner;
-                    for (int64_t d = rank - 1; d > axis; --d) {
-                        inner_off += (rem % X.shape(d)) * X.stride_elems(d);
-                        rem /= X.shape(d);
-                    }
-                }
-                for (int64_t k = 0; k < D; ++k) {
-                    float xv;
-                    if constexpr (std::is_same_v<T, half>) {
-                        xv = half_to_float(x_base[inner_off + k * x_axis_stride]);
-                    }
-                    else {
-                        xv = static_cast<float>(x_base[inner_off + k * x_axis_stride]);
-                    }
-                    float q = std::round(xv / s_f32[static_cast<size_t>(k)]) + z_f32[static_cast<size_t>(k)];
-                    k::quant_write_int8(y_base, out_dtype, inner_off + k * x_axis_stride, static_cast<int32_t>(q));
-                }
-            }
-        };
-
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_outer, process_outer);
-        }
-        else {
-            for (int64_t o = 0; o < num_outer; ++o) {
-                process_outer(o);
-            }
-        }
-
+    // f16 input → f32 temp buffer.
+    std::vector<float> f32_buf;
+    const float* src_ptr;
+    if constexpr (std::is_same_v<T, half>) {
+        f32_buf.resize(static_cast<size_t>(numel));
+        convert_half_to_float(f32_buf.data(), X.ptr<half>(), static_cast<int>(numel));
+        src_ptr = f32_buf.data();
     } else {
-        // ---- Planar layout (NCHW/NCDHW) ----
-        int64_t stride_before_axis = 1;
-        for (int64_t d = 0; d < axis; ++d) {
-            stride_before_axis *= X.shape(d);
+        src_ptr = X.ptr<float>();
+    }
+
+    // Per-group kernel driver, templated on the output integer type U.
+    const auto run = [&](auto u_tag) {
+        using U = typename decltype(u_tag)::type;
+        U* dst = static_cast<U*>(output.ptr<void>());
+
+        if (!is_per_channel) {
+            quant_kernel::quantization<U>(1, static_cast<int>(numel),
+                                          dst, static_cast<int>(numel),
+                                          src_ptr, static_cast<int>(numel),
+                                          s_f32.data(), z_f32.data());
+            return;
         }
 
-        int64_t stride_after_axis = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) {
-            stride_after_axis *= X.shape(d);
-        }
-
-        const auto process_outer = [&](int64_t outer) {
-            int64_t base = outer * D * stride_after_axis;
-
-            // Contiguous tail with per-tensor scale: SIMD fast path
-            if (!is_per_channel && (stride_after_axis == 1 || axis == rank - 1)) {
-                int64_t i = base;
-                float inv_s = 1.0f / s_f32[0];
-                auto vs = v_set1_f32x8(inv_s);
-                auto vzp = v_set1_f32x8(z_f32[0]);
-                for (; i + k::kQuantLane <= base + D * stride_after_axis; i += k::kQuantLane) {
-                    auto vx = k::quant_load_f32(X.ptr<T>() + i);
-                    auto vr = v_add(v_mul(vx, vs), vzp);
-                    k::quant_store_int8(vr, output.ptr<void>(), i, k::kQuantLane, out_dtype);
-                }
-                for (; i < base + D * stride_after_axis; ++i) {
-                    float xv;
-                    if constexpr (std::is_same_v<T, half>) {
-                        xv = half_to_float(X.ptr<T>()[i]);
-                    }
-                    else {
-                        xv = X.ptr<float>()[i];
-                    }
-                    float q = std::round(xv * inv_s) + z_f32[0];
-                    k::quant_write_int8(output.ptr<void>(), out_dtype, i, static_cast<int32_t>(q));
-                }
-            } else {
-                // Per-channel or non-contiguous: scalar loop with per-k scale/zp
-                for (int64_t k = 0; k < D; ++k) {
-                    float inv_s = 1.0f / s_f32[static_cast<size_t>(k)];
-                    float z = z_f32[static_cast<size_t>(k)];
-                    auto vs = v_set1_f32x8(inv_s);
-                    auto vzp = v_set1_f32x8(z);
-                    int64_t ks = base + k * X.stride_elems(axis);
-                    int64_t i = 0;
-                    for (; i + k::kQuantLane <= stride_after_axis; i += k::kQuantLane) {
-                        auto vx = k::quant_load_f32(X.ptr<T>() + ks + i);
-                        auto vr = v_add(v_mul(vx, vs), vzp);
-                        k::quant_store_int8(vr, output.ptr<void>(), ks + i, k::kQuantLane, out_dtype);
-                    }
-                    for (; i < stride_after_axis; ++i) {
-                        float xv;
-                        if constexpr (std::is_same_v<T, half>) {
-                            xv = half_to_float(X.ptr<T>()[ks + i]);
-                        }
-                        else {
-                            xv = X.ptr<float>()[ks + i];
-                        }
-                        float q = std::round(xv * inv_s) + z;
-                        k::quant_write_int8(output.ptr<void>(), out_dtype, ks + i, static_cast<int32_t>(q));
-                    }
-                }
-            }
+        const auto process = [&](int64_t o) {
+            quant_kernel::quantization<U>(static_cast<int>(D), static_cast<int>(dec.inner),
+                                          dst + o * D * dec.inner, static_cast<int>(dec.inner),
+                                          src_ptr + o * D * dec.inner, static_cast<int>(dec.inner),
+                                          s_f32.data(), z_f32.data());
         };
-
         if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, stride_before_axis, process_outer);
-        }
-        else {
-            for (int64_t o = 0; o < stride_before_axis; ++o) {
-                process_outer(o);
+            ctx.cpu_parallel_for(0, dec.outer, process);
+        } else {
+            for (int64_t o = 0; o < dec.outer; ++o) {
+                process(o);
             }
         }
+    };
+
+    if (out_dtype == DataType::s8) {
+        run(std::type_identity<int8_t>{});
+    } else {
+        run(std::type_identity<uint8_t>{});
     }
 }
 
@@ -250,10 +173,11 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         axis += rank;
     }
 
-    const int64_t D = X.shape(axis);
+    const AxisDecomp dec = decompose_axis(X, axis);
+    const int64_t D = dec.D;
     const bool is_per_channel = (scale.numel() > 1);
     const DataType in_dtype = X.data_type();
-    const bool in_is_i8 = (in_dtype == DataType::s8);
+    const int64_t numel = X.numel();
 
     std::vector<float> s_f32(static_cast<size_t>(D));
     std::vector<float> z_f32(static_cast<size_t>(D));
@@ -265,178 +189,52 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
-    const int64_t pack = X.channel_pack_size();
-
-    if (pack > 1 && axis == rank - 1) {
-        // ---- Packed SIMD: axis == last dim (W), per-lane processing ----
-        const int64_t num_rows = X.total_rows();
-        const int64_t x_rs = X.row_stride_elems();
-        const int64_t y_rs = output.row_stride_elems();
-        const int64_t W = X.shape(rank - 1);
-
-        const float s_val = s_f32[0];
-        const float z_val = z_f32[0];
-
-        const auto process_row = [&](int64_t r) {
-            const void* x_row = static_cast<const char*>(X.ptr<void>()) + r * x_rs;
-            T* y_row = output.ptr<T>() + r * y_rs;
-
-            for (int64_t w = 0; w < W; ++w) {
-                int64_t off = w * pack;
-                auto vx = k::load_i8_to_f32(static_cast<const char*>(x_row) + off, in_is_i8);
-                float s = is_per_channel ? s_f32[static_cast<size_t>(w)] : s_val;
-                float z = is_per_channel ? z_f32[static_cast<size_t>(w)] : z_val;
-                auto vs = v_set1_f32x8(s);
-                auto vz = v_set1_f32x8(z);
-                auto vy = v_mul(v_sub(vx, vz), vs);
-                k::quant_store_f32(y_row + off, vy);
-            }
-        };
-
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_rows, process_row);
-        }
-        else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                process_row(r);
-            }
-        }
-
-    } else if (pack > 1) {
-        // ---- Packed general axis: scalar ----
-        const int64_t num_outer = [&]() {
-            int64_t n = 1;
-            for (int64_t d = 0; d < axis; ++d) {
-                n *= X.shape(d);
-            }
-            return n;
-        }();
-        const int64_t num_inner = [&]() {
-            int64_t n = 1;
-            for (int64_t d = axis + 1; d < rank; ++d) {
-                n *= X.shape(d);
-            }
-            return n;
-        }();
-        const int64_t x_outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
-        const int64_t x_axis_stride = X.stride_elems(axis);
-
-        const auto process_outer = [&](int64_t outer) {
-            const void* x_base = static_cast<const char*>(X.ptr<void>()) + outer * x_outer_stride;
-            T* y_base = output.ptr<T>() + outer * x_outer_stride;
-
-            for (int64_t inner = 0; inner < num_inner; ++inner) {
-                int64_t inner_off = 0;
-                {
-                    int64_t rem = inner;
-                    for (int64_t d = rank - 1; d > axis; --d) {
-                        inner_off += (rem % X.shape(d)) * X.stride_elems(d);
-                        rem /= X.shape(d);
-                    }
-                }
-                for (int64_t k = 0; k < D; ++k) {
-                    int64_t off = inner_off + k * x_axis_stride;
-                    int32_t iv = in_is_i8
-                        ? static_cast<int32_t>(static_cast<const int8_t*>(x_base)[off])
-                        : static_cast<int32_t>(static_cast<const uint8_t*>(x_base)[off]);
-                    float yv = (static_cast<float>(iv) - z_f32[static_cast<size_t>(k)]) * s_f32[static_cast<size_t>(k)];
-                    if constexpr (std::is_same_v<T, half>) {
-                        y_base[off] = float_to_half(yv);
-                    }
-                    else {
-                        y_base[off] = yv;
-                    }
-                }
-            }
-        };
-
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_outer, process_outer);
-        }
-        else {
-            for (int64_t o = 0; o < num_outer; ++o) {
-                process_outer(o);
-            }
-        }
-
+    // f16 output → dequant into a f32 temp buffer, then convert.
+    std::vector<float> f32_buf;
+    float* dst_f32;
+    if constexpr (std::is_same_v<T, half>) {
+        f32_buf.resize(static_cast<size_t>(numel));
+        dst_f32 = f32_buf.data();
     } else {
-        // ---- Planar layout (NCHW/NCDHW) ----
-        int64_t stride_before_axis = 1;
-        for (int64_t d = 0; d < axis; ++d) {
-            stride_before_axis *= X.shape(d);
+        dst_f32 = output.ptr<float>();
+    }
+
+    // Per-group kernel driver, templated on the input integer type U.
+    const auto run = [&](auto u_tag) {
+        using U = typename decltype(u_tag)::type;
+        const U* src = static_cast<const U*>(X.ptr<void>());
+
+        if (!is_per_channel) {
+            quant_kernel::dequantization<U>(1, static_cast<int>(numel),
+                                            dst_f32, static_cast<int>(numel),
+                                            src, static_cast<int>(numel),
+                                            s_f32.data(), z_f32.data());
+            return;
         }
 
-        int64_t stride_after_axis = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) {
-            stride_after_axis *= X.shape(d);
-        }
-
-        const auto process_outer = [&](int64_t outer) {
-            int64_t base = outer * D * stride_after_axis;
-
-            // Per-tensor scale with contiguous tail: SIMD fast path
-            if (!is_per_channel && (axis == rank - 1 || stride_after_axis == 1)) {
-                float s = s_f32[0];
-                float z = z_f32[0];
-                const int64_t total = D * stride_after_axis;
-                int64_t i = base;
-                auto vs = v_set1_f32x8(s);
-                auto vz = v_set1_f32x8(z);
-                for (; i + k::kQuantLane <= base + total; i += k::kQuantLane) {
-                    auto vx = k::load_i8_to_f32(static_cast<const char*>(X.ptr<void>()) + i, in_is_i8);
-                    auto vy = v_mul(v_sub(vx, vz), vs);
-                    k::quant_store_f32(output.ptr<T>() + i, vy);
-                }
-                for (; i < base + total; ++i) {
-                    int32_t iv = in_is_i8
-                        ? static_cast<int32_t>(X.ptr<int8_t>()[i])
-                        : static_cast<int32_t>(X.ptr<uint8_t>()[i]);
-                    float yv = (static_cast<float>(iv) - z) * s;
-                    if constexpr (std::is_same_v<T, half>) {
-                        output.ptr<T>()[i] = float_to_half(yv);
-                    }
-                    else {
-                        output.ptr<float>()[i] = yv;
-                    }
-                }
-            } else {
-                // Per-channel or non-contiguous: iterate per axis element
-                for (int64_t k = 0; k < D; ++k) {
-                    float s = s_f32[static_cast<size_t>(k)];
-                    float z = z_f32[static_cast<size_t>(k)];
-                    int64_t ks = base + k * X.stride_elems(axis);
-                    int64_t i = 0;
-                    auto vs = v_set1_f32x8(s);
-                    auto vz = v_set1_f32x8(z);
-                    for (; i + k::kQuantLane <= stride_after_axis; i += k::kQuantLane) {
-                        auto vx = k::load_i8_to_f32(static_cast<const char*>(X.ptr<void>()) + ks + i, in_is_i8);
-                        auto vy = v_mul(v_sub(vx, vz), vs);
-                        k::quant_store_f32(output.ptr<T>() + ks + i, vy);
-                    }
-                    for (; i < stride_after_axis; ++i) {
-                        int32_t iv = in_is_i8
-                            ? static_cast<int32_t>(X.ptr<int8_t>()[ks + i])
-                            : static_cast<int32_t>(X.ptr<uint8_t>()[ks + i]);
-                        float yv = (static_cast<float>(iv) - z) * s;
-                        if constexpr (std::is_same_v<T, half>) {
-                            output.ptr<T>()[ks + i] = float_to_half(yv);
-                        }
-                        else {
-                            output.ptr<float>()[ks + i] = yv;
-                        }
-                    }
-                }
-            }
+        const auto process = [&](int64_t o) {
+            quant_kernel::dequantization<U>(static_cast<int>(D), static_cast<int>(dec.inner),
+                                            dst_f32 + o * D * dec.inner, static_cast<int>(dec.inner),
+                                            src + o * D * dec.inner, static_cast<int>(dec.inner),
+                                            s_f32.data(), z_f32.data());
         };
-
         if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, stride_before_axis, process_outer);
-        }
-        else {
-            for (int64_t o = 0; o < stride_before_axis; ++o) {
-                process_outer(o);
+            ctx.cpu_parallel_for(0, dec.outer, process);
+        } else {
+            for (int64_t o = 0; o < dec.outer; ++o) {
+                process(o);
             }
         }
+    };
+
+    if (in_dtype == DataType::s8) {
+        run(std::type_identity<int8_t>{});
+    } else {
+        run(std::type_identity<uint8_t>{});
+    }
+
+    if constexpr (std::is_same_v<T, half>) {
+        convert_float_to_half(output.ptr<half>(), f32_buf.data(), static_cast<int>(numel));
     }
 }
 

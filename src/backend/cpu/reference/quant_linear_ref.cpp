@@ -152,7 +152,7 @@ void quantize_linear_ref(const QuantLinearAttributes& attrs,
         int32_t z = load_zero_point(zp, s_idx);
 
         float x_val = read_float_input(x, flat);
-        float q = std::round(x_val / s) + static_cast<float>(z);
+        float q = std::nearbyintf(x_val / s) + static_cast<float>(z);
         write_int_output(output, flat, static_cast<int32_t>(q));
     }
 }
