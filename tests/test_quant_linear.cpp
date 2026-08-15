@@ -209,6 +209,112 @@ NNOPS_TEST(quantize_linear_2d_per_channel) {
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[5]), 4);
 }
 
+NNOPS_TEST(quantize_linear_2d_per_token) {
+    // [M, N] → one scale per row (M entries); each row shares its scale.
+    const int64_t shape[] = {2, 3};
+    float in_data[] = {0.0f, 1.0f, 2.0f, 10.0f, 20.0f, 30.0f};
+    TensorView input(shape, DataType::f32, in_data);
+
+    QuantLinearAttributes attrs;
+    attrs.axis = -1;  // per-token (default): one scale per row
+    attrs.output_dtype = DataType::s8;
+    auto op = QuantizeLinear::create(attrs, Backend::CPU);
+
+    std::vector<int8_t> out_buf(6);
+    TensorView output(shape, DataType::s8, out_buf.data());
+
+    float scale_data[] = {1.0f, 10.0f};
+    int8_t zp_data[] = {0, 0};
+    const int64_t s_shape[] = {2};
+    TensorView scale(s_shape, DataType::f32, scale_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
+
+    const TensorView ins[] = {input, scale, zp};
+    op->compute(output, ins);
+
+    // Row 0 (scale=1): 0,1,2
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 0);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 1);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[2]), 2);
+    // Row 1 (scale=10): 1,2,3
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[3]), 1);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[4]), 2);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[5]), 3);
+}
+
+NNOPS_TEST(quantize_linear_3d_per_token) {
+    // [2, 2, 2] → 4 rows of 2 elements; 4 scales (one per row).
+    const int64_t shape[] = {2, 2, 2};
+    float in_data[] = {0.0f, 1.0f, 2.0f, 4.0f, 10.0f, 20.0f, 30.0f, 40.0f};
+    TensorView input(shape, DataType::f32, in_data);
+
+    QuantLinearAttributes attrs;
+    attrs.axis = -1;  // per-token (default): one scale per row
+    attrs.output_dtype = DataType::s8;
+    auto op = QuantizeLinear::create(attrs, Backend::CPU);
+
+    std::vector<int8_t> out_buf(8);
+    TensorView output(shape, DataType::s8, out_buf.data());
+
+    float scale_data[] = {1.0f, 2.0f, 5.0f, 10.0f};
+    int8_t zp_data[] = {0, 0, 0, 0};
+    const int64_t s_shape[] = {4};
+    TensorView scale(s_shape, DataType::f32, scale_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
+
+    const TensorView ins[] = {input, scale, zp};
+    op->compute(output, ins);
+
+    // Row 0 (scale=1): 0,1
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 0);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 1);
+    // Row 1 (scale=2): 2/2=1, 4/2=2
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[2]), 1);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[3]), 2);
+    // Row 2 (scale=5): 10/5=2, 20/5=4
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[4]), 2);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[5]), 4);
+    // Row 3 (scale=10): 30/10=3, 40/10=4
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[6]), 3);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[7]), 4);
+}
+
+NNOPS_TEST(quantize_linear_per_channel_axis0_weights) {
+    // Weight-like [OC, IC] quantized per output channel (axis=0): the
+    // PerChannel mode is reserved for weights.
+    const int64_t shape[] = {2, 4};
+    float in_data[] = {0.0f, 1.0f, 2.0f, 3.0f, 10.0f, 20.0f, 30.0f, 40.0f};
+    TensorView input(shape, DataType::f32, in_data);
+
+    QuantLinearAttributes attrs;
+    attrs.axis = 0;
+    attrs.output_dtype = DataType::s8;
+    auto op = QuantizeLinear::create(attrs, Backend::CPU);
+
+    std::vector<int8_t> out_buf(8);
+    TensorView output(shape, DataType::s8, out_buf.data());
+
+    float scale_data[] = {1.0f, 10.0f};
+    int8_t zp_data[] = {0, 0};
+    const int64_t s_shape[] = {2};
+    TensorView scale(s_shape, DataType::f32, scale_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
+
+    const TensorView ins[] = {input, scale, zp};
+    op->compute(output, ins);
+
+    // Channel 0 (scale=1): 0,1,2,3
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 0);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 1);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[2]), 2);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[3]), 3);
+    // Channel 1 (scale=10): 1,2,3,4
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[4]), 1);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[5]), 2);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[6]), 3);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[7]), 4);
+}
+
 NNOPS_TEST(quantize_linear_random) {
     auto [in_vec, input] = test::make_random_tensor({4, 8}, -10.0f, 10.0f);
 
@@ -345,6 +451,39 @@ NNOPS_TEST(dequantize_linear_2d_per_channel) {
     NNOPS_EXPECT_NEAR(out_buf[1], 0.0f, 1e-5f);
     NNOPS_EXPECT_NEAR(out_buf[4], 10.0f, 1e-5f);
     NNOPS_EXPECT_NEAR(out_buf[2], 3.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 12.0f, 1e-5f);
+}
+
+NNOPS_TEST(dequantize_linear_2d_per_token) {
+    // [M, N] → one scale per row (M entries).
+    const int64_t shape[] = {2, 3};
+    int8_t in_data[] = {1, 2, 3, 4, 5, 6};
+    TensorView input(shape, DataType::s8, in_data);
+
+    QuantLinearAttributes attrs;
+    attrs.axis = -1;  // per-token (default): one scale per row
+    attrs.output_dtype = DataType::f32;
+    auto op = DequantizeLinear::create(attrs, Backend::CPU);
+
+    std::vector<float> out_buf(6);
+    TensorView output(shape, DataType::f32, out_buf.data());
+
+    float scale_data[] = {0.5f, 2.0f};
+    int8_t zp_data[] = {0, 0};
+    const int64_t s_shape[] = {2};
+    TensorView scale(s_shape, DataType::f32, scale_data);
+    TensorView zp(s_shape, DataType::s8, zp_data);
+
+    const TensorView ins[] = {input, scale, zp};
+    op->compute(output, ins);
+
+    // Row 0 (scale=0.5): 0.5, 1.0, 1.5
+    NNOPS_EXPECT_NEAR(out_buf[0], 0.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 1.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 1.5f, 1e-5f);
+    // Row 1 (scale=2.0): 8.0, 10.0, 12.0
+    NNOPS_EXPECT_NEAR(out_buf[3], 8.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[4], 10.0f, 1e-5f);
     NNOPS_EXPECT_NEAR(out_buf[5], 12.0f, 1e-5f);
 }
 

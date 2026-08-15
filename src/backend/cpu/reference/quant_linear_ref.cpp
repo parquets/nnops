@@ -88,6 +88,37 @@ inline int32_t int_max_for(DataType dt) {
     return (dt == DataType::s8) ? 127 : 255;
 }
 
+/// Resolve the PerChannel quantization axis (negative → from end).
+inline int64_t resolve_quant_axis(const TensorView& x, int64_t axis) {
+    return axis < 0 ? axis + x.rank() : axis;
+}
+
+/// Compute the index into scale/zero_point for a flat element offset.
+///
+///   PerTensor  → 0
+///   PerToken   → row index (flat / last_dim) — one parameter per row
+///   PerChannel → axis coordinate ((flat / stride_after_axis) % shape[axis])
+inline int64_t quant_param_index(const TensorView& x, int64_t flat,
+                                 QuantGranularity g, int64_t axis) {
+    switch (g) {
+    case QuantGranularity::PerToken: {
+        const int64_t last_dim = x.shape(x.rank() - 1);
+        return flat / last_dim;
+    }
+    case QuantGranularity::PerChannel: {
+        const int64_t D = x.shape(axis);
+        int64_t stride_after = 1;
+        for (int64_t d = axis + 1; d < x.rank(); ++d) {
+            stride_after *= x.shape(d);
+        }
+        return (flat / stride_after) % D;
+    }
+    case QuantGranularity::PerTensor:
+    default:
+        return 0;
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -104,55 +135,21 @@ void quantize_linear_ref(const QuantLinearAttributes& attrs,
     const auto& scale = inputs[1];  // f32
     const auto& zp    = inputs[2];  // s8 or u8
 
-    const int64_t rank = x.rank();
-    int64_t axis = attrs.axis;
-    if (axis < 0) {
-        axis += rank;
-    }
-    NNOPS_ASSERT(axis >= 0 && axis < rank);
+    const QuantGranularity g = resolve_quant_granularity(scale, attrs.axis);
+    const int64_t axis = resolve_quant_axis(x, attrs.axis);
+    NNOPS_ASSERT(axis >= 0 && axis < x.rank());
 
-    const int64_t D = x.shape(axis);
-    const bool is_per_channel = (scale.numel() > 1);
     const int64_t n_total = x.numel();
 
     // Flatten the tensor: for each element, compute its scale/zp index
     // and apply the quantization formula.
     for (int64_t flat = 0; flat < n_total; ++flat) {
-        // Compute the axis index for this flat position
-        int64_t ax_idx = 0;
-        {
-            int64_t rem = flat;
-            for (int64_t d = 0; d <= axis; ++d) {
-                int64_t dim = x.shape(d);
-                int64_t coord = rem;
-                if (d < axis) {
-                    // Divide by inner dimensions
-                    for (int64_t inner = d + 1; inner < rank; ++inner) {
-                        coord /= x.shape(inner);
-                    }
-                } else {
-                    coord = rem % dim;
-                }
-                if (d == axis) {
-                    ax_idx = coord;
-                }
-                rem = rem;
-            }
-            // Simpler approach: build coordinate and read axis
-            int64_t tmp = flat;
-            int64_t stride_after_axis = 1;
-            for (int64_t d = axis + 1; d < rank; ++d) {
-                stride_after_axis *= x.shape(d);
-            }
-            ax_idx = (flat / stride_after_axis) % D;
-        }
+        const int64_t s_idx = quant_param_index(x, flat, g, axis);
+        const float s = load_scale(scale, s_idx);
+        const int32_t z = load_zero_point(zp, s_idx);
 
-        int64_t s_idx = is_per_channel ? ax_idx : 0;
-        float s = load_scale(scale, s_idx);
-        int32_t z = load_zero_point(zp, s_idx);
-
-        float x_val = read_float_input(x, flat);
-        float q = std::nearbyintf(x_val / s) + static_cast<float>(z);
+        const float x_val = read_float_input(x, flat);
+        const float q = std::nearbyintf(x_val / s) + static_cast<float>(z);
         write_int_output(output, flat, static_cast<int32_t>(q));
     }
 }
@@ -171,30 +168,19 @@ void dequantize_linear_ref(const QuantLinearAttributes& attrs,
     const auto& scale = inputs[1];  // f32
     const auto& zp    = inputs[2];  // s8 or u8
 
-    const int64_t rank = x.rank();
-    int64_t axis = attrs.axis;
-    if (axis < 0) {
-        axis += rank;
-    }
-    NNOPS_ASSERT(axis >= 0 && axis < rank);
+    const QuantGranularity g = resolve_quant_granularity(scale, attrs.axis);
+    const int64_t axis = resolve_quant_axis(x, attrs.axis);
+    NNOPS_ASSERT(axis >= 0 && axis < x.rank());
 
-    const int64_t D = x.shape(axis);
-    const bool is_per_channel = (scale.numel() > 1);
     const int64_t n_total = x.numel();
 
     for (int64_t flat = 0; flat < n_total; ++flat) {
-        int64_t stride_after_axis = 1;
-        for (int64_t d = axis + 1; d < rank; ++d) {
-            stride_after_axis *= x.shape(d);
-        }
-        int64_t ax_idx = (flat / stride_after_axis) % D;
+        const int64_t s_idx = quant_param_index(x, flat, g, axis);
+        const float s = load_scale(scale, s_idx);
+        const int32_t z = load_zero_point(zp, s_idx);
 
-        int64_t s_idx = is_per_channel ? ax_idx : 0;
-        float s = load_scale(scale, s_idx);
-        int32_t z = load_zero_point(zp, s_idx);
-
-        int32_t x_val = read_int_input(x, flat);
-        float y_val = (static_cast<float>(x_val) - static_cast<float>(z)) * s;
+        const int32_t x_val = read_int_input(x, flat);
+        const float y_val = (static_cast<float>(x_val) - static_cast<float>(z)) * s;
         write_float_output(output, flat, y_val);
     }
 }

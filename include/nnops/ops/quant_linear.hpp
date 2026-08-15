@@ -8,10 +8,23 @@
 /// DequantizeLinear: integer (s8/u8) → float (f32)
 ///   y = (x - zero_point) * scale
 ///
-/// Both support three quantization granularities via scale/zero_point shape:
-///   PerTensor:  scale and zero_point are scalars (rank-0 or single-element)
-///   PerChannel: scale and zero_point are 1D along `axis` (shape[axis] elements)
-///   PerToken:   scale and zero_point are 1D along `axis` (generalized)
+/// Three quantization granularities, selected by the `axis` attribute and the
+/// scale/zero_point shape (matching ONNX conventions):
+///
+///   PerTensor:  scale and zero_point are scalars (numel == 1). One shared
+///               parameter for the whole tensor, regardless of `axis`.
+///
+///   PerToken:   `axis == -1` (the default) with a per-row scale/zero_point.
+///               The last (innermost) dimension is the quantization unit: every
+///               element in the same row shares one parameter; different rows
+///               do not. For an input of shape [..., H], scale/zero_point have
+///               numel(x)/H entries. This is the activation-quantization mode
+///               (per-token activation quantization in LLM inference).
+///
+///   PerChannel: `axis >= 0` with a per-channel scale/zero_point
+///               (shape[axis] entries), broadcast across all other dims.
+///               WEIGHTS ONLY — reserved for weight tensors; activations must
+///               use PerTensor / PerToken.
 ///
 /// Supported layouts: NCHW, NCDHW, NCHWC8, NCDHWC8
 /// Supported float types: f32, f16
@@ -19,6 +32,7 @@
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
+#include "nnops/core/quant_params.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
 #include <cstdint>
@@ -29,14 +43,39 @@ namespace nnops {
 
 /// Attributes shared by QuantizeLinear and DequantizeLinear.
 struct QuantLinearAttributes {
-    /// Axis along which per-channel/per-token quantization is applied.
-    /// -1 = last axis (default). Set to 1 for per-channel weight quantization.
+    /// Quantization axis — selects the granularity of scale/zero_point:
+    ///
+    ///   -1 (default): PerToken — one (scale, zero_point) per ROW. The last
+    ///                 (innermost) dimension is the quantization unit: every
+    ///                 element in the same row shares one parameter, different
+    ///                 rows do not. For x of shape [..., H], scale/zero_point
+    ///                 have numel(x)/H entries. Activation-quantization mode.
+    ///
+    ///   >= 0:         PerChannel — one (scale, zero_point) per channel along
+    ///                 `axis` (shape[axis] entries), broadcast across all other
+    ///                 dims. WEIGHTS ONLY: reserved for weight tensors.
+    ///
+    ///   When scale/zero_point are scalars (numel == 1), the result is
+    ///   PerTensor regardless of `axis`.
     int64_t axis = -1;
 
     /// For QuantizeLinear: output integer type (s8 or u8).
     /// For DequantizeLinear: output float type (f32 or f16).
     DataType output_dtype = DataType::s8;
 };
+
+/// Resolve the effective quantization granularity from the scale tensor and
+/// the `axis` attribute:
+///   - scalar scale (numel <= 1)  → PerTensor
+///   - axis < 0                   → PerToken  (per-row, last dim)
+///   - axis >= 0                  → PerChannel (per-axis, weights only)
+inline QuantGranularity resolve_quant_granularity(const TensorView& scale,
+                                                  int64_t axis) {
+    if (scale.numel() <= 1) {
+        return QuantGranularity::PerTensor;
+    }
+    return (axis < 0) ? QuantGranularity::PerToken : QuantGranularity::PerChannel;
+}
 
 // ============================================================
 // QuantizeLinear: float → integer

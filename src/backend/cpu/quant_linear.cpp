@@ -8,9 +8,11 @@
 ///     which round half-to-even (ONNX default).
 ///   - Every tensor is treated as a flat row-major `numel()` array; packed and
 ///     planar layouts are NOT distinguished.
-///   - Per-channel scale/zp maps the `axis` dimension to the kernel's per-row
-///     `M`. The dimensions before `axis` are parallelized over (the `outer`
-///     groups); the dimensions after `axis` form the contiguous per-row `N`.
+///   - The scale/zp granularity maps to the kernel's per-row `M`×`N` shape:
+///       PerTensor  → M=1,           N=numel
+///       PerToken   → M=numel/last,  N=last (one scale per row)
+///       PerChannel → M=shape[axis], N=inner; the dimensions before `axis` are
+///                    parallelized over (the `outer` groups)
 ///   - f16 input/output is converted to/from f32 at the boundary (the arch
 ///     kernels operate on f32 only).
 
@@ -90,20 +92,44 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         axis += rank;
     }
 
+    const QuantGranularity g = resolve_quant_granularity(scale, attrs.axis);
     const AxisDecomp dec = decompose_axis(X, axis);
-    const int64_t D = dec.D;
-    const bool is_per_channel = (scale.numel() > 1);
     const DataType out_dtype = output.data_type();
     const int64_t numel = X.numel();
 
-    // Pre-load scale/zp as float (per-tensor: single value; per-channel: D values).
-    std::vector<float> s_f32(static_cast<size_t>(D));
-    std::vector<float> z_f32(static_cast<size_t>(D));
-    for (int64_t k = 0; k < D; ++k) {
-        s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[is_per_channel ? k : 0];
+    // Kernel launch shape per granularity: M quantized rows × N elements each.
+    int64_t M;
+    int64_t N;
+    switch (g) {
+    case QuantGranularity::PerTensor:
+        M = 1;
+        N = numel;
+        break;
+    case QuantGranularity::PerToken: {
+        const int64_t last_dim = X.shape(rank - 1);
+        M = numel / last_dim;   // one scale per row (last dim)
+        N = last_dim;
+        break;
+    }
+    case QuantGranularity::PerChannel:
+        M = dec.D;
+        N = dec.inner;
+        break;
+    default:
+        NNOPS_ASSERT(!"quantize_linear: unsupported granularity");
+        M = 1;
+        N = numel;
+    }
+
+    // Pre-load scale/zp as float (one entry per quantized row).
+    NNOPS_ASSERT(scale.numel() == M);
+    std::vector<float> s_f32(static_cast<size_t>(M));
+    std::vector<float> z_f32(static_cast<size_t>(M));
+    for (int64_t k = 0; k < M; ++k) {
+        s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[k];
         int32_t z = (zp.data_type() == DataType::s8)
-            ? static_cast<int32_t>(zp.ptr<int8_t>()[is_per_channel ? k : 0])
-            : static_cast<int32_t>(zp.ptr<uint8_t>()[is_per_channel ? k : 0]);
+            ? static_cast<int32_t>(zp.ptr<int8_t>()[k])
+            : static_cast<int32_t>(zp.ptr<uint8_t>()[k]);
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
@@ -123,7 +149,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         using U = typename decltype(u_tag)::type;
         U* dst = static_cast<U*>(output.ptr<void>());
 
-        if (!is_per_channel) {
+        if (g == QuantGranularity::PerTensor) {
             quant_kernel::quantization<U>(1, static_cast<int>(numel),
                                           dst, static_cast<int>(numel),
                                           src_ptr, static_cast<int>(numel),
@@ -131,10 +157,19 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
             return;
         }
 
+        if (g == QuantGranularity::PerToken) {
+            quant_kernel::quantization<U>(static_cast<int>(M), static_cast<int>(N),
+                                          dst, static_cast<int>(N),
+                                          src_ptr, static_cast<int>(N),
+                                          s_f32.data(), z_f32.data());
+            return;
+        }
+
+        // PerChannel: loop over the outer groups (dims before `axis`).
         const auto process = [&](int64_t o) {
-            quant_kernel::quantization<U>(static_cast<int>(D), static_cast<int>(dec.inner),
-                                          dst + o * D * dec.inner, static_cast<int>(dec.inner),
-                                          src_ptr + o * D * dec.inner, static_cast<int>(dec.inner),
+            quant_kernel::quantization<U>(static_cast<int>(dec.D), static_cast<int>(dec.inner),
+                                          dst + o * dec.D * dec.inner, static_cast<int>(dec.inner),
+                                          src_ptr + o * dec.D * dec.inner, static_cast<int>(dec.inner),
                                           s_f32.data(), z_f32.data());
         };
         if (ctx.cpu_parallel_for) {
@@ -173,19 +208,44 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         axis += rank;
     }
 
+    const QuantGranularity g = resolve_quant_granularity(scale, attrs.axis);
     const AxisDecomp dec = decompose_axis(X, axis);
-    const int64_t D = dec.D;
-    const bool is_per_channel = (scale.numel() > 1);
     const DataType in_dtype = X.data_type();
     const int64_t numel = X.numel();
 
-    std::vector<float> s_f32(static_cast<size_t>(D));
-    std::vector<float> z_f32(static_cast<size_t>(D));
-    for (int64_t k = 0; k < D; ++k) {
-        s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[is_per_channel ? k : 0];
+    // Kernel launch shape per granularity: M quantized rows × N elements each.
+    int64_t M;
+    int64_t N;
+    switch (g) {
+    case QuantGranularity::PerTensor:
+        M = 1;
+        N = numel;
+        break;
+    case QuantGranularity::PerToken: {
+        const int64_t last_dim = X.shape(rank - 1);
+        M = numel / last_dim;   // one scale per row (last dim)
+        N = last_dim;
+        break;
+    }
+    case QuantGranularity::PerChannel:
+        M = dec.D;
+        N = dec.inner;
+        break;
+    default:
+        NNOPS_ASSERT(!"dequantize_linear: unsupported granularity");
+        M = 1;
+        N = numel;
+    }
+
+    // Pre-load scale/zp as float (one entry per quantized row).
+    NNOPS_ASSERT(scale.numel() == M);
+    std::vector<float> s_f32(static_cast<size_t>(M));
+    std::vector<float> z_f32(static_cast<size_t>(M));
+    for (int64_t k = 0; k < M; ++k) {
+        s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[k];
         int32_t z = (zp.data_type() == DataType::s8)
-            ? static_cast<int32_t>(zp.ptr<int8_t>()[is_per_channel ? k : 0])
-            : static_cast<int32_t>(zp.ptr<uint8_t>()[is_per_channel ? k : 0]);
+            ? static_cast<int32_t>(zp.ptr<int8_t>()[k])
+            : static_cast<int32_t>(zp.ptr<uint8_t>()[k]);
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
@@ -204,7 +264,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         using U = typename decltype(u_tag)::type;
         const U* src = static_cast<const U*>(X.ptr<void>());
 
-        if (!is_per_channel) {
+        if (g == QuantGranularity::PerTensor) {
             quant_kernel::dequantization<U>(1, static_cast<int>(numel),
                                             dst_f32, static_cast<int>(numel),
                                             src, static_cast<int>(numel),
@@ -212,10 +272,19 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
             return;
         }
 
+        if (g == QuantGranularity::PerToken) {
+            quant_kernel::dequantization<U>(static_cast<int>(M), static_cast<int>(N),
+                                            dst_f32, static_cast<int>(N),
+                                            src, static_cast<int>(N),
+                                            s_f32.data(), z_f32.data());
+            return;
+        }
+
+        // PerChannel: loop over the outer groups (dims before `axis`).
         const auto process = [&](int64_t o) {
-            quant_kernel::dequantization<U>(static_cast<int>(D), static_cast<int>(dec.inner),
-                                            dst_f32 + o * D * dec.inner, static_cast<int>(dec.inner),
-                                            src + o * D * dec.inner, static_cast<int>(dec.inner),
+            quant_kernel::dequantization<U>(static_cast<int>(dec.D), static_cast<int>(dec.inner),
+                                            dst_f32 + o * dec.D * dec.inner, static_cast<int>(dec.inner),
+                                            src + o * dec.D * dec.inner, static_cast<int>(dec.inner),
                                             s_f32.data(), z_f32.data());
         };
         if (ctx.cpu_parallel_for) {
