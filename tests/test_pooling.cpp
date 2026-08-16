@@ -15,6 +15,8 @@
 #include <vector>
 #include <cmath>
 #include <limits>
+#include <cstdint>
+#include <type_traits>
 
 using namespace nnops;
 
@@ -718,4 +720,176 @@ NNOPS_TEST(pooling_nchwc8_3d_random) {
             NNOPS_EXPECT_TRUE(!std::isinf(row[e]));
         }
     }
+}
+
+// ============================================================
+// Quantized pooling (s8/u8, PerTensor activation) — NCHWC8 SIMD
+// vs NCHW reference. MaxPooling with matching dtype/scale/zp takes
+// the raw-integer fast path; everything else uses the float path.
+// ============================================================
+
+static QuantParams make_per_tensor_q(float scale, int32_t zp) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerTensor;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+template <typename InT, typename OutT>
+static void pooling_q_test(const std::vector<int64_t>& shape,
+                           const PoolingAttributes& attrs,
+                           const QuantParams& in_qp,
+                           const QuantParams& out_qp)
+{
+    constexpr DataType in_dt  = std::is_same_v<InT, int8_t> ? DataType::s8 : DataType::u8;
+    constexpr DataType out_dt = std::is_same_v<OutT, int8_t> ? DataType::s8 : DataType::u8;
+
+    auto numel = [](const std::vector<int64_t>& s) {
+        int64_t n = 1;
+        for (int64_t d : s) n *= d;
+        return n;
+    };
+
+    // Deterministic small-integer data (exact in float for scale == 1).
+    std::vector<InT> in_data(static_cast<size_t>(numel(shape)));
+    for (size_t i = 0; i < in_data.size(); ++i) {
+        int32_t v = static_cast<int32_t>((i * 7 + 3) % 9) - 4;  // -4..4
+        if constexpr (std::is_same_v<InT, uint8_t>) v += 4;      // 0..8
+        in_data[i] = static_cast<InT>(v);
+    }
+
+    TensorView in_nchw(std::span<const int64_t>(shape), in_dt, in_data.data(),
+                       TensorLayout::NCHW, in_qp);
+
+    // ---- Reference (NCHW, ground truth) ----
+    auto op_ref = Pooling::create(attrs, Backend::CPU);
+    TensorDesc in_desc_ref = in_nchw.desc();
+    const TensorDesc ref_arr[] = {in_desc_ref};
+    auto ref_desc = op_ref->getOutputTensorDesc(ref_arr)[0];
+    std::vector<OutT> ref_buf(static_cast<size_t>(ref_desc.numel()));
+    TensorView ref_out(std::span<const int64_t>(ref_desc.dims.data(),
+                       static_cast<size_t>(ref_desc.rank)), out_dt,
+                       ref_buf.data(), TensorLayout::NCHW, out_qp);
+    {
+        ComputeContext ctx;
+        const TensorView ins[] = {in_nchw};
+        backend::cpu::reference::pooling_ref(attrs, ref_out, ins, ctx, nullptr);
+    }
+
+    // ---- SIMD path: pack -> pool -> unpack ----
+    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    TensorDesc in_desc = in_nchw.desc();
+    const TensorDesc pack_arr[] = {in_desc};
+    auto pack_desc = pack_op->getOutputTensorDesc(pack_arr)[0];
+    std::vector<InT> in_c8_buf(static_cast<size_t>(pack_desc.storage_bytes() / sizeof(InT)));
+    TensorView in_c8(std::span<const int64_t>(pack_desc.dims.data(),
+                     static_cast<size_t>(pack_desc.rank)), in_dt, in_c8_buf.data(),
+                     pack_desc.row_pitch(), TensorLayout::NCHWC8, in_qp);
+    {
+        const TensorView ins[] = {in_nchw};
+        TensorView outs[] = {in_c8};
+        pack_op->compute(outs, ins);
+    }
+
+    auto pool_op = Pooling::create(attrs);
+    TensorDesc c8_desc = in_c8.desc();
+    const TensorDesc pool_arr[] = {c8_desc};
+    auto pool_desc = pool_op->getOutputTensorDesc(pool_arr)[0];
+    std::vector<OutT> out_c8_buf(static_cast<size_t>(pool_desc.storage_bytes() / sizeof(OutT)));
+    TensorView out_c8(std::span<const int64_t>(pool_desc.dims.data(),
+                      static_cast<size_t>(pool_desc.rank)), out_dt, out_c8_buf.data(),
+                      pool_desc.row_pitch(), TensorLayout::NCHWC8, out_qp);
+    {
+        const TensorView ins[] = {in_c8};
+        TensorView outs[] = {out_c8};
+        pool_op->compute(outs, ins);
+    }
+
+    auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
+    TensorDesc oc8_desc = out_c8.desc();
+    const TensorDesc unpack_arr[] = {oc8_desc};
+    auto unpack_desc = unpack_op->getOutputTensorDesc(unpack_arr)[0];
+    std::vector<OutT> simd_buf(static_cast<size_t>(unpack_desc.numel()));
+    TensorView simd_out(std::span<const int64_t>(unpack_desc.dims.data(),
+                        static_cast<size_t>(unpack_desc.rank)), out_dt,
+                        simd_buf.data(), TensorLayout::NCHW, out_qp);
+    {
+        const TensorView ins[] = {out_c8};
+        TensorView outs[] = {simd_out};
+        unpack_op->compute(outs, ins);
+    }
+
+    // ---- Compare (dequantized, tolerance = one output quant step) ----
+    const float out_scale = out_qp.scale;
+    const float out_zero  = static_cast<float>(out_qp.zero_point);
+    const int64_t n = ref_desc.numel();
+    NNOPS_EXPECT_EQ(unpack_desc.numel(), n);
+    for (int64_t i = 0; i < n; ++i) {
+        const float fa = (static_cast<float>(ref_buf[static_cast<size_t>(i)]) - out_zero) * out_scale;
+        const float fb = (static_cast<float>(simd_buf[static_cast<size_t>(i)]) - out_zero) * out_scale;
+        NNOPS_EXPECT_NEAR(fa, fb, out_scale * 1.001f);
+    }
+}
+
+NNOPS_TEST(pooling_q_max_fast_path) {
+    // InT == OutT, same scale/zp, !add_to -> raw-integer fast path.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+    pooling_q_test<int8_t, int8_t>({1, 8, 8, 8}, attrs,
+        make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
+}
+
+NNOPS_TEST(pooling_q_max_float_path_scale) {
+    // Differing scale -> float dequant/max/requant path.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    pooling_q_test<int8_t, uint8_t>({1, 4, 8, 8}, attrs,
+        make_per_tensor_q(2.0f, 0), make_per_tensor_q(1.0f, 128));
+}
+
+NNOPS_TEST(pooling_q_max_u8_to_s8) {
+    // Mixed dtype (u8 -> s8) exercises the float path.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    pooling_q_test<uint8_t, int8_t>({1, 8, 8, 8}, attrs,
+        make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
+}
+
+NNOPS_TEST(pooling_q_avg) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+    pooling_q_test<int8_t, int8_t>({1, 4, 6, 6}, attrs,
+        make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
+}
+
+NNOPS_TEST(pooling_q_avg_exclude_pad) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.exclude_pad = true;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 1, 1};
+    attrs.padding      = {0, 1, 1};
+    pooling_q_test<int8_t, int8_t>({1, 3, 5, 5}, attrs,
+        make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
+}
+
+NNOPS_TEST(pooling_q_partial_c8) {
+    // C=5 -> partial C8 exercises pad-lane zero_point fill.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    pooling_q_test<int8_t, int8_t>({1, 5, 6, 6}, attrs,
+        make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
 }

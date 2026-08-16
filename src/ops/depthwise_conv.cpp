@@ -13,6 +13,7 @@
 #include "nnops/detail/simd/simd.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 
 namespace nnops {
@@ -196,6 +197,76 @@ void prepack_dwconv_weight_3d(const TensorView& weight_ncdhw,
     }
 }
 
+// ============================================================
+// Byte-copy prepack for s8/u8 weights (8 channels = 8 bytes)
+// ============================================================
+//
+// int8/uint8 `v_load` returns 16-lane vectors, so the 8×8 float transpose
+// above is not valid. These paths copy 8 channel bytes per kernel position
+// directly. Pad lanes (c >= C) are filled with 0 — they are neutralized by the
+// quantized backend via w_scale8[lane] = 0, so the byte value is irrelevant.
+
+template <typename T>
+void prepack_dwconv_weight_2d_byte(const TensorView& weight_nchw,
+                                   TensorView& packed_out)
+{
+    const int64_t C  = weight_nchw.shape(0);
+    const int64_t KH = weight_nchw.shape(2);
+    const int64_t KW = weight_nchw.shape(3);
+    const int64_t C8 = (C + 7) / 8;
+    const int64_t ch_stride = KH * KW;
+
+    const auto* src = weight_nchw.ptr<T>();
+    auto* dst = packed_out.ptr<T>();
+
+    for (int64_t c8 = 0; c8 < C8; ++c8) {
+        const int64_t c_base = c8 * 8;
+        for (int64_t kh = 0; kh < KH; ++kh) {
+            for (int64_t kw = 0; kw < KW; ++kw) {
+                T* out = &dst[(c8 * KH * KW + kh * KW + kw) * 8];
+                for (int64_t lane = 0; lane < 8; ++lane) {
+                    const int64_t c = c_base + lane;
+                    out[lane] = (c < C)
+                        ? src[c * ch_stride + kh * KW + kw]
+                        : static_cast<T>(0);
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+void prepack_dwconv_weight_3d_byte(const TensorView& weight_ncdhw,
+                                   TensorView& packed_out)
+{
+    const int64_t C  = weight_ncdhw.shape(0);
+    const int64_t KD = weight_ncdhw.shape(2);
+    const int64_t KH = weight_ncdhw.shape(3);
+    const int64_t KW = weight_ncdhw.shape(4);
+    const int64_t C8 = (C + 7) / 8;
+    const int64_t ch_stride = KD * KH * KW;
+
+    const auto* src = weight_ncdhw.ptr<T>();
+    auto* dst = packed_out.ptr<T>();
+
+    for (int64_t c8 = 0; c8 < C8; ++c8) {
+        const int64_t c_base = c8 * 8;
+        for (int64_t kd = 0; kd < KD; ++kd) {
+            for (int64_t kh = 0; kh < KH; ++kh) {
+                for (int64_t kw = 0; kw < KW; ++kw) {
+                    T* out = &dst[(c8 * KD * KH * KW + kd * KH * KW + kh * KW + kw) * 8];
+                    for (int64_t lane = 0; lane < 8; ++lane) {
+                        const int64_t c = c_base + lane;
+                        out[lane] = (c < C)
+                            ? src[c * ch_stride + kd * KH * KW + kh * KW + kw]
+                            : static_cast<T>(0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <typename T>
 void prepack_dwconv_bias_impl(const TensorView& bias_nchw,
                                 TensorView& packed_out)
@@ -243,6 +314,22 @@ void prepack_dwconv_weight(const TensorView& weight,
         }
         else {
             prepack_dwconv_weight_2d<backend::cpu::half>(weight, packed_out);
+        }
+        return;
+    case DataType::s8:
+        if (srank == 3) {
+            prepack_dwconv_weight_3d_byte<int8_t>(weight, packed_out);
+        }
+        else {
+            prepack_dwconv_weight_2d_byte<int8_t>(weight, packed_out);
+        }
+        return;
+    case DataType::u8:
+        if (srank == 3) {
+            prepack_dwconv_weight_3d_byte<uint8_t>(weight, packed_out);
+        }
+        else {
+            prepack_dwconv_weight_2d_byte<uint8_t>(weight, packed_out);
         }
         return;
     default:
@@ -319,6 +406,12 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
     const int64_t C8 = (C + 7) / 8;
     const DataType dtype = weight.data_type();
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
+    // Bias keeps its own dtype (f32 for quantized int8 convs).
+    const DataType bdtype = has_bias ? inputs[1].data_type() : dtype;
+    const int64_t belem_size = static_cast<int64_t>(data_type_size(bdtype));
+    // Preserve weight PerChannel quant params on the packed weight so the
+    // backend can index scale_data/zero_point_data by input channel C.
+    const QuantParams w_qp = weight.quant_params();
 
     if (outputs[0].is_empty()) {
         // ---- Query mode: fill metadata so caller can allocate ----
@@ -329,22 +422,22 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
             const int64_t w_pitch = 8 * elem_size;  // innermost dim = 8 lanes
             outputs[0] = TensorView(
                 std::span<const int64_t>(w_shape, 5), dtype,
-                nullptr, w_pitch, TensorLayout::PackedWeight);
+                nullptr, w_pitch, TensorLayout::PackedWeight, w_qp);
         } else {
             // Packed weight: [C8, KH, KW, 8]
             const int64_t w_shape[] = {C8, KH, KW, 8};
             const int64_t w_pitch = 8 * elem_size;
             outputs[0] = TensorView(
                 std::span<const int64_t>(w_shape, 4), dtype,
-                nullptr, w_pitch, TensorLayout::PackedWeight);
+                nullptr, w_pitch, TensorLayout::PackedWeight, w_qp);
         }
 
         // Packed bias: [C8, 8]
         if (has_bias) {
             const int64_t b_shape[] = {C8, 8};
-            const int64_t b_pitch = 8 * elem_size;
+            const int64_t b_pitch = 8 * belem_size;
             outputs[1] = TensorView(
-                std::span<const int64_t>(b_shape, 2), dtype,
+                std::span<const int64_t>(b_shape, 2), bdtype,
                 nullptr, b_pitch, TensorLayout::PackedWeight);
         }
     } else {
@@ -395,7 +488,8 @@ void depthwise_conv(const TensorView& input,
 
     std::vector<char> wbuf(packed_w.nbytes());
     packed_w = TensorView(packed_w.shape_span(), packed_w.data_type(),
-                           wbuf.data(), packed_w.pitch(), packed_w.layout());
+                           wbuf.data(), packed_w.pitch(), packed_w.layout(),
+                           weight.quant_params());
     op->prepackWeights({&weight, 1}, {&packed_w, 1});
 
     const TensorView ins[] = {input, packed_w};
@@ -418,7 +512,8 @@ void depthwise_conv(const TensorView& input,
 
     std::vector<char> wbuf(packed_w.nbytes());
     packed_w = TensorView(packed_w.shape_span(), packed_w.data_type(),
-                           wbuf.data(), packed_w.pitch(), packed_w.layout());
+                           wbuf.data(), packed_w.pitch(), packed_w.layout(),
+                           weight.quant_params());
     std::vector<char> bbuf(packed_b.nbytes());
     packed_b = TensorView(packed_b.shape_span(), packed_b.data_type(),
                            bbuf.data(), packed_b.pitch(), packed_b.layout());

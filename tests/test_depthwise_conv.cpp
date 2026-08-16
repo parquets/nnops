@@ -1557,3 +1557,252 @@ NNOPS_TEST(dwconv_3d_ncdhwc8_vs_ref_add_to) {
     attrs.add_to = true;
     test_ncdhwc8_vs_ref({1, 4, 4, 4, 4}, {4, 1, 2, 2, 2}, attrs);
 }
+
+// ============================================================
+// Quantized depthwise conv (s8/u8 input/output, PerTensor act,
+// PerChannel weight) — NCHWC8 SIMD vs NCHW reference.
+// ============================================================
+
+static QuantParams make_per_tensor(float scale, int32_t zp) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerTensor;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+static QuantParams make_per_channel(const std::vector<float>& scales,
+                                    const std::vector<int32_t>& zps) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerChannel;
+    qp.scale = 1.0f;      // unused when per-channel
+    qp.zero_point = 0;
+    qp.scale_data = scales.data();
+    qp.zero_point_data = zps.data();
+    qp.num_scales = static_cast<int64_t>(scales.size());
+    return qp;
+}
+
+template <typename InT, typename OutT>
+static void dwconv_q_test(const std::vector<int64_t>& in_shape,
+                          const std::vector<int64_t>& w_shape,
+                          const DepthwiseConvAttributes& attrs,
+                          const QuantParams& in_qp,
+                          const QuantParams& w_qp,
+                          const QuantParams& out_qp,
+                          bool has_bias)
+{
+    constexpr DataType in_dt  = std::is_same_v<InT, int8_t> ? DataType::s8 : DataType::u8;
+    constexpr DataType out_dt = std::is_same_v<OutT, int8_t> ? DataType::s8 : DataType::u8;
+
+    auto numel = [](const std::vector<int64_t>& s) {
+        int64_t n = 1;
+        for (int64_t d : s) n *= d;
+        return n;
+    };
+    const int64_t C = w_shape[0];
+
+    // Deterministic small-integer data (exact in float for scale == 1).
+    std::vector<InT> in_data(static_cast<size_t>(numel(in_shape)));
+    std::vector<InT> w_data(static_cast<size_t>(numel(w_shape)));
+    for (size_t i = 0; i < in_data.size(); ++i) {
+        int32_t v = static_cast<int32_t>((i * 7 + 3) % 9) - 4;  // -4..4
+        if constexpr (std::is_same_v<InT, uint8_t>) v += 4;      // 0..8
+        in_data[i] = static_cast<InT>(v);
+    }
+    for (size_t i = 0; i < w_data.size(); ++i) {
+        int32_t v = static_cast<int32_t>((i * 5 + 1) % 5) - 2;  // -2..2
+        if constexpr (std::is_same_v<InT, uint8_t>) v += 2;      // 0..4
+        w_data[i] = static_cast<InT>(v);
+    }
+    std::vector<float> bias_data;
+    if (has_bias) {
+        bias_data.resize(static_cast<size_t>(C));
+        for (int64_t c = 0; c < C; ++c) bias_data[static_cast<size_t>(c)] = (c % 5) * 0.25f;
+    }
+
+    TensorView in_nchw(std::span<const int64_t>(in_shape), in_dt, in_data.data(),
+                       TensorLayout::NCHW, in_qp);
+    TensorView w_nchw(std::span<const int64_t>(w_shape), in_dt, w_data.data(),
+                      TensorLayout::NCHW, w_qp);
+    TensorView b_nchw;
+    if (has_bias) {
+        const int64_t bshape[] = {C};
+        b_nchw = TensorView(std::span<const int64_t>(bshape, 1), DataType::f32,
+                            bias_data.data(), TensorLayout::NCHW);
+    }
+
+    // ---- Reference (NCHW, ground truth) ----
+    auto op_ref = DepthwiseConv::create(attrs, Backend::CPU);
+    TensorDesc in_desc_ref = in_nchw.desc();
+    TensorDesc w_desc_ref  = w_nchw.desc();
+    std::vector<TensorDesc> ref_descs;
+    if (has_bias) {
+        TensorDesc b_desc_ref = b_nchw.desc();
+        const TensorDesc arr[] = {in_desc_ref, w_desc_ref, b_desc_ref};
+        ref_descs = op_ref->getOutputTensorDesc(arr);
+    } else {
+        const TensorDesc arr[] = {in_desc_ref, w_desc_ref};
+        ref_descs = op_ref->getOutputTensorDesc(arr);
+    }
+    std::vector<OutT> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
+    TensorView ref_out(std::span<const int64_t>(ref_descs[0].dims.data(),
+                        static_cast<size_t>(ref_descs[0].rank)), out_dt,
+                        ref_buf.data(), TensorLayout::NCHW, out_qp);
+    {
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView arr[] = {in_nchw, w_nchw, b_nchw};
+            backend::cpu::reference::depthwise_conv_ref(attrs, ref_out, arr, ctx, nullptr);
+        } else {
+            const TensorView arr[] = {in_nchw, w_nchw};
+            backend::cpu::reference::depthwise_conv_ref(attrs, ref_out, arr, ctx, nullptr);
+        }
+    }
+
+    // ---- SIMD path: pack input -> prepack weight -> compute -> unpack ----
+    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    TensorDesc in_desc = in_nchw.desc();
+    const TensorDesc lc_in_arr[] = {in_desc};
+    auto in_c8_desc = lc_in->getOutputTensorDesc(lc_in_arr)[0];
+    std::vector<InT> in_c8_buf(static_cast<size_t>(in_c8_desc.storage_bytes() / sizeof(InT)));
+    TensorView in_c8(std::span<const int64_t>(in_c8_desc.dims.data(),
+                     static_cast<size_t>(in_c8_desc.rank)), in_dt, in_c8_buf.data(),
+                     in_c8_desc.row_pitch(), TensorLayout::NCHWC8, in_qp);
+    {
+        const TensorView i[] = {in_nchw};
+        TensorView o[] = {in_c8};
+        lc_in->compute(o, i);
+    }
+
+    auto op = DepthwiseConv::create(attrs, Backend::CPU);
+
+    TensorView pw_query;
+    TensorView pb_query;
+    if (has_bias) {
+        const TensorView wq[] = {w_nchw, b_nchw};
+        TensorView pq[] = {pw_query, pb_query};
+        op->prepackWeights(wq, pq);
+        pw_query = pq[0];
+        pb_query = pq[1];
+    } else {
+        const TensorView wq[] = {w_nchw};
+        TensorView pq[] = {pw_query};
+        op->prepackWeights(wq, pq);
+        pw_query = pq[0];
+    }
+
+    // packed weight: preserve the query's pitch + quant params
+    std::vector<InT> pw_buf(static_cast<size_t>(pw_query.numel()));
+    TensorView pw_view(pw_query.shape_span(), in_dt, pw_buf.data(),
+                       pw_query.pitch(), TensorLayout::PackedWeight, w_qp);
+    std::vector<float> pb_buf;
+    TensorView pb_view;
+    if (has_bias) {
+        pb_buf.resize(static_cast<size_t>(pb_query.numel()));
+        pb_view = TensorView(pb_query.shape_span(), DataType::f32, pb_buf.data(),
+                             pb_query.pitch(), TensorLayout::PackedWeight);
+    }
+
+    if (has_bias) {
+        const TensorView wp[] = {w_nchw, b_nchw};
+        TensorView po[] = {pw_view, pb_view};
+        op->prepackWeights(wp, po);
+    } else {
+        const TensorView wp[] = {w_nchw};
+        TensorView po[] = {pw_view};
+        op->prepackWeights(wp, po);
+    }
+
+    std::vector<TensorDesc> out_c8_descs;
+    {
+        TensorDesc in_c8_desc = in_c8.desc();
+        TensorDesc pw_desc = pw_view.desc();
+        if (has_bias) {
+            TensorDesc pb_desc = pb_view.desc();
+            const TensorDesc arr[] = {in_c8_desc, pw_desc, pb_desc};
+            out_c8_descs = op->getOutputTensorDesc(arr);
+        } else {
+            const TensorDesc arr[] = {in_c8_desc, pw_desc};
+            out_c8_descs = op->getOutputTensorDesc(arr);
+        }
+    }
+    std::vector<OutT> out_c8_buf(static_cast<size_t>(out_c8_descs[0].storage_bytes() / sizeof(OutT)));
+    TensorView out_c8(std::span<const int64_t>(out_c8_descs[0].dims.data(),
+                      static_cast<size_t>(out_c8_descs[0].rank)), out_dt, out_c8_buf.data(),
+                      out_c8_descs[0].row_pitch(), TensorLayout::NCHWC8, out_qp);
+    {
+        if (has_bias) {
+            const TensorView ins[] = {in_c8, pw_view, pb_view};
+            TensorView outs[] = {out_c8};
+            op->compute(outs, ins);
+        } else {
+            const TensorView ins[] = {in_c8, pw_view};
+            TensorView outs[] = {out_c8};
+            op->compute(outs, ins);
+        }
+    }
+
+    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    TensorDesc out_c8_desc = out_c8.desc();
+    const TensorDesc lc_out_arr[] = {out_c8_desc};
+    auto out_nchw_desc = lc_out->getOutputTensorDesc(lc_out_arr)[0];
+    std::vector<OutT> simd_buf(static_cast<size_t>(out_nchw_desc.numel()));
+    TensorView simd_out(std::span<const int64_t>(out_nchw_desc.dims.data(),
+                        static_cast<size_t>(out_nchw_desc.rank)), out_dt,
+                        simd_buf.data(), TensorLayout::NCHW, out_qp);
+    {
+        const TensorView i[] = {out_c8};
+        TensorView o[] = {simd_out};
+        lc_out->compute(o, i);
+    }
+
+    // ---- Compare (dequantized, tolerance = one output quant step) ----
+    const float out_scale = out_qp.scale;
+    const float out_zero  = static_cast<float>(out_qp.zero_point);
+    const int64_t n = ref_descs[0].numel();
+    NNOPS_EXPECT_EQ(out_nchw_desc.numel(), n);
+    for (int64_t i = 0; i < n; ++i) {
+        const float fa = (static_cast<float>(ref_buf[static_cast<size_t>(i)]) - out_zero) * out_scale;
+        const float fb = (static_cast<float>(simd_buf[static_cast<size_t>(i)]) - out_zero) * out_scale;
+        NNOPS_EXPECT_NEAR(fa, fb, out_scale * 1.001f);
+    }
+}
+
+NNOPS_TEST(dwconv_q_s8_to_s8) {
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    std::vector<float> wscales(8, 1.0f);
+    std::vector<int32_t> wzps(8, 0);
+    dwconv_q_test<int8_t, int8_t>({1, 8, 8, 8}, {8, 1, 3, 3}, attrs,
+        make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
+        make_per_tensor(1.0f, 0), false);
+}
+
+NNOPS_TEST(dwconv_q_s8_to_u8_bias_partial_c8) {
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    std::vector<float> wscales(5, 1.0f);
+    std::vector<int32_t> wzps(5, 0);
+    dwconv_q_test<int8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 3, 3}, attrs,
+        make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
+        make_per_tensor(1.0f, 128), true);
+}
+
+NNOPS_TEST(dwconv_q_u8_to_s8_scale) {
+    // Non-trivial scales exercise the float dequant/requant path (not exact integers).
+    DepthwiseConvAttributes attrs{{1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    std::vector<float> wscales(8, 2.0f);
+    std::vector<int32_t> wzps(8, 0);
+    dwconv_q_test<uint8_t, int8_t>({1, 8, 4, 4}, {8, 1, 1, 1}, attrs,
+        make_per_tensor(2.0f, 0), make_per_channel(wscales, wzps),
+        make_per_tensor(1.0f, 0), false);
+}
+
+NNOPS_TEST(dwconv_q_multi_c8) {
+    // C=17 -> 3 C8 blocks (2 full + 1 partial) exercises pad-lane neutralization.
+    DepthwiseConvAttributes attrs{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    std::vector<float> wscales(17, 1.0f);
+    std::vector<int32_t> wzps(17, 0);
+    dwconv_q_test<int8_t, int8_t>({1, 17, 5, 5}, {17, 1, 2, 2}, attrs,
+        make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
+        make_per_tensor(1.0f, 0), false);
+}

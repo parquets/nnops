@@ -1,6 +1,7 @@
 #pragma once
 /// @file simd_quant.hpp
-/// @brief SIMD kernel functions for QuantizeLinear / DequantizeLinear.
+/// @brief SIMD kernel functions for QuantizeLinear / DequantizeLinear, plus the
+/// shared dequant/requant helpers for quantized conv/pooling kernels.
 ///
 /// All arithmetic is in f32 (v_f32x8) or f16 (v_f16x8) depending on the
 /// output type. For f16, the full pipeline runs in f16 vectors when possible.
@@ -12,18 +13,38 @@
 ///   quant_store_f32 / quant_load_f32    — f32/f16 boundary load/store
 ///   dequant_i8_store / dequant_i8_scalar — full load→dequant→store pipeline
 ///
+/// The quantized conv/pooling kernels (depthwise conv, pooling) share a second
+/// group of helpers at the bottom of this file: dequantize_tensor (PerTensor),
+/// dequantize_channel (PerChannel weight), and requantize_store
+/// (round-to-nearest-even via the arch `requantize_8`). The `quant_kernel`
+/// alias resolves to the active arch quant primitives.
+///
 /// Reference: include/nnops/detail/simd/simd.hpp — v_load/v_store for half*
 
 #include "nnops/detail/simd/simd.hpp"
+#include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/half.hpp"
+
+#if defined(NNOPS_ARCH_X86_64)
+#include "../x86_64/quant.hpp"
+#elif defined(NNOPS_ARCH_AARCH64)
+#include "../aarch64/quant.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace nnops::kernel {
 
 using namespace simd;
+
+#if defined(NNOPS_ARCH_X86_64)
+namespace quant_kernel = nnops::backend::cpu::x86_64;
+#elif defined(NNOPS_ARCH_AARCH64)
+namespace quant_kernel = nnops::backend::cpu::aarch64;
+#endif
 
 constexpr int kQuantLane = 8;  // v_f32x8 / v_f16x8 lane width
 
@@ -167,6 +188,59 @@ inline void dequant_i8_scalar(const void* src, bool is_i8,
         ? static_cast<float>(*static_cast<const int8_t*>(src))
         : static_cast<float>(*static_cast<const uint8_t*>(src));
     *dst = ::nnops::backend::cpu::float_to_half((w - zp) * scale);
+}
+
+// ============================================================
+// Shared dequant/requant helpers for quantized conv/pooling kernels
+// ============================================================
+//
+// Depthwise conv and pooling dequantize s8/u8 inputs to float on load,
+// accumulate in float, then requantize on store. These helpers are the shared
+// glue between the two operators' SIMD kernels. The activation is PerTensor
+// (broadcast scale/zero_point); the depthwise weight is PerChannel (per-lane
+// scale/zero_point). Rounding is round-to-nearest-even via the arch
+// `requantize_8`.
+
+/// Dequantize 8 activation values (PerTensor: broadcast scale/zero_point).
+template <typename InT>
+inline v_f32x8 dequantize_tensor(const InT* p, float scale, float zero) {
+    v_f32x8 v;
+    if constexpr (std::is_same_v<InT, int8_t>) {
+        v = v_cvt_s8_to_f32(p);
+    } else {
+        v = v_cvt_u8_to_f32(p);
+    }
+    v = v_sub(v, v_set1_f32x8(zero));
+    return v_mul(v, v_set1_f32x8(scale));
+}
+
+/// Dequantize 8 weight values (PerChannel: per-lane scale/zero_point).
+template <typename InT>
+inline v_f32x8 dequantize_channel(const InT* p, const float* scale8, const float* zero8) {
+    v_f32x8 v;
+    if constexpr (std::is_same_v<InT, int8_t>) {
+        v = v_cvt_s8_to_f32(p);
+    } else {
+        v = v_cvt_u8_to_f32(p);
+    }
+    v = v_sub(v, v_load(zero8));
+    return v_mul(v, v_load(scale8));
+}
+
+/// Requantize a float accumulator and store to 8 int8/uint8 output lanes.
+/// `add_to` dequantizes the existing output, adds in float, then requantizes.
+template <typename OutT>
+inline void requantize_store(OutT* dst, const v_f32x8& acc,
+                             float out_scale, float out_zero, bool add_to) {
+    float buf[8];
+    v_store(buf, acc);
+    if (add_to) {
+        for (int i = 0; i < 8; ++i) {
+            const float q = static_cast<float>(dst[i]);
+            buf[i] += (q - out_zero) * out_scale;
+        }
+    }
+    quant_kernel::requantize_8<OutT>(dst, buf, 1.0f / out_scale, out_zero);
 }
 
 }  // namespace nnops::kernel

@@ -169,6 +169,55 @@ inline void quantization(int M, int N,
     }
 }
 
+// =========================================================================
+//  NCHWC8 8-wide primitives (8 channels = 8 bytes = one 64-bit group)
+//
+// These operate on a single channel-packed lane group (8 int8/uint8 values) —
+// the granularity used by the quantized depthwise-conv / pooling SIMD kernels.
+// =========================================================================
+
+/// Requantize 8 floats to 8 int8/uint8 with a broadcast (per-tensor) scale and
+/// zero_point: `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
+/// Rounding is round-to-nearest-even (`_mm_cvtps_epi32`), matching the per-token
+/// `quantization<T>` path. Used for output requantization of the NCHWC8
+/// quantized depthwise-conv / pooling kernels.
+template <typename T>
+inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
+                         float inv_scale, float zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "requantize_8: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+    const __m128 v_inv = _mm_set1_ps(inv_scale);
+    const __m128 v_zero = _mm_set1_ps(zero);
+    const __m128 d0 = _mm_fmadd_ps(_mm_loadu_ps(src + 0), v_inv, v_zero);
+    const __m128 d1 = _mm_fmadd_ps(_mm_loadu_ps(src + 4), v_inv, v_zero);
+    const __m128i i0 = _mm_cvtps_epi32(d0);
+    const __m128i i1 = _mm_cvtps_epi32(d1);
+    const __m128i i16 = _mm_packs_epi32(i0, i1);
+    __m128i i8;
+    if constexpr (Q_U8) {
+        i8 = _mm_packus_epi16(i16, i16);
+    } else {
+        i8 = _mm_packs_epi16(i16, i16);
+    }
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), i8);
+}
+
+/// Per-lane maximum of two 8-wide int8/uint8 vectors (raw integer max, no
+/// dequantization). Used by the MaxPooling fast path, which is valid when input
+/// and output share the same scale and zero_point.
+template <typename T>
+inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
+                  const T* NNOPS_RESTRICT b) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "max_8: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+    const __m128i va = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(a));
+    const __m128i vb = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b));
+    const __m128i vmax = Q_U8 ? _mm_max_epu8(va, vb) : _mm_max_epi8(va, vb);
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), vmax);
+}
+
 /// Dequantize an M×N integer matrix of type `T` to f32, one (scale, zero_point)
 /// per row.
 ///

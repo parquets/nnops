@@ -13,7 +13,10 @@
 ///   6. Params passed by const reference (unified across all kernels).
 
 #include "nnops/detail/simd/simd.hpp"
+#include "simd_quant.hpp"
 
+#include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace nnops::kernel {
@@ -331,6 +334,381 @@ inline void avgpool_h1(
             vacc = v_add(vacc, v_load(out_r));
         }
         v_store(out_r, vacc);
+    }
+}
+
+// ============================================================
+// Quantized pooling (s8/u8 input/output, float accumulate)
+// ============================================================
+//
+// Dequantize-on-load / requantize-on-store around the same float SIMD
+// accumulation as the f32/f16 kernels. The activation is PerTensor-quantized
+// (broadcast scale/zero_point). MaxPooling additionally has a raw-integer fast
+// path when input and output share the same scale and zero_point (no
+// dequantization needed). The shared dequant/requant helpers live in
+// simd_quant.hpp (dequantize_tensor / requantize_store).
+
+// ---- MaxPooling: float path (input/output scales differ, or add_to) ----
+
+template <typename InT, typename OutT>
+inline void maxpool_h4_quant(
+    OutT* output, const InT* input,
+    const PoolingKernelParams& p,
+    float in_scale, float in_zero,
+    float out_scale, float out_zero, bool add_to)
+{
+    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
+    const auto vinit = v_set1_f32x8(neg_inf);
+    const auto vzero = v_zero_f32x8();
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        auto vacc0 = vinit, vacc1 = vinit, vacc2 = vinit, vacc3 = vinit;
+        bool any0 = false, any1 = false, any2 = false, any3 = false;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
+                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
+                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
+                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
+                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
+                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
+                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
+                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    int64_t w_off = iw * 8;
+
+                    if (v0) { vacc0 = v_max(vacc0, dequantize_tensor(input + d_off + ih0 * p.in_row_stride + w_off, in_scale, in_zero)); any0 = true; }
+                    if (v1) { vacc1 = v_max(vacc1, dequantize_tensor(input + d_off + ih1 * p.in_row_stride + w_off, in_scale, in_zero)); any1 = true; }
+                    if (v2) { vacc2 = v_max(vacc2, dequantize_tensor(input + d_off + ih2 * p.in_row_stride + w_off, in_scale, in_zero)); any2 = true; }
+                    if (v3) { vacc3 = v_max(vacc3, dequantize_tensor(input + d_off + ih3 * p.in_row_stride + w_off, in_scale, in_zero)); any3 = true; }
+                }
+            }
+        }
+
+        if (!any0) { vacc0 = vzero; }
+        if (!any1) { vacc1 = vzero; }
+        if (!any2) { vacc2 = vzero; }
+        if (!any3) { vacc3 = vzero; }
+
+        if (p.oh + 0 < p.OH) {
+            requantize_store(output + 0 * p.out_row_stride + ow * 8, vacc0,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 1 < p.OH) {
+            requantize_store(output + 1 * p.out_row_stride + ow * 8, vacc1,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 2 < p.OH) {
+            requantize_store(output + 2 * p.out_row_stride + ow * 8, vacc2,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 3 < p.OH) {
+            requantize_store(output + 3 * p.out_row_stride + ow * 8, vacc3,
+                           out_scale, out_zero, add_to);
+        }
+    }
+}
+
+template <typename InT, typename OutT>
+inline void maxpool_h1_quant(
+    OutT* output, const InT* input,
+    const PoolingKernelParams& p,
+    float in_scale, float in_zero,
+    float out_scale, float out_zero, bool add_to)
+{
+    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
+    const auto vinit = v_set1_f32x8(neg_inf);
+    const auto vzero = v_zero_f32x8();
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        auto vacc = vinit;
+        bool any = false;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    vacc = v_max(vacc, dequantize_tensor(input + d_off + ih * p.in_row_stride + iw * 8, in_scale, in_zero));
+                    any = true;
+                }
+            }
+        }
+
+        if (!any) {
+            vacc = vzero;
+        }
+
+        requantize_store(output + ow * 8, vacc, out_scale, out_zero, add_to);
+    }
+}
+
+// ---- MaxPooling: raw-integer fast path (input/output share scale+zero_point) ----
+
+template <typename T>
+inline void maxpool_h4_quant_fast(
+    T* output, const T* input,
+    const PoolingKernelParams& p,
+    float out_zero)
+{
+    constexpr T min_val = std::numeric_limits<T>::lowest();
+    const T z = static_cast<T>(out_zero);
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        T acc0[8], acc1[8], acc2[8], acc3[8];
+        for (int i = 0; i < 8; ++i) {
+            acc0[i] = min_val;
+            acc1[i] = min_val;
+            acc2[i] = min_val;
+            acc3[i] = min_val;
+        }
+        bool any0 = false, any1 = false, any2 = false, any3 = false;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
+                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
+                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
+                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
+                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
+                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
+                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
+                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    int64_t w_off = iw * 8;
+
+                    if (v0) { quant_kernel::max_8<T>(acc0, acc0, input + d_off + ih0 * p.in_row_stride + w_off); any0 = true; }
+                    if (v1) { quant_kernel::max_8<T>(acc1, acc1, input + d_off + ih1 * p.in_row_stride + w_off); any1 = true; }
+                    if (v2) { quant_kernel::max_8<T>(acc2, acc2, input + d_off + ih2 * p.in_row_stride + w_off); any2 = true; }
+                    if (v3) { quant_kernel::max_8<T>(acc3, acc3, input + d_off + ih3 * p.in_row_stride + w_off); any3 = true; }
+                }
+            }
+        }
+
+        if (!any0) { for (int i = 0; i < 8; ++i) acc0[i] = z; }
+        if (!any1) { for (int i = 0; i < 8; ++i) acc1[i] = z; }
+        if (!any2) { for (int i = 0; i < 8; ++i) acc2[i] = z; }
+        if (!any3) { for (int i = 0; i < 8; ++i) acc3[i] = z; }
+
+        if (p.oh + 0 < p.OH) { std::memcpy(output + 0 * p.out_row_stride + ow * 8, acc0, 8); }
+        if (p.oh + 1 < p.OH) { std::memcpy(output + 1 * p.out_row_stride + ow * 8, acc1, 8); }
+        if (p.oh + 2 < p.OH) { std::memcpy(output + 2 * p.out_row_stride + ow * 8, acc2, 8); }
+        if (p.oh + 3 < p.OH) { std::memcpy(output + 3 * p.out_row_stride + ow * 8, acc3, 8); }
+    }
+}
+
+template <typename T>
+inline void maxpool_h1_quant_fast(
+    T* output, const T* input,
+    const PoolingKernelParams& p,
+    float out_zero)
+{
+    constexpr T min_val = std::numeric_limits<T>::lowest();
+    const T z = static_cast<T>(out_zero);
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        T acc[8];
+        for (int i = 0; i < 8; ++i) {
+            acc[i] = min_val;
+        }
+        bool any = false;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    quant_kernel::max_8<T>(acc, acc, input + d_off + ih * p.in_row_stride + iw * 8);
+                    any = true;
+                }
+            }
+        }
+
+        if (!any) {
+            for (int i = 0; i < 8; ++i) {
+                acc[i] = z;
+            }
+        }
+
+        std::memcpy(output + ow * 8, acc, 8);
+    }
+}
+
+// ---- AvgPooling: float path (no fast path; always dequant/accum/requant) ----
+
+template <typename InT, typename OutT>
+inline void avgpool_h4_quant(
+    OutT* output, const InT* input,
+    const PoolingKernelParams& p,
+    float scale,
+    float in_scale, float in_zero,
+    float out_scale, float out_zero, bool add_to)
+{
+    const auto vscale = v_set1_f32x8(scale);
+    const auto vzero  = v_zero_f32x8();
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        auto vacc0 = vzero, vacc1 = vzero, vacc2 = vzero, vacc3 = vzero;
+        int64_t cnt0 = 0, cnt1 = 0, cnt2 = 0, cnt3 = 0;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
+                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
+                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
+                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
+                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
+                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
+                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
+                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    int64_t w_off = iw * 8;
+
+                    if (v0) { vacc0 = v_add(vacc0, dequantize_tensor(input + d_off + ih0 * p.in_row_stride + w_off, in_scale, in_zero)); cnt0++; }
+                    if (v1) { vacc1 = v_add(vacc1, dequantize_tensor(input + d_off + ih1 * p.in_row_stride + w_off, in_scale, in_zero)); cnt1++; }
+                    if (v2) { vacc2 = v_add(vacc2, dequantize_tensor(input + d_off + ih2 * p.in_row_stride + w_off, in_scale, in_zero)); cnt2++; }
+                    if (v3) { vacc3 = v_add(vacc3, dequantize_tensor(input + d_off + ih3 * p.in_row_stride + w_off, in_scale, in_zero)); cnt3++; }
+                }
+            }
+        }
+
+        if (p.exclude_pad) {
+            if (cnt0 > 0) { vacc0 = v_mul(vacc0, v_set1_f32x8(1.0f / static_cast<float>(cnt0))); }
+            if (cnt1 > 0) { vacc1 = v_mul(vacc1, v_set1_f32x8(1.0f / static_cast<float>(cnt1))); }
+            if (cnt2 > 0) { vacc2 = v_mul(vacc2, v_set1_f32x8(1.0f / static_cast<float>(cnt2))); }
+            if (cnt3 > 0) { vacc3 = v_mul(vacc3, v_set1_f32x8(1.0f / static_cast<float>(cnt3))); }
+        } else {
+            vacc0 = v_mul(vacc0, vscale);
+            vacc1 = v_mul(vacc1, vscale);
+            vacc2 = v_mul(vacc2, vscale);
+            vacc3 = v_mul(vacc3, vscale);
+        }
+
+        if (p.oh + 0 < p.OH) {
+            requantize_store(output + 0 * p.out_row_stride + ow * 8, vacc0,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 1 < p.OH) {
+            requantize_store(output + 1 * p.out_row_stride + ow * 8, vacc1,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 2 < p.OH) {
+            requantize_store(output + 2 * p.out_row_stride + ow * 8, vacc2,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 3 < p.OH) {
+            requantize_store(output + 3 * p.out_row_stride + ow * 8, vacc3,
+                           out_scale, out_zero, add_to);
+        }
+    }
+}
+
+template <typename InT, typename OutT>
+inline void avgpool_h1_quant(
+    OutT* output, const InT* input,
+    const PoolingKernelParams& p,
+    float scale,
+    float in_scale, float in_zero,
+    float out_scale, float out_zero, bool add_to)
+{
+    const auto vscale = v_set1_f32x8(scale);
+    const auto vzero  = v_zero_f32x8();
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        auto vacc = vzero;
+        int64_t valid_count = 0;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    vacc = v_add(vacc, dequantize_tensor(input + d_off + ih * p.in_row_stride + iw * 8, in_scale, in_zero));
+                    valid_count++;
+                }
+            }
+        }
+
+        if (p.exclude_pad && valid_count > 0) {
+            vacc = v_mul(vacc, v_set1_f32x8(1.0f / static_cast<float>(valid_count)));
+        } else if (!p.exclude_pad) {
+            vacc = v_mul(vacc, vscale);
+        }
+
+        requantize_store(output + ow * 8, vacc, out_scale, out_zero, add_to);
     }
 }
 

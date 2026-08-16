@@ -131,4 +131,41 @@ inline void layout_unpack_row(
     }
 }
 
+// ============================================================
+// Byte-copy pack/unpack for s8/u8 (8 channels = 8 bytes)
+// ============================================================
+//
+// The 8×8 transpose above operates on 8-lane floating vectors (f32/f16) and is
+// not valid for int8/uint8 (whose `v_load` returns 16 lanes). These byte paths
+// copy 8 channel bytes per W position directly. Pack fills pad lanes (c >= C)
+// with `pad_val` — the activation's zero_point — so that padded channels in a
+// quantized NCHWC8 tensor dequantize to zero contribution.
+
+template <typename T>
+inline void layout_pack_row_byte(
+    const T* in_row, T* out_row,
+    int64_t W, int64_t c_base, int64_t ch_stride,
+    int64_t /*valid_lanes*/, int64_t C, T pad_val)
+{
+    for (int64_t w = 0; w < W; ++w) {
+        for (int64_t lane = 0; lane < 8; ++lane) {
+            const int64_t c = c_base + lane;
+            out_row[w * 8 + lane] = (c < C) ? in_row[c * ch_stride + w] : pad_val;
+        }
+    }
+}
+
+template <typename T>
+inline void layout_unpack_row_byte(
+    const T* in_row, T* out_row,
+    int64_t W, int64_t c_base, int64_t ch_stride,
+    int64_t valid_lanes, int64_t /*C*/)
+{
+    for (int64_t w = 0; w < W; ++w) {
+        for (int64_t lane = 0; lane < valid_lanes; ++lane) {
+            out_row[(c_base + lane) * ch_stride + w] = in_row[w * 8 + lane];
+        }
+    }
+}
+
 }  // namespace nnops::kernel

@@ -15,6 +15,9 @@
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
 #include "../epilogue_impl.hpp"
+#include "simd_quant.hpp"
+
+#include <cstdint>
 
 namespace nnops::kernel {
 
@@ -168,6 +171,157 @@ inline void dwconv_h1(
 
         vacc = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc);
         v_store_add(output + ow * 8, vacc, add_to);
+    }
+}
+
+// ============================================================
+// Quantized dwconv (s8/u8 input/output, float accumulate)
+// ============================================================
+//
+// Dequantize-on-load / requantize-on-store around the same float SIMD
+// accumulation as the f32/f16 kernels. The activation is PerTensor-quantized
+// (broadcast scale/zero_point); the weight is PerChannel-quantized (per-lane
+// scale/zero_point, with pad lanes neutralized by scale == 0). The shared
+// dequant/requant helpers live in simd_quant.hpp (dequantize_tensor /
+// dequantize_channel / requantize_store).
+
+template <typename InT, typename OutT>
+inline void dwconv_h4_quant(
+    OutT* output, const InT* input, const float* wq,  // precomputed dequantized weights
+    const float* bias_vec,            // f32 bias (nullptr or 8 values)
+    const DwConvParams& p,
+    const Epilogue& epilogue,
+    bool add_to,
+    float in_scale, float in_zero,
+    float out_scale, float out_zero)
+{
+    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero_f32x8();
+    float type_tag_storage = 0.0f;
+    const float* type_tag = &type_tag_storage;
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        auto vacc0 = vbias;
+        auto vacc1 = vbias;
+        auto vacc2 = vbias;
+        auto vacc3 = vbias;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
+                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
+                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
+                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
+                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
+                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
+                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
+                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    int64_t w_off = iw * 8;
+
+                    auto vk = v_load(&wq[(kd * p.KH * p.KW + kh * p.KW + kw) * 8]);
+
+                    if (v0) {
+                        vacc0 = v_fmadd(dequantize_tensor(input + d_off + ih0 * p.in_row_stride + w_off,
+                                                      in_scale, in_zero), vk, vacc0);
+                    }
+                    if (v1) {
+                        vacc1 = v_fmadd(dequantize_tensor(input + d_off + ih1 * p.in_row_stride + w_off,
+                                                      in_scale, in_zero), vk, vacc1);
+                    }
+                    if (v2) {
+                        vacc2 = v_fmadd(dequantize_tensor(input + d_off + ih2 * p.in_row_stride + w_off,
+                                                      in_scale, in_zero), vk, vacc2);
+                    }
+                    if (v3) {
+                        vacc3 = v_fmadd(dequantize_tensor(input + d_off + ih3 * p.in_row_stride + w_off,
+                                                      in_scale, in_zero), vk, vacc3);
+                    }
+                }
+            }
+        }
+
+        // Epilogue in float space, then requantize.
+        vacc0 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc0);
+        vacc1 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc1);
+        vacc2 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc2);
+        vacc3 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc3);
+
+        if (p.oh + 0 < p.OH) {
+            requantize_store(output + 0 * p.out_row_stride + ow * 8, vacc0,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 1 < p.OH) {
+            requantize_store(output + 1 * p.out_row_stride + ow * 8, vacc1,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 2 < p.OH) {
+            requantize_store(output + 2 * p.out_row_stride + ow * 8, vacc2,
+                           out_scale, out_zero, add_to);
+        }
+        if (p.oh + 3 < p.OH) {
+            requantize_store(output + 3 * p.out_row_stride + ow * 8, vacc3,
+                           out_scale, out_zero, add_to);
+        }
+    }
+}
+
+template <typename InT, typename OutT>
+inline void dwconv_h1_quant(
+    OutT* output, const InT* input, const float* wq,  // precomputed dequantized weights
+    const float* bias_vec,
+    const DwConvParams& p,
+    const Epilogue& epilogue,
+    bool add_to,
+    float in_scale, float in_zero,
+    float out_scale, float out_zero)
+{
+    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero_f32x8();
+    float type_tag_storage = 0.0f;
+    const float* type_tag = &type_tag_storage;
+
+    for (int64_t ow = 0; ow < p.OW; ++ow) {
+        auto vacc = vbias;
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) {
+                continue;
+            }
+            int64_t d_off = id * p.in_d_stride;
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
+                if (ih < 0 || ih >= p.IH) {
+                    continue;
+                }
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    if (iw < 0 || iw >= p.IW) {
+                        continue;
+                    }
+                    int64_t w_off = iw * 8;
+
+                    auto vk = v_load(&wq[(kd * p.KH * p.KW + kh * p.KW + kw) * 8]);
+                    vacc = v_fmadd(dequantize_tensor(input + d_off + ih * p.in_row_stride + w_off,
+                                                  in_scale, in_zero), vk, vacc);
+                }
+            }
+        }
+
+        vacc = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc);
+        requantize_store(output + ow * 8, vacc, out_scale, out_zero, add_to);
     }
 }
 
