@@ -34,8 +34,7 @@ inline void rope_process_row_splithalf(
     T* y, const T* x,
     int64_t head_dim,
     const float* cos_table,
-    const float* sin_table,
-    bool add_to)
+    const float* sin_table)
 {
     const int64_t half = head_dim / 2;
 
@@ -55,8 +54,8 @@ inline void rope_process_row_splithalf(
             auto x1c  = v_mul(x1, c);
             auto x1s  = v_mul(x1, s);
 
-            v_store_add(y + d,       v_sub(x0c, x1s), add_to);
-            v_store_add(y + d + half, v_add(x1c, x0s), add_to);
+            v_store(y + d,       v_sub(x0c, x1s));
+            v_store(y + d + half, v_add(x1c, x0s));
         }
 
         // Scalar tail
@@ -65,8 +64,8 @@ inline void rope_process_row_splithalf(
             float x1v = s_load(&x[d + half]);
             float cv  = cos_table[d];
             float sv  = sin_table[d];
-            s_store_add(&y[d],        x0v * cv - x1v * sv, add_to);
-            s_store_add(&y[d + half], x1v * cv + x0v * sv, add_to);
+            s_store(&y[d],        x0v * cv - x1v * sv);
+            s_store(&y[d + half], x1v * cv + x0v * sv);
         }
     } else {
         // f16: all-scalar (s_load transparently converts f16→f32→f16)
@@ -75,8 +74,8 @@ inline void rope_process_row_splithalf(
             float x1v = s_load(&x[d + half]);
             float cv  = cos_table[d];
             float sv  = sin_table[d];
-            s_store_add(&y[d],        x0v * cv - x1v * sv, add_to);
-            s_store_add(&y[d + half], x1v * cv + x0v * sv, add_to);
+            s_store(&y[d],        x0v * cv - x1v * sv);
+            s_store(&y[d + half], x1v * cv + x0v * sv);
         }
     }
 }
@@ -90,8 +89,7 @@ inline void rope_process_row_interleaved(
     T* y, const T* x,
     int64_t head_dim,
     const float* cos_table,
-    const float* sin_table,
-    bool add_to)
+    const float* sin_table)
 {
     for (int64_t d = 0; d < head_dim; d += 2) {
         float x0 = s_load(&x[d]);
@@ -102,8 +100,8 @@ inline void rope_process_row_interleaved(
         float y0 = x0 * cv - x1 * sv;
         float y1 = x1 * cv + x0 * sv;
 
-        s_store_add(&y[d],     y0, add_to);
-        s_store_add(&y[d + 1], y1, add_to);
+        s_store(&y[d],     y0);
+        s_store(&y[d + 1], y1);
     }
 }
 
@@ -117,13 +115,12 @@ inline void rope_process_row(
     int64_t head_dim,
     const float* cos_table,
     const float* sin_table,
-    bool interleaved,
-    bool add_to)
+    bool interleaved)
 {
     if (interleaved) {
-        rope_process_row_interleaved<T>(y, x, head_dim, cos_table, sin_table, add_to);
+        rope_process_row_interleaved<T>(y, x, head_dim, cos_table, sin_table);
     } else {
-        rope_process_row_splithalf<T>(y, x, head_dim, cos_table, sin_table, add_to);
+        rope_process_row_splithalf<T>(y, x, head_dim, cos_table, sin_table);
     }
 }
 

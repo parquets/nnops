@@ -130,7 +130,6 @@ void rope_impl(const RoPEAttributes& attrs,
     const int64_t row_stride  = X.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
     const bool    interleaved = attrs.interleaved;
-    const bool    add_to      = attrs.add_to;
 
     // ---- Row-by-row rotation ----
     const auto process_outer = [&](int64_t outer) {
@@ -145,7 +144,7 @@ void rope_impl(const RoPEAttributes& attrs,
 
             kernel::rope_process_row<T>(
                 y_row, x_row, head_dim, cos_row, sin_row,
-                interleaved, add_to);
+                interleaved);
         }
     };
 

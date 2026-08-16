@@ -38,10 +38,6 @@ struct RoPEAttributes {
     /// half: (0, D/2), (1, D/2+1), ... (GPT-NeoX convention).
     bool interleaved = true;
 
-    /// If true, add rotation result to existing output instead of overwriting.
-    /// Only supported for interleaved mode.
-    bool add_to = false;
-
     /// mRoPE: dimension counts for each section. When non-empty, head_dim is
     /// partitioned into sections, and each section uses a potentially different
     /// base frequency. The sum of all entries must equal head_dim.

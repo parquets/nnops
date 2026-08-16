@@ -86,7 +86,6 @@ void rope_ref(const RoPEAttributes& attrs,
     auto sections = build_sections(attrs, head_dim);
 
     const bool interleaved = attrs.interleaved;
-    const bool add_to      = attrs.add_to;
     const int64_t half     = head_dim / 2;
 
     const auto process_outer = [&](int64_t outer) {
@@ -112,13 +111,8 @@ void rope_ref(const RoPEAttributes& attrs,
                     float y0 = x0 * cv - x1 * sv;
                     float y1 = x1 * cv + x0 * sv;
 
-                    if (add_to) {
-                        y_row[d]     += y0;
-                        y_row[d + 1] += y1;
-                    } else {
-                        y_row[d]     = y0;
-                        y_row[d + 1] = y1;
-                    }
+                    y_row[d]     = y0;
+                    y_row[d + 1] = y1;
                 }
             } else {
                 for (int64_t d = 0; d < half; ++d) {
@@ -134,13 +128,8 @@ void rope_ref(const RoPEAttributes& attrs,
                     float y0 = x0 * cv - x1 * sv;
                     float y1 = x1 * cv + x0 * sv;
 
-                    if (add_to) {
-                        y_row[d]        += y0;
-                        y_row[d + half] += y1;
-                    } else {
-                        y_row[d]        = y0;
-                        y_row[d + half] = y1;
-                    }
+                    y_row[d]        = y0;
+                    y_row[d + half] = y1;
                 }
             }
         }
