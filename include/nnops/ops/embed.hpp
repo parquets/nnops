@@ -59,9 +59,8 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// Workspace (bytes) required only for int8/uint8 weight with f16 output:
-    /// a f32 staging buffer for the dequantized gathered rows. Returns 0 for
-    /// f32 output (dequantized directly into the output) and for float weight.
+    /// Always returns 0: f16 output is dequantized into a per-thread f32
+    /// scratch and converted f32→f16 in-place, so no workspace is required.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 

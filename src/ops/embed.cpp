@@ -79,22 +79,13 @@ std::vector<TensorDesc> Embed::getOutputTensorDesc(
     return embed_output_shape(inputs);
 }
 
-size_t Embed::getWorkspaceSize(std::span<const TensorDesc> inputs,
-                               std::span<const TensorDesc> outputs) const
+size_t Embed::getWorkspaceSize(std::span<const TensorDesc> /*inputs*/,
+                               std::span<const TensorDesc> /*outputs*/) const
 {
-    NNOPS_ASSERT(inputs.size() == 2);
-    const auto& weight = inputs[0];
-
-    // Only int8/uint8 weight with f16 output needs a f32 staging scratch.
-    if (!is_quantized_dtype(weight.dtype)) {
-        return 0;
-    }
-    if (outputs.empty() || outputs[0].dtype != DataType::f16) {
-        return 0;
-    }
-
-    // Dequantized gathered rows: indices.numel() × embedding_dim floats.
-    return static_cast<size_t>(outputs[0].numel()) * sizeof(float);
+    // No workspace needed: for f16 output the kernel dequantizes each gathered
+    // row into a per-thread f32 scratch and converts f32→f16 inside the same
+    // body iteration, so no full-size staging buffer (or second pass) is used.
+    return 0;
 }
 
 void Embed::compute(std::span<TensorView> outputs,
