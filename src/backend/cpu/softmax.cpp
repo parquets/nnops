@@ -22,15 +22,31 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_softmax.hpp"
+
+#if defined(NNOPS_ARCH_X86_64)
+#include "x86_64/quant.hpp"
+#elif defined(NNOPS_ARCH_AARCH64)
+#include "aarch64/quant.hpp"
+#else
+#error "softmax: unsupported architecture for quantization kernels"
+#endif
 
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
 #include <vector>
 
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
+
+#if defined(NNOPS_ARCH_X86_64)
+namespace quant_kernel = nnops::backend::cpu::x86_64;
+#elif defined(NNOPS_ARCH_AARCH64)
+namespace quant_kernel = nnops::backend::cpu::aarch64;
+#endif
 
 namespace {
 
@@ -319,6 +335,97 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 }
 
 // ============================================================
+// Quantized input (s8/u8) → float output (f32/f16)
+// ============================================================
+//
+// Quantized softmax: the integer input is dequantized to f32 (via the arch
+// quant.hpp per-row kernels) into a contiguous scratch buffer, softmax runs in
+// f32 on that scratch, and the result is written back as f32 or f16 (softmax
+// probabilities are not re-quantized). Only PerTensor / PerToken granularity
+// and planar (pack == 1) layouts are supported — packed channel layouts with
+// quantized input are not defined.
+
+void softmax_quant_input_impl(const SoftmaxAttributes& attrs,
+                              TensorView& output,
+                              std::span<const TensorView> inputs,
+                              const ComputeContext& ctx,
+                              void* workspace)
+{
+    const auto& X = inputs[0];
+    const int64_t numel = X.numel();
+    const int64_t rank = X.rank();
+    NNOPS_ASSERT(rank >= 1);
+
+    const DataType in_dtype  = X.data_type();             // s8 or u8
+    const DataType out_dtype = output.data_type();        // f32 or f16
+    NNOPS_ASSERT(is_quantized_dtype(in_dtype));
+    NNOPS_ASSERT(out_dtype == DataType::f32 || out_dtype == DataType::f16);
+
+    // Quantized softmax is only defined over planar layouts.
+    NNOPS_ASSERT(X.channel_pack_size() == 1);
+    NNOPS_ASSERT(workspace != nullptr);
+
+    const QuantParams& qp = X.quant_params();
+    const bool per_token = qp.granularity == QuantGranularity::PerToken
+                        && qp.scale_data != nullptr;
+
+    // Row shape: PerToken = one (scale, zero_point) per innermost row;
+    // PerTensor = one parameter for the whole tensor.
+    const int64_t last_dim = X.shape(rank - 1);
+    const int64_t M = numel / last_dim;  // number of `last_dim`-element rows
+
+    // Carve the caller-provided workspace (sized by Softmax::getWorkspaceSize):
+    //   [ x_f32 : numel ][ scale : M ][ zero : M ][ y_f32 : numel (f16 only) ]
+    float* x_f32 = static_cast<float*>(workspace);
+    float* scale = x_f32 + numel;
+    float* zero  = scale + M;
+
+    // Quant kernels take int dimensions/strides (see x86_64/quant.hpp).
+    const uint8_t* in_base = X.ptr<uint8_t>();
+    const int sr_i = static_cast<int>(X.row_stride_elems());
+    const int m_i = static_cast<int>(M);
+    const int n_i = static_cast<int>(last_dim);
+
+    // Materialize per-row (scale, zero_point) as float for the arch kernel.
+    for (int64_t i = 0; i < M; ++i) {
+        if (per_token) {
+            scale[i] = qp.scale_data[i];
+            zero[i]  = qp.zero_point_data != nullptr
+                ? static_cast<float>(qp.zero_point_data[i]) : 0.0f;
+        } else {
+            scale[i] = qp.scale;
+            zero[i]  = static_cast<float>(qp.zero_point);
+        }
+    }
+
+    // Dequantize into a contiguous f32 scratch (no pitch).
+    if (in_dtype == DataType::s8) {
+        quant_kernel::dequantization<int8_t>(m_i, n_i, x_f32, n_i,
+            reinterpret_cast<const int8_t*>(in_base), sr_i, scale, zero);
+    } else {
+        quant_kernel::dequantization<uint8_t>(m_i, n_i, x_f32, n_i,
+            in_base, sr_i, scale, zero);
+    }
+
+    // Run softmax over the contiguous f32 view (same logical shape).
+    TensorView x_view(X.shape_span(), DataType::f32, x_f32, TensorLayout::NCHW);
+    const TensorView ins[] = {x_view};
+
+    if (out_dtype == DataType::f32) {
+        softmax_impl<float>(attrs, output, ins, ctx);
+    } else {
+        // Compute in f32, then downcast to f16 (probabilities are not quantized).
+        float* y_f32 = zero + M;
+        TensorView y_view(X.shape_span(), DataType::f32, y_f32, TensorLayout::NCHW);
+        softmax_impl<float>(attrs, y_view, ins, ctx);
+        half* out = output.ptr<half>();
+        for (int64_t i = 0; i < numel; ++i) {
+            s_store(&out[i], y_f32[i]);
+        }
+    }
+}
+
+// ============================================================
 // Entry point with dtype dispatch
 // ============================================================
 
@@ -326,9 +433,15 @@ void softmax_cpu(const SoftmaxAttributes& attrs,
                   TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
-                  void* /*workspace*/)
+                  void* workspace)
 {
     const auto dtype = inputs[0].data_type();
+    if (is_quantized_dtype(dtype)) {
+        // s8/u8 input: softmax probabilities are dequantized float, never int.
+        NNOPS_ASSERT(!is_quantized_dtype(output.data_type()));
+        softmax_quant_input_impl(attrs, output, inputs, ctx, workspace);
+        return;
+    }
     switch (dtype) {
     case DataType::f32:
         softmax_impl<float>(attrs, output, inputs, ctx);

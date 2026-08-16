@@ -44,6 +44,11 @@ struct EltwiseAttributes {
 ///
 /// Input:  A [*], B [*]  (same shape and dtype)
 /// Output: C [*]          (same shape and dtype)
+///
+/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: both
+/// inputs are dequantized, the op is applied in f32, and the result is
+/// re-quantized (f32 → int). Both inputs and the output must be quantized. Only
+/// PerTensor / PerToken activation granularity is used.
 class Eltwise : public OpBase {
 public:
     /// Create an Eltwise operator for the specified backend.

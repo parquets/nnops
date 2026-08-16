@@ -79,7 +79,37 @@ Softmax::Softmax(const SoftmaxAttributes& attrs, Backend backend)
 std::vector<TensorDesc> Softmax::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return {identity_output_shape(inputs)};
+    auto out = identity_output_shape(inputs);
+    // Quantized input (s8/u8): softmax output is dequantized float (default f32),
+    // not re-quantized int.
+    if (is_quantized_dtype(inputs[0].dtype)) {
+        out[0].dtype = DataType::f32;
+    }
+    return out;
+}
+
+size_t Softmax::getWorkspaceSize(std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> outputs) const
+{
+    NNOPS_ASSERT(inputs.size() == 1);
+    if (!is_quantized_dtype(inputs[0].dtype)) {
+        return 0;  // float softmax needs no scratch
+    }
+
+    // Quantized input (s8/u8): a contiguous f32 dequantization scratch plus
+    // per-row scale/zero_point, and (for f16 output) a f32 staging buffer.
+    const int64_t rank = inputs[0].rank;
+    NNOPS_ASSERT(rank >= 1);
+    const int64_t numel = inputs[0].numel();
+    const int64_t last_dim = inputs[0].dims[static_cast<size_t>(rank - 1)];
+    const int64_t M = numel / last_dim;
+
+    size_t ws = static_cast<size_t>(numel) * sizeof(float)             // x_f32
+              + 2 * static_cast<size_t>(M) * sizeof(float);            // scale + zero
+    if (outputs.size() == 1 && outputs[0].dtype == DataType::f16) {
+        ws += static_cast<size_t>(numel) * sizeof(float);              // y_f32 staging
+    }
+    return ws;
 }
 
 void Softmax::compute(std::span<TensorView> outputs,
@@ -92,6 +122,12 @@ void Softmax::compute(std::span<TensorView> outputs,
     auto& output = outputs[0];
     NNOPS_ASSERT(!output.is_empty());
     NNOPS_ASSERT(!inputs[0].is_empty());
+
+    // Quantized input (s8/u8): output must be float (f32 or f16), not int.
+    if (is_quantized_dtype(inputs[0].data_type())) {
+        NNOPS_ASSERT(output.data_type() == DataType::f32 ||
+                     output.data_type() == DataType::f16);
+    }
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }

@@ -646,3 +646,96 @@ NNOPS_TEST(eltwise_random_mul_f16) {
         NNOPS_EXPECT_NEAR(result, a_f32_vec[i] * b_f32_vec[i], 3e-2f);
     }
 }
+
+// ============================================================
+// Quantized input/output tests (fused dequant → op → quant)
+// ============================================================
+
+NNOPS_TEST(eltwise_quant_per_tensor_add_s8) {
+    // s8 → s8 (fused), per-tensor scale=1/zp=0, Add.
+    const int64_t shape[] = {4};
+    int8_t a_data[] = {1, 2, 3, 4};
+    int8_t b_data[] = {5, 6, 7, 8};
+
+    QuantParams qp;
+    qp.scale = 1.0f;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView a(shape, DataType::s8, a_data, TensorLayout::NCHW, qp);
+    TensorView b(shape, DataType::s8, b_data, TensorLayout::NCHW, qp);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Add;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    int8_t out_buf[4] = {};
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_EQ(out_buf[0], 6);
+    NNOPS_EXPECT_EQ(out_buf[1], 8);
+    NNOPS_EXPECT_EQ(out_buf[2], 10);
+    NNOPS_EXPECT_EQ(out_buf[3], 12);
+}
+
+NNOPS_TEST(eltwise_quant_per_token_sub_s8) {
+    // Per-token s8 → s8 (fused), Sub, distinct per-row scales.
+    const int64_t shape[] = {2, 3};
+    int8_t a_data[] = {6, 9, 12,  15, 18, 21};
+    int8_t b_data[] = {1, 2, 3,   4, 5, 6};
+
+    float scale_data[] = {0.5f, 0.25f};
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = 2;
+    TensorView a(shape, DataType::s8, a_data, TensorLayout::NCHW, qp);
+    TensorView b(shape, DataType::s8, b_data, TensorLayout::NCHW, qp);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Sub;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    int8_t out_buf[6] = {};
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    // Row0 (scale 0.5): a=[3,4.5,6] b=[0.5,1,1.5] → sub=[2.5,3.5,4.5] → /0.5=[5,7,9]
+    // Row1 (scale 0.25): a=[3.75,4.5,5.25] b=[1,1.25,1.5] → sub=[2.75,3.25,3.75] → /0.25=[11,13,15]
+    const int8_t expected[] = {5, 7, 9, 11, 13, 15};
+    for (int i = 0; i < 6; ++i) {
+        NNOPS_EXPECT_EQ(out_buf[i], expected[i]);
+    }
+}
+
+NNOPS_TEST(eltwise_quant_per_tensor_add_u8) {
+    // Asymmetric u8 → u8 (fused), Add. scale=0.5, zp=128.
+    const int64_t shape[] = {3};
+    uint8_t a_data[] = {128, 129, 130};
+    uint8_t b_data[] = {128, 130, 132};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.zero_point = 128;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView a(shape, DataType::u8, a_data, TensorLayout::NCHW, qp);
+    TensorView b(shape, DataType::u8, b_data, TensorLayout::NCHW, qp);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Add;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    uint8_t out_buf[3] = {};
+    TensorView output(shape, DataType::u8, out_buf, TensorLayout::NCHW, qp);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    // dequant a=[0,0.5,1] b=[0,1,2] → add=[0,1.5,3] → /0.5+128 → [128,131,134]
+    NNOPS_EXPECT_EQ(out_buf[0], 128);
+    NNOPS_EXPECT_EQ(out_buf[1], 131);
+    NNOPS_EXPECT_EQ(out_buf[2], 134);
+}

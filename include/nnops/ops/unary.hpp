@@ -54,7 +54,13 @@ struct UnaryAttributes {
 ///   Sqrt: output[i] = sqrt(input[i])
 ///
 /// Input:  X [*]
-/// Output: Y [*]  (same shape and dtype)
+/// Output: Y [*]  (same shape)
+///
+/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
+/// quantized input is dequantized, the op is applied in f32, and the result is
+/// re-quantized (f32 → int). Both input and output must be quantized. Only
+/// PerTensor / PerToken activation granularity is used; Round/Ceil/Floor are
+/// float-meaning ops and do not support quantized data types.
 class Unary : public OpBase {
 public:
     /// Create a Unary operator for the specified backend.

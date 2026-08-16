@@ -45,7 +45,13 @@ struct SoftmaxAttributes {
 ///   log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))
 ///
 /// Input: [*, D_axis, *]
-/// Output: same shape as input
+/// Output: same shape as input.
+///
+/// Quantized input (s8/u8) is supported: the integer input is dequantized to
+/// f32, softmax runs in f32, and the output is float (f32 by default, or f16).
+/// Softmax probabilities are never re-quantized to integer. Only PerTensor /
+/// PerToken granularity and planar (NCHW) layouts are supported for quantized
+/// input; packed channel layouts are not defined there.
 class Softmax : public OpBase {
 public:
     /// Create a Softmax operator for the specified backend.
@@ -60,6 +66,12 @@ public:
     // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
+
+    /// Workspace (bytes) required for quantized input (s8/u8): a contiguous
+    /// f32 dequantization scratch, per-row scale/zero_point, and (for f16
+    /// output) a f32 staging buffer. Returns 0 for float input.
+    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const override;
 
     /// inputs[0] = input tensor (any rank >= 1)
     using OpBase::compute;

@@ -265,3 +265,87 @@ NNOPS_TEST(activation_random_relu_f16) {
         NNOPS_EXPECT_NEAR(result, expected, 1e-2f);
     }
 }
+
+// ============================================================
+// Quantized input/output tests (fused dequant → activation → quant)
+// ============================================================
+
+NNOPS_TEST(activation_quant_per_tensor_relu_s8) {
+    // s8 → s8 (fused), per-tensor scale=0.5/zp=0, Relu.
+    const int64_t shape[] = {6};
+    int8_t in_data[] = {-4, -2, 0, 2, 4, 6};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::Relu;
+    auto op = Activation::create(attrs, Backend::CPU);
+
+    int8_t out_buf[6] = {};
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // dequant: [-2,-1,0,1,2,3] → relu: [0,0,0,1,2,3] → /0.5: [0,0,0,2,4,6]
+    const int8_t expected[] = {0, 0, 0, 2, 4, 6};
+    for (int i = 0; i < 6; ++i) {
+        NNOPS_EXPECT_EQ(out_buf[i], expected[i]);
+    }
+}
+
+NNOPS_TEST(activation_quant_per_tensor_sigmoid_s8) {
+    // s8 → s8 (fused), per-tensor scale=1/zp=0, Sigmoid.
+    const int64_t shape[] = {2};
+    int8_t in_data[] = {0, 2};
+
+    QuantParams qp;
+    qp.scale = 1.0f;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::Sigmoid;
+    auto op = Activation::create(attrs, Backend::CPU);
+
+    int8_t out_buf[2] = {};
+    TensorView output(shape, DataType::s8, out_buf, TensorLayout::NCHW, qp);
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // sigmoid(0)=0.5 → ties-to-even → 0; sigmoid(2)=0.8808 → 1
+    NNOPS_EXPECT_EQ(out_buf[0], 0);
+    NNOPS_EXPECT_EQ(out_buf[1], 1);
+}
+
+NNOPS_TEST(activation_quant_per_tensor_relu_u8) {
+    // Asymmetric u8 → u8 (fused), Relu. scale=0.5, zp=128.
+    const int64_t shape[] = {4};
+    uint8_t in_data[] = {126, 127, 128, 129};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.zero_point = 128;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView input(shape, DataType::u8, in_data, TensorLayout::NCHW, qp);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::Relu;
+    auto op = Activation::create(attrs, Backend::CPU);
+
+    uint8_t out_buf[4] = {};
+    TensorView output(shape, DataType::u8, out_buf, TensorLayout::NCHW, qp);
+
+    const TensorView ins[] = {input};
+    op->compute(output, ins);
+
+    // dequant: [-1,-0.5,0,0.5] → relu: [0,0,0,0.5] → /0.5+128: [128,128,128,129]
+    NNOPS_EXPECT_EQ(out_buf[0], 128);
+    NNOPS_EXPECT_EQ(out_buf[1], 128);
+    NNOPS_EXPECT_EQ(out_buf[2], 128);
+    NNOPS_EXPECT_EQ(out_buf[3], 129);
+}

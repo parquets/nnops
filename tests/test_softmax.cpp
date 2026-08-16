@@ -753,6 +753,136 @@ NNOPS_TEST(softmax_nchwc8_axis_channel) {
     }
 }
 
+// ============================================================
+// Quantized input (s8/u8) → float output (f32/f16)
+// ============================================================
+
+NNOPS_TEST(softmax_quant_s8_per_tensor) {
+    // s8 input, per-tensor scale=0.5/zp=0. Dequantized {1, 2, 3} → softmax.
+    const int64_t shape[] = {3};
+    int8_t in_data[] = {2, 4, 6};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+
+    auto op = Softmax::create({}, Backend::CPU);
+    const TensorDesc in_arr[] = {input.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    // Quantized input ⇒ output is float (f32), not int.
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(descs[0].numel());
+    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    std::vector<char> workspace(op->getWorkspaceSize(in_arr, descs));
+    const TensorView ins[] = {input};
+    op->compute(output, ins, {}, workspace.data());
+
+    // dequant {1,2,3} → exp {2.7183, 7.3891, 20.0855}, sum 30.1929
+    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
+    NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[0] + out_buf[1] + out_buf[2], 1.0f, 1e-5f);
+}
+
+NNOPS_TEST(softmax_quant_u8_per_tensor) {
+    // Asymmetric u8 input, scale=0.5/zp=128. Dequantized {1, 2, 3}.
+    const int64_t shape[] = {3};
+    uint8_t in_data[] = {130, 132, 134};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.zero_point = 128;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView input(shape, DataType::u8, in_data, TensorLayout::NCHW, qp);
+
+    auto op = Softmax::create({}, Backend::CPU);
+    const TensorDesc in_arr[] = {input.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(descs[0].numel());
+    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    std::vector<char> workspace(op->getWorkspaceSize(in_arr, descs));
+    const TensorView ins[] = {input};
+    op->compute(output, ins, {}, workspace.data());
+
+    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
+    NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum_exp, 1e-4f);
+}
+
+NNOPS_TEST(softmax_quant_s8_per_token) {
+    // Per-token s8, rows {1,2,3} and {2,4,6} with scales {1, 0.5}.
+    // Both rows dequantize to {1, 2, 3}, so softmax over axis=1 is identical.
+    const int64_t shape[] = {2, 3};
+    int8_t in_data[] = {1, 2, 3,  2, 4, 6};
+    float scale_data[] = {1.0f, 0.5f};
+
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = 2;
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+
+    SoftmaxAttributes attrs;
+    attrs.axis = 1;
+    auto op = Softmax::create(attrs, Backend::CPU);
+    const TensorDesc in_arr[] = {input.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(descs[0].numel());
+    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    std::vector<char> workspace(op->getWorkspaceSize(in_arr, descs));
+    const TensorView ins[] = {input};
+    op->compute(output, ins, {}, workspace.data());
+
+    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
+    const float e0 = std::exp(1.0f) / sum_exp;
+    const float e1 = std::exp(2.0f) / sum_exp;
+    const float e2 = std::exp(3.0f) / sum_exp;
+    for (int r = 0; r < 2; ++r) {
+        NNOPS_EXPECT_NEAR(out_buf[r * 3 + 0], e0, 1e-4f);
+        NNOPS_EXPECT_NEAR(out_buf[r * 3 + 1], e1, 1e-4f);
+        NNOPS_EXPECT_NEAR(out_buf[r * 3 + 2], e2, 1e-4f);
+    }
+}
+
+NNOPS_TEST(softmax_quant_s8_f16_output) {
+    // s8 input with f16 output (softmax probabilities downcast to half).
+    const int64_t shape[] = {3};
+    int8_t in_data[] = {2, 4, 6};
+
+    QuantParams qp;
+    qp.scale = 0.5f;
+    qp.granularity = QuantGranularity::PerTensor;
+    TensorView input(shape, DataType::s8, in_data, TensorLayout::NCHW, qp);
+
+    auto op = Softmax::create({}, Backend::CPU);
+
+    std::vector<nnops::backend::cpu::half> out_buf(3);
+    TensorView output(shape, DataType::f16, out_buf.data(), TensorLayout::NCHW);
+
+    const TensorDesc in_arr[] = {input.desc()};
+    const TensorDesc out_arr[] = {output.desc()};
+    std::vector<char> workspace(op->getWorkspaceSize(in_arr, out_arr));
+    const TensorView ins[] = {input};
+    op->compute(output, ins, {}, workspace.data());
+
+    float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[0]), std::exp(1.0f) / sum_exp, 1e-2f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[1]), std::exp(2.0f) / sum_exp, 1e-2f);
+    NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[2]), std::exp(3.0f) / sum_exp, 1e-2f);
+}
+
 NNOPS_TEST(softmax_nchwc8_axis_channel_partial_c8) {
     // NCHWC8 [1, 10, 2, 3] — C=10 not a multiple of 8 (C8=2, valid_lanes=2).
     // Exercises the partial-lane path in packed channel softmax.

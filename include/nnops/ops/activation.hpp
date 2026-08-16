@@ -38,6 +38,11 @@ struct ActivationAttributes {
 ///
 /// Element-wise operation: output[i] = f(input[i]).
 /// Input and output must have the same shape and data type.
+///
+/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
+/// quantized input is dequantized, the activation is applied in f32, and the
+/// result is re-quantized (f32 → int). Both input and output must be quantized.
+/// Only PerTensor / PerToken activation granularity is used.
 class Activation : public OpBase {
 public:
     /// Create an Activation operator for the specified backend.
