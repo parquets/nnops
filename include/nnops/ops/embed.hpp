@@ -59,9 +59,9 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// Workspace (bytes) required only for int8/uint8 weight with f16 output:
-    /// a f32 staging buffer for the dequantized gathered rows. Returns 0 for
-    /// f32 output (dequantized directly into the output) and for float weight.
+    /// Workspace (bytes) required by Embed. Always 0: int8/uint8 weight is
+    /// dequantized directly into the f32 or f16 output (f16 via a fused
+    /// half-output kernel), so no staging buffer is needed.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 

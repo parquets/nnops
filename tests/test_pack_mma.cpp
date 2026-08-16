@@ -22,6 +22,7 @@
   #include "backend/cpu/x86_64/mma_pack_f16.hpp"
   #include "backend/cpu/x86_64/mma_direct_f32.hpp"
   #include "backend/cpu/x86_64/mma_direct_f16.hpp"
+  #include "backend/cpu/x86_64/quant.hpp"
   using namespace nnops::backend::cpu::x86_64;
   using f16_t = nnops::backend::cpu::half;  // x86_64: struct half { uint16_t bits; }
   #define NNOPS_PACK_MMA_ARCH "x86_64"
@@ -32,6 +33,7 @@
   #include "backend/cpu/aarch64/mma_pack_f16.hpp"
   #include "backend/cpu/aarch64/mma_direct_f32.hpp"
   #include "backend/cpu/aarch64/mma_direct_f16.hpp"
+  #include "backend/cpu/aarch64/quant.hpp"
   using namespace nnops::backend::cpu::aarch64;
   using f16_t = float16_t;
   #define NNOPS_PACK_MMA_ARCH "aarch64"
@@ -42,6 +44,7 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <type_traits>
 
 // =========================================================================
 //  Helpers
@@ -569,3 +572,90 @@ NNOPS_TEST(mma_f32_zero_a) {
         NNOPS_EXPECT_NEAR(C[i], C_saved[i], 1e-6f);
     }
 }
+
+// =========================================================================
+//  Section 12: half (f16) quantization / dequantization kernels
+// =========================================================================
+
+/// Scalar reference for half→int8/uint8 quantization (matches SIMD rounding).
+template <typename T>
+static void ref_quant_f16(const f16_t* src, const float* scale, const float* zero,
+                          T* dst, int M, int N) {
+    const int qmin = std::is_same_v<T, uint8_t> ? 0 : -128;
+    const int qmax = std::is_same_v<T, uint8_t> ? 255 : 127;
+    for (int m = 0; m < M; ++m) {
+        const float inv = 1.0f / scale[m];
+        const float zp = (zero == nullptr) ? 0.0f : zero[m];
+        for (int n = 0; n < N; ++n) {
+            const float q = f16_to_f(src[m * N + n]) * inv + zp;
+            int qi = static_cast<int>(std::nearbyintf(q));
+            qi = std::min(std::max(qi, qmin), qmax);
+            dst[m * N + n] = static_cast<T>(qi);
+        }
+    }
+}
+
+/// Scalar reference for int8/uint8→half dequantization (matches SIMD rounding).
+template <typename T>
+static void ref_dequant_f16(const T* src, const float* scale, const float* zero,
+                            f16_t* dst, int M, int N) {
+    for (int m = 0; m < M; ++m) {
+        const float zp = (zero == nullptr) ? 0.0f : zero[m];
+        for (int n = 0; n < N; ++n) {
+            dst[m * N + n] = f_to_f16((static_cast<float>(src[m * N + n]) - zp) * scale[m]);
+        }
+    }
+}
+
+/// Shared body: half→int8/uint8 quantization vs scalar reference.
+template <typename T>
+static void check_quant_f16(int M, int N, bool with_zero) {
+    std::vector<f16_t> src(M * N);
+    std::vector<float> scale(M);
+    std::vector<float> zero(M);
+    std::vector<T> dst(M * N);
+    std::vector<T> ref(M * N);
+
+    for (int i = 0; i < M * N; ++i) { src[i] = f_to_f16((float(i % 257) - 128.0f) * 0.7f); }
+    for (int m = 0; m < M; ++m) { scale[m] = 0.5f + 0.13f * float(m); zero[m] = float(m) - 2.0f; }
+
+    quantization<T>(M, N, dst.data(), N, src.data(), N, scale.data(),
+                    with_zero ? zero.data() : nullptr);
+    ref_quant_f16<T>(src.data(), scale.data(), with_zero ? zero.data() : nullptr,
+                     ref.data(), M, N);
+
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_EQ(static_cast<int>(dst[i]), static_cast<int>(ref[i]));
+    }
+}
+
+NNOPS_TEST(quant_f16_to_s8)     { check_quant_f16<int8_t>(3, 56, true); }
+NNOPS_TEST(quant_f16_to_u8)     { check_quant_f16<uint8_t>(3, 56, true); }
+NNOPS_TEST(quant_f16_to_s8_sym) { check_quant_f16<int8_t>(2, 37, false); }
+
+/// Shared body: int8/uint8→half dequantization vs scalar reference.
+template <typename T>
+static void check_dequant_f16(int M, int N, bool with_zero) {
+    std::vector<T> src(M * N);
+    std::vector<float> scale(M);
+    std::vector<float> zero(M);
+    std::vector<f16_t> dst(M * N);
+    std::vector<f16_t> ref(M * N);
+
+    const int off = std::is_same_v<T, uint8_t> ? 0 : 128;
+    for (int i = 0; i < M * N; ++i) { src[i] = static_cast<T>((i % 256) - off); }
+    for (int m = 0; m < M; ++m) { scale[m] = 0.25f + 0.07f * float(m); zero[m] = float(m) - 1.0f; }
+
+    dequantization<T>(M, N, dst.data(), N, src.data(), N, scale.data(),
+                      with_zero ? zero.data() : nullptr);
+    ref_dequant_f16<T>(src.data(), scale.data(), with_zero ? zero.data() : nullptr,
+                       ref.data(), M, N);
+
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(f16_to_f(dst[i]), f16_to_f(ref[i]), 1e-6f);
+    }
+}
+
+NNOPS_TEST(dequant_s8_to_f16)     { check_dequant_f16<int8_t>(3, 40, true); }
+NNOPS_TEST(dequant_u8_to_f16)     { check_dequant_f16<uint8_t>(3, 40, true); }
+NNOPS_TEST(dequant_s8_to_f16_sym) { check_dequant_f16<int8_t>(2, 33, false); }

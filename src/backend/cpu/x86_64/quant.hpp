@@ -26,8 +26,13 @@
 #include <type_traits>
 
 #include "backend/cpu/common/restrict.hpp"
+#include "nnops/detail/half.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
+
+using nnops::backend::cpu::half;
+using nnops::backend::cpu::half_to_float;
+using nnops::backend::cpu::float_to_half;
 
 // =========================================================================
 //  Block helpers — register-level quantize / dequantize primitives
@@ -170,6 +175,73 @@ inline void quantization(int M, int N,
 }
 
 // =========================================================================
+//  Top-level per-token quantize with half (f16) input
+// =========================================================================
+
+/// Quantize an M×N f16 matrix to integer `T`, one (scale, zero_point) per row.
+///
+/// The half input is widened to f32 with F16C (`_mm256_cvtph_ps` for the
+/// 32-wide path, `_mm_cvtph_ps` for the 16-wide tail) and then run through the
+/// same f32→int8 arithmetic as the f32 `quantization<T>` overload. Rounding and
+/// clamping are identical (round-to-nearest-even, saturating to `T`'s range).
+/// `T` is int8_t (s8) or uint8_t (u8).
+template <typename T>
+inline void quantization(int M, int N,
+                         T* NNOPS_RESTRICT dst, int dr_step,
+                         const half* NNOPS_RESTRICT src, int sr_step,
+                         const float* NNOPS_RESTRICT scale,
+                         const float* NNOPS_RESTRICT zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "quantization: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+    constexpr int32_t qmin = Q_U8 ? 0 : -128;
+    constexpr int32_t qmax = Q_U8 ? 255 : 127;
+
+    for (int m = 0; m < M; ++m) {
+        const float inv_scale = 1.0f / scale[m];
+        const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+
+        const __m256 v_inv_scale = _mm256_set1_ps(inv_scale);
+        const __m256 v_zero = _mm256_set1_ps(zero_val);
+        const __m128 v_inv_scale_lo = _mm256_castps256_ps128(v_inv_scale);
+        const __m128 v_zero_lo = _mm256_castps256_ps128(v_zero);
+
+        T* dst_ptr = dst + m * dr_step;
+        const half* src_ptr = src + m * sr_step;
+
+        int n = 0;
+        for (; n + 32 <= N; n += 32) {
+            const __m128i h0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 0));
+            const __m128i h1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 8));
+            const __m128i h2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 16));
+            const __m128i h3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 24));
+            const __m256 d0 = _mm256_cvtph_ps(h0);
+            const __m256 d1 = _mm256_cvtph_ps(h1);
+            const __m256 d2 = _mm256_cvtph_ps(h2);
+            const __m256 d3 = _mm256_cvtph_ps(h3);
+            const __m256i q = quant_block32_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale, v_zero);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_ptr + n), q);
+        }
+        for (; n + 16 <= N; n += 16) {
+            const __m128i h0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 0));
+            const __m128i h1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 8));
+            const __m128 d0 = _mm_cvtph_ps(h0);
+            const __m128 d1 = _mm_cvtph_ps(_mm_srli_si128(h0, 8));
+            const __m128 d2 = _mm_cvtph_ps(h1);
+            const __m128 d3 = _mm_cvtph_ps(_mm_srli_si128(h1, 8));
+            const __m128i q = quant_block16_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale_lo, v_zero_lo);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n), q);
+        }
+        for (; n < N; ++n) {
+            const float q = half_to_float(src_ptr[n]) * inv_scale + zero_val;
+            int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
+            qi = std::min(std::max(qi, qmin), qmax);
+            dst_ptr[n] = static_cast<T>(qi);
+        }
+    }
+}
+
+// =========================================================================
 //  NCHWC8 8-wide primitives (8 channels = 8 bytes = one 64-bit group)
 //
 // These operate on a single channel-packed lane group (8 int8/uint8 values) —
@@ -253,6 +325,52 @@ inline void dequantization(int M, int N,
         }
         for (; n < N; ++n) {
             dst_ptr[n] = (static_cast<float>(src_ptr[n]) - zero_val) * scale_val;
+        }
+    }
+}
+
+// =========================================================================
+//  Top-level per-token dequantize with half (f16) output
+// =========================================================================
+
+/// Dequantize an M×N integer matrix of type `T` to f16, one (scale, zero_point)
+/// per row.
+///
+/// The integer input is widened and dequantized to f32 with the same arithmetic
+/// as the f32 `dequantization<T>`, then narrowed to f16 with F16C
+/// `_mm256_cvtps_ph` (round-to-nearest-even). `T` is int8_t (s8) or uint8_t (u8).
+template <typename T>
+inline void dequantization(int M, int N,
+                           half* NNOPS_RESTRICT dst, int dr_step,
+                           const T* NNOPS_RESTRICT src, int sr_step,
+                           const float* NNOPS_RESTRICT scale,
+                           const float* NNOPS_RESTRICT zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "dequantization: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+
+    for (int m = 0; m < M; ++m) {
+        const float scale_val = scale[m];
+        const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+
+        const __m256 v_scale = _mm256_set1_ps(scale_val);
+        const __m256 v_zero = _mm256_set1_ps(zero_val);
+
+        half* dst_ptr = dst + m * dr_step;
+        const T* src_ptr = src + m * sr_step;
+
+        int n = 0;
+        for (; n + 16 <= N; n += 16) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n));
+            __m256 res0, res1;
+            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_zero, res0, res1);
+            const __m128i h0 = _mm256_cvtps_ph(res0, _MM_FROUND_TO_NEAREST_INT);
+            const __m128i h1 = _mm256_cvtps_ph(res1, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 0), h0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 8), h1);
+        }
+        for (; n < N; ++n) {
+            dst_ptr[n] = float_to_half((static_cast<float>(src_ptr[n]) - zero_val) * scale_val);
         }
     }
 }

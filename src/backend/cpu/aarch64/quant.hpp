@@ -30,8 +30,13 @@
 #include <type_traits>
 
 #include "backend/cpu/common/restrict.hpp"
+#include "nnops/detail/half.hpp"
 
 namespace nnops::backend::cpu::aarch64 {
+
+using nnops::backend::cpu::half;
+using nnops::backend::cpu::half_to_float;
+using nnops::backend::cpu::float_to_half;
 
 // =========================================================================
 //  Block helpers — register-level quantize / dequantize primitives
@@ -150,6 +155,59 @@ inline void quantization(int M, int N,
 }
 
 // =========================================================================
+//  Top-level per-token quantize with half (f16) input
+// =========================================================================
+
+/// Quantize an M×N f16 matrix to integer `T`, one (scale, zero_point) per row.
+///
+/// The half input is widened to f32 with the NEON fp16→fp32 conversion
+/// (`vcvt_f32_f16` / `vcvt_high_f32_f16`) and then run through the same
+/// f32→int8 arithmetic as the f32 `quantization<T>` overload. Rounding and
+/// clamping are identical (round-to-nearest-even, saturating to `T`'s range).
+/// `T` is int8_t (s8) or uint8_t (u8).
+template <typename T>
+inline void quantization(int M, int N,
+                         T* NNOPS_RESTRICT dst, int dr_step,
+                         const half* NNOPS_RESTRICT src, int sr_step,
+                         const float* NNOPS_RESTRICT scale,
+                         const float* NNOPS_RESTRICT zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "quantization: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+    constexpr int32_t qmin = Q_U8 ? 0 : -128;
+    constexpr int32_t qmax = Q_U8 ? 255 : 127;
+
+    for (int m = 0; m < M; ++m) {
+        const float inv_scale = 1.0f / scale[m];
+        const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+
+        const float32x4_t v_inv_scale = vdupq_n_f32(inv_scale);
+        const float32x4_t v_zero = vdupq_n_f32(zero_val);
+
+        T* dst_ptr = dst + m * dr_step;
+        const half* src_ptr = src + m * sr_step;
+
+        int n = 0;
+        for (; n + 16 <= N; n += 16) {
+            const float16x8_t h0 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 0));
+            const float16x8_t h1 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 8));
+            const float32x4_t d0 = vcvt_f32_f16(vget_low_f16(h0));
+            const float32x4_t d1 = vcvt_high_f32_f16(h0);
+            const float32x4_t d2 = vcvt_f32_f16(vget_low_f16(h1));
+            const float32x4_t d3 = vcvt_high_f32_f16(h1);
+            const int8x16_t q = quant_block16_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale, v_zero);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n), q);
+        }
+        for (; n < N; ++n) {
+            const float q = half_to_float(src_ptr[n]) * inv_scale + zero_val;
+            int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
+            qi = std::min(std::max(qi, qmin), qmax);
+            dst_ptr[n] = static_cast<T>(qi);
+        }
+    }
+}
+
+// =========================================================================
 //  NCHWC8 8-wide primitives (8 channels = 8 bytes = one 64-bit group)
 //
 // These operate on a single channel-packed lane group (8 int8/uint8 values) —
@@ -241,6 +299,52 @@ inline void dequantization(int M, int N,
         }
         for (; n < N; ++n) {
             dst_ptr[n] = (static_cast<float>(src_ptr[n]) - zero_val) * scale_val;
+        }
+    }
+}
+
+// =========================================================================
+//  Top-level per-token dequantize with half (f16) output
+// =========================================================================
+
+/// Dequantize an M×N integer matrix of type `T` to f16, one (scale, zero_point)
+/// per row.
+///
+/// The integer input is widened and dequantized to f32 with the same arithmetic
+/// as the f32 `dequantization<T>`, then narrowed to f16 with the NEON fp32→fp16
+/// conversion (`vcvt_f16_f32`). `T` is int8_t (s8) or uint8_t (u8).
+template <typename T>
+inline void dequantization(int M, int N,
+                           half* NNOPS_RESTRICT dst, int dr_step,
+                           const T* NNOPS_RESTRICT src, int sr_step,
+                           const float* NNOPS_RESTRICT scale,
+                           const float* NNOPS_RESTRICT zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "dequantization: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+
+    for (int m = 0; m < M; ++m) {
+        const float scale_val = scale[m];
+        const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+
+        const float32x4_t v_scale = vdupq_n_f32(scale_val);
+        const float32x4_t v_zero = vdupq_n_f32(zero_val);
+
+        half* dst_ptr = dst + m * dr_step;
+        const T* src_ptr = src + m * sr_step;
+
+        int n = 0;
+        for (; n + 16 <= N; n += 16) {
+            const int8x16_t v = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n));
+            float32x4_t res0, res1, res2, res3;
+            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_zero, res0, res1, res2, res3);
+            const float16x8_t h0 = vcombine_f16(vcvt_f16_f32(res0), vcvt_f16_f32(res1));
+            const float16x8_t h1 = vcombine_f16(vcvt_f16_f32(res2), vcvt_f16_f32(res3));
+            vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 0), h0);
+            vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 8), h1);
+        }
+        for (; n < N; ++n) {
+            dst_ptr[n] = float_to_half((static_cast<float>(src_ptr[n]) - zero_val) * scale_val);
         }
     }
 }
