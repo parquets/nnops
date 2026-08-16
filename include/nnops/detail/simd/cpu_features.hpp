@@ -23,6 +23,13 @@
   #endif
 #endif
 
+// F16C (16-bit half-precision float conversions) is baseline on the target
+// x86_64 platform. GCC/Clang define __F16C__ with -mf16c, but MSVC's /arch:AVX2
+// does not, so define it explicitly to keep the guarded f16 SIMD path active.
+#if defined(NNOPS_ARCH_X86_64) && !defined(__F16C__)
+  #define __F16C__ 1
+#endif
+
 namespace nnops {
 namespace simd {
 

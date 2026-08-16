@@ -14,6 +14,16 @@
 #include <algorithm>
 #include "sse_mathfunc.hpp"
 
+// The F16C fp16 path (below) widens to fp32 and uses the AVX2 transcendental
+// math functions. avx2_mathfunc.hpp opens `namespace nnops::simd::arch::avx2`,
+// so it must be included here at file scope — NOT inside the `namespace sse`
+// block below, which would nest it into sse::nnops::simd::arch::avx2 and break
+// the sibling `avx2::` lookup in the v_f16x8 transcendental ops.
+#if defined(__F16C__)
+#include <immintrin.h>
+#include "avx2_mathfunc.hpp"
+#endif
+
 namespace nnops {
 namespace simd {
 namespace arch {
@@ -285,9 +295,6 @@ inline float v_reduce_min(const v_f32x8& a) {
 // narrow fp32→fp16. Assumes target CPU supports F16C, AVX2, FMA3.
 // ============================================================
 #if defined(__F16C__)
-
-#include <immintrin.h>
-#include "avx2_mathfunc.hpp"
 
 struct v_f16x8 {
     __m128i val;  // 8 × fp16 (binary16) values
@@ -667,10 +674,14 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
 
 #if defined(__F16C__)
 /// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
-/// Uses _mm_unpacklo_epi16 / _mm_unpackhi_epi16 (equiv to NEON ZIP1/ZIP2).
+///
+/// Three interleave stages, each widening the granularity: 16-bit pairs,
+/// then 32-bit quads, then 64-bit octets. Using epi16 in every stage (the
+/// naive NEON-zip mirror) would yield a bit-reversal permutation instead of
+/// a transpose; the granularity must double each round.
 inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
                              v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
-    // Step 1: pairwise interchange (2×2 blocks)
+    // Stage 1: transpose 2×2 blocks (16-bit interleave of low/high halves)
     __m128i t0 = _mm_unpacklo_epi16(r0.val, r1.val);
     __m128i t1 = _mm_unpackhi_epi16(r0.val, r1.val);
     __m128i t2 = _mm_unpacklo_epi16(r2.val, r3.val);
@@ -680,25 +691,25 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
     __m128i t6 = _mm_unpacklo_epi16(r6.val, r7.val);
     __m128i t7 = _mm_unpackhi_epi16(r6.val, r7.val);
 
-    // Step 2: interchange pairs into quads (4×4 blocks)
-    __m128i u0 = _mm_unpacklo_epi16(t0, t2);
-    __m128i u2 = _mm_unpackhi_epi16(t0, t2);
-    __m128i u1 = _mm_unpacklo_epi16(t1, t3);
-    __m128i u3 = _mm_unpackhi_epi16(t1, t3);
-    __m128i u4 = _mm_unpacklo_epi16(t4, t6);
-    __m128i u6 = _mm_unpackhi_epi16(t4, t6);
-    __m128i u5 = _mm_unpacklo_epi16(t5, t7);
-    __m128i u7 = _mm_unpackhi_epi16(t5, t7);
+    // Stage 2: transpose 4×4 blocks (32-bit interleave)
+    __m128i u0 = _mm_unpacklo_epi32(t0, t2);  // rows 0-3, cols 0-1
+    __m128i u1 = _mm_unpackhi_epi32(t0, t2);  // rows 0-3, cols 2-3
+    __m128i u2 = _mm_unpacklo_epi32(t1, t3);  // rows 0-3, cols 4-5
+    __m128i u3 = _mm_unpackhi_epi32(t1, t3);  // rows 0-3, cols 6-7
+    __m128i u4 = _mm_unpacklo_epi32(t4, t6);  // rows 4-7, cols 0-1
+    __m128i u5 = _mm_unpackhi_epi32(t4, t6);  // rows 4-7, cols 2-3
+    __m128i u6 = _mm_unpacklo_epi32(t5, t7);  // rows 4-7, cols 4-5
+    __m128i u7 = _mm_unpackhi_epi32(t5, t7);  // rows 4-7, cols 6-7
 
-    // Step 3: interchange quads into full 8×8 transpose
-    r0.val = _mm_unpacklo_epi16(u0, u4);  // col 0
-    r1.val = _mm_unpackhi_epi16(u0, u4);  // col 1
-    r2.val = _mm_unpacklo_epi16(u2, u6);  // col 2
-    r3.val = _mm_unpackhi_epi16(u2, u6);  // col 3
-    r4.val = _mm_unpacklo_epi16(u1, u5);  // col 4
-    r5.val = _mm_unpackhi_epi16(u1, u5);  // col 5
-    r6.val = _mm_unpacklo_epi16(u3, u7);  // col 6
-    r7.val = _mm_unpackhi_epi16(u3, u7);  // col 7
+    // Stage 3: transpose 8×8 blocks (64-bit interleave)
+    r0.val = _mm_unpacklo_epi64(u0, u4);  // col 0
+    r1.val = _mm_unpackhi_epi64(u0, u4);  // col 1
+    r2.val = _mm_unpacklo_epi64(u1, u5);  // col 2
+    r3.val = _mm_unpackhi_epi64(u1, u5);  // col 3
+    r4.val = _mm_unpacklo_epi64(u2, u6);  // col 4
+    r5.val = _mm_unpackhi_epi64(u2, u6);  // col 5
+    r6.val = _mm_unpacklo_epi64(u3, u7);  // col 6
+    r7.val = _mm_unpackhi_epi64(u3, u7);  // col 7
 }
 #endif  // defined(__F16C__)
 
