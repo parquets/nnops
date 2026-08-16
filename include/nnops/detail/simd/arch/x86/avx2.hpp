@@ -18,6 +18,12 @@
 #include "sse_mathfunc.hpp"
 #include "avx2_mathfunc.hpp"
 
+// v_cvt_f32_to_f16 returns arch::sse::v_f16x8 (the canonical 128-bit fp16 type
+// on x86_64), so pull in sse.hpp to make that type visible on the F16C path.
+#if defined(__F16C__)
+#include "sse.hpp"
+#endif
+
 namespace nnops {
 namespace simd {
 namespace arch {
@@ -236,6 +242,18 @@ inline float v_reduce_min(const v_f32x8& a) {
     __m128 min128 = _mm_min_ps(lo, hi);
     return v_reduce_min(v_f32x4(min128));
 }
+
+// ============================================================
+// f32 → f16 conversion (F16C)
+// ============================================================
+#if defined(__F16C__)
+
+/// @brief Narrow 8 f32 lanes (__m256) to 8 f16 lanes (sse::v_f16x8).
+inline sse::v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
+    return sse::v_f16x8(_mm256_cvtps_ph(a.val, 0));
+}
+
+#endif  // defined(__F16C__)
 
 // ============================================================
 // Deinterleave (stride-2 gather) — pair types

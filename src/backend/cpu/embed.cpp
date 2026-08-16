@@ -9,14 +9,15 @@
 ///
 /// For int8/uint8 dequantization, the per-row arithmetic is delegated to the
 /// raw arch kernels in `x86_64/quant.hpp` / `aarch64/quant.hpp`
-/// (quant_kernel::dequantization<T>), which output f32. For f16 output each
-/// gathered row is dequantized into a per-thread f32 scratch and converted
-/// f32→f16 in the same body, so no workspace is required.
+/// (quant_kernel::dequantization<T>), which output f32. For f16 output the
+/// gathered rows are dequantized into a f32 workspace scratch, then converted
+/// f32→f16 with SIMD (v_cvt_f32_to_f16) in a second pass.
 
 #include "nnops/ops/embed.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
+#include "nnops/detail/simd/simd.hpp"
 
 #if defined(NNOPS_ARCH_X86_64)
 #include "x86_64/quant.hpp"
@@ -29,9 +30,10 @@
 #include <algorithm>
 #include <cstring>
 #include <type_traits>
-#include <vector>
 
 namespace nnops::backend::cpu {
+
+using namespace nnops::simd;
 
 #if defined(NNOPS_ARCH_X86_64)
 namespace quant_kernel = nnops::backend::cpu::x86_64;
@@ -106,16 +108,29 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
 //
 // The per-row dequant arithmetic is delegated to the raw arch kernels in
 // `x86_64/quant.hpp` (AVX2+FMA) / `aarch64/quant.hpp` (NEON):
-// `quant_kernel::dequantization<T>`, which outputs f32. For f16 output each
-// gathered row is dequantized into a per-thread f32 scratch and converted
-// f32→f16 in the same body — the row is fully independent, so this avoids a
-// full-size staging buffer and the second conversion pass.
+// `quant_kernel::dequantization<T>`, which outputs f32. For f16 output the
+// gathered rows are first dequantized into a f32 workspace scratch, then
+// converted f32→f16 with SIMD (v_cvt_f32_to_f16) in a second pass.
+
+// Vectorized f32 → f16 conversion of one row of `n` elements (8 per step).
+// Uses the portable v_cvt_f32_to_f16 (AVX2+F16C on x86_64, NEON on AArch64);
+// the scalar tail handles the remainder.
+inline void convert_f32_to_f16_row(half* dst, const float* src, int n) {
+    int j = 0;
+    for (; j + 8 <= n; j += 8) {
+        v_store(dst + j, v_cvt_f32_to_f16(v_load_f32x8(src + j)));
+    }
+    for (; j < n; ++j) {
+        dst[j] = float_to_half(src[j]);
+    }
+}
 
 template <typename T>  // T = weight storage type (int8_t / uint8_t)
 void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
                               TensorView& output,
                               std::span<const TensorView> inputs,
-                              const ComputeContext& ctx)
+                              const ComputeContext& ctx,
+                              void* workspace)
 {
     const auto& weight  = inputs[0];
     const auto& indices = inputs[1];
@@ -144,10 +159,9 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
 
     const int dim_i = static_cast<int>(dim);
 
-    // Per-thread f32 staging for f16 output. Each cpu_parallel_for worker gets
-    // its own instance, so dequantize→convert per row is race-free without a
-    // full-size workspace. `resize` is a no-op once sized (dim is constant).
-    thread_local std::vector<float> row_scratch;
+    // f16 output is dequantized into this f32 scratch (caller-provided workspace).
+    float* scratch = out_f16 ? static_cast<float*>(workspace) : nullptr;
+    NNOPS_ASSERT(!out_f16 || scratch != nullptr);
 
     const auto resolve_idx = [&](int64_t n) -> int64_t {
         int64_t idx = is_i64
@@ -167,19 +181,13 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
             ? static_cast<float>(per_row ? qp.zero_point_data[idx] : qp.zero_point)
             : 0.0f;
 
-        if (out_f16) {
-            // Dequantize one (M=1) row into f32, then convert f32→f16 in-place.
-            row_scratch.resize(static_cast<size_t>(dim));
-            quant_kernel::dequantization<T>(1, dim_i, row_scratch.data(), dim_i,
-                                            w_row, dim_i, &s_val, &zp_val);
-            convert_float_to_half(output.ptr<half>() + n * out_row_stride,
-                                  row_scratch.data(), dim_i);
-        } else {
-            // Dequantize one (M=1) row directly into the f32 output.
-            quant_kernel::dequantization<T>(1, dim_i,
-                                            output.ptr<float>() + n * out_row_stride, dim_i,
-                                            w_row, dim_i, &s_val, &zp_val);
-        }
+        // Dequantize one (M=1) row into f32 — directly into the output, or into
+        // the f16 scratch (single-element per-row scale/zero_point arrays).
+        float* dst = out_f16
+            ? scratch + n * dim
+            : output.ptr<float>() + n * out_row_stride;
+        quant_kernel::dequantization<T>(1, dim_i, dst, dim_i,
+                                        w_row, dim_i, &s_val, &zp_val);
     };
 
     if (ctx.cpu_parallel_for) {
@@ -188,6 +196,23 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
     else {
         for (int64_t n = 0; n < num_indices; ++n) {
             body(n);
+        }
+    }
+
+    if (out_f16) {
+        // Convert the f32 scratch → f16 output (SIMD, parallel over rows).
+        half* out_ptr = output.ptr<half>();
+        const auto convert = [&](int64_t n) {
+            convert_f32_to_f16_row(out_ptr + n * out_row_stride,
+                                   scratch + n * dim, dim_i);
+        };
+        if (ctx.cpu_parallel_for) {
+            ctx.cpu_parallel_for(0, num_indices, convert);
+        }
+        else {
+            for (int64_t n = 0; n < num_indices; ++n) {
+                convert(n);
+            }
         }
     }
 }
@@ -202,7 +227,7 @@ void embed_cpu(const EmbedAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
-                 void* /*workspace*/)
+                 void* workspace)
 {
     const auto w_dtype = inputs[0].data_type();
     const auto o_dtype = output.data_type();
@@ -219,9 +244,9 @@ void embed_cpu(const EmbedAttributes& attrs,
     // Int8/uint8 weight: dequantize to f32 or f16 output.
     NNOPS_ASSERT(o_dtype == DataType::f32 || o_dtype == DataType::f16);
     if (w_dtype == DataType::s8) {
-        embed_int8_dequant_impl<int8_t>(attrs, output, inputs, ctx);
+        embed_int8_dequant_impl<int8_t>(attrs, output, inputs, ctx, workspace);
     } else if (w_dtype == DataType::u8) {
-        embed_int8_dequant_impl<uint8_t>(attrs, output, inputs, ctx);
+        embed_int8_dequant_impl<uint8_t>(attrs, output, inputs, ctx, workspace);
     } else {
         NNOPS_ASSERT(!"embed_cpu: unsupported weight dtype");
     }

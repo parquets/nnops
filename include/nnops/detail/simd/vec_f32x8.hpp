@@ -49,6 +49,8 @@
     using arch::avx2::v_reduce_sum;
     using arch::avx2::v_reduce_max;
     using arch::avx2::v_reduce_min;
+    // f32 → f16 conversion (returns arch::sse::v_f16x8)
+    using arch::avx2::v_cvt_f32_to_f16;
     // deinterleave
     using arch::avx2::v_f32x8x2_t;
     using arch::avx2::v_deinterleave_f32x8;
