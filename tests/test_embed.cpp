@@ -442,6 +442,96 @@ NNOPS_TEST(embed_int8_with_zero_point) {
     NNOPS_EXPECT_NEAR(out_buf[5], 20.0f, 1e-5f);
 }
 
+NNOPS_TEST(embed_int8_per_channel_f32) {
+    // Weight [2, 4] int8, PerChannel (per-row) scale, no zp.
+    // Row 0: scale=0.25, Row 1: scale=1.0
+    const int64_t V = 2, D = 4;
+    int8_t w_data[] = {10, 20, 30, 40, 5, 10, 15, 20};
+    const int64_t w_shape[] = {V, D};
+
+    float scale_data[] = {0.25f, 1.0f};
+
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerChannel;
+    qp.scale_data = scale_data;
+    qp.num_scales = V;
+
+    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1, 0};
+    const int64_t idx_shape[] = {3};
+    TensorView indices(idx_shape, DataType::s64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(static_cast<size_t>(3 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: [10,20,30,40] * 0.25 = [2.5, 5, 7.5, 10]
+    NNOPS_EXPECT_NEAR(out_buf[0], 2.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 7.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 10.0f, 1e-5f);
+    // Index 1: [5,10,15,20] * 1.0 = [5,10,15,20]
+    NNOPS_EXPECT_NEAR(out_buf[4], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 10.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[6], 15.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[7], 20.0f, 1e-5f);
+    // Index 0 again
+    NNOPS_EXPECT_NEAR(out_buf[8], 2.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[9], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[10], 7.5f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[11], 10.0f, 1e-5f);
+}
+
+NNOPS_TEST(embed_uint8_per_channel_zp) {
+    // uint8 weight [2, 3], PerChannel (per-row) scale + zero point.
+    const int64_t V = 2, D = 3;
+    uint8_t w_data[] = {10, 20, 30, 100, 150, 200};
+    const int64_t w_shape[] = {V, D};
+
+    float scale_data[] = {0.5f, 1.0f};
+    int32_t zp_data[] = {10, 100};
+
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerChannel;
+    qp.scale_data = scale_data;
+    qp.zero_point_data = zp_data;
+    qp.num_scales = V;
+
+    TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::NCHW, qp);
+
+    int64_t idx_data[] = {0, 1};
+    const int64_t idx_shape[] = {2};
+    TensorView indices(idx_shape, DataType::s64, idx_data);
+
+    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
+    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(static_cast<size_t>(2 * D));
+    TensorView output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {weight, indices};
+    op->compute(output, ins);
+
+    // Index 0: (w - 10) * 0.5 → [10,20,30] → [0,5,10]
+    NNOPS_EXPECT_NEAR(out_buf[0], 0.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 10.0f, 1e-5f);
+    // Index 1: (w - 100) * 1.0 → [100,150,200] → [0,50,100]
+    NNOPS_EXPECT_NEAR(out_buf[3], 0.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[4], 50.0f, 1e-5f);
+    NNOPS_EXPECT_NEAR(out_buf[5], 100.0f, 1e-5f);
+}
+
 NNOPS_TEST(embed_int8_output_f16) {
     // Per-tensor int8 → f16 output
     const int64_t V = 2, D = 4;
@@ -472,8 +562,12 @@ NNOPS_TEST(embed_int8_output_f16) {
     using nnops::backend::cpu::half;
     std::vector<half> out_buf(static_cast<size_t>(2 * D));
     TensorView output = test::make_planar(descs[0], out_buf.data());
+
+    const TensorDesc out_arr[] = {descs[0]};
+    std::vector<char> workspace(op->getWorkspaceSize(in_arr, out_arr));
+
     const TensorView ins[] = {weight, indices};
-    op->compute(output, ins);
+    op->compute(output, ins, {}, workspace.data());
 
     // Index 0: [0,20,40,60] * 0.1 = [0,2,4,6]
     NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[0]), 0.0f, 1e-3f);

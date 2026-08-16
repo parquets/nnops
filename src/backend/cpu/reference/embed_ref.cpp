@@ -82,7 +82,10 @@ void embed_int8_dequant_ref_impl(const EmbedAttributes& /*attrs*/,
 
     const auto& qp = weight.quant_params();
     const bool in_is_i8 = (weight.data_type() == DataType::s8);
-    const bool per_token = (qp.granularity == QuantGranularity::PerToken);
+    // PerChannel on a 2D weight quantizes along axis 0 (the vocab entry),
+    // i.e. per-row — identical to PerToken for the embed weight.
+    const bool per_row = (qp.granularity == QuantGranularity::PerToken)
+                      || (qp.granularity == QuantGranularity::PerChannel);
     const bool has_zp   = (qp.zero_point_data != nullptr);
 
     const float per_tensor_scale = qp.scale;
@@ -114,9 +117,9 @@ void embed_int8_dequant_ref_impl(const EmbedAttributes& /*attrs*/,
             idx = V - 1;
         }
 
-        const float s_val = per_token ? qp.scale_data[idx] : per_tensor_scale;
+        const float s_val = per_row ? qp.scale_data[idx] : per_tensor_scale;
         const float zp_val = has_zp
-            ? static_cast<float>(per_token ? qp.zero_point_data[idx] : qp.zero_point)
+            ? static_cast<float>(per_row ? qp.zero_point_data[idx] : qp.zero_point)
             : 0.0f;
 
         Tout* out_row = out_ptr + n * out_row_stride;

@@ -33,7 +33,9 @@ struct EmbedAttributes {
 ///
 /// Quantization parameters (scale, zero_point, granularity) are stored in
 /// the weight tensor via TensorView::QuantParams. Supports PerTensor
-/// (single scale/zp for all rows) and PerToken (per-row scale/zp).
+/// (single scale/zp for all rows), PerToken (per-row scale/zp), and
+/// PerChannel — for the 2D weight [vocab_size, dim], PerChannel quantizes
+/// along axis 0 (the vocab entry), i.e. per-row, identical to PerToken.
 ///
 /// Inputs (2):
 ///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, s8, u8)
@@ -56,6 +58,12 @@ public:
     // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
+
+    /// Workspace (bytes) required only for int8/uint8 weight with f16 output:
+    /// a f32 staging buffer for the dequantized gathered rows. Returns 0 for
+    /// f32 output (dequantized directly into the output) and for float weight.
+    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const override;
 
     using OpBase::compute;
 
