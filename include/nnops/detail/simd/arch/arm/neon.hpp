@@ -595,10 +595,13 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
 }
 
 /// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
-/// Uses ZIP1/ZIP2 to interchange in 3 steps (2→4→8).
+/// Interleaves with widening granularity per stage — 16-bit (ZIP f16) → 32-bit
+/// (ZIP u32) → 64-bit (ZIP u64) — the same 2→4→8 widening used by the x86 path.
+/// Using f16 ZIP in every stage produces a bit-reversal permutation, not a
+/// transpose, so stages 2 and 3 reinterpret the lanes as wider integers first.
 inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
                              v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
-    // Step 1: pairwise interchange (2×2 blocks)
+    // Step 1: pairwise interchange (16-bit, 2×2 blocks)
     float16x8_t t0 = vzip1q_f16(r0.val, r1.val);
     float16x8_t t1 = vzip2q_f16(r0.val, r1.val);
     float16x8_t t2 = vzip1q_f16(r2.val, r3.val);
@@ -608,25 +611,25 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
     float16x8_t t6 = vzip1q_f16(r6.val, r7.val);
     float16x8_t t7 = vzip2q_f16(r6.val, r7.val);
 
-    // Step 2: interchange pairs into quads (4×4 blocks)
-    float16x8_t u0 = vzip1q_f16(t0, t2);
-    float16x8_t u2 = vzip2q_f16(t0, t2);
-    float16x8_t u1 = vzip1q_f16(t1, t3);
-    float16x8_t u3 = vzip2q_f16(t1, t3);
-    float16x8_t u4 = vzip1q_f16(t4, t6);
-    float16x8_t u6 = vzip2q_f16(t4, t6);
-    float16x8_t u5 = vzip1q_f16(t5, t7);
-    float16x8_t u7 = vzip2q_f16(t5, t7);
+    // Step 2: interchange pairs into quads (32-bit, 4×4 blocks)
+    uint32x4_t u0 = vzip1q_u32(vreinterpretq_u32_f16(t0), vreinterpretq_u32_f16(t2));  // rows 0-3, cols 0-1
+    uint32x4_t u1 = vzip2q_u32(vreinterpretq_u32_f16(t0), vreinterpretq_u32_f16(t2));  // rows 0-3, cols 2-3
+    uint32x4_t u2 = vzip1q_u32(vreinterpretq_u32_f16(t1), vreinterpretq_u32_f16(t3));  // rows 0-3, cols 4-5
+    uint32x4_t u3 = vzip2q_u32(vreinterpretq_u32_f16(t1), vreinterpretq_u32_f16(t3));  // rows 0-3, cols 6-7
+    uint32x4_t u4 = vzip1q_u32(vreinterpretq_u32_f16(t4), vreinterpretq_u32_f16(t6));  // rows 4-7, cols 0-1
+    uint32x4_t u5 = vzip2q_u32(vreinterpretq_u32_f16(t4), vreinterpretq_u32_f16(t6));  // rows 4-7, cols 2-3
+    uint32x4_t u6 = vzip1q_u32(vreinterpretq_u32_f16(t5), vreinterpretq_u32_f16(t7));  // rows 4-7, cols 4-5
+    uint32x4_t u7 = vzip2q_u32(vreinterpretq_u32_f16(t5), vreinterpretq_u32_f16(t7));  // rows 4-7, cols 6-7
 
-    // Step 3: interchange quads into full 8×8 transpose
-    r0.val = vzip1q_f16(u0, u4);  // col 0
-    r1.val = vzip2q_f16(u0, u4);  // col 1
-    r2.val = vzip1q_f16(u2, u6);  // col 2
-    r3.val = vzip2q_f16(u2, u6);  // col 3
-    r4.val = vzip1q_f16(u1, u5);  // col 4
-    r5.val = vzip2q_f16(u1, u5);  // col 5
-    r6.val = vzip1q_f16(u3, u7);  // col 6
-    r7.val = vzip2q_f16(u3, u7);  // col 7
+    // Step 3: interchange quads into full 8×8 transpose (64-bit)
+    r0.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u0), vreinterpretq_u64_u32(u4)));  // col 0
+    r1.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u0), vreinterpretq_u64_u32(u4)));  // col 1
+    r2.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u1), vreinterpretq_u64_u32(u5)));  // col 2
+    r3.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u1), vreinterpretq_u64_u32(u5)));  // col 3
+    r4.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u2), vreinterpretq_u64_u32(u6)));  // col 4
+    r5.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u2), vreinterpretq_u64_u32(u6)));  // col 5
+    r6.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u3), vreinterpretq_u64_u32(u7)));  // col 6
+    r7.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u3), vreinterpretq_u64_u32(u7)));  // col 7
 }
 
 // ============================================================
