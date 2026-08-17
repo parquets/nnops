@@ -44,6 +44,7 @@ enum class OpType : uint8_t {
     TransposeConv2D = 33,
     LinearAttention = 34,
     Norm = 35,
+    MoE     = 36,
 };
 
 }  // namespace nnops
