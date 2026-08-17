@@ -18,9 +18,8 @@ enum class DataType : uint8_t {
     s64     = 6,  ///< signed 64-bit integer
     f8_e4m3 = 7,  ///< 8-bit float E4M3 (4 exponent, 3 mantissa) — precision
     f8_e5m2 = 8,  ///< 8-bit float E5M2 (5 exponent, 2 mantissa) — range
-    // ---- Reserved for future quantized types ----
-    // s4      = 9,  ///< signed 4-bit integer (2 values per byte)
-    // u4      = 10, ///< unsigned 4-bit integer (2 values per byte)
+    s4      = 9,  ///< signed 4-bit integer (2 values packed per byte, low nibble first)
+    u4      = 10, ///< unsigned 4-bit integer (2 values packed per byte, low nibble first)
 };
 
 /// Compile-time traits for each DataType.
@@ -90,6 +89,20 @@ struct DataTypeTraits<DataType::f8_e5m2> {
     static constexpr const char* name = "f8_e5m2";
 };
 
+template <>
+struct DataTypeTraits<DataType::s4> {
+    using ctype = uint8_t;   ///< packed byte storage; 2 int4 values per byte (low nibble first)
+    static constexpr size_t size = 0;  ///< sub-byte — use packed helpers, not sizeof(ctype)
+    static constexpr const char* name = "s4";
+};
+
+template <>
+struct DataTypeTraits<DataType::u4> {
+    using ctype = uint8_t;   ///< packed byte storage; 2 uint4 values per byte (low nibble first)
+    static constexpr size_t size = 0;  ///< sub-byte — use packed helpers, not sizeof(ctype)
+    static constexpr const char* name = "u4";
+};
+
 /// Returns the size in bytes of a single element of the given DataType.
 constexpr size_t data_type_size(DataType dt) noexcept {
     switch (dt) {
@@ -102,14 +115,14 @@ constexpr size_t data_type_size(DataType dt) noexcept {
     case DataType::s64:     return 8;
     case DataType::f8_e4m3: return 1;
     case DataType::f8_e5m2: return 1;
-    // case DataType::s4:   return 0;  // sub-byte: 0.5 elems/byte (use packed helpers)
-    // case DataType::u4:   return 0;
+    case DataType::s4:   return 0;  // sub-byte: 2 elems/byte (use packed helpers)
+    case DataType::u4:   return 0;  // sub-byte: 2 elems/byte (use packed helpers)
     }
     return 0;
 }
 
 /// Whether a DataType represents quantized integer storage that uses
-/// scale/zero_point dequantization (s8, u8, and future s4/u4).
+/// scale/zero_point dequantization (s8, u8, s4, u4).
 ///
 /// FP8 types (f8_e4m3, f8_e5m2) are NOT included here — they are
 /// floating-point formats that don't use integer zero_point semantics.
@@ -117,12 +130,32 @@ constexpr bool is_quantized_dtype(DataType dt) noexcept {
     switch (dt) {
     case DataType::s8:
     case DataType::u8:
-    // case DataType::s4:   // future
-    // case DataType::u4:   // future
+    case DataType::s4:
+    case DataType::u4:
         return true;
     default:
         return false;
     }
+}
+
+/// Returns the bit width of a single element of the given DataType.
+/// Essential for packed (sub-byte) types: s4/u4 → 4 bits, s8/u8 → 8 bits.
+/// Returns 0 for unknown types.
+constexpr int data_type_bits(DataType dt) noexcept {
+    switch (dt) {
+    case DataType::s4:  return 4;
+    case DataType::u4:  return 4;
+    case DataType::s8:  return 8;
+    case DataType::u8:  return 8;
+    case DataType::f8_e4m3: return 8;
+    case DataType::f8_e5m2: return 8;
+    case DataType::f16: return 16;
+    case DataType::bf16: return 16;
+    case DataType::f32: return 32;
+    case DataType::s32: return 32;
+    case DataType::s64: return 64;
+    }
+    return 0;
 }
 
 }  // namespace nnops
