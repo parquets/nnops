@@ -90,17 +90,21 @@ inline void widen8_i8_to_i32(int8x8_t v, int32x4_t& lo, int32x4_t& hi) noexcept 
 }
 
 /// Dequantize 16 int8 (1×int8x16_t) to 16 floats (4×float32x4_t).
+///
+/// Uses FMA: `i_f32 * scale + neg_zero_scale` where `neg_zero_scale = -zero * scale`
+/// is precomputed once per row. This replaces the two-instruction `sub + mul` with
+/// a single fused multiply-add, saving one arithmetic instruction per 4-wide lane.
 template <bool Q_U8>
-inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t zero,
+inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t neg_zero_scale,
                                    float32x4_t& res0, float32x4_t& res1,
                                    float32x4_t& res2, float32x4_t& res3) noexcept {
     int32x4_t i0, i1, i2, i3;
     widen8_i8_to_i32<Q_U8>(vget_low_s8(v), i0, i1);
     widen8_i8_to_i32<Q_U8>(vget_high_s8(v), i2, i3);
-    res0 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(i0), zero), scale);
-    res1 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(i1), zero), scale);
-    res2 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(i2), zero), scale);
-    res3 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(i3), zero), scale);
+    res0 = vfmaq_f32(neg_zero_scale, vcvtq_f32_s32(i0), scale);
+    res1 = vfmaq_f32(neg_zero_scale, vcvtq_f32_s32(i1), scale);
+    res2 = vfmaq_f32(neg_zero_scale, vcvtq_f32_s32(i2), scale);
+    res3 = vfmaq_f32(neg_zero_scale, vcvtq_f32_s32(i3), scale);
 }
 
 // =========================================================================
@@ -114,6 +118,9 @@ inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t z
 /// is written with row stride `dr_step` elements, `src` read with `sr_step`
 /// elements. SIMD and scalar tails round to nearest-even (`vcvtnq_s32_f32` /
 /// `std::nearbyintf`) and saturate to the type's range.
+///
+/// The inner loop is unrolled 2× (32 elements per iteration) to reduce loop
+/// overhead on medium-to-large N.
 template <typename T>
 inline void quantization(int M, int N,
                          T* NNOPS_RESTRICT dst, int dr_step,
@@ -137,6 +144,22 @@ inline void quantization(int M, int N,
         const float* src_ptr = src + m * sr_step;
 
         int n = 0;
+        // 32-wide unrolled path: two 16-wide blocks per iteration
+        for (; n + 32 <= N; n += 32) {
+            const float32x4_t d0 = vld1q_f32(src_ptr + n + 0);
+            const float32x4_t d1 = vld1q_f32(src_ptr + n + 4);
+            const float32x4_t d2 = vld1q_f32(src_ptr + n + 8);
+            const float32x4_t d3 = vld1q_f32(src_ptr + n + 12);
+            const float32x4_t d4 = vld1q_f32(src_ptr + n + 16);
+            const float32x4_t d5 = vld1q_f32(src_ptr + n + 20);
+            const float32x4_t d6 = vld1q_f32(src_ptr + n + 24);
+            const float32x4_t d7 = vld1q_f32(src_ptr + n + 28);
+            const int8x16_t q0 = quant_block16_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale, v_zero);
+            const int8x16_t q1 = quant_block16_f32_i8<Q_U8>(d4, d5, d6, d7, v_inv_scale, v_zero);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 0), q0);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 16), q1);
+        }
+        // 16-wide path for the remaining ≥16 tail
         for (; n + 16 <= N; n += 16) {
             const float32x4_t d0 = vld1q_f32(src_ptr + n + 0);
             const float32x4_t d1 = vld1q_f32(src_ptr + n + 4);
@@ -165,6 +188,9 @@ inline void quantization(int M, int N,
 /// f32→int8 arithmetic as the f32 `quantization<T>` overload. Rounding and
 /// clamping are identical (round-to-nearest-even, saturating to `T`'s range).
 /// `T` is int8_t (s8) or uint8_t (u8).
+///
+/// The inner loop is unrolled 2× (32 elements per iteration) to reduce loop
+/// overhead on medium-to-large N.
 template <typename T>
 inline void quantization(int M, int N,
                          T* NNOPS_RESTRICT dst, int dr_step,
@@ -188,6 +214,25 @@ inline void quantization(int M, int N,
         const half* src_ptr = src + m * sr_step;
 
         int n = 0;
+        // 32-wide unrolled path: load 32 halfs, convert to 32 floats, quantize to 32 int8
+        for (; n + 32 <= N; n += 32) {
+            const float16x8_t h0 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 0));
+            const float16x8_t h1 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 8));
+            const float16x8_t h2 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 16));
+            const float16x8_t h3 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 24));
+            const float32x4_t d0 = vcvt_f32_f16(vget_low_f16(h0));
+            const float32x4_t d1 = vcvt_high_f32_f16(h0);
+            const float32x4_t d2 = vcvt_f32_f16(vget_low_f16(h1));
+            const float32x4_t d3 = vcvt_high_f32_f16(h1);
+            const float32x4_t d4 = vcvt_f32_f16(vget_low_f16(h2));
+            const float32x4_t d5 = vcvt_high_f32_f16(h2);
+            const float32x4_t d6 = vcvt_f32_f16(vget_low_f16(h3));
+            const float32x4_t d7 = vcvt_high_f32_f16(h3);
+            const int8x16_t q0 = quant_block16_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale, v_zero);
+            const int8x16_t q1 = quant_block16_f32_i8<Q_U8>(d4, d5, d6, d7, v_inv_scale, v_zero);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 0), q0);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 16), q1);
+        }
         for (; n + 16 <= N; n += 16) {
             const float16x8_t h0 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 0));
             const float16x8_t h1 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 8));
@@ -267,6 +312,10 @@ inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
 ///
 /// `T` is int8_t (s8) or uint8_t (u8). `scale` and `zero` each have M entries
 /// (or `zero` is nullptr for all-zero).
+///
+/// The inner loop is unrolled 2× (32 elements per iteration) and uses a single
+/// FMA per 4-wide lane (`neg_zero_scale + i_f32 * scale`) instead of the
+/// two-instruction `sub + mul` sequence.
 template <typename T>
 inline void dequantization(int M, int N,
                            float* NNOPS_RESTRICT dst, int dr_step,
@@ -280,18 +329,37 @@ inline void dequantization(int M, int N,
     for (int m = 0; m < M; ++m) {
         const float scale_val = scale[m];
         const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+        // Precompute neg_zero_scale = -zero * scale so the inner loop can use a
+        // single FMA: fma(neg_zero_scale, i_f32, scale) = i_f32*scale - zero*scale
+        const float neg_zero_scale = -zero_val * scale_val;
 
         const float32x4_t v_scale = vdupq_n_f32(scale_val);
-        const float32x4_t v_zero = vdupq_n_f32(zero_val);
+        const float32x4_t v_neg_zero_scale = vdupq_n_f32(neg_zero_scale);
 
         float* dst_ptr = dst + m * dr_step;
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
+        // 32-wide unrolled path: two 16-wide blocks per iteration
+        for (; n + 32 <= N; n += 32) {
+            const int8x16_t v0 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 0));
+            const int8x16_t v1 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 16));
+            float32x4_t r0, r1, r2, r3, r4, r5, r6, r7;
+            dequant_block16_i8_f32<Q_U8>(v0, v_scale, v_neg_zero_scale, r0, r1, r2, r3);
+            dequant_block16_i8_f32<Q_U8>(v1, v_scale, v_neg_zero_scale, r4, r5, r6, r7);
+            vst1q_f32(dst_ptr + n + 0, r0);
+            vst1q_f32(dst_ptr + n + 4, r1);
+            vst1q_f32(dst_ptr + n + 8, r2);
+            vst1q_f32(dst_ptr + n + 12, r3);
+            vst1q_f32(dst_ptr + n + 16, r4);
+            vst1q_f32(dst_ptr + n + 20, r5);
+            vst1q_f32(dst_ptr + n + 24, r6);
+            vst1q_f32(dst_ptr + n + 28, r7);
+        }
         for (; n + 16 <= N; n += 16) {
             const int8x16_t v = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n));
             float32x4_t res0, res1, res2, res3;
-            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_zero, res0, res1, res2, res3);
+            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_neg_zero_scale, res0, res1, res2, res3);
             vst1q_f32(dst_ptr + n + 0, res0);
             vst1q_f32(dst_ptr + n + 4, res1);
             vst1q_f32(dst_ptr + n + 8, res2);
@@ -313,6 +381,9 @@ inline void dequantization(int M, int N,
 /// The integer input is widened and dequantized to f32 with the same arithmetic
 /// as the f32 `dequantization<T>`, then narrowed to f16 with the NEON fp32→fp16
 /// conversion (`vcvt_f16_f32`). `T` is int8_t (s8) or uint8_t (u8).
+///
+/// The inner loop is unrolled 2× (32 elements per iteration) and uses a single
+/// FMA per 4-wide lane.
 template <typename T>
 inline void dequantization(int M, int N,
                            half* NNOPS_RESTRICT dst, int dr_step,
@@ -326,18 +397,35 @@ inline void dequantization(int M, int N,
     for (int m = 0; m < M; ++m) {
         const float scale_val = scale[m];
         const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+        const float neg_zero_scale = -zero_val * scale_val;
 
         const float32x4_t v_scale = vdupq_n_f32(scale_val);
-        const float32x4_t v_zero = vdupq_n_f32(zero_val);
+        const float32x4_t v_neg_zero_scale = vdupq_n_f32(neg_zero_scale);
 
         half* dst_ptr = dst + m * dr_step;
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
+        // 32-wide unrolled path
+        for (; n + 32 <= N; n += 32) {
+            const int8x16_t v0 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 0));
+            const int8x16_t v1 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 16));
+            float32x4_t r0, r1, r2, r3, r4, r5, r6, r7;
+            dequant_block16_i8_f32<Q_U8>(v0, v_scale, v_neg_zero_scale, r0, r1, r2, r3);
+            dequant_block16_i8_f32<Q_U8>(v1, v_scale, v_neg_zero_scale, r4, r5, r6, r7);
+            const float16x8_t h0 = vcombine_f16(vcvt_f16_f32(r0), vcvt_f16_f32(r1));
+            const float16x8_t h1 = vcombine_f16(vcvt_f16_f32(r2), vcvt_f16_f32(r3));
+            const float16x8_t h2 = vcombine_f16(vcvt_f16_f32(r4), vcvt_f16_f32(r5));
+            const float16x8_t h3 = vcombine_f16(vcvt_f16_f32(r6), vcvt_f16_f32(r7));
+            vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 0), h0);
+            vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 8), h1);
+            vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 16), h2);
+            vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 24), h3);
+        }
         for (; n + 16 <= N; n += 16) {
             const int8x16_t v = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n));
             float32x4_t res0, res1, res2, res3;
-            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_zero, res0, res1, res2, res3);
+            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_neg_zero_scale, res0, res1, res2, res3);
             const float16x8_t h0 = vcombine_f16(vcvt_f16_f32(res0), vcvt_f16_f32(res1));
             const float16x8_t h1 = vcombine_f16(vcvt_f16_f32(res2), vcvt_f16_f32(res3));
             vst1q_f16(reinterpret_cast<float16_t*>(dst_ptr + n + 0), h0);

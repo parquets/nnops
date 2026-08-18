@@ -316,4 +316,71 @@ inline void softmax_process_standard_row(
     }
 }
 
+/// Strided-axis SIMD softmax for planar layouts (axis != rank-1, pack == 1).
+///
+/// Processes `simd_lane_for<T>` contiguous inner positions as a group. Each SIMD
+/// lane is an independent 3-pass softmax over D strided elements. The stride
+/// between consecutive axis elements is `axis_stride`.
+///
+/// This is the SIMD replacement for the scalar loop in softmax_general_scalar.
+/// The caller groups inner_total positions into L-sized chunks and calls this
+/// function for each chunk. The L positions must be contiguous in memory
+/// (i.e. the tensor must be densely packed with no pitch padding).
+///
+/// Example: for a [N, C, H, W] tensor with axis=0 and no pitch padding,
+/// each call processes 8 spatial positions from the C*H*W inner pool,
+/// each doing an independent softmax over N strided values.
+///
+/// Algorithm: standard 3-pass (max → exp+sum → normalize), same as the
+/// contiguous-row and packed-channel paths, but with strided access along
+/// the axis dimension.
+template <typename T>
+inline void softmax_process_strided_axis(
+    const T* x, T* y,
+    int64_t axis_stride, int64_t D,
+    bool log_softmax, float inv_T)
+{
+    constexpr int L = simd_lane_for<T>;
+
+    auto v_inv_T = v_set1(x, inv_T);
+
+    // ---- Pass 1: per-lane max (temperature doesn't affect max) ----
+    auto v_max = v_set1(x, -std::numeric_limits<float>::infinity());
+    for (int64_t k = 0; k < D; ++k) {
+        v_max = v_max(v_max, v_load(x + k * axis_stride));
+    }
+
+    // ---- Pass 2: exp((x - max) / T) + per-lane sum ----
+    auto v_sum = v_zero(x);
+    auto v_neg_max = v_neg(v_max);
+    for (int64_t k = 0; k < D; ++k) {
+        auto v = v_add(v_load(x + k * axis_stride), v_neg_max);
+        if (inv_T != 1.0f) {
+            v = v_mul(v, v_inv_T);
+        }
+        v = v_exp(v);
+        if (!log_softmax) {
+            v_store(y + k * axis_stride, v);
+        }
+        v_sum = v_add(v_sum, v);
+    }
+
+    // ---- Pass 3: normalize ----
+    if (log_softmax) {
+        // log_softmax = (x - max) / T - log(sum)
+        //             = x * inv_T - max * inv_T - log(sum)
+        auto v_bias = v_sub(v_neg(v_mul(v_max, v_inv_T)), v_log(v_sum));
+        for (int64_t k = 0; k < D; ++k) {
+            v_store(y + k * axis_stride,
+                    v_add(v_mul(v_load(x + k * axis_stride), v_inv_T), v_bias));
+        }
+    } else {
+        auto v_inv = v_div(v_set1(x, 1.0f), v_sum);
+        for (int64_t k = 0; k < D; ++k) {
+            v_store(y + k * axis_stride,
+                    v_mul(v_load(y + k * axis_stride), v_inv));
+        }
+    }
+}
+
 }  // namespace nnops::kernel

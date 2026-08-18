@@ -92,8 +92,12 @@ inline __m256i quant_block32_f32_i8(__m256 d0, __m256 d1, __m256 d2, __m256 d3,
 }
 
 /// Dequantize 16 int8 (1×__m128i) to 16 floats (2×__m256).
+///
+/// Uses FMA: `i_f32 * scale + neg_zero_scale` where `neg_zero_scale = -zero * scale`
+/// is precomputed once per row. This replaces the two-instruction `sub + mul` with
+/// a single fused multiply-add, saving one arithmetic instruction per 8-wide lane.
 template <bool Q_U8>
-inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 zero,
+inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 neg_zero_scale,
                                    __m256& res0, __m256& res1) noexcept {
     __m256i d0_i32;
     if constexpr (Q_U8) {
@@ -101,7 +105,7 @@ inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 zero,
     } else {
         d0_i32 = _mm256_cvtepi8_epi32(v);
     }
-    res0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(d0_i32), zero), scale);
+    res0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d0_i32), scale, neg_zero_scale);
 
     const __m128i v_hi = _mm_srli_si128(v, 8);
     __m256i d1_i32;
@@ -110,7 +114,7 @@ inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 zero,
     } else {
         d1_i32 = _mm256_cvtepi8_epi32(v_hi);
     }
-    res1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(d1_i32), zero), scale);
+    res1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d1_i32), scale, neg_zero_scale);
 }
 
 // =========================================================================
@@ -295,6 +299,10 @@ inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
 ///
 /// `T` is int8_t (s8) or uint8_t (u8). `scale` and `zero` each have M entries
 /// (or `zero` is nullptr for all-zero).
+///
+/// The inner loop uses a 32-wide path (two 16-wide blocks) to reduce loop
+/// overhead, and a single FMA per 8-wide lane (`neg_zero_scale + i_f32 * scale`)
+/// instead of the two-instruction `sub + mul` sequence.
 template <typename T>
 inline void dequantization(int M, int N,
                            float* NNOPS_RESTRICT dst, int dr_step,
@@ -308,18 +316,33 @@ inline void dequantization(int M, int N,
     for (int m = 0; m < M; ++m) {
         const float scale_val = scale[m];
         const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+        // Precompute neg_zero_scale = -zero * scale so the inner loop can use a
+        // single FMA: fma(i_f32, scale, neg_zero_scale) = i_f32*scale - zero*scale
+        const float neg_zero_scale = -zero_val * scale_val;
 
         const __m256 v_scale = _mm256_set1_ps(scale_val);
-        const __m256 v_zero = _mm256_set1_ps(zero_val);
+        const __m256 v_neg_zero_scale = _mm256_set1_ps(neg_zero_scale);
 
         float* dst_ptr = dst + m * dr_step;
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
+        // 32-wide path: two 16-wide blocks per iteration
+        for (; n + 32 <= N; n += 32) {
+            const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 0));
+            const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 16));
+            __m256 r0, r1, r2, r3;
+            dequant_block16_i8_f32<Q_U8>(v0, v_scale, v_neg_zero_scale, r0, r1);
+            dequant_block16_i8_f32<Q_U8>(v1, v_scale, v_neg_zero_scale, r2, r3);
+            _mm256_storeu_ps(dst_ptr + n + 0, r0);
+            _mm256_storeu_ps(dst_ptr + n + 8, r1);
+            _mm256_storeu_ps(dst_ptr + n + 16, r2);
+            _mm256_storeu_ps(dst_ptr + n + 24, r3);
+        }
         for (; n + 16 <= N; n += 16) {
             const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n));
             __m256 res0, res1;
-            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_zero, res0, res1);
+            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_neg_zero_scale, res0, res1);
             _mm256_storeu_ps(dst_ptr + n + 0, res0);
             _mm256_storeu_ps(dst_ptr + n + 8, res1);
         }
@@ -339,6 +362,8 @@ inline void dequantization(int M, int N,
 /// The integer input is widened and dequantized to f32 with the same arithmetic
 /// as the f32 `dequantization<T>`, then narrowed to f16 with F16C
 /// `_mm256_cvtps_ph` (round-to-nearest-even). `T` is int8_t (s8) or uint8_t (u8).
+///
+/// The inner loop uses a 32-wide path and FMA-based dequantization.
 template <typename T>
 inline void dequantization(int M, int N,
                            half* NNOPS_RESTRICT dst, int dr_step,
@@ -352,18 +377,35 @@ inline void dequantization(int M, int N,
     for (int m = 0; m < M; ++m) {
         const float scale_val = scale[m];
         const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+        const float neg_zero_scale = -zero_val * scale_val;
 
         const __m256 v_scale = _mm256_set1_ps(scale_val);
-        const __m256 v_zero = _mm256_set1_ps(zero_val);
+        const __m256 v_neg_zero_scale = _mm256_set1_ps(neg_zero_scale);
 
         half* dst_ptr = dst + m * dr_step;
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
+        // 32-wide path: two 16-wide blocks per iteration
+        for (; n + 32 <= N; n += 32) {
+            const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 0));
+            const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 16));
+            __m256 r0, r1, r2, r3;
+            dequant_block16_i8_f32<Q_U8>(v0, v_scale, v_neg_zero_scale, r0, r1);
+            dequant_block16_i8_f32<Q_U8>(v1, v_scale, v_neg_zero_scale, r2, r3);
+            const __m128i h0 = _mm256_cvtps_ph(r0, _MM_FROUND_TO_NEAREST_INT);
+            const __m128i h1 = _mm256_cvtps_ph(r1, _MM_FROUND_TO_NEAREST_INT);
+            const __m128i h2 = _mm256_cvtps_ph(r2, _MM_FROUND_TO_NEAREST_INT);
+            const __m128i h3 = _mm256_cvtps_ph(r3, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 0), h0);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 8), h1);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 16), h2);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 24), h3);
+        }
         for (; n + 16 <= N; n += 16) {
             const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n));
             __m256 res0, res1;
-            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_zero, res0, res1);
+            dequant_block16_i8_f32<Q_U8>(v, v_scale, v_neg_zero_scale, res0, res1);
             const __m128i h0 = _mm256_cvtps_ph(res0, _MM_FROUND_TO_NEAREST_INT);
             const __m128i h1 = _mm256_cvtps_ph(res1, _MM_FROUND_TO_NEAREST_INT);
             _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_ptr + n + 0), h0);

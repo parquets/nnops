@@ -51,67 +51,112 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 namespace {
 
 // ============================================================
-// General-axis scalar normalization (reference-style decomposition)
+// General-axis softmax — SIMD strided + scalar tail
 // ============================================================
+//
+// When the tensor is densely packed (pitch == last_dim * elem_size), inner
+// positions are contiguous in memory and we can process them in SIMD groups
+// of L=8. Each SIMD lane does an independent softmax over the D strided
+// axis elements. The scalar tail handles the remaining inner positions
+// and the case where pitch padding breaks contiguity.
+//
+// When pitch padding is present, inner positions are NOT contiguous
+// (row boundaries have gaps), so we fall back to the scalar decomposition
+// with precomputed inner offsets.
 
 template <typename T>
-void softmax_general_scalar(
+void softmax_general(
     const T* x_ptr, T* y_ptr,
     const TensorView& X,
     int64_t axis, int64_t outer_size, int64_t D, int64_t inner_total,
     bool log_softmax, float inv_T,
     const ComputeContext& ctx)
 {
+    constexpr int L = simd_lane_for<T>;
     const int64_t rank = X.rank();
-    const int64_t pack = X.channel_pack_size();
-
+    const int64_t pack = X.channel_pack_size();  // always 1 here (packed paths handled earlier)
     const int64_t axis_stride = X.stride_elems(axis) * pack;
 
-    // Precompute offsets for inner dimensions (dims after axis)
-    std::vector<int64_t> inner_offsets(static_cast<size_t>(inner_total));
-    for (int64_t s = 0; s < inner_total; ++s) {
-        int64_t off = 0, rem = s;
-        for (int64_t d = rank - 1; d > axis; --d) {
-            int64_t dim = X.shape(d);
-            off += (rem % dim) * X.stride_elems(d) * pack;
-            rem /= dim;
-        }
-        inner_offsets[static_cast<size_t>(s)] = off;
-    }
+    // Check whether inner positions are contiguous in memory.
+    // - axis == rank-2: inner = last dim only, always contiguous
+    // - axis < rank-2:  contiguous iff no pitch padding
+    const int64_t elem_size = static_cast<int64_t>(data_type_size(X.data_type()));
+    const bool dense = (axis >= rank - 2) ||
+                       (X.pitch() == X.shape(rank - 1) * elem_size);
 
     const auto process_row = [&](int64_t outer) {
         int64_t base = outer * D * axis_stride;
 
-        for (int64_t s = 0; s < inner_total; ++s) {
-            int64_t inner_off = inner_offsets[static_cast<size_t>(s)];
-
-            // ---- Pass 1: find max ----
-            float max_val = -std::numeric_limits<float>::infinity();
-            for (int64_t k = 0; k < D; ++k) {
-                float v = s_load(&x_ptr[base + inner_off + k * axis_stride]);
-                if (v > max_val) {
-                    max_val = v;
+        if (dense) {
+            // ---- SIMD path: process inner_total in groups of L ----
+            int64_t s = 0;
+            for (; s + L <= inner_total; s += L) {
+                kernel::softmax_process_strided_axis<T>(
+                    x_ptr + base + s, y_ptr + base + s,
+                    axis_stride, D, log_softmax, inv_T);
+            }
+            // Scalar tail for remaining inner positions
+            for (; s < inner_total; ++s) {
+                float max_val = -std::numeric_limits<float>::infinity();
+                for (int64_t k = 0; k < D; ++k) {
+                    float v = s_load(&x_ptr[base + s + k * axis_stride]);
+                    if (v > max_val) { max_val = v; }
+                }
+                float sum_exp = 0.0f;
+                for (int64_t k = 0; k < D; ++k) {
+                    sum_exp += std::exp((s_load(&x_ptr[base + s + k * axis_stride]) - max_val) * inv_T);
+                }
+                if (log_softmax) {
+                    float log_sum = std::log(sum_exp);
+                    for (int64_t k = 0; k < D; ++k) {
+                        float val = (s_load(&x_ptr[base + s + k * axis_stride]) - max_val) * inv_T - log_sum;
+                        s_store(&y_ptr[base + s + k * axis_stride], val);
+                    }
+                } else {
+                    float inv_sum = 1.0f / sum_exp;
+                    for (int64_t k = 0; k < D; ++k) {
+                        float val = std::exp((s_load(&x_ptr[base + s + k * axis_stride]) - max_val) * inv_T) * inv_sum;
+                        s_store(&y_ptr[base + s + k * axis_stride], val);
+                    }
                 }
             }
-
-            // ---- Pass 2: sum of exp((x - max) / T) ----
-            float sum_exp = 0.0f;
-            for (int64_t k = 0; k < D; ++k) {
-                sum_exp += std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T);
+        } else {
+            // ---- Pitch-padded fallback: scalar with precomputed offsets ----
+            std::vector<int64_t> inner_offsets(static_cast<size_t>(inner_total));
+            for (int64_t s = 0; s < inner_total; ++s) {
+                int64_t off = 0, rem = s;
+                for (int64_t d = rank - 1; d > axis; --d) {
+                    int64_t dim = X.shape(d);
+                    off += (rem % dim) * X.stride_elems(d) * pack;
+                    rem /= dim;
+                }
+                inner_offsets[static_cast<size_t>(s)] = off;
             }
 
-            // ---- Pass 3: normalize ----
-            if (log_softmax) {
-                float log_sum = std::log(sum_exp);
+            for (int64_t s = 0; s < inner_total; ++s) {
+                int64_t inner_off = inner_offsets[static_cast<size_t>(s)];
+
+                float max_val = -std::numeric_limits<float>::infinity();
                 for (int64_t k = 0; k < D; ++k) {
-                    float val = (s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T - log_sum;
-                    s_store(&y_ptr[base + inner_off + k * axis_stride], val);
+                    float v = s_load(&x_ptr[base + inner_off + k * axis_stride]);
+                    if (v > max_val) { max_val = v; }
                 }
-            } else {
-                float inv_sum = 1.0f / sum_exp;
+                float sum_exp = 0.0f;
                 for (int64_t k = 0; k < D; ++k) {
-                    float val = std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T) * inv_sum;
-                    s_store(&y_ptr[base + inner_off + k * axis_stride], val);
+                    sum_exp += std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T);
+                }
+                if (log_softmax) {
+                    float log_sum = std::log(sum_exp);
+                    for (int64_t k = 0; k < D; ++k) {
+                        float val = (s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T - log_sum;
+                        s_store(&y_ptr[base + inner_off + k * axis_stride], val);
+                    }
+                } else {
+                    float inv_sum = 1.0f / sum_exp;
+                    for (int64_t k = 0; k < D; ++k) {
+                        float val = std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T) * inv_sum;
+                        s_store(&y_ptr[base + inner_off + k * axis_stride], val);
+                    }
                 }
             }
         }
@@ -327,7 +372,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
             inner_total *= X.shape(i);
         }
 
-        softmax_general_scalar<T>(
+        softmax_general<T>(
             x_ptr, y_ptr, X,
             axis, outer_size, D, inner_total,
             log_softmax, inv_T, ctx);
