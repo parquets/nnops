@@ -53,30 +53,27 @@ constexpr int NR_MAX_F16 = arch::nr_f16[0];
 
 // ---- public API --------------------------------------------------------
 
-void panel_pack_rhs(bool trans, int mr, int kc, float* dst, const float* src, int lds, float scale);
-void tile_pack_rhs(bool trans, int mc, int kc, float* dst, const float* src, int lds, float scale);
+void tile_pack_rhs(bool trans, int mc, int kc, float* dst,int ldd, const float* src, int lds, float scale);
+void tile_pack_lhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
+void tile_pack_rhs(bool trans, int mc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
+void tile_pack_lhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
-void panel_pack_lhs(bool trans, int nr, int kc, float* dst, const float* src, int lds, float scale);
-void tile_pack_lhs(bool trans, int nc, int kc, float* dst, const float* src, int lds, float scale);
-
-void panel_mma_pack(int mr, int nc, int kc, float* c, int ldc, const float* a, const float* b, int ldb, float clamp_min, float clamp_max);
-void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* a, const float* b, int ldb, float clamp_min, float clamp_max);
-
-void panel_mma_direct(int mr, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int ldb, float clamp_min, float clamp_max);
+void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, int lda, const float* b, int ldb, float clamp_min, float clamp_max);
 void tile_mma_direct(int Mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int ldb, float clamp_min, float clamp_max);
-
-void panel_pack_rhs(bool trans, int mr, int kc, half* dst, const half* src, int lds, float scale);
-void tile_pack_rhs(bool trans, int Mc, int kc, half* dst, const half* src, int lds, float scale);
-
-void panel_pack_lhs(bool trans, int Nr, int kc, half* dst, const half* src, int lds, float scale);
-void tile_pack_lhs(bool trans, int nc, int kc, half* dst, const half* src, int lds, float scale);
-
-void panel_mma_pack(int mr, int nc, int kc, half* c, int ldc, const half* a, const half* b, int ldb, float clamp_min, float clamp_max);
-void tile_mma_pack(int Mc, int nc, int kc, half* c, int ldc, const half* a, const half* b, int ldb, float clamp_min, float clamp_max);
-
-void panel_mma_direct(int mr, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int ldb, float clamp_min, float clamp_max);
+void tile_mma_pack(int Mc, int nc, int kc, half* c, int ldc, const half* packed_a, int lda, const half* b, int ldb, float clamp_min, float clamp_max);
 void tile_mma_direct(int Mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int ldb, float clamp_min, float clamp_max);
 
 
-}  // namrspace nnops::backend::cpu
+// single-precision and half-precision GEMM implementations (for matmul.cpp)
+template <typename T>
+void shgemm_impl(bool trans_a, bool trans_b,
+                 bool packed_a, bool packed_b,
+                 int Mc, int Nc, int Kc,
+                 T* c, int ldc,
+                 const T* a, int lda,
+                 const T* b, int ldb,
+                 float clamp_min, float clamp_max,
+                 T* workspace, size_t workspace_bytes);
+
+}  // namespace nnops::backend::cpu
 

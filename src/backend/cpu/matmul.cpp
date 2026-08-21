@@ -8,6 +8,7 @@
 
 #include "matmul.h"
 #include "matmul_impl.h"
+#include "epilogue_impl.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/assert.hpp"
@@ -15,6 +16,8 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <type_traits>
+#include <vector>
 
 // Forward-declare reference kernel for batched fallback.
 namespace nnops::backend::cpu::reference {
@@ -58,6 +61,12 @@ constexpr int NR_MAX_I8    = 4;
 constexpr int MR_MAX_F16I4 = 4;
 constexpr int NR_MAX_F16I4 = 4;
 
+// 64-byte aligned panel strides (in elements): ldd = align_up(mr_max * kc * sizeof(T), 64) / sizeof(T)
+constexpr int LDD_A_F32 = (MR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
+constexpr int LDD_B_F32 = (NR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
+constexpr int LDD_A_F16 = (MR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
+constexpr int LDD_B_F16 = (NR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
+
 
 // =========================================================================
 //  Nc from L2 constraint
@@ -77,8 +86,14 @@ inline int round_down_nc(int nc, int nr_max) noexcept {
 }
 
 
-inline size_t workspace_bytes(int mc, int nc, int kc, size_t elem) noexcept {
-    return static_cast<size_t>(mc + nc) * static_cast<size_t>(kc) * elem;
+// Workspace = packed A + packed B with 64-byte-aligned panel strides.
+// ldd_a/b are in elements: align_up(mr_max * kc * sizeof(T), 64) / sizeof(T)
+inline size_t workspace_bytes(int mc, int nc, int mr_max, int nr_max,
+                              int ldd_a, int ldd_b, size_t elem) noexcept {
+    int num_panels_a = (mc + mr_max - 1) / mr_max;
+    int num_panels_b = (nc + nr_max - 1) / nr_max;
+    return (static_cast<size_t>(num_panels_a) * static_cast<size_t>(ldd_a) +
+            static_cast<size_t>(num_panels_b) * static_cast<size_t>(ldd_b)) * elem;
 }
 
 
@@ -86,20 +101,227 @@ inline size_t workspace_bytes(int mc, int nc, int kc, size_t elem) noexcept {
 //  Kernel stubs — dispatched by (A_dtype, B_dtype) pair
 // =========================================================================
 
-void matmul_kernel_f32(const MatMulAttributes& /*attrs*/,
-                       TensorView& /*output*/,
-                       std::span<const TensorView> /*inputs*/,
-                       void* /*workspace*/)
+// =========================================================================
+//  Generic 2D GEMM kernel — NKM tiled loop with mma_direct.
+//  Used for non-transposed cases.  Takes raw pointers for batch reuse.
+// =========================================================================
+template <typename T>
+void matmul_kernel_2d_direct(const MatMulAttributes& attrs,
+                             T* c_ptr, int ldc,
+                             const T* a_ptr, int lda,
+                             const T* b_ptr, int ldb,
+                             int M, int N, int K,
+                             int kc, int mr_max, int nr_max)
 {
-    // TODO: NKM tiled loop over Mc×Nc×Kc with imatmul pack + mma_pack
+    // ---- Clamp for epilogue ----
+    float clamp_min = -std::numeric_limits<float>::infinity();
+    float clamp_max =  std::numeric_limits<float>::infinity();
+    if (attrs.epilogue.type == EpilogueActivateType::Relu) {
+        clamp_min = 0.0f;
+    }
+
+    // ---- Beta: pre-scale C (MMA accumulates: C += A×B) ----
+    if (attrs.beta == 0.0f) {
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                c_ptr[i * ldc + j] = T(0);
+            }
+        }
+    } else if (attrs.beta != 1.0f) {
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                float val = s_load(&c_ptr[i * ldc + j]) * attrs.beta;
+                s_store(&c_ptr[i * ldc + j], val);
+            }
+        }
+    }
+
+    // ---- Compute tile sizes ----
+    int mc = std::min(MC_TARGET, M);
+    size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
+    int nc = round_down_nc(compute_nc(mr_max, kc, static_cast<int>(sizeof(T)), l2_size), nr_max);
+    nc = std::min(nc, N);
+
+    // ---- NKM tiled loop (direct path) ----
+    for (int n = 0; n < N; n += nc) {
+        int actual_nc = std::min(nc, N - n);
+        for (int k = 0; k < K; k += kc) {
+            int actual_kc = std::min(kc, K - k);
+
+            const T* b_sub = b_ptr + k * ldb + n;  // B is K×N, row k, col n
+
+            for (int m = 0; m < M; m += mc) {
+                int actual_mc = std::min(mc, M - m);
+
+                const T* a_sub = a_ptr + m * lda + k;  // A is M×K, row m, col k
+
+                tile_mma_direct(actual_mc, actual_nc, actual_kc,
+                                c_ptr + m * ldc + n, ldc,
+                                a_sub, lda, b_sub, ldb,
+                                clamp_min, clamp_max);
+            }
+        }
+    }
+
+    // ---- Non-clamp epilogue post-processing ----
+    if (attrs.epilogue.type != EpilogueActivateType::None &&
+        attrs.epilogue.type != EpilogueActivateType::Relu) {
+        matmul_epilogue_inplace(M, N, c_ptr, ldc,
+                                static_cast<const T*>(nullptr), attrs.epilogue);
+    }
 }
 
-void matmul_kernel_f16(const MatMulAttributes& /*attrs*/,
-                       TensorView& /*output*/,
-                       std::span<const TensorView> /*inputs*/,
-                       void* /*workspace*/)
+// =========================================================================
+//  Generic 2D GEMM kernel — NKM tiled loop with pack + mma_pack.
+//  Used for transposed cases (handles strided column access).
+// =========================================================================
+template <typename T>
+void matmul_kernel_2d_packed(const MatMulAttributes& attrs,
+                             T* c_ptr, int ldc,
+                             const T* a_ptr, int lda,
+                             const T* b_ptr, int ldb,
+                             int M, int N, int K,
+                             int kc, int mr_max, int nr_max,
+                             void* workspace)
 {
-    // TODO: NKM tiled loop with imatmul f16 pack + mma_pack
+    // ---- Clamp for epilogue ----
+    float clamp_min = -std::numeric_limits<float>::infinity();
+    float clamp_max =  std::numeric_limits<float>::infinity();
+    if (attrs.epilogue.type == EpilogueActivateType::Relu) {
+        clamp_min = 0.0f;
+    }
+
+    // ---- Beta: pre-scale C ----
+    if (attrs.beta == 0.0f) {
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                c_ptr[i * ldc + j] = T(0);
+            }
+        }
+    } else if (attrs.beta != 1.0f) {
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                float val = s_load(&c_ptr[i * ldc + j]) * attrs.beta;
+                s_store(&c_ptr[i * ldc + j], val);
+            }
+        }
+    }
+
+    // ---- Compute tile sizes ----
+    int mc = std::min(MC_TARGET, M);
+    size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
+    int nc = round_down_nc(compute_nc(mr_max, kc, static_cast<int>(sizeof(T)), l2_size), nr_max);
+    nc = std::min(nc, N);
+
+    // 64-byte-aligned panel strides (in elements)
+    constexpr int ldd_a = std::is_same_v<T, float> ? LDD_A_F32 : LDD_A_F16;
+    constexpr int ldd_b = std::is_same_v<T, float> ? LDD_B_F32 : LDD_B_F16;
+
+    // ---- Workspace layout ----
+    T* pack_a = static_cast<T*>(workspace);
+    int num_panels_a = (mc + mr_max - 1) / mr_max;
+    T* pack_b = pack_a + num_panels_a * ldd_a;
+
+    // ---- NKM tiled loop (packed path) ----
+    for (int n = 0; n < N; n += nc) {
+        int actual_nc = std::min(nc, N - n);
+        for (int k = 0; k < K; k += kc) {
+            int actual_kc = std::min(kc, K - k);
+
+            // Pack B panel
+            const T* b_src = attrs.transpose_b
+                ? b_ptr + n * ldb + k   // B phys is N×K, row n, col k
+                : b_ptr + k * ldb + n;  // B phys is K×N, row k, col n
+            tile_pack_rhs(attrs.transpose_b, actual_nc, actual_kc,
+                          pack_b, ldd_b, b_src, ldb, 1.0f);
+
+            for (int m = 0; m < M; m += mc) {
+                int actual_mc = std::min(mc, M - m);
+
+                // Pack A panel
+                const T* a_src = attrs.transpose_a
+                    ? a_ptr + k * lda + m   // A phys is K×M, row k, col m
+                    : a_ptr + m * lda + k;  // A phys is M×K, row m, col k
+                tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
+                              pack_a, ldd_a, a_src, lda, 1.0f);
+
+                // MMA
+                tile_mma_pack(actual_mc, actual_nc, actual_kc,
+                              c_ptr + m * ldc + n, ldc,
+                              pack_a, ldd_a, pack_b, ldd_b,
+                              clamp_min, clamp_max);
+            }
+        }
+    }
+
+    // ---- Non-clamp epilogue ----
+    if (attrs.epilogue.type != EpilogueActivateType::None &&
+        attrs.epilogue.type != EpilogueActivateType::Relu) {
+        matmul_epilogue_inplace(M, N, c_ptr, ldc,
+                                static_cast<const T*>(nullptr), attrs.epilogue);
+    }
+}
+
+void matmul_kernel_f32(const MatMulAttributes& attrs,
+                       TensorView& output,
+                       std::span<const TensorView> inputs,
+                       void* workspace)
+{
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+
+    const int64_t a_rank = a.rank();
+    const int64_t b_rank = b.rank();
+    const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
+    const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
+    const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
+
+    auto* c_ptr = output.ptr<float>();
+    const auto* a_ptr = a.ptr<float>();
+    const auto* b_ptr = b.ptr<float>();
+    int ldc = static_cast<int>(output.row_stride_elems());
+    int lda = static_cast<int>(a.row_stride_elems());
+    int ldb = static_cast<int>(b.row_stride_elems());
+    int iM = static_cast<int>(M), iN = static_cast<int>(N), iK = static_cast<int>(K);
+
+    if (attrs.transpose_a || attrs.transpose_b) {
+        matmul_kernel_2d_packed<float>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                       iM, iN, iK, KC_F32, MR_MAX_F32, NR_MAX_F32, workspace);
+    } else {
+        matmul_kernel_2d_direct<float>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                       iM, iN, iK, KC_F32, MR_MAX_F32, NR_MAX_F32);
+    }
+}
+
+void matmul_kernel_f16(const MatMulAttributes& attrs,
+                       TensorView& output,
+                       std::span<const TensorView> inputs,
+                       void* workspace)
+{
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+
+    const int64_t a_rank = a.rank();
+    const int64_t b_rank = b.rank();
+    const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
+    const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
+    const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
+
+    auto* c_ptr = output.ptr<half>();
+    const auto* a_ptr = a.ptr<half>();
+    const auto* b_ptr = b.ptr<half>();
+    int ldc = static_cast<int>(output.row_stride_elems());
+    int lda = static_cast<int>(a.row_stride_elems());
+    int ldb = static_cast<int>(b.row_stride_elems());
+    int iM = static_cast<int>(M), iN = static_cast<int>(N), iK = static_cast<int>(K);
+
+    if (attrs.transpose_a || attrs.transpose_b) {
+        matmul_kernel_2d_packed<half>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                      iM, iN, iK, KC_F16, MR_MAX_F16, NR_MAX_F16, workspace);
+    } else {
+        matmul_kernel_2d_direct<half>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                      iM, iN, iK, KC_F16, MR_MAX_F16, NR_MAX_F16);
+    }
 }
 
 
@@ -210,49 +432,166 @@ void matmul_kernel(const MatMulAttributes& attrs,
     NNOPS_ASSERT(b.rank() >= 2);
     NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);
 
-    // 2D only for now — batched falls through to reference
-    if (a.rank() != 2 || b.rank() != 2) {
+    const auto dt_a = a.data_type();
+    const auto dt_b = b.data_type();
+
+    // ---- Resolve dtype-specific kernel parameters ----
+    int kc, mr_max, nr_max;
+    bool supported = true;
+
+    if (dt_a == DataType::f32 && dt_b == DataType::f32) {
+        kc = KC_F32; mr_max = MR_MAX_F32; nr_max = NR_MAX_F32;
+    } else if (dt_a == DataType::f16 && dt_b == DataType::f16) {
+        kc = KC_F16; mr_max = MR_MAX_F16; nr_max = NR_MAX_F16;
+    } else {
+        // Unsupported dtype — fall back to reference for all ranks
+        supported = false;
+    }
+
+    if (!supported) {
         reference::matmul_ref(attrs, output, inputs, ctx, workspace);
         return;
     }
 
-    const auto dt_a = a.data_type();
-    const auto dt_b = b.data_type();
+    // ---- Extract matrix dimensions ----
+    const int64_t a_rank = a.rank();
+    const int64_t b_rank = b.rank();
+    const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
+    const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
+    const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
 
-    // ---- f32 × f32 ----------------------------------------------------
-    if (dt_a == DataType::f32 && dt_b == DataType::f32) {
-        matmul_kernel_f32(attrs, output, inputs, workspace);
+    const int64_t lda = a.row_stride_elems();
+    const int64_t ldb = b.row_stride_elems();
+    const int64_t ldc = output.row_stride_elems();
+
+    // ---- 2D case: dispatch directly ----
+    if (a_rank == 2 && b_rank == 2) {
+        bool use_packed = attrs.transpose_a || attrs.transpose_b;
+        if (dt_a == DataType::f32) {
+            if (use_packed) {
+                matmul_kernel_2d_packed<float>(attrs,
+                    output.ptr<float>(), static_cast<int>(ldc),
+                    a.ptr<float>(), static_cast<int>(lda),
+                    b.ptr<float>(), static_cast<int>(ldb),
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    kc, mr_max, nr_max, workspace);
+            } else {
+                matmul_kernel_2d_direct<float>(attrs,
+                    output.ptr<float>(), static_cast<int>(ldc),
+                    a.ptr<float>(), static_cast<int>(lda),
+                    b.ptr<float>(), static_cast<int>(ldb),
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    kc, mr_max, nr_max);
+            }
+        } else {
+            if (use_packed) {
+                matmul_kernel_2d_packed<half>(attrs,
+                    output.ptr<half>(), static_cast<int>(ldc),
+                    a.ptr<half>(), static_cast<int>(lda),
+                    b.ptr<half>(), static_cast<int>(ldb),
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    kc, mr_max, nr_max, workspace);
+            } else {
+                matmul_kernel_2d_direct<half>(attrs,
+                    output.ptr<half>(), static_cast<int>(ldc),
+                    a.ptr<half>(), static_cast<int>(lda),
+                    b.ptr<half>(), static_cast<int>(ldb),
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    kc, mr_max, nr_max);
+            }
+        }
         return;
     }
 
-    // ---- f16 × f16 ----------------------------------------------------
-    if (dt_a == DataType::f16 && dt_b == DataType::f16) {
-        matmul_kernel_f16(attrs, output, inputs, workspace);
-        return;
+    // ---- Batched case (rank > 2): numpy-style broadcasting ----
+    // Compute broadcast batch dimensions (same logic as matmul_ref)
+    const int64_t batch_a_dims = a_rank - 2;
+    const int64_t batch_b_dims = b_rank - 2;
+    const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
+
+    std::vector<int64_t> batch_a_shape(batch_ndim, 1);
+    std::vector<int64_t> batch_b_shape(batch_ndim, 1);
+    std::vector<int64_t> batch_out_shape(batch_ndim, 1);
+
+    for (int64_t i = 0; i < batch_a_dims; ++i) {
+        batch_a_shape[batch_ndim - batch_a_dims + i] = a.shape(i);
+    }
+    for (int64_t i = 0; i < batch_b_dims; ++i) {
+        batch_b_shape[batch_ndim - batch_b_dims + i] = b.shape(i);
     }
 
-    // ---- u8 × s8 (unsigned activation, signed weight) -----------------
-    if (dt_a == DataType::u8 && dt_b == DataType::s8) {
-        matmul_kernel_u8i8(attrs, output, inputs, workspace);
-        return;
+    int64_t total_batch = 1;
+    for (int64_t i = 0; i < batch_ndim; ++i) {
+        const int64_t da = batch_a_shape[i];
+        const int64_t db = batch_b_shape[i];
+        if (da == db) {
+            batch_out_shape[i] = da;
+        } else if (da == 1) {
+            batch_out_shape[i] = db;
+        } else if (db == 1) {
+            batch_out_shape[i] = da;
+        } else {
+            NNOPS_ASSERT(!"MatMul: incompatible batch dimensions for broadcast");
+        }
+        total_batch *= batch_out_shape[i];
     }
 
-    // ---- s8 × s8 ------------------------------------------------------
-    if (dt_a == DataType::s8 && dt_b == DataType::s8) {
-        matmul_kernel_i8i8(attrs, output, inputs, workspace);
-        return;
-    }
+    // Dispatch per-batch-element 2D GEMM
+    bool use_packed = attrs.transpose_a || attrs.transpose_b;
+    auto dispatch_2d = [&](auto* type_tag) {
+        using T = std::decay_t<decltype(*type_tag)>;
+        auto* c_base = output.ptr<T>();
+        const auto* a_base = a.ptr<T>();
+        const auto* b_base = b.ptr<T>();
 
-    // ---- fp16 × int4 (future: s4 weights packed 2× per byte) -----------
-    // B dtype is s8 (container for packed s4) — distinction TBD when s4
-    // becomes a first-class DataType.
-    if (dt_a == DataType::f16 && dt_b == DataType::s8) {
-        matmul_kernel_f16i4(attrs, output, inputs, workspace);
-        return;
-    }
+        for (int64_t bi = 0; bi < total_batch; ++bi) {
+            int64_t rem = bi;
+            int64_t a_offset = 0;
+            int64_t b_offset = 0;
+            int64_t c_offset = 0;
 
-    // Unsupported dtype combination — fall back to reference.
-    reference::matmul_ref(attrs, output, inputs, ctx, workspace);
+            for (int64_t d = batch_ndim - 1; d >= 0; --d) {
+                const int64_t coord = rem % batch_out_shape[d];
+                rem /= batch_out_shape[d];
+
+                const int64_t a_dim = d - (batch_ndim - batch_a_dims);
+                if (a_dim >= 0) {
+                    const int64_t a_coord = (batch_a_shape[d] == 1) ? 0 : coord;
+                    a_offset += a_coord * a.stride_elems(a_dim);
+                }
+
+                const int64_t b_dim = d - (batch_ndim - batch_b_dims);
+                if (b_dim >= 0) {
+                    const int64_t b_coord = (batch_b_shape[d] == 1) ? 0 : coord;
+                    b_offset += b_coord * b.stride_elems(b_dim);
+                }
+
+                c_offset += coord * output.stride_elems(d);
+            }
+
+            if (use_packed) {
+                matmul_kernel_2d_packed<T>(attrs,
+                    c_base + c_offset, static_cast<int>(ldc),
+                    a_base + a_offset, static_cast<int>(lda),
+                    b_base + b_offset, static_cast<int>(ldb),
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    kc, mr_max, nr_max, workspace);
+            } else {
+                matmul_kernel_2d_direct<T>(attrs,
+                    c_base + c_offset, static_cast<int>(ldc),
+                    a_base + a_offset, static_cast<int>(lda),
+                    b_base + b_offset, static_cast<int>(ldb),
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    kc, mr_max, nr_max);
+            }
+        }
+    };
+
+    if (dt_a == DataType::f32) {
+        dispatch_2d(static_cast<const float*>(nullptr));
+    } else {
+        dispatch_2d(static_cast<const half*>(nullptr));
+    }
 }
 
 }  // namespace nnops::backend::cpu

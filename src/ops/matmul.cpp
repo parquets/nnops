@@ -34,7 +34,7 @@ auto resolve_matmul_kernel(Backend backend) -> MatMul::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::matmul_ref;
+        return backend::cpu::matmul_kernel;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;

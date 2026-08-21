@@ -70,6 +70,7 @@ __global__ void unary_kernel(
     bool add_to)
 {
     const UnaryFn fn = get_unary_fn(type);
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
 
     const int tid = threadIdx.x;
     const int row = blockIdx.x;
@@ -79,7 +80,45 @@ __global__ void unary_kernel(
     const T* in_row  = input  + row * in_row_stride;
     T*       out_row = output + row * out_row_stride;
 
-    for (int i = tid; i < last_dim; i += blockDim.x) {
+    const int64_t vec_end = (last_dim / VEC) * VEC;
+
+    // 128-bit vectorized loop: VEC elements per iteration
+    if constexpr (sizeof(T) == 4) {
+        // f32 path: float4 = 4 floats
+        for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+            float4 vin = v4_load(&in_row[i]);
+            float r0 = fn(vin.x), r1 = fn(vin.y), r2 = fn(vin.z), r3 = fn(vin.w);
+            if (add_to) {
+                float4 vout = v4_load(&out_row[i]);
+                v4_store(&out_row[i], make_float4(
+                    vout.x + r0, vout.y + r1, vout.z + r2, vout.w + r3));
+            } else {
+                v4_store(&out_row[i], make_float4(r0, r1, r2, r3));
+            }
+        }
+    } else {
+        // f16 path: half8 = 8 halfs
+        for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+            half8 vin = v4_load(&in_row[i]);
+            float r0 = fn(__half2float(vin.data[0]));
+            float r1 = fn(__half2float(vin.data[1]));
+            float r2 = fn(__half2float(vin.data[2]));
+            float r3 = fn(__half2float(vin.data[3]));
+            float r4 = fn(__half2float(vin.data[4]));
+            float r5 = fn(__half2float(vin.data[5]));
+            float r6 = fn(__half2float(vin.data[6]));
+            float r7 = fn(__half2float(vin.data[7]));
+            if (add_to) {
+                v4_store(&out_row[i], half8_add(v4_load(&out_row[i]),
+                    r0, r1, r2, r3, r4, r5, r6, r7));
+            } else {
+                v4_store(&out_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+            }
+        }
+    }
+
+    // Scalar tail for remaining elements
+    for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
         float x = s_load(&in_row[i]);
         float rv = fn(x);
         if (add_to) {
@@ -103,11 +142,49 @@ __global__ void unary_flat_kernel(
     bool add_to)
 {
     const UnaryFn fn = get_unary_fn(type);
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
 
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
+    const int64_t vec_end = (total / VEC) * VEC;
 
-    for (int i = tid; i < total; i += stride) {
+    // 128-bit vectorized grid-stride loop
+    if constexpr (sizeof(T) == 4) {
+        // f32 path: float4 = 4 floats
+        for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+            float4 vin = v4_load(&input[i]);
+            float r0 = fn(vin.x), r1 = fn(vin.y), r2 = fn(vin.z), r3 = fn(vin.w);
+            if (add_to) {
+                float4 vout = v4_load(&output[i]);
+                v4_store(&output[i], make_float4(
+                    vout.x + r0, vout.y + r1, vout.z + r2, vout.w + r3));
+            } else {
+                v4_store(&output[i], make_float4(r0, r1, r2, r3));
+            }
+        }
+    } else {
+        // f16 path: half8 = 8 halfs
+        for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+            half8 vin = v4_load(&input[i]);
+            float r0 = fn(__half2float(vin.data[0]));
+            float r1 = fn(__half2float(vin.data[1]));
+            float r2 = fn(__half2float(vin.data[2]));
+            float r3 = fn(__half2float(vin.data[3]));
+            float r4 = fn(__half2float(vin.data[4]));
+            float r5 = fn(__half2float(vin.data[5]));
+            float r6 = fn(__half2float(vin.data[6]));
+            float r7 = fn(__half2float(vin.data[7]));
+            if (add_to) {
+                v4_store(&output[i], half8_add(v4_load(&output[i]),
+                    r0, r1, r2, r3, r4, r5, r6, r7));
+            } else {
+                v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+            }
+        }
+    }
+
+    // Scalar tail for remaining elements
+    for (int64_t i = vec_end + tid; i < total; i += stride) {
         float x = s_load(&input[i]);
         float rv = fn(x);
         if (add_to) {

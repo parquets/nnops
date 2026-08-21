@@ -345,14 +345,14 @@ inline void softmax_process_strided_axis(
     auto v_inv_T = v_set1(x, inv_T);
 
     // ---- Pass 1: per-lane max (temperature doesn't affect max) ----
-    auto v_max = v_set1(x, -std::numeric_limits<float>::infinity());
+    auto v_max_vec = v_set1(x, -std::numeric_limits<float>::infinity());
     for (int64_t k = 0; k < D; ++k) {
-        v_max = v_max(v_max, v_load(x + k * axis_stride));
+        v_max_vec = v_max(v_max_vec, v_load(x + k * axis_stride));
     }
 
     // ---- Pass 2: exp((x - max) / T) + per-lane sum ----
     auto v_sum = v_zero(x);
-    auto v_neg_max = v_neg(v_max);
+    auto v_neg_max = v_neg(v_max_vec);
     for (int64_t k = 0; k < D; ++k) {
         auto v = v_add(v_load(x + k * axis_stride), v_neg_max);
         if (inv_T != 1.0f) {
@@ -369,7 +369,7 @@ inline void softmax_process_strided_axis(
     if (log_softmax) {
         // log_softmax = (x - max) / T - log(sum)
         //             = x * inv_T - max * inv_T - log(sum)
-        auto v_bias = v_sub(v_neg(v_mul(v_max, v_inv_T)), v_log(v_sum));
+        auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum));
         for (int64_t k = 0; k < D; ++k) {
             v_store(y + k * axis_stride,
                     v_add(v_mul(v_load(x + k * axis_stride), v_inv_T), v_bias));

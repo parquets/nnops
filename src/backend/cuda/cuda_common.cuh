@@ -57,6 +57,64 @@ __device__ inline void s_store(float* ptr, float val) noexcept { *ptr = val; }
 __device__ inline void s_store(__half* ptr, float val) noexcept { *ptr = __float2half(val); }
 
 // ============================================================
+// 128-bit vectorized load/store helpers
+// ============================================================
+// f32: float4 = 128 bits = 4 floats
+// f16: half8  = 128 bits = 8 halfs (via aligned struct)
+//
+// These generate a single 128-bit LDG/STG instruction, reducing
+// memory transactions by 4× (f32) or 8× (f16) vs scalar s_load.
+
+struct alignas(16) half8 {
+    __half data[8];
+};
+
+__device__ inline float4 v4_load(const float* ptr) noexcept {
+    return *reinterpret_cast<const float4*>(ptr);
+}
+__device__ inline void v4_store(float* ptr, float4 val) noexcept {
+    *reinterpret_cast<float4*>(ptr) = val;
+}
+
+__device__ inline half8 v4_load(const __half* ptr) noexcept {
+    return *reinterpret_cast<const half8*>(ptr);
+}
+__device__ inline void v4_store(__half* ptr, half8 val) noexcept {
+    *reinterpret_cast<half8*>(ptr) = val;
+}
+
+// f16 128-bit helpers: pack 8 float results into half8, and accumulate
+// onto an existing half8 (for add_to mode).  Reduces per-op boilerplate.
+__device__ inline half8 half8_set(
+    float r0, float r1, float r2, float r3,
+    float r4, float r5, float r6, float r7) noexcept
+{
+    half8 r;
+    r.data[0] = __float2half(r0); r.data[1] = __float2half(r1);
+    r.data[2] = __float2half(r2); r.data[3] = __float2half(r3);
+    r.data[4] = __float2half(r4); r.data[5] = __float2half(r5);
+    r.data[6] = __float2half(r6); r.data[7] = __float2half(r7);
+    return r;
+}
+
+__device__ inline half8 half8_add(
+    half8 base,
+    float r0, float r1, float r2, float r3,
+    float r4, float r5, float r6, float r7) noexcept
+{
+    half8 r;
+    r.data[0] = __float2half(__half2float(base.data[0]) + r0);
+    r.data[1] = __float2half(__half2float(base.data[1]) + r1);
+    r.data[2] = __float2half(__half2float(base.data[2]) + r2);
+    r.data[3] = __float2half(__half2float(base.data[3]) + r3);
+    r.data[4] = __float2half(__half2float(base.data[4]) + r4);
+    r.data[5] = __float2half(__half2float(base.data[5]) + r5);
+    r.data[6] = __float2half(__half2float(base.data[6]) + r6);
+    r.data[7] = __float2half(__half2float(base.data[7]) + r7);
+    return r;
+}
+
+// ============================================================
 // Warp-level reductions (shuffle-based, no shared memory)
 // ============================================================
 

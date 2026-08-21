@@ -30,6 +30,8 @@ __global__ void eltwise_kernel(
     EltwiseType op_type,
     bool add_to)
 {
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
+
     const int tid = threadIdx.x;
     const int row = blockIdx.x;
 
@@ -39,9 +41,49 @@ __global__ void eltwise_kernel(
     const T* b_row = b + row * b_row_stride;
     T* o_row = output + row * o_row_stride;
 
+    const int64_t vec_end = (last_dim / VEC) * VEC;
+
     switch (op_type) {
+    // ================================================================
+    // Add
+    // ================================================================
     case EltwiseType::Add: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + va.x + vb.x, vo.y + va.y + vb.y,
+                        vo.z + va.z + vb.z, vo.w + va.w + vb.w));
+                } else {
+                    v4_store(&o_row[i], make_float4(
+                        va.x + vb.x, va.y + vb.y,
+                        va.z + vb.z, va.w + vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = __half2float(va.data[0]) + __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) + __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) + __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) + __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) + __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) + __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) + __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) + __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float rv = s_load(&a_row[i]) + s_load(&b_row[i]);
             if (add_to) {
                 s_store(&o_row[i], s_load(&o_row[i]) + rv);
@@ -51,8 +93,46 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    // ================================================================
+    // Sub
+    // ================================================================
     case EltwiseType::Sub: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + va.x - vb.x, vo.y + va.y - vb.y,
+                        vo.z + va.z - vb.z, vo.w + va.w - vb.w));
+                } else {
+                    v4_store(&o_row[i], make_float4(
+                        va.x - vb.x, va.y - vb.y,
+                        va.z - vb.z, va.w - vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = __half2float(va.data[0]) - __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) - __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) - __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) - __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) - __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) - __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) - __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) - __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float rv = s_load(&a_row[i]) - s_load(&b_row[i]);
             if (add_to) {
                 s_store(&o_row[i], s_load(&o_row[i]) + rv);
@@ -62,8 +142,46 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    // ================================================================
+    // Mul
+    // ================================================================
     case EltwiseType::Mul: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + va.x * vb.x, vo.y + va.y * vb.y,
+                        vo.z + va.z * vb.z, vo.w + va.w * vb.w));
+                } else {
+                    v4_store(&o_row[i], make_float4(
+                        va.x * vb.x, va.y * vb.y,
+                        va.z * vb.z, va.w * vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = __half2float(va.data[0]) * __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) * __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) * __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) * __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) * __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) * __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) * __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) * __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float rv = s_load(&a_row[i]) * s_load(&b_row[i]);
             if (add_to) {
                 s_store(&o_row[i], s_load(&o_row[i]) + rv);
@@ -73,8 +191,46 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    // ================================================================
+    // Div
+    // ================================================================
     case EltwiseType::Div: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + va.x / vb.x, vo.y + va.y / vb.y,
+                        vo.z + va.z / vb.z, vo.w + va.w / vb.w));
+                } else {
+                    v4_store(&o_row[i], make_float4(
+                        va.x / vb.x, va.y / vb.y,
+                        va.z / vb.z, va.w / vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = __half2float(va.data[0]) / __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) / __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) / __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) / __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) / __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) / __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) / __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) / __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float rv = s_load(&a_row[i]) / s_load(&b_row[i]);
             if (add_to) {
                 s_store(&o_row[i], s_load(&o_row[i]) + rv);
@@ -84,8 +240,47 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    // ================================================================
+    // Min
+    // ================================================================
     case EltwiseType::Min: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                float r0 = fminf(va.x, vb.x);
+                float r1 = fminf(va.y, vb.y);
+                float r2 = fminf(va.z, vb.z);
+                float r3 = fminf(va.w, vb.w);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                } else {
+                    v4_store(&o_row[i], make_float4(r0, r1, r2, r3));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = fminf(__half2float(va.data[0]), __half2float(vb.data[0]));
+                float r1 = fminf(__half2float(va.data[1]), __half2float(vb.data[1]));
+                float r2 = fminf(__half2float(va.data[2]), __half2float(vb.data[2]));
+                float r3 = fminf(__half2float(va.data[3]), __half2float(vb.data[3]));
+                float r4 = fminf(__half2float(va.data[4]), __half2float(vb.data[4]));
+                float r5 = fminf(__half2float(va.data[5]), __half2float(vb.data[5]));
+                float r6 = fminf(__half2float(va.data[6]), __half2float(vb.data[6]));
+                float r7 = fminf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float av = s_load(&a_row[i]);
             float bv = s_load(&b_row[i]);
             float rv = av < bv ? av : bv;
@@ -97,8 +292,47 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    // ================================================================
+    // Max
+    // ================================================================
     case EltwiseType::Max: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                float r0 = fmaxf(va.x, vb.x);
+                float r1 = fmaxf(va.y, vb.y);
+                float r2 = fmaxf(va.z, vb.z);
+                float r3 = fmaxf(va.w, vb.w);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                } else {
+                    v4_store(&o_row[i], make_float4(r0, r1, r2, r3));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = fmaxf(__half2float(va.data[0]), __half2float(vb.data[0]));
+                float r1 = fmaxf(__half2float(va.data[1]), __half2float(vb.data[1]));
+                float r2 = fmaxf(__half2float(va.data[2]), __half2float(vb.data[2]));
+                float r3 = fmaxf(__half2float(va.data[3]), __half2float(vb.data[3]));
+                float r4 = fmaxf(__half2float(va.data[4]), __half2float(vb.data[4]));
+                float r5 = fmaxf(__half2float(va.data[5]), __half2float(vb.data[5]));
+                float r6 = fmaxf(__half2float(va.data[6]), __half2float(vb.data[6]));
+                float r7 = fmaxf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float av = s_load(&a_row[i]);
             float bv = s_load(&b_row[i]);
             float rv = av > bv ? av : bv;
@@ -110,8 +344,47 @@ __global__ void eltwise_kernel(
         }
         break;
     }
+    // ================================================================
+    // Pow
+    // ================================================================
     case EltwiseType::Pow: {
-        for (int i = tid; i < last_dim; i += blockDim.x) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                float4 va = v4_load(&a_row[i]);
+                float4 vb = v4_load(&b_row[i]);
+                float r0 = powf(va.x, vb.x);
+                float r1 = powf(va.y, vb.y);
+                float r2 = powf(va.z, vb.z);
+                float r3 = powf(va.w, vb.w);
+                if (add_to) {
+                    float4 vo = v4_load(&o_row[i]);
+                    v4_store(&o_row[i], make_float4(
+                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                } else {
+                    v4_store(&o_row[i], make_float4(r0, r1, r2, r3));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += blockDim.x * VEC) {
+                half8 va = v4_load(&a_row[i]);
+                half8 vb = v4_load(&b_row[i]);
+                float r0 = powf(__half2float(va.data[0]), __half2float(vb.data[0]));
+                float r1 = powf(__half2float(va.data[1]), __half2float(vb.data[1]));
+                float r2 = powf(__half2float(va.data[2]), __half2float(vb.data[2]));
+                float r3 = powf(__half2float(va.data[3]), __half2float(vb.data[3]));
+                float r4 = powf(__half2float(va.data[4]), __half2float(vb.data[4]));
+                float r5 = powf(__half2float(va.data[5]), __half2float(vb.data[5]));
+                float r6 = powf(__half2float(va.data[6]), __half2float(vb.data[6]));
+                float r7 = powf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                if (add_to) {
+                    v4_store(&o_row[i], half8_add(v4_load(&o_row[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&o_row[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < last_dim; i += blockDim.x) {
             float rv = powf(s_load(&a_row[i]), s_load(&b_row[i]));
             if (add_to) {
                 s_store(&o_row[i], s_load(&o_row[i]) + rv);
@@ -137,12 +410,53 @@ __global__ void eltwise_flat_kernel(
     EltwiseType op_type,
     bool add_to)
 {
+    constexpr int VEC = sizeof(T) == 2 ? 8 : 4;  // 128-bit / sizeof(T)
+
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
+    const int64_t vec_end = (total / VEC) * VEC;
 
     switch (op_type) {
+    // ================================================================
+    // Add
+    // ================================================================
     case EltwiseType::Add: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + va.x + vb.x, vo.y + va.y + vb.y,
+                        vo.z + va.z + vb.z, vo.w + va.w + vb.w));
+                } else {
+                    v4_store(&output[i], make_float4(
+                        va.x + vb.x, va.y + vb.y,
+                        va.z + vb.z, va.w + vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = __half2float(va.data[0]) + __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) + __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) + __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) + __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) + __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) + __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) + __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) + __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float rv = s_load(&a[i]) + s_load(&b[i]);
             if (add_to) {
                 s_store(&output[i], s_load(&output[i]) + rv);
@@ -152,8 +466,46 @@ __global__ void eltwise_flat_kernel(
         }
         break;
     }
+    // ================================================================
+    // Sub
+    // ================================================================
     case EltwiseType::Sub: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + va.x - vb.x, vo.y + va.y - vb.y,
+                        vo.z + va.z - vb.z, vo.w + va.w - vb.w));
+                } else {
+                    v4_store(&output[i], make_float4(
+                        va.x - vb.x, va.y - vb.y,
+                        va.z - vb.z, va.w - vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = __half2float(va.data[0]) - __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) - __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) - __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) - __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) - __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) - __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) - __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) - __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float rv = s_load(&a[i]) - s_load(&b[i]);
             if (add_to) {
                 s_store(&output[i], s_load(&output[i]) + rv);
@@ -163,8 +515,46 @@ __global__ void eltwise_flat_kernel(
         }
         break;
     }
+    // ================================================================
+    // Mul
+    // ================================================================
     case EltwiseType::Mul: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + va.x * vb.x, vo.y + va.y * vb.y,
+                        vo.z + va.z * vb.z, vo.w + va.w * vb.w));
+                } else {
+                    v4_store(&output[i], make_float4(
+                        va.x * vb.x, va.y * vb.y,
+                        va.z * vb.z, va.w * vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = __half2float(va.data[0]) * __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) * __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) * __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) * __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) * __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) * __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) * __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) * __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float rv = s_load(&a[i]) * s_load(&b[i]);
             if (add_to) {
                 s_store(&output[i], s_load(&output[i]) + rv);
@@ -174,8 +564,46 @@ __global__ void eltwise_flat_kernel(
         }
         break;
     }
+    // ================================================================
+    // Div
+    // ================================================================
     case EltwiseType::Div: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + va.x / vb.x, vo.y + va.y / vb.y,
+                        vo.z + va.z / vb.z, vo.w + va.w / vb.w));
+                } else {
+                    v4_store(&output[i], make_float4(
+                        va.x / vb.x, va.y / vb.y,
+                        va.z / vb.z, va.w / vb.w));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = __half2float(va.data[0]) / __half2float(vb.data[0]);
+                float r1 = __half2float(va.data[1]) / __half2float(vb.data[1]);
+                float r2 = __half2float(va.data[2]) / __half2float(vb.data[2]);
+                float r3 = __half2float(va.data[3]) / __half2float(vb.data[3]);
+                float r4 = __half2float(va.data[4]) / __half2float(vb.data[4]);
+                float r5 = __half2float(va.data[5]) / __half2float(vb.data[5]);
+                float r6 = __half2float(va.data[6]) / __half2float(vb.data[6]);
+                float r7 = __half2float(va.data[7]) / __half2float(vb.data[7]);
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float rv = s_load(&a[i]) / s_load(&b[i]);
             if (add_to) {
                 s_store(&output[i], s_load(&output[i]) + rv);
@@ -185,8 +613,47 @@ __global__ void eltwise_flat_kernel(
         }
         break;
     }
+    // ================================================================
+    // Min
+    // ================================================================
     case EltwiseType::Min: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                float r0 = fminf(va.x, vb.x);
+                float r1 = fminf(va.y, vb.y);
+                float r2 = fminf(va.z, vb.z);
+                float r3 = fminf(va.w, vb.w);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                } else {
+                    v4_store(&output[i], make_float4(r0, r1, r2, r3));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = fminf(__half2float(va.data[0]), __half2float(vb.data[0]));
+                float r1 = fminf(__half2float(va.data[1]), __half2float(vb.data[1]));
+                float r2 = fminf(__half2float(va.data[2]), __half2float(vb.data[2]));
+                float r3 = fminf(__half2float(va.data[3]), __half2float(vb.data[3]));
+                float r4 = fminf(__half2float(va.data[4]), __half2float(vb.data[4]));
+                float r5 = fminf(__half2float(va.data[5]), __half2float(vb.data[5]));
+                float r6 = fminf(__half2float(va.data[6]), __half2float(vb.data[6]));
+                float r7 = fminf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float av = s_load(&a[i]);
             float bv = s_load(&b[i]);
             float rv = av < bv ? av : bv;
@@ -198,8 +665,47 @@ __global__ void eltwise_flat_kernel(
         }
         break;
     }
+    // ================================================================
+    // Max
+    // ================================================================
     case EltwiseType::Max: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                float r0 = fmaxf(va.x, vb.x);
+                float r1 = fmaxf(va.y, vb.y);
+                float r2 = fmaxf(va.z, vb.z);
+                float r3 = fmaxf(va.w, vb.w);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                } else {
+                    v4_store(&output[i], make_float4(r0, r1, r2, r3));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = fmaxf(__half2float(va.data[0]), __half2float(vb.data[0]));
+                float r1 = fmaxf(__half2float(va.data[1]), __half2float(vb.data[1]));
+                float r2 = fmaxf(__half2float(va.data[2]), __half2float(vb.data[2]));
+                float r3 = fmaxf(__half2float(va.data[3]), __half2float(vb.data[3]));
+                float r4 = fmaxf(__half2float(va.data[4]), __half2float(vb.data[4]));
+                float r5 = fmaxf(__half2float(va.data[5]), __half2float(vb.data[5]));
+                float r6 = fmaxf(__half2float(va.data[6]), __half2float(vb.data[6]));
+                float r7 = fmaxf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float av = s_load(&a[i]);
             float bv = s_load(&b[i]);
             float rv = av > bv ? av : bv;
@@ -211,8 +717,47 @@ __global__ void eltwise_flat_kernel(
         }
         break;
     }
+    // ================================================================
+    // Pow
+    // ================================================================
     case EltwiseType::Pow: {
-        for (int i = tid; i < total; i += stride) {
+        if constexpr (sizeof(T) == 4) {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                float4 va = v4_load(&a[i]);
+                float4 vb = v4_load(&b[i]);
+                float r0 = powf(va.x, vb.x);
+                float r1 = powf(va.y, vb.y);
+                float r2 = powf(va.z, vb.z);
+                float r3 = powf(va.w, vb.w);
+                if (add_to) {
+                    float4 vo = v4_load(&output[i]);
+                    v4_store(&output[i], make_float4(
+                        vo.x + r0, vo.y + r1, vo.z + r2, vo.w + r3));
+                } else {
+                    v4_store(&output[i], make_float4(r0, r1, r2, r3));
+                }
+            }
+        } else {
+            for (int64_t i = tid * VEC; i < vec_end; i += stride * VEC) {
+                half8 va = v4_load(&a[i]);
+                half8 vb = v4_load(&b[i]);
+                float r0 = powf(__half2float(va.data[0]), __half2float(vb.data[0]));
+                float r1 = powf(__half2float(va.data[1]), __half2float(vb.data[1]));
+                float r2 = powf(__half2float(va.data[2]), __half2float(vb.data[2]));
+                float r3 = powf(__half2float(va.data[3]), __half2float(vb.data[3]));
+                float r4 = powf(__half2float(va.data[4]), __half2float(vb.data[4]));
+                float r5 = powf(__half2float(va.data[5]), __half2float(vb.data[5]));
+                float r6 = powf(__half2float(va.data[6]), __half2float(vb.data[6]));
+                float r7 = powf(__half2float(va.data[7]), __half2float(vb.data[7]));
+                if (add_to) {
+                    v4_store(&output[i], half8_add(v4_load(&output[i]),
+                        r0, r1, r2, r3, r4, r5, r6, r7));
+                } else {
+                    v4_store(&output[i], half8_set(r0, r1, r2, r3, r4, r5, r6, r7));
+                }
+            }
+        }
+        for (int64_t i = vec_end + tid; i < total; i += stride) {
             float rv = powf(s_load(&a[i]), s_load(&b[i]));
             if (add_to) {
                 s_store(&output[i], s_load(&output[i]) + rv);
