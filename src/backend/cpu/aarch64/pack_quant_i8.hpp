@@ -10,8 +10,8 @@
 ///   - pack_quant_trans_nN (LHS/A): reads N f32 rows (stride ir_step), transposes
 ///     N×K blocks, quantizes per-row (each row has its own scale/zero), packs
 ///     4 i8 per i32, writes contiguously.
-///   - pack_quant_copy_nN (RHS/B): reads N-column f32 rows, quantizes per-K-row
-///     (each of the K rows has its own scale/zero), groups each 4-k block into
+///   - pack_quant_copy_nN (RHS/B): reads N-column f32 rows, quantizes with
+///     K-shared scale/zero (broadcast across all K), groups each 4-k block into
 ///     contiguous 4-i8 runs per column.
 ///
 /// Quantization: dst = clamp(round(src * inv_scale + zero), qmin, qmax)
@@ -39,7 +39,7 @@ namespace nnops::backend::cpu::aarch64 {
 //  the scale and zero are per-lane, not broadcast.
 // =========================================================================
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline int8x16_t quant_trans_block_4x4_f32_i8(
     float32x4_t d0, float32x4_t d1, float32x4_t d2, float32x4_t d3,
     const float32x4_t& v_inv_scale, const float32x4_t& v_zero) noexcept
@@ -71,7 +71,7 @@ inline int8x16_t quant_trans_block_4x4_f32_i8(
 
 /// Quantize 4 floats (one float32x4_t) with per-lane scale/zero into int32x4_t.
 /// Used for the pack_copy path where each K position has its own scale.
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline int32x4_t quant_4f32_to_i32(float32x4_t d,
                                     float32x4_t v_inv_scale,
                                     float32x4_t v_zero) noexcept
@@ -81,7 +81,7 @@ inline int32x4_t quant_4f32_to_i32(float32x4_t d,
 }
 
 /// Narrow 4 int32x4_t to int8x16_t, saturating to the target range.
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline int8x16_t narrow_4i32_to_i8(int32x4_t i0, int32x4_t i1,
                                     int32x4_t i2, int32x4_t i3) noexcept
 {
@@ -102,7 +102,7 @@ inline int8x16_t narrow_4i32_to_i8(int32x4_t i0, int32x4_t i1,
 //  LHS Transpose pack + quantize  (f32 → i8, per-row scale/zero)
 // =========================================================================
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_trans_n1_i8(void* NNOPS_RESTRICT output,
                                     const float* NNOPS_RESTRICT input,
                                     int ir_step, int K,
@@ -146,7 +146,7 @@ inline void pack_quant_trans_n1_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_trans_n4_i8(void* NNOPS_RESTRICT output,
                                     const float* NNOPS_RESTRICT input,
                                     int ir_step, int K,
@@ -199,7 +199,7 @@ inline void pack_quant_trans_n4_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_trans_n8_i8(void* NNOPS_RESTRICT output,
                                     const float* NNOPS_RESTRICT input,
                                     int ir_step, int K,
@@ -261,7 +261,7 @@ inline void pack_quant_trans_n8_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_trans_n12_i8(void* NNOPS_RESTRICT output,
                                      const float* NNOPS_RESTRICT input,
                                      int ir_step, int K,
@@ -314,7 +314,7 @@ inline void pack_quant_trans_n12_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
                                      const float* NNOPS_RESTRICT input,
                                      int ir_step, int K,
@@ -369,13 +369,13 @@ inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  RHS Copy pack + quantize  (f32 → i8, per-K-row scale/zero)
+//  RHS Copy pack + quantize  (f32 → i8, K-shared scale/zero)
 //
-//  The scale/zero array has K entries (one per row of the input matrix).
-//  Each group of 4 consecutive K elements uses scale[k], scale[k+1], etc.
+//  Scale/zero is broadcast across all K elements (single scale/zero for the
+//  entire K dimension).  K step = 4 (group 4 consecutive K elements).
 // =========================================================================
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_copy_n1_i8(void* NNOPS_RESTRICT output,
                                    const float* NNOPS_RESTRICT input,
                                    int ir_step, int K,
@@ -386,13 +386,12 @@ inline void pack_quant_copy_n1_i8(void* NNOPS_RESTRICT output,
     constexpr int32_t qmax = Q_U8 ? 255 : 127;
 
     int8_t* NNOPS_RESTRICT out_i8 = static_cast<int8_t*>(output);
-    const bool has_zero = (zero != nullptr);
+    const float inv_s = 1.0f / scale[0];
+    const float zval = (zero == nullptr) ? 0.0f : zero[0];
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
         for (int kk = 0; kk < 4; ++kk) {
-            float inv_s = 1.0f / scale[k + kk];
-            float zval = has_zero ? zero[k + kk] : 0.0f;
             float qval = input[kk * ir_step] * inv_s + zval;
             int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
             out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
@@ -402,8 +401,6 @@ inline void pack_quant_copy_n1_i8(void* NNOPS_RESTRICT output,
     }
     if (k < K) {
         for (int kk = 0; kk < 4 && k + kk < K; ++kk) {
-            float inv_s = 1.0f / scale[k + kk];
-            float zval = has_zero ? zero[k + kk] : 0.0f;
             float qval = input[kk * ir_step] * inv_s + zval;
             int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
             out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
@@ -414,7 +411,7 @@ inline void pack_quant_copy_n1_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_copy_n4_i8(void* NNOPS_RESTRICT output,
                                    const float* NNOPS_RESTRICT input,
                                    int ir_step, int K,
@@ -425,36 +422,24 @@ inline void pack_quant_copy_n4_i8(void* NNOPS_RESTRICT output,
     constexpr int32_t qmax = Q_U8 ? 255 : 127;
 
     int8_t* NNOPS_RESTRICT out_i8 = static_cast<int8_t*>(output);
-    const bool has_zero = (zero != nullptr);
+    const float inv_s = 1.0f / scale[0];
+    const float zval = (zero == nullptr) ? 0.0f : zero[0];
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        // Gather per-K-row scale/zero for the 4 consecutive K rows
-        float inv_s[4], z[4];
-        for (int kk = 0; kk < 4; ++kk) {
-            inv_s[kk] = 1.0f / scale[k + kk];
-            z[kk] = has_zero ? zero[k + kk] : 0.0f;
-        }
-        const float32x4_t v_inv_s = vld1q_f32(inv_s);
-        const float32x4_t v_z = vld1q_f32(z);
-
-        // For each of the 4 columns, quantize the 4 K elements
         for (int x = 0; x < 4; ++x) {
-            float32x4_t d = vld1q_f32(input + 0 * ir_step + x);
-            // d[0] uses scale[k], d[1] uses scale[k+1], etc.
-            // But d is loaded from input[0*ir_step+x], input[1*ir_step+x], etc.
-            // So d[0] comes from row k, d[1] from row k+1, etc.
-            // This matches the per-lane scale pattern!
-            float32x4_t dq = vaddq_f32(vmulq_f32(d, v_inv_s), v_z);
-            int32x4_t qi = vcvtnq_s32_f32(dq);
-
-            // Extract 4 int32 values and clamp to int8 range, then pack
-            int32_t qi_arr[4];
-            vst1q_s32(qi_arr, qi);
-            out_i8[0] = static_cast<int8_t>(std::min(std::max(qi_arr[0], qmin), qmax));
-            out_i8[1] = static_cast<int8_t>(std::min(std::max(qi_arr[1], qmin), qmax));
-            out_i8[2] = static_cast<int8_t>(std::min(std::max(qi_arr[2], qmin), qmax));
-            out_i8[3] = static_cast<int8_t>(std::min(std::max(qi_arr[3], qmin), qmax));
+            float q0 = input[0 * ir_step + x] * inv_s + zval;
+            float q1 = input[1 * ir_step + x] * inv_s + zval;
+            float q2 = input[2 * ir_step + x] * inv_s + zval;
+            float q3 = input[3 * ir_step + x] * inv_s + zval;
+            out_i8[0] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(q0)), qmin), qmax));
+            out_i8[1] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(q1)), qmin), qmax));
+            out_i8[2] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(q2)), qmin), qmax));
+            out_i8[3] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(q3)), qmin), qmax));
             out_i8 += 4;
         }
         input += 4 * ir_step;
@@ -462,23 +447,20 @@ inline void pack_quant_copy_n4_i8(void* NNOPS_RESTRICT output,
 
     if (k < K) {
         for (int x = 0; x < 4; ++x) {
-            for (int kk = 0; kk < 4; ++kk) {
-                if (k + kk < K) {
-                    float inv_s = 1.0f / scale[k + kk];
-                    float zval = has_zero ? zero[k + kk] : 0.0f;
-                    float qval = input[kk * ir_step + x] * inv_s + zval;
-                    int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
-                    out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
-                } else {
-                    out_i8[kk] = 0;
-                }
-            }
+            out_i8[0] = k + 0 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[0 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[1] = k + 1 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[1 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[2] = k + 2 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[2 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[3] = k + 3 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[3 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
             out_i8 += 4;
         }
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_copy_n8_i8(void* NNOPS_RESTRICT output,
                                    const float* NNOPS_RESTRICT input,
                                    int ir_step, int K,
@@ -489,56 +471,67 @@ inline void pack_quant_copy_n8_i8(void* NNOPS_RESTRICT output,
     constexpr int32_t qmax = Q_U8 ? 255 : 127;
 
     int8_t* NNOPS_RESTRICT out_i8 = static_cast<int8_t*>(output);
-    const bool has_zero = (zero != nullptr);
+    const float inv_s = 1.0f / scale[0];
+    const float zval = (zero == nullptr) ? 0.0f : zero[0];
+    const float32x4_t v_inv_s = vdupq_n_f32(inv_s);
+    const float32x4_t v_z = vdupq_n_f32(zval);
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float inv_s[4], z[4];
-        for (int kk = 0; kk < 4; ++kk) {
-            inv_s[kk] = 1.0f / scale[k + kk];
-            z[kk] = has_zero ? zero[k + kk] : 0.0f;
-        }
-        const float32x4_t v_inv_s = vld1q_f32(inv_s);
-        const float32x4_t v_z = vld1q_f32(z);
+        // Quantize 8 elements per row
+        float32x4_t d0_lo = vld1q_f32(input + 0 * ir_step + 0);
+        float32x4_t d0_hi = vld1q_f32(input + 0 * ir_step + 4);
+        int16x8_t s0 = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_lo, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_hi, v_inv_s), v_z))));
+        int8x8_t r0 = vqmovn_s16(s0);
 
-        // Load 8 elements from each of 4 K rows → 4 float32x4_t × 2 groups
-        for (int x = 0; x < 8; x += 4) {
-            float32x4_t d0 = vld1q_f32(input + 0 * ir_step + x);
-            float32x4_t d1 = vld1q_f32(input + 1 * ir_step + x);
-            float32x4_t d2 = vld1q_f32(input + 2 * ir_step + x);
-            float32x4_t d3 = vld1q_f32(input + 3 * ir_step + x);
+        float32x4_t d1_lo = vld1q_f32(input + 1 * ir_step + 0);
+        float32x4_t d1_hi = vld1q_f32(input + 1 * ir_step + 4);
+        int16x8_t s1 = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_lo, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_hi, v_inv_s), v_z))));
+        int8x8_t r1 = vqmovn_s16(s1);
 
-            int32x4_t i0 = quant_4f32_to_i32<Q_U8>(d0, v_inv_s, v_z);
-            int32x4_t i1 = quant_4f32_to_i32<Q_U8>(d1, v_inv_s, v_z);
-            int32x4_t i2 = quant_4f32_to_i32<Q_U8>(d2, v_inv_s, v_z);
-            int32x4_t i3 = quant_4f32_to_i32<Q_U8>(d3, v_inv_s, v_z);
+        float32x4_t d2_lo = vld1q_f32(input + 2 * ir_step + 0);
+        float32x4_t d2_hi = vld1q_f32(input + 2 * ir_step + 4);
+        int16x8_t s2 = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_lo, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_hi, v_inv_s), v_z))));
+        int8x8_t r2 = vqmovn_s16(s2);
 
-            const int8x16_t q = narrow_4i32_to_i8<Q_U8>(i0, i1, i2, i3);
-            vst1q_s8(out_i8, q);
-            out_i8 += 16;
-        }
+        float32x4_t d3_lo = vld1q_f32(input + 3 * ir_step + 0);
+        float32x4_t d3_hi = vld1q_f32(input + 3 * ir_step + 4);
+        int16x8_t s3 = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_lo, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_hi, v_inv_s), v_z))));
+        int8x8_t r3 = vqmovn_s16(s3);
+
+        // Interleaved store matching dp4a layout
+        int8x8x4_t v_out;
+        v_out.val[0] = r0; v_out.val[1] = r1;
+        v_out.val[2] = r2; v_out.val[3] = r3;
+        vst4_s8(out_i8, v_out);
+        out_i8 += 4 * 8;
         input += 4 * ir_step;
     }
 
     if (k < K) {
         for (int x = 0; x < 8; ++x) {
-            for (int kk = 0; kk < 4; ++kk) {
-                if (k + kk < K) {
-                    float inv_s = 1.0f / scale[k + kk];
-                    float zval = has_zero ? zero[k + kk] : 0.0f;
-                    float qval = input[kk * ir_step + x] * inv_s + zval;
-                    int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
-                    out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
-                } else {
-                    out_i8[kk] = 0;
-                }
-            }
+            out_i8[0] = k + 0 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[0 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[1] = k + 1 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[1 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[2] = k + 2 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[2 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[3] = k + 3 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[3 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
             out_i8 += 4;
         }
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_copy_n12_i8(void* NNOPS_RESTRICT output,
                                     const float* NNOPS_RESTRICT input,
                                     int ir_step, int K,
@@ -549,42 +542,60 @@ inline void pack_quant_copy_n12_i8(void* NNOPS_RESTRICT output,
     constexpr int32_t qmax = Q_U8 ? 255 : 127;
 
     int8_t* NNOPS_RESTRICT out_i8 = static_cast<int8_t*>(output);
-    const bool has_zero = (zero != nullptr);
+    const float inv_s = 1.0f / scale[0];
+    const float zval = (zero == nullptr) ? 0.0f : zero[0];
+    const float32x4_t v_inv_s = vdupq_n_f32(inv_s);
+    const float32x4_t v_z = vdupq_n_f32(zval);
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float inv_s[4], z[4];
-        for (int kk = 0; kk < 4; ++kk) {
-            inv_s[kk] = 1.0f / scale[k + kk];
-            z[kk] = has_zero ? zero[k + kk] : 0.0f;
+        // First 8 columns: quantize per-row, interleave via vst4_s8
+        {
+            float32x4_t d0_lo = vld1q_f32(input + 0 * ir_step + 0);
+            float32x4_t d0_hi = vld1q_f32(input + 0 * ir_step + 4);
+            int16x8_t s0 = vcombine_s16(
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_lo, v_inv_s), v_z))),
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_hi, v_inv_s), v_z))));
+            int8x8_t r0 = vqmovn_s16(s0);
+
+            float32x4_t d1_lo = vld1q_f32(input + 1 * ir_step + 0);
+            float32x4_t d1_hi = vld1q_f32(input + 1 * ir_step + 4);
+            int16x8_t s1 = vcombine_s16(
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_lo, v_inv_s), v_z))),
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_hi, v_inv_s), v_z))));
+            int8x8_t r1 = vqmovn_s16(s1);
+
+            float32x4_t d2_lo = vld1q_f32(input + 2 * ir_step + 0);
+            float32x4_t d2_hi = vld1q_f32(input + 2 * ir_step + 4);
+            int16x8_t s2 = vcombine_s16(
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_lo, v_inv_s), v_z))),
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_hi, v_inv_s), v_z))));
+            int8x8_t r2 = vqmovn_s16(s2);
+
+            float32x4_t d3_lo = vld1q_f32(input + 3 * ir_step + 0);
+            float32x4_t d3_hi = vld1q_f32(input + 3 * ir_step + 4);
+            int16x8_t s3 = vcombine_s16(
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_lo, v_inv_s), v_z))),
+                vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_hi, v_inv_s), v_z))));
+            int8x8_t r3 = vqmovn_s16(s3);
+
+            int8x8x4_t v_out;
+            v_out.val[0] = r0; v_out.val[1] = r1;
+            v_out.val[2] = r2; v_out.val[3] = r3;
+            vst4_s8(out_i8, v_out);
+            out_i8 += 4 * 8;
         }
-        const float32x4_t v_inv_s = vld1q_f32(inv_s);
-        const float32x4_t v_z = vld1q_f32(z);
 
-        // First 8 columns: SIMD
-        for (int x = 0; x < 8; x += 4) {
-            float32x4_t d0 = vld1q_f32(input + 0 * ir_step + x);
-            float32x4_t d1 = vld1q_f32(input + 1 * ir_step + x);
-            float32x4_t d2 = vld1q_f32(input + 2 * ir_step + x);
-            float32x4_t d3 = vld1q_f32(input + 3 * ir_step + x);
-
-            int32x4_t i0 = quant_4f32_to_i32<Q_U8>(d0, v_inv_s, v_z);
-            int32x4_t i1 = quant_4f32_to_i32<Q_U8>(d1, v_inv_s, v_z);
-            int32x4_t i2 = quant_4f32_to_i32<Q_U8>(d2, v_inv_s, v_z);
-            int32x4_t i3 = quant_4f32_to_i32<Q_U8>(d3, v_inv_s, v_z);
-
-            const int8x16_t q = narrow_4i32_to_i8<Q_U8>(i0, i1, i2, i3);
-            vst1q_s8(out_i8, q);
-            out_i8 += 16;
-        }
-
-        // Remaining 4 columns: scalar
+        // Remaining 4 columns: scalar interleaved
         for (int x = 8; x < 12; ++x) {
-            for (int kk = 0; kk < 4; ++kk) {
-                float qval = input[kk * ir_step + x] * inv_s[kk] + z[kk];
-                int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
-                out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
-            }
+            out_i8[0] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[0 * ir_step + x] * inv_s + zval)), qmin), qmax));
+            out_i8[1] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[1 * ir_step + x] * inv_s + zval)), qmin), qmax));
+            out_i8[2] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[2 * ir_step + x] * inv_s + zval)), qmin), qmax));
+            out_i8[3] = static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[3 * ir_step + x] * inv_s + zval)), qmin), qmax));
             out_i8 += 4;
         }
         input += 4 * ir_step;
@@ -592,23 +603,20 @@ inline void pack_quant_copy_n12_i8(void* NNOPS_RESTRICT output,
 
     if (k < K) {
         for (int x = 0; x < 12; ++x) {
-            for (int kk = 0; kk < 4; ++kk) {
-                if (k + kk < K) {
-                    float inv_s = 1.0f / scale[k + kk];
-                    float zval = has_zero ? zero[k + kk] : 0.0f;
-                    float qval = input[kk * ir_step + x] * inv_s + zval;
-                    int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
-                    out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
-                } else {
-                    out_i8[kk] = 0;
-                }
-            }
+            out_i8[0] = k + 0 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[0 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[1] = k + 1 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[1 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[2] = k + 2 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[2 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[3] = k + 3 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[3 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
             out_i8 += 4;
         }
     }
 }
 
-template <bool Q_U8>
+template <bool Q_U8 = false>
 inline void pack_quant_copy_n16_i8(void* NNOPS_RESTRICT output,
                                     const float* NNOPS_RESTRICT input,
                                     int ir_step, int K,
@@ -619,49 +627,81 @@ inline void pack_quant_copy_n16_i8(void* NNOPS_RESTRICT output,
     constexpr int32_t qmax = Q_U8 ? 255 : 127;
 
     int8_t* NNOPS_RESTRICT out_i8 = static_cast<int8_t*>(output);
-    const bool has_zero = (zero != nullptr);
+    const float inv_s = 1.0f / scale[0];
+    const float zval = (zero == nullptr) ? 0.0f : zero[0];
+    const float32x4_t v_inv_s = vdupq_n_f32(inv_s);
+    const float32x4_t v_z = vdupq_n_f32(zval);
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float inv_s[4], z[4];
-        for (int kk = 0; kk < 4; ++kk) {
-            inv_s[kk] = 1.0f / scale[k + kk];
-            z[kk] = has_zero ? zero[k + kk] : 0.0f;
-        }
-        const float32x4_t v_inv_s = vld1q_f32(inv_s);
-        const float32x4_t v_z = vld1q_f32(z);
+        // Quantize 16 elements per row
+        float32x4_t d0_0 = vld1q_f32(input + 0 * ir_step + 0);
+        float32x4_t d0_1 = vld1q_f32(input + 0 * ir_step + 4);
+        float32x4_t d0_2 = vld1q_f32(input + 0 * ir_step + 8);
+        float32x4_t d0_3 = vld1q_f32(input + 0 * ir_step + 12);
+        int16x8_t s0_lo = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_0, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_1, v_inv_s), v_z))));
+        int16x8_t s0_hi = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_2, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d0_3, v_inv_s), v_z))));
+        int8x16_t r0 = vcombine_s8(vqmovn_s16(s0_lo), vqmovn_s16(s0_hi));
 
-        for (int x = 0; x < 16; x += 4) {
-            float32x4_t d0 = vld1q_f32(input + 0 * ir_step + x);
-            float32x4_t d1 = vld1q_f32(input + 1 * ir_step + x);
-            float32x4_t d2 = vld1q_f32(input + 2 * ir_step + x);
-            float32x4_t d3 = vld1q_f32(input + 3 * ir_step + x);
+        float32x4_t d1_0 = vld1q_f32(input + 1 * ir_step + 0);
+        float32x4_t d1_1 = vld1q_f32(input + 1 * ir_step + 4);
+        float32x4_t d1_2 = vld1q_f32(input + 1 * ir_step + 8);
+        float32x4_t d1_3 = vld1q_f32(input + 1 * ir_step + 12);
+        int16x8_t s1_lo = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_0, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_1, v_inv_s), v_z))));
+        int16x8_t s1_hi = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_2, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d1_3, v_inv_s), v_z))));
+        int8x16_t r1 = vcombine_s8(vqmovn_s16(s1_lo), vqmovn_s16(s1_hi));
 
-            int32x4_t i0 = quant_4f32_to_i32<Q_U8>(d0, v_inv_s, v_z);
-            int32x4_t i1 = quant_4f32_to_i32<Q_U8>(d1, v_inv_s, v_z);
-            int32x4_t i2 = quant_4f32_to_i32<Q_U8>(d2, v_inv_s, v_z);
-            int32x4_t i3 = quant_4f32_to_i32<Q_U8>(d3, v_inv_s, v_z);
+        float32x4_t d2_0 = vld1q_f32(input + 2 * ir_step + 0);
+        float32x4_t d2_1 = vld1q_f32(input + 2 * ir_step + 4);
+        float32x4_t d2_2 = vld1q_f32(input + 2 * ir_step + 8);
+        float32x4_t d2_3 = vld1q_f32(input + 2 * ir_step + 12);
+        int16x8_t s2_lo = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_0, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_1, v_inv_s), v_z))));
+        int16x8_t s2_hi = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_2, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d2_3, v_inv_s), v_z))));
+        int8x16_t r2 = vcombine_s8(vqmovn_s16(s2_lo), vqmovn_s16(s2_hi));
 
-            const int8x16_t q = narrow_4i32_to_i8<Q_U8>(i0, i1, i2, i3);
-            vst1q_s8(out_i8, q);
-            out_i8 += 16;
-        }
+        float32x4_t d3_0 = vld1q_f32(input + 3 * ir_step + 0);
+        float32x4_t d3_1 = vld1q_f32(input + 3 * ir_step + 4);
+        float32x4_t d3_2 = vld1q_f32(input + 3 * ir_step + 8);
+        float32x4_t d3_3 = vld1q_f32(input + 3 * ir_step + 12);
+        int16x8_t s3_lo = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_0, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_1, v_inv_s), v_z))));
+        int16x8_t s3_hi = vcombine_s16(
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_2, v_inv_s), v_z))),
+            vqmovn_s32(vcvtnq_s32_f32(vaddq_f32(vmulq_f32(d3_3, v_inv_s), v_z))));
+        int8x16_t r3 = vcombine_s8(vqmovn_s16(s3_lo), vqmovn_s16(s3_hi));
+
+        // Interleaved store matching dp4a layout
+        int8x16x4_t v_out;
+        v_out.val[0] = r0; v_out.val[1] = r1;
+        v_out.val[2] = r2; v_out.val[3] = r3;
+        vst4q_s8(out_i8, v_out);
+        out_i8 += 4 * 16;
         input += 4 * ir_step;
     }
 
     if (k < K) {
         for (int x = 0; x < 16; ++x) {
-            for (int kk = 0; kk < 4; ++kk) {
-                if (k + kk < K) {
-                    float inv_s = 1.0f / scale[k + kk];
-                    float zval = has_zero ? zero[k + kk] : 0.0f;
-                    float qval = input[kk * ir_step + x] * inv_s + zval;
-                    int32_t qi = static_cast<int32_t>(std::nearbyintf(qval));
-                    out_i8[kk] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
-                } else {
-                    out_i8[kk] = 0;
-                }
-            }
+            out_i8[0] = k + 0 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[0 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[1] = k + 1 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[1 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[2] = k + 2 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[2 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
+            out_i8[3] = k + 3 < K ? static_cast<int8_t>(std::min(std::max(
+                static_cast<int32_t>(std::nearbyintf(input[3 * ir_step + x] * inv_s + zval)), qmin), qmax)) : 0;
             out_i8 += 4;
         }
     }
