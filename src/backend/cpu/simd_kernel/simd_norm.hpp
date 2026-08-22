@@ -9,11 +9,8 @@
 ///     with 4→2→1-wide multi-accumulator unrolling and scalar tail.
 ///   - norm_apply_affine_row<T>: SIMD normalize with broadcast scale/bias:
 ///     y = (x - mean) * inv_std * scale_val + bias_val
-///
-/// High-level kernels (consume the shared primitives):
-///   - layer_norm_process_row<T>: full LN: norm_reduce_sum_sq → stats → per-element normalize
-///   - rms_norm_process_row<T>:   full RMS: norm_reduce_sum_sq → rms stats → per-element normalize
-///   - l2_norm_process_row<T>:    full L2: norm_reduce_sum_sq → l2 norm → per-element normalize
+///   - norm_apply_row<T, HasMean, HasScale, HasBias>: unified SIMD normalize pass
+///     for L2/RMS/Layer norm: y = ((x - mean?) * inv_std) * scale? + bias?
 ///
 /// BatchNorm kernels (fused fmadd formula, structurally different):
 ///   - batch_norm_process_packed_row<T>
@@ -145,6 +142,61 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
     }
 }
 
+/// Unified SIMD element-wise normalize pass.
+///
+/// Computes: y[i] = ((x[i] - mean?) * inv_std) * scale? + bias?
+/// Template bools control which operations are compiled in — the compiler
+/// eliminates dead branches for each instantiation via `if constexpr`.
+///
+/// Used as the second pass by L2Norm, RMSNorm, and LayerNorm.
+template <typename T, bool HasMean, bool HasScale, bool HasBias>
+inline void norm_apply_row(const T* x, T* y, int64_t n,
+                            float mean_val, float inv_std,
+                            const T* scale, const T* bias,
+                            bool scale_is_scalar, bool add_to)
+{
+    constexpr int L = simd_lane_for<T>;
+    int64_t i = 0;
+
+    const auto v_mean    = v_set1(x, mean_val);
+    const auto v_inv_std = v_set1(x, inv_std);
+
+    for (; i + L <= n; i += L) {
+        auto xv = v_load(x + i);
+        auto rv = xv;
+        if constexpr (HasMean) {
+            rv = v_sub(rv, v_mean);
+        }
+        rv = v_mul(rv, v_inv_std);
+        if constexpr (HasScale) {
+            auto vs = v_load(scale + (scale_is_scalar ? 0 : i));
+            rv = v_mul(rv, vs);
+        }
+        if constexpr (HasBias) {
+            auto vb = v_load(bias + (scale_is_scalar ? 0 : i));
+            rv = v_add(rv, vb);
+        }
+        v_store_add(y + i, rv, add_to);
+    }
+    for (; i < n; ++i) {
+        float xv = s_load(&x[i]);
+        float rv = xv;
+        if constexpr (HasMean) {
+            rv -= mean_val;
+        }
+        rv *= inv_std;
+        if constexpr (HasScale) {
+            int64_t s_idx = scale_is_scalar ? 0 : i;
+            rv *= s_load(&scale[s_idx]);
+        }
+        if constexpr (HasBias) {
+            int64_t b_idx = scale_is_scalar ? 0 : i;
+            rv += s_load(&bias[b_idx]);
+        }
+        s_store_add(&y[i], rv, add_to);
+    }
+}
+
 // ============================================================
 // BatchNorm kernels (fused fmadd formula, structurally unique)
 // ============================================================
@@ -248,137 +300,8 @@ inline void batch_norm_process_nonspatial_block(
 }
 
 // ============================================================
-// L2Norm kernel
+// L2Norm / LayerNorm / RMSNorm — unified via norm_apply_row
+// (stats computation inlined at call sites in norm.cpp)
 // ============================================================
-
-/// Process one row of L2 normalization using SIMD fast path.
-///
-/// y = x / sqrt(sum(x^2) + epsilon) — no mean subtraction, no scale/bias.
-template <typename T>
-inline void l2_norm_process_row(
-    const T* x, T* y,
-    int64_t n, float epsilon, bool add_to)
-{
-    constexpr int L = simd_lane_for<T>;
-
-    // Pass 1 — SIMD sum_sq reduction via shared primitive (ignore sum)
-    auto sum_sq_pair = norm_reduce_sum_sq<T>(x, n);
-    float sum_sq = sum_sq_pair.second;
-    (void)sum_sq_pair.first;
-
-    const float norm_val = std::sqrt(sum_sq + epsilon);
-    const float inv_norm = 1.0f / norm_val;
-
-    // Pass 2 — SIMD normalize
-    int64_t i = 0;
-    const auto v_inv = v_set1(x, inv_norm);
-
-    for (; i + L <= n; i += L) {
-        auto xv = v_load(x + i);
-        auto rv = v_mul(xv, v_inv);
-        v_store_add(y + i, rv, add_to);
-    }
-    for (; i < n; ++i) {
-        float rv = s_load(&x[i]) * inv_norm;
-        s_store_add(&y[i], rv, add_to);
-    }
-}
-
-// ============================================================
-// LayerNorm kernel
-// ============================================================
-
-/// Process one row of layer normalization using SIMD fast path.
-///
-/// Uses norm_reduce_sum_sq for the reduction pass, then per-element
-/// SIMD normalize with optional per-element or scalar scale/bias.
-template <typename T>
-inline void layer_norm_process_row(
-    const T* x, T* y,
-    const T* scale, const T* bias,
-    int64_t n, float epsilon,
-    bool scale_is_scalar, bool has_bias, bool add_to)
-{
-    constexpr int L = simd_lane_for<T>;
-
-    // Pass 1 — SIMD reduction via shared primitive
-    auto [sum, sum_sq] = norm_reduce_sum_sq<T>(x, n);
-
-    const float inv_n = 1.0f / static_cast<float>(n);
-    const float mean_val = sum * inv_n;
-    float var_val = sum_sq * inv_n - mean_val * mean_val;
-    if (var_val < 0.0f) { var_val = 0.0f; }
-    const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
-
-    // Pass 2 — SIMD normalize with per-element or scalar scale/bias
-    int64_t i = 0;
-
-    const auto v_mean    = v_set1(x, mean_val);
-    const auto v_inv_std = v_set1(x, inv_std);
-    const auto v_zero_b  = v_zero(x);
-
-    for (; i + L <= n; i += L) {
-        auto xv = v_load(x + i);
-        auto vs = v_load(scale + (scale_is_scalar ? 0 : i));
-        auto vb = (has_bias && bias)
-            ? v_load(bias + (scale_is_scalar ? 0 : i))
-            : v_zero_b;
-        auto rv = v_fmadd(v_mul(v_sub(xv, v_mean), v_inv_std), vs, vb);
-        v_store_add(y + i, rv, add_to);
-    }
-    for (; i < n; ++i) {
-        int64_t s_idx = scale_is_scalar ? 0 : i;
-        int64_t b_idx = scale_is_scalar ? 0 : i;
-        float xv = s_load(&x[i]);
-        float s = s_load(&scale[s_idx]);
-        float b = (has_bias && bias) ? s_load(&bias[b_idx]) : 0.0f;
-        float rv = (xv - mean_val) * inv_std * s + b;
-        s_store_add(&y[i], rv, add_to);
-    }
-}
-
-// ============================================================
-// RMSNorm kernel
-// ============================================================
-
-/// Process one row of RMS normalization using SIMD fast path.
-///
-/// Uses norm_reduce_sum_sq for the sum-of-squares reduction (ignores sum),
-/// then per-element SIMD normalize with optional per-element or scalar scale.
-template <typename T>
-inline void rms_norm_process_row(
-    const T* x, T* y,
-    const T* scale,
-    int64_t n, float epsilon,
-    bool scale_is_scalar, bool add_to)
-{
-    constexpr int L = simd_lane_for<T>;
-
-    // Pass 1 — SIMD sum_sq reduction via shared primitive (ignore sum)
-    auto sum_sq_pair = norm_reduce_sum_sq<T>(x, n);
-    float sum_sq = sum_sq_pair.second;
-    (void)sum_sq_pair.first;
-
-    const float rms = std::sqrt(sum_sq / static_cast<float>(n) + epsilon);
-    const float inv_rms = 1.0f / rms;
-
-    // Pass 2 — SIMD normalize with per-element or scalar scale
-    int64_t i = 0;
-    const auto v_inv_rms = v_set1(x, inv_rms);
-
-    for (; i + L <= n; i += L) {
-        auto xv = v_load(x + i);
-        auto vs = v_load(scale + (scale_is_scalar ? 0 : i));
-        auto rv = v_mul(v_mul(xv, v_inv_rms), vs);
-        v_store_add(y + i, rv, add_to);
-    }
-    for (; i < n; ++i) {
-        int64_t s_idx = scale_is_scalar ? 0 : i;
-        float xv = s_load(&x[i]);
-        float s = s_load(&scale[s_idx]);
-        float rv = xv * inv_rms * s;
-        s_store_add(&y[i], rv, add_to);
-    }
-}
 
 }  // namespace nnops::kernel

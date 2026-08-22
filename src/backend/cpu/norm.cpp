@@ -23,6 +23,53 @@ using namespace nnops::simd;
 namespace {
 
 // ============================================================
+// Shared helpers
+// ============================================================
+
+/// Pre-compute element offsets for non-contiguous normalization axes.
+/// Maps a flattened inner index (0..norm_size-1) to its stride offset
+/// within the tensor, handling arbitrary multi-dimensional layouts.
+inline std::vector<int64_t> compute_inner_offsets(
+    const TensorView& X, int64_t axis, int64_t norm_size)
+{
+    const int64_t rank = X.rank();
+    std::vector<int64_t> offsets(static_cast<size_t>(norm_size));
+    for (int64_t flat = 0; flat < norm_size; ++flat) {
+        int64_t off = 0;
+        int64_t rem = flat;
+        for (int64_t d = rank - 1; d >= axis; --d) {
+            int64_t dim = X.shape(d);
+            off += (rem % dim) * X.stride_elems(d);
+            rem /= dim;
+        }
+        offsets[static_cast<size_t>(flat)] = off;
+    }
+    return offsets;
+}
+
+/// Normalized axis dimensions for row-wise norm dispatch.
+struct NormDims {
+    int64_t axis;               ///< Normalized axis (0 <= axis < rank)
+    int64_t num_rows;           ///< Number of independent rows to process
+    int64_t norm_size;          ///< Elements per normalization row
+    bool is_contiguous_tail;   ///< True when axis == rank-1 (SIMD fast path)
+};
+
+inline NormDims compute_norm_dims(const TensorView& X, int64_t raw_axis) {
+    const int64_t rank = X.rank();
+    int64_t axis = raw_axis;
+    if (axis < 0) { axis += rank; }
+    NNOPS_ASSERT(axis >= 0 && axis < rank);
+
+    int64_t num_rows = 1;
+    for (int64_t i = 0; i < axis; ++i) { num_rows *= X.shape(i); }
+    int64_t norm_size = 1;
+    for (int64_t i = axis; i < rank; ++i) { norm_size *= X.shape(i); }
+
+    return {axis, num_rows, norm_size, axis == rank - 1};
+}
+
+// ============================================================
 // BatchNorm
 // ============================================================
 
@@ -162,20 +209,7 @@ void layer_norm_general_scalar(
     float epsilon, bool add_to, bool has_bias,
     const ComputeContext& ctx)
 {
-    const int64_t rank = X.rank();
-
-    std::vector<int64_t> inner_offsets(static_cast<size_t>(norm_size));
-    for (int64_t flat = 0; flat < norm_size; ++flat) {
-        int64_t off = 0;
-        int64_t rem = flat;
-        for (int64_t d = rank - 1; d >= axis; --d) {
-            int64_t dim = X.shape(d);
-            off += (rem % dim) * X.stride_elems(d);
-            rem /= dim;
-        }
-        inner_offsets[static_cast<size_t>(flat)] = off;
-    }
-
+    const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
     const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
     const bool scale_is_scalar = (scale.numel() == 1);
 
@@ -222,21 +256,7 @@ void layer_norm_impl(const NormAttributes& attrs,
     const auto& scale = inputs[1];
     const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
 
-    const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
-
-    int64_t axis = attrs.axis;
-    if (axis < 0) { axis += rank; }
-    NNOPS_ASSERT(axis >= 0 && axis < rank);
-
-    int64_t num_rows = 1;
-    for (int64_t i = 0; i < axis; ++i) {
-        num_rows *= X.shape(i);
-    }
-    int64_t norm_size = 1;
-    for (int64_t i = axis; i < rank; ++i) {
-        norm_size *= X.shape(i);
-    }
 
     const auto* x_ptr  = X.ptr<T>();
     const auto* s_ptr  = scale.ptr<T>();
@@ -244,12 +264,12 @@ void layer_norm_impl(const NormAttributes& attrs,
     auto* y_ptr = output.ptr<T>();
 
     const bool add_to = attrs.add_to;
-    const bool is_contiguous_tail = (axis == rank - 1);
+    const auto dims = compute_norm_dims(X, attrs.axis);
 
-    if (!is_contiguous_tail) {
+    if (!dims.is_contiguous_tail) {
         layer_norm_general_scalar<T>(
             x_ptr, s_ptr, b_ptr, y_ptr,
-            num_rows, norm_size, axis, X, scale,
+            dims.num_rows, dims.norm_size, dims.axis, X, scale,
             epsilon, add_to, has_bias, ctx);
         return;
     }
@@ -259,17 +279,29 @@ void layer_norm_impl(const NormAttributes& attrs,
 
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
-        kernel::layer_norm_process_row<T>(
-            x_ptr + row_off, y_ptr + row_off,
-            s_ptr, b_ptr,
-            norm_size, epsilon,
-            scale_is_scalar, has_bias, add_to);
+        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, dims.norm_size);
+
+        const float inv_n = 1.0f / static_cast<float>(dims.norm_size);
+        const float mean_val = sum * inv_n;
+        float var_val = sum_sq * inv_n - mean_val * mean_val;
+        if (var_val < 0.0f) { var_val = 0.0f; }
+        const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
+
+        if (has_bias && b_ptr) {
+            kernel::norm_apply_row<T, true, true, true>(
+                x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+                mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to);
+        } else {
+            kernel::norm_apply_row<T, true, true, false>(
+                x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+                mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to);
+        }
     };
 
     if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
+        ctx.cpu_parallel_for(0, dims.num_rows, process_row);
     } else {
-        for (int64_t row = 0; row < num_rows; ++row) {
+        for (int64_t row = 0; row < dims.num_rows; ++row) {
             process_row(row);
         }
     }
@@ -288,20 +320,7 @@ void rms_norm_general_scalar(
     float epsilon, bool add_to,
     const ComputeContext& ctx)
 {
-    const int64_t rank = X.rank();
-
-    std::vector<int64_t> inner_offsets(static_cast<size_t>(norm_size));
-    for (int64_t flat = 0; flat < norm_size; ++flat) {
-        int64_t off = 0;
-        int64_t rem = flat;
-        for (int64_t d = rank - 1; d >= axis; --d) {
-            int64_t dim = X.shape(d);
-            off += (rem % dim) * X.stride_elems(d);
-            rem /= dim;
-        }
-        inner_offsets[static_cast<size_t>(flat)] = off;
-    }
-
+    const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
     const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
     const bool scale_is_scalar = (scale.numel() == 1);
 
@@ -343,33 +362,19 @@ void rms_norm_impl(const NormAttributes& attrs,
     const auto& X     = inputs[0];
     const auto& scale = inputs[1];
 
-    const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
-
-    int64_t axis = attrs.axis;
-    if (axis < 0) { axis += rank; }
-    NNOPS_ASSERT(axis >= 0 && axis < rank);
-
-    int64_t num_rows = 1;
-    for (int64_t i = 0; i < axis; ++i) {
-        num_rows *= X.shape(i);
-    }
-    int64_t norm_size = 1;
-    for (int64_t i = axis; i < rank; ++i) {
-        norm_size *= X.shape(i);
-    }
 
     const auto* x_ptr = X.ptr<T>();
     const auto* s_ptr = scale.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
     const bool add_to = attrs.add_to;
-    const bool is_contiguous_tail = (axis == rank - 1);
+    const auto dims = compute_norm_dims(X, attrs.axis);
 
-    if (!is_contiguous_tail) {
+    if (!dims.is_contiguous_tail) {
         rms_norm_general_scalar<T>(
             x_ptr, s_ptr, y_ptr,
-            num_rows, norm_size, axis, X, scale,
+            dims.num_rows, dims.norm_size, dims.axis, X, scale,
             epsilon, add_to, ctx);
         return;
     }
@@ -379,17 +384,18 @@ void rms_norm_impl(const NormAttributes& attrs,
 
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
-        kernel::rms_norm_process_row<T>(
-            x_ptr + row_off, y_ptr + row_off,
-            s_ptr,
-            norm_size, epsilon,
-            scale_is_scalar, add_to);
+        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, dims.norm_size);
+        (void)sum;
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(dims.norm_size) + epsilon);
+        kernel::norm_apply_row<T, false, true, false>(
+            x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+            0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
     };
 
     if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
+        ctx.cpu_parallel_for(0, dims.num_rows, process_row);
     } else {
-        for (int64_t row = 0; row < num_rows; ++row) {
+        for (int64_t row = 0; row < dims.num_rows; ++row) {
             process_row(row);
         }
     }
@@ -407,20 +413,7 @@ void l2_norm_general_scalar(
     float epsilon, bool add_to,
     const ComputeContext& ctx)
 {
-    const int64_t rank = X.rank();
-
-    std::vector<int64_t> inner_offsets(static_cast<size_t>(norm_size));
-    for (int64_t flat = 0; flat < norm_size; ++flat) {
-        int64_t off = 0;
-        int64_t rem = flat;
-        for (int64_t d = rank - 1; d >= axis; --d) {
-            int64_t dim = X.shape(d);
-            off += (rem % dim) * X.stride_elems(d);
-            rem /= dim;
-        }
-        inner_offsets[static_cast<size_t>(flat)] = off;
-    }
-
+    const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
     const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
 
     const auto process_row = [&](int64_t row) {
@@ -458,32 +451,18 @@ void l2_norm_impl(const NormAttributes& attrs,
 {
     const auto& X = inputs[0];
 
-    const int64_t rank = X.rank();
     const float epsilon = attrs.epsilon;
-
-    int64_t axis = attrs.axis;
-    if (axis < 0) { axis += rank; }
-    NNOPS_ASSERT(axis >= 0 && axis < rank);
-
-    int64_t num_rows = 1;
-    for (int64_t i = 0; i < axis; ++i) {
-        num_rows *= X.shape(i);
-    }
-    int64_t norm_size = 1;
-    for (int64_t i = axis; i < rank; ++i) {
-        norm_size *= X.shape(i);
-    }
 
     const auto* x_ptr = X.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
     const bool add_to = attrs.add_to;
-    const bool is_contiguous_tail = (axis == rank - 1);
+    const auto dims = compute_norm_dims(X, attrs.axis);
 
-    if (!is_contiguous_tail) {
+    if (!dims.is_contiguous_tail) {
         l2_norm_general_scalar<T>(
             x_ptr, y_ptr,
-            num_rows, norm_size, axis, X,
+            dims.num_rows, dims.norm_size, dims.axis, X,
             epsilon, add_to, ctx);
         return;
     }
@@ -492,15 +471,18 @@ void l2_norm_impl(const NormAttributes& attrs,
 
     const auto process_row = [&](int64_t row) {
         const int64_t row_off = row * x_row_stride;
-        kernel::l2_norm_process_row<T>(
-            x_ptr + row_off, y_ptr + row_off,
-            norm_size, epsilon, add_to);
+        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, dims.norm_size);
+        (void)sum;
+        const float inv_norm = 1.0f / std::sqrt(sum_sq + epsilon);
+        kernel::norm_apply_row<T, false, false, false>(
+            x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+            0.0f, inv_norm, nullptr, nullptr, false, add_to);
     };
 
     if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
+        ctx.cpu_parallel_for(0, dims.num_rows, process_row);
     } else {
-        for (int64_t row = 0; row < num_rows; ++row) {
+        for (int64_t row = 0; row < dims.num_rows; ++row) {
             process_row(row);
         }
     }
