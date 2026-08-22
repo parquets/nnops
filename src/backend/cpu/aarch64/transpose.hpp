@@ -1,9 +1,16 @@
 #pragma once
 /// @file transpose.hpp
-/// @brief ARM NEON matrix transpose primitives for pack operations.
+/// @brief ARM NEON matrix transpose primitives for GEMM micro-kernels.
 ///
-/// Provides vector register-level transposes used by the pack kernels
-/// to reorder data between row-major (input) and packed (output) layouts.
+/// Three register categories are used:
+///   - float32x4_t  (4×float32) — packed float intrinsics (vzipq_f32 + vcombine_f32)
+///   - int32x4_t    (4×int32)   — packed integer intrinsics (for int8 dp4a pack)
+///   - float16x4_t / float16x8_t (4×/8×float16) — native NEON fp16
+///
+/// f16 transposes use vreinterpretq_f32_f16 to reuse f32 zip-combine logic
+/// where possible, falling back to explicit vcombine_f32 for larger tiles.
+///
+/// Reference: nn_compute/src/cpu/kernel/transpose/aarch64/transpose_aarch64.hpp
 
 #include <arm_neon.h>
 #include "backend/cpu/common/restrict.hpp"

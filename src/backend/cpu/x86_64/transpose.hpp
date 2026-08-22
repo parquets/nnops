@@ -2,12 +2,16 @@
 /// @file transpose.hpp
 /// @brief x86_64 SSE/AVX transpose primitives for GEMM micro-kernels.
 ///
-/// Two register widths are used:
-///   - __m128  (4×float32 or 8×float16) — packed float/intrinsics
-///   - __m256  (8×float32) — packed float intrinsics
+/// Three register widths are used:
+///   - __m128  (4×float32)          — packed float intrinsics
+///   - __m256  (8×float32)          — packed float intrinsics
+///   - __m128i (8×int16 or 16×int8) — packed integer intrinsics
 ///
 /// For fp16, data is held in __m128i and transposed as 16-bit lanes;
 /// the caller is responsible for half <-> float conversion.
+///
+/// The 4×16 int8 transpose (transpose_4x16_i8) operates on raw bytes
+/// and is used by the int8 dp4a pack_copy_n16 pipeline.
 ///
 /// Reference: nn_compute/src/cpu/kernel/transpose/x86_64/transpose_x86.hpp
 
