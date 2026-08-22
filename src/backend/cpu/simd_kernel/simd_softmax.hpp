@@ -2,10 +2,11 @@
 /// @file simd_softmax.hpp
 /// @brief SIMD kernel functions for softmax / log-softmax.
 ///
-/// Three SIMD dispatch paths:
-///   - Packed row:    per-lane SIMD, contiguous pack-wide strides (axis == rank-1)
-///   - Packed channel: per-lane SIMD with pitch between C8 blocks (axis == 1)
-///   - Standard:       contiguous tail, SIMD max/sum reduction (pack == 1)
+/// Kernel architecture:
+///   - softmax_per_lane:        unified per-lane 3-pass kernel (max→exp+sum→norm)
+///                              for all strided-access variants
+///   - softmax_packed_channel:   per-lane + partial last-block scalar correction
+///   - softmax_standard_row:     horizontal SIMD reduction for contiguous tail
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
@@ -18,109 +19,65 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Packed SIMD path: per-lane reduction within each physical row.
-/// For NCHWC8 [N,C8,H,W] with axis=W, each of the `pack` C lanes
-/// is an independent softmax over D=W spatial positions.
+/// Per-lane SIMD softmax: each SIMD lane is an independent 3-pass softmax
+/// over D strided elements.
+///
+/// Algorithm: max → exp((x - max) / T) + sum → normalize.
+/// All per-lane softmax variants (packed row, packed column, strided axis)
+/// reduce to this single kernel — the only difference is the stride value.
 template <typename T>
-inline void softmax_process_packed_row(
-    const T* x_row, T* y_row,
-    int64_t D, int64_t pack, bool log_softmax,
-    float inv_T = 1.0f)
+inline void softmax_per_lane(
+    const T* x, T* y,
+    int64_t D, int64_t stride,
+    bool log_softmax, float inv_T)
 {
-    auto v_inv_T = v_set1(x_row, inv_T);
+    auto v_inv_T = v_set1(x, inv_T);
 
-    auto v_max_vec = v_set1(x_row, -std::numeric_limits<float>::infinity());
-    for (int64_t w = 0; w < D; ++w) {
-        v_max_vec = v_max(v_max_vec, v_load(x_row + w * pack));
+    // Pass 1: per-lane max
+    auto v_max_vec = v_set1(x, -std::numeric_limits<float>::infinity());
+    for (int64_t k = 0; k < D; ++k) {
+        v_max_vec = v_max(v_max_vec, v_load(x + k * stride));
     }
 
-    auto v_sum_vec = v_zero(x_row);
+    // Pass 2: exp((x - max) / T) + per-lane sum
+    auto v_sum_vec = v_zero(x);
     auto v_neg_max = v_neg(v_max_vec);
-    for (int64_t w = 0; w < D; ++w) {
-        auto v = v_add(v_load(x_row + w * pack), v_neg_max);
+    for (int64_t k = 0; k < D; ++k) {
+        auto v = v_add(v_load(x + k * stride), v_neg_max);
         if (inv_T != 1.0f) {
             v = v_mul(v, v_inv_T);
         }
         v = v_exp(v);
-        if (!log_softmax) { v_store(y_row + w * pack, v); }
+        if (!log_softmax) { v_store(y + k * stride, v); }
         v_sum_vec = v_add(v_sum_vec, v);
     }
 
+    // Pass 3: normalize
     if (log_softmax) {
-        // log_softmax = (x - max) / T - log(sum)
-        //             = x * inv_T - max * inv_T - log(sum)
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
-        for (int64_t w = 0; w < D; ++w) {
-            v_store(y_row + w * pack,
-                    v_add(v_mul(v_load(x_row + w * pack), v_inv_T), v_bias));
+        for (int64_t k = 0; k < D; ++k) {
+            v_store(y + k * stride,
+                    v_add(v_mul(v_load(x + k * stride), v_inv_T), v_bias));
         }
     } else {
-        auto v_inv = v_div(v_set1(x_row, 1.0f), v_sum_vec);
-        for (int64_t w = 0; w < D; ++w) {
-            v_store(y_row + w * pack, v_mul(v_load(y_row + w * pack), v_inv));
-        }
-    }
-}
-
-template <typename T>
-inline void softmax_process_packed_col(
-    const T* x_col, T* y_col,
-    int64_t x_pitch, int64_t y_pitch,
-    int64_t D, // number of rows
-    int64_t pack, // number of lanes
-    bool log_softmax,
-    float inv_T = 1.0f
-)
-{
-    auto v_inv_T = v_set1(x_col, inv_T);
-
-    auto v_max_vec = v_set1(x_col, -std::numeric_limits<float>::infinity());
-    for (int64_t h = 0; h < D; ++h) {
-        v_max_vec = v_max(v_max_vec, v_load(x_col + h * x_pitch));
-    }
-
-    auto v_sum_vec = v_zero(x_col);
-    auto v_neg_max = v_neg(v_max_vec);
-    for (int64_t h = 0; h < D; ++h) {
-        auto v = v_add(v_load(x_col + h * x_pitch), v_neg_max);
-        if (inv_T != 1.0f) {
-            v = v_mul(v, v_inv_T);
-        }
-        v = v_exp(v);
-        if (!log_softmax) { v_store(y_col + h * y_pitch, v); }
-        v_sum_vec = v_add(v_sum_vec, v);
-    }
-
-    if (log_softmax) {
-        // log_softmax = (x - max) / T - log(sum)
-        auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
-        for (int64_t h = 0; h < D; ++h) {
-            v_store(y_col + h * y_pitch,
-                    v_add(v_mul(v_load(x_col + h * x_pitch), v_inv_T), v_bias));
-        }
-    } else {
-        auto v_inv = v_div(v_set1(x_col, 1.0f), v_sum_vec);
-        for (int64_t h = 0; h < D; ++h) {
-            v_store(y_col + h * y_pitch, v_mul(v_load(y_col + h * y_pitch), v_inv));
+        auto v_inv = v_div(v_set1(x, 1.0f), v_sum_vec);
+        for (int64_t k = 0; k < D; ++k) {
+            v_store(y + k * stride, v_mul(v_load(y + k * stride), v_inv));
         }
     }
 }
 
 /// Channel-wise softmax for NCHWC8 / NCDHWC8 packed layout.
 ///
-/// At each spatial position, D = C8 channel blocks are traversed via
-/// chan_stride.  Each of the `pack` SIMD lanes is an independent softmax
-/// across the C8 dimension.  Per-lane SIMD processes full C8 blocks;
-/// the partial last block (when valid_lanes < pack) is handled with
-/// scalar per-lane correction so that padded zeros do not perturb the
-/// per-lane max / sum / normalization.
-///
-/// valid_lanes: number of valid channels in the last C8 block
-///   (= C % pack, or pack when C is a multiple of pack).
+/// This is the only per-lane variant that needs special handling: when the
+/// last C8 block is partial (valid_lanes < pack), padded zeros must not
+/// perturb the per-lane max / sum / normalization. Full blocks are processed
+/// via the same 3-pass algorithm as softmax_per_lane; the partial last block
+/// uses scalar per-lane correction.
 template <typename T>
 inline void softmax_process_packed_channel(
     const T* x_chan, T* y_chan,
-    int64_t x_chan_stride, int64_t y_chan_stride,
+    int64_t stride,
     int64_t D, int64_t pack, int64_t valid_lanes,
     bool log_softmax,
     float inv_T = 1.0f
@@ -136,53 +93,48 @@ inline void softmax_process_packed_channel(
     };
 
     // ============================================================
-    // Pass 1 — per-lane max (temperature doesn't affect max)
+    // Pass 1: per-lane max over full blocks + partial block
     // ============================================================
     auto v_max_vec = v_set1(x_chan, -std::numeric_limits<float>::infinity());
     for (int64_t c = 0; c < full_blocks; ++c) {
-        v_max_vec = v_max(v_max_vec, v_load(x_chan + c * x_chan_stride));
+        v_max_vec = v_max(v_max_vec, v_load(x_chan + c * stride));
     }
 
     if (valid_lanes < pack) {
         T tmp[16];
         v_store(tmp, v_max_vec);
-        const T* last = x_chan + (D - 1) * x_chan_stride;
+        const T* last = x_chan + (D - 1) * stride;
         for (int64_t l = 0; l < valid_lanes; ++l) {
             float v = s_load(&last[l]);
-            if (v > s_load(&tmp[l])) {
-                s_store(&tmp[l], v);
-            }
+            if (v > s_load(&tmp[l])) { s_store(&tmp[l], v); }
         }
         v_max_vec = v_load(tmp);
     }
 
     // ============================================================
-    // Pass 2 — exp((x - max) / T) + per-lane sum
+    // Pass 2: exp((x - max) / T) + per-lane sum
     // ============================================================
     auto v_sum_vec = v_zero(x_chan);
     auto v_neg_max = v_neg(v_max_vec);
 
     for (int64_t c = 0; c < full_blocks; ++c) {
-        auto v = v_add(v_load(x_chan + c * x_chan_stride), v_neg_max);
-        if (inv_T != 1.0f) {
-            v = v_mul(v, v_inv_T);
-        }
+        auto v = v_add(v_load(x_chan + c * stride), v_neg_max);
+        if (inv_T != 1.0f) { v = v_mul(v, v_inv_T); }
         v = v_exp(v);
-        if (!log_softmax) { v_store(y_chan + c * y_chan_stride, v); }
+        if (!log_softmax) { v_store(y_chan + c * stride, v); }
         v_sum_vec = v_add(v_sum_vec, v);
     }
 
-    // Partial last block: scalar exp + sum for valid lanes
     if (valid_lanes < pack) {
         T tmp[16];
         v_store(tmp, v_sum_vec);
-        const T* last_x = x_chan + (D - 1) * x_chan_stride;
-        T*       last_y = y_chan + (D - 1) * y_chan_stride;
+        const T* last_x = x_chan + (D - 1) * stride;
+        T*       last_y = y_chan + (D - 1) * stride;
 
         for (int64_t l = 0; l < valid_lanes; ++l) {
-            float xv  = s_load(&last_x[l]);
-            float nm  = lane_val(v_neg_max, l);          // -max for this lane
-            float ev  = std::exp((xv + nm) * inv_T);     // exp((x - max) / T)
+            float xv = s_load(&last_x[l]);
+            float nm = lane_val(v_neg_max, l);
+            float ev = std::exp((xv + nm) * inv_T);
             if (!log_softmax) { s_store(&last_y[l], ev); }
             s_store(&tmp[l], s_load(&tmp[l]) + ev);
         }
@@ -190,21 +142,17 @@ inline void softmax_process_packed_channel(
     }
 
     // ============================================================
-    // Pass 3 — normalize
+    // Pass 3: normalize
     // ============================================================
     if (log_softmax) {
-        // log_softmax = (x - max) / T - log(sum)
-        //             = x * inv_T - max * inv_T - log(sum)
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
         for (int64_t c = 0; c < full_blocks; ++c) {
-            v_store(y_chan + c * y_chan_stride,
-                    v_add(v_mul(v_load(x_chan + c * x_chan_stride), v_inv_T), v_bias));
-
-        // Partial last block
+            v_store(y_chan + c * stride,
+                    v_add(v_mul(v_load(x_chan + c * stride), v_inv_T), v_bias));
         }
         if (valid_lanes < pack) {
-            const T* last_x = x_chan + (D - 1) * x_chan_stride;
-            T*       last_y = y_chan + (D - 1) * y_chan_stride;
+            const T* last_x = x_chan + (D - 1) * stride;
+            T*       last_y = y_chan + (D - 1) * stride;
             for (int64_t l = 0; l < valid_lanes; ++l) {
                 float xv = s_load(&last_x[l]);
                 float b  = lane_val(v_bias, l);
@@ -214,14 +162,11 @@ inline void softmax_process_packed_channel(
     } else {
         auto v_inv = v_div(v_set1(x_chan, 1.0f), v_sum_vec);
         for (int64_t c = 0; c < full_blocks; ++c) {
-            v_store(y_chan + c * y_chan_stride,
-                    v_mul(v_load(y_chan + c * y_chan_stride), v_inv));
-
-        // Partial last block: exp values were already computed with temperature
-        // in pass 2, just multiply by inverse sum.
+            v_store(y_chan + c * stride,
+                    v_mul(v_load(y_chan + c * stride), v_inv));
         }
         if (valid_lanes < pack) {
-            T* last_y = y_chan + (D - 1) * y_chan_stride;
+            T* last_y = y_chan + (D - 1) * stride;
             for (int64_t l = 0; l < valid_lanes; ++l) {
                 float ev = s_load(&last_y[l]);
                 float inv = lane_val(v_inv, l);
@@ -233,6 +178,8 @@ inline void softmax_process_packed_channel(
 
 
 /// Standard SIMD fast path: contiguous tail, pack == 1.
+/// Uses horizontal SIMD reduction (v_reduce_max / v_reduce_sum),
+/// not per-lane SIMD — structurally different from softmax_per_lane.
 template <typename T>
 inline void softmax_process_standard_row(
     const T* x, T* y,
@@ -312,73 +259,6 @@ inline void softmax_process_standard_row(
         }
         for (; i < D; ++i) {
             s_store(&y[i], s_load(&y[i]) / sum_exp);
-        }
-    }
-}
-
-/// Strided-axis SIMD softmax for planar layouts (axis != rank-1, pack == 1).
-///
-/// Processes `simd_lane_for<T>` contiguous inner positions as a group. Each SIMD
-/// lane is an independent 3-pass softmax over D strided elements. The stride
-/// between consecutive axis elements is `axis_stride`.
-///
-/// This is the SIMD replacement for the scalar loop in softmax_general_scalar.
-/// The caller groups inner_total positions into L-sized chunks and calls this
-/// function for each chunk. The L positions must be contiguous in memory
-/// (i.e. the tensor must be densely packed with no pitch padding).
-///
-/// Example: for a [N, C, H, W] tensor with axis=0 and no pitch padding,
-/// each call processes 8 spatial positions from the C*H*W inner pool,
-/// each doing an independent softmax over N strided values.
-///
-/// Algorithm: standard 3-pass (max → exp+sum → normalize), same as the
-/// contiguous-row and packed-channel paths, but with strided access along
-/// the axis dimension.
-template <typename T>
-inline void softmax_process_strided_axis(
-    const T* x, T* y,
-    int64_t axis_stride, int64_t D,
-    bool log_softmax, float inv_T)
-{
-    constexpr int L = simd_lane_for<T>;
-
-    auto v_inv_T = v_set1(x, inv_T);
-
-    // ---- Pass 1: per-lane max (temperature doesn't affect max) ----
-    auto v_max_vec = v_set1(x, -std::numeric_limits<float>::infinity());
-    for (int64_t k = 0; k < D; ++k) {
-        v_max_vec = v_max(v_max_vec, v_load(x + k * axis_stride));
-    }
-
-    // ---- Pass 2: exp((x - max) / T) + per-lane sum ----
-    auto v_sum = v_zero(x);
-    auto v_neg_max = v_neg(v_max_vec);
-    for (int64_t k = 0; k < D; ++k) {
-        auto v = v_add(v_load(x + k * axis_stride), v_neg_max);
-        if (inv_T != 1.0f) {
-            v = v_mul(v, v_inv_T);
-        }
-        v = v_exp(v);
-        if (!log_softmax) {
-            v_store(y + k * axis_stride, v);
-        }
-        v_sum = v_add(v_sum, v);
-    }
-
-    // ---- Pass 3: normalize ----
-    if (log_softmax) {
-        // log_softmax = (x - max) / T - log(sum)
-        //             = x * inv_T - max * inv_T - log(sum)
-        auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum));
-        for (int64_t k = 0; k < D; ++k) {
-            v_store(y + k * axis_stride,
-                    v_add(v_mul(v_load(x + k * axis_stride), v_inv_T), v_bias));
-        }
-    } else {
-        auto v_inv = v_div(v_set1(x, 1.0f), v_sum);
-        for (int64_t k = 0; k < D; ++k) {
-            v_store(y + k * axis_stride,
-                    v_mul(v_load(y + k * axis_stride), v_inv));
         }
     }
 }

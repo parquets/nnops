@@ -87,38 +87,42 @@ void softmax_general(
     const auto process_row = [&](int64_t outer) {
         int64_t base = outer * D * axis_stride;
 
+        // Scalar softmax over D strided axis elements starting at inner_off
+        const auto scalar_softmax = [&](int64_t inner_off) {
+            float max_val = -std::numeric_limits<float>::infinity();
+            for (int64_t k = 0; k < D; ++k) {
+                float v = s_load(&x_ptr[base + inner_off + k * axis_stride]);
+                if (v > max_val) { max_val = v; }
+            }
+            float sum_exp = 0.0f;
+            for (int64_t k = 0; k < D; ++k) {
+                sum_exp += std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T);
+            }
+            if (log_softmax) {
+                float log_sum = std::log(sum_exp);
+                for (int64_t k = 0; k < D; ++k) {
+                    float val = (s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T - log_sum;
+                    s_store(&y_ptr[base + inner_off + k * axis_stride], val);
+                }
+            } else {
+                float inv_sum = 1.0f / sum_exp;
+                for (int64_t k = 0; k < D; ++k) {
+                    float val = std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T) * inv_sum;
+                    s_store(&y_ptr[base + inner_off + k * axis_stride], val);
+                }
+            }
+        };
+
         if (dense) {
             // ---- SIMD path: process inner_total in groups of L ----
             int64_t s = 0;
             for (; s + L <= inner_total; s += L) {
-                kernel::softmax_process_strided_axis<T>(
+                kernel::softmax_per_lane<T>(
                     x_ptr + base + s, y_ptr + base + s,
-                    axis_stride, D, log_softmax, inv_T);
+                    D, axis_stride, log_softmax, inv_T);
             }
-            // Scalar tail for remaining inner positions
             for (; s < inner_total; ++s) {
-                float max_val = -std::numeric_limits<float>::infinity();
-                for (int64_t k = 0; k < D; ++k) {
-                    float v = s_load(&x_ptr[base + s + k * axis_stride]);
-                    if (v > max_val) { max_val = v; }
-                }
-                float sum_exp = 0.0f;
-                for (int64_t k = 0; k < D; ++k) {
-                    sum_exp += std::exp((s_load(&x_ptr[base + s + k * axis_stride]) - max_val) * inv_T);
-                }
-                if (log_softmax) {
-                    float log_sum = std::log(sum_exp);
-                    for (int64_t k = 0; k < D; ++k) {
-                        float val = (s_load(&x_ptr[base + s + k * axis_stride]) - max_val) * inv_T - log_sum;
-                        s_store(&y_ptr[base + s + k * axis_stride], val);
-                    }
-                } else {
-                    float inv_sum = 1.0f / sum_exp;
-                    for (int64_t k = 0; k < D; ++k) {
-                        float val = std::exp((s_load(&x_ptr[base + s + k * axis_stride]) - max_val) * inv_T) * inv_sum;
-                        s_store(&y_ptr[base + s + k * axis_stride], val);
-                    }
-                }
+                scalar_softmax(s);
             }
         } else {
             // ---- Pitch-padded fallback: scalar with precomputed offsets ----
@@ -134,30 +138,7 @@ void softmax_general(
             }
 
             for (int64_t s = 0; s < inner_total; ++s) {
-                int64_t inner_off = inner_offsets[static_cast<size_t>(s)];
-
-                float max_val = -std::numeric_limits<float>::infinity();
-                for (int64_t k = 0; k < D; ++k) {
-                    float v = s_load(&x_ptr[base + inner_off + k * axis_stride]);
-                    if (v > max_val) { max_val = v; }
-                }
-                float sum_exp = 0.0f;
-                for (int64_t k = 0; k < D; ++k) {
-                    sum_exp += std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T);
-                }
-                if (log_softmax) {
-                    float log_sum = std::log(sum_exp);
-                    for (int64_t k = 0; k < D; ++k) {
-                        float val = (s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T - log_sum;
-                        s_store(&y_ptr[base + inner_off + k * axis_stride], val);
-                    }
-                } else {
-                    float inv_sum = 1.0f / sum_exp;
-                    for (int64_t k = 0; k < D; ++k) {
-                        float val = std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T) * inv_sum;
-                        s_store(&y_ptr[base + inner_off + k * axis_stride], val);
-                    }
-                }
+                scalar_softmax(inner_offsets[static_cast<size_t>(s)]);
             }
         }
     };
@@ -216,7 +197,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         const int64_t y_rs = output.row_stride_elems();
 
         const auto process_row = [&](int64_t r) {
-            kernel::softmax_process_packed_row<T>(
+            kernel::softmax_per_lane<T>(
                 x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax, inv_T);
         };
 
@@ -264,7 +245,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
             }
             kernel::softmax_process_packed_channel<T>(
                 x_ptr + off, y_ptr + off,
-                chan_stride, chan_stride,
+                chan_stride,
                 C8, pack, valid_lanes, log_softmax, inv_T);
         };
 
@@ -307,10 +288,9 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 off += (rem % dim) * X.stride_elems(d);
                 rem /= dim;
             }
-            kernel::softmax_process_packed_col<T>(
+            kernel::softmax_per_lane<T>(
                 x_ptr + off, y_ptr + off,
-                axis_stride, axis_stride,
-                D, pack, log_softmax, inv_T);
+                D, axis_stride, log_softmax, inv_T);
         };
 
         if (ctx.cpu_parallel_for) {

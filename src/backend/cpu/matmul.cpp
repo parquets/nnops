@@ -367,55 +367,55 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& b_desc,
                                  const TensorDesc& /*c_desc*/)
 {
-    int64_t a_rank = a_desc.rank;
-    int64_t b_rank = b_desc.rank;
-    // M = rows of A in its logical (non-transposed) layout
-    // N = cols of B in its logical (non-transposed) layout
-    int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
-                                  : a_desc.dims[static_cast<size_t>(a_rank - 2)];
-    int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
-                                  : b_desc.dims[static_cast<size_t>(b_rank - 1)];
+    // int64_t a_rank = a_desc.rank;
+    // int64_t b_rank = b_desc.rank;
+    // // M = rows of A in its logical (non-transposed) layout
+    // // N = cols of B in its logical (non-transposed) layout
+    // int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
+    //                               : a_desc.dims[static_cast<size_t>(a_rank - 2)];
+    // int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
+    //                               : b_desc.dims[static_cast<size_t>(b_rank - 1)];
 
-    size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
+    // size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
 
-    auto dtype_a = a_desc.dtype;
-    auto dtype_b = b_desc.dtype;
+    // auto dtype_a = a_desc.dtype;
+    // auto dtype_b = b_desc.dtype;
 
-    // ---- f16 ----------------------------------------------------------
-    if (dtype_a == DataType::f16 && dtype_b == DataType::f16) {
-        int nc = round_down_nc(compute_nc(MR_MAX_F16, KC_F16, 2, l2_size), NR_MAX_F16);
-        int mc = std::min(MC_TARGET, static_cast<int>(M));
-        nc = std::min(nc, static_cast<int>(N));
-        return workspace_bytes(mc, nc, KC_F16, 2);
-    }
+    // // ---- f16 ----------------------------------------------------------
+    // if (dtype_a == DataType::f16 && dtype_b == DataType::f16) {
+    //     int nc = round_down_nc(compute_nc(MR_MAX_F16, KC_F16, 2, l2_size), NR_MAX_F16);
+    //     int mc = std::min(MC_TARGET, static_cast<int>(M));
+    //     nc = std::min(nc, static_cast<int>(N));
+    //     return workspace_bytes(mc, nc, KC_F16, 2);
+    // }
 
-    // ---- f32 ----------------------------------------------------------
-    if (dtype_a == DataType::f32 && dtype_b == DataType::f32) {
-        int nc = round_down_nc(compute_nc(MR_MAX_F32, KC_F32, 4, l2_size), NR_MAX_F32);
-        int mc = std::min(MC_TARGET, static_cast<int>(M));
-        nc = std::min(nc, static_cast<int>(N));
-        return workspace_bytes(mc, nc, KC_F32, 4);
-    }
+    // // ---- f32 ----------------------------------------------------------
+    // if (dtype_a == DataType::f32 && dtype_b == DataType::f32) {
+    //     int nc = round_down_nc(compute_nc(MR_MAX_F32, KC_F32, 4, l2_size), NR_MAX_F32);
+    //     int mc = std::min(MC_TARGET, static_cast<int>(M));
+    //     nc = std::min(nc, static_cast<int>(N));
+    //     return workspace_bytes(mc, nc, KC_F32, 4);
+    // }
 
-    // ---- int8 variants (u8×s8, i8×s8) ---------------------------------
-    if ((dtype_a == DataType::u8 || dtype_a == DataType::s8) && dtype_b == DataType::s8) {
-        // Placeholder: use MR_MAX_I8 / NR_MAX_I8 until SIMD kernels define real panels.
-        int nc = round_down_nc(compute_nc(MR_MAX_I8, KC_I8, 1, l2_size), NR_MAX_I8);
-        int mc = std::min(MC_TARGET, static_cast<int>(M));
-        nc = std::min(nc, static_cast<int>(N));
-        return workspace_bytes(mc, nc, KC_I8, 1);  // 1 byte per element
-    }
+    // // ---- int8 variants (u8×s8, i8×s8) ---------------------------------
+    // if ((dtype_a == DataType::u8 || dtype_a == DataType::s8) && dtype_b == DataType::s8) {
+    //     // Placeholder: use MR_MAX_I8 / NR_MAX_I8 until SIMD kernels define real panels.
+    //     int nc = round_down_nc(compute_nc(MR_MAX_I8, KC_I8, 1, l2_size), NR_MAX_I8);
+    //     int mc = std::min(MC_TARGET, static_cast<int>(M));
+    //     nc = std::min(nc, static_cast<int>(N));
+    //     return workspace_bytes(mc, nc, KC_I8, 1);  // 1 byte per element
+    // }
 
-    // ---- fp16×int4 (future) ------------------------------------------
-    if (dtype_a == DataType::f16 && dtype_b == DataType::s8) {
-        // s4 weights are packed 2× per s8 byte — placeholder sizing.
-        int nc = round_down_nc(compute_nc(MR_MAX_F16I4, KC_F16I4, 2, l2_size), NR_MAX_F16I4);
-        int mc = std::min(MC_TARGET, static_cast<int>(M));
-        nc = std::min(nc, static_cast<int>(N));
-        return workspace_bytes(mc, nc, KC_F16I4, 2);  // fp16 = 2 bytes per element
-    }
+    // // ---- fp16×int4 (future) ------------------------------------------
+    // if (dtype_a == DataType::f16 && dtype_b == DataType::s8) {
+    //     // s4 weights are packed 2× per s8 byte — placeholder sizing.
+    //     int nc = round_down_nc(compute_nc(MR_MAX_F16I4, KC_F16I4, 2, l2_size), NR_MAX_F16I4);
+    //     int mc = std::min(MC_TARGET, static_cast<int>(M));
+    //     nc = std::min(nc, static_cast<int>(N));
+    //     return workspace_bytes(mc, nc, KC_F16I4, 2);  // fp16 = 2 bytes per element
+    // }
 
-    // ---- unsupported combination — fallback won't pack, just return minimal ----
+    // // ---- unsupported combination — fallback won't pack, just return minimal ----
     return 0;
 }
 
