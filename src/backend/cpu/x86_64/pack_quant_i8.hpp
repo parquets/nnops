@@ -87,15 +87,13 @@ inline __m256i narrow_32i32_to_i8(__m256i i0, __m256i i1, __m256i i2, __m256i i3
 //  LHS pack + quantize  (f32 → i8, per-row scale/zero_point)
 //
 //  Each row is quantized independently with its own scale/zero_point
-//  (broadcast across all K elements).  K step = 8 (AVX2 __m256).
+//  (broadcast across all K elements).  K step = 4 (SSE __m128) to keep
+//  register pressure low — each row produces 4 int8 = 1 int32 per step.
 //  Quantization: round(src * inv_scale) + zero_point.
-//  After narrowing,
 //  4 consecutive K values from the SAME row are packed into each int32,
 //  matching the VNNI dp4a interleaved format:
 //    out_i32[0] = [q(r0_k0), q(r0_k1), q(r0_k2), q(r0_k3)]
 //    out_i32[1] = [q(r1_k0), q(r1_k1), q(r1_k2), q(r1_k3)]
-//    ...
-//    out_i32[N] = [q(r0_k4), q(r0_k5), q(r0_k6), q(r0_k7)]
 //    ...
 // =========================================================================
 
@@ -112,34 +110,14 @@ inline void pack_quant_trans_n1_i8(void* NNOPS_RESTRICT output,
     int32_t* NNOPS_RESTRICT out_i32 = static_cast<int32_t*>(output);
     const float inv_scale = 1.0f / scale[0];
     const int32_t zp = (zero == nullptr) ? 0 : zero[0];
-    const __m256i v_zp = _mm256_set1_epi32(zp);
-    const __m128i v_zp128 = _mm_set1_epi32(zp);
+    const __m128i v_zp = _mm_set1_epi32(zp);
 
     int k = 0;
-    for (; k <= K - 8; k += 8) {
-        __m256 v = _mm256_loadu_ps(input);
-        __m256 v_s = _mm256_set1_ps(inv_scale);
-        __m256i qi = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_s));
-        qi = _mm256_add_epi32(qi, v_zp);
-
-        __m128i lo = _mm256_castsi256_si128(qi);
-        __m128i hi = _mm256_extracti128_si256(qi, 1);
-        __m128i i16 = _mm_packs_epi32(lo, hi);
-        __m128i i8;
-        if constexpr (Q_U8) {
-            i8 = _mm_packus_epi16(i16, _mm_setzero_si128());
-        } else {
-            i8 = _mm_packs_epi16(i16, _mm_setzero_si128());
-        }
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out_i32), i8);
-        out_i32 += 2;
-        input += 8;
-    }
     for (; k <= K - 4; k += 4) {
         __m128 v = _mm_loadu_ps(input);
         __m128 v_s = _mm_set1_ps(inv_scale);
         __m128i qi = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
-        qi = _mm_add_epi32(qi, v_zp128);
+        qi = _mm_add_epi32(qi, v_zp);
         __m128i i16 = _mm_packs_epi32(qi, _mm_setzero_si128());
         __m128i i8;
         if constexpr (Q_U8) {
@@ -184,47 +162,8 @@ inline void pack_quant_trans_n4_i8(void* NNOPS_RESTRICT output,
     }
 
     int k = 0;
-    for (; k <= K - 8; k += 8) {
-        const float* NNOPS_RESTRICT p[4];
-        for (int i = 0; i < 4; ++i) p[i] = input + i * ir_step;
-
-        // Quantize each row: round(f32 * inv_scale) + zero_point
-        __m256i qi[4];
-        for (int i = 0; i < 4; ++i) {
-            __m256 v = _mm256_loadu_ps(p[i]);
-            __m256 v_s = _mm256_set1_ps(inv_s[i]);
-            qi[i] = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_s));
-            qi[i] = _mm256_add_epi32(qi[i], _mm256_set1_epi32(zp[i]));
-        }
-
-        // Narrow each row: 8 int32 → 8 int8 (lower 8 bytes of __m128i)
-        __m128i r[4];
-        for (int i = 0; i < 4; ++i) {
-            __m128i lo = _mm256_castsi256_si128(qi[i]);
-            __m128i hi = _mm256_extracti128_si256(qi[i], 1);
-            __m128i i16 = _mm_packs_epi32(lo, hi);
-            if constexpr (Q_U8) {
-                r[i] = _mm_packus_epi16(i16, _mm_setzero_si128());
-            } else {
-                r[i] = _mm_packs_epi16(i16, _mm_setzero_si128());
-            }
-        }
-        // r[i] = [q_k0, q_k1, q_k2, q_k3, q_k4, q_k5, q_k6, q_k7, 0, ...]
-
-        // Interleave: group 0 (K=0..3) for all rows, then group 1 (K=4..7)
-        __m128i r01_lo = _mm_unpacklo_epi32(r[0], r[1]);
-        __m128i r23_lo = _mm_unpacklo_epi32(r[2], r[3]);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 0),
-                         _mm_unpacklo_epi64(r01_lo, r23_lo));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 4),
-                         _mm_unpackhi_epi64(r01_lo, r23_lo));
-
-        out_i32 += 8;
-        input += 8;
-    }
-
-    // 4-wide tail: 4 f32 per row → 1 int32 per row
     for (; k <= K - 4; k += 4) {
+        // Quantize 4 rows, each producing 4 int32 → 4 int8 = 1 int32
         __m128i qi[4];
         for (int i = 0; i < 4; ++i) {
             __m128 v = _mm_loadu_ps(input + i * ir_step);
@@ -232,6 +171,7 @@ inline void pack_quant_trans_n4_i8(void* NNOPS_RESTRICT output,
             qi[i] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
             qi[i] = _mm_add_epi32(qi[i], _mm_set1_epi32(zp[i]));
         }
+        // Pack 4 rows: 4×4 int32 → 16 int8 → 4 int32
         __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
         __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
         __m128i i8;
@@ -277,58 +217,36 @@ inline void pack_quant_trans_n6_i8(void* NNOPS_RESTRICT output,
     }
 
     int k = 0;
-    for (; k <= K - 8; k += 8) {
-        const float* NNOPS_RESTRICT p[6];
-        for (int i = 0; i < 6; ++i) p[i] = input + i * ir_step;
-
-        __m256i qi[6];
-        for (int i = 0; i < 6; ++i) {
-            __m256 v = _mm256_loadu_ps(p[i]);
-            __m256 v_s = _mm256_set1_ps(inv_s[i]);
-            qi[i] = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_s));
-            qi[i] = _mm256_add_epi32(qi[i], _mm256_set1_epi32(zp[i]));
-        }
-
-        __m128i r[6];
-        for (int i = 0; i < 6; ++i) {
-            __m128i lo = _mm256_castsi256_si128(qi[i]);
-            __m128i hi = _mm256_extracti128_si256(qi[i], 1);
-            __m128i i16 = _mm_packs_epi32(lo, hi);
-            if constexpr (Q_U8) {
-                r[i] = _mm_packus_epi16(i16, _mm_setzero_si128());
-            } else {
-                r[i] = _mm_packs_epi16(i16, _mm_setzero_si128());
-            }
-        }
-
-        __m128i r01 = _mm_unpacklo_epi32(r[0], r[1]);
-        __m128i r23 = _mm_unpacklo_epi32(r[2], r[3]);
-        __m128i r45 = _mm_unpacklo_epi32(r[4], r[5]);
-
-        // Group 0 (K=0..3): rows 0-5
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 0),
-                         _mm_unpacklo_epi64(r01, r23));  // rows 0-3
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out_i32 + 4), r45);  // rows 4-5
-
-        // Group 1 (K=4..7): rows 0-5
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 6),
-                         _mm_unpackhi_epi64(r01, r23));  // rows 0-3
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out_i32 + 10),
-                         _mm_unpackhi_epi64(r45, r45));  // rows 4-5
-
-        out_i32 += 12;
-        input += 8;
-    }
-
     for (; k <= K - 4; k += 4) {
-        int8_t* out_i8 = reinterpret_cast<int8_t*>(out_i32);
+        // Quantize 6 rows
+        __m128i qi[6];
         for (int i = 0; i < 6; ++i) {
-            float qval = input[i * ir_step] * inv_s[i];
-            int32_t qi = static_cast<int32_t>(std::nearbyintf(qval)) + zp[i];
-            out_i8[i] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
+            __m128 v = _mm_loadu_ps(input + i * ir_step);
+            __m128 v_s = _mm_set1_ps(inv_s[i]);
+            qi[i] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
+            qi[i] = _mm_add_epi32(qi[i], _mm_set1_epi32(zp[i]));
         }
-        out_i32++;
-        input += 1;
+        // Rows 0-3: pack to 4 int32
+        __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
+        __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
+        __m128i i8_03;
+        if constexpr (Q_U8) {
+            i8_03 = _mm_packus_epi16(i16_01, i16_23);
+        } else {
+            i8_03 = _mm_packs_epi16(i16_01, i16_23);
+        }
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32), i8_03);
+        // Rows 4-5: pack to 2 int32
+        __m128i i16_45 = _mm_packs_epi32(qi[4], qi[5]);
+        __m128i i8_45;
+        if constexpr (Q_U8) {
+            i8_45 = _mm_packus_epi16(i16_45, _mm_setzero_si128());
+        } else {
+            i8_45 = _mm_packs_epi16(i16_45, _mm_setzero_si128());
+        }
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out_i32 + 4), i8_45);
+        out_i32 += 6;
+        input += 4;
     }
 
     for (; k < K; ++k) {
@@ -363,60 +281,29 @@ inline void pack_quant_trans_n8_i8(void* NNOPS_RESTRICT output,
     }
 
     int k = 0;
-    for (; k <= K - 8; k += 8) {
-        const float* NNOPS_RESTRICT p[8];
-        for (int i = 0; i < 8; ++i) p[i] = input + i * ir_step;
-
-        __m256i qi[8];
-        for (int i = 0; i < 8; ++i) {
-            __m256 v = _mm256_loadu_ps(p[i]);
-            __m256 v_s = _mm256_set1_ps(inv_s[i]);
-            qi[i] = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_s));
-            qi[i] = _mm256_add_epi32(qi[i], _mm256_set1_epi32(zp[i]));
-        }
-
-        __m128i r[8];
-        for (int i = 0; i < 8; ++i) {
-            __m128i lo = _mm256_castsi256_si128(qi[i]);
-            __m128i hi = _mm256_extracti128_si256(qi[i], 1);
-            __m128i i16 = _mm_packs_epi32(lo, hi);
-            if constexpr (Q_U8) {
-                r[i] = _mm_packus_epi16(i16, _mm_setzero_si128());
-            } else {
-                r[i] = _mm_packs_epi16(i16, _mm_setzero_si128());
-            }
-        }
-
-        __m128i r01_0 = _mm_unpacklo_epi32(r[0], r[1]);
-        __m128i r23_0 = _mm_unpacklo_epi32(r[2], r[3]);
-        __m128i r01_1 = _mm_unpacklo_epi32(r[4], r[5]);
-        __m128i r23_1 = _mm_unpacklo_epi32(r[6], r[7]);
-
-        // Group 0 (K=0..3): rows 0-7
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 0),
-                         _mm_unpacklo_epi64(r01_0, r23_0));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 4),
-                         _mm_unpacklo_epi64(r01_1, r23_1));
-
-        // Group 1 (K=4..7): rows 0-7
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 8),
-                         _mm_unpackhi_epi64(r01_0, r23_0));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 12),
-                         _mm_unpackhi_epi64(r01_1, r23_1));
-
-        out_i32 += 16;
-        input += 8;
-    }
-
     for (; k <= K - 4; k += 4) {
-        int8_t* out_i8 = reinterpret_cast<int8_t*>(out_i32);
-        for (int i = 0; i < 8; ++i) {
-            float qval = input[i * ir_step] * inv_s[i];
-            int32_t qi = static_cast<int32_t>(std::nearbyintf(qval)) + zp[i];
-            out_i8[i] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
+        // Process in 2 groups of 4 rows to keep register pressure low
+        for (int g = 0; g < 2; ++g) {
+            __m128i qi[4];
+            for (int j = 0; j < 4; ++j) {
+                int i = g * 4 + j;
+                __m128 v = _mm_loadu_ps(input + i * ir_step);
+                __m128 v_s = _mm_set1_ps(inv_s[i]);
+                qi[j] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
+                qi[j] = _mm_add_epi32(qi[j], _mm_set1_epi32(zp[i]));
+            }
+            __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
+            __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
+            __m128i i8;
+            if constexpr (Q_U8) {
+                i8 = _mm_packus_epi16(i16_01, i16_23);
+            } else {
+                i8 = _mm_packs_epi16(i16_01, i16_23);
+            }
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + g * 4), i8);
         }
-        out_i32++;
-        input += 1;
+        out_i32 += 8;
+        input += 4;
     }
 
     for (; k < K; ++k) {
@@ -451,61 +338,29 @@ inline void pack_quant_trans_n12_i8(void* NNOPS_RESTRICT output,
     }
 
     int k = 0;
-    for (; k <= K - 8; k += 8) {
-        const float* NNOPS_RESTRICT p[12];
-        for (int i = 0; i < 12; ++i) p[i] = input + i * ir_step;
-
-        __m256i qi[12];
-        for (int i = 0; i < 12; ++i) {
-            __m256 v = _mm256_loadu_ps(p[i]);
-            __m256 v_s = _mm256_set1_ps(inv_s[i]);
-            qi[i] = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_s));
-            qi[i] = _mm256_add_epi32(qi[i], _mm256_set1_epi32(zp[i]));
-        }
-
-        __m128i r[12];
-        for (int i = 0; i < 12; ++i) {
-            __m128i lo = _mm256_castsi256_si128(qi[i]);
-            __m128i hi = _mm256_extracti128_si256(qi[i], 1);
-            __m128i i16 = _mm_packs_epi32(lo, hi);
-            if constexpr (Q_U8) {
-                r[i] = _mm_packus_epi16(i16, _mm_setzero_si128());
-            } else {
-                r[i] = _mm_packs_epi16(i16, _mm_setzero_si128());
-            }
-        }
-
-        __m128i r01[3], r23[3];
-        for (int g = 0; g < 3; ++g) {
-            r01[g] = _mm_unpacklo_epi32(r[g * 4 + 0], r[g * 4 + 1]);
-            r23[g] = _mm_unpacklo_epi32(r[g * 4 + 2], r[g * 4 + 3]);
-        }
-
-        // Group 0 (K=0..3): rows 0-11
-        for (int g = 0; g < 3; ++g) {
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + g * 4),
-                             _mm_unpacklo_epi64(r01[g], r23[g]));
-        }
-
-        // Group 1 (K=4..7): rows 0-11
-        for (int g = 0; g < 3; ++g) {
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 12 + g * 4),
-                             _mm_unpackhi_epi64(r01[g], r23[g]));
-        }
-
-        out_i32 += 24;
-        input += 8;
-    }
-
     for (; k <= K - 4; k += 4) {
-        int8_t* out_i8 = reinterpret_cast<int8_t*>(out_i32);
-        for (int i = 0; i < 12; ++i) {
-            float qval = input[i * ir_step] * inv_s[i];
-            int32_t qi = static_cast<int32_t>(std::nearbyintf(qval)) + zp[i];
-            out_i8[i] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
+        // Process in 3 groups of 4 rows
+        for (int g = 0; g < 3; ++g) {
+            __m128i qi[4];
+            for (int j = 0; j < 4; ++j) {
+                int i = g * 4 + j;
+                __m128 v = _mm_loadu_ps(input + i * ir_step);
+                __m128 v_s = _mm_set1_ps(inv_s[i]);
+                qi[j] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
+                qi[j] = _mm_add_epi32(qi[j], _mm_set1_epi32(zp[i]));
+            }
+            __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
+            __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
+            __m128i i8;
+            if constexpr (Q_U8) {
+                i8 = _mm_packus_epi16(i16_01, i16_23);
+            } else {
+                i8 = _mm_packs_epi16(i16_01, i16_23);
+            }
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + g * 4), i8);
         }
-        out_i32++;
-        input += 1;
+        out_i32 += 12;
+        input += 4;
     }
 
     for (; k < K; ++k) {
@@ -540,61 +395,29 @@ inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
     }
 
     int k = 0;
-    for (; k <= K - 8; k += 8) {
-        const float* NNOPS_RESTRICT p[16];
-        for (int i = 0; i < 16; ++i) p[i] = input + i * ir_step;
-
-        __m256i qi[16];
-        for (int i = 0; i < 16; ++i) {
-            __m256 v = _mm256_loadu_ps(p[i]);
-            __m256 v_s = _mm256_set1_ps(inv_s[i]);
-            qi[i] = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_s));
-            qi[i] = _mm256_add_epi32(qi[i], _mm256_set1_epi32(zp[i]));
-        }
-
-        __m128i r[16];
-        for (int i = 0; i < 16; ++i) {
-            __m128i lo = _mm256_castsi256_si128(qi[i]);
-            __m128i hi = _mm256_extracti128_si256(qi[i], 1);
-            __m128i i16 = _mm_packs_epi32(lo, hi);
-            if constexpr (Q_U8) {
-                r[i] = _mm_packus_epi16(i16, _mm_setzero_si128());
-            } else {
-                r[i] = _mm_packs_epi16(i16, _mm_setzero_si128());
-            }
-        }
-
-        __m128i r01[4], r23[4];
-        for (int g = 0; g < 4; ++g) {
-            r01[g] = _mm_unpacklo_epi32(r[g * 4 + 0], r[g * 4 + 1]);
-            r23[g] = _mm_unpacklo_epi32(r[g * 4 + 2], r[g * 4 + 3]);
-        }
-
-        // Group 0 (K=0..3): rows 0-15
-        for (int g = 0; g < 4; ++g) {
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + g * 4),
-                             _mm_unpacklo_epi64(r01[g], r23[g]));
-        }
-
-        // Group 1 (K=4..7): rows 0-15
-        for (int g = 0; g < 4; ++g) {
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + 16 + g * 4),
-                             _mm_unpackhi_epi64(r01[g], r23[g]));
-        }
-
-        out_i32 += 32;
-        input += 8;
-    }
-
     for (; k <= K - 4; k += 4) {
-        int8_t* out_i8 = reinterpret_cast<int8_t*>(out_i32);
-        for (int i = 0; i < 16; ++i) {
-            float qval = input[i * ir_step] * inv_s[i];
-            int32_t qi = static_cast<int32_t>(std::nearbyintf(qval)) + zp[i];
-            out_i8[i] = static_cast<int8_t>(std::min(std::max(qi, qmin), qmax));
+        // Process in 4 groups of 4 rows
+        for (int g = 0; g < 4; ++g) {
+            __m128i qi[4];
+            for (int j = 0; j < 4; ++j) {
+                int i = g * 4 + j;
+                __m128 v = _mm_loadu_ps(input + i * ir_step);
+                __m128 v_s = _mm_set1_ps(inv_s[i]);
+                qi[j] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
+                qi[j] = _mm_add_epi32(qi[j], _mm_set1_epi32(zp[i]));
+            }
+            __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
+            __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
+            __m128i i8;
+            if constexpr (Q_U8) {
+                i8 = _mm_packus_epi16(i16_01, i16_23);
+            } else {
+                i8 = _mm_packs_epi16(i16_01, i16_23);
+            }
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32 + g * 4), i8);
         }
-        out_i32++;
-        input += 1;
+        out_i32 += 16;
+        input += 4;
     }
 
     for (; k < K; ++k) {
