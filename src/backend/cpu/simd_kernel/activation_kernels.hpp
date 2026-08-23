@@ -3,7 +3,7 @@
 /// @brief Shared SIMD activation kernels — pure per-vector math, no I/O.
 ///
 /// Used by both the standalone Activation operator and the epilogue fusion
-/// path (epilogue_impl.hpp). Each kernel takes an input vector and
+/// path (simd_epilogue.hpp). Each kernel takes an input vector and
 /// pre-computed constant vectors, returns the result vector.
 ///
 /// All kernels use min/max decomposition for conditional activation types

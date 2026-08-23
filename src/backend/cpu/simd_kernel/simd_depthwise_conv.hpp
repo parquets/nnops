@@ -14,7 +14,7 @@
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
-#include "../epilogue_impl.hpp"
+#include "simd_epilogue.hpp"
 #include "simd_quant.hpp"
 
 #include <cstdint>

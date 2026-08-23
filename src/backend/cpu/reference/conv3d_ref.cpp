@@ -6,7 +6,7 @@
 
 #include "nnops/ops/conv3d.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "../epilogue_impl.hpp"
+#include "../simd_kernel/simd_epilogue.hpp"
 
 namespace nnops::backend::cpu::reference {
 

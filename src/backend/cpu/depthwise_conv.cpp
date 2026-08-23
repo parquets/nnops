@@ -23,7 +23,7 @@
 #include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_depthwise_conv.hpp"
-#include "epilogue_impl.hpp"
+#include "simd_kernel/simd_epilogue.hpp"
 
 #include <cstdint>
 #include <type_traits>

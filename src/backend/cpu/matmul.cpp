@@ -1,5 +1,5 @@
 /// @file matmul.cpp
-/// @brief Tiled matrix multiplication kernel — NKM loop with imatmul pack + MMA.
+/// @brief Tiled matrix multiplication kernel — NKM loop with matmul_helper pack + MMA.
 ///
 /// Determines tile sizes Mc, Nc from the L2 cache constraint:
 ///   (mr × Kc + Nc × Kc + mr × Nc) × 2 × elem_size < L2_SIZE
@@ -7,8 +7,8 @@
 /// is in the L2 working set during MMA).
 
 #include "matmul.h"
-#include "matmul_impl.h"
-#include "epilogue_impl.hpp"
+#include "matmul_helper.h"
+#include "simd_kernel/simd_epilogue.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/assert.hpp"
@@ -31,7 +31,7 @@ extern void matmul_ref(const MatMulAttributes& attrs,
 // =========================================================================
 //  Panel-size compile-time constants from the active arch namespace.
 // =========================================================================
-// These come from imatmul.h — arch::mr_f32 / arch::nr_f32 etc. are
+// These come from matmul_helper.h — arch::mr_f32 / arch::nr_f32 etc. are
 // defined in the arch-specific pack_f32.hpp / pack_f16.hpp headers and
 // exposed through the `arch` namespace alias.
 
@@ -55,7 +55,7 @@ constexpr int KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 constexpr int MC_TARGET = 192;  // 192/6=32 (x86), 192/8=24 (aarch64)
 
 // Placeholder max panel sizes for integer kernels (no SIMD kernels yet).
-// MR_MAX_F32 / NR_MAX_F32 / MR_MAX_F16 / NR_MAX_F16 are in imatmul.h.
+// MR_MAX_F32 / NR_MAX_F32 / MR_MAX_F16 / NR_MAX_F16 are in matmul_helper.h.
 constexpr int MR_MAX_I8    = 4;
 constexpr int NR_MAX_I8    = 4;
 constexpr int MR_MAX_F16I4 = 4;
@@ -106,12 +106,12 @@ inline size_t workspace_bytes(int mc, int nc, int mr_max, int nr_max,
 //  Used for non-transposed cases.  Takes raw pointers for batch reuse.
 // =========================================================================
 template <typename T>
-void matmul_kernel_2d_direct(const MatMulAttributes& attrs,
+void matmul_kernel_2d_direct_flt(const MatMulAttributes& attrs,
                              T* c_ptr, int ldc,
                              const T* a_ptr, int lda,
                              const T* b_ptr, int ldb,
                              int M, int N, int K,
-                             int kc, int mr_max, int nr_max)
+                             int kc, int clamp_min, int clamp_max)
 {
     // ---- Clamp for epilogue ----
     float clamp_min = -std::numeric_limits<float>::infinity();
@@ -120,21 +120,8 @@ void matmul_kernel_2d_direct(const MatMulAttributes& attrs,
         clamp_min = 0.0f;
     }
 
-    // ---- Beta: pre-scale C (MMA accumulates: C += A×B) ----
-    if (attrs.beta == 0.0f) {
-        for (int i = 0; i < M; ++i) {
-            for (int j = 0; j < N; ++j) {
-                c_ptr[i * ldc + j] = T(0);
-            }
-        }
-    } else if (attrs.beta != 1.0f) {
-        for (int i = 0; i < M; ++i) {
-            for (int j = 0; j < N; ++j) {
-                float val = s_load(&c_ptr[i * ldc + j]) * attrs.beta;
-                s_store(&c_ptr[i * ldc + j], val);
-            }
-        }
-    }
+    constexpr int mr_max = mr_max_flt<T>();
+    constexpr int nr_max = nr_max_flt<T>();
 
     // ---- Compute tile sizes ----
     int mc = std::min(MC_TARGET, M);
@@ -142,7 +129,11 @@ void matmul_kernel_2d_direct(const MatMulAttributes& attrs,
     int nc = round_down_nc(compute_nc(mr_max, kc, static_cast<int>(sizeof(T)), l2_size), nr_max);
     nc = std::min(nc, N);
 
+    bool requires_epilogue = (attrs.epilogue.type != EpilogueActivateType::None &&
+                         attrs.epilogue.type != EpilogueActivateType::Relu);
+
     // ---- NKM tiled loop (direct path) ----
+    // Beta scaling fused into first k-block; epilogue fused after last k-block.
     for (int n = 0; n < N; n += nc) {
         int actual_nc = std::min(nc, N - n);
         for (int k = 0; k < K; k += kc) {
@@ -155,19 +146,24 @@ void matmul_kernel_2d_direct(const MatMulAttributes& attrs,
 
                 const T* a_sub = a_ptr + m * lda + k;  // A is M×K, row m, col k
 
+                // Fuse beta scaling into first k-block (subsequent blocks accumulate)
+                if (k == 0 && attrs.beta != 1.0f) {
+                    tile_scale(c_ptr + m * ldc + n, ldc, attrs.beta, actual_mc, actual_nc);
+                }
+
                 tile_mma_direct(actual_mc, actual_nc, actual_kc,
                                 c_ptr + m * ldc + n, ldc,
                                 a_sub, lda, b_sub, ldb,
                                 clamp_min, clamp_max);
+
+                // Fuse epilogue after last k-block (C tile still in L1 cache)
+                if (requires_epilogue && k + kc >= K) {
+                    epilogue_inplace(actual_mc, actual_nc,
+                                            c_ptr + m * ldc + n, ldc,
+                                            static_cast<const T*>(nullptr), attrs.epilogue);
+                }
             }
         }
-    }
-
-    // ---- Non-clamp epilogue post-processing ----
-    if (attrs.epilogue.type != EpilogueActivateType::None &&
-        attrs.epilogue.type != EpilogueActivateType::Relu) {
-        matmul_epilogue_inplace(M, N, c_ptr, ldc,
-                                static_cast<const T*>(nullptr), attrs.epilogue);
     }
 }
 
@@ -176,12 +172,11 @@ void matmul_kernel_2d_direct(const MatMulAttributes& attrs,
 //  Used for transposed cases (handles strided column access).
 // =========================================================================
 template <typename T>
-void matmul_kernel_2d_packed(const MatMulAttributes& attrs,
+void matmul_kernel_2d_packed_flt(const MatMulAttributes& attrs,
                              T* c_ptr, int ldc,
                              const T* a_ptr, int lda,
                              const T* b_ptr, int ldb,
-                             int M, int N, int K,
-                             int kc, int mr_max, int nr_max,
+                             int M, int N, int K, int kc, 
                              void* workspace)
 {
     // ---- Clamp for epilogue ----
@@ -191,31 +186,13 @@ void matmul_kernel_2d_packed(const MatMulAttributes& attrs,
         clamp_min = 0.0f;
     }
 
-    // ---- Beta: pre-scale C ----
-    if (attrs.beta == 0.0f) {
-        for (int i = 0; i < M; ++i) {
-            for (int j = 0; j < N; ++j) {
-                c_ptr[i * ldc + j] = T(0);
-            }
-        }
-    } else if (attrs.beta != 1.0f) {
-        for (int i = 0; i < M; ++i) {
-            for (int j = 0; j < N; ++j) {
-                float val = s_load(&c_ptr[i * ldc + j]) * attrs.beta;
-                s_store(&c_ptr[i * ldc + j], val);
-            }
-        }
-    }
-
+    constexpr int mr_max = mr_max_flt<T>();
+    constexpr int nr_max = nr_max_flt<T>();
     // ---- Compute tile sizes ----
     int mc = std::min(MC_TARGET, M);
     size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
     int nc = round_down_nc(compute_nc(mr_max, kc, static_cast<int>(sizeof(T)), l2_size), nr_max);
     nc = std::min(nc, N);
-
-    // 64-byte-aligned panel strides (in elements)
-    constexpr int ldd_a = std::is_same_v<T, float> ? LDD_A_F32 : LDD_A_F16;
-    constexpr int ldd_b = std::is_same_v<T, float> ? LDD_B_F32 : LDD_B_F16;
 
     // ---- Workspace layout ----
     T* pack_a = static_cast<T*>(workspace);
@@ -223,11 +200,13 @@ void matmul_kernel_2d_packed(const MatMulAttributes& attrs,
     T* pack_b = pack_a + num_panels_a * ldd_a;
 
     // ---- NKM tiled loop (packed path) ----
+    // Beta scaling fused into first k-block; epilogue fused after last k-block.
     for (int n = 0; n < N; n += nc) {
         int actual_nc = std::min(nc, N - n);
         for (int k = 0; k < K; k += kc) {
             int actual_kc = std::min(kc, K - k);
 
+            int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * sizeof(T)) / sizeof(T);
             // Pack B panel
             const T* b_src = attrs.transpose_b
                 ? b_ptr + n * ldb + k   // B phys is N×K, row n, col k
@@ -242,23 +221,30 @@ void matmul_kernel_2d_packed(const MatMulAttributes& attrs,
                 const T* a_src = attrs.transpose_a
                     ? a_ptr + k * lda + m   // A phys is K×M, row k, col m
                     : a_ptr + m * lda + k;  // A phys is M×K, row m, col k
+
+                int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * sizeof(T)) / sizeof(T);
                 tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
                               pack_a, ldd_a, a_src, lda, 1.0f);
+
+                // Fuse beta scaling into first k-block (subsequent blocks accumulate)
+                if (k == 0 && attrs.beta != 1.0f) {
+                    tile_scale(c_ptr + m * ldc + n, ldc, attrs.beta, actual_mc, actual_nc);
+                }
 
                 // MMA
                 tile_mma_pack(actual_mc, actual_nc, actual_kc,
                               c_ptr + m * ldc + n, ldc,
-                              pack_a, ldd_a, pack_b, ldd_b,
+                              pack_a, pack_b, ldd_b,
                               clamp_min, clamp_max);
+
+                // Fuse epilogue after last k-block (C tile still in L1 cache)
+                if (requires_epilogue && k + kc >= K) {
+                    epilogue_inplace(actual_mc, actual_nc,
+                                            c_ptr + m * ldc + n, ldc,
+                                            static_cast<const T*>(nullptr), attrs.epilogue);
+                }
             }
         }
-    }
-
-    // ---- Non-clamp epilogue ----
-    if (attrs.epilogue.type != EpilogueActivateType::None &&
-        attrs.epilogue.type != EpilogueActivateType::Relu) {
-        matmul_epilogue_inplace(M, N, c_ptr, ldc,
-                                static_cast<const T*>(nullptr), attrs.epilogue);
     }
 }
 

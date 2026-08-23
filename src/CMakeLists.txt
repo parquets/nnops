@@ -69,7 +69,7 @@ set(NNOPS_CPU_SOURCES
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA)
     backend/cpu/matmul.cpp
-    backend/cpu/matmul_impl.cpp
+    backend/cpu/matmul_helper.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp

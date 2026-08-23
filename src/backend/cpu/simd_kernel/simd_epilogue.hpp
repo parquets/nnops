@@ -1,17 +1,18 @@
 #pragma once
-/// @file epilogue_impl.hpp
-/// @brief CPU backend implementations of apply_epilogue.
+/// @file simd_epilogue.hpp
+/// @brief SIMD epilogue kernels — scalar and vector apply_epilogue, plus
+///        epilogue_inplace for fused bias + activation output write-back.
 ///
 /// Contains:
 ///   1. Scalar apply_epilogue (moved from include/nnops/core/epilogue.hpp)
-///   2. SIMD vector apply_epilogue for f32x8 and f16x8
-///   3. matmul_epilogue_inplace — fused bias + epilogue for MatMul output
+///   2. SIMD vector apply_epilogue for v_f32x8 and v_f16x8
+///   3. epilogue_inplace — fused bias + epilogue for MatMul output
 ///
 /// Formulas match activation_ref.cpp exactly.
 
 #include "nnops/core/epilogue.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "simd_kernel/activation_kernels.hpp"
+#include "activation_kernels.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -138,7 +139,7 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
 }
 
 // ============================================================
-// matmul_epilogue_inplace — fused bias + epilogue for MatMul output
+// epilogue_inplace — fused bias + epilogue for MatMul output
 // ============================================================
 
 /// Apply bias addition and epilogue activation to a MatMul output matrix.
@@ -156,7 +157,7 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
 /// @param bias     Per-column bias array of length N (may be nullptr)
 /// @param epilogue Epilogue descriptor (None = identity, no-op)
 template <class T>
-void matmul_epilogue_inplace(int M, int N, T* data, int ld,
+void epilogue_inplace(int M, int N, T* data, int ld,
                               const T* bias, const Epilogue& epilogue) {
     constexpr int L = simd_lane_for<T>;
 
@@ -191,5 +192,15 @@ void matmul_epilogue_inplace(int M, int N, T* data, int ld,
         }
     }
 }
+
+// Explicit instantiations for epilogue_inplace (f32 and f16).
+// These ensure the symbol is emitted in this translation unit so that
+// callers from other .cpp files can link against it.
+
+extern template void epilogue_inplace<float>(
+    int M, int N, float* data, int ld, const float* bias, const Epilogue& epilogue);
+
+extern template void epilogue_inplace<half>(
+    int M, int N, half* data, int ld, const half* bias, const Epilogue& epilogue);
 
 }  // namespace nnops::backend::cpu

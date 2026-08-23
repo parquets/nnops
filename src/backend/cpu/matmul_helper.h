@@ -1,5 +1,5 @@
 #pragma once
-/// @file imatmul.h
+/// @file matmul_helper.h
 /// @brief Inner matrix multiplication — pack + MMA micro-kernel dispatch.
 ///
 /// All arch-specific pack/mma headers share an identical API in namrspaces
@@ -29,6 +29,9 @@
 
 #include "nnops/detail/half.hpp"
 
+// 64-byte cache-line alignment for packed panel strides
+#define PANEL_ALIGN_BYTES 64
+
 namespace nnops::backend::cpu {
 
 // ---- namrspace alias ---------------------------------------------------
@@ -50,6 +53,33 @@ constexpr int NR_MAX_F32 = arch::nr_f32[0];
 constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
 
+template <class T>
+int mr_max_flt() {
+    if constexpr (std::is_same_v<T, float>) {
+        return MR_MAX_F32;
+    } else if constexpr (std::is_same_v<T, half>) {
+        return MR_MAX_F16;
+    } else {
+        static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>, "Unsupported type");
+    }
+}
+
+template <class T>
+int nr_max_flt() {
+    if constexpr (std::is_same_v<T, float>) {
+        return NR_MAX_F32;
+    } else if constexpr (std::is_same_v<T, half>) {
+        return NR_MAX_F16;
+    } else {
+        static_assert(std::is_same_v<T, float> || std::is_same_v<T  , half>, "Unsupported type");
+    }
+}
+
+template <int AlignBytes>
+int align_up(int n) {
+    return (n + AlignBytes - 1) & ~(AlignBytes - 1);
+}
+
 
 // ---- public API --------------------------------------------------------
 
@@ -58,11 +88,14 @@ void tile_pack_lhs(bool trans, int nc, int kc, float* dst, int ldd, const float*
 void tile_pack_rhs(bool trans, int mc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 void tile_pack_lhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
-void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, int lda, const float* b, int ldb, float clamp_min, float clamp_max);
-void tile_mma_direct(int Mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int ldb, float clamp_min, float clamp_max);
-void tile_mma_pack(int Mc, int nc, int kc, half* c, int ldc, const half* packed_a, int lda, const half* b, int ldb, float clamp_min, float clamp_max);
-void tile_mma_direct(int Mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int ldb, float clamp_min, float clamp_max);
+void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* maybe_packed_b, int ldb, float clamp_min, float clamp_max);
+void tile_mma_direct(int Mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* maybe_packed_b, int ldb, float clamp_min, float clamp_max);
+void tile_mma_pack(int Mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* maybe_packed_b, int ldb, float clamp_min, float clamp_max);
+void tile_mma_direct(int Mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* maybe_packed_b, int ldb, float clamp_min, float clamp_max);
 
+// SIMD-accelerated in-place scale: C[i] *= scale
+void tile_scale(float* c, int ldc, float scale, int M, int N);
+void tile_scale(half* c, int ldc, float scale, int M, int N);
 
 // single-precision and half-precision GEMM implementations (for matmul.cpp)
 template <typename T>

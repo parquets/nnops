@@ -14,7 +14,7 @@
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "../epilogue_impl.hpp"
+#include "../simd_kernel/simd_epilogue.hpp"
 
 #include <algorithm>
 #include <cstring>

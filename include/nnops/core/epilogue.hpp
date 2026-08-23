@@ -11,7 +11,7 @@
 ///
 /// The Epilogue struct is defined here so operator headers can embed it.
 /// Implementations of apply_epilogue (scalar and SIMD) live in the CPU
-/// backend at src/backend/cpu/epilogue_impl.hpp.
+/// backend at src/backend/cpu/simd_kernel/simd_epilogue.hpp.
 
 #include <cstdint>
 
@@ -69,7 +69,7 @@ struct Epilogue {
 };
 
 // ---- Scalar apply_epilogue (declarations only) ----
-// Implementations live in src/backend/cpu/epilogue_impl.hpp.
+// Implementations live in src/backend/cpu/simd_kernel/simd_epilogue.hpp.
 
 /// Apply an epilogue to a single scalar output value (activation types).
 /// Returns the value unchanged when type == None (identity).

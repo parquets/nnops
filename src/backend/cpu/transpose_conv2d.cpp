@@ -13,7 +13,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "epilogue_impl.hpp"
+#include "simd_kernel/simd_epilogue.hpp"
 
 namespace nnops::backend::cpu {
 
