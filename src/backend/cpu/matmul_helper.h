@@ -182,7 +182,8 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
 //   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance by the
 //              uniform aligned stride ldd_b = align_up(nr_max*Kc*elem,64)/elem)
 //   ldb >= 0 → B is raw (row stride ldb, advance nr per panel)
-// `tile_mma_direct` reads both A and B raw via lda/ldb.
+// `tile_mma_direct` reads A raw via lda; B follows the same ldb < 0 /
+//   ldb >= 0 convention (packed vs raw) as `tile_mma_pack`.
 
 void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_lhs(bool trans, int mc, int kc, float* dst, int ldd, const float* src, int lds, float scale);

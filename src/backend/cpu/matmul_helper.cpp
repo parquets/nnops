@@ -329,25 +329,30 @@ void mrkcnc_mma_pack(int Nc, int Kc,
     }
 }
 
-// f32 — raw A + raw B
+// f32 — raw A, packed/raw B (ldb < 0 signals packed, as in the pack path)
 void mrkcnc_mma_direct(int Nc, int Kc,
                        float* c, int ldc,
                        const float* a, int lda,
                        const float* b, int ldb,
                        float clamp_min, float clamp_max,
                        const std::array<MmaDirectF32Fn, 3>& mma_direct_f32_fn) {
+    const bool packed = (ldb < 0);
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
     int n = 0;
     for(; n + NR_F32[0] <= Nc; n += NR_F32[0]) {
-        mma_direct_f32_fn[0](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
-        b += NR_F32[0];
+        mma_direct_f32_fn[0](c + n, ldc, a, lda, b,
+                             packed ? NR_F32[0] : ldb, Kc, clamp_min, clamp_max);
+        b += packed ? ldd_b : NR_F32[0];
     }
     for(; n + NR_F32[1] <= Nc; n += NR_F32[1]) {
-        mma_direct_f32_fn[1](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
-        b += NR_F32[1];
+        mma_direct_f32_fn[1](c + n, ldc, a, lda, b,
+                             packed ? NR_F32[1] : ldb, Kc, clamp_min, clamp_max);
+        b += packed ? ldd_b : NR_F32[1];
     }
     for(; n + NR_F32[2] <= Nc; n += NR_F32[2]) {
-        mma_direct_f32_fn[2](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
-        b += NR_F32[2];
+        mma_direct_f32_fn[2](c + n, ldc, a, lda, b,
+                             packed ? NR_F32[2] : ldb, Kc, clamp_min, clamp_max);
+        b += packed ? ldd_b : NR_F32[2];
     }
 }
 
@@ -377,25 +382,30 @@ void mrkcnc_mma_pack(int Nc, int Kc,
     }
 }
 
-// f16 — raw A + raw B
+// f16 — raw A, packed/raw B (ldb < 0 signals packed, as in the pack path)
 void mrkcnc_mma_direct(int Nc, int Kc,
                        half* c, int ldc,
                        const half* a, int lda,
                        const half* b, int ldb,
                        float clamp_min, float clamp_max,
                        const std::array<MmaDirectF16Fn, 3>& mma_direct_f16_fn) {
+    const bool packed = (ldb < 0);
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_F16[0] * Kc * static_cast<int>(sizeof(half))) / static_cast<int>(sizeof(half));
     int n = 0;
     for(; n + NR_F16[0] <= Nc; n += NR_F16[0]) {
-        mma_direct_f16_fn[0](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
-        b += NR_F16[0];
+        mma_direct_f16_fn[0](c + n, ldc, a, lda, b,
+                             packed ? NR_F16[0] : ldb, Kc, clamp_min, clamp_max);
+        b += packed ? ldd_b : NR_F16[0];
     }
     for(; n + NR_F16[1] <= Nc; n += NR_F16[1]) {
-        mma_direct_f16_fn[1](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
-        b += NR_F16[1];
+        mma_direct_f16_fn[1](c + n, ldc, a, lda, b,
+                             packed ? NR_F16[1] : ldb, Kc, clamp_min, clamp_max);
+        b += packed ? ldd_b : NR_F16[1];
     }
     for(; n + NR_F16[2] <= Nc; n += NR_F16[2]) {
-        mma_direct_f16_fn[2](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
-        b += NR_F16[2];
+        mma_direct_f16_fn[2](c + n, ldc, a, lda, b,
+                             packed ? NR_F16[2] : ldb, Kc, clamp_min, clamp_max);
+        b += packed ? ldd_b : NR_F16[2];
     }
 }
 
@@ -426,7 +436,7 @@ void tile_mma_pack(int Mc, int Nc, int Kc,
     }
 }
 
-// f32 — direct: A raw via lda, B raw via ldb
+// f32 — direct: A raw via lda, B raw/packed via ldb
 void tile_mma_direct(int Mc, int Nc, int Kc,
                      float* c, int ldc,
                      const float* a, int lda,
@@ -478,7 +488,7 @@ void tile_mma_pack(int Mc, int Nc, int Kc,
     }
 }
 
-// f16 — direct: A raw via lda, B raw via ldb
+// f16 — direct: A raw via lda, B raw/packed via ldb
 void tile_mma_direct(int Mc, int Nc, int Kc,
                      half* c, int ldc,
                      const half* a, int lda,
