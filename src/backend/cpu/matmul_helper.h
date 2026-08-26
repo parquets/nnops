@@ -54,7 +54,7 @@ constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
 
 template <class T>
-int mr_max_flt() {
+constexpr int mr_max_flt() {
     if constexpr (std::is_same_v<T, float>) {
         return MR_MAX_F32;
     } else if constexpr (std::is_same_v<T, half>) {
@@ -65,7 +65,7 @@ int mr_max_flt() {
 }
 
 template <class T>
-int nr_max_flt() {
+constexpr int nr_max_flt() {
     if constexpr (std::is_same_v<T, float>) {
         return NR_MAX_F32;
     } else if constexpr (std::is_same_v<T, half>) {
@@ -76,7 +76,7 @@ int nr_max_flt() {
 }
 
 template <int AlignBytes>
-int align_up(int n) {
+constexpr int align_up(int n) {
     return (n + AlignBytes - 1) & ~(AlignBytes - 1);
 }
 

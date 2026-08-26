@@ -540,6 +540,7 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
 
 template <typename T>
 void tile_scale_impl(T* c, int ldc, float scale, int M, int N) {
+    using namespace nnops::simd;
     constexpr int L = simd_lane_for<T>;  // 8 for both f32 and f16
     for (int m = 0; m < M; ++m) {
         T* row = c + m * ldc;

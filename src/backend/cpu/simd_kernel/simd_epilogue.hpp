@@ -157,8 +157,7 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
 /// @param bias     Per-column bias array of length N (may be nullptr)
 /// @param epilogue Epilogue descriptor (None = identity, no-op)
 template <class T>
-void epilogue_inplace(int M, int N, T* data, int ld,
-                              const T* bias, const Epilogue& epilogue) {
+void epilogue_inplace(int M, int N, T* data, int ld, const T* bias, const Epilogue& epilogue) {
     constexpr int L = simd_lane_for<T>;
 
     for (int m = 0; m < M; ++m) {
@@ -192,15 +191,5 @@ void epilogue_inplace(int M, int N, T* data, int ld,
         }
     }
 }
-
-// Explicit instantiations for epilogue_inplace (f32 and f16).
-// These ensure the symbol is emitted in this translation unit so that
-// callers from other .cpp files can link against it.
-
-extern template void epilogue_inplace<float>(
-    int M, int N, float* data, int ld, const float* bias, const Epilogue& epilogue);
-
-extern template void epilogue_inplace<half>(
-    int M, int N, half* data, int ld, const half* bias, const Epilogue& epilogue);
 
 }  // namespace nnops::backend::cpu

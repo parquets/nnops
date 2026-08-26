@@ -111,7 +111,7 @@ void matmul_kernel_2d_direct_flt(const MatMulAttributes& attrs,
                              const T* a_ptr, int lda,
                              const T* b_ptr, int ldb,
                              int M, int N, int K,
-                             int kc, int clamp_min, int clamp_max)
+                             int kc)
 {
     // ---- Clamp for epilogue ----
     float clamp_min = -std::numeric_limits<float>::infinity();
@@ -195,12 +195,15 @@ void matmul_kernel_2d_packed_flt(const MatMulAttributes& attrs,
     nc = std::min(nc, N);
 
     // ---- Workspace layout ----
+    int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * kc * sizeof(T)) / sizeof(T);
     T* pack_a = static_cast<T*>(workspace);
     int num_panels_a = (mc + mr_max - 1) / mr_max;
     T* pack_b = pack_a + num_panels_a * ldd_a;
 
     // ---- NKM tiled loop (packed path) ----
     // Beta scaling fused into first k-block; epilogue fused after last k-block.
+    bool requires_epilogue = (attrs.epilogue.type != EpilogueActivateType::None &&
+                         attrs.epilogue.type != EpilogueActivateType::Relu);
     for (int n = 0; n < N; n += nc) {
         int actual_nc = std::min(nc, N - n);
         for (int k = 0; k < K; k += kc) {
@@ -271,11 +274,11 @@ void matmul_kernel_f32(const MatMulAttributes& attrs,
     int iM = static_cast<int>(M), iN = static_cast<int>(N), iK = static_cast<int>(K);
 
     if (attrs.transpose_a || attrs.transpose_b) {
-        matmul_kernel_2d_packed<float>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
-                                       iM, iN, iK, KC_F32, MR_MAX_F32, NR_MAX_F32, workspace);
+        matmul_kernel_2d_packed_flt<float>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                       iM, iN, iK, KC_F32, workspace);
     } else {
-        matmul_kernel_2d_direct<float>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
-                                       iM, iN, iK, KC_F32, MR_MAX_F32, NR_MAX_F32);
+        matmul_kernel_2d_direct_flt<float>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                       iM, iN, iK, KC_F32);
     }
 }
 
@@ -302,11 +305,11 @@ void matmul_kernel_f16(const MatMulAttributes& attrs,
     int iM = static_cast<int>(M), iN = static_cast<int>(N), iK = static_cast<int>(K);
 
     if (attrs.transpose_a || attrs.transpose_b) {
-        matmul_kernel_2d_packed<half>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
-                                      iM, iN, iK, KC_F16, MR_MAX_F16, NR_MAX_F16, workspace);
+        matmul_kernel_2d_packed_flt<half>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                      iM, iN, iK, KC_F16, workspace);
     } else {
-        matmul_kernel_2d_direct<half>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
-                                      iM, iN, iK, KC_F16, MR_MAX_F16, NR_MAX_F16);
+        matmul_kernel_2d_direct_flt<half>(attrs, c_ptr, ldc, a_ptr, lda, b_ptr, ldb,
+                                      iM, iN, iK, KC_F16);
     }
 }
 
@@ -455,35 +458,35 @@ void matmul_kernel(const MatMulAttributes& attrs,
         bool use_packed = attrs.transpose_a || attrs.transpose_b;
         if (dt_a == DataType::f32) {
             if (use_packed) {
-                matmul_kernel_2d_packed<float>(attrs,
+                matmul_kernel_2d_packed_flt<float>(attrs,
                     output.ptr<float>(), static_cast<int>(ldc),
                     a.ptr<float>(), static_cast<int>(lda),
                     b.ptr<float>(), static_cast<int>(ldb),
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                    kc, mr_max, nr_max, workspace);
+                    kc, workspace);
             } else {
-                matmul_kernel_2d_direct<float>(attrs,
+                matmul_kernel_2d_direct_flt<float>(attrs,
                     output.ptr<float>(), static_cast<int>(ldc),
                     a.ptr<float>(), static_cast<int>(lda),
                     b.ptr<float>(), static_cast<int>(ldb),
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                    kc, mr_max, nr_max);
+                    kc);
             }
         } else {
             if (use_packed) {
-                matmul_kernel_2d_packed<half>(attrs,
+                matmul_kernel_2d_packed_flt<half>(attrs,
                     output.ptr<half>(), static_cast<int>(ldc),
                     a.ptr<half>(), static_cast<int>(lda),
                     b.ptr<half>(), static_cast<int>(ldb),
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                    kc, mr_max, nr_max, workspace);
+                    kc, workspace);
             } else {
-                matmul_kernel_2d_direct<half>(attrs,
+                matmul_kernel_2d_direct_flt<half>(attrs,
                     output.ptr<half>(), static_cast<int>(ldc),
                     a.ptr<half>(), static_cast<int>(lda),
                     b.ptr<half>(), static_cast<int>(ldb),
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                    kc, mr_max, nr_max);
+                    kc);
             }
         }
         return;
@@ -556,19 +559,19 @@ void matmul_kernel(const MatMulAttributes& attrs,
             }
 
             if (use_packed) {
-                matmul_kernel_2d_packed<T>(attrs,
+                matmul_kernel_2d_packed_flt<T>(attrs,
                     c_base + c_offset, static_cast<int>(ldc),
                     a_base + a_offset, static_cast<int>(lda),
                     b_base + b_offset, static_cast<int>(ldb),
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                    kc, mr_max, nr_max, workspace);
+                    kc, workspace);
             } else {
-                matmul_kernel_2d_direct<T>(attrs,
+                matmul_kernel_2d_direct_flt<T>(attrs,
                     c_base + c_offset, static_cast<int>(ldc),
                     a_base + a_offset, static_cast<int>(lda),
                     b_base + b_offset, static_cast<int>(ldb),
                     static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                    kc, mr_max, nr_max);
+                    kc);
             }
         }
     };
