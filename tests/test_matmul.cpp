@@ -11,11 +11,22 @@
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
+#include "common/compare.hpp"
 
 #include <vector>
 #include <cmath>
 
 using namespace nnops;
+
+// Reference kernel for packed-path comparison (test-local declaration,
+// following the test_concat.cpp pattern).
+namespace nnops::backend::cpu::reference {
+void matmul_ref(const MatMulAttributes& attrs,
+                TensorView& output,
+                std::span<const TensorView> inputs,
+                const ComputeContext& ctx,
+                void* workspace);
+}
 
 // ============================================================
 // Basic 2D MatMul
@@ -1013,5 +1024,203 @@ NNOPS_TEST(matmul_random_transpose_b) {
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(out_buf[i]));
         NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
+    }
+}
+
+// ============================================================
+// Packed path (with workspace) — SIMD pack + MMA kernels
+// ============================================================
+//
+// The workspace-less tests above fall back to the reference kernel for
+// transposed cases; these tests allocate matmul_get_workspace_size() bytes so
+// the fused pack + MMA path is exercised, and compare against matmul_ref.
+
+NNOPS_TEST(matmul_packed_transpose_both_workspace) {
+    auto [a_vec, a] = test::make_random_tensor({13, 21});   // phys [K, M] (transpose_a)
+    auto [b_vec, b] = test::make_random_tensor({29, 13});   // phys [N, K] (transpose_b)
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = true;
+    attrs.transpose_b = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+    // M = A.shape[1] (21), N = B.shape[0] (29)
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(21));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(29));
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    // Packed path requires a workspace sized by the operator.
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    // Reference oracle on a separate buffer.
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-4f, 1e-5f));
+}
+
+NNOPS_TEST(matmul_packed_multiple_kblocks) {
+    // K = 300 > KC_F32 (128): exercises multi-k-block accumulation and the
+    // last-k-block epilogue/clamp logic in the packed path.
+    auto [a_vec, a] = test::make_random_tensor({6, 300});    // [M, K]
+    auto [b_vec, b] = test::make_random_tensor({9, 300});    // phys [N, K]
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(6));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(9));
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
+}
+
+NNOPS_TEST(matmul_packed_beta_relu_workspace) {
+    // Beta + Relu epilogue in the packed path must match reference semantics:
+    // C = relu(A×B + beta×C_old).
+    auto [a_vec, a] = test::make_random_tensor({4, 6});   // [M, K]
+    auto [b_vec, b] = test::make_random_tensor({5, 6});   // phys [N, K]
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = true;
+    attrs.beta = 0.5f;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    // Seed C with old values so beta scaling is observable.
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        out_buf[i] = static_cast<float>(i) * 0.25f;
+        ref_buf[i] = out_buf[i];
+    }
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-4f, 1e-5f));
+}
+
+NNOPS_TEST(matmul_packed_batched_workspace) {
+    // Batched (rank 3) transpose_b through the packed path.
+    auto [a_vec, a] = test::make_random_tensor({3, 5, 8});    // [B, M, K]
+    auto [b_vec, b] = test::make_random_tensor({3, 7, 8});    // phys [B, N, K]
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(3));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(5));
+    NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(7));
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-4f, 1e-5f));
+}
+
+NNOPS_TEST(matmul_packed_f16_workspace) {
+    // f16 transpose_a through the packed path, compared against the f32
+    // reference computed from the f16 inputs (loose tolerance for f16).
+    auto [a_f32, _] = test::make_random_tensor({7, 6}, -1.0f, 1.0f, 777);  // phys [K, M]
+    auto [b_f32, __] = test::make_random_tensor({7, 5}, -1.0f, 1.0f, 888);  // [K, N]
+    auto a_f16 = test::f32_to_f16(a_f32);
+    auto b_f16 = test::f32_to_f16(b_f32);
+
+    const int64_t a_shape[] = {7, 6};
+    const int64_t b_shape[] = {7, 5};
+    TensorView a(a_shape, DataType::f16, a_f16.data());
+    TensorView b(b_shape, DataType::f16, b_f16.data());
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    // f32 reference on converted buffers.
+    const int64_t a32_shape[] = {7, 6};
+    const int64_t b32_shape[] = {7, 5};
+    TensorView a32(a32_shape, DataType::f32, a_f32.data());
+    TensorView b32(b32_shape, DataType::f32, b_f32.data());
+    const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(ref_descs[0].numel());
+    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32, b32};
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (int64_t i = 0; i < descs[0].numel(); ++i) {
+        float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], 5e-2f);
     }
 }

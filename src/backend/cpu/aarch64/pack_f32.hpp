@@ -27,7 +27,7 @@ inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
                               int ir_step, int K, float scale) noexcept {
     for (int k = 0; k < K; ++k) {
         *output++ = input[0] * scale;
-        input += ir_step;
+        input += 1;  // consecutive k within the M×K source row
     }
 }
 

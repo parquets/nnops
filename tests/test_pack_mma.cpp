@@ -14,6 +14,7 @@
 #include "common/test_harness.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd.hpp"
+#include "backend/cpu/matmul_helper.h"
 
 #if defined(NNOPS_ARCH_X86_64)
   #include "backend/cpu/x86_64/pack_f32.hpp"
@@ -659,3 +660,104 @@ static void check_dequant_f16(int M, int N, bool with_zero) {
 NNOPS_TEST(dequant_s8_to_f16)     { check_dequant_f16<int8_t>(3, 40, true); }
 NNOPS_TEST(dequant_u8_to_f16)     { check_dequant_f16<uint8_t>(3, 40, true); }
 NNOPS_TEST(dequant_s8_to_f16_sym) { check_dequant_f16<int8_t>(2, 33, false); }
+
+// =========================================================================
+//  Section 13: tiled pack entry points (tile_pack_lhs / tile_pack_rhs)
+// =========================================================================
+//
+// These wrappers decompose an M×K (or N×K) tile into the arch panel sizes
+// (mr/nr ∈ {max, mid, 1}) and place each panel at a uniform 64-byte-aligned
+// stride `ldd`. The packed panel layout is [K][mr]/[K][nr] (k outer, m/n
+// inner) — the exact layout the MMA kernels consume. We verify both the
+// transpose and copy modes against the logical A/B matrices.
+
+namespace cpu = nnops::backend::cpu;
+
+/// Verify tile_pack_lhs for one transpose mode.
+/// src is the physical matrix: [M,K] row-major when !trans, [K,M] when trans.
+/// The packed panel p (mr_p rows) must satisfy:
+///     dst[p*ldd + k*mr_p + m] = A_logical[m + m_offset_p][k]
+static void check_tile_pack_lhs(bool trans) {
+    constexpr int M = 11;   // decomposes 6+4+1 across all three mr sizes
+    constexpr int K = 13;   // SIMD(8) + partial + scalar tail
+
+    const int lds = trans ? M : K;   // physical row stride of the source
+    std::vector<float> src(M * K);
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            // A_logical[m][k]
+            const float v = 1.0f + float(m * 100 + k);
+            src[trans ? (k * lds + m) : (m * lds + k)] = v;
+        }
+    }
+
+    const int mr0 = cpu::MR_F32[0];
+    const int ldd = (mr0 * K * 4 + 63) / 64 * 16;  // 64-byte-aligned stride
+    // Buffer must hold every panel at the aligned stride, not just M*K.
+    std::vector<float> dst(static_cast<size_t>(cpu::num_panels(M, cpu::MR_F32)) * ldd, -1.0f);
+
+    cpu::tile_pack_lhs(trans, M, K, dst.data(), ldd, src.data(), lds, 1.0f);
+
+    const int* mr = cpu::MR_F32;
+    int m_off = 0;
+    int p = 0;
+    for (int si = 0; si < 3; ++si) {
+        for (; m_off + mr[si] <= M; m_off += mr[si], ++p) {
+            // Panel p starts at p * ldd (uniform 64-byte-aligned stride).
+            const float* panel = dst.data() + p * ldd;
+            for (int k = 0; k < K; ++k) {
+                for (int m = 0; m < mr[si]; ++m) {
+                    const float expect = 1.0f + float((m_off + m) * 100 + k);
+                    NNOPS_EXPECT_NEAR(panel[k * mr[si] + m], expect, 1e-5f);
+                }
+            }
+        }
+    }
+}
+
+/// Verify tile_pack_rhs for one transpose mode.
+/// src is the physical matrix: [K,N] row-major when !trans, [N,K] when trans.
+/// The packed panel p (nr_p cols) must satisfy:
+///     dst[p*ldd + k*nr_p + n] = B_logical[k][n + n_offset_p]
+static void check_tile_pack_rhs(bool trans) {
+    constexpr int N = 19;   // decomposes across nr sizes (16/12 + ...)
+    constexpr int K = 13;
+
+    const int lds = trans ? K : N;   // physical row stride of the source
+    std::vector<float> src(K * N);
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
+            // B_logical[k][n]
+            const float v = 0.5f + float(k * 100 + n);
+            src[trans ? (n * lds + k) : (k * lds + n)] = v;
+        }
+    }
+
+    const int nr0 = cpu::NR_F32[0];
+    const int ldd = (nr0 * K * 4 + 63) / 64 * 16;  // 64-byte-aligned stride
+    // Buffer must hold every panel at the aligned stride, not just N*K.
+    std::vector<float> dst(static_cast<size_t>(cpu::num_panels(N, cpu::NR_F32)) * ldd, -1.0f);
+
+    cpu::tile_pack_rhs(trans, N, K, dst.data(), ldd, src.data(), lds, 1.0f);
+
+    const int* nr = cpu::NR_F32;
+    int n_off = 0;
+    int p = 0;
+    for (int si = 0; si < 3; ++si) {
+        for (; n_off + nr[si] <= N; n_off += nr[si], ++p) {
+            // Panel p starts at p * ldd (uniform 64-byte-aligned stride).
+            const float* panel = dst.data() + p * ldd;
+            for (int k = 0; k < K; ++k) {
+                for (int n = 0; n < nr[si]; ++n) {
+                    const float expect = 0.5f + float(k * 100 + (n_off + n));
+                    NNOPS_EXPECT_NEAR(panel[k * nr[si] + n], expect, 1e-5f);
+                }
+            }
+        }
+    }
+}
+
+NNOPS_TEST(tile_pack_lhs_trans)   { check_tile_pack_lhs(true); }
+NNOPS_TEST(tile_pack_lhs_copy)    { check_tile_pack_lhs(false); }
+NNOPS_TEST(tile_pack_rhs_trans)   { check_tile_pack_rhs(true); }
+NNOPS_TEST(tile_pack_rhs_copy)    { check_tile_pack_rhs(false); }

@@ -24,7 +24,7 @@ inline void pack_trans_n1_f16(float16_t* NNOPS_RESTRICT output,
                               int ir_step, int K, float /*scale*/) noexcept {
     for (int k = 0; k < K; ++k) {
         *output++ = input[0];
-        input += ir_step;
+        input += 1;  // consecutive k within the M×K source row
     }
 }
 

@@ -10,6 +10,62 @@ using namespace nnops::backend::cpu::aarch64;
 
 namespace nnops::backend::cpu {
 
+// =========================================================================
+//  Workspace sizing — same tiling as the matmul.cpp kernels
+// =========================================================================
+
+size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
+                                 const TensorDesc& a_desc,
+                                 const TensorDesc& b_desc,
+                                 const TensorDesc& /*c_desc*/)
+{
+    // Only the packed path (transpose_a or transpose_b) uses a workspace;
+    // the direct path and the reference fallback need none.
+    if (!attrs.transpose_a && !attrs.transpose_b) {
+        return 0;
+    }
+    const auto dt_a = a_desc.dtype;
+    if (dt_a != b_desc.dtype) {
+        return 0;
+    }
+
+    const int64_t a_rank = a_desc.rank;
+    const int64_t b_rank = b_desc.rank;
+    NNOPS_ASSERT(a_rank >= 2 && b_rank >= 2);
+
+    const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
+                                        : a_desc.dims[static_cast<size_t>(a_rank - 2)];
+    const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
+                                        : b_desc.dims[static_cast<size_t>(b_rank - 1)];
+
+    int kc, mr_max, nr_max;
+    size_t elem;
+    const int* mr;
+    const int* nr;
+    if (dt_a == DataType::f32) {
+        kc = KC_F32;  mr_max = MR_MAX_F32;  nr_max = NR_MAX_F32;  elem = sizeof(float);
+        mr = MR_F32;  nr = NR_F32;
+    } else if (dt_a == DataType::f16) {
+        kc = KC_F16;  mr_max = MR_MAX_F16;  nr_max = NR_MAX_F16;  elem = sizeof(half);
+        mr = MR_F16;  nr = NR_F16;
+    } else {
+        return 0;  // unsupported dtype → reference fallback, no workspace
+    }
+
+    // Same tile sizes as matmul_kernel's packed path (shared resolver).
+    int mc, nc;
+    resolve_tile_sizes(static_cast<int>(M), static_cast<int>(N),
+                       mr_max, nr_max, kc, static_cast<int>(elem), mc, nc);
+
+    // Uniform 64-byte-aligned panel strides at the full Kc (upper bound of any
+    // per-k-block stride, matching the kernel's pack_b = pack_a + num_panels_a
+    // * ldd_a layout).
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * kc * static_cast<int>(elem)) / static_cast<int>(elem);
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(elem)) / static_cast<int>(elem);
+
+    return workspace_bytes(mc, nc, ldd_a, ldd_b, elem, mr, nr);
+}
+
 // ---- pack function pointer types ---------------------------------------
 
 using PackF32Fn = void (*)(float* NNOPS_RESTRICT output,
@@ -146,39 +202,36 @@ constexpr std::array<std::array<MmaDirectF16Fn, 3>, 3> mma_direct_f16_fn = {{
 
 
 // ---- tiled pack entry points -------------------------------------------
-// ldd = aligned panel size in bytes: align_up(mr_max * kc * sizeof(T), 64)
-// Panels are placed at panel_idx * ldd byte offsets, ensuring 64-byte-aligned starts.
+// Panels are packed densely (contiguous); panel p of size mr/nr occupies the
+// next mr*kc / nr*kc elements. This matches the nn_compute reference and the
+// low-level pack kernels (which write output contiguously).
 
 void tile_pack_lhs(bool trans, int mc, int kc,
-                   float* dst, int ldd,
-                   const float* src, int lds,
-                   float scale) {
+                   float* dst, int ldd, const float* src, int lds, float scale) {
     int pack_lds = trans ? 1 : lds;
     auto& pack_fns = trans ? pack_copy_f32_fn[0] : pack_trans_f32_fn[0];
-
-    int panel_idx = 0;
     int m = 0;
-    for(; m + MR_F32[0] <= mc; m += MR_F32[0], panel_idx++) {
-        pack_fns[0](dst + panel_idx * ldd, src, lds, kc, scale);
+    for(; m + MR_F32[0] <= mc; m += MR_F32[0]) {
+        pack_fns[0](dst, src, lds, kc, scale);
+        dst += ldd;
         src += MR_F32[0] * pack_lds;
     }
-    for(; m + MR_F32[1] <= mc; m += MR_F32[1], panel_idx++) {
-        pack_fns[1](dst + panel_idx * ldd, src, lds, kc, scale);
+    for(; m + MR_F32[1] <= mc; m += MR_F32[1]) {
+        pack_fns[1](dst, src, lds, kc, scale);
+        dst += ldd;
         src += MR_F32[1] * pack_lds;
     }
-    for(; m + MR_F32[2] <= mc; m += MR_F32[2], panel_idx++) {
-        pack_fns[2](dst + panel_idx * ldd, src, lds, kc, scale);
+    for(; m + MR_F32[2] <= mc; m += MR_F32[2]) {
+        pack_fns[2](dst, src, lds, kc, scale);
+        dst += ldd;
         src += MR_F32[2] * pack_lds;
     }
 }
 
 void tile_pack_lhs(bool trans, int mc, int kc,
-                  half* dst, int ldd,
-                  const half* src, int lds, float scale) {
-
+                   half* dst, int ldd, const half* src, int lds, float scale) {
     int pack_lds = trans ? 1 : lds;
     auto& pack_fns = trans ? pack_copy_f16_fn[0] : pack_trans_f16_fn[0];
-
     int m = 0;
     for(; m + MR_F16[0] <= mc; m += MR_F16[0]) {
         pack_fns[0](dst, src, lds, kc, scale);
@@ -198,12 +251,9 @@ void tile_pack_lhs(bool trans, int mc, int kc,
 }
 
 void tile_pack_rhs(bool trans, int nc, int kc,
-                   float* dst, int ldd,
-                   const float* src, int lds, float scale) {
+                   float* dst, int ldd, const float* src, int lds, float scale) {
     int pack_lds = trans ? lds : 1;
-
     auto& pack_fns = trans ? pack_trans_f32_fn[1] : pack_copy_f32_fn[1];
-
     int n = 0;
     for(; n + NR_F32[0] <= nc; n += NR_F32[0]) {
         pack_fns[0](dst, src, lds, kc, scale);
@@ -223,12 +273,9 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 }
 
 void tile_pack_rhs(bool trans, int nc, int kc,
-                   half* dst, int ldd,
-                   const half* src, int lds, float scale) {
+                   half* dst, int ldd, const half* src, int lds, float scale) {
     int pack_lds = trans ? lds : 1;
-
     auto& pack_fns = trans ? pack_trans_f16_fn[1] : pack_copy_f16_fn[1];
-
     int n = 0;
     for(; n + NR_F16[0] <= nc; n += NR_F16[0]) {
         pack_fns[0](dst, src, lds, kc, scale);
@@ -249,284 +296,210 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 
 
 // ---- mma entry points ---------------------------------------------------
+//
+// `maybe_packed_b`/`ldb` describe B for the pack path:
+//   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance nr*K)
+//   ldb >= 0 → B is raw (row stride ldb, advance nr per panel)
+// Packed A panels advance contiguously by mr*Kc.
 
-// f32 — pack
-// ldb < 0: B packed (mma_ldb=NR[i], b_offset=64B-aligned panel stride)
-// else:    B raw    (mma_ldb=ldb,    b_offset=ldb)
+// f32 — packed A, packed/raw B
 void mrkcnc_mma_pack(int Nc, int Kc,
                      float* c, int ldc,
-                     const float* packed_a, 
+                     const float* packed_a,
                      const float* maybe_packed_b, int ldb,
                      float clamp_min, float clamp_max,
                      const std::array<MmaPackF32Fn, 3>& mma_pack_f32_fn) {
-    bool is_b_packed = ldb < 0;
+    const bool packed = (ldb < 0);
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
     int n = 0;
     for(; n + NR_F32[0] <= Nc; n += NR_F32[0]) {
-        int mma_ldb = is_b_packed ? NR_F32[0] : ldb;
-        mma_pack_f32_fn[0](c + n, ldc, packed_a,
-                           maybe_packed_b, mma_ldb, 
-                           Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F32[0] * Kc * sizeof(float)) / sizeof(float) : ldb;
-        maybe_packed_b += b_offset;
+        mma_pack_f32_fn[0](c + n, ldc, packed_a, maybe_packed_b,
+                           packed ? NR_F32[0] : ldb, Kc, clamp_min, clamp_max);
+        maybe_packed_b += packed ? ldd_b : NR_F32[0];
     }
-
     for(; n + NR_F32[1] <= Nc; n += NR_F32[1]) {
-        int mma_ldb = is_b_packed ? NR_F32[1] : ldb;
-        mma_pack_f32_fn[1](c + n, ldc, packed_a,
-                           maybe_packed_b, mma_ldb, 
-                           Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F32[1] * Kc * sizeof(float)) / sizeof(float) : ldb;
-        maybe_packed_b += b_offset;
+        mma_pack_f32_fn[1](c + n, ldc, packed_a, maybe_packed_b,
+                           packed ? NR_F32[1] : ldb, Kc, clamp_min, clamp_max);
+        maybe_packed_b += packed ? ldd_b : NR_F32[1];
     }
-
     for(; n + NR_F32[2] <= Nc; n += NR_F32[2]) {
-        int mma_ldb = is_b_packed ? NR_F32[2] : ldb;
-        mma_pack_f32_fn[2](c + n, ldc, packed_a,
-                           maybe_packed_b, mma_ldb,
-                           Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F32[2] * Kc * sizeof(float)) / sizeof(float) : ldb;
-        maybe_packed_b += b_offset;
+        mma_pack_f32_fn[2](c + n, ldc, packed_a, maybe_packed_b,
+                           packed ? NR_F32[2] : ldb, Kc, clamp_min, clamp_max);
+        maybe_packed_b += packed ? ldd_b : NR_F32[2];
     }
 }
 
-// f32 — direct
-// ldb < 0: B packed (mma_ldb=NR[i], b_offset=64B-aligned panel stride)
-// else:    B raw    (mma_ldb=ldb,    b_offset=ldb)
+// f32 — raw A + raw B
 void mrkcnc_mma_direct(int Nc, int Kc,
-                    float* c, int ldc,
-                    const float* a, int lda,
-                    const float* maybe_packed_b, int ldb,
-                    float clamp_min, float clamp_max,
-                    const std::array<MmaDirectF32Fn, 3>& mma_direct_f32_fn) {
-    bool is_b_packed = ldb < 0;
-    
+                       float* c, int ldc,
+                       const float* a, int lda,
+                       const float* b, int ldb,
+                       float clamp_min, float clamp_max,
+                       const std::array<MmaDirectF32Fn, 3>& mma_direct_f32_fn) {
     int n = 0;
     for(; n + NR_F32[0] <= Nc; n += NR_F32[0]) {
-        int mma_ldb = is_b_packed ? NR_F32[0] : ldb;
-        mma_direct_f32_fn[0](c + n, ldc, a, lda, maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F32[0] * Kc * sizeof(float)) / sizeof(float) : ldb;
-        maybe_packed_b += b_offset;
+        mma_direct_f32_fn[0](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
+        b += NR_F32[0];
     }
     for(; n + NR_F32[1] <= Nc; n += NR_F32[1]) {
-        int mma_ldb = is_b_packed ? NR_F32[1] : ldb;
-        mma_direct_f32_fn[1](c + n, ldc, a, lda, maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F32[1] * Kc * sizeof(float)) / sizeof(float) : ldb;
-        maybe_packed_b += b_offset;
+        mma_direct_f32_fn[1](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
+        b += NR_F32[1];
     }
     for(; n + NR_F32[2] <= Nc; n += NR_F32[2]) {
-        int mma_ldb = is_b_packed ? NR_F32[2] : ldb;
-        mma_direct_f32_fn[2](c + n, ldc, a, lda, maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F32[2] * Kc * sizeof(float)) / sizeof(float) : ldb;
-        maybe_packed_b += b_offset;
+        mma_direct_f32_fn[2](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
+        b += NR_F32[2];
     }
 }
 
-// f16 — pack
-// ldb < 0: B packed (mma_ldb=NR[i], b_offset=64B-aligned panel stride)
-// else:    B raw    (mma_ldb=ldb,    b_offset=ldb)
+// f16 — packed A, packed/raw B
 void mrkcnc_mma_pack(int Nc, int Kc,
                      half* c, int ldc,
                      const half* packed_a, const half* maybe_packed_b, int ldb,
                      float clamp_min, float clamp_max,
                      const std::array<MmaPackF16Fn, 3>& mma_pack_f16_fn) {
-    bool is_b_packed = ldb < 0;
+    const bool packed = (ldb < 0);
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_F16[0] * Kc * static_cast<int>(sizeof(half))) / static_cast<int>(sizeof(half));
     int n = 0;
     for(; n + NR_F16[0] <= Nc; n += NR_F16[0]) {
-        int mma_ldb = is_b_packed ? NR_F16[0] : ldb;
-        mma_pack_f16_fn[0](c + n, ldc, packed_a,
-                           maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F16[0] * Kc * sizeof(half)) / sizeof(half) : ldb;
-        maybe_packed_b += b_offset;
+        mma_pack_f16_fn[0](c + n, ldc, packed_a, maybe_packed_b,
+                           packed ? NR_F16[0] : ldb, Kc, clamp_min, clamp_max);
+        maybe_packed_b += packed ? ldd_b : NR_F16[0];
     }
-
     for(; n + NR_F16[1] <= Nc; n += NR_F16[1]) {
-        int mma_ldb = is_b_packed ? NR_F16[1] : ldb;
-        mma_pack_f16_fn[1](c + n, ldc, packed_a,
-                           maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F16[1] * Kc * sizeof(half)) / sizeof(half) : ldb;
-        maybe_packed_b += b_offset;
+        mma_pack_f16_fn[1](c + n, ldc, packed_a, maybe_packed_b,
+                           packed ? NR_F16[1] : ldb, Kc, clamp_min, clamp_max);
+        maybe_packed_b += packed ? ldd_b : NR_F16[1];
     }
-
     for(; n + NR_F16[2] <= Nc; n += NR_F16[2]) {
-        int mma_ldb = is_b_packed ? NR_F16[2] : ldb;
-        mma_pack_f16_fn[2](c + n, ldc, packed_a,
-                           maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F16[2] * Kc * sizeof(half)) / sizeof(half) : ldb;
-        maybe_packed_b += b_offset;
+        mma_pack_f16_fn[2](c + n, ldc, packed_a, maybe_packed_b,
+                           packed ? NR_F16[2] : ldb, Kc, clamp_min, clamp_max);
+        maybe_packed_b += packed ? ldd_b : NR_F16[2];
     }
 }
 
-// f16 — direct
-// ldb < 0: B packed (mma_ldb=NR[i], b_offset=64B-aligned panel stride)
-// else:    B raw    (mma_ldb=ldb,    b_offset=ldb)
+// f16 — raw A + raw B
 void mrkcnc_mma_direct(int Nc, int Kc,
-                    half* c, int ldc,
-                    const half* a, int lda,
-                    const half* maybe_packed_b, int ldb,
-                    float clamp_min, float clamp_max,
-                    const std::array<MmaDirectF16Fn, 3>& mma_direct_f16_fn) {
-    bool is_b_packed = ldb < 0;
-
+                       half* c, int ldc,
+                       const half* a, int lda,
+                       const half* b, int ldb,
+                       float clamp_min, float clamp_max,
+                       const std::array<MmaDirectF16Fn, 3>& mma_direct_f16_fn) {
     int n = 0;
     for(; n + NR_F16[0] <= Nc; n += NR_F16[0]) {
-        int mma_ldb = is_b_packed ? NR_F16[0] : ldb;
-        mma_direct_f16_fn[0](c + n, ldc, a, lda, maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F16[0] * Kc * sizeof(half)) / sizeof(half) : ldb;
-        maybe_packed_b += b_offset;
+        mma_direct_f16_fn[0](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
+        b += NR_F16[0];
     }
     for(; n + NR_F16[1] <= Nc; n += NR_F16[1]) {
-        int mma_ldb = is_b_packed ? NR_F16[1] : ldb;
-        mma_direct_f16_fn[1](c + n, ldc, a, lda, maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F16[1] * Kc * sizeof(half)) / sizeof(half) : ldb;
-        maybe_packed_b += b_offset;
+        mma_direct_f16_fn[1](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
+        b += NR_F16[1];
     }
     for(; n + NR_F16[2] <= Nc; n += NR_F16[2]) {
-        int mma_ldb = is_b_packed ? NR_F16[2] : ldb;
-        mma_direct_f16_fn[2](c + n, ldc, a, lda, maybe_packed_b, mma_ldb, Kc, clamp_min, clamp_max);
-        int b_offset = is_b_packed ? align_up<PANEL_ALIGN_BYTES>(NR_F16[2] * Kc * sizeof(half)) / sizeof(half) : ldb;
-        maybe_packed_b += b_offset;
+        mma_direct_f16_fn[2](c + n, ldc, a, lda, b, ldb, Kc, clamp_min, clamp_max);
+        b += NR_F16[2];
     }
 }
 
-// f32 — pack
-// packed_a stride = align_up(MR[i] * Kc * sizeof(float), PANEL_ALIGN_BYTES) / sizeof(float)
+// f32 — packed: packed_a advances contiguously by mr*Kc
 void tile_mma_pack(int Mc, int Nc, int Kc,
-                 float* c, int ldc,
-                 const float* packed_a, const float* maybe_packed_b, int ldb,
-                 float clamp_min, float clamp_max) {
-   
-    int m = 0;
-    for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
-        mrkcnc_mma_pack(Nc, Kc,
-                        c + m * ldc, ldc,
-                        packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max,
-                        mma_pack_f32_fn[0]);
-        packed_a += align_up<PANEL_ALIGN_BYTES>(MR_F32[0] * Kc * sizeof(float)) / sizeof(float);
-    }
-
-    for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
-        mrkcnc_mma_pack(Nc, Kc,
-                        c + m * ldc, ldc,
-                        packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max,
-                        mma_pack_f32_fn[1]);
-        packed_a += align_up<PANEL_ALIGN_BYTES>(MR_F32[1] * Kc * sizeof(float)) / sizeof(float);
-    }
-
-    for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
-        mrkcnc_mma_pack(Nc, Kc,
-                        c + m * ldc, ldc,
-                        packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max,
-                        mma_pack_f32_fn[2]);
-        packed_a += align_up<PANEL_ALIGN_BYTES>(MR_F32[2] * Kc * sizeof(float)) / sizeof(float);
-    }
-}
-
-
-// f32 — direct
-// A is raw (indexed via lda), B may be packed (ldb < 0) or raw
-void tile_mma_direct(int Mc, int Nc, int Kc,
                    float* c, int ldc,
-                   const float* a, int lda,
-                   const float* maybe_packed_b, int ldb,
+                   const float* packed_a, const float* maybe_packed_b, int ldb,
                    float clamp_min, float clamp_max) {
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
     int m = 0;
     for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
-        mrkcnc_mma_direct(Nc, Kc,
-                          c + m * ldc, ldc,
-                          a + m * lda, lda,
-                          maybe_packed_b, ldb,
-                          clamp_min, clamp_max,
-                          mma_direct_f32_fn[0]);
+        mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
+                        packed_a, maybe_packed_b, ldb,
+                        clamp_min, clamp_max, mma_pack_f32_fn[0]);
+        packed_a += ldd_a;
     }
     for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
-        mrkcnc_mma_direct(Nc, Kc,
-                          c + m * ldc, ldc,
-                          a + m * lda, lda,
-                          maybe_packed_b, ldb,
-                          clamp_min, clamp_max,
-                          mma_direct_f32_fn[1]);
+        mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
+                        packed_a, maybe_packed_b, ldb,
+                        clamp_min, clamp_max, mma_pack_f32_fn[1]);
+        packed_a += ldd_a;
     }
     for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
-        mrkcnc_mma_direct(Nc, Kc,
-                          c + m * ldc, ldc,
-                          a + m * lda, lda,
-                          maybe_packed_b, ldb,
-                          clamp_min, clamp_max,
-                          mma_direct_f32_fn[2]);
+        mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
+                        packed_a, maybe_packed_b, ldb,
+                        clamp_min, clamp_max, mma_pack_f32_fn[2]);
+        packed_a += ldd_a;
     }
 }
 
-// f16 — pack
-// packed_a stride = align_up(MR[i] * Kc * sizeof(half), PANEL_ALIGN_BYTES) / sizeof(half)
-void tile_mma_pack(int Mc, int Nc, int Kc,
-                 half* c, int ldc,
-                 const half* packed_a, const half* maybe_packed_b, int ldb,
-                 float clamp_min, float clamp_max) {
-
-    int m = 0;
-    for(; m + MR_F16[0] <= Mc; m += MR_F16[0]) {
-        mrkcnc_mma_pack(Nc, Kc,
-                        c + m * ldc, ldc,
-                        packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max,
-                        mma_pack_f16_fn[0]);
-        packed_a += align_up<PANEL_ALIGN_BYTES>(MR_F16[0] * Kc * sizeof(half)) / sizeof(half);
-    }
-
-    for(; m + MR_F16[1] <= Mc; m += MR_F16[1]) {
-        mrkcnc_mma_pack(Nc, Kc,
-                        c + m * ldc, ldc,
-                        packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max,
-                        mma_pack_f16_fn[1]);
-        packed_a += align_up<PANEL_ALIGN_BYTES>(MR_F16[1] * Kc * sizeof(half)) / sizeof(half);
-    }
-
-    for(; m + MR_F16[2] <= Mc; m += MR_F16[2]) {
-        mrkcnc_mma_pack(Nc, Kc,
-                        c + m * ldc, ldc,
-                        packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max,
-                        mma_pack_f16_fn[2]);
-        packed_a += align_up<PANEL_ALIGN_BYTES>(MR_F16[2] * Kc * sizeof(half)) / sizeof(half);
-    }
-}
-
-
-// f16 — direct
-// A is raw (indexed via lda), B may be packed (ldb < 0) or raw
+// f32 — direct: A raw via lda, B raw via ldb
 void tile_mma_direct(int Mc, int Nc, int Kc,
+                     float* c, int ldc,
+                     const float* a, int lda,
+                     const float* b, int ldb,
+                     float clamp_min, float clamp_max) {
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
+    int m = 0;
+    for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
+        mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
+                          a + m * lda, lda, b, ldb,
+                          clamp_min, clamp_max, mma_direct_f32_fn[0]);
+    }
+    for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
+        mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
+                          a + m * lda, lda, b, ldb,
+                          clamp_min, clamp_max, mma_direct_f32_fn[1]);
+    }
+    for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
+        mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
+                          a + m * lda, lda, b, ldb,
+                          clamp_min, clamp_max, mma_direct_f32_fn[2]);
+    }
+}
+
+// f16 — packed: packed_a advances contiguously by mr*Kc
+void tile_mma_pack(int Mc, int Nc, int Kc,
                    half* c, int ldc,
-                   const half* a, int lda,
-                   const half* maybe_packed_b, int ldb,
+                   const half* packed_a, const half* maybe_packed_b, int ldb,
                    float clamp_min, float clamp_max) {
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F16[0] * Kc * static_cast<int>(sizeof(half))) / static_cast<int>(sizeof(half));
     int m = 0;
     for(; m + MR_F16[0] <= Mc; m += MR_F16[0]) {
-        mrkcnc_mma_direct(Nc, Kc,
-                          c + m * ldc, ldc,
-                          a + m * lda, lda,
-                          maybe_packed_b, ldb,
-                          clamp_min, clamp_max,
-                          mma_direct_f16_fn[0]);
+        mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
+                        packed_a, maybe_packed_b, ldb,
+                        clamp_min, clamp_max, mma_pack_f16_fn[0]);
+        packed_a += ldd_a;
     }
     for(; m + MR_F16[1] <= Mc; m += MR_F16[1]) {
-        mrkcnc_mma_direct(Nc, Kc,
-                          c + m * ldc, ldc,
-                          a + m * lda, lda,
-                          maybe_packed_b, ldb,
-                          clamp_min, clamp_max,
-                          mma_direct_f16_fn[1]);
+        mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
+                        packed_a, maybe_packed_b, ldb,
+                        clamp_min, clamp_max, mma_pack_f16_fn[1]);
+        packed_a += ldd_a;
     }
     for(; m + MR_F16[2] <= Mc; m += MR_F16[2]) {
-        mrkcnc_mma_direct(Nc, Kc,
-                          c + m * ldc, ldc,
-                          a + m * lda, lda,
-                          maybe_packed_b, ldb,
-                          clamp_min, clamp_max,
-                          mma_direct_f16_fn[2]);
+        mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
+                        packed_a, maybe_packed_b, ldb,
+                        clamp_min, clamp_max, mma_pack_f16_fn[2]);
+        packed_a += ldd_a;
+    }
+}
+
+// f16 — direct: A raw via lda, B raw via ldb
+void tile_mma_direct(int Mc, int Nc, int Kc,
+                     half* c, int ldc,
+                     const half* a, int lda,
+                     const half* b, int ldb,
+                     float clamp_min, float clamp_max) {
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F16[0] * Kc * static_cast<int>(sizeof(half))) / static_cast<int>(sizeof(half));
+    int m = 0;
+    for(; m + MR_F16[0] <= Mc; m += MR_F16[0]) {
+        mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
+                          a + m * lda, lda, b, ldb,
+                          clamp_min, clamp_max, mma_direct_f16_fn[0]);
+    }
+    for(; m + MR_F16[1] <= Mc; m += MR_F16[1]) {
+        mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
+                          a + m * lda, lda, b, ldb,
+                          clamp_min, clamp_max, mma_direct_f16_fn[1]);
+    }
+    for(; m + MR_F16[2] <= Mc; m += MR_F16[2]) {
+        mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
+                          a + m * lda, lda, b, ldb,
+                          clamp_min, clamp_max, mma_direct_f16_fn[2]);
     }
 }
 

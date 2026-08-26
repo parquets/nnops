@@ -4,22 +4,17 @@
 ///        interfaces.  Loop order: NKM (N outer, K middle, M inner).
 ///
 /// Workspace (pack buffers for A and B) is allocated externally — use
-/// matmul_get_workspace_size() to determine the required size.
+/// matmul_get_workspace_size() (declared in matmul_helper.h) to determine the
+/// required size.
 
 #include <cstddef>
 #include <span>
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/ops/matmul.hpp"
+#include "matmul_helper.h"
 
 namespace nnops::backend::cpu {
-
-/// Compute the workspace size (bytes) required by matmul_kernel for the given
-/// tensor descriptors and operator attributes.
-size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
-                                 const TensorDesc& a_desc,
-                                 const TensorDesc& b_desc,
-                                 const TensorDesc& c_desc);
 
 /// Tiled matrix multiplication: C = A x B   (2D GEMM, NKM loop order).
 ///
