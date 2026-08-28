@@ -190,3 +190,27 @@ NNOPS_TEST(tensor_desc_numel) {
     NNOPS_EXPECT_EQ(d.numel(), 24);
     NNOPS_EXPECT_EQ(static_cast<int64_t>(d.nbytes()), 24 * 4);
 }
+
+NNOPS_TEST(tensor_desc_row_stride_elems) {
+    // Default aggregate: 0 = unknown → compact.
+    TensorDesc d0;
+    NNOPS_EXPECT_EQ(d0.row_stride_elems, 0);
+
+    // Compact 2D view: row stride == last dim (W).
+    const int64_t shape2d[] = {5, 7};
+    float data2d[5 * 7] = {};
+    TensorView compact(shape2d, DataType::f32, data2d);
+    NNOPS_EXPECT_EQ(compact.desc().row_stride_elems, 7);
+
+    // Padded 2D view (explicit pitch): row stride == pitch / elem_size.
+    const int64_t pitch = 12 * 4;  // 12 floats per row, padded from 7
+    float data_pad[5 * 12] = {};
+    TensorView padded(shape2d, DataType::f32, data_pad, pitch);
+    NNOPS_EXPECT_EQ(padded.desc().row_stride_elems, 12);
+
+    // rank < 2: desc leaves row_stride_elems at 0.
+    const int64_t shape1d[] = {9};
+    float data1d[9] = {};
+    TensorView vec(shape1d, DataType::f32, data1d);
+    NNOPS_EXPECT_EQ(vec.desc().row_stride_elems, 0);
+}

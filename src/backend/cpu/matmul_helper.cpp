@@ -19,11 +19,6 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& b_desc,
                                  const TensorDesc& /*c_desc*/)
 {
-    // Only the packed path (transpose_a or transpose_b) uses a workspace;
-    // the direct path and the reference fallback need none.
-    if (!attrs.transpose_a && !attrs.transpose_b) {
-        return 0;
-    }
     const auto dt_a = a_desc.dtype;
     if (dt_a != b_desc.dtype) {
         return 0;
@@ -38,32 +33,42 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
     const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
                                         : b_desc.dims[static_cast<size_t>(b_rank - 1)];
 
-    int kc, mr_max, nr_max;
+    // Physical row strides (elements): use the desc pitch when present, else the
+    // compact last-dim size. This keeps sizing consistent with the kernel's
+    // runtime lda/ldb even for padded, non-transposed matrices.
+    const int64_t lda = (a_desc.row_stride_elems > 0)
+        ? a_desc.row_stride_elems : a_desc.dims[static_cast<size_t>(a_rank - 1)];
+    const int64_t ldb = (b_desc.row_stride_elems > 0)
+        ? b_desc.row_stride_elems : b_desc.dims[static_cast<size_t>(b_rank - 1)];
+
+    int kc, nr_max;
     size_t elem;
-    const int* mr;
     const int* nr;
     if (dt_a == DataType::f32) {
-        kc = KC_F32;  mr_max = MR_MAX_F32;  nr_max = NR_MAX_F32;  elem = sizeof(float);
-        mr = MR_F32;  nr = NR_F32;
+        kc = KC_F32;  nr_max = NR_MAX_F32;  elem = sizeof(float);  nr = NR_F32;
     } else if (dt_a == DataType::f16) {
-        kc = KC_F16;  mr_max = MR_MAX_F16;  nr_max = NR_MAX_F16;  elem = sizeof(half);
-        mr = MR_F16;  nr = NR_F16;
+        kc = KC_F16;  nr_max = NR_MAX_F16;  elem = sizeof(half);   nr = NR_F16;
     } else {
         return 0;  // unsupported dtype → reference fallback, no workspace
     }
 
-    // Same tile sizes as matmul_kernel's packed path (shared resolver).
-    int mc, nc;
-    resolve_tile_sizes(static_cast<int>(M), static_cast<int>(N),
-                       mr_max, nr_max, kc, static_cast<int>(elem), mc, nc);
+    // Global plan (full M×N) mirrors the kernel's dispatch: a workspace is
+    // needed iff pack_b. The size is thread-count invariant — per-block panel
+    // slices tile the buffer exactly, so only the global shape matters here.
+    const bool pack_b = (dt_a == DataType::f32)
+        ? make_pack_plan<float>(attrs, M, N, lda, ldb).pack_b
+        : make_pack_plan<half>(attrs, M, N, lda, ldb).pack_b;
+    if (!pack_b) {
+        return 0;
+    }
 
-    // Uniform 64-byte-aligned panel strides at the full Kc (upper bound of any
-    // per-k-block stride, matching the kernel's pack_b = pack_a + num_panels_a
-    // * ldd_a layout).
-    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * kc * static_cast<int>(elem)) / static_cast<int>(elem);
+    // Packed B panels sit at the workspace base at a uniform 64-byte-aligned
+    // full-Kc stride. Each n-block owns num_panels(nc, nr) panels at this
+    // stride and the blocks tile the buffer exactly, so the total is
+    // num_panels(N, nr) panels — independent of nc and of the thread count.
     const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(elem)) / static_cast<int>(elem);
 
-    return workspace_bytes(mc, nc, ldd_a, ldd_b, elem, mr, nr);
+    return static_cast<size_t>(num_panels(static_cast<int>(N), nr)) * static_cast<size_t>(ldd_b) * elem;
 }
 
 // ---- pack function pointer types ---------------------------------------

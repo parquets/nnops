@@ -8,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace nnops::test {
 
@@ -34,4 +35,21 @@ inline void report_bench(const BenchResult& r) {
               << " (" << r.iterations << " iters)" << std::endl;
 }
 
+// ---- benchmark registration (mirrors the test framework) ----
+using BenchFn = std::function<void()>;
+
+inline std::vector<BenchFn>& bench_registry() {
+    static std::vector<BenchFn> reg;
+    return reg;
+}
+
+struct BenchRegistrar {
+    explicit BenchRegistrar(BenchFn fn) { bench_registry().push_back(std::move(fn)); }
+};
+
 }  // namespace nnops::test
+
+#define NNOPS_BENCH(name) \
+    static void _nnops_bench_##name(); \
+    static ::nnops::test::BenchRegistrar _nnops_bench_reg_##name(_nnops_bench_##name); \
+    static void _nnops_bench_##name()

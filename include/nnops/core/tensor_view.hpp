@@ -40,6 +40,10 @@ struct TensorDesc {
     DataType dtype = DataType::f32;
     TensorLayout layout = TensorLayout::NCHW;
 
+    /// Actual row stride in elements (source view pitch / elem_size).
+    /// 0 = unknown → consumers must treat the tensor as compact (last_dim elems/row).
+    int64_t row_stride_elems = 0;
+
     /// Total number of logical elements.
     /// For packed layouts (NCHWC8, etc.), counts storage elements
     /// including channel block rounding: ceil(C/pack) × pack instead of C.
@@ -257,6 +261,9 @@ public:
         d.dims = shape_;
         d.dtype = dtype_;
         d.layout = layout_;
+        if (rank_ >= 2) {
+            d.row_stride_elems = pitch_ / static_cast<int64_t>(data_type_size(dtype_));
+        }
         return d;
     }
 

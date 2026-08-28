@@ -5,6 +5,8 @@
 
 int main() {
     std::cout << "=== nnops benchmarks ===" << std::endl;
-    // Benchmarks are registered and run from bench_conv2d.cpp etc.
+    for (auto& fn : nnops::test::bench_registry()) {
+        fn();
+    }
     return 0;
 }

@@ -1,38 +1,67 @@
 # How to Optimize GEMM — Design Notes for the Tiled MatMul Backend
 
 A record of the optimization decisions, constraints, and trade-offs that shaped the
-tiled GEMM implementation in [src/backend/cpu/matmul.cpp](../src/backend/cpu/matmul.cpp).
+tiled GEMM implementation in [src/backend/cpu/matmul.cpp](../src/backend/cpu/matmul.cpp)
+and the shared pack/MMA helpers in [src/backend/cpu/matmul_helper.h](../src/backend/cpu/matmul_helper.h).
 
 ---
 
 ## 1. High-Level Architecture
 
-### 1.1 Loop Order: NKM
+### 1.1 Loop Order: NKM and MKN (plan-driven)
+
+The loop order is chosen by the static pack decision, not hard-coded:
 
 ```text
-for n in [0..N, step Nc]:         # N outer
-  for k in [0..K, step Kc]:       # K middle
-    for m in [0..M, step Mc]:     # M inner
+NKM (default)                       MKN (A-only pack)
+for n in [0..N, step Nc]:           for k in [0..K, step Kc]:
+  for k in [0..K, step Kc]:           for m in [0..M, step Mc]:
+    for m in [0..M, step Mc]:           for n in [0..N, step Nc]:
 ```
 
 **Why NKM?** B is packed once per Kc×Nc block in the K-loop and reused across all
 M panels. Putting N outermost means packed_B stays live in L2 across the entire M
 sweep, maximizing reuse of the packed RHS.
 
-Contrast with KMN (A-packed reuse) or MNK (many C reloads). NKM gives the best
-L2 residency for the tiled data under the constraint that B is always packed.
+**Why MKN?** When *only* A is packed (B stays raw), the A pack is the expensive
+operation, so we hoist it: A is packed once per Kc×Mc block and reused across the
+entire N sweep. Packing B in MKN order would re-pack B `M/mc` times, so MKN is
+chosen *only* when `pack_a && !pack_b`.
 
-### 1.2 Packing Strategy
+**Routing table** (see `make_pack_plan<T>` in matmul_helper.h):
 
-- **B (RHS) — Always packed.** Packing transposes or copies B into a contiguous
-  Kc×Nc layout consumed by the MMA micro-kernel.
-- **A (LHS) — Conditional.** Skipped only when `sizeof(elem) × lda < 4096` **and**
-  `!transpose_a`. When the row stride fits in one page, the TLB and L1 cache handle
-  the strided access cheaply enough; packing adds unnecessary overhead.
+| pack_a | pack_b | loop order | mma call                          | split dim |
+|--------|--------|------------|-----------------------------------|-----------|
+| ✓      | ✓      | NKM (fused)| `tile_mma_pack(..., -1)`          | N |
+| ✓      | ✗      | **MKN**    | `tile_mma_pack(..., b_raw, ldb)`  | M |
+| ✗      | ✓      | NKM (fused)| `tile_mma_direct(..., pack_b, -1)`| N |
+| ✗      | ✗      | NKM (direct)| `tile_mma_direct(..., b_raw, ldb)`| N |
 
-When A is packed, the layout switches from row-major to **interleaved**:
-`A[m + k × mr]` — mr elements from each k-step, so the MMA kernel loads contiguous
-vectors along k.
+### 1.2 Packing Strategy — static cost model (`PackPlan`)
+
+The decision lives in one place: `make_pack_plan<T>(attrs, M_s, N_s, lda, ldb)`.
+
+```text
+pack_a = transpose_a || (N_s > nc && lda > thr)
+pack_b = transpose_b || (M_s > mc && ldb > thr)
+mkn_order = pack_a && !pack_b
+thr = 4096 / sizeof(T)   // page-size heuristic: f32 → 1024, f16 → 2048
+```
+
+Rules, in order:
+
+1. **Correctness.** `transpose_a ⇒ pack_a`, `transpose_b ⇒ pack_b` — the
+   micro-kernel requires A as `[m][k]` and B as `[k][nr]` panels.
+2. **Stride + reuse.** Pack only when the row stride is page-scattered (`lda/ldb > thr`)
+   **and** the panel is actually re-read across tile blocks (A is re-read `N_s/nc`
+   times, B `M_s/mc` times). A single-pass read is never worth the extra copy.
+3. **Loop order.** MKN only when A is packed and B is raw.
+
+The **global vs per-slab** split matters under threading: `pack_b` is decided
+globally (workspace is a global resource; sizing can't know the thread count), while
+`pack_a` can be refined per-slab (the stack buffer is per-thread): under an N-split,
+each thread reads A exactly once, so stride-triggered `pack_a` collapses to
+`transpose_a`.
 
 ### 1.3 Workspace Model (TensorRT Pattern)
 
@@ -40,7 +69,16 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
 
 - `TensorDesc` carries metadata only (dims, dtype, layout) — no data pointer.
 - `getWorkspaceSize(inputs, outputs)` returns the byte count. The caller allocates.
-- Workspace layout: `[packed_A (Mc × Kc × elem)] [packed_B (Nc × Kc × elem)]`.
+- **Workspace holds packed B only.** Packed A lives in a 72 KB per-thread stack
+  buffer (`MC_TARGET × Kc × elem`: f32 144×128×4, f16 144×256×2), so every
+  `pack_a`-only / direct path needs **zero** workspace.
+- `TensorDesc.row_stride_elems` carries the source view's physical row pitch (in
+  elements) through the sizing path, so a wide non-transposed B is sized correctly.
+  `0` = unknown → treat as compact (`last_dim` elems/row).
+- **Thread-count invariant sizing.** Each n-block owns `num_panels(nc, nr)` packed-B
+  panels at a uniform 64-byte-aligned full-Kc stride; the blocks tile the buffer
+  exactly, so the total is `num_panels(N, nr) × ldd_b × elem` — independent of both
+  `nc` and the thread count.
 
 ---
 
@@ -55,15 +93,15 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
 
 ### 2.2 Mc — Free Parameter
 
-**Mc = 192** — chosen to be divisible by the largest mr on both architectures:
+**Mc = 144 (`MC_TARGET`)** — chosen to be divisible by the largest mr on both
+architectures:
 
-- x86_64: 192 / 6 = 32 panels (also clean for mr=4: 48 panels)
-- aarch64: 192 / 8 = 24 panels (also clean for mr=4: 48 panels)
+- x86_64: 144 / 6 = 24 panels (also clean for mr=4: 36 panels)
+- aarch64: 144 / 8 = 18 panels (also clean for mr=4: 36 panels)
 
-Larger Mc amortizes B-packing cost over more M rows. But going too large eats L2
-capacity and hurts cache residency of packed_B. 192 is a pragmatic balance —
-reasonably large for throughput, clean on both arches, and keeps the A pack buffer
-at a modest 96 KB (f32, Kc=128).
+Larger Mc amortizes B-packing cost over more M rows, but too large eats L2 capacity
+and hurts packed_B residency. 144 keeps the A pack stack buffer at exactly 72 KB on
+both arches (f32: 144×128×4; f16: 144×256×2 — same byte count).
 
 ### 2.3 Nc — L2 Cache Constraint (the key derivation)
 
@@ -180,8 +218,8 @@ for (int mi = 0; mi < 3 && m_off < mc_actual; ++mi) {
 }
 ```
 
-This ensures Mc = 192 decomposes cleanly as 32 × mr0 on x86_64 (192/6 = 32)
-and 24 × mr0 on aarch64 (192/8 = 24) — no remainder panels needed.
+This ensures Mc = 144 decomposes cleanly as 24 × mr0 on x86_64 (144/6 = 24)
+and 18 × mr0 on aarch64 (144/8 = 18) — no remainder panels needed.
 
 ---
 
@@ -195,9 +233,10 @@ Two dispatch families per dtype:
 C[mr][nr] += A[mr][Kc] × B[Kc][nr]
 ```
 
-A is row-major with stride `lda`; B is packed contiguous. The kernel broadcasts
-a single A element per K-step and multiplies it against a vector of B, accumulating
-into registers. Used when A's stride is small enough to skip packing.
+A is row-major with stride `lda`; B is packed contiguous (or raw, signalled by
+`ldb >= 0`). The kernel broadcasts a single A element per K-step and multiplies it
+against a vector of B, accumulating into registers. Used when A's stride is small
+enough to skip packing.
 
 ### 5.2 mma_pack (A packed)
 
@@ -205,16 +244,21 @@ into registers. Used when A's stride is small enough to skip packing.
 C[mr][nr] += A[mr][Kc] × B[Kc][nr]
 ```
 
-A is interleaved (`A[m + k × mr]`); B is packed contiguous. Both inputs are
-contiguous in the k-dimension, enabling fully vectorized inner loops with no
-strided access.
+A is interleaved (`A[m + k × mr]`); B is packed contiguous (or raw via `ldb`). Both
+inputs are contiguous in the k-dimension when B is packed, enabling fully vectorized
+inner loops with no strided access.
+
+**The `ldb < 0` convention** describes B for both entry points: `ldb < 0` means B
+is packed ([K][nr], panels advance by the aligned stride `ldd_b`); `ldb >= 0` means
+B is raw (row stride `ldb`). This single convention lets one fused kernel serve
+`pack_b`/raw-B, and `transpose_b`/non-transposed B alike.
 
 ### 5.3 Kernel Name Composition (Macro-Based)
 
 Architecture-specific kernels use `#ifdef` blocks only at the top of
-[imatmul.cpp](../src/backend/cpu/imatmul.cpp). The dispatch logic is shared:
-macros paste `mr` and `nr` into kernel names (e.g., `mma_pack_6x16_f32`), and
-the compiler resolves the correct specialization at compile time.
+[matmul_helper.cpp](../src/backend/cpu/matmul_helper.cpp). The dispatch logic is
+shared: macros paste `mr` and `nr` into kernel names (e.g., `mma_pack_6x16_f32`),
+and the compiler resolves the correct specialization at compile time.
 
 ---
 
@@ -228,40 +272,68 @@ the compiler resolves the correct specialization at compile time.
 
 Fusing Relu into the MMA kernel avoids a separate pass over C. The clamp
 is applied per-element as the accumulation completes, inside the register file.
+Beta scaling (`C = A×B + beta×C`) is fused into the first k-block (`tile_scale`).
 
 ---
 
-## 7. Key Design Decisions
+## 7. Multithreading
 
-1. **2D only for v1.** Batched matmul (rank > 2) falls through to the reference
-   kernel. Batched tiling adds significant complexity (broadcast semantics, stride
-   management across batch dims) and is deferred.
+The tiled kernel is parallelized through `ctx.cpu_parallel_for` at **tile-block**
+granularity (not bare rows): N-split produces `ceil(N/nc)` blocks, M-split
+`ceil(M/mc)` blocks.
 
-2. **No multi-threading in v1.** The tiled kernel is single-threaded. Parallel
-   decomposition across the N or M dimension is a natural next step.
+- **Split dimension** follows the routing table: MKN → M-split (A-pack traffic
+  stays MK), everything else → N-split (BLIS convention).
+- **No barriers, no reductions.** Each block writes a disjoint C tile; the k-loop is
+  independent per thread. The result is **bit-identical to serial** — the thread
+  count does not change any output value (asserted by `matmul_threaded_matches_serial`).
+- **Workspace slicing.** Each n-block's packed-B panels start at
+  `workspace + blk × num_panels(nc,nr) × ldd_b × elem`; panel ranges are disjoint,
+  so the total stays `num_panels(N,nr)` regardless of thread count.
+- **Per-slab pack_a refinement.** Under N-split, each thread reads A once, so
+  `pack_a` reduces to `transpose_a` (stride-triggered packing is correctly disabled).
+- **Batched matmul** iterates batch elements serially, parallelizing *within* each
+  element. Flattening `(batch × block)` is a possible future extension.
+- **L2 contention.** With T threads, T hot working sets may exceed L2 and spill to
+  L3 — consistent with BLIS/OpenBLAS. Shrinking `nc` per-thread would restore
+  residency but break the thread-count-invariant workspace formula; noted as a future
+  tuning point. (The large L2-derived `nc ≈ 224–240` also means an N-split over
+  N ≈ 1024 yields only ~2–4 blocks — the M-split MKN path scales better on such
+  shapes.)
+
+---
+
+## 8. Key Design Decisions
+
+1. **2D + batched.** Rank-2 runs the fused tiled kernels; rank > 2 runs the same
+   kernels per batch element with numpy-style broadcast (shared logic with the
+   reference). Non-f32/f16 dtypes fall through to the reference kernel.
+
+2. **Multi-threading is now in.** Parallel decomposition is block-granularity and
+   bit-identical to serial; see §7.
 
 3. **External workspace allocation.** The kernel never allocates internally.
    `getWorkspaceSize()` lets the runtime pre-allocate once and reuse the buffer
    across operator invocations.
 
 4. **Architecture constants duplicated, not shared.** Panel sizes and half-precision
-   pointer types appear in both [imatmul.cpp](../src/backend/cpu/imatmul.cpp) and
-   [matmul.cpp](../src/backend/cpu/matmul.cpp). This is intentional — they are ISA
-   facts, not implementation details. Each file is self-contained and can be read
-   without cross-referencing.
+   pointer types appear in both the pack/MMA helpers and the matmul kernels. This is
+   intentional — they are ISA facts, not implementation details. Each file is
+   self-contained and can be read without cross-referencing.
 
 5. **Runtime L2 detection, not compile-time.** Hardcoding L2 size to a lowest-common
    denominator wastes cache on larger CPUs. The CPUID path adds ~10 lines of code
    and pays for itself on any CPU with > 256 KB L2.
 
-6. **Mc = 192 is arbitrary but portable.** It divides cleanly by both 6 (x86_64
-   mr0) and 8 (aarch64 mr0), keeps workspace reasonable (~96 KB for A pack), and
-   amortizes B-packing overhead. Tuning Mc per-architecture or per-problem-size
-   could squeeze out more performance but adds complexity for diminishing returns.
+6. **Mc = 144 is arbitrary but portable.** It divides cleanly by both 6 (x86_64
+   mr0) and 8 (aarch64 mr0), keeps the A pack stack buffer at exactly 72 KB on both
+   arches, and amortizes B-packing overhead. Tuning Mc per-architecture or
+   per-problem-size could squeeze out more performance but adds complexity for
+   diminishing returns.
 
 ---
 
-## 8. References
+## 9. References
 
 - onnxruntime: `cpuid_info.h` / `cpuid_info.cc` — CPUID singleton pattern
 - TensorRT: `IPluginV2DynamicExt::getWorkspaceSize` — workspace sizing API

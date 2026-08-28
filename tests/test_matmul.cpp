@@ -13,7 +13,9 @@
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 
+#include <atomic>
 #include <vector>
+#include <thread>
 #include <cmath>
 
 using namespace nnops;
@@ -1028,12 +1030,12 @@ NNOPS_TEST(matmul_random_transpose_b) {
 }
 
 // ============================================================
-// Packed path (with workspace) — SIMD pack + MMA kernels
+// Fused path — SIMD pack + MMA kernels
 // ============================================================
 //
-// The workspace-less tests above fall back to the reference kernel for
-// transposed cases; these tests allocate matmul_get_workspace_size() bytes so
-// the fused pack + MMA path is exercised, and compare against matmul_ref.
+// These tests exercise the fused pack + MMA path: packed A lives on the
+// kernel stack, packed B in the workspace (matmul_get_workspace_size() is
+// nonzero only for transpose_b), and results are compared against matmul_ref.
 
 NNOPS_TEST(matmul_packed_transpose_both_workspace) {
     auto [a_vec, a] = test::make_random_tensor({13, 21});   // phys [K, M] (transpose_a)
@@ -1176,8 +1178,9 @@ NNOPS_TEST(matmul_packed_batched_workspace) {
 }
 
 NNOPS_TEST(matmul_packed_f16_workspace) {
-    // f16 transpose_a through the packed path, compared against the f32
-    // reference computed from the f16 inputs (loose tolerance for f16).
+    // f16 transpose_a through the fused path (A packed on the stack, zero
+    // workspace), compared against the f32 reference computed from the f16
+    // inputs (loose tolerance for f16).
     auto [a_f32, _] = test::make_random_tensor({7, 6}, -1.0f, 1.0f, 777);  // phys [K, M]
     auto [b_f32, __] = test::make_random_tensor({7, 5}, -1.0f, 1.0f, 888);  // [K, N]
     auto a_f16 = test::f32_to_f16(a_f32);
@@ -1201,8 +1204,9 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
     std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
 
+    // transpose_a-only packs A on the kernel stack — no workspace needed.
     std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
-    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+    NNOPS_EXPECT_EQ(workspace.size(), 0u);
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, workspace.data());
@@ -1223,4 +1227,347 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
         float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
         NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], 5e-2f);
     }
+}
+
+// ============================================================
+// Pack-decision + threading helpers
+// ============================================================
+
+// Build a 2D TensorView with an explicit row pitch (elements), filling only the
+// logical [rows, cols] region with random data (padding lanes stay 0 so any
+// accidental read of padding would corrupt the comparison).
+static std::pair<std::vector<float>, TensorView>
+make_padded_f32(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
+    std::vector<float> buf(static_cast<size_t>(rows * pitch_elems), 0.0f);
+    nnops::test::XorShift128 rng(seed);
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t c = 0; c < cols; ++c) {
+            buf[static_cast<size_t>(r * pitch_elems + c)] = rng.next_float(-1.0f, 1.0f);
+        }
+    }
+    const int64_t shape[] = {rows, cols};
+    TensorView tv(shape, DataType::f32, buf.data(),
+                  pitch_elems * static_cast<int64_t>(sizeof(float)));
+    return {std::move(buf), tv};
+}
+
+// Minimal fixed-size thread pool injecting cpu_parallel_for. Items in
+// [begin, end) are claimed via an atomic counter; each worker runs body(i)
+// until the range is exhausted.
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {}
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+};
+
+// ============================================================
+// Wide-stride pack decision
+// ============================================================
+
+NNOPS_TEST(matmul_padded_b_stride_pack_b_workspace) {
+    // Non-transposed B with a wide row stride: pack_b triggers on stride
+    // (M > mc re-reads B, ldb > 1024 page-scattered) and the workspace must be
+    // sized for the whole N (multiple n-blocks tile the buffer).
+    const int64_t M = 256, K = 128, N = 2048;
+    auto [a_vec, a] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 101);
+    auto [b_vec, b] = make_padded_f32(K, N, /*pitch_elems=*/4096, 202);
+
+    NNOPS_EXPECT_EQ(b.desc().row_stride_elems, 4096);
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
+}
+
+NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
+    // f16 variant: stride threshold is 2048 (4096/sizeof(half)), so a 4096-elem
+    // pitch on B triggers pack_b; the packed result must match the f32 reference.
+    const int64_t M = 256, K = 256, N = 1024;
+    const int64_t pitch_elems = 4096;
+
+    auto [a_f32, _] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 303);
+    auto [b_f32, __] = make_padded_f32(K, N, pitch_elems, 404);
+    auto a_f16 = test::f32_to_f16(a_f32);
+    auto b_f16 = test::f32_to_f16(b_f32);
+
+    const int64_t a_shape[] = {M, K};
+    const int64_t b_shape[] = {K, N};
+    TensorView a(a_shape, DataType::f16, a_f16.data());
+    TensorView b(b_shape, DataType::f16, b_f16.data(),
+                 pitch_elems * static_cast<int64_t>(sizeof(nnops::backend::cpu::half)));
+
+    NNOPS_EXPECT_EQ(b.desc().row_stride_elems, pitch_elems);
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+
+    std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    const int64_t a32_shape[] = {M, K};
+    const int64_t b32_shape[] = {K, N};
+    TensorView a32(a32_shape, DataType::f32, a_f32.data());
+    TensorView b32(b32_shape, DataType::f32, b_f32.data(),
+                   pitch_elems * static_cast<int64_t>(sizeof(float)));
+    const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(ref_descs[0].numel());
+    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32, b32};
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (int64_t i = 0; i < descs[0].numel(); ++i) {
+        float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], 5e-2f);
+    }
+}
+
+NNOPS_TEST(matmul_padded_a_stride_correctness) {
+    // Wide row stride on A, but N <= nc (single n-block) → A is read once, so
+    // the stride pack must NOT trigger; the direct path reads A raw via lda.
+    const int64_t M = 512, K = 512, N = 512;
+    auto [a_vec, a] = make_padded_f32(M, K, /*pitch_elems=*/2048, 707);
+    auto [b_vec, b] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 808);
+
+    NNOPS_EXPECT_EQ(a.desc().row_stride_elems, 2048);
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_EQ(workspace.size(), 0u);  // no pack → no workspace
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
+}
+
+NNOPS_TEST(matmul_mkn_transpose_a_multik) {
+    // transpose_a only → pack_a && !pack_b → MKN loop order. Multi-k and
+    // multi-m blocks exercise beta@k==0, Relu clamp, and the last-k epilogue.
+    const int64_t K = 300, M = 256, N = 128;
+    auto [a_vec, a] = test::make_random_tensor({K, M}, -1.0f, 1.0f, 505);  // phys [K, M]
+    auto [b_vec, b] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 606);  // [K, N]
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = true;
+    attrs.beta = 0.5f;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    // transpose_a only packs A on the kernel stack — no workspace needed.
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    NNOPS_EXPECT_EQ(workspace.size(), 0u);
+
+    std::vector<float> out_buf(descs[0].numel(), 1.0f);  // prefill for beta
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, workspace.data());
+
+    std::vector<float> ref_buf(descs[0].numel(), 1.0f);
+    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
+}
+
+// ============================================================
+// Multithreading: bit-identical to serial
+// ============================================================
+
+namespace {
+struct MatmulInputs {
+    std::vector<float> a_buf, b_buf;
+    TensorView a, b;
+};
+
+MatmulInputs make_matmul_inputs(int64_t M, int64_t K, int64_t N,
+                                bool ta, bool tb, bool pad_b, uint64_t seed)
+{
+    const int64_t a_rows = ta ? K : M, a_cols = ta ? M : K;
+    const int64_t b_rows = tb ? N : K, b_cols = tb ? K : N;
+
+    auto [a_buf, a] = test::make_random_tensor({a_rows, a_cols}, -1.0f, 1.0f, seed);
+    std::vector<float> b_buf;
+    TensorView b;
+    if (pad_b) {
+        const int64_t pitch = b_cols + 2048;  // wide stride (> 1024 → pack_b)
+        b_buf.assign(static_cast<size_t>(b_rows * pitch), 0.0f);
+        nnops::test::XorShift128 rng(seed + 1);
+        for (int64_t r = 0; r < b_rows; ++r) {
+            for (int64_t c = 0; c < b_cols; ++c) {
+                b_buf[static_cast<size_t>(r * pitch + c)] = rng.next_float(-1.0f, 1.0f);
+            }
+        }
+        const int64_t shape[] = {b_rows, b_cols};
+        b = TensorView(shape, DataType::f32, b_buf.data(),
+                       pitch * static_cast<int64_t>(sizeof(float)));
+    } else {
+        auto [buf, view] = test::make_random_tensor({b_rows, b_cols}, -1.0f, 1.0f, seed + 1);
+        b_buf = std::move(buf);
+        b = view;
+    }
+    return {std::move(a_buf), std::move(b_buf), a, b};
+}
+}  // anonymous namespace
+
+NNOPS_TEST(matmul_threaded_matches_serial) {
+    // Threading is bit-identical to serial: blocks write disjoint C tiles with
+    // no reductions, so the thread count must not change any result.
+    const int64_t M = 200, K = 160, N = 300;
+
+    struct Case { const char* name; bool ta; bool tb; bool pad_b; };
+    const Case cases[] = {
+        {"nn", false, false, false},
+        {"ta", true, false, false},
+        {"tb", false, true, false},
+        {"tatb", true, true, false},
+        {"pad_b", false, false, true},
+    };
+
+    for (const Case& c : cases) {
+        for (int nthreads : {2, 4}) {
+            MatmulInputs in = make_matmul_inputs(M, K, N, c.ta, c.tb, c.pad_b, 1234);
+
+            MatMulAttributes attrs{};
+            attrs.transpose_a = c.ta;
+            attrs.transpose_b = c.tb;
+            auto op = MatMul::create(attrs, Backend::CPU);
+
+            auto a_desc = in.a.desc();
+            auto b_desc = in.b.desc();
+            const TensorDesc arr[] = {a_desc, b_desc};
+            auto descs = op->getOutputTensorDesc(arr);
+
+            std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+            const TensorView ins[] = {in.a, in.b};
+
+            // Serial (no parallelism hook).
+            std::vector<float> serial_buf(descs[0].numel());
+            auto serial_out = test::make_planar(descs[0], serial_buf.data());
+            op->compute(serial_out, ins, {}, workspace.data());
+
+            // Threaded via SimplePool.
+            SimplePool pool(nthreads);
+            ComputeContext ctx;
+            ctx.cpu_parallel_for = [&pool](int64_t b, int64_t e, const ParallelForBody& body) {
+                pool.parallel_for(b, e, body);
+            };
+            std::vector<float> threaded_buf(descs[0].numel());
+            auto threaded_out = test::make_planar(descs[0], threaded_buf.data());
+            op->compute(threaded_out, ins, ctx, workspace.data());
+
+            // Bit-identical: disjoint C tiles, no reductions.
+            for (int64_t i = 0; i < descs[0].numel(); ++i) {
+                if (serial_buf[static_cast<size_t>(i)] != threaded_buf[static_cast<size_t>(i)]) {
+                    throw std::runtime_error(
+                        std::string("matmul_threaded_matches_serial: bit mismatch at ") +
+                        std::to_string(i) + " (case " + c.name + ", " +
+                        std::to_string(nthreads) + " threads)");
+                }
+            }
+
+            // Both match the reference.
+            std::vector<float> ref_buf(descs[0].numel());
+            auto ref_out = test::make_planar(descs[0], ref_buf.data());
+            nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+            NNOPS_EXPECT_TRUE(test::allclose(serial_out, ref_out, 1e-3f, 1e-4f));
+        }
+    }
+}
+
+NNOPS_TEST(matmul_threaded_batched) {
+    // Batched matmul with the threading pool: each batch element parallelizes
+    // independently; the result must still match the reference.
+    const int64_t B = 3, M = 96, K = 128, N = 160;
+    auto [a_vec, a] = test::make_random_tensor({B, M, K}, -1.0f, 1.0f, 909);
+    auto [b_vec, b] = test::make_random_tensor({B, K, N}, -1.0f, 1.0f, 1010);
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+
+    SimplePool pool(4);
+    ComputeContext ctx;
+    ctx.cpu_parallel_for = [&pool](int64_t b0, int64_t e, const ParallelForBody& body) {
+        pool.parallel_for(b0, e, body);
+    };
+
+    std::vector<float> out_buf(descs[0].numel());
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, ctx, workspace.data());
+
+    std::vector<float> ref_buf(descs[0].numel());
+    auto ref_out = test::make_planar(descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
 }

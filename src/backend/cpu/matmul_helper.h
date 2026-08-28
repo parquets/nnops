@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <type_traits>
 
 // ---- arch-specific includes --------------------------------------------
 
@@ -94,7 +95,7 @@ constexpr int KC_F16   = 256;
 constexpr int KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
 constexpr int KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 
-constexpr int MC_TARGET = 192;  // 192/6=32 (x86), 192/8=24 (aarch64)
+constexpr int MC_TARGET = 144;  // 144/6=24 (x86), 144/8=18 (aarch64)
 
 // 64-byte aligned panel strides (in elements): ldd = align_up(mr_max * kc * sizeof(T), 64) / sizeof(T)
 constexpr int LDD_A_F32 = (MR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
@@ -137,11 +138,68 @@ inline void resolve_tile_sizes(int M, int N, int mr_max, int nr_max, int kc,
                   nr_max, N);
 }
 
+// =========================================================================
+//  Pack decision — static cost model (single source of truth)
+// =========================================================================
+
+/// Static pack decision for one GEMM computation scope.
+struct PackPlan {
+    bool pack_a = false;     ///< A packed into the stack buffer (transpose_a or wide stride)
+    bool pack_b = false;     ///< B packed into the workspace (transpose_b or wide stride)
+    bool mkn_order = false;  ///< MKN loop order (only when pack_a && !pack_b)
+};
+
+/// Page-size heuristic (elements): 4096 / sizeof(T) → f32 1024, f16 2048.
+/// A row stride at or above one page makes the NKM/MKN panel reads page-scattered,
+/// so packing into a contiguous 64-byte-aligned panel wins — but only when the
+/// matrix is actually re-read across tile blocks (see the reuse guards below).
+template <class T>
+constexpr int pack_threshold_elems() {
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
+                  "pack_threshold_elems: only float/half are supported");
+    return 4096 / static_cast<int>(sizeof(T));
+}
+
+/// Decide whether A and B should be packed for a GEMM over the row/column range
+/// M_s × N_s, given the physical row strides lda/ldb (elements).
+///
+/// M_s / N_s are the range *participating in this computation scope*: the full
+/// M×N for the global plan (workspace sizing, split-dimension choice), or a
+/// per-slab range for the stack-resident A pack refinement (reuse counts must be
+/// measured against what the slab actually reads). Rules:
+///   1. correctness: transpose_a ⇒ pack_a, transpose_b ⇒ pack_b
+///   2. stride+reuse: pack only when the stride is wide AND the panel is re-read
+///      across multiple tile blocks (A re-read N_s/nc times, B re-read M_s/mc
+///      times); a single-pass read is never worth the extra copy
+///   3. loop order: MKN (k{m{n}}) amortizes the A pack; it is only chosen when A
+///      is packed and B is raw (packing B too would amplify B-pack traffic)
+template <class T>
+inline PackPlan make_pack_plan(const MatMulAttributes& attrs,
+                               int64_t M_s, int64_t N_s,
+                               int64_t lda, int64_t ldb) {
+    constexpr int mr_max = mr_max_flt<T>();
+    constexpr int nr_max = nr_max_flt<T>();
+    constexpr int kc     = std::is_same_v<T, float> ? KC_F32 : KC_F16;
+    constexpr int elem   = static_cast<int>(sizeof(T));
+
+    int mc, nc;
+    resolve_tile_sizes(static_cast<int>(M_s), static_cast<int>(N_s),
+                       mr_max, nr_max, kc, elem, mc, nc);
+
+    const int thr = pack_threshold_elems<T>();
+
+    PackPlan p;
+    p.pack_a    = attrs.transpose_a || (N_s > nc && lda > thr);
+    p.pack_b    = attrs.transpose_b || (M_s > mc && ldb > thr);
+    p.mkn_order = p.pack_a && !p.pack_b;
+    return p;
+}
+
 /// Number of panels for the largest-first decomposition of `n` into the three
 /// sizes nr[0] >= nr[1] >= nr[2] (== 1). This is what the pack/MMA loops
 /// actually emit, so workspace sizing must match it exactly (a simple
 /// ceil(n / nr[0]) under-counts when the tail decomposes into nr=1 panels).
-inline int num_panels(int n, const int* nr) noexcept {
+constexpr int num_panels(int n, const int* nr) noexcept {
     int count = 0;
     int i = 0;
     for (int s = 0; s < 3; ++s) {
@@ -150,21 +208,26 @@ inline int num_panels(int n, const int* nr) noexcept {
     return count;
 }
 
-/// Workspace = packed A + packed B, each panel laid out at a uniform
-/// 64-byte-aligned stride (ldd_a / ldd_b in elements). ldd_a/b are computed
-/// from the full Kc, upper-bounding any per-k-block stride.
-inline size_t workspace_bytes(int mc, int nc, int ldd_a, int ldd_b, size_t elem,
-                              const int* mr, const int* nr) noexcept {
-    return (static_cast<size_t>(num_panels(mc, mr)) * static_cast<size_t>(ldd_a) +
-            static_cast<size_t>(num_panels(nc, nr)) * static_cast<size_t>(ldd_b)) * elem;
+/// Stack-resident packed-A buffer size (elements) for one MC_TARGET×Kc tile at
+/// the full-Kc uniform stride — an upper bound for every per-k-block pack:
+///   f32: 144×128×4 = 72 KB, f16: 144×256×2 = 72 KB (KC_F16 = 256), both arches.
+/// Declared with alignas in the kernel.
+template <class T>
+constexpr int pack_a_stack_elems() {
+    constexpr const int* mr    = std::is_same_v<T, float> ? MR_F32 : MR_F16;
+    constexpr int       ldd_a  = std::is_same_v<T, float> ? LDD_A_F32 : LDD_A_F16;
+    return num_panels(MC_TARGET, mr) * ldd_a;
 }
 
 /// Compute the workspace size (bytes) required by matmul_kernel for the given
 /// tensor descriptors and operator attributes.
 ///
-/// Only the packed path (transpose_a or transpose_b, f32/f16) needs a
-/// workspace; all other paths return 0. The kernel uses the same tiling here,
-/// so the reported size always covers the kernel's pack buffers.
+/// A workspace is needed iff the *global* pack plan decides pack_b (transpose_b
+/// or a wide non-transposed B row stride). Packed A lives on the kernel stack,
+/// so every pack_a-only / direct path returns 0. The size is computed from the
+/// global M×N (not the thread count): the per-block panel slices tile the buffer
+/// exactly, so the formula below is thread-count invariant and always covers the
+/// kernel's pack_b buffer.
 size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& a_desc,
                                  const TensorDesc& b_desc,

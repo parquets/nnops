@@ -64,8 +64,8 @@ add_test(NAME nnops_test COMMAND nnops_test)
 
 # ---- Benchmarks (optional) ----
 if(NNOPS_BUILD_BENCHMARKS)
-    # Benchmarks are optional; add benchmark .cpp files here when ready.
-    # set(BENCH_SOURCES common/bench_harness.cpp bench_conv2d.cpp)
-    # add_executable(nnops_bench ${BENCH_SOURCES})
-    # target_link_libraries(nnops_bench PRIVATE nnops_cpu)
+    set(BENCH_SOURCES common/bench_harness.cpp bench_matmul.cpp)
+    add_executable(nnops_bench ${BENCH_SOURCES})
+    target_link_libraries(nnops_bench PRIVATE nnops_cpu)
+    target_include_directories(nnops_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 endif()
