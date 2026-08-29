@@ -72,14 +72,4 @@ private:
     Backend backend_;
 };
 
-/// Functional layout_convert — pack or unpack a single tensor.
-///
-/// The source layout is determined by input.layout().
-/// The target layout is specified explicitly.
-/// Supported pairs: NCHW↔NCHWC8, NCDHW↔NCDHWC8.
-void layout_convert(const TensorView& input,
-                    TensorView& output,
-                    TensorLayout target_layout,
-                    const ComputeContext& ctx = {});
-
 }  // namespace nnops

@@ -98,11 +98,4 @@ private:
     Backend backend_;
 };
 
-/// Functional grid_sample.
-void grid_sample(const TensorView& input,
-                 const TensorView& grid,
-                 TensorView& output,
-                 const GridSampleAttributes& attrs,
-                 const ComputeContext& ctx = {});
-
 }  // namespace nnops

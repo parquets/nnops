@@ -1,5 +1,5 @@
 /// Unit tests for Conv2D operator (CPU reference).
-/// Uses Conv2D class API exclusively — no functional conv2d() calls.
+/// Uses Conv2D class API exclusively.
 
 #include "nnops/ops/conv2d.hpp"
 #include "common/test_harness.hpp"

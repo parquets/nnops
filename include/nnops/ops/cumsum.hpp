@@ -74,14 +74,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional cumsum.
-void cumsum(const TensorView& input,
-            TensorView& output,
-            const CumSumAttributes& attrs = {},
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops

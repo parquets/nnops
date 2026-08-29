@@ -96,15 +96,4 @@ void Activation::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void activation(const TensorView& input,
-                TensorView& output,
-                const ActivationAttributes& attrs,
-                const ComputeContext& ctx)
-{
-    auto op = Activation::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

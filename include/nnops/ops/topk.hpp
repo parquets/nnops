@@ -89,20 +89,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional TopK operation.
-/// @param input   Input tensor.
-/// @param values  Output values tensor (axis dim replaced by k).
-/// @param indices Output indices tensor (int64, same shape as values).
-/// @param attrs   TopK attributes (k, axis, type, sorted).
-/// @param ctx     Compute context.
-void topk(const TensorView& input,
-          TensorView& values,
-          TensorView& indices,
-          const TopKAttributes& attrs = {},
-          const ComputeContext& ctx = {});
-
 }  // namespace nnops

@@ -105,10 +105,4 @@ private:
     Backend backend_;
 };
 
-/// Functional pooling.
-void pooling(const TensorView& input,
-             TensorView& output,
-             const PoolingAttributes& attrs,
-             const ComputeContext& ctx = {});
-
 }  // namespace nnops

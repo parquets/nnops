@@ -85,14 +85,4 @@ void Concat::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void concat(std::span<const TensorView> inputs,
-            TensorView& output,
-            const ConcatAttributes& attrs,
-            const ComputeContext& ctx)
-{
-    auto op = Concat::create(attrs, ctx.expected_backend);
-    op->compute(output, inputs, ctx, nullptr);
-}
-
 }  // namespace nnops

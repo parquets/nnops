@@ -80,10 +80,4 @@ private:
     Backend backend_;
 };
 
-/// Functional activation.
-void activation(const TensorView& input,
-                TensorView& output,
-                const ActivationAttributes& attrs,
-                const ComputeContext& ctx = {});
-
 }  // namespace nnops

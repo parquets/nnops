@@ -192,30 +192,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional MoE — no expert biases (default attributes).
-/// inputs: input, router_probs, fc1_weights, fc2_weights.
-void moe(const TensorView& input,
-         const TensorView& router_probs,
-         const TensorView& fc1_weights,
-         const TensorView& fc2_weights,
-         TensorView& output,
-         const MoEAttributes& attrs = {},
-         const ComputeContext& ctx = {});
-
-/// Functional MoE — with expert biases (default attributes).
-/// inputs: input, router_probs, fc1_weights, fc1_bias, fc2_weights, fc2_bias.
-void moe(const TensorView& input,
-         const TensorView& router_probs,
-         const TensorView& fc1_weights,
-         const TensorView& fc1_bias,
-         const TensorView& fc2_weights,
-         const TensorView& fc2_bias,
-         TensorView& output,
-         const MoEAttributes& attrs = {},
-         const ComputeContext& ctx = {});
-
 }  // namespace nnops

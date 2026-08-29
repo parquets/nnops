@@ -234,10 +234,10 @@ NNOPS_TEST(clamp_packed_layout) {
 }
 
 // ============================================================
-// Functional API test
+// Class API test
 // ============================================================
 
-NNOPS_TEST(clamp_functional_api) {
+NNOPS_TEST(clamp_class_api) {
     const int64_t shape[] = {4};
     float in_data[]  = {-5.0f, 0.0f, 5.0f, 10.0f};
     float out_buf_class[4] = {};
@@ -260,13 +260,14 @@ NNOPS_TEST(clamp_functional_api) {
         op->compute(output, ins);
     }
 
-    // Functional API
+    // Class API (second instance)
     {
         auto op = Clamp::create(attrs, Backend::CPU);
         const TensorDesc in_arr[] = {d};
         auto descs = op->getOutputTensorDesc(in_arr);
         TensorView output = test::make_planar(descs[0], out_buf_func);
-        clamp_op(input, output, attrs);
+        const TensorView ins[] = {input};
+        op->compute(output, ins);
     }
 
     for (int i = 0; i < 4; ++i) {

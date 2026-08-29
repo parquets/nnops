@@ -88,15 +88,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional element-wise binary operation.
-void eltwise(const TensorView& a,
-             const TensorView& b,
-             TensorView& output,
-             const EltwiseAttributes& attrs = {},
-             const ComputeContext& ctx = {});
-
 }  // namespace nnops

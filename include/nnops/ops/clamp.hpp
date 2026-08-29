@@ -74,14 +74,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional element-wise clamp.
-void clamp_op(const TensorView& input,
-              TensorView& output,
-              const ClampAttributes& attrs = {},
-              const ComputeContext& ctx = {});
-
 }  // namespace nnops

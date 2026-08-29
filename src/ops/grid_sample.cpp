@@ -80,16 +80,4 @@ void GridSample::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void grid_sample(const TensorView& input,
-                 const TensorView& grid,
-                 TensorView& output,
-                 const GridSampleAttributes& attrs,
-                 const ComputeContext& ctx)
-{
-    auto op = GridSample::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input, grid};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

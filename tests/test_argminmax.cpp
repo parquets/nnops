@@ -260,10 +260,10 @@ NNOPS_TEST(argmin_random_vs_ref) {
 }
 
 // ============================================================
-// Functional API
+// Class API
 // ============================================================
 
-NNOPS_TEST(argmax_functional_api) {
+NNOPS_TEST(argmax_class_1d) {
     const int64_t shape[] = {4};
     float data[] = {1.0f, 8.0f, 3.0f, 6.0f};
     int64_t out_data = -1;
@@ -279,12 +279,13 @@ NNOPS_TEST(argmax_functional_api) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     auto output = test::make_planar(descs[0], &out_data);
-    argmax(in, output, attrs);
+    const TensorView ins[] = {in};
+    op->compute(output, ins);
 
     NNOPS_EXPECT_EQ(out_data, 1);  // max 8.0 at idx 1
 }
 
-NNOPS_TEST(argmin_functional_api) {
+NNOPS_TEST(argmin_class_1d) {
     const int64_t shape[] = {4};
     float data[] = {7.0f, 3.0f, 9.0f, 1.0f};
     int64_t out_data = -1;
@@ -300,7 +301,8 @@ NNOPS_TEST(argmin_functional_api) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     auto output = test::make_planar(descs[0], &out_data);
-    argmin(in, output, attrs);
+    const TensorView ins[] = {in};
+    op->compute(output, ins);
 
     NNOPS_EXPECT_EQ(out_data, 3);  // min 1.0 at idx 3
 }

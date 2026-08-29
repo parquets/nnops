@@ -82,33 +82,4 @@ void Attention::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API (without mask)
-void attention(const TensorView& query,
-               const TensorView& key,
-               const TensorView& value,
-               TensorView& output,
-               const AttentionAttributes& attrs,
-               const ComputeContext& ctx,
-               void* workspace)
-{
-    auto op = Attention::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {query, key, value};
-    op->compute(output, ins, ctx, workspace);
-}
-
-// Functional API (with mask)
-void attention(const TensorView& query,
-               const TensorView& key,
-               const TensorView& value,
-               const TensorView& mask,
-               TensorView& output,
-               const AttentionAttributes& attrs,
-               const ComputeContext& ctx,
-               void* workspace)
-{
-    auto op = Attention::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {query, key, value, mask};
-    op->compute(output, ins, ctx, workspace);
-}
-
 }  // namespace nnops

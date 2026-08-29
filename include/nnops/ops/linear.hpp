@@ -74,34 +74,4 @@ private:
     Backend backend_;
 };
 
-// ---- Functional API ----
-
-/// Functional linear without bias (default attributes).
-void linear(const TensorView& input,
-            const TensorView& weight,
-            TensorView& output,
-            const ComputeContext& ctx = {});
-
-/// Functional linear with bias (default attributes).
-void linear(const TensorView& input,
-            const TensorView& weight,
-            const TensorView& bias,
-            TensorView& output,
-            const ComputeContext& ctx = {});
-
-/// Functional linear without bias, with epilogue support.
-void linear(const TensorView& input,
-            const TensorView& weight,
-            TensorView& output,
-            const LinearAttributes& attrs,
-            const ComputeContext& ctx = {});
-
-/// Functional linear with bias, with epilogue support.
-void linear(const TensorView& input,
-            const TensorView& weight,
-            const TensorView& bias,
-            TensorView& output,
-            const LinearAttributes& attrs,
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops

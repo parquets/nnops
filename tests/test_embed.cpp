@@ -262,10 +262,10 @@ NNOPS_TEST(embed_shape_inference) {
 }
 
 // ============================================================
-// Functional API test
+// Class API test
 // ============================================================
 
-NNOPS_TEST(embed_functional_api) {
+NNOPS_TEST(embed_class_api) {
     float weight_data[] = {
         0.1f, 0.2f, 0.3f,
         1.1f, 1.2f, 1.3f,
@@ -288,14 +288,15 @@ NNOPS_TEST(embed_functional_api) {
         op->compute(output, ins);
     }
 
-    // Functional API
+    // Class API (second instance)
     std::vector<float> out_func(6);
     {
         auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
         const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
         auto descs = op->getOutputTensorDesc(in_arr);
         TensorView output = test::make_planar(descs[0], out_func.data());
-        embed(weight, indices, output);
+        const TensorView ins[] = {weight, indices};
+        op->compute(output, ins);
     }
 
     for (size_t i = 0; i < 6; ++i) {
@@ -649,8 +650,8 @@ NNOPS_TEST(embed_int8_uint8_weight) {
     NNOPS_EXPECT_NEAR(out_buf[5], 4.0f, 1e-5f);
 }
 
-NNOPS_TEST(embed_int8_functional_api) {
-    // Verify functional API works with int8 weight
+NNOPS_TEST(embed_int8_class_api) {
+    // Verify class API works with int8 weight
     const int64_t V = 2, D = 2;
     int8_t w_data[] = {10, 20, 30, 40};
     const int64_t w_shape[] = {V, D};
@@ -673,10 +674,10 @@ NNOPS_TEST(embed_int8_functional_api) {
     const TensorView ins1[] = {weight, indices};
     op->compute(out1, ins1);
 
-    // Functional API
+    // Class API (second instance)
     std::vector<float> out_func(static_cast<size_t>(descs[0].numel()));
     TensorView out2 = test::make_planar(descs[0], out_func.data());
-    embed(weight, indices, out2);
+    op->compute(out2, ins1);
 
     for (size_t i = 0; i < out_class.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_class[i], out_func[i], 1e-5f);

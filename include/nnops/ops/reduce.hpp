@@ -82,14 +82,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional tensor reduction.
-void reduce(const TensorView& input,
-            TensorView& output,
-            const ReduceAttributes& attrs = {},
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops

@@ -96,32 +96,4 @@ void Conv2D::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// ============================================================
-// Functional API
-// ============================================================
-void conv2d(const TensorView& input,
-            const TensorView& weight,
-            TensorView& output,
-            const Conv2DAttributes& attrs,
-            const ComputeContext& ctx,
-            void* workspace)
-{
-    auto op = Conv2D::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input, weight};
-    op->compute(output, ins, ctx, workspace);
-}
-
-void conv2d(const TensorView& input,
-            const TensorView& weight,
-            const TensorView& bias,
-            TensorView& output,
-            const Conv2DAttributes& attrs,
-            const ComputeContext& ctx,
-            void* workspace)
-{
-    auto op = Conv2D::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input, weight, bias};
-    op->compute(output, ins, ctx, workspace);
-}
-
 }  // namespace nnops

@@ -113,14 +113,4 @@ void RoPE::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void rope(const TensorView& x,
-          TensorView& output,
-          const RoPEAttributes& attrs,
-          const ComputeContext& ctx)
-{
-    auto op = RoPE::create(attrs, ctx.expected_backend);
-    op->compute(output, {&x, 1}, ctx, nullptr);
-}
-
 }  // namespace nnops

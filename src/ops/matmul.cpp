@@ -102,16 +102,4 @@ void MatMul::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void matmul(const TensorView& a,
-            const TensorView& b,
-            TensorView& c,
-            const MatMulAttributes& attrs,
-            const ComputeContext& ctx)
-{
-    auto op = MatMul::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {a, b};
-    op->compute(c, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

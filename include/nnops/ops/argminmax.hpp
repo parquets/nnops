@@ -115,18 +115,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-void argmax(const TensorView& input,
-            TensorView& output,
-            const ArgMinMaxAttributes& attrs = {},
-            const ComputeContext& ctx = {});
-
-void argmin(const TensorView& input,
-            TensorView& output,
-            const ArgMinMaxAttributes& attrs = {},
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops

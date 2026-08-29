@@ -105,25 +105,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API (convenience wrappers)
-// ============================================================
-
-/// Functional transpose_conv2d without bias.
-void transpose_conv2d(const TensorView& input,
-                      const TensorView& weight,
-                      TensorView& output,
-                      const TransposeConv2DAttributes& attrs,
-                      const ComputeContext& ctx = {},
-                      void* workspace = nullptr);
-
-/// Functional transpose_conv2d with bias.
-void transpose_conv2d(const TensorView& input,
-                      const TensorView& weight,
-                      const TensorView& bias,
-                      TensorView& output,
-                      const TransposeConv2DAttributes& attrs,
-                      const ComputeContext& ctx = {},
-                      void* workspace = nullptr);
-
 }  // namespace nnops

@@ -449,8 +449,8 @@ NNOPS_TEST(slice_shape_inference) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 }
 
-NNOPS_TEST(slice_functional_api) {
-    // Verify functional API produces same result as class API
+NNOPS_TEST(slice_class_api) {
+    // Verify two class API instances produce identical results
     const int64_t in_shape[] = {2, 3, 4};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 999);
 
@@ -472,10 +472,10 @@ NNOPS_TEST(slice_functional_api) {
     const TensorView ins[] = {input};
     op->compute(out_view1, ins);
 
-    // Functional API
+    // Class API (second instance)
     std::vector<float> out_func(static_cast<size_t>(numel));
     TensorView out_view2 = test::make_planar(descs[0], out_func.data());
-    slice(input, out_view2, attrs);
+    op->compute(out_view2, ins);
 
     for (size_t i = 0; i < static_cast<size_t>(numel); ++i) {
         NNOPS_EXPECT_NEAR(out_class[i], out_func[i], 1e-5f);

@@ -2,7 +2,7 @@
 ///
 /// Covers BatchNorm, LayerNorm, RMSNorm, GroupNorm, and L2Norm through the
 /// shared Norm class / NormAttributes, distinguished by NormType.
-/// Uses the class API, plus functional norm() parity checks.
+/// Uses the class API exclusively.
 
 #include "nnops/ops/norm.hpp"
 #include "common/test_harness.hpp"
@@ -1190,7 +1190,7 @@ NNOPS_TEST(norm_group_norm_rank3_ncw) {
     }
 }
 
-NNOPS_TEST(norm_group_norm_functional_api) {
+NNOPS_TEST(norm_group_norm_class_api) {
     const int64_t shape[] = {1, 2, 2};
     const int64_t scale_shape[] = {2};
 
@@ -1215,14 +1215,14 @@ NNOPS_TEST(norm_group_norm_functional_api) {
     const TensorView ins_class[] = {x, s};
     op->compute(out1, ins_class);
 
-    norm(x, s, out2, attrs);
+    op->compute(out2, ins_class);
 
     for (size_t i = 0; i < out_buf1.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_buf1[i], out_buf2[i], 1e-6f);
     }
 }
 
-NNOPS_TEST(norm_group_norm_functional_api_with_bias) {
+NNOPS_TEST(norm_group_norm_class_api_with_bias) {
     const int64_t shape[] = {1, 2, 2};
     const int64_t scale_shape[] = {2};
 
@@ -1249,7 +1249,7 @@ NNOPS_TEST(norm_group_norm_functional_api_with_bias) {
     const TensorView ins_class[] = {x, s, b};
     op->compute(out1, ins_class);
 
-    norm(x, s, b, out2, attrs);
+    op->compute(out2, ins_class);
 
     for (size_t i = 0; i < out_buf1.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_buf1[i], out_buf2[i], 1e-6f);

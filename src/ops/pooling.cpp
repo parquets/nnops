@@ -93,15 +93,4 @@ void Pooling::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, nullptr);
 }
 
-// Functional API
-void pooling(const TensorView& input,
-             TensorView& output,
-             const PoolingAttributes& attrs,
-             const ComputeContext& ctx)
-{
-    auto op = Pooling::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

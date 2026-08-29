@@ -98,14 +98,4 @@ void Flatten::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void flatten(const TensorView& input,
-             TensorView& output,
-             const ComputeContext& ctx)
-{
-    auto op = Flatten::create(FlattenAttributes{}, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

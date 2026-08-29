@@ -100,17 +100,4 @@ void TopK::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, values, indices, inputs, ctx, workspace);
 }
 
-// Functional API
-void topk(const TensorView& input,
-           TensorView& values,
-           TensorView& indices,
-           const TopKAttributes& attrs,
-           const ComputeContext& ctx)
-{
-    auto op = TopK::create(attrs, ctx.expected_backend);
-    TensorView outs[] = {values, indices};
-    const TensorView ins[] = {input};
-    op->compute(outs, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

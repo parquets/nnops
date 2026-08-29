@@ -532,10 +532,10 @@ NNOPS_TEST(topk_negative_axis) {
 }
 
 // ============================================================
-// Functional API
+// Class API
 // ============================================================
 
-NNOPS_TEST(topk_functional_api) {
+NNOPS_TEST(topk_class_api) {
     const int64_t shape[] = {5};
     float data[] = {2.0f, 8.0f, 4.0f, 1.0f, 6.0f};
     float val_buf[3] = {};
@@ -558,7 +558,8 @@ NNOPS_TEST(topk_functional_api) {
     auto idx_out = test::make_planar(descs[1], idx_buf);
     TensorView out_arr[] = {val_out, idx_out};
 
-    topk(in, val_out, idx_out, attrs);
+    const TensorView ins[] = {in};
+    op->compute(out_arr, ins);
 
     NNOPS_EXPECT_NEAR(val_buf[0], 8.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[0], 1);

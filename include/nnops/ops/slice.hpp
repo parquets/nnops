@@ -81,14 +81,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional slice.
-void slice(const TensorView& input,
-           TensorView& output,
-           const SliceAttributes& attrs,
-           const ComputeContext& ctx = {});
-
 }  // namespace nnops

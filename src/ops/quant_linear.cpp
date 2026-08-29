@@ -168,32 +168,4 @@ void DequantizeLinear::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
-// ============================================================
-// Functional API
-// ============================================================
-
-void quantize_linear(const TensorView& input,
-                     const TensorView& scale,
-                     const TensorView& zero_point,
-                     TensorView& output,
-                     const QuantLinearAttributes& attrs,
-                     const ComputeContext& ctx)
-{
-    auto op = QuantizeLinear::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input, scale, zero_point};
-    op->compute(output, ins, ctx, nullptr);
-}
-
-void dequantize_linear(const TensorView& input,
-                       const TensorView& scale,
-                       const TensorView& zero_point,
-                       TensorView& output,
-                       const QuantLinearAttributes& attrs,
-                       const ComputeContext& ctx)
-{
-    auto op = DequantizeLinear::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input, scale, zero_point};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

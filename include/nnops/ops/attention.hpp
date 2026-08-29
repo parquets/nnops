@@ -81,23 +81,4 @@ private:
     Backend backend_;
 };
 
-/// Functional attention.
-void attention(const TensorView& query,
-               const TensorView& key,
-               const TensorView& value,
-               TensorView& output,
-               const AttentionAttributes& attrs,
-               const ComputeContext& ctx = {},
-               void* workspace = nullptr);
-
-/// Functional attention with explicit mask.
-void attention(const TensorView& query,
-               const TensorView& key,
-               const TensorView& value,
-               const TensorView& mask,
-               TensorView& output,
-               const AttentionAttributes& attrs,
-               const ComputeContext& ctx = {},
-               void* workspace = nullptr);
-
 }  // namespace nnops

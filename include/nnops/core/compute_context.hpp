@@ -11,8 +11,8 @@ namespace nnops {
 /// Execution context passed to operator compute() calls.
 /// Each backend reads only the fields it cares about.
 struct ComputeContext {
-    /// Target backend for execution. Functional API reads this to select
-    /// the backend when creating operators. Default: CPU.
+    /// Target backend for execution. Callers read this to select the backend
+    /// when creating operators. Default: CPU.
     Backend expected_backend = Backend::CPU;
 
     /// CPU parallelism hook. nullptr means sequential execution.

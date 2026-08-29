@@ -368,19 +368,19 @@ NNOPS_TEST(pooling_2d_class_api) {
     const TensorView pack_ins[] = {in_nchw};
     pack_op->compute(in_c8, pack_ins);
 
-    // Functional API path
+    // Class API path (first instance)
     TensorDesc c8_desc = in_c8.desc();
     const TensorDesc pool_in_desc[] = {c8_desc};
 
-    // Get output desc from Pooling for functional path
+    // Get output desc from Pooling for the first class path
     auto pool_ref = Pooling::create(attrs);
     auto func_out_descs = pool_ref->getOutputTensorDesc(pool_in_desc);
     std::vector<char> func_buf(func_out_descs[0].storage_bytes());
     auto out1_c8 = test::make_packed(func_out_descs[0], func_buf.data());
     const TensorView func_ins[] = {in_c8};
-    pooling(in_c8, out1_c8, attrs);
+    pool_ref->compute(out1_c8, func_ins);
 
-    // Class API path
+    // Class API path (second instance)
     auto pool_op = Pooling::create(attrs);
     auto cls_out_descs = pool_op->getOutputTensorDesc(pool_in_desc);
     std::vector<char> cls_buf(cls_out_descs[0].storage_bytes());
@@ -391,7 +391,7 @@ NNOPS_TEST(pooling_2d_class_api) {
     // Unpack both and compare
     auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
 
-    // Functional path unpack
+    // First instance unpack
     TensorDesc func_c8_desc = out1_c8.desc();
     const TensorDesc func_unpack_in[] = {func_c8_desc};
     auto func_unpack_descs = unpack_op->getOutputTensorDesc(func_unpack_in);

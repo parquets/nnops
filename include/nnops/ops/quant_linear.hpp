@@ -175,24 +175,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional quantize: float → integer.
-void quantize_linear(const TensorView& input,
-                     const TensorView& scale,
-                     const TensorView& zero_point,
-                     TensorView& output,
-                     const QuantLinearAttributes& attrs = {},
-                     const ComputeContext& ctx = {});
-
-/// Functional dequantize: integer → float.
-void dequantize_linear(const TensorView& input,
-                       const TensorView& scale,
-                       const TensorView& zero_point,
-                       TensorView& output,
-                       const QuantLinearAttributes& attrs = {},
-                       const ComputeContext& ctx = {});
-
 }  // namespace nnops

@@ -99,14 +99,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional element-wise unary operation.
-void unary(const TensorView& input,
-           TensorView& output,
-           const UnaryAttributes& attrs = {},
-           const ComputeContext& ctx = {});
-
 }  // namespace nnops

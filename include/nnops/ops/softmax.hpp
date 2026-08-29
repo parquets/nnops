@@ -96,14 +96,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional softmax.
-void softmax(const TensorView& input,
-             TensorView& output,
-             const SoftmaxAttributes& attrs = {},
-             const ComputeContext& ctx = {});
-
 }  // namespace nnops

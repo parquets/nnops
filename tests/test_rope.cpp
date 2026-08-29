@@ -1,6 +1,6 @@
 /// Unit tests for RoPE operator (CPU optimized + reference).
 /// Covers standard RoPE (interleaved and split-half), mRoPE, various shapes,
-/// edge cases, and the functional API.
+/// edge cases.
 
 #include "nnops/ops/rope.hpp"
 #include "common/test_harness.hpp"
@@ -481,10 +481,10 @@ NNOPS_TEST(rope_large_head_dim) {
 }
 
 // ============================================================
-// Functional API
+// Class API
 // ============================================================
 
-NNOPS_TEST(rope_functional_api) {
+NNOPS_TEST(rope_class_api) {
     const int64_t shape[] = {1, 4};
     float x_data[] = {1.0f, 0.0f, 2.0f, 0.0f};
     float out_data[4] = {};
@@ -497,7 +497,9 @@ NNOPS_TEST(rope_functional_api) {
     ComputeContext ctx;
     ctx.expected_backend = Backend::CPU;
 
-    rope(x, y, attrs, ctx);
+    auto op = RoPE::create(attrs, Backend::CPU);
+    const TensorView ins[] = {x};
+    op->compute(y, ins, ctx);
 
     // pos=0 → identity
     NNOPS_EXPECT_NEAR(out_data[0], 1.0f, 1e-5f);

@@ -109,25 +109,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API (convenience wrappers)
-// ============================================================
-
-/// Functional depthwise_conv without bias.
-void depthwise_conv(const TensorView& input,
-                     const TensorView& weight,
-                     TensorView& output,
-                     const DepthwiseConvAttributes& attrs,
-                     const ComputeContext& ctx = {},
-                     void* workspace = nullptr);
-
-/// Functional depthwise_conv with bias.
-void depthwise_conv(const TensorView& input,
-                     const TensorView& weight,
-                     const TensorView& bias,
-                     TensorView& output,
-                     const DepthwiseConvAttributes& attrs,
-                     const ComputeContext& ctx = {},
-                     void* workspace = nullptr);
-
 }  // namespace nnops

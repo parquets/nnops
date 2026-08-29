@@ -112,10 +112,4 @@ private:
     Backend backend_;
 };
 
-/// Functional resize.
-void resize(const TensorView& input,
-            TensorView& output,
-            const ResizeAttributes& attrs,
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops

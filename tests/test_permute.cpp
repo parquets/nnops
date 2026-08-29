@@ -473,10 +473,10 @@ NNOPS_TEST(permute_shape_inference) {
 }
 
 // ============================================================
-// Functional API test
+// Class API test
 // ============================================================
 
-NNOPS_TEST(permute_functional_api) {
+NNOPS_TEST(permute_class_api) {
     float in_data[] = {
         1.0f, 2.0f, 3.0f,
         4.0f, 5.0f, 6.0f,
@@ -499,14 +499,15 @@ NNOPS_TEST(permute_functional_api) {
         op->compute(output, ins);
     }
 
-    // Functional API
+    // Class API (second instance)
     std::vector<float> out_func(6);
     {
         auto op = Permute::create(attrs, Backend::CPU);
         const TensorDesc in_arr[] = {input.desc()};
         auto descs = op->getOutputTensorDesc(in_arr);
         TensorView output = test::make_planar(descs[0], out_func.data());
-        permute(input, output, attrs);
+        const TensorView ins[] = {input};
+        op->compute(output, ins);
     }
 
     for (size_t i = 0; i < 6; ++i) {

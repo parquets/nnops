@@ -89,15 +89,4 @@ void CumSum::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void cumsum(const TensorView& input,
-            TensorView& output,
-            const CumSumAttributes& attrs,
-            const ComputeContext& ctx)
-{
-    auto op = CumSum::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

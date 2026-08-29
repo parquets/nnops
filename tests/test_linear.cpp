@@ -1,5 +1,5 @@
 /// Unit tests for Linear operator (CPU reference).
-/// Uses Linear class API exclusively — no functional linear() calls.
+/// Uses Linear class API exclusively.
 
 #include "nnops/ops/linear.hpp"
 #include "common/test_harness.hpp"

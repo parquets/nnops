@@ -91,17 +91,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional embedding lookup.
-/// For int8 weight, quantization params (scale/zero_point) are read from
-/// weight.quant_params() via TensorView.
-void embed(const TensorView& weight,
-           const TensorView& indices,
-           TensorView& output,
-           const EmbedAttributes& attrs = {},
-           const ComputeContext& ctx = {});
-
 }  // namespace nnops

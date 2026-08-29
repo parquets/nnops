@@ -105,39 +105,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional norm — L2Norm (1 input).
-void norm(const TensorView& x,
-          TensorView& output,
-          const NormAttributes& attrs = {},
-          const ComputeContext& ctx = {});
-
-/// Functional norm — LayerNorm / RMSNorm / GroupNorm (2 inputs).
-void norm(const TensorView& x,
-          const TensorView& scale,
-          TensorView& output,
-          const NormAttributes& attrs = {},
-          const ComputeContext& ctx = {});
-
-/// Functional norm — LayerNorm / GroupNorm with bias (3 inputs).
-void norm(const TensorView& x,
-          const TensorView& scale,
-          const TensorView& bias,
-          TensorView& output,
-          const NormAttributes& attrs = {},
-          const ComputeContext& ctx = {});
-
-/// Functional norm — BatchNorm (5 inputs).
-void norm(const TensorView& x,
-          const TensorView& scale,
-          const TensorView& bias,
-          const TensorView& mean,
-          const TensorView& var,
-          TensorView& output,
-          const NormAttributes& attrs = {},
-          const ComputeContext& ctx = {});
-
 }  // namespace nnops

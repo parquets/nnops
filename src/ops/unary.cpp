@@ -107,15 +107,4 @@ void Unary::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void unary(const TensorView& input,
-            TensorView& output,
-            const UnaryAttributes& attrs,
-            const ComputeContext& ctx)
-{
-    auto op = Unary::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

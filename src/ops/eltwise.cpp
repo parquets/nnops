@@ -108,16 +108,4 @@ void Eltwise::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void eltwise(const TensorView& a,
-              const TensorView& b,
-              TensorView& output,
-              const EltwiseAttributes& attrs,
-              const ComputeContext& ctx)
-{
-    auto op = Eltwise::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {a, b};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

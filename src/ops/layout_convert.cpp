@@ -100,15 +100,4 @@ void LayoutConvert::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(output, inputs, attrs_, ctx);
 }
 
-// Functional API
-void layout_convert(const TensorView& input,
-                    TensorView& output,
-                    TensorLayout target_layout,
-                    const ComputeContext& ctx)
-{
-    auto op = LayoutConvert::create(target_layout, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

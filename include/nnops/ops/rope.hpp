@@ -100,14 +100,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional rope.
-void rope(const TensorView& x,
-          TensorView& output,
-          const RoPEAttributes& attrs = {},
-          const ComputeContext& ctx = {});
-
 }  // namespace nnops

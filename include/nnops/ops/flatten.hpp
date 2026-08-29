@@ -71,9 +71,4 @@ private:
     Backend backend_;
 };
 
-/// Functional flatten.
-void flatten(const TensorView& input,
-             TensorView& output,
-             const ComputeContext& ctx = {});
-
 }  // namespace nnops

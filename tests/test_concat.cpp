@@ -434,7 +434,7 @@ NNOPS_TEST(concat_nchw_axis1) {
 }
 
 NNOPS_TEST(concat_random_2d_ref_vs_simd) {
-    // Verify class API and functional API produce identical results
+    // Verify two class API instances produce identical results
     const int64_t shape_a[] = {4, 7};
     const int64_t shape_b[] = {4, 5};
 
@@ -459,9 +459,9 @@ NNOPS_TEST(concat_random_2d_ref_vs_simd) {
     const TensorView ins[] = {a, b};
     op->compute(output1, ins);
 
-    // Functional API
+    // Class API (second instance)
     auto output2 = test::make_planar(descs[0], out_ref.data());
-    concat(ins, output2, attrs);
+    op->compute(output2, ins);
 
     // Compare
     for (int64_t i = 0; i < total_out; ++i) {

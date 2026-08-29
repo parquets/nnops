@@ -85,11 +85,4 @@ private:
     Backend backend_;
 };
 
-/// Functional matmul (supports N-D batch with broadcasting).
-void matmul(const TensorView& a,
-            const TensorView& b,
-            TensorView& c,
-            const MatMulAttributes& attrs = {},
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops

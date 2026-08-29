@@ -130,16 +130,4 @@ void Embed::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// Functional API
-void embed(const TensorView& weight,
-           const TensorView& indices,
-           TensorView& output,
-           const EmbedAttributes& attrs,
-           const ComputeContext& ctx)
-{
-    auto op = Embed::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {weight, indices};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

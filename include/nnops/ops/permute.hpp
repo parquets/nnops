@@ -74,14 +74,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional dimension permute (transpose).
-void permute(const TensorView& input,
-             TensorView& output,
-             const PermuteAttributes& attrs,
-             const ComputeContext& ctx = {});
-
 }  // namespace nnops

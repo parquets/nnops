@@ -162,30 +162,4 @@ void ArgMin::compute(std::span<TensorView> outputs,
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
 
-// ============================================================
-// Functional API
-// ============================================================
-
-void argmax(const TensorView& input,
-            TensorView& output,
-            const ArgMinMaxAttributes& attrs,
-            const ComputeContext& ctx)
-{
-    auto op = ArgMax::create(attrs, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
-void argmin(const TensorView& input,
-            TensorView& output,
-            const ArgMinMaxAttributes& attrs,
-            const ComputeContext& ctx)
-{
-    ArgMinMaxAttributes a = attrs;
-    a.type = ArgMinMaxType::Min;
-    auto op = ArgMin::create(a, ctx.expected_backend);
-    const TensorView ins[] = {input};
-    op->compute(output, ins, ctx, nullptr);
-}
-
 }  // namespace nnops

@@ -68,14 +68,4 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// Functional API
-// ============================================================
-
-/// Functional concat.
-void concat(std::span<const TensorView> inputs,
-            TensorView& output,
-            const ConcatAttributes& attrs = {},
-            const ComputeContext& ctx = {});
-
 }  // namespace nnops
