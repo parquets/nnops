@@ -71,6 +71,9 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/matmul.cpp
     backend/cpu/matmul_helper.cpp
 
+    # CPU tiled im2col + GEMM Conv2D kernel (planar NCHW)
+    backend/cpu/conv2d_im2col.cpp
+
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp
     backend/cpu/reference/activation_ref.cpp

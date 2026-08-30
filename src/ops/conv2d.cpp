@@ -4,17 +4,9 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
+#include "backend/cpu/conv2d_im2col.h"
 
 namespace nnops {
-
-// Forward declarations of backend kernel entry points
-namespace backend::cpu::reference {
-    void conv2d_ref(const Conv2DAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
 
 // ============================================================
 // Impl — holds the backend-bound kernel function pointer
@@ -33,7 +25,7 @@ auto resolve_conv2d_kernel(Backend backend) -> Conv2D::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::conv2d_ref;
+        return backend::cpu::conv2d_im2col_kernel;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;  // backend::cuda::conv2d_cuda
@@ -74,6 +66,17 @@ std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
     return {conv2d_output_shape(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
         static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs)};
+}
+
+// ============================================================
+// getWorkspaceSize
+// ============================================================
+size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc> inputs,
+                                std::span<const TensorDesc> outputs) const
+{
+    NNOPS_ASSERT(inputs.size() >= 2);
+    NNOPS_ASSERT(outputs.size() >= 1);
+    return backend::cpu::conv2d_im2col_get_workspace_size(attrs_, inputs, outputs);
 }
 
 // ============================================================

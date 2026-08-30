@@ -1,0 +1,390 @@
+/// @file conv2d_im2col.cpp
+/// @brief Tiled im2col + direct GEMM Conv2D kernel (planar NCHW, f32 / f16).
+///
+/// Algorithm (ported from nn_compute im2col_gemm_conv2d_impl):
+///   For each (batch, group) — parallel via ctx.cpu_parallel_for:
+///     For each oh-block of the output plane:
+///       For each ic-block:
+///         im2col the input block into a scratch matrix [K=icnc*karea][N=ohc*OW]
+///         For each oc-block:
+///           init output tile = bias (+ original output when add_to)
+///           tile += weight[ocnc, K] × col_data[K, roi_area]  (tile_mma_direct)
+///           (after the last ic-block) apply the epilogue in-place
+///
+/// Work is split at (batch, group) granularity so the per-(batch,group)
+/// col_data scratch is reused across oh-blocks — no per-thread indexing is
+/// required by the external parallel_for hook. C tiles are disjoint, so the
+/// result is bit-identical to serial execution.
+
+#include "conv2d_im2col.h"
+#include "matmul_helper.h"                 // tile_mma_direct + arch panel constants
+#include "simd_kernel/simd_epilogue.hpp"   // epilogue_inplace
+#include "simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d / tiled_im2col_3d
+#include "nnops/detail/simd/simd.hpp"
+#include "nnops/detail/half.hpp"
+#include "nnops/detail/assert.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+namespace nnops::backend::cpu {
+
+// Forward-declare the reference kernel for the fallback paths.
+namespace reference {
+void conv2d_ref(const Conv2DAttributes& attrs,
+                TensorView& output,
+                std::span<const TensorView> inputs,
+                const ComputeContext& ctx,
+                void* workspace);
+}
+
+namespace {
+
+using namespace nnops::simd;
+namespace k = nnops::kernel;  // pure SIMD kernels: tiled_im2col_2d / tiled_im2col_3d
+
+// ---- block-size heuristics (ported from nn_compute) ----------------------
+
+/// Input-channel block size from the kernel area. Larger kernels reuse fewer
+/// input channels per im2col buffer to bound the scratch footprint.
+inline int get_ic_block(int karea) noexcept {
+    if (karea == 1)  { return 64; }
+    if (karea <= 9)  { return 8;  }
+    if (karea <= 25) { return 4;  }
+    if (karea <= 49) { return 2;  }
+    return 1;
+}
+
+constexpr int kOcnBlock = 128;  // output-channel tile (nn_compute single-thread default)
+constexpr int kAlign     = 4;   // oh-block alignment
+
+// ---- tile init / save / add helpers --------------------------------------
+
+/// Initialize an output tile (M rows of N columns, row stride ld) with the
+/// per-row bias. When @p add_to, add the pre-existing output into the
+/// accumulator (used for the identity-epilogue residual path).
+template <class T>
+void tile_set_bias(T* NNOPS_RESTRICT tile, int ld, int M, int N,
+                   const T* NNOPS_RESTRICT bias, bool add_to) noexcept
+{
+    constexpr int L = simd_lane_for<T>;
+    for (int m = 0; m < M; ++m) {
+        T* row = tile + m * ld;
+        const float b = bias ? s_load(&bias[m]) : 0.0f;
+        const auto vb = v_set1(row, b);
+        int i = 0;
+        if (add_to) {
+            for (; i + L <= N; i += L) {
+                v_store(row + i, v_add(v_load(row + i), vb));
+            }
+            for (; i < N; ++i) {
+                s_store(&row[i], s_load(&row[i]) + b);
+            }
+        } else {
+            for (; i + L <= N; i += L) {
+                v_store(row + i, vb);
+            }
+            for (; i < N; ++i) {
+                s_store(&row[i], b);
+            }
+        }
+    }
+}
+
+/// Copy a strided tile (row stride ld) into a dense scratch buffer (row stride N).
+template <class T>
+void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src,
+               int ld, int M, int N) noexcept
+{
+    constexpr int L = simd_lane_for<T>;
+    for (int m = 0; m < M; ++m) {
+        const T* s = src + m * ld;
+        T* d = dst + m * N;
+        int i = 0;
+        for (; i + L <= N; i += L) {
+            v_store(d + i, v_load(s + i));
+        }
+        for (; i < N; ++i) {
+            d[i] = s[i];
+        }
+    }
+}
+
+/// Add a dense scratch buffer (row stride N) back into a strided tile.
+template <class T>
+void tile_add(T* NNOPS_RESTRICT tile, int ld, const T* NNOPS_RESTRICT orig,
+              int M, int N) noexcept
+{
+    constexpr int L = simd_lane_for<T>;
+    for (int m = 0; m < M; ++m) {
+        T* row = tile + m * ld;
+        const T* o = orig + m * N;
+        int i = 0;
+        for (; i + L <= N; i += L) {
+            v_store(row + i, v_add(v_load(row + i), v_load(o + i)));
+        }
+        for (; i < N; ++i) {
+            s_store(&row[i], s_load(&row[i]) + s_load(&o[i]));
+        }
+    }
+}
+
+// ---- main kernel ----------------------------------------------------------
+
+template <class T>
+void conv2d_im2col_impl(const Conv2DAttributes& attrs,
+                        TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx,
+                        void* workspace)
+{
+    const auto& input  = inputs[0];
+    const auto& weight = inputs[1];
+    const bool has_bias = inputs.size() > 2;
+
+    // Input: [N, IC, IH, IW]
+    const int64_t N  = input.shape(0);
+    const int64_t IC = input.shape(1);
+    const int64_t IH = input.shape(2);
+    const int64_t IW = input.shape(3);
+    const int64_t in_row_stride = input.row_stride_elems();
+
+    // Weight: [OC, IC/G, KH, KW]
+    const int64_t OC = weight.shape(0);
+
+    // Output: [N, OC, OH, OW]
+    const int64_t OH = output.shape(2);
+    const int64_t OW = output.shape(3);
+    const int64_t out_row_stride = output.row_stride_elems();
+
+    const int64_t G = attrs.groups;
+    const int64_t ic_per_group = IC / G;
+    const int64_t oc_per_group = OC / G;
+
+    const int64_t KH = attrs.kernel_size[0];
+    const int64_t KW = attrs.kernel_size[1];
+    const int64_t SH = attrs.stride[0];
+    const int64_t SW = attrs.stride[1];
+    const int64_t DH = attrs.dilation[0];
+    const int64_t DW = attrs.dilation[1];
+    const int64_t PH = attrs.padding[0];
+    const int64_t PW = attrs.padding[1];
+
+    const int64_t karea = KH * KW;
+
+    // Block sizes (values shared with conv2d_im2col_get_workspace_size).
+    const int64_t icn_block = std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
+    const int64_t ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
+    const int64_t oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
+
+    // Strides (elements).
+    const int64_t icn_step = IH * in_row_stride;         // between input channels
+    const int64_t ib_step  = IC * icn_step;              // between batch samples
+    const int64_t ig_step  = ic_per_group * icn_step;    // between groups (input)
+
+    const int64_t ocn_step = OH * out_row_stride;        // between output channels
+    const int64_t ob_step  = OC * ocn_step;              // between batch samples
+    const int64_t og_step  = oc_per_group * ocn_step;    // between groups (output)
+
+    // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
+    const int64_t w_ocn_step = ic_per_group * karea;
+
+    T* out_ptr = output.ptr<T>();
+    const T* in_ptr  = input.ptr<T>();
+    const T* w_ptr   = weight.ptr<T>();
+    const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
+
+    // Workspace slices (per (batch, group)).
+    const int64_t col_size  = icn_block * karea * oh_block * OW;
+    const int64_t orig_size = attrs.add_to ? ocn_block * oh_block * OW : 0;
+
+    T* col_base  = static_cast<T*>(workspace);
+    T* orig_base = attrs.add_to ? col_base + N * G * col_size : nullptr;
+
+    const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
+
+    const int64_t NG = N * G;
+    const auto run_ng = [&](int64_t ng) {
+        const int64_t n = ng / G;
+        const int64_t g = ng % G;
+
+        T* col_data = col_base + ng * col_size;
+        T* orig = orig_base ? orig_base + ng * orig_size : nullptr;
+
+        T* output_ptr = out_ptr + n * ob_step + g * og_step;
+        const T* input_ptr  = in_ptr + n * ib_step + g * ig_step;
+        const T* weight_ptr = w_ptr + g * oc_per_group * ic_per_group * karea;
+        const T* bias_ptr   = b_ptr ? b_ptr + g * oc_per_group : nullptr;
+
+        for (int64_t oh = 0; oh < OH; oh += oh_block) {
+            const int64_t ohc      = std::min(oh_block, OH - oh);
+            const int64_t roi_area = ohc * OW;
+
+            const int64_t ih = oh * SH - PH;
+            const int64_t iw = 0 * SW - PW;
+            const int roi_pad_h = (ih < 0) ? static_cast<int>(-ih)
+                                           : (ih >= IH ? static_cast<int>(ih - IH) : 0);
+            const int roi_pad_w = (iw < 0) ? static_cast<int>(-iw)
+                                           : (iw >= IW ? static_cast<int>(iw - IW) : 0);
+
+            T* tile_base = output_ptr + oh * out_row_stride;
+
+            for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
+                const int64_t icnc = std::min(icn_block, ic_per_group - icn);
+                const bool is_last_icn = (icn + icn_block) >= ic_per_group;
+
+                const T* input_local = input_ptr + icn * icn_step;
+                k::tiled_im2col_2d<T>(col_data, input_local,
+                                      0, static_cast<int>(oh),
+                                      static_cast<int>(OW), static_cast<int>(ohc),
+                                      roi_pad_h, roi_pad_w,
+                                      static_cast<int>(PH), static_cast<int>(PW),
+                                      static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
+                                      static_cast<int>(icn_step), static_cast<int>(in_row_stride),
+                                      static_cast<int>(KH), static_cast<int>(KW),
+                                      static_cast<int>(SH), static_cast<int>(SW),
+                                      static_cast<int>(DH), static_cast<int>(DW));
+
+                for (int64_t ocn = 0; ocn < oc_per_group; ocn += ocn_block) {
+                    const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
+                    T* tile = tile_base + ocn * ocn_step;
+
+                    if (icn == 0) {
+                        // add_to + non-identity epilogue needs the original
+                        // output preserved (epilogue(bias + Σ) then += orig).
+                        if (attrs.add_to && epilogue_active) {
+                            tile_save<T>(orig, tile, static_cast<int>(ocn_step),
+                                         static_cast<int>(ocnc), static_cast<int>(roi_area));
+                        }
+                        tile_set_bias<T>(tile, static_cast<int>(ocn_step),
+                                         static_cast<int>(ocnc), static_cast<int>(roi_area),
+                                         bias_ptr ? bias_ptr + ocn : nullptr,
+                                         attrs.add_to && !epilogue_active);
+                    }
+
+                    const T* a = weight_ptr + icn * karea + ocn * w_ocn_step;
+                    tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area),
+                                    static_cast<int>(icnc * karea),
+                                    tile, static_cast<int>(ocn_step),
+                                    a, static_cast<int>(w_ocn_step),
+                                    col_data, static_cast<int>(roi_area),
+                                    -std::numeric_limits<float>::infinity(),
+                                    std::numeric_limits<float>::infinity());
+
+                    if (is_last_icn) {
+                        epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),
+                                            tile, static_cast<int>(ocn_step),
+                                            static_cast<const T*>(nullptr), attrs.epilogue);
+                        if (attrs.add_to && epilogue_active) {
+                            tile_add<T>(tile, static_cast<int>(ocn_step), orig,
+                                        static_cast<int>(ocnc), static_cast<int>(roi_area));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    if (ctx.cpu_parallel_for) {
+        ctx.cpu_parallel_for(0, NG, run_ng);
+    } else {
+        for (int64_t ng = 0; ng < NG; ++ng) {
+            run_ng(ng);
+        }
+    }
+}
+
+}  // anonymous namespace
+
+// =========================================================================
+//  Workspace sizing — mirrors the kernel's block sizes exactly
+// =========================================================================
+
+size_t conv2d_im2col_get_workspace_size(const Conv2DAttributes& attrs,
+                                        std::span<const TensorDesc> inputs,
+                                        std::span<const TensorDesc> outputs)
+{
+    NNOPS_ASSERT(inputs.size() >= 2);
+    NNOPS_ASSERT(outputs.size() >= 1);
+
+    const auto& in  = inputs[0];
+    const auto& wt  = inputs[1];
+    const auto& out = outputs[0];
+
+    const DataType dt = in.dtype;
+    if (dt != DataType::f32 && dt != DataType::f16) {
+        return 0;
+    }
+    if (wt.dtype != dt || out.dtype != dt) {
+        return 0;
+    }
+    if (inputs.size() > 2 && inputs[2].dtype != dt) {
+        return 0;
+    }
+
+    const int64_t N  = in.dims[0];
+    const int64_t IC = in.dims[1];
+    const int64_t OC = wt.dims[0];
+    const int64_t OH = out.dims[2];
+    const int64_t OW = out.dims[3];
+
+    const int64_t G = attrs.groups;
+    const int64_t ic_per_group = IC / G;
+    const int64_t oc_per_group = OC / G;
+
+    const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
+    const int64_t PH    = attrs.padding[0];
+
+    const int64_t icn_block = std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
+    const int64_t ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
+    const int64_t oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
+
+    const int64_t col_size  = icn_block * karea * oh_block * OW;
+    const int64_t orig_size = attrs.add_to ? ocn_block * oh_block * OW : 0;
+
+    return static_cast<size_t>(N * G)
+         * static_cast<size_t>(col_size + orig_size)
+         * data_type_size(dt);
+}
+
+// =========================================================================
+//  Public API
+// =========================================================================
+
+void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
+                          TensorView& output,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx,
+                          void* workspace)
+{
+    const DataType dt = inputs[0].data_type();
+
+    const bool dtypes_ok = (dt == DataType::f32 || dt == DataType::f16) &&
+                           inputs[1].data_type() == dt &&
+                           output.data_type() == dt &&
+                           (inputs.size() <= 2 || inputs[2].data_type() == dt);
+
+    if (dtypes_ok && workspace != nullptr) {
+        if (dt == DataType::f32) {
+            conv2d_im2col_impl<float>(attrs, output, inputs, ctx, workspace);
+        } else {
+            conv2d_im2col_impl<half>(attrs, output, inputs, ctx, workspace);
+        }
+        return;
+    }
+
+    // f32 without a workspace (or mismatched dtypes): the reference is the
+    // correctness baseline and needs no scratch. f16 has no reference — a
+    // workspace buffer is mandatory there.
+    if (dt == DataType::f32) {
+        reference::conv2d_ref(attrs, output, inputs, ctx, workspace);
+        return;
+    }
+
+    NNOPS_ASSERT(!"conv2d_im2col_kernel: f16 Conv2D requires a workspace buffer "
+                   "(see Conv2D::getWorkspaceSize)");
+}
+
+}  // namespace nnops::backend::cpu

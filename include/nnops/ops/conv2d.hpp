@@ -70,6 +70,12 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    /// Scratch buffer size required by the CPU tiled im2col + GEMM kernel
+    /// (f32/f16). Returns 0 for unsupported dtypes or when no workspace is
+    /// needed by the fallback path.
+    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const override;
+
     /// inputs[0] = input tensor (NCHW)
     /// inputs[1] = weight tensor (OIHW or GOIHW for grouped)
     /// inputs[2] = bias tensor [OC] (optional)
