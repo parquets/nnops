@@ -142,10 +142,13 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
 // epilogue_inplace — fused bias + epilogue for MatMul output
 // ============================================================
 
-/// Apply bias addition and epilogue activation to a MatMul output matrix.
+/// Apply bias addition, epilogue activation, and an optional residual add-back
+/// to a MatMul/Conv output matrix.
 ///
 /// Processes output in-place: for each of the M rows, applies per-column
-/// bias (if non-null) and then the epilogue activation function.
+/// bias (if non-null), the epilogue activation function, and — when @p add_to —
+/// adds back @p add_src. This fuses the Conv2D residual (add_to) path into a
+/// single write-back pass instead of a separate epilogue + add kernel.
 ///
 /// Uses SIMD for the bulk of each row; scalar for the tail.
 ///
@@ -156,12 +159,18 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
 /// @param ld       Leading dimension (stride in elements between consecutive rows)
 /// @param bias     Per-column bias array of length N (may be nullptr)
 /// @param epilogue Epilogue descriptor (None = identity, no-op)
+/// @param add_src  Dense M×N residual buffer (row stride N), added after the
+///                 epilogue when @p add_to. May be nullptr.
+/// @param add_to   When true, adds @p add_src back into @p data after the
+///                 epilogue: data = epilogue(data + bias) + add_src.
 template <class T>
-void epilogue_inplace(int M, int N, T* data, int ld, const T* bias, const Epilogue& epilogue) {
+void epilogue_inplace(int M, int N, T* data, int ld, const T* bias, const Epilogue& epilogue,
+                      const T* add_src = nullptr, bool add_to = false) {
     constexpr int L = simd_lane_for<T>;
 
     for (int m = 0; m < M; ++m) {
         T* row = data + m * ld;
+        const T* add_row = (add_to && add_src) ? add_src + m * N : nullptr;
         int n = 0;
 
         // ---- SIMD loop ----
@@ -177,6 +186,11 @@ void epilogue_inplace(int M, int N, T* data, int ld, const T* bias, const Epilog
             // Epilogue activation (type dispatched via pointer overload)
             v_data = apply_epilogue_vec(epilogue, row + n, v_data);
 
+            // Fused residual add-back (add_to residual connection)
+            if (add_row) {
+                v_data = v_add(v_data, v_load(add_row + n));
+            }
+
             v_store(row + n, v_data);
         }
 
@@ -187,6 +201,9 @@ void epilogue_inplace(int M, int N, T* data, int ld, const T* bias, const Epilog
                 val += s_load(&bias[n]);
             }
             val = nnops::apply_epilogue(epilogue, val);
+            if (add_row) {
+                val += s_load(&add_row[n]);
+            }
             s_store(&row[n], val);
         }
     }

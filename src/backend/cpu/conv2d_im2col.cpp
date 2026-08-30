@@ -112,25 +112,6 @@ void tile_save(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src,
     }
 }
 
-/// Add a dense scratch buffer (row stride N) back into a strided tile.
-template <class T>
-void tile_add(T* NNOPS_RESTRICT tile, int ld, const T* NNOPS_RESTRICT orig,
-              int M, int N) noexcept
-{
-    constexpr int L = simd_lane_for<T>;
-    for (int m = 0; m < M; ++m) {
-        T* row = tile + m * ld;
-        const T* o = orig + m * N;
-        int i = 0;
-        for (; i + L <= N; i += L) {
-            v_store(row + i, v_add(v_load(row + i), v_load(o + i)));
-        }
-        for (; i < N; ++i) {
-            s_store(&row[i], s_load(&row[i]) + s_load(&o[i]));
-        }
-    }
-}
-
 // ---- main kernel ----------------------------------------------------------
 
 template <class T>
@@ -276,11 +257,8 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     if (is_last_icn) {
                         epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                             tile, static_cast<int>(ocn_step),
-                                            static_cast<const T*>(nullptr), attrs.epilogue);
-                        if (attrs.add_to && epilogue_active) {
-                            tile_add<T>(tile, static_cast<int>(ocn_step), orig,
-                                        static_cast<int>(ocnc), static_cast<int>(roi_area));
-                        }
+                                            static_cast<const T*>(nullptr), attrs.epilogue,
+                                            orig, attrs.add_to && epilogue_active);
                     }
                 }
             }
