@@ -119,15 +119,14 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
     const auto& indices = inputs[1];
 
     const auto& qp = weight.quant_params();
-    // For the 2D embed weight [vocab_size, dim], PerChannel quantizes along
-    // axis 0 (the output channel = vocab entry), i.e. per-row — the same as
-    // PerToken. Both use one (scale, zero_point) per weight row.
+    // Embed weight [vocab_size, dim] is quantized per-row: one (scale,
+    // zero_point) per vocab entry. PerToken does this directly; PerChannel on a
+    // 2D weight quantizes along axis 0 (the vocab entry) — identical to
+    // PerToken. Per-tensor and block quantization are not supported: reject.
     const bool per_row = (qp.granularity == QuantGranularity::PerToken)
                       || (qp.granularity == QuantGranularity::PerChannel);
-    const bool has_zp   = (qp.zero_point_data != nullptr);
-
-    const float per_tensor_scale = qp.scale;
-    const float per_tensor_zp    = static_cast<float>(qp.zero_point);
+    NNOPS_ASSERT(per_row);
+    const bool has_zp = (qp.zero_point_data != nullptr);
 
     const int64_t V = weight.shape(0);
     const int64_t dim = weight.shape(1);
@@ -155,10 +154,8 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
         const int64_t idx = resolve_idx(n);
         const T* w_row = weight_ptr + idx * w_row_elems;
 
-        const float s_val = per_row ? qp.scale_data[idx] : per_tensor_scale;
-        const float zp_val = has_zp
-            ? static_cast<float>(per_row ? qp.zero_point_data[idx] : qp.zero_point)
-            : 0.0f;
+        const float s_val = qp.scale_data[idx];
+        const float zp_val = has_zp ? static_cast<float>(qp.zero_point_data[idx]) : 0.0f;
 
         // Dequantize one (M=1) row directly into the output. The f16 path uses
         // the fused half-output overload (single pass, no staging scratch).

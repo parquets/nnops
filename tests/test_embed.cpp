@@ -305,52 +305,8 @@ NNOPS_TEST(embed_class_api) {
 }
 
 // ============================================================
-// Int8 weight with per-tensor dequantization
+// Int8 weight with per-token (per-row) dequantization
 // ============================================================
-
-NNOPS_TEST(embed_int8_per_tensor_f32) {
-    // Weight [3, 4] int8, quantized with scale=0.5, zp=0
-    // Values: [0,10,20,30], [40,50,60,70], [80,90,100,110]
-    const int64_t V = 3, D = 4;
-    int8_t w_data[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110};
-    const int64_t w_shape[] = {V, D};
-
-    QuantParams qp;
-    qp.scale = 0.5f;
-    qp.zero_point = 0;
-    qp.granularity = QuantGranularity::PerTensor;
-
-    TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
-
-    int64_t idx_data[] = {0, 2};
-    const int64_t idx_shape[] = {2};
-    TensorView indices(idx_shape, DataType::s64, idx_data);
-
-    auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
-    const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
-    auto descs = op->getOutputTensorDesc(in_arr);
-
-    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
-    NNOPS_EXPECT_EQ(descs[0].rank, 2);
-    NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
-    NNOPS_EXPECT_EQ(descs[0].dims[1], D);
-
-    std::vector<float> out_buf(static_cast<size_t>(2 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
-    const TensorView ins[] = {weight, indices};
-    op->compute(output, ins);
-
-    // Index 0: values [0,10,20,30] * 0.5 = [0,5,10,15]
-    NNOPS_EXPECT_NEAR(out_buf[0], 0.0f, 1e-5f);
-    NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);
-    NNOPS_EXPECT_NEAR(out_buf[2], 10.0f, 1e-5f);
-    NNOPS_EXPECT_NEAR(out_buf[3], 15.0f, 1e-5f);
-    // Index 2: values [80,90,100,110] * 0.5 = [40,45,50,55]
-    NNOPS_EXPECT_NEAR(out_buf[4], 40.0f, 1e-5f);
-    NNOPS_EXPECT_NEAR(out_buf[5], 45.0f, 1e-5f);
-    NNOPS_EXPECT_NEAR(out_buf[6], 50.0f, 1e-5f);
-    NNOPS_EXPECT_NEAR(out_buf[7], 55.0f, 1e-5f);
-}
 
 NNOPS_TEST(embed_int8_per_token_f32) {
     // Weight [2, 4] int8, per-token scale, no zp
@@ -534,15 +490,16 @@ NNOPS_TEST(embed_uint8_per_channel_zp) {
 }
 
 NNOPS_TEST(embed_int8_output_f16) {
-    // Per-tensor int8 → f16 output
+    // Per-token int8 → f16 output
     const int64_t V = 2, D = 4;
     int8_t w_data[] = {0, 20, 40, 60, -10, 10, 30, 50};
     const int64_t w_shape[] = {V, D};
 
+    float scale_data[] = {0.1f, 0.1f};
     QuantParams qp;
-    qp.scale = 0.1f;
-    qp.zero_point = 0;
-    qp.granularity = QuantGranularity::PerTensor;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = V;
 
     TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
@@ -588,8 +545,11 @@ NNOPS_TEST(embed_int8_out_of_bounds) {
     int8_t w_data[] = {1, 2, 3, 4, 5, 6};
     const int64_t w_shape[] = {V, D};
 
+    float scale_data[] = {2.0f, 2.0f, 2.0f};
     QuantParams qp;
-    qp.scale = 2.0f;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = V;
 
     TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 
@@ -616,14 +576,16 @@ NNOPS_TEST(embed_int8_out_of_bounds) {
 }
 
 NNOPS_TEST(embed_int8_uint8_weight) {
-    // uint8 weight with per-tensor scale
+    // uint8 weight with per-token scale
     const int64_t V = 2, D = 3;
     uint8_t w_data[] = {0, 128, 255, 50, 100, 200};
     const int64_t w_shape[] = {V, D};
 
+    float scale_data[] = {0.02f, 0.02f};
     QuantParams qp;
-    qp.scale = 0.02f;
-    qp.zero_point = 0;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = V;
 
     TensorView weight(w_shape, DataType::u8, w_data, TensorLayout::NCHW, qp);
 
@@ -656,8 +618,11 @@ NNOPS_TEST(embed_int8_class_api) {
     int8_t w_data[] = {10, 20, 30, 40};
     const int64_t w_shape[] = {V, D};
 
+    float scale_data[] = {0.1f, 0.1f};
     QuantParams qp;
-    qp.scale = 0.1f;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale_data;
+    qp.num_scales = V;
 
     TensorView weight(w_shape, DataType::s8, w_data, TensorLayout::NCHW, qp);
 

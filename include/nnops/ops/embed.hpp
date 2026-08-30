@@ -32,10 +32,11 @@ struct EmbedAttributes {
 ///   output[j] = (weight[idx, j] - zero_point[idx]) * scale[idx]
 ///
 /// Quantization parameters (scale, zero_point, granularity) are stored in
-/// the weight tensor via TensorView::QuantParams. Supports PerTensor
-/// (single scale/zp for all rows), PerToken (per-row scale/zp), and
-/// PerChannel — for the 2D weight [vocab_size, dim], PerChannel quantizes
-/// along axis 0 (the vocab entry), i.e. per-row, identical to PerToken.
+/// the weight tensor via TensorView::QuantParams. Only per-row (per-token)
+/// quantization is supported: one (scale, zero_point) per vocab entry.
+/// PerToken does this directly; PerChannel — for the 2D weight
+/// [vocab_size, dim], quantizing along axis 0 (the vocab entry) — is
+/// identical to PerToken. PerTensor and PerBlock are rejected.
 ///
 /// Inputs (2):
 ///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, s8, u8)
