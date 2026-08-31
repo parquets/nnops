@@ -58,6 +58,9 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const override;
+
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

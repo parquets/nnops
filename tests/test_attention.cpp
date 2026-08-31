@@ -18,6 +18,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 using namespace nnops;
 
@@ -165,4 +166,118 @@ NNOPS_TEST(attention_random) {
         NNOPS_EXPECT_TRUE(!std::isnan(out_buf[i]));
         NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
     }
+}
+
+// ============================================================
+// Tiled attention fast path (vs reference)
+// ============================================================
+
+// Reference kernel for comparison (test-local declaration, following the
+// test_conv2d.cpp pattern).
+namespace nnops::backend::cpu::reference {
+void attention_ref(const AttentionAttributes& attrs,
+                   TensorView& output,
+                   std::span<const TensorView> inputs,
+                   const ComputeContext& ctx,
+                   void* workspace);
+}
+
+namespace {
+
+/// Run the fast path (workspace provided) and the reference, and report whether
+/// every output element agrees within (rtol, atol).
+bool attention_fast_vs_ref(const AttentionAttributes& attrs,
+                           const TensorView& q, const TensorView& k, const TensorView& v,
+                           const TensorView* mask,
+                           float rtol, float atol)
+{
+    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
+    std::vector<TensorView> ins   = {q, k, v};
+    if (mask) {
+        descs.push_back(mask->desc());
+        ins.push_back(*mask);
+    }
+
+    auto op = Attention::create(attrs, Backend::CPU);
+    auto out_descs = op->getOutputTensorDesc(descs);
+    const int64_t out_numel = out_descs[0].numel();
+
+    // Fast path (allocated workspace).
+    std::vector<float> fast_buf(static_cast<size_t>(out_numel));
+    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    std::vector<char> workspace(op->getWorkspaceSize(descs, out_descs));
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
+    op->compute(fast_out, ins, {}, workspace.data());
+
+    // Reference baseline.
+    std::vector<float> ref_buf(static_cast<size_t>(out_numel));
+    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::attention_ref(attrs, ref_out, ins, {}, nullptr);
+
+    for (int64_t i = 0; i < out_numel; ++i) {
+        const float diff = std::abs(fast_buf[i] - ref_buf[i]);
+        const float thr  = atol + rtol * std::max(std::abs(fast_buf[i]), std::abs(ref_buf[i]));
+        if (diff > thr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(attention_tiled_matches_ref) {
+    // Merged [B, S, H*D] self-attention across a spread of batch / heads /
+    // sequence / head-dim sizes, exercising multi-k-block and multi-n-block
+    // tiling paths, with and without a mask.
+    struct Case { std::array<int64_t, 3> qshape; std::array<int64_t, 3> kshape;
+                  std::array<int64_t, 3> vshape; int64_t heads; float scale; bool mask; };
+    const Case cases[] = {
+        {{1, 4, 4},     {1, 4, 4},     {1, 4, 4},     1, 0.0f, false},
+        {{2, 8, 64},    {2, 8, 64},    {2, 8, 64},    4, 0.0f, false},
+        {{1, 16, 32},   {1, 16, 32},   {1, 16, 32},   1, 0.0f, false},
+        {{2, 6, 24},    {2, 6, 24},    {2, 6, 24},    3, 0.5f, true},
+        {{1, 32, 128},  {1, 32, 128},  {1, 32, 128},  8, 0.0f, true},
+        // head_dim > Kc: exercises the multi-k-block GEMM1 / multi-n-block GEMM2
+        {{1, 4, 512},   {1, 4, 512},   {1, 4, 512},   1, 0.0f, false},
+    };
+
+    for (const auto& c : cases) {
+        auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 200);
+        auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 201);
+        auto [v_vec, v] = test::make_random_tensor(c.vshape, -1.0f, 1.0f, 202);
+
+        std::vector<float> m_vec;
+        TensorView mask;
+        if (c.mask) {
+            // Reference reads the mask flat [Sq, Sk]; keep it 2-D here.
+            auto [mv, m] = test::make_random_tensor(
+                {c.qshape[1], c.kshape[1]}, -2.0f, 2.0f, 203);
+            m_vec = std::move(mv);
+            mask  = m;
+        }
+
+        AttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+        attrs.scale     = c.scale;
+
+        const TensorView* mp = c.mask ? &mask : nullptr;
+        NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, mp, 1e-3f, 1e-4f));
+    }
+}
+
+NNOPS_TEST(attention_tiled_explicit_matches_ref) {
+    // Explicit [B, H, S, D] layout (one head per (batch, head) block).
+    const int64_t qshape[] = {2, 3, 5, 8};
+    const int64_t kshape[] = {2, 3, 5, 8};
+    const int64_t vshape[] = {2, 3, 5, 8};
+
+    auto [q_vec, q] = test::make_random_tensor(qshape, -1.0f, 1.0f, 210);
+    auto [k_vec, k] = test::make_random_tensor(kshape, -1.0f, 1.0f, 211);
+    auto [v_vec, v] = test::make_random_tensor(vshape, -1.0f, 1.0f, 212);
+
+    AttentionAttributes attrs;
+    attrs.num_heads = 3;
+
+    NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f));
 }

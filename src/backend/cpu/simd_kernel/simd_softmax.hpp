@@ -263,4 +263,94 @@ inline void softmax_process_standard_row(
     }
 }
 
+/// Masked standard-row softmax: fuses an additive mask into the contiguous-row
+/// 3-pass kernel, computing softmax(x + mask) without materializing the sum.
+/// `mask` points at D contiguous elements aligned with x; both inputs are
+/// read-only and y may alias x (in-place). This saves one full-buffer pass
+/// versus an explicit `x += mask` before a plain softmax.
+template <typename T>
+inline void mask_softmax_process_standard_row(
+    const T* x, const T* mask, T* y,
+    int64_t D, bool log_softmax,
+    float inv_T = 1.0f)
+{
+    constexpr int L = simd_lane_for<T>;
+    int64_t i = 0;
+
+    // Pass 1: Max over (x + mask)
+    float max_val = -std::numeric_limits<float>::infinity();
+    {
+        auto v_max_val = v_set1(x, max_val);
+        for (; i + L <= D; i += L) {
+            v_max_val = v_max(v_max_val, v_add(v_load(x + i), v_load(mask + i)));
+        }
+        max_val = v_reduce_max(v_max_val);
+    }
+    for (; i < D; ++i) {
+        float xv = s_load(&x[i]) + s_load(&mask[i]);
+        if (xv > max_val) { max_val = xv; }
+    }
+
+    const float neg_max = -max_val;
+
+    // Pass 2: Sum of exp((x + mask - max) / T)
+    float sum_exp = 0.0f;
+    i = 0;
+    const bool store_exp = !log_softmax;
+
+    {
+        auto v_sum = v_zero(x);
+        auto v_neg_max = v_set1(x, neg_max);
+        auto v_inv_T = v_set1(x, inv_T);
+        for (; i + L <= D; i += L) {
+            auto v = v_add(v_add(v_load(x + i), v_load(mask + i)), v_neg_max);
+            if (inv_T != 1.0f) {
+                v = v_mul(v, v_inv_T);
+            }
+            v = v_exp(v);
+            if (store_exp) { v_store(y + i, v); }
+            v_sum = v_add(v_sum, v);
+        }
+        sum_exp = v_reduce_sum(v_sum);
+    }
+    for (; i < D; ++i) {
+        float val = std::exp((s_load(&x[i]) + s_load(&mask[i]) - max_val) * inv_T);
+        if (store_exp) { s_store(&y[i], val); }
+        sum_exp += val;
+    }
+
+    // Pass 3: Normalize
+    i = 0;
+    if (log_softmax) {
+        const float bias = neg_max * inv_T - std::log(sum_exp);
+        auto v_bias = v_set1(x, bias);
+        if (inv_T != 1.0f) {
+            auto v_inv_T = v_set1(x, inv_T);
+            for (; i + L <= D; i += L) {
+                auto xm = v_add(v_load(x + i), v_load(mask + i));
+                v_store(y + i, v_add(v_mul(xm, v_inv_T), v_bias));
+            }
+            for (; i < D; ++i) {
+                s_store(&y[i], (s_load(&x[i]) + s_load(&mask[i])) * inv_T + bias);
+            }
+        } else {
+            for (; i + L <= D; i += L) {
+                auto xm = v_add(v_load(x + i), v_load(mask + i));
+                v_store(y + i, v_add(xm, v_bias));
+            }
+            for (; i < D; ++i) {
+                s_store(&y[i], s_load(&x[i]) + s_load(&mask[i]) + bias);
+            }
+        }
+    } else {
+        auto v_inv = v_set1(x, 1.0f / sum_exp);
+        for (; i + L <= D; i += L) {
+            v_store(y + i, v_mul(v_load(y + i), v_inv));
+        }
+        for (; i < D; ++i) {
+            s_store(&y[i], s_load(&y[i]) / sum_exp);
+        }
+    }
+}
+
 }  // namespace nnops::kernel

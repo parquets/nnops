@@ -4,6 +4,7 @@
 #include "nnops/ops/attention.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
+#include "backend/cpu/attention.h"
 
 namespace nnops {
 
@@ -32,7 +33,7 @@ auto resolve_attention_kernel(Backend backend) -> Attention::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::attention_ref;
+        return backend::cpu::attention_kernel;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;
@@ -62,6 +63,15 @@ std::vector<TensorDesc> Attention::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     return {attention_output_shape(inputs)};
+}
+
+size_t Attention::getWorkspaceSize(std::span<const TensorDesc> inputs,
+                                   std::span<const TensorDesc> outputs) const
+{
+    NNOPS_ASSERT(inputs.size() >= 3);
+    NNOPS_ASSERT(inputs.size() <= 4);
+    NNOPS_ASSERT(outputs.size() == 1);
+    return backend::cpu::attention_get_workspace_size(attrs_, inputs, outputs);
 }
 
 void Attention::compute(std::span<TensorView> outputs,
