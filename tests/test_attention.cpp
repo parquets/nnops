@@ -281,3 +281,40 @@ NNOPS_TEST(attention_tiled_explicit_matches_ref) {
 
     NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f));
 }
+
+// ============================================================
+// FlashAttention path (large sequence length)
+// ============================================================
+
+NNOPS_TEST(attention_flash_matches_ref) {
+    // Large-sequence cases that route through the tiled FlashAttention path
+    // (Sq × Sk ≥ 65536), exercising single- and multi-KV-block online softmax,
+    // with and without an additive mask.
+    struct Case { std::array<int64_t, 3> qshape; int64_t heads; bool mask; };
+    const Case cases[] = {
+        {{1, 256, 64},  2, false},   // Sq*Sk = 65536, H*D = 64
+        {{1, 320, 32},  1, true},    // Sq*Sk = 102400, masked
+        {{1, 512, 128}, 1, false},   // Sq*Sk = 262144, D=128 → multi-KV-block
+    };
+
+    for (const auto& c : cases) {
+        auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 300);
+        auto [k_vec, k] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 301);
+        auto [v_vec, v] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 302);
+
+        std::vector<float> m_vec;
+        TensorView mask;
+        if (c.mask) {
+            auto [mv, m] = test::make_random_tensor(
+                {c.qshape[1], c.qshape[1]}, -2.0f, 2.0f, 303);
+            m_vec = std::move(mv);
+            mask  = m;
+        }
+
+        AttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+
+        const TensorView* mp = c.mask ? &mask : nullptr;
+        NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, mp, 1e-3f, 1e-4f));
+    }
+}

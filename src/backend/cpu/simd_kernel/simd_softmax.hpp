@@ -353,4 +353,57 @@ inline void mask_softmax_process_standard_row(
     }
 }
 
+/// Row maximum of one contiguous row — building block of the tiled
+/// (FlashAttention) online-softmax, where the caller tracks the running max
+/// across KV tiles instead of materializing the full softmax row.
+template <typename T>
+inline float softmax_row_max(const T* x, int64_t n)
+{
+    constexpr int L = simd_lane_for<T>;
+    int64_t i = 0;
+    float mx = -std::numeric_limits<float>::infinity();
+    {
+        auto v_mx = v_set1(x, mx);
+        for (; i + L <= n; i += L) { v_mx = v_max(v_mx, v_load(x + i)); }
+        mx = v_reduce_max(v_mx);
+    }
+    for (; i < n; ++i) {
+        float xv = s_load(&x[i]);
+        if (xv > mx) { mx = xv; }
+    }
+    return mx;
+}
+
+/// Scaled exp + sum of one contiguous row referenced to an externally supplied
+/// running max `ref_max` (the max of this row across all KV tiles processed so
+/// far): writes y[i] = exp((x[i] - ref_max) * inv_T) and returns sum(y). The
+/// caller owns the running max/sum and the final normalization; this is the
+/// per-tile update step of the tiled (FlashAttention) online-softmax.
+template <typename T>
+inline float softmax_row_exp_sum(const T* x, T* y, int64_t n, float ref_max, float inv_T)
+{
+    constexpr int L = simd_lane_for<T>;
+    int64_t i = 0;
+    float sum = 0.0f;
+    {
+        auto v_sum = v_zero(x);
+        auto v_neg_ref = v_set1(x, -ref_max);
+        auto v_inv_T = v_set1(x, inv_T);
+        for (; i + L <= n; i += L) {
+            auto v = v_add(v_load(x + i), v_neg_ref);
+            if (inv_T != 1.0f) { v = v_mul(v, v_inv_T); }
+            v = v_exp(v);
+            v_store(y + i, v);
+            v_sum = v_add(v_sum, v);
+        }
+        sum = v_reduce_sum(v_sum);
+    }
+    for (; i < n; ++i) {
+        float val = std::exp((s_load(&x[i]) - ref_max) * inv_T);
+        s_store(&y[i], val);
+        sum += val;
+    }
+    return sum;
+}
+
 }  // namespace nnops::kernel

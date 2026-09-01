@@ -17,12 +17,17 @@
 /// buffer is zeroed before GEMM1 and the output head is zeroed before GEMM2
 /// (attention has no beta / add_to; the reference overwrites the output).
 ///
+/// When the per-head scores matrix is large (Sq × Sk ≥ kFlashMinScores), the
+/// tiled online-softmax FlashAttention path (attention_flash_impl) is used
+/// instead, streaming KV in Br×Bc tiles so the full scores matrix is never
+/// materialized (MLAS FlashAttention-1 algorithm, adapted to these kernels).
+///
 /// Grouped-query attention (attrs.num_group) is not yet handled — this runs
 /// standard MHA (one head block per (batch, head)), matching the reference.
 
 #include "attention.h"
 #include "matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs + panel constants
-#include "simd_kernel/simd_softmax.hpp"     // softmax_process_standard_row
+#include "simd_kernel/simd_softmax.hpp"     // softmax + FlashAttention row kernels
 #include "nnops/detail/assert.hpp"
 
 #include <algorithm>
@@ -226,6 +231,228 @@ void attention_impl(const AttentionAttributes& attrs,
     }
 }
 
+// ---- FlashAttention routing + tiling -------------------------------------
+//
+// The tiled online-softmax (FlashAttention) path is chosen once the per-head
+// scores matrix (Sq × Sk floats) is large enough that the standard path —
+// materializing the full scores plus the fused mask/softmax passes — would
+// thrash cache. Br / Bc follow the MLAS L2 heuristic:
+//   Bc ≈ L2 / (4 · 4 · (qk_head_size + v_head_size)),  Br = min(Bc, 2D).
+
+constexpr int64_t kFlashMinScores = 1 << 16;  // Sq*Sk threshold (≈ 256 KiB f32)
+
+inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
+{
+    return Sq * Sk >= kFlashMinScores;
+}
+
+inline void resolve_flash_tile_sizes(int64_t Sq, int64_t Sk, int64_t D, int& Br, int& Bc)
+{
+    const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
+    const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u);  // 1 MiB fallback
+    const int64_t head_pairs = D + D;  // qk_head_size + v_head_size (both == D here)
+    Bc = static_cast<int>(l2_eff / (sizeof(float) * 4 * head_pairs));
+    if (Bc < 1) { Bc = 1; }
+    Br = static_cast<int>(std::min<int64_t>(Bc, head_pairs));
+    Bc = static_cast<int>(std::min<int64_t>(Bc, Sk));
+    Br = static_cast<int>(std::min<int64_t>(Br, Sq));
+    if (Br < 1) { Br = 1; }
+    if (Bc < 1) { Bc = 1; }
+}
+
+// Per-head scratch (elements), mirroring the layout inside attention_flash_impl:
+//   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:num_panels(Bc)*ldd_b_full]
+inline int64_t flash_per_head_elems(int Br, int Bc, int64_t D)
+{
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(NR_MAX_F32 * KC_F32 * static_cast<int>(sizeof(float)))
+                           / static_cast<int>(sizeof(float));
+    const int pack_elems = num_panels(Bc, NR_F32) * ldd_b_full;
+    return static_cast<int64_t>(Br) * 2
+         + static_cast<int64_t>(Br) * Bc
+         + static_cast<int64_t>(Br) * D
+         + pack_elems;
+}
+
+// ---- per-(batch,head) tiled FlashAttention kernel -------------------------
+//
+// Splits the query rows into Br-sized blocks and streams the KV rows in
+// Bc-sized blocks, keeping a running max/sum and an output accumulator so the
+// full Sq×Sk scores matrix is never materialized (standard online-softmax /
+// FlashAttention-1 forward pass). Reuses tile_mma_direct / tile_pack_rhs.
+
+template <class T>
+void attention_flash_impl(const AttentionAttributes& attrs,
+                          TensorView& output,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx,
+                          void* workspace)
+{
+    const auto& Q = inputs[0];
+    const auto& K = inputs[1];
+    const auto& V = inputs[2];
+    const bool has_mask = inputs.size() > 3;
+
+    const HeadShape hs = resolve_head_shape(attrs, inputs);
+    const int64_t B = hs.B, H = hs.H, Sq = hs.Sq, Sk = hs.Sk, D = hs.D;
+    const bool merged = hs.merged;
+
+    const float scale = (attrs.scale == 0.0f)
+        ? (1.0f / std::sqrt(static_cast<float>(D)))
+        : attrs.scale;
+
+    const T* q_ptr = Q.ptr<T>();
+    const T* k_ptr = K.ptr<T>();
+    const T* v_ptr = V.ptr<T>();
+    const T* mask_ptr = has_mask ? inputs[3].ptr<T>() : nullptr;
+    T* out_ptr = output.ptr<T>();
+
+    const int64_t q_rs = Q.row_stride_elems();
+    const int64_t k_rs = K.row_stride_elems();
+    const int64_t v_rs = V.row_stride_elems();
+    const int64_t o_rs = output.row_stride_elems();
+
+    constexpr int nr_max = nr_max_flt<T>();
+    constexpr int kc = KC_F32;
+    constexpr int L = simd::simd_lane_for<T>;
+
+    int Br, Bc;
+    resolve_flash_tile_sizes(Sq, Sk, D, Br, Bc);
+    const int64_t per_head = flash_per_head_elems(Br, Bc, D);
+
+    const int64_t NG = B * H;
+    T* ws_base = static_cast<T*>(workspace);
+
+    const auto run = [&](int64_t idx) {
+        const int64_t b = idx / H;
+        const int64_t h = idx % H;
+
+        const T* q_head;
+        const T* k_head;
+        const T* v_head;
+        T* o_head;
+        if (merged) {
+            q_head = q_ptr + b * Sq * q_rs + h * D;
+            k_head = k_ptr + b * Sk * k_rs + h * D;
+            v_head = v_ptr + b * hs.Sv * v_rs + h * D;
+            o_head = out_ptr + b * Sq * o_rs + h * D;
+        } else {
+            q_head = q_ptr + (b * H + h) * Sq * q_rs;
+            k_head = k_ptr + (b * H + h) * Sk * k_rs;
+            v_head = v_ptr + (b * H + h) * hs.Sv * v_rs;
+            o_head = out_ptr + (b * H + h) * Sq * o_rs;
+        }
+
+        T* m      = ws_base + idx * per_head;
+        T* l      = m + Br;
+        T* s      = l + Br;
+        T* o_acc  = s + static_cast<int64_t>(Br) * Bc;
+        T* pack_b = o_acc + static_cast<int64_t>(Br) * D;
+
+        for (int64_t i0 = 0; i0 < Sq; i0 += Br) {
+            const int actual_br = static_cast<int>(std::min<int64_t>(Br, Sq - i0));
+
+            // reset the running online-softmax state for this query block
+            for (int i = 0; i < actual_br; ++i) {
+                m[i] = -std::numeric_limits<T>::infinity();
+                l[i] = 0.0f;
+            }
+            std::memset(o_acc, 0, static_cast<size_t>(actual_br) * static_cast<size_t>(D) * sizeof(T));
+
+            for (int64_t j0 = 0; j0 < Sk; j0 += Bc) {
+                const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, Sk - j0));
+
+                // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
+                std::memset(s, 0, static_cast<size_t>(actual_br) * static_cast<size_t>(actual_bc) * sizeof(T));
+                for (int64_t k0 = 0; k0 < D; k0 += kc) {
+                    const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
+                    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+                                      / static_cast<int>(sizeof(T));
+                    tile_pack_rhs(true, actual_bc, actual_kc,
+                                  pack_b, ldd_b,
+                                  k_head + j0 * k_rs + k0, static_cast<int>(k_rs), scale);
+                    tile_mma_direct(actual_br, actual_bc, actual_kc,
+                                    s, actual_bc,
+                                    q_head + i0 * q_rs + k0, static_cast<int>(q_rs),
+                                    pack_b, -1, kNegInf, kPosInf);
+                }
+
+                // ---- additive mask (flat [Sq, Sk], shared across heads) ----
+                if (mask_ptr) {
+                    for (int i = 0; i < actual_br; ++i) {
+                        const T* mrow = mask_ptr + (i0 + i) * Sk + j0;
+                        T* srow = s + i * actual_bc;
+                        int j = 0;
+                        for (; j + L <= actual_bc; j += L) {
+                            simd::v_store(srow + j, simd::v_add(simd::v_load(srow + j), simd::v_load(mrow + j)));
+                        }
+                        for (; j < actual_bc; ++j) {
+                            simd::s_store(&srow[j], simd::s_load(&srow[j]) + simd::s_load(&mrow[j]));
+                        }
+                    }
+                }
+
+                // ---- online-softmax update + accumulate into o_acc -----
+                for (int i = 0; i < actual_br; ++i) {
+                    T* srow = s + i * actual_bc;
+                    const float rowmax = kernel::softmax_row_max<T>(srow, actual_bc);
+                    const float old_m = static_cast<float>(m[i]);
+                    const float new_m = std::max(old_m, rowmax);
+                    const float exp_diff = std::exp(old_m - new_m);  // 0 on the first KV block
+                    m[i] = static_cast<T>(new_m);
+                    const float rowsum = kernel::softmax_row_exp_sum<T>(srow, srow, actual_bc, new_m, 1.0f);
+                    l[i] = static_cast<T>(exp_diff * static_cast<float>(l[i]) + rowsum);
+
+                    // rescale the accumulated output by exp_diff (skip work when it is 1.0)
+                    if (exp_diff != 1.0f) {
+                        T* orow = o_acc + i * D;
+                        auto v_ed = simd::v_set1(orow, exp_diff);
+                        int64_t d = 0;
+                        for (; d + L <= D; d += L) {
+                            simd::v_store(orow + d, simd::v_mul(simd::v_load(orow + d), v_ed));
+                        }
+                        for (; d < D; ++d) {
+                            simd::s_store(&orow[d], simd::s_load(&orow[d]) * exp_diff);
+                        }
+                    }
+                }
+
+                // ---- o_acc += S @ V[j0:j0+Bc] --------------------------
+                for (int64_t k0 = 0; k0 < actual_bc; k0 += kc) {
+                    const int actual_kc = static_cast<int>(std::min<int64_t>(kc, actual_bc - k0));
+                    tile_mma_direct(actual_br, static_cast<int>(D), actual_kc,
+                                    o_acc, static_cast<int>(D),
+                                    s + k0, actual_bc,
+                                    v_head + (j0 + k0) * v_rs, static_cast<int>(v_rs),
+                                    kNegInf, kPosInf);
+                }
+            }
+
+            // ---- final normalize: output = o_acc / l -------------------
+            for (int i = 0; i < actual_br; ++i) {
+                const float inv_l = 1.0f / static_cast<float>(l[i]);
+                const T* src = o_acc + i * D;
+                T* dst = o_head + (i0 + i) * o_rs;
+                auto v_inv = simd::v_set1(src, inv_l);
+                int64_t d = 0;
+                for (; d + L <= D; d += L) {
+                    simd::v_store(dst + d, simd::v_mul(simd::v_load(src + d), v_inv));
+                }
+                for (; d < D; ++d) {
+                    simd::s_store(&dst[d], simd::s_load(&src[d]) * inv_l);
+                }
+            }
+        }
+    };
+
+    if (ctx.cpu_parallel_for) {
+        ctx.cpu_parallel_for(0, NG, run);
+    } else {
+        for (int64_t idx = 0; idx < NG; ++idx) {
+            run(idx);
+        }
+    }
+}
+
 }  // anonymous namespace
 
 // =========================================================================
@@ -262,6 +489,14 @@ size_t attention_get_workspace_size(const AttentionAttributes& attrs,
         Sq = q.dims[2];
         Sk = k.dims[2];
         D  = q.dims[3];
+    }
+
+    // FlashAttention path — sized with the same Br/Bc the kernel resolves.
+    if (should_use_flash_attention(Sq, Sk)) {
+        int Br, Bc;
+        resolve_flash_tile_sizes(Sq, Sk, D, Br, Bc);
+        const int64_t per_head = flash_per_head_elems(Br, Bc, D);
+        return static_cast<size_t>(B * H) * static_cast<size_t>(per_head) * sizeof(float);
     }
 
     constexpr int mr_max = MR_MAX_F32;
@@ -303,7 +538,12 @@ void attention_kernel(const AttentionAttributes& attrs,
                            (inputs.size() <= 3 || inputs[3].data_type() == dt);
 
     if (dtypes_ok && workspace != nullptr) {
-        attention_impl<float>(attrs, output, inputs, ctx, workspace);
+        const HeadShape hs = resolve_head_shape(attrs, inputs);
+        if (should_use_flash_attention(hs.Sq, hs.Sk)) {
+            attention_flash_impl<float>(attrs, output, inputs, ctx, workspace);
+        } else {
+            attention_impl<float>(attrs, output, inputs, ctx, workspace);
+        }
         return;
     }
 
