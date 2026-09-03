@@ -20,6 +20,7 @@
 /// output is overwritten (out[i] = fn(in[i])).
 
 #include "nnops/detail/simd/simd.hpp"
+#include "tiled_map.hpp"
 
 #include <cmath>
 
@@ -28,10 +29,10 @@ namespace nnops::kernel {
 using namespace simd;
 
 // ============================================================
-// Internal row-processing helpers
+// Row-processing helpers — thin arity adapters over tiled_map
 // ============================================================
 
-/// Row-by-row SIMD + scalar tail loop. Used for ops with SIMD intrinsics.
+/// Row-by-row SIMD + scalar tail loop for unary ops (Nin = 1).
 template <typename T, typename SimdK, typename ScalarK>
 inline void tiled_unary_simd(
     const T* in, T* out,
@@ -41,21 +42,11 @@ inline void tiled_unary_simd(
     SimdK&& simd_kernel,
     ScalarK&& scalar_kernel)
 {
-    constexpr int L = simd_lane_for<T>;  // 8 for both f32 and f16
-    for (int64_t r = 0; r < m; ++r) {
-        const T* in_row = in + r * in_pitch;
-        T* out_row = out + r * out_pitch;
-        int64_t i = 0;
-        for (; i + L <= n; i += L) {
-            v_store_add(out_row + i, simd_kernel(v_load(in_row + i)), add_to);
-        }
-        for (; i < n; ++i) {
-            s_store_add(&out_row[i], scalar_kernel(s_load(&in_row[i])), add_to);
-        }
-    }
+    tiled_map_simd<T, 1>({in}, {in_pitch}, out, out_pitch, m, n, add_to,
+                         simd_kernel, scalar_kernel);
 }
 
-/// Row-by-row scalar-only loop. Used for ops without SIMD intrinsics
+/// Row-by-row scalar-only loop for unary ops without SIMD intrinsics
 /// (Erf, Round, Ceil, Floor, Recip, Sign).
 template <typename T, typename ScalarK>
 inline void tiled_unary_scalar(
@@ -65,13 +56,8 @@ inline void tiled_unary_scalar(
     bool add_to,
     ScalarK&& scalar_kernel)
 {
-    for (int64_t r = 0; r < m; ++r) {
-        const T* in_row = in + r * in_pitch;
-        T* out_row = out + r * out_pitch;
-        for (int64_t i = 0; i < n; ++i) {
-            s_store_add(&out_row[i], scalar_kernel(s_load(&in_row[i])), add_to);
-        }
-    }
+    tiled_map_scalar<T, 1>({in}, {in_pitch}, out, out_pitch, m, n, add_to,
+                           scalar_kernel);
 }
 
 // ============================================================

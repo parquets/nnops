@@ -16,6 +16,7 @@
 ///   add(a_ptr, b_ptr, out_ptr, m, n, a_pitch, b_pitch, out_pitch, add_to);
 
 #include "nnops/detail/simd/simd.hpp"
+#include "tiled_map.hpp"
 
 #include <cmath>
 
@@ -24,10 +25,10 @@ namespace nnops::kernel {
 using namespace simd;
 
 // ============================================================
-// Internal row-processing helpers
+// Row-processing helpers — thin arity adapters over tiled_map
 // ============================================================
 
-/// Row-by-row SIMD + scalar tail loop for binary ops.
+/// Row-by-row SIMD + scalar tail loop for binary ops (Nin = 2).
 template <typename T, typename SimdK, typename ScalarK>
 inline void tiled_eltwise_simd(
     const T* a, const T* b, T* out,
@@ -37,21 +38,8 @@ inline void tiled_eltwise_simd(
     SimdK&& simd_kernel,
     ScalarK&& scalar_kernel)
 {
-    constexpr int L = simd_lane_for<T>;  // 8 for both f32 and f16
-    for (int64_t r = 0; r < m; ++r) {
-        const T* a_row = a + r * a_pitch;
-        const T* b_row = b + r * b_pitch;
-        T* out_row = out + r * out_pitch;
-        int64_t i = 0;
-        for (; i + L <= n; i += L) {
-            v_store_add(out_row + i,
-                simd_kernel(v_load(a_row + i), v_load(b_row + i)), add_to);
-        }
-        for (; i < n; ++i) {
-            s_store_add(&out_row[i],
-                scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i])), add_to);
-        }
-    }
+    tiled_map_simd<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to,
+                         simd_kernel, scalar_kernel);
 }
 
 /// Row-by-row scalar-only loop for binary ops without SIMD intrinsics.
@@ -63,15 +51,8 @@ inline void tiled_eltwise_scalar(
     bool add_to,
     ScalarK&& scalar_kernel)
 {
-    for (int64_t r = 0; r < m; ++r) {
-        const T* a_row = a + r * a_pitch;
-        const T* b_row = b + r * b_pitch;
-        T* out_row = out + r * out_pitch;
-        for (int64_t i = 0; i < n; ++i) {
-            s_store_add(&out_row[i],
-                scalar_kernel(s_load(&a_row[i]), s_load(&b_row[i])), add_to);
-        }
-    }
+    tiled_map_scalar<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to,
+                           scalar_kernel);
 }
 
 // ============================================================
