@@ -11,6 +11,7 @@
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/ops/reduce.hpp"
+#include "simd_reduce_primitive.hpp"
 
 #include <cfloat>
 
@@ -197,97 +198,27 @@ inline void reduce_process_packed_channel(
     }
 }
 
-/// Contiguous tail: multi-accumulator unrolling per row.
+/// Contiguous tail: multi-accumulator unrolling per row, delegated to the
+/// shared row_reduce primitive (4→2→1 → scalar).
 template <typename T>
 inline void reduce_process_contiguous_row(
     const T* x_row, float* out_scalar,
     int64_t norm_size, ReduceType type)
 {
-    constexpr int L = simd_lane_for<T>;
-    int64_t i = 0;
-
     switch (type) {
     case ReduceType::Sum:
     case ReduceType::Mean: {
-        auto v_sum0 = v_zero(x_row);
-        auto v_sum1 = v_zero(x_row);
-        auto v_sum2 = v_zero(x_row);
-        auto v_sum3 = v_zero(x_row);
-
-        for (; i + 4 * L <= norm_size; i += 4 * L) {
-            v_sum0 = v_add(v_sum0, v_load(x_row + i));
-            v_sum1 = v_add(v_sum1, v_load(x_row + i + L));
-            v_sum2 = v_add(v_sum2, v_load(x_row + i + 2 * L));
-            v_sum3 = v_add(v_sum3, v_load(x_row + i + 3 * L));
-        }
-        auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
-
-        auto v_sum4 = v_zero(x_row);
-        auto v_sum5 = v_zero(x_row);
-        for (; i + 2 * L <= norm_size; i += 2 * L) {
-            v_sum4 = v_add(v_sum4, v_load(x_row + i));
-            v_sum5 = v_add(v_sum5, v_load(x_row + i + L));
-        }
-        v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
-
-        for (; i + L <= norm_size; i += L) {
-            v_sum = v_add(v_sum, v_load(x_row + i));
-        }
-        float sum = v_reduce_sum(v_sum);
-
-        for (; i < norm_size; ++i) {
-            sum += s_load(&x_row[i]);
-        }
+        const float sum = row_reduce<T, ReduceAdd>(x_row, norm_size);
         *out_scalar = (type == ReduceType::Mean)
             ? sum / static_cast<float>(norm_size) : sum;
         break;
     }
-
-    case ReduceType::Max: {
-        auto v_best0 = v_set1(x_row, -std::numeric_limits<float>::infinity());
-        auto v_best1 = v_set1(x_row, -std::numeric_limits<float>::infinity());
-
-        for (; i + 2 * L <= norm_size; i += 2 * L) {
-            v_best0 = v_max(v_best0, v_load(x_row + i));
-            v_best1 = v_max(v_best1, v_load(x_row + i + L));
-        }
-        auto v_best = v_max(v_best0, v_best1);
-
-        for (; i + L <= norm_size; i += L) {
-            v_best = v_max(v_best, v_load(x_row + i));
-        }
-        float best = v_reduce_max(v_best);
-
-        for (; i < norm_size; ++i) {
-            float xv = s_load(&x_row[i]);
-            if (xv > best) { best = xv; }
-        }
-        *out_scalar = best;
+    case ReduceType::Max:
+        *out_scalar = row_reduce<T, ReduceMax>(x_row, norm_size);
         break;
-    }
-
-    case ReduceType::Min: {
-        auto v_best0 = v_set1(x_row, std::numeric_limits<float>::infinity());
-        auto v_best1 = v_set1(x_row, std::numeric_limits<float>::infinity());
-
-        for (; i + 2 * L <= norm_size; i += 2 * L) {
-            v_best0 = v_min(v_best0, v_load(x_row + i));
-            v_best1 = v_min(v_best1, v_load(x_row + i + L));
-        }
-        auto v_best = v_min(v_best0, v_best1);
-
-        for (; i + L <= norm_size; i += L) {
-            v_best = v_min(v_best, v_load(x_row + i));
-        }
-        float best = v_reduce_min(v_best);
-
-        for (; i < norm_size; ++i) {
-            float xv = s_load(&x_row[i]);
-            if (xv < best) { best = xv; }
-        }
-        *out_scalar = best;
+    case ReduceType::Min:
+        *out_scalar = row_reduce<T, ReduceMin>(x_row, norm_size);
         break;
-    }
     }
 }
 

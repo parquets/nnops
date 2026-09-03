@@ -4,7 +4,7 @@
 /// Design:
 ///   - BLOCK_SIZE = 256 threads per block (standard occupancy-friendly choice)
 ///   - WARP_SIZE = 32 (all current NVIDIA GPUs)
-///   - Reduction helpers: warp_reduce_sum, warp_reduce_max, block_reduce_sum
+///   - Reduction helpers: generic warp_reduce/block_reduce + sum/max/min wrappers
 ///   - f16 support via __half type with float accumulators
 ///   - ceil_div for grid sizing
 ///   - All kernels follow the CPU reference semantics exactly
@@ -118,35 +118,40 @@ __device__ inline half8 half8_add(
 // Warp-level reductions (shuffle-based, no shared memory)
 // ============================================================
 
-__device__ inline float warp_reduce_sum(float val) noexcept {
+/// Binary combiners for the reduce helpers. Plain inline functions (rather than
+/// lambdas) so they can be passed by value to the device reduce templates.
+__host__ __device__ inline float cuda_reduce_add(float a, float b) noexcept { return a + b; }
+__host__ __device__ inline float cuda_reduce_max(float a, float b) noexcept { return fmaxf(a, b); }
+__host__ __device__ inline float cuda_reduce_min(float a, float b) noexcept { return fminf(a, b); }
+
+/// Generic warp shuffle-down reduction. `combine` is the binary op (sum/max/min).
+template <typename Combine>
+__device__ inline float warp_reduce(float val, Combine combine) noexcept {
     #pragma unroll
     for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val = combine(val, __shfl_down_sync(0xffffffff, val, offset));
     }
     return val;
 }
 
-__device__ inline float warp_reduce_max(float val) noexcept {
-    #pragma unroll
-    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(0xffffffff, val, offset);
-        val = fmaxf(val, other);
-    }
-    return val;
-}
+__device__ inline float warp_reduce_sum(float val) noexcept { return warp_reduce(val, cuda_reduce_add); }
+__device__ inline float warp_reduce_max(float val) noexcept { return warp_reduce(val, cuda_reduce_max); }
+__device__ inline float warp_reduce_min(float val) noexcept { return warp_reduce(val, cuda_reduce_min); }
 
 // ============================================================
 // Block-level reductions (shared memory)
 // ============================================================
 
-/// Block-level sum reduction. Each thread provides a float value;
-/// the total sum is stored in shared[0] and returned by all threads.
-__device__ inline float block_reduce_sum(float val, float* shared) noexcept {
+/// Generic block reduction: warp-reduce, write per-warp leaders to shared,
+/// then have warp 0 reduce across leaders (padding inactive lanes with
+/// `identity`, the op's neutral element). `combine` is the binary op.
+template <typename Combine>
+__device__ inline float block_reduce(float val, float* shared, Combine combine, float identity) noexcept {
     const int lane = threadIdx.x % kCudaWarpSize;
     const int wid  = threadIdx.x / kCudaWarpSize;
 
     // Step 1: warp-level reduction
-    val = warp_reduce_sum(val);
+    val = warp_reduce(val, combine);
 
     // Step 2: first thread of each warp writes to shared memory
     if (lane == 0) {
@@ -157,64 +162,28 @@ __device__ inline float block_reduce_sum(float val, float* shared) noexcept {
     // Step 3: first warp reduces across warp leaders
     const int num_warps = ceil_div(blockDim.x, kCudaWarpSize);
     if (wid == 0) {
-        val = (lane < num_warps) ? shared[lane] : 0.0f;
-        val = warp_reduce_sum(val);
+        val = (lane < num_warps) ? shared[lane] : identity;
+        val = warp_reduce(val, combine);
     }
     __syncthreads();
 
     return val;
+}
+
+/// Block-level sum reduction. Each thread provides a float value;
+/// the total sum is stored in shared[0] and returned by all threads.
+__device__ inline float block_reduce_sum(float val, float* shared) noexcept {
+    return block_reduce(val, shared, cuda_reduce_add, 0.0f);
 }
 
 /// Block-level max reduction.
 __device__ inline float block_reduce_max(float val, float* shared) noexcept {
-    const int lane = threadIdx.x % kCudaWarpSize;
-    const int wid  = threadIdx.x / kCudaWarpSize;
-
-    val = warp_reduce_max(val);
-
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-    __syncthreads();
-
-    const int num_warps = ceil_div(blockDim.x, kCudaWarpSize);
-    if (wid == 0) {
-        val = (lane < num_warps) ? shared[lane] : -1e30f;
-        val = warp_reduce_max(val);
-    }
-    __syncthreads();
-
-    return val;
+    return block_reduce(val, shared, cuda_reduce_max, -1e30f);
 }
 
 /// Block-level min reduction.
 __device__ inline float block_reduce_min(float val, float* shared) noexcept {
-    const int lane = threadIdx.x % kCudaWarpSize;
-    const int wid  = threadIdx.x / kCudaWarpSize;
-
-    #pragma unroll
-    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(0xffffffff, val, offset);
-        val = fminf(val, other);
-    }
-
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-    __syncthreads();
-
-    const int num_warps = ceil_div(blockDim.x, kCudaWarpSize);
-    if (wid == 0) {
-        val = (lane < num_warps) ? shared[lane] : 1e30f;
-        // warp_reduce_min inline
-        #pragma unroll
-        for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
-            val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
-        }
-    }
-    __syncthreads();
-
-    return val;
+    return block_reduce(val, shared, cuda_reduce_min, 1e30f);
 }
 
 // ============================================================

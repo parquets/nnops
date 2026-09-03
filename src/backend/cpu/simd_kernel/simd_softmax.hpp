@@ -11,6 +11,7 @@
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
 #include "nnops/detail/simd/simd.hpp"
+#include "simd_reduce_primitive.hpp"
 
 #include <cmath>
 #include <cfloat>
@@ -177,14 +178,41 @@ inline void softmax_process_packed_channel(
 }
 
 
-/// Standard SIMD fast path: contiguous tail, pack == 1.
-/// Uses horizontal SIMD reduction (v_reduce_max / v_reduce_sum),
-/// not per-lane SIMD — structurally different from softmax_per_lane.
-template <typename T>
-inline void softmax_process_standard_row(
-    const T* x, T* y,
+/// Value of the softmax element at index i: x[i] (unmasked) or x[i] + mask[i]
+/// (masked). `if constexpr` selects the form, so the masked path never reads
+/// `mask` when HasMask is false.
+template <typename T, bool HasMask>
+inline auto softmax_xm(const T* x, const T* mask, int64_t i) {
+    if constexpr (HasMask) {
+        return v_add(v_load(x + i), v_load(mask + i));
+    } else {
+        return v_load(x + i);
+    }
+}
+
+/// Scalar form of softmax_xm.
+template <typename T, bool HasMask>
+inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i) {
+    if constexpr (HasMask) {
+        return s_load(&x[i]) + s_load(&mask[i]);
+    } else {
+        return s_load(&x[i]);
+    }
+}
+
+/// Shared core of the standard-row softmax (contiguous tail, pack == 1).
+///
+/// Uses horizontal SIMD reduction (v_reduce_max / v_reduce_sum), not per-lane
+/// SIMD — structurally different from softmax_per_lane. `HasMask` selects
+/// whether an additive mask is fused in (softmax(x + mask)) without
+/// materializing the sum, saving one full-buffer pass versus an explicit
+/// `x += mask` before a plain softmax. `mask` is only read when HasMask is
+/// true (may be null otherwise); y may alias x (in-place).
+template <typename T, bool HasMask>
+inline void softmax_process_standard_row_impl(
+    const T* x, const T* mask, T* y,
     int64_t D, bool log_softmax,
-    float inv_T = 1.0f)
+    float inv_T)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
@@ -194,12 +222,12 @@ inline void softmax_process_standard_row(
     {
         auto v_max_val = v_set1(x, max_val);
         for (; i + L <= D; i += L) {
-            v_max_val = v_max(v_max_val, v_load(x + i));
+            v_max_val = v_max(v_max_val, softmax_xm<T, HasMask>(x, mask, i));
         }
         max_val = v_reduce_max(v_max_val);
     }
     for (; i < D; ++i) {
-        float xv = s_load(&x[i]);
+        float xv = softmax_xm_scalar<T, HasMask>(x, mask, i);
         if (xv > max_val) { max_val = xv; }
     }
 
@@ -215,7 +243,7 @@ inline void softmax_process_standard_row(
         auto v_neg_max = v_set1(x, neg_max);
         auto v_inv_T = v_set1(x, inv_T);
         for (; i + L <= D; i += L) {
-            auto v = v_add(v_load(x + i), v_neg_max);
+            auto v = v_add(softmax_xm<T, HasMask>(x, mask, i), v_neg_max);
             if (inv_T != 1.0f) {
                 v = v_mul(v, v_inv_T);
             }
@@ -226,7 +254,7 @@ inline void softmax_process_standard_row(
         sum_exp = v_reduce_sum(v_sum);
     }
     for (; i < D; ++i) {
-        float val = std::exp((s_load(&x[i]) - max_val) * inv_T);
+        float val = std::exp((softmax_xm_scalar<T, HasMask>(x, mask, i) - max_val) * inv_T);
         if (store_exp) { s_store(&y[i], val); }
         sum_exp += val;
     }
@@ -239,17 +267,17 @@ inline void softmax_process_standard_row(
         if (inv_T != 1.0f) {
             auto v_inv_T = v_set1(x, inv_T);
             for (; i + L <= D; i += L) {
-                v_store(y + i, v_add(v_mul(v_load(x + i), v_inv_T), v_bias));
+                v_store(y + i, v_add(v_mul(softmax_xm<T, HasMask>(x, mask, i), v_inv_T), v_bias));
             }
             for (; i < D; ++i) {
-                s_store(&y[i], s_load(&x[i]) * inv_T + bias);
+                s_store(&y[i], softmax_xm_scalar<T, HasMask>(x, mask, i) * inv_T + bias);
             }
         } else {
             for (; i + L <= D; i += L) {
-                v_store(y + i, v_add(v_load(x + i), v_bias));
+                v_store(y + i, v_add(softmax_xm<T, HasMask>(x, mask, i), v_bias));
             }
             for (; i < D; ++i) {
-                s_store(&y[i], s_load(&x[i]) + bias);
+                s_store(&y[i], softmax_xm_scalar<T, HasMask>(x, mask, i) + bias);
             }
         }
     } else {
@@ -263,94 +291,24 @@ inline void softmax_process_standard_row(
     }
 }
 
-/// Masked standard-row softmax: fuses an additive mask into the contiguous-row
-/// 3-pass kernel, computing softmax(x + mask) without materializing the sum.
-/// `mask` points at D contiguous elements aligned with x; both inputs are
-/// read-only and y may alias x (in-place). This saves one full-buffer pass
-/// versus an explicit `x += mask` before a plain softmax.
+/// Standard-row softmax (no mask).
+template <typename T>
+inline void softmax_process_standard_row(
+    const T* x, T* y,
+    int64_t D, bool log_softmax,
+    float inv_T = 1.0f)
+{
+    softmax_process_standard_row_impl<T, false>(x, nullptr, y, D, log_softmax, inv_T);
+}
+
+/// Masked standard-row softmax: softmax(x + mask) without materializing the sum.
 template <typename T>
 inline void mask_softmax_process_standard_row(
     const T* x, const T* mask, T* y,
     int64_t D, bool log_softmax,
     float inv_T = 1.0f)
 {
-    constexpr int L = simd_lane_for<T>;
-    int64_t i = 0;
-
-    // Pass 1: Max over (x + mask)
-    float max_val = -std::numeric_limits<float>::infinity();
-    {
-        auto v_max_val = v_set1(x, max_val);
-        for (; i + L <= D; i += L) {
-            v_max_val = v_max(v_max_val, v_add(v_load(x + i), v_load(mask + i)));
-        }
-        max_val = v_reduce_max(v_max_val);
-    }
-    for (; i < D; ++i) {
-        float xv = s_load(&x[i]) + s_load(&mask[i]);
-        if (xv > max_val) { max_val = xv; }
-    }
-
-    const float neg_max = -max_val;
-
-    // Pass 2: Sum of exp((x + mask - max) / T)
-    float sum_exp = 0.0f;
-    i = 0;
-    const bool store_exp = !log_softmax;
-
-    {
-        auto v_sum = v_zero(x);
-        auto v_neg_max = v_set1(x, neg_max);
-        auto v_inv_T = v_set1(x, inv_T);
-        for (; i + L <= D; i += L) {
-            auto v = v_add(v_add(v_load(x + i), v_load(mask + i)), v_neg_max);
-            if (inv_T != 1.0f) {
-                v = v_mul(v, v_inv_T);
-            }
-            v = v_exp(v);
-            if (store_exp) { v_store(y + i, v); }
-            v_sum = v_add(v_sum, v);
-        }
-        sum_exp = v_reduce_sum(v_sum);
-    }
-    for (; i < D; ++i) {
-        float val = std::exp((s_load(&x[i]) + s_load(&mask[i]) - max_val) * inv_T);
-        if (store_exp) { s_store(&y[i], val); }
-        sum_exp += val;
-    }
-
-    // Pass 3: Normalize
-    i = 0;
-    if (log_softmax) {
-        const float bias = neg_max * inv_T - std::log(sum_exp);
-        auto v_bias = v_set1(x, bias);
-        if (inv_T != 1.0f) {
-            auto v_inv_T = v_set1(x, inv_T);
-            for (; i + L <= D; i += L) {
-                auto xm = v_add(v_load(x + i), v_load(mask + i));
-                v_store(y + i, v_add(v_mul(xm, v_inv_T), v_bias));
-            }
-            for (; i < D; ++i) {
-                s_store(&y[i], (s_load(&x[i]) + s_load(&mask[i])) * inv_T + bias);
-            }
-        } else {
-            for (; i + L <= D; i += L) {
-                auto xm = v_add(v_load(x + i), v_load(mask + i));
-                v_store(y + i, v_add(xm, v_bias));
-            }
-            for (; i < D; ++i) {
-                s_store(&y[i], s_load(&x[i]) + s_load(&mask[i]) + bias);
-            }
-        }
-    } else {
-        auto v_inv = v_set1(x, 1.0f / sum_exp);
-        for (; i + L <= D; i += L) {
-            v_store(y + i, v_mul(v_load(y + i), v_inv));
-        }
-        for (; i < D; ++i) {
-            s_store(&y[i], s_load(&y[i]) / sum_exp);
-        }
-    }
+    softmax_process_standard_row_impl<T, true>(x, mask, y, D, log_softmax, inv_T);
 }
 
 /// Row maximum of one contiguous row — building block of the tiled
@@ -359,19 +317,7 @@ inline void mask_softmax_process_standard_row(
 template <typename T>
 inline float softmax_row_max(const T* x, int64_t n)
 {
-    constexpr int L = simd_lane_for<T>;
-    int64_t i = 0;
-    float mx = -std::numeric_limits<float>::infinity();
-    {
-        auto v_mx = v_set1(x, mx);
-        for (; i + L <= n; i += L) { v_mx = v_max(v_mx, v_load(x + i)); }
-        mx = v_reduce_max(v_mx);
-    }
-    for (; i < n; ++i) {
-        float xv = s_load(&x[i]);
-        if (xv > mx) { mx = xv; }
-    }
-    return mx;
+    return row_reduce<T, ReduceMax>(x, n);
 }
 
 /// Scaled exp + sum of one contiguous row referenced to an externally supplied

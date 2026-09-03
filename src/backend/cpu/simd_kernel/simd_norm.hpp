@@ -18,6 +18,7 @@
 ///   - batch_norm_process_nonspatial_block<T>
 
 #include "nnops/detail/simd/simd.hpp"
+#include "simd_reduce_primitive.hpp"
 
 #include <cmath>
 #include <utility>
@@ -30,84 +31,12 @@ using namespace simd;
 // Shared primitives
 // ============================================================
 
-/// SIMD sum + sum-of-squares reduction over n contiguous elements.
-///
-/// Uses 4-wide multi-accumulator unrolling for ILP, then falls back
-/// through 2-wide → 1-wide SIMD → scalar tail.
-///
-/// Returns {sum, sum_sq} as float regardless of T (fp16 values are promoted).
+/// SIMD sum + sum-of-squares reduction over n contiguous elements — thin
+/// forwarder to the shared reduction primitive in simd_reduce_primitive.hpp.
 template <typename T>
 inline std::pair<float, float> norm_reduce_sum_sq(const T* x, int64_t n)
 {
-    constexpr int L = simd_lane_for<T>;
-    int64_t i = 0;
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
-
-    // ---- Stage 1: 4-wide SIMD reduction (ILP ×4) ----
-    {
-        auto v_sum0 = v_zero(x);
-        auto v_sum_sq0 = v_zero(x);
-        auto v_sum1 = v_zero(x);
-        auto v_sum_sq1 = v_zero(x);
-        auto v_sum2 = v_zero(x);
-        auto v_sum_sq2 = v_zero(x);
-        auto v_sum3 = v_zero(x);
-        auto v_sum_sq3 = v_zero(x);
-
-        for (; i + 4 * L <= n; i += 4 * L) {
-            auto v0 = v_load(x + i);
-            auto v1 = v_load(x + i + L);
-            auto v2 = v_load(x + i + 2 * L);
-            auto v3 = v_load(x + i + 3 * L);
-            v_sum0 = v_add(v_sum0, v0);
-            v_sum_sq0 = v_fmadd(v0, v0, v_sum_sq0);
-            v_sum1 = v_add(v_sum1, v1);
-            v_sum_sq1 = v_fmadd(v1, v1, v_sum_sq1);
-            v_sum2 = v_add(v_sum2, v2);
-            v_sum_sq2 = v_fmadd(v2, v2, v_sum_sq2);
-            v_sum3 = v_add(v_sum3, v3);
-            v_sum_sq3 = v_fmadd(v3, v3, v_sum_sq3);
-        }
-        auto v_sum = v_add(v_add(v_sum0, v_sum1), v_add(v_sum2, v_sum3));
-        auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
-                               v_add(v_sum_sq2, v_sum_sq3));
-
-        // ---- Stage 2: 2-wide SIMD ----
-        auto v_sum4 = v_zero(x);
-        auto v_sum_sq4 = v_zero(x);
-        auto v_sum5 = v_zero(x);
-        auto v_sum_sq5 = v_zero(x);
-        for (; i + 2 * L <= n; i += 2 * L) {
-            auto v4 = v_load(x + i);
-            auto v5 = v_load(x + i + L);
-            v_sum4 = v_add(v_sum4, v4);
-            v_sum_sq4 = v_fmadd(v4, v4, v_sum_sq4);
-            v_sum5 = v_add(v_sum5, v5);
-            v_sum_sq5 = v_fmadd(v5, v5, v_sum_sq5);
-        }
-        v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
-        v_sum_sq = v_add(v_sum_sq, v_add(v_sum_sq4, v_sum_sq5));
-
-        // ---- Stage 3: 1-wide SIMD ----
-        for (; i + L <= n; i += L) {
-            auto v = v_load(x + i);
-            v_sum = v_add(v_sum, v);
-            v_sum_sq = v_fmadd(v, v, v_sum_sq);
-        }
-
-        sum = v_reduce_sum(v_sum);
-        sum_sq = v_reduce_sum(v_sum_sq);
-    }
-
-    // ---- Stage 4: scalar tail ----
-    for (; i < n; ++i) {
-        float xv = s_load(&x[i]);
-        sum += xv;
-        sum_sq += xv * xv;
-    }
-
-    return {sum, sum_sq};
+    return row_reduce_sum_sq<T>(x, n);
 }
 
 /// SIMD normalize: apply `(x - mean) * inv_std * scale_val + bias_val`
