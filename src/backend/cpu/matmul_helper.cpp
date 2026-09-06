@@ -17,9 +17,10 @@ namespace nnops::backend::cpu {
 size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& a_desc,
                                  const TensorDesc& b_desc,
-                                 const TensorDesc& /*c_desc*/)
+                                 const TensorDesc& c_desc)
 {
     const auto dt_a = a_desc.dtype;
+    const auto dt_b = b_desc.dtype;
     if (dt_a != b_desc.dtype) {
         return 0;
     }
@@ -33,13 +34,17 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
     const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
                                         : b_desc.dims[static_cast<size_t>(b_rank - 1)];
 
-    // Physical row strides (elements): use the desc pitch when present, else the
-    // compact last-dim size. This keeps sizing consistent with the kernel's
-    // runtime lda/ldb even for padded, non-transposed matrices.
-    const int64_t lda = (a_desc.row_stride_elems > 0)
-        ? a_desc.row_stride_elems : a_desc.dims[static_cast<size_t>(a_rank - 1)];
-    const int64_t ldb = (b_desc.row_stride_elems > 0)
-        ? b_desc.row_stride_elems : b_desc.dims[static_cast<size_t>(b_rank - 1)];
+    // int8 (s8×s8): the tiled path always packs B, and for an s8 output it also
+    // needs an int32 accumulator buffer. Both live in the workspace.
+    if (dt_a == DataType::s8 && dt_b == DataType::s8) {
+        const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * KC_I8);
+        size_t total = static_cast<size_t>(num_panels4(static_cast<int>(N), NR_I8))
+                     * static_cast<size_t>(ldd_b);
+        if (c_desc.dtype == DataType::s8) {
+            total += static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
+        }
+        return total;
+    }
 
     int kc, nr_max;
     size_t elem;
@@ -52,20 +57,19 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
         return 0;  // unsupported dtype → reference fallback, no workspace
     }
 
-    // Global plan (full M×N) mirrors the kernel's dispatch: a workspace is
-    // needed iff pack_b. The size is thread-count invariant — per-block panel
-    // slices tile the buffer exactly, so only the global shape matters here.
-    const bool pack_b = (dt_a == DataType::f32)
-        ? make_pack_plan<float>(attrs, M, N, lda, ldb).pack_b
-        : make_pack_plan<half>(attrs, M, N, lda, ldb).pack_b;
-    if (!pack_b) {
+    // Fast path (f32 only): tiny GEMMs go to the reference and need no
+    // workspace. f16 has no reference kernel, so it always uses the tiled path.
+    const int64_t K = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
+                                        : b_desc.dims[static_cast<size_t>(b_rank - 2)];
+    if (dt_a == DataType::f32 && gemm_is_small(M, N, K)) {
         return 0;
     }
 
-    // Packed B panels sit at the workspace base at a uniform 64-byte-aligned
-    // full-Kc stride. Each n-block owns num_panels(nc, nr) panels at this
-    // stride and the blocks tile the buffer exactly, so the total is
-    // num_panels(N, nr) panels — independent of nc and of the thread count.
+    // B is always packed. Packed B panels sit at the workspace base at a
+    // uniform 64-byte-aligned full-Kc stride. Each n-block owns num_panels(nc,
+    // nr) panels at this stride and the blocks tile the buffer exactly, so the
+    // total is num_panels(N, nr) panels — independent of nc and of the thread
+    // count.
     const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(elem)) / static_cast<int>(elem);
 
     return static_cast<size_t>(num_panels(static_cast<int>(N), nr)) * static_cast<size_t>(ldd_b) * elem;
@@ -515,6 +519,168 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, mma_direct_f16_fn[2]);
+    }
+}
+
+// =========================================================================
+//  int8 (s8×s8) pack + MMA dispatch
+// =========================================================================
+
+using PackI8Fn = void (*)(void* NNOPS_RESTRICT output,
+                          const void* NNOPS_RESTRICT input,
+                          int ir_step, int K, float scale);
+
+#ifdef NNOPS_ARCH_X86_64
+using MmaPackI8Fn = void (*)(int32_t* NNOPS_RESTRICT C, int ldc,
+                             const uint8_t* NNOPS_RESTRICT A,
+                             const int8_t* NNOPS_RESTRICT B,
+                             int K, int32_t clamp_min, int32_t clamp_max);
+#else
+using MmaPackI8Fn = void (*)(int32_t* NNOPS_RESTRICT C, int ldc,
+                             const int8_t* NNOPS_RESTRICT A,
+                             const int8_t* NNOPS_RESTRICT B,
+                             int K, int32_t clamp_min, int32_t clamp_max);
+#endif
+
+// LHS (MR-based) / RHS (NR-based) pack tables. The RHS tables have 4 entries
+// because NR_I8 has the extra nr=4 level.
+constexpr std::array<PackI8Fn, 3> pack_trans_i8_lhs = {{
+#ifdef NNOPS_ARCH_X86_64
+    pack_trans_n6_dp4a_i8, pack_trans_n4_dp4a_i8, pack_trans_n1_dp4a_i8,
+#elif defined(NNOPS_ARCH_AARCH64)
+    pack_trans_n8_dp4a_i8, pack_trans_n4_dp4a_i8, pack_trans_n1_dp4a_i8,
+#endif
+}};
+
+constexpr std::array<PackI8Fn, 4> pack_trans_i8_rhs = {{
+#ifdef NNOPS_ARCH_X86_64
+    pack_trans_n16_dp4a_i8, pack_trans_n8_dp4a_i8, pack_trans_n4_dp4a_i8, pack_trans_n1_dp4a_i8,
+#elif defined(NNOPS_ARCH_AARCH64)
+    pack_trans_n12_dp4a_i8, pack_trans_n8_dp4a_i8, pack_trans_n4_dp4a_i8, pack_trans_n1_dp4a_i8,
+#endif
+}};
+
+constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs = {{
+#ifdef NNOPS_ARCH_X86_64
+    pack_copy_n6_dp4a_i8, pack_copy_n4_dp4a_i8, pack_copy_n1_dp4a_i8,
+#elif defined(NNOPS_ARCH_AARCH64)
+    pack_copy_n8_dp4a_i8, pack_copy_n4_dp4a_i8, pack_copy_n1_dp4a_i8,
+#endif
+}};
+
+constexpr std::array<PackI8Fn, 4> pack_copy_i8_rhs = {{
+#ifdef NNOPS_ARCH_X86_64
+    pack_copy_n16_dp4a_i8, pack_copy_n8_dp4a_i8, pack_copy_n4_dp4a_i8, pack_copy_n1_dp4a_i8,
+#elif defined(NNOPS_ARCH_AARCH64)
+    pack_copy_n12_dp4a_i8, pack_copy_n8_dp4a_i8, pack_copy_n4_dp4a_i8, pack_copy_n1_dp4a_i8,
+#endif
+}};
+
+// [mr idx][nr idx] — x86 VNNI (u8×s8) or aarch64 SDOT (s8×s8) micro-kernels.
+constexpr std::array<std::array<MmaPackI8Fn, 4>, 3> mma_pack_i8_fn = {{
+#ifdef NNOPS_ARCH_X86_64
+    {mma_pack_6x16_u8s8_vnni, mma_pack_6x8_u8s8_vnni, mma_pack_6x4_u8s8_vnni, mma_pack_6x1_u8s8_vnni},
+    {mma_pack_4x16_u8s8_vnni, mma_pack_4x8_u8s8_vnni, mma_pack_4x4_u8s8_vnni, mma_pack_4x1_u8s8_vnni},
+    {mma_pack_1x16_u8s8_vnni, mma_pack_1x8_u8s8_vnni, mma_pack_1x4_u8s8_vnni, mma_pack_1x1_u8s8_vnni},
+#elif defined(NNOPS_ARCH_AARCH64)
+    {mma_pack_8x12_s8s8_dot, mma_pack_8x8_s8s8_dot, mma_pack_8x4_s8s8_dot, mma_pack_8x1_s8s8_dot},
+    {mma_pack_4x12_s8s8_dot, mma_pack_4x8_s8s8_dot, mma_pack_4x4_s8s8_dot, mma_pack_4x1_s8s8_dot},
+    {mma_pack_1x12_s8s8_dot, mma_pack_1x8_s8s8_dot, mma_pack_1x4_s8s8_dot, mma_pack_1x1_s8s8_dot},
+#endif
+}};
+
+void xor0x80_i8(int8_t* p, int nbytes) {
+    uint8_t* u = reinterpret_cast<uint8_t*>(p);
+    int i = 0;
+#if defined(NNOPS_ARCH_X86_64)
+    // 32 bytes (16 int8 groups) per AVX2 iteration; XOR 0x80 into each byte.
+    const __m256i mask = _mm256_set1_epi32(0x80808080);
+    for (; i + 32 <= nbytes; i += 32) {
+        __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(u + i));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(u + i), _mm256_xor_si256(x, mask));
+    }
+#elif defined(NNOPS_ARCH_AARCH64)
+    // 16 bytes (8 int8 groups) per NEON iteration.
+    const uint8x16_t mask = vdupq_n_u8(0x80);
+    for (; i + 16 <= nbytes; i += 16) {
+        vst1q_u8(u + i, veorq_u8(vld1q_u8(u + i), mask));
+    }
+#endif
+    // Scalar tail (nbytes is a multiple of 4, so at most 31 / 15 bytes remain).
+    for (; i < nbytes; ++i) {
+        u[i] ^= 0x80u;
+    }
+}
+
+void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds) {
+    const int pack_lds = trans ? 1 : lds;
+    const auto& pack_fns = trans ? pack_copy_i8_lhs : pack_trans_i8_lhs;
+    const int kbytes = (kc + 3) & ~3;  // pack writes ceil(kc/4)*4 bytes per row
+    int m = 0;
+    for (int mi = 0; mi < 3; ++mi) {
+        const int mr = MR_I8[mi];
+        for (; m + mr <= mc; m += mr) {
+            pack_fns[static_cast<size_t>(mi)](dst, src, lds, kc, 0.0f);
+            if constexpr (INT8_USE_U8_OFFSET) {
+                xor0x80_i8(dst, mr * kbytes);
+            }
+            dst += ldd;
+            src += mr * pack_lds;
+        }
+    }
+}
+
+void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds) {
+    const int pack_lds = trans ? lds : 1;
+    const auto& pack_fns = trans ? pack_trans_i8_rhs : pack_copy_i8_rhs;
+    int n = 0;
+    for (int ni = 0; ni < 4; ++ni) {
+        const int nr = NR_I8[ni];
+        for (; n + nr <= nc; n += nr) {
+            pack_fns[static_cast<size_t>(ni)](dst, src, lds, kc, 0.0f);
+            dst += ldd;
+            src += nr * pack_lds;
+        }
+    }
+}
+
+void tile_mma_pack_i8(int mc, int nc, int kc,
+                      int32_t* c, int ldc,
+                      const int8_t* packed_a, const int8_t* packed_b,
+                      int32_t clamp_min, int32_t clamp_max) {
+    // The pack kernels write ceil(kc/4) groups (4 int8 per int32), zero-padding
+    // the final partial group. Round K up so the MMA processes that padded tail
+    // group too, and size the panel strides to the padded byte count so adjacent
+    // panels never overlap.
+    const int kbytes = (kc + 3) & ~3;
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * kbytes);
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kbytes);
+    const int k_groups = kbytes / 4;
+
+    int m = 0;
+    for (int mi = 0; mi < 3; ++mi) {
+        const int mr = MR_I8[mi];
+        for (; m + mr <= mc; m += mr) {
+            int n = 0;
+            const int8_t* b_panel = packed_b;
+            for (int ni = 0; ni < 4; ++ni) {
+                const int nr = NR_I8[ni];
+                for (; n + nr <= nc; n += nr) {
+                    int32_t* c_mn = c + m * ldc + n;
+#ifdef NNOPS_ARCH_X86_64
+                    mma_pack_i8_fn[static_cast<size_t>(mi)][static_cast<size_t>(ni)](
+                        c_mn, ldc, reinterpret_cast<const uint8_t*>(packed_a), b_panel,
+                        kbytes, clamp_min, clamp_max);
+#else
+                    mma_pack_i8_fn[static_cast<size_t>(mi)][static_cast<size_t>(ni)](
+                        c_mn, ldc, packed_a, b_panel,
+                        k_groups, clamp_min, clamp_max);
+#endif
+                    b_panel += ldd_b;
+                }
+            }
+            packed_a += ldd_a;
+        }
     }
 }
 

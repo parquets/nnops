@@ -16,13 +16,16 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# MSVC: use UTF-8 source encoding, no deprecation warnings for std::span use
-# Also enable AVX2+F16C (assumed baseline on x86_64 target platforms)
+# MSVC: use UTF-8 source encoding, no deprecation warnings for std::span use.
+# int8 VNNI: MSVC has no /arch:AVXVNNI switch — the AVX-VNNI intrinsics are
+# declared unconditionally in immintrin.h, so we keep /arch:AVX2 (for the AVX2
+# SIMD layer) and manually define __AVXVNNI__ to select our VNNI micro-kernels.
+# The target always has VNNI, so no runtime check is needed.
 # NOTE: scoped to CXX only — CUDA/nvcc does not understand MSVC flags
 if(MSVC)
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/bigobj> $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/bigobj> $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2> $<$<COMPILE_LANGUAGE:CXX>:/D__AVXVNNI__>)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64)|(amd64)|(i686)")
-    add_compile_options(-mavx2 -mfma -mf16c)
+    add_compile_options(-mavx2 -mfma -mf16c -mavxvnni)
 endif()
 
 # ---- Export compile commands (for IDE support) ----

@@ -24,6 +24,8 @@
 #include "x86_64/mma_direct_f32.hpp"
 #include "x86_64/mma_pack_f16.hpp"
 #include "x86_64/mma_pack_f32.hpp"
+#include "x86_64/pack_dp4a_i8.hpp"
+#include "x86_64/mma_pack_vnni_i8.hpp"
 #elif defined(NNOPS_ARCH_AARCH64)
 #include "aarch64/pack_f16.hpp"
 #include "aarch64/pack_f32.hpp"
@@ -31,6 +33,8 @@
 #include "aarch64/mma_direct_f32.hpp"
 #include "aarch64/mma_pack_f16.hpp"
 #include "aarch64/mma_pack_f32.hpp"
+#include "aarch64/pack_dp4a_i8.hpp"
+#include "aarch64/mma_pack_i8_dot.hpp"
 #endif
 
 #include "nnops/detail/half.hpp"
@@ -58,6 +62,31 @@ constexpr int MR_MAX_F32 = arch::mr_f32[0];
 constexpr int NR_MAX_F32 = arch::nr_f32[0];
 constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
+
+// int8 (s8×s8) panel sizes. The NR list has four entries (extra nr=4 level),
+// so int8 pack/mma dispatch uses a 4-level decomposition (num_panels4).
+#ifdef NNOPS_ARCH_X86_64
+constexpr int MR_I8[3] = {6, 4, 1};
+constexpr int NR_I8[4] = {16, 8, 4, 1};
+#elif defined(NNOPS_ARCH_AARCH64)
+constexpr int MR_I8[3] = {8, 4, 1};
+constexpr int NR_I8[4] = {12, 8, 4, 1};
+#endif
+
+constexpr int MR_MAX_I8 = MR_I8[0];
+constexpr int NR_MAX_I8 = NR_I8[0];
+
+// Hardware int8 dot-product is always used — no compile-time or runtime checks:
+//   x86_64: VNNI (vpdpbusd), aarch64: SDOT (vdotq_s32). The build enables the
+//   matching ISA (see CMakeLists.txt: /arch:AVXVNNI / -mavxvnni).
+//
+// x86 VNNI computes u8×s8 (A stored as qa+128); the epilogue folds the −128·Σqw
+// correction. aarch64 SDOT computes s8×s8 directly (no offset).
+#ifdef NNOPS_ARCH_X86_64
+constexpr bool INT8_USE_U8_OFFSET = true;
+#else
+constexpr bool INT8_USE_U8_OFFSET = false;
+#endif
 
 template <class T>
 constexpr int mr_max_flt() {
@@ -139,60 +168,44 @@ inline void resolve_tile_sizes(int M, int N, int mr_max, int nr_max, int kc,
 }
 
 // =========================================================================
-//  Pack decision — static cost model (single source of truth)
+//  Parallel split — block count for the larger-dimension partition
 // =========================================================================
+//
+// The GEMM is split on its larger dimension (N when N > M, else M) and the
+// blocks are handed to ctx.cpu_parallel_for as equal contiguous slabs. The
+// block count is ceil(larger / mc), one slab per A-panel tile — deliberately
+// coarser than MLAS's complexity/64K target-thread formula (Complexity / 64K +
+// 1 clamped to the pool size). Finer blocks do not help in practice: the GEMM
+// is already limited by packed-B bandwidth and, on hybrid P/E-core CPUs, by
+// the slow E-cores, so more/smaller blocks only add per-block pack overhead and
+// one-panel seams without more parallelism. ceil(larger / mc) fills a modest
+// thread pool (8 blocks for M=1024) without those costs.
 
-/// Static pack decision for one GEMM computation scope.
-struct PackPlan {
-    bool pack_a = false;     ///< A packed into the stack buffer (transpose_a or wide stride)
-    bool pack_b = false;     ///< B packed into the workspace (transpose_b or wide stride)
-    bool mkn_order = false;  ///< MKN loop order (only when pack_a && !pack_b)
-};
-
-/// Page-size heuristic (elements): 4096 / sizeof(T) → f32 1024, f16 2048.
-/// A row stride at or above one page makes the NKM/MKN panel reads page-scattered,
-/// so packing into a contiguous 64-byte-aligned panel wins — but only when the
-/// matrix is actually re-read across tile blocks (see the reuse guards below).
-template <class T>
-constexpr int pack_threshold_elems() {
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
-                  "pack_threshold_elems: only float/half are supported");
-    return 4096 / static_cast<int>(sizeof(T));
+inline int64_t split_block_count(int64_t larger, int64_t mc) noexcept {
+    return std::max<int64_t>(1, (larger + mc - 1) / mc);
 }
 
-/// Decide whether A and B should be packed for a GEMM over the row/column range
-/// M_s × N_s, given the physical row strides lda/ldb (elements).
-///
-/// M_s / N_s are the range *participating in this computation scope*: the full
-/// M×N for the global plan (workspace sizing, split-dimension choice), or a
-/// per-slab range for the stack-resident A pack refinement (reuse counts must be
-/// measured against what the slab actually reads). Rules:
-///   1. correctness: transpose_a ⇒ pack_a, transpose_b ⇒ pack_b
-///   2. stride+reuse: pack only when the stride is wide AND the panel is re-read
-///      across multiple tile blocks (A re-read N_s/nc times, B re-read M_s/mc
-///      times); a single-pass read is never worth the extra copy
-///   3. loop order: MKN (k{m{n}}) amortizes the A pack; it is only chosen when A
-///      is packed and B is raw (packing B too would amplify B-pack traffic)
-template <class T>
-inline PackPlan make_pack_plan(const MatMulAttributes& attrs,
-                               int64_t M_s, int64_t N_s,
-                               int64_t lda, int64_t ldb) {
-    constexpr int mr_max = mr_max_flt<T>();
-    constexpr int nr_max = nr_max_flt<T>();
-    constexpr int kc     = std::is_same_v<T, float> ? KC_F32 : KC_F16;
-    constexpr int elem   = static_cast<int>(sizeof(T));
+// =========================================================================
+//  Pack decision — simplified (mirrors onnxruntime MLAS sgemm)
+// =========================================================================
+//
+// B (rhs) is always packed into the workspace. A (lhs) is packed only when
+// transpose_a forces it (correctness) or when its row stride exceeds one
+// cache-friendly page so the panel reads would be page-scattered. The loop
+// order is always NKM (n-block outer, k, then m); the MKN and direct orders
+// are gone. Tiny GEMMs (M*N*K below the fast-path threshold) skip the tiled
+// path entirely and go straight to the reference.
 
-    int mc, nc;
-    resolve_tile_sizes(static_cast<int>(M_s), static_cast<int>(N_s),
-                       mr_max, nr_max, kc, elem, mc, nc);
+/// A is packed when its row stride exceeds this many elements (wide stride →
+/// page-scattered reads), independent of element type.
+constexpr int64_t PACK_A_STRIDE_THRESHOLD = 1024;
 
-    const int thr = pack_threshold_elems<T>();
+/// GEMMs with fewer than this many MACs take the fast path (naive reference),
+/// skipping pack/tile/threading overhead.
+constexpr int64_t GEMM_FAST_PATH_THRESHOLD = 1024;
 
-    PackPlan p;
-    p.pack_a    = attrs.transpose_a || (N_s > nc && lda > thr);
-    p.pack_b    = attrs.transpose_b || (M_s > mc && ldb > thr);
-    p.mkn_order = p.pack_a && !p.pack_b;
-    return p;
+inline bool gemm_is_small(int64_t M, int64_t N, int64_t K) noexcept {
+    return M * N * K < GEMM_FAST_PATH_THRESHOLD;
 }
 
 /// Number of panels for the largest-first decomposition of `n` into the three
@@ -203,6 +216,16 @@ constexpr int num_panels(int n, const int* nr) noexcept {
     int count = 0;
     int i = 0;
     for (int s = 0; s < 3; ++s) {
+        for (; i + nr[s] <= n; i += nr[s]) { ++count; }
+    }
+    return count;
+}
+
+/// 4-level variant for the int8 NR lists ({16,8,4,1} / {12,8,4,1}).
+constexpr int num_panels4(int n, const int* nr) noexcept {
+    int count = 0;
+    int i = 0;
+    for (int s = 0; s < 4; ++s) {
         for (; i + nr[s] <= n; i += nr[s]) { ++count; }
     }
     return count;
@@ -219,15 +242,21 @@ constexpr int pack_a_stack_elems() {
     return num_panels(MC_TARGET, mr) * ldd_a;
 }
 
+// int8 packed-A stack buffer: the panel stride is in bytes (int8 = 1 byte/elem),
+// so LDD_A_I8 = align_up(MR_MAX_I8 * KC_I8, 64) and the buffer holds
+// num_panels(MC_TARGET, MR_I8) panels at that full-Kc stride.
+constexpr int LDD_A_I8 = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * KC_I8);
+constexpr int PACK_A_STACK_I8 = num_panels(MC_TARGET, MR_I8) * LDD_A_I8;
+
 /// Compute the workspace size (bytes) required by matmul_kernel for the given
 /// tensor descriptors and operator attributes.
 ///
-/// A workspace is needed iff the *global* pack plan decides pack_b (transpose_b
-/// or a wide non-transposed B row stride). Packed A lives on the kernel stack,
-/// so every pack_a-only / direct path returns 0. The size is computed from the
-/// global M×N (not the thread count): the per-block panel slices tile the buffer
-/// exactly, so the formula below is thread-count invariant and always covers the
-/// kernel's pack_b buffer.
+/// The fp tiled path always packs B, so a workspace is always needed for it —
+/// except on the fast path (M*N*K < 1024), which routes to the reference and
+/// needs none. Packed A lives on the kernel stack, so it never consumes
+/// workspace. The size is computed from the global N (not the thread count):
+/// the per-block panel slices tile the buffer exactly, so the formula below is
+/// thread-count invariant and always covers the kernel's pack_b buffer.
 size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& a_desc,
                                  const TensorDesc& b_desc,
@@ -261,6 +290,32 @@ void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, in
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
 void tile_scale(half* c, int ldc, float scale, int M, int N);
+
+// ---- int8 (s8×s8) pack + MMA --------------------------------------------
+//
+// Packed layouts (shared with the VNNI/SDOT micro-kernels): both A and B are
+// "group-major" — 4 consecutive int8 packed per int32, groups of 4 int8 along
+// the K dimension. For a panel of mr rows (A) or nr columns (B):
+//   A: [group g: row0(4B) row1(4B) ... row(mr-1)(4B)] ...
+//   B: [group g: col0(4B) col1(4B) ... col(nr-1)(4B)] ...
+// `kc` is the number of int8 elements along K (the pack kernels consume 4 at a
+// time; the x86 VNNI kernels take K in elements, aarch64 SDOT takes K/4 groups).
+
+// Pack A (LHS) / B (RHS) into the 4-int8-per-int32 layout. On x86 with VNNI the
+// A pack also XORs every byte with 0x80 (s8 → u8 two's-complement bias); the
+// correction is folded back in the epilogue (see INT8_USE_U8_OFFSET).
+void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds);
+void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds);
+
+// Accumulate C[mc][nc] += A_packed[mc][K] × B_packed[K][nc] (int32).
+// `kc` is in int8 elements; the caller packs A/B with tile_pack_{lhs,rhs}_i8.
+void tile_mma_pack_i8(int mc, int nc, int kc,
+                      int32_t* c, int ldc,
+                      const int8_t* packed_a, const int8_t* packed_b,
+                      int32_t clamp_min, int32_t clamp_max);
+
+// XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
+void xor0x80_i8(int8_t* p, int nbytes);
 
 }  // namespace nnops::backend::cpu
 

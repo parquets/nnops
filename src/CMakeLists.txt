@@ -83,6 +83,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/pooling_ref.cpp
     backend/cpu/reference/linear_ref.cpp
     backend/cpu/reference/matmul_ref.cpp
+    backend/cpu/reference/matmul_int8_ref.cpp
     backend/cpu/reference/attention_ref.cpp
     backend/cpu/reference/causal_attention_ref.cpp
     backend/cpu/reference/clamp_ref.cpp

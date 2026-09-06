@@ -1,20 +1,19 @@
 /// @file bench_matmul.cpp
-/// @brief MatMul micro-benchmarks — pack-decision routing + thread scaling.
+/// @brief MatMul micro-benchmarks — pack decision + thread scaling.
 ///
-/// Each case exercises one cell of the pack-decision routing table (direct /
-/// NKM-fused / MKN-fused) across {nn, ta, tb, tatb} and padded strides. For each
-/// case the harness reports:
-///   - the static PackPlan routing decision (pack_a / pack_b / loop order),
+/// Every case runs the single NKM-fused path (B always packed, A packed only on
+/// transpose_a or a wide row stride) across {nn, ta, tb, tatb} and padded
+/// strides. For each case the harness reports:
+///   - the pack_a decision,
 ///   - the resolved tile sizes (mc, nc) and split block count,
 ///   - the workspace size,
 ///   - GFLOPS at 1, 2, 4, 8 and hardware threads.
 ///
-/// The point is to confirm the static plan picks a sane path and to see where
-/// block-granularity threading scales (and where it can't — e.g. when Nc is so
-/// large that an N-split yields only one block).
+/// The point is to see where block-granularity threading scales (and where it
+/// can't — e.g. when Nc is so large that an N-split yields only one block).
 
 #include "nnops/ops/matmul.hpp"
-#include "backend/cpu/matmul_helper.h"   // make_pack_plan, resolve_tile_sizes, tile constants
+#include "backend/cpu/matmul_helper.h"   // resolve_tile_sizes, PACK_A_STRIDE_THRESHOLD, tile constants
 #include "common/bench_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
@@ -83,6 +82,19 @@ make_tensor(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
     return {std::move(buf), tv};
 }
 
+// Build a compact [rows, cols] s8 tensor. Quant params are left at the default
+// identity (zp=0, scale=1), so the int8 kernel accumulates the raw dot product —
+// the qgemm / MatMulInteger analog — with a trivial zero-point compensation.
+std::pair<std::vector<int8_t>, TensorView>
+make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed) {
+    std::vector<int8_t> buf(static_cast<size_t>(rows * cols));
+    nnops::test::XorShift128 rng(seed);
+    for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 255 - 127); }
+    const int64_t shape[] = {rows, cols};
+    TensorView tv(shape, DataType::s8, buf.data());
+    return {std::move(buf), tv};
+}
+
 struct GeMMCase {
     const char* name;
     int64_t M, K, N;
@@ -94,7 +106,9 @@ struct GeMMCase {
 
 struct GeMMReport {
     const char* name;
-    bool pack_a, pack_b, mkn_order;
+    const char* route;   // "NKM-fused" (fp) or "int8-NKM"
+    const char* unit;    // "GFLOPS" or "GOPS"
+    bool pack_a, pack_b;
     int mc, nc;
     int64_t num_blocks;
     size_t workspace_bytes;
@@ -123,19 +137,16 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // --- static plan metadata (mirrors matmul_dispatch_2d) ---
+    // --- static metadata (mirrors matmul_dispatch_2d) ---
     const int64_t lda = a.row_stride_elems();
-    const int64_t ldb = b.row_stride_elems();
-    const cpu::PackPlan plan = cpu::make_pack_plan<T>(attrs, c.M, c.N, lda, ldb);
+    const bool pack_a = c.ta || (lda > cpu::PACK_A_STRIDE_THRESHOLD);
     constexpr int mr_max = cpu::mr_max_flt<T>();
     constexpr int nr_max = cpu::nr_max_flt<T>();
     constexpr int kc = std::is_same_v<T, float> ? cpu::KC_F32 : cpu::KC_F16;
     int mc, nc;
     cpu::resolve_tile_sizes(static_cast<int>(c.M), static_cast<int>(c.N),
                             mr_max, nr_max, kc, static_cast<int>(sizeof(T)), mc, nc);
-    const int64_t num_blocks = plan.mkn_order
-        ? (c.M + mc - 1) / mc
-        : (c.N + nc - 1) / nc;
+    const int64_t num_blocks = (c.N + nc - 1) / nc;
 
     std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
@@ -144,9 +155,10 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.pack_a = plan.pack_a;
-    rep.pack_b = plan.pack_b;
-    rep.mkn_order = plan.mkn_order;
+    rep.route = "NKM-fused";
+    rep.unit = "GFLOPS";
+    rep.pack_a = pack_a;
+    rep.pack_b = true;
     rep.mc = mc;
     rep.nc = nc;
     rep.num_blocks = num_blocks;
@@ -180,18 +192,16 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
 }
 
 void print_report(const GeMMReport& r) {
-    const char* route = r.mkn_order ? "MKN (A-pack)"
-                       : (r.pack_a || r.pack_b) ? "NKM-fused" : "direct";
     std::printf("  %s\n", r.name);
     std::printf("    route=%-12s pack_a=%d pack_b=%d  mc=%d nc=%d  blocks=%lld  ws=%zu B\n",
-                route, (int)r.pack_a, (int)r.pack_b, r.mc, r.nc,
+                r.route, (int)r.pack_a, (int)r.pack_b, r.mc, r.nc,
                 static_cast<long long>(r.num_blocks), r.workspace_bytes);
 
     const double g1 = r.gflops.empty() ? 0.0 : r.gflops[0];
     std::printf("    ");
     for (size_t i = 0; i < r.threads.size(); ++i) {
         const double speedup = g1 > 0.0 ? r.gflops[i] / g1 : 0.0;
-        std::printf(" %2dT %7.1f GFLOPS (%.2fx)", r.threads[i], r.gflops[i], speedup);
+        std::printf(" %2dT %7.1f %s (%.2fx)", r.threads[i], r.gflops[i], r.unit, speedup);
         if (i + 1 < r.threads.size()) { std::printf(" |"); }
     }
     std::printf("\n");
@@ -207,6 +217,86 @@ void bench_case(const GeMMCase& c) {
     GeMMReport rep = c.f16 ? run_geMM<half>(c, threads, iters)
                            : run_geMM<float>(c, threads, iters);
     print_report(rep);
+}
+
+// Time one int8 (s8×s8 → s32) case; mirrors run_geMM but uses the int8 panel
+// constants and a s32 output buffer. GFLOPS is relabeled GOPS for int8.
+GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int iters) {
+    const int64_t a_rows = c.ta ? c.K : c.M;
+    const int64_t a_cols = c.ta ? c.M : c.K;
+    const int64_t b_rows = c.tb ? c.N : c.K;
+    const int64_t b_cols = c.tb ? c.K : c.N;
+
+    auto [a_vec, a] = make_tensor_i8(a_rows, a_cols, 1);
+    auto [b_vec, b] = make_tensor_i8(b_rows, b_cols, 2);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = c.ta;
+    attrs.transpose_b = c.tb;
+    attrs.output_dtype = DataType::s32;   // MatMulInteger semantics
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    // int8 tiling: elements are 1 byte; panel sizes come from the int8 lists.
+    int mc, nc;
+    cpu::resolve_tile_sizes(static_cast<int>(c.M), static_cast<int>(c.N),
+                            cpu::MR_MAX_I8, cpu::NR_MAX_I8, cpu::KC_I8, 1, mc, nc);
+    const int64_t num_blocks = (c.N + nc - 1) / nc;
+
+    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
+    std::vector<int32_t> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+
+    GeMMReport rep;
+    rep.name = c.name;
+    rep.route = "int8-NKM";
+    rep.unit = "GOPS";
+    rep.pack_a = true;   // int8 always packs both A and B
+    rep.pack_b = true;
+    rep.mc = mc;
+    rep.nc = nc;
+    rep.num_blocks = num_blocks;
+    rep.workspace_bytes = workspace.size();
+    rep.threads = threads;
+
+    for (int nt : threads) {
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu_parallel_for = [&pool](int64_t b0, int64_t e, const ParallelForBody& body) {
+            pool.parallel_for(b0, e, body);
+        };
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        for (int i = 0; i < 2; ++i) {
+            op->compute(output, ins, use_ctx, workspace.data());
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            op->compute(output, ins, use_ctx, workspace.data());
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        rep.gflops.push_back(
+            2.0 * static_cast<double>(c.M) * static_cast<double>(c.N)
+                * static_cast<double>(c.K) * static_cast<double>(iters) / (ms * 1e6));
+    }
+    return rep;
+}
+
+void bench_i8_case(const GeMMCase& c) {
+    const int iters = 20;
+    std::vector<int> threads{1, 2, 4, 8};
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
+        threads.push_back(hw);
+    }
+    print_report(run_geMM_i8(c, threads, iters));
 }
 
 }  // anonymous namespace
@@ -253,4 +343,21 @@ NNOPS_BENCH(matmul_f16_nn) {
 NNOPS_BENCH(matmul_f16_ta) {
     bench_case({"f16 ta 512x512x256 MKN", 512, 512, 256, /*ta=*/true, /*tb=*/false,
                 /*pad_a=*/0, /*pad_b=*/0, /*f16=*/true});
+}
+
+// ============================================================
+// int8 (s8×s8 → s32) — qgemm path
+// ============================================================
+
+NNOPS_BENCH(matmul_i8_nn_large) {
+    bench_i8_case({"i8 nn 1024x512x1024", 1024, 512, 1024});
+}
+
+NNOPS_BENCH(matmul_i8_nn_256) {
+    bench_i8_case({"i8 nn 256^3", 256, 256, 256});
+}
+
+NNOPS_BENCH(matmul_i8_tb_large) {
+    // LLM-style A @ W^T (transpose_b): weight-B is [N, K] per-token.
+    bench_i8_case({"i8 tb 1024x512x1024", 1024, 512, 1024, /*ta=*/false, /*tb=*/true});
 }

@@ -28,6 +28,16 @@ struct MatMulAttributes {
     /// beta=0 (default) overwrites C; beta=1 adds A×B to existing C.
     float beta = 0.0f;
 
+    /// Output data type for the integer (s8×s8) matmul path.
+    ///
+    ///   s32 (default): raw int32 accumulate with zero-point compensation
+    ///                  (MatMulInteger semantics).
+    ///   s8:            requantize the accumulate to int8.
+    ///
+    /// Ignored for f32/f16 inputs, where the output follows the input dtype.
+    /// alpha/beta are also ignored on the integer path.
+    DataType output_dtype = DataType::s32;
+
     /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
 };

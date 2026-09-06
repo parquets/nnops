@@ -15,6 +15,7 @@
 #include "activation_kernels.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <algorithm>
 
 // ============================================================
@@ -84,6 +85,48 @@ namespace nnops::backend::cpu {
 
 using namespace simd;  // v_load, v_zero, v_set1, etc.
 using namespace nnops::kernel;  // pure SIMD kernels: v_relu, v_gelu, v_sigmoid, ...
+
+// ============================================================
+// s8×s8 matmul epilogue — zero-point compensation + requantization
+// ============================================================
+//
+// The GEMM accumulates (in int32) the raw dot-product
+//
+//     raw[m,n] = Σ_k (qa[m,k] + u8_offset) · qb[k,n]
+//
+// where `u8_offset` is the two's-complement bias the x86 VNNI path bakes into
+// the A pack (128 to turn s8 into u8), and 0 everywhere else (SDOT / scalar /
+// reference compute s8×s8 directly). The MatMulInteger value — the dot product
+// of the *dezero-pointed* operands — is recovered as
+//
+//     out[m,n] = raw − (u8_offset + zp_a[m])·R_b[n] − zp_b[n]·R_a[m]
+//                     + K·zp_a[m]·zp_b[n]
+//
+// with the per-token / per-channel row reductions R_a[m] = Σ_k qa[m,k] and
+// R_b[n] = Σ_k qb[k,n]. For an s8 output the compensated int32 is requantized
+// with the output scale / zero-point. These are shared by the tiled kernel and
+// the reference so they agree bit-for-bit.
+
+/// Recover the MatMulInteger value (Σ (qa − zp_a)·(qb − zp_b)) from a raw int32
+/// accumulate. All arithmetic is exact for the int8 operand range.
+inline int32_t matmul_int8_compensate(int32_t raw, int32_t u8_offset,
+                                      int32_t zp_a, int32_t zp_b,
+                                      int32_t r_a, int32_t r_b, int32_t k) noexcept {
+    return raw - (u8_offset + zp_a) * r_b - zp_b * r_a + k * zp_a * zp_b;
+}
+
+/// Requantize a compensated int32 accumulate to int8.
+///
+///   q = clamp(round(acc · requant_scale) + zp_out, −128, 127)
+///
+/// where requant_scale = scale_a[m]·scale_b[n] / scale_out. The multiply is done
+/// in double (exact for the int32 range) and rounded half-away-from-zero.
+inline int8_t matmul_int8_requant(int32_t acc, double requant_scale, int32_t zp_out) noexcept {
+    const double d = std::round(static_cast<double>(acc) * requant_scale)
+                   + static_cast<double>(zp_out);
+    const int64_t v = static_cast<int64_t>(d);
+    return static_cast<int8_t>(std::max<int64_t>(-128, std::min<int64_t>(127, v)));
+}
 
 /// Deduce the SIMD vector type for a given data pointer type T*.
 /// v_load(float*) → v_f32x8, v_load(half*) → v_f16x8.

@@ -1,24 +1,19 @@
 /// @file matmul.cpp
-/// @brief Tiled matrix multiplication kernel — plan-driven pack + MMA dispatch.
+/// @brief Tiled matrix multiplication kernel — pack + MMA dispatch.
 ///
-/// Packing, tiling, and the static pack decision all live in
+/// Packing, tiling, and the (now trivial) pack decision live in
 /// matmul_helper.{h,cpp}; this file owns the tiled loops and the operator-level
-/// dispatch. The pack decision (make_pack_plan<T>) picks, for each GEMM:
+/// dispatch. Mirroring onnxruntime MLAS sgemm, B (rhs) is always packed into
+/// the caller-provided workspace and A (lhs) is packed into a per-thread stack
+/// buffer only when transpose_a forces it or its row stride is page-scattered
+/// (lda > PACK_A_STRIDE_THRESHOLD); otherwise A is read directly. The loop
+/// order is always NKM (n-block outer, k, then m).
 ///
-///   global pack_a | pack_b | loop order | split dim
-///   --------------+--------+------------+----------
-///   T             | T      | NKM (fused)| N  (B-pack traffic stays NK)
-///   T             | F      | MKN (fused)| M  (A-pack traffic stays MK)
-///   F             | T      | NKM (fused)| N
-///   F             | F      | NKM (direct)| N  (BLIS convention)
-///
-/// A is packed into a per-thread stack buffer only when the global plan packs it
-/// AND the split keeps A reused (MKN), or when transpose_a forces it (N-split
-/// NKM). B is packed into the caller-provided workspace when the global plan
-/// packs it; the per-block panel slices tile that buffer exactly, so the size is
-/// thread-count invariant. Work is split at tile-block granularity through
-/// ctx.cpu_parallel_for (serial fallback otherwise); C tiles are disjoint and
-/// there are no reductions, so the result is bit-identical to serial.
+/// GEMMs below GEMM_FAST_PATH_THRESHOLD MACs skip the tiled path entirely and
+/// go straight to the reference. Work is split on the larger dimension (N when
+/// N > M, else M — mirroring MLAS) through ctx.cpu_parallel_for (serial
+/// fallback otherwise); C tiles are disjoint and there are no reductions, so
+/// the result is bit-identical to serial.
 ///
 /// Beta scaling is fused into the first k-block; the epilogue (and the Relu
 /// clamp) applies after the last k-block, matching matmul_ref semantics.
@@ -35,13 +30,18 @@
 #include <type_traits>
 #include <vector>
 
-// Forward-declare reference kernel for the fallback paths.
+// Forward-declare reference kernels for the fallback paths.
 namespace nnops::backend::cpu::reference {
 extern void matmul_ref(const MatMulAttributes& attrs,
                        TensorView& output,
                        std::span<const TensorView> inputs,
                        const ComputeContext& ctx,
                        void* workspace);
+extern void matmul_int8_ref(const MatMulAttributes& attrs,
+                            TensorView& output,
+                            std::span<const TensorView> inputs,
+                            const ComputeContext& ctx,
+                            void* workspace);
 }
 
 namespace nnops::backend::cpu {
@@ -72,51 +72,70 @@ inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept {
 }
 
 // =========================================================================
-//  Tile-block kernels — one call processes one n-block (NKM) or m-block (MKN)
+//  Tile-block kernels — one call processes one (m-range × n-range) tile
 // =========================================================================
 
-/// Direct NKM: raw A (M×K) × raw B (K×N), one n-block [n, n+actual_nc).
+/// Compute the m-panels of a single k-block against an already-packed B slice.
+/// Shared by the N-split and M-split paths so both use identical pack/MMA/
+/// epilogue logic. @p packed_b holds @p n_count columns for this k-block (its
+/// panel stride is derived internally from @p actual_kc); @p m_start/@p m_count
+/// select the C rows.
 template <typename T>
-void matmul_block_direct_nkm(const MatMulAttributes& attrs,
-                             T* c_ptr, int ldc,
-                             const T* a_ptr, int lda,
-                             const T* b_ptr, int ldb,
-                             int M, int K, int kc, int mc,
-                             int n, int actual_nc)
+void matmul_m_panels(const MatMulAttributes& attrs,
+                     T* c_ptr, int ldc,
+                     const T* a_ptr, int lda,
+                     int m_start, int m_count, int mc,
+                     int n_start, int n_count,
+                     int k, int actual_kc, bool last_k,
+                     bool pack_a, const T* packed_b)
 {
+    constexpr int mr_max = mr_max_flt<T>();
+
+    // Packed A lives on the kernel stack (72 KB, 64-byte aligned).
+    alignas(PANEL_ALIGN_BYTES) T pack_a_buf[pack_a_stack_elems<T>()];
+
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))
+                      / static_cast<int>(sizeof(T));
     const bool epilogue = has_inplace_epilogue(attrs);
 
-    for (int k = 0; k < K; k += kc) {
-        int actual_kc = std::min(kc, K - k);
-        const bool last_k = (k + kc >= K);
-        const T* b_sub = b_ptr + k * ldb + n;  // B is K×N, row k, col n
+    for (int m = m_start; m < m_start + m_count; m += mc) {
+        int actual_mc = std::min(mc, m_start + m_count - m);
+        T* c_tile = c_ptr + m * ldc + n_start;
 
-        for (int m = 0; m < M; m += mc) {
-            int actual_mc = std::min(mc, M - m);
-            const T* a_sub = a_ptr + m * lda + k;  // A is M×K, row m, col k
-            T* c_tile = c_ptr + m * ldc + n;
+        if (k == 0 && attrs.beta != 1.0f) {
+            tile_scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
+        }
 
-            if (k == 0 && attrs.beta != 1.0f) {
-                tile_scale(c_tile, ldc, attrs.beta, actual_mc, actual_nc);
-            }
+        const auto [cmin, cmax] = kblock_clamp(attrs, last_k);
 
-            const auto [cmin, cmax] = kblock_clamp(attrs, last_k);
-            tile_mma_direct(actual_mc, actual_nc, actual_kc,
+        if (pack_a) {
+            const T* a_src = attrs.transpose_a
+                ? a_ptr + k * lda + m    // A phys is K×M, row k, col m
+                : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
+            tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
+                          pack_a_buf, ldd_a, a_src, lda, 1.0f);
+            tile_mma_pack(actual_mc, n_count, actual_kc,
+                          c_tile, ldc,
+                          pack_a_buf, packed_b, -1,
+                          cmin, cmax);
+        } else {
+            const T* a_sub = a_ptr + m * lda + k;  // A phys is M×K, row m, col k
+            tile_mma_direct(actual_mc, n_count, actual_kc,
                             c_tile, ldc,
-                            a_sub, lda, b_sub, ldb,
+                            a_sub, lda, packed_b, -1,
                             cmin, cmax);
+        }
 
-            if (epilogue && last_k) {
-                epilogue_inplace(actual_mc, actual_nc, c_tile, ldc,
-                                 static_cast<const T*>(nullptr), attrs.epilogue);
-            }
+        if (epilogue && last_k) {
+            epilogue_inplace(actual_mc, n_count, c_tile, ldc,
+                             static_cast<const T*>(nullptr), attrs.epilogue);
         }
     }
 }
 
-/// Fused NKM: B always packed into pack_b_slice; A packed on the stack only
-/// when @p pack_a (transpose_a on this path), else read raw. One n-block
-/// [n, n+actual_nc).
+/// Fused NKM (N-split): B always packed into pack_b_slice; A packed on the
+/// stack only when @p pack_a (transpose_a on this path), else read raw. One
+/// n-block [n, n+actual_nc) over the full M.
 template <typename T>
 void matmul_block_fused_nkm(const MatMulAttributes& attrs,
                             T* c_ptr, int ldc,
@@ -126,21 +145,13 @@ void matmul_block_fused_nkm(const MatMulAttributes& attrs,
                             int n, int actual_nc,
                             bool pack_a, T* pack_b_slice)
 {
-    constexpr int mr_max = mr_max_flt<T>();
     constexpr int nr_max = nr_max_flt<T>();
-
-    // Packed A lives on the kernel stack (72 KB, 64-byte aligned).
-    alignas(PANEL_ALIGN_BYTES) T pack_a_buf[pack_a_stack_elems<T>()];
-
-    const bool epilogue = has_inplace_epilogue(attrs);
 
     for (int k = 0; k < K; k += kc) {
         int actual_kc = std::min(kc, K - k);
         const bool last_k = (k + kc >= K);
 
-        // Uniform 64-byte-aligned panel strides for this k-block.
-        const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))
-                          / static_cast<int>(sizeof(T));
+        // Uniform 64-byte-aligned panel stride for this k-block.
         const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
                           / static_cast<int>(sizeof(T));
 
@@ -151,98 +162,14 @@ void matmul_block_fused_nkm(const MatMulAttributes& attrs,
         tile_pack_rhs(attrs.transpose_b, actual_nc, actual_kc,
                       pack_b_slice, ldd_b, b_src, ldb, 1.0f);
 
-        for (int m = 0; m < M; m += mc) {
-            int actual_mc = std::min(mc, M - m);
-            T* c_tile = c_ptr + m * ldc + n;
-
-            if (k == 0 && attrs.beta != 1.0f) {
-                tile_scale(c_tile, ldc, attrs.beta, actual_mc, actual_nc);
-            }
-
-            const auto [cmin, cmax] = kblock_clamp(attrs, last_k);
-
-            if (pack_a) {
-                const T* a_src = attrs.transpose_a
-                    ? a_ptr + k * lda + m    // A phys is K×M, row k, col m
-                    : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
-                tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
-                              pack_a_buf, ldd_a, a_src, lda, 1.0f);
-                tile_mma_pack(actual_mc, actual_nc, actual_kc,
-                              c_tile, ldc,
-                              pack_a_buf, pack_b_slice, -1,
-                              cmin, cmax);
-            } else {
-                const T* a_sub = a_ptr + m * lda + k;  // A phys is M×K, row m, col k
-                tile_mma_direct(actual_mc, actual_nc, actual_kc,
-                                c_tile, ldc,
-                                a_sub, lda, pack_b_slice, -1,
-                                cmin, cmax);
-            }
-
-            if (epilogue && last_k) {
-                epilogue_inplace(actual_mc, actual_nc, c_tile, ldc,
-                                 static_cast<const T*>(nullptr), attrs.epilogue);
-            }
-        }
-    }
-}
-
-/// Fused MKN: A packed once per k-block and reused across all n-blocks; B is
-/// raw K×N. One m-block [m, m+actual_mc), full N width.
-template <typename T>
-void matmul_block_fused_mkn(const MatMulAttributes& attrs,
-                            T* c_ptr, int ldc,
-                            const T* a_ptr, int lda,
-                            const T* b_ptr, int ldb,
-                            int N, int K, int kc, int nc,
-                            int m, int actual_mc)
-{
-    constexpr int mr_max = mr_max_flt<T>();
-
-    // Packed A lives on the kernel stack (72 KB, 64-byte aligned).
-    alignas(PANEL_ALIGN_BYTES) T pack_a_buf[pack_a_stack_elems<T>()];
-
-    const bool epilogue = has_inplace_epilogue(attrs);
-
-    for (int k = 0; k < K; k += kc) {
-        int actual_kc = std::min(kc, K - k);
-        const bool last_k = (k + kc >= K);
-
-        const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))
-                          / static_cast<int>(sizeof(T));
-
-        // Pack A once for this m-block, reuse across every n-block.
-        const T* a_src = attrs.transpose_a
-            ? a_ptr + k * lda + m    // A phys is K×M, row k, col m
-            : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
-        tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
-                      pack_a_buf, ldd_a, a_src, lda, 1.0f);
-
-        T* c_tile = c_ptr + m * ldc;  // full row range [0, N)
-        if (k == 0 && attrs.beta != 1.0f) {
-            tile_scale(c_tile, ldc, attrs.beta, actual_mc, N);
-        }
-
-        const auto [cmin, cmax] = kblock_clamp(attrs, last_k);
-
-        for (int n = 0; n < N; n += nc) {
-            int actual_nc = std::min(nc, N - n);
-            const T* b_mma = b_ptr + k * ldb + n;  // B raw K×N, row k, col n
-            tile_mma_pack(actual_mc, actual_nc, actual_kc,
-                          c_tile + n, ldc,
-                          pack_a_buf, b_mma, ldb,
-                          cmin, cmax);
-        }
-
-        if (epilogue && last_k) {
-            epilogue_inplace(actual_mc, N, c_tile, ldc,
-                             static_cast<const T*>(nullptr), attrs.epilogue);
-        }
+        matmul_m_panels<T>(attrs, c_ptr, ldc, a_ptr, lda,
+                           0, M, mc, n, actual_nc,
+                           k, actual_kc, last_k, pack_a, pack_b_slice);
     }
 }
 
 // =========================================================================
-//  Batched dispatch — plan-driven routing + block-granularity parallelism
+//  Batched dispatch — pack + block-granularity parallelism
 // =========================================================================
 
 template <typename T>
@@ -261,6 +188,16 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
     const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
     const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
 
+    // Fast path (f32 only): tiny GEMMs (M*N*K < 1024) skip the tiled/packed
+    // machinery and go straight to the reference. f16 has no reference kernel,
+    // so it always uses the tiled path below.
+    if constexpr (std::is_same_v<T, float>) {
+        if (gemm_is_small(M, N, K)) {
+            reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
+            return;
+        }
+    }
+
     const int ldc = static_cast<int>(output.row_stride_elems());
     const int lda = static_cast<int>(a.row_stride_elems());
     const int ldb = static_cast<int>(b.row_stride_elems());
@@ -269,11 +206,10 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
     const T* a_base = a.ptr<T>();
     const T* b_base = b.ptr<T>();
 
-    // Global plan (full M×N) → routing + split dimension.
-    const PackPlan plan = make_pack_plan<T>(attrs, M, N, lda, ldb);
-
-    // A workspace is needed iff pack_b; without one, fall back to reference.
-    if (plan.pack_b && workspace == nullptr) {
+    // A is packed only for transpose_a (correctness) or a wide row stride
+    // (page-scattered reads). B is always packed, so a workspace is mandatory.
+    const bool pack_a = attrs.transpose_a || (lda > PACK_A_STRIDE_THRESHOLD);
+    if (workspace == nullptr) {
         reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
         return;
     }
@@ -291,13 +227,10 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                            / static_cast<int>(sizeof(T));
     const int np_full = num_panels(nc, std::is_same_v<T, float> ? NR_F32 : NR_F16);
 
-    // Split dimension: MKN → M-split, otherwise N-split (BLIS convention).
-    const bool split_m = plan.mkn_order;
-    const int64_t num_blocks = split_m ? (M + mc - 1) / mc : (N + nc - 1) / nc;
-
-    // Per-slab pack_a for N-split: stride-triggered packing is refined away —
-    // each thread reads A exactly once, so pack_a reduces to transpose_a.
-    const bool pack_a_slab = attrs.transpose_a;
+    // Work is split on the larger dimension (mirrors MLAS sgemm/qgemm: 1D
+    // partition over N when N > M, else over M). The workspace always holds
+    // the packed B for the full N at one k-block stride, so both paths fit in
+    // the same buffer.
 
     // Broadcast batch dimensions (same logic as matmul_ref).
     const int64_t batch_a_dims = a_rank - 2;
@@ -365,32 +298,381 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
         const T* a_p = a_base + a_offset;
         const T* b_p = b_base + b_offset;
 
-        auto run_block = [&](int64_t blk) {
-            if (split_m) {
-                const int m = static_cast<int>(blk) * mc;
-                const int actual_mc = std::min(mc, Mi - m);
-                matmul_block_fused_mkn<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
-                                          Ni, Ki, kc, nc, m, actual_mc);
-            } else if (plan.pack_b) {
+        if (N > M) {
+            // N-split: one n-block per parallel task (N is the larger dim).
+            const int64_t num_blocks = (Ni + nc - 1) / nc;
+            auto run_block = [&](int64_t blk) {
                 const int n = static_cast<int>(blk) * nc;
                 const int actual_nc = std::min(nc, Ni - n);
                 T* pack_b_slice = static_cast<T*>(workspace) + blk * np_full * ldd_b_full;
                 matmul_block_fused_nkm<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
                                           Mi, Ki, kc, mc, n, actual_nc,
-                                          pack_a_slab, pack_b_slice);
+                                          pack_a, pack_b_slice);
+            };
+            if (ctx.cpu_parallel_for) {
+                ctx.cpu_parallel_for(0, num_blocks, run_block);
             } else {
+                for (int64_t blk = 0; blk < num_blocks; ++blk) {
+                    run_block(blk);
+                }
+            }
+        } else {
+            // M-split: pack B once per k-block (full N), then parallelize the M
+            // rows into equal contiguous slabs. Mirrors MLAS's "M >= N →
+            // partition M" rule; the block count is ceil(M/mc).
+            const int64_t num_m_blocks = split_block_count(Mi, mc);
+
+            for (int k = 0; k < Ki; k += kc) {
+                const int actual_kc = std::min(kc, Ki - k);
+                const bool last_k = (k + kc >= Ki);
+                const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+                                  / static_cast<int>(sizeof(T));
+                const T* b_src = attrs.transpose_b
+                    ? b_p + k                  // B phys is N×K, col k over full N
+                    : b_p + k * ldb;           // B phys is K×N, row k over full N
+                T* pack_b = static_cast<T*>(workspace);
+                tile_pack_rhs(attrs.transpose_b, Ni, actual_kc, pack_b, ldd_b, b_src, ldb, 1.0f);
+
+                auto run_m = [&](int64_t blk) {
+                    const int m_start = static_cast<int>(blk * Mi / num_m_blocks);
+                    const int m_end   = static_cast<int>((blk + 1) * Mi / num_m_blocks);
+                    matmul_m_panels<T>(attrs, c_p, ldc, a_p, lda,
+                                       m_start, m_end - m_start, mc,
+                                       0, Ni, k, actual_kc, last_k, pack_a, pack_b);
+                };
+                if (ctx.cpu_parallel_for) {
+                    ctx.cpu_parallel_for(0, num_m_blocks, run_m);
+                } else {
+                    for (int64_t blk = 0; blk < num_m_blocks; ++blk) {
+                        run_m(blk);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
+//  int8 (s8×s8) — fused NKM, always packs A and B
+// =========================================================================
+
+/// Zero-point / scale accessor: PerTensor falls back to the scalar, PerToken /
+/// PerChannel index the external buffer at @p idx (the output row m for A, the
+/// output column n for the weight B).
+inline int32_t quant_zp_at(const QuantParams& q, int64_t idx) noexcept {
+    return (q.zero_point_data != nullptr) ? q.zero_point_data[idx] : q.zero_point;
+}
+inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
+    return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
+}
+
+/// Raw int8 row/column reductions needed by the epilogue:
+///   r_a[m] = Σ_k A[m,k] (or A[k,m] if transpose_a)
+///   r_b[n] = Σ_k B[k,n] (or B[n,k] if transpose_b)
+void compute_int8_reductions(const int8_t* a_ptr, int64_t lda,
+                             const int8_t* b_ptr, int64_t ldb,
+                             const MatMulAttributes& attrs,
+                             int64_t M, int64_t N, int64_t K,
+                             int32_t* r_a, int32_t* r_b) {
+    for (int64_t m = 0; m < M; ++m) {
+        int32_t s = 0;
+        for (int64_t k = 0; k < K; ++k) {
+            s += attrs.transpose_a ? a_ptr[k * lda + m] : a_ptr[m * lda + k];
+        }
+        r_a[m] = s;
+    }
+    for (int64_t n = 0; n < N; ++n) {
+        int32_t s = 0;
+        for (int64_t k = 0; k < K; ++k) {
+            s += attrs.transpose_b ? b_ptr[n * ldb + k] : b_ptr[k * ldb + n];
+        }
+        r_b[n] = s;
+    }
+}
+
+/// Compute the m-panels of a single k-block against a packed-B slice (s8×s8).
+/// Shared by the N-split and M-split int8 paths. @p packed_b holds @p n_count
+/// columns for this k-block; @p m_start/@p m_count select the C rows.
+void matmul_m_panels_i8(const MatMulAttributes& attrs,
+                        int32_t* c_ptr, int ldc,
+                        const int8_t* a_ptr, int lda,
+                        int m_start, int m_count, int mc,
+                        int n_start, int n_count,
+                        int k, int actual_kc,
+                        const int8_t* packed_b)
+{
+    alignas(PANEL_ALIGN_BYTES) int8_t pack_a_buf[PACK_A_STACK_I8];
+
+    // Pack step writes ceil(kc/4) groups per row; stride by the padded byte
+    // count to keep adjacent panels from overlapping.
+    const int kbytes = (actual_kc + 3) & ~3;
+    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * kbytes);
+
+    for (int m = m_start; m < m_start + m_count; m += mc) {
+        int actual_mc = std::min(mc, m_start + m_count - m);
+        int32_t* c_tile = c_ptr + m * ldc + n_start;
+
+        const int8_t* a_src = attrs.transpose_a
+            ? a_ptr + k * lda + m    // A phys is K×M, row k, col m
+            : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
+        tile_pack_lhs_i8(attrs.transpose_a, actual_mc, actual_kc,
+                         pack_a_buf, ldd_a, a_src, lda);
+
+        tile_mma_pack_i8(actual_mc, n_count, actual_kc,
+                         c_tile, ldc,
+                         pack_a_buf, packed_b,
+                         INT32_MIN, INT32_MAX);
+    }
+}
+
+/// One n-block of the s8×s8 GEMM: packs B once per k-block, packs A per
+/// m-panel on the stack, accumulates the raw int32 dot-product into @p c_ptr.
+void matmul_block_int8(const MatMulAttributes& attrs,
+                       int32_t* c_ptr, int ldc,
+                       const int8_t* a_ptr, int lda,
+                       const int8_t* b_ptr, int ldb,
+                       int M, int K, int kc, int mc,
+                       int n, int actual_nc,
+                       int8_t* pack_b_slice)
+{
+    for (int k = 0; k < K; k += kc) {
+        int actual_kc = std::min(kc, K - k);
+
+        // Uniform 64-byte-aligned panel stride (bytes) for this k-block.
+        const int kbytes = (actual_kc + 3) & ~3;
+        const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kbytes);
+
+        // B panel: packed ([K][nr]) regardless of transpose_b.
+        const int8_t* b_src = attrs.transpose_b
+            ? b_ptr + n * ldb + k     // B phys is N×K, row n, col k
+            : b_ptr + k * ldb + n;    // B phys is K×N, row k, col n
+        tile_pack_rhs_i8(attrs.transpose_b, actual_nc, actual_kc,
+                         pack_b_slice, ldd_b, b_src, ldb);
+
+        matmul_m_panels_i8(attrs, c_ptr, ldc, a_ptr, lda,
+                           0, M, mc, n, actual_nc, k, actual_kc, pack_b_slice);
+    }
+}
+
+/// Plan-driven-free int8 dispatch: per-token A × per-channel W, raw int32
+/// accumulate, then a single epilogue pass that applies zero-point compensation
+/// (and, for an s8 output, requantization). Packed B lives in the workspace;
+/// for an s8 output the workspace also carries the int32 accumulator.
+void matmul_dispatch_int8(const MatMulAttributes& attrs,
+                          TensorView& output,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx,
+                          int kc, void* workspace)
+{
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+
+    const int64_t a_rank = a.rank();
+    const int64_t b_rank = b.rank();
+    const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
+    const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
+    const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
+
+    const int lda = static_cast<int>(a.row_stride_elems());
+    const int ldb = static_cast<int>(b.row_stride_elems());
+    const int ldc_out = static_cast<int>(output.row_stride_elems());
+
+    const int8_t* a_base = a.ptr<int8_t>();
+    const int8_t* b_base = b.ptr<int8_t>();
+
+    const bool out_s8 = (output.data_type() == DataType::s8);
+    // int32 accumulator: the output itself for s32, a compact M×N temp for s8.
+    const int ldc = out_s8 ? static_cast<int>(N) : ldc_out;
+
+    // Resolve tile sizes once (M/N/K shared across batch elements).
+    int mc, nc;
+    resolve_tile_sizes(static_cast<int>(M), static_cast<int>(N),
+                       MR_MAX_I8, NR_MAX_I8, kc, 1, mc, nc);
+
+    // Workspace: packed-B panels at the base, then the s8 accumulator.
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kc);
+    const int np_full = num_panels4(nc, NR_I8);
+    int8_t* pack_b_base = static_cast<int8_t*>(workspace);
+    int32_t* accum = nullptr;
+    if (out_s8) {
+        accum = reinterpret_cast<int32_t*>(
+            pack_b_base + static_cast<size_t>(num_panels4(static_cast<int>(N), NR_I8)) * static_cast<size_t>(ldd_b_full));
+    }
+
+    // Compile-time u8 offset baked into the A pack on the x86 VNNI path.
+    constexpr int32_t u8_offset = INT8_USE_U8_OFFSET ? 128 : 0;
+
+    // Quantization parameters (batch-independent, indexed by m / n / 0).
+    const QuantParams& qa = a.quant_params();
+    const QuantParams& qb = b.quant_params();
+    const QuantParams& qc = output.quant_params();
+    const double  scale_out = (qc.scale_data != nullptr) ? static_cast<double>(qc.scale_data[0]) : static_cast<double>(qc.scale);
+    const int32_t zp_out    = (qc.zero_point_data != nullptr) ? qc.zero_point_data[0] : qc.zero_point;
+    const bool relu = (attrs.epilogue.type == EpilogueActivateType::Relu);
+
+    // ---- broadcast batch dims (same logic as matmul_dispatch_2d) ----
+    const int64_t batch_a_dims = a_rank - 2;
+    const int64_t batch_b_dims = b_rank - 2;
+    const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
+
+    std::vector<int64_t> batch_a_shape(batch_ndim, 1);
+    std::vector<int64_t> batch_b_shape(batch_ndim, 1);
+    std::vector<int64_t> batch_out_shape(batch_ndim, 1);
+
+    for (int64_t i = 0; i < batch_a_dims; ++i) {
+        batch_a_shape[batch_ndim - batch_a_dims + i] = a.shape(i);
+    }
+    for (int64_t i = 0; i < batch_b_dims; ++i) {
+        batch_b_shape[batch_ndim - batch_b_dims + i] = b.shape(i);
+    }
+
+    int64_t total_batch = 1;
+    for (int64_t i = 0; i < batch_ndim; ++i) {
+        const int64_t da = batch_a_shape[i];
+        const int64_t db = batch_b_shape[i];
+        if (da == db) {
+            batch_out_shape[i] = da;
+        } else if (da == 1) {
+            batch_out_shape[i] = db;
+        } else if (db == 1) {
+            batch_out_shape[i] = da;
+        } else {
+            NNOPS_ASSERT(!"MatMul: incompatible batch dimensions for broadcast");
+        }
+        total_batch *= batch_out_shape[i];
+    }
+
+    const int Mi = static_cast<int>(M);
+    const int Ni = static_cast<int>(N);
+    const int Ki = static_cast<int>(K);
+
+    std::vector<int32_t> r_a(static_cast<size_t>(M));
+    std::vector<int32_t> r_b(static_cast<size_t>(N));
+
+    for (int64_t bi = 0; bi < total_batch; ++bi) {
+        int64_t rem = bi;
+        int64_t a_offset = 0;
+        int64_t b_offset = 0;
+        int64_t c_offset = 0;
+
+        for (int64_t d = batch_ndim - 1; d >= 0; --d) {
+            const int64_t coord = rem % batch_out_shape[d];
+            rem /= batch_out_shape[d];
+
+            const int64_t a_dim = d - (batch_ndim - batch_a_dims);
+            if (a_dim >= 0) {
+                const int64_t a_coord = (batch_a_shape[d] == 1) ? 0 : coord;
+                a_offset += a_coord * a.stride_elems(a_dim);
+            }
+
+            const int64_t b_dim = d - (batch_ndim - batch_b_dims);
+            if (b_dim >= 0) {
+                const int64_t b_coord = (batch_b_shape[d] == 1) ? 0 : coord;
+                b_offset += b_coord * b.stride_elems(b_dim);
+            }
+
+            c_offset += coord * output.stride_elems(d);
+        }
+
+        const int8_t* a_p = a_base + a_offset;
+        const int8_t* b_p = b_base + b_offset;
+
+        // int32 accumulator for this batch element.
+        int32_t* c_p;
+        if (out_s8) {
+            c_p = accum;  // reused per batch element
+        } else {
+            c_p = output.ptr<int32_t>() + c_offset;
+        }
+
+        // Precompute the raw int8 reductions for the epilogue.
+        compute_int8_reductions(a_p, lda, b_p, ldb, attrs, M, N, K,
+                                r_a.data(), r_b.data());
+
+        if (N > M) {
+            // N-split: one n-block per parallel task (N is the larger dim).
+            const int64_t num_blocks = (Ni + nc - 1) / nc;
+            auto run_block = [&](int64_t blk) {
                 const int n = static_cast<int>(blk) * nc;
                 const int actual_nc = std::min(nc, Ni - n);
-                matmul_block_direct_nkm<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
-                                           Mi, Ki, kc, mc, n, actual_nc);
-            }
-        };
+                int8_t* pack_b_slice = pack_b_base + blk * np_full * ldd_b_full;
+                matmul_block_int8(attrs, c_p, ldc, a_p, lda, b_p, ldb,
+                                  Mi, Ki, kc, mc, n, actual_nc, pack_b_slice);
+            };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_blocks, run_block);
+            if (ctx.cpu_parallel_for) {
+                ctx.cpu_parallel_for(0, num_blocks, run_block);
+            } else {
+                for (int64_t blk = 0; blk < num_blocks; ++blk) {
+                    run_block(blk);
+                }
+            }
         } else {
-            for (int64_t blk = 0; blk < num_blocks; ++blk) {
-                run_block(blk);
+            // M-split: pack B once per k-block (full N), then parallelize the M
+            // rows into equal contiguous slabs. Mirrors MLAS's "M >= N →
+            // partition M" rule; the block count is ceil(M/mc).
+            const int64_t num_m_blocks = split_block_count(Mi, mc);
+
+            for (int k = 0; k < Ki; k += kc) {
+                const int actual_kc = std::min(kc, Ki - k);
+                const int kbytes = (actual_kc + 3) & ~3;
+                const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kbytes);
+                const int8_t* b_src = attrs.transpose_b
+                    ? b_p + k                  // B phys is N×K, col k over full N
+                    : b_p + k * ldb;           // B phys is K×N, row k over full N
+                tile_pack_rhs_i8(attrs.transpose_b, Ni, actual_kc,
+                                 pack_b_base, ldd_b, b_src, ldb);
+
+                auto run_m = [&](int64_t blk) {
+                    const int m_start = static_cast<int>(blk * Mi / num_m_blocks);
+                    const int m_end   = static_cast<int>((blk + 1) * Mi / num_m_blocks);
+                    matmul_m_panels_i8(attrs, c_p, ldc, a_p, lda,
+                                       m_start, m_end - m_start, mc,
+                                       0, Ni, k, actual_kc, pack_b_base);
+                };
+                if (ctx.cpu_parallel_for) {
+                    ctx.cpu_parallel_for(0, num_m_blocks, run_m);
+                } else {
+                    for (int64_t blk = 0; blk < num_m_blocks; ++blk) {
+                        run_m(blk);
+                    }
+                }
+            }
+        }
+
+        // Epilogue: zero-point compensation (+ requantization for s8).
+        if (out_s8) {
+            int8_t* out_p = output.ptr<int8_t>() + c_offset;
+            for (int64_t m = 0; m < M; ++m) {
+                const int32_t zp_a = quant_zp_at(qa, m);
+                const double  s_a  = static_cast<double>(quant_scale_at(qa, m));
+                for (int64_t n = 0; n < N; ++n) {
+                    int32_t v = matmul_int8_compensate(c_p[m * ldc + n], u8_offset,
+                                                       zp_a, quant_zp_at(qb, n),
+                                                       r_a[static_cast<size_t>(m)],
+                                                       r_b[static_cast<size_t>(n)],
+                                                       Ki);
+                    if (relu) {
+                        v = std::max(v, 0);
+                    }
+                    const double req = s_a * static_cast<double>(quant_scale_at(qb, n)) / scale_out;
+                    out_p[m * ldc_out + n] = matmul_int8_requant(v, req, zp_out);
+                }
+            }
+        } else {
+            for (int64_t m = 0; m < M; ++m) {
+                const int32_t zp_a = quant_zp_at(qa, m);
+                for (int64_t n = 0; n < N; ++n) {
+                    int32_t v = matmul_int8_compensate(c_p[m * ldc + n], u8_offset,
+                                                       zp_a, quant_zp_at(qb, n),
+                                                       r_a[static_cast<size_t>(m)],
+                                                       r_b[static_cast<size_t>(n)],
+                                                       Ki);
+                    if (relu) {
+                        v = std::max(v, 0);
+                    }
+                    c_p[m * ldc + n] = v;
+                }
             }
         }
     }
@@ -417,6 +699,19 @@ void matmul_kernel(const MatMulAttributes& attrs,
 
     const auto dt_a = a.data_type();
     const auto dt_b = b.data_type();
+
+    // int8 (s8×s8): fused tiled kernel for s32 / s8 outputs. The tiled path
+    // always packs B, so it needs a workspace; without one, fall back to ref.
+    if (dt_a == DataType::s8 && dt_b == DataType::s8) {
+        const bool out_ok = (output.data_type() == DataType::s32) ||
+                            (output.data_type() == DataType::s8);
+        if (out_ok && workspace != nullptr) {
+            matmul_dispatch_int8(attrs, output, inputs, ctx, KC_I8, workspace);
+        } else {
+            reference::matmul_int8_ref(attrs, output, inputs, ctx, workspace);
+        }
+        return;
+    }
 
     // Only f32 and f16 have fused kernels; everything else uses the reference.
     const bool supported = (dt_a == DataType::f32 && dt_b == DataType::f32) ||

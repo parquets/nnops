@@ -71,7 +71,15 @@ size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
 std::vector<TensorDesc> MatMul::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return {matmul_output_shape(attrs_.transpose_a, attrs_.transpose_b, inputs)};
+    auto out = matmul_output_shape(attrs_.transpose_a, attrs_.transpose_b, inputs);
+
+    // Integer (s8×s8) matmul: the output follows output_dtype (s32 accumulate or
+    // requantized s8), not the input dtype.
+    if (inputs[0].dtype == DataType::s8 && inputs[1].dtype == DataType::s8) {
+        out[0].dtype = attrs_.output_dtype;
+    }
+
+    return out;
 }
 
 void MatMul::compute(std::span<TensorView> outputs,

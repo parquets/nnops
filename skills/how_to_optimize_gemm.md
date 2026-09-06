@@ -8,60 +8,45 @@ and the shared pack/MMA helpers in [src/backend/cpu/matmul_helper.h](../src/back
 
 ## 1. High-Level Architecture
 
-### 1.1 Loop Order: NKM and MKN (plan-driven)
+### 1.1 Loop Order: NKM only (simplified, mirrors onnxruntime MLAS)
 
-The loop order is chosen by the static pack decision, not hard-coded:
+The loop order is fixed — there is no routing table. Mirroring onnxruntime's MLAS
+`sgemm.cpp`, B is *always* packed and the loop is always NKM:
 
 ```text
-NKM (default)                       MKN (A-only pack)
-for n in [0..N, step Nc]:           for k in [0..K, step Kc]:
-  for k in [0..K, step Kc]:           for m in [0..M, step Mc]:
-    for m in [0..M, step Mc]:           for n in [0..N, step Nc]:
+NKM
+for n in [0..N, step Nc]:
+  for k in [0..K, step Kc]:
+    for m in [0..M, step Mc]:
 ```
 
 **Why NKM?** B is packed once per Kc×Nc block in the K-loop and reused across all
 M panels. Putting N outermost means packed_B stays live in L2 across the entire M
-sweep, maximizing reuse of the packed RHS.
+sweep, maximizing reuse of the packed RHS. The former MKN (A-only-pack) and direct
+(no-pack) orders were removed: they only won when B was *not* packed, and B is now
+always packed.
 
-**Why MKN?** When *only* A is packed (B stays raw), the A pack is the expensive
-operation, so we hoist it: A is packed once per Kc×Mc block and reused across the
-entire N sweep. Packing B in MKN order would re-pack B `M/mc` times, so MKN is
-chosen *only* when `pack_a && !pack_b`.
+### 1.2 Packing Strategy — always-pack-B, threshold-pack-A
 
-**Routing table** (see `make_pack_plan<T>` in matmul_helper.h):
-
-| pack_a | pack_b | loop order | mma call                          | split dim |
-|--------|--------|------------|-----------------------------------|-----------|
-| ✓      | ✓      | NKM (fused)| `tile_mma_pack(..., -1)`          | N |
-| ✓      | ✗      | **MKN**    | `tile_mma_pack(..., b_raw, ldb)`  | M |
-| ✗      | ✓      | NKM (fused)| `tile_mma_direct(..., pack_b, -1)`| N |
-| ✗      | ✗      | NKM (direct)| `tile_mma_direct(..., b_raw, ldb)`| N |
-
-### 1.2 Packing Strategy — static cost model (`PackPlan`)
-
-The decision lives in one place: `make_pack_plan<T>(attrs, M_s, N_s, lda, ldb)`.
+The decision is two trivial rules (see `PACK_A_STRIDE_THRESHOLD` and
+`gemm_is_small` in matmul_helper.h):
 
 ```text
-pack_a = transpose_a || (N_s > nc && lda > thr)
-pack_b = transpose_b || (M_s > mc && ldb > thr)
-mkn_order = pack_a && !pack_b
-thr = 4096 / sizeof(T)   // page-size heuristic: f32 → 1024, f16 → 2048
+pack_b = true                                            // rhs always packed
+pack_a = transpose_a || (lda > PACK_A_STRIDE_THRESHOLD)  // 1024 elements
 ```
 
 Rules, in order:
 
-1. **Correctness.** `transpose_a ⇒ pack_a`, `transpose_b ⇒ pack_b` — the
-   micro-kernel requires A as `[m][k]` and B as `[k][nr]` panels.
-2. **Stride + reuse.** Pack only when the row stride is page-scattered (`lda/ldb > thr`)
-   **and** the panel is actually re-read across tile blocks (A is re-read `N_s/nc`
-   times, B `M_s/mc` times). A single-pass read is never worth the extra copy.
-3. **Loop order.** MKN only when A is packed and B is raw.
-
-The **global vs per-slab** split matters under threading: `pack_b` is decided
-globally (workspace is a global resource; sizing can't know the thread count), while
-`pack_a` can be refined per-slab (the stack buffer is per-thread): under an N-split,
-each thread reads A exactly once, so stride-triggered `pack_a` collapses to
-`transpose_a`.
+1. **B is always packed.** The packed RHS is what the micro-kernel consumes
+   (`tile_mma_pack(..., -1)` / `tile_mma_direct(..., pack_b, -1)`); packing it is
+   the RHS-reuse win and is never skipped.
+2. **A packs on correctness or wide stride.** `transpose_a` forces packing (the
+   micro-kernel wants A as `[m][k]` panels); otherwise A packs only when its row
+   stride exceeds 1024 elements (page-scattered reads). Otherwise A is read directly
+   via `tile_mma_direct`.
+3. **Fast path.** GEMMs with `M*N*K < 1024` MACs skip the tiled path entirely and
+   go to the reference.
 
 ### 1.3 Workspace Model (TensorRT Pattern)
 
@@ -279,27 +264,23 @@ Beta scaling (`C = A×B + beta×C`) is fused into the first k-block (`tile_scale
 ## 7. Multithreading
 
 The tiled kernel is parallelized through `ctx.cpu_parallel_for` at **tile-block**
-granularity (not bare rows): N-split produces `ceil(N/nc)` blocks, M-split
-`ceil(M/mc)` blocks.
+granularity (not bare rows): N-split produces `ceil(N/nc)` blocks.
 
-- **Split dimension** follows the routing table: MKN → M-split (A-pack traffic
-  stays MK), everything else → N-split (BLIS convention).
+- **Split dimension** is always N-split (BLIS convention) — there is no M-split
+  path.
 - **No barriers, no reductions.** Each block writes a disjoint C tile; the k-loop is
   independent per thread. The result is **bit-identical to serial** — the thread
   count does not change any output value (asserted by `matmul_threaded_matches_serial`).
 - **Workspace slicing.** Each n-block's packed-B panels start at
   `workspace + blk × num_panels(nc,nr) × ldd_b × elem`; panel ranges are disjoint,
   so the total stays `num_panels(N,nr)` regardless of thread count.
-- **Per-slab pack_a refinement.** Under N-split, each thread reads A once, so
-  `pack_a` reduces to `transpose_a` (stride-triggered packing is correctly disabled).
 - **Batched matmul** iterates batch elements serially, parallelizing *within* each
   element. Flattening `(batch × block)` is a possible future extension.
 - **L2 contention.** With T threads, T hot working sets may exceed L2 and spill to
   L3 — consistent with BLIS/OpenBLAS. Shrinking `nc` per-thread would restore
   residency but break the thread-count-invariant workspace formula; noted as a future
   tuning point. (The large L2-derived `nc ≈ 224–240` also means an N-split over
-  N ≈ 1024 yields only ~2–4 blocks — the M-split MKN path scales better on such
-  shapes.)
+  N ≈ 1024 yields only ~2–4 blocks.)
 
 ---
 

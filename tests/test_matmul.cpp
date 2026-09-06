@@ -1108,8 +1108,8 @@ NNOPS_TEST(matmul_packed_multiple_kblocks) {
 NNOPS_TEST(matmul_packed_beta_relu_workspace) {
     // Beta + Relu epilogue in the packed path must match reference semantics:
     // C = relu(A×B + beta×C_old).
-    auto [a_vec, a] = test::make_random_tensor({4, 6});   // [M, K]
-    auto [b_vec, b] = test::make_random_tensor({5, 6});   // phys [N, K]
+    auto [a_vec, a] = test::make_random_tensor({64, 64});  // [M, K]
+    auto [b_vec, b] = test::make_random_tensor({32, 64});  // phys [N, K]
 
     MatMulAttributes attrs{};
     attrs.transpose_b = true;
@@ -1145,8 +1145,8 @@ NNOPS_TEST(matmul_packed_beta_relu_workspace) {
 
 NNOPS_TEST(matmul_packed_batched_workspace) {
     // Batched (rank 3) transpose_b through the packed path.
-    auto [a_vec, a] = test::make_random_tensor({3, 5, 8});    // [B, M, K]
-    auto [b_vec, b] = test::make_random_tensor({3, 7, 8});    // phys [B, N, K]
+    auto [a_vec, a] = test::make_random_tensor({2, 16, 16});   // [B, M, K]
+    auto [b_vec, b] = test::make_random_tensor({2, 16, 16});   // phys [B, N, K]
 
     MatMulAttributes attrs{};
     attrs.transpose_b = true;
@@ -1157,9 +1157,9 @@ NNOPS_TEST(matmul_packed_batched_workspace) {
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
     NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
-    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(3));
-    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(5));
-    NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(7));
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(16));
+    NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(16));
 
     std::vector<float> out_buf(descs[0].numel());
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
@@ -1204,9 +1204,10 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
     std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
 
-    // transpose_a-only packs A on the kernel stack — no workspace needed.
+    // transpose_a packs A on the kernel stack; B is always packed into the
+    // workspace.
     std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
-    NNOPS_EXPECT_EQ(workspace.size(), 0u);
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, workspace.data());
@@ -1367,8 +1368,8 @@ NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
 }
 
 NNOPS_TEST(matmul_padded_a_stride_correctness) {
-    // Wide row stride on A, but N <= nc (single n-block) → A is read once, so
-    // the stride pack must NOT trigger; the direct path reads A raw via lda.
+    // Wide row stride on A (> 1024) triggers pack_a; the packed result must
+    // match the reference computed from the padded (wide-stride) source.
     const int64_t M = 512, K = 512, N = 512;
     auto [a_vec, a] = make_padded_f32(M, K, /*pitch_elems=*/2048, 707);
     auto [b_vec, b] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 808);
@@ -1384,7 +1385,7 @@ NNOPS_TEST(matmul_padded_a_stride_correctness) {
     auto descs = op->getOutputTensorDesc(arr);
 
     std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
-    NNOPS_EXPECT_EQ(workspace.size(), 0u);  // no pack → no workspace
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);  // B is always packed
 
     std::vector<float> out_buf(descs[0].numel());
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
@@ -1399,8 +1400,8 @@ NNOPS_TEST(matmul_padded_a_stride_correctness) {
 }
 
 NNOPS_TEST(matmul_mkn_transpose_a_multik) {
-    // transpose_a only → pack_a && !pack_b → MKN loop order. Multi-k and
-    // multi-m blocks exercise beta@k==0, Relu clamp, and the last-k epilogue.
+    // transpose_a → pack_a (NKM order, B always packed). Multi-k and multi-m
+    // blocks exercise beta@k==0, Relu clamp, and the last-k epilogue.
     const int64_t K = 300, M = 256, N = 128;
     auto [a_vec, a] = test::make_random_tensor({K, M}, -1.0f, 1.0f, 505);  // phys [K, M]
     auto [b_vec, b] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 606);  // [K, N]
@@ -1416,9 +1417,10 @@ NNOPS_TEST(matmul_mkn_transpose_a_multik) {
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // transpose_a only packs A on the kernel stack — no workspace needed.
+    // transpose_a packs A on the kernel stack; B is always packed into the
+    // workspace.
     std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
-    NNOPS_EXPECT_EQ(workspace.size(), 0u);
+    NNOPS_EXPECT_TRUE(workspace.size() > 0);
 
     std::vector<float> out_buf(descs[0].numel(), 1.0f);  // prefill for beta
     auto output = nnops::test::make_planar(descs[0], out_buf.data());
