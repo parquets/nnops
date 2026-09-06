@@ -31,7 +31,7 @@ nnops is a C++23 multi-backend neural network operator library with zero third-p
 | TensorView storage | `SmallVector<int64_t, 8>` for shape (zero heap for <= 8D); `int64_t pitch_` for row pitch in bytes |
 | TensorView data access | `ptr<T>()` / `ptr<T>(row_id)` (typed, OpenCV-style) — replaces old `data()` and `data_as<T>()`; `is_empty()` for null checks |
 | Backend dispatch | `switch(backend_)` in compute() |
-| CPU parallelism | `std::function` passed via `ComputeContext::cpu_parallel_for` |
+| CPU parallelism | `CpuBackend` struct (parallel_for / num_threads / thread_id `std::function`s) embedded as `ComputeContext::cpu` |
 | Memory | User owns all buffers; workspace passed as `void*` |
 | Functional API | Free function wrapping create+compute |
 | Build | Modern CMake, C++23, explicit source files, no `file(GLOB)` |

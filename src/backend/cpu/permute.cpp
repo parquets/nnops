@@ -70,14 +70,7 @@ void permute_last_two_swap_impl(TensorView& output,
             M);  // out_ld: elements between output rows
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, batch, body);
-    }
-    else {
-        for (int64_t b = 0; b < batch; ++b) {
-            body(b);
-        }
-    }
+    ctx.cpu.run(0, batch, body);
 }
 
 // ============================================================
@@ -157,14 +150,7 @@ void permute_impl(const PermuteAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, outer_total, body);
-    }
-    else {
-        for (int64_t o = 0; o < outer_total; ++o) {
-            body(o);
-        }
-    }
+    ctx.cpu.run(0, outer_total, body);
 }
 
 // ============================================================

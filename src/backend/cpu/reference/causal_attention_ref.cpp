@@ -375,14 +375,8 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
 
     // Parallel dispatch over B * H heads
     const int64_t total = B * H;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total,
+    ctx.cpu.run(0, total,
             [&](int64_t idx) { process_head(idx); });
-    } else {
-        for (int64_t idx = 0; idx < total; ++idx) {
-            process_head(idx);
-        }
-    }
 }
 
 }  // namespace nnops::backend::cpu::reference

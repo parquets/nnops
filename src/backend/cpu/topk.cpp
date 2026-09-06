@@ -122,13 +122,7 @@ void topk_impl(const TopKAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for && outer_dims > 1) {
-        ctx.cpu_parallel_for(0, outer_dims, process_outer);
-    } else {
-        for (int64_t i = 0; i < outer_dims; ++i) {
-            process_outer(i);
-        }
-    }
+    ctx.cpu.run(0, outer_dims, process_outer);
 }
 
 void topk_cpu(const TopKAttributes& attrs,

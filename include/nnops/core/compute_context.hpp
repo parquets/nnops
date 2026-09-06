@@ -15,8 +15,8 @@ struct ComputeContext {
     /// when creating operators. Default: CPU.
     Backend expected_backend = Backend::CPU;
 
-    /// CPU parallelism hook. nullptr means sequential execution.
-    ParallelForFn cpu_parallel_for = nullptr;
+    /// CPU execution backend: parallelism + worker-count / thread-id hooks.
+    CpuBackend cpu;
 
     /// CUDA stream (cudaStream_t), opaque pointer.
     void* cuda_stream = nullptr;

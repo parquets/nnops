@@ -231,18 +231,10 @@ void tconv2d_impl_nchwc8(
 
     // ---- Normal case (add_to=false): parallel over N * OC8 ----
     const int64_t N_OC8 = N * OC8;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N_OC8,
+    ctx.cpu.run(0, N_OC8,
             [&](int64_t tid) {
                 compute_sample_c8(tid / OC8, tid % OC8);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t oc8 = 0; oc8 < OC8; ++oc8) {
-                compute_sample_c8(n, oc8);
-            }
-        }
-    }
 }
 
 // ============================================================

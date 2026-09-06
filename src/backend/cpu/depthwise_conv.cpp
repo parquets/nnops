@@ -130,16 +130,8 @@ void dwconv_impl_nchwc8(
 
     // Parallel dispatch (N * C8)
     const int64_t N_C8 = N * C8;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N_C8,
+    ctx.cpu.run(0, N_C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c8 = 0; c8 < C8; ++c8) {
-                compute_c8(n, c8);
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -302,16 +294,8 @@ void dwconv_impl_nchwc8_quant(
     };
 
     const int64_t N_C8 = N * C8;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N_C8,
+    ctx.cpu.run(0, N_C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c8 = 0; c8 < C8; ++c8) {
-                compute_c8(n, c8);
-            }
-        }
-    }
 }
 
 // ============================================================

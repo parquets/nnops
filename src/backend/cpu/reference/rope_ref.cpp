@@ -135,13 +135,7 @@ void rope_ref(const RoPEAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, outer_count, process_outer);
-    } else {
-        for (int64_t i = 0; i < outer_count; ++i) {
-            process_outer(i);
-        }
-    }
+    ctx.cpu.run(0, outer_count, process_outer);
 }
 
 }  // namespace nnops::backend::cpu::reference

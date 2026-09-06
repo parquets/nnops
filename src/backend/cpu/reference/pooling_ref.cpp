@@ -157,20 +157,12 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
     };
 
     const int64_t NC = N * C;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NC,
+    ctx.cpu.run(0, NC,
             [&](int64_t tid) {
                 int64_t n = tid / C;
                 int64_t c = tid % C;
                 compute_channel(n, c);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
-                compute_channel(n, c);
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -297,20 +289,12 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
     };
 
     const int64_t NC = N * C;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NC,
+    ctx.cpu.run(0, NC,
             [&](int64_t tid) {
                 int64_t n = tid / C;
                 int64_t c = tid % C;
                 compute_channel(n, c);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
-                compute_channel(n, c);
-            }
-        }
-    }
 }
 
 void pooling_ref(const PoolingAttributes& attrs,

@@ -89,13 +89,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
                 }
             };
 
-            if (ctx.cpu_parallel_for) {
-                ctx.cpu_parallel_for(0, num_rows, process_row);
-            } else {
-                for (int64_t r = 0; r < num_rows; ++r) {
-                    process_row(r);
-                }
-            }
+            ctx.cpu.run(0, num_rows, process_row);
 
         } else {
             // ---- Planar layout path (NCHW, NCDHW) ----
@@ -134,11 +128,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
                 }
             };
 
-            if (ctx.cpu_parallel_for) {
-                ctx.cpu_parallel_for(0, spatial_total, body);
-            } else {
-                for (int64_t i = 0; i < spatial_total; ++i) { body(i); }
-            }
+            ctx.cpu.run(0, spatial_total, body);
         }
     } else {
         // ---- Non-spatial: per-element statistics ----
@@ -151,11 +141,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
             y_ptr[i] = attrs.add_to ? y_ptr[i] + val : val;
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, total, body);
-        } else {
-            for (int64_t i = 0; i < total; ++i) { body(i); }
-        }
+        ctx.cpu.run(0, total, body);
     }
 }
 
@@ -239,13 +225,7 @@ void layer_norm_ref_impl(const NormAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < num_rows; ++i) {
-            process_row(i);
-        }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 // ============================================================
@@ -315,13 +295,7 @@ void rms_norm_ref_impl(const NormAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < num_rows; ++i) {
-            process_row(i);
-        }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 // ============================================================
@@ -385,13 +359,7 @@ void l2_norm_ref_impl(const NormAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < num_rows; ++i) {
-            process_row(i);
-        }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 // ============================================================
@@ -493,13 +461,7 @@ void group_norm_ref_impl(const NormAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total_groups, process_group);
-    } else {
-        for (int64_t i = 0; i < total_groups; ++i) {
-            process_group(i);
-        }
-    }
+    ctx.cpu.run(0, total_groups, process_group);
 }
 
 }  // anonymous namespace

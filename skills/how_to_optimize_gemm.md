@@ -263,7 +263,7 @@ Beta scaling (`C = A×B + beta×C`) is fused into the first k-block (`tile_scale
 
 ## 7. Multithreading
 
-The tiled kernel is parallelized through `ctx.cpu_parallel_for` at **tile-block**
+The tiled kernel is parallelized through `ctx.cpu.run` at **tile-block**
 granularity (not bare rows): N-split produces `ceil(N/nc)` blocks.
 
 - **Split dimension** is always N-split (BLIS convention) — there is no M-split

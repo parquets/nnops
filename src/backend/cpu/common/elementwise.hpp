@@ -5,7 +5,7 @@
 ///        dequantize → op → quantize path.
 ///
 /// The four operators share the same shape: a pitch-aware row loop tiled into
-/// groups of TILE_M rows, dispatched via `ComputeContext::cpu_parallel_for`,
+/// groups of TILE_M rows, dispatched via `ComputeContext::cpu.parallel_for`,
 /// plus (for Activation/Unary/Eltwise) a quantized path that dequantizes the
 /// int input(s) to f32, runs the float op, and requantizes the result. This
 /// header is the single source of truth for that boilerplate; each operator
@@ -46,16 +46,10 @@ namespace quant_kernel = aarch64;
 
 /// Run `body(i)` for i in [0, count) — parallelized when a hook is installed,
 /// sequential otherwise. The canonical replacement for the per-operator
-/// `if (ctx.cpu_parallel_for) ... else ...` idiom.
+/// `ctx.cpu.run(0, count, body)` idiom.
 inline void run_parallel(const ComputeContext& ctx, int64_t count,
                          const ParallelForBody& body) {
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, count, body);
-    } else {
-        for (int64_t i = 0; i < count; ++i) {
-            body(i);
-        }
-    }
+    ctx.cpu.run(0, count, body);
 }
 
 /// Row-major view of a pitch-aware tensor: `num_rows` logical rows of

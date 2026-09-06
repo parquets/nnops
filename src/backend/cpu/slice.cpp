@@ -8,7 +8,7 @@
 ///      memcpy per output row — optimal.
 ///   2. General n-D: scalar strided copy, parallel over outer dims.
 ///
-/// Both paths use cpu_parallel_for over outer-row index.
+/// Both paths use ctx.cpu.run over outer-row index.
 
 #include "nnops/ops/slice.hpp"
 #include "nnops/detail/assert.hpp"
@@ -107,14 +107,7 @@ void slice_impl(const SliceAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, outer_total, body);
-    }
-    else {
-        for (int64_t o = 0; o < outer_total; ++o) {
-            body(o);
-        }
-    }
+    ctx.cpu.run(0, outer_total, body);
 }
 
 }  // anonymous namespace

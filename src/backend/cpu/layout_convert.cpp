@@ -12,7 +12,7 @@
 /// Partial (trailing) C8 blocks are zero-padded on pack and truncated on unpack.
 ///
 /// Parallelism: flattens N * ceil(C/8) * [D] * H into a single loop of
-/// independent rows dispatched via ctx.cpu_parallel_for; falls back to
+/// independent rows dispatched via ctx.cpu.run; falls back to
 /// sequential otherwise. 2D: N*C8*H rows; 3D: N*C8*D*H rows.
 
 #include "backend/cpu/layout_convert.hpp"
@@ -75,11 +75,7 @@ void pack_impl(const TensorView& src, TensorView& dst,
         k::layout_pack_row<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < total_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, total_rows, process_row);
 }
 
 // ============================================================
@@ -124,11 +120,7 @@ void unpack_impl(const TensorView& src, TensorView& dst,
         k::layout_unpack_row<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < total_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, total_rows, process_row);
 }
 
 }  // anonymous namespace
@@ -183,11 +175,7 @@ void pack_impl_q(const TensorView& src, TensorView& dst,
         k::layout_pack_row_byte<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C, pad_val);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < total_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, total_rows, process_row);
 }
 
 template <typename T>
@@ -227,11 +215,7 @@ void unpack_impl_q(const TensorView& src, TensorView& dst,
         k::layout_unpack_row_byte<T>(in_row, out_row, W, c_base, ch_stride, valid_lanes, C);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < total_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, total_rows, process_row);
 }
 
 }  // anonymous namespace

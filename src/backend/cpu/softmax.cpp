@@ -144,14 +144,7 @@ void softmax_general(
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, outer_size, process_row);
-    }
-    else {
-        for (int64_t i = 0; i < outer_size; ++i) {
-            process_row(i);
-        }
-    }
+    ctx.cpu.run(0, outer_size, process_row);
 }
 
 
@@ -202,14 +195,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_rows, process_row);
-        }
-        else {
-            for (int64_t r = 0; r < num_rows; ++r) {
-                process_row(r);
-            }
-        }
+        ctx.cpu.run(0, num_rows, process_row);
 
         return;
     }
@@ -250,14 +236,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 C8, pack, valid_lanes, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_spatial, process_pos);
-        }
-        else {
-            for (int64_t i = 0; i < num_spatial; ++i) {
-                process_pos(i);
-            }
-        }
+        ctx.cpu.run(0, num_spatial, process_pos);
 
         return;
     }
@@ -294,14 +273,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 D, axis_stride, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_positions, process_pos);
-        }
-        else {
-            for (int64_t i = 0; i < num_positions; ++i) {
-                process_pos(i);
-            }
-        }
+        ctx.cpu.run(0, num_positions, process_pos);
 
         return;
     }
@@ -324,14 +296,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
                 x_ptr + row * group_stride, y_ptr + row * group_stride, D, log_softmax, inv_T);
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_rows, process_row);
-        }
-        else {
-            for (int64_t row = 0; row < num_rows; ++row) {
-                process_row(row);
-            }
-        }
+        ctx.cpu.run(0, num_rows, process_row);
 
         return;
     }

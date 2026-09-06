@@ -93,14 +93,8 @@ void conv2d_ref(const Conv2DAttributes& attrs,
     };
 
     // Parallel dispatch
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N,
+    ctx.cpu.run(0, N,
             [&](int64_t n) { compute_sample(n); });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            compute_sample(n);
-        }
-    }
 }
 
 }  // namespace nnops::backend::cpu::reference

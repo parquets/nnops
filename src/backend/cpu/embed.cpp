@@ -5,7 +5,7 @@
 /// per-row dequantization: output[j] = (weight[idx,j] - zp[idx]) * scale[idx].
 ///
 /// The core operation is copying (f32/f16) or dequantizing (int8) embedding
-/// rows, parallelized over indices via cpu_parallel_for.
+/// rows, parallelized over indices via ctx.cpu.run.
 ///
 /// For int8/uint8 dequantization, the per-row arithmetic is delegated to the
 /// raw arch kernels in `x86_64/quant.hpp` / `aarch64/quant.hpp`
@@ -89,14 +89,7 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
                     row_bytes);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_indices, body);
-    }
-    else {
-        for (int64_t n = 0; n < num_indices; ++n) {
-            body(n);
-        }
-    }
+    ctx.cpu.run(0, num_indices, body);
 }
 
 // ============================================================
@@ -170,14 +163,7 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_indices, body);
-    }
-    else {
-        for (int64_t n = 0; n < num_indices; ++n) {
-            body(n);
-        }
-    }
+    ctx.cpu.run(0, num_indices, body);
 }
 
 }  // anonymous namespace

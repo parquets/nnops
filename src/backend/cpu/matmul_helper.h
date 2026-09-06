@@ -172,7 +172,7 @@ inline void resolve_tile_sizes(int M, int N, int mr_max, int nr_max, int kc,
 // =========================================================================
 //
 // The GEMM is split on its larger dimension (N when N > M, else M) and the
-// blocks are handed to ctx.cpu_parallel_for as equal contiguous slabs. The
+// blocks are handed to ctx.cpu.run as equal contiguous slabs. The
 // block count is ceil(larger / mc), one slab per A-panel tile — deliberately
 // coarser than MLAS's complexity/64K target-thread formula (Complexity / 64K +
 // 1 clamped to the pool size). Finer blocks do not help in practice: the GEMM

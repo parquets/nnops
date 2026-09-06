@@ -3,7 +3,7 @@
 ///
 /// Supports both f32 and f16 via a single templated implementation.
 /// Processing is tiled in groups of 32 rows and dispatched via
-/// ComputeContext::cpu_parallel_for when available.
+/// ComputeContext::cpu.parallel_for when available.
 ///
 /// Core operation: v_max(v_min(x, max_val), min_val) — 2 SIMD instructions.
 

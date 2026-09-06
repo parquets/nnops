@@ -118,20 +118,12 @@ void dwconv_impl_2d_ref(const DepthwiseConvAttributes& attrs,
     };
 
     const int64_t NC = N * C;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NC,
+    ctx.cpu.run(0, NC,
             [&](int64_t tid) {
                 int64_t n = tid / C;
                 int64_t c = tid % C;
                 compute_channel(n, c);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
-                compute_channel(n, c);
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -238,20 +230,12 @@ void dwconv_impl_3d_ref(const DepthwiseConvAttributes& attrs,
     };
 
     const int64_t NC = N * C;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NC,
+    ctx.cpu.run(0, NC,
             [&](int64_t tid) {
                 int64_t n = tid / C;
                 int64_t c = tid % C;
                 compute_channel(n, c);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
-                compute_channel(n, c);
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -353,20 +337,12 @@ void dwconv_impl_2d_ref_quant(const DepthwiseConvAttributes& attrs,
     };
 
     const int64_t NC = N * C;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NC,
+    ctx.cpu.run(0, NC,
             [&](int64_t tid) {
                 int64_t n = tid / C;
                 int64_t c = tid % C;
                 compute_channel(n, c);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
-                compute_channel(n, c);
-            }
-        }
-    }
 }
 
 template <typename InT, typename OutT>
@@ -486,20 +462,12 @@ void dwconv_impl_3d_ref_quant(const DepthwiseConvAttributes& attrs,
     };
 
     const int64_t NC = N * C;
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NC,
+    ctx.cpu.run(0, NC,
             [&](int64_t tid) {
                 int64_t n = tid / C;
                 int64_t c = tid % C;
                 compute_channel(n, c);
             });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c = 0; c < C; ++c) {
-                compute_channel(n, c);
-            }
-        }
-    }
 }
 
 // ============================================================

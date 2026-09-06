@@ -52,14 +52,8 @@ void linear_ref(const LinearAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, M,
+    ctx.cpu.run(0, M,
             [&](int64_t m) { compute_row(m); });
-    } else {
-        for (int64_t m = 0; m < M; ++m) {
-            compute_row(m);
-        }
-    }
 }
 
 }  // namespace nnops::backend::cpu::reference

@@ -48,7 +48,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Input:** `[N, C, IH, IW]`, weight `[C, 1, KH, KW]`, optional bias `[C]`
 - **Output:** `[N, C, OH, OW]` (NCHW layout)
 - **Formula:** Per-channel convolution — each input channel is convolved with its own independent KH×KW filter. No cross-channel mixing.
-- **CPU SIMD Kernel** (`src/backend/cpu/depthwise_conv2d.cpp`): Height-4 blocking (process 4 output rows simultaneously to reuse kernel weights), width SIMD via `simd_lane_for<T>` (8 lanes), region splitting (pad regions → scalar, interior → SIMD), kernel weight pre-load into registers, N×C parallel via `cpu_parallel_for`. Falls back to reference when SIMD unavailable.
+- **CPU SIMD Kernel** (`src/backend/cpu/depthwise_conv2d.cpp`): Height-4 blocking (process 4 output rows simultaneously to reuse kernel weights), width SIMD via `simd_lane_for<T>` (8 lanes), region splitting (pad regions → scalar, interior → SIMD), kernel weight pre-load into registers, N×C parallel via `ctx.cpu.run`. Falls back to reference when SIMD unavailable.
 - **Data types:** f32 and f16 (templated `depthwise_conv2d_impl<T>`, dtype dispatch at entry)
 - **CUDA Kernel** ([depthwise_conv2d.cu](src/backend/cuda/depthwise_conv2d.cu)): Grid = N×C blocks, one per (sample, channel). Epilogue fusion via `device_apply_epilogue()` supporting all 8 activation types. Handles stride, dilation, padding. Optional bias. Supports add_to.
 - **Design reference:** nn_compute depthwise_conv (h4 blocking + w8 SIMD), onnxruntime MLAS sconv_nchw_depthwise (3×3 kernel specialization), ARM ComputeLibrary NEDepthwiseConvolutionLayer (stride/dilation handling)
@@ -144,7 +144,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Output:** Y `[*]`
 - **Formula:** `y = (x - mean) / sqrt(var + epsilon) * scale + bias`
 - **Algorithm:** Two-pass SIMD: Pass 1 — SIMD reduction (sum, sum_sq) using typed SIMD API, then scalar tail uses Welford's online algorithm for numerical stability, merged via parallel Welford formula (Chan et al.); Pass 2 — normalize with scale/bias using typed SIMD + scalar tail. Fast path for contiguous tail (axis == rank-1, the 99% LLM case); general axis falls back to full Welford scalar pass with pre-computed inner offsets.
-- **SIMD Kernel** (`src/backend/cpu/layer_norm.cpp`): Templated `layer_norm_impl<T>`, dtype dispatch at entry. Both passes use the generic typed API. Parallel dispatch over num_rows via `cpu_parallel_for`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
+- **SIMD Kernel** (`src/backend/cpu/layer_norm.cpp`): Templated `layer_norm_impl<T>`, dtype dispatch at entry. Both passes use the generic typed API. Parallel dispatch over num_rows via `ctx.cpu.run`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
 - **Data types:** f32 and f16
 - **Reference:** onnxruntime `MlasLayerNormF32` / `ComputeJobGenericShared`
 - **Added:** 2026-07-22
@@ -171,7 +171,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Output:** Y `[*]` (same shape as input)
 - **Formula:** `softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))`, `log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))`
 - **Algorithm (per row, mirrors onnxruntime):** Three-stage pipeline — (1) ReduceMax: SIMD `v_max` reduction + scalar tail → max_val; (2) ComputeSumExp: SIMD `v_exp` on `(x - max)` + reduce sum, with exp values stored to output for reuse (avoids recomputing exp in normalization pass); (3) Normalize: softmax = exp/sum via SIMD multiply, or log_softmax = `(x - max) - log(sum)`. Fast path for axis == rank-1 (contiguous last dim, the 99% LLM attention case); general axis falls back to scalar path with pre-computed inner offsets.
-- **SIMD Kernel** (`src/backend/cpu/softmax.cpp`): Templated `softmax_impl<T>`, dtype dispatch at entry. All three passes use the generic typed API (`v_load`/`v_store`/`v_max`/`v_exp`/`v_add`/`v_mul`/`v_set1`/`v_reduce_sum`/`s_load`/`s_store`). `reduce_max_vec` helper reduces SIMD max vector to scalar via temp store+scan (the SIMD layer has `v_reduce_sum` but no `v_reduce_max`). Parallel dispatch over num_rows via `cpu_parallel_for`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
+- **SIMD Kernel** (`src/backend/cpu/softmax.cpp`): Templated `softmax_impl<T>`, dtype dispatch at entry. All three passes use the generic typed API (`v_load`/`v_store`/`v_max`/`v_exp`/`v_add`/`v_mul`/`v_set1`/`v_reduce_sum`/`s_load`/`s_store`). `reduce_max_vec` helper reduces SIMD max vector to scalar via temp store+scan (the SIMD layer has `v_reduce_sum` but no `v_reduce_max`). Parallel dispatch over num_rows via `ctx.cpu.run`. Pitch-aware via `row_stride_elems()` / `stride_elems()`.
 - **Data types:** f32 and f16
 - **Reference:** onnxruntime `MlasComputeSoftmax` / `MlasReduceMaximumF32Kernel` / `MlasComputeSumExpF32Kernel` / `MlasComputeSoftmaxOutputF32Kernel`
 - **Added:** 2026-07-22
@@ -183,7 +183,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Input (1):** X `[*]` (any rank >= 1)
 - **Output:** Y `[*]` (same shape as input)
 - **Formula:** Inclusive: `output[i] = sum(input[0..i])`, Exclusive: `output[0] = 0, output[i] = sum(input[0..i-1])`. Reverse: sum from last element backward.
-- **Algorithm:** Tensor decomposed along axis into upper/lower dim groups. Each independent scan vector runs sequentially along axis. CPU reference uses `cpu_parallel_for` over upper slices. CUDA kernel uses one block per upper slice, one thread per lower-dim position, sequential scan per thread.
+- **Algorithm:** Tensor decomposed along axis into upper/lower dim groups. Each independent scan vector runs sequentially along axis. CPU reference uses `ctx.cpu.run` over upper slices. CUDA kernel uses one block per upper slice, one thread per lower-dim position, sequential scan per thread.
 - **Data types:** f32 and f16 (CPU reference f32 only; CUDA supports both)
 - **add_to:** Removed 2026-07-25 — this operator no longer supports output accumulation.
 - **Added:** 2026-07-20 (CPU reference), 2026-07-23 (CUDA)

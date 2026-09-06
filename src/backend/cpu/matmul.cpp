@@ -11,7 +11,7 @@
 ///
 /// GEMMs below GEMM_FAST_PATH_THRESHOLD MACs skip the tiled path entirely and
 /// go straight to the reference. Work is split on the larger dimension (N when
-/// N > M, else M — mirroring MLAS) through ctx.cpu_parallel_for (serial
+/// N > M, else M — mirroring MLAS) through ctx.cpu.run (serial
 /// fallback otherwise); C tiles are disjoint and there are no reductions, so
 /// the result is bit-identical to serial.
 ///
@@ -310,13 +310,7 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                                           Mi, Ki, kc, mc, n, actual_nc,
                                           pack_a, pack_b_slice);
             };
-            if (ctx.cpu_parallel_for) {
-                ctx.cpu_parallel_for(0, num_blocks, run_block);
-            } else {
-                for (int64_t blk = 0; blk < num_blocks; ++blk) {
-                    run_block(blk);
-                }
-            }
+            ctx.cpu.run(0, num_blocks, run_block);
         } else {
             // M-split: pack B once per k-block (full N), then parallelize the M
             // rows into equal contiguous slabs. Mirrors MLAS's "M >= N →
@@ -341,13 +335,7 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                                        m_start, m_end - m_start, mc,
                                        0, Ni, k, actual_kc, last_k, pack_a, pack_b);
                 };
-                if (ctx.cpu_parallel_for) {
-                    ctx.cpu_parallel_for(0, num_m_blocks, run_m);
-                } else {
-                    for (int64_t blk = 0; blk < num_m_blocks; ++blk) {
-                        run_m(blk);
-                    }
-                }
+                ctx.cpu.run(0, num_m_blocks, run_m);
             }
         }
     }
@@ -607,13 +595,7 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
                                   Mi, Ki, kc, mc, n, actual_nc, pack_b_slice);
             };
 
-            if (ctx.cpu_parallel_for) {
-                ctx.cpu_parallel_for(0, num_blocks, run_block);
-            } else {
-                for (int64_t blk = 0; blk < num_blocks; ++blk) {
-                    run_block(blk);
-                }
-            }
+            ctx.cpu.run(0, num_blocks, run_block);
         } else {
             // M-split: pack B once per k-block (full N), then parallelize the M
             // rows into equal contiguous slabs. Mirrors MLAS's "M >= N →
@@ -637,13 +619,7 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
                                        m_start, m_end - m_start, mc,
                                        0, Ni, k, actual_kc, pack_b_base);
                 };
-                if (ctx.cpu_parallel_for) {
-                    ctx.cpu_parallel_for(0, num_m_blocks, run_m);
-                } else {
-                    for (int64_t blk = 0; blk < num_m_blocks; ++blk) {
-                        run_m(blk);
-                    }
-                }
+                ctx.cpu.run(0, num_m_blocks, run_m);
             }
         }
 

@@ -2,7 +2,7 @@
 /// @brief Tiled im2col + direct GEMM Conv2D kernel (planar NCHW, f32 / f16).
 ///
 /// Algorithm (ported from nn_compute im2col_gemm_conv2d_impl):
-///   For each (batch, group) — parallel via ctx.cpu_parallel_for:
+///   For each (batch, group) — parallel via ctx.cpu.run:
 ///     For each oh-block of the output plane:
 ///       For each ic-block:
 ///         im2col the input block into a scratch matrix [K=icnc*karea][N=ohc*OW]
@@ -266,13 +266,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NG, run_ng);
-    } else {
-        for (int64_t ng = 0; ng < NG; ++ng) {
-            run_ng(ng);
-        }
-    }
+    ctx.cpu.run(0, NG, run_ng);
 }
 
 }  // anonymous namespace

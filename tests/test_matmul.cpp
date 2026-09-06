@@ -1235,18 +1235,26 @@ make_padded_f32(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) 
     return {std::move(buf), tv};
 }
 
-// Minimal fixed-size thread pool injecting cpu_parallel_for. Items in
-// [begin, end) are claimed via an atomic counter; each worker runs body(i)
-// until the range is exhausted.
+// Minimal fixed-size thread pool exposing a CpuBackend. Items in [begin, end)
+// are claimed via an atomic counter; each worker runs body(i) until the range
+// is exhausted. Exposes parallel_for + num_threads + thread_id for injection
+// into ComputeContext.
 struct SimplePool {
-    explicit SimplePool(int nthreads) : nthreads_(nthreads) {}
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
 
     void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
         std::atomic<int64_t> next{begin};
         std::vector<std::thread> workers;
         workers.reserve(static_cast<size_t>(nthreads_));
         for (int t = 0; t < nthreads_; ++t) {
-            workers.emplace_back([&]() {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
                 for (;;) {
                     int64_t i = next.fetch_add(1, std::memory_order_relaxed);
                     if (i >= end) { break; }
@@ -1258,6 +1266,8 @@ struct SimplePool {
     }
 
     int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
 };
 
 // ============================================================
@@ -1481,9 +1491,7 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
             // Threaded via SimplePool.
             SimplePool pool(nthreads);
             ComputeContext ctx;
-            ctx.cpu_parallel_for = [&pool](int64_t b, int64_t e, const ParallelForBody& body) {
-                pool.parallel_for(b, e, body);
-            };
+            ctx.cpu = pool.cpu;
             std::vector<float> threaded_buf(descs[0].numel());
             auto threaded_out = test::make_planar(descs[0], threaded_buf.data());
             op->compute(threaded_out, ins, ctx, nullptr);
@@ -1524,9 +1532,7 @@ NNOPS_TEST(matmul_threaded_batched) {
 
     SimplePool pool(4);
     ComputeContext ctx;
-    ctx.cpu_parallel_for = [&pool](int64_t b0, int64_t e, const ParallelForBody& body) {
-        pool.parallel_for(b0, e, body);
-    };
+    ctx.cpu = pool.cpu;
 
     std::vector<float> out_buf(descs[0].numel());
     auto output = test::make_planar(descs[0], out_buf.data());

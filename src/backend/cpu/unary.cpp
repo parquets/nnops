@@ -3,12 +3,12 @@
 ///
 /// Supports both f32 and f16 via a single templated implementation.
 /// Processing is tiled in groups of 8 rows and dispatched via
-/// ComputeContext::cpu_parallel_for when available.
+/// ComputeContext::cpu.parallel_for when available.
 ///
 /// Design:
 ///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking
 ///   2. Each tile calls into tiled_unary kernel library (lane=8, v_f32x8/v_f16x8)
-///   3. Tile iteration is parallelized via ctx.cpu_parallel_for; falls back to
+///   3. Tile iteration is parallelized via ctx.cpu.run; falls back to
 ///      sequential when no parallel hook is provided
 ///   4. Op-type dispatch lives in the shared apply_unary_flt helper
 ///

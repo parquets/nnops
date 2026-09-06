@@ -10,7 +10,7 @@
 /// is num_spatial_rows (H for 2D, D*H for 3D).
 ///
 /// All functions support f32 and f16, with optional parallel dispatch
-/// via ctx.cpu_parallel_for.
+/// via ctx.cpu.run.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"

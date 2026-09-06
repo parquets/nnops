@@ -1,7 +1,7 @@
 /// @file attention.cpp
 /// @brief Tiled multi-head scaled dot-product attention — fused QK^T + softmax + AV.
 ///
-/// For each (batch, head) — parallel via ctx.cpu_parallel_for (serial fallback):
+/// For each (batch, head) — parallel via ctx.cpu.run (serial fallback):
 ///   scores = Q @ K^T * scale   (transpose-B GEMM: K^T packed into the workspace)
 ///   scores += mask             (optional, flat [Sq, Sk] as in the reference)
 ///   attn   = softmax(scores)   (simd_softmax, per contiguous row, in-place)
@@ -226,13 +226,7 @@ void attention_impl(const AttentionAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NG, run);
-    } else {
-        for (int64_t idx = 0; idx < NG; ++idx) {
-            run(idx);
-        }
-    }
+    ctx.cpu.run(0, NG, run);
 }
 
 // ---- FlashAttention routing + tiling -------------------------------------
@@ -452,13 +446,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, NG, run);
-    } else {
-        for (int64_t idx = 0; idx < NG; ++idx) {
-            run(idx);
-        }
-    }
+    ctx.cpu.run(0, NG, run);
 }
 
 }  // anonymous namespace

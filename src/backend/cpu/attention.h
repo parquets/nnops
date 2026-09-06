@@ -2,7 +2,7 @@
 /// @file attention.h
 /// @brief Multi-head scaled dot-product attention — tiled GEMM + softmax kernel.
 ///
-/// For each (batch, head) — parallel via ctx.cpu_parallel_for:
+/// For each (batch, head) — parallel via ctx.cpu.run:
 ///   scores = Q @ K^T * scale      (transpose-B GEMM, K^T packed into pooled scratch)
 ///   scores += mask                (optional, flat [Sq, Sk] as in the reference)
 ///   attn   = softmax(scores, -1)  (simd_softmax per contiguous row)

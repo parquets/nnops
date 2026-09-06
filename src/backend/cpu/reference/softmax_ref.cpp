@@ -216,13 +216,7 @@ void softmax_ref(const SoftmaxAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, outer_size, process_row);
-    } else {
-        for (int64_t i = 0; i < outer_size; ++i) {
-            process_row(i);
-        }
-    }
+    ctx.cpu.run(0, outer_size, process_row);
 }
 
 }  // namespace nnops::backend::cpu::reference

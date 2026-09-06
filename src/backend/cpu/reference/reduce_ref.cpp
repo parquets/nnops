@@ -121,11 +121,7 @@ void reduce_ref(const ReduceAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_outer, process_outer);
-    } else {
-        for (int64_t i = 0; i < num_outer; ++i) { process_outer(i); }
-    }
+    ctx.cpu.run(0, num_outer, process_outer);
 }
 
 }  // namespace nnops::backend::cpu::reference

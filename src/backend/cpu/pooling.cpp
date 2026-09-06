@@ -121,16 +121,8 @@ void pooling_impl(const PoolingAttributes& attrs,
     };
 
     // Parallel dispatch (N * C8)
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N * C8,
+    ctx.cpu.run(0, N * C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c8 = 0; c8 < C8; ++c8) {
-                compute_c8(n, c8);
-            }
-        }
-    }
 }
 
 // ============================================================
@@ -270,16 +262,8 @@ void pooling_impl_quant(const PoolingAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, N * C8,
+    ctx.cpu.run(0, N * C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
-    } else {
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t c8 = 0; c8 < C8; ++c8) {
-                compute_c8(n, c8);
-            }
-        }
-    }
 }
 
 }  // anonymous namespace

@@ -77,13 +77,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
             }
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, upper_dim_count, process_slice);
-        } else {
-            for (int64_t i = 0; i < upper_dim_count; ++i) {
-                process_slice(i);
-            }
-        }
+        ctx.cpu.run(0, upper_dim_count, process_slice);
     } else {
         // Reverse cumulative sum (start from the end)
         const auto process_slice = [&](int64_t outer) {
@@ -113,13 +107,7 @@ void cumsum_ref(const CumSumAttributes& attrs,
             }
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, upper_dim_count, process_slice);
-        } else {
-            for (int64_t i = 0; i < upper_dim_count; ++i) {
-                process_slice(i);
-            }
-        }
+        ctx.cpu.run(0, upper_dim_count, process_slice);
     }
 }
 

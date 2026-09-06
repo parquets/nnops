@@ -76,7 +76,7 @@
 ```cpp
 struct ComputeContext {
     Backend expected_backend = Backend::CPU;  // 目标后端
-    ParallelForFn cpu_parallel_for = nullptr; // CPU 并行钩子
+    CpuBackend cpu;                           // CPU 后端: parallel_for + num_threads + thread_id
     void* cuda_stream = nullptr;              // CUDA 流
 
     // ── Vulkan 专用字段 ──

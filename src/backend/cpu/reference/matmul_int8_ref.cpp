@@ -151,13 +151,7 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
             }
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, M, [&](int64_t m) { compute_row(m); });
-        } else {
-            for (int64_t m = 0; m < M; ++m) {
-                compute_row(m);
-            }
-        }
+        ctx.cpu.run(0, M, [&](int64_t m) { compute_row(m); });
     };
 
     // ---- batch iteration ----

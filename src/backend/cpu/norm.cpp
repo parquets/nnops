@@ -137,13 +137,7 @@ void batch_norm_impl(const NormAttributes& attrs,
                     c8, pack, last_dim, attrs.add_to);
             };
 
-            if (ctx.cpu_parallel_for) {
-                ctx.cpu_parallel_for(0, num_rows, process_row);
-            } else {
-                for (int64_t r = 0; r < num_rows; ++r) {
-                    process_row(r);
-                }
-            }
+            ctx.cpu.run(0, num_rows, process_row);
 
         } else {
             int64_t sample_size = 1;
@@ -179,13 +173,7 @@ void batch_norm_impl(const NormAttributes& attrs,
                 }
             };
 
-            if (ctx.cpu_parallel_for) {
-                ctx.cpu_parallel_for(0, N, compute_sample);
-            } else {
-                for (int64_t n = 0; n < N; ++n) {
-                    compute_sample(n);
-                }
-            }
+            ctx.cpu.run(0, N, compute_sample);
         }
 
     } else {
@@ -239,11 +227,7 @@ void layer_norm_general_scalar(
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < num_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 template <typename T>
@@ -298,13 +282,7 @@ void layer_norm_impl(const NormAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, dims.num_rows, process_row);
-    } else {
-        for (int64_t row = 0; row < dims.num_rows; ++row) {
-            process_row(row);
-        }
-    }
+    ctx.cpu.run(0, dims.num_rows, process_row);
 }
 
 // ============================================================
@@ -346,11 +324,7 @@ void rms_norm_general_scalar(
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < num_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 template <typename T>
@@ -392,13 +366,7 @@ void rms_norm_impl(const NormAttributes& attrs,
             0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, dims.num_rows, process_row);
-    } else {
-        for (int64_t row = 0; row < dims.num_rows; ++row) {
-            process_row(row);
-        }
-    }
+    ctx.cpu.run(0, dims.num_rows, process_row);
 }
 
 // ============================================================
@@ -436,11 +404,7 @@ void l2_norm_general_scalar(
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t i = 0; i < num_rows; ++i) { process_row(i); }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 template <typename T>
@@ -479,13 +443,7 @@ void l2_norm_impl(const NormAttributes& attrs,
             0.0f, inv_norm, nullptr, nullptr, false, add_to);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, dims.num_rows, process_row);
-    } else {
-        for (int64_t row = 0; row < dims.num_rows; ++row) {
-            process_row(row);
-        }
-    }
+    ctx.cpu.run(0, dims.num_rows, process_row);
 }
 
 // ============================================================
@@ -573,13 +531,7 @@ void group_norm_impl(const NormAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, total_groups, process_group);
-    } else {
-        for (int64_t i = 0; i < total_groups; ++i) {
-            process_group(i);
-        }
-    }
+    ctx.cpu.run(0, total_groups, process_group);
 }
 
 }  // anonymous namespace

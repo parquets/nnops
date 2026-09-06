@@ -37,6 +37,7 @@ set(TEST_SOURCES
     test_flatten.cpp
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
+    test_cpu_backend.cpp
 )
 
 # Vulkan tests (only when Vulkan backend is enabled)

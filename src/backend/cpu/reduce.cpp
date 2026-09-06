@@ -56,13 +56,7 @@ void reduce_packed_simd(const ReduceAttributes& attrs,
             x_ptr + r * x_rs, y_ptr + r * pack, D, pack, attrs.type, inv_D);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            process_row(r);
-        }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 // ============================================================
@@ -97,11 +91,7 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
         s_store(&y_ptr[row], result);
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, process_row);
-    } else {
-        for (int64_t row = 0; row < num_rows; ++row) { process_row(row); }
-    }
+    ctx.cpu.run(0, num_rows, process_row);
 }
 
 // ============================================================
@@ -176,11 +166,7 @@ void reduce_inner_contiguous_simd(const ReduceAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_outer, process_outer);
-    } else {
-        for (int64_t i = 0; i < num_outer; ++i) { process_outer(i); }
-    }
+    ctx.cpu.run(0, num_outer, process_outer);
 }
 
 // ============================================================
@@ -273,11 +259,7 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
         }
     };
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_outer, process_outer);
-    } else {
-        for (int64_t i = 0; i < num_outer; ++i) { process_outer(i); }
-    }
+    ctx.cpu.run(0, num_outer, process_outer);
 }
 
 }  // anonymous namespace
@@ -360,14 +342,7 @@ void reduce_impl(const ReduceAttributes& attrs,
                 chan_stride, C8, pack, valid_lanes, attrs.type, inv_total);
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_spatial, process_pos);
-        }
-        else {
-            for (int64_t i = 0; i < num_spatial; ++i) {
-                process_pos(i);
-            }
-        }
+        ctx.cpu.run(0, num_spatial, process_pos);
 
         return;
     }
@@ -422,14 +397,7 @@ void reduce_impl(const ReduceAttributes& attrs,
                 axis_stride, D, pack, attrs.type, inv_D);
         };
 
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, num_positions, process_pos);
-        }
-        else {
-            for (int64_t i = 0; i < num_positions; ++i) {
-                process_pos(i);
-            }
-        }
+        ctx.cpu.run(0, num_positions, process_pos);
 
         return;
     }

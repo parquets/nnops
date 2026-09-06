@@ -68,14 +68,8 @@ static void element_wise_compute(TensorView& output,
         const auto write = [&](int64_t i, float v) {
             out_ptr[i] = add_to ? out_ptr[i] + v : v;
         };
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, N,
+        ctx.cpu.run(0, N,
                 [&](int64_t idx) { write(idx, func(in_ptr[idx])); });
-        } else {
-            for (int64_t i = 0; i < N; ++i) {
-                write(i, func(in_ptr[i]));
-            }
-        }
         return;
     }
 
@@ -87,8 +81,7 @@ static void element_wise_compute(TensorView& output,
     const auto* in_ptr  = input.ptr<float>();
     auto* out_ptr = output.ptr<float>();
 
-    if (ctx.cpu_parallel_for) {
-        ctx.cpu_parallel_for(0, num_rows, [&](int64_t r) {
+    ctx.cpu.run(0, num_rows, [&](int64_t r) {
             const float* in_row = in_ptr + r * in_rs;
             float* out_row = out_ptr + r * out_rs;
             for (int64_t i = 0; i < last_dim; ++i) {
@@ -96,16 +89,6 @@ static void element_wise_compute(TensorView& output,
                 out_row[i] = add_to ? out_row[i] + v : v;
             }
         });
-    } else {
-        for (int64_t r = 0; r < num_rows; ++r) {
-            const float* in_row = in_ptr + r * in_rs;
-            float* out_row = out_ptr + r * out_rs;
-            for (int64_t i = 0; i < last_dim; ++i) {
-                float v = func(in_row[i]);
-                out_row[i] = add_to ? out_row[i] + v : v;
-            }
-        }
-    }
 }
 
 void activation_ref(const ActivationAttributes& attrs,

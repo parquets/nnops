@@ -172,13 +172,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
                                           src_ptr + o * dec.D * dec.inner, static_cast<int>(dec.inner),
                                           s_f32.data(), z_f32.data());
         };
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, dec.outer, process);
-        } else {
-            for (int64_t o = 0; o < dec.outer; ++o) {
-                process(o);
-            }
-        }
+        ctx.cpu.run(0, dec.outer, process);
     };
 
     if (out_dtype == DataType::s8) {
@@ -287,13 +281,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
                                             src + o * dec.D * dec.inner, static_cast<int>(dec.inner),
                                             s_f32.data(), z_f32.data());
         };
-        if (ctx.cpu_parallel_for) {
-            ctx.cpu_parallel_for(0, dec.outer, process);
-        } else {
-            for (int64_t o = 0; o < dec.outer; ++o) {
-                process(o);
-            }
-        }
+        ctx.cpu.run(0, dec.outer, process);
     };
 
     if (in_dtype == DataType::s8) {
