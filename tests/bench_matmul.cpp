@@ -6,7 +6,6 @@
 /// strides. For each case the harness reports:
 ///   - the pack_a decision,
 ///   - the resolved tile sizes (mc, nc) and split block count,
-///   - the workspace size,
 ///   - GFLOPS at 1, 2, 4, 8 and hardware threads.
 ///
 /// The point is to see where block-granularity threading scales (and where it
@@ -111,7 +110,6 @@ struct GeMMReport {
     bool pack_a, pack_b;
     int mc, nc;
     int64_t num_blocks;
-    size_t workspace_bytes;
     std::vector<int> threads;
     std::vector<double> gflops;
 };
@@ -148,7 +146,6 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
                             mr_max, nr_max, kc, static_cast<int>(sizeof(T)), mc, nc);
     const int64_t num_blocks = (c.N + nc - 1) / nc;
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_planar(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
@@ -162,7 +159,6 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     rep.mc = mc;
     rep.nc = nc;
     rep.num_blocks = num_blocks;
-    rep.workspace_bytes = workspace.size();
     rep.threads = threads;
 
     for (int nt : threads) {
@@ -175,12 +171,12 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
 
         // Warm-up (also faults/allocates pages).
         for (int i = 0; i < 2; ++i) {
-            op->compute(output, ins, use_ctx, workspace.data());
+            op->compute(output, ins, use_ctx, nullptr);
         }
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < iters; ++i) {
-            op->compute(output, ins, use_ctx, workspace.data());
+            op->compute(output, ins, use_ctx, nullptr);
         }
         auto end = std::chrono::high_resolution_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -193,9 +189,9 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
 
 void print_report(const GeMMReport& r) {
     std::printf("  %s\n", r.name);
-    std::printf("    route=%-12s pack_a=%d pack_b=%d  mc=%d nc=%d  blocks=%lld  ws=%zu B\n",
+    std::printf("    route=%-12s pack_a=%d pack_b=%d  mc=%d nc=%d  blocks=%lld\n",
                 r.route, (int)r.pack_a, (int)r.pack_b, r.mc, r.nc,
-                static_cast<long long>(r.num_blocks), r.workspace_bytes);
+                static_cast<long long>(r.num_blocks));
 
     const double g1 = r.gflops.empty() ? 0.0 : r.gflops[0];
     std::printf("    ");
@@ -247,7 +243,6 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
                             cpu::MR_MAX_I8, cpu::NR_MAX_I8, cpu::KC_I8, 1, mc, nc);
     const int64_t num_blocks = (c.N + nc - 1) / nc;
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     std::vector<int32_t> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_planar(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
@@ -261,7 +256,6 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     rep.mc = mc;
     rep.nc = nc;
     rep.num_blocks = num_blocks;
-    rep.workspace_bytes = workspace.size();
     rep.threads = threads;
 
     for (int nt : threads) {
@@ -273,12 +267,12 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
         for (int i = 0; i < 2; ++i) {
-            op->compute(output, ins, use_ctx, workspace.data());
+            op->compute(output, ins, use_ctx, nullptr);
         }
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < iters; ++i) {
-            op->compute(output, ins, use_ctx, workspace.data());
+            op->compute(output, ins, use_ctx, nullptr);
         }
         auto end = std::chrono::high_resolution_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(end - start).count();

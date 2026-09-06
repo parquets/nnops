@@ -15,7 +15,8 @@
 /// semantics (epilogue applied to bias + Σ, then added to the pre-existing
 /// output), preserving the original tile in a scratch buffer when needed.
 ///
-/// Workspace layout (per (batch, group) slice, reused across oh-blocks):
+/// Scratch layout (pooled internally; per (batch, group) slice, reused across
+/// oh-blocks):
 ///   [col_data : icn_block*karea*oh_block*out_w]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
 ///
@@ -33,17 +34,16 @@ namespace nnops::backend::cpu {
 
 /// Tiled im2col + direct GEMM Conv2D kernel (f32 / f16, planar NCHW).
 ///
-/// Falls back to the reference kernel for f32 when @p workspace is null or the
-/// dtypes do not match (the reference is f32-only; f16 requires a workspace).
-/// The caller must provide @p workspace of at least
-/// conv2d_im2col_get_workspace_size() bytes.
+/// Falls back to the reference kernel for f32 when the dtypes do not match (the
+/// reference is f32-only). Scratch is pooled internally (sized by
+/// conv2d_im2col_get_workspace_size); @p workspace is vestigial.
 void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
                           void* workspace);
 
-/// Workspace bytes required by conv2d_im2col_kernel for the given descriptors.
+/// Scratch bytes pooled by conv2d_im2col_kernel for the given descriptors.
 ///
 /// Returns 0 for unsupported dtypes (f32/f16 only, all tensors matching).
 size_t conv2d_im2col_get_workspace_size(const Conv2DAttributes& attrs,

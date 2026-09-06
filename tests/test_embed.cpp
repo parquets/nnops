@@ -521,11 +521,8 @@ NNOPS_TEST(embed_int8_output_f16) {
     std::vector<half> out_buf(static_cast<size_t>(2 * D));
     TensorView output = test::make_planar(descs[0], out_buf.data());
 
-    const TensorDesc out_arr[] = {descs[0]};
-    std::vector<char> workspace(op->getWorkspaceSize(in_arr, out_arr));
-
     const TensorView ins[] = {weight, indices};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     // Index 0: [0,20,40,60] * 0.1 = [0,2,4,6]
     NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[0]), 0.0f, 1e-3f);

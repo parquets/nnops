@@ -67,9 +67,9 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// Workspace (bytes) required for quantized input (s8/u8): a contiguous
-    /// f32 dequantization scratch, per-row scale/zero_point, and (for f16
-    /// output) a f32 staging buffer. Returns 0 for float input.
+    /// Always 0: the quantized (s8/u8) dequantization scratch, per-row
+    /// scale/zero_point, and (for f16 output) f32 staging buffer are pooled
+    /// internally by the CPU kernel.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 

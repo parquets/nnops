@@ -135,18 +135,13 @@ NNOPS_TEST(causal_attention_first_token) {
     NNOPS_EXPECT_EQ(descs.size(), size_t(1));
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(1));
 
-    // Verify workspace
-    size_t ws_size = op->getWorkspaceSize(desc_arr, descs);
-    NNOPS_EXPECT_EQ(ws_size, size_t(B * H * 1 * (max_len + 1)) * sizeof(float));
-
     int64_t pos_buf = 0, len_buf = 0;
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    std::vector<char> workspace(ws_size);
     const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
     TensorView outs[] = {output, k_cache, v_cache};
-    op->compute(outs, ins, {}, workspace.data());
+    op->compute(outs, ins, {}, nullptr);
 
     // Output should equal V_new (softmax over 1 element = identity)
     const float* v_ptr = v_tv.ptr<float>();
@@ -186,14 +181,11 @@ NNOPS_TEST(causal_attention_two_steps_f32) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     // Step 1
     {
         const TensorView ins[] = {q1, k1, v1, cache_pos, cache_len};
         TensorView outs[] = {output, k_cache, v_cache};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
     for (int64_t d = 0; d < D; ++d) {
         NNOPS_EXPECT_NEAR(out[d], v1_v[d], 1e-5f);
@@ -209,7 +201,7 @@ NNOPS_TEST(causal_attention_two_steps_f32) {
     {
         const TensorView ins[] = {q2, k2, v2, cache_pos, cache_len};
         TensorView outs[] = {output, k_cache, v_cache};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
 
     // Q2·K1=0, Q2·K2=1: softmax([0,1]) → [e^0/(e^0+e^1), e^1/(e^0+e^1)]
@@ -250,12 +242,9 @@ NNOPS_TEST(causal_attention_chunk_prefill) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * Sq * (max_len + Sq) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     const TensorView ins[] = {q, k, v, cache_pos, cache_len};
     TensorView outs[] = {output, k_cache, v_cache};
-    op->compute(outs, ins, {}, workspace.data());
+    op->compute(outs, ins, {}, nullptr);
 
     // Row 0 (i=0): Q[0]=[1,0], K[0]=[1,0], K[1]=[0,1]
     //   scores: dot(Q[0],K[0])=1, dot(Q[0],K[1])=0
@@ -316,20 +305,17 @@ NNOPS_TEST(causal_attention_f16_cache) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     // f32 reference
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {output_f32, k_cache_f32, v_cache_f32};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
     // f16 cache
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {output_f16, k_cache_f16, v_cache_f16};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
 
     for (size_t i = 0; i < out_f32.size(); ++i) {
@@ -365,12 +351,9 @@ NNOPS_TEST(causal_attention_multi_head) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
     TensorView outs[] = {output, k_cache, v_cache};
-    op->compute(outs, ins, {}, workspace.data());
+    op->compute(outs, ins, {}, nullptr);
 
     for (size_t i = 0; i < out.size(); ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(out[i]));
@@ -406,12 +389,9 @@ NNOPS_TEST(causal_attention_multi_batch) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
     TensorView outs[] = {output, k_cache, v_cache};
-    op->compute(outs, ins, {}, workspace.data());
+    op->compute(outs, ins, {}, nullptr);
 
     for (size_t i = 0; i < out.size(); ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(out[i]));
@@ -457,18 +437,15 @@ NNOPS_TEST(causal_attention_temperature) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * Sq * (max_len + Sq) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o1, kc1, vc1};
-        op_t1->compute(outs, ins, {}, workspace.data());
+        op_t1->compute(outs, ins, {}, nullptr);
     }
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o2, kc2, vc2};
-        op_t2->compute(outs, ins, {}, workspace.data());
+        op_t2->compute(outs, ins, {}, nullptr);
     }
 
     // T=2.0 gives softer distribution — results should differ
@@ -513,18 +490,15 @@ NNOPS_TEST(causal_attention_auto_scale) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o_a, kc_a, vc_a};
-        op_a->compute(outs, ins, {}, workspace.data());
+        op_a->compute(outs, ins, {}, nullptr);
     }
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o_e, kc_e, vc_e};
-        op_e->compute(outs, ins, {}, workspace.data());
+        op_e->compute(outs, ins, {}, nullptr);
     }
 
     for (size_t i = 0; i < out1.size(); ++i) {
@@ -576,18 +550,15 @@ NNOPS_TEST(causal_attention_int8_cache) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o_f32, kc_f32_tv, vc_f32_tv};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o_i8, kc_i8, vc_i8};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
 
     for (size_t i = 0; i < out_f32.size(); ++i) {
@@ -637,18 +608,15 @@ NNOPS_TEST(causal_attention_bf16_cache) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * 1 * (max_len + 1) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o_f32, kc_f32_tv, vc_f32_tv};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
     {
         const TensorView ins[] = {q_tv, k_tv, v_tv, cache_pos, cache_len};
         TensorView outs[] = {o_bf16, kc_bf16, vc_bf16};
-        op->compute(outs, ins, {}, workspace.data());
+        op->compute(outs, ins, {}, nullptr);
     }
 
     for (size_t i = 0; i < out_f32.size(); ++i) {
@@ -732,12 +700,9 @@ NNOPS_TEST(causal_attention_chunk_with_past) {
     auto cache_pos = make_scalar_i64(pos_buf);
     auto cache_len = make_scalar_i64(len_buf);
 
-    size_t ws_size = B * H * Sq * (max_len + Sq) * sizeof(float);
-    std::vector<char> workspace(ws_size);
-
     const TensorView ins[] = {q, k, v, cache_pos, cache_len};
     TensorView outs[] = {output, k_cache, v_cache};
-    op->compute(outs, ins, {}, workspace.data());
+    op->compute(outs, ins, {}, nullptr);
 
     for (size_t i = 0; i < out.size(); ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(out[i]));

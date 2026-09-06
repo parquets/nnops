@@ -79,11 +79,8 @@ NNOPS_TEST(matmul_int8_basic_s32) {
     std::vector<int32_t> out_buf(descs[0].numel());
     auto output = test::make_planar(descs[0], out_buf.data());
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
-    NNOPS_EXPECT_TRUE(workspace.size() > 0);
-
     const TensorView ins[] = {a, b};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     // C[0] = dot({1,-2,3},{1,3,5}) = 10, C[1] = dot({1,-2,3},{2,4,6}) = 12
     // C[2] = dot({-4,5,-6},{1,3,5}) = -19, C[3] = dot({-4,5,-6},{2,4,6}) = -24
@@ -128,9 +125,8 @@ NNOPS_TEST(matmul_int8_zeropoint_s32) {
     std::vector<int32_t> out_buf(descs[0].numel());
     auto output = test::make_planar(descs[0], out_buf.data());
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     const TensorView ins[] = {a, w};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     // MatMulInteger: Σ (qa−zp_a[m])·(qw−zp_w[n])
     //   out[0,0] = dot({0,1,2},{4,5,6}) = 17, out[0,1] = dot({0,1,2},{6,7,8}) = 23
@@ -175,10 +171,8 @@ NNOPS_TEST(matmul_int8_requant_s8) {
     std::vector<int8_t> out_buf(descs[0].numel());
     TensorView output = make_q(1, 2, DataType::s8, out_buf.data(), per_tensor(2.0f, 0));
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
-    NNOPS_EXPECT_TRUE(workspace.size() > 0);
     const TensorView ins[] = {a, w};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     // acc = dot({4,6},{1,1}) = 10 → requant = round(10/2) = 5 (both columns).
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 5);
@@ -209,9 +203,8 @@ NNOPS_TEST(matmul_int8_requant_clamp_s8) {
     std::vector<int8_t> out_buf(descs[0].numel());
     TensorView output = make_q(1, 2, DataType::s8, out_buf.data(), per_tensor(1.0f, 0));
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     const TensorView ins[] = {a, w};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     // acc = 100*100 + 100*100 = 20000 → clamps to 127.
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 127);
@@ -288,9 +281,8 @@ NNOPS_TEST(matmul_int8_random_s32) {
 
         std::vector<int32_t> out_buf(descs[0].numel());
         auto output = test::make_planar(descs[0], out_buf.data());
-        std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
         const TensorView ins[] = {in.a, in.b};
-        op->compute(output, ins, {}, workspace.data());
+        op->compute(output, ins, {}, nullptr);
 
         std::vector<int32_t> ref_buf(descs[0].numel());
         auto ref_out = test::make_planar(descs[0], ref_buf.data());
@@ -321,9 +313,8 @@ NNOPS_TEST(matmul_int8_random_s8) {
     std::vector<int8_t> out_buf(descs[0].numel());
     TensorView output = make_q(M, N, DataType::s8, out_buf.data(), per_tensor(out_scale, out_zp));
 
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     const TensorView ins[] = {in.a, in.b};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     std::vector<int8_t> ref_buf(descs[0].numel());
     TensorView ref_out = make_q(M, N, DataType::s8, ref_buf.data(), per_tensor(out_scale, out_zp));
@@ -354,9 +345,8 @@ NNOPS_TEST(matmul_int8_multik_s32) {
 
     std::vector<int32_t> out_buf(descs[0].numel());
     auto output = test::make_planar(descs[0], out_buf.data());
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     const TensorView ins[] = {in.a, in.b};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     std::vector<int32_t> ref_buf(descs[0].numel());
     auto ref_out = test::make_planar(descs[0], ref_buf.data());
@@ -391,9 +381,8 @@ NNOPS_TEST(matmul_int8_batched_s32) {
 
     std::vector<int32_t> out_buf(descs[0].numel());
     auto output = test::make_planar(descs[0], out_buf.data());
-    std::vector<char> workspace(op->getWorkspaceSize(arr, descs));
     const TensorView ins[] = {a, b};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     std::vector<int32_t> ref_buf(descs[0].numel());
     auto ref_out = test::make_planar(descs[0], ref_buf.data());

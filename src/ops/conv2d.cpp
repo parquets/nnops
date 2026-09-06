@@ -74,9 +74,10 @@ std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
 size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc> inputs,
                                 std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 2);
-    NNOPS_ASSERT(outputs.size() >= 1);
-    return backend::cpu::conv2d_im2col_get_workspace_size(attrs_, inputs, outputs);
+    (void)inputs;
+    (void)outputs;
+    // im2col scratch is pooled internally by the CPU kernel.
+    return 0;
 }
 
 // ============================================================

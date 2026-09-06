@@ -86,12 +86,10 @@ size_t CausalAttention::getWorkspaceSize(
     std::span<const TensorDesc> inputs,
     std::span<const TensorDesc> outputs) const
 {
+    (void)inputs;
     (void)outputs;
-    const int64_t B = inputs[0].dims[0];
-    const int64_t H = attrs_.num_heads;
-    const int64_t Sq = attrs_.max_chunk_size;
-    const int64_t max_Sk = attrs_.max_cache_seq_len + Sq;
-    return static_cast<size_t>(B * H * Sq * max_Sk) * sizeof(float);
+    // The per-(batch, head) scores buffer is pooled internally by the CPU kernel.
+    return 0;
 }
 
 void CausalAttention::compute(std::span<TensorView> outputs,

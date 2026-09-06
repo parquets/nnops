@@ -4,7 +4,7 @@
 /// Packing, tiling, and the (now trivial) pack decision live in
 /// matmul_helper.{h,cpp}; this file owns the tiled loops and the operator-level
 /// dispatch. Mirroring onnxruntime MLAS sgemm, B (rhs) is always packed into
-/// the caller-provided workspace and A (lhs) is packed into a per-thread stack
+/// pooled scratch and A (lhs) is packed into a per-thread stack
 /// buffer only when transpose_a forces it or its row stride is page-scattered
 /// (lda > PACK_A_STRIDE_THRESHOLD); otherwise A is read directly. The loop
 /// order is always NKM (n-block outer, k, then m).
@@ -21,6 +21,7 @@
 #include "matmul.h"
 #include "matmul_helper.h"
 #include "simd_kernel/simd_epilogue.hpp"
+#include "common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
 
@@ -577,12 +578,18 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
         const int8_t* a_p = a_base + a_offset;
         const int8_t* b_p = b_base + b_offset;
 
-        // int32 accumulator for this batch element.
+        // int32 accumulator for this batch element. The MMA micro-kernels
+        // accumulate (C += A·B), and alpha/beta are ignored on the integer
+        // path (C = A·B, overwrite semantics), so zero the tile first.
         int32_t* c_p;
         if (out_s8) {
             c_p = accum;  // reused per batch element
+            std::fill(accum, accum + M * N, 0);
         } else {
             c_p = output.ptr<int32_t>() + c_offset;
+            for (int64_t m = 0; m < M; ++m) {
+                std::fill(c_p + m * ldc, c_p + m * ldc + N, 0);
+            }
         }
 
         // Precompute the raw int8 reductions for the epilogue.
@@ -688,7 +695,7 @@ void matmul_kernel(const MatMulAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,
-                   void* workspace)
+                   void* /*workspace*/)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -701,14 +708,16 @@ void matmul_kernel(const MatMulAttributes& attrs,
     const auto dt_b = b.data_type();
 
     // int8 (s8×s8): fused tiled kernel for s32 / s8 outputs. The tiled path
-    // always packs B, so it needs a workspace; without one, fall back to ref.
+    // always packs B into pooled scratch (getWorkspaceSize returns 0).
     if (dt_a == DataType::s8 && dt_b == DataType::s8) {
         const bool out_ok = (output.data_type() == DataType::s32) ||
                             (output.data_type() == DataType::s8);
-        if (out_ok && workspace != nullptr) {
-            matmul_dispatch_int8(attrs, output, inputs, ctx, KC_I8, workspace);
+        if (out_ok) {
+            const size_t ws = matmul_get_workspace_size(attrs, a.desc(), b.desc(), output.desc());
+            PoolPtr scratch(ws);
+            matmul_dispatch_int8(attrs, output, inputs, ctx, KC_I8, scratch.get());
         } else {
-            reference::matmul_int8_ref(attrs, output, inputs, ctx, workspace);
+            reference::matmul_int8_ref(attrs, output, inputs, ctx, nullptr);
         }
         return;
     }
@@ -717,16 +726,23 @@ void matmul_kernel(const MatMulAttributes& attrs,
     const bool supported = (dt_a == DataType::f32 && dt_b == DataType::f32) ||
                            (dt_a == DataType::f16 && dt_b == DataType::f16);
     if (!supported) {
-        reference::matmul_ref(attrs, output, inputs, ctx, workspace);
+        reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
         return;
     }
 
     const int kc = (dt_a == DataType::f32) ? KC_F32 : KC_F16;
 
+    // Packed-B scratch is pooled internally (sized once, allocated before the
+    // parallel dispatch). For the f32 fast path (M*N*K < 1024) this is 0 and the
+    // dispatch routes to the reference; the PoolPtr(0) allocation is a harmless
+    // 64-byte class block.
+    const size_t ws = matmul_get_workspace_size(attrs, a.desc(), b.desc(), output.desc());
+    PoolPtr scratch(ws);
+
     if (dt_a == DataType::f32) {
-        matmul_dispatch_2d<float>(attrs, output, inputs, ctx, kc, workspace);
+        matmul_dispatch_2d<float>(attrs, output, inputs, ctx, kc, scratch.get());
     } else {
-        matmul_dispatch_2d<half>(attrs, output, inputs, ctx, kc, workspace);
+        matmul_dispatch_2d<half>(attrs, output, inputs, ctx, kc, scratch.get());
     }
 }
 

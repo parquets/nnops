@@ -184,8 +184,8 @@ void attention_ref(const AttentionAttributes& attrs,
 
 namespace {
 
-/// Run the fast path (workspace provided) and the reference, and report whether
-/// every output element agrees within (rtol, atol).
+/// Run the fast path and the reference, and report whether every output element
+/// agrees within (rtol, atol).
 bool attention_fast_vs_ref(const AttentionAttributes& attrs,
                            const TensorView& q, const TensorView& k, const TensorView& v,
                            const TensorView* mask,
@@ -202,12 +202,10 @@ bool attention_fast_vs_ref(const AttentionAttributes& attrs,
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    // Fast path (allocated workspace).
+    // Fast path (scratch pooled internally by the kernel).
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
-    std::vector<char> workspace(op->getWorkspaceSize(descs, out_descs));
-    NNOPS_EXPECT_TRUE(workspace.size() > 0);
-    op->compute(fast_out, ins, {}, workspace.data());
+    op->compute(fast_out, ins, {}, nullptr);
 
     // Reference baseline.
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));

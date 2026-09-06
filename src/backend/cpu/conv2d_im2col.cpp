@@ -20,6 +20,7 @@
 #include "matmul_helper.h"                 // tile_mma_direct + arch panel constants
 #include "simd_kernel/simd_epilogue.hpp"   // epilogue_inplace
 #include "simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d / tiled_im2col_3d
+#include "common/memory_pool.hpp"          // internal scratch-memory pool
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
@@ -335,7 +336,7 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
-                          void* workspace)
+                          void* /*workspace*/)
 {
     const DataType dt = inputs[0].data_type();
 
@@ -344,25 +345,33 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                            output.data_type() == dt &&
                            (inputs.size() <= 2 || inputs[2].data_type() == dt);
 
-    if (dtypes_ok && workspace != nullptr) {
+    if (dtypes_ok) {
+        // im2col scratch is pooled internally (getWorkspaceSize returns 0). Sized
+        // and allocated once, before the (batch, group) parallel dispatch.
+        std::vector<TensorDesc> descs;
+        descs.reserve(inputs.size());
+        for (const auto& t : inputs) { descs.push_back(t.desc()); }
+        const TensorDesc outs[] = {output.desc()};
+        const size_t ws = conv2d_im2col_get_workspace_size(attrs, descs, outs);
+        PoolPtr scratch(ws);
+
         if (dt == DataType::f32) {
-            conv2d_im2col_impl<float>(attrs, output, inputs, ctx, workspace);
+            conv2d_im2col_impl<float>(attrs, output, inputs, ctx, scratch.as<float>());
         } else {
-            conv2d_im2col_impl<half>(attrs, output, inputs, ctx, workspace);
+            conv2d_im2col_impl<half>(attrs, output, inputs, ctx, scratch.as<half>());
         }
         return;
     }
 
-    // f32 without a workspace (or mismatched dtypes): the reference is the
-    // correctness baseline and needs no scratch. f16 has no reference — a
-    // workspace buffer is mandatory there.
+    // Mismatched dtypes: the f32 reference is the correctness baseline (no
+    // scratch). f16 has no reference, so a dtype mismatch there is a hard error.
     if (dt == DataType::f32) {
-        reference::conv2d_ref(attrs, output, inputs, ctx, workspace);
+        reference::conv2d_ref(attrs, output, inputs, ctx, nullptr);
         return;
     }
 
-    NNOPS_ASSERT(!"conv2d_im2col_kernel: f16 Conv2D requires a workspace buffer "
-                   "(see Conv2D::getWorkspaceSize)");
+    NNOPS_ASSERT(!"conv2d_im2col_kernel: f16 Conv2D dtype mismatch "
+                   "(f16 input requires an f16 weight and f16 output)");
 }
 
 }  // namespace nnops::backend::cpu

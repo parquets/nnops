@@ -63,6 +63,12 @@ target_include_directories(nnops_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAK
 # Register with CTest
 add_test(NAME nnops_test COMMAND nnops_test)
 
+# ---- Memory pool tests (separate executable, exercises the internal pool) ----
+add_executable(nnops_test_memory_pool test_memory_pool.cpp common/test_harness.cpp)
+target_link_libraries(nnops_test_memory_pool PRIVATE nnops_cpu)
+target_include_directories(nnops_test_memory_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME nnops_test_memory_pool COMMAND nnops_test_memory_pool)
+
 # ---- Benchmarks (optional) ----
 if(NNOPS_BUILD_BENCHMARKS)
     set(BENCH_SOURCES common/bench_harness.cpp bench_matmul.cpp)

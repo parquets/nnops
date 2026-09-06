@@ -777,9 +777,8 @@ NNOPS_TEST(softmax_quant_s8_per_tensor) {
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
 
-    std::vector<char> workspace(op->getWorkspaceSize(in_arr, descs));
     const TensorView ins[] = {input};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     // dequant {1,2,3} → exp {2.7183, 7.3891, 20.0855}, sum 30.1929
     float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
@@ -808,9 +807,8 @@ NNOPS_TEST(softmax_quant_u8_per_tensor) {
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
 
-    std::vector<char> workspace(op->getWorkspaceSize(in_arr, descs));
     const TensorView ins[] = {input};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
     NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
@@ -841,9 +839,8 @@ NNOPS_TEST(softmax_quant_s8_per_token) {
     std::vector<float> out_buf(descs[0].numel());
     TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
 
-    std::vector<char> workspace(op->getWorkspaceSize(in_arr, descs));
     const TensorView ins[] = {input};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
     const float e0 = std::exp(1.0f) / sum_exp;
@@ -873,9 +870,8 @@ NNOPS_TEST(softmax_quant_s8_f16_output) {
 
     const TensorDesc in_arr[] = {input.desc()};
     const TensorDesc out_arr[] = {output.desc()};
-    std::vector<char> workspace(op->getWorkspaceSize(in_arr, out_arr));
     const TensorView ins[] = {input};
-    op->compute(output, ins, {}, workspace.data());
+    op->compute(output, ins, {}, nullptr);
 
     float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
     NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[0]), std::exp(1.0f) / sum_exp, 1e-2f);

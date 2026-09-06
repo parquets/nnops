@@ -70,9 +70,8 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// Scratch buffer size required by the CPU tiled im2col + GEMM kernel
-    /// (f32/f16). Returns 0 for unsupported dtypes or when no workspace is
-    /// needed by the fallback path.
+    /// Always 0: the CPU tiled im2col + GEMM kernel pools its scratch
+    /// internally.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 

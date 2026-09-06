@@ -23,6 +23,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
+#include "common/memory_pool.hpp"
 #include "simd_kernel/simd_softmax.hpp"
 
 #if defined(NNOPS_ARCH_X86_64)
@@ -399,7 +400,8 @@ void softmax_quant_input_impl(const SoftmaxAttributes& attrs,
     const int64_t last_dim = X.shape(rank - 1);
     const int64_t M = numel / last_dim;  // number of `last_dim`-element rows
 
-    // Carve the caller-provided workspace (sized by Softmax::getWorkspaceSize):
+    // Carve the pooled scratch (allocated once in softmax_cpu; getWorkspaceSize
+    // returns 0):
     //   [ x_f32 : numel ][ scale : M ][ zero : M ][ y_f32 : numel (f16 only) ]
     float* x_f32 = static_cast<float*>(workspace);
     float* scale = x_f32 + numel;
@@ -458,13 +460,28 @@ void softmax_cpu(const SoftmaxAttributes& attrs,
                   TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
-                  void* workspace)
+                  void* /*workspace*/)
 {
     const auto dtype = inputs[0].data_type();
     if (is_quantized_dtype(dtype)) {
         // s8/u8 input: softmax probabilities are dequantized float, never int.
         NNOPS_ASSERT(!is_quantized_dtype(output.data_type()));
-        softmax_quant_input_impl(attrs, output, inputs, ctx, workspace);
+
+        // Dequantization scratch is pooled internally (getWorkspaceSize returns
+        // 0); it mirrors the layout Softmax::getWorkspaceSize used to report:
+        //   [ x_f32 : numel ][ scale : M ][ zero : M ][ y_f32 : numel (f16) ].
+        const int64_t numel    = inputs[0].numel();
+        const int64_t rank     = inputs[0].rank();
+        const int64_t last_dim = inputs[0].shape(rank - 1);
+        const int64_t M        = numel / last_dim;
+        size_t ws = static_cast<size_t>(numel) * sizeof(float)          // x_f32
+                  + 2 * static_cast<size_t>(M) * sizeof(float);         // scale + zero
+        if (output.data_type() == DataType::f16) {
+            ws += static_cast<size_t>(numel) * sizeof(float);           // y_f32 staging
+        }
+        PoolPtr scratch(ws);
+
+        softmax_quant_input_impl(attrs, output, inputs, ctx, scratch.get());
         return;
     }
     switch (dtype) {

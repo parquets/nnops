@@ -68,10 +68,10 @@ std::vector<TensorDesc> Attention::getOutputTensorDesc(
 size_t Attention::getWorkspaceSize(std::span<const TensorDesc> inputs,
                                    std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 3);
-    NNOPS_ASSERT(inputs.size() <= 4);
-    NNOPS_ASSERT(outputs.size() == 1);
-    return backend::cpu::attention_get_workspace_size(attrs_, inputs, outputs);
+    (void)inputs;
+    (void)outputs;
+    // Scratch (scores + packed K^T) is pooled internally by the CPU kernel.
+    return 0;
 }
 
 void Attention::compute(std::span<TensorView> outputs,

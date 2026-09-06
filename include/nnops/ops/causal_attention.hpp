@@ -7,7 +7,7 @@
 /// and multi-dtype cache (f32/f16/bf16/s8/u8).
 ///
 /// The operator is stateless: all cache memory is owned by the caller.
-/// Intermediate scores are stored in a caller-provided workspace buffer.
+/// Intermediate scores are allocated internally from the CPU memory pool.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -28,12 +28,12 @@ struct CausalAttentionAttributes {
     int64_t num_heads = 8;
 
     /// Maximum KV-cache sequence length (total capacity).
-    /// Used for workspace sizing and bounds validation.
+    /// Used for bounds validation.
     /// In block mode: max_cache_seq_len = num_blocks * block_size.
     int64_t max_cache_seq_len = 0;
 
     /// Maximum chunk size (Sq dimension of Q/K_new/V_new).
-    /// Controls peak workspace memory. Set to 1 for decode-only,
+    /// Controls peak scratch memory. Set to 1 for decode-only,
     /// or to the desired chunk size (e.g. 512) for chunk prefill support.
     int64_t max_chunk_size = 1;
 
@@ -83,8 +83,7 @@ struct CausalAttentionAttributes {
 ///   outputs[1] = K_cache  [B,H,max_len,D] or [num_blocks,H,block_size,D]
 ///   outputs[2] = V_cache  same as K_cache
 ///
-/// Workspace:
-///   B * H * max_chunk_size * (max_cache_seq_len + max_chunk_size) * sizeof(float)
+/// Scratch is pooled internally by the CPU kernel (getWorkspaceSize returns 0).
 class CausalAttention : public OpBase {
 public:
     /// Create a CausalAttention operator for the specified backend.

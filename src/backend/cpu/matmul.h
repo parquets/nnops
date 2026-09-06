@@ -4,10 +4,9 @@
 ///        Loop order is plan-driven: NKM (N outer, K middle, M inner) or MKN
 ///        (k{m{n}}), selected by the static pack decision in matmul_helper.h.
 ///
-/// Workspace (pack buffer for B) is allocated externally — use
-/// matmul_get_workspace_size() (declared in matmul_helper.h) to determine the
-/// required size (nonzero iff the global plan packs B; packed A lives on the
-/// kernel stack).
+/// Scratch (pack buffer for B) is pooled internally — sized via
+/// matmul_get_workspace_size() (declared in matmul_helper.h); packed A lives on
+/// the kernel stack.
 
 #include <cstddef>
 #include <span>
@@ -20,10 +19,9 @@ namespace nnops::backend::cpu {
 
 /// Tiled matrix multiplication: C = A x B   (2D GEMM, NKM loop order).
 ///
-/// Uses the packing and MMA micro-kernel dispatch from imatmul.
-/// The caller must pre-allocate a workspace buffer of at least
-/// matmul_get_workspace_size() bytes (0 unless transpose_b) and pass it via
-/// @p workspace.
+/// Uses the packing and MMA micro-kernel dispatch from matmul_helper. Scratch
+/// is pooled internally (sized by matmul_get_workspace_size); @p workspace is
+/// vestigial.
 ///
 /// Falls back to reference matmul for batched (rank > 2) or non-f32/f16 dtypes.
 void matmul_kernel(const MatMulAttributes& attrs,

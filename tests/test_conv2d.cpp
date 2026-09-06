@@ -304,8 +304,8 @@ void conv2d_ref(const Conv2DAttributes& attrs,
 
 namespace {
 
-/// Run the fast path (workspace provided) and the reference, and report
-/// whether every output element agrees within (rtol, atol).
+/// Run the fast path and the reference, and report whether every output element
+/// agrees within (rtol, atol).
 bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
                         const TensorView& input, const TensorView& weight,
                         const TensorView* bias,
@@ -322,12 +322,10 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    // Fast path (allocated workspace).
+    // Fast path (scratch pooled internally by the kernel).
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
-    std::vector<char> workspace(op->getWorkspaceSize(descs, out_descs));
-    NNOPS_EXPECT_TRUE(workspace.size() > 0);
-    op->compute(fast_out, ins, {}, workspace.data());
+    op->compute(fast_out, ins, {}, nullptr);
 
     // Reference baseline.
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
@@ -428,8 +426,7 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
         ref_buf[i]  = res_vec[i];
     }
 
-    std::vector<char> workspace(op->getWorkspaceSize(descs, out_descs));
-    op->compute(fast_out, ins, {}, workspace.data());
+    op->compute(fast_out, ins, {}, nullptr);
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
 
     for (int64_t i = 0; i < out_numel; ++i) {
@@ -471,9 +468,7 @@ NNOPS_TEST(conv2d_im2col_f16) {
     auto f16_out_descs = op->getOutputTensorDesc(f16_descs);
     std::vector<nnops::backend::cpu::half> out_f16(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(f16_out_descs[0], out_f16.data());
-    std::vector<char> workspace(op->getWorkspaceSize(f16_descs, f16_out_descs));
-    NNOPS_EXPECT_TRUE(workspace.size() > 0);
-    op->compute(fast_out, f16_ins, {}, workspace.data());
+    op->compute(fast_out, f16_ins, {}, nullptr);
 
     auto fast_f32 = test::f16_to_f32(out_f16);
     for (int64_t i = 0; i < out_numel; ++i) {

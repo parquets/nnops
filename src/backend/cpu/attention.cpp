@@ -31,6 +31,7 @@
 #include "attention.h"
 #include "matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs + panel constants
 #include "simd_kernel/simd_softmax.hpp"     // softmax + FlashAttention row kernels
+#include "common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/detail/assert.hpp"
 
 #include <algorithm>
@@ -536,7 +537,7 @@ void attention_kernel(const AttentionAttributes& attrs,
                       TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
-                      void* workspace)
+                      void* /*workspace*/)
 {
     const DataType dt = inputs[0].data_type();
 
@@ -546,19 +547,27 @@ void attention_kernel(const AttentionAttributes& attrs,
                            output.data_type() == dt &&
                            (inputs.size() <= 3 || inputs[3].data_type() == dt);
 
-    if (dtypes_ok && workspace != nullptr) {
+    if (dtypes_ok) {
+        // Scratch (scores + packed K^T) is pooled internally; the caller-provided
+        // workspace is obsolete (getWorkspaceSize returns 0). Allocated once here,
+        // before the parallel dispatch, so no per-task allocation happens inside
+        // the parallel body.
+        const TensorDesc descs[] = {inputs[0].desc(), inputs[1].desc(), inputs[2].desc()};
+        const TensorDesc outs[]  = {output.desc()};
+        const size_t ws = attention_get_workspace_size(attrs, descs, outs);
+        PoolPtr scratch(ws);
+
         const HeadShape hs = resolve_head_shape(attrs, inputs);
         if (should_use_flash_attention(hs.Sq, hs.Sk)) {
-            attention_flash_impl<float>(attrs, output, inputs, ctx, workspace);
+            attention_flash_impl<float>(attrs, output, inputs, ctx, scratch.as<float>());
         } else {
-            attention_impl<float>(attrs, output, inputs, ctx, workspace);
+            attention_impl<float>(attrs, output, inputs, ctx, scratch.as<float>());
         }
         return;
     }
 
-    // f32 without a workspace (or mismatched dtypes): the reference is the
-    // correctness baseline and needs no scratch.
-    reference::attention_ref(attrs, output, inputs, ctx, workspace);
+    // Mismatched dtypes: the reference is the correctness baseline (no scratch).
+    reference::attention_ref(attrs, output, inputs, ctx, nullptr);
 }
 
 }  // namespace nnops::backend::cpu

@@ -63,9 +63,10 @@ MatMul::MatMul(const MatMulAttributes& attrs, Backend backend)
 size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
                                 std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 2);
-    NNOPS_ASSERT(outputs.size() >= 1);
-    return backend::cpu::matmul_get_workspace_size(attrs_, inputs[0], inputs[1], outputs[0]);
+    (void)inputs;
+    (void)outputs;
+    // Packed-B (and int8 accumulator) scratch is pooled internally by the CPU kernel.
+    return 0;
 }
 
 std::vector<TensorDesc> MatMul::getOutputTensorDesc(

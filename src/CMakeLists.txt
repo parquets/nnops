@@ -39,6 +39,9 @@ set(NNOPS_CPU_SOURCES
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
 
+    # Operator scratch-memory pool (shared, thread-safe singleton)
+    backend/cpu/common/memory_pool.cpp
+
     # Layout conversion utilities (pack/unpack between NCHW and NCHWC8)
     backend/cpu/layout_convert.cpp
     backend/cpu/linear_attention.cpp
