@@ -54,5 +54,5 @@ src/backend/cpu/
                           using NEON for f32, NEON FP16 for fp16 (ARMv8.2+)
 src/backend/cuda/       — CUDA kernels (optional)
 src/backend/vulkan/     — Vulkan kernels (optional)
-tests/                  — Unit tests (14 files, 135 tests) + common test utilities
+tests/                  — Unit tests (one standalone demo executable per test_*.cpp) + common test utilities; run via scripts/run_tests.sh
 ```

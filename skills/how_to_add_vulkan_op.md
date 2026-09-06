@@ -492,7 +492,7 @@ NNOPS_TEST(eltwise_vulkan_add_1d) {
 7. **构建和测试**
    - [ ] `cmake .. -DNNOPS_BUILD_VULKAN=ON -DNNOPS_BUILD_TESTS=ON`
    - [ ] `cmake --build . --config Release`
-   - [ ] `./tests/Release/nnops_test.exe` 确保所有测试通过
+   - [ ] `scripts/run_tests.sh Release` 确保所有测试通过（或 `./tests/Release/test_<op>_vulkan.exe` 单跑 Vulkan 测试）
 
 ---
 

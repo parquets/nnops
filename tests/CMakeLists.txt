@@ -1,6 +1,5 @@
-# ---- Test sources ----
+# ---- Test sources (one standalone demo executable per file) ----
 set(TEST_SOURCES
-    common/test_harness.cpp
     test_tensor_view.cpp
     test_matmul.cpp
     test_matmul_int8.cpp
@@ -38,37 +37,41 @@ set(TEST_SOURCES
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
     test_cpu_backend.cpp
+    test_memory_pool.cpp
 )
 
-# Vulkan tests (only when Vulkan backend is enabled)
-if(NNOPS_BUILD_VULKAN)
-    find_package(Vulkan REQUIRED)
-    list(APPEND TEST_SOURCES
-        common/vulkan_test_helper.cpp
-        test_eltwise_vulkan.cpp
-        test_unary_vulkan.cpp
-    )
-endif()
+# Each test file links against `common/test_harness.cpp` (which supplies main)
+# and becomes its own runnable demo. Every demo is also registered with CTest.
+function(nnops_add_test_demo src)
+    get_filename_component(name "${src}" NAME_WE)   # strip .cpp → e.g. test_matmul
+    add_executable(${name} "${src}" common/test_harness.cpp)
+    target_link_libraries(${name} PRIVATE nnops_cpu)
+    if(NNOPS_BUILD_CUDA)
+        target_link_libraries(${name} PRIVATE CUDA::cudart)
+    endif()
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
 
-add_executable(nnops_test ${TEST_SOURCES})
-target_link_libraries(nnops_test PRIVATE nnops_cpu)
 if(NNOPS_BUILD_CUDA)
     find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(nnops_test PRIVATE CUDA::cudart)
 endif()
+
+foreach(src ${TEST_SOURCES})
+    nnops_add_test_demo(${src})
+endforeach()
+
+# ---- Vulkan tests (only when Vulkan backend is enabled) ----
 if(NNOPS_BUILD_VULKAN)
-    target_link_libraries(nnops_test PRIVATE Vulkan::Vulkan)
+    find_package(Vulkan REQUIRED)
+    foreach(src test_eltwise_vulkan.cpp test_unary_vulkan.cpp)
+        get_filename_component(name "${src}" NAME_WE)
+        add_executable(${name} "${src}" common/test_harness.cpp common/vulkan_test_helper.cpp)
+        target_link_libraries(${name} PRIVATE nnops_cpu Vulkan::Vulkan)
+        target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+        add_test(NAME ${name} COMMAND ${name})
+    endforeach()
 endif()
-target_include_directories(nnops_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
-
-# Register with CTest
-add_test(NAME nnops_test COMMAND nnops_test)
-
-# ---- Memory pool tests (separate executable, exercises the internal pool) ----
-add_executable(nnops_test_memory_pool test_memory_pool.cpp common/test_harness.cpp)
-target_link_libraries(nnops_test_memory_pool PRIVATE nnops_cpu)
-target_include_directories(nnops_test_memory_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
-add_test(NAME nnops_test_memory_pool COMMAND nnops_test_memory_pool)
 
 # ---- Benchmarks (optional) ----
 if(NNOPS_BUILD_BENCHMARKS)

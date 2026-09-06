@@ -175,7 +175,7 @@ These operators return `nullptr` for `Backend::CUDA`:
 
 **tests/CMakeLists.txt:**
 - `find_package(CUDAToolkit REQUIRED)` when CUDA enabled
-- Links `nnops_test` against `CUDA::cudart`
+- Each per-file test demo links `CUDA::cudart` (via `nnops_add_test_demo` in `tests/CMakeLists.txt`)
 
 ### Dispatch Wiring Pattern
 

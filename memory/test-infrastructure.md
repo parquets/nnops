@@ -32,11 +32,16 @@ Each operator has a corresponding `tests/test_<op>.cpp` with tests in three cate
 
 ## Running Tests
 
+Each `tests/test_*.cpp` builds into its own standalone demo executable (one per file, each linked
+against `common/test_harness.cpp`, which supplies `main()`). Run every demo with:
+
 ```bash
-cd build && cmake --build . --config Release --target nnops_test && ctest -C Release
+scripts/run_tests.sh Release      # prints [PASS]/[FAIL] per demo + final tally; exit 0 iff all pass
 ```
 
-Tests are registered via CTest. Currently 135 tests across 14 test files (activation, attention, batch_norm, conv2d, cumsum, layer_norm, linear, matmul, pooling, rms_norm, simd, softmax, tensor_view, plus common harness).
+Demos live at `build/tests/<Config>/test_*.exe` (Visual Studio generator) and are also registered
+with CTest, so `ctest --test-dir build -C Release --output-on-failure` works too. The benchmark
+binary (`nnops_bench`) is built separately via `NNOPS_BUILD_BENCHMARKS`.
 
 ## Benchmark Pattern
 
