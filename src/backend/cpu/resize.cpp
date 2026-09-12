@@ -21,6 +21,7 @@
 #include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_resize.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -162,17 +163,10 @@ void resize_cpu(const ResizeAttributes& attrs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        resize_impl_nchwc8<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        resize_impl_nchwc8<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"resize_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "resize_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        resize_impl_nchwc8<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

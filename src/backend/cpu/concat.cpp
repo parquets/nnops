@@ -14,6 +14,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cstring>
 #include <vector>
@@ -302,17 +303,10 @@ void concat_cpu(const ConcatAttributes& attrs,
                  const ComputeContext& /*ctx*/,
                  void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        concat_impl<float>(attrs, output, inputs);
-        return;
-    case DataType::f16:
-        concat_impl<half>(attrs, output, inputs);
-        return;
-    default:
-        NNOPS_ASSERT(!"concat_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "concat_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        concat_impl<T>(attrs, output, inputs);
+    });
 }
 
 }  // namespace nnops::backend::cpu

@@ -11,6 +11,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -132,17 +133,10 @@ void topk_cpu(const TopKAttributes& attrs,
                const ComputeContext& ctx,
                void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        topk_impl<float>(attrs, values, indices, inputs, ctx);
-        return;
-    case DataType::f16:
-        topk_impl<half>(attrs, values, indices, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"topk_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "topk_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        topk_impl<T>(attrs, values, indices, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

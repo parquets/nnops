@@ -17,6 +17,8 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_reduce.hpp"
+#include "common/index.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -186,28 +188,12 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
     const int64_t rank = input.rank();
     const int64_t rank_out = output.rank();
 
-    std::vector<int64_t> inner_offsets(static_cast<size_t>(num_inner));
-    for (int64_t flat = 0; flat < num_inner; ++flat) {
-        int64_t off = 0;
-        int64_t rem = flat;
-        for (int64_t d = rank - 1; d >= axis + 1; --d) {
-            off += (rem % input.shape(d)) * input.stride_elems(d);
-            rem /= input.shape(d);
-        }
-        inner_offsets[static_cast<size_t>(flat)] = off;
-    }
+    const std::vector<int64_t> inner_offsets =
+        build_offsets(input, axis + 1, rank - 1, num_inner);
 
     const int64_t y_inner_start = attrs.keepdims ? axis + 1 : axis;
-    std::vector<int64_t> y_inner_offsets(static_cast<size_t>(num_inner));
-    for (int64_t flat = 0; flat < num_inner; ++flat) {
-        int64_t off = 0;
-        int64_t rem = flat;
-        for (int64_t d = rank_out - 1; d >= y_inner_start; --d) {
-            off += (rem % output.shape(d)) * output.stride_elems(d);
-            rem /= output.shape(d);
-        }
-        y_inner_offsets[static_cast<size_t>(flat)] = off;
-    }
+    const std::vector<int64_t> y_inner_offsets =
+        build_offsets(output, y_inner_start, rank_out - 1, num_inner);
 
     const int64_t x_outer_stride = (axis > 0) ? input.stride_elems(axis - 1) : 0;
     const int64_t y_outer_stride = (axis > 0) ? output.stride_elems(axis - 1) : 0;
@@ -313,30 +299,11 @@ void reduce_impl(const ReduceAttributes& attrs,
         const bool keepdims = attrs.keepdims;
 
         const auto process_pos = [&](int64_t s) {
-            // Input offset: decompose flat index → element offset (c8=0)
-            int64_t in_off = 0;
-            int64_t rem = s;
-            for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == 1) {
-                    continue;
-                }
-                int64_t dim = input.shape(d);
-                in_off += (rem % dim) * input.stride_elems(d);
-                rem /= dim;
-            }
-
-            // Output offset: same decomposition on output tensor
-            int64_t out_off = 0;
-            rem = s;
-            for (int64_t d = rank_out - 1; d >= 0; --d) {
-                if (keepdims && d == 1) {
-                    continue; // collapsed C8 dim
-                }
-                int64_t dim = output.shape(d);
-                out_off += (rem % dim) * output.stride_elems(d);
-                rem /= dim;
-            }
-
+            // Input offset: decompose flat index → element offset (skip C dim)
+            const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/1);
+            // Output offset: same decomposition on output tensor (skip C dim iff keepdims)
+            const int64_t out_off = decompose_flat_offset(s, output, 0, rank_out - 1,
+                                                          keepdims ? 1 : -1);
             kernel::reduce_process_packed_channel<T>(
                 x_ptr + in_off, y_ptr + out_off,
                 chan_stride, C8, pack, valid_lanes, attrs.type, inv_total);
@@ -368,30 +335,11 @@ void reduce_impl(const ReduceAttributes& attrs,
         const bool keepdims = attrs.keepdims;
 
         const auto process_pos = [&](int64_t s) {
-            // Input offset at first row along reduce axis
-            int64_t in_off = 0;
-            int64_t rem = s;
-            for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == axis) {
-                    continue;
-                }
-                int64_t dim = input.shape(d);
-                in_off += (rem % dim) * input.stride_elems(d);
-                rem /= dim;
-            }
-
-            // Output offset
-            int64_t out_off = 0;
-            rem = s;
-            for (int64_t d_out = rank_out - 1; d_out >= 0; --d_out) {
-                if (keepdims && d_out == axis) {
-                    continue;
-                }
-                int64_t dim = output.shape(d_out);
-                out_off += (rem % dim) * output.stride_elems(d_out);
-                rem /= dim;
-            }
-
+            // Input offset at first row along reduce axis (skip the reduce axis)
+            const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/axis);
+            // Output offset (skip the reduce axis iff keepdims)
+            const int64_t out_off = decompose_flat_offset(s, output, 0, rank_out - 1,
+                                                          keepdims ? axis : -1);
             kernel::reduce_process_packed_col<T>(
                 x_ptr + in_off, y_ptr + out_off,
                 axis_stride, D, pack, attrs.type, inv_D);
@@ -444,17 +392,10 @@ void reduce_cpu(const ReduceAttributes& attrs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        reduce_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        reduce_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"reduce_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "reduce_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        reduce_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

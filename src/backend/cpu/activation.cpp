@@ -26,6 +26,7 @@
 #include "simd_kernel/simd_activation.hpp"
 #include "simd_kernel/activation_kernels.hpp"
 #include "common/elementwise.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cstdint>
 
@@ -105,16 +106,11 @@ void activation_cpu(const ActivationAttributes& attrs,
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
-        switch (dtype) {
-        case DataType::f32:
-            activation_impl<float>(attrs, output, inputs, ctx);
-            return;
-        case DataType::f16:
-            activation_impl<half>(attrs, output, inputs, ctx);
-            return;
-        default:
-            NNOPS_ASSERT(!"activation_cpu: unsupported data type (only f32 and f16)");
-        }
+        dispatch_f32_f16(dtype, "activation_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            activation_impl<T>(attrs, output, inputs, ctx);
+        });
+        return;
     }
 
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).

@@ -13,6 +13,7 @@
 #include "nnops/ops/slice.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -118,17 +119,10 @@ void slice_cpu(const SliceAttributes& attrs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        slice_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        slice_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"slice_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "slice_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        slice_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

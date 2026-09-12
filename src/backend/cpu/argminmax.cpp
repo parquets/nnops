@@ -9,6 +9,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "common/dtype_dispatch.hpp"
 #include <limits>
 
 namespace nnops::backend::cpu {
@@ -78,17 +79,10 @@ void argmax_cpu(const ArgMinMaxAttributes& attrs,
                  const ComputeContext& /*ctx*/,
                  void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        argminmax_impl<float>(attrs, output, inputs);
-        return;
-    case DataType::f16:
-        argminmax_impl<half>(attrs, output, inputs);
-        return;
-    default:
-        NNOPS_ASSERT(!"argmax_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "argmax_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        argminmax_impl<T>(attrs, output, inputs);
+    });
 }
 
 void argmin_cpu(const ArgMinMaxAttributes& attrs,

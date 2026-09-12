@@ -20,6 +20,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/half.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #if defined(NNOPS_ARCH_X86_64)
 #include "x86_64/quant.hpp"
@@ -305,16 +306,10 @@ void quantize_linear_cpu(const QuantLinearAttributes& attrs,
                          const ComputeContext& ctx,
                          void* /*workspace*/)
 {
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        quantize_linear_impl<float>(attrs, output, inputs, ctx);
-        break;
-    case DataType::f16:
-        quantize_linear_impl<half>(attrs, output, inputs, ctx);
-        break;
-    default:
-        NNOPS_ASSERT(!"quantize_linear_cpu: unsupported input dtype");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "quantize_linear_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        quantize_linear_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 void dequantize_linear_cpu(const QuantLinearAttributes& attrs,
@@ -323,16 +318,10 @@ void dequantize_linear_cpu(const QuantLinearAttributes& attrs,
                            const ComputeContext& ctx,
                            void* /*workspace*/)
 {
-    switch (output.data_type()) {
-    case DataType::f32:
-        dequantize_linear_impl<float>(attrs, output, inputs, ctx);
-        break;
-    case DataType::f16:
-        dequantize_linear_impl<half>(attrs, output, inputs, ctx);
-        break;
-    default:
-        NNOPS_ASSERT(!"dequantize_linear_cpu: unsupported output dtype");
-    }
+    dispatch_f32_f16(output.data_type(), "dequantize_linear_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        dequantize_linear_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

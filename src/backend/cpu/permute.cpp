@@ -17,6 +17,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_permute.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -185,29 +186,18 @@ void permute_cpu(const PermuteAttributes& attrs,
     }
 
     if (is_last_two_swap) {
-        switch (dtype) {
-        case DataType::f32:
-            permute_last_two_swap_impl<float>(output, inputs, ctx);
-            return;
-        case DataType::f16:
-            permute_last_two_swap_impl<half>(output, inputs, ctx);
-            return;
-        default:
-            break;
-        }
+        dispatch_f32_f16(dtype, "permute_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            permute_last_two_swap_impl<T>(output, inputs, ctx);
+        });
+        return;
     }
 
     // General path
-    switch (dtype) {
-    case DataType::f32:
-        permute_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        permute_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"permute_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(dtype, "permute_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        permute_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

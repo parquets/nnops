@@ -24,6 +24,8 @@
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
 #include "common/memory_pool.hpp"
+#include "common/index.hpp"
+#include "common/dtype_dispatch.hpp"
 #include "simd_kernel/simd_softmax.hpp"
 
 #if defined(NNOPS_ARCH_X86_64)
@@ -127,16 +129,7 @@ void softmax_general(
             }
         } else {
             // ---- Pitch-padded fallback: scalar with precomputed offsets ----
-            std::vector<int64_t> inner_offsets(static_cast<size_t>(inner_total));
-            for (int64_t s = 0; s < inner_total; ++s) {
-                int64_t off = 0, rem = s;
-                for (int64_t d = rank - 1; d > axis; --d) {
-                    int64_t dim = X.shape(d);
-                    off += (rem % dim) * X.stride_elems(d) * pack;
-                    rem /= dim;
-                }
-                inner_offsets[static_cast<size_t>(s)] = off;
-            }
+            const auto inner_offsets = build_offsets(X, axis + 1, rank - 1, inner_total);
 
             for (int64_t s = 0; s < inner_total; ++s) {
                 scalar_softmax(inner_offsets[static_cast<size_t>(s)]);
@@ -220,16 +213,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 
         const auto process_pos = [&](int64_t s) {
             // Map flat spatial index → tensor offset (skipping C8 dim)
-            int64_t off = 0;
-            int64_t rem = s;
-            for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == 1) {
-                    continue;
-                }
-                int64_t dim = X.shape(d);
-                off += (rem % dim) * X.stride_elems(d);
-                rem /= dim;
-            }
+            const int64_t off = decompose_flat_offset(s, X, 0, rank - 1, /*skip_dim=*/1);
             kernel::softmax_process_packed_channel<T>(
                 x_ptr + off, y_ptr + off,
                 chan_stride,
@@ -258,16 +242,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
         }
 
         const auto process_pos = [&](int64_t s) {
-            int64_t off = 0;
-            int64_t rem = s;
-            for (int64_t d = rank - 1; d >= 0; --d) {
-                if (d == axis) {
-                    continue;
-                }
-                int64_t dim = X.shape(d);
-                off += (rem % dim) * X.stride_elems(d);
-                rem /= dim;
-            }
+            const int64_t off = decompose_flat_offset(s, X, 0, rank - 1, /*skip_dim=*/axis);
             kernel::softmax_per_lane<T>(
                 x_ptr + off, y_ptr + off,
                 D, axis_stride, log_softmax, inv_T);
@@ -449,16 +424,10 @@ void softmax_cpu(const SoftmaxAttributes& attrs,
         softmax_quant_input_impl(attrs, output, inputs, ctx, scratch.get());
         return;
     }
-    switch (dtype) {
-    case DataType::f32:
-        softmax_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        softmax_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"softmax_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(dtype, "softmax_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        softmax_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

@@ -26,6 +26,7 @@
 #include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_unary.hpp"
 #include "common/elementwise.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cstdint>
 
@@ -115,16 +116,11 @@ void unary_cpu(const UnaryAttributes& attrs,
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
-        switch (dtype) {
-        case DataType::f32:
-            unary_impl<float>(attrs, output, inputs, ctx);
-            return;
-        case DataType::f16:
-            unary_impl<half>(attrs, output, inputs, ctx);
-            return;
-        default:
-            NNOPS_ASSERT(!"unary_cpu: unsupported data type (only f32 and f16)");
-        }
+        dispatch_f32_f16(dtype, "unary_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            unary_impl<T>(attrs, output, inputs, ctx);
+        });
+        return;
     }
 
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).

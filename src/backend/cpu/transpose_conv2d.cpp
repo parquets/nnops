@@ -14,6 +14,7 @@
 #include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_epilogue.hpp"
+#include "common/dtype_dispatch.hpp"
 
 namespace nnops::backend::cpu {
 
@@ -247,17 +248,10 @@ void transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
                            const ComputeContext& ctx,
                            void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        tconv2d_impl_nchwc8<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        tconv2d_impl_nchwc8<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"transpose_conv2d_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "transpose_conv2d_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        tconv2d_impl_nchwc8<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

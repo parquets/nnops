@@ -12,6 +12,7 @@
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/tiled_map.hpp"
 #include "common/elementwise.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <algorithm>
 
@@ -45,17 +46,10 @@ void clamp_cpu(const ClampAttributes& attrs,
                  const ComputeContext& ctx,
                  void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        clamp_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        clamp_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"clamp_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "clamp_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        clamp_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

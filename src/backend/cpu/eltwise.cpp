@@ -24,6 +24,7 @@
 #include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_eltwise.hpp"
 #include "common/elementwise.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cstdint>
 
@@ -102,16 +103,11 @@ void eltwise_cpu(const EltwiseAttributes& attrs,
     const bool out_is_int = is_quantized_dtype(output.data_type());
 
     if (!in_is_int && !out_is_int) {
-        switch (dtype) {
-        case DataType::f32:
-            eltwise_impl<float>(attrs, output, inputs, ctx);
-            return;
-        case DataType::f16:
-            eltwise_impl<half>(attrs, output, inputs, ctx);
-            return;
-        default:
-            NNOPS_ASSERT(!"eltwise_cpu: unsupported data type (only f32 and f16)");
-        }
+        dispatch_f32_f16(dtype, "eltwise_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            eltwise_impl<T>(attrs, output, inputs, ctx);
+        });
+        return;
     }
 
     // Quantized path: both inputs and the output must be s8/u8 (no float↔int mixing).

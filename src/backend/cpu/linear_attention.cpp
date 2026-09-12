@@ -7,6 +7,7 @@
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
+#include "common/dtype_dispatch.hpp"
 
 namespace nnops::backend::cpu {
 
@@ -50,17 +51,10 @@ void linear_attention_cpu(const LinearAttentionAttributes& attrs,
                           const ComputeContext& ctx,
                           void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        linear_attention_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        linear_attention_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"linear_attention_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "linear_attention_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        linear_attention_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

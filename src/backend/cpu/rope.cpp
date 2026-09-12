@@ -15,6 +15,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_rope.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cmath>
 #include <vector>
@@ -161,17 +162,10 @@ void rope_cpu(const RoPEAttributes& attrs,
               const ComputeContext& ctx,
               void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        rope_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        rope_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"rope_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "rope_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        rope_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu

@@ -11,6 +11,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cstring>
 
@@ -100,17 +101,10 @@ void flatten_cpu(const FlattenAttributes& attrs,
                   const ComputeContext& /*ctx*/,
                   void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        flatten_impl<float>(attrs, output, inputs);
-        return;
-    case DataType::f16:
-        flatten_impl<half>(attrs, output, inputs);
-        return;
-    default:
-        NNOPS_ASSERT(!"flatten_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "flatten_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        flatten_impl<T>(attrs, output, inputs);
+    });
 }
 
 }  // namespace nnops::backend::cpu

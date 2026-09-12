@@ -12,6 +12,8 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_norm.hpp"
+#include "common/index.hpp"
+#include "common/dtype_dispatch.hpp"
 
 #include <cmath>
 #include <vector>
@@ -32,19 +34,7 @@ namespace {
 inline std::vector<int64_t> compute_inner_offsets(
     const TensorView& X, int64_t axis, int64_t norm_size)
 {
-    const int64_t rank = X.rank();
-    std::vector<int64_t> offsets(static_cast<size_t>(norm_size));
-    for (int64_t flat = 0; flat < norm_size; ++flat) {
-        int64_t off = 0;
-        int64_t rem = flat;
-        for (int64_t d = rank - 1; d >= axis; --d) {
-            int64_t dim = X.shape(d);
-            off += (rem % dim) * X.stride_elems(d);
-            rem /= dim;
-        }
-        offsets[static_cast<size_t>(flat)] = off;
-    }
-    return offsets;
+    return build_offsets(X, axis, X.rank() - 1, norm_size);
 }
 
 /// Normalized axis dimensions for row-wise norm dispatch.
@@ -572,17 +562,10 @@ void norm_cpu(const NormAttributes& attrs,
               const ComputeContext& ctx,
               void* /*workspace*/)
 {
-    const auto dtype = inputs[0].data_type();
-    switch (dtype) {
-    case DataType::f32:
-        norm_impl<float>(attrs, output, inputs, ctx);
-        return;
-    case DataType::f16:
-        norm_impl<half>(attrs, output, inputs, ctx);
-        return;
-    default:
-        NNOPS_ASSERT(!"norm_cpu: unsupported data type (only f32 and f16)");
-    }
+    dispatch_f32_f16(inputs[0].data_type(), "norm_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        norm_impl<T>(attrs, output, inputs, ctx);
+    });
 }
 
 }  // namespace nnops::backend::cpu
