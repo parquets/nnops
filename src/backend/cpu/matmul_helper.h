@@ -120,7 +120,7 @@ constexpr int align_up(int n) {
 // =========================================================================
 
 constexpr int KC_F32   = 128;
-constexpr int KC_F16   = 256;
+constexpr int KC_F16   = 128;   // k-block length also bounds per-block fp16 accumulation error
 constexpr int KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
 constexpr int KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 
@@ -233,7 +233,7 @@ constexpr int num_panels4(int n, const int* nr) noexcept {
 
 /// Stack-resident packed-A buffer size (elements) for one MC_TARGET×Kc tile at
 /// the full-Kc uniform stride — an upper bound for every per-k-block pack:
-///   f32: 144×128×4 = 72 KB, f16: 144×256×2 = 72 KB (KC_F16 = 256), both arches.
+///   f32: 144×128×4 = 72 KB, f16: 144×128×2 = 36 KB (KC_F16 = 128), both arches.
 /// Declared with alignas in the kernel.
 template <class T>
 constexpr int pack_a_stack_elems() {

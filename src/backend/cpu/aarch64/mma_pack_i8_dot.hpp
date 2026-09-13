@@ -43,6 +43,32 @@ inline void mma_pack_1x1_s8s8_dot(int32_t* NNOPS_RESTRICT C, int ldc,
     C[0 * ldc] = std::min(std::max(c, clamp_min), clamp_max);
 }
 
+inline void mma_pack_1x4_s8s8_dot(int32_t* NNOPS_RESTRICT C, int ldc,
+                                  const int8_t* NNOPS_RESTRICT A,
+                                  const int8_t* NNOPS_RESTRICT B, int K,
+                                  int32_t clamp_min, int32_t clamp_max) noexcept {
+    int32x4_t v_c00 = vld1q_s32(C + 0 * ldc);
+
+    for (int k = 0; k < K; ++k) {
+        int8x16_t v_a = vreinterpretq_s8_s32(vdupq_n_s32(*reinterpret_cast<const int32_t*>(A)));
+
+        int8x16_t v_b0 = vld1q_s8(B);
+
+        v_c00 = vdotq_s32(v_c00, v_a, v_b0);
+
+        A += 4;
+        B += 16;
+    }
+
+    int32x4_t v_min = vdupq_n_s32(clamp_min);
+    v_c00 = vmaxq_s32(v_c00, v_min);
+
+    int32x4_t v_max = vdupq_n_s32(clamp_max);
+    v_c00 = vminq_s32(v_c00, v_max);
+
+    vst1q_s32(C + 0 * ldc, v_c00);
+}
+
 inline void mma_pack_1x8_s8s8_dot(int32_t* NNOPS_RESTRICT C, int ldc,
                                   const int8_t* NNOPS_RESTRICT A,
                                   const int8_t* NNOPS_RESTRICT B, int K,
