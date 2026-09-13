@@ -17,6 +17,9 @@
 ///     allocation happens once per operator call, not per element, so the lock
 ///     cost is negligible even under parallel operator execution.
 ///   - Requests above 4 MiB bypass the pool and use a direct aligned alloc/free.
+///   - The free lists are bounded by a retention budget: once pooled bytes
+///     exceed it, the largest freed blocks are returned to the OS instead of
+///     being kept, so the pool's idle footprint can't grow without limit.
 ///
 /// This header is internal to the CPU backend (not part of the public nnops
 /// API). The only surface exposed to library consumers is

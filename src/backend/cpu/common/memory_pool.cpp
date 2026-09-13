@@ -1,5 +1,6 @@
 /// @file memory_pool.cpp
-/// @brief MemoryPool implementation — size-class free lists + a global mutex.
+/// @brief MemoryPool implementation — size-class free lists, a global mutex,
+///        and a bounded retention budget.
 
 #include "backend/cpu/common/memory_pool.hpp"
 #include "nnops/detail/assert.hpp"
@@ -17,6 +18,15 @@ constexpr size_t kAlignment = 64;                  // matches GEMM PANEL_ALIGN_B
 constexpr size_t kMinClass  = 64;                  // smallest pooled size
 constexpr size_t kMaxClass  = 4u * 1024u * 1024u;  // 4 MiB cap
 constexpr int    kNumClasses = 17;                 // 64 B .. 4 MiB (powers of two)
+
+// Retention budget: total bytes allowed to sit in the free lists. When a free
+// pushes the pool over this bound, the largest pooled blocks are returned to
+// the OS so the pool's footprint stays bounded. This is the knob that trades
+// reuse (fewer malloc/free calls) against held-but-idle memory: a larger budget
+// reuses more, a smaller budget returns scratch to the OS sooner. 64 MiB is a
+// conservative default, far above a single <=4 MiB request so it does not
+// inhibit normal scratch reuse.
+constexpr size_t kMaxPooledBytes = 64u * 1024u * 1024u;
 
 constexpr uint32_t kMagic = 0x4E4E4F50u;           // "NNOP" — block sanity tag
 
@@ -120,6 +130,24 @@ void MemoryPool::deallocate(void* ptr) noexcept {
         impl_->buckets[idx] = h;
         impl_->pooled_bytes_ += size;
         ++impl_->pooled_blocks_;
+
+        // Keep the retained footprint bounded: once the free lists hold more
+        // than the budget, return the largest surplus blocks to the OS. Walk
+        // classes largest-first so the big, rarely-reused scratch is returned
+        // before the small, hot classes.
+        for (int i = kNumClasses - 1;
+             i >= 0 && impl_->pooled_bytes_ > kMaxPooledBytes; --i) {
+            const size_t cls = size_t{kMinClass} << i;
+            PoolHeader* cur = impl_->buckets[i];
+            while (cur != nullptr && impl_->pooled_bytes_ > kMaxPooledBytes) {
+                PoolHeader* next = cur->next;
+                ::operator delete(cur, std::align_val_t{kAlignment});
+                --impl_->pooled_blocks_;
+                impl_->pooled_bytes_ -= cls;
+                cur = next;
+            }
+            impl_->buckets[i] = cur;
+        }
     } else {
         ::operator delete(h, std::align_val_t{kAlignment});
     }
