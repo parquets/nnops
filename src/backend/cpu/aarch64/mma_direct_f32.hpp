@@ -29,6 +29,7 @@ namespace nnops::backend::cpu::aarch64 {
 //  mr=1  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_direct_1x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -46,6 +47,7 @@ inline void mma_direct_1x1_f32(
     C[0] = std::min(std::max(c0, clamp_min), clamp_max);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_1x4_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -76,12 +78,13 @@ inline void mma_direct_1x4_f32(
         v_c0 = vfmaq_n_f32(v_c0, v_b0, *A_ptr0++);
     }
 
-    v_c0 = vaddq_f32(v_c0, vld1q_f32(C));
+    if constexpr (!zero_mode) { v_c0 = vaddq_f32(v_c0, vld1q_f32(C)); }
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
     vst1q_f32(C, vminq_f32(vmaxq_f32(v_c0, v_min), v_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_1x12_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -148,9 +151,9 @@ inline void mma_direct_1x12_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    v_c00 = vaddq_f32(v_c00, vld1q_f32(C + 0 * 4));
-    v_c01 = vaddq_f32(v_c01, vld1q_f32(C + 1 * 4));
-    v_c02 = vaddq_f32(v_c02, vld1q_f32(C + 2 * 4));
+    if constexpr (!zero_mode) { v_c00 = vaddq_f32(v_c00, vld1q_f32(C + 0 * 4)); 
+    v_c01 = vaddq_f32(v_c01, vld1q_f32(C + 1 * 4)); 
+    v_c02 = vaddq_f32(v_c02, vld1q_f32(C + 2 * 4)); }
 
     vst1q_f32(C + 0 * 4, vminq_f32(vmaxq_f32(v_c00, v_min), v_max));
     vst1q_f32(C + 1 * 4, vminq_f32(vmaxq_f32(v_c01, v_min), v_max));
@@ -161,6 +164,7 @@ inline void mma_direct_1x12_f32(
 //  mr=4  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_direct_4x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -185,7 +189,8 @@ inline void mma_direct_4x1_f32(
     }
 
     auto write = [&](float* dst, float acc) {
-        float v = *dst + acc;
+        float v = acc;
+        if constexpr (!zero_mode) { v = *dst + acc; }
         *dst = std::min(std::max(v, clamp_min), clamp_max);
     };
     write(C + 0 * ldc, c0);
@@ -194,6 +199,7 @@ inline void mma_direct_4x1_f32(
     write(C + 3 * ldc, c3);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_4x4_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -254,10 +260,10 @@ inline void mma_direct_4x4_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    v_c0 = vaddq_f32(v_c0, vld1q_f32(C + 0 * ldc));
-    v_c1 = vaddq_f32(v_c1, vld1q_f32(C + 1 * ldc));
-    v_c2 = vaddq_f32(v_c2, vld1q_f32(C + 2 * ldc));
-    v_c3 = vaddq_f32(v_c3, vld1q_f32(C + 3 * ldc));
+    if constexpr (!zero_mode) { v_c0 = vaddq_f32(v_c0, vld1q_f32(C + 0 * ldc)); 
+    v_c1 = vaddq_f32(v_c1, vld1q_f32(C + 1 * ldc)); 
+    v_c2 = vaddq_f32(v_c2, vld1q_f32(C + 2 * ldc)); 
+    v_c3 = vaddq_f32(v_c3, vld1q_f32(C + 3 * ldc)); }
 
     vst1q_f32(C + 0 * ldc, vminq_f32(vmaxq_f32(v_c0, v_min), v_max));
     vst1q_f32(C + 1 * ldc, vminq_f32(vmaxq_f32(v_c1, v_min), v_max));
@@ -265,6 +271,7 @@ inline void mma_direct_4x4_f32(
     vst1q_f32(C + 3 * ldc, vminq_f32(vmaxq_f32(v_c3, v_min), v_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_4x12_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -397,24 +404,25 @@ inline void mma_direct_4x12_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    v_c00 = vaddq_f32(v_c00, vld1q_f32(C + 0 * ldc + 0 * 4)); vst1q_f32(C + 0 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c00, v_min), v_max));
-    v_c01 = vaddq_f32(v_c01, vld1q_f32(C + 0 * ldc + 1 * 4)); vst1q_f32(C + 0 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c01, v_min), v_max));
-    v_c02 = vaddq_f32(v_c02, vld1q_f32(C + 0 * ldc + 2 * 4)); vst1q_f32(C + 0 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c02, v_min), v_max));
-    v_c10 = vaddq_f32(v_c10, vld1q_f32(C + 1 * ldc + 0 * 4)); vst1q_f32(C + 1 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c10, v_min), v_max));
-    v_c11 = vaddq_f32(v_c11, vld1q_f32(C + 1 * ldc + 1 * 4)); vst1q_f32(C + 1 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c11, v_min), v_max));
-    v_c12 = vaddq_f32(v_c12, vld1q_f32(C + 1 * ldc + 2 * 4)); vst1q_f32(C + 1 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c12, v_min), v_max));
-    v_c20 = vaddq_f32(v_c20, vld1q_f32(C + 2 * ldc + 0 * 4)); vst1q_f32(C + 2 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c20, v_min), v_max));
-    v_c21 = vaddq_f32(v_c21, vld1q_f32(C + 2 * ldc + 1 * 4)); vst1q_f32(C + 2 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c21, v_min), v_max));
-    v_c22 = vaddq_f32(v_c22, vld1q_f32(C + 2 * ldc + 2 * 4)); vst1q_f32(C + 2 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c22, v_min), v_max));
-    v_c30 = vaddq_f32(v_c30, vld1q_f32(C + 3 * ldc + 0 * 4)); vst1q_f32(C + 3 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c30, v_min), v_max));
-    v_c31 = vaddq_f32(v_c31, vld1q_f32(C + 3 * ldc + 1 * 4)); vst1q_f32(C + 3 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c31, v_min), v_max));
-    v_c32 = vaddq_f32(v_c32, vld1q_f32(C + 3 * ldc + 2 * 4)); vst1q_f32(C + 3 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c32, v_min), v_max));
+    if constexpr (!zero_mode) { v_c00 = vaddq_f32(v_c00, vld1q_f32(C + 0 * ldc + 0 * 4)); } vst1q_f32(C + 0 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c00, v_min), v_max));
+    if constexpr (!zero_mode) { v_c01 = vaddq_f32(v_c01, vld1q_f32(C + 0 * ldc + 1 * 4)); } vst1q_f32(C + 0 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c01, v_min), v_max));
+    if constexpr (!zero_mode) { v_c02 = vaddq_f32(v_c02, vld1q_f32(C + 0 * ldc + 2 * 4)); } vst1q_f32(C + 0 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c02, v_min), v_max));
+    if constexpr (!zero_mode) { v_c10 = vaddq_f32(v_c10, vld1q_f32(C + 1 * ldc + 0 * 4)); } vst1q_f32(C + 1 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c10, v_min), v_max));
+    if constexpr (!zero_mode) { v_c11 = vaddq_f32(v_c11, vld1q_f32(C + 1 * ldc + 1 * 4)); } vst1q_f32(C + 1 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c11, v_min), v_max));
+    if constexpr (!zero_mode) { v_c12 = vaddq_f32(v_c12, vld1q_f32(C + 1 * ldc + 2 * 4)); } vst1q_f32(C + 1 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c12, v_min), v_max));
+    if constexpr (!zero_mode) { v_c20 = vaddq_f32(v_c20, vld1q_f32(C + 2 * ldc + 0 * 4)); } vst1q_f32(C + 2 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c20, v_min), v_max));
+    if constexpr (!zero_mode) { v_c21 = vaddq_f32(v_c21, vld1q_f32(C + 2 * ldc + 1 * 4)); } vst1q_f32(C + 2 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c21, v_min), v_max));
+    if constexpr (!zero_mode) { v_c22 = vaddq_f32(v_c22, vld1q_f32(C + 2 * ldc + 2 * 4)); } vst1q_f32(C + 2 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c22, v_min), v_max));
+    if constexpr (!zero_mode) { v_c30 = vaddq_f32(v_c30, vld1q_f32(C + 3 * ldc + 0 * 4)); } vst1q_f32(C + 3 * ldc + 0 * 4, vminq_f32(vmaxq_f32(v_c30, v_min), v_max));
+    if constexpr (!zero_mode) { v_c31 = vaddq_f32(v_c31, vld1q_f32(C + 3 * ldc + 1 * 4)); } vst1q_f32(C + 3 * ldc + 1 * 4, vminq_f32(vmaxq_f32(v_c31, v_min), v_max));
+    if constexpr (!zero_mode) { v_c32 = vaddq_f32(v_c32, vld1q_f32(C + 3 * ldc + 2 * 4)); } vst1q_f32(C + 3 * ldc + 2 * 4, vminq_f32(vmaxq_f32(v_c32, v_min), v_max));
 }
 
 // =========================================================================
 //  mr=8  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_direct_8x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -448,7 +456,8 @@ inline void mma_direct_8x1_f32(
     }
 
     auto write = [&](float* dst, float acc) {
-        float v = *dst + acc;
+        float v = acc;
+        if constexpr (!zero_mode) { v = *dst + acc; }
         *dst = std::min(std::max(v, clamp_min), clamp_max);
     };
     write(C + 0 * ldc, c0);
@@ -461,6 +470,7 @@ inline void mma_direct_8x1_f32(
     write(C + 7 * ldc, c7);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_8x4_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -553,16 +563,17 @@ inline void mma_direct_8x4_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    v_c0 = vaddq_f32(v_c0, vld1q_f32(C + 0 * ldc)); vst1q_f32(C + 0 * ldc, vminq_f32(vmaxq_f32(v_c0, v_min), v_max));
-    v_c1 = vaddq_f32(v_c1, vld1q_f32(C + 1 * ldc)); vst1q_f32(C + 1 * ldc, vminq_f32(vmaxq_f32(v_c1, v_min), v_max));
-    v_c2 = vaddq_f32(v_c2, vld1q_f32(C + 2 * ldc)); vst1q_f32(C + 2 * ldc, vminq_f32(vmaxq_f32(v_c2, v_min), v_max));
-    v_c3 = vaddq_f32(v_c3, vld1q_f32(C + 3 * ldc)); vst1q_f32(C + 3 * ldc, vminq_f32(vmaxq_f32(v_c3, v_min), v_max));
-    v_c4 = vaddq_f32(v_c4, vld1q_f32(C + 4 * ldc)); vst1q_f32(C + 4 * ldc, vminq_f32(vmaxq_f32(v_c4, v_min), v_max));
-    v_c5 = vaddq_f32(v_c5, vld1q_f32(C + 5 * ldc)); vst1q_f32(C + 5 * ldc, vminq_f32(vmaxq_f32(v_c5, v_min), v_max));
-    v_c6 = vaddq_f32(v_c6, vld1q_f32(C + 6 * ldc)); vst1q_f32(C + 6 * ldc, vminq_f32(vmaxq_f32(v_c6, v_min), v_max));
-    v_c7 = vaddq_f32(v_c7, vld1q_f32(C + 7 * ldc)); vst1q_f32(C + 7 * ldc, vminq_f32(vmaxq_f32(v_c7, v_min), v_max));
+    if constexpr (!zero_mode) { v_c0 = vaddq_f32(v_c0, vld1q_f32(C + 0 * ldc)); } vst1q_f32(C + 0 * ldc, vminq_f32(vmaxq_f32(v_c0, v_min), v_max));
+    if constexpr (!zero_mode) { v_c1 = vaddq_f32(v_c1, vld1q_f32(C + 1 * ldc)); } vst1q_f32(C + 1 * ldc, vminq_f32(vmaxq_f32(v_c1, v_min), v_max));
+    if constexpr (!zero_mode) { v_c2 = vaddq_f32(v_c2, vld1q_f32(C + 2 * ldc)); } vst1q_f32(C + 2 * ldc, vminq_f32(vmaxq_f32(v_c2, v_min), v_max));
+    if constexpr (!zero_mode) { v_c3 = vaddq_f32(v_c3, vld1q_f32(C + 3 * ldc)); } vst1q_f32(C + 3 * ldc, vminq_f32(vmaxq_f32(v_c3, v_min), v_max));
+    if constexpr (!zero_mode) { v_c4 = vaddq_f32(v_c4, vld1q_f32(C + 4 * ldc)); } vst1q_f32(C + 4 * ldc, vminq_f32(vmaxq_f32(v_c4, v_min), v_max));
+    if constexpr (!zero_mode) { v_c5 = vaddq_f32(v_c5, vld1q_f32(C + 5 * ldc)); } vst1q_f32(C + 5 * ldc, vminq_f32(vmaxq_f32(v_c5, v_min), v_max));
+    if constexpr (!zero_mode) { v_c6 = vaddq_f32(v_c6, vld1q_f32(C + 6 * ldc)); } vst1q_f32(C + 6 * ldc, vminq_f32(vmaxq_f32(v_c6, v_min), v_max));
+    if constexpr (!zero_mode) { v_c7 = vaddq_f32(v_c7, vld1q_f32(C + 7 * ldc)); } vst1q_f32(C + 7 * ldc, vminq_f32(vmaxq_f32(v_c7, v_min), v_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_8x12_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -680,58 +691,58 @@ inline void mma_direct_8x12_f32(
     const float32x4_t v_min = vdupq_n_f32(clamp_min);
     const float32x4_t v_max = vdupq_n_f32(clamp_max);
 
-    c00 = vaddq_f32(c00, vld1q_f32(C + 0 * ldc + 0 * 4));
-    c01 = vaddq_f32(c01, vld1q_f32(C + 0 * ldc + 1 * 4));
-    c02 = vaddq_f32(c02, vld1q_f32(C + 0 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c00 = vaddq_f32(c00, vld1q_f32(C + 0 * ldc + 0 * 4)); 
+    c01 = vaddq_f32(c01, vld1q_f32(C + 0 * ldc + 1 * 4)); 
+    c02 = vaddq_f32(c02, vld1q_f32(C + 0 * ldc + 2 * 4)); }
     vst1q_f32(C + 0 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c00, v_min), v_max));
     vst1q_f32(C + 0 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c01, v_min), v_max));
     vst1q_f32(C + 0 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c02, v_min), v_max));
 
-    c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4));
-    c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4));
-    c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); 
+    c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); 
+    c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4)); }
     vst1q_f32(C + 1 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c10, v_min), v_max));
     vst1q_f32(C + 1 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c11, v_min), v_max));
     vst1q_f32(C + 1 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c12, v_min), v_max));
 
-    c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4));
-    c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4));
-    c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); 
+    c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); 
+    c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4)); }
     vst1q_f32(C + 2 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c20, v_min), v_max));
     vst1q_f32(C + 2 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c21, v_min), v_max));
     vst1q_f32(C + 2 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c22, v_min), v_max));
 
-    c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4));
-    c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4));
-    c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4)); 
+    c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4)); 
+    c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4)); }
     vst1q_f32(C + 3 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c30, v_min), v_max));
     vst1q_f32(C + 3 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c31, v_min), v_max));
     vst1q_f32(C + 3 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c32, v_min), v_max));
 
-    c40 = vaddq_f32(c40, vld1q_f32(C + 4 * ldc + 0 * 4));
-    c41 = vaddq_f32(c41, vld1q_f32(C + 4 * ldc + 1 * 4));
-    c42 = vaddq_f32(c42, vld1q_f32(C + 4 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c40 = vaddq_f32(c40, vld1q_f32(C + 4 * ldc + 0 * 4)); 
+    c41 = vaddq_f32(c41, vld1q_f32(C + 4 * ldc + 1 * 4)); 
+    c42 = vaddq_f32(c42, vld1q_f32(C + 4 * ldc + 2 * 4)); }
     vst1q_f32(C + 4 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c40, v_min), v_max));
     vst1q_f32(C + 4 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c41, v_min), v_max));
     vst1q_f32(C + 4 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c42, v_min), v_max));
 
-    c50 = vaddq_f32(c50, vld1q_f32(C + 5 * ldc + 0 * 4));
-    c51 = vaddq_f32(c51, vld1q_f32(C + 5 * ldc + 1 * 4));
-    c52 = vaddq_f32(c52, vld1q_f32(C + 5 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c50 = vaddq_f32(c50, vld1q_f32(C + 5 * ldc + 0 * 4)); 
+    c51 = vaddq_f32(c51, vld1q_f32(C + 5 * ldc + 1 * 4)); 
+    c52 = vaddq_f32(c52, vld1q_f32(C + 5 * ldc + 2 * 4)); }
     vst1q_f32(C + 5 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c50, v_min), v_max));
     vst1q_f32(C + 5 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c51, v_min), v_max));
     vst1q_f32(C + 5 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c52, v_min), v_max));
 
-    c60 = vaddq_f32(c60, vld1q_f32(C + 6 * ldc + 0 * 4));
-    c61 = vaddq_f32(c61, vld1q_f32(C + 6 * ldc + 1 * 4));
-    c62 = vaddq_f32(c62, vld1q_f32(C + 6 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c60 = vaddq_f32(c60, vld1q_f32(C + 6 * ldc + 0 * 4)); 
+    c61 = vaddq_f32(c61, vld1q_f32(C + 6 * ldc + 1 * 4)); 
+    c62 = vaddq_f32(c62, vld1q_f32(C + 6 * ldc + 2 * 4)); }
     vst1q_f32(C + 6 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c60, v_min), v_max));
     vst1q_f32(C + 6 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c61, v_min), v_max));
     vst1q_f32(C + 6 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c62, v_min), v_max));
 
-    c70 = vaddq_f32(c70, vld1q_f32(C + 7 * ldc + 0 * 4));
-    c71 = vaddq_f32(c71, vld1q_f32(C + 7 * ldc + 1 * 4));
-    c72 = vaddq_f32(c72, vld1q_f32(C + 7 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c70 = vaddq_f32(c70, vld1q_f32(C + 7 * ldc + 0 * 4)); 
+    c71 = vaddq_f32(c71, vld1q_f32(C + 7 * ldc + 1 * 4)); 
+    c72 = vaddq_f32(c72, vld1q_f32(C + 7 * ldc + 2 * 4)); }
     vst1q_f32(C + 7 * ldc + 0 * 4, vminq_f32(vmaxq_f32(c70, v_min), v_max));
     vst1q_f32(C + 7 * ldc + 1 * 4, vminq_f32(vmaxq_f32(c71, v_min), v_max));
     vst1q_f32(C + 7 * ldc + 2 * 4, vminq_f32(vmaxq_f32(c72, v_min), v_max));

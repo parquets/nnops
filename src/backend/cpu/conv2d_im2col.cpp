@@ -247,13 +247,16 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     }
 
                     const T* a = weight_ptr + icn * karea + ocn * w_ocn_step;
+                    // The tile was just initialised with the bias (or the saved
+                    // original output) — every icn block must accumulate.
                     tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                     static_cast<int>(icnc * karea),
                                     tile, static_cast<int>(ocn_step),
                                     a, static_cast<int>(w_ocn_step),
                                     col_data, static_cast<int>(roi_area),
                                     -std::numeric_limits<float>::infinity(),
-                                    std::numeric_limits<float>::infinity());
+                                    std::numeric_limits<float>::infinity(),
+                                    /*zero_mode=*/false);
 
                     if (is_last_icn) {
                         epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),

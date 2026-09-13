@@ -25,6 +25,7 @@ namespace nnops::backend::cpu::x86_64 {
 //  mr=1  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_direct_1x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -39,10 +40,11 @@ inline void mma_direct_1x1_f32(
         c0 += *A_ptr0++ * b0;
         B += ldb;
     }
-    c0 += C[0];
+    if constexpr (!zero_mode) { c0 += C[0]; }
     C[0] = std::min(std::max(c0, clamp_min), clamp_max);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_1x8_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -59,7 +61,7 @@ inline void mma_direct_1x8_f32(
         v_c0 = _mm256_fmadd_ps(v_a0, v_b0, v_c0);
     }
 
-    v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C)); }
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
@@ -69,6 +71,7 @@ inline void mma_direct_1x8_f32(
     _mm256_storeu_ps(C, v_c0);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_1x16_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -93,8 +96,8 @@ inline void mma_direct_1x16_f32(
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
 
-    v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * 8));
-    v_c01 = _mm256_add_ps(v_c01, _mm256_loadu_ps(C + 1 * 8));
+    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * 8)); 
+    v_c01 = _mm256_add_ps(v_c01, _mm256_loadu_ps(C + 1 * 8)); }
 
     _mm256_storeu_ps(C + 0 * 8, _mm256_min_ps(_mm256_max_ps(v_c00, v_min), v_max));
     _mm256_storeu_ps(C + 1 * 8, _mm256_min_ps(_mm256_max_ps(v_c01, v_min), v_max));
@@ -104,6 +107,7 @@ inline void mma_direct_1x16_f32(
 //  mr=4  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_direct_4x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -127,7 +131,8 @@ inline void mma_direct_4x1_f32(
     }
 
     auto write = [&](float* dst, float acc) {
-        float v = *dst + acc;
+        float v = acc;
+        if constexpr (!zero_mode) { v = *dst + acc; }
         *dst = std::min(std::max(v, clamp_min), clamp_max);
     };
     write(C + 0 * ldc, c0);
@@ -136,6 +141,7 @@ inline void mma_direct_4x1_f32(
     write(C + 3 * ldc, c3);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_4x8_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -168,10 +174,10 @@ inline void mma_direct_4x8_f32(
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
 
-    v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * ldc));
-    v_c1 = _mm256_add_ps(v_c1, _mm256_loadu_ps(C + 1 * ldc));
-    v_c2 = _mm256_add_ps(v_c2, _mm256_loadu_ps(C + 2 * ldc));
-    v_c3 = _mm256_add_ps(v_c3, _mm256_loadu_ps(C + 3 * ldc));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * ldc)); 
+    v_c1 = _mm256_add_ps(v_c1, _mm256_loadu_ps(C + 1 * ldc)); 
+    v_c2 = _mm256_add_ps(v_c2, _mm256_loadu_ps(C + 2 * ldc)); 
+    v_c3 = _mm256_add_ps(v_c3, _mm256_loadu_ps(C + 3 * ldc)); }
 
     _mm256_storeu_ps(C + 0 * ldc, _mm256_min_ps(_mm256_max_ps(v_c0, v_min), v_max));
     _mm256_storeu_ps(C + 1 * ldc, _mm256_min_ps(_mm256_max_ps(v_c1, v_min), v_max));
@@ -179,6 +185,7 @@ inline void mma_direct_4x8_f32(
     _mm256_storeu_ps(C + 3 * ldc, _mm256_min_ps(_mm256_max_ps(v_c3, v_min), v_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_4x16_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -224,14 +231,14 @@ inline void mma_direct_4x16_f32(
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
 
-    v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * ldc + 0 * 8));
-    v_c01 = _mm256_add_ps(v_c01, _mm256_loadu_ps(C + 0 * ldc + 1 * 8));
-    v_c10 = _mm256_add_ps(v_c10, _mm256_loadu_ps(C + 1 * ldc + 0 * 8));
-    v_c11 = _mm256_add_ps(v_c11, _mm256_loadu_ps(C + 1 * ldc + 1 * 8));
-    v_c20 = _mm256_add_ps(v_c20, _mm256_loadu_ps(C + 2 * ldc + 0 * 8));
-    v_c21 = _mm256_add_ps(v_c21, _mm256_loadu_ps(C + 2 * ldc + 1 * 8));
-    v_c30 = _mm256_add_ps(v_c30, _mm256_loadu_ps(C + 3 * ldc + 0 * 8));
-    v_c31 = _mm256_add_ps(v_c31, _mm256_loadu_ps(C + 3 * ldc + 1 * 8));
+    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * ldc + 0 * 8)); 
+    v_c01 = _mm256_add_ps(v_c01, _mm256_loadu_ps(C + 0 * ldc + 1 * 8)); 
+    v_c10 = _mm256_add_ps(v_c10, _mm256_loadu_ps(C + 1 * ldc + 0 * 8)); 
+    v_c11 = _mm256_add_ps(v_c11, _mm256_loadu_ps(C + 1 * ldc + 1 * 8)); 
+    v_c20 = _mm256_add_ps(v_c20, _mm256_loadu_ps(C + 2 * ldc + 0 * 8)); 
+    v_c21 = _mm256_add_ps(v_c21, _mm256_loadu_ps(C + 2 * ldc + 1 * 8)); 
+    v_c30 = _mm256_add_ps(v_c30, _mm256_loadu_ps(C + 3 * ldc + 0 * 8)); 
+    v_c31 = _mm256_add_ps(v_c31, _mm256_loadu_ps(C + 3 * ldc + 1 * 8)); }
 
     _mm256_storeu_ps(C + 0 * ldc + 0 * 8, _mm256_min_ps(_mm256_max_ps(v_c00, v_min), v_max));
     _mm256_storeu_ps(C + 0 * ldc + 1 * 8, _mm256_min_ps(_mm256_max_ps(v_c01, v_min), v_max));
@@ -247,6 +254,7 @@ inline void mma_direct_4x16_f32(
 //  mr=6  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_direct_6x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -275,7 +283,8 @@ inline void mma_direct_6x1_f32(
     }
 
     auto write = [&](float* dst, float acc) {
-        float v = *dst + acc;
+        float v = acc;
+        if constexpr (!zero_mode) { v = *dst + acc; }
         *dst = std::min(std::max(v, clamp_min), clamp_max);
     };
     write(C + 0 * ldc, acc0);
@@ -286,6 +295,7 @@ inline void mma_direct_6x1_f32(
     write(C + 5 * ldc, acc5);
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_6x8_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -326,12 +336,12 @@ inline void mma_direct_6x8_f32(
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
 
-    v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * ldc));
-    v_c1 = _mm256_add_ps(v_c1, _mm256_loadu_ps(C + 1 * ldc));
-    v_c2 = _mm256_add_ps(v_c2, _mm256_loadu_ps(C + 2 * ldc));
-    v_c3 = _mm256_add_ps(v_c3, _mm256_loadu_ps(C + 3 * ldc));
-    v_c4 = _mm256_add_ps(v_c4, _mm256_loadu_ps(C + 4 * ldc));
-    v_c5 = _mm256_add_ps(v_c5, _mm256_loadu_ps(C + 5 * ldc));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, _mm256_loadu_ps(C + 0 * ldc)); 
+    v_c1 = _mm256_add_ps(v_c1, _mm256_loadu_ps(C + 1 * ldc)); 
+    v_c2 = _mm256_add_ps(v_c2, _mm256_loadu_ps(C + 2 * ldc)); 
+    v_c3 = _mm256_add_ps(v_c3, _mm256_loadu_ps(C + 3 * ldc)); 
+    v_c4 = _mm256_add_ps(v_c4, _mm256_loadu_ps(C + 4 * ldc)); 
+    v_c5 = _mm256_add_ps(v_c5, _mm256_loadu_ps(C + 5 * ldc)); }
 
     _mm256_storeu_ps(C + 0 * ldc, _mm256_min_ps(_mm256_max_ps(v_c0, v_min), v_max));
     _mm256_storeu_ps(C + 1 * ldc, _mm256_min_ps(_mm256_max_ps(v_c1, v_min), v_max));
@@ -341,6 +351,7 @@ inline void mma_direct_6x8_f32(
     _mm256_storeu_ps(C + 5 * ldc, _mm256_min_ps(_mm256_max_ps(v_c5, v_min), v_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_direct_6x16_f32(
     float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -400,18 +411,18 @@ inline void mma_direct_6x16_f32(
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
 
-    v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * ldc + 0 * 8));
-    v_c01 = _mm256_add_ps(v_c01, _mm256_loadu_ps(C + 0 * ldc + 1 * 8));
-    v_c10 = _mm256_add_ps(v_c10, _mm256_loadu_ps(C + 1 * ldc + 0 * 8));
-    v_c11 = _mm256_add_ps(v_c11, _mm256_loadu_ps(C + 1 * ldc + 1 * 8));
-    v_c20 = _mm256_add_ps(v_c20, _mm256_loadu_ps(C + 2 * ldc + 0 * 8));
-    v_c21 = _mm256_add_ps(v_c21, _mm256_loadu_ps(C + 2 * ldc + 1 * 8));
-    v_c30 = _mm256_add_ps(v_c30, _mm256_loadu_ps(C + 3 * ldc + 0 * 8));
-    v_c31 = _mm256_add_ps(v_c31, _mm256_loadu_ps(C + 3 * ldc + 1 * 8));
-    v_c40 = _mm256_add_ps(v_c40, _mm256_loadu_ps(C + 4 * ldc + 0 * 8));
-    v_c41 = _mm256_add_ps(v_c41, _mm256_loadu_ps(C + 4 * ldc + 1 * 8));
-    v_c50 = _mm256_add_ps(v_c50, _mm256_loadu_ps(C + 5 * ldc + 0 * 8));
-    v_c51 = _mm256_add_ps(v_c51, _mm256_loadu_ps(C + 5 * ldc + 1 * 8));
+    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, _mm256_loadu_ps(C + 0 * ldc + 0 * 8)); 
+    v_c01 = _mm256_add_ps(v_c01, _mm256_loadu_ps(C + 0 * ldc + 1 * 8)); 
+    v_c10 = _mm256_add_ps(v_c10, _mm256_loadu_ps(C + 1 * ldc + 0 * 8)); 
+    v_c11 = _mm256_add_ps(v_c11, _mm256_loadu_ps(C + 1 * ldc + 1 * 8)); 
+    v_c20 = _mm256_add_ps(v_c20, _mm256_loadu_ps(C + 2 * ldc + 0 * 8)); 
+    v_c21 = _mm256_add_ps(v_c21, _mm256_loadu_ps(C + 2 * ldc + 1 * 8)); 
+    v_c30 = _mm256_add_ps(v_c30, _mm256_loadu_ps(C + 3 * ldc + 0 * 8)); 
+    v_c31 = _mm256_add_ps(v_c31, _mm256_loadu_ps(C + 3 * ldc + 1 * 8)); 
+    v_c40 = _mm256_add_ps(v_c40, _mm256_loadu_ps(C + 4 * ldc + 0 * 8)); 
+    v_c41 = _mm256_add_ps(v_c41, _mm256_loadu_ps(C + 4 * ldc + 1 * 8)); 
+    v_c50 = _mm256_add_ps(v_c50, _mm256_loadu_ps(C + 5 * ldc + 0 * 8)); 
+    v_c51 = _mm256_add_ps(v_c51, _mm256_loadu_ps(C + 5 * ldc + 1 * 8)); }
 
     _mm256_storeu_ps(C + 0 * ldc + 0 * 8, _mm256_min_ps(_mm256_max_ps(v_c00, v_min), v_max));
     _mm256_storeu_ps(C + 0 * ldc + 1 * 8, _mm256_min_ps(_mm256_max_ps(v_c01, v_min), v_max));

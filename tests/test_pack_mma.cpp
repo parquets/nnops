@@ -575,6 +575,112 @@ NNOPS_TEST(mma_f32_zero_a) {
 }
 
 // =========================================================================
+//  Section 11b: ZeroMode — <true> overwrites C, <false> accumulates
+// =========================================================================
+
+NNOPS_TEST(mma_f32_zero_mode_pack) {
+    constexpr int M = 4, N = 8, K = 5;
+    std::vector<float> A(M * K);
+    std::vector<float> B_packed(K * N);
+    fill_ramp(A.data(), M * K, 1.0f);
+    fill_ramp(B_packed.data(), K * N, 0.5f);
+
+    std::vector<float> C_ref(M * N);
+    naive_gemm_packed(C_ref.data(), N, A.data(), B_packed.data(), N, M, N, K);
+
+    // ZeroMode=true: the junk pre-fill must be ignored (overwrite).
+    std::vector<float> C(M * N);
+    fill_ramp(C.data(), M * N, 100.0f);
+    mma_pack_4x8_f32<true>(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(C[i], C_ref[i], 1e-4f);
+    }
+
+    // ZeroMode=false: the same pre-fill must be added (accumulate).
+    fill_ramp(C.data(), M * N, 100.0f);
+    mma_pack_4x8_f32<false>(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(C[i], C_ref[i] + 100.0f + float(i), 1e-3f);
+    }
+}
+
+NNOPS_TEST(mma_f32_zero_mode_direct) {
+    constexpr int M = 4, N = 8, K = 5;
+    std::vector<float> A(M * K);
+    std::vector<float> B(K * N);
+    fill_ramp(A.data(), M * K, 1.0f);
+    fill_ramp(B.data(), K * N, 0.5f);
+
+    std::vector<float> C_ref(M * N);
+    naive_gemm(C_ref.data(), N, A.data(), K, B.data(), N, M, N, K);
+
+    std::vector<float> C(M * N);
+    fill_ramp(C.data(), M * N, 100.0f);
+    mma_direct_4x8_f32<true>(C.data(), N, A.data(), K, B.data(), N, K, -1e9f, 1e9f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(C[i], C_ref[i], 1e-4f);
+    }
+
+    fill_ramp(C.data(), M * N, 100.0f);
+    mma_direct_4x8_f32<false>(C.data(), N, A.data(), K, B.data(), N, K, -1e9f, 1e9f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(C[i], C_ref[i] + 100.0f + float(i), 1e-3f);
+    }
+}
+
+NNOPS_TEST(mma_f16_zero_mode_pack) {
+    constexpr int M = 4, N = 8, K = 5;
+    std::vector<f16_t> A(M * K);
+    std::vector<f16_t> B_packed(K * N);
+    for (int i = 0; i < M * K; ++i) { A[i] = f_to_f16(1.0f + 0.1f * float(i)); }
+    for (int i = 0; i < K * N; ++i) { B_packed[i] = f_to_f16(0.5f + 0.05f * float(i)); }
+
+    std::vector<float> A_f32(M * K), B_f32(K * N), C_ref(M * N);
+    for (int i = 0; i < M * K; ++i) { A_f32[i] = f16_to_f(A[i]); }
+    for (int i = 0; i < K * N; ++i) { B_f32[i] = f16_to_f(B_packed[i]); }
+    naive_gemm_packed(C_ref.data(), N, A_f32.data(), B_f32.data(), N, M, N, K);
+
+    std::vector<f16_t> C(M * N);
+    for (int i = 0; i < M * N; ++i) { C[i] = f_to_f16(100.0f + float(i)); }
+    mma_pack_4x8_f16<true>(C.data(), N, A.data(), B_packed.data(), N, K, -1e4f, 1e4f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(f16_to_f(C[i]), C_ref[i], 0.5f);
+    }
+
+    for (int i = 0; i < M * N; ++i) { C[i] = f_to_f16(100.0f + float(i)); }
+    mma_pack_4x8_f16<false>(C.data(), N, A.data(), B_packed.data(), N, K, -1e4f, 1e4f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(f16_to_f(C[i]), C_ref[i] + 100.0f + float(i), 0.5f);
+    }
+}
+
+NNOPS_TEST(mma_f16_zero_mode_direct) {
+    constexpr int M = 4, N = 8, K = 5;
+    std::vector<f16_t> A(M * K);
+    std::vector<f16_t> B(K * N);
+    for (int i = 0; i < M * K; ++i) { A[i] = f_to_f16(1.0f + 0.1f * float(i)); }
+    for (int i = 0; i < K * N; ++i) { B[i] = f_to_f16(0.5f + 0.05f * float(i)); }
+
+    std::vector<float> A_f32(M * K), B_f32(K * N), C_ref(M * N);
+    for (int i = 0; i < M * K; ++i) { A_f32[i] = f16_to_f(A[i]); }
+    for (int i = 0; i < K * N; ++i) { B_f32[i] = f16_to_f(B[i]); }
+    naive_gemm(C_ref.data(), N, A_f32.data(), K, B_f32.data(), N, M, N, K);
+
+    std::vector<f16_t> C(M * N);
+    for (int i = 0; i < M * N; ++i) { C[i] = f_to_f16(100.0f + float(i)); }
+    mma_direct_4x8_f16<true>(C.data(), N, A.data(), K, B.data(), N, K, -1e4f, 1e4f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(f16_to_f(C[i]), C_ref[i], 0.5f);
+    }
+
+    for (int i = 0; i < M * N; ++i) { C[i] = f_to_f16(100.0f + float(i)); }
+    mma_direct_4x8_f16<false>(C.data(), N, A.data(), K, B.data(), N, K, -1e4f, 1e4f);
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(f16_to_f(C[i]), C_ref[i] + 100.0f + float(i), 0.5f);
+    }
+}
+
+// =========================================================================
 //  Section 12: half (f16) quantization / dequantization kernels
 // =========================================================================
 

@@ -98,12 +98,16 @@ void matmul_m_panels(const MatMulAttributes& attrs,
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))
                       / static_cast<int>(sizeof(T));
     const bool epilogue = has_inplace_epilogue(attrs);
+    // First k-block with beta == 0 overwrites C outright (the kernels skip
+    // the C load); every other block accumulates. beta ∉ {0, 1} still needs
+    // the in-place scale pass, beta == 1 is a plain accumulate.
+    const bool zero_mode = (k == 0 && attrs.beta == 0.0f);
 
     for (int m = m_start; m < m_start + m_count; m += mc) {
         int actual_mc = std::min(mc, m_start + m_count - m);
         T* c_tile = c_ptr + m * ldc + n_start;
 
-        if (k == 0 && attrs.beta != 1.0f) {
+        if (k == 0 && attrs.beta != 1.0f && attrs.beta != 0.0f) {
             tile_scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
         }
 
@@ -118,13 +122,13 @@ void matmul_m_panels(const MatMulAttributes& attrs,
             tile_mma_pack(actual_mc, n_count, actual_kc,
                           c_tile, ldc,
                           pack_a_buf, packed_b, -1,
-                          cmin, cmax);
+                          cmin, cmax, zero_mode);
         } else {
             const T* a_sub = a_ptr + m * lda + k;  // A phys is M×K, row m, col k
             tile_mma_direct(actual_mc, n_count, actual_kc,
                             c_tile, ldc,
                             a_sub, lda, packed_b, -1,
-                            cmin, cmax);
+                            cmin, cmax, zero_mode);
         }
 
         if (epilogue && last_k) {

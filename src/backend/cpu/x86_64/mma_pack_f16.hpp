@@ -27,6 +27,7 @@ using nnops::backend::cpu::float_to_half;
 //  mr=1  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_pack_1x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
                              const half* NNOPS_RESTRICT B,
@@ -37,10 +38,11 @@ inline void mma_pack_1x1_f16(half* NNOPS_RESTRICT C, int ldc,
         c0 += half_to_float(*A++) * half_to_float(B[0]);
         B += ldb;
     }
-    c0 += half_to_float(C[0 * ldc]);
+    if constexpr (!zero_mode) { c0 += half_to_float(C[0 * ldc]); }
     C[0 * ldc] = float_to_half(std::min(std::max(c0, clamp_min), clamp_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_1x8_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
                              const half* NNOPS_RESTRICT B,
@@ -54,11 +56,12 @@ inline void mma_pack_1x8_f16(half* NNOPS_RESTRICT C, int ldc,
     }
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_c0 = _mm256_add_ps(v_c0, load_f16x8(C));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C)); }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C, v_c0);
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_1x16_f16(half* NNOPS_RESTRICT C, int ldc,
                               const half* NNOPS_RESTRICT A,
                               const half* NNOPS_RESTRICT B,
@@ -76,10 +79,10 @@ inline void mma_pack_1x16_f16(half* NNOPS_RESTRICT C, int ldc,
     }
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * 8));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * 8)); }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C + 0 * 8, v_c0);
-    v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * 8));
+    if constexpr (!zero_mode) { v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * 8)); }
     v_c1 = _mm256_max_ps(_mm256_min_ps(v_c1, v_max), v_min);
     store_f16x8(C + 1 * 8, v_c1);
 }
@@ -88,6 +91,7 @@ inline void mma_pack_1x16_f16(half* NNOPS_RESTRICT C, int ldc,
 //  mr=4  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_pack_4x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
                              const half* NNOPS_RESTRICT B,
@@ -102,12 +106,13 @@ inline void mma_pack_4x1_f16(half* NNOPS_RESTRICT C, int ldc,
         c3 += half_to_float(A[3]) * b;
         A += 4;
     }
-    C[0 * ldc] = float_to_half(std::min(std::max(c0 + half_to_float(C[0 * ldc]), clamp_min), clamp_max));
-    C[1 * ldc] = float_to_half(std::min(std::max(c1 + half_to_float(C[1 * ldc]), clamp_min), clamp_max));
-    C[2 * ldc] = float_to_half(std::min(std::max(c2 + half_to_float(C[2 * ldc]), clamp_min), clamp_max));
-    C[3 * ldc] = float_to_half(std::min(std::max(c3 + half_to_float(C[3 * ldc]), clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c0 += half_to_float(C[0 * ldc]); } } C[0 * ldc] = float_to_half(std::min(std::max(c0, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c1 += half_to_float(C[1 * ldc]); } } C[1 * ldc] = float_to_half(std::min(std::max(c1, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c2 += half_to_float(C[2 * ldc]); } } C[2 * ldc] = float_to_half(std::min(std::max(c2, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c3 += half_to_float(C[3 * ldc]); } } C[3 * ldc] = float_to_half(std::min(std::max(c3, clamp_min), clamp_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_4x8_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
                              const half* NNOPS_RESTRICT B,
@@ -129,20 +134,21 @@ inline void mma_pack_4x8_f16(half* NNOPS_RESTRICT C, int ldc,
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc)); }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C + 0 * ldc, v_c0);
-    v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc));
+    if constexpr (!zero_mode) { v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc)); }
     v_c1 = _mm256_max_ps(_mm256_min_ps(v_c1, v_max), v_min);
     store_f16x8(C + 1 * ldc, v_c1);
-    v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc));
+    if constexpr (!zero_mode) { v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc)); }
     v_c2 = _mm256_max_ps(_mm256_min_ps(v_c2, v_max), v_min);
     store_f16x8(C + 2 * ldc, v_c2);
-    v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc));
+    if constexpr (!zero_mode) { v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc)); }
     v_c3 = _mm256_max_ps(_mm256_min_ps(v_c3, v_max), v_min);
     store_f16x8(C + 3 * ldc, v_c3);
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_4x16_f16(half* NNOPS_RESTRICT C, int ldc,
                               const half* NNOPS_RESTRICT A,
                               const half* NNOPS_RESTRICT B,
@@ -177,28 +183,28 @@ inline void mma_pack_4x16_f16(half* NNOPS_RESTRICT C, int ldc,
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0));
+    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0)); }
     v_c00 = _mm256_max_ps(_mm256_min_ps(v_c00, v_max), v_min);
     store_f16x8(C + 0 * ldc + 0, v_c00);
-    v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 8));
+    if constexpr (!zero_mode) { v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 8)); }
     v_c01 = _mm256_max_ps(_mm256_min_ps(v_c01, v_max), v_min);
     store_f16x8(C + 0 * ldc + 8, v_c01);
-    v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0));
+    if constexpr (!zero_mode) { v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0)); }
     v_c10 = _mm256_max_ps(_mm256_min_ps(v_c10, v_max), v_min);
     store_f16x8(C + 1 * ldc + 0, v_c10);
-    v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 8));
+    if constexpr (!zero_mode) { v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 8)); }
     v_c11 = _mm256_max_ps(_mm256_min_ps(v_c11, v_max), v_min);
     store_f16x8(C + 1 * ldc + 8, v_c11);
-    v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0));
+    if constexpr (!zero_mode) { v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0)); }
     v_c20 = _mm256_max_ps(_mm256_min_ps(v_c20, v_max), v_min);
     store_f16x8(C + 2 * ldc + 0, v_c20);
-    v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 8));
+    if constexpr (!zero_mode) { v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 8)); }
     v_c21 = _mm256_max_ps(_mm256_min_ps(v_c21, v_max), v_min);
     store_f16x8(C + 2 * ldc + 8, v_c21);
-    v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0));
+    if constexpr (!zero_mode) { v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0)); }
     v_c30 = _mm256_max_ps(_mm256_min_ps(v_c30, v_max), v_min);
     store_f16x8(C + 3 * ldc + 0, v_c30);
-    v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 8));
+    if constexpr (!zero_mode) { v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 8)); }
     v_c31 = _mm256_max_ps(_mm256_min_ps(v_c31, v_max), v_min);
     store_f16x8(C + 3 * ldc + 8, v_c31);
 }
@@ -207,6 +213,7 @@ inline void mma_pack_4x16_f16(half* NNOPS_RESTRICT C, int ldc,
 //  mr=6  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_pack_6x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
                              const half* NNOPS_RESTRICT B,
@@ -223,14 +230,15 @@ inline void mma_pack_6x1_f16(half* NNOPS_RESTRICT C, int ldc,
         c5 += half_to_float(A[5]) * b;
         A += 6;
     }
-    C[0 * ldc] = float_to_half(std::min(std::max(c0 + half_to_float(C[0 * ldc]), clamp_min), clamp_max));
-    C[1 * ldc] = float_to_half(std::min(std::max(c1 + half_to_float(C[1 * ldc]), clamp_min), clamp_max));
-    C[2 * ldc] = float_to_half(std::min(std::max(c2 + half_to_float(C[2 * ldc]), clamp_min), clamp_max));
-    C[3 * ldc] = float_to_half(std::min(std::max(c3 + half_to_float(C[3 * ldc]), clamp_min), clamp_max));
-    C[4 * ldc] = float_to_half(std::min(std::max(c4 + half_to_float(C[4 * ldc]), clamp_min), clamp_max));
-    C[5 * ldc] = float_to_half(std::min(std::max(c5 + half_to_float(C[5 * ldc]), clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c0 += half_to_float(C[0 * ldc]); } } C[0 * ldc] = float_to_half(std::min(std::max(c0, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c1 += half_to_float(C[1 * ldc]); } } C[1 * ldc] = float_to_half(std::min(std::max(c1, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c2 += half_to_float(C[2 * ldc]); } } C[2 * ldc] = float_to_half(std::min(std::max(c2, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c3 += half_to_float(C[3 * ldc]); } } C[3 * ldc] = float_to_half(std::min(std::max(c3, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c4 += half_to_float(C[4 * ldc]); } } C[4 * ldc] = float_to_half(std::min(std::max(c4, clamp_min), clamp_max));
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c5 += half_to_float(C[5 * ldc]); } } C[5 * ldc] = float_to_half(std::min(std::max(c5, clamp_min), clamp_max));
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_6x8_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
                              const half* NNOPS_RESTRICT B,
@@ -256,26 +264,27 @@ inline void mma_pack_6x8_f16(half* NNOPS_RESTRICT C, int ldc,
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc));
+    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc)); }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C + 0 * ldc, v_c0);
-    v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc));
+    if constexpr (!zero_mode) { v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc)); }
     v_c1 = _mm256_max_ps(_mm256_min_ps(v_c1, v_max), v_min);
     store_f16x8(C + 1 * ldc, v_c1);
-    v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc));
+    if constexpr (!zero_mode) { v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc)); }
     v_c2 = _mm256_max_ps(_mm256_min_ps(v_c2, v_max), v_min);
     store_f16x8(C + 2 * ldc, v_c2);
-    v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc));
+    if constexpr (!zero_mode) { v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc)); }
     v_c3 = _mm256_max_ps(_mm256_min_ps(v_c3, v_max), v_min);
     store_f16x8(C + 3 * ldc, v_c3);
-    v_c4 = _mm256_add_ps(v_c4, load_f16x8(C + 4 * ldc));
+    if constexpr (!zero_mode) { v_c4 = _mm256_add_ps(v_c4, load_f16x8(C + 4 * ldc)); }
     v_c4 = _mm256_max_ps(_mm256_min_ps(v_c4, v_max), v_min);
     store_f16x8(C + 4 * ldc, v_c4);
-    v_c5 = _mm256_add_ps(v_c5, load_f16x8(C + 5 * ldc));
+    if constexpr (!zero_mode) { v_c5 = _mm256_add_ps(v_c5, load_f16x8(C + 5 * ldc)); }
     v_c5 = _mm256_max_ps(_mm256_min_ps(v_c5, v_max), v_min);
     store_f16x8(C + 5 * ldc, v_c5);
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_6x16_f16(half* NNOPS_RESTRICT C, int ldc,
                               const half* NNOPS_RESTRICT A,
                               const half* NNOPS_RESTRICT B,
@@ -319,40 +328,40 @@ inline void mma_pack_6x16_f16(half* NNOPS_RESTRICT C, int ldc,
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0));
+    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0)); }
     v_c00 = _mm256_max_ps(_mm256_min_ps(v_c00, v_max), v_min);
     store_f16x8(C + 0 * ldc + 0, v_c00);
-    v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 8));
+    if constexpr (!zero_mode) { v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 8)); }
     v_c01 = _mm256_max_ps(_mm256_min_ps(v_c01, v_max), v_min);
     store_f16x8(C + 0 * ldc + 8, v_c01);
-    v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0));
+    if constexpr (!zero_mode) { v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0)); }
     v_c10 = _mm256_max_ps(_mm256_min_ps(v_c10, v_max), v_min);
     store_f16x8(C + 1 * ldc + 0, v_c10);
-    v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 8));
+    if constexpr (!zero_mode) { v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 8)); }
     v_c11 = _mm256_max_ps(_mm256_min_ps(v_c11, v_max), v_min);
     store_f16x8(C + 1 * ldc + 8, v_c11);
-    v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0));
+    if constexpr (!zero_mode) { v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0)); }
     v_c20 = _mm256_max_ps(_mm256_min_ps(v_c20, v_max), v_min);
     store_f16x8(C + 2 * ldc + 0, v_c20);
-    v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 8));
+    if constexpr (!zero_mode) { v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 8)); }
     v_c21 = _mm256_max_ps(_mm256_min_ps(v_c21, v_max), v_min);
     store_f16x8(C + 2 * ldc + 8, v_c21);
-    v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0));
+    if constexpr (!zero_mode) { v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0)); }
     v_c30 = _mm256_max_ps(_mm256_min_ps(v_c30, v_max), v_min);
     store_f16x8(C + 3 * ldc + 0, v_c30);
-    v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 8));
+    if constexpr (!zero_mode) { v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 8)); }
     v_c31 = _mm256_max_ps(_mm256_min_ps(v_c31, v_max), v_min);
     store_f16x8(C + 3 * ldc + 8, v_c31);
-    v_c40 = _mm256_add_ps(v_c40, load_f16x8(C + 4 * ldc + 0));
+    if constexpr (!zero_mode) { v_c40 = _mm256_add_ps(v_c40, load_f16x8(C + 4 * ldc + 0)); }
     v_c40 = _mm256_max_ps(_mm256_min_ps(v_c40, v_max), v_min);
     store_f16x8(C + 4 * ldc + 0, v_c40);
-    v_c41 = _mm256_add_ps(v_c41, load_f16x8(C + 4 * ldc + 8));
+    if constexpr (!zero_mode) { v_c41 = _mm256_add_ps(v_c41, load_f16x8(C + 4 * ldc + 8)); }
     v_c41 = _mm256_max_ps(_mm256_min_ps(v_c41, v_max), v_min);
     store_f16x8(C + 4 * ldc + 8, v_c41);
-    v_c50 = _mm256_add_ps(v_c50, load_f16x8(C + 5 * ldc + 0));
+    if constexpr (!zero_mode) { v_c50 = _mm256_add_ps(v_c50, load_f16x8(C + 5 * ldc + 0)); }
     v_c50 = _mm256_max_ps(_mm256_min_ps(v_c50, v_max), v_min);
     store_f16x8(C + 5 * ldc + 0, v_c50);
-    v_c51 = _mm256_add_ps(v_c51, load_f16x8(C + 5 * ldc + 8));
+    if constexpr (!zero_mode) { v_c51 = _mm256_add_ps(v_c51, load_f16x8(C + 5 * ldc + 8)); }
     v_c51 = _mm256_max_ps(_mm256_min_ps(v_c51, v_max), v_min);
     store_f16x8(C + 5 * ldc + 8, v_c51);
 }

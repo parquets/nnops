@@ -33,7 +33,9 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                         : a_desc.dims[static_cast<size_t>(a_rank - 2)];
     const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
                                         : b_desc.dims[static_cast<size_t>(b_rank - 1)];
-
+    const int64_t K = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
+                                        : b_desc.dims[static_cast<size_t>(b_rank - 2)];
+    
     // int8 (s8×s8): the tiled path always packs B, and for an s8 output it also
     // needs an int32 accumulator buffer. Both live in the workspace.
     if (dt_a == DataType::s8 && dt_b == DataType::s8) {
@@ -50,17 +52,21 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
     size_t elem;
     const int* nr;
     if (dt_a == DataType::f32) {
-        kc = KC_F32;  nr_max = NR_MAX_F32;  elem = sizeof(float);  nr = NR_F32;
-    } else if (dt_a == DataType::f16) {
-        kc = KC_F16;  nr_max = NR_MAX_F16;  elem = sizeof(half);   nr = NR_F16;
+        kc = std::min(KC_F32, static_cast<int>(K));  
+        nr_max = NR_MAX_F32;  
+        elem = sizeof(float);  
+        nr = NR_F32;
+    } else if (dt_a == DataType::f16 || dt_a == DataType::bf16) {
+        kc = std::min(KC_F16, static_cast<int>(K));  
+        nr_max = NR_MAX_F16;  
+        elem = sizeof(half);   
+        nr = NR_F16;
     } else {
         return 0;  // unsupported dtype → reference fallback, no workspace
     }
 
     // Fast path (f32 only): tiny GEMMs go to the reference and need no
     // workspace. f16 has no reference kernel, so it always uses the tiled path.
-    const int64_t K = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
-                                        : b_desc.dims[static_cast<size_t>(b_rank - 2)];
     if (dt_a == DataType::f32 && gemm_is_small(M, N, K)) {
         return 0;
     }
@@ -161,51 +167,55 @@ constexpr std::array<std::array<PackF16Fn, 3>, 2> pack_copy_f16_fn = {{
 
 // ---- MMA dispatch tables -----------------------------------------------
 
+template <bool zero_mode>
 constexpr std::array<std::array<MmaPackF32Fn, 3>, 3> mma_pack_f32_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {{mma_pack_6x16_f32, mma_pack_6x8_f32, mma_pack_6x1_f32}},
-    {{mma_pack_4x16_f32, mma_pack_4x8_f32, mma_pack_4x1_f32}},
-    {{mma_pack_1x16_f32, mma_pack_1x8_f32, mma_pack_1x1_f32}},
+    {{mma_pack_6x16_f32<zero_mode>, mma_pack_6x8_f32<zero_mode>, mma_pack_6x1_f32<zero_mode>}},
+    {{mma_pack_4x16_f32<zero_mode>, mma_pack_4x8_f32<zero_mode>, mma_pack_4x1_f32<zero_mode>}},
+    {{mma_pack_1x16_f32<zero_mode>, mma_pack_1x8_f32<zero_mode>, mma_pack_1x1_f32<zero_mode>}},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_pack_8x12_f32, mma_pack_8x4_f32, mma_pack_8x1_f32}},
-    {{mma_pack_4x12_f32, mma_pack_4x4_f32, mma_pack_4x1_f32}},
-    {{mma_pack_1x12_f32, mma_pack_1x4_f32, mma_pack_1x1_f32}},
+    {{mma_pack_8x12_f32<zero_mode>, mma_pack_8x4_f32<zero_mode>, mma_pack_8x1_f32<zero_mode>}},
+    {{mma_pack_4x12_f32<zero_mode>, mma_pack_4x4_f32<zero_mode>, mma_pack_4x1_f32<zero_mode>}},
+    {{mma_pack_1x12_f32<zero_mode>, mma_pack_1x4_f32<zero_mode>, mma_pack_1x1_f32<zero_mode>}},
 #endif
 }};
 
+template <bool zero_mode>
 constexpr std::array<std::array<MmaPackF16Fn, 3>, 3> mma_pack_f16_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {{mma_pack_6x16_f16, mma_pack_6x8_f16, mma_pack_6x1_f16}},
-    {{mma_pack_4x16_f16, mma_pack_4x8_f16, mma_pack_4x1_f16}},
-    {{mma_pack_1x16_f16, mma_pack_1x8_f16, mma_pack_1x1_f16}},
+    {{mma_pack_6x16_f16<zero_mode>, mma_pack_6x8_f16<zero_mode>, mma_pack_6x1_f16<zero_mode>}},
+    {{mma_pack_4x16_f16<zero_mode>, mma_pack_4x8_f16<zero_mode>, mma_pack_4x1_f16<zero_mode>}},
+    {{mma_pack_1x16_f16<zero_mode>, mma_pack_1x8_f16<zero_mode>, mma_pack_1x1_f16<zero_mode>}},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_pack_8x16_f16, mma_pack_8x8_f16, mma_pack_8x1_f16}},
-    {{mma_pack_4x16_f16, mma_pack_4x8_f16, mma_pack_4x1_f16}},
-    {{mma_pack_1x16_f16, mma_pack_1x8_f16, mma_pack_1x1_f16}},
+    {{mma_pack_8x16_f16<zero_mode>, mma_pack_8x8_f16<zero_mode>, mma_pack_8x1_f16<zero_mode>}},
+    {{mma_pack_4x16_f16<zero_mode>, mma_pack_4x8_f16<zero_mode>, mma_pack_4x1_f16<zero_mode>}},
+    {{mma_pack_1x16_f16<zero_mode>, mma_pack_1x8_f16<zero_mode>, mma_pack_1x1_f16<zero_mode>}},
 #endif
 }};
 
+template <bool zero_mode>
 constexpr std::array<std::array<MmaDirectF32Fn, 3>, 3> mma_direct_f32_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {{mma_direct_6x16_f32, mma_direct_6x8_f32, mma_direct_6x1_f32}},
-    {{mma_direct_4x16_f32, mma_direct_4x8_f32, mma_direct_4x1_f32}},
-    {{mma_direct_1x16_f32, mma_direct_1x8_f32, mma_direct_1x1_f32}},
+    {{mma_direct_6x16_f32<zero_mode>, mma_direct_6x8_f32<zero_mode>, mma_direct_6x1_f32<zero_mode>}},
+    {{mma_direct_4x16_f32<zero_mode>, mma_direct_4x8_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
+    {{mma_direct_1x16_f32<zero_mode>, mma_direct_1x8_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_direct_8x12_f32, mma_direct_8x4_f32, mma_direct_8x1_f32}},
-    {{mma_direct_4x12_f32, mma_direct_4x4_f32, mma_direct_4x1_f32}},
-    {{mma_direct_1x12_f32, mma_direct_1x4_f32, mma_direct_1x1_f32}},
+    {{mma_direct_8x12_f32<zero_mode>, mma_direct_8x4_f32<zero_mode>, mma_direct_8x1_f32<zero_mode>}},
+    {{mma_direct_4x12_f32<zero_mode>, mma_direct_4x4_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
+    {{mma_direct_1x12_f32<zero_mode>, mma_direct_1x4_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
 #endif
 }};
 
+template <bool zero_mode>
 constexpr std::array<std::array<MmaDirectF16Fn, 3>, 3> mma_direct_f16_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {{mma_direct_6x16_f16, mma_direct_6x8_f16, mma_direct_6x1_f16}},
-    {{mma_direct_4x16_f16, mma_direct_4x8_f16, mma_direct_4x1_f16}},
-    {{mma_direct_1x16_f16, mma_direct_1x8_f16, mma_direct_1x1_f16}},
+    {{mma_direct_6x16_f16<zero_mode>, mma_direct_6x8_f16<zero_mode>, mma_direct_6x1_f16<zero_mode>}},
+    {{mma_direct_4x16_f16<zero_mode>, mma_direct_4x8_f16<zero_mode>, mma_direct_4x1_f16<zero_mode>}},
+    {{mma_direct_1x16_f16<zero_mode>, mma_direct_1x8_f16<zero_mode>, mma_direct_1x1_f16<zero_mode>}},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_direct_8x16_f16, mma_direct_8x8_f16, mma_direct_8x1_f16}},
-    {{mma_direct_4x16_f16, mma_direct_4x8_f16, mma_direct_4x1_f16}},
-    {{mma_direct_1x16_f16, mma_direct_1x8_f16, mma_direct_1x1_f16}},
+    {{mma_direct_8x16_f16<zero_mode>, mma_direct_8x8_f16<zero_mode>, mma_direct_8x1_f16<zero_mode>}},
+    {{mma_direct_4x16_f16<zero_mode>, mma_direct_4x8_f16<zero_mode>, mma_direct_4x1_f16<zero_mode>}},
+    {{mma_direct_1x16_f16<zero_mode>, mma_direct_1x8_f16<zero_mode>, mma_direct_1x1_f16<zero_mode>}},
 #endif
 }};
 
@@ -422,25 +432,26 @@ void mrkcnc_mma_direct(int Nc, int Kc,
 void tile_mma_pack(int Mc, int Nc, int Kc,
                    float* c, int ldc,
                    const float* packed_a, const float* maybe_packed_b, int ldb,
-                   float clamp_min, float clamp_max) {
+                   float clamp_min, float clamp_max, bool zero_mode) {
+    const auto& fns = zero_mode ? mma_pack_f32_fn<true> : mma_pack_f32_fn<false>;
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
     int m = 0;
     for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
         mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
                         packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max, mma_pack_f32_fn[0]);
+                        clamp_min, clamp_max, fns[0]);
         packed_a += ldd_a;
     }
     for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
         mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
                         packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max, mma_pack_f32_fn[1]);
+                        clamp_min, clamp_max, fns[1]);
         packed_a += ldd_a;
     }
     for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
         mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
                         packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max, mma_pack_f32_fn[2]);
+                        clamp_min, clamp_max, fns[2]);
         packed_a += ldd_a;
     }
 }
@@ -450,23 +461,24 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
                      float* c, int ldc,
                      const float* a, int lda,
                      const float* b, int ldb,
-                     float clamp_min, float clamp_max) {
+                     float clamp_min, float clamp_max, bool zero_mode) {
+    const auto& fns = zero_mode ? mma_direct_f32_fn<true> : mma_direct_f32_fn<false>;
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
     int m = 0;
     for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
-                          clamp_min, clamp_max, mma_direct_f32_fn[0]);
+                          clamp_min, clamp_max, fns[0]);
     }
     for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
-                          clamp_min, clamp_max, mma_direct_f32_fn[1]);
+                          clamp_min, clamp_max, fns[1]);
     }
     for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
-                          clamp_min, clamp_max, mma_direct_f32_fn[2]);
+                          clamp_min, clamp_max, fns[2]);
     }
 }
 
@@ -474,25 +486,26 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
 void tile_mma_pack(int Mc, int Nc, int Kc,
                    half* c, int ldc,
                    const half* packed_a, const half* maybe_packed_b, int ldb,
-                   float clamp_min, float clamp_max) {
+                   float clamp_min, float clamp_max, bool zero_mode) {
+    const auto& fns = zero_mode ? mma_pack_f16_fn<true> : mma_pack_f16_fn<false>;
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F16[0] * Kc * static_cast<int>(sizeof(half))) / static_cast<int>(sizeof(half));
     int m = 0;
     for(; m + MR_F16[0] <= Mc; m += MR_F16[0]) {
         mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
                         packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max, mma_pack_f16_fn[0]);
+                        clamp_min, clamp_max, fns[0]);
         packed_a += ldd_a;
     }
     for(; m + MR_F16[1] <= Mc; m += MR_F16[1]) {
         mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
                         packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max, mma_pack_f16_fn[1]);
+                        clamp_min, clamp_max, fns[1]);
         packed_a += ldd_a;
     }
     for(; m + MR_F16[2] <= Mc; m += MR_F16[2]) {
         mrkcnc_mma_pack(Nc, Kc, c + m * ldc, ldc,
                         packed_a, maybe_packed_b, ldb,
-                        clamp_min, clamp_max, mma_pack_f16_fn[2]);
+                        clamp_min, clamp_max, fns[2]);
         packed_a += ldd_a;
     }
 }
@@ -502,23 +515,24 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
                      half* c, int ldc,
                      const half* a, int lda,
                      const half* b, int ldb,
-                     float clamp_min, float clamp_max) {
+                     float clamp_min, float clamp_max, bool zero_mode) {
+    const auto& fns = zero_mode ? mma_direct_f16_fn<true> : mma_direct_f16_fn<false>;
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F16[0] * Kc * static_cast<int>(sizeof(half))) / static_cast<int>(sizeof(half));
     int m = 0;
     for(; m + MR_F16[0] <= Mc; m += MR_F16[0]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
-                          clamp_min, clamp_max, mma_direct_f16_fn[0]);
+                          clamp_min, clamp_max, fns[0]);
     }
     for(; m + MR_F16[1] <= Mc; m += MR_F16[1]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
-                          clamp_min, clamp_max, mma_direct_f16_fn[1]);
+                          clamp_min, clamp_max, fns[1]);
     }
     for(; m + MR_F16[2] <= Mc; m += MR_F16[2]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
-                          clamp_min, clamp_max, mma_direct_f16_fn[2]);
+                          clamp_min, clamp_max, fns[2]);
     }
 }
 

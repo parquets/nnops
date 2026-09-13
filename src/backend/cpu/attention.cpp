@@ -170,7 +170,7 @@ void attention_impl(const AttentionAttributes& attrs,
         T* pack_b = scores + scores_elems;
 
         // ---- GEMM1: scores = Q @ K^T * scale --------------------------
-        std::memset(scores, 0, static_cast<size_t>(scores_elems) * sizeof(T));
+        // First k-block writes with add_to=false — no pre-zeroing pass.
         for (int64_t k0 = 0; k0 < D; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
             const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
@@ -186,7 +186,7 @@ void attention_impl(const AttentionAttributes& attrs,
                                     scores + m * Sk + n, static_cast<int>(Sk),
                                     q_head + m * q_rs + k0, static_cast<int>(q_rs),
                                     pack_b, -1,
-                                    kNegInf, kPosInf);
+                                    kNegInf, kPosInf, k0 == 0);
                 }
             }
         }
@@ -206,10 +206,7 @@ void attention_impl(const AttentionAttributes& attrs,
             }
         }
 
-        // ---- GEMM2: output = attn @ V (zero-init, then accumulate) ----
-        for (int64_t m = 0; m < Sq; ++m) {
-            std::memset(o_head + m * o_rs, 0, static_cast<size_t>(D) * sizeof(T));
-        }
+        // ---- GEMM2: output = attn @ V (first block writes, rest accumulate) ----
         for (int64_t k0 = 0; k0 < Sk; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Sk - k0));
             for (int64_t n = 0; n < D; n += nc2) {
@@ -220,7 +217,7 @@ void attention_impl(const AttentionAttributes& attrs,
                                     o_head + m * o_rs + n, static_cast<int>(o_rs),
                                     scores + m * Sk + k0, static_cast<int>(Sk),
                                     v_head + k0 * v_rs + n, static_cast<int>(v_rs),
-                                    kNegInf, kPosInf);
+                                    kNegInf, kPosInf, k0 == 0);
                 }
             }
         }
@@ -359,13 +356,14 @@ void attention_flash_impl(const AttentionAttributes& attrs,
             m[i] = -std::numeric_limits<T>::infinity();
             l[i] = 0.0f;
         }
-        std::memset(o_acc, 0, static_cast<size_t>(actual_br) * static_cast<size_t>(D) * sizeof(T));
-
+        // o_acc is written by the first KV block with add_to=false — no
+        // pre-zeroing pass. (The exp_diff rescale below may touch it first on
+        // j0 == 0; that garbage is fully overwritten by the first MMA.)
         for (int64_t j0 = 0; j0 < Sk; j0 += Bc) {
             const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, Sk - j0));
 
             // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
-            std::memset(s, 0, static_cast<size_t>(actual_br) * static_cast<size_t>(actual_bc) * sizeof(T));
+            // First k-block writes with add_to=false — no pre-zeroing pass.
             for (int64_t k0 = 0; k0 < D; k0 += kc) {
                 const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
                 const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
@@ -376,7 +374,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                 tile_mma_direct(actual_br, actual_bc, actual_kc,
                                 s, actual_bc,
                                 q_head + i0 * q_rs + k0, static_cast<int>(q_rs),
-                                pack_b, -1, kNegInf, kPosInf);
+                                pack_b, -1, kNegInf, kPosInf, k0 == 0);
             }
 
             // ---- additive mask (flat [Sq, Sk], shared across heads) ----
@@ -426,7 +424,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                                 o_acc, static_cast<int>(D),
                                 s + k0, actual_bc,
                                 v_head + (j0 + k0) * v_rs, static_cast<int>(v_rs),
-                                kNegInf, kPosInf);
+                                kNegInf, kPosInf, j0 == 0 && k0 == 0);
             }
         }
 

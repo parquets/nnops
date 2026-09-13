@@ -22,6 +22,7 @@ namespace nnops::backend::cpu::aarch64 {
 //  mr=1  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_pack_1x1_f32(float* NNOPS_RESTRICT C, int ldc,
                              const float* NNOPS_RESTRICT A,
                              const float* NNOPS_RESTRICT B,
@@ -32,10 +33,11 @@ inline void mma_pack_1x1_f32(float* NNOPS_RESTRICT C, int ldc,
         c0 += (*A++) * B[0];
         B += ldb;
     }
-    c0 += C[0 * ldc];
+    if constexpr (!zero_mode) { c0 += C[0 * ldc]; }
     C[0 * ldc] = std::min(std::max(c0, clamp_min), clamp_max);
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_1x4_f32(float* NNOPS_RESTRICT C, int ldc,
                              const float* NNOPS_RESTRICT A,
                              const float* NNOPS_RESTRICT B,
@@ -46,12 +48,13 @@ inline void mma_pack_1x4_f32(float* NNOPS_RESTRICT C, int ldc,
         c0 = vfmaq_n_f32(c0, vld1q_f32(B), *A++);
         B += ldb;
     }
-    c0 = vaddq_f32(c0, vld1q_f32(C));
+    if constexpr (!zero_mode) { c0 = vaddq_f32(c0, vld1q_f32(C)); }
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
     vst1q_f32(C, vminq_f32(vmaxq_f32(c0, vmin), vmax));
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_1x12_f32(float* NNOPS_RESTRICT C, int ldc,
                               const float* NNOPS_RESTRICT A,
                               const float* NNOPS_RESTRICT B,
@@ -72,9 +75,9 @@ inline void mma_pack_1x12_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    c0 = vaddq_f32(c0, vld1q_f32(C + 0 * 4));
-    c1 = vaddq_f32(c1, vld1q_f32(C + 1 * 4));
-    c2 = vaddq_f32(c2, vld1q_f32(C + 2 * 4));
+    if constexpr (!zero_mode) { c0 = vaddq_f32(c0, vld1q_f32(C + 0 * 4)); 
+    c1 = vaddq_f32(c1, vld1q_f32(C + 1 * 4)); 
+    c2 = vaddq_f32(c2, vld1q_f32(C + 2 * 4)); }
 
     vst1q_f32(C + 0 * 4, vminq_f32(vmaxq_f32(c0, vmin), vmax));
     vst1q_f32(C + 1 * 4, vminq_f32(vmaxq_f32(c1, vmin), vmax));
@@ -85,6 +88,7 @@ inline void mma_pack_1x12_f32(float* NNOPS_RESTRICT C, int ldc,
 //  mr=4  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_pack_4x1_f32(float* NNOPS_RESTRICT C, int ldc,
                              const float* NNOPS_RESTRICT A,
                              const float* NNOPS_RESTRICT B,
@@ -99,16 +103,17 @@ inline void mma_pack_4x1_f32(float* NNOPS_RESTRICT C, int ldc,
         c3 += A[3] * b;
         A += 4;
     }
-    c0 = std::min(std::max(c0 + C[0 * ldc], clamp_min), clamp_max);
-    c1 = std::min(std::max(c1 + C[1 * ldc], clamp_min), clamp_max);
-    c2 = std::min(std::max(c2 + C[2 * ldc], clamp_min), clamp_max);
-    c3 = std::min(std::max(c3 + C[3 * ldc], clamp_min), clamp_max);
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c0 += C[0 * ldc]; } } c0 = std::min(std::max(c0, clamp_min), clamp_max);
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c1 += C[1 * ldc]; } } c1 = std::min(std::max(c1, clamp_min), clamp_max);
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c2 += C[2 * ldc]; } } c2 = std::min(std::max(c2, clamp_min), clamp_max);
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c3 += C[3 * ldc]; } } c3 = std::min(std::max(c3, clamp_min), clamp_max);
     C[0 * ldc] = c0;
     C[1 * ldc] = c1;
     C[2 * ldc] = c2;
     C[3 * ldc] = c3;
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_4x4_f32(float* NNOPS_RESTRICT C, int ldc,
                              const float* NNOPS_RESTRICT A,
                              const float* NNOPS_RESTRICT B,
@@ -132,10 +137,10 @@ inline void mma_pack_4x4_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    c0 = vaddq_f32(c0, vld1q_f32(C + 0 * ldc));
-    c1 = vaddq_f32(c1, vld1q_f32(C + 1 * ldc));
-    c2 = vaddq_f32(c2, vld1q_f32(C + 2 * ldc));
-    c3 = vaddq_f32(c3, vld1q_f32(C + 3 * ldc));
+    if constexpr (!zero_mode) { c0 = vaddq_f32(c0, vld1q_f32(C + 0 * ldc)); 
+    c1 = vaddq_f32(c1, vld1q_f32(C + 1 * ldc)); 
+    c2 = vaddq_f32(c2, vld1q_f32(C + 2 * ldc)); 
+    c3 = vaddq_f32(c3, vld1q_f32(C + 3 * ldc)); }
 
     vst1q_f32(C + 0 * ldc, vminq_f32(vmaxq_f32(c0, vmin), vmax));
     vst1q_f32(C + 1 * ldc, vminq_f32(vmaxq_f32(c1, vmin), vmax));
@@ -143,6 +148,7 @@ inline void mma_pack_4x4_f32(float* NNOPS_RESTRICT C, int ldc,
     vst1q_f32(C + 3 * ldc, vminq_f32(vmaxq_f32(c3, vmin), vmax));
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_4x12_f32(float* NNOPS_RESTRICT C, int ldc,
                               const float* NNOPS_RESTRICT A,
                               const float* NNOPS_RESTRICT B,
@@ -180,10 +186,18 @@ inline void mma_pack_4x12_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    c00 = vaddq_f32(c00, vld1q_f32(C + 0 * 4)); c01 = vaddq_f32(c01, vld1q_f32(C + 1 * 4)); c02 = vaddq_f32(c02, vld1q_f32(C + 2 * 4));
-    c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4));
-    c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4));
-    c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4)); c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4)); c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c00 = vaddq_f32(c00, vld1q_f32(C + 0 * 4)); 
+    c01 = vaddq_f32(c01, vld1q_f32(C + 1 * 4)); 
+    c02 = vaddq_f32(c02, vld1q_f32(C + 2 * 4)); 
+    c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); 
+    c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); 
+    c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4)); 
+    c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); 
+    c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); 
+    c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4)); 
+    c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4)); 
+    c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4)); 
+    c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4)); }
 
     c00 = vminq_f32(vmaxq_f32(c00, vmin), vmax); c01 = vminq_f32(vmaxq_f32(c01, vmin), vmax); c02 = vminq_f32(vmaxq_f32(c02, vmin), vmax);
     c10 = vminq_f32(vmaxq_f32(c10, vmin), vmax); c11 = vminq_f32(vmaxq_f32(c11, vmin), vmax); c12 = vminq_f32(vmaxq_f32(c12, vmin), vmax);
@@ -200,6 +214,7 @@ inline void mma_pack_4x12_f32(float* NNOPS_RESTRICT C, int ldc,
 //  mr=8  kernels
 // =========================================================================
 
+template <bool zero_mode = false>
 inline void mma_pack_8x1_f32(float* NNOPS_RESTRICT C, int ldc,
                              const float* NNOPS_RESTRICT A,
                              const float* NNOPS_RESTRICT B,
@@ -213,16 +228,17 @@ inline void mma_pack_8x1_f32(float* NNOPS_RESTRICT C, int ldc,
         c4 += A[4] * b; c5 += A[5] * b; c6 += A[6] * b; c7 += A[7] * b;
         A += 8;
     }
-    c0 = std::min(std::max(c0 + C[0 * ldc], clamp_min), clamp_max); C[0 * ldc] = c0;
-    c1 = std::min(std::max(c1 + C[1 * ldc], clamp_min), clamp_max); C[1 * ldc] = c1;
-    c2 = std::min(std::max(c2 + C[2 * ldc], clamp_min), clamp_max); C[2 * ldc] = c2;
-    c3 = std::min(std::max(c3 + C[3 * ldc], clamp_min), clamp_max); C[3 * ldc] = c3;
-    c4 = std::min(std::max(c4 + C[4 * ldc], clamp_min), clamp_max); C[4 * ldc] = c4;
-    c5 = std::min(std::max(c5 + C[5 * ldc], clamp_min), clamp_max); C[5 * ldc] = c5;
-    c6 = std::min(std::max(c6 + C[6 * ldc], clamp_min), clamp_max); C[6 * ldc] = c6;
-    c7 = std::min(std::max(c7 + C[7 * ldc], clamp_min), clamp_max); C[7 * ldc] = c7;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c0 += C[0 * ldc]; } } c0 = std::min(std::max(c0, clamp_min), clamp_max); C[0 * ldc] = c0;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c1 += C[1 * ldc]; } } c1 = std::min(std::max(c1, clamp_min), clamp_max); C[1 * ldc] = c1;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c2 += C[2 * ldc]; } } c2 = std::min(std::max(c2, clamp_min), clamp_max); C[2 * ldc] = c2;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c3 += C[3 * ldc]; } } c3 = std::min(std::max(c3, clamp_min), clamp_max); C[3 * ldc] = c3;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c4 += C[4 * ldc]; } } c4 = std::min(std::max(c4, clamp_min), clamp_max); C[4 * ldc] = c4;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c5 += C[5 * ldc]; } } c5 = std::min(std::max(c5, clamp_min), clamp_max); C[5 * ldc] = c5;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c6 += C[6 * ldc]; } } c6 = std::min(std::max(c6, clamp_min), clamp_max); C[6 * ldc] = c6;
+    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c7 += C[7 * ldc]; } } c7 = std::min(std::max(c7, clamp_min), clamp_max); C[7 * ldc] = c7;
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_8x4_f32(float* NNOPS_RESTRICT C, int ldc,
                              const float* NNOPS_RESTRICT A,
                              const float* NNOPS_RESTRICT B,
@@ -258,14 +274,14 @@ inline void mma_pack_8x4_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    c0 = vaddq_f32(c0, vld1q_f32(C + 0 * ldc));
-    c1 = vaddq_f32(c1, vld1q_f32(C + 1 * ldc));
-    c2 = vaddq_f32(c2, vld1q_f32(C + 2 * ldc));
-    c3 = vaddq_f32(c3, vld1q_f32(C + 3 * ldc));
-    c4 = vaddq_f32(c4, vld1q_f32(C + 4 * ldc));
-    c5 = vaddq_f32(c5, vld1q_f32(C + 5 * ldc));
-    c6 = vaddq_f32(c6, vld1q_f32(C + 6 * ldc));
-    c7 = vaddq_f32(c7, vld1q_f32(C + 7 * ldc));
+    if constexpr (!zero_mode) { c0 = vaddq_f32(c0, vld1q_f32(C + 0 * ldc)); 
+    c1 = vaddq_f32(c1, vld1q_f32(C + 1 * ldc)); 
+    c2 = vaddq_f32(c2, vld1q_f32(C + 2 * ldc)); 
+    c3 = vaddq_f32(c3, vld1q_f32(C + 3 * ldc)); 
+    c4 = vaddq_f32(c4, vld1q_f32(C + 4 * ldc)); 
+    c5 = vaddq_f32(c5, vld1q_f32(C + 5 * ldc)); 
+    c6 = vaddq_f32(c6, vld1q_f32(C + 6 * ldc)); 
+    c7 = vaddq_f32(c7, vld1q_f32(C + 7 * ldc)); }
 
     vst1q_f32(C + 0 * ldc, vminq_f32(vmaxq_f32(c0, vmin), vmax));
     vst1q_f32(C + 1 * ldc, vminq_f32(vmaxq_f32(c1, vmin), vmax));
@@ -277,6 +293,7 @@ inline void mma_pack_8x4_f32(float* NNOPS_RESTRICT C, int ldc,
     vst1q_f32(C + 7 * ldc, vminq_f32(vmaxq_f32(c7, vmin), vmax));
 }
 
+template <bool zero_mode = false>
 inline void mma_pack_8x12_f32(float* NNOPS_RESTRICT C, int ldc,
                               const float* NNOPS_RESTRICT A,
                               const float* NNOPS_RESTRICT B,
@@ -330,14 +347,30 @@ inline void mma_pack_8x12_f32(float* NNOPS_RESTRICT C, int ldc,
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    c00 = vaddq_f32(c00, vld1q_f32(C + 0 * 4)); c01 = vaddq_f32(c01, vld1q_f32(C + 1 * 4)); c02 = vaddq_f32(c02, vld1q_f32(C + 2 * 4));
-    c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4));
-    c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4));
-    c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4)); c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4)); c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4));
-    c40 = vaddq_f32(c40, vld1q_f32(C + 4 * ldc + 0 * 4)); c41 = vaddq_f32(c41, vld1q_f32(C + 4 * ldc + 1 * 4)); c42 = vaddq_f32(c42, vld1q_f32(C + 4 * ldc + 2 * 4));
-    c50 = vaddq_f32(c50, vld1q_f32(C + 5 * ldc + 0 * 4)); c51 = vaddq_f32(c51, vld1q_f32(C + 5 * ldc + 1 * 4)); c52 = vaddq_f32(c52, vld1q_f32(C + 5 * ldc + 2 * 4));
-    c60 = vaddq_f32(c60, vld1q_f32(C + 6 * ldc + 0 * 4)); c61 = vaddq_f32(c61, vld1q_f32(C + 6 * ldc + 1 * 4)); c62 = vaddq_f32(c62, vld1q_f32(C + 6 * ldc + 2 * 4));
-    c70 = vaddq_f32(c70, vld1q_f32(C + 7 * ldc + 0 * 4)); c71 = vaddq_f32(c71, vld1q_f32(C + 7 * ldc + 1 * 4)); c72 = vaddq_f32(c72, vld1q_f32(C + 7 * ldc + 2 * 4));
+    if constexpr (!zero_mode) { c00 = vaddq_f32(c00, vld1q_f32(C + 0 * 4)); 
+    c01 = vaddq_f32(c01, vld1q_f32(C + 1 * 4)); 
+    c02 = vaddq_f32(c02, vld1q_f32(C + 2 * 4)); 
+    c10 = vaddq_f32(c10, vld1q_f32(C + 1 * ldc + 0 * 4)); 
+    c11 = vaddq_f32(c11, vld1q_f32(C + 1 * ldc + 1 * 4)); 
+    c12 = vaddq_f32(c12, vld1q_f32(C + 1 * ldc + 2 * 4)); 
+    c20 = vaddq_f32(c20, vld1q_f32(C + 2 * ldc + 0 * 4)); 
+    c21 = vaddq_f32(c21, vld1q_f32(C + 2 * ldc + 1 * 4)); 
+    c22 = vaddq_f32(c22, vld1q_f32(C + 2 * ldc + 2 * 4)); 
+    c30 = vaddq_f32(c30, vld1q_f32(C + 3 * ldc + 0 * 4)); 
+    c31 = vaddq_f32(c31, vld1q_f32(C + 3 * ldc + 1 * 4)); 
+    c32 = vaddq_f32(c32, vld1q_f32(C + 3 * ldc + 2 * 4)); 
+    c40 = vaddq_f32(c40, vld1q_f32(C + 4 * ldc + 0 * 4)); 
+    c41 = vaddq_f32(c41, vld1q_f32(C + 4 * ldc + 1 * 4)); 
+    c42 = vaddq_f32(c42, vld1q_f32(C + 4 * ldc + 2 * 4)); 
+    c50 = vaddq_f32(c50, vld1q_f32(C + 5 * ldc + 0 * 4)); 
+    c51 = vaddq_f32(c51, vld1q_f32(C + 5 * ldc + 1 * 4)); 
+    c52 = vaddq_f32(c52, vld1q_f32(C + 5 * ldc + 2 * 4)); 
+    c60 = vaddq_f32(c60, vld1q_f32(C + 6 * ldc + 0 * 4)); 
+    c61 = vaddq_f32(c61, vld1q_f32(C + 6 * ldc + 1 * 4)); 
+    c62 = vaddq_f32(c62, vld1q_f32(C + 6 * ldc + 2 * 4)); 
+    c70 = vaddq_f32(c70, vld1q_f32(C + 7 * ldc + 0 * 4)); 
+    c71 = vaddq_f32(c71, vld1q_f32(C + 7 * ldc + 1 * 4)); 
+    c72 = vaddq_f32(c72, vld1q_f32(C + 7 * ldc + 2 * 4)); }
 
     c00 = vminq_f32(vmaxq_f32(c00, vmin), vmax); c01 = vminq_f32(vmaxq_f32(c01, vmin), vmax); c02 = vminq_f32(vmaxq_f32(c02, vmin), vmax);
     c10 = vminq_f32(vmaxq_f32(c10, vmin), vmax); c11 = vminq_f32(vmaxq_f32(c11, vmin), vmax); c12 = vminq_f32(vmaxq_f32(c12, vmin), vmax);
