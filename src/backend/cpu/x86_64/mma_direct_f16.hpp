@@ -45,7 +45,9 @@ inline void mma_direct_1x1_f16(
         c0 += half_to_float(*A_ptr0++) * b0;
         B += ldb;
     }
-    if constexpr (!zero_mode) { c0 += half_to_float(C[0]); }
+    if constexpr (!zero_mode) {
+        c0 += half_to_float(C[0]);
+    }
     C[0] = float_to_half(std::min(std::max(c0, clamp_min), clamp_max));
 }
 
@@ -68,7 +70,9 @@ inline void mma_direct_1x8_f16(
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C)); }
+    if constexpr (!zero_mode) {
+        v_c0 = _mm256_add_ps(v_c0, load_f16x8(C));
+    }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C, v_c0);
 }
@@ -97,10 +101,14 @@ inline void mma_direct_1x16_f16(
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * 8));
+    }
     v_c00 = _mm256_max_ps(_mm256_min_ps(v_c00, v_max), v_min);
     store_f16x8(C + 0 * 8, v_c00);
-    if constexpr (!zero_mode) { v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 1 * 8));
+    }
     v_c01 = _mm256_max_ps(_mm256_min_ps(v_c01, v_max), v_min);
     store_f16x8(C + 1 * 8, v_c01);
 }
@@ -132,11 +140,23 @@ inline void mma_direct_4x1_f16(
         B += ldb;
     }
 
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c0 += half_to_float(C[0 * ldc]); } } C[0 * ldc] = float_to_half(std::min(std::max(c0, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c1 += half_to_float(C[1 * ldc]); } } C[1 * ldc] = float_to_half(std::min(std::max(c1, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c2 += half_to_float(C[2 * ldc]); } } C[2 * ldc] = float_to_half(std::min(std::max(c2, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { c3 += half_to_float(C[3 * ldc]); } } C[3 * ldc] = float_to_half(std::min(std::max(c3, clamp_min), clamp_max));
-}
+    if constexpr (!zero_mode) {
+        c0 += half_to_float(C[0 * ldc]);
+    }
+    C[0 * ldc] = float_to_half(std::min(std::max(c0, clamp_min), clamp_max));
+        if constexpr (!zero_mode) {
+            c1 += half_to_float(C[1 * ldc]);
+        }
+        C[1 * ldc] = float_to_half(std::min(std::max(c1, clamp_min), clamp_max));
+        if constexpr (!zero_mode) {
+            c2 += half_to_float(C[2 * ldc]);
+        }
+        C[2 * ldc] = float_to_half(std::min(std::max(c2, clamp_min), clamp_max));
+        if constexpr (!zero_mode) {
+            c3 += half_to_float(C[3 * ldc]);
+        }
+        C[3 * ldc] = float_to_half(std::min(std::max(c3, clamp_min), clamp_max));
+    }
 
 template <bool zero_mode = false>
 inline void mma_direct_4x8_f16(
@@ -170,16 +190,24 @@ inline void mma_direct_4x8_f16(
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc));
+    }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C + 0 * ldc, v_c0);
-    if constexpr (!zero_mode) { v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc));
+    }
     v_c1 = _mm256_max_ps(_mm256_min_ps(v_c1, v_max), v_min);
     store_f16x8(C + 1 * ldc, v_c1);
-    if constexpr (!zero_mode) { v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc));
+    }
     v_c2 = _mm256_max_ps(_mm256_min_ps(v_c2, v_max), v_min);
     store_f16x8(C + 2 * ldc, v_c2);
-    if constexpr (!zero_mode) { v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc));
+    }
     v_c3 = _mm256_max_ps(_mm256_min_ps(v_c3, v_max), v_min);
     store_f16x8(C + 3 * ldc, v_c3);
 }
@@ -229,28 +257,44 @@ inline void mma_direct_4x16_f16(
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0 * 8));
+    }
     v_c00 = _mm256_max_ps(_mm256_min_ps(v_c00, v_max), v_min);
     store_f16x8(C + 0 * ldc + 0 * 8, v_c00);
-    if constexpr (!zero_mode) { v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 1 * 8));
+    }
     v_c01 = _mm256_max_ps(_mm256_min_ps(v_c01, v_max), v_min);
     store_f16x8(C + 0 * ldc + 1 * 8, v_c01);
-    if constexpr (!zero_mode) { v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0 * 8));
+    }
     v_c10 = _mm256_max_ps(_mm256_min_ps(v_c10, v_max), v_min);
     store_f16x8(C + 1 * ldc + 0 * 8, v_c10);
-    if constexpr (!zero_mode) { v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 1 * 8));
+    }
     v_c11 = _mm256_max_ps(_mm256_min_ps(v_c11, v_max), v_min);
     store_f16x8(C + 1 * ldc + 1 * 8, v_c11);
-    if constexpr (!zero_mode) { v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0 * 8));
+    }
     v_c20 = _mm256_max_ps(_mm256_min_ps(v_c20, v_max), v_min);
     store_f16x8(C + 2 * ldc + 0 * 8, v_c20);
-    if constexpr (!zero_mode) { v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 1 * 8));
+    }
     v_c21 = _mm256_max_ps(_mm256_min_ps(v_c21, v_max), v_min);
     store_f16x8(C + 2 * ldc + 1 * 8, v_c21);
-    if constexpr (!zero_mode) { v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0 * 8));
+    }
     v_c30 = _mm256_max_ps(_mm256_min_ps(v_c30, v_max), v_min);
     store_f16x8(C + 3 * ldc + 0 * 8, v_c30);
-    if constexpr (!zero_mode) { v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 1 * 8));
+    }
     v_c31 = _mm256_max_ps(_mm256_min_ps(v_c31, v_max), v_min);
     store_f16x8(C + 3 * ldc + 1 * 8, v_c31);
 }
@@ -287,13 +331,20 @@ inline void mma_direct_6x1_f16(
         B += ldb;
     }
 
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc0 += half_to_float(C[0 * ldc]); } } C[0 * ldc] = float_to_half(std::min(std::max(acc0, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc1 += half_to_float(C[1 * ldc]); } } C[1 * ldc] = float_to_half(std::min(std::max(acc1, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc2 += half_to_float(C[2 * ldc]); } } C[2 * ldc] = float_to_half(std::min(std::max(acc2, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc3 += half_to_float(C[3 * ldc]); } } C[3 * ldc] = float_to_half(std::min(std::max(acc3, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc4 += half_to_float(C[4 * ldc]); } } C[4 * ldc] = float_to_half(std::min(std::max(acc4, clamp_min), clamp_max));
-    if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc5 += half_to_float(C[5 * ldc]); } } C[5 * ldc] = float_to_half(std::min(std::max(acc5, clamp_min), clamp_max));
-}
+    if constexpr (!zero_mode) {
+        if constexpr (!zero_mode) { acc0 += half_to_float(C[0 * ldc]);
+        } } C[0 * ldc] = float_to_half(std::min(std::max(acc0, clamp_min), clamp_max));
+        if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc1 += half_to_float(C[1 * ldc]);
+        } } C[1 * ldc] = float_to_half(std::min(std::max(acc1, clamp_min), clamp_max));
+        if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc2 += half_to_float(C[2 * ldc]);
+        } } C[2 * ldc] = float_to_half(std::min(std::max(acc2, clamp_min), clamp_max));
+        if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc3 += half_to_float(C[3 * ldc]);
+        } } C[3 * ldc] = float_to_half(std::min(std::max(acc3, clamp_min), clamp_max));
+        if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc4 += half_to_float(C[4 * ldc]);
+        } } C[4 * ldc] = float_to_half(std::min(std::max(acc4, clamp_min), clamp_max));
+        if constexpr (!zero_mode) { if constexpr (!zero_mode) { acc5 += half_to_float(C[5 * ldc]);
+        } } C[5 * ldc] = float_to_half(std::min(std::max(acc5, clamp_min), clamp_max));
+    }
 
 template <bool zero_mode = false>
 inline void mma_direct_6x8_f16(
@@ -335,22 +386,34 @@ inline void mma_direct_6x8_f16(
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    if constexpr (!zero_mode) { v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c0 = _mm256_add_ps(v_c0, load_f16x8(C + 0 * ldc));
+    }
     v_c0 = _mm256_max_ps(_mm256_min_ps(v_c0, v_max), v_min);
     store_f16x8(C + 0 * ldc, v_c0);
-    if constexpr (!zero_mode) { v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c1 = _mm256_add_ps(v_c1, load_f16x8(C + 1 * ldc));
+    }
     v_c1 = _mm256_max_ps(_mm256_min_ps(v_c1, v_max), v_min);
     store_f16x8(C + 1 * ldc, v_c1);
-    if constexpr (!zero_mode) { v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c2 = _mm256_add_ps(v_c2, load_f16x8(C + 2 * ldc));
+    }
     v_c2 = _mm256_max_ps(_mm256_min_ps(v_c2, v_max), v_min);
     store_f16x8(C + 2 * ldc, v_c2);
-    if constexpr (!zero_mode) { v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c3 = _mm256_add_ps(v_c3, load_f16x8(C + 3 * ldc));
+    }
     v_c3 = _mm256_max_ps(_mm256_min_ps(v_c3, v_max), v_min);
     store_f16x8(C + 3 * ldc, v_c3);
-    if constexpr (!zero_mode) { v_c4 = _mm256_add_ps(v_c4, load_f16x8(C + 4 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c4 = _mm256_add_ps(v_c4, load_f16x8(C + 4 * ldc));
+    }
     v_c4 = _mm256_max_ps(_mm256_min_ps(v_c4, v_max), v_min);
     store_f16x8(C + 4 * ldc, v_c4);
-    if constexpr (!zero_mode) { v_c5 = _mm256_add_ps(v_c5, load_f16x8(C + 5 * ldc)); }
+    if constexpr (!zero_mode) {
+        v_c5 = _mm256_add_ps(v_c5, load_f16x8(C + 5 * ldc));
+    }
     v_c5 = _mm256_max_ps(_mm256_min_ps(v_c5, v_max), v_min);
     store_f16x8(C + 5 * ldc, v_c5);
 }
@@ -414,40 +477,64 @@ inline void mma_direct_6x16_f16(
 
     const __m256 v_min = _mm256_set1_ps(clamp_min);
     const __m256 v_max = _mm256_set1_ps(clamp_max);
-    if constexpr (!zero_mode) { v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c00 = _mm256_add_ps(v_c00, load_f16x8(C + 0 * ldc + 0 * 8));
+    }
     v_c00 = _mm256_max_ps(_mm256_min_ps(v_c00, v_max), v_min);
     store_f16x8(C + 0 * ldc + 0 * 8, v_c00);
-    if constexpr (!zero_mode) { v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c01 = _mm256_add_ps(v_c01, load_f16x8(C + 0 * ldc + 1 * 8));
+    }
     v_c01 = _mm256_max_ps(_mm256_min_ps(v_c01, v_max), v_min);
     store_f16x8(C + 0 * ldc + 1 * 8, v_c01);
-    if constexpr (!zero_mode) { v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c10 = _mm256_add_ps(v_c10, load_f16x8(C + 1 * ldc + 0 * 8));
+    }
     v_c10 = _mm256_max_ps(_mm256_min_ps(v_c10, v_max), v_min);
     store_f16x8(C + 1 * ldc + 0 * 8, v_c10);
-    if constexpr (!zero_mode) { v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c11 = _mm256_add_ps(v_c11, load_f16x8(C + 1 * ldc + 1 * 8));
+    }
     v_c11 = _mm256_max_ps(_mm256_min_ps(v_c11, v_max), v_min);
     store_f16x8(C + 1 * ldc + 1 * 8, v_c11);
-    if constexpr (!zero_mode) { v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c20 = _mm256_add_ps(v_c20, load_f16x8(C + 2 * ldc + 0 * 8));
+    }
     v_c20 = _mm256_max_ps(_mm256_min_ps(v_c20, v_max), v_min);
     store_f16x8(C + 2 * ldc + 0 * 8, v_c20);
-    if constexpr (!zero_mode) { v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c21 = _mm256_add_ps(v_c21, load_f16x8(C + 2 * ldc + 1 * 8));
+    }
     v_c21 = _mm256_max_ps(_mm256_min_ps(v_c21, v_max), v_min);
     store_f16x8(C + 2 * ldc + 1 * 8, v_c21);
-    if constexpr (!zero_mode) { v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c30 = _mm256_add_ps(v_c30, load_f16x8(C + 3 * ldc + 0 * 8));
+    }
     v_c30 = _mm256_max_ps(_mm256_min_ps(v_c30, v_max), v_min);
     store_f16x8(C + 3 * ldc + 0 * 8, v_c30);
-    if constexpr (!zero_mode) { v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c31 = _mm256_add_ps(v_c31, load_f16x8(C + 3 * ldc + 1 * 8));
+    }
     v_c31 = _mm256_max_ps(_mm256_min_ps(v_c31, v_max), v_min);
     store_f16x8(C + 3 * ldc + 1 * 8, v_c31);
-    if constexpr (!zero_mode) { v_c40 = _mm256_add_ps(v_c40, load_f16x8(C + 4 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c40 = _mm256_add_ps(v_c40, load_f16x8(C + 4 * ldc + 0 * 8));
+    }
     v_c40 = _mm256_max_ps(_mm256_min_ps(v_c40, v_max), v_min);
     store_f16x8(C + 4 * ldc + 0 * 8, v_c40);
-    if constexpr (!zero_mode) { v_c41 = _mm256_add_ps(v_c41, load_f16x8(C + 4 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c41 = _mm256_add_ps(v_c41, load_f16x8(C + 4 * ldc + 1 * 8));
+    }
     v_c41 = _mm256_max_ps(_mm256_min_ps(v_c41, v_max), v_min);
     store_f16x8(C + 4 * ldc + 1 * 8, v_c41);
-    if constexpr (!zero_mode) { v_c50 = _mm256_add_ps(v_c50, load_f16x8(C + 5 * ldc + 0 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c50 = _mm256_add_ps(v_c50, load_f16x8(C + 5 * ldc + 0 * 8));
+    }
     v_c50 = _mm256_max_ps(_mm256_min_ps(v_c50, v_max), v_min);
     store_f16x8(C + 5 * ldc + 0 * 8, v_c50);
-    if constexpr (!zero_mode) { v_c51 = _mm256_add_ps(v_c51, load_f16x8(C + 5 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        v_c51 = _mm256_add_ps(v_c51, load_f16x8(C + 5 * ldc + 1 * 8));
+    }
     v_c51 = _mm256_max_ps(_mm256_min_ps(v_c51, v_max), v_min);
     store_f16x8(C + 5 * ldc + 1 * 8, v_c51);
 }

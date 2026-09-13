@@ -34,7 +34,9 @@ inline void mma_pack_1x1_f16(float16_t* NNOPS_RESTRICT C, int ldc,
         c0 += *A++ * B[0];
         B += ldb;
     }
-    if constexpr (!zero_mode) { c0 = c0 + C[0 * ldc]; }
+    if constexpr (!zero_mode) {
+        c0 = c0 + C[0 * ldc];
+    }
     C[0 * ldc] = std::min(std::max(c0, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
 }
 
@@ -78,7 +80,9 @@ inline void mma_pack_1x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     c4 = vaddq_f16(vaddq_f16(c4, c5), vaddq_f16(c6, c7));
     c0 = vaddq_f16(c0, vaddq_f16(c4, ct));
 
-    if constexpr (!zero_mode) { c0 = vaddq_f16(c0, vld1q_f16(C)); }
+    if constexpr (!zero_mode) {
+        c0 = vaddq_f16(c0, vld1q_f16(C));
+    }
     const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
     const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
     vst1q_f16(C, vminq_f16(vmaxq_f16(c0, vmin), vmax));
@@ -143,8 +147,10 @@ inline void mma_pack_1x16_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
     const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    if constexpr (!zero_mode) { c00 = vaddq_f16(c00, vld1q_f16(C + 0 * 8)); 
-    c01 = vaddq_f16(c01, vld1q_f16(C + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c00 = vaddq_f16(c00, vld1q_f16(C + 0 * 8));
+        c01 = vaddq_f16(c01, vld1q_f16(C + 1 * 8));
+    }
 
     vst1q_f16(C + 0 * 8, vminq_f16(vmaxq_f16(c00, vmin), vmax));
     vst1q_f16(C + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
@@ -169,10 +175,26 @@ inline void mma_pack_4x1_f16(float16_t* NNOPS_RESTRICT C, int ldc,
         c3 += A[3] * b;
         A += 4;
     }
-    if constexpr (!zero_mode) { c0 += C[0 * ldc]; } c0 = std::min(std::max(c0, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[0 * ldc] = c0;
-    if constexpr (!zero_mode) { c1 += C[1 * ldc]; } c1 = std::min(std::max(c1, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[1 * ldc] = c1;
-    if constexpr (!zero_mode) { c2 += C[2 * ldc]; } c2 = std::min(std::max(c2, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[2 * ldc] = c2;
-    if constexpr (!zero_mode) { c3 += C[3 * ldc]; } c3 = std::min(std::max(c3, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[3 * ldc] = c3;
+    if constexpr (!zero_mode) {
+        c0 += C[0 * ldc];
+    }
+    c0 = std::min(std::max(c0, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[0 * ldc] = c0;
+    if constexpr (!zero_mode) {
+        c1 += C[1 * ldc];
+    }
+    c1 = std::min(std::max(c1, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[1 * ldc] = c1;
+    if constexpr (!zero_mode) {
+        c2 += C[2 * ldc];
+    }
+    c2 = std::min(std::max(c2, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[2 * ldc] = c2;
+    if constexpr (!zero_mode) {
+        c3 += C[3 * ldc];
+    }
+    c3 = std::min(std::max(c3, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[3 * ldc] = c3;
 }
 
 template <bool zero_mode = false>
@@ -199,10 +221,12 @@ inline void mma_pack_4x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
     const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    if constexpr (!zero_mode) { c0 = vaddq_f16(c0, vld1q_f16(C + 0 * ldc)); 
-    c1 = vaddq_f16(c1, vld1q_f16(C + 1 * ldc)); 
-    c2 = vaddq_f16(c2, vld1q_f16(C + 2 * ldc)); 
-    c3 = vaddq_f16(c3, vld1q_f16(C + 3 * ldc)); }
+    if constexpr (!zero_mode) {
+        c0 = vaddq_f16(c0, vld1q_f16(C + 0 * ldc));
+        c1 = vaddq_f16(c1, vld1q_f16(C + 1 * ldc));
+        c2 = vaddq_f16(c2, vld1q_f16(C + 2 * ldc));
+        c3 = vaddq_f16(c3, vld1q_f16(C + 3 * ldc));
+    }
 
     vst1q_f16(C + 0 * ldc, vminq_f16(vmaxq_f16(c0, vmin), vmax));
     vst1q_f16(C + 1 * ldc, vminq_f16(vmaxq_f16(c1, vmin), vmax));
@@ -240,23 +264,31 @@ inline void mma_pack_4x16_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
     const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    if constexpr (!zero_mode) { c00 = vaddq_f16(c00, vld1q_f16(C + 0 * ldc + 0 * 8)); 
-    c01 = vaddq_f16(c01, vld1q_f16(C + 0 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c00 = vaddq_f16(c00, vld1q_f16(C + 0 * ldc + 0 * 8));
+        c01 = vaddq_f16(c01, vld1q_f16(C + 0 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 0 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c00, vmin), vmax));
     vst1q_f16(C + 0 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
 
-    if constexpr (!zero_mode) { c10 = vaddq_f16(c10, vld1q_f16(C + 1 * ldc + 0 * 8)); 
-    c11 = vaddq_f16(c11, vld1q_f16(C + 1 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c10 = vaddq_f16(c10, vld1q_f16(C + 1 * ldc + 0 * 8));
+        c11 = vaddq_f16(c11, vld1q_f16(C + 1 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 1 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c10, vmin), vmax));
     vst1q_f16(C + 1 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c11, vmin), vmax));
 
-    if constexpr (!zero_mode) { c20 = vaddq_f16(c20, vld1q_f16(C + 2 * ldc + 0 * 8)); 
-    c21 = vaddq_f16(c21, vld1q_f16(C + 2 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c20 = vaddq_f16(c20, vld1q_f16(C + 2 * ldc + 0 * 8));
+        c21 = vaddq_f16(c21, vld1q_f16(C + 2 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 2 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c20, vmin), vmax));
     vst1q_f16(C + 2 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c21, vmin), vmax));
 
-    if constexpr (!zero_mode) { c30 = vaddq_f16(c30, vld1q_f16(C + 3 * ldc + 0 * 8)); 
-    c31 = vaddq_f16(c31, vld1q_f16(C + 3 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c30 = vaddq_f16(c30, vld1q_f16(C + 3 * ldc + 0 * 8));
+        c31 = vaddq_f16(c31, vld1q_f16(C + 3 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 3 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c30, vmin), vmax));
     vst1q_f16(C + 3 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c31, vmin), vmax));
 }
@@ -285,15 +317,48 @@ inline void mma_pack_8x1_f16(float16_t* NNOPS_RESTRICT C, int ldc,
         c7 += A[7] * b;
         A += 8;
     }
-    if constexpr (!zero_mode) { c0 += C[0 * ldc]; } c0 = std::min(std::max(c0, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[0 * ldc] = c0;
-    if constexpr (!zero_mode) { c1 += C[1 * ldc]; } c1 = std::min(std::max(c1, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[1 * ldc] = c1;
-    if constexpr (!zero_mode) { c2 += C[2 * ldc]; } c2 = std::min(std::max(c2, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[2 * ldc] = c2;
-    if constexpr (!zero_mode) { c3 += C[3 * ldc]; } c3 = std::min(std::max(c3, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[3 * ldc] = c3;
-    if constexpr (!zero_mode) { c4 += C[4 * ldc]; } c4 = std::min(std::max(c4, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[4 * ldc] = c4;
-    if constexpr (!zero_mode) { c5 += C[5 * ldc]; } c5 = std::min(std::max(c5, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[5 * ldc] = c5;
-    if constexpr (!zero_mode) { c6 += C[6 * ldc]; } c6 = std::min(std::max(c6, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[6 * ldc] = c6;
-    if constexpr (!zero_mode) { c7 += C[7 * ldc]; } c7 = std::min(std::max(c7, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max)); C[7 * ldc] = c7;
+    if constexpr (!zero_mode) {
+        c0 += C[0 * ldc];
+    }
+    c0 = std::min(std::max(c0, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[0 * ldc] = c0;
+    if constexpr (!zero_mode) {
+        c1 += C[1 * ldc];
+    }
+    c1 = std::min(std::max(c1, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[1 * ldc] = c1;
+    if constexpr (!zero_mode) {
+        c2 += C[2 * ldc];
+    }
+    c2 = std::min(std::max(c2, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[2 * ldc] = c2;
+    if constexpr (!zero_mode) {
+        c3 += C[3 * ldc];
+    }
+    c3 = std::min(std::max(c3, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[3 * ldc] = c3;
+    if constexpr (!zero_mode) {
+        c4 += C[4 * ldc];
+    }
+    c4 = std::min(std::max(c4, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[4 * ldc] = c4;
+    if constexpr (!zero_mode) {
+        c5 += C[5 * ldc];
+    }
+    c5 = std::min(std::max(c5, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[5 * ldc] = c5;
+    if constexpr (!zero_mode) {
+        c6 += C[6 * ldc];
+    }
+    c6 = std::min(std::max(c6, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[6 * ldc] = c6;
+    if constexpr (!zero_mode) {
+        c7 += C[7 * ldc];
+    }
+    c7 = std::min(std::max(c7, static_cast<float16_t>(clamp_min)), static_cast<float16_t>(clamp_max));
+    C[7 * ldc] = c7;
 }
+
 
 template <bool zero_mode = false>
 inline void mma_pack_8x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
@@ -327,14 +392,16 @@ inline void mma_pack_8x8_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
     const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    if constexpr (!zero_mode) { c0 = vaddq_f16(c0, vld1q_f16(C + 0 * ldc)); 
-    c1 = vaddq_f16(c1, vld1q_f16(C + 1 * ldc)); 
-    c2 = vaddq_f16(c2, vld1q_f16(C + 2 * ldc)); 
-    c3 = vaddq_f16(c3, vld1q_f16(C + 3 * ldc)); 
-    c4 = vaddq_f16(c4, vld1q_f16(C + 4 * ldc)); 
-    c5 = vaddq_f16(c5, vld1q_f16(C + 5 * ldc)); 
-    c6 = vaddq_f16(c6, vld1q_f16(C + 6 * ldc)); 
-    c7 = vaddq_f16(c7, vld1q_f16(C + 7 * ldc)); }
+    if constexpr (!zero_mode) {
+        c0 = vaddq_f16(c0, vld1q_f16(C + 0 * ldc));
+        c1 = vaddq_f16(c1, vld1q_f16(C + 1 * ldc));
+        c2 = vaddq_f16(c2, vld1q_f16(C + 2 * ldc));
+        c3 = vaddq_f16(c3, vld1q_f16(C + 3 * ldc));
+        c4 = vaddq_f16(c4, vld1q_f16(C + 4 * ldc));
+        c5 = vaddq_f16(c5, vld1q_f16(C + 5 * ldc));
+        c6 = vaddq_f16(c6, vld1q_f16(C + 6 * ldc));
+        c7 = vaddq_f16(c7, vld1q_f16(C + 7 * ldc));
+    }
 
     vst1q_f16(C + 0 * ldc, vminq_f16(vmaxq_f16(c0, vmin), vmax));
     vst1q_f16(C + 1 * ldc, vminq_f16(vmaxq_f16(c1, vmin), vmax));
@@ -388,43 +455,59 @@ inline void mma_pack_8x16_f16(float16_t* NNOPS_RESTRICT C, int ldc,
     const float16x8_t vmin = vdupq_n_f16(static_cast<float16_t>(clamp_min));
     const float16x8_t vmax = vdupq_n_f16(static_cast<float16_t>(clamp_max));
 
-    if constexpr (!zero_mode) { c00 = vaddq_f16(c00, vld1q_f16(C + 0 * ldc + 0 * 8)); 
-    c01 = vaddq_f16(c01, vld1q_f16(C + 0 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c00 = vaddq_f16(c00, vld1q_f16(C + 0 * ldc + 0 * 8));
+        c01 = vaddq_f16(c01, vld1q_f16(C + 0 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 0 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c00, vmin), vmax));
     vst1q_f16(C + 0 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
 
-    if constexpr (!zero_mode) { c10 = vaddq_f16(c10, vld1q_f16(C + 1 * ldc + 0 * 8)); 
-    c11 = vaddq_f16(c11, vld1q_f16(C + 1 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c10 = vaddq_f16(c10, vld1q_f16(C + 1 * ldc + 0 * 8));
+        c11 = vaddq_f16(c11, vld1q_f16(C + 1 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 1 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c10, vmin), vmax));
     vst1q_f16(C + 1 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c11, vmin), vmax));
 
-    if constexpr (!zero_mode) { c20 = vaddq_f16(c20, vld1q_f16(C + 2 * ldc + 0 * 8)); 
-    c21 = vaddq_f16(c21, vld1q_f16(C + 2 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c20 = vaddq_f16(c20, vld1q_f16(C + 2 * ldc + 0 * 8));
+        c21 = vaddq_f16(c21, vld1q_f16(C + 2 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 2 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c20, vmin), vmax));
     vst1q_f16(C + 2 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c21, vmin), vmax));
 
-    if constexpr (!zero_mode) { c30 = vaddq_f16(c30, vld1q_f16(C + 3 * ldc + 0 * 8)); 
-    c31 = vaddq_f16(c31, vld1q_f16(C + 3 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c30 = vaddq_f16(c30, vld1q_f16(C + 3 * ldc + 0 * 8));
+        c31 = vaddq_f16(c31, vld1q_f16(C + 3 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 3 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c30, vmin), vmax));
     vst1q_f16(C + 3 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c31, vmin), vmax));
 
-    if constexpr (!zero_mode) { c40 = vaddq_f16(c40, vld1q_f16(C + 4 * ldc + 0 * 8)); 
-    c41 = vaddq_f16(c41, vld1q_f16(C + 4 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c40 = vaddq_f16(c40, vld1q_f16(C + 4 * ldc + 0 * 8));
+        c41 = vaddq_f16(c41, vld1q_f16(C + 4 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 4 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c40, vmin), vmax));
     vst1q_f16(C + 4 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c41, vmin), vmax));
 
-    if constexpr (!zero_mode) { c50 = vaddq_f16(c50, vld1q_f16(C + 5 * ldc + 0 * 8)); 
-    c51 = vaddq_f16(c51, vld1q_f16(C + 5 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c50 = vaddq_f16(c50, vld1q_f16(C + 5 * ldc + 0 * 8));
+        c51 = vaddq_f16(c51, vld1q_f16(C + 5 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 5 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c50, vmin), vmax));
     vst1q_f16(C + 5 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c51, vmin), vmax));
 
-    if constexpr (!zero_mode) { c60 = vaddq_f16(c60, vld1q_f16(C + 6 * ldc + 0 * 8)); 
-    c61 = vaddq_f16(c61, vld1q_f16(C + 6 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c60 = vaddq_f16(c60, vld1q_f16(C + 6 * ldc + 0 * 8));
+        c61 = vaddq_f16(c61, vld1q_f16(C + 6 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 6 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c60, vmin), vmax));
     vst1q_f16(C + 6 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c61, vmin), vmax));
 
-    if constexpr (!zero_mode) { c70 = vaddq_f16(c70, vld1q_f16(C + 7 * ldc + 0 * 8)); 
-    c71 = vaddq_f16(c71, vld1q_f16(C + 7 * ldc + 1 * 8)); }
+    if constexpr (!zero_mode) {
+        c70 = vaddq_f16(c70, vld1q_f16(C + 7 * ldc + 0 * 8));
+        c71 = vaddq_f16(c71, vld1q_f16(C + 7 * ldc + 1 * 8));
+    }
     vst1q_f16(C + 7 * ldc + 0 * 8, vminq_f16(vmaxq_f16(c70, vmin), vmax));
     vst1q_f16(C + 7 * ldc + 1 * 8, vminq_f16(vmaxq_f16(c71, vmin), vmax));
 }
