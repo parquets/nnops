@@ -1,11 +1,11 @@
 /// @file bench_matmul.cpp
 /// @brief MatMul micro-benchmarks — pack decision + thread scaling.
 ///
-/// Every case runs the single NKM-fused path (B always packed, A packed only on
+/// Every case runs the plan-driven fused path (B always packed, A packed only on
 /// transpose_a or a wide row stride) across {nn, ta, tb, tatb} and padded
 /// strides. For each case the harness reports:
-///   - the pack_a decision,
-///   - the resolved tile sizes (mc, nc) and split block count,
+///   - the split direction (NKM when split on N, MKN when split on M),
+///   - the resolved tile sizes (mc, nc) and block count from get_matmul_plan(),
 ///   - GFLOPS at 1, 2, 4, 8 and hardware threads.
 ///
 /// The point is to see where block-granularity threading scales (and where it
@@ -144,16 +144,8 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // --- static metadata (mirrors matmul_dispatch_2d) ---
-    const int64_t lda = a.row_stride_elems();
-    const bool pack_a = c.ta || (lda > cpu::PACK_A_STRIDE_THRESHOLD);
-    constexpr int mr_max = cpu::mr_max_flt<T>();
-    constexpr int nr_max = cpu::nr_max_flt<T>();
-    constexpr int kc = std::is_same_v<T, float> ? cpu::KC_F32 : cpu::KC_F16;
-    int mc, nc;
-    cpu::resolve_tile_sizes(static_cast<int>(c.M), static_cast<int>(c.N),
-                            mr_max, nr_max, kc, static_cast<int>(sizeof(T)), mc, nc);
-    const int64_t num_blocks = (c.N + nc - 1) / nc;
+    // --- static metadata from the plan (mirrors matmul_kernel) ---
+    const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_planar(descs[0], out_buf.data());
@@ -161,13 +153,15 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = "NKM-fused";
+    rep.route = plan.split_n ? "NKM" : "MKN";
     rep.unit = "GFLOPS";
-    rep.pack_a = pack_a;
+    rep.pack_a = plan.pack_a;
     rep.pack_b = true;
-    rep.mc = mc;
-    rep.nc = nc;
-    rep.num_blocks = num_blocks;
+    rep.mc = static_cast<int>(plan.mc);
+    rep.nc = static_cast<int>(plan.nc);
+    rep.num_blocks = plan.split_n
+        ? (c.N + plan.nc - 1) / plan.nc
+        : cpu::split_block_count(c.M, plan.mc);
     rep.threads = threads;
 
     for (int nt : threads) {
@@ -248,7 +242,10 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     int mc, nc;
     cpu::resolve_tile_sizes(static_cast<int>(c.M), static_cast<int>(c.N),
                             cpu::MR_MAX_I8, cpu::NR_MAX_I8, cpu::KC_I8, 1, mc, nc);
-    const int64_t num_blocks = (c.N + nc - 1) / nc;
+    const bool split_n = (c.N > c.M);
+    const int64_t num_blocks = split_n
+        ? (c.N + nc - 1) / nc
+        : cpu::split_block_count(c.M, mc);
 
     std::vector<int32_t> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_planar(descs[0], out_buf.data());
@@ -256,7 +253,7 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = "int8-NKM";
+    rep.route = split_n ? "int8-NKM" : "int8-MKN";
     rep.unit = "GOPS";
     rep.pack_a = true;   // int8 always packs both A and B
     rep.pack_b = true;
