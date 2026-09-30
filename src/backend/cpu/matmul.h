@@ -1,12 +1,11 @@
 #pragma once
 /// @file matmul.h
 /// @brief Tiled matrix multiplication kernel using the pack + MMA interfaces.
-///        Loop order is plan-driven: NKM (N outer, K middle, M inner) or MKN
-///        (k{m{n}}), selected by the static pack decision in matmul_helper.h.
+///        Loop order is plan-driven: NKM (split on N) or MKN (split on M),
+///        selected by get_matmul_plan() in matmul_helper.h.
 ///
-/// Scratch (pack buffer for B) is pooled internally — sized via
-/// matmul_get_workspace_size() (declared in matmul_helper.h); packed A lives on
-/// the kernel stack.
+/// Scratch (pack buffer for B) is pooled internally, sized by the plan;
+/// packed A lives on the kernel stack.
 
 #include <cstddef>
 #include <span>
@@ -17,13 +16,12 @@
 
 namespace nnops::backend::cpu {
 
-/// Tiled matrix multiplication: C = A x B   (2D GEMM, NKM loop order).
+/// Tiled matrix multiplication: C = A × B.
 ///
-/// Uses the packing and MMA micro-kernel dispatch from matmul_helper. Scratch
-/// is pooled internally (sized by matmul_get_workspace_size); @p workspace is
-/// vestigial.
+/// Uses the MatMulPlan and pack/MMA dispatch from matmul_helper. Scratch is
+/// pooled internally (sized by the plan); @p workspace is vestigial.
 ///
-/// Falls back to reference matmul for batched (rank > 2) or non-f32/f16 dtypes.
+/// Falls back to the reference kernel for non-f32/f16 dtypes.
 void matmul_kernel(const MatMulAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,

@@ -248,15 +248,9 @@ constexpr int pack_a_stack_elems() {
 constexpr int LDD_A_I8 = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * KC_I8);
 constexpr int PACK_A_STACK_I8 = num_panels(MC_TARGET, MR_I8) * LDD_A_I8;
 
-/// Compute the workspace size (bytes) required by matmul_kernel for the given
-/// tensor descriptors and operator attributes.
-///
-/// The fp tiled path always packs B, so a workspace is always needed for it —
-/// except on the fast path (M*N*K < 1024), which routes to the reference and
-/// needs none. Packed A lives on the kernel stack, so it never consumes
-/// workspace. The size is computed from the global N (not the thread count):
-/// the per-block panel slices tile the buffer exactly, so the formula below is
-/// thread-count invariant and always covers the kernel's pack_b buffer.
+/// Compute the workspace size (bytes) for the int8 (s8×s8) path: packed-B
+/// panels plus, for an s8 output, the int32 accumulator. The fp path sizes its
+/// own workspace via get_matmul_plan(); this returns 0 for non-int8 dtypes.
 size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& a_desc,
                                  const TensorDesc& b_desc,
@@ -323,18 +317,16 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
 void xor0x80_i8(int8_t* p, int nbytes);
 
 struct MatMulPlan {
-    int64_t mc, nc, kc;
-    int64_t ldd_b;
-    bool pack_a, pack_b;
-    bool split_m, split_n;
-    int64_t pack_bytes;
-    int64_t workspace_size;
+    int64_t mc, nc, kc;       // tile sizes
+    int64_t ldd_b;            // packed-B panel stride (elements) at full Kc
+    bool    pack_a;           // A is packed (transpose_a or wide row stride)
+    bool    split_n;          // split on N (else on M)
+    int64_t workspace_size;   // scratch bytes for packed B
 };
 
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,
-                          const TensorDesc& c_desc,
                           int num_threads = 1);
 
 }  // namespace nnops::backend::cpu

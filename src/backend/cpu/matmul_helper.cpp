@@ -692,7 +692,6 @@ void tile_scale(half* c, int ldc, float scale, int M, int N) {
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,
-                          const TensorDesc& c_desc,
                           int num_threads) {
     MatMulPlan plan;
 
@@ -725,11 +724,10 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     int64_t lda = a_desc.row_stride_elems;
     if (lda == 0) { lda = attrs.transpose_a ? M : K; }
     plan.pack_a = attrs.transpose_a || (lda > PACK_A_STRIDE_THRESHOLD);
-    plan.pack_b = true;
 
     // Split on the larger dimension (the dispatch's N > M rule).
     plan.split_n = (N > M);
-    plan.split_m = !plan.split_n;
+    const bool split_m = !plan.split_n;
 
     plan.kc = std::min<int64_t>(is_f32 ? KC_F32 : KC_F16, K);
 
@@ -738,7 +736,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const int* nr     = is_f32 ? NR_F32 : NR_F16;
     const int  elem   = is_f32 ? static_cast<int>(sizeof(float)) : static_cast<int>(sizeof(half));
 
-    plan.mc = (plan.split_m && num_threads > 1) ? (M / num_threads) : MC_TARGET;
+    plan.mc = (split_m && num_threads > 1) ? (M / num_threads) : MC_TARGET;
     plan.mc = std::max<int64_t>(std::min<int64_t>(plan.mc, MC_TARGET), 1);
 
     // N tile bounded by the L2 cache, rounded down to a nr_max multiple so the
@@ -762,8 +760,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     // own slice, so the workspace is num_m_blocks × this.
     const size_t packed_b_bytes = static_cast<size_t>(num_panels(static_cast<int>(N), nr))
                                 * static_cast<size_t>(ldd_b) * static_cast<size_t>(elem);
-    plan.pack_bytes = static_cast<int64_t>(packed_b_bytes);
-    if (plan.split_m) {
+    if (split_m) {
         const int64_t num_m_blocks = split_block_count(M, plan.mc);
         plan.workspace_size = num_m_blocks * static_cast<int64_t>(packed_b_bytes);
     } else {

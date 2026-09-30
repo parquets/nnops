@@ -1,22 +1,19 @@
 /// @file matmul.cpp
 /// @brief Tiled matrix multiplication kernel — pack + MMA dispatch.
 ///
-/// Packing, tiling, and the (now trivial) pack decision live in
-/// matmul_helper.{h,cpp}; this file owns the tiled loops and the operator-level
-/// dispatch. Mirroring onnxruntime MLAS sgemm, B (rhs) is always packed into
-/// pooled scratch and A (lhs) is packed into a per-thread stack
-/// buffer only when transpose_a forces it or its row stride is page-scattered
-/// (lda > PACK_A_STRIDE_THRESHOLD); otherwise A is read directly. The loop
-/// order is always NKM (n-block outer, k, then m).
+/// B (rhs) is always packed into pooled scratch; A (lhs) is packed on the
+/// per-thread stack only when transpose_a forces it or its row stride is
+/// page-scattered, else read directly. Tiling, the pack decision, the split
+/// direction, and the workspace size all come from get_matmul_plan()
+/// (matmul_helper): the loop order is NKM when split on N, MKN when split on M.
 ///
-/// GEMMs below GEMM_FAST_PATH_THRESHOLD MACs skip the tiled path entirely and
-/// go straight to the reference. Work is split on the larger dimension (N when
-/// N > M, else M — mirroring MLAS) through ctx.cpu.run (serial
-/// fallback otherwise); C tiles are disjoint and there are no reductions, so
-/// the result is bit-identical to serial.
+/// GEMMs below GEMM_FAST_PATH_THRESHOLD MACs route to the reference. Work is
+/// split on the larger dimension via ctx.cpu.run; C tiles are disjoint with no
+/// reductions, so the result is bit-identical to serial.
 ///
-/// Beta scaling is fused into the first k-block; the epilogue (and the Relu
-/// clamp) applies after the last k-block, matching matmul_ref semantics.
+/// Beta scaling is fused into the first k-block; the clamp (epilogue
+/// min_clip/max_clip) is folded into the last k-block and the other activations
+/// apply in-place, matching matmul_ref semantics.
 
 #include "matmul.h"
 #include "matmul_helper.h"
@@ -681,7 +678,7 @@ void matmul_kernel(const MatMulAttributes& attrs,
     default: break;
     }
 
-    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), output.desc(), ctx.cpu.thread_count());
+    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count());
 
     // int8 (s8×s8): fused tiled kernel for s32 / s8 outputs. The tiled path
     // always packs B into pooled scratch (getWorkspaceSize returns 0).
