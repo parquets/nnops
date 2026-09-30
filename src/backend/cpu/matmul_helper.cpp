@@ -11,7 +11,7 @@ using namespace nnops::backend::cpu::aarch64;
 namespace nnops::backend::cpu {
 
 // =========================================================================
-//  Workspace sizing — same tiling as the matmul.cpp kernels
+//  Workspace sizing — int8 path only (fp sizing lives in get_matmul_plan)
 // =========================================================================
 
 size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
@@ -19,26 +19,15 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
                                  const TensorDesc& b_desc,
                                  const TensorDesc& c_desc)
 {
-    const auto dt_a = a_desc.dtype;
-    const auto dt_b = b_desc.dtype;
-    if (dt_a != b_desc.dtype) {
-        return 0;
-    }
-
-    const int64_t a_rank = a_desc.rank;
-    const int64_t b_rank = b_desc.rank;
-    NNOPS_ASSERT(a_rank >= 2 && b_rank >= 2);
-
-    const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
-                                        : a_desc.dims[static_cast<size_t>(a_rank - 2)];
-    const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
-                                        : b_desc.dims[static_cast<size_t>(b_rank - 1)];
-    const int64_t K = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
-                                        : b_desc.dims[static_cast<size_t>(b_rank - 2)];
-    
-    // int8 (s8×s8): the tiled path always packs B, and for an s8 output it also
-    // needs an int32 accumulator buffer. Both live in the workspace.
-    if (dt_a == DataType::s8 && dt_b == DataType::s8) {
+    // int8 (s8×s8): the tiled path always packs B, and an s8 output also needs
+    // an int32 accumulator. Both live in the workspace. (The fp path computes
+    // its own workspace through get_matmul_plan(), so this is never called for
+    // f32/f16 and returns 0 there.)
+    if (a_desc.dtype == DataType::s8 && b_desc.dtype == DataType::s8) {
+        const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_desc.rank - 1)]
+                                            : a_desc.dims[static_cast<size_t>(a_desc.rank - 2)];
+        const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_desc.rank - 2)]
+                                            : b_desc.dims[static_cast<size_t>(b_desc.rank - 1)];
         const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * KC_I8);
         size_t total = static_cast<size_t>(num_panels4(static_cast<int>(N), NR_I8))
                      * static_cast<size_t>(ldd_b);
@@ -47,38 +36,7 @@ size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
         }
         return total;
     }
-
-    int kc, nr_max;
-    size_t elem;
-    const int* nr;
-    if (dt_a == DataType::f32) {
-        kc = std::min(KC_F32, static_cast<int>(K));  
-        nr_max = NR_MAX_F32;  
-        elem = sizeof(float);  
-        nr = NR_F32;
-    } else if (dt_a == DataType::f16 || dt_a == DataType::bf16) {
-        kc = std::min(KC_F16, static_cast<int>(K));  
-        nr_max = NR_MAX_F16;  
-        elem = sizeof(half);   
-        nr = NR_F16;
-    } else {
-        return 0;  // unsupported dtype → reference fallback, no workspace
-    }
-
-    // Fast path (f32 only): tiny GEMMs go to the reference and need no
-    // workspace. f16 has no reference kernel, so it always uses the tiled path.
-    if (dt_a == DataType::f32 && gemm_is_small(M, N, K)) {
-        return 0;
-    }
-
-    // B is always packed. Packed B panels sit at the workspace base at a
-    // uniform 64-byte-aligned full-Kc stride. Each n-block owns num_panels(nc,
-    // nr) panels at this stride and the blocks tile the buffer exactly, so the
-    // total is num_panels(N, nr) panels — independent of nc and of the thread
-    // count.
-    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(elem)) / static_cast<int>(elem);
-
-    return static_cast<size_t>(num_panels(static_cast<int>(N), nr)) * static_cast<size_t>(ldd_b) * elem;
+    return 0;
 }
 
 // ---- pack function pointer types ---------------------------------------
@@ -731,6 +689,89 @@ void tile_scale(half* c, int ldc, float scale, int M, int N) {
     tile_scale_impl(c, ldc, scale, M, N);
 }
 
+MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
+                          const TensorDesc& a_desc,
+                          const TensorDesc& b_desc,
+                          const TensorDesc& c_desc,
+                          int num_threads) {
+    MatMulPlan plan;
+
+    const auto dt_a = a_desc.dtype;
+    const auto dt_b = b_desc.dtype;
+    if (dt_a != b_desc.dtype) {
+        return plan;
+    }
+
+    const bool is_f32 = (dt_a == DataType::f32);
+    const bool is_f16 = (dt_a == DataType::f16);
+    if (!is_f32 && !is_f16) {
+        return plan;  // int8 / other dtypes are dispatched elsewhere
+    }
+    num_threads = std::max(num_threads, 1);
+
+    const int64_t a_rank = a_desc.rank;
+    const int64_t b_rank = b_desc.rank;
+    NNOPS_ASSERT(a_rank >= 2 && b_rank >= 2);
+
+    const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
+                                        : a_desc.dims[static_cast<size_t>(a_rank - 2)];
+    const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
+                                        : b_desc.dims[static_cast<size_t>(b_rank - 1)];
+    const int64_t K = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
+                                        : b_desc.dims[static_cast<size_t>(b_rank - 2)];
+
+
+    // A is packed for correctness (transpose_a) or a page-scattered row stride.
+    int64_t lda = a_desc.row_stride_elems;
+    if (lda == 0) { lda = attrs.transpose_a ? M : K; }
+    plan.pack_a = attrs.transpose_a || (lda > PACK_A_STRIDE_THRESHOLD);
+    plan.pack_b = true;
+
+    // Split on the larger dimension (the dispatch's N > M rule).
+    plan.split_n = (N > M);
+    plan.split_m = !plan.split_n;
+
+    plan.kc = std::min<int64_t>(is_f32 ? KC_F32 : KC_F16, K);
+
+    const int  mr_max = is_f32 ? mr_max_flt<float>() : mr_max_flt<half>();
+    const int  nr_max = is_f32 ? nr_max_flt<float>() : nr_max_flt<half>();
+    const int* nr     = is_f32 ? NR_F32 : NR_F16;
+    const int  elem   = is_f32 ? static_cast<int>(sizeof(float)) : static_cast<int>(sizeof(half));
+
+    plan.mc = (plan.split_m && num_threads > 1) ? (M / num_threads) : MC_TARGET;
+    plan.mc = std::max<int64_t>(std::min<int64_t>(plan.mc, MC_TARGET), 1);
+
+    // N tile bounded by the L2 cache, rounded down to a nr_max multiple so the
+    // per-block packed-B slices tile the workspace exactly, clamped to [nr_max, N].
+    const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
+    const int nc_l2 = compute_nc(mr_max, static_cast<int>(plan.kc), elem, l2);
+    const int nc_cap = clamp_nc(round_down_nc(nc_l2, nr_max), nr_max, static_cast<int>(N));
+
+    int64_t nc = nc_cap;
+    if (plan.split_n && num_threads > 1) {
+        nc = std::min<int64_t>(N / num_threads, nc_cap);
+    }
+    plan.nc = clamp_nc(round_down_nc(static_cast<int>(nc), nr_max), nr_max, static_cast<int>(N));
+
+    // Packed-B stride (elements) at full Kc.
+    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(plan.kc) * elem) / elem;
+    plan.ldd_b = ldd_b;
+
+    // One full-N packed-B slice (bytes). N-split tiles this once across the
+    // n-blocks (thread-count invariant); M-split (MKN) gives every m-block its
+    // own slice, so the workspace is num_m_blocks × this.
+    const size_t packed_b_bytes = static_cast<size_t>(num_panels(static_cast<int>(N), nr))
+                                * static_cast<size_t>(ldd_b) * static_cast<size_t>(elem);
+    plan.pack_bytes = static_cast<int64_t>(packed_b_bytes);
+    if (plan.split_m) {
+        const int64_t num_m_blocks = split_block_count(M, plan.mc);
+        plan.workspace_size = num_m_blocks * static_cast<int64_t>(packed_b_bytes);
+    } else {
+        plan.workspace_size = static_cast<int64_t>(packed_b_bytes);
+    }
+
+    return plan;
+}
 
 
 }  // namespace nnops::backend::cpu

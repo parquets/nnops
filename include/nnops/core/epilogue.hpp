@@ -29,6 +29,7 @@ enum class EpilogueActivateType : uint8_t {
     Silu       = 6,   ///< f(x) = x * sigmoid(x) (Swish)
     HardSwish  = 7,   ///< f(x) = x * relu6(x + 3) / 6
     Elu        = 8,   ///< f(x) = x > 0 ? x : alpha * (exp(x) - 1)
+    Relu6      = 9,   ///< f(x) = min(max(0, x), 6)
 
     // ---- Quantize / Dequantize (future) ----
     // Dequantize  = 9,   ///< y = (x - zp[c]) * scale[c]  (per-channel or per-tensor)
@@ -48,6 +49,8 @@ struct Epilogue {
     float                alpha = 0.0f;   ///< Slope for LeakyRelu, alpha for Elu
     float                beta  = 1.0f;   ///< Parameter for HardSwish
 
+    float min_clip = -std::numeric_limits<float>::infinity();  ///< Optional clamp min (default: none)
+    float max_clip =  std::numeric_limits<float>::infinity();  ///< Optional clamp max
     // ---- Per-channel quantization parameters (for Dequantize / Requantize) ----
     /// Per-channel quantization scales.
     /// Size: quant_param_count. Indexed by the channel axis.

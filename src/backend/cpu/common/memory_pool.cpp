@@ -16,15 +16,15 @@ namespace {
 
 constexpr size_t kAlignment = 64;                  // matches GEMM PANEL_ALIGN_BYTES
 constexpr size_t kMinClass  = 64;                  // smallest pooled size
-constexpr size_t kMaxClass  = 4u * 1024u * 1024u;  // 4 MiB cap
-constexpr int    kNumClasses = 17;                 // 64 B .. 4 MiB (powers of two)
+constexpr size_t kMaxClass  = 16u * 1024u * 1024u;  // 16 MiB cap
+constexpr int    kNumClasses = 19;                 // 64 B .. 16 MiB (powers of two)
 
 // Retention budget: total bytes allowed to sit in the free lists. When a free
 // pushes the pool over this bound, the largest pooled blocks are returned to
 // the OS so the pool's footprint stays bounded. This is the knob that trades
 // reuse (fewer malloc/free calls) against held-but-idle memory: a larger budget
 // reuses more, a smaller budget returns scratch to the OS sooner. 64 MiB is a
-// conservative default, far above a single <=4 MiB request so it does not
+// conservative default, far above a single <=16 MiB request so it does not
 // inhibit normal scratch reuse.
 constexpr size_t kMaxPooledBytes = 64u * 1024u * 1024u;
 

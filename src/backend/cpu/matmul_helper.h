@@ -119,18 +119,18 @@ constexpr int align_up(int n) {
 //  Tiling constants (shared by matmul.cpp kernels and workspace sizing)
 // =========================================================================
 
-constexpr int KC_F32   = 128;
-constexpr int KC_F16   = 128;   // k-block length also bounds per-block fp16 accumulation error
-constexpr int KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
-constexpr int KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
+constexpr int64_t KC_F32   = 128;
+constexpr int64_t KC_F16   = 128;   // k-block length also bounds per-block fp16 accumulation error
+constexpr int64_t KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
+constexpr int64_t KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 
-constexpr int MC_TARGET = 144;  // 144/6=24 (x86), 144/8=18 (aarch64)
+constexpr int64_t MC_TARGET = 144;  // 144/6=24 (x86), 144/8=18 (aarch64)
 
 // 64-byte aligned panel strides (in elements): ldd = align_up(mr_max * kc * sizeof(T), 64) / sizeof(T)
-constexpr int LDD_A_F32 = (MR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
-constexpr int LDD_B_F32 = (NR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
-constexpr int LDD_A_F16 = (MR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
-constexpr int LDD_B_F16 = (NR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
+constexpr int64_t LDD_A_F32 = (MR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
+constexpr int64_t LDD_B_F32 = (NR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
+constexpr int64_t LDD_A_F16 = (MR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
+constexpr int64_t LDD_B_F16 = (NR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
 
 // =========================================================================
 //  Nc from L2 constraint
@@ -159,7 +159,7 @@ inline int clamp_nc(int nc, int nr_max, int N) noexcept {
 
 /// Resolve the tile sizes (mc, nc) for a GEMM of M×N with the given panel
 /// maxima and Kc. Single source of truth for both kernels and sizing.
-inline void resolve_tile_sizes(int M, int N, int mr_max, int nr_max, int kc,
+inline void resolve_tile_sizes(int64_t  M, int64_t N, int64_t mr_max, int64_t nr_max, int64_t kc,
                                int elem_bytes, int& mc, int& nc) noexcept {
     mc = std::min(MC_TARGET, M);
     size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
@@ -321,6 +321,21 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
 
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
 void xor0x80_i8(int8_t* p, int nbytes);
+
+struct MatMulPlan {
+    int64_t mc, nc, kc;
+    int64_t ldd_b;
+    bool pack_a, pack_b;
+    bool split_m, split_n;
+    int64_t pack_bytes;
+    int64_t workspace_size;
+};
+
+MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
+                          const TensorDesc& a_desc,
+                          const TensorDesc& b_desc,
+                          const TensorDesc& c_desc,
+                          int num_threads = 1);
 
 }  // namespace nnops::backend::cpu
 

@@ -52,17 +52,16 @@ namespace {
 //  Shared helpers
 // =========================================================================
 
-/// Clamp bounds for the current k-block. Relu clamps only on the final
-/// k-block; intermediate partial sums must accumulate unclamped.
+/// Clamp bounds for the current k-block, read directly from the epilogue's
+/// explicit min_clip/max_clip (Relu → [0,∞] / Relu6 → [0,6] are folded into
+/// those bounds upstream). Only the final k-block clamps; intermediate partial
+/// sums must accumulate unclamped.
 inline std::pair<float, float> kblock_clamp(const MatMulAttributes& attrs, bool last_k) noexcept {
-    const float inf = std::numeric_limits<float>::infinity();
     if (!last_k) {
+        const float inf = std::numeric_limits<float>::infinity();
         return {-inf, inf};
     }
-    if (attrs.epilogue.type == EpilogueActivateType::Relu) {
-        return {0.0f, inf};
-    }
-    return {-inf, inf};
+    return {attrs.epilogue.min_clip, attrs.epilogue.max_clip};
 }
 
 /// Non-clamp epilogues (Relu is folded into the MMA clamp) are applied
@@ -76,19 +75,19 @@ inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept {
 //  Tile-block kernels — one call processes one (m-range × n-range) tile
 // =========================================================================
 
-/// Compute the m-panels of a single k-block against an already-packed B slice.
-/// Shared by the N-split and M-split paths so both use identical pack/MMA/
-/// epilogue logic. @p packed_b holds @p n_count columns for this k-block (its
-/// panel stride is derived internally from @p actual_kc); @p m_start/@p m_count
-/// select the C rows.
+/// Accumulate one k-block into an m×n tile of C: C += A × packed_B. Shared by
+/// the N-split (m over full M) and M-split (n over full N) paths so both use
+/// identical pack/MMA/epilogue logic. @p packed_b holds @p n_count columns for
+/// this k-block (its panel stride is derived internally from @p actual_kc);
+/// @p m_start/@p m_count and @p n_start/@p n_count select the C tile.
 template <typename T>
-void matmul_m_panels(const MatMulAttributes& attrs,
-                     T* c_ptr, int ldc,
-                     const T* a_ptr, int lda,
-                     int m_start, int m_count, int mc,
-                     int n_start, int n_count,
-                     int k, int actual_kc, bool last_k,
-                     bool pack_a, const T* packed_b)
+void matmul_tile(const MatMulAttributes& attrs,
+                 T* c_ptr, int ldc,
+                 const T* a_ptr, int lda,
+                 int m_start, int m_count, int mc,
+                 int n_start, int n_count,
+                 int k, int actual_kc, bool last_k,
+                 bool pack_a, const T* packed_b)
 {
     constexpr int mr_max = mr_max_flt<T>();
 
@@ -138,17 +137,19 @@ void matmul_m_panels(const MatMulAttributes& attrs,
     }
 }
 
-/// Fused NKM (N-split): B always packed into pack_b_slice; A packed on the
-/// stack only when @p pack_a (transpose_a on this path), else read raw. One
-/// n-block [n, n+actual_nc) over the full M.
+/// Fused tiled kernel: B is always packed into @p pack_b_slice; A is packed on
+/// the stack only when @p pack_a, else read raw. Processes one (m-range ×
+/// n-range) tile over all K-blocks. Shared by the N-split path (m over full M,
+/// n = one n-block) and the M-split path (m = one m-block, n over full N).
 template <typename T>
-void matmul_block_fused_nkm(const MatMulAttributes& attrs,
-                            T* c_ptr, int ldc,
-                            const T* a_ptr, int lda,
-                            const T* b_ptr, int ldb,
-                            int M, int K, int kc, int mc,
-                            int n, int actual_nc,
-                            bool pack_a, T* pack_b_slice)
+void matmul_block_fused(const MatMulAttributes& attrs,
+                        T* c_ptr, int ldc,
+                        const T* a_ptr, int lda,
+                        const T* b_ptr, int ldb,
+                        int K, int kc, int mc,
+                        int m_start, int m_count,
+                        int n_start, int n_count,
+                        bool pack_a, T* pack_b_slice)
 {
     constexpr int nr_max = nr_max_flt<T>();
 
@@ -162,16 +163,17 @@ void matmul_block_fused_nkm(const MatMulAttributes& attrs,
 
         // B panel: packed ([K][nr]) regardless of transpose_b.
         const T* b_src = attrs.transpose_b
-            ? b_ptr + n * ldb + k     // B phys is N×K, row n, col k
-            : b_ptr + k * ldb + n;    // B phys is K×N, row k, col n
-        tile_pack_rhs(attrs.transpose_b, actual_nc, actual_kc,
+            ? b_ptr + n_start * ldb + k     // B phys is N×K, row n, col k
+            : b_ptr + k * ldb + n_start;    // B phys is K×N, row k, col n
+        tile_pack_rhs(attrs.transpose_b, n_count, actual_kc,
                       pack_b_slice, ldd_b, b_src, ldb, 1.0f);
 
-        matmul_m_panels<T>(attrs, c_ptr, ldc, a_ptr, lda,
-                           0, M, mc, n, actual_nc,
-                           k, actual_kc, last_k, pack_a, pack_b_slice);
+        matmul_tile<T>(attrs, c_ptr, ldc, a_ptr, lda,
+                       m_start, m_count, mc, n_start, n_count,
+                       k, actual_kc, last_k, pack_a, pack_b_slice);
     }
 }
+
 
 // =========================================================================
 //  Batched dispatch — pack + block-granularity parallelism
@@ -182,7 +184,7 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                         TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
-                        int kc, void* workspace)
+                        const MatMulPlan& plan, void* workspace)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -211,26 +213,21 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
     const T* a_base = a.ptr<T>();
     const T* b_base = b.ptr<T>();
 
-    // A is packed only for transpose_a (correctness) or a wide row stride
-    // (page-scattered reads). B is always packed, so a workspace is mandatory.
-    const bool pack_a = attrs.transpose_a || (lda > PACK_A_STRIDE_THRESHOLD);
+    // A is packed only for transpose_a (correctness) or a wide row stride —
+    // decided once in get_matmul_plan, not re-derived here.
+    const bool pack_a = plan.pack_a;
     if (workspace == nullptr) {
         reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
         return;
     }
 
-    // Resolve tile sizes once (M/N/K are shared across all batch elements).
-    constexpr int mr_max = mr_max_flt<T>();
-    constexpr int nr_max = nr_max_flt<T>();
-    int mc, nc;
-    resolve_tile_sizes(static_cast<int>(M), static_cast<int>(N),
-                       mr_max, nr_max, kc, static_cast<int>(sizeof(T)), mc, nc);
+    // Tile sizes come from the plan (single source of truth).
+    const int kc = static_cast<int>(plan.kc);
+    const int mc = static_cast<int>(plan.mc);
+    const int nc = static_cast<int>(plan.nc);
 
-    // Workspace slice constants for the N-split packed-B path: each full
-    // n-block owns np_full panels at the full-Kc aligned stride.
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(T)))
-                           / static_cast<int>(sizeof(T));
-    const int np_full = num_panels(nc, std::is_same_v<T, float> ? NR_F32 : NR_F16);
+    // Full-Kc packed-B panel stride, shared by both split paths.
+    const int ldd_b_full = static_cast<int>(plan.ldd_b);
 
     // Work is split on the larger dimension (mirrors MLAS sgemm/qgemm: 1D
     // partition over N when N > M, else over M). The workspace always holds
@@ -303,45 +300,33 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
         const T* a_p = a_base + a_offset;
         const T* b_p = b_base + b_offset;
 
-        if (N > M) {
-            // N-split: one n-block per parallel task (N is the larger dim).
-            const int64_t num_blocks = (Ni + nc - 1) / nc;
-            auto run_block = [&](int64_t blk) {
-                const int n = static_cast<int>(blk) * nc;
-                const int actual_nc = std::min(nc, Ni - n);
-                T* pack_b_slice = static_cast<T*>(workspace) + blk * np_full * ldd_b_full;
-                matmul_block_fused_nkm<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
-                                          Mi, Ki, kc, mc, n, actual_nc,
-                                          pack_a, pack_b_slice);
-            };
-            ctx.cpu.run(0, num_blocks, run_block);
-        } else {
-            // M-split: pack B once per k-block (full N), then parallelize the M
-            // rows into equal contiguous slabs. Mirrors MLAS's "M >= N →
-            // partition M" rule; the block count is ceil(M/mc).
-            const int64_t num_m_blocks = split_block_count(Mi, mc);
+        // One block either owns an n-block (N-split) or an m-block (M-split); each
+        // reduces to an (m-range × n-range) tile over packed B.
+        const bool split_n = plan.split_n;
+        const int64_t num_blocks = split_n
+            ? (Ni + nc - 1) / nc
+            : split_block_count(Mi, mc);
+        const int np_full_b = num_panels(split_n ? nc : Ni,
+                                         std::is_same_v<T, float> ? NR_F32 : NR_F16);
 
-            for (int k = 0; k < Ki; k += kc) {
-                const int actual_kc = std::min(kc, Ki - k);
-                const bool last_k = (k + kc >= Ki);
-                const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
-                                  / static_cast<int>(sizeof(T));
-                const T* b_src = attrs.transpose_b
-                    ? b_p + k                  // B phys is N×K, col k over full N
-                    : b_p + k * ldb;           // B phys is K×N, row k over full N
-                T* pack_b = static_cast<T*>(workspace);
-                tile_pack_rhs(attrs.transpose_b, Ni, actual_kc, pack_b, ldd_b, b_src, ldb, 1.0f);
-
-                auto run_m = [&](int64_t blk) {
-                    const int m_start = static_cast<int>(blk * Mi / num_m_blocks);
-                    const int m_end   = static_cast<int>((blk + 1) * Mi / num_m_blocks);
-                    matmul_m_panels<T>(attrs, c_p, ldc, a_p, lda,
-                                       m_start, m_end - m_start, mc,
-                                       0, Ni, k, actual_kc, last_k, pack_a, pack_b);
-                };
-                ctx.cpu.run(0, num_m_blocks, run_m);
+        ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
+            int m_start, m_count, n_start, n_count;
+            if (split_n) {
+                n_start = static_cast<int>(blk) * nc;
+                n_count = std::min(nc, Ni - n_start);
+                m_start = 0;
+                m_count = Mi;
+            } else {
+                m_start = static_cast<int>(blk * Mi / num_blocks);
+                m_count = static_cast<int>((blk + 1) * Mi / num_blocks) - m_start;
+                n_start = 0;
+                n_count = Ni;
             }
-        }
+            T* pack_b_slice = static_cast<T*>(workspace) + blk * np_full_b * ldd_b_full;
+            matmul_block_fused<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
+                                  Ki, kc, mc, m_start, m_count, n_start, n_count,
+                                  pack_a, pack_b_slice);
+        });
     }
 }
 
@@ -687,17 +672,28 @@ void matmul_kernel(const MatMulAttributes& attrs,
     const auto dt_a = a.data_type();
     const auto dt_b = b.data_type();
 
+    // Fold the pure-clamp activations into the epilogue's explicit clip bounds
+    // so the tiled kernel's kblock_clamp reads min_clip/max_clip directly.
+    MatMulAttributes attrs_n = attrs;
+    switch (attrs_n.epilogue.type) {
+    case EpilogueActivateType::Relu:  attrs_n.epilogue.min_clip = 0.0f; break;
+    case EpilogueActivateType::Relu6: attrs_n.epilogue.min_clip = 0.0f; attrs_n.epilogue.max_clip = 6.0f; break;
+    default: break;
+    }
+
+    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), output.desc(), ctx.cpu.thread_count());
+
     // int8 (s8×s8): fused tiled kernel for s32 / s8 outputs. The tiled path
     // always packs B into pooled scratch (getWorkspaceSize returns 0).
     if (dt_a == DataType::s8 && dt_b == DataType::s8) {
         const bool out_ok = (output.data_type() == DataType::s32) ||
                             (output.data_type() == DataType::s8);
         if (out_ok) {
-            const size_t ws = matmul_get_workspace_size(attrs, a.desc(), b.desc(), output.desc());
+            const size_t ws = matmul_get_workspace_size(attrs_n, a.desc(), b.desc(), output.desc());
             PoolPtr scratch(ws);
-            matmul_dispatch_int8(attrs, output, inputs, ctx, KC_I8, scratch.get());
+            matmul_dispatch_int8(attrs_n, output, inputs, ctx, KC_I8, scratch.get());
         } else {
-            reference::matmul_int8_ref(attrs, output, inputs, ctx, nullptr);
+            reference::matmul_int8_ref(attrs_n, output, inputs, ctx, nullptr);
         }
         return;
     }
@@ -706,23 +702,16 @@ void matmul_kernel(const MatMulAttributes& attrs,
     const bool supported = (dt_a == DataType::f32 && dt_b == DataType::f32) ||
                            (dt_a == DataType::f16 && dt_b == DataType::f16);
     if (!supported) {
-        reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
+        reference::matmul_ref(attrs_n, output, inputs, ctx, nullptr);
         return;
     }
 
-    const int kc = (dt_a == DataType::f32) ? KC_F32 : KC_F16;
-
-    // Packed-B scratch is pooled internally (sized once, allocated before the
-    // parallel dispatch). For the f32 fast path (M*N*K < 1024) this is 0 and the
-    // dispatch routes to the reference; the PoolPtr(0) allocation is a harmless
-    // 64-byte class block.
-    const size_t ws = matmul_get_workspace_size(attrs, a.desc(), b.desc(), output.desc());
-    PoolPtr scratch(ws);
+    PoolPtr scratch(plan.workspace_size);
 
     if (dt_a == DataType::f32) {
-        matmul_dispatch_2d<float>(attrs, output, inputs, ctx, kc, scratch.get());
+        matmul_dispatch_2d<float>(attrs_n, output, inputs, ctx, plan, scratch.get());
     } else {
-        matmul_dispatch_2d<half>(attrs, output, inputs, ctx, kc, scratch.get());
+        matmul_dispatch_2d<half>(attrs_n, output, inputs, ctx, plan, scratch.get());
     }
 }
 

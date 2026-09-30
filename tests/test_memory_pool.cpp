@@ -15,7 +15,7 @@ using nnops::backend::cpu::MemoryPool;
 namespace {
 
 constexpr size_t kAlign = 64;
-constexpr size_t kOversize = 5u * 1024u * 1024u;  // > 4 MiB cap
+constexpr size_t kOversize = 20u * 1024u * 1024u;  // > 16 MiB cap
 
 inline bool aligned(void* p) {
     return (reinterpret_cast<uintptr_t>(p) % kAlign) == 0;
