@@ -69,7 +69,7 @@ inline void cache_store_f32(void* cache_ptr, int64_t offset, float val,
         static_cast<float*>(cache_ptr)[offset] = val;
         break;
     case DataType::f16: {
-        static_cast<uint16_t*>(cache_ptr)[offset] = float_to_half(val).bits;
+        static_cast<uint16_t*>(cache_ptr)[offset] = half_to_bits(float_to_half(val));
         break;
     }
     case DataType::bf16: {
@@ -183,7 +183,7 @@ inline void store_f32(void* ptr, int64_t offset, float val, DataType dtype) {
     } else {
         // f16 compute dtype
         uint16_t* dst16 = static_cast<uint16_t*>(ptr);
-        dst16[offset] = float_to_half(val).bits;
+        dst16[offset] = half_to_bits(float_to_half(val));
     }
 }
 

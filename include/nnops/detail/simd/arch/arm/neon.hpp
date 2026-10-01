@@ -35,7 +35,16 @@ struct v_f32x4 {
         val = vld1q_f32(tmp);
     }
 
-    float operator[](int i) const { return vgetq_lane_f32(val, i); }
+    float operator[](int i) const {
+        // vgetq_lane_f32 requires a compile-time constant lane, so unroll the
+        // index with a switch (a runtime lane index is not accepted by clang).
+        switch (i) {
+            case 0:  return vgetq_lane_f32(val, 0);
+            case 1:  return vgetq_lane_f32(val, 1);
+            case 2:  return vgetq_lane_f32(val, 2);
+            default: return vgetq_lane_f32(val, 3);
+        }
+    }
 };
 
 // ============================================================
@@ -397,10 +406,12 @@ inline v_f16x8 v_rcp(const v_f16x8& a) {
 }
 
 inline float v_reduce_sum(const v_f16x8& a) {
-    // Horizontal v_add across all 8 lanes
-    // Approach: reduce low and high halves, accumulate as float32
-    float sum = static_cast<float>(vaddvq_f16(a.val));
-    return sum;
+    // Horizontal sum across all 8 lanes. vaddvq_f16 is GCC-only (clang's
+    // arm_neon.h does not provide it), so mirror the f32 pairwise reduction.
+    float16x4_t sum4 = vpadd_f16(vget_low_f16(a.val), vget_high_f16(a.val));
+    sum4 = vpadd_f16(sum4, sum4);
+    sum4 = vpadd_f16(sum4, sum4);
+    return static_cast<float>(vget_lane_f16(sum4, 0));
 }
 
 // Horizontal max/min — pairwise reduction tree (same pattern as v_reduce_sum

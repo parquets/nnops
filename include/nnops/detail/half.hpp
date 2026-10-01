@@ -31,6 +31,13 @@ inline half float_to_half(float f) noexcept {
     return static_cast<__fp16>(f);
 }
 
+/// @brief Reinterpret a half as its IEEE 754 binary16 bit pattern.
+inline uint16_t half_to_bits(half h) noexcept {
+    uint16_t bits;
+    __builtin_memcpy(&bits, &h, sizeof(bits));
+    return bits;
+}
+
 /// @brief Convert array of fp16 to fp32 / fp32 to fp16.
 inline void convert_half_to_float(float* dst, const half* src, int n) noexcept {
     for (int i = 0; i < n; ++i) {
@@ -124,6 +131,11 @@ inline half float_to_half(float f) noexcept {
 
     bits = static_cast<uint16_t>(bits | static_cast<uint16_t>(sign >> 16));
     return half{bits};
+}
+
+/// @brief Reinterpret a half as its IEEE 754 binary16 bit pattern.
+inline uint16_t half_to_bits(half h) noexcept {
+    return h.bits;
 }
 
 /// @brief Convert array of fp16 to fp32 in-place (scalar loop).
