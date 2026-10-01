@@ -19,6 +19,8 @@ struct Conv2D::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Conv2D::~Conv2D() = default;
+
 
 namespace {
 auto resolve_conv2d_kernel(Backend backend) -> Conv2D::Impl::KernelFn

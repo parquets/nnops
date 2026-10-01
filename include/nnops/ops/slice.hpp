@@ -72,6 +72,7 @@ public:
     const SliceAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in slice.cpp (Pimpl pattern)
+    ~Slice();
 
 private:
     Slice(const SliceAttributes& attrs, Backend backend);

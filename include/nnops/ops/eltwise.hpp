@@ -79,6 +79,7 @@ public:
     const EltwiseAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in eltwise.cpp (Pimpl pattern)
+    ~Eltwise();
 
 private:
     Eltwise(const EltwiseAttributes& attrs, Backend backend);

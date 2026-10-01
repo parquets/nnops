@@ -96,6 +96,7 @@ public:
     const TransposeConv2DAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in transpose_conv2d.cpp (Pimpl pattern)
+    ~TransposeConv2D();
 
 private:
     TransposeConv2D(const TransposeConv2DAttributes& attrs, Backend backend);

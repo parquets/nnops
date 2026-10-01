@@ -118,6 +118,7 @@ public:
     const QuantLinearAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~QuantizeLinear();
 
 private:
     QuantizeLinear(const QuantLinearAttributes& attrs, Backend backend);
@@ -167,6 +168,7 @@ public:
     const QuantLinearAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~DequantizeLinear();
 
 private:
     DequantizeLinear(const QuantLinearAttributes& attrs, Backend backend);

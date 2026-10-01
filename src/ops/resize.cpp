@@ -34,6 +34,8 @@ struct Resize::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Resize::~Resize() = default;
+
 
 namespace {
 auto resolve_resize_kernel(Backend backend) -> Resize::Impl::KernelFn

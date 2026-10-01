@@ -44,6 +44,8 @@ struct Softmax::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Softmax::~Softmax() = default;
+
 
 namespace {
 auto resolve_softmax_kernel(Backend backend) -> Softmax::Impl::KernelFn

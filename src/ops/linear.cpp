@@ -26,6 +26,8 @@ struct Linear::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Linear::~Linear() = default;
+
 
 namespace {
 auto resolve_linear_kernel(Backend backend) -> Linear::Impl::KernelFn

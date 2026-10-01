@@ -96,6 +96,7 @@ public:
     const PoolingAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in pooling.cpp (Pimpl pattern)
+    ~Pooling();
 
 private:
     Pooling(const PoolingAttributes& attrs, Backend backend);

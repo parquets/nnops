@@ -100,6 +100,7 @@ public:
     const DepthwiseConvAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in depthwise_conv.cpp (Pimpl pattern)
+    ~DepthwiseConv();
 
 private:
     DepthwiseConv(const DepthwiseConvAttributes& attrs, Backend backend);

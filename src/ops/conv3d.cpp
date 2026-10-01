@@ -27,6 +27,8 @@ struct Conv3D::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Conv3D::~Conv3D() = default;
+
 
 namespace {
 auto resolve_conv3d_kernel(Backend backend) -> Conv3D::Impl::KernelFn

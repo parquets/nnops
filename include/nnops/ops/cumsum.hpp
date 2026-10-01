@@ -65,6 +65,7 @@ public:
     const CumSumAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in cumsum.cpp (Pimpl pattern)
+    ~CumSum();
 
 private:
     CumSum(const CumSumAttributes& attrs, Backend backend);

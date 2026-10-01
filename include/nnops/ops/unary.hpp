@@ -90,6 +90,7 @@ public:
     const UnaryAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in unary.cpp (Pimpl pattern)
+    ~Unary();
 
 private:
     Unary(const UnaryAttributes& attrs, Backend backend);

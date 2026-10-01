@@ -45,6 +45,8 @@ struct Clamp::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Clamp::~Clamp() = default;
+
 
 namespace {
 auto resolve_clamp_kernel(Backend backend) -> Clamp::Impl::KernelFn

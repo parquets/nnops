@@ -28,6 +28,8 @@ struct MatMul::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+MatMul::~MatMul() = default;
+
 
 namespace {
 auto resolve_matmul_kernel(Backend backend) -> MatMul::Impl::KernelFn

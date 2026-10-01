@@ -44,6 +44,8 @@ struct RoPE::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+RoPE::~RoPE() = default;
+
 
 namespace {
 auto resolve_rope_kernel(Backend backend) -> RoPE::Impl::KernelFn

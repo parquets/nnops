@@ -73,6 +73,7 @@ public:
     const ReduceAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in reduce.cpp (Pimpl pattern)
+    ~Reduce();
 
 private:
     Reduce(const ReduceAttributes& attrs, Backend backend);

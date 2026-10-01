@@ -55,6 +55,8 @@ struct Eltwise::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Eltwise::~Eltwise() = default;
+
 
 namespace {
 auto resolve_eltwise_kernel(Backend backend) -> Eltwise::Impl::KernelFn

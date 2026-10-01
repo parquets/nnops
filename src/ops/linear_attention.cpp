@@ -36,6 +36,8 @@ struct LinearAttention::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+LinearAttention::~LinearAttention() = default;
+
 
 namespace {
 auto resolve_linear_attention_kernel(Backend backend) -> LinearAttention::Impl::KernelFn

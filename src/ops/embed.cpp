@@ -45,6 +45,8 @@ struct Embed::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Embed::~Embed() = default;
+
 
 namespace {
 auto resolve_embed_kernel(Backend backend) -> Embed::Impl::KernelFn

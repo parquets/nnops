@@ -80,6 +80,7 @@ public:
     const TopKAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in topk.cpp (Pimpl pattern)
+    ~TopK();
 
 private:
     TopK(const TopKAttributes& attrs, Backend backend);

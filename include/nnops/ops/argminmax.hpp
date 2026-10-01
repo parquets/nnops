@@ -68,6 +68,7 @@ public:
     const ArgMinMaxAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~ArgMax();
 
 private:
     ArgMax(const ArgMinMaxAttributes& attrs, Backend backend);
@@ -107,6 +108,7 @@ public:
     const ArgMinMaxAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~ArgMin();
 
 private:
     ArgMin(const ArgMinMaxAttributes& attrs, Backend backend);

@@ -48,6 +48,8 @@ struct LayoutConvert::Impl {
                                const ComputeContext&);
     KernelFn kernel_fn = nullptr;
 };
+LayoutConvert::~LayoutConvert() = default;
+
 
 namespace {
 auto resolve_layout_convert_kernel(Backend backend)

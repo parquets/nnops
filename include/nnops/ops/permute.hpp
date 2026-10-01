@@ -65,6 +65,7 @@ public:
     const PermuteAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in permute.cpp (Pimpl pattern)
+    ~Permute();
 
 private:
     Permute(const PermuteAttributes& attrs, Backend backend);

@@ -83,6 +83,7 @@ public:
     const EmbedAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in embed.cpp (Pimpl pattern)
+    ~Embed();
 
 private:
     Embed(const EmbedAttributes& attrs, Backend backend);

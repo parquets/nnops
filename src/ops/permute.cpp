@@ -47,6 +47,8 @@ struct Permute::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Permute::~Permute() = default;
+
 
 namespace {
 auto resolve_permute_kernel(Backend backend) -> Permute::Impl::KernelFn

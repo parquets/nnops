@@ -44,6 +44,8 @@ struct Activation::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Activation::~Activation() = default;
+
 
 namespace {
 auto resolve_activation_kernel(Backend backend) -> Activation::Impl::KernelFn

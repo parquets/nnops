@@ -86,6 +86,7 @@ public:
     const Conv3DAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in conv3d.cpp (Pimpl pattern)
+    ~Conv3D();
 
 private:
     Conv3D(const Conv3DAttributes& attrs, Backend backend);

@@ -63,6 +63,7 @@ public:
     const LayoutConvertAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~LayoutConvert();
 
 private:
     LayoutConvert(const LayoutConvertAttributes& attrs, Backend backend);

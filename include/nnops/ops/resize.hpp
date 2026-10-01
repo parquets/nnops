@@ -103,6 +103,7 @@ public:
     const ResizeAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in resize.cpp (Pimpl pattern)
+    ~Resize();
 
 private:
     Resize(const ResizeAttributes& attrs, Backend backend);

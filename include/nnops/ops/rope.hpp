@@ -91,6 +91,7 @@ public:
     const RoPEAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in rope.cpp (Pimpl pattern)
+    ~RoPE();
 
 private:
     RoPE(const RoPEAttributes& attrs, Backend backend);

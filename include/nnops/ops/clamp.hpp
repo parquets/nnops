@@ -65,6 +65,7 @@ public:
     const ClampAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in clamp.cpp (Pimpl pattern)
+    ~Clamp();
 
 private:
     Clamp(const ClampAttributes& attrs, Backend backend);

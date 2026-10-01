@@ -119,6 +119,7 @@ public:
     const CausalAttentionAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in causal_attention.cpp (Pimpl pattern)
+    ~CausalAttention();
 
 private:
     CausalAttention(const CausalAttentionAttributes& attrs, Backend backend);

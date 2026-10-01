@@ -102,6 +102,7 @@ public:
     const LinearAttentionAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in linear_attention.cpp (Pimpl pattern)
+    ~LinearAttention();
 
 private:
     LinearAttention(const LinearAttentionAttributes& attrs, Backend backend);

@@ -93,6 +93,7 @@ public:
     const Conv2DAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in conv2d.cpp (Pimpl pattern)
+    ~Conv2D();
 
 private:
     Conv2D(const Conv2DAttributes& attrs, Backend backend);

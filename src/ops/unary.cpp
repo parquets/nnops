@@ -55,6 +55,8 @@ struct Unary::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Unary::~Unary() = default;
+
 
 namespace {
 auto resolve_unary_kernel(Backend backend) -> Unary::Impl::KernelFn

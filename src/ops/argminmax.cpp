@@ -44,6 +44,8 @@ struct ArgMax::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+ArgMax::~ArgMax() = default;
+
 
 struct ArgMin::Impl {
     using KernelFn = void (*)(const ArgMinMaxAttributes&,
@@ -53,6 +55,8 @@ struct ArgMin::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+ArgMin::~ArgMin() = default;
+
 
 namespace {
 auto resolve_argmax_kernel(Backend backend) -> ArgMax::Impl::KernelFn

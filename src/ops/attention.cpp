@@ -27,6 +27,8 @@ struct Attention::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Attention::~Attention() = default;
+
 
 namespace {
 auto resolve_attention_kernel(Backend backend) -> Attention::Impl::KernelFn

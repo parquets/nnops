@@ -62,6 +62,7 @@ public:
     const FlattenAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~Flatten();
 
 private:
     Flatten(const FlattenAttributes& attrs, Backend backend);

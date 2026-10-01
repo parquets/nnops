@@ -60,6 +60,7 @@ public:
     const ConcatAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;
+    ~Concat();
 
 private:
     Concat(const ConcatAttributes& attrs, Backend backend);

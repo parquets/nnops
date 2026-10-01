@@ -47,6 +47,8 @@ struct Slice::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Slice::~Slice() = default;
+
 
 namespace {
 auto resolve_slice_kernel(Backend backend) -> Slice::Impl::KernelFn

@@ -44,6 +44,8 @@ struct CausalAttention::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+CausalAttention::~CausalAttention() = default;
+
 
 namespace {
 auto resolve_causal_attention_kernel(Backend backend) -> CausalAttention::Impl::KernelFn

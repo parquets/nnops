@@ -36,6 +36,8 @@ struct CumSum::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+CumSum::~CumSum() = default;
+
 
 namespace {
 auto resolve_cumsum_kernel(Backend backend) -> CumSum::Impl::KernelFn

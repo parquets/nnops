@@ -87,6 +87,7 @@ public:
     const SoftmaxAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in softmax.cpp (Pimpl pattern)
+    ~Softmax();
 
 private:
     Softmax(const SoftmaxAttributes& attrs, Backend backend);

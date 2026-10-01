@@ -58,6 +58,8 @@ struct DepthwiseConv::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+DepthwiseConv::~DepthwiseConv() = default;
+
 
 namespace {
 auto resolve_depthwise_conv_kernel(Backend backend) -> DepthwiseConv::Impl::KernelFn

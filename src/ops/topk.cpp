@@ -49,6 +49,8 @@ struct TopK::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+TopK::~TopK() = default;
+
 
 namespace {
 auto resolve_topk_kernel(Backend backend) -> TopK::Impl::KernelFn

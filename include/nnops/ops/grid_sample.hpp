@@ -89,6 +89,7 @@ public:
     const GridSampleAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in grid_sample.cpp (Pimpl pattern)
+    ~GridSample();
 
 private:
     GridSample(const GridSampleAttributes& attrs, Backend backend);

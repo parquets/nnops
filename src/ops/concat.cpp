@@ -34,6 +34,8 @@ struct Concat::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Concat::~Concat() = default;
+
 
 namespace {
 auto resolve_concat_kernel(Backend backend) -> Concat::Impl::KernelFn

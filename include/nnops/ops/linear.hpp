@@ -65,6 +65,7 @@ public:
     const LinearAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in linear.cpp (Pimpl pattern)
+    ~Linear();
 
 private:
     Linear(const LinearAttributes& attrs, Backend backend);

@@ -44,6 +44,8 @@ struct Reduce::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Reduce::~Reduce() = default;
+
 
 namespace {
 auto resolve_reduce_kernel(Backend backend) -> Reduce::Impl::KernelFn

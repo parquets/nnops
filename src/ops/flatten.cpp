@@ -34,6 +34,8 @@ struct Flatten::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Flatten::~Flatten() = default;
+
 
 namespace {
 auto resolve_flatten_kernel(Backend backend) -> Flatten::Impl::KernelFn

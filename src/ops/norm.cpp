@@ -44,6 +44,8 @@ struct Norm::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Norm::~Norm() = default;
+
 
 namespace {
 auto resolve_norm_kernel(Backend backend) -> Norm::Impl::KernelFn

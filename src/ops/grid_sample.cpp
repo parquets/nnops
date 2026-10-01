@@ -26,6 +26,8 @@ struct GridSample::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+GridSample::~GridSample() = default;
+
 
 namespace {
 auto resolve_grid_sample_kernel(Backend backend) -> GridSample::Impl::KernelFn

@@ -96,6 +96,7 @@ public:
     const NormAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in norm.cpp (Pimpl pattern)
+    ~Norm();
 
 private:
     Norm(const NormAttributes& attrs, Backend backend);

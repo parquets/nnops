@@ -60,6 +60,8 @@ struct QuantizeLinear::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+QuantizeLinear::~QuantizeLinear() = default;
+
 
 namespace {
 auto resolve_quantize_kernel(Backend backend) -> QuantizeLinear::Impl::KernelFn
@@ -120,6 +122,8 @@ struct DequantizeLinear::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+DequantizeLinear::~DequantizeLinear() = default;
+
 
 namespace {
 auto resolve_dequantize_kernel(Backend backend) -> DequantizeLinear::Impl::KernelFn

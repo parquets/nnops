@@ -36,6 +36,8 @@ struct Pooling::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+Pooling::~Pooling() = default;
+
 
 namespace {
 auto resolve_pooling_kernel(Backend backend) -> Pooling::Impl::KernelFn

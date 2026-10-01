@@ -27,6 +27,8 @@ struct TransposeConv2D::Impl {
                                void*);
     KernelFn kernel_fn = nullptr;
 };
+TransposeConv2D::~TransposeConv2D() = default;
+
 
 namespace {
 auto resolve_transpose_conv2d_kernel(Backend backend) -> TransposeConv2D::Impl::KernelFn
