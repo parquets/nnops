@@ -9,14 +9,15 @@
 /// invocations, avoiding repeated malloc/free churn.
 ///
 /// Design:
-///   - Size-class free lists (powers of two, 64 B .. 4 MiB). allocate() rounds
+///   - Size-class free lists (powers of two, 64 B .. 16 MiB). allocate() rounds
 ///     the request up to the next class; deallocate() returns the block to its
-///     class bucket for reuse by the next request of a matching size.
+///     class for reuse by the next request of a matching size.
 ///   - Every block is 64-byte aligned (matches the GEMM PANEL_ALIGN_BYTES).
-///   - A single mutex serializes pool operations. This is deliberate: scratch
-///     allocation happens once per operator call, not per element, so the lock
-///     cost is negligible even under parallel operator execution.
-///   - Requests above 4 MiB bypass the pool and use a direct aligned alloc/free.
+///   - Each thread keeps a small cache (one recycled block per size class), so
+///     the common "allocate one scratch buffer, free it on return" pattern hits
+///     a lock-free fast path and never touches the shared pool. A thread's cache
+///     is registered globally so release_all() can drain every thread's blocks.
+///   - Requests above 16 MiB bypass the pool and use a direct aligned alloc/free.
 ///   - The free lists are bounded by a retention budget: once pooled bytes
 ///     exceed it, the largest freed blocks are returned to the OS instead of
 ///     being kept, so the pool's idle footprint can't grow without limit.
@@ -40,8 +41,9 @@ public:
     MemoryPool& operator=(const MemoryPool&) = delete;
 
     /// Allocate @p size bytes, 64-byte aligned. Reuses a pooled block when one
-    /// is available; otherwise allocates fresh from the OS. Requests larger than
-    /// the max class size (4 MiB) are allocated directly and not recycled.
+    /// is available (this thread's cache first, then the shared pool); otherwise
+    /// allocates fresh from the OS. Requests larger than the max class size
+    /// (16 MiB) are allocated directly and not recycled.
     void* allocate(size_t size);
 
     /// Return a block previously obtained from allocate(). nullptr is a no-op.
