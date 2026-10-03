@@ -94,6 +94,7 @@ void attention_impl(const AttentionAttributes& attrs,
                     TensorView& output,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx,
+                    const AttentionPlan& plan,
                     void* workspace)
 {
     const auto& Q = inputs[0];
@@ -121,17 +122,15 @@ void attention_impl(const AttentionAttributes& attrs,
     const int64_t v_rs = V.row_stride_elems();
     const int64_t o_rs = output.row_stride_elems();
 
-    // Tile sizes (f32 only — the fast path is gated on dtype in attention_kernel).
-    constexpr int mr_max = mr_max_flt<T>();
+    // Tile sizes come from the plan (attention_kernel resolved them once,
+    // together with the workspace sizing — single source of truth).
     constexpr int nr_max = nr_max_flt<T>();
     constexpr int kc     = KC_F32;
 
-    int mc1, nc1;
-    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Sk),
-                       mr_max, nr_max, kc, static_cast<int>(sizeof(T)), mc1, nc1);
-    int mc2, nc2;
-    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(D),
-                       mr_max, nr_max, kc, static_cast<int>(sizeof(T)), mc2, nc2);
+    const int mc1 = plan.mc1;
+    const int nc1 = plan.nc1;
+    const int mc2 = plan.mc2;
+    const int nc2 = plan.nc2;
 
     // Uniform 64-byte-aligned panel stride at full Kc (sizing upper bound).
     const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(T)))
@@ -284,6 +283,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
+                          const AttentionPlan& plan,
                           void* workspace)
 {
     const auto& Q = inputs[0];
@@ -314,8 +314,8 @@ void attention_flash_impl(const AttentionAttributes& attrs,
     constexpr int kc = KC_F32;
     constexpr int L = simd::simd_lane_for<T>;
 
-    int Br, Bc;
-    resolve_flash_tile_sizes(Sq, Sk, D, Br, Bc);
+    const int Br = plan.Br;
+    const int Bc = plan.Bc;
     const int64_t per_task = flash_per_task_elems(Br, Bc, D);
 
     const int64_t NQ = (Sq + Br - 1) / Br;  // number of Br-row query blocks
@@ -450,12 +450,12 @@ void attention_flash_impl(const AttentionAttributes& attrs,
 }  // anonymous namespace
 
 // =========================================================================
-//  Workspace sizing — mirrors the kernel's tiling exactly
+//  Plan — single source of truth for tile sizes + workspace layout
 // =========================================================================
 
-size_t attention_get_workspace_size(const AttentionAttributes& attrs,
-                                    std::span<const TensorDesc> inputs,
-                                    std::span<const TensorDesc> /*outputs*/)
+AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
+                                 std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> /*outputs*/)
 {
     NNOPS_ASSERT(inputs.size() >= 3);
     NNOPS_ASSERT(inputs.size() <= 4);
@@ -464,10 +464,12 @@ size_t attention_get_workspace_size(const AttentionAttributes& attrs,
     const auto& k = inputs[1];
     const auto& v = inputs[2];
 
+    AttentionPlan plan;
+
     // f32-only fast path (reference is f32-only).
     if (q.dtype != DataType::f32 || k.dtype != DataType::f32 ||
         v.dtype != DataType::f32) {
-        return 0;
+        return plan;
     }
 
     const int64_t H = attrs.num_heads;
@@ -485,14 +487,20 @@ size_t attention_get_workspace_size(const AttentionAttributes& attrs,
         D  = q.dims[3];
     }
 
-    // FlashAttention path — sized with the same Br/Bc the kernel resolves, and
-    // with one scratch slot per query block (tasks are B × H × NQ).
-    if (should_use_flash_attention(Sq, Sk)) {
+    plan.use_flash = should_use_flash_attention(Sq, Sk);
+
+    // FlashAttention path — sized with the same Br/Bc the kernel uses, and with
+    // one scratch slot per query block (tasks are B × H × NQ).
+    if (plan.use_flash) {
         int Br, Bc;
         resolve_flash_tile_sizes(Sq, Sk, D, Br, Bc);
+        plan.Br = Br;
+        plan.Bc = Bc;
         const int64_t per_task = flash_per_task_elems(Br, Bc, D);
         const int64_t NQ = (Sq + Br - 1) / Br;
-        return static_cast<size_t>(B * H * NQ) * static_cast<size_t>(per_task) * sizeof(float);
+        plan.workspace_size = static_cast<size_t>(B * H * NQ)
+                            * static_cast<size_t>(per_task) * sizeof(float);
+        return plan;
     }
 
     constexpr int mr_max = MR_MAX_F32;
@@ -503,6 +511,12 @@ size_t attention_get_workspace_size(const AttentionAttributes& attrs,
     resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Sk),
                        mr_max, nr_max, kc, static_cast<int>(sizeof(float)),
                        mc1, nc1);
+    int mc2, nc2;
+    resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(D),
+                       mr_max, nr_max, kc, static_cast<int>(sizeof(float)),
+                       mc2, nc2);
+    plan.mc1 = mc1; plan.nc1 = nc1;
+    plan.mc2 = mc2; plan.nc2 = nc2;
 
     const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(float)))
                            / static_cast<int>(sizeof(float));
@@ -512,7 +526,9 @@ size_t attention_get_workspace_size(const AttentionAttributes& attrs,
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
     const int64_t per_head     = scores_elems + pack_elems;
 
-    return static_cast<size_t>(B * H) * static_cast<size_t>(per_head) * sizeof(float);
+    plan.workspace_size = static_cast<size_t>(B * H)
+                        * static_cast<size_t>(per_head) * sizeof(float);
+    return plan;
 }
 
 // =========================================================================
@@ -534,20 +550,20 @@ void attention_kernel(const AttentionAttributes& attrs,
                            (inputs.size() <= 3 || inputs[3].data_type() == dt);
 
     if (dtypes_ok) {
-        // Scratch (scores + packed K^T) is pooled internally; the caller-provided
-        // workspace is obsolete (getWorkspaceSize returns 0). Allocated once here,
+        // Tile sizes + scratch (scores + packed K^T) come from one plan, so the
+        // kernels and the workspace sizing agree by construction. Scratch is
+        // pooled internally (getWorkspaceSize returns 0); allocated once here,
         // before the parallel dispatch, so no per-task allocation happens inside
         // the parallel body.
         const TensorDesc descs[] = {inputs[0].desc(), inputs[1].desc(), inputs[2].desc()};
         const TensorDesc outs[]  = {output.desc()};
-        const size_t ws = attention_get_workspace_size(attrs, descs, outs);
-        PoolPtr scratch(ws);
+        const AttentionPlan plan = get_attention_plan(attrs, descs, outs);
+        PoolPtr scratch(plan.workspace_size);
 
-        const HeadShape hs = resolve_head_shape(attrs, inputs);
-        if (should_use_flash_attention(hs.Sq, hs.Sk)) {
-            attention_flash_impl<float>(attrs, output, inputs, ctx, scratch.as<float>());
+        if (plan.use_flash) {
+            attention_flash_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
         } else {
-            attention_impl<float>(attrs, output, inputs, ctx, scratch.as<float>());
+            attention_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
         }
         return;
     }

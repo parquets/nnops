@@ -2,8 +2,8 @@
 /// @brief Tiled im2col + direct GEMM Conv2D kernel (planar NCHW, f32 / f16).
 ///
 /// Algorithm (ported from nn_compute im2col_gemm_conv2d_impl):
-///   For each (batch, group) — parallel via ctx.cpu.run:
-///     For each oh-block of the output plane:
+///   For each (batch, group, oh-chunk) — parallel via ctx.cpu.run:
+///     For each oh-block in the chunk's contiguous range of the output plane:
 ///       For each ic-block:
 ///         im2col the input block into a scratch matrix [K=icnc*karea][N=ohc*OW]
 ///         For each oc-block:
@@ -11,10 +11,11 @@
 ///           tile += weight[ocnc, K] × col_data[K, roi_area]  (tile_mma_direct)
 ///           (after the last ic-block) apply the epilogue in-place
 ///
-/// Work is split at (batch, group) granularity so the per-(batch,group)
-/// col_data scratch is reused across oh-blocks — no per-thread indexing is
-/// required by the external parallel_for hook. C tiles are disjoint, so the
-/// result is bit-identical to serial execution.
+/// Work is split at (batch, group) granularity and, when that under-subscribes
+/// the thread pool (the common batch=1 / groups=1 case), the oh-blocks are
+/// partitioned into parallel chunks, each owning its own col_data scratch so no
+/// per-thread indexing is required by the external parallel_for hook. C tiles
+/// are disjoint, so the result is bit-identical to serial execution.
 
 #include "conv2d_im2col.h"
 #include "matmul_helper.h"                 // tile_mma_direct + arch panel constants
@@ -119,6 +120,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                         TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
+                        const Conv2DPlan& plan,
                         void* workspace)
 {
     const auto& input  = inputs[0];
@@ -155,10 +157,13 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
 
     const int64_t karea = KH * KW;
 
-    // Block sizes (values shared with conv2d_im2col_get_workspace_size).
-    const int64_t icn_block = std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
-    const int64_t ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
-    const int64_t oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
+    // Block sizes + parallel decomposition from the plan (single source of
+    // truth — conv2d_im2col_kernel resolved them once, with the sizing).
+    const int64_t icn_block = plan.icn_block;
+    const int64_t ocn_block = plan.ocn_block;
+    const int64_t oh_block  = plan.oh_block;
+    const int64_t num_oh_blocks = plan.num_oh_blocks;
+    const int64_t oh_chunks     = plan.oh_chunks;
 
     // Strides (elements).
     const int64_t icn_step = IH * in_row_stride;         // between input channels
@@ -177,29 +182,39 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     const T* w_ptr   = weight.ptr<T>();
     const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    // Workspace slices (per (batch, group)).
-    const int64_t col_size  = icn_block * karea * oh_block * OW;
-    const int64_t orig_size = attrs.add_to ? ocn_block * oh_block * OW : 0;
+    // Workspace slices (per parallel task: (batch, group, oh-chunk)).
+    const int64_t col_size  = plan.col_size;
+    const int64_t orig_size = plan.orig_size;
+
+    const int64_t NG = N * G;
+    const int64_t total = NG * oh_chunks;
 
     T* col_base  = static_cast<T*>(workspace);
-    T* orig_base = attrs.add_to ? col_base + N * G * col_size : nullptr;
+    T* orig_base = attrs.add_to ? col_base + total * col_size : nullptr;
 
     const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
 
-    const int64_t NG = N * G;
-    const auto run_ng = [&](int64_t ng) {
+    const auto run_task = [&](int64_t t) {
+        const int64_t ng    = t / oh_chunks;
+        const int64_t chunk = t % oh_chunks;
         const int64_t n = ng / G;
         const int64_t g = ng % G;
 
-        T* col_data = col_base + ng * col_size;
-        T* orig = orig_base ? orig_base + ng * orig_size : nullptr;
+        T* col_data = col_base + t * col_size;
+        T* orig = orig_base ? orig_base + t * orig_size : nullptr;
 
         T* output_ptr = out_ptr + n * ob_step + g * og_step;
         const T* input_ptr  = in_ptr + n * ib_step + g * ig_step;
         const T* weight_ptr = w_ptr + g * oc_per_group * ic_per_group * karea;
         const T* bias_ptr   = b_ptr ? b_ptr + g * oc_per_group : nullptr;
 
-        for (int64_t oh = 0; oh < OH; oh += oh_block) {
+        // Contiguous range of oh-blocks owned by this chunk (disjoint across
+        // chunks, so output tiles never overlap → bit-identical to serial).
+        const int64_t b0 = chunk * num_oh_blocks / oh_chunks;
+        const int64_t b1 = (chunk + 1) * num_oh_blocks / oh_chunks;
+
+        for (int64_t b = b0; b < b1; ++b) {
+            const int64_t oh       = b * oh_block;
             const int64_t ohc      = std::min(oh_block, OH - oh);
             const int64_t roi_area = ohc * OW;
 
@@ -268,18 +283,19 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
         }
     };
 
-    ctx.cpu.run(0, NG, run_ng);
+    ctx.cpu.run(0, total, run_task);
 }
 
 }  // anonymous namespace
 
 // =========================================================================
-//  Workspace sizing — mirrors the kernel's block sizes exactly
+//  Plan — single source of truth for block sizes, parallelism + workspace
 // =========================================================================
 
-size_t conv2d_im2col_get_workspace_size(const Conv2DAttributes& attrs,
-                                        std::span<const TensorDesc> inputs,
-                                        std::span<const TensorDesc> outputs)
+Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
+                           std::span<const TensorDesc> inputs,
+                           std::span<const TensorDesc> outputs,
+                           int num_threads)
 {
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(outputs.size() >= 1);
@@ -288,15 +304,17 @@ size_t conv2d_im2col_get_workspace_size(const Conv2DAttributes& attrs,
     const auto& wt  = inputs[1];
     const auto& out = outputs[0];
 
+    Conv2DPlan plan;
+
     const DataType dt = in.dtype;
     if (dt != DataType::f32 && dt != DataType::f16) {
-        return 0;
+        return plan;
     }
     if (wt.dtype != dt || out.dtype != dt) {
-        return 0;
+        return plan;
     }
     if (inputs.size() > 2 && inputs[2].dtype != dt) {
-        return 0;
+        return plan;
     }
 
     const int64_t N  = in.dims[0];
@@ -312,16 +330,28 @@ size_t conv2d_im2col_get_workspace_size(const Conv2DAttributes& attrs,
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
     const int64_t PH    = attrs.padding[0];
 
-    const int64_t icn_block = std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
-    const int64_t ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
-    const int64_t oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
+    plan.icn_block = std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
+    plan.ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
+    plan.oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
 
-    const int64_t col_size  = icn_block * karea * oh_block * OW;
-    const int64_t orig_size = attrs.add_to ? ocn_block * oh_block * OW : 0;
+    plan.num_oh_blocks = (OH + plan.oh_block - 1) / plan.oh_block;
 
-    return static_cast<size_t>(N * G)
-         * static_cast<size_t>(col_size + orig_size)
-         * data_type_size(dt);
+    // Split the oh dimension when (batch, group) alone under-subscribes the
+    // thread pool (the common batch=1 / groups=1 case would otherwise run
+    // single-threaded). Each oh-chunk owns its own im2col scratch, so cap the
+    // chunk count at the number of oh-blocks.
+    const int64_t NG = N * G;
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+    plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, plan.num_oh_blocks);
+
+    plan.col_size  = plan.icn_block * karea * plan.oh_block * OW;
+    plan.orig_size = attrs.add_to ? plan.ocn_block * plan.oh_block * OW : 0;
+
+    const int64_t total = NG * plan.oh_chunks;
+    plan.workspace_size = static_cast<size_t>(total)
+                        * static_cast<size_t>(plan.col_size + plan.orig_size)
+                        * data_type_size(dt);
+    return plan;
 }
 
 // =========================================================================
@@ -342,19 +372,21 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                            (inputs.size() <= 2 || inputs[2].data_type() == dt);
 
     if (dtypes_ok) {
-        // im2col scratch is pooled internally (getWorkspaceSize returns 0). Sized
-        // and allocated once, before the (batch, group) parallel dispatch.
+        // Block sizes + scratch (im2col buffer) come from one plan, so the
+        // kernel and its sizing agree by construction. Scratch is pooled
+        // internally (getWorkspaceSize returns 0); sized and allocated once,
+        // before the (batch, group, oh-chunk) parallel dispatch.
         std::vector<TensorDesc> descs;
         descs.reserve(inputs.size());
         for (const auto& t : inputs) { descs.push_back(t.desc()); }
         const TensorDesc outs[] = {output.desc()};
-        const size_t ws = conv2d_im2col_get_workspace_size(attrs, descs, outs);
-        PoolPtr scratch(ws);
+        const Conv2DPlan plan = get_conv2d_plan(attrs, descs, outs, ctx.cpu.thread_count());
+        PoolPtr scratch(plan.workspace_size);
 
         if (dt == DataType::f32) {
-            conv2d_im2col_impl<float>(attrs, output, inputs, ctx, scratch.as<float>());
+            conv2d_im2col_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
         } else {
-            conv2d_im2col_impl<half>(attrs, output, inputs, ctx, scratch.as<half>());
+            conv2d_im2col_impl<half>(attrs, output, inputs, ctx, plan, scratch.as<half>());
         }
         return;
     }

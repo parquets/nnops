@@ -13,6 +13,9 @@
 /// submatrices of the planar tensors, for both merged [B, S, H*D] and explicit
 /// [B, H, S, D] layouts (a head's D columns are contiguous within each row).
 ///
+/// Tile sizes and the workspace layout come from a single plan
+/// (get_attention_plan), so the kernels and the workspace sizing never drift.
+///
 /// Grouped-query attention (attrs.num_group) is not yet handled; the kernel
 /// runs standard MHA (one head block per (batch, head)).
 ///
@@ -30,20 +33,30 @@
 
 namespace nnops::backend::cpu {
 
+/// Single source of truth for the attention tile sizes and workspace layout,
+/// shared by the kernels and the workspace sizing (get_attention_plan).
+struct AttentionPlan {
+    bool   use_flash = false;   ///< route through the FlashAttention path
+    int    mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
+    int    mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × D) tiles
+    int    Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
+    size_t workspace_size = 0;  ///< pooled scratch bytes (0 → reference fallback)
+};
+
+/// Resolve the attention plan (tile sizes + workspace bytes) from the
+/// descriptors. Returns a zeroed plan (workspace_size 0) for non-f32 dtypes,
+/// which routes the kernel to the reference.
+AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
+                                 std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> outputs);
+
 /// Tiled attention kernel (f32). Falls back to the reference kernel when the
 /// dtype is not f32 (the reference is f32-only). Scratch is pooled internally
-/// (sized by attention_get_workspace_size); @p workspace is vestigial.
+/// (sized by get_attention_plan); @p workspace is vestigial.
 void attention_kernel(const AttentionAttributes& attrs,
                       TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
                       void* workspace);
-
-/// Scratch bytes pooled by attention_kernel for the given descriptors.
-///
-/// Returns 0 for non-f32 dtypes (reference fallback, no scratch).
-size_t attention_get_workspace_size(const AttentionAttributes& attrs,
-                                    std::span<const TensorDesc> inputs,
-                                    std::span<const TensorDesc> outputs);
 
 }  // namespace nnops::backend::cpu

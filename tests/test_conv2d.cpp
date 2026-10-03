@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <atomic>
+#include <thread>
 
 using namespace nnops;
 
@@ -302,6 +304,40 @@ void conv2d_ref(const Conv2DAttributes& attrs,
                 void* workspace);
 }
 
+// Minimal fixed-size thread pool exposing a CpuBackend (test_matmul.cpp
+// pattern). Items in [begin, end) are claimed via an atomic counter; each
+// worker runs body(i) until the range is exhausted.
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
 namespace {
 
 /// Run the fast path and the reference, and report whether every output element
@@ -384,6 +420,83 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
 
         const TensorView* bp = c.bias ? &bias : nullptr;
         NNOPS_EXPECT_TRUE(conv2d_fast_vs_ref(attrs, input, weight, bp, 1e-3f, 1e-4f));
+    }
+}
+
+NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
+    // Threaded vs serial bit-identical: the oh-blocks are partitioned into
+    // disjoint per-chunk output tiles, so parallel execution (SimplePool) must
+    // match the single-threaded result exactly — and both match the reference.
+    struct Case { std::array<int64_t,4> ishape; std::array<int64_t,4> wshape;
+                  int64_t kh, kw, sh, sw, ph, pw, dh, dw, groups; bool bias; };
+    const Case cases[] = {
+        // batch=1, groups=1 with a tall OH → the oh-chunks split kicks in.
+        {{1, 3, 32, 32}, {8, 3, 3, 3},   3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        {{1, 4, 24, 24}, {12, 4, 3, 3},  3, 3, 2, 2, 1, 1, 1, 1, 1, false},
+        // grouped + dilated, small NG so chunks still split.
+        {{1, 4, 20, 20}, {8, 2, 3, 3},   3, 3, 1, 1, 1, 1, 2, 2, 2, false},
+        // batch=2 exercises both the (batch) and the oh-chunk dimensions.
+        {{2, 3, 16, 16}, {8, 3, 3, 3},   3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+    };
+
+    for (const auto& c : cases) {
+        for (int nthreads : {2, 4}) {
+            auto [in_vec, input] = test::make_random_tensor(c.ishape, -1.0f, 1.0f, 711);
+            auto [w_vec, weight] = test::make_random_tensor(c.wshape, -1.0f, 1.0f, 712);
+            std::vector<float> b_vec;
+            TensorView bias;
+            if (c.bias) {
+                b_vec = std::vector<float>(static_cast<size_t>(c.wshape[0]), 0.0f);
+                test::XorShift128 rng(713);
+                rng.fill_float(b_vec.data(), static_cast<int64_t>(b_vec.size()), -1.0f, 1.0f);
+                const int64_t bshape[] = {c.wshape[0]};
+                bias = TensorView(bshape, DataType::f32, b_vec.data());
+            }
+
+            Conv2DAttributes attrs;
+            attrs.kernel_size = {c.kh, c.kw};
+            attrs.stride      = {c.sh, c.sw};
+            attrs.dilation    = {c.dh, c.dw};
+            attrs.padding     = {c.ph, c.pw};
+            attrs.groups      = c.groups;
+
+            std::vector<TensorDesc> descs = {input.desc(), weight.desc()};
+            std::vector<TensorView> ins   = {input, weight};
+            if (c.bias) {
+                descs.push_back(bias.desc());
+                ins.push_back(bias);
+            }
+            auto op = Conv2D::create(attrs, Backend::CPU);
+            auto out_descs = op->getOutputTensorDesc(descs);
+            const int64_t out_numel = out_descs[0].numel();
+
+            // Serial (default context, no parallelism hook → oh_chunks == 1).
+            std::vector<float> serial_buf(static_cast<size_t>(out_numel));
+            auto serial_out = test::make_planar(out_descs[0], serial_buf.data());
+            op->compute(serial_out, ins, {}, nullptr);
+
+            // Threaded via SimplePool.
+            SimplePool pool(nthreads);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            std::vector<float> threaded_buf(static_cast<size_t>(out_numel));
+            auto threaded_out = test::make_planar(out_descs[0], threaded_buf.data());
+            op->compute(threaded_out, ins, ctx, nullptr);
+
+            for (int64_t i = 0; i < out_numel; ++i) {
+                if (serial_buf[static_cast<size_t>(i)] != threaded_buf[static_cast<size_t>(i)]) {
+                    throw std::runtime_error(
+                        std::string("conv2d_im2col_threaded_matches_serial: bit mismatch at ") +
+                        std::to_string(i) + " (" + std::to_string(nthreads) + " threads)");
+                }
+            }
+
+            // Both match the reference.
+            std::vector<float> ref_buf(static_cast<size_t>(out_numel));
+            auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+            nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
+            NNOPS_EXPECT_TRUE(test::allclose(serial_out, ref_out, 1e-3f, 1e-4f));
+        }
     }
 }
 
