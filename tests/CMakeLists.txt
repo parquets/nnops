@@ -75,9 +75,26 @@ if(NNOPS_BUILD_VULKAN)
 endif()
 
 # ---- Benchmarks (optional) ----
+# One standalone benchmark executable per file, mirroring the test layout above:
+# each links against `common/bench_harness.cpp` (which supplies main) and against
+# the shared `nnops_cpu` library, so a single family can be built and run without
+# paying for the others.
 if(NNOPS_BUILD_BENCHMARKS)
-    set(BENCH_SOURCES common/bench_harness.cpp bench_matmul.cpp bench_conv2d.cpp bench_attention.cpp bench_pack_mma.cpp)
-    add_executable(nnops_bench ${BENCH_SOURCES})
-    target_link_libraries(nnops_bench PRIVATE nnops_cpu)
-    target_include_directories(nnops_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    function(nnops_add_bench_demo src)
+        get_filename_component(name "${src}" NAME_WE)   # strip .cpp → e.g. bench_matmul
+        add_executable(${name} "${src}" common/bench_harness.cpp)
+        target_link_libraries(${name} PRIVATE nnops_cpu)
+        target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    endfunction()
+
+    set(BENCH_SOURCES
+        bench_matmul.cpp
+        bench_conv2d.cpp
+        bench_attention.cpp
+        bench_pack_mma.cpp
+    )
+
+    foreach(src ${BENCH_SOURCES})
+        nnops_add_bench_demo(${src})
+    endforeach()
 endif()

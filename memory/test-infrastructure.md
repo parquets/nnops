@@ -40,8 +40,10 @@ scripts/run_tests.sh Release      # prints [PASS]/[FAIL] per demo + final tally;
 ```
 
 Demos live at `build/tests/<Config>/test_*.exe` (Visual Studio generator) and are also registered
-with CTest, so `ctest --test-dir build -C Release --output-on-failure` works too. The benchmark
-binary (`nnops_bench`) is built separately via `NNOPS_BUILD_BENCHMARKS`.
+with CTest, so `ctest --test-dir build -C Release --output-on-failure` works too. Benchmarks follow
+the same one-executable-per-file layout — each `tests/bench_*.cpp` builds into its own
+`bench_<family>` demo (linked against `common/bench_harness.cpp`, which supplies `main()`), gated by
+`NNOPS_BUILD_BENCHMARKS`. They are not registered with CTest, since benchmarks are not pass/fail.
 
 ## Benchmark Pattern
 

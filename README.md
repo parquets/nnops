@@ -47,7 +47,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNNOPS_BUILD_VULKAN=ON
 | Option | Default | Meaning |
 |---|---|---|
 | `NNOPS_BUILD_TESTS` | `ON` | Build the unit-test demos |
-| `NNOPS_BUILD_BENCHMARKS` | `ON` | Build the micro-benchmark binary |
+| `NNOPS_BUILD_BENCHMARKS` | `ON` | Build the micro-benchmark demos |
 | `NNOPS_BUILD_CUDA` | `OFF` | Build the CUDA backend |
 | `NNOPS_BUILD_VULKAN` | `OFF` | Build the Vulkan backend |
 
@@ -149,11 +149,19 @@ Tests use a self-contained harness (XorShift128 RNG, `allclose` comparison) — 
 
 ## Benchmarks
 
+Each `tests/bench_*.cpp` builds into its own standalone benchmark executable, mirroring
+the test layout. Run one family at a time:
+
 ```bash
-# Windows (multi-config)
-./build/tests/Release/nnops_bench.exe
 # POSIX
-./build/tests/nnops_bench
+./build/tests/bench_matmul
+./build/tests/bench_conv2d
+./build/tests/bench_attention
+./build/tests/bench_pack_mma
+# Windows (multi-config) — same names under tests/Release/, with a .exe suffix
+./build/tests/Release/bench_matmul.exe
 ```
 
-Micro-benchmarks for `MatMul`, `Conv2D`, and `Attention` (including depthwise and fused attention kernels).
+`bench_matmul` covers `MatMul` (pack decision + thread scaling), `bench_conv2d` the im2col
+GEMM `Conv2D`, `bench_attention` the fused attention kernels (standard and flash), and
+`bench_pack_mma` the pack/MMA micro-kernels in isolation.
