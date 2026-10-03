@@ -1702,6 +1702,64 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
     }
 }
 
+NNOPS_TEST(matmul_packed_a_stack_holds_every_tile_height) {
+    namespace cpu = nnops::backend::cpu;
+
+    // The on-stack packed-A tile must hold the panels of whatever mc the
+    // dispatch actually picks — a per-block height <= MC_TARGET, not
+    // MC_TARGET itself. The greedy {mr,..,1} decomposition the pack emits is
+    // NOT monotonic in mc, so sizing the buffer at num_panels(MC_TARGET, mr)
+    // under-counts: {8,4,1} needs 21 panels at mc = 143 (17×8 + 4 + 1 + 1 + 1)
+    // but only 18 at mc = 144, and an 18-panel buffer overflowed by 3 panels
+    // (12 KB past the end). This pins the invariant directly, so it fails
+    // deterministically instead of relying on a stack smash being noticed.
+    for (int mc = 1; mc <= static_cast<int>(cpu::MC_TARGET); ++mc) {
+        NNOPS_EXPECT_TRUE(cpu::pack_a_stack_elems<float>()
+                          >= cpu::num_panels(mc, cpu::MR_F32) * cpu::LDD_A_F32);
+        NNOPS_EXPECT_TRUE(cpu::pack_a_stack_elems<nnops::backend::cpu::half>()
+                          >= cpu::num_panels(mc, cpu::MR_F16) * cpu::LDD_A_F16);
+        NNOPS_EXPECT_TRUE(cpu::PACK_A_STACK_I8
+                          >= cpu::num_panels(mc, cpu::MR_I8) * cpu::LDD_A_I8);
+    }
+}
+
+NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
+    // End-to-end cover for the same overflow. The plan shrinks mc to
+    // M / num_threads, so M = 572 with 4 workers gives mc = 143 — the {8,4,1}
+    // worst case. K == KC_F32 puts the pack at the full-Kc stride the buffer is
+    // sized at, and transpose_a forces pack_a, so the on-stack tile is used.
+    const int64_t M = 572, K = 128, N = 64;
+    MatmulInputs in = make_matmul_inputs(M, K, N, /*ta=*/true, /*tb=*/false, /*pad_b=*/false, 7);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = in.a.desc();
+    auto b_desc = in.b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    // Pin the premise: if the tile-shrink rule changes, this case stops
+    // covering the bad remainder and the test should say so.
+    const auto plan = nnops::backend::cpu::get_matmul_plan(attrs, a_desc, b_desc, 4);
+    NNOPS_EXPECT_EQ(plan.mc, int64_t{143});
+    NNOPS_EXPECT_TRUE(plan.pack_a);
+
+    const TensorView ins[] = {in.a, in.b};
+    std::vector<float> got(descs[0].numel()), want(descs[0].numel());
+    auto out = test::make_planar(descs[0], got.data());
+    auto ref_out = test::make_planar(descs[0], want.data());
+
+    SimplePool pool(4);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    op->compute(out, ins, ctx, nullptr);
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+    NNOPS_EXPECT_TRUE(test::allclose(out, ref_out, 1e-3f, 1e-4f));
+}
+
 NNOPS_TEST(matmul_threaded_multi_block_slots) {
     // M-split with far more m-blocks than workers. The packed-B scratch is one
     // slot per worker thread, so a thread reuses its slot across every block it

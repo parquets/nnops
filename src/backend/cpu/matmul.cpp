@@ -91,7 +91,10 @@ void matmul_tile(const MatMulAttributes& attrs,
     // tile_mma_direct reads A through lda and never touches ldd_a/pack_a_buf.
     constexpr int mr_max = mr_max_flt<T>(/*pack_a=*/true);
 
-    // Packed A lives on the kernel stack (72 KB, 64-byte aligned).
+    // Packed A lives on the kernel stack (84 KB f32 / 42 KB f16 on aarch64,
+    // 64-byte aligned). Sized by num_panels_max, not num_panels(MC_TARGET, ..):
+    // this tile's mc is a per-block height <= MC_TARGET whose greedy
+    // decomposition can need more panels than MC_TARGET's (see num_panels_max).
     alignas(PANEL_ALIGN_BYTES) T pack_a_buf[pack_a_stack_elems<T>()];
 
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))

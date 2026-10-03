@@ -392,3 +392,42 @@ NNOPS_TEST(matmul_int8_batched_s32) {
         NNOPS_EXPECT_EQ(out_buf[i], ref_buf[i]);
     }
 }
+
+NNOPS_TEST(matmul_int8_packed_a_bad_remainder_s32) {
+    // Regression: the on-stack packed-A tile is sized by the panel count of
+    // MC_TARGET itself (mc = 144 -> 18 panels of mr = 8), but the greedy
+    // {8,4,1} decomposition the pack actually emits is NOT monotonic in mc —
+    // a *smaller* tile needs more panels (142 -> 20, 143 -> 21). An m-slab
+    // landing on one of those wrote up to 3 panels (12 KB) past the buffer.
+    //
+    // Reached through the public op: an M-split whose slab height is ~M /
+    // ceil(M / 144), with K == KC_I8 so the pack uses the full-Kc panel stride
+    // the buffer is sized at. Slab heights of 142/143 appear for many M, which
+    // is why this is worth a regression case rather than a comment.
+    for (int64_t M : {1152, 2048, 2304, 2560, 2688, 3072, 4096}) {
+        const int64_t K = 512, N = 256;   // K == KC_I8 -> full-Kc stride
+        I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 900 + static_cast<uint64_t>(M));
+
+        MatMulAttributes attrs{};
+        attrs.output_dtype = DataType::s32;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        auto a_desc = in.a.desc();
+        auto b_desc = in.b.desc();
+        const TensorDesc arr[] = {a_desc, b_desc};
+        auto descs = op->getOutputTensorDesc(arr);
+
+        std::vector<int32_t> out_buf(descs[0].numel());
+        auto output = test::make_planar(descs[0], out_buf.data());
+        const TensorView ins[] = {in.a, in.b};
+        op->compute(output, ins, {}, nullptr);
+
+        std::vector<int32_t> ref_buf(descs[0].numel());
+        auto ref_out = test::make_planar(descs[0], ref_buf.data());
+        nnops::backend::cpu::reference::matmul_int8_ref(attrs, ref_out, ins, {}, nullptr);
+
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            NNOPS_EXPECT_EQ(out_buf[i], ref_buf[i]);
+        }
+    }
+}

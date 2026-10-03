@@ -243,22 +243,48 @@ constexpr int num_panels4(int n, const int* nr) noexcept {
     return count;
 }
 
+/// Largest `num_panels()` over every mc in [1, n].
+///
+/// The greedy decomposition above is NOT monotonic in n: with {8,4,1} a 143-row
+/// tile needs 21 panels (17×8 + 4 + 1 + 1 + 1) while a 144-row tile needs only
+/// 18 (18×8). So sizing a buffer at num_panels(MC_TARGET, mr) is wrong — the
+/// *smaller* tile is the one that overflows it:
+///
+///   aarch64 MR = {8,4,1}: 18 at mc=144, worst 21 at mc=143
+///   x86_64  MR = {6,4,1}: 24 at mc=144, worst 26 at mc=141
+///
+/// Anything holding the panels of an arbitrary mc <= MC_TARGET (the on-stack
+/// packed-A tile) must size with this maximum, not with num_panels(n, mr).
+constexpr int num_panels_max(int n, const int* mr) noexcept {
+    int worst = 0;
+    for (int mc = 1; mc <= n; ++mc) {
+        const int c = num_panels(mc, mr);
+        worst = c > worst ? c : worst;
+    }
+    return worst;
+}
+
 /// Stack-resident packed-A buffer size (elements) for one MC_TARGET×Kc tile at
 /// the full-Kc uniform stride — an upper bound for every per-k-block pack:
-///   f32: 144×128×4 = 72 KB, f16: 144×128×2 = 36 KB (KC_F16 = 128), both arches.
-/// Declared with alignas in the kernel.
+///   f32 84 KB (aarch64) / 78 KB (x86_64), f16 exactly half of that.
+/// The panel count is num_panels_max, not num_panels(MC_TARGET, mr): the tile
+/// the kernel actually packs is a per-block mc <= MC_TARGET, whose greedy
+/// decomposition can need more panels than MC_TARGET's does (see
+/// num_panels_max). Declared with alignas in the kernel.
 template <class T>
 constexpr int pack_a_stack_elems() {
     constexpr const int* mr    = std::is_same_v<T, float> ? MR_F32 : MR_F16;
     constexpr int       ldd_a  = std::is_same_v<T, float> ? LDD_A_F32 : LDD_A_F16;
-    return num_panels(MC_TARGET, mr) * ldd_a;
+    return num_panels_max(MC_TARGET, mr) * ldd_a;
 }
 
 // int8 packed-A stack buffer: the panel stride is in bytes (int8 = 1 byte/elem),
 // so LDD_A_I8 = align_up(MR_MAX_I8 * KC_I8, 64) and the buffer holds
-// num_panels(MC_TARGET, MR_I8) panels at that full-Kc stride.
+// num_panels_max(MC_TARGET, MR_I8) panels at that full-Kc stride (21 on
+// aarch64 / 26 on x86_64 — not the 18 / 24 that MC_TARGET itself decomposes
+// into, which several smaller mc would overflow; see num_panels_max).
 constexpr int LDD_A_I8 = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * KC_I8);
-constexpr int PACK_A_STACK_I8 = num_panels(MC_TARGET, MR_I8) * LDD_A_I8;
+constexpr int PACK_A_STACK_I8 = num_panels_max(MC_TARGET, MR_I8) * LDD_A_I8;
 
 /// Compute the workspace size (bytes) for the int8 (s8×s8) path: packed-B
 /// panels plus, for an s8 output, the int32 accumulator. The fp path sizes its
