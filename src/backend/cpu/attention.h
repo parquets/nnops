@@ -60,7 +60,7 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
 /// an f32 dtype mismatch; an f16 mismatch is a hard error (the reference is
 /// f32-only, so it would silently read f16 as f32). Scratch is pooled
 /// internally (sized by get_attention_plan); @p workspace is vestigial.
-void attention_kernel(const AttentionAttributes& attrs,
+void attention_cpu(const AttentionAttributes& attrs,
                       TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,

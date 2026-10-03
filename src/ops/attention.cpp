@@ -35,7 +35,7 @@ auto resolve_attention_kernel(Backend backend) -> Attention::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::attention_kernel;
+        return backend::cpu::attention_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;

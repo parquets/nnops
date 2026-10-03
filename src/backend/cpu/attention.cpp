@@ -137,7 +137,7 @@ void attention_impl(const AttentionAttributes& attrs,
     const int64_t v_rs = V.row_stride_elems();
     const int64_t o_rs = output.row_stride_elems();
 
-    // Tile sizes come from the plan (attention_kernel resolved them once,
+    // Tile sizes come from the plan (attention_cpu resolved them once,
     // together with the workspace sizing — single source of truth).
     constexpr int nr_max = nr_max_flt<T>();
     constexpr int64_t kc = kc_for<T>();
@@ -592,7 +592,7 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
 //  Public API
 // =========================================================================
 
-void attention_kernel(const AttentionAttributes& attrs,
+void attention_cpu(const AttentionAttributes& attrs,
                       TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
@@ -643,7 +643,7 @@ void attention_kernel(const AttentionAttributes& attrs,
         return;
     }
 
-    NNOPS_ASSERT(!"attention_kernel: f16 Attention dtype mismatch "
+    NNOPS_ASSERT(!"attention_cpu: f16 Attention dtype mismatch "
                    "(f16 Q requires matching f16 K/V/output/mask)");
 }
 
