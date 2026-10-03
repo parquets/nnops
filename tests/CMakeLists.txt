@@ -75,7 +75,7 @@ endif()
 
 # ---- Benchmarks (optional) ----
 if(NNOPS_BUILD_BENCHMARKS)
-    set(BENCH_SOURCES common/bench_harness.cpp bench_matmul.cpp)
+    set(BENCH_SOURCES common/bench_harness.cpp bench_matmul.cpp bench_conv2d.cpp bench_attention.cpp)
     add_executable(nnops_bench ${BENCH_SOURCES})
     target_link_libraries(nnops_bench PRIVATE nnops_cpu)
     target_include_directories(nnops_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
