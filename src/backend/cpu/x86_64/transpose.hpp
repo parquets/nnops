@@ -5,10 +5,13 @@
 /// Three register widths are used:
 ///   - __m128  (4×float32)          — packed float intrinsics
 ///   - __m256  (8×float32)          — packed float intrinsics
-///   - __m128i (8×int16 or 16×int8) — packed integer intrinsics
+///   - __m128i (16×int8)            — packed integer intrinsics
 ///
-/// For fp16, data is held in __m128i and transposed as 16-bit lanes;
-/// the caller is responsible for half <-> float conversion.
+/// fp16 packing does NOT transpose in 16-bit lanes: the f16 packs convert to
+/// f32 (F16C) and reuse the __m256 f32 transposes above, because only they
+/// produce the linear [K][n] panel order the mma kernels read (see
+/// pack_f16.hpp). A 16-bit-lane __m128i transpose family that once lived
+/// here produced a blocked order instead and was removed.
 ///
 /// The 4×16 int8 transpose (transpose_4x16_i8) operates on raw bytes
 /// and is used by the int8 dp4a pack_copy_n16 pipeline.
@@ -342,15 +345,13 @@ inline void transpose_16x8_f32(
 }
 
 // =========================================================================
-//  i16 (fp16 storage)  —  __m128i (8-element)  transposes
-//  Used by the floating-point f16 pack pipelines.
+//  i8  —  __m128i (16-element)  transpose
 // =========================================================================
 
 /// @brief 4×16 int8 register transpose (byte-level, for the int8 dp4a pack).
 ///
-/// Transposes four __m128i registers each holding 16 int8 elements. Unlike
-/// transpose_4x8_i16 (which treats elements as 16-bit), this operates on raw
-/// bytes and is used by the int8 pack_copy_n16 pipeline.
+/// Transposes four __m128i registers each holding 16 int8 elements. Operates
+/// on raw bytes; used by the int8 pack_copy_n16 pipeline.
 inline void transpose_4x16_i8(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3) noexcept {
     const __m128i plo01 = _mm_unpacklo_epi8(v_r0, v_r1);
     const __m128i phi01 = _mm_unpackhi_epi8(v_r0, v_r1);
@@ -361,129 +362,6 @@ inline void transpose_4x16_i8(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m12
     v_r1 = _mm_unpackhi_epi16(plo01, plo23);
     v_r2 = _mm_unpacklo_epi16(phi01, phi23);
     v_r3 = _mm_unpackhi_epi16(phi01, phi23);
-}
-
-inline void transpose_4x8_i16(__m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3) noexcept {
-    const __m128i tmp0 = _mm_unpacklo_epi16(v_r0, v_r1);
-    const __m128i tmp1 = _mm_unpackhi_epi16(v_r0, v_r1);
-    const __m128i tmp2 = _mm_unpacklo_epi16(v_r2, v_r3);
-    const __m128i tmp3 = _mm_unpackhi_epi16(v_r2, v_r3);
-
-    v_r0 = _mm_castps_si128(_mm_movelh_ps(_mm_castsi128_ps(tmp0), _mm_castsi128_ps(tmp2)));
-    v_r1 = _mm_castps_si128(_mm_movehl_ps(_mm_castsi128_ps(tmp2), _mm_castsi128_ps(tmp0)));
-    v_r2 = _mm_castps_si128(_mm_movelh_ps(_mm_castsi128_ps(tmp1), _mm_castsi128_ps(tmp3)));
-    v_r3 = _mm_castps_si128(_mm_movehl_ps(_mm_castsi128_ps(tmp3), _mm_castsi128_ps(tmp1)));
-}
-
-inline void transpose_6x8_i16(__m128i& v_a, __m128i& v_b, __m128i& v_c,
-                               __m128i& v_d, __m128i& v_e, __m128i& v_f) noexcept {
-    const __m128i t0 = _mm_unpacklo_epi16(v_a, v_b);
-    const __m128i t1 = _mm_unpackhi_epi16(v_a, v_b);
-    const __m128i t2 = _mm_unpacklo_epi16(v_c, v_d);
-    const __m128i t3 = _mm_unpackhi_epi16(v_c, v_d);
-    const __m128i t4 = _mm_unpacklo_epi16(v_e, v_f);
-    const __m128i t5 = _mm_unpackhi_epi16(v_e, v_f);
-
-    v_a = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t1), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_b = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t2), _mm_castsi128_ps(t3), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_c = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t5), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_d = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t1), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_e = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t2), _mm_castsi128_ps(t3), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_f = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t5), _MM_SHUFFLE(3, 2, 3, 2)));
-}
-
-inline void transpose_8x8_i16(__m128i& v_a, __m128i& v_b, __m128i& v_c, __m128i& v_d,
-                               __m128i& v_e, __m128i& v_f, __m128i& v_g, __m128i& v_h) noexcept {
-    const __m128i t0 = _mm_unpacklo_epi16(v_a, v_b);
-    const __m128i t1 = _mm_unpackhi_epi16(v_a, v_b);
-    const __m128i t2 = _mm_unpacklo_epi16(v_c, v_d);
-    const __m128i t3 = _mm_unpackhi_epi16(v_c, v_d);
-    const __m128i t4 = _mm_unpacklo_epi16(v_e, v_f);
-    const __m128i t5 = _mm_unpackhi_epi16(v_e, v_f);
-    const __m128i t6 = _mm_unpacklo_epi16(v_g, v_h);
-    const __m128i t7 = _mm_unpackhi_epi16(v_g, v_h);
-
-    v_a = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t2), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_b = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t6), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_c = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t2), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_d = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t6), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_e = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t1), _mm_castsi128_ps(t3), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_f = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t5), _mm_castsi128_ps(t7), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_g = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t1), _mm_castsi128_ps(t3), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_h = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t5), _mm_castsi128_ps(t7), _MM_SHUFFLE(3, 2, 3, 2)));
-}
-
-inline void transpose_12x8_i16(
-    __m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3,
-    __m128i& v_r4, __m128i& v_r5, __m128i& v_r6, __m128i& v_r7,
-    __m128i& v_r8, __m128i& v_r9, __m128i& v_ra, __m128i& v_rb) noexcept {
-
-    const __m128i t0 = _mm_unpacklo_epi16(v_r0, v_r1);
-    const __m128i t1 = _mm_unpackhi_epi16(v_r0, v_r1);
-    const __m128i t2 = _mm_unpacklo_epi16(v_r2, v_r3);
-    const __m128i t3 = _mm_unpackhi_epi16(v_r2, v_r3);
-    const __m128i t4 = _mm_unpacklo_epi16(v_r4, v_r5);
-    const __m128i t5 = _mm_unpackhi_epi16(v_r4, v_r5);
-    const __m128i t6 = _mm_unpacklo_epi16(v_r6, v_r7);
-    const __m128i t7 = _mm_unpackhi_epi16(v_r6, v_r7);
-    const __m128i t8 = _mm_unpacklo_epi16(v_r8, v_r9);
-    const __m128i t9 = _mm_unpackhi_epi16(v_r8, v_r9);
-    const __m128i ta = _mm_unpacklo_epi16(v_ra, v_rb);
-    const __m128i tb = _mm_unpackhi_epi16(v_ra, v_rb);
-
-    v_r0 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t1), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r1 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t2), _mm_castsi128_ps(t3), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r2 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t5), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r3 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t1), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r4 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t2), _mm_castsi128_ps(t3), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r5 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t5), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r6 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t6), _mm_castsi128_ps(t7), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r7 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t8), _mm_castsi128_ps(t9), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r8 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(ta), _mm_castsi128_ps(tb), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r9 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t6), _mm_castsi128_ps(t7), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_ra = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t8), _mm_castsi128_ps(t9), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_rb = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(ta), _mm_castsi128_ps(tb), _MM_SHUFFLE(3, 2, 3, 2)));
-}
-
-inline void transpose_16x8_i16(
-    __m128i& v_r0, __m128i& v_r1, __m128i& v_r2, __m128i& v_r3,
-    __m128i& v_r4, __m128i& v_r5, __m128i& v_r6, __m128i& v_r7,
-    __m128i& v_r8, __m128i& v_r9, __m128i& v_ra, __m128i& v_rb,
-    __m128i& v_rc, __m128i& v_rd, __m128i& v_re, __m128i& v_rf) noexcept {
-
-    const __m128i t0  = _mm_unpacklo_epi16(v_r0, v_r1);
-    const __m128i t1  = _mm_unpackhi_epi16(v_r0, v_r1);
-    const __m128i t2  = _mm_unpacklo_epi16(v_r2, v_r3);
-    const __m128i t3  = _mm_unpackhi_epi16(v_r2, v_r3);
-    const __m128i t4  = _mm_unpacklo_epi16(v_r4, v_r5);
-    const __m128i t5  = _mm_unpackhi_epi16(v_r4, v_r5);
-    const __m128i t6  = _mm_unpacklo_epi16(v_r6, v_r7);
-    const __m128i t7  = _mm_unpackhi_epi16(v_r6, v_r7);
-    const __m128i t8  = _mm_unpacklo_epi16(v_r8, v_r9);
-    const __m128i t9  = _mm_unpackhi_epi16(v_r8, v_r9);
-    const __m128i ta  = _mm_unpacklo_epi16(v_ra, v_rb);
-    const __m128i tb  = _mm_unpackhi_epi16(v_ra, v_rb);
-    const __m128i tc  = _mm_unpacklo_epi16(v_rc, v_rd);
-    const __m128i td  = _mm_unpackhi_epi16(v_rc, v_rd);
-    const __m128i te  = _mm_unpacklo_epi16(v_re, v_rf);
-    const __m128i tf  = _mm_unpackhi_epi16(v_re, v_rf);
-
-    v_r0 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t1), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r1 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t2), _mm_castsi128_ps(t3), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r2 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t5), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r3 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t6), _mm_castsi128_ps(t7), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r4 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t0), _mm_castsi128_ps(t1), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r5 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t2), _mm_castsi128_ps(t3), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r6 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t4), _mm_castsi128_ps(t5), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r7 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t6), _mm_castsi128_ps(t7), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_r8 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t8), _mm_castsi128_ps(t9), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_r9 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(ta), _mm_castsi128_ps(tb), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_ra = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(tc), _mm_castsi128_ps(td), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_rb = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(te), _mm_castsi128_ps(tf), _MM_SHUFFLE(1, 0, 1, 0)));
-    v_rc = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t8), _mm_castsi128_ps(t9), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_rd = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(ta), _mm_castsi128_ps(tb), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_re = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(tc), _mm_castsi128_ps(td), _MM_SHUFFLE(3, 2, 3, 2)));
-    v_rf = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(te), _mm_castsi128_ps(tf), _MM_SHUFFLE(3, 2, 3, 2)));
 }
 
 }  // namespace nnops::backend::cpu::x86_64
