@@ -333,12 +333,15 @@ NNOPS_BENCH(conv2d_f16_resnet_block_3x3) {
 // ============================================================
 
 NNOPS_BENCH(dwconv_f32_3x3) {
-    // Same shape as the im2col depthwise case above — direct head-to-head.
-    bench_depthwise_case({"f32 dwconv 1x256x28x28 -> 3x3 s1 p1", 1, 256, 28, 28, 3, 3});
+    // Same shape as the im2col depthwise case above (SAME padding, OH=28) —
+    // direct head-to-head.
+    bench_depthwise_case({"f32 dwconv 1x256x28x28 -> 3x3 s1 p1", 1, 256, 28, 28, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
 
 NNOPS_BENCH(dwconv_f32_3x3_large) {
-    bench_depthwise_case({"f32 dwconv 1x256x56x56 -> 3x3 s1 p1", 1, 256, 56, 56, 3, 3});
+    bench_depthwise_case({"f32 dwconv 1x256x56x56 -> 3x3 s1 p1", 1, 256, 56, 56, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
 
 NNOPS_BENCH(dwconv_f32_stride2) {
@@ -353,5 +356,6 @@ NNOPS_BENCH(dwconv_f32_5x5) {
 }
 
 NNOPS_BENCH(dwconv_f32_batch) {
-    bench_depthwise_case({"f32 dwconv batch 8x128x28x28 -> 3x3 s1 p1", 8, 128, 28, 28, 3, 3});
+    bench_depthwise_case({"f32 dwconv batch 8x128x28x28 -> 3x3 s1 p1", 8, 128, 28, 28, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
