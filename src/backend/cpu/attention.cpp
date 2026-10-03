@@ -143,6 +143,8 @@ void attention_impl(const AttentionAttributes& attrs,
 
     const int64_t NG = B * H;
     T* ws_base = static_cast<T*>(workspace);
+    const int nslots = ctx.cpu.thread_slot_count();
+    const bool per_thread = nslots > 0 && nslots < NG;
 
     const auto run = [&](int64_t idx) {
         const int64_t b = idx / H;
@@ -165,7 +167,8 @@ void attention_impl(const AttentionAttributes& attrs,
             o_head = out_ptr + (b * H + h) * Sq * o_rs;
         }
 
-        T* scores = ws_base + idx * per_head;
+        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : idx;
+        T* scores = ws_base + slot * per_head;
         T* pack_b = scores + scores_elems;
 
         // ---- GEMM1: scores = Q @ K^T * scale --------------------------
@@ -321,6 +324,8 @@ void attention_flash_impl(const AttentionAttributes& attrs,
     const int64_t NQ = (Sq + Br - 1) / Br;  // number of Br-row query blocks
     const int64_t NG = B * H * NQ;
     T* ws_base = static_cast<T*>(workspace);
+    const int nslots = ctx.cpu.thread_slot_count();
+    const bool per_thread = nslots > 0 && nslots < NG;
 
     const auto run = [&](int64_t idx) {
         const int64_t qi = idx % NQ;
@@ -345,7 +350,8 @@ void attention_flash_impl(const AttentionAttributes& attrs,
             o_head = out_ptr + (b * H + h) * Sq * o_rs;
         }
 
-        T* m      = ws_base + idx * per_task;
+        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : idx;
+        T* m      = ws_base + slot * per_task;
         T* l      = m + Br;
         T* s      = l + Br;
         T* o_acc  = s + static_cast<int64_t>(Br) * Bc;
@@ -455,7 +461,9 @@ void attention_flash_impl(const AttentionAttributes& attrs,
 
 AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
                                  std::span<const TensorDesc> inputs,
-                                 std::span<const TensorDesc> /*outputs*/)
+                                 std::span<const TensorDesc> /*outputs*/,
+                                 int num_threads,
+                                 bool use_thread_slots)
 {
     NNOPS_ASSERT(inputs.size() >= 3);
     NNOPS_ASSERT(inputs.size() <= 4);
@@ -489,8 +497,9 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
 
     plan.use_flash = should_use_flash_attention(Sq, Sk);
 
-    // FlashAttention path — sized with the same Br/Bc the kernel uses, and with
-    // one scratch slot per query block (tasks are B × H × NQ).
+    // FlashAttention path — sized with the same Br/Bc the kernel uses. Scratch
+    // slots are per worker thread when thread ids are reported, else per query
+    // block (tasks are B × H × NQ).
     if (plan.use_flash) {
         int Br, Bc;
         resolve_flash_tile_sizes(Sq, Sk, D, Br, Bc);
@@ -498,7 +507,9 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
         plan.Bc = Bc;
         const int64_t per_task = flash_per_task_elems(Br, Bc, D);
         const int64_t NQ = (Sq + Br - 1) / Br;
-        plan.workspace_size = static_cast<size_t>(B * H * NQ)
+        const int64_t nt  = std::max<int64_t>(num_threads, 1);
+        plan.num_slots = (use_thread_slots && nt < B * H * NQ) ? nt : B * H * NQ;
+        plan.workspace_size = static_cast<size_t>(plan.num_slots)
                             * static_cast<size_t>(per_task) * sizeof(float);
         return plan;
     }
@@ -526,7 +537,9 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
     const int64_t per_head     = scores_elems + pack_elems;
 
-    plan.workspace_size = static_cast<size_t>(B * H)
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+    plan.num_slots = (use_thread_slots && nt < B * H) ? nt : B * H;
+    plan.workspace_size = static_cast<size_t>(plan.num_slots)
                         * static_cast<size_t>(per_head) * sizeof(float);
     return plan;
 }
@@ -557,7 +570,9 @@ void attention_kernel(const AttentionAttributes& attrs,
         // the parallel body.
         const TensorDesc descs[] = {inputs[0].desc(), inputs[1].desc(), inputs[2].desc()};
         const TensorDesc outs[]  = {output.desc()};
-        const AttentionPlan plan = get_attention_plan(attrs, descs, outs);
+        const AttentionPlan plan = get_attention_plan(attrs, descs, outs,
+                                                      ctx.cpu.thread_count(),
+                                                      ctx.cpu.thread_slot_count() > 0);
         PoolPtr scratch(plan.workspace_size);
 
         if (plan.use_flash) {

@@ -40,15 +40,19 @@ struct AttentionPlan {
     int    mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
     int    mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × D) tiles
     int    Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
+    int64_t num_slots = 0;      ///< scratch slots (worker threads, else tasks)
     size_t workspace_size = 0;  ///< pooled scratch bytes (0 → reference fallback)
 };
 
 /// Resolve the attention plan (tile sizes + workspace bytes) from the
 /// descriptors. Returns a zeroed plan (workspace_size 0) for non-f32 dtypes,
-/// which routes the kernel to the reference.
+/// which routes the kernel to the reference. @p num_threads bounds the
+/// per-thread scratch slot count when @p use_thread_slots is set.
 AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
                                  std::span<const TensorDesc> inputs,
-                                 std::span<const TensorDesc> outputs);
+                                 std::span<const TensorDesc> outputs,
+                                 int num_threads = 1,
+                                 bool use_thread_slots = false);
 
 /// Tiled attention kernel (f32). Falls back to the reference kernel when the
 /// dtype is not f32 (the reference is f32-only). Scratch is pooled internally

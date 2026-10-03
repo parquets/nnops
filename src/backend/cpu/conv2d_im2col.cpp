@@ -13,9 +13,11 @@
 ///
 /// Work is split at (batch, group) granularity and, when that under-subscribes
 /// the thread pool (the common batch=1 / groups=1 case), the oh-blocks are
-/// partitioned into parallel chunks, each owning its own col_data scratch so no
-/// per-thread indexing is required by the external parallel_for hook. C tiles
-/// are disjoint, so the result is bit-identical to serial execution.
+/// partitioned into parallel chunks. Scratch is indexed by thread id when the
+/// backend reports worker ids (one slot per thread, reused across every task a
+/// thread claims); otherwise each parallel task owns its own col_data scratch.
+/// Output tiles are disjoint either way, so the result is bit-identical to
+/// serial execution.
 
 #include "conv2d_im2col.h"
 #include "matmul_helper.h"                 // tile_mma_direct + arch panel constants
@@ -182,15 +184,21 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     const T* w_ptr   = weight.ptr<T>();
     const T* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    // Workspace slices (per parallel task: (batch, group, oh-chunk)).
+    // Scratch slices: one per worker thread (thread_id-indexed, reused across
+    // every task a thread claims) when the backend reports thread ids, else one
+    // per parallel task. Output tiles are disjoint either way, so the result is
+    // bit-identical.
     const int64_t col_size  = plan.col_size;
     const int64_t orig_size = plan.orig_size;
 
     const int64_t NG = N * G;
     const int64_t total = NG * oh_chunks;
 
+    const int nslots = ctx.cpu.thread_slot_count();
+    const bool per_thread = nslots > 0 && nslots < total;
+
     T* col_base  = static_cast<T*>(workspace);
-    T* orig_base = attrs.add_to ? col_base + total * col_size : nullptr;
+    T* orig_base = attrs.add_to ? col_base + plan.num_slots * col_size : nullptr;
 
     const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
 
@@ -200,8 +208,9 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
         const int64_t n = ng / G;
         const int64_t g = ng % G;
 
-        T* col_data = col_base + t * col_size;
-        T* orig = orig_base ? orig_base + t * orig_size : nullptr;
+        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
+        T* col_data = col_base + slot * col_size;
+        T* orig = orig_base ? orig_base + slot * orig_size : nullptr;
 
         T* output_ptr = out_ptr + n * ob_step + g * og_step;
         const T* input_ptr  = in_ptr + n * ib_step + g * ig_step;
@@ -295,7 +304,8 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
 Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
                            std::span<const TensorDesc> inputs,
                            std::span<const TensorDesc> outputs,
-                           int num_threads)
+                           int num_threads,
+                           bool use_thread_slots)
 {
     NNOPS_ASSERT(inputs.size() >= 2);
     NNOPS_ASSERT(outputs.size() >= 1);
@@ -347,8 +357,12 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     plan.col_size  = plan.icn_block * karea * plan.oh_block * OW;
     plan.orig_size = attrs.add_to ? plan.ocn_block * plan.oh_block * OW : 0;
 
+    // Scratch slots: one per worker thread when the backend reports thread ids and
+    // that is fewer than the task count (thread_id-indexed, reused across every
+    // task a thread claims); else one per parallel task.
     const int64_t total = NG * plan.oh_chunks;
-    plan.workspace_size = static_cast<size_t>(total)
+    plan.num_slots = (use_thread_slots && nt < total) ? nt : total;
+    plan.workspace_size = static_cast<size_t>(plan.num_slots)
                         * static_cast<size_t>(plan.col_size + plan.orig_size)
                         * data_type_size(dt);
     return plan;
@@ -380,7 +394,8 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
         descs.reserve(inputs.size());
         for (const auto& t : inputs) { descs.push_back(t.desc()); }
         const TensorDesc outs[] = {output.desc()};
-        const Conv2DPlan plan = get_conv2d_plan(attrs, descs, outs, ctx.cpu.thread_count());
+        const Conv2DPlan plan = get_conv2d_plan(attrs, descs, outs, ctx.cpu.thread_count(),
+                                                ctx.cpu.thread_slot_count() > 0);
         PoolPtr scratch(plan.workspace_size);
 
         if (dt == DataType::f32) {

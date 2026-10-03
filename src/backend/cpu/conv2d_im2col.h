@@ -12,9 +12,10 @@
 ///
 /// Work is split at (batch, group, oh-chunk) granularity: when (batch, group)
 /// alone cannot fill the thread pool (the common batch=1 / groups=1 case), the
-/// oh-blocks are partitioned into parallel chunks, each owning its own im2col
-/// scratch. Output tiles are disjoint, so the result is bit-identical to serial
-/// execution.
+/// oh-blocks are partitioned into parallel chunks. Scratch is indexed by thread
+/// id when the backend reports worker ids; otherwise each chunk owns its own
+/// im2col scratch. Output tiles are disjoint, so the result is bit-identical to
+/// serial execution.
 ///
 /// Bias is fused into the accumulator init; the epilogue (activation) is
 /// applied in-place after the last ic-block; `add_to` follows the reference
@@ -24,8 +25,8 @@
 /// Block sizes, the parallel decomposition, and the scratch layout all come
 /// from one plan (get_conv2d_plan), so the kernel and its sizing never drift.
 ///
-/// Scratch layout (pooled internally; per task, reused across the task's
-/// oh-blocks):
+/// Scratch layout (pooled internally; one slot per worker thread when thread
+/// ids are reported, else one slot per task, reused across the task's oh-blocks):
 ///   [col_data : icn_block*karea*oh_block*out_w]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
 ///
@@ -50,19 +51,22 @@ struct Conv2DPlan {
     int64_t oh_block  = 0;         ///< output-row block
     int64_t num_oh_blocks = 1;     ///< ceil(OH / oh_block)
     int64_t oh_chunks     = 1;     ///< parallel oh-chunks per (batch, group)
-    int64_t col_size  = 0;         ///< im2col scratch elements per task
-    int64_t orig_size = 0;         ///< add_to scratch elements per task
+    int64_t num_slots = 0;         ///< scratch slots (worker threads, else tasks)
+    int64_t col_size  = 0;         ///< im2col scratch elements per slot
+    int64_t orig_size = 0;         ///< add_to scratch elements per slot
     size_t  workspace_size = 0;    ///< pooled scratch bytes (0 → reference fallback)
 };
 
 /// Resolve the conv2d plan (block sizes, oh-chunk split, workspace bytes) from
 /// the descriptors. Returns a zeroed plan (workspace_size 0) for unsupported
 /// dtypes (f32/f16 only, all tensors matching), which routes the kernel to the
-/// reference.
+/// reference. @p num_threads drives the oh-chunk split; @p use_thread_slots
+/// sizes the scratch per worker thread (thread_id-indexed) instead of per task.
 Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
                            std::span<const TensorDesc> inputs,
                            std::span<const TensorDesc> outputs,
-                           int num_threads);
+                           int num_threads,
+                           bool use_thread_slots = false);
 
 /// Tiled im2col + direct GEMM Conv2D kernel (f32 / f16, planar NCHW).
 ///

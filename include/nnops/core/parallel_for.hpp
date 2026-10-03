@@ -48,6 +48,14 @@ struct CpuBackend {
 
     /// Current worker thread id (0-based), or 0 when no hook reports it.
     int current_thread_id() const { return thread_id ? thread_id() : 0; }
+
+    /// Number of per-thread scratch slots available: thread_count() when both
+    /// num_threads and thread_id are installed, so operators can size their
+    /// scratch by worker count and index it with current_thread_id(); else 0,
+    /// meaning operators must fall back to per-task scratch indexing.
+    int thread_slot_count() const {
+        return (num_threads && thread_id) ? thread_count() : 0;
+    }
 };
 
 }  // namespace nnops
