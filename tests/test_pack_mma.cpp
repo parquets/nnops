@@ -386,6 +386,9 @@ NNOPS_TEST(mma_direct_f32_1x12) { test_mma_direct_f32(mma_direct_1x12_f32,  1, 1
 NNOPS_TEST(mma_direct_f32_4x1)  { test_mma_direct_f32(mma_direct_4x1_f32,   4, 1,  7); }
 NNOPS_TEST(mma_direct_f32_4x4)  { test_mma_direct_f32(mma_direct_4x4_f32,   4, 4,  7); }
 NNOPS_TEST(mma_direct_f32_4x12) { test_mma_direct_f32(mma_direct_4x12_f32,  4, 12, 7); }
+NNOPS_TEST(mma_direct_f32_6x1)  { test_mma_direct_f32(mma_direct_6x1_f32,   6, 1,  7); }
+NNOPS_TEST(mma_direct_f32_6x4)  { test_mma_direct_f32(mma_direct_6x4_f32,   6, 4,  7); }
+NNOPS_TEST(mma_direct_f32_6x12) { test_mma_direct_f32(mma_direct_6x12_f32,  6, 12, 7); }
 NNOPS_TEST(mma_direct_f32_8x1)  { test_mma_direct_f32(mma_direct_8x1_f32,   8, 1,  7); }
 NNOPS_TEST(mma_direct_f32_8x4)  { test_mma_direct_f32(mma_direct_8x4_f32,   8, 4,  7); }
 NNOPS_TEST(mma_direct_f32_8x12) { test_mma_direct_f32(mma_direct_8x12_f32,  8, 12, 7); }
@@ -399,6 +402,9 @@ NNOPS_TEST(mma_direct_f32_6x16_strided_a) {
     test_mma_direct_strided_f32(mma_direct_6x16_f32, 6, 16, 37, 37 + 16);
 }
 #elif defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(mma_direct_f32_6x12_strided_a) {
+    test_mma_direct_strided_f32(mma_direct_6x12_f32, 6, 12, 37, 37 + 16);
+}
 NNOPS_TEST(mma_direct_f32_8x12_strided_a) {
     test_mma_direct_strided_f32(mma_direct_8x12_f32, 8, 12, 37, 37 + 16);
 }

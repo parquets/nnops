@@ -8,6 +8,7 @@
 ///   5. const TensorView ins[] = {a, b}; op->compute(out, ins);
 
 #include "nnops/ops/matmul.hpp"
+#include "backend/cpu/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
@@ -1397,6 +1398,62 @@ NNOPS_TEST(matmul_padded_a_stride_correctness) {
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
+}
+
+NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
+    // The complement of matmul_padded_a_stride_correctness: a *compact*
+    // non-transposed A stays on the unpacked-A (pack_a=0) route, and that route
+    // decomposes M with its own panel heights — MR_F32_DIRECT, {6,4,1}, so Mc
+    // splits as 6a + 4b + 1c. Walk M across that boundary and K across both the
+    // 4-wide inner unroll and KC_F32, so the tall tile, the 4/1 remainder
+    // kernels and the scalar k-tail are each checked against the reference.
+    // N walks the nr panel widths too — the kernel is selected per (mr, nr), so
+    // 13 exercises the 12+1 columns and 17 the 12+4+1 ones.
+    const int64_t Ms[] = {1, 5, 6, 7, 8, 13, 143, 144, 145};
+    const int64_t Ks[] = {1, 3, 4, 7, 128, 129};
+    const int64_t Ns[] = {1, 13, 17};
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            for (int64_t N : Ns) {
+                auto [a_vec, a] = test::make_random_tensor({M, K});
+                auto [b_vec, b] = test::make_random_tensor({K, N});
+
+                MatMulAttributes attrs{};
+                auto op = MatMul::create(attrs, Backend::CPU);
+
+                // Pin the route. If a compact non-transposed A ever stops being
+                // lda == K <= PACK_A_STRIDE_THRESHOLD this test would silently
+                // start covering the packed kernels instead of the direct ones.
+                const auto plan = nnops::backend::cpu::get_matmul_plan(
+                    attrs, a.desc(), b.desc(), 1);
+                if (plan.pack_a) {
+                    throw std::runtime_error(
+                        "matmul_f32_nn_direct_tile_remainders: expected pack_a=0 at M="
+                        + std::to_string(M) + " K=" + std::to_string(K));
+                }
+
+                const TensorDesc arr[] = {a.desc(), b.desc()};
+                auto descs = op->getOutputTensorDesc(arr);
+
+                std::vector<float> out_buf(descs[0].numel());
+                auto output = nnops::test::make_planar(descs[0], out_buf.data());
+                const TensorView ins[] = {a, b};
+                op->compute(output, ins, {}, nullptr);
+
+                std::vector<float> ref_buf(descs[0].numel());
+                auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+                nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+                if (!test::allclose(output, ref_out, 1e-4f, 1e-5f)) {
+                    throw std::runtime_error(
+                        "matmul_f32_nn_direct_tile_remainders: mismatch at M="
+                        + std::to_string(M) + " K=" + std::to_string(K)
+                        + " N=" + std::to_string(N));
+                }
+            }
+        }
+    }
 }
 
 NNOPS_TEST(matmul_mkn_transpose_a_multik) {

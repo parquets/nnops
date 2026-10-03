@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace nnops;
@@ -295,6 +296,89 @@ void bench_i8_case(const GeMMCase& c) {
     print_report(run_geMM_i8(c, threads, iters));
 }
 
+// ---- controlled A/B between two routes ------------------------------------
+//
+// bench_case() runs each route as its own case, so the two numbers are taken in
+// different thermal/frequency states — on a fanless host, two runs of the *same*
+// route differ by >30%, which swamps the pack_a=0 vs pack_a=1 gap this suite
+// exists to expose. This builds both routes up front and alternates them round
+// by round inside one process, so the ratio is measured under matched
+// conditions. Read the per-round ratios, not the absolute GFLOPS.
+struct RouteAB {
+    using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
+
+    OpPtr op;
+    std::vector<float> a_buf, b_buf, out_buf;
+    TensorView a, b, out;
+    TensorView ins[2];
+    int64_t M, N, K;
+    bool pack_a;
+
+    RouteAB(int64_t m, int64_t k, int64_t n, bool transpose_a, uint64_t seed)
+        : M(m), N(n), K(k) {
+        auto [a_vec, a_view] = make_tensor<float>(transpose_a ? K : M,
+                                                  transpose_a ? M : K,
+                                                  transpose_a ? M : K, seed);
+        a_buf = std::move(a_vec);
+        a = a_view;
+
+        auto [b_vec, b_view] = make_tensor<float>(K, N, N, seed + 1);
+        b_buf = std::move(b_vec);
+        b = b_view;
+
+        MatMulAttributes attrs{};
+        attrs.transpose_a = transpose_a;
+        op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        out_buf.assign(static_cast<size_t>(descs[0].numel()), 0.0f);
+        out = test::make_planar(descs[0], out_buf.data());
+
+        ins[0] = a;
+        ins[1] = b;
+        pack_a = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1).pack_a;
+    }
+
+    double time(int iters) {
+        for (int i = 0; i < 2; ++i) { op->compute(out, ins, {}, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { op->compute(out, ins, {}, nullptr); }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return 2.0 * static_cast<double>(M) * static_cast<double>(N)
+             * static_cast<double>(K) * static_cast<double>(iters) / (ms * 1e6);
+    }
+};
+
+void bench_route_ab(int64_t M, int64_t K, int64_t N, int rounds = 6, int iters = 20) {
+    RouteAB nn(M, K, N, /*transpose_a=*/false, 1);
+    RouteAB ta(M, K, N, /*transpose_a=*/true, 1);
+
+    std::printf("  route A/B  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+    std::printf("    pack_a: nn=%d ta=%d   (0 = unpacked-A direct route)\n",
+                static_cast<int>(nn.pack_a), static_cast<int>(ta.pack_a));
+
+    std::vector<double> rn, rt;
+    for (int r = 0; r < rounds; ++r) {
+        const double g_nn = nn.time(iters);
+        const double g_ta = ta.time(iters);
+        rn.push_back(g_nn);
+        rt.push_back(g_ta);
+        std::printf("    round %d:  nn=%7.1f  ta=%7.1f   nn/ta=%.3f\n",
+                    r, g_nn, g_ta, g_nn / g_ta);
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double mn = median(rn), mt = median(rt);
+    std::printf("    median:   nn=%7.1f  ta=%7.1f   nn/ta=%.3f\n", mn, mt, mn / mt);
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -307,6 +391,12 @@ NNOPS_BENCH(matmul_f32_nn_direct_256) {
 
 NNOPS_BENCH(matmul_f32_nn_direct_large) {
     bench_case({"nn 1024x512x1024", 1024, 512, 1024});
+}
+
+NNOPS_BENCH(matmul_f32_route_ab) {
+    // Paired with matmul_f32_nn_direct_large / matmul_f32_ta_mkn, which measure
+    // the same shapes but in separate, individually-unreliable runs.
+    bench_route_ab(1024, 512, 1024);
 }
 
 NNOPS_BENCH(matmul_f32_ta_mkn) {

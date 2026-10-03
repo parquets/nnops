@@ -16,8 +16,9 @@
 ///               isolating it from direct/lda separates any stride/cache-line
 ///               effect from the kernel's own instruction mix
 ///
-/// GFLOPS are computed from the kernel's real tile (mr x nr x K x 2), not from
-/// a nominal size, so the three rows are directly comparable.
+/// GFLOPS are computed from each kernel's real tile (mr x nr x K x 2), not from
+/// a nominal size, so the three rows are directly comparable even where the
+/// pack and direct paths use different tile heights (see NNOPS_BENCH_MMA_MR*).
 
 #include "nnops/detail/simd.hpp"           // NNOPS_ARCH_* selection
 #include "common/bench_harness.hpp"
@@ -33,6 +34,7 @@
   #include "backend/cpu/x86_64/mma_direct_f32.hpp"
   using namespace nnops::backend::cpu::x86_64;
   #define NNOPS_BENCH_MMA_MR 6
+  #define NNOPS_BENCH_MMA_MR_DIRECT 6
   #define NNOPS_BENCH_MMA_NR 16
   #define NNOPS_BENCH_MMA_PACK   mma_pack_6x16_f32
   #define NNOPS_BENCH_MMA_DIRECT mma_direct_6x16_f32
@@ -40,10 +42,15 @@
   #include "backend/cpu/aarch64/mma_pack_f32.hpp"
   #include "backend/cpu/aarch64/mma_direct_f32.hpp"
   using namespace nnops::backend::cpu::aarch64;
+  // The pack and direct paths tile M differently: the packed layout keeps four
+  // rows per A vector and runs at mr=8, while row-major A pins one vector per
+  // row and has to drop to mr=6 to stay inside the register file. These macros
+  // must track arch::mr_f32 / arch::mr_f32_direct.
   #define NNOPS_BENCH_MMA_MR 8
+  #define NNOPS_BENCH_MMA_MR_DIRECT 6
   #define NNOPS_BENCH_MMA_NR 12
   #define NNOPS_BENCH_MMA_PACK   mma_pack_8x12_f32
-  #define NNOPS_BENCH_MMA_DIRECT mma_direct_8x12_f32
+  #define NNOPS_BENCH_MMA_DIRECT mma_direct_6x12_f32
 #else
   #error "Unsupported architecture"
 #endif
@@ -51,6 +58,7 @@
 namespace {
 
 constexpr int MR = NNOPS_BENCH_MMA_MR;
+constexpr int MR_DIRECT = NNOPS_BENCH_MMA_MR_DIRECT;
 constexpr int NR = NNOPS_BENCH_MMA_NR;
 
 constexpr int REPS = 200000;
@@ -81,15 +89,18 @@ void fill_random(float* p, size_t n, uint64_t seed) {
 volatile double g_sink = 0.0;
 
 /// Time `mma` over REPS calls; returns GFLOPS for the mr x nr x K tile.
+/// `mr` is the tile height the kernel was instantiated at, which is not the
+/// same for the pack and direct rows on aarch64.
 template <typename Fn>
-double time_kernel(Fn&& mma, int K) {
-    // C_TILES separate MR x NR accumulator blocks, kept live across the loop.
-    std::vector<float> C(static_cast<size_t>(C_TILES) * MR * NR);
+double time_kernel(Fn&& mma, int mr, int K) {
+    // C_TILES separate mr x NR accumulator blocks, kept live across the loop.
+    const size_t tile = static_cast<size_t>(mr) * NR;
+    std::vector<float> C(static_cast<size_t>(C_TILES) * tile);
     for (auto& v : C) { v = 0.0f; }
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < REPS; ++i) {
-        mma(C.data() + (static_cast<size_t>(i % C_TILES) * MR * NR));
+        mma(C.data() + (static_cast<size_t>(i % C_TILES) * tile));
     }
     const auto t1 = std::chrono::steady_clock::now();
 
@@ -97,7 +108,7 @@ double time_kernel(Fn&& mma, int K) {
     for (float v : C) { g_sink += static_cast<double>(v); }
 
     const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
-    return 2.0 * MR * NR * static_cast<double>(K) * REPS / ns;
+    return 2.0 * mr * NR * static_cast<double>(K) * REPS / ns;
 }
 
 struct Case {
@@ -118,8 +129,8 @@ void bench_geometry(int K) {
     const int lda_pad = K + STRIDE_PAD;
 
     std::vector<float> A_packed(static_cast<size_t>(MR) * K);
-    std::vector<float> A_padded(static_cast<size_t>(MR) * lda_pad);
-    std::vector<float> A_compact(static_cast<size_t>(MR) * K);
+    std::vector<float> A_padded(static_cast<size_t>(MR_DIRECT) * lda_pad);
+    std::vector<float> A_compact(static_cast<size_t>(MR_DIRECT) * K);
     std::vector<float> B(static_cast<size_t>(NR) * K);
 
     // Seed from the address, so the data is runtime-opaque but reproducible.
@@ -133,17 +144,17 @@ void bench_geometry(int K) {
     const double g_pack = time_kernel(
         [&](float* c) {
             NNOPS_BENCH_MMA_PACK(c, NR, A_packed.data(), B.data(), NR, K, -1e30f, 1e30f);
-        }, K);
+        }, MR, K);
     const double g_padded = time_kernel(
         [&](float* c) {
             NNOPS_BENCH_MMA_DIRECT(c, NR, A_padded.data(), lda_pad,
                                    B.data(), NR, K, -1e30f, 1e30f);
-        }, K);
+        }, MR_DIRECT, K);
     const double g_compact = time_kernel(
         [&](float* c) {
             NNOPS_BENCH_MMA_DIRECT(c, NR, A_compact.data(), K,
                                    B.data(), NR, K, -1e30f, 1e30f);
-        }, K);
+        }, MR_DIRECT, K);
 
     // cases[0] is pack and cases[1] is a direct row, so report()'s ratio holds.
     report(K, {{"mma_pack", g_pack},
