@@ -93,10 +93,17 @@ constexpr bool INT8_USE_U8_OFFSET = true;
 constexpr bool INT8_USE_U8_OFFSET = false;
 #endif
 
+/// M panel height the chosen route will actually run.
+///
+/// f16 tiles M identically on both routes, but f32 does not: packing interleaves
+/// four rows per vector (mr=8 on aarch64) while reading unpacked A pins one
+/// vector per row and has to drop to mr=6 to stay inside the register file (see
+/// arch::mr_f32_direct). Callers that model a working set must charge the height
+/// the route really uses, or a pack_a=0 GEMM is sized as if it were packing.
 template <class T>
-constexpr int mr_max_flt() {
+constexpr int mr_max_flt(bool pack_a) {
     if constexpr (std::is_same_v<T, float>) {
-        return MR_MAX_F32;
+        return pack_a ? MR_MAX_F32 : MR_MAX_F32_DIRECT;
     } else if constexpr (std::is_same_v<T, half>) {
         return MR_MAX_F16;
     } else {

@@ -732,7 +732,11 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
     plan.kc = std::min<int64_t>(is_f32 ? KC_F32 : KC_F16, K);
 
-    const int  mr_max = is_f32 ? mr_max_flt<float>() : mr_max_flt<half>();
+    // The M panel height the route will actually run — the nc heuristic below
+    // charges the L2 working set for it, so a pack_a=0 GEMM must be sized with
+    // the direct height, not the packed one.
+    const int  mr_panel = is_f32 ? mr_max_flt<float>(plan.pack_a)
+                                 : mr_max_flt<half>(plan.pack_a);
     const int  nr_max = is_f32 ? nr_max_flt<float>() : nr_max_flt<half>();
     const int* nr     = is_f32 ? NR_F32 : NR_F16;
     const int  elem   = is_f32 ? static_cast<int>(sizeof(float)) : static_cast<int>(sizeof(half));
@@ -743,7 +747,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     // N tile bounded by the L2 cache, rounded down to a nr_max multiple so the
     // per-block packed-B slices tile the workspace exactly, clamped to [nr_max, N].
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
-    const int nc_l2 = compute_nc(mr_max, static_cast<int>(plan.kc), elem, l2);
+    const int nc_l2 = compute_nc(mr_panel, static_cast<int>(plan.kc), elem, l2);
     const int nc_cap = clamp_nc(round_down_nc(nc_l2, nr_max), nr_max, static_cast<int>(N));
 
     int64_t nc = nc_cap;
