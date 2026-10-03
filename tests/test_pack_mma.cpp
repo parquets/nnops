@@ -336,6 +336,39 @@ static void test_mma_direct_f32(
     }
 }
 
+/// Same contract as test_mma_direct_f32, but A carries a row pitch of
+/// `lda` > K. That is the geometry the pack_a=0 dispatch feeds the direct
+/// kernels: A is read raw from its original row-major layout, so its pitch is
+/// the caller's stride, not K. A kernel that silently assumes lda == K passes
+/// the contiguous test above and fails only here.
+static void test_mma_direct_strided_f32(
+    void (*mma)(float*, int, const float*, int, const float*, int, int, float, float),
+    int M, int N, int K, int lda,
+    float clamp_min = -1e9f, float clamp_max = 1e9f)
+{
+    std::vector<float> A(static_cast<size_t>(M) * static_cast<size_t>(lda));
+    std::vector<float> B(static_cast<size_t>(K) * N);
+    std::vector<float> C_mma(static_cast<size_t>(M) * N);
+    std::vector<float> C_ref(static_cast<size_t>(M) * N);
+
+    // Poison the padding columns: a read past column K then shows up as a
+    // grossly wrong result rather than a near-miss.
+    for (auto& v : A) { v = 1234.5f; }
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            A[static_cast<size_t>(m) * lda + k] = 1.0f + float(m * K + k);
+        }
+    }
+    fill_ramp(B.data(), K * N, 0.5f);
+
+    mma(C_mma.data(), N, A.data(), lda, B.data(), N, K, clamp_min, clamp_max);
+    naive_gemm(C_ref.data(), N, A.data(), lda, B.data(), N, M, N, K);
+
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(C_mma[i], C_ref[i], 1e-4f);
+    }
+}
+
 #if defined(NNOPS_ARCH_X86_64)
 NNOPS_TEST(mma_direct_f32_1x1)  { test_mma_direct_f32(mma_direct_1x1_f32,  1, 1,  7); }
 NNOPS_TEST(mma_direct_f32_1x8)  { test_mma_direct_f32(mma_direct_1x8_f32,  1, 8,  7); }
@@ -356,6 +389,19 @@ NNOPS_TEST(mma_direct_f32_4x12) { test_mma_direct_f32(mma_direct_4x12_f32,  4, 1
 NNOPS_TEST(mma_direct_f32_8x1)  { test_mma_direct_f32(mma_direct_8x1_f32,   8, 1,  7); }
 NNOPS_TEST(mma_direct_f32_8x4)  { test_mma_direct_f32(mma_direct_8x4_f32,   8, 4,  7); }
 NNOPS_TEST(mma_direct_f32_8x12) { test_mma_direct_f32(mma_direct_8x12_f32,  8, 12, 7); }
+#endif
+
+// ---- strided A (the pack_a=0 geometry: row pitch > K) --------------------
+// One case per arch on the largest tile, at an odd K so the kernel's 4-wide
+// unroll takes its scalar tail with a non-contiguous pitch in flight.
+#if defined(NNOPS_ARCH_X86_64)
+NNOPS_TEST(mma_direct_f32_6x16_strided_a) {
+    test_mma_direct_strided_f32(mma_direct_6x16_f32, 6, 16, 37, 37 + 16);
+}
+#elif defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(mma_direct_f32_8x12_strided_a) {
+    test_mma_direct_strided_f32(mma_direct_8x12_f32, 8, 12, 37, 37 + 16);
+}
 #endif
 
 // =========================================================================
@@ -392,6 +438,43 @@ NNOPS_TEST(mma_f32_pack_vs_direct) {
 
     NNOPS_MMA_F32_MID_PACK(C_pack.data(), N, A_pack.data(), B_packed.data(), N, K, -1e9f, 1e9f);
     NNOPS_MMA_F32_MID_DIRECT(C_direct.data(), N, A_direct.data(), K, B.data(), N, K, -1e9f, 1e9f);
+
+    for (int i = 0; i < M * N; ++i) {
+        NNOPS_EXPECT_NEAR(C_pack[i], C_direct[i], 1e-4f);
+    }
+}
+
+NNOPS_TEST(mma_f32_pack_vs_direct_strided_a) {
+    // Same cross-check, but the direct side is given the pack_a=0 geometry:
+    // a row pitch of lda > K rather than the compact lda == K. Padding columns
+    // are poisoned so a kernel that ignores lda is caught, not merely nudged.
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 9;
+    constexpr int lda = K + 16;
+    std::vector<float> A_pack(M * K);               // interleaved: A_pack[m + k*M]
+    std::vector<float> A_direct(static_cast<size_t>(M) * lda);
+    std::vector<float> B(K * N);
+    std::vector<float> B_packed(K * N);
+    std::vector<float> C_pack(M * N);
+    std::vector<float> C_direct(M * N);
+
+    fill_ramp(B.data(), K * N, 0.5f);
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
+            B_packed[k * N + n] = B[k * N + n];
+        }
+    }
+
+    for (auto& v : A_direct) { v = 1234.5f; }
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            float val = 1.0f + float(m + k * M);
+            A_pack[m + k * M] = val;
+            A_direct[static_cast<size_t>(m) * lda + k] = val;
+        }
+    }
+
+    NNOPS_MMA_F32_MID_PACK(C_pack.data(), N, A_pack.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_DIRECT(C_direct.data(), N, A_direct.data(), lda, B.data(), N, K, -1e9f, 1e9f);
 
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C_pack[i], C_direct[i], 1e-4f);
