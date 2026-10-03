@@ -53,6 +53,36 @@ TensorView make_q(int64_t rows, int64_t cols, DataType dt, void* data, const Qua
     return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
 }
 
+// Same, for any rank (the batched cases).
+TensorView make_q_nd(std::span<const int64_t> shape, DataType dt, void* data, const QuantParams& qp) {
+    return TensorView(shape, dt, data, TensorLayout::NCHW, qp);
+}
+
+// The output shape op->getOutputTensorDesc() resolved, as a span for make_q_nd.
+std::span<const int64_t> desc_shape(const TensorDesc& d) {
+    return std::span<const int64_t>(d.dims.data(), static_cast<size_t>(d.rank));
+}
+
+/// Run the tiled kernel and matmul_int8_ref over the same inputs and require
+/// exact agreement on every element. `out_qp` is only read for an s8 output.
+template <typename T>
+void expect_matches_ref(const MatMulAttributes& attrs, const TensorDesc& odesc,
+                        std::span<const TensorView> ins, QuantParams out_qp = {}) {
+    const DataType dt = std::is_same_v<T, int32_t> ? DataType::s32 : DataType::s8;
+    std::vector<T> got(static_cast<size_t>(odesc.numel()));
+    std::vector<T> want(static_cast<size_t>(odesc.numel()));
+    TensorView output = make_q_nd(desc_shape(odesc), dt, got.data(), out_qp);
+    TensorView ref_out = make_q_nd(desc_shape(odesc), dt, want.data(), out_qp);
+
+    auto op = MatMul::create(attrs, Backend::CPU);
+    op->compute(output, ins, {}, nullptr);
+    nnops::backend::cpu::reference::matmul_int8_ref(attrs, ref_out, ins, {}, nullptr);
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        NNOPS_EXPECT_EQ(static_cast<long>(got[i]), static_cast<long>(want[i]));
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -221,7 +251,8 @@ NNOPS_TEST(matmul_int8_requant_clamp_s8) {
 
 namespace {
 
-// Random int8 tensors with per-token quant params over [lo, hi).
+// Random int8 tensors with per-token quant params over [lo, hi). `a`/`b` are
+// the 2-D views; the buffer behind them may hold more (see batch_a/batch_b).
 struct I8Inputs {
     std::vector<int8_t> a_buf, b_buf;
     std::vector<float> a_scale, b_scale;
@@ -229,7 +260,13 @@ struct I8Inputs {
     TensorView a, b;
 };
 
-I8Inputs make_i8_inputs(int64_t M, int64_t K, int64_t N, bool transpose_b, uint64_t seed) {
+/// Build the operands for one GEMM, or for `batch_a` × `batch_b` independent
+/// GEMMs stacked along a leading batch dim. The buffers are sized for the batch
+/// so an [B, M, K] / [B, K, N] view over them stays in bounds — a rank-3 view
+/// over a 2-D-sized buffer reads past the allocation. Weights and activations
+/// batch separately because the N-D cases broadcast one against the other.
+I8Inputs make_i8_inputs(int64_t M, int64_t K, int64_t N, bool transpose_b, uint64_t seed,
+                        int64_t batch_a = 1, int64_t batch_b = 1) {
     const int64_t b_rows = transpose_b ? N : K;
     const int64_t b_cols = transpose_b ? K : N;
 
@@ -245,8 +282,8 @@ I8Inputs make_i8_inputs(int64_t M, int64_t K, int64_t N, bool transpose_b, uint6
     };
 
     I8Inputs in;
-    in.a_buf.resize(static_cast<size_t>(M * K));
-    in.b_buf.resize(static_cast<size_t>(b_rows * b_cols));
+    in.a_buf.resize(static_cast<size_t>(batch_a * M * K));
+    in.b_buf.resize(static_cast<size_t>(batch_b * b_rows * b_cols));
     fill_i8(in.a_buf);
     fill_i8(in.b_buf);
 
@@ -363,14 +400,17 @@ NNOPS_TEST(matmul_int8_multik_s32) {
 
 NNOPS_TEST(matmul_int8_batched_s32) {
     const int64_t B = 3, M = 7, K = 13, N = 5;
-    // Batch 0..2 share the same per-token quant params; build three views.
-    I8Inputs in = make_i8_inputs(B * M, K, N, /*transpose_b=*/false, 31337);
+    // Per-token / per-channel params are batch-independent (indexed by m and n),
+    // so every batch element shares the same scales and zero points.
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 31337, /*batch_a=*/B, /*batch_b=*/B);
 
-    // A is [B, M, K], B is [B, K, N] — reuse the flat buffers.
+    // A is [B, M, K], B is [B, K, N].
     const int64_t ashape[] = {B, M, K};
     const int64_t bshape[] = {B, K, N};
-    TensorView a(ashape, DataType::s8, in.a_buf.data());
-    TensorView b(bshape, DataType::s8, in.b_buf.data());
+    TensorView a = make_q_nd(ashape, DataType::s8, in.a_buf.data(),
+                             per_token(in.a_scale.data(), in.a_zp.data(), M));
+    TensorView b = make_q_nd(bshape, DataType::s8, in.b_buf.data(),
+                             per_token(in.b_scale.data(), in.b_zp.data(), N));
 
     MatMulAttributes attrs{};
     attrs.output_dtype = DataType::s32;
@@ -395,6 +435,103 @@ NNOPS_TEST(matmul_int8_batched_s32) {
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_EQ(out_buf[i], ref_buf[i]);
     }
+}
+
+// ============================================================
+// transpose_a, batch broadcast, batched s8 and the batched N-split
+// ============================================================
+
+NNOPS_TEST(matmul_int8_transpose_a_s32) {
+    const int64_t M = 6, K = 15, N = 9;
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 777);
+
+    // The same bytes in.a reads as [M, K], read instead as [K, M] — A^T. The
+    // per-token params still index the output row m.
+    const int64_t ashape[] = {K, M};
+    TensorView a = make_q_nd(ashape, DataType::s8, in.a_buf.data(),
+                             per_token(in.a_scale.data(), in.a_zp.data(), M));
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = true;
+    attrs.output_dtype = DataType::s32;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), in.b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], M);
+    NNOPS_EXPECT_EQ(descs[0].dims[1], N);
+
+    const TensorView ins[] = {a, in.b};
+    expect_matches_ref<int32_t>(attrs, descs[0], ins);
+}
+
+NNOPS_TEST(matmul_int8_batched_broadcast_s32) {
+    const int64_t B = 3, M = 5, K = 11, N = 4;
+    // A batches over B; B stays 2-D and broadcasts against every batch element.
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 5150, /*batch_a=*/B);
+
+    const int64_t ashape[] = {B, M, K};
+    TensorView a = make_q_nd(ashape, DataType::s8, in.a_buf.data(),
+                             per_token(in.a_scale.data(), in.a_zp.data(), M));
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s32;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), in.b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(B));
+
+    const TensorView ins[] = {a, in.b};
+    expect_matches_ref<int32_t>(attrs, descs[0], ins);
+}
+
+NNOPS_TEST(matmul_int8_batched_s8) {
+    const int64_t B = 2, M = 9, K = 40, N = 6;
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 909, B, B);
+
+    const int64_t ashape[] = {B, M, K};
+    const int64_t bshape[] = {B, K, N};
+    TensorView a = make_q_nd(ashape, DataType::s8, in.a_buf.data(),
+                             per_token(in.a_scale.data(), in.a_zp.data(), M));
+    TensorView b = make_q_nd(bshape, DataType::s8, in.b_buf.data(),
+                             per_token(in.b_scale.data(), in.b_zp.data(), N));
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s8;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s8);
+    NNOPS_EXPECT_EQ(descs[0].rank, int64_t(3));
+
+    // The requantized path needs a per-tensor output scale / zero point.
+    const TensorView ins[] = {a, b};
+    expect_matches_ref<int8_t>(attrs, descs[0], ins, per_tensor(0.3f, 3));
+}
+
+NNOPS_TEST(matmul_int8_batched_nsplit_s32) {
+    // N > M selects the N-split (one n-block per task) rather than the M-split,
+    // and K = 1200 spans three k-blocks (KC_I8 = 512).
+    const int64_t B = 2, M = 6, K = 1200, N = 70;
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 616, B, B);
+
+    const int64_t ashape[] = {B, M, K};
+    const int64_t bshape[] = {B, K, N};
+    TensorView a = make_q_nd(ashape, DataType::s8, in.a_buf.data(),
+                             per_token(in.a_scale.data(), in.a_zp.data(), M));
+    TensorView b = make_q_nd(bshape, DataType::s8, in.b_buf.data(),
+                             per_token(in.b_scale.data(), in.b_zp.data(), N));
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s32;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dims[1], M);
+    NNOPS_EXPECT_EQ(descs[0].dims[2], N);
+
+    const TensorView ins[] = {a, b};
+    expect_matches_ref<int32_t>(attrs, descs[0], ins);
 }
 
 NNOPS_TEST(matmul_int8_packed_a_bad_remainder_s32) {
