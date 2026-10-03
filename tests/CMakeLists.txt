@@ -33,6 +33,7 @@ set(TEST_SOURCES
     test_rope.cpp
     test_simd_unary.cpp
     test_simd_eltwise.cpp
+    test_simd_add_fuse_norm.cpp
     test_flatten.cpp
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
