@@ -1456,6 +1456,84 @@ NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
     }
 }
 
+NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
+    // f16 complement of matmul_f32_nn_direct_tile_remainders: a compact
+    // non-transposed A stays on the unpacked-A (pack_a=0) route. f16 has no
+    // mr_f16_direct — the direct kernels read row-major A at the same height
+    // they pack — so the route decomposes M with MR_F16 = {8,4,1}, i.e. 8a+4b+1c,
+    // not the f32 direct {6,4,1}. Walk M across those boundaries, K across the
+    // 4-wide inner unroll and KC_F16 (=128), and N across the NR_F16 = {16,8,1}
+    // panel widths, checking each tile against the f32 reference.
+    const int64_t Ms[] = {1, 4, 5, 8, 9, 12, 13, 143, 144, 145};
+    const int64_t Ks[] = {1, 3, 4, 5, 128, 129};
+    const int64_t Ns[] = {1, 17, 25};  // 16+1 and 16+8+1
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            for (int64_t N : Ns) {
+                auto [a_f32, _] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 909);
+                auto [b_f32, __] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 1010);
+                auto a_f16 = test::f32_to_f16(a_f32);
+                auto b_f16 = test::f32_to_f16(b_f32);
+
+                const int64_t a_shape[] = {M, K};
+                const int64_t b_shape[] = {K, N};
+                TensorView a(a_shape, DataType::f16, a_f16.data());
+                TensorView b(b_shape, DataType::f16, b_f16.data());
+
+                MatMulAttributes attrs{};
+                auto op = MatMul::create(attrs, Backend::CPU);
+
+                // Pin the route. A compact non-transposed A has lda == K, so this
+                // stays direct only while K <= PACK_A_STRIDE_THRESHOLD; if that
+                // threshold is ever retuned below K the test would silently start
+                // covering the packed kernels instead.
+                const auto plan = nnops::backend::cpu::get_matmul_plan(
+                    attrs, a.desc(), b.desc(), 1);
+                if (plan.pack_a) {
+                    throw std::runtime_error(
+                        "matmul_f16_nn_direct_tile_remainders: expected pack_a=0 at M="
+                        + std::to_string(M) + " K=" + std::to_string(K));
+                }
+
+                const TensorDesc arr[] = {a.desc(), b.desc()};
+                auto descs = op->getOutputTensorDesc(arr);
+                NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+                std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
+                auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+                const TensorView ins[] = {a, b};
+                op->compute(output, ins, {}, nullptr);
+
+                // f32 reference computed from the f16 inputs (loose f16 tol).
+                const int64_t a32_shape[] = {M, K};
+                const int64_t b32_shape[] = {K, N};
+                TensorView a32(a32_shape, DataType::f32, a_f32.data());
+                TensorView b32(b32_shape, DataType::f32, b_f32.data());
+                const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
+                auto ref_descs = op->getOutputTensorDesc(ref_arr);
+                std::vector<float> ref_buf(ref_descs[0].numel());
+                auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+                const TensorView ref_ins[] = {a32, b32};
+                nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+                for (int64_t i = 0; i < descs[0].numel(); ++i) {
+                    const float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+                    const float r = ref_buf[static_cast<size_t>(i)];
+                    if (std::fabs(v - r) > kF16GemmTol) {
+                        throw std::runtime_error(
+                            "matmul_f16_nn_direct_tile_remainders: mismatch at M="
+                            + std::to_string(M) + " K=" + std::to_string(K)
+                            + " N=" + std::to_string(N) + " idx=" + std::to_string(i)
+                            + " got=" + std::to_string(v) + " want=" + std::to_string(r));
+                    }
+                }
+            }
+        }
+    }
+}
+
 NNOPS_TEST(matmul_mkn_transpose_a_multik) {
     // transpose_a → pack_a (NKM order, B always packed). Multi-k and multi-m
     // blocks exercise beta@k==0, Relu clamp, and the last-k epilogue.
