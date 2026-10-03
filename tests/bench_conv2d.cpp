@@ -328,6 +328,31 @@ NNOPS_BENCH(conv2d_f16_resnet_block_3x3) {
                        /*bias=*/false, /*f16=*/true});
 }
 
+NNOPS_BENCH(conv2d_f16_resnet_first_7x7) {
+    bench_conv2d_case({"f16 resnet-first 1x3x224x224 -> 64 x 7x7 s2 p3", 1, 3, 224, 224, 64, 7, 7,
+                       /*SH=*/2, /*SW=*/2, /*PH=*/3, /*PW=*/3, /*DH=*/1, /*DW=*/1, /*groups=*/1,
+                       /*bias=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(conv2d_f16_pointwise_1x1) {
+    bench_conv2d_case({"f16 pointwise 1x256x28x28 -> 512 x 1x1 s1", 1, 256, 28, 28, 512, 1, 1,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0, /*DH=*/1, /*DW=*/1, /*groups=*/1,
+                       /*bias=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(conv2d_f16_grouped_3x3) {
+    // groups == IC: the grouped im2col path.
+    bench_conv2d_case({"f16 depthwise 1x256x28x28 -> 256 x 3x3 g256 s1 p1", 1, 256, 28, 28, 256, 3, 3,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1, /*DH=*/1, /*DW=*/1, /*groups=*/256,
+                       /*bias=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(conv2d_f16_batch) {
+    bench_conv2d_case({"f16 batch 8x64x28x28 -> 128 x 3x3 s1 p1", 8, 64, 28, 28, 128, 3, 3,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1, /*DH=*/1, /*DW=*/1, /*groups=*/1,
+                       /*bias=*/false, /*f16=*/true});
+}
+
 // ============================================================
 // DepthwiseConv — dedicated NCHWC8 kernel
 // ============================================================

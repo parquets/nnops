@@ -20,10 +20,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace nnops;
 namespace cpu = nnops::backend::cpu;
+using cpu::half;
 
 namespace {
 
@@ -59,13 +61,25 @@ struct SimplePool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
+// Build a random tensor of type T (float -> f32, half -> f16).
+template <typename T>
+auto make_random(std::span<const int64_t> shape, uint64_t seed) {
+    if constexpr (std::is_same_v<T, float>) {
+        return test::make_random_tensor(shape, -1.0f, 1.0f, seed);
+    } else {
+        return test::make_random_f16_tensor(shape, -1.0f, 1.0f, seed);
+    }
+}
+
 struct AttentionCase {
     const char* name;
     int64_t B, S, H, D;     // merged [B, S, H*D], self-attention (Sq = S)
     int64_t Sk = 0;         // key seq len; 0 -> S
     bool mask = false;
+    bool f16 = false;
 };
 
+template <typename T>
 void run_attention(const AttentionCase& c, const std::vector<int>& threads, int iters) {
     const int64_t Sq = c.S;
     const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
@@ -76,15 +90,15 @@ void run_attention(const AttentionCase& c, const std::vector<int>& threads, int 
     const int64_t kshape[] = {c.B, Sk, H * D};
     const int64_t vshape[] = {c.B, Sk, H * D};
 
-    auto [q_vec, q] = test::make_random_tensor(qshape, -1.0f, 1.0f, 11);
-    auto [k_vec, k] = test::make_random_tensor(kshape, -1.0f, 1.0f, 12);
-    auto [v_vec, v] = test::make_random_tensor(vshape, -1.0f, 1.0f, 13);
+    auto [q_vec, q] = make_random<T>(qshape, 11);
+    auto [k_vec, k] = make_random<T>(kshape, 12);
+    auto [v_vec, v] = make_random<T>(vshape, 13);
 
-    std::vector<float> m_vec;
+    std::vector<T> m_vec;
     TensorView mask_view;
     if (c.mask) {
         const int64_t mshape[] = {Sq, Sk};
-        auto [mv, m] = test::make_random_tensor(mshape, -2.0f, 2.0f, 14);
+        auto [mv, m] = make_random<T>(mshape, 14);
         m_vec = std::move(mv);
         mask_view = m;
     }
@@ -107,13 +121,14 @@ void run_attention(const AttentionCase& c, const std::vector<int>& threads, int 
     // 2 matmuls per head: QK^T (Sq*Sk*D) + attn@V (Sq*D*Sk) = 2*Sq*Sk*D MACs.
     const double flops_per_iter = 4.0 * static_cast<double>(c.B) * H * Sq * Sk * D;
 
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
     auto output = test::make_planar(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
-    std::printf("    B=%lld H=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)%s\n",
+    std::printf("    B=%lld H=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s\n",
                 (long long)c.B, (long long)H, (long long)Sq, (long long)Sk,
-                (long long)D, (long long)(Sq * Sk), c.mask ? "  mask" : "");
+                (long long)D, (long long)(Sq * Sk),
+                c.f16 ? "f16" : "f32", c.mask ? "  mask" : "");
     if (plan.use_flash) {
         std::printf("    route=flash Br=%d Bc=%d  ws=%zuB\n",
                     plan.Br, plan.Bc, plan.workspace_size);
@@ -156,7 +171,8 @@ void bench_attention_case(const AttentionCase& c) {
     if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
         threads.push_back(hw);
     }
-    run_attention(c, threads, iters);
+    if (c.f16) { run_attention<half>(c, threads, iters); }
+    else       { run_attention<float>(c, threads, iters); }
 }
 
 }  // anonymous namespace
@@ -188,4 +204,33 @@ NNOPS_BENCH(attention_f32_flash_masked) {
     // Flash + additive mask.
     bench_attention_case({"attn f32 flash masked B2 S256 H8 D64", 2, 256, 8, 64,
                           /*Sk=*/0, /*mask=*/true});
+}
+
+// ============================================================
+// f16 (same shapes as the f32 sweep, for a direct comparison)
+// ============================================================
+
+NNOPS_BENCH(attention_f16_standard) {
+    bench_attention_case({"attn f16 standard B2 S128 H8 D64", 2, 128, 8, 64,
+                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(attention_f16_standard_wide) {
+    bench_attention_case({"attn f16 standard-wide B1 S128 H8 D128", 1, 128, 8, 128,
+                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(attention_f16_flash) {
+    bench_attention_case({"attn f16 flash B1 S512 H8 D64", 1, 512, 8, 64,
+                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(attention_f16_flash_128) {
+    bench_attention_case({"attn f16 flash D128 B1 S512 H16 D128", 1, 512, 16, 128,
+                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(attention_f16_flash_masked) {
+    bench_attention_case({"attn f16 flash masked B2 S256 H8 D64", 2, 256, 8, 64,
+                          /*Sk=*/0, /*mask=*/true, /*f16=*/true});
 }
