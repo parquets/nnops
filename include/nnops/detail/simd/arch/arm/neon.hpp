@@ -89,15 +89,13 @@ inline v_f32x4 v_mul(const v_f32x4& a, const v_f32x4& b) {
     return v_f32x4(vmulq_f32(a.val, b.val));
 }
 
-// Division: NEON doesn't have native float v_div, use reciprocal + NR step.
-// For simplicity use vrecpe + vrecps (Newton-Raphson) or just the scalar fallback.
-// Actually, GCC/Clang provide __builtin_vdivq_f32 (compiler synthesizes).
+// Division: AArch64 has a correctly-rounded vector FDIV (mandatory in
+// ARMv8-A), which matches x86 _mm_div_ps / scalar `a / b` bit-for-bit,
+// including x/0 -> ±inf and 0/0 -> NaN. Do NOT emulate this with
+// vrecpeq_f32 + Newton-Raphson: that path is slower, not exact, and turns
+// a/0 into NaN.
 inline v_f32x4 v_div(const v_f32x4& a, const v_f32x4& b) {
-    // Use reciprocal approximation with Newton-Raphson refinement
-    float32x4_t recip = vrecpeq_f32(b.val);          // initial estimate ~1/b
-    recip = vmulq_f32(vrecpsq_f32(b.val, recip), recip);  // Newton-Raphson step
-    recip = vmulq_f32(vrecpsq_f32(b.val, recip), recip);  // second NR step for full precision
-    return v_f32x4(vmulq_f32(a.val, recip));
+    return v_f32x4(vdivq_f32(a.val, b.val));
 }
 
 inline v_f32x4 v_fmadd(const v_f32x4& a, const v_f32x4& b, const v_f32x4& c) {
@@ -143,19 +141,20 @@ inline v_f32x4 v_or(const v_f32x4& a, const v_f32x4& b) {
         vorrq_u32(vreinterpretq_u32_f32(a.val), vreinterpretq_u32_f32(b.val))));
 }
 
+// Square root: AArch64 has a correctly-rounded vector FSQRT (mandatory in
+// ARMv8-A), matching x86 _mm_sqrt_ps / std::sqrt. The old vrsqrteq_f32 +
+// 2x Newton-Raphson emulation is slower, not exact, and returns NaN for
+// sqrt(0) (0 * inf), which diverges from every other backend.
 inline v_f32x4 v_sqrt(const v_f32x4& a) {
-    // NEON: vsqrt is not always available. Use vrsqrte + NR + v_mul for portability.
-    float32x4_t est = vrsqrteq_f32(a.val);          // 1/v_sqrt(a) estimate
-    est = vmulq_f32(vrsqrtsq_f32(a.val, vmulq_f32(est, est)), est);  // NR step
-    est = vmulq_f32(vrsqrtsq_f32(a.val, vmulq_f32(est, est)), est);  // second NR
-    return v_f32x4(vmulq_f32(a.val, est));          // a * 1/v_sqrt(a) = v_sqrt(a)
+    return v_f32x4(vsqrtq_f32(a.val));
 }
 
-// Reciprocal with Newton-Raphson refinement
+// Reciprocal. Computed exactly as 1/a so the result matches the scalar
+// reference (scalar.hpp, arch::scalar::v_rcp) bit-for-bit, including
+// rcp(±0) -> ±inf. x86 keeps its 12-bit _mm_rcp_ps estimate, so NEON is
+// strictly more accurate here — not a divergence in the wrong direction.
 inline v_f32x4 v_rcp(const v_f32x4& a) {
-    float32x4_t est = vrecpeq_f32(a.val);
-    est = vmulq_f32(vrecpsq_f32(a.val, est), est);
-    return v_f32x4(vmulq_f32(vrecpsq_f32(a.val, est), est));
+    return v_f32x4(vdivq_f32(vdupq_n_f32(1.0f), a.val));
 }
 
 // Transcendental math functions (delegated to neon_mathfunc.hpp)
