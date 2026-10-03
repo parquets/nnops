@@ -446,15 +446,16 @@ void matmul_block_int8(const MatMulAttributes& attrs,
     }
 }
 
-/// Plan-driven-free int8 dispatch: per-token A × per-channel W, raw int32
-/// accumulate, then a single epilogue pass that applies zero-point compensation
-/// (and, for an s8 output, requantization). Packed B lives in the workspace;
-/// for an s8 output the workspace also carries the int32 accumulator.
+/// Plan-driven int8 dispatch: per-token A × per-channel W, raw int32 accumulate,
+/// then a single epilogue pass that applies zero-point compensation (and, for an
+/// s8 output, requantization). Packed B lives in the plan's workspace; for an s8
+/// output the int32 accumulator sits after it (sized by matmul_kernel — it is a
+/// property of the output, not of the packed-B layout).
 void matmul_dispatch_int8(const MatMulAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
-                          int kc, void* workspace)
+                          const MatMulPlan& plan, void* workspace)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -476,19 +477,19 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     // int32 accumulator: the output itself for s32, a compact M×N temp for s8.
     const int ldc = out_s8 ? static_cast<int>(N) : ldc_out;
 
-    // Resolve tile sizes once (M/N/K shared across batch elements).
-    int mc, nc;
-    resolve_tile_sizes(static_cast<int>(M), static_cast<int>(N),
-                       MR_MAX_I8, NR_MAX_I8, kc, 1, mc, nc);
+    // Tiles come from the plan (M/N/K are shared across batch elements). Its
+    // ldd_b is the full-Kc stride used for *sizing*; each k-block below packs at
+    // its own actual_kc stride, which is <= that.
+    const int kc = static_cast<int>(plan.kc);
+    const int mc = static_cast<int>(plan.mc);
+    const int nc = static_cast<int>(plan.nc);
 
     // Workspace: packed-B panels at the base, then the s8 accumulator.
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kc);
     const int np_full = num_panels4(nc, NR_I8);
     int8_t* pack_b_base = static_cast<int8_t*>(workspace);
     int32_t* accum = nullptr;
     if (out_s8) {
-        accum = reinterpret_cast<int32_t*>(
-            pack_b_base + static_cast<size_t>(num_panels4(static_cast<int>(N), NR_I8)) * static_cast<size_t>(ldd_b_full));
+        accum = reinterpret_cast<int32_t*>(pack_b_base + static_cast<size_t>(plan.workspace_size));
     }
 
     // Compile-time u8 offset baked into the A pack on the x86 VNNI path.
@@ -587,13 +588,16 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
         compute_int8_reductions(a_p, lda, b_p, ldb, attrs, M, N, K,
                                 r_a.data(), r_b.data());
 
-        if (N > M) {
+        if (plan.split_n) {
             // N-split: one n-block per parallel task (N is the larger dim).
             const int64_t num_blocks = (Ni + nc - 1) / nc;
             auto run_block = [&](int64_t blk) {
                 const int n = static_cast<int>(blk) * nc;
                 const int actual_nc = std::min(nc, Ni - n);
-                int8_t* pack_b_slice = pack_b_base + blk * np_full * ldd_b_full;
+                // Slices are laid out at the plan's sizing stride (full Kc, or K
+                // when K < Kc), which is >= the per-k-block stride the block
+                // below packs at — that is what makes the offset an upper bound.
+                int8_t* pack_b_slice = pack_b_base + blk * np_full * plan.ldd_b;
                 matmul_block_int8(attrs, c_p, ldc, a_p, lda, b_p, ldb,
                                   Mi, Ki, kc, mc, n, actual_nc, pack_b_slice);
             };
@@ -701,14 +705,24 @@ void matmul_kernel(const MatMulAttributes& attrs,
                                 ctx.cpu.thread_slot_count() > 0);
 
     // int8 (s8×s8): fused tiled kernel for s32 / s8 outputs. The tiled path
-    // always packs B into pooled scratch (getWorkspaceSize returns 0).
+    // always packs B into pooled scratch; an s8 output additionally needs an
+    // int32 M×N accumulator, which is a property of the output rather than of
+    // the packed-B layout, so it is sized here from the output's last two dims
+    // (the output shape is [..., M, N]) and appended after the plan's scratch.
     if (dt_a == DataType::s8 && dt_b == DataType::s8) {
         const bool out_ok = (output.data_type() == DataType::s32) ||
                             (output.data_type() == DataType::s8);
         if (out_ok) {
-            const size_t ws = matmul_get_workspace_size(attrs_n, a.desc(), b.desc(), output.desc());
+            NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
+            size_t ws = static_cast<size_t>(plan.workspace_size);
+            if (output.data_type() == DataType::s8) {
+                const auto od = output.desc();
+                ws += static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 2)])
+                    * static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 1)])
+                    * sizeof(int32_t);
+            }
             PoolPtr scratch(ws);
-            matmul_dispatch_int8(attrs_n, output, inputs, ctx, KC_I8, scratch.get());
+            matmul_dispatch_int8(attrs_n, output, inputs, ctx, plan, scratch.get());
         } else {
             reference::matmul_int8_ref(attrs_n, output, inputs, ctx, nullptr);
         }

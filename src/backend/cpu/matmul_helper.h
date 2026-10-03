@@ -286,15 +286,6 @@ constexpr int pack_a_stack_elems() {
 constexpr int LDD_A_I8 = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * KC_I8);
 constexpr int PACK_A_STACK_I8 = num_panels_max(MC_TARGET, MR_I8) * LDD_A_I8;
 
-/// Compute the workspace size (bytes) for the int8 (s8×s8) path: packed-B
-/// panels plus, for an s8 output, the int32 accumulator. The fp path sizes its
-/// own workspace via get_matmul_plan(); this returns 0 for non-int8 dtypes.
-size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
-                                 const TensorDesc& a_desc,
-                                 const TensorDesc& b_desc,
-                                 const TensorDesc& c_desc);
-
-
 // ---- public API --------------------------------------------------------
 //
 // Pack entry points: panels are laid out at a uniform 64-byte-aligned stride
@@ -357,13 +348,18 @@ void xor0x80_i8(int8_t* p, int nbytes);
 struct MatMulPlan {
     int64_t mc, nc, kc;       // tile sizes
     int64_t ldd_b;            // packed-B panel stride (elements) at full Kc
-    bool    pack_a;           // A is packed (transpose_a or wide row stride)
+    bool    pack_a;           // A is packed (transpose_a, wide row stride, or int8)
     bool    split_n;          // split on N (else on M)
     int64_t num_slots;        // packed-B slices allocated (<= num_blocks)
     int64_t workspace_size;   // scratch bytes for packed B
 };
 
 /// Resolve the tile sizes, the split direction and the packed-B scratch layout.
+///
+/// Covers f32, f16 and s8×s8. Only `kc`, the panel lists and `num_slots` differ
+/// per dtype; the thread-aware mc/nc shrink is shared, which is what makes the
+/// block count (and so the parallelism) grow with the pool. Returns an all-zero
+/// plan for any other dtype — every field must be checked before use.
 ///
 /// @p use_thread_slots mirrors the conv2d/attention plans: when the backend
 /// reports worker ids, the scratch is one slot per worker thread (indexed by

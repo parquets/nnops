@@ -13,35 +13,6 @@ using namespace nnops::backend::cpu::aarch64;
 
 namespace nnops::backend::cpu {
 
-// =========================================================================
-//  Workspace sizing — int8 path only (fp sizing lives in get_matmul_plan)
-// =========================================================================
-
-size_t matmul_get_workspace_size(const MatMulAttributes& attrs,
-                                 const TensorDesc& a_desc,
-                                 const TensorDesc& b_desc,
-                                 const TensorDesc& c_desc)
-{
-    // int8 (s8×s8): the tiled path always packs B, and an s8 output also needs
-    // an int32 accumulator. Both live in the workspace. (The fp path computes
-    // its own workspace through get_matmul_plan(), so this is never called for
-    // f32/f16 and returns 0 there.)
-    if (a_desc.dtype == DataType::s8 && b_desc.dtype == DataType::s8) {
-        const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_desc.rank - 1)]
-                                            : a_desc.dims[static_cast<size_t>(a_desc.rank - 2)];
-        const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_desc.rank - 2)]
-                                            : b_desc.dims[static_cast<size_t>(b_desc.rank - 1)];
-        const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * KC_I8);
-        size_t total = static_cast<size_t>(num_panels4(static_cast<int>(N), NR_I8))
-                     * static_cast<size_t>(ldd_b);
-        if (c_desc.dtype == DataType::s8) {
-            total += static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
-        }
-        return total;
-    }
-    return 0;
-}
-
 // ---- pack function pointer types ---------------------------------------
 
 using PackF32Fn = void (*)(float* NNOPS_RESTRICT output,
@@ -705,8 +676,9 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
     const bool is_f32 = (dt_a == DataType::f32);
     const bool is_f16 = (dt_a == DataType::f16);
-    if (!is_f32 && !is_f16) {
-        return plan;  // int8 / other dtypes are dispatched elsewhere
+    const bool is_i8  = (dt_a == DataType::s8);
+    if (!is_f32 && !is_f16 && !is_i8) {
+        return plan;  // other dtypes are dispatched by the reference path
     }
     num_threads = std::max(num_threads, 1);
 
@@ -723,24 +695,32 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
 
     // A is packed for correctness (transpose_a) or a page-scattered row stride.
+    // int8 has no direct-A route at all — tile_pack_lhs_i8 is unconditional.
     int64_t lda = a_desc.row_stride_elems;
     if (lda == 0) { lda = attrs.transpose_a ? M : K; }
-    plan.pack_a = attrs.transpose_a || (lda > PACK_A_STRIDE_THRESHOLD);
+    plan.pack_a = is_i8 || attrs.transpose_a || (lda > PACK_A_STRIDE_THRESHOLD);
 
     // Split on the larger dimension (the dispatch's N > M rule).
     plan.split_n = (N > M);
     const bool split_m = !plan.split_n;
 
-    plan.kc = std::min<int64_t>(is_f32 ? KC_F32 : KC_F16, K);
+    plan.kc = std::min<int64_t>(is_i8 ? KC_I8 : (is_f32 ? KC_F32 : KC_F16), K);
 
     // The M panel height the route will actually run — the nc heuristic below
     // charges the L2 working set for it, so a pack_a=0 GEMM must be sized with
     // the direct height, not the packed one.
-    const int  mr_panel = is_f32 ? mr_max_flt<float>(plan.pack_a)
-                                 : mr_max_flt<half>(plan.pack_a);
-    const int  nr_max = is_f32 ? nr_max_flt<float>() : nr_max_flt<half>();
-    const int* nr     = is_f32 ? NR_F32 : NR_F16;
-    const int  elem   = is_f32 ? static_cast<int>(sizeof(float)) : static_cast<int>(sizeof(half));
+    const int  mr_panel = is_i8 ? MR_MAX_I8
+                     : (is_f32 ? mr_max_flt<float>(plan.pack_a) : mr_max_flt<half>(plan.pack_a));
+    const int  nr_max = is_i8 ? NR_MAX_I8 : (is_f32 ? nr_max_flt<float>() : nr_max_flt<half>());
+    const int* nr     = is_i8 ? NR_I8 : (is_f32 ? NR_F32 : NR_F16);
+    const int  elem   = is_i8 ? 1
+                     : (is_f32 ? static_cast<int>(sizeof(float)) : static_cast<int>(sizeof(half)));
+
+    // Panel count of an n-run for this dtype's NR list: three levels for fp,
+    // four for int8 ({16,8,4,1} / {12,8,4,1}).
+    auto panel_count = [&](int n) {
+        return is_i8 ? num_panels4(n, nr) : num_panels(n, nr);
+    };
 
     plan.mc = (split_m && num_threads > 1) ? (M / num_threads) : MC_TARGET;
     plan.mc = std::max<int64_t>(std::min<int64_t>(plan.mc, MC_TARGET), 1);
@@ -774,13 +754,21 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     //            scratch goes one slot per worker thread instead: a thread
     //            packs one slice at a time, so num_threads slots serve
     //            num_m_blocks blocks (see MatMulPlan::num_slots).
-    const int64_t slice_bytes = static_cast<int64_t>(num_panels(static_cast<int>(N), nr))
+    //
+    // int8 is the exception on the M-split: its dispatch hoists the B pack out
+    // of the parallel region (one pack per k-block, then M is partitioned), so
+    // every m-block reads the same slice and one slot serves all of them.
+    const int64_t slice_bytes = static_cast<int64_t>(panel_count(static_cast<int>(N)))
                               * static_cast<int64_t>(ldd_b) * elem;
 
     if (split_m) {
-        const int64_t num_m_blocks = split_block_count(M, plan.mc);
-        const int64_t nt = std::max<int64_t>(num_threads, 1);
-        plan.num_slots = (use_thread_slots && nt < num_m_blocks) ? nt : num_m_blocks;
+        if (is_i8) {
+            plan.num_slots = 1;
+        } else {
+            const int64_t num_m_blocks = split_block_count(M, plan.mc);
+            const int64_t nt = std::max<int64_t>(num_threads, 1);
+            plan.num_slots = (use_thread_slots && nt < num_m_blocks) ? nt : num_m_blocks;
+        }
         plan.workspace_size = plan.num_slots * slice_bytes;
     } else {
         plan.num_slots = (N + plan.nc - 1) / plan.nc;

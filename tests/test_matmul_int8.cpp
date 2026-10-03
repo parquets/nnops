@@ -6,11 +6,15 @@
 /// compensation and requantization formulas.
 
 #include "nnops/ops/matmul.hpp"
+#include "backend/cpu/matmul_helper.h"   // get_matmul_plan — the int8 path is plan-driven
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace nnops;
@@ -430,4 +434,161 @@ NNOPS_TEST(matmul_int8_packed_a_bad_remainder_s32) {
             NNOPS_EXPECT_EQ(out_buf[i], ref_buf[i]);
         }
     }
+}
+
+// ============================================================
+// Plan — int8 shares the fp plan, so the tiles shrink with the pool
+// ============================================================
+
+namespace {
+
+// The plan for an s8×s8 GEMM of the given shape at `nt` worker threads.
+nnops::backend::cpu::MatMulPlan i8_plan(int64_t M, int64_t K, int64_t N, int nt) {
+    std::vector<int8_t> ab(static_cast<size_t>(M * K), 1);
+    std::vector<int8_t> bb(static_cast<size_t>(K * N), 2);
+    const int64_t as[] = {M, K};
+    const int64_t bs[] = {K, N};
+    TensorView a(as, DataType::s8, ab.data());
+    TensorView b(bs, DataType::s8, bb.data());
+    MatMulAttributes attrs{};
+    return nnops::backend::cpu::get_matmul_plan(attrs, a.desc(), b.desc(), nt);
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
+    namespace cpu = nnops::backend::cpu;
+
+    // int8 used to resolve its own tiles with no thread awareness (mc was always
+    // min(MC_TARGET, M)), so a small M produced two blocks however big the pool
+    // was. It now goes through get_matmul_plan, whose thread-aware mc/nc shrink
+    // is what makes the block count grow with the pool.
+    const auto p1  = i8_plan(256, 256, 256, 1);
+    const auto p10 = i8_plan(256, 256, 256, 10);
+    NNOPS_EXPECT_TRUE(!p10.split_n);                     // M >= N → split on M
+    NNOPS_EXPECT_EQ(p1.mc, cpu::MC_TARGET);              // 256 > MC_TARGET → clamped
+    NNOPS_EXPECT_EQ(cpu::split_block_count(256, p1.mc), int64_t{2});
+    NNOPS_EXPECT_EQ(p10.mc, int64_t{25});                // 256 / 10
+    NNOPS_EXPECT_EQ(cpu::split_block_count(256, p10.mc), int64_t{11});
+
+    // The shape the int8 scaling was measured on: at one thread mc is already
+    // MC_TARGET, so the pool is what moves the block count.
+    const auto b1  = i8_plan(1024, 512, 1024, 1);
+    const auto b10 = i8_plan(1024, 512, 1024, 10);
+    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b1.mc), int64_t{8});
+    NNOPS_EXPECT_EQ(b10.mc, int64_t{102});
+    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b10.mc), int64_t{11});
+
+    // int8 has no direct-A route, so A is packed however narrow its row stride.
+    NNOPS_EXPECT_TRUE(b10.pack_a);
+
+    // M-split: the B pack is hoisted out of the parallel region, so one slice
+    // serves every m-block and the workspace is one full-N slice either way.
+    const int64_t ldd_b = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * 512);
+    const int64_t one_slice = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b;
+    NNOPS_EXPECT_EQ(b10.kc, int64_t{512});               // min(KC_I8, K)
+    NNOPS_EXPECT_EQ(b10.ldd_b, ldd_b);
+    NNOPS_EXPECT_EQ(b1.num_slots, int64_t{1});
+    NNOPS_EXPECT_EQ(b10.num_slots, int64_t{1});
+    NNOPS_EXPECT_EQ(b1.workspace_size, one_slice);
+    NNOPS_EXPECT_EQ(b10.workspace_size, one_slice);
+
+    // N-split (N > M): the n-blocks tile one full-N slice, so the workspace is
+    // that slice however many blocks there are.
+    const auto n10 = i8_plan(64, 512, 1024, 10);
+    NNOPS_EXPECT_TRUE(n10.split_n);
+    NNOPS_EXPECT_EQ(n10.nc % cpu::NR_MAX_I8, int64_t{0});
+    NNOPS_EXPECT_EQ(n10.num_slots, (int64_t{1024} + n10.nc - 1) / n10.nc);
+    NNOPS_EXPECT_EQ(n10.workspace_size, one_slice);
+}
+
+// ============================================================
+// Threaded correctness — the block decomposition moves with the pool
+// ============================================================
+
+namespace {
+
+// Minimal fixed-size thread pool exposing a CpuBackend (as in test_matmul.cpp):
+// items in [begin, end) are claimed via an atomic counter, each worker runs
+// body(i) until the range is exhausted.
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
+/// Run one s8×s8 GEMM through the public op with `nt` workers and require exact
+/// agreement with matmul_int8_ref — the int8 path is integer, so agreement is
+/// element-exact, not approximate.
+template <typename T>
+void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uint64_t seed) {
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, seed);
+
+    constexpr DataType odt = std::is_same_v<T, int32_t> ? DataType::s32 : DataType::s8;
+    MatMulAttributes attrs{};
+    attrs.output_dtype = odt;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {in.a.desc(), in.b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    const QuantParams oq = std::is_same_v<T, int32_t> ? QuantParams{} : per_tensor(0.25f, -7);
+    std::vector<T> got(static_cast<size_t>(descs[0].numel()));
+    std::vector<T> want(got.size());
+    TensorView output  = make_q(descs[0].dims[0], descs[0].dims[1], odt, got.data(), oq);
+    TensorView ref_out = make_q(descs[0].dims[0], descs[0].dims[1], odt, want.data(), oq);
+
+    SimplePool pool(nt);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+
+    const TensorView ins[] = {in.a, in.b};
+    op->compute(output, ins, ctx, nullptr);
+    nnops::backend::cpu::reference::matmul_int8_ref(attrs, ref_out, ins, {}, nullptr);
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        NNOPS_EXPECT_EQ(static_cast<int>(got[i]), static_cast<int>(want[i]));
+    }
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(matmul_int8_threaded_matches_ref) {
+    // With a pool the plan shrinks mc (M-split, once M/nt drops below
+    // MC_TARGET) and nc (N-split), so the decomposition differs per thread
+    // count. Both int8 splits, plus the s8 accumulator and requant epilogue,
+    // must still match the reference element for element.
+    for (int nt : {2, 4, 8}) {
+        expect_i8_threaded_matches_ref<int32_t>(512, 512, 128, nt, 11);   // M-split
+        expect_i8_threaded_matches_ref<int32_t>(128, 512, 512, nt, 12);   // N-split
+        expect_i8_threaded_matches_ref<int32_t>(256, 256, 256, nt, 13);   // mc < MC_TARGET
+        expect_i8_threaded_matches_ref<int32_t>(1024, 512, 1024, nt, 14); // the measured shape
+    }
+    expect_i8_threaded_matches_ref<int8_t>(512, 512, 128, 4, 15);
+    expect_i8_threaded_matches_ref<int8_t>(128, 512, 512, 4, 16);
 }

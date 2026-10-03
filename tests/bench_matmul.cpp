@@ -239,14 +239,13 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // int8 tiling: elements are 1 byte; panel sizes come from the int8 lists.
-    int mc, nc;
-    cpu::resolve_tile_sizes(static_cast<int>(c.M), static_cast<int>(c.N),
-                            cpu::MR_MAX_I8, cpu::NR_MAX_I8, cpu::KC_I8, 1, mc, nc);
-    const bool split_n = (c.N > c.M);
-    const int64_t num_blocks = split_n
-        ? (c.N + nc - 1) / nc
-        : cpu::split_block_count(c.M, mc);
+    // Static metadata from the plan, exactly as matmul_kernel builds it. The
+    // int8 path is plan-driven like fp, so mc/nc/blocks are what the kernel
+    // actually runs — resolvable only for a given pool size. Report the largest
+    // pool in the row: those numbers describe the (fastest) run printed last,
+    // whereas the 1-thread plan would describe no run at all.
+    const int meta_threads = *std::max_element(threads.begin(), threads.end());
+    const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, meta_threads);
 
     std::vector<int32_t> out_buf(static_cast<size_t>(descs[0].numel()));
     auto output = test::make_planar(descs[0], out_buf.data());
@@ -254,13 +253,15 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = split_n ? "int8-NKM" : "int8-MKN";
+    rep.route = plan.split_n ? "int8-NKM" : "int8-MKN";
     rep.unit = "GOPS";
-    rep.pack_a = true;   // int8 always packs both A and B
+    rep.pack_a = plan.pack_a;   // int8 always packs both A and B
     rep.pack_b = true;
-    rep.mc = mc;
-    rep.nc = nc;
-    rep.num_blocks = num_blocks;
+    rep.mc = static_cast<int>(plan.mc);
+    rep.nc = static_cast<int>(plan.nc);
+    rep.num_blocks = plan.split_n
+        ? (c.N + plan.nc - 1) / plan.nc
+        : cpu::split_block_count(c.M, plan.mc);
     rep.threads = threads;
 
     for (int nt : threads) {
