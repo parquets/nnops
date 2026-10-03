@@ -1588,6 +1588,75 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
     }
 }
 
+NNOPS_TEST(matmul_threaded_multi_block_slots) {
+    // M-split with far more m-blocks than workers. The packed-B scratch is one
+    // slot per worker thread, so a thread reuses its slot across every block it
+    // claims rather than owning one slice per block. The case above uses
+    // M=200/N=300, where the split collapses to a single block, so this is the
+    // one that actually exercises slot reuse. The result must stay bit-identical
+    // to serial: blocks write disjoint C tiles and no reduction is reordered.
+    // Each entry is one (shape, pool) pair. The M=1024 shape gives 8 blocks
+    // (mc clamps to M/nt = 128 at 8 workers), so 8 threads is NOT slot mode
+    // there; M=2048 gives 15 blocks against 8 slots, which is the ratio the
+    // change is actually for. Only configs that really shrink are listed.
+    struct Case { const char* name; int64_t M, K, N; bool ta; int nthreads; };
+    const Case cases[] = {
+        {"nn",      1024, 128, 512, false, 2},
+        {"nn",      1024, 128, 512, false, 4},
+        {"ta",      1024, 128, 512, true,  2},
+        {"ta",      1024, 128, 512, true,  4},
+        {"nn-big",  2048, 512, 256, false, 2},
+        {"nn-big",  2048, 512, 256, false, 4},
+        {"nn-big",  2048, 512, 256, false, 8},
+    };
+
+    for (const Case& c : cases) {
+        MatmulInputs in = make_matmul_inputs(c.M, c.K, c.N, c.ta, /*tb=*/false,
+                                             /*pad_b=*/false, 77);
+
+        MatMulAttributes attrs{};
+        attrs.transpose_a = c.ta;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {in.a.desc(), in.b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        const TensorView ins[] = {in.a, in.b};
+
+        // Guard against the test going vacuous: the plan must really be in
+        // slot mode (fewer slots than blocks) for this shape and pool.
+        const auto plan = nnops::backend::cpu::get_matmul_plan(
+            attrs, in.a.desc(), in.b.desc(), c.nthreads, /*use_thread_slots=*/true);
+        const int64_t num_blocks =
+            nnops::backend::cpu::split_block_count(c.M, plan.mc);
+        if (!(plan.num_slots < num_blocks)) {
+            throw std::runtime_error(
+                std::string("matmul_threaded_multi_block_slots: expected slot mode (") +
+                c.name + ", " + std::to_string(c.nthreads) + "t), got num_slots=" +
+                std::to_string(plan.num_slots) + " blocks=" + std::to_string(num_blocks));
+        }
+
+        std::vector<float> serial_buf(descs[0].numel());
+        auto serial_out = test::make_planar(descs[0], serial_buf.data());
+        op->compute(serial_out, ins, {}, nullptr);
+
+        SimplePool pool(c.nthreads);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        std::vector<float> threaded_buf(descs[0].numel());
+        auto threaded_out = test::make_planar(descs[0], threaded_buf.data());
+        op->compute(threaded_out, ins, ctx, nullptr);
+
+        for (int64_t i = 0; i < descs[0].numel(); ++i) {
+            if (serial_buf[static_cast<size_t>(i)] != threaded_buf[static_cast<size_t>(i)]) {
+                throw std::runtime_error(
+                    std::string("matmul_threaded_multi_block_slots: bit mismatch at ") +
+                    std::to_string(i) + " (case " + c.name + ", " +
+                    std::to_string(c.nthreads) + " threads)");
+            }
+        }
+    }
+}
+
 NNOPS_TEST(matmul_threaded_batched) {
     // Batched matmul with the threading pool: each batch element parallelizes
     // independently; the result must still match the reference.

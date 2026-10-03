@@ -309,6 +309,14 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
         const int np_full_b = num_panels(split_n ? nc : Ni,
                                          std::is_same_v<T, float> ? NR_F32 : NR_F16);
 
+        // Scratch slots: the plan allocates one packed-B slice per worker thread
+        // when the backend reports ids and that is fewer than the block count
+        // (M-split only — N-split's blocks tile a single full-N slice), else one
+        // per block. A thread packs one slice at a time and blocks are
+        // independent, so reusing a slot across every block a thread claims is
+        // safe and the result is unchanged.
+        const bool per_thread = plan.num_slots < num_blocks;
+
         ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
             int m_start, m_count, n_start, n_count;
             if (split_n) {
@@ -322,7 +330,10 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                 n_start = 0;
                 n_count = Ni;
             }
-            T* pack_b_slice = static_cast<T*>(workspace) + blk * np_full_b * ldd_b_full;
+            const int64_t slot = per_thread
+                ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+                : blk;
+            T* pack_b_slice = static_cast<T*>(workspace) + slot * np_full_b * ldd_b_full;
             matmul_block_fused<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
                                   Ki, kc, mc, m_start, m_count, n_start, n_count,
                                   pack_a, pack_b_slice);
@@ -681,7 +692,10 @@ void matmul_kernel(const MatMulAttributes& attrs,
     default: break;
     }
 
-    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count());
+    // Worker ids available → the packed-B scratch is one slot per worker thread
+    // instead of one per m-block (see MatMulPlan::num_slots).
+    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count(),
+                                ctx.cpu.thread_slot_count() > 0);
 
     // int8 (s8×s8): fused tiled kernel for s32 / s8 outputs. The tiled path
     // always packs B into pooled scratch (getWorkspaceSize returns 0).

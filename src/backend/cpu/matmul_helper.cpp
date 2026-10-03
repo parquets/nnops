@@ -693,7 +693,8 @@ void tile_scale(half* c, int ldc, float scale, int M, int N) {
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,
-                          int num_threads) {
+                          int num_threads,
+                          bool use_thread_slots) {
     MatMulPlan plan;
 
     const auto dt_a = a_desc.dtype;
@@ -760,16 +761,30 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(plan.kc) * elem) / elem;
     plan.ldd_b = ldd_b;
 
-    // One full-N packed-B slice (bytes). N-split tiles this once across the
-    // n-blocks (thread-count invariant); M-split (MKN) gives every m-block its
-    // own slice, so the workspace is num_m_blocks × this.
-    const size_t packed_b_bytes = static_cast<size_t>(num_panels(static_cast<int>(N), nr))
-                                * static_cast<size_t>(ldd_b) * static_cast<size_t>(elem);
+    // Packed-B scratch. One full-N slice is `slice_bytes`; how many the
+    // workspace holds, and what indexes them, depends on the split:
+    //
+    //   N-split  the n-blocks TILE one full-N slice, so the buffer already
+    //            holds exactly one slice per block with nothing duplicated.
+    //            Nothing to share — num_slots stays num_blocks and the
+    //            dispatch indexes by block, as before.
+    //   M-split  every m-block gets its OWN full-N slice, because the blocks
+    //            run concurrently and each packs its B per k-block. That is
+    //            the duplication. When the backend reports worker ids the
+    //            scratch goes one slot per worker thread instead: a thread
+    //            packs one slice at a time, so num_threads slots serve
+    //            num_m_blocks blocks (see MatMulPlan::num_slots).
+    const int64_t slice_bytes = static_cast<int64_t>(num_panels(static_cast<int>(N), nr))
+                              * static_cast<int64_t>(ldd_b) * elem;
+
     if (split_m) {
         const int64_t num_m_blocks = split_block_count(M, plan.mc);
-        plan.workspace_size = num_m_blocks * static_cast<int64_t>(packed_b_bytes);
+        const int64_t nt = std::max<int64_t>(num_threads, 1);
+        plan.num_slots = (use_thread_slots && nt < num_m_blocks) ? nt : num_m_blocks;
+        plan.workspace_size = plan.num_slots * slice_bytes;
     } else {
-        plan.workspace_size = static_cast<int64_t>(packed_b_bytes);
+        plan.num_slots = (N + plan.nc - 1) / plan.nc;
+        plan.workspace_size = slice_bytes;
     }
 
     return plan;

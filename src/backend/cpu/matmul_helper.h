@@ -333,13 +333,23 @@ struct MatMulPlan {
     int64_t ldd_b;            // packed-B panel stride (elements) at full Kc
     bool    pack_a;           // A is packed (transpose_a or wide row stride)
     bool    split_n;          // split on N (else on M)
+    int64_t num_slots;        // packed-B slices allocated (<= num_blocks)
     int64_t workspace_size;   // scratch bytes for packed B
 };
 
+/// Resolve the tile sizes, the split direction and the packed-B scratch layout.
+///
+/// @p use_thread_slots mirrors the conv2d/attention plans: when the backend
+/// reports worker ids, the scratch is one slot per worker thread (indexed by
+/// current_thread_id() and reused across every block a thread claims) rather
+/// than one slot per parallel block. Blocks are only ever live one at a time
+/// per thread, so this is the same buffer the dispatch would have handed each
+/// block on its own — it just stops paying for one copy per block.
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,
-                          int num_threads = 1);
+                          int num_threads = 1,
+                          bool use_thread_slots = false);
 
 }  // namespace nnops::backend::cpu
 
