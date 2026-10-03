@@ -55,6 +55,21 @@ namespace {
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr float kPosInf =  std::numeric_limits<float>::infinity();
 
+// ---- dtype-selected tiling constants -------------------------------------
+// The GEMM scratch (packed panels) and the k-block length are dtype-dependent;
+// these mirror matmul_helper.h's matmul kernel so the plan and the kernels
+// resolve identical tile sizes for either element type.
+
+template <class T>
+constexpr const int* nr_cascade() {
+    return std::is_same_v<T, half> ? NR_F16 : NR_F32;
+}
+
+template <class T>
+constexpr int64_t kc_for() {
+    return std::is_same_v<T, half> ? KC_F16 : KC_F32;
+}
+
 // ---- head-shape extraction (merged [B,S,H*D] vs explicit [B,H,S,D]) ----
 
 struct HeadShape {
@@ -125,7 +140,7 @@ void attention_impl(const AttentionAttributes& attrs,
     // Tile sizes come from the plan (attention_kernel resolved them once,
     // together with the workspace sizing — single source of truth).
     constexpr int nr_max = nr_max_flt<T>();
-    constexpr int kc     = KC_F32;
+    constexpr int64_t kc = kc_for<T>();
 
     const int mc1 = plan.mc1;
     const int nc1 = plan.nc1;
@@ -135,7 +150,7 @@ void attention_impl(const AttentionAttributes& attrs,
     // Uniform 64-byte-aligned panel stride at full Kc (sizing upper bound).
     const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(T)))
                            / static_cast<int>(sizeof(T));
-    const int np_full = num_panels(nc1, NR_F32);
+    const int np_full = num_panels(nc1, nr_cascade<T>());
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
@@ -243,12 +258,13 @@ inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
     return Sq * Sk >= kFlashMinScores;
 }
 
+template <class T>
 inline void resolve_flash_tile_sizes(int64_t Sq, int64_t Sk, int64_t D, int& Br, int& Bc)
 {
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
     const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u);  // 1 MiB fallback
     const int64_t head_pairs = D + D;  // qk_head_size + v_head_size (both == D here)
-    Bc = static_cast<int>(l2_eff / (sizeof(float) * 4 * head_pairs));
+    Bc = static_cast<int>(l2_eff / (sizeof(T) * 4 * head_pairs));
     if (Bc < 1) { Bc = 1; }
     Br = static_cast<int>(std::min<int64_t>(Bc, head_pairs));
     Bc = static_cast<int>(std::min<int64_t>(Bc, Sk));
@@ -260,11 +276,14 @@ inline void resolve_flash_tile_sizes(int64_t Sq, int64_t Sk, int64_t D, int& Br,
 // Per-task scratch (elements) — one Br-row query block — mirroring the layout
 // inside attention_flash_impl:
 //   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:num_panels(Bc)*ldd_b_full]
+template <class T>
 inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 {
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(NR_MAX_F32 * KC_F32 * static_cast<int>(sizeof(float)))
-                           / static_cast<int>(sizeof(float));
-    const int pack_elems = num_panels(Bc, NR_F32) * ldd_b_full;
+    constexpr int nr_max = nr_max_flt<T>();
+    constexpr int64_t kc = std::is_same_v<T, half> ? KC_F16 : KC_F32;
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(T)))
+                           / static_cast<int>(sizeof(T));
+    const int pack_elems = num_panels(Bc, nr_cascade<T>()) * ldd_b_full;
     return static_cast<int64_t>(Br) * 2
          + static_cast<int64_t>(Br) * Bc
          + static_cast<int64_t>(Br) * D
@@ -314,12 +333,12 @@ void attention_flash_impl(const AttentionAttributes& attrs,
     const int64_t o_rs = output.row_stride_elems();
 
     constexpr int nr_max = nr_max_flt<T>();
-    constexpr int kc = KC_F32;
+    constexpr int64_t kc = kc_for<T>();
     constexpr int L = simd::simd_lane_for<T>;
 
     const int Br = plan.Br;
     const int Bc = plan.Bc;
-    const int64_t per_task = flash_per_task_elems(Br, Bc, D);
+    const int64_t per_task = flash_per_task_elems<T>(Br, Bc, D);
 
     const int64_t NQ = (Sq + Br - 1) / Br;  // number of Br-row query blocks
     const int64_t NG = B * H * NQ;
@@ -357,10 +376,14 @@ void attention_flash_impl(const AttentionAttributes& attrs,
         T* o_acc  = s + static_cast<int64_t>(Br) * Bc;
         T* pack_b = o_acc + static_cast<int64_t>(Br) * D;
 
-        // reset the running online-softmax state for this query block
+        // reset the running online-softmax state for this query block. The
+        // scalar simd bridge is used because std::numeric_limits<T> is not
+        // specialized for half (it would silently yield 0, not -inf) and
+        // static_cast<half>(float) is a numeric bits conversion, not a value
+        // conversion, on the x86 half wrapper.
         for (int i = 0; i < actual_br; ++i) {
-            m[i] = -std::numeric_limits<T>::infinity();
-            l[i] = 0.0f;
+            simd::s_store(&m[i], -std::numeric_limits<float>::infinity());
+            simd::s_store(&l[i], 0.0f);
         }
         // o_acc is written by the first KV block with add_to=false — no
         // pre-zeroing pass. (The exp_diff rescale below may touch it first on
@@ -402,12 +425,12 @@ void attention_flash_impl(const AttentionAttributes& attrs,
             for (int i = 0; i < actual_br; ++i) {
                 T* srow = s + i * actual_bc;
                 const float rowmax = kernel::softmax_row_max<T>(srow, actual_bc);
-                const float old_m = static_cast<float>(m[i]);
+                const float old_m = simd::s_load(&m[i]);
                 const float new_m = std::max(old_m, rowmax);
                 const float exp_diff = std::exp(old_m - new_m);  // 0 on the first KV block
-                m[i] = static_cast<T>(new_m);
+                simd::s_store(&m[i], new_m);
                 const float rowsum = kernel::softmax_row_exp_sum<T>(srow, srow, actual_bc, new_m, 1.0f);
-                l[i] = static_cast<T>(exp_diff * static_cast<float>(l[i]) + rowsum);
+                simd::s_store(&l[i], exp_diff * simd::s_load(&l[i]) + rowsum);
 
                 // rescale the accumulated output by exp_diff (skip work when it is 1.0)
                 if (exp_diff != 1.0f) {
@@ -436,7 +459,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
 
         // ---- final normalize: output = o_acc / l -------------------
         for (int i = 0; i < actual_br; ++i) {
-            const float inv_l = 1.0f / static_cast<float>(l[i]);
+            const float inv_l = 1.0f / simd::s_load(&l[i]);
             const T* src = o_acc + i * D;
             T* dst = o_head + (i0 + i) * o_rs;
             auto v_inv = simd::v_set1(src, inv_l);
@@ -459,26 +482,21 @@ void attention_flash_impl(const AttentionAttributes& attrs,
 //  Plan — single source of truth for tile sizes + workspace layout
 // =========================================================================
 
-AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
+namespace {
+
+/// Plan resolution for one element type — the dtype-specific tile sizes and
+/// scratch layout, shared by get_attention_plan's per-dtype dispatch below.
+/// (f32 and f16 differ in NR/Kc/element size, exactly as in matmul.)
+template <class T>
+AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
                                  std::span<const TensorDesc> inputs,
-                                 std::span<const TensorDesc> /*outputs*/,
                                  int num_threads,
                                  bool use_thread_slots)
 {
-    NNOPS_ASSERT(inputs.size() >= 3);
-    NNOPS_ASSERT(inputs.size() <= 4);
-
     const auto& q = inputs[0];
     const auto& k = inputs[1];
-    const auto& v = inputs[2];
 
     AttentionPlan plan;
-
-    // f32-only fast path (reference is f32-only).
-    if (q.dtype != DataType::f32 || k.dtype != DataType::f32 ||
-        v.dtype != DataType::f32) {
-        return plan;
-    }
 
     const int64_t H = attrs.num_heads;
     const bool merged = (q.rank == 3);
@@ -502,36 +520,34 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
     // block (tasks are B × H × NQ).
     if (plan.use_flash) {
         int Br, Bc;
-        resolve_flash_tile_sizes(Sq, Sk, D, Br, Bc);
+        resolve_flash_tile_sizes<T>(Sq, Sk, D, Br, Bc);
         plan.Br = Br;
         plan.Bc = Bc;
-        const int64_t per_task = flash_per_task_elems(Br, Bc, D);
+        const int64_t per_task = flash_per_task_elems<T>(Br, Bc, D);
         const int64_t NQ = (Sq + Br - 1) / Br;
         const int64_t nt  = std::max<int64_t>(num_threads, 1);
         plan.num_slots = (use_thread_slots && nt < B * H * NQ) ? nt : B * H * NQ;
         plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                            * static_cast<size_t>(per_task) * sizeof(float);
+                            * static_cast<size_t>(per_task) * sizeof(T);
         return plan;
     }
 
-    constexpr int mr_max = MR_MAX_F32;
-    constexpr int nr_max = NR_MAX_F32;
-    constexpr int kc     = KC_F32;
+    constexpr int mr_max = std::is_same_v<T, half> ? MR_MAX_F16 : MR_MAX_F32;
+    constexpr int nr_max = nr_max_flt<T>();
+    constexpr int kc     = static_cast<int>(kc_for<T>());
+    constexpr int esz    = static_cast<int>(sizeof(T));
 
     int mc1, nc1;
     resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Sk),
-                       mr_max, nr_max, kc, static_cast<int>(sizeof(float)),
-                       mc1, nc1);
+                       mr_max, nr_max, kc, esz, mc1, nc1);
     int mc2, nc2;
     resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(D),
-                       mr_max, nr_max, kc, static_cast<int>(sizeof(float)),
-                       mc2, nc2);
+                       mr_max, nr_max, kc, esz, mc2, nc2);
     plan.mc1 = mc1; plan.nc1 = nc1;
     plan.mc2 = mc2; plan.nc2 = nc2;
 
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(float)))
-                           / static_cast<int>(sizeof(float));
-    const int np_full = num_panels(nc1, NR_F32);
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * esz) / esz;
+    const int np_full = num_panels(nc1, nr_cascade<T>());
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
@@ -540,8 +556,36 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
     const int64_t nt = std::max<int64_t>(num_threads, 1);
     plan.num_slots = (use_thread_slots && nt < B * H) ? nt : B * H;
     plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                        * static_cast<size_t>(per_head) * sizeof(float);
+                        * static_cast<size_t>(per_head) * sizeof(T);
     return plan;
+}
+
+}  // namespace
+
+AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
+                                 std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> /*outputs*/,
+                                 int num_threads,
+                                 bool use_thread_slots)
+{
+    NNOPS_ASSERT(inputs.size() >= 3);
+    NNOPS_ASSERT(inputs.size() <= 4);
+
+    const DataType dt = inputs[0].dtype;
+
+    // f32 and f16 take the tiled fast path; any other dtype — or a Q/K/V dtype
+    // mismatch — leaves workspace_size == 0 so the kernel routes to the
+    // reference (which is f32-only; the kernel asserts instead of silently
+    // reading f16 as f32).
+    const bool types_match = (inputs[1].dtype == dt) && (inputs[2].dtype == dt);
+    if (!types_match) { return AttentionPlan{}; }
+    if (dt == DataType::f16) {
+        return attention_plan_for<half>(attrs, inputs, num_threads, use_thread_slots);
+    }
+    if (dt == DataType::f32) {
+        return attention_plan_for<float>(attrs, inputs, num_threads, use_thread_slots);
+    }
+    return AttentionPlan{};
 }
 
 // =========================================================================
@@ -556,7 +600,7 @@ void attention_kernel(const AttentionAttributes& attrs,
 {
     const DataType dt = inputs[0].data_type();
 
-    const bool dtypes_ok = (dt == DataType::f32) &&
+    const bool dtypes_ok = (dt == DataType::f32 || dt == DataType::f16) &&
                            inputs[1].data_type() == dt &&
                            inputs[2].data_type() == dt &&
                            output.data_type() == dt &&
@@ -575,16 +619,32 @@ void attention_kernel(const AttentionAttributes& attrs,
                                                       ctx.cpu.thread_slot_count() > 0);
         PoolPtr scratch(plan.workspace_size);
 
-        if (plan.use_flash) {
-            attention_flash_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
+        if (dt == DataType::f16) {
+            if (plan.use_flash) {
+                attention_flash_impl<half>(attrs, output, inputs, ctx, plan, scratch.as<half>());
+            } else {
+                attention_impl<half>(attrs, output, inputs, ctx, plan, scratch.as<half>());
+            }
         } else {
-            attention_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
+            if (plan.use_flash) {
+                attention_flash_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
+            } else {
+                attention_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
+            }
         }
         return;
     }
 
-    // Mismatched dtypes: the reference is the correctness baseline (no scratch).
-    reference::attention_ref(attrs, output, inputs, ctx, nullptr);
+    // Mismatched dtypes: the f32 reference is the correctness baseline (no
+    // scratch). f16 has no reference, so a dtype mismatch there is a hard error
+    // (mirroring conv2d_im2col_kernel) rather than a silent f32 misread.
+    if (dt == DataType::f32) {
+        reference::attention_ref(attrs, output, inputs, ctx, nullptr);
+        return;
+    }
+
+    NNOPS_ASSERT(!"attention_kernel: f16 Attention dtype mismatch "
+                   "(f16 Q requires matching f16 K/V/output/mask)");
 }
 
 }  // namespace nnops::backend::cpu

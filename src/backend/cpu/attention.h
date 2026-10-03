@@ -45,7 +45,9 @@ struct AttentionPlan {
 };
 
 /// Resolve the attention plan (tile sizes + workspace bytes) from the
-/// descriptors. Returns a zeroed plan (workspace_size 0) for non-f32 dtypes,
+/// descriptors, for f32 or f16 (the two dtypes with a tiled fast path; the
+/// tile sizes and scratch element size follow the dtype). Returns a zeroed plan
+/// (workspace_size 0) for any other dtype, or when Q/K/V dtypes disagree —
 /// which routes the kernel to the reference. @p num_threads bounds the
 /// per-thread scratch slot count when @p use_thread_slots is set.
 AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
@@ -54,9 +56,10 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
                                  int num_threads = 1,
                                  bool use_thread_slots = false);
 
-/// Tiled attention kernel (f32). Falls back to the reference kernel when the
-/// dtype is not f32 (the reference is f32-only). Scratch is pooled internally
-/// (sized by get_attention_plan); @p workspace is vestigial.
+/// Tiled attention kernel (f32 / f16). Falls back to the reference kernel for
+/// an f32 dtype mismatch; an f16 mismatch is a hard error (the reference is
+/// f32-only, so it would silently read f16 as f32). Scratch is pooled
+/// internally (sized by get_attention_plan); @p workspace is vestigial.
 void attention_kernel(const AttentionAttributes& attrs,
                       TensorView& output,
                       std::span<const TensorView> inputs,
