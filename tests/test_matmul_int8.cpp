@@ -682,16 +682,44 @@ struct SimplePool {
 /// Run one s8×s8 GEMM through the public op with `nt` workers and require exact
 /// agreement with matmul_int8_ref — the int8 path is integer, so agreement is
 /// element-exact, not approximate.
+///
+/// `ta`/`tb` select the transposed operand layouts, which change which axis each
+/// pre-epilogue reduction runs along (A physical K×M under transpose_a, B
+/// physical N×K under transpose_b) — a different loop nest per combination, so
+/// each needs its own pooled coverage.
 template <typename T>
-void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uint64_t seed) {
-    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, seed);
+void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uint64_t seed,
+                                    bool ta = false, bool tb = false) {
+    I8Inputs in = make_i8_inputs(M, K, N, tb, seed);
+
+    // make_i8_inputs always lays A out as M×K; for transpose_a build a K×M
+    // operand over its own buffer. Scales stay per logical token (M of them),
+    // matching how the kernel indexes qa[m].
+    std::vector<int8_t> a_t_buf;
+    std::vector<float> a_t_scale;
+    std::vector<int32_t> a_t_zp;
+    if (ta) {
+        nnops::test::XorShift128 rng(seed ^ 0x5eedULL);
+        a_t_buf.resize(static_cast<size_t>(K * M));
+        for (auto& v : a_t_buf) v = static_cast<int8_t>(rng.next_u64() % 255 - 127);
+        a_t_scale.resize(static_cast<size_t>(M));
+        a_t_zp.resize(static_cast<size_t>(M));
+        for (auto& v : a_t_scale) v = 0.5f + (rng.next_u64() % 1000) / 1000.0f;
+        for (auto& v : a_t_zp) v = static_cast<int32_t>(rng.next_u64() % 11 - 5);
+    }
+    const TensorView a_view =
+        ta ? make_q(K, M, DataType::s8, a_t_buf.data(),
+                    per_token(a_t_scale.data(), a_t_zp.data(), M))
+           : in.a;
 
     constexpr DataType odt = std::is_same_v<T, int32_t> ? DataType::s32 : DataType::s8;
     MatMulAttributes attrs{};
     attrs.output_dtype = odt;
+    attrs.transpose_a = ta;
+    attrs.transpose_b = tb;
     auto op = MatMul::create(attrs, Backend::CPU);
 
-    const TensorDesc arr[] = {in.a.desc(), in.b.desc()};
+    const TensorDesc arr[] = {a_view.desc(), in.b.desc()};
     auto descs = op->getOutputTensorDesc(arr);
 
     const QuantParams oq = std::is_same_v<T, int32_t> ? QuantParams{} : per_tensor(0.25f, -7);
@@ -704,7 +732,7 @@ void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uin
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
 
-    const TensorView ins[] = {in.a, in.b};
+    const TensorView ins[] = {a_view, in.b};
     op->compute(output, ins, ctx, nullptr);
     nnops::backend::cpu::reference::matmul_int8_ref(attrs, ref_out, ins, {}, nullptr);
 
@@ -728,4 +756,15 @@ NNOPS_TEST(matmul_int8_threaded_matches_ref) {
     }
     expect_i8_threaded_matches_ref<int8_t>(512, 512, 128, 4, 15);
     expect_i8_threaded_matches_ref<int8_t>(128, 512, 512, 4, 16);
+
+    // Transposed operands: the reductions run along a different axis, and each
+    // combination is a separate loop nest, so cover all four with a pool.
+    for (int nt : {2, 4, 8}) {
+        expect_i8_threaded_matches_ref<int32_t>(512, 512, 128, nt, 21, /*ta=*/true);
+        expect_i8_threaded_matches_ref<int32_t>(512, 512, 128, nt, 22, /*ta=*/false, /*tb=*/true);
+        expect_i8_threaded_matches_ref<int32_t>(512, 512, 128, nt, 23, /*ta=*/true,  /*tb=*/true);
+        // Wide-N (N-split) with both transposes, where nc is also shrunk.
+        expect_i8_threaded_matches_ref<int32_t>(128, 512, 512, nt, 24, /*ta=*/true,  /*tb=*/true);
+        expect_i8_threaded_matches_ref<int8_t>(256, 256, 256, nt, 25, /*ta=*/true,  /*tb=*/true);
+    }
 }
