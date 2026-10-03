@@ -54,11 +54,16 @@ namespace arch = aarch64;
 
 // Panel size arrays (largest-first decomposition)
 constexpr int MR_F32[3] = {arch::mr_f32[0], arch::mr_f32[1], arch::mr_f32[2]};
+// The unpacked-A ("direct") path decomposes M with its own heights: reading A
+// row-major pins one vector per row across the 4-k unroll, so aarch64 has to
+// stop at mr=6 to stay inside the 32 NEON registers (see arch::mr_f32_direct).
+constexpr int MR_F32_DIRECT[3] = {arch::mr_f32_direct[0], arch::mr_f32_direct[1], arch::mr_f32_direct[2]};
 constexpr int NR_F32[3] = {arch::nr_f32[0], arch::nr_f32[1], arch::nr_f32[2]};
 constexpr int MR_F16[3] = {arch::mr_f16[0], arch::mr_f16[1], arch::mr_f16[2]};
 constexpr int NR_F16[3] = {arch::nr_f16[0], arch::nr_f16[1], arch::nr_f16[2]};
 
 constexpr int MR_MAX_F32 = arch::mr_f32[0];
+constexpr int MR_MAX_F32_DIRECT = arch::mr_f32_direct[0];
 constexpr int NR_MAX_F32 = arch::nr_f32[0];
 constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];

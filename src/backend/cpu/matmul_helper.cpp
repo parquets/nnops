@@ -161,7 +161,9 @@ constexpr std::array<std::array<MmaDirectF32Fn, 3>, 3> mma_direct_f32_fn = {{
     {{mma_direct_4x16_f32<zero_mode>, mma_direct_4x8_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
     {{mma_direct_1x16_f32<zero_mode>, mma_direct_1x8_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_direct_8x12_f32<zero_mode>, mma_direct_8x4_f32<zero_mode>, mma_direct_8x1_f32<zero_mode>}},
+    // mr=6, not 8: the 8-row direct kernel keeps 35 vectors live and spills on
+    // every k. Rows here must stay consistent with MR_F32_DIRECT.
+    {{mma_direct_6x12_f32<zero_mode>, mma_direct_6x4_f32<zero_mode>, mma_direct_6x1_f32<zero_mode>}},
     {{mma_direct_4x12_f32<zero_mode>, mma_direct_4x4_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
     {{mma_direct_1x12_f32<zero_mode>, mma_direct_1x4_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
 #endif
@@ -424,19 +426,18 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
                      const float* b, int ldb,
                      float clamp_min, float clamp_max, bool zero_mode) {
     const auto& fns = zero_mode ? mma_direct_f32_fn<true> : mma_direct_f32_fn<false>;
-    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_F32[0] * Kc * static_cast<int>(sizeof(float))) / static_cast<int>(sizeof(float));
     int m = 0;
-    for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
+    for(; m + MR_F32_DIRECT[0] <= Mc; m += MR_F32_DIRECT[0]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, fns[0]);
     }
-    for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
+    for(; m + MR_F32_DIRECT[1] <= Mc; m += MR_F32_DIRECT[1]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, fns[1]);
     }
-    for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
+    for(; m + MR_F32_DIRECT[2] <= Mc; m += MR_F32_DIRECT[2]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, fns[2]);

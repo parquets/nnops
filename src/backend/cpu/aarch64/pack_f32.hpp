@@ -376,6 +376,15 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
 /// Maps {large, medium, small} micro-panel heights indexed as [m_idx].
 inline constexpr int mr_f32[3] = {8, 4, 1};
 
+/// @brief LHS panel heights for the unpacked-A (direct) path.
+/// The direct kernels read A row-major, so each row's 4-k slice is held live
+/// across the whole 4-k unroll: the register set is mr*nr/4 + mr + nr/4. At
+/// nr=12 that reaches 35 > 32 NEON registers for mr=8 and the kernel spills on
+/// every k, but 27 for mr=6, which is the largest spill-free height. The pack
+/// path keeps mr=8 — its interleaved A layout carries four rows per vector and
+/// never exceeds the budget.
+inline constexpr int mr_f32_direct[3] = {6, 4, 1};
+
 /// @brief Panel sizes for f32 RHS (B matrix columns).
 inline constexpr int nr_f32[3] = {12, 4, 1};
 
