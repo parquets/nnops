@@ -31,6 +31,22 @@ void matmul_ref(const MatMulAttributes& attrs,
 }
 
 // ============================================================
+// f16 GEMM comparison tolerance
+// ============================================================
+//
+// The f16 MMA kernels accumulate in different precisions per arch:
+//   - x86_64:  fp32 accumulators (F16C widen → FMA → narrow), error ~fp32.
+//   - aarch64: native fp16 accumulators (vfmaq_laneq_f16), so the error grows
+//              with K and reaches ~0.09 for K=256 (≈3-4 fp16 ulp of the result).
+// The tolerance is therefore arch-specific; the x86 value would be far too
+// tight on aarch64 for any K beyond a few dozen.
+#if defined(NNOPS_ARCH_AARCH64)
+inline constexpr float kF16GemmTol = 2e-1f;
+#else
+inline constexpr float kF16GemmTol = 5e-2f;
+#endif
+
+// ============================================================
 // Basic 2D MatMul
 // ============================================================
 
@@ -1209,7 +1225,7 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
 
     for (int64_t i = 0; i < descs[0].numel(); ++i) {
         float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
-        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], 5e-2f);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16GemmTol);
     }
 }
 
@@ -1350,7 +1366,7 @@ NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
 
     for (int64_t i = 0; i < descs[0].numel(); ++i) {
         float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
-        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], 5e-2f);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16GemmTol);
     }
 }
 
