@@ -656,15 +656,17 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
     r0.lo = a0; r1.lo = a1; r2.lo = a2; r3.lo = a3;
 
+    // Snapshot r{4..7}.lo (bottom-left source) before it is overwritten below.
+    __m128 b0 = r4.lo, b1 = r5.lo, b2 = r6.lo, b3 = r7.lo;
+
     // 4×4 transpose of r{0..3}.hi → results go to r{4..7}.lo
     a0 = r0.hi; a1 = r1.hi; a2 = r2.hi; a3 = r3.hi;
     _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
     r4.lo = a0; r5.lo = a1; r6.lo = a2; r7.lo = a3;
 
-    // 4×4 transpose of r{4..7}.lo → results go to r{0..3}.hi
-    a0 = r4.lo; a1 = r5.lo; a2 = r6.lo; a3 = r7.lo;
-    _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
-    r0.hi = a0; r1.hi = a1; r2.hi = a2; r3.hi = a3;
+    // 4×4 transpose of r{4..7}.lo (saved above) → results go to r{0..3}.hi
+    _MM_TRANSPOSE4_PS(b0, b1, b2, b3);
+    r0.hi = b0; r1.hi = b1; r2.hi = b2; r3.hi = b3;
 
     // 4×4 transpose of r{4..7}.hi → results go to r{4..7}.hi
     a0 = r4.hi; a1 = r5.hi; a2 = r6.hi; a3 = r7.hi;

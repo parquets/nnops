@@ -582,7 +582,11 @@ inline void transpose_4x4_f32(float32x4_t& r0, float32x4_t& r1,
 /// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
+    // Snapshot all four quadrants first — the top-right and bottom-left sources
+    // are each other's destinations, so a write-then-read ordering would corrupt
+    // the second quadrant read (read-after-write hazard).
     float32x4_t t0, t1, t2, t3;
+    float32x4_t u0 = r4.lo, u1 = r5.lo, u2 = r6.lo, u3 = r7.lo;  // bottom-left
 
     // r{0..3}.lo → r{0..3}.lo
     t0 = r0.lo; t1 = r1.lo; t2 = r2.lo; t3 = r3.lo;
@@ -594,10 +598,9 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     transpose_4x4_f32(t0, t1, t2, t3);
     r4.lo = t0; r5.lo = t1; r6.lo = t2; r7.lo = t3;
 
-    // r{4..7}.lo → r{0..3}.hi
-    t0 = r4.lo; t1 = r5.lo; t2 = r6.lo; t3 = r7.lo;
-    transpose_4x4_f32(t0, t1, t2, t3);
-    r0.hi = t0; r1.hi = t1; r2.hi = t2; r3.hi = t3;
+    // r{4..7}.lo (saved above) → r{0..3}.hi
+    transpose_4x4_f32(u0, u1, u2, u3);
+    r0.hi = u0; r1.hi = u1; r2.hi = u2; r3.hi = u3;
 
     // r{4..7}.hi → r{4..7}.hi
     t0 = r4.hi; t1 = r5.hi; t2 = r6.hi; t3 = r7.hi;
