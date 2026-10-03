@@ -8,7 +8,6 @@
 /// Core operation: v_max(v_min(x, max_val), min_val) — 2 SIMD instructions.
 
 #include "nnops/ops/clamp.hpp"
-#include "nnops/detail/assert.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/tiled_map.hpp"
 #include "common/elementwise.hpp"

@@ -17,12 +17,9 @@
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/core/tensor_layout.hpp"
-#include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_pooling.hpp"
 
 #include <cstdint>
-#include <limits>
 #include <type_traits>
 
 namespace nnops::backend::cpu {

@@ -8,8 +8,6 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
 
-#include <numeric>
-
 namespace nnops::backend::cpu::reference {
 
 void cumsum_ref(const CumSumAttributes& attrs,

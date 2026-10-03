@@ -9,9 +9,7 @@
 /// Per-(N, C8) parallel dispatch, following the depthwise_conv.cpp pattern.
 
 #include "nnops/ops/transpose_conv2d.hpp"
-#include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_epilogue.hpp"
 #include "common/dtype_dispatch.hpp"

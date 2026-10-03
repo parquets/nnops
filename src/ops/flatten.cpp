@@ -3,7 +3,6 @@
 
 #include "nnops/ops/flatten.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -35,7 +34,6 @@ struct Flatten::Impl {
     KernelFn kernel_fn = nullptr;
 };
 Flatten::~Flatten() = default;
-
 
 namespace {
 auto resolve_flatten_kernel(Backend backend) -> Flatten::Impl::KernelFn

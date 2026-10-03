@@ -9,7 +9,6 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 
-#include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu::reference {

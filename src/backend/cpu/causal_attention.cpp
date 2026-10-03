@@ -7,7 +7,6 @@
 
 #include "nnops/ops/causal_attention.hpp"
 #include "common/memory_pool.hpp"           // internal scratch-memory pool
-#include "nnops/detail/assert.hpp"
 
 namespace nnops::backend::cpu {
 

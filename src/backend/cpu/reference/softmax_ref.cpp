@@ -11,7 +11,6 @@
 #include "nnops/detail/half.hpp"
 
 #include <cmath>
-#include <algorithm>
 #include <cfloat>
 #include <cstdint>
 #include <vector>

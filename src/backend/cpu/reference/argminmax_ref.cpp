@@ -7,7 +7,6 @@
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include <limits>
 
 namespace nnops::backend::cpu::reference {
 

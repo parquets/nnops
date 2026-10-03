@@ -10,7 +10,6 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 
-#include <algorithm>
 #include <cfloat>
 #include <vector>
 

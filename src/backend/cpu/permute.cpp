@@ -14,12 +14,9 @@
 ///   3. General n-D: scalar strided copy, parallel over outer dim.
 
 #include "nnops/ops/permute.hpp"
-#include "nnops/detail/assert.hpp"
-#include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_permute.hpp"
 #include "common/dtype_dispatch.hpp"
 
-#include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu {

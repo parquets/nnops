@@ -10,10 +10,8 @@
 #include "nnops/ops/topk.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "nnops/core/parallel_for.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <vector>
 
 namespace nnops::backend::cpu::reference {

@@ -20,7 +20,6 @@
 #include "common/index.hpp"
 #include "common/dtype_dispatch.hpp"
 
-#include <algorithm>
 #include <cfloat>
 #include <vector>
 

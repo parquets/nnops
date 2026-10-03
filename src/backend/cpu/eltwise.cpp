@@ -21,7 +21,6 @@
 
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_eltwise.hpp"
 #include "common/elementwise.hpp"
 #include "common/dtype_dispatch.hpp"

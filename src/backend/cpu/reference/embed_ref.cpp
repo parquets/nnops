@@ -13,7 +13,6 @@
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
-#include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu::reference {

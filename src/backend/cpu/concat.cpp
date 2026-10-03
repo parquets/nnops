@@ -11,8 +11,6 @@
 ///   3. Outer axis (axis < rank-1): memcpy per contiguous block
 
 #include "nnops/ops/concat.hpp"
-#include "nnops/detail/assert.hpp"
-#include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
 

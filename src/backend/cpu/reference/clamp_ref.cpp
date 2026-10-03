@@ -9,7 +9,6 @@
 #include "nnops/detail/simd/simd.hpp"
 
 #include <algorithm>
-#include <limits>
 
 namespace nnops::backend::cpu::reference {
 

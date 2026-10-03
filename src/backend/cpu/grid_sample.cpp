@@ -17,15 +17,9 @@
 ///   6. Grid access is scalar (grid is NCHW, not channel-packed).
 
 #include "nnops/ops/grid_sample.hpp"
-#include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/core/tensor_layout.hpp"
-#include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_grid_sample.hpp"
 #include "common/dtype_dispatch.hpp"
-
-#include <algorithm>
-#include <cmath>
 
 namespace nnops::backend::cpu {
 

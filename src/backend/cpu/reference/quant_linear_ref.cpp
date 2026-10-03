@@ -11,14 +11,11 @@
 
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/half.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
-#include <vector>
 
 namespace nnops::backend::cpu::reference {
 

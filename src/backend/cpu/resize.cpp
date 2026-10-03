@@ -18,13 +18,8 @@
 #include "nnops/ops/resize.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/core/tensor_layout.hpp"
-#include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_resize.hpp"
 #include "common/dtype_dispatch.hpp"
-
-#include <algorithm>
-#include <cmath>
 
 namespace nnops::backend::cpu {
 

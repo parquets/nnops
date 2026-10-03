@@ -6,7 +6,6 @@
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/half.hpp"
 #include "common/dtype_dispatch.hpp"
 
 namespace nnops::backend::cpu {

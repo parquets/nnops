@@ -3,7 +3,6 @@
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
@@ -37,7 +36,6 @@ struct LinearAttention::Impl {
     KernelFn kernel_fn = nullptr;
 };
 LinearAttention::~LinearAttention() = default;
-
 
 namespace {
 auto resolve_linear_attention_kernel(Backend backend) -> LinearAttention::Impl::KernelFn

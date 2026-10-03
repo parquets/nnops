@@ -22,9 +22,7 @@
 
 #include "nnops/ops/activation.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_activation.hpp"
-#include "simd_kernel/activation_kernels.hpp"
 #include "common/elementwise.hpp"
 #include "common/dtype_dispatch.hpp"
 

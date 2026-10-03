@@ -8,8 +8,6 @@
 /// (pack == 1, row_stride == oW) → single memcpy of the entire buffer.
 
 #include "nnops/ops/flatten.hpp"
-#include "nnops/detail/assert.hpp"
-#include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
 

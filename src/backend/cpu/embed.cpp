@@ -26,9 +26,7 @@
 #error "embed: unsupported architecture for quantization kernels"
 #endif
 
-#include <algorithm>
 #include <cstring>
-#include <type_traits>
 
 namespace nnops::backend::cpu {
 

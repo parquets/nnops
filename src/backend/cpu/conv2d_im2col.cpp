@@ -26,7 +26,6 @@
 #include "nnops/detail/assert.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <limits>
 

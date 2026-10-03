@@ -20,14 +20,10 @@
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/core/tensor_layout.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_depthwise_conv.hpp"
-#include "simd_kernel/simd_epilogue.hpp"
 
 #include <cstdint>
-#include <type_traits>
-
 
 namespace nnops::backend::cpu {
 

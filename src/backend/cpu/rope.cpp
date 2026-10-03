@@ -13,7 +13,6 @@
 #include "nnops/ops/rope.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
-#include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_rope.hpp"
 #include "common/dtype_dispatch.hpp"
 

@@ -23,7 +23,6 @@
 
 #include "nnops/ops/unary.hpp"
 #include "nnops/detail/assert.hpp"
-#include "nnops/detail/half.hpp"
 #include "simd_kernel/simd_unary.hpp"
 #include "common/elementwise.hpp"
 #include "common/dtype_dispatch.hpp"

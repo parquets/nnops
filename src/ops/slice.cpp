@@ -5,8 +5,6 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
-#include <algorithm>
-
 namespace nnops {
 
 // Forward declarations of backend kernel entry points
@@ -48,7 +46,6 @@ struct Slice::Impl {
     KernelFn kernel_fn = nullptr;
 };
 Slice::~Slice() = default;
-
 
 namespace {
 auto resolve_slice_kernel(Backend backend) -> Slice::Impl::KernelFn

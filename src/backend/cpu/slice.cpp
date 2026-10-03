@@ -11,11 +11,8 @@
 /// Both paths use ctx.cpu.run over outer-row index.
 
 #include "nnops/ops/slice.hpp"
-#include "nnops/detail/assert.hpp"
-#include "nnops/detail/half.hpp"
 #include "common/dtype_dispatch.hpp"
 
-#include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu {
