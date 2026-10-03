@@ -49,8 +49,7 @@ inline void fill_sequential_f16(TensorView& tv) {
                 for (int64_t w = 0; w < W; ++w) {
                     uint16_t* p = tv.ptr<uint16_t>()
                                   + (n * C + c) * ch + hh * row + w;
-                    half h = float_to_half(val);
-                    *p = h.bits;
+                    *p = half_to_bits(float_to_half(val));
                     val += 1.0f;
                 }
             }

@@ -49,7 +49,7 @@ TensorView make_cache(const std::vector<int64_t>& shape,
         {
             auto* p = reinterpret_cast<uint16_t*>(storage.data());
             for (int64_t i = 0; i < total; ++i) {
-                p[i] = float_to_half(f32_data[i]).bits;
+                p[i] = half_to_bits(float_to_half(f32_data[i]));
             }
         }
         return TensorView(shape, DataType::f16, storage.data(), TensorLayout::NCHW);

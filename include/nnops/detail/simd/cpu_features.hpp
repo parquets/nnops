@@ -9,6 +9,7 @@
 /// Provides a singleton CpuFeatures that detects available ISA levels once
 /// at first access. Used by optimized kernels to select the best code path.
 
+#include <cstddef>
 #include <cstdint>
 
 // NNOPS_ARCH_X86_64 / NNOPS_ARCH_AARCH64 are defined by simd.hpp.

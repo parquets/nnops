@@ -2,6 +2,9 @@
 
 #include <array>
 
+#include "nnops/detail/half.hpp"
+#include "nnops/detail/simd.hpp"
+
 #ifdef NNOPS_ARCH_X86_64
 using namespace nnops::backend::cpu::x86_64;
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -656,9 +659,6 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
     }
 }
 
-
-#include "nnops/detail/half.hpp"
-#include "nnops/detail/simd.hpp"
 
 // ---- tile scale -----------------------------------------------------------
 // SIMD-accelerated in-place scale: C[i] *= scale

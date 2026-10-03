@@ -2,7 +2,7 @@
 /// @brief Unit tests for the fused multiply-add + sum-of-squares SIMD primitive
 /// (simd_kernel/simd_add_fuse_norm.hpp).
 
-#include "../src/backend/cpu/simd_kernel/simd_add_fuse_norm.hpp"
+#include "../src/backend/cpu/simd_kernel/simd_mul_add_reduce.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 

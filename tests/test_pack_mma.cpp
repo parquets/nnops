@@ -42,6 +42,24 @@
   #error "Unsupported architecture"
 #endif
 
+// ---- arch-specific f32 mma tile geometry ----------------------------------
+// The f32 mma micro-kernels tile differently per arch: x86_64 uses
+// mr∈{6,4,1} × nr∈{16,8,1}, aarch64 uses mr∈{8,4,1} × nr∈{12,4,1}. The
+// specific-size tests below exercise one mid-sized tile, which is 4x8 on
+// x86_64 and 4x4 on aarch64. The f16 kernels share mr∈{4,1} and nr∈{16,8,1}
+// across both arches, so the 4x8 f16 tile is arch-neutral and needs no macro.
+#if defined(NNOPS_ARCH_X86_64)
+  #define NNOPS_MMA_F32_MID_PACK    mma_pack_4x8_f32
+  #define NNOPS_MMA_F32_MID_DIRECT  mma_direct_4x8_f32
+  #define NNOPS_MMA_F32_MID_M 4
+  #define NNOPS_MMA_F32_MID_N 8
+#elif defined(NNOPS_ARCH_AARCH64)
+  #define NNOPS_MMA_F32_MID_PACK    mma_pack_4x4_f32
+  #define NNOPS_MMA_F32_MID_DIRECT  mma_direct_4x4_f32
+  #define NNOPS_MMA_F32_MID_M 4
+  #define NNOPS_MMA_F32_MID_N 4
+#endif
+
 #include <cstring>
 #include <vector>
 #include <cmath>
@@ -249,6 +267,7 @@ static void test_mma_pack_f32(
     }
 }
 
+#if defined(NNOPS_ARCH_X86_64)
 NNOPS_TEST(mma_pack_f32_1x1)  { test_mma_pack_f32(mma_pack_1x1_f32,  1, 1,  7); }
 NNOPS_TEST(mma_pack_f32_1x8)  { test_mma_pack_f32(mma_pack_1x8_f32,  1, 8,  7); }
 NNOPS_TEST(mma_pack_f32_1x16) { test_mma_pack_f32(mma_pack_1x16_f32, 1, 16, 7); }
@@ -258,13 +277,24 @@ NNOPS_TEST(mma_pack_f32_4x16) { test_mma_pack_f32(mma_pack_4x16_f32, 4, 16, 7); 
 NNOPS_TEST(mma_pack_f32_6x1)  { test_mma_pack_f32(mma_pack_6x1_f32,  6, 1,  7); }
 NNOPS_TEST(mma_pack_f32_6x8)  { test_mma_pack_f32(mma_pack_6x8_f32,  6, 8,  7); }
 NNOPS_TEST(mma_pack_f32_6x16) { test_mma_pack_f32(mma_pack_6x16_f32, 6, 16, 7); }
+#elif defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(mma_pack_f32_1x1)  { test_mma_pack_f32(mma_pack_1x1_f32,   1, 1,  7); }
+NNOPS_TEST(mma_pack_f32_1x4)  { test_mma_pack_f32(mma_pack_1x4_f32,   1, 4,  7); }
+NNOPS_TEST(mma_pack_f32_1x12) { test_mma_pack_f32(mma_pack_1x12_f32,  1, 12, 7); }
+NNOPS_TEST(mma_pack_f32_4x1)  { test_mma_pack_f32(mma_pack_4x1_f32,   4, 1,  7); }
+NNOPS_TEST(mma_pack_f32_4x4)  { test_mma_pack_f32(mma_pack_4x4_f32,   4, 4,  7); }
+NNOPS_TEST(mma_pack_f32_4x12) { test_mma_pack_f32(mma_pack_4x12_f32,  4, 12, 7); }
+NNOPS_TEST(mma_pack_f32_8x1)  { test_mma_pack_f32(mma_pack_8x1_f32,   8, 1,  7); }
+NNOPS_TEST(mma_pack_f32_8x4)  { test_mma_pack_f32(mma_pack_8x4_f32,   8, 4,  7); }
+NNOPS_TEST(mma_pack_f32_8x12) { test_mma_pack_f32(mma_pack_8x12_f32,  8, 12, 7); }
+#endif
 
 NNOPS_TEST(mma_pack_f32_clamp) {
     // Clamp to [2.0, 5.0] — values outside should be clipped.
     // A[m][k]=2, B_packed[k][n]=2*k+1 → inner product per col n
     // A×B col 0: 2*1 + 2*3 + 2*5 = 18 → clamped to 5
     // A×B col 1: 2*1 + 2*3 + 2*5 = 18 → clamped to 5
-    constexpr int M = 4, N = 8, K = 3;
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 3;
     float A[M * K];
     float B_packed[K * N];
     float C[M * N] = {};
@@ -272,7 +302,7 @@ NNOPS_TEST(mma_pack_f32_clamp) {
     for (int i = 0; i < M * K; ++i) { A[i] = 2.0f; }
     for (int i = 0; i < K * N; ++i) { B_packed[i] = 1.0f; }
 
-    mma_pack_4x8_f32(C, N, A, B_packed, N, K, 2.0f, 5.0f);
+    NNOPS_MMA_F32_MID_PACK(C, N, A, B_packed, N, K, 2.0f, 5.0f);
 
     // A×B = 2*1+2*1+2*1 = 6 per element → clamped to 5.0
     for (int i = 0; i < M * N; ++i) {
@@ -306,6 +336,7 @@ static void test_mma_direct_f32(
     }
 }
 
+#if defined(NNOPS_ARCH_X86_64)
 NNOPS_TEST(mma_direct_f32_1x1)  { test_mma_direct_f32(mma_direct_1x1_f32,  1, 1,  7); }
 NNOPS_TEST(mma_direct_f32_1x8)  { test_mma_direct_f32(mma_direct_1x8_f32,  1, 8,  7); }
 NNOPS_TEST(mma_direct_f32_1x16) { test_mma_direct_f32(mma_direct_1x16_f32, 1, 16, 7); }
@@ -315,6 +346,17 @@ NNOPS_TEST(mma_direct_f32_4x16) { test_mma_direct_f32(mma_direct_4x16_f32, 4, 16
 NNOPS_TEST(mma_direct_f32_6x1)  { test_mma_direct_f32(mma_direct_6x1_f32,  6, 1,  7); }
 NNOPS_TEST(mma_direct_f32_6x8)  { test_mma_direct_f32(mma_direct_6x8_f32,  6, 8,  7); }
 NNOPS_TEST(mma_direct_f32_6x16) { test_mma_direct_f32(mma_direct_6x16_f32, 6, 16, 7); }
+#elif defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(mma_direct_f32_1x1)  { test_mma_direct_f32(mma_direct_1x1_f32,   1, 1,  7); }
+NNOPS_TEST(mma_direct_f32_1x4)  { test_mma_direct_f32(mma_direct_1x4_f32,   1, 4,  7); }
+NNOPS_TEST(mma_direct_f32_1x12) { test_mma_direct_f32(mma_direct_1x12_f32,  1, 12, 7); }
+NNOPS_TEST(mma_direct_f32_4x1)  { test_mma_direct_f32(mma_direct_4x1_f32,   4, 1,  7); }
+NNOPS_TEST(mma_direct_f32_4x4)  { test_mma_direct_f32(mma_direct_4x4_f32,   4, 4,  7); }
+NNOPS_TEST(mma_direct_f32_4x12) { test_mma_direct_f32(mma_direct_4x12_f32,  4, 12, 7); }
+NNOPS_TEST(mma_direct_f32_8x1)  { test_mma_direct_f32(mma_direct_8x1_f32,   8, 1,  7); }
+NNOPS_TEST(mma_direct_f32_8x4)  { test_mma_direct_f32(mma_direct_8x4_f32,   8, 4,  7); }
+NNOPS_TEST(mma_direct_f32_8x12) { test_mma_direct_f32(mma_direct_8x12_f32,  8, 12, 7); }
+#endif
 
 // =========================================================================
 //  Section 5: f32 mma cross-validation  —  pack vs direct (same A,B)
@@ -323,7 +365,7 @@ NNOPS_TEST(mma_direct_f32_6x16) { test_mma_direct_f32(mma_direct_6x16_f32, 6, 16
 NNOPS_TEST(mma_f32_pack_vs_direct) {
     // mma_pack uses interleaved A (A[m + k*M]), mma_direct uses row-major (A[m*K + k]).
     // Build a mathematical matrix and lay it out both ways.
-    constexpr int M = 4, N = 8, K = 9;
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 9;
     std::vector<float> A_pack(M * K);      // interleaved: A_pack[m + k*M]
     std::vector<float> A_direct(M * K);    // row-major:  A_direct[m*K + k]
     std::vector<float> B(K * N);
@@ -348,8 +390,8 @@ NNOPS_TEST(mma_f32_pack_vs_direct) {
         }
     }
 
-    mma_pack_4x8_f32(C_pack.data(), N, A_pack.data(), B_packed.data(), N, K, -1e9f, 1e9f);
-    mma_direct_4x8_f32(C_direct.data(), N, A_direct.data(), K, B.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_PACK(C_pack.data(), N, A_pack.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_DIRECT(C_direct.data(), N, A_direct.data(), K, B.data(), N, K, -1e9f, 1e9f);
 
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C_pack[i], C_direct[i], 1e-4f);
@@ -425,6 +467,7 @@ static void test_mma_pack_f16(
     }  // f16 tolerance
 }
 
+#if defined(NNOPS_ARCH_X86_64)
 NNOPS_TEST(mma_pack_f16_1x1)  { test_mma_pack_f16(mma_pack_1x1_f16,  1, 1,  7); }
 NNOPS_TEST(mma_pack_f16_1x8)  { test_mma_pack_f16(mma_pack_1x8_f16,  1, 8,  7); }
 NNOPS_TEST(mma_pack_f16_1x16) { test_mma_pack_f16(mma_pack_1x16_f16, 1, 16, 7); }
@@ -434,6 +477,17 @@ NNOPS_TEST(mma_pack_f16_4x16) { test_mma_pack_f16(mma_pack_4x16_f16, 4, 16, 7); 
 NNOPS_TEST(mma_pack_f16_6x1)  { test_mma_pack_f16(mma_pack_6x1_f16,  6, 1,  7); }
 NNOPS_TEST(mma_pack_f16_6x8)  { test_mma_pack_f16(mma_pack_6x8_f16,  6, 8,  7); }
 NNOPS_TEST(mma_pack_f16_6x16) { test_mma_pack_f16(mma_pack_6x16_f16, 6, 16, 7); }
+#elif defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(mma_pack_f16_1x1)  { test_mma_pack_f16(mma_pack_1x1_f16,  1, 1,  7); }
+NNOPS_TEST(mma_pack_f16_1x8)  { test_mma_pack_f16(mma_pack_1x8_f16,  1, 8,  7); }
+NNOPS_TEST(mma_pack_f16_1x16) { test_mma_pack_f16(mma_pack_1x16_f16, 1, 16, 7); }
+NNOPS_TEST(mma_pack_f16_4x1)  { test_mma_pack_f16(mma_pack_4x1_f16,  4, 1,  7); }
+NNOPS_TEST(mma_pack_f16_4x8)  { test_mma_pack_f16(mma_pack_4x8_f16,  4, 8,  7); }
+NNOPS_TEST(mma_pack_f16_4x16) { test_mma_pack_f16(mma_pack_4x16_f16, 4, 16, 7); }
+NNOPS_TEST(mma_pack_f16_8x1)  { test_mma_pack_f16(mma_pack_8x1_f16,  8, 1,  7); }
+NNOPS_TEST(mma_pack_f16_8x8)  { test_mma_pack_f16(mma_pack_8x8_f16,  8, 8,  7); }
+NNOPS_TEST(mma_pack_f16_8x16) { test_mma_pack_f16(mma_pack_8x16_f16, 8, 16, 7); }
+#endif
 
 NNOPS_TEST(mma_pack_f16_clamp) {
     constexpr int M = 4, N = 8, K = 3;
@@ -478,6 +532,7 @@ static void test_mma_direct_f16(
     }
 }
 
+#if defined(NNOPS_ARCH_X86_64)
 NNOPS_TEST(mma_direct_f16_1x1)  { test_mma_direct_f16(mma_direct_1x1_f16,  1, 1,  7); }
 NNOPS_TEST(mma_direct_f16_1x8)  { test_mma_direct_f16(mma_direct_1x8_f16,  1, 8,  7); }
 NNOPS_TEST(mma_direct_f16_1x16) { test_mma_direct_f16(mma_direct_1x16_f16, 1, 16, 7); }
@@ -487,6 +542,17 @@ NNOPS_TEST(mma_direct_f16_4x16) { test_mma_direct_f16(mma_direct_4x16_f16, 4, 16
 NNOPS_TEST(mma_direct_f16_6x1)  { test_mma_direct_f16(mma_direct_6x1_f16,  6, 1,  7); }
 NNOPS_TEST(mma_direct_f16_6x8)  { test_mma_direct_f16(mma_direct_6x8_f16,  6, 8,  7); }
 NNOPS_TEST(mma_direct_f16_6x16) { test_mma_direct_f16(mma_direct_6x16_f16, 6, 16, 7); }
+#elif defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(mma_direct_f16_1x1)  { test_mma_direct_f16(mma_direct_1x1_f16,  1, 1,  7); }
+NNOPS_TEST(mma_direct_f16_1x8)  { test_mma_direct_f16(mma_direct_1x8_f16,  1, 8,  7); }
+NNOPS_TEST(mma_direct_f16_1x16) { test_mma_direct_f16(mma_direct_1x16_f16, 1, 16, 7); }
+NNOPS_TEST(mma_direct_f16_4x1)  { test_mma_direct_f16(mma_direct_4x1_f16,  4, 1,  7); }
+NNOPS_TEST(mma_direct_f16_4x8)  { test_mma_direct_f16(mma_direct_4x8_f16,  4, 8,  7); }
+NNOPS_TEST(mma_direct_f16_4x16) { test_mma_direct_f16(mma_direct_4x16_f16, 4, 16, 7); }
+NNOPS_TEST(mma_direct_f16_8x1)  { test_mma_direct_f16(mma_direct_8x1_f16,  8, 1,  7); }
+NNOPS_TEST(mma_direct_f16_8x8)  { test_mma_direct_f16(mma_direct_8x8_f16,  8, 8,  7); }
+NNOPS_TEST(mma_direct_f16_8x16) { test_mma_direct_f16(mma_direct_8x16_f16, 8, 16, 7); }
+#endif
 
 // =========================================================================
 //  Section 9: f16 mma cross-validation  —  pack vs direct
@@ -531,7 +597,7 @@ NNOPS_TEST(mma_f16_pack_vs_direct) {
 // =========================================================================
 
 NNOPS_TEST(mma_f32_accumulation) {
-    constexpr int M = 4, N = 8, K = 3;
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 3;
     float A[M * K] = {1,0,0, 0,1,0, 0,0,1, 1,1,1};
     float B_packed[K * N] = {};
     B_packed[0 * N + 0] = 2;
@@ -543,7 +609,7 @@ NNOPS_TEST(mma_f32_accumulation) {
     fill_ramp(C.data(), M * N, 10.0f);
     std::vector<float> C_init = C;
 
-    mma_pack_4x8_f32(C.data(), N, A, B_packed, N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_PACK(C.data(), N, A, B_packed, N, K, -1e9f, 1e9f);
 
     std::vector<float> C_expected = C_init;
     naive_gemm_packed(C_expected.data(), N, A, B_packed, N, M, N, K);
@@ -558,7 +624,7 @@ NNOPS_TEST(mma_f32_accumulation) {
 // =========================================================================
 
 NNOPS_TEST(mma_f32_zero_a) {
-    constexpr int M = 4, N = 8, K = 5;
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 5;
     std::vector<float> A(M * K, 0.0f);
     std::vector<float> B_packed(K * N);
     std::vector<float> C(M * N);
@@ -567,7 +633,7 @@ NNOPS_TEST(mma_f32_zero_a) {
     fill_ramp(C.data(), M * N, 100.0f);
     auto C_saved = C;
 
-    mma_pack_4x8_f32(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_PACK(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
 
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_saved[i], 1e-6f);
@@ -579,7 +645,7 @@ NNOPS_TEST(mma_f32_zero_a) {
 // =========================================================================
 
 NNOPS_TEST(mma_f32_zero_mode_pack) {
-    constexpr int M = 4, N = 8, K = 5;
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 5;
     std::vector<float> A(M * K);
     std::vector<float> B_packed(K * N);
     fill_ramp(A.data(), M * K, 1.0f);
@@ -591,21 +657,21 @@ NNOPS_TEST(mma_f32_zero_mode_pack) {
     // ZeroMode=true: the junk pre-fill must be ignored (overwrite).
     std::vector<float> C(M * N);
     fill_ramp(C.data(), M * N, 100.0f);
-    mma_pack_4x8_f32<true>(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_PACK<true>(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_ref[i], 1e-4f);
     }
 
     // ZeroMode=false: the same pre-fill must be added (accumulate).
     fill_ramp(C.data(), M * N, 100.0f);
-    mma_pack_4x8_f32<false>(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_PACK<false>(C.data(), N, A.data(), B_packed.data(), N, K, -1e9f, 1e9f);
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_ref[i] + 100.0f + float(i), 1e-3f);
     }
 }
 
 NNOPS_TEST(mma_f32_zero_mode_direct) {
-    constexpr int M = 4, N = 8, K = 5;
+    constexpr int M = NNOPS_MMA_F32_MID_M, N = NNOPS_MMA_F32_MID_N, K = 5;
     std::vector<float> A(M * K);
     std::vector<float> B(K * N);
     fill_ramp(A.data(), M * K, 1.0f);
@@ -616,13 +682,13 @@ NNOPS_TEST(mma_f32_zero_mode_direct) {
 
     std::vector<float> C(M * N);
     fill_ramp(C.data(), M * N, 100.0f);
-    mma_direct_4x8_f32<true>(C.data(), N, A.data(), K, B.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_DIRECT<true>(C.data(), N, A.data(), K, B.data(), N, K, -1e9f, 1e9f);
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_ref[i], 1e-4f);
     }
 
     fill_ramp(C.data(), M * N, 100.0f);
-    mma_direct_4x8_f32<false>(C.data(), N, A.data(), K, B.data(), N, K, -1e9f, 1e9f);
+    NNOPS_MMA_F32_MID_DIRECT<false>(C.data(), N, A.data(), K, B.data(), N, K, -1e9f, 1e9f);
     for (int i = 0; i < M * N; ++i) {
         NNOPS_EXPECT_NEAR(C[i], C_ref[i] + 100.0f + float(i), 1e-3f);
     }
