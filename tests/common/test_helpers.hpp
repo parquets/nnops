@@ -25,6 +25,24 @@ inline TensorView make_packed(const TensorDesc& desc, void* data, int64_t alignm
 }
 
 // ============================================================
+// f16 accumulation tolerance
+// ============================================================
+//
+// The f16 GEMM micro-kernels accumulate in different precisions per arch:
+//   - x86_64:  fp32 accumulators (F16C widen → FMA → narrow), error ~fp32.
+//   - aarch64: native fp16 accumulators (vfmaq_laneq_f16), so the error grows
+//              with K and reaches ~0.09 for K=256 (≈3-4 fp16 ulp of the result).
+// The tolerance is therefore arch-specific; the x86 value would be far too
+// tight on aarch64 for any K beyond a few dozen. Shared by the f16 GEMM-family
+// tests (matmul, conv2d, attention), which all compare an f16 op against the
+// f32 reference computed on the same input data.
+#if defined(NNOPS_ARCH_AARCH64)
+inline constexpr float kF16AccumTol = 2e-1f;
+#else
+inline constexpr float kF16AccumTol = 5e-2f;
+#endif
+
+// ============================================================
 // f16 test helpers
 // ============================================================
 

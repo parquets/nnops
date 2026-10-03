@@ -10,6 +10,7 @@
 ///   6. const TensorView ins[] = {q, k, v}; op->compute(output, ins);
 
 #include "nnops/ops/attention.hpp"
+#include "backend/cpu/attention.h"      // get_attention_plan — to pin the f16 fast path
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
@@ -17,8 +18,11 @@
 
 #include <vector>
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 #include <array>
+#include <stdexcept>
+#include <string>
 
 using namespace nnops;
 
@@ -314,5 +318,171 @@ NNOPS_TEST(attention_flash_matches_ref) {
 
         const TensorView* mp = c.mask ? &mask : nullptr;
         NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, mp, 1e-3f, 1e-4f));
+    }
+}
+
+// ============================================================
+// f16 fast path (vs the f32 reference on the same data)
+// ============================================================
+
+namespace {
+
+using nnops::backend::cpu::half;
+
+/// f16 fast path vs the f32 reference computed on the *same* underlying data —
+/// the pattern shared by the other f16 GEMM tests (matmul, conv2d). Returns the
+/// max absolute element-wise deviation so the caller can compare it to a
+/// tolerance and report the margin.
+float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
+                                const TensorView& q32, const TensorView& k32, const TensorView& v32,
+                                const TensorView* m32,
+                                const TensorView& q16, const TensorView& k16, const TensorView& v16,
+                                const TensorView* m16)
+{
+    auto op = Attention::create(attrs, Backend::CPU);
+
+    // f32 reference baseline.
+    std::vector<TensorDesc> rdescs = {q32.desc(), k32.desc(), v32.desc()};
+    std::vector<TensorView> rins   = {q32, k32, v32};
+    if (m32) { rdescs.push_back(m32->desc()); rins.push_back(*m32); }
+    auto rout_descs = op->getOutputTensorDesc(rdescs);
+    const int64_t out_numel = rout_descs[0].numel();
+    std::vector<float> ref_buf(static_cast<size_t>(out_numel));
+    auto ref_out = test::make_planar(rout_descs[0], ref_buf.data());
+    nnops::backend::cpu::reference::attention_ref(attrs, ref_out, rins, {}, nullptr);
+
+    // f16 fast path (scratch pooled internally by the kernel).
+    std::vector<TensorDesc> fdescs = {q16.desc(), k16.desc(), v16.desc()};
+    std::vector<TensorView> fins   = {q16, k16, v16};
+    if (m16) { fdescs.push_back(m16->desc()); fins.push_back(*m16); }
+    auto fout_descs = op->getOutputTensorDesc(fdescs);
+    std::vector<half> fast_buf(static_cast<size_t>(out_numel));
+    auto fast_out = test::make_planar(fout_descs[0], fast_buf.data());
+    op->compute(fast_out, fins, {}, nullptr);
+
+    const auto fast_f32 = test::f16_to_f32(fast_buf);
+    float max_dev = 0.0f;
+    for (int64_t i = 0; i < out_numel; ++i) {
+        max_dev = std::max(max_dev,
+            std::abs(fast_f32[static_cast<size_t>(i)] - ref_buf[static_cast<size_t>(i)]));
+    }
+    return max_dev;
+}
+
+/// Build the f32 + f16 views for one case (merged rank-3 or explicit rank-4,
+/// decided by the shapes), run fast-vs-ref and return the max deviation.
+/// @p mshape empty means "no mask".
+float run_f16_case(const AttentionAttributes& attrs,
+                   const std::vector<int64_t>& qshape,
+                   const std::vector<int64_t>& kshape,
+                   const std::vector<int64_t>& vshape,
+                   const std::vector<int64_t>& mshape,
+                   uint64_t seed)
+{
+    auto [q32v, q32] = test::make_random_tensor(qshape, -1.0f, 1.0f, seed);
+    auto [k32v, k32] = test::make_random_tensor(kshape, -1.0f, 1.0f, seed + 1);
+    auto [v32v, v32] = test::make_random_tensor(vshape, -1.0f, 1.0f, seed + 2);
+
+    const bool has_mask = !mshape.empty();
+    std::vector<float> m32v;
+    std::vector<half>  m16v;
+    TensorView m32, m16;
+    if (has_mask) {
+        auto [mv, m] = test::make_random_tensor(mshape, -2.0f, 2.0f, seed + 3);
+        m32v = std::move(mv);
+        m32  = m;
+        m16v = test::f32_to_f16(m32v);
+        m16  = TensorView(std::span<const int64_t>(mshape), DataType::f16, m16v.data());
+    }
+
+    auto q16v = test::f32_to_f16(q32v);
+    auto k16v = test::f32_to_f16(k32v);
+    auto v16v = test::f32_to_f16(v32v);
+    TensorView q16(std::span<const int64_t>(qshape), DataType::f16, q16v.data());
+    TensorView k16(std::span<const int64_t>(kshape), DataType::f16, k16v.data());
+    TensorView v16(std::span<const int64_t>(vshape), DataType::f16, v16v.data());
+
+    return attention_f16_fast_vs_ref(attrs, q32, k32, v32, has_mask ? &m32 : nullptr,
+                                     q16, k16, v16, has_mask ? &m16 : nullptr);
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(attention_f16_routes_to_fast_path) {
+    // f16 must resolve a real plan (workspace_size != 0), i.e. take the tiled
+    // fast path rather than falling through to the f32-only reference — which
+    // would silently interpret the f16 buffers as f32.
+    const int64_t qshape[] = {1, 8, 32};
+    auto [q16v, q16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 400);
+    auto [k16v, k16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 401);
+    auto [v16v, v16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 402);
+
+    AttentionAttributes attrs;
+    attrs.num_heads = 2;
+
+    const TensorDesc descs[] = {q16.desc(), k16.desc(), v16.desc()};
+    const auto plan = nnops::backend::cpu::get_attention_plan(attrs, descs, {}, 1, false);
+    NNOPS_EXPECT_TRUE(plan.workspace_size != 0);
+}
+
+NNOPS_TEST(attention_f16_matches_ref) {
+    // f16 tiled standard path (Sq*Sk < kFlashMinScores): merged and explicit
+    // layouts, multi-head, an additive mask, and head_dim > Kc (multi-k-block
+    // GEMM1). The f32 reference on the same data is the ground truth.
+    struct Case { std::vector<int64_t> qshape, kshape, vshape, mshape;
+                  int64_t heads; float scale; };
+    const Case cases[] = {
+        // merged [B, S, H*D], single head.
+        {{1, 4, 8},    {1, 4, 8},    {1, 4, 8},    {},        1, 0.0f},
+        // merged, multi-head (H=2 -> per-head D=32).
+        {{2, 8, 64},   {2, 8, 64},   {2, 8, 64},   {},        2, 0.0f},
+        // merged, additive mask + non-default scale, H=3 (per-head D=8).
+        {{2, 6, 24},   {2, 6, 24},   {2, 6, 24},   {6, 6},    3, 0.5f},
+        // merged, H=8 (per-head D=16), masked.
+        {{1, 16, 128}, {1, 16, 128}, {1, 16, 128}, {16, 16},  8, 0.0f},
+        // head_dim (512) > Kc (128): multi-k-block GEMM1.
+        {{1, 4, 512},  {1, 4, 512},  {1, 4, 512},  {},        1, 0.0f},
+        // explicit [B, H, S, D] layout, H=3, per-head D=8.
+        {{2, 3, 5, 8}, {2, 3, 5, 8}, {2, 3, 5, 8}, {},        3, 0.0f},
+    };
+
+    const float tol = nnops::test::kF16AccumTol;
+    float worst = 0.0f;
+    for (const auto& c : cases) {
+        AttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+        attrs.scale     = c.scale;
+        const float dev = run_f16_case(attrs, c.qshape, c.kshape, c.vshape, c.mshape, 500);
+        worst = std::max(worst, dev);
+    }
+    std::printf("      f16 attention (standard): max deviation %.4f (tol %.3f)\n", worst, tol);
+    if (worst > tol) {
+        throw std::runtime_error("f16 attention standard-path deviation " +
+                                 std::to_string(worst) + " > tol " + std::to_string(tol));
+    }
+}
+
+NNOPS_TEST(attention_f16_flash_matches_ref) {
+    // Large Sq*Sk routes through the f16 FlashAttention path (online softmax
+    // with f16 running max/sum), single- and multi-KV-block, with and without a
+    // mask.
+    struct Case { std::vector<int64_t> qshape, mshape; int64_t heads; };
+    const Case cases[] = {
+        {{1, 256, 64},  {},        2},   // Sq*Sk = 65536, H*D = 64
+        {{1, 320, 32},  {320, 320},1},   // masked
+        {{1, 512, 128}, {},        1},   // D=128 -> multi-KV-block
+    };
+
+    const float tol = nnops::test::kF16AccumTol;
+    float worst = 0.0f;
+    for (const auto& c : cases) {
+        AttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+        worst = std::max(worst, run_f16_case(attrs, c.qshape, c.qshape, c.qshape, c.mshape, 600));
+    }
+    std::printf("      f16 attention (flash): max deviation %.4f (tol %.3f)\n", worst, tol);
+    if (worst > tol) {
+        throw std::runtime_error("f16 attention flash-path deviation " +
+                                 std::to_string(worst) + " > tol " + std::to_string(tol));
     }
 }

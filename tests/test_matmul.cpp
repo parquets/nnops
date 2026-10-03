@@ -31,21 +31,9 @@ void matmul_ref(const MatMulAttributes& attrs,
                 void* workspace);
 }
 
-// ============================================================
-// f16 GEMM comparison tolerance
-// ============================================================
-//
-// The f16 MMA kernels accumulate in different precisions per arch:
-//   - x86_64:  fp32 accumulators (F16C widen → FMA → narrow), error ~fp32.
-//   - aarch64: native fp16 accumulators (vfmaq_laneq_f16), so the error grows
-//              with K and reaches ~0.09 for K=256 (≈3-4 fp16 ulp of the result).
-// The tolerance is therefore arch-specific; the x86 value would be far too
-// tight on aarch64 for any K beyond a few dozen.
-#if defined(NNOPS_ARCH_AARCH64)
-inline constexpr float kF16GemmTol = 2e-1f;
-#else
-inline constexpr float kF16GemmTol = 5e-2f;
-#endif
+// f16 GEMM comparison tolerance: the arch-aware shared constant from
+// common/test_helpers.hpp (x86 fp32 accumulators vs aarch64 native fp16).
+using nnops::test::kF16AccumTol;
 
 // ============================================================
 // Basic 2D MatMul
@@ -1226,7 +1214,55 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
 
     for (int64_t i = 0; i < descs[0].numel(); ++i) {
         float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
-        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16GemmTol);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16AccumTol);
+    }
+}
+
+NNOPS_TEST(matmul_f16_transpose_b_packed) {
+    // f16 transpose_b through the packed path — the route that transposes B into
+    // the pooled panel scratch (pack_trans_n16/n8/n1_f16). The shapes make the N
+    // cascade hit all three panel widths (25 = 16 + 8 + 1) and K exercise an
+    // 8-block plus a scalar tail (13 = 8 + 5).
+    auto [a_f32, _]  = test::make_random_tensor({7, 13},  -1.0f, 1.0f, 901);  // [M, K]
+    auto [b_f32, __] = test::make_random_tensor({25, 13}, -1.0f, 1.0f, 902);  // phys [N, K]
+    auto a_f16 = test::f32_to_f16(a_f32);
+    auto b_f16 = test::f32_to_f16(b_f32);
+
+    const int64_t a_shape[] = {7, 13};
+    const int64_t b_shape[] = {25, 13};
+    TensorView a(a_shape, DataType::f16, a_f16.data());
+    TensorView b(b_shape, DataType::f16, b_f16.data());
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(25));
+
+    std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, nullptr);
+
+    // f32 reference on the same values.
+    const int64_t a32_shape[] = {7, 13};
+    const int64_t b32_shape[] = {25, 13};
+    TensorView a32(a32_shape, DataType::f32, a_f32.data());
+    TensorView b32(b32_shape, DataType::f32, b_f32.data());
+    const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(ref_descs[0].numel());
+    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32, b32};
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (int64_t i = 0; i < descs[0].numel(); ++i) {
+        float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16AccumTol);
     }
 }
 
@@ -1367,7 +1403,7 @@ NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
 
     for (int64_t i = 0; i < descs[0].numel(); ++i) {
         float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
-        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16GemmTol);
+        NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16AccumTol);
     }
 }
 
@@ -1521,7 +1557,7 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
                 for (int64_t i = 0; i < descs[0].numel(); ++i) {
                     const float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
                     const float r = ref_buf[static_cast<size_t>(i)];
-                    if (std::fabs(v - r) > kF16GemmTol) {
+                    if (std::fabs(v - r) > kF16AccumTol) {
                         throw std::runtime_error(
                             "matmul_f16_nn_direct_tile_remainders: mismatch at M="
                             + std::to_string(M) + " K=" + std::to_string(K)

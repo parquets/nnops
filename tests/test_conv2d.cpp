@@ -14,8 +14,11 @@
 #include <cmath>
 #include <atomic>
 #include <thread>
+#include <cstdio>
+#include <stdexcept>
 
 using namespace nnops;
+using nnops::backend::cpu::half;
 
 // ============================================================
 // Hand-verified small tests
@@ -378,6 +381,70 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
     return true;
 }
 
+/// Run one conv config on a single set of values: the f32 reference is the
+/// ground truth, and the f16 fast path runs on the same values converted to
+/// f16. Returns the max absolute deviation over the output.
+float conv2d_f16_case(const Conv2DAttributes& attrs,
+                      const std::vector<int64_t>& ishape,
+                      const std::vector<int64_t>& wshape,
+                      bool bias, uint64_t seed)
+{
+    auto [in32v, in32] = test::make_random_tensor(ishape, -1.0f, 1.0f, seed);
+    auto [w32v, w32]   = test::make_random_tensor(wshape, -1.0f, 1.0f, seed + 1);
+
+    std::vector<float> b32v;
+    TensorView b32;
+    if (bias) {
+        b32v = std::vector<float>(static_cast<size_t>(wshape[0]), 0.0f);
+        test::XorShift128 rng(seed + 2);
+        rng.fill_float(b32v.data(), static_cast<int64_t>(b32v.size()), -1.0f, 1.0f);
+        const int64_t bshape[] = {wshape[0]};
+        b32 = TensorView(bshape, DataType::f32, b32v.data());
+    }
+
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    // f32 reference (ground truth).
+    std::vector<TensorDesc> d32 = {in32.desc(), w32.desc()};
+    std::vector<TensorView> i32 = {in32, w32};
+    if (bias) { d32.push_back(b32.desc()); i32.push_back(b32); }
+    auto od32 = op->getOutputTensorDesc(d32);
+    const int64_t n = od32[0].numel();
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_planar(od32[0], ref_buf.data());
+    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
+
+    // f16 fast path on the same values.
+    auto in16v = test::f32_to_f16(in32v);
+    auto w16v  = test::f32_to_f16(w32v);
+    TensorView in16(std::span<const int64_t>(ishape), DataType::f16, in16v.data());
+    TensorView w16(std::span<const int64_t>(wshape), DataType::f16, w16v.data());
+
+    std::vector<TensorDesc> d16 = {in16.desc(), w16.desc()};
+    std::vector<TensorView> i16 = {in16, w16};
+    std::vector<half> b16v;
+    TensorView b16;
+    if (bias) {
+        b16v = test::f32_to_f16(b32v);
+        const int64_t bshape[] = {wshape[0]};
+        b16 = TensorView(bshape, DataType::f16, b16v.data());
+        d16.push_back(b16.desc());
+        i16.push_back(b16);
+    }
+    auto od16 = op->getOutputTensorDesc(d16);
+    std::vector<half> out16(static_cast<size_t>(n));
+    auto fast_out = test::make_planar(od16[0], out16.data());
+    op->compute(fast_out, i16, {}, nullptr);
+
+    auto fast32 = test::f16_to_f32(out16);
+    float dev = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        dev = std::max(dev,
+            std::abs(fast32[static_cast<size_t>(i)] - ref_buf[static_cast<size_t>(i)]));
+    }
+    return dev;
+}
+
 }  // anonymous namespace
 
 NNOPS_TEST(conv2d_im2col_matches_ref) {
@@ -547,46 +614,110 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
     }
 }
 
-NNOPS_TEST(conv2d_im2col_f16) {
-    // f16 fast path must match the f32 reference within f16 precision.
-    const int64_t ishape[] = {1, 4, 14, 14};
-    const int64_t wshape[] = {8, 4, 3, 3};
+NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
+    // f16 fast path against the f32 reference on the same values, across the
+    // configurations the f32 table above covers: bias, groups > 1, stride and
+    // dilation > 1, a non-square kernel, and K = C*KH*KW past KC_F16 (128) so
+    // the reduction spans multiple k-blocks.
+    struct Case { std::vector<int64_t> ishape, wshape;
+                  int64_t kh, kw, sh, sw, ph, pw, dh, dw, groups; bool bias; };
+    const Case cases[] = {
+        // baseline 3x3 + bias.
+        {{1, 3, 16, 16}, {8, 3, 3, 3},   3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        // stride 2.
+        {{2, 4, 13, 15}, {6, 4, 3, 3},   3, 3, 2, 2, 1, 1, 1, 1, 1, false},
+        // padding 2 + bias.
+        {{1, 2, 12, 12}, {4, 2, 3, 3},   3, 3, 1, 1, 2, 2, 1, 1, 1, true},
+        // groups 2.
+        {{1, 4, 20, 20}, {8, 2, 2, 2},   2, 2, 2, 2, 1, 1, 1, 1, 2, false},
+        // 1x1 pointwise + bias.
+        {{1, 3, 16, 16}, {6, 3, 1, 1},   1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+        // non-square kernel 3x5.
+        {{1, 3, 18, 22}, {6, 3, 3, 5},   3, 5, 1, 1, 1, 2, 1, 1, 1, false},
+        // dilation 2.
+        {{1, 3, 18, 18}, {6, 3, 3, 3},   3, 3, 1, 1, 1, 1, 2, 2, 1, false},
+        // K = 32*3*3 = 288 > KC_F16 (128): multi-k-block reduction.
+        {{1, 32, 10, 10}, {16, 32, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        // wide N (32) with groups, deeper K, no bias.
+        {{1, 16, 12, 12}, {32, 8, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},
+    };
 
-    auto [in_f32, input_f32]   = test::make_random_tensor(ishape, -1.0f, 1.0f, 101);
-    auto [w_f32, weight_f32]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 102);
+    const float tol = nnops::test::kF16AccumTol;
+    float worst = 0.0f;
+    for (const auto& c : cases) {
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.kh, c.kw};
+        attrs.stride      = {c.sh, c.sw};
+        attrs.dilation    = {c.dh, c.dw};
+        attrs.padding     = {c.ph, c.pw};
+        attrs.groups      = c.groups;
+        worst = std::max(worst, conv2d_f16_case(attrs, c.ishape, c.wshape, c.bias, 300));
+    }
+    std::printf("      f16 conv2d (im2col): max deviation %.4f (tol %.3f)\n", worst, tol);
+    if (worst > tol) {
+        throw std::runtime_error("f16 conv2d deviation " + std::to_string(worst) +
+                                 " > tol " + std::to_string(tol));
+    }
+}
+
+NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
+    // The im2col gather must walk the input through the view's row pitch: the
+    // f16 input here is a padded buffer (W + 3 slack columns per row, zero
+    // filled) whose logical region holds the same values as the dense f32
+    // reference input. Any pitch-ignoring read picks up the zero slack and
+    // diverges.
+    const int64_t C = 4, H = 9, W = 11, Wpad = W + 3;
+    const int64_t wshape[] = {8, C, 3, 3};
+
+    const int64_t ishape[] = {1, C, H, W};
+    auto [in32v, in32] = test::make_random_tensor(ishape, -1.0f, 1.0f, 401);
+    auto [w32v, w32]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 402);
 
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
-    attrs.stride  = {1, 1};
-    attrs.padding = {1, 1};
+    attrs.padding     = {1, 1};
 
-    // f32 reference.
-    std::vector<TensorDesc> f32_descs = {input_f32.desc(), weight_f32.desc()};
-    std::vector<TensorView> f32_ins   = {input_f32, weight_f32};
     auto op = Conv2D::create(attrs, Backend::CPU);
-    auto f32_out_descs = op->getOutputTensorDesc(f32_descs);
-    const int64_t out_numel = f32_out_descs[0].numel();
-    std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(f32_out_descs[0], ref_buf.data());
-    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, f32_ins, {}, nullptr);
 
-    // f16 fast path.
-    auto in_f16  = test::f32_to_f16(in_f32);
-    auto w_f16   = test::f32_to_f16(w_f32);
-    TensorView input_f16(ishape, DataType::f16, in_f16.data());
-    TensorView weight_f16(wshape, DataType::f16, w_f16.data());
+    const std::vector<TensorDesc> d32 = {in32.desc(), w32.desc()};
+    const std::vector<TensorView> i32 = {in32, w32};
+    auto od = op->getOutputTensorDesc(d32);
+    const int64_t n = od[0].numel();
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_planar(od[0], ref_buf.data());
+    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
 
-    std::vector<TensorDesc> f16_descs = {input_f16.desc(), weight_f16.desc()};
-    std::vector<TensorView> f16_ins   = {input_f16, weight_f16};
-    auto f16_out_descs = op->getOutputTensorDesc(f16_descs);
-    std::vector<nnops::backend::cpu::half> out_f16(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(f16_out_descs[0], out_f16.data());
-    op->compute(fast_out, f16_ins, {}, nullptr);
-
-    auto fast_f32 = test::f16_to_f32(out_f16);
-    for (int64_t i = 0; i < out_numel; ++i) {
-        NNOPS_EXPECT_NEAR(fast_f32[i], ref_buf[i], 2e-2f);
+    // Padded f16 input: rows of Wpad elements, only the first W logical.
+    auto in16v = test::f32_to_f16(in32v);
+    std::vector<half> padded(static_cast<size_t>(C * H * Wpad), static_cast<half>(0));
+    for (int64_t c = 0; c < C; ++c) {
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t w = 0; w < W; ++w) {
+                padded[static_cast<size_t>((c * H + h) * Wpad + w)] =
+                    in16v[static_cast<size_t>((c * H + h) * W + w)];
+            }
+        }
     }
+    TensorView in16(ishape, DataType::f16, padded.data(),
+                    Wpad * static_cast<int64_t>(sizeof(half)));
+    auto w16v = test::f32_to_f16(w32v);
+    TensorView w16(wshape, DataType::f16, w16v.data());
+
+    const std::vector<TensorDesc> d16 = {in16.desc(), w16.desc()};
+    const std::vector<TensorView> i16 = {in16, w16};
+    auto od16 = op->getOutputTensorDesc(d16);
+    std::vector<half> out16(static_cast<size_t>(n));
+    auto fast_out = test::make_planar(od16[0], out16.data());
+    op->compute(fast_out, i16, {}, nullptr);
+
+    auto fast32 = test::f16_to_f32(out16);
+    float worst = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        worst = std::max(worst,
+            std::abs(fast32[static_cast<size_t>(i)] - ref_buf[static_cast<size_t>(i)]));
+    }
+    std::printf("      f16 conv2d (pitched input): max deviation %.4f\n", worst);
+    NNOPS_EXPECT_NEAR(worst, 0.0f, nnops::test::kF16AccumTol);
 }
 
 // ============================================================
