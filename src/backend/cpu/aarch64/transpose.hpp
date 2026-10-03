@@ -264,6 +264,11 @@ inline void transpose_8x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, fl
     h = vreinterpretq_f16_f32(vcombine_f32(vget_high_f32(abcd1.val[1]), vget_high_f32(efgh1.val[1])));
 }
 
+/// NOTE: unreachable today — the f16 RHS cascade is nr_f16 = {16, 8, 1} and no
+/// 1x12 f16 micro-kernel exists, so pack_trans_n12_f16 is never dispatched.
+/// Its output order is therefore unvalidated against an mma; do not wire up an
+/// nr=12 f16 panel without checking it (transpose_16x8_f16 had the same shape of
+/// latent bug, see below).
 inline void transpose_12x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, float16x8_t& d,
                                 float16x8_t& e, float16x8_t& f, float16x8_t& g, float16x8_t& h,
                                 float16x8_t& i, float16x8_t& j, float16x8_t& k, float16x8_t& l) noexcept {
@@ -308,51 +313,26 @@ inline void transpose_16x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, f
                                 float16x8_t& e, float16x8_t& f, float16x8_t& g, float16x8_t& h,
                                 float16x8_t& i, float16x8_t& j, float16x8_t& k, float16x8_t& l,
                                 float16x8_t& m, float16x8_t& n, float16x8_t& o, float16x8_t& p) noexcept {
-    const float16x8x2_t ab = vzipq_f16(a, b);
-    const float16x8x2_t cd = vzipq_f16(c, d);
-    const float16x8x2_t ef = vzipq_f16(e, f);
-    const float16x8x2_t gh = vzipq_f16(g, h);
-    const float16x8x2_t ij = vzipq_f16(i, j);
-    const float16x8x2_t kl = vzipq_f16(k, l);
-    const float16x8x2_t mn = vzipq_f16(m, n);
-    const float16x8x2_t op = vzipq_f16(o, p);
+    // Two independent 8x8 transposes: rows 0..7 yield the low half of each of
+    // the 8 output columns, rows 8..15 the high half. Interleaving them gives
+    // the plain row-major 16-column transposed block that the packed-B
+    // convention expects — [K][nr] with ldb == nr == 16, which
+    // mma_pack_1x16_f16 reads at B + r*ldb + h*8 for the k residue r and the
+    // 8-wide half h. (A single 16-wide butterfly would produce a 4-row-block
+    // interleaved order instead, which the pack's linear stores cannot express.)
+    float16x8_t lo[8] = {a, b, c, d, e, f, g, h};
+    float16x8_t hi[8] = {i, j, k, l, m, n, o, p};
+    transpose_8x8_f16(lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7]);
+    transpose_8x8_f16(hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7]);
 
-    float32x4x2_t ab_f32{ vreinterpretq_f32_f16(ab.val[0]), vreinterpretq_f32_f16(ab.val[1]) };
-    float32x4x2_t cd_f32{ vreinterpretq_f32_f16(cd.val[0]), vreinterpretq_f32_f16(cd.val[1]) };
-    float32x4x2_t ef_f32{ vreinterpretq_f32_f16(ef.val[0]), vreinterpretq_f32_f16(ef.val[1]) };
-    float32x4x2_t gh_f32{ vreinterpretq_f32_f16(gh.val[0]), vreinterpretq_f32_f16(gh.val[1]) };
-    float32x4x2_t ij_f32{ vreinterpretq_f32_f16(ij.val[0]), vreinterpretq_f32_f16(ij.val[1]) };
-    float32x4x2_t kl_f32{ vreinterpretq_f32_f16(kl.val[0]), vreinterpretq_f32_f16(kl.val[1]) };
-    float32x4x2_t mn_f32{ vreinterpretq_f32_f16(mn.val[0]), vreinterpretq_f32_f16(mn.val[1]) };
-    float32x4x2_t op_f32{ vreinterpretq_f32_f16(op.val[0]), vreinterpretq_f32_f16(op.val[1]) };
-
-    float32x4x2_t abcd_f32 = vzipq_f32(ab_f32.val[0], cd_f32.val[0]);
-    float32x4x2_t efgh_f32 = vzipq_f32(ef_f32.val[0], gh_f32.val[0]);
-    float32x4x2_t ijkl_f32 = vzipq_f32(ij_f32.val[0], kl_f32.val[0]);
-    float32x4x2_t mnop_f32 = vzipq_f32(mn_f32.val[0], op_f32.val[0]);
-
-    a = vreinterpretq_f16_f32(abcd_f32.val[0]);
-    b = vreinterpretq_f16_f32(efgh_f32.val[0]);
-    c = vreinterpretq_f16_f32(ijkl_f32.val[0]);
-    d = vreinterpretq_f16_f32(mnop_f32.val[0]);
-    e = vreinterpretq_f16_f32(abcd_f32.val[1]);
-    f = vreinterpretq_f16_f32(efgh_f32.val[1]);
-    g = vreinterpretq_f16_f32(ijkl_f32.val[1]);
-    h = vreinterpretq_f16_f32(mnop_f32.val[1]);
-
-    abcd_f32 = vzipq_f32(ab_f32.val[1], cd_f32.val[1]);
-    efgh_f32 = vzipq_f32(ef_f32.val[1], gh_f32.val[1]);
-    ijkl_f32 = vzipq_f32(ij_f32.val[1], kl_f32.val[1]);
-    mnop_f32 = vzipq_f32(mn_f32.val[1], op_f32.val[1]);
-
-    i = vreinterpretq_f16_f32(abcd_f32.val[0]);
-    j = vreinterpretq_f16_f32(efgh_f32.val[0]);
-    k = vreinterpretq_f16_f32(ijkl_f32.val[0]);
-    l = vreinterpretq_f16_f32(mnop_f32.val[0]);
-    m = vreinterpretq_f16_f32(abcd_f32.val[1]);
-    n = vreinterpretq_f16_f32(efgh_f32.val[1]);
-    o = vreinterpretq_f16_f32(ijkl_f32.val[1]);
-    p = vreinterpretq_f16_f32(mnop_f32.val[1]);
+    a = lo[0]; b = hi[0];
+    c = lo[1]; d = hi[1];
+    e = lo[2]; f = hi[2];
+    g = lo[3]; h = hi[3];
+    i = lo[4]; j = hi[4];
+    k = lo[5]; l = hi[5];
+    m = lo[6]; n = hi[6];
+    o = lo[7]; p = hi[7];
 }
 
 inline void transpose_24x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, float16x8_t& d,
