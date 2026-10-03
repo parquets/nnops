@@ -304,25 +304,36 @@ void bench_i8_case(const GeMMCase& c) {
 // exists to expose. This builds both routes up front and alternates them round
 // by round inside one process, so the ratio is measured under matched
 // conditions. Read the per-round ratios, not the absolute GFLOPS.
+//
+// The A-side of each pair is built to take the unpacked-A ("direct") route and
+// the B-side the packed route. Two ways to force packing exist and they answer
+// different questions:
+//   * transpose_a=true  — packing is required for correctness (A is stored
+//                         K×M), so the pair also changes A's memory layout;
+//   * a wide A row pitch — trips the stride heuristic (lda > PACK_A_STRIDE_THRESHOLD)
+//                         with the layout held fixed.
+// Both are exposed; read the per-round ratios.
+template <typename T>
 struct RouteAB {
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
 
     OpPtr op;
-    std::vector<float> a_buf, b_buf, out_buf;
+    std::vector<T> a_buf, b_buf, out_buf;
     TensorView a, b, out;
     TensorView ins[2];
     int64_t M, N, K;
     bool pack_a;
 
-    RouteAB(int64_t m, int64_t k, int64_t n, bool transpose_a, uint64_t seed)
+    RouteAB(int64_t m, int64_t k, int64_t n, bool transpose_a, uint64_t seed,
+            int64_t pad_a = 0)
         : M(m), N(n), K(k) {
-        auto [a_vec, a_view] = make_tensor<float>(transpose_a ? K : M,
-                                                  transpose_a ? M : K,
-                                                  transpose_a ? M : K, seed);
+        const int64_t a_rows = transpose_a ? k : m;
+        const int64_t a_cols = transpose_a ? m : k;
+        auto [a_vec, a_view] = make_tensor<T>(a_rows, a_cols, a_cols + pad_a, seed);
         a_buf = std::move(a_vec);
         a = a_view;
 
-        auto [b_vec, b_view] = make_tensor<float>(K, N, N, seed + 1);
+        auto [b_vec, b_view] = make_tensor<T>(k, n, n, seed + 1);
         b_buf = std::move(b_vec);
         b = b_view;
 
@@ -332,7 +343,7 @@ struct RouteAB {
 
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
-        out_buf.assign(static_cast<size_t>(descs[0].numel()), 0.0f);
+        out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
         out = test::make_planar(descs[0], out_buf.data());
 
         ins[0] = a;
@@ -351,32 +362,39 @@ struct RouteAB {
     }
 };
 
-void bench_route_ab(int64_t M, int64_t K, int64_t N, int rounds = 6, int iters = 20) {
-    RouteAB nn(M, K, N, /*transpose_a=*/false, 1);
-    RouteAB ta(M, K, N, /*transpose_a=*/true, 1);
+/// Build two routes, alternate them round by round, and report the per-round
+/// ratio plus the median. @p la is the expected unpacked-A (direct) side.
+template <typename T>
+void bench_route_ab(const char* tag, const char* la, const char* lb,
+                    int64_t M, int64_t K, int64_t N,
+                    bool ta_a, int64_t pad_a, bool ta_b, int64_t pad_b,
+                    int rounds = 6, int iters = 20) {
+    RouteAB<T> ra(M, K, N, ta_a, 1, pad_a);
+    RouteAB<T> rb(M, K, N, ta_b, 1, pad_b);
 
-    std::printf("  route A/B  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
-                static_cast<long long>(M), static_cast<long long>(K),
+    std::printf("  route A/B %s  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
+                tag, static_cast<long long>(M), static_cast<long long>(K),
                 static_cast<long long>(N), rounds, iters);
-    std::printf("    pack_a: nn=%d ta=%d   (0 = unpacked-A direct route)\n",
-                static_cast<int>(nn.pack_a), static_cast<int>(ta.pack_a));
+    std::printf("    pack_a: %s=%d %s=%d   (0 = unpacked-A direct route)\n",
+                la, static_cast<int>(ra.pack_a), lb, static_cast<int>(rb.pack_a));
 
-    std::vector<double> rn, rt;
+    std::vector<double> va, vb;
     for (int r = 0; r < rounds; ++r) {
-        const double g_nn = nn.time(iters);
-        const double g_ta = ta.time(iters);
-        rn.push_back(g_nn);
-        rt.push_back(g_ta);
-        std::printf("    round %d:  nn=%7.1f  ta=%7.1f   nn/ta=%.3f\n",
-                    r, g_nn, g_ta, g_nn / g_ta);
+        const double ga = ra.time(iters);
+        const double gb = rb.time(iters);
+        va.push_back(ga);
+        vb.push_back(gb);
+        std::printf("    round %d:  %s=%7.1f  %s=%7.1f   %s/%s=%.3f\n",
+                    r, la, ga, lb, gb, la, lb, ga / gb);
     }
 
     auto median = [](std::vector<double> v) {
         std::sort(v.begin(), v.end());
         return v[v.size() / 2];
     };
-    const double mn = median(rn), mt = median(rt);
-    std::printf("    median:   nn=%7.1f  ta=%7.1f   nn/ta=%.3f\n", mn, mt, mn / mt);
+    const double ma = median(va), mb = median(vb);
+    std::printf("    median:   %s=%7.1f  %s=%7.1f   %s/%s=%.3f\n",
+                la, ma, lb, mb, la, lb, ma / mb);
 }
 
 }  // anonymous namespace
@@ -395,8 +413,12 @@ NNOPS_BENCH(matmul_f32_nn_direct_large) {
 
 NNOPS_BENCH(matmul_f32_route_ab) {
     // Paired with matmul_f32_nn_direct_large / matmul_f32_ta_mkn, which measure
-    // the same shapes but in separate, individually-unreliable runs.
-    bench_route_ab(1024, 512, 1024);
+    // the same shapes but in separate, individually-unreliable runs. On aarch64
+    // the two routes also differ in M panel height (pack mr=8, direct mr=6), so
+    // the nn/ta ratio folds in the narrower direct panel.
+    bench_route_ab<float>("f32", "nn", "ta", 1024, 512, 1024,
+                          /*ta_a=*/false, /*pad_a=*/0,
+                          /*ta_b=*/true,  /*pad_b=*/0);
 }
 
 NNOPS_BENCH(matmul_f32_ta_mkn) {
@@ -429,6 +451,86 @@ NNOPS_BENCH(matmul_f16_nn) {
 NNOPS_BENCH(matmul_f16_ta) {
     bench_case({"f16 ta 512x512x256 MKN", 512, 512, 256, /*ta=*/true, /*tb=*/false,
                 /*pad_a=*/0, /*pad_b=*/0, /*f16=*/true});
+}
+
+// f16 pack-vs-direct, measured under matched conditions (see bench_route_ab).
+// Unlike f32, f16 tiles M identically on both routes (mr={8,4,1}; there is no
+// mr_f16_direct), so the ratio here is not tangled up with panel height.
+NNOPS_BENCH(matmul_f16_route_ab) {
+    bench_route_ab<half>("f16", "nn", "ta", 512, 512, 256,
+                         /*ta_a=*/false, /*pad_a=*/0,
+                         /*ta_b=*/true,  /*pad_b=*/0);
+}
+
+NNOPS_BENCH(matmul_f16_route_ab_large) {
+    bench_route_ab<half>("f16", "nn", "ta", 1024, 1024, 1024,
+                         /*ta_a=*/false, /*pad_a=*/0,
+                         /*ta_b=*/true,  /*pad_b=*/0,
+                         /*rounds=*/4, /*iters=*/10);
+}
+
+NNOPS_BENCH(matmul_f16_route_ab_deep_k) {
+    // Deep K. NOTE: with a compact A, lda == K, so K > PACK_A_STRIDE_THRESHOLD
+    // means the stride heuristic fires on *both* sides — this measures packed
+    // vs packed-transposed, not pack vs direct (the plan prints nn=1 ta=1).
+    // A direct route is simply unreachable at this depth without raising the
+    // threshold.
+    bench_route_ab<half>("f16 deep-K (both packed)", "nn", "ta", 512, 2048, 512,
+                         /*ta_a=*/false, /*pad_a=*/0,
+                         /*ta_b=*/true,  /*pad_b=*/0,
+                         /*rounds=*/4, /*iters=*/10);
+}
+
+NNOPS_BENCH(matmul_f16_a_pitch_sweep) {
+    // Walk the A row pitch across PACK_A_STRIDE_THRESHOLD with transpose_a=false
+    // on every row, so lda == pitch and the only thing changing is the plan's
+    // pack_a decision (and the row footprint that drives it). Shows where the
+    // heuristic flips and what the flip costs. Rounds are interleaved across all
+    // pitches so the comparison is thermal-matched (see bench_route_ab).
+    const int64_t M = 512, K = 512, N = 256;
+    const int64_t pads[] = {0, 128, 256, 384, 512, 513, 640, 1024, 3072};
+    const int rounds = 5, iters = 20;
+
+    std::vector<RouteAB<half>> routes;
+    routes.reserve(std::size(pads));
+    for (int64_t pad : pads) {
+        routes.emplace_back(M, K, N, /*transpose_a=*/false, 1, pad);
+    }
+
+    std::printf("  f16 A row-pitch sweep  %lldx%lldx%lld  1T  rounds=%d iters=%d  "
+                "threshold=%lld elems\n",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters,
+                static_cast<long long>(cpu::PACK_A_STRIDE_THRESHOLD));
+
+    std::vector<std::vector<double>> samples(routes.size());
+    for (int r = 0; r < rounds; ++r) {
+        for (size_t i = 0; i < routes.size(); ++i) {
+            samples[i].push_back(routes[i].time(iters));
+        }
+    }
+    for (size_t i = 0; i < routes.size(); ++i) {
+        auto v = samples[i];
+        std::sort(v.begin(), v.end());
+        const int64_t lda = K + pads[i];
+        std::printf("    lda=%5lld elems (%6.1f KB/row)  pack_a=%d   %7.1f GFLOPS\n",
+                    static_cast<long long>(lda),
+                    static_cast<double>(lda) * sizeof(half) / 1024.0,
+                    static_cast<int>(routes[i].pack_a),
+                    v[v.size() / 2]);
+    }
+}
+
+NNOPS_BENCH(matmul_f16_route_ab_stride) {
+    // Layout held fixed (transpose_a=false on both sides) so this isolates the
+    // pack *copy* from the transpose relayout: the direct route reads a compact
+    // A (lda = K, below the heuristic), the packed route trips the stride
+    // heuristic with a wide row pitch (lda = K + PACK_A_STRIDE_THRESHOLD + 512).
+    // The wide pitch is part of the decision the plan makes — read it as "when A
+    // is page-scattered, does packing it back pay off?", not a pure toggle.
+    bench_route_ab<half>("f16 stride-pack", "nn", "nn-wide", 512, 512, 256,
+                         /*ta_a=*/false, /*pad_a=*/0,
+                         /*ta_b=*/false, /*pad_b=*/cpu::PACK_A_STRIDE_THRESHOLD + 512);
 }
 
 // ============================================================
