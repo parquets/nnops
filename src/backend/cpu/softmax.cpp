@@ -8,13 +8,17 @@
 /// Reference: onnxruntime MlasComputeSoftmax + MlasReduceMaximumF32Kernel +
 ///            MlasComputeSumExpF32Kernel + MlasComputeSoftmaxOutputF32Kernel.
 ///
-/// Three paths:
-///   - Packed SIMD (axis == rank-1, pack > 1): per-lane SIMD reduction
-///     within each physical row. Delegates to kernel::softmax_process_packed_channel.
-///   - Standard SIMD fast path (axis == rank-1, pack == 1): contiguous
-///     tail. Delegates to kernel::softmax_process_standard_row.
-///   - General scalar path: reference-style outer/D/inner decomposition
-///     with strided access, correct for all layouts and axes.
+/// Five dispatch paths, tried in the order below:
+///   - axis == rank-1, pack > 1: per-lane SIMD within each physical row
+///     (kernel::softmax_per_lane).
+///   - axis == 1, pack > 1 (NCHWC8): per-lane across channel blocks
+///     (kernel::softmax_process_packed_channel).
+///   - pack > 1, any other axis: per-lane SIMD, strided along the axis
+///     (kernel::softmax_per_lane).
+///   - axis == rank-1, pack == 1: contiguous-tail SIMD
+///     (kernel::softmax_process_standard_row).
+///   - otherwise: scalar reference-style outer/D/inner decomposition with
+///     strided access, correct for all layouts and axes.
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems().
 
@@ -163,7 +167,6 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(temperature > 0.0f);
     const float inv_T = 1.0f / temperature;
 
-    // Normalize axis
     int64_t axis = attrs.axis;
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);

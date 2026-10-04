@@ -157,9 +157,10 @@ constexpr std::array<std::array<MmaDirectF16Fn, 3>, 3> mma_direct_f16_fn = {{
 
 
 // ---- tiled pack entry points -------------------------------------------
-// Panels are packed densely (contiguous); panel p of size mr/nr occupies the
-// next mr*kc / nr*kc elements. This matches the nn_compute reference and the
-// low-level pack kernels (which write output contiguously).
+// A panel's payload is contiguous (mr*kc elements for A, nr*kc for B) but is
+// laid down at the caller's uniform 64-byte-aligned stride `ldd`, not packed
+// end to end. This matches the nn_compute reference and the low-level pack
+// kernels (which write their panel's output contiguously).
 
 void tile_pack_lhs(bool trans, int mc, int kc,
                    float* dst, int ldd, const float* src, int lds, float scale) {
@@ -253,9 +254,10 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 // ---- mma entry points ---------------------------------------------------
 //
 // `maybe_packed_b`/`ldb` describe B for the pack path:
-//   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance nr*K)
+//   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance by the
+//              aligned stride ldd_b = align_up(nr_max*Kc*elem,64)/elem)
 //   ldb >= 0 → B is raw (row stride ldb, advance nr per panel)
-// Packed A panels advance contiguously by mr*Kc.
+// Packed A panels advance by the aligned stride ldd_a.
 
 // f32 — packed A, packed/raw B
 void mrkcnc_mma_pack(int Nc, int Kc,
@@ -364,7 +366,7 @@ void mrkcnc_mma_direct(int Nc, int Kc,
     }
 }
 
-// f32 — packed: packed_a advances contiguously by mr*Kc
+// f32 — packed: packed_a advances by the aligned stride ldd_a
 void tile_mma_pack(int Mc, int Nc, int Kc,
                    float* c, int ldc,
                    const float* packed_a, const float* maybe_packed_b, int ldb,
@@ -417,7 +419,7 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
     }
 }
 
-// f16 — packed: packed_a advances contiguously by mr*Kc
+// f16 — packed: packed_a advances by the aligned stride ldd_a
 void tile_mma_pack(int Mc, int Nc, int Kc,
                    half* c, int ldc,
                    const half* packed_a, const half* maybe_packed_b, int ldb,
@@ -635,7 +637,6 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
 
 
 // ---- tile scale -----------------------------------------------------------
-// SIMD-accelerated in-place scale: C[i] *= scale
 // Uses 8-wide SIMD lanes (v_f32x8 / v_f16x8) with scalar tail for remainder.
 
 template <typename T>

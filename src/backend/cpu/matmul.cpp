@@ -7,7 +7,7 @@
 /// direction, and the workspace size all come from get_matmul_plan()
 /// (matmul_helper): the loop order is NKM when split on N, MKN when split on M.
 ///
-/// GEMMs below GEMM_FAST_PATH_THRESHOLD MACs route to the reference. Work is
+/// f32 GEMMs below GEMM_FAST_PATH_THRESHOLD MACs route to the reference. Work is
 /// split on the larger dimension via ctx.cpu.run; C tiles are disjoint with no
 /// reductions, so the result is bit-identical to serial.
 ///
@@ -366,10 +366,9 @@ inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
 /// non-transposed B) the naive per-output form strides by the row pitch, so
 /// every element is a fresh cache line. Sweeping along the row and accumulating
 /// instead — the transposed layout's axis order — touches the same bytes but
-/// contiguously; measured 732 → 42 us for r_b at 1024x1024x512. The sum is
-/// unchanged: int32 accumulates of int8 products cannot overflow for any K this
-/// kernel accepts, and integer addition is associative, so the result stays
-/// bit-identical to the reference.
+/// contiguously. The sum is unchanged: int32 accumulates of int8 products
+/// cannot overflow for any K this kernel accepts, and integer addition is
+/// associative, so the result stays bit-identical to the reference.
 ///
 /// The output index is split into contiguous slabs so the whole thing runs on
 /// the pool; slabs are disjoint, so no atomics or per-thread partials are
@@ -643,7 +642,6 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
             }
         }
 
-        // Precompute the raw int8 reductions for the epilogue.
         compute_int8_reductions(a_p, lda, b_p, ldb, attrs, M, N, K,
                                 r_a.data(), r_b.data(), ctx);
 
