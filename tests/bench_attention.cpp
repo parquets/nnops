@@ -190,6 +190,11 @@ NNOPS_BENCH(attention_f32_standard_wide) {
     bench_attention_case({"attn f32 standard-wide B1 S128 H8 D128", 1, 128, 8, 128});
 }
 
+NNOPS_BENCH(attention_f32_standard_d256) {
+    // D=256 -> GEMM1's K loop runs twice at Kc=128.
+    bench_attention_case({"attn f32 standard D256 B2 S128 H8 D256", 2, 128, 8, 256});
+}
+
 NNOPS_BENCH(attention_f32_flash) {
     // Sq*Sk = 262144 -> online-softmax FlashAttention path.
     bench_attention_case({"attn f32 flash B1 S512 H8 D64", 1, 512, 8, 64});
@@ -198,6 +203,16 @@ NNOPS_BENCH(attention_f32_flash) {
 NNOPS_BENCH(attention_f32_flash_128) {
     // D=128 -> multi-KV-block flash path.
     bench_attention_case({"attn f32 flash D128 B1 S512 H16 D128", 1, 512, 16, 128});
+}
+
+NNOPS_BENCH(attention_f32_flash_d256) {
+    // D=256 in the flash path -> GEMM1's K loop runs twice at Kc=128.
+    bench_attention_case({"attn f32 flash D256 B1 S1024 H8 D256", 1, 1024, 8, 256});
+}
+
+NNOPS_BENCH(attention_f32_flash_d192) {
+    // D=192 -> GEMM1's K loop splits 128 + 64 at Kc=128.
+    bench_attention_case({"attn f32 flash D192 B1 S1024 H8 D192", 1, 1024, 8, 192});
 }
 
 NNOPS_BENCH(attention_f32_flash_masked) {
@@ -220,6 +235,11 @@ NNOPS_BENCH(attention_f16_standard_wide) {
                           /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
+NNOPS_BENCH(attention_f16_standard_d256) {
+    bench_attention_case({"attn f16 standard D256 B2 S128 H8 D256", 2, 128, 8, 256,
+                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+}
+
 NNOPS_BENCH(attention_f16_flash) {
     bench_attention_case({"attn f16 flash B1 S512 H8 D64", 1, 512, 8, 64,
                           /*Sk=*/0, /*mask=*/false, /*f16=*/true});
@@ -227,6 +247,11 @@ NNOPS_BENCH(attention_f16_flash) {
 
 NNOPS_BENCH(attention_f16_flash_128) {
     bench_attention_case({"attn f16 flash D128 B1 S512 H16 D128", 1, 512, 16, 128,
+                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(attention_f16_flash_d256) {
+    bench_attention_case({"attn f16 flash D256 B1 S1024 H8 D256", 1, 1024, 8, 256,
                           /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
