@@ -288,7 +288,7 @@ constexpr int PACK_A_STACK_I8 = num_panels_max(MC_TARGET, MR_I8) * LDD_A_I8;
 // sizes. The caller computes ldd from the actual k-block length (actual_kc).
 //
 // MMA entry points: `tile_mma_pack` accumulates C[mr][nr] += A_packed[mr][K]
-// × B[nr][K], where `maybe_packed_b`/`ldb` describe B:
+// × B[K][nr], where `maybe_packed_b`/`ldb` describe B:
 //   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance by the
 //              uniform aligned stride ldd_b = align_up(nr_max*Kc*elem,64)/elem)
 //   ldb >= 0 → B is raw (row stride ldb, advance nr per panel)

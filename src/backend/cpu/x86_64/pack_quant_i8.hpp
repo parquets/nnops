@@ -89,7 +89,6 @@ inline __m256i narrow_32i32_to_i8(__m256i i0, __m256i i1, __m256i i2, __m256i i3
 //  Each row is quantized independently with its own scale/zero_point
 //  (broadcast across all K elements).  K step = 4 (SSE __m128) to keep
 //  register pressure low — each row produces 4 int8 = 1 int32 per step.
-//  Quantization: round(src * inv_scale) + zero_point.
 //  4 consecutive K values from the SAME row are packed into each int32,
 //  matching the VNNI dp4a interleaved format:
 //    out_i32[0] = [q(r0_k0), q(r0_k1), q(r0_k2), q(r0_k3)]
@@ -218,7 +217,6 @@ inline void pack_quant_trans_n6_i8(void* NNOPS_RESTRICT output,
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        // Quantize 6 rows
         __m128i qi[6];
         for (int i = 0; i < 6; ++i) {
             __m128 v = _mm_loadu_ps(input + i * ir_step);
@@ -339,7 +337,6 @@ inline void pack_quant_trans_n12_i8(void* NNOPS_RESTRICT output,
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        // Process in 3 groups of 4 rows
         for (int g = 0; g < 3; ++g) {
             __m128i qi[4];
             for (int j = 0; j < 4; ++j) {
@@ -396,7 +393,6 @@ inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        // Process in 4 groups of 4 rows
         for (int g = 0; g < 4; ++g) {
             __m128i qi[4];
             for (int j = 0; j < 4; ++j) {
@@ -437,7 +433,6 @@ inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
 //
 //  Scale/zero_point is broadcast across all K elements (single scale/zero_point
 //  for the entire K dimension).  K step = 4 (group 4 consecutive K elements).
-//  Quantization: round(src * inv_scale) + zero_point.
 // =========================================================================
 
 template <bool Q_U8 = false>

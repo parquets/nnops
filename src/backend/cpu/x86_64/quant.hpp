@@ -34,10 +34,6 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-// =========================================================================
-//  Block helpers — register-level quantize / dequantize primitives
-// =========================================================================
-
 /// Quantize 16 floats (4×__m128) to 16 int8 (1×__m128i), natural order.
 ///
 /// 128-bit packs are used on purpose: the 256-bit `_mm256_packs_epi16` operates
@@ -117,10 +113,6 @@ inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 neg_zero_scal
     res1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d1_i32), scale, neg_zero_scale);
 }
 
-// =========================================================================
-//  Top-level per-token quantize / dequantize (s8 and u8)
-// =========================================================================
-
 /// Quantize an M×N f32 matrix to integer `T`, one (scale, zero_point) per row.
 ///
 /// `T` is int8_t (s8, clamp [-128, 127]) or uint8_t (u8, clamp [0, 255]).
@@ -177,10 +169,6 @@ inline void quantization(int M, int N,
         }
     }
 }
-
-// =========================================================================
-//  Top-level per-token quantize with half (f16) input
-// =========================================================================
 
 /// Quantize an M×N f16 matrix to integer `T`, one (scale, zero_point) per row.
 ///
@@ -245,12 +233,10 @@ inline void quantization(int M, int N,
     }
 }
 
-// =========================================================================
-//  NCHWC8 8-wide primitives (8 channels = 8 bytes = one 64-bit group)
+// NCHWC8 8-wide primitives (8 channels = 8 bytes = one 64-bit group)
 //
 // These operate on a single channel-packed lane group (8 int8/uint8 values) —
 // the granularity used by the quantized depthwise-conv / pooling SIMD kernels.
-// =========================================================================
 
 /// Requantize 8 floats to 8 int8/uint8 with a broadcast (per-tensor) scale and
 /// zero_point: `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
@@ -327,7 +313,6 @@ inline void dequantization(int M, int N,
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
-        // 32-wide path: two 16-wide blocks per iteration
         for (; n + 32 <= N; n += 32) {
             const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 0));
             const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 16));
@@ -351,10 +336,6 @@ inline void dequantization(int M, int N,
         }
     }
 }
-
-// =========================================================================
-//  Top-level per-token dequantize with half (f16) output
-// =========================================================================
 
 /// Dequantize an M×N integer matrix of type `T` to f16, one (scale, zero_point)
 /// per row.
@@ -386,7 +367,6 @@ inline void dequantization(int M, int N,
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
-        // 32-wide path: two 16-wide blocks per iteration
         for (; n + 32 <= N; n += 32) {
             const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 0));
             const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_ptr + n + 16));

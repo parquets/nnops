@@ -2,7 +2,7 @@
 /// @file mma_pack_f32.hpp
 /// @brief x86_64 AVX2/FMA float32 MMA (matrix micro-accumulate) packed-B kernels.
 ///
-/// Each kernel computes C[mr][nr] += A[mr][K] × B_packed[nr][K] then clamps.
+/// Each kernel computes  C[mr][nr] += A[mr][K] × B_packed[K][nr]  then clamps.
 /// Tile sizes (x86_64-optimised):
 ///   M ∈ {6, 4, 1}    N ∈ {16, 8, 1}
 /// Uses _mm256_fmadd_ps (FMA) and _mm256_broadcast_ss for A-element splat.
@@ -14,10 +14,6 @@
 #include "backend/cpu/common/restrict.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
-
-// =========================================================================
-//  mr=1  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_pack_1x1_f32(float* NNOPS_RESTRICT C, int ldc,
@@ -89,10 +85,6 @@ inline void mma_pack_1x16_f32(float* NNOPS_RESTRICT C, int ldc,
     _mm256_storeu_ps(C + 0 * 8, v_c0);
     _mm256_storeu_ps(C + 1 * 8, v_c1);
 }
-
-// =========================================================================
-//  mr=4  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_pack_4x1_f32(float* NNOPS_RESTRICT C, int ldc,
@@ -232,10 +224,6 @@ inline void mma_pack_4x16_f32(float* NNOPS_RESTRICT C, int ldc,
     _mm256_storeu_ps(C + 3 * ldc + 0, v_c30);
     _mm256_storeu_ps(C + 3 * ldc + 8, v_c31);
 }
-
-// =========================================================================
-//  mr=6  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_pack_6x1_f32(float* NNOPS_RESTRICT C, int ldc,

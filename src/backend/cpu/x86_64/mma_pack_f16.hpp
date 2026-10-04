@@ -23,10 +23,6 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-// =========================================================================
-//  mr=1  kernels
-// =========================================================================
-
 template <bool zero_mode = false>
 inline void mma_pack_1x1_f16(half* NNOPS_RESTRICT C, int ldc,
                              const half* NNOPS_RESTRICT A,
@@ -94,10 +90,6 @@ inline void mma_pack_1x16_f16(half* NNOPS_RESTRICT C, int ldc,
     v_c1 = _mm256_max_ps(_mm256_min_ps(v_c1, v_max), v_min);
     store_f16x8(C + 1 * 8, v_c1);
 }
-
-// =========================================================================
-//  mr=4  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_pack_4x1_f16(half* NNOPS_RESTRICT C, int ldc,
@@ -252,10 +244,6 @@ inline void mma_pack_4x16_f16(half* NNOPS_RESTRICT C, int ldc,
     v_c31 = _mm256_max_ps(_mm256_min_ps(v_c31, v_max), v_min);
     store_f16x8(C + 3 * ldc + 8, v_c31);
 }
-
-// =========================================================================
-//  mr=6  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_pack_6x1_f16(half* NNOPS_RESTRICT C, int ldc,

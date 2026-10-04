@@ -9,7 +9,8 @@
 ///
 /// Tile sizes (x86_64-optimised):
 ///   M ∈ {6, 4, 1}    N ∈ {16, 8, 4, 1}
-/// Uses _mm256_dpbusd_epi32 (AVX512-VNNI) or _mm256_dpbusd_avx_epi32 (AVX-VNNI).
+/// Uses _mm256_dpbusd_epi32 / _mm_dpbusd_epi32 (AVX512-VNNI) or their AVX-VNNI
+/// counterparts _mm256_dpbusd_avx_epi32 / _mm_dpbusd_avx_epi32.
 ///
 /// Reference: nn_compute/src/cpu/kernel/mma/x86_64/mma_pack_vnni_i8.hpp
 

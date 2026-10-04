@@ -19,31 +19,24 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-// Helper: load 8 fp16 values and convert to __m256 (fp32)
 namespace {
 inline __m256 load_f16x8(const half* NNOPS_RESTRICT p) noexcept {
     return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
 }
 
-// Helper: convert __m256 (fp32) to 8 fp16 values and store
 inline void store_f16x8(half* NNOPS_RESTRICT p, __m256 v) noexcept {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(p),
                      _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
 }
 }  // anonymous namespace
 
-// =========================================================================
-//  Transpose pack (f16)
-//
-//  The vector loops convert to f32 and run the SAME transpose_Nx8_f32 the
-//  f32 packs use, then round back to f16 on store — no extra conversions,
-//  since the scale multiply already round-trips through f32. This matters
-//  because the pack stores its registers linearly and the mma kernels read
-//  the panel as [K][n] (n contiguous per k): only the f32 transposes
-//  produce that order. A 16-bit-lane butterfly cannot express it (mr=6
-//  panels interleave two k's per register); an earlier __m128i transpose
-//  family got this wrong and produced a 2x2-blocked order.
-// =========================================================================
+// The vector loops convert to f32 and run the SAME transpose_Nx8_f32 the
+// f32 packs use, then round back to f16 on store; no extra conversions,
+// since the scale multiply already round-trips through f32. This matters
+// because the pack stores its registers linearly and the mma kernels read
+// the panel as [K][n] (n contiguous per k): only the f32 transposes
+// produce that order. A 16-bit-lane butterfly cannot express it (mr=6
+// panels interleave two k's per register).
 
 inline void pack_trans_n1_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
@@ -219,10 +212,6 @@ inline void pack_trans_n24_f16(half* NNOPS_RESTRICT output,
     }
 }
 
-// =========================================================================
-//  RHS Copy pack (f16)
-// =========================================================================
-
 inline void pack_copy_n1_f16(half* NNOPS_RESTRICT output,
                              const half* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale) noexcept {
@@ -318,10 +307,6 @@ inline void pack_copy_n24_f16(half* NNOPS_RESTRICT output,
         input  += ir_step;
     }
 }
-
-// =========================================================================
-//  Panel size constants (f16)  —  tuned for x86_64 AVX2/F16C.
-// =========================================================================
 
 /// @brief f16 LHS micro-panel heights.
 inline constexpr int mr_f16[3] = {6, 4, 1};

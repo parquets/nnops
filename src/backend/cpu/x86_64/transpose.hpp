@@ -8,10 +8,9 @@
 ///   - __m128i (16×int8)            — packed integer intrinsics
 ///
 /// fp16 packing does NOT transpose in 16-bit lanes: the f16 packs convert to
-/// f32 (F16C) and reuse the __m256 f32 transposes above, because only they
-/// produce the linear [K][n] panel order the mma kernels read (see
-/// pack_f16.hpp). A 16-bit-lane __m128i transpose family that once lived
-/// here produced a blocked order instead and was removed.
+/// f32 (F16C) and reuse the __m256 f32 transposes in this header, because only
+/// they produce the linear [K][n] panel order the mma kernels read (see
+/// pack_f16.hpp).
 ///
 /// The 4×16 int8 transpose (transpose_4x16_i8) operates on raw bytes
 /// and is used by the int8 dp4a pack_copy_n16 pipeline.
@@ -22,10 +21,6 @@
 #include "backend/cpu/common/restrict.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
-
-// =========================================================================
-//  f32  —  __m128 (4-element)  transposes
-// =========================================================================
 
 inline void transpose_2x4_f32(__m128& v_r0, __m128& v_r1) noexcept {
     const __m128 tmp0 = _mm_unpacklo_ps(v_r0, v_r1);
@@ -158,10 +153,6 @@ inline void transpose_16x4_f32(
     v_re = _mm_shuffle_ps(tc, td, _MM_SHUFFLE(3, 2, 3, 2));
     v_rf = _mm_shuffle_ps(te, tf, _MM_SHUFFLE(3, 2, 3, 2));
 }
-
-// =========================================================================
-//  f32  —  __m256 (8-element)  transposes
-// =========================================================================
 
 inline void transpose_2x8_f32(__m256& v_r0, __m256& v_r1) noexcept {
     const __m256 tmp0 = _mm256_unpacklo_ps(v_r0, v_r1);
@@ -343,10 +334,6 @@ inline void transpose_16x8_f32(
     v_re = _mm256_permute2f128_ps(u3, u7, _MM_SHUFFLE(0, 3, 0, 1));
     v_rf = _mm256_permute2f128_ps(u11, u15, _MM_SHUFFLE(0, 3, 0, 1));
 }
-
-// =========================================================================
-//  i8  —  __m128i (16-element)  transpose
-// =========================================================================
 
 /// @brief 4×16 int8 register transpose (byte-level, for the int8 dp4a pack).
 ///

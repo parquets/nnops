@@ -13,10 +13,6 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-// =========================================================================
-//  LHS Transpose pack (f32)  —  x86_64 AVX path (K step = 8)
-// =========================================================================
-
 inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale) noexcept {
@@ -205,10 +201,6 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-// =========================================================================
-//  RHS Copy pack (f32)  —  contiguous-row copy
-// =========================================================================
-
 inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale) noexcept {
@@ -333,11 +325,6 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
         input  += ir_step;
     }
 }
-
-// =========================================================================
-//  Panel size constants (f32)  —  tuned for x86_64 AVX2.
-//  Values must match mma_pack_f32.hpp kernel set.
-// =========================================================================
 
 /// @brief f32 LHS micro-panel heights, shared by both routes.
 /// The 6-row direct kernels already match the pack side, and AVX2's 16 ymm

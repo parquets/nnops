@@ -21,10 +21,6 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-// =========================================================================
-//  mr=1  kernels
-// =========================================================================
-
 template <bool zero_mode = false>
 inline void mma_direct_1x1_f32(
     float* NNOPS_RESTRICT C, int ldc,
@@ -108,10 +104,6 @@ inline void mma_direct_1x16_f32(
     _mm256_storeu_ps(C + 0 * 8, _mm256_min_ps(_mm256_max_ps(v_c00, v_min), v_max));
     _mm256_storeu_ps(C + 1 * 8, _mm256_min_ps(_mm256_max_ps(v_c01, v_min), v_max));
 }
-
-// =========================================================================
-//  mr=4  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_direct_4x1_f32(
@@ -261,10 +253,6 @@ inline void mma_direct_4x16_f32(
     _mm256_storeu_ps(C + 3 * ldc + 0 * 8, _mm256_min_ps(_mm256_max_ps(v_c30, v_min), v_max));
     _mm256_storeu_ps(C + 3 * ldc + 1 * 8, _mm256_min_ps(_mm256_max_ps(v_c31, v_min), v_max));
 }
-
-// =========================================================================
-//  mr=6  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_direct_6x1_f32(
