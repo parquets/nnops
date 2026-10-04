@@ -436,6 +436,20 @@ void moe_cpu(const MoEAttributes& attrs,
              const ComputeContext& ctx,
              void* workspace)
 {
+    // A sigmoid (or sqrt-softplus) score is in (0, 1) and does not sum to 1, so
+    // leaving it unnormalized scales the routed output down by roughly k/2.
+    // That is well defined and occasionally intended, hence a warning rather
+    // than an assertion — but it is far more often a forgotten
+    // `normalize_routing_weights` (DeepSeek-V3 pairs the two, plus a
+    // `routed_scaling_factor`). It cannot fire when `router_weights` supplies
+    // the mixing weights, since then the gating scores only select.
+    NNOPS_WARN_MSG(attrs.router_gating == MoERouterGating::Softmax ||
+                       attrs.normalize_routing_weights ||
+                       has_input(inputs, 8),
+                   "moe_cpu: non-softmax router gating without "
+                   "normalize_routing_weights: the routed output will be "
+                   "systematically smaller than under softmax");
+
     switch (inputs[0].data_type()) {
     case DataType::f32: moe_cpu_impl<float>(attrs, output, inputs, ctx); return;
     case DataType::f16: moe_cpu_impl<half>(attrs, output, inputs, ctx);  return;

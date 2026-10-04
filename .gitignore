@@ -1,6 +1,7 @@
 # Build directories
 build/
 build_vulkan/
+build-debug/
 out/
 cmake-build-*/
 

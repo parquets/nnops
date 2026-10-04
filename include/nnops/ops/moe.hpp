@@ -115,11 +115,18 @@ struct MoEAttributes {
     /// default `Softmax` reproduces the historical behaviour exactly.
     ///
     /// With `Sigmoid` the scores are in (0, 1) and do **not** sum to 1, so the
-    /// routed output is systematically smaller than under `Softmax`. That is the
-    /// expected model behaviour (DeepSeek-V3 pairs sigmoid with
-    /// `normalize_routing_weights` and `routed_scaling_factor` to bring the
-    /// scale back), not a bug — but it is worth being deliberate about the
-    /// combination.
+    /// routed output is systematically smaller than under `Softmax` — by roughly
+    /// a factor of `k/2`. That is the definition of the function, not a defect,
+    /// but it is why sigmoid routing is almost always paired with
+    /// `normalize_routing_weights`. The DeepSeek-V3 combination is exactly:
+    ///
+    ///     router_gating             = Sigmoid;
+    ///     normalize_routing_weights = true;
+    ///     routed_scaling_factor     = 2.5f;
+    ///
+    /// A Debug build warns when a non-softmax gating is left unnormalized (and
+    /// no `router_weights` supplies the mixing weights): that is legal, but far
+    /// more often a forgotten line than an intentional choice.
     MoERouterGating router_gating = MoERouterGating::Softmax;
 
     /// Multiplier applied to the routing weights after normalization —
@@ -133,6 +140,9 @@ struct MoEAttributes {
     /// softmax or sigmoid values, or the gathered `router_weights`). When
     /// `router_weights` (input 8) is present this renormalizes those gathered
     /// weights instead — the selection still comes from `router_probs`.
+    ///
+    /// Strongly recommended with `Sigmoid` / `SqrtSoftplus` gating, whose
+    /// unnormalized scores do not sum to 1 — see `router_gating`.
     bool normalize_routing_weights = false;
 
     /// Sparse-mixer routing variant (selects k=2 experts and applies the
