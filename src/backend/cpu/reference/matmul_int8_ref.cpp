@@ -68,7 +68,6 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
     const int32_t zp_out    = (qc.zero_point_data != nullptr) ? qc.zero_point_data[0] : qc.zero_point;
     const bool relu = (attrs.epilogue.type == EpilogueActivateType::Relu);
 
-    // ---- broadcast batch shape ----
     const int64_t batch_a_dims = a_rank - 2;
     const int64_t batch_b_dims = b_rank - 2;
     const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
@@ -100,7 +99,6 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
         total_batch *= batch_out_shape[i];
     }
 
-    // ---- per-batch 2D GEMM ----
     const auto gemm_2d = [&](const int8_t* a_ptr, const int8_t* b_ptr,
                              int32_t* c_int, int8_t* c_out) {
         // Raw reductions over K.
@@ -154,7 +152,6 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
         ctx.cpu.run(0, M, [&](int64_t m) { compute_row(m); });
     };
 
-    // ---- batch iteration ----
     for (int64_t bi = 0; bi < total_batch; ++bi) {
         int64_t rem = bi;
         int64_t a_offset = 0;

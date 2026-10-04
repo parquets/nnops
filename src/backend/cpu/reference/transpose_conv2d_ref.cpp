@@ -32,19 +32,16 @@ void transpose_conv2d_nchw_ref(const TransposeConv2DAttributes& attrs,
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    // Input: [N, IC, IH, IW]
     const int64_t N  = input.shape(0);
     const int64_t IC = input.shape(1);
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
     const int64_t in_row_stride = input.row_stride_elems();
 
-    // Weight: [IC, OC/G, KH, KW]
     const int64_t OC_per_G = weight.shape(1);
     const int64_t KH = attrs.kernel_size[0];
     const int64_t KW = attrs.kernel_size[1];
 
-    // Output: [N, OC, OH, OW]
     const int64_t OC = output.shape(1);
     const int64_t OH = output.shape(2);
     const int64_t OW = output.shape(3);
@@ -76,10 +73,8 @@ void transpose_conv2d_nchw_ref(const TransposeConv2DAttributes& attrs,
             saved.assign(out_ptr + n_offset, out_ptr + n_offset + out_sample_size);
         }
 
-        // Zero-initialize output region for this sample
         std::fill_n(out_ptr + n_offset, out_sample_size, 0.0f);
 
-        // Scatter-add: each input pixel * weight → output region
         for (int64_t g = 0; g < G; ++g) {
             const int64_t ic_start = g * IC_per_G;
             const int64_t oc_start = g * OC_per_G;
@@ -115,7 +110,6 @@ void transpose_conv2d_nchw_ref(const TransposeConv2DAttributes& attrs,
             }
         }
 
-        // Apply bias, epilogue, add_to
         for (int64_t oc = 0; oc < OC; ++oc) {
             const float bias_val = b_ptr ? b_ptr[oc] : 0.0f;
             for (int64_t oh = 0; oh < OH; ++oh) {

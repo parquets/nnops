@@ -2,8 +2,6 @@
 /// @brief Naive CPU reference implementation of Slice.
 ///
 /// Correctness baseline. Handles all planar layouts uniformly.
-/// Uses flat-index decomposition: for each output element, compute the
-/// corresponding input flat index via starts/steps/axes mapping.
 
 #include "nnops/ops/slice.hpp"
 #include "nnops/detail/assert.hpp"
@@ -53,7 +51,6 @@ void slice_impl_ref(const SliceAttributes& attrs,
         in_strides[i] = in_strides[i + 1] * input.shape(i + 1);
     }
 
-    // Output strides in elements (planar)
     int64_t out_strides[TensorDesc::kMaxRank];
     out_strides[rank - 1] = 1;
     for (int64_t i = rank - 2; i >= 0; --i) {
@@ -64,13 +61,11 @@ void slice_impl_ref(const SliceAttributes& attrs,
     T*       out_ptr = output.ptr<T>();
 
     for (int64_t out_idx = 0; out_idx < total; ++out_idx) {
-        // Decompose flat output index → multi-index
         int64_t tmp = out_idx;
         int64_t in_idx = 0;
         for (int64_t d = 0; d < rank; ++d) {
             int64_t coord = tmp / out_strides[d];
             tmp %= out_strides[d];
-            // Map output coord to input coord via slice parameters
             int64_t in_coord = eff_start[static_cast<size_t>(d)]
                              + coord * eff_step[static_cast<size_t>(d)];
             in_idx += in_coord * in_strides[d];

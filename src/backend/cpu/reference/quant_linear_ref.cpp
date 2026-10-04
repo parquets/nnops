@@ -44,7 +44,6 @@ inline int32_t load_zero_point(const TensorView& zp_tensor, int64_t idx) {
     }
 }
 
-/// Read a float value from input (f32 or f16).
 inline float read_float_input(const TensorView& input, int64_t off) {
     if (input.data_type() == DataType::f16) {
         return half_to_float(input.ptr<half>()[off]);
@@ -52,7 +51,6 @@ inline float read_float_input(const TensorView& input, int64_t off) {
     return input.ptr<float>()[off];
 }
 
-/// Read an integer value from input (s8 or u8), returned as int32.
 inline int32_t read_int_input(const TensorView& input, int64_t off) {
     if (input.data_type() == DataType::s8) {
         return static_cast<int32_t>(input.ptr<int8_t>()[off]);
@@ -61,12 +59,10 @@ inline int32_t read_int_input(const TensorView& input, int64_t off) {
     }
 }
 
-/// Write a float to output (f32).
 inline void write_float_output(TensorView& output, int64_t off, float val) {
     output.ptr<float>()[off] = val;
 }
 
-/// Write an integer to output (s8 or u8), clamped to type range.
 inline void write_int_output(TensorView& output, int64_t off, int32_t val) {
     if (output.data_type() == DataType::s8) {
         val = std::max<int32_t>(-128, std::min<int32_t>(127, val));
@@ -77,7 +73,6 @@ inline void write_int_output(TensorView& output, int64_t off, int32_t val) {
     }
 }
 
-/// Get integer type range for clamping.
 inline int32_t int_min_for(DataType dt) {
     return (dt == DataType::s8) ? -128 : 0;
 }
@@ -138,8 +133,6 @@ void quantize_linear_ref(const QuantLinearAttributes& attrs,
 
     const int64_t n_total = x.numel();
 
-    // Flatten the tensor: for each element, compute its scale/zp index
-    // and apply the quantization formula.
     for (int64_t flat = 0; flat < n_total; ++flat) {
         const int64_t s_idx = quant_param_index(x, flat, g, axis);
         const float s = load_scale(scale, s_idx);

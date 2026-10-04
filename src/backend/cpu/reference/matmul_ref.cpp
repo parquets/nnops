@@ -32,7 +32,6 @@ void matmul_ref(const MatMulAttributes& attrs,
     NNOPS_ASSERT(a_rank >= 2);
     NNOPS_ASSERT(b_rank >= 2);
 
-    // ---- extract matrix dimensions ----
     const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
     const int64_t Ka = attrs.transpose_a ? a.shape(a_rank - 2) : a.shape(a_rank - 1);
     const int64_t Kb = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
@@ -48,7 +47,6 @@ void matmul_ref(const MatMulAttributes& attrs,
     const int64_t b_row_stride = b.row_stride_elems();
     const int64_t c_row_stride = output.row_stride_elems();
 
-    // ---- compute broadcast batch shape ----
     const int64_t batch_a_dims = a_rank - 2;
     const int64_t batch_b_dims = b_rank - 2;
     const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
@@ -80,8 +78,6 @@ void matmul_ref(const MatMulAttributes& attrs,
         total_batch *= batch_out_shape[i];
     }
 
-    // ---- 2D GEMM kernel (per sub-matrix) ----
-    // For each output row m, compute dot(K) with each column n of B.
     const auto gemm_2d = [&](const float* a_ptr, const float* b_ptr, float* c_ptr,
                               int64_t lda, int64_t ldb, int64_t ldc) {
         const auto compute_row = [&](int64_t m) {
@@ -105,9 +101,7 @@ void matmul_ref(const MatMulAttributes& attrs,
                 [&](int64_t m) { compute_row(m); });
     };
 
-    // ---- batch iteration ----
     for (int64_t bi = 0; bi < total_batch; ++bi) {
-        // Unflatten batch index → multi-dimensional coords
         int64_t rem = bi;
         int64_t a_offset = 0;
         int64_t b_offset = 0;
@@ -126,7 +120,6 @@ void matmul_ref(const MatMulAttributes& attrs,
                 }
             }
 
-            // B offset
             {
                 const int64_t b_dim = d - (batch_ndim - batch_b_dims);
                 if (b_dim >= 0) {
@@ -135,7 +128,6 @@ void matmul_ref(const MatMulAttributes& attrs,
                 }
             }
 
-            // C offset: output always has batch_out_shape
             c_offset += coord * output.stride_elems(d);
         }
 

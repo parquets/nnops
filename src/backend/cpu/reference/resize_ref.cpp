@@ -22,12 +22,10 @@ using nnops::simd::s_store;
 
 namespace {
 
-/// Clamp a source index to [0, src_size - 1].
 inline int64_t clamp_idx(int64_t idx, int64_t src_size) {
     return std::max<int64_t>(0, std::min(idx, src_size - 1));
 }
 
-/// Compute source coordinate based on the coordinate transform mode.
 inline float compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_size,
                                CoordinateTransformMode mode) {
     if (dst_size == src_size) {
@@ -75,7 +73,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     const int64_t raw_IH = input.shape(srank);
     const int64_t raw_IW = input.shape(srank + 1);
 
-    // ---- Crop: compute effective input region ----
     // When crop_end[d] > 0, use crop region; otherwise use full input.
     const bool has_crop = attrs.has_crop();
 
@@ -83,7 +80,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     int64_t crop_off = 0;  // in elements, planar layout (no pack factor)
 
     if (has_crop) {
-        // Validate crop bounds
         if (srank == 3 && attrs.crop_end[0] > 0) {
             NNOPS_ASSERT(attrs.crop_start[0] >= 0 && attrs.crop_start[0] < raw_ID);
             NNOPS_ASSERT(attrs.crop_end[0] > attrs.crop_start[0] && attrs.crop_end[0] <= raw_ID);
@@ -104,7 +100,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
         }
     }
 
-    // Output spatial dims
     const int64_t OD = (srank == 3) ? output.shape(2) : 1;
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
@@ -124,7 +119,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     const auto mode = attrs.mode;
     const bool add_to = attrs.add_to;
 
-    // Per-channel compute lambda (N*C parallel)
     const auto compute_channel = [&](int64_t n, int64_t c) {
         const T* in_ch  = in_ptr + n * C * in_ch_stride + c * in_ch_stride + crop_off;
         T* out_ch = out_ptr + n * C * out_ch_stride + c * out_ch_stride;
@@ -135,7 +129,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                     float result;
 
                     if (mode == ResizeMode::Nearest) {
-                        // ---- Nearest-neighbor ----
                         if (srank == 3) {
                             float src_d = compute_src_coord(od, eff_ID, OD, coord_mode);
                             float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
@@ -152,7 +145,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                             result = s_load(&in_ch[ih * in_row_stride + iw]);
                         }
                     } else {
-                        // ---- Linear (bilinear / trilinear) ----
                         if (srank == 3) {
                             // Trilinear: 8 neighbors in 3D
                             float src_d = compute_src_coord(od, eff_ID, OD, coord_mode);
@@ -173,7 +165,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                             float wy0 = 1.0f - wy;
                             float wx0 = 1.0f - wx;
 
-                            // Load 8 corners via s_load
                             float v000 = s_load(&in_ch[z0 * in_d_stride + y0 * in_row_stride + x0]);
                             float v100 = s_load(&in_ch[z0 * in_d_stride + y0 * in_row_stride + x1]);
                             float v010 = s_load(&in_ch[z0 * in_d_stride + y1 * in_row_stride + x0]);

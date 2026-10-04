@@ -339,7 +339,6 @@ void unary_quant_ref(const UnaryAttributes& attrs,
         const int64_t in_idx  = in_per_token  ? (flat / last_dim) : 0;
         const int64_t out_idx = out_per_token ? (flat / last_dim) : 0;
 
-        // Dequantize → f32.
         const float in_s = in_per_token ? in_qp.scale_data[in_idx] : in_qp.scale;
         const float in_z = in_per_token
             ? (in_qp.zero_point_data != nullptr ? static_cast<float>(in_qp.zero_point_data[in_idx]) : 0.0f)
@@ -348,10 +347,8 @@ void unary_quant_ref(const UnaryAttributes& attrs,
             ? (static_cast<float>(input.ptr<int8_t>()[flat]) - in_z) * in_s
             : (static_cast<float>(input.ptr<uint8_t>()[flat]) - in_z) * in_s;
 
-        // Unary op.
         const float y = unary_scalar(attrs.type, x);
 
-        // Quantize → store.
         const float out_s = out_per_token ? out_qp.scale_data[out_idx] : out_qp.scale;
         const float out_z = out_per_token
             ? (out_qp.zero_point_data != nullptr ? static_cast<float>(out_qp.zero_point_data[out_idx]) : 0.0f)

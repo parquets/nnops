@@ -193,7 +193,6 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
                 }
             }
 
-            // Write the final state back.
             for (int64_t i = 0; i < D; ++i) {
                 for (int64_t j = 0; j < D; ++j) {
                     store_f(sp + b * ts0 + hkv * ts1 + i * ts2 + j * ts3,

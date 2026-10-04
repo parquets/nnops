@@ -38,7 +38,6 @@ void topk_impl_ref(const TopKAttributes& attrs,
     const bool is_max = (attrs.type == TopKType::Max);
     const bool sorted_opt = attrs.sorted;
 
-    // Compute outer_dims (product of dims before ax) and inner_size (dims after ax)
     int64_t outer_dims = 1;
     for (int64_t d = 0; d < ax; ++d) {
         outer_dims *= in.shape(d);
@@ -54,7 +53,6 @@ void topk_impl_ref(const TopKAttributes& attrs,
 
     const int64_t axis_stride = in.stride_elems(ax);
 
-    // Output strides (planar layout)
     // Output shape = [d0, ..., d_{ax-1}, k, d_{ax+1}, ...]
     const int64_t v_outer_stride = k * inner_size;
     const int64_t v_inner_stride = k;
@@ -81,10 +79,8 @@ void topk_impl_ref(const TopKAttributes& attrs,
 
     for (int64_t outer = 0; outer < outer_dims; ++outer) {
         for (int64_t inner = 0; inner < inner_size; ++inner) {
-            // Base offset: outer * (stride * dim) + inner position within tail
             int64_t i_base = outer * axis_stride * axis_dim + inner;
 
-            // Initialize with first k elements
             for (int64_t j = 0; j < k; ++j) {
                 heap[static_cast<size_t>(j)] = {
                     s_load(i_ptr + i_base + j * axis_stride), j};
@@ -96,7 +92,6 @@ void topk_impl_ref(const TopKAttributes& attrs,
                     return worst_cmp(a.value, b.value);
                 });
 
-            // Scan remaining elements along the axis
             for (int64_t j = k; j < axis_dim; ++j) {
                 float val = s_load(i_ptr + i_base + j * axis_stride);
                 if (worst_cmp(heap[0].value, val)) {
@@ -111,7 +106,6 @@ void topk_impl_ref(const TopKAttributes& attrs,
                 }
             }
 
-            // Final sort if requested
             if (sorted_opt) {
                 if (is_max) {
                     std::sort(heap.begin(), heap.end(),
@@ -126,7 +120,6 @@ void topk_impl_ref(const TopKAttributes& attrs,
                 }
             }
 
-            // Write output
             int64_t v_base = outer * v_outer_stride + inner * v_inner_stride;
             for (int64_t j = 0; j < k; ++j) {
                 s_store(v_ptr + v_base + j, heap[static_cast<size_t>(j)].value);

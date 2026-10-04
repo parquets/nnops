@@ -1,8 +1,5 @@
 /// @file permute_ref.cpp
 /// @brief Scalar CPU reference implementation of dimension permute (transpose).
-///
-/// For planar data, computes input strides and output strides in elements,
-/// then copies each element from the permuted input position.
 
 #include "nnops/ops/permute.hpp"
 #include "nnops/detail/assert.hpp"
@@ -29,7 +26,6 @@ void permute_impl_ref(const PermuteAttributes& attrs,
         in_strides[i] = in_strides[i + 1] * input.shape(i + 1);
     }
 
-    // Output strides in elements
     int64_t out_strides[TensorDesc::kMaxRank];
     out_strides[rank - 1] = 1;
     for (int64_t i = rank - 2; i >= 0; --i) {
@@ -40,7 +36,6 @@ void permute_impl_ref(const PermuteAttributes& attrs,
     T*       out_ptr = output.ptr<T>();
 
     for (int64_t out_idx = 0; out_idx < total; ++out_idx) {
-        // Decompose flat output index into multi-dimensional coordinates
         int64_t tmp = out_idx;
         int64_t in_idx = 0;
         for (int64_t d = 0; d < rank; ++d) {

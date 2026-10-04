@@ -72,7 +72,6 @@ void rope_ref(const RoPEAttributes& attrs,
     const int64_t head_dim = X.shape(rank - 1);
     NNOPS_ASSERT(head_dim % 2 == 0);
 
-    // Flatten leading dims → single outer loop
     int64_t outer_count = 1;
     for (int64_t i = 0; i < rank - 2; ++i) {
         outer_count *= X.shape(i);
@@ -82,7 +81,6 @@ void rope_ref(const RoPEAttributes& attrs,
     const auto* x_ptr = X.ptr<float>();
     auto* y_ptr = output.ptr<float>();
 
-    // Build mRoPE section table
     auto sections = build_sections(attrs, head_dim);
 
     const bool interleaved = attrs.interleaved;

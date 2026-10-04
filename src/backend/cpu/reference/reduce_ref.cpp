@@ -24,7 +24,6 @@ void reduce_ref(const ReduceAttributes& attrs,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
 
-    // Normalize axis
     int64_t axis = attrs.axis;
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
@@ -34,7 +33,6 @@ void reduce_ref(const ReduceAttributes& attrs,
     float* out_ptr = output.ptr<float>();
     const int64_t rank_out = output.rank();
 
-    // Number of independent output elements (outer dims only)
     const int64_t num_outer = [&]() {
         int64_t n = 1;
         for (int64_t d = 0; d < axis; ++d) { n *= input.shape(d); }
@@ -62,7 +60,6 @@ void reduce_ref(const ReduceAttributes& attrs,
         inner_offsets[static_cast<size_t>(flat)] = off;
     }
 
-    // Precompute inner offsets for output
     const int64_t y_inner_start = attrs.keepdims ? axis + 1 : axis;
     const int64_t y_outer_stride = (axis > 0) ? output.stride_elems(axis - 1) : 0;
     std::vector<int64_t> y_inner_offsets(static_cast<size_t>(num_inner));

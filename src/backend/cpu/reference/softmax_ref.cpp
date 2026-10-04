@@ -19,7 +19,6 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Scalar softmax over a contiguous f32 buffer with logical shape.
 void softmax_scalar_contig(const float* x, float* y,
                            const int64_t* shape, int64_t rank, int64_t axis,
                            bool log_softmax, float inv_T)
@@ -76,12 +75,10 @@ void softmax_quant_ref(const SoftmaxAttributes& attrs,
                         && qp.scale_data != nullptr;
     const int64_t last_dim = X.shape(rank - 1);
 
-    // Normalize axis.
     int64_t axis = attrs.axis;
     if (axis < 0) { axis += rank; }
     const float inv_T = 1.0f / attrs.temperature;
 
-    // Dequantize (scalar) into a contiguous f32 buffer.
     std::vector<float> x_f32(static_cast<size_t>(numel));
     const int8_t* s8 = reinterpret_cast<const int8_t*>(X.ptr<uint8_t>());
     const uint8_t* u8 = X.ptr<uint8_t>();
@@ -96,12 +93,10 @@ void softmax_quant_ref(const SoftmaxAttributes& attrs,
         x_f32[static_cast<size_t>(flat)] = (v - z) * s;
     }
 
-    // Softmax in f32.
     std::vector<float> y_f32(static_cast<size_t>(numel));
     softmax_scalar_contig(x_f32.data(), y_f32.data(), X.shape(), rank, axis,
                           attrs.log_softmax, inv_T);
 
-    // Write back (f32 or f16).
     if (out_dtype == DataType::f32) {
         float* out = output.ptr<float>();
         for (int64_t i = 0; i < numel; ++i) {
@@ -131,12 +126,10 @@ void softmax_ref(const SoftmaxAttributes& attrs,
     const int64_t rank = input.rank();
     NNOPS_ASSERT(rank >= 1);
 
-    // Normalize axis
     int64_t axis = attrs.axis;
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
-    // Compute outer size and axis stride
     int64_t outer_size = 1;
     for (int64_t i = 0; i < axis; ++i) {
         outer_size *= input.shape(i);
@@ -152,7 +145,6 @@ void softmax_ref(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(temperature > 0.0f);
     const float inv_T = 1.0f / temperature;
 
-    // Process each row of size D
     const auto process_row = [&](int64_t outer) {
         int64_t base = outer * D * axis_elems;
         // Iterate over inner elements (elements "between" axis values)
@@ -188,7 +180,6 @@ void softmax_ref(const SoftmaxAttributes& attrs,
                 if (v > max_val) { max_val = v; }
             }
 
-            // Step 2: Compute sum of exp((x - max) / T)
             float sum_exp = 0.0f;
             for (int64_t k = 0; k < D; ++k) {
                 float v = in_ptr[base + k * axis_elems + inner_off];
@@ -196,7 +187,6 @@ void softmax_ref(const SoftmaxAttributes& attrs,
             }
 
             if (log_softmax) {
-                // log_softmax = (x - max) / T - log(sum_exp)
                 float log_sum = std::log(sum_exp);
                 for (int64_t k = 0; k < D; ++k) {
                     float v = in_ptr[base + k * axis_elems + inner_off];
@@ -204,7 +194,6 @@ void softmax_ref(const SoftmaxAttributes& attrs,
                     out_ptr[base + k * axis_elems + inner_off] = val;
                 }
             } else {
-                // softmax = exp((x - max) / T) / sum_exp
                 float inv_sum = 1.0f / sum_exp;
                 for (int64_t k = 0; k < D; ++k) {
                     float v = in_ptr[base + k * axis_elems + inner_off];
