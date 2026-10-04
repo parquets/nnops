@@ -378,9 +378,9 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
 /// register file. The unpacked-A ("direct") route reads A row-major, and a 4-k
 /// unroll there holds each row's slice live across the whole unroll: the
 /// register set becomes mr*nr/4 + mr + nr/4, which at nr=12 is 35 > 32 NEON
-/// registers for mr=8 and spills on every k (measured 22.2 ps/FMA, against 16.0
-/// un-unrolled). The 8x12 kernel therefore runs un-unrolled, which is what lets
-/// both routes share mr=8 instead of the direct path dropping to mr=6.
+/// registers for mr=8 and spills on every k. The 8x12 kernel therefore runs
+/// un-unrolled, which is what lets both routes share mr=8 instead of the direct
+/// path dropping to mr=6.
 inline constexpr int mr_f32[3] = {8, 4, 1};
 
 /// @brief Panel sizes for f32 RHS (B matrix columns).

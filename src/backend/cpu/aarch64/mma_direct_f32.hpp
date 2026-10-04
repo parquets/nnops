@@ -11,7 +11,7 @@
 /// then clamps the result to [clamp_min, clamp_max].
 ///
 /// Tile sizes (AArch64-optimised):
-///   M ∈ {8, 4, 1}    N ∈ {12, 4, 1}
+///   M ∈ {8, 6, 4, 1}    N ∈ {12, 4, 1}
 ///
 /// K is unrolled by 4: four A elements are loaded as a float32x4_t
 /// and broadcast lane-by-lane with vfmaq_laneq_f32 against four
@@ -956,12 +956,9 @@ inline void mma_direct_8x12_f32(
     // K is *not* unrolled by 4 here, unlike the other direct kernels. The unroll
     // holds one A vector per row live across the whole k-group, and at mr=8 that
     // plus the 24 accumulators and 3 B vectors is 35 vectors — three past the 32
-    // NEON registers, so the compiler spills in the hot loop. Measured at K=512
-    // with everything resident in L1: 22.2 ps/FMA unrolled (spilling) versus 16.0
-    // ps/FMA for the scalar form below, and 16.6 for mr=6 *with* the unroll. The
-    // unroll only pays while it still fits; once it spills it is strictly worse,
-    // and scalar also issues fewer memory ops per k (3 B vectors + 8 A lane loads
-    // = 11, against 5 loads + ~7.5 spill ops = 12.5 for the unrolled form).
+    // NEON registers, so the compiler spills in the hot loop. The unroll only pays
+    // while it still fits; once it spills it is strictly worse, and the scalar form
+    // also issues fewer memory ops per k.
     for (int k = 0; k < K; ++k) {
         const float32x4_t v_b0 = vld1q_f32(B + 0 * 4);
         const float32x4_t v_b1 = vld1q_f32(B + 1 * 4);

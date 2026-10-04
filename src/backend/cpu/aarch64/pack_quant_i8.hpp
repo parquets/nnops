@@ -34,8 +34,7 @@
 namespace nnops::backend::cpu::aarch64 {
 
 // =========================================================================
-//  Per-lane quantization helpers (kept for backward compatibility;
-//  the new LHS pack_quant_trans uses per-row broadcast scale/zero).
+//  Per-lane quantization helpers.
 //
 //  After transpose, each float32x4_t lane comes from a different input row,
 //  so each lane needs its own scale/zero.  We use mul+add (not FMA) because
