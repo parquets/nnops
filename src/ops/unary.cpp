@@ -68,8 +68,9 @@ auto resolve_unary_kernel(Backend backend) -> Unary::Impl::KernelFn
     case Backend::Vulkan:
         return backend::vulkan::unary_vulkan;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

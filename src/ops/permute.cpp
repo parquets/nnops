@@ -53,8 +53,9 @@ auto resolve_permute_kernel(Backend backend) -> Permute::Impl::KernelFn
     case Backend::CUDA:
         return backend::cuda::permute_cuda;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

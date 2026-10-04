@@ -58,8 +58,9 @@ auto resolve_causal_attention_kernel(Backend backend) -> CausalAttention::Impl::
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

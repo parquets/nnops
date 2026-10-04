@@ -58,8 +58,9 @@ auto resolve_topk_kernel(Backend backend) -> TopK::Impl::KernelFn
     case Backend::CUDA:
         return backend::cuda::topk_cuda;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

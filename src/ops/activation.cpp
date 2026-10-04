@@ -58,8 +58,9 @@ auto resolve_activation_kernel(Backend backend) -> Activation::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

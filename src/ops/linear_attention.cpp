@@ -50,8 +50,9 @@ auto resolve_linear_attention_kernel(Backend backend) -> LinearAttention::Impl::
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

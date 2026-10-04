@@ -48,8 +48,9 @@ auto resolve_moe_kernel(Backend backend) -> MoE::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

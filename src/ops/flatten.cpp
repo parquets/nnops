@@ -46,8 +46,9 @@ auto resolve_flatten_kernel(Backend backend) -> Flatten::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

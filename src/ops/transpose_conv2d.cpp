@@ -40,8 +40,9 @@ auto resolve_transpose_conv2d_kernel(Backend backend) -> TransposeConv2D::Impl::
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

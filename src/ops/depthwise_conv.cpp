@@ -71,8 +71,9 @@ auto resolve_depthwise_conv_kernel(Backend backend) -> DepthwiseConv::Impl::Kern
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 
 // ============================================================

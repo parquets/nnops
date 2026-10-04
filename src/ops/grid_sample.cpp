@@ -40,8 +40,9 @@ auto resolve_grid_sample_kernel(Backend backend) -> GridSample::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

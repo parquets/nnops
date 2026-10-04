@@ -53,8 +53,9 @@ auto resolve_slice_kernel(Backend backend) -> Slice::Impl::KernelFn
     case Backend::CUDA:
         return backend::cuda::slice_cuda;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

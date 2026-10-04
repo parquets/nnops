@@ -50,8 +50,9 @@ auto resolve_pooling_kernel(Backend backend) -> Pooling::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

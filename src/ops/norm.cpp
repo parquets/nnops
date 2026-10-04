@@ -58,8 +58,9 @@ auto resolve_norm_kernel(Backend backend) -> Norm::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 
 /// Expected input count range for each norm type, as {min_inputs, max_inputs}.

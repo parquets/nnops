@@ -48,8 +48,9 @@ auto resolve_resize_kernel(Backend backend) -> Resize::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

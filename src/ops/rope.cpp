@@ -58,8 +58,9 @@ auto resolve_rope_kernel(Backend backend) -> RoPE::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

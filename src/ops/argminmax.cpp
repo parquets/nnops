@@ -69,8 +69,9 @@ auto resolve_argmax_kernel(Backend backend) -> ArgMax::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 
 auto resolve_argmin_kernel(Backend backend) -> ArgMin::Impl::KernelFn
@@ -86,8 +87,9 @@ auto resolve_argmin_kernel(Backend backend) -> ArgMin::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

@@ -48,8 +48,9 @@ auto resolve_concat_kernel(Backend backend) -> Concat::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

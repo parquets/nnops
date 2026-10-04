@@ -40,8 +40,9 @@ auto resolve_linear_kernel(Backend backend) -> Linear::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

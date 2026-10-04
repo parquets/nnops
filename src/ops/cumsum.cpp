@@ -50,8 +50,9 @@ auto resolve_cumsum_kernel(Backend backend) -> CumSum::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

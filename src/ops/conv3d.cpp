@@ -40,8 +40,9 @@ auto resolve_conv3d_kernel(Backend backend) -> Conv3D::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

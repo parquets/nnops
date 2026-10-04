@@ -58,8 +58,9 @@ auto resolve_softmax_kernel(Backend backend) -> Softmax::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

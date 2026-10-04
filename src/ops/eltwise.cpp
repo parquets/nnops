@@ -68,8 +68,9 @@ auto resolve_eltwise_kernel(Backend backend) -> Eltwise::Impl::KernelFn
     case Backend::Vulkan:
         return backend::vulkan::eltwise_vulkan;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

@@ -41,8 +41,9 @@ auto resolve_attention_kernel(Backend backend) -> Attention::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

@@ -58,8 +58,9 @@ auto resolve_reduce_kernel(Backend backend) -> Reduce::Impl::KernelFn
     case Backend::Vulkan:
         return nullptr;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

@@ -54,8 +54,9 @@ auto resolve_clamp_kernel(Backend backend) -> Clamp::Impl::KernelFn
     case Backend::CUDA:
         return backend::cuda::clamp_cuda;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 

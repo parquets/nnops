@@ -54,8 +54,9 @@ auto resolve_embed_kernel(Backend backend) -> Embed::Impl::KernelFn
     case Backend::CUDA:
         return backend::cuda::embed_cuda;
 #endif
+    default:
+        return nullptr;
     }
-    return nullptr;
 }
 }  // anonymous namespace
 
