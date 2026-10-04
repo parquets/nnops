@@ -21,7 +21,8 @@ namespace nnops::backend::cpu {
 /// Uses the MatMulPlan and pack/MMA dispatch from matmul_helper. Scratch is
 /// pooled internally (sized by the plan); @p workspace is vestigial.
 ///
-/// Falls back to the reference kernel for non-f32/f16 dtypes.
+/// s8×s8 has its own fused int8 path; every other dtype with no fused path
+/// falls back to the reference kernel.
 void matmul_cpu(const MatMulAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,

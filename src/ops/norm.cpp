@@ -65,9 +65,7 @@ auto resolve_norm_kernel(Backend backend) -> Norm::Impl::KernelFn
     return nullptr;
 }
 
-/// Expected input count range for each norm type.
-/// Returns {min_inputs, max_inputs}. max_inputs == -1 means unbounded (but
-/// practically bounded by the batch-norm 5-input signature).
+/// Expected input count range for each norm type, as {min_inputs, max_inputs}.
 std::pair<int, int> norm_input_range(NormType type) {
     switch (type) {
     case NormType::BatchNorm: return {5, 5};

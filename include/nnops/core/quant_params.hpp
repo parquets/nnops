@@ -19,8 +19,8 @@
 /// |--------|----------|------------------|------------|---------|
 /// | int8   | 1 byte   | [-128, 127]      | float      | done    |
 /// | uint8  | 1 byte   | [0, 255]         | float      | done    |
-/// | int4   | 0.5 byte | [-8, 7]          | float      | done    |
-/// | uint4  | 0.5 byte | [0, 15]          | float      | done    |
+/// | int4   | 0.5 byte | [-8, 7]          | float      | planned |
+/// | uint4  | 0.5 byte | [0, 15]          | float      | planned |
 /// | fp8    | 1 byte   | n/a (zp=0)       | float      | planned |
 ///
 /// For fp8 types (f8_e4m3, f8_e5m2), the "quantization" is a data-type cast.
@@ -50,13 +50,11 @@
 ///               `scale_data` and `zero_point_data` point to arrays of
 ///               length `num_scales`, where num_scales = shape[1] (channels).
 ///
-///   PerBlock:   one (scale, zero_point) per contiguous block of
-///               `block_size` elements along the innermost (K) dimension —
-///               the weight-only / grouped-quantization mode used by Q4/Q8
-///               GEMM (onnxruntime MatMulNBits, llama.cpp Q4_K). The block
-///               size is stored in `QuantParams::block_size`; the packed bit
-///               width comes from the storage DataType (s4/u4 → 4 bits,
-///               s8/u8 → 8 bits) via data_type_bits().
+///   PerBlock:   one (scale, zero_point) per physical KV-cache block, indexed
+///               by block number — the block (PagedAttention-style) KV-cache
+///               quantization CausalAttention uses. The block size is
+///               `QuantParams::block_size`. (Weight-only grouped Q4/Q8 GEMM
+///               would reuse these fields but is not implemented.)
 ///
 /// ## Design notes
 ///
@@ -122,9 +120,7 @@ struct QuantParams {
     /// Number of entries in scale_data / zero_point_data.
     /// For PerToken:   equals the number of rows (total_rows()).
     /// For PerChannel: equals the number of channels (shape[1]).
-    /// For PerBlock:   equals the total number of blocks — for a weight [N, K],
-    ///                 num_scales = N * ceil(K / block_size) (blocks run along
-    ///                 the innermost K dimension).
+    /// For PerBlock:   equals the number of KV-cache blocks.
     int64_t num_scales = 0;
 
     /// For PerBlock granularity: number of contiguous elements (along the
@@ -137,7 +133,7 @@ struct QuantParams {
     int64_t block_size = 0;
 
     /// Whether these parameters describe block quantization — PerBlock
-    /// granularity with a non-zero block_size (the Q4/Q8 weight-only GEMM mode).
+    /// granularity with a non-zero block_size.
     bool is_block_quantized() const noexcept {
         return granularity == QuantGranularity::PerBlock && block_size > 0;
     }

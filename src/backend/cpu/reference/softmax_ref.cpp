@@ -143,7 +143,7 @@ void softmax_ref(const SoftmaxAttributes& attrs,
     }
     const int64_t D = input.shape(axis);  // normalization dimension
     const int64_t axis_elems = input.stride_elems(axis);  // element stride along axis (accounts for pitch)
-    const int64_t inner_elems = input.stride_elems(rank - 1);  // always 1
+    const int64_t inner_elems = input.stride_elems(rank - 1);  // == channel_pack_size()
 
     const auto* in_ptr  = input.ptr<float>();
     auto* out_ptr = output.ptr<float>();

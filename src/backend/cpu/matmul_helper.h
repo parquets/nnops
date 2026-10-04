@@ -2,10 +2,10 @@
 /// @file matmul_helper.h
 /// @brief Inner matrix multiplication — pack + MMA micro-kernel dispatch.
 ///
-/// All arch-specific pack/mma headers share an identical API in namrspaces
+/// All arch-specific pack/mma headers share an identical API in the namespaces
 ///   nnops::backend::cpu::x86_64   and   nnops::backend::cpu::aarch64.
 /// This header picks the right set via NNOPS_ARCH_* and exposes the active
-/// namrspace as `arch`, so consumrr code stays clean of #ifdef.
+/// namespace as `arch`, so consumer code stays clean of #ifdef.
 
 #include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / NNOPS_ARCH_AARCH64
 #include "nnops/ops/matmul.hpp"                // MatMulAttributes
@@ -44,7 +44,7 @@
 
 namespace nnops::backend::cpu {
 
-// ---- namrspace alias ---------------------------------------------------
+// ---- namespace alias ---------------------------------------------------
 
 #ifdef NNOPS_ARCH_X86_64
 namespace arch = x86_64;
@@ -196,12 +196,12 @@ inline int64_t split_block_count(int64_t larger, int64_t mc) noexcept {
 //  Pack decision — simplified (mirrors onnxruntime MLAS sgemm)
 // =========================================================================
 //
-// B (rhs) is always packed into the workspace. A (lhs) is packed only when
-// transpose_a forces it (correctness) or when its row stride exceeds one
-// cache-friendly page so the panel reads would be page-scattered. The loop
-// order is always NKM (n-block outer, k, then m); the MKN and direct orders
-// are gone. Tiny GEMMs (M*N*K below the fast-path threshold) skip the tiled
-// path entirely and go straight to the reference.
+// B (rhs) is always packed into the workspace. A (lhs) is packed when
+// transpose_a forces it (correctness), when its row stride exceeds one
+// cache-friendly page so the panel reads would be page-scattered, or for int8.
+// The loop order follows the split: NKM when split on N, MKN when split on M.
+// Tiny GEMMs (M*N*K below the fast-path threshold) skip the tiled path
+// entirely and go straight to the reference.
 
 /// A is packed when its row stride exceeds this many elements (wide stride →
 /// page-scattered reads), independent of element type.

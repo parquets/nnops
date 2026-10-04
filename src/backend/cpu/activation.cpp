@@ -3,8 +3,8 @@
 ///
 /// All 8 activation types are vectorized with the nnops SIMD abstraction layer.
 /// Supports both f32 (v_f32x8) and f16 (v_f16x8) via a single templated implementation.
-/// Processing is tiled in groups of 32 rows and dispatched via
-/// ComputeContext::cpu.parallel_for when available.
+/// Processing is tiled in groups of TILE_M rows and dispatched via
+/// ComputeContext::cpu.run.
 ///
 /// Design:
 ///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking

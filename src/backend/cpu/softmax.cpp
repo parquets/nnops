@@ -10,7 +10,7 @@
 ///
 /// Three paths:
 ///   - Packed SIMD (axis == rank-1, pack > 1): per-lane SIMD reduction
-///     within each physical row. Delegates to kernel::softmax_process_packed_row.
+///     within each physical row. Delegates to kernel::softmax_process_packed_channel.
 ///   - Standard SIMD fast path (axis == rank-1, pack == 1): contiguous
 ///     tail. Delegates to kernel::softmax_process_standard_row.
 ///   - General scalar path: reference-style outer/D/inner decomposition

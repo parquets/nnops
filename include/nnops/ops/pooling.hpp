@@ -1,6 +1,6 @@
 #pragma once
 /// @file pooling.hpp
-/// @brief Pooling operator — 2D/3D spatial pooling with NCHW/NCDHW layout.
+/// @brief Pooling operator — 2D/3D spatial pooling, packed NCHWC8/NCDHWC8 layout.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

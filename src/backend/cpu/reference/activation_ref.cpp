@@ -138,8 +138,7 @@ void activation_ref(const ActivationAttributes& attrs,
     }
     case ActivationType::Gelu: {
         const auto fn = [](float x) -> float {
-            // GELU approximation: x * sigmoid(1.702 * x)
-            // or exact: 0.5 * x * (1 + erf(x / sqrt(2)))
+            // GELU, tanh approximation — matches the kernel's SIMD path.
             const float c = 0.7978845608028654f;  // sqrt(2/pi)
             return 0.5f * x * (1.0f + std::tanh(c * (x + 0.044715f * x * x * x)));
         };

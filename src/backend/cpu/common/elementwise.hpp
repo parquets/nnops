@@ -5,7 +5,7 @@
 ///        dequantize → op → quantize path.
 ///
 /// The four operators share the same shape: a pitch-aware row loop tiled into
-/// groups of TILE_M rows, dispatched via `ComputeContext::cpu.parallel_for`,
+/// groups of TILE_M rows, dispatched via `ComputeContext::cpu.run`,
 /// plus (for Activation/Unary/Eltwise) a quantized path that dequantizes the
 /// int input(s) to f32, runs the float op, and requantizes the result. This
 /// header is the single source of truth for that boilerplate; each operator

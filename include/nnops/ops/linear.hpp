@@ -25,10 +25,10 @@ struct LinearAttributes {
 /// Linear / fully-connected operator (class-based API).
 ///
 /// Computes: output = input × weight^T + bias
-///   input:  [M, K] (2D, or [*, K] which broadcasts to 2D)
+///   input:  [..., K]
 ///   weight: [N, K]
 ///   bias:   [N] (optional)
-///   output: [M, N]
+///   output: [..., N]   (leading dims preserved; only the last becomes N)
 ///
 /// Transposed weight is implicit — the weight is stored as [N, K] and
 /// the multiplication is input × weight^T.

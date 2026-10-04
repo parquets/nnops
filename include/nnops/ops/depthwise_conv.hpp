@@ -1,6 +1,6 @@
 #pragma once
 /// @file depthwise_conv.hpp
-/// @brief DepthwiseConv operator — depthwise separable 2D/3D convolution (NCHW/NCDHW layout).
+/// @brief DepthwiseConv operator — depthwise separable 2D/3D convolution (NCHWC8/NCDHWC8 layout).
 ///
 /// Depthwise convolution applies a separate filter to each input channel independently.
 /// There is no cross-channel mixing. This is the first step of a depthwise-separable

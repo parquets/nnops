@@ -436,8 +436,9 @@ void moe_cpu(const MoEAttributes& attrs,
              const ComputeContext& ctx,
              void* workspace)
 {
-    // A sigmoid (or sqrt-softplus) score is in (0, 1) and does not sum to 1, so
-    // leaving it unnormalized scales the routed output down by roughly k/2.
+    // Sigmoid scores sit in (0, 1) and do not sum to 1 (sqrt-softplus scores are
+    // unbounded, but likewise do not sum to 1), so leaving them unnormalized
+    // scales the routed output down — by about 2/k for sigmoid.
     // That is well defined and occasionally intended, hence a warning rather
     // than an assertion — but it is far more often a forgotten
     // `normalize_routing_weights` (DeepSeek-V3 pairs the two, plus a

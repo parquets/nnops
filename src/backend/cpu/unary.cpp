@@ -2,8 +2,8 @@
 /// @brief SIMD-optimized CPU implementation of element-wise unary operations.
 ///
 /// Supports both f32 and f16 via a single templated implementation.
-/// Processing is tiled in groups of 8 rows and dispatched via
-/// ComputeContext::cpu.parallel_for when available.
+/// Processing is tiled in groups of TILE_M rows and dispatched via
+/// ComputeContext::cpu.run when available.
 ///
 /// Design:
 ///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking

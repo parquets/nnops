@@ -1,6 +1,6 @@
 #pragma once
 /// @file grid_sample.hpp
-/// @brief GridSample operator — 2D/3D grid-based spatial sampling with NCHW/NCDHW layout.
+/// @brief GridSample operator — 2D/3D grid-based spatial sampling, packed NCHWC8/NCDHWC8 layout.
 ///
 /// Given an input tensor and a flow-field grid, GridSample computes the output by
 /// sampling the input at locations defined by the grid. The grid contains normalized

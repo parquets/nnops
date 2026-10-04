@@ -1,9 +1,8 @@
 /// @file causal_attention.cpp
-/// @brief SIMD-optimized CPU implementation of CausalAttention.
+/// @brief CPU implementation of CausalAttention.
 ///
-/// Currently delegates to the reference kernel for all paths.
-/// The entry point provides dtype dispatch; SIMD fast-paths for f32/f32
-/// and f32/f16 will be added incrementally.
+/// Currently delegates to the reference kernel for all paths; the entry point
+/// provides dtype dispatch. SIMD fast-paths will be added incrementally.
 
 #include "nnops/ops/causal_attention.hpp"
 #include "common/memory_pool.hpp"           // internal scratch-memory pool

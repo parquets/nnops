@@ -5,7 +5,7 @@
 ///   - QuantizeLinear:  f32/f16 → s8/u8
 ///   - DequantizeLinear: s8/u8 → f32
 ///   - All layouts: NCHW, NCDHW, NCHWC8, NCDHWC8
-///   - PerTensor and PerChannel granularities
+///   - PerTensor, PerToken and PerChannel granularities
 ///
 /// Serves as the correctness baseline for SIMD kernels.
 

@@ -3,7 +3,7 @@
 ///
 /// Supports both f32 and f16 via a single templated implementation.
 /// Processing is tiled in groups of TILE_M rows and dispatched via
-/// ComputeContext::cpu.parallel_for when available.
+/// ComputeContext::cpu.run.
 ///
 /// Design:
 ///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking

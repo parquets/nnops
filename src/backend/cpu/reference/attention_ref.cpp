@@ -131,10 +131,10 @@ void attention_ref(const AttentionAttributes& attrs,
             }
         }
 
-        // Step 4: Softmax along last dimension
+        // Step 3: Softmax along last dimension
         softmax_last_dim(scores.data(), Sq, Sk);
 
-        // Step 5: output = attn @ V
+        // Step 4: output = attn @ V
         for (int64_t i = 0; i < Sq; ++i) {
             for (int64_t d = 0; d < D; ++d) {
                 float sum = 0.0f;

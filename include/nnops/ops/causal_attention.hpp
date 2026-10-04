@@ -54,7 +54,7 @@ struct CausalAttentionAttributes {
     /// When < num_heads, KV heads are shared across query head groups.
     int64_t num_group = 0;
 
-    /// Data type for KV-cache storage (f32/f16).
+    /// Data type for KV-cache storage (f32/f16/bf16/s8/u8).
     DataType kv_cache_dtype = DataType::f32;
 
     /// If true, apply QK normalization (QK-norm) before softmax.

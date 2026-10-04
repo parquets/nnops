@@ -1,6 +1,6 @@
 #pragma once
 /// @file resize.hpp
-/// @brief Resize operator — 2D/3D spatial interpolation with NCHW/NCDHW layout.
+/// @brief Resize operator — 2D/3D spatial interpolation, packed NCHWC8/NCDHWC8 layout.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -28,10 +28,10 @@ enum class CoordinateTransformMode : uint8_t {
 
 /// Attributes for the Resize operator (supports both 2D and 3D).
 ///
-/// For 2D resize (NCHW input, rank=4): output_size[1]=OH, output_size[2]=OW.
+/// For 2D resize (NCHWC8 input, rank=4): output_size[1]=OH, output_size[2]=OW.
 ///   output_size[0] is ignored.
 ///
-/// For 3D resize (NCDHW input, rank=5): all 3 elements are used (OD, OH, OW).
+/// For 3D resize (NCDHWC8 input, rank=5): all 3 elements are used (OD, OH, OW).
 struct ResizeAttributes {
     ResizeMode mode = ResizeMode::Nearest;
     CoordinateTransformMode coord_mode = CoordinateTransformMode::HalfPixel;
@@ -49,9 +49,9 @@ struct ResizeAttributes {
     /// When crop_end[d] == 0, no crop is applied for that dimension
     /// (the full input spatial extent is used).
     ///
-    /// For 2D input (NCHW/NCHWC8, rank=4), index 0 (D) is ignored
+    /// For 2D input (NCHWC8, rank=4), index 0 (D) is ignored
     ///   — only crop_start[1]/[2] and crop_end[1]/[2] (H, W) are used.
-    /// For 3D input (NCDHW/NCDHWC8, rank=5), all three indices are used.
+    /// For 3D input (NCDHWC8, rank=5), all three indices are used.
     ///
     /// Example: input [N,C,8,16,16], crop_start={2,4,4}, crop_end={6,12,12}
     ///   → crops region d=[2,6), h=[4,12), w=[4,12), then resizes to output_size.

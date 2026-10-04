@@ -2,8 +2,8 @@
 /// @brief SIMD-optimized CPU implementation of element-wise Clamp.
 ///
 /// Supports both f32 and f16 via a single templated implementation.
-/// Processing is tiled in groups of 32 rows and dispatched via
-/// ComputeContext::cpu.parallel_for when available.
+/// Processing is tiled in groups of TILE_M rows and dispatched via
+/// ComputeContext::cpu.run.
 ///
 /// Core operation: v_max(v_min(x, max_val), min_val) — 2 SIMD instructions.
 

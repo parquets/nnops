@@ -802,7 +802,8 @@ void matmul_cpu(const MatMulAttributes& attrs,
         return;
     }
 
-    // Only f32 and f16 have fused kernels; everything else uses the reference.
+    // Past the int8 branch: only f32 and f16 have a fused kernel, the rest use
+    // the reference.
     const bool supported = (dt_a == DataType::f32 && dt_b == DataType::f32) ||
                            (dt_a == DataType::f16 && dt_b == DataType::f16);
     if (!supported) {
