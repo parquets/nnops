@@ -37,8 +37,9 @@ public:
     /// layout of each output tensor. Used by graph engines and runtime
     /// memory planners to pre-allocate output buffers.
     ///
-    /// Most operators produce exactly one output. A few (e.g. training-mode
-    /// BatchNorm) may produce multiple outputs.
+    /// Most operators produce exactly one output. These produce more:
+    /// CausalAttention (output + KV cache), LinearAttention (output + state),
+    /// TopK (values + indices).
     ///
     /// @param inputs  Input tensor descriptors (shapes + dtype + layout).
     /// @return        Output tensor descriptors. Size is typically 1.

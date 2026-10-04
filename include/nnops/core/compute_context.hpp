@@ -11,8 +11,9 @@ namespace nnops {
 /// Execution context passed to operator compute() calls.
 /// Each backend reads only the fields it cares about.
 struct ComputeContext {
-    /// Target backend for execution. Callers read this to select the backend
-    /// when creating operators. Default: CPU.
+    /// Backend this context was prepared for. Default: CPU.
+    /// Nothing in the library dispatches on it — an operator is bound to its
+    /// backend at creation — so it is informational for callers and tests.
     Backend expected_backend = Backend::CPU;
 
     /// CPU execution backend: parallelism + worker-count / thread-id hooks.

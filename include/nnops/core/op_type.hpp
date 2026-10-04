@@ -1,12 +1,16 @@
 #pragma once
 /// @file op_type.hpp
-/// @brief OpType enum identifying different operator types (aligned with ONNX op types).
+/// @brief OpType enum identifying different operator types.
+///
+/// Loosely tracks ONNX op naming, but several entries have no ONNX op behind
+/// them (CausalAttention, LinearAttention, MoE, Norm, GroupNorm, …). Nothing in
+/// the library maps these to ONNX names; the enum is this library's own.
 
 #include <cstdint>
 
 namespace nnops {
 
-/// Operator type identifiers (corresponds to ONNX OpType).
+/// Operator type identifiers.
 enum class OpType : uint8_t {
     Conv2D      = 0,
     Activation  = 1,

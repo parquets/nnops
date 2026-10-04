@@ -3,11 +3,7 @@
 /// @brief SIMD epilogue kernels — scalar and vector apply_epilogue, plus
 ///        epilogue_inplace for fused bias + activation output write-back.
 ///
-/// Contains:
-///   1. Scalar apply_epilogue (moved from include/nnops/core/epilogue.hpp)
-///   2. SIMD vector apply_epilogue for v_f32x8 and v_f16x8
-///   3. epilogue_inplace — fused bias + epilogue for MatMul output
-///
+/// The scalar overloads declared in nnops/core/epilogue.hpp are defined here.
 /// Formulas match activation_ref.cpp exactly.
 
 #include "nnops/core/epilogue.hpp"
@@ -25,10 +21,6 @@
 
 namespace nnops {
 
-/// Apply an epilogue to a single scalar output value (activation types).
-/// Returns the value unchanged when type == None (identity).
-///
-/// Formulas match activation_ref.cpp exactly.
 inline float apply_epilogue(const Epilogue& ep, float x) {
     switch (ep.type) {
     case EpilogueActivateType::None:
@@ -57,21 +49,10 @@ inline float apply_epilogue(const Epilogue& ep, float x) {
     return x;
 }
 
-/// Apply an epilogue to a single scalar output value at a given channel index.
-///
-/// For activation types: delegates to the scalar overload (channel is ignored).
-/// For dequantize / requantize (future): uses per-channel or per-tensor
-/// quantization parameters.
 inline float apply_epilogue(const Epilogue& ep, float x, int64_t /*channel*/) {
-    // Future quantize / dequantize types will use channel here:
-    // case EpilogueActivateType::Dequantize: {
-    //     int64_t idx = (ep.quant_param_count > 0)
-    //         ? std::min(channel, ep.quant_param_count - 1) : 0;
-    //     float scale = ep.quant_scales[idx];
-    //     float zp = ep.quant_zero_points
-    //         ? static_cast<float>(ep.quant_zero_points[idx]) : 0.0f;
-    //     return (x - zp) * scale;
-    // }
+    // Every live epilogue type is per-element, so the channel index is unused;
+    // a future Dequantize/Requantize would index quant_scales/quant_zero_points
+    // with it here.
     return apply_epilogue(ep, x);
 }
 

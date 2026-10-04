@@ -12,9 +12,10 @@
 ///   Higher dimensions (C, N, D, etc.) are densely packed — their stride is
 ///   the product of the inner dimension size and its byte stride.
 ///
-/// Examples (assuming 32-byte alignment for row padding):
-///   NCHW uint8,  W=70: pitch = 72  (70 rounded up to next aligned value)
-///   NCHWC8 uint8, W=7:  pitch = 72  (7*8=56, aligned → 72)
+/// Examples, using the 32-byte row alignment TensorDesc::row_pitch() defaults to
+/// (a TensorView built with an explicit pitch accepts any value >= the minimum):
+///   NCHW uint8,  W=70: pitch = 96  (70 rounded up to a multiple of 32)
+///   NCHWC8 uint8, W=7:  pitch = 64  (7*8 = 56 rounded up to a multiple of 32)
 
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_layout.hpp"
@@ -271,7 +272,8 @@ public:
 
     /// Compute the element stride for a given dimension.
     /// Stride is the number of elements to skip to advance by 1 in that dim.
-    /// For rank-1 (innermost): always 1 (contiguous within a row).
+    /// For rank-1 (innermost): channel_pack_size() — 1 for planar, the pack
+    /// size (e.g. 8) for NCHWC8, since one logical step moves a whole lane.
     /// For rank-2: pitch / elem_size (may be > shape[rank-1] if padded).
     /// For higher dims: shape[dim+1] * stride(dim+1).
     int64_t stride_elems(int64_t dim) const noexcept {

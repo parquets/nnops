@@ -16,7 +16,9 @@
 ///   NCHWC32:  [N, ceil(C/32), H, W, 32]     — 2D, 32 chan/lane (AVX-512)
 ///   NCDHWC8:  [N, ceil(C/8), D, H, W, 8]    — 3D packed variant
 ///
-/// The [W][Cx] row is always a single contiguous block; pitch = align_up(W * Cx * elem_size, 32).
+/// A [W][Cx] row is a single contiguous block. Channel-packed tensors use
+/// pitch = align_up(W * pack * elem_size, 32) — see TensorDesc::row_pitch().
+/// A TensorView built with an explicit pitch may use any larger value.
 
 #include <cstdint>
 
