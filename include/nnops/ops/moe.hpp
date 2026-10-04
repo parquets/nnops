@@ -7,9 +7,10 @@
 /// etc.). It is a *fused* operator that runs, for every token, the selected
 /// top-K experts end-to-end:
 ///
-///     p       = softmax(router_probs[token, :])         (over all E experts)
+///     p       = gating(router_probs[token, :])          (over all E experts)
 ///     ids, ws = top_k(p, k)                             (select + gather)
 ///     if normalize_routing_weights: ws = ws / sum(ws)   (renormalize the k)
+///     if routed_scaling_factor:     ws = ws * factor
 ///     for (id, w) in zip(ids, ws):
 ///         h  = act(  x @ fc1_w[id]^T + fc1_b[id]  )      (per-expert GEMM 1)
 ///         y += w * ( h @ fc2_w[id]^T + fc2_b[id] )       (per-expert GEMM 2)
@@ -17,9 +18,14 @@
 ///
 /// Routing (the gate projection) is deliberately *external*: the caller computes
 /// `router_probs` (typically `linear(gate)` — raw logits) with the existing
-/// Linear op and passes it in. The softmax over all experts and the top-K select
+/// Linear op and passes it in. The scoring over all experts and the top-K select
 /// happen *inside* this op, matching onnxruntime's `com.microsoft::MoE` contrib
 /// op, which is the primary integration target of this library.
+///
+/// The scoring function is selectable (`router_gating`). onnxruntime has no such
+/// attribute — it always softmaxes — so this one follows llama.cpp's
+/// `expert_gating_func`, which is what lets the op cover DeepSeek-V3 / Llama-4
+/// style sigmoid routing. `Softmax` is the default and matches ORT.
 ///
 /// Each expert's FFN is a two-(or three-)layer MLP whose weights are stacked
 /// along a leading expert axis (shape[0] == num_experts). The inner per-expert
@@ -58,6 +64,19 @@ enum class MoEActivation : uint8_t {
     SwiGLU   = 4,  ///< h = gate * sigmoid(alpha*gate) * (value + beta)  (see below)
 };
 
+/// Router scoring function: how the gate logits become the probabilities that
+/// top-K selects from. Mirrors llama.cpp's `llama_expert_gating_func_type`
+/// (its NONE and SOFTMAX_WEIGHT variants are not carried over — see below).
+///
+/// Only the *selection* score changes; the top-K tie-break (ascending scan,
+/// exact ties resolved toward the lower expert index) is the same for all of
+/// them.
+enum class MoERouterGating : uint8_t {
+    Softmax      = 0,  ///< p = softmax(logits)          (Mixtral, Qwen-MoE)
+    Sigmoid      = 1,  ///< p = sigmoid(logits)          (DeepSeek-V3, Llama-4)
+    SqrtSoftplus = 2,  ///< p = sqrt(softplus(logits))   (llama.cpp)
+};
+
 /// How the Gate / Value halves of a SwiGLU expert are laid out in the expert
 /// weight tensors (only meaningful when `activation == SwiGLU`).
 ///
@@ -92,10 +111,28 @@ struct MoEAttributes {
     /// Mixtral/Gemma-style LLM MoE (onnxruntime's default is `relu`).
     MoEActivation activation = MoEActivation::Silu;
 
+    /// Router scoring function applied to `router_probs` *before* top-K. The
+    /// default `Softmax` reproduces the historical behaviour exactly.
+    ///
+    /// With `Sigmoid` the scores are in (0, 1) and do **not** sum to 1, so the
+    /// routed output is systematically smaller than under `Softmax`. That is the
+    /// expected model behaviour (DeepSeek-V3 pairs sigmoid with
+    /// `normalize_routing_weights` and `routed_scaling_factor` to bring the
+    /// scale back), not a bug — but it is worth being deliberate about the
+    /// combination.
+    MoERouterGating router_gating = MoERouterGating::Softmax;
+
+    /// Multiplier applied to the routing weights after normalization —
+    /// llama.cpp's `w_scale`, DeepSeek-V3's `routed_scaling_factor` (2.5).
+    /// Default 1.0 leaves the weights alone. Applied to whichever weights the
+    /// routing gathered, so it composes with `router_weights` too.
+    float routed_scaling_factor = 1.0f;
+
     /// Re-normalize the selected routing weights to sum to 1 (divide the top-K
-    /// by their own sum). When false, the selected softmax probabilities are used
-    /// as-is. When `router_weights` (input 8) is present this renormalizes those
-    /// gathered weights instead — the selection still comes from `router_probs`.
+    /// by their own sum). When false, the selected scores are used as-is (the
+    /// softmax or sigmoid values, or the gathered `router_weights`). When
+    /// `router_weights` (input 8) is present this renormalizes those gathered
+    /// weights instead — the selection still comes from `router_probs`.
     bool normalize_routing_weights = false;
 
     /// Sparse-mixer routing variant (selects k=2 experts and applies the
@@ -124,7 +161,8 @@ struct MoEAttributes {
 ///
 ///   [0] input                  [num_tokens, hidden_size]     (f32/f16)
 ///   [1] router_probs           [num_tokens, num_experts]     (f32/f16)
-///                              raw router LOGITS — softmaxed inside this op
+///                              raw router LOGITS — scored inside this op
+///                              (see `router_gating`)
 ///   [2] fc1_experts_weights    [E, fc1_out, hidden_size]     gate (or gate+value)
 ///   [3] fc1_experts_bias       [E, fc1_out]                  (optional)
 ///   [4] fc2_experts_weights    [E, hidden_size, inter_size]  down-projection
@@ -140,14 +178,15 @@ struct MoEAttributes {
 ///     fc1_out = inter_size            (Separate, or non-SwiGLU)
 ///     fc1_out = 2 * inter_size        (Interleaved / Block SwiGLU)
 ///
-/// `softmax(router_probs)` drives both the top-K *selection* and the mixing
+/// `router_gating(router_probs)` drives both the top-K *selection* and the mixing
 /// weights, unless `router_weights` is provided, in which case the mixing weights
 /// are gathered from it at the selected indices and `router_probs` only selects.
 ///
-/// Implemented today (CPU): f32/f16, the Relu/Gelu/Silu/Identity activations, and
-/// SwiGLU with the `Separate` layout — the one that takes its value half from
-/// fc3. The `Interleaved`/`Block` SwiGLU layouts and `use_sparse_mixer` are part
-/// of the interface but not yet implemented; they are rejected by an assertion.
+/// Implemented today (CPU): f32/f16, all three `router_gating` functions,
+/// `routed_scaling_factor`, the Relu/Gelu/Silu/Identity activations, and SwiGLU
+/// with the `Separate` layout — the one that takes its value half from fc3. The
+/// `Interleaved`/`Block` SwiGLU layouts and `use_sparse_mixer` are part of the
+/// interface but not yet implemented; they are rejected by an assertion.
 ///
 /// Output (1):
 ///   [0] output                    [num_tokens, hidden_size]

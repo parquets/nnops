@@ -5,8 +5,9 @@
 /// correctness oracle for the optimized kernel in `backend/cpu/moe.cpp` — it
 /// deliberately shares no code with it.
 ///
-/// Per token: softmax the router logits over *all* experts, take the top-K (ties
-/// toward the lower expert index), optionally renormalize the selected weights,
+/// Per token: score the router logits over *all* experts with
+/// `attrs.router_gating` (softmax by default), take the top-K (ties toward the
+/// lower expert index), optionally renormalize and scale the selected weights,
 /// then run the selected experts' FFNs and accumulate `w * expert_out` in f32.
 ///
 /// Scope matches the kernel: f32/f16, Relu/Gelu/Silu/Identity, and SwiGLU with
@@ -61,6 +62,24 @@ inline float apply_activation(MoEActivation act, float x, float alpha, float bet
     }
     NNOPS_ASSERT(!"moe_ref: unsupported activation");
     return x;
+}
+
+/// Router score for a single logit, for the gating functions that are
+/// pointwise. Softmax normalizes across the row, so the caller computes it in
+/// full — deliberately the same split as the optimized kernel, but written
+/// independently.
+///
+/// Softplus guards at 20 because log1p(exp(x)) would overflow just above it;
+/// below the guard it loses nothing. This mirrors llama.cpp's
+/// `ggml_compute_softplus_f32`.
+inline float gating_sigmoid(float x) noexcept
+{
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+inline float gating_sqrt_softplus(float x) noexcept
+{
+    return std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
 }
 
 /// SwiGLU value/gate combine, matching moe.hpp's documented formula:
@@ -135,20 +154,37 @@ void moe_ref_impl(const MoEAttributes& attrs,
     for (int64_t t = 0; t < num_tokens; ++t) {
         const T* logits = rout_ptr + t * rout_row_stride;
 
-        // ---- softmax over all experts (max-subtracted, f32) ----
-        float max_logit = load_at(logits, 0);
-        for (int64_t e = 1; e < E; ++e) {
-            const float v = load_at(logits, e);
-            max_logit = v > max_logit ? v : max_logit;
-        }
-        float sum_exp = 0.0f;
-        for (int64_t e = 0; e < E; ++e) {
-            probs[static_cast<size_t>(e)] = std::exp(load_at(logits, e) - max_logit);
-            sum_exp += probs[static_cast<size_t>(e)];
-        }
-        const float inv_sum = 1.0f / sum_exp;
-        for (int64_t e = 0; e < E; ++e) {
-            probs[static_cast<size_t>(e)] *= inv_sum;
+        // ---- score the logits over all experts (f32) ----
+        switch (attrs.router_gating) {
+        case MoERouterGating::Softmax: {
+            // Max-subtracted for stability; the softmax normalizes the row.
+            float max_logit = load_at(logits, 0);
+            for (int64_t e = 1; e < E; ++e) {
+                const float v = load_at(logits, e);
+                max_logit = v > max_logit ? v : max_logit;
+            }
+            float sum_exp = 0.0f;
+            for (int64_t e = 0; e < E; ++e) {
+                probs[static_cast<size_t>(e)] = std::exp(load_at(logits, e) - max_logit);
+                sum_exp += probs[static_cast<size_t>(e)];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int64_t e = 0; e < E; ++e) {
+                probs[static_cast<size_t>(e)] *= inv_sum;
+            }
+        } break;
+        case MoERouterGating::Sigmoid:
+            // Pointwise, and deliberately not max-subtracted: shifting the
+            // logits would change the scores rather than rescale them.
+            for (int64_t e = 0; e < E; ++e) {
+                probs[static_cast<size_t>(e)] = gating_sigmoid(load_at(logits, e));
+            }
+            break;
+        case MoERouterGating::SqrtSoftplus:
+            for (int64_t e = 0; e < E; ++e) {
+                probs[static_cast<size_t>(e)] = gating_sqrt_softplus(load_at(logits, e));
+            }
+            break;
         }
 
         // ---- top-K selection: scan ascending with a strict '>', so an exact
@@ -174,6 +210,13 @@ void moe_ref_impl(const MoEAttributes& attrs,
             for (int64_t j = 0; j < k; ++j) { wsum += weights[static_cast<size_t>(j)]; }
             const float inv_wsum = (wsum != 0.0f) ? 1.0f / wsum : 0.0f;
             for (int64_t j = 0; j < k; ++j) { weights[static_cast<size_t>(j)] *= inv_wsum; }
+        }
+
+        // Routed scaling, applied last so it composes with the renormalization.
+        if (attrs.routed_scaling_factor != 1.0f) {
+            for (int64_t j = 0; j < k; ++j) {
+                weights[static_cast<size_t>(j)] *= attrs.routed_scaling_factor;
+            }
         }
 
         const T* x = in_ptr + t * in_row_stride;

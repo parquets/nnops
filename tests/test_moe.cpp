@@ -516,6 +516,169 @@ NNOPS_TEST(moe_router_weights)
     NNOPS_EXPECT_TRUE(max_abs_diff(run_kernel(p, plain), run_kernel(q, plain)) > 1e-3f);
 }
 
+// Every router gating function must track the reference, and each must actually
+// change the result — a kernel-vs-reference comparison alone would pass
+// vacuously if the attribute were ignored, since both sides would ignore it
+// together.
+NNOPS_TEST(moe_router_gating_functions)
+{
+    const MoERouterGating modes[] = {MoERouterGating::Softmax, MoERouterGating::Sigmoid,
+                                     MoERouterGating::SqrtSoftplus};
+    const char* names[] = {"softmax", "sigmoid", "sqrt_softplus"};
+
+    MoEProblem p;
+    p.T = 12; p.H = 16; p.E = 4; p.I = 16;
+    p.build(/*seed=*/61);
+
+    std::vector<std::vector<float>> outs;
+    for (int i = 0; i < 3; ++i) {
+        MoEAttributes attrs;
+        attrs.k = 2;
+        attrs.router_gating = modes[i];
+        expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f,
+                           std::string("moe gating ") + names[i]);
+        outs.push_back(run_kernel(p, attrs));
+    }
+
+    // Pairwise distinct: the three score the same logits differently, so their
+    // mixing weights differ (softmax renormalizes the row, the other two do not).
+    for (int i = 0; i < 3; ++i) {
+        for (int j = i + 1; j < 3; ++j) {
+            NNOPS_EXPECT_TRUE(max_abs_diff(outs[i], outs[j]) > 1e-3f);
+        }
+    }
+}
+
+// Hand-computed routing weights, one gating function at a time, on a problem
+// where the output *is* the selected routing weight:
+//
+//   T = 1, H = 1, E = 3, I = 1, k = 1, Identity activation, no biases
+//   x = [1], every expert weight = 1  =>  out = the selected expert's weight
+//
+//   logits = [0, 1, 2]  ->  argmax is expert 2 under all three functions:
+//     softmax      e^2/(1+e+e^2)        = 0.665240956
+//     sigmoid      1/(1+e^-2)           = 0.880797078
+//     sqrt_softplus sqrt(ln(1+e^2))     = 1.458399418
+//
+// The three are all monotonic in the logits, so they select the *same* expert
+// and only disagree on the weight — which is exactly the property being pinned
+// here. (It also means a 2-expert case would prove nothing: softmax([0,b]) is
+// sigmoid(b), so the two coincide.)
+NNOPS_TEST(moe_sigmoid_routing_hand_computed)
+{
+    MoEProblem p;
+    p.T = 1; p.H = 1; p.E = 3; p.I = 1;
+    p.build(/*seed=*/601);
+    p.has_fc1b = false;
+    p.has_fc2b = false;
+
+    p.input.f32  = {1.0f};
+    p.router.f32 = {0.0f, 1.0f, 2.0f};
+    p.fc1w.f32   = {1.0f, 1.0f, 1.0f};
+    p.fc2w.f32   = {1.0f, 1.0f, 1.0f};
+
+    const MoERouterGating modes[] = {MoERouterGating::Softmax, MoERouterGating::Sigmoid,
+                                     MoERouterGating::SqrtSoftplus};
+    const float expect[] = {0.665240956f, 0.880797078f, 1.458399418f};
+
+    for (int i = 0; i < 3; ++i) {
+        MoEAttributes attrs;
+        attrs.k = 1;
+        attrs.activation = MoEActivation::Identity;
+        attrs.router_gating = modes[i];
+
+        auto got = run_kernel(p, attrs);
+        NNOPS_EXPECT_EQ(got.size(), size_t(1));
+        NNOPS_EXPECT_NEAR(got[0], expect[i], 1e-5f);
+
+        // Same numbers through the reference: the two agree on the score, not
+        // just on the final value.
+        expect_close(got, run_ref(p, attrs), 0.0f, 1e-5f, "moe gating hand computed");
+    }
+}
+
+// The routed scaling factor is llama.cpp's w_scale / DeepSeek-V3's 2.5. It is a
+// pure multiplier on the routed output — the experts are combined linearly in
+// the routing weight — which pins its semantics independently of the reference.
+NNOPS_TEST(moe_routed_scaling_factor)
+{
+    MoEProblem p;
+    p.T = 10; p.H = 16; p.E = 4; p.I = 16;
+    p.build(/*seed=*/91);
+
+    MoEAttributes attrs;
+    attrs.k = 2;
+    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe scale=1");
+
+    MoEAttributes scaled = attrs;
+    scaled.routed_scaling_factor = 2.5f;
+    expect_matches_ref(p, scaled, {}, 1e-4f, 1e-5f, "moe scale=2.5");
+
+    auto plain_out  = run_kernel(p, attrs);
+    auto scaled_out = run_kernel(p, scaled);
+    NNOPS_EXPECT_TRUE(max_abs_diff(plain_out, scaled_out) > 1e-3f);
+    for (size_t i = 0; i < plain_out.size(); ++i) {
+        NNOPS_EXPECT_NEAR(scaled_out[i], 2.5f * plain_out[i], 1e-4f);
+    }
+}
+
+// The DeepSeek-V3 combination: sigmoid scoring, renormalize the top-K, then
+// scale. Sigmoid scores do not sum to 1 and the renormalization is what puts
+// them back on the softmax scale — so it must genuinely matter here.
+NNOPS_TEST(moe_sigmoid_routing_normalized)
+{
+    MoEProblem p;
+    p.T = 12; p.H = 16; p.E = 8; p.I = 16;
+    p.build(/*seed=*/101);
+
+    MoEAttributes attrs;
+    attrs.k = 2;
+    attrs.router_gating = MoERouterGating::Sigmoid;
+    attrs.normalize_routing_weights = true;
+    attrs.routed_scaling_factor = 2.5f;
+    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe sigmoid+normalize+scale");
+
+    MoEAttributes raw = attrs;
+    raw.normalize_routing_weights = false;
+    NNOPS_EXPECT_TRUE(max_abs_diff(run_kernel(p, attrs), run_kernel(p, raw)) > 1e-3f);
+}
+
+// SqrtSoftplus over logits that run past the softplus guard (llama.cpp's
+// ggml_compute_softplus_f32 switches to the identity above 20 to keep
+// log1p(exp(x)) from overflowing). The reference takes the same branch, so
+// agreement alone proves nothing here — the finiteness check is what catches a
+// missing guard, since exp(100) is inf and sqrt(inf) is still inf.
+//
+// The logits are laid out explicitly rather than randomly: the guard only
+// matters above ln(FLT_MAX) ~ 88.7, which a uniform draw of f32 values reaches
+// only some of the time. A random fill here would be a test that passes or
+// fails by luck.
+NNOPS_TEST(moe_sqrt_softplus_routing_large_logits)
+{
+    MoEProblem p;
+    p.T = 6; p.H = 8; p.E = 4; p.I = 8;
+    p.build(/*seed=*/111);
+    p.router.f32 = {
+        -1000.0f,  -50.0f,    0.0f,   95.0f,   // -1000 underflows to softplus 0
+         -95.0f,   50.0f,   20.0f,  100.0f,
+          80.0f,   88.0f,   90.0f,  120.0f,   // 88.7 is the overflow threshold
+         -120.0f,  -90.0f,  -20.0f,   30.0f,
+           0.0f,     0.0f,    0.0f,    0.0f,
+         200.0f, -200.0f,   89.0f,  -89.0f,
+    };
+
+    MoEAttributes attrs;
+    attrs.k = 2;
+    attrs.router_gating = MoERouterGating::SqrtSoftplus;
+    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe sqrt_softplus large logits");
+
+    // sqrt(softplus(95)) is sqrt(95) ~ 9.7 under the guard; without it the score
+    // is inf and so is the output.
+    for (float v : run_kernel(p, attrs)) {
+        NNOPS_EXPECT_TRUE(std::isfinite(v));
+    }
+}
+
 // Every non-gated activation.
 NNOPS_TEST(moe_activations)
 {

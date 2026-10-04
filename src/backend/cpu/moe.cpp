@@ -2,9 +2,15 @@
 /// @brief CPU Mixture-of-Experts kernel — fused router + per-expert FFN.
 ///
 /// Semantics follow onnxruntime's `com.microsoft::MoE` CPU kernel: the router
-/// logits are softmaxed over *all* experts, the top-K are selected (ties toward
-/// the lower expert index), optionally renormalized, and then each selected
-/// expert's FFN runs and contributes `w * expert_out` to the token's output.
+/// logits are scored over *all* experts, the top-K are selected (ties toward
+/// the lower expert index), optionally renormalized and scaled, and then each
+/// selected expert's FFN runs and contributes `w * expert_out` to the token's
+/// output.
+///
+/// The scoring function is `attrs.router_gating` — softmax by default (which is
+/// what ORT does, unconditionally), or sigmoid / sqrt-softplus following
+/// llama.cpp's `expert_gating_func`. It changes only the mixing weights: all
+/// three are monotonic in the logits, so the selected experts are the same.
 ///
 /// The work is split in two phases so that neither races:
 ///
@@ -62,6 +68,25 @@ inline float ldf(const T* p) noexcept { return simd::s_load(p); }
 
 template <typename T>
 inline void stf(T* p, float v) noexcept { simd::s_store(p, v); }
+
+/// Elementwise router scores, for the gating functions that do not need the
+/// whole row. Softmax normalizes across the row, so it is computed by the caller
+/// directly; these two are pointwise and can be applied a logit at a time.
+///
+/// Sigmoid saturates on its own (exp(-x) overflows to inf at ~-88, giving 0; at
+/// large +x it underflows to 0, giving 1), so it needs no range guard. Softplus
+/// does: ggml guards at 20 and llama.cpp's `ggml_compute_softplus_f32` is the
+/// model here — log1p(exp(x)) loses nothing below the guard and would overflow
+/// above it.
+inline float gating_sigmoid(float x) noexcept
+{
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+inline float gating_sqrt_softplus(float x) noexcept
+{
+    return std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
+}
 
 /// SwiGLU gate/value combine, matching moe.hpp's documented formula:
 ///   h = gate * sigmoid(alpha * gate) * (value + beta)
@@ -196,9 +221,11 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     (void)fc1_out;
 
     // ------------------------------------------------------------------
-    // Routing: softmax over all experts, then top-K. Serial on purpose —
-    // O(T*E) is negligible next to the GEMMs, and a fixed order keeps the
-    // tie-break and the weights bit-reproducible.
+    // Routing: score over all experts (`attrs.router_gating`), then top-K,
+    // then optional normalize and scale. Serial on purpose — O(T*E) is
+    // negligible next to the GEMMs, and a fixed order keeps the tie-break and
+    // the weights bit-reproducible. Everything that finalizes route_weight
+    // belongs in here: Phase B reads it from worker threads.
     // ------------------------------------------------------------------
     std::vector<int32_t> route_expert(static_cast<size_t>(total));
     std::vector<float>   route_weight(static_cast<size_t>(total));
@@ -209,19 +236,37 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         for (int64_t t = 0; t < num_tokens; ++t) {
             const T* logits = rout_ptr + t * rout_row_stride;
 
-            float max_logit = ldf(logits);
-            for (int64_t e = 1; e < E; ++e) {
-                const float v = ldf(logits + e);
-                max_logit = v > max_logit ? v : max_logit;
-            }
-            float sum_exp = 0.0f;
-            for (int64_t e = 0; e < E; ++e) {
-                probs[static_cast<size_t>(e)] = std::exp(ldf(logits + e) - max_logit);
-                sum_exp += probs[static_cast<size_t>(e)];
-            }
-            const float inv_sum = 1.0f / sum_exp;
-            for (int64_t e = 0; e < E; ++e) {
-                probs[static_cast<size_t>(e)] *= inv_sum;
+            switch (attrs.router_gating) {
+            case MoERouterGating::Softmax: {
+                // Max-subtracted for stability. The scoring is over *all* E
+                // experts, so the softmax normalizes the full row.
+                float max_logit = ldf(logits);
+                for (int64_t e = 1; e < E; ++e) {
+                    const float v = ldf(logits + e);
+                    max_logit = v > max_logit ? v : max_logit;
+                }
+                float sum_exp = 0.0f;
+                for (int64_t e = 0; e < E; ++e) {
+                    probs[static_cast<size_t>(e)] = std::exp(ldf(logits + e) - max_logit);
+                    sum_exp += probs[static_cast<size_t>(e)];
+                }
+                const float inv_sum = 1.0f / sum_exp;
+                for (int64_t e = 0; e < E; ++e) {
+                    probs[static_cast<size_t>(e)] *= inv_sum;
+                }
+            } break;
+            case MoERouterGating::Sigmoid:
+                // Pointwise, and deliberately *not* max-subtracted: shifting the
+                // logits would change the scores, not just rescale them.
+                for (int64_t e = 0; e < E; ++e) {
+                    probs[static_cast<size_t>(e)] = gating_sigmoid(ldf(logits + e));
+                }
+                break;
+            case MoERouterGating::SqrtSoftplus:
+                for (int64_t e = 0; e < E; ++e) {
+                    probs[static_cast<size_t>(e)] = gating_sqrt_softplus(ldf(logits + e));
+                }
+                break;
             }
 
             std::fill(used.begin(), used.end(), 0);
@@ -252,6 +297,15 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                 const float inv_wsum = (wsum != 0.0f) ? 1.0f / wsum : 0.0f;
                 for (int64_t j = 0; j < k; ++j) {
                     route_weight[static_cast<size_t>(t * k + j)] *= inv_wsum;
+                }
+            }
+
+            // Routed scaling (llama.cpp's w_scale / DeepSeek-V3's 2.5) goes
+            // last, on whatever the routing gathered — so it composes with the
+            // renormalization above rather than fighting it.
+            if (attrs.routed_scaling_factor != 1.0f) {
+                for (int64_t j = 0; j < k; ++j) {
+                    route_weight[static_cast<size_t>(t * k + j)] *= attrs.routed_scaling_factor;
                 }
             }
         }
