@@ -33,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct RoPE::Impl {
     using KernelFn = void (*)(const RoPEAttributes&,
                                TensorView&,
@@ -100,7 +97,6 @@ void RoPE::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(rank >= 2);
     NNOPS_ASSERT(X.shape(rank - 1) % 2 == 0);  // head_dim must be even
 
-    // Validate mRoPE section dims if present
     if (!attrs_.mrope_section_dims.empty()) {
         int64_t total = 0;
         for (auto d : attrs_.mrope_section_dims) {

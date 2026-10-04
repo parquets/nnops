@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void slice_ref(const SliceAttributes& attrs,
                     TensorView& output,
@@ -34,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Slice::Impl {
     using KernelFn = void (*)(const SliceAttributes&,
                                TensorView&,
@@ -95,27 +91,21 @@ void Slice::compute(std::span<TensorView> outputs,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
 
-    // Validate rank
     NNOPS_ASSERT(rank >= 1 && rank <= TensorDesc::kMaxRank);
 
-    // Validate input dtype
     NNOPS_ASSERT(input.data_type() == DataType::f32 ||
                  input.data_type() == DataType::f16);
 
-    // Validate planar layout
     NNOPS_ASSERT(is_layout_supported(input.layout(), LayoutSupport::PlanarOnly));
     NNOPS_ASSERT(is_layout_supported(output.layout(), LayoutSupport::PlanarOnly));
 
-    // Validate output dtype matches input
     NNOPS_ASSERT(output.data_type() == input.data_type());
 
-    // Validate starts/ends/axes size consistency
     const size_t n_axes = attrs_.axes.size();
     NNOPS_ASSERT(attrs_.starts.size() == n_axes);
     NNOPS_ASSERT(attrs_.ends.size() == n_axes);
     NNOPS_ASSERT(attrs_.steps.empty() || attrs_.steps.size() == n_axes);
 
-    // Validate output shape matches expected sliced shape
     const TensorDesc in_desc_arr[] = {input.desc()};
     const auto expected = slice_output_shape(
         attrs_.starts, attrs_.ends, attrs_.axes, attrs_.steps, in_desc_arr);

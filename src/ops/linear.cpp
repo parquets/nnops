@@ -15,9 +15,6 @@ namespace backend::cpu::reference {
                     void* workspace);
 }
 
-// ============================================================
-// Impl — holds the backend-bound kernel function pointer
-// ============================================================
 struct Linear::Impl {
     using KernelFn = void (*)(const LinearAttributes&,
                                TensorView&,

@@ -8,9 +8,6 @@
 
 namespace nnops {
 
-// ============================================================
-// Impl — holds the backend-bound kernel function pointer
-// ============================================================
 struct Conv2D::Impl {
     using KernelFn = void (*)(const Conv2DAttributes&,
                                TensorView&,
@@ -30,38 +27,29 @@ auto resolve_conv2d_kernel(Backend backend) -> Conv2D::Impl::KernelFn
         return backend::cpu::conv2d_im2col_kernel;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;  // backend::cuda::conv2d_cuda
+        return nullptr;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
-        return nullptr;  // backend::vulkan::conv2d_vulkan
+        return nullptr;
 #endif
     }
     return nullptr;
 }
 }  // anonymous namespace
 
-// ============================================================
-// Factory
-// ============================================================
 std::unique_ptr<Conv2D> Conv2D::create(const Conv2DAttributes& attrs,
                                         Backend backend)
 {
     return std::unique_ptr<Conv2D>(new Conv2D(attrs, backend));
 }
 
-// ============================================================
-// Constructor
-// ============================================================
 Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_conv2d_kernel(backend);
 }
 
-// ============================================================
-// getOutputTensorDesc
-// ============================================================
 std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
@@ -70,9 +58,6 @@ std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
         static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs)};
 }
 
-// ============================================================
-// getWorkspaceSize
-// ============================================================
 size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc> inputs,
                                 std::span<const TensorDesc> outputs) const
 {
@@ -82,9 +67,6 @@ size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc> inputs,
     return 0;
 }
 
-// ============================================================
-// compute
-// ============================================================
 void Conv2D::compute(std::span<TensorView> outputs,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,

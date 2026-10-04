@@ -25,9 +25,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct CumSum::Impl {
     using KernelFn = void (*)(const CumSumAttributes&,
                                TensorView&,

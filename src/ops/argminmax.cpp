@@ -33,9 +33,6 @@ namespace backend::cpu {
                     void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct ArgMax::Impl {
     using KernelFn = void (*)(const ArgMinMaxAttributes&,
                                TensorView&,
@@ -94,10 +91,6 @@ auto resolve_argmin_kernel(Backend backend) -> ArgMin::Impl::KernelFn
 }
 }  // anonymous namespace
 
-// ============================================================
-// ArgMax
-// ============================================================
-
 std::unique_ptr<ArgMax> ArgMax::create(const ArgMinMaxAttributes& attrs,
                                          Backend backend)
 {
@@ -129,10 +122,6 @@ void ArgMax::compute(std::span<TensorView> outputs,
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }
-
-// ============================================================
-// ArgMin
-// ============================================================
 
 std::unique_ptr<ArgMin> ArgMin::create(const ArgMinMaxAttributes& attrs,
                                          Backend backend)

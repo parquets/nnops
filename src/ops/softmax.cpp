@@ -33,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Softmax::Impl {
     using KernelFn = void (*)(const SoftmaxAttributes&,
                                TensorView&,
@@ -110,7 +107,6 @@ void Softmax::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!output.is_empty());
     NNOPS_ASSERT(!inputs[0].is_empty());
 
-    // Quantized input (s8/u8): output must be float (f32 or f16), not int.
     if (is_quantized_dtype(inputs[0].data_type())) {
         NNOPS_ASSERT(output.data_type() == DataType::f32 ||
                      output.data_type() == DataType::f16);

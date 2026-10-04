@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void embed_ref(const EmbedAttributes& attrs,
                     TensorView& output,
@@ -34,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Embed::Impl {
     using KernelFn = void (*)(const EmbedAttributes&,
                                TensorView&,
@@ -105,14 +101,11 @@ void Embed::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!weight.is_empty());
     NNOPS_ASSERT(!indices.is_empty());
 
-    // Validate indices dtype
     NNOPS_ASSERT(indices.data_type() == DataType::s64 ||
                  indices.data_type() == DataType::s32);
 
-    // Validate weight rank >= 2
     NNOPS_ASSERT(weight.rank() >= 2);
 
-    // Validate planar layout
     NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOnly));
     NNOPS_ASSERT(is_layout_supported(indices.layout(), LayoutSupport::PlanarOnly));
 

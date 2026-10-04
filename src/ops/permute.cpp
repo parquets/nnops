@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void permute_ref(const PermuteAttributes& attrs,
                      TensorView& output,
@@ -34,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Permute::Impl {
     using KernelFn = void (*)(const PermuteAttributes&,
                                TensorView&,
@@ -95,21 +91,16 @@ void Permute::compute(std::span<TensorView> outputs,
     const int64_t rank = input.rank();
     NNOPS_ASSERT(static_cast<size_t>(rank) == attrs_.perm.size());
 
-    // Validate rank
     NNOPS_ASSERT(rank >= 1 && rank <= TensorDesc::kMaxRank);
 
-    // Validate input dtype
     NNOPS_ASSERT(input.data_type() == DataType::f32 ||
                  input.data_type() == DataType::f16);
 
-    // Validate planar layout
     NNOPS_ASSERT(is_layout_supported(input.layout(), LayoutSupport::PlanarOnly));
     NNOPS_ASSERT(is_layout_supported(output.layout(), LayoutSupport::PlanarOnly));
 
-    // Validate output dtype matches input
     NNOPS_ASSERT(output.data_type() == input.data_type());
 
-    // Validate output shape matches permuted input shape
     NNOPS_ASSERT(output.rank() == rank);
     for (int64_t i = 0; i < rank; ++i) {
         NNOPS_ASSERT(output.shape(i) == input.shape(attrs_.perm[static_cast<size_t>(i)]));

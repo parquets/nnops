@@ -38,9 +38,6 @@ namespace {
     }
 }  // anonymous namespace
 
-// ============================================================
-// Impl
-// ============================================================
 struct LayoutConvert::Impl {
     using KernelFn = void (*)(TensorView&,
                                std::span<const TensorView>,

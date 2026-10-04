@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void clamp_ref(const ClampAttributes& attrs,
                     TensorView& output,
@@ -34,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Clamp::Impl {
     using KernelFn = void (*)(const ClampAttributes&,
                                TensorView&,

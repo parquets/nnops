@@ -15,9 +15,6 @@ namespace backend::cpu {
                          void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct GridSample::Impl {
     using KernelFn = void (*)(const GridSampleAttributes&,
                                TensorView&,

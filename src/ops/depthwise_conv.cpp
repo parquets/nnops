@@ -20,7 +20,6 @@ namespace nnops {
 
 using namespace simd;
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void depthwise_conv_ref(const DepthwiseConvAttributes& attrs,
                              TensorView& output,
@@ -47,9 +46,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl — holds the backend-bound kernel function pointer
-// ============================================================
 struct DepthwiseConv::Impl {
     using KernelFn = void (*)(const DepthwiseConvAttributes&,
                                TensorView&,
@@ -356,27 +352,18 @@ void prepack_dwconv_bias(const TensorView& bias_nchw,
 
 }  // anonymous namespace
 
-// ============================================================
-// Factory
-// ============================================================
 std::unique_ptr<DepthwiseConv> DepthwiseConv::create(
     const DepthwiseConvAttributes& attrs, Backend backend)
 {
     return std::unique_ptr<DepthwiseConv>(new DepthwiseConv(attrs, backend));
 }
 
-// ============================================================
-// Constructor
-// ============================================================
 DepthwiseConv::DepthwiseConv(const DepthwiseConvAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_depthwise_conv_kernel(backend);
 }
 
-// ============================================================
-// getOutputTensorDesc
-// ============================================================
 std::vector<TensorDesc> DepthwiseConv::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
@@ -385,9 +372,6 @@ std::vector<TensorDesc> DepthwiseConv::getOutputTensorDesc(
         0 /* NOTSET */, inputs)};
 }
 
-// ============================================================
-// prepackWeights — dual-behavior: empty → metadata, filled → pack
-// ============================================================
 void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
                                     std::span<TensorView> outputs,
                                     const ComputeContext& ctx)
@@ -452,9 +436,6 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
     }
 }
 
-// ============================================================
-// compute — direct dispatch to backend (input/output already NCHWC8/NCDHWC8)
-// ============================================================
 void DepthwiseConv::compute(std::span<TensorView> outputs,
                              std::span<const TensorView> inputs,
                              const ComputeContext& ctx,

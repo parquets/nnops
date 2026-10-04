@@ -33,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Norm::Impl {
     using KernelFn = void (*)(const NormAttributes&,
                                TensorView&,

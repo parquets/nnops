@@ -33,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Reduce::Impl {
     using KernelFn = void (*)(const ReduceAttributes&,
                                TensorView&,

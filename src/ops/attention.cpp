@@ -16,9 +16,6 @@ namespace backend::cpu::reference {
                        void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct Attention::Impl {
     using KernelFn = void (*)(const AttentionAttributes&,
                                TensorView&,

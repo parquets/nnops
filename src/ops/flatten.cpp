@@ -22,9 +22,6 @@ namespace backend::cpu {
                      void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct Flatten::Impl {
     using KernelFn = void (*)(const FlattenAttributes&,
                                TensorView&,
@@ -70,7 +67,6 @@ std::vector<TensorDesc> Flatten::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     // Same logical shape, always dense planar layout.
-    // Determine planar layout from input rank.
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
     const int64_t srank = rank - 2;

@@ -48,10 +48,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// QuantizeLinear
-// ============================================================
-
 struct QuantizeLinear::Impl {
     using KernelFn = void (*)(const QuantLinearAttributes&,
                                TensorView&,
@@ -109,10 +105,6 @@ void QuantizeLinear::compute(std::span<TensorView> outputs,
 
     impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
-
-// ============================================================
-// DequantizeLinear
-// ============================================================
 
 struct DequantizeLinear::Impl {
     using KernelFn = void (*)(const QuantLinearAttributes&,

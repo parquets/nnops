@@ -1,5 +1,5 @@
 /// @file pooling.cpp
-/// @brief Pooling operator dispatch — input/output always NCHWC8, direct pass-through.
+/// @brief Pooling operator dispatch — input/output always NCHWC8/NCDHWC8, direct pass-through.
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -25,9 +25,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Pooling::Impl {
     using KernelFn = void (*)(const PoolingAttributes&,
                                TensorView&,

@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void topk_ref(const TopKAttributes& attrs,
                   TensorView& values,
@@ -37,9 +36,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct TopK::Impl {
     using KernelFn = void (*)(const TopKAttributes&,
                                TensorView&,

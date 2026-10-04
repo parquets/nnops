@@ -23,9 +23,6 @@ namespace backend::cpu {
                     void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct Concat::Impl {
     using KernelFn = void (*)(const ConcatAttributes&,
                                TensorView&,

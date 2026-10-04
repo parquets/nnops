@@ -33,9 +33,6 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Activation::Impl {
     using KernelFn = void (*)(const ActivationAttributes&,
                                TensorView&,

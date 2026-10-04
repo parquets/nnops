@@ -17,9 +17,6 @@ namespace backend::cpu::reference {
                     void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct MatMul::Impl {
     using KernelFn = void (*)(const MatMulAttributes&,
                                TensorView&,
@@ -105,7 +102,6 @@ void MatMul::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(a_rank >= 2);
     NNOPS_ASSERT(b_rank >= 2);
 
-    // Validate K dimensions match (with optional transpose)
     const int64_t Ka = attrs_.transpose_a ? a.shape(a_rank - 2) : a.shape(a_rank - 1);
     const int64_t Kb = attrs_.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
     NNOPS_ASSERT(Ka == Kb);

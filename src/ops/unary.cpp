@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void unary_ref(const UnaryAttributes& attrs,
                     TensorView& output,
@@ -44,9 +43,6 @@ namespace backend::vulkan {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct Unary::Impl {
     using KernelFn = void (*)(const UnaryAttributes&,
                                TensorView&,

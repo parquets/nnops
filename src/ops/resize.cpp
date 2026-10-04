@@ -23,9 +23,6 @@ namespace backend::cpu {
                     void* workspace);
 }
 
-// ============================================================
-// Impl
-// ============================================================
 struct Resize::Impl {
     using KernelFn = void (*)(const ResizeAttributes&,
                                TensorView&,

@@ -24,13 +24,9 @@ namespace backend::cuda {
 }
 #endif
 
-// ============================================================
-// Impl
-// ============================================================
 struct LinearAttention::Impl {
     // `outputs` is a span, not a single view: the operator's recurrent State
-    // lives in outputs[1], and it has to reach the kernel. An earlier revision
-    // forwarded only outputs[0], which left the recurrence uncomputable.
+    // lives in outputs[1], and it has to reach the kernel.
     using KernelFn = void (*)(const LinearAttentionAttributes&,
                               std::span<TensorView>,
                               std::span<const TensorView>,

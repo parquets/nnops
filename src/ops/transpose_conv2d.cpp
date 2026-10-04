@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu {
     void transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
                                TensorView& output,
@@ -16,9 +15,6 @@ namespace backend::cpu {
                                void* workspace);
 }
 
-// ============================================================
-// Impl — holds the backend-bound kernel function pointer
-// ============================================================
 struct TransposeConv2D::Impl {
     using KernelFn = void (*)(const TransposeConv2DAttributes&,
                                TensorView&,
@@ -38,29 +34,23 @@ auto resolve_transpose_conv2d_kernel(Backend backend) -> TransposeConv2D::Impl::
         return backend::cpu::transpose_conv2d_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;  // backend::cuda::transpose_conv2d_cuda
+        return nullptr;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
-        return nullptr;  // backend::vulkan::transpose_conv2d_vulkan
+        return nullptr;
 #endif
     }
     return nullptr;
 }
 }  // anonymous namespace
 
-// ============================================================
-// Factory
-// ============================================================
 std::unique_ptr<TransposeConv2D> TransposeConv2D::create(
     const TransposeConv2DAttributes& attrs, Backend backend)
 {
     return std::unique_ptr<TransposeConv2D>(new TransposeConv2D(attrs, backend));
 }
 
-// ============================================================
-// Constructor
-// ============================================================
 TransposeConv2D::TransposeConv2D(const TransposeConv2DAttributes& attrs,
                                    Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
@@ -68,9 +58,6 @@ TransposeConv2D::TransposeConv2D(const TransposeConv2DAttributes& attrs,
     impl_->kernel_fn = resolve_transpose_conv2d_kernel(backend);
 }
 
-// ============================================================
-// getOutputTensorDesc
-// ============================================================
 std::vector<TensorDesc> TransposeConv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
@@ -79,9 +66,6 @@ std::vector<TensorDesc> TransposeConv2D::getOutputTensorDesc(
         attrs_.output_padding, attrs_.groups, inputs);
 }
 
-// ============================================================
-// compute
-// ============================================================
 void TransposeConv2D::compute(std::span<TensorView> outputs,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,

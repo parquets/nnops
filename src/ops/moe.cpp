@@ -7,7 +7,6 @@
 
 namespace nnops {
 
-// Forward declarations of backend kernel entry points
 namespace backend::cpu::reference {
     void moe_ref(const MoEAttributes& attrs,
                  TensorView& output,
@@ -24,9 +23,6 @@ namespace backend::cpu {
                  void* workspace);
 }
 
-// ============================================================
-// Impl — holds the backend-bound kernel function pointer
-// ============================================================
 struct MoE::Impl {
     using KernelFn = void (*)(const MoEAttributes&,
                               TensorView&,
@@ -87,9 +83,9 @@ void MoE::compute(std::span<TensorView> outputs,
                   const ComputeContext& ctx,
                   void* workspace)
 {
-    // 5 required inputs (input, router_probs, fc1_w, fc1_b, fc2_w) plus the
-    // optional fc2_b and the SwiGLU fc3 pair / router_weights tail. Optional
-    // entries may be omitted entirely or passed as an empty TensorView.
+    // At least 5 inputs (input, router_probs, fc1_w, fc1_b, fc2_w); fc1_b may
+    // be empty. The fc2_b and SwiGLU fc3 pair / router_weights tail are also
+    // optional and may be omitted entirely or passed as an empty TensorView.
     NNOPS_ASSERT(inputs.size() >= 5);
     NNOPS_ASSERT(inputs.size() <= 9);
     NNOPS_ASSERT(outputs.size() == 1);
