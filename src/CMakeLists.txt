@@ -35,6 +35,7 @@ set(NNOPS_CPU_SOURCES
     ops/rope.cpp
     ops/flatten.cpp
     ops/transpose_conv2d.cpp
+    ops/moe.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -69,6 +70,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/rope.cpp
     backend/cpu/flatten.cpp
     backend/cpu/transpose_conv2d.cpp
+    backend/cpu/moe.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA)
     backend/cpu/matmul.cpp
@@ -109,6 +111,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/rope_ref.cpp
     backend/cpu/reference/flatten_ref.cpp
     backend/cpu/reference/transpose_conv2d_ref.cpp
+    backend/cpu/reference/moe_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

@@ -814,4 +814,25 @@ inline std::vector<TensorDesc> slice_output_shape(
     return {out};
 }
 
+/// MoE shape inference.
+/// inputs[0] = input [num_tokens, hidden_size] (or any rank whose trailing dim
+///             is the hidden size); the expert weights carry the expert axis.
+/// Returns: same shape, dtype and layout as inputs[0] — MoE is shape-preserving.
+/// Only inputs[0] is read, so this is safe to call with a partial input span.
+inline std::vector<TensorDesc> moe_output_shape(
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+
+    TensorDesc out;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+    out.rank   = in.rank;
+    out.dims.resize(static_cast<size_t>(in.rank));
+    for (int64_t i = 0; i < in.rank; ++i) {
+        out.dims[static_cast<size_t>(i)] = in.dims[static_cast<size_t>(i)];
+    }
+    return {out};
+}
+
 }  // namespace nnops

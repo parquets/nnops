@@ -7,19 +7,19 @@
 /// etc.). It is a *fused* operator that runs, for every token, the selected
 /// top-K experts end-to-end:
 ///
-///     scores  = router_probs[token, :]                 (computed externally)
-///     ids, ws = top_k(scores, k)                        (select + gather)
-///     if normalize_routing_weights: ws = renorm(ws)     (softmax / sum-to-1)
+///     p       = softmax(router_probs[token, :])         (over all E experts)
+///     ids, ws = top_k(p, k)                             (select + gather)
+///     if normalize_routing_weights: ws = ws / sum(ws)   (renormalize the k)
 ///     for (id, w) in zip(ids, ws):
 ///         h  = act(  x @ fc1_w[id]^T + fc1_b[id]  )      (per-expert GEMM 1)
 ///         y += w * ( h @ fc2_w[id]^T + fc2_b[id] )       (per-expert GEMM 2)
 ///     output[token] = y
 ///
-/// Routing (the gate) is deliberately *external*: the caller computes
-/// `router_probs` (typically `linear(gate)` + softmax/sigmoid, or a learned
-/// gate) with the existing Linear/Softmax/TopK ops and passes the result in.
-/// This keeps MoE composable and mirrors onnxruntime's `com.microsoft::MoE`
-/// contrib op, which is the primary integration target of this library.
+/// Routing (the gate projection) is deliberately *external*: the caller computes
+/// `router_probs` (typically `linear(gate)` — raw logits) with the existing
+/// Linear op and passes it in. The softmax over all experts and the top-K select
+/// happen *inside* this op, matching onnxruntime's `com.microsoft::MoE` contrib
+/// op, which is the primary integration target of this library.
 ///
 /// Each expert's FFN is a two-(or three-)layer MLP whose weights are stacked
 /// along a leading expert axis (shape[0] == num_experts). The inner per-expert
@@ -92,9 +92,10 @@ struct MoEAttributes {
     /// Mixtral/Gemma-style LLM MoE (onnxruntime's default is `relu`).
     MoEActivation activation = MoEActivation::Silu;
 
-    /// Re-normalize the top-K routing weights to sum to 1 (softmax over the
-    /// selected experts). When false, the gathered router_probs values are used
-    /// as-is (already-softmaxed logits).
+    /// Re-normalize the selected routing weights to sum to 1 (divide the top-K
+    /// by their own sum). When false, the selected softmax probabilities are used
+    /// as-is. When `router_weights` (input 8) is present this renormalizes those
+    /// gathered weights instead — the selection still comes from `router_probs`.
     bool normalize_routing_weights = false;
 
     /// Sparse-mixer routing variant (selects k=2 experts and applies the
@@ -121,8 +122,9 @@ struct MoEAttributes {
 /// Inputs (optional inputs may be omitted by passing an empty TensorView,
 /// i.e. `is_empty() == true`):
 ///
-///   [0] input                  [num_tokens, hidden_size]     (f32/f16/bf16)
-///   [1] router_probs           [num_tokens, num_experts]     (f32/f16/bf16)
+///   [0] input                  [num_tokens, hidden_size]     (f32/f16)
+///   [1] router_probs           [num_tokens, num_experts]     (f32/f16)
+///                              raw router LOGITS — softmaxed inside this op
 ///   [2] fc1_experts_weights    [E, fc1_out, hidden_size]     gate (or gate+value)
 ///   [3] fc1_experts_bias       [E, fc1_out]                  (optional)
 ///   [4] fc2_experts_weights    [E, hidden_size, inter_size]  down-projection
@@ -138,9 +140,14 @@ struct MoEAttributes {
 ///     fc1_out = inter_size            (Separate, or non-SwiGLU)
 ///     fc1_out = 2 * inter_size        (Interleaved / Block SwiGLU)
 ///
-/// `router_probs` drives top-K *selection*; the gathered values become the
-/// mixing weights unless `router_weights` is provided, in which case it supplies
-/// the mixing weights at the selected indices (router_probs then only selects).
+/// `softmax(router_probs)` drives both the top-K *selection* and the mixing
+/// weights, unless `router_weights` is provided, in which case the mixing weights
+/// are gathered from it at the selected indices and `router_probs` only selects.
+///
+/// Implemented today (CPU): f32/f16, the Relu/Gelu/Silu/Identity activations, and
+/// SwiGLU with the `Separate` layout — the one that takes its value half from
+/// fc3. The `Interleaved`/`Block` SwiGLU layouts and `use_sparse_mixer` are part
+/// of the interface but not yet implemented; they are rejected by an assertion.
 ///
 /// Output (1):
 ///   [0] output                    [num_tokens, hidden_size]
@@ -158,13 +165,15 @@ public:
         return create(MoEAttributes{}, backend);
     }
 
+    ~MoE();
+
     // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// Workspace (bytes) required by MoE. Non-zero: the op stages the expanded
-    /// top-K tokens and per-expert intermediate activations. The exact size is
-    /// derived from the shapes in `inputs`/`outputs`.
+    /// Workspace (bytes) required by MoE. Always 0: the op stages the expanded
+    /// top-K tokens and per-expert intermediate activations in its own pooled
+    /// scratch, like MatMul/Attention/Conv2D — the caller allocates nothing.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 
