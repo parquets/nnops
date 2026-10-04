@@ -2,8 +2,9 @@
 /// @file small_vector.hpp
 /// @brief SmallVector — a vector with inline storage for up to N elements.
 ///
-/// For tensors with rank ≤ N (N=8 by default), no heap allocation occurs.
-/// This covers all practical neural network tensor dimensionalities.
+/// For tensors with rank at most N (N = 8 for nnops tensor shapes), no heap
+/// allocation occurs. This covers all practical neural network tensor
+/// dimensionalities.
 
 #include "nnops/detail/assert.hpp"
 

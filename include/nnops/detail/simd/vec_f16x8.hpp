@@ -49,14 +49,12 @@
   using arch::neon::v_reduce_sum;
   using arch::neon::v_reduce_max;
   using arch::neon::v_reduce_min;
-  // deinterleave
   using arch::neon::v_f16x8x2_t;
   using arch::neon::v_deinterleave_f16x8;
   using arch::neon::v_load_even_f16x8;
   using arch::neon::v_load_odd_f16x8;
   using arch::neon::v_load_stride2_even_f16x8;
   using arch::neon::v_load_stride2_odd_f16x8;
-  // transpose
   using arch::neon::v_transpose_8x8;
   }} // namespace nnops::simd
 #elif defined(NNOPS_ARCH_X86_64) && defined(__F16C__)
@@ -92,14 +90,12 @@
   using arch::sse::v_reduce_sum;
   using arch::sse::v_reduce_max;
   using arch::sse::v_reduce_min;
-  // deinterleave
   using arch::sse::v_f16x8x2_t;
   using arch::sse::v_deinterleave_f16x8;
   using arch::sse::v_load_even_f16x8;
   using arch::sse::v_load_odd_f16x8;
   using arch::sse::v_load_stride2_even_f16x8;
   using arch::sse::v_load_stride2_odd_f16x8;
-  // transpose
   using arch::sse::v_transpose_8x8;
   }} // namespace nnops::simd
 #else
@@ -133,14 +129,12 @@
   using arch::scalar::v_reduce_sum;
   using arch::scalar::v_reduce_max;
   using arch::scalar::v_reduce_min;
-  // deinterleave
   using arch::scalar::v_f16x8x2_t;
   using arch::scalar::v_deinterleave_f16x8;
   using arch::scalar::v_load_even_f16x8;
   using arch::scalar::v_load_odd_f16x8;
   using arch::scalar::v_load_stride2_even_f16x8;
   using arch::scalar::v_load_stride2_odd_f16x8;
-  // transpose
   using arch::scalar::v_transpose_8x8;
   }} // namespace nnops::simd
 #endif

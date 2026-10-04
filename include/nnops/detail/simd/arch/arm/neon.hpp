@@ -13,7 +13,7 @@
 #endif
 
 #include <arm_neon.h>
-#include <cmath>  // for std::abs in vec_abs emulation
+#include <cmath>
 #include "neon_mathfunc.hpp"
 
 namespace nnops {
@@ -347,7 +347,6 @@ inline v_f16x8 v_zero_f16x8() {
 
 // FP16 <-> FP32 conversion
 inline v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
-    // Correct approach for NEON f16x8 → f32x8:
     float32x4_t f32_lo = vcvt_f32_f16(vget_low_f16(a.val));
     float32x4_t f32_hi = vcvt_f32_f16(vget_high_f16(a.val));
 
@@ -581,9 +580,10 @@ inline void transpose_4x4_f32(float32x4_t& r0, float32x4_t& r1,
 /// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
-    // Snapshot all four quadrants first — the top-right and bottom-left sources
-    // are each other's destinations, so a write-then-read ordering would corrupt
-    // the second quadrant read (read-after-write hazard).
+    // Snapshot the bottom-left quadrant (r{4..7}.lo) before it is overwritten:
+    // it and the top-right quadrant (r{0..3}.hi) are each other's destinations,
+    // so writing top-right into r{4..7}.lo first would clobber the bottom-left
+    // source still needed by the third block (read-after-write hazard).
     float32x4_t t0, t1, t2, t3;
     float32x4_t u0 = r4.lo, u1 = r5.lo, u2 = r6.lo, u3 = r7.lo;  // bottom-left
 

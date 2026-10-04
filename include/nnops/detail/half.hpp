@@ -96,7 +96,7 @@ inline float half_to_float(half h) noexcept {
 /// @brief Convert a float32 value to IEEE 754 binary16.
 ///
 /// Rounds to nearest even. Handles overflow to infinity, subnormals,
-/// and NaN payload truncation.
+/// and NaN (canonicalized to qNaN, payload dropped).
 inline half float_to_half(float f) noexcept {
     constexpr uint32_t f32infty_u = 255U << 23;
     constexpr uint32_t f16max_u   = (127U + 16U) << 23;
@@ -138,7 +138,7 @@ inline uint16_t half_to_bits(half h) noexcept {
     return h.bits;
 }
 
-/// @brief Convert array of fp16 to fp32 in-place (scalar loop).
+/// @brief Convert array of fp16 to fp32 (scalar loop).
 /// @{
 inline void convert_half_to_float(float* dst, const half* src, int n) noexcept {
     for (int i = 0; i < n; ++i) {

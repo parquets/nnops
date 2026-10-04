@@ -42,7 +42,8 @@ struct v_f32x4 {
         : val(_mm_setr_ps(v0, v1, v2, v3)) {}
 
     float operator[](int i) const {
-        // MSVC-compatible: extract lane via _mm_shuffle_ps + _mm_cvtss_f32
+        // Spill to a stack array: a runtime lane index rules out the extract
+        // intrinsics, which require a compile-time immediate.
         float tmp[4];
         _mm_storeu_ps(tmp, val);
         return tmp[i];
@@ -161,7 +162,6 @@ inline v_f32x4 v_tanh(const v_f32x4& a) {
     return v_f32x4(tanh_ps(a.val));
 }
 
-// Horizontal sum
 inline float v_reduce_sum(const v_f32x4& a) {
     __m128 t = _mm_add_ps(a.val, _mm_movehl_ps(a.val, a.val));
     t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 1));
@@ -304,7 +304,6 @@ struct v_f16x8 {
     explicit v_f16x8(float s) : val(_mm256_cvtps_ph(_mm256_set1_ps(s), 0)) {}
 };
 
-// Load / v_store
 inline v_f16x8 v_load_f16x8(const uint16_t* p) {
     return v_f16x8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
 }
@@ -312,7 +311,6 @@ inline void v_store(uint16_t* p, const v_f16x8& a) {
     _mm_storeu_si128(reinterpret_cast<__m128i*>(p), a.val);
 }
 
-// Broadcast / zero
 inline v_f16x8 v_set1_f16x8(float s) {
     return v_f16x8(_mm256_cvtps_ph(_mm256_set1_ps(s), 0));
 }
@@ -320,7 +318,6 @@ inline v_f16x8 v_zero_f16x8() {
     return v_f16x8(_mm_setzero_si128());
 }
 
-// Helper: extract __m256 from v_f32x8
 inline __m256 to_m256(const v_f32x8& a) {
     return _mm256_insertf128_ps(
         _mm256_castps128_ps256(a.lo), a.hi, 1);
@@ -355,7 +352,7 @@ NNOPS_F16X8_BINOP(v_max, _mm256_max_ps)
 
 #undef NNOPS_F16X8_BINOP
 
-// v_fmadd: a*b + c (fused multiply-v_add via FMA3)
+// v_fmadd: a*b + c (fused multiply-add via FMA3)
 inline v_f16x8 v_fmadd(const v_f16x8& a, const v_f16x8& b, const v_f16x8& c) {
     __m256 fa = _mm256_cvtph_ps(a.val);
     __m256 fb = _mm256_cvtph_ps(b.val);
@@ -389,7 +386,6 @@ inline v_f16x8 v_cmpgt(const v_f16x8& a, const v_f16x8& b) {
     return v_cmplt(b, a);
 }
 
-// v_sqrt
 inline v_f16x8 v_sqrt(const v_f16x8& a) {
     __m256 f32 = _mm256_cvtph_ps(a.val);
     return v_f16x8(_mm256_cvtps_ph(_mm256_sqrt_ps(f32), 0));
@@ -582,7 +578,6 @@ struct v_f16x8x2_t { v_f16x8 even; v_f16x8 odd; };
 /// @brief Load 16 contiguous f16s, return {h0,h2,...,h14}, {h1,h3,...,h15}.
 ///
 /// Strategy: convert to f32, deinterleave with UNPCK cascade, convert back.
-/// The stack buffer (16 f32 = 64 B) stays in L1; overhead is negligible.
 inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
     // Load 2×8 f16 → convert to 2×8 f32
     __m256 flo = _mm256_cvtph_ps(

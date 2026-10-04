@@ -13,5 +13,4 @@
   #define NNOPS_ARCH_AARCH64 1
 #endif
 
-// Include the full SIMD abstraction layer
 #include "nnops/detail/simd/simd.hpp"

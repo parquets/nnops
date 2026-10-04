@@ -554,7 +554,7 @@ inline std::vector<TensorDesc> grid_sample_output_shape(
     out.dims[0] = in.dims[0];  // N
     out.dims[1] = in.dims[1];  // C
 
-    // Grid spatial dims: grid rank = srank + 3 (N + spatial + coordinate)
+    // Grid spatial dims: grid rank = srank + 2 (N + spatial + coordinate)
     // For 2D: grid = [N, OH, OW, 2], spatial dims at indices 1,2
     // For 3D: grid = [N, OD, OH, OW, 3], spatial dims at indices 1,2,3
     for (int64_t d = 0; d < srank; ++d) {

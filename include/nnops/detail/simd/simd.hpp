@@ -11,14 +11,16 @@
 ///   ├── cpu_features.hpp   — runtime CPU detection (CpuFeatures singleton)
 ///   ├── vec_f32x4.hpp      — 128-bit float32 vector (SSE / NEON / scalar)
 ///   ├── vec_f32x8.hpp      — 256-bit float32 vector (AVX2 / emulated / scalar)
-///   └── vec_f16x8.hpp      — 128-bit float16 vector (NEON FP16 / scalar)
+///   ├── vec_f16x8.hpp      — 128-bit float16 vector (NEON FP16 / x86 F16C / scalar)
+///   ├── vec_s8x16.hpp      — 128-bit int8 vector (SSE / NEON / scalar)
+///   ├── vec_u8x16.hpp      — 128-bit uint8 vector (SSE / NEON / scalar)
 ///   └── arch/
-///       ├── scalar.hpp     — scalar C++ fallback (f32 + f16)
+///       ├── scalar.hpp     — scalar C++ fallback (f32 + f16 + int8)
 ///       ├── x86/
 ///       │   ├── sse.hpp    — SSE4.1 backend
 ///       │   └── avx2.hpp   — AVX2+FMA backend
 ///       └── arm/
-///           └── neon.hpp   — ARM NEON backend (f32 + f16)
+///           └── neon.hpp   — ARM NEON backend (f32 + f16 + int8)
 ///
 /// ## Usage
 ///
@@ -72,13 +74,13 @@ inline constexpr int simd_lane_i8x16 = 16;
 inline constexpr int simd_lane_u8x16 = 16;
 
 /// @brief Recommended default SIMD lane count for f32 kernels.
-/// On all hardware SIMD backends this is 8 (AVX2 __m256 native;
-/// NEON two float32x4_t emulated; RISC-V V vsetivli LMUL=2).
+/// On every hardware SIMD backend this is 8: AVX2 is a native __m256,
+/// NEON emulates it with two float32x4_t.
 inline constexpr int simd_default_lane_f32 = 8;
 
 /// @brief Recommended default SIMD lane count for f16 kernels.
 /// On x86 F16C+AVX2 this is 8 (cvt→compute→cvt); on ARM NEON native fp16
-/// (float16x8_t) this is 8; on RISC-V V with LMUL=2 this is 8.
+/// (float16x8_t) this is 8.
 inline constexpr int simd_default_lane_f16 = 8;
 
 /// @brief Compile-time SIMD lane count for a given data type T.
@@ -158,8 +160,8 @@ inline void s_store(half* p, float v) {
 // ============================================================
 // Store-with-accumulate helpers — SIMD/scalar equivalents of
 // *ptr += val, combining load+add+store into one call.
-// Eliminates the v_add(v_load(ptr), val) / v_store(ptr, ...)
-// if/else boilerplate that was duplicated across 6+ operators.
+// Eliminates the v_add(v_load(ptr), val) / v_store(ptr, ...) if/else
+// boilerplate at each call site.
 // ============================================================
 template <typename Ptr, typename Vec>
 inline void v_store_add(Ptr ptr, const Vec& val, bool add_to) {

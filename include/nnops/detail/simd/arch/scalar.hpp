@@ -355,7 +355,7 @@ inline uint16_t f32_to_f16(float ff) {
     // 3. For Inf/NaN: threshold check → preset values
 
     constexpr uint32_t f32infty_u   = 255u << 23;
-    constexpr uint32_t f16max_u     = (127u + 16u) << 23;  // v_max f16 representable in f32
+    constexpr uint32_t f16max_u     = (127u + 16u) << 23;  // 2^16 cutoff: at/above this the value maps to Inf/NaN
     constexpr uint32_t denorm_magic = ((127u - 15u) + (23u - 10u) + 1u) << 23;
     constexpr uint32_t sign_mask    = 0x80000000u;
 

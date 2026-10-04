@@ -30,7 +30,7 @@ namespace arch {
 namespace avx2 {
 
 // ============================================================
-// v_f32x4 — 128-bit, via __m128 (low 128 bits of 256-bit)
+// v_f32x4: 128-bit float vector, backed by __m128
 // ============================================================
 struct v_f32x4 {
     __m128 val;
@@ -163,7 +163,7 @@ inline v_f32x8 v_mul(const v_f32x8& a, const v_f32x8& b)
 inline v_f32x8 v_div(const v_f32x8& a, const v_f32x8& b)
     { return v_f32x8(_mm256_div_ps(a.val, b.val)); }
 
-// FMA: true fused multiply-v_add via FMA3
+// FMA: true fused multiply-add via FMA3
 inline v_f32x8 v_fmadd(const v_f32x8& a, const v_f32x8& b, const v_f32x8& c)
     { return v_f32x8(_mm256_fmadd_ps(a.val, b.val, c.val)); }
 inline v_f32x8 v_fmsub(const v_f32x8& a, const v_f32x8& b, const v_f32x8& c)
@@ -219,7 +219,7 @@ inline v_f32x8 v_tanh(const v_f32x8& a) {
     return v_f32x8(tanh256_ps(a.val));
 }
 
-// Horizontal sum via hadd + permute
+// Horizontal sum: fold the two 128-bit halves, then pairwise-reduce
 inline float v_reduce_sum(const v_f32x8& a) {
     __m128 lo = _mm256_castps256_ps128(a.val);
     __m128 hi = _mm256_extractf128_ps(a.val, 1);
@@ -347,8 +347,8 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     t7 = _mm256_unpackhi_ps(r6.val, r7.val);
 
     // Phase 2: shuffle within 128-bit lanes
-    s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1,0,1,0));  // a0,a2,b0,b2 | ...
-    s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3,2,3,2));  // a1,a3,b1,b3 | ...
+    s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1,0,1,0));  // col 0 | col 4
+    s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3,2,3,2));  // col 1 | col 5
     s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1,0,1,0));
     s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3,2,3,2));
     s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1,0,1,0));
