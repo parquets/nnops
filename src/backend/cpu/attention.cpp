@@ -59,6 +59,31 @@ constexpr int64_t kc_for() {
     return std::is_same_v<T, half> ? KC_F16 : KC_F32;
 }
 
+/// Size bound for GEMM1's packed K^T scratch.
+///
+/// GEMM1 reduces over the head dim D, so its k-block never exceeds
+/// `min(Kc, D)` — and D (64/128 in practice) is usually *below* Kc, where
+/// sizing the panels from Kc alone over-allocates the slot by up to 2x. The
+/// GEMM1 loops still step by Kc; this is purely the sizing bound.
+template <class T>
+constexpr int64_t kc_pack_bound(int64_t D) {
+    constexpr int64_t kc = std::is_same_v<T, half> ? KC_F16 : KC_F32;
+    return D < kc ? D : kc;
+}
+
+/// Panel count a packed K^T tile of *any* n <= n_max can emit.
+///
+/// Both GEMM1 loops pack the last n-block, whose own column count is
+/// `N mod tile` — as small as `tile - 1`. The pack's greedy NR decomposition
+/// is not monotonic in n (matmul_helper.h: with NR = {12,4,1} a 511-column
+/// pack emits 46 panels, a 512-column one only 44), so sizing the scratch from
+/// `num_panels(tile, NR)` — the exactly-divisible case — is short by a few
+/// panels and the pack writes past its slot. num_panels_max is the real bound.
+template <class T>
+constexpr int panels_for_pack(int n_max) {
+    return num_panels_max(n_max, nr_cascade<T>());
+}
+
 // ---- head-shape extraction (merged [B,S,H*D] vs explicit [B,H,S,D]) ----
 
 struct HeadShape {
@@ -136,10 +161,12 @@ void attention_impl(const AttentionAttributes& attrs,
     const int mc2 = plan.mc2;
     const int nc2 = plan.nc2;
 
-    // Uniform 64-byte-aligned panel stride at full Kc (sizing upper bound).
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(T)))
+    // Uniform 64-byte-aligned panel stride at GEMM1's largest k-block, and the
+    // panel count any n-block can emit — both sizing upper bounds, see
+    // kc_pack_bound / panels_for_pack.
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
                            / static_cast<int>(sizeof(T));
-    const int np_full = num_panels(nc1, nr_cascade<T>());
+    const int np_full = panels_for_pack<T>(nc1);
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
@@ -264,15 +291,14 @@ inline void resolve_flash_tile_sizes(int64_t Sq, int64_t Sk, int64_t D, int& Br,
 
 // Per-task scratch (elements) — one Br-row query block — mirroring the layout
 // inside attention_flash_impl:
-//   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:num_panels(Bc)*ldd_b_full]
+//   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:panels_for_pack(Bc)*ldd_b_full]
 template <class T>
 inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 {
     constexpr int nr_max = nr_max_flt<T>();
-    constexpr int64_t kc = std::is_same_v<T, half> ? KC_F16 : KC_F32;
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * static_cast<int>(sizeof(T)))
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
                            / static_cast<int>(sizeof(T));
-    const int pack_elems = num_panels(Bc, nr_cascade<T>()) * ldd_b_full;
+    const int pack_elems = panels_for_pack<T>(Bc) * ldd_b_full;
     return static_cast<int64_t>(Br) * 2
          + static_cast<int64_t>(Br) * Bc
          + static_cast<int64_t>(Br) * D
@@ -535,8 +561,8 @@ AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
     plan.mc1 = mc1; plan.nc1 = nc1;
     plan.mc2 = mc2; plan.nc2 = nc2;
 
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * kc * esz) / esz;
-    const int np_full = num_panels(nc1, nr_cascade<T>());
+    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * esz) / esz;
+    const int np_full = panels_for_pack<T>(nc1);
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;

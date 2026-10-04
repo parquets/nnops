@@ -11,6 +11,7 @@
 
 #include "nnops/ops/attention.hpp"
 #include "backend/cpu/attention.h"      // get_attention_plan — to pin the f16 fast path
+#include "backend/cpu/matmul_helper.h"  // num_panels / NR / Kc — pack-scratch sizing test
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
@@ -25,6 +26,7 @@
 #include <string>
 
 using namespace nnops;
+namespace cpu = nnops::backend::cpu;
 
 // ============================================================
 // Basic single-head attention
@@ -216,12 +218,21 @@ bool attention_fast_vs_ref(const AttentionAttributes& attrs,
     auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::attention_ref(attrs, ref_out, ins, {}, nullptr);
 
+    int64_t worst_i = -1;
+    float worst_over = 0.0f;
     for (int64_t i = 0; i < out_numel; ++i) {
         const float diff = std::abs(fast_buf[i] - ref_buf[i]);
         const float thr  = atol + rtol * std::max(std::abs(fast_buf[i]), std::abs(ref_buf[i]));
-        if (diff > thr) {
-            return false;
+        if (diff > thr && (worst_i < 0 || diff - thr > worst_over)) {
+            worst_i = i;
+            worst_over = diff - thr;
         }
+    }
+    if (worst_i >= 0) {
+        std::printf("        worst mismatch at %lld: fast %.6f vs ref %.6f\n",
+                    (long long)worst_i, (double)fast_buf[static_cast<size_t>(worst_i)],
+                    (double)ref_buf[static_cast<size_t>(worst_i)]);
+        return false;
     }
     return true;
 }
@@ -240,7 +251,10 @@ NNOPS_TEST(attention_tiled_matches_ref) {
         {{1, 16, 32},   {1, 16, 32},   {1, 16, 32},   1, 0.0f, false},
         {{2, 6, 24},    {2, 6, 24},    {2, 6, 24},    3, 0.5f, true},
         {{1, 32, 128},  {1, 32, 128},  {1, 32, 128},  8, 0.0f, true},
-        // head_dim > Kc: exercises the multi-k-block GEMM1 / multi-n-block GEMM2
+        // head_dim just above Kc (128): GEMM1's K loop splits 128 + 64
+        {{1, 8, 192},   {1, 8, 192},   {1, 8, 192},   1, 0.0f, false},
+        {{1, 8, 256},   {1, 8, 256},   {1, 8, 256},   1, 0.0f, true},
+        // head_dim well past Kc: exercises the multi-k-block GEMM1 / multi-n-block GEMM2
         {{1, 4, 512},   {1, 4, 512},   {1, 4, 512},   1, 0.0f, false},
     };
 
@@ -285,6 +299,77 @@ NNOPS_TEST(attention_tiled_explicit_matches_ref) {
 }
 
 // ============================================================
+// Pack-scratch sizing
+// ============================================================
+
+namespace {
+
+/// Elements the kernel writes for a packed K^T block of @p n columns, at the
+/// panel stride GEMM1 runs with for a head dim of @p D (the widest k-block it
+/// takes is min(Kc, D)).
+template <class T>
+int64_t pack_demand_elems(int64_t n, int64_t D)
+{
+    constexpr int nr_max = cpu::nr_max_flt<T>();
+    constexpr int64_t kc = std::is_same_v<T, cpu::half> ? cpu::KC_F16 : cpu::KC_F32;
+    constexpr int esz = static_cast<int>(sizeof(T));
+    const int64_t ldd = cpu::align_up<PANEL_ALIGN_BYTES>(
+        static_cast<int>(nr_max * std::min<int64_t>(kc, D) * esz)) / esz;
+    const int* nr = std::is_same_v<T, cpu::half> ? cpu::NR_F16 : cpu::NR_F32;
+    return cpu::num_panels(static_cast<int>(n), nr) * ldd;
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
+    // Both GEMM1 loops pack the *last* n-block of the K^T tile, whose own
+    // column count is `Sk mod tile` — as small as tile-1. num_panels() splits
+    // that run greedily by NR (largest panel first) and is NOT monotonic in n
+    // (NR_F32 = {12,4,1}: 3839 columns emit 324 panels, 3840 only 320), so a
+    // partial block can need more panels than the tile-sized count the scratch
+    // is sized from. Every case below has a final block one column short of a
+    // full tile — the worst remainder for the panel decomposition.
+    struct Case { bool f16; int64_t Sq, D, Sk; };
+    const Case cases[] = {
+        {false,  8, 128, 7679},   // standard path, Sk = 2*nc1 - 1
+        {false, 33, 128, 2047},   // flash, Sk = 2*Bc - 1
+        {false, 65, 256, 1023},   // flash, D = 2*Kc
+        {true,  17, 128, 4095},   // flash, f16 (NR_F16 has a wider gap)
+    };
+
+    for (const auto& c : cases) {
+        TensorDesc q, k, v;
+        q.rank = k.rank = v.rank = 3;
+        q.dtype = k.dtype = v.dtype = c.f16 ? DataType::f16 : DataType::f32;
+        q.dims = {1, c.Sq, c.D};
+        k.dims = v.dims = {1, c.Sk, c.D};
+
+        AttentionAttributes attrs;
+        attrs.num_heads = 1;
+
+        const TensorDesc descs[] = {q, k, v};
+        const cpu::AttentionPlan plan = cpu::get_attention_plan(attrs, descs, {}, 1, false);
+        const int64_t esz = c.f16 ? 2 : 4;
+
+        // One scratch slot here (B = H = 1), and pack_b is its last region, so
+        // everything past the fixed prefix is the packed-K^T capacity.
+        const int64_t tile = plan.use_flash ? plan.Bc : plan.nc1;
+        const int64_t prefix = plan.use_flash
+            ? static_cast<int64_t>(plan.Br) * 2
+              + static_cast<int64_t>(plan.Br) * plan.Bc
+              + static_cast<int64_t>(plan.Br) * c.D
+            : c.Sq * c.Sk;
+        const int64_t capacity = static_cast<int64_t>(plan.workspace_size) / esz - prefix;
+
+        const int64_t actual = ((c.Sk - 1) % tile) + 1;
+        const int64_t demand = c.f16 ? pack_demand_elems<cpu::half>(actual, c.D)
+                                     : pack_demand_elems<float>(actual, c.D);
+
+        NNOPS_EXPECT_TRUE(demand <= capacity);
+    }
+}
+
+// ============================================================
 // FlashAttention path (large sequence length)
 // ============================================================
 
@@ -297,6 +382,7 @@ NNOPS_TEST(attention_flash_matches_ref) {
         {{1, 256, 64},  2, false},   // Sq*Sk = 65536, H*D = 64
         {{1, 320, 32},  1, true},    // Sq*Sk = 102400, masked
         {{1, 512, 128}, 1, false},   // Sq*Sk = 262144, D=128 → multi-KV-block
+        {{1, 256, 256}, 1, false},   // D=256 → GEMM1's K loop splits into two k-blocks
     };
 
     for (const auto& c : cases) {
@@ -427,8 +513,9 @@ NNOPS_TEST(attention_f16_routes_to_fast_path) {
 
 NNOPS_TEST(attention_f16_matches_ref) {
     // f16 tiled standard path (Sq*Sk < kFlashMinScores): merged and explicit
-    // layouts, multi-head, an additive mask, and head_dim > Kc (multi-k-block
-    // GEMM1). The f32 reference on the same data is the ground truth.
+    // layouts, multi-head, an additive mask, and head_dims above Kc — both the
+    // single-k-block GEMM1 (D <= Kc) and the split one (D > Kc).
+    // The f32 reference on the same data is the ground truth.
     struct Case { std::vector<int64_t> qshape, kshape, vshape, mshape;
                   int64_t heads; float scale; };
     const Case cases[] = {
@@ -440,7 +527,9 @@ NNOPS_TEST(attention_f16_matches_ref) {
         {{2, 6, 24},   {2, 6, 24},   {2, 6, 24},   {6, 6},    3, 0.5f},
         // merged, H=8 (per-head D=16), masked.
         {{1, 16, 128}, {1, 16, 128}, {1, 16, 128}, {16, 16},  8, 0.0f},
-        // head_dim (512) > Kc (128): multi-k-block GEMM1.
+        // head_dim (256) = 2*Kc: GEMM1's K loop takes two full k-blocks.
+        {{1, 8, 256},  {1, 8, 256},  {1, 8, 256},  {},        1, 0.0f},
+        // head_dim (512) well past Kc: multi-k-block GEMM1.
         {{1, 4, 512},  {1, 4, 512},  {1, 4, 512},  {},        1, 0.0f},
         // explicit [B, H, S, D] layout, H=3, per-head D=8.
         {{2, 3, 5, 8}, {2, 3, 5, 8}, {2, 3, 5, 8}, {},        3, 0.0f},
@@ -471,6 +560,7 @@ NNOPS_TEST(attention_f16_flash_matches_ref) {
         {{1, 256, 64},  {},        2},   // Sq*Sk = 65536, H*D = 64
         {{1, 320, 32},  {320, 320},1},   // masked
         {{1, 512, 128}, {},        1},   // D=128 -> multi-KV-block
+        {{1, 256, 256}, {},        1},   // D=256 -> GEMM1's K loop splits into two k-blocks
     };
 
     const float tol = nnops::test::kF16AccumTol;

@@ -22,7 +22,7 @@
 /// Scratch layout (pooled internally; per (batch, head) slice, thread-count
 /// invariant):
 ///   [scores : Sq*Sk]
-///   [pack_b : num_panels(nc, NR) * ldd_b   (transposed-K^T panel, GEMM1)]
+///   [pack_b : num_panels_max(nc, NR) * ldd_b  (transposed-K^T panel, GEMM1)]
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
