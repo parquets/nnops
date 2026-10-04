@@ -14,10 +14,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Per-element helpers — used for partial/remainder
-// ============================================================
-
 template <typename T>
 inline void layout_pack_one_w(const T* in_row, T* out_row,
                                int64_t w, int64_t c_base, int64_t ch_stride,
@@ -39,10 +35,6 @@ inline void layout_unpack_one_w(const T* in_row, T* out_row,
         out_row[(c_base + lane) * ch_stride + w] = tmp[lane];
     }
 }
-
-// ============================================================
-// Pack: NCHW → NCHWC8 (one physical row at a time)
-// ============================================================
 
 template <typename T>
 inline void layout_pack_row(
@@ -77,10 +69,6 @@ inline void layout_pack_row(
         layout_pack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
     }
 }
-
-// ============================================================
-// Unpack: NCHWC8 → NCHW (one physical row at a time)
-// ============================================================
 
 template <typename T>
 inline void layout_unpack_row(
@@ -131,10 +119,6 @@ inline void layout_unpack_row(
     }
 }
 
-// ============================================================
-// Byte-copy pack/unpack for s8/u8 (8 channels = 8 bytes)
-// ============================================================
-//
 // The 8×8 transpose above operates on 8-lane floating vectors (f32/f16) and is
 // not valid for int8/uint8 (whose `v_load` returns 16 lanes). These byte paths
 // copy 8 channel bytes per W position directly. Pack fills pad lanes (c >= C)

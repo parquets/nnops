@@ -47,7 +47,7 @@ inline void tiled_unary_simd(
 }
 
 /// Row-by-row scalar-only loop for unary ops without SIMD intrinsics
-/// (Erf, Round, Ceil, Floor, Recip, Sign).
+/// (Erf, Round, Ceil, Floor, Sign).
 template <typename T, typename ScalarK>
 inline void tiled_unary_scalar(
     const T* in, T* out,

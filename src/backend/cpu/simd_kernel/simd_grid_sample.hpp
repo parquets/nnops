@@ -24,10 +24,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Coordinate helpers
-// ============================================================
-
 inline float gridsample_grid_to_pixel(float coord, int64_t size, bool align_corners) {
     if (align_corners) {
         return (coord + 1.0f) * static_cast<float>(size - 1) * 0.5f;
@@ -86,10 +82,6 @@ inline bool gridsample_trilinear_bounds_ok(float px, float py, float pz,
            gridsample_in_bounds(std::floor(pz), IW) &&
            gridsample_in_bounds(std::ceil(pz),  IW);
 }
-
-// ============================================================
-// 2D Bilinear NCHWC8 SIMD kernel
-// ============================================================
 
 template <typename T>
 void gridsample_bilinear_2d(
@@ -152,10 +144,6 @@ void gridsample_bilinear_2d(
     }
 }
 
-// ============================================================
-// 2D Nearest-neighbor NCHWC8 SIMD kernel
-// ============================================================
-
 template <typename T>
 void gridsample_nearest_2d(
     T* output, const T* input, const float* grid_n,
@@ -196,10 +184,6 @@ void gridsample_nearest_2d(
         output += out_row_stride;
     }
 }
-
-// ============================================================
-// 3D Trilinear NCDHWC8 SIMD kernel
-// ============================================================
 
 template <typename T>
 void gridsample_trilinear_3d(
@@ -284,10 +268,6 @@ void gridsample_trilinear_3d(
         }
     }
 }
-
-// ============================================================
-// 3D Nearest-neighbor NCDHWC8 SIMD kernel
-// ============================================================
 
 template <typename T>
 void gridsample_nearest_3d(

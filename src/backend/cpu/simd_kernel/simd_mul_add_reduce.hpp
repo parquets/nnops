@@ -1,13 +1,12 @@
 #pragma once
-/// @file simd_add_fuse_norm.hpp
-/// @brief Fused multiply-add + sum / sum-of-squares primitives for the
-/// AddFuseNorm operator (scaled residual add fused with normalization
-/// statistics).
+/// @file simd_mul_add_reduce.hpp
+/// @brief Fused multiply-add + sum / sum-of-squares primitives for a scaled
+/// residual add fused with normalization statistics.
 ///
-/// Pass 1 of AddFuseNorm: for one contiguous row, write
-/// out[i] = a[i] + b[i] * scale while simultaneously accumulating that row's
-/// sum and sum-of-squares, so the subsequent normalize pass can derive
-/// mean/var (LayerNorm) or rms (RMSNorm) without re-reading the row.
+/// For one contiguous row, write out[i] = a[i] + b[i] * scale while
+/// simultaneously accumulating that row's sum and sum-of-squares, so the
+/// subsequent normalize pass can derive mean/var (LayerNorm) or rms (RMSNorm)
+/// without re-reading the row.
 
 #include "nnops/detail/simd/simd.hpp"
 

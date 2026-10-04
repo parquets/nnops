@@ -3,11 +3,8 @@
 /// @brief Generic row-tiled element-wise mapper — single source of truth for
 ///        the SIMD + scalar-tail row loop shared by every element-wise op.
 ///
-/// This replaces the four near-identical row loops that used to live in
-/// `simd_unary.hpp` (tiled_unary_simd / tiled_unary_scalar) and
-/// `simd_eltwise.hpp` (tiled_eltwise_simd / tiled_eltwise_scalar). The only
-/// difference between unary and binary (and future n-ary) element-wise kernels
-/// is the arity, captured here by the compile-time `Nin` (number of inputs).
+/// The only difference between unary and binary (and future n-ary) element-wise
+/// kernels is the arity, captured here by the compile-time `Nin` (number of inputs).
 ///
 /// The op-specific work is supplied as two functors over the loaded values:
 ///   - `simd_kernel(v0, v1, ...)  -> Vec`  for the vectorized (lane=8) path

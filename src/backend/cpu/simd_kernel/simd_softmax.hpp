@@ -3,10 +3,10 @@
 /// @brief SIMD kernel functions for softmax / log-softmax.
 ///
 /// Kernel architecture:
-///   - softmax_per_lane:        unified per-lane 3-pass kernel (max→exp+sum→norm)
-///                              for all strided-access variants
-///   - softmax_packed_channel:   per-lane + partial last-block scalar correction
-///   - softmax_standard_row:     horizontal SIMD reduction for contiguous tail
+///   - softmax_per_lane:                unified per-lane 3-pass kernel (max -> exp + sum -> norm)
+///                                      for all strided-access variants
+///   - softmax_process_packed_channel:  per-lane + partial last-block scalar correction
+///   - softmax_process_standard_row:    horizontal SIMD reduction for contiguous tail
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
@@ -86,7 +86,6 @@ inline void softmax_process_packed_channel(
     int64_t full_blocks = (valid_lanes == pack || D == 0) ? D : D - 1;
     auto v_inv_T = v_set1(x_chan, inv_T);
 
-    // ---- helper: read a single lane from a SIMD vector ----
     auto lane_val = [](auto vec, int64_t l) -> float {
         T buf[16];
         v_store(buf, vec);

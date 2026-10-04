@@ -27,10 +27,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Shared primitives
-// ============================================================
-
 /// SIMD sum + sum-of-squares reduction over n contiguous elements — thin
 /// forwarder to the shared reduction primitive in simd_reduce_primitive.hpp.
 template <typename T>
@@ -125,10 +121,6 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
         s_store_add(&y[i], rv, add_to);
     }
 }
-
-// ============================================================
-// BatchNorm kernels (fused fmadd formula, structurally unique)
-// ============================================================
 
 /// Packed layout: per-row SIMD fmadd with per-C8-block scale/bias.
 template <typename T>
@@ -227,10 +219,5 @@ inline void batch_norm_process_nonspatial_block(
         s_store_add(&y[i], rv, add_to);
     }
 }
-
-// ============================================================
-// L2Norm / LayerNorm / RMSNorm — unified via norm_apply_row
-// (stats computation inlined at call sites in norm.cpp)
-// ============================================================
 
 }  // namespace nnops::kernel

@@ -10,7 +10,7 @@
 /// input channel and one kernel tap, across the current output block (the roi).
 /// Positions that fall outside the input (padding) are zero-filled.
 ///
-/// Padding convention (mirrors nn_compute tiled_im2col_2d — see the note):
+/// Padding convention (mirrors nn_compute tiled_im2col_2d):
 ///   * *local* padding — the padding remaining inside this block (roi_pad_*)
 ///     — determines where the valid region *starts* (the `*_beg` bounds).
 ///   * *global* padding — the operator's padding (PD/PH/PW) — determines where
@@ -18,8 +18,7 @@
 ///     (`id_paded`/`ih_paded`/`iw_paded`).
 ///
 /// Mixing these up (using the local padding for the input addressing) produces
-/// off-by-padding input rows on every block after the first — the bug fixed
-/// while porting the 2D kernel from nn_compute.
+/// off-by-padding input rows on every block after the first.
 ///
 /// The innermost (width) copy uses an L-wide SIMD loop when stride_w == 1 (the
 /// dominant case); otherwise a scalar loop advancing by stride_w.

@@ -11,7 +11,7 @@
 /// simd_lane_for<T> = 8 convention used throughout the CPU backend.
 ///
 /// Usage:
-///   #include "nnops/backend/cpu/simd_kernel/simd_eltwise.hpp"
+///   #include "simd_kernel/simd_eltwise.hpp"
 ///   using namespace nnops::kernel;
 ///   add(a_ptr, b_ptr, out_ptr, m, n, a_pitch, b_pitch, out_pitch, add_to);
 
@@ -23,10 +23,6 @@
 namespace nnops::kernel {
 
 using namespace simd;
-
-// ============================================================
-// Row-processing helpers — thin arity adapters over tiled_map
-// ============================================================
 
 /// Row-by-row SIMD + scalar tail loop for binary ops (Nin = 2).
 template <typename T, typename SimdK, typename ScalarK>
@@ -54,10 +50,6 @@ inline void tiled_eltwise_scalar(
     tiled_map_scalar<T, 2>({a, b}, {a_pitch, b_pitch}, out, out_pitch, m, n, add_to,
                            scalar_kernel);
 }
-
-// ============================================================
-// Tiled SIMD kernels — one function per binary operation
-// ============================================================
 
 template <typename T>
 inline void add(
@@ -130,10 +122,6 @@ inline void max(
         [](auto va, auto vb) { return v_max(va, vb); },
         [](float fa, float fb) { return fa > fb ? fa : fb; });
 }
-
-// ============================================================
-// Tiled SIMD pow — v_pow(a, b) = exp(b * log(a))
-// ============================================================
 
 template <typename T>
 inline void pow(

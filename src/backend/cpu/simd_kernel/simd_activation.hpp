@@ -24,10 +24,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Tiled activation kernels — one per activation type
-// ============================================================
-
 template <typename T>
 inline void relu(
     const T* in, T* out,

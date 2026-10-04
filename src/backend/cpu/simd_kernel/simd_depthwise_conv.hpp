@@ -23,10 +23,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Kernel parameters — set once per C8 block, od/oh updated per call
-// ============================================================
-
 struct DwConvParams {
     int64_t ID, IH, IW;           // input spatial dims
     int64_t OH, OW;               // output spatial dims (for store bounds)
@@ -39,10 +35,6 @@ struct DwConvParams {
     int64_t in_d_stride;          // input depth stride (elems)
     int64_t in_row_stride;        // input row stride (elems)
 };
-
-// ============================================================
-// H4 SIMD kernel: process 4 output rows x all OW columns
-// ============================================================
 
 template <typename T>
 inline void dwconv_h4(
@@ -103,13 +95,11 @@ inline void dwconv_h4(
             }
         }
 
-        // SIMD epilogue
         vacc0 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc0);
         vacc1 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc1);
         vacc2 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc2);
         vacc3 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc3);
 
-        // Store
         if (p.oh + 0 < p.OH) {
             v_store_add(output + 0 * p.out_row_stride + ow * 8, vacc0, add_to);
         }
@@ -124,10 +114,6 @@ inline void dwconv_h4(
         }
     }
 }
-
-// ============================================================
-// H1 SIMD kernel: process 1 output row x all OW columns
-// ============================================================
 
 template <typename T>
 inline void dwconv_h1(
@@ -174,10 +160,6 @@ inline void dwconv_h1(
     }
 }
 
-// ============================================================
-// Quantized dwconv (s8/u8 input/output, float accumulate)
-// ============================================================
-//
 // Dequantize-on-load / requantize-on-store around the same float SIMD
 // accumulation as the f32/f16 kernels. The activation is PerTensor-quantized
 // (broadcast scale/zero_point); the weight is PerChannel-quantized (per-lane

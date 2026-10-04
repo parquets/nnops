@@ -53,7 +53,6 @@ inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
             const int64_t tile_k = std::min(TILE, K - j);
 
             if (tile_m == TILE && tile_k == TILE) {
-                // Full 8×8 tile: load 8 rows, transpose, store 8 rows
                 auto r0 = v_load(&in_ptr[(i + 0) * in_ld + j]);
                 auto r1 = v_load(&in_ptr[(i + 1) * in_ld + j]);
                 auto r2 = v_load(&in_ptr[(i + 2) * in_ld + j]);
@@ -74,7 +73,6 @@ inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
                 v_store(&out_ptr[(j + 6) * out_ld + i], r6);
                 v_store(&out_ptr[(j + 7) * out_ld + i], r7);
             } else {
-                // Partial tile at edge: scalar copy
                 for (int64_t mi = 0; mi < tile_m; ++mi) {
                     for (int64_t kj = 0; kj < tile_k; ++kj) {
                         out_ptr[(j + kj) * out_ld + (i + mi)] =

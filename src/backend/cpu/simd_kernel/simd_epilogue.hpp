@@ -14,11 +14,6 @@
 #include <cstdint>
 #include <algorithm>
 
-// ============================================================
-// Scalar apply_epilogue (in the nnops namespace, matching
-// the declarations in nnops/core/epilogue.hpp)
-// ============================================================
-
 namespace nnops {
 
 inline float apply_epilogue(const Epilogue& ep, float x) {
@@ -58,19 +53,11 @@ inline float apply_epilogue(const Epilogue& ep, float x, int64_t /*channel*/) {
 
 }  // namespace nnops
 
-// ============================================================
-// SIMD vector apply_epilogue — unified template
-// ============================================================
-
 namespace nnops::backend::cpu {
 
 using namespace simd;  // v_load, v_zero, v_set1, etc.
 using namespace nnops::kernel;  // pure SIMD kernels: v_relu, v_gelu, v_sigmoid, ...
 
-// ============================================================
-// s8×s8 matmul epilogue — zero-point compensation + requantization
-// ============================================================
-//
 // The GEMM accumulates (in int32) the raw dot-product
 //
 //     raw[m,n] = Σ_k (qa[m,k] + u8_offset) · qb[k,n]
@@ -161,10 +148,6 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
     }
     return vx;
 }
-
-// ============================================================
-// epilogue_inplace — fused bias + epilogue for MatMul output
-// ============================================================
 
 /// Apply bias addition, epilogue activation, and an optional residual add-back
 /// to a MatMul/Conv output matrix.

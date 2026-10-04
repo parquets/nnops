@@ -2,17 +2,15 @@
 /// @file simd_reduce_primitive.hpp
 /// @brief Shared reduction primitives for contiguous rows.
 ///
-/// Two of the per-operator kernels — Reduce, Softmax and Norm — independently
-/// re-implemented the same "multi-accumulator reduce a contiguous row to a
-/// scalar" pattern (4-wide ILP, 2-wide, 1-wide, scalar tail) and the same
-/// horizontal max/min/sum reductions. This header is the single source of
-/// truth for that pattern:
+/// The Reduce, Softmax and Norm kernels share the same "multi-accumulator
+/// reduce a contiguous row to a scalar" pattern (4-wide ILP, 2-wide, 1-wide,
+/// scalar tail) and the same horizontal max/min/sum reductions. This header
+/// is the single source of truth for that pattern:
 ///
 ///   - ReduceAdd / ReduceMax / ReduceMin: tag types capturing a reduction's
 ///     identity, vector combine, horizontal reduction and scalar combine.
 ///   - row_reduce<T, Op>: generic 4→2→1 multi-accumulator reduce to scalar.
-///   - row_reduce_sum_sq<T>: fused sum + sum-of-squares reduce (moved from
-///     simd_norm.hpp so all reduction primitives live in one place).
+///   - row_reduce_sum_sq<T>: fused sum + sum-of-squares reduce.
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
