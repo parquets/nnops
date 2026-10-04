@@ -53,7 +53,6 @@ void conv2d_ref(const Conv2DAttributes& attrs,
     const auto* w_ptr   = weight.ptr<float>();
     const auto* b_ptr   = has_bias ? inputs[2].ptr<float>() : nullptr;
 
-    // Per-sample compute lambda
     const auto compute_sample = [&](int64_t n) {
         for (int64_t g = 0; g < G; ++g) {
             for (int64_t oc = 0; oc < OC_per_G; ++oc) {
@@ -92,7 +91,6 @@ void conv2d_ref(const Conv2DAttributes& attrs,
         }
     };
 
-    // Parallel dispatch
     ctx.cpu.run(0, N,
             [&](int64_t n) { compute_sample(n); });
 }

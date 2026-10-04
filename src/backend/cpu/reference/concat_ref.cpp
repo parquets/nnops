@@ -16,10 +16,6 @@ namespace nnops::backend::cpu::reference {
 using nnops::simd::s_load;
 using nnops::simd::s_store;
 
-// ============================================================
-// Packed C-axis concat — lane-level merge within C8 vectors
-// ============================================================
-
 template <typename T>
 void concat_packed_c_axis_ref(TensorView& output,
                                std::span<const TensorView> inputs)
@@ -99,11 +95,9 @@ void concat_packed_c_axis_ref(TensorView& output,
         }
     }
 
-    // Iterate over all spatial positions and fill C8 blocks
     for (int64_t n = 0; n < oN; ++n) {
         for (int64_t d = 0; d < oD; ++d) {
             for (int64_t h = 0; h < oH; ++h) {
-                // Base pointer for this (n, d, h) spatial row
                 T* o_row = o_ptr
                     + n  * output.stride_elems(0)
                     + (srank == 3 ? d * output.stride_elems(2) : int64_t(0))
@@ -115,7 +109,6 @@ void concat_packed_c_axis_ref(TensorView& output,
                         int64_t src_idx = full_copy_src[static_cast<size_t>(c8)];
 
                         if (src_idx >= 0) {
-                            // Full C8 block — copy the entire vector
                             const auto& in = inputs[static_cast<size_t>(src_idx)];
                             const T* i_vec = in.ptr<T>()
                                 + n  * in.stride_elems(0)
@@ -127,7 +120,6 @@ void concat_packed_c_axis_ref(TensorView& output,
                                 o_vec[l] = i_vec[l];
                             }
                         } else {
-                            // Partial C8 block — lane-by-lane copy
                             const auto& map = lane_map[static_cast<size_t>(c8)];
                             for (int64_t l = 0; l < pack; ++l) {
                                 const auto& src = map[static_cast<size_t>(l)];
@@ -152,10 +144,6 @@ void concat_packed_c_axis_ref(TensorView& output,
     }
 }
 
-// ============================================================
-// General concat path (planar all axes + packed non-C axes)
-// ============================================================
-
 template <typename T>
 void concat_impl_ref(const ConcatAttributes& attrs,
                       TensorView& output,
@@ -170,13 +158,11 @@ void concat_impl_ref(const ConcatAttributes& attrs,
     const int64_t ax = (attrs.axis < 0) ? attrs.axis + rank : attrs.axis;
     const int64_t pack = inputs[0].channel_pack_size();
 
-    // ---- Packed C-axis concat (requires lane-level merge) ----
     if (ax == 1 && pack > 1 && rank >= 3) {
         concat_packed_c_axis_ref<T>(output, inputs);
         return;
     }
 
-    // ---- Compute axis offsets (physical dims for packed C axis) ----
     std::vector<int64_t> axis_offset(static_cast<size_t>(N + 1), 0);
     for (int64_t i = 0; i < N; ++i) {
         axis_offset[static_cast<size_t>(i + 1)] =
@@ -194,7 +180,7 @@ void concat_impl_ref(const ConcatAttributes& attrs,
     auto* o_ptr = output.ptr<T>();
 
     if (axis_splits_row) {
-        // ---- Within-row concat: each input provides a segment of each row ----
+        // Within-row concat: each input provides a segment of each row
         for (int64_t r = 0; r < num_rows; ++r) {
             T* o_row = o_ptr + r * o_row_stride;
             int64_t o_col = 0;
@@ -211,7 +197,7 @@ void concat_impl_ref(const ConcatAttributes& attrs,
             }
         }
     } else {
-        // ---- Outer axis concat: rows/blocks from different inputs ----
+        // Outer axis concat: rows/blocks from different inputs
         const int64_t n_pre = ax;  // number of dimensions before the concat axis
         const int64_t phys_inner = is_rank1 ? output.numel() : output.stride_elems(ax);
 
@@ -245,10 +231,8 @@ void concat_impl_ref(const ConcatAttributes& attrs,
                 pre_strides[static_cast<size_t>(d)] = output.stride_elems(d);
             }
 
-            // Odometer iteration
             std::vector<int64_t> idx(static_cast<size_t>(n_pre), 0);
             do {
-                // Compute output base offset for this outer position
                 int64_t o_base = 0;
                 for (int64_t d = 0; d < n_pre; ++d) {
                     o_base += idx[static_cast<size_t>(d)]
@@ -261,7 +245,6 @@ void concat_impl_ref(const ConcatAttributes& attrs,
                     const int64_t i_stride_ax = is_rank1 ? 1 : in.stride_elems(ax);
                     const T* i_ptr = in.ptr<T>();
 
-                    // Compute input base offset
                     int64_t i_base = 0;
                     for (int64_t d = 0; d < n_pre; ++d) {
                         i_base += idx[static_cast<size_t>(d)]
@@ -279,7 +262,6 @@ void concat_impl_ref(const ConcatAttributes& attrs,
                     }
                 }
 
-                // Increment odometer
                 int64_t d = n_pre - 1;
                 while (d >= 0 && ++idx[static_cast<size_t>(d)]
                                   == pre_sizes[static_cast<size_t>(d)])

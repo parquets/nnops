@@ -21,10 +21,6 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-// ============================================================
-// Cache type conversion helpers
-// ============================================================
-
 /// Load a single element from cache storage and convert to float32.
 inline float cache_load_f32(const void* cache_ptr, int64_t offset,
                             DataType cache_dtype,
@@ -113,10 +109,6 @@ inline int64_t qp_index(const QuantParams& qp, int64_t phys_block,
     }
 }
 
-// ============================================================
-// Cache addressing (contiguous vs block mode)
-// ============================================================
-
 /// Resolve a logical cache position to a physical offset within the cache buffer.
 /// Continuous mode (block_size == 0): phys_offset = b * HC * max_len * D + h * max_len * D + pos * D + d
 /// Block mode (block_size > 0):     phys_block → row within block
@@ -133,9 +125,8 @@ inline int64_t cache_offset(int64_t b, int64_t h, int64_t logical_pos, int64_t d
         int64_t max_len = cache.shape(2);
         int64_t D_dim = cache.shape(3);
         int64_t row_stride = cache.row_stride_elems();
-        // Per-batch offset
         int64_t b_off = b * H_dim * max_len * D_dim;
-        // Within batch: h * max_len * row_stride + pos * row_stride + d
+        // Within batch: h * max_len * D_dim + pos * D_dim + d
         return b_off + h * max_len * D_dim + logical_pos * D_dim + d;
     } else {
         // Block mode: [num_blocks, H, block_size, D]
@@ -163,10 +154,6 @@ inline int64_t cache_row_offset(int64_t b, int64_t h, int64_t logical_pos,
     return cache_offset(b, h, logical_pos, 0, cache, block_size,
                         block_table, max_blocks, out_phys_block);
 }
-
-// ============================================================
-// Element load/store helpers for compute tensors (Q, K_new, V_new, output)
-// ============================================================
 
 inline float load_f32(const void* ptr, int64_t offset, DataType dtype) {
     switch (dtype) {
@@ -207,10 +194,6 @@ inline void softmax_row(float* row, int64_t n, float inv_T) {
 }
 
 }  // anonymous namespace
-
-// ============================================================
-// Main kernel
-// ============================================================
 
 void causal_attention_ref(const CausalAttentionAttributes& attrs,
                            std::span<TensorView> outputs,
@@ -255,7 +238,6 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
         max_blocks = inputs[5].shape(1);
     }
 
-    // Raw data pointers
     const void* q_ptr    = Q.ptr<void>();
     const void* kn_ptr   = K_new.ptr<void>();
     const void* vn_ptr   = V_new.ptr<void>();
@@ -263,7 +245,6 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
     void*       kc_ptr   = K_cache.ptr<void>();
     void*       vc_ptr   = V_cache.ptr<void>();
 
-    // Stride helpers for compute tensors
     const int64_t q_row_stride  = Q.row_stride_elems();
     const int64_t kn_row_stride = K_new.row_stride_elems();
     const int64_t vn_row_stride = V_new.row_stride_elems();
@@ -276,7 +257,6 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
         return ((b * H + h) * t.shape(2) + s) * row_stride + d;
     };
 
-    // Per-(batch, head) work item
     auto process_head = [&](int64_t idx) {
         const int64_t b = idx / H;
         const int64_t h = idx % H;
@@ -373,7 +353,6 @@ void causal_attention_ref(const CausalAttentionAttributes& attrs,
         }
     };
 
-    // Parallel dispatch over B * H heads
     const int64_t total = B * H;
     ctx.cpu.run(0, total,
             [&](int64_t idx) { process_head(idx); });

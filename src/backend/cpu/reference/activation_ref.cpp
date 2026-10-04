@@ -47,10 +47,6 @@ void activation_quant_ref(const ActivationAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs);
 
-// ============================================================
-// Functor definitions — one per activation type
-// ============================================================
-
 template <typename F>
 static void element_wise_compute(TensorView& output,
                                   const TensorView& input,
@@ -107,7 +103,6 @@ void activation_ref(const ActivationAttributes& attrs,
         return;
     }
 
-    // Select the activation function at runtime
     switch (attrs.type) {
     case ActivationType::Relu: {
         const auto fn = [](float x) -> float { return x > 0.0f ? x : 0.0f; };
@@ -172,10 +167,6 @@ void activation_ref(const ActivationAttributes& attrs,
     }
 }
 
-// ============================================================
-// Fused quantized activation (scalar reference)
-// ============================================================
-
 void activation_quant_ref(const ActivationAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs)
@@ -198,7 +189,6 @@ void activation_quant_ref(const ActivationAttributes& attrs,
         const int64_t in_idx  = in_per_token  ? (flat / last_dim) : 0;
         const int64_t out_idx = out_per_token ? (flat / last_dim) : 0;
 
-        // Dequantize → f32.
         const float in_s = in_per_token ? in_qp.scale_data[in_idx] : in_qp.scale;
         const float in_z = in_per_token
             ? (in_qp.zero_point_data != nullptr ? static_cast<float>(in_qp.zero_point_data[in_idx]) : 0.0f)
@@ -207,10 +197,8 @@ void activation_quant_ref(const ActivationAttributes& attrs,
             ? (static_cast<float>(input.ptr<int8_t>()[flat]) - in_z) * in_s
             : (static_cast<float>(input.ptr<uint8_t>()[flat]) - in_z) * in_s;
 
-        // Activation.
         const float y = activation_scalar(attrs.type, x, attrs.alpha, attrs.beta);
 
-        // Quantize → store.
         const float out_s = out_per_token ? out_qp.scale_data[out_idx] : out_qp.scale;
         const float out_z = out_per_token
             ? (out_qp.zero_point_data != nullptr ? static_cast<float>(out_qp.zero_point_data[out_idx]) : 0.0f)

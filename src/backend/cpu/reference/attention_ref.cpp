@@ -22,13 +22,11 @@ void softmax_last_dim(float* data, int64_t rows, int64_t cols) {
         for (int64_t c = 0; c < cols; ++c) {
             max_val = std::max(max_val, row[c]);
         }
-        // Exp and sum
         float sum = 0.0f;
         for (int64_t c = 0; c < cols; ++c) {
             row[c] = std::exp(row[c] - max_val);
             sum += row[c];
         }
-        // Normalize
         float inv_sum = 1.0f / sum;
         for (int64_t c = 0; c < cols; ++c) {
             row[c] *= inv_sum;
@@ -101,12 +99,10 @@ void attention_ref(const AttentionAttributes& attrs,
         ptr[idx] = val;
     };
 
-    // Per-head compute lambda
     const auto compute_head_batch = [&](int64_t idx) {
         const int64_t b = idx / H;
         const int64_t h = idx % H;
 
-        // Allocate scratch for scores: [Sq, Sk]
         std::vector<float> scores(static_cast<size_t>(Sq * Sk), 0.0f);
 
         // Step 1: scores = Q @ K^T * scale

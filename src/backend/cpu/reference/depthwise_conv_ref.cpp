@@ -78,7 +78,6 @@ void dwconv_impl_2d_ref(const DepthwiseConvAttributes& attrs,
     const auto* w_ptr   = weight.ptr<T>();
     const auto* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    // Per-channel compute lambda (N*C parallel)
     const auto compute_channel = [&](int64_t n, int64_t c) {
         for (int64_t oh = 0; oh < OH; ++oh) {
             for (int64_t ow = 0; ow < OW; ++ow) {
@@ -173,7 +172,6 @@ void dwconv_impl_3d_ref(const DepthwiseConvAttributes& attrs,
     const auto* w_ptr   = weight.ptr<T>();
     const auto* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    // Per-channel compute lambda (N*C parallel)
     const auto compute_channel = [&](int64_t n, int64_t c) {
         for (int64_t od = 0; od < OD; ++od) {
             for (int64_t oh = 0; oh < OH; ++oh) {

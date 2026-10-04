@@ -184,10 +184,6 @@ void eltwise_impl_ref(const EltwiseAttributes& attrs,
     }
 }
 
-// ============================================================
-// Fused quantized eltwise (scalar reference)
-// ============================================================
-
 void eltwise_quant_ref(const EltwiseAttributes& attrs,
                        TensorView& output,
                        std::span<const TensorView> inputs)
@@ -217,7 +213,6 @@ void eltwise_quant_ref(const EltwiseAttributes& attrs,
         const int64_t b_idx = b_per_token ? (flat / last_dim) : 0;
         const int64_t o_idx = o_per_token ? (flat / last_dim) : 0;
 
-        // Dequantize both inputs → f32.
         const float a_s = a_per_token ? a_qp.scale_data[a_idx] : a_qp.scale;
         const float a_z = a_per_token
             ? (a_qp.zero_point_data != nullptr ? static_cast<float>(a_qp.zero_point_data[a_idx]) : 0.0f)
@@ -233,10 +228,8 @@ void eltwise_quant_ref(const EltwiseAttributes& attrs,
             ? (static_cast<float>(B.ptr<int8_t>()[flat]) - b_z) * b_s
             : (static_cast<float>(B.ptr<uint8_t>()[flat]) - b_z) * b_s;
 
-        // Binary op.
         const float r = eltwise_scalar(attrs.type, x, y);
 
-        // Quantize → store.
         const float o_s = o_per_token ? o_qp.scale_data[o_idx] : o_qp.scale;
         const float o_z = o_per_token
             ? (o_qp.zero_point_data != nullptr ? static_cast<float>(o_qp.zero_point_data[o_idx]) : 0.0f)

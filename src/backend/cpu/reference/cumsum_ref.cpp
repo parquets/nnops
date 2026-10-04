@@ -20,7 +20,6 @@ void cumsum_ref(const CumSumAttributes& attrs,
     const int64_t rank = input.rank();
     NNOPS_ASSERT(rank >= 1);
 
-    // Normalize axis
     int64_t axis = attrs.axis;
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
@@ -47,7 +46,6 @@ void cumsum_ref(const CumSumAttributes& attrs,
     const int64_t axis_stride = input.stride_elems(axis);
 
     if (!attrs.reverse) {
-        // Forward cumulative sum
         const auto process_slice = [&](int64_t outer) {
             const int64_t slice_start = outer * dim * lower_dim_size;
 
@@ -77,7 +75,6 @@ void cumsum_ref(const CumSumAttributes& attrs,
 
         ctx.cpu.run(0, upper_dim_count, process_slice);
     } else {
-        // Reverse cumulative sum (start from the end)
         const auto process_slice = [&](int64_t outer) {
             const int64_t slice_start = outer * dim * lower_dim_size;
 

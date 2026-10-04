@@ -17,10 +17,6 @@
 
 namespace nnops::backend::cpu::reference {
 
-// ============================================================
-// Direct lookup (f32/f16 weight)
-// ============================================================
-
 template <typename T>
 void embed_direct_ref_impl(const EmbedAttributes& /*attrs*/,
                             TensorView& output,
@@ -52,7 +48,6 @@ void embed_direct_ref_impl(const EmbedAttributes& /*attrs*/,
             idx = static_cast<const int32_t*>(indices.ptr<void>())[n];
         }
 
-        // Clamp to valid range
         if (idx < 0) {
             idx = 0;
         }
@@ -60,16 +55,11 @@ void embed_direct_ref_impl(const EmbedAttributes& /*attrs*/,
             idx = V - 1;
         }
 
-        // Copy weight[idx, :] to output[n, :]
         std::memcpy(out_ptr + n * out_row_stride,
                     weight_ptr + idx * w_row_stride,
                     static_cast<size_t>(dim) * sizeof(T));
     }
 }
-
-// ============================================================
-// Int8 lookup with scalar per-row dequantization
-// ============================================================
 
 template <typename Tout>
 void embed_int8_dequant_ref_impl(const EmbedAttributes& /*attrs*/,

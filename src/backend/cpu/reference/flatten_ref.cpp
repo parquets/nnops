@@ -40,7 +40,6 @@ void flatten_impl_ref(const FlattenAttributes& /*attrs*/,
         num_logical_rows *= output.shape(d);
     }
 
-    // Within-row element stride for the input.
     const int64_t i_w_stride = input.stride_elems(rank - 1);  // 1 planar, pack for packed
 
     for (int64_t row = 0; row < num_logical_rows; ++row) {
@@ -69,7 +68,6 @@ void flatten_impl_ref(const FlattenAttributes& /*attrs*/,
             }
         }
 
-        // Copy this row: o_row[w] ← input[row_start + w * i_w_stride]
         for (int64_t w = 0; w < oW; ++w) {
             s_store(&o_row[w], s_load(&i_ptr[i_off + w * i_w_stride]));
         }

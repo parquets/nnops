@@ -33,12 +33,10 @@ void argmax_impl_ref(const ArgMinMaxAttributes& attrs,
         inner_size *= in.shape(d);
     }
 
-    // Physical strides
     const int64_t axis_stride = in.stride_elems(ax);  // elements between consecutive axis positions
     const auto* i_ptr = in.ptr<T>();
     auto* o_ptr = output.ptr<int64_t>();
 
-    // Output strides
     int64_t o_outer_stride = 0, o_axis_stride = 0;
     if (attrs.keepdims) {
         o_outer_stride = output.stride_elems(ax);  // stride along outer→axis transition
@@ -54,10 +52,8 @@ void argmax_impl_ref(const ArgMinMaxAttributes& attrs,
 
     for (int64_t outer = 0; outer < outer_dims; ++outer) {
         for (int64_t inner = 0; inner < inner_size; ++inner) {
-            // Base position in input
             int64_t i_base = outer * axis_stride * axis_dim + inner;
 
-            // Find argmax/argmin along axis
             int64_t best_idx = 0;
             float   best_val = s_load(i_ptr + i_base);
 
@@ -70,7 +66,6 @@ void argmax_impl_ref(const ArgMinMaxAttributes& attrs,
                 }
             }
 
-            // Output position
             int64_t o_pos;
             if (attrs.keepdims) {
                 o_pos = outer * o_outer_stride + inner;  // axis dim is 1, skip it

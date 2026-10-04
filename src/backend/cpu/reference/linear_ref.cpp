@@ -20,7 +20,6 @@ void linear_ref(const LinearAttributes& attrs,
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
 
-    // Determine M and K from input
     const int64_t M = (input.rank() > 1) ? input.shape(0) : 1;
     const int64_t K = (input.rank() > 1) ? input.shape(1) : input.shape(0);
 
@@ -37,7 +36,6 @@ void linear_ref(const LinearAttributes& attrs,
     const int64_t w_row_stride   = weight.row_stride_elems();  // >= K
     const int64_t out_row_stride = output.row_stride_elems();  // >= N
 
-    // Parallel over M (batch dimension)
     const auto compute_row = [&](int64_t m) {
         for (int64_t n = 0; n < N; ++n) {
             float sum = 0.0f;
