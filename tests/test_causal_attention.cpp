@@ -281,10 +281,10 @@ NNOPS_TEST(causal_attention_f16_cache) {
     std::vector<float> vc_f32;
     auto v_cache_f32 = make_f32tv(cache_sh, vc_f32);
     for (auto& x : kc_f32) {
-        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+        x = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
     }
     for (auto& x : vc_f32) {
-        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+        x = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
     }
 
     std::vector<char> kc_f16_st, vc_f16_st;
@@ -524,10 +524,10 @@ NNOPS_TEST(causal_attention_int8_cache) {
     std::vector<float> vc_f32;
     auto vc_f32_tv = make_f32tv(cache_sh, vc_f32);
     for (auto& x : kc_f32) {
-        x = static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f;
+        x = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) * 2.0f - 1.0f;
     }
     for (auto& x : vc_f32) {
-        x = static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f;
+        x = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) * 2.0f - 1.0f;
     }
 
     float scale = 0.01f;
@@ -584,10 +584,10 @@ NNOPS_TEST(causal_attention_bf16_cache) {
     std::vector<float> vc_f32;
     auto vc_f32_tv = make_f32tv(cache_sh, vc_f32);
     for (auto& x : kc_f32) {
-        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+        x = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
     }
     for (auto& x : vc_f32) {
-        x = static_cast<float>(rand()) / RAND_MAX - 0.5f;
+        x = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
     }
 
     std::vector<char> kc_bf16_st, vc_bf16_st;
