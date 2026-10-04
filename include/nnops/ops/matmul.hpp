@@ -61,11 +61,9 @@ struct MatMulAttributes {
 ///   - 4D × 3D:    [2,1,M,K] × [3,K,N] → [2,3,M,N]
 class MatMul : public OpBase {
 public:
-    /// Create a MatMul operator for the specified backend.
     static std::unique_ptr<MatMul> create(const MatMulAttributes& attrs = {},
                                           Backend backend = Backend::CPU);
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

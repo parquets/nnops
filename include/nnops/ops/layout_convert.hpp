@@ -34,19 +34,16 @@ struct LayoutConvertAttributes {
 /// last C8 block is zero-padded if C is not a multiple of pack_size.
 class LayoutConvert : public OpBase {
 public:
-    /// Create a LayoutConvert operator for the specified backend.
     static std::unique_ptr<LayoutConvert> create(
         const LayoutConvertAttributes& attrs,
         Backend backend = Backend::CPU);
 
-    /// Create with a target layout only.
     static std::unique_ptr<LayoutConvert> create(
         TensorLayout target_layout,
         Backend backend = Backend::CPU) {
         return create(LayoutConvertAttributes{target_layout}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

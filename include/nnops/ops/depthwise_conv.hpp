@@ -56,31 +56,25 @@ struct DepthwiseConvAttributes {
 
 /// DepthwiseConv operator (class-based API).
 ///
-/// Supports NCHW/NCDHW layouts with depthwise (channel-wise) convolution.
-/// Each input channel is convolved with its own independent filter.
+/// Channel-packed layouts only (NCHWC8 / NCDHWC8); each input channel is
+/// convolved with its own independent filter, with no cross-channel mixing.
 ///
 /// 2D: Input [N, C, IH, IW], Weight [C, 1, KH, KW], Output [N, C, OH, OW].
 /// 3D: Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW], Output [N, C, OD, OH, OW].
 /// Optional bias: [C].
 class DepthwiseConv : public OpBase {
 public:
-    /// Create a DepthwiseConv operator for the specified backend.
     static std::unique_ptr<DepthwiseConv> create(
         const DepthwiseConvAttributes& attrs,
         Backend backend = Backend::CPU);
 
-    /// Create a DepthwiseConv operator with default attributes.
     static std::unique_ptr<DepthwiseConv> create(Backend backend = Backend::CPU) {
         return create(DepthwiseConvAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = input tensor  [N, C, (D,) H, W]
-    /// inputs[1] = weight tensor [C, 1, (KD,) KH, KW]
-    /// inputs[2] = bias tensor   [C] (optional)
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,
@@ -96,7 +90,6 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
 
-    /// Access the depthwise convolution attributes.
     const DepthwiseConvAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in depthwise_conv.cpp (Pimpl pattern)

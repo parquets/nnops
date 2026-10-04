@@ -70,16 +70,13 @@ struct NormAttributes {
 /// Output (1): Y with the same shape as X.
 class Norm : public OpBase {
 public:
-    /// Create a Norm operator for the specified backend.
     static std::unique_ptr<Norm> create(const NormAttributes& attrs = {},
                                         Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Norm> create(Backend backend) {
         return create(NormAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

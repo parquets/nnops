@@ -45,16 +45,13 @@ struct AttentionAttributes {
 /// inputs[3] = mask (optional, broadcastable to [B, 1, Sq, Sk] or [B, H, Sq, Sk])
 class Attention : public OpBase {
 public:
-    /// Create an Attention operator.
     static std::unique_ptr<Attention> create(const AttentionAttributes& attrs,
                                              Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Attention> create(Backend backend = Backend::CPU) {
         return create(AttentionAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

@@ -52,20 +52,16 @@ struct TopKAttributes {
 ///         Indices [*]   (same shape as Values, int64)
 class TopK : public OpBase {
 public:
-    /// Create a TopK operator for the specified backend.
     static std::unique_ptr<TopK> create(const TopKAttributes& attrs = {},
                                          Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<TopK> create(Backend backend) {
         return create(TopKAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = X tensor [*]
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

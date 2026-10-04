@@ -21,10 +21,10 @@ enum class PoolingType : uint8_t {
 
 /// Attributes for the Pooling operator (supports both 2D and 3D).
 ///
-/// For 2D pooling (NCHW input, rank=4): only the last 2 elements of each array
+/// For 2D pooling (NCHWC8 input, rank=4): only the last 2 elements of each array
 /// are used (H, W dimensions). The first element (D) is ignored.
 ///
-/// For 3D pooling (NCDHW input, rank=5): all 3 elements are used (D, H, W).
+/// For 3D pooling (NCDHWC8 input, rank=5): all 3 elements are used (D, H, W).
 struct PoolingAttributes {
     PoolingType type = PoolingType::Max;
 
@@ -69,16 +69,13 @@ struct PoolingAttributes {
 /// 3D: Input [N, C, ID, IH, IW] → Output [N, C, OD, OH, OW]
 class Pooling : public OpBase {
 public:
-    /// Create a Pooling operator for the specified backend.
     static std::unique_ptr<Pooling> create(const PoolingAttributes& attrs,
                                            Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Pooling> create(Backend backend = Backend::CPU) {
         return create(PoolingAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

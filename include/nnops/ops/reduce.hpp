@@ -46,20 +46,16 @@ struct ReduceAttributes {
 /// Output: Y [*]  (reduced shape: axis removed or kept as 1 if keepdims)
 class Reduce : public OpBase {
 public:
-    /// Create a Reduce operator for the specified backend.
     static std::unique_ptr<Reduce> create(const ReduceAttributes& attrs = {},
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Reduce> create(Backend backend) {
         return create(ReduceAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = X tensor [*]
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

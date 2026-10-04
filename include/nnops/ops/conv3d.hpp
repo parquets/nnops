@@ -55,21 +55,18 @@ struct Conv3DAttributes {
 /// Optional bias: [OC].
 class Conv3D : public OpBase {
 public:
-    /// Create a Conv3D operator for the specified backend.
     static std::unique_ptr<Conv3D> create(const Conv3DAttributes& attrs,
                                           Backend backend = Backend::CPU);
 
-    /// Create a Conv3D operator (same as above, convenience).
     static std::unique_ptr<Conv3D> create(Backend backend = Backend::CPU) {
         return create(Conv3DAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
     /// inputs[0] = input tensor (NCDHW)
-    /// inputs[1] = weight tensor (OIDHW or GOIDHW for grouped)
+    /// inputs[1] = weight tensor [OC, IC/G, KD, KH, KW] — ONNX-style, also when grouped
     /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
@@ -82,7 +79,6 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
 
-    /// Access the convolution attributes.
     const Conv3DAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in conv3d.cpp (Pimpl pattern)

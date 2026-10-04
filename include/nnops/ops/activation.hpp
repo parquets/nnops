@@ -18,9 +18,9 @@ enum class ActivationType : uint8_t {
     LeakyRelu,  ///< f(x) = x > 0 ? x : alpha * x
     Sigmoid,    ///< f(x) = 1 / (1 + exp(-x))
     Tanh,       ///< f(x) = tanh(x)
-    Gelu,       ///< f(x) = x * Phi(x) (Gaussian error linear unit)
+    Gelu,       ///< f(x) ≈ x * Phi(x), tanh approximation
     Silu,       ///< f(x) = x * sigmoid(x) (Swish)
-    HardSwish,  ///< f(x) = x * relu6(x + 3) / 6
+    HardSwish,  ///< f(x) = x * relu6(x + 3) * beta / 6
     Elu,        ///< f(x) = x > 0 ? x : alpha * (exp(x) - 1)
 };
 
@@ -42,19 +42,16 @@ struct ActivationAttributes {
 /// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
 /// quantized input is dequantized, the activation is applied in f32, and the
 /// result is re-quantized (f32 → int). Both input and output must be quantized.
-/// Only PerTensor / PerToken activation granularity is used.
+/// Only PerTensor / PerToken quantization granularity is supported.
 class Activation : public OpBase {
 public:
-    /// Create an Activation operator for the specified backend.
     static std::unique_ptr<Activation> create(const ActivationAttributes& attrs,
                                               Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Activation> create(Backend backend = Backend::CPU) {
         return create(ActivationAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

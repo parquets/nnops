@@ -33,20 +33,16 @@ struct ConcatAttributes {
 /// Output: O [*]                     (axis dim = sum of all input axis dims)
 class Concat : public OpBase {
 public:
-    /// Create a Concat operator for the specified backend.
     static std::unique_ptr<Concat> create(const ConcatAttributes& attrs = {},
                                            Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Concat> create(Backend backend) {
         return create(ConcatAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0..N-1] = tensors to concatenate
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

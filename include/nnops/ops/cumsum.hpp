@@ -37,20 +37,16 @@ struct CumSumAttributes {
 /// Output: same shape as input
 class CumSum : public OpBase {
 public:
-    /// Create a CumSum operator for the specified backend.
     static std::unique_ptr<CumSum> create(const CumSumAttributes& attrs = {},
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<CumSum> create(Backend backend) {
         return create(CumSumAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = input tensor (rank >= 1)
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

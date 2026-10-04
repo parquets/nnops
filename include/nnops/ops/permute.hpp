@@ -35,16 +35,13 @@ struct PermuteAttributes {
 /// Output: Y [*]  (same dtype, permuted shape, planar)
 class Permute : public OpBase {
 public:
-    /// Create a Permute operator for the specified backend.
     static std::unique_ptr<Permute> create(const PermuteAttributes& attrs,
                                             Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Permute> create(Backend backend) {
         return create(PermuteAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

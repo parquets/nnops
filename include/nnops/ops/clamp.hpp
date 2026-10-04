@@ -2,9 +2,6 @@
 /// @file clamp.hpp
 /// @brief Clamp operator — element-wise value clamping to [min, max].
 ///
-/// Used for action bounds enforcement in VLA policies, numerical stability
-/// clipping, and general-purpose value range limiting.
-///
 /// Supports arbitrary layouts (Planar + Packed) via pitch-aware row processing.
 
 #include "nnops/core/op_base.hpp"
@@ -38,20 +35,16 @@ struct ClampAttributes {
 /// Output: Y [*]          (same shape, rank, layout, dtype)
 class Clamp : public OpBase {
 public:
-    /// Create a Clamp operator for the specified backend.
     static std::unique_ptr<Clamp> create(const ClampAttributes& attrs = {},
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Clamp> create(Backend backend) {
         return create(ClampAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = X tensor [*]
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

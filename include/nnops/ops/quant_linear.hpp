@@ -5,26 +5,12 @@
 /// QuantizeLinear:  float (f32/f16) → integer (s8/u8)
 ///   y = clamp(round(x / scale) + zero_point, type_min, type_max)
 ///
-/// DequantizeLinear: integer (s8/u8) → float (f32)
+/// DequantizeLinear: integer (s8/u8) → float (f32/f16)
 ///   y = (x - zero_point) * scale
 ///
-/// Three quantization granularities, selected by the `axis` attribute and the
-/// scale/zero_point shape (matching ONNX conventions):
-///
-///   PerTensor:  scale and zero_point are scalars (numel == 1). One shared
-///               parameter for the whole tensor, regardless of `axis`.
-///
-///   PerToken:   `axis == -1` (the default) with a per-row scale/zero_point.
-///               The last (innermost) dimension is the quantization unit: every
-///               element in the same row shares one parameter; different rows
-///               do not. For an input of shape [..., H], scale/zero_point have
-///               numel(x)/H entries. This is the activation-quantization mode
-///               (per-token activation quantization in LLM inference).
-///
-///   PerChannel: `axis >= 0` with a per-channel scale/zero_point
-///               (shape[axis] entries), broadcast across all other dims.
-///               WEIGHTS ONLY — reserved for weight tensors; activations must
-///               use PerTensor / PerToken.
+/// Three granularities — PerTensor, PerToken, PerChannel — selected by the
+/// `axis` attribute and the scale shape (matching ONNX conventions).
+/// See QuantLinearAttributes::axis for the exact rules.
 ///
 /// Supported layouts: NCHW, NCDHW, NCHWC8, NCDHWC8
 /// Supported float types: f32, f16
@@ -77,10 +63,6 @@ inline QuantGranularity resolve_quant_granularity(const TensorView& scale,
     return (axis < 0) ? QuantGranularity::PerToken : QuantGranularity::PerChannel;
 }
 
-// ============================================================
-// QuantizeLinear: float → integer
-// ============================================================
-
 /// QuantizeLinear operator.
 ///
 /// Inputs:
@@ -100,11 +82,9 @@ public:
         return create(QuantLinearAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = x, inputs[1] = scale, inputs[2] = zero_point
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,
@@ -127,10 +107,6 @@ private:
     Backend backend_;
 };
 
-// ============================================================
-// DequantizeLinear: integer → float
-// ============================================================
-
 /// DequantizeLinear operator.
 ///
 /// Inputs:
@@ -150,11 +126,9 @@ public:
         return create(QuantLinearAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = x, inputs[1] = scale, inputs[2] = zero_point
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

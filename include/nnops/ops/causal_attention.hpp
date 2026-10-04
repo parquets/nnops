@@ -86,17 +86,14 @@ struct CausalAttentionAttributes {
 /// Scratch is pooled internally by the CPU kernel (getWorkspaceSize returns 0).
 class CausalAttention : public OpBase {
 public:
-    /// Create a CausalAttention operator for the specified backend.
     static std::unique_ptr<CausalAttention> create(
         const CausalAttentionAttributes& attrs,
         Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<CausalAttention> create(Backend backend = Backend::CPU) {
         return create(CausalAttentionAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

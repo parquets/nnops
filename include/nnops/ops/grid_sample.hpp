@@ -48,7 +48,7 @@ struct GridSampleAttributes {
     bool add_to = false;
 
     /// Returns the spatial rank (2 or 3) inferred from the input tensor rank.
-    /// For a 4D input (NCHW), returns 2. For a 5D input (NCDHW), returns 3.
+    /// For a 4D input (NCHWC8), returns 2. For a 5D input (NCDHWC8), returns 3.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
         return input_rank - 2;  // N, C + spatial dims
     }
@@ -62,16 +62,13 @@ struct GridSampleAttributes {
 /// 3D: Input [N, C, ID, IH, IW], Grid [N, OD, OH, OW, 3] → Output [N, C, OD, OH, OW]
 class GridSample : public OpBase {
 public:
-    /// Create a GridSample operator for the specified backend.
     static std::unique_ptr<GridSample> create(const GridSampleAttributes& attrs,
                                                 Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<GridSample> create(Backend backend = Backend::CPU) {
         return create(GridSampleAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

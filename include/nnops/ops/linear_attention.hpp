@@ -122,17 +122,14 @@ struct LinearAttentionAttributes {
 ///   outputs[1] = State  [B, H_kv, D, D]   recurrent state (read then overwritten)
 class LinearAttention : public OpBase {
 public:
-    /// Create a LinearAttention operator for the specified backend.
     static std::unique_ptr<LinearAttention> create(
         const LinearAttentionAttributes& attrs,
         Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<LinearAttention> create(Backend backend = Backend::CPU) {
         return create(LinearAttentionAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

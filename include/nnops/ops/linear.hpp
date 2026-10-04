@@ -34,22 +34,16 @@ struct LinearAttributes {
 /// the multiplication is input × weight^T.
 class Linear : public OpBase {
 public:
-    /// Create a Linear operator for the specified backend.
     static std::unique_ptr<Linear> create(const LinearAttributes& attrs,
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults (convenience).
     static std::unique_ptr<Linear> create(Backend backend = Backend::CPU) {
         return create(LinearAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = input tensor [M, K] (or broadcastable to 2D)
-    /// inputs[1] = weight tensor [N, K]
-    /// inputs[2] = bias tensor [N] (optional)
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,
@@ -61,7 +55,6 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
 
-    /// Access the linear attributes.
     const LinearAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in linear.cpp (Pimpl pattern)

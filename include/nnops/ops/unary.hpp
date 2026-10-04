@@ -41,42 +41,27 @@ struct UnaryAttributes {
 
 /// Unary operator (class-based API).
 ///
-/// Element-wise math operations on a single tensor.
-///
-///   Exp:  output[i] = exp(input[i])
-///   Log:  output[i] = ln(input[i])
-///   Sin:  output[i] = sin(input[i])
-///   Cos:  output[i] = cos(input[i])
-///   Tan:  output[i] = tan(input[i])
-///   Tanh: output[i] = tanh(input[i])
-///   Abs:  output[i] = |input[i]|
-///   Neg:  output[i] = -input[i]
-///   Sqrt: output[i] = sqrt(input[i])
-///
-/// Input:  X [*]
-/// Output: Y [*]  (same shape)
+/// Element-wise math operations on a single tensor: output[i] = f(input[i]),
+/// with f chosen by UnaryAttributes::type. Input and output share shape, rank
+/// and layout.
 ///
 /// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
 /// quantized input is dequantized, the op is applied in f32, and the result is
 /// re-quantized (f32 → int). Both input and output must be quantized. Only
-/// PerTensor / PerToken activation granularity is used; Round/Ceil/Floor are
-/// float-meaning ops and do not support quantized data types.
+/// PerTensor / PerToken quantization granularity is supported; Round/Ceil/Floor
+/// are float-meaning ops and reject quantized data types.
 class Unary : public OpBase {
 public:
-    /// Create a Unary operator for the specified backend.
     static std::unique_ptr<Unary> create(const UnaryAttributes& attrs = {},
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Unary> create(Backend backend) {
         return create(UnaryAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = X tensor [*]
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

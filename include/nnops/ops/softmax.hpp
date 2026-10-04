@@ -54,26 +54,20 @@ struct SoftmaxAttributes {
 /// input; packed channel layouts are not defined there.
 class Softmax : public OpBase {
 public:
-    /// Create a Softmax operator for the specified backend.
     static std::unique_ptr<Softmax> create(const SoftmaxAttributes& attrs = {},
                                            Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Softmax> create(Backend backend) {
         return create(SoftmaxAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// Always 0: the quantized (s8/u8) dequantization scratch, per-row
-    /// scale/zero_point, and (for f16 output) f32 staging buffer are pooled
-    /// internally by the CPU kernel.
+    /// Always 0: the CPU kernel pools its own scratch.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 
-    /// inputs[0] = input tensor (any rank >= 1)
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

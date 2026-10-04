@@ -64,23 +64,17 @@ struct TransposeConv2DAttributes {
 /// Weight is accepted in planar NCHW format and accessed directly.
 class TransposeConv2D : public OpBase {
 public:
-    /// Create a TransposeConv2D operator for the specified backend.
     static std::unique_ptr<TransposeConv2D> create(
         const TransposeConv2DAttributes& attrs,
         Backend backend = Backend::CPU);
 
-    /// Create a TransposeConv2D operator with default attributes.
     static std::unique_ptr<TransposeConv2D> create(Backend backend = Backend::CPU) {
         return create(TransposeConv2DAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = input tensor  [N, IC, IH, IW] (NCHWC8)
-    /// inputs[1] = weight tensor [IC, OC/G, KH, KW] (planar NCHW)
-    /// inputs[2] = bias tensor   [OC] (optional, planar)
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,
@@ -92,7 +86,6 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
 
-    /// Access the transpose convolution attributes.
     const TransposeConv2DAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in transpose_conv2d.cpp (Pimpl pattern)

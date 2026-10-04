@@ -52,21 +52,17 @@ struct Conv2DAttributes {
 /// Conv2D operator (class-based API).
 ///
 /// Supports NCHW layout with grouped and dilated convolution.
-/// Input: [N, IC, IH, IW], Weight: [OC, IC/G, KH, KW] or [OC, IC/G, KH, KW] for grouped.
-/// Output: [N, OC, OH, OW].
+/// Input: [N, IC, IH, IW], Weight: [OC, IC/G, KH, KW], Output: [N, OC, OH, OW].
 /// Optional bias: [OC].
 class Conv2D : public OpBase {
 public:
-    /// Create a Conv2D operator for the specified backend.
     static std::unique_ptr<Conv2D> create(const Conv2DAttributes& attrs,
                                           Backend backend = Backend::CPU);
 
-    /// Create a Conv2D operator (same as above, convenience).
     static std::unique_ptr<Conv2D> create(Backend backend = Backend::CPU) {
         return create(Conv2DAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
@@ -76,7 +72,7 @@ public:
                             std::span<const TensorDesc> outputs) const override;
 
     /// inputs[0] = input tensor (NCHW)
-    /// inputs[1] = weight tensor (OIHW or GOIHW for grouped)
+    /// inputs[1] = weight tensor [OC, IC/G, KH, KW] — ONNX-style, also when grouped
     /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
@@ -89,7 +85,6 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
 
-    /// Access the convolution attributes.
     const Conv2DAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in conv2d.cpp (Pimpl pattern)

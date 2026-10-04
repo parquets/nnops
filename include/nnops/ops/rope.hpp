@@ -59,21 +59,16 @@ struct RoPEAttributes {
 /// the second-to-last dimension.
 class RoPE : public OpBase {
 public:
-    /// Create a RoPE operator for the specified backend.
     static std::unique_ptr<RoPE> create(const RoPEAttributes& attrs = {},
                                          Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<RoPE> create(Backend backend) {
         return create(RoPEAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = X [..., S, D]
-    /// outputs[0] = Y [..., S, D]
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

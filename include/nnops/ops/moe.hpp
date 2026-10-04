@@ -58,7 +58,7 @@ namespace nnops {
 /// and `Identity` (linear experts), which are MoE-specific.
 enum class MoEActivation : uint8_t {
     Relu     = 0,  ///< h = max(0, x)
-    Gelu     = 1,  ///< h = x * Phi(x) (Gaussian error linear unit)
+    Gelu     = 1,  ///< h ≈ x * Phi(x), tanh approximation
     Silu     = 2,  ///< h = x * sigmoid(x)  (Swish; Mixtral/Gemma default)
     Identity = 3,  ///< h = x (linear expert, no activation)
     SwiGLU   = 4,  ///< h = gate * sigmoid(alpha*gate) * (value + beta)  (see below)
@@ -205,18 +205,15 @@ struct MoEAttributes {
 /// Linear/MatMul/Attention.
 class MoE : public OpBase {
 public:
-    /// Create a MoE operator for the specified backend.
     static std::unique_ptr<MoE> create(const MoEAttributes& attrs = {},
                                        Backend backend = Backend::CPU);
 
-    /// Create with defaults (convenience).
     static std::unique_ptr<MoE> create(Backend backend = Backend::CPU) {
         return create(MoEAttributes{}, backend);
     }
 
     ~MoE();
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
@@ -237,7 +234,6 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
 
-    /// Access the MoE attributes.
     const MoEAttributes& attributes() const noexcept { return attrs_; }
 
     struct Impl;  // defined in moe.cpp (Pimpl pattern)

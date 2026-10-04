@@ -47,16 +47,13 @@ struct EmbedAttributes {
 ///                dtype = weight dtype (f32/f16), or f32/f16 when weight is int8
 class Embed : public OpBase {
 public:
-    /// Create an Embed operator for the specified backend.
     static std::unique_ptr<Embed> create(const EmbedAttributes& attrs = {},
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Embed> create(Backend backend) {
         return create(EmbedAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

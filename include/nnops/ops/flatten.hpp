@@ -36,16 +36,13 @@ struct FlattenAttributes {
 ///   - Prepare data for serialization or external consumers
 class Flatten : public OpBase {
 public:
-    /// Create a Flatten operator for the specified backend.
     static std::unique_ptr<Flatten> create(const FlattenAttributes& attrs = {},
                                             Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Flatten> create(Backend backend) {
         return create(FlattenAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 

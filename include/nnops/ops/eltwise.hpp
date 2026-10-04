@@ -33,39 +33,25 @@ struct EltwiseAttributes {
 
 /// Eltwise operator (class-based API).
 ///
-/// Element-wise binary operations on two tensors of the same shape and data type.
-///
-///   Add: output[i] = A[i] + B[i]
-///   Sub: output[i] = A[i] - B[i]
-///   Mul: output[i] = A[i] * B[i]
-///   Div: output[i] = A[i] / B[i]
-///   Min: output[i] = min(A[i], B[i])
-///   Max: output[i] = max(A[i], B[i])
-///
-/// Input:  A [*], B [*]  (same shape and dtype)
-/// Output: C [*]          (same shape and dtype)
+/// Element-wise binary operation on two tensors of the same shape and data type,
+/// chosen by EltwiseAttributes::type.
 ///
 /// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: both
 /// inputs are dequantized, the op is applied in f32, and the result is
 /// re-quantized (f32 → int). Both inputs and the output must be quantized. Only
-/// PerTensor / PerToken activation granularity is used.
+/// PerTensor / PerToken quantization granularity is supported.
 class Eltwise : public OpBase {
 public:
-    /// Create an Eltwise operator for the specified backend.
     static std::unique_ptr<Eltwise> create(const EltwiseAttributes& attrs = {},
                                             Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Eltwise> create(Backend backend) {
         return create(EltwiseAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
-    /// inputs[0] = A tensor [*]
-    /// inputs[1] = B tensor [*]  (same shape and dtype as A)
     using OpBase::compute;
 
     void compute(std::span<TensorView> outputs,

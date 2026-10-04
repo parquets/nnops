@@ -42,16 +42,13 @@ struct SliceAttributes {
 /// Output: Y [*]  (same dtype, sliced shape, planar)
 class Slice : public OpBase {
 public:
-    /// Create a Slice operator for the specified backend.
     static std::unique_ptr<Slice> create(const SliceAttributes& attrs,
                                           Backend backend = Backend::CPU);
 
-    /// Create with defaults.
     static std::unique_ptr<Slice> create(Backend backend) {
         return create(SliceAttributes{}, backend);
     }
 
-    // ---- OpBase interface ----
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
