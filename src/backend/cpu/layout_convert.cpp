@@ -9,7 +9,8 @@
 /// 8 vector loads + transpose + 8 vector stores processes 8 W-positions
 /// at once (64 elements per iteration). Works for both f32 and f16 via
 /// generic auto-deduction (v_load/v_store dispatch to the correct SIMD type).
-/// Partial (trailing) C8 blocks are zero-padded on pack and truncated on unpack.
+/// Partial (trailing) C8 blocks are zero-padded on pack and truncated on unpack
+/// (the s8/u8 byte path below pads with the activation zero point instead).
 ///
 /// Parallelism: flattens N * ceil(C/8) * [D] * H into a single loop of
 /// independent rows dispatched via ctx.cpu.run; falls back to
@@ -30,11 +31,6 @@ using namespace nnops::simd;
 namespace k = nnops::kernel;
 
 namespace {
-
-// ============================================================
-// Unified pack kernel — works for both NCHW→NCHWC8 (2D)
-// and NCDHW→NCDHWC8 (3D).
-// ============================================================
 
 template <typename T>
 void pack_impl(const TensorView& src, TensorView& dst,
@@ -78,11 +74,6 @@ void pack_impl(const TensorView& src, TensorView& dst,
     ctx.cpu.run(0, total_rows, process_row);
 }
 
-// ============================================================
-// Unified unpack kernel — works for both NCHWC8→NCHW (2D)
-// and NCDHWC8→NCDHW (3D).
-// ============================================================
-
 template <typename T>
 void unpack_impl(const TensorView& src, TensorView& dst,
                  const ComputeContext& ctx)
@@ -125,10 +116,7 @@ void unpack_impl(const TensorView& src, TensorView& dst,
 
 }  // anonymous namespace
 
-// ============================================================
-// Byte-copy pack/unpack for s8/u8 (8 channels = 8 bytes)
-// ============================================================
-//
+// Byte-copy pack/unpack for s8/u8 (8 channels = 8 bytes).
 // int8/uint8 use `v_load` → 16-lane vectors, so the 8×8 float transpose is not
 // applicable. These paths copy 8 bytes per W position directly. Pack fills pad
 // channels with the activation zero_point (so padded lanes dequantize to zero
@@ -220,10 +208,6 @@ void unpack_impl_q(const TensorView& src, TensorView& dst,
 
 }  // anonymous namespace
 
-// ============================================================
-// Public entry points — dtype dispatch
-// ============================================================
-
 void pack_nchw_to_nchwc8(const TensorView& src, TensorView& dst,
                           const ComputeContext& ctx) {
     NNOPS_ASSERT(src.data_type() == dst.data_type());
@@ -271,10 +255,6 @@ void unpack_ncdhwc8_to_ncdhw(const TensorView& src, TensorView& dst,
     default: NNOPS_ASSERT(!"unpack_ncdhwc8_to_ncdhw: unsupported data type");
     }
 }
-
-// ============================================================
-// Storage size helper
-// ============================================================
 
 size_t nchwc8_storage_bytes(const TensorDesc& logical_desc, int64_t alignment) {
     const int64_t C = logical_desc.dims[1];

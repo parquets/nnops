@@ -26,10 +26,6 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 namespace k = nnops::kernel;
 
-// ============================================================
-// Main resize implementation — N*C8 parallel dispatch
-// ============================================================
-
 template <typename T>
 void resize_impl_nchwc8(const ResizeAttributes& attrs,
                          TensorView& output,
@@ -142,15 +138,10 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
         }
     };
 
-    // Parallel dispatch (N * C8)
     const int64_t N_C8 = N * C8;
     ctx.cpu.run(0, N_C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
 }
-
-// ============================================================
-// Entry point — dtype dispatch
-// ============================================================
 
 void resize_cpu(const ResizeAttributes& attrs,
                 TensorView& output,

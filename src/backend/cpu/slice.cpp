@@ -88,7 +88,6 @@ void slice_impl(const SliceAttributes& attrs,
             in_base += in_coord * in_strides[d];
         }
 
-        // Add innermost start offset
         in_base += eff_start[static_cast<size_t>(rank - 1)];
 
         T* out_row = out_ptr + outer_idx * inner_dim;
@@ -98,7 +97,6 @@ void slice_impl(const SliceAttributes& attrs,
             std::memcpy(out_row, in_ptr + in_base,
                         static_cast<size_t>(inner_dim) * sizeof(T));
         } else {
-            // Strided access in input
             for (int64_t i = 0; i < inner_dim; ++i) {
                 out_row[i] = in_ptr[in_base + i * in_inner_step];
             }

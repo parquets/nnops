@@ -3,7 +3,6 @@
 ///
 /// Supports both f32 and f16 via templated implementation.
 /// Uses scalar selection (top-k is inherently sequential along the axis).
-/// Data loading uses generic s_load for dtype abstraction.
 ///
 /// Supports planar layouts (NCHW, NCDHW). Not for packed layouts.
 
@@ -76,7 +75,6 @@ void topk_impl(const TopKAttributes& attrs,
         for (int64_t inner = 0; inner < inner_size; ++inner) {
             int64_t i_base = outer * axis_stride * axis_dim + inner;
 
-            // Initialize with first k elements
             for (int64_t j = 0; j < k; ++j) {
                 heap[static_cast<size_t>(j)] = {
                     s_load(i_ptr + i_base + j * axis_stride), j};
@@ -87,7 +85,6 @@ void topk_impl(const TopKAttributes& attrs,
                     return worst_cmp(a.value, b.value);
                 });
 
-            // Scan remaining elements
             for (int64_t j = k; j < axis_dim; ++j) {
                 float val = s_load(i_ptr + i_base + j * axis_stride);
                 if (worst_cmp(heap[0].value, val)) {

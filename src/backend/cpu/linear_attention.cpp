@@ -39,7 +39,6 @@
 #include <cmath>
 #include <span>
 
-// Forward-declare the reference kernel for the unsupported-dtype fallback.
 namespace nnops::backend::cpu::reference {
 extern void linear_attention_ref(const LinearAttentionAttributes& attrs,
                                  std::span<TensorView> outputs,

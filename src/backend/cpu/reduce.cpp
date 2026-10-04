@@ -4,11 +4,13 @@
 /// Supports f32 and f16. Supports planar (NCHW/NCDHW) and packed (NCHWC8/NCDHWC8)
 /// layouts.
 ///
-/// Four dispatch paths:
-///   1. Packed SIMD (axis == rank-1, pack > 1): delegates to kernel::reduce_process_packed_row.
-///   2. Contiguous tail (axis == rank-1, pack == 1): delegates to kernel::reduce_process_contiguous_row.
-///   3. Inner-contiguous general axis: delegates to kernel::reduce_process_inner_contiguous_block.
-///   4. General scalar (non-contiguous inner dims or packed layout).
+/// Six dispatch paths:
+///   1.  Packed SIMD (axis == rank-1, pack > 1): delegates to kernel::reduce_process_packed_row.
+///   1b. Packed channel SIMD (axis == 1, pack > 1, NCHWC8): delegates to kernel::reduce_process_packed_channel.
+///   1c. Packed column SIMD (pack > 1, general axis): delegates to kernel::reduce_process_packed_col.
+///   2.  Contiguous tail (axis == rank-1, pack == 1): delegates to kernel::reduce_process_contiguous_row.
+///   3.  Inner-contiguous general axis: delegates to kernel::reduce_process_inner_contiguous_block.
+///   4.  General scalar (non-contiguous inner dims or packed layout).
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems().
 
@@ -28,10 +30,6 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 namespace {
-
-// ============================================================
-// Path 1: Packed SIMD — axis == rank-1, pack > 1
-// ============================================================
 
 template <typename T>
 void reduce_packed_simd(const ReduceAttributes& attrs,
@@ -59,10 +57,6 @@ void reduce_packed_simd(const ReduceAttributes& attrs,
 
     ctx.cpu.run(0, num_rows, process_row);
 }
-
-// ============================================================
-// Path 2: Contiguous tail (axis == rank-1, pack == 1)
-// ============================================================
 
 template <typename T>
 void reduce_contiguous_simd(const ReduceAttributes& attrs,
@@ -94,10 +88,6 @@ void reduce_contiguous_simd(const ReduceAttributes& attrs,
 
     ctx.cpu.run(0, num_rows, process_row);
 }
-
-// ============================================================
-// Path 3: Inner-contiguous general axis (axis < rank-1, pack == 1)
-// ============================================================
 
 template <typename T>
 void reduce_inner_contiguous_simd(const ReduceAttributes& attrs,
@@ -169,10 +159,6 @@ void reduce_inner_contiguous_simd(const ReduceAttributes& attrs,
 
     ctx.cpu.run(0, num_outer, process_outer);
 }
-
-// ============================================================
-// Path 4: General scalar (non-contiguous inner dims or packed)
-// ============================================================
 
 template <typename T>
 void reduce_general_scalar(const ReduceAttributes& attrs,
@@ -248,10 +234,6 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
 }
 
 }  // anonymous namespace
-
-// ============================================================
-// Templated dispatch (f32 and f16)
-// ============================================================
 
 template <typename T>
 void reduce_impl(const ReduceAttributes& attrs,
@@ -380,10 +362,6 @@ void reduce_impl(const ReduceAttributes& attrs,
     reduce_general_scalar<T>(attrs, output, input, axis,
                               num_outer, reduce_size, num_inner, ctx);
 }
-
-// ============================================================
-// Entry point
-// ============================================================
 
 void reduce_cpu(const ReduceAttributes& attrs,
                 TensorView& output,

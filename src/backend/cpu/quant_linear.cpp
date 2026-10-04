@@ -73,10 +73,6 @@ inline AxisDecomp decompose_axis(const TensorView& x, int64_t axis) {
 
 }  // anonymous namespace
 
-// ============================================================
-// QuantizeLinear: float → integer
-// ============================================================
-
 template <typename T>  // T = float or half (input type)
 void quantize_linear_impl(const QuantLinearAttributes& attrs,
                           TensorView& output,
@@ -182,10 +178,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         run(std::type_identity<uint8_t>{});
     }
 }
-
-// ============================================================
-// DequantizeLinear: integer → float
-// ============================================================
 
 template <typename T>  // T = float or half (output type)
 void dequantize_linear_impl(const QuantLinearAttributes& attrs,
@@ -295,10 +287,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         convert_float_to_half(output.ptr<half>(), f32_buf.data(), static_cast<int>(numel));
     }
 }
-
-// ============================================================
-// Entry points
-// ============================================================
 
 void quantize_linear_cpu(const QuantLinearAttributes& attrs,
                          TensorView& output,

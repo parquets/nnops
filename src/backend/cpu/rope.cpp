@@ -25,10 +25,6 @@ using namespace nnops::simd;
 
 namespace {
 
-// ============================================================
-// Cos/Sin table computation (float, shared across heads/batch)
-// ============================================================
-
 struct RoPESection {
     int64_t dim_start;   // inclusive
     int64_t dim_end;     // exclusive (must be even)
@@ -92,10 +88,6 @@ void compute_cos_sin_tables(
 
 }  // anonymous namespace
 
-// ============================================================
-// Templated implementation (f32 and f16)
-// ============================================================
-
 template <typename T>
 void rope_impl(const RoPEAttributes& attrs,
                TensorView& output,
@@ -150,10 +142,6 @@ void rope_impl(const RoPEAttributes& attrs,
 
     ctx.cpu.run(0, outer_count, process_outer);
 }
-
-// ============================================================
-// Entry point with dtype dispatch
-// ============================================================
 
 void rope_cpu(const RoPEAttributes& attrs,
               TensorView& output,

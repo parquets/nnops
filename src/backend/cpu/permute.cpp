@@ -7,7 +7,7 @@
 /// Optimization tiers:
 ///   1. Last-2-dims swap (rank>=2, only last 2 dims transposed):
 ///      tiled 8×8 SIMD transpose via v_transpose_8x8, batched over
-///      all leading dimensions. 2-4× speedup over scalar.
+///      all leading dimensions.
 ///      Covers: 2D transpose, batched matrix transpose (B,M,K)→(B,K,M),
 ///      NCHW↔NHCW, multi-head dim reordering, etc.
 ///   2. Inner dim contiguous (in_step==1): memcpy per output row.
@@ -21,12 +21,6 @@
 
 namespace nnops::backend::cpu {
 
-// ============================================================
-// Batched last-2-dims swap: rank >= 2, only dims (rank-2, rank-1) swapped.
-//
-// Flattens all leading dimensions into a batch count, then does a
-// 2D tiled transpose for each batch element.
-// ============================================================
 template <typename T>
 void permute_last_two_swap_impl(TensorView& output,
                                 std::span<const TensorView> inputs,
@@ -71,12 +65,6 @@ void permute_last_two_swap_impl(TensorView& output,
     ctx.cpu.run(0, batch, body);
 }
 
-// ============================================================
-// General n-D permute
-// Splits output into outer dims (0..rank-2) + inner dim (rank-1).
-// Outer dims are parallelized; inner dim is processed sequentially.
-// memcpy fast-path when innermost output dim maps to stride-1 input.
-// ============================================================
 template <typename T>
 void permute_impl(const PermuteAttributes& attrs,
                   TensorView& output,
@@ -141,7 +129,6 @@ void permute_impl(const PermuteAttributes& attrs,
             std::memcpy(out_row, in_ptr + in_base,
                         static_cast<size_t>(inner_dim) * sizeof(T));
         } else {
-            // Strided access in input
             for (int64_t i = 0; i < inner_dim; ++i) {
                 out_row[i] = in_ptr[in_base + i * in_inner_step];
             }
@@ -151,9 +138,6 @@ void permute_impl(const PermuteAttributes& attrs,
     ctx.cpu.run(0, outer_total, body);
 }
 
-// ============================================================
-// Dispatch
-// ============================================================
 void permute_cpu(const PermuteAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,

@@ -5,13 +5,6 @@
 /// Processing is tiled in groups of TILE_M rows and dispatched via
 /// ComputeContext::cpu.run when available.
 ///
-/// Design:
-///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking
-///   2. Each tile calls into tiled_unary kernel library (lane=8, v_f32x8/v_f16x8)
-///   3. Tile iteration is parallelized via ctx.cpu.run; falls back to
-///      sequential when no parallel hook is provided
-///   4. Op-type dispatch lives in the shared apply_unary_flt helper
-///
 /// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
 /// input is dequantized (int → f32), the unary op is applied in f32, and the
 /// result is re-quantized (f32 → int). Both input and output must be quantized
@@ -30,10 +23,6 @@
 #include <cstdint>
 
 namespace nnops::backend::cpu {
-
-// ============================================================
-// Op-type dispatch helper
-// ============================================================
 
 namespace {
 
@@ -66,10 +55,6 @@ void apply_unary_flt(UnaryType type, const T* in, T* out,
 
 }  // anonymous namespace
 
-// ============================================================
-// Templated implementation (f32 and f16)
-// ============================================================
-
 template <typename T>
 void unary_impl(const UnaryAttributes& attrs,
                  TensorView& output,
@@ -81,10 +66,6 @@ void unary_impl(const UnaryAttributes& attrs,
             apply_unary_flt<T>(attrs.type, in, out, m, n, in_stride, out_stride, attrs.add_to);
         });
 }
-
-// ============================================================
-// Fused quantized unary — dequantize → unary → quantize
-// ============================================================
 
 void unary_quant_impl(const UnaryAttributes& attrs,
                       TensorView& output,
@@ -99,10 +80,6 @@ void unary_quant_impl(const UnaryAttributes& attrs,
             apply_unary_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false);
         });
 }
-
-// ============================================================
-// Entry point with dtype dispatch
-// ============================================================
 
 void unary_cpu(const UnaryAttributes& attrs,
                  TensorView& output,

@@ -44,10 +44,6 @@ void pack_ncdhw_to_ncdhwc8(const TensorView& src, TensorView& dst,
 void unpack_ncdhwc8_to_ncdhw(const TensorView& src, TensorView& dst,
                               const ComputeContext& ctx = {});
 
-// ============================================================
-// Storage size helper
-// ============================================================
-
 size_t nchwc8_storage_bytes(const TensorDesc& logical_desc,
                              int64_t alignment = 32);
 

@@ -18,10 +18,6 @@ namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
 
-// ============================================================
-// Main transpose conv kernel (NCHWC8, scatter-add)
-// ============================================================
-
 template <typename T>
 void tconv2d_impl_nchwc8(
     const TransposeConv2DAttributes& attrs,
@@ -105,11 +101,9 @@ void tconv2d_impl_nchwc8(
                 const int64_t ic8 = ic / in_pack;
                 const int64_t in_lane = ic % in_pack;
 
-                // Check if this input channel falls within this output C8 block
                 for (int64_t oc_local = 0; oc_local < OC_per_G; ++oc_local) {
                     const int64_t oc = g_oc_start + oc_local;
 
-                    // Skip if output channel is not in this C8 block
                     if (oc < oc_start || oc >= oc_end) { continue; }
 
                     const int64_t w_base = ((ic * OC_per_G + oc_local) * KH) * KW;
@@ -202,16 +196,13 @@ void tconv2d_impl_nchwc8(
                 const int64_t oc_end = std::min(oc_start + out_pack, OC);
                 const int64_t num_oc = oc_end - oc_start;
 
-                // Save existing output for this (n, oc8) block
                 T* out_block = out_ptr + n * OC8 * out_ch_stride + oc8 * out_ch_stride;
                 for (int64_t i = 0; i < out_block_elems; ++i) {
                     saved[i] = out_block[i];
                 }
 
-                // Compute (zeroes output, scatter-add, applies bias+epilogue)
                 compute_sample_c8(n, oc8);
 
-                // Add saved original back to the epilogue result
                 for (int64_t oh = 0; oh < OH; ++oh) {
                     T* out_row = out_block + oh * out_row_stride;
                     const T* saved_row = saved.data() + oh * out_row_stride;
