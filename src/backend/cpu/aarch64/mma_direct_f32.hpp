@@ -456,10 +456,12 @@ inline void mma_direct_4x12_f32(
 //
 // The 4-k unroll keeps one A vector per row live across all four kk steps, so
 // the register budget is  mr*nr/4 (accumulators) + mr (A) + nr/4 (B). At nr=12
-// that is 6+3+18 = 27 vectors for mr=6, versus 35 for mr=8 — over the 32 NEON
-// registers, which makes the mr=8 kernels spill on every k. mr=6 is the largest
-// height that stays spill-free at nr=12, and its 18 accumulators are still
-// enough independent FMA chains to cover the pipeline latency.
+// that is 18+3+6 = 27 vectors for mr=6, versus 24+3+8 = 35 for mr=8 — over the
+// 32 NEON registers, which makes an *unrolled* mr=8 kernel spill on every k. So
+// mr=6 is the largest height that can unroll at nr=12; mr=8 at nr=12 is
+// spill-free only if it drops the unroll, which is what the mr=8 kernels below
+// do. Either way the accumulators are enough independent FMA chains to cover
+// the pipeline latency.
 // =========================================================================
 
 template <bool zero_mode = false>
@@ -757,6 +759,9 @@ inline void mma_direct_6x12_f32(
 
 // =========================================================================
 //  mr=8  kernels
+//
+// 8x1 and 8x4 keep the 4-k unroll (their register budget is well inside 32).
+// 8x12 does not — see the comment in its body.
 // =========================================================================
 
 template <bool zero_mode = false>
@@ -948,72 +953,16 @@ inline void mma_direct_8x12_f32(
     float32x4_t c60 = vdupq_n_f32(0.0f), c61 = vdupq_n_f32(0.0f), c62 = vdupq_n_f32(0.0f);
     float32x4_t c70 = vdupq_n_f32(0.0f), c71 = vdupq_n_f32(0.0f), c72 = vdupq_n_f32(0.0f);
 
-    int k = 0;
-    for (; k < K - 3; k += 4) {
-        const float32x4_t v_a0 = vld1q_f32(A_ptr0); A_ptr0 += 4;
-        const float32x4_t v_a1 = vld1q_f32(A_ptr1); A_ptr1 += 4;
-        const float32x4_t v_a2 = vld1q_f32(A_ptr2); A_ptr2 += 4;
-        const float32x4_t v_a3 = vld1q_f32(A_ptr3); A_ptr3 += 4;
-        const float32x4_t v_a4 = vld1q_f32(A_ptr4); A_ptr4 += 4;
-        const float32x4_t v_a5 = vld1q_f32(A_ptr5); A_ptr5 += 4;
-        const float32x4_t v_a6 = vld1q_f32(A_ptr6); A_ptr6 += 4;
-        const float32x4_t v_a7 = vld1q_f32(A_ptr7); A_ptr7 += 4;
-
-        // kk=0
-        float32x4_t v_b0 = vld1q_f32(B + 0 * ldb + 0 * 4);
-        float32x4_t v_b1 = vld1q_f32(B + 0 * ldb + 1 * 4);
-        float32x4_t v_b2 = vld1q_f32(B + 0 * ldb + 2 * 4);
-        c00 = vfmaq_laneq_f32(c00, v_b0, v_a0, 0); c01 = vfmaq_laneq_f32(c01, v_b1, v_a0, 0); c02 = vfmaq_laneq_f32(c02, v_b2, v_a0, 0);
-        c10 = vfmaq_laneq_f32(c10, v_b0, v_a1, 0); c11 = vfmaq_laneq_f32(c11, v_b1, v_a1, 0); c12 = vfmaq_laneq_f32(c12, v_b2, v_a1, 0);
-        c20 = vfmaq_laneq_f32(c20, v_b0, v_a2, 0); c21 = vfmaq_laneq_f32(c21, v_b1, v_a2, 0); c22 = vfmaq_laneq_f32(c22, v_b2, v_a2, 0);
-        c30 = vfmaq_laneq_f32(c30, v_b0, v_a3, 0); c31 = vfmaq_laneq_f32(c31, v_b1, v_a3, 0); c32 = vfmaq_laneq_f32(c32, v_b2, v_a3, 0);
-        c40 = vfmaq_laneq_f32(c40, v_b0, v_a4, 0); c41 = vfmaq_laneq_f32(c41, v_b1, v_a4, 0); c42 = vfmaq_laneq_f32(c42, v_b2, v_a4, 0);
-        c50 = vfmaq_laneq_f32(c50, v_b0, v_a5, 0); c51 = vfmaq_laneq_f32(c51, v_b1, v_a5, 0); c52 = vfmaq_laneq_f32(c52, v_b2, v_a5, 0);
-        c60 = vfmaq_laneq_f32(c60, v_b0, v_a6, 0); c61 = vfmaq_laneq_f32(c61, v_b1, v_a6, 0); c62 = vfmaq_laneq_f32(c62, v_b2, v_a6, 0);
-        c70 = vfmaq_laneq_f32(c70, v_b0, v_a7, 0); c71 = vfmaq_laneq_f32(c71, v_b1, v_a7, 0); c72 = vfmaq_laneq_f32(c72, v_b2, v_a7, 0);
-
-        // kk=1
-        v_b0 = vld1q_f32(B + 1 * ldb + 0 * 4);
-        v_b1 = vld1q_f32(B + 1 * ldb + 1 * 4);
-        v_b2 = vld1q_f32(B + 1 * ldb + 2 * 4);
-        c00 = vfmaq_laneq_f32(c00, v_b0, v_a0, 1); c01 = vfmaq_laneq_f32(c01, v_b1, v_a0, 1); c02 = vfmaq_laneq_f32(c02, v_b2, v_a0, 1);
-        c10 = vfmaq_laneq_f32(c10, v_b0, v_a1, 1); c11 = vfmaq_laneq_f32(c11, v_b1, v_a1, 1); c12 = vfmaq_laneq_f32(c12, v_b2, v_a1, 1);
-        c20 = vfmaq_laneq_f32(c20, v_b0, v_a2, 1); c21 = vfmaq_laneq_f32(c21, v_b1, v_a2, 1); c22 = vfmaq_laneq_f32(c22, v_b2, v_a2, 1);
-        c30 = vfmaq_laneq_f32(c30, v_b0, v_a3, 1); c31 = vfmaq_laneq_f32(c31, v_b1, v_a3, 1); c32 = vfmaq_laneq_f32(c32, v_b2, v_a3, 1);
-        c40 = vfmaq_laneq_f32(c40, v_b0, v_a4, 1); c41 = vfmaq_laneq_f32(c41, v_b1, v_a4, 1); c42 = vfmaq_laneq_f32(c42, v_b2, v_a4, 1);
-        c50 = vfmaq_laneq_f32(c50, v_b0, v_a5, 1); c51 = vfmaq_laneq_f32(c51, v_b1, v_a5, 1); c52 = vfmaq_laneq_f32(c52, v_b2, v_a5, 1);
-        c60 = vfmaq_laneq_f32(c60, v_b0, v_a6, 1); c61 = vfmaq_laneq_f32(c61, v_b1, v_a6, 1); c62 = vfmaq_laneq_f32(c62, v_b2, v_a6, 1);
-        c70 = vfmaq_laneq_f32(c70, v_b0, v_a7, 1); c71 = vfmaq_laneq_f32(c71, v_b1, v_a7, 1); c72 = vfmaq_laneq_f32(c72, v_b2, v_a7, 1);
-
-        // kk=2
-        v_b0 = vld1q_f32(B + 2 * ldb + 0 * 4);
-        v_b1 = vld1q_f32(B + 2 * ldb + 1 * 4);
-        v_b2 = vld1q_f32(B + 2 * ldb + 2 * 4);
-        c00 = vfmaq_laneq_f32(c00, v_b0, v_a0, 2); c01 = vfmaq_laneq_f32(c01, v_b1, v_a0, 2); c02 = vfmaq_laneq_f32(c02, v_b2, v_a0, 2);
-        c10 = vfmaq_laneq_f32(c10, v_b0, v_a1, 2); c11 = vfmaq_laneq_f32(c11, v_b1, v_a1, 2); c12 = vfmaq_laneq_f32(c12, v_b2, v_a1, 2);
-        c20 = vfmaq_laneq_f32(c20, v_b0, v_a2, 2); c21 = vfmaq_laneq_f32(c21, v_b1, v_a2, 2); c22 = vfmaq_laneq_f32(c22, v_b2, v_a2, 2);
-        c30 = vfmaq_laneq_f32(c30, v_b0, v_a3, 2); c31 = vfmaq_laneq_f32(c31, v_b1, v_a3, 2); c32 = vfmaq_laneq_f32(c32, v_b2, v_a3, 2);
-        c40 = vfmaq_laneq_f32(c40, v_b0, v_a4, 2); c41 = vfmaq_laneq_f32(c41, v_b1, v_a4, 2); c42 = vfmaq_laneq_f32(c42, v_b2, v_a4, 2);
-        c50 = vfmaq_laneq_f32(c50, v_b0, v_a5, 2); c51 = vfmaq_laneq_f32(c51, v_b1, v_a5, 2); c52 = vfmaq_laneq_f32(c52, v_b2, v_a5, 2);
-        c60 = vfmaq_laneq_f32(c60, v_b0, v_a6, 2); c61 = vfmaq_laneq_f32(c61, v_b1, v_a6, 2); c62 = vfmaq_laneq_f32(c62, v_b2, v_a6, 2);
-        c70 = vfmaq_laneq_f32(c70, v_b0, v_a7, 2); c71 = vfmaq_laneq_f32(c71, v_b1, v_a7, 2); c72 = vfmaq_laneq_f32(c72, v_b2, v_a7, 2);
-
-        // kk=3
-        v_b0 = vld1q_f32(B + 3 * ldb + 0 * 4);
-        v_b1 = vld1q_f32(B + 3 * ldb + 1 * 4);
-        v_b2 = vld1q_f32(B + 3 * ldb + 2 * 4);
-        c00 = vfmaq_laneq_f32(c00, v_b0, v_a0, 3); c01 = vfmaq_laneq_f32(c01, v_b1, v_a0, 3); c02 = vfmaq_laneq_f32(c02, v_b2, v_a0, 3);
-        c10 = vfmaq_laneq_f32(c10, v_b0, v_a1, 3); c11 = vfmaq_laneq_f32(c11, v_b1, v_a1, 3); c12 = vfmaq_laneq_f32(c12, v_b2, v_a1, 3);
-        c20 = vfmaq_laneq_f32(c20, v_b0, v_a2, 3); c21 = vfmaq_laneq_f32(c21, v_b1, v_a2, 3); c22 = vfmaq_laneq_f32(c22, v_b2, v_a2, 3);
-        c30 = vfmaq_laneq_f32(c30, v_b0, v_a3, 3); c31 = vfmaq_laneq_f32(c31, v_b1, v_a3, 3); c32 = vfmaq_laneq_f32(c32, v_b2, v_a3, 3);
-        c40 = vfmaq_laneq_f32(c40, v_b0, v_a4, 3); c41 = vfmaq_laneq_f32(c41, v_b1, v_a4, 3); c42 = vfmaq_laneq_f32(c42, v_b2, v_a4, 3);
-        c50 = vfmaq_laneq_f32(c50, v_b0, v_a5, 3); c51 = vfmaq_laneq_f32(c51, v_b1, v_a5, 3); c52 = vfmaq_laneq_f32(c52, v_b2, v_a5, 3);
-        c60 = vfmaq_laneq_f32(c60, v_b0, v_a6, 3); c61 = vfmaq_laneq_f32(c61, v_b1, v_a6, 3); c62 = vfmaq_laneq_f32(c62, v_b2, v_a6, 3);
-        c70 = vfmaq_laneq_f32(c70, v_b0, v_a7, 3); c71 = vfmaq_laneq_f32(c71, v_b1, v_a7, 3); c72 = vfmaq_laneq_f32(c72, v_b2, v_a7, 3);
-
-        B += 4 * ldb;
-    }
-    for (; k < K; ++k) {
+    // K is *not* unrolled by 4 here, unlike the other direct kernels. The unroll
+    // holds one A vector per row live across the whole k-group, and at mr=8 that
+    // plus the 24 accumulators and 3 B vectors is 35 vectors — three past the 32
+    // NEON registers, so the compiler spills in the hot loop. Measured at K=512
+    // with everything resident in L1: 22.2 ps/FMA unrolled (spilling) versus 16.0
+    // ps/FMA for the scalar form below, and 16.6 for mr=6 *with* the unroll. The
+    // unroll only pays while it still fits; once it spills it is strictly worse,
+    // and scalar also issues fewer memory ops per k (3 B vectors + 8 A lane loads
+    // = 11, against 5 loads + ~7.5 spill ops = 12.5 for the unrolled form).
+    for (int k = 0; k < K; ++k) {
         const float32x4_t v_b0 = vld1q_f32(B + 0 * 4);
         const float32x4_t v_b1 = vld1q_f32(B + 1 * 4);
         const float32x4_t v_b2 = vld1q_f32(B + 2 * 4);

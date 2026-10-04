@@ -54,16 +54,11 @@ namespace arch = aarch64;
 
 // Panel size arrays (largest-first decomposition)
 constexpr int MR_F32[3] = {arch::mr_f32[0], arch::mr_f32[1], arch::mr_f32[2]};
-// The unpacked-A ("direct") path decomposes M with its own heights: reading A
-// row-major pins one vector per row across the 4-k unroll, so aarch64 has to
-// stop at mr=6 to stay inside the 32 NEON registers (see arch::mr_f32_direct).
-constexpr int MR_F32_DIRECT[3] = {arch::mr_f32_direct[0], arch::mr_f32_direct[1], arch::mr_f32_direct[2]};
 constexpr int NR_F32[3] = {arch::nr_f32[0], arch::nr_f32[1], arch::nr_f32[2]};
 constexpr int MR_F16[3] = {arch::mr_f16[0], arch::mr_f16[1], arch::mr_f16[2]};
 constexpr int NR_F16[3] = {arch::nr_f16[0], arch::nr_f16[1], arch::nr_f16[2]};
 
 constexpr int MR_MAX_F32 = arch::mr_f32[0];
-constexpr int MR_MAX_F32_DIRECT = arch::mr_f32_direct[0];
 constexpr int NR_MAX_F32 = arch::nr_f32[0];
 constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
@@ -95,15 +90,15 @@ constexpr bool INT8_USE_U8_OFFSET = false;
 
 /// M panel height the chosen route will actually run.
 ///
-/// f16 tiles M identically on both routes, but f32 does not: packing interleaves
-/// four rows per vector (mr=8 on aarch64) while reading unpacked A pins one
-/// vector per row and has to drop to mr=6 to stay inside the register file (see
-/// arch::mr_f32_direct). Callers that model a working set must charge the height
-/// the route really uses, or a pack_a=0 GEMM is sized as if it were packing.
+/// Largest M-panel height a float tile uses. Both routes now share one MR table:
+/// packing interleaves four rows per vector (mr=8 on aarch64), and the f32 direct
+/// path reads A row-major one vector per row but its widest kernel (8x12) runs
+/// un-unrolled, which is what keeps mr=8 inside the register file. Callers that
+/// model a working set must charge this height.
 template <class T>
-constexpr int mr_max_flt(bool pack_a) {
+constexpr int mr_max_flt() {
     if constexpr (std::is_same_v<T, float>) {
-        return pack_a ? MR_MAX_F32 : MR_MAX_F32_DIRECT;
+        return MR_MAX_F32;
     } else if constexpr (std::is_same_v<T, half>) {
         return MR_MAX_F16;
     } else {

@@ -132,9 +132,11 @@ constexpr std::array<std::array<MmaDirectF32Fn, 3>, 3> mma_direct_f32_fn = {{
     {{mma_direct_4x16_f32<zero_mode>, mma_direct_4x8_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
     {{mma_direct_1x16_f32<zero_mode>, mma_direct_1x8_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
 #elif defined(NNOPS_ARCH_AARCH64)
-    // mr=6, not 8: the 8-row direct kernel keeps 35 vectors live and spills on
-    // every k. Rows here must stay consistent with MR_F32_DIRECT.
-    {{mma_direct_6x12_f32<zero_mode>, mma_direct_6x4_f32<zero_mode>, mma_direct_6x1_f32<zero_mode>}},
+    // mr=8. An unrolled 8x12 would hold 24 accumulators + 8 A + 3 B = 35
+    // vectors and spill on every k, so that kernel runs un-unrolled (see its
+    // definition); 8x4 and 8x1 are inside the budget either way. Rows here must
+    // stay consistent with MR_F32.
+    {{mma_direct_8x12_f32<zero_mode>, mma_direct_8x4_f32<zero_mode>, mma_direct_8x1_f32<zero_mode>}},
     {{mma_direct_4x12_f32<zero_mode>, mma_direct_4x4_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
     {{mma_direct_1x12_f32<zero_mode>, mma_direct_1x4_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
 #endif
@@ -398,17 +400,17 @@ void tile_mma_direct(int Mc, int Nc, int Kc,
                      float clamp_min, float clamp_max, bool zero_mode) {
     const auto& fns = zero_mode ? mma_direct_f32_fn<true> : mma_direct_f32_fn<false>;
     int m = 0;
-    for(; m + MR_F32_DIRECT[0] <= Mc; m += MR_F32_DIRECT[0]) {
+    for(; m + MR_F32[0] <= Mc; m += MR_F32[0]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, fns[0]);
     }
-    for(; m + MR_F32_DIRECT[1] <= Mc; m += MR_F32_DIRECT[1]) {
+    for(; m + MR_F32[1] <= Mc; m += MR_F32[1]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, fns[1]);
     }
-    for(; m + MR_F32_DIRECT[2] <= Mc; m += MR_F32_DIRECT[2]) {
+    for(; m + MR_F32[2] <= Mc; m += MR_F32[2]) {
         mrkcnc_mma_direct(Nc, Kc, c + m * ldc, ldc,
                           a + m * lda, lda, b, ldb,
                           clamp_min, clamp_max, fns[2]);
@@ -706,11 +708,10 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
     plan.kc = std::min<int64_t>(is_i8 ? KC_I8 : (is_f32 ? KC_F32 : KC_F16), K);
 
-    // The M panel height the route will actually run — the nc heuristic below
-    // charges the L2 working set for it, so a pack_a=0 GEMM must be sized with
-    // the direct height, not the packed one.
+    // The M panel height the tile will run — the nc heuristic below charges the
+    // L2 working set for it, so it must be the height the route really uses.
     const int  mr_panel = is_i8 ? MR_MAX_I8
-                     : (is_f32 ? mr_max_flt<float>(plan.pack_a) : mr_max_flt<half>(plan.pack_a));
+                     : (is_f32 ? mr_max_flt<float>() : mr_max_flt<half>());
     const int  nr_max = is_i8 ? NR_MAX_I8 : (is_f32 ? nr_max_flt<float>() : nr_max_flt<half>());
     const int* nr     = is_i8 ? NR_I8 : (is_f32 ? NR_F32 : NR_F16);
     const int  elem   = is_i8 ? 1

@@ -86,10 +86,10 @@ void matmul_tile(const MatMulAttributes& attrs,
                  int k, int actual_kc, bool last_k,
                  bool pack_a, const T* packed_b)
 {
-    // The packed-A panel stride is a packing concern, so it always uses the
-    // packed height even when this tile takes the unpacked-A branch below —
-    // tile_mma_direct reads A through lda and never touches ldd_a/pack_a_buf.
-    constexpr int mr_max = mr_max_flt<T>(/*pack_a=*/true);
+    // The tallest A micro-panel this tile can be packed into, which is what sizes
+    // the packed-A panel stride below. Routing is irrelevant here: tile_mma_direct
+    // reads A through lda and never touches ldd_a/pack_a_buf.
+    constexpr int mr_max = mr_max_flt<T>();
 
     // Packed A lives on the kernel stack (84 KB f32 / 42 KB f16 on aarch64,
     // 64-byte aligned). Sized by num_panels_max, not num_panels(MC_TARGET, ..):

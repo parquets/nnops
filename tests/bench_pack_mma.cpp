@@ -56,15 +56,15 @@
   #include "backend/cpu/aarch64/mma_pack_f16.hpp"
   #include "backend/cpu/aarch64/mma_direct_f16.hpp"
   using namespace nnops::backend::cpu::aarch64;
-  // The f32 pack and direct paths tile M differently: the packed layout keeps
-  // four rows per A vector and runs at mr=8, while row-major A pins one vector
-  // per row and has to drop to mr=6 to stay inside the register file. These
-  // macros must track arch::mr_f32 / arch::mr_f32_direct.
+  // f32 tiles M at the same height on both routes: the packed layout keeps four
+  // rows per A vector, and the direct 8x12 kernel runs un-unrolled so row-major
+  // A stays inside the register file too (there is no mr_f32_direct). These
+  // macros must track arch::mr_f32.
   #define NNOPS_BENCH_MMA_MR 8
-  #define NNOPS_BENCH_MMA_MR_DIRECT 6
+  #define NNOPS_BENCH_MMA_MR_DIRECT 8
   #define NNOPS_BENCH_MMA_NR 12
   #define NNOPS_BENCH_MMA_PACK   mma_pack_8x12_f32<false>
-  #define NNOPS_BENCH_MMA_DIRECT mma_direct_6x12_f32<false>
+  #define NNOPS_BENCH_MMA_DIRECT mma_direct_8x12_f32<false>
   // f16 has no such split: both routes use mr=8, nr=16 (there is no
   // mr_f16_direct), so pack-vs-direct here is purely the kernel + copy.
   #define NNOPS_BENCH_MMA_F16_MR 8

@@ -339,13 +339,10 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
 //  Values must match mma_pack_f32.hpp kernel set.
 // =========================================================================
 
-/// @brief f32 LHS micro-panel heights.
+/// @brief f32 LHS micro-panel heights, shared by both routes.
+/// The 6-row direct kernels already match the pack side, and AVX2's 16 ymm
+/// registers leave no room for a taller tile anyway.
 inline constexpr int mr_f32[3] = {6, 4, 1};
-
-/// @brief f32 LHS panel heights for the unpacked-A (direct) path.
-/// Identical to mr_f32 here: the 6-row direct kernels already match the pack
-/// side, and AVX2's 16 ymm registers leave no room for a taller tile anyway.
-inline constexpr int mr_f32_direct[3] = {6, 4, 1};
 
 /// @brief f32 RHS micro-panel widths.
 inline constexpr int nr_f32[3] = {16, 8, 1};

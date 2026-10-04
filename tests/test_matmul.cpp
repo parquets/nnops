@@ -1439,8 +1439,8 @@ NNOPS_TEST(matmul_padded_a_stride_correctness) {
 NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
     // The complement of matmul_padded_a_stride_correctness: a *compact*
     // non-transposed A stays on the unpacked-A (pack_a=0) route, and that route
-    // decomposes M with its own panel heights — MR_F32_DIRECT, {6,4,1}, so Mc
-    // splits as 6a + 4b + 1c. Walk M across that boundary and K across both the
+    // decomposes M by the shared MR_F32 table, {8,4,1} on aarch64, so Mc splits
+    // as 8a + 4b + 1c. Walk M across that boundary and K across both the
     // 4-wide inner unroll and KC_F32, so the tall tile, the 4/1 remainder
     // kernels and the scalar k-tail are each checked against the reference.
     // N walks the nr panel widths too — the kernel is selected per (mr, nr), so
