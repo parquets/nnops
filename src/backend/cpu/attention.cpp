@@ -1,17 +1,6 @@
 /// @file attention.cpp
 /// @brief Tiled multi-head scaled dot-product attention — fused QK^T + softmax + AV.
 ///
-/// For each (batch, head) — parallel via ctx.cpu.run (serial fallback):
-///   scores = Q @ K^T * scale   (transpose-B GEMM: K^T packed into the workspace)
-///   scores += mask             (optional, flat [Sq, Sk] as in the reference)
-///   attn   = softmax(scores)   (simd_softmax, per contiguous row, in-place)
-///   output = attn @ V          (direct GEMM, V raw K×N)
-///
-/// Both GEMMs reuse the tile_mma_direct / tile_pack_rhs micro-kernel dispatch
-/// from matmul_helper.h. A Q/K/V/O head slice is an M×K / N×K / K×N / M×N
-/// submatrix of the planar tensor, for both merged [B, S, H*D] and explicit
-/// [B, H, S, D] layouts (a head's D columns are contiguous within each row).
-///
 /// The scale factor is fused into the GEMM1 RHS pack, so scores accumulate
 /// Q·K^T·scale directly. The GEMM kernels accumulate C += A×B, so the scores
 /// buffer is zeroed before GEMM1 and the output head is zeroed before GEMM2
@@ -25,8 +14,8 @@
 /// mirroring MLAS's q_chunk_count task decomposition, so long-sequence prefill
 /// still exposes ample parallelism even when B × H is small.
 ///
-/// Grouped-query attention (attrs.num_group) is not yet handled — this runs
-/// standard MHA (one head block per (batch, head)), matching the reference.
+/// See attention.h for the per-(batch, head) algorithm, the layout contract
+/// and the scratch layout.
 
 #include "attention.h"
 #include "matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs + panel constants

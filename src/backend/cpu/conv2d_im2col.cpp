@@ -11,13 +11,8 @@
 ///           tile += weight[ocnc, K] × col_data[K, roi_area]  (tile_mma_direct)
 ///           (after the last ic-block) apply the epilogue in-place
 ///
-/// Work is split at (batch, group) granularity and, when that under-subscribes
-/// the thread pool (the common batch=1 / groups=1 case), the oh-blocks are
-/// partitioned into parallel chunks. Scratch is indexed by thread id when the
-/// backend reports worker ids (one slot per thread, reused across every task a
-/// thread claims); otherwise each parallel task owns its own col_data scratch.
-/// Output tiles are disjoint either way, so the result is bit-identical to
-/// serial execution.
+/// See conv2d_im2col.h for the work split, the scratch layout, the bias /
+/// epilogue / add_to semantics and the shared plan.
 
 #include "conv2d_im2col.h"
 #include "matmul_helper.h"                 // tile_mma_direct + arch panel constants
