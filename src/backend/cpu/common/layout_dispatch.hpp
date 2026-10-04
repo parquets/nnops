@@ -15,7 +15,7 @@
 ///   }
 ///
 ///   size_t Operator::getWorkspaceSize(...) const override {
-///       return layout_dispatch_workspace(inputs[0], outputs[0]);
+///       return layout_dispatch_workspace(inputs[0].desc(), outputs[0].desc());
 ///   }
 
 #include "nnops/core/tensor_view.hpp"
@@ -26,10 +26,6 @@
 #include <span>
 
 namespace nnops::backend::cpu {
-
-// ============================================================
-// LayoutDispatch — encodes the 4-path dispatch decision
-// ============================================================
 
 struct LayoutDispatch {
     bool in_packed;
@@ -49,16 +45,13 @@ struct LayoutDispatch {
     bool needs_workspace() const { return in_packed || out_packed; }
 };
 
-// ============================================================
-// dispatch_layout — single-kernel dispatch with auto-conversion
-// ============================================================
-
 /// Route a compute call through layout conversion as needed.
 ///
 /// `kernel` is the operator's compute function. It always receives NCHW
 /// (unpacked) inputs and produces NCHW outputs. This function transparently
-/// unpacks channel-packed inputs before calling the kernel and packs the
-/// output after if the user requested a packed output layout.
+/// unpacks the channel-packed first input (inputs[0]) before calling the
+/// kernel, and packs the output after if the user requested a packed output
+/// layout.
 ///
 /// Workspace layout (when needed):
 ///   [temp_input buffer (if in_packed)] [temp_output buffer (if out_packed)]
@@ -83,7 +76,6 @@ void dispatch_layout(const LayoutDispatch& ld,
     const int64_t elem_size = static_cast<int64_t>(
         data_type_size(inputs[0].data_type()));
 
-    // --- Unpack input if needed ---
     std::span<const TensorView> effective_inputs = inputs;
     if (ld.needs_input_unpack()) {
         const auto& input = inputs[0];
@@ -95,7 +87,6 @@ void dispatch_layout(const LayoutDispatch& ld,
         ws += in_bytes;
     }
 
-    // --- Allocate temp output if needed ---
     TensorView effective_output = output;
     if (ld.needs_output_pack()) {
         int64_t out_bytes = output.numel() * elem_size;
@@ -104,19 +95,13 @@ void dispatch_layout(const LayoutDispatch& ld,
                                        ws, TensorLayout::NCHW);
     }
 
-    // --- Compute in NCHW space ---
     kernel(effective_output, effective_inputs, ctx,
            /* remaining workspace — only for kernel's own use */ nullptr);
 
-    // --- Pack output if needed ---
     if (ld.needs_output_pack()) {
         pack_nchw_to_nchwc8(effective_output, output, ctx);
     }
 }
-
-// ============================================================
-// Workspace sizing
-// ============================================================
 
 /// Compute workspace bytes needed for layout conversion temp buffers.
 inline size_t layout_dispatch_workspace(const TensorDesc& input,
@@ -129,12 +114,10 @@ inline size_t layout_dispatch_workspace(const TensorDesc& input,
     const auto elem_size = data_type_size(input.dtype);
     size_t ws = 0;
 
-    // Temp buffer for unpacking input (if input is packed)
     if (ld.needs_input_unpack()) {
         ws += static_cast<size_t>(input.numel()) * elem_size;
     }
 
-    // Temp buffer for packing output (if output is packed)
     if (ld.needs_output_pack()) {
         ws += static_cast<size_t>(output.numel()) * elem_size;
     }

@@ -40,10 +40,6 @@ namespace quant_kernel = x86_64;
 namespace quant_kernel = aarch64;
 #endif
 
-// ============================================================
-// Parallel dispatch + row geometry
-// ============================================================
-
 /// Run `body(i)` for i in [0, count) — parallelized when a hook is installed,
 /// sequential otherwise. The canonical replacement for the per-operator
 /// `ctx.cpu.run(0, count, body)` idiom.
@@ -69,10 +65,6 @@ inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& o
     const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;
     return { last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems() };
 }
-
-// ============================================================
-// Tiled float dispatch (f32 / f16)
-// ============================================================
 
 /// Row-tiled float transform for a unary op. `apply` receives the base pointers
 /// of a ≤TILE_M-row tile and its row strides, and runs the op over it.
@@ -123,10 +115,6 @@ void tiled_float_transform2(const TensorView& a, const TensorView& b, TensorView
     };
     run_parallel(ctx, num_tiles, body);
 }
-
-// ============================================================
-// Fused quantized transform — dequantize → op → quantize
-// ============================================================
 
 /// Fill per-row scale/zero arrays for a ≤TILE_H-row tile of a quantized tensor.
 inline void fill_quant_row_params(const QuantParams& qp, bool per_token,

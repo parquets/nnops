@@ -195,7 +195,7 @@ void* MemoryPool::allocate(size_t size) {
 void MemoryPool::deallocate(void* ptr) noexcept {
     if (ptr == nullptr) { return; }
     PoolHeader* h = static_cast<PoolHeader*>(ptr) - 1;
-    NNOPS_ASSERT(h->magic == kMagic);  // double-free / foreign pointer
+    NNOPS_ASSERT(h->magic == kMagic);  // foreign pointer / corrupted header
     const size_t size = h->size;       // read before h is possibly recycled below
 
     if (!h->pooled) {

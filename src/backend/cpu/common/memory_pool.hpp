@@ -47,8 +47,9 @@ public:
     void* allocate(size_t size);
 
     /// Return a block previously obtained from allocate(). nullptr is a no-op.
-    /// The block must have come from this pool; passing a foreign pointer or
-    /// freeing twice is a programmer error (asserted in debug builds).
+    /// The block must have come from this pool; a foreign pointer trips the
+    /// block's magic-tag assert in debug builds. Freeing the same block twice
+    /// is a programmer error but is not detected.
     void deallocate(void* ptr) noexcept;
 
     /// Allocate @p count elements of type T, 64-byte aligned.
