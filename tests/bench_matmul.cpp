@@ -145,7 +145,7 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // --- static metadata from the plan (mirrors matmul_kernel) ---
+    // --- static metadata from the plan (mirrors matmul_cpu) ---
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
@@ -239,7 +239,7 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // Static metadata from the plan, exactly as matmul_kernel builds it. The
+    // Static metadata from the plan, exactly as matmul_cpu builds it. The
     // int8 path is plan-driven like fp, so mc/nc/blocks are what the kernel
     // actually runs — resolvable only for a given pool size. Report the largest
     // pool in the row: those numbers describe the (fastest) run printed last,

@@ -22,7 +22,7 @@ namespace nnops::backend::cpu {
 /// pooled internally (sized by the plan); @p workspace is vestigial.
 ///
 /// Falls back to the reference kernel for non-f32/f16 dtypes.
-void matmul_kernel(const MatMulAttributes& attrs,
+void matmul_cpu(const MatMulAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,

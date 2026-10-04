@@ -18,7 +18,7 @@
 /// with top-K > 1 a token belongs to K *different* experts, which run on
 /// different workers.
 ///
-/// The per-expert GEMMs reuse the library's tiled `matmul_kernel` with a
+/// The per-expert GEMMs reuse the library's tiled `matmul_cpu` with a
 /// *default-constructed* ComputeContext, so the inner GEMM stays sequential and
 /// does not nest a second parallel region inside phase A.
 
@@ -108,7 +108,7 @@ void expert_gemm(const T* a, int64_t M, int64_t K,
 
     const TensorView ins[] = {a_view, b_view};
     const ComputeContext serial_ctx;  // no hooks -> inner GEMM runs sequentially
-    matmul_kernel(mm, c_view, ins, serial_ctx, nullptr);
+    matmul_cpu(mm, c_view, ins, serial_ctx, nullptr);
 }
 
 /// Add a per-expert bias vector to every row of an [M,N] block, in f32.

@@ -508,7 +508,7 @@ void matmul_block_int8(const MatMulAttributes& attrs,
 /// Plan-driven int8 dispatch: per-token A × per-channel W, raw int32 accumulate,
 /// then a single epilogue pass that applies zero-point compensation (and, for an
 /// s8 output, requantization). Packed B lives in the plan's workspace; for an s8
-/// output the int32 accumulator sits after it (sized by matmul_kernel — it is a
+/// output the int32 accumulator sits after it (sized by matmul_cpu — it is a
 /// property of the output, not of the packed-B layout).
 void matmul_dispatch_int8(const MatMulAttributes& attrs,
                           TensorView& output,
@@ -747,7 +747,7 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
 //  Public API
 // =========================================================================
 
-void matmul_kernel(const MatMulAttributes& attrs,
+void matmul_cpu(const MatMulAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,
