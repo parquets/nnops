@@ -8,14 +8,6 @@
 /// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
 /// A single unified kernel handles both 2D and 3D: the KD loop is always present;
 /// for 2D, KD=1 so it degenerates to a single no-op iteration.
-///
-/// Key design decisions (following the pooling.cpp pattern):
-///   1. Single DwConvParams struct with full 3D fields — 2D uses KD=1/OD=1/ID=1.
-///   2. Single set of h4/h1 SIMD kernels with built-in KD loop.
-///   3. Dispatch has od loop; for 2D, OD=1 so it runs once.
-///   4. All C8 blocks use SIMD — pad channels are zero.
-///   5. N*C8 parallel dispatch.
-///   6. Weights loaded as vectors (8 channels at once) from prepacked buffer.
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -124,7 +116,6 @@ void dwconv_impl_nchwc8(
         }
     };
 
-    // Parallel dispatch (N * C8)
     const int64_t N_C8 = N * C8;
     ctx.cpu.run(0, N_C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });

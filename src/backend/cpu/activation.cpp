@@ -6,12 +6,6 @@
 /// Processing is tiled in groups of TILE_M rows and dispatched via
 /// ComputeContext::cpu.run.
 ///
-/// Design:
-///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking
-///   2. Each tile calls into tiled_activation kernel library
-///   3. Tile iteration is parallelized via ctx.cpu.run
-///   4. Op-type dispatch lives in the shared apply_activation_flt helper
-///
 /// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
 /// input is dequantized (int → f32), the activation is applied in f32, and the
 /// result is re-quantized (f32 → int). Both input and output must be quantized
@@ -53,10 +47,6 @@ void apply_activation_flt(ActivationType type, const T* in, T* out,
 
 }  // anonymous namespace
 
-// ============================================================
-// Templated implementation (f32 and f16)
-// ============================================================
-
 template <typename T>
 void activation_impl(const ActivationAttributes& attrs,
                      TensorView& output,
@@ -69,10 +59,6 @@ void activation_impl(const ActivationAttributes& attrs,
                                     attrs.add_to, attrs.alpha, attrs.beta);
         });
 }
-
-// ============================================================
-// Fused quantized activation — dequantize → activation → quantize
-// ============================================================
 
 void activation_quant_impl(const ActivationAttributes& attrs,
                            TensorView& output,
@@ -88,10 +74,6 @@ void activation_quant_impl(const ActivationAttributes& attrs,
                                         attrs.alpha, attrs.beta);
         });
 }
-
-// ============================================================
-// Main entry point with dtype dispatch
-// ============================================================
 
 void activation_cpu(const ActivationAttributes& attrs,
                      TensorView& output,

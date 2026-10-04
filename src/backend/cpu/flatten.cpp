@@ -35,14 +35,11 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
     const auto* i_ptr = input.ptr<T>();
     const int64_t i_w_stride = input.stride_elems(rank - 1);
 
-    // ---- Fast path: already dense planar → single memcpy ----
     if (pack == 1 && input.row_stride_elems() == oW) {
         size_t total_bytes = static_cast<size_t>(output.numel()) * sizeof(T);
         std::memcpy(o_ptr, i_ptr, total_bytes);
         return;
     }
-
-    // ---- General path: row-by-row SIMD copy ----
 
     int64_t num_logical_rows = 1;
     for (int64_t d = 0; d < rank - 1; ++d) {
@@ -69,7 +66,6 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
             }
         }
 
-        // SIMD copy within the row
         int64_t w = 0;
         if (i_w_stride == 1 && pack == 1) {
             // Planar input: contiguous row → SIMD vector copy

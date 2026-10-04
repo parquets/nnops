@@ -9,7 +9,6 @@
 
 namespace nnops::backend::cpu {
 
-// Forward-declare reference kernel
 namespace reference {
     void causal_attention_ref(const CausalAttentionAttributes& attrs,
                                std::span<TensorView> outputs,
@@ -24,10 +23,9 @@ void causal_attention_cpu(const CausalAttentionAttributes& attrs,
                            const ComputeContext& ctx,
                            void* /*workspace*/)
 {
-    // Delegate to reference for all combinations; SIMD optimizations will be
-    // added per (ComputeT, CacheT) pair. The reference materializes a per-
-    // (batch, head) scores buffer, which is pooled internally (getWorkspaceSize
-    // returns 0). Sized once, before the parallel dispatch.
+    // The reference materializes a per-(batch, head) scores buffer, which is
+    // pooled internally (getWorkspaceSize returns 0). Sized once, before the
+    // parallel dispatch.
     const int64_t B      = inputs[0].shape(0);
     const int64_t H      = attrs.num_heads;
     const int64_t Sq     = attrs.max_chunk_size;

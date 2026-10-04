@@ -38,10 +38,6 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 
 namespace {
 
-// ============================================================
-// Direct lookup (f32/f16 weight)
-// ============================================================
-
 template <typename T>
 void embed_direct_impl(const EmbedAttributes& /*attrs*/,
                         TensorView& output,
@@ -73,7 +69,6 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
             idx = static_cast<const int32_t*>(indices.ptr<void>())[n];
         }
 
-        // Clamp to valid range
         if (idx < 0) {
             idx = 0;
         }
@@ -81,7 +76,6 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
             idx = V - 1;
         }
 
-        // Copy weight[idx, :] to output[n, :]
         std::memcpy(out_ptr + n * out_row_stride,
                     weight_ptr + idx * w_row_stride,
                     row_bytes);
@@ -90,10 +84,6 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
     ctx.cpu.run(0, num_indices, body);
 }
 
-// ============================================================
-// Int8/uint8 lookup with per-row dequantization → f32 or f16
-// ============================================================
-//
 // The per-row dequant arithmetic is delegated to the raw arch kernels in
 // `x86_64/quant.hpp` (AVX2+FMA) / `aarch64/quant.hpp` (NEON):
 // `quant_kernel::dequantization<T>`. The f32 overload writes f32 output; the
@@ -165,10 +155,6 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
 }
 
 }  // anonymous namespace
-
-// ============================================================
-// Entry point with dtype dispatch
-// ============================================================
 
 void embed_cpu(const EmbedAttributes& attrs,
                  TensorView& output,

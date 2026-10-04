@@ -3,7 +3,6 @@
 ///
 /// Supports both f32 and f16 via templated implementation.
 /// Uses scalar reduction (argminmax is inherently sequential along the axis).
-/// Data loading uses generic s_load for dtype abstraction.
 
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/detail/simd/simd.hpp"

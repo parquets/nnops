@@ -101,7 +101,6 @@ void concat_packed_c_axis(TensorView& output,
         }
     }
 
-    // Iterate over spatial positions
     for (int64_t n = 0; n < oN; ++n) {
         for (int64_t d = 0; d < oD; ++d) {
             for (int64_t h = 0; h < oH; ++h) {

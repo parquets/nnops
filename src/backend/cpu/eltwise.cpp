@@ -5,13 +5,6 @@
 /// Processing is tiled in groups of TILE_M rows and dispatched via
 /// ComputeContext::cpu.run.
 ///
-/// Design:
-///   1. Rows are grouped into tiles of TILE_M (32) for SIMD-friendly blocking
-///   2. Each tile calls into tiled_eltwise kernel library (lane=8, v_f32x8/v_f16x8)
-///   3. Tile iteration is parallelized via ctx.cpu.run; falls back to
-///      sequential when no parallel hook is provided
-///   4. Op-type dispatch lives in the shared apply_eltwise_flt helper
-///
 /// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: both
 /// inputs are dequantized (int → f32), the binary op is applied in f32, and the
 /// result is re-quantized (f32 → int). Both inputs and the output must be
@@ -51,10 +44,6 @@ void apply_eltwise_flt(EltwiseType type, const T* a, const T* b, T* out,
 
 }  // anonymous namespace
 
-// ============================================================
-// Templated implementation (f32 and f16)
-// ============================================================
-
 template <typename T>
 void eltwise_impl(const EltwiseAttributes& attrs,
                    TensorView& output,
@@ -69,10 +58,6 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         });
 }
 
-// ============================================================
-// Fused quantized eltwise — dequantize → op → quantize
-// ============================================================
-
 void eltwise_quant_impl(const EltwiseAttributes& attrs,
                         TensorView& output,
                         std::span<const TensorView> inputs,
@@ -86,10 +71,6 @@ void eltwise_quant_impl(const EltwiseAttributes& attrs,
             apply_eltwise_flt<float>(attrs.type, a, b, a, h, w, w, w, w, false);
         });
 }
-
-// ============================================================
-// Entry point with dtype dispatch
-// ============================================================
 
 void eltwise_cpu(const EltwiseAttributes& attrs,
                    TensorView& output,
