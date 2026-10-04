@@ -112,6 +112,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/flatten_ref.cpp
     backend/cpu/reference/transpose_conv2d_ref.cpp
     backend/cpu/reference/moe_ref.cpp
+    backend/cpu/reference/linear_attention_ref.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})
