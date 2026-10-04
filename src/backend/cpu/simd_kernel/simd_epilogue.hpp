@@ -22,6 +22,8 @@ inline float apply_epilogue(const Epilogue& ep, float x) {
         return x;
     case EpilogueActivateType::Relu:
         return x > 0.0f ? x : 0.0f;
+    case EpilogueActivateType::Relu6:
+        return std::min(std::max(x, 0.0f), 6.0f);
     case EpilogueActivateType::LeakyRelu:
         return x > 0.0f ? x : ep.alpha * x;
     case EpilogueActivateType::Sigmoid:
@@ -117,6 +119,8 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
         return vx;
     case EpilogueActivateType::Relu:
         return v_relu(vx, v_zero(type_tag));
+    case EpilogueActivateType::Relu6:
+        return v_min(v_max(vx, v_zero(type_tag)), v_set1(type_tag, 6.0f));
     case EpilogueActivateType::LeakyRelu:
         return v_leaky_relu(vx, v_zero(type_tag),
                                  v_set1(type_tag, ep.alpha));

@@ -30,6 +30,8 @@ __device__ inline float device_apply_epilogue(
         return x;
     case EpilogueActivateType::Relu:
         return fmaxf(x, 0.0f);
+    case EpilogueActivateType::Relu6:
+        return fminf(fmaxf(x, 0.0f), 6.0f);
     case EpilogueActivateType::LeakyRelu:
         return (x > 0.0f) ? x : alpha * x;
     case EpilogueActivateType::Sigmoid:

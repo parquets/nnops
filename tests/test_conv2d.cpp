@@ -9,6 +9,7 @@
 #include "common/compare.hpp"
 
 #include <vector>
+#include <algorithm>
 #include <cstring>
 #include <cstdint>
 #include <cmath>
@@ -612,6 +613,51 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
     for (int64_t i = 0; i < out_numel; ++i) {
         NNOPS_EXPECT_NEAR(fast_buf[i], ref_buf[i], 1e-4f);
     }
+}
+
+NNOPS_TEST(conv2d_im2col_epilogue_relu6) {
+    // Relu6 is a pure clamp of bias + Σ. The fast path and conv2d_ref share
+    // apply_epilogue, so comparing them proves nothing here — compare against
+    // the same convolution run with no epilogue, clamped by hand instead.
+    const int64_t ishape[] = {1, 3, 12, 12};
+    const int64_t wshape[] = {6, 3, 3, 3};
+    const int64_t bshape[] = {6};
+
+    auto [in_vec, input]  = test::make_random_tensor(ishape, -1.0f, 1.0f, 95);
+    auto [w_vec, weight]  = test::make_random_tensor(wshape, -2.0f, 2.0f, 96);
+    auto [b_vec, bias]    = test::make_random_tensor(bshape, -1.0f, 1.0f, 97);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride  = {1, 1};
+    attrs.padding = {1, 1};
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc(), bias.desc()};
+    std::vector<TensorView> ins   = {input, weight, bias};
+
+    auto out_descs = Conv2D::create(attrs, Backend::CPU)->getOutputTensorDesc(descs);
+    const int64_t out_numel = out_descs[0].numel();
+
+    std::vector<float> plain_buf(static_cast<size_t>(out_numel));
+    auto plain_out = test::make_planar(out_descs[0], plain_buf.data());
+    auto plain_op = Conv2D::create(attrs, Backend::CPU);
+    plain_op->compute(plain_out, ins, {}, nullptr);
+
+    attrs.epilogue.type = EpilogueActivateType::Relu6;
+    std::vector<float> relu6_buf(static_cast<size_t>(out_numel));
+    auto relu6_out = test::make_planar(out_descs[0], relu6_buf.data());
+    auto relu6_op = Conv2D::create(attrs, Backend::CPU);
+    relu6_op->compute(relu6_out, ins, {}, nullptr);
+
+    int64_t below_lo = 0, above_hi = 0;
+    for (int64_t i = 0; i < out_numel; ++i) {
+        const float want = std::min(std::max(plain_buf[i], 0.0f), 6.0f);
+        NNOPS_EXPECT_NEAR(relu6_buf[i], want, 1e-4f);
+        below_lo += (plain_buf[i] < 0.0f);
+        above_hi += (plain_buf[i] > 6.0f);
+    }
+    // Both clamp bounds must actually bite, otherwise the case is vacuous.
+    NNOPS_EXPECT_TRUE(below_lo > 0 && above_hi > 0);
 }
 
 NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
