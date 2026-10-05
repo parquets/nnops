@@ -215,27 +215,27 @@ inline bool gemm_is_small(int64_t M, int64_t N, int64_t K) noexcept {
     return M * N * K < GEMM_FAST_PATH_THRESHOLD;
 }
 
-/// Number of panels for the largest-first decomposition of `n` into the three
-/// sizes nr[0] >= nr[1] >= nr[2] (== 1). This is what the pack/MMA loops
+/// Number of panels for the largest-first decomposition of `n` into the
+/// `levels` sizes nr[0] >= ... >= nr[levels-1] (the last == 1; 3 by default,
+/// 4 for the int8 lists). This is what the pack/MMA loops
 /// actually emit, so workspace sizing must match it exactly (a simple
 /// ceil(n / nr[0]) under-counts when the tail decomposes into nr=1 panels).
-constexpr int num_panels(int n, const int* nr) noexcept {
+/// Written as the quotient chain rather than the stepwise loop the pack runs:
+/// taking nr[s] panels while they fit leaves `rem % nr[s]` behind, so the two are
+/// the same count, in O(levels) instead of O(n / nr[0]) steps.
+constexpr int num_panels(int n, const int* nr, int levels = 3) noexcept {
     int count = 0;
-    int i = 0;
-    for (int s = 0; s < 3; ++s) {
-        for (; i + nr[s] <= n; i += nr[s]) { ++count; }
+    int rem   = n;
+    for (int s = 0; s < levels; ++s) {
+        count += rem / nr[s];
+        rem   %= nr[s];
     }
     return count;
 }
 
 /// 4-level variant for the int8 NR lists ({16,8,4,1} / {12,8,4,1}).
 constexpr int num_panels4(int n, const int* nr) noexcept {
-    int count = 0;
-    int i = 0;
-    for (int s = 0; s < 4; ++s) {
-        for (; i + nr[s] <= n; i += nr[s]) { ++count; }
-    }
-    return count;
+    return num_panels(n, nr, 4);
 }
 
 /// Largest `num_panels()` over every mc in [1, n].
@@ -250,24 +250,31 @@ constexpr int num_panels4(int n, const int* nr) noexcept {
 ///
 /// Anything holding the panels of an arbitrary mc <= MC_TARGET (the on-stack
 /// packed-A tile) must size with this maximum, not with num_panels(n, mr).
-constexpr int num_panels_max(int n, const int* mr) noexcept {
-    int worst = 0;
-    for (int mc = 1; mc <= n; ++mc) {
-        const int c = num_panels(mc, mr);
-        worst = c > worst ? c : worst;
-    }
-    return worst;
+///
+/// Computed in closed form rather than by scanning [1, n]: the scan is
+/// O(n*levels) and runs on the per-plan path (n = the tile width, up to NC_MAX —
+/// ~2.6 us for {12,4,1} at n=1024, which is more than a small GEMM's whole
+/// kernel), while this is O(levels).
+///
+/// Any m <= n decomposes as a*nr[0] + r with a <= q = n/nr[0]. For a == q the
+/// remainder is capped at s = n%nr[0]; for a <= q-1 it runs up to nr[0]-1, and
+/// among those a = q-1 dominates. So the maximum is at one of two points —
+/// the two branches below — and the remainder is the same question one level
+/// down, which is the recursion.
+constexpr int num_panels_max(int n, const int* nr, int levels = 3) noexcept {
+    if (n <= 0 || levels <= 0) { return 0; }
+    const int step = nr[0];
+    const int q    = n / step;
+    if (q == 0) { return num_panels_max(n, nr + 1, levels - 1); }
+    const int at_q    = q + num_panels_max(n - q * step, nr + 1, levels - 1);
+    const int below_q = (q - 1) + num_panels_max(step - 1, nr + 1, levels - 1);
+    return at_q > below_q ? at_q : below_q;
 }
 
 /// 4-level `num_panels_max` for the int8 NR lists ({16,8,4,1} / {12,8,4,1}) —
 /// same non-monotonicity, one more level to decompose (see num_panels4).
 constexpr int num_panels_max4(int n, const int* nr) noexcept {
-    int worst = 0;
-    for (int mc = 1; mc <= n; ++mc) {
-        const int c = num_panels4(mc, nr);
-        worst = c > worst ? c : worst;
-    }
-    return worst;
+    return num_panels_max(n, nr, 4);
 }
 
 /// Stack-resident packed-A buffer size (elements) for one MC_TARGET×Kc tile at

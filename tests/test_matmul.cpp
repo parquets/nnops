@@ -1723,6 +1723,46 @@ NNOPS_TEST(matmul_packed_a_stack_holds_every_tile_height) {
     }
 }
 
+NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
+    namespace cpu = nnops::backend::cpu;
+
+    // num_panels/num_panels4 and num_panels_max/num_panels_max4 are now closed
+    // forms of the loops they used to run: "take nr[s] panels while they fit"
+    // leaves `rem % nr[s]` behind, so that loop is the quotient chain; and the
+    // largest count over every width in [1, n] sits at one of two points (a full
+    // q = n/nr[0], or a short q-1 with a worst-case remainder) rather than
+    // anywhere in the range.
+    //
+    // The rewrite is what takes the per-plan path from O(n*levels) to
+    // O(levels) — the scan ran at n = the tile width (up to NC_MAX) on every
+    // get_matmul_plan and every attention tile sizing, 2.6 us at n = 1024 for
+    // {12,4,1}. It is worth exactly nothing if the recursion is wrong, so pin
+    // both identities against the loops themselves, for every NR/MR list the
+    // kernels use, past every width the tiling heuristic can ask for.
+    auto stepwise = [](int n, const int* nr, int levels) {
+        int count = 0;
+        int i = 0;
+        for (int s = 0; s < levels; ++s) {
+            for (; i + nr[s] <= n; i += nr[s]) { ++count; }
+        }
+        return count;
+    };
+
+    struct List { const int* nr; int levels; };
+    for (const List& l : {List{cpu::MR_F32, 3}, List{cpu::MR_F16, 3}, List{cpu::NR_F32, 3},
+                          List{cpu::NR_F16, 3}, List{cpu::MR_I8, 3},  List{cpu::NR_I8, 4}}) {
+        for (int n = 1; n <= 8192; ++n) {
+            NNOPS_EXPECT_EQ(cpu::num_panels(n, l.nr, l.levels), stepwise(n, l.nr, l.levels));
+            int worst = 0;
+            for (int mc = 1; mc <= n; ++mc) {
+                const int c = stepwise(mc, l.nr, l.levels);
+                worst = c > worst ? c : worst;
+            }
+            NNOPS_EXPECT_EQ(cpu::num_panels_max(n, l.nr, l.levels), worst);
+        }
+    }
+}
+
 NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
     namespace cpu = nnops::backend::cpu;
 
