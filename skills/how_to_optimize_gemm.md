@@ -76,10 +76,13 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
   `K` elems/row for a non-transposed A, `M` for a transposed one). It does not
   affect the workspace size, which depends only on N, Kc, dtype and the NR panel
   list.
-- **Thread-count invariant sizing.** Each block owns `num_panels(nc, nr)` packed-B
-  panels at a uniform 64-byte-aligned full-Kc stride, so the packed-B footprint is
-  `num_panels(N, nr) × ldd_b × elem` — independent of the thread count. See §7 for
-  what that one slice maps onto in each split.
+- **Sizing follows the split, and comes from the plan.** The packed-B region is
+  `num_slots × np_slice × ldd_b × elem`, every panel at a uniform 64-byte-aligned
+  full-Kc stride: on the M-split `np_slice = num_panels(N, nr)` with one slot per
+  concurrent m-block, on the N-split `np_slice = num_panels_max(nc, nr)` with one
+  slot per n-block (`ceil(N/nc)`). Neither the dispatch nor the workspace test
+  recomputes these — `np_slice` is carried in the plan for exactly that reason.
+  See §7 for what a slot maps onto in each split.
 
 ---
 
@@ -95,7 +98,7 @@ it maximises the tile's arithmetic intensity
 AI = 2·mc·nc·kc / (mc·kc + nc·kc + mc·nc)
 ```
 
-subject to four constraints, all of which the tile must satisfy:
+subject to four constraints on the tile itself:
 
 1. **Aggregate L2** — the `num_threads` concurrent blocks' packed A and B fit
    half of the shared L2:
@@ -125,8 +128,16 @@ snapped to the grids and clamped by the shape and the split:
 split_n :  mc = snap24(min(mc_t, M))
            nc = balance_tile(N, nc_t, 48, nt)
 else    :  mc = balance_tile(M, mc_t, 24, nt)
-           nc = snap48(min(nc_t, N))
+           nc = min(nc_t, N)
 ```
+
+The split side is the one the pool divides, so it is the one balanced; the other
+spans whole and is only bounded by the ceiling and the shape. Both branches then
+finish `nc` the same way: `round_nc_target` (down to a 48 multiple when the tile
+is at least that wide, else to an `nr_max` multiple — that alone is already exact
+for the panel grid) and `clamp_nc` into `[nr_max, N]`. `s` is clamped to
+`[MC_ALIGN + NC_ALIGN, 2·MC_MAX]`, so even a huge budget starts from a tile the
+ceiling can hold.
 
 `balance_tile` is the fifth constraint, and the one that only exists because
 blocks are handed out to a pool:
@@ -141,13 +152,35 @@ tile  = min(tile, cap_a)
 
 It keeps the block count a multiple of the worker count, so no worker ends up
 with a double-length share while another idles. At `nt == 1` it short-circuits to
-`cap_a` — with one worker there is no balance to strike. The split side is the one
-balanced: `mc` when the split is on M, `nc` when it is on N.
+`cap_a` — with one worker there is no balance to strike.
 
 Rounding the count *up* can pull the tile below what the budget allows — 8192 rows
 in 24 blocks is 360, not the 504 the L2 budget would give — so balancing trades
-some AI for even work distribution. That is the trade the paired A/B asked for:
-without it, the 768 ceiling made 2T and 4T *slower* than the old flat-144 rule.
+some AI for even work distribution. Measured (Release, 7 interleaved paired
+rounds, median over cases, win counts), balanced vs the same rule with
+`balance_tile` neutered:
+
+| T | ratio | wins |
+|---|---|---|
+| 1 | 0.975–1.015 | 1–3/7 — flat, the hard gate |
+| 2 | 1.327 | 6–7/7 |
+| 4 | 1.450 | 5–6/7 |
+| 8 | 1.059 | 6/7 (one 256³ case 0.887) |
+| 10 | 0.914 | 0–2/7 |
+
+Without it, `mc` at the 768 ceiling gave M = 1024 two blocks for *any* thread
+count — two workers idle, two running double — which the earlier unbalanced-vs-HEAD
+run measured at 0.81 / 0.72 for 2T / 4T. Chained onto that, the whole change is
+roughly 2T +8%, 4T +4%, 1T −1%, 10T −8%. The 10T loss is the same mechanism
+pointing the other way: balanced coarser blocks fit `nt` exactly, the old finer
+ones kept 11 blocks on 8–10 threads. ≥8T was previously written off as
+unmeasurable on this fanless M4, so it is left as a known cost rather than tuned
+to — but it is 0–2/7 wins with ratios clustered in 0.905–0.972 over seven shapes,
+so it is not noise (same-binary 3v3 null control: median 0.98, IQR 0.88–1.03).
+
+With `kc` pinned (attention's path) the same code runs with `s = C / kc` in place
+of `2·isqrt(C)` — the objective is monotonic in `mc == nc` once `kc` is fixed, so
+the tile simply takes the whole budget — and the re-derivation below is skipped.
 
 `kc` is re-derived from the `mc + nc` the routing actually produced — so a shape
 that shrinks `mc` gets the freed budget back into `kc` — and clamped to the L1
@@ -172,19 +205,21 @@ is 1365 at 1T and still 266 at 8T, so the unconstrained optimum is unreachable a
 the cap, not the budget, decides `kc`. That is the deliberate cost of the shorter
 k-block (§2.2): the three-heuristic scheme this replaced sat at a flat **AI 169**
 on every f32 shape (`nc` pinned below its L2 target by a 1024 cap, `mc` a fixed
-144), and the rule beats it comfortably at 1T–4T but not at 8T, where rounding the
-block count up to 24 pulls `mc` from 504 to 360. What the rule is *for* is the
-block count tracking the pool — 11/12/12/23 blocks for 1/2/4/8 workers instead of
-the old 57 — which is the effect the paired A/B measured.
+144), and the new rule's AI beats that comfortably at 1T–4T but not at 8T, where
+rounding the block count up to 24 pulls `mc` from 504 to 360. What the rule is
+*for* is the block count tracking the pool — 11/12/12/23 blocks for 1/2/4/8 workers
+instead of the old 57.
 
 **Alignment.** `NC_ALIGN = 48 = lcm(12, 16)` is the `nr_max` grid across both
-arches; `MC_ALIGN = 24 = lcm(6, 8)` is the `mr_max` grid. Aligning `mc` to 48 would
-break M-split exactness (M = 1024 @ 8T: `min(480, 128)` should snap to 96 for 8
-even blocks, not to 48 for 11 ragged ones).
+arches, so a 48-aligned `nc` decomposes into whole B panels; `MC_ALIGN = 24 =
+lcm(6, 8)` is the `mr_max` grid, so a 24-aligned `mc` leaves no partial A panel
+either way. The two differ because the panel lists do: 48 is the widest `nr_max`
+the fp pack can be handed, while `mc` decomposes into `mr_max` panels — aligning
+`mc` to 48 would only coarsen the even share `balance_tile` is trying to hit.
 
 ### 2.2 Per-dtype Kc cap
 
-The formula above predicts `kc` in the hundreds for the small-element dtypes,
+The formula above asks for `kc` in the high hundreds to thousands on every dtype,
 because `esz` makes the model see more room than the kernel can actually use:
 
 | dtype | `kc_cap` | Why the cap |
@@ -222,12 +257,17 @@ rule in §2.1; the only per-dtype inputs are `mr_max`, `nr_max`, `esz` and
 
 ---
 
-## 3. Runtime L2 Cache Detection
+## 3. Runtime Cache Detection
+
+The tile rule (§2.1) has exactly two machine inputs, both read here:
+`l1_cache_size()` for the prefetch bound and `l2_shared_cache_size()` for the
+residency budget.
 
 ### 3.1 x86_64: CPUID Leaf 4
 
 Intel/AMD CPUs report deterministic cache parameters via CPUID leaf 4.
-We iterate sub-leaves looking for a Level-2 cache of type Data (1) or Unified (3):
+We iterate sub-leaves looking for the L1D (Level 1, type Data) and the L2
+(Level 2, type Data or Unified):
 
 ```text
 Size = Ways × Partitions × LineSize × Sets
@@ -248,11 +288,22 @@ the OS, per platform:
   `/sys/devices/system/cpu/cpu0/cache/index2/size` (parsing the K/M/G suffix).
 - **Windows ARM64:** `GetLogicalProcessorInformation`, first `RelationCache` with
   `Level == 2`.
-- **macOS:** `sysctlbyname("hw.l2cachesize")`.
+- **macOS:** `sysctlbyname("hw.l2cachesize")`, plus `hw.l1dcachesize` for the L1
+  and `hw.perflevel0.l2cachesize` for the shared L2 (below).
 
-256 KB is the **fallback** when every query fails (or the header says nothing
-detects a size), not the aarch64 default. Under-provisioning Nc only costs reuse;
-it never over-subscribes the scratch.
+**Apple's `hw.l2cachesize` is the efficiency cluster's L2** — 4 MiB on an M4,
+against 16 MiB on the performance cluster — so the residency budget would size
+itself against a cache four times smaller than the one the work runs in.
+`l2_shared_cache_size()` is the accessor that asks for the P cluster explicitly
+(`hw.perflevel0.l2cachesize`) and falls back to `l2_cache_size()` where the two
+cannot differ. `hw.l1dcachesize` has the mirror-image property: it reports the
+*E* cluster's L1D (64 KiB vs the P cluster's 128 KiB), which is the useful one
+because workers land on either cluster and a working set sized for the bigger
+one overflows on the E cores.
+
+Two fallbacks, both deliberately conservative: 32 KB for the L1 (typical x86 L1D)
+and 256 KB for the L2 when every query fails (not the aarch64 default). Under-
+provisioning only costs reuse; it never over-subscribes the scratch.
 
 ---
 
@@ -401,10 +452,14 @@ the M-split.
 - **No barriers, no reductions.** Each block writes a disjoint C tile; the k-loop is
   independent per thread. The result is **bit-identical to serial** — the thread
   count does not change any output value (asserted by `matmul_threaded_matches_serial`).
-- **Nc shrinks with the thread count.** On the N-split with more than one thread,
-  `nc = min(N / num_threads, nc_cap)`. Without that, the L2-derived `nc`
-  (224/228 for f32) would leave an N = 1024 GEMM with only `ceil(1024/224) = 5`
-  blocks regardless of pool size; the division brings it to 8 blocks at 8 threads.
+- **The block count is a multiple of the worker count.** The split side's tile is
+  not `larger / num_threads` any more — it is `balance_tile`'s even share of a
+  block count rounded *up* to `nt` (§2.1), so every worker gets the same number of
+  blocks instead of some idling while others run double. This is the constraint
+  that made the 768 ceiling affordable: without it, M = 1024 resolved to `mc = 768`
+  and 2 blocks at *any* pool size. The alignment round-up can still hand back one
+  block fewer than targeted (8192 rows over 8 workers targets 24 blocks, gets 23),
+  so the count is a target, not a guarantee.
 - **Workspace slicing.** The packed-B footprint is always
   `num_panels(N, nr) × ldd_b × elem` (see §1.3), but what that one slice maps onto
   differs by split:
@@ -453,20 +508,25 @@ the M-split.
    also restated in prose in each pack/MMA file's header comment — they are ISA
    facts, so each file stays readable without cross-referencing.
 
-5. **Runtime L2 detection, not compile-time.** Hardcoding L2 size to a lowest-common
-   denominator wastes cache on larger CPUs. The CPUID path adds ~10 lines of code
-   and pays for itself on any CPU with > 256 KB L2.
+5. **Runtime cache detection, not compile-time.** Hardcoding a cache size to a
+   lowest-common denominator wastes cache on larger CPUs, and on a hybrid part the
+   *wrong cluster's* size is worse than a conservative one: Apple's
+   `hw.l2cachesize` is the efficiency cluster's 4 MiB, a quarter of the 16 MiB the
+   work runs in. The CPUID path adds ~10 lines of code and pays for itself on any
+   CPU with > 256 KB L2.
 
 6. **Mc/Nc/Kc are one derivation, not three heuristics.** Earlier the three came
    from separate rules that shared an L2 budget without knowing about each other:
    `nc` from a single-block working set capped at 1024, `kc` from a
    `num_threads`-blocks-in-half-of-L2 rule capped at 256, and `mc` a flat 144.
    They are now picked together by `choose_matmul_tile` (§2.1) to maximise the
-   tile's arithmetic intensity subject to the aggregate-L2, L1-prefetch,
-   ceiling, alignment and block-count-balancing constraints. The packed-A region is sized
-   `num_panels_max(mc, mr) × ldd_a` from the plan's own `mc` — worst-case panel
-   counts exceed `num_panels(mc, mr)` because the greedy decomposition is not
-   monotonic in `mc` (24k − 1 needs 3k + 3 panels, 24k only 3k).
+   tile's arithmetic intensity subject to the aggregate-L2, L1-prefetch, ceiling
+   and alignment constraints — plus `balance_tile`, which keeps the block count a
+   multiple of the worker count and is what makes a large tile affordable. The
+   packed-A region is sized `num_panels_max(mc, mr) × ldd_a` from the plan's own
+   `mc` — worst-case panel counts exceed `num_panels(mc, mr)` because the greedy
+   decomposition is not monotonic in `mc` (24k − 1 needs 3k + 3 panels, 24k only
+   3k).
 
 ---
 
