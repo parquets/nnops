@@ -114,7 +114,7 @@ constexpr int nr_max_flt() {
     } else if constexpr (std::is_same_v<T, half>) {
         return NR_MAX_F16;
     } else {
-        static_assert(std::is_same_v<T, float> || std::is_same_v<T  , half>, "Unsupported type");
+        static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>, "Unsupported type");
     }
 }
 
@@ -145,10 +145,8 @@ constexpr int64_t KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 //     (mr_max + 2·nr_max) · kc · elem_bytes  <  L1          (next-B prefetch)
 //     mc <= MC_MAX,  nc <= NC_MAX
 //
-// The three dimensions used to be three independent heuristics that shared this
-// budget without knowing about each other — a flat MC_TARGET, an nc capped at
-// NC_MAX regardless of thread count, and a kc clamped at MATMUL_KC_MAX. They are
-// now the limits of the one problem rather than its answer.
+// These are limits on one problem, not three independent heuristics. Derivation
+// and the measured A/B: skills/how_to_optimize_gemm.md §2.1.
 
 /// Ceiling on both tile dimensions.
 constexpr int64_t MC_MAX = 768;
@@ -166,15 +164,14 @@ constexpr int NC_ALIGN = 48;
 constexpr int64_t KC_MIN   = 128;
 constexpr int64_t KC_ALIGN = 32;
 
-/// Per-dtype kc ceilings. f32 and f16 share one; int8 keeps its historical 512.
-/// The aggregate model would otherwise ask for 1344+ on int8 — with
-/// elem_bytes == 1 it sees room the pack and the s8 accumulator actually use.
+/// Per-dtype kc ceilings (int8 keeps its historical 512; the aggregate model
+/// would otherwise ask for 1344+ there, since elem_bytes == 1 understates what
+/// the pack and the s8 accumulator use).
 ///
-/// 128 on the float paths is not a budget limit but a length limit: the aarch64
-/// f16 kernel accumulates in f16, so kc is how many products round into the
+/// 128 on the float paths is a length limit, not a budget one: the aarch64 f16
+/// kernel accumulates in f16, so kc is how many products round into the
 /// accumulator before the C read-modify-write. At K = 4096, kc 128 -> 256 moved
-/// the worst deviation 0.183 -> 0.230 (relative to an output magnitude of ~80,
-/// 0.23% -> 0.29%); the shorter block is kept.
+/// the worst deviation 0.183 -> 0.230 (~0.23% -> 0.29% of an output of ~80).
 constexpr int64_t KC_CAP_F32 = 128;
 constexpr int64_t KC_CAP_F16 = 128;
 constexpr int64_t KC_CAP_I8  = 512;
@@ -234,13 +231,13 @@ inline int64_t kc_prefetch_bound(int mr_max, int nr_max, int elem_bytes,
 ///
 /// Maximising reuse alone picks a tile so wide that the dimension splits into
 /// fewer blocks than there are workers: at 4 workers a 1024-row M resolved to
-/// mc = 768 (2 blocks), so two workers idled while the other two ran double
-/// (measured 0.72x against the previous rule, and the same at 2 workers with 3
-/// blocks). Targeting a block count that is a multiple of @p nt keeps every
-/// worker at the same number of blocks instead.
+/// mc = 768 (2 blocks), so two workers idled while two ran double — 0.72x
+/// against the previous rule, and the same at 2 workers with 3 blocks.
+/// Targeting a block count that is a multiple of @p nt keeps every worker at
+/// the same number of blocks instead.
 ///
-/// One worker is exempt: with a single thread there is nothing to balance, so the
-/// tile stays at the cap and the dimension is only clamped to fit.
+/// One worker is exempt: there is nothing to balance, so the tile stays at the
+/// cap and the dimension is only clamped to fit.
 inline int64_t balance_tile(int64_t dim, int64_t cap, int64_t align,
                             int64_t nt) noexcept {
     if (dim <= 0) { return 1; }
@@ -427,16 +424,11 @@ constexpr int num_panels4(int n, const int* nr) noexcept {
 /// Anything holding the panels of an arbitrary height (the packed-A tile) must
 /// size with this maximum, not with num_panels(n, mr).
 ///
-/// Computed in closed form rather than by scanning [1, n]: the scan is
-/// O(n*levels) and runs on the per-plan path (n = the tile width, up to NC_MAX —
-/// ~2.6 us for {12,4,1} at n=1024, which is more than a small GEMM's whole
-/// kernel), while this is O(levels).
-///
-/// Any m <= n decomposes as a*nr[0] + r with a <= q = n/nr[0]. For a == q the
-/// remainder is capped at s = n%nr[0]; for a <= q-1 it runs up to nr[0]-1, and
-/// among those a = q-1 dominates. So the maximum is at one of two points —
-/// the two branches below — and the remainder is the same question one level
-/// down, which is the recursion.
+/// Closed form rather than a scan of [1, n]: the scan is O(n*levels) on the
+/// per-plan path (~2.6 us for {12,4,1} at n=1024, more than a small GEMM's whole
+/// kernel), while this is O(levels). The maximum sits at one of the two branches
+/// below — the quotient, or one step under it — and the remainder is the same
+/// question one level down.
 constexpr int num_panels_max(int n, const int* nr, int levels = 3) noexcept {
     if (n <= 0 || levels <= 0) { return 0; }
     const int step = nr[0];
@@ -452,21 +444,6 @@ constexpr int num_panels_max(int n, const int* nr, int levels = 3) noexcept {
 constexpr int num_panels_max4(int n, const int* nr) noexcept {
     return num_panels_max(n, nr, 4);
 }
-
-/// The kernel's packed-A tile lives in the plan's workspace, not on the stack:
-/// one region of `num_slots_a` slots, each holding `num_panels_max(mc, MR)`
-/// panels at the plan's full-kc panel stride (see MatMulPlan::np_a/ldd_a).
-///
-/// It is sized from the plan's own mc and kc rather than from a fixed target
-/// tile and k-block, which is what makes the region a bound instead of a worst
-/// case: every per-block tile has `actual_mc <= mc` and `actual_kc <= kc`. The
-/// panel count must still be num_panels_max and not num_panels(mc, ..) — the
-/// greedy decomposition is not monotonic in the tile height, so a *shorter*
-/// tile can need more panels than the height it is sized for.
-///
-/// The stride is in bytes for int8 (1 byte/elem) and in elements for fp; both
-/// go through align_up<PANEL_ALIGN_BYTES>, so every slot and the region itself
-/// are 64-byte aligned, which is what the pack/MMA kernels assume.
 
 // ---- public API --------------------------------------------------------
 //
@@ -537,9 +514,14 @@ struct MatMulPlan {
     int64_t workspace_size;   // total scratch bytes: packed B, then packed A
 
     // Packed-A region, which begins at pack_a_offset — the end of the packed-B
-    // region — and runs to workspace_size. ldd_a, np_a and num_slots_a are all
-    // zero when !pack_a: the direct-A route never touches the buffer, so it pays
-    // nothing for it, and pack_a_offset is then just the end of packed B.
+    // region — and runs to workspace_size. It holds num_slots_a slots of np_a
+    // panels each at the ldd_a stride; the stride is in elements for fp and in
+    // bytes for int8, and both go through align_up<PANEL_ALIGN_BYTES>, so every
+    // slot and the region are 64-byte aligned, which is what the pack/MMA
+    // kernels assume. Sized from the plan's own mc and kc, so it is a bound and
+    // not a worst case: any block has actual_mc <= mc and actual_kc <= kc.
+    // ldd_a, np_a and num_slots_a are all zero when !pack_a: the direct-A route
+    // never touches the buffer, so pack_a_offset is then just the end of B.
     int64_t ldd_a;            // panel stride at full kc (elements; bytes for int8)
     int64_t np_a;             // panels one packed-A tile holds (num_panels_max(mc, MR))
     int64_t num_slots_a;      // packed-A slots (see get_matmul_plan)

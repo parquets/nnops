@@ -68,6 +68,76 @@ inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept {
            attrs.epilogue.type != EpilogueActivateType::Relu;
 }
 
+/// M, N and K of the product, honouring the transpose flags.
+struct MatMulDims { int64_t M, N, K; };
+
+inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
+                              const TensorView& a, const TensorView& b) noexcept {
+    return { attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
+             attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1),
+             attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };
+}
+
+/// Broadcast A's and B's batch dimensions (same rule as matmul_ref) and walk the
+/// flattened batch index back out to per-operand element offsets.
+struct BatchWalk {
+    const TensorView* a;
+    const TensorView* b;
+    int64_t ndim  = 0;
+    int64_t total = 1;
+    std::vector<int64_t> a_shape, b_shape, out_shape;
+
+    BatchWalk(const TensorView& a_, const TensorView& b_) : a(&a_), b(&b_) {
+        const int64_t a_dims = a->rank() - 2;
+        const int64_t b_dims = b->rank() - 2;
+        ndim = std::max(a_dims, b_dims);
+        a_shape.assign(static_cast<size_t>(ndim), 1);
+        b_shape.assign(static_cast<size_t>(ndim), 1);
+        out_shape.assign(static_cast<size_t>(ndim), 1);
+
+        for (int64_t i = 0; i < a_dims; ++i) a_shape[ndim - a_dims + i] = a->shape(i);
+        for (int64_t i = 0; i < b_dims; ++i) b_shape[ndim - b_dims + i] = b->shape(i);
+
+        for (int64_t i = 0; i < ndim; ++i) {
+            const int64_t da = a_shape[i];
+            const int64_t db = b_shape[i];
+            if (da == db || db == 1) {
+                out_shape[i] = da;
+            } else if (da == 1) {
+                out_shape[i] = db;
+            } else {
+                NNOPS_ASSERT(!"MatMul: incompatible batch dimensions for broadcast");
+            }
+            total *= out_shape[i];
+        }
+    }
+
+    void offsets(int64_t bi, const TensorView& out,
+                 int64_t& a_off, int64_t& b_off, int64_t& c_off) const {
+        a_off = 0;
+        b_off = 0;
+        c_off = 0;
+        for (int64_t d = ndim - 1; d >= 0; --d) {
+            const int64_t coord = bi % out_shape[d];
+            bi /= out_shape[d];
+
+            const int64_t a_dim = d - (ndim - (a->rank() - 2));
+            if (a_dim >= 0) {
+                const int64_t a_coord = (a_shape[d] == 1) ? 0 : coord;
+                a_off += a_coord * a->stride_elems(a_dim);
+            }
+
+            const int64_t b_dim = d - (ndim - (b->rank() - 2));
+            if (b_dim >= 0) {
+                const int64_t b_coord = (b_shape[d] == 1) ? 0 : coord;
+                b_off += b_coord * b->stride_elems(b_dim);
+            }
+
+            c_off += coord * out.stride_elems(d);
+        }
+    }
+};
+
 // =========================================================================
 //  Tile-block kernels — one call processes one (m-range × n-range) tile
 // =========================================================================
@@ -188,11 +258,7 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
     const auto& a = inputs[0];
     const auto& b = inputs[1];
 
-    const int64_t a_rank = a.rank();
-    const int64_t b_rank = b.rank();
-    const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
-    const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
-    const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
+    const auto [M, N, K] = matmul_dims(attrs, a, b);
 
     // Fast path (f32 only): tiny GEMMs (M*N*K < 1024) skip the tiled/packed
     // machinery and go straight to the reference. f16 has no reference kernel,
@@ -233,67 +299,15 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
     // the packed B for the full N at one k-block stride, so both paths fit in
     // the same buffer.
 
-    // Broadcast batch dimensions (same logic as matmul_ref).
-    const int64_t batch_a_dims = a_rank - 2;
-    const int64_t batch_b_dims = b_rank - 2;
-    const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
-
-    std::vector<int64_t> batch_a_shape(batch_ndim, 1);
-    std::vector<int64_t> batch_b_shape(batch_ndim, 1);
-    std::vector<int64_t> batch_out_shape(batch_ndim, 1);
-
-    for (int64_t i = 0; i < batch_a_dims; ++i) {
-        batch_a_shape[batch_ndim - batch_a_dims + i] = a.shape(i);
-    }
-    for (int64_t i = 0; i < batch_b_dims; ++i) {
-        batch_b_shape[batch_ndim - batch_b_dims + i] = b.shape(i);
-    }
-
-    int64_t total_batch = 1;
-    for (int64_t i = 0; i < batch_ndim; ++i) {
-        const int64_t da = batch_a_shape[i];
-        const int64_t db = batch_b_shape[i];
-        if (da == db) {
-            batch_out_shape[i] = da;
-        } else if (da == 1) {
-            batch_out_shape[i] = db;
-        } else if (db == 1) {
-            batch_out_shape[i] = da;
-        } else {
-            NNOPS_ASSERT(!"MatMul: incompatible batch dimensions for broadcast");
-        }
-        total_batch *= batch_out_shape[i];
-    }
+    const BatchWalk batch(a, b);
 
     const int Mi = static_cast<int>(M);
     const int Ni = static_cast<int>(N);
     const int Ki = static_cast<int>(K);
 
-    for (int64_t bi = 0; bi < total_batch; ++bi) {
-        // Unflatten batch index → multi-dimensional coords.
-        int64_t rem = bi;
-        int64_t a_offset = 0;
-        int64_t b_offset = 0;
-        int64_t c_offset = 0;
-
-        for (int64_t d = batch_ndim - 1; d >= 0; --d) {
-            const int64_t coord = rem % batch_out_shape[d];
-            rem /= batch_out_shape[d];
-
-            const int64_t a_dim = d - (batch_ndim - batch_a_dims);
-            if (a_dim >= 0) {
-                const int64_t a_coord = (batch_a_shape[d] == 1) ? 0 : coord;
-                a_offset += a_coord * a.stride_elems(a_dim);
-            }
-
-            const int64_t b_dim = d - (batch_ndim - batch_b_dims);
-            if (b_dim >= 0) {
-                const int64_t b_coord = (batch_b_shape[d] == 1) ? 0 : coord;
-                b_offset += b_coord * b.stride_elems(b_dim);
-            }
-
-            c_offset += coord * output.stride_elems(d);
-        }
+    for (int64_t bi = 0; bi < batch.total; ++bi) {
+        int64_t a_offset, b_offset, c_offset;
+        batch.offsets(bi, output, a_offset, b_offset, c_offset);
 
         T* c_p = c_base + c_offset;
         const T* a_p = a_base + a_offset;
@@ -373,86 +387,66 @@ inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
-/// Raw int8 row/column reductions needed by the epilogue:
+/// Raw int8 reductions needed by the epilogue:
 ///   r_a[m] = Σ_k A[m,k] (or A[k,m] if transpose_a)
 ///   r_b[n] = Σ_k B[k,n] (or B[n,k] if transpose_b)
 ///
-/// When the sum runs *down a column* of the physical layout (transpose_a, or a
-/// non-transposed B) the naive per-output form strides by the row pitch, so
-/// every element is a fresh cache line. Sweeping along the row and accumulating
-/// instead — the transposed layout's axis order — touches the same bytes but
-/// contiguously. The sum is unchanged: int32 accumulates of int8 products
-/// cannot overflow for any K this kernel accepts, and integer addition is
-/// associative, so the result stays bit-identical to the reference.
-///
-/// The output index is split into contiguous slabs so the whole thing runs on
+/// Split into contiguous slabs of the output index so the whole thing runs on
 /// the pool; slabs are disjoint, so no atomics or per-thread partials are
-/// needed.
+/// needed. int32 accumulates of int8 products cannot overflow for any K this
+/// kernel accepts, and integer addition is associative, so the result stays
+/// bit-identical to the reference either way round.
+
+/// r[i] = Σ_j p[j*ld + i]. The output index is the contiguous one, so the sum
+/// sweeps the outer axis and accumulates across a slab of outputs — the
+/// transposed physical layout's axis order, which is why it beats the naive
+/// per-output form (that one strides by the row pitch, a fresh cache line per
+/// element).
+void reduce_cols(const int8_t* p, int64_t ld, int64_t n_out, int64_t n_in,
+                 int32_t* r, const ComputeContext& ctx) {
+    const int64_t tasks = std::min<int64_t>(n_out,
+        std::max<int64_t>(ctx.cpu.thread_count(), 1));
+    ctx.cpu.run(0, tasks, [&](int64_t t) {
+        const int64_t i0 = t * n_out / tasks;
+        const int64_t i1 = (t + 1) * n_out / tasks;
+        for (int64_t i = i0; i < i1; ++i) r[i] = 0;
+        for (int64_t j = 0; j < n_in; ++j) {
+            const int8_t* row = p + j * ld;
+            for (int64_t i = i0; i < i1; ++i) r[i] += row[i];
+        }
+    });
+}
+
+/// r[i] = Σ_j p[i*ld + j]. Each output is already a contiguous row sum.
+void reduce_rows(const int8_t* p, int64_t ld, int64_t n_out, int64_t n_in,
+                 int32_t* r, const ComputeContext& ctx) {
+    const int64_t tasks = std::min<int64_t>(n_out,
+        std::max<int64_t>(ctx.cpu.thread_count(), 1));
+    ctx.cpu.run(0, tasks, [&](int64_t t) {
+        const int64_t i0 = t * n_out / tasks;
+        const int64_t i1 = (t + 1) * n_out / tasks;
+        for (int64_t i = i0; i < i1; ++i) {
+            const int8_t* row = p + i * ld;
+            int32_t s = 0;
+            for (int64_t j = 0; j < n_in; ++j) s += row[j];
+            r[i] = s;
+        }
+    });
+}
+
+/// A physical is K×M when transposed (sum down a column), M×K otherwise (row
+/// sums); B is the mirror image.
 void compute_int8_reductions(const int8_t* a_ptr, int64_t lda,
                              const int8_t* b_ptr, int64_t ldb,
                              const MatMulAttributes& attrs,
                              int64_t M, int64_t N, int64_t K,
                              int32_t* r_a, int32_t* r_b,
                              const ComputeContext& ctx) {
-    const int64_t nt = std::max<int64_t>(ctx.cpu.thread_count(), 1);
+    if (attrs.transpose_a) reduce_cols(a_ptr, lda, M, K, r_a, ctx);
+    else                   reduce_rows(a_ptr, lda, M, K, r_a, ctx);
 
-    // ---- r_a: one output per A row ----
-    if (attrs.transpose_a) {
-        // A physical is K×M: the sum runs down a column, so sweep k and
-        // accumulate across a contiguous slab of m.
-        const int64_t tasks = std::min<int64_t>(M, nt);
-        ctx.cpu.run(0, tasks, [&](int64_t t) {
-            const int64_t m0 = t * M / tasks;
-            const int64_t m1 = (t + 1) * M / tasks;
-            for (int64_t m = m0; m < m1; ++m) r_a[m] = 0;
-            for (int64_t k = 0; k < K; ++k) {
-                const int8_t* row = a_ptr + k * lda;
-                for (int64_t m = m0; m < m1; ++m) r_a[m] += row[m];
-            }
-        });
-    } else {
-        // A physical is M×K: each row is already contiguous.
-        const int64_t tasks = std::min<int64_t>(M, nt);
-        ctx.cpu.run(0, tasks, [&](int64_t t) {
-            const int64_t m0 = t * M / tasks;
-            const int64_t m1 = (t + 1) * M / tasks;
-            for (int64_t m = m0; m < m1; ++m) {
-                const int8_t* row = a_ptr + m * lda;
-                int32_t s = 0;
-                for (int64_t k = 0; k < K; ++k) s += row[k];
-                r_a[m] = s;
-            }
-        });
-    }
-
-    // ---- r_b: one output per B column ----
-    if (attrs.transpose_b) {
-        // B physical is N×K: each row is already contiguous.
-        const int64_t tasks = std::min<int64_t>(N, nt);
-        ctx.cpu.run(0, tasks, [&](int64_t t) {
-            const int64_t n0 = t * N / tasks;
-            const int64_t n1 = (t + 1) * N / tasks;
-            for (int64_t n = n0; n < n1; ++n) {
-                const int8_t* row = b_ptr + n * ldb;
-                int32_t s = 0;
-                for (int64_t k = 0; k < K; ++k) s += row[k];
-                r_b[n] = s;
-            }
-        });
-    } else {
-        // B physical is K×N: the sum runs down a column, so sweep k and
-        // accumulate across a contiguous slab of n.
-        const int64_t tasks = std::min<int64_t>(N, nt);
-        ctx.cpu.run(0, tasks, [&](int64_t t) {
-            const int64_t n0 = t * N / tasks;
-            const int64_t n1 = (t + 1) * N / tasks;
-            for (int64_t n = n0; n < n1; ++n) r_b[n] = 0;
-            for (int64_t k = 0; k < K; ++k) {
-                const int8_t* row = b_ptr + k * ldb;
-                for (int64_t n = n0; n < n1; ++n) r_b[n] += row[n];
-            }
-        });
-    }
+    if (attrs.transpose_b) reduce_rows(b_ptr, ldb, N, K, r_b, ctx);
+    else                   reduce_cols(b_ptr, ldb, N, K, r_b, ctx);
 }
 
 /// Compute the m-panels of a single k-block against a packed-B slice (s8×s8).
@@ -536,11 +530,7 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     const auto& a = inputs[0];
     const auto& b = inputs[1];
 
-    const int64_t a_rank = a.rank();
-    const int64_t b_rank = b.rank();
-    const int64_t M  = attrs.transpose_a ? a.shape(a_rank - 1) : a.shape(a_rank - 2);
-    const int64_t N  = attrs.transpose_b ? b.shape(b_rank - 2) : b.shape(b_rank - 1);
-    const int64_t K  = attrs.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
+    const auto [M, N, K] = matmul_dims(attrs, a, b);
 
     const int lda = static_cast<int>(a.row_stride_elems());
     const int ldb = static_cast<int>(b.row_stride_elems());
@@ -584,37 +574,7 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     const int32_t zp_out    = (qc.zero_point_data != nullptr) ? qc.zero_point_data[0] : qc.zero_point;
     const bool relu = (attrs.epilogue.type == EpilogueActivateType::Relu);
 
-    // ---- broadcast batch dims (same logic as matmul_dispatch_2d) ----
-    const int64_t batch_a_dims = a_rank - 2;
-    const int64_t batch_b_dims = b_rank - 2;
-    const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
-
-    std::vector<int64_t> batch_a_shape(batch_ndim, 1);
-    std::vector<int64_t> batch_b_shape(batch_ndim, 1);
-    std::vector<int64_t> batch_out_shape(batch_ndim, 1);
-
-    for (int64_t i = 0; i < batch_a_dims; ++i) {
-        batch_a_shape[batch_ndim - batch_a_dims + i] = a.shape(i);
-    }
-    for (int64_t i = 0; i < batch_b_dims; ++i) {
-        batch_b_shape[batch_ndim - batch_b_dims + i] = b.shape(i);
-    }
-
-    int64_t total_batch = 1;
-    for (int64_t i = 0; i < batch_ndim; ++i) {
-        const int64_t da = batch_a_shape[i];
-        const int64_t db = batch_b_shape[i];
-        if (da == db) {
-            batch_out_shape[i] = da;
-        } else if (da == 1) {
-            batch_out_shape[i] = db;
-        } else if (db == 1) {
-            batch_out_shape[i] = da;
-        } else {
-            NNOPS_ASSERT(!"MatMul: incompatible batch dimensions for broadcast");
-        }
-        total_batch *= batch_out_shape[i];
-    }
+    const BatchWalk batch(a, b);
 
     const int Mi = static_cast<int>(M);
     const int Ni = static_cast<int>(N);
@@ -623,30 +583,9 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     std::vector<int32_t> r_a(static_cast<size_t>(M));
     std::vector<int32_t> r_b(static_cast<size_t>(N));
 
-    for (int64_t bi = 0; bi < total_batch; ++bi) {
-        int64_t rem = bi;
-        int64_t a_offset = 0;
-        int64_t b_offset = 0;
-        int64_t c_offset = 0;
-
-        for (int64_t d = batch_ndim - 1; d >= 0; --d) {
-            const int64_t coord = rem % batch_out_shape[d];
-            rem /= batch_out_shape[d];
-
-            const int64_t a_dim = d - (batch_ndim - batch_a_dims);
-            if (a_dim >= 0) {
-                const int64_t a_coord = (batch_a_shape[d] == 1) ? 0 : coord;
-                a_offset += a_coord * a.stride_elems(a_dim);
-            }
-
-            const int64_t b_dim = d - (batch_ndim - batch_b_dims);
-            if (b_dim >= 0) {
-                const int64_t b_coord = (batch_b_shape[d] == 1) ? 0 : coord;
-                b_offset += b_coord * b.stride_elems(b_dim);
-            }
-
-            c_offset += coord * output.stride_elems(d);
-        }
+    for (int64_t bi = 0; bi < batch.total; ++bi) {
+        int64_t a_offset, b_offset, c_offset;
+        batch.offsets(bi, output, a_offset, b_offset, c_offset);
 
         const int8_t* a_p = a_base + a_offset;
         const int8_t* b_p = b_base + b_offset;
@@ -732,48 +671,31 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
         // hoisted to the slab's row loop exactly as before.
         const int64_t ep_rows = std::max<int64_t>(ctx.cpu.thread_count(), 1);
         const int64_t ep_tasks = std::min<int64_t>(M, ep_rows);
-        if (out_s8) {
-            int8_t* out_p = output.ptr<int8_t>() + c_offset;
-            ctx.cpu.run(0, ep_tasks, [&](int64_t t) {
-                const int64_t m0 = t * M / ep_tasks;
-                const int64_t m1 = (t + 1) * M / ep_tasks;
-                for (int64_t m = m0; m < m1; ++m) {
-                    const int32_t zp_a = quant_zp_at(qa, m);
-                    const double  s_a  = static_cast<double>(quant_scale_at(qa, m));
-                    for (int64_t n = 0; n < N; ++n) {
-                        int32_t v = matmul_int8_compensate(c_p[m * ldc + n], u8_offset,
-                                                           zp_a, quant_zp_at(qb, n),
-                                                           r_a[static_cast<size_t>(m)],
-                                                           r_b[static_cast<size_t>(n)],
-                                                           Ki);
-                        if (relu) {
-                            v = std::max(v, 0);
-                        }
+        int8_t* out_p = out_s8 ? output.ptr<int8_t>() + c_offset : nullptr;
+        ctx.cpu.run(0, ep_tasks, [&](int64_t t) {
+            const int64_t m0 = t * M / ep_tasks;
+            const int64_t m1 = (t + 1) * M / ep_tasks;
+            for (int64_t m = m0; m < m1; ++m) {
+                const int32_t zp_a = quant_zp_at(qa, m);
+                const double  s_a  = out_s8 ? static_cast<double>(quant_scale_at(qa, m)) : 0.0;
+                for (int64_t n = 0; n < N; ++n) {
+                    int32_t v = matmul_int8_compensate(c_p[m * ldc + n], u8_offset,
+                                                       zp_a, quant_zp_at(qb, n),
+                                                       r_a[static_cast<size_t>(m)],
+                                                       r_b[static_cast<size_t>(n)],
+                                                       Ki);
+                    if (relu) {
+                        v = std::max(v, 0);
+                    }
+                    if (out_s8) {
                         const double req = s_a * static_cast<double>(quant_scale_at(qb, n)) / scale_out;
                         out_p[m * ldc_out + n] = matmul_int8_requant(v, req, zp_out);
-                    }
-                }
-            });
-        } else {
-            ctx.cpu.run(0, ep_tasks, [&](int64_t t) {
-                const int64_t m0 = t * M / ep_tasks;
-                const int64_t m1 = (t + 1) * M / ep_tasks;
-                for (int64_t m = m0; m < m1; ++m) {
-                    const int32_t zp_a = quant_zp_at(qa, m);
-                    for (int64_t n = 0; n < N; ++n) {
-                        int32_t v = matmul_int8_compensate(c_p[m * ldc + n], u8_offset,
-                                                           zp_a, quant_zp_at(qb, n),
-                                                           r_a[static_cast<size_t>(m)],
-                                                           r_b[static_cast<size_t>(n)],
-                                                           Ki);
-                        if (relu) {
-                            v = std::max(v, 0);
-                        }
+                    } else {
                         c_p[m * ldc + n] = v;
                     }
                 }
-            });
-        }
+            }
+        });
     }
 }
 
