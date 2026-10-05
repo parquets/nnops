@@ -1723,6 +1723,54 @@ NNOPS_TEST(matmul_packed_a_stack_holds_every_tile_height) {
     }
 }
 
+NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
+    namespace cpu = nnops::backend::cpu;
+
+    // The N-side sibling of matmul_packed_a_stack_holds_every_tile_height. The
+    // N-split packs each n-block's B into its own slice, indexed by the
+    // dispatch as `blk * np_slice * ldd_b`. Only the blocks before the last are
+    // exactly nc wide — the last packs N mod nc columns — and the greedy NR
+    // decomposition is NOT monotonic in n ({12,4,1}: 3839 columns emit 324
+    // panels, 3840 only 320), so a short tile can emit MORE panels than a full
+    // one. Sizing the slice at num_panels(nc), or the whole buffer at
+    // num_panels(N) as this used to, therefore under-counts and the last pack
+    // runs past the end. The plan now sizes both from the worst-case count for
+    // a tile of nc columns.
+    //
+    // K == 2*KC_F32 keeps the kernel's per-k-block panel stride equal to
+    // plan.ldd_b, so the demand checked below is exact, not merely bounded.
+    for (int64_t N : {int64_t{2000}, int64_t{2001}, int64_t{2047}, int64_t{2048}}) {
+        MatmulInputs in = make_matmul_inputs(64, 256, N, false, false, false, 3);
+        MatMulAttributes attrs{};
+        const auto plan = cpu::get_matmul_plan(attrs, in.a.desc(), in.b.desc(), 4);
+
+        NNOPS_EXPECT_TRUE(plan.split_n);
+        NNOPS_EXPECT_EQ(plan.num_slots, (N + plan.nc - 1) / plan.nc);
+
+        // Panels the pack emits for each tile width the split can hand it.
+        int worst = 0;
+        for (int w = 1; w <= static_cast<int>(plan.nc); ++w) {
+            const int c = cpu::num_panels(w, cpu::NR_F32);
+            worst = (c > worst) ? c : worst;
+        }
+        NNOPS_EXPECT_TRUE(plan.np_slice >= worst);
+        // The case only covers anything while the worst tile really is wider
+        // than the exactly-nc one; if that ever stops holding, say so.
+        NNOPS_EXPECT_TRUE(plan.np_slice > cpu::num_panels(static_cast<int>(plan.nc), cpu::NR_F32));
+
+        // Every block, at the offset the dispatch gives it, stays inside the
+        // workspace the plan hands over.
+        const int64_t nb = (N + plan.nc - 1) / plan.nc;
+        const int64_t capacity = plan.workspace_size / static_cast<int64_t>(sizeof(float));
+        for (int64_t blk = 0; blk < nb; ++blk) {
+            const int64_t left = N - blk * plan.nc;
+            const int64_t n_count = (left < plan.nc) ? left : plan.nc;
+            const int64_t demand = cpu::num_panels(static_cast<int>(n_count), cpu::NR_F32) * plan.ldd_b;
+            NNOPS_EXPECT_TRUE(blk * plan.np_slice * plan.ldd_b + demand <= capacity);
+        }
+    }
+}
+
 NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
     // End-to-end cover for the same overflow. The plan shrinks mc to
     // M / num_threads, so M = 572 with 4 workers gives mc = 143 — the {8,4,1}

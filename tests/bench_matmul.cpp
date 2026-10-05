@@ -440,6 +440,13 @@ NNOPS_BENCH(matmul_f32_padded_b_stride) {
                 /*pad_a=*/0, /*pad_b=*/4096});
 }
 
+NNOPS_BENCH(matmul_f32_n_split) {
+    // N > M takes the N-split (NKM), where each n-block packs its own B slice.
+    // N is not a multiple of nc, so the last block packs a short tile — the case
+    // the packed-B slice sizing is about (see num_panels_max).
+    bench_case({"nn 256x512x10240 N-split", 256, 512, 10240});
+}
+
 // ============================================================
 // f16 — fused path spot checks
 // ============================================================

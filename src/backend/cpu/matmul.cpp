@@ -309,15 +309,18 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
         const int64_t num_blocks = split_n
             ? (Ni + nc - 1) / nc
             : split_block_count(Mi, mc);
-        const int np_full_b = num_panels(split_n ? nc : Ni,
-                                         std::is_same_v<T, float> ? NR_F32 : NR_F16);
+        // Panels per packed-B slice, from the plan — it owns both the slice
+        // width and the workspace behind it, so the two cannot drift apart.
+        // (N-split: the worst-case count for a tile of nc columns, see
+        // num_panels_max; M-split: one full-N slice, packed as a whole.)
+        const int np_full_b = static_cast<int>(plan.np_slice);
 
         // Scratch slots: the plan allocates one packed-B slice per worker thread
         // when the backend reports ids and that is fewer than the block count
-        // (M-split only — N-split's blocks tile a single full-N slice), else one
-        // per block. A thread packs one slice at a time and blocks are
-        // independent, so reusing a slot across every block a thread claims is
-        // safe and the result is unchanged.
+        // (M-split only — on the N-split every block gets its own slice, so
+        // num_slots is the block count), else one per block. A thread packs one
+        // slice at a time and blocks are independent, so reusing a slot across
+        // every block a thread claims is safe and the result is unchanged.
         const bool per_thread = plan.num_slots < num_blocks;
 
         ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
@@ -543,7 +546,10 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     const int nc = static_cast<int>(plan.nc);
 
     // Workspace: packed-B panels at the base, then the s8 accumulator.
-    const int np_full = num_panels4(nc, NR_I8);
+    // Panels per packed-B slice, from the plan (see MatMulPlan::np_slice). Only
+    // the N-split below indexes by it — the M-split packs the whole full-N slice
+    // at the base, one k-block at a time.
+    const int np_full = static_cast<int>(plan.np_slice);
     int8_t* pack_b_base = static_cast<int8_t*>(workspace);
     int32_t* accum = nullptr;
     if (out_s8) {
@@ -651,9 +657,11 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
             auto run_block = [&](int64_t blk) {
                 const int n = static_cast<int>(blk) * nc;
                 const int actual_nc = std::min(nc, Ni - n);
-                // Slices are laid out at the plan's sizing stride (full Kc, or K
+                // Slices are one worst-case tile wide (np_full panels, see
+                // num_panels_max4) at the plan's sizing stride (full Kc, or K
                 // when K < Kc), which is >= the per-k-block stride the block
-                // below packs at — that is what makes the offset an upper bound.
+                // below packs at — that is what makes the slice an upper bound
+                // on the panels actually written, short last block included.
                 int8_t* pack_b_slice = pack_b_base + blk * np_full * plan.ldd_b;
                 matmul_block_int8(attrs, c_p, ldc, a_p, lda, b_p, ldb,
                                   Mi, Ki, kc, mc, n, actual_nc, pack_b_slice);

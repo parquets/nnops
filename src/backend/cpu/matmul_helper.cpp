@@ -746,16 +746,22 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     // Packed-B scratch. One full-N slice is `slice_bytes`; how many the
     // workspace holds, and what indexes them, depends on the split:
     //
-    //   N-split  the n-blocks TILE one full-N slice, so the buffer already
-    //            holds exactly one slice per block with nothing duplicated.
-    //            Nothing to share — num_slots stays num_blocks and the
-    //            dispatch indexes by block, as before.
+    //   N-split  each n-block owns a slice one worst-case tile wide and the
+    //            dispatch indexes them by block. Every block but the last packs
+    //            exactly nc columns; the last packs `N mod nc`, anywhere in
+    //            1..nc. The greedy NR decomposition is not monotonic in n (see
+    //            num_panels_max: num_panels(nc - 1) exceeds num_panels(nc)), so
+    //            the slice is sized at the largest count any tile of nc columns
+    //            can emit — sizing it from num_panels(N) across the whole
+    //            buffer, as this used to, is short by those few panels and the
+    //            last pack writes past the end.
     //   M-split  every m-block gets its OWN full-N slice, because the blocks
     //            run concurrently and each packs its B per k-block. That is
     //            the duplication. When the backend reports worker ids the
     //            scratch goes one slot per worker thread instead: a thread
     //            packs one slice at a time, so num_threads slots serve
-    //            num_m_blocks blocks (see MatMulPlan::num_slots).
+    //            num_m_blocks blocks (see MatMulPlan::num_slots). Every block
+    //            packs the full N, so num_panels(N) is exact here.
     //
     // int8 is the exception on the M-split: its dispatch hoists the B pack out
     // of the parallel region (one pack per k-block, then M is partitioned), so
@@ -771,10 +777,15 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
             const int64_t nt = std::max<int64_t>(num_threads, 1);
             plan.num_slots = (use_thread_slots && nt < num_m_blocks) ? nt : num_m_blocks;
         }
+        // Every m-block packs the full N, so the exact count is the bound.
+        plan.np_slice = panel_count(static_cast<int>(N));
         plan.workspace_size = plan.num_slots * slice_bytes;
     } else {
         plan.num_slots = (N + plan.nc - 1) / plan.nc;
-        plan.workspace_size = slice_bytes;
+        plan.np_slice = is_i8 ? num_panels_max4(static_cast<int>(plan.nc), nr)
+                              : num_panels_max(static_cast<int>(plan.nc), nr);
+        plan.workspace_size = plan.num_slots * plan.np_slice
+                            * static_cast<int64_t>(ldd_b) * elem;
     }
 
     return plan;

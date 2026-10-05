@@ -630,13 +630,18 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     NNOPS_EXPECT_EQ(b1.workspace_size, one_slice);
     NNOPS_EXPECT_EQ(b10.workspace_size, one_slice);
 
-    // N-split (N > M): the n-blocks tile one full-N slice, so the workspace is
-    // that slice however many blocks there are.
+    // N-split (N > M): each n-block owns a slice, sized at the worst-case panel
+    // count for a tile of nc columns — the last block packs N mod nc columns,
+    // and a run one column short of a multiple of nr_max can emit more panels
+    // than an nc-wide one does (see num_panels_max4).
     const auto n10 = i8_plan(64, 512, 1024, 10);
     NNOPS_EXPECT_TRUE(n10.split_n);
     NNOPS_EXPECT_EQ(n10.nc % cpu::NR_MAX_I8, int64_t{0});
-    NNOPS_EXPECT_EQ(n10.num_slots, (int64_t{1024} + n10.nc - 1) / n10.nc);
-    NNOPS_EXPECT_EQ(n10.workspace_size, one_slice);
+    const int64_t n_blocks = (int64_t{1024} + n10.nc - 1) / n10.nc;
+    const int64_t np_max = cpu::num_panels_max4(static_cast<int>(n10.nc), cpu::NR_I8);
+    NNOPS_EXPECT_TRUE(np_max > cpu::num_panels4(static_cast<int>(n10.nc), cpu::NR_I8));
+    NNOPS_EXPECT_EQ(n10.num_slots, n_blocks);
+    NNOPS_EXPECT_EQ(n10.workspace_size, n_blocks * np_max * ldd_b);
 }
 
 // ============================================================

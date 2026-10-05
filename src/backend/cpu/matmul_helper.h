@@ -259,6 +259,17 @@ constexpr int num_panels_max(int n, const int* mr) noexcept {
     return worst;
 }
 
+/// 4-level `num_panels_max` for the int8 NR lists ({16,8,4,1} / {12,8,4,1}) —
+/// same non-monotonicity, one more level to decompose (see num_panels4).
+constexpr int num_panels_max4(int n, const int* nr) noexcept {
+    int worst = 0;
+    for (int mc = 1; mc <= n; ++mc) {
+        const int c = num_panels4(mc, nr);
+        worst = c > worst ? c : worst;
+    }
+    return worst;
+}
+
 /// Stack-resident packed-A buffer size (elements) for one MC_TARGET×Kc tile at
 /// the full-Kc uniform stride — an upper bound for every per-k-block pack:
 ///   f32 84 KB (aarch64) / 78 KB (x86_64), f16 exactly half of that.
@@ -343,6 +354,7 @@ void xor0x80_i8(int8_t* p, int nbytes);
 struct MatMulPlan {
     int64_t mc, nc, kc;       // tile sizes
     int64_t ldd_b;            // packed-B panel stride (elements) at full Kc
+    int64_t np_slice;         // panels one packed-B slice holds (see get_matmul_plan)
     bool    pack_a;           // A is packed (transpose_a, wide row stride, or int8)
     bool    split_n;          // split on N (else on M)
     int64_t num_slots;        // packed-B slices allocated (<= num_blocks)
