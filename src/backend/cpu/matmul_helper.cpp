@@ -727,17 +727,17 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     plan.mc = (split_m && num_threads > 1) ? (M / num_threads) : MC_TARGET;
     plan.mc = std::max<int64_t>(std::min<int64_t>(plan.mc, MC_TARGET), 1);
 
-    // N tile bounded by the L2 cache, rounded down to a nr_max multiple so the
-    // per-block packed-B slices tile the workspace exactly, clamped to [nr_max, N].
+    // N tile from the L2 bound, capped at NC_MAX and snapped to the panel grid
+    // (NC_ALIGN where it fits, else nr_max), clamped to [nr_max, N].
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
-    const int nc_l2 = compute_nc(mr_panel, static_cast<int>(plan.kc), elem, l2);
-    const int nc_cap = clamp_nc(round_down_nc(nc_l2, nr_max), nr_max, static_cast<int>(N));
+    const int nc_l2 = compute_nc_capped(mr_panel, static_cast<int>(plan.kc), elem, l2);
+    const int nc_cap = clamp_nc(round_nc_target(nc_l2, nr_max), nr_max, static_cast<int>(N));
 
     int64_t nc = nc_cap;
     if (plan.split_n && num_threads > 1) {
         nc = std::min<int64_t>(N / num_threads, nc_cap);
     }
-    plan.nc = clamp_nc(round_down_nc(static_cast<int>(nc), nr_max), nr_max, static_cast<int>(N));
+    plan.nc = clamp_nc(round_nc_target(static_cast<int>(nc), nr_max), nr_max, static_cast<int>(N));
 
     // Packed-B stride (elements) at full Kc.
     const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(plan.kc) * elem) / elem;

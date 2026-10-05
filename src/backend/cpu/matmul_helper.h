@@ -152,8 +152,34 @@ inline int compute_nc(int mr_max, int kc, int elem_bytes, size_t l2_size) noexce
     return (rhs / denom) - 1;  // -1 for safety margin
 }
 
+/// Cap on the n-tile. The L2 heuristic alone asks for tiles thousands of
+/// columns wide (3840 f32 / 7696 f16 on a 4 MiB L2), which makes each block's
+/// packed B a couple of MB — more than the kernel needs resident at once, and
+/// it leaves little of the cache for the A panels and C tile beside it.
+constexpr int NC_MAX = 1024;
+
+/// Panel-grid multiple for the n-tile: the LCM of the two fp nr_max values
+/// (12 and 16). An NC_ALIGN-wide tile therefore decomposes into equal
+/// nr_max-wide panels with no tail at all, and it is a multiple of every nr_max
+/// the pack can be given — fp or int8.
+constexpr int NC_ALIGN = 48;
+
 inline int round_down_nc(int nc, int nr_max) noexcept {
     return (nc / nr_max) * nr_max;
+}
+
+/// Snap an n-tile target down to the tile grid: to an NC_ALIGN multiple while
+/// that still leaves an aligned tile, else to the nr_max multiple the pack
+/// requires. Called before clamp_nc, so an N-driven short tile can still end up
+/// below NC_ALIGN (down to N itself when N < nr_max).
+inline int round_nc_target(int nc, int nr_max) noexcept {
+    return (nc >= NC_ALIGN) ? round_down_nc(nc, NC_ALIGN) : round_down_nc(nc, nr_max);
+}
+
+/// The n-tile target from the L2 working-set bound, capped at NC_MAX.
+inline int compute_nc_capped(int mr_max, int kc, int elem_bytes, size_t l2_size) noexcept {
+    const int nc = compute_nc(mr_max, kc, elem_bytes, l2_size);
+    return (nc < NC_MAX) ? nc : NC_MAX;
 }
 
 /// Clamp nc into [nr_max, N] so the NKM loop always makes progress and the
@@ -170,7 +196,7 @@ inline void resolve_tile_sizes(int64_t  M, int64_t N, int64_t mr_max, int64_t nr
                                int elem_bytes, int& mc, int& nc) noexcept {
     mc = std::min(MC_TARGET, M);
     size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
-    nc = clamp_nc(round_down_nc(compute_nc(mr_max, kc, elem_bytes, l2_size), nr_max),
+    nc = clamp_nc(round_nc_target(compute_nc_capped(mr_max, kc, elem_bytes, l2_size), nr_max),
                   nr_max, N);
 }
 
