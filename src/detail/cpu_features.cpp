@@ -213,11 +213,32 @@ void CpuFeatures::detect() {
 #elif defined(__APPLE__)
     {
         // macOS Apple Silicon: use sysctl
+        int64_t l1_size = 0;
+        size_t len = sizeof(l1_size);
+        if (sysctlbyname("hw.l1dcachesize", &l1_size, &len, nullptr, 0) == 0 &&
+            l1_size > 0) {
+            l1_cache_size_ = static_cast<size_t>(l1_size);
+        }
+
         int64_t l2_size = 0;
-        size_t len = sizeof(l2_size);
+        len = sizeof(l2_size);
         if (sysctlbyname("hw.l2cachesize", &l2_size, &len, nullptr, 0) == 0 &&
             l2_size > 0) {
             l2_cache_size_ = static_cast<size_t>(l2_size);
+        }
+    }
+#endif
+
+    // hw.l2cachesize is the *efficiency* cluster's L2 on a hybrid Mac. Ask for
+    // the performance cluster's explicitly when the OS exposes it; leaving the
+    // member 0 makes l2_shared_cache_size() fall back to l2_cache_size_.
+#if defined(__APPLE__)
+    {
+        int64_t l2_perf = 0;
+        size_t len = sizeof(l2_perf);
+        if (sysctlbyname("hw.perflevel0.l2cachesize", &l2_perf, &len, nullptr, 0) == 0 &&
+            l2_perf > 0) {
+            l2_shared_cache_size_ = static_cast<size_t>(l2_perf);
         }
     }
 #endif

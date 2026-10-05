@@ -62,13 +62,15 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
 
 - `TensorDesc` carries metadata only (dims, dtype, layout) — no data pointer.
 - `getWorkspaceSize(inputs, outputs)` returns the byte count. The caller allocates.
-- **Workspace holds packed B only.** Packed A lives in a per-thread stack buffer
-  sized `num_panels_max(MC_TARGET, mr) × ldd_a` (see matmul_helper.h):
-  84 KiB on aarch64 / 78 KiB on x86_64 for f32, exactly half for f16. Note this is
-  *not* the naive `MC_TARGET × Kc × elem` (72 KiB) — the greedy largest-first
-  decomposition of an `mc < MC_TARGET` can need more panels than MC_TARGET's does,
-  so the buffer is sized for the worst `mc`, not for `MC_TARGET` itself. Either
-  way, every `pack_a`-only / direct path needs **zero** workspace.
+- **Workspace holds packed B and, on the packed-A route, packed A.** Packed B is
+  hoisted out of the parallel region on an M-split (one slice serves every
+  m-block); packed A is per-m-block and takes its own region of the same
+  workspace. Both are sized from the plan's own `mc`/`nc`/`kc` (see §2), the
+  packed-A region at `num_panels_max(mc, mr) × ldd_a` per block. Note this is
+  *not* the naive `mc × Kc × elem` — the greedy largest-first decomposition of a
+  short final block can need more panels than the tile's own `mc` does, so the
+  region is sized for the worst height in `[1, mc]`, not for `mc` itself. Every
+  direct-A path needs **zero** workspace.
 - `TensorDesc.row_stride_elems` feeds the **pack decision for A**: a stride wider
   than `PACK_A_STRIDE_THRESHOLD` makes A pack (`0` = unknown → treat as compact,
   `K` elems/row for a non-transposed A, `M` for a transposed one). It does not
@@ -83,97 +85,140 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
 
 ## 2. Tiling Parameters
 
-### 2.1 Kc — Fixed Constant
+### 2.1 One rule for Mc, Nc and Kc
 
-| dtype | Kc  | Rationale |
-|-------|-----|-----------|
-| f32   | 128 | Fits 2× mr×Kc panels in L1 (6×128×4 = 3KB on x86); good ILP without blowing register pressure. |
-| f16   | 128 | Same value as f32 — it bounds the per-k-block fp16 accumulation error, and half the elements make the panels half the size. |
-| s8    | 512 | 4× the float value: int8 elements are 1 byte, so the same byte budget buys 4× the K. |
+`choose_matmul_tile` in
+[matmul_helper.h](../src/backend/cpu/matmul_helper.h) picks all three together:
+it maximises the tile's arithmetic intensity
+
+```text
+AI = 2·mc·nc·kc / (mc·kc + nc·kc + mc·nc)
+```
+
+subject to four constraints, all of which the tile must satisfy:
+
+1. **Aggregate L2** — the `num_threads` concurrent blocks' packed A and B fit
+   half of the shared L2:
+   ```text
+   C = l2_shared / (2 · nt · esz)          kc · (mc + nc) ≤ C
+   ```
+2. **L1 prefetch residency** — the running `mr_max` rows of A plus the current and
+   next `nr_max` columns of B fit L1, so the next B panel can be prefetched while
+   the current one is consumed:
+   ```text
+   kc_l1 = snap32( l1 / ((mr_max + 2·nr_max) · esz) )
+   ```
+3. **Ceiling** — `mc ≤ MC_MAX = 768`, `nc ≤ NC_MAX = 768`.
+4. **Panel grids** — `mc` on `MC_ALIGN = 24`, `nc` on `NC_ALIGN = 48`,
+   `kc` on `KC_ALIGN = 32`.
+
+Spending the L2 budget fully, the unconstrained optimum is closed-form:
+
+```text
+mc = nc = √C ,  kc = √C / 2
+```
+
+so the rule is `s = 2·isqrt(C)` for the total `mc + nc`, split evenly, then
+snapped to the grids and clamped by the shape and the split:
+
+```text
+split_n :  mc = snap24(min(mc_t, M))
+           nc = balance_tile(N, nc_t, 48, nt)
+else    :  mc = balance_tile(M, mc_t, 24, nt)
+           nc = snap48(min(nc_t, N))
+```
+
+`balance_tile` is the fifth constraint, and the one that only exists because
+blocks are handed out to a pool:
+
+```text
+cap_a = snap_down(min(cap, dim), align)      // largest legal tile
+n_min = ceil(dim / cap_a)                    // fewest blocks the cap allows
+n_blk = ceil(n_min / nt) · nt                // round the count up to the pool
+tile  = round_up(ceil(dim / n_blk), align)   // the even share, on the grid
+tile  = min(tile, cap_a)
+```
+
+It keeps the block count a multiple of the worker count, so no worker ends up
+with a double-length share while another idles. At `nt == 1` it short-circuits to
+`cap_a` — with one worker there is no balance to strike. The split side is the one
+balanced: `mc` when the split is on M, `nc` when it is on N.
+
+Rounding the count *up* can pull the tile below what the budget allows — 8192 rows
+in 24 blocks is 360, not the 504 the L2 budget would give — so balancing trades
+some AI for even work distribution. That is the trade the paired A/B asked for:
+without it, the 768 ceiling made 2T and 4T *slower* than the old flat-144 rule.
+
+`kc` is re-derived from the `mc + nc` the routing actually produced — so a shape
+that shrinks `mc` gets the freed budget back into `kc` — and clamped to the L1
+bound, the dtype cap, and `K`:
+
+```text
+kc = snap32(clamp(min(C/(mc+nc), kc_l1, kc_cap, K), KC_MIN, K))
+```
+
+On the M4 (f32, `l2_shared` = 16 MiB, `l1` = 64 KiB), for M = N = 8192, K = 4096:
+
+| nt | C | mc | nc | kc | blocks | AI |
+|---|---|---|---|---|---|---|
+| 1 | 2 097 152 | 768 | 768 | 128 | 11 | 192 |
+| 2 | 1 048 576 | 696 | 768 | 128 | 12 | 190 |
+| 4 | 524 288 | 696 | 720 | 128 | 12 | 188 |
+| 8 | 262 144 | 360 | 480 | 128 | 23 | 158 |
+
+The 768 ceiling binds at `nt = 1`; above that the L2 budget does, and from 8T the
+block balancing starts to. **`kc` never leaves `KC_CAP_F32 = 128`** — `C/(mc+nc)`
+is 1365 at 1T and still 266 at 8T, so the unconstrained optimum is unreachable and
+the cap, not the budget, decides `kc`. That is the deliberate cost of the shorter
+k-block (§2.2): the three-heuristic scheme this replaced sat at a flat **AI 169**
+on every f32 shape (`nc` pinned below its L2 target by a 1024 cap, `mc` a fixed
+144), and the rule beats it comfortably at 1T–4T but not at 8T, where rounding the
+block count up to 24 pulls `mc` from 504 to 360. What the rule is *for* is the
+block count tracking the pool — 11/12/12/23 blocks for 1/2/4/8 workers instead of
+the old 57 — which is the effect the paired A/B measured.
+
+**Alignment.** `NC_ALIGN = 48 = lcm(12, 16)` is the `nr_max` grid across both
+arches; `MC_ALIGN = 24 = lcm(6, 8)` is the `mr_max` grid. Aligning `mc` to 48 would
+break M-split exactness (M = 1024 @ 8T: `min(480, 128)` should snap to 96 for 8
+even blocks, not to 48 for 11 ragged ones).
+
+### 2.2 Per-dtype Kc cap
+
+The formula above predicts `kc` in the hundreds for the small-element dtypes,
+because `esz` makes the model see more room than the kernel can actually use:
+
+| dtype | `kc_cap` | Why the cap |
+|-------|----------|-------------|
+| f32   | 128 | Not a budget limit but a length limit — kept equal to f16's for one rule. The budget would allow 1365 here (§2.1). |
+| f16   | 128 | Bounds the per-k-block fp16 accumulation error — **the aarch64 f16 kernel accumulates in f16**, so a longer k-block means a longer rounding chain before the f32 C read-modify-write. At K = 4096, kc 128 → 256 moved the worst deviation 0.23% → 0.29% of the output magnitude. |
+| s8    | 512 | The formula predicts 1344–2048 here (`esz = 1` makes the model see 8× the room); 512 is the value the int8 kernel is tuned and tested at. |
+
+`KC_MIN = 128` is the floor: a shape too small to fill the budget still gets a
+full 128-wide k-block. `kc = min(kc, K)` always holds, so short reductions never
+pad.
 
 `KC_F16I4 = 256` is declared as a placeholder for a future fp16×int4 path; nothing
 reads it.
 
-Kc is also clamped to the actual K (`plan.kc = min(KC_*, K)`), so short reductions
-never pad.
+**On Apple the L1 bound (§2.1 constraint 2) is slack for every dtype** once
+`kc ≤ 128` (f32 would need 512, f16 800). It only binds on x86_64, where a 32 KiB
+L1D gives f32 `kc_l1 = 192`. It is kept as the prefetch-residency guard it was
+specified as, not as the term that drives the choice.
 
-### 2.2 Mc — Free Parameter
+**Attention shares the rule.** `resolve_tile_sizes` — which attention's
+non-flash path calls for both GEMM1 and GEMM2 — is a thin wrapper over the same
+`choose_matmul_tile`, passing attention's fixed kc (`KC_F32`/`KC_F16` = 128) as
+`kc_fixed`. Attention has no M/N split of its own, so both call sites take the
+same `split_n = (N > M)` default as matmul. Only the non-flash path is affected:
+the flash branch sizes its `Br`/`Bc` from `resolve_flash_tile_sizes`, which does
+not read `NC_MAX`. Attention's `nc1` moved 1008 → 768 with the ceiling.
 
-**Mc = 144 (`MC_TARGET`)** — chosen to be divisible by the largest mr on both
-architectures:
+### 2.3 Mc, Nc and Kc are all derived
 
-- x86_64: 144 / 6 = 24 panels (also clean for mr=4: 36 panels)
-- aarch64: 144 / 8 = 18 panels (also clean for mr=4: 36 panels)
-
-Larger Mc amortizes B-packing cost over more M rows, but too large eats L2 capacity
-and hurts packed_B residency.
-
-`mc` is clamped to `min(MC_TARGET, M)`, and on the M-split with more than one
-thread it becomes `M / num_threads` (still capped at `MC_TARGET`) so the m-blocks
-are spread evenly. The A pack stack buffer is sized for the worst `mc <=
-MC_TARGET` (see §1.3), not for `MC_TARGET` itself — the greedy panel
-decomposition is not monotonic in `mc`, so 144 rows need 18 panels (aarch64) while
-143 rows need 21.
-
-### 2.3 Nc — L2 Cache Constraint (the key derivation)
-
-#### The Working Set During MMA
-
-During a `MrNcKcMMa` call, the **active** working set in L2 is:
-
-- **A panel:** `mr × Kc` — only the current mr rows (the micro-kernel panel, not all of Mc)
-- **B panel:** `Nc × Kc` — the full packed B block
-- **C panel:** `mr × Nc` — the mr×Nc slice of C being accumulated
-
-With double buffering (pack next while compute current), multiply by 2:
-
-```text
-(mr × Kc + Nc × Kc + mr × Nc) × 2 × elem_size < L2_SIZE
-```
-
-**Critical insight:** Only **mr** (micro-kernel panel, e.g. 6 or 8) appears — not
-**Mc** (tiled block). The rest of packed A is in L2 but not the hot working set
-during a single MMA call.
-
-#### Solving for Nc
-
-`compute_nc` solves that inequality and subtracts one for a safety margin:
-
-```text
-Nc < (L2_SIZE / (2 × elem_size) - mr × Kc) / (Kc + mr)   - 1
-```
-
-With L2 = 256 KB (Haswell baseline) and Kc = 128:
-
-| Arch    | dtype | mr | nr_max | Nc (raw) | Nc (rounded) | Divisor check |
-|---------|-------|----|--------|----------|--------------|---------------|
-| x86_64  | f32   | 6  | 16     | 237      | **224**      | 224/16 = 14 ✓ |
-| x86_64  | f16   | 6  | 16     | 482      | **480**      | 480/16 = 30 ✓ |
-| aarch64 | f32   | 8  | 12     | 232      | **228**      | 228/12 = 19 ✓ |
-| aarch64 | f16   | 8  | 16     | 473      | **464**      | 464/16 = 29 ✓ |
-
-Nc is rounded down to the nearest multiple of the largest nr for clean panel
-decomposition, then clamped into `[nr_max, N]` so the loop always makes progress
-and the sizing matches the kernel exactly. At runtime Mc is clamped to the problem
-dimensions too (no padding waste). The actual L2 size is read at runtime (§3), so
-these figures are the floor, not the values a real CPU will use.
-
-### 2.4 Why Mc ≠ Nc — the AM-GM Proof
-
-For a fixed L2 budget (`L2_BUDGET = mr × Kc + Nc × Kc + mr × Nc`), the
-computational intensity of an MMA call is:
-
-```text
-CI = mr × Nc × Kc / ((mr + Nc) × Kc + mr × Nc)
-   ≈ mr × Nc / (mr + Nc)          [Kc dominates]
-```
-
-By AM-GM, the product `mr × Nc` is maximized when `mr = Nc`. But mr is fixed by
-the micro-kernel (6 or 8), and Nc is hundreds of columns (224–480 across the
-dtype/arch table in §2.3). The formula does
-**not** produce a balanced tile — it produces the tile that minimizes data movement
-**given** the architecture's fixed mr. Mc is a separate free parameter entirely,
-chosen for panel divisibility and pack amortization.
+There is no fixed `MC_TARGET` any more. Every one of the three comes out of the
+rule in §2.1; the only per-dtype inputs are `mr_max`, `nr_max`, `esz` and
+`kc_cap`, and the only machine inputs are `l1_cache_size()` and
+`l2_shared_cache_size()` (§3).
 
 ---
 
@@ -246,8 +291,8 @@ for (; n + NR_F32[0] <= nc; n += NR_F32[0]) {
 ```
 
 `NR_F32[2]` is always 1, so the last loop cleans up any remainder one panel at a
-time. This ensures Mc = 144 decomposes cleanly as 24 × mr0 on x86_64 (144/6 = 24)
-and 18 × mr0 on aarch64 (144/8 = 18) — no remainder panels needed.
+time. In practice it never runs: `nc` is a multiple of `NC_ALIGN = 48 = lcm(12, 16)`,
+the `nr_max` grid on both arches, so the widest loop consumes the whole tile.
 
 The greedy walk is what makes `num_panels()` the correct sizing primitive, and
 why it is not monotonic: see §1.3 and `num_panels_max` in matmul_helper.h.
@@ -412,15 +457,16 @@ the M-split.
    denominator wastes cache on larger CPUs. The CPUID path adds ~10 lines of code
    and pays for itself on any CPU with > 256 KB L2.
 
-6. **Mc = 144 is arbitrary but portable.** It divides cleanly by both 6 (x86_64
-   mr0) and 8 (aarch64 mr0), and it is large enough to amortize B-packing overhead.
-   It is also the knob that fixes the A-pack stack buffer: the buffer is sized
-   `pack_a_stack_elems() = num_panels_max(MC_TARGET, mr) × ldd_a` — worst-case panel
-   counts 26 (x86_64) / 21 (aarch64), not the 24 / 18 that MC_TARGET itself
-   decomposes into — giving 78 KB / 84 KB for f32 and exactly half that for f16.
-   Growing Mc grows that buffer linearly, so it is not free. Tuning Mc
-   per-architecture or per-problem-size could squeeze out more performance but adds
-   complexity for diminishing returns.
+6. **Mc/Nc/Kc are one derivation, not three heuristics.** Earlier the three came
+   from separate rules that shared an L2 budget without knowing about each other:
+   `nc` from a single-block working set capped at 1024, `kc` from a
+   `num_threads`-blocks-in-half-of-L2 rule capped at 256, and `mc` a flat 144.
+   They are now picked together by `choose_matmul_tile` (§2.1) to maximise the
+   tile's arithmetic intensity subject to the aggregate-L2, L1-prefetch,
+   ceiling, alignment and block-count-balancing constraints. The packed-A region is sized
+   `num_panels_max(mc, mr) × ldd_a` from the plan's own `mc` — worst-case panel
+   counts exceed `num_panels(mc, mr)` because the greedy decomposition is not
+   monotonic in `mc` (24k − 1 needs 3k + 3 panels, 24k only 3k).
 
 ---
 

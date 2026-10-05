@@ -1075,8 +1075,9 @@ NNOPS_TEST(matmul_packed_transpose_both_workspace) {
 }
 
 NNOPS_TEST(matmul_packed_multiple_kblocks) {
-    // K = 300 > KC_F32 (128): exercises multi-k-block accumulation and the
-    // last-k-block epilogue/clamp logic in the packed path.
+    // K = 300 > the plan's f32 k-block (128 here, capped at 256): exercises
+    // multi-k-block accumulation and the last-k-block epilogue/clamp logic in
+    // the packed path.
     auto [a_vec, a] = test::make_random_tensor({6, 300});    // [M, K]
     auto [b_vec, b] = test::make_random_tensor({9, 300});    // phys [N, K]
 
@@ -1216,6 +1217,68 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
         float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
         NNOPS_EXPECT_NEAR(v, ref_buf[static_cast<size_t>(i)], kF16AccumTol);
     }
+}
+
+NNOPS_TEST(matmul_f16_deep_k_accumulation) {
+    namespace cpu = nnops::backend::cpu;
+
+    // On aarch64 the f16 kernel accumulates in f16 (mma_pack_8x8_f16 keeps
+    // float16x8_t accumulators), so kc bounds how many products round into the
+    // accumulator before the C read-modify-write. The shared tile rule settles
+    // this shape on kc = 128 (KC_CAP_F16), so pin the deep-K worst case against
+    // the reference rather than assuming the accumulation still holds.
+    const int64_t M = 64, K = 4096, N = 64;
+    auto [a_f32, _]  = test::make_random_tensor({M, K}, -1.0f, 1.0f, 4242);
+    auto [b_f32, __] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 4243);
+    auto a_f16 = test::f32_to_f16(a_f32);
+    auto b_f16 = test::f32_to_f16(b_f32);
+
+    const int64_t a_shape[] = {M, K};
+    const int64_t b_shape[] = {K, N};
+    TensorView a(a_shape, DataType::f16, a_f16.data());
+    TensorView b(b_shape, DataType::f16, b_f16.data());
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+
+    // Pin the kc this shape actually gets; if the rule moves it the test still
+    // checks correctness, it just stops covering this accumulation depth.
+    const auto plan = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1);
+
+    std::vector<cpu::half> out_buf(descs[0].numel());
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, nullptr);
+
+    const int64_t a32_shape[] = {M, K};
+    const int64_t b32_shape[] = {K, N};
+    TensorView a32(a32_shape, DataType::f32, a_f32.data());
+    TensorView b32(b32_shape, DataType::f32, b_f32.data());
+    const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(ref_descs[0].numel());
+    auto ref_out = test::make_planar(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32, b32};
+    cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    float worst = 0.0f, maxref = 0.0f;
+    for (int64_t i = 0; i < descs[0].numel(); ++i) {
+        const float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+        const float r = ref_buf[static_cast<size_t>(i)];
+        worst = std::max(worst, std::fabs(v - r));
+        maxref = std::max(maxref, std::fabs(r));
+    }
+    NNOPS_EXPECT_EQ(plan.kc, int64_t{128});
+
+    // The deviation scales with the output magnitude — max |ref| is ~80 here
+    // from a 4096-long reduction — so the absolute kF16AccumTol the small-GEMM
+    // f16 tests use does not apply. Bound it relative to that magnitude instead.
+    // Measured: 0.23% at kc = 128 (0.29% at kc = 256, which the rule no longer
+    // reaches here). The bound has ~2x headroom, so it catches a real
+    // accumulation break, not drift.
+    NNOPS_EXPECT_TRUE(worst <= 0.005f * maxref);
 }
 
 NNOPS_TEST(matmul_f16_transpose_b_packed) {
@@ -1441,8 +1504,9 @@ NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
     // non-transposed A stays on the unpacked-A (pack_a=0) route, and that route
     // decomposes M by the shared MR_F32 table, {8,4,1} on aarch64, so Mc splits
     // as 8a + 4b + 1c. Walk M across that boundary and K across both the
-    // 4-wide inner unroll and KC_F32, so the tall tile, the 4/1 remainder
-    // kernels and the scalar k-tail are each checked against the reference.
+    // 4-wide inner unroll and the plan's k-block (128 for these shapes), so the
+    // tall tile, the 4/1 remainder kernels and the scalar k-tail are each
+    // checked against the reference.
     // N walks the nr panel widths too — the kernel is selected per (mr, nr), so
     // 13 exercises the 12+1 columns and 17 the 12+4+1 ones.
     const int64_t Ms[] = {1, 5, 6, 7, 8, 13, 143, 144, 145};
@@ -1498,8 +1562,9 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
     // mr_f16_direct — the direct kernels read row-major A at the same height
     // they pack — so the route decomposes M with MR_F16 = {8,4,1}, i.e. 8a+4b+1c,
     // not the f32 direct {6,4,1}. Walk M across those boundaries, K across the
-    // 4-wide inner unroll and KC_F16 (=128), and N across the NR_F16 = {16,8,1}
-    // panel widths, checking each tile against the f32 reference.
+    // 4-wide inner unroll and the plan's k-block (128 for these shapes; the cap
+    // is 256), and N across the NR_F16 = {16,8,1} panel widths, checking each
+    // tile against the f32 reference.
     const int64_t Ms[] = {1, 4, 5, 8, 9, 12, 13, 143, 144, 145};
     const int64_t Ks[] = {1, 3, 4, 5, 128, 129};
     const int64_t Ns[] = {1, 17, 25};  // 16+1 and 16+8+1
@@ -1702,24 +1767,57 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
     }
 }
 
-NNOPS_TEST(matmul_packed_a_stack_holds_every_tile_height) {
+NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
     namespace cpu = nnops::backend::cpu;
 
-    // The on-stack packed-A tile must hold the panels of whatever mc the
-    // dispatch actually picks — a per-block height <= MC_TARGET, not
-    // MC_TARGET itself. The greedy {mr,..,1} decomposition the pack emits is
-    // NOT monotonic in mc, so sizing the buffer at num_panels(MC_TARGET, mr)
-    // under-counts: {8,4,1} needs 21 panels at mc = 143 (17×8 + 4 + 1 + 1 + 1)
-    // but only 18 at mc = 144, and an 18-panel buffer overflowed by 3 panels
-    // (12 KB past the end). This pins the invariant directly, so it fails
-    // deterministically instead of relying on a stack smash being noticed.
-    for (int mc = 1; mc <= static_cast<int>(cpu::MC_TARGET); ++mc) {
-        NNOPS_EXPECT_TRUE(cpu::pack_a_stack_elems<float>()
-                          >= cpu::num_panels(mc, cpu::MR_F32) * cpu::LDD_A_F32);
-        NNOPS_EXPECT_TRUE(cpu::pack_a_stack_elems<nnops::backend::cpu::half>()
-                          >= cpu::num_panels(mc, cpu::MR_F16) * cpu::LDD_A_F16);
-        NNOPS_EXPECT_TRUE(cpu::PACK_A_STACK_I8
-                          >= cpu::num_panels(mc, cpu::MR_I8) * cpu::LDD_A_I8);
+    // The packed-A region must hold the panels of whatever mc the dispatch
+    // actually picks — a per-block height <= plan.mc, not plan.mc itself. The
+    // greedy {mr,..,1} decomposition the pack emits is NOT monotonic in mc, so
+    // sizing the region at num_panels(plan.mc, mr) under-counts: {8,4,1} needs
+    // 21 panels at mc = 143 (17×8 + 4 + 1 + 1 + 1) but only 18 at mc = 144, so
+    // a region sized for a 144-row tile overruns by 3 panels when the shape
+    // clips the last block to 143 rows.
+    //
+    // The tile used to be a stack array sized at the compile-time worst case;
+    // it is now a slot in the plan's workspace, so this pins the plan's own
+    // arithmetic. Heights straddle the {8,4,1} boundary so the non-monotonic
+    // case is really reached, and transpose_a forces the packed-A route.
+    for (int64_t M : {int64_t{143}, int64_t{144}, int64_t{145}, int64_t{572},
+                      int64_t{1024}, int64_t{1152}}) {
+        MatmulInputs in = make_matmul_inputs(M, 128, 64, /*ta=*/true, false, false, 7);
+        MatMulAttributes attrs{};
+        attrs.transpose_a = true;
+        const auto a_desc = in.a.desc();
+        const auto b_desc = in.b.desc();
+
+        for (int nt : {1, 2, 4}) {
+            const auto plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, nt);
+            NNOPS_EXPECT_TRUE(plan.pack_a);
+
+            // The worst panel count over every height the block can hand the
+            // pack, demanded at the widest stride it can use: the kernel packs
+            // at actual_kc <= plan.kc, and ldd_a grows with kc, so plan.ldd_a
+            // is the bound. This is the whole invariant — num_panels_max, not
+            // num_panels(plan.mc, ..).
+            int worst = 0;
+            for (int mc = 1; mc <= static_cast<int>(plan.mc); ++mc) {
+                const int c = cpu::num_panels(mc, cpu::MR_F32);
+                worst = (c > worst) ? c : worst;
+            }
+            NNOPS_EXPECT_EQ(plan.np_a, int64_t{worst});
+
+            // Geometry: sized from the plan's own kc, and every part of the
+            // region 64-byte aligned so the slots after it stay aligned (the
+            // pack/MMA kernels assume that alignment).
+            const int64_t ldd_a = cpu::align_up<PANEL_ALIGN_BYTES>(
+                                      cpu::MR_MAX_F32 * static_cast<int>(plan.kc) * 4) / 4;
+            NNOPS_EXPECT_EQ(plan.ldd_a, ldd_a);
+            NNOPS_EXPECT_EQ(plan.pack_a_offset % 64, int64_t{0});
+            NNOPS_EXPECT_EQ((plan.np_a * plan.ldd_a * 4) % 64, int64_t{0});
+            NNOPS_EXPECT_EQ(plan.workspace_size,
+                            plan.pack_a_offset
+                                + plan.num_slots_a * plan.np_a * plan.ldd_a * 4);
+        }
     }
 }
 
@@ -1763,6 +1861,85 @@ NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
     }
 }
 
+NNOPS_TEST(matmul_tile_rule_properties) {
+    namespace cpu = nnops::backend::cpu;
+
+    // One rule now picks mc/nc/kc for every dtype: maximise the tile's reuse
+    // subject to (a) the aggregate L2 the concurrent blocks occupy, (b) an L1
+    // prefetch-residency bound, (c) the MC_MAX / NC_MAX ceiling, and (d) the
+    // panel grids — mc on MC_ALIGN, nc on NC_ALIGN, kc on KC_ALIGN. Pin all
+    // four so a change to the rule has to say so here instead of drifting.
+    //
+    // This is the guard on the rule itself; matmul_threaded_matches_serial
+    // remains the guard on its output.
+    struct Dtype {
+        DataType dt;
+        int mr_max, nr_max;
+        int64_t esz, kc_cap;
+    };
+    const Dtype dtypes[] = {
+        {DataType::f32, cpu::MR_MAX_F32, cpu::NR_MAX_F32, 4, cpu::KC_CAP_F32},
+        {DataType::f16, cpu::MR_MAX_F16, cpu::NR_MAX_F16, 2, cpu::KC_CAP_F16},
+        {DataType::s8,  cpu::MR_MAX_I8,  cpu::NR_MAX_I8,  1, cpu::KC_CAP_I8},
+    };
+
+    const auto& f = nnops::simd::CpuFeatures::get();
+    const int64_t l1 = static_cast<int64_t>(f.l1_cache_size());
+    const int64_t l2 = static_cast<int64_t>(f.l2_shared_cache_size());
+
+    const int64_t Ms[]  = {1, 7, 24, 100, 143, 256, 512, 1024, 4096};
+    const int64_t Ns[]  = {1, 8, 48, 100, 256, 1024, 2048};
+    const int64_t Ks[]  = {1, 32, 128, 129, 256, 512, 3000};
+    const int64_t nts[] = {1, 2, 4, 8, 16};
+
+    for (const Dtype& d : dtypes) {
+        for (int64_t M : Ms) {
+            for (int64_t N : Ns) {
+                for (int64_t K : Ks) {
+                    TensorDesc ad, bd;
+                    ad.rank = bd.rank = 2;
+                    ad.dtype = bd.dtype = d.dt;
+                    ad.dims.push_back(M); ad.dims.push_back(K);
+                    bd.dims.push_back(K); bd.dims.push_back(N);
+                    MatMulAttributes attrs{};
+                    for (int64_t nt : nts) {
+                        const auto p = cpu::get_matmul_plan(attrs, ad, bd, nt);
+
+                        // (c) ceiling, and (d) grid: below the align width the
+                        // tile sits on the mr/nr grid instead, so only the
+                        // large-tile case pins the alignment exactly.
+                        NNOPS_EXPECT_TRUE(p.mc <= cpu::MC_MAX);
+                        NNOPS_EXPECT_TRUE(p.mc % cpu::MC_ALIGN == 0 ||
+                                          p.mc < cpu::MC_ALIGN);
+                        NNOPS_EXPECT_TRUE(p.nc <= cpu::NC_MAX);
+                        NNOPS_EXPECT_TRUE(p.nc % cpu::NC_ALIGN == 0 ||
+                                          p.nc < cpu::NC_ALIGN);
+                        NNOPS_EXPECT_TRUE(p.kc % cpu::KC_ALIGN == 0 || p.kc == K);
+
+                        // kc never exceeds its dtype cap nor the reduction length.
+                        NNOPS_EXPECT_TRUE(p.kc <= d.kc_cap);
+                        NNOPS_EXPECT_TRUE(p.kc <= K);
+
+                        // (b) prefetch residency: mr_max rows of A plus the
+                        // current and next nr_max columns of B fit in L1.
+                        NNOPS_EXPECT_TRUE((d.mr_max + 2 * static_cast<int64_t>(d.nr_max)) *
+                                              p.kc * d.esz <= l1);
+
+                        // (a) aggregate L2 the concurrent blocks occupy. The
+                        // KC_MIN floor is the one escape — it can raise kc back
+                        // over the budget for a very large span at a high thread
+                        // count — so a floor hit is exempt rather than failing.
+                        const bool floored =
+                            p.kc == std::min<int64_t>(cpu::KC_MIN, K);
+                        NNOPS_EXPECT_TRUE(floored ||
+                                          nt * p.kc * (p.mc + p.nc) * d.esz <= l2 / 2);
+                    }
+                }
+            }
+        }
+    }
+}
+
 NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
     namespace cpu = nnops::backend::cpu;
 
@@ -1777,14 +1954,20 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
     // runs past the end. The plan now sizes both from the worst-case count for
     // a tile of nc columns.
     //
-    // K == 2*KC_F32 keeps the kernel's per-k-block panel stride equal to
-    // plan.ldd_b, so the demand checked below is exact, not merely bounded.
+    // These shapes resolve kc == K (256), so the kernel's per-k-block panel
+    // stride equals plan.ldd_b and the demand checked below is exact, not merely
+    // bounded. If the rule ever drops kc below K here the check still holds, it
+    // just stops being tight — the np_slice guard above is what pins the sizing.
     for (int64_t N : {int64_t{2000}, int64_t{2001}, int64_t{2047}, int64_t{2048}}) {
         MatmulInputs in = make_matmul_inputs(64, 256, N, false, false, false, 3);
         MatMulAttributes attrs{};
         const auto plan = cpu::get_matmul_plan(attrs, in.a.desc(), in.b.desc(), 4);
 
         NNOPS_EXPECT_TRUE(plan.split_n);
+        // The A row stride is K = 256, so this is the direct-A route and the
+        // packed-A region is empty — the offsets checked below are then pure
+        // packed-B, which is what makes them exact rather than merely bounded.
+        NNOPS_EXPECT_TRUE(!plan.pack_a);
         NNOPS_EXPECT_EQ(plan.num_slots, (N + plan.nc - 1) / plan.nc);
 
         // Panels the pack emits for each tile width the split can hand it.
@@ -1812,40 +1995,71 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
 }
 
 NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
-    // End-to-end cover for the same overflow. The plan shrinks mc to
-    // M / num_threads, so M = 572 with 4 workers gives mc = 143 — the {8,4,1}
-    // worst case. K == KC_F32 puts the pack at the full-Kc stride the buffer is
-    // sized at, and transpose_a forces pack_a, so the on-stack tile is used.
-    const int64_t M = 572, K = 128, N = 64;
-    MatmulInputs in = make_matmul_inputs(M, K, N, /*ta=*/true, /*tb=*/false, /*pad_b=*/false, 7);
+    // End-to-end cover for the {8,4,1} non-monotonicity the region sizing is
+    // there for: a short final block packs more panels than the tile's own
+    // height does (143 rows -> 21 panels, 144 -> 18), so a region sized at
+    // num_panels(plan.mc) is the one that overruns. mc is a multiple of
+    // MC_ALIGN = 24, and the worst count always sits one row under it (24k-1
+    // needs 3k+3 panels, 24k only 3k), so num_panels_max exceeds
+    // num_panels(plan.mc) for every tile the rule produces — which is why
+    // sizing must use the former.
+    //
+    // Both shapes reach the pack through the packed-A kernel (transpose_a) with
+    // K == plan.kc, so the pack uses the full-Kc stride the region is sized at.
+    // The rule sizes the M-split so the block count is a multiple of the worker
+    // count, which makes the last block exactly mc-1 rows here — the worst case
+    // is not hypothetical, it is what these two shapes actually pack:
+    //   - M = 575 with 4 workers: mc = 144 (575/4 rounded up to the 24-grid),
+    //     blocks 144,144,144,143.
+    //   - M = 287 with 2 workers: mc = 144, blocks 144,143.
+    struct Case { int64_t M; int nthreads; int64_t want_mc; };
+    const Case cases[] = {
+        {575, 4, 144},
+        {287, 2, 144},
+    };
 
-    MatMulAttributes attrs{};
-    attrs.transpose_a = true;
-    auto op = MatMul::create(attrs, Backend::CPU);
+    for (const Case& c : cases) {
+        const int64_t K = 128, N = 64;
+        MatmulInputs in = make_matmul_inputs(c.M, K, N, /*ta=*/true, /*tb=*/false,
+                                             /*pad_b=*/false, 7);
 
-    auto a_desc = in.a.desc();
-    auto b_desc = in.b.desc();
-    const TensorDesc arr[] = {a_desc, b_desc};
-    auto descs = op->getOutputTensorDesc(arr);
+        MatMulAttributes attrs{};
+        attrs.transpose_a = true;
+        auto op = MatMul::create(attrs, Backend::CPU);
 
-    // Pin the premise: if the tile-shrink rule changes, this case stops
-    // covering the bad remainder and the test should say so.
-    const auto plan = nnops::backend::cpu::get_matmul_plan(attrs, a_desc, b_desc, 4);
-    NNOPS_EXPECT_EQ(plan.mc, int64_t{143});
-    NNOPS_EXPECT_TRUE(plan.pack_a);
+        auto a_desc = in.a.desc();
+        auto b_desc = in.b.desc();
+        const TensorDesc arr[] = {a_desc, b_desc};
+        auto descs = op->getOutputTensorDesc(arr);
 
-    const TensorView ins[] = {in.a, in.b};
-    std::vector<float> got(descs[0].numel()), want(descs[0].numel());
-    auto out = test::make_planar(descs[0], got.data());
-    auto ref_out = test::make_planar(descs[0], want.data());
+        // Pin the premise: if the tile-shrink or clamp rule changes, these stop
+        // covering the bad remainder and the test should say so.
+        const auto plan = nnops::backend::cpu::get_matmul_plan(attrs, a_desc, b_desc,
+                                                               c.nthreads);
+        NNOPS_EXPECT_EQ(plan.mc, c.want_mc);
+        NNOPS_EXPECT_TRUE(plan.pack_a);
+        NNOPS_EXPECT_EQ(plan.np_a,
+                        int64_t{nnops::backend::cpu::num_panels_max(static_cast<int>(plan.mc), nnops::backend::cpu::MR_F32)});
+        // And np_a really does exceed num_panels(plan.mc) — the count a naive
+        // region sizing would use, and the one that would put the short block's
+        // extra panels past the end of the region.
+        NNOPS_EXPECT_TRUE(plan.np_a >
+                          nnops::backend::cpu::num_panels(static_cast<int>(plan.mc),
+                                                          nnops::backend::cpu::MR_F32));
 
-    SimplePool pool(4);
-    ComputeContext ctx;
-    ctx.cpu = pool.cpu;
-    op->compute(out, ins, ctx, nullptr);
-    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+        const TensorView ins[] = {in.a, in.b};
+        std::vector<float> got(descs[0].numel()), want(descs[0].numel());
+        auto out = test::make_planar(descs[0], got.data());
+        auto ref_out = test::make_planar(descs[0], want.data());
 
-    NNOPS_EXPECT_TRUE(test::allclose(out, ref_out, 1e-3f, 1e-4f));
+        SimplePool pool(c.nthreads);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        op->compute(out, ins, ctx, nullptr);
+        nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+        NNOPS_EXPECT_TRUE(test::allclose(out, ref_out, 1e-3f, 1e-4f));
+    }
 }
 
 NNOPS_TEST(matmul_threaded_multi_block_slots) {
@@ -1855,19 +2069,24 @@ NNOPS_TEST(matmul_threaded_multi_block_slots) {
     // M=200/N=300, where the split collapses to a single block, so this is the
     // one that actually exercises slot reuse. The result must stay bit-identical
     // to serial: blocks write disjoint C tiles and no reduction is reordered.
-    // Each entry is one (shape, pool) pair. The M=1024 shape gives 8 blocks
-    // (mc clamps to M/nt = 128 at 8 workers), so 8 threads is NOT slot mode
-    // there; M=2048 gives 15 blocks against 8 slots, which is the ratio the
-    // change is actually for. Only configs that really shrink are listed.
+    //
+    // The rule now sizes the M-split so the block count is a multiple of the
+    // worker count (balance_tile), so blocks == nthreads whenever M is under
+    // MC_MAX * nthreads = 768 * nthreads — and with one block per thread there
+    // is nothing to reuse a slot across. Slot mode therefore needs a big M now,
+    // not the M=1024 the old rule shrank to 8 blocks: every row below is in the
+    // thousands. The "ta" rows are the same shape as the "nn" ones with A
+    // stored transposed, so they reach the pack by the other route rather than
+    // by a different block count.
     struct Case { const char* name; int64_t M, K, N; bool ta; int nthreads; };
     const Case cases[] = {
-        {"nn",      1024, 128, 512, false, 2},
-        {"nn",      1024, 128, 512, false, 4},
-        {"ta",      1024, 128, 512, true,  2},
-        {"ta",      1024, 128, 512, true,  4},
-        {"nn-big",  2048, 512, 256, false, 2},
-        {"nn-big",  2048, 512, 256, false, 4},
-        {"nn-big",  2048, 512, 256, false, 8},
+        {"nn",      4096, 128, 512, false, 2},
+        {"nn",      4096, 128, 512, false, 4},
+        {"ta",      4096, 128, 512, true,  2},
+        {"ta",      4096, 128, 512, true,  4},
+        {"nn-big",  8192, 512, 256, false, 2},
+        {"nn-big",  8192, 512, 256, false, 4},
+        {"nn-big",  8192, 512, 256, false, 8},
     };
 
     for (const Case& c : cases) {

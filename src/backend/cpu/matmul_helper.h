@@ -12,6 +12,7 @@
 #include "nnops/core/tensor_view.hpp"          // TensorDesc
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <type_traits>
 
@@ -126,43 +127,61 @@ constexpr int align_up(int n) {
 //  Tiling constants (shared by matmul.cpp kernels and workspace sizing)
 // =========================================================================
 
-constexpr int64_t KC_F32   = 128;
-constexpr int64_t KC_F16   = 128;   // k-block length also bounds per-block fp16 accumulation error
+constexpr int64_t KC_F32   = 128;   // attention's k-block length (see attention.cpp)
+constexpr int64_t KC_F16   = 128;   // attention's f16 k-block length
 constexpr int64_t KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
 constexpr int64_t KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 
-constexpr int64_t MC_TARGET = 144;  // 144/6=24 (x86), 144/8=18 (aarch64)
+// ---- The tile problem ---------------------------------------------------
+//
+// mc, nc and kc all come out of ONE objective (see choose_matmul_tile): maximise
+// the tile's compute-to-traffic ratio
+//
+//     2·mc·nc·kc / (mc·kc + nc·kc + mc·nc)
+//
+// subject to
+//
+//     nt · kc · (mc + nc) · elem_bytes  <=  L2_shared / 2   (aggregate residency)
+//     (mr_max + 2·nr_max) · kc · elem_bytes  <  L1          (next-B prefetch)
+//     mc <= MC_MAX,  nc <= NC_MAX
+//
+// The three dimensions used to be three independent heuristics that shared this
+// budget without knowing about each other — a flat MC_TARGET, an nc capped at
+// NC_MAX regardless of thread count, and a kc clamped at MATMUL_KC_MAX. They are
+// now the limits of the one problem rather than its answer.
 
-// 64-byte aligned panel strides (in elements): ldd = align_up(mr_max * kc * sizeof(T), 64) / sizeof(T)
-constexpr int64_t LDD_A_F32 = (MR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
-constexpr int64_t LDD_B_F32 = (NR_MAX_F32 * KC_F32 * 4 + 63) / 64 * 16;
-constexpr int64_t LDD_A_F16 = (MR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
-constexpr int64_t LDD_B_F16 = (NR_MAX_F16 * KC_F16 * 2 + 63) / 64 * 32;
+/// Ceiling on both tile dimensions.
+constexpr int64_t MC_MAX = 768;
+constexpr int     NC_MAX = 768;
 
-// =========================================================================
-//  Nc from L2 constraint
-// =========================================================================
-// From: (mr × Kc + Nc × Kc + mr × Nc) × 2 × elem_size < L2_SIZE
-// → Nc < (L2_SIZE / (2 × elem_size) - mr × Kc) / (Kc + mr)
+/// mc decomposes into mr_max panels; lcm(6, 8) = 24 covers x86_64 and aarch64, so
+/// a 24-aligned mc leaves no partial A panel on either. (48, the nc grid, would
+/// break M-split exactness: M=1024 on 8 workers wants mc=128, and 128 snaps to 96.)
+constexpr int64_t MC_ALIGN = 24;
 
-inline int compute_nc(int mr_max, int kc, int elem_bytes, size_t l2_size) noexcept {
-    int denom = 2 * elem_bytes;
-    int rhs   = static_cast<int>(l2_size / denom) - mr_max * kc;
-    denom = kc + mr_max;
-    return (rhs / denom) - 1;  // -1 for safety margin
-}
-
-/// Cap on the n-tile. The L2 heuristic alone asks for tiles thousands of
-/// columns wide (3840 f32 / 7696 f16 on a 4 MiB L2), which makes each block's
-/// packed B a couple of MB — more than the kernel needs resident at once, and
-/// it leaves little of the cache for the A panels and C tile beside it.
-constexpr int NC_MAX = 1024;
-
-/// Panel-grid multiple for the n-tile: the LCM of the two fp nr_max values
-/// (12 and 16). An NC_ALIGN-wide tile therefore decomposes into equal
-/// nr_max-wide panels with no tail at all, and it is a multiple of every nr_max
-/// the pack can be given — fp or int8.
+/// nc decomposes into nr_max panels: lcm(12, 16) = 48 is a multiple of every
+/// nr_max the pack can be given — fp or int8.
 constexpr int NC_ALIGN = 48;
+
+constexpr int64_t KC_MIN   = 128;
+constexpr int64_t KC_ALIGN = 32;
+
+/// Per-dtype kc ceilings. f32 and f16 share one; int8 keeps its historical 512.
+/// The aggregate model would otherwise ask for 1344+ on int8 — with
+/// elem_bytes == 1 it sees room the pack and the s8 accumulator actually use.
+///
+/// 128 on the float paths is not a budget limit but a length limit: the aarch64
+/// f16 kernel accumulates in f16, so kc is how many products round into the
+/// accumulator before the C read-modify-write. At K = 4096, kc 128 -> 256 moved
+/// the worst deviation 0.183 -> 0.230 (relative to an output magnitude of ~80,
+/// 0.23% -> 0.29%); the shorter block is kept.
+constexpr int64_t KC_CAP_F32 = 128;
+constexpr int64_t KC_CAP_F16 = 128;
+constexpr int64_t KC_CAP_I8  = 512;
+
+// =========================================================================
+//  Panel-grid snapping
+// =========================================================================
 
 inline int round_down_nc(int nc, int nr_max) noexcept {
     return (nc / nr_max) * nr_max;
@@ -176,12 +195,6 @@ inline int round_nc_target(int nc, int nr_max) noexcept {
     return (nc >= NC_ALIGN) ? round_down_nc(nc, NC_ALIGN) : round_down_nc(nc, nr_max);
 }
 
-/// The n-tile target from the L2 working-set bound, capped at NC_MAX.
-inline int compute_nc_capped(int mr_max, int kc, int elem_bytes, size_t l2_size) noexcept {
-    const int nc = compute_nc(mr_max, kc, elem_bytes, l2_size);
-    return (nc < NC_MAX) ? nc : NC_MAX;
-}
-
 /// Clamp nc into [nr_max, N] so the NKM loop always makes progress and the
 /// workspace sizing matches the kernel exactly (N >= 1 guaranteed by shape).
 inline int clamp_nc(int nc, int nr_max, int N) noexcept {
@@ -190,14 +203,151 @@ inline int clamp_nc(int nc, int nr_max, int N) noexcept {
     return nc;
 }
 
-/// Resolve the tile sizes (mc, nc) for a GEMM of M×N with the given panel
-/// maxima and Kc. Single source of truth for both kernels and sizing.
-inline void resolve_tile_sizes(int64_t  M, int64_t N, int64_t mr_max, int64_t nr_max, int64_t kc,
-                               int elem_bytes, int& mc, int& nc) noexcept {
-    mc = std::min(MC_TARGET, M);
-    size_t l2_size = simd::CpuFeatures::get().l2_cache_size();
-    nc = clamp_nc(round_nc_target(compute_nc_capped(mr_max, kc, elem_bytes, l2_size), nr_max),
-                  nr_max, N);
+inline int64_t snap_down(int64_t v, int64_t align) noexcept {
+    return (v / align) * align;
+}
+
+/// Integer square root, exact (std::sqrt on doubles is not reliable near the
+/// boundaries this feeds).
+inline int64_t isqrt_i64(int64_t v) noexcept {
+    if (v <= 0) { return 0; }
+    int64_t r = static_cast<int64_t>(std::sqrt(static_cast<double>(v)));
+    while (r > 0 && r * r > v) { --r; }
+    while ((r + 1) * (r + 1) <= v) { ++r; }
+    return r;
+}
+
+/// kc bound from the prefetch residency requirement: the kernel holds the
+/// current A micro-panel (mr_max × kc) plus TWO B micro-panels (nr_max × kc) —
+/// the one being consumed and the one being prefetched for the next n-step. All
+/// three must sit in L1 together or the prefetch evicts what it is feeding.
+inline int64_t kc_prefetch_bound(int mr_max, int nr_max, int elem_bytes,
+                                 size_t l1_bytes) noexcept {
+    const int64_t per_kc = static_cast<int64_t>(mr_max + 2 * nr_max) * elem_bytes;
+    return (per_kc > 0) ? snap_down(static_cast<int64_t>(l1_bytes) / per_kc, KC_ALIGN)
+                        : 0;
+}
+
+/// Tile height/width for one dimension of a split, chosen so the pool can fill
+/// every worker. @p cap is the largest tile the reuse objective allows; the result
+/// never exceeds it, so this trades reuse away only as far as balance needs.
+///
+/// Maximising reuse alone picks a tile so wide that the dimension splits into
+/// fewer blocks than there are workers: at 4 workers a 1024-row M resolved to
+/// mc = 768 (2 blocks), so two workers idled while the other two ran double
+/// (measured 0.72x against the previous rule, and the same at 2 workers with 3
+/// blocks). Targeting a block count that is a multiple of @p nt keeps every
+/// worker at the same number of blocks instead.
+///
+/// One worker is exempt: with a single thread there is nothing to balance, so the
+/// tile stays at the cap and the dimension is only clamped to fit.
+inline int64_t balance_tile(int64_t dim, int64_t cap, int64_t align,
+                            int64_t nt) noexcept {
+    if (dim <= 0) { return 1; }
+    const int64_t cap_a = std::max<int64_t>(snap_down(std::min(cap, dim), align), align);
+    if (nt <= 1) { return std::min<int64_t>(cap_a, dim); }
+
+    // Fewest blocks the cap allows, rounded up to a whole number of blocks per
+    // worker; the tile is then the aligned even share of that many blocks.
+    const int64_t nb_min = std::max<int64_t>((dim + cap_a - 1) / cap_a, 1);
+    const int64_t nb = ((nb_min + nt - 1) / nt) * nt;
+    int64_t tile = (((dim + nb - 1) / nb) + align - 1) / align * align;
+    tile = std::min<int64_t>(tile, cap_a);
+    return std::min<int64_t>(std::max<int64_t>(tile, 1), dim);
+}
+
+/// Shared core of the two entry points below. @p kc_fixed > 0 pins kc and sizes
+/// mc/nc around it; 0 lets the solver choose kc too.
+inline void choose_tile_impl(int64_t M, int64_t N, int64_t K,
+                             int mr_max, int nr_max, int elem_bytes,
+                             int64_t num_threads, bool split_n,
+                             int64_t kc_cap, int64_t kc_fixed,
+                             size_t l1_bytes, size_t l2_bytes,
+                             int64_t& mc, int64_t& nc, int64_t& kc) noexcept {
+    const int64_t nt  = std::max<int64_t>(num_threads, 1);
+    const int64_t esz = std::max<int64_t>(elem_bytes, 1);
+
+    // kc·(mc+nc) <= C is the aggregate residency budget: all nt concurrent blocks
+    // hold their own packed A and packed B for the k-block at the same time.
+    const int64_t C = static_cast<int64_t>(l2_bytes) / (2 * nt * esz);
+
+    if (kc_fixed > 0) {
+        // Fixed kc (attention pins its own): spend what is left on the tile.
+        kc = std::min<int64_t>(std::max<int64_t>(kc_fixed, 1), std::max<int64_t>(K, 1));
+    }
+
+    // With a free kc, maximising 2·mc·nc·kc/(mc·kc+nc·kc+mc·nc) over mc == nc at
+    // kc·(mc+nc) == C gives mc = nc = sqrt(C), kc = sqrt(C)/2 — the point where
+    // one more row/column and one more k are worth the same. With kc pinned the
+    // objective is monotonic in mc == nc, so the tile takes the whole budget.
+    const int64_t s_cap = 2 * MC_MAX;
+    int64_t s = (kc_fixed > 0) ? (kc > 0 ? C / kc : s_cap) : 2 * isqrt_i64(C);
+    s = std::min(s, s_cap);
+    s = std::max(s, MC_ALIGN + NC_ALIGN);
+
+    int64_t mc_t = std::max<int64_t>(snap_down(std::min(s / 2, MC_MAX), MC_ALIGN), MC_ALIGN);
+    int64_t nc_t = std::max<int64_t>(
+        snap_down(std::min(s - mc_t, static_cast<int64_t>(NC_MAX)), NC_ALIGN), NC_ALIGN);
+
+    // Routing. The split dimension is the one the pool divides, so it is the one
+    // that has to be balanced across workers; the other spans whole and is only
+    // bounded by the ceiling and the shape.
+    int64_t mc_raw, nc_raw;
+    if (split_n) {
+        mc_raw = snap_down(std::min(mc_t, std::max<int64_t>(M, 1)), MC_ALIGN);
+        nc_raw = balance_tile(std::max<int64_t>(N, 1), nc_t, NC_ALIGN, nt);
+    } else {
+        mc_raw = balance_tile(std::max<int64_t>(M, 1), mc_t, MC_ALIGN, nt);
+        nc_raw = std::min(nc_t, std::max<int64_t>(N, 1));
+    }
+    mc = std::max<int64_t>(mc_raw, 1);
+
+    nc = clamp_nc(round_nc_target(static_cast<int>(std::min(nc_raw, std::max<int64_t>(N, 1))),
+                                  nr_max),
+                  nr_max, static_cast<int>(std::max<int64_t>(N, 1)));
+
+    if (kc_fixed > 0) { return; }
+
+    // Routing may have left budget on the table (a short M, a small nt); hand it
+    // back to kc rather than wasting it.
+    const int64_t span = std::max<int64_t>(mc + nc, 1);
+    int64_t lim = (C > 0) ? C / span : 0;
+    lim = std::min(lim, kc_prefetch_bound(mr_max, nr_max, elem_bytes, l1_bytes));
+    lim = std::min(lim, kc_cap);
+    lim = std::min(lim, std::max<int64_t>(K, 1));
+
+    kc = snap_down(lim, KC_ALIGN);
+    const int64_t floor_kc = std::min<int64_t>(KC_MIN, std::max<int64_t>(K, 1));
+    if (kc < floor_kc) { kc = floor_kc; }
+    kc = std::min(kc, std::max<int64_t>(K, 1));
+    if (kc < 1) { kc = 1; }
+}
+
+/// Resolve (mc, nc, kc) for a GEMM of M×N, K deep. Single source of truth for
+/// both kernel routing and workspace sizing.
+inline void choose_matmul_tile(int64_t M, int64_t N, int64_t K,
+                               int mr_max, int nr_max, int elem_bytes,
+                               int64_t num_threads, bool split_n, int64_t kc_cap,
+                               size_t l1_bytes, size_t l2_bytes,
+                               int64_t& mc, int64_t& nc, int64_t& kc) noexcept {
+    choose_tile_impl(M, N, K, mr_max, nr_max, elem_bytes, num_threads, split_n,
+                     kc_cap, /*kc_fixed=*/0, l1_bytes, l2_bytes, mc, nc, kc);
+}
+
+/// Resolve the tile sizes (mc, nc) for a GEMM of M×N with the caller's own fixed
+/// Kc — attention pins its k-block and only wants the two spatial dimensions.
+/// Same rule as choose_matmul_tile, so the two stay in step.
+inline void resolve_tile_sizes(int64_t M, int64_t N, int64_t mr_max, int64_t nr_max,
+                               int64_t kc, int elem_bytes, int64_t num_threads,
+                               int& mc, int& nc) noexcept {
+    const auto& f = simd::CpuFeatures::get();
+    int64_t mc64 = 0, nc64 = 0, kc_out = 0;
+    choose_tile_impl(M, N, /*K=*/kc, static_cast<int>(mr_max), static_cast<int>(nr_max),
+                     elem_bytes, num_threads, /*split_n=*/N > M, /*kc_cap=*/kc,
+                     /*kc_fixed=*/kc, f.l1_cache_size(), f.l2_shared_cache_size(),
+                     mc64, nc64, kc_out);
+    mc = static_cast<int>(mc64);
+    nc = static_cast<int>(nc64);
 }
 
 // =========================================================================
@@ -268,14 +418,14 @@ constexpr int num_panels4(int n, const int* nr) noexcept {
 ///
 /// The greedy decomposition above is NOT monotonic in n: with {8,4,1} a 143-row
 /// tile needs 21 panels (17×8 + 4 + 1 + 1 + 1) while a 144-row tile needs only
-/// 18 (18×8). So sizing a buffer at num_panels(MC_TARGET, mr) is wrong — the
+/// 18 (18×8). So sizing a buffer at num_panels(mc, mr) is wrong — the
 /// *smaller* tile is the one that overflows it:
 ///
 ///   aarch64 MR = {8,4,1}: 18 at mc=144, worst 21 at mc=143
 ///   x86_64  MR = {6,4,1}: 24 at mc=144, worst 26 at mc=141
 ///
-/// Anything holding the panels of an arbitrary mc <= MC_TARGET (the on-stack
-/// packed-A tile) must size with this maximum, not with num_panels(n, mr).
+/// Anything holding the panels of an arbitrary height (the packed-A tile) must
+/// size with this maximum, not with num_panels(n, mr).
 ///
 /// Computed in closed form rather than by scanning [1, n]: the scan is
 /// O(n*levels) and runs on the per-plan path (n = the tile width, up to NC_MAX —
@@ -303,27 +453,20 @@ constexpr int num_panels_max4(int n, const int* nr) noexcept {
     return num_panels_max(n, nr, 4);
 }
 
-/// Stack-resident packed-A buffer size (elements) for one MC_TARGET×Kc tile at
-/// the full-Kc uniform stride — an upper bound for every per-k-block pack:
-///   f32 84 KB (aarch64) / 78 KB (x86_64), f16 exactly half of that.
-/// The panel count is num_panels_max, not num_panels(MC_TARGET, mr): the tile
-/// the kernel actually packs is a per-block mc <= MC_TARGET, whose greedy
-/// decomposition can need more panels than MC_TARGET's does (see
-/// num_panels_max). Declared with alignas in the kernel.
-template <class T>
-constexpr int pack_a_stack_elems() {
-    constexpr const int* mr    = std::is_same_v<T, float> ? MR_F32 : MR_F16;
-    constexpr int       ldd_a  = std::is_same_v<T, float> ? LDD_A_F32 : LDD_A_F16;
-    return num_panels_max(MC_TARGET, mr) * ldd_a;
-}
-
-// int8 packed-A stack buffer: the panel stride is in bytes (int8 = 1 byte/elem),
-// so LDD_A_I8 = align_up(MR_MAX_I8 * KC_I8, 64) and the buffer holds
-// num_panels_max(MC_TARGET, MR_I8) panels at that full-Kc stride (21 on
-// aarch64 / 26 on x86_64 — not the 18 / 24 that MC_TARGET itself decomposes
-// into, which several smaller mc would overflow; see num_panels_max).
-constexpr int LDD_A_I8 = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * KC_I8);
-constexpr int PACK_A_STACK_I8 = num_panels_max(MC_TARGET, MR_I8) * LDD_A_I8;
+/// The kernel's packed-A tile lives in the plan's workspace, not on the stack:
+/// one region of `num_slots_a` slots, each holding `num_panels_max(mc, MR)`
+/// panels at the plan's full-kc panel stride (see MatMulPlan::np_a/ldd_a).
+///
+/// It is sized from the plan's own mc and kc rather than from a fixed target
+/// tile and k-block, which is what makes the region a bound instead of a worst
+/// case: every per-block tile has `actual_mc <= mc` and `actual_kc <= kc`. The
+/// panel count must still be num_panels_max and not num_panels(mc, ..) — the
+/// greedy decomposition is not monotonic in the tile height, so a *shorter*
+/// tile can need more panels than the height it is sized for.
+///
+/// The stride is in bytes for int8 (1 byte/elem) and in elements for fp; both
+/// go through align_up<PANEL_ALIGN_BYTES>, so every slot and the region itself
+/// are 64-byte aligned, which is what the pack/MMA kernels assume.
 
 // ---- public API --------------------------------------------------------
 //
@@ -391,10 +534,19 @@ struct MatMulPlan {
     bool    pack_a;           // A is packed (transpose_a, wide row stride, or int8)
     bool    split_n;          // split on N (else on M)
     int64_t num_slots;        // packed-B slices allocated (<= num_blocks)
-    int64_t workspace_size;   // scratch bytes for packed B
+    int64_t workspace_size;   // total scratch bytes: packed B, then packed A
+
+    // Packed-A region, which begins at pack_a_offset — the end of the packed-B
+    // region — and runs to workspace_size. ldd_a, np_a and num_slots_a are all
+    // zero when !pack_a: the direct-A route never touches the buffer, so it pays
+    // nothing for it, and pack_a_offset is then just the end of packed B.
+    int64_t ldd_a;            // panel stride at full kc (elements; bytes for int8)
+    int64_t np_a;             // panels one packed-A tile holds (num_panels_max(mc, MR))
+    int64_t num_slots_a;      // packed-A slots (see get_matmul_plan)
+    int64_t pack_a_offset;    // byte offset of the region (== the packed-B size)
 };
 
-/// Resolve the tile sizes, the split direction and the packed-B scratch layout.
+/// Resolve the tile sizes, the split direction and the packed-A/B scratch layout.
 ///
 /// Covers f32, f16 and s8×s8. Only `kc`, the panel lists and `num_slots` differ
 /// per dtype; the thread-aware mc/nc shrink is shared, which is what makes the
@@ -407,6 +559,15 @@ struct MatMulPlan {
 /// than one slot per parallel block. Blocks are only ever live one at a time
 /// per thread, so this is the same buffer the dispatch would have handed each
 /// block on its own — it just stops paying for one copy per block.
+///
+/// num_slots_a follows the same idea but with its own predicate, and that
+/// difference is load-bearing: the int8 M-split hoists its *B* pack out of the
+/// parallel region (so num_slots == 1 there) while every m-block still packs its
+/// own A. The dispatch must therefore decide the A slot from `num_slots_a`, not
+/// from `num_slots`. A single thread always gets one A slot regardless of the
+/// block count — a sequential run cannot have two A tiles live at once, and
+/// sizing it per block is what would push a large M-split past the memory
+/// pool's 16 MiB ceiling and turn a pooled allocation into a per-call OS one.
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,

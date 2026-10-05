@@ -535,16 +535,17 @@ NNOPS_TEST(matmul_int8_batched_nsplit_s32) {
 }
 
 NNOPS_TEST(matmul_int8_packed_a_bad_remainder_s32) {
-    // Regression: the on-stack packed-A tile is sized by the panel count of
-    // MC_TARGET itself (mc = 144 -> 18 panels of mr = 8), but the greedy
-    // {8,4,1} decomposition the pack actually emits is NOT monotonic in mc —
-    // a *smaller* tile needs more panels (142 -> 20, 143 -> 21). An m-slab
-    // landing on one of those wrote up to 3 panels (12 KB) past the buffer.
+    // Regression: the packed-A region is sized by the panel count of the tile's
+    // own mc (mc = 144 -> 18 panels of mr = 8), but the greedy {8,4,1}
+    // decomposition the pack actually emits is NOT monotonic in mc — a *smaller*
+    // tile needs more panels (142 -> 20, 143 -> 21). An m-slab landing on one of
+    // those wrote past the buffer. The sizing now uses num_panels_max over the
+    // whole tile, so it holds for any mc the rule produces.
     //
-    // Reached through the public op: an M-split whose slab height is ~M /
-    // ceil(M / 144), with K == KC_I8 so the pack uses the full-Kc panel stride
-    // the buffer is sized at. Slab heights of 142/143 appear for many M, which
-    // is why this is worth a regression case rather than a comment.
+    // Reached through the public op: an M-split whose slab height lands one of
+    // those non-monotonic widths, with K == KC_I8 so the pack uses the full-Kc
+    // panel stride the buffer is sized at. Such slab heights appear for many M,
+    // which is why this is worth a regression case rather than a comment.
     for (int64_t M : {1152, 2048, 2304, 2560, 2688, 3072, 4096}) {
         const int64_t K = 512, N = 256;   // K == KC_I8 -> full-Kc stride
         I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 900 + static_cast<uint64_t>(M));
@@ -597,38 +598,63 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     namespace cpu = nnops::backend::cpu;
 
     // int8 used to resolve its own tiles with no thread awareness (mc was always
-    // min(MC_TARGET, M)), so a small M produced two blocks however big the pool
+    // a fixed clamp on M), so a small M produced two blocks however big the pool
     // was. It now goes through get_matmul_plan, whose thread-aware mc/nc shrink
     // is what makes the block count grow with the pool.
+    //
+    // mc is now bounded by MC_MAX (768) and the shape, then balanced on an
+    // M-split: the block count is rounded up to a multiple of the pool and the
+    // tile is that even share, rounded up to MC_ALIGN (24).
     const auto p1  = i8_plan(256, 256, 256, 1);
     const auto p10 = i8_plan(256, 256, 256, 10);
     NNOPS_EXPECT_TRUE(!p10.split_n);                     // M >= N → split on M
-    NNOPS_EXPECT_EQ(p1.mc, cpu::MC_TARGET);              // 256 > MC_TARGET → clamped
+    NNOPS_EXPECT_EQ(p1.mc, int64_t{240});                // snap24(min(768, 256))
     NNOPS_EXPECT_EQ(cpu::split_block_count(256, p1.mc), int64_t{2});
-    NNOPS_EXPECT_EQ(p10.mc, int64_t{25});                // 256 / 10
-    NNOPS_EXPECT_EQ(cpu::split_block_count(256, p10.mc), int64_t{11});
+    NNOPS_EXPECT_EQ(p10.mc, int64_t{48});                // ceil24(256 / 10) → 6 blocks
+    NNOPS_EXPECT_EQ(cpu::split_block_count(256, p10.mc), int64_t{6});
 
-    // The shape the int8 scaling was measured on: at one thread mc is already
-    // MC_TARGET, so the pool is what moves the block count.
+    // The shape the int8 scaling was measured on: at one thread mc is the 768
+    // ceiling, so the pool is what moves the block count.
     const auto b1  = i8_plan(1024, 512, 1024, 1);
     const auto b10 = i8_plan(1024, 512, 1024, 10);
-    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b1.mc), int64_t{8});
-    NNOPS_EXPECT_EQ(b10.mc, int64_t{102});
-    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b10.mc), int64_t{11});
+    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b1.mc), int64_t{2});   // mc = 768
+    NNOPS_EXPECT_EQ(b10.mc, int64_t{120});               // ceil24(1024 / 10)
+    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b10.mc), int64_t{9});
 
     // int8 has no direct-A route, so A is packed however narrow its row stride.
     NNOPS_EXPECT_TRUE(b10.pack_a);
 
     // M-split: the B pack is hoisted out of the parallel region, so one slice
-    // serves every m-block and the workspace is one full-N slice either way.
+    // serves every m-block and the B region is one full-N slice either way.
+    //
+    // The packed-A region is separate and is NOT hoisted — every m-block packs
+    // its own A — so it is the one place where num_slots (1, the hoisted B) and
+    // num_slots_a disagree. That is why the dispatch picks the A slot from
+    // num_slots_a rather than from num_slots.
     const int64_t ldd_b = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * 512);
     const int64_t one_slice = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b;
     NNOPS_EXPECT_EQ(b10.kc, int64_t{512});               // min(KC_I8, K)
     NNOPS_EXPECT_EQ(b10.ldd_b, ldd_b);
     NNOPS_EXPECT_EQ(b1.num_slots, int64_t{1});
     NNOPS_EXPECT_EQ(b10.num_slots, int64_t{1});
-    NNOPS_EXPECT_EQ(b1.workspace_size, one_slice);
-    NNOPS_EXPECT_EQ(b10.workspace_size, one_slice);
+    NNOPS_EXPECT_EQ(b1.pack_a_offset, one_slice);
+    NNOPS_EXPECT_EQ(b10.pack_a_offset, one_slice);
+
+    // One thread gets one A slot whatever the block count; b1's A region is
+    // therefore a single tile, and workspace_size is pack_a_offset plus exactly
+    // that. (b10 reports 10 threads but the pool is what installs the thread
+    // ids — i8_plan passes no hooks, so A falls back to one slot per m-block.)
+    const int64_t b1_ldd_a = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::MR_MAX_I8 * 512);
+    const int64_t b1_np_a  = cpu::num_panels_max(static_cast<int>(b1.mc), cpu::MR_I8);
+    NNOPS_EXPECT_EQ(b1.num_slots_a, int64_t{1});
+    NNOPS_EXPECT_EQ(b1.ldd_a, b1_ldd_a);
+    NNOPS_EXPECT_EQ(b1.np_a, b1_np_a);
+    NNOPS_EXPECT_EQ(b1.workspace_size, one_slice + b1_np_a * b1_ldd_a);
+
+    const int64_t b10_blocks = cpu::split_block_count(int64_t{1024}, b10.mc);
+    const int64_t b10_np_a   = cpu::num_panels_max(static_cast<int>(b10.mc), cpu::MR_I8);
+    NNOPS_EXPECT_EQ(b10.num_slots_a, b10_blocks);
+    NNOPS_EXPECT_EQ(b10.workspace_size, one_slice + b10_blocks * b10_np_a * b10.ldd_a);
 
     // N-split (N > M): each n-block owns a slice, sized at the worst-case panel
     // count for a tile of nc columns — the last block packs N mod nc columns,
@@ -641,7 +667,12 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     const int64_t np_max = cpu::num_panels_max4(static_cast<int>(n10.nc), cpu::NR_I8);
     NNOPS_EXPECT_TRUE(np_max > cpu::num_panels4(static_cast<int>(n10.nc), cpu::NR_I8));
     NNOPS_EXPECT_EQ(n10.num_slots, n_blocks);
-    NNOPS_EXPECT_EQ(n10.workspace_size, n_blocks * np_max * ldd_b);
+    NNOPS_EXPECT_EQ(n10.pack_a_offset, n_blocks * np_max * ldd_b);
+    NNOPS_EXPECT_EQ(n10.num_slots_a, n_blocks);   // per-block: no thread ids here
+    NNOPS_EXPECT_EQ(n10.workspace_size,
+                    n10.pack_a_offset
+                        + n_blocks * cpu::num_panels_max(static_cast<int>(n10.mc), cpu::MR_I8)
+                          * n10.ldd_a);
 }
 
 // ============================================================
@@ -749,14 +780,14 @@ void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uin
 }  // anonymous namespace
 
 NNOPS_TEST(matmul_int8_threaded_matches_ref) {
-    // With a pool the plan shrinks mc (M-split, once M/nt drops below
-    // MC_TARGET) and nc (N-split), so the decomposition differs per thread
+    // With a pool the plan shrinks mc (M-split, once M/nt drops below MC_MAX or
+    // the L2 budget) and nc (N-split), so the decomposition differs per thread
     // count. Both int8 splits, plus the s8 accumulator and requant epilogue,
     // must still match the reference element for element.
     for (int nt : {2, 4, 8}) {
         expect_i8_threaded_matches_ref<int32_t>(512, 512, 128, nt, 11);   // M-split
         expect_i8_threaded_matches_ref<int32_t>(128, 512, 512, nt, 12);   // N-split
-        expect_i8_threaded_matches_ref<int32_t>(256, 256, 256, nt, 13);   // mc < MC_TARGET
+        expect_i8_threaded_matches_ref<int32_t>(256, 256, 256, nt, 13);   // mc < MC_MAX
         expect_i8_threaded_matches_ref<int32_t>(1024, 512, 1024, nt, 14); // the measured shape
     }
     expect_i8_threaded_matches_ref<int8_t>(512, 512, 128, 4, 15);

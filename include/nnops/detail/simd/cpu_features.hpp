@@ -71,17 +71,39 @@ public:
     /// Raw feature bitmask.
     uint32_t raw() const { return features_; }
 
+    /// L1 data cache size in bytes.
+    ///
+    /// On Apple Silicon `hw.l1dcachesize` reports the *efficiency* cluster's L1D
+    /// (64 KiB on an M4) while the performance cluster has 128 KiB. The smaller
+    /// figure is the useful one: worker threads land on either cluster, so a
+    /// working set sized for the bigger one overflows on the E cores.
+    /// Defaults to 32768 (a typical x86 L1D) when no detection path is available.
+    size_t l1_cache_size() const { return l1_cache_size_; }
+
     /// L2 cache size in bytes (per-core). Detected via CPUID on x86_64 and
     /// OS cache queries on AArch64; defaults to 262144 (256KB) when no
     /// detection path is available.
     size_t l2_cache_size() const { return l2_cache_size_; }
+
+    /// L2 in bytes shared by the cores the compute actually lands on.
+    ///
+    /// On Apple Silicon `hw.l2cachesize` reports the *efficiency* cluster's L2
+    /// (4 MiB on an M4) while the performance cluster has 16 MiB, so tiling
+    /// heuristics keyed off l2_cache_size() would size themselves against a
+    /// cache four times smaller than the one the work runs in. Equals
+    /// l2_cache_size() everywhere the two cannot differ.
+    size_t l2_shared_cache_size() const {
+        return l2_shared_cache_size_ ? l2_shared_cache_size_ : l2_cache_size_;
+    }
 
 private:
     CpuFeatures() { detect(); }
     void detect();
 
     uint32_t features_ = 0;
+    size_t l1_cache_size_ = 32768;   // 32KB default (typical x86 L1D)
     size_t l2_cache_size_ = 262144;  // 256KB default (Haswell baseline)
+    size_t l2_shared_cache_size_ = 0;  // 0 = no separate value known
 };
 
 // ============================================================

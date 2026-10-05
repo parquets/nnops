@@ -554,10 +554,10 @@ AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
 
     int mc1, nc1;
     resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(Sk),
-                       mr_max, nr_max, kc, esz, mc1, nc1);
+                       mr_max, nr_max, kc, esz, num_threads, mc1, nc1);
     int mc2, nc2;
     resolve_tile_sizes(static_cast<int>(Sq), static_cast<int>(D),
-                       mr_max, nr_max, kc, esz, mc2, nc2);
+                       mr_max, nr_max, kc, esz, num_threads, mc2, nc2);
     plan.mc1 = mc1; plan.nc1 = nc1;
     plan.mc2 = mc2; plan.nc2 = nc2;
 

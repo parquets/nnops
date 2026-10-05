@@ -4,8 +4,8 @@
 ///        Loop order is plan-driven: NKM (split on N) or MKN (split on M),
 ///        selected by get_matmul_plan() in matmul_helper.h.
 ///
-/// Scratch (pack buffer for B) is pooled internally, sized by the plan;
-/// packed A lives on the kernel stack.
+/// Scratch (the pack buffers for both A and B) is pooled internally, sized by
+/// the plan — neither one lives on the kernel stack.
 
 #include <cstddef>
 #include <span>

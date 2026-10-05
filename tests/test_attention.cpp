@@ -331,7 +331,7 @@ NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
     // full tile — the worst remainder for the panel decomposition.
     struct Case { bool f16; int64_t Sq, D, Sk; };
     const Case cases[] = {
-        {false,  8, 128, 7679},   // standard path, Sk = 2*nc1 - 1
+        {false,  8, 128, 7679},   // standard path, Sk = 10*nc1 - 1 (nc1 = 768)
         {false, 33, 128, 2047},   // flash, Sk = 2*Bc - 1
         {false, 65, 256, 1023},   // flash, D = 2*Kc
         {true,  17, 128, 4095},   // flash, f16 (NR_F16 has a wider gap)

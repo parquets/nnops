@@ -1,8 +1,8 @@
 /// @file matmul.cpp
 /// @brief Tiled matrix multiplication kernel — pack + MMA dispatch.
 ///
-/// B (rhs) is always packed into pooled scratch; A (lhs) is packed on the
-/// per-thread stack only when transpose_a forces it or its row stride is
+/// B (rhs) is always packed into pooled scratch; A (lhs) is packed into a slot
+/// of that same workspace only when transpose_a forces it or its row stride is
 /// page-scattered, else read directly. Tiling, the pack decision, the split
 /// direction, and the workspace size all come from get_matmul_plan()
 /// (matmul_helper): the loop order is NKM when split on N, MKN when split on M.
@@ -77,6 +77,8 @@ inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept {
 /// identical pack/MMA/epilogue logic. @p packed_b holds @p n_count columns for
 /// this k-block (its panel stride is derived internally from @p actual_kc);
 /// @p m_start/@p m_count and @p n_start/@p n_count select the C tile.
+/// @p pack_a_slice is the caller's packed-A slot, untouched when @p pack_a is
+/// false (the direct route reads A through @p lda).
 template <typename T>
 void matmul_tile(const MatMulAttributes& attrs,
                  T* c_ptr, int ldc,
@@ -84,18 +86,12 @@ void matmul_tile(const MatMulAttributes& attrs,
                  int m_start, int m_count, int mc,
                  int n_start, int n_count,
                  int k, int actual_kc, bool last_k,
-                 bool pack_a, const T* packed_b)
+                 bool pack_a, const T* packed_b, T* pack_a_slice)
 {
     // The tallest A micro-panel this tile can be packed into, which is what sizes
     // the packed-A panel stride below. Routing is irrelevant here: tile_mma_direct
-    // reads A through lda and never touches ldd_a/pack_a_buf.
+    // reads A through lda and never touches ldd_a/pack_a_slice.
     constexpr int mr_max = mr_max_flt<T>();
-
-    // Packed A lives on the kernel stack (84 KB f32 / 42 KB f16 on aarch64,
-    // 64-byte aligned). Sized by num_panels_max, not num_panels(MC_TARGET, ..):
-    // this tile's mc is a per-block height <= MC_TARGET whose greedy
-    // decomposition can need more panels than MC_TARGET's (see num_panels_max).
-    alignas(PANEL_ALIGN_BYTES) T pack_a_buf[pack_a_stack_elems<T>()];
 
     const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))
                       / static_cast<int>(sizeof(T));
@@ -120,10 +116,10 @@ void matmul_tile(const MatMulAttributes& attrs,
                 ? a_ptr + k * lda + m    // A phys is K×M, row k, col m
                 : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
             tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
-                          pack_a_buf, ldd_a, a_src, lda, 1.0f);
+                          pack_a_slice, ldd_a, a_src, lda, 1.0f);
             tile_mma_pack(actual_mc, n_count, actual_kc,
                           c_tile, ldc,
-                          pack_a_buf, packed_b, -1,
+                          pack_a_slice, packed_b, -1,
                           cmin, cmax, zero_mode);
         } else {
             const T* a_sub = a_ptr + m * lda + k;  // A phys is M×K, row m, col k
@@ -140,10 +136,10 @@ void matmul_tile(const MatMulAttributes& attrs,
     }
 }
 
-/// Fused tiled kernel: B is always packed into @p pack_b_slice; A is packed on
-/// the stack only when @p pack_a, else read raw. Processes one (m-range ×
-/// n-range) tile over all K-blocks. Shared by the N-split path (m over full M,
-/// n = one n-block) and the M-split path (m = one m-block, n over full N).
+/// Fused tiled kernel: B is always packed into @p pack_b_slice; A is packed into
+/// @p pack_a_slice only when @p pack_a, else read raw. Processes one
+/// (m-range × n-range) tile over all K-blocks. Shared by the N-split path (m over
+/// full M, n = one n-block) and the M-split path (m = one m-block, n over full N).
 template <typename T>
 void matmul_block_fused(const MatMulAttributes& attrs,
                         T* c_ptr, int ldc,
@@ -152,7 +148,7 @@ void matmul_block_fused(const MatMulAttributes& attrs,
                         int K, int kc, int mc,
                         int m_start, int m_count,
                         int n_start, int n_count,
-                        bool pack_a, T* pack_b_slice)
+                        bool pack_a, T* pack_b_slice, T* pack_a_slice)
 {
     constexpr int nr_max = nr_max_flt<T>();
 
@@ -173,7 +169,7 @@ void matmul_block_fused(const MatMulAttributes& attrs,
 
         matmul_tile<T>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
-                       k, actual_kc, last_k, pack_a, pack_b_slice);
+                       k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice);
     }
 }
 
@@ -340,9 +336,25 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                 ? static_cast<int64_t>(ctx.cpu.current_thread_id())
                 : blk;
             T* pack_b_slice = static_cast<T*>(workspace) + slot * np_full_b * ldd_b_full;
+
+            // The A slot has its own predicate, taken from plan.num_slots_a
+            // rather than from the B one above: the two agree on this path, but
+            // the int8 M-split hoists its B pack (num_slots == 1) while every
+            // m-block still packs its own A, and reusing the B predicate there
+            // would put every A tile in slot 0.
+            T* pack_a_slice = nullptr;
+            if (pack_a) {
+                const int64_t aslot = (plan.num_slots_a < num_blocks)
+                    ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+                    : blk;
+                auto* a_base = reinterpret_cast<T*>(
+                    static_cast<char*>(workspace) + plan.pack_a_offset);
+                pack_a_slice = a_base + aslot * plan.np_a * plan.ldd_a;
+            }
+
             matmul_block_fused<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
                                   Ki, kc, mc, m_start, m_count, n_start, n_count,
-                                  pack_a, pack_b_slice);
+                                  pack_a, pack_b_slice, pack_a_slice);
         });
     }
 }
@@ -446,16 +458,16 @@ void compute_int8_reductions(const int8_t* a_ptr, int64_t lda,
 /// Compute the m-panels of a single k-block against a packed-B slice (s8×s8).
 /// Shared by the N-split and M-split int8 paths. @p packed_b holds @p n_count
 /// columns for this k-block; @p m_start/@p m_count select the C rows.
+/// @p pack_a_buf is the caller's packed-A slot.
 void matmul_m_panels_i8(const MatMulAttributes& attrs,
                         int32_t* c_ptr, int ldc,
                         const int8_t* a_ptr, int lda,
                         int m_start, int m_count, int mc,
                         int n_start, int n_count,
                         int k, int actual_kc,
-                        const int8_t* packed_b)
+                        const int8_t* packed_b,
+                        int8_t* pack_a_buf)
 {
-    alignas(PANEL_ALIGN_BYTES) int8_t pack_a_buf[PACK_A_STACK_I8];
-
     // Pack step writes ceil(kc/4) groups per row; stride by the padded byte
     // count to keep adjacent panels from overlapping.
     const int kbytes = (actual_kc + 3) & ~3;
@@ -479,14 +491,16 @@ void matmul_m_panels_i8(const MatMulAttributes& attrs,
 }
 
 /// One n-block of the s8×s8 GEMM: packs B once per k-block, packs A per
-/// m-panel on the stack, accumulates the raw int32 dot-product into @p c_ptr.
+/// m-panel into @p pack_a_slice, accumulates the raw int32 dot-product into
+/// @p c_ptr.
 void matmul_block_int8(const MatMulAttributes& attrs,
                        int32_t* c_ptr, int ldc,
                        const int8_t* a_ptr, int lda,
                        const int8_t* b_ptr, int ldb,
                        int M, int K, int kc, int mc,
                        int n, int actual_nc,
-                       int8_t* pack_b_slice)
+                       int8_t* pack_b_slice,
+                       int8_t* pack_a_slice)
 {
     for (int k = 0; k < K; k += kc) {
         int actual_kc = std::min(kc, K - k);
@@ -503,7 +517,8 @@ void matmul_block_int8(const MatMulAttributes& attrs,
                          pack_b_slice, ldd_b, b_src, ldb);
 
         matmul_m_panels_i8(attrs, c_ptr, ldc, a_ptr, lda,
-                           0, M, mc, n, actual_nc, k, actual_kc, pack_b_slice);
+                           0, M, mc, n, actual_nc, k, actual_kc, pack_b_slice,
+                           pack_a_slice);
     }
 }
 
@@ -545,12 +560,14 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     const int mc = static_cast<int>(plan.mc);
     const int nc = static_cast<int>(plan.nc);
 
-    // Workspace: packed-B panels at the base, then the s8 accumulator.
-    // Panels per packed-B slice, from the plan (see MatMulPlan::np_slice). Only
-    // the N-split below indexes by it — the M-split packs the whole full-N slice
-    // at the base, one k-block at a time.
+    // Workspace: packed-B panels at the base, then the packed-A region, then the
+    // s8 accumulator. Panels per packed-B slice, from the plan (see
+    // MatMulPlan::np_slice). Only the N-split below indexes by it — the M-split
+    // packs the whole full-N slice at the base, one k-block at a time.
     const int np_full = static_cast<int>(plan.np_slice);
     int8_t* pack_b_base = static_cast<int8_t*>(workspace);
+    // int8 always packs A, so the region is always present here.
+    int8_t* pack_a_base = pack_b_base + plan.pack_a_offset;
     int32_t* accum = nullptr;
     if (out_s8) {
         accum = reinterpret_cast<int32_t*>(pack_b_base + static_cast<size_t>(plan.workspace_size));
@@ -663,8 +680,13 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
                 // below packs at — that is what makes the slice an upper bound
                 // on the panels actually written, short last block included.
                 int8_t* pack_b_slice = pack_b_base + blk * np_full * plan.ldd_b;
+                const int64_t a_slot = (plan.num_slots_a < num_blocks)
+                    ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+                    : blk;
+                int8_t* pack_a_slice = pack_a_base + a_slot * plan.np_a * plan.ldd_a;
                 matmul_block_int8(attrs, c_p, ldc, a_p, lda, b_p, ldb,
-                                  Mi, Ki, kc, mc, n, actual_nc, pack_b_slice);
+                                  Mi, Ki, kc, mc, n, actual_nc, pack_b_slice,
+                                  pack_a_slice);
             };
 
             ctx.cpu.run(0, num_blocks, run_block);
@@ -687,9 +709,17 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
                 auto run_m = [&](int64_t blk) {
                     const int m_start = static_cast<int>(blk * Mi / num_m_blocks);
                     const int m_end   = static_cast<int>((blk + 1) * Mi / num_m_blocks);
+                    // B is one shared slice here (the pack was hoisted above),
+                    // but every m-block packs its own A — hence num_slots_a, not
+                    // num_slots, decides the slot.
+                    const int64_t a_slot = (plan.num_slots_a < num_m_blocks)
+                        ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+                        : blk;
+                    int8_t* pack_a_slice = pack_a_base + a_slot * plan.np_a * plan.ldd_a;
                     matmul_m_panels_i8(attrs, c_p, ldc, a_p, lda,
                                        m_start, m_end - m_start, mc,
-                                       0, Ni, k, actual_kc, pack_b_base);
+                                       0, Ni, k, actual_kc, pack_b_base,
+                                       pack_a_slice);
                 };
                 ctx.cpu.run(0, num_m_blocks, run_m);
             }

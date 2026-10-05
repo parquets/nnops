@@ -669,7 +669,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& b_desc,
                           int num_threads,
                           bool use_thread_slots) {
-    MatMulPlan plan;
+    MatMulPlan plan{};  // the dtype-reject returns below promise an all-zero plan
 
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
@@ -707,8 +707,6 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     plan.split_n = (N > M);
     const bool split_m = !plan.split_n;
 
-    plan.kc = std::min<int64_t>(is_i8 ? KC_I8 : (is_f32 ? KC_F32 : KC_F16), K);
-
     // The M panel height the tile will run — the nc heuristic below charges the
     // L2 working set for it, so it must be the height the route really uses.
     const int  mr_panel = is_i8 ? MR_MAX_I8
@@ -724,20 +722,17 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
         return is_i8 ? num_panels4(n, nr) : num_panels(n, nr);
     };
 
-    plan.mc = (split_m && num_threads > 1) ? (M / num_threads) : MC_TARGET;
-    plan.mc = std::max<int64_t>(std::min<int64_t>(plan.mc, MC_TARGET), 1);
-
-    // N tile from the L2 bound, capped at NC_MAX and snapped to the panel grid
-    // (NC_ALIGN where it fits, else nr_max), clamped to [nr_max, N].
-    const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
-    const int nc_l2 = compute_nc_capped(mr_panel, static_cast<int>(plan.kc), elem, l2);
-    const int nc_cap = clamp_nc(round_nc_target(nc_l2, nr_max), nr_max, static_cast<int>(N));
-
-    int64_t nc = nc_cap;
-    if (plan.split_n && num_threads > 1) {
-        nc = std::min<int64_t>(N / num_threads, nc_cap);
-    }
-    plan.nc = clamp_nc(round_nc_target(static_cast<int>(nc), nr_max), nr_max, static_cast<int>(N));
+    // The tile. mc, nc and kc are one problem now, not three — see the constants
+    // block in matmul_helper.h for the objective and its constraints. Both L2
+    // sources feed the same budget, so they have to be the same number: the
+    // shared (performance-cluster) size.
+    const auto& features = simd::CpuFeatures::get();
+    const int64_t kc_cap = is_i8  ? KC_CAP_I8
+                         : is_f32 ? KC_CAP_F32
+                                  : KC_CAP_F16;
+    choose_matmul_tile(M, N, K, mr_panel, nr_max, elem, num_threads, plan.split_n,
+                       kc_cap, features.l1_cache_size(), features.l2_shared_cache_size(),
+                       plan.mc, plan.nc, plan.kc);
 
     // Packed-B stride (elements) at full Kc.
     const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(plan.kc) * elem) / elem;
@@ -769,11 +764,15 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const int64_t slice_bytes = static_cast<int64_t>(panel_count(static_cast<int>(N)))
                               * static_cast<int64_t>(ldd_b) * elem;
 
+    // The block counts of both splits. The packed-A region below needs the same
+    // number either way: it is how many A tiles can be live at once.
+    const int64_t num_m_blocks = split_block_count(M, plan.mc);
+    const int64_t num_n_blocks = (N + plan.nc - 1) / plan.nc;
+
     if (split_m) {
         if (is_i8) {
             plan.num_slots = 1;
         } else {
-            const int64_t num_m_blocks = split_block_count(M, plan.mc);
             const int64_t nt = std::max<int64_t>(num_threads, 1);
             plan.num_slots = (use_thread_slots && nt < num_m_blocks) ? nt : num_m_blocks;
         }
@@ -781,11 +780,36 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
         plan.np_slice = panel_count(static_cast<int>(N));
         plan.workspace_size = plan.num_slots * slice_bytes;
     } else {
-        plan.num_slots = (N + plan.nc - 1) / plan.nc;
+        plan.num_slots = num_n_blocks;
         plan.np_slice = is_i8 ? num_panels_max4(static_cast<int>(plan.nc), nr)
                               : num_panels_max(static_cast<int>(plan.nc), nr);
         plan.workspace_size = plan.num_slots * plan.np_slice
                             * static_cast<int64_t>(ldd_b) * elem;
+    }
+
+    // Packed-A scratch, appended after the packed-B region (whose offsets the
+    // dispatch already computes from the workspace base and must keep).
+    plan.pack_a_offset = plan.workspace_size;
+    if (plan.pack_a) {
+        const int64_t nconcurrent = plan.split_n ? num_n_blocks : num_m_blocks;
+        const int64_t nt          = std::max<int64_t>(num_threads, 1);
+        if (nt <= 1) {
+            plan.num_slots_a = 1;
+        } else if (use_thread_slots && nt < nconcurrent) {
+            plan.num_slots_a = nt;
+        } else {
+            plan.num_slots_a = nconcurrent;
+        }
+
+        plan.ldd_a = is_i8
+            ? align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8
+                  * ((static_cast<int>(plan.kc) + 3) & ~3))
+            : align_up<PANEL_ALIGN_BYTES>(mr_panel * static_cast<int>(plan.kc) * elem) / elem;
+        const int* mr_a = is_i8 ? MR_I8 : (is_f32 ? MR_F32 : MR_F16);
+        plan.np_a = num_panels_max(static_cast<int>(plan.mc), mr_a);
+
+        plan.workspace_size = plan.pack_a_offset
+                            + plan.num_slots_a * plan.np_a * plan.ldd_a * elem;
     }
 
     return plan;
