@@ -226,7 +226,7 @@ because `esz` makes the model see more room than the kernel can actually use:
 |-------|----------|-------------|
 | f32   | 128 | Not a budget limit but a length limit — kept equal to f16's for one rule. The budget would allow 1365 here (§2.1). |
 | f16   | 128 | Bounds the per-k-block fp16 accumulation error — **the aarch64 f16 kernel accumulates in f16**, so a longer k-block means a longer rounding chain before the f32 C read-modify-write. At K = 4096, kc 128 → 256 moved the worst deviation 0.23% → 0.29% of the output magnitude. |
-| s8    | 512 | The formula predicts 1344–2048 here (`esz = 1` makes the model see 8× the room); 512 is the value the int8 kernel is tuned and tested at. |
+| s8    | 512 | Not a precision limit — the accumulator is int32, so `kc` cannot round. The formula predicts 1344–2048 here (`esz = 1` makes the model see 8× the room), and below this cap the budget term is what decides `kc`, so on a host where it never binds (a large shared L2) the plan reports the host's L2 rather than the rule's answer — 16 MiB asks for 512 where 2 MiB asks for 256. Capping at 256 would make `kc` host-invariant; measured, it cost 3–13% on the s8 GEMM (worst at 10 threads on a deep K, where the shorter k-block buys a second C read-modify-write), so the cap stays at the tuned value. |
 
 `KC_MIN = 128` is the floor: a shape too small to fill the budget still gets a
 full 128-wide k-block. `kc = min(kc, K)` always holds, so short reductions never
@@ -235,10 +235,11 @@ pad.
 `KC_F16I4 = 256` is declared as a placeholder for a future fp16×int4 path; nothing
 reads it.
 
-**On Apple the L1 bound (§2.1 constraint 2) is slack for every dtype** once
-`kc ≤ 128` (f32 would need 512, f16 800). It only binds on x86_64, where a 32 KiB
-L1D gives f32 `kc_l1 = 192`. It is kept as the prefetch-residency guard it was
-specified as, not as the term that drives the choice.
+**On Apple the L1 bound (§2.1 constraint 2) is slack for every dtype**: the caps
+(128 fp / 512 s8) all sit below their own bound (f32 would need 512, f16 800,
+s8 2048). It only binds on x86_64, where a 32 KiB L1D gives f32 `kc_l1 = 192`. It
+is kept as the prefetch-residency guard it was specified as, not as the term that
+drives the choice.
 
 **Attention shares the rule.** `resolve_tile_sizes` — which attention's
 non-flash path calls for both GEMM1 and GEMM2 — is a thin wrapper over the same

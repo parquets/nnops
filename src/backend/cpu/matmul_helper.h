@@ -129,7 +129,6 @@ constexpr int align_up(int n) {
 
 constexpr int64_t KC_F32   = 128;   // attention's k-block length (see attention.cpp)
 constexpr int64_t KC_F16   = 128;   // attention's f16 k-block length
-constexpr int64_t KC_I8    = 512;   // int8: larger Kc since elements are 1 byte
 constexpr int64_t KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 
 // ---- The tile problem ---------------------------------------------------
@@ -164,14 +163,25 @@ constexpr int NC_ALIGN = 48;
 constexpr int64_t KC_MIN   = 128;
 constexpr int64_t KC_ALIGN = 32;
 
-/// Per-dtype kc ceilings (int8 keeps its historical 512; the aggregate model
-/// would otherwise ask for 1344+ there, since elem_bytes == 1 understates what
-/// the pack and the s8 accumulator use).
+/// Per-dtype kc ceilings. Every dtype stops short of what the residency budget
+/// would afford, each for its own reason:
 ///
-/// 128 on the float paths is a length limit, not a budget one: the aarch64 f16
-/// kernel accumulates in f16, so kc is how many products round into the
-/// accumulator before the C read-modify-write. At K = 4096, kc 128 -> 256 moved
-/// the worst deviation 0.183 -> 0.230 (~0.23% -> 0.29% of an output of ~80).
+/// 128 on the float paths is a length limit: the aarch64 f16 kernel accumulates
+/// in f16, so kc is how many products round into the accumulator before the C
+/// read-modify-write. At K = 4096, kc 128 -> 256 moved the worst deviation
+/// 0.183 -> 0.230 (~0.23% -> 0.29% of an output of ~80). f32 shares the value so
+/// one rule covers both, though only f16 has the rounding argument.
+///
+/// 512 on int8 is a tuning ceiling, not a precision one — the s8 accumulator is
+/// int32, so kc cannot round. It sits below what the budget affords (esz = 1
+/// makes the model see ~8x the room; the L1 prefetch bound is 1696-2048), which is
+/// what lets the budget term decide kc instead on a host where it binds. That
+/// makes the int8 plan cache-dependent — 16 MiB asked for 512 where 2 MiB asked
+/// for 256 — and lowering the cap is what would remove it. It is not worth it:
+/// capping at 256 measured 3-13% slower on the int8 GEMM (worst at 10 threads
+/// on a deep K, where it buys a second C read-modify-write per k-block) and
+/// never faster. The cap stays, and the plan keeps following the cache it runs
+/// in.
 constexpr int64_t KC_CAP_F32 = 128;
 constexpr int64_t KC_CAP_F16 = 128;
 constexpr int64_t KC_CAP_I8  = 512;
