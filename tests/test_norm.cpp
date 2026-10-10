@@ -11,8 +11,12 @@
 #include "common/compare.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
-#include <vector>
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <thread>
+#include <vector>
 
 using namespace nnops;
 
@@ -1286,6 +1290,396 @@ NNOPS_TEST(norm_group_norm_shape_inference) {
 }
 
 // ============================================================
+// Quantized input (s8/u8) — LayerNorm / RMSNorm / L2Norm
+// ============================================================
+//
+// X is s8/u8 carrying its own PerTensor / PerToken quant params; the kernel
+// dequantizes one row at a time, runs the float norm row kernel on it, and then
+// stores f32/f16 as-is or requantizes with the output TensorView's params.
+// Only axis == rank-1 is defined, so one norm row is exactly one quantization
+// row (the unit of a PerToken scale/zero_point).
+//
+// No reference kernel takes integer input, so the expected values are built the
+// slow way: dequantize by hand to f32, run reference::norm_ref on that, and
+// requantize by hand when the output is integer.
+
+namespace nnops::backend::cpu::reference {
+void norm_ref(const NormAttributes& attrs,
+              TensorView& output,
+              std::span<const TensorView> inputs,
+              const ComputeContext& ctx,
+              void* workspace);
+}
+
+namespace {
+
+// Minimal fixed-size thread pool exposing a CpuBackend (test_conv2d pattern).
+// Items in [begin, end) are claimed via an atomic counter; each worker runs
+// body(i) until the range is exhausted.
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
+// ---- quant-param builders (test_matmul_int8 pattern) ----
+
+QuantParams per_tensor(float scale, int32_t zp) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerTensor;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+QuantParams per_token(const float* scale, const int32_t* zp, int64_t n) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerToken;
+    qp.scale_data = scale;
+    qp.zero_point_data = zp;
+    qp.num_scales = n;
+    return qp;
+}
+
+/// Planar s8/u8 view over `data` carrying explicit quant params.
+TensorView make_q(std::span<const int64_t> shape, DataType dt, void* data,
+                  const QuantParams& qp, TensorLayout layout = TensorLayout::NCHW) {
+    return TensorView(shape, dt, data, layout, qp);
+}
+
+/// The (scale, zero_point) the kernel uses for row `row`: the per-row buffers
+/// when present, else the per-tensor scalars. A missing zero_point buffer is 0.
+void row_qparam(const QuantParams& qp, int64_t row, float& scale, int32_t& zp) {
+    if (qp.scale_data != nullptr) {
+        scale = qp.scale_data[row];
+        zp = (qp.zero_point_data != nullptr) ? qp.zero_point_data[row] : 0;
+    } else {
+        scale = qp.scale;
+        zp = qp.zero_point;
+    }
+}
+
+/// x = (q - zero_point) * scale.
+float dequant_one(int64_t q, float scale, int32_t zp) {
+    return (static_cast<float>(q) - static_cast<float>(zp)) * scale;
+}
+
+int32_t qmin_for(DataType dt) { return dt == DataType::u8 ? 0 : -128; }
+int32_t qmax_for(DataType dt) { return dt == DataType::u8 ? 255 : 127; }
+
+/// Quantize one f32 value the way the arch kernel does: round to nearest, then
+/// clamp to the target dtype's range.
+int32_t requant_one(float v, float scale, int32_t zp, DataType dt) {
+    const int32_t q = static_cast<int32_t>(std::nearbyintf(v / scale)) + zp;
+    return std::min(std::max(q, qmin_for(dt)), qmax_for(dt));
+}
+
+/// Element `idx` of an s8/u8 buffer, read as a signed integer (both dtypes are
+/// stored one byte per element).
+int64_t raw_at(const uint8_t* bytes, int64_t idx, DataType dt) {
+    if (dt == DataType::u8) { return static_cast<int64_t>(bytes[idx]); }
+    return static_cast<int64_t>(reinterpret_cast<const int8_t*>(bytes)[idx]);
+}
+
+/// Quantize a contiguous f32 [rows, n] buffer with `qp`'s row params.
+std::vector<uint8_t> quantize_rows(const float* src, int64_t rows, int64_t n,
+                                   const QuantParams& qp, DataType dt) {
+    std::vector<uint8_t> out(static_cast<size_t>(rows * n));
+    for (int64_t r = 0; r < rows; ++r) {
+        float s; int32_t z;
+        row_qparam(qp, r, s, z);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t idx = r * n + i;
+            out[static_cast<size_t>(idx)] =
+                static_cast<uint8_t>(requant_one(src[idx], s, z, dt));
+        }
+    }
+    return out;
+}
+
+/// Run the quantized path once and check it against "dequantize by hand ->
+/// reference norm -> requantize by hand".
+///
+/// `attrs` carries the norm type / axis / output_dtype; `x_q` is the s8/u8
+/// input; `extra_inputs` holds [scale] or [scale, bias], f32. `num_rows` is the
+/// norm row count (and the PerToken param count); the row width is derived.
+void expect_quant_norm(const NormAttributes& attrs,
+                       const TensorView& x_q,
+                       std::span<const TensorView> extra_inputs,
+                       const QuantParams& y_qp,
+                       int64_t num_rows,
+                       float tol,
+                       const ComputeContext& ctx = {})
+{
+    const DataType   x_dt = x_q.data_type();
+    const DataType   y_dt = attrs.output_dtype;
+    const auto&      x_qp = x_q.quant_params();
+    const uint8_t*   x_bytes = x_q.ptr<uint8_t>();
+    const int64_t    n = x_q.numel() / num_rows;
+    const auto       shape = x_q.shape_span();
+
+    // ---- expected: hand-dequantized f32 through the f32 reference ----
+    std::vector<float> x_f32(static_cast<size_t>(num_rows * n));
+    for (int64_t r = 0; r < num_rows; ++r) {
+        float s; int32_t z;
+        row_qparam(x_qp, r, s, z);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t idx = r * n + i;
+            x_f32[static_cast<size_t>(idx)] = dequant_one(raw_at(x_bytes, idx, x_dt), s, z);
+        }
+    }
+
+    TensorView x_ref(shape, DataType::f32, x_f32.data(), x_q.layout());
+    std::vector<TensorView> ref_ins;
+    ref_ins.push_back(x_ref);
+    for (const auto& t : extra_inputs) { ref_ins.push_back(t); }
+
+    std::vector<float> want(static_cast<size_t>(num_rows * n));
+    TensorView want_view(shape, DataType::f32, want.data(), x_q.layout());
+    nnops::backend::cpu::reference::norm_ref(
+        attrs, want_view, std::span<const TensorView>(ref_ins), {}, nullptr);
+
+    // ---- the op under test ----
+    auto op = Norm::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> in_descs;
+    in_descs.push_back(x_q.desc());
+    for (const auto& t : extra_inputs) { in_descs.push_back(t.desc()); }
+    const auto out_desc = op->getOutputTensorDesc(std::span<const TensorDesc>(in_descs));
+    NNOPS_EXPECT_EQ(static_cast<int>(out_desc[0].dtype), static_cast<int>(y_dt));
+
+    const size_t numel = static_cast<size_t>(num_rows * n);
+    std::vector<float> y_f32(y_dt == DataType::f32 ? numel : 0);
+    std::vector<nnops::backend::cpu::half> y_f16(y_dt == DataType::f16 ? numel : 0);
+    std::vector<uint8_t> y_bytes(is_quantized_dtype(y_dt) ? numel : 0);
+    void* y_data = (y_dt == DataType::f32) ? static_cast<void*>(y_f32.data())
+                 : (y_dt == DataType::f16) ? static_cast<void*>(y_f16.data())
+                 : static_cast<void*>(y_bytes.data());
+
+    TensorView out = make_q(shape, y_dt, y_data,
+                            is_quantized_dtype(y_dt) ? y_qp : QuantParams{},
+                            x_q.layout());
+
+    std::vector<TensorView> ins;
+    ins.push_back(x_q);
+    for (const auto& t : extra_inputs) { ins.push_back(t); }
+    op->compute(out, std::span<const TensorView>(ins), ctx);
+
+    // ---- compare ----
+    if (y_dt == DataType::f32) {
+        for (size_t i = 0; i < numel; ++i) {
+            NNOPS_EXPECT_NEAR(y_f32[i], want[i], tol);
+        }
+    } else if (y_dt == DataType::f16) {
+        for (size_t i = 0; i < numel; ++i) {
+            NNOPS_EXPECT_NEAR(simd::s_load(&y_f16[i]), want[i], tol);
+        }
+    } else {
+        // Integer output: compare in quantized units, allowing one LSB for
+        // rounding-mode / reassociation differences.
+        for (int64_t r = 0; r < num_rows; ++r) {
+            float s; int32_t z;
+            row_qparam(y_qp, r, s, z);
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t idx = r * n + i;
+                const int64_t want_q = requant_one(want[static_cast<size_t>(idx)], s, z, y_dt);
+                NNOPS_EXPECT_TRUE(std::abs(raw_at(y_bytes.data(), idx, y_dt) - want_q) <= 1);
+            }
+        }
+    }
+}
+
+/// Sweep every supported combination — {PerTensor, PerToken} input params x
+/// {f32, f16, s8} output dtype — for one norm type. The integer output reuses
+/// the input's granularity, so both output-param paths are exercised.
+void sweep_quant_norm(NormType type, bool with_bias, const ComputeContext& ctx = {})
+{
+    constexpr int64_t kRows = 4;
+    constexpr int64_t kDim  = 12;
+
+    auto [x_data, _x] = test::make_random_tensor({kRows, kDim}, -1.0f, 1.0f, 900);
+    auto [s_data, s_view] = test::make_random_tensor({kDim}, 0.25f, 2.0f, 901);
+    auto [b_data, b_view] = test::make_random_tensor({kDim}, -0.5f, 0.5f, 902);
+    (void)_x; (void)s_data; (void)b_data;
+
+    // PerTensor covers the input range exactly; the PerToken scales vary a
+    // little per row (and carry non-zero zero points) so the row mapping is
+    // observable.
+    const QuantParams x_qp_pt = per_tensor(1.0f / 127.0f, 0);
+    const float row_scale[] = {0.0079f, 0.0081f, 0.0077f, 0.0083f};
+    const int32_t row_zp[]  = {0, -3, 5, -8};
+    const QuantParams x_qp_pr = per_token(row_scale, row_zp, kRows);
+
+    const QuantParams y_qp_pt = per_tensor(1.0f / 64.0f, 0);
+    const float out_scale[] = {1.0f / 64.0f, 1.0f / 60.0f, 1.0f / 68.0f, 1.0f / 62.0f};
+    const int32_t out_zp[]  = {0, 0, 0, 0};
+    const QuantParams y_qp_pr = per_token(out_scale, out_zp, kRows);
+
+    const int64_t shape[] = {kRows, kDim};
+
+    for (int g = 0; g < 2; ++g) {
+        const bool per_row = (g == 1);
+        const QuantParams& x_qp = per_row ? x_qp_pr : x_qp_pt;
+        const QuantParams& y_qp = per_row ? y_qp_pr : y_qp_pt;
+
+        std::vector<uint8_t> x_bytes =
+            quantize_rows(x_data.data(), kRows, kDim, x_qp, DataType::s8);
+        TensorView x_q = make_q(shape, DataType::s8, x_bytes.data(), x_qp);
+
+        std::vector<TensorView> extras;
+        if (type != NormType::L2Norm) {
+            extras.push_back(s_view);
+            if (with_bias) { extras.push_back(b_view); }
+        }
+
+        for (DataType y_dt : {DataType::f32, DataType::f16, DataType::s8}) {
+            NormAttributes attrs;
+            attrs.type = type;
+            attrs.axis = -1;
+            attrs.output_dtype = y_dt;
+            const float tol = (y_dt == DataType::f16) ? 1e-2f : 1e-3f;
+            expect_quant_norm(attrs, x_q, std::span<const TensorView>(extras), y_qp,
+                              kRows, tol, ctx);
+        }
+    }
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(norm_quant_layernorm_all_combos) {
+    sweep_quant_norm(NormType::LayerNorm, /*with_bias=*/true);
+}
+
+NNOPS_TEST(norm_quant_rmsnorm_all_combos) {
+    sweep_quant_norm(NormType::RMSNorm, /*with_bias=*/false);
+}
+
+NNOPS_TEST(norm_quant_l2norm_all_combos) {
+    sweep_quant_norm(NormType::L2Norm, /*with_bias=*/false);
+}
+
+NNOPS_TEST(norm_quant_threaded_matches_serial) {
+    // The per-row staging buffer comes from the memory pool, so the parallel
+    // path must produce the same values as the serial one.
+    SimplePool pool(4);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    sweep_quant_norm(NormType::LayerNorm, /*with_bias=*/true, ctx);
+}
+
+NNOPS_TEST(norm_quant_3d_per_token_no_zero_point) {
+    // 3D [B, S, H]: PerToken row r maps to param r, and a null zero_point
+    // buffer means zero_point == 0.
+    constexpr int64_t kRows = 6;
+    constexpr int64_t kDim  = 8;
+    const int64_t shape[] = {2, 3, kDim};
+
+    auto [x_data, _x] = test::make_random_tensor({2, 3, kDim}, -1.0f, 1.0f, 910);
+    auto [s_data, s_view] = test::make_random_tensor({kDim}, 0.5f, 1.5f, 911);
+    (void)_x; (void)s_data;
+
+    const float row_scale[] = {0.0075f, 0.0078f, 0.0082f, 0.0073f, 0.0080f, 0.0076f};
+    const QuantParams x_qp = per_token(row_scale, nullptr, kRows);
+    std::vector<uint8_t> x_bytes =
+        quantize_rows(x_data.data(), kRows, kDim, x_qp, DataType::s8);
+    TensorView x_q = make_q(shape, DataType::s8, x_bytes.data(), x_qp);
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;   // no bias -> the HasBias=false instantiation
+    attrs.axis = -1;
+    const TensorView extras[] = {s_view};
+
+    expect_quant_norm(attrs, x_q, std::span<const TensorView>(extras, 1),
+                      QuantParams{}, kRows, 1e-3f);
+}
+
+NNOPS_TEST(norm_quant_u8_input) {
+    // u8 with a non-zero zero_point: the dequantize/reference mapping flips to
+    // the unsigned convention.
+    constexpr int64_t kRows = 3;
+    constexpr int64_t kDim  = 10;
+    const int64_t shape[] = {kRows, kDim};
+
+    auto [x_data, _x] = test::make_random_tensor({kRows, kDim}, -0.5f, 1.5f, 920);
+    (void)_x;
+
+    const QuantParams x_qp = per_tensor(2.0f / 255.0f, 128);
+    std::vector<uint8_t> x_bytes =
+        quantize_rows(x_data.data(), kRows, kDim, x_qp, DataType::u8);
+    TensorView x_q = make_q(shape, DataType::u8, x_bytes.data(), x_qp);
+
+    NormAttributes attrs;
+    attrs.type = NormType::L2Norm;
+    attrs.axis = -1;
+
+    expect_quant_norm(attrs, x_q, std::span<const TensorView>(), QuantParams{},
+                      kRows, 1e-3f);
+}
+
+NNOPS_TEST(norm_quant_output_desc_follows_output_dtype) {
+    // A quantized X makes the output follow attrs.output_dtype; a float X still
+    // follows X.
+    const int64_t shape[] = {2, 4};
+    uint8_t x_bytes[8] = {};
+    const int64_t s_shape[] = {4};
+    float s_data[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    TensorView s(s_shape, DataType::f32, s_data);
+
+    const QuantParams x_qp = per_tensor(0.01f, 0);
+    TensorView x_q = make_q(shape, DataType::s8, x_bytes, x_qp);
+
+    const TensorDesc in_descs[] = {x_q.desc(), s.desc()};
+
+    NormAttributes attrs;
+    attrs.type = NormType::LayerNorm;
+    auto op = Norm::create(attrs, Backend::CPU);
+    NNOPS_EXPECT_EQ(static_cast<int>(op->getOutputTensorDesc(in_descs)[0].dtype),
+                    static_cast<int>(DataType::f32));  // default
+
+    attrs.output_dtype = DataType::s8;
+    auto op_s8 = Norm::create(attrs, Backend::CPU);
+    NNOPS_EXPECT_EQ(static_cast<int>(op_s8->getOutputTensorDesc(in_descs)[0].dtype),
+                    static_cast<int>(DataType::s8));
+
+    attrs.output_dtype = DataType::f16;
+    auto op_f16 = Norm::create(attrs, Backend::CPU);
+    NNOPS_EXPECT_EQ(static_cast<int>(op_f16->getOutputTensorDesc(in_descs)[0].dtype),
+                    static_cast<int>(DataType::f16));
+
+    // Float X is unaffected by output_dtype.
+    float x_f32[8] = {};
+    TensorView x_float(shape, DataType::f32, x_f32);
+    const TensorDesc f_descs[] = {x_float.desc(), s.desc()};
+    NNOPS_EXPECT_EQ(static_cast<int>(op_s8->getOutputTensorDesc(f_descs)[0].dtype),
+                    static_cast<int>(DataType::f32));
+}
+
+// ============================================================
 // OpType / Backend / default-attributes checks
 // ============================================================
 
@@ -1305,4 +1699,5 @@ NNOPS_TEST(norm_default_attrs) {
     NNOPS_EXPECT_NEAR(attrs.epsilon, 1e-5f, 1e-9f);
     NNOPS_EXPECT_EQ(attrs.spatial, true);
     NNOPS_EXPECT_EQ(attrs.add_to, false);
+    NNOPS_EXPECT_EQ(static_cast<int>(attrs.output_dtype), static_cast<int>(DataType::f32));
 }

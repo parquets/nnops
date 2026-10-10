@@ -8,6 +8,7 @@
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
+#include "nnops/core/data_type.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
 #include <cstdint>
@@ -52,7 +53,14 @@ struct NormAttributes {
     /// BatchNorm: per-channel statistics (true) vs per-element (false).
     bool spatial = true;
 
+    /// Storage type of the output when X is quantized (s8/u8): f32/f16 for a
+    /// dequantized output, s8/u8 for a requantized one (the quantized output's
+    /// scale/zero_point come from the output TensorView). Ignored for float
+    /// inputs, whose output follows X's dtype. Default f32.
+    DataType output_dtype = DataType::f32;
+
     /// If true, add result to existing output buffer instead of overwriting.
+    /// Not supported on the quantized-input path.
     bool add_to = false;
 };
 
@@ -68,6 +76,10 @@ struct NormAttributes {
 ///   L2Norm     (1): X
 ///
 /// Output (1): Y with the same shape as X.
+///
+/// Quantized input (CPU): X may be s8/u8 with PerTensor or PerToken quant
+/// params, in which case Y's dtype is NormAttributes::output_dtype. Supported
+/// for LayerNorm / RMSNorm / L2Norm with axis == rank-1 only.
 class Norm : public OpBase {
 public:
     static std::unique_ptr<Norm> create(const NormAttributes& attrs = {},

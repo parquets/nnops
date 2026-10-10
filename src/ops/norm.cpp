@@ -90,7 +90,13 @@ Norm::Norm(const NormAttributes& attrs, Backend backend)
 std::vector<TensorDesc> Norm::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return {identity_output_shape(inputs)};
+    auto out = identity_output_shape(inputs);
+    // Quantized X (s8/u8): the output storage type is chosen by the caller —
+    // f32/f16 to read back dequantized values, s8/u8 to requantize.
+    if (is_quantized_dtype(inputs[0].dtype)) {
+        out[0].dtype = attrs_.output_dtype;
+    }
+    return out;
 }
 
 void Norm::compute(std::span<TensorView> outputs,
