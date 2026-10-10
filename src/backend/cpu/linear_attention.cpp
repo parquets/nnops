@@ -55,7 +55,13 @@ using namespace nnops::simd;
 
 /// Widen L consecutive T elements to an f32 vector (f16 widens, f32 is a load).
 inline v_f32x8 vload_f32(const float* p) { return v_load(p); }
-inline v_f32x8 vload_f32(const half* p)  { return v_cvt_f16_to_f32(v_load(p)); }
+inline v_f32x8 vload_f32(const half* p) {
+    // The pointer overload of v_cvt_f16_to_f32 widens into *this arch's*
+    // v_f32x8 — the vector-level overload takes the f16 layer's own f32 type,
+    // which on AVX2 is the SSE lo/hi pair, not the __m256 the float overload
+    // above produces. Using it keeps this file free of arch intrinsics.
+    return v_cvt_f16_to_f32(p);
+}
 
 /// Narrow an f32 vector back to T and store it.
 inline void vstore_f32(float* p, const v_f32x8& v) { v_store(p, v); }
