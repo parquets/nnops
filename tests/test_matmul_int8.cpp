@@ -367,11 +367,11 @@ NNOPS_TEST(matmul_int8_random_s8) {
 }
 
 // ============================================================
-// Multi-k-block (K > KC_I8) and batched
+// Multi-k-block (K > KC_CAP_I8) and batched
 // ============================================================
 
 NNOPS_TEST(matmul_int8_multik_s32) {
-    const int64_t M = 8, K = 1200, N = 6;   // K = 1200 > KC_I8 (512)
+    const int64_t M = 8, K = 1200, N = 6;   // K = 1200 > KC_CAP_I8 (512)
     I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/true, 4242);
 
     MatMulAttributes attrs{};
@@ -511,7 +511,7 @@ NNOPS_TEST(matmul_int8_batched_s8) {
 
 NNOPS_TEST(matmul_int8_batched_nsplit_s32) {
     // N > M selects the N-split (one n-block per task) rather than the M-split,
-    // and K = 1200 spans three k-blocks (KC_I8 = 512).
+    // and K = 1200 spans three k-blocks at the cap (KC_CAP_I8 = 512).
     const int64_t B = 2, M = 6, K = 1200, N = 70;
     I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 616, B, B);
 
@@ -543,11 +543,12 @@ NNOPS_TEST(matmul_int8_packed_a_bad_remainder_s32) {
     // whole tile, so it holds for any mc the rule produces.
     //
     // Reached through the public op: an M-split whose slab height lands one of
-    // those non-monotonic widths, with K == KC_I8 so the pack uses the full-Kc
-    // panel stride the buffer is sized at. Such slab heights appear for many M,
-    // which is why this is worth a regression case rather than a comment.
+    // those non-monotonic widths, at a K that fills whole k-blocks so each
+    // block's pack stride is the plan's own ldd_a — the value the buffer is
+    // sized at. Such slab heights appear for many M, which is why this is worth
+    // a regression case rather than a comment.
     for (int64_t M : {1152, 2048, 2304, 2560, 2688, 3072, 4096}) {
-        const int64_t K = 512, N = 256;   // K == KC_I8 -> full-Kc stride
+        const int64_t K = 512, N = 256;   // K == KC_CAP_I8, one k-block at the cap
         I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 900 + static_cast<uint64_t>(M));
 
         MatMulAttributes attrs{};
@@ -632,13 +633,32 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     // num_slots_a disagree. That is why the dispatch picks the A slot from
     // num_slots_a rather than from num_slots.
     //
-    // kc is part of that same budget, so it shrinks with the pool as well: it is
-    // not a fixed clamp on K, it is whatever the residency model can afford once
-    // mc and nc have taken their share. Size each slice from its own plan's kc —
-    // these two numbers are the host's L2 in the residency budget, so a machine
-    // with a different L2 moves them (and only them).
-    NNOPS_EXPECT_EQ(b1.kc, int64_t{512});                // the KC_CAP_I8 ceiling, K = 512
-    NNOPS_EXPECT_EQ(b10.kc, int64_t{256});               // half the budget at 10 threads
+    // kc is the one tile size here that moves with the host: it is capped per
+    // dtype, and below that cap it is the residency budget — how much L2 the
+    // host reports — that decides it. A literal would therefore assert this
+    // host's cache, not the rule. So the rule is checked directly, on an L2 the
+    // test chooses: a big one leaves the cap binding, a small one hands kc to
+    // the budget. The plan's own kc, whatever it resolved to, is only bounded;
+    // everything sized from it below is checked against its own value.
+    {
+        int64_t mc = 0, nc = 0, kc = 0;
+        // K deep enough that neither K nor the budget (5461 at this L2) nor the
+        // L1 prefetch bound (1696 and up) is anywhere near the cap, so what comes
+        // back is the cap itself.
+        cpu::choose_matmul_tile(1024, 1024, 4096, cpu::MR_MAX_I8, cpu::NR_MAX_I8,
+                                1, 1, /*split_n=*/false, cpu::KC_CAP_I8,
+                                /*l1=*/65536, size_t{16} << 20, mc, nc, kc);
+        NNOPS_EXPECT_EQ(kc, cpu::KC_CAP_I8);         // 16 MiB: the cap decides
+        cpu::choose_matmul_tile(1024, 1024, 4096, cpu::MR_MAX_I8, cpu::NR_MAX_I8,
+                                1, 10, /*split_n=*/false, cpu::KC_CAP_I8,
+                                /*l1=*/65536, size_t{2} << 20, mc, nc, kc);
+        NNOPS_EXPECT_TRUE(kc < cpu::KC_CAP_I8);      // 2 MiB / 10 threads: neither cap
+        NNOPS_EXPECT_TRUE(kc > cpu::KC_MIN);         // nor floor — the budget decides
+    }
+    NNOPS_EXPECT_TRUE(b1.kc <= cpu::KC_CAP_I8);      // and K = 512 is the cap
+    NNOPS_EXPECT_TRUE(b10.kc <= cpu::KC_CAP_I8);
+    NNOPS_EXPECT_EQ(b1.kc % cpu::KC_ALIGN, int64_t{0});
+    NNOPS_EXPECT_EQ(b10.kc % cpu::KC_ALIGN, int64_t{0});
     const int64_t ldd_b1  = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * b1.kc);
     const int64_t ldd_b10 = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * b10.kc);
     const int64_t one_slice1  = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b1;
