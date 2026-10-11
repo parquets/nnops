@@ -9,6 +9,12 @@
 /// partitioned into parallel chunks (plan.oh_chunks). The report shows the block
 /// geometry (icn/ocn/oh_block), the resulting oh-block count, and the total
 /// parallel task count (N*G*oh_chunks).
+///
+/// Cases are point-shaped — one named network layer per bench — plus, at the end,
+/// kernel-area sweep tables: one shape walked across kernel size, plane size and
+/// group count. The plan's block sizes are a function of kernel *area*
+/// (get_ic_block), so no single 3x3 point case can show what a 5x5 or 7x7 does to
+/// them.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
@@ -24,6 +30,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -470,6 +478,171 @@ void bench_wino_case(const WinoCase& c) {
     else       { run_wino_ab<float>(c, threads, iters, rounds); }
 }
 
+// ============================================================
+// Kernel-area / shape sweeps
+// ============================================================
+//
+// The point cases above each pin one shape, and 3x3 dominates them. The one
+// thing 3x3 cannot show is what the kernel *area* does to the plan:
+// get_ic_block() maps karea -> icn_block (64 at 1x1, 8 through 3x3, 4 through
+// 5x5, 2 through 7x7, 1 past that), and a single GEMM call reduces over
+// icn_block * karea. The ladder holds that K roughly flat as the kernel grows —
+// the K column below reads 64 -> 72 -> 100 -> 98 for 1x1 -> 3x3 -> 5x5 -> 7x7 —
+// so the im2col panel handed to one GEMM stays near 70-100 wide no matter the
+// kernel. What is *not* flat is the traffic: every input channel's karea taps
+// must be materialised for every output row, so the im2col write per output row
+// is IC * karea and grows 49/9 from 3x3 to 7x7, and the weight panel is re-read
+// once per ic-block (IC / icn_block of them). These tables put a number on that.
+//
+// The tile columns are the plan resolved at the *largest* pool in the row, not
+// at 1 thread: oh_chunks and the oh-block shrink are per-pool decisions, so the
+// widest pool is the geometry the narrower ones are compared against. blks
+// (N*G*oh_blocks) is the hard ceiling on tasks — where blks is far below the
+// thread count, the multi-thread columns are partly measuring the pool.
+//
+// Cells are adaptive — each runs until a wall-clock budget elapses — rather than
+// the flat 20 the point cases use: a 7x7 at 112x112 is orders of magnitude more
+// work per call than a 1x1 at 7x7, so no single iteration count covers both.
+//
+// Caveat on the multi-thread columns: SimplePool spawns and joins its workers
+// inside every parallel_for, so each call pays thread start-up once. Measured on
+// this host that is ~450 us at 20 threads — around a quarter of the f32 3x3 row
+// in the first table, and the reason the smallest rows' 8T/20T cells read low.
+// The 5x5/7x7 rows do 25/9 and 49/9 of the 3x3's work per call and are far less
+// affected; read the small-shape 20T cells as a lower bound on the kernel.
+
+struct ConvSweepShape {
+    int64_t N, IC, IH, OC, K;    // square input plane, square kernel
+    int64_t S = 1;               // stride (both axes)
+    int64_t groups = 1;
+    int64_t pad = -1;            // -1 == "same": ((K-1)*D)/2
+    int64_t D = 1;               // dilation (both axes)
+};
+
+std::vector<int> sweep_threads() {
+    std::vector<int> threads{1, 2, 4, 8};
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
+        threads.push_back(hw);
+    }
+    return threads;
+}
+
+/// One conv problem, built once and reused across pool sizes.
+template <typename T>
+struct ConvSweepOp {
+    std::unique_ptr<Conv2D> op;
+    std::vector<T> in_buf, w_buf, out_buf;
+    std::vector<TensorView> ins;
+    TensorView out;
+    int64_t icn, ocn, ohb, blks, tasks;
+    double flops;
+
+    ConvSweepOp(const ConvSweepShape& s, uint64_t seed, int64_t meta_threads) {
+        const int64_t ph = s.pad < 0 ? ((s.K - 1) * s.D) / 2 : s.pad;
+        const int64_t ishape[] = {s.N, s.IC, s.IH, s.IH};
+        const int64_t wshape[] = {s.OC, s.IC / s.groups, s.K, s.K};
+
+        auto [iv, in] = make_random<T>(ishape, seed);
+        auto [wv, w]  = make_random<T>(wshape, seed + 1);
+        in_buf = std::move(iv);
+        w_buf  = std::move(wv);
+
+        Conv2DAttributes attrs{};
+        attrs.kernel_size = {s.K, s.K};
+        attrs.stride      = {s.S, s.S};
+        attrs.dilation    = {s.D, s.D};
+        attrs.padding     = {ph, ph};
+        attrs.groups      = s.groups;
+
+        op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {in.desc(), w.desc()};
+        auto out_descs = op->getOutputTensorDesc(descs);
+        out_buf.assign(static_cast<size_t>(out_descs[0].numel()), T{});
+        out = test::make_planar(out_descs[0], out_buf.data());
+        ins = {in, w};
+
+        const cpu::Conv2DPlan plan = cpu::get_conv2d_plan(
+            attrs, descs, out_descs, meta_threads, /*use_thread_slots=*/true);
+        icn   = plan.icn_block;
+        ocn   = plan.ocn_block;
+        ohb   = plan.oh_block;
+        blks  = s.N * s.groups * plan.num_oh_blocks;
+        tasks = s.N * s.groups * plan.oh_chunks;
+
+        const int64_t OH = out_descs[0].dims[2], OW = out_descs[0].dims[3];
+        flops = 2.0 * static_cast<double>(s.N) * static_cast<double>(s.OC) *
+                static_cast<double>(OH) * static_cast<double>(OW) *
+                static_cast<double>(s.IC / s.groups) *
+                static_cast<double>(s.K) * static_cast<double>(s.K);
+    }
+
+    /// GFLOPS over one budgeted block: warm up, then iterate until @p target_ms
+    /// of wall time has elapsed.
+    double time_budget(const ComputeContext& ctx, double target_ms) {
+        for (int i = 0; i < 2; ++i) { op->compute(out, ins, ctx, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        int64_t iters = 0;
+        double ms = 0.0;
+        constexpr int64_t kMaxIters = 20000;   // the floor is a 1x1 at 7x7
+        do {
+            op->compute(out, ins, ctx, nullptr);
+            ++iters;
+            ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::high_resolution_clock::now() - t0).count();
+        } while (ms < target_ms && iters < kMaxIters);
+        return flops * static_cast<double>(iters) / (ms * 1e6);
+    }
+};
+
+void print_conv_sweep_header(const std::vector<int>& threads) {
+    std::printf("   %3s %4s %4s %4s %3s %4s %2s %2s | %4s %4s %4s %5s %5s |",
+                "N", "IC", "IH", "OC", "K", "g", "s", "d",
+                "icn", "ocn", "ohb", "blks", "tasks");
+    for (int t : threads) {
+        const std::string label = std::to_string(t) + "T";
+        std::printf(" %7s", label.c_str());
+    }
+    std::printf("   (GFLOPS)\n");
+}
+
+void print_conv_sweep_row(const ConvSweepShape& s, int64_t icn, int64_t ocn, int64_t ohb,
+                          int64_t blks, int64_t tasks, const std::vector<double>& g) {
+    std::printf("   %3lld %4lld %4lld %4lld %3lld %4lld %2lld %2lld |"
+                " %4lld %4lld %4lld %5lld %5lld |",
+                static_cast<long long>(s.N), static_cast<long long>(s.IC),
+                static_cast<long long>(s.IH), static_cast<long long>(s.OC),
+                static_cast<long long>(s.K), static_cast<long long>(s.groups),
+                static_cast<long long>(s.S), static_cast<long long>(s.D),
+                static_cast<long long>(icn), static_cast<long long>(ocn),
+                static_cast<long long>(ohb), static_cast<long long>(blks),
+                static_cast<long long>(tasks));
+    for (double v : g) { std::printf(" %7.1f", v); }
+    std::printf("\n");
+}
+
+template <typename T>
+void sweep_conv(const char* tag, const std::vector<ConvSweepShape>& shapes,
+                const std::vector<int>& threads, double target_ms) {
+    const int64_t meta_threads = *std::max_element(threads.begin(), threads.end());
+    std::printf("  %s conv sweep  budget=%.0f ms/cell\n", tag, target_ms);
+    print_conv_sweep_header(threads);
+    uint64_t seed = 7;
+    for (const ConvSweepShape& s : shapes) {
+        ConvSweepOp<T> g(s, seed, meta_threads);
+        seed += 2;
+        std::vector<double> gflops;
+        for (int nt : threads) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+            gflops.push_back(g.time_budget(use_ctx, target_ms));
+        }
+        print_conv_sweep_row(s, g.icn, g.ocn, g.ohb, g.blks, g.tasks, gflops);
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -532,6 +705,63 @@ NNOPS_BENCH(conv2d_f16_grouped_3x3) {
 NNOPS_BENCH(conv2d_f16_batch) {
     bench_conv2d_case({"f16 batch 8x64x28x28 -> 128 x 3x3 s1 p1", 8, 64, 28, 28, 128, 3, 3,
                        /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1, /*DH=*/1, /*DW=*/1, /*groups=*/1,
+                       /*bias=*/false, /*f16=*/true});
+}
+
+// ============================================================
+// Larger kernels — 5x5, 7x7
+// ============================================================
+//
+// karea drives icn_block (8 through 3x3, 4 through 5x5, 2 through 7x7), so
+// everything past 3x3 runs on a narrower im2col panel and a deeper ic-block
+// walk. The 56x56 cases deliberately share the resnet-block shape above them so
+// the rows differ in the kernel and nothing else.
+
+NNOPS_BENCH(conv2d_f32_5x5) {
+    // Same in/out shape as conv2d_f32_resnet_block_3x3 — 25/9 the FLOPs, icn 4.
+    bench_conv2d_case({"f32 5x5 1x64x56x56 -> 64 x 5x5 s1 p2", 1, 64, 56, 56, 64, 5, 5,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2});
+}
+
+NNOPS_BENCH(conv2d_f32_7x7) {
+    // 49/9 of the 3x3 at the same shape, and 4x the 5x5 above it. karea 49 puts
+    // icn_block at 2: the same output is produced from a panel half as wide,
+    // rewritten twice as many times.
+    bench_conv2d_case({"f32 7x7 1x64x56x56 -> 64 x 7x7 s1 p3", 1, 64, 56, 56, 64, 7, 7,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/3, /*PW=*/3});
+}
+
+NNOPS_BENCH(conv2d_f32_5x5_stride2) {
+    // MobileNet-style downsample: 5x5 stride 2 is the largest kernel that
+    // actually sits in a cheap block of a real network.
+    bench_conv2d_case({"f32 5x5 s2 1x32x112x112 -> 32 x 5x5 s2 p2", 1, 32, 112, 112, 32, 5, 5,
+                       /*SH=*/2, /*SW=*/2, /*PH=*/2, /*PW=*/2});
+}
+
+NNOPS_BENCH(conv2d_f32_5x5_dilated2) {
+    // karea stays 25 (icn_block 4) while the gathered window is 9 wide — the
+    // contrast case against a real 9x9, which plans icn_block 1.
+    bench_conv2d_case({"f32 5x5 d2 1x64x56x56 -> 64 x 5x5 s1 p2 d2", 1, 64, 56, 56, 64, 5, 5,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2, /*DH=*/2, /*DW=*/2});
+}
+
+NNOPS_BENCH(conv2d_f32_5x5_grouped) {
+    // The im2col grouped path at 5x5 — pairs with dwconv_f32_5x5 below, which is
+    // the dedicated NCHWC8 kernel on the same shape.
+    bench_conv2d_case({"f32 depthwise 5x5 1x128x28x28 -> 128 x 5x5 g128 s1 p2",
+                       1, 128, 28, 28, 128, 5, 5, /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2,
+                       /*DH=*/1, /*DW=*/1, /*groups=*/128});
+}
+
+NNOPS_BENCH(conv2d_f16_5x5) {
+    bench_conv2d_case({"f16 5x5 1x64x56x56 -> 64 x 5x5 s1 p2", 1, 64, 56, 56, 64, 5, 5,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2, /*DH=*/1, /*DW=*/1, /*groups=*/1,
+                       /*bias=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(conv2d_f16_7x7) {
+    bench_conv2d_case({"f16 7x7 1x64x56x56 -> 64 x 7x7 s1 p3", 1, 64, 56, 56, 64, 7, 7,
+                       /*SH=*/1, /*SW=*/1, /*PH=*/3, /*PW=*/3, /*DH=*/1, /*DW=*/1, /*groups=*/1,
                        /*bias=*/false, /*f16=*/true});
 }
 
@@ -608,4 +838,62 @@ NNOPS_BENCH(conv2d_wino_f16_64ch) {
 NNOPS_BENCH(conv2d_wino_f16_256ch) {
     bench_wino_case({"f16 wino 1x256x28x28 -> 256 x 3x3 s1 p1", 1, 256, 28, 28, 256,
                      /*PH=*/1, /*PW=*/1, /*bias=*/false, /*f16=*/true});
+}
+
+// ============================================================
+// Kernel-area sweeps — what 5x5 and 7x7 cost against 3x3
+// ============================================================
+//
+// Same shapes, read as a table: the icn column is the plan's answer to karea,
+// and the gflops columns are what that answer buys.
+
+NNOPS_BENCH(conv2d_f32_kernel_sweep) {
+    // One shape (1x64x56x56 -> 64), one padding rule, only the kernel moves.
+    // Read icn against K: the plan trades icn_block away roughly in step with
+    // karea, so the K of one GEMM call stays in the 64-100 band while the FLOPs
+    // above it scale with karea^2. The dilated 3x3 is the outlier — karea 9
+    // (icn 8) with a 5-wide gather window, so it plans like a 3x3 and gathers
+    // like a 5x5; only the `d` column tells it apart from the row above.
+    sweep_conv<float>("f32", {
+        {1, 64, 56, 64, 1},                        // pointwise: karea  1, icn 64
+        {1, 64, 56, 64, 3},                        // karea  9, icn 8
+        {1, 64, 56, 64, 3, 1, 1, -1, /*D=*/2},     // dilated 3x3: karea 9, window 5
+        {1, 64, 56, 64, 5},                        // karea 25, icn 4
+        {1, 64, 56, 64, 7},                        // karea 49, icn 2
+    }, sweep_threads(), 80.0);
+}
+
+NNOPS_BENCH(conv2d_f32_large_kernel_shape_sweep) {
+    // Kernel area against plane size. At 28x28 the whole plane is 7 oh-blocks,
+    // so the tasks ceiling (blks) is well under the pool; at 112x112 it is not.
+    sweep_conv<float>("f32", {
+        {1, 64,  28, 64, 3},
+        {1, 64,  28, 64, 5},
+        {1, 64,  28, 64, 7},
+        {1, 64, 112, 64, 3},
+        {1, 64, 112, 64, 5},
+        {1, 64, 112, 64, 7},
+    }, sweep_threads(), 80.0);
+}
+
+NNOPS_BENCH(conv2d_f32_5x5_group_sweep) {
+    // Groups against a fixed 5x5: raising g shrinks ic_per_group, which min()s
+    // into icn_block, so g = 16 already sits at icn_block 1 — the same rank-1
+    // panel a 9x9 reaches with g = 1. Task count rises with g throughout, so
+    // this isolates tile size from pool fill.
+    sweep_conv<float>("f32", {
+        {1, 64, 28, 64, 5, 1, /*groups=*/1},
+        {1, 64, 28, 64, 5, 1, /*groups=*/4},
+        {1, 64, 28, 64, 5, 1, /*groups=*/16},
+        {1, 64, 28, 64, 5, 1, /*groups=*/64},   // depthwise 5x5
+    }, sweep_threads(), 80.0);
+}
+
+NNOPS_BENCH(conv2d_f16_kernel_sweep) {
+    sweep_conv<half>("f16", {
+        {1, 64, 56, 64, 1},
+        {1, 64, 56, 64, 3},
+        {1, 64, 56, 64, 5},
+        {1, 64, 56, 64, 7},
+    }, sweep_threads(), 80.0);
 }
