@@ -398,6 +398,206 @@ void bench_route_ab(const char* tag, const char* la, const char* lb,
                 la, ma, lb, mb, la, lb, ma / mb);
 }
 
+// ---- size / shape sweeps ---------------------------------------------------
+//
+// The point cases above each pin one shape. That answers the routing questions
+// but not the one the 20T column kept raising: 256^3 resolves to two M-blocks,
+// so its 20T row measures the thread pool start-up, not the kernel, and the
+// useful question is where the knee between "pool dominates" and "kernel
+// dominates" sits. These sweep it.
+//
+// Iterations are adaptive here — every cell runs until a fixed wall-clock
+// budget elapses — rather than the flat 20 the point cases use. At 2048^3
+// twenty iterations is ~30 s per thread count; at 64^3 it is well under a
+// millisecond, too short to time at all. A fixed budget also leaves every row
+// on the machine for the same wall time, which is what makes the rows
+// comparable on a host that drifts under load (see the A/B section above for
+// how much it drifts).
+//
+// The tile columns are the plan resolved at the *largest* pool in the row, not
+// at 1 thread: kc shares the residency budget with mc and nc, so the plan is
+// per-pool, and the widest pool is the run whose block count bounds the others.
+
+struct SweepShape { int64_t M, K, N; };
+
+std::vector<int> sweep_threads() {
+    std::vector<int> threads{1, 2, 4, 8};
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
+        threads.push_back(hw);
+    }
+    return threads;
+}
+
+void print_sweep_header(const std::vector<int>& threads, const char* unit) {
+    std::printf("   %5s %5s %5s  %-5s %4s %4s %4s |", "M", "K", "N", "route", "mc", "nc", "blk");
+    for (int t : threads) {
+        const std::string label = std::to_string(t) + "T";
+        std::printf(" %7s", label.c_str());
+    }
+    std::printf("   (%s)\n", unit);
+}
+
+void print_sweep_row(const SweepShape& s, const char* route, int mc, int nc, int64_t blocks,
+                     const std::vector<double>& g) {
+    std::printf("   %5lld %5lld %5lld  %-5s %4d %4d %4lld |",
+                static_cast<long long>(s.M), static_cast<long long>(s.K),
+                static_cast<long long>(s.N), route, mc, nc,
+                static_cast<long long>(blocks));
+    for (double v : g) { std::printf(" %7.1f", v); }
+    std::printf("\n");
+}
+
+/// One (M,K,N) fp problem, built once and reused across pool sizes.
+template <typename T>
+struct SweepOp {
+    using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
+
+    OpPtr op;
+    std::vector<T> a_buf, b_buf, out_buf;
+    TensorView ins[2], out;
+    int64_t M, K, N, blocks;
+    int mc, nc;
+    bool split_n;
+    double flops;
+
+    SweepOp(int64_t m, int64_t k, int64_t n, uint64_t seed, int64_t meta_threads)
+        : M(m), K(k), N(n) {
+        auto [av, a] = make_tensor<T>(M, K, K, seed);
+        auto [bv, b] = make_tensor<T>(K, N, N, seed + 1);
+        a_buf = std::move(av);
+        b_buf = std::move(bv);
+
+        MatMulAttributes attrs{};
+        op = MatMul::create(attrs, Backend::CPU);
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
+        out = test::make_planar(descs[0], out_buf.data());
+        ins[0] = a;
+        ins[1] = b;
+
+        const cpu::MatMulPlan plan =
+            cpu::get_matmul_plan(attrs, a.desc(), b.desc(), meta_threads);
+        split_n = plan.split_n;
+        mc = static_cast<int>(plan.mc);
+        nc = static_cast<int>(plan.nc);
+        blocks = split_n ? (N + plan.nc - 1) / plan.nc : cpu::split_block_count(M, plan.mc);
+        flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
+    }
+
+    /// GFLOPS of one budgeted block: warm up, then iterate until @p target_ms
+    /// of wall time has elapsed. One block rather than a median of blocks —
+    /// at ~100 ms a block is long enough that the spread within it sits far
+    /// below the between-size differences this table is read for.
+    double time_budget(const ComputeContext& ctx, double target_ms) {
+        for (int i = 0; i < 2; ++i) { op->compute(out, ins, ctx, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        int64_t iters = 0;
+        double ms = 0.0;
+        constexpr int64_t kMaxIters = 20000;   // the floor is 64^3 against 100 ms
+        do {
+            op->compute(out, ins, ctx, nullptr);
+            ++iters;
+            ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::high_resolution_clock::now() - t0).count();
+        } while (ms < target_ms && iters < kMaxIters);
+        return flops * static_cast<double>(iters) / (ms * 1e6);
+    }
+};
+
+template <typename T>
+void sweep_fp(const char* tag, const std::vector<SweepShape>& shapes,
+              const std::vector<int>& threads, double target_ms) {
+    const int64_t meta_threads = *std::max_element(threads.begin(), threads.end());
+    std::printf("  %s nn sweep  budget=%.0f ms/cell\n", tag, target_ms);
+    print_sweep_header(threads, "GFLOPS");
+    for (const SweepShape& s : shapes) {
+        SweepOp<T> g(s.M, s.K, s.N, 7, meta_threads);
+        std::vector<double> gflops;
+        for (int nt : threads) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+            gflops.push_back(g.time_budget(ctx, target_ms));
+        }
+        print_sweep_row(s, g.split_n ? "NKM" : "MKN", g.mc, g.nc, g.blocks, gflops);
+    }
+}
+
+/// The int8 counterpart. Same shape as SweepOp, on the s8×s8 → s32 path.
+struct SweepOpI8 {
+    using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
+
+    OpPtr op;
+    std::vector<int8_t> a_buf, b_buf;
+    std::vector<int32_t> out_buf;
+    TensorView ins[2], out;
+    int64_t M, K, N, blocks;
+    int mc, nc;
+    bool split_n;
+    double flops;
+
+    SweepOpI8(int64_t m, int64_t k, int64_t n, uint64_t seed, int64_t meta_threads)
+        : M(m), K(k), N(n) {
+        auto [av, a] = make_tensor_i8(M, K, seed);
+        auto [bv, b] = make_tensor_i8(K, N, seed + 1);
+        a_buf = std::move(av);
+        b_buf = std::move(bv);
+
+        MatMulAttributes attrs{};
+        attrs.output_dtype = DataType::s32;
+        op = MatMul::create(attrs, Backend::CPU);
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        out_buf.assign(static_cast<size_t>(descs[0].numel()), 0);
+        out = test::make_planar(descs[0], out_buf.data());
+        ins[0] = a;
+        ins[1] = b;
+
+        const cpu::MatMulPlan plan =
+            cpu::get_matmul_plan(attrs, a.desc(), b.desc(), meta_threads);
+        split_n = plan.split_n;
+        mc = static_cast<int>(plan.mc);
+        nc = static_cast<int>(plan.nc);
+        blocks = split_n ? (N + plan.nc - 1) / plan.nc : cpu::split_block_count(M, plan.mc);
+        flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
+    }
+
+    double time_budget(const ComputeContext& ctx, double target_ms) {
+        for (int i = 0; i < 2; ++i) { op->compute(out, ins, ctx, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        int64_t iters = 0;
+        double ms = 0.0;
+        constexpr int64_t kMaxIters = 20000;
+        do {
+            op->compute(out, ins, ctx, nullptr);
+            ++iters;
+            ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::high_resolution_clock::now() - t0).count();
+        } while (ms < target_ms && iters < kMaxIters);
+        return flops * static_cast<double>(iters) / (ms * 1e6);
+    }
+};
+
+void sweep_i8(const std::vector<SweepShape>& shapes, const std::vector<int>& threads,
+              double target_ms) {
+    const int64_t meta_threads = *std::max_element(threads.begin(), threads.end());
+    std::printf("  int8 nn sweep  budget=%.0f ms/cell\n", target_ms);
+    print_sweep_header(threads, "GOPS");
+    for (const SweepShape& s : shapes) {
+        SweepOpI8 g(s.M, s.K, s.N, 7, meta_threads);
+        std::vector<double> gops;
+        for (int nt : threads) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+            gops.push_back(g.time_budget(ctx, target_ms));
+        }
+        print_sweep_row(s, g.split_n ? "NKM" : "MKN", g.mc, g.nc, g.blocks, gops);
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -556,4 +756,57 @@ NNOPS_BENCH(matmul_i8_nn_256) {
 NNOPS_BENCH(matmul_i8_tb_large) {
     // LLM-style A @ W^T (transpose_b): weight-B is [N, K] per-token.
     bench_i8_case({"i8 tb 1024x512x1024", 1024, 512, 1024, /*ta=*/false, /*tb=*/true});
+}
+
+// ============================================================
+// Size and shape sweeps — where the thread pool starts to pay
+// ============================================================
+//
+// Same binary, same shapes as above but read as a table instead of one case at
+// a time: the point cases answer "which route", these answer "at what size".
+// Everything is capped at 2048^3.
+
+NNOPS_BENCH(matmul_f32_size_sweep) {
+    // Square, doubling-ish from 64 to the 2048 cap. The left end is where the
+    // pool has nothing to hand out (256^3 = 2 M-blocks, which is why its point
+    // case reads 0.48x at 20T) and the right end is past L2/L3.
+    sweep_fp<float>("f32", {
+        {64, 64, 64},       {96, 96, 96},       {128, 128, 128},   {192, 192, 192},
+        {256, 256, 256},    {384, 384, 384},    {512, 512, 512},   {768, 768, 768},
+        {1024, 1024, 1024}, {1536, 1536, 1536}, {2048, 2048, 2048},
+    }, sweep_threads(), 120.0);
+}
+
+NNOPS_BENCH(matmul_f32_shape_sweep) {
+    // Asymmetric shapes, each isolating one axis as the one that has to carry
+    // the parallelism. M=1 decode is the extreme: there is no M to split at
+    // all, so the block count is whatever N yields.
+    sweep_fp<float>("f32", {
+        {1, 2048, 2048},      // decode: one token, M is not a splittable axis
+        {16, 2048, 2048},     // small-batch decode
+        {2048, 512, 128},     // tall-skinny: only M splits
+        {128, 512, 2048},     // short-fat: N > M, takes the NKM split
+        {512, 2048, 512},     // deep K: kc blocking, not tile count, dominates
+        {2048, 2048, 2048},   // the cap, as the square reference point
+    }, sweep_threads(), 120.0);
+}
+
+NNOPS_BENCH(matmul_f16_size_sweep) {
+    // f16 runs at the F16C cvt→compute→cvt rate (~78 GFLOPS at 1T on this
+    // host), so 2048^3 is a ~220 ms iteration — one per cell here.
+    sweep_fp<half>("f16", {
+        {128, 128, 128},   {256, 256, 256},   {384, 384, 384},   {512, 512, 512},
+        {768, 768, 768},   {1024, 1024, 1024},{1536, 1536, 1536}, {2048, 2048, 2048},
+    }, sweep_threads(), 120.0);
+}
+
+NNOPS_BENCH(matmul_i8_size_sweep) {
+    // The int8 point case 256^3 collapses to 0.08x at 20T (mc=24, nc=240, 11
+    // blocks — the kc budget shrinks the tiles as the pool grows). This walks
+    // the same curve at a size where the tiles have room as well.
+    sweep_i8({
+        {128, 128, 128},    {192, 192, 192},    {256, 256, 256},   {384, 384, 384},
+        {512, 512, 512},    {768, 768, 768},    {1024, 1024, 1024},
+        {1536, 1536, 1536}, {2048, 2048, 2048},
+    }, sweep_threads(), 120.0);
 }
