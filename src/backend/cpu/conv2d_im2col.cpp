@@ -339,14 +339,39 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     plan.ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
     plan.oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
 
+    const int64_t NG = N * G;
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+
+    // The oh-block is the atomic unit of work — a chunk owns a whole number of
+    // them — so the pool can never be filled past NG·num_oh_blocks tasks, no
+    // matter how many threads it has. When that leaves more than half the pool
+    // idle, halve the block to double the task count. The halving stops at a
+    // block two n-panels wide: below that a block's GEMM is too narrow to pay
+    // for re-reading its own weight panel at every oh-step.
+    //
+    // Measured on this host (i5-13600KF, 6P+8E, 20 threads), interleaved A/B:
+    //   1x256x28x28 3x3   7 blocks -> 14: 406 -> 466 GFLOPS  (+15%, arms disjoint)
+    //   1x64x56x56 3x3   14 blocks -> 20: within noise (+3%), so the gate is
+    //                     "more than half the pool idle", not merely "any idle
+    //                     worker" — at 8 threads the same 7-block plan against
+    //                     an 8-thread pool is *hurt* by the split (397 -> 349),
+    //                     and the gate is what keeps that case on 4 rows.
+    // It costs no scratch: col_size shrinks with the block.
+    const int64_t nr_max = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
+    for (;;) {
+        const int64_t blocks = (OH + plan.oh_block - 1) / plan.oh_block;
+        if (2 * NG * blocks >= nt || plan.oh_block <= 1) { break; }
+        const int64_t next = plan.oh_block / 2;
+        if (next * OW < 2 * nr_max) { break; }
+        plan.oh_block = next;
+    }
+
     plan.num_oh_blocks = (OH + plan.oh_block - 1) / plan.oh_block;
 
     // Split the oh dimension when (batch, group) alone under-subscribes the
     // thread pool (the common batch=1 / groups=1 case would otherwise run
     // single-threaded). Each oh-chunk owns its own im2col scratch, so cap the
     // chunk count at the number of oh-blocks.
-    const int64_t NG = N * G;
-    const int64_t nt = std::max<int64_t>(num_threads, 1);
     plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, plan.num_oh_blocks);
 
     plan.col_size  = plan.icn_block * karea * plan.oh_block * OW;
