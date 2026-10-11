@@ -300,12 +300,22 @@ struct WinoCase {
     bool bias = false, f16 = false;
 };
 
+/// Mean wall time of ONE call, in milliseconds.
+///
+/// Per-call, not per-batch: the caller divides a FLOP count taken per iteration
+/// by this and prints the quotient as a per-call rate, so a batch total here
+/// inflates the ms column by `iters` and the GFLOPS column by 1000/iters —
+/// 20x and 50x at the 20 iterations this section runs. The speedup column is a
+/// ratio and cancelled it, so the A/B verdicts stayed right while every
+/// absolute number was wrong. The caller's divisor was off in the same
+/// direction and was fixed in the same change.
 template <typename Fn>
 double time_ms(Fn&& fn, int iters) {
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i) { fn(); }
     auto t1 = std::chrono::high_resolution_clock::now();
-    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+           std::max(iters, 1);
 }
 
 /// Interleaved A/B. Within one round the two variants alternate A B A B, and the
@@ -443,8 +453,8 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
 
         std::printf("    %2dT  im2col %7.3f ms (%7.1f GFLOPS) | wino %7.3f ms (%7.1f GFLOPS)"
                     " | speedup %.2fx%s | null %.1f%%\n",
-                    nt, im, flops_per_iter / im / 1e3,
-                    wn, flops_per_iter_wino / wn / 1e3,
+                    nt, im, flops_per_iter / im / 1e6,
+                    wn, flops_per_iter_wino / wn / 1e6,
                     speedup, real ? "" : " (within noise)", nf);
     }
 }
