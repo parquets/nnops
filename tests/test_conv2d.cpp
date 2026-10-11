@@ -2,6 +2,7 @@
 /// Uses Conv2D class API exclusively.
 
 #include "nnops/ops/conv2d.hpp"
+#include "backend/cpu/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -464,6 +465,36 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
         {{1, 16, 8, 8},  {32, 16, 3, 3},  3, 3, 1, 1, 1, 1, 1, 1, 1, true},
         {{1, 4, 8, 8},   {144, 4, 3, 3},  3, 3, 1, 1, 1, 1, 1, 1, 1, false},
         {{1, 3, 18, 18}, {6, 3, 3, 3},    3, 3, 1, 1, 1, 1, 2, 2, 1, false},
+
+        // ---- kernel area past 3x3 ------------------------------------------
+        // get_ic_block() picks icn_block from karea alone: 8 through 3x3, 4
+        // through 5x5, 2 through 7x7, 1 past that. Every case above sits on the
+        // top rung, so nothing here exercised the ic-block ladder, the narrow
+        // im2col panel it produces, or the deeper ic_per_group / icn_block walk
+        // that comes with it.
+
+        // 5x5 "same" + bias — karea 25, the first rung down.
+        {{1, 3, 32, 32}, {8, 3, 5, 5},     5, 5, 1, 1, 2, 2, 1, 1, 1, true},
+        // 5x5 stride 2 (MobileNet-style downsample): strided gather + big kernel.
+        {{1, 4, 28, 28}, {16, 4, 5, 5},    5, 5, 2, 2, 1, 1, 1, 1, 1, false},
+        // 5x5 dilated 2: karea is still 25, but the gathered window is 9 wide.
+        {{1, 3, 32, 32}, {8, 3, 5, 5},     5, 5, 1, 1, 2, 2, 2, 2, 1, false},
+        // 5x5 with groups: NG > 1 with the same narrow panel.
+        {{1, 8, 20, 20}, {16, 4, 5, 5},    5, 5, 1, 1, 2, 2, 1, 1, 2, false},
+        // wide OC (144 > ocn_block 128) over a 5x5 reduction.
+        {{1, 16, 14, 14}, {144, 16, 5, 5}, 5, 5, 1, 1, 2, 2, 1, 1, 1, true},
+        // non-square 5x7 — karea 35, still on the icn_block-2 rung.
+        {{1, 3, 24, 28}, {6, 3, 5, 7},     5, 7, 1, 1, 2, 3, 1, 1, 1, false},
+
+        // 7x7 ResNet stem (stride 2, pad 3) + bias — karea 49, icn_block 2.
+        {{1, 3, 32, 32}, {16, 3, 7, 7},    7, 7, 2, 2, 3, 3, 1, 1, 1, true},
+        // 7x7 with IC (8) well past icn_block (2): four ic-block iterations.
+        {{1, 8, 16, 16}, {8, 8, 7, 7},     7, 7, 1, 1, 3, 3, 1, 1, 1, false},
+        // 7x7 with groups: NG > 1 on the narrow panel.
+        {{1, 4, 32, 32}, {8, 2, 7, 7},     7, 7, 1, 1, 3, 3, 1, 1, 2, true},
+
+        // karea 81 > 49: the last rung, icn_block 1 (a rank-1 panel).
+        {{1, 2, 24, 24}, {4, 2, 9, 9},     9, 9, 1, 1, 4, 4, 1, 1, 1, false},
     };
 
     for (const auto& c : cases) {
@@ -505,6 +536,12 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
         {{1, 4, 20, 20}, {8, 2, 3, 3},   3, 3, 1, 1, 1, 1, 2, 2, 2, false},
         // batch=2 exercises both the (batch) and the oh-chunk dimensions.
         {{2, 3, 16, 16}, {8, 3, 3, 3},   3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        // 7x7: karea 49 drops icn_block to 2, so each oh-chunk re-reads the
+        // weight panel far more often — still disjoint output tiles, so the
+        // per-chunk results must stay bit-identical.
+        {{1, 4, 32, 32}, {8, 4, 7, 7},   7, 7, 1, 1, 3, 3, 1, 1, 1, true},
+        // 5x5 stride 2: large karea and a strided im2col gather.
+        {{1, 8, 28, 28}, {16, 8, 5, 5},  5, 5, 2, 2, 2, 2, 1, 1, 1, false},
     };
 
     for (const auto& c : cases) {
@@ -686,6 +723,20 @@ NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
         {{1, 32, 10, 10}, {16, 32, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
         // wide N (32) with groups, deeper K, no bias.
         {{1, 16, 12, 12}, {32, 8, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},
+
+        // ---- kernel area past 3x3 (the f32 table's new rows, in f16) -------
+        // 5x5, K = 8*25 = 200 > KC_F16 (128): multi-k-block with a large karea.
+        {{1, 8, 16, 16}, {16, 8, 5, 5},  5, 5, 1, 1, 2, 2, 1, 1, 1, true},
+        // 5x5 stride 2, groups 2.
+        {{1, 8, 20, 20}, {16, 4, 5, 5},  5, 5, 2, 2, 2, 2, 1, 1, 2, false},
+        // 7x7 ResNet stem (stride 2, pad 3) + bias — karea 49, icn_block 2.
+        {{1, 3, 32, 32}, {16, 3, 7, 7},  7, 7, 2, 2, 3, 3, 1, 1, 1, true},
+        // 7x7 with IC (8) past icn_block (2).
+        {{1, 8, 16, 16}, {8, 8, 7, 7},   7, 7, 1, 1, 3, 3, 1, 1, 1, false},
+        // non-square 5x7 — karea 35.
+        {{1, 3, 20, 24}, {6, 3, 5, 7},   5, 7, 1, 1, 2, 3, 1, 1, 1, false},
+        // karea 81 > 49: icn_block 1.
+        {{1, 2, 20, 20}, {4, 2, 9, 9},   9, 9, 1, 1, 4, 4, 1, 1, 1, false},
     };
 
     const float tol = nnops::test::kF16AccumTol;
@@ -764,6 +815,64 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
     }
     std::printf("      f16 conv2d (pitched input): max deviation %.4f\n", worst);
     NNOPS_EXPECT_NEAR(worst, 0.0f, nnops::test::kF16AccumTol);
+}
+
+// ============================================================
+// Large-kernel planning (5x5 / 7x7 / 9x9)
+// ============================================================
+
+NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
+    // get_ic_block() picks icn_block from karea alone — 64 at 1x1, 8 through
+    // 3x3, 4 through 5x5, 2 through 7x7, and 1 past that. One GEMM call reduces
+    // over icn_block * karea, so the ladder exists to hold that K roughly flat
+    // as the kernel area grows: the im2col panel is written karea times per
+    // input channel either way, and a constant K is what keeps the weight
+    // panel's re-read cost per output proportional rather than exploding.
+    //
+    // The correctness tables above now run every rung, but they only observe the
+    // result. Pin the ladder itself, so retuning the thresholds is a visible,
+    // deliberate change rather than a silent shift in how much traffic every
+    // 5x5/7x7 in the tree generates.
+    struct Ladder { int64_t kh, kw, want_icn; };
+    const Ladder ladder[] = {
+        {1, 1, 64},   // karea  1
+        {1, 5,  8},   // karea  5  — inside the band the 3x3 cases use
+        {3, 3,  8},   // karea  9  — that band's edge
+        {3, 5,  4},   // karea 15  — first rung down
+        {5, 5,  4},   // karea 25  — that band's edge
+        {5, 7,  2},   // karea 35
+        {7, 7,  2},   // karea 49  — that band's edge
+        {9, 9,  1},   // karea 81  — past the ladder: a rank-1 panel
+    };
+
+    for (const Ladder& l : ladder) {
+        const int64_t IC = 64, OC = 64, HW = 24;
+        const int64_t ishape[] = {1, IC, HW, HW};
+        const int64_t wshape[] = {OC, IC, l.kh, l.kw};
+
+        std::vector<float> in_buf(static_cast<size_t>(IC * HW * HW), 0.0f);
+        std::vector<float> w_buf(static_cast<size_t>(OC * IC * l.kh * l.kw), 0.0f);
+        TensorView input(ishape, DataType::f32, in_buf.data());
+        TensorView weight(wshape, DataType::f32, w_buf.data());
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {l.kh, l.kw};
+        attrs.padding     = {l.kh / 2, l.kw / 2};
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {input.desc(), weight.desc()};
+        const auto out_descs = op->getOutputTensorDesc(descs);
+
+        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+            attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
+
+        NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
+        NNOPS_EXPECT_EQ(plan.icn_block, l.want_icn);
+        // The plan's im2col panel must be exactly the block the kernel is handed:
+        // icn_block channels x karea taps x oh_block output rows x OW columns.
+        NNOPS_EXPECT_EQ(plan.col_size,
+                        plan.icn_block * l.kh * l.kw * plan.oh_block * out_descs[0].dims[3]);
+    }
 }
 
 // ============================================================
