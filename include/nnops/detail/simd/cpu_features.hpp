@@ -73,11 +73,18 @@ public:
 
     /// L1 data cache size in bytes.
     ///
+    /// Detected on x86_64 (CPUID leaf 4, the level-1 *data* entry) and on
+    /// AArch64 (Linux sysfs, `hw.l1dcachesize`, or GetLogicalProcessorInformation).
+    /// This feeds the kc bound, so it has to be the data cache: the instruction
+    /// cache is a different size on most parts and never holds a packed panel.
+    ///
     /// On Apple Silicon `hw.l1dcachesize` reports the *efficiency* cluster's L1D
     /// (64 KiB on an M4) while the performance cluster has 128 KiB. The smaller
     /// figure is the useful one: worker threads land on either cluster, so a
     /// working set sized for the bigger one overflows on the E cores.
-    /// Defaults to 32768 (a typical x86 L1D) when no detection path is available.
+    ///
+    /// Defaults to 32768 (a typical x86 L1D) when no detection path is available
+    /// — notably on any aarch64 target that is not Linux, macOS or Windows ARM64.
     size_t l1_cache_size() const { return l1_cache_size_; }
 
     /// L2 cache size in bytes (per-core). Detected via CPUID on x86_64 and

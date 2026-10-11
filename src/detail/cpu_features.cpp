@@ -54,6 +54,59 @@ bool os_avx512_support() {
 #endif
 }
 
+// Walk CPUID leaf 4 ("deterministic cache parameters") and report the first
+// level-1 *data* cache and the first level-2 cache it describes. A member is
+// left untouched if nothing matches, so the caller's default survives.
+//
+// One walk fills both because they feed one decision: the tile solver sizes kc
+// from L1 (a k-block holds one A micro-panel plus two B micro-panels there) and
+// mc/nc from L2, and both numbers have to come from the same machine. Two
+// details a naive walk gets wrong:
+//
+//   - The level-1 entry has to be the *data* cache (type 1). Type 2 is the
+//     instruction cache, which is a different size on most parts (32 KiB
+//     against the data cache's 48 KiB here) and never holds a packed panel.
+//   - The walk must not stop at the first cache it can use. Level-2 typically
+//     follows level-1 in the enumeration — but "typically" is not a guarantee,
+//     and stopping early is what left this host's L1 at the default 32 KiB.
+//
+// Leaf 4 exists on Intel Nehalem+ and AMD Bulldozer+. Older parts report
+// cache_type 0 on the first subleaf and both outputs stay as they were, which
+// is not a loss here: the library's baseline already requires AVX2 (x86) or
+// NEON (ARM), and no CPU that old has either.
+inline void cpuid_cache_sizes(size_t& l1_data_bytes, size_t& l2_bytes) {
+    for (int subleaf = 0; ; ++subleaf) {
+        int info[4] = {0};
+    #if defined(_MSC_VER)
+        __cpuidex(info, 4, subleaf);
+    #else
+        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+        __cpuid_count(4, subleaf, eax, ebx, ecx, edx);
+        info[0] = static_cast<int>(eax);
+        info[1] = static_cast<int>(ebx);
+        info[2] = static_cast<int>(ecx);
+        info[3] = static_cast<int>(edx);
+    #endif
+        const int cache_type = info[0] & 0x1F;
+        if (cache_type == 0) { break; }  // no more caches
+
+        const int cache_level = (info[0] >> 5) & 0x7;
+        // type 1 = data cache, type 3 = unified cache
+        const bool is_l1_data = (cache_level == 1 && cache_type == 1);
+        const bool is_l2      = (cache_level == 2 && (cache_type == 1 || cache_type == 3));
+        if (!is_l1_data && !is_l2) { continue; }
+
+        const int line_size  = (info[1] & 0xFFF) + 1;
+        const int partitions = ((info[1] >> 12) & 0x3FF) + 1;
+        const int ways       = ((info[1] >> 22) & 0x3FF) + 1;
+        const int sets       = info[2] + 1;
+        const size_t bytes =
+            static_cast<size_t>(ways) * partitions * line_size * sets;
+        if (is_l1_data) { l1_data_bytes = bytes; }
+        else            { l2_bytes = bytes; }
+    }
+}
+
 } // anonymous namespace
 
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -66,6 +119,41 @@ bool os_avx512_support() {
 #endif
 #include <cstdio>
 #include <cstdlib>
+
+namespace {
+
+// Read one Linux sysfs cache size, e.g. "/sys/devices/system/cpu/cpu0/cache/
+// index1/size" holding "48K". Returns 0 if the file is absent or unparseable,
+// which leaves the caller's default in place.
+//
+// cpu0 is deliberate rather than a sum over CPUs: the tile solver models the
+// caches of the core it is running on, and on the parts this targets every core
+// has the same L1 and L2. `index1` is the data cache and `index2` the unified
+// one — the kernel numbers L1I as index0.
+size_t read_sysfs_cache_size(const char* path) {
+    std::FILE* fp = std::fopen(path, "r");
+    if (!fp) { return 0; }
+    char buf[32] = {};
+    size_t out = 0;
+    if (std::fgets(buf, sizeof(buf), fp)) {
+        char* end = nullptr;
+        unsigned long val = std::strtoul(buf, &end, 10);
+        if (end != buf && val > 0) {
+            if (*end == 'K' || *end == 'k') {
+                val *= 1024;
+            } else if (*end == 'M' || *end == 'm') {
+                val *= 1024 * 1024;
+            } else if (*end == 'G' || *end == 'g') {
+                val *= 1024 * 1024 * 1024;
+            }
+            out = static_cast<size_t>(val);
+        }
+    }
+    std::fclose(fp);
+    return out;
+}
+
+} // anonymous namespace
 #elif defined(_WIN32)
 #include <Windows.h>
 #elif defined(__APPLE__)
@@ -106,31 +194,9 @@ void CpuFeatures::detect() {
         }
     }
 
-    // ---- L2 cache size via CPUID leaf 4 (deterministic cache parameters) ----
-    for (int subleaf = 0; ; ++subleaf) {
-    #if defined(_MSC_VER)
-        int info[4] = {0};
-        __cpuidex(info, 4, subleaf);
-    #else
-        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-        __cpuid_count(4, subleaf, eax, ebx, ecx, edx);
-        int info[4] = {static_cast<int>(eax), static_cast<int>(ebx),
-                       static_cast<int>(ecx), static_cast<int>(edx)};
-    #endif
-        int cache_type = info[0] & 0x1F;
-        if (cache_type == 0) { break; }  // no more caches
-
-        int cache_level = (info[0] >> 5) & 0x7;
-        // type 1 = data cache, type 3 = unified cache
-        if (cache_level == 2 && (cache_type == 1 || cache_type == 3)) {
-            int line_size  = (info[1] & 0xFFF) + 1;
-            int partitions = ((info[1] >> 12) & 0x3FF) + 1;
-            int ways       = ((info[1] >> 22) & 0x3FF) + 1;
-            int sets       = info[2] + 1;
-            l2_cache_size_ = static_cast<size_t>(ways) * partitions * line_size * sets;
-            break;
-        }
-    }
+    // ---- L1 data and L2 sizes via CPUID leaf 4 (deterministic cache params) ----
+    // Both members keep their defaults if the walk finds nothing.
+    cpuid_cache_sizes(l1_cache_size_, l2_cache_size_);
 
 #elif defined(NNOPS_ARCH_AARCH64)
     // NEON (ASIMD) is mandatory on AArch64
@@ -160,6 +226,19 @@ void CpuFeatures::detect() {
     }
 #endif
 
+    // ---- L1 data cache size detection ----
+    // x86 reads this from CPUID leaf 4 above; on aarch64 it comes from the OS.
+    // Apple's is folded into the sysctl block below, which is already open.
+#if defined(__linux__)
+    {
+        // sysfs only: there is no getauxval(AT_L1D_CACHESIZE), and HWCAP does
+        // not describe cache geometry at all.
+        const size_t l1 = read_sysfs_cache_size(
+            "/sys/devices/system/cpu/cpu0/cache/index1/size");
+        if (l1 > 0) { l1_cache_size_ = l1; }
+    }
+#endif
+
     // ---- L2 cache size detection ----
 #if defined(__linux__)
     {
@@ -172,40 +251,32 @@ void CpuFeatures::detect() {
             l2_cache_size_ = static_cast<size_t>(aux_l2);
         } else {
             // Fallback: read Linux sysfs for per-CPU L2 cache
-            std::FILE* fp = std::fopen(
-                "/sys/devices/system/cpu/cpu0/cache/index2/size", "r");
-            if (fp) {
-                char buf[32] = {};
-                if (std::fgets(buf, sizeof(buf), fp)) {
-                    char* end = nullptr;
-                    unsigned long val = std::strtoul(buf, &end, 10);
-                    if (end != buf && val > 0) {
-                        if (*end == 'K' || *end == 'k') {
-                            val *= 1024;
-                        } else if (*end == 'M' || *end == 'm') {
-                            val *= 1024 * 1024;
-                        } else if (*end == 'G' || *end == 'g') {
-                            val *= 1024 * 1024 * 1024;
-                        }
-                        l2_cache_size_ = static_cast<size_t>(val);
-                    }
-                }
-                std::fclose(fp);
-            }
+            const size_t l2 = read_sysfs_cache_size(
+                "/sys/devices/system/cpu/cpu0/cache/index2/size");
+            if (l2 > 0) { l2_cache_size_ = l2; }
         }
     }
 #elif defined(_WIN32)
     {
-        // Windows ARM64: use GetLogicalProcessorInformation
+        // Windows ARM64: use GetLogicalProcessorInformation. Both levels in one
+        // pass, each taking the first entry that matches. The order of the cache
+        // entries is not documented to be by level, and returning at the first
+        // L2 — as this used to — can walk past the L1 data cache.
         SYSTEM_LOGICAL_PROCESSOR_INFORMATION buf[256];
         DWORD len = sizeof(buf);
         if (GetLogicalProcessorInformation(buf, &len)) {
             DWORD count = len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+            bool have_l1 = false;
+            bool have_l2 = false;
             for (DWORD i = 0; i < count; ++i) {
-                if (buf[i].Relationship == RelationCache &&
-                    buf[i].Cache.Level == 2) {
-                    l2_cache_size_ = buf[i].Cache.Size;
-                    break;
+                if (buf[i].Relationship != RelationCache) { continue; }
+                const CACHE_DESCRIPTOR& c = buf[i].Cache;
+                if (c.Level == 1 && c.Type == CacheData && !have_l1) {
+                    l1_cache_size_ = c.Size;
+                    have_l1 = true;
+                } else if (c.Level == 2 && !have_l2) {
+                    l2_cache_size_ = c.Size;
+                    have_l2 = true;
                 }
             }
         }
