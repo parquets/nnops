@@ -5,6 +5,8 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/conv2d_im2col.h"
+#include "backend/cpu/conv2d_winograd.h"
+#include "backend/cpu/simd_kernel/simd_winograd.hpp"
 
 namespace nnops {
 
@@ -20,8 +22,12 @@ Conv2D::~Conv2D() = default;
 
 
 namespace {
-auto resolve_conv2d_kernel(Backend backend) -> Conv2D::Impl::KernelFn
+auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
+    -> Conv2D::Impl::KernelFn
 {
+    if (algorithm == ConvAlgorithm::Winograd && backend == Backend::CPU) {
+        return backend::cpu::conv2d_winograd_kernel;
+    }
     switch (backend) {
     case Backend::CPU:
         return backend::cpu::conv2d_im2col_kernel;
@@ -37,6 +43,24 @@ auto resolve_conv2d_kernel(Backend backend) -> Conv2D::Impl::KernelFn
         return nullptr;
     }
 }
+
+/// Pack the raw [OC, IC/G, 3, 3] weight into U[16][OC][IC/G] = G g Gᵀ.
+/// @p ld_u / @p ld_c are the row / column strides of one 4×4 transform block
+/// inside the U buffer (p = i·4 + j maps to p·OC·ICG).
+template <class T>
+void wino_pack_weight(const TensorView& weight, TensorView& u_out,
+                      int64_t OC, int64_t ICG, int64_t ld_u, int64_t ld_c)
+{
+    const T* g = weight.ptr<T>();
+    T* u = u_out.ptr<T>();
+    for (int64_t oc = 0; oc < OC; ++oc) {
+        for (int64_t ic = 0; ic < ICG; ++ic) {
+            nnops::kernel::winograd_weight_transform(
+                g + (oc * ICG + ic) * 9, 3, u + oc * ICG + ic,
+                static_cast<int>(ld_u), static_cast<int>(ld_c));
+        }
+    }
+}
 }  // anonymous namespace
 
 std::unique_ptr<Conv2D> Conv2D::create(const Conv2DAttributes& attrs,
@@ -48,7 +72,7 @@ std::unique_ptr<Conv2D> Conv2D::create(const Conv2DAttributes& attrs,
 Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
-    impl_->kernel_fn = resolve_conv2d_kernel(backend);
+    impl_->kernel_fn = resolve_conv2d_kernel(backend, attrs_.algorithm);
 }
 
 std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
@@ -83,6 +107,60 @@ void Conv2D::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+}
+
+void Conv2D::prepackWeights(std::span<const TensorView> inputs,
+                            std::span<TensorView> outputs,
+                            const ComputeContext& ctx)
+{
+    (void)ctx;
+
+    // compute() receives U and cannot fall back to the raw-weight im2col path,
+    // so every unsupported configuration has to fail here, at prepack time.
+    NNOPS_ASSERT(attrs_.algorithm == ConvAlgorithm::Winograd &&
+                 "Conv2D::prepackWeights: attrs.algorithm must be Winograd");
+    NNOPS_ASSERT(attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
+                 attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
+                 attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1 &&
+                 "Conv2D::prepackWeights: Winograd requires k3s1");
+
+    NNOPS_ASSERT(inputs.size() >= 1);
+    NNOPS_ASSERT(outputs.size() >= 1);
+    const auto& weight = inputs[0];
+    NNOPS_ASSERT(weight.rank() == 4);
+    NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOnly));
+
+    // Weight: [OC, IC/G, 3, 3]
+    const int64_t OC  = weight.shape(0);
+    const int64_t ICG = weight.shape(1);
+    const DataType dtype = weight.data_type();
+    const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
+
+    if (outputs[0].is_empty()) {
+        // ---- Query: U is [16, OC, IC/G] — one 4×4 transform-domain kernel per
+        // position. The pitch is explicit: PackedWinoWeight is not
+        // channel-packed, so TensorDesc::row_pitch() would align the row to
+        // 32 B, which is not ICG × elem_size in general.
+        const int64_t u_shape[] = {16, OC, ICG};
+        const int64_t u_pitch = ICG * elem_size;
+        outputs[0] = TensorView(std::span<const int64_t>(u_shape, 3), dtype,
+                                nullptr, u_pitch, TensorLayout::PackedWinoWeight);
+        return;
+    }
+
+    // ---- Pack: U[p][oc][ic] = (G g Gᵀ)[p], row stride between p planes.
+    NNOPS_ASSERT(outputs[0].shape(0) == 16 && outputs[0].shape(1) == OC &&
+                 outputs[0].shape(2) == ICG);
+    const int64_t plane = OC * ICG;  // elements between transform positions
+    const int64_t ld_c  = plane;     // column (j) step of the 4×4 block
+    const int64_t ld_u  = 4 * plane; // row (i) step: p = i·4 + j
+
+    if (dtype == DataType::f32) {
+        wino_pack_weight<float>(weight, outputs[0], OC, ICG, ld_u, ld_c);
+    } else {
+        NNOPS_ASSERT(dtype == DataType::f16);
+        wino_pack_weight<backend::cpu::half>(weight, outputs[0], OC, ICG, ld_u, ld_c);
+    }
 }
 
 }  // namespace nnops

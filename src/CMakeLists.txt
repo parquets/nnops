@@ -78,6 +78,7 @@ set(NNOPS_CPU_SOURCES
 
     # CPU tiled im2col + GEMM Conv2D kernel (planar NCHW)
     backend/cpu/conv2d_im2col.cpp
+    backend/cpu/conv2d_winograd.cpp
 
     # CPU tiled attention kernel (fused QK^T + softmax + AV, planar)
     backend/cpu/attention.cpp

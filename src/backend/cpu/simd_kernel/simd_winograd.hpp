@@ -1,0 +1,215 @@
+#pragma once
+/// @file simd_winograd.hpp
+/// @brief SIMD transforms for the Winograd F(2×2, 3×3) Conv2D path (k3s1).
+///
+/// One 2×2 output tile comes from a 4×4 input window and a 3×3 kernel through
+///
+///     Y = Aᵀ [ (G g Gᵀ) ⊙ (Bᵀ d B) ] A
+///
+/// which trades 36 multiplies for 16 (2.25× fewer) at the cost of the two
+/// transforms below. F(2,3) is the *correlation* form (no kernel flip), so the
+/// result matches the ONNX / nnops conv convention directly.
+///
+/// This header is the single source of truth for the three matrices. G is read
+/// only by prepack (winograd_weight_transform); B and A only by the kernel
+/// (winograd_input_tile8 / winograd_output_tile8), so they cannot drift.
+///
+///   Bᵀ = [[ 1, 0,-1, 0],     G = [[ 1,   0,   0  ],     Aᵀ = [[1, 1, 1, 0],
+///         [ 0, 1, 1, 0],           [ 1/2, 1/2, 1/2],           [0, 1,-1,-1]]
+///         [ 0,-1, 1, 0],           [ 1/2,-1/2, 1/2],
+///         [ 0, 1, 0,-1]]           [ 0,   0,   1  ]]
+///
+/// B and A carry only 0/±1, so those two transforms are pure adds/subs (no
+/// multiplies, no FMA). G has the 1/2s and is applied once per (oc, ic) during
+/// prepack.
+///
+/// Every transform runs in f32 — f16 storage would round twice, once in the
+/// GEMM and again in the transform, on top of the f16 accumulate.
+///
+/// The 8-tile batch is the width of one vector: 8 horizontally adjacent tiles
+/// are loaded with two stride-2 loads (offset 0 and 2), which is exactly what
+/// NEON's vld2q does in the reference implementation and what the portable
+/// v_load_even / v_load_odd / v_deinterleave* primitives compile to on both
+/// arches. Two consequences the caller must honour:
+///   * the 8 tiles must lie in the same tile *row* (so the tile grid cannot be
+///     flattened to a 1-D index), and
+///   * the padded halo row must be at least 2·TW_pad + 2 wide — the offset-2
+///     loads touch element 2·(TW_pad−8) + 17.
+
+#include "nnops/detail/simd/simd.hpp"
+#include "nnops/core/epilogue.hpp"
+#include "simd_epilogue.hpp"  // epilogue_inplace's scalar apply_epilogue
+
+#include <cstddef>
+#include <cstdint>
+
+namespace nnops::kernel {
+
+using namespace simd;
+
+// ---- in-register widen / narrow shims ------------------------------------
+// f32 is the transform domain regardless of the storage type.
+
+inline v_f32x8 wino_widen(const v_f32x8& v) noexcept { return v; }
+inline v_f32x8 wino_widen(const v_f16x8& v) noexcept { return v_cvt_f16_to_f32(v); }
+inline void wino_store(float* p, const v_f32x8& v) noexcept { v_store(p, v); }
+inline void wino_store(half* p, const v_f32x8& v) noexcept {
+    v_store(p, v_cvt_f32_to_f16(v));
+}
+
+// ---- G g Gᵀ — 3×3 kernel → 4×4 transform-domain kernel --------------------
+
+/// Transform one 3×3 kernel into its 4×4 Winograd form U = G g Gᵀ.
+///
+/// Scalar on purpose: prepack runs it once per (oc, ic), so there is nothing to
+/// vectorise. Everything is f32 even for f16 weights — the result is narrowed
+/// only on store, where the caller writes into the U buffer.
+///
+/// @param g   3×3 kernel, row stride @p ld_g (elements)
+/// @param u   4×4 output, row stride @p ld_u, column stride @p ld_c (elements) —
+///            the transform-domain position p = i·4 + j is usually stored in a
+///            separate plane, so the caller passes ld_u = 4·plane, ld_c = plane.
+template <class T>
+inline void winograd_weight_transform(const T* g, int ld_g, T* u, int ld_u,
+                                      int ld_c = 1) noexcept {
+    // G g: t0 = g0, t1 = (g0+g1+g2)/2, t2 = (g0−g1+g2)/2, t3 = g2 — one column
+    // at a time, so the whole 3×3 never needs to be live.
+    float t[4][3];
+    for (int j = 0; j < 3; ++j) {
+        const float g0 = s_load(g + 0 * ld_g + j);
+        const float g1 = s_load(g + 1 * ld_g + j);
+        const float g2 = s_load(g + 2 * ld_g + j);
+        t[0][j] = g0;
+        t[1][j] = 0.5f * (g0 + g1 + g2);
+        t[2][j] = 0.5f * (g0 - g1 + g2);
+        t[3][j] = g2;
+    }
+    // (G g) Gᵀ: col0 = t0, col1 = (t0+t1+t2)/2, col2 = (t0−t1+t2)/2, col3 = t2.
+    for (int i = 0; i < 4; ++i) {
+        const float c0 = t[i][0], c1 = t[i][1], c2 = t[i][2];
+        T* row = u + i * ld_u;
+        s_store(row + 0 * ld_c, c0);
+        s_store(row + 1 * ld_c, 0.5f * (c0 + c1 + c2));
+        s_store(row + 2 * ld_c, 0.5f * (c0 - c1 + c2));
+        s_store(row + 3 * ld_c, c2);
+    }
+}
+
+// ---- Bᵀ d B — input window → V -------------------------------------------
+
+/// Transform 8 horizontally adjacent 4×4 input windows into V = Bᵀ d B.
+///
+/// @param halo       padded input for one (n, g, ic): halo[ph][pw] is the input
+///                   value at (ph − PH, pw − PW), zero outside. Row stride
+///                   @p halo_ld (>= 2·TW_pad + 2).
+/// @param ph0, pw0   halo coordinates of the first tile's window origin —
+///                   (2·th, 2·tw0).
+/// @param v_base     &V[0][ic][tw0]; transform position p lives at
+///                   v_base + p·@p v_plane_stride, tile tw0+t at +t.
+template <class T>
+inline void winograd_input_tile8(const T* halo, int halo_ld,
+                                 int ph0, int pw0,
+                                 T* v_base, int v_plane_stride) noexcept {
+    // Right-multiply by B first (E = d B), keeping the 16 intermediates in an
+    // f32 stack buffer: all 16 live in registers would spill on 16-ymm x86.
+    alignas(32) float e[4][4][8];
+    for (int r = 0; r < 4; ++r) {  // window rows
+        const T* row = halo + static_cast<ptrdiff_t>(ph0 + r) * halo_ld + pw0;
+        // The 4 window columns of the 8 tiles: two stride-2 loads at offsets 0
+        // and 2. Lane t of d_k is the window element at column 2·t + k.
+        const v_f32x8 d0 = wino_widen(v_load_even(row));
+        const v_f32x8 d1 = wino_widen(v_load_odd(row));
+        const v_f32x8 d2 = wino_widen(v_load_even(row + 2));
+        const v_f32x8 d3 = wino_widen(v_load_odd(row + 2));
+        // d · B  (B = (Bᵀ)ᵀ): col0 = d0−d2, col1 = d1+d2, col2 = d2−d1, col3 = d1−d3
+        v_store(&e[r][0][0], v_sub(d0, d2));
+        v_store(&e[r][1][0], v_add(d1, d2));
+        v_store(&e[r][2][0], v_sub(d2, d1));
+        v_store(&e[r][3][0], v_sub(d1, d3));
+    }
+    // Bᵀ · E: row0 = e0−e2, row1 = e1+e2, row2 = e2−e1, row3 = e1−e3
+    for (int j = 0; j < 4; ++j) {
+        const v_f32x8 e0 = v_load(&e[0][j][0]);
+        const v_f32x8 e1 = v_load(&e[1][j][0]);
+        const v_f32x8 e2 = v_load(&e[2][j][0]);
+        const v_f32x8 e3 = v_load(&e[3][j][0]);
+        wino_store(v_base + (0 * 4 + j) * v_plane_stride, v_sub(e0, e2));
+        wino_store(v_base + (1 * 4 + j) * v_plane_stride, v_add(e1, e2));
+        wino_store(v_base + (2 * 4 + j) * v_plane_stride, v_sub(e2, e1));
+        wino_store(v_base + (3 * 4 + j) * v_plane_stride, v_sub(e1, e3));
+    }
+}
+
+// ---- Aᵀ M A — M → 2×2 output tile ----------------------------------------
+
+/// Transform 8 horizontally adjacent tiles' M into their 2×2 outputs and write
+/// them straight into the output plane.
+///
+/// Both bias and the epilogue are applied here, per output element, in the same
+/// pass as the write-back. That is deliberate: epilogue_inplace's bias is
+/// indexed per *column* while ours is per *output channel*, and — because every
+/// output element is written exactly once — the add_to residual can read the
+/// pre-existing output in place. No orig scratch buffer, no second pass.
+///
+/// The 2×2 result is [row][col]; row r advances the output row, column c the
+/// output column. The two column vectors are written with scalar strided
+/// stores: the repo has no portable v_interleave, so column 2t and 2t+1 come
+/// out of separate vectors. Masked at OW, since the padded tile count produces
+/// columns >= OW in the last group of 8.
+///
+/// @param m_base     &M[0][oc][t0]; position p at m_base + p·@p m_plane_stride,
+///                   row oc at + oc·@p m_row_stride.
+/// @param out0,out1  output rows 2·th and 2·th+1 (pointing at column 0).
+/// @param ow0        output column of the first tile (2·tw0).
+/// @param ow_end     OW — columns >= this belong to padding tiles, not written.
+/// @param row1_ok    false when 2·th+1 >= OH (odd OH), skipping the second row.
+/// @param bias_oc    per-output-channel bias (added after the transform; the
+///                   caller passes 0 when there is none).
+/// @param add_to     add the pre-existing output (residual connection).
+template <class T>
+inline void winograd_output_tile8(const T* m_base, int m_plane_stride,
+                                  int m_row_stride, int oc, int t0,
+                                  T* out0, T* out1,
+                                  int ow0, int ow_end, bool row1_ok,
+                                  const Epilogue& ep, float bias_oc,
+                                  bool add_to) noexcept {
+    // Aᵀ M: row0 = m0+m1+m2, row1 = m1−m2−m3 — done per column c, since the
+    // four rows of a column are 4·m_plane_stride apart.
+    v_f32x8 t[2][4];
+    for (int c = 0; c < 4; ++c) {
+        const T* mp = m_base + c * m_plane_stride
+                           + static_cast<ptrdiff_t>(oc) * m_row_stride + t0;
+        const v_f32x8 m0 = wino_widen(v_load(mp + 0 * 4 * m_plane_stride));
+        const v_f32x8 m1 = wino_widen(v_load(mp + 1 * 4 * m_plane_stride));
+        const v_f32x8 m2 = wino_widen(v_load(mp + 2 * 4 * m_plane_stride));
+        const v_f32x8 m3 = wino_widen(v_load(mp + 3 * 4 * m_plane_stride));
+        t[0][c] = v_add(v_add(m0, m1), m2);
+        t[1][c] = v_sub(v_sub(m1, m2), m3);
+    }
+    // (Aᵀ M) A: col0 = t0+t1+t2, col1 = t1−t2−t3.
+    for (int r = 0; r < 2; ++r) {
+        if (r == 1 && !row1_ok) { break; }
+        const v_f32x8 o0 = v_add(v_add(t[r][0], t[r][1]), t[r][2]);
+        const v_f32x8 o1 = v_sub(v_sub(t[r][1], t[r][2]), t[r][3]);
+        alignas(32) float b0[8], b1[8];
+        v_store(b0, o0);
+        v_store(b1, o1);
+        T* row = (r == 0) ? out0 : out1;
+        for (int lane = 0; lane < 8; ++lane) {
+            const int ow = ow0 + 2 * lane;
+            if (ow >= ow_end) { break; }
+            float v = b0[lane] + bias_oc;
+            v = apply_epilogue(ep, v);
+            if (add_to) { v += s_load(row + ow); }
+            s_store(row + ow, v);
+            if (ow + 1 < ow_end) {
+                float v1 = b1[lane] + bias_oc;
+                v1 = apply_epilogue(ep, v1);
+                if (add_to) { v1 += s_load(row + ow + 1); }
+                s_store(row + ow + 1, v1);
+            }
+        }
+    }
+}
+
+}  // namespace nnops::kernel

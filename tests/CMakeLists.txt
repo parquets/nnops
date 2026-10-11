@@ -4,6 +4,7 @@ set(TEST_SOURCES
     test_matmul.cpp
     test_matmul_int8.cpp
     test_conv2d.cpp
+    test_conv2d_winograd.cpp
     test_activation.cpp
     test_pooling.cpp
     test_linear.cpp

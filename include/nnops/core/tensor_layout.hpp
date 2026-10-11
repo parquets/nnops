@@ -44,6 +44,10 @@ enum class TensorLayout : uint8_t {
 
     // ---- Prepacked weight (dense, last dim = 8 lanes) ----
     PackedWeight = 8,  ///< [C8, (KD,) KH, KW, 8] — prepacked depthwise/conv weights
+
+    // ---- Winograd-transformed weight ----
+    PackedWinoWeight = 9,  ///< [16, OC, IC/G] — F(2,3) Winograd-transformed weight U
+                           ///< (one 4×4 transform-domain kernel per position p ∈ [0,16))
 };
 
 /// Returns the channel pack size for packed layouts, or 1 for planar layouts.
@@ -58,6 +62,7 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::NCHWC32:  return 32;
     case TensorLayout::NCDHWC32: return 32;
     case TensorLayout::PackedWeight: return 1;
+    case TensorLayout::PackedWinoWeight: return 1;
     }
     return 1;
 }
@@ -76,6 +81,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::NCHWC16:
     case TensorLayout::NCHWC32:
     case TensorLayout::PackedWeight:
+    case TensorLayout::PackedWinoWeight:
         return 2;
     case TensorLayout::NCDHW:
     case TensorLayout::NCDHWC8:
