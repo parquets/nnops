@@ -323,13 +323,15 @@ inline __m256 to_m256(const v_f32x8& a) {
         _mm256_castps128_ps256(a.lo), a.hi, 1);
 }
 
-// Conversion: v_f16x8 ↔ v_f32x8
-inline v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
-    __m256 f32 = _mm256_cvtph_ps(a.val);
-    return v_f32x8(
-        _mm256_castps256_ps128(f32),
-        _mm256_extractf128_ps(f32, 1));
-}
+// Conversion: v_f32x8 → v_f16x8
+//
+// Only the narrowing direction is defined here. The widening one lives in the
+// f16 layer (vec_f16x8.hpp) instead, because the f32 type it must return is not
+// this namespace's v_f32x8 on an AVX build — it is arch::avx2's single __m256,
+// not the lo/hi __m128 pair below. A definition here would have the same
+// parameter type as that one, and ADL on a v_f16x8 argument reaches this
+// namespace, so the two could not coexist: the call would be ambiguous rather
+// than shadowed. Keep the widen out of arch::sse.
 inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     __m256 f32 = to_m256(a);
     return v_f16x8(_mm256_cvtps_ph(f32, 0));

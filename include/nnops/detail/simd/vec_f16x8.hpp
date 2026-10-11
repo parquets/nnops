@@ -60,13 +60,37 @@
 #elif defined(NNOPS_ARCH_X86_64) && defined(__F16C__)
   // x86_64: F16C + AVX2 (__m128i storage, convert→compute→convert via _mm256_cvtph_ps / _mm256_cvtps_ph)
   #include "nnops/detail/simd/arch/x86/sse.hpp"
+  #if defined(__AVX__)
+    #include "nnops/detail/simd/arch/x86/avx2.hpp"
+  #endif
   namespace nnops { namespace simd {
   using v_f16x8 = arch::sse::v_f16x8;
   using arch::sse::v_load_f16x8;
   using arch::sse::v_store;
   using arch::sse::v_set1_f16x8;
   using arch::sse::v_zero_f16x8;
-  using arch::sse::v_cvt_f16_to_f32;
+
+  // ---- f16 → f32 widen ----------------------------------------------------
+  // Defined here, in the f16 layer, rather than in an arch namespace: the f32
+  // type it returns is whatever *this build's* v_f32x8 is — arch::avx2::v_f32x8
+  // on an AVX build (a single __m256), arch::sse::v_f32x8 otherwise (a lo/hi
+  // __m128 pair). arch::sse must therefore not also define this name with this
+  // parameter type: ADL on a v_f16x8 argument finds that namespace, and two
+  // viable overloads would be an ambiguity, not a shadow. See the matching note
+  // in arch/x86/sse.hpp.
+  #if defined(__AVX__)
+  inline arch::avx2::v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
+      return arch::avx2::v_f32x8(_mm256_cvtph_ps(a.val));
+  }
+  #else
+  inline arch::sse::v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
+      __m256 f32 = _mm256_cvtph_ps(a.val);
+      return arch::sse::v_f32x8(
+          _mm256_castps256_ps128(f32),
+          _mm256_extractf128_ps(f32, 1));
+  }
+  #endif
+
   using arch::sse::v_cvt_f32_to_f16;
   using arch::sse::v_add;
   using arch::sse::v_sub;

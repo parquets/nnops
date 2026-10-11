@@ -310,39 +310,15 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 // f16 → float32 conversion, loading straight from memory
 // (8 lanes → v_f32x8)
 //
-// The vector-level v_cvt_f16_to_f32 (vec_f16x8.hpp) widens through the f16
-// layer's own v_f32x8, which on an AVX2 build is arch::sse::v_f32x8 — a lo/hi
-// __m128 pair, not the arch's __m256. A kernel that widens an f16 row into f32
-// accumulators needs the arch's own type, so this pointer-taking overload is the
-// f16 counterpart of v_cvt_s8_to_f32 / v_cvt_u8_to_f32 above.
+// The pointer counterpart of the f16 layer's v_cvt_f16_to_f32, next to the
+// s8/u8 pair above so a kernel can widen a row without naming any vector type.
+// No arch dispatch here: the widen itself returns each build's own v_f32x8
+// (vec_f16x8.hpp), which is what makes this a load and a call.
 // ============================================================
 
-#if defined(NNOPS_ARCH_X86_64)
-  #if defined(__AVX__) && defined(__F16C__)
-inline v_f32x8 v_cvt_f16_to_f32(const half* p) {
-    return v_f32x8(_mm256_cvtph_ps(
-        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))));
-}
-  #else
 inline v_f32x8 v_cvt_f16_to_f32(const half* p) {
     return v_cvt_f16_to_f32(v_load_f16x8(reinterpret_cast<const uint16_t*>(p)));
 }
-  #endif
-
-#elif defined(NNOPS_ARCH_AARCH64)
-inline v_f32x8 v_cvt_f16_to_f32(const half* p) {
-    return v_cvt_f16_to_f32(v_load_f16x8(reinterpret_cast<const uint16_t*>(p)));
-}
-
-#else
-inline v_f32x8 v_cvt_f16_to_f32(const half* p) {
-    float buf[8];
-    for (int i = 0; i < 8; ++i) {
-        buf[i] = ::nnops::backend::cpu::half_to_float(p[i]);
-    }
-    return v_load(buf);
-}
-#endif
 
 // int8/uint8 → f16: direct per-element conversion (8 lanes)
 inline v_f16x8 v_cvt_s8_to_f16(const int8_t* p) {

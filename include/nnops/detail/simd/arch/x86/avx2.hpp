@@ -249,6 +249,10 @@ inline float v_reduce_min(const v_f32x8& a) {
 #if defined(__F16C__)
 
 /// @brief Narrow 8 f32 lanes (__m256) to 8 f16 lanes (sse::v_f16x8).
+///
+/// The widening direction is not defined here either: it belongs to the f16
+/// layer (vec_f16x8.hpp), which is what knows this build's v_f32x8. See the
+/// note there and in arch/x86/sse.hpp.
 inline sse::v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     return sse::v_f16x8(_mm256_cvtps_ph(a.val, 0));
 }
