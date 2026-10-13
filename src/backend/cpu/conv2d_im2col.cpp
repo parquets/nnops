@@ -196,6 +196,11 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     T* orig_base = attrs.add_to ? col_base + plan.num_slots * col_size : nullptr;
 
     const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
+    // Nothing to seed the accumulator with (no bias tensor, no residual to fold
+    // in) → the first icn block starts from zero inside the micro-kernel instead
+    // of being pre-filled over the whole tile first. matmul.cpp takes the same
+    // shortcut on its first k-block (`k == 0 && attrs.beta == 0`).
+    const bool seed_needed = has_bias || attrs.add_to;
 
     const auto run_task = [&](int64_t t) {
         const int64_t ng    = t / oh_chunks;
@@ -251,7 +256,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
                     T* tile = tile_base + ocn * ocn_step;
 
-                    if (icn == 0) {
+                    if (icn == 0 && seed_needed) {
                         // add_to + non-identity epilogue needs the original
                         // output preserved (epilogue(bias + Σ) then += orig).
                         if (attrs.add_to && epilogue_active) {
@@ -265,8 +270,8 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     }
 
                     const T* a = weight_ptr + icn * karea + ocn * w_ocn_step;
-                    // The tile was just initialised with the bias (or the saved
-                    // original output) — every icn block must accumulate.
+                    // An unseeded first block overwrites C outright; every
+                    // later block (and every seeded one) accumulates.
                     tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                     static_cast<int>(icnc * karea),
                                     tile, static_cast<int>(ocn_step),
@@ -274,9 +279,11 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                                     col_data, static_cast<int>(roi_area),
                                     -std::numeric_limits<float>::infinity(),
                                     std::numeric_limits<float>::infinity(),
-                                    /*zero_mode=*/false);
+                                    /*zero_mode=*/icn == 0 && !seed_needed);
 
-                    if (is_last_icn) {
+                    // An identity epilogue is a whole-tile copy-back — skip it
+                    // (matmul.cpp guards the same call the same way).
+                    if (is_last_icn && epilogue_active) {
                         epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                             tile, static_cast<int>(ocn_step),
                                             static_cast<const T*>(nullptr), attrs.epilogue,

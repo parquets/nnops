@@ -665,6 +665,63 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
     }
 }
 
+NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
+    // add_to with no activation: the residual is folded into the tile at
+    // icn == 0 and no epilogue runs at all — an identity epilogue would only
+    // copy the tile back over itself. The no-bias form additionally takes the
+    // zero_mode seeding path, so the accumulator must come out of the
+    // micro-kernel as bias-free Σ + residual rather than being pre-filled.
+    // Geometry: IC 16 over icn_block 8 → two icn blocks (only the first is
+    // unseeded), OC 40 under ocn_block 128 with a 4-row MR tail, and an 18x18
+    // plane split into 4-row blocks → N 72 then a 36 tail under nr 16.
+    const int64_t oshape[] = {1, 40, 18, 18};
+
+    for (bool with_bias : {true, false}) {
+        const int64_t ishape[] = {1, 16, 18, 18};
+        const int64_t wshape[] = {40, 16, 3, 3};
+        const int64_t bshape[] = {40};
+
+        auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 101);
+        auto [w_vec, weight] = test::make_random_tensor(wshape, -1.0f, 1.0f, 102);
+        auto [b_vec, bias]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 103);
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {3, 3};
+        attrs.stride      = {1, 1};
+        attrs.padding     = {1, 1};
+        attrs.add_to      = true;   // epilogue stays identity (None)
+
+        std::vector<TensorDesc> descs = {input.desc(), weight.desc()};
+        std::vector<TensorView> ins   = {input, weight};
+        if (with_bias) {
+            descs.push_back(bias.desc());
+            ins.push_back(bias);
+        }
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        auto out_descs = op->getOutputTensorDesc(descs);
+        const int64_t out_numel = out_descs[0].numel();
+
+        // Pre-existing residual output, identical for the fast path and the ref.
+        auto [res_vec, _] = test::make_random_tensor(oshape, -0.5f, 0.5f, 104);
+        std::vector<float> fast_buf(static_cast<size_t>(out_numel));
+        auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+        std::vector<float> ref_buf(static_cast<size_t>(out_numel));
+        auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+        for (int64_t i = 0; i < out_numel; ++i) {
+            fast_buf[i] = res_vec[i];
+            ref_buf[i]  = res_vec[i];
+        }
+
+        op->compute(fast_out, ins, {}, nullptr);
+        nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
+
+        for (int64_t i = 0; i < out_numel; ++i) {
+            NNOPS_EXPECT_NEAR(fast_buf[i], ref_buf[i], 1e-4f);
+        }
+    }
+}
+
 NNOPS_TEST(conv2d_im2col_epilogue_relu6) {
     // Relu6 is a pure clamp of bias + Σ. The fast path and conv2d_ref share
     // apply_epilogue, so comparing them proves nothing here — compare against
