@@ -241,16 +241,31 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                 const bool is_last_icn = (icn + icn_block) >= ic_per_group;
 
                 const T* input_local = input_ptr + icn * icn_step;
-                k::tiled_im2col_2d<T>(col_data, input_local,
-                                      0, static_cast<int>(oh),
-                                      static_cast<int>(OW), static_cast<int>(ohc),
-                                      roi_pad_h, roi_pad_w,
-                                      static_cast<int>(PH), static_cast<int>(PW),
-                                      static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
-                                      static_cast<int>(icn_step), static_cast<int>(in_row_stride),
-                                      static_cast<int>(KH), static_cast<int>(KW),
-                                      static_cast<int>(SH), static_cast<int>(SW),
-                                      static_cast<int>(DH), static_cast<int>(DW));
+                // A pointwise gather would be a dense row copy, so building it
+                // only adds a write and a re-read; B is read from the input
+                // instead (below). pad == 0 and stride == 1 mean the ROI never
+                // leaves the input, so there is no border case to handle either.
+                if (!plan.pointwise) {
+                    k::tiled_im2col_2d<T>(col_data, input_local,
+                                          0, static_cast<int>(oh),
+                                          static_cast<int>(OW), static_cast<int>(ohc),
+                                          roi_pad_h, roi_pad_w,
+                                          static_cast<int>(PH), static_cast<int>(PW),
+                                          static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
+                                          static_cast<int>(icn_step), static_cast<int>(in_row_stride),
+                                          static_cast<int>(KH), static_cast<int>(KW),
+                                          static_cast<int>(SH), static_cast<int>(SW),
+                                          static_cast<int>(DH), static_cast<int>(DW));
+                }
+
+                // Pointwise B: the block's ROI inside the input plane, one
+                // roi_area-wide run per input channel, so the k stride is the
+                // channel stride rather than the ROI width. input_local already
+                // carries the batch and group offsets (above).
+                const T* b_src = plan.pointwise ? input_local + oh * in_row_stride
+                                                : col_data;
+                const int b_ld = plan.pointwise ? static_cast<int>(icn_step)
+                                                : static_cast<int>(roi_area);
 
                 for (int64_t ocn = 0; ocn < oc_per_group; ocn += ocn_block) {
                     const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
@@ -276,7 +291,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                                     static_cast<int>(icnc * karea),
                                     tile, static_cast<int>(ocn_step),
                                     a, static_cast<int>(w_ocn_step),
-                                    col_data, static_cast<int>(roi_area),
+                                    b_src, b_ld,
                                     -std::numeric_limits<float>::infinity(),
                                     std::numeric_limits<float>::infinity(),
                                     /*zero_mode=*/icn == 0 && !seed_needed);
@@ -331,6 +346,7 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
 
     const int64_t N  = in.dims[0];
     const int64_t IC = in.dims[1];
+    const int64_t IW = in.dims[3];
     const int64_t OC = wt.dims[0];
     const int64_t OH = out.dims[2];
     const int64_t OW = out.dims[3];
@@ -342,7 +358,25 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     const int64_t karea = attrs.kernel_size[0] * attrs.kernel_size[1];
     const int64_t PH    = attrs.padding[0];
 
-    plan.icn_block = std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
+    // A 1x1 kernel at unit stride with no padding makes the im2col gather a dense
+    // row copy, so the GEMM can read the input plane directly: B becomes the
+    // input with ldb = the channel stride and K the whole ic_per_group. That only
+    // holds while an output row's worth of input is contiguous, hence the row
+    // stride test — a pitched input keeps the im2col path, which walks the pitch.
+    // row_stride_elems == 0 is TensorDesc's "unknown → treat as compact"
+    // convention (tensor_view.hpp:44), matching what row_stride_elems() returns
+    // for the dense view at run time.
+    plan.pointwise = (karea == 1 &&
+                      attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
+                      attrs.padding[0] == 0 && attrs.padding[1] == 0 &&
+                      (in.row_stride_elems == 0 || in.row_stride_elems == IW));
+
+    // With no col buffer there is nothing left bounding the ic-block, so K runs
+    // the whole ic_per_group in one pass — which also removes the reason
+    // get_ic_block caps it at 64 for karea == 1.
+    plan.icn_block = plan.pointwise
+                   ? ic_per_group
+                   : std::min<int64_t>(get_ic_block(static_cast<int>(karea)), ic_per_group);
     plan.ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
     plan.oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
 
@@ -403,7 +437,8 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // chunk count at the number of oh-blocks.
     plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, plan.num_oh_blocks);
 
-    plan.col_size  = plan.icn_block * karea * plan.oh_block * OW;
+    plan.col_size  = plan.pointwise ? 0
+                                    : plan.icn_block * karea * plan.oh_block * OW;
     plan.orig_size = attrs.add_to ? plan.ocn_block * plan.oh_block * OW : 0;
 
     // Scratch slots: one per worker thread when the backend reports thread ids and

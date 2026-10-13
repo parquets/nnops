@@ -10,6 +10,13 @@
 /// accumulated with the raw (unpacked) weight through the same `tile_mma_direct`
 /// micro-kernel dispatch that MatMul uses (matmul_helper.h).
 ///
+/// A 1x1 kernel with unit stride and no padding needs no im2col at all — at
+/// karea == 1 the gather degenerates to a dense row copy — so that case (the
+/// plan's `pointwise` flag, set only for a dense input) runs the GEMM straight
+/// off the input tensor: B is the input plane with ldb = the channel stride, and
+/// K is the whole ic_per_group in one pass. MLAS takes the same route
+/// (convolve.cpp:1654, MlasConvAlgorithmGemmDirect, on K == InputChannels).
+///
 /// Work is split at (batch, group, oh-chunk) granularity: when (batch, group)
 /// alone cannot fill the thread pool (the common batch=1 / groups=1 case), the
 /// oh-blocks are partitioned into parallel chunks. Scratch is indexed by thread
@@ -30,8 +37,9 @@
 ///   [col_data : icn_block*karea*oh_block*out_w]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
 ///
-/// col_data is the im2col matrix [K=icn_block*karea][N=oh_block*out_w];
-/// orig preserves the output tile for the exact add_to semantics.
+/// col_data is the im2col matrix [K=icn_block*karea][N=oh_block*out_w], and is
+/// absent under `pointwise` (col_size 0) — the GEMM then reads B straight from
+/// the input. orig preserves the output tile for the exact add_to semantics.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -52,9 +60,15 @@ struct Conv2DPlan {
     int64_t num_oh_blocks = 1;     ///< ceil(OH / oh_block)
     int64_t oh_chunks     = 1;     ///< parallel oh-chunks per (batch, group)
     int64_t num_slots = 0;         ///< scratch slots (worker threads, else tasks)
-    int64_t col_size  = 0;         ///< im2col scratch elements per slot
+    int64_t col_size  = 0;         ///< im2col scratch elements per slot (0 → pointwise)
     int64_t orig_size = 0;         ///< add_to scratch elements per slot
-    size_t  workspace_size = 0;    ///< pooled scratch bytes (0 → reference fallback)
+    bool pointwise = false;        ///< k1s1p0 + dense input: the GEMM reads the input
+                                   ///< tensor directly, so there is no im2col buffer
+                                   ///< and icn_block spans all of ic_per_group
+    size_t  workspace_size = 0;    ///< pooled scratch bytes. 0 means either "unsupported
+                                   ///< dtype → reference fallback" or "nothing to pool"
+                                   ///< (pointwise with no add_to); the kernel tells those
+                                   ///< apart by dtype, never by this value.
 };
 
 /// Resolve the conv2d plan (block sizes, oh-chunk split, workspace bytes) from

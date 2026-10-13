@@ -142,10 +142,11 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
                 (long long)c.N, (long long)c.OC, (long long)OH, (long long)OW,
                 c.f16 ? "f16" : "f32");
     std::printf("    icn=%lld ocn=%lld oh_block=%lld oh_blocks=%lld  tasks=N*G*oh_chunks=%lld"
-                "  ws=%zuB\n",
+                "  ws=%zuB%s\n",
                 (long long)plan.icn_block, (long long)plan.ocn_block,
                 (long long)plan.oh_block, (long long)plan.num_oh_blocks,
-                (long long)(c.N * c.groups * plan.oh_chunks), plan.workspace_size);
+                (long long)(c.N * c.groups * plan.oh_chunks), plan.workspace_size,
+                plan.pointwise ? "  pointwise(no col buffer)" : "");
 
     auto compute = [&](const ComputeContext& ctx) { op->compute(output, ins, ctx, nullptr); };
     std::vector<double> gflops;
@@ -489,7 +490,11 @@ void bench_wino_case(const WinoCase& c) {
 // icn_block * karea. The ladder holds that K roughly flat as the kernel grows —
 // the K column below reads 64 -> 72 -> 100 -> 98 for 1x1 -> 3x3 -> 5x5 -> 7x7 —
 // so the im2col panel handed to one GEMM stays near 70-100 wide no matter the
-// kernel. What is *not* flat is the traffic: every input channel's karea taps
+// kernel. The 1x1 rows read 64 only because IC is 64 here; they take the plan's
+// pointwise route (the pw column), so they never consult get_ic_block() and
+// never build a panel — 64 is the whole channel count, not a cap.
+//
+// What is *not* flat is the traffic: every input channel's karea taps
 // must be materialised for every output row, so the im2col write per output row
 // is IC * karea and grows 49/9 from 3x3 to 7x7, and the weight panel is re-read
 // once per ic-block (IC / icn_block of them). These tables put a number on that.
@@ -536,6 +541,7 @@ struct ConvSweepOp {
     std::vector<TensorView> ins;
     TensorView out;
     int64_t icn, ocn, ohb, blks, tasks;
+    bool pw;                     // plan.pointwise — no col buffer, B off the input
     double flops;
 
     ConvSweepOp(const ConvSweepShape& s, uint64_t seed, int64_t meta_threads) {
@@ -569,6 +575,7 @@ struct ConvSweepOp {
         ohb   = plan.oh_block;
         blks  = s.N * s.groups * plan.num_oh_blocks;
         tasks = s.N * s.groups * plan.oh_chunks;
+        pw    = plan.pointwise;
 
         const int64_t OH = out_descs[0].dims[2], OW = out_descs[0].dims[3];
         flops = 2.0 * static_cast<double>(s.N) * static_cast<double>(s.OC) *
@@ -596,9 +603,9 @@ struct ConvSweepOp {
 };
 
 void print_conv_sweep_header(const std::vector<int>& threads) {
-    std::printf("   %3s %4s %4s %4s %3s %4s %2s %2s | %4s %4s %4s %5s %5s |",
+    std::printf("   %3s %4s %4s %4s %3s %4s %2s %2s | %4s %4s %4s %5s %5s %3s |",
                 "N", "IC", "IH", "OC", "K", "g", "s", "d",
-                "icn", "ocn", "ohb", "blks", "tasks");
+                "icn", "ocn", "ohb", "blks", "tasks", "pw");
     for (int t : threads) {
         const std::string label = std::to_string(t) + "T";
         std::printf(" %7s", label.c_str());
@@ -607,16 +614,17 @@ void print_conv_sweep_header(const std::vector<int>& threads) {
 }
 
 void print_conv_sweep_row(const ConvSweepShape& s, int64_t icn, int64_t ocn, int64_t ohb,
-                          int64_t blks, int64_t tasks, const std::vector<double>& g) {
+                          int64_t blks, int64_t tasks, bool pw,
+                          const std::vector<double>& g) {
     std::printf("   %3lld %4lld %4lld %4lld %3lld %4lld %2lld %2lld |"
-                " %4lld %4lld %4lld %5lld %5lld |",
+                " %4lld %4lld %4lld %5lld %5lld %3s |",
                 static_cast<long long>(s.N), static_cast<long long>(s.IC),
                 static_cast<long long>(s.IH), static_cast<long long>(s.OC),
                 static_cast<long long>(s.K), static_cast<long long>(s.groups),
                 static_cast<long long>(s.S), static_cast<long long>(s.D),
                 static_cast<long long>(icn), static_cast<long long>(ocn),
                 static_cast<long long>(ohb), static_cast<long long>(blks),
-                static_cast<long long>(tasks));
+                static_cast<long long>(tasks), pw ? "yes" : "-");
     for (double v : g) { std::printf(" %7.1f", v); }
     std::printf("\n");
 }
@@ -639,7 +647,7 @@ void sweep_conv(const char* tag, const std::vector<ConvSweepShape>& shapes,
             const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
             gflops.push_back(g.time_budget(use_ctx, target_ms));
         }
-        print_conv_sweep_row(s, g.icn, g.ocn, g.ohb, g.blks, g.tasks, gflops);
+        print_conv_sweep_row(s, g.icn, g.ocn, g.ohb, g.blks, g.tasks, g.pw, gflops);
     }
 }
 
@@ -933,9 +941,13 @@ NNOPS_BENCH(conv2d_f16_kernel_sweep) {
 // kernel, and the kernel is the only thing the two implementations can be
 // compared on without also measuring the harnesses.
 //
-// The 1x1 rows are the exception to "im2col" in the section title: both sides
-// skip the panel for karea 1 (this plan degenerates, MLAS takes
-// MlasConvAlgorithmGemmDirect), so those two rows compare the GEMM underneath.
+// The 1x1 rows are the exception to "im2col" in the section title: at karea 1
+// with unit stride and zero padding both sides run the GEMM straight off the
+// input tensor (the plan's `pointwise` flag; MLAS takes
+// MlasConvAlgorithmGemmDirect), so those rows compare the GEMM underneath. They
+// are the pw=yes rows, and note what the icn column reads there: IC itself, not
+// the 64 the 1x1 rung of get_ic_block() would give — with the col buffer gone
+// the whole group fits in a single K pass.
 
 NNOPS_BENCH(conv2d_f32_im2col_parity_1t) {
     sweep_conv<float>("f32 im2col parity", {

@@ -503,6 +503,23 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
         // only other one that reaches the loop, and its OH is aligned, so this is
         // what exercises the unaligned block end to end.
         {{1, 16, 28, 28}, {256, 16, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
+
+        // ---- 1x1 pointwise (the GEMM-direct route) --------------------------
+        // At karea 1 with unit stride and zero padding the gather degenerates to
+        // a dense row copy, so the plan drops the col buffer and reads B straight
+        // from the input. The single 1x1 row above is IC 3 / OC 6, which covers
+        // none of the variants that route actually has: IC past the 64-channel
+        // ic-block cap (one K pass instead of several), OC past ocn_block,
+        // groups (the group-relative ldb), and a batch dimension.
+        // IC 128 > 64: K spans the whole group in a single block.
+        {{1, 128, 8, 8},   {192, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+        // groups 2 with icg 128: pins the group offset and the in-group ldb.
+        {{1, 256, 8, 8},   {64, 128, 1, 1},  1, 1, 1, 1, 0, 0, 1, 1, 2, false},
+        // batch 2 with IC 128: the batch step must land on the right plane.
+        {{2, 128, 10, 10}, {64, 128, 1, 1},  1, 1, 1, 1, 0, 0, 1, 1, 1, false},
+        // dilation on a 1x1 is a no-op (there is only one tap), so it must not
+        // push the case off the pointwise route.
+        {{1, 128, 12, 12}, {32, 128, 1, 1},  1, 1, 1, 1, 0, 0, 3, 3, 1, false},
     };
 
     for (const auto& c : cases) {
@@ -555,6 +572,11 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
         // halfway (oh_block 8, 2 blocks, 2 chunks) — both must stay bit-identical
         // to the serial run.
         {{1, 16, 28, 28}, {256, 16, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
+        // 1x1 pointwise with IC past the old ic-block cap: one K pass over the
+        // whole group with B read off the input plane. The chunk split has no col
+        // buffer to absorb the row offset here, so a per-chunk B base that was
+        // wrong by even a row would break the bit-identity below.
+        {{1, 128, 16, 16}, {192, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
     };
 
     for (const auto& c : cases) {
@@ -785,6 +807,9 @@ NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
         {{1, 4, 20, 20}, {8, 2, 2, 2},   2, 2, 2, 2, 1, 1, 1, 1, 2, false},
         // 1x1 pointwise + bias.
         {{1, 3, 16, 16}, {6, 3, 1, 1},   1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+        // 1x1 pointwise with K = 128 = KC_F16 past the ic-block cap: the f16 side
+        // has to reduce over the whole group in one block, too.
+        {{1, 128, 8, 8}, {32, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
         // non-square kernel 3x5.
         {{1, 3, 18, 22}, {6, 3, 3, 5},   3, 5, 1, 1, 1, 2, 1, 1, 1, false},
         // dilation 2.
@@ -903,16 +928,19 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
     // result. Pin the ladder itself, so retuning the thresholds is a visible,
     // deliberate change rather than a silent shift in how much traffic every
     // 5x5/7x7 in the tree generates.
-    struct Ladder { int64_t kh, kw, want_icn; };
+    struct Ladder { int64_t kh, kw, want_icn, stride; };
     const Ladder ladder[] = {
-        {1, 1, 64},   // karea  1
-        {1, 5,  8},   // karea  5  — inside the band the 3x3 cases use
-        {3, 3,  8},   // karea  9  — that band's edge
-        {3, 5,  4},   // karea 15  — first rung down
-        {5, 5,  4},   // karea 25  — that band's edge
-        {5, 7,  2},   // karea 35
-        {7, 7,  2},   // karea 49  — that band's edge
-        {9, 9,  1},   // karea 81  — past the ladder: a rank-1 panel
+        // karea 1 carries stride 2 on purpose: at unit stride with zero padding a
+        // 1x1 kernel takes the plan's pointwise path, which bypasses get_ic_block
+        // altogether, so this rung needs a strided case to stay on the ladder.
+        {1, 1, 64, 2},   // karea  1
+        {1, 5,  8, 1},   // karea  5  — inside the band the 3x3 cases use
+        {3, 3,  8, 1},   // karea  9  — that band's edge
+        {3, 5,  4, 1},   // karea 15  — first rung down
+        {5, 5,  4, 1},   // karea 25  — that band's edge
+        {5, 7,  2, 1},   // karea 35
+        {7, 7,  2, 1},   // karea 49  — that band's edge
+        {9, 9,  1, 1},   // karea 81  — past the ladder: a rank-1 panel
     };
 
     for (const Ladder& l : ladder) {
@@ -927,6 +955,7 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
 
         Conv2DAttributes attrs;
         attrs.kernel_size = {l.kh, l.kw};
+        attrs.stride      = {l.stride, l.stride};
         attrs.padding     = {l.kh / 2, l.kw / 2};
 
         auto op = Conv2D::create(attrs, Backend::CPU);
@@ -936,6 +965,10 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
         const auto plan = nnops::backend::cpu::get_conv2d_plan(
             attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
 
+        // Every rung must stay on the im2col path — that is what makes the
+        // icn_block expectation below a statement about get_ic_block rather than
+        // about the pointwise shortcut.
+        NNOPS_EXPECT_FALSE(plan.pointwise);
         NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
         NNOPS_EXPECT_EQ(plan.icn_block, l.want_icn);
         // The plan's im2col panel must be exactly the block the kernel is handed:
@@ -957,23 +990,25 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
     struct Case {
         std::array<int64_t,4> ishape; std::array<int64_t,4> wshape;
         int64_t kh, kw, sh, sw, ph, pw, groups; int nthreads;
-        int64_t want_oh_block, want_blocks;
+        int64_t want_oh_block, want_blocks; bool want_pointwise;
     };
     const Case cases[] = {
         // 1x128x28x28 -> 512 3x3 s2 p1: 512 filters > the 14x14 plane's 196
         // positions. 14 rows is not a multiple of kAlign — the block lands on OH
         // itself, since the kernel takes its row count from min(oh_block, OH-oh).
-        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 14, 1},
+        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 14, 1, false},
         // Same shape at 4 threads: the mirrored half-pool gate stops it halfway,
         // at the first block that would leave more than half the pool idle.
-        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 4,  8, 2},
+        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 4,  8, 2, false},
         // ... and at 8 threads it does not fire at all.
-        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 8,  4, 4},
-        // 1x1 pointwise over a short plane: 2048 filters > 49 positions.
-        {{1, 512, 7, 7}, {2048, 512, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 7, 1},
+        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 8,  4, 4, false},
+        // 1x1 pointwise over a short plane: 2048 filters > 49 positions. This one
+        // also happens to be the pointwise case, so it pins that the expansion
+        // loop still lands on the whole plane when the col buffer is gone.
+        {{1, 512, 7, 7}, {2048, 512, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 7, 1, true},
         // Counter-case: 64 filters <= 3136 positions, so the 14-block split the
         // halving measurements tuned is left alone.
-        {{1, 64, 56, 56}, {64, 64, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 4, 14},
+        {{1, 64, 56, 56}, {64, 64, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 4, 14, false},
     };
 
     for (const Case& c : cases) {
@@ -1003,15 +1038,177 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
         if (c.nthreads == 1) {
             NNOPS_EXPECT_EQ(plan.oh_chunks, 1);
         }
+        NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
+        // Pointwise carries no col buffer at all; otherwise the plan's im2col
+        // panel must be exactly the block the kernel is handed.
         NNOPS_EXPECT_EQ(plan.col_size,
-                        plan.icn_block * c.kh * c.kw * plan.oh_block * out_descs[0].dims[3]);
+                        c.want_pointwise
+                            ? 0
+                            : plan.icn_block * c.kh * c.kw * plan.oh_block * out_descs[0].dims[3]);
+    }
+}
+
+NNOPS_TEST(conv2d_pointwise_routing) {
+    // A 1x1 kernel at unit stride with zero padding makes the im2col gather a
+    // dense row copy, so the plan drops the col buffer (col_size 0) and lifts
+    // icn_block off the get_ic_block(1) == 64 cap to the whole group. Pin the
+    // accept side and every reject side — each reject is a case where reading B
+    // off the input plane would be wrong.
+    struct Case {
+        std::array<int64_t,4> ishape, wshape;
+        int64_t kh, kw, sh, sw, ph, pw, groups;
+        bool want_pointwise;
+    };
+    const Case cases[] = {
+        // k1 s1 p0 — the route itself.
+        {{1, 64, 8, 8},   {16, 64, 1, 1},  1, 1, 1, 1, 0, 0, 1, true},
+        // icg 128 past the 64 cap: the single K block is the whole group.
+        {{1, 128, 8, 8},  {16, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, true},
+        // groups 2 at icg 128 — no extra guard is needed for groups; the
+        // group-relative channel stride is what makes that true.
+        {{1, 256, 8, 8},  {32, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 2, true},
+        // stride 2: an output row is no longer a contiguous input row.
+        {{1, 64, 16, 16}, {16, 64, 1, 1},  1, 1, 2, 2, 0, 0, 1, false},
+        // pad 1: the first output row's window starts outside the input plane.
+        {{1, 64, 16, 16}, {16, 64, 1, 1},  1, 1, 1, 1, 1, 1, 1, false},
+        // k3 s1 p0: a real gather, whatever the stride and padding.
+        {{1, 64, 16, 16}, {16, 64, 3, 3},  3, 3, 1, 1, 0, 0, 1, false},
+    };
+
+    for (const Case& c : cases) {
+        std::vector<float> in_buf(
+            static_cast<size_t>(c.ishape[0] * c.ishape[1] * c.ishape[2] * c.ishape[3]), 0.0f);
+        std::vector<float> w_buf(
+            static_cast<size_t>(c.wshape[0] * c.wshape[1] * c.wshape[2] * c.wshape[3]), 0.0f);
+        TensorView input(c.ishape, DataType::f32, in_buf.data());
+        TensorView weight(c.wshape, DataType::f32, w_buf.data());
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.kh, c.kw};
+        attrs.stride      = {c.sh, c.sw};
+        attrs.padding     = {c.ph, c.pw};
+        attrs.groups      = c.groups;
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {input.desc(), weight.desc()};
+        const auto out_descs = op->getOutputTensorDesc(descs);
+        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+            attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
+
+        NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
+        if (c.want_pointwise) {
+            // One K pass over the whole group and no col buffer at all.
+            NNOPS_EXPECT_EQ(plan.icn_block, c.ishape[1] / c.groups);
+            NNOPS_EXPECT_EQ(plan.col_size, 0);
+        } else {
+            NNOPS_EXPECT_EQ(plan.col_size,
+                            plan.icn_block * c.kh * c.kw * plan.oh_block * out_descs[0].dims[3]);
+        }
+    }
+
+    // A pitched input has to stay on the im2col path, and the guard is the only
+    // thing that keeps it there: the pointwise B read takes roi_area contiguous
+    // elements per channel row, which holds only when the row pitch is IW itself.
+    // So build a padded buffer — W + 3 slack columns per row, zero filled, the
+    // same logical values as the dense reference input — and check both that the
+    // plan rejects it and that the values still come out right: any
+    // pitch-ignoring read would pick up the zero slack instead.
+    const int64_t C = 128, H = 9, W = 11, Wpad = W + 3;
+    const int64_t ishape[] = {1, C, H, W};
+    const int64_t wshape[] = {16, C, 1, 1};
+
+    auto [in_vec, in32] = test::make_random_tensor(ishape, -1.0f, 1.0f, 501);
+    auto [w_vec, w32]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 502);
+
+    Conv2DAttributes attrs;   // 1x1, stride 1, no padding — otherwise eligible
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    const std::vector<TensorDesc> d32 = {in32.desc(), w32.desc()};
+    const std::vector<TensorView> i32 = {in32, w32};
+    auto od = op->getOutputTensorDesc(d32);
+    const int64_t n = od[0].numel();
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_planar(od[0], ref_buf.data());
+    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
+
+    std::vector<float> padded(static_cast<size_t>(C * H * Wpad), 0.0f);
+    for (int64_t c = 0; c < C; ++c) {
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t w = 0; w < W; ++w) {
+                padded[static_cast<size_t>((c * H + h) * Wpad + w)] =
+                    in_vec[static_cast<size_t>((c * H + h) * W + w)];
+            }
+        }
+    }
+    TensorView pitched(ishape, DataType::f32, padded.data(),
+                       Wpad * static_cast<int64_t>(sizeof(float)));
+
+    const TensorDesc pdescs[] = {pitched.desc(), w32.desc()};
+    const auto pplan = nnops::backend::cpu::get_conv2d_plan(
+        attrs, pdescs, od, /*num_threads=*/1, /*use_thread_slots=*/false);
+    NNOPS_EXPECT_FALSE(pplan.pointwise);
+    // Still the 1x1 rung of the ic-block ladder, with the col buffer back.
+    NNOPS_EXPECT_EQ(pplan.icn_block, int64_t{64});
+    NNOPS_EXPECT_EQ(pplan.col_size, int64_t{64} * pplan.oh_block * W);
+
+    const std::vector<TensorView> pins = {pitched, w32};
+    std::vector<float> out_buf(static_cast<size_t>(n));
+    auto out = test::make_planar(od[0], out_buf.data());
+    op->compute(out, pins, {}, nullptr);
+    NNOPS_EXPECT_TRUE(test::allclose(out, ref_out, 1e-3f, 1e-4f));
+}
+
+NNOPS_TEST(conv2d_pointwise_epilogue_add_to) {
+    // The pointwise route skips the im2col gather but must still run the whole
+    // epilogue chain: bias seeded into the accumulator, the activation applied to
+    // bias + Σ, and the residual add on top of that. IC 128 also makes this the
+    // single-K-pass case, where no earlier ic-block seeds the accumulator, so the
+    // zero_mode / add_to interaction is pinned too.
+    const int64_t ishape[] = {1, 128, 9, 9};
+    const int64_t wshape[] = {64, 128, 1, 1};
+    const int64_t bshape[] = {64};
+
+    auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 511);
+    auto [w_vec, weight] = test::make_random_tensor(wshape, -2.0f, 2.0f, 512);
+    auto [b_vec, bias]   = test::make_random_tensor(bshape, -1.0f, 1.0f, 513);
+
+    Conv2DAttributes attrs;   // 1x1, stride 1, no padding — the pointwise route
+    attrs.epilogue.type = EpilogueActivateType::Relu6;
+    attrs.add_to        = true;
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc(), bias.desc()};
+    std::vector<TensorView> ins   = {input, weight, bias};
+
+    auto op = Conv2D::create(attrs, Backend::CPU);
+    auto out_descs = op->getOutputTensorDesc(descs);
+    const int64_t out_numel = out_descs[0].numel();
+
+    // Pre-existing residual output, identical for the fast path and the ref.
+    std::vector<int64_t> out_shape(out_descs[0].dims.data(),
+                                   out_descs[0].dims.data() + out_descs[0].rank);
+    auto [res_vec, _] = test::make_random_tensor(out_shape, -0.5f, 0.5f, 514);
+
+    std::vector<float> fast_buf(static_cast<size_t>(out_numel));
+    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    std::vector<float> ref_buf(static_cast<size_t>(out_numel));
+    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    for (int64_t i = 0; i < out_numel; ++i) {
+        fast_buf[static_cast<size_t>(i)] = res_vec[static_cast<size_t>(i)];
+        ref_buf[static_cast<size_t>(i)]  = res_vec[static_cast<size_t>(i)];
+    }
+
+    op->compute(fast_out, ins, {}, nullptr);
+    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
+
+    for (int64_t i = 0; i < out_numel; ++i) {
+        NNOPS_EXPECT_NEAR(fast_buf[static_cast<size_t>(i)],
+                          ref_buf[static_cast<size_t>(i)], 1e-4f);
     }
 }
 
 // ============================================================
 // tiled_im2col_3d kernel correctness (vs brute-force)
 // ============================================================
-
 NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
     // tiled_im2col_3d must match a naive per-position gather for a spread of
     // stride / padding / dilation / block-origin configs.
