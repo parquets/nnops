@@ -495,6 +495,14 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
 
         // karea 81 > 49: the last rung, icn_block 1 (a rank-1 panel).
         {{1, 2, 24, 24}, {4, 2, 9, 9},     9, 9, 1, 1, 4, 4, 1, 1, 1, false},
+
+        // ---- filter-dominated planes ---------------------------------------
+        // 256 filters over a 14x14 plane: the expansion loop grows the oh-block
+        // to cover the whole plane, so the block is 14 rows — deliberately not a
+        // multiple of kAlign. The case above with 144 filters over 8x8 is the
+        // only other one that reaches the loop, and its OH is aligned, so this is
+        // what exercises the unaligned block end to end.
+        {{1, 16, 28, 28}, {256, 16, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
     };
 
     for (const auto& c : cases) {
@@ -542,6 +550,11 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
         {{1, 4, 32, 32}, {8, 4, 7, 7},   7, 7, 1, 1, 3, 3, 1, 1, 1, true},
         // 5x5 stride 2: large karea and a strided im2col gather.
         {{1, 8, 28, 28}, {16, 8, 5, 5},  5, 5, 2, 2, 2, 2, 1, 1, 1, false},
+        // filter-dominated plane: the expansion loop meets the chunk split here.
+        // At 2 threads it collapses to one whole-plane block, at 4 it stops
+        // halfway (oh_block 8, 2 blocks, 2 chunks) — both must stay bit-identical
+        // to the serial run.
+        {{1, 16, 28, 28}, {256, 16, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
     };
 
     for (const auto& c : cases) {
@@ -872,6 +885,69 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
         // icn_block channels x karea taps x oh_block output rows x OW columns.
         NNOPS_EXPECT_EQ(plan.col_size,
                         plan.icn_block * l.kh * l.kw * plan.oh_block * out_descs[0].dims[3]);
+    }
+}
+
+NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominates) {
+    // The initial oh-block is ceil((PH+1)/kAlign)*kAlign, so a 3x3 stride-2 pad-1
+    // layer starts at 4 rows however short the plane is. A small plane with many
+    // filters then issued wide-M / narrow-N GEMMs and re-read the weight panel
+    // once per block. The expansion loop mirrors the halving loop above: when one
+    // block per (batch, group) already keeps half the pool busy — so the split
+    // buys no parallelism — and the per-group filter count exceeds the plane
+    // area (the proxy MLAS uses to pick its whole-plane ExpandThenGemm), grow the
+    // block to cover the plane. These cases pin both sides of that gate.
+    struct Case {
+        std::array<int64_t,4> ishape; std::array<int64_t,4> wshape;
+        int64_t kh, kw, sh, sw, ph, pw, groups; int nthreads;
+        int64_t want_oh_block, want_blocks;
+    };
+    const Case cases[] = {
+        // 1x128x28x28 -> 512 3x3 s2 p1: 512 filters > the 14x14 plane's 196
+        // positions. 14 rows is not a multiple of kAlign — the block lands on OH
+        // itself, since the kernel takes its row count from min(oh_block, OH-oh).
+        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 14, 1},
+        // Same shape at 4 threads: the mirrored half-pool gate stops it halfway,
+        // at the first block that would leave more than half the pool idle.
+        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 4,  8, 2},
+        // ... and at 8 threads it does not fire at all.
+        {{1, 128, 28, 28}, {512, 128, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 8,  4, 4},
+        // 1x1 pointwise over a short plane: 2048 filters > 49 positions.
+        {{1, 512, 7, 7}, {2048, 512, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 7, 1},
+        // Counter-case: 64 filters <= 3136 positions, so the 14-block split the
+        // halving measurements tuned is left alone.
+        {{1, 64, 56, 56}, {64, 64, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 4, 14},
+    };
+
+    for (const Case& c : cases) {
+        std::vector<float> in_buf(
+            static_cast<size_t>(c.ishape[0] * c.ishape[1] * c.ishape[2] * c.ishape[3]), 0.0f);
+        std::vector<float> w_buf(
+            static_cast<size_t>(c.wshape[0] * c.wshape[1] * c.wshape[2] * c.wshape[3]), 0.0f);
+        TensorView input(c.ishape, DataType::f32, in_buf.data());
+        TensorView weight(c.wshape, DataType::f32, w_buf.data());
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.kh, c.kw};
+        attrs.stride      = {c.sh, c.sw};
+        attrs.padding     = {c.ph, c.pw};
+        attrs.groups      = c.groups;
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {input.desc(), weight.desc()};
+        const auto out_descs = op->getOutputTensorDesc(descs);
+
+        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+            attrs, descs, out_descs, c.nthreads, /*use_thread_slots=*/false);
+
+        NNOPS_EXPECT_EQ(plan.oh_block, c.want_oh_block);
+        NNOPS_EXPECT_EQ(plan.num_oh_blocks, c.want_blocks);
+        // nthreads=1 with NG=1 leaves exactly one parallel task.
+        if (c.nthreads == 1) {
+            NNOPS_EXPECT_EQ(plan.oh_chunks, 1);
+        }
+        NNOPS_EXPECT_EQ(plan.col_size,
+                        plan.icn_block * c.kh * c.kw * plan.oh_block * out_descs[0].dims[3]);
     }
 }
 

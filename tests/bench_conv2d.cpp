@@ -897,3 +897,66 @@ NNOPS_BENCH(conv2d_f16_kernel_sweep) {
         {1, 64, 56, 64, 7},
     }, sweep_threads(), 80.0);
 }
+
+// ============================================================
+// im2col parity set vs MLAS — single thread
+// ============================================================
+//
+// The first twelve rows are the shape set onnxruntime's MLAS convolution
+// benchmark runs (onnxruntime/test/mlas/bench/bench_sconv.cpp: the ResNet50 set
+// plus the TeamsModel depthwise layer), expressed in this harness's
+// (N, IC, IH, OC, K, stride, groups, pad, dilation) form. Each one is therefore
+// a head-to-head with an MLAS `MlasConv` number on the identical problem:
+//
+//   row                              MLAS parameters (N, G, Cpg, Fpg, I, K, P, S)
+//   1x3x224x224 -> 64 x 7x7 s2       1, 1, 3,   64,  224, 7x7, 3, 2
+//   1x64x56x56 -> 64 x 3x3           1, 1, 64,  64,  56,  3x3, 1, 1
+//   1x64x56x56 -> 256 x 1x1          1, 1, 64,  256, 56,  1x1, 0, 1
+//   1x128x28x28 -> 512 x 3x3 s2      1, 1, 128, 512, 28,  3x3, 1, 2
+//   1x256x14x14 -> 1024 x 1x1        1, 1, 256, 1024, 14, 1x1, 0, 1
+//   1x512x7x7 -> 2048 x 1x1          1, 1, 512, 2048, 7,  1x1, 0, 1
+//   1x64x56x56 -> 64 x 3x3 g64       1, 64, 1,  1,   56,  3x3, 1, 1
+//   1x24x72x72 -> 12 x 3x3 g2 p0     1, 2, 12,  6,   72,  3x3, 0, 1
+//   1x256x378x378 -> 256 3x3 g256    1, 256, 1, 1,   378, 3x3, 1, 1
+//   8x64x56x56 -> 64 x 3x3           8, 1, 64,  64,  56,  3x3, 1, 1
+//   8x64x56x56 -> 256 x 1x1          8, 1, 64,  256, 56,  1x1, 0, 1
+//   1x256x224x224 -> 256 x 3x3       1, 1, 256, 256, 224, 3x3, 1, 1
+//
+// The rows past them are the cases the MLAS set does not reach: karea 81 (the
+// plan's icn 1 floor), a small-plane depthwise layer, a depthwise 5x5, a
+// dilated 5x5 on a 112 plane, and a grouped 3x3 whose output is 4x the input.
+//
+// Single thread only: at one thread every thread-count knob disappears from
+// both harnesses — no pool geometry, no per-call thread creation (this harness's
+// SimplePool spawns its workers inside every parallel_for, which at 8T/20T costs
+// more than the small rows below take in total). The rate printed here is the
+// kernel, and the kernel is the only thing the two implementations can be
+// compared on without also measuring the harnesses.
+//
+// The 1x1 rows are the exception to "im2col" in the section title: both sides
+// skip the panel for karea 1 (this plan degenerates, MLAS takes
+// MlasConvAlgorithmGemmDirect), so those two rows compare the GEMM underneath.
+
+NNOPS_BENCH(conv2d_f32_im2col_parity_1t) {
+    sweep_conv<float>("f32 im2col parity", {
+        // --- MLAS ResNet50 + TeamsModel set ---
+        {1,   3, 224,   64, 7, /*S=*/2},                       // resnet50 conv1 7x7 s2
+        {1,  64,  56,   64, 3},                                // resnet50 3x3
+        {1,  64,  56,  256, 1},                                // resnet50 1x1 pw
+        {1, 128,  28,  512, 3, /*S=*/2},                       // resnet50 3x3 s2
+        {1, 256,  14, 1024, 1},                                // resnet50 1x1 pw (14x14)
+        {1, 512,   7, 2048, 1},                                // resnet50 1x1 pw (7x7)
+        {1,  64,  56,   64, 3, 1, /*groups=*/64},              // mobilenet depthwise
+        {1,  24,  72,   12, 3, 1, /*groups=*/2,  /*pad=*/0},   // grouped g2, no pad
+        {1, 256, 378,  256, 3, 1, /*groups=*/256},             // teams depthwise 378x378
+        {8,  64,  56,   64, 3},                                // batch 8, 3x3
+        {8,  64,  56,  256, 1},                                // batch 8, 1x1 pw
+        {1, 256, 224,  256, 3},                                // 224 plane, 256x256
+        // --- past the MLAS set ---
+        {1,  64,  56,   64, 9},                                // karea 81 -> icn 1
+        {1, 256,  28,  256, 3, 1, /*groups=*/256},             // depthwise on a small plane
+        {1, 128,  28,  128, 5, 1, /*groups=*/128},             // depthwise 5x5
+        {1,  64, 112,   64, 5, 1, /*groups=*/1, /*pad=*/4, /*D=*/2},  // dilated 5x5, 112 plane
+        {1,  64,  28,  256, 3, 1, /*groups=*/4},               // grouped, OC = 4x IC
+    }, {1}, /*target_ms=*/300.0);
+}

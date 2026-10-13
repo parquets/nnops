@@ -356,7 +356,8 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     //                     worker" — at 8 threads the same 7-block plan against
     //                     an 8-thread pool is *hurt* by the split (397 -> 349),
     //                     and the gate is what keeps that case on 4 rows.
-    // It costs no scratch: col_size shrinks with the block.
+    // It costs no scratch in that direction: col_size shrinks with the block.
+    // The expansion loop below grows it back, bounded by the whole plane.
     const int64_t nr_max = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
     for (;;) {
         const int64_t blocks = (OH + plan.oh_block - 1) / plan.oh_block;
@@ -364,6 +365,27 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
         const int64_t next = plan.oh_block / 2;
         if (next * OW < 2 * nr_max) { break; }
         plan.oh_block = next;
+    }
+
+    // Mirror of the halving loop. Once one oh-block per (batch, group) already
+    // keeps at least half the pool busy the split buys no parallelism, and when
+    // the weight panel is bigger than the output plane it feeds, covering the
+    // whole plane means sweeping that panel once instead of once per block.
+    // (MLAS's MlasConvPrepare takes its whole-plane ExpandThenGemm path on the
+    // same filter-count-vs-output-size crossover, convolve.cpp:1691. Its weaker
+    // proxy — filters per group vs plane area, not the full panel vs the plane —
+    // is what keeps this to the small-plane / wide-filter shapes: the stronger
+    // form would also catch the 1x64x56x56 1x1 blocks, which the halving
+    // measurements below already put on 4 rows.) Growing past OH is not useful,
+    // so the block lands on OH itself, which need not be a multiple of kAlign —
+    // the kernel derives the row count per block from min(oh_block, OH - oh).
+    if (oc_per_group > OH * OW) {
+        while (plan.oh_block < OH) {
+            const int64_t grown = std::min<int64_t>(plan.oh_block * 2, OH);
+            const int64_t grown_blocks = (OH + grown - 1) / grown;
+            if (2 * NG * grown_blocks < nt) { break; }  // pool still needs the split
+            plan.oh_block = grown;
+        }
     }
 
     plan.num_oh_blocks = (OH + plan.oh_block - 1) / plan.oh_block;
