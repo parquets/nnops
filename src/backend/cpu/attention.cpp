@@ -164,8 +164,9 @@ void attention_impl(const AttentionAttributes& attrs,
     // Uniform 64-byte-aligned panel stride at GEMM1's largest k-block, and the
     // panel count any n-block can emit — both sizing upper bounds, see
     // kc_pack_bound / panels_for_pack.
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
-                           / static_cast<int>(sizeof(T));
+    const int ldd_b_full = static_cast<int>(
+        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
+        / static_cast<int>(sizeof(T)));
     const int np_full = panels_for_pack<T>(nc1);
 
     const int64_t scores_elems = Sq * Sk;
@@ -206,8 +207,9 @@ void attention_impl(const AttentionAttributes& attrs,
         // First k-block writes with add_to=false — no pre-zeroing pass.
         for (int64_t k0 = 0; k0 < D; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
-            const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
-                              / static_cast<int>(sizeof(T));
+            const int ldd_b = static_cast<int>(
+                mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+                / static_cast<int>(sizeof(T)));
             for (int64_t n = 0; n < Sk; n += nc1) {
                 const int actual_nc = static_cast<int>(std::min<int64_t>(nc1, Sk - n));
                 tile_pack_rhs(true, actual_nc, actual_kc,
@@ -296,8 +298,9 @@ template <class T>
 inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 {
     constexpr int nr_max = nr_max_flt<T>();
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
-                           / static_cast<int>(sizeof(T));
+    const int ldd_b_full = static_cast<int>(
+        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
+        / static_cast<int>(sizeof(T)));
     const int pack_elems = panels_for_pack<T>(Bc) * ldd_b_full;
     return static_cast<int64_t>(Br) * 2
          + static_cast<int64_t>(Br) * Bc
@@ -410,8 +413,9 @@ void attention_flash_impl(const AttentionAttributes& attrs,
             // First k-block writes with add_to=false — no pre-zeroing pass.
             for (int64_t k0 = 0; k0 < D; k0 += kc) {
                 const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
-                const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
-                                  / static_cast<int>(sizeof(T));
+                const int ldd_b = static_cast<int>(
+                    mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+                    / static_cast<int>(sizeof(T)));
                 tile_pack_rhs(true, actual_bc, actual_kc,
                               pack_b, ldd_b,
                               k_head + j0 * k_rs + k0, static_cast<int>(k_rs), scale);
@@ -561,7 +565,8 @@ AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
     plan.mc1 = mc1; plan.nc1 = nc1;
     plan.mc2 = mc2; plan.nc2 = nc2;
 
-    const int ldd_b_full = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * esz) / esz;
+    const int ldd_b_full = static_cast<int>(
+        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * esz) / esz);
     const int np_full = panels_for_pack<T>(nc1);
 
     const int64_t scores_elems = Sq * Sk;

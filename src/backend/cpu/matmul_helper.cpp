@@ -192,8 +192,9 @@ template <> struct TileTraits<half> {
 /// Uniform 64-byte-aligned panel stride, in elements, for a `rows × kc` panel.
 template <class T>
 constexpr int panel_stride(int rows, int kc) {
-    return align_up<PANEL_ALIGN_BYTES>(rows * kc * static_cast<int>(sizeof(T)))
-           / static_cast<int>(sizeof(T));
+    return static_cast<int>(
+        mma_pack_align(rows * kc * static_cast<int>(sizeof(T)))
+        / static_cast<int>(sizeof(T)));
 }
 
 /// Walk one level of a largest-first decomposition: take `sizes[Level]`-sized
@@ -506,8 +507,8 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
     // group too, and size the panel strides to the padded byte count so adjacent
     // panels never overlap.
     const int kbytes = (kc + 3) & ~3;
-    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * kbytes);
-    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kbytes);
+    const int ldd_a = static_cast<int>(mma_pack_align(MR_MAX_I8 * kbytes));
+    const int ldd_b = static_cast<int>(mma_pack_align(NR_MAX_I8 * kbytes));
     const int k_groups = kbytes / 4;
 
     int m = 0;
@@ -636,7 +637,8 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                        plan.mc, plan.nc, plan.kc);
 
     // Packed-B stride (elements) at full Kc.
-    const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * static_cast<int>(plan.kc) * elem) / elem;
+    const int ldd_b = static_cast<int>(
+        mma_pack_align(nr_max * static_cast<int>(plan.kc) * elem) / elem);
     plan.ldd_b = ldd_b;
 
     // Packed-B scratch. One full-N slice is `slice_bytes`; how many the
@@ -702,10 +704,9 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
             plan.num_slots_a = nconcurrent;
         }
 
-        plan.ldd_a = is_i8
-            ? align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8
-                  * ((static_cast<int>(plan.kc) + 3) & ~3))
-            : align_up<PANEL_ALIGN_BYTES>(mr_panel * static_cast<int>(plan.kc) * elem) / elem;
+        plan.ldd_a = static_cast<int64_t>(is_i8
+            ? mma_pack_align(MR_MAX_I8 * ((static_cast<int>(plan.kc) + 3) & ~3))
+            : mma_pack_align(mr_panel * static_cast<int>(plan.kc) * elem) / elem);
         const int* mr_a = is_i8 ? MR_I8 : (is_f32 ? MR_F32 : MR_F16);
         plan.np_a = num_panels_max(static_cast<int>(plan.mc), mr_a);
 

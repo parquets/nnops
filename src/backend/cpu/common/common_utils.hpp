@@ -50,9 +50,14 @@
 namespace nnops::backend::cpu {
 
 /// Round n up to a multiple of AlignBytes (a power of two).
-template <int AlignBytes>
-constexpr int align_up(int n) {
+template <size_t AlignBytes>
+constexpr size_t align_up(size_t n) {
     return (n + AlignBytes - 1) & ~(AlignBytes - 1);
+}
+
+constexpr size_t mma_pack_align(size_t n) {
+    constexpr size_t PANEL_ALIGN_BYTES = 64;
+    return align_up<PANEL_ALIGN_BYTES>(n);
 }
 
 }  // namespace nnops::backend::cpu

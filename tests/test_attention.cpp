@@ -313,8 +313,8 @@ int64_t pack_demand_elems(int64_t n, int64_t D)
     constexpr int nr_max = cpu::nr_max_flt<T>();
     constexpr int64_t kc = std::is_same_v<T, cpu::half> ? cpu::KC_F16 : cpu::KC_F32;
     constexpr int esz = static_cast<int>(sizeof(T));
-    const int64_t ldd = cpu::align_up<PANEL_ALIGN_BYTES>(
-        static_cast<int>(nr_max * std::min<int64_t>(kc, D) * esz)) / esz;
+    const int64_t ldd = static_cast<int64_t>(cpu::mma_pack_align(
+        static_cast<int>(nr_max * std::min<int64_t>(kc, D) * esz)) / esz);
     const int* nr = std::is_same_v<T, cpu::half> ? cpu::NR_F16 : cpu::NR_F32;
     return cpu::num_panels(static_cast<int>(n), nr) * ldd;
 }

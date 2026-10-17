@@ -12,7 +12,7 @@
 ///   - Size-class free lists (powers of two, 64 B .. 16 MiB). allocate() rounds
 ///     the request up to the next class; deallocate() returns the block to its
 ///     class for reuse by the next request of a matching size.
-///   - Every block is 64-byte aligned (matches the GEMM PANEL_ALIGN_BYTES).
+///   - Every block is 64-byte aligned (matches mma_pack_align).
 ///   - Each thread keeps a small cache (one recycled block per size class), so
 ///     the common "allocate one scratch buffer, free it on return" pattern hits
 ///     a lock-free fast path and never touches the shared pool. A thread's cache

@@ -41,9 +41,6 @@
 
 #include "nnops/detail/half.hpp"
 
-// 64-byte cache-line alignment for packed panel strides
-#define PANEL_ALIGN_BYTES 64
-
 namespace nnops::backend::cpu {
 
 // ---- namespace alias ---------------------------------------------------
@@ -522,7 +519,7 @@ struct MatMulPlan {
     // Packed-A region, which begins at pack_a_offset — the end of the packed-B
     // region — and runs to workspace_size. It holds num_slots_a slots of np_a
     // panels each at the ldd_a stride; the stride is in elements for fp and in
-    // bytes for int8, and both go through align_up<PANEL_ALIGN_BYTES>, so every
+    // bytes for int8, and both go through mma_pack_align, so every
     // slot and the region are 64-byte aligned, which is what the pack/MMA
     // kernels assume. Sized from the plan's own mc and kc, so it is a bound and
     // not a worst case: any block has actual_mc <= mc and actual_kc <= kc.

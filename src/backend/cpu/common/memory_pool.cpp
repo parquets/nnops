@@ -17,7 +17,7 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-constexpr size_t kAlignment = 64;                  // matches GEMM PANEL_ALIGN_BYTES
+constexpr size_t kAlignment = 64;                  // matches mma_pack_align
 constexpr size_t kMinClass  = 64;                  // smallest pooled size
 constexpr size_t kMaxClass  = 16u * 1024u * 1024u; // 16 MiB cap
 constexpr int    kNumClasses = 19;                 // 64 B .. 16 MiB (powers of two)

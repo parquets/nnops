@@ -163,8 +163,9 @@ void matmul_tile(const MatMulAttributes& attrs,
     // reads A through lda and never touches ldd_a/pack_a_slice.
     constexpr int mr_max = mr_max_flt<T>();
 
-    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(mr_max * actual_kc * static_cast<int>(sizeof(T)))
-                      / static_cast<int>(sizeof(T));
+    const int ldd_a = static_cast<int>(
+        mma_pack_align(mr_max * actual_kc * static_cast<int>(sizeof(T)))
+        / static_cast<int>(sizeof(T)));
     const bool epilogue = has_inplace_epilogue(attrs);
     // First k-block with beta == 0 overwrites C outright (the kernels skip
     // the C load); every other block accumulates. beta ∉ {0, 1} still needs
@@ -227,8 +228,9 @@ void matmul_block_fused(const MatMulAttributes& attrs,
         const bool last_k = (k + kc >= K);
 
         // Uniform 64-byte-aligned panel stride for this k-block.
-        const int ldd_b = align_up<PANEL_ALIGN_BYTES>(nr_max * actual_kc * static_cast<int>(sizeof(T)))
-                          / static_cast<int>(sizeof(T));
+        const int ldd_b = static_cast<int>(
+            mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+            / static_cast<int>(sizeof(T)));
 
         // B panel: packed ([K][nr]) regardless of transpose_b.
         const T* b_src = attrs.transpose_b
@@ -465,7 +467,7 @@ void matmul_m_panels_i8(const MatMulAttributes& attrs,
     // Pack step writes ceil(kc/4) groups per row; stride by the padded byte
     // count to keep adjacent panels from overlapping.
     const int kbytes = (actual_kc + 3) & ~3;
-    const int ldd_a = align_up<PANEL_ALIGN_BYTES>(MR_MAX_I8 * kbytes);
+    const int ldd_a = static_cast<int>(mma_pack_align(MR_MAX_I8 * kbytes));
 
     for (int m = m_start; m < m_start + m_count; m += mc) {
         int actual_mc = std::min(mc, m_start + m_count - m);
@@ -501,7 +503,7 @@ void matmul_block_int8(const MatMulAttributes& attrs,
 
         // Uniform 64-byte-aligned panel stride (bytes) for this k-block.
         const int kbytes = (actual_kc + 3) & ~3;
-        const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kbytes);
+        const int ldd_b = static_cast<int>(mma_pack_align(NR_MAX_I8 * kbytes));
 
         // B panel: packed ([K][nr]) regardless of transpose_b.
         const int8_t* b_src = attrs.transpose_b
@@ -638,7 +640,7 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
             for (int k = 0; k < Ki; k += kc) {
                 const int actual_kc = std::min(kc, Ki - k);
                 const int kbytes = (actual_kc + 3) & ~3;
-                const int ldd_b = align_up<PANEL_ALIGN_BYTES>(NR_MAX_I8 * kbytes);
+                const int ldd_b = static_cast<int>(mma_pack_align(NR_MAX_I8 * kbytes));
                 const int8_t* b_src = attrs.transpose_b
                     ? b_p + k                  // B phys is N×K, col k over full N
                     : b_p + k * ldb;           // B phys is K×N, row k over full N

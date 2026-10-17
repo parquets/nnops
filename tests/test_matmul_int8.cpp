@@ -659,8 +659,8 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     NNOPS_EXPECT_TRUE(b10.kc <= cpu::KC_CAP_I8);
     NNOPS_EXPECT_EQ(b1.kc % cpu::KC_ALIGN, int64_t{0});
     NNOPS_EXPECT_EQ(b10.kc % cpu::KC_ALIGN, int64_t{0});
-    const int64_t ldd_b1  = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * b1.kc);
-    const int64_t ldd_b10 = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * b10.kc);
+    const int64_t ldd_b1  = static_cast<int64_t>(cpu::mma_pack_align(cpu::NR_MAX_I8 * b1.kc));
+    const int64_t ldd_b10 = static_cast<int64_t>(cpu::mma_pack_align(cpu::NR_MAX_I8 * b10.kc));
     const int64_t one_slice1  = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b1;
     const int64_t one_slice10 = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b10;
     NNOPS_EXPECT_EQ(b1.ldd_b, ldd_b1);
@@ -674,7 +674,7 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     // therefore a single tile, and workspace_size is pack_a_offset plus exactly
     // that. (b10 reports 10 threads but the pool is what installs the thread
     // ids — i8_plan passes no hooks, so A falls back to one slot per m-block.)
-    const int64_t b1_ldd_a = cpu::align_up<PANEL_ALIGN_BYTES>(cpu::MR_MAX_I8 * b1.kc);
+    const int64_t b1_ldd_a = static_cast<int64_t>(cpu::mma_pack_align(cpu::MR_MAX_I8 * b1.kc));
     const int64_t b1_np_a  = cpu::num_panels_max(static_cast<int>(b1.mc), cpu::MR_I8);
     NNOPS_EXPECT_EQ(b1.num_slots_a, int64_t{1});
     NNOPS_EXPECT_EQ(b1.ldd_a, b1_ldd_a);
@@ -696,7 +696,8 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     const int64_t n_blocks = (int64_t{1024} + n10.nc - 1) / n10.nc;
     const int64_t np_max = cpu::num_panels_max4(static_cast<int>(n10.nc), cpu::NR_I8);
     NNOPS_EXPECT_TRUE(np_max > cpu::num_panels4(static_cast<int>(n10.nc), cpu::NR_I8));
-    NNOPS_EXPECT_EQ(n10.ldd_b, cpu::align_up<PANEL_ALIGN_BYTES>(cpu::NR_MAX_I8 * n10.kc));
+    NNOPS_EXPECT_EQ(n10.ldd_b,
+                    static_cast<int64_t>(cpu::mma_pack_align(cpu::NR_MAX_I8 * n10.kc)));
     NNOPS_EXPECT_EQ(n10.num_slots, n_blocks);
     NNOPS_EXPECT_EQ(n10.pack_a_offset, n_blocks * np_max * n10.ldd_b);
     NNOPS_EXPECT_EQ(n10.num_slots_a, n_blocks);   // per-block: no thread ids here

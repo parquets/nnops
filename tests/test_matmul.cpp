@@ -1809,8 +1809,8 @@ NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
             // Geometry: sized from the plan's own kc, and every part of the
             // region 64-byte aligned so the slots after it stay aligned (the
             // pack/MMA kernels assume that alignment).
-            const int64_t ldd_a = cpu::align_up<PANEL_ALIGN_BYTES>(
-                                      cpu::MR_MAX_F32 * static_cast<int>(plan.kc) * 4) / 4;
+            const int64_t ldd_a = static_cast<int64_t>(
+                cpu::mma_pack_align(cpu::MR_MAX_F32 * static_cast<int>(plan.kc) * 4) / 4);
             NNOPS_EXPECT_EQ(plan.ldd_a, ldd_a);
             NNOPS_EXPECT_EQ(plan.pack_a_offset % 64, int64_t{0});
             NNOPS_EXPECT_EQ((plan.np_a * plan.ldd_a * 4) % 64, int64_t{0});
