@@ -12,7 +12,7 @@
 
 #include <arm_neon.h>
 #include <cstring>
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 #include "transpose.hpp"
 
 namespace nnops::backend::cpu::aarch64 {

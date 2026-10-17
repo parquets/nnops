@@ -24,7 +24,7 @@
 
 #include <cstdint>
 #include <immintrin.h>
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 #include "transpose.hpp"
 
 namespace nnops::backend::cpu::x86_64 {

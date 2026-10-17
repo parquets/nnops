@@ -10,6 +10,7 @@
 #include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / NNOPS_ARCH_AARCH64
 #include "nnops/ops/matmul.hpp"                // MatMulAttributes
 #include "nnops/core/tensor_view.hpp"          // TensorDesc
+#include "backend/cpu/common/common_utils.hpp" // align_up
 
 #include <algorithm>
 #include <cmath>
@@ -116,11 +117,6 @@ constexpr int nr_max_flt() {
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>, "Unsupported type");
     }
-}
-
-template <int AlignBytes>
-constexpr int align_up(int n) {
-    return (n + AlignBytes - 1) & ~(AlignBytes - 1);
 }
 
 // =========================================================================

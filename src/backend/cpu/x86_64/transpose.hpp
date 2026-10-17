@@ -18,7 +18,7 @@
 /// Reference: nn_compute/src/cpu/kernel/transpose/x86_64/transpose_x86.hpp
 
 #include <immintrin.h>
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
 

@@ -13,7 +13,7 @@
 /// Reference: nn_compute/src/cpu/kernel/transpose/aarch64/transpose_aarch64.hpp
 
 #include <arm_neon.h>
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 
 namespace nnops::backend::cpu::aarch64 {
 

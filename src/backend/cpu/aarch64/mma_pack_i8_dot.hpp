@@ -16,7 +16,7 @@
 #include <arm_neon.h>
 #include <algorithm>
 #include <cstdint>
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 
 namespace nnops::backend::cpu::aarch64 {
 

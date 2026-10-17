@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 #include "nnops/detail/half.hpp"
 
 namespace nnops::backend::cpu::aarch64 {

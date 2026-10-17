@@ -8,7 +8,7 @@
 /// Reference: nn_compute/src/cpu/kernel/pack/x86_64/pack_f32.hpp
 
 #include <immintrin.h>
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 #include "transpose.hpp"
 
 namespace nnops::backend::cpu::x86_64 {

@@ -17,7 +17,7 @@
 #include <immintrin.h>
 #include <algorithm>
 #include "nnops/detail/half.hpp"
-#include "backend/cpu/common/restrict.hpp"
+#include "backend/cpu/common/common_utils.hpp"
 #include "pack_f16.hpp"  // for load_f16x8, store_f16x8
 
 namespace nnops::backend::cpu::x86_64 {
