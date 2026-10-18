@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
@@ -175,13 +176,32 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
     std::printf("\n");
 }
 
-void bench_conv2d_case(const Conv2DCase& c) {
-    const int iters = 20;
-    std::vector<int> threads{1, 2, 4, 8};
-    int hw = static_cast<int>(std::thread::hardware_concurrency());
+/// Thread ladder for every conv bench. `NNOPS_BENCH_THREADS=1` (or "1,4") pins
+/// it: the multi-thread cells on a busy host mostly measure background load,
+/// and a pinned run is the only way to get a clean per-core number.
+std::vector<int> conv_bench_threads() {
+    std::vector<int> threads;
+    if (const char* env = std::getenv("NNOPS_BENCH_THREADS")) {
+        for (const char* p = env; *p;) {
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end != p && v > 0) { threads.push_back(static_cast<int>(v)); }
+            p = (end != p) ? end : p + 1;
+            if (*p == ',') { ++p; }
+        }
+        if (!threads.empty()) { return threads; }
+    }
+    threads = {1, 2, 4, 8};
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
     if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
         threads.push_back(hw);
     }
+    return threads;
+}
+
+void bench_conv2d_case(const Conv2DCase& c) {
+    const int iters = 20;
+    const std::vector<int> threads = conv_bench_threads();
     if (c.f16) { run_conv2d<half>(c, threads, iters); }
     else        { run_conv2d<float>(c, threads, iters); }
 }
@@ -290,11 +310,7 @@ void run_depthwise(const DepthwiseCase& c, const std::vector<int>& threads, int 
 
 void bench_depthwise_case(const DepthwiseCase& c) {
     const int iters = 20;
-    std::vector<int> threads{1, 2, 4, 8};
-    int hw = static_cast<int>(std::thread::hardware_concurrency());
-    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
-        threads.push_back(hw);
-    }
+    const std::vector<int> threads = conv_bench_threads();
     run_depthwise(c, threads, iters);
 }
 
@@ -470,11 +486,7 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
 
 void bench_wino_case(const WinoCase& c) {
     const int iters = 20, rounds = 5;
-    std::vector<int> threads{1, 2, 4, 8};
-    int hw = static_cast<int>(std::thread::hardware_concurrency());
-    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
-        threads.push_back(hw);
-    }
+    const std::vector<int> threads = conv_bench_threads();
     if (c.f16) { run_wino_ab<half>(c, threads, iters, rounds); }
     else       { run_wino_ab<float>(c, threads, iters, rounds); }
 }
@@ -525,12 +537,7 @@ struct ConvSweepShape {
 };
 
 std::vector<int> sweep_threads() {
-    std::vector<int> threads{1, 2, 4, 8};
-    const int hw = static_cast<int>(std::thread::hardware_concurrency());
-    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
-        threads.push_back(hw);
-    }
-    return threads;
+    return conv_bench_threads();
 }
 
 /// One conv problem, built once and reused across pool sizes.
@@ -971,4 +978,104 @@ NNOPS_BENCH(conv2d_f32_im2col_parity_1t) {
         {1,  64, 112,   64, 5, 1, /*groups=*/1, /*pad=*/4, /*D=*/2},  // dilated 5x5, 112 plane
         {1,  64,  28,  256, 3, 1, /*groups=*/4},               // grouped, OC = 4x IC
     }, {1}, /*target_ms=*/300.0);
+}
+
+// ============================================================
+// Classic classification backbones — full layer stacks
+// ============================================================
+//
+// The parity set above measures single layers at one thread. These walk the
+// whole stack of the three backbones people actually profile, one row per
+// distinct layer shape in execution order (N = 1, the training/inference batch
+// every published number uses). Rows that repeat inside a stage appear twice
+// only in VGG, where the depth of the stage is the point: block3 has three
+// 256-channel convs, blocks 4 and 5 have three each in VGG-16.
+//
+// Layer shapes follow torchvision's resnet50/resnet18 and vgg16 weight shapes;
+// stride-2 is on the first 1x1 of every ResNet stage (the bottleneck
+// downsample), as in the reference implementation.
+
+NNOPS_BENCH(conv2d_f32_resnet50_stack) {
+    sweep_conv<float>("f32 resnet50", {
+        {1,    3, 224,   64, 7, /*S=*/2},                      // conv1
+        {1,   64,  56,   64, 1},                               // conv2_1 1x1
+        {1,   64,  56,   64, 3},                               // conv2_1 3x3
+        {1,   64,  56,  256, 1},                               // conv2_1 1x1 expand
+        {1,  256,  56,  128, 1, /*S=*/2},                      // conv3_1 1x1 downsample
+        {1,  128,  28,  128, 3},                               // conv3_1 3x3
+        {1,  128,  28,  512, 1},                               // conv3_1 1x1 expand
+        {1,  512,  28,  256, 1, /*S=*/2},                      // conv4_1 1x1 downsample
+        {1,  256,  14,  256, 3},                               // conv4_1 3x3
+        {1,  256,  14, 1024, 1},                               // conv4_1 1x1 expand
+        {1, 1024,  14,  512, 1, /*S=*/2},                      // conv5_1 1x1 downsample
+        {1,  512,   7,  512, 3},                               // conv5_1 3x3
+        {1,  512,   7, 2048, 1},                               // conv5_1 1x1 expand
+    }, sweep_threads(), 250.0);
+}
+
+NNOPS_BENCH(conv2d_f32_resnet18_stack) {
+    sweep_conv<float>("f32 resnet18", {
+        {1,   3, 224,  64, 7, /*S=*/2},                        // conv1
+        {1,  64,  56,  64, 3},                                 // layer1
+        {1,  64,  56, 128, 3, /*S=*/2},                        // layer2 downsample
+        {1, 128,  28, 128, 3},                                 // layer2
+        {1, 128,  28, 256, 3, /*S=*/2},                        // layer3 downsample
+        {1, 256,  14, 256, 3},                                 // layer3
+        {1, 256,  14, 512, 3, /*S=*/2},                        // layer4 downsample
+        {1, 512,   7, 512, 3},                                 // layer4
+    }, sweep_threads(), 250.0);
+}
+
+NNOPS_BENCH(conv2d_f32_vgg16_stack) {
+    sweep_conv<float>("f32 vgg16", {
+        {1,   3, 224,  64, 3},                                 // block1
+        {1,  64, 224,  64, 3},
+        {1,  64, 112, 128, 3},                                 // block2
+        {1, 128, 112, 128, 3},
+        {1, 128,  56, 256, 3},                                 // block3 (x3)
+        {1, 256,  56, 256, 3},
+        {1, 256,  56, 256, 3},
+        {1, 256,  28, 512, 3},                                 // block4 (x3)
+        {1, 512,  28, 512, 3},
+        {1, 512,  28, 512, 3},
+        {1, 512,  14, 512, 3},                                 // block5 (x3)
+        {1, 512,  14, 512, 3},
+        {1, 512,  14, 512, 3},
+    }, sweep_threads(), 250.0);
+}
+
+NNOPS_BENCH(conv2d_f16_resnet50_stack) {
+    sweep_conv<half>("f16 resnet50", {
+        {1,    3, 224,   64, 7, /*S=*/2},
+        {1,   64,  56,   64, 1},
+        {1,   64,  56,   64, 3},
+        {1,   64,  56,  256, 1},
+        {1,  256,  56,  128, 1, /*S=*/2},
+        {1,  128,  28,  128, 3},
+        {1,  128,  28,  512, 1},
+        {1,  512,  28,  256, 1, /*S=*/2},
+        {1,  256,  14,  256, 3},
+        {1,  256,  14, 1024, 1},
+        {1, 1024,  14,  512, 1, /*S=*/2},
+        {1,  512,   7,  512, 3},
+        {1,  512,   7, 2048, 1},
+    }, sweep_threads(), 250.0);
+}
+
+NNOPS_BENCH(conv2d_f16_vgg16_stack) {
+    sweep_conv<half>("f16 vgg16", {
+        {1,   3, 224,  64, 3},
+        {1,  64, 224,  64, 3},
+        {1,  64, 112, 128, 3},
+        {1, 128, 112, 128, 3},
+        {1, 128,  56, 256, 3},
+        {1, 256,  56, 256, 3},
+        {1, 256,  56, 256, 3},
+        {1, 256,  28, 512, 3},
+        {1, 512,  28, 512, 3},
+        {1, 512,  28, 512, 3},
+        {1, 512,  14, 512, 3},
+        {1, 512,  14, 512, 3},
+        {1, 512,  14, 512, 3},
+    }, sweep_threads(), 250.0);
 }
