@@ -5,7 +5,7 @@
 /// scratch layout and the numeric-ordering rules.
 
 #include "conv2d_winograd.h"
-#include "matmul_helper.h"                  // tile_mma_direct
+#include "matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs
 #include "simd_kernel/simd_winograd.hpp"    // BᵀdB / AᵀMA / GgGᵀ transforms
 #include "common/memory_pool.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -133,11 +133,16 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     const int64_t u_plane_step = OC * u_pitch;   // between transform positions
     const int64_t v_p_step     = ICG * num_tiles;  // between transform positions
 
-    // Scratch: [halo][V][M × num_slots]. V and the halo are per-(batch, group)
-    // and shared by both phases; M is per worker slot.
+    // Scratch: [halo][V][M × num_slots][B × num_slots]. V and the halo are
+    // per-(batch, group) and shared by both phases; M and the packed B panels
+    // are per worker slot.
     T* halo_base = static_cast<T*>(workspace);
     T* v_all     = halo_base + plan.halo_size;
     T* m_all     = v_all + plan.v_size;
+    T* b_all     = m_all + plan.num_slots * plan.m_size;
+
+    constexpr int nr_max = nr_max_flt<T>();
+    constexpr int esz    = static_cast<int>(sizeof(T));
 
     const int64_t halo_ld = plan.halo_w;
     const int64_t halo_ch = plan.halo_h * plan.halo_w;
@@ -197,6 +202,7 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
 
         const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
         T* m = m_all + slot * plan.m_size;
+        T* pack_b = b_all + slot * plan.b_size;
 
         // Accumulate over the input channels: M_p is zeroed on the first ic
         // block (zero_mode) and accumulated after. Bias is deliberately NOT
@@ -208,14 +214,23 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                                   + (g * oc_per_group + ocn0) * u_pitch + icn;
                 const T* b = v_all + p * v_p_step + icn * num_tiles + v_row_off + tw0;
                 T* c = m + p * (ocn_block * tile_block);
+
+                // Pack this transform position's V slice [icnc][nc] into
+                // uniform nr_max-wide panels; every oc row in the tile reuses
+                // it, so the copy costs 1/ocnc of the GEMM's MACs.
+                const int ldd_b = static_cast<int>(
+                    mma_pack_align(nr_max * static_cast<int>(icnc) * esz) / esz);
+                tile_pack_rhs(false, static_cast<int>(nc), static_cast<int>(icnc),
+                                      pack_b, ldd_b, b, static_cast<int>(num_tiles), 1.0f);
+
                 tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(nc),
-                                static_cast<int>(icnc),
-                                c, static_cast<int>(tile_block),
-                                a, static_cast<int>(u_pitch),
-                                b, static_cast<int>(num_tiles),
-                                -std::numeric_limits<float>::infinity(),
-                                std::numeric_limits<float>::infinity(),
-                                /*zero_mode=*/icn == 0);
+                                        static_cast<int>(icnc),
+                                        c, static_cast<int>(tile_block),
+                                        a, static_cast<int>(u_pitch),
+                                        pack_b,
+                                        -std::numeric_limits<float>::infinity(),
+                                        std::numeric_limits<float>::infinity(),
+                                        /*zero_mode=*/icn == 0);
             }
         }
 
@@ -326,11 +341,18 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
     plan.v_size    = static_cast<int64_t>(kWinoPos) * ICG * plan.num_tiles;
     plan.m_size    = static_cast<int64_t>(kWinoPos) * plan.ocn_block * plan.tile_block;
 
+    // Uniform packed-B scratch: one V slice [icn_block][tile_block] per slot.
+    const int64_t nr_max = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
+    const int64_t esz    = static_cast<int64_t>(data_type_size(dt));
+    const int64_t ldd_b_max = mma_pack_align(
+        static_cast<size_t>(nr_max * plan.icn_block * esz)) / esz;
+    plan.b_size = ((plan.tile_block + nr_max - 1) / nr_max) * ldd_b_max;
+
     const int64_t nt = std::max<int64_t>(num_threads, 1);
     plan.num_slots = (use_thread_slots && nt < plan.num_b_tasks) ? nt : plan.num_b_tasks;
 
     plan.workspace_size = static_cast<size_t>(plan.halo_size + plan.v_size
-                                              + plan.num_slots * plan.m_size)
+                                              + plan.num_slots * (plan.m_size + plan.b_size))
                         * data_type_size(dt);
     return plan;
 }

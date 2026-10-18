@@ -10,6 +10,7 @@
 #endif
 
 #include <smmintrin.h>  // SSE4.1
+#include <immintrin.h>  // FMA + F16C intrinsics used by the helpers below
 #include <cstdint>
 #include <algorithm>
 #include "sse_mathfunc.hpp"
@@ -20,7 +21,6 @@
 // block below, which would nest it into sse::nnops::simd::arch::avx2 and break
 // the sibling `avx2::` lookup in the v_f16x8 transcendental ops.
 #if defined(__F16C__)
-#include <immintrin.h>
 #include "avx2_mathfunc.hpp"
 #endif
 

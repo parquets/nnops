@@ -21,7 +21,7 @@ namespace nnops::backend::cpu::aarch64 {
 
 inline void pack_trans_n1_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale) noexcept {
+                              int ir_step, int K, float scale, int mr = 1) noexcept {
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         *output++ = input[0] * s;
@@ -31,14 +31,24 @@ inline void pack_trans_n1_f16(float16_t* NNOPS_RESTRICT output,
 
 inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale) noexcept {
+                              int ir_step, int K, float scale, int mr = 4) noexcept {
+    // Rows past `mr` alias the last live row — the same convention the
+    // MMA kernels use — so a partial-M panel needs no padding.
+    const int r1 = (mr > 1) ? 1 : 0;
+    const int r2 = (mr > 2) ? 2 : r1;
+    const int r3 = (mr > 3) ? 3 : r2;
+    const float16_t* NNOPS_RESTRICT p0 = input + 0 * ir_step;
+    const float16_t* NNOPS_RESTRICT p1 = input + r1 * ir_step;
+    const float16_t* NNOPS_RESTRICT p2 = input + r2 * ir_step;
+    const float16_t* NNOPS_RESTRICT p3 = input + r3 * ir_step;
+
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float16x4_t v0 = vmul_n_f16(vld1_f16(input + 0 * ir_step), s);
-        float16x4_t v1 = vmul_n_f16(vld1_f16(input + 1 * ir_step), s);
-        float16x4_t v2 = vmul_n_f16(vld1_f16(input + 2 * ir_step), s);
-        float16x4_t v3 = vmul_n_f16(vld1_f16(input + 3 * ir_step), s);
+        float16x4_t v0 = vmul_n_f16(vld1_f16(p0), s); p0 += 4;
+        float16x4_t v1 = vmul_n_f16(vld1_f16(p1), s); p1 += 4;
+        float16x4_t v2 = vmul_n_f16(vld1_f16(p2), s); p2 += 4;
+        float16x4_t v3 = vmul_n_f16(vld1_f16(p3), s); p3 += 4;
 
         transpose_4x4_f16(v0, v1, v2, v3);
 
@@ -48,34 +58,49 @@ inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
         vst1_f16(output + 3 * 4, v3);
 
         output += 4 * 4;
-        input  += 4;
     }
     for (; k < K; ++k) {
-        output[0] = input[0 * ir_step] * s;
-        output[1] = input[1 * ir_step] * s;
-        output[2] = input[2 * ir_step] * s;
-        output[3] = input[3 * ir_step] * s;
-        output += 4;
-        input  += 1;
+        *output++ = *(p0++) * s;
+        *output++ = *(p1++) * s;
+        *output++ = *(p2++) * s;
+        *output++ = *(p3++) * s;
     }
 }
 
 inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale) noexcept {
+                              int ir_step, int K, float scale, int mr = 8) noexcept {
+    // Rows past `mr` alias the last live row — the same convention the
+    // MMA kernels use — so a partial-M panel needs no padding.
+    const int r1 = (mr > 1) ? 1 : 0;
+    const int r2 = (mr > 2) ? 2 : r1;
+    const int r3 = (mr > 3) ? 3 : r2;
+    const int r4 = (mr > 4) ? 4 : r3;
+    const int r5 = (mr > 5) ? 5 : r4;
+    const int r6 = (mr > 6) ? 6 : r5;
+    const int r7 = (mr > 7) ? 7 : r6;
+    const float16_t* NNOPS_RESTRICT p0 = input + 0 * ir_step;
+    const float16_t* NNOPS_RESTRICT p1 = input + r1 * ir_step;
+    const float16_t* NNOPS_RESTRICT p2 = input + r2 * ir_step;
+    const float16_t* NNOPS_RESTRICT p3 = input + r3 * ir_step;
+    const float16_t* NNOPS_RESTRICT p4 = input + r4 * ir_step;
+    const float16_t* NNOPS_RESTRICT p5 = input + r5 * ir_step;
+    const float16_t* NNOPS_RESTRICT p6 = input + r6 * ir_step;
+    const float16_t* NNOPS_RESTRICT p7 = input + r7 * ir_step;
+
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     // One 128-bit f16 vector is 8 columns wide, so the block advances 8 per
     // iteration (the f32 kernel steps 4 — its vector is 4 wide).
     for (; k <= K - 8; k += 8) {
-        float16x8_t v0 = vmulq_n_f16(vld1q_f16(input + 0 * ir_step), s);
-        float16x8_t v1 = vmulq_n_f16(vld1q_f16(input + 1 * ir_step), s);
-        float16x8_t v2 = vmulq_n_f16(vld1q_f16(input + 2 * ir_step), s);
-        float16x8_t v3 = vmulq_n_f16(vld1q_f16(input + 3 * ir_step), s);
-        float16x8_t v4 = vmulq_n_f16(vld1q_f16(input + 4 * ir_step), s);
-        float16x8_t v5 = vmulq_n_f16(vld1q_f16(input + 5 * ir_step), s);
-        float16x8_t v6 = vmulq_n_f16(vld1q_f16(input + 6 * ir_step), s);
-        float16x8_t v7 = vmulq_n_f16(vld1q_f16(input + 7 * ir_step), s);
+        float16x8_t v0 = vmulq_n_f16(vld1q_f16(p0), s); p0 += 8;
+        float16x8_t v1 = vmulq_n_f16(vld1q_f16(p1), s); p1 += 8;
+        float16x8_t v2 = vmulq_n_f16(vld1q_f16(p2), s); p2 += 8;
+        float16x8_t v3 = vmulq_n_f16(vld1q_f16(p3), s); p3 += 8;
+        float16x8_t v4 = vmulq_n_f16(vld1q_f16(p4), s); p4 += 8;
+        float16x8_t v5 = vmulq_n_f16(vld1q_f16(p5), s); p5 += 8;
+        float16x8_t v6 = vmulq_n_f16(vld1q_f16(p6), s); p6 += 8;
+        float16x8_t v7 = vmulq_n_f16(vld1q_f16(p7), s); p7 += 8;
 
         transpose_8x8_f16(v0, v1, v2, v3, v4, v5, v6, v7);
 
@@ -89,135 +114,86 @@ inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
         vst1q_f16(output + 7 * 8, v7);
 
         output += 8 * 8;
-        input  += 8;
     }
     for (; k < K; ++k) {
-        for (int i = 0; i < 8; ++i) {
-            *output++ = input[i * ir_step] * s;
-        }
-        input += 1;
+        *output++ = *(p0++) * s;
+        *output++ = *(p1++) * s;
+        *output++ = *(p2++) * s;
+        *output++ = *(p3++) * s;
+        *output++ = *(p4++) * s;
+        *output++ = *(p5++) * s;
+        *output++ = *(p6++) * s;
+        *output++ = *(p7++) * s;
     }
 }
 
 inline void pack_trans_n12_f16(float16_t* NNOPS_RESTRICT output,
                                const float16_t* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale) noexcept {
+                               int ir_step, int K, float scale, int mr = 12) noexcept {
+    // Rows past `mr` alias the last live row — the same convention the
+    // MMA kernels use — so a partial-M panel needs no padding.
+    const int last = (mr > 1) ? mr - 1 : 0;
+    const float16_t* NNOPS_RESTRICT p[12];
+    for (int i = 0; i < 12; ++i) {
+        p[i] = input + ((i < mr) ? i : last) * ir_step;
+    }
+
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 8; k += 8) {
-        float16x8_t v0  = vmulq_n_f16(vld1q_f16(input + 0 * ir_step), s);
-        float16x8_t v1  = vmulq_n_f16(vld1q_f16(input + 1 * ir_step), s);
-        float16x8_t v2  = vmulq_n_f16(vld1q_f16(input + 2 * ir_step), s);
-        float16x8_t v3  = vmulq_n_f16(vld1q_f16(input + 3 * ir_step), s);
-        float16x8_t v4  = vmulq_n_f16(vld1q_f16(input + 4 * ir_step), s);
-        float16x8_t v5  = vmulq_n_f16(vld1q_f16(input + 5 * ir_step), s);
-        float16x8_t v6  = vmulq_n_f16(vld1q_f16(input + 6 * ir_step), s);
-        float16x8_t v7  = vmulq_n_f16(vld1q_f16(input + 7 * ir_step), s);
-        float16x8_t v8  = vmulq_n_f16(vld1q_f16(input + 8 * ir_step), s);
-        float16x8_t v9  = vmulq_n_f16(vld1q_f16(input + 9 * ir_step), s);
-        float16x8_t v10 = vmulq_n_f16(vld1q_f16(input + 10 * ir_step), s);
-        float16x8_t v11 = vmulq_n_f16(vld1q_f16(input + 11 * ir_step), s);
+        float16x8_t v[12];
+        for (int i = 0; i < 12; ++i) {
+            v[i] = vmulq_n_f16(vld1q_f16(p[i]), s); p[i] += 8;
+        }
 
-        transpose_12x8_f16(v0, v1, v2, v3, v4, v5,
-                           v6, v7, v8, v9, v10, v11);
+        transpose_12x8_f16(v[0], v[1], v[2], v[3], v[4], v[5],
+                           v[6], v[7], v[8], v[9], v[10], v[11]);
 
-        vst1q_f16(output + 0 * 8, v0);
-        vst1q_f16(output + 1 * 8, v1);
-        vst1q_f16(output + 2 * 8, v2);
-        vst1q_f16(output + 3 * 8, v3);
-        vst1q_f16(output + 4 * 8, v4);
-        vst1q_f16(output + 5 * 8, v5);
-        vst1q_f16(output + 6 * 8, v6);
-        vst1q_f16(output + 7 * 8, v7);
-        vst1q_f16(output + 8 * 8, v8);
-        vst1q_f16(output + 9 * 8, v9);
-        vst1q_f16(output + 10 * 8, v10);
-        vst1q_f16(output + 11 * 8, v11);
+        for (int i = 0; i < 12; ++i) {
+            vst1q_f16(output + i * 8, v[i]);
+        }
 
         output += 12 * 8;
-        input  += 8;
     }
     for (; k < K; ++k) {
-        *output++ = input[0 * ir_step] * s;
-        *output++ = input[1 * ir_step] * s;
-        *output++ = input[2 * ir_step] * s;
-        *output++ = input[3 * ir_step] * s;
-        *output++ = input[4 * ir_step] * s;
-        *output++ = input[5 * ir_step] * s;
-        *output++ = input[6 * ir_step] * s;
-        *output++ = input[7 * ir_step] * s;
-        *output++ = input[8 * ir_step] * s;
-        *output++ = input[9 * ir_step] * s;
-        *output++ = input[10 * ir_step] * s;
-        *output++ = input[11 * ir_step] * s;
-        input += 1;
+        for (int i = 0; i < 12; ++i) {
+            *output++ = *(p[i]++) * s;
+        }
     }
 }
 
 inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
                                const float16_t* NNOPS_RESTRICT input,
-                               int ir_step, int K, float scale) noexcept {
+                               int ir_step, int K, float scale, int mr = 16) noexcept {
+    // Rows past `mr` alias the last live row — the same convention the
+    // MMA kernels use — so a partial-M panel needs no padding.
+    const int last = (mr > 1) ? mr - 1 : 0;
+    const float16_t* NNOPS_RESTRICT p[16];
+    for (int i = 0; i < 16; ++i) {
+        p[i] = input + ((i < mr) ? i : last) * ir_step;
+    }
+
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 8; k += 8) {
-        float16x8_t v0  = vmulq_n_f16(vld1q_f16(input + 0 * ir_step), s);
-        float16x8_t v1  = vmulq_n_f16(vld1q_f16(input + 1 * ir_step), s);
-        float16x8_t v2  = vmulq_n_f16(vld1q_f16(input + 2 * ir_step), s);
-        float16x8_t v3  = vmulq_n_f16(vld1q_f16(input + 3 * ir_step), s);
-        float16x8_t v4  = vmulq_n_f16(vld1q_f16(input + 4 * ir_step), s);
-        float16x8_t v5  = vmulq_n_f16(vld1q_f16(input + 5 * ir_step), s);
-        float16x8_t v6  = vmulq_n_f16(vld1q_f16(input + 6 * ir_step), s);
-        float16x8_t v7  = vmulq_n_f16(vld1q_f16(input + 7 * ir_step), s);
-        float16x8_t v8  = vmulq_n_f16(vld1q_f16(input + 8 * ir_step), s);
-        float16x8_t v9  = vmulq_n_f16(vld1q_f16(input + 9 * ir_step), s);
-        float16x8_t v10 = vmulq_n_f16(vld1q_f16(input + 10 * ir_step), s);
-        float16x8_t v11 = vmulq_n_f16(vld1q_f16(input + 11 * ir_step), s);
-        float16x8_t v12 = vmulq_n_f16(vld1q_f16(input + 12 * ir_step), s);
-        float16x8_t v13 = vmulq_n_f16(vld1q_f16(input + 13 * ir_step), s);
-        float16x8_t v14 = vmulq_n_f16(vld1q_f16(input + 14 * ir_step), s);
-        float16x8_t v15 = vmulq_n_f16(vld1q_f16(input + 15 * ir_step), s);
+        float16x8_t v[16];
+        for (int i = 0; i < 16; ++i) {
+            v[i] = vmulq_n_f16(vld1q_f16(p[i]), s); p[i] += 8;
+        }
 
-        transpose_16x8_f16(v0, v1, v2, v3, v4, v5, v6, v7,
-                           v8, v9, v10, v11, v12, v13, v14, v15);
+        transpose_16x8_f16(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                           v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
 
-        vst1q_f16(output + 0 * 8,  v0);
-        vst1q_f16(output + 1 * 8,  v1);
-        vst1q_f16(output + 2 * 8,  v2);
-        vst1q_f16(output + 3 * 8,  v3);
-        vst1q_f16(output + 4 * 8,  v4);
-        vst1q_f16(output + 5 * 8,  v5);
-        vst1q_f16(output + 6 * 8,  v6);
-        vst1q_f16(output + 7 * 8,  v7);
-        vst1q_f16(output + 8 * 8,  v8);
-        vst1q_f16(output + 9 * 8,  v9);
-        vst1q_f16(output + 10 * 8, v10);
-        vst1q_f16(output + 11 * 8, v11);
-        vst1q_f16(output + 12 * 8, v12);
-        vst1q_f16(output + 13 * 8, v13);
-        vst1q_f16(output + 14 * 8, v14);
-        vst1q_f16(output + 15 * 8, v15);
+        for (int i = 0; i < 16; ++i) {
+            vst1q_f16(output + i * 8, v[i]);
+        }
 
         output += 16 * 8;
-        input  += 8;
     }
     for (; k < K; ++k) {
-        *output++ = input[0 * ir_step] * s;
-        *output++ = input[1 * ir_step] * s;
-        *output++ = input[2 * ir_step] * s;
-        *output++ = input[3 * ir_step] * s;
-        *output++ = input[4 * ir_step] * s;
-        *output++ = input[5 * ir_step] * s;
-        *output++ = input[6 * ir_step] * s;
-        *output++ = input[7 * ir_step] * s;
-        *output++ = input[8 * ir_step] * s;
-        *output++ = input[9 * ir_step] * s;
-        *output++ = input[10 * ir_step] * s;
-        *output++ = input[11 * ir_step] * s;
-        *output++ = input[12 * ir_step] * s;
-        *output++ = input[13 * ir_step] * s;
-        *output++ = input[14 * ir_step] * s;
-        *output++ = input[15 * ir_step] * s;
-        input += 1;
+        for (int i = 0; i < 16; ++i) {
+            *output++ = *(p[i]++) * s;
+        }
     }
 }
 
@@ -227,62 +203,80 @@ inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
 
 inline void pack_copy_n1_f16(float16_t* NNOPS_RESTRICT output,
                              const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale) noexcept {
+                             int ir_step, int K, float scale, int nr = 1) noexcept {
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
-        *output++ = input[0] * s;
+        *output++ = (nr > 0) ? input[0] * s : static_cast<float16_t>(0.0f);
         input += ir_step;
     }
 }
 
 inline void pack_copy_n4_f16(float16_t* NNOPS_RESTRICT output,
                              const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale) noexcept {
+                             int ir_step, int K, float scale, int nr = 4) noexcept {
+    // One k loop serves every width: a full panel takes the plain loads, a
+    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        float16x4_t v0 = vmul_n_f16(vld1_f16(input + 0 * ir_step + 0 * 4), s);
-        float16x4_t v1 = vmul_n_f16(vld1_f16(input + 1 * ir_step + 0 * 4), s);
-        float16x4_t v2 = vmul_n_f16(vld1_f16(input + 2 * ir_step + 0 * 4), s);
-        float16x4_t v3 = vmul_n_f16(vld1_f16(input + 3 * ir_step + 0 * 4), s);
+        if (nr >= 4) {
+            const float16x4_t v0 = vmul_n_f16(vld1_f16(input + 0 * ir_step), s);
+            const float16x4_t v1 = vmul_n_f16(vld1_f16(input + 1 * ir_step), s);
+            const float16x4_t v2 = vmul_n_f16(vld1_f16(input + 2 * ir_step), s);
+            const float16x4_t v3 = vmul_n_f16(vld1_f16(input + 3 * ir_step), s);
 
-        vst1_f16(output + 0 * 4, v0);
-        vst1_f16(output + 1 * 4, v1);
-        vst1_f16(output + 2 * 4, v2);
-        vst1_f16(output + 3 * 4, v3);
+            vst1_f16(output + 0 * 4, v0);
+            vst1_f16(output + 1 * 4, v1);
+            vst1_f16(output + 2 * 4, v2);
+            vst1_f16(output + 3 * 4, v3);
 
-        output += 4 * 4;
-        input  += 4 * ir_step;
+            output += 4 * 4;
+        } else {
+            for (int j = 0; j < 4; ++j) {
+                for (int i = 0; i < 4; ++i) {
+                    output[i] = (i < nr) ? input[j * ir_step + i] * s
+                                         : static_cast<float16_t>(0.0f);
+                }
+                output += 4;
+            }
+        }
+        input += 4 * ir_step;
     }
     for (; k < K; ++k) {
-        output[0] = input[0] * s;
-        output[1] = input[1] * s;
-        output[2] = input[2] * s;
-        output[3] = input[3] * s;
-        output += 4;
-        input  += ir_step;
-    }
-}
-
-inline void pack_copy_n6_f16(float16_t* NNOPS_RESTRICT output,
-                             const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale) noexcept {
-    const float16_t s = static_cast<float16_t>(scale);
-    for (int k = 0; k < K; ++k) {
-        for (int i = 0; i < 6; ++i) {
-            *output++ = input[i] * s;
+        for (int i = 0; i < 4; ++i) {
+            *output++ = (i < nr) ? input[i] * s : static_cast<float16_t>(0.0f);
         }
         input += ir_step;
     }
 }
 
-inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
+inline void pack_copy_n6_f16(float16_t* NNOPS_RESTRICT output,
                              const float16_t* NNOPS_RESTRICT input,
-                             int ir_step, int K, float scale) noexcept {
+                             int ir_step, int K, float scale, int nr = 6) noexcept {
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
-        float16x8_t v0 = vmulq_n_f16(vld1q_f16(input), s);
-        vst1q_f16(output, v0);
+        for (int i = 0; i < 6; ++i) {
+            *output++ = (i < nr) ? input[i * ir_step] * s
+                                 : static_cast<float16_t>(0.0f);
+        }
+        input += 1;
+    }
+}
+
+inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
+                             const float16_t* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 8) noexcept {
+    // One k loop serves every width: a full panel takes the plain load, a
+    // narrow one reads only its live columns and zero-fills the rest.
+    const float16_t s = static_cast<float16_t>(scale);
+    for (int k = 0; k < K; ++k) {
+        if (nr >= 8) {
+            vst1q_f16(output, vmulq_n_f16(vld1q_f16(input), s));
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                output[i] = (i < nr) ? input[i] * s : static_cast<float16_t>(0.0f);
+            }
+        }
         output += 8;
         input  += ir_step;
     }
@@ -290,13 +284,19 @@ inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
 
 inline void pack_copy_n12_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale) noexcept {
+                              int ir_step, int K, float scale, int nr = 12) noexcept {
+    // One k loop serves every width: a full panel takes the plain loads, a
+    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
-        float16x8_t v0 = vmulq_n_f16(vld1q_f16(input + 0 * 8), s);
-        float16x4_t v1 = vmul_n_f16(vld1_f16(input + 1 * 8), s);
-        vst1q_f16(output + 0 * 8, v0);
-        vst1_f16(output + 1 * 8, v1);
+        if (nr >= 12) {
+            vst1q_f16(output + 0 * 8, vmulq_n_f16(vld1q_f16(input + 0 * 8), s));
+            vst1_f16(output + 1 * 8, vmul_n_f16(vld1_f16(input + 1 * 8), s));
+        } else {
+            for (int i = 0; i < 12; ++i) {
+                output[i] = (i < nr) ? input[i] * s : static_cast<float16_t>(0.0f);
+            }
+        }
         output += 12;
         input  += ir_step;
     }
@@ -304,13 +304,19 @@ inline void pack_copy_n12_f16(float16_t* NNOPS_RESTRICT output,
 
 inline void pack_copy_n16_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
-                              int ir_step, int K, float scale) noexcept {
+                              int ir_step, int K, float scale, int nr = 16) noexcept {
+    // One k loop serves every width: a full panel takes the plain loads, a
+    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
-        float16x8_t v0 = vmulq_n_f16(vld1q_f16(input + 0 * 8), s);
-        float16x8_t v1 = vmulq_n_f16(vld1q_f16(input + 1 * 8), s);
-        vst1q_f16(output + 0 * 8, v0);
-        vst1q_f16(output + 1 * 8, v1);
+        if (nr >= 16) {
+            vst1q_f16(output + 0 * 8, vmulq_n_f16(vld1q_f16(input + 0 * 8), s));
+            vst1q_f16(output + 1 * 8, vmulq_n_f16(vld1q_f16(input + 1 * 8), s));
+        } else {
+            for (int i = 0; i < 16; ++i) {
+                output[i] = (i < nr) ? input[i] * s : static_cast<float16_t>(0.0f);
+            }
+        }
         output += 16;
         input  += ir_step;
     }

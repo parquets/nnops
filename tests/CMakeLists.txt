@@ -42,6 +42,7 @@ set(TEST_SOURCES
     test_cpu_backend.cpp
     test_cpu_features.cpp
     test_memory_pool.cpp
+    test_mma_packed.cpp
 )
 
 # Each test file links against `common/test_harness.cpp` (which supplies main)
@@ -94,7 +95,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_matmul.cpp
         bench_conv2d.cpp
         bench_attention.cpp
-        bench_pack_mma.cpp
+        bench_mma_packed.cpp
     )
 
     foreach(src ${BENCH_SOURCES})

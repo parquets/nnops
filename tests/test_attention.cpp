@@ -304,37 +304,37 @@ NNOPS_TEST(attention_tiled_explicit_matches_ref) {
 
 namespace {
 
-/// Elements the kernel writes for a packed K^T block of @p n columns, at the
-/// panel stride GEMM1 runs with for a head dim of @p D (the widest k-block it
-/// takes is min(Kc, D)).
+/// Elements the kernel writes for a packed B block of @p n columns at the
+/// panel stride the plan sizes from — min(Kc, max(D, Sk)), the longest k-run
+/// either GEMM takes. The packer emits ceil(n / nr_max) uniform panels.
 template <class T>
-int64_t pack_demand_elems(int64_t n, int64_t D)
+int64_t pack_demand_elems(int64_t n, int64_t D, int64_t Sk)
 {
     constexpr int nr_max = cpu::nr_max_flt<T>();
     constexpr int64_t kc = std::is_same_v<T, cpu::half> ? cpu::KC_F16 : cpu::KC_F32;
     constexpr int esz = static_cast<int>(sizeof(T));
+    const int64_t k_bound = std::min<int64_t>(kc, std::max(D, Sk));
     const int64_t ldd = static_cast<int64_t>(cpu::mma_pack_align(
-        static_cast<int>(nr_max * std::min<int64_t>(kc, D) * esz)) / esz);
-    const int* nr = std::is_same_v<T, cpu::half> ? cpu::NR_F16 : cpu::NR_F32;
-    return cpu::num_panels(static_cast<int>(n), nr) * ldd;
+        static_cast<int>(nr_max * k_bound * esz)) / esz);
+    const int64_t panels = (n + nr_max - 1) / nr_max;
+    return panels * ldd;
 }
 
 }  // anonymous namespace
 
 NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
-    // Both GEMM1 loops pack the *last* n-block of the K^T tile, whose own
-    // column count is `Sk mod tile` — as small as tile-1. num_panels() splits
-    // that run greedily by NR (largest panel first) and is NOT monotonic in n
-    // (NR_F32 = {12,4,1}: 3839 columns emit 324 panels, 3840 only 320), so a
-    // partial block can need more panels than the tile-sized count the scratch
-    // is sized from. Every case below has a final block one column short of a
-    // full tile — the worst remainder for the panel decomposition.
+    // Both GEMM loops pack B block by block, and the *last* n-block of a tile
+    // is narrower than a full one — as small as one column. The uniform route
+    // emits ceil(n / nr_max) panels, which is monotonic in n, so a partial
+    // block can never need more than the tile-sized count the scratch is
+    // sized from. Every case below has a final block one column short of a
+    // full tile, the narrowest partial width.
     struct Case { bool f16; int64_t Sq, D, Sk; };
     const Case cases[] = {
         {false,  8, 128, 7679},   // standard path, Sk = 10*nc1 - 1 (nc1 = 768)
         {false, 33, 128, 2047},   // flash, Sk = 2*Bc - 1
         {false, 65, 256, 1023},   // flash, D = 2*Kc
-        {true,  17, 128, 4095},   // flash, f16 (NR_F16 has a wider gap)
+        {true,  17, 128, 4095},   // flash, f16
     };
 
     for (const auto& c : cases) {
@@ -352,7 +352,7 @@ NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
         const int64_t esz = c.f16 ? 2 : 4;
 
         // One scratch slot here (B = H = 1), and pack_b is its last region, so
-        // everything past the fixed prefix is the packed-K^T capacity.
+        // everything past the fixed prefix is the packed-B capacity.
         const int64_t tile = plan.use_flash ? plan.Bc : plan.nc1;
         const int64_t prefix = plan.use_flash
             ? static_cast<int64_t>(plan.Br) * 2
@@ -362,8 +362,8 @@ NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
         const int64_t capacity = static_cast<int64_t>(plan.workspace_size) / esz - prefix;
 
         const int64_t actual = ((c.Sk - 1) % tile) + 1;
-        const int64_t demand = c.f16 ? pack_demand_elems<cpu::half>(actual, c.D)
-                                     : pack_demand_elems<float>(actual, c.D);
+        const int64_t demand = c.f16 ? pack_demand_elems<cpu::half>(actual, c.D, c.Sk)
+                                     : pack_demand_elems<float>(actual, c.D, c.Sk);
 
         NNOPS_EXPECT_TRUE(demand <= capacity);
     }

@@ -13,47 +13,26 @@ using namespace nnops::backend::cpu::aarch64;
 
 namespace nnops::backend::cpu {
 
-// ---- pack function pointer types ---------------------------------------
+// ---- pack / MMA function pointer types ----------------------------------
+//
+// Every pack kernel carries a trailing live width so one kernel serves both
+// the full panel and a partial one (last-row alias for A, zero fill for B).
 
-using PackF32Fn = void (*)(float* NNOPS_RESTRICT output,
-                           const float* NNOPS_RESTRICT input,
-                           int ir_step, int K, float scale);
+template <class T>
+using PackFn = void (*)(T* NNOPS_RESTRICT output, const T* NNOPS_RESTRICT input,
+                        int ir_step, int K, float scale, int w);
 
-using PackF16Fn = void (*)(half* NNOPS_RESTRICT output,
-                           const half* NNOPS_RESTRICT input,
-                           int ir_step, int K, float scale);
-
-// ---- MMA-pack function pointer types -----------------------------------
-
-using MmaPackF32Fn = void (*)(float* NNOPS_RESTRICT C, int ldc,
-                              const float* NNOPS_RESTRICT A,
-                              const float* NNOPS_RESTRICT B,
-                              int ldb, int K,
-                              float clamp_min, float clamp_max);
-
-using MmaPackF16Fn = void (*)(half* NNOPS_RESTRICT C, int ldc,
-                              const half* NNOPS_RESTRICT A,
-                              const half* NNOPS_RESTRICT B,
-                              int ldb, int K,
-                              float clamp_min, float clamp_max);
-
-// ---- MMA-direct function pointer types ---------------------------------
-
-using MmaDirectF32Fn = void (*)(float* NNOPS_RESTRICT C, int ldc,
-                                const float* NNOPS_RESTRICT A, int lda,
-                                const float* NNOPS_RESTRICT B, int ldb,
-                                int K, float clamp_min, float clamp_max);
-
-using MmaDirectF16Fn = void (*)(half* NNOPS_RESTRICT C, int ldc,
-                                const half* NNOPS_RESTRICT A, int lda,
-                                const half* NNOPS_RESTRICT B, int ldb,
-                                int K, float clamp_min, float clamp_max);
+/// A × packed-B (A packed) and A × packed-B (A read raw through lda).
+template <class T>
+using MmaPackFn = void (*)(int, int, int, T*, int, const T*, const T*, float, float);
+template <class T>
+using MmaDirectFn = void (*)(int, int, int, T*, int, const T*, int, const T*, float, float);
 
 // ---- pack dispatch tables (largest-first decomposition) -----------------
 
 // f32 dispatch tables
 // Row 0: MR-based (LHS packing), Row 1: NR-based (RHS packing)
-constexpr std::array<std::array<PackF32Fn, 3>, 2> pack_trans_f32_fn = {{
+constexpr std::array<std::array<PackFn<float>, 3>, 2> pack_trans_f32_fn = {{
 #ifdef NNOPS_ARCH_X86_64
     {pack_trans_n6_f32, pack_trans_n4_f32, pack_trans_n1_f32},
     {pack_trans_n16_f32, pack_trans_n8_f32, pack_trans_n1_f32},
@@ -63,7 +42,7 @@ constexpr std::array<std::array<PackF32Fn, 3>, 2> pack_trans_f32_fn = {{
 #endif
 }};
 
-constexpr std::array<std::array<PackF32Fn, 3>, 2> pack_copy_f32_fn = {{
+constexpr std::array<std::array<PackFn<float>, 3>, 2> pack_copy_f32_fn = {{
 #ifdef NNOPS_ARCH_X86_64
     {pack_copy_n6_f32, pack_copy_n4_f32, pack_copy_n1_f32},
     {pack_copy_n16_f32, pack_copy_n8_f32, pack_copy_n1_f32},
@@ -75,7 +54,7 @@ constexpr std::array<std::array<PackF32Fn, 3>, 2> pack_copy_f32_fn = {{
 
 // f16 dispatch tables
 // Row 0: MR-based (LHS packing), Row 1: NR-based (RHS packing)
-constexpr std::array<std::array<PackF16Fn, 3>, 2> pack_trans_f16_fn = {{
+constexpr std::array<std::array<PackFn<half>, 3>, 2> pack_trans_f16_fn = {{
 #ifdef NNOPS_ARCH_X86_64
     {pack_trans_n6_f16, pack_trans_n4_f16, pack_trans_n1_f16},
     {pack_trans_n16_f16, pack_trans_n8_f16, pack_trans_n1_f16},
@@ -85,7 +64,7 @@ constexpr std::array<std::array<PackF16Fn, 3>, 2> pack_trans_f16_fn = {{
 #endif
 }};
 
-constexpr std::array<std::array<PackF16Fn, 3>, 2> pack_copy_f16_fn = {{
+constexpr std::array<std::array<PackFn<half>, 3>, 2> pack_copy_f16_fn = {{
 #ifdef NNOPS_ARCH_X86_64
     {pack_copy_n6_f16, pack_copy_n4_f16, pack_copy_n1_f16},
     {pack_copy_n16_f16, pack_copy_n8_f16, pack_copy_n1_f16},
@@ -95,98 +74,39 @@ constexpr std::array<std::array<PackF16Fn, 3>, 2> pack_copy_f16_fn = {{
 #endif
 }};
 
-// ---- MMA dispatch tables -----------------------------------------------
-
-template <bool zero_mode>
-constexpr std::array<std::array<MmaPackF32Fn, 3>, 3> mma_pack_f32_fn = {{
-#ifdef NNOPS_ARCH_X86_64
-    {{mma_pack_6x16_f32<zero_mode>, mma_pack_6x8_f32<zero_mode>, mma_pack_6x1_f32<zero_mode>}},
-    {{mma_pack_4x16_f32<zero_mode>, mma_pack_4x8_f32<zero_mode>, mma_pack_4x1_f32<zero_mode>}},
-    {{mma_pack_1x16_f32<zero_mode>, mma_pack_1x8_f32<zero_mode>, mma_pack_1x1_f32<zero_mode>}},
-#elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_pack_8x12_f32<zero_mode>, mma_pack_8x4_f32<zero_mode>, mma_pack_8x1_f32<zero_mode>}},
-    {{mma_pack_4x12_f32<zero_mode>, mma_pack_4x4_f32<zero_mode>, mma_pack_4x1_f32<zero_mode>}},
-    {{mma_pack_1x12_f32<zero_mode>, mma_pack_1x4_f32<zero_mode>, mma_pack_1x1_f32<zero_mode>}},
-#endif
-}};
-
-template <bool zero_mode>
-constexpr std::array<std::array<MmaPackF16Fn, 3>, 3> mma_pack_f16_fn = {{
-#ifdef NNOPS_ARCH_X86_64
-    {{mma_pack_6x16_f16<zero_mode>, mma_pack_6x8_f16<zero_mode>, mma_pack_6x1_f16<zero_mode>}},
-    {{mma_pack_4x16_f16<zero_mode>, mma_pack_4x8_f16<zero_mode>, mma_pack_4x1_f16<zero_mode>}},
-    {{mma_pack_1x16_f16<zero_mode>, mma_pack_1x8_f16<zero_mode>, mma_pack_1x1_f16<zero_mode>}},
-#elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_pack_8x16_f16<zero_mode>, mma_pack_8x8_f16<zero_mode>, mma_pack_8x1_f16<zero_mode>}},
-    {{mma_pack_4x16_f16<zero_mode>, mma_pack_4x8_f16<zero_mode>, mma_pack_4x1_f16<zero_mode>}},
-    {{mma_pack_1x16_f16<zero_mode>, mma_pack_1x8_f16<zero_mode>, mma_pack_1x1_f16<zero_mode>}},
-#endif
-}};
-
-template <bool zero_mode>
-constexpr std::array<std::array<MmaDirectF32Fn, 3>, 3> mma_direct_f32_fn = {{
-#ifdef NNOPS_ARCH_X86_64
-    {{mma_direct_6x16_f32<zero_mode>, mma_direct_6x8_f32<zero_mode>, mma_direct_6x1_f32<zero_mode>}},
-    {{mma_direct_4x16_f32<zero_mode>, mma_direct_4x8_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
-    {{mma_direct_1x16_f32<zero_mode>, mma_direct_1x8_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
-#elif defined(NNOPS_ARCH_AARCH64)
-    // mr=8. An unrolled 8x12 would hold 24 accumulators + 8 A + 3 B = 35
-    // vectors and spill on every k, so that kernel runs un-unrolled (see its
-    // definition); 8x4 and 8x1 are inside the budget either way. Rows here must
-    // stay consistent with MR_F32.
-    {{mma_direct_8x12_f32<zero_mode>, mma_direct_8x4_f32<zero_mode>, mma_direct_8x1_f32<zero_mode>}},
-    {{mma_direct_4x12_f32<zero_mode>, mma_direct_4x4_f32<zero_mode>, mma_direct_4x1_f32<zero_mode>}},
-    {{mma_direct_1x12_f32<zero_mode>, mma_direct_1x4_f32<zero_mode>, mma_direct_1x1_f32<zero_mode>}},
-#endif
-}};
-
-template <bool zero_mode>
-constexpr std::array<std::array<MmaDirectF16Fn, 3>, 3> mma_direct_f16_fn = {{
-#ifdef NNOPS_ARCH_X86_64
-    {{mma_direct_6x16_f16<zero_mode>, mma_direct_6x8_f16<zero_mode>, mma_direct_6x1_f16<zero_mode>}},
-    {{mma_direct_4x16_f16<zero_mode>, mma_direct_4x8_f16<zero_mode>, mma_direct_4x1_f16<zero_mode>}},
-    {{mma_direct_1x16_f16<zero_mode>, mma_direct_1x8_f16<zero_mode>, mma_direct_1x1_f16<zero_mode>}},
-#elif defined(NNOPS_ARCH_AARCH64)
-    {{mma_direct_8x16_f16<zero_mode>, mma_direct_8x8_f16<zero_mode>, mma_direct_8x1_f16<zero_mode>}},
-    {{mma_direct_4x16_f16<zero_mode>, mma_direct_4x8_f16<zero_mode>, mma_direct_4x1_f16<zero_mode>}},
-    {{mma_direct_1x16_f16<zero_mode>, mma_direct_1x8_f16<zero_mode>, mma_direct_1x1_f16<zero_mode>}},
-#endif
-}};
-
 // ---- per-dtype tile traits ---------------------------------------------
 //
 // Everything below that used to be written once for float and once for half
 // differs only in the panel array and the dispatch tables, so those are named
 // once here and the code is templated on the element type.
 
+// ---- per-dtype tile traits ---------------------------------------------
+//
+// Rows of the arch MMA tables are the MR levels in MR_F32 / MR_F16 order; each
+// kernel takes the runtime panel height, so a remainder panel below its own MR
+// runs through the level above it. B is always packed, so the two families
+// differ only in whether A is.
+
 template <class T> struct TileTraits;
 
 template <> struct TileTraits<float> {
-    using PackFn      = PackF32Fn;
-    using MmaPackFn   = MmaPackF32Fn;
-    using MmaDirectFn = MmaDirectF32Fn;
+    using Pack = PackFn<float>;
     static constexpr const int* mr() { return MR_F32; }
     static constexpr const int* nr() { return NR_F32; }
-    static constexpr const std::array<std::array<PackFn, 3>, 2>& trans() { return pack_trans_f32_fn; }
-    static constexpr const std::array<std::array<PackFn, 3>, 2>& copy()  { return pack_copy_f32_fn; }
-    template <bool Z>
-    static constexpr const std::array<std::array<MmaPackFn, 3>, 3>& mma_pack() { return mma_pack_f32_fn<Z>; }
-    template <bool Z>
-    static constexpr const std::array<std::array<MmaDirectFn, 3>, 3>& mma_direct() { return mma_direct_f32_fn<Z>; }
+    static constexpr const auto& trans() { return pack_trans_f32_fn; }
+    static constexpr const auto& copy()  { return pack_copy_f32_fn; }
+    template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f32<Z>; }
+    template <bool Z> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z>; }
 };
 
 template <> struct TileTraits<half> {
-    using PackFn      = PackF16Fn;
-    using MmaPackFn   = MmaPackF16Fn;
-    using MmaDirectFn = MmaDirectF16Fn;
+    using Pack = PackFn<half>;
     static constexpr const int* mr() { return MR_F16; }
     static constexpr const int* nr() { return NR_F16; }
-    static constexpr const std::array<std::array<PackFn, 3>, 2>& trans() { return pack_trans_f16_fn; }
-    static constexpr const std::array<std::array<PackFn, 3>, 2>& copy()  { return pack_copy_f16_fn; }
-    template <bool Z>
-    static constexpr const std::array<std::array<MmaPackFn, 3>, 3>& mma_pack() { return mma_pack_f16_fn<Z>; }
-    template <bool Z>
-    static constexpr const std::array<std::array<MmaDirectFn, 3>, 3>& mma_direct() { return mma_direct_f16_fn<Z>; }
+    static constexpr const auto& trans() { return pack_trans_f16_fn; }
+    static constexpr const auto& copy()  { return pack_copy_f16_fn; }
+    template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f16<Z>; }
+    template <bool Z> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z>; }
 };
 
 /// Uniform 64-byte-aligned panel stride, in elements, for a `rows × kc` panel.
@@ -215,165 +135,166 @@ inline void panel_level(int& i, int count, const int* sizes,
 // end to end — matching the low-level pack kernels, which write their panel's
 // output contiguously.
 
-template <class T, bool IsLhs>
-void tile_pack_impl(bool trans, int count, int kc, T* dst, int ldd,
-                    const T* src, int lds, float scale) {
+template <class T>
+void tile_pack_lhs_impl(bool trans, int mc, int kc, T* dst, int ldd,
+                        const T* src, int lds, float scale) {
     using Tr = TileTraits<T>;
-    using Fn = typename Tr::PackFn;
-    // lhs packs A, so `trans` (A stored column-major) selects the transposing
-    // kernel; rhs packs B and selects it the other way round.
-    const std::array<Fn, 3>& fns = IsLhs ? (trans ? Tr::copy()[0]  : Tr::trans()[0])
-                                         : (trans ? Tr::trans()[1] : Tr::copy()[1]);
-    const int* sizes    = IsLhs ? Tr::mr() : Tr::nr();
-    const int  pack_lds = IsLhs ? (trans ? 1 : lds) : (trans ? lds : 1);
+    using Fn = typename Tr::Pack;
+    // transpose_a stores A column-major, so packing it is a plain copy; the
+    // row-major case is what needs the transposing kernel.
+    const std::array<Fn, 3>& fns = trans ? Tr::copy()[0] : Tr::trans()[0];
+    const int pack_lds = trans ? 1 : lds;
 
     int i = 0;
     auto emit = [&](int s, Fn fn) {
-        fn(dst, src, lds, kc, scale);
+        fn(dst, src, lds, kc, scale, s);
         dst += ldd;
         src += s * pack_lds;
     };
-    panel_level<0>(i, count, sizes, fns, emit);
-    panel_level<1>(i, count, sizes, fns, emit);
-    panel_level<2>(i, count, sizes, fns, emit);
+    panel_level<0>(i, mc, Tr::mr(), fns, emit);
+    panel_level<1>(i, mc, Tr::mr(), fns, emit);
+    panel_level<2>(i, mc, Tr::mr(), fns, emit);
 }
 
 void tile_pack_lhs(bool trans, int mc, int kc,
                    float* dst, int ldd, const float* src, int lds, float scale) {
-    tile_pack_impl<float, true>(trans, mc, kc, dst, ldd, src, lds, scale);
+    tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
 }
 
 void tile_pack_lhs(bool trans, int mc, int kc,
                    half* dst, int ldd, const half* src, int lds, float scale) {
-    tile_pack_impl<half, true>(trans, mc, kc, dst, ldd, src, lds, scale);
+    tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
 }
 
-void tile_pack_rhs(bool trans, int nc, int kc,
-                   float* dst, int ldd, const float* src, int lds, float scale) {
-    tile_pack_impl<float, false>(trans, nc, kc, dst, ldd, src, lds, scale);
-}
-
-void tile_pack_rhs(bool trans, int nc, int kc,
-                   half* dst, int ldd, const half* src, int lds, float scale) {
-    tile_pack_impl<half, false>(trans, nc, kc, dst, ldd, src, lds, scale);
-}
-
-// ---- mma entry points ---------------------------------------------------
+// =========================================================================
+//  Uniform-width RHS panels — the mrxncxkc kernel route
+// =========================================================================
 //
-// `maybe_packed_b`/`ldb` describe B for the pack path:
-//   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance by the
-//              aligned stride ldd_b = align_up(nr_max*Kc*elem,64)/elem)
-//   ldb >= 0 → B is raw (row stride ldb, advance nr per panel)
-// Packed A panels advance by the aligned stride ldd_a.
+// These kernels take a runtime mr/nc and read nr_max B lanes per k at every
+// column, so B does not decompose per width: it is ceil(nc/nr_max) uniform
+// panels, the last zero-filled past its live width, all at the same aligned
+// panel stride. The packer below is the same nr_max-wide kernel for every
+// panel: it takes the panel's live width and zero-pads the tail itself.
+//
+// nr_max is arch::nr_*[0] — 16 on x86_64, 12 for aarch64 f32 and 16 for
+// aarch64 f16 — and each kernel family follows its arch's MR levels.
 
-/// One level of the N decomposition of an m-panel against B. B is packed when
-/// @p ldb < 0 (panels advance by the aligned stride), else raw (panels advance
-/// by their width).
+/// Pack B into uniform nr_max-wide panels. The kernel takes each panel's live
+/// width, so the last panel needs no separate tail kernel: the transposing
+/// kernel aliases its last live row into the tail columns, the row-major copy
+/// zero-fills them. Either is fine — the MMA stores only the panel's live
+/// columns, so tail garbage never reaches C. Panels advance by @p ldd, the
+/// caller's aligned nr_max*kc slot stride — the same one the MMA route walks.
 template <class T>
-void mrkcnc_pack_impl(int Nc, int Kc, T* c, int ldc, const T* packed_a,
-                      const T* b, int ldb, float clamp_min, float clamp_max,
-                      const std::array<typename TileTraits<T>::MmaPackFn, 3>& fns) {
+void tile_pack_rhs_impl(bool trans, int nc, int kc, T* dst, int ldd,
+                        const T* src, int lds, float scale) {
     using Tr = TileTraits<T>;
-    const bool packed = (ldb < 0);
-    const int  ldd_b  = panel_stride<T>(Tr::nr()[0], Kc);
+    using Fn = typename Tr::Pack;
+    constexpr int nr_max = Tr::nr()[0];
+    const Fn fn = trans ? Tr::trans()[1][0] : Tr::copy()[1][0];
+    // transposed source: a panel is nr_max rows of K; row-major: nr_max columns.
+    const int step = trans ? lds : 1;
+
     int n = 0;
-    auto emit = [&](int s, auto fn) {
-        fn(c + n, ldc, packed_a, b, packed ? s : ldb, Kc, clamp_min, clamp_max);
-        b += packed ? ldd_b : s;
-    };
-    panel_level<0>(n, Nc, Tr::nr(), fns, emit);
-    panel_level<1>(n, Nc, Tr::nr(), fns, emit);
-    panel_level<2>(n, Nc, Tr::nr(), fns, emit);
+    for (; n + nr_max <= nc; n += nr_max) {
+        fn(dst, src, lds, kc, scale, nr_max);
+        dst += ldd;
+        src += nr_max * step;
+    }
+    if (n < nc) { fn(dst, src, lds, kc, scale, nc - n); }
 }
 
-/// Same, for the raw-A route: A is read through @p lda.
-template <class T>
-void mrkcnc_direct_impl(int Nc, int Kc, T* c, int ldc, const T* a, int lda,
-                        const T* b, int ldb, float clamp_min, float clamp_max,
-                        const std::array<typename TileTraits<T>::MmaDirectFn, 3>& fns) {
-    using Tr = TileTraits<T>;
-    const bool packed = (ldb < 0);
-    const int  ldd_b  = panel_stride<T>(Tr::nr()[0], Kc);
-    int n = 0;
-    auto emit = [&](int s, auto fn) {
-        fn(c + n, ldc, a, lda, b, packed ? s : ldb, Kc, clamp_min, clamp_max);
-        b += packed ? ldd_b : s;
-    };
-    panel_level<0>(n, Nc, Tr::nr(), fns, emit);
-    panel_level<1>(n, Nc, Tr::nr(), fns, emit);
-    panel_level<2>(n, Nc, Tr::nr(), fns, emit);
+/// Walk the MR levels of an M tile, handing each panel to `emit(height, fn)`.
+/// `m` stays in the caller, which is what advances C and A per panel.
+template <class T, class Fn, class Emit>
+inline void walk_m_panels(int& m, int mc, const std::array<Fn, 3>& fns, Emit&& emit) {
+    const int* mr = TileTraits<T>::mr();
+    panel_level<0>(m, mc, mr, fns, emit);
+    panel_level<1>(m, mc, mr, fns, emit);
+    panel_level<2>(m, mc, mr, fns, emit);
 }
 
-/// Decompose M into MR panels, each packed A panel advancing by ldd_a.
-template <class T>
-void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc, const T* packed_a,
-                        const T* b, int ldb, float clamp_min, float clamp_max,
-                        bool zero_mode) {
+/// One M panel of a tile against the packed B. The kernel itself walks the N
+/// side — its own panel loop advances B by the same aligned slot stride and
+/// handles the last, zero-padded panel (storing only that panel's live
+/// columns) — so a tile costs one call per M panel, not one per N panel.
+template <class T, bool Zero>
+void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
+                        const T* packed_a, const T* b,
+                        float clamp_min, float clamp_max) {
     using Tr = TileTraits<T>;
-    const auto& fns = zero_mode ? Tr::template mma_pack<true>()
-                                : Tr::template mma_pack<false>();
+    using Fn = MmaPackFn<T>;
+    const auto& fns = Tr::template mma_pack<Zero>();
     const int ldd_a = panel_stride<T>(Tr::mr()[0], Kc);
+
     int m = 0;
-    auto emit = [&](int, const auto& row) {
-        mrkcnc_pack_impl<T>(Nc, Kc, c + m * ldc, ldc, packed_a, b, ldb,
-                            clamp_min, clamp_max, row);
+    walk_m_panels<T>(m, Mc, fns, [&](int s, Fn fn) {
+        fn(s, Nc, Kc, c + m * ldc, ldc, packed_a, b, clamp_min, clamp_max);
         packed_a += ldd_a;
-    };
-    panel_level<0>(m, Mc, Tr::mr(), fns, emit);
-    panel_level<1>(m, Mc, Tr::mr(), fns, emit);
-    panel_level<2>(m, Mc, Tr::mr(), fns, emit);
+    });
 }
 
-/// Decompose M into MR panels, reading A raw through lda.
-template <class T>
-void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc, const T* a,
-                          int lda, const T* b, int ldb, float clamp_min,
-                          float clamp_max, bool zero_mode) {
+/// Same walk, A read raw through @p lda.
+template <class T, bool Zero>
+void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
+                          const T* a, int lda, const T* b,
+                          float clamp_min, float clamp_max) {
     using Tr = TileTraits<T>;
-    const auto& fns = zero_mode ? Tr::template mma_direct<true>()
-                                : Tr::template mma_direct<false>();
+    using Fn = MmaDirectFn<T>;
+    const auto& fns = Tr::template mma_direct<Zero>();
+
     int m = 0;
-    auto emit = [&](int, const auto& row) {
-        mrkcnc_direct_impl<T>(Nc, Kc, c + m * ldc, ldc, a + m * lda, lda, b, ldb,
-                              clamp_min, clamp_max, row);
-    };
-    panel_level<0>(m, Mc, Tr::mr(), fns, emit);
-    panel_level<1>(m, Mc, Tr::mr(), fns, emit);
-    panel_level<2>(m, Mc, Tr::mr(), fns, emit);
+    walk_m_panels<T>(m, Mc, fns, [&](int s, Fn fn) {
+        fn(s, Nc, Kc, c + m * ldc, ldc, a + m * lda, lda, b, clamp_min, clamp_max);
+    });
 }
 
-void tile_mma_pack(int Mc, int Nc, int Kc,
-                   float* c, int ldc,
-                   const float* packed_a, const float* maybe_packed_b, int ldb,
+template <class T>
+void dispatch_mma_pack(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
+                       const T* a, const T* b, float lo, float hi) {
+    if (zero_mode) { tile_mma_pack_impl<T, true>(Mc, Nc, Kc, c, ldc, a, b, lo, hi); }
+    else           { tile_mma_pack_impl<T, false>(Mc, Nc, Kc, c, ldc, a, b, lo, hi); }
+}
+
+template <class T>
+void dispatch_mma_direct(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
+                         const T* a, int lda, const T* b, float lo, float hi) {
+    if (zero_mode) { tile_mma_direct_impl<T, true>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi); }
+    else           { tile_mma_direct_impl<T, false>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi); }
+}
+
+void tile_pack_rhs(bool trans, int nc, int kc,
+                   float* dst, int ldd, const float* src, int lds, float scale) {
+    tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
+}
+
+void tile_pack_rhs(bool trans, int nc, int kc,
+                   half* dst, int ldd, const half* src, int lds, float scale) {
+    tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
+}
+
+void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc,
+                   const float* packed_a, const float* b,
                    float clamp_min, float clamp_max, bool zero_mode) {
-    tile_mma_pack_impl<float>(Mc, Nc, Kc, c, ldc, packed_a, maybe_packed_b, ldb,
-                              clamp_min, clamp_max, zero_mode);
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, clamp_min, clamp_max);
 }
 
-void tile_mma_pack(int Mc, int Nc, int Kc,
-                   half* c, int ldc,
-                   const half* packed_a, const half* maybe_packed_b, int ldb,
+void tile_mma_pack(int Mc, int Nc, int Kc, half* c, int ldc,
+                   const half* packed_a, const half* b,
                    float clamp_min, float clamp_max, bool zero_mode) {
-    tile_mma_pack_impl<half>(Mc, Nc, Kc, c, ldc, packed_a, maybe_packed_b, ldb,
-                             clamp_min, clamp_max, zero_mode);
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, clamp_min, clamp_max);
 }
 
-void tile_mma_direct(int Mc, int Nc, int Kc,
-                     float* c, int ldc,
-                     const float* a, int lda,
-                     const float* b, int ldb,
+void tile_mma_direct(int Mc, int Nc, int Kc, float* c, int ldc,
+                     const float* a, int lda, const float* b,
                      float clamp_min, float clamp_max, bool zero_mode) {
-    tile_mma_direct_impl<float>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
-                                clamp_min, clamp_max, zero_mode);
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max);
 }
 
-void tile_mma_direct(int Mc, int Nc, int Kc,
-                     half* c, int ldc,
-                     const half* a, int lda,
-                     const half* b, int ldb,
+void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
+                     const half* a, int lda, const half* b,
                      float clamp_min, float clamp_max, bool zero_mode) {
-    tile_mma_direct_impl<half>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
-                               clamp_min, clamp_max, zero_mode);
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max);
 }
 
 // =========================================================================
@@ -466,36 +387,37 @@ void xor0x80_i8(int8_t* p, int nbytes) {
     }
 }
 
-void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds) {
-    const int pack_lds = trans ? 1 : lds;
-    const auto& pack_fns = trans ? pack_copy_i8_lhs : pack_trans_i8_lhs;
-    const int kbytes = (kc + 3) & ~3;  // pack writes ceil(kc/4)*4 bytes per row
-    int m = 0;
-    for (int mi = 0; mi < 3; ++mi) {
-        const int mr = MR_I8[mi];
-        for (; m + mr <= mc; m += mr) {
-            pack_fns[static_cast<size_t>(mi)](dst, src, lds, kc, 0.0f);
-            if constexpr (INT8_USE_U8_OFFSET) {
-                xor0x80_i8(dst, mr * kbytes);
-            }
+/// One int8 pack pass over the MR (A) or NR (B) cascade. The RHS lists have a
+/// fourth level ({16,8,4,1} / {12,8,4,1}); only the LHS is XOR-biased for VNNI.
+template <bool IsLhs>
+void tile_pack_i8_impl(bool trans, int count, int kc, int8_t* dst, int ldd,
+                       const int8_t* src, int lds) {
+    constexpr int levels = IsLhs ? 3 : 4;
+    const PackI8Fn* fns = IsLhs
+        ? (trans ? pack_copy_i8_lhs : pack_trans_i8_lhs).data()
+        : (trans ? pack_trans_i8_rhs : pack_copy_i8_rhs).data();
+    const int* sizes   = IsLhs ? MR_I8 : NR_I8;
+    const int pack_lds = IsLhs ? (trans ? 1 : lds) : (trans ? lds : 1);
+    const int kbytes   = (kc + 3) & ~3;  // pack writes ceil(kc/4)*4 bytes per row
+
+    int i = 0;
+    for (int level = 0; level < levels; ++level) {
+        const int s = sizes[level];
+        for (; i + s <= count; i += s) {
+            fns[level](dst, src, lds, kc, 0.0f);
+            if constexpr (IsLhs && INT8_USE_U8_OFFSET) { xor0x80_i8(dst, s * kbytes); }
             dst += ldd;
-            src += mr * pack_lds;
+            src += s * pack_lds;
         }
     }
 }
 
+void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds) {
+    tile_pack_i8_impl<true>(trans, mc, kc, dst, ldd, src, lds);
+}
+
 void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd, const int8_t* src, int lds) {
-    const int pack_lds = trans ? lds : 1;
-    const auto& pack_fns = trans ? pack_trans_i8_rhs : pack_copy_i8_rhs;
-    int n = 0;
-    for (int ni = 0; ni < 4; ++ni) {
-        const int nr = NR_I8[ni];
-        for (; n + nr <= nc; n += nr) {
-            pack_fns[static_cast<size_t>(ni)](dst, src, lds, kc, 0.0f);
-            dst += ldd;
-            src += nr * pack_lds;
-        }
-    }
+    tile_pack_i8_impl<false>(trans, nc, kc, dst, ldd, src, lds);
 }
 
 void tile_mma_pack_i8(int mc, int nc, int kc,
@@ -618,10 +540,10 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const int  elem   = is_i8 ? 1
                      : (is_f32 ? static_cast<int>(sizeof(float)) : static_cast<int>(sizeof(half)));
 
-    // Panel count of an n-run for this dtype's NR list: three levels for fp,
-    // four for int8 ({16,8,4,1} / {12,8,4,1}).
+    // Panel count of an n-run. fp packs B into uniform nr_max-wide panels;
+    // int8 keeps its per-width cascade (four levels: {16,8,4,1} / {12,8,4,1}).
     auto panel_count = [&](int n) {
-        return is_i8 ? num_panels4(n, nr) : num_panels(n, nr);
+        return is_i8 ? num_panels4(n, nr) : (n + nr_max - 1) / nr_max;
     };
 
     // The tile. mc, nc and kc are one problem now, not three — see the constants
@@ -685,7 +607,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     } else {
         plan.num_slots = num_n_blocks;
         plan.np_slice = is_i8 ? num_panels_max4(static_cast<int>(plan.nc), nr)
-                              : num_panels_max(static_cast<int>(plan.nc), nr);
+                              : panel_count(static_cast<int>(plan.nc));
         plan.workspace_size = plan.num_slots * plan.np_slice
                             * static_cast<int64_t>(ldd_b) * elem;
     }

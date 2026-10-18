@@ -6,9 +6,9 @@
 ///   scores = Q @ K^T * scale      (transpose-B GEMM, K^T packed into pooled scratch)
 ///   scores += mask                (optional, flat [Sq, Sk] as in the reference)
 ///   attn   = softmax(scores, -1)  (simd_softmax per contiguous row)
-///   output = attn @ V             (direct GEMM, V raw K×N)
+///   output = attn @ V             (B-packed GEMM, V packed into pooled scratch)
 ///
-/// Both GEMMs reuse the tile_mma_direct / tile_pack_rhs micro-kernel dispatch
+/// Both GEMMs reuse the tile_pack_rhs / tile_mma_direct route
 /// from matmul_helper.h. Q/K/V/O head slices are M×K / N×K / K×N / M×N
 /// submatrices of the planar tensors, for both merged [B, S, H*D] and explicit
 /// [B, H, S, D] layouts (a head's D columns are contiguous within each row).

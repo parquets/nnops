@@ -159,8 +159,8 @@ void matmul_tile(const MatMulAttributes& attrs,
                  bool pack_a, const T* packed_b, T* pack_a_slice)
 {
     // The tallest A micro-panel this tile can be packed into, which is what sizes
-    // the packed-A panel stride below. Routing is irrelevant here: tile_mma_direct
-    // reads A through lda and never touches ldd_a/pack_a_slice.
+    // the packed-A panel stride below. Routing is irrelevant here: the
+    // B-packed-only MMA reads A through lda and never touches ldd_a/pack_a_slice.
     constexpr int mr_max = mr_max_flt<T>();
 
     const int ldd_a = static_cast<int>(
@@ -189,15 +189,15 @@ void matmul_tile(const MatMulAttributes& attrs,
             tile_pack_lhs(attrs.transpose_a, actual_mc, actual_kc,
                           pack_a_slice, ldd_a, a_src, lda, 1.0f);
             tile_mma_pack(actual_mc, n_count, actual_kc,
-                          c_tile, ldc,
-                          pack_a_slice, packed_b, -1,
-                          cmin, cmax, zero_mode);
+                                  c_tile, ldc,
+                                  pack_a_slice, packed_b,
+                                  cmin, cmax, zero_mode);
         } else {
             const T* a_sub = a_ptr + m * lda + k;  // A phys is M×K, row m, col k
             tile_mma_direct(actual_mc, n_count, actual_kc,
-                            c_tile, ldc,
-                            a_sub, lda, packed_b, -1,
-                            cmin, cmax, zero_mode);
+                                    c_tile, ldc,
+                                    a_sub, lda, packed_b,
+                                    cmin, cmax, zero_mode);
         }
 
         if (epilogue && last_k) {
@@ -236,8 +236,10 @@ void matmul_block_fused(const MatMulAttributes& attrs,
         const T* b_src = attrs.transpose_b
             ? b_ptr + n_start * ldb + k     // B phys is N×K, row n, col k
             : b_ptr + k * ldb + n_start;    // B phys is K×N, row k, col n
+        // Uniform nr_max-wide panels (last one zero-filled) for the mrxncxkc
+        // MMA kernels.
         tile_pack_rhs(attrs.transpose_b, n_count, actual_kc,
-                      pack_b_slice, ldd_b, b_src, ldb, 1.0f);
+                              pack_b_slice, ldd_b, b_src, ldb, 1.0f);
 
         matmul_tile<T>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,

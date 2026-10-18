@@ -10,9 +10,9 @@
 /// with M = OC, N = tiles, K = IC. U is the prepacked weight (G g Gᵀ, one 4×4
 /// kernel per position — [16, OC, IC/G], TensorLayout::PackedWinoWeight); V is
 /// the transformed input (Bᵀ d B, one 4×4 window per 2×2 output tile, fully
-/// materialised). The GEMMs go straight through tile_mma_direct with ldb >= 0
-/// (raw [K][N] RHS); it needs no alignment, so the 16 arbitrary-shape GEMMs per
-/// block are issued directly.
+/// materialised). For each transform position the V slice [K=ic][N=tiles] is
+/// packed into uniform nr_max-wide panels (tile_pack_rhs) and the GEMM
+/// runs through tile_mma_direct, the same route MatMul uses.
 ///
 /// Structure: two parallel phases per (batch, group).
 ///   Phase A — input transform, parallel over (tile row, 8-tile column group),
@@ -90,6 +90,7 @@ struct Conv2DWinogradPlan {
     int64_t halo_size = 0;   ///< ic_per_group · halo_h · halo_w
     int64_t v_size = 0;      ///< 16 · ic_per_group · num_tiles
     int64_t m_size = 0;      ///< 16 · ocn_block · tile_block
+    int64_t b_size = 0;      ///< uniform packed-B elements per slot
     size_t workspace_size = 0;
 };
 

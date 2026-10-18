@@ -22,19 +22,15 @@
 #ifdef NNOPS_ARCH_X86_64
 #include "x86_64/pack_f16.hpp"
 #include "x86_64/pack_f32.hpp"
-#include "x86_64/mma_direct_f16.hpp"
-#include "x86_64/mma_direct_f32.hpp"
-#include "x86_64/mma_pack_f16.hpp"
-#include "x86_64/mma_pack_f32.hpp"
+#include "x86_64/mma_f16.hpp"
+#include "x86_64/mma_f32.hpp"
 #include "x86_64/pack_dp4a_i8.hpp"
 #include "x86_64/mma_pack_vnni_i8.hpp"
 #elif defined(NNOPS_ARCH_AARCH64)
 #include "aarch64/pack_f16.hpp"
 #include "aarch64/pack_f32.hpp"
-#include "aarch64/mma_direct_f16.hpp"
-#include "aarch64/mma_direct_f32.hpp"
-#include "aarch64/mma_pack_f16.hpp"
-#include "aarch64/mma_pack_f32.hpp"
+#include "aarch64/mma_f16.hpp"
+#include "aarch64/mma_f32.hpp"
 #include "aarch64/pack_dp4a_i8.hpp"
 #include "aarch64/mma_pack_i8_dot.hpp"
 #endif
@@ -454,28 +450,36 @@ constexpr int num_panels_max4(int n, const int* nr) noexcept {
 // `ldd` (elements), so pack and MMA agree on panel placement for all panel
 // sizes. The caller computes ldd from the actual k-block length (actual_kc).
 //
-// MMA entry points: `tile_mma_pack` accumulates C[mr][nr] += A_packed[mr][K]
-// × B[K][nr], where `maybe_packed_b`/`ldb` describe B:
-//   ldb < 0  → B is packed ([K][nr], row stride nr, panels advance by the
-//              uniform aligned stride ldd_b = align_up(nr_max*Kc*elem,64)/elem)
-//   ldb >= 0 → B is raw (row stride ldb, advance nr per panel)
-// `tile_mma_direct` reads A raw via lda; B follows the same ldb < 0 /
-//   ldb >= 0 convention (packed vs raw) as `tile_mma_pack`.
-
-void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
+// A (the LHS of the packed-A route) still decomposes into the arch's MR
+// cascade ({6,4,1} x86_64, {8,4,1} aarch64); every panel advances by ldd.
+// B (the RHS) and the C-side MMA are uniform-width — see below.
 void tile_pack_lhs(bool trans, int mc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
-void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 void tile_pack_lhs(bool trans, int mc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
+// ---- uniform-width RHS panels — the only B/MMA route ---------------------
+//
+// The mrxncxkc MMA kernels read `nr_max` B lanes per k at every column, so B
+// has to be uniform: ceil(nc/nr_max) panels, each a full `nr_max` columns wide
+// with the columns past `nc` zero-filled, all at the same aligned panel stride.
+// The packer is one nr_max-wide copy/transpose per panel plus a zero-padded
+// tail; the tail's *source read* still stays narrow (never reads columns that
+// are not there). `nr_max` is arch::nr_*[0] — 16 on x86_64, 12 for aarch64 f32
+// and 16 for aarch64 f16.
+//
 // `zero_mode` selects the kernel variant: true overwrites C and never reads
 // it (first k-block with beta == 0 — the accumulator starts at zero), false
 // accumulates into C (C += A·B). The kernels' ZeroMode template is
 // compile-time; this runtime flag picks between the two pre-instantiated
 // dispatch tables.
-void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* maybe_packed_b, int ldb, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int ldb, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* maybe_packed_b, int ldb, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int ldb, float clamp_min, float clamp_max, bool zero_mode);
+void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
+void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
+
+// B is always packed here (no ldb parameter); panels advance by the aligned
+// nr_max*kc panel stride.
+void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
 
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);

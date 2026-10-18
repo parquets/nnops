@@ -338,7 +338,7 @@ struct SimplePool {
         std::vector<std::thread> workers;
         workers.reserve(static_cast<size_t>(nthreads_));
         for (int t = 0; t < nthreads_; ++t) {
-            workers.emplace_back([&]() {
+            workers.emplace_back([&, t]() {
                 current_thread_id_ = t;
                 for (;;) {
                     int64_t i = next.fetch_add(1, std::memory_order_relaxed);

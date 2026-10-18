@@ -1283,9 +1283,9 @@ NNOPS_TEST(matmul_f16_deep_k_accumulation) {
 
 NNOPS_TEST(matmul_f16_transpose_b_packed) {
     // f16 transpose_b through the packed path — the route that transposes B into
-    // the pooled panel scratch (pack_trans_n16/n8/n1_f16). The shapes make the N
-    // cascade hit all three panel widths (25 = 16 + 8 + 1) and K exercise an
-    // 8-block plus a scalar tail (13 = 8 + 5).
+    // the pooled panel scratch. The shape makes N hit a full 16-wide panel plus
+    // a narrow tail (25 = 16 + 9; x86 zero-pads that tail, aarch64 decomposes it
+    // into 8 + 1) and K exercise an 8-block plus a scalar tail (13 = 8 + 5).
     auto [a_f32, _]  = test::make_random_tensor({7, 13},  -1.0f, 1.0f, 901);  // [M, K]
     auto [b_f32, __] = test::make_random_tensor({25, 13}, -1.0f, 1.0f, 902);  // phys [N, K]
     auto a_f16 = test::f32_to_f16(a_f32);
@@ -1946,13 +1946,10 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
     // The N-side sibling of matmul_packed_a_stack_holds_every_tile_height. The
     // N-split packs each n-block's B into its own slice, indexed by the
     // dispatch as `blk * np_slice * ldd_b`. Only the blocks before the last are
-    // exactly nc wide — the last packs N mod nc columns — and the greedy NR
-    // decomposition is NOT monotonic in n ({12,4,1}: 3839 columns emit 324
-    // panels, 3840 only 320), so a short tile can emit MORE panels than a full
-    // one. Sizing the slice at num_panels(nc), or the whole buffer at
-    // num_panels(N) as this used to, therefore under-counts and the last pack
-    // runs past the end. The plan now sizes both from the worst-case count for
-    // a tile of nc columns.
+    // exactly nc wide — the last packs N mod nc columns. The uniform route
+    // emits ceil(n/nr_max) panels for n columns, so the widest tile (nc) is
+    // also the worst case, and np_slice must cover it. A tile below nc emits
+    // fewer panels, never more.
     //
     // These shapes resolve kc == K (256), so the kernel's per-k-block panel
     // stride equals plan.ldd_b and the demand checked below is exact, not merely
@@ -1970,16 +1967,12 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
         NNOPS_EXPECT_TRUE(!plan.pack_a);
         NNOPS_EXPECT_EQ(plan.num_slots, (N + plan.nc - 1) / plan.nc);
 
-        // Panels the pack emits for each tile width the split can hand it.
-        int worst = 0;
-        for (int w = 1; w <= static_cast<int>(plan.nc); ++w) {
-            const int c = cpu::num_panels(w, cpu::NR_F32);
-            worst = (c > worst) ? c : worst;
-        }
-        NNOPS_EXPECT_TRUE(plan.np_slice >= worst);
-        // The case only covers anything while the worst tile really is wider
-        // than the exactly-nc one; if that ever stops holding, say so.
-        NNOPS_EXPECT_TRUE(plan.np_slice > cpu::num_panels(static_cast<int>(plan.nc), cpu::NR_F32));
+        // Panels the uniform pack emits for a tile of n columns.
+        const int nr0 = cpu::NR_F32[0];
+        const auto panels_for = [nr0](int64_t n) {
+            return (n + nr0 - 1) / nr0;
+        };
+        NNOPS_EXPECT_EQ(plan.np_slice, panels_for(plan.nc));
 
         // Every block, at the offset the dispatch gives it, stays inside the
         // workspace the plan hands over.
@@ -1988,7 +1981,7 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
         for (int64_t blk = 0; blk < nb; ++blk) {
             const int64_t left = N - blk * plan.nc;
             const int64_t n_count = (left < plan.nc) ? left : plan.nc;
-            const int64_t demand = cpu::num_panels(static_cast<int>(n_count), cpu::NR_F32) * plan.ldd_b;
+            const int64_t demand = panels_for(n_count) * plan.ldd_b;
             NNOPS_EXPECT_TRUE(blk * plan.np_slice * plan.ldd_b + demand <= capacity);
         }
     }

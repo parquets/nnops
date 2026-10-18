@@ -6,16 +6,17 @@
 ///     For each oh-block in the chunk's contiguous range of the output plane:
 ///       For each ic-block:
 ///         im2col the input block into a scratch matrix [K=icnc*karea][N=ohc*OW]
+///         pack col_data into uniform nr_max-wide panels (tile_pack_rhs)
 ///         For each oc-block:
 ///           init output tile = bias (+ original output when add_to)
-///           tile += weight[ocnc, K] × col_data[K, roi_area]  (tile_mma_direct)
+///           tile += weight[ocnc, K] × packed_col (tile_mma_direct)
 ///           (after the last ic-block) apply the epilogue in-place
 ///
 /// See conv2d_im2col.h for the work split, the scratch layout, the bias /
 /// epilogue / add_to semantics and the shared plan.
 
 #include "conv2d_im2col.h"
-#include "matmul_helper.h"                 // tile_mma_direct + arch panel constants
+#include "matmul_helper.h"                 // uniform pack/MMA + arch panel constants
 #include "simd_kernel/simd_epilogue.hpp"   // epilogue_inplace
 #include "simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d / tiled_im2col_3d
 #include "common/memory_pool.hpp"          // internal scratch-memory pool
@@ -184,7 +185,11 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     // per parallel task. Output tiles are disjoint either way, so the result is
     // bit-identical.
     const int64_t col_size  = plan.col_size;
-    const int64_t orig_size = plan.orig_size;
+    const int64_t orig_size = attrs.add_to ? plan.orig_size : 0;
+    const int64_t pack_size = plan.pack_size;
+
+    constexpr int nr_max = nr_max_flt<T>();
+    constexpr int esz    = static_cast<int>(sizeof(T));
 
     const int64_t NG = N * G;
     const int64_t total = NG * oh_chunks;
@@ -194,6 +199,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
 
     T* col_base  = static_cast<T*>(workspace);
     T* orig_base = attrs.add_to ? col_base + plan.num_slots * col_size : nullptr;
+    T* pack_base = col_base + plan.num_slots * (col_size + orig_size);
 
     const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
     // Nothing to seed the accumulator with (no bias tensor, no residual to fold
@@ -211,6 +217,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
         const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
         T* col_data = col_base + slot * col_size;
         T* orig = orig_base ? orig_base + slot * orig_size : nullptr;
+        T* pack_b = pack_base + slot * pack_size;
 
         T* output_ptr = out_ptr + n * ob_step + g * og_step;
         const T* input_ptr  = in_ptr + n * ib_step + g * ig_step;
@@ -267,6 +274,15 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                 const int b_ld = plan.pointwise ? static_cast<int>(icn_step)
                                                 : static_cast<int>(roi_area);
 
+                // B = [K=icnc*karea][N=roi_area]. Pack it once per ic-block
+                // into uniform nr_max-wide panels; every oc-block below reuses
+                // it (the unified MMA route always consumes packed B).
+                const int kdim = static_cast<int>(icnc * karea);
+                const int ldd_b = static_cast<int>(
+                    mma_pack_align(nr_max * kdim * esz) / esz);
+                tile_pack_rhs(false, static_cast<int>(roi_area), kdim,
+                                      pack_b, ldd_b, b_src, b_ld, 1.0f);
+
                 for (int64_t ocn = 0; ocn < oc_per_group; ocn += ocn_block) {
                     const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
                     T* tile = tile_base + ocn * ocn_step;
@@ -288,13 +304,13 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     // An unseeded first block overwrites C outright; every
                     // later block (and every seeded one) accumulates.
                     tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area),
-                                    static_cast<int>(icnc * karea),
-                                    tile, static_cast<int>(ocn_step),
-                                    a, static_cast<int>(w_ocn_step),
-                                    b_src, b_ld,
-                                    -std::numeric_limits<float>::infinity(),
-                                    std::numeric_limits<float>::infinity(),
-                                    /*zero_mode=*/icn == 0 && !seed_needed);
+                                            kdim,
+                                            tile, static_cast<int>(ocn_step),
+                                            a, static_cast<int>(w_ocn_step),
+                                            pack_b,
+                                            -std::numeric_limits<float>::infinity(),
+                                            std::numeric_limits<float>::infinity(),
+                                            /*zero_mode=*/icn == 0 && !seed_needed);
 
                     // An identity epilogue is a whole-tile copy-back — skip it
                     // (matmul.cpp guards the same call the same way).
@@ -441,13 +457,23 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
                                     : plan.icn_block * karea * plan.oh_block * OW;
     plan.orig_size = attrs.add_to ? plan.ocn_block * plan.oh_block * OW : 0;
 
+    // Uniform packed-B scratch, sized at the widest n-block (a whole oh-block
+    // at once) and the longest k-block. The packer's stride is computed from
+    // the actual k each call, so this is a bound, not a worst case.
+    const int64_t esz      = static_cast<int64_t>(data_type_size(dt));
+    const int64_t kdim_max = plan.icn_block * karea;
+    const int64_t ldd_b_max = mma_pack_align(
+        static_cast<size_t>(nr_max * kdim_max * esz)) / esz;
+    plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max) * ldd_b_max;
+
     // Scratch slots: one per worker thread when the backend reports thread ids and
     // that is fewer than the task count (thread_id-indexed, reused across every
     // task a thread claims); else one per parallel task.
     const int64_t total = NG * plan.oh_chunks;
     plan.num_slots = (use_thread_slots && nt < total) ? nt : total;
     plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                        * static_cast<size_t>(plan.col_size + plan.orig_size)
+                        * static_cast<size_t>(plan.col_size + plan.orig_size
+                                              + plan.pack_size)
                         * data_type_size(dt);
     return plan;
 }

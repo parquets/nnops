@@ -50,38 +50,32 @@ constexpr float kPosInf =  std::numeric_limits<float>::infinity();
 // resolve identical tile sizes for either element type.
 
 template <class T>
-constexpr const int* nr_cascade() {
-    return std::is_same_v<T, half> ? NR_F16 : NR_F32;
-}
-
-template <class T>
 constexpr int64_t kc_for() {
     return std::is_same_v<T, half> ? KC_F16 : KC_F32;
 }
 
-/// Size bound for GEMM1's packed K^T scratch.
+/// Size bound for the packed-B scratch's k-run.
 ///
-/// GEMM1 reduces over the head dim D, so its k-block never exceeds
-/// `min(Kc, D)` — and D (64/128 in practice) is usually *below* Kc, where
-/// sizing the panels from Kc alone over-allocates the slot by up to 2x. The
-/// GEMM1 loops still step by Kc; this is purely the sizing bound.
+/// A GEMM with k length @p k reduces in blocks of at most `min(Kc, k)`, and
+/// D (64/128 in practice) is usually *below* Kc, where sizing the panels from
+/// Kc alone over-allocates the slot by up to 2x. The loops still step by Kc;
+/// this is purely the sizing bound — pass the longer of the two GEMMs' k.
 template <class T>
-constexpr int64_t kc_pack_bound(int64_t D) {
+constexpr int64_t kc_pack_bound(int64_t k) {
     constexpr int64_t kc = std::is_same_v<T, half> ? KC_F16 : KC_F32;
-    return D < kc ? D : kc;
+    return k < kc ? k : kc;
 }
 
-/// Panel count a packed K^T tile of *any* n <= n_max can emit.
+/// Panel count a uniform packed-B tile of any n <= n_max emits.
 ///
-/// Both GEMM1 loops pack the last n-block, whose own column count is
-/// `N mod tile` — as small as `tile - 1`. The pack's greedy NR decomposition
-/// is not monotonic in n (matmul_helper.h: with NR = {12,4,1} a 511-column
-/// pack emits 46 panels, a 512-column one only 44), so sizing the scratch from
-/// `num_panels(tile, NR)` — the exactly-divisible case — is short by a few
-/// panels and the pack writes past its slot. num_panels_max is the real bound.
+/// The uniform packer lays down ceil(n / nr_max) full-width panels, so the
+/// widest n-block in a loop is the bound — not a cascade decomposition (the
+/// greedy per-width decomposition is not monotonic in n and was short by a few
+/// panels; size from the uniform count instead).
 template <class T>
-constexpr int panels_for_pack(int n_max) {
-    return num_panels_max(n_max, nr_cascade<T>());
+constexpr int panels_for_pack(int64_t n_max) {
+    constexpr int nr_max = nr_max_flt<T>();
+    return static_cast<int>((n_max + nr_max - 1) / nr_max);
 }
 
 // ---- head-shape extraction (merged [B,S,H*D] vs explicit [B,H,S,D]) ----
@@ -161,13 +155,15 @@ void attention_impl(const AttentionAttributes& attrs,
     const int mc2 = plan.mc2;
     const int nc2 = plan.nc2;
 
-    // Uniform 64-byte-aligned panel stride at GEMM1's largest k-block, and the
-    // panel count any n-block can emit — both sizing upper bounds, see
-    // kc_pack_bound / panels_for_pack.
+    // Uniform 64-byte-aligned panel stride at the largest k-block either GEMM
+    // runs, and the panel count any n-block can emit — both sizing upper
+    // bounds, see kc_pack_bound / panels_for_pack.
     const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
+        mma_pack_align(nr_max * static_cast<int>(
+            kc_pack_bound<T>(std::max(D, Sk))) * static_cast<int>(sizeof(T)))
         / static_cast<int>(sizeof(T)));
-    const int np_full = panels_for_pack<T>(nc1);
+    const int np_full = std::max(panels_for_pack<T>(nc1),
+                                 panels_for_pack<T>(std::min<int64_t>(D, nc2)));
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
@@ -213,15 +209,15 @@ void attention_impl(const AttentionAttributes& attrs,
             for (int64_t n = 0; n < Sk; n += nc1) {
                 const int actual_nc = static_cast<int>(std::min<int64_t>(nc1, Sk - n));
                 tile_pack_rhs(true, actual_nc, actual_kc,
-                              pack_b, ldd_b,
-                              k_head + n * k_rs + k0, static_cast<int>(k_rs), scale);
+                                      pack_b, ldd_b,
+                                      k_head + n * k_rs + k0, static_cast<int>(k_rs), scale);
                 for (int64_t m = 0; m < Sq; m += mc1) {
                     const int actual_mc = static_cast<int>(std::min<int64_t>(mc1, Sq - m));
                     tile_mma_direct(actual_mc, actual_nc, actual_kc,
-                                    scores + m * Sk + n, static_cast<int>(Sk),
-                                    q_head + m * q_rs + k0, static_cast<int>(q_rs),
-                                    pack_b, -1,
-                                    kNegInf, kPosInf, k0 == 0);
+                                            scores + m * Sk + n, static_cast<int>(Sk),
+                                            q_head + m * q_rs + k0, static_cast<int>(q_rs),
+                                            pack_b,
+                                            kNegInf, kPosInf, k0 == 0);
                 }
             }
         }
@@ -244,15 +240,24 @@ void attention_impl(const AttentionAttributes& attrs,
         // ---- GEMM2: output = attn @ V (first block writes, rest accumulate) ----
         for (int64_t k0 = 0; k0 < Sk; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Sk - k0));
+            const int ldd_b = static_cast<int>(
+                mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+                / static_cast<int>(sizeof(T)));
             for (int64_t n = 0; n < D; n += nc2) {
                 const int actual_nc = static_cast<int>(std::min<int64_t>(nc2, D - n));
+                // V is the GEMM's B side: pack [actual_kc][actual_nc] of the
+                // head's V into uniform panels once per (k-block, n-block),
+                // then every m-block reuses it.
+                tile_pack_rhs(false, actual_nc, actual_kc,
+                                      pack_b, ldd_b,
+                                      v_head + k0 * v_rs + n, static_cast<int>(v_rs),
+                                      1.0f);
                 for (int64_t m = 0; m < Sq; m += mc2) {
                     const int actual_mc = static_cast<int>(std::min<int64_t>(mc2, Sq - m));
                     tile_mma_direct(actual_mc, actual_nc, actual_kc,
-                                    o_head + m * o_rs + n, static_cast<int>(o_rs),
-                                    scores + m * Sk + k0, static_cast<int>(Sk),
-                                    v_head + k0 * v_rs + n, static_cast<int>(v_rs),
-                                    kNegInf, kPosInf, k0 == 0);
+                                            o_head + m * o_rs + n, static_cast<int>(o_rs),
+                                            scores + m * Sk + k0, static_cast<int>(Sk),
+                                            pack_b, kNegInf, kPosInf, k0 == 0);
                 }
             }
         }
@@ -293,15 +298,21 @@ inline void resolve_flash_tile_sizes(int64_t Sq, int64_t Sk, int64_t D, int& Br,
 
 // Per-task scratch (elements) — one Br-row query block — mirroring the layout
 // inside attention_flash_impl:
-//   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:panels_for_pack(Bc)*ldd_b_full]
+//   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:panels*ldd_b_full]
+//
+// The packed-B slot serves GEMM1 (K = D, N <= Bc) and GEMM2 (K <= Bc, N = D),
+// so the stride is bounded by the longer k-block and the panel count by the
+// wider n-block.
 template <class T>
 inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 {
     constexpr int nr_max = nr_max_flt<T>();
     const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * static_cast<int>(sizeof(T)))
+        mma_pack_align(nr_max * static_cast<int>(
+            kc_pack_bound<T>(std::max<int64_t>(D, Bc))) * static_cast<int>(sizeof(T)))
         / static_cast<int>(sizeof(T)));
-    const int pack_elems = panels_for_pack<T>(Bc) * ldd_b_full;
+    const int np_full = std::max(panels_for_pack<T>(Bc), panels_for_pack<T>(D));
+    const int pack_elems = np_full * ldd_b_full;
     return static_cast<int64_t>(Br) * 2
          + static_cast<int64_t>(Br) * Bc
          + static_cast<int64_t>(Br) * D
@@ -315,8 +326,8 @@ inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 // output accumulator so the full Sq×Sk scores matrix is never materialized
 // (standard online-softmax / FlashAttention-1 forward pass). Query blocks are
 // folded into the parallel dimension (B × H × NQ) so long sequences still
-// saturate the thread pool even when B × H is small. Reuses tile_mma_direct /
-// tile_pack_rhs.
+// saturate the thread pool even when B × H is small. Reuses the uniform
+// packed-B route (tile_pack_rhs / tile_mma_direct).
 
 template <class T>
 void attention_flash_impl(const AttentionAttributes& attrs,
@@ -417,12 +428,12 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                     mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
                     / static_cast<int>(sizeof(T)));
                 tile_pack_rhs(true, actual_bc, actual_kc,
-                              pack_b, ldd_b,
-                              k_head + j0 * k_rs + k0, static_cast<int>(k_rs), scale);
+                                      pack_b, ldd_b,
+                                      k_head + j0 * k_rs + k0, static_cast<int>(k_rs), scale);
                 tile_mma_direct(actual_br, actual_bc, actual_kc,
-                                s, actual_bc,
-                                q_head + i0 * q_rs + k0, static_cast<int>(q_rs),
-                                pack_b, -1, kNegInf, kPosInf, k0 == 0);
+                                        s, actual_bc,
+                                        q_head + i0 * q_rs + k0, static_cast<int>(q_rs),
+                                        pack_b, kNegInf, kPosInf, k0 == 0);
             }
 
             // ---- additive mask (flat [Sq, Sk], shared across heads) ----
@@ -468,11 +479,19 @@ void attention_flash_impl(const AttentionAttributes& attrs,
             // ---- o_acc += S @ V[j0:j0+Bc] --------------------------
             for (int64_t k0 = 0; k0 < actual_bc; k0 += kc) {
                 const int actual_kc = static_cast<int>(std::min<int64_t>(kc, actual_bc - k0));
+                const int ldd_b = static_cast<int>(
+                    mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
+                    / static_cast<int>(sizeof(T)));
+                // V rows [j0+k0, +actual_kc) x D columns, packed once and
+                // reused across the Br-row query block.
+                tile_pack_rhs(false, static_cast<int>(D), actual_kc,
+                                      pack_b, ldd_b,
+                                      v_head + (j0 + k0) * v_rs, static_cast<int>(v_rs),
+                                      1.0f);
                 tile_mma_direct(actual_br, static_cast<int>(D), actual_kc,
-                                o_acc, static_cast<int>(D),
-                                s + k0, actual_bc,
-                                v_head + (j0 + k0) * v_rs, static_cast<int>(v_rs),
-                                kNegInf, kPosInf, j0 == 0 && k0 == 0);
+                                        o_acc, static_cast<int>(D),
+                                        s + k0, actual_bc,
+                                        pack_b, kNegInf, kPosInf, j0 == 0 && k0 == 0);
             }
         }
 
@@ -565,9 +584,14 @@ AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
     plan.mc1 = mc1; plan.nc1 = nc1;
     plan.mc2 = mc2; plan.nc2 = nc2;
 
+    // The packed-B slot serves GEMM1 (K = D, N <= nc1) and GEMM2 (K = Sk,
+    // N <= min(nc2, D)) in turn, so the stride is bounded by the longer k-block
+    // and the panel count by the wider n-block.
     const int ldd_b_full = static_cast<int>(
-        mma_pack_align(nr_max * static_cast<int>(kc_pack_bound<T>(D)) * esz) / esz);
-    const int np_full = panels_for_pack<T>(nc1);
+        mma_pack_align(nr_max * static_cast<int>(
+            kc_pack_bound<T>(std::max(D, Sk))) * esz) / esz);
+    const int np_full = std::max(panels_for_pack<T>(nc1),
+                                 panels_for_pack<T>(std::min<int64_t>(D, nc2)));
 
     const int64_t scores_elems = Sq * Sk;
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;

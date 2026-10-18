@@ -6,9 +6,10 @@
 /// `kernel/conv2d/nchw/implicit_gemm_conv2d.hpp` +
 /// `kernel/conv2d/im2col_2d.hpp`). The output spatial plane is split into
 /// oh-blocks; for each block the input is materialized into a per-(batch,
-/// group) im2col buffer via tiled_im2col_2d, then the output tile is
-/// accumulated with the raw (unpacked) weight through the same `tile_mma_direct`
-/// micro-kernel dispatch that MatMul uses (matmul_helper.h).
+/// group) im2col buffer via tiled_im2col_2d, then B is packed into uniform
+/// nr_max-wide panels and the output tile is accumulated with the raw
+/// (unpacked) weight through the same `tile_mma_direct` dispatch that
+/// MatMul uses (matmul_helper.h).
 ///
 /// A 1x1 kernel with unit stride and no padding needs no im2col at all — at
 /// karea == 1 the gather degenerates to a dense row copy — so that case (the
@@ -36,10 +37,13 @@
 /// ids are reported, else one slot per task, reused across the task's oh-blocks):
 ///   [col_data : icn_block*karea*oh_block*out_w]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
+///   [pack_b   : ceil(oh_block*out_w/nr_max) * ldd_b]
 ///
 /// col_data is the im2col matrix [K=icn_block*karea][N=oh_block*out_w], and is
-/// absent under `pointwise` (col_size 0) — the GEMM then reads B straight from
-/// the input. orig preserves the output tile for the exact add_to semantics.
+/// absent under `pointwise` (col_size 0) — the packer then reads B straight
+/// from the input. orig preserves the output tile for the exact add_to
+/// semantics. pack_b holds B in the uniform nr_max-wide panel layout the
+/// unified MMA kernels consume (matmul_helper.h); it is rebuilt per ic-block.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -62,6 +66,7 @@ struct Conv2DPlan {
     int64_t num_slots = 0;         ///< scratch slots (worker threads, else tasks)
     int64_t col_size  = 0;         ///< im2col scratch elements per slot (0 → pointwise)
     int64_t orig_size = 0;         ///< add_to scratch elements per slot
+    int64_t pack_size = 0;         ///< uniform packed-B elements per slot
     bool pointwise = false;        ///< k1s1p0 + dense input: the GEMM reads the input
                                    ///< tensor directly, so there is no im2col buffer
                                    ///< and icn_block spans all of ic_per_group
