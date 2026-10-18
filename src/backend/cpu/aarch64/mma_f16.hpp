@@ -890,7 +890,9 @@ inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
     const float16_t* NNOPS_RESTRICT A, int lda,
     const float16_t* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max) noexcept {
-    (void)mr;   // one row, so the row count never varies
+    (void)mr;    // one row, so the row count never varies
+    (void)lda;   // A is read consecutively along its single row
+    (void)ldc;   // one row, so the C row stride never applies
 
     float16_t* NNOPS_RESTRICT c0_ptr = C;
 
@@ -912,7 +914,6 @@ inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
             b_ptr += 16;
 
             const float16_t a = *a_ptr++;
-            a_ptr += lda - 1;
 
             c00 = vfmaq_n_f16(c00, b0, a);
             c01 = vfmaq_n_f16(c01, b1, a);
@@ -943,7 +944,6 @@ inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
                 b_ptr += 16;
 
                 const float16_t a = *a_ptr++;
-                a_ptr += lda - 1;
 
                 c00 = vfmaq_n_f16(c00, b0, a);
                 c01 = vfmaq_n_f16(c01, b1, a);
@@ -954,7 +954,6 @@ inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
                 b_ptr += 16;
 
                 const float16_t a = *a_ptr++;
-                a_ptr += lda - 1;
 
                 c00 = vfmaq_n_f16(c00, b0, a);
             }

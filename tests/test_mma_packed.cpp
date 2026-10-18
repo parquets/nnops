@@ -250,27 +250,67 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
     const float b_fill = to_float(from_float<T>(B_SENTINEL));
 
     auto fail = [&](const char* why, int r, int col) {
-        char msg[256];
+        char msg[320];
         std::snprintf(msg, sizeof(msg),
                       "%s: %s at mr=%d/%d nc=%d kc=%d ldc=%d r=%d c=%d",
                       what, why, mr, MR, nc, kc, ldc, r, col);
         throw std::runtime_error(msg);
     };
+    auto fail_value = [&](int r, int col, float got, float ref) {
+        char msg[320];
+        std::snprintf(msg, sizeof(msg),
+                      "%s: value at mr=%d/%d nc=%d kc=%d ldc=%d r=%d c=%d "
+                      "(got %.6f want %.6f)",
+                      what, mr, MR, nc, kc, ldc, r, col, got, ref);
+        throw std::runtime_error(msg);
+    };
+
+    // aarch64 fp16 kernels accumulate in f16 (x86_64 and every f32 kernel
+    // accumulate in f32). Match that in the reference: kc products of mixed
+    // sign can cancel to near zero, and an f32 reference then disagrees with
+    // the f16 kernel by far more than the relative tolerance allows.
+#if defined(NNOPS_ARCH_AARCH64)
+    constexpr bool f16_accum = std::is_same_v<T, half>;
+#else
+    constexpr bool f16_accum = false;
+#endif
 
     for (int r = 0; r < live; ++r) {
         for (int col = 0; col < nc; ++col) {
-            float acc = 0.f;
-            for (int k = 0; k < kc; ++k) {
-                acc += to_float(a_at(k, r)) *
-                       to_float(b_raw[static_cast<size_t>(k) * nc + col]);
+            float acc;
+            if constexpr (f16_accum) {
+                T h = from_float<T>(0.f);
+                for (int k = 0; k < kc; ++k) {
+                    h = from_float<T>(
+                        to_float(h) +
+                        to_float(a_at(k, r)) *
+                            to_float(b_raw[static_cast<size_t>(k) * nc + col]));
+                }
+                acc = to_float(h);
+            } else {
+                acc = 0.f;
+                for (int k = 0; k < kc; ++k) {
+                    acc += to_float(a_at(k, r)) *
+                           to_float(b_raw[static_cast<size_t>(k) * nc + col]);
+                }
             }
-            float ref = zero_mode ? acc
-                                  : to_float(c0[static_cast<size_t>(r) * ldc + col]) + acc;
+            float ref;
+            if constexpr (f16_accum) {
+                const float acc_c = zero_mode
+                    ? acc
+                    : to_float(from_float<T>(
+                          to_float(c0[static_cast<size_t>(r) * ldc + col]) + acc));
+                ref = acc_c;
+            } else {
+                ref = zero_mode
+                    ? acc
+                    : to_float(c0[static_cast<size_t>(r) * ldc + col]) + acc;
+            }
             ref = std::fmin(std::fmax(ref, clamp_min), clamp_max);
             ref = to_float(from_float<T>(ref));          // f16 storage rounding
             const float got = to_float(c[static_cast<size_t>(r) * ldc + col]);
             if (!(std::fabs(got - ref) <= tol * (1.f + std::fabs(ref)))) {
-                fail("value", r, col);
+                fail_value(r, col, got, ref);
             }
         }
         for (int col = nc; col < ldc; ++col) {           // untouched columns
@@ -308,6 +348,16 @@ void check_ab(AbKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
 
     std::vector<T> a(static_cast<size_t>(kc) * level);
     for (auto& v : a) { v = from_float<T>(rnd()); }
+    // Rows past `mr` alias row mr-1, exactly as pack_trans_* lays them down:
+    // the AB kernels read all MR lanes of A, and the extra rows must compute
+    // duplicates that the aliased C row pointers can store idempotently.
+    const int last = (mr > 1) ? mr - 1 : 0;
+    for (int k = 0; k < kc; ++k) {
+        for (int r = mr; r < level; ++r) {
+            a[static_cast<size_t>(k) * level + r] =
+                a[static_cast<size_t>(k) * level + last];
+        }
+    }
 
     std::vector<T> b_raw(static_cast<size_t>(kc) * nc);
     for (auto& v : b_raw) { v = from_float<T>(rnd()); }

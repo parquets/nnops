@@ -32,7 +32,7 @@ inline float cache_load_f32(const void* cache_ptr, int64_t offset,
     }
     case DataType::f16: {
         uint16_t bits = static_cast<const uint16_t*>(cache_ptr)[offset];
-        return half_to_float(half(bits));
+        return half_to_float(half_from_bits(bits));
     }
     case DataType::bf16: {
         uint16_t v = static_cast<const uint16_t*>(cache_ptr)[offset];
@@ -158,7 +158,7 @@ inline int64_t cache_row_offset(int64_t b, int64_t h, int64_t logical_pos,
 inline float load_f32(const void* ptr, int64_t offset, DataType dtype) {
     switch (dtype) {
     case DataType::f32: return static_cast<const float*>(ptr)[offset];
-    case DataType::f16: return half_to_float(half(static_cast<const uint16_t*>(ptr)[offset]));
+    case DataType::f16: return half_to_float(half_from_bits(static_cast<const uint16_t*>(ptr)[offset]));
     default: return 0.0f;
     }
 }

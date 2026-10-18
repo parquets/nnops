@@ -38,6 +38,16 @@ inline uint16_t half_to_bits(half h) noexcept {
     return bits;
 }
 
+/// @brief Build a half from its IEEE 754 binary16 bit pattern.
+///
+/// `half(bits)` would be a *numeric* conversion of the integer on AArch64
+/// (half is __fp16 there), so raw cache storage must be reinterpreted instead.
+inline half half_from_bits(uint16_t bits) noexcept {
+    half h;
+    __builtin_memcpy(&h, &bits, sizeof(bits));
+    return h;
+}
+
 /// @brief Convert array of fp16 to fp32 / fp32 to fp16.
 inline void convert_half_to_float(float* dst, const half* src, int n) noexcept {
     for (int i = 0; i < n; ++i) {
@@ -136,6 +146,11 @@ inline half float_to_half(float f) noexcept {
 /// @brief Reinterpret a half as its IEEE 754 binary16 bit pattern.
 inline uint16_t half_to_bits(half h) noexcept {
     return h.bits;
+}
+
+/// @brief Build a half from its IEEE 754 binary16 bit pattern.
+inline half half_from_bits(uint16_t bits) noexcept {
+    return half(bits);
 }
 
 /// @brief Convert array of fp16 to fp32 (scalar loop).
