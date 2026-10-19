@@ -1,6 +1,8 @@
 # ---- Test sources (one standalone demo executable per file) ----
 set(TEST_SOURCES
     test_tensor_view.cpp
+    test_q5_1.cpp
+    test_matmul_q5_1.cpp
     test_matmul.cpp
     test_matmul_int8.cpp
     test_conv2d.cpp

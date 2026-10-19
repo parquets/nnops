@@ -38,18 +38,27 @@ inline void report_bench(const BenchResult& r) {
 // ---- benchmark registration (mirrors the test framework) ----
 using BenchFn = std::function<void()>;
 
-inline std::vector<BenchFn>& bench_registry() {
-    static std::vector<BenchFn> reg;
+struct BenchEntry {
+    std::string name;
+    BenchFn fn;
+};
+
+inline std::vector<BenchEntry>& bench_registry() {
+    static std::vector<BenchEntry> reg;
     return reg;
 }
 
 struct BenchRegistrar {
-    explicit BenchRegistrar(BenchFn fn) { bench_registry().push_back(std::move(fn)); }
+    BenchRegistrar(std::string name, BenchFn fn) {
+        bench_registry().push_back({std::move(name), std::move(fn)});
+    }
 };
 
 }  // namespace nnops::test
 
+// The name is recorded too, so the runner can take an optional substring
+// filter: `bench_matmul q5` runs only the Q5 cases.
 #define NNOPS_BENCH(name) \
     static void _nnops_bench_##name(); \
-    static ::nnops::test::BenchRegistrar _nnops_bench_reg_##name(_nnops_bench_##name); \
+    static ::nnops::test::BenchRegistrar _nnops_bench_reg_##name(#name, _nnops_bench_##name); \
     static void _nnops_bench_##name()

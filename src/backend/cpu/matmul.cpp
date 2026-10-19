@@ -43,6 +43,15 @@ extern void matmul_int8_ref(const MatMulAttributes& attrs,
 }
 
 namespace nnops::backend::cpu {
+
+#if defined(NNOPS_ARCH_X86_64)
+/// Diagnostic cap on the fused Q5_1 small-M route: negative uses the limits
+/// declared below, 0 disables the route, a non-negative value caps M. Lets a
+/// benchmark A/B the fused and packed routes inside one process, which host
+/// drift makes otherwise unreliable.
+int q5_fused_max_m_override = -1;
+#endif
+
 namespace {
 
 // =========================================================================
@@ -76,6 +85,12 @@ inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
     return { attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
              attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1),
              attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };
+}
+
+/// Q5_1 B address for a batch element: BatchWalk yields block offsets, and the
+/// stream is addressed in 24-byte blocks.
+inline const uint8_t* q5_rhs_at(const uint8_t* base, int64_t block_off) noexcept {
+    return base + block_off * static_cast<int64_t>(q5_1_block_bytes);
 }
 
 /// Broadcast A's and B's batch dimensions (same rule as matmul_ref) and walk the
@@ -143,12 +158,8 @@ struct BatchWalk {
 // =========================================================================
 
 /// Accumulate one k-block into an m×n tile of C: C += A × packed_B. Shared by
-/// the N-split (m over full M) and M-split (n over full N) paths so both use
-/// identical pack/MMA/epilogue logic. @p packed_b holds @p n_count columns for
-/// this k-block (its panel stride is derived internally from @p actual_kc);
-/// @p m_start/@p m_count and @p n_start/@p n_count select the C tile.
-/// @p pack_a_slice is the caller's packed-A slot, untouched when @p pack_a is
-/// false (the direct route reads A through @p lda).
+/// both split directions. @p pack_a_slice is untouched when @p pack_a is false
+/// (the direct route reads A through @p lda).
 template <typename T>
 void matmul_tile(const MatMulAttributes& attrs,
                  T* c_ptr, int ldc,
@@ -207,15 +218,14 @@ void matmul_tile(const MatMulAttributes& attrs,
     }
 }
 
-/// Fused tiled kernel: B is always packed into @p pack_b_slice; A is packed into
-/// @p pack_a_slice only when @p pack_a, else read raw. Processes one
-/// (m-range × n-range) tile over all K-blocks. Shared by the N-split path (m over
-/// full M, n = one n-block) and the M-split path (m = one m-block, n over full N).
+/// Fused tiled kernel: one (m-range × n-range) tile over all K-blocks. B is
+/// always packed; A is packed only when @p pack_a, else read raw.
 template <typename T>
 void matmul_block_fused(const MatMulAttributes& attrs,
                         T* c_ptr, int ldc,
                         const T* a_ptr, int lda,
-                        const T* b_ptr, int ldb,
+                        const void* b_ptr, int ldb,
+                        bool b_q51, int64_t b_row_blocks,
                         int K, int kc, int mc,
                         int m_start, int m_count,
                         int n_start, int n_count,
@@ -232,14 +242,21 @@ void matmul_block_fused(const MatMulAttributes& attrs,
             mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
             / static_cast<int>(sizeof(T)));
 
-        // B panel: packed ([K][nr]) regardless of transpose_b.
-        const T* b_src = attrs.transpose_b
-            ? b_ptr + n_start * ldb + k     // B phys is N×K, row n, col k
-            : b_ptr + k * ldb + n_start;    // B phys is K×N, row k, col n
         // Uniform nr_max-wide panels (last one zero-filled) for the mrxncxkc
-        // MMA kernels.
-        tile_pack_rhs(attrs.transpose_b, n_count, actual_kc,
-                              pack_b_slice, ldd_b, b_src, ldb, 1.0f);
+        // MMA kernels. A Q5_1 B is decoded straight into those panels: the
+        // packer takes the logical tile origin in block units, so no element
+        // pointer arithmetic is possible (or needed) here.
+        if (b_q51) {
+            tile_pack_rhs_q5_1(attrs.transpose_b, n_start, n_count, k, actual_kc,
+                               pack_b_slice, ldd_b, b_ptr, b_row_blocks);
+        } else {
+            const T* b_t = static_cast<const T*>(b_ptr);
+            const T* b_src = attrs.transpose_b
+                ? b_t + n_start * ldb + k     // B phys is N×K, row n, col k
+                : b_t + k * ldb + n_start;    // B phys is K×N, row k, col n
+            tile_pack_rhs(attrs.transpose_b, n_count, actual_kc,
+                          pack_b_slice, ldd_b, b_src, ldb, 1.0f);
+        }
 
         matmul_tile<T>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
@@ -247,6 +264,147 @@ void matmul_block_fused(const MatMulAttributes& attrs,
     }
 }
 
+
+// =========================================================================
+//  Fused Q5_1 small-M route — decode straight into the dot product
+// =========================================================================
+
+#if defined(NNOPS_ARCH_X86_64)
+/// Largest M routed to the fused Q5_1 kernels, measured at K=N=4096: the dot
+/// kernel stays 2x..3.8x ahead to M=16 and loses at 32, where the per-panel
+/// re-decode outweighs the packed panel round trip; the outer kernel (2 rows
+/// per panel, four accumulators each) wins to M=4.
+constexpr int Q5_FUSED_MAX_M_TRANS = 16;
+constexpr int Q5_FUSED_MAX_M_COPY  = 4;
+
+/// Two Q5_1 blocks per worker task, which is also the copy kernel's minimum.
+constexpr int Q5_FUSED_NTILE = 2 * static_cast<int>(q5_1_block_elems);
+
+/// Call the kernel instantiated for exactly @p MR live rows (rows are never
+/// duplicated), recursing down to the runtime row count.
+template <bool ZERO, bool TRANS, int MR>
+inline void q5_fused_rows(int mr, int nc, int K, float* c, int ldc,
+                          const float* a, int lda, const uint8_t* B,
+                          int64_t row_blocks, int n_start,
+                          float cmin, float cmax) {
+    if (mr >= MR) {
+        if constexpr (TRANS) {
+            arch::mma_q5_f32_trans<MR, ZERO>(nc, K, c, ldc, a, lda, B, row_blocks,
+                                             n_start, cmin, cmax);
+        } else {
+            arch::mma_q5_f32_copy<MR, ZERO>(nc, K, c, ldc, a, lda, B, row_blocks,
+                                            n_start, cmin, cmax);
+        }
+    } else if constexpr (MR > 1) {
+        q5_fused_rows<ZERO, TRANS, MR - 1>(mr, nc, K, c, ldc, a, lda, B,
+                                           row_blocks, n_start, cmin, cmax);
+    }
+}
+
+/// One m-panel at a time: 8 rows for the dot kernel, 2 for the outer product.
+template <bool ZERO, bool TRANS>
+inline void q5_fused_dispatch(int M, int nc, int K, float* C, int ldc,
+                              const float* A, int lda, const uint8_t* B,
+                              int64_t row_blocks, int n_start,
+                              float cmin, float cmax) {
+    constexpr int kPanel = TRANS ? 8 : 2;
+    for (int m = 0; m < M; m += kPanel) {
+        q5_fused_rows<ZERO, TRANS, kPanel>(
+            std::min(kPanel, M - m), nc, K, C + static_cast<int64_t>(m) * ldc,
+            ldc, A + static_cast<int64_t>(m) * lda, lda, B, row_blocks,
+            n_start, cmin, cmax);
+    }
+}
+
+/// Select the kernel family for one n tile; ZERO is the beta == 0 case.
+template <bool ZERO>
+inline void q5_fused_run(bool trans, int M, int nc, int K, float* C, int ldc,
+                         const float* A, int lda, const uint8_t* B,
+                         int64_t row_blocks, int n_start,
+                         float cmin, float cmax) {
+    if (trans) {
+        q5_fused_dispatch<ZERO, true>(M, nc, K, C, ldc, A, lda, B, row_blocks,
+                                      n_start, cmin, cmax);
+    } else {
+        q5_fused_dispatch<ZERO, false>(M, nc, K, C, ldc, A, lda, B, row_blocks,
+                                       n_start, cmin, cmax);
+    }
+}
+
+/// Run the whole product through the fused Q5_1 kernels: no packed B, no
+/// workspace, no k-blocking (each call sweeps K once, so it clamps the final
+/// value). Returns false when this route does not apply.
+bool matmul_q5_fused(const MatMulAttributes& attrs,
+                     TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     int M, int N, int K)
+{
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+
+    const bool trans = attrs.transpose_b;
+    if (K <= 0 || N <= 0) {
+        return false;
+    }
+    int max_m = trans ? Q5_FUSED_MAX_M_TRANS : Q5_FUSED_MAX_M_COPY;
+    if (q5_fused_max_m_override >= 0) {
+        max_m = q5_fused_max_m_override;
+    }
+    if (M > max_m) {
+        return false;
+    }
+    const int lda = static_cast<int>(a.row_stride_elems());
+    const int ldc = static_cast<int>(output.row_stride_elems());
+    const int64_t row_blocks = b.row_stride_elems();
+
+    const float* a_base = a.ptr<float>();
+    const uint8_t* b_base = static_cast<const uint8_t*>(b.ptr<void>());
+    float* c_base = output.ptr<float>();
+
+    const auto [cmin, cmax] = kblock_clamp(attrs, /*last_k=*/true);
+    const bool epilogue = has_inplace_epilogue(attrs);
+    const bool scale_c = attrs.beta != 0.0f && attrs.beta != 1.0f;
+
+    const BatchWalk batch(a, b);
+    const int nt = Q5_FUSED_NTILE;
+    const int64_t n_tiles = split_block_count(N, nt);
+
+    // One flat task list over (batch, n tile) — batch elements are independent
+    // and need no per-element fork/join.
+    ctx.cpu.run(0, batch.total * n_tiles, [&](int64_t task) {
+        const int64_t bi = task / n_tiles;
+        const int64_t t = task % n_tiles;
+        const int n_start = static_cast<int>(t) * nt;
+        const int nc = std::min(nt, static_cast<int>(N) - n_start);
+
+        int64_t a_off, b_off, c_off;
+        batch.offsets(bi, output, a_off, b_off, c_off);
+        const float* a_p = a_base + a_off;
+        const uint8_t* b_p = q5_rhs_at(b_base, b_off);
+        float* c_p = c_base + c_off + n_start;
+
+        // beta ∉ {0, 1} scales the tile in place; beta == 0 skips the C load.
+        if (scale_c) {
+            tile_scale(c_p, ldc, attrs.beta, M, nc);
+        }
+
+        if (attrs.beta == 0.0f) {
+            q5_fused_run<true>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
+                               row_blocks, n_start, cmin, cmax);
+        } else {
+            q5_fused_run<false>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
+                                row_blocks, n_start, cmin, cmax);
+        }
+
+        if (epilogue) {
+            epilogue_inplace(M, nc, c_p, ldc,
+                             static_cast<const float*>(nullptr), attrs.epilogue);
+        }
+    });
+    return true;
+}
+#endif  // NNOPS_ARCH_X86_64
 
 // =========================================================================
 //  Batched dispatch — pack + block-granularity parallelism
@@ -264,11 +422,15 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
 
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 
+    // A Q5_1 B has no dense element view: no reference fast path, no raw
+    // element arithmetic.
+    const bool b_q51 = (b.data_type() == DataType::q5_1);
+
     // Fast path (f32 only): tiny GEMMs (M*N*K < 1024) skip the tiled/packed
     // machinery and go straight to the reference. f16 has no reference kernel,
     // so it always uses the tiled path below.
     if constexpr (std::is_same_v<T, float>) {
-        if (gemm_is_small(M, N, K)) {
+        if (gemm_is_small(M, N, K) && !b_q51) {
             reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
             return;
         }
@@ -276,15 +438,19 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
 
     const int ldc = static_cast<int>(output.row_stride_elems());
     const int lda = static_cast<int>(a.row_stride_elems());
+    // For Q5_1 this is the row pitch in blocks, never an element stride.
     const int ldb = static_cast<int>(b.row_stride_elems());
 
     T* c_base = output.ptr<T>();
     const T* a_base = a.ptr<T>();
-    const T* b_base = b.ptr<T>();
+    const void* b_base = b.ptr<void>();
+    const T* b_base_t = static_cast<const T*>(b_base);
+    const int64_t b_row_blocks = b_q51 ? static_cast<int64_t>(ldb) : 0;
 
     // A is packed only for transpose_a (correctness) or a wide row stride —
     // decided once in get_matmul_plan, not re-derived here.
     const bool pack_a = plan.pack_a;
+
     if (workspace == nullptr) {
         reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
         return;
@@ -309,33 +475,28 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
     const int Ni = static_cast<int>(N);
     const int Ki = static_cast<int>(K);
 
+    // Split on the larger dimension (as MLAS does): a block owns an n-block
+    // (N-split) or an m-block (M-split), each an (m-range × n-range) tile over
+    // packed B. One scratch slot per worker thread when there are fewer threads
+    // than blocks, else one per block (see MatMulPlan::num_slots).
+    const bool split_n = plan.split_n;
+    const int64_t num_blocks = split_n ? split_block_count(Ni, nc)
+                                       : split_block_count(Mi, mc);
+    const int np_full_b = static_cast<int>(plan.np_slice);
+    const bool per_thread = plan.num_slots < num_blocks;
+
     for (int64_t bi = 0; bi < batch.total; ++bi) {
         int64_t a_offset, b_offset, c_offset;
         batch.offsets(bi, output, a_offset, b_offset, c_offset);
 
         T* c_p = c_base + c_offset;
         const T* a_p = a_base + a_offset;
-        const T* b_p = b_base + b_offset;
-
-        // One block either owns an n-block (N-split) or an m-block (M-split); each
-        // reduces to an (m-range × n-range) tile over packed B.
-        const bool split_n = plan.split_n;
-        const int64_t num_blocks = split_n
-            ? (Ni + nc - 1) / nc
-            : split_block_count(Mi, mc);
-        // Panels per packed-B slice, from the plan — it owns both the slice
-        // width and the workspace behind it, so the two cannot drift apart.
-        // (N-split: the worst-case count for a tile of nc columns, see
-        // num_panels_max; M-split: one full-N slice, packed as a whole.)
-        const int np_full_b = static_cast<int>(plan.np_slice);
-
-        // Scratch slots: the plan allocates one packed-B slice per worker thread
-        // when the backend reports ids and that is fewer than the block count
-        // (M-split only — on the N-split every block gets its own slice, so
-        // num_slots is the block count), else one per block. A thread packs one
-        // slice at a time and blocks are independent, so reusing a slot across
-        // every block a thread claims is safe and the result is unchanged.
-        const bool per_thread = plan.num_slots < num_blocks;
+        // Batch offsets use the tensor's stride unit: elements for dense types,
+        // 24-byte blocks for Q5_1.
+        const void* b_p = b_q51
+            ? static_cast<const void*>(
+                  q5_rhs_at(static_cast<const uint8_t*>(b_base), b_offset))
+            : static_cast<const void*>(b_base_t + b_offset);
 
         ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
             int m_start, m_count, n_start, n_count;
@@ -355,11 +516,8 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
                 : blk;
             T* pack_b_slice = static_cast<T*>(workspace) + slot * np_full_b * ldd_b_full;
 
-            // The A slot has its own predicate, taken from plan.num_slots_a
-            // rather than from the B one above: the two agree on this path, but
-            // the int8 M-split hoists its B pack (num_slots == 1) while every
-            // m-block still packs its own A, and reusing the B predicate there
-            // would put every A tile in slot 0.
+            // A's slot predicate is separate: the int8 M-split hoists its B
+            // pack (num_slots == 1) but every m-block still packs its own A.
             T* pack_a_slice = nullptr;
             if (pack_a) {
                 const int64_t aslot = (plan.num_slots_a < num_blocks)
@@ -371,6 +529,7 @@ void matmul_dispatch_2d(const MatMulAttributes& attrs,
             }
 
             matmul_block_fused<T>(attrs, c_p, ldc, a_p, lda, b_p, ldb,
+                                  b_q51, b_row_blocks,
                                   Ki, kc, mc, m_start, m_count, n_start, n_count,
                                   pack_a, pack_b_slice, pack_a_slice);
         });
@@ -391,21 +550,14 @@ inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
-/// Raw int8 reductions needed by the epilogue:
-///   r_a[m] = Σ_k A[m,k] (or A[k,m] if transpose_a)
-///   r_b[n] = Σ_k B[k,n] (or B[n,k] if transpose_b)
-///
-/// Split into contiguous slabs of the output index so the whole thing runs on
-/// the pool; slabs are disjoint, so no atomics or per-thread partials are
-/// needed. int32 accumulates of int8 products cannot overflow for any K this
-/// kernel accepts, and integer addition is associative, so the result stays
-/// bit-identical to the reference either way round.
+/// Raw int8 reductions for the epilogue: r_a[m] = Σ_k A[m,k] (A[k,m] when
+/// transposed), r_b[n] = Σ_k B[k,n] (mirror image). Slabs of the output index
+/// are disjoint, so the pool needs no atomics, and int32 accumulation stays
+/// bit-identical to the reference.
 
-/// r[i] = Σ_j p[j*ld + i]. The output index is the contiguous one, so the sum
-/// sweeps the outer axis and accumulates across a slab of outputs — the
-/// transposed physical layout's axis order, which is why it beats the naive
-/// per-output form (that one strides by the row pitch, a fresh cache line per
-/// element).
+/// r[i] = Σ_j p[j*ld + i]. The output index is contiguous, so the sum sweeps
+/// the outer axis; the naive per-output form would stride by the row pitch and
+/// touch a fresh cache line per element.
 void reduce_cols(const int8_t* p, int64_t ld, int64_t n_out, int64_t n_in,
                  int32_t* r, const ComputeContext& ctx) {
     const int64_t tasks = std::min<int64_t>(n_out,
@@ -520,11 +672,10 @@ void matmul_block_int8(const MatMulAttributes& attrs,
     }
 }
 
-/// Plan-driven int8 dispatch: per-token A × per-channel W, raw int32 accumulate,
-/// then a single epilogue pass that applies zero-point compensation (and, for an
-/// s8 output, requantization). Packed B lives in the plan's workspace; for an s8
-/// output the int32 accumulator sits after it (sized by matmul_cpu — it is a
-/// property of the output, not of the packed-B layout).
+/// Plan-driven int8 dispatch: per-token A × per-channel W, raw int32
+/// accumulate, then one epilogue pass (zero-point compensation, plus
+/// requantization for an s8 output, whose accumulator sits after the packed-B
+/// region — it is a property of the output, not of the layout).
 void matmul_dispatch_int8(const MatMulAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
@@ -554,10 +705,9 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
     const int mc = static_cast<int>(plan.mc);
     const int nc = static_cast<int>(plan.nc);
 
-    // Workspace: packed-B panels at the base, then the packed-A region, then the
-    // s8 accumulator. Panels per packed-B slice, from the plan (see
-    // MatMulPlan::np_slice). Only the N-split below indexes by it — the M-split
-    // packs the whole full-N slice at the base, one k-block at a time.
+    // Workspace: packed-B panels, then packed A, then the s8 accumulator. Only
+    // the N-split indexes B by np_slice; the M-split packs the whole full-N
+    // slice at the base, one k-block at a time.
     const int np_full = static_cast<int>(plan.np_slice);
     int8_t* pack_b_base = static_cast<int8_t*>(workspace);
     // int8 always packs A, so the region is always present here.
@@ -594,9 +744,8 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
         const int8_t* a_p = a_base + a_offset;
         const int8_t* b_p = b_base + b_offset;
 
-        // int32 accumulator for this batch element. The MMA micro-kernels
-        // accumulate (C += A·B), and alpha/beta are ignored on the integer
-        // path (C = A·B, overwrite semantics), so zero the tile first.
+        // Zero the int32 accumulator: the MMA accumulates, and the integer path
+        // has overwrite semantics (alpha/beta ignored).
         int32_t* c_p;
         if (out_s8) {
             c_p = accum;  // reused per batch element
@@ -617,11 +766,9 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
             auto run_block = [&](int64_t blk) {
                 const int n = static_cast<int>(blk) * nc;
                 const int actual_nc = std::min(nc, Ni - n);
-                // Slices are one worst-case tile wide (np_full panels, see
-                // num_panels_max4) at the plan's sizing stride (full Kc, or K
-                // when K < Kc), which is >= the per-k-block stride the block
-                // below packs at — that is what makes the slice an upper bound
-                // on the panels actually written, short last block included.
+                // A slice is one worst-case tile wide (np_full panels) at the
+                // plan's sizing stride, which is >= every per-k-block stride
+                // packed into it below.
                 int8_t* pack_b_slice = pack_b_base + blk * np_full * plan.ldd_b;
                 const int64_t a_slot = (plan.num_slots_a < num_blocks)
                     ? static_cast<int64_t>(ctx.cpu.current_thread_id())
@@ -634,9 +781,8 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
 
             ctx.cpu.run(0, num_blocks, run_block);
         } else {
-            // M-split: pack B once per k-block (full N), then parallelize the M
-            // rows into equal contiguous slabs. Mirrors MLAS's "M >= N →
-            // partition M" rule; the block count is ceil(M/mc).
+            // M-split: pack B once per k-block (full N), then split the M rows
+            // into equal contiguous slabs.
             const int64_t num_m_blocks = split_block_count(Mi, mc);
 
             for (int k = 0; k < Ki; k += kc) {
@@ -652,9 +798,8 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
                 auto run_m = [&](int64_t blk) {
                     const int m_start = static_cast<int>(blk * Mi / num_m_blocks);
                     const int m_end   = static_cast<int>((blk + 1) * Mi / num_m_blocks);
-                    // B is one shared slice here (the pack was hoisted above),
-                    // but every m-block packs its own A — hence num_slots_a, not
-                    // num_slots, decides the slot.
+                    // B is shared here; every m-block packs its own A, so
+                    // num_slots_a (not num_slots) decides the slot.
                     const int64_t a_slot = (plan.num_slots_a < num_m_blocks)
                         ? static_cast<int64_t>(ctx.cpu.current_thread_id())
                         : blk;
@@ -668,11 +813,9 @@ void matmul_dispatch_int8(const MatMulAttributes& attrs,
             }
         }
 
-        // Epilogue: zero-point compensation (+ requantization for s8). Each
-        // output row depends only on its own C row, r_a[m] and the (read-only)
-        // r_b, so rows are independent and can be split into slabs across the
-        // pool — no reduction, no atomics. The per-row terms (zp_a, s_a) are
-        // hoisted to the slab's row loop exactly as before.
+        // Epilogue: zero-point compensation (+ requantization for s8). Rows are
+        // independent (own C row, r_a[m], read-only r_b), so they split into
+        // slabs without reductions or atomics.
         const int64_t ep_rows = std::max<int64_t>(ctx.cpu.thread_count(), 1);
         const int64_t ep_tasks = std::min<int64_t>(M, ep_rows);
         int8_t* out_p = out_s8 ? output.ptr<int8_t>() + c_offset : nullptr;
@@ -734,6 +877,20 @@ void matmul_cpu(const MatMulAttributes& attrs,
     default: break;
     }
 
+#if defined(NNOPS_ARCH_X86_64)
+    // Small-M Q5_1: decode straight into the reduction, before the plan and the
+    // pooled scratch so the route pays for neither. Only a transposed A is out
+    // of reach (the kernels index A[m][k] through any row stride).
+    if (dt_a == DataType::f32 && dt_b == DataType::q5_1 && !attrs_n.transpose_a) {
+        const auto [M, N, K] = matmul_dims(attrs_n, a, b);
+        if (matmul_q5_fused(attrs_n, output, inputs, ctx,
+                            static_cast<int>(M), static_cast<int>(N),
+                            static_cast<int>(K))) {
+            return;
+        }
+    }
+#endif
+
     // Worker ids available → the packed-B scratch is one slot per worker thread
     // instead of one per m-block (see MatMulPlan::num_slots).
     auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count(),
@@ -764,10 +921,11 @@ void matmul_cpu(const MatMulAttributes& attrs,
         return;
     }
 
-    // Past the int8 branch: only f32 and f16 have a fused kernel, the rest use
-    // the reference.
-    const bool supported = (dt_a == DataType::f32 && dt_b == DataType::f32) ||
-                           (dt_a == DataType::f16 && dt_b == DataType::f16);
+    // Past the int8 branch: only f32/f16 have a fused kernel, plus a Q5_1 B
+    // (its blocks decode to A's type in the RHS pack).
+    const bool b_q51 = (dt_b == DataType::q5_1);
+    const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
+    const bool supported = float_a && (dt_b == dt_a || b_q51);
     if (!supported) {
         reference::matmul_ref(attrs_n, output, inputs, ctx, nullptr);
         return;

@@ -3,10 +3,19 @@
 
 #include "bench_harness.hpp"
 
-int main() {
+#include <cstring>
+
+int main(int argc, char** argv) {
+    // Optional substring filter on the benchmark name; no argument runs all.
+    const std::string filter = (argc > 1) ? argv[1] : "";
+
     std::cout << "=== nnops benchmarks ===" << std::endl;
-    for (auto& fn : nnops::test::bench_registry()) {
-        fn();
+    for (auto& e : nnops::test::bench_registry()) {
+        if (!filter.empty() && e.name.find(filter) == std::string::npos) {
+            continue;
+        }
+        std::cout << "--- " << e.name << " ---" << std::endl;
+        e.fn();
     }
     return 0;
 }

@@ -3,6 +3,7 @@
 #include <array>
 
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/q5_1.hpp"
 #include "nnops/detail/simd.hpp"
 
 #ifdef NNOPS_ARCH_X86_64
@@ -273,6 +274,79 @@ void tile_pack_rhs(bool trans, int nc, int kc,
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
 
+// ---- Q5_1 RHS -----------------------------------------------------------
+//
+// The fused unpack/dequantize panel pack lives in the arch header; this is
+// only the type-erased entry point MatMul calls. The panel layout it writes is
+// identical to tile_pack_rhs's, so the MMA route needs no Q5_1 knowledge.
+
+#ifdef NNOPS_ARCH_X86_64
+
+void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks) {
+    arch::pack_q5_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                               src_row_blocks);
+}
+
+void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks) {
+    arch::pack_q5_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                              src_row_blocks);
+}
+
+#else
+
+/// Portable fallback for arches without a vectorized Q5_1 kernel: same uniform
+/// panel layout, decoded one value at a time through the scalar reference in
+/// <nnops/detail/q5_1.hpp>. Keeps MatMul correct everywhere; x86_64 uses the
+/// SIMD pack in x86_64/pack_q5_1.hpp.
+template <class T>
+void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int kc,
+                               T* dst, int ldd, const void* src, int64_t row_blocks) {
+    constexpr int NR = 16;
+    const uint8_t* base = static_cast<const uint8_t*>(src);
+    const int64_t row_bytes = row_blocks * static_cast<int64_t>(q5_1_block_bytes);
+
+    auto store = [](T* p, float v) {
+        if constexpr (std::is_same_v<T, float>) { *p = v; }
+        else { *p = float_to_half(v); }
+    };
+
+    int n = 0;
+    while (n < nc) {
+        const int nr = std::min(NR, nc - n);
+        for (int k = 0; k < kc; ++k) {
+            T* o = dst + static_cast<int64_t>(k) * NR;
+            for (int j = 0; j < nr; ++j) {
+                const int row = trans ? (n_start + n + j) : (k_start + k);
+                const int col = trans ? (k_start + k)     : (n_start + n + j);
+                float vals[q5_1_block_elems];
+                q5_1_unpack_block(base + static_cast<int64_t>(row) * row_bytes
+                                       + static_cast<int64_t>(col >> 5) * q5_1_block_bytes,
+                                  vals);
+                store(&o[j], vals[col & 31]);
+            }
+            for (int j = nr; j < NR; ++j) { o[j] = T{}; }
+        }
+        dst += ldd;
+        n += nr;
+    }
+}
+
+void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks) {
+    tile_pack_rhs_q5_1_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
+                                     src, src_row_blocks);
+}
+
+void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks) {
+    tile_pack_rhs_q5_1_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
+                                    src, src_row_blocks);
+}
+
+#endif
+
 void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc,
                    const float* packed_a, const float* b,
                    float clamp_min, float clamp_max, bool zero_mode) {
@@ -497,7 +571,13 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
-    if (dt_a != b_desc.dtype) {
+
+    // A Q5_1 B is self-describing (its per-block d/m live in the data), so the
+    // only compatibility requirement is that A has a float kernel to convert
+    // the decoded values into: f32 or f16.
+    const bool q5_1_rhs = (dt_b == DataType::q5_1) &&
+                          (dt_a == DataType::f32 || dt_a == DataType::f16);
+    if (dt_a != dt_b && !q5_1_rhs) {
         return plan;
     }
 

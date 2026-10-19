@@ -42,7 +42,8 @@ struct TensorDesc {
     TensorLayout layout = TensorLayout::NCHW;
 
     /// Actual row stride in elements (source view pitch / elem_size).
-    /// 0 = unknown → consumers must treat the tensor as compact (last_dim elems/row).
+    /// For block-packed types (q5_1) the unit is a 24-byte block, not an
+    /// element. 0 = unknown → consumers must treat the tensor as compact.
     int64_t row_stride_elems = 0;
 
     /// Total number of logical elements.
@@ -66,23 +67,31 @@ struct TensorDesc {
         return n;
     }
 
-    /// Total storage size in bytes (numel × elem_size, with channel rounding).
+    /// Total storage size in bytes (logical elements, with channel rounding).
     /// Does NOT include per-row pitch padding — call storage_bytes() for that.
+    /// Block-packed types (q5_1) round the innermost dimension up to whole blocks.
     size_t nbytes() const noexcept {
+        if (data_type_size(dtype) == 0) {
+            if (rank <= 0) {
+                return data_type_row_bytes(dtype, 1);
+            }
+            const int64_t cols = dims[static_cast<size_t>(rank - 1)];
+            const int64_t rows = (cols > 0) ? numel() / cols : 0;
+            return static_cast<size_t>(rows) * data_type_row_bytes(dtype, cols);
+        }
         return static_cast<size_t>(numel()) * data_type_size(dtype);
     }
 
     /// Row pitch (byte stride between consecutive rows).
-    /// For rank < 2, returns elem_size.
-    /// For packed layouts, pitch = align_up(W × pack × elem_size, alignment).
+    /// For rank < 2, returns the storage unit (element or block size).
+    /// For packed layouts, pitch = align_up(W × pack × unit, alignment).
     int64_t row_pitch(int64_t alignment = 32) const noexcept {
         if (rank < 2) {
-            return static_cast<int64_t>(data_type_size(dtype));
+            return static_cast<int64_t>(data_type_stride_unit(dtype));
         }
         int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
         int64_t W = dims[static_cast<size_t>(rank - 1)];
-        int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
-        int64_t row_bytes = W * pack * elem_size;
+        int64_t row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W)) * pack;
         return ((row_bytes + alignment - 1) / alignment) * alignment;
     }
 
@@ -93,8 +102,7 @@ struct TensorDesc {
         }
         int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
         int64_t W = dims[static_cast<size_t>(rank - 1)];
-        int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
-        int64_t row_bytes = W * pack * elem_size;
+        int64_t row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W)) * pack;
         int64_t aligned_row = ((row_bytes + alignment - 1) / alignment) * alignment;
         int64_t rows = dims[0];
         if (rank >= 2) {
@@ -127,12 +135,13 @@ public:
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
         if (rank_ >= 2) {
-            // pitch = innermost dim * elem_size (bytes between consecutive rows)
-            pitch_ = shape_[static_cast<size_t>(rank_ - 1)]
-                   * static_cast<int64_t>(data_type_size(dtype));
+            // pitch = bytes of the innermost dimension (whole blocks for
+            // block-packed types such as q5_1)
+            pitch_ = static_cast<int64_t>(
+                data_type_row_bytes(dtype, shape_[static_cast<size_t>(rank_ - 1)]));
         } else if (rank_ == 1) {
-            // 1D tensor: pitch = elem_size (single-element rows)
-            pitch_ = static_cast<int64_t>(data_type_size(dtype));
+            // 1D tensor: pitch = storage unit of one value
+            pitch_ = static_cast<int64_t>(data_type_stride_unit(dtype));
         } else {
             pitch_ = 0;
         }
@@ -153,10 +162,9 @@ public:
         // Validate pitch for packed layouts: must hold at least
         // last_dim * pack_size elements per row.
         const int64_t pack = layout_channel_pack(layout);
-        if (pack > 1 && rank_ >= 2) {
-            const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
-            const int64_t min_pitch = shape_[static_cast<size_t>(rank_ - 1)]
-                                    * pack * elem_size;
+        if (rank_ >= 2) {
+            const int64_t min_pitch = static_cast<int64_t>(
+                data_type_row_bytes(dtype, shape_[static_cast<size_t>(rank_ - 1)])) * pack;
             NNOPS_ASSERT(pitch_ >= min_pitch);
         }
     }
@@ -247,7 +255,7 @@ public:
     /// For packed layouts accounts for channel block rounding and row alignment.
     size_t storage_bytes() const noexcept {
         if (rank_ < 2) {
-            return static_cast<size_t>(numel()) * data_type_size(dtype_);
+            return data_type_row_bytes(dtype_, numel());
         }
         return static_cast<size_t>(total_rows()) * static_cast<size_t>(pitch_);
     }
@@ -263,7 +271,8 @@ public:
         d.dtype = dtype_;
         d.layout = layout_;
         if (rank_ >= 2) {
-            d.row_stride_elems = pitch_ / static_cast<int64_t>(data_type_size(dtype_));
+            const int64_t unit = static_cast<int64_t>(data_type_stride_unit(dtype_));
+            d.row_stride_elems = (unit > 0) ? pitch_ / unit : 0;
         }
         return d;
     }
@@ -284,8 +293,9 @@ public:
             return channel_pack_size();
         }
         // Second-innermost: stride comes from pitch (may be > shape[rank-1] if padded)
-        const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype_));
-        int64_t s = pitch_ / elem_size;
+        const int64_t unit = static_cast<int64_t>(data_type_stride_unit(dtype_));
+        if (unit <= 0) { return 0; }  // no element/block storage unit (s4/u4)
+        int64_t s = pitch_ / unit;
         if (dim == rank_ - 2) { return s; }
         // Outer dimensions: accumulate via shape[i+1] * stride(i+1).
         // For channel-packed layouts, the physical size of the C dimension
@@ -304,7 +314,8 @@ public:
     /// Equivalent to stride_elems(rank() - 2) for rank >= 2, or 1 for rank < 2.
     int64_t row_stride_elems() const noexcept {
         if (rank_ < 2) { return 1; }
-        return pitch_ / static_cast<int64_t>(data_type_size(dtype_));
+        const int64_t unit = static_cast<int64_t>(data_type_stride_unit(dtype_));
+        return (unit > 0) ? pitch_ / unit : 0;
     }
 
     // ---- Layout-aware accessors ----

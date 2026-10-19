@@ -22,8 +22,10 @@
 #ifdef NNOPS_ARCH_X86_64
 #include "x86_64/pack_f16.hpp"
 #include "x86_64/pack_f32.hpp"
+#include "x86_64/pack_q5_1.hpp"
 #include "x86_64/mma_f16.hpp"
 #include "x86_64/mma_f32.hpp"
+#include "x86_64/mma_q5_q.hpp"
 #include "x86_64/pack_dp4a_i8.hpp"
 #include "x86_64/mma_pack_vnni_i8.hpp"
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -57,6 +59,13 @@ constexpr int MR_MAX_F32 = arch::mr_f32[0];
 constexpr int NR_MAX_F32 = arch::nr_f32[0];
 constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
+
+#ifdef NNOPS_ARCH_X86_64
+// The Q5_1 RHS kernel writes the same uniform panels as the float packers, so
+// its hard-coded width must track both NR tables (16 for f32 and f16 here).
+static_assert(arch::q5_1_nr_max == NR_MAX_F32 && arch::q5_1_nr_max == NR_MAX_F16,
+              "Q5_1 RHS panel width must match the float RHS panel width");
+#endif
 
 // int8 (s8×s8) panel sizes. The NR list has four entries (extra nr=4 level),
 // so int8 pack/mma dispatch uses a 4-level decomposition (num_panels4).
@@ -474,6 +483,25 @@ void tile_pack_lhs(bool trans, int mc, int kc, half* dst, int ldd, const half* s
 void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
+// ---- Q5_1 (llama.cpp block format) RHS ----------------------------------
+//
+// A Q5_1 B has no per-element storage: it is a stream of 24-byte blocks
+// covering 32 logical values, each carrying its own fp16 scale/min. The pack
+// fuses unpack + dequantize + f16 narrowing into the uniform nr_max-wide panel
+// layout above, so the MMA side is unchanged — the destination type (f32 or
+// f16) follows A and decides the tensor type the panels are written as.
+//
+// Unlike tile_pack_rhs there is no `lds`/`src` pre-offset: a panel can start
+// mid-block, so the kernel takes the logical tile origin and applies it in
+// block units itself. `src_row_blocks` is the physical row pitch divided by
+// the 24-byte block size (TensorView::row_stride_elems() for a Q5_1 view).
+//
+// Supported on x86_64 only; get_matmul_plan rejects a Q5_1 B elsewhere.
+void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks);
+void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks);
+
 // B is always packed here (no ldb parameter); panels advance by the aligned
 // nr_max*kc panel stride.
 void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
@@ -537,7 +565,9 @@ struct MatMulPlan {
 
 /// Resolve the tile sizes, the split direction and the packed-A/B scratch layout.
 ///
-/// Covers f32, f16 and s8×s8. Only `kc`, the panel lists and `num_slots` differ
+/// Covers f32, f16 and s8×s8, plus an f32/f16 A with a Q5_1 (llama.cpp block)
+/// B: the Q5_1 block stream is decoded into the same T panels during packing,
+/// so tiling and the MMA route are unchanged. Only `kc`, the panel lists and `num_slots` differ
 /// per dtype; the thread-aware mc/nc shrink is shared, which is what makes the
 /// block count (and so the parallelism) grow with the pool. Returns an all-zero
 /// plan for any other dtype — every field must be checked before use.
@@ -562,6 +592,13 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& b_desc,
                           int num_threads = 1,
                           bool use_thread_slots = false);
+
+#ifdef NNOPS_ARCH_X86_64
+/// Diagnostic cap on the fused Q5_1 small-M route (matmul.cpp): negative keeps
+/// the built-in per-layout M limits, 0 disables the route. Benchmarks use it to
+/// A/B the fused and packed routes inside one process.
+extern int q5_fused_max_m_override;
+#endif
 
 }  // namespace nnops::backend::cpu
 
