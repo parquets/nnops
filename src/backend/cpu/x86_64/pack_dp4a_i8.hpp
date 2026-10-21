@@ -446,12 +446,32 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
+/// @brief 16-wide panel of a transposed B (16 source rows of K), at a live
+/// width `nr <= 16`. The narrow last panel is a scalar pass that touches only
+/// the live rows and zero-fills the rest, so it never reads a column that is
+/// not there; the full-width path stays the vector transpose.
 inline void pack_trans_n16_dp4a_i8(void* NNOPS_RESTRICT output,
                                    const void* NNOPS_RESTRICT input,
-                                   int ir_step, int K, float scale) noexcept {
+                                   int ir_step, int K, float scale,
+                                   int nr = 16) noexcept {
     (void)scale;
     int32_t* NNOPS_RESTRICT output_i32 = static_cast<int32_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
+
+    if (nr < 16) {
+        int8_t* NNOPS_RESTRICT output_i8 = reinterpret_cast<int8_t*>(output_i32);
+        for (int k = 0; k < K; k += 4) {
+            for (int x = 0; x < 16; ++x) {
+                const int8_t* NNOPS_RESTRICT rp =
+                    (x < nr) ? input_i8 + x * ir_step : input_i8;
+                for (int i = 0; i < 4; ++i) {
+                    output_i8[0] = (x < nr && k + i < K) ? rp[k + i] : 0;
+                    ++output_i8;
+                }
+            }
+        }
+        return;
+    }
 
     const int8_t* NNOPS_RESTRICT input_i8_ptr0  = input_i8 + 0 * ir_step;
     const int8_t* NNOPS_RESTRICT input_i8_ptr1  = input_i8 + 1 * ir_step;
@@ -767,12 +787,29 @@ inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
+/// @brief 16-wide panel of a row-major B (K source rows of N), at a live width
+/// `nr <= 16`. Columns past `nr` are zero-filled; the narrow pass reads only
+/// the live ones, so a short last panel never runs past the tensor.
 inline void pack_copy_n16_dp4a_i8(void* NNOPS_RESTRICT output,
                                   const void* NNOPS_RESTRICT input,
-                                  int ir_step, int K, float scale) noexcept {
+                                  int ir_step, int K, float scale,
+                                  int nr = 16) noexcept {
     (void)scale;
     int8_t* NNOPS_RESTRICT output_i8 = static_cast<int8_t*>(output);
     const int8_t* NNOPS_RESTRICT input_i8 = static_cast<const int8_t*>(input);
+
+    if (nr < 16) {
+        for (int k = 0; k < K; k += 4) {
+            for (int x = 0; x < 16; ++x) {
+                for (int i = 0; i < 4; ++i) {
+                    output_i8[0] = (x < nr && k + i < K)
+                        ? input_i8[(k + i) * ir_step + x] : 0;
+                    ++output_i8;
+                }
+            }
+        }
+        return;
+    }
 
     int k = 0;
     for (; k < K - 3; k += 4) {

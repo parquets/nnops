@@ -34,12 +34,12 @@ sized against that.
 
 ### 1.2 Packing Strategy — always-pack-B, threshold-pack-A
 
-The decision is two trivial rules (see `PACK_A_STRIDE_THRESHOLD` and
+The decision is two trivial rules (see `PACK_A_K_THRESHOLD` and
 `gemm_is_small` in matmul_helper.h, applied in `get_matmul_plan`):
 
 ```text
-pack_b = true                                             // rhs always packed
-pack_a = is_i8 || transpose_a || (lda > PACK_A_STRIDE_THRESHOLD)   // 1024 elements
+pack_b = true                                        // rhs always packed
+pack_a = is_i8 || transpose_a || (K > PACK_A_K_THRESHOLD)   // 1024 elements
 ```
 
 Rules, in order:
@@ -47,14 +47,22 @@ Rules, in order:
 1. **B is always packed.** The packed RHS is what the micro-kernel consumes
    (`tile_mma_pack(..., -1)` / `tile_mma_direct(..., -1)`); packing it is the
    RHS-reuse win and is never skipped.
-2. **A packs on correctness, dtype or wide stride.** int8 has no direct-A route
-   at all (`tile_pack_lhs_i8` is unconditional); `transpose_a` forces packing (the
-   micro-kernel wants A as `[m][k]` panels); otherwise A packs only when its row
-   stride exceeds 1024 elements (page-scattered reads). Otherwise A is read
-   directly via `tile_mma_direct`.
-3. **Fast path (f32 only).** f32 GEMMs with `M*N*K < 1024` MACs skip the tiled
-   path entirely and go to the reference. f16 has no reference kernel, so it
-   always takes the tiled path.
+2. **A packs on correctness, dtype or depth.** int8 has no direct-A route at
+   all (`tile_pack_lhs_i8` is unconditional); `transpose_a` forces packing (the
+   micro-kernel wants A as `[m][k]` panels); otherwise A packs only when the
+   reduction depth exceeds 1024 elements, where a panel's direct row reads no
+   longer stay inside a page and packing turns them sequential. Otherwise A is
+   read directly via `tile_mma_direct`. The row *pitch* never enters the
+   decision.
+3. **Small-GEMM path (f32 and f16).** GEMMs with `M*N*K < 1024` MACs never reach
+   the plan: each batch element runs the arch's naive SIMD kernel
+   (`x86_64/matmul_naive.hpp`, `aarch64/matmul_naive.hpp`) plus one epilogue
+   pass. It has no pack, no tiles and no scratch, and the pool is only used once
+   `batch × M×N×K ≥ 32768`. Two loop shapes keep it vectorized at every N:
+   wide N sweeps eight (four on NEON) columns per row of A; narrow N switches to
+   one vectorized-over-K dot product per output. Operands stored the other way
+   round are transposed into a 1024-element stack scratch. Unsupported dtype
+   pairs and "no workspace" calls still go to the reference.
 
 ### 1.3 Workspace Model (TensorRT Pattern)
 
@@ -71,11 +79,10 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
   short final block can need more panels than the tile's own `mc` does, so the
   region is sized for the worst height in `[1, mc]`, not for `mc` itself. Every
   direct-A path needs **zero** workspace.
-- `TensorDesc.row_stride_elems` feeds the **pack decision for A**: a stride wider
-  than `PACK_A_STRIDE_THRESHOLD` makes A pack (`0` = unknown → treat as compact,
-  `K` elems/row for a non-transposed A, `M` for a transposed one). It does not
-  affect the workspace size, which depends only on N, Kc, dtype and the NR panel
-  list.
+- `TensorDesc.row_stride_elems` only describes the input's actual row pitch;
+  the pack decision for A is `K`-based (§1.2), and the packed-A kernel reads
+  rows by that pitch either way. It does not affect the workspace size, which
+  depends only on N, Kc, dtype and the NR panel list.
 - **Sizing follows the split, and comes from the plan.** The packed-B region is
   `num_slots × np_slice × ldd_b × elem`, every panel at a uniform 64-byte-aligned
   full-Kc stride: on the M-split `np_slice = num_panels(N, nr)` with one slot per
@@ -487,10 +494,10 @@ the M-split.
 ## 8. Key Design Decisions
 
 1. **2D + batched.** Rank-2 runs the fused tiled kernels; rank > 2 runs the same
-   kernels per batch element with numpy-style broadcast (shared logic with the
-   reference). Fused tiled kernels exist for f32, f16, and s8×s8 → s32/s8
-   (`matmul_dispatch_int8`); every other dtype combination falls through to the
-   reference kernel.
+   kernels per batch element with numpy-style broadcast. Fused tiled kernels
+   exist for f32, f16, and s8×s8 → s32/s8 (`matmul_dispatch_int8`); small f32/f16
+   products go to the naive arch kernel (§1.2 rule 3) and every other dtype
+   combination falls through to the reference kernel.
 
 2. **Multi-threading is now in.** Parallel decomposition is block-granularity and
    bit-identical to serial; see §7.

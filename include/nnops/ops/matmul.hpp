@@ -28,7 +28,7 @@ struct MatMulAttributes {
     /// beta=0 (default) overwrites C; beta=1 adds A×B to existing C.
     float beta = 0.0f;
 
-    /// Output data type for the integer (s8×s8) matmul path.
+    /// Output data type for the integer (s8|u8 × s8) matmul path.
     ///
     ///   s32 (default): raw int32 accumulate with zero-point compensation
     ///                  (MatMulInteger semantics).
@@ -41,6 +41,15 @@ struct MatMulAttributes {
     /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
 };
+
+/// True for the integer GEMM: an int8 or uint8 A against an int8 B — the
+/// MatMulInteger operand combinations — whose raw int32 accumulate
+/// `output_dtype` then either returns as s32 or requantizes to s8. The operator
+/// and the CPU backend must agree on this pair (the backend fuses exactly the
+/// cases whose output dtype the operator resolves), so it lives here.
+inline constexpr bool is_int8_matmul(DataType a, DataType b) noexcept {
+    return (a == DataType::s8 || a == DataType::u8) && b == DataType::s8;
+}
 
 /// Matrix multiplication operator (class-based API).
 ///

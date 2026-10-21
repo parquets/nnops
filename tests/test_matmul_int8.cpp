@@ -1,5 +1,5 @@
-/// Unit tests for integer (s8×s8) MatMul — per-token activation × per-channel
-/// weight, s32 (MatMulInteger) or requantized s8 output.
+/// Unit tests for integer (s8|u8 × s8) MatMul — per-token activation ×
+/// per-channel weight, s32 (MatMulInteger) or requantized s8 output.
 ///
 /// The tiled kernel (packed VNNI / SDOT / scalar path) is compared against
 /// matmul_int8_ref, plus a few exact-value cases that pin the zero-point
@@ -172,6 +172,55 @@ NNOPS_TEST(matmul_int8_zeropoint_s32) {
 }
 
 // ============================================================
+// u8 activation × s8 weight → s32
+// ============================================================
+
+NNOPS_TEST(matmul_int8_u8_zeropoint_s32) {
+    // The u8 A path: the pack shifts A into signed range for a signed-dot
+    // kernel, and the 128·Σb that shift injects must come back out of the
+    // accumulator. zp_a = 128 (the natural u8 zero point) exercises it directly,
+    // and a non-128 zp on the second row checks the compensation algebra rather
+    // than just the identity case.
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    uint8_t a_data[6] = {130, 128, 3, 200, 255, 0};   // A = [[130,128,3],[200,255,0]]
+    int8_t  b_data[6] = {1, -4, 2, 5, 3, -6};         // B = [[1,-4],[2,5],[3,-6]]
+
+    float   a_scale[2] = {1.0f, 1.0f};
+    int32_t a_zp[2]    = {128, 100};
+    TensorView a = make_q(2, 3, DataType::u8, a_data, per_token(a_scale, a_zp, 2));
+    TensorView b = make_q(3, 2, DataType::s8, b_data, per_tensor(1.0f, 3));
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s32;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    auto a_desc = a.desc();
+    auto b_desc = b.desc();
+    const TensorDesc arr[] = {a_desc, b_desc};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s32);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
+
+    std::vector<int32_t> out_buf(descs[0].numel());
+    auto output = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, nullptr);
+
+    // Dezero-pointed: A = [[2,0,-125],[100,155,-100]], B = [[-2,-7],[-1,2],[0,-9]].
+    //   out[0,0] = 2·(−2) + 0·(−1) + (−125)·0            = −4
+    //   out[0,1] = 2·(−7) + 0·2    + (−125)·(−9)        = 1111
+    //   out[1,0] = 100·(−2) + 155·(−1) + (−100)·0       = −355
+    //   out[1,1] = 100·(−7) + 155·2    + (−100)·(−9)    = 510
+    NNOPS_EXPECT_EQ(out_buf[0], -4);
+    NNOPS_EXPECT_EQ(out_buf[1], 1111);
+    NNOPS_EXPECT_EQ(out_buf[2], -355);
+    NNOPS_EXPECT_EQ(out_buf[3], 510);
+}
+
+// ============================================================
 // Requantized s8 output
 // ============================================================
 
@@ -265,14 +314,24 @@ struct I8Inputs {
 /// so an [B, M, K] / [B, K, N] view over them stays in bounds — a rank-3 view
 /// over a 2-D-sized buffer reads past the allocation. Weights and activations
 /// batch separately because the N-D cases broadcast one against the other.
+///
+/// `a_dt` picks A's element type: s8 (signed range) or u8 (the buffer still
+/// holds bytes; the full 0..255 range is what the view's dtype makes them mean).
 I8Inputs make_i8_inputs(int64_t M, int64_t K, int64_t N, bool transpose_b, uint64_t seed,
-                        int64_t batch_a = 1, int64_t batch_b = 1) {
+                        int64_t batch_a = 1, int64_t batch_b = 1,
+                        DataType a_dt = DataType::s8) {
     const int64_t b_rows = transpose_b ? N : K;
     const int64_t b_cols = transpose_b ? K : N;
 
     nnops::test::XorShift128 rng(seed);
     auto fill_i8 = [&](std::vector<int8_t>& buf) {
         for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 255 - 127); }
+    };
+    auto fill_a = [&](std::vector<int8_t>& buf) {
+        for (auto& v : buf) {
+            v = (a_dt == DataType::u8) ? static_cast<int8_t>(rng.next_u64() % 256)
+                                       : static_cast<int8_t>(rng.next_u64() % 255 - 127);
+        }
     };
     auto fill_zp = [&](std::vector<int32_t>& buf) {
         for (auto& v : buf) { v = static_cast<int32_t>(rng.next_u64() % 11 - 5); }
@@ -284,7 +343,7 @@ I8Inputs make_i8_inputs(int64_t M, int64_t K, int64_t N, bool transpose_b, uint6
     I8Inputs in;
     in.a_buf.resize(static_cast<size_t>(batch_a * M * K));
     in.b_buf.resize(static_cast<size_t>(batch_b * b_rows * b_cols));
-    fill_i8(in.a_buf);
+    fill_a(in.a_buf);
     fill_i8(in.b_buf);
 
     in.a_scale.resize(static_cast<size_t>(M));
@@ -296,7 +355,7 @@ I8Inputs make_i8_inputs(int64_t M, int64_t K, int64_t N, bool transpose_b, uint6
     fill_zp(in.a_zp);
     fill_zp(in.b_zp);
 
-    in.a = make_q(M, K, DataType::s8, in.a_buf.data(),
+    in.a = make_q(M, K, a_dt, in.a_buf.data(),
                   per_token(in.a_scale.data(), in.a_zp.data(), M));
     in.b = make_q(b_rows, b_cols, DataType::s8, in.b_buf.data(),
                   per_token(in.b_scale.data(), in.b_zp.data(), N));
@@ -363,6 +422,52 @@ NNOPS_TEST(matmul_int8_random_s8) {
 
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_EQ(static_cast<int>(out_buf[i]), static_cast<int>(ref_buf[i]));
+    }
+}
+
+NNOPS_TEST(matmul_int8_u8_random_matches_ref) {
+    // u8 activation against the reference. The kernels are signed-dot only, so
+    // the pack shifts A into range and the injected bias comes back out later
+    // (folded per panel on x86, deferred to the epilogue on aarch64). K >
+    // KC_CAP_I8 spans several k-blocks, so the per-panel folding is exercised
+    // rather than a single panel.
+    for (bool tb : {false, true}) {
+        const int64_t M = 14, K = 1100, N = 19;
+        I8Inputs in = make_i8_inputs(M, K, N, tb, 8642, 1, 1, DataType::u8);
+
+        MatMulAttributes attrs{};
+        attrs.transpose_b = tb;
+        attrs.output_dtype = DataType::s32;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {in.a.desc(), in.b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s32);
+
+        const TensorView ins[] = {in.a, in.b};
+        expect_matches_ref<int32_t>(attrs, descs[0], ins);
+    }
+}
+
+NNOPS_TEST(matmul_int8_u8_requant_s8_matches_ref) {
+    // The requantizing epilogue on top of the u8 activation path. 2048 is a
+    // power of two, so the output scale introduces no rounding of its own — any
+    // mismatch would be the accumulator, not the requant.
+    for (bool tb : {false, true}) {
+        const int64_t M = 9, K = 17, N = 11;
+        I8Inputs in = make_i8_inputs(M, K, N, tb, 777777, 1, 1, DataType::u8);
+
+        MatMulAttributes attrs{};
+        attrs.transpose_b = tb;
+        attrs.output_dtype = DataType::s8;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {in.a.desc(), in.b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s8);
+
+        const TensorView ins[] = {in.a, in.b};
+        expect_matches_ref<int8_t>(attrs, descs[0], ins, per_tensor(2048.0f, -7));
     }
 }
 
@@ -507,6 +612,33 @@ NNOPS_TEST(matmul_int8_batched_s8) {
     // The requantized path needs a per-tensor output scale / zero point.
     const TensorView ins[] = {a, b};
     expect_matches_ref<int8_t>(attrs, descs[0], ins, per_tensor(0.3f, 3));
+}
+
+NNOPS_TEST(matmul_int8_batched_u8_s32) {
+    // u8 A across a batch. The per-batch byte offset and the A-bias epilogue
+    // offset both live in the batch walk, which is exactly where they can be
+    // confused for one another — hence a dedicated case.
+    const int64_t B = 3, M = 5, K = 40, N = 7;
+    I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/false, 5151, B, B,
+                                 DataType::u8);
+
+    const int64_t ashape[] = {B, M, K};
+    const int64_t bshape[] = {B, K, N};
+    TensorView a = make_q_nd(ashape, DataType::u8, in.a_buf.data(),
+                             per_token(in.a_scale.data(), in.a_zp.data(), M));
+    TensorView b = make_q_nd(bshape, DataType::s8, in.b_buf.data(),
+                             per_token(in.b_scale.data(), in.b_zp.data(), N));
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s32;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s32);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(B));
+
+    const TensorView ins[] = {a, b};
+    expect_matches_ref<int32_t>(attrs, descs[0], ins);
 }
 
 NNOPS_TEST(matmul_int8_batched_nsplit_s32) {
@@ -659,10 +791,13 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     NNOPS_EXPECT_TRUE(b10.kc <= cpu::KC_CAP_I8);
     NNOPS_EXPECT_EQ(b1.kc % cpu::KC_ALIGN, int64_t{0});
     NNOPS_EXPECT_EQ(b10.kc % cpu::KC_ALIGN, int64_t{0});
-    const int64_t ldd_b1  = static_cast<int64_t>(cpu::mma_pack_align(cpu::NR_MAX_I8 * b1.kc));
-    const int64_t ldd_b10 = static_cast<int64_t>(cpu::mma_pack_align(cpu::NR_MAX_I8 * b10.kc));
-    const int64_t one_slice1  = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b1;
-    const int64_t one_slice10 = cpu::num_panels4(1024, cpu::NR_I8) * ldd_b10;
+    // B panels are uniform nr_max-wide slots -- including the arch's trailing
+    // correction block -- so a slice is ceil(N / nr_max) of them.
+    const int64_t ldd_b1  = cpu::int8_panel_stride(b1.kc);
+    const int64_t ldd_b10 = cpu::int8_panel_stride(b10.kc);
+    const int64_t np_n    = (int64_t{1024} + cpu::NR_MAX_I8 - 1) / cpu::NR_MAX_I8;
+    const int64_t one_slice1  = np_n * ldd_b1;
+    const int64_t one_slice10 = np_n * ldd_b10;
     NNOPS_EXPECT_EQ(b1.ldd_b, ldd_b1);
     NNOPS_EXPECT_EQ(b10.ldd_b, ldd_b10);
     NNOPS_EXPECT_EQ(b1.num_slots, int64_t{1});
@@ -686,18 +821,15 @@ NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     NNOPS_EXPECT_EQ(b10.num_slots_a, b10_blocks);
     NNOPS_EXPECT_EQ(b10.workspace_size, one_slice10 + b10_blocks * b10_np_a * b10.ldd_a);
 
-    // N-split (N > M): each n-block owns a slice, sized at the worst-case panel
-    // count for a tile of nc columns — the last block packs N mod nc columns,
-    // and a run one column short of a multiple of nr_max can emit more panels
-    // than an nc-wide one does (see num_panels_max4).
+    // N-split (N > M): each n-block owns a slice. Uniform panels make the count
+    // monotonic, so ceil(nc / nr_max) per block is exact -- the last block packs
+    // N mod nc <= nc columns, which can only need fewer panels.
     const auto n10 = i8_plan(64, 512, 1024, 10);
     NNOPS_EXPECT_TRUE(n10.split_n);
     NNOPS_EXPECT_EQ(n10.nc % cpu::NR_MAX_I8, int64_t{0});
     const int64_t n_blocks = (int64_t{1024} + n10.nc - 1) / n10.nc;
-    const int64_t np_max = cpu::num_panels_max4(static_cast<int>(n10.nc), cpu::NR_I8);
-    NNOPS_EXPECT_TRUE(np_max > cpu::num_panels4(static_cast<int>(n10.nc), cpu::NR_I8));
-    NNOPS_EXPECT_EQ(n10.ldd_b,
-                    static_cast<int64_t>(cpu::mma_pack_align(cpu::NR_MAX_I8 * n10.kc)));
+    const int64_t np_max = (n10.nc + cpu::NR_MAX_I8 - 1) / cpu::NR_MAX_I8;
+    NNOPS_EXPECT_EQ(n10.ldd_b, cpu::int8_panel_stride(n10.kc));
     NNOPS_EXPECT_EQ(n10.num_slots, n_blocks);
     NNOPS_EXPECT_EQ(n10.pack_a_offset, n_blocks * np_max * n10.ldd_b);
     NNOPS_EXPECT_EQ(n10.num_slots_a, n_blocks);   // per-block: no thread ids here
@@ -757,8 +889,9 @@ struct SimplePool {
 /// each needs its own pooled coverage.
 template <typename T>
 void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uint64_t seed,
-                                    bool ta = false, bool tb = false) {
-    I8Inputs in = make_i8_inputs(M, K, N, tb, seed);
+                                    bool ta = false, bool tb = false,
+                                    DataType a_dt = DataType::s8) {
+    I8Inputs in = make_i8_inputs(M, K, N, tb, seed, 1, 1, a_dt);
 
     // make_i8_inputs always lays A out as M×K; for transpose_a build a K×M
     // operand over its own buffer. Scales stay per logical token (M of them),
@@ -769,14 +902,17 @@ void expect_i8_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uin
     if (ta) {
         nnops::test::XorShift128 rng(seed ^ 0x5eedULL);
         a_t_buf.resize(static_cast<size_t>(K * M));
-        for (auto& v : a_t_buf) v = static_cast<int8_t>(rng.next_u64() % 255 - 127);
+        for (auto& v : a_t_buf) {
+            v = (a_dt == DataType::u8) ? static_cast<int8_t>(rng.next_u64() % 256)
+                                       : static_cast<int8_t>(rng.next_u64() % 255 - 127);
+        }
         a_t_scale.resize(static_cast<size_t>(M));
         a_t_zp.resize(static_cast<size_t>(M));
         for (auto& v : a_t_scale) v = 0.5f + (rng.next_u64() % 1000) / 1000.0f;
         for (auto& v : a_t_zp) v = static_cast<int32_t>(rng.next_u64() % 11 - 5);
     }
     const TensorView a_view =
-        ta ? make_q(K, M, DataType::s8, a_t_buf.data(),
+        ta ? make_q(K, M, a_dt, a_t_buf.data(),
                     per_token(a_t_scale.data(), a_t_zp.data(), M))
            : in.a;
 
@@ -835,4 +971,18 @@ NNOPS_TEST(matmul_int8_threaded_matches_ref) {
         expect_i8_threaded_matches_ref<int32_t>(128, 512, 512, nt, 24, /*ta=*/true,  /*tb=*/true);
         expect_i8_threaded_matches_ref<int8_t>(256, 256, 256, nt, 25, /*ta=*/true,  /*tb=*/true);
     }
+
+    // u8 activations through a pool: the A-bias shift and its correction are
+    // dtype paths, not shape paths, but both splits and the transposed
+    // reduction are worth pinning down on the unsigned side too.
+    for (int nt : {2, 4}) {
+        expect_i8_threaded_matches_ref<int32_t>(256, 256, 256, nt, 31, /*ta=*/false, /*tb=*/false,
+                                                DataType::u8);
+        expect_i8_threaded_matches_ref<int32_t>(128, 512, 512, nt, 32, /*ta=*/false, /*tb=*/true,
+                                                DataType::u8);
+        expect_i8_threaded_matches_ref<int32_t>(512, 512, 128, nt, 33, /*ta=*/true, /*tb=*/false,
+                                                DataType::u8);
+    }
+    expect_i8_threaded_matches_ref<int8_t>(256, 256, 256, 4, 34, /*ta=*/true, /*tb=*/true,
+                                           DataType::u8);
 }

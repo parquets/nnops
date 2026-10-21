@@ -1,10 +1,11 @@
 /// @file matmul_int8_ref.cpp
-/// @brief Naive CPU reference for integer (s8×s8) matrix multiplication.
+/// @brief Naive CPU reference for integer (s8|u8 × s8) matrix multiplication.
 ///
 /// Semantics: C = A × B with per-token / per-channel (asymmetric) quantization.
 /// The accumulate is the MatMulInteger value — the dot product of the
 /// dezero-pointed operands — written directly to an s32 output, or requantized
-/// to an s8 output with the output scale / zero-point.
+/// to an s8 output with the output scale / zero-point. A is read through its
+/// own element type, so a u8 A contributes its unsigned value.
 ///
 /// Supports N-D batch matmul with numpy-style broadcasting (same as matmul_ref).
 
@@ -28,13 +29,13 @@ inline float scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
-}  // anonymous namespace
-
-void matmul_int8_ref(const MatMulAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* /*workspace*/)
+// A is int8 or uint8 (B is always int8); templating keeps the u8 reads
+// unsigned and the s8 reads sign-extended in the same inner loops.
+template <class AT>
+void matmul_int8_ref_impl(const MatMulAttributes& attrs,
+                          TensorView& output,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -52,7 +53,7 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
     NNOPS_ASSERT(Ka == Kb);
     const int64_t K = Ka;
 
-    const int8_t* a_base = a.ptr<int8_t>();
+    const AT*     a_base = a.ptr<AT>();
     const int8_t* b_base = b.ptr<int8_t>();
 
     const int64_t a_row_stride = a.row_stride_elems();
@@ -99,7 +100,7 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
         total_batch *= batch_out_shape[i];
     }
 
-    const auto gemm_2d = [&](const int8_t* a_ptr, const int8_t* b_ptr,
+    const auto gemm_2d = [&](const AT* a_ptr, const int8_t* b_ptr,
                              int32_t* c_int, int8_t* c_out) {
         // Raw reductions over K.
         std::vector<int32_t> r_a(static_cast<size_t>(M), 0);
@@ -123,7 +124,8 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
             const int32_t zp_a = zp_at(qa, m);
             const double  s_a  = static_cast<double>(scale_at(qa, m));
             for (int64_t n = 0; n < N; ++n) {
-                // True s8×s8 dot product (no u8 offset in the reference).
+                // True integer dot product over A's own element type, with no
+                // hardware shift to undo (hence the 0 offset below).
                 int32_t raw = 0;
                 for (int64_t k = 0; k < K; ++k) {
                     const int32_t av = attrs.transpose_a ? a_ptr[k * a_row_stride + m] : a_ptr[m * a_row_stride + k];
@@ -180,6 +182,21 @@ void matmul_int8_ref(const MatMulAttributes& attrs,
         gemm_2d(a_base + a_offset, b_base + b_offset,
                 output.ptr<int32_t>() + c_offset,
                 output.ptr<int8_t>() + c_offset);
+    }
+}
+
+}  // anonymous namespace
+
+void matmul_int8_ref(const MatMulAttributes& attrs,
+                     TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* /*workspace*/)
+{
+    if (inputs[0].data_type() == DataType::u8) {
+        matmul_int8_ref_impl<uint8_t>(attrs, output, inputs, ctx);
+    } else {
+        matmul_int8_ref_impl<int8_t>(attrs, output, inputs, ctx);
     }
 }
 

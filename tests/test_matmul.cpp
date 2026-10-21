@@ -1522,9 +1522,10 @@ NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
                 MatMulAttributes attrs{};
                 auto op = MatMul::create(attrs, Backend::CPU);
 
-                // Pin the route. If a compact non-transposed A ever stops being
-                // lda == K <= PACK_A_STRIDE_THRESHOLD this test would silently
-                // start covering the packed kernels instead of the direct ones.
+                // Pin the route. A compact non-transposed A stays direct only
+                // while K <= PACK_A_K_THRESHOLD; if that threshold is ever
+                // retuned below K the test would silently start covering the
+                // packed kernels instead of the direct ones.
                 const auto plan = nnops::backend::cpu::get_matmul_plan(
                     attrs, a.desc(), b.desc(), 1);
                 if (plan.pack_a) {
@@ -1585,10 +1586,10 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
                 MatMulAttributes attrs{};
                 auto op = MatMul::create(attrs, Backend::CPU);
 
-                // Pin the route. A compact non-transposed A has lda == K, so this
-                // stays direct only while K <= PACK_A_STRIDE_THRESHOLD; if that
-                // threshold is ever retuned below K the test would silently start
-                // covering the packed kernels instead.
+                // Pin the route. This stays direct only while
+                // K <= PACK_A_K_THRESHOLD; if that threshold is ever retuned
+                // below K the test would silently start covering the packed
+                // kernels instead.
                 const auto plan = nnops::backend::cpu::get_matmul_plan(
                     attrs, a.desc(), b.desc(), 1);
                 if (plan.pack_a) {
@@ -1824,7 +1825,7 @@ NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
 NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
     namespace cpu = nnops::backend::cpu;
 
-    // num_panels/num_panels4 and num_panels_max/num_panels_max4 are now closed
+    // num_panels and num_panels_max are now closed
     // forms of the loops they used to run: "take nr[s] panels while they fit"
     // leaves `rem % nr[s]` behind, so that loop is the quotient chain; and the
     // largest count over every width in [1, n] sits at one of two points (a full
@@ -1848,7 +1849,7 @@ NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
 
     struct List { const int* nr; int levels; };
     for (const List& l : {List{cpu::MR_F32, 3}, List{cpu::MR_F16, 3}, List{cpu::NR_F32, 3},
-                          List{cpu::NR_F16, 3}, List{cpu::MR_I8, 3},  List{cpu::NR_I8, 4}}) {
+                          List{cpu::NR_F16, 3}, List{cpu::MR_I8, 3}}) {
         for (int n = 1; n <= 8192; ++n) {
             NNOPS_EXPECT_EQ(cpu::num_panels(n, l.nr, l.levels), stepwise(n, l.nr, l.levels));
             int worst = 0;
@@ -2158,4 +2159,91 @@ NNOPS_TEST(matmul_threaded_batched) {
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
+}
+
+// ============================================================
+// Small-GEMM kernel (arch::matmul_naive), called directly
+// ============================================================
+
+NNOPS_TEST(matmul_naive_kernel_layouts) {
+    // The small-GEMM kernel bypasses the operator, so its own coverage has to
+    // name the layouts: all four transpose combinations, N on both sides of the
+    // vector width (wide sweep vs per-output dots), k tails, padded pitches on A,
+    // B and C, and beta folded into the output.
+    namespace cpu = nnops::backend::cpu;
+    using cpu::half;
+
+    const int64_t shapes[][3] = {{1, 1, 1}, {2, 3, 4}, {5, 4, 8},
+                                 {9, 8, 13}, {3, 16, 5}, {4, 21, 9}};
+
+    const auto run = [&](auto dtype_tag) {
+        using T = decltype(dtype_tag);
+        constexpr float tol = std::is_same_v<T, float> ? 1e-5f : kF16AccumTol;
+
+        const auto cast = [](float v) -> T {
+            if constexpr (std::is_same_v<T, float>) { return v; }
+            else { return cpu::float_to_half(v); }
+        };
+        const auto to_f = [](T v) -> float {
+            if constexpr (std::is_same_v<T, float>) { return v; }
+            else { return cpu::half_to_float(v); }
+        };
+
+        for (const auto& s : shapes) {
+            const int64_t M = s[0], N = s[1], K = s[2];
+            for (int ta = 0; ta < 2; ++ta) {
+                for (int tb = 0; tb < 2; ++tb) {
+                    for (int64_t pad : {int64_t{0}, int64_t{3}}) {
+                        const int64_t a_rows = ta ? K : M, a_cols = ta ? M : K;
+                        const int64_t b_rows = tb ? N : K, b_cols = tb ? K : N;
+                        const int64_t apitch = a_cols + pad;
+                        const int64_t bpitch = b_cols + pad;
+                        const int64_t ldc = N + 1;
+                        const float beta = pad ? 0.5f : 0.0f;
+
+                        nnops::test::XorShift128 rng(17 + static_cast<uint64_t>(pad));
+                        std::vector<T> abuf(static_cast<size_t>(a_rows * apitch));
+                        std::vector<T> bbuf(static_cast<size_t>(b_rows * bpitch));
+                        std::vector<T> cbuf(static_cast<size_t>(M * ldc));
+                        for (int64_t r = 0; r < a_rows; ++r) {
+                            for (int64_t c = 0; c < a_cols; ++c) {
+                                abuf[static_cast<size_t>(r * apitch + c)] = cast(rng.next_float());
+                            }
+                        }
+                        for (int64_t r = 0; r < b_rows; ++r) {
+                            for (int64_t c = 0; c < b_cols; ++c) {
+                                bbuf[static_cast<size_t>(r * bpitch + c)] = cast(rng.next_float());
+                            }
+                        }
+                        for (auto& v : cbuf) { v = cast(1.0f); }
+
+                        cpu::arch::matmul_naive(static_cast<int>(M), static_cast<int>(N),
+                                                static_cast<int>(K),
+                                                abuf.data(), static_cast<int>(apitch), ta != 0,
+                                                bbuf.data(), static_cast<int>(bpitch), tb != 0,
+                                                cbuf.data(), static_cast<int>(ldc), beta);
+
+                        for (int64_t m = 0; m < M; ++m) {
+                            for (int64_t n = 0; n < N; ++n) {
+                                float want = 0.0f;
+                                for (int64_t k = 0; k < K; ++k) {
+                                    const float av = to_f(abuf[static_cast<size_t>(
+                                        ta ? k * apitch + m : m * apitch + k)]);
+                                    const float bv = to_f(bbuf[static_cast<size_t>(
+                                        tb ? n * bpitch + k : k * bpitch + n)]);
+                                    want += av * bv;
+                                }
+                                if (beta != 0.0f) { want += beta * 1.0f; }
+                                NNOPS_EXPECT_NEAR(to_f(cbuf[static_cast<size_t>(m * ldc + n)]),
+                                                  want, tol);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    run(0.0f);
+    run(half{});
 }

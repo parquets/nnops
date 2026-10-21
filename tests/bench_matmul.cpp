@@ -2,7 +2,7 @@
 /// @brief MatMul micro-benchmarks — pack decision + thread scaling.
 ///
 /// Every case runs the plan-driven fused path (B always packed, A packed only on
-/// transpose_a or a wide row stride) across {nn, ta, tb, tatb} and padded
+/// transpose_a or a deep K) across {nn, ta, tb, tatb} and padded
 /// strides. For each case the harness reports:
 ///   - the split direction (NKM when split on N, MKN when split on M),
 ///   - the resolved tile sizes (mc, nc) and block count from get_matmul_plan(),
@@ -13,7 +13,7 @@
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q5_1.hpp"         // q5_1_block, float_to_half, half_to_bits
-#include "backend/cpu/matmul_helper.h"   // resolve_tile_sizes, PACK_A_STRIDE_THRESHOLD, tile constants
+#include "backend/cpu/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
 #include "common/bench_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
@@ -97,16 +97,22 @@ make_tensor(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
     return {std::move(buf), tv};
 }
 
-// Build a compact [rows, cols] s8 tensor. Quant params are left at the default
-// identity (zp=0, scale=1), so the int8 kernel accumulates the raw dot product —
-// the qgemm / MatMulInteger analog — with a trivial zero-point compensation.
+// Build a compact [rows, cols] int8 tensor (s8 by default, u8 on request; the
+// buffer is bytes either way). Quant params are left at the default identity
+// (zp=0, scale=1), so the int8 kernel accumulates the raw dot product — the
+// qgemm / MatMulInteger analog — with a trivial zero-point compensation.
 std::pair<std::vector<int8_t>, TensorView>
-make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed) {
+make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed,
+               DataType dt = DataType::s8) {
     std::vector<int8_t> buf(static_cast<size_t>(rows * cols));
     nnops::test::XorShift128 rng(seed);
-    for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 255 - 127); }
+    if (dt == DataType::u8) {
+        for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 256); }
+    } else {
+        for (auto& v : buf) { v = static_cast<int8_t>(rng.next_u64() % 255 - 127); }
+    }
     const int64_t shape[] = {rows, cols};
-    TensorView tv(shape, DataType::s8, buf.data());
+    TensorView tv(shape, dt, buf.data());
     return {std::move(buf), tv};
 }
 
@@ -154,6 +160,7 @@ struct GeMMCase {
     int64_t pad_a = 0;  // extra elements on A's row pitch (0 = compact)
     int64_t pad_b = 0;
     bool f16 = false;
+    DataType a_dt = DataType::s8;   // int8 cases only: s8 (default) or u8
 };
 
 struct GeMMReport {
@@ -264,15 +271,15 @@ void bench_case(const GeMMCase& c) {
     print_report(rep);
 }
 
-// Time one int8 (s8×s8 → s32) case; mirrors run_geMM but uses the int8 panel
-// constants and a s32 output buffer. GFLOPS is relabeled GOPS for int8.
+// Time one int8 (s8|u8 × s8 → s32) case; mirrors run_geMM but uses the int8
+// panel constants and a s32 output buffer. GFLOPS is relabeled GOPS for int8.
 GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int iters) {
     const int64_t a_rows = c.ta ? c.K : c.M;
     const int64_t a_cols = c.ta ? c.M : c.K;
     const int64_t b_rows = c.tb ? c.N : c.K;
     const int64_t b_cols = c.tb ? c.K : c.N;
 
-    auto [a_vec, a] = make_tensor_i8(a_rows, a_cols, 1);
+    auto [a_vec, a] = make_tensor_i8(a_rows, a_cols, 1, c.a_dt);
     auto [b_vec, b] = make_tensor_i8(b_rows, b_cols, 2);
 
     MatMulAttributes attrs{};
@@ -439,13 +446,9 @@ void bench_q5_case(const GeMMCase& c) {
 // conditions. Read the per-round ratios, not the absolute GFLOPS.
 //
 // The A-side of each pair is built to take the unpacked-A ("direct") route and
-// the B-side the packed route. Two ways to force packing exist and they answer
-// different questions:
-//   * transpose_a=true  — packing is required for correctness (A is stored
-//                         K×M), so the pair also changes A's memory layout;
-//   * a wide A row pitch — trips the stride heuristic (lda > PACK_A_STRIDE_THRESHOLD)
-//                         with the layout held fixed.
-// Both are exposed; read the per-round ratios.
+// the B-side the packed route. Packing A is forced by transpose_a (required for
+// correctness) or by K > PACK_A_K_THRESHOLD; the row pitch never enters the
+// decision, so a pad_a/pad_b pair past the threshold still runs one route twice.
 template <typename T>
 struct RouteAB {
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
@@ -660,7 +663,7 @@ void sweep_fp(const char* tag, const std::vector<SweepShape>& shapes,
     }
 }
 
-/// The int8 counterpart. Same shape as SweepOp, on the s8×s8 → s32 path.
+/// The int8 counterpart. Same shape as SweepOp, on the s8|u8 × s8 → s32 path.
 struct SweepOpI8 {
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
 
@@ -673,9 +676,10 @@ struct SweepOpI8 {
     bool split_n;
     double flops;
 
-    SweepOpI8(int64_t m, int64_t k, int64_t n, uint64_t seed, int64_t meta_threads)
+    SweepOpI8(int64_t m, int64_t k, int64_t n, uint64_t seed, int64_t meta_threads,
+              DataType a_dt = DataType::s8)
         : M(m), K(k), N(n) {
-        auto [av, a] = make_tensor_i8(M, K, seed);
+        auto [av, a] = make_tensor_i8(M, K, seed, a_dt);
         auto [bv, b] = make_tensor_i8(K, N, seed + 1);
         a_buf = std::move(av);
         b_buf = std::move(bv);
@@ -716,12 +720,13 @@ struct SweepOpI8 {
 };
 
 void sweep_i8(const std::vector<SweepShape>& shapes, const std::vector<int>& threads,
-              double target_ms) {
+              double target_ms, DataType a_dt = DataType::s8) {
     const int64_t meta_threads = *std::max_element(threads.begin(), threads.end());
-    std::printf("  int8 nn sweep  budget=%.0f ms/cell\n", target_ms);
+    std::printf("  %s nn sweep  budget=%.0f ms/cell\n",
+                a_dt == DataType::u8 ? "u8s8" : "s8s8", target_ms);
     print_sweep_header(threads, "GOPS");
     for (const SweepShape& s : shapes) {
-        SweepOpI8 g(s.M, s.K, s.N, 7, meta_threads);
+        SweepOpI8 g(s.M, s.K, s.N, 7, meta_threads, a_dt);
         std::vector<double> gops;
         for (int nt : threads) {
             SimplePool pool(nt);
@@ -950,6 +955,81 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
     std::printf("    median:   f16=%7.1f  q5_1=%7.1f   q5/f16=%.3f\n", mf, mq, mq / mf);
 }
 
+// Interleaved A/B of the two activation dtypes at identical memory: one byte
+// buffer is viewed as s8 and as u8, so the only difference is the dtype
+// contract. On x86 the s8 A pack XORs every byte into unsigned range and the B
+// packer writes the column sums the accumulators are seeded from; the u8 A
+// packs verbatim and the sums block is zeroed. The kernel itself is the same
+// code on both sides, so this measures the cost of the bias bookkeeping alone.
+void bench_i8_u8_ab(const char* tag, int64_t M, int64_t K, int64_t N,
+                    int rounds = 5, int iters = 20) {
+    std::vector<int8_t> a_bytes(static_cast<size_t>(M * K));
+    nnops::test::XorShift128 rng(1);
+    for (auto& v : a_bytes) { v = static_cast<int8_t>(rng.next_u64() % 256); }
+    const int64_t ashape[] = {M, K};
+    TensorView a_s8(ashape, DataType::s8, a_bytes.data());
+    TensorView a_u8(ashape, DataType::u8, a_bytes.data());
+    auto [bv, b] = make_tensor_i8(K, N, 2);
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s32;
+    auto op_s8 = MatMul::create(attrs, Backend::CPU);
+    auto op_u8 = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr_s8[] = {a_s8.desc(), b.desc()};
+    const TensorDesc arr_u8[] = {a_u8.desc(), b.desc()};
+    auto descs_s8 = op_s8->getOutputTensorDesc(arr_s8);
+    auto descs_u8 = op_u8->getOutputTensorDesc(arr_u8);
+    std::vector<int32_t> out_s8(static_cast<size_t>(descs_s8[0].numel()));
+    std::vector<int32_t> out_u8(static_cast<size_t>(descs_u8[0].numel()));
+    auto vout_s8 = test::make_planar(descs_s8[0], out_s8.data());
+    auto vout_u8 = test::make_planar(descs_u8[0], out_u8.data());
+
+    const TensorView ins_s8[] = {a_s8, b};
+    const TensorView ins_u8[] = {a_u8, b};
+
+    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
+                       * static_cast<double>(K);
+
+    auto time_s8 = [&]() {
+        for (int i = 0; i < 2; ++i) { op_s8->compute(vout_s8, ins_s8, {}, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { op_s8->compute(vout_s8, ins_s8, {}, nullptr); }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        return flops * iters / (ms * 1e6);
+    };
+    auto time_u8 = [&]() {
+        for (int i = 0; i < 2; ++i) { op_u8->compute(vout_u8, ins_u8, {}, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { op_u8->compute(vout_u8, ins_u8, {}, nullptr); }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        return flops * iters / (ms * 1e6);
+    };
+
+    std::printf("  int8 A-dtype A/B  %s  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
+                tag, static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+
+    std::vector<double> vs, vu;
+    for (int r = 0; r < rounds; ++r) {
+        const double gs = time_s8();
+        const double gu = time_u8();
+        vs.push_back(gs);
+        vu.push_back(gu);
+        std::printf("    round %d:  s8=%7.1f  u8=%7.1f   u8/s8=%.3f\n",
+                    r, gs, gu, gu / gs);
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double ms = median(vs), mu = median(vu);
+    std::printf("    median:   s8=%7.1f  u8=%7.1f   u8/s8=%.3f\n", ms, mu, mu / ms);
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -1030,10 +1110,9 @@ NNOPS_BENCH(matmul_f16_route_ab_large) {
 }
 
 NNOPS_BENCH(matmul_f16_route_ab_deep_k) {
-    // Deep K. NOTE: with a compact A, lda == K, so K > PACK_A_STRIDE_THRESHOLD
-    // means the stride heuristic fires on *both* sides — this measures packed
-    // vs packed-transposed, not pack vs direct (the plan prints nn=1 ta=1).
-    // A direct route is simply unreachable at this depth without raising the
+    // Deep K. K > PACK_A_K_THRESHOLD packs A on *both* sides — this measures
+    // packed vs packed-transposed, not pack vs direct (the plan prints nn=1
+    // ta=1). A direct route is unreachable at this depth without raising the
     // threshold.
     bench_route_ab<half>("f16 deep-K (both packed)", "nn", "ta", 512, 2048, 512,
                          /*ta_a=*/false, /*pad_a=*/0,
@@ -1042,11 +1121,10 @@ NNOPS_BENCH(matmul_f16_route_ab_deep_k) {
 }
 
 NNOPS_BENCH(matmul_f16_a_pitch_sweep) {
-    // Walk the A row pitch across PACK_A_STRIDE_THRESHOLD with transpose_a=false
-    // on every row, so lda == pitch and the only thing changing is the plan's
-    // pack_a decision (and the row footprint that drives it). Shows where the
-    // heuristic flips and what the flip costs. Rounds are interleaved across all
-    // pitches so the comparison is thermal-matched (see bench_route_ab).
+    // How much a wide A row pitch costs the *direct* route. K is below
+    // PACK_A_K_THRESHOLD, so pack_a=0 at every pitch and the only variable is
+    // the row footprint the direct reads scatter across. Rounds are interleaved
+    // across all pitches so the comparison is thermal-matched.
     const int64_t M = 512, K = 512, N = 256;
     const int64_t pads[] = {0, 128, 256, 384, 512, 513, 640, 1024, 3072};
     const int rounds = 5, iters = 20;
@@ -1057,11 +1135,9 @@ NNOPS_BENCH(matmul_f16_a_pitch_sweep) {
         routes.emplace_back(M, K, N, /*transpose_a=*/false, 1, pad);
     }
 
-    std::printf("  f16 A row-pitch sweep  %lldx%lldx%lld  1T  rounds=%d iters=%d  "
-                "threshold=%lld elems\n",
+    std::printf("  f16 A row-pitch sweep  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
                 static_cast<long long>(M), static_cast<long long>(K),
-                static_cast<long long>(N), rounds, iters,
-                static_cast<long long>(cpu::PACK_A_STRIDE_THRESHOLD));
+                static_cast<long long>(N), rounds, iters);
 
     std::vector<std::vector<double>> samples(routes.size());
     for (int r = 0; r < rounds; ++r) {
@@ -1081,16 +1157,104 @@ NNOPS_BENCH(matmul_f16_a_pitch_sweep) {
     }
 }
 
-NNOPS_BENCH(matmul_f16_route_ab_stride) {
-    // Layout held fixed (transpose_a=false on both sides) so this isolates the
-    // pack *copy* from the transpose relayout: the direct route reads a compact
-    // A (lda = K, below the heuristic), the packed route trips the stride
-    // heuristic with a wide row pitch (lda = K + PACK_A_STRIDE_THRESHOLD + 512).
-    // The wide pitch is part of the decision the plan makes — read it as "when A
-    // is page-scattered, does packing it back pay off?", not a pure toggle.
-    bench_route_ab<half>("f16 stride-pack", "nn", "nn-wide", 512, 512, 256,
-                         /*ta_a=*/false, /*pad_a=*/0,
-                         /*ta_b=*/false, /*pad_b=*/cpu::PACK_A_STRIDE_THRESHOLD + 512);
+NNOPS_BENCH(matmul_f16_pack_k_flip) {
+    // The pack-A threshold crossed. Layout and M/N are held fixed and K goes
+    // from PACK_A_K_THRESHOLD to +1 — a 0.1% work difference that flips pack_a
+    // from 0 to 1 — so the interleaved ratio is what the threshold buys at the
+    // boundary. Rounds alternate the two routes in one process (see
+    // bench_route_ab).
+    const int64_t M = 512, N = 256;
+    const int64_t k_direct = cpu::PACK_A_K_THRESHOLD;
+    const int64_t k_packed = cpu::PACK_A_K_THRESHOLD + 1;
+    const int rounds = 5, iters = 10;
+
+    RouteAB<half> rd(M, k_direct, N, /*transpose_a=*/false, 1);
+    RouteAB<half> rp(M, k_packed, N, /*transpose_a=*/false, 1);
+
+    std::printf("  f16 pack-A K flip  M=%lld N=%lld  1T  rounds=%d iters=%d\n",
+                static_cast<long long>(M), static_cast<long long>(N),
+                rounds, iters);
+    std::printf("    K=%lld pack_a=%d   K=%lld pack_a=%d\n",
+                static_cast<long long>(k_direct), static_cast<int>(rd.pack_a),
+                static_cast<long long>(k_packed), static_cast<int>(rp.pack_a));
+
+    std::vector<double> vd, vp;
+    for (int r = 0; r < rounds; ++r) {
+        const double gd = rd.time(iters);
+        const double gp = rp.time(iters);
+        vd.push_back(gd);
+        vp.push_back(gp);
+        std::printf("    round %d:  direct=%7.1f  packed=%7.1f   d/p=%.3f\n",
+                    r, gd, gp, gd / gp);
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    std::printf("    median:   direct=%7.1f  packed=%7.1f   d/p=%.3f\n",
+                median(vd), median(vp), median(vd) / median(vp));
+}
+
+// Small GEMMs (M*N*K below GEMM_FAST_PATH_THRESHOLD) take the per-arch naive
+// SIMD kernel instead of the scalar reference. Interleaved A/B in one process,
+// as elsewhere — but the unit is ns/call, since at these sizes the call overhead
+// and not the FLOPs sets the time.
+namespace nnops::backend::cpu::reference {
+void matmul_ref(const MatMulAttributes& attrs,
+                TensorView& output,
+                std::span<const TensorView> inputs,
+                const ComputeContext& ctx,
+                void* workspace);
+}
+
+NNOPS_BENCH(matmul_small_naive_ab) {
+    struct Shape { int64_t M, N, K; };
+    const Shape shapes[] = {{1, 512, 1}, {4, 64, 2}, {16, 16, 3},
+                            {32, 8, 3},  {1, 1, 512}, {8, 32, 3}};
+    const int rounds = 5, iters = 2000;
+
+    std::printf("  small-GEMM naive vs scalar reference  1T  rounds=%d iters=%d  "
+                "(ns/call)\n", rounds, iters);
+
+    for (const Shape& s : shapes) {
+        auto [a_vec, a] = make_tensor<float>(s.M, s.K, s.K, 1);
+        auto [b_vec, b] = make_tensor<float>(s.K, s.N, s.N, 2);
+
+        MatMulAttributes attrs{};
+        auto op = MatMul::create(attrs, Backend::CPU);
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+        auto output = test::make_planar(descs[0], out_buf.data());
+        const TensorView ins[] = {a, b};
+
+        const auto ns_per_call = [&](auto&& fn) {
+            for (int i = 0; i < 20; ++i) { fn(); }
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; ++i) { fn(); }
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::nano>(t1 - t0).count() / iters;
+        };
+
+        std::vector<double> vn, vr;
+        for (int r = 0; r < rounds; ++r) {
+            vn.push_back(ns_per_call([&] { op->compute(output, ins, {}, nullptr); }));
+            vr.push_back(ns_per_call([&] {
+                cpu::reference::matmul_ref(attrs, output, ins, ComputeContext{}, nullptr);
+            }));
+        }
+
+        auto median = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        };
+        const double mn = median(vn), mr = median(vr);
+        std::printf("    M=%2lld N=%4lld K=%3lld   naive=%8.1f  ref=%8.1f   "
+                    "ref/naive=%.2f\n",
+                    static_cast<long long>(s.M), static_cast<long long>(s.N),
+                    static_cast<long long>(s.K), mn, mr, mr / mn);
+    }
 }
 
 // ============================================================
@@ -1108,6 +1272,26 @@ NNOPS_BENCH(matmul_i8_nn_256) {
 NNOPS_BENCH(matmul_i8_tb_large) {
     // LLM-style A @ W^T (transpose_b): weight-B is [N, K] per-token.
     bench_i8_case({"i8 tb 1024x512x1024", 1024, 512, 1024, /*ta=*/false, /*tb=*/true});
+}
+
+NNOPS_BENCH(matmul_u8s8_nn_large) {
+    // Same shape as matmul_i8_nn_large with a u8 activation, so the two rows
+    // answer "what does the unsigned-A contract cost?" from the same table.
+    bench_i8_case({"u8s8 nn 1024x512x1024", 1024, 512, 1024,
+                   /*ta=*/false, /*tb=*/false, /*pad_a=*/0, /*pad_b=*/0,
+                   /*f16=*/false, DataType::u8});
+}
+
+NNOPS_BENCH(matmul_u8s8_tb_large) {
+    bench_i8_case({"u8s8 tb 1024x512x1024", 1024, 512, 1024,
+                   /*ta=*/false, /*tb=*/true, /*pad_a=*/0, /*pad_b=*/0,
+                   /*f16=*/false, DataType::u8});
+}
+
+NNOPS_BENCH(matmul_u8s8_vs_s8_ab) {
+    // Interleaved, same process, identical A bytes: the dtype is the only
+    // variable, so the ratio is the bias bookkeeping and nothing else.
+    bench_i8_u8_ab("nn", 1024, 512, 1024);
 }
 
 // ============================================================
