@@ -13,6 +13,7 @@
 #include "matmul.h"
 #include "matmul_helper.h"
 #include "simd_kernel/simd_epilogue.hpp"
+#include "simd_kernel/simd_int8_reduce.hpp"
 #include "common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
@@ -477,7 +478,8 @@ void matmul_tile(const MatMulAttributes& attrs,
                  int n_start, int n_count,
                  int k, int actual_kc, bool last_k,
                  bool pack_a, const typename R::Elem* packed_b,
-                 typename R::Elem* pack_a_slice, bool a_biased)
+                 typename R::Elem* pack_a_slice, bool a_biased,
+                 const Int8EpilogueParams* ip)
 {
     using Elem = typename R::Elem;
     using Acc  = typename R::Acc;
@@ -488,6 +490,9 @@ void matmul_tile(const MatMulAttributes& attrs,
     // fp-only; compile out of the int8 instantiation.
     const bool scale_c  = R::is_fp && k == 0 && attrs.beta != 1.0f && attrs.beta != 0.0f;
     const bool epilogue = R::is_fp && last_k && has_inplace_epilogue(attrs);
+    // int8 does its output pass in the same place fp does: on the tile the
+    // last k-block just produced, while it is still in cache.
+    const bool int8_ep = !R::is_fp && last_k && (ip != nullptr);
 
     for (int m = m_start; m < m_start + m_count; m += mc) {
         const int actual_mc = std::min(mc, m_start + m_count - m);
@@ -511,6 +516,13 @@ void matmul_tile(const MatMulAttributes& attrs,
         }
         if constexpr (R::is_fp) {
             if (epilogue) { R::epilogue(attrs, c_tile, ldc, actual_mc, n_count); }
+        } else {
+            // From column 0 of C, not from the tile: the kernels index the row
+            // by the absolute output column (they read r_b[n] the same way).
+            if (int8_ep) {
+                int8_epilogue_tile(*ip, c_ptr + m * ldc, ldc, m, n_start,
+                                   actual_mc, n_count);
+            }
         }
     }
 }
@@ -525,7 +537,7 @@ void matmul_block(const MatMulAttributes& attrs,
                   int m_start, int m_count, int n_start, int n_count,
                   typename R::Elem* pack_b_slice,
                   typename R::Elem* pack_a_slice,
-                  bool pack_a, bool a_biased)
+                  bool pack_a, bool a_biased, const Int8EpilogueParams* ip)
 {
     for (int k = 0; k < K; k += kc) {
         const int actual_kc = std::min(kc, K - k);
@@ -536,7 +548,7 @@ void matmul_block(const MatMulAttributes& attrs,
         matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
                        k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice,
-                       a_biased);
+                       a_biased, ip);
     }
 }
 
@@ -691,45 +703,10 @@ inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
-/// r[i] = Σ_j p[j*ld + i]. Sweeping the outer axis keeps the output contiguous;
-/// the per-output form would touch a fresh cache line per element.
-template <class AT>
-void reduce_cols(const AT* p, int64_t ld, int64_t n_out, int64_t n_in,
-                 int32_t* r, const ComputeContext& ctx) {
-    const int64_t tasks = std::min<int64_t>(n_out,
-        std::max<int64_t>(ctx.cpu.thread_count(), 1));
-    ctx.cpu.run(0, tasks, [&](int64_t t) {
-        const int64_t i0 = t * n_out / tasks;
-        const int64_t i1 = (t + 1) * n_out / tasks;
-        for (int64_t i = i0; i < i1; ++i) r[i] = 0;
-        for (int64_t j = 0; j < n_in; ++j) {
-            const AT* row = p + j * ld;
-            for (int64_t i = i0; i < i1; ++i) r[i] += static_cast<int32_t>(row[i]);
-        }
-    });
-}
-
-/// r[i] = Σ_j p[i*ld + j]. Each output is already a contiguous row sum.
-template <class AT>
-void reduce_rows(const AT* p, int64_t ld, int64_t n_out, int64_t n_in,
-                 int32_t* r, const ComputeContext& ctx) {
-    const int64_t tasks = std::min<int64_t>(n_out,
-        std::max<int64_t>(ctx.cpu.thread_count(), 1));
-    ctx.cpu.run(0, tasks, [&](int64_t t) {
-        const int64_t i0 = t * n_out / tasks;
-        const int64_t i1 = (t + 1) * n_out / tasks;
-        for (int64_t i = i0; i < i1; ++i) {
-            const AT* row = p + i * ld;
-            int32_t s = 0;
-            for (int64_t j = 0; j < n_in; ++j) s += static_cast<int32_t>(row[j]);
-            r[i] = s;
-        }
-    });
-}
-
 /// Raw int8 reductions for the epilogue: r_a[m] = Σ_k A[m,k], r_b[n] = Σ_k B[k,n]
 /// (A[k,m] / the mirror image when transposed). Output slabs are disjoint, so
-/// no atomics; int32 accumulation matches the reference bit for bit.
+/// no atomics; int32 accumulation matches the reference bit for bit. The
+/// kernels are in simd_int8_reduce.hpp — this only owns the slab split.
 ///
 /// B is always int8; @p a_u8 selects A's element type — a u8 A must be summed
 /// unsigned, since the compensation is over the true value.
@@ -739,72 +716,38 @@ void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda,
                              int64_t M, int64_t N, int64_t K,
                              int32_t* r_a, int32_t* r_b,
                              const ComputeContext& ctx) {
-    if (a_u8) {
-        const uint8_t* au = reinterpret_cast<const uint8_t*>(a_ptr);
-        if (attrs.transpose_a) reduce_cols(au, lda, M, K, r_a, ctx);
-        else                   reduce_rows(au, lda, M, K, r_a, ctx);
-    } else {
-        if (attrs.transpose_a) reduce_cols(a_ptr, lda, M, K, r_a, ctx);
-        else                   reduce_rows(a_ptr, lda, M, K, r_a, ctx);
-    }
-
-    if (attrs.transpose_b) reduce_rows(b_ptr, ldb, N, K, r_b, ctx);
-    else                   reduce_cols(b_ptr, ldb, N, K, r_b, ctx);
-}
-
-/// int8 epilogue: compensation plus (for an s8 output) requantization, in one
-/// pass. Rows are independent, so they split into slabs without atomics.
-void matmul_int8_epilogue(const MatMulAttributes& attrs,
-                          const TensorView& a, const TensorView& b,
-                          TensorView& output,
-                          int32_t* c_p, int ldc, int64_t c_offset,
-                          int M, int N, int K,
-                          const int32_t* r_a, const int32_t* r_b,
-                          int32_t a_bias_offset, const ComputeContext& ctx)
-{
-    const bool out_s8 = (output.data_type() == DataType::s8);
-    const int ldc_out = static_cast<int>(output.row_stride_elems());
-    int8_t* out_p = out_s8 ? output.ptr<int8_t>() + c_offset : nullptr;
-
-    // Quantization parameters (batch-independent, indexed by m / n / 0).
-    const QuantParams& qa = a.quant_params();
-    const QuantParams& qb = b.quant_params();
-    const QuantParams& qc = output.quant_params();
-    const double  scale_out = (qc.scale_data != nullptr) ? static_cast<double>(qc.scale_data[0])
-                                                         : static_cast<double>(qc.scale);
-    const int32_t zp_out = (qc.zero_point_data != nullptr) ? qc.zero_point_data[0]
-                                                           : qc.zero_point;
-    const bool relu = (attrs.epilogue.type == EpilogueActivateType::Relu);
-
-    const int64_t ep_tasks = std::min<int64_t>(M, std::max<int64_t>(ctx.cpu.thread_count(), 1));
-    ctx.cpu.run(0, ep_tasks, [&](int64_t t) {
-        const int64_t m0 = t * M / ep_tasks;
-        const int64_t m1 = (t + 1) * M / ep_tasks;
-        for (int64_t m = m0; m < m1; ++m) {
-            const int32_t zp_a = quant_zp_at(qa, m);
-            const double  s_a  = out_s8 ? static_cast<double>(quant_scale_at(qa, m)) : 0.0;
-            for (int64_t n = 0; n < N; ++n) {
-                // Both arches return the exact s8×s8 product. x86 folds the
-                // VNNI bias out in-kernel; aarch64 leaves the u8 A's -128 shift
-                // in, withdrawn here with the full-K column sums.
-                int32_t v = matmul_int8_compensate(c_p[m * ldc + n], a_bias_offset,
-                                                   zp_a, quant_zp_at(qb, n),
-                                                   r_a[static_cast<size_t>(m)],
-                                                   r_b[static_cast<size_t>(n)],
-                                                   K);
-                if (relu) {
-                    v = std::max(v, 0);
+    // `rows` is the reduction direction: r[i] = Σ_j p[i*ld+j] when the K axis
+    // is contiguous (the transposed layout), else a column slab.
+    const auto reduce = [&](const void* p, bool u8, int64_t ld, int64_t n_out,
+                            bool rows, int32_t* r) {
+        const int64_t tasks = std::min<int64_t>(
+            n_out, std::max<int64_t>(ctx.cpu.thread_count(), 1));
+        ctx.cpu.run(0, tasks, [&](int64_t t) {
+            const int64_t i0 = t * n_out / tasks;
+            const int64_t i1 = (t + 1) * n_out / tasks;
+            if (rows) {
+                for (int64_t i = i0; i < i1; ++i) {
+                    r[i] = u8
+                        ? kernel::int8_row_sum(
+                              static_cast<const uint8_t*>(p) + i * ld, K)
+                        : kernel::int8_row_sum(
+                              static_cast<const int8_t*>(p) + i * ld, K);
                 }
-                if (out_s8) {
-                    const double req = s_a * static_cast<double>(quant_scale_at(qb, n))
-                                     / scale_out;
-                    out_p[m * ldc_out + n] = matmul_int8_requant(v, req, zp_out);
+            } else {
+                for (int64_t i = i0; i < i1; ++i) { r[i] = 0; }
+                if (u8) {
+                    kernel::int8_col_sum_slab(static_cast<const uint8_t*>(p), ld,
+                                              i0, i1, K, r);
                 } else {
-                    c_p[m * ldc + n] = v;
+                    kernel::int8_col_sum_slab(static_cast<const int8_t*>(p), ld,
+                                              i0, i1, K, r);
                 }
             }
-        }
-    });
+        });
+    };
+
+    reduce(a_ptr, a_u8, lda, M, /*rows=*/!attrs.transpose_a, r_a);
+    reduce(b_ptr, /*u8=*/false, ldb, N, /*rows=*/attrs.transpose_b, r_b);
 }
 
 // =========================================================================
@@ -887,11 +830,56 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const int64_t num_blocks = split_n ? split_block_count(Ni, nc)
                                        : split_block_count(Mi, mc);
 
+    // The reduction sweep and the epilogue exist only to apply quantization:
+    // with no zero points, no activation, no s8 output and no A shift left to
+    // withdraw, both are arithmetic identities (compensate reduces to `raw`).
+    // They are not free — a full sweep of A and B up front, then a pass over
+    // every element of C — and at shallow K that fixed cost is what keeps the
+    // call off the kernel rate.
+    bool int8_passes = false;
     std::vector<int32_t> r_a, r_b;
     if constexpr (!R::is_fp) {
-        r_a.resize(static_cast<size_t>(Mi));
-        r_b.resize(static_cast<size_t>(Ni));
+        const QuantParams& qa = a.quant_params();
+        const QuantParams& qb = b.quant_params();
+        int8_passes = out_s8 || a_bias_offset != 0 ||
+                      attrs.epilogue.type != EpilogueActivateType::None ||
+                      qa.zero_point != 0 || qb.zero_point != 0 ||
+                      qa.zero_point_data != nullptr || qb.zero_point_data != nullptr;
+        if (int8_passes) {
+            r_a.resize(static_cast<size_t>(Mi));
+            r_b.resize(static_cast<size_t>(Ni));
+        }
     }
+
+    // The int8 output pass rides on the last k-block's tile, exactly where fp
+    // runs its epilogue, so C is never swept a second time. Its full-K inputs
+    // (the reductions) are ready before the blocks start; only the s8
+    // destination moves per batch.
+    Int8EpilogueParams ip{};
+    if constexpr (!R::is_fp) {
+        if (int8_passes) {
+            const QuantParams& qa = a.quant_params();
+            const QuantParams& qb = b.quant_params();
+            const QuantParams& qc = output.quant_params();
+            ip.r_a = r_a.data();
+            ip.r_b = r_b.data();
+            ip.s_a = qa.scale_data;
+            ip.s_a_scalar = qa.scale;
+            ip.zp_a = qa.zero_point_data;
+            ip.zp_a_scalar = qa.zero_point;
+            ip.s_b = qb.scale_data;
+            ip.s_b_scalar = qb.scale;
+            ip.zp_b = qb.zero_point_data;
+            ip.zp_b_scalar = qb.zero_point;
+            ip.out_scale = quant_scale_at(qc, 0);  // requant only
+            ip.zp_out = quant_zp_at(qc, 0);
+            ip.a_bias_offset = a_bias_offset;
+            ip.k = Ki;
+            ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
+            ip.ldc_out = ldc_out;
+        }
+    }
+    const Int8EpilogueParams* ip_or_null = int8_passes ? &ip : nullptr;
 
     for (int64_t bi = 0; bi < batch.total; ++bi) {
         int64_t a_offset, b_offset, c_offset;
@@ -905,9 +893,12 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
             // Integer matmul ignores alpha/beta, so C starts at zero. fp needs
             // no pass: its first k-block runs the zero_mode kernel.
             R::zero_c(c_p, ldc, Mi, Ni);
-            compute_int8_reductions(a_p, a.data_type() == DataType::u8, lda,
-                                    b_src.ptr, ldb, attrs, M, N, K,
-                                    r_a.data(), r_b.data(), ctx);
+            if (int8_passes) {
+                compute_int8_reductions(a_p, a.data_type() == DataType::u8, lda,
+                                        b_src.ptr, ldb, attrs, M, N, K,
+                                        r_a.data(), r_b.data(), ctx);
+                if (out_s8) { ip.out = output.ptr<int8_t>() + c_offset; }
+            }
         }
 
         if (split_n) {
@@ -919,7 +910,8 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 Ki, kc, mc, 0, Mi, nr.start, nr.count,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                plan.pack_a, a_biased);
+                                plan.pack_a, a_biased,
+                                ip_or_null);
             });
         } else if constexpr (R::hoists_b_m_split) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
@@ -935,7 +927,7 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                    mr.start, mr.count, mc, 0, Ni,
                                    k, actual_kc, last_k, plan.pack_a, pack_b_base,
                                    pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                   a_biased);
+                                   a_biased, ip_or_null);
                 });
             }
         } else {
@@ -947,14 +939,9 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 Ki, kc, mc, mr.start, mr.count, 0, Ni,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                plan.pack_a, a_biased);
+                                plan.pack_a, a_biased,
+                                ip_or_null);
             });
-        }
-
-        if constexpr (!R::is_fp) {
-            matmul_int8_epilogue(attrs, a, b, output, c_p, ldc, c_offset,
-                                 Mi, Ni, Ki, r_a.data(), r_b.data(),
-                                 a_bias_offset, ctx);
         }
     }
 }

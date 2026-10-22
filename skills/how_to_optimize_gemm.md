@@ -455,9 +455,37 @@ Beta scaling (`C = A×B + beta×C`) is fused too: `tile_scale` applies `beta` at
 `k == 0` for `beta ∉ {0, 1}`, and `zero_mode` lets the first k-block skip the C
 load entirely when `beta == 0`.
 
-The int8 path is separate: it folds only `Relu` (as a clamp on the requantized
-output) and computes the raw int8 reductions needed for the zero-point
-compensation (`compute_int8_reductions`).
+The int8 path folds only `Relu` (as a clamp on the requantized output). Its
+output pass is fused exactly like fp's: `int8_epilogue_tile` runs inside
+`matmul_tile` at `last_k`, on the tile the last k-block just produced, and does
+compensation plus (for an s8 output) requantization in one vectorized row walk
+(`int8_epilogue_row_s32` / `_s8` in
+[simd_epilogue.hpp](../src/backend/cpu/simd_kernel/simd_epilogue.hpp)). Only the
+s8 destination moves per batch element, so the parameters
+(`Int8EpilogueParams`) are built once per call.
+
+The one thing that cannot be tile-local is the **reduction** input: the
+compensation needs `r_a[m] = Σ_k A[m,k]` and `r_b[n] = Σ_k B[k,n]` over the
+*full* K, so they must be complete before the first tile finishes. They stay a
+pre-pass (`compute_int8_reductions`, kernels in
+[simd_int8_reduce.hpp](../src/backend/cpu/simd_kernel/simd_int8_reduce.hpp)),
+one sweep of A and B, 0.03 ms of a 2.6 ms call at 1024×512×1024. Folding them
+into the packers is the only way to remove that sweep, and it would either
+duplicate the A sum across every N-block task or need per-task scratch.
+
+Both passes are **skipped whenever they are the identity** — no s8 output, no
+activation, no A shift left to withdraw, and zero points of zero
+(`matmul_int8_compensate` then returns the raw accumulator unchanged). Before
+that gate existed they were a separate sweep of A and B plus a scalar pass over
+all of C, and at shallow K they dominated the call (K=128 was 111 of the
+kernel's ~570 GOPS). Worth checking the same recursion whenever an epilogue grows
+a branch that is a no-op for the default attributes.
+
+The fusion's measured value is modest: on s8→s8 with per-tensor scales, 256³
+went 0.120 → 0.108 ms/call at 1T and 1024×512×1024 was flat (2.59 → 2.60 ms).
+The pass is compute-bound on the f64 requant, not on the C re-read, so removing
+the second sweep of C does not buy much; the win is structural — one dispatch
+instead of two, no full-M×N pass.
 
 ---
 
