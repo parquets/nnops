@@ -2247,3 +2247,118 @@ NNOPS_TEST(matmul_naive_kernel_layouts) {
     run(0.0f);
     run(half{});
 }
+
+// ============================================================
+// GEMV route (M <= GEMV_M_MAX): direct kernels, no packing
+// ============================================================
+
+NNOPS_TEST(matmul_gemv_route_layouts) {
+    // Small M leaves the packed route entirely: the direct kernel streams B
+    // once. Every shape below is far above GEMM_FAST_PATH_THRESHOLD, so each
+    // really takes that route — except ta+tb, which the kernel declines and the
+    // packed path must still answer. Covered: both dtypes, every transpose
+    // pair, k and n tails, N on both sides of the 1024-wide GEMV block, beta, a
+    // Relu epilogue, and a broadcast batch.
+    namespace cpu = nnops::backend::cpu;
+    using cpu::half;
+
+    struct Case {
+        int64_t M, N, K;
+        bool ta, tb, batch, beta, relu;
+    };
+    const Case cases[] = {
+        {1, 3000, 64,   false, false, false, false, false},
+        {2, 129,  512,  false, true,  false, true,  true},
+        {3, 1024, 300,  true,  false, false, false, false},
+        {4, 33,   4096, false, false, false, true,  false},
+        {1, 700,  900,  false, false, true,  false, true},
+        {2, 100,  700,  true,  true,  false, false, false},
+    };
+
+    const auto run = [&](auto dtype_tag) {
+        using T = decltype(dtype_tag);
+        constexpr float tol = std::is_same_v<T, float> ? 1e-4f : kF16AccumTol;
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32
+                                                         : DataType::f16;
+
+        const auto cast = [](float v) -> T {
+            if constexpr (std::is_same_v<T, float>) { return v; }
+            else { return cpu::float_to_half(v); }
+        };
+        const auto to_f = [](T v) -> float {
+            if constexpr (std::is_same_v<T, float>) { return v; }
+            else { return cpu::half_to_float(v); }
+        };
+
+        for (const Case& c : cases) {
+            const int64_t a_rows = c.ta ? c.K : c.M;
+            const int64_t a_cols = c.ta ? c.M : c.K;
+            const int64_t b_rows = c.tb ? c.N : c.K;
+            const int64_t b_cols = c.tb ? c.K : c.N;
+            const int64_t batch = c.batch ? 2 : 1;
+
+            // The reference is f32-only, so it reads f32 mirrors of the same
+            // values (the f16 inputs are already rounded to what the op saw).
+            nnops::test::XorShift128 rng(31);
+            std::vector<float> af32(static_cast<size_t>(batch * a_rows * a_cols));
+            std::vector<float> bf32(static_cast<size_t>(batch * b_rows * b_cols));
+            for (auto& v : af32) { v = rng.next_float(-1.0f, 1.0f); }
+            for (auto& v : bf32) { v = rng.next_float(-1.0f, 1.0f); }
+            std::vector<T> abuf(af32.size());
+            std::vector<T> bbuf(bf32.size());
+            for (size_t i = 0; i < af32.size(); ++i) { abuf[i] = cast(af32[i]); }
+            for (size_t i = 0; i < bf32.size(); ++i) { bbuf[i] = cast(bf32[i]); }
+
+            TensorView a, b, a32, b32;
+            if (c.batch) {
+                const int64_t as[] = {batch, a_rows, a_cols};
+                const int64_t bs[] = {batch, b_rows, b_cols};
+                a   = TensorView(as, dt, abuf.data());
+                b   = TensorView(bs, dt, bbuf.data());
+                a32 = TensorView(as, DataType::f32, af32.data());
+                b32 = TensorView(bs, DataType::f32, bf32.data());
+            } else {
+                const int64_t as[] = {a_rows, a_cols};
+                const int64_t bs[] = {b_rows, b_cols};
+                a   = TensorView(as, dt, abuf.data());
+                b   = TensorView(bs, dt, bbuf.data());
+                a32 = TensorView(as, DataType::f32, af32.data());
+                b32 = TensorView(bs, DataType::f32, bf32.data());
+            }
+
+            MatMulAttributes attrs{};
+            attrs.transpose_a = c.ta;
+            attrs.transpose_b = c.tb;
+            if (c.beta) { attrs.beta = 0.5f; }
+            if (c.relu) { attrs.epilogue.type = EpilogueActivateType::Relu; }
+            auto op = MatMul::create(attrs, Backend::CPU);
+
+            const TensorDesc arr[] = {a.desc(), b.desc()};
+            auto descs = op->getOutputTensorDesc(arr);
+            std::vector<T> got_buf(static_cast<size_t>(descs[0].numel()));
+            std::vector<float> want_buf(static_cast<size_t>(descs[0].numel()));
+            // Seed C so a beta would be observable.
+            for (size_t i = 0; i < got_buf.size(); ++i) {
+                got_buf[i] = cast(static_cast<float>(i % 17) * 0.25f);
+                want_buf[i] = to_f(got_buf[i]);
+            }
+            auto got = nnops::test::make_planar(descs[0], got_buf.data());
+
+            const TensorView ins[] = {a, b};
+            op->compute(got, ins, {}, nullptr);
+
+            const TensorView ref_ins[] = {a32, b32};
+            const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
+            auto ref_descs = op->getOutputTensorDesc(ref_arr);
+            auto want = nnops::test::make_planar(ref_descs[0], want_buf.data());
+            cpu::reference::matmul_ref(attrs, want, ref_ins, {}, nullptr);
+
+            for (size_t i = 0; i < got_buf.size(); ++i) {
+                NNOPS_EXPECT_NEAR(to_f(got_buf[i]), want_buf[i], tol);
+            }
+        }
+    };
+
+    run(float{});
+    run(half{});
+}

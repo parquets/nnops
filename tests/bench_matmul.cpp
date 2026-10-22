@@ -1257,6 +1257,102 @@ NNOPS_BENCH(matmul_small_naive_ab) {
     }
 }
 
+// GEMV (M <= 4): the packed route sweeps B twice (write the packed copy, then
+// read it back) for a handful of output rows; the direct route streams B once.
+// The packed side is forced by handing the same GEMM over as ta+tb, which is
+// the one layout the direct kernel declines. Interleaved A/B at 1T, then a
+// thread ladder for the direct route (its N blocks are the parallel unit).
+template <typename T>
+void bench_gemv_dtype(const char* tag) {
+    struct Shape { int64_t M, N, K; };
+    const Shape shapes[] = {{1, 2048, 2048}, {2, 2048, 2048}, {3, 2048, 2048},
+                            {4, 2048, 2048}, {8, 2048, 2048}};
+    const int rounds = 5, iters = 10;
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    std::vector<int> threads{1, 2, 4, 8};
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
+        threads.push_back(hw);
+    }
+
+    std::printf("  GEMV direct (no pack) vs packed  %s  rounds=%d iters=%d\n",
+                tag, rounds, iters);
+
+    for (const Shape& s : shapes) {
+        // Direct: A [M][K], B [K][N] (the GEMV kernel's own layout).
+        auto [a_vec, a] = make_tensor<T>(s.M, s.K, s.K, 1);
+        auto [b_vec, b] = make_tensor<T>(s.K, s.N, s.N, 2);
+        // Packed: the same GEMM as A^T [K][M] and B^T [N][K].
+        auto [at_vec, at] = make_tensor<T>(s.K, s.M, s.M, 3);
+        auto [bt_vec, bt] = make_tensor<T>(s.N, s.K, s.K, 4);
+
+        MatMulAttributes attrs_direct{};
+        MatMulAttributes attrs_packed{};
+        attrs_packed.transpose_a = true;
+        attrs_packed.transpose_b = true;
+        auto op_direct = MatMul::create(attrs_direct, Backend::CPU);
+        auto op_packed = MatMul::create(attrs_packed, Backend::CPU);
+
+        const TensorDesc descs_in[] = {a.desc(), b.desc()};
+        auto descs = op_direct->getOutputTensorDesc(descs_in);
+        std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
+        auto output = test::make_planar(descs[0], out_buf.data());
+        const TensorView ins_direct[] = {a, b};
+        const TensorView ins_packed[] = {at, bt};
+
+        const auto ns_per_call = [&](auto&& fn) {
+            for (int i = 0; i < 2; ++i) { fn(); }
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; ++i) { fn(); }
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::nano>(t1 - t0).count() / iters;
+        };
+
+        std::vector<double> vd, vp;
+        for (int r = 0; r < rounds; ++r) {
+            vd.push_back(ns_per_call(
+                [&] { op_direct->compute(output, ins_direct, ComputeContext{}, nullptr); }));
+            vp.push_back(ns_per_call(
+                [&] { op_packed->compute(output, ins_packed, ComputeContext{}, nullptr); }));
+        }
+
+        const double md = median(vd), mp = median(vp);
+        const double flops = 2.0 * static_cast<double>(s.M) *
+                             static_cast<double>(s.N) * static_cast<double>(s.K);
+        std::printf("    M=%lld N=%lld K=%lld   direct=%8.2f GFLOPS  "
+                    "packed=%8.2f GFLOPS   d/p=%.2f\n",
+                    static_cast<long long>(s.M), static_cast<long long>(s.N),
+                    static_cast<long long>(s.K), flops / md, flops / mp,
+                    mp / md);
+
+        // The direct route splits N across threads instead of batching the
+        // packing work, so its ladder starts at one row of output.
+        std::printf("      direct ladder:");
+        const ComputeContext serial{};
+        for (int nt : threads) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            const ComputeContext& use_ctx = (nt > 1) ? ctx : serial;
+            const double ns = ns_per_call([&] {
+                op_direct->compute(output, ins_direct, use_ctx, nullptr);
+            });
+            std::printf("  %dT %6.1f", nt, flops / ns);
+        }
+        std::printf("  GFLOPS\n");
+    }
+}
+
+NNOPS_BENCH(matmul_gemv_direct_ab) {
+    bench_gemv_dtype<float>("f32");
+    bench_gemv_dtype<half>("f16");
+}
+
 // ============================================================
 // int8 (s8×s8 → s32) — qgemm path
 // ============================================================

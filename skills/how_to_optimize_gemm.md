@@ -46,7 +46,9 @@ Rules, in order:
 
 1. **B is always packed.** The packed RHS is what the micro-kernel consumes
    (`tile_mma_pack(..., -1)` / `tile_mma_direct(..., -1)`); packing it is the
-   RHS-reuse win and is never skipped.
+   RHS-reuse win and is never skipped. The one exception is below the plan
+   entirely: at M ≤ 4 the driver takes the GEMV route (rule 4), which never
+   touches the pack at all.
 2. **A packs on correctness, dtype or depth.** int8 has no direct-A route at
    all (`tile_pack_lhs_i8` is unconditional); `transpose_a` forces packing (the
    micro-kernel wants A as `[m][k]` panels); otherwise A packs only when the
@@ -63,6 +65,17 @@ Rules, in order:
    one vectorized-over-K dot product per output. Operands stored the other way
    round are transposed into a 1024-element stack scratch. Unsupported dtype
    pairs and "no workspace" calls still go to the reference.
+4. **GEMV path (f32 and f16, M ≤ 4 at any size).** Above the small-GEMM budget
+   the packed route is the wrong trade for a handful of output rows: it sweeps
+   all of B twice (write the packed copy, read it back) and reads it a third
+   time in the micro-kernel, while a direct kernel reads B once. So at
+   `M <= GEMV_M_MAX` (4) the driver calls the arch's `matmul_gemv` and skips the
+   plan. The kernel walks **k outer, n-block inner** with `gemv_block = 1024`
+   (4 KB contiguous of B per k, accumulators L1-resident); a `[N][K]` B gets the
+   dot-product twin that keeps one k-vector accumulator per output row.
+   `transpose_a && transpose_b` is the one layout pair the direct kernel
+   declines, and the packed route answers it. Blocks give the pool N-parallel
+   work; a batch > 1 parallelizes over the batch instead.
 
 ### 1.3 Workspace Model (TensorRT Pattern)
 
@@ -496,8 +509,9 @@ the M-split.
 1. **2D + batched.** Rank-2 runs the fused tiled kernels; rank > 2 runs the same
    kernels per batch element with numpy-style broadcast. Fused tiled kernels
    exist for f32, f16, and s8×s8 → s32/s8 (`matmul_dispatch_int8`); small f32/f16
-   products go to the naive arch kernel (§1.2 rule 3) and every other dtype
-   combination falls through to the reference kernel.
+   products go to the naive arch kernel (§1.2 rule 3), M ≤ 4 f32/f16 products to
+   the GEMV kernel (§1.2 rule 4), and every other dtype combination falls through
+   to the reference kernel.
 
 2. **Multi-threading is now in.** Parallel decomposition is block-granularity and
    bit-identical to serial; see §7.

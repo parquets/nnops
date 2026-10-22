@@ -1,15 +1,19 @@
 #pragma once
 /// @file matmul_naive.hpp
-/// @brief AArch64 NEON GEMM for shapes below the small-GEMM threshold.
+/// @brief AArch64 NEON direct kernels: small GEMMs and GEMV, no packing.
 ///
-/// A plain triple loop with the n axis vectorized 4-wide: per row of A one
-/// a[m,k] is broadcast and FMA'd across a 4-lane row of B. No packing, tiling,
-/// blocking or threading — below GEMM_FAST_PATH_THRESHOLD MACs those setups cost
-/// more than the arithmetic they save.
+/// matmul_naive is a plain triple loop with the n axis vectorized 4-wide: per
+/// row of A one a[m,k] is broadcast and FMA'd across a 4-lane row of B. No
+/// packing, tiling, blocking or threading — below GEMM_FAST_PATH_THRESHOLD MACs
+/// those setups cost more than the arithmetic they save.
 ///
 /// The hot loop wants B as [K][N]; a transposed B ([N][K]) is copied into a
 /// stack scratch first. A transposed A only changes the stride the scalar
 /// broadcast walks.
+///
+/// matmul_gemv covers the other small-M extreme (M <= 4 at any size): it reads
+/// B once, so no pack is ever justified, but it blocks over n so that each k
+/// contributes a contiguous run of B (see the comment at gemv_block).
 ///
 /// fp16 is widened to f32 for the accumulate and narrowed again on write-back.
 
@@ -17,6 +21,14 @@
 #include "nnops/detail/half.hpp"
 
 namespace nnops::backend::cpu::aarch64 {
+
+/// GEMV n-block: the slice of N one call owns. M rows of f32 accumulators stay
+/// in L1 (16 KB at most) and each k contributes a contiguous 4 KB run of B, so
+/// the prefetcher still sees sequential data.
+constexpr int gemv_block = 1024;
+
+/// Output rows one GEMV call handles; the driver's M cutoff must not exceed it.
+constexpr int gemv_max_m = 4;
 
 namespace naive_detail {
 
@@ -174,7 +186,120 @@ inline void gemm(int M, int N, int K,
     dots<T>(M, N, K, ak, akstride, bk, bkstride, c, ldc, beta);
 }
 
+// ---- GEMV (M small) ----------------------------------------------------
+//
+// The packed route sweeps all of B twice (write the packed copy, then read it
+// back) for a handful of output rows. These kernels read B once instead.
+
+/// C[m][n0:n1] += A[m][:] · B[:][n] for a row-major [K][N] B. k outer, n-block
+/// inner: B is read once and in order, and the accumulators ping-pong through
+/// L1 — the traversal a GEMV wants (the reverse order walks B with an ldb
+/// stride, one cache line at a time, which no prefetcher follows).
+/// A transposed A only changes the stride the scalar broadcast walks.
+template <typename T>
+inline void gemv_nn(int M, int N, int K,
+                    const T* a, int lda, bool ta,
+                    const T* b, int ldb,
+                    T* c, int ldc, float beta,
+                    int n0, int n1) noexcept {
+    const int nb = n1 - n0;
+    alignas(16) float acc[gemv_max_m][gemv_block];
+    for (int m = 0; m < M; ++m) {
+        for (int j = 0; j < nb; ++j) { acc[m][j] = 0.0f; }
+    }
+
+    for (int k = 0; k < K; ++k) {
+        const T* b_row = b + static_cast<int64_t>(k) * ldb + n0;
+        float av[gemv_max_m];
+        for (int m = 0; m < M; ++m) {
+            av[m] = to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
+                                   : static_cast<int64_t>(m) * lda + k));
+        }
+        int j = 0;
+        for (; j + lanes <= nb; j += lanes) {
+            const float32x4_t bv = load4(b_row + j);
+            for (int m = 0; m < M; ++m) {
+                float32x4_t v = vld1q_f32(acc[m] + j);
+                v = vfmaq_n_f32(v, bv, av[m]);
+                vst1q_f32(acc[m] + j, v);
+            }
+        }
+        for (; j < nb; ++j) {
+            const float bj = to_f32(b_row + j);
+            for (int m = 0; m < M; ++m) { acc[m][j] += av[m] * bj; }
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        for (int j = 0; j < nb; ++j) {
+            T* dst = c + m * ldc + n0 + j;
+            store1(dst, (beta != 0.0f) ? acc[m][j] + beta * to_f32(dst) : acc[m][j]);
+        }
+    }
+}
+
+/// C[m][n0:n1] += A[m][:] · B[n][:] for a [N][K] B: one k-vector accumulator
+/// per output row, B read once and in order. Holds row-major A only.
+template <typename T>
+inline void gemv_tn(int M, int N, int K,
+                    const T* a, int lda,
+                    const T* b, int ldb,
+                    T* c, int ldc, float beta,
+                    int n0, int n1) noexcept {
+    for (int n = n0; n < n1; ++n) {
+        const T* b_row = b + static_cast<int64_t>(n) * ldb;
+        float32x4_t vacc[gemv_max_m];
+        for (int m = 0; m < M; ++m) { vacc[m] = vdupq_n_f32(0.0f); }
+
+        int k = 0;
+        for (; k + lanes <= K; k += lanes) {
+            const float32x4_t bv = load4(b_row + k);
+            for (int m = 0; m < M; ++m) {
+                vacc[m] = vfmaq_f32(vacc[m],
+                                    load4(a + static_cast<int64_t>(m) * lda + k), bv);
+            }
+        }
+        for (int m = 0; m < M; ++m) {
+            float sum = hsum(vacc[m]);
+            for (int t = k; t < K; ++t) {
+                sum += to_f32(a + static_cast<int64_t>(m) * lda + t) * to_f32(b_row + t);
+            }
+            T* dst = c + m * ldc + n;
+            store1(dst, (beta != 0.0f) ? sum + beta * to_f32(dst) : sum);
+        }
+    }
+}
+
 }  // namespace naive_detail
+
+/// C[m][n_begin:n_end] = A·B + beta·C for M <= gemv_max_m, no packing. Handles
+/// every layout except a transposed A against a transposed B (the caller keeps
+/// that on the packed route).
+inline void matmul_gemv(int M, int N, int K,
+                        const float* a, int lda, bool trans_a,
+                        const float* b, int ldb, bool trans_b,
+                        float* c, int ldc, float beta,
+                        int n_begin, int n_end) noexcept {
+    if (trans_b) {
+        naive_detail::gemv_tn<float>(M, N, K, a, lda, b, ldb, c, ldc, beta, n_begin, n_end);
+    } else {
+        naive_detail::gemv_nn<float>(M, N, K, a, lda, trans_a, b, ldb, c, ldc, beta,
+                                     n_begin, n_end);
+    }
+}
+
+inline void matmul_gemv(int M, int N, int K,
+                        const half* a, int lda, bool trans_a,
+                        const half* b, int ldb, bool trans_b,
+                        half* c, int ldc, float beta,
+                        int n_begin, int n_end) noexcept {
+    if (trans_b) {
+        naive_detail::gemv_tn<half>(M, N, K, a, lda, b, ldb, c, ldc, beta, n_begin, n_end);
+    } else {
+        naive_detail::gemv_nn<half>(M, N, K, a, lda, trans_a, b, ldb, c, ldc, beta,
+                                    n_begin, n_end);
+    }
+}
 
 /// C = A·B + beta·C for a small M×N×K, operands in either transpose layout.
 /// The epilogue is the caller's.
