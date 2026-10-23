@@ -3,6 +3,12 @@
 A record of the optimization decisions, constraints, and trade-offs that shaped the
 tiled GEMM implementation in [src/backend/cpu/matmul.cpp](../src/backend/cpu/matmul.cpp)
 and the shared pack/MMA helpers in [src/backend/cpu/matmul_helper.h](../src/backend/cpu/matmul_helper.h).
+The two routes that bypass the plan — the small-GEMM / GEMV paths (rules 3 and 4
+below) and the fused Q5_1 decode — are self-contained and live beside it in
+[matmul_small.cpp](../src/backend/cpu/matmul_small.cpp) and
+[matmul_q5_fused.cpp](../src/backend/cpu/matmul_q5_fused.cpp); what they share with
+the driver (dims, batch walk, epilogue predicates) is in
+[matmul_internal.h](../src/backend/cpu/matmul_internal.h).
 
 ---
 
@@ -64,7 +70,9 @@ Rules, in order:
    wide N sweeps eight (four on NEON) columns per row of A; narrow N switches to
    one vectorized-over-K dot product per output. Operands stored the other way
    round are transposed into a 1024-element stack scratch. Unsupported dtype
-   pairs and "no workspace" calls still go to the reference.
+   pairs and "no workspace" calls still go to the reference. Both this rule and
+   the next live in `matmul_small.cpp`; `matmul_small_fp` is the whole driver
+   interface to them.
 4. **GEMV path (f32 and f16, M ≤ 4 at any size).** Above the small-GEMM budget
    the packed route is the wrong trade for a handful of output rows: it sweeps
    all of B twice (write the packed copy, read it back) and reads it a third
@@ -486,6 +494,135 @@ went 0.120 → 0.108 ms/call at 1T and 1024×512×1024 was flat (2.59 → 2.60 m
 The pass is compute-bound on the f64 requant, not on the C re-read, so removing
 the second sweep of C does not buy much; the win is structural — one dispatch
 instead of two, no full-M×N pass.
+
+### 6.1 fp activations → int8 GEMM → fp output (W8A8, offline parameters)
+
+The deployment shape: the activation quantization parameters are calibrated
+offline, A arrives as f32/f16 carrying them in its `QuantParams` (PerTensor or
+PerToken), B is s8 with a per-output-channel scale, and C must come back in A's
+dtype. `is_fp_quant_matmul(a, b, a_qp)` is the predicate; `matmul_cpu` routes it
+to `matmul_dq<T>`.
+
+```text
+A_q[m,k] = clamp(rne(A[m,k] · (1/s_a[m]) + zp_a[m]), qmin, qmax)   // s8 or u8
+acc      = Σ_k (A_q[m,k] + u8_shift) · B[k,n]                     // the int8 MMA
+C[m,n]   = ep(clamp(acc · s_a[m] · s_b[n], min_clip, max_clip))   // f32 math
+```
+
+Three pieces, and only the first is new machinery:
+
+1. **The quantize pass** (`quantize_activation<T>`) reuses
+   `quant_kernel::quantization` — per-row scale, per-row-or-null zero, FMA +
+   RNE + saturating clamp, f32 and f16 overloads on both arches. It slab-splits
+   rows over `ctx.cpu.run`, so it costs 0.031 ms of a 2.3 ms call at
+   1024×512×1024 (1.3%) and ~17 Gvalues/s at 1T.
+2. **The GEMM is the existing int8 route.** The trick that makes this free:
+   `matmul_dq` describes A_q as a compact s8/u8 `TensorView` with *A's shape and
+   A's QuantParams* — the same view shape it hands to the plan, and the same one
+   it materializes when the pack has to read it. `get_matmul_plan`, the batch
+   walk, `lda`, `compute_int8_reductions` and — critically —
+   `a_biased`/`a_bias_offset`, which come from the *target* dtype, are then all
+   correct with **zero plan changes**. Never derive the pack bias from the
+   original fp A: on x86 that loses an XOR and on aarch64 adds one, and every
+   output is wrong. That is what `R::a_eff_type(attrs, a)` exists for: on the
+   fused route it answers `attrs.act_quant_dtype`, everywhere else
+   `a.data_type()`.
+3. **The epilogue** is `dq_epilogue_tile<TOut>` (in
+   [simd_epilogue.hpp](../src/backend/cpu/simd_kernel/simd_epilogue.hpp)),
+   modelled on `int8_epilogue_tile`: same compensation, then
+   `float(acc) · (s_a·s_b)` in f32, then clip, then `apply_epilogue`. All
+   indices are absolute columns, so it works unchanged for the N-split.
+
+The order matters: **clip cannot be folded into the MMA clamp**, because the MMA
+clamps the int32 accumulate while the clip applies after dequantization — even
+`Relu` has to run in the epilogue. `DqRoute<TOut> : I8Route` therefore sets
+`always_epilogue = true`, `c_base()` always returns the int32 accumulator (the
+output is fp, so it cannot accumulate in place), and `extra_workspace` is
+`M·N·4` unconditionally.
+
+Per-token arrays are indexed by A's **global** row, so the per-batch refresh uses
+`row_base = a_offset / lda` (batch strides are whole rows). A broadcast A lands
+at row 0 of the array, which is what the reference does too.
+
+The same route serves the "A is already quantized, give me fp out" case
+(`output_dtype = f32/f16` on an s8/u8 A): no quantize pass, everything else
+identical.
+
+Measured (Release, 20 logical cores, `bench_matmul matmul_dq_*`). The point
+cases pin one shape each; `matmul_dq_size_sweep` / `_tb_size_sweep` /
+`_f16_size_sweep` / `_rect_sweep` replay the same square ladder as
+`matmul_i8_size_sweep` (plus the N-split, deep-K and 1-row corners) so the two
+tables read side by side, and `matmul_dq_vs_fp_sweep` prints dq/dense per size:
+
+At 1024×512×1024, 1 thread:
+
+- dq, per-token, f32 activations: **~460 GFLOPS** (457.9 median of the A/B rows)
+- same-shape `matmul_i8_nn_large`: 540 GOPS — dq is **85%** of int8
+- dense f32 B over the same A: 142 GFLOPS — **dq/dense = 3.2**
+- dense f16 B at 4T: 293 GFLOPS against dq's 957 — **dq/dense = 3.3**; a B that
+  is only half as wide saves less on paper, but the f16 dense route scales
+  worse across threads, so the measured ratio holds
+- the quantize pass on its own: 1.3% of the call
+
+**The reduction sweep is conditional.** `compensate()` is the identity when
+`a_bias_offset + zp_a == 0` for every row and every `zp_b == 0`, which is the
+ordinary symmetric s8 W8A8 setup; the dispatch then skips
+`compute_int8_reductions` entirely (`int8_passes == false`, while `int8_ep`
+keeps the dequant output pass running) and the row pass drops both loads.
+Measured on the same instrument by flipping that one condition: **+3%** at
+1024×512×1024 and **+13%** at 256³ on one thread, and one fewer `ctx.cpu.run`
+per call, which in the bench harness is worth another ~20-30% at 4T because
+`SimplePool` re-spawns its workers every call. u8 activations (`zp_a = 128`)
+keep the sweep: `coef_rb = 128` is not zero.
+
+The m-ladder (K=N=2048, dq/dense) goes 1.9, 1.5, 3.1, 3.2, 3.6, 3.5 at M = 1, 4,
+16, 64, 256, 1024. At M ≤ 4 both routes are weight-streaming bound and the dq
+side wins only on B's width — 4 MB against 16 MB — because it has no GEMV
+kernel and runs the tiled GEMM for a handful of rows; that is also where
+dropping the reduction sweep helps most. From M=16 up the int8 FLOP rate takes
+over and the ratio settles near 3.5. High-thread columns sag for *every* route
+in that harness (SimplePool spawns workers per call); read the 1T column.
+
+One more harness trap, measured while writing this: under sustained 4T load this
+host enters throttled episodes lasting seconds, during which **both** routes in
+an A/B read 4-5x slow, so whichever row happens to be in flight takes the hit.
+With all four A/B rows in one process the f16 row (last) read dense 55 / dq 145
+in three consecutive runs; moved to the front it read 241 / 646, and the row
+that ended up last sagged instead. That is why `matmul_dq_vs_fp_ab_nn`, `_tb`
+and `_f16` are separate registrations — run each in its own process when the
+multi-threaded numbers matter. 1T rows are stable in any layout.
+
+**The quantize pass is fused into the A pack** when nothing else needs A_q: no
+compensation (`int8_passes == false`), an M-split, and an untransposed A. Then
+`DqRoute<TOut, AIn>` is instantiated with `AIn = float/half`, `matmul_dq` passes
+the *fp* `a` to the dispatcher, and `pack_a` calls
+`tile_pack_quant_lhs_i8`: each panel row is quantized into a 4 KB stack buffer
+(`MR_MAX_I8 × kc ≤ 8 × 512`) and then handed to the ordinary
+`pack_trans_i8_lhs[level]` kernel, so the panel bytes and the rounding are
+identical to quantize-then-pack — every dq test compares bit for bit against
+`reference::matmul_dq_ref`, and `matmul_dq_shape_sweep_symmetric` runs the whole
+tiling-boundary table through this route (the non-symmetric sweeps pin the
+materialized one). The stack copy stays in L1; what
+disappears is the full M×K write plus its read, the `PoolPtr` for A_q, and the
+`ctx.cpu.run` that used to carry the pass.
+
+Three gates, each with a reason:
+
+- **no compensation** — the sweep is the only other reader of A_q, and the pack
+  cannot accumulate `r_a` per row without per-task scratch. A non-zero `zp_a`
+  or `zp_b` keeps the materialized route.
+- **M-split** — under `split_n` the same A row is packed by every N-block task,
+  so the fusion would quantize it `nt` times instead of once.
+- **untransposed A** — the transposing pack is the one that maps M×K to panels;
+  `transpose_a` already routes to `matmul_dq_ref`.
+
+Measured with the same instrument (an interleaved A/B, 8 rounds per config,
+1024×512×1024 f32): **1T 455→461 (+1%)**, 2T 710→740 (+4%), 4T 978→1115
+(+14%), 8T 936→1119 (+20%). At 256³ on one thread it is a wash (±1%). The
+shape of that curve is the point: the arithmetic saved is small (1.3% of the
+call), but the extra `ctx.cpu.run` is not, and `SimplePool` re-spawns workers
+per call — so the fusion is worth about one run's worth of overhead, which only
+multi-threaded measurement shows.
 
 ---
 

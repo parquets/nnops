@@ -5,6 +5,7 @@ set(TEST_SOURCES
     test_matmul_q5_1.cpp
     test_matmul.cpp
     test_matmul_int8.cpp
+    test_matmul_dq.cpp
     test_conv2d.cpp
     test_conv2d_winograd.cpp
     test_activation.cpp

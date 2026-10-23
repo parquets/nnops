@@ -2,9 +2,11 @@
 
 #include <array>
 
+#include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/q5_1.hpp"
 #include "nnops/detail/simd.hpp"
+#include "simd_kernel/simd_quant.hpp"
 
 #ifdef NNOPS_ARCH_X86_64
 using namespace nnops::backend::cpu::x86_64;
@@ -385,6 +387,72 @@ void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
         dst += ldd;
         src += s * pack_lds;
     });
+}
+
+/// Quantise one panel's rows into a stack copy and run the ordinary int8 pack
+/// on it. The panel layout and the rounding are therefore the same bytes the
+/// materialise-then-pack route produces; only the full M×K intermediate is gone.
+template <class AT, class QT>
+void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
+                            const AT* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool a_biased) {
+    NNOPS_ASSERT(kc <= KC_CAP_I8);
+    const int kbytes = (kc + 3) & ~3;
+    // One level at a time: at most MR_MAX_I8 rows of at most kbytes elements.
+    QT tmp[MR_MAX_I8 * (static_cast<int>(KC_CAP_I8) + 3)];
+
+    int i = 0;
+    walk_levels(i, mc, MR_I8, [&](int level, int s) {
+        for (int r = 0; r < s; ++r) {
+            const float sc = (scale != nullptr) ? scale[i + r] : scale_scalar;
+            // The quant kernel takes a float zero-point array; a null pointer
+            // means "no zero point", exactly as in the materialised route.
+            float zf = (zero != nullptr) ? static_cast<float>(zero[i + r])
+                                         : static_cast<float>(zero_scalar);
+            const float* zp = (zero != nullptr || zero_scalar != 0) ? &zf : nullptr;
+            kernel::quant_kernel::quantization<QT>(
+                1, kc, tmp + r * kbytes, kbytes, src + (i + r) * lds, lds, &sc, zp);
+        }
+        pack_trans_i8_lhs[level](dst, tmp, kbytes, kc, 0.0f);
+        if (a_biased) { xor0x80_i8(dst, s * kbytes); }
+        dst += ldd;
+    });
+}
+
+template <class AT>
+void pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                       const AT* src, int lds,
+                       const float* scale, const int32_t* zero,
+                       float scale_scalar, int32_t zero_scalar,
+                       bool u8, bool a_biased) {
+    // Only the clamp range differs between the two quantised storage types.
+    if (u8) {
+        pack_quant_lhs_i8_impl<AT, uint8_t>(mc, kc, dst, ldd, src, lds, scale, zero,
+                                            scale_scalar, zero_scalar, a_biased);
+    } else {
+        pack_quant_lhs_i8_impl<AT, int8_t>(mc, kc, dst, ldd, src, lds, scale, zero,
+                                           scale_scalar, zero_scalar, a_biased);
+    }
+}
+
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                            const float* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool u8, bool a_biased) {
+    pack_quant_lhs_i8<float>(mc, kc, dst, ldd, src, lds, scale, zero,
+                             scale_scalar, zero_scalar, u8, a_biased);
+}
+
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                            const half* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool u8, bool a_biased) {
+    pack_quant_lhs_i8<half>(mc, kc, dst, ldd, src, lds, scale, zero,
+                            scale_scalar, zero_scalar, u8, a_biased);
 }
 
 /// B into uniform panels. On x86 each panel's column sums are appended after

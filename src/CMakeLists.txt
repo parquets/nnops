@@ -72,9 +72,12 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/transpose_conv2d.cpp
     backend/cpu/moe.cpp
 
-    # CPU tiled matmul kernel (NKM loop with pack + MMA)
+    # CPU tiled matmul kernel (NKM loop with pack + MMA), plus the two routes
+    # that bypass the plan (small naive / GEMV, fused Q5_1)
     backend/cpu/matmul.cpp
     backend/cpu/matmul_helper.cpp
+    backend/cpu/matmul_small.cpp
+    backend/cpu/matmul_q5_fused.cpp
 
     # CPU tiled im2col + GEMM Conv2D kernel (planar NCHW)
     backend/cpu/conv2d_im2col.cpp
@@ -90,6 +93,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/reference/linear_ref.cpp
     backend/cpu/reference/matmul_ref.cpp
     backend/cpu/reference/matmul_int8_ref.cpp
+    backend/cpu/reference/matmul_dq_ref.cpp
     backend/cpu/reference/attention_ref.cpp
     backend/cpu/reference/causal_attention_ref.cpp
     backend/cpu/reference/clamp_ref.cpp

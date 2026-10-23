@@ -489,4 +489,192 @@ inline void int8_epilogue_tile(const Int8EpilogueParams& p, int32_t* c, int ldc,
     }
 }
 
+// =========================================================================
+//  fp output pass — compensate, dequantize, clip, activate
+// =========================================================================
+//
+// The offline-quantized-activation route writes fp output:
+//
+//   acc   = matmul_int8_compensate(raw, u8_offset, zp_a, zp_b[n], R_a, R_b[n], K)
+//   f     = float(acc) · (s_a · s_b[n])
+//   out   = ep(clamp(f, min_clip, max_clip))
+//
+// fp's own route clips inside the last-k MMA and activates in place afterwards;
+// here the MMA clamps int32, so the fp clip happens after the dequant, before
+// the activation. The float expression is identical to matmul_dq_ref's, so the
+// tests compare output bits.
+
+/// The row-constant half of the fp output pass.
+template <class TOut>
+struct DqEpilogueRow {
+    int32_t coef_rb;        ///< a_bias_offset + zp_a
+    int32_t coef_zp;        ///< r_a − k·zp_a
+    /// False when both coefficients are zero for every row and column, i.e.
+    /// compensate() is the identity. r_a / r_b are null then and the dispatch
+    /// skipped the reduction sweep entirely.
+    bool compensate;
+    int32_t a_bias_offset;
+    int32_t zp_a;
+    int32_t r_a;
+    const int32_t* r_b;     ///< Σ_k B[k,n], indexed by column
+    const int32_t* zp_b;    ///< per-channel B zero points, or nullptr
+    int32_t zp_b_scalar;
+    float s_a;              ///< A scale for this row
+    const float* s_b;       ///< per-channel B scales, or nullptr
+    float s_b_scalar;
+    int32_t k;
+    const Epilogue* ep;     ///< clip bounds + activation
+};
+
+template <class TOut>
+inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
+                            const DqEpilogueRow<TOut>& p) noexcept {
+    const Epilogue& ep = *p.ep;
+    const bool plain = (ep.type == EpilogueActivateType::None);
+    int64_t n = n0;
+
+#if defined(NNOPS_ARCH_X86_64)
+    const __m256i vcrb = _mm256_set1_epi32(p.coef_rb);
+    const __m256i vczp = _mm256_set1_epi32(p.coef_zp);
+    const __m256 vsa  = _mm256_set1_ps(p.s_a);
+    const __m256 vsbs = _mm256_set1_ps(p.s_b_scalar);
+    const __m256 vmin = _mm256_set1_ps(ep.min_clip);
+    const __m256 vmax = _mm256_set1_ps(ep.max_clip);
+    alignas(32) float fbuf[8];
+    for (; n + 8 <= n1; n += 8) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
+        if (p.compensate) {
+            v = _mm256_sub_epi32(
+                v, _mm256_mullo_epi32(vcrb,
+                                      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+                                          p.r_b + n))));
+            const __m256i zps =
+                p.zp_b ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.zp_b + n))
+                       : _mm256_set1_epi32(p.zp_b_scalar);
+            v = _mm256_sub_epi32(v, _mm256_mullo_epi32(vczp, zps));
+        }
+
+        const __m256 sb = p.s_b ? _mm256_loadu_ps(p.s_b + n) : vsbs;
+        __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(v), _mm256_mul_ps(vsa, sb));
+        f = _mm256_min_ps(_mm256_max_ps(f, vmin), vmax);
+
+        if (plain) {
+            if constexpr (std::is_same_v<TOut, half>) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(out + n),
+                                 _mm256_cvtps_ph(f, _MM_FROUND_TO_NEAREST_INT));
+            } else {
+                _mm256_storeu_ps(out + n, f);
+            }
+        } else {
+            // The scalar epilogue is the reference's, lane for lane.
+            _mm256_store_ps(fbuf, f);
+            for (int i = 0; i < 8; ++i) {
+                s_store(&out[n + i], nnops::apply_epilogue(ep, fbuf[i]));
+            }
+        }
+    }
+#elif defined(NNOPS_ARCH_AARCH64)
+    const int32x4_t vcrb = vdupq_n_s32(p.coef_rb);
+    const int32x4_t vczp = vdupq_n_s32(p.coef_zp);
+    const float32x4_t vsa = vdupq_n_f32(p.s_a);
+    const float32x4_t vsbs = vdupq_n_f32(p.s_b_scalar);
+    const float32x4_t vmin = vdupq_n_f32(ep.min_clip);
+    const float32x4_t vmax = vdupq_n_f32(ep.max_clip);
+    alignas(16) float fbuf[4];
+    for (; n + 4 <= n1; n += 4) {
+        int32x4_t v = vld1q_s32(c + n);
+        if (p.compensate) {
+            v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n)));
+            const int32x4_t zps =
+                p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
+            v = vsubq_s32(v, vmulq_s32(vczp, zps));
+        }
+
+        const float32x4_t sb = p.s_b ? vld1q_f32(p.s_b + n) : vsbs;
+        float32x4_t f = vmulq_f32(vcvtq_f32_s32(v), vmulq_f32(vsa, sb));
+        f = vminq_f32(vmaxq_f32(f, vmin), vmax);
+
+        if (plain) {
+            if constexpr (std::is_same_v<TOut, half>) {
+                vst1_f16(reinterpret_cast<__fp16*>(out + n), vcvt_f16_f32(f));
+            } else {
+                vst1q_f32(out + n, f);
+            }
+        } else {
+            vst1q_f32(fbuf, f);
+            for (int i = 0; i < 4; ++i) {
+                s_store(&out[n + i], nnops::apply_epilogue(ep, fbuf[i]));
+            }
+        }
+    }
+#endif
+
+    for (; n < n1; ++n) {
+        const int32_t zp_b = p.zp_b ? p.zp_b[n] : p.zp_b_scalar;
+        const int32_t acc =
+            p.compensate
+                ? matmul_int8_compensate(c[n], p.a_bias_offset, p.zp_a, zp_b,
+                                         p.r_a, p.r_b[n], p.k)
+                : c[n];
+        const float scale = p.s_a * (p.s_b ? p.s_b[n] : p.s_b_scalar);
+        float f = static_cast<float>(acc) * scale;
+        f = std::min(std::max(f, ep.min_clip), ep.max_clip);
+        f = nnops::apply_epilogue(ep, f);
+        s_store(&out[n], f);
+    }
+}
+
+/// Everything the fp output pass needs beyond the tile itself.
+template <class TOut>
+struct DqEpilogueParams {
+    const int32_t* r_a;      ///< Σ_k A[m,k], indexed by global row
+    const float* s_a;        ///< per-token A scales, or nullptr
+    const int32_t* zp_a;     ///< per-token A zero points, or nullptr
+    const int32_t* r_b;      ///< Σ_k B[k,n], indexed by column
+    const float* s_b;        ///< per-channel B scales, or nullptr
+    const int32_t* zp_b;     ///< per-channel B zero points, or nullptr
+    float s_a_scalar, s_b_scalar;
+    int32_t zp_a_scalar, zp_b_scalar;
+    int32_t a_bias_offset;
+    int32_t k;
+    /// False when the compensation is the identity for every row and column
+    /// (a_bias_offset + zp_a == 0 and all zp_b == 0). The reductions are then
+    /// skipped, r_a / r_b are null, and the row pass drops both subtractions.
+    bool compensate;
+    /// A is quantised inside the A pack from the fp activations rather than
+    /// materialised as an int8 tensor; this is the target's storage type.
+    bool act_u8;
+    const Epilogue* ep;
+    TOut* out;               ///< fp destination
+    int ldc_out;
+};
+
+/// Apply the fp output pass to one C tile — rows [m0, m0+mc) × columns
+/// [n0, n0+nc) — at last_k, like the int8 and fp epilogues.
+template <class TOut>
+inline void dq_epilogue_tile(const DqEpilogueParams<TOut>& p, const int32_t* c, int ldc,
+                             int64_t m0, int n0, int64_t mc, int64_t nc) noexcept {
+    for (int64_t r = 0; r < mc; ++r) {
+        const int64_t m = m0 + r;
+        const int32_t zp_a = int8_zp_at(p.zp_a, p.zp_a_scalar, m);
+        const DqEpilogueRow<TOut> row{
+            p.a_bias_offset + zp_a,
+            p.compensate ? p.r_a[m] - p.k * zp_a : 0,
+            p.compensate,
+            p.a_bias_offset,
+            zp_a,
+            p.compensate ? p.r_a[m] : 0,
+            p.r_b,
+            p.zp_b,
+            p.zp_b_scalar,
+            int8_scale_at(p.s_a, p.s_a_scalar, m),
+            p.s_b,
+            p.s_b_scalar,
+            p.k,
+            p.ep,
+        };
+        dq_epilogue_row(c + r * ldc, p.out + m * p.ldc_out, n0, n0 + nc, row);
+    }
+}
+
 }  // namespace nnops::backend::cpu

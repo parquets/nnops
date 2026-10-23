@@ -14,6 +14,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q5_1.hpp"         // q5_1_block, float_to_half, half_to_bits
 #include "backend/cpu/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
+#include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
@@ -1587,6 +1588,645 @@ NNOPS_BENCH(matmul_q5_vs_f32_ab) {
 
 NNOPS_BENCH(matmul_q5_vs_f16_ab_large) {
     bench_b_format_ab<half>("f16-act", 1024, 1024, 1024, /*rounds=*/4, /*iters=*/10);
+}
+
+// ============================================================
+// Offline-quantized fp activations × s8 weights (W8A8, fp in / fp out)
+// ============================================================
+//
+// The deployment shape this route serves: the activation quantization
+// parameters are fixed offline (calibration), A arrives as f32/f16, B is s8,
+// and C must come back in A's dtype. Every call then does three pieces of work
+// — quantize A (M×K fp reads, one byte written per element), run the int8 GEMM,
+// dequantize the int32 accumulate — yet the GFLOPS below are still computed
+// from 2·M·N·K, so a dq row reads directly against the dense fp row of the same
+// shape. That comparison is the reason the route exists, and
+// `matmul_dq_vs_fp_ab` is where it is measured under matched conditions.
+//
+// A carries its parameters in QuantParams (per-token arrays for the point
+// cases, per-tensor for the granularity split); B carries one scale per output
+// channel, the layout a W8A8 checkpoint loads in.
+//
+// Which A path a row takes: the s8 rows below are symmetric (zp_a = 0, zp_b
+// all zero), so the compensation is the identity; on an M-split the A pack then
+// quantizes the fp activations itself and no A_q is ever materialized. The u8
+// rows (zp_a = 128) need the compensation, so they keep the materialized A_q —
+// every fifth row is the other route, which is deliberate.
+//
+// Baseline on the dev host (Release, 20 logical cores), as a regression guard:
+//   - 1024x512x1024 dq is ~87% of the same-shape `matmul_i8_nn_large` GOPS at
+//     1T. The difference is the int32 accumulator round trip plus whatever the
+//     quantize pass leaves on the table.
+//     The reduction sweep is skipped whenever the compensation is the identity
+//     — a_bias_offset + zp_a == 0 for every row and every zp_b == 0 — worth
+//     +3% here and +13% at 256^3 on one thread, plus one fewer `ctx.cpu.run`.
+//     Fusing the quantization into the A pack (same identity case, M-split
+//     only) removes the remaining pass: interleaved A/B, 8 rounds per config,
+//     1024x512x1024 f32 nn: 1T 455→461 (+1%), 2T 710→740 (+4%), 4T 978→1115
+//     (+14%), 8T 936→1119 (+20%). At 256^3 1T it is a wash (~±1%); the win is
+//     the dropped `ctx.cpu.run`, which is why it grows with thread count and
+//     shrinks to nothing at one thread.
+//   - dq/dense is ~3.3 at 1T for f32 activations and ~3.3 for f16 at 4T: the
+//     dense B is only half as wide there, but the f16 dense route also scales
+//     worse across threads.
+//   - the 8T/20T columns sag for *every* route in this file because SimplePool
+//     spawns its workers per call; and dq makes one more `ctx.cpu.run` than
+//     int8, so it sags a little earlier. Read the 1T column and the ratio
+//     columns, not the high-thread columns.
+//   - under sustained 4T load this host drops into throttled episodes lasting
+//     seconds, during which *both* routes read ~4-5x slow, so whichever row is
+//     in flight takes the hit. With all four A/B rows in one process the f16
+//     row (measured last) read dense=55 / dq=145 in three consecutive runs;
+//     moved to the front it read dense=241 / dq=646, and the row that ended up
+//     last (tb) sagged by the same factor instead. So each A/B row has its own
+//     registration (`matmul_dq_vs_fp_ab_nn`, `_tb`, `_f16`) and should be run
+//     in its own process when the multi-threaded numbers matter. The 1T rows
+//     are stable in any process layout.
+
+/// Run @p f until @p budget_ms elapses (at least once); return ms per call.
+/// At the sizes below a fixed iteration count is either too short to time or
+/// far too long, and a wall-clock budget also leaves every row of a ladder on
+/// the machine for the same time, which is what makes the rows comparable on a
+/// host that drifts under load.
+template <typename F>
+double time_budget_ms(F&& f, double budget_ms) {
+    f();
+    f();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    int iters = 0;
+    double ms = 0.0;
+    do {
+        f();
+        ++iters;
+        ms = std::chrono::duration<double, std::milli>(
+                 std::chrono::high_resolution_clock::now() - t0).count();
+    } while (ms < budget_ms && iters < 20000);
+    return ms / static_cast<double>(iters);
+}
+
+template <typename F>
+double time_budget_gflops(F&& f, double flops, double budget_ms) {
+    return flops / (time_budget_ms(std::forward<F>(f), budget_ms) * 1e6);
+}
+
+/// Everything one dq case needs. A is fp with offline QuantParams attached, B is
+/// s8 with a per-output-channel scale, and a dense fp copy of B is kept so the
+/// fp-route side of an A/B multiplies exactly the same weights.
+template <typename T>
+struct DqCase {
+    int64_t M, K, N;
+    bool tb;
+    QuantGranularity gran;
+    DataType act_dt;
+
+    std::vector<T>       a_buf, bf_buf, c_buf, c_fp_buf;
+    std::vector<float>   s_a, s_b;
+    std::vector<int32_t> zp_a, zp_b;
+    std::vector<int8_t>  b_buf, aq_buf;
+
+    TensorView a, b, bf, c, c_fp, aq;
+    TensorView ins[2], ins_fp[2];
+
+    DqCase(int64_t m, int64_t k, int64_t n, bool transpose_b,
+           QuantGranularity g, DataType qdt)
+        : M(m), K(k), N(n), tb(transpose_b), gran(g), act_dt(qdt)
+    {
+        nnops::test::XorShift128 rng(1);
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+
+        // --- A: activations in the range a real layer produces ---
+        {
+            std::vector<float> f(static_cast<size_t>(M * K));
+            for (auto& v : f) { v = rng.next_float(-1.0f, 1.0f); }
+            a_buf.resize(f.size());
+            for (size_t i = 0; i < f.size(); ++i) {
+                if constexpr (std::is_same_v<T, float>) { a_buf[i] = f[i]; }
+                else { simd::s_store(&a_buf[i], f[i]); }
+            }
+        }
+
+        // Offline activation parameters: a scale that only just covers [-1, 1],
+        // so most of the integer range is in use, varied per row so nothing
+        // folds at compile time.
+        const float span = (act_dt == DataType::u8) ? 2.0f / 255.0f : 1.0f / 127.0f;
+        const int32_t zp0 = (act_dt == DataType::u8) ? 128 : 0;
+        const bool per_token = (gran == QuantGranularity::PerToken);
+        const size_t ns = static_cast<size_t>(per_token ? M : 1);
+        s_a.resize(ns);
+        zp_a.assign(ns, zp0);
+        for (auto& s : s_a) { s = span * (0.8f + 0.4f * rng.next_float(0.0f, 1.0f)); }
+
+        QuantParams qa;
+        qa.granularity = gran;
+        qa.scale = s_a[0];
+        qa.zero_point = zp0;
+        if (per_token) {
+            qa.scale_data = s_a.data();
+            qa.zero_point_data = zp_a.data();
+            qa.num_scales = M;
+        }
+
+        // --- B: s8 weights, one scale per output column. A second generator
+        // keeps B identical between a per-token and a per-tensor case, since
+        // the two consume a different number of draws for A's parameters. ---
+        nnops::test::XorShift128 rng_b(2);
+        const int64_t b_rows = tb ? N : K;
+        const int64_t b_cols = tb ? K : N;
+        b_buf.resize(static_cast<size_t>(b_rows * b_cols));
+        for (auto& v : b_buf) { v = static_cast<int8_t>(rng_b.next_u64() % 255 - 127); }
+        s_b.resize(static_cast<size_t>(N));
+        zp_b.assign(static_cast<size_t>(N), 0);   // symmetric weight quant
+        for (auto& s : s_b) { s = 0.008f * (0.8f + 0.4f * rng_b.next_float(0.0f, 1.0f)); }
+
+        QuantParams qb;
+        qb.granularity = QuantGranularity::PerChannel;
+        qb.scale = s_b[0];
+        qb.scale_data = s_b.data();
+        qb.zero_point_data = zp_b.data();
+        qb.num_scales = N;
+
+        // The fp route's B: exactly the values the s8 B represents.
+        bf_buf.resize(b_buf.size());
+        for (int64_t r = 0; r < b_rows; ++r) {
+            for (int64_t cidx = 0; cidx < b_cols; ++cidx) {
+                const size_t i = static_cast<size_t>(r * b_cols + cidx);
+                const int64_t col = tb ? r : cidx;
+                const float v = s_b[static_cast<size_t>(col)] * static_cast<float>(b_buf[i]);
+                if constexpr (std::is_same_v<T, float>) { bf_buf[i] = v; }
+                else { simd::s_store(&bf_buf[i], v); }
+            }
+        }
+
+        // --- views (compact pitches) ---
+        const int64_t as[] = {M, K};
+        const int64_t bs[] = {b_rows, b_cols};
+        const int64_t cs[] = {M, N};
+        const int64_t ts = static_cast<int64_t>(sizeof(T));
+
+        c_buf.resize(static_cast<size_t>(M * N));
+        c_fp_buf.resize(static_cast<size_t>(M * N));
+        aq_buf.resize(static_cast<size_t>(M * K));
+
+        a  = TensorView(as, dt, a_buf.data(), K * ts, TensorLayout::NCHW, qa);
+        b  = TensorView(bs, DataType::s8, b_buf.data(), b_cols, TensorLayout::NCHW, qb);
+        bf = TensorView(bs, dt, bf_buf.data(), b_cols * ts);
+        c    = TensorView(cs, dt, c_buf.data(), N * ts);
+        c_fp = TensorView(cs, dt, c_fp_buf.data(), N * ts);
+        // Desc-only view of the compact A_q the backend materializes on every
+        // call; only its desc is read (the backend allocates the real one).
+        aq = TensorView(as, act_dt, aq_buf.data(), K, TensorLayout::NCHW, qa);
+
+        ins[0] = a;     ins[1] = b;
+        ins_fp[0] = a;  ins_fp[1] = bf;
+    }
+};
+
+/// Time one dq case at the given thread counts; mirrors run_geMM_i8.
+template <typename T>
+GeMMReport run_geMM_dq(DqCase<T>& dc, const char* name,
+                       const std::vector<int>& threads, int iters) {
+    MatMulAttributes attrs{};
+    attrs.transpose_b = dc.tb;
+    attrs.act_quant_dtype = dc.act_dt;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    // The backend plans off the compact A_q desc, so mirror that here: the
+    // reported tile sizes and split direction are the ones that actually run.
+    const int meta_threads = *std::max_element(threads.begin(), threads.end());
+    const cpu::MatMulPlan plan =
+        cpu::get_matmul_plan(attrs, dc.aq.desc(), dc.b.desc(), meta_threads);
+
+    GeMMReport rep;
+    rep.name = name;
+    rep.route = plan.split_n ? "dq-NKM" : "dq-MKN";
+    rep.unit = "GFLOPS";
+    rep.pack_a = plan.pack_a;
+    rep.pack_b = true;
+    rep.mc = static_cast<int>(plan.mc);
+    rep.nc = static_cast<int>(plan.nc);
+    rep.kc = static_cast<int>(plan.kc);
+    rep.num_blocks = plan.split_n
+        ? (dc.N + plan.nc - 1) / plan.nc
+        : cpu::split_block_count(dc.M, plan.mc);
+    rep.b_mb = static_cast<double>(dc.b.storage_bytes()) / (1024.0 * 1024.0);
+    rep.threads = threads;
+
+    for (int nt : threads) {
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        for (int i = 0; i < 2; ++i) {
+            op->compute(dc.c, dc.ins, use_ctx, nullptr);
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            op->compute(dc.c, dc.ins, use_ctx, nullptr);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        rep.gflops.push_back(
+            2.0 * static_cast<double>(dc.M) * static_cast<double>(dc.N)
+                * static_cast<double>(dc.K) * static_cast<double>(iters) / (ms * 1e6));
+    }
+    return rep;
+}
+
+template <typename T>
+void bench_dq_case(const char* name, int64_t M, int64_t K, int64_t N,
+                   bool tb = false,
+                   QuantGranularity gran = QuantGranularity::PerToken,
+                   DataType act_dt = DataType::s8) {
+    const int iters = 20;
+    std::vector<int> threads{1, 2, 4, 8};
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
+        threads.push_back(hw);
+    }
+    DqCase<T> dc(M, K, N, tb, gran, act_dt);
+    print_report(run_geMM_dq(dc, name, threads, iters));
+}
+
+/// One dq problem per shape, all thread counts, as a table — the counterpart of
+/// `sweep_i8`, so the two tables can be read side by side. Every row includes
+/// the quantize pass and the dequantizing epilogue, which is what makes the
+/// per-size gap against `matmul_i8_size_sweep` the cost of the fp activation
+/// boundary rather than of the GEMM.
+template <typename T>
+void sweep_dq(const char* tag, const std::vector<SweepShape>& shapes,
+              const std::vector<int>& threads, double target_ms,
+              bool tb = false,
+              QuantGranularity gran = QuantGranularity::PerToken) {
+    const char* dense = std::is_same_v<T, float> ? "f32" : "f16";
+    std::printf("  %s-act dq sweep  B=%s  budget=%.0f ms/cell\n", dense,
+                tb ? "[N][K]" : "[K][N]", target_ms);
+    print_sweep_header(threads, "GFLOPS");
+
+    const int meta_threads = *std::max_element(threads.begin(), threads.end());
+    for (const SweepShape& s : shapes) {
+        DqCase<T> dc(s.M, s.K, s.N, tb, gran, DataType::s8);
+
+        MatMulAttributes attrs{};
+        attrs.transpose_b = tb;
+        attrs.act_quant_dtype = DataType::s8;
+        auto op = MatMul::create(attrs, Backend::CPU);
+        // Plan off the A_q desc, as matmul_cpu does — see run_geMM_dq.
+        const cpu::MatMulPlan plan =
+            cpu::get_matmul_plan(attrs, dc.aq.desc(), dc.b.desc(), meta_threads);
+
+        const double flops = 2.0 * static_cast<double>(s.M) * static_cast<double>(s.N)
+                           * static_cast<double>(s.K);
+        std::vector<double> g;
+        for (int nt : threads) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+            g.push_back(time_budget_gflops(
+                [&] { op->compute(dc.c, dc.ins, ctx, nullptr); }, flops, target_ms));
+        }
+        print_sweep_row(s, plan.split_n ? "NKM" : "MKN",
+                        static_cast<int>(plan.mc), static_cast<int>(plan.nc),
+                        plan.split_n ? (s.N + plan.nc - 1) / plan.nc
+                                     : cpu::split_block_count(s.M, plan.mc), g);
+    }
+}
+
+/// Interleaved A/B: the same A and the same weight values, once as dense fp B
+/// (the fp route) and once as s8 B (the dq route). Reports dq/fp — the ratio is
+/// what the quantization pass and the smaller B have to pay for against a
+/// wider GEMM, so >1 means the dq route is the faster way to get these numbers.
+template <typename T>
+void bench_dq_vs_fp_ab(int64_t M, int64_t K, int64_t N, bool tb = false,
+                       QuantGranularity gran = QuantGranularity::PerToken,
+                       int nt = 1, int rounds = 3, double budget_ms = 150.0) {
+    DqCase<T> dc(M, K, N, tb, gran, DataType::s8);
+
+    MatMulAttributes attrs_dq{};
+    attrs_dq.transpose_b = tb;
+    attrs_dq.act_quant_dtype = DataType::s8;
+    MatMulAttributes attrs_fp{};
+    attrs_fp.transpose_b = tb;
+
+    auto op_dq = MatMul::create(attrs_dq, Backend::CPU);
+    auto op_fp = MatMul::create(attrs_fp, Backend::CPU);
+
+    SimplePool pool(nt);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
+                       * static_cast<double>(K);
+    auto time_dq = [&] {
+        return time_budget_gflops(
+            [&] { op_dq->compute(dc.c, dc.ins, use_ctx, nullptr); }, flops, budget_ms);
+    };
+    auto time_fp = [&] {
+        return time_budget_gflops(
+            [&] { op_fp->compute(dc.c_fp, dc.ins_fp, use_ctx, nullptr); }, flops, budget_ms);
+    };
+
+    std::printf("  dq vs dense  %s%s  %lldx%lldx%lld  %dT  rounds=%d  "
+                "B: s8 %.2f MB, dense %.2f MB\n",
+                std::is_same_v<T, float> ? "f32" : "f16", tb ? "-act  tb" : "-act  nn",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), nt, rounds,
+                static_cast<double>(K * N) / (1024.0 * 1024.0),
+                static_cast<double>(K * N * static_cast<int64_t>(sizeof(T)))
+                    / (1024.0 * 1024.0));
+
+    std::vector<double> vd, vf;
+    for (int r = 0; r < rounds; ++r) {
+        // Alternate which route is measured first: the one measured second
+        // inherits the other's cache state and reads slower.
+        const bool dq_first = (r % 2) == 0;
+        const double t1 = dq_first ? time_dq() : time_fp();
+        const double t2 = dq_first ? time_fp() : time_dq();
+        (dq_first ? vd : vf).push_back(t1);
+        (dq_first ? vf : vd).push_back(t2);
+        std::printf("    round %d:  dq=%7.1f  dense=%7.1f   dq/dense=%.3f\n",
+                    r, vd.back(), vf.back(), vd.back() / vf.back());
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double md = median(vd), mf = median(vf);
+    std::printf("    median:   dq=%7.1f  dense=%7.1f   dq/dense=%.3f\n",
+                md, mf, md / mf);
+}
+
+/// PerTensor vs PerToken parameters over identical tensors. The GEMM, the
+/// quantize pass and the output pass are the same code; the only difference is
+/// whether the epilogue broadcasts one (scale, zp) or loads a per-row vector,
+/// so the ratio isolates that.
+template <typename T>
+void bench_dq_granularity_ab(int64_t M, int64_t K, int64_t N,
+                             int rounds = 3, double budget_ms = 150.0) {
+    DqCase<T> dc_tok(M, K, N, /*tb=*/false, QuantGranularity::PerToken, DataType::s8);
+    DqCase<T> dc_ten(M, K, N, /*tb=*/false, QuantGranularity::PerTensor, DataType::s8);
+
+    MatMulAttributes attrs{};
+    attrs.act_quant_dtype = DataType::s8;
+    auto op_tok = MatMul::create(attrs, Backend::CPU);
+    auto op_ten = MatMul::create(attrs, Backend::CPU);
+
+    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
+                       * static_cast<double>(K);
+    auto time_tok = [&] {
+        return time_budget_gflops(
+            [&] { op_tok->compute(dc_tok.c, dc_tok.ins, {}, nullptr); }, flops, budget_ms);
+    };
+    auto time_ten = [&] {
+        return time_budget_gflops(
+            [&] { op_ten->compute(dc_ten.c, dc_ten.ins, {}, nullptr); }, flops, budget_ms);
+    };
+
+    std::printf("  dq granularity  %lldx%lldx%lld  1T  rounds=%d\n",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds);
+
+    std::vector<double> vt, vn;
+    for (int r = 0; r < rounds; ++r) {
+        const bool tok_first = (r % 2) == 0;
+        const double t1 = tok_first ? time_tok() : time_ten();
+        const double t2 = tok_first ? time_ten() : time_tok();
+        (tok_first ? vt : vn).push_back(t1);
+        (tok_first ? vn : vt).push_back(t2);
+        std::printf("    round %d:  per_token=%7.1f  per_tensor=%7.1f   tok/ten=%.3f\n",
+                    r, vt.back(), vn.back(), vt.back() / vn.back());
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double mt = median(vt), mn = median(vn);
+    std::printf("    median:   per_token=%7.1f  per_tensor=%7.1f   tok/ten=%.3f\n",
+                mt, mn, mt / mn);
+}
+
+// ---- dq point cases -------------------------------------------------------
+
+NNOPS_BENCH(matmul_dq_f32_nn_large) {
+    // The main case: a prefill-sized activation against a W8A8 weight.
+    bench_dq_case<float>("dq/f32 nn 1024x512x1024", 1024, 512, 1024);
+}
+
+NNOPS_BENCH(matmul_dq_f32_tb_large) {
+    // LLM-style A @ W^T: the weight is stored [N][K], as a checkpoint loads it.
+    // The per-channel scale still indexes the output column.
+    bench_dq_case<float>("dq/f32 tb 1024x512x1024", 1024, 512, 1024, /*tb=*/true);
+}
+
+NNOPS_BENCH(matmul_dq_f32_nn_256) {
+    // Smallest useful shape: the quantize pass (M×K) and the dequantize pass
+    // (M×N) are a much larger share of the call than at 1024x512x1024.
+    bench_dq_case<float>("dq/f32 nn 256^3", 256, 256, 256);
+}
+
+NNOPS_BENCH(matmul_dq_f32_nn_512) {
+    bench_dq_case<float>("dq/f32 nn 512^3", 512, 512, 512);
+}
+
+NNOPS_BENCH(matmul_dq_f32_tb_256) {
+    bench_dq_case<float>("dq/f32 tb 256^3", 256, 256, 256, /*tb=*/true);
+}
+
+NNOPS_BENCH(matmul_dq_f32_odd_n) {
+    // N=1000 is not a multiple of nc (240) or of the 16-wide B panel, so the
+    // last n-block runs the masked pack and the epilogue's scalar tail.
+    bench_dq_case<float>("dq/f32 nn 1024x512x1000", 1024, 512, 1000);
+}
+
+NNOPS_BENCH(matmul_dq_f32_nsplit) {
+    // N ≫ M: the plan splits over N, so the quantized A is packed by every
+    // n-block task and the per-token arrays are read by all of them.
+    bench_dq_case<float>("dq/f32 nn 128x512x4096", 128, 512, 4096);
+}
+
+NNOPS_BENCH(matmul_dq_f32_deep_k) {
+    // K ≫ M, N: several k-blocks per tile, small tiles, and the quantize pass
+    // is K-wide per row.
+    bench_dq_case<float>("dq/f32 nn 64x4096x64", 64, 4096, 64);
+}
+
+NNOPS_BENCH(matmul_dq_f16_nn) {
+    bench_dq_case<half>("dq/f16 nn 1024x512x1024", 1024, 512, 1024);
+}
+
+NNOPS_BENCH(matmul_dq_f16_tb) {
+    bench_dq_case<half>("dq/f16 tb 1024x512x1024", 1024, 512, 1024, /*tb=*/true);
+}
+
+NNOPS_BENCH(matmul_dq_u8_act_large) {
+    // u8 activations (zp=128): on x86 the pack folds no bias, on aarch64 the
+    // u8→s8 pack XORs — either way the epilogue is unchanged.
+    bench_dq_case<float>("dq/u8act nn 1024x512x1024", 1024, 512, 1024,
+                         /*tb=*/false, QuantGranularity::PerToken, DataType::u8);
+}
+
+NNOPS_BENCH(matmul_dq_u8_act_tb) {
+    bench_dq_case<float>("dq/u8act tb 1024x512x1024", 1024, 512, 1024,
+                         /*tb=*/true, QuantGranularity::PerToken, DataType::u8);
+}
+
+NNOPS_BENCH(matmul_dq_per_tensor_large) {
+    // Per-tensor parameters: one (scale, zp) broadcasts into the epilogue
+    // instead of a row vector. Same kernel, one load fewer per row.
+    bench_dq_case<float>("dq/f32 nn 1024x512x1024 per-tensor", 1024, 512, 1024,
+                         /*tb=*/false, QuantGranularity::PerTensor);
+}
+
+NNOPS_BENCH(matmul_dq_vs_fp_ab_nn) {
+    // The reason the route exists: same A, same weight values, s8 B vs a dense
+    // B. Read the ratio, not the absolute GFLOPS.
+    for (int nt : {1, 4}) {
+        bench_dq_vs_fp_ab<float>(1024, 512, 1024, /*tb=*/false,
+                                 QuantGranularity::PerToken, nt);
+    }
+}
+
+NNOPS_BENCH(matmul_dq_vs_fp_ab_tb) {
+    bench_dq_vs_fp_ab<float>(1024, 512, 1024, /*tb=*/true,
+                             QuantGranularity::PerToken, 4);
+}
+
+NNOPS_BENCH(matmul_dq_vs_fp_ab_f16) {
+    bench_dq_vs_fp_ab<half>(1024, 512, 1024, /*tb=*/false,
+                            QuantGranularity::PerToken, 4);
+}
+
+NNOPS_BENCH(matmul_dq_vs_fp_sweep) {
+    // The same comparison as a table over the square ladder: dq/dense is the
+    // shape of the route's value, and it moves with the B footprint (B is
+    // 4x smaller as s8, so the win grows until the GEMM stops being
+    // bandwidth bound and shrinks again once both fit in cache).
+    const std::vector<int64_t> sizes{128, 256, 384, 512, 768, 1024, 1536};
+    std::printf("  dq vs dense f32-act  nn  budget=100 ms/cell   (GFLOPS)\n");
+    std::printf("   %5s | %9s %9s %7s | %9s %9s %7s\n", "size",
+                "dq 1T", "f32 1T", "dq/f32", "dq 4T", "f32 4T", "dq/f32");
+    // Caveat for the 4T columns: SimplePool spawns its workers per call, and dq
+    // issues one more ctx.cpu.run than the fp route, so below ~768 the 4T ratio
+    // measures pool start-up. The 1T ratio is the honest curve.
+    for (int64_t S : sizes) {
+        DqCase<float> dc(S, S, S, /*tb=*/false, QuantGranularity::PerToken, DataType::s8);
+        MatMulAttributes a_dq{};
+        a_dq.act_quant_dtype = DataType::s8;
+        auto op_dq = MatMul::create(a_dq, Backend::CPU);
+        auto op_fp = MatMul::create(MatMulAttributes{}, Backend::CPU);
+        const double flops = 2.0 * static_cast<double>(S) * static_cast<double>(S)
+                           * static_cast<double>(S);
+
+        std::printf("   %5lld |", static_cast<long long>(S));
+        for (int nt : {1, 4}) {
+            SimplePool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+            const double g_dq = time_budget_gflops(
+                [&] { op_dq->compute(dc.c, dc.ins, ctx, nullptr); }, flops, 100.0);
+            const double g_fp = time_budget_gflops(
+                [&] { op_fp->compute(dc.c_fp, dc.ins_fp, ctx, nullptr); }, flops, 100.0);
+            std::printf(" %9.1f %9.1f %7.2f |", g_dq, g_fp, g_dq / g_fp);
+        }
+        std::printf("\n");
+    }
+}
+
+NNOPS_BENCH(matmul_dq_size_sweep) {
+    // The square ladder of matmul_i8_size_sweep, so the two tables read side by
+    // side: the gap at each size is the quantize pass plus the int32
+    // accumulator round trip.
+    sweep_dq<float>("f32", {
+        {128, 128, 128},    {192, 192, 192},    {256, 256, 256},   {384, 384, 384},
+        {512, 512, 512},    {768, 768, 768},    {1024, 1024, 1024},
+        {1536, 1536, 1536}, {2048, 2048, 2048},
+    }, sweep_threads(), 120.0);
+}
+
+NNOPS_BENCH(matmul_dq_tb_size_sweep) {
+    // Same ladder with a [N][K] weight — the Linear/checkpoint layout.
+    sweep_dq<float>("f32", {
+        {128, 128, 128},    {256, 256, 256},    {512, 512, 512},
+        {1024, 1024, 1024}, {1536, 1536, 1536}, {2048, 2048, 2048},
+    }, sweep_threads(), 120.0, /*tb=*/true);
+}
+
+NNOPS_BENCH(matmul_dq_f16_size_sweep) {
+    // f16 activations: the quantize pass reads half the bytes, the output pass
+    // writes half. The int8 GEMM is unchanged.
+    sweep_dq<half>("f16", {
+        {128, 128, 128},    {256, 256, 256},    {512, 512, 512},
+        {1024, 1024, 1024}, {1536, 1536, 1536},
+    }, sweep_threads(), 120.0);
+}
+
+NNOPS_BENCH(matmul_dq_rect_sweep) {
+    // Rectangles rather than cubes: the corners where one dimension is 1 or far
+    // from the tile size, so the plan changes shape (M-split vs N-split, a
+    // single k-block vs many).
+    sweep_dq<float>("f32", {
+        {1, 512, 4096},   {1, 4096, 4096},   {16, 4096, 4096},  {64, 4096, 4096},
+        {1024, 256, 64},  {1024, 512, 1000}, {128, 512, 4096},  {4096, 256, 256},
+    }, sweep_threads(), 120.0);
+}
+
+NNOPS_BENCH(matmul_dq_granularity_ab) {
+    bench_dq_granularity_ab<float>(1024, 512, 1024);
+    bench_dq_granularity_ab<float>(256, 256, 256);
+}
+
+NNOPS_BENCH(matmul_dq_quantize_only) {
+    // The quantize pass on its own, against the full dq call on the same
+    // shape: how much of a call the fp→int8 conversion is. If this share ever
+    // matters, the pass folds into A's pack (see skills/how_to_optimize_gemm.md).
+    constexpr int64_t M = 1024, K = 512, N = 1024;
+    std::vector<float>  src(static_cast<size_t>(M * K));
+    std::vector<int8_t> dst(src.size());
+    std::vector<float>  scale(static_cast<size_t>(M));
+    nnops::test::XorShift128 rng(1);
+    for (auto& v : src) { v = rng.next_float(-1.0f, 1.0f); }
+    for (auto& s : scale) { s = (0.8f + 0.4f * rng.next_float(0.0f, 1.0f)) / 127.0f; }
+
+    auto pass = [&] {
+        kernel::quant_kernel::quantization<int8_t>(
+            static_cast<int>(M), static_cast<int>(K), dst.data(), static_cast<int>(K),
+            src.data(), static_cast<int>(K), scale.data(), nullptr);
+    };
+    pass();   // fault the pages before the timed runs
+    const double pass_ms = time_budget_ms(pass, 200.0);
+    const double vals = static_cast<double>(M) * static_cast<double>(K);
+    const double bytes = vals * (sizeof(float) + 1);   // fp read + byte write
+
+    DqCase<float> dc(M, K, N, /*tb=*/false, QuantGranularity::PerToken, DataType::s8);
+    MatMulAttributes attrs{};
+    attrs.act_quant_dtype = DataType::s8;
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const double op_ms = time_budget_ms([&] { op->compute(dc.c, dc.ins, {}, nullptr); }, 200.0);
+
+    std::printf("  dq quantize pass  %lldx%lld  1T : %.3f ms  = %.2f Gvalues/s, %.2f GB/s\n",
+                static_cast<long long>(M), static_cast<long long>(K), pass_ms,
+                vals / (pass_ms * 1e6), bytes / (pass_ms * 1e6));
+    std::printf("  full dq call      %lldx%lldx%lld 1T : %.3f ms  (pass = %.1f%% of it)\n",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), op_ms, 100.0 * pass_ms / op_ms);
+}
+
+NNOPS_BENCH(matmul_dq_m_ladder) {
+    // Decode-to-prefill sweep. At small M both routes stream B and the dq side
+    // wins only on B's width — it has no GEMV kernel, so it runs the tiled GEMM
+    // for one row — which is why the ratio sits near 1.2 until M is large
+    // enough for the int8 FLOP rate to matter (K=N=2048 keeps B at 4 MB: out of
+    // L2, in L3). Measured on the dev host: 1.2, 1.2, 2.6, 2.9, 3.4, 3.6.
+    const std::vector<int64_t> ms{1, 4, 16, 64, 256, 1024};
+    for (int64_t M : ms) {
+        bench_dq_vs_fp_ab<float>(M, 2048, 2048, /*tb=*/false,
+                                 QuantGranularity::PerToken, /*nt=*/1,
+                                 /*rounds=*/3, /*budget_ms=*/100.0);
+    }
 }
 
 // ============================================================

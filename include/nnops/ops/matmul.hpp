@@ -33,10 +33,19 @@ struct MatMulAttributes {
     ///   s32 (default): raw int32 accumulate with zero-point compensation
     ///                  (MatMulInteger semantics).
     ///   s8:            requantize the accumulate to int8.
+    ///   f32 / f16:     dequantize the accumulate back to the given float type
+    ///                  (valid when A carries active QuantParams).
     ///
-    /// Ignored for f32/f16 inputs, where the output follows the input dtype.
+    /// Ignored for f32/f16 × f32/f16 inputs, where the output follows the input
+    /// dtype (including the fp-activation path, whose output follows A).
     /// alpha/beta are also ignored on the integer path.
     DataType output_dtype = DataType::s32;
+
+    /// Integer storage for the activation quantization on the
+    /// fp-activation × s8-weight path: the in-kernel pass writes A's activation
+    /// values as `act_quant_dtype` (s8 default, or u8) before the int8 GEMM.
+    /// Only read when is_fp_quant_matmul() holds; ignored everywhere else.
+    DataType act_quant_dtype = DataType::s8;
 
     /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
@@ -49,6 +58,18 @@ struct MatMulAttributes {
 /// cases whose output dtype the operator resolves), so it lives here.
 inline constexpr bool is_int8_matmul(DataType a, DataType b) noexcept {
     return (a == DataType::s8 || a == DataType::u8) && b == DataType::s8;
+}
+
+/// True for the offline-quantized-activation GEMM: a floating-point A carrying
+/// active (per-tensor or per-token) quantization parameters against an int8 B.
+///
+/// The kernel quantizes A into `MatMulAttributes::act_quant_dtype` on the fly,
+/// runs the int8 GEMM, and dequantizes the int32 accumulate back to A's dtype.
+/// With inactive QuantParams the pair has no defined semantics — a float A is
+/// not a quantized tensor to dequantize — so the backend rejects it rather than
+/// reading B as floats.
+inline bool is_fp_quant_matmul(DataType a, DataType b, const QuantParams& a_qp) noexcept {
+    return (a == DataType::f32 || a == DataType::f16) && b == DataType::s8 && a_qp.is_active();
 }
 
 /// Matrix multiplication operator (class-based API).

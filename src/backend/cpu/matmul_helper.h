@@ -502,6 +502,26 @@ void tile_scale(half* c, int ldc, float scale, int M, int N);
 // write or zero that correction block.
 void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased);
+
+// fp activations straight into the packed int8 A panel: every panel row is
+// quantised with its own offline (scale, zero_point) into a small stack buffer
+// and then packed. Produces exactly the bytes of quantise-then-pack, without
+// the full M×K intermediate. Row-major A only (the transposing pack).
+//
+// `scale` / `zero` are indexed from the panel's first row and may be null, in
+// which case the scalar applies. `u8` selects the clamp range (0..255 vs
+// -128..127) — storage only, the panel stays signed.
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                            const float* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool u8, bool a_biased);
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                            const half* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool u8, bool a_biased);
+
 void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased);
 
@@ -552,9 +572,9 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           bool use_thread_slots = false);
 
 #ifdef NNOPS_ARCH_X86_64
-/// Diagnostic cap on the fused Q5_1 small-M route (matmul.cpp): negative keeps
-/// the built-in per-layout M limits, 0 disables the route. Benchmarks use it to
-/// A/B the fused and packed routes inside one process.
+/// Diagnostic cap on the fused Q5_1 small-M route (matmul_q5_fused.cpp):
+/// negative keeps the built-in per-layout M limits, 0 disables the route.
+/// Benchmarks use it to A/B the fused and packed routes inside one process.
 extern int q5_fused_max_m_override;
 #endif
 
