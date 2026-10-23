@@ -26,6 +26,16 @@ enum class ConvAlgorithm : uint8_t {
     Winograd,          ///< F(2×2, 3×3) Winograd, k3s1 only, requires prepacked U
 };
 
+/// True for the quantized Conv2D route: an s8 weight (per-channel QuantParams)
+/// against a u8/s8/f16/f32 activation (per-tensor QuantParams), fp output.
+///
+/// Analogous to `is_int8_matmul` / `is_fp_quant_matmul`, this lives here so the
+/// operator and the CPU backend agree on which dtype combination is the
+/// quantized one (the backend dispatches on exactly this predicate).
+inline constexpr bool is_quantized_conv2d(DataType weight_dtype) noexcept {
+    return weight_dtype == DataType::s8;
+}
+
 /// Attributes describing a 2D convolution.
 struct Conv2DAttributes {
     /// Kernel size along height and width.
@@ -60,6 +70,23 @@ struct Conv2DAttributes {
     ///   output += Conv(input)  rather than  output = Conv(input)
     bool add_to = false;
 
+    // ---- quantized route (is_quantized_conv2d(weight): s8 weights) ----------
+    //
+    // The two attributes mirror MatMul's: same names, same meaning. They are
+    // ignored on the floating-point route.
+
+    /// Output dtype of the quantized route when the activation is *already*
+    /// quantized (u8/s8): the GEMM output is dequantized to this fp type.
+    /// Ignored when the activation is f32/f16 — the output then follows the
+    /// activation's dtype (f32 → f32, f16 → f16), as on MatMul's dq route.
+    DataType output_dtype = DataType::f32;
+
+    /// Integer storage the fp activation (f32/f16) is quantized to inside the
+    /// kernel, per im2col tile: s8 (default) or u8. Selects the clamp range and
+    /// the zero-point convention. Only read when the activation is f32/f16;
+    /// pre-quantized activations keep their storage type.
+    DataType act_quant_dtype = DataType::s8;
+
     /// Kernel-selection hint for the CPU backend (default preserves today's
     /// tiled im2col path, so existing callers are unaffected).
     ///
@@ -76,6 +103,11 @@ struct Conv2DAttributes {
 /// Supports NCHW layout with grouped and dilated convolution.
 /// Input: [N, IC, IH, IW], Weight: [OC, IC/G, KH, KW], Output: [N, OC, OH, OW].
 /// Optional bias: [OC].
+///
+/// Data types: f32/f16 on every input and output (the floating-point route), or
+/// the quantized route — an s8 weight with per-channel QuantParams against a
+/// u8/s8/f16/f32 activation with per-tensor QuantParams, producing fp output.
+/// See is_quantized_conv2d().
 class Conv2D : public OpBase {
 public:
     static std::unique_ptr<Conv2D> create(const Conv2DAttributes& attrs,

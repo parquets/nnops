@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 
 using namespace nnops;
 using half = nnops::backend::cpu::half;
+using nnops::backend::cpu::float_to_half;
 namespace cpu = nnops::backend::cpu;
 
 namespace {
@@ -343,6 +345,13 @@ double time_ms(Fn&& fn, int iters) {
            std::max(iters, 1);
 }
 
+/// Median of the per-round timings — one descheduled round should not decide
+/// the verdict for every other round.
+double median_of(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
 /// Interleaved A/B. Within one round the two variants alternate A B A B, and the
 /// second A is the **null control**: same op, same binary, same buffers, so an
 /// A2/A1 gap is pure measurement drift (fanless thermal soak, cache state) and
@@ -462,14 +471,8 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
             wn_ms.push_back(b);
             null_pct.push_back(std::abs(a2 - a1) / std::min(a1, a2) * 100.0);
         }
-        auto median = [](std::vector<double> v) {
-            std::sort(v.begin(), v.end());
-            return v[v.size() / 2];
-        };
-        const double im = median(im_ms), wn = median(wn_ms);
-        // Median, not max: one descheduled round should not be allowed to
-        // disable the verdict for every other round.
-        const double nf = median(null_pct);
+        const double im = median_of(im_ms), wn = median_of(wn_ms);
+        const double nf = median_of(null_pct);
         const double speedup = im / wn;
         // The two GFLOPS columns are each variant's own useful-work rate; they
         // are not comparable (im2col does 9/4x the multiplies). The verdict is
@@ -489,6 +492,352 @@ void bench_wino_case(const WinoCase& c) {
     const std::vector<int> threads = conv_bench_threads();
     if (c.f16) { run_wino_ab<half>(c, threads, iters, rounds); }
     else       { run_wino_ab<float>(c, threads, iters, rounds); }
+}
+
+// ============================================================
+// Quantized Conv2D — s8 weight × u8/s8/f32/f16 activation → fp output
+// ============================================================
+//
+// Rates are GOPS of int8 MACs, counted with the same
+// 2·N·OC·OH·OW·(IC/G)·KH·KW expression the fp cases call FLOPs, so the A/B
+// rows below compare wall time for the same amount of useful work.
+//
+// A pre-quantized activation (u8/s8) is the deployment shape: the tensor
+// arrives quantized, so im2col is a byte copy. An fp activation is quantized
+// while the tile is gathered — identical MACs, extra work per element — and
+// `conv2d_i8_fp_act_overhead_ab` measures exactly that difference.
+
+struct Conv2DI8Case {
+    const char* name;
+    int64_t N, IC, IH, IW, OC, KH, KW;
+    int64_t SH = 1, SW = 1, PH = 0, PW = 0, DH = 1, DW = 1, groups = 1;
+    bool bias = false;
+    DataType act = DataType::u8;      // stored activation dtype
+    DataType out = DataType::f32;
+    DataType act_q = DataType::s8;    // quantization target for fp activations
+    bool asym_w = false;              // per-channel weight zero point != 0
+};
+
+/// float → s8/u8 storage value, with the arithmetic the kernels use.
+int32_t quant_i8(float x, float inv_scale, int32_t zp, bool u8) {
+    const float v = std::fmaf(x, inv_scale, static_cast<float>(zp));
+    const int32_t q = static_cast<int32_t>(std::nearbyintf(v));
+    return std::min(std::max(q, u8 ? 0 : -128), u8 ? 255 : 127);
+}
+
+const char* dtype_name(DataType dt) {
+    switch (dt) {
+        case DataType::f32: return "f32";
+        case DataType::f16: return "f16";
+        case DataType::u8:  return "u8";
+        case DataType::s8:  return "s8";
+        default:            return "?";
+    }
+}
+
+/// A fully built quantized convolution. Construction is the whole setup —
+/// operand storage, the views over it, the op, the output and the plan — done
+/// once outside every timed region; `run` is then the entire timed body.
+struct I8Op {
+    I8Op(const Conv2DI8Case& c, int plan_threads) {
+        const int64_t N = c.N, IC = c.IC, IH = c.IH, IW = c.IW, OC = c.OC;
+        icg = IC / c.groups;
+        const bool act_u8 = (c.act == DataType::u8);
+        const bool fp_act = (c.act == DataType::f32 || c.act == DataType::f16);
+        const bool target_u8 = (c.act_q == DataType::u8);
+        const float s_x = 0.0078125f;   // 1/128 — exact, and the fp range fits
+        const int32_t zp_x = (act_u8 || (fp_act && target_u8)) ? 128 : 0;
+        const int64_t act_n = N * IC * IH * IW;
+
+        act.resize(static_cast<size_t>(act_n) * static_cast<size_t>(data_type_size(c.act)));
+        {
+            test::XorShift128 rng(31);
+            const float inv = 1.0f / s_x;
+            for (int64_t i = 0; i < act_n; ++i) {
+                const float x = rng.next_float(-1.0f, 1.0f);
+                if (c.act == DataType::f32) {
+                    reinterpret_cast<float*>(act.data())[i] = x;
+                } else if (c.act == DataType::f16) {
+                    reinterpret_cast<half*>(act.data())[i] = float_to_half(x);
+                } else {
+                    act[static_cast<size_t>(i)] =
+                        static_cast<uint8_t>(quant_i8(x, inv, zp_x, act_u8));
+                }
+            }
+        }
+
+        const int64_t w_n = OC * icg * c.KH * c.KW;
+        w.resize(static_cast<size_t>(w_n));
+        w_s.resize(static_cast<size_t>(OC));
+        w_zp.resize(static_cast<size_t>(OC));
+        {
+            test::XorShift128 rng(32);
+            for (int64_t i = 0; i < w_n; ++i) {
+                w[static_cast<size_t>(i)] = static_cast<int8_t>(
+                    quant_i8(rng.next_float(-1.0f, 1.0f), 127.0f, 0, /*u8=*/false));
+            }
+            for (int64_t oc = 0; oc < OC; ++oc) {
+                w_s[static_cast<size_t>(oc)] = 0.01f * static_cast<float>(1 + oc % 5);
+                w_zp[static_cast<size_t>(oc)] =
+                    c.asym_w ? static_cast<int32_t>(-40 + (oc * 7) % 60) : 0;
+            }
+        }
+
+        if (c.bias) {
+            bias.resize(static_cast<size_t>(OC) * static_cast<size_t>(data_type_size(c.out)));
+            test::XorShift128 rng(33);
+            for (int64_t oc = 0; oc < OC; ++oc) {
+                const float b = rng.next_float(-0.5f, 0.5f);
+                if (c.out == DataType::f16) {
+                    reinterpret_cast<half*>(bias.data())[oc] = float_to_half(b);
+                } else {
+                    reinterpret_cast<float*>(bias.data())[oc] = b;
+                }
+            }
+        }
+
+        // Per-tensor activation, per-channel weight — the contract's shape.
+        qa.granularity = QuantGranularity::PerTensor;
+        qa.scale = s_x;
+        qa.zero_point = zp_x;
+        qw.granularity = QuantGranularity::PerChannel;
+        qw.scale_data = w_s.data();
+        qw.zero_point_data = w_zp.data();
+        qw.num_scales = OC;
+
+        attrs.kernel_size = {c.KH, c.KW};
+        attrs.stride      = {c.SH, c.SW};
+        attrs.dilation    = {c.DH, c.DW};
+        attrs.padding     = {c.PH, c.PW};
+        attrs.groups      = c.groups;
+        attrs.output_dtype = c.out;
+        attrs.act_quant_dtype = c.act_q;
+
+        const int64_t ishape[] = {N, IC, IH, IW};
+        const int64_t wshape[] = {OC, icg, c.KH, c.KW};
+        ins.push_back(TensorView(ishape, c.act, act.data(), TensorLayout::NCHW, qa));
+        ins.push_back(TensorView(wshape, DataType::s8, w.data(), TensorLayout::NCHW, qw));
+        if (c.bias) {
+            const int64_t bshape[] = {OC};
+            ins.push_back(TensorView(bshape, c.out, bias.data(), TensorLayout::NCHW));
+        }
+
+        std::vector<TensorDesc> descs;
+        descs.reserve(ins.size());
+        for (const auto& v : ins) { descs.push_back(v.desc()); }
+
+        op = Conv2D::create(attrs, Backend::CPU);
+        const auto outs = op->getOutputTensorDesc(descs);
+        OH = outs[0].dims[2];
+        OW = outs[0].dims[3];
+        out_buf.assign(outs[0].nbytes(), 0);
+        out = test::make_planar(outs[0], out_buf.data());
+
+        // Resolved at the largest thread count (the max oh-chunk split), with
+        // per-thread scratch sized in — the bench pool reports thread ids.
+        plan = cpu::get_conv2d_plan(attrs, descs, outs, plan_threads,
+                                    /*use_thread_slots=*/true);
+        work = 2.0 * static_cast<double>(N) * OC * OH * OW *
+               static_cast<double>(icg) * c.KH * c.KW;
+    }
+
+    void run(const ComputeContext& ctx) { op->compute(out, ins, ctx, nullptr); }
+
+    Conv2DAttributes attrs{};
+    QuantParams qa{}, qw{};
+    std::vector<uint8_t> act, bias, out_buf;
+    std::vector<int8_t>  w;
+    std::vector<float>   w_s;
+    std::vector<int32_t> w_zp;
+    std::vector<TensorView> ins;
+    TensorView out;
+    std::unique_ptr<Conv2D> op;
+    cpu::Conv2DPlan plan{};
+    int64_t OH = 0, OW = 0, icg = 0;
+    double work = 0.0;   // MACs per call
+};
+
+/// The fp32 baseline for the A/B — the same geometry through the fp
+/// im2col+GEMM route, kept alive across rounds. `run_conv2d` builds, reports and
+/// tears everything down in one call, which is the wrong shape for an
+/// interleaved comparison.
+struct Fp32Op {
+    explicit Fp32Op(const Conv2DCase& c) {
+        const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t wshape[] = {c.OC, c.IC / c.groups, c.KH, c.KW};
+        icg = c.IC / c.groups;
+
+        in_buf.resize(static_cast<size_t>(c.N * c.IC * c.IH * c.IW));
+        in = TensorView(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
+        test::fill_random_float(in, -1.0f, 1.0f, 41);
+
+        w_buf.resize(static_cast<size_t>(c.OC * icg * c.KH * c.KW));
+        w = TensorView(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
+        test::fill_random_float(w, -1.0f, 1.0f, 42);
+
+        attrs.kernel_size = {c.KH, c.KW};
+        attrs.stride      = {c.SH, c.SW};
+        attrs.dilation    = {c.DH, c.DW};
+        attrs.padding     = {c.PH, c.PW};
+        attrs.groups      = c.groups;
+
+        std::vector<TensorDesc> descs = {in.desc(), w.desc()};
+        ins = {in, w};
+        if (c.bias) {
+            b_buf.resize(static_cast<size_t>(c.OC));
+            bias = TensorView(std::span<const int64_t>(&c.OC, 1), DataType::f32,
+                              b_buf.data(), TensorLayout::NCHW);
+            test::fill_random_float(bias, -0.5f, 0.5f, 43);
+            descs.push_back(bias.desc());
+            ins.push_back(bias);
+        }
+
+        op = Conv2D::create(attrs, Backend::CPU);
+        const auto outs = op->getOutputTensorDesc(descs);
+        OH = outs[0].dims[2];
+        OW = outs[0].dims[3];
+        out_buf.assign(outs[0].nbytes(), 0);
+        out = test::make_planar(outs[0], out_buf.data());
+        work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW *
+               static_cast<double>(icg) * c.KH * c.KW;
+    }
+
+    void run(const ComputeContext& ctx) { op->compute(out, ins, ctx, nullptr); }
+
+    Conv2DAttributes attrs{};
+    std::vector<float> in_buf, w_buf, b_buf, out_buf;
+    TensorView in, w, bias, out;
+    std::vector<TensorView> ins;
+    std::unique_ptr<Conv2D> op;
+    int64_t OH = 0, OW = 0, icg = 0;
+    double work = 0.0;   // FLOPs per call
+};
+
+Conv2DI8Case as_i8(const Conv2DCase& c, DataType act) {
+    Conv2DI8Case q{};
+    q.name = c.name;
+    q.N = c.N; q.IC = c.IC; q.IH = c.IH; q.IW = c.IW;
+    q.OC = c.OC; q.KH = c.KH; q.KW = c.KW;
+    q.SH = c.SH; q.SW = c.SW; q.PH = c.PH; q.PW = c.PW;
+    q.DH = c.DH; q.DW = c.DW; q.groups = c.groups;
+    q.bias = c.bias;
+    q.act = act;
+    return q;
+}
+
+void run_conv2d_i8(const Conv2DI8Case& c, const std::vector<int>& threads, int iters) {
+    I8Op b(c, threads.back());
+
+    std::printf("  %s\n", c.name);
+    std::printf("    in[%lld,%lld,%lld,%lld] %s  w[%lld,%lld,%lldx%lld] s8  ->"
+                "  out[%lld,%lld,%lld,%lld] %s%s%s%s\n",
+                (long long)c.N, (long long)c.IC, (long long)c.IH, (long long)c.IW,
+                dtype_name(c.act),
+                (long long)c.OC, (long long)b.icg, (long long)c.KH, (long long)c.KW,
+                (long long)c.N, (long long)c.OC, (long long)b.OH, (long long)b.OW,
+                dtype_name(c.out),
+                c.bias ? "  +bias" : "", c.asym_w ? "  asym-w" : "",
+                c.act == DataType::f32 || c.act == DataType::f16
+                    ? (c.act_q == DataType::u8 ? "  quant->u8" : "  quant->s8") : "");
+    std::printf("    icn=%lld ocn=%lld oh_block=%lld oh_blocks=%lld  tasks=N*G*oh_chunks=%lld"
+                "  ws=%zuB%s\n",
+                (long long)b.plan.icn_block, (long long)b.plan.ocn_block,
+                (long long)b.plan.oh_block, (long long)b.plan.num_oh_blocks,
+                (long long)(c.N * c.groups * b.plan.oh_chunks), b.plan.workspace_size,
+                b.plan.pointwise ? "  pointwise(no col buffer)" : "");
+
+    std::vector<double> gops;
+    for (int nt : threads) {
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        auto compute = [&]() { b.run(use_ctx); };
+        for (int i = 0; i < 2; ++i) { compute(); }   // warm-up / page faults
+        const double ms = time_ms(compute, iters);
+        gops.push_back(b.work / ms / 1e6);
+    }
+
+    const double g1 = gops.empty() ? 0.0 : gops[0];
+    std::printf("    ");
+    for (size_t i = 0; i < threads.size(); ++i) {
+        const double speedup = g1 > 0.0 ? gops[i] / g1 : 0.0;
+        std::printf(" %2dT %7.1f GOPS (%.2fx)", threads[i], gops[i], speedup);
+        if (i + 1 < threads.size()) { std::printf(" |"); }
+    }
+    std::printf("\n");
+}
+
+void bench_conv2d_i8_case(const Conv2DI8Case& c) {
+    run_conv2d_i8(c, conv_bench_threads(), 20);
+}
+
+/// Interleaved A/B, the same discipline as `run_wino_ab`: within a round the
+/// variants alternate A B A B, and the second A is the null control — same op,
+/// same binary, same buffers, so an A2/A1 gap is measurement drift and nothing
+/// else. Per round the minimum is kept and the median across rounds is
+/// reported; the verdict is called real only when it clears the null floor.
+/// One interleaved A/B measurement at @p nt threads, in per-call ms.
+struct AbResult {
+    double a_ms = 0.0, b_ms = 0.0;   ///< median over rounds of the per-round min
+    double null_pct = 0.0;           ///< median A2/A1 drift — the noise floor
+};
+
+template <class FA, class FB>
+AbResult measure_ab(int nt, FA&& a, FB&& b, int iters, int rounds) {
+    SimplePool pool(nt);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+    auto run_a = [&]() { a(use_ctx); };
+    auto run_b = [&]() { b(use_ctx); };
+    run_a(); run_b(); run_a(); run_b();   // warm-up / page faults
+
+    std::vector<double> a_ms, b_ms, null_pct;
+    for (int r = 0; r < rounds; ++r) {
+        const double a1 = time_ms(run_a, iters);
+        const double b1 = time_ms(run_b, iters);
+        const double a2 = time_ms(run_a, iters);   // null control
+        const double b2 = time_ms(run_b, iters);
+        a_ms.push_back(std::min(a1, a2));
+        b_ms.push_back(std::min(b1, b2));
+        null_pct.push_back(std::abs(a2 - a1) / std::min(a1, a2) * 100.0);
+    }
+    return {median_of(a_ms), median_of(b_ms), median_of(null_pct)};
+}
+
+template <class FA, class FB>
+void run_ab_pair(const char* title,
+                 const char* la, double wa, const char* ua, FA&& a,
+                 const char* lb, double wb, const char* ub, FB&& b,
+                 const std::vector<int>& threads, int iters, int rounds) {
+    std::printf("  %s\n", title);
+    for (int nt : threads) {
+        const AbResult r = measure_ab(nt, a, b, iters, rounds);
+        // B's wall time as a fraction of A's: 0.5x means B costs half the time.
+        const double ratio = r.b_ms / r.a_ms;
+        const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
+
+        std::printf("    %2dT  %-6s %7.3f ms (%7.1f %s) | %-6s %7.3f ms (%7.1f %s)"
+                    " | %s/%s time %.2fx%s | null %.1f%%\n",
+                    nt, la, r.a_ms, wa / r.a_ms / 1e6, ua,
+                    lb, r.b_ms, wb / r.b_ms / 1e6, ub,
+                    lb, la, ratio, real ? "" : " (within noise)", r.null_pct);
+    }
+}
+
+/// The headline number: the quantized route against the fp route on the same
+/// geometry (u8 activation, which is the deployment shape).
+void bench_conv2d_i8_vs_fp(const Conv2DCase& c, int iters, int rounds) {
+    const std::vector<int> threads = conv_bench_threads();
+    I8Op i8(as_i8(c, DataType::u8), threads.back());
+    Fp32Op fp(c);
+    run_ab_pair(c.name,
+                "fp32", fp.work, "GFLOPS", [&](const ComputeContext& x) { fp.run(x); },
+                "int8", i8.work, "GOPS",  [&](const ComputeContext& x) { i8.run(x); },
+                threads, iters, rounds);
 }
 
 // ============================================================
@@ -1078,4 +1427,210 @@ NNOPS_BENCH(conv2d_f16_vgg16_stack) {
         {1, 512,  14, 512, 3},
         {1, 512,  14, 512, 3},
     }, sweep_threads(), 250.0);
+}
+
+// ============================================================
+// Quantized Conv2D — s8 weight × u8/s8/f32/f16 activation → fp output
+// ============================================================
+
+NNOPS_BENCH(conv2d_i8_u8_3x3) {
+    // Pre-quantized activation — the deployment shape: im2col is a byte copy.
+    bench_conv2d_i8_case({"i8 u8-act 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                          1, 64, 56, 56, 64, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                          /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true});
+}
+
+NNOPS_BENCH(conv2d_i8_f32act_3x3) {
+    // Same geometry, fp activation: quantized inside the im2col gather.
+    bench_conv2d_i8_case({"i8 f32-act 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                          1, 64, 56, 56, 64, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                          /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true,
+                          DataType::f32});
+}
+
+NNOPS_BENCH(conv2d_i8_pointwise_1x1) {
+    // 1x1 with a pre-quantized activation takes the pointwise route (no col).
+    bench_conv2d_i8_case({"i8 u8-act pointwise 1x256x28x28 -> 256 x 1x1 +bias",
+                          1, 256, 28, 28, 256, 1, 1,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0,
+                          /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true});
+}
+
+NNOPS_BENCH(conv2d_i8_mid_3x3) {
+    bench_conv2d_i8_case({"i8 u8-act 1x128x28x28 -> 128 x 3x3 s1 p1 +bias",
+                          1, 128, 28, 28, 128, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                          /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true});
+}
+
+NNOPS_BENCH(conv2d_i8_groups4) {
+    // Grouped: K per group is IC/G·karea, so the ic-block count collapses.
+    bench_conv2d_i8_case({"i8 u8-act grouped 1x128x56x56 -> 128 x 3x3 g4 +bias",
+                          1, 128, 56, 56, 128, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                          /*DH=*/1, /*DW=*/1, /*groups=*/4, /*bias=*/true});
+}
+
+NNOPS_BENCH(conv2d_i8_f16_act_out) {
+    // f16 in, f16 out: the quantize-in-gather path with an f16 epilogue.
+    bench_conv2d_i8_case({"i8 f16-act/f16-out 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                          1, 64, 56, 56, 64, 3, 3,
+                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                          /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true,
+                          DataType::f16, DataType::f16});
+}
+
+NNOPS_BENCH(conv2d_i8_vs_fp_ab) {
+    // The headline number: how much of the fp wall time the quantized route
+    // recovers, same geometry, same useful work.
+    bench_conv2d_i8_vs_fp({"int8 vs fp32 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                           1, 64, 56, 56, 64, 3, 3,
+                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                           /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
+                          10, 5);
+}
+
+NNOPS_BENCH(conv2d_i8_fp_act_overhead_ab) {
+    // The price of quantizing on the fly: identical MACs, a conversion per
+    // gathered element. Pointwise is where it should hurt most — the 1x1 case
+    // turns im2col into a pure quantizing copy.
+    const int iters = 10, rounds = 5;
+    const std::vector<int> threads = conv_bench_threads();
+
+    auto bench_one = [&](const Conv2DI8Case& u8c) {
+        Conv2DI8Case f32c = u8c;
+        f32c.act = DataType::f32;
+        I8Op a(u8c, threads.back());
+        I8Op b(f32c, threads.back());
+        run_ab_pair(u8c.name,
+                    "u8", a.work, "GOPS", [&](const ComputeContext& x) { a.run(x); },
+                    "f32", b.work, "GOPS", [&](const ComputeContext& x) { b.run(x); },
+                    threads, iters, rounds);
+    };
+
+    bench_one({"i8 fp-act overhead 1x256x28x28 -> 256 x 1x1 +bias",
+               1, 256, 28, 28, 256, 1, 1,
+               /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0,
+               /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true});
+    bench_one({"i8 fp-act overhead 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+               1, 64, 56, 56, 64, 3, 3,
+               /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+               /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true});
+}
+
+/// The layer ladder the comparison sweeps walk: a ResNet-ish stack plus a
+/// grouped and a batched case, every one with bias.
+const std::vector<Conv2DCase>& conv_sweep_shapes() {
+    static const std::vector<Conv2DCase> shapes = {
+        {"1x3x224x224  -> 64  7x7 s2 p3",  1,   3, 224, 224,  64, 7, 7,
+         2, 2, 3, 3, 1, 1, 1, true},
+        {"1x64x56x56   -> 64  3x3 p1",     1,  64,  56,  56,  64, 3, 3,
+         1, 1, 1, 1, 1, 1, 1, true},
+        {"1x64x56x56   -> 256 1x1",        1,  64,  56,  56, 256, 1, 1,
+         1, 1, 0, 0, 1, 1, 1, true},
+        {"1x128x28x28  -> 128 3x3 p1",     1, 128,  28,  28, 128, 3, 3,
+         1, 1, 1, 1, 1, 1, 1, true},
+        {"1x256x28x28  -> 256 1x1",        1, 256,  28,  28, 256, 1, 1,
+         1, 1, 0, 0, 1, 1, 1, true},
+        {"1x256x14x14  -> 256 3x3 p1",     1, 256,  14,  14, 256, 3, 3,
+         1, 1, 1, 1, 1, 1, 1, true},
+        {"1x512x14x14  -> 512 1x1",        1, 512,  14,  14, 512, 1, 1,
+         1, 1, 0, 0, 1, 1, 1, true},
+        {"1x128x56x56  -> 128 3x3 g4 p1",  1, 128,  56,  56, 128, 3, 3,
+         1, 1, 1, 1, 1, 1, 4, true},
+        {"4x64x28x28   -> 128 3x3 p1",     4,  64,  28,  28, 128, 3, 3,
+         1, 1, 1, 1, 1, 1, 1, true},
+    };
+    return shapes;
+}
+
+NNOPS_BENCH(conv2d_i8_vs_fp_sweep) {
+    // The two routes side by side over one network's layer ladder. Both columns
+    // count the same 2·N·OC·OH·OW·(IC/G)·KH·KW MACs, so GFLOPS and GOPS are
+    // directly comparable, and the last column is B's wall time over A's.
+    // Every row is an interleaved A/B with a null control, so a row that lands
+    // inside the noise floor says so instead of reporting drift as a win.
+    const std::vector<Conv2DCase>& shapes = conv_sweep_shapes();
+
+    const int iters = 10, rounds = 3;
+    const std::vector<int> threads = conv_bench_threads();
+    for (int nt : threads) {
+        std::printf("\n  %d thread%s — fp32 = im2col+GEMM, int8 = s8 weight x u8 activation\n",
+                    nt, nt == 1 ? "" : "s");
+        std::printf("    %-31s %7s %8s | %7s %8s | %6s | %s\n",
+                    "case", "fp32 ms", "GFLOPS", "int8 ms", "GOPS", "int8/fp32", "null");
+        double tot_a = 0.0, tot_b = 0.0;
+        for (const auto& c : shapes) {
+            I8Op i8(as_i8(c, DataType::u8), nt);
+            Fp32Op fp(c);
+            const AbResult r = measure_ab(nt,
+                                          [&](const ComputeContext& x) { fp.run(x); },
+                                          [&](const ComputeContext& x) { i8.run(x); },
+                                          iters, rounds);
+            tot_a += r.a_ms;
+            tot_b += r.b_ms;
+            const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
+            std::printf("    %-31s %7.3f %8.1f | %7.3f %8.1f | %5.2fx | %4.1f%%%s\n",
+                        c.name, r.a_ms, fp.work / r.a_ms / 1e6,
+                        r.b_ms, i8.work / r.b_ms / 1e6,
+                        r.b_ms / r.a_ms, r.null_pct, real ? "" : " (noise)");
+        }
+        // Sum of the per-layer times: the speedup a straight fp→int8 swap of the
+        // whole stack would deliver, unweighted by how often each layer runs.
+        std::printf("    %-31s %7.3f %8s | %7.3f %8s | %5.2fx |\n",
+                    "sum of the layers", tot_a, "", tot_b, "", tot_b / tot_a);
+    }
+}
+
+NNOPS_BENCH(conv2d_i8_fpact_vs_fp_sweep) {
+    // In-kernel quantization, priced against fp32: the same fp32 activation goes
+    // through the int8 route, which quantizes each im2col tile as it is gathered.
+    // The fp32 column is the alternative, so `f32act/fp32` is the answer to "I
+    // cannot pre-quantize my tensors — is this route still worth it". The `u8`
+    // column is what pre-quantizing would add on top; `f32/u8` is therefore the
+    // price of quantizing on the fly.
+    //
+    // Two interleaved pairs per row (fp32 vs f32act, u8 vs f32act) rather than
+    // one three-way, so each ratio is measured against a baseline carrying the
+    // same drift.
+    const std::vector<Conv2DCase>& shapes = conv_sweep_shapes();
+
+    const int iters = 10, rounds = 3;
+    const std::vector<int> threads = conv_bench_threads();
+    for (int nt : threads) {
+        std::printf("\n  %d thread%s — fp32 route vs the int8 route with an f32 activation,"
+                    " and with a pre-quantized u8 one\n", nt, nt == 1 ? "" : "s");
+        std::printf("    %-31s %7s %8s | %8s %8s | %s | %7s %8s | %s\n",
+                    "case", "fp32 ms", "GFLOPS", "f32act ms", "GOPS",
+                    "f32act/fp32", "u8 ms", "GOPS", "f32act/u8");
+        double tot_a = 0.0, tot_b = 0.0, tot_u = 0.0;
+        for (const auto& c : shapes) {
+            I8Op u8op(as_i8(c, DataType::u8), nt);
+            I8Op fop(as_i8(c, DataType::f32), nt);
+            Fp32Op fp(c);
+
+            const AbResult rf = measure_ab(nt,
+                                           [&](const ComputeContext& x) { fp.run(x); },
+                                           [&](const ComputeContext& x) { fop.run(x); },
+                                           iters, rounds);
+            const AbResult ru = measure_ab(nt,
+                                           [&](const ComputeContext& x) { u8op.run(x); },
+                                           [&](const ComputeContext& x) { fop.run(x); },
+                                           iters, rounds);
+            tot_a += rf.a_ms;
+            tot_b += rf.b_ms;
+            tot_u += ru.a_ms;
+            const bool real = std::abs(rf.a_ms - rf.b_ms) / rf.a_ms * 100.0 > rf.null_pct;
+            std::printf("    %-31s %7.3f %8.1f | %8.3f %8.1f | %9.2fx | %7.3f %8.1f | %8.2fx%s\n",
+                        c.name, rf.a_ms, fp.work / rf.a_ms / 1e6,
+                        rf.b_ms, fop.work / rf.b_ms / 1e6, rf.b_ms / rf.a_ms,
+                        ru.a_ms, u8op.work / ru.a_ms / 1e6, ru.b_ms / ru.a_ms,
+                        real ? "" : " (noise)");
+        }
+        std::printf("    %-31s %7.3f %8s | %8.3f %8s | %9.2fx | %7.3f %8s | %8.2fx\n",
+                    "sum of the layers", tot_a, "", tot_b, "", tot_b / tot_a,
+                    tot_u, "", tot_b / tot_u);
+    }
 }

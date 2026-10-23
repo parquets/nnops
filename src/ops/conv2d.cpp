@@ -78,9 +78,19 @@ Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
 std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return {conv2d_output_shape(
+    std::vector<TensorDesc> outs = conv2d_output_shape(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs)};
+        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs);
+
+    // The quantized route writes fp output. A fp activation already carries the
+    // output dtype (shape inference copies the input dtype); a pre-quantized
+    // activation (u8/s8) leaves it to attributes.output_dtype.
+    if (inputs.size() > 1 && is_quantized_conv2d(inputs[1].dtype)) {
+        const DataType act = inputs[0].dtype;
+        const bool fp_act = (act == DataType::f32 || act == DataType::f16);
+        outs[0].dtype = fp_act ? act : attrs_.output_dtype;
+    }
+    return outs;
 }
 
 size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc> inputs,
@@ -105,6 +115,13 @@ void Conv2D::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!inputs[0].is_empty());
     NNOPS_ASSERT(!inputs[1].is_empty());
     NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
+
+    // Winograd has no integer counterpart, so the quantized route always runs
+    // the im2col kernel — including for the k3s1 geometry Winograd would take.
+    if (backend_ == Backend::CPU && is_quantized_conv2d(inputs[1].data_type())) {
+        backend::cpu::conv2d_im2col_kernel(attrs_, output, inputs, ctx, workspace);
+        return;
+    }
 
     impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
 }

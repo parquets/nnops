@@ -22,29 +22,78 @@
 ///
 /// The innermost (width) copy uses an L-wide SIMD loop when stride_w == 1 (the
 /// dominant case); otherwise a scalar loop advancing by stride_w.
+///
+/// `tiled_im2col_2d` writes the input values through unchanged, with a
+/// configurable pad value. That is all the quantized Conv2D route needs: it
+/// quantizes an fp activation into a plane up front (conv2d_im2col_int8.cpp,
+/// quantize_plane) and gathers bytes from then on, so no store policy other
+/// than "copy" is required.
 
 #include "nnops/detail/simd/simd.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 
 namespace nnops::kernel {
 
 using namespace simd;
 
-/// 2D im2col for NCHW convolution.
-///
-/// Builds col_data[ic*karea][roi_w*roi_h] where karea = kernel_h*kernel_w and
-/// the roi is an output window at (roi_x, roi_y) of size roi_w×roi_h. Row
-/// (ic*karea + kh*kernel_w + kw) holds the spatial positions for that
-/// (channel, tap); positions outside the input are zero.
-///
-/// Strides are in elements: icn_step between input channels, ih_step between
-/// input rows (the padded row pitch).
+namespace detail {
+
+/// Copy policy: write the gathered values (and `pad` outside the input)
+/// unchanged. `pad` is the value standing in for a zero input sample, which is
+/// the activation zero point on the pre-quantized route.
 template <class T>
-inline void tiled_im2col_2d(
-    T* col_data, const T* input,
+struct Im2colCopy {
+    using src_t = T;
+    using dst_t = T;
+
+    T pad;
+
+    void fill(T* d, int n) const noexcept {
+        if constexpr (std::is_integral_v<T>) {
+            // The int8 activation path: only +0 exists, and no SIMD helper
+            // handles the byte types.
+            if (pad == T(0)) {
+                std::memset(d, 0, sizeof(T) * static_cast<size_t>(n));
+            } else {
+                std::fill(d, d + n, pad);
+            }
+        } else {
+            // +0 and -0 are the same value and both memset to zero bits.
+            if (s_load(&pad) == 0.0f) {
+                std::memset(d, 0, sizeof(T) * static_cast<size_t>(n));
+            } else {
+                std::fill(d, d + n, pad);
+            }
+        }
+    }
+
+    void emit(T* d, const T* s, int n, int step) const noexcept {
+        if constexpr (std::is_integral_v<T>) {
+            if (step == 1) {
+                std::memcpy(d, s, sizeof(T) * static_cast<size_t>(n));
+            } else {
+                for (int i = 0; i < n; ++i) { d[i] = s[i * step]; }
+            }
+        } else if (step == 1) {
+            constexpr int L = simd_lane_for<T>;
+            int i = 0;
+            for (; i + L <= n; i += L) { v_store(d + i, v_load(s + i)); }
+            for (; i < n; ++i) { d[i] = s[i]; }
+        } else {
+            for (int i = 0; i < n; ++i) { d[i] = s[i * step]; }
+        }
+    }
+};
+
+/// The shared index/bounds walk: for every (channel, tap, roi row) it fills the
+/// padded faces and hands the valid run to the store policy.
+template <class Store>
+inline void im2col_2d_walk(
+    typename Store::dst_t* col_data, const typename Store::src_t* input,
     int roi_x, int roi_y, int roi_w, int roi_h,
     int pad_top_local, int pad_left_local,
     int pad_top_global, int pad_left_global,
@@ -52,18 +101,21 @@ inline void tiled_im2col_2d(
     int icn_step, int ih_step,
     int kernel_h, int kernel_w,
     int stride_h, int stride_w,
-    int dilate_h, int dilate_w) noexcept
+    int dilate_h, int dilate_w,
+    const Store& store) noexcept
 {
+    using TDst = typename Store::dst_t;
+    using TSrc = typename Store::src_t;
+
     const int karea    = kernel_h * kernel_w;
     const int roi_area = roi_w * roi_h;
-    constexpr int L    = simd_lane_for<T>;
 
     for (int ic = 0; ic < in_channel; ++ic) {
-        const T* input_ptr = input + ic * icn_step;
+        const TSrc* input_ptr = input + ic * icn_step;
         for (int k = 0; k < karea; ++k) {
             const int kh = k / kernel_w;
             const int kw = k % kernel_w;
-            T* col_ptr = col_data + (ic * karea + k) * roi_area;
+            TDst* col_ptr = col_data + (ic * karea + k) * roi_area;
 
             const int ikh = kh * dilate_h;
             const int ikw = kw * dilate_w;
@@ -75,35 +127,62 @@ inline void tiled_im2col_2d(
             const int ow_end = std::max(ow_beg, std::min(roi_w, (int)std::ceil((pad_left_global + in_w - ikw) / (float)stride_w) - roi_x));
 
             if (oh_beg > 0) {
-                std::memset(col_ptr, 0, sizeof(T) * static_cast<size_t>(oh_beg) * roi_w);
+                store.fill(col_ptr, oh_beg * roi_w);
             }
 
             int ih_paded = (oh_beg + roi_y) * stride_h - pad_top_global + ikh;
             int iw_paded = (ow_beg + roi_x) * stride_w - pad_left_global + ikw;
 
             for (int h = oh_beg; h < oh_end; ++h, ih_paded += stride_h) {
-                std::memset(col_ptr + h * roi_w, 0, sizeof(T) * static_cast<size_t>(ow_beg));
-                int w = ow_beg;
-                int in_id = ih_paded * ih_step + iw_paded;
-                if (stride_w == 1) {
-                    for (; w + L <= ow_end; w += L, in_id += L) {
-                        v_store(col_ptr + h * roi_w + w, v_load(input_ptr + in_id));
-                    }
-                }
-                int out_id = h * roi_w + w;
-                for (; w < ow_end; ++w, ++out_id, in_id += stride_w) {
-                    col_ptr[out_id] = input_ptr[in_id];
-                }
-                std::memset(col_ptr + h * roi_w + w, 0,
-                            sizeof(T) * static_cast<size_t>(roi_w - w));
+                TDst* row = col_ptr + h * roi_w;
+                store.fill(row, ow_beg);
+                const int in_id = ih_paded * ih_step + iw_paded;
+                store.emit(row + ow_beg, input_ptr + in_id, ow_end - ow_beg, stride_w);
+                store.fill(row + ow_end, roi_w - ow_end);
             }
 
             if (oh_end < roi_h) {
-                std::memset(col_ptr + oh_end * roi_w, 0,
-                            sizeof(T) * static_cast<size_t>(roi_h - oh_end) * roi_w);
+                store.fill(col_ptr + oh_end * roi_w, (roi_h - oh_end) * roi_w);
             }
         }
     }
+}
+
+}  // namespace detail
+
+/// 2D im2col for NCHW convolution.
+///
+/// Builds col_data[ic*karea][roi_w*roi_h] where karea = kernel_h*kernel_w and
+/// the roi is an output window at (roi_x, roi_y) of size roi_w×roi_h. Row
+/// (ic*karea + kh*kernel_w + kw) holds the spatial positions for that
+/// (channel, tap); positions outside the input hold @p pad_value.
+///
+/// Strides are in elements: icn_step between input channels, ih_step between
+/// input rows (the padded row pitch).
+///
+/// @p pad_value is what an out-of-input sample stores. It is 0 for the fp conv
+/// route; the pre-quantized activation route passes its activation zero point,
+/// since a quantized tensor represents the real value 0 as `zero_point`.
+template <class T>
+inline void tiled_im2col_2d(
+    T* col_data, const T* input,
+    int roi_x, int roi_y, int roi_w, int roi_h,
+    int pad_top_local, int pad_left_local,
+    int pad_top_global, int pad_left_global,
+    int in_channel, int in_h, int in_w,
+    int icn_step, int ih_step,
+    int kernel_h, int kernel_w,
+    int stride_h, int stride_w,
+    int dilate_h, int dilate_w,
+    T pad_value = T(0)) noexcept
+{
+    detail::im2col_2d_walk(col_data, input, roi_x, roi_y, roi_w, roi_h,
+                           pad_top_local, pad_left_local,
+                           pad_top_global, pad_left_global,
+                           in_channel, in_h, in_w, icn_step, ih_step,
+                           kernel_h, kernel_w, stride_h, stride_w,
+                           dilate_h, dilate_w,
+                           detail::Im2colCopy<T>{pad_value});
 }
 
 /// 3D im2col for NCDHW convolution.

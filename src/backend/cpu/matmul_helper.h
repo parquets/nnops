@@ -522,8 +522,14 @@ void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
                             float scale_scalar, int32_t zero_scalar,
                             bool u8, bool a_biased);
 
+// `src_shift` treats the source bytes as unsigned and shifts them into the
+// signed range (XOR 0x80, i.e. value − 128) as they are packed — the u8
+// activation of the quantized Conv2D route. On x86 the shift happens before the
+// panel's correction block is computed, so the sums describe the shifted bytes
+// the kernel actually multiplies.
 void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
-                      const int8_t* src, int lds, bool a_biased);
+                      const int8_t* src, int lds, bool a_biased,
+                      bool src_shift = false);
 
 // Accumulate C[mc][nc] += A_packed[mc][K] × B_packed[K][nc] (int32), one kernel
 // call per M panel covering the whole N side.

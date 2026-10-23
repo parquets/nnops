@@ -35,15 +35,23 @@
 ///
 /// Scratch layout (pooled internally; one slot per worker thread when thread
 /// ids are reported, else one slot per task, reused across the task's oh-blocks):
+///   [quant    : N*IC*IH*IW bytes — the fp activation quantized once, shared]
 ///   [col_data : icn_block*karea*oh_block*out_w]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
 ///   [pack_b   : ceil(oh_block*out_w/nr_max) * ldd_b]
+/// then, on the quantized route only (fp has both regions sized 0):
+///   [acc      : ocn_block*oh_block*out_w    int32]
+///   [pack_a   : num_panels_max(ocn_block, MR_I8) * ldd_a_i8]
 ///
 /// col_data is the im2col matrix [K=icn_block*karea][N=oh_block*out_w], and is
 /// absent under `pointwise` (col_size 0) — the packer then reads B straight
 /// from the input. orig preserves the output tile for the exact add_to
 /// semantics. pack_b holds B in the uniform nr_max-wide panel layout the
 /// unified MMA kernels consume (matmul_helper.h); it is rebuilt per ic-block.
+/// The quant plane is written once per call (not per slot) and then read as if
+/// the activation had arrived quantized — that is what lets an fp activation
+/// take the pointwise route and stops the gather from re-quantizing per
+/// oc-block.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -67,6 +75,18 @@ struct Conv2DPlan {
     int64_t col_size  = 0;         ///< im2col scratch elements per slot (0 → pointwise)
     int64_t orig_size = 0;         ///< add_to scratch elements per slot
     int64_t pack_size = 0;         ///< uniform packed-B elements per slot
+
+    // ---- quantized route only (0 on the floating-point route) --------------
+    int64_t acc_size     = 0;      ///< int32 accumulator elements per slot
+                                   ///< (ocn_block·oh_block·OW)
+    int64_t pack_a_size  = 0;      ///< packed-weight bytes per slot
+    int64_t quant_size   = 0;      ///< bytes of the materialized int8 activation
+                                   ///< plane (N·IC·IH·IW); 0 when the activation
+                                   ///< already arrives quantized. Shared, not per
+                                   ///< slot — it sits at the front of the arena.
+    int64_t acc_offset    = 0;     ///< byte offset of the accumulator region
+    int64_t pack_a_offset = 0;     ///< byte offset of the packed-A region
+
     bool pointwise = false;        ///< k1s1p0 + dense input: the GEMM reads the input
                                    ///< tensor directly, so there is no im2col buffer
                                    ///< and icn_block spans all of ic_per_group
@@ -77,10 +97,14 @@ struct Conv2DPlan {
 };
 
 /// Resolve the conv2d plan (block sizes, oh-chunk split, workspace bytes) from
-/// the descriptors. Returns a zeroed plan (workspace_size 0) for unsupported
-/// dtypes (f32/f16 only, all tensors matching), which routes the kernel to the
-/// reference. @p num_threads drives the oh-chunk split; @p use_thread_slots
-/// sizes the scratch per worker thread (thread_id-indexed) instead of per task.
+/// the descriptors. Returns a zeroed plan for unsupported dtype combinations,
+/// which routes the kernel to the reference. Supported:
+///   * f32/f16 on every tensor (the floating-point route);
+///   * the quantized route — an s8 weight, a u8/s8/f16/f32 activation, a
+///     f32/f16 output and a matching bias (see is_quantized_conv2d), without
+///     add_to (which only the reference implements).
+/// @p num_threads drives the oh-chunk split; @p use_thread_slots sizes the
+/// scratch per worker thread (thread_id-indexed) instead of per task.
 Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
                            std::span<const TensorDesc> inputs,
                            std::span<const TensorDesc> outputs,
@@ -97,5 +121,22 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
                           void* workspace);
+
+/// Quantized Conv2D kernel (conv2d_im2col_int8.cpp): s8 weight (per-channel
+/// QuantParams) × u8/s8/f16/f32 activation (per-tensor QuantParams) → f32/f16
+/// output, through the int8 GEMM and a dequantizing epilogue.
+///
+/// Same tiling, parallel decomposition and scratch layout as the floating-point
+/// kernel, plus an int32 accumulator and a packed-weight region. A f32/f16
+/// activation is quantized into a dense plane once per call (plan.quant_size,
+/// at the front of the arena) and read as bytes from then on, so it follows the
+/// same route as a pre-quantized one — including pointwise. `add_to` and every
+/// unsupported combination go to the reference. Called from
+/// conv2d_im2col_kernel when the weight is s8.
+void conv2d_int8_kernel(const Conv2DAttributes& attrs,
+                        TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx,
+                        void* workspace);
 
 }  // namespace nnops::backend::cpu

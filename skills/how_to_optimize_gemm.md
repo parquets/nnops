@@ -624,6 +624,113 @@ call), but the extra `ctx.cpu.run` is not, and `SimplePool` re-spawns workers
 per call — so the fusion is worth about one run's worth of overhead, which only
 multi-threaded measurement shows.
 
+### 6.2 Quantized Conv2D — im2col + int8 GEMM
+
+The same W8A8 shape one level up: the weight is A (M = OC/G, K = IC/G·karea,
+s8 with per-output-channel parameters) and the im2col tile is B (N =
+oh_block·OW, same K, s8/u8 per-tensor). `conv2d_im2col_kernel` forwards to
+`conv2d_int8_kernel` ([conv2d_im2col_int8.cpp](../src/backend/cpu/conv2d_im2col_int8.cpp))
+whenever `is_quantized_conv2d(w)`, so the operator, the plan, the
+(batch, group, oh-chunk) decomposition and the scratch slots are unchanged; the
+plan only grows an int32 accumulator (`acc_size`) and a packed-weight region
+(`pack_a_size`) per slot.
+
+Three activation routes converge on one integer tile:
+
+| activation | built by | `col_data` holds | pointwise |
+|---|---|---|---|
+| s8 | `tiled_im2col_2d` (copy) | the stored byte | yes |
+| u8 | `tiled_im2col_2d` (copy, pad = zp_x) | the stored byte; the B packer XORs 0x80 | yes |
+| f32 / f16 | `quantize_plane` once per call, then `tiled_im2col_2d` (copy) | the quantized byte | yes |
+
+The fp activation is converted into a dense `[N][IC][IH][IW]` byte plane at the
+front of the scratch (`plan.quant_size`, shared across slots, not per slot) and
+from there the call is byte-for-byte the pre-quantized route. The first attempt
+quantized inside the im2col gather instead, reasoning that the gather already
+touches every element. It measured badly: the gather runs once per oh-block and
+again per oc-block, so the conversion repeated with the tiling while a single
+linear pass does not, and with no dense plane in hand a 1x1 conv could not take
+the pointwise route. Materializing made the fp route **indistinguishable from
+u8** (`f32act/u8` = 0.98–1.05 below) where the gather-time version ran 1.3–3.7x
+the u8 time.
+
+Two costs remain, and both are visible only in the multithreaded numbers:
+
+- the plane is a second memory pass (read 4 bytes, write 1, read 1 back). At 1T
+  it is ~0.3% of a layer; the GEMM hides it.
+- it is also a second **pool dispatch**. Below 2^19 elements the pass runs
+  inline on the calling thread: on this host one dispatch is ~100 µs at 4
+  threads (the pool re-spawns its workers per run) against ~10 µs of work for a
+  200k-element plane. With the dispatch it cost 1.63x the u8 1x1 at 4T; inline
+  it costs 1.09x.
+
+Conv still differs from MatMul here in *where* the conversion happens: MatMul's
+A is the original tensor, so its pack fuses the quantize
+(`tile_pack_quant_lhs_i8`); Conv's B is the im2col result, and quantizing inside
+the pack would mean materializing the fp tile at 4 bytes/element for every
+(oh-block, oc-block).
+
+**Kernel-side traps**, in the order they bite:
+
+- **oc must be the outer loop, ic-block inner.** The int32 accumulator holds one
+  oc-block's tile, so with ic outer a later oc-block's `std::fill` + MMA wipes
+  an earlier oc-block's partial sums and K is only half accumulated. It stays
+  silent until both loops iterate — more than one ic-block *and* more than one
+  oc-block — which is exactly what a small test shape hides.
+- **`tile_mma_pack_i8` has no zero_mode**, unlike the fp `tile_mma_direct`; the
+  accumulator is zeroed explicitly on the first ic-block.
+- **`dq_epilogue_tile`'s `p.k` is the full K** (`ic_per_group·karea`), never the
+  last ic-block's `kdim` — the compensation is a multiple of it.
+- **u8 is three coordinated places**: the packer's XOR (value − 128), the
+  epilogue's `zp_eff = zp_x − 128`, and `r_b`'s `−128·kdim`. Any one alone is a
+  silent wrong answer, so the u8 cases run zp ∈ {0, 127, 128}.
+- **`a_biased` comes from the weight dtype only** (s8 → 128 on x86), never from
+  the activation: the activation dtype decides the B-side shift, not the A-side.
+
+Measured (Release, 1T, `bench_conv2d conv2d_i8_*`):
+
+| case | GOPS | vs the fp route |
+|---|---|---|
+| 64ch 3x3 56x56, u8 act | 273 | 0.41x the fp32 time (2.4x faster) |
+| 64ch 3x3 56x56, f32 act | 275 | 1.00x the u8 time |
+| 64ch 3x3 56x56, f16 act + f16 out | 276 | |
+| 128ch 3x3 28x28, u8 act | 303 | |
+| 128ch 3x3 56x56 g4, u8 act | 183 | |
+| 256ch 1x1 28x28, u8 act (pointwise) | 405 | |
+| 256ch 1x1 28x28, f32 act | 401 | 1.01x the u8 time |
+
+The grouped row is the same MACs split into four smaller GEMMs (K = 288 instead
+of 576, an oc-block of 32 instead of 64), so the per-tile pack and epilogue
+overheads rise faster than the GEMM shrinks. The A/B rows (`conv2d_i8_vs_fp_ab`,
+`conv2d_i8_fp_act_overhead_ab`) are interleaved with the null control described
+above; 1T numbers are stable, multi-threaded ones need their own process.
+
+**In-kernel quantization against fp32** (`conv2d_i8_fpact_vs_fp_sweep`): an fp32
+activation through the int8 route costs **0.35x–0.58x** the fp32 route per layer,
+**0.45x** summed at 1T (2.2x faster) and **0.55x** at 4T (1.8x). Per layer, the
+worst case is the 7x7 stride-2 first layer (0.58x) — its gather is most of the
+work, and the fp32 route's GEMM is small enough that the im2col dominates both.
+Everything the plane pass adds is inside the noise: `f32act/u8` stays at
+0.98–1.05 summed 1.01x at 1T (0.97–1.09, 1.03x at 4T), so an fp activation that
+is quantized on the fly is now the same call as one that arrived quantized.
+
+Getting there took two changes, and the first attempt was the wrong shape:
+
+- quantizing inside the im2col gather, in place of the plane, *repeated* the
+  conversion once per oh-block and again per oc-block (`oc_per_group > 128`),
+  and kept fp 1x1 off the pointwise route. Measured: 0.52x–1.41x fp32 per layer,
+  0.80x summed at 1T. The `f32/u8` ratio tracked the oc-block count — 1.3x at
+  one, 2.3x at two, 3.7x at four — while the pre-quantized route stayed flat,
+  because there the repetition is only a byte copy.
+- with the plane, the remaining cost was the dispatch, not the conversion: at 4T
+  a 200k-element plane took 118 µs (a ~10 µs pass plus a ~100 µs pool
+  re-spawn), so fp 1x1 was 1.63x the u8 time. Running planes under 2^19 elements
+  inline on the calling thread brought it to 1.09x, and the summed 4T figure
+  from 0.69x to 0.55x of fp32.
+
+The lesson generalizes: when a conversion pass is cheaper than a dispatch, the
+pass is not the cost — scheduling it is.
+
 ---
 
 ## 7. Multithreading

@@ -350,14 +350,41 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     Conv2DPlan plan;
 
     const DataType dt = in.dtype;
-    if (dt != DataType::f32 && dt != DataType::f16) {
-        return plan;
-    }
-    if (wt.dtype != dt || out.dtype != dt) {
-        return plan;
-    }
-    if (inputs.size() > 2 && inputs[2].dtype != dt) {
-        return plan;
+    const bool quant = is_quantized_conv2d(wt.dtype);
+
+    if (quant) {
+        // Activation: pre-quantized (u8/s8), or fp quantized per im2col tile.
+        if (dt != DataType::u8 && dt != DataType::s8 &&
+            dt != DataType::f32 && dt != DataType::f16) {
+            return plan;
+        }
+        // Output is fp only: the activation dtype when the activation is fp,
+        // attributes.output_dtype when it is already quantized (checked by the
+        // caller against what it asked for; here only the fp-ness matters).
+        if (out.dtype != DataType::f32 && out.dtype != DataType::f16) {
+            return plan;
+        }
+        if ((dt == DataType::f32 || dt == DataType::f16) && out.dtype != dt) {
+            return plan;
+        }
+        if (inputs.size() > 2 && inputs[2].dtype != out.dtype) {
+            return plan;
+        }
+        // add_to needs the pre-existing output inside the accumulator; only the
+        // reference implements that fold.
+        if (attrs.add_to) {
+            return plan;
+        }
+    } else {
+        if (dt != DataType::f32 && dt != DataType::f16) {
+            return plan;
+        }
+        if (wt.dtype != dt || out.dtype != dt) {
+            return plan;
+        }
+        if (inputs.size() > 2 && inputs[2].dtype != dt) {
+            return plan;
+        }
     }
 
     const int64_t N  = in.dims[0];
@@ -382,10 +409,22 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // row_stride_elems == 0 is TensorDesc's "unknown → treat as compact"
     // convention (tensor_view.hpp:44), matching what row_stride_elems() returns
     // for the dense view at run time.
+    // A fp activation is quantized into a dense int8 plane once, up front (see
+    // quant_size below), so the pitch of the fp input does not disqualify
+    // pointwise on the quantized route — the materialized plane is compact.
+    const bool fp_act = (dt == DataType::f32 || dt == DataType::f16);
     plan.pointwise = (karea == 1 &&
                       attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
                       attrs.padding[0] == 0 && attrs.padding[1] == 0 &&
-                      (in.row_stride_elems == 0 || in.row_stride_elems == IW));
+                      ((quant && fp_act) ||
+                       in.row_stride_elems == 0 || in.row_stride_elems == IW));
+
+    // An fp activation is quantized into a compact plane once per call and then
+    // consumed exactly like a pre-quantized one. Quantizing it in the gather
+    // instead redoes the work for every oc-block (the oc-outer loop order) and
+    // keeps a 1x1 conv off the pointwise route (bench_conv2d
+    // conv2d_i8_fpact_vs_fp_sweep for the cost of both).
+    plan.quant_size = (quant && fp_act) ? N * IC * in.dims[2] * IW : 0;
 
     // With no col buffer there is nothing left bounding the ic-block, so K runs
     // the whole ic_per_group in one pass — which also removes the reason
@@ -415,7 +454,8 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     //                     and the gate is what keeps that case on 4 rows.
     // It costs no scratch in that direction: col_size shrinks with the block.
     // The expansion loop below grows it back, bounded by the whole plane.
-    const int64_t nr_max = (dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
+    const int64_t nr_max = quant ? NR_MAX_I8
+                                 : ((dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32);
     for (;;) {
         const int64_t blocks = (OH + plan.oh_block - 1) / plan.oh_block;
         if (2 * NG * blocks >= nt || plan.oh_block <= 1) { break; }
@@ -455,26 +495,56 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
 
     plan.col_size  = plan.pointwise ? 0
                                     : plan.icn_block * karea * plan.oh_block * OW;
-    plan.orig_size = attrs.add_to ? plan.ocn_block * plan.oh_block * OW : 0;
+    // The quantized route never reaches here with add_to (gated above), so its
+    // residual buffer does not exist.
+    plan.orig_size = (attrs.add_to && !quant)
+                   ? plan.ocn_block * plan.oh_block * OW : 0;
 
     // Uniform packed-B scratch, sized at the widest n-block (a whole oh-block
     // at once) and the longest k-block. The packer's stride is computed from
     // the actual k each call, so this is a bound, not a worst case.
-    const int64_t esz      = static_cast<int64_t>(data_type_size(dt));
+    //
+    // The quantized route's col/pack-B scratch is in bytes whatever the
+    // activation dtype is (esz 1), and its packed-B stride is the int8 panel
+    // stride rather than a float panel's.
+    const int64_t esz      = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
     const int64_t kdim_max = plan.icn_block * karea;
-    const int64_t ldd_b_max = mma_pack_align(
-        static_cast<size_t>(nr_max * kdim_max * esz)) / esz;
-    plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max) * ldd_b_max;
+    plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max)
+                   * (quant ? int8_panel_stride(kdim_max)
+                            : static_cast<int64_t>(mma_pack_align(
+                                  static_cast<size_t>(nr_max * kdim_max * esz)) / esz));
 
     // Scratch slots: one per worker thread when the backend reports thread ids and
     // that is fewer than the task count (thread_id-indexed, reused across every
     // task a thread claims); else one per parallel task.
     const int64_t total = NG * plan.oh_chunks;
     plan.num_slots = (use_thread_slots && nt < total) ? nt : total;
-    plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                        * static_cast<size_t>(plan.col_size + plan.orig_size
-                                              + plan.pack_size)
-                        * data_type_size(dt);
+
+    // col/orig/pack_b for the whole plan, in elements on the fp route and in
+    // bytes on the quantized one (esz == 1 there), preceded by the shared
+    // quantized-activation plane (bytes; 0 on every route that has no fp
+    // activation to quantize).
+    const int64_t base = plan.quant_size
+                       + plan.num_slots
+                       * (plan.col_size + plan.orig_size + plan.pack_size);
+    if (quant) {
+        // The int32 accumulator holds one oc-block's whole (oc, oh-block) tile;
+        // the packed-A region one oc-block's panels at the widest k-block.
+        plan.acc_size = plan.ocn_block * plan.oh_block * OW;
+        plan.pack_a_size = static_cast<int64_t>(
+            num_panels_max(static_cast<int>(plan.ocn_block), MR_I8))
+            * geom_ldd_i8_a(kdim_max);
+        // Both regions are 64-byte aligned: the panels are written and read with
+        // the same aligned-stride assumptions as MatMul's.
+        plan.acc_offset    = (base + 63) & ~int64_t{63};
+        plan.pack_a_offset = (plan.acc_offset
+                              + plan.num_slots * plan.acc_size * sizeof(int32_t)
+                              + 63) & ~int64_t{63};
+        plan.workspace_size = static_cast<size_t>(
+            plan.pack_a_offset + plan.num_slots * plan.pack_a_size);
+    } else {
+        plan.workspace_size = static_cast<size_t>(base * esz);
+    }
     return plan;
 }
 
@@ -486,8 +556,15 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
-                          void* /*workspace*/)
+                          void* workspace)
 {
+    // s8 weights select the quantized route (conv2d_int8.cpp), whatever the
+    // activation dtype is; it owns its own fallbacks.
+    if (is_quantized_conv2d(inputs[1].data_type())) {
+        conv2d_int8_kernel(attrs, output, inputs, ctx, workspace);
+        return;
+    }
+
     const DataType dt = inputs[0].data_type();
 
     const bool dtypes_ok = (dt == DataType::f32 || dt == DataType::f16) &&

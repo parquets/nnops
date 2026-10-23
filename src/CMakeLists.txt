@@ -82,12 +82,14 @@ set(NNOPS_CPU_SOURCES
     # CPU tiled im2col + GEMM Conv2D kernel (planar NCHW)
     backend/cpu/conv2d_im2col.cpp
     backend/cpu/conv2d_winograd.cpp
+    backend/cpu/conv2d_im2col_int8.cpp
 
     # CPU tiled attention kernel (fused QK^T + softmax + AV, planar)
     backend/cpu/attention.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp
+    backend/cpu/reference/conv2d_int8_ref.cpp
     backend/cpu/reference/activation_ref.cpp
     backend/cpu/reference/pooling_ref.cpp
     backend/cpu/reference/linear_ref.cpp

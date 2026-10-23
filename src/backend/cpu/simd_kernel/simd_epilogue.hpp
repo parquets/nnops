@@ -7,6 +7,7 @@
 /// Formulas match activation_ref.cpp exactly.
 
 #include "nnops/core/epilogue.hpp"
+#include "nnops/core/quant_params.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "activation_kernels.hpp"
 
@@ -67,6 +68,16 @@ namespace nnops::backend::cpu {
 
 using namespace simd;  // v_load, v_zero, v_set1, etc.
 using namespace nnops::kernel;  // pure SIMD kernels: v_relu, v_gelu, v_sigmoid, ...
+
+/// Index a quantization parameter by output row / channel: the per-token or
+/// per-channel buffer when present, else the per-tensor scalar. Shared by the
+/// MatMul and Conv2D quantization paths, which both resolve parameters this way.
+inline int32_t quant_zp_at(const QuantParams& q, int64_t idx) noexcept {
+    return (q.zero_point_data != nullptr) ? q.zero_point_data[idx] : q.zero_point;
+}
+inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
+    return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
+}
 
 // The GEMM accumulates (in int32) the raw dot-product
 //
@@ -522,6 +533,7 @@ struct DqEpilogueRow {
     float s_a;              ///< A scale for this row
     const float* s_b;       ///< per-channel B scales, or nullptr
     float s_b_scalar;
+    float bias;             ///< output-row bias, added before the clip (0 if none)
     int32_t k;
     const Epilogue* ep;     ///< clip bounds + activation
 };
@@ -540,6 +552,10 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
     const __m256 vsbs = _mm256_set1_ps(p.s_b_scalar);
     const __m256 vmin = _mm256_set1_ps(ep.min_clip);
     const __m256 vmax = _mm256_set1_ps(ep.max_clip);
+    const __m256 vbias = _mm256_set1_ps(p.bias);
+    // Skipping a zero bias keeps x + 0 from turning -0 into +0: MatMul compares
+    // these outputs by bit pattern, and it never has a bias.
+    const bool biased = (p.bias != 0.0f);
     alignas(32) float fbuf[8];
     for (; n + 8 <= n1; n += 8) {
         __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
@@ -556,6 +572,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
 
         const __m256 sb = p.s_b ? _mm256_loadu_ps(p.s_b + n) : vsbs;
         __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(v), _mm256_mul_ps(vsa, sb));
+        if (biased) { f = _mm256_add_ps(f, vbias); }
         f = _mm256_min_ps(_mm256_max_ps(f, vmin), vmax);
 
         if (plain) {
@@ -580,6 +597,10 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
     const float32x4_t vsbs = vdupq_n_f32(p.s_b_scalar);
     const float32x4_t vmin = vdupq_n_f32(ep.min_clip);
     const float32x4_t vmax = vdupq_n_f32(ep.max_clip);
+    const float32x4_t vbias = vdupq_n_f32(p.bias);
+    // Skipping a zero bias keeps x + 0 from turning -0 into +0: MatMul compares
+    // these outputs by bit pattern, and it never has a bias.
+    const bool biased = (p.bias != 0.0f);
     alignas(16) float fbuf[4];
     for (; n + 4 <= n1; n += 4) {
         int32x4_t v = vld1q_s32(c + n);
@@ -592,6 +613,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
 
         const float32x4_t sb = p.s_b ? vld1q_f32(p.s_b + n) : vsbs;
         float32x4_t f = vmulq_f32(vcvtq_f32_s32(v), vmulq_f32(vsa, sb));
+        if (biased) { f = vaddq_f32(f, vbias); }
         f = vminq_f32(vmaxq_f32(f, vmin), vmax);
 
         if (plain) {
@@ -618,6 +640,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
                 : c[n];
         const float scale = p.s_a * (p.s_b ? p.s_b[n] : p.s_b_scalar);
         float f = static_cast<float>(acc) * scale;
+        if (p.bias != 0.0f) { f += p.bias; }
         f = std::min(std::max(f, ep.min_clip), ep.max_clip);
         f = nnops::apply_epilogue(ep, f);
         s_store(&out[n], f);
@@ -645,6 +668,10 @@ struct DqEpilogueParams {
     /// materialised as an int8 tensor; this is the target's storage type.
     bool act_u8;
     const Epilogue* ep;
+    /// Per-row bias, added after the dequantize and before the clip — the same
+    /// place fp's accumulator seed puts it. nullptr → no bias. MatMul passes
+    /// nullptr (it folds its bias into the accumulator).
+    const TOut* bias;
     TOut* out;               ///< fp destination
     int ldc_out;
 };
@@ -670,6 +697,7 @@ inline void dq_epilogue_tile(const DqEpilogueParams<TOut>& p, const int32_t* c, 
             int8_scale_at(p.s_a, p.s_a_scalar, m),
             p.s_b,
             p.s_b_scalar,
+            p.bias ? s_load(&p.bias[m]) : 0.0f,
             p.k,
             p.ep,
         };

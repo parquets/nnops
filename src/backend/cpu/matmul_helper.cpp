@@ -458,7 +458,8 @@ void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
 /// B into uniform panels. On x86 each panel's column sums are appended after
 /// its data (zeroed when @p a_biased is false); the MMA seeds from them.
 void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
-                      const int8_t* src, int lds, bool a_biased) {
+                      const int8_t* src, int lds, bool a_biased,
+                      bool src_shift) {
     constexpr int nr_max = NR_MAX_I8;
     const PackI8WideFn fn = trans ? pack_i8_rhs_trans : pack_i8_rhs_copy;
     // transposed source: a panel is nr_max rows of K; row-major: nr_max columns.
@@ -467,6 +468,9 @@ void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
 
     for_each_n_panel(nc, nr_max, [&](int w) {
         fn(dst, src, lds, kc, 0.0f, w);
+        // Only the data lanes are shifted; the correction block after them must
+        // then be summed from the shifted bytes, so this has to come first.
+        if (src_shift) { xor0x80_i8(dst, nr_max * kbytes); }
         mma_i8_b_panel_sums(dst, kbytes, a_biased);
         dst += ldd;
         src += w * step;

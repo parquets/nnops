@@ -427,15 +427,6 @@ void matmul_block(const MatMulAttributes& attrs,
 //  int8 — reduction and epilogue passes around the raw accumulate
 // =========================================================================
 
-/// Scalar fallback for PerTensor; PerToken / PerChannel index the buffer at
-/// @p idx (output row m for A, output column n for B).
-inline int32_t quant_zp_at(const QuantParams& q, int64_t idx) noexcept {
-    return (q.zero_point_data != nullptr) ? q.zero_point_data[idx] : q.zero_point;
-}
-inline float quant_scale_at(const QuantParams& q, int64_t idx) noexcept {
-    return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
-}
-
 /// Raw int8 reductions for the epilogue: r_a[m] = Σ_k A[m,k], r_b[n] = Σ_k B[k,n]
 /// (A[k,m] / the mirror image when transposed). Output slabs are disjoint, so
 /// no atomics; int32 accumulation matches the reference bit for bit. The
