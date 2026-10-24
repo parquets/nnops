@@ -241,10 +241,21 @@ void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
 #else
 
 /// Portable fallback for arches without a vectorized Q5_1 pack.
+///
+/// The panel width must be the active arch's float RHS panel width, because the
+/// workspace stride (ldd_b) and the MMA kernels are sized from it — it is not
+/// the same on every arch (aarch64 f32 uses nr_f32[0] = 12, both x86 widths and
+/// the aarch64 f16 one are 16).
+template <class T>
+constexpr int q5_1_panel_nr() noexcept {
+    if constexpr (std::is_same_v<T, float>) { return NR_MAX_F32; }
+    else { return NR_MAX_F16; }
+}
+
 template <class T>
 void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int kc,
                                T* dst, int ldd, const void* src, int64_t row_blocks) {
-    constexpr int NR = 16;
+    constexpr int NR = q5_1_panel_nr<T>();
     const uint8_t* base = static_cast<const uint8_t*>(src);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q5_1_block_bytes);
 

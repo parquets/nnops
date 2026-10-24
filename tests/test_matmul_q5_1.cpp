@@ -275,8 +275,12 @@ void run_case(const Case& c) {
         want[static_cast<size_t>(i)] = apply_expected_epilogue(v, c.ep);
     }
 
-    const float rtol = a16 ? 5e-2f : 1e-4f;
-    const float atol = a16 ? 5e-2f : 1e-3f;
+    // The f16 route accumulates in the arch's native precision (fp32 on x86,
+    // native fp16 on aarch64), so take the shared arch-aware tolerance instead
+    // of a fixed value: near-zero results from a long cancelling reduction are
+    // exactly where the wider aarch64 error shows up.
+    const float rtol = a16 ? nnops::test::kF16AccumTol : 1e-4f;
+    const float atol = a16 ? nnops::test::kF16AccumTol : 1e-3f;
     float worst = 0.0f;
     for (int64_t i = 0; i < M * N; ++i) {
         const float got = a16
