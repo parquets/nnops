@@ -23,8 +23,7 @@ namespace {
 using namespace nnops::simd;
 namespace k = nnops::kernel;
 
-constexpr int kWinoTile = 2;  // F(2,3): 2×2 output, 4×4 input window
-constexpr int kWinoAlpha = 4; // the 4×4 transform domain
+constexpr int kWinoAlpha = 4; // the 4×4 transform domain (F(2,3): 2×2 output)
 constexpr int kWinoPos = kWinoAlpha * kWinoAlpha;  // 16 batched GEMMs
 
 /// Fill a halo row: dst[0..n_cols) = src[valid_beg-PW .. valid_end-PW), zero
@@ -45,25 +44,30 @@ inline void halo_row(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT src_row,
     for (int t = valid_end; t < n_cols; ++t) { s_store(dst + t, 0.0f); }
 }
 
-/// Materialize one input channel's padded halo. halo[ph][pw] is the input value
-/// at (ph − PH, pw − PW); out-of-range is zero. Row stride is @p halo_ld.
+/// Materialize one input channel's padded-halo *strip*: row r of @p dst is padded
+/// halo row (row0 + r), column c is padded column (col0 + c) — i.e. the input
+/// value at (row0 + r − PH, col0 + c − PW), zero outside the input. Row stride is
+/// @p ld. The coordinates are in the *global* padded grid, so a task can build
+/// just the rows and columns its tiles read and index them locally.
 template <class T>
-void build_halo(T* NNOPS_RESTRICT halo, int halo_ld,
-                const T* NNOPS_RESTRICT in, int in_ld,
-                int in_h, int in_w, int halo_h, int n_cols,
-                int PH, int PW) noexcept {
-    const int valid_beg = std::max(0, PW);
-    const int valid_end = std::min(n_cols, PW + in_w);
-    for (int ph = 0; ph < halo_h; ++ph) {
-        T* dst = halo + static_cast<ptrdiff_t>(ph) * halo_ld;
-        const int src_h = ph - PH;
+void build_halo_strip(T* NNOPS_RESTRICT dst, int ld,
+                      const T* NNOPS_RESTRICT in, int in_ld,
+                      int in_h, int in_w,
+                      int row0, int col0, int rows, int n_cols,
+                      int PH, int PW) noexcept {
+    // Padded column c is inside the input iff PW <= c < PW + in_w.
+    const int valid_beg = std::max(col0, PW) - col0;
+    const int valid_end = std::min(col0 + n_cols, PW + in_w) - col0;
+    for (int r = 0; r < rows; ++r) {
+        T* d = dst + static_cast<ptrdiff_t>(r) * ld;
+        const int src_h = row0 + r - PH;
         if (src_h < 0 || src_h >= in_h || valid_beg >= valid_end) {
-            for (int t = 0; t < n_cols; ++t) { s_store(dst + t, 0.0f); }
+            for (int t = 0; t < n_cols; ++t) { s_store(d + t, 0.0f); }
             continue;
         }
         const T* src_row = in + static_cast<ptrdiff_t>(src_h) * in_ld
-                             + (valid_beg - PW);
-        halo_row<T>(dst, src_row, n_cols, valid_beg, valid_end);
+                             + (col0 + valid_beg - PW);
+        halo_row<T>(d, src_row, n_cols, valid_beg, valid_end);
     }
 }
 
@@ -109,7 +113,6 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
 
     const int64_t TH      = plan.num_tile_rows;
     const int64_t TW_pad  = plan.num_tile_cols_pad;
-    const int64_t num_tiles = plan.num_tiles;
 
     const int64_t icn_block  = plan.icn_block;
     const int64_t ocn_block  = plan.ocn_block;
@@ -131,142 +134,135 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     const int64_t og_step  = oc_per_group * ocn_step;  // between groups (output)
 
     const int64_t u_plane_step = OC * u_pitch;   // between transform positions
-    const int64_t v_p_step     = ICG * num_tiles;  // between transform positions
 
-    // Scratch: [halo][V][M × num_slots][B × num_slots]. V and the halo are
-    // per-(batch, group) and shared by both phases; M and the packed B panels
-    // are per worker slot.
-    T* halo_base = static_cast<T*>(workspace);
-    T* v_all     = halo_base + plan.halo_size;
-    T* m_all     = v_all + plan.v_size;
-    T* b_all     = m_all + plan.num_slots * plan.m_size;
+    T* slot_base = static_cast<T*>(workspace);
 
     constexpr int nr_max = nr_max_flt<T>();
     constexpr int esz    = static_cast<int>(sizeof(T));
 
-    const int64_t halo_ld = plan.halo_w;
-    const int64_t halo_ch = plan.halo_h * plan.halo_w;
+    // One slot's scratch: [halo strip][V][M][packed-B]. Every task owns the whole
+    // chain for its own tiles — halo rows and columns, the transformed V, the
+    // transform-domain accumulator M and the packed panels — so tasks share no
+    // scratch and need no ordering between them.
+    const int64_t halo_ld = plan.halo_ld;              // 2·tile_block + 2 columns
+    const int64_t halo_ch = kWinoAlpha * halo_ld;      // one channel's strip
+    const int64_t v_p_step = plan.v_p_stride;          // one transform position's V plane
 
-    const int64_t num_b_tasks = plan.num_b_tasks;
+    const int64_t num_tasks = plan.num_tasks;
     const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < num_b_tasks;
+    const bool per_thread = nslots > 0 && plan.num_slots < num_tasks;
 
-    const int64_t tw_groups = TW_pad / 8;
-
-    // Current (batch, group) — set per iteration, read by the phase lambdas.
-    const T* halo_src = nullptr;
-    int64_t n = 0;
-    int64_t g = 0;
-
-    // Phase A: build the halo, then transform the input into V. V is fully
-    // materialized here (the reference implementation's choice).
-    const auto run_halo = [&](int64_t ic) {
-        build_halo<T>(halo_base + ic * halo_ch, static_cast<int>(halo_ld),
-                      halo_src + ic * icn_step, static_cast<int>(in_row_stride),
-                      static_cast<int>(IH), static_cast<int>(IW),
-                      static_cast<int>(plan.halo_h), static_cast<int>(plan.halo_w),
-                      static_cast<int>(PH), static_cast<int>(PW));
-    };
-
-    const auto run_a = [&](int64_t t) {
-        const int64_t th  = t / tw_groups;
-        const int64_t tw0 = (t % tw_groups) * 8;
-        // A tile's index is row-major over the padded grid (th·TW_pad + tw), so
-        // each 8-tile group writes a slice offset by its tile row — and, because
-        // the group never spans rows, always within one row.
-        const int64_t row_off = th * TW_pad;
-        for (int64_t ic = 0; ic < ic_per_group; ++ic) {
-            k::winograd_input_tile8<T>(halo_base + ic * halo_ch, static_cast<int>(halo_ld),
-                                       static_cast<int>(2 * th), static_cast<int>(2 * tw0),
-                                       v_all + ic * num_tiles + row_off + tw0,
-                                       static_cast<int>(v_p_step));
-        }
-    };
-
-    // Phase B: 16 accumulating GEMMs, then the output transform + write-back.
-    const auto run_b = [&](int64_t t) {
+    // One task = one (batch, group, tile row, tile block): build the halo strip
+    // its tiles read, transform it, run the 16 GEMMs for every oc block of that
+    // group, and write the tiles back. Tile rows and blocks are disjoint, so the
+    // whole convolution is one dispatch with no phase between them.
+    const auto run_task = [&](int64_t t) {
         int64_t idx = t;
         const int64_t tb = idx % num_tile_blocks; idx /= num_tile_blocks;
         const int64_t th = idx % TH;              idx /= TH;
-        const int64_t ob = idx;
+        const int64_t g  = idx % G;               idx /= G;
+        const int64_t n  = idx;
 
         const int64_t tw0 = tb * tile_block;
-        const int64_t tw1 = std::min(tw0 + tile_block, TW_pad);
-        const int64_t nc  = tw1 - tw0;
+        const int64_t nc  = std::min(tile_block, TW_pad - tw0);
 
-        const int64_t ocn0 = ob * ocn_block;
-        const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn0);
+        const int64_t slot = per_thread
+            ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+            : std::min(t, plan.num_slots - 1);
+        T* scratch = slot_base + slot * plan.slot_size;
+        T* halo    = scratch;
+        T* v_all   = halo + plan.halo_size;
+        T* m_all_  = v_all + plan.v_size;
+        T* pack_b  = m_all_ + plan.m_size;
 
-        // This task's tiles start at the tile row's origin.
-        const int64_t v_row_off = th * TW_pad;
+        // Halo strip: padded rows [2·th, 2·th + 4) — the four window rows of this
+        // tile row — and halo_ld = 2·tile_block + 2 columns starting at the
+        // block's first tile. Neighbouring tasks repeat the two window columns
+        // their tile blocks share; that copy is cheaper than a phase boundary.
+        const T* task_in = in_ptr + n * ib_step + g * ig_step;
+        for (int64_t ic = 0; ic < ic_per_group; ++ic) {
+            build_halo_strip<T>(halo + ic * halo_ch, static_cast<int>(halo_ld),
+                                task_in + ic * icn_step, static_cast<int>(in_row_stride),
+                                static_cast<int>(IH), static_cast<int>(IW),
+                                static_cast<int>(2 * th), static_cast<int>(2 * tw0),
+                                kWinoAlpha,
+                                static_cast<int>(halo_ld),
+                                static_cast<int>(PH), static_cast<int>(PW));
+        }
 
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
-        T* m = m_all + slot * plan.m_size;
-        T* pack_b = b_all + slot * plan.b_size;
-
-        // Accumulate over the input channels: M_p is zeroed on the first ic
-        // block (zero_mode) and accumulated after. Bias is deliberately NOT
-        // folded in — M is transform-domain, and Aᵀ(·)A would distort it.
-        for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
-            const int64_t icnc = std::min(icn_block, ic_per_group - icn);
-            for (int p = 0; p < kWinoPos; ++p) {
-                const T* a = u_ptr + p * u_plane_step
-                                  + (g * oc_per_group + ocn0) * u_pitch + icn;
-                const T* b = v_all + p * v_p_step + icn * num_tiles + v_row_off + tw0;
-                T* c = m + p * (ocn_block * tile_block);
-
-                // Pack this transform position's V slice [icnc][nc] into
-                // uniform nr_max-wide panels; every oc row in the tile reuses
-                // it, so the copy costs 1/ocnc of the GEMM's MACs.
-                const int ldd_b = static_cast<int>(
-                    mma_pack_align(nr_max * static_cast<int>(icnc) * esz) / esz);
-                tile_pack_rhs(false, static_cast<int>(nc), static_cast<int>(icnc),
-                                      pack_b, ldd_b, b, static_cast<int>(num_tiles), 1.0f);
-
-                tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(nc),
-                                        static_cast<int>(icnc),
-                                        c, static_cast<int>(tile_block),
-                                        a, static_cast<int>(u_pitch),
-                                        pack_b,
-                                        -std::numeric_limits<float>::infinity(),
-                                        std::numeric_limits<float>::infinity(),
-                                        /*zero_mode=*/icn == 0);
+        // Input transform of this block's tiles, for every input channel.
+        for (int64_t ic = 0; ic < ic_per_group; ++ic) {
+            T* v = v_all + ic * tile_block;
+            const T* h = halo + ic * halo_ch;
+            for (int64_t tg = 0; tg < nc; tg += 8) {
+                k::winograd_input_tile8<T>(h, static_cast<int>(halo_ld), 0,
+                                           static_cast<int>(2 * tg), v + tg,
+                                           static_cast<int>(v_p_step));
             }
         }
 
-        // Output transform + bias + epilogue + write-back, per oc row.
-        const int64_t oh0 = 2 * th;
-        const bool row1_ok = (oh0 + 1) < OH;
-        T* out_base = out_ptr + n * ob_step + g * og_step;
+        for (int64_t ob = 0; ob < num_oc_blocks; ++ob) {
+            const int64_t ocn0 = ob * ocn_block;
+            const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn0);
 
-        for (int64_t oc = 0; oc < ocnc; ++oc) {
-            const float bias_oc = b_ptr ? s_load(b_ptr + g * oc_per_group + ocn0 + oc) : 0.0f;
-            T* row0 = out_base + (ocn0 + oc) * ocn_step + oh0 * out_row_stride;
-            T* row1 = row1_ok ? row0 + out_row_stride : row0;
-            for (int64_t tl = 0; tl < nc; tl += 8) {
-                // ow0 is an absolute output column and row0/row1 point at column
-                // 0 — so the tile offset lives in ow0 alone. Offsetting the
-                // pointers by 2·tw as well would count the column twice and, on
-                // any group past the first, write a full row out of place.
-                k::winograd_output_tile8<T>(
-                    m, static_cast<int>(ocn_block * tile_block),
-                    static_cast<int>(tile_block), static_cast<int>(oc), static_cast<int>(tl),
-                    row0, row1,
-                    static_cast<int>(2 * (tw0 + tl)), static_cast<int>(OW), row1_ok,
-                    attrs.epilogue, bias_oc, attrs.add_to);
+            // Accumulate over the input channels: M_p is zeroed on the first ic
+            // block (zero_mode) and accumulated after. Bias is deliberately NOT
+            // folded in — M is transform-domain, and Aᵀ(·)A would distort it.
+            for (int64_t icn = 0; icn < ic_per_group; icn += icn_block) {
+                const int64_t icnc = std::min(icn_block, ic_per_group - icn);
+                for (int p = 0; p < kWinoPos; ++p) {
+                    const T* a = u_ptr + p * u_plane_step
+                                      + (g * oc_per_group + ocn0) * u_pitch + icn;
+                    const T* b = v_all + p * v_p_step + icn * tile_block;
+                    T* c = m_all_ + p * (ocn_block * tile_block);
+
+                    // Pack this transform position's V slice [icnc][nc] into
+                    // uniform nr_max-wide panels; every oc row in the tile
+                    // reuses it, so the copy costs 1/ocnc of the GEMM's MACs.
+                    const int ldd_b = static_cast<int>(
+                        mma_pack_align(nr_max * static_cast<int>(icnc) * esz) / esz);
+                    tile_pack_rhs(false, static_cast<int>(nc), static_cast<int>(icnc),
+                                  pack_b, ldd_b, b, static_cast<int>(tile_block), 1.0f);
+
+                    tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(nc),
+                                    static_cast<int>(icnc),
+                                    c, static_cast<int>(tile_block),
+                                    a, static_cast<int>(u_pitch),
+                                    pack_b,
+                                    -std::numeric_limits<float>::infinity(),
+                                    std::numeric_limits<float>::infinity(),
+                                    /*zero_mode=*/icn == 0);
+                }
+            }
+
+            // Output transform + bias + epilogue + write-back, per oc row.
+            const int64_t oh0 = 2 * th;
+            const bool row1_ok = (oh0 + 1) < OH;
+            T* out_base = out_ptr + n * ob_step + g * og_step;
+
+            for (int64_t oc = 0; oc < ocnc; ++oc) {
+                const float bias_oc = b_ptr ? s_load(b_ptr + g * oc_per_group + ocn0 + oc) : 0.0f;
+                T* row0 = out_base + (ocn0 + oc) * ocn_step + oh0 * out_row_stride;
+                T* row1 = row1_ok ? row0 + out_row_stride : row0;
+                for (int64_t tl = 0; tl < nc; tl += 8) {
+                    // ow0 is an absolute output column and row0/row1 point at
+                    // column 0 — so the tile offset lives in ow0 alone.
+                    // Offsetting the pointers by 2·tw as well would count the
+                    // column twice and, on any group past the first, write a
+                    // full row out of place.
+                    k::winograd_output_tile8<T>(
+                        m_all_, static_cast<int>(ocn_block * tile_block),
+                        static_cast<int>(tile_block), static_cast<int>(oc),
+                        static_cast<int>(tl),
+                        row0, row1,
+                        static_cast<int>(2 * (tw0 + tl)), static_cast<int>(OW), row1_ok,
+                        attrs.epilogue, bias_oc, attrs.add_to);
+                }
             }
         }
     };
 
-    for (n = 0; n < N; ++n) {
-        const T* batch_in = in_ptr + n * ib_step;
-        for (g = 0; g < G; ++g) {
-            halo_src = batch_in + g * ig_step;
-            ctx.cpu.run(0, ic_per_group, run_halo);
-            ctx.cpu.run(0, plan.num_a_tasks, run_a);
-            ctx.cpu.run(0, num_b_tasks, run_b);
-        }
-    }
+    ctx.cpu.run(0, num_tasks, run_task);
 }
 
 }  // anonymous namespace
@@ -322,23 +318,35 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
     plan.num_tile_cols     = TW;
     plan.num_tile_cols_pad = TW_pad;
     plan.num_tiles         = TH * TW_pad;
-    plan.halo_h            = 2 * TH + 2;
-    plan.halo_w            = 2 * TW_pad + 2;
 
     // K is capped at the f16 accumulate budget; M at 16·ocn·tile elements so a
     // slot's M stays small; the tile block is 8 or 16 tiles (one or two vector
-    // groups) to balance phase-B task count against M footprint.
+    // groups, and at least one full nr_max panel) to balance task count against
+    // the V/M footprint a task carries.
     plan.icn_block  = std::min<int64_t>(ICG, 128);
     plan.ocn_block  = std::min<int64_t>(64, oc_per_group);
     plan.tile_block = std::clamp<int64_t>(TW_pad, 8, 16);
 
     plan.num_oc_blocks   = (oc_per_group + plan.ocn_block - 1) / plan.ocn_block;
     plan.num_tile_blocks = (TW_pad + plan.tile_block - 1) / plan.tile_block;
-    plan.num_a_tasks     = TH * (TW_pad / 8);
-    plan.num_b_tasks     = plan.num_oc_blocks * TH * plan.num_tile_blocks;
 
-    plan.halo_size = ICG * plan.halo_h * plan.halo_w;
-    plan.v_size    = static_cast<int64_t>(kWinoPos) * ICG * plan.num_tiles;
+    // One task per (batch, group, tile row, tile block). The batch and group
+    // axes are part of the task grid, not a serial loop around one dispatch, so
+    // N·G also counts towards filling the pool.
+    const int64_t NB = (in.dims[0] > 0) ? in.dims[0] : 1;
+    plan.num_tasks  = NB * G * TH * plan.num_tile_blocks;
+    plan.halo_ld    = 2 * plan.tile_block + 2;   // padded columns per strip
+    plan.halo_rows  = kWinoAlpha;                // the 4 window rows of one tile row
+
+    plan.halo_size = ICG * plan.halo_rows * plan.halo_ld;
+    // One extra vector of slack per transform position: the 16 positions are
+    // written one vector at a time, and a plane stride that lands on a
+    // power-of-two multiple collapses those stores onto a handful of L1 sets.
+    // Measured on 1x64x56x56 f32 (interleaved A/B): 1.50 -> 1.32 ms at 1 thread,
+    // 0.50 -> 0.47 at 4; the f16 cases lose about a percentage point at 1 thread
+    // to the same effect, so the slack pays for itself on every case here.
+    plan.v_p_stride = ICG * plan.tile_block + 8;
+    plan.v_size     = static_cast<int64_t>(kWinoPos) * plan.v_p_stride;
     plan.m_size    = static_cast<int64_t>(kWinoPos) * plan.ocn_block * plan.tile_block;
 
     // Uniform packed-B scratch: one V slice [icn_block][tile_block] per slot.
@@ -348,11 +356,15 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
         static_cast<size_t>(nr_max * plan.icn_block * esz)) / esz;
     plan.b_size = ((plan.tile_block + nr_max - 1) / nr_max) * ldd_b_max;
 
-    const int64_t nt = std::max<int64_t>(num_threads, 1);
-    plan.num_slots = (use_thread_slots && nt < plan.num_b_tasks) ? nt : plan.num_b_tasks;
+    plan.slot_size = plan.halo_size + plan.v_size + plan.m_size + plan.b_size;
 
-    plan.workspace_size = static_cast<size_t>(plan.halo_size + plan.v_size
-                                              + plan.num_slots * (plan.m_size + plan.b_size))
+    // Slots: one per worker when the caller reports worker ids, else one per
+    // task (the same convention Conv2D's im2col plan uses — without a worker id
+    // there is no way to pick a slot that two concurrent tasks will not share).
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+    plan.num_slots = (use_thread_slots && nt < plan.num_tasks) ? nt : plan.num_tasks;
+
+    plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size)
                         * data_type_size(dt);
     return plan;
 }
@@ -384,9 +396,14 @@ void conv2d_winograd_kernel(const Conv2DAttributes& attrs,
     descs.reserve(inputs.size());
     for (const auto& t : inputs) { descs.push_back(t.desc()); }
     const TensorDesc outs[] = {output.desc()};
+    // Slot sizing: per worker when the caller reports worker ids; one slot when
+    // there is no pool at all (a serial run reuses it task after task); else one
+    // per task — the plan's fallback when parallelism exists but cannot be
+    // indexed (see Conv2DWinogradPlan::num_slots).
+    const bool serial = !ctx.cpu.parallel_for;
     const Conv2DWinogradPlan plan =
         get_conv2d_winograd_plan(attrs, descs, outs, ctx.cpu.thread_count(),
-                                 ctx.cpu.thread_slot_count() > 0);
+                                 serial || ctx.cpu.thread_slot_count() > 0);
     NNOPS_ASSERT(plan.workspace_size > 0 &&
                  "conv2d_winograd_kernel: unsupported conv geometry (k3s1 only)");
 

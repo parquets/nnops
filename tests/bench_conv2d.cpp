@@ -429,18 +429,22 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
     if (c.bias) { im_ins.push_back(bias_view); wn_ins.push_back(bias_view); }
 
     // Report the resolved Winograd geometry (descs are the same for both ops).
+    // Planned for the widest thread count in the sweep: the scratch is per
+    // worker slot, so the serial plan is the one that would size it by task.
     {
         std::vector<TensorDesc> wd = {input.desc(), u_view.desc()};
         if (c.bias) { wd.push_back(bias_view.desc()); }
         const TensorDesc wo_arr[] = {out_descs[0]};
-        const auto wp = cpu::get_conv2d_winograd_plan(base, wd, wo_arr, 1, false);
+        const int max_nt = threads.empty() ? 1 : *std::max_element(threads.begin(),
+                                                                  threads.end());
+        const auto wp = cpu::get_conv2d_winograd_plan(base, wd, wo_arr, max_nt, true);
         std::printf("    wino: tiles=%lldx%lld(pad %lld) icn=%lld ocn=%lld tile_blk=%lld"
-                    " a_tasks=%lld b_tasks=%lld ws=%zuB\n",
+                    " tasks=%lld x %lld slots, slot=%lld el, ws=%zuB\n",
                     (long long)wp.num_tile_rows, (long long)wp.num_tile_cols,
                     (long long)wp.num_tile_cols_pad, (long long)wp.icn_block,
                     (long long)wp.ocn_block, (long long)wp.tile_block,
-                    (long long)wp.num_a_tasks, (long long)wp.num_b_tasks,
-                    wp.workspace_size);
+                    (long long)wp.num_tasks, (long long)wp.num_slots,
+                    (long long)wp.slot_size, wp.workspace_size);
     }
 
     std::printf("  %s\n", c.name);
@@ -1172,13 +1176,20 @@ NNOPS_BENCH(dwconv_f32_batch) {
 // ============================================================
 //
 // Winograd trades 2.25× fewer multiplies for transforms whose cost is fixed per
-// tile and per channel, so it only wins once IC and OC are large. The first two
-// cases are the regime it is for; the small-channel and single-channel cases are
-// the degenerate end where it must lose — kept in the sweep so a regression in
-// the guard shows up as a number, not an assumption.
+// tile and per channel, so the win grows with the channel count: from 32 channels
+// up it is ahead of im2col here, and at 8 it is a wash. The 8-channel case is the
+// floor of the range this kernel is worth calling for — kept in the sweep so a
+// regression in the transforms shows up as a number, not an assumption.
 
 NNOPS_BENCH(conv2d_wino_f32_64ch) {
     bench_wino_case({"f32 wino 1x64x56x56 -> 64 x 3x3 s1 p1", 1, 64, 56, 56, 64});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_batch4) {
+    // Batch is part of the task grid, not a serial loop around one dispatch, so
+    // N=4 should scale with threads the same way N=1 does rather than paying the
+    // per-(batch, group) phases and dispatches four times over.
+    bench_wino_case({"f32 wino 4x64x56x56 -> 64 x 3x3 s1 p1", 4, 64, 56, 56, 64});
 }
 
 NNOPS_BENCH(conv2d_wino_f32_256ch) {
@@ -1190,7 +1201,8 @@ NNOPS_BENCH(conv2d_wino_f32_32ch) {
 }
 
 NNOPS_BENCH(conv2d_wino_f32_8ch_degenerate) {
-    // Below the ~16-channel floor: the transforms and the extra passes dominate.
+    // The floor: at 8 channels the transforms eat the 2.25x multiply saving, so
+    // this is the case where Winograd is only at parity with im2col.
     bench_wino_case({"f32 wino 1x8x56x56 -> 8 x 3x3 s1 p1 (degenerate)", 1, 8, 56, 56, 8});
 }
 

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <atomic>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -525,8 +526,8 @@ NNOPS_TEST(wino_matches_ref_batch) {
 
 NNOPS_TEST(wino_matches_ref_threaded) {
     // Same shapes as the plain case, but through a 4-thread pool — exercises the
-    // per-thread M slot indexing (thread_slot_count() > 0) and the fact that
-    // phase-A/B task ranges are disjoint.
+    // per-thread slot indexing (thread_slot_count() > 0) and the fact that tile
+    // rows and blocks are disjoint between tasks.
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride = {1, 1};
@@ -536,6 +537,71 @@ NNOPS_TEST(wino_matches_ref_threaded) {
     ctx.cpu = pool.cpu;
     wino_vs_ref_f32({1, 8, 12, 12}, {8, 8, 3, 3}, attrs, /*has_bias=*/true,
                     /*fill_out=*/0.0f, &ctx);
+}
+
+NNOPS_TEST(wino_threads_bit_identical_batch_groups) {
+    // Batch and group are part of the task grid, so this is the one shape where
+    // tasks of *different* (batch, group) run at the same time — the plain and
+    // threaded cases above keep both at 1 and would not notice a shared scratch
+    // buffer. Each output element is produced by exactly one task, with the same
+    // per-element operation order as the serial run, so the pooled and serial
+    // results must agree bit for bit rather than within a tolerance.
+    auto [in_buf, in_view] = test::make_random_tensor({2, 8, 14, 16}, -1.0f, 1.0f, 71);
+    auto [w_buf, w_view] = test::make_random_tensor({8, 4, 3, 3}, -0.5f, 0.5f, 72);
+    auto [b_buf, b_view] = test::make_random_tensor({8}, -0.5f, 0.5f, 73);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    attrs.groups = 2;
+    attrs.algorithm = ConvAlgorithm::Winograd;
+
+    auto op = Conv2D::create(attrs, Backend::CPU);
+    const TensorDesc descs[] = {in_view.desc(), w_view.desc(), b_view.desc()};
+    const auto outs = op->getOutputTensorDesc(descs);
+    const int64_t on = desc_numel(outs[0]);
+
+    // Prepack U once; both runs read the same transformed weight.
+    std::vector<float> u_buf;
+    TensorView u_view;
+    {
+        TensorView empty;
+        const TensorView w_in[] = {w_view};
+        TensorView o[] = {empty};
+        op->prepackWeights(w_in, o);
+        const TensorView q = o[0];
+        u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(float)), 0.0f);
+        u_view = TensorView(q.shape_span(), DataType::f32, u_buf.data(),
+                            q.pitch(), TensorLayout::PackedWinoWeight);
+        const TensorView w_in2[] = {w_view};
+        TensorView o2[] = {u_view};
+        op->prepackWeights(w_in2, o2);
+    }
+
+    const std::vector<TensorView> ins = {in_view, u_view, b_view};
+
+    std::vector<float> out_serial(static_cast<size_t>(on), 0.0f);
+    auto serial_view = test::make_planar(outs[0], out_serial.data());
+    op->compute(serial_view, ins, ComputeContext{});
+
+    SimplePool pool(4);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    std::vector<float> out_pool(static_cast<size_t>(on), 0.0f);
+    auto pool_view = test::make_planar(outs[0], out_pool.data());
+    op->compute(pool_view, ins, ctx);
+
+    // 2 batches · 2 groups · 7 tile rows = 28 tasks over 4 workers, so the pool
+    // path really does run (and shares slots between) several (batch, group)
+    // pairs.
+    int64_t mismatches = 0;
+    for (int64_t i = 0; i < on; ++i) {
+        const float a = out_serial[static_cast<size_t>(i)];
+        const float b = out_pool[static_cast<size_t>(i)];
+        if (std::memcmp(&a, &b, sizeof(float)) != 0) { ++mismatches; }
+    }
+    NNOPS_EXPECT_EQ(mismatches, int64_t{0});
 }
 
 // ============================================================
