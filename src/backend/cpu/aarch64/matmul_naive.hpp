@@ -12,8 +12,8 @@
 /// broadcast walks.
 ///
 /// matmul_gemv covers the other small-M extreme (M <= 4 at any size): it reads
-/// B once, so no pack is ever justified, but it blocks over n so that each k
-/// contributes a contiguous run of B (see the comment at gemv_block).
+/// B once, so no pack is ever justified, and it trades the two traversals of a
+/// given B (see the section comment below) on the operand's size.
 ///
 /// fp16 is widened to f32 for the accumulate and narrowed again on write-back.
 
@@ -22,9 +22,8 @@
 
 namespace nnops::backend::cpu::aarch64 {
 
-/// GEMV n-block: the slice of N one call owns. M rows of f32 accumulators stay
-/// in L1 (16 KB at most) and each k contributes a contiguous 4 KB run of B, so
-/// the prefetcher still sees sequential data.
+/// GEMV n-block: the slice of N one call owns. This is the driver's unit of
+/// work — the granularity it hands to a thread — not the kernel's tile.
 constexpr int gemv_block = 1024;
 
 /// Output rows one GEMV call handles; the driver's M cutoff must not exceed it.
@@ -190,77 +189,242 @@ inline void gemm(int M, int N, int K,
 //
 // The packed route sweeps all of B twice (write the packed copy, then read it
 // back) for a handful of output rows. These kernels read B once instead.
+//
+// Two traversals, because the answer depends on where B lives. Cached B (up to
+// L2) is reread per n-tile for free, so the register tile keeps the whole k
+// sweep of one 16-64 column tile in registers and pays nothing per FMA beyond
+// one B load — and that load is shared by all M rows. B out of cache cannot be
+// reread, and a tile-wide walk would then visit it in ldb-sized strides, which
+// reaches a fraction of the memory bandwidth; there the accumulator goes back
+// into L1 and k becomes the outer loop, so B is read once in address order.
+// The L1 reload/store pair that costs is only paid per unrolled group of k.
 
-/// C[m][n0:n1] += A[m][:] · B[:][n] for a row-major [K][N] B. k outer, n-block
-/// inner: B is read once and in order, and the accumulators ping-pong through
-/// L1 — the traversal a GEMV wants (the reverse order walks B with an ldb
-/// stride, one cache line at a time, which no prefetcher follows).
-/// A transposed A only changes the stride the scalar broadcast walks.
-template <typename T>
-inline void gemv_nn(int M, int N, int K,
-                    const T* a, int lda, bool ta,
-                    const T* b, int ldb,
-                    T* c, int ldc, float beta,
-                    int n0, int n1) noexcept {
-    const int nb = n1 - n0;
-    alignas(16) float acc[gemv_max_m][gemv_block];
+/// Accumulator vectors per n-tile, by row count: M * vecs stays inside the 32
+/// NEON registers with one B vector and one A broadcast in flight. A tile is
+/// vecs * lanes columns wide, so each k contributes a 16-64 element run of B.
+template <int M>
+constexpr int gemv_vecs = (M <= 1) ? 16 : (M == 2 ? 12 : (M == 3 ? 8 : 6));
+
+/// One n-tile of the [K][N] B kernel: C[m][j0:j1] += A[m][:] · B[:][j], j0:j1
+/// exactly @p V vectors wide. The whole k sweep lives inside the tile, so the
+/// M*V accumulators never leave registers and B is loaded once per element.
+template <typename T, int M, int V>
+inline void gemv_nn_tile(int K,
+                         const T* a, int lda, bool ta,
+                         const T* b, int ldb,
+                         T* c, int ldc, float beta, int j0) noexcept {
+    float32x4_t acc[M][V];
     for (int m = 0; m < M; ++m) {
-        for (int j = 0; j < nb; ++j) { acc[m][j] = 0.0f; }
+        for (int v = 0; v < V; ++v) { acc[m][v] = vdupq_n_f32(0.0f); }
     }
 
     for (int k = 0; k < K; ++k) {
-        const T* b_row = b + static_cast<int64_t>(k) * ldb + n0;
-        float av[gemv_max_m];
+        const T* b_row = b + static_cast<int64_t>(k) * ldb + j0;
+        float av[M];
         for (int m = 0; m < M; ++m) {
             av[m] = to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
                                    : static_cast<int64_t>(m) * lda + k));
         }
-        int j = 0;
-        for (; j + lanes <= nb; j += lanes) {
-            const float32x4_t bv = load4(b_row + j);
+        for (int v = 0; v < V; ++v) {
+            const float32x4_t bv = load4(b_row + v * lanes);
             for (int m = 0; m < M; ++m) {
-                float32x4_t v = vld1q_f32(acc[m] + j);
-                v = vfmaq_n_f32(v, bv, av[m]);
-                vst1q_f32(acc[m] + j, v);
+                acc[m][v] = vfmaq_n_f32(acc[m][v], bv, av[m]);
             }
-        }
-        for (; j < nb; ++j) {
-            const float bj = to_f32(b_row + j);
-            for (int m = 0; m < M; ++m) { acc[m][j] += av[m] * bj; }
         }
     }
 
     for (int m = 0; m < M; ++m) {
-        for (int j = 0; j < nb; ++j) {
-            T* dst = c + m * ldc + n0 + j;
-            store1(dst, (beta != 0.0f) ? acc[m][j] + beta * to_f32(dst) : acc[m][j]);
+        for (int v = 0; v < V; ++v) {
+            T* dst = c + static_cast<int64_t>(m) * ldc + j0 + v * lanes;
+            store4(dst, (beta != 0.0f) ? vfmaq_n_f32(acc[m][v], load4(dst), beta)
+                                       : acc[m][v]);
         }
     }
 }
 
-/// C[m][n0:n1] += A[m][:] · B[n][:] for a [N][K] B: one k-vector accumulator
-/// per output row, B read once and in order. Holds row-major A only.
-template <typename T>
-inline void gemv_tn(int M, int N, int K,
-                    const T* a, int lda,
-                    const T* b, int ldb,
-                    T* c, int ldc, float beta,
-                    int n0, int n1) noexcept {
-    for (int n = n0; n < n1; ++n) {
-        const T* b_row = b + static_cast<int64_t>(n) * ldb;
-        float32x4_t vacc[gemv_max_m];
-        for (int m = 0; m < M; ++m) { vacc[m] = vdupq_n_f32(0.0f); }
+/// C[m][n0:n1] += A[m][:] · B[:][n] for a row-major [K][N] B. n is cut into
+/// register-sized tiles; within a tile k is the inner loop, so the accumulator
+/// never leaves registers and B is loaded once per element. Built for a B that
+/// is reread per tile out of cache.
+/// A transposed A only changes the stride the scalar broadcast walks.
+template <typename T, int M>
+inline void gemv_nn_rows(int N, int K,
+                         const T* a, int lda, bool ta,
+                         const T* b, int ldb,
+                         T* c, int ldc, float beta,
+                         int n0, int n1) noexcept {
+    (void)N;
+    constexpr int V = gemv_vecs<M>;
 
-        int k = 0;
-        for (; k + lanes <= K; k += lanes) {
-            const float32x4_t bv = load4(b_row + k);
+    int j = n0;
+    for (; j + V * lanes <= n1; j += V * lanes) {
+        gemv_nn_tile<T, M, V>(K, a, lda, ta, b, ldb, c, ldc, beta, j);
+    }
+    // Column tail: single-vector tiles, then the scalars below one vector.
+    for (; j + lanes <= n1; j += lanes) {
+        gemv_nn_tile<T, M, 1>(K, a, lda, ta, b, ldb, c, ldc, beta, j);
+    }
+    for (; j < n1; ++j) {
+        float sum[gemv_max_m] = {};
+        for (int k = 0; k < K; ++k) {
+            const float bj = to_f32(b + static_cast<int64_t>(k) * ldb + j);
             for (int m = 0; m < M; ++m) {
-                vacc[m] = vfmaq_f32(vacc[m],
-                                    load4(a + static_cast<int64_t>(m) * lda + k), bv);
+                sum[m] += to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
+                                         : static_cast<int64_t>(m) * lda + k)) * bj;
             }
         }
         for (int m = 0; m < M; ++m) {
-            float sum = hsum(vacc[m]);
+            T* dst = c + static_cast<int64_t>(m) * ldc + j;
+            store1(dst, (beta != 0.0f) ? sum[m] + beta * to_f32(dst) : sum[m]);
+        }
+    }
+}
+
+/// Columns the streaming kernel accumulates over in one pass, by row count,
+/// sized so the accumulator is an L1-resident 32-64 KB and each k contributes a
+/// long contiguous run of B.
+template <int M>
+constexpr int gemv_stream_cap = (M <= 1) ? 8192 : 4096;
+
+/// k rows one accumulator load/store pair covers. Both extra factors cost
+/// nothing while B is the wall (one row of f32 at M=1); they pay as soon as the
+/// accumulator traffic or the widening of a narrow B load becomes the limit.
+template <typename T, int M>
+constexpr int gemv_stream_unroll = (M <= 1) ? (sizeof(T) == 2 ? 2 : 1) : 4;
+
+/// B bytes above which the register tile is given up for the streaming kernel.
+/// Below this the operand is cache-resident, so reusing each B element across
+/// rows from a register tile beats streaming; above it B is streaming from
+/// DRAM and only an in-order read reaches the bandwidth. The cutoff is 1.5x the
+/// P-core L2: the two kernels cross over near the cache size, and an E-core
+/// (smaller L2) only makes the streaming side more attractive.
+constexpr int64_t gemv_stream_bytes = 24 * 1024 * 1024;
+
+inline bool gemv_streams(int64_t b_bytes) noexcept { return b_bytes > gemv_stream_bytes; }
+
+/// C[m][n0:n1] += A[m][:] · B[:][n] for a row-major [K][N] B, k outer: the
+/// accumulator spans whole cap-wide slices of N in L1, so each k reads a long
+/// contiguous run of B and the operand is walked once in address order. The
+/// accumulator is reloaded and stored per k — an extra L1 access per FMA, which
+/// is free while B itself is coming from memory.
+template <typename T, int M>
+inline void gemv_nn_stream(int K,
+                           const T* a, int lda, bool ta,
+                           const T* b, int ldb,
+                           T* c, int ldc, float beta,
+                           int n0, int n1) noexcept {
+    constexpr int CAP = gemv_stream_cap<M>;
+    constexpr int U = gemv_stream_unroll<T, M>;
+    alignas(16) float acc[gemv_max_m][CAP];
+
+    for (int j0 = n0; j0 < n1; j0 += CAP) {
+        const int nb = (n1 - j0 < CAP) ? (n1 - j0) : CAP;
+        for (int m = 0; m < M; ++m) {
+            for (int j = 0; j < nb; ++j) { acc[m][j] = 0.0f; }
+        }
+
+        int k = 0;
+        for (; k + U <= K; k += U) {
+            const T* b_row[U];
+            float av[M][U];
+            for (int u = 0; u < U; ++u) {
+                b_row[u] = b + static_cast<int64_t>(k + u) * ldb + j0;
+                for (int m = 0; m < M; ++m) {
+                    av[m][u] = to_f32(a + (ta ? static_cast<int64_t>(k + u) * lda + m
+                                              : static_cast<int64_t>(m) * lda + k + u));
+                }
+            }
+            int j = 0;
+            for (; j + lanes <= nb; j += lanes) {
+                float32x4_t bv[U];
+                for (int u = 0; u < U; ++u) { bv[u] = load4(b_row[u] + j); }
+                for (int m = 0; m < M; ++m) {
+                    float* p = acc[m] + j;
+                    float32x4_t s = vld1q_f32(p);
+                    for (int u = 0; u < U; ++u) { s = vfmaq_n_f32(s, bv[u], av[m][u]); }
+                    vst1q_f32(p, s);
+                }
+            }
+            for (; j < nb; ++j) {
+                for (int m = 0; m < M; ++m) {
+                    for (int u = 0; u < U; ++u) {
+                        acc[m][j] += av[m][u] * to_f32(b_row[u] + j);
+                    }
+                }
+            }
+        }
+        // Rows left below the unroll depth.
+        for (; k < K; ++k) {
+            const T* b_row = b + static_cast<int64_t>(k) * ldb + j0;
+            float av[M];
+            for (int m = 0; m < M; ++m) {
+                av[m] = to_f32(a + (ta ? static_cast<int64_t>(k) * lda + m
+                                       : static_cast<int64_t>(m) * lda + k));
+            }
+            int j = 0;
+            for (; j + lanes <= nb; j += lanes) {
+                const float32x4_t bv = load4(b_row + j);
+                for (int m = 0; m < M; ++m) {
+                    float* p = acc[m] + j;
+                    vst1q_f32(p, vfmaq_n_f32(vld1q_f32(p), bv, av[m]));
+                }
+            }
+            for (; j < nb; ++j) {
+                const float bj = to_f32(b_row + j);
+                for (int m = 0; m < M; ++m) { acc[m][j] += av[m] * bj; }
+            }
+        }
+
+        for (int m = 0; m < M; ++m) {
+            T* c_row = c + static_cast<int64_t>(m) * ldc;
+            for (int j = 0; j < nb; ++j) {
+                T* dst = c_row + j0 + j;
+                store1(dst, (beta != 0.0f) ? acc[m][j] + beta * to_f32(dst) : acc[m][j]);
+            }
+        }
+    }
+}
+
+/// Independent accumulators per output row for the [N][K] B kernel. Each k step
+/// carries one FMA into one of them, so the FMA latency hides behind its
+/// siblings instead of stalling the row's single dependency chain.
+template <int M>
+constexpr int gemv_tn_unroll = (M <= 1) ? 8 : (M == 2 ? 4 : 2);
+
+/// C[m][n0:n1] += A[m][:] · B[n][:] for a [N][K] B: one k-vector accumulator
+/// per output row, B read once and in order. Holds row-major A only.
+template <typename T, int M>
+inline void gemv_tn_rows(int N, int K,
+                         const T* a, int lda,
+                         const T* b, int ldb,
+                         T* c, int ldc, float beta,
+                         int n0, int n1) noexcept {
+    (void)N;
+    constexpr int U = gemv_tn_unroll<M>;
+
+    for (int n = n0; n < n1; ++n) {
+        const T* b_row = b + static_cast<int64_t>(n) * ldb;
+        float32x4_t acc[M][U];
+        for (int m = 0; m < M; ++m) {
+            for (int u = 0; u < U; ++u) { acc[m][u] = vdupq_n_f32(0.0f); }
+        }
+
+        int k = 0;
+        for (; k + U * lanes <= K; k += U * lanes) {
+            float32x4_t bv[U];
+            for (int u = 0; u < U; ++u) { bv[u] = load4(b_row + k + u * lanes); }
+            for (int m = 0; m < M; ++m) {
+                const T* a_row = a + static_cast<int64_t>(m) * lda;
+                for (int u = 0; u < U; ++u) {
+                    acc[m][u] = vfmaq_f32(acc[m][u], load4(a_row + k + u * lanes), bv[u]);
+                }
+            }
+        }
+
+        for (int m = 0; m < M; ++m) {
+            float32x4_t v = acc[m][0];
+            for (int u = 1; u < U; ++u) { v = vaddq_f32(v, acc[m][u]); }
+            float sum = hsum(v);
             for (int t = k; t < K; ++t) {
                 sum += to_f32(a + static_cast<int64_t>(m) * lda + t) * to_f32(b_row + t);
             }
@@ -270,7 +434,66 @@ inline void gemv_tn(int M, int N, int K,
     }
 }
 
+/// Dispatch a row count of 1..gemv_max_m onto the templated kernels, choosing
+/// the traversal by operand size: cache-resident B favours the register tile,
+/// DRAM-resident B the streaming kernel.
+template <typename T>
+inline void gemv_nn(int M, int N, int K,
+                    const T* a, int lda, bool ta,
+                    const T* b, int ldb,
+                    T* c, int ldc, float beta,
+                    int n0, int n1) noexcept {
+    if (gemv_streams(static_cast<int64_t>(N) * K * static_cast<int64_t>(sizeof(T)))) {
+        switch (M) {
+            case 1: gemv_nn_stream<T, 1>(K, a, lda, ta, b, ldb, c, ldc, beta, n0, n1); break;
+            case 2: gemv_nn_stream<T, 2>(K, a, lda, ta, b, ldb, c, ldc, beta, n0, n1); break;
+            case 3: gemv_nn_stream<T, 3>(K, a, lda, ta, b, ldb, c, ldc, beta, n0, n1); break;
+            default: gemv_nn_stream<T, gemv_max_m>(K, a, lda, ta, b, ldb, c, ldc, beta,
+                                                   n0, n1); break;
+        }
+        return;
+    }
+    switch (M) {
+        case 1: gemv_nn_rows<T, 1>(N, K, a, lda, ta, b, ldb, c, ldc, beta, n0, n1); break;
+        case 2: gemv_nn_rows<T, 2>(N, K, a, lda, ta, b, ldb, c, ldc, beta, n0, n1); break;
+        case 3: gemv_nn_rows<T, 3>(N, K, a, lda, ta, b, ldb, c, ldc, beta, n0, n1); break;
+        default: gemv_nn_rows<T, gemv_max_m>(N, K, a, lda, ta, b, ldb, c, ldc, beta,
+                                             n0, n1); break;
+    }
+}
+
+template <typename T>
+inline void gemv_tn(int M, int N, int K,
+                    const T* a, int lda,
+                    const T* b, int ldb,
+                    T* c, int ldc, float beta,
+                    int n0, int n1) noexcept {
+    switch (M) {
+        case 1: gemv_tn_rows<T, 1>(N, K, a, lda, b, ldb, c, ldc, beta, n0, n1); break;
+        case 2: gemv_tn_rows<T, 2>(N, K, a, lda, b, ldb, c, ldc, beta, n0, n1); break;
+        case 3: gemv_tn_rows<T, 3>(N, K, a, lda, b, ldb, c, ldc, beta, n0, n1); break;
+        default: gemv_tn_rows<T, gemv_max_m>(N, K, a, lda, b, ldb, c, ldc, beta,
+                                             n0, n1); break;
+    }
+}
+
 }  // namespace naive_detail
+
+/// Width of the N slice one GEMV call owns — the driver's thread granularity.
+/// The streaming kernel accumulates over exactly one slice, so it wants a wide
+/// one; the register tile retiles internally, so it keeps the narrow slice and
+/// leaves the pool more blocks to spread.
+template <typename T>
+inline int gemv_slice(int M, int64_t N, int64_t K) noexcept {
+    if (!naive_detail::gemv_streams(N * K * static_cast<int64_t>(sizeof(T)))) {
+        return gemv_block;
+    }
+    switch (M) {
+        case 1: return naive_detail::gemv_stream_cap<1>;
+        case 2: return naive_detail::gemv_stream_cap<2>;
+        default: return naive_detail::gemv_stream_cap<gemv_max_m>;
+    }
+}
 
 /// C[m][n_begin:n_end] = A·B + beta·C for M <= gemv_max_m, no packing. Handles
 /// every layout except a transposed A against a transposed B (the caller keeps

@@ -2258,7 +2258,8 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
     // really takes that route — except ta+tb, which the kernel declines and the
     // packed path must still answer. Covered: both dtypes, every transpose
     // pair, k and n tails, N on both sides of the 1024-wide GEMV block, beta, a
-    // Relu epilogue, and a broadcast batch.
+    // Relu epilogue, a broadcast batch, and B either side of the size cutoff
+    // that switches the nn kernel from the register tile to the stream.
     namespace cpu = nnops::backend::cpu;
     using cpu::half;
 
@@ -2273,6 +2274,11 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
         {4, 33,   4096, false, false, false, true,  false},
         {1, 700,  900,  false, false, true,  false, true},
         {2, 100,  700,  true,  true,  false, false, false},
+        // B over the 24 MB cutoff at f32 (25 MB) and at f16 (25 MB), which is
+        // the streaming kernel at M=2 and M=1 respectively; 3073 leaves a k
+        // row below the unroll depth.
+        {2, 2048, 3073, false, false, false, true,  false},
+        {1, 4096, 3073, false, false, false, false, false},
     };
 
     const auto run = [&](auto dtype_tag) {

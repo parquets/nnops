@@ -71,7 +71,10 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     const int Mi = static_cast<int>(M);
     const int Ni = static_cast<int>(N);
     const int Ki = static_cast<int>(K);
-    const int blocks = (Ni + arch::gemv_block - 1) / arch::gemv_block;
+    // The kernel picks the traversal from B's size, and the traversal decides
+    // how wide a slice is worth handing to one call (see arch::gemv_slice).
+    const int span = arch::gemv_slice<T>(Mi, N, K);
+    const int blocks = (Ni + span - 1) / span;
 
     const T* a_base = a.ptr<T>();
     const T* b_base = b.ptr<T>();
@@ -81,8 +84,8 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     const auto block = [&](int64_t bi, int nb) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
-        const int n0 = static_cast<int>(nb) * arch::gemv_block;
-        const int n1 = std::min(n0 + arch::gemv_block, Ni);
+        const int n0 = static_cast<int>(nb) * span;
+        const int n1 = std::min(n0 + span, Ni);
         arch::matmul_gemv(Mi, Ni, Ki,
                           a_base + a_off, lda, attrs.transpose_a,
                           b_base + b_off, ldb, attrs.transpose_b,

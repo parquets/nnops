@@ -1260,14 +1260,18 @@ NNOPS_BENCH(matmul_small_naive_ab) {
 
 // GEMV (M <= 4): the packed route sweeps B twice (write the packed copy, then
 // read it back) for a handful of output rows; the direct route streams B once.
-// The packed side is forced by handing the same GEMM over as ta+tb, which is
-// the one layout the direct kernel declines. Interleaved A/B at 1T, then a
-// thread ladder for the direct route (its N blocks are the parallel unit).
+// Three direct layouts are timed: B as [K][N] with a cache-resident B (the
+// register tile), B as [K][N] at 64 MB (the streaming kernel), and B as [N][K]
+// (transpose_b, the decode layout). The packed side is forced by handing the
+// same GEMM over as ta+tb, which is the one layout the direct kernel declines.
+// Interleaved A/B at 1T, then a thread ladder for the direct route (its N
+// blocks are the parallel unit).
 template <typename T>
 void bench_gemv_dtype(const char* tag) {
     struct Shape { int64_t M, N, K; };
-    const Shape shapes[] = {{1, 2048, 2048}, {2, 2048, 2048}, {3, 2048, 2048},
-                            {4, 2048, 2048}, {8, 2048, 2048}};
+    const Shape shapes[] = {{1, 2048, 2048}, {2, 2048, 2048}, {4, 2048, 2048},
+                            {1, 4096, 4096}, {2, 4096, 4096}, {4, 4096, 4096},
+                            {8, 2048, 2048}};
     const int rounds = 5, iters = 10;
 
     auto median = [](std::vector<double> v) {
@@ -1292,11 +1296,17 @@ void bench_gemv_dtype(const char* tag) {
         auto [at_vec, at] = make_tensor<T>(s.K, s.M, s.M, 3);
         auto [bt_vec, bt] = make_tensor<T>(s.N, s.K, s.K, 4);
 
+        // transpose_b: A [M][K] against a [N][K] weight, the decode layout.
+        auto [bt2_vec, bt2] = make_tensor<T>(s.N, s.K, s.K, 5);
+
         MatMulAttributes attrs_direct{};
+        MatMulAttributes attrs_tb{};
+        attrs_tb.transpose_b = true;
         MatMulAttributes attrs_packed{};
         attrs_packed.transpose_a = true;
         attrs_packed.transpose_b = true;
         auto op_direct = MatMul::create(attrs_direct, Backend::CPU);
+        auto op_tb = MatMul::create(attrs_tb, Backend::CPU);
         auto op_packed = MatMul::create(attrs_packed, Backend::CPU);
 
         const TensorDesc descs_in[] = {a.desc(), b.desc()};
@@ -1304,6 +1314,7 @@ void bench_gemv_dtype(const char* tag) {
         std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
         auto output = test::make_planar(descs[0], out_buf.data());
         const TensorView ins_direct[] = {a, b};
+        const TensorView ins_tb[] = {a, bt2};
         const TensorView ins_packed[] = {at, bt};
 
         const auto ns_per_call = [&](auto&& fn) {
@@ -1314,22 +1325,24 @@ void bench_gemv_dtype(const char* tag) {
             return std::chrono::duration<double, std::nano>(t1 - t0).count() / iters;
         };
 
-        std::vector<double> vd, vp;
+        std::vector<double> vd, vt, vp;
         for (int r = 0; r < rounds; ++r) {
             vd.push_back(ns_per_call(
                 [&] { op_direct->compute(output, ins_direct, ComputeContext{}, nullptr); }));
+            vt.push_back(ns_per_call(
+                [&] { op_tb->compute(output, ins_tb, ComputeContext{}, nullptr); }));
             vp.push_back(ns_per_call(
                 [&] { op_packed->compute(output, ins_packed, ComputeContext{}, nullptr); }));
         }
 
-        const double md = median(vd), mp = median(vp);
+        const double md = median(vd), mt = median(vt), mp = median(vp);
         const double flops = 2.0 * static_cast<double>(s.M) *
                              static_cast<double>(s.N) * static_cast<double>(s.K);
-        std::printf("    M=%lld N=%lld K=%lld   direct=%8.2f GFLOPS  "
-                    "packed=%8.2f GFLOPS   d/p=%.2f\n",
+        std::printf("    M=%lld N=%lld K=%lld   direct=%8.2f  tb=%8.2f  "
+                    "packed=%8.2f GFLOPS   d/p=%.2f  tb/p=%.2f\n",
                     static_cast<long long>(s.M), static_cast<long long>(s.N),
-                    static_cast<long long>(s.K), flops / md, flops / mp,
-                    mp / md);
+                    static_cast<long long>(s.K), flops / md, flops / mt, flops / mp,
+                    mp / md, mp / mt);
 
         // The direct route splits N across threads instead of batching the
         // packing work, so its ladder starts at one row of output.
