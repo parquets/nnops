@@ -3,6 +3,7 @@
 
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
+#include "backend/cpu/matmul/matmul_helper.h" // nr_max_flt / mma_pack_align / tile_pack_rhs
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -18,9 +19,23 @@
 #include <thread>
 #include <cstdio>
 #include <stdexcept>
+#include <type_traits>
 
 using namespace nnops;
 using nnops::backend::cpu::half;
+
+/// Packed-B scratch (elements per slot) a float conv plan must reserve: the
+/// plan's im2col block — icn_block channels x karea taps x oh_block rows x OW
+/// columns — re-laid out in nr_max-wide panels. Mirrors get_conv2d_plan;
+/// nr_max is arch-dependent (12 on aarch64, 16 on x86_64).
+static int64_t expected_pack_size(const nnops::backend::cpu::Conv2DPlan& plan,
+                                  int64_t karea, int64_t out_w) {
+    constexpr int nr = nnops::backend::cpu::nr_max_flt<float>();
+    const int64_t kdim = plan.icn_block * karea;
+    return ((plan.oh_block * out_w + nr - 1) / nr)
+         * static_cast<int64_t>(nnops::backend::cpu::mma_pack_align(
+               static_cast<size_t>(nr * kdim * sizeof(float))) / sizeof(float));
+}
 
 // ============================================================
 // Hand-verified small tests
@@ -971,10 +986,108 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
         NNOPS_EXPECT_FALSE(plan.pointwise);
         NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
         NNOPS_EXPECT_EQ(plan.icn_block, l.want_icn);
-        // The plan's im2col panel must be exactly the block the kernel is handed:
+        // The gather writes the packed panels directly, so the fp route carries
+        // no col matrix; what the kernel is handed is the packed-B block —
         // icn_block channels x karea taps x oh_block output rows x OW columns.
-        NNOPS_EXPECT_EQ(plan.col_size,
-                        plan.icn_block * l.kh * l.kw * plan.oh_block * out_descs[0].dims[3]);
+        NNOPS_EXPECT_EQ(plan.col_size, 0);
+        NNOPS_EXPECT_EQ(plan.pack_size,
+                        expected_pack_size(plan, l.kh * l.kw, out_descs[0].dims[3]));
+    }
+}
+
+NNOPS_TEST(conv2d_fused_im2col_pack_matches_two_step) {
+    // tiled_im2col_2d_packed must land every value on the same panel slot the
+    // two-step route does (tiled_im2col_2d into [K][roi_area], then
+    // tile_pack_rhs into nr_max-wide panels): same gather, same padding, same
+    // zero-filled tail of the last panel. Both are pure re-orderings, so the
+    // region the MMA reads must match bit for bit — on f32 and f16, and across
+    // stride, dilation, padding and a roi that is not a whole number of panels.
+    struct Case {
+        int64_t ic, ih, iw, kh, kw, sh, sw, ph, pw, dh, dw;
+        int64_t oh, ohc, ow;   // roi origin (output row), roi rows, roi width
+    };
+    const Case cases[] = {
+        { 3,  9, 11, 3, 3, 1, 1, 1, 1, 1, 1, 0, 4,  9},  // padding on all sides
+        { 2, 12, 10, 3, 3, 2, 2, 1, 1, 1, 1, 2, 4,  5},  // stride 2, interior roi
+        { 2,  9, 13, 3, 3, 1, 1, 2, 2, 2, 2, 0, 4,  7},  // dilation 2, pad 2
+        { 1,  7,  8, 5, 1, 1, 1, 0, 2, 1, 1, 3, 4,  8},  // 5x1 taps, top/left pad
+        { 4,  6,  6, 1, 1, 1, 1, 0, 0, 1, 1, 0, 6,  6},  // 1x1 kernel
+        { 5,  9,  9, 3, 3, 1, 1, 1, 1, 1, 1, 4, 5,  5},  // roi_area 25 → tail
+        { 7,  8,  9, 3, 3, 1, 1, 1, 1, 1, 1, 0, 8,  9},  // 72 columns, 8 rows
+    };
+
+    for (const Case& c : cases) {
+        const int64_t karea    = c.kh * c.kw;
+        const int64_t kdim     = c.ic * karea;
+        const int64_t roi_area = c.ohc * c.ow;
+        const int64_t ih0 = c.oh * c.sh - c.ph;
+        const int64_t iw0 = -c.pw;
+        const int roi_pad_h = static_cast<int>(ih0 < 0 ? -ih0 : (ih0 >= c.ih ? ih0 - c.ih : 0));
+        const int roi_pad_w = static_cast<int>(iw0 < 0 ? -iw0 : (iw0 >= c.iw ? iw0 - c.iw : 0));
+
+        auto check = [&](auto tag) {
+            using T = decltype(tag);
+            constexpr int nr = nnops::backend::cpu::nr_max_flt<T>();
+            const int ldd = static_cast<int>(
+                nnops::backend::cpu::mma_pack_align(
+                    static_cast<size_t>(nr) * kdim * sizeof(T)) / sizeof(T));
+            const int64_t npanel = (roi_area + nr - 1) / nr;
+
+            auto to_T = [](float v) -> T {
+                if constexpr (std::is_same_v<T, float>) {
+                    return v;
+                } else {
+                    return nnops::backend::cpu::float_to_half(v);
+                }
+            };
+
+            // Small integers are exact in f16, so both dtypes hold the same
+            // values and the comparison stays bit-exact.
+            const int64_t in_n = c.ic * c.ih * c.iw;
+            std::vector<T> in(static_cast<size_t>(in_n));
+            for (int64_t i = 0; i < in_n; ++i) {
+                in[static_cast<size_t>(i)] =
+                    to_T(static_cast<float>((i * 37) % 61 - 30));
+            }
+
+            std::vector<T> col(static_cast<size_t>(kdim * roi_area));
+            std::vector<T> want(static_cast<size_t>(npanel * ldd), to_T(-7.0f));
+            std::vector<T> got(static_cast<size_t>(npanel * ldd), to_T(-7.0f));
+
+            nnops::kernel::tiled_im2col_2d<T>(
+                col.data(), in.data(), 0, static_cast<int>(c.oh),
+                static_cast<int>(c.ow), static_cast<int>(c.ohc),
+                roi_pad_h, roi_pad_w, static_cast<int>(c.ph), static_cast<int>(c.pw),
+                static_cast<int>(c.ic), static_cast<int>(c.ih), static_cast<int>(c.iw),
+                static_cast<int>(c.ih * c.iw), static_cast<int>(c.iw),
+                static_cast<int>(c.kh), static_cast<int>(c.kw),
+                static_cast<int>(c.sh), static_cast<int>(c.sw),
+                static_cast<int>(c.dh), static_cast<int>(c.dw));
+            nnops::backend::cpu::tile_pack_rhs(false, static_cast<int>(roi_area),
+                                               static_cast<int>(kdim), want.data(), ldd,
+                                               col.data(), static_cast<int>(roi_area), 1.0f);
+
+            nnops::kernel::tiled_im2col_2d_packed<T, nr>(
+                got.data(), ldd, in.data(), 0, static_cast<int>(c.oh),
+                static_cast<int>(c.ow), static_cast<int>(c.ohc),
+                roi_pad_h, roi_pad_w, static_cast<int>(c.ph), static_cast<int>(c.pw),
+                static_cast<int>(c.ic), static_cast<int>(c.ih), static_cast<int>(c.iw),
+                static_cast<int>(c.ih * c.iw), static_cast<int>(c.iw),
+                static_cast<int>(c.kh), static_cast<int>(c.kw),
+                static_cast<int>(c.sh), static_cast<int>(c.sw),
+                static_cast<int>(c.dh), static_cast<int>(c.dw));
+
+            // Only [0, nr*kdim) of each panel is ever read by the MMA; the
+            // ldd tail is padding neither route has to initialize.
+            for (int64_t p = 0; p < npanel; ++p) {
+                NNOPS_EXPECT_TRUE(std::memcmp(want.data() + p * ldd,
+                                              got.data() + p * ldd,
+                                              sizeof(T) * nr * kdim) == 0);
+            }
+        };
+
+        check(float{});
+        check(half{});
     }
 }
 
@@ -1041,12 +1154,11 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
             NNOPS_EXPECT_EQ(plan.oh_chunks, 1);
         }
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
-        // Pointwise carries no col buffer at all; otherwise the plan's im2col
-        // panel must be exactly the block the kernel is handed.
-        NNOPS_EXPECT_EQ(plan.col_size,
-                        c.want_pointwise
-                            ? 0
-                            : plan.icn_block * c.kh * c.kw * plan.oh_block * out_descs[0].dims[3]);
+        // The fp route has no col matrix at all — the gather is fused with the
+        // pack — so the scratch the kernel is handed is the packed-B block.
+        NNOPS_EXPECT_EQ(plan.col_size, 0);
+        NNOPS_EXPECT_EQ(plan.pack_size,
+                        expected_pack_size(plan, c.kh * c.kw, out_descs[0].dims[3]));
     }
 }
 
@@ -1098,13 +1210,14 @@ NNOPS_TEST(conv2d_pointwise_routing) {
             attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
 
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
+        // Neither route keeps a col matrix on fp: pointwise reads B off the
+        // input plane, everything else gathers straight into the packed panels.
+        NNOPS_EXPECT_EQ(plan.col_size, 0);
+        NNOPS_EXPECT_EQ(plan.pack_size,
+                        expected_pack_size(plan, c.kh * c.kw, out_descs[0].dims[3]));
         if (c.want_pointwise) {
-            // One K pass over the whole group and no col buffer at all.
+            // One K pass over the whole group.
             NNOPS_EXPECT_EQ(plan.icn_block, c.ishape[1] / c.groups);
-            NNOPS_EXPECT_EQ(plan.col_size, 0);
-        } else {
-            NNOPS_EXPECT_EQ(plan.col_size,
-                            plan.icn_block * c.kh * c.kw * plan.oh_block * out_descs[0].dims[3]);
         }
     }
 
@@ -1149,9 +1262,11 @@ NNOPS_TEST(conv2d_pointwise_routing) {
     const auto pplan = nnops::backend::cpu::get_conv2d_plan(
         attrs, pdescs, od, /*num_threads=*/1, /*use_thread_slots=*/false);
     NNOPS_EXPECT_FALSE(pplan.pointwise);
-    // Still the 1x1 rung of the ic-block ladder, with the col buffer back.
+    // Still the 1x1 rung of the ic-block ladder, with the packed-B scratch back
+    // (the gather handles the pitch; it writes the panels directly).
     NNOPS_EXPECT_EQ(pplan.icn_block, int64_t{64});
-    NNOPS_EXPECT_EQ(pplan.col_size, int64_t{64} * pplan.oh_block * W);
+    NNOPS_EXPECT_EQ(pplan.col_size, 0);
+    NNOPS_EXPECT_EQ(pplan.pack_size, expected_pack_size(pplan, 1, W));
 
     const std::vector<TensorView> pins = {pitched, w32};
     std::vector<float> out_buf(static_cast<size_t>(n));
@@ -1336,12 +1451,11 @@ NNOPS_TEST(conv2d_wide_frame_plan) {
         NNOPS_EXPECT_EQ(plan.num_oh_blocks, c.want_blocks);
         NNOPS_EXPECT_EQ(plan.oh_chunks, std::min<int64_t>(c.nt, c.want_blocks));
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
-        // The col panel is the block the kernel is handed: icn x karea taps x
-        // oh_block rows x the frame's output width.
-        NNOPS_EXPECT_EQ(plan.col_size,
-                        c.want_pointwise
-                            ? int64_t{0}
-                            : plan.icn_block * c.K * c.K * plan.oh_block * c.want_ow);
+        // No col matrix on the fp route; the packed-B block the kernel is
+        // handed is icn x karea taps x oh_block rows x the frame's output width.
+        NNOPS_EXPECT_EQ(plan.col_size, 0);
+        NNOPS_EXPECT_EQ(plan.pack_size,
+                        expected_pack_size(plan, c.K * c.K, c.want_ow));
     }
 }
 

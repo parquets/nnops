@@ -5,8 +5,9 @@
 ///   For each (batch, group, oh-chunk) — parallel via ctx.cpu.run:
 ///     For each oh-block in the chunk's contiguous range of the output plane:
 ///       For each ic-block:
-///         im2col the input block into a scratch matrix [K=icnc*karea][N=ohc*OW]
-///         pack col_data into uniform nr_max-wide panels (tile_pack_rhs)
+///         gather the input block straight into uniform nr_max-wide packed-B
+///         panels (tiled_im2col_2d_packed — the fused im2col + pack; a
+///         pointwise block packs the input plane itself instead)
 ///         For each oc-block:
 ///           init output tile = bias (+ original output when add_to)
 ///           tile += weight[ocnc, K] × packed_col (tile_mma_direct)
@@ -192,9 +193,13 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     // every task a thread claims) when the backend reports thread ids, else one
     // per parallel task. Output tiles are disjoint either way, so the result is
     // bit-identical.
-    const int64_t col_size  = plan.col_size;
+    //
+    // The fp route has no col buffer: the gather writes the packed B panels
+    // directly (tiled_im2col_2d_packed), so the plan sizes col_size 0 and one
+    // slot is [orig][pack_b].
     const int64_t orig_size = attrs.add_to ? plan.orig_size : 0;
     const int64_t pack_size = plan.pack_size;
+    NNOPS_ASSERT(plan.col_size == 0);
 
     constexpr int nr_max = nr_max_flt<T>();
     constexpr int esz    = static_cast<int>(sizeof(T));
@@ -205,9 +210,8 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     const int nslots = ctx.cpu.thread_slot_count();
     const bool per_thread = nslots > 0 && nslots < total;
 
-    T* col_base  = static_cast<T*>(workspace);
-    T* orig_base = attrs.add_to ? col_base + plan.num_slots * col_size : nullptr;
-    T* pack_base = col_base + plan.num_slots * (col_size + orig_size);
+    T* orig_base = attrs.add_to ? static_cast<T*>(workspace) : nullptr;
+    T* pack_base = static_cast<T*>(workspace) + plan.num_slots * orig_size;
 
     const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
     // Nothing to seed the accumulator with (no bias tensor, no residual to fold
@@ -223,7 +227,6 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
         const int64_t g = ng % G;
 
         const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : t;
-        T* col_data = col_base + slot * col_size;
         T* orig = orig_base ? orig_base + slot * orig_size : nullptr;
         T* pack_b = pack_base + slot * pack_size;
 
@@ -256,40 +259,43 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                 const bool is_last_icn = (icn + icn_block) >= ic_per_group;
 
                 const T* input_local = input_ptr + icn * icn_step;
-                // A pointwise gather would be a dense row copy, so building it
-                // only adds a write and a re-read; B is read from the input
-                // instead (below). pad == 0 and stride == 1 mean the ROI never
-                // leaves the input, so there is no border case to handle either.
-                if (!plan.pointwise) {
-                    k::tiled_im2col_2d<T>(col_data, input_local,
-                                          0, static_cast<int>(oh),
-                                          static_cast<int>(OW), static_cast<int>(ohc),
-                                          roi_pad_h, roi_pad_w,
-                                          static_cast<int>(PH), static_cast<int>(PW),
-                                          static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
-                                          static_cast<int>(icn_step), static_cast<int>(in_row_stride),
-                                          static_cast<int>(KH), static_cast<int>(KW),
-                                          static_cast<int>(SH), static_cast<int>(SW),
-                                          static_cast<int>(DH), static_cast<int>(DW));
-                }
 
-                // Pointwise B: the block's ROI inside the input plane, one
-                // roi_area-wide run per input channel, so the k stride is the
-                // channel stride rather than the ROI width. input_local already
-                // carries the batch and group offsets (above).
-                const T* b_src = plan.pointwise ? input_local + oh * in_row_stride
-                                                : col_data;
-                const int b_ld = plan.pointwise ? static_cast<int>(icn_step)
-                                                : static_cast<int>(roi_area);
-
-                // B = [K=icnc*karea][N=roi_area]. Pack it once per ic-block
-                // into uniform nr_max-wide panels; every oc-block below reuses
-                // it (the unified MMA route always consumes packed B).
+                // B = [K=icnc*karea][N=roi_area], packed once per ic-block into
+                // uniform nr_max-wide panels; every oc-block below reuses it
+                // (the unified MMA route always consumes packed B).
                 const int kdim = static_cast<int>(icnc * karea);
                 const int ldd_b = static_cast<int>(
                     mma_pack_align(nr_max * kdim * esz) / esz);
-                tile_pack_rhs(false, static_cast<int>(roi_area), kdim,
-                                      pack_b, ldd_b, b_src, b_ld, 1.0f);
+
+                if (!plan.pointwise) {
+                    // Gather straight into the panels. Materializing the col
+                    // matrix first and packing it afterwards moves the same
+                    // bytes twice (write + re-read of roi_area*kdim elements)
+                    // for a pure re-ordering; this does it in one pass. The
+                    // values, zero padding and panel layout are identical.
+                    k::tiled_im2col_2d_packed<T, nr_max>(pack_b, ldd_b, input_local,
+                                                 0, static_cast<int>(oh),
+                                                 static_cast<int>(OW), static_cast<int>(ohc),
+                                                 roi_pad_h, roi_pad_w,
+                                                 static_cast<int>(PH), static_cast<int>(PW),
+                                                 static_cast<int>(icnc), static_cast<int>(IH), static_cast<int>(IW),
+                                                 static_cast<int>(icn_step), static_cast<int>(in_row_stride),
+                                                 static_cast<int>(KH), static_cast<int>(KW),
+                                                 static_cast<int>(SH), static_cast<int>(SW),
+                                                 static_cast<int>(DH), static_cast<int>(DW));
+                } else {
+                    // A pointwise gather would be a dense row copy, so building
+                    // it only adds a write and a re-read; B is read from the
+                    // input instead. pad == 0 and stride == 1 mean the ROI never
+                    // leaves the input, so there is no border case to handle.
+                    // The block's ROI inside the input plane is one roi_area-wide
+                    // run per input channel, so the k stride is the channel
+                    // stride rather than the ROI width. input_local already
+                    // carries the batch and group offsets (above).
+                    const T* b_src = input_local + oh * in_row_stride;
+                    tile_pack_rhs(false, static_cast<int>(roi_area), kdim,
+                                  pack_b, ldd_b, b_src, static_cast<int>(icn_step), 1.0f);
+                }
 
                 for (int64_t ocn = 0; ocn < oc_per_group; ocn += ocn_block) {
                     const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
@@ -498,8 +504,8 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // not to the plane — so a 28-row plane runs 4-row blocks that each restart
     // the gather, the packer and their own C read-modify-write pass. Covering
     // more rows per block measures +10..15% at one thread on the 28-plane rows
-    // and within +-2% at 112 (a wash: the col scratch it multiplies has caught
-    // up by then), so the 28-56 row planes are what this is for.
+    // and within +-2% at 112 (a wash: the scratch it multiplies has caught up
+    // by then), so the 28-56 row planes are what this is for.
     //
     // Two constraints keep it from losing at more threads. The block count must
     // stay a multiple of the chunk count (an uneven split leaves one worker with
@@ -513,9 +519,9 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // reaches 14 rows on a 112 plane: 4 -> 8 -> 16 skips every count that
     // divides evenly.
     if (!plan.pointwise) {
-        constexpr int64_t kColCap = int64_t{256} << 10;   // elements per slot
-        const int64_t col_per_row = plan.icn_block * karea * OW;
-        const int64_t cap_rows = (col_per_row > 0) ? kColCap / col_per_row : OH;
+        constexpr int64_t kScratchCap = int64_t{256} << 10;   // elements per slot
+        const int64_t scratch_per_row = plan.icn_block * karea * OW;
+        const int64_t cap_rows = (scratch_per_row > 0) ? kScratchCap / scratch_per_row : OH;
         const int64_t max_rows = std::max<int64_t>(plan.oh_block,
                                                    std::min<int64_t>(OH, cap_rows));
         const int64_t chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, OH);
@@ -535,7 +541,7 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
         const int64_t base_rows = busiest_chunk_rows(plan.oh_block);
         for (int64_t blocks = chunks; blocks <= OH; blocks += chunks) {
             const int64_t grown = (OH + blocks - 1) / blocks;
-            if (grown > max_rows) { continue; }          // over the col budget
+            if (grown > max_rows) { continue; }          // over the scratch budget
             // ceil(OH/grown) need not hand `blocks` back — only then is the
             // split actually one block per chunk.
             if ((OH + grown - 1) / grown != blocks) { continue; }
@@ -553,8 +559,12 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // chunk count at the number of oh-blocks.
     plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, plan.num_oh_blocks);
 
-    plan.col_size  = plan.pointwise ? 0
-                                    : plan.icn_block * karea * plan.oh_block * OW;
+    // The fp route fuses the gather with the pack (tiled_im2col_2d_packed), so
+    // it never materializes the col matrix; the quantized route still builds
+    // one and packs it separately.
+    plan.col_size  = (plan.pointwise || !quant)
+                   ? 0
+                   : plan.icn_block * karea * plan.oh_block * OW;
     // The quantized route never reaches here with add_to (gated above), so its
     // residual buffer does not exist.
     plan.orig_size = (attrs.add_to && !quant)

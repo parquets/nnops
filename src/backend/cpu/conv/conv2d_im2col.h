@@ -5,11 +5,13 @@
 /// Ported from nn_compute (`src/cpu/im2col_conv2d_cpu.cpp` +
 /// `kernel/conv2d/nchw/implicit_gemm_conv2d.hpp` +
 /// `kernel/conv2d/im2col_2d.hpp`). The output spatial plane is split into
-/// oh-blocks; for each block the input is materialized into a per-(batch,
-/// group) im2col buffer via tiled_im2col_2d, then B is packed into uniform
-/// nr_max-wide panels and the output tile is accumulated with the raw
-/// (unpacked) weight through the same `tile_mma_direct` dispatch that
-/// MatMul uses (matmul_helper.h).
+/// oh-blocks; for each block the input is gathered straight into the uniform
+/// nr_max-wide packed-B panels the GEMM consumes (tiled_im2col_2d_packed —
+/// the im2col and pack steps fused into one pass, no intermediate col matrix)
+/// and the output tile is accumulated with the raw (unpacked) weight through
+/// the same `tile_mma_direct` dispatch that MatMul uses (matmul_helper.h).
+/// The quantized route keeps the two-step form: it gathers bytes into a col
+/// buffer and packs it separately (conv2d_im2col_int8.cpp).
 ///
 /// A 1x1 kernel with unit stride and no padding needs no im2col at all — at
 /// karea == 1 the gather degenerates to a dense row copy — so that case (the
@@ -37,15 +39,16 @@
 /// ids are reported, else one slot per task, reused across the task's oh-blocks):
 ///   [quant    : N·IC·IH·IW bytes — the fp activation, quantized once per
 ///               call and shared by every task]
-///   [col_data : icn_block*karea*oh_block*out_w]
+///   [col_data : icn_block*karea*oh_block*out_w — quantized route only]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
 ///   [pack_b   : ceil(oh_block*out_w/nr_max) * ldd_b]
 /// then, on the quantized route only (fp has both regions sized 0):
 ///   [acc      : ocn_block*oh_block*out_w    int32]
 ///   [pack_a   : num_panels_max(ocn_block, MR_I8) * ldd_a_i8]
 ///
-/// col_data is the im2col matrix [K=icn_block*karea][N=oh_block*out_w], and is
-/// absent under `pointwise` (col_size 0) — the packer then reads B straight
+/// col_data is the im2col matrix [K=icn_block*karea][N=oh_block*out_w]. The fp
+/// route never builds it (col_size 0) — the gather writes the packed panels
+/// directly — and neither does `pointwise`, where the packer reads B straight
 /// from the input. orig preserves the output tile for the exact add_to
 /// semantics. pack_b holds B in the uniform nr_max-wide panel layout the
 /// unified MMA kernels consume (matmul_helper.h); it is rebuilt per ic-block.
@@ -76,7 +79,9 @@ struct Conv2DPlan {
     int64_t num_oh_blocks = 1;     ///< ceil(OH / oh_block)
     int64_t oh_chunks     = 1;     ///< parallel oh-chunks per (batch, group)
     int64_t num_slots = 0;         ///< scratch slots (worker threads, else tasks)
-    int64_t col_size  = 0;         ///< im2col scratch elements per slot (0 → pointwise)
+    int64_t col_size  = 0;         ///< im2col scratch elements per slot (0 → pointwise,
+                                   ///< or the fp route, whose gather is fused with
+                                   ///< the pack; only the quantized route builds it)
     int64_t orig_size = 0;         ///< add_to scratch elements per slot
     int64_t pack_size = 0;         ///< uniform packed-B elements per slot
 
