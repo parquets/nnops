@@ -11,7 +11,7 @@
 /// step), so every end-to-end comparison is tolerance-based.
 
 #include "nnops/ops/conv2d.hpp"
-#include "backend/cpu/conv2d_winograd.h"
+#include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"

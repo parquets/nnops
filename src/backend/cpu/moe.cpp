@@ -33,7 +33,7 @@
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
-#include "matmul.h"
+#include "backend/cpu/matmul/matmul.h"
 #include "common/memory_pool.hpp"
 #include "simd_kernel/simd_activation.hpp"
 

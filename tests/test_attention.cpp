@@ -10,8 +10,8 @@
 ///   6. const TensorView ins[] = {q, k, v}; op->compute(output, ins);
 
 #include "nnops/ops/attention.hpp"
-#include "backend/cpu/attention.h"      // get_attention_plan — to pin the f16 fast path
-#include "backend/cpu/matmul_helper.h"  // num_panels / NR / Kc — pack-scratch sizing test
+#include "backend/cpu/attention/attention.h"      // get_attention_plan — to pin the f16 fast path
+#include "backend/cpu/matmul/matmul_helper.h"  // num_panels / NR / Kc — pack-scratch sizing test
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"

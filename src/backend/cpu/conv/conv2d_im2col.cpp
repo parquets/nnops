@@ -16,10 +16,10 @@
 /// epilogue / add_to semantics and the shared plan.
 
 #include "conv2d_im2col.h"
-#include "matmul_helper.h"                 // uniform pack/MMA + arch panel constants
-#include "simd_kernel/simd_epilogue.hpp"   // epilogue_inplace
-#include "simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d / tiled_im2col_3d
-#include "common/memory_pool.hpp"          // internal scratch-memory pool
+#include "backend/cpu/matmul/matmul_helper.h"                 // uniform pack/MMA + arch panel constants
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // epilogue_inplace
+#include "backend/cpu/simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d / tiled_im2col_3d
+#include "backend/cpu/common/memory_pool.hpp"          // internal scratch-memory pool
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"

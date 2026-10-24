@@ -63,12 +63,12 @@
 /// under INT32_MAX until K ≈ 131k — the same bound the int8 MatMul route has.
 
 #include "conv2d_im2col.h"
-#include "matmul_helper.h"                 // int8 pack / MMA, panel strides, arch bias
-#include "simd_kernel/simd_epilogue.hpp"   // dq_epilogue_tile, quant_scale_at
-#include "simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d
-#include "simd_kernel/simd_quant.hpp"      // quant_kernel::quantization (fp → s8/u8)
-#include "simd_kernel/simd_int8_reduce.hpp"// int8_row_sum / int8_col_sum_slab
-#include "common/memory_pool.hpp"          // internal scratch-memory pool
+#include "backend/cpu/matmul/matmul_helper.h"                 // int8 pack / MMA, panel strides, arch bias
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // dq_epilogue_tile, quant_scale_at
+#include "backend/cpu/simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d
+#include "backend/cpu/simd_kernel/simd_quant.hpp"      // quant_kernel::quantization (fp → s8/u8)
+#include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"// int8_row_sum / int8_col_sum_slab
+#include "backend/cpu/common/memory_pool.hpp"          // internal scratch-memory pool
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
 

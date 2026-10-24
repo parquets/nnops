@@ -18,7 +18,7 @@
 #include "common/test_harness.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd.hpp"
-#include "backend/cpu/matmul_helper.h"
+#include "backend/cpu/matmul/matmul_helper.h"
 
 #if defined(NNOPS_ARCH_X86_64)
   #include "backend/cpu/x86_64/pack_f32.hpp"

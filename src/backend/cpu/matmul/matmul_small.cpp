@@ -14,7 +14,7 @@
 /// See matmul_internal.h for the batch walk shared with the driver.
 
 #include "matmul_internal.h"
-#include "simd_kernel/simd_epilogue.hpp"   // apply_epilogue
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // apply_epilogue
 #include "nnops/detail/half.hpp"
 
 #include <algorithm>

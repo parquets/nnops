@@ -45,14 +45,11 @@ set(NNOPS_CPU_SOURCES
 
     # Layout conversion utilities (pack/unpack between NCHW and NCHWC8)
     backend/cpu/layout_convert.cpp
-    backend/cpu/linear_attention.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
     backend/cpu/activation.cpp
-    backend/cpu/causal_attention.cpp
     backend/cpu/clamp.cpp
     backend/cpu/norm.cpp
-    backend/cpu/depthwise_conv.cpp
     backend/cpu/pooling.cpp
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
@@ -73,19 +70,26 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/moe.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA), plus the two routes
-    # that bypass the plan (small naive / GEMV, fused Q5_1)
-    backend/cpu/matmul.cpp
-    backend/cpu/matmul_helper.cpp
-    backend/cpu/matmul_small.cpp
-    backend/cpu/matmul_q5_fused.cpp
+    # that bypass the plan (small naive / GEMV, fused Q5_1). matmul_helper is the
+    # shared pack/MMA layer that conv2d and attention also drive.
+    backend/cpu/matmul/matmul.cpp
+    backend/cpu/matmul/matmul_helper.cpp
+    backend/cpu/matmul/matmul_small.cpp
+    backend/cpu/matmul/matmul_q5_fused.cpp
 
-    # CPU tiled im2col + GEMM Conv2D kernel (planar NCHW)
-    backend/cpu/conv2d_im2col.cpp
-    backend/cpu/conv2d_winograd.cpp
-    backend/cpu/conv2d_im2col_int8.cpp
+    # CPU convolution kernels: im2col + GEMM (planar NCHW), the int8 route, the
+    # Winograd F(2x2,3x3) route, and the depthwise kernel (one file, but it is
+    # the conv family's third shape)
+    backend/cpu/conv/conv2d_im2col.cpp
+    backend/cpu/conv/conv2d_winograd.cpp
+    backend/cpu/conv/conv2d_im2col_int8.cpp
+    backend/cpu/conv/depthwise_conv.cpp
 
-    # CPU tiled attention kernel (fused QK^T + softmax + AV, planar)
-    backend/cpu/attention.cpp
+    # CPU tiled attention kernels (fused QK^T + softmax + AV; causal and linear
+    # attention live alongside it)
+    backend/cpu/attention/attention.cpp
+    backend/cpu/attention/causal_attention.cpp
+    backend/cpu/attention/linear_attention.cpp
 
     # CPU reference kernels (always compiled — correctness baseline)
     backend/cpu/reference/conv2d_ref.cpp

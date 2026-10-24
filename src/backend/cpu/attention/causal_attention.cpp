@@ -5,7 +5,7 @@
 /// provides dtype dispatch. SIMD fast-paths will be added incrementally.
 
 #include "nnops/ops/causal_attention.hpp"
-#include "common/memory_pool.hpp"           // internal scratch-memory pool
+#include "backend/cpu/common/memory_pool.hpp"           // internal scratch-memory pool
 
 namespace nnops::backend::cpu {
 

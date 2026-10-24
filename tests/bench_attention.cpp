@@ -9,7 +9,7 @@
 /// The report shows which route fired and the resolved tile sizes.
 
 #include "nnops/ops/attention.hpp"
-#include "backend/cpu/attention.h"        // get_attention_plan, AttentionPlan
+#include "backend/cpu/attention/attention.h"        // get_attention_plan, AttentionPlan
 #include "common/bench_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"

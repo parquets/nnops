@@ -1,14 +1,14 @@
 # How to Optimize GEMM — Design Notes for the Tiled MatMul Backend
 
 A record of the optimization decisions, constraints, and trade-offs that shaped the
-tiled GEMM implementation in [src/backend/cpu/matmul.cpp](../src/backend/cpu/matmul.cpp)
-and the shared pack/MMA helpers in [src/backend/cpu/matmul_helper.h](../src/backend/cpu/matmul_helper.h).
+tiled GEMM implementation in [src/backend/cpu/matmul/matmul.cpp](../src/backend/cpu/matmul/matmul.cpp)
+and the shared pack/MMA helpers in [src/backend/cpu/matmul/matmul_helper.h](../src/backend/cpu/matmul/matmul_helper.h).
 The two routes that bypass the plan — the small-GEMM / GEMV paths (rules 3 and 4
 below) and the fused Q5_1 decode — are self-contained and live beside it in
-[matmul_small.cpp](../src/backend/cpu/matmul_small.cpp) and
-[matmul_q5_fused.cpp](../src/backend/cpu/matmul_q5_fused.cpp); what they share with
+[matmul_small.cpp](../src/backend/cpu/matmul/matmul_small.cpp) and
+[matmul_q5_fused.cpp](../src/backend/cpu/matmul/matmul_q5_fused.cpp); what they share with
 the driver (dims, batch walk, epilogue predicates) is in
-[matmul_internal.h](../src/backend/cpu/matmul_internal.h).
+[matmul_internal.h](../src/backend/cpu/matmul/matmul_internal.h).
 
 ---
 
@@ -119,7 +119,7 @@ Following TensorRT's `IPluginV2DynamicExt::getWorkspaceSize`:
 ### 2.1 One rule for Mc, Nc and Kc
 
 `choose_matmul_tile` in
-[matmul_helper.h](../src/backend/cpu/matmul_helper.h) picks all three together:
+[matmul_helper.h](../src/backend/cpu/matmul/matmul_helper.h) picks all three together:
 it maximises the tile's arithmetic intensity
 
 ```text
@@ -356,7 +356,7 @@ provisioning only costs reuse; it never over-subscribes the scratch.
 
 Any Mc/Nc is decomposed into panels by three consecutive largest-first loops,
 each step selecting the matching kernel from a dispatch table. In
-[matmul_helper.cpp](../src/backend/cpu/matmul_helper.cpp) this is written out
+[matmul_helper.cpp](../src/backend/cpu/matmul/matmul_helper.cpp) this is written out
 rather than driven by an index (f32 RHS shown; LHS and f16/f8 are identical with
 their own tables):
 
@@ -629,7 +629,7 @@ multi-threaded measurement shows.
 The same W8A8 shape one level up: the weight is A (M = OC/G, K = IC/G·karea,
 s8 with per-output-channel parameters) and the im2col tile is B (N =
 oh_block·OW, same K, s8/u8 per-tensor). `conv2d_im2col_kernel` forwards to
-`conv2d_int8_kernel` ([conv2d_im2col_int8.cpp](../src/backend/cpu/conv2d_im2col_int8.cpp))
+`conv2d_int8_kernel` ([conv2d_im2col_int8.cpp](../src/backend/cpu/conv/conv2d_im2col_int8.cpp))
 whenever `is_quantized_conv2d(w)`, so the operator, the plan, the
 (batch, group, oh-chunk) decomposition and the scratch slots are unchanged; the
 plan only grows an int32 accumulator (`acc_size`) and a packed-weight region

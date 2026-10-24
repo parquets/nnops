@@ -13,7 +13,7 @@
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q5_1.hpp"         // q5_1_block, float_to_half, half_to_bits
-#include "backend/cpu/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
+#include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
 #include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
 #include "common/test_helpers.hpp"

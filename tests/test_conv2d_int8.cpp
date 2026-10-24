@@ -13,7 +13,7 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
-#include "backend/cpu/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
+#include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"

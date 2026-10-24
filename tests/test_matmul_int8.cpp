@@ -6,7 +6,7 @@
 /// compensation and requantization formulas.
 
 #include "nnops/ops/matmul.hpp"
-#include "backend/cpu/matmul_helper.h"   // get_matmul_plan — the int8 path is plan-driven
+#include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — the int8 path is plan-driven
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"

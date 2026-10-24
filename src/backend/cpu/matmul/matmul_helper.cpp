@@ -6,7 +6,7 @@
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/q5_1.hpp"
 #include "nnops/detail/simd.hpp"
-#include "simd_kernel/simd_quant.hpp"
+#include "backend/cpu/simd_kernel/simd_quant.hpp"
 
 #ifdef NNOPS_ARCH_X86_64
 using namespace nnops::backend::cpu::x86_64;

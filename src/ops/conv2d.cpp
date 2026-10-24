@@ -4,8 +4,8 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
-#include "backend/cpu/conv2d_im2col.h"
-#include "backend/cpu/conv2d_winograd.h"
+#include "backend/cpu/conv/conv2d_im2col.h"
+#include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
 
 namespace nnops {

@@ -17,10 +17,10 @@
 #include "matmul.h"
 #include "matmul_internal.h"      // dims / batch walk shared with the small routes
 #include "matmul_helper.h"
-#include "simd_kernel/simd_epilogue.hpp"
-#include "simd_kernel/simd_int8_reduce.hpp"
-#include "simd_kernel/simd_quant.hpp"
-#include "common/memory_pool.hpp"           // internal scratch-memory pool
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"
+#include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"
+#include "backend/cpu/simd_kernel/simd_quant.hpp"
+#include "backend/cpu/common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"
 

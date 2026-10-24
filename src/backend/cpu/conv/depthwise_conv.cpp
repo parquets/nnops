@@ -13,7 +13,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
-#include "simd_kernel/simd_depthwise_conv.hpp"
+#include "backend/cpu/simd_kernel/simd_depthwise_conv.hpp"
 
 #include <cstdint>
 

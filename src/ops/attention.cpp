@@ -4,7 +4,7 @@
 #include "nnops/ops/attention.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
-#include "backend/cpu/attention.h"
+#include "backend/cpu/attention/attention.h"
 
 namespace nnops {
 

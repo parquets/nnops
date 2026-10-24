@@ -8,7 +8,7 @@
 ///   5. const TensorView ins[] = {a, b}; op->compute(out, ins);
 
 #include "nnops/ops/matmul.hpp"
-#include "backend/cpu/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
+#include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"

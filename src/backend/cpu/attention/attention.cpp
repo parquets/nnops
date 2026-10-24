@@ -18,9 +18,9 @@
 /// and the scratch layout.
 
 #include "attention.h"
-#include "matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs + panel constants
-#include "simd_kernel/simd_softmax.hpp"     // softmax + FlashAttention row kernels
-#include "common/memory_pool.hpp"           // internal scratch-memory pool
+#include "backend/cpu/matmul/matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs + panel constants
+#include "backend/cpu/simd_kernel/simd_softmax.hpp"     // softmax + FlashAttention row kernels
+#include "backend/cpu/common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/detail/assert.hpp"
 
 #include <algorithm>

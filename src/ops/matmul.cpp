@@ -5,7 +5,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
-#include "backend/cpu/matmul.h"
+#include "backend/cpu/matmul/matmul.h"
 
 namespace nnops {
 

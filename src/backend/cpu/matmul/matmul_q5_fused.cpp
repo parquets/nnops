@@ -12,7 +12,7 @@
 /// the product and gets false back when the shape is out of range.
 
 #include "matmul_internal.h"
-#include "simd_kernel/simd_epilogue.hpp"   // tile_scale / epilogue_inplace
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // tile_scale / epilogue_inplace
 
 #include <algorithm>
 

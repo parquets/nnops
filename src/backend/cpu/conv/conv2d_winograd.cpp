@@ -5,9 +5,9 @@
 /// scratch layout and the numeric-ordering rules.
 
 #include "conv2d_winograd.h"
-#include "matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs
-#include "simd_kernel/simd_winograd.hpp"    // BᵀdB / AᵀMA / GgGᵀ transforms
-#include "common/memory_pool.hpp"
+#include "backend/cpu/matmul/matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs
+#include "backend/cpu/simd_kernel/simd_winograd.hpp"    // BᵀdB / AᵀMA / GgGᵀ transforms
+#include "backend/cpu/common/memory_pool.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/assert.hpp"

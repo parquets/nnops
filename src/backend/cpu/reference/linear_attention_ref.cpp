@@ -1,7 +1,8 @@
 /// @file linear_attention_ref.cpp
 /// @brief Scalar reference for the LinearAttention operator.
 ///
-/// Deliberately independent of the SIMD kernel in backend/cpu/linear_attention.cpp
+/// Deliberately independent of the SIMD kernel in
+/// backend/cpu/attention/linear_attention.cpp
 /// — no shared helpers, no shared loop structure — so that agreement between the
 /// two is evidence about the *math*, not about a shared bug. Everything is
 /// computed in f32 with naive triple-nested loops; only the I/O is rounded

@@ -34,7 +34,7 @@
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
-#include "common/memory_pool.hpp"
+#include "backend/cpu/common/memory_pool.hpp"
 
 #include <cmath>
 #include <span>

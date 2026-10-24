@@ -19,8 +19,8 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/ops/layout_convert.hpp"
-#include "backend/cpu/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
-#include "backend/cpu/conv2d_winograd.h" // get_conv2d_winograd_plan
+#include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
+#include "backend/cpu/conv/conv2d_winograd.h" // get_conv2d_winograd_plan
 #include "common/bench_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
