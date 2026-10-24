@@ -633,10 +633,11 @@ struct I8Op {
         out_buf.assign(outs[0].nbytes(), 0);
         out = test::make_planar(outs[0], out_buf.data());
 
-        // Resolved at the largest thread count (the max oh-chunk split), with
-        // per-thread scratch sized in — the bench pool reports thread ids.
+        // Resolved at the thread count the pair runs on, with per-thread scratch
+        // sized in — the bench pool reports thread ids. A single thread runs on
+        // a bare ComputeContext, which reports none, so it is sized per task.
         plan = cpu::get_conv2d_plan(attrs, descs, outs, plan_threads,
-                                    /*use_thread_slots=*/true);
+                                    /*use_thread_slots=*/plan_threads > 1);
         work = 2.0 * static_cast<double>(N) * OC * OH * OW *
                static_cast<double>(icg) * c.KH * c.KW;
     }
@@ -846,12 +847,13 @@ void bench_conv2d_i8_vs_fp(const Conv2DCase& c, int iters, int rounds) {
 //
 // The point cases above each pin one shape, and 3x3 dominates them. The one
 // thing 3x3 cannot show is what the kernel *area* does to the plan:
-// get_ic_block() maps karea -> icn_block (64 at 1x1, 8 through 3x3, 4 through
+// get_ic_block() maps karea -> icn_block (64 at 1x1, 16 through 3x3, 8 through
 // 5x5, 2 through 7x7, 1 past that), and a single GEMM call reduces over
 // icn_block * karea. The ladder holds that K roughly flat as the kernel grows —
-// the K column below reads 64 -> 72 -> 100 -> 98 for 1x1 -> 3x3 -> 5x5 -> 7x7 —
-// so the im2col panel handed to one GEMM stays near 70-100 wide no matter the
-// kernel. The 1x1 rows read 64 only because IC is 64 here; they take the plan's
+// the K column below reads 64 -> 144 -> 200 -> 98 for 1x1 -> 3x3 -> 5x5 -> 7x7 —
+// so the im2col panel handed to one GEMM stays near 144-200 wide through 5x5.
+// The 7x7 rung is left at 98: a 49 -> 4 bump measured -3.8% on a 112 plane.
+// The 1x1 rows read 64 only because IC is 64 here; they take the plan's
 // pointwise route (the pw column), so they never consult get_ic_block() and
 // never build a panel — 64 is the whole channel count, not a cap.
 //
@@ -878,11 +880,12 @@ void bench_conv2d_i8_vs_fp(const Conv2DCase& c, int iters, int rounds) {
 // affected; read the small-shape 20T cells as a lower bound on the kernel.
 
 struct ConvSweepShape {
-    int64_t N, IC, IH, OC, K;    // square input plane, square kernel
+    int64_t N, IC, IH, OC, K;    // square kernel; plane is IH x IW
     int64_t S = 1;               // stride (both axes)
     int64_t groups = 1;
     int64_t pad = -1;            // -1 == "same": ((K-1)*D)/2
     int64_t D = 1;               // dilation (both axes)
+    int64_t IW = 0;              // 0 == square (IW = IH); set for wide frames
 };
 
 std::vector<int> sweep_threads() {
@@ -902,7 +905,8 @@ struct ConvSweepOp {
 
     ConvSweepOp(const ConvSweepShape& s, uint64_t seed, int64_t meta_threads) {
         const int64_t ph = s.pad < 0 ? ((s.K - 1) * s.D) / 2 : s.pad;
-        const int64_t ishape[] = {s.N, s.IC, s.IH, s.IH};
+        const int64_t iw = s.IW > 0 ? s.IW : s.IH;
+        const int64_t ishape[] = {s.N, s.IC, s.IH, iw};
         const int64_t wshape[] = {s.OC, s.IC / s.groups, s.K, s.K};
 
         auto [iv, in] = make_random<T>(ishape, seed);
@@ -959,8 +963,8 @@ struct ConvSweepOp {
 };
 
 void print_conv_sweep_header(const std::vector<int>& threads) {
-    std::printf("   %3s %4s %4s %4s %3s %4s %2s %2s | %4s %4s %4s %5s %5s %3s |",
-                "N", "IC", "IH", "OC", "K", "g", "s", "d",
+    std::printf("   %3s %4s %4s %5s %4s %3s %4s %2s %2s | %4s %4s %4s %5s %5s %3s |",
+                "N", "IC", "IH", "IW", "OC", "K", "g", "s", "d",
                 "icn", "ocn", "ohb", "blks", "tasks", "pw");
     for (int t : threads) {
         const std::string label = std::to_string(t) + "T";
@@ -972,10 +976,12 @@ void print_conv_sweep_header(const std::vector<int>& threads) {
 void print_conv_sweep_row(const ConvSweepShape& s, int64_t icn, int64_t ocn, int64_t ohb,
                           int64_t blks, int64_t tasks, bool pw,
                           const std::vector<double>& g) {
-    std::printf("   %3lld %4lld %4lld %4lld %3lld %4lld %2lld %2lld |"
+    std::printf("   %3lld %4lld %4lld %5lld %4lld %3lld %4lld %2lld %2lld |"
                 " %4lld %4lld %4lld %5lld %5lld %3s |",
                 static_cast<long long>(s.N), static_cast<long long>(s.IC),
-                static_cast<long long>(s.IH), static_cast<long long>(s.OC),
+                static_cast<long long>(s.IH),
+                static_cast<long long>(s.IW > 0 ? s.IW : s.IH),
+                static_cast<long long>(s.OC),
                 static_cast<long long>(s.K), static_cast<long long>(s.groups),
                 static_cast<long long>(s.S), static_cast<long long>(s.D),
                 static_cast<long long>(icn), static_cast<long long>(ocn),
@@ -1076,21 +1082,21 @@ NNOPS_BENCH(conv2d_f16_batch) {
 // Larger kernels — 5x5, 7x7
 // ============================================================
 //
-// karea drives icn_block (8 through 3x3, 4 through 5x5, 2 through 7x7), so
+// karea drives icn_block (16 through 3x3, 8 through 5x5, 2 through 7x7), so
 // everything past 3x3 runs on a narrower im2col panel and a deeper ic-block
 // walk. The 56x56 cases deliberately share the resnet-block shape above them so
 // the rows differ in the kernel and nothing else.
 
 NNOPS_BENCH(conv2d_f32_5x5) {
-    // Same in/out shape as conv2d_f32_resnet_block_3x3 — 25/9 the FLOPs, icn 4.
+    // Same in/out shape as conv2d_f32_resnet_block_3x3 — 25/9 the FLOPs, icn 8.
     bench_conv2d_case({"f32 5x5 1x64x56x56 -> 64 x 5x5 s1 p2", 1, 64, 56, 56, 64, 5, 5,
                        /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2});
 }
 
 NNOPS_BENCH(conv2d_f32_7x7) {
     // 49/9 of the 3x3 at the same shape, and 4x the 5x5 above it. karea 49 puts
-    // icn_block at 2: the same output is produced from a panel half as wide,
-    // rewritten twice as many times.
+    // icn_block at 2: the same output is produced from a panel a quarter as wide
+    // as the 5x5's, rewritten four times as many times.
     bench_conv2d_case({"f32 7x7 1x64x56x56 -> 64 x 7x7 s1 p3", 1, 64, 56, 56, 64, 7, 7,
                        /*SH=*/1, /*SW=*/1, /*PH=*/3, /*PW=*/3});
 }
@@ -1103,7 +1109,7 @@ NNOPS_BENCH(conv2d_f32_5x5_stride2) {
 }
 
 NNOPS_BENCH(conv2d_f32_5x5_dilated2) {
-    // karea stays 25 (icn_block 4) while the gathered window is 9 wide — the
+    // karea stays 25 (icn_block 8) while the gathered window is 9 wide — the
     // contrast case against a real 9x9, which plans icn_block 1.
     bench_conv2d_case({"f32 5x5 d2 1x64x56x56 -> 64 x 5x5 s1 p2 d2", 1, 64, 56, 56, 64, 5, 5,
                        /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2, /*DH=*/2, /*DW=*/2});
@@ -1214,15 +1220,15 @@ NNOPS_BENCH(conv2d_wino_f16_256ch) {
 NNOPS_BENCH(conv2d_f32_kernel_sweep) {
     // One shape (1x64x56x56 -> 64), one padding rule, only the kernel moves.
     // Read icn against K: the plan trades icn_block away roughly in step with
-    // karea, so the K of one GEMM call stays in the 64-100 band while the FLOPs
+    // karea, so the K of one GEMM call stays in the 144-200 band while the FLOPs
     // above it scale with karea^2. The dilated 3x3 is the outlier — karea 9
-    // (icn 8) with a 5-wide gather window, so it plans like a 3x3 and gathers
+    // (icn 16) with a 5-wide gather window, so it plans like a 3x3 and gathers
     // like a 5x5; only the `d` column tells it apart from the row above.
     sweep_conv<float>("f32", {
         {1, 64, 56, 64, 1},                        // pointwise: karea  1, icn 64
-        {1, 64, 56, 64, 3},                        // karea  9, icn 8
+        {1, 64, 56, 64, 3},                        // karea  9, icn 16
         {1, 64, 56, 64, 3, 1, 1, -1, /*D=*/2},     // dilated 3x3: karea 9, window 5
-        {1, 64, 56, 64, 5},                        // karea 25, icn 4
+        {1, 64, 56, 64, 5},                        // karea 25, icn 8
         {1, 64, 56, 64, 7},                        // karea 49, icn 2
     }, sweep_threads(), 80.0);
 }
@@ -1390,6 +1396,46 @@ NNOPS_BENCH(conv2d_f32_vgg16_stack) {
         {1, 512,  14, 512, 3},                                 // block5 (x3)
         {1, 512,  14, 512, 3},
         {1, 512,  14, 512, 3},
+    }, sweep_threads(), 250.0);
+}
+
+// ============================================================
+// Wide frames — ResNet / VGG at 1280 x 720 and 1280 x 960
+// ============================================================
+//
+// Every stack above is a 224-square plane. A frame is not square: at 1280 wide
+// the N side of the GEMM spans many nr_max panels on its own, and an oh-block
+// of 4 rows is a far smaller share of the plane, so the multi-block and
+// multi-chunk walk is much deeper than on any 224 row. These tables are the
+// front stages of each model at that frame size — the layers whose plane is
+// large enough for the width to show. Deeper stages sit at 1/8, 1/16 and 1/32
+// of the frame and are the same shapes the 224 stacks already cover. Input and
+// output tensors here are up to ~236 MB per side (1x64x720x1280 f32), so this
+// is the one table that measures the memory system as much as the kernel.
+
+NNOPS_BENCH(conv2d_f32_720p_stack) {
+    sweep_conv<float>("f32 1280x720", {
+        // ResNet50 front: the stem drops to 360x640, conv2_x runs at 180x320.
+        {1,   3, 720,  64, 7, /*S=*/2, 1, -1, 1, 1280},   // conv1 7x7 s2
+        {1,  64, 180,  64, 3, 1, 1, -1, 1, 320},           // conv2_x 3x3
+        {1,  64, 180, 256, 1, 1, 1,  0, 1, 320},           // conv2_x 1x1 expand
+        // VGG16 front: block1 is full resolution, block2 half of it.
+        {1,   3, 720,  64, 3, 1, 1, -1, 1, 1280},          // block1 a
+        {1,  64, 720,  64, 3, 1, 1, -1, 1, 1280},          // block1 b
+        {1,  64, 360, 128, 3, 1, 1, -1, 1, 640},           // block2 a
+        {1, 128, 360, 128, 3, 1, 1, -1, 1, 640},           // block2 b
+    }, sweep_threads(), 250.0);
+}
+
+NNOPS_BENCH(conv2d_f32_960p_stack) {
+    sweep_conv<float>("f32 1280x960", {
+        {1,   3, 960,  64, 7, /*S=*/2, 1, -1, 1, 1280},   // conv1 7x7 s2
+        {1,  64, 240,  64, 3, 1, 1, -1, 1, 320},           // conv2_x 3x3
+        {1,  64, 240, 256, 1, 1, 1,  0, 1, 320},           // conv2_x 1x1 expand
+        {1,   3, 960,  64, 3, 1, 1, -1, 1, 1280},          // block1 a
+        {1,  64, 960,  64, 3, 1, 1, -1, 1, 1280},          // block1 b
+        {1,  64, 480, 128, 3, 1, 1, -1, 1, 640},           // block2 a
+        {1, 128, 480, 128, 3, 1, 1, -1, 1, 640},           // block2 b
     }, sweep_threads(), 250.0);
 }
 
@@ -1586,7 +1632,7 @@ NNOPS_BENCH(conv2d_i8_vs_fp_sweep) {
 
 NNOPS_BENCH(conv2d_i8_fpact_vs_fp_sweep) {
     // In-kernel quantization, priced against fp32: the same fp32 activation goes
-    // through the int8 route, which quantizes each im2col tile as it is gathered.
+    // through the int8 route, which quantizes it into a byte plane up front.
     // The fp32 column is the alternative, so `f32act/fp32` is the answer to "I
     // cannot pre-quantize my tensors — is this route still worth it". The `u8`
     // column is what pre-quantizing would add on top; `f32/u8` is therefore the
@@ -1602,9 +1648,9 @@ NNOPS_BENCH(conv2d_i8_fpact_vs_fp_sweep) {
     for (int nt : threads) {
         std::printf("\n  %d thread%s — fp32 route vs the int8 route with an f32 activation,"
                     " and with a pre-quantized u8 one\n", nt, nt == 1 ? "" : "s");
-        std::printf("    %-31s %7s %8s | %8s %8s | %s | %7s %8s | %s\n",
+        std::printf("    %-31s %7s %8s | %8s %8s | %s | %7s %8s | %s | %s %s\n",
                     "case", "fp32 ms", "GFLOPS", "f32act ms", "GOPS",
-                    "f32act/fp32", "u8 ms", "GOPS", "f32act/u8");
+                    "f32act/fp32", "u8 ms", "GOPS", "f32act/u8", "plane KB", "arena KB");
         double tot_a = 0.0, tot_b = 0.0, tot_u = 0.0;
         for (const auto& c : shapes) {
             I8Op u8op(as_i8(c, DataType::u8), nt);
@@ -1623,13 +1669,16 @@ NNOPS_BENCH(conv2d_i8_fpact_vs_fp_sweep) {
             tot_b += rf.b_ms;
             tot_u += ru.a_ms;
             const bool real = std::abs(rf.a_ms - rf.b_ms) / rf.a_ms * 100.0 > rf.null_pct;
-            std::printf("    %-31s %7.3f %8.1f | %8.3f %8.1f | %9.2fx | %7.3f %8.1f | %8.2fx%s\n",
+            std::printf("    %-31s %7.3f %8.1f | %8.3f %8.1f | %9.2fx | %7.3f %8.1f | %8.2fx%s"
+                        " | %6lld %7lld\n",
                         c.name, rf.a_ms, fp.work / rf.a_ms / 1e6,
                         rf.b_ms, fop.work / rf.b_ms / 1e6, rf.b_ms / rf.a_ms,
                         ru.a_ms, u8op.work / ru.a_ms / 1e6, ru.b_ms / ru.a_ms,
-                        real ? "" : " (noise)");
+                        real ? "" : " (noise)",
+                        (long long)(fop.plan.quant_size / 1024),
+                        (long long)(fop.plan.workspace_size / 1024));
         }
-        std::printf("    %-31s %7.3f %8s | %8.3f %8s | %9.2fx | %7.3f %8s | %8.2fx\n",
+        std::printf("    %-31s %7.3f %8s | %8.3f %8s | %9.2fx | %7.3f %8s | %8.2fx |\n",
                     "sum of the layers", tot_a, "", tot_b, "", tot_b / tot_a,
                     tot_u, "", tot_b / tot_u);
     }

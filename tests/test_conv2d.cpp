@@ -467,7 +467,7 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
         {{1, 3, 18, 18}, {6, 3, 3, 3},    3, 3, 1, 1, 1, 1, 2, 2, 1, false},
 
         // ---- kernel area past 3x3 ------------------------------------------
-        // get_ic_block() picks icn_block from karea alone: 8 through 3x3, 4
+        // get_ic_block() picks icn_block from karea alone: 16 through 3x3, 8
         // through 5x5, 2 through 7x7, 1 past that. Every case above sits on the
         // top rung, so nothing here exercised the ic-block ladder, the narrow
         // im2col panel it produces, or the deeper ic_per_group / icn_block walk
@@ -693,14 +693,14 @@ NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
     // copy the tile back over itself. The no-bias form additionally takes the
     // zero_mode seeding path, so the accumulator must come out of the
     // micro-kernel as bias-free Σ + residual rather than being pre-filled.
-    // Geometry: IC 16 over icn_block 8 → two icn blocks (only the first is
+    // Geometry: IC 32 over icn_block 16 → two icn blocks (only the first is
     // unseeded), OC 40 under ocn_block 128 with a 4-row MR tail, and an 18x18
     // plane split into 4-row blocks → N 72 then a 36 tail under nr 16.
     const int64_t oshape[] = {1, 40, 18, 18};
 
     for (bool with_bias : {true, false}) {
-        const int64_t ishape[] = {1, 16, 18, 18};
-        const int64_t wshape[] = {40, 16, 3, 3};
+        const int64_t ishape[] = {1, 32, 18, 18};
+        const int64_t wshape[] = {40, 32, 3, 3};
         const int64_t bshape[] = {40};
 
         auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 101);
@@ -917,12 +917,12 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
 // ============================================================
 
 NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
-    // get_ic_block() picks icn_block from karea alone — 64 at 1x1, 8 through
-    // 3x3, 4 through 5x5, 2 through 7x7, and 1 past that. One GEMM call reduces
+    // get_ic_block() picks icn_block from karea alone — 64 at 1x1, 16 through
+    // 3x3, 8 through 5x5, 2 through 7x7, and 1 past that. One GEMM call reduces
     // over icn_block * karea, so the ladder exists to hold that K roughly flat
-    // as the kernel area grows: the im2col panel is written karea times per
-    // input channel either way, and a constant K is what keeps the weight
-    // panel's re-read cost per output proportional rather than exploding.
+    // (in the 144-200 range) as the kernel area grows: a short K makes every
+    // ic-block re-read and rewrite the whole output tile and restart the
+    // packer, while a long one only costs col buffer.
     //
     // The correctness tables above now run every rung, but they only observe the
     // result. Pin the ladder itself, so retuning the thresholds is a visible,
@@ -934,10 +934,10 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
         // 1x1 kernel takes the plan's pointwise path, which bypasses get_ic_block
         // altogether, so this rung needs a strided case to stay on the ladder.
         {1, 1, 64, 2},   // karea  1
-        {1, 5,  8, 1},   // karea  5  — inside the band the 3x3 cases use
-        {3, 3,  8, 1},   // karea  9  — that band's edge
-        {3, 5,  4, 1},   // karea 15  — first rung down
-        {5, 5,  4, 1},   // karea 25  — that band's edge
+        {1, 5, 16, 1},   // karea  5  — inside the band the 3x3 cases use
+        {3, 3, 16, 1},   // karea  9  — that band's edge
+        {3, 5,  8, 1},   // karea 15  — first rung down
+        {5, 5,  8, 1},   // karea 25  — that band's edge
         {5, 7,  2, 1},   // karea 35
         {7, 7,  2, 1},   // karea 49  — that band's edge
         {9, 9,  1, 1},   // karea 81  — past the ladder: a rank-1 panel
@@ -1006,9 +1006,11 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
         // also happens to be the pointwise case, so it pins that the expansion
         // loop still lands on the whole plane when the col buffer is gone.
         {{1, 512, 7, 7}, {2048, 512, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 7, 1, true},
-        // Counter-case: 64 filters <= 3136 positions, so the 14-block split the
-        // halving measurements tuned is left alone.
-        {{1, 64, 56, 56}, {64, 64, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 4, 14, false},
+        // Counter-case: 64 filters <= 3136 positions, so the expansion gate never
+        // fires. The row count still moves off the filter-derived 4, but only to
+        // what the col-budget growth loop allows (28 rows at 16 channels x 9 taps
+        // x 56 columns -> 32 rows of col cap), not to the whole plane.
+        {{1, 64, 56, 56}, {64, 64, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 28, 2, false},
     };
 
     for (const Case& c : cases) {
@@ -1272,5 +1274,217 @@ NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
             }
         }
         NNOPS_EXPECT_TRUE(ok);
+    }
+}
+
+// ============================================================
+// Wide frames — 1280 x 720 / 960 (ResNet / VGG front layers)
+// ============================================================
+
+NNOPS_TEST(conv2d_wide_frame_plan) {
+    // A 1280-wide frame is the first plane in the suite that is not square.
+    // The plan's block heuristics are the same ones the 224 tests pin, but the
+    // width makes every OW-dependent quantity (the col panel, the N side of the
+    // GEMM, the nr panels per row) different from OH, and the row count turns
+    // the oh walk into hundreds of blocks. These are the front layers of
+    // ResNet50 / VGG16 at that frame size: the stem (7x7 s2, icn 2), VGG block1
+    // (3x3 at full resolution, icn 16), and the ResNet 1x1 expand at a quarter
+    // resolution, which takes the pointwise route with no col buffer at all.
+    struct Case {
+        int64_t N, IC, IH, IW, OC, K, S, PH, PW;
+        int64_t want_oh, want_ow, want_icn, want_ocn, want_ohb, want_blocks;
+        bool want_pointwise; int nt;
+    };
+    const Case cases[] = {
+        // ResNet50 conv1 on 720p -> 360x640, 90 four-row blocks.
+        {1,  3, 720, 1280,  64, 7, 2, 3, 3,  360,  640,  2,  64, 4,  90, false, 1},
+        {1,  3, 720, 1280,  64, 7, 2, 3, 3,  360,  640,  2,  64, 4,  90, false, 4},
+        // VGG16 block1 on 720p: the plane is unchanged, 180 blocks deep.
+        {1, 64, 720, 1280,  64, 3, 1, 1, 1,  720, 1280, 16,  64, 4, 180, false, 1},
+        // ... and on 960p, 240 blocks.
+        {1, 64, 960, 1280,  64, 3, 1, 1, 1,  960, 1280, 16,  64, 4, 240, false, 4},
+        // ResNet50 conv2_x expand on 720p: 1x1 p0 at a quarter resolution.
+        {1, 64, 180,  320, 256, 1, 1, 0, 0,  180,  320, 64, 128, 4,  45, true,  4},
+    };
+
+    // Shape inference and the plan read descriptors only, so one placeholder
+    // element stands in for the data pointer: a 960p VGG plane is 314 MB and
+    // nothing here would ever touch it.
+    float placeholder = 0.0f;
+    for (const Case& c : cases) {
+        const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t wshape[] = {c.OC, c.IC, c.K, c.K};
+        TensorView input(ishape, DataType::f32, &placeholder);
+        TensorView weight(wshape, DataType::f32, &placeholder);
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.K, c.K};
+        attrs.stride      = {c.S, c.S};
+        attrs.padding     = {c.PH, c.PW};
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {input.desc(), weight.desc()};
+        const auto out_descs = op->getOutputTensorDesc(descs);
+        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+            attrs, descs, out_descs, c.nt, /*use_thread_slots=*/false);
+
+        NNOPS_EXPECT_EQ(out_descs[0].dims[2], c.want_oh);
+        NNOPS_EXPECT_EQ(out_descs[0].dims[3], c.want_ow);
+        NNOPS_EXPECT_EQ(plan.icn_block, c.want_icn);
+        NNOPS_EXPECT_EQ(plan.ocn_block, c.want_ocn);
+        NNOPS_EXPECT_EQ(plan.oh_block, c.want_ohb);
+        NNOPS_EXPECT_EQ(plan.num_oh_blocks, c.want_blocks);
+        NNOPS_EXPECT_EQ(plan.oh_chunks, std::min<int64_t>(c.nt, c.want_blocks));
+        NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
+        // The col panel is the block the kernel is handed: icn x karea taps x
+        // oh_block rows x the frame's output width.
+        NNOPS_EXPECT_EQ(plan.col_size,
+                        c.want_pointwise
+                            ? int64_t{0}
+                            : plan.icn_block * c.K * c.K * plan.oh_block * c.want_ow);
+    }
+}
+
+NNOPS_TEST(conv2d_wide_frame_matches_ref) {
+    // 1280x720 through a 3x3 layer and a 1x1 pointwise layer — VGG16's first
+    // conv and ResNet50's conv2_x 1x1 at that frame size. The tiled path runs
+    // the full plane (103 oh-blocks, 80 nr panels across a row); the reference
+    // is run on a crop of the top rows and only those rows are compared, since
+    // output row r of a 3x3 reads at most input row r+1 (a 66-row crop is exact
+    // for the first 64) and a full-frame reference is not affordable. The full
+    // output is checked for thread-identity: the chunks own disjoint row
+    // ranges, so 4 threads must reproduce the serial result bit for bit — that
+    // is where a per-chunk row offset or a missed halo would show.
+    const int64_t ishape[] = {1, 3, 720, 1280};
+    const int64_t wshape[] = {8, 3, 3, 3};
+    const int64_t IH = ishape[2], IW = ishape[3];
+
+    auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 881);
+    auto [w_vec, weight] = test::make_random_tensor(wshape, -1.0f, 1.0f, 882);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.padding     = {1, 1};
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc()};
+    std::vector<TensorView> ins   = {input, weight};
+    auto op = Conv2D::create(attrs, Backend::CPU);
+    auto out_descs = op->getOutputTensorDesc(descs);
+    const int64_t OH = out_descs[0].dims[2], OW = out_descs[0].dims[3];
+    const int64_t out_numel = out_descs[0].numel();
+
+    // The wide walk must actually be the one under test. With IC 3 the single
+    // ic-block is 3x9x1280 = 34560 col elements per row, so the 256K-element
+    // col budget still allows 7 rows and the growth loop takes them (the same
+    // plane at IC 64 is pinned to 4 — see conv2d_wide_frame_plan). Either way
+    // the plane is walked in a hundred-odd blocks of a few rows.
+    const auto plan = nnops::backend::cpu::get_conv2d_plan(attrs, descs, out_descs, 1, false);
+    NNOPS_EXPECT_EQ(plan.oh_block, int64_t{7});
+    NNOPS_EXPECT_EQ(plan.num_oh_blocks, int64_t{103});
+
+    std::vector<float> serial_buf(static_cast<size_t>(out_numel));
+    auto serial_out = test::make_planar(out_descs[0], serial_buf.data());
+    op->compute(serial_out, ins, {}, nullptr);
+
+    SimplePool pool(4);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    std::vector<float> threaded_buf(static_cast<size_t>(out_numel));
+    auto threaded_out = test::make_planar(out_descs[0], threaded_buf.data());
+    op->compute(threaded_out, ins, ctx, nullptr);
+    int64_t mismatches = 0;
+    for (int64_t i = 0; i < out_numel; ++i) {
+        if (serial_buf[static_cast<size_t>(i)] != threaded_buf[static_cast<size_t>(i)]) {
+            ++mismatches;
+        }
+    }
+    NNOPS_EXPECT_EQ(mismatches, int64_t{0});
+
+    const int64_t OC = wshape[0];
+    const int64_t crop_rows = 66, check_rows = 64;
+    const int64_t cshape[] = {1, ishape[1], crop_rows, IW};
+    std::vector<float> crop_buf(static_cast<size_t>(ishape[1] * crop_rows * IW));
+    for (int64_t c = 0; c < ishape[1]; ++c) {
+        std::memcpy(crop_buf.data() + static_cast<size_t>(c * crop_rows * IW),
+                    in_vec.data() + static_cast<size_t>(c * IH * IW),
+                    sizeof(float) * static_cast<size_t>(crop_rows * IW));
+    }
+    TensorView crop(cshape, DataType::f32, crop_buf.data());
+    const int64_t rshape[] = {1, OC, crop_rows, IW};
+    std::vector<float> ref_buf(static_cast<size_t>(OC * crop_rows * IW));
+    TensorView ref_out(rshape, DataType::f32, ref_buf.data());
+    const std::vector<TensorView> crop_ins = {crop, weight};
+    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, crop_ins, {}, nullptr);
+
+    float worst = 0.0f;
+    for (int64_t oc = 0; oc < OC; ++oc) {
+        for (int64_t r = 0; r < check_rows; ++r) {
+            const float* a = serial_buf.data() + static_cast<size_t>((oc * OH + r) * OW);
+            const float* b = ref_buf.data() + static_cast<size_t>((oc * crop_rows + r) * IW);
+            for (int64_t w = 0; w < OW; ++w) {
+                worst = std::max(worst, std::abs(a[w] - b[w]));
+            }
+        }
+    }
+    std::printf("      wide frame 3x3 (1280x720): max deviation %.6f\n", worst);
+    NNOPS_EXPECT_NEAR(worst, 0.0f, 1e-4f);
+
+    // 1x1 pointwise on a 1280-wide plane: B comes straight off the input with
+    // no col buffer, so the per-chunk row base is the only thing locating B.
+    // There is no halo, so a 32-row crop is exact.
+    {
+        const int64_t pshape[] = {1, 8, 180, 1280};
+        const int64_t pwshape[] = {16, 8, 1, 1};
+        auto [p_in_vec, p_in] = test::make_random_tensor(pshape, -1.0f, 1.0f, 883);
+        auto [p_w_vec, p_w]   = test::make_random_tensor(pwshape, -1.0f, 1.0f, 884);
+
+        Conv2DAttributes pattrs;
+        pattrs.kernel_size = {1, 1};
+        std::vector<TensorDesc> pdescs = {p_in.desc(), p_w.desc()};
+        std::vector<TensorView> pins   = {p_in, p_w};
+        auto pop = Conv2D::create(pattrs, Backend::CPU);
+        auto pouts = pop->getOutputTensorDesc(pdescs);
+        NNOPS_EXPECT_TRUE(nnops::backend::cpu::get_conv2d_plan(
+            pattrs, pdescs, pouts, 4, /*use_thread_slots=*/false).pointwise);
+
+        const int64_t pn = pouts[0].numel();
+        const int64_t POW = pouts[0].dims[3];
+        std::vector<float> p_buf(static_cast<size_t>(pn));
+        auto p_out = test::make_planar(pouts[0], p_buf.data());
+        pop->compute(p_out, pins, {}, nullptr);
+
+        std::vector<float> p_threaded(static_cast<size_t>(pn));
+        auto p_tout = test::make_planar(pouts[0], p_threaded.data());
+        pop->compute(p_tout, pins, ctx, nullptr);
+        NNOPS_EXPECT_TRUE(p_buf == p_threaded);
+
+        const int64_t p_crop = 32;
+        const int64_t pc_shape[] = {1, 8, p_crop, 1280};
+        std::vector<float> pc_buf(static_cast<size_t>(8 * p_crop * 1280));
+        for (int64_t c = 0; c < 8; ++c) {
+            std::memcpy(pc_buf.data() + static_cast<size_t>(c * p_crop * 1280),
+                        p_in_vec.data() + static_cast<size_t>(c * 180 * 1280),
+                        sizeof(float) * static_cast<size_t>(p_crop * 1280));
+        }
+        TensorView p_crop_in(pc_shape, DataType::f32, pc_buf.data());
+        const int64_t pr_shape[] = {1, 16, p_crop, 1280};
+        std::vector<float> pr_buf(static_cast<size_t>(16 * p_crop * 1280));
+        TensorView p_ref(pr_shape, DataType::f32, pr_buf.data());
+        const std::vector<TensorView> pc_ins = {p_crop_in, p_w};
+        nnops::backend::cpu::reference::conv2d_ref(pattrs, p_ref, pc_ins, {}, nullptr);
+
+        float p_worst = 0.0f;
+        for (int64_t oc = 0; oc < 16; ++oc) {
+            for (int64_t r = 0; r < p_crop; ++r) {
+                const float* a = p_buf.data() + static_cast<size_t>((oc * 180 + r) * POW);
+                const float* b = pr_buf.data() + static_cast<size_t>((oc * p_crop + r) * 1280);
+                for (int64_t w = 0; w < POW; ++w) {
+                    p_worst = std::max(p_worst, std::abs(a[w] - b[w]));
+                }
+            }
+        }
+        std::printf("      wide frame 1x1 (1280x180): max deviation %.6f\n", p_worst);
+        NNOPS_EXPECT_NEAR(p_worst, 0.0f, 1e-4f);
     }
 }

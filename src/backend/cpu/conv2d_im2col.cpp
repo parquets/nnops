@@ -46,12 +46,20 @@ namespace k = nnops::kernel;  // pure SIMD kernels: tiled_im2col_2d / tiled_im2c
 
 // ---- block-size heuristics (ported from nn_compute) ----------------------
 
-/// Input-channel block size from the kernel area. Larger kernels reuse fewer
-/// input channels per im2col buffer to bound the scratch footprint.
+/// Input-channel block size from the kernel area, sized so one GEMM call sees
+/// kdim = ic_block * karea of roughly 144-200 whatever the kernel size.
+///
+/// The kdim this produces is the block's real cost knob, not its budget: every
+/// ic-block re-reads and re-writes the whole output tile (the accumulator *is*
+/// the output), so a short K pays that pass too often, and the pack/gather
+/// restart per block. On a 3x3 the 8 rung gave kdim 72 and a 16 rung (kdim 144)
+/// measured -2.5..-4.4% interleaved at one thread; the 5x5 and larger rungs move
+/// much less (-0.5%) because their kdim was already in range. Above that the
+/// col buffer it multiplies starts to cost more than the passes it saves.
 inline int get_ic_block(int karea) noexcept {
     if (karea == 1)  { return 64; }
-    if (karea <= 9)  { return 8;  }
-    if (karea <= 25) { return 4;  }
+    if (karea <= 9)  { return 16; }
+    if (karea <= 25) { return 8;  }
     if (karea <= 49) { return 2;  }
     return 1;
 }
@@ -482,6 +490,58 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
             const int64_t grown_blocks = (OH + grown - 1) / grown;
             if (2 * NG * grown_blocks < nt) { break; }  // pool still needs the split
             plan.oh_block = grown;
+        }
+    }
+
+    // Grow the oh-block back while every worker still gets a whole block of its
+    // own. The initial block is align(PH+1, 4) — a row count tied to the filter,
+    // not to the plane — so a 28-row plane runs 4-row blocks that each restart
+    // the gather, the packer and their own C read-modify-write pass. Covering
+    // more rows per block measures +10..15% at one thread on the 28-plane rows
+    // and within +-2% at 112 (a wash: the col scratch it multiplies has caught
+    // up by then), so the 28-56 row planes are what this is for.
+    //
+    // Two constraints keep it from losing at more threads. The block count must
+    // stay a multiple of the chunk count (an uneven split leaves one worker with
+    // two blocks while the rest idle: -12% at 4 threads on a 112 plane), and the
+    // busiest chunk must not end up with more *rows* than the ungrown plan gave
+    // it: a block size that does not divide the plane leaves a short tail, so an
+    // even block count can still be an uneven row count (112 = 11x10 + 2: three
+    // chunks of 30 rows and one of 22, -4.8% at 4 threads on the 112-plane 5x5;
+    // 7 rows divides it into 16 balanced blocks and is accepted instead).
+    // Searching the *block count* rather than doubling the row count is what
+    // reaches 14 rows on a 112 plane: 4 -> 8 -> 16 skips every count that
+    // divides evenly.
+    if (!plan.pointwise) {
+        constexpr int64_t kColCap = int64_t{256} << 10;   // elements per slot
+        const int64_t col_per_row = plan.icn_block * karea * OW;
+        const int64_t cap_rows = (col_per_row > 0) ? kColCap / col_per_row : OH;
+        const int64_t max_rows = std::max<int64_t>(plan.oh_block,
+                                                   std::min<int64_t>(OH, cap_rows));
+        const int64_t chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, OH);
+        // Rows the busiest oh-chunk owns under block size `block` (the kernel's
+        // own b0..b1 split, conv2d_im2col.cpp above).
+        auto busiest_chunk_rows = [&](int64_t block) {
+            const int64_t nblk = (OH + block - 1) / block;
+            const int64_t nc = std::min(chunks, nblk);   // oh_chunks <= num_oh_blocks
+            int64_t worst = 0;
+            for (int64_t c = 0; c < nc; ++c) {
+                const int64_t lo = std::min(OH, c * nblk / nc * block);
+                const int64_t hi = std::min(OH, (c + 1) * nblk / nc * block);
+                worst = std::max(worst, hi - lo);
+            }
+            return worst;
+        };
+        const int64_t base_rows = busiest_chunk_rows(plan.oh_block);
+        for (int64_t blocks = chunks; blocks <= OH; blocks += chunks) {
+            const int64_t grown = (OH + blocks - 1) / blocks;
+            if (grown > max_rows) { continue; }          // over the col budget
+            // ceil(OH/grown) need not hand `blocks` back — only then is the
+            // split actually one block per chunk.
+            if ((OH + grown - 1) / grown != blocks) { continue; }
+            if (busiest_chunk_rows(grown) > base_rows) { continue; }  // long tail
+            if (grown > plan.oh_block) { plan.oh_block = grown; }
+            break;
         }
     }
 
