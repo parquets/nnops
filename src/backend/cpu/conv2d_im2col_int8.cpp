@@ -24,6 +24,18 @@
 /// does not, and only a materialized plane lets a 1x1 convolution take the
 /// pointwise route (bench_conv2d conv2d_i8_fpact_vs_fp_sweep has both).
 ///
+/// The pass is one linear read+write, ~10 us per 200k elements here. Planes up
+/// to 2^19 elements stay on the calling thread, because a second `ctx.cpu.run`
+/// costs ~100 us at 4 threads with a pool that re-spawns its workers per run;
+/// larger ones split over the pool, where the pass is the bigger cost.
+///
+/// Quantizing per task instead — each task materializing only the input rows it
+/// reads into its own slot's plane — was measured and rejected. It folds the
+/// conversion into the split that already exists, worth ~3% at 4 threads, but
+/// the halo rows are then converted again at every oh-chunk boundary: on the
+/// single-image shapes that dominate, the slots sum to 1.1-1.4x the scratch of
+/// one shared plane (bench_conv2d conv2d_i8_fpact_vs_fp_sweep prints both).
+///
 /// # The u8 activation
 ///
 /// The kernels multiply signed bytes (VNNI u8×s8 on x86 after the A-side XOR,

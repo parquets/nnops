@@ -890,6 +890,29 @@ NNOPS_TEST(conv2d_i8_plan) {
         NNOPS_EXPECT_EQ(p.quant_size, 1 * 32 * 5 * 5);
     }
 
+    // One fp plane for the whole call, however many slots and tasks there are:
+    // the same tensor batched or threaded costs the same scratch. A per-task
+    // plane would have to duplicate the oh-chunk halos and hold more.
+    Case batched;
+    batched.ishape = {4, 16, 20, 20};
+    batched.wshape = {32, 16, 3, 3};
+    batched.kh = batched.kw = 3;
+    batched.act = DataType::f32;
+    {
+        Fixture f(batched);
+        std::vector<TensorDesc> ins = f.descs();
+        auto op = Conv2D::create(f.attrs, Backend::CPU);
+        auto outs = op->getOutputTensorDesc(ins);
+        const TensorDesc o[] = {outs[0]};
+        const int64_t whole = 4 * 16 * 20 * 20;
+        for (bool slots : {false, true}) {
+            for (int nt : {1, 4}) {
+                const auto p = backend::cpu::get_conv2d_plan(f.attrs, ins, o, nt, slots);
+                NNOPS_EXPECT_EQ(p.quant_size, whole);
+            }
+        }
+    }
+
     // add_to is reference-only: a zeroed plan.
     Case at;
     at.ishape = {1, 4, 7, 7};

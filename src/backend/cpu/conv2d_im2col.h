@@ -35,7 +35,8 @@
 ///
 /// Scratch layout (pooled internally; one slot per worker thread when thread
 /// ids are reported, else one slot per task, reused across the task's oh-blocks):
-///   [quant    : N*IC*IH*IW bytes — the fp activation quantized once, shared]
+///   [quant    : N·IC·IH·IW bytes — the fp activation, quantized once per
+///               call and shared by every task]
 ///   [col_data : icn_block*karea*oh_block*out_w]
 ///   [orig     : ocn_block*oh_block*out_w   (add_to only)]
 ///   [pack_b   : ceil(oh_block*out_w/nr_max) * ldd_b]
@@ -48,10 +49,13 @@
 /// from the input. orig preserves the output tile for the exact add_to
 /// semantics. pack_b holds B in the uniform nr_max-wide panel layout the
 /// unified MMA kernels consume (matmul_helper.h); it is rebuilt per ic-block.
-/// The quant plane is written once per call (not per slot) and then read as if
-/// the activation had arrived quantized — that is what lets an fp activation
-/// take the pointwise route and stops the gather from re-quantizing per
-/// oc-block.
+/// The quant plane is written once per call (on the calling thread, before the
+/// task loop) and then read as if the activation had arrived quantized — that is
+/// what lets an fp activation take the pointwise route and stops the gather from
+/// re-quantizing per oc-block. It is one plane for the whole call, not one per
+/// task: a per-task plane would have to duplicate the halo rows at every
+/// oh-chunk boundary and so holds more, not less, scratch on the single-image
+/// shapes that dominate (bench_conv2d conv2d_i8_fpact_vs_fp_sweep prints it).
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -80,10 +84,10 @@ struct Conv2DPlan {
     int64_t acc_size     = 0;      ///< int32 accumulator elements per slot
                                    ///< (ocn_block·oh_block·OW)
     int64_t pack_a_size  = 0;      ///< packed-weight bytes per slot
-    int64_t quant_size   = 0;      ///< bytes of the materialized int8 activation
-                                   ///< plane (N·IC·IH·IW); 0 when the activation
-                                   ///< already arrives quantized. Shared, not per
-                                   ///< slot — it sits at the front of the arena.
+    int64_t quant_size   = 0;      ///< bytes of the shared quantized-activation
+                                   ///< plane at the front of the arena
+                                   ///< (N·IC·IH·IW, one byte each). 0 when the
+                                   ///< activation already arrives quantized.
     int64_t acc_offset    = 0;     ///< byte offset of the accumulator region
     int64_t pack_a_offset = 0;     ///< byte offset of the packed-A region
 

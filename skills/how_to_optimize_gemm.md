@@ -658,11 +658,12 @@ Two costs remain, and both are visible only in the multithreaded numbers:
 
 - the plane is a second memory pass (read 4 bytes, write 1, read 1 back). At 1T
   it is ~0.3% of a layer; the GEMM hides it.
-- it is also a second **pool dispatch**. Below 2^19 elements the pass runs
-  inline on the calling thread: on this host one dispatch is ~100 µs at 4
-  threads (the pool re-spawns its workers per run) against ~10 µs of work for a
-  200k-element plane. With the dispatch it cost 1.63x the u8 1x1 at 4T; inline
-  it costs 1.09x.
+- the pass is not free at 4T: planes up to 2^19 elements run on the calling
+  thread, because a second `ctx.cpu.run` on this host is ~100 µs (the pool
+  re-spawns its workers per run) against ~10 µs for a 200k-element pass; only
+  larger planes split over the pool. Measured in `conv2d_i8_fpact_vs_fp_sweep`,
+  `f32act/u8` sums to 1.00x at 1T and 1.04x at 4T (worst layer 1.14x) — every
+  plane the sweep produces is below the split, so those rows are the inline cost.
 
 Conv still differs from MatMul here in *where* the conversion happens: MatMul's
 A is the original tensor, so its pack fuses the quantize
@@ -706,15 +707,16 @@ overheads rise faster than the GEMM shrinks. The A/B rows (`conv2d_i8_vs_fp_ab`,
 above; 1T numbers are stable, multi-threaded ones need their own process.
 
 **In-kernel quantization against fp32** (`conv2d_i8_fpact_vs_fp_sweep`): an fp32
-activation through the int8 route costs **0.35x–0.58x** the fp32 route per layer,
-**0.45x** summed at 1T (2.2x faster) and **0.55x** at 4T (1.8x). Per layer, the
+activation through the int8 route costs **0.34x–0.58x** the fp32 route per layer,
+**0.44x** summed at 1T (2.3x faster) and **0.54x** at 4T (1.8x). Per layer, the
 worst case is the 7x7 stride-2 first layer (0.58x) — its gather is most of the
 work, and the fp32 route's GEMM is small enough that the im2col dominates both.
-Everything the plane pass adds is inside the noise: `f32act/u8` stays at
-0.98–1.05 summed 1.01x at 1T (0.97–1.09, 1.03x at 4T), so an fp activation that
-is quantized on the fly is now the same call as one that arrived quantized.
+Everything the plane pass adds is nearly inside the noise: `f32act/u8` runs
+0.99–1.10 summed 1.00x at 1T (1.00–1.14, 1.04x at 4T), so an fp activation that
+is quantized on the fly is essentially the same call as one that arrived
+quantized.
 
-Getting there took two changes, and the first attempt was the wrong shape:
+Getting there took three attempts, and the first two were the wrong shape:
 
 - quantizing inside the im2col gather, in place of the plane, *repeated* the
   conversion once per oh-block and again per oc-block (`oc_per_group > 128`),
@@ -722,14 +724,22 @@ Getting there took two changes, and the first attempt was the wrong shape:
   0.80x summed at 1T. The `f32/u8` ratio tracked the oc-block count — 1.3x at
   one, 2.3x at two, 3.7x at four — while the pre-quantized route stayed flat,
   because there the repetition is only a byte copy.
-- with the plane, the remaining cost was the dispatch, not the conversion: at 4T
-  a 200k-element plane took 118 µs (a ~10 µs pass plus a ~100 µs pool
-  re-spawn), so fp 1x1 was 1.63x the u8 time. Running planes under 2^19 elements
-  inline on the calling thread brought it to 1.09x, and the summed 4T figure
-  from 0.69x to 0.55x of fp32.
+- with the plane, the remaining 4T cost was the dispatch, not the conversion: a
+  200k-element plane took 118 µs (a ~10 µs pass plus a ~100 µs pool re-spawn),
+  so fp 1x1 was 1.63x the u8 time. Running the pass inline brought it to 1.09x
+  and the summed 4T figure from 0.69x to 0.55x of fp32.
+- quantizing *per task* — each task materializing only the input rows it reads —
+  was the memory question, and it loses: the halo rows at every oh-chunk
+  boundary get converted twice, so with thread slots the scratch is
+  `num_slots × (blocks_max·oh_block + dil_h)` rows against the shared plane's
+  `IH`. On the bench's single-image shapes that is 1.1–1.4x *more* (the `plane
+  KB` column), bought with only 3–4% at 4T and nothing at 1T. It only pays when the
+  pool spreads a call over batches or groups with fewer slots than
+  (batch · group) pairs — not the shapes inference actually runs.
 
 The lesson generalizes: when a conversion pass is cheaper than a dispatch, the
-pass is not the cost — scheduling it is.
+pass is not the cost — scheduling it is. And once the pass is that cheap, the
+smallest buffer wins over the cleverest partition.
 
 ---
 
