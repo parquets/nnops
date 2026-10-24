@@ -1,6 +1,6 @@
 /// @file bench_mma_packed.cpp
-/// @brief Micro-benchmarks for the x86_64 packed-AB / packed-B MMA kernels at
-///        every tile height in the mr menu.
+/// @brief Micro-benchmarks for the x86_64 / aarch64 packed-AB / packed-B MMA
+///        kernels at every tile height in the arch's mr menu.
 ///
 /// Both kernel families take a runtime `mr`, so one 6x16 kernel serves any
 /// partial-M tile by aliasing rows past `mr` onto row mr-1. This harness shows
@@ -33,21 +33,53 @@
 #include <type_traits>
 #include <vector>
 
-#if defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 
+#if defined(NNOPS_ARCH_X86_64)
+  #include "backend/cpu/x86_64/pack_f32.hpp"   // mr_f32 / nr_f32 menus
+  #include "backend/cpu/x86_64/pack_f16.hpp"
   #include "backend/cpu/x86_64/mma_f32.hpp"
   #include "backend/cpu/x86_64/mma_f16.hpp"
+  namespace bench_arch = nnops::backend::cpu::x86_64;
+#else
+  #include "backend/cpu/aarch64/pack_f32.hpp"  // mr_f32 / nr_f32 menus
+  #include "backend/cpu/aarch64/pack_f16.hpp"
+  #include "backend/cpu/aarch64/mma_f32.hpp"
+  #include "backend/cpu/aarch64/mma_f16.hpp"
+  namespace bench_arch = nnops::backend::cpu::aarch64;
+#endif
 
 namespace {
 
-using namespace nnops::backend::cpu::x86_64;
+using namespace bench_arch;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::float_to_half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::mma_pack_align;
 
 constexpr int REPS = 100000;
-constexpr int NR = 16;
+
+/// RHS panel width of the active arch. Both x86 dtypes are 16 wide; aarch64
+/// f32 is 12 wide (aarch64 f16 is 16).
+template <typename T>
+constexpr int nr_of() noexcept {
+    if constexpr (std::is_same_v<T, float>) { return bench_arch::nr_f32[0]; }
+    else { return bench_arch::nr_f16[0]; }
+}
+
+/// Widest and middle tile heights in the arch's mr menu: {6,4,1} on x86,
+/// {8,4,1} on aarch64. The x86 menu also times the extra mr=2 level.
+template <typename T>
+constexpr int mr_head() noexcept {
+    if constexpr (std::is_same_v<T, float>) { return bench_arch::mr_f32[0]; }
+    else { return bench_arch::mr_f16[0]; }
+}
+
+template <typename T>
+constexpr int mr_mid() noexcept {
+    if constexpr (std::is_same_v<T, float>) { return bench_arch::mr_f32[1]; }
+    else { return bench_arch::mr_f16[1]; }
+}
 
 /// Distinct C tiles cycled through so consecutive calls do not serialize
 /// through a store->load on the same accumulator block.
@@ -88,6 +120,7 @@ using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
 
 template <typename T>
 AbKernel<T> ab_fn(int level) {
+#ifdef NNOPS_ARCH_X86_64
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
         case 6: return mma_packed_ab_mr6_nr16_mrxncxkc_f32<false>;
@@ -103,10 +136,26 @@ AbKernel<T> ab_fn(int level) {
         default: return mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
         }
     }
+#else
+    if constexpr (std::is_same_v<T, float>) {
+        switch (level) {
+        case 8: return mma_packed_ab_mr8_nr12_mrxncxkc_f32<false>;
+        case 4: return mma_packed_ab_mr4_nr12_mrxncxkc_f32<false>;
+        default: return mma_packed_ab_mr1_nr12_mrxncxkc_f32<false>;
+        }
+    } else {
+        switch (level) {
+        case 8: return mma_packed_ab_mr8_nr16_mrxncxkc_f16<false>;
+        case 4: return mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
+        default: return mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
+        }
+    }
+#endif
 }
 
 template <typename T>
 BKernel<T> b_fn(int level) {
+#ifdef NNOPS_ARCH_X86_64
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
         case 6: return mma_packed_b_mr6_nr16_mrxncxkc_f32<false>;
@@ -122,6 +171,21 @@ BKernel<T> b_fn(int level) {
         default: return mma_packed_b_mr1_nr16_mrxncxkc_f16<false>;
         }
     }
+#else
+    if constexpr (std::is_same_v<T, float>) {
+        switch (level) {
+        case 8: return mma_packed_b_mr8_nr12_mrxncxkc_f32<false>;
+        case 4: return mma_packed_b_mr4_nr12_mrxncxkc_f32<false>;
+        default: return mma_packed_b_mr1_nr12_mrxncxkc_f32<false>;
+        }
+    } else {
+        switch (level) {
+        case 8: return mma_packed_b_mr8_nr16_mrxncxkc_f16<false>;
+        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f16<false>;
+        default: return mma_packed_b_mr1_nr16_mrxncxkc_f16<false>;
+        }
+    }
+#endif
 }
 
 /// Sum of every kernel result, written through a volatile so the timings
@@ -149,7 +213,8 @@ double time_kernel(Fn&& mma, int mr, int MR, int nc, int ldc, int kc, int reps) 
 
 template <typename T, int MR>
 void bench_ab(const char* dtype, int kc) {
-    const int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(T)) / sizeof(T));
+    constexpr int NR = nr_of<T>();
+    const int ldb = static_cast<int>(mma_pack_align(NR * kc * sizeof(T)) / sizeof(T));
     const uint64_t seed = 0x9E3779B97F4A7C15ull
                         ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&kc));
 
@@ -173,8 +238,9 @@ void bench_ab(const char* dtype, int kc) {
 
 template <typename T, int MR>
 void bench_b(const char* dtype, int kc) {
+    constexpr int NR = nr_of<T>();
     const int lda = kc;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(T)) / sizeof(T));
+    const int ldb = static_cast<int>(mma_pack_align(NR * kc * sizeof(T)) / sizeof(T));
     const uint64_t seed = 0x9E3779B97F4A7C15ull
                         ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&kc));
 
@@ -207,9 +273,9 @@ void bench_b(const char* dtype, int kc) {
 constexpr int NC_LDC = 64;   // C row pitch, wider than any nc in the sweep
 constexpr int NC_KC = 256;
 
-/// Panels the x86_64 packer lays down for `nc` columns: every panel is a full
-/// 16-wide slot, the last one zero-padded past `nc`.
-int panel_slots(int nc) { return (nc + 15) / 16; }
+/// Panels the packer lays down for `nc` columns at width `nr`: every panel is
+/// a full `nr`-wide slot, the last one zero-padded past `nc`.
+int panel_slots(int nc, int nr) { return (nc + nr - 1) / nr; }
 
 /// Same work in every measurement, so a 1-column call is not timed for
 /// nanoseconds. Clamped so the widest tiles still finish quickly.
@@ -231,8 +297,9 @@ void print_nc_rows(const std::vector<NcPoint>& rows) {
 
 template <typename T>
 void bench_nc_ab(const char* dtype) {
-    constexpr int MR = 6;
-    const int ldb = static_cast<int>(mma_pack_align(16 * NC_KC * sizeof(T)) / sizeof(T));
+    constexpr int MR = mr_head<T>();
+    constexpr int NR = nr_of<T>();
+    const int ldb = static_cast<int>(mma_pack_align(NR * NC_KC * sizeof(T)) / sizeof(T));
     std::vector<T> A(static_cast<size_t>(NC_KC) * MR);
     fill_random<T>(A.data(), A.size(), 0xA11CE);
 
@@ -243,7 +310,7 @@ void bench_nc_ab(const char* dtype) {
     std::vector<NcPoint> rows;
     for (int nc : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16,
                    17, 20, 24, 28, 31, 32, 33, 40, 48, 64}) {
-        const int nslots = panel_slots(nc);
+        const int nslots = panel_slots(nc, NR);
         std::vector<T> B(static_cast<size_t>(nslots) * ldb);
         fill_random<T>(B.data(), B.size(), 0xB0B ^ static_cast<uint64_t>(nc));
 
@@ -260,9 +327,10 @@ void bench_nc_ab(const char* dtype) {
 
 template <typename T>
 void bench_nc_b(const char* dtype) {
-    constexpr int MR = 6;
+    constexpr int MR = mr_head<T>();
+    constexpr int NR = nr_of<T>();
     const int lda = NC_KC;
-    const int ldb = static_cast<int>(mma_pack_align(16 * NC_KC * sizeof(T)) / sizeof(T));
+    const int ldb = static_cast<int>(mma_pack_align(NR * NC_KC * sizeof(T)) / sizeof(T));
     std::vector<T> A(static_cast<size_t>(lda) * MR);
     fill_random<T>(A.data(), A.size(), 0xC0FFEE);
 
@@ -273,7 +341,7 @@ void bench_nc_b(const char* dtype) {
     std::vector<NcPoint> rows;
     for (int nc : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16,
                    17, 20, 24, 28, 31, 32, 33, 40, 48, 64}) {
-        const int nslots = panel_slots(nc);
+        const int nslots = panel_slots(nc, NR);
         std::vector<T> B(static_cast<size_t>(nslots) * ldb);
         fill_random<T>(B.data(), B.size(), 0xBEEF ^ static_cast<uint64_t>(nc));
 
@@ -301,7 +369,7 @@ void bench_nc_dtype(const char* dtype) {
 // panel rate at t = 16. Each base is its own reference (t = 0).
 
 template <typename Launch>
-void print_large_nc(const char* name, const char* dtype, Launch&& launch) {
+void print_large_nc(const char* name, const char* dtype, int mr, Launch&& launch) {
     const int bases[] = {128, 256, 512};
     constexpr int NBASE = 3;
     std::vector<double> grid[NBASE];
@@ -309,13 +377,13 @@ void print_large_nc(const char* name, const char* dtype, Launch&& launch) {
     for (int b = 0; b < NBASE; ++b) {
         for (int t = 0; t <= 15; ++t) {
             const int nc = bases[b] + t;
-            const int reps = reps_for(6, nc, NC_KC);
+            const int reps = reps_for(mr, nc, NC_KC);
             grid[b].push_back(launch(nc, reps));
         }
     }
 
-    std::printf("  %s %s  level=6 mr=6 kc=%d  (tail t = nc - base)\n",
-                name, dtype, NC_KC);
+    std::printf("  %s %s  level=%d mr=%d kc=%d  (tail t = nc - base)\n",
+                name, dtype, mr, mr, NC_KC);
     std::printf("      %-6s", "t");
     for (int b = 0; b < NBASE; ++b) { std::printf("   base=%-4d GFLOPS     %%", bases[b]); }
     std::printf("\n");
@@ -331,14 +399,15 @@ void print_large_nc(const char* name, const char* dtype, Launch&& launch) {
 
 template <typename T>
 void bench_large_nc_ab(const char* dtype) {
-    constexpr int MR = 6;
-    const int ldb = static_cast<int>(mma_pack_align(16 * NC_KC * sizeof(T)) / sizeof(T));
+    constexpr int MR = mr_head<T>();
+    constexpr int NR = nr_of<T>();
+    const int ldb = static_cast<int>(mma_pack_align(NR * NC_KC * sizeof(T)) / sizeof(T));
     std::vector<T> A(static_cast<size_t>(NC_KC) * MR);
     fill_random<T>(A.data(), A.size(), 0x1DEA);
     const AbKernel<T> fn = ab_fn<T>(MR);
 
-    print_large_nc("mma_packed_ab", dtype, [&](int nc, int reps) {
-        const int nslots = panel_slots(nc);
+    print_large_nc("mma_packed_ab", dtype, MR, [&](int nc, int reps) {
+        const int nslots = panel_slots(nc, NR);
         std::vector<T> B(static_cast<size_t>(nslots) * ldb);
         fill_random<T>(B.data(), B.size(), 0xDEAD ^ static_cast<uint64_t>(nc));
         return time_kernel<T>(
@@ -351,15 +420,16 @@ void bench_large_nc_ab(const char* dtype) {
 
 template <typename T>
 void bench_large_nc_b(const char* dtype) {
-    constexpr int MR = 6;
+    constexpr int MR = mr_head<T>();
+    constexpr int NR = nr_of<T>();
     const int lda = NC_KC;
-    const int ldb = static_cast<int>(mma_pack_align(16 * NC_KC * sizeof(T)) / sizeof(T));
+    const int ldb = static_cast<int>(mma_pack_align(NR * NC_KC * sizeof(T)) / sizeof(T));
     std::vector<T> A(static_cast<size_t>(lda) * MR);
     fill_random<T>(A.data(), A.size(), 0xBEE5);
     const BKernel<T> fn = b_fn<T>(MR);
 
-    print_large_nc("mma_packed_b", dtype, [&](int nc, int reps) {
-        const int nslots = panel_slots(nc);
+    print_large_nc("mma_packed_b", dtype, MR, [&](int nc, int reps) {
+        const int nslots = panel_slots(nc, NR);
         std::vector<T> B(static_cast<size_t>(nslots) * ldb);
         fill_random<T>(B.data(), B.size(), 0xF00D ^ static_cast<uint64_t>(nc));
         return time_kernel<T>(
@@ -378,13 +448,17 @@ void bench_large_nc_dtype(const char* dtype) {
 
 template <typename T>
 void bench_dtype(const char* dtype, int kc) {
-    bench_ab<T, 6>(dtype, kc);
-    bench_ab<T, 4>(dtype, kc);
-    bench_ab<T, 2>(dtype, kc);
+    bench_ab<T, mr_head<T>()>(dtype, kc);
+    bench_ab<T, mr_mid<T>()>(dtype, kc);
+#ifdef NNOPS_ARCH_X86_64
+    bench_ab<T, 2>(dtype, kc);   // extra level in the x86 menu only
+#endif
     bench_ab<T, 1>(dtype, kc);
-    bench_b<T, 6>(dtype, kc);
-    bench_b<T, 4>(dtype, kc);
+    bench_b<T, mr_head<T>()>(dtype, kc);
+    bench_b<T, mr_mid<T>()>(dtype, kc);
+#ifdef NNOPS_ARCH_X86_64
     bench_b<T, 2>(dtype, kc);
+#endif
     bench_b<T, 1>(dtype, kc);
 }
 
@@ -402,4 +476,4 @@ NNOPS_BENCH(mma_packed_nc_f16) { bench_nc_dtype<half>("f16"); }
 NNOPS_BENCH(mma_packed_tail_f32) { bench_large_nc_dtype<float>("f32"); }
 NNOPS_BENCH(mma_packed_tail_f16) { bench_large_nc_dtype<half>("f16"); }
 
-#endif  // NNOPS_ARCH_X86_64
+#endif  // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64
