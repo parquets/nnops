@@ -118,14 +118,15 @@ struct FpRoute {
         // The packer takes the tile origin in block units, not elements.
         if (b.q51) {
             tile_pack_rhs_q5_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
-                               b.ptr, b.row_blocks);
+                               b.ptr, b.row_blocks, attrs.alpha);
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
         const Elem* src = attrs.transpose_b
             ? base + n_start * b.ldb + k     // N×K: row n, col k
             : base + k * b.ldb + n_start;    // K×N: row k, col n
-        tile_pack_rhs(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, 1.0f);
+        // alpha rides the RHS pack: every k-block scales, so the sum does too.
+        tile_pack_rhs(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, attrs.alpha);
     }
 
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
@@ -146,6 +147,13 @@ struct FpRoute {
     }
     static void scale(Acc* c, int ldc, float beta, int mc, int nc) {
         tile_scale(c, ldc, beta, mc, nc);
+    }
+    /// C = beta·C_old + bias. Folded into the first k-block's tile pass, so the
+    /// bias costs the same one sweep over C that beta already paid and the
+    /// kernels keep accumulating the bare product.
+    static void scale_add_bias(Acc* c, int ldc, float beta, const Elem* bias,
+                               int mc, int nc) {
+        tile_scale_add_bias(c, ldc, beta, bias, mc, nc);
     }
     static void epilogue(const MatMulAttributes& attrs, Acc* c, int ldc, int mc, int nc) {
         epilogue_inplace(mc, nc, c, ldc, static_cast<const Elem*>(nullptr),
@@ -350,15 +358,21 @@ void matmul_tile(const MatMulAttributes& attrs,
                  int k, int actual_kc, bool last_k,
                  bool pack_a, const typename R::Elem* packed_b,
                  typename R::Elem* pack_a_slice, bool a_biased,
-                 const typename R::EpilogueParams* ip)
+                 const typename R::EpilogueParams* ip,
+                 const typename R::Elem* bias)
 {
     using Acc = typename R::Acc;
 
     const int ldd_a = R::ldd_a(actual_kc);
-    const bool zero_mode = (k == 0 && attrs.beta == 0.0f);  // C is overwritten
+    // The first k-block primes C with beta·C_old + bias; every k-block then
+    // only accumulates the product. A bias forces accumulate mode — the
+    // overwriting kernel would drop it — even when beta is 0.
+    const bool prime_c = R::is_fp && k == 0 && bias != nullptr;
+    const bool zero_mode = (k == 0 && attrs.beta == 0.0f && bias == nullptr);
     const auto [cmin, cmax] = R::clamp(attrs, last_k);
     // fp-only; compile out of the int8 instantiation.
-    const bool scale_c  = R::is_fp && k == 0 && attrs.beta != 1.0f && attrs.beta != 0.0f;
+    const bool scale_c  = R::is_fp && k == 0 && bias == nullptr &&
+                          attrs.beta != 1.0f && attrs.beta != 0.0f;
     const bool epilogue = R::is_fp && last_k && has_inplace_epilogue(attrs);
     // int8 does its output pass in the same place fp does: on the tile the
     // last k-block just produced, while it is still in cache.
@@ -373,7 +387,12 @@ void matmul_tile(const MatMulAttributes& attrs,
             : a_ptr + m * lda + k;   // A phys is M×K, row m, col k
 
         if constexpr (R::is_fp) {
-            if (scale_c) { R::scale(c_tile, ldc, attrs.beta, actual_mc, n_count); }
+            if (prime_c) {
+                R::scale_add_bias(c_tile, ldc, attrs.beta, bias + n_start,
+                                  actual_mc, n_count);
+            } else if (scale_c) {
+                R::scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
+            }
         }
         if (pack_a) {
             R::pack_a(attrs.transpose_a, actual_mc, actual_kc,
@@ -408,7 +427,8 @@ void matmul_block(const MatMulAttributes& attrs,
                   typename R::Elem* pack_b_slice,
                   typename R::Elem* pack_a_slice,
                   bool pack_a, bool a_biased,
-                  const typename R::EpilogueParams* ip)
+                  const typename R::EpilogueParams* ip,
+                  const typename R::Elem* bias)
 {
     for (int k = 0; k < K; k += kc) {
         const int actual_kc = std::min(kc, K - k);
@@ -419,7 +439,7 @@ void matmul_block(const MatMulAttributes& attrs,
         matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
                        k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice,
-                       a_biased, ip);
+                       a_biased, ip, bias);
     }
 }
 
@@ -534,6 +554,14 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 
     const bool b_q51 = R::is_fp && (b.data_type() == DataType::q5_1);
+
+    // Optional per-column bias, fp only: the first k-block of every tile primes
+    // C with beta·C_old + bias, so it rides the tile pass instead of a sweep
+    // over the finished output.
+    const typename R::Elem* bias = nullptr;
+    if constexpr (R::is_fp) {
+        if (inputs.size() > 2) { bias = inputs[2].ptr<typename R::Elem>(); }
+    }
 
     if constexpr (R::is_fp) {
         // No scratch to pack into: the reference is the only route left.
@@ -661,6 +689,11 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 ip.compensate = int8_passes;
                 ip.act_u8 = R::a_eff_type(attrs, a) == DataType::u8;
                 ip.ep = &attrs.epilogue;
+                // The dequantize pass is this route's accumulator: the bias
+                // enters there, between the product and the clip.
+                if (inputs.size() > 2) {
+                    ip.col_bias = inputs[2].ptr<typename R::OutElem>();
+                }
             } else {
                 const QuantParams& qc = output.quant_params();
                 ip.out_scale = quant_scale_at(qc, 0);  // requant only
@@ -718,7 +751,7 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null);
+                                ip_or_null, bias);
             });
         } else if constexpr (R::hoists_b_m_split) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
@@ -734,7 +767,7 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                    mr.start, mr.count, mc, 0, Ni,
                                    k, actual_kc, last_k, plan.pack_a, pack_b_base,
                                    pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                   a_biased, ip_or_null);
+                                   a_biased, ip_or_null, bias);
                 });
             }
         } else {
@@ -747,7 +780,7 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null);
+                                ip_or_null, bias);
             });
         }
     }
@@ -851,12 +884,13 @@ void matmul_dq(const MatMulAttributes& attrs, TensorView& output,
     // form.
     const auto [M, N, K] = matmul_dims(attrs, a, b);
     const int32_t a_bias_offset = int8_epilogue_offset(attrs.act_quant_dtype);
+    // The optional bias rides `inputs` through both branches: the fused route
+    // reads A from it, the materialised one only needs its third element.
     if (!plan.split_n && !attrs.transpose_a &&
         !dq_needs_compensation(a, b, a_bias_offset, M, N)) {
-        const TensorView ins[] = {a, b};
         PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
                         + DqRoute<T, T>::extra_workspace(output));
-        matmul_dispatch_tiled<DqRoute<T, T>>(attrs, output, ins, ctx, plan,
+        matmul_dispatch_tiled<DqRoute<T, T>>(attrs, output, inputs, ctx, plan,
                                              scratch.get());
         return;
     }
@@ -866,10 +900,17 @@ void matmul_dq(const MatMulAttributes& attrs, TensorView& output,
                   TensorLayout::NCHW, a.quant_params());
     quantize_activation<T>(a, aq, ctx);
 
-    const TensorView ins[] = {aq, b};
     PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
                     + DqRoute<T>::extra_workspace(output));
-    matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan, scratch.get());
+    if (inputs.size() > 2) {
+        const TensorView ins[] = {aq, b, inputs[2]};
+        matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
+                                          scratch.get());
+    } else {
+        const TensorView ins[] = {aq, b};
+        matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
+                                          scratch.get());
+    }
 }
 
 }  // anonymous namespace
@@ -878,11 +919,17 @@ void matmul_dq(const MatMulAttributes& attrs, TensorView& output,
 //  Public API
 // =========================================================================
 
-void matmul_cpu(const MatMulAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx,
-                   void* /*workspace*/)
+namespace {
+
+/// An optional third input (a per-column bias) rides the routes that write fp
+/// output: the fp kernels seed their accumulator with it, the dequantizing int8
+/// route adds it inside its output pass. The raw integer outputs reject it (see
+/// matmul_cpu).
+void matmul_dispatch_impl(const MatMulAttributes& attrs,
+                          TensorView& output,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx,
+                          void* /*workspace*/)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -1005,6 +1052,36 @@ void matmul_cpu(const MatMulAttributes& attrs,
         matmul_dispatch_tiled<FpRoute<half>>(attrs_n, output, inputs, ctx, plan,
                                              scratch.get());
     }
+}
+
+}  // anonymous namespace
+
+void matmul_cpu(const MatMulAttributes& attrs,
+                TensorView& output,
+                std::span<const TensorView> inputs,
+                const ComputeContext& ctx,
+                void* workspace)
+{
+    NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);
+    if (inputs.size() < 3) {
+        matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
+        return;
+    }
+
+    // An optional [N] bias. Every fp-output route consumes it where its
+    // accumulator is seeded — the fp kernels with beta·C_old + bias before the
+    // first k-block, the dequantizing int8 route between the dequantize and the
+    // clip — so the dispatch always runs with the bias in reach and the normal
+    // last-k clamp and epilogue stay in place. Bias is not scaled by alpha,
+    // which only rides the RHS pack.
+    const TensorView& bias = inputs[2];
+    const DataType odt = output.data_type();
+    NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16,
+                     "MatMul: a bias needs an fp output (s32/s8 carries no bias)");
+    NNOPS_ASSERT(bias.data_type() == odt);
+    NNOPS_ASSERT(bias.numel() >= output.shape(output.rank() - 1));
+
+    matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
 }
 
 }  // namespace nnops::backend::cpu

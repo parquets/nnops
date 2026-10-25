@@ -8,12 +8,14 @@
 ///   5. const TensorView ins[] = {a, b}; op->compute(out, ins);
 
 #include "nnops/ops/matmul.hpp"
+#include "nnops/core/quant_params.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <vector>
 #include <thread>
@@ -21,14 +23,19 @@
 
 using namespace nnops;
 
-// Reference kernel for packed-path comparison (test-local declaration,
-// following the test_concat.cpp pattern).
+// Reference kernels for comparison (test-local declarations, following the
+// test_concat.cpp pattern).
 namespace nnops::backend::cpu::reference {
 void matmul_ref(const MatMulAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
                 void* workspace);
+void matmul_dq_ref(const MatMulAttributes& attrs,
+                   TensorView& output,
+                   std::span<const TensorView> inputs,
+                   const ComputeContext& ctx,
+                   void* workspace);
 }
 
 // f16 GEMM comparison tolerance: the arch-aware shared constant from
@@ -794,6 +801,777 @@ NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     //             8 + 0.5*10 = 13  → relu(13) = 13
     NNOPS_EXPECT_NEAR(c[0], 0.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[1], 13.0f, 1e-6f);
+}
+
+// ============================================================
+// Bias — the optional third input
+//
+// C = epilogue(A×B + bias + beta×C_old), the bias broadcast down the columns.
+// The order matters: it sits between the product and the activation, so Relu
+// must see (product + bias), not product.
+// ============================================================
+
+namespace {
+
+QuantParams bias_per_tensor(float scale, int32_t zp) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerTensor;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+TensorView quant_view(const int64_t* shape, int64_t rank, DataType dt, void* data,
+                      const QuantParams& qp) {
+    return TensorView(std::span<const int64_t>(shape, static_cast<size_t>(rank)),
+                      dt, data, TensorLayout::NCHW, qp);
+}
+
+/// Run a MatMul and matmul_ref over the same f32 operands and require
+/// agreement. @p initial optionally seeds C in both outputs (for beta).
+void expect_matches_ref(const MatMulAttributes& attrs,
+                        const std::vector<TensorView>& ins,
+                        std::span<const float> initial = {},
+                        float tol = 1e-4f)
+{
+    std::vector<TensorDesc> descs;
+    descs.reserve(ins.size());
+    for (const auto& t : ins) { descs.push_back(t.desc()); }
+
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const auto odescs = op->getOutputTensorDesc(descs);
+    const TensorDesc& od = odescs[0];
+    NNOPS_EXPECT_EQ(od.dtype, DataType::f32);
+
+    std::vector<float> got(static_cast<size_t>(od.numel()), 0.0f);
+    std::vector<float> want(got.size(), 0.0f);
+    if (!initial.empty()) {
+        std::copy(initial.begin(), initial.end(), got.begin());
+        std::copy(initial.begin(), initial.end(), want.begin());
+    }
+
+    TensorView og = nnops::test::make_planar(od, got.data());
+    TensorView ow = nnops::test::make_planar(od, want.data());
+
+    op->compute(og, ins);
+    nnops::backend::cpu::reference::matmul_ref(attrs, ow, ins, {}, nullptr);
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got[i], want[i], tol * std::max(1.0f, std::abs(want[i])));
+    }
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(matmul_bias_basic_2d) {
+    // A = [[1,2,3],[4,5,6]], B = [[1,0],[0,1],[1,1]]  →  A×B = [[4,5],[10,11]]
+    // bias = [10,-20] adds down the columns: [[14,-15],[20,-9]].
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 2, 3, 4, 5, 6};
+    float b_data[6] = {1, 0, 0, 1, 1, 1};
+    float bias_data[2] = {10, -20};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs.size(), 1u);
+    NNOPS_EXPECT_EQ(descs[0].rank, int64_t(2));
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 14.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], -15.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 20.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], -9.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_precedes_activation) {
+    // Same product as matmul_epilogue_relu: [[6,-6],[-15,15]].
+    // With bias [-10,10]: relu(6-10)=0, relu(-6+10)=4, relu(-15-10)=0,
+    // relu(15+10)=25. Adding the bias after the Relu instead would give
+    // [[0,10],[0,25]] — the 4 in cell [0,1] pins the order.
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 2, 3, -4, -5, -6};
+    float b_data[6] = {1, -1, 1, -1, 1, -1};
+    float bias_data[2] = {-10, 10};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 0.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 4.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 0.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 25.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_with_beta) {
+    // Small route: A = [[1,-2]], B = [[3,-4],[5,-6]]  →  [[-7,8]].
+    // +bias [1,-1] = [-6,7], +0.5×C_old(10) = [-1,12].
+    const int64_t ashape[] = {1, 2};
+    const int64_t bshape[] = {2, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[2] = {1, -2};
+    float b_data[4] = {3, -4, 5, -6};
+    float bias_data[2] = {1, -1};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.beta = 0.5f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 10.0f);
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], -1.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 12.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_tiled_with_beta) {
+    // A tiled shape, a random bias and beta = 1.5 over a seeded C — the
+    // accumulate-into-C path under a biased call, against matmul_ref.
+    auto [av, a] = test::make_random_tensor({37, 65}, -1.0f, 1.0f, 910);
+    auto [bv, b] = test::make_random_tensor({65, 41}, -1.0f, 1.0f, 911);
+    auto [zbv, bias] = test::make_random_tensor({41}, -0.5f, 0.5f, 912);
+
+    MatMulAttributes attrs{};
+    attrs.beta = 1.5f;
+    std::vector<float> initial(37 * 41, 0.25f);
+    expect_matches_ref(attrs, {a, b, bias}, initial);
+}
+
+NNOPS_TEST(matmul_bias_transpose_b) {
+    // [M,K] × [N,K] (transpose_b) — the Linear weight layout — with a bias
+    // over the N columns.
+    auto [av, a] = test::make_random_tensor({23, 71}, -1.0f, 1.0f, 920);
+    auto [bvt, bt] = test::make_random_tensor({19, 71}, -1.0f, 1.0f, 921);
+    auto [zbv, bias] = test::make_random_tensor({19}, -0.5f, 0.5f, 922);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = true;
+    expect_matches_ref(attrs, {a, bt, bias});
+}
+
+NNOPS_TEST(matmul_bias_batched_broadcast) {
+    // C[2,3,5] from a 3D A and a 2D B: the bias broadcasts over both the batch
+    // and the M axis.
+    {
+        auto [av, a] = test::make_random_tensor({2, 3, 8}, -1.0f, 1.0f, 930);
+        auto [bv, b] = test::make_random_tensor({8, 5}, -1.0f, 1.0f, 931);
+        auto [zbv, bias] = test::make_random_tensor({5}, -0.5f, 0.5f, 932);
+        expect_matches_ref(MatMulAttributes{}, {a, b, bias});
+    }
+    {
+        // Both batched with a broadcast batch dim: [2,1,M,K] × [2,K,N].
+        auto [av, a] = test::make_random_tensor({2, 1, 4, 9}, -1.0f, 1.0f, 933);
+        auto [bv, b] = test::make_random_tensor({2, 9, 7}, -1.0f, 1.0f, 934);
+        auto [zbv, bias] = test::make_random_tensor({7}, -0.5f, 0.5f, 935);
+        expect_matches_ref(MatMulAttributes{}, {a, b, bias});
+    }
+}
+
+NNOPS_TEST(matmul_bias_small_and_gemv_routes) {
+    // M=1 decode (GEMV), a single output column, and a K that is not a
+    // multiple of the pack width.
+    {
+        auto [av, a] = test::make_random_tensor({1, 17}, -1.0f, 1.0f, 940);
+        auto [bv, b] = test::make_random_tensor({17, 13}, -1.0f, 1.0f, 941);
+        auto [zbv, bias] = test::make_random_tensor({13}, -0.5f, 0.5f, 942);
+        expect_matches_ref(MatMulAttributes{}, {a, b, bias});
+    }
+    {
+        auto [av, a] = test::make_random_tensor({3, 23}, -1.0f, 1.0f, 943);
+        auto [bv, b] = test::make_random_tensor({23, 1}, -1.0f, 1.0f, 944);
+        auto [zbv, bias] = test::make_random_tensor({1}, -0.5f, 0.5f, 945);
+        expect_matches_ref(MatMulAttributes{}, {a, b, bias});
+    }
+    {
+        // The streaming GEMV route (M <= 4, above the naive MAC threshold),
+        // with beta and alpha riding the same accumulator prime as the bias.
+        auto [av, a] = test::make_random_tensor({2, 128}, -1.0f, 1.0f, 946);
+        auto [bv, b] = test::make_random_tensor({128, 256}, -1.0f, 1.0f, 947);
+        auto [zbv, bias] = test::make_random_tensor({256}, -0.5f, 0.5f, 948);
+        expect_matches_ref(MatMulAttributes{}, {a, b, bias});
+
+        MatMulAttributes attrs{};
+        attrs.alpha = 1.5f;
+        attrs.beta = 0.5f;
+        const std::vector<float> initial(2 * 256, 0.25f);
+        expect_matches_ref(attrs, {a, b, bias}, initial);
+    }
+}
+
+NNOPS_TEST(matmul_bias_f16) {
+    // f16 operands and an f16 bias, against the f32 reference on the same
+    // values (f16 is computed in f32 on x86 and native f16 on aarch64, so the
+    // comparison uses the shared accumulate tolerance).
+    auto [a32, _] = test::make_random_tensor({12, 40}, -1.0f, 1.0f, 950);
+    auto [b32, __] = test::make_random_tensor({40, 9}, -1.0f, 1.0f, 951);
+    auto [z32, ___] = test::make_random_tensor({9}, -0.5f, 0.5f, 952);
+    auto a_f16 = test::f32_to_f16(a32);
+    auto b_f16 = test::f32_to_f16(b32);
+    auto bias_f16 = test::f32_to_f16(z32);
+
+    const int64_t a_shape[] = {12, 40};
+    const int64_t b_shape[] = {40, 9};
+    const int64_t bias_shape[] = {9};
+    TensorView a(a_shape, DataType::f16, a_f16.data());
+    TensorView b(b_shape, DataType::f16, b_f16.data());
+    TensorView bias(bias_shape, DataType::f16, bias_f16.data());
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(
+        static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    TensorView a32v(a_shape, DataType::f32, a32.data());
+    TensorView b32v(b_shape, DataType::f32, b32.data());
+    TensorView z32v(bias_shape, DataType::f32, z32.data());
+    const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc(), z32v.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
+    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32v, b32v, z32v};
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[i]), ref_buf[i], kF16AccumTol);
+    }
+}
+
+NNOPS_TEST(matmul_bias_int8_dequant) {
+    // s8 × s8 → f32: the bias lands on the dequantized accumulate, before the
+    // activation. C = acc·(0.5·0.25) + bias, then Relu.
+    //   acc = [[1,2],[3,4]]  →  [[0.125,0.25],[0.375,0.5]]
+    //   +bias [1,-1]         →  [[1.125,-0.75],[1.375,-0.5]]
+    //   relu                 →  [[1.125,0],[1.375,0]]
+    const int64_t ashape[] = {2, 2};
+    const int64_t bshape[] = {2, 2};
+    const int64_t bias_shape[] = {2};
+
+    int8_t a_data[4] = {1, 2, 3, 4};
+    int8_t b_data[4] = {1, 0, 0, 1};
+    float bias_data[2] = {1.0f, -1.0f};
+
+    TensorView a = quant_view(ashape, 2, DataType::s8, a_data,
+                              bias_per_tensor(0.5f, 0));
+    TensorView b = quant_view(bshape, 2, DataType::s8, b_data,
+                              bias_per_tensor(0.25f, 0));
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::f32;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+    NNOPS_EXPECT_EQ(descs[0].rank, int64_t(2));
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 1.125f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 0.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 1.375f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 0.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_fp_activation_dq) {
+    // fp A (offline per-token params) × s8 B (per-channel): the dequantizing
+    // route, biased. matmul_dq_ref carries the same bias-then-activation order,
+    // so the two agree to the last bit; the tolerance only absorbs the
+    // multiply order.
+    const int64_t M = 6, K = 32, N = 13;
+    auto [av, a_f32] = test::make_random_tensor({M, K}, -2.0f, 2.0f, 960);
+
+    std::vector<float> a_s(static_cast<size_t>(M));
+    std::vector<int32_t> a_zp(static_cast<size_t>(M));
+    for (int64_t m = 0; m < M; ++m) {
+        a_s[static_cast<size_t>(m)] = 0.02f + 0.005f * static_cast<float>(m);
+        a_zp[static_cast<size_t>(m)] = static_cast<int32_t>(m) - 3;
+    }
+
+    std::vector<int8_t> bv(static_cast<size_t>(K * N));
+    nnops::test::XorShift128 rng(961);
+    for (auto& v : bv) {
+        v = static_cast<int8_t>(static_cast<int32_t>(rng.next_u64() % 255) - 127);
+    }
+    std::vector<float> b_s(static_cast<size_t>(N));
+    std::vector<int32_t> b_zp(static_cast<size_t>(N));
+    for (int64_t n = 0; n < N; ++n) {
+        b_s[static_cast<size_t>(n)] = 0.004f + 0.004f * static_cast<float>(n % 8) / 7.0f;
+        b_zp[static_cast<size_t>(n)] = static_cast<int32_t>(n % 5) - 2;
+    }
+
+    QuantParams qa;
+    qa.granularity = QuantGranularity::PerToken;
+    qa.scale_data = a_s.data();
+    qa.zero_point_data = a_zp.data();
+    qa.num_scales = M;
+
+    QuantParams qb;
+    qb.granularity = QuantGranularity::PerChannel;
+    qb.scale_data = b_s.data();
+    qb.zero_point_data = b_zp.data();
+    qb.num_scales = N;
+
+    const int64_t ashape[] = {M, K};
+    const int64_t bshape[] = {K, N};
+    const int64_t bias_shape[] = {N};
+    TensorView a = quant_view(ashape, 2, DataType::f32, av.data(), qa);
+    TensorView b = quant_view(bshape, 2, DataType::s8, bv.data(), qb);
+    auto [zv, bias] = test::make_random_tensor({N}, -0.5f, 0.5f, 962);
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
+
+    std::vector<float> got(static_cast<size_t>(descs[0].numel()));
+    std::vector<float> want(got.size());
+    auto og = nnops::test::make_planar(descs[0], got.data());
+    auto ow = nnops::test::make_planar(descs[0], want.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(og, ins);
+    nnops::backend::cpu::reference::matmul_dq_ref(attrs, ow, ins, {}, nullptr);
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got[i], want[i], 1e-6f * std::max(1.0f, std::abs(want[i])));
+    }
+}
+
+NNOPS_TEST(matmul_bias_clip_bounds) {
+    // The epilogue's clamp bounds belong to the same slot as the bias:
+    // C = clamp(A×B + bias, -15, 15). Product [[4,5],[10,11]], +[10,-20]
+    // gives [[14,-15],[20,-9]], which the bounds pull to [[14,-15],[15,-9]].
+    // A biased call runs its kernels with a neutral epilogue, so this pins
+    // that the post-pass still applies the caller's bounds.
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 2, 3, 4, 5, 6};
+    float b_data[6] = {1, 0, 0, 1, 1, 1};
+    float bias_data[2] = {10, -20};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.epilogue.min_clip = -15.0f;
+    attrs.epilogue.max_clip = 15.0f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 14.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], -15.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 15.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], -9.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_relu6) {
+    // Bias then Relu6 — both ends of the activation are hit:
+    // [[4,5],[10,11]] + [10,-20] = [[14,-15],[20,-9]] → [[6,0],[6,0]].
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 2, 3, 4, 5, 6};
+    float b_data[6] = {1, 0, 0, 1, 1, 1};
+    float bias_data[2] = {10, -20};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.epilogue.type = EpilogueActivateType::Relu6;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 6.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 0.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 6.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 0.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_transpose_a) {
+    // The same product as matmul_bias_basic_2d with A stored [K, M], which
+    // takes the transposed-A pack. A^T = [[1,2,3],[4,5,6]].
+    const int64_t ashape[] = {3, 2};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 4, 2, 5, 3, 6};
+    float b_data[6] = {1, 0, 0, 1, 1, 1};
+    float bias_data[2] = {10, -20};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_a = true;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
+    NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 14.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], -15.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 20.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], -9.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_bias_int8_dequant_clip) {
+    // The dequantizing int8 route with clip bounds and an activation: the order
+    // is dequantize → bias → clamp → activate, the same expression
+    // matmul_dq_ref evaluates.
+    //   acc = [[1,2],[3,4]] · (0.5·0.25) = [[0.125,0.25],[0.375,0.5]]
+    //   +[1,-1]  = [[1.125,-0.75],[1.375,-0.5]]
+    //   clamp -1..1 → [[1,-0.75],[1,-0.5]] → relu → [[1,0],[1,0]]
+    const int64_t ashape[] = {2, 2};
+    const int64_t bshape[] = {2, 2};
+    const int64_t bias_shape[] = {2};
+
+    int8_t a_data[4] = {1, 2, 3, 4};
+    int8_t b_data[4] = {1, 0, 0, 1};
+    float bias_data[2] = {1.0f, -1.0f};
+
+    TensorView a = quant_view(ashape, 2, DataType::s8, a_data,
+                              bias_per_tensor(0.5f, 0));
+    TensorView b = quant_view(bshape, 2, DataType::s8, b_data,
+                              bias_per_tensor(0.25f, 0));
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::f32;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.epilogue.min_clip = -1.0f;
+    attrs.epilogue.max_clip = 1.0f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> got(static_cast<size_t>(descs[0].numel()));
+    auto og = nnops::test::make_planar(descs[0], got.data());
+
+    // No reference comparison here: matmul_dq_ref only backs the fp-A route,
+    // so for a quantized A the hand-computed values below are the spec.
+    const TensorView ins[] = {a, b, bias};
+    op->compute(og, ins);
+
+    NNOPS_EXPECT_NEAR(got[0], 1.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(got[1], 0.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(got[2], 1.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(got[3], 0.0f, 1e-6f);
+}
+
+// ============================================================
+// alpha: C = epilogue(alpha·(A×B) + bias + beta·C_old)
+// ============================================================
+//
+// alpha scales the product only — neither the bias nor beta·C_old. The
+// reference kernel honours the same attributes, so it is the oracle for the
+// routes; the hand-computed cases below pin the order independently.
+
+NNOPS_TEST(matmul_alpha_fp_routes) {
+    // One case per routing decision: the packed MMA tile (NN, NT, and a
+    // multi-k-block TT), the small-M kernels, and the direct GEMV. alpha ∉
+    // {0, 1} on every one.
+    struct Case {
+        int64_t M, N, K;
+        bool ta, tb;
+        float alpha, beta;
+    };
+    const Case cases[] = {
+        {64, 48, 96, false, false, 2.0f, 0.0f},   // packed, NN
+        {64, 48, 96, false, true,  -0.5f, 0.0f},  // packed, NT
+        {13, 21, 300, true, true,  1.5f, 0.5f},   // packed, TT, multi-k-block
+        {8, 37, 40, false, false,  3.0f, 0.0f},   // small-M / packed boundary
+        {2, 33, 70, false, true,  -2.0f, 1.0f},   // small-M
+        {1, 64, 40, false, false,  0.25f, 0.0f},  // GEMV, M=1
+        {3, 64, 40, false, true,   4.0f, -1.0f},  // GEMV, transposed B
+    };
+
+    uint64_t seed = 7100;
+    for (const Case& c : cases) {
+        int64_t a_shape[2];
+        int64_t b_shape[2];
+        if (c.ta) { a_shape[0] = c.K; a_shape[1] = c.M; }
+        else      { a_shape[0] = c.M; a_shape[1] = c.K; }
+        if (c.tb) { b_shape[0] = c.N; b_shape[1] = c.K; }
+        else      { b_shape[0] = c.K; b_shape[1] = c.N; }
+
+        auto [a_vec, a] = test::make_random_tensor(
+            std::span<const int64_t>(a_shape, 2), -2.0f, 2.0f, seed++);
+        auto [b_vec, b] = test::make_random_tensor(
+            std::span<const int64_t>(b_shape, 2), -2.0f, 2.0f, seed++);
+
+        MatMulAttributes attrs{};
+        attrs.transpose_a = c.ta;
+        attrs.transpose_b = c.tb;
+        attrs.alpha = c.alpha;
+        attrs.beta = c.beta;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        NNOPS_EXPECT_EQ(descs[0].dims[0], c.M);
+        NNOPS_EXPECT_EQ(descs[0].dims[1], c.N);
+
+        std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+        auto output = nnops::test::make_planar(descs[0], out_buf.data());
+        // beta ∉ {0}: give the accumulate real prior data.
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            out_buf[i] = 0.25f * static_cast<float>(i % 7) - 0.5f;
+        }
+
+        const TensorView ins[] = {a, b};
+        op->compute(output, ins);
+
+        std::vector<float> ref_buf(out_buf.size());
+        auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+        for (size_t i = 0; i < ref_buf.size(); ++i) {
+            ref_buf[i] = 0.25f * static_cast<float>(i % 7) - 0.5f;
+        }
+        nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
+
+        NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-4f, 1e-5f));
+    }
+}
+
+NNOPS_TEST(matmul_alpha_scales_product_only) {
+    // A×B = [[4,5],[10,11]]. With alpha = 2: [[8,10],[20,22]].
+    //   + bias [10,-20]  → [[18,-10],[30,2]]      (bias is not scaled)
+    //   + beta·C_old with beta = 1, C_old = [[1,2],[3,4]]
+    //                    → [[19,-8],[33,6]]       (C_old is not scaled either)
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 2, 3, 4, 5, 6};
+    float b_data[6] = {1, 0, 0, 1, 1, 1};
+    float bias_data[2] = {10, -20};
+    float c_init[4] = {1, 2, 3, 4};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.alpha = 2.0f;
+    attrs.beta = 1.0f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
+    std::copy(std::begin(c_init), std::end(c_init), out_buf.begin());
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 19.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], -8.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 33.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 6.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_alpha_before_activation) {
+    // The clamp/activation sees alpha·(A×B) + bias, not the raw product:
+    // alpha=2, bias [10,-20] → [[18,-10],[30,2]] → clamp -15..15
+    // → [[15,-10],[15,2]] → relu → [[15,0],[15,2]].
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    const int64_t bias_shape[] = {2};
+
+    float a_data[6] = {1, 2, 3, 4, 5, 6};
+    float b_data[6] = {1, 0, 0, 1, 1, 1};
+    float bias_data[2] = {10, -20};
+
+    TensorView a(ashape, DataType::f32, a_data);
+    TensorView b(bshape, DataType::f32, b_data);
+    TensorView bias(bias_shape, DataType::f32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.alpha = 2.0f;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.epilogue.min_clip = -15.0f;
+    attrs.epilogue.max_clip = 15.0f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins);
+
+    NNOPS_EXPECT_NEAR(out_buf[0], 15.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 0.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 15.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[3], 2.0f, 1e-6f);
+}
+
+NNOPS_TEST(matmul_alpha_f16) {
+    // f16 operands, alpha folded into the f16 RHS pack. The oracle is the f32
+    // reference on the same values, hence the arch-aware f16 tolerance.
+    auto [a32, _] = test::make_random_tensor({12, 40}, -1.0f, 1.0f, 960);
+    auto [b32, __] = test::make_random_tensor({40, 9}, -1.0f, 1.0f, 961);
+    auto a_f16 = test::f32_to_f16(a32);
+    auto b_f16 = test::f32_to_f16(b32);
+
+    const int64_t a_shape[] = {12, 40};
+    const int64_t b_shape[] = {40, 9};
+    TensorView a(a_shape, DataType::f16, a_f16.data());
+    TensorView b(b_shape, DataType::f16, b_f16.data());
+
+    MatMulAttributes attrs{};
+    attrs.alpha = 2.5f;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+
+    std::vector<nnops::backend::cpu::half> out_buf(
+        static_cast<size_t>(descs[0].numel()));
+    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins);
+
+    TensorView a32v(a_shape, DataType::f32, a32.data());
+    TensorView b32v(b_shape, DataType::f32, b32.data());
+    const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
+    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32v, b32v};
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[i]), ref_buf[i], kF16AccumTol);
+    }
+}
+
+NNOPS_TEST(matmul_alpha_ignored_on_integer_route) {
+    // alpha is a floating-point scale; the int8 accumulator has none of its
+    // own, so the integer route ignores it (see MatMulAttributes::alpha).
+    const int64_t ashape[] = {2, 2};
+    const int64_t bshape[] = {2, 2};
+
+    int8_t a_data[4] = {1, 2, 3, 4};
+    int8_t b_data[4] = {1, 0, 0, 1};
+
+    TensorView a = quant_view(ashape, 2, DataType::s8, a_data, bias_per_tensor(0.5f, 0));
+    TensorView b = quant_view(bshape, 2, DataType::s8, b_data, bias_per_tensor(0.25f, 0));
+
+    auto run = [&](float alpha, std::vector<float>& out) {
+        MatMulAttributes attrs{};
+        attrs.output_dtype = DataType::f32;
+        attrs.alpha = alpha;
+        auto op = MatMul::create(attrs, Backend::CPU);
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        out.assign(static_cast<size_t>(descs[0].numel()), 0.0f);
+        auto output = nnops::test::make_planar(descs[0], out.data());
+        const TensorView ins[] = {a, b};
+        op->compute(output, ins);
+    };
+
+    std::vector<float> plain, scaled;
+    run(1.0f, plain);
+    run(2.0f, scaled);
+    for (size_t i = 0; i < plain.size(); ++i) {
+        NNOPS_EXPECT_NEAR(scaled[i], plain[i], 1e-6f);
+    }
+
+    // Sanity: the unscaled result really is the product × (0.5·0.25) = 0.125.
+    NNOPS_EXPECT_NEAR(plain[0], 0.125f, 1e-6f);
+    NNOPS_EXPECT_NEAR(plain[3], 0.5f, 1e-6f);
 }
 
 // ============================================================
@@ -2221,7 +2999,7 @@ NNOPS_TEST(matmul_naive_kernel_layouts) {
                                                 static_cast<int>(K),
                                                 abuf.data(), static_cast<int>(apitch), ta != 0,
                                                 bbuf.data(), static_cast<int>(bpitch), tb != 0,
-                                                cbuf.data(), static_cast<int>(ldc), beta);
+                                                cbuf.data(), static_cast<int>(ldc), 1.0f, beta);
 
                         for (int64_t m = 0; m < M; ++m) {
                             for (int64_t n = 0; n < N; ++n) {

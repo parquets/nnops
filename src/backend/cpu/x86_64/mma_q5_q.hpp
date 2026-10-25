@@ -71,7 +71,8 @@ template <int MR, bool ZERO>
 void mma_q5_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                       const float* NNOPS_RESTRICT A, int lda,
                       const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
-                      int n_start, float clamp_min, float clamp_max) noexcept {
+                      int n_start, float alpha, float clamp_min,
+                      float clamp_max) noexcept {
     static_assert(MR >= 1 && MR <= 8, "trans Q5_1 kernel: MR in [1, 8]");
 
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q5_1_block_bytes);
@@ -157,6 +158,7 @@ void mma_q5_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
         auto finish = [&](int row, __m256 acc, float tail) {
             float* cp = c + static_cast<int64_t>(row) * ldc;
             float v = q5_hsum_ps(acc) + tail;
+            if (alpha != 1.0f) { v *= alpha; }
             if constexpr (!ZERO) { v += *cp; }
             *cp = std::min(std::max(v, clamp_min), clamp_max);
         };
@@ -188,7 +190,8 @@ template <int MR, bool ZERO>
 void mma_q5_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                      const float* NNOPS_RESTRICT A, int lda,
                      const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
-                     int n_start, float clamp_min, float clamp_max) noexcept {
+                     int n_start, float alpha, float clamp_min,
+                     float clamp_max) noexcept {
     static_assert(MR == 1 || MR == 2, "copy Q5_1 kernel: MR in {1, 2}");
 
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q5_1_block_bytes);
@@ -197,6 +200,8 @@ void mma_q5_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const __m256 vlo = _mm256_set1_ps(clamp_min);
     const __m256 vhi = _mm256_set1_ps(clamp_max);
     const __m256 vzero = _mm256_setzero_ps();
+    const __m256 valpha = _mm256_set1_ps(alpha);
+    const bool scaled = (alpha != 1.0f);
 
     for (int n = 0; n < nc; n += q5_1_block_elems) {
         const int width = std::min(static_cast<int>(q5_1_block_elems), nc - n);
@@ -231,6 +236,12 @@ void mma_q5_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
         auto emit = [&](int row, __m256 q0, __m256 q1, __m256 q2, __m256 q3) {
             float* cp = C + static_cast<int64_t>(row) * ldc + n;
             if (width == q5_1_block_elems) {
+                if (scaled) {
+                    q0 = _mm256_mul_ps(q0, valpha);
+                    q1 = _mm256_mul_ps(q1, valpha);
+                    q2 = _mm256_mul_ps(q2, valpha);
+                    q3 = _mm256_mul_ps(q3, valpha);
+                }
                 if constexpr (!ZERO) {
                     q0 = _mm256_add_ps(q0, _mm256_loadu_ps(cp + 0));
                     q1 = _mm256_add_ps(q1, _mm256_loadu_ps(cp + 8));
@@ -249,6 +260,7 @@ void mma_q5_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                 _mm256_storeu_ps(tmp + 24, q3);
                 for (int i = 0; i < width; ++i) {
                     float v = tmp[i];
+                    if (scaled) { v *= alpha; }
                     if constexpr (!ZERO) { v += cp[i]; }
                     cp[i] = std::min(std::max(v, clamp_min), clamp_max);
                 }

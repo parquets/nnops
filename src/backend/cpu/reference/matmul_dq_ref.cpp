@@ -94,6 +94,12 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
     const QuantParams& qb = b.quant_params();
     const Epilogue&    ep = attrs.epilogue;
 
+    // Optional per-column bias in the fp output dtype, applied after the
+    // dequantize and before the clamp/activation.
+    const bool has_bias = inputs.size() > 2;
+    const AT* bias = has_bias ? inputs[2].ptr<AT>() : nullptr;
+    NNOPS_ASSERT(!has_bias || inputs[2].numel() >= N);
+
     const int64_t batch_a_dims = a_rank - 2;
     const int64_t batch_b_dims = b_rank - 2;
     const int64_t batch_ndim   = std::max(batch_a_dims, batch_b_dims);
@@ -179,9 +185,11 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
                     raw, 0, zp_a, zp_b, r_a, r_b[static_cast<size_t>(n)],
                     static_cast<int32_t>(K));
 
-                // 3. Dequantize, clip, activate — the SIMD kernel's exact order.
+                // 3. Dequantize, bias, clip, activate — the SIMD kernel's exact
+                //    order (the bias sits between the product and the clamp).
                 const float scale = s_a * scale_at(qb, n);
                 float f = static_cast<float>(acc) * scale;
+                if (bias != nullptr) { f += a_load(bias, n); }
                 f = std::min(std::max(f, ep.min_clip), ep.max_clip);
                 f = nnops::apply_epilogue(ep, f);
 

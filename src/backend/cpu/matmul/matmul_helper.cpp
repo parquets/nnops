@@ -227,15 +227,17 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 #ifdef NNOPS_ARCH_X86_64
 
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks) {
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
     arch::pack_q5_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                               src_row_blocks);
+                               src_row_blocks, scale);
 }
 
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks) {
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
     arch::pack_q5_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                              src_row_blocks);
+                              src_row_blocks, scale);
 }
 
 #else
@@ -254,7 +256,8 @@ constexpr int q5_1_panel_nr() noexcept {
 
 template <class T>
 void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int kc,
-                               T* dst, int ldd, const void* src, int64_t row_blocks) {
+                               T* dst, int ldd, const void* src, int64_t row_blocks,
+                               float scale) {
     constexpr int NR = q5_1_panel_nr<T>();
     const uint8_t* base = static_cast<const uint8_t*>(src);
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(q5_1_block_bytes);
@@ -276,7 +279,7 @@ void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int
                 q5_1_unpack_block(base + static_cast<int64_t>(row) * row_bytes
                                        + static_cast<int64_t>(col >> 5) * q5_1_block_bytes,
                                   vals);
-                store(&o[j], vals[col & 31]);
+                store(&o[j], vals[col & 31] * scale);
             }
             for (int j = nr; j < NR; ++j) { o[j] = T{}; }
         }
@@ -286,15 +289,17 @@ void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int
 }
 
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks) {
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
     tile_pack_rhs_q5_1_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                     src, src_row_blocks);
+                                     src, src_row_blocks, scale);
 }
 
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks) {
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
     tile_pack_rhs_q5_1_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                    src, src_row_blocks);
+                                    src, src_row_blocks, scale);
 }
 
 #endif
@@ -528,6 +533,35 @@ void tile_scale(float* c, int ldc, float scale, int M, int N) {
 
 void tile_scale(half* c, int ldc, float scale, int M, int N) {
     tile_scale_impl(c, ldc, scale, M, N);
+}
+
+template <typename T>
+void tile_scale_add_bias_impl(T* c, int ldc, float scale, const T* bias,
+                              int M, int N) {
+    using namespace nnops::simd;
+    constexpr int L = simd_lane_for<T>;
+    for (int m = 0; m < M; ++m) {
+        T* row = c + m * ldc;
+        auto v_scale = v_set1(row, scale);
+        int i = 0;
+        for (; i + L <= N; i += L) {
+            auto v = v_add(v_mul(v_load(row + i), v_scale), v_load(bias + i));
+            v_store(row + i, v);
+        }
+        for (; i < N; ++i) {
+            s_store(&row[i], s_load(&row[i]) * scale + s_load(&bias[i]));
+        }
+    }
+}
+
+void tile_scale_add_bias(float* c, int ldc, float scale, const float* bias,
+                         int M, int N) {
+    tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
+}
+
+void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias,
+                         int M, int N) {
+    tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
 }
 
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,

@@ -47,9 +47,14 @@ using nnops::backend::cpu::half_to_float;
 /// The nibble bytes are widened once into two 16-byte halves (low nibbles and
 /// high nibbles); the 5th-bit mask is spread by a per-lane variable shift, one
 /// `srlv` per 8 lanes, instead of a per-value bit test.
+///
+/// @param scale multiplies the whole block: the decode is `q·d + m`, so scaling
+///              `d` and `m` once per block scales all 32 values — MatMul's alpha
+///              without a per-element pass.
 inline void decode_q5_1_block_ps(const uint8_t* p,
                                  __m256& v0, __m256& v1,
-                                 __m256& v2, __m256& v3) noexcept {
+                                 __m256& v2, __m256& v3,
+                                 float scale = 1.0f) noexcept {
     uint16_t d_bits, m_bits;
     uint32_t qh;
     std::memcpy(&d_bits, p + 0, sizeof(d_bits));
@@ -59,8 +64,13 @@ inline void decode_q5_1_block_ps(const uint8_t* p,
     // F16C on the two scale fields: the portable half_to_float is a scalar
     // branchy routine, and at two calls per 32 values it costs more than the
     // rest of the decode. `_mm_cvtph_ps` + a broadcast is one instruction pair.
-    const __m256 md = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(d_bits)));
-    const __m256 mm = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(m_bits)));
+    __m256 md = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(d_bits)));
+    __m256 mm = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(m_bits)));
+    if (scale != 1.0f) {
+        const __m256 vs = _mm256_set1_ps(scale);
+        md = _mm256_mul_ps(md, vs);
+        mm = _mm256_mul_ps(mm, vs);
+    }
 
     const __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8));
     const __m128i m0f = _mm_set1_epi8(0x0F);
@@ -100,12 +110,13 @@ inline void decode_q5_1_block_ps(const uint8_t* p,
 
 /// Decode one block into 32 f32 or f16 values (f16 rounds once per element).
 template <class T>
-inline void decode_q5_1_block(const uint8_t* p, T* out) noexcept {
+inline void decode_q5_1_block(const uint8_t* p, T* out,
+                              float scale = 1.0f) noexcept {
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
                   "decode_q5_1_block: T must be float or half");
 
     __m256 v0, v1, v2, v3;
-    decode_q5_1_block_ps(p, v0, v1, v2, v3);
+    decode_q5_1_block_ps(p, v0, v1, v2, v3, scale);
 
     if constexpr (std::is_same_v<T, float>) {
         _mm256_storeu_ps(out + 0,  v0);
@@ -174,7 +185,8 @@ inline constexpr int q5_1_nr_max = 16;
 /// most two block decodes feed one row. @p width is ignored when NR > 0.
 template <class T, int NR>
 void pack_q5_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
-                          int k_start, int kc, int n_start, int width) noexcept {
+                          int k_start, int kc, int n_start, int width,
+                          float scale = 1.0f) noexcept {
     const int nb    = (NR > 0) ? NR : width;
     const int blk0  = n_start >> 5;
     const int off0  = n_start & 31;
@@ -188,13 +200,14 @@ void pack_q5_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
         const uint8_t* row = src + static_cast<int64_t>(k_start + k) * row_bytes;
         T* o = out + static_cast<int64_t>(k) * q5_1_nr_max;
 
-        decode_q5_1_block<T>(row + static_cast<int64_t>(blk0) * q5_1_block_bytes, v0);
+        decode_q5_1_block<T>(row + static_cast<int64_t>(blk0) * q5_1_block_bytes, v0,
+                             scale);
         for (int j = 0; j < first; ++j) {
             o[j] = v0[off0 + j];
         }
         if (two) {
             decode_q5_1_block<T>(
-                row + static_cast<int64_t>(blk0 + 1) * q5_1_block_bytes, v1);
+                row + static_cast<int64_t>(blk0 + 1) * q5_1_block_bytes, v1, scale);
             for (int j = first; j < nb; ++j) {
                 o[j] = v1[j - first];
             }
@@ -211,7 +224,8 @@ void pack_q5_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
 /// Linear's [N][K] weights.
 template <class T, int NR>
 void pack_q5_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
-                           int k_start, int kc, int n_start, int width) noexcept {
+                           int k_start, int kc, int n_start, int width,
+                           float scale = 1.0f) noexcept {
     const int nb     = (NR > 0) ? NR : width;
     const int blk0   = k_start >> 5;
     const int off0   = k_start & 31;
@@ -226,7 +240,7 @@ void pack_q5_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
         int k = 0;
         for (int b = 0; b < nblk; ++b) {
             decode_q5_1_block<T>(row + static_cast<int64_t>(b) * q5_1_block_bytes,
-                                 vals);
+                                 vals, scale);
             const int start = (b == 0) ? off0 : 0;
             const int count = std::min(32 - start, kc - k);
             T* o = out + static_cast<int64_t>(k) * q5_1_nr_max + j;
@@ -258,9 +272,13 @@ void pack_q5_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
 /// @param ldd        aligned panel stride in elements (nr_max * kc rounded).
 /// @param src        first block of the batch element's B.
 /// @param row_blocks 24-byte blocks per physical row (the B row pitch / 24).
+/// @param scale      MatMul alpha. It folds into each block's `d` and `m`
+///                   (two multiplies per 32 weights), so the pack itself does
+///                   no extra work per element.
 template <class T>
 void pack_q5_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
-                   T* dst, int ldd, const void* src, int64_t row_blocks) noexcept {
+                   T* dst, int ldd, const void* src, int64_t row_blocks,
+                   float scale) noexcept {
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
                   "pack_q5_1_rhs: T must be float or half");
 
@@ -270,20 +288,20 @@ void pack_q5_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
     for (; n + q5_1_nr_max <= nc; n += q5_1_nr_max) {
         if (trans) {
             pack_q5_1_trans_panel<T, q5_1_nr_max>(
-                dst, base, row_blocks, k_start, kc, n_start + n, 0);
+                dst, base, row_blocks, k_start, kc, n_start + n, 0, scale);
         } else {
             pack_q5_1_copy_panel<T, q5_1_nr_max>(
-                dst, base, row_blocks, k_start, kc, n_start + n, 0);
+                dst, base, row_blocks, k_start, kc, n_start + n, 0, scale);
         }
         dst += ldd;
     }
     if (n < nc) {
         if (trans) {
             pack_q5_1_trans_panel<T, 0>(
-                dst, base, row_blocks, k_start, kc, n_start + n, nc - n);
+                dst, base, row_blocks, k_start, kc, n_start + n, nc - n, scale);
         } else {
             pack_q5_1_copy_panel<T, 0>(
-                dst, base, row_blocks, k_start, kc, n_start + n, nc - n);
+                dst, base, row_blocks, k_start, kc, n_start + n, nc - n, scale);
         }
     }
 }

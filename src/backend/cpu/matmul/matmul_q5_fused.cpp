@@ -40,19 +40,19 @@ constexpr int Q5_FUSED_NTILE = 2 * static_cast<int>(q5_1_block_elems);
 template <bool ZERO, bool TRANS, int MR>
 inline void q5_fused_rows(int mr, int nc, int K, float* c, int ldc,
                           const float* a, int lda, const uint8_t* B,
-                          int64_t row_blocks, int n_start,
+                          int64_t row_blocks, int n_start, float alpha,
                           float cmin, float cmax) {
     if (mr >= MR) {
         if constexpr (TRANS) {
             arch::mma_q5_f32_trans<MR, ZERO>(nc, K, c, ldc, a, lda, B, row_blocks,
-                                             n_start, cmin, cmax);
+                                             n_start, alpha, cmin, cmax);
         } else {
             arch::mma_q5_f32_copy<MR, ZERO>(nc, K, c, ldc, a, lda, B, row_blocks,
-                                            n_start, cmin, cmax);
+                                            n_start, alpha, cmin, cmax);
         }
     } else if constexpr (MR > 1) {
         q5_fused_rows<ZERO, TRANS, MR - 1>(mr, nc, K, c, ldc, a, lda, B,
-                                           row_blocks, n_start, cmin, cmax);
+                                           row_blocks, n_start, alpha, cmin, cmax);
     }
 }
 
@@ -60,14 +60,14 @@ inline void q5_fused_rows(int mr, int nc, int K, float* c, int ldc,
 template <bool ZERO, bool TRANS>
 inline void q5_fused_dispatch(int M, int nc, int K, float* C, int ldc,
                               const float* A, int lda, const uint8_t* B,
-                              int64_t row_blocks, int n_start,
+                              int64_t row_blocks, int n_start, float alpha,
                               float cmin, float cmax) {
     constexpr int kPanel = TRANS ? 8 : 2;
     for (int m = 0; m < M; m += kPanel) {
         q5_fused_rows<ZERO, TRANS, kPanel>(
             std::min(kPanel, M - m), nc, K, C + static_cast<int64_t>(m) * ldc,
             ldc, A + static_cast<int64_t>(m) * lda, lda, B, row_blocks,
-            n_start, cmin, cmax);
+            n_start, alpha, cmin, cmax);
     }
 }
 
@@ -75,14 +75,14 @@ inline void q5_fused_dispatch(int M, int nc, int K, float* C, int ldc,
 template <bool ZERO>
 inline void q5_fused_run(bool trans, int M, int nc, int K, float* C, int ldc,
                          const float* A, int lda, const uint8_t* B,
-                         int64_t row_blocks, int n_start,
+                         int64_t row_blocks, int n_start, float alpha,
                          float cmin, float cmax) {
     if (trans) {
         q5_fused_dispatch<ZERO, true>(M, nc, K, C, ldc, A, lda, B, row_blocks,
-                                      n_start, cmin, cmax);
+                                      n_start, alpha, cmin, cmax);
     } else {
         q5_fused_dispatch<ZERO, false>(M, nc, K, C, ldc, A, lda, B, row_blocks,
-                                       n_start, cmin, cmax);
+                                       n_start, alpha, cmin, cmax);
     }
 }
 
@@ -118,7 +118,12 @@ bool matmul_q5_fused(const MatMulAttributes& attrs,
 
     const auto [cmin, cmax] = kblock_clamp(attrs, /*last_k=*/true);
     const bool epilogue = has_inplace_epilogue(attrs);
-    const bool scale_c = attrs.beta != 0.0f && attrs.beta != 1.0f;
+    // A bias primes each tile with beta·C_old + bias before the k loop, so this
+    // route always accumulates (the overwriting mode would drop it) and the
+    // last-k clamp + epilogue run on the biased sum, as on the tiled route.
+    const float* bias = inputs.size() > 2 ? inputs[2].ptr<float>() : nullptr;
+    const bool prime_c = (bias != nullptr);
+    const bool scale_c = !prime_c && attrs.beta != 0.0f && attrs.beta != 1.0f;
 
     const BatchWalk batch(a, b);
     const int nt = Q5_FUSED_NTILE;
@@ -137,16 +142,18 @@ bool matmul_q5_fused(const MatMulAttributes& attrs,
         const uint8_t* b_p = q5_rhs_at(b_base, b_off);
         float* c_p = c_base + c_off + n_start;
 
-        if (scale_c) {
+        if (prime_c) {
+            tile_scale_add_bias(c_p, ldc, attrs.beta, bias + n_start, M, nc);
+        } else if (scale_c) {
             tile_scale(c_p, ldc, attrs.beta, M, nc);
         }
 
-        if (attrs.beta == 0.0f) {
+        if (attrs.beta == 0.0f && !prime_c) {
             q5_fused_run<true>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
-                               row_blocks, n_start, cmin, cmax);
+                               row_blocks, n_start, attrs.alpha, cmin, cmax);
         } else {
             q5_fused_run<false>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
-                                row_blocks, n_start, cmin, cmax);
+                                row_blocks, n_start, attrs.alpha, cmin, cmax);
         }
 
         if (epilogue) {

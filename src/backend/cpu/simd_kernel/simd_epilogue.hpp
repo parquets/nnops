@@ -534,6 +534,7 @@ struct DqEpilogueRow {
     const float* s_b;       ///< per-channel B scales, or nullptr
     float s_b_scalar;
     float bias;             ///< output-row bias, added before the clip (0 if none)
+    const TOut* col_bias;   ///< per-column bias, indexed by absolute column, or null
     int32_t k;
     const Epilogue* ep;     ///< clip bounds + activation
 };
@@ -556,6 +557,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
     // Skipping a zero bias keeps x + 0 from turning -0 into +0: MatMul compares
     // these outputs by bit pattern, and it never has a bias.
     const bool biased = (p.bias != 0.0f);
+    const bool col_biased = (p.col_bias != nullptr);
     alignas(32) float fbuf[8];
     for (; n + 8 <= n1; n += 8) {
         __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
@@ -573,6 +575,14 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
         const __m256 sb = p.s_b ? _mm256_loadu_ps(p.s_b + n) : vsbs;
         __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(v), _mm256_mul_ps(vsa, sb));
         if (biased) { f = _mm256_add_ps(f, vbias); }
+        if (col_biased) {
+            if constexpr (std::is_same_v<TOut, half>) {
+                f = _mm256_add_ps(f, _mm256_cvtph_ps(_mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(p.col_bias + n))));
+            } else {
+                f = _mm256_add_ps(f, _mm256_loadu_ps(p.col_bias + n));
+            }
+        }
         f = _mm256_min_ps(_mm256_max_ps(f, vmin), vmax);
 
         if (plain) {
@@ -601,6 +611,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
     // Skipping a zero bias keeps x + 0 from turning -0 into +0: MatMul compares
     // these outputs by bit pattern, and it never has a bias.
     const bool biased = (p.bias != 0.0f);
+    const bool col_biased = (p.col_bias != nullptr);
     alignas(16) float fbuf[4];
     for (; n + 4 <= n1; n += 4) {
         int32x4_t v = vld1q_s32(c + n);
@@ -614,6 +625,14 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
         const float32x4_t sb = p.s_b ? vld1q_f32(p.s_b + n) : vsbs;
         float32x4_t f = vmulq_f32(vcvtq_f32_s32(v), vmulq_f32(vsa, sb));
         if (biased) { f = vaddq_f32(f, vbias); }
+        if (col_biased) {
+            if constexpr (std::is_same_v<TOut, half>) {
+                f = vaddq_f32(f, vcvt_f32_f16(vld1_f16(
+                    reinterpret_cast<const __fp16*>(p.col_bias + n))));
+            } else {
+                f = vaddq_f32(f, vld1q_f32(p.col_bias + n));
+            }
+        }
         f = vminq_f32(vmaxq_f32(f, vmin), vmax);
 
         if (plain) {
@@ -641,6 +660,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
         const float scale = p.s_a * (p.s_b ? p.s_b[n] : p.s_b_scalar);
         float f = static_cast<float>(acc) * scale;
         if (p.bias != 0.0f) { f += p.bias; }
+        if (p.col_bias != nullptr) { f += s_load(&p.col_bias[n]); }
         f = std::min(std::max(f, ep.min_clip), ep.max_clip);
         f = nnops::apply_epilogue(ep, f);
         s_store(&out[n], f);
@@ -669,9 +689,11 @@ struct DqEpilogueParams {
     bool act_u8;
     const Epilogue* ep;
     /// Per-row bias, added after the dequantize and before the clip — the same
-    /// place fp's accumulator seed puts it. nullptr → no bias. MatMul passes
-    /// nullptr (it folds its bias into the accumulator).
+    /// place fp's accumulator seed puts it. nullptr → no bias.
     const TOut* bias;
+    /// Per-column bias over the full [N] output width, added in the same place.
+    /// MatMul passes its optional bias here; Conv2D has none and leaves it null.
+    const TOut* col_bias;
     TOut* out;               ///< fp destination
     int ldc_out;
 };
@@ -698,6 +720,7 @@ inline void dq_epilogue_tile(const DqEpilogueParams<TOut>& p, const int32_t* c, 
             p.s_b,
             p.s_b_scalar,
             p.bias ? s_load(&p.bias[m]) : 0.0f,
+            p.col_bias,
             p.k,
             p.ep,
         };

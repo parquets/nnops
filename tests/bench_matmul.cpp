@@ -1460,7 +1460,7 @@ NNOPS_BENCH(matmul_q5_pack_only) {
 
     // Both physical layouts; the same square buffers serve as [K][N] (nn) and
     // [N][K] (tb) since K == N.
-    auto sweep = [&](bool q5, bool trans) {
+    auto sweep = [&](bool q5, bool trans, float scale) {
         for (int n0 = 0; n0 < static_cast<int>(N); n0 += nc) {
             const int width = std::min(nc, static_cast<int>(N - n0));
             for (int k = 0; k < static_cast<int>(K); k += kc) {
@@ -1469,27 +1469,35 @@ NNOPS_BENCH(matmul_q5_pack_only) {
                     cpu::mma_pack_align(nr * actual_kc * sizeof(float)) / sizeof(float));
                 if (q5) {
                     cpu::tile_pack_rhs_q5_1(trans, n0, width, k, actual_kc,
-                                            buf.data(), ldd, bv.data(), row_blocks);
+                                            buf.data(), ldd, bv.data(), row_blocks,
+                                            scale);
                 } else {
                     const float* src = trans
                         ? fv.data() + static_cast<int64_t>(n0) * K + k
                         : fv.data() + static_cast<int64_t>(k) * N + n0;
                     cpu::tile_pack_rhs(trans, width, actual_kc, buf.data(), ldd,
-                                       src, static_cast<int>(N), 1.0f);
+                                       src, static_cast<int>(N), scale);
                 }
             }
         }
     };
 
+    // [q5][trans][scale]: scale 1 is the plain pack, scale 2 the alpha path,
+    // which for Q5_1 is a second sweep over the finished panel (the dense
+    // packer scales as it stores).
     const int iters = 20;
-    double ms[2][2] = {};
+    double ms[2][2][2] = {};
     for (int q5 = 0; q5 < 2; ++q5) {
         for (int tr = 0; tr < 2; ++tr) {
-            sweep(q5 == 1, tr == 1);
-            auto t0 = std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < iters; ++i) { sweep(q5 == 1, tr == 1); }
-            ms[q5][tr] = std::chrono::duration<double, std::milli>(
-                             std::chrono::high_resolution_clock::now() - t0).count() / iters;
+            for (int sc = 0; sc < 2; ++sc) {
+                const float scale = sc == 0 ? 1.0f : 2.0f;
+                sweep(q5 == 1, tr == 1, scale);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < iters; ++i) { sweep(q5 == 1, tr == 1, scale); }
+                ms[q5][tr][sc] = std::chrono::duration<double, std::milli>(
+                                     std::chrono::high_resolution_clock::now() - t0).count()
+                                 / iters;
+            }
         }
     }
 
@@ -1503,8 +1511,12 @@ NNOPS_BENCH(matmul_q5_pack_only) {
     for (int q5 = 0; q5 < 2; ++q5) {
         for (int tr = 0; tr < 2; ++tr) {
             std::printf("    %-22s : %7.3f ms  = %6.2f Gvalues/s   (%.2fx dense)\n",
-                        kLabels[q5][tr], ms[q5][tr], values / (ms[q5][tr] * 1e6),
-                        ms[q5][tr] / ms[0][tr]);
+                        kLabels[q5][tr], ms[q5][tr][0], values / (ms[q5][tr][0] * 1e6),
+                        ms[q5][tr][0] / ms[0][tr][0]);
+            std::printf("    %-22s : %7.3f ms  = %6.2f Gvalues/s   (alpha=2: %.2fx plain)\n",
+                        "  same, alpha=2", ms[q5][tr][1],
+                        values / (ms[q5][tr][1] * 1e6),
+                        ms[q5][tr][1] / ms[q5][tr][0]);
         }
     }
 }
@@ -2369,4 +2381,243 @@ NNOPS_BENCH(matmul_q5_decode_rate) {
 #else
     std::printf("  q5_1 decode rate: x86_64 only\n");
 #endif
+}
+
+// ---- bias A/B --------------------------------------------------------------
+//
+// A biased call costs the kernels nothing: matmul_cpu strips the activation (and
+// the Relu/Relu6 clamp fold) from the attrs it dispatches with, runs the bare
+// product, then sweeps C once with epilogue_inplace(bias, activation). The price
+// is that one extra read-modify-write pass over M×N plus a third input span —
+// invisible next to a large GEMM, and only worth measuring at decode shapes,
+// where M×N output traffic is comparable to the arithmetic.
+//
+// The four variants share the operands and alternate round by round in one
+// process, so `bias/plain` is a real ratio and not a thermal artifact (see the
+// route A/B note above for how far this host drifts between separate runs).
+
+template <typename T>
+struct BiasAB {
+    using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
+
+    struct Variant {
+        const char* label;
+        OpPtr op;
+        std::vector<TensorView> ins;
+    };
+
+    std::vector<T> a_buf, b_buf, z_buf, out_buf;
+    std::vector<Variant> variants;   // 0 plain, 1 relu, 2 bias, 3 bias+relu
+    TensorView out;
+    int64_t M, N, K;
+
+    BiasAB(int64_t m, int64_t k, int64_t n, bool transpose_b, uint64_t seed)
+        : M(m), N(n), K(k) {
+        auto [av, a] = make_tensor<T>(m, k, k, seed);
+        a_buf = std::move(av);
+
+        const int64_t b_rows = transpose_b ? n : k;
+        const int64_t b_cols = transpose_b ? k : n;
+        auto [bv, b] = make_tensor<T>(b_rows, b_cols, b_cols, seed + 1);
+        b_buf = std::move(bv);
+
+        // A rank-1 [N] bias; make_tensor builds the [1,N] pitch view we fill.
+        auto [zv, _] = make_tensor<T>(1, n, n, seed + 2);
+        z_buf = std::move(zv);
+        constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+        const int64_t zshape[] = {n};
+        TensorView bias(zshape, dt, z_buf.data());
+
+        MatMulAttributes plain_attrs{};
+        plain_attrs.transpose_b = transpose_b;
+        MatMulAttributes relu_attrs = plain_attrs;
+        relu_attrs.epilogue.type = EpilogueActivateType::Relu;
+
+        auto add = [&](const char* label, const MatMulAttributes& attrs, bool with_bias) {
+            Variant v;
+            v.label = label;
+            v.op = MatMul::create(attrs, Backend::CPU);
+            v.ins.push_back(a);
+            v.ins.push_back(b);
+            if (with_bias) { v.ins.push_back(bias); }
+            variants.push_back(std::move(v));
+        };
+        add("plain", plain_attrs, false);
+        add("relu", relu_attrs, false);
+        add("bias", plain_attrs, true);
+        add("bias+relu", relu_attrs, true);
+
+        const TensorDesc arr[] = {a.desc(), b.desc()};
+        auto descs = variants[0].op->getOutputTensorDesc(arr);
+        out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
+        out = test::make_planar(descs[0], out_buf.data());
+    }
+
+    double time(Variant& v, int iters) {
+        for (int i = 0; i < 2; ++i) { v.op->compute(out, v.ins, {}, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { v.op->compute(out, v.ins, {}, nullptr); }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return 2.0 * static_cast<double>(M) * static_cast<double>(N)
+             * static_cast<double>(K) * static_cast<double>(iters) / (ms * 1e6);
+    }
+};
+
+template <typename T>
+void bench_bias_ab(const char* tag, int64_t M, int64_t K, int64_t N,
+                   bool transpose_b = false, int rounds = 6, int iters = 8) {
+    BiasAB<T> p(M, K, N, transpose_b, 11);
+    std::printf("  bias A/B %s%s  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
+                tag, transpose_b ? " tb" : "",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+
+    const size_t nv = p.variants.size();
+    std::vector<std::vector<double>> vals(nv);
+    for (int r = 0; r < rounds; ++r) {
+        std::printf("    round %d:", r);
+        for (size_t v = 0; v < nv; ++v) {
+            const double g = p.time(p.variants[v], iters);
+            vals[v].push_back(g);
+            std::printf("  %s=%7.1f", p.variants[v].label, g);
+        }
+        const double base = vals[0].back();
+        std::printf("   bias/plain=%.3f  bias+relu/plain=%.3f\n",
+                    vals[2].back() / base, vals[3].back() / base);
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double base = median(vals[0]);
+    std::printf("    median GFLOPS (vs plain):");
+    for (size_t v = 0; v < nv; ++v) {
+        const double m = median(vals[v]);
+        std::printf("  %s=%.1f (%.3f)", p.variants[v].label, m, m / base);
+    }
+    std::printf("\n");
+}
+
+// ---- alpha A/B -------------------------------------------------------------
+//
+// On the tiled route alpha is folded into the RHS pack — every k-block of the
+// panel is scaled, so the dot product comes out scaled and the MMA never sees
+// it. The small-M kernels have no pack to ride, so they scale the finished
+// accumulator instead: one multiply per output element, which is what a decode
+// shape (M=1) measures. Variants alternate round by round in one process, as
+// with the bias A/B.
+
+template <typename T>
+struct AlphaAB {
+    using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
+
+    struct Variant {
+        const char* label;
+        OpPtr op;
+    };
+
+    std::vector<T> a_buf, b_buf, out_buf;
+    std::vector<Variant> variants;   // 0 plain, 1 alpha=2, 2 alpha=0.5
+    std::vector<TensorView> ins;
+    TensorView out;
+    int64_t M, N, K;
+
+    AlphaAB(int64_t m, int64_t k, int64_t n, bool transpose_b, uint64_t seed)
+        : M(m), N(n), K(k) {
+        auto [av, a] = make_tensor<T>(m, k, k, seed);
+        a_buf = std::move(av);
+
+        const int64_t b_rows = transpose_b ? n : k;
+        const int64_t b_cols = transpose_b ? k : n;
+        auto [bv, b] = make_tensor<T>(b_rows, b_cols, b_cols, seed + 1);
+        b_buf = std::move(bv);
+        ins.push_back(a);
+        ins.push_back(b);
+
+        auto add = [&](const char* label, float alpha) {
+            MatMulAttributes attrs{};
+            attrs.transpose_b = transpose_b;
+            attrs.alpha = alpha;
+            variants.push_back({label, MatMul::create(attrs, Backend::CPU)});
+        };
+        add("plain", 1.0f);
+        add("a=2", 2.0f);
+        add("a=0.5", 0.5f);
+
+        const TensorDesc arr[] = {ins[0].desc(), ins[1].desc()};
+        auto descs = variants[0].op->getOutputTensorDesc(arr);
+        out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
+        out = test::make_planar(descs[0], out_buf.data());
+    }
+
+    double time(Variant& v, int iters) {
+        for (int i = 0; i < 2; ++i) { v.op->compute(out, ins, {}, nullptr); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { v.op->compute(out, ins, {}, nullptr); }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return 2.0 * static_cast<double>(M) * static_cast<double>(N)
+             * static_cast<double>(K) * static_cast<double>(iters) / (ms * 1e6);
+    }
+};
+
+template <typename T>
+void bench_alpha_ab(const char* tag, int64_t M, int64_t K, int64_t N,
+                    bool transpose_b = false, int rounds = 6, int iters = 8) {
+    AlphaAB<T> p(M, K, N, transpose_b, 13);
+    std::printf("  alpha A/B %s%s  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
+                tag, transpose_b ? " tb" : "",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+
+    const size_t nv = p.variants.size();
+    std::vector<std::vector<double>> vals(nv);
+    for (int r = 0; r < rounds; ++r) {
+        std::printf("    round %d:", r);
+        for (size_t v = 0; v < nv; ++v) {
+            const double g = p.time(p.variants[v], iters);
+            vals[v].push_back(g);
+            std::printf("  %s=%7.1f", p.variants[v].label, g);
+        }
+        const double base = vals[0].back();
+        std::printf("   a2/plain=%.3f  a05/plain=%.3f\n",
+                    vals[1].back() / base, vals[2].back() / base);
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double base = median(vals[0]);
+    std::printf("    median GFLOPS (vs plain):");
+    for (size_t v = 0; v < nv; ++v) {
+        const double m = median(vals[v]);
+        std::printf("  %s=%.1f (%.3f)", p.variants[v].label, m, m / base);
+    }
+    std::printf("\n");
+}
+
+NNOPS_BENCH(matmul_alpha_ab) {
+    // Decode (small-M kernels), packed prefill, square, and Linear's [N][K]
+    // weight layout — the four ways alpha reaches the product.
+    bench_alpha_ab<float>("f32", 1, 4096, 4096, false, 6, 30);
+    bench_alpha_ab<float>("f32", 128, 4096, 4096, false, 6, 4);
+    bench_alpha_ab<float>("f32", 1024, 1024, 1024, false, 6, 8);
+    bench_alpha_ab<float>("f32", 128, 4096, 4096, true, 6, 4);
+    bench_alpha_ab<half>("f16", 1, 4096, 4096, false, 6, 30);
+    bench_alpha_ab<half>("f16", 128, 4096, 4096, false, 6, 4);
+}
+
+NNOPS_BENCH(matmul_bias_ab) {
+    // Decode / prefill / square, then Linear's transposed-weight layout. `iters`
+    // is scaled so each timing lands in the 50-250 ms range: the output-pass
+    // delta is what we are after and it would drown in a 2 ms sample.
+    bench_bias_ab<float>("f32", 1, 4096, 4096, false, 6, 30);
+    bench_bias_ab<float>("f32", 128, 4096, 4096, false, 6, 4);
+    bench_bias_ab<float>("f32", 1024, 1024, 1024, false, 6, 8);
+    bench_bias_ab<float>("f32", 128, 4096, 4096, true, 6, 4);
+    bench_bias_ab<half>("f16", 1, 4096, 4096, false, 6, 30);
+    bench_bias_ab<half>("f16", 128, 4096, 4096, false, 6, 4);
 }

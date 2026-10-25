@@ -2,10 +2,19 @@
 /// @brief Linear operator dispatch.
 
 #include "nnops/ops/linear.hpp"
+#include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
+
+namespace backend::cpu {
+    void linear_cpu(const LinearAttributes& attrs,
+                    TensorView& output,
+                    std::span<const TensorView> inputs,
+                    const ComputeContext& ctx,
+                    void* workspace);
+}
 
 namespace backend::cpu::reference {
     void linear_ref(const LinearAttributes& attrs,
@@ -31,7 +40,7 @@ auto resolve_linear_kernel(Backend backend) -> Linear::Impl::KernelFn
 {
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::reference::linear_ref;
+        return backend::cpu::linear_cpu;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;
@@ -61,7 +70,17 @@ Linear::Linear(const LinearAttributes& attrs, Backend backend)
 std::vector<TensorDesc> Linear::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return {linear_output_shape(inputs)};
+    auto out = linear_output_shape(inputs);
+
+    // The quantized path always produces floating point, selected by
+    // output_dtype; the fp path follows the input dtype (set by the shape
+    // helper already).
+    if (is_int8_matmul(inputs[0].dtype, inputs[1].dtype)) {
+        out[0].dtype = (attrs_.output_dtype == DataType::f16) ? DataType::f16
+                                                              : DataType::f32;
+    }
+
+    return out;
 }
 
 void Linear::compute(std::span<TensorView> outputs,

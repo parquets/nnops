@@ -30,13 +30,39 @@ constexpr int64_t NAIVE_PARALLEL_MACS = 32768;
 /// M at or below this takes the direct GEMV.
 constexpr int64_t GEMV_M_MAX = 4;
 
-/// Apply the activation epilogue in place over one batch element's M×N output.
+/// C = beta·C_old + bias over every batch element, before any block runs.
+///
+/// Same accumulator-init the tiled route does in its first k-block: the kernel
+/// then accumulates the product with beta = 1, and the bias — unscaled by
+/// alpha, added before clamp and activation — is already in place.
+template <typename T>
+void prime_bias_pass(const MatMulAttributes& attrs, TensorView& output,
+                     const BatchWalk& batch, T* c_base, int ldc,
+                     int M, int N, const T* bias, const ComputeContext& ctx)
+{
+    const auto prime = [&](int64_t bi) {
+        int64_t a_off, b_off, c_off;
+        batch.offsets(bi, output, a_off, b_off, c_off);
+        tile_scale_add_bias(c_base + c_off, ldc, attrs.beta, bias, M, N);
+    };
+    if (batch.total > 1) {
+        ctx.cpu.run(0, batch.total, prime);
+    } else {
+        prime(0);
+    }
+}
+
+/// Apply the clamp and activation epilogue in place over each batch element's
+/// M×N output, the same order the tiled route folds into its last k-block.
 template <typename T>
 void apply_epilogue_pass(const MatMulAttributes& attrs, TensorView& output,
                          const BatchWalk& batch, T* c_base, int ldc,
                          int M, int N)
 {
-    if (attrs.epilogue.type == EpilogueActivateType::None) { return; }
+    const Epilogue& ep = attrs.epilogue;
+    const float inf = std::numeric_limits<float>::infinity();
+    const bool clamp = ep.min_clip > -inf || ep.max_clip < inf;
+    if (ep.type == EpilogueActivateType::None && !clamp) { return; }
     for (int64_t bi = 0; bi < batch.total; ++bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
@@ -44,10 +70,17 @@ void apply_epilogue_pass(const MatMulAttributes& attrs, TensorView& output,
         for (int m = 0; m < M; ++m) {
             for (int n = 0; n < N; ++n) {
                 T& slot = c_p[m * ldc + n];
+                float f = 0.0f;
                 if constexpr (std::is_same_v<T, float>) {
-                    slot = apply_epilogue(attrs.epilogue, slot);
+                    f = slot;
                 } else {
-                    slot = float_to_half(apply_epilogue(attrs.epilogue, half_to_float(slot)));
+                    f = half_to_float(slot);
+                }
+                f = std::min(std::max(f, ep.min_clip), ep.max_clip);
+                if constexpr (std::is_same_v<T, float>) {
+                    slot = apply_epilogue(ep, f);
+                } else {
+                    slot = float_to_half(apply_epilogue(ep, f));
                 }
             }
         }
@@ -81,6 +114,13 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     T* c_base = output.ptr<T>();
 
     const BatchWalk batch(a, b);
+    // A bias primes C with beta·C_old + bias, so the kernel accumulates the
+    // product (beta = 1) and the epilogue pass below still runs.
+    const T* bias = inputs.size() > 2 ? inputs[2].ptr<T>() : nullptr;
+    if (bias != nullptr) {
+        prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
+    }
+    const float beta = (bias != nullptr) ? 1.0f : attrs.beta;
     const auto block = [&](int64_t bi, int nb) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
@@ -89,7 +129,7 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
         arch::matmul_gemv(Mi, Ni, Ki,
                           a_base + a_off, lda, attrs.transpose_a,
                           b_base + b_off, ldb, attrs.transpose_b,
-                          c_base + c_off, ldc, attrs.beta, n0, n1);
+                          c_base + c_off, ldc, attrs.alpha, beta, n0, n1);
     };
 
     if (batch.total > 1) {
@@ -131,13 +171,20 @@ void matmul_naive_small(const MatMulAttributes& attrs, TensorView& output,
     T* c_base = output.ptr<T>();
 
     const BatchWalk batch(a, b);
+    // Same accumulator-init as the GEMV route: beta·C_old + bias first, then
+    // the product accumulates with beta = 1.
+    const T* bias = inputs.size() > 2 ? inputs[2].ptr<T>() : nullptr;
+    if (bias != nullptr) {
+        prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
+    }
+    const float beta = (bias != nullptr) ? 1.0f : attrs.beta;
     const auto gemm = [&](int64_t bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
         arch::matmul_naive(Mi, Ni, Ki,
                            a_base + a_off, lda, attrs.transpose_a,
                            b_base + b_off, ldb, attrs.transpose_b,
-                           c_base + c_off, ldc, attrs.beta);
+                           c_base + c_off, ldc, attrs.alpha, beta);
     };
 
     if (batch.total > 1 && batch.total * M * N * K >= NAIVE_PARALLEL_MACS) {

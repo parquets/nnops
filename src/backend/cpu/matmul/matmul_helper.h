@@ -472,12 +472,14 @@ void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* s
 //
 // A Q5_1 B is a 24-byte-block stream; the pack fuses unpack + dequantize into
 // the uniform panels above, so the MMA side is unchanged. The tile origin is
-// taken in block units (a panel can start mid-block), and `src_row_blocks` is
-// the row pitch in blocks. x86_64 only; get_matmul_plan rejects it elsewhere.
+// taken in block units (a panel can start mid-block), `src_row_blocks` is the
+// row pitch in blocks, and `scale` (alpha) multiplies every decoded weight.
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks);
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale);
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks);
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale);
 
 // B is always packed here; panels advance by the aligned nr_max*kc stride.
 void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
@@ -488,6 +490,14 @@ void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, in
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
 void tile_scale(half* c, int ldc, float scale, int M, int N);
+
+// Prime an fp output tile before its first k-block: C = scale * C + bias, with
+// one bias row covering the tile's columns. This is where MatMul's beta and its
+// optional bias enter the accumulator, so the k-blocks only add the product.
+void tile_scale_add_bias(float* c, int ldc, float scale, const float* bias,
+                         int M, int N);
+void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias,
+                         int M, int N);
 
 // ---- int8 (s8×s8) pack + MMA --------------------------------------------
 //

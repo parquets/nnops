@@ -43,6 +43,12 @@ void matmul_ref(const MatMulAttributes& attrs,
     const auto* b_base = b.ptr<float>();
     auto*       c_base = output.ptr<float>();
 
+    // Optional per-column bias, added after the product and before the
+    // activation (the same order the fused epilogue pass uses).
+    const bool has_bias = inputs.size() > 2;
+    const auto* bias = has_bias ? inputs[2].ptr<float>() : nullptr;
+    NNOPS_ASSERT(!has_bias || inputs[2].numel() >= N);
+
     const int64_t a_row_stride = a.row_stride_elems();
     const int64_t b_row_stride = b.row_stride_elems();
     const int64_t c_row_stride = output.row_stride_elems();
@@ -92,8 +98,15 @@ void matmul_ref(const MatMulAttributes& attrs,
                         : b_ptr[k * ldb + n];
                     sum += a_val * b_val;
                 }
+                if (attrs.alpha != 1.0f) { sum *= attrs.alpha; }
+                if (bias != nullptr) { sum += bias[n]; }
                 float* dst = c_ptr + m * ldc + n;
-                *dst = apply_epilogue(attrs.epilogue, sum + attrs.beta * (*dst), n);
+                // Product + bias + beta×old C, then the clamp and activation —
+                // the same order the tiled kernel's last-k clamp uses.
+                float out = sum + attrs.beta * (*dst);
+                out = std::min(std::max(out, attrs.epilogue.min_clip),
+                               attrs.epilogue.max_clip);
+                *dst = apply_epilogue(attrs.epilogue, out, n);
             }
         };
 

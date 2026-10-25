@@ -169,7 +169,9 @@ struct Case {
     bool f16;
     bool transpose_a;
     float beta = 0.0f;                         ///< 0/1/other: overwrite / accumulate / scale
+    float alpha = 1.0f;                        ///< scales the product only
     EpilogueActivateType ep = EpilogueActivateType::None;
+    bool bias = false;                         ///< adds a per-column [N] input
 };
 
 /// Deterministic prior C contents, so beta != 0 has something to act on.
@@ -229,6 +231,7 @@ void run_case(const Case& c) {
     attrs.transpose_b = c.transpose_b;
     attrs.transpose_a = c.transpose_a;
     attrs.beta = c.beta;
+    attrs.alpha = c.alpha;
     attrs.epilogue.type = c.ep;
     auto op = MatMul::create(attrs, Backend::CPU);
 
@@ -256,21 +259,51 @@ void run_case(const Case& c) {
         return nnops::test::make_planar(descs[0], out_f32.data());
     }();
 
-    const TensorView ins[] = {a, bv};
-    op->compute(output, ins);
+    // Optional [N] bias in the output dtype, deterministic and exactly
+    // representable in f16.
+    std::vector<float> bias_f32;
+    std::vector<half>  bias_f16;
+    const int64_t bias_shape[] = {N};
+    if (c.bias) {
+        bias_f32.resize(static_cast<size_t>(N));
+        bias_f16.resize(static_cast<size_t>(N));
+        for (int64_t n = 0; n < N; ++n) {
+            const float v = 0.125f * static_cast<float>(n % 9) - 0.5f;
+            bias_f32[static_cast<size_t>(n)] = v;
+            bias_f16[static_cast<size_t>(n)] = float_to_half(v);
+        }
+    }
+    const TensorView bias_view(
+        bias_shape, a16 ? DataType::f16 : DataType::f32,
+        a16 ? static_cast<void*>(bias_f16.data())
+            : static_cast<void*>(bias_f32.data()));
+
+    const TensorView ins2[] = {a, bv};
+    const TensorView ins3[] = {a, bv, bias_view};
+    op->compute(output, c.bias ? std::span<const TensorView>(ins3, 3)
+                               : std::span<const TensorView>(ins2, 2));
 
     std::vector<float> want = a16
         ? reference_matmul<half>(a_f16_logical.data(), b, M, N, K, c.transpose_b)
         : reference_matmul<float>(a_f32.data(), b, M, N, K, c.transpose_b);
 
-    // Post-accumulation semantics shared by every route: C = A×B + beta·C_old,
-    // then the clamp/epilogue.
+    // Post-accumulation semantics shared by every route: C = alpha·(A×B)
+    // + beta·C_old, then the clamp/epilogue. alpha scales the product only.
     for (int64_t i = 0; i < M * N; ++i) {
         float v = want[static_cast<size_t>(i)];
+        if (c.alpha != 1.0f) {
+            v *= c.alpha;
+        }
         if (c.beta != 0.0f) {
             const float old = a16
                 ? half_to_float(float_to_half(ramp_value(i))) : ramp_value(i);
             v += c.beta * old;
+        }
+        if (c.bias) {
+            // Unscaled by alpha, added before the clamp/epilogue.
+            const int64_t n = i % N;
+            v += a16 ? half_to_float(float_to_half(bias_f32[static_cast<size_t>(n)]))
+                     : bias_f32[static_cast<size_t>(n)];
         }
         want[static_cast<size_t>(i)] = apply_expected_epilogue(v, c.ep);
     }
@@ -358,6 +391,21 @@ NNOPS_TEST(matmul_q5_1_f32) {
     // Transposed A: physically [K][M], so the pack-A route runs as well.
     run_case({17, 23, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/true});
     run_case({17, 23, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/true});
+    // alpha rides the Q5_1 RHS pack (every decoded weight scaled), so the
+    // packed route needs no post-pass; both physical layouts covered.
+    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false,
+              0.0f, 2.5f});
+    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false,
+              0.0f, -1.5f});
+    run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false,
+              0.5f, 0.5f});
+    // A bias enters the accumulator as beta·C_old + bias before the first
+    // k-block, so the overwriting (beta = 0) case must still keep it, and the
+    // f16 panel scaling of alpha stays separate.
+    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false,
+              0.0f, 1.0f, EpilogueActivateType::None, /*bias=*/true});
+    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false,
+              0.5f, 2.0f, EpilogueActivateType::None, /*bias=*/true});
 }
 
 /// The small-M fused route: Q5_1 blocks decoded straight into the reduction
@@ -382,10 +430,25 @@ NNOPS_TEST(matmul_q5_1_fused_small_m) {
     run_case({5, 37, 70, /*transpose_b=*/true, false, false, 0.5f});
 
     // Clamp folds into the final write.
-    run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f,
+    run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
               EpilogueActivateType::Relu6});
-    run_case({7, 37, 70, /*transpose_b=*/true, false, false, 0.0f,
+    run_case({7, 37, 70, /*transpose_b=*/true, false, false, 0.0f, 1.0f,
               EpilogueActivateType::Relu});
+
+    // alpha in the fused kernels, which scale the finished dot (full blocks
+    // and the scalar k tail alike), with and without beta.
+    run_case({16, 37, 33, /*transpose_b=*/true, false, false, 0.0f, 2.0f});
+    run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, -0.5f});
+    run_case({5, 37, 70, /*transpose_b=*/true, false, false, 0.5f, 3.0f});
+
+    // The bias primes the tile before the fused kernel runs, so the accumulate
+    // mode has to be used even at beta = 0.
+    run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
+              EpilogueActivateType::None, /*bias=*/true});
+    run_case({8, 71, 160, /*transpose_b=*/true, false, false, 0.0f, 2.0f,
+              EpilogueActivateType::None, /*bias=*/true});
+    run_case({16, 37, 33, /*transpose_b=*/true, false, false, 0.5f, 1.5f,
+              EpilogueActivateType::Relu6, /*bias=*/true});
 }
 
 NNOPS_TEST(matmul_q5_1_f16) {
@@ -393,4 +456,15 @@ NNOPS_TEST(matmul_q5_1_f16) {
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false});
     run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/true, /*transpose_a=*/false});
     run_case({17, 23, 70, /*transpose_b=*/true, /*f16=*/true, /*transpose_a=*/true});
+    // The f16 panel is scaled in f16 after the decode, so the rounding is one
+    // more step than the f32 route's — same arch-aware tolerance.
+    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/true, /*transpose_a=*/false,
+              0.0f, 2.0f});
+    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false,
+              0.0f, 0.5f});
+    // f16 bias on the tiled route (the fused small-M route is f32-only).
+    run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/true, /*transpose_a=*/false,
+              0.0f, 1.0f, EpilogueActivateType::None, /*bias=*/true});
+    run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false,
+              0.5f, 1.0f, EpilogueActivateType::None, /*bias=*/true});
 }

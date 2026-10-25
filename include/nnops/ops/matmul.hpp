@@ -15,13 +15,29 @@ namespace nnops {
 
 /// Attributes for matrix multiplication.
 ///
-/// Semantics: C = alpha × (A × B) + beta × bias
-/// where bias is an optional third input broadcast over M rows.
+/// Semantics: C = epilogue(alpha × (A × B) + bias + beta × C_old)
+/// where bias is an optional third input of shape [N], broadcast over the M
+/// rows. It sits between the product and the activation, so `epilogue` sees
+/// `product + bias`.
+///
+/// A bias is supported only where the output is floating point — every fp × fp
+/// route, the Q5_1 weight route, and the dequantizing int8 route (output_dtype
+/// f32/f16). The raw integer routes (output_dtype s32 / s8) have no bias
+/// semantics and reject it.
 struct MatMulAttributes {
     bool transpose_a = false;
     bool transpose_b = false;
 
-    /// Scale factor for the A×B matrix product (fused into pack — zero overhead).
+    /// Scale factor for the A×B matrix product only — bias and beta×C_old stay
+    /// unscaled (see the semantics above). Floating-point routes fold it into
+    /// the RHS pack (f32/f16 × f32/f16, Q5_1 weights), so it costs nothing; the
+    /// small-M kernels apply it to the accumulator before the beta add.
+    ///
+    /// The raw integer routes (output_dtype s32 / s8) ignore alpha: their
+    /// accumulator is int32 and has no scale of its own — requantization
+    /// belongs in the output QuantParams. The dequantizing int8 route ignores
+    /// it too, for the same reason (its scale is per-tensor/per-channel, not
+    /// a single float).
     float alpha = 1.0f;
 
     /// Scale factor for old C values: C_out = alpha×A×B + bias + beta×C_old.

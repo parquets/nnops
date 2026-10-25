@@ -318,7 +318,7 @@ void check_q5_1_panels(const Q5Matrix& m, bool trans,
     std::vector<T> dst(static_cast<size_t>(npanels * ldd), T{});
 
     pack_q5_1_rhs<T>(trans, n_start, nc, k_start, kc,
-                     dst.data(), ldd, m.bytes.data(), m.blocks_per_row);
+                     dst.data(), ldd, m.bytes.data(), m.blocks_per_row, 1.0f);
 
     for (int p = 0; p < npanels; ++p) {
         const int n0 = n_start + p * q5_1_nr_max;
