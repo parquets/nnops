@@ -27,7 +27,8 @@ enum class ConvAlgorithm : uint8_t {
 };
 
 /// True for the quantized Conv2D route: an s8 weight (per-channel QuantParams)
-/// against a u8/s8/f16/f32 activation (per-tensor QuantParams), fp output.
+/// against a u8/s8/f16/f32 activation (per-tensor QuantParams), with an fp or
+/// integer (s8/u8) output.
 ///
 /// Analogous to `is_int8_matmul` / `is_fp_quant_matmul`, this lives here so the
 /// operator and the CPU backend agree on which dtype combination is the
@@ -63,6 +64,9 @@ struct Conv2DAttributes {
     AutoPad auto_pad = AutoPad::NOTSET;
 
     /// Post-processing applied during output write-back (default: identity).
+    /// On an s8/u8 destination (the quantized route) only Relu is applied — on
+    /// the int32 accumulate, before the requant; the clip range and the other
+    /// activations belong to the fp epilogue and are ignored there.
     Epilogue epilogue{};
 
     /// If true, add result to existing output buffer instead of overwriting.
@@ -75,10 +79,20 @@ struct Conv2DAttributes {
     // The two attributes mirror MatMul's: same names, same meaning. They are
     // ignored on the floating-point route.
 
-    /// Output dtype of the quantized route when the activation is *already*
-    /// quantized (u8/s8): the GEMM output is dequantized to this fp type.
-    /// Ignored when the activation is f32/f16 — the output then follows the
-    /// activation's dtype (f32 → f32, f16 → f16), as on MatMul's dq route.
+    /// Output dtype of the quantized route.
+    ///
+    ///   f32 (default) / f16: dequantize the int32 accumulate. With an fp
+    ///                        activation (f32/f16) the output follows the
+    ///                        activation's dtype and the value is ignored; with
+    ///                        a pre-quantized one (u8/s8) it is honoured.
+    ///   s8 / u8:             requantize the accumulate with the output's
+    ///                        QuantParams (scale s_w·s_x/out_scale, round half
+    ///                        away from zero, clamped to the storage range; the
+    ///                        product is f32, as in ONNX Runtime's requantize).
+    ///                        Honoured for every activation dtype; the bias is
+    ///                        then int32 rather than the output dtype.
+    ///
+    /// Any other value is refused by the kernel plan.
     DataType output_dtype = DataType::f32;
 
     /// Integer storage the fp activation (f32/f16) is quantized to inside the
@@ -106,8 +120,12 @@ struct Conv2DAttributes {
 ///
 /// Data types: f32/f16 on every input and output (the floating-point route), or
 /// the quantized route — an s8 weight with per-channel QuantParams against a
-/// u8/s8/f16/f32 activation with per-tensor QuantParams, producing fp output.
-/// See is_quantized_conv2d().
+/// u8/s8/f16/f32 activation with per-tensor QuantParams, producing fp or s8/u8
+/// output (see Conv2DAttributes::output_dtype). See is_quantized_conv2d().
+///
+/// The bias dtype follows the output: [OC] in the output's fp dtype on an fp
+/// destination, [OC] int32 on an s8/u8 one (the raw int32 accumulate, added
+/// before the activation and never scaled by anything).
 class Conv2D : public OpBase {
 public:
     static std::unique_ptr<Conv2D> create(const Conv2DAttributes& attrs,

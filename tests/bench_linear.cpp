@@ -20,6 +20,9 @@
 ///   linear_f16            the same pairing in f16.
 ///   linear_int8           u8s8 / s8s8 -> f32 / f16, the dequant route, with
 ///                         realistic per-token X and per-channel W parameters.
+///   linear_int8_int_out   the same operands with an integral destination
+///                         (s32 / s8 / u8) and its int32 bias, against the f32
+///                         dequantizing row.
 ///   linear_threads        block-granularity scaling of the plain f32 call.
 ///
 /// The decode rows (M=1) are the ones that matter for the operator's real use:
@@ -253,21 +256,27 @@ void bench_fp_vs_matmul(const char* tag, const std::vector<Shape>& shapes,
 
 /// One u8|s8 x s8 problem with the parameters an LLM checkpoint carries: X
 /// per-token (scale per row, zero point per row), W per-channel (scale and zero
-/// point per output channel). The output is fp, which is the whole reason this
-/// route exists — the int32 accumulate is dequantized in the MatMul output pass.
+/// point per output channel). `out_dt` selects the output pass: f32/f16
+/// dequantize the int32 accumulate, s32 keeps it (a bias-only pass), s8/u8
+/// requantize it with the output's QuantParams. An integer destination takes its
+/// bias as int32, an fp one in the output dtype.
 template <typename OutT>
 struct QuantProblem {
     std::vector<int8_t> a_buf, w_buf;   // byte storage; X's dtype decides s8/u8
     std::vector<float> sx, sw;
     std::vector<int32_t> zx, zw;
+    std::vector<int32_t> ibias;         // bias storage, integer destinations
+    std::vector<OutT> fbias;            // bias storage, fp destinations
     std::vector<OutT> out_buf;
     TensorView out;
     std::vector<TensorView> ins;
+    QuantParams out_q;
     std::unique_ptr<OpBase> linear;
     std::unique_ptr<OpBase> matmul;
     double flops;
 
-    QuantProblem(const Shape& s, DataType a_dt, DataType out_dt, uint64_t seed = 1)
+    QuantProblem(const Shape& s, DataType a_dt, DataType out_dt,
+                 uint64_t seed = 1, bool with_bias = false)
         : a_buf(static_cast<size_t>(s.M * s.K)),
           w_buf(static_cast<size_t>(s.N * s.K)),
           sx(static_cast<size_t>(s.M)),
@@ -305,6 +314,15 @@ struct QuantProblem {
         qw.zero_point_data = zw.data();
         qw.num_scales = s.N;
 
+        // An s8/u8 destination requantizes with the output's own parameters.
+        const bool int_out = (out_dt == DataType::s32 || out_dt == DataType::s8 ||
+                              out_dt == DataType::u8);
+        if (out_dt == DataType::s8 || out_dt == DataType::u8) {
+            out_q.granularity = QuantGranularity::PerTensor;
+            out_q.scale = 0.0625f;
+            out_q.zero_point = (out_dt == DataType::u8) ? 128 : 0;
+        }
+
         const int64_t as[] = {s.M, s.K};
         const int64_t ws[] = {s.N, s.K};
         const int64_t os[] = {s.M, s.N};
@@ -312,7 +330,30 @@ struct QuantProblem {
                          a_buf.data(), TensorLayout::NCHW, qx);
         ins.emplace_back(std::span<const int64_t>(ws, 2), DataType::s8,
                          w_buf.data(), TensorLayout::NCHW, qw);
-        out = TensorView(std::span<const int64_t>(os, 2), out_dt, out_buf.data());
+        if (with_bias) {
+            const int64_t bs[] = {s.N};
+            if (int_out) {
+                ibias.resize(static_cast<size_t>(s.N));
+                for (auto& b : ibias) {
+                    b = static_cast<int32_t>(rng.next_u64() % 4096) - 2048;
+                }
+                ins.emplace_back(std::span<const int64_t>(bs, 1), DataType::s32,
+                                 ibias.data(), TensorLayout::NCHW);
+            } else {
+                fbias.resize(static_cast<size_t>(s.N));
+                for (auto& b : fbias) {
+                    if constexpr (std::is_same_v<OutT, half>) {
+                        b = nnops::backend::cpu::float_to_half(rng.next_float(-0.5f, 0.5f));
+                    } else {
+                        b = rng.next_float(-0.5f, 0.5f);
+                    }
+                }
+                ins.emplace_back(std::span<const int64_t>(bs, 1), out_dt,
+                                 fbias.data(), TensorLayout::NCHW);
+            }
+        }
+        out = TensorView(std::span<const int64_t>(os, 2), out_dt, out_buf.data(),
+                         TensorLayout::NCHW, out_q);
 
         LinearAttributes la;
         la.output_dtype = out_dt;
@@ -341,8 +382,8 @@ struct QuantProblem {
 /// operands and identical output dtype.
 template <typename OutT>
 void bench_quant_row(const Shape& s, DataType a_dt, DataType out_dt, int nt,
-                     double target_ms, int rounds) {
-    QuantProblem<OutT> p(s, a_dt, out_dt);
+                     double target_ms, int rounds, bool with_bias = false) {
+    QuantProblem<OutT> p(s, a_dt, out_dt, 1, with_bias);
     SimplePool pool(nt);
     ComputeContext ctx;
     if (nt > 1) { ctx.cpu = pool.cpu; }
@@ -353,11 +394,16 @@ void bench_quant_row(const Shape& s, DataType a_dt, DataType out_dt, int nt,
         vm.push_back(p.run(*p.matmul, ctx, target_ms));
     }
     const double gl = median(vl), gm = median(vm);
-    std::printf("   %5lld %5lld %5lld  %-7s -> %-3s | %9.1f %9.1f %5.3f |\n",
+    const char* oname = out_dt == DataType::f16   ? "f16"
+                      : out_dt == DataType::s32   ? "s32"
+                      : out_dt == DataType::s8    ? "s8"
+                      : out_dt == DataType::u8    ? "u8"
+                                                  : "f32";
+    std::printf("   %5lld %5lld %5lld  %-7s -> %-3s%s | %9.1f %9.1f %5.3f |\n",
                 static_cast<long long>(s.M), static_cast<long long>(s.K),
                 static_cast<long long>(s.N),
-                a_dt == DataType::u8 ? "u8s8" : "s8s8",
-                out_dt == DataType::f16 ? "f16" : "f32",
+                a_dt == DataType::u8 ? "u8s8" : "s8s8", oname,
+                with_bias ? " +b" : "   ",
                 gl, gm, gm > 0.0 ? gl / gm : 0.0);
 }
 
@@ -474,6 +520,44 @@ NNOPS_BENCH(linear_int8) {
                                kBudgetMs, kRounds);
         bench_quant_row<half>(s, DataType::s8, DataType::f16, kThreads,
                               kBudgetMs, kRounds);
+    }
+}
+
+// ============================================================
+// Quantized operands with an integer destination — s32 / s8 / u8
+// ============================================================
+//
+// The output dtype decides which pass ends the call. s32 writes the compensated
+// accumulate with the int32 bias added (the reductions stay off when the zero
+// points are symmetric); s8/u8 requantize with the output's QuantParams, so the
+// reduction sweep has to run and the per-element walk does the round-and-clamp.
+// f32 is kept as the dequantizing baseline. Every row carries a bias, since that
+// is the input the integer routes exist to fuse.
+
+NNOPS_BENCH(linear_int8_int_out) {
+    const std::vector<Shape> shapes{
+        {1, 4096, 4096},     // decode: the output pass is the largest share
+        {128, 4096, 4096},   // prefill: the GEMM dominates
+    };
+    constexpr int kRounds = 3;
+    constexpr double kBudgetMs = 100.0;
+    constexpr int kThreads = 1;
+
+    std::printf("  quantized Linear, integer destinations vs MatMul(tb)"
+                "  %dT  budget=%.0f ms/cell  rounds=%d\n", kThreads, kBudgetMs,
+                kRounds);
+    std::printf("   %5s %5s %5s  %-7s    %-6s | %9s %9s %5s |\n", "M", "K", "N",
+                "dtype", "out", "Linear", "MatMul", "L/M");
+
+    for (const Shape& s : shapes) {
+        bench_quant_row<float>(s, DataType::s8, DataType::f32, kThreads,
+                               kBudgetMs, kRounds, /*with_bias=*/true);
+        bench_quant_row<int32_t>(s, DataType::s8, DataType::s32, kThreads,
+                                 kBudgetMs, kRounds, /*with_bias=*/true);
+        bench_quant_row<int8_t>(s, DataType::s8, DataType::s8, kThreads,
+                                kBudgetMs, kRounds, /*with_bias=*/true);
+        bench_quant_row<uint8_t>(s, DataType::s8, DataType::u8, kThreads,
+                                 kBudgetMs, kRounds, /*with_bias=*/true);
     }
 }
 

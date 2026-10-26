@@ -1,6 +1,6 @@
 /// @file conv2d_im2col_int8.cpp
 /// @brief Quantized Conv2D kernel — s8 weight × u8/s8/f16/f32 activation →
-///        f32 / f16 output (planar NCHW).
+///        f32 / f16 / s8 / u8 output (planar NCHW).
 ///
 /// The floating-point route (conv2d_im2col.cpp) maps Conv2D onto
 ///   C[OC][roi_area] = W[OC][IC/G · karea] × col[IC/G · karea][roi_area]
@@ -12,9 +12,11 @@
 ///       s8 bytes.
 ///
 /// Everything after that is the shipped int8 GEMM: pack A and B into the arch's
-/// panels, accumulate int32, then dq_epilogue_tile (simd_epilogue.hpp)
-/// compensates the zero points, dequantizes, adds the bias, clips and
-/// activates.
+/// panels, accumulate int32, then the epilogue (simd_epilogue.hpp) compensates
+/// the zero points and either dequantizes, adds the bias, clips and activates
+/// (fp destination — dq_epilogue_tile), or adds an int32 bias, applies Relu and
+/// requantizes with the output's QuantParams (s8/u8 destination —
+/// int8_epilogue_tile, the same one MatMul's integer output uses).
 ///
 /// An fp activation is quantized into a compact plane once, before the tile
 /// loop (quantize_plane), and is bytes from then on — the same representation a
@@ -64,7 +66,7 @@
 
 #include "conv2d_im2col.h"
 #include "backend/cpu/matmul/matmul_helper.h"                 // int8 pack / MMA, panel strides, arch bias
-#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // dq_epilogue_tile, quant_scale_at
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // dq/int8_epilogue_tile, quant_scale_at
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"     // tiled_im2col_2d
 #include "backend/cpu/simd_kernel/simd_quant.hpp"      // quant_kernel::quantization (fp → s8/u8)
 #include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"// int8_row_sum / int8_col_sum_slab
@@ -181,6 +183,9 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
     /// The B packer XORs 0x80, i.e. reads the stored bytes as unsigned and
     /// shifts them to (value − 128).
     constexpr bool kU8 = std::is_same_v<TDst, uint8_t>;
+    /// An integer destination: the accumulators are requantized (not
+    /// dequantized) and the bias is an int32 per output channel.
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
     const auto& input  = inputs[0];
     const auto& weight = inputs[1];
@@ -249,12 +254,17 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
     const bool    a_biased      = int8_a_pack_bias(DataType::s8) != 0;
     const int32_t a_bias_offset = int8_epilogue_offset(DataType::s8);
 
-    // The compensation is the identity for every (row, column) exactly when the
-    // weight's zero point is already the compensated one and the shifted
-    // activation zero point is 0 — then neither reduction is swept and r_a / r_b
-    // stay null (see DqEpilogueParams::compensate).
-    const bool need_comp =
-        !all_zp_equal(qw, OC, -a_bias_offset) || zp_eff != 0;
+    // The epilogue's compensation is
+    //     raw − (a_bias_offset + zp_a[m])·r_b[n] − zp_b·r_a[m] + k·zp_a[m]·zp_b
+    // Only the first product is per column: it survives exactly when the
+    // weight's zero point is not already the compensated one. Everything else
+    // is per output channel, so it is computed once per call — into the bias for
+    // an integer destination (what MLAS prepacks into its Bias), into an int32
+    // row offset for the fp one (see row_fold / bias_fold below).
+    const bool need_col_sum = !all_zp_equal(qw, OC, -a_bias_offset);
+    // r_a feeds both the column term and the fold; the fp epilogue reads both
+    // reductions whenever it compensates.
+    const bool need_comp = need_col_sum || zp_eff != 0;
 
     // ---- the activation as stored bytes -----------------------------------
     // An fp activation is quantized into the plane at the front of the scratch
@@ -278,19 +288,59 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
     const int64_t ig_step  = ic_per_group * icn_step;    // between groups (input)
 
     const int8_t* w_ptr = weight.ptr<int8_t>();
-    const TOut* b_ptr   = has_bias ? inputs[2].ptr<TOut>() : nullptr;
+    // The bias is typed by the branch: output dtype on the fp destination,
+    // int32 [OC] on the integer one.
+    [[maybe_unused]] const TOut* b_ptr =
+        (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    [[maybe_unused]] const int32_t* b_i32 =
+        (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
     TOut* out_ptr       = output.ptr<TOut>();
+    // The requant's output parameters, read only for an integer destination.
+    [[maybe_unused]] const QuantParams& qc = output.quant_params();
 
     // R_a[oc] = Σ_k weight[oc,k], over the whole K (never a single ic-block).
     // The weight layout is [OC][IC/G][KH][KW], so the global output-channel
     // index works across groups.
+    //
+    // Deliberately serial: it is one SIMD pass over the weight panel — the same
+    // bytes the A pack streams in every ic-block, so a few percent of the call —
+    // while a `ctx.cpu.run` here is a second pool dispatch on top of the tile
+    // one. With the pool that spawns and joins per parallel_for that dispatch
+    // costs more than the pass itself and grows with the pool: measured on this
+    // host as 1.18x at 2T -> 1.9x at 20T on a 3x3 whose zero points are not the
+    // packer's (bench_conv2d conv2d_i8_act_zp_ab, the zp120 arms).
     std::vector<int32_t> r_a;
     if (need_comp) {
         r_a.resize(static_cast<size_t>(OC));
-        ctx.cpu.run(0, OC, [&](int64_t oc) {
+        for (int64_t oc = 0; oc < OC; ++oc) {
             r_a[static_cast<size_t>(oc)] =
                 k::int8_row_sum<int8_t>(w_ptr + oc * w_ocn_step, k_full);
-        });
+        }
+    }
+
+    // The per-channel half of the compensation, computed once per call instead
+    // of once per element: −zp_b·(r_a − k·zp_a) per output channel. An integer
+    // destination folds it into the bias; an fp one takes it as an int32 row
+    // offset ahead of the dequantize (its own bias is fp and cannot carry it).
+    // Either way the epilogue then compensates only for the column term, and
+    // sweeps r_b only when that term exists.
+    std::vector<int32_t> row_fold;
+    std::vector<int32_t> bias_fold;
+    if (!need_col_sum && zp_eff != 0) {
+        row_fold.resize(static_cast<size_t>(OC));
+        for (int64_t oc = 0; oc < OC; ++oc) {
+            const int32_t coef_zp =
+                r_a[static_cast<size_t>(oc)] -
+                static_cast<int32_t>(k_full) * quant_zp_at(qw, oc);
+            row_fold[static_cast<size_t>(oc)] = -zp_eff * coef_zp;
+        }
+        if constexpr (kIntOut) {
+            bias_fold.resize(static_cast<size_t>(OC));
+            for (int64_t oc = 0; oc < OC; ++oc) {
+                bias_fold[static_cast<size_t>(oc)] =
+                    row_fold[static_cast<size_t>(oc)] + (b_i32 ? b_i32[oc] : 0);
+            }
+        }
     }
 
     // R_b[column] = Σ_k (stored byte) over the whole K of one output column,
@@ -298,7 +348,7 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
     // oh-block, and never outlives this call.
     const int64_t r_b_len = plan.oh_block * OW;
     std::vector<int32_t> r_b_buf(
-        need_comp ? static_cast<size_t>(plan.num_slots * r_b_len) : 0);
+        need_col_sum ? static_cast<size_t>(plan.num_slots * r_b_len) : 0);
 
     // ---- scratch slices ---------------------------------------------------
     // The quantized-activation plane, when there is one, occupies the front of
@@ -331,12 +381,15 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
         int8_t* pack_b = pack_b_base + slot * plan.pack_size;
         int32_t* acc   = acc_base + slot * plan.acc_size;
         int8_t* pack_a = pack_a_base + slot * plan.pack_a_size;
-        int32_t* r_b   = need_comp ? r_b_buf.data() + slot * r_b_len : nullptr;
+        int32_t* r_b   = need_col_sum ? r_b_buf.data() + slot * r_b_len : nullptr;
 
         TOut* output_ptr = out_ptr + n * ob_step + g * og_step;
         const TDst* input_ptr  = in_base + n * ib_step + g * ig_step;
         const int8_t* weight_ptr = w_ptr + g * oc_per_group * w_ocn_step;
-        const TOut* bias_ptr = b_ptr ? b_ptr + g * oc_per_group : nullptr;
+        [[maybe_unused]] const TOut* bias_ptr =
+            b_ptr ? b_ptr + g * oc_per_group : nullptr;
+        [[maybe_unused]] const int32_t* ibias_ptr =
+            b_i32 ? b_i32 + g * oc_per_group : nullptr;
 
         // Contiguous range of oh-blocks owned by this chunk (disjoint across
         // chunks, so output tiles never overlap → bit-identical to serial).
@@ -372,7 +425,7 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
                 const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
 
                 // The column sums accumulate across this oc-block's ic-blocks.
-                if (need_comp) {
+                if (need_col_sum) {
                     std::fill(r_b, r_b + roi_area, 0);
                 }
 
@@ -413,7 +466,7 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
                                      reinterpret_cast<const int8_t*>(b_src), b_ld,
                                      a_biased, /*src_shift=*/kU8);
 
-                    if (need_comp) {
+                    if (need_col_sum) {
                         // Sum the bytes as the packer read them, then move the
                         // unsigned sum into the shifted space the kernel multiplies.
                         if constexpr (kU8) {
@@ -442,30 +495,79 @@ void conv2d_int8_impl(const Conv2DAttributes& attrs,
                                      pack_a, pack_b, INT32_MIN, INT32_MAX);
                 }
 
-                // The oc-block is complete: dequantize in place, on the tile, while
-                // it is still hot.
-                DqEpilogueParams<TOut> ip{};
-                ip.r_a        = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
-                ip.s_a        = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn
-                                              : nullptr;
-                ip.zp_a       = qw.zero_point_data
-                              ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
-                ip.r_b        = r_b;
-                ip.zp_b       = nullptr;          // per-tensor activation
-                ip.s_a_scalar = qw.scale;
-                ip.s_b_scalar = s_x;
-                ip.zp_a_scalar = qw.zero_point;
-                ip.zp_b_scalar = zp_eff;
-                ip.a_bias_offset = a_bias_offset;
-                ip.k    = static_cast<int32_t>(k_full);
-                ip.compensate = need_comp;
-                ip.act_u8 = kU8;
-                ip.ep   = &attrs.epilogue;
-                ip.bias = bias_ptr ? bias_ptr + ocn : nullptr;
-                ip.out  = output_ptr + oh * out_row_stride + ocn * ocn_step;
-                ip.ldc_out = static_cast<int>(ocn_step);
-                dq_epilogue_tile<TOut>(ip, acc, static_cast<int>(roi_area),
+                // The oc-block is complete: rewrite in place, on the tile, while
+                // it is still hot — dequantized to fp, or requantized to the
+                // integer destination.
+                if constexpr (kIntOut) {
+                    // MatMul's integer output pass: compensate, bias, Relu,
+                    // then the output scale / zero point into s8/u8. The rows
+                    // of the tile are output channels, so the weight's
+                    // per-channel arrays are the per-row ones and the bias is a
+                    // per-row int32.
+                    Int8EpilogueParams ip{};
+                    ip.r_a  = need_comp ? r_a.data() + g * oc_per_group + ocn
+                                        : nullptr;
+                    ip.s_a  = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn
+                                            : nullptr;
+                    ip.zp_a = qw.zero_point_data
+                            ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
+                    ip.r_b         = need_col_sum ? r_b : nullptr;
+                    ip.zp_b        = nullptr;          // per-tensor activation
+                    ip.s_a_scalar  = qw.scale;
+                    ip.s_b_scalar  = s_x;
+                    ip.zp_a_scalar = qw.zero_point;
+                    ip.zp_b_scalar = zp_eff;
+                    ip.a_bias_offset = a_bias_offset;
+                    ip.k    = static_cast<int32_t>(k_full);
+                    // With the weights' zero point off the compensated one, both
+                    // terms are live; otherwise the per-output-channel half is in
+                    // bias_fold and only the column term would be left.
+                    ip.compensate = need_col_sum;
+                    ip.col_term   = need_col_sum;
+                    ip.out_scale = quant_scale_at(qc, 0);
+                    ip.zp_out    = quant_zp_at(qc, 0);
+                    ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
+                    ip.bias = !bias_fold.empty()
+                            ? bias_fold.data() + g * oc_per_group + ocn
+                            : (ibias_ptr ? ibias_ptr + ocn : nullptr);
+                    TOut* dst = output_ptr + oh * out_row_stride + ocn * ocn_step;
+                    if constexpr (std::is_same_v<TOut, uint8_t>) {
+                        ip.out_u8 = dst;
+                    } else {
+                        ip.out = dst;
+                    }
+                    ip.ldc_out = static_cast<int>(ocn_step);
+                    int8_epilogue_tile(ip, acc, static_cast<int>(roi_area),
                                        0, 0, ocnc, roi_area);
+                } else {
+                    DqEpilogueParams<TOut> ip{};
+                    ip.r_a        = need_comp ? r_a.data() + g * oc_per_group + ocn : nullptr;
+                    ip.s_a        = qw.scale_data ? qw.scale_data + g * oc_per_group + ocn
+                                                  : nullptr;
+                    ip.zp_a       = qw.zero_point_data
+                                  ? qw.zero_point_data + g * oc_per_group + ocn : nullptr;
+                    ip.r_b        = need_col_sum ? r_b : nullptr;
+                    ip.row_off    = row_fold.empty() ? nullptr
+                                : row_fold.data() + g * oc_per_group + ocn;
+                    ip.zp_b       = nullptr;          // per-tensor activation
+                    ip.s_a_scalar = qw.scale;
+                    ip.s_b_scalar = s_x;
+                    ip.zp_a_scalar = qw.zero_point;
+                    ip.zp_b_scalar = zp_eff;
+                    ip.a_bias_offset = a_bias_offset;
+                    ip.k    = static_cast<int32_t>(k_full);
+                    // Both terms when the weights' zero point is not the
+                    // compensated one; otherwise the row half is in row_off.
+                    ip.compensate = need_col_sum;
+                    ip.col_term   = need_col_sum;
+                    ip.act_u8 = kU8;
+                    ip.ep   = &attrs.epilogue;
+                    ip.bias = bias_ptr ? bias_ptr + ocn : nullptr;
+                    ip.out  = output_ptr + oh * out_row_stride + ocn * ocn_step;
+                    ip.ldc_out = static_cast<int>(ocn_step);
+                    dq_epilogue_tile<TOut>(ip, acc, static_cast<int>(roi_area),
+                                           0, 0, ocnc, roi_area);
+                }
             }
         }
     });
@@ -502,10 +604,19 @@ void conv2d_int8_out(const Conv2DAttributes& attrs,
                      const Conv2DPlan& plan,
                      void* workspace)
 {
-    if (output.data_type() == DataType::f16) {
+    switch (output.data_type()) {
+    case DataType::f16:
         conv2d_int8_act<TAct, half>(attrs, output, inputs, ctx, plan, workspace);
-    } else {
+        break;
+    case DataType::s8:
+        conv2d_int8_act<TAct, int8_t>(attrs, output, inputs, ctx, plan, workspace);
+        break;
+    case DataType::u8:
+        conv2d_int8_act<TAct, uint8_t>(attrs, output, inputs, ctx, plan, workspace);
+        break;
+    default:
         conv2d_int8_act<TAct, float>(attrs, output, inputs, ctx, plan, workspace);
+        break;
     }
 }
 

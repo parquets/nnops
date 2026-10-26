@@ -520,6 +520,7 @@ struct Conv2DI8Case {
     DataType out = DataType::f32;
     DataType act_q = DataType::s8;    // quantization target for fp activations
     bool asym_w = false;              // per-channel weight zero point != 0
+    int32_t zp_x = 128;               // activation zero point (u8 activations)
 };
 
 /// float → s8/u8 storage value, with the arithmetic the kernels use.
@@ -550,7 +551,7 @@ struct I8Op {
         const bool fp_act = (c.act == DataType::f32 || c.act == DataType::f16);
         const bool target_u8 = (c.act_q == DataType::u8);
         const float s_x = 0.0078125f;   // 1/128 — exact, and the fp range fits
-        const int32_t zp_x = (act_u8 || (fp_act && target_u8)) ? 128 : 0;
+        const int32_t zp_x = (act_u8 || (fp_act && target_u8)) ? c.zp_x : 0;
         const int64_t act_n = N * IC * IH * IW;
 
         act.resize(static_cast<size_t>(act_n) * static_cast<size_t>(data_type_size(c.act)));
@@ -587,10 +588,19 @@ struct I8Op {
             }
         }
 
+        const bool int_out = (c.out == DataType::s8 || c.out == DataType::u8);
         if (c.bias) {
-            bias.resize(static_cast<size_t>(OC) * static_cast<size_t>(data_type_size(c.out)));
+            bias.resize(static_cast<size_t>(OC) *
+                        (int_out ? sizeof(int32_t) : static_cast<size_t>(data_type_size(c.out))));
             test::XorShift128 rng(33);
             for (int64_t oc = 0; oc < OC; ++oc) {
+                if (int_out) {
+                    // An integer destination takes the bias in the accumulate's
+                    // own units, not the output dtype's.
+                    reinterpret_cast<int32_t*>(bias.data())[oc] =
+                        static_cast<int32_t>(rng.next_float(-1500.0f, 1500.0f));
+                    continue;
+                }
                 const float b = rng.next_float(-0.5f, 0.5f);
                 if (c.out == DataType::f16) {
                     reinterpret_cast<half*>(bias.data())[oc] = float_to_half(b);
@@ -623,7 +633,16 @@ struct I8Op {
         ins.push_back(TensorView(wshape, DataType::s8, w.data(), TensorLayout::NCHW, qw));
         if (c.bias) {
             const int64_t bshape[] = {OC};
-            ins.push_back(TensorView(bshape, c.out, bias.data(), TensorLayout::NCHW));
+            ins.push_back(TensorView(bshape, int_out ? DataType::s32 : c.out,
+                                     bias.data(), TensorLayout::NCHW));
+        }
+
+        // An s8/u8 destination requantizes with the output's QuantParams; the
+        // scale is a plausible product scale (s_x · s_w ≈ 1e-2 · 1e-2).
+        if (int_out) {
+            out_q.granularity = QuantGranularity::PerTensor;
+            out_q.scale = 0.03125f;
+            out_q.zero_point = (c.out == DataType::u8) ? 128 : 0;
         }
 
         std::vector<TensorDesc> descs;
@@ -635,7 +654,10 @@ struct I8Op {
         OH = outs[0].dims[2];
         OW = outs[0].dims[3];
         out_buf.assign(outs[0].nbytes(), 0);
-        out = test::make_planar(outs[0], out_buf.data());
+        // make_planar would drop the QuantParams the integer destination needs.
+        const std::span<const int64_t> oshape(outs[0].dims.data(), 4);
+        out = TensorView(oshape, outs[0].dtype, out_buf.data(),
+                         outs[0].layout, out_q);
 
         // Resolved at the thread count the pair runs on, with per-thread scratch
         // sized in — the bench pool reports thread ids. A single thread runs on
@@ -649,7 +671,7 @@ struct I8Op {
     void run(const ComputeContext& ctx) { op->compute(out, ins, ctx, nullptr); }
 
     Conv2DAttributes attrs{};
-    QuantParams qa{}, qw{};
+    QuantParams qa{}, qw{}, out_q{};
     std::vector<uint8_t> act, bias, out_buf;
     std::vector<int8_t>  w;
     std::vector<float>   w_s;
@@ -842,6 +864,79 @@ void bench_conv2d_i8_vs_fp(const Conv2DCase& c, int iters, int rounds) {
     run_ab_pair(c.name,
                 "fp32", fp.work, "GFLOPS", [&](const ComputeContext& x) { fp.run(x); },
                 "int8", i8.work, "GOPS",  [&](const ComputeContext& x) { i8.run(x); },
+                threads, iters, rounds);
+}
+
+/// Integer destinations against the same geometry's fp one: an s8/u8 output
+/// requantizes on the tile (`int8_epilogue_tile`) instead of dequantizing to
+/// f32 (`dq_epilogue_tile`), so this is the cost of the requant pass — the
+/// reductions it reads run either way only when the weight's zero point is
+/// asymmetric; with the symmetric parameters here both destinations skip them
+/// (the activation's zero point, when it is not the packer's, folds into the
+/// bias / a row offset instead). Both sides carry a bias (int32 on the integer
+/// destination).
+void bench_conv2d_i8_out(const Conv2DCase& c, DataType act, int iters, int rounds) {
+    const std::vector<int> threads = conv_bench_threads();
+    Conv2DI8Case base = as_i8(c, act);
+    base.bias = true;
+
+    Conv2DI8Case q_s8 = base;
+    q_s8.out = DataType::s8;
+    Conv2DI8Case q_u8 = base;
+    q_u8.out = DataType::u8;
+
+    I8Op fp(base, threads.back());
+    I8Op s8(q_s8, threads.back());
+    I8Op u8(q_u8, threads.back());
+    const char* act_tag = (act == DataType::u8) ? "u8" : "f32";
+
+    char title[192];
+    std::snprintf(title, sizeof(title),
+                  "%s  act=%s  bias  out: f32 dequant vs s8/u8 requant", c.name, act_tag);
+    run_ab_pair(title,
+                "f32", fp.work, "GOPS", [&](const ComputeContext& x) { fp.run(x); },
+                "s8",  s8.work, "GOPS", [&](const ComputeContext& x) { s8.run(x); },
+                threads, iters, rounds);
+    run_ab_pair(title,
+                "f32", fp.work, "GOPS", [&](const ComputeContext& x) { fp.run(x); },
+                "u8",  u8.work, "GOPS", [&](const ComputeContext& x) { u8.run(x); },
+                threads, iters, rounds);
+}
+
+/// The activation's zero point in the shifted space the packer produces:
+/// zp_eff = zp_x − 128 for a u8 activation. With symmetric weights the column
+/// coefficient (a_bias_offset + zp_a) is 0, so only the per-channel half of the
+/// compensation survives, and the route computes it once per call — into the
+/// bias for an integer destination, into an int32 row offset for the fp one.
+/// This A/B guards that fold: one convolution, zp_x 128 against 120, on both
+/// destinations. An arm slower than its twin means a reduction sweep or a
+/// per-element compensation came back.
+void bench_conv2d_i8_act_zp(const Conv2DCase& c, int iters, int rounds) {
+    const std::vector<int> threads = conv_bench_threads();
+    Conv2DI8Case q128 = as_i8(c, DataType::u8);
+    q128.bias = true;
+    Conv2DI8Case q120 = q128;
+    q120.zp_x = 120;
+    Conv2DI8Case q128_s8 = q128;
+    q128_s8.out = DataType::s8;
+    Conv2DI8Case q120_s8 = q120;
+    q120_s8.out = DataType::s8;
+
+    I8Op fp128(q128, threads.back()), fp120(q120, threads.back());
+    I8Op s8_128(q128_s8, threads.back()), s8_120(q120_s8, threads.back());
+
+    char title[192];
+    std::snprintf(title, sizeof(title),
+                  "%s  u8 act  out f32  act zp 128 vs 120", c.name);
+    run_ab_pair(title,
+                "zp128", fp128.work, "GOPS", [&](const ComputeContext& x) { fp128.run(x); },
+                "zp120", fp120.work, "GOPS", [&](const ComputeContext& x) { fp120.run(x); },
+                threads, iters, rounds);
+    std::snprintf(title, sizeof(title),
+                  "%s  u8 act  out s8   act zp 128 vs 120", c.name);
+    run_ab_pair(title,
+                "zp128", s8_128.work, "GOPS", [&](const ComputeContext& x) { s8_128.run(x); },
+                "zp120", s8_120.work, "GOPS", [&](const ComputeContext& x) { s8_120.run(x); },
                 threads, iters, rounds);
 }
 
@@ -1548,6 +1643,58 @@ NNOPS_BENCH(conv2d_i8_vs_fp_ab) {
                            /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
                            /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
                           10, 5);
+}
+
+// ============================================================
+// Quantized Conv2D with an integer destination (s8 / u8)
+// ============================================================
+//
+// An integer output requantizes on the tile with the output's QuantParams and
+// takes an int32 bias; the fp destination dequantizes. Same MACs, same gather,
+// same epilogue position — the difference is which per-element pass runs last.
+
+NNOPS_BENCH(conv2d_i8_out_3x3_ab) {
+    // Pre-quantized u8 activation, the deployment shape.
+    bench_conv2d_i8_out({"conv2d_i8_out 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                         1, 64, 56, 56, 64, 3, 3,
+                         /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                         /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
+                        DataType::u8, 10, 5);
+}
+
+NNOPS_BENCH(conv2d_i8_out_fp_act_ab) {
+    // fp activation: the quantize plane runs in addition, so this row also
+    // carries the pointwise-route question (an integer destination changes
+    // nothing about which path the tile loop takes).
+    bench_conv2d_i8_out({"conv2d_i8_out f32-act 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                         1, 64, 56, 56, 64, 3, 3,
+                         /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                         /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
+                        DataType::f32, 10, 5);
+}
+
+NNOPS_BENCH(conv2d_i8_out_pointwise_ab) {
+    // 1x1 pointwise: the epilogue is the largest share of the call here.
+    bench_conv2d_i8_out({"conv2d_i8_out pointwise 1x256x28x28 -> 256 x 1x1 +bias",
+                         1, 256, 28, 28, 256, 1, 1,
+                         /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0,
+                         /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
+                        DataType::u8, 10, 5);
+}
+
+NNOPS_BENCH(conv2d_i8_act_zp_ab) {
+    // The activation zero point the packer does not already remove: the fold
+    // that keeps it off the per-element path, on both destinations.
+    bench_conv2d_i8_act_zp({"conv2d_i8 act-zp 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
+                            1, 64, 56, 56, 64, 3, 3,
+                            /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                            /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
+                           10, 5);
+    bench_conv2d_i8_act_zp({"conv2d_i8 act-zp pointwise 1x256x28x28 -> 256 x 1x1 +bias",
+                            1, 256, 28, 28, 256, 1, 1,
+                            /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0,
+                            /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true},
+                           10, 5);
 }
 
 NNOPS_BENCH(conv2d_i8_fp_act_overhead_ab) {

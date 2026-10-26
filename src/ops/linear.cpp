@@ -72,12 +72,15 @@ std::vector<TensorDesc> Linear::getOutputTensorDesc(
 {
     auto out = linear_output_shape(inputs);
 
-    // The quantized path always produces floating point, selected by
-    // output_dtype; the fp path follows the input dtype (set by the shape
-    // helper already).
+    // The quantized path's output follows output_dtype: f32/f16 dequantizes,
+    // s32/s8/u8 keeps the result integral; the fp path follows the input dtype
+    // (set by the shape helper already).
     if (is_int8_matmul(inputs[0].dtype, inputs[1].dtype)) {
-        out[0].dtype = (attrs_.output_dtype == DataType::f16) ? DataType::f16
-                                                              : DataType::f32;
+        const DataType odt = attrs_.output_dtype;
+        const bool known = odt == DataType::f16 || odt == DataType::f32 ||
+                           odt == DataType::s32 || odt == DataType::s8 ||
+                           odt == DataType::u8;
+        out[0].dtype = known ? odt : DataType::f32;
     }
 
     return out;

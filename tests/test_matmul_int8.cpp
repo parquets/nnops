@@ -64,11 +64,13 @@ std::span<const int64_t> desc_shape(const TensorDesc& d) {
 }
 
 /// Run the tiled kernel and matmul_int8_ref over the same inputs and require
-/// exact agreement on every element. `out_qp` is only read for an s8 output.
+/// exact agreement on every element. `out_qp` is only read for an s8/u8 output.
 template <typename T>
 void expect_matches_ref(const MatMulAttributes& attrs, const TensorDesc& odesc,
                         std::span<const TensorView> ins, QuantParams out_qp = {}) {
-    const DataType dt = std::is_same_v<T, int32_t> ? DataType::s32 : DataType::s8;
+    constexpr DataType dt = std::is_same_v<T, int32_t> ? DataType::s32
+                          : std::is_same_v<T, uint8_t> ? DataType::u8
+                                                       : DataType::s8;
     std::vector<T> got(static_cast<size_t>(odesc.numel()));
     std::vector<T> want(static_cast<size_t>(odesc.numel()));
     TensorView output = make_q_nd(desc_shape(odesc), dt, got.data(), out_qp);
@@ -469,6 +471,116 @@ NNOPS_TEST(matmul_int8_u8_requant_s8_matches_ref) {
         const TensorView ins[] = {in.a, in.b};
         expect_matches_ref<int8_t>(attrs, descs[0], ins, per_tensor(2048.0f, -7));
     }
+}
+
+// ============================================================
+// int32 bias on the integer outputs
+// ============================================================
+
+NNOPS_TEST(matmul_int8_bias_s32) {
+    // Identity compensation: no zero points and no A shift left over, so the
+    // bias is the only thing the output pass does. A bias alone must still turn
+    // the pass on — without sweeping the reductions.
+    const int64_t ashape[] = {2, 3};
+    const int64_t bshape[] = {3, 2};
+    int8_t a_data[6] = {1, -2, 3, -4, 5, -6};
+    int8_t b_data[6] = {1, 2, 3, 4, 5, 6};
+    int32_t bias_data[2] = {-5, 7};
+
+    TensorView a(ashape, DataType::s8, a_data);
+    TensorView b(bshape, DataType::s8, b_data);
+    const int64_t bias_shape[] = {2};
+    TensorView bias(bias_shape, DataType::s32, bias_data);
+
+    MatMulAttributes attrs{};
+    attrs.output_dtype = DataType::s32;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<int32_t> out_buf(descs[0].numel());
+    auto output = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b, bias};
+    op->compute(output, ins, {}, nullptr);
+
+    // C = [[10, 12], [-19, -24]] + bias [-5, 7]
+    NNOPS_EXPECT_EQ(out_buf[0], 5);
+    NNOPS_EXPECT_EQ(out_buf[1], 19);
+    NNOPS_EXPECT_EQ(out_buf[2], -24);
+    NNOPS_EXPECT_EQ(out_buf[3], -17);
+}
+
+NNOPS_TEST(matmul_int8_bias_requant_matches_ref) {
+    // Per-token / per-channel zero points, K spanning several k-blocks, an int32
+    // bias, Relu and both integer destinations — kernel against reference,
+    // element for element.
+    for (DataType odt : {DataType::s8, DataType::u8}) {
+        const int64_t M = 7, K = 1200, N = 13;
+        I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/true, 5150, 1, 1,
+                                     DataType::u8);
+
+        std::vector<int32_t> bias_buf(static_cast<size_t>(N));
+        nnops::test::XorShift128 rng(77);
+        for (auto& v : bias_buf) {
+            v = static_cast<int32_t>(rng.next_u64() % 20001) - 10000;
+        }
+        const int64_t bias_shape[] = {N};
+        TensorView bias(bias_shape, DataType::s32, bias_buf.data());
+
+        MatMulAttributes attrs{};
+        attrs.transpose_b = true;
+        attrs.output_dtype = odt;
+        attrs.epilogue.type = EpilogueActivateType::Relu;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc arr[] = {in.a.desc(), in.b.desc()};
+        auto descs = op->getOutputTensorDesc(arr);
+        NNOPS_EXPECT_EQ(descs[0].dtype, odt);
+
+        // 1024 is a power of two: the requant scale adds no rounding of its own.
+        const QuantParams oq =
+            per_tensor(1024.0f, odt == DataType::u8 ? 128 : -7);
+        const TensorView ins[] = {in.a, in.b, bias};
+        if (odt == DataType::s8) {
+            expect_matches_ref<int8_t>(attrs, descs[0], ins, oq);
+        } else {
+            expect_matches_ref<uint8_t>(attrs, descs[0], ins, oq);
+        }
+    }
+}
+
+NNOPS_TEST(matmul_int8_requant_clamp_u8) {
+    // The u8 arm of the requant: the same saturating epilogue, clamped to
+    // [0, 255] instead of [-128, 127]. acc = 20000 and acc = -45, zp_out = 10.
+    const int64_t ashape[] = {2, 2};
+    const int64_t wshape[] = {2, 2};
+    int8_t a_data[4] = {100, 100, 1, -2};
+    //  W = [[100,100],[100,100]] → row 0: 20000, row 1: 1·100 + (−2)·100 = −100
+    int8_t w_data[4] = {100, 100, 100, 100};
+
+    TensorView a(ashape, DataType::s8, a_data);
+    TensorView w(wshape, DataType::s8, w_data);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = true;
+    attrs.output_dtype = DataType::u8;
+    auto op = MatMul::create(attrs, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), w.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::u8);
+
+    std::vector<uint8_t> out_buf(descs[0].numel());
+    TensorView output = make_q(2, 2, DataType::u8, out_buf.data(), per_tensor(1.0f, 10));
+
+    const TensorView ins[] = {a, w};
+    op->compute(output, ins, {}, nullptr);
+
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 255);   // 20000 + 10 clamps
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 255);
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[2]), 0);     // −100 + 10 clamps
+    NNOPS_EXPECT_EQ(static_cast<int>(out_buf[3]), 0);
 }
 
 // ============================================================
@@ -985,4 +1097,37 @@ NNOPS_TEST(matmul_int8_threaded_matches_ref) {
     }
     expect_i8_threaded_matches_ref<int8_t>(256, 256, 256, 4, 34, /*ta=*/true, /*tb=*/true,
                                            DataType::u8);
+}
+
+NNOPS_TEST(matmul_int8_per_tensor_weight_zp_matches_ref) {
+    // A per-tensor (non-zero) zp_w is the one shape that lets the per-element
+    // half of the compensation fold into a single int32 per output row, which
+    // the epilogue then adds from its per-row bias slot. With A symmetric that
+    // fold is the whole compensation; with a per-token A zero point the column
+    // half is swept as usual. Both destination kinds are compared to the
+    // reference.
+    for (int symmetric_a : {1, 0}) {
+        const int64_t M = 15, K = 23, N = 12;
+        I8Inputs in = make_i8_inputs(M, K, N, /*transpose_b=*/true, 4711 + 2 * symmetric_a);
+        TensorView a = make_q(M, K, DataType::s8, in.a_buf.data(),
+                              symmetric_a
+                                  ? per_tensor(1.0f, 0)
+                                  : per_token(in.a_scale.data(), in.a_zp.data(), M));
+        TensorView b = make_q(N, K, DataType::s8, in.b_buf.data(), per_tensor(1.0f, -3));
+        const TensorView ins[] = {a, b};
+
+        for (DataType odt : {DataType::s32, DataType::s8}) {
+            MatMulAttributes attrs{};
+            attrs.transpose_b = true;
+            attrs.output_dtype = odt;
+            auto op = MatMul::create(attrs, Backend::CPU);
+            const TensorDesc arr[] = {a.desc(), b.desc()};
+            auto descs = op->getOutputTensorDesc(arr);
+            if (odt == DataType::s32) {
+                expect_matches_ref<int32_t>(attrs, descs[0], ins);
+            } else {
+                expect_matches_ref<int8_t>(attrs, descs[0], ins, per_tensor(0.125f, 3));
+            }
+        }
+    }
 }

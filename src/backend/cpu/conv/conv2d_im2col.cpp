@@ -372,16 +372,21 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
             dt != DataType::f32 && dt != DataType::f16) {
             return plan;
         }
-        // Output is fp only: the activation dtype when the activation is fp,
-        // attributes.output_dtype when it is already quantized (checked by the
-        // caller against what it asked for; here only the fp-ness matters).
-        if (out.dtype != DataType::f32 && out.dtype != DataType::f16) {
+        // Output: an fp destination (the activation dtype when the activation
+        // is fp, attributes.output_dtype when it is already quantized) or an
+        // integer one (s8/u8, requantized with the output's QuantParams).
+        const bool int_out = out.dtype == DataType::s8 || out.dtype == DataType::u8;
+        if (!int_out && out.dtype != DataType::f32 && out.dtype != DataType::f16) {
             return plan;
         }
-        if ((dt == DataType::f32 || dt == DataType::f16) && out.dtype != dt) {
+        if (!int_out && (dt == DataType::f32 || dt == DataType::f16) &&
+            out.dtype != dt) {
             return plan;
         }
-        if (inputs.size() > 2 && inputs[2].dtype != out.dtype) {
+        // The bias is typed by the branch: the output dtype on an fp
+        // destination, int32 on an integer one.
+        const DataType bias_dt = int_out ? DataType::s32 : out.dtype;
+        if (inputs.size() > 2 && inputs[2].dtype != bias_dt) {
             return plan;
         }
         // add_to needs the pre-existing output inside the accumulator; only the

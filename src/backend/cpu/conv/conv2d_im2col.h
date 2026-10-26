@@ -109,9 +109,10 @@ struct Conv2DPlan {
 /// the descriptors. Returns a zeroed plan for unsupported dtype combinations,
 /// which routes the kernel to the reference. Supported:
 ///   * f32/f16 on every tensor (the floating-point route);
-///   * the quantized route — an s8 weight, a u8/s8/f16/f32 activation, a
-///     f32/f16 output and a matching bias (see is_quantized_conv2d), without
-///     add_to (which only the reference implements).
+///   * the quantized route — an s8 weight, a u8/s8/f16/f32 activation, an
+///     f32/f16/s8/u8 output and a matching bias (see is_quantized_conv2d:
+///     the bias is int32 on an s8/u8 destination, the output dtype otherwise),
+///     without add_to (which only the reference implements).
 /// @p num_threads drives the oh-chunk split; @p use_thread_slots sizes the
 /// scratch per worker thread (thread_id-indexed) instead of per task.
 Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,

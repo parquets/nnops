@@ -4,16 +4,20 @@
 ///
 /// Supported operand combinations:
 ///   - f32 × f32, f16 × f16                 → output follows the input dtype
-///   - u8  × s8,  s8 × s8 (quantized)       → output is always f32 or f16,
-///                                             selected by `output_dtype`
+///   - u8  × s8,  s8 × s8 (quantized)       → output follows `output_dtype`:
+///                                             f32/f16 dequantizes, s32/s8/u8
+///                                             keeps the result integral
 ///
-/// The quantized path dequantizes each int32 accumulate with the QuantParams
-/// carried by the two input TensorViews: X's per-tensor / per-token parameters
-/// and W's per-tensor / per-channel parameters. With inactive parameters the
-/// scales are 1 and the zero points 0, i.e. a plain integer product.
+/// The quantized path dequantizes (or requantizes) each int32 accumulate with
+/// the QuantParams carried by the two input TensorViews: X's per-tensor /
+/// per-token parameters and W's per-tensor / per-channel parameters. With
+/// inactive parameters the scales are 1 and the zero points 0, i.e. a plain
+/// integer product. An s8/u8 output requantizes with the output's QuantParams,
+/// clamping to the storage range of the destination type.
 ///
 /// The weight is stored [N, K] and the multiplication is X × W^T. The optional
-/// third input is a per-output-channel bias of shape [N] in the output dtype.
+/// third input is a per-output-channel bias of shape [N]: its dtype follows the
+/// output — the output dtype for f32/f16, int32 for s32/s8/u8.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -34,9 +38,11 @@ struct LinearAttributes {
     /// If true, add result to existing output buffer instead of overwriting.
     bool add_to = false;
 
-    /// Output data type for the quantized (u8|s8 × s8) path. The output is
-    /// always floating point: f16 selects the half output, anything else
-    /// (including the default f32) selects float.
+    /// Output data type for the quantized (u8|s8 × s8) path: f32 / f16 for a
+    /// dequantizing output, s32 / s8 / u8 for an integer one (the last two
+    /// requantize with the output's QuantParams). Anything else selects f32.
+    ///
+    /// An integer output takes its bias as int32; see MatMulAttributes.
     ///
     /// Ignored for f32/f16 operands, whose output always follows the input
     /// dtype (fp in, fp out).
@@ -48,7 +54,7 @@ struct LinearAttributes {
 /// Computes: output = epilogue(input × weight^T + bias)
 ///   input:  [..., K]     (f32 | f16 | u8 | s8)
 ///   weight: [N, K]       (f32 | f16, or s8 for the quantized path)
-///   bias:   [N] (optional, output dtype)
+///   bias:   [N] (optional, output dtype — int32 when the output is integral)
 ///   output: [..., N]     (leading dims preserved; only the last becomes N)
 ///
 /// Transposed weight is implicit — the weight is stored as [N, K] and

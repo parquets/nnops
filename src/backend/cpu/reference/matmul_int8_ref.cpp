@@ -4,8 +4,10 @@
 /// Semantics: C = A × B with per-token / per-channel (asymmetric) quantization.
 /// The accumulate is the MatMulInteger value — the dot product of the
 /// dezero-pointed operands — written directly to an s32 output, or requantized
-/// to an s8 output with the output scale / zero-point. A is read through its
-/// own element type, so a u8 A contributes its unsigned value.
+/// to an s8 / u8 output with the output scale / zero-point. An optional int32
+/// [N] bias is added to the compensated accumulate before Relu and the requant.
+/// A is read through its own element type, so a u8 A contributes its unsigned
+/// value.
 ///
 /// Supports N-D batch matmul with numpy-style broadcasting (same as matmul_ref).
 
@@ -60,12 +62,16 @@ void matmul_int8_ref_impl(const MatMulAttributes& attrs,
     const int64_t b_row_stride = b.row_stride_elems();
     const int64_t c_row_stride = output.row_stride_elems();
 
-    const bool out_s8 = (output.data_type() == DataType::s8);
+    const DataType odt = output.data_type();
+    const bool out_q  = (odt == DataType::s8 || odt == DataType::u8);
+    const bool out_u8 = (odt == DataType::u8);
+    // Integer output only: the int32 [N] bias, added to the compensated value.
+    const int32_t* bias = (inputs.size() > 2) ? inputs[2].ptr<int32_t>() : nullptr;
 
     const QuantParams& qa = a.quant_params();
     const QuantParams& qb = b.quant_params();
     const QuantParams& qc = output.quant_params();
-    const double  scale_out = (qc.scale_data != nullptr) ? static_cast<double>(qc.scale_data[0]) : static_cast<double>(qc.scale);
+    const float   scale_out = (qc.scale_data != nullptr) ? qc.scale_data[0] : qc.scale;
     const int32_t zp_out    = (qc.zero_point_data != nullptr) ? qc.zero_point_data[0] : qc.zero_point;
     const bool relu = (attrs.epilogue.type == EpilogueActivateType::Relu);
 
@@ -101,7 +107,7 @@ void matmul_int8_ref_impl(const MatMulAttributes& attrs,
     }
 
     const auto gemm_2d = [&](const AT* a_ptr, const int8_t* b_ptr,
-                             int32_t* c_int, int8_t* c_out) {
+                             int32_t* c_int, uint8_t* c_out) {
         // Raw reductions over K.
         std::vector<int32_t> r_a(static_cast<size_t>(M), 0);
         std::vector<int32_t> r_b(static_cast<size_t>(N), 0);
@@ -122,7 +128,7 @@ void matmul_int8_ref_impl(const MatMulAttributes& attrs,
 
         const auto compute_row = [&](int64_t m) {
             const int32_t zp_a = zp_at(qa, m);
-            const double  s_a  = static_cast<double>(scale_at(qa, m));
+            const float   s_a  = scale_at(qa, m);
             for (int64_t n = 0; n < N; ++n) {
                 // True integer dot product over A's own element type, with no
                 // hardware shift to undo (hence the 0 offset below).
@@ -138,13 +144,23 @@ void matmul_int8_ref_impl(const MatMulAttributes& attrs,
                                                    r_a[static_cast<size_t>(m)],
                                                    r_b[static_cast<size_t>(n)],
                                                    static_cast<int32_t>(K));
+                if (bias != nullptr) {
+                    v += bias[n];
+                }
                 if (relu) {
                     v = std::max(v, 0);
                 }
 
-                if (out_s8) {
-                    const double req = s_a * static_cast<double>(scale_at(qb, n)) / scale_out;
-                    c_out[m * c_row_stride + n] = matmul_int8_requant(v, req, zp_out);
+                if (out_q) {
+                    const float req = matmul_int8_requant_scale(
+                        s_a, scale_at(qb, n), scale_out);
+                    const int64_t off = m * c_row_stride + n;
+                    if (out_u8) {
+                        c_out[off] = matmul_int8_requant<uint8_t>(v, req, zp_out);
+                    } else {
+                        reinterpret_cast<int8_t*>(c_out)[off] =
+                            matmul_int8_requant(v, req, zp_out);
+                    }
                 } else {
                     c_int[m * c_row_stride + n] = v;
                 }
@@ -181,7 +197,7 @@ void matmul_int8_ref_impl(const MatMulAttributes& attrs,
 
         gemm_2d(a_base + a_offset, b_base + b_offset,
                 output.ptr<int32_t>() + c_offset,
-                output.ptr<int8_t>() + c_offset);
+                output.ptr<uint8_t>() + c_offset);
     }
 }
 

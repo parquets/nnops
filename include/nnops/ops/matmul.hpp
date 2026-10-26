@@ -20,10 +20,11 @@ namespace nnops {
 /// rows. It sits between the product and the activation, so `epilogue` sees
 /// `product + bias`.
 ///
-/// A bias is supported only where the output is floating point — every fp × fp
-/// route, the Q5_1 weight route, and the dequantizing int8 route (output_dtype
-/// f32/f16). The raw integer routes (output_dtype s32 / s8) have no bias
-/// semantics and reject it.
+/// Every route takes a bias, and its dtype follows the output: the output's own
+/// fp dtype on an fp destination (fp × fp, Q5_1 weights, the dequantizing int8
+/// route), int32 on an integer one (output_dtype s32 / s8 / u8). Integer
+/// destinations add it to the compensated int32 accumulate — before the
+/// activation, and never scaled by alpha, which the integer routes ignore.
 struct MatMulAttributes {
     bool transpose_a = false;
     bool transpose_b = false;
@@ -33,7 +34,7 @@ struct MatMulAttributes {
     /// the RHS pack (f32/f16 × f32/f16, Q5_1 weights), so it costs nothing; the
     /// small-M kernels apply it to the accumulator before the beta add.
     ///
-    /// The raw integer routes (output_dtype s32 / s8) ignore alpha: their
+    /// The integer routes (output_dtype s32 / s8 / u8) ignore alpha: their
     /// accumulator is int32 and has no scale of its own — requantization
     /// belongs in the output QuantParams. The dequantizing int8 route ignores
     /// it too, for the same reason (its scale is per-tensor/per-channel, not
@@ -48,7 +49,10 @@ struct MatMulAttributes {
     ///
     ///   s32 (default): raw int32 accumulate with zero-point compensation
     ///                  (MatMulInteger semantics).
-    ///   s8:            requantize the accumulate to int8.
+    ///   s8 / u8:       requantize the accumulate with the output's QuantParams
+    ///                  (scale s_a·s_b/out_scale, round half away from zero,
+    ///                  clamped to the storage range; the product is f32, as in
+    ///                  ONNX Runtime's requantize). The bias is int32.
     ///   f32 / f16:     dequantize the accumulate back to the given float type
     ///                  (valid when A carries active QuantParams).
     ///
@@ -69,7 +73,7 @@ struct MatMulAttributes {
 
 /// True for the integer GEMM: an int8 or uint8 A against an int8 B — the
 /// MatMulInteger operand combinations — whose raw int32 accumulate
-/// `output_dtype` then either returns as s32 or requantizes to s8. The operator
+/// `output_dtype` then returns as s32 or requantizes to s8 / u8. The operator
 /// and the CPU backend must agree on this pair (the backend fuses exactly the
 /// cases whose output dtype the operator resolves), so it lives here.
 inline constexpr bool is_int8_matmul(DataType a, DataType b) noexcept {

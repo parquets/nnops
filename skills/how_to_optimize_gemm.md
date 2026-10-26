@@ -463,14 +463,19 @@ Beta scaling (`C = A×B + beta×C`) is fused too: `tile_scale` applies `beta` at
 `k == 0` for `beta ∉ {0, 1}`, and `zero_mode` lets the first k-block skip the C
 load entirely when `beta == 0`.
 
-The int8 path folds only `Relu` (as a clamp on the requantized output). Its
+The int8 path folds only `Relu` (as a max on the int32 pre-activation). Its
 output pass is fused exactly like fp's: `int8_epilogue_tile` runs inside
 `matmul_tile` at `last_k`, on the tile the last k-block just produced, and does
-compensation plus (for an s8 output) requantization in one vectorized row walk
-(`int8_epilogue_row_s32` / `_s8` in
-[simd_epilogue.hpp](../src/backend/cpu/simd_kernel/simd_epilogue.hpp)). Only the
-s8 destination moves per batch element, so the parameters
-(`Int8EpilogueParams`) are built once per call.
+compensation, the int32 bias, `Relu` and (for an s8/u8 output) requantization in
+one vectorized row walk (`int8_epilogue_row_s32` / `_bias` /
+`_quant<TOut>` in
+[simd_epilogue.hpp](../src/backend/cpu/simd_kernel/simd_epilogue.hpp)). The bias
+is `int32` on an integer destination — the same units as the compensated
+accumulate — which is also the reason it fuses here rather than in a separate
+sweep: there is nothing to dequantize twice. Only the integer destination moves
+per batch element, so the parameters (`Int8EpilogueParams`) are built once per
+call, and Conv2D reuses the same tile function by passing its oc-block as the
+row range.
 
 The one thing that cannot be tile-local is the **reduction** input: the
 compensation needs `r_a[m] = Σ_k A[m,k]` and `r_b[n] = Σ_k B[k,n]` over the
@@ -481,19 +486,93 @@ one sweep of A and B, 0.03 ms of a 2.6 ms call at 1024×512×1024. Folding them
 into the packers is the only way to remove that sweep, and it would either
 duplicate the A sum across every N-block task or need per-task scratch.
 
-Both passes are **skipped whenever they are the identity** — no s8 output, no
-activation, no A shift left to withdraw, and zero points of zero
-(`matmul_int8_compensate` then returns the raw accumulator unchanged). Before
+Both passes are **skipped whenever they are the identity** — no A shift left to
+withdraw and zero points of zero (`matmul_int8_compensate` then returns the raw
+accumulator unchanged); an integer destination or an activation does not stop
+them being the identity. Before
 that gate existed they were a separate sweep of A and B plus a scalar pass over
 all of C, and at shallow K they dominated the call (K=128 was 111 of the
 kernel's ~570 GOPS). Worth checking the same recursion whenever an epilogue grows
 a branch that is a no-op for the default attributes.
 
+The output pass and the reduction sweep are gated separately, because a bias is
+its own reason to run the first and no reason at all to run the second: an s32
+output with a bias and no zero points runs `int8_epilogue_row_bias` — add the
+bias in place, no reductions, no recompute of the compensation. The sweep asks
+the same question the dq route asks (`dq_needs_compensation`): an integer
+destination alone is not a reason to sweep, so a symmetric s8 W8A8 setup
+requantizes straight from the raw accumulate. Measured on `matmul_i8_out_decode`
+(8×4096×4096, 1T): 65.6 → 83.5 GOPS, and `linear_int8_int_out` M=1 went
+23.8 → 29.1 GOPS for the s32 destination, i.e. the sweep had been paying for a
+full extra read of B on every call whose zero points were all zero.
+
+Conv2D's int8 route applies the same split one step further, and it is worth
+copying wherever a compensation is available in pieces. Of its two products,
+only `−(a_bias_offset + zp_a[m])·r_b[n]` is per column; `−zp_b·r_a[m]` and
+`k·zp_a[m]·zp_b` are per output channel, so they are computed once per call and
+folded — into the bias on an integer destination, into an int32 row offset
+(`DqEpilogueParams::row_off`) on the fp one, whose bias is fp and cannot carry
+them. That is what MLAS does at prepack time
+(`column_sums_[oc] = bias[oc] − ΣW[oc]·zp_fixup`, qlinearconv.cc:207), and it
+leaves the integer epilogue as `raw + bias`, `Relu`, requant: no per-element
+compensation, and `r_b` swept only when the weight's zero point is asymmetric
+(`conv2d_i8_act_zp_ab`, activation zp 128 vs 120, is the guard). Measured on
+`conv2d_i8_out_*` (u8 act, symmetric weights), the s8 destination went from
+1.18x/1.53x/1.77x the f32 one at 1/4/8T to 1.00x/1.00x/1.01x — the destination
+type had been paying for a full `r_b` pass over the im2col matrix per oc-block,
+which is bandwidth every worker competes for, so the gap grew with the pool.
+
+MatMul's dq and integer routes now do the same, with the halves as separate
+flags instead of one gate: `DqEpilogueParams::compensate` is
+`−(r_a − k·zp_a)·zp_b[n]` and reads only `r_a`, `col_term` is
+`−(a_bias_offset + zp_a)·r_b[n]` and reads only `r_b`, and each reduction is
+swept only for its own half (`compute_int8_reductions` skips a null
+destination, which also drops that dispatch). Which halves are live is a
+property of the zero points, not of the destination type: a u8 activation
+against symmetric weights has `col_term` alone, an s8 activation against
+asymmetric weights has the row half alone, and a fully symmetric W8A8 setup has
+neither — that last one is unchanged (it never swept), but the middle cases used
+to read the whole other operand for nothing. Where `zp_b` is per-tensor the row
+half is a row constant, so it is folded once per row into `row_off` (fp
+destination) or into the per-row `bias` slot (integer destination, whose own
+bias is per column) and `compensate` is cleared; a per-channel `zp_b` cannot
+fold and keeps the per-element term. Interleaved medians of 3 rounds,
+`matmul_dq_weight_zp_ab`: the u8/symmetric arm 363 → 375 GFLOPS at 256³ 1T,
+453.6 → 463.8 at 1024×512×1024 1T and 814 → 827 at 4T (dropping the `r_a`
+sweep); the s8 + per-channel-asymmetric arm 447.4 → 456.9 at 1T and
+812.5 → 891.5 at 4T (dropping the `r_b` sweep, +9.7%); the per-tensor-zp arm
+450.9 → 455.4 at 1T (the fold), with null controls ≤ 1.5% except the 4T rows.
+Note the per-tensor fold only applies when B carries no per-channel zp *array* —
+a checkpoint that stores one zp per channel, even all equal, keeps the
+per-element path, and scanning for uniformity is not worth it.
+
+**A second `ctx.cpu.run` for a small reduction is expensive.** `r_a` (one SIMD
+pass over the weight panel) used to run on the pool, on top of the tile
+dispatch. With a pool that spawns per `parallel_for` that dispatch grows with
+the thread count: the same 3x3 convolution read 0.678 ms at 1T either way, but
+1.18x at 2T and 1.9x at 20T versus the same call with the zero point the packer
+already removes (`conv2d_i8_act_zp_ab`). It is serial now — the pass is a
+fraction of the panel traffic the A pack already streams — and the arms match at
+every thread count. Anything sized like this (a few hundred KB, a few tens of
+microseconds) belongs in the caller's thread, not in a dispatch of its own.
+
 The fusion's measured value is modest: on s8→s8 with per-tensor scales, 256³
 went 0.120 → 0.108 ms/call at 1T and 1024×512×1024 was flat (2.59 → 2.60 ms).
-The pass is compute-bound on the f64 requant, not on the C re-read, so removing
-the second sweep of C does not buy much; the win is structural — one dispatch
+The pass was compute-bound on the requant, not on the C re-read, so removing
+the second sweep of C did not buy much; the win is structural — one dispatch
 instead of two, no full-M×N pass.
+
+The requant itself is **f32, not f64** (`matmul_int8_requant`), the way MLAS's
+`MlasRequantizeOutput` does it: convert, one multiply by `(s_a/s_out)·s_b`,
+clamp inside `[min − zp, max − zp]`, round, add `zp_out`, saturate through the
+two packs. The f64 form needed half the vector width per instruction and a
+seven-instruction `std::round` emulation, and cost ~1 ns per output element —
+more than the GEMM itself at 256³. Measured after the switch: 256³ 0.68 → 0.92
+of the s32 rate, 1024×512×1024 0.79 → 0.96, Conv2D 3x3 1.27 → 1.15x an f32
+destination, pointwise 1.37 → 1.11x. Rounding stayed half-away-from-zero
+(`cvttps` on `x + copysign(0.5, x)` on x86, `FCVTAS` on aarch64) so the
+documented semantics did not move; the f32 product is exact below 2^24 and the
+mantissa above it only shifts the result inside one output step.
 
 ### 6.1 fp activations → int8 GEMM → fp output (W8A8, offline parameters)
 
@@ -682,6 +761,11 @@ the pack would mean materializing the fp tile at 4 bytes/element for every
   accumulator is zeroed explicitly on the first ic-block.
 - **`dq_epilogue_tile`'s `p.k` is the full K** (`ic_per_group·karea`), never the
   last ic-block's `kdim` — the compensation is a multiple of it.
+- **An s8/u8 destination goes through MatMul's `int8_epilogue_tile`**, whose
+  rows are output channels here: `r_a`/`s_a`/`zp_a` and the int32 `bias` are
+  pre-offset by `g·oc_per_group + ocn` and the tile is passed with `m0 = 0`. The
+  epilogue's `ldc_out` is the oc step (`ocn_step`, i.e. `OH·out_row_stride`), so
+  an oc-block writes a column strip of the spatial-major output.
 - **u8 is three coordinated places**: the packer's XOR (value − 128), the
   epilogue's `zp_eff = zp_x − 128`, and `r_b`'s `−128·kdim`. Any one alone is a
   silent wrong answer, so the u8 cases run zp ∈ {0, 127, 128}.

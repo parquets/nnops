@@ -104,17 +104,42 @@ inline int32_t matmul_int8_compensate(int32_t raw, int32_t u8_offset,
     return raw - (u8_offset + zp_a) * r_b - zp_b * r_a + k * zp_a * zp_b;
 }
 
-/// Requantize a compensated int32 accumulate to int8.
+/// Requantize a compensated int32 accumulate to int8 or uint8.
 ///
-///   q = clamp(round(acc · requant_scale) + zp_out, −128, 127)
+///   q = clamp(round(acc · requant_scale) + zp_out, −128, 127)   [s8]
+///   q = clamp(round(acc · requant_scale) + zp_out,   0, 255)    [u8]
 ///
-/// where requant_scale = scale_a[m]·scale_b[n] / scale_out. The multiply is done
-/// in double (exact for the int32 range) and rounded half-away-from-zero.
-inline int8_t matmul_int8_requant(int32_t acc, double requant_scale, int32_t zp_out) noexcept {
-    const double d = std::round(static_cast<double>(acc) * requant_scale)
-                   + static_cast<double>(zp_out);
-    const int64_t v = static_cast<int64_t>(d);
-    return static_cast<int8_t>(std::max<int64_t>(-128, std::min<int64_t>(127, v)));
+/// where requant_scale = scale_a[m]·scale_b[n] / scale_out (built by
+/// matmul_int8_requant_scale).
+///
+/// The multiply and the rounding are f32, like MLAS's requantize: the product
+/// is exact below 2^24 and, above it, the shorter mantissa only moves the
+/// result by a fraction of one output step — never across a clamp bound. Ties
+/// round away from zero, here and in the vector pass (the tests compare exact
+/// bytes). The clamp runs before the truncating convert, since an f32 outside
+/// int32 turns into the "integer indefinite" value.
+template <class TOut>
+inline TOut matmul_int8_requant(int32_t acc, float requant_scale, int32_t zp_out) noexcept {
+    constexpr float kMin = std::is_same_v<TOut, uint8_t> ? 0.0f : -128.0f;
+    constexpr float kMax = std::is_same_v<TOut, uint8_t> ? 255.0f : 127.0f;
+    const float zpf = static_cast<float>(zp_out);
+    const float x = std::min(std::max(static_cast<float>(acc) * requant_scale, kMin - zpf),
+                             kMax - zpf);
+    const float r = std::trunc(x + std::copysign(0.5f, x));
+    return static_cast<TOut>(static_cast<int32_t>(r) + zp_out);
+}
+
+/// The s8 form, kept as a plain overload so existing callers read as before.
+inline int8_t matmul_int8_requant(int32_t acc, float requant_scale, int32_t zp_out) noexcept {
+    return matmul_int8_requant<int8_t>(acc, requant_scale, zp_out);
+}
+
+/// The requant factor, (s_a / s_out) · s_b, in f32. Folding the output scale
+/// into s_a leaves one multiply per element even when the weight scale is
+/// per-channel, and keeps the tiled pass, the reference and Conv2D on one
+/// identical expression.
+inline float matmul_int8_requant_scale(float s_a, float s_b, float out_scale) noexcept {
+    return (s_a / out_scale) * s_b;
 }
 
 // =========================================================================
@@ -124,12 +149,21 @@ inline int8_t matmul_int8_requant(int32_t acc, double requant_scale, int32_t zp_
 // Per column n of one output row,
 //
 //   v[n]  = raw[n] − (u8_offset + zp_a)·R_b[n] − (R_a − K·zp_a)·zp_b[n]
+//   v[n] += bias            (int32, per row and/or per column; integer outputs)
 //   out   = clamp(round(v·s_a·s_b[n]/s_out) + zp_out, −128, 127)   [s8 output]
+//   out   = clamp(round(v·s_a·s_b[n]/s_out) + zp_out,    0, 255)   [u8 output]
+//   out   = v                                                       [s32 output]
 //
-// so the column-varying part is exactly two vectors — R_b (always) and zp_b
-// (only when per-channel) — scaled by row constants. The scalar form ran a
-// libm round per element; the vector form keeps f64 so it stays bit-identical
-// to matmul_int8_requant (the tests compare exact bytes).
+// The bias is an int32 in the same units as the compensated accumulate, so it
+// lands between the compensation and the requant (and before Relu, which is part
+// of the pre-activation value).
+//
+// The column-varying part is exactly two vectors — R_b and zp_b — scaled by
+// row constants, and both disappear when the compensation is the identity.
+// The requant then stays in f32 end to end: convert, one multiply (the row's
+// s_a/s_out, times the per-channel s_b when there is one), clamp inside the
+// output range, round, add zp_out, saturate. f64 would double the vector width
+// needed and cost ~2x per element for no output it can tell apart.
 
 /// The row-constant half of the int8 epilogue.
 struct Int8EpilogueRow {
@@ -146,22 +180,22 @@ struct Int8EpilogueRow {
     int32_t zp_out;         ///< output zero point (s8 output only)
     int32_t k;              ///< reduction depth
     bool relu;              ///< fuse Relu before the (optional) requant
+    int32_t bias;           ///< row-constant int32 bias (Conv2D's [OC]), or 0
+    const int32_t* col_bias;///< per-column int32 bias, or nullptr
+    bool compensate;        ///< the −(r_a − k·zp_a)·zp_b[n] term is live
+    bool col_term;          ///< the −(a_bias_offset + zp_a)·r_b[n] term is live
 };
 
 #if defined(NNOPS_ARCH_X86_64)
-/// std::round semantics — nearest, ties away from zero — in f64.
+/// std::round semantics — nearest, ties away from zero — in f32.
 ///
-/// AVX2 only offers ties-to-even, so this rounds by truncating and adding the
-/// sign when the fractional part reaches a half: t = trunc(x), f = x − t is
-/// exact for every |x| < 2^52 (and f = 0 above it), so the test is exact.
-inline __m256d int8_round_away(__m256d x) noexcept {
-    const __m256d t = _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
-    const __m256d f = _mm256_sub_pd(x, t);
-    const __m256d af = _mm256_andnot_pd(_mm256_set1_pd(-0.0), f);
-    const __m256d half = _mm256_cmp_pd(af, _mm256_set1_pd(0.5), _CMP_GE_OQ);
-    const __m256d dir = _mm256_and_pd(
-        half, _mm256_or_pd(_mm256_and_pd(x, _mm256_set1_pd(-0.0)), _mm256_set1_pd(1.0)));
-    return _mm256_add_pd(t, dir);
+/// AVX2 only offers ties-to-even, so round by adding ±0.5 (rebuilt from the
+/// sign bit) and letting the caller truncate: the sum is exact for every
+/// |x| < 2^23, and above that x carries no fractional part to round.
+inline __m256 int8_round_away_f32(__m256 x) noexcept {
+    const __m256 half = _mm256_or_ps(_mm256_and_ps(x, _mm256_set1_ps(-0.0f)),
+                                     _mm256_set1_ps(0.5f));
+    return _mm256_add_ps(x, half);
 }
 #endif
 
@@ -173,149 +207,220 @@ inline void int8_epilogue_row_s32(int32_t* c, int64_t n0, int64_t n1,
     int64_t n = n0;
 
     // The compensation is v = raw − coef_rb·R_b[n] − coef_zp·zp_b[n]: two
-    // vector FMAs' worth of integer work per element, no float involved.
+    // vector FMAs' worth of integer work per element, no float involved. The
+    // two halves are independent — a caller that folded one out sets only the
+    // other's flag.
+    const bool biased = (p.bias != 0);
+    const bool col_biased = (p.col_bias != nullptr);
 #if defined(NNOPS_ARCH_X86_64)
     const __m256i vcrb = _mm256_set1_epi32(coef_rb);
     const __m256i vczp = _mm256_set1_epi32(coef_zp);
+    const __m256i vbias = _mm256_set1_epi32(p.bias);
     for (; n + 8 <= n1; n += 8) {
         __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
-        v = _mm256_sub_epi32(
-            v, _mm256_mullo_epi32(vcrb,
-                                  _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                                      p.r_b + n))));
-        const __m256i zps =
-            p.zp_b ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.zp_b + n))
-                   : _mm256_set1_epi32(p.zp_b_scalar);
-        v = _mm256_sub_epi32(v, _mm256_mullo_epi32(vczp, zps));
+        if (p.col_term) {
+            v = _mm256_sub_epi32(
+                v, _mm256_mullo_epi32(vcrb,
+                                      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+                                          p.r_b + n))));
+        }
+        if (p.compensate) {
+            const __m256i zps =
+                p.zp_b ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.zp_b + n))
+                       : _mm256_set1_epi32(p.zp_b_scalar);
+            v = _mm256_sub_epi32(v, _mm256_mullo_epi32(vczp, zps));
+        }
+        if (biased) { v = _mm256_add_epi32(v, vbias); }
+        if (col_biased) {
+            v = _mm256_add_epi32(
+                v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.col_bias + n)));
+        }
         if (p.relu) { v = _mm256_max_epi32(v, _mm256_setzero_si256()); }
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + n), v);
     }
 #elif defined(NNOPS_ARCH_AARCH64)
     const int32x4_t vcrb = vdupq_n_s32(coef_rb);
     const int32x4_t vczp = vdupq_n_s32(coef_zp);
+    const int32x4_t vbias = vdupq_n_s32(p.bias);
     for (; n + 4 <= n1; n += 4) {
         int32x4_t v = vld1q_s32(c + n);
-        v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n)));
-        const int32x4_t zps = p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
-        v = vsubq_s32(v, vmulq_s32(vczp, zps));
+        if (p.col_term) { v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n))); }
+        if (p.compensate) {
+            const int32x4_t zps = p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
+            v = vsubq_s32(v, vmulq_s32(vczp, zps));
+        }
+        if (biased) { v = vaddq_s32(v, vbias); }
+        if (col_biased) { v = vaddq_s32(v, vld1q_s32(p.col_bias + n)); }
         if (p.relu) { v = vmaxq_s32(v, vdupq_n_s32(0)); }
         vst1q_s32(c + n, v);
     }
 #endif
 
     for (; n < n1; ++n) {
-        const int32_t zp_bn = p.zp_b ? p.zp_b[n] : p.zp_b_scalar;
-        int32_t v = matmul_int8_compensate(c[n], p.a_bias_offset, p.zp_a, zp_bn,
-                                           p.r_a, p.r_b[n], p.k);
+        int32_t v = c[n];
+        if (p.col_term) { v -= coef_rb * p.r_b[n]; }
+        if (p.compensate) {
+            v -= coef_zp * (p.zp_b ? p.zp_b[n] : p.zp_b_scalar);
+        }
+        if (p.bias != 0) { v += p.bias; }
+        if (p.col_bias) { v += p.col_bias[n]; }
         if (p.relu) { v = std::max(v, 0); }
         c[n] = v;
     }
 }
 
-/// Compensate and requantize one output row into an s8 row.
-inline void int8_epilogue_row_s8(const int32_t* c, int8_t* out, int64_t n0, int64_t n1,
-                                 const Int8EpilogueRow& p) noexcept {
-    const int32_t coef_rb = p.a_bias_offset + p.zp_a;
-    const int32_t coef_zp = p.r_a - p.k * p.zp_a;
+/// Bias-only s32 output: the compensation is the identity, so no reductions
+/// exist and the row is raw + bias [+ relu], in place.
+inline void int8_epilogue_row_bias(int32_t* c, int64_t n0, int64_t n1,
+                                   const Int8EpilogueRow& p) noexcept {
+    const bool biased = (p.bias != 0);
+    const bool col_biased = (p.col_bias != nullptr);
     int64_t n = n0;
 #if defined(NNOPS_ARCH_X86_64)
-    const __m256i vcrb = _mm256_set1_epi32(coef_rb);
-    const __m256i vczp = _mm256_set1_epi32(coef_zp);
-    const __m256d vsa = _mm256_set1_pd(p.s_a);
-    const __m256d vsout = _mm256_set1_pd(p.out_scale);
-    const __m256d vzp = _mm256_set1_pd(static_cast<double>(p.zp_out));
-    const __m256d vmin = _mm256_set1_pd(-128.0);
-    const __m256d vmax = _mm256_set1_pd(127.0);
-    // Per-tensor B scale: the scalar's exact expression, once per row.
-    const __m256d vreq = _mm256_set1_pd(
-        p.s_a * static_cast<double>(p.s_b_scalar) / p.out_scale);
+    const __m256i vbias = _mm256_set1_epi32(p.bias);
     for (; n + 8 <= n1; n += 8) {
         __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
-        v = _mm256_sub_epi32(
-            v, _mm256_mullo_epi32(vcrb,
-                                  _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                                      p.r_b + n))));
-        const __m256i zps =
-            p.zp_b ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.zp_b + n))
-                   : _mm256_set1_epi32(p.zp_b_scalar);
-        v = _mm256_sub_epi32(v, _mm256_mullo_epi32(vczp, zps));
-        if (p.relu) { v = _mm256_max_epi32(v, _mm256_setzero_si256()); }
-
-        __m256d a = _mm256_cvtepi32_pd(_mm256_castsi256_si128(v));
-        __m256d b = _mm256_cvtepi32_pd(_mm256_extracti128_si256(v, 1));
-        if (p.s_b) {
-            a = _mm256_mul_pd(a, _mm256_div_pd(
-                _mm256_mul_pd(vsa, _mm256_cvtps_pd(_mm_loadu_ps(p.s_b + n))), vsout));
-            b = _mm256_mul_pd(b, _mm256_div_pd(
-                _mm256_mul_pd(vsa, _mm256_cvtps_pd(_mm_loadu_ps(p.s_b + n + 4))), vsout));
-        } else {
-            a = _mm256_mul_pd(a, vreq);
-            b = _mm256_mul_pd(b, vreq);
+        if (biased) { v = _mm256_add_epi32(v, vbias); }
+        if (col_biased) {
+            v = _mm256_add_epi32(
+                v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.col_bias + n)));
         }
-        a = _mm256_add_pd(int8_round_away(a), vzp);
-        b = _mm256_add_pd(int8_round_away(b), vzp);
-        a = _mm256_min_pd(_mm256_max_pd(a, vmin), vmax);
-        b = _mm256_min_pd(_mm256_max_pd(b, vmin), vmax);
-        // In range and integral, so the truncating convert and the saturating
-        // packs are both exact.
-        const __m128i i16 = _mm_packs_epi32(_mm256_cvttpd_epi32(a),
-                                            _mm256_cvttpd_epi32(b));
-        const __m128i i8 = _mm_packs_epi16(i16, i16);
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(out + n), i8);
+        if (p.relu) { v = _mm256_max_epi32(v, _mm256_setzero_si256()); }
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c + n), v);
     }
 #elif defined(NNOPS_ARCH_AARCH64)
-    const int32x4_t vcrb = vdupq_n_s32(coef_rb);
-    const int32x4_t vczp = vdupq_n_s32(coef_zp);
-    const float64x2_t vsa = vdupq_n_f64(p.s_a);
-    const float64x2_t vsout = vdupq_n_f64(p.out_scale);
-    const float64x2_t vzp = vdupq_n_f64(static_cast<double>(p.zp_out));
-    const float64x2_t vmin = vdupq_n_f64(-128.0);
-    const float64x2_t vmax = vdupq_n_f64(127.0);
-    const float64x2_t vreq = vdupq_n_f64(
-        p.s_a * static_cast<double>(p.s_b_scalar) / p.out_scale);
+    const int32x4_t vbias = vdupq_n_s32(p.bias);
     for (; n + 4 <= n1; n += 4) {
         int32x4_t v = vld1q_s32(c + n);
-        v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n)));
-        const int32x4_t zps = p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
-        v = vsubq_s32(v, vmulq_s32(vczp, zps));
+        if (biased) { v = vaddq_s32(v, vbias); }
+        if (col_biased) { v = vaddq_s32(v, vld1q_s32(p.col_bias + n)); }
         if (p.relu) { v = vmaxq_s32(v, vdupq_n_s32(0)); }
-
-        // int32 → int64 → f64: exact, and the only widening clang's arm_neon.h
-        // offers from a 2-lane int32 vector.
-        float64x2_t a0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(v)));
-        float64x2_t a1 = vcvtq_f64_s64(vmovl_s32(vget_high_s32(v)));
-        if (p.s_b) {
-            const float32x4_t sb = vld1q_f32(p.s_b + n);
-            a0 = vmulq_f64(a0, vdivq_f64(vmulq_f64(vsa, vcvt_f64_f32(vget_low_f32(sb))),
-                                         vsout));
-            a1 = vmulq_f64(a1, vdivq_f64(vmulq_f64(vsa, vcvt_f64_f32(vget_high_f32(sb))),
-                                         vsout));
-        } else {
-            a0 = vmulq_f64(a0, vreq);
-            a1 = vmulq_f64(a1, vreq);
-        }
-        // FRINTA: nearest, ties away from zero — exactly std::round.
-        a0 = vaddq_f64(vrndaq_f64(a0), vzp);
-        a1 = vaddq_f64(vrndaq_f64(a1), vzp);
-        a0 = vminq_f64(vmaxq_f64(a0, vmin), vmax);
-        a1 = vminq_f64(vmaxq_f64(a1, vmin), vmax);
-        const int32x4_t vi = vcombine_s32(vmovn_s64(vcvtq_s64_f64(a0)),
-                                          vmovn_s64(vcvtq_s64_f64(a1)));
-        const int16x4_t i16 = vqmovn_s32(vi);
-        const int8x8_t i8 = vqmovn_s16(vcombine_s16(i16, i16));
-        vst1_lane_s32(reinterpret_cast<int32_t*>(out + n),
-                      vreinterpret_s32_s8(i8), 0);
+        vst1q_s32(c + n, v);
     }
 #endif
 
     for (; n < n1; ++n) {
-        const int32_t zp_bn = p.zp_b ? p.zp_b[n] : p.zp_b_scalar;
-        int32_t v = matmul_int8_compensate(c[n], p.a_bias_offset, p.zp_a, zp_bn,
-                                           p.r_a, p.r_b[n], p.k);
+        int32_t v = c[n];
+        if (p.bias != 0) { v += p.bias; }
+        if (p.col_bias) { v += p.col_bias[n]; }
         if (p.relu) { v = std::max(v, 0); }
-        const double req = p.s_a * static_cast<double>(p.s_b ? p.s_b[n] : p.s_b_scalar)
-                         / p.out_scale;
-        out[n] = matmul_int8_requant(v, req, p.zp_out);
+        c[n] = v;
+    }
+}
+
+/// Compensate, bias and requantize one output row into an s8 or u8 row.
+///
+/// TOut picks the clamp range and the saturating pack: [-128, 127] + packs_epi16
+/// for s8, [0, 255] + packus_epi16 for u8. Everything before the clamp is the
+/// same expression, so the two forms stay bit-identical to each other.
+template <class TOut>
+inline void int8_epilogue_row_quant(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
+                                    const Int8EpilogueRow& p) noexcept {
+    constexpr bool kU8 = std::is_same_v<TOut, uint8_t>;
+    constexpr float kMin = kU8 ? 0.0f : -128.0f;
+    constexpr float kMax = kU8 ? 255.0f : 127.0f;
+    const int32_t coef_rb = p.a_bias_offset + p.zp_a;
+    const int32_t coef_zp = p.r_a - p.k * p.zp_a;
+    const bool biased = (p.bias != 0);
+    const bool col_biased = (p.col_bias != nullptr);
+    // s_a / s_out once per row: a per-channel weight scale is then one multiply.
+    const float row_k = static_cast<float>(p.s_a) / static_cast<float>(p.out_scale);
+    const float zpf = static_cast<float>(p.zp_out);
+    int64_t n = n0;
+#if defined(NNOPS_ARCH_X86_64)
+    const __m256i vcrb = _mm256_set1_epi32(coef_rb);
+    const __m256i vczp = _mm256_set1_epi32(coef_zp);
+    const __m256i vbias = _mm256_set1_epi32(p.bias);
+    const __m256i vzp = _mm256_set1_epi32(p.zp_out);
+    const __m256 vk = _mm256_set1_ps(row_k);
+    const __m256 vreq = _mm256_set1_ps(row_k * p.s_b_scalar);
+    const __m256 vmin = _mm256_set1_ps(kMin - zpf);
+    const __m256 vmax = _mm256_set1_ps(kMax - zpf);
+    for (; n + 8 <= n1; n += 8) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
+        if (p.col_term) {
+            v = _mm256_sub_epi32(
+                v, _mm256_mullo_epi32(vcrb,
+                                      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+                                          p.r_b + n))));
+        }
+        if (p.compensate) {
+            const __m256i zps =
+                p.zp_b ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.zp_b + n))
+                       : _mm256_set1_epi32(p.zp_b_scalar);
+            v = _mm256_sub_epi32(v, _mm256_mullo_epi32(vczp, zps));
+        }
+        if (biased) { v = _mm256_add_epi32(v, vbias); }
+        if (col_biased) {
+            v = _mm256_add_epi32(
+                v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.col_bias + n)));
+        }
+        if (p.relu) { v = _mm256_max_epi32(v, _mm256_setzero_si256()); }
+
+        __m256 f = _mm256_cvtepi32_ps(v);
+        f = _mm256_mul_ps(f, p.s_b ? _mm256_mul_ps(vk, _mm256_loadu_ps(p.s_b + n)) : vreq);
+        // Clamped into [kMin − zp, kMax − zp]: the truncating convert below is
+        // then always in range, so its indefinite value never appears.
+        f = _mm256_min_ps(_mm256_max_ps(f, vmin), vmax);
+        const __m256i q =
+            _mm256_add_epi32(_mm256_cvttps_epi32(int8_round_away_f32(f)), vzp);
+        const __m128i i16 =
+            _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+        __m128i v8;
+        if constexpr (kU8) {
+            v8 = _mm_packus_epi16(i16, i16);
+        } else {
+            v8 = _mm_packs_epi16(i16, i16);
+        }
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out + n), v8);
+    }
+#elif defined(NNOPS_ARCH_AARCH64)
+    const int32x4_t vcrb = vdupq_n_s32(coef_rb);
+    const int32x4_t vczp = vdupq_n_s32(coef_zp);
+    const int32x4_t vbias = vdupq_n_s32(p.bias);
+    const int32x4_t vzp = vdupq_n_s32(p.zp_out);
+    const float32x4_t vk = vdupq_n_f32(row_k);
+    const float32x4_t vreq = vdupq_n_f32(row_k * p.s_b_scalar);
+    const float32x4_t vmin = vdupq_n_f32(kMin - zpf);
+    const float32x4_t vmax = vdupq_n_f32(kMax - zpf);
+    for (; n + 4 <= n1; n += 4) {
+        int32x4_t v = vld1q_s32(c + n);
+        if (p.col_term) { v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n))); }
+        if (p.compensate) {
+            const int32x4_t zps = p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
+            v = vsubq_s32(v, vmulq_s32(vczp, zps));
+        }
+        if (biased) { v = vaddq_s32(v, vbias); }
+        if (col_biased) { v = vaddq_s32(v, vld1q_s32(p.col_bias + n)); }
+        if (p.relu) { v = vmaxq_s32(v, vdupq_n_s32(0)); }
+
+        float32x4_t f = vcvtq_f32_s32(v);
+        f = vmulq_f32(f, p.s_b ? vmulq_f32(vk, vld1q_f32(p.s_b + n)) : vreq);
+        f = vminq_f32(vmaxq_f32(f, vmin), vmax);
+        // FCVTAS: nearest, ties away from zero — exactly std::round.
+        const int32x4_t q = vaddq_s32(vcvtaq_s32_f32(f), vzp);
+        const int16x4_t i16 = vqmovn_s32(q);
+        if constexpr (kU8) {
+            const uint8x8_t v8 = vqmovun_s16(vcombine_s16(i16, i16));
+            vst1_lane_u32(reinterpret_cast<uint32_t*>(out + n),
+                          vreinterpret_u32_u8(v8), 0);
+        } else {
+            const int8x8_t v8 = vqmovn_s16(vcombine_s16(i16, i16));
+            vst1_lane_s32(reinterpret_cast<int32_t*>(out + n),
+                          vreinterpret_s32_s8(v8), 0);
+        }
+    }
+#endif
+
+    for (; n < n1; ++n) {
+        int32_t v = c[n];
+        if (p.col_term) { v -= coef_rb * p.r_b[n]; }
+        if (p.compensate) { v -= coef_zp * (p.zp_b ? p.zp_b[n] : p.zp_b_scalar); }
+        if (p.bias != 0) { v += p.bias; }
+        if (p.col_bias) { v += p.col_bias[n]; }
+        if (p.relu) { v = std::max(v, 0); }
+        const float req = row_k * (p.s_b ? p.s_b[n] : p.s_b_scalar);
+        out[n] = matmul_int8_requant<TOut>(v, req, p.zp_out);
     }
 }
 
@@ -442,9 +547,11 @@ void epilogue_inplace(int M, int N, T* data, int ld, const T* bias, const Epilog
 }
 
 /// Everything the tile epilogue needs beyond the tile itself: the two
-/// reductions, the quantization parameters, and (for an s8 output) the real
-/// destination. The per-token / per-channel arrays are indexed by the *global*
-/// output row / column, so a tile can be handled on its own.
+/// reductions, the quantization parameters, the int32 bias, and the integer
+/// destination (s8 / u8 / s32-in-place). The per-token / per-channel arrays are
+/// indexed by the *global* output row / column, so a tile can be handled on its
+/// own; the per-row bias tile offsets are applied by the caller, the per-column
+/// ones are indexed absolutely like r_b.
 struct Int8EpilogueParams {
     const int32_t* r_a;      ///< Σ_k A[m,k]
     const float* s_a;        ///< per-token A scales, or nullptr
@@ -459,7 +566,23 @@ struct Int8EpilogueParams {
     int32_t a_bias_offset;
     int32_t k;
     bool relu;
-    int8_t* out;             ///< s8 destination; nullptr → s32, in place
+    /// The compensation's two halves, applied independently:
+    ///   compensate → subtract (r_a − k·zp_a)·zp_b[n] per element (r_a is read)
+    ///   col_term   → subtract (a_bias_offset + zp_a)·r_b[n]      (r_b is read)
+    /// Both false when the compensation is the identity, i.e. both coefficients
+    /// are zero for every row and every zp_b is zero: r_a / r_b are null and the
+    /// reduction sweep was skipped, leaving only the bias, relu and requant per
+    /// element. An integer destination does not by itself force the sweep — a
+    /// symmetric s8 W8A8 setup requantizes from the raw accumulate.
+    /// A caller may fold one half out instead: `bias` (the per-row vector) takes
+    /// the per-element half as a precomputed int32, which is what Conv2D's and
+    /// MatMul's per-tensor-B folds carry.
+    bool compensate;
+    bool col_term;
+    const int32_t* bias;     ///< per-row int32 bias (Conv2D [OC]), or nullptr
+    const int32_t* col_bias; ///< per-column int32 bias (MatMul [N]), or nullptr
+    int8_t* out;             ///< s8 destination; nullptr → s32 or u8 (see out_u8)
+    uint8_t* out_u8;         ///< u8 destination; takes precedence over out
     int ldc_out;
 };
 
@@ -480,22 +603,33 @@ inline void int8_epilogue_tile(const Int8EpilogueParams& p, int32_t* c, int ldc,
         const Int8EpilogueRow row{
             p.a_bias_offset,
             int8_zp_at(p.zp_a, p.zp_a_scalar, m),
-            p.r_a[m],
+            p.compensate ? p.r_a[m] : 0,
             p.r_b,
             p.zp_b,
             p.zp_b_scalar,
-            p.out ? static_cast<double>(int8_scale_at(p.s_a, p.s_a_scalar, m)) : 0.0,
+            (p.out || p.out_u8)
+                ? static_cast<double>(int8_scale_at(p.s_a, p.s_a_scalar, m)) : 0.0,
             p.s_b,
             p.s_b_scalar,
             p.out_scale,
             p.zp_out,
             p.k,
             p.relu,
+            p.bias ? p.bias[m] : 0,
+            p.col_bias,
+            p.compensate,
+            p.col_term,
         };
-        if (p.out != nullptr) {
-            int8_epilogue_row_s8(c + r * ldc, p.out + m * p.ldc_out, n0, n0 + nc, row);
-        } else {
+        if (p.out_u8 != nullptr) {
+            int8_epilogue_row_quant<uint8_t>(c + r * ldc, p.out_u8 + m * p.ldc_out,
+                                             n0, n0 + nc, row);
+        } else if (p.out != nullptr) {
+            int8_epilogue_row_quant<int8_t>(c + r * ldc, p.out + m * p.ldc_out,
+                                            n0, n0 + nc, row);
+        } else if (p.compensate || p.col_term) {
             int8_epilogue_row_s32(c + r * ldc, n0, n0 + nc, row);
+        } else {
+            int8_epilogue_row_bias(c + r * ldc, n0, n0 + nc, row);
         }
     }
 }
@@ -520,10 +654,15 @@ template <class TOut>
 struct DqEpilogueRow {
     int32_t coef_rb;        ///< a_bias_offset + zp_a
     int32_t coef_zp;        ///< r_a − k·zp_a
-    /// False when both coefficients are zero for every row and column, i.e.
-    /// compensate() is the identity. r_a / r_b are null then and the dispatch
-    /// skipped the reduction sweep entirely.
+    /// The compensation's two halves, applied independently (see
+    /// DqEpilogueParams): the per-element one −coef_zp·zp_b[n] is live here, the
+    /// column one −coef_rb·r_b[n] is live when col_term is set.
     bool compensate;
+    bool col_term;
+    /// −zp_b·(r_a − k·zp_a) for this row, precomputed by the caller: the
+    /// per-row half of the compensation applied once per row instead of once
+    /// per element. 0 when the caller folded nothing (the usual case).
+    int32_t row_off;
     int32_t a_bias_offset;
     int32_t zp_a;
     int32_t r_a;
@@ -549,6 +688,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
 #if defined(NNOPS_ARCH_X86_64)
     const __m256i vcrb = _mm256_set1_epi32(p.coef_rb);
     const __m256i vczp = _mm256_set1_epi32(p.coef_zp);
+    const __m256i vrow = _mm256_set1_epi32(p.row_off);
     const __m256 vsa  = _mm256_set1_ps(p.s_a);
     const __m256 vsbs = _mm256_set1_ps(p.s_b_scalar);
     const __m256 vmin = _mm256_set1_ps(ep.min_clip);
@@ -561,16 +701,19 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
     alignas(32) float fbuf[8];
     for (; n + 8 <= n1; n += 8) {
         __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + n));
-        if (p.compensate) {
+        if (p.col_term) {
             v = _mm256_sub_epi32(
                 v, _mm256_mullo_epi32(vcrb,
                                       _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
                                           p.r_b + n))));
+        }
+        if (p.compensate) {
             const __m256i zps =
                 p.zp_b ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p.zp_b + n))
                        : _mm256_set1_epi32(p.zp_b_scalar);
             v = _mm256_sub_epi32(v, _mm256_mullo_epi32(vczp, zps));
         }
+        if (p.row_off != 0) { v = _mm256_add_epi32(v, vrow); }
 
         const __m256 sb = p.s_b ? _mm256_loadu_ps(p.s_b + n) : vsbs;
         __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(v), _mm256_mul_ps(vsa, sb));
@@ -603,6 +746,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
 #elif defined(NNOPS_ARCH_AARCH64)
     const int32x4_t vcrb = vdupq_n_s32(p.coef_rb);
     const int32x4_t vczp = vdupq_n_s32(p.coef_zp);
+    const int32x4_t vrow = vdupq_n_s32(p.row_off);
     const float32x4_t vsa = vdupq_n_f32(p.s_a);
     const float32x4_t vsbs = vdupq_n_f32(p.s_b_scalar);
     const float32x4_t vmin = vdupq_n_f32(ep.min_clip);
@@ -615,12 +759,13 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
     alignas(16) float fbuf[4];
     for (; n + 4 <= n1; n += 4) {
         int32x4_t v = vld1q_s32(c + n);
+        if (p.col_term) { v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n))); }
         if (p.compensate) {
-            v = vsubq_s32(v, vmulq_s32(vcrb, vld1q_s32(p.r_b + n)));
             const int32x4_t zps =
                 p.zp_b ? vld1q_s32(p.zp_b + n) : vdupq_n_s32(p.zp_b_scalar);
             v = vsubq_s32(v, vmulq_s32(vczp, zps));
         }
+        if (p.row_off != 0) { v = vaddq_s32(v, vrow); }
 
         const float32x4_t sb = p.s_b ? vld1q_f32(p.s_b + n) : vsbs;
         float32x4_t f = vmulq_f32(vcvtq_f32_s32(v), vmulq_f32(vsa, sb));
@@ -652,11 +797,10 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
 
     for (; n < n1; ++n) {
         const int32_t zp_b = p.zp_b ? p.zp_b[n] : p.zp_b_scalar;
-        const int32_t acc =
-            p.compensate
-                ? matmul_int8_compensate(c[n], p.a_bias_offset, p.zp_a, zp_b,
-                                         p.r_a, p.r_b[n], p.k)
-                : c[n];
+        int32_t acc = c[n];
+        if (p.col_term) { acc -= p.coef_rb * p.r_b[n]; }
+        if (p.compensate) { acc -= p.coef_zp * zp_b; }
+        acc += p.row_off;
         const float scale = p.s_a * (p.s_b ? p.s_b[n] : p.s_b_scalar);
         float f = static_cast<float>(acc) * scale;
         if (p.bias != 0.0f) { f += p.bias; }
@@ -676,14 +820,27 @@ struct DqEpilogueParams {
     const int32_t* r_b;      ///< Σ_k B[k,n], indexed by column
     const float* s_b;        ///< per-channel B scales, or nullptr
     const int32_t* zp_b;     ///< per-channel B zero points, or nullptr
+    /// Per-row half of the compensation, already computed: −zp_b·(r_a − k·zp_a)
+    /// for row m, added to the accumulate before the dequantize. nullptr → the
+    /// row pass applies that term itself, per element.
+    const int32_t* row_off;
     float s_a_scalar, s_b_scalar;
     int32_t zp_a_scalar, zp_b_scalar;
     int32_t a_bias_offset;
     int32_t k;
-    /// False when the compensation is the identity for every row and column
-    /// (a_bias_offset + zp_a == 0 and all zp_b == 0). The reductions are then
-    /// skipped, r_a / r_b are null, and the row pass drops both subtractions.
+    /// The compensation's two halves, applied independently, so a caller can
+    /// keep whichever ones it did not fold away:
+    ///   compensate → subtract (r_a − k·zp_a)·zp_b[n] per element (r_a is read)
+    ///   col_term   → subtract (a_bias_offset + zp_a)·r_b[n]      (r_b is read)
+    /// Both false when the compensation is the identity for every row and
+    /// column (a_bias_offset + zp_a == 0 and all zp_b == 0): the reductions are
+    /// then skipped, r_a / r_b are null, and the row pass drops both
+    /// subtractions. The per-element half is a row constant whenever zp_b is
+    /// per-tensor, so MatMul folds it into row_off and leaves compensate false,
+    /// which also retires the r_a read; the column half has no n-constant fold
+    /// and is only absent when a_bias_offset + zp_a == 0 for every row.
     bool compensate;
+    bool col_term;
     /// A is quantised inside the A pack from the fp activations rather than
     /// materialised as an int8 tensor; this is the target's storage type.
     bool act_u8;
@@ -710,6 +867,8 @@ inline void dq_epilogue_tile(const DqEpilogueParams<TOut>& p, const int32_t* c, 
             p.a_bias_offset + zp_a,
             p.compensate ? p.r_a[m] - p.k * zp_a : 0,
             p.compensate,
+            p.col_term,
+            p.row_off ? p.row_off[m] : 0,
             p.a_bias_offset,
             zp_a,
             p.compensate ? p.r_a[m] : 0,

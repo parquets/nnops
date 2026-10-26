@@ -95,6 +95,8 @@ struct Case {
     bool bias = false;
     float s_x = 0.0078125f;           // 1/128 — exact in binary
     int32_t zp_x = 0;
+    float s_out = 0.03125f;           // requant scale, integer output only
+    int32_t zp_out = 0;
     bool asym_w = false;              // per-channel weight zero point != 0
     bool add_to = false;
     EpilogueActivateType ep = EpilogueActivateType::None;
@@ -112,6 +114,7 @@ struct Fixture {
     std::vector<float>   w_s;         // per-channel weight scales
     std::vector<int32_t> w_zp;        // per-channel weight zero points
     QuantParams qa, qw;
+    QuantParams out_q;                // the requant's parameters (integer output)
     Conv2DAttributes attrs;
     std::vector<TensorView> ins;
 
@@ -123,6 +126,7 @@ struct Fixture {
         const bool is_u8 = (c.act == DataType::u8);
         const bool fp_act = (c.act == DataType::f32 || c.act == DataType::f16);
         const bool quant_target_u8 = (c.act_q == DataType::u8);
+        const bool int_out = (c.out == DataType::s8 || c.out == DataType::u8);
 
         // ---- activation ----
         act.resize(static_cast<size_t>(N * IC * IH * pitch) * elem_size(c.act));
@@ -166,11 +170,17 @@ struct Fixture {
             }
         }
 
-        // ---- bias ----
+        // ---- bias: the output dtype on an fp destination, int32 on s8/u8 ----
         if (c.bias) {
-            bias.resize(static_cast<size_t>(OC) * elem_size(c.out));
+            bias.resize(static_cast<size_t>(OC) *
+                        (int_out ? sizeof(int32_t) : elem_size(c.out)));
             test::XorShift128 rng(c.seed + 2);
             for (int64_t oc = 0; oc < OC; ++oc) {
+                if (int_out) {
+                    reinterpret_cast<int32_t*>(bias.data())[oc] =
+                        static_cast<int32_t>(rng.next_float(-1500.0f, 1500.0f));
+                    continue;
+                }
                 const float b = rng.next_float(-0.5f, 0.5f);
                 if (c.out == DataType::f16) {
                     reinterpret_cast<half*>(bias.data())[oc] = float_to_half(b);
@@ -183,6 +193,7 @@ struct Fixture {
         // ---- views ----
         qa = per_tensor(c.s_x, c.zp_x);
         qw = per_channel(w_s.data(), w_zp.data(), OC);
+        if (int_out) { out_q = per_tensor(c.s_out, c.zp_out); }
 
         attrs.kernel_size = {c.kh, c.kw};
         attrs.stride = {c.sh, c.sw};
@@ -206,7 +217,8 @@ struct Fixture {
         ins.push_back(TensorView(wshape, DataType::s8, w.data(), TensorLayout::NCHW, qw));
         if (c.bias) {
             const int64_t bshape[] = {OC};
-            ins.push_back(TensorView(bshape, c.out, bias.data(), TensorLayout::NCHW));
+            const DataType bdt = int_out ? DataType::s32 : c.out;
+            ins.push_back(TensorView(bshape, bdt, bias.data(), TensorLayout::NCHW));
         }
     }
 
@@ -221,6 +233,11 @@ struct Fixture {
 /// Deterministic initial output contents (only `add_to` reads them back).
 void seed_output(std::vector<uint8_t>& buf, DataType dt, uint64_t seed) {
     test::XorShift128 rng(seed);
+    if (dt == DataType::s8 || dt == DataType::u8) {
+        // No add_to on an integer destination: the contents are overwritten.
+        for (auto& b : buf) { b = static_cast<uint8_t>(rng.next_u64() & 0xFFu); }
+        return;
+    }
     const int64_t n = static_cast<int64_t>(buf.size() / elem_size(dt));
     for (int64_t i = 0; i < n; ++i) {
         const float v = rng.next_float(-1.0f, 1.0f);
@@ -230,6 +247,12 @@ void seed_output(std::vector<uint8_t>& buf, DataType dt, uint64_t seed) {
             reinterpret_cast<float*>(buf.data())[i] = v;
         }
     }
+}
+
+/// make_planar, keeping the quant params an integer destination needs.
+TensorView make_out_view(const TensorDesc& desc, void* data, const QuantParams& qp) {
+    auto shape = std::span<const int64_t>(desc.dims.data(), static_cast<size_t>(desc.rank));
+    return TensorView(shape, desc.dtype, data, desc.layout, qp);
 }
 
 struct Result {
@@ -247,7 +270,9 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     r.desc = outs[0];
     r.buf.assign(outs[0].nbytes(), 0);
     seed_output(r.buf, outs[0].dtype, c.seed + 3);
-    auto out = test::make_planar(outs[0], r.buf.data());
+    // The output view carries the requant's QuantParams for an integer
+    // destination (`make_planar` would drop them).
+    auto out = make_out_view(outs[0], r.buf.data(), f.out_q);
 
     if (reference) {
         nnops::backend::cpu::reference::conv2d_int8_ref(f.attrs, out, f.ins, ctx, nullptr);
@@ -274,6 +299,13 @@ std::string first_difference(const Result& a, const Result& b) {
                               "elem %zu: kernel 0x%04x (%.6f) vs ref 0x%04x (%.6f)",
                               i, unsigned(half_to_bits(*x)), double(half_to_float(*x)),
                               unsigned(half_to_bits(*y)), double(half_to_float(*y)));
+            } else if (a.desc.dtype == DataType::s8) {
+                std::snprintf(msg, sizeof(msg), "elem %zu: kernel %d vs ref %d", i,
+                              int(static_cast<int8_t>(a.buf[i])),
+                              int(static_cast<int8_t>(b.buf[i])));
+            } else if (a.desc.dtype == DataType::u8) {
+                std::snprintf(msg, sizeof(msg), "elem %zu: kernel %d vs ref %d", i,
+                              int(a.buf[i]), int(b.buf[i]));
             } else {
                 const float* x = reinterpret_cast<const float*>(a.buf.data()) + i;
                 const float* y = reinterpret_cast<const float*>(b.buf.data()) + i;
@@ -634,35 +666,7 @@ NNOPS_TEST(conv2d_i8_epilogues_match_ref) {
 }
 
 // ============================================================
-// add_to (reference-only path)
-// ============================================================
-
-NNOPS_TEST(conv2d_i8_add_to_matches_ref) {
-    Case c;
-    c.ishape = {1, 4, 7, 7};
-    c.wshape = {6, 4, 3, 3};
-    c.kh = c.kw = 3;
-    c.ph = c.pw = 1;
-    c.act = DataType::u8;
-    c.zp_x = 128;
-    c.asym_w = true;
-    c.add_to = true;
-    c.ep = EpilogueActivateType::Relu;
-    c.seed = 3000;
-    expect_matches_ref(c);
-
-    // The same case without add_to must differ: seed_output() lays down a
-    // different baseline, so equality would mean add_to was ignored.
-    Case plain = c;
-    plain.add_to = false;
-    const Result with_add = run_route(c, {}, false);
-    const Result without  = run_route(plain, {}, false);
-    NNOPS_EXPECT_FALSE(std::memcmp(with_add.buf.data(), without.buf.data(),
-                                   with_add.buf.size()) == 0);
-}
-
-// ============================================================
-// Threading: identical bits across thread counts
+// Integer output (s8 / u8) — int32 bias, requant
 // ============================================================
 
 /// Minimal fixed-size pool exposing a CpuBackend (test_conv2d.cpp pattern).
@@ -696,6 +700,303 @@ struct SimplePool {
     CpuBackend cpu;
     inline static thread_local int current_thread_id_ = 0;
 };
+
+NNOPS_TEST(conv2d_i8_int_out_hand_exact) {
+    // The operands of conv2d_i8_hand_exact: the compensate-free accumulate is
+    // -1, -3, -7, -9 and s_w · s_x = 0.125, so the requant scale is
+    // 0.125 / s_out exactly and every expectation below is hand-computable.
+    const int64_t ishape[] = {1, 1, 3, 3};
+    const int64_t wshape[] = {1, 1, 2, 2};
+    const int64_t bshape[] = {1};
+
+    std::vector<int8_t>  in = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<int8_t>  wt = {1, -1, 2, 0};
+    std::vector<float>   ws = {0.5f};
+    std::vector<int32_t> wz = {1};
+
+    auto run = [&](DataType out_dt, float s_out, int32_t zp_out,
+                   const int32_t* bias, EpilogueActivateType ep) {
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {2, 2};
+        attrs.stride = {1, 1};
+        attrs.padding = {0, 0};
+        attrs.output_dtype = out_dt;
+        attrs.epilogue.type = ep;
+
+        TensorView input(ishape, DataType::s8, in.data(), TensorLayout::NCHW,
+                         per_tensor(0.25f, 2));
+        TensorView weight(wshape, DataType::s8, wt.data(), TensorLayout::NCHW,
+                          per_channel(ws.data(), wz.data(), 1));
+        TensorView bias_view(bshape, DataType::s32,
+                             const_cast<int32_t*>(bias), TensorLayout::NCHW);
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {input.desc(), weight.desc(), bias_view.desc()};
+        auto outs = op->getOutputTensorDesc(descs);
+        NNOPS_EXPECT_EQ(outs[0].dtype, out_dt);
+
+        std::vector<uint8_t> buf(static_cast<size_t>(outs[0].nbytes()), 0);
+        auto out = make_out_view(outs[0], buf.data(), per_tensor(s_out, zp_out));
+        const TensorView ins[] = {input, weight, bias_view};
+        op->compute(out, ins);
+
+        std::vector<int32_t> got(4);
+        for (int i = 0; i < 4; ++i) {
+            got[static_cast<size_t>(i)] = (out_dt == DataType::u8)
+                ? int32_t(buf[static_cast<size_t>(i)])
+                : int32_t(static_cast<int8_t>(buf[static_cast<size_t>(i)]));
+        }
+        return got;
+    };
+
+    {
+        // bias 5 → 4, 2, -2, -4; req 1 → v + 10.
+        const int32_t bias = 5;
+        const auto got = run(DataType::s8, 0.125f, 10, &bias, EpilogueActivateType::None);
+        const int32_t want[4] = {14, 12, 8, 6};
+        for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_EQ(got[static_cast<size_t>(i)], want[i]); }
+    }
+    {
+        // req 64 → 256, 128, -128, -256: both clamps of the s8 range.
+        const int32_t bias = 5;
+        const auto got = run(DataType::s8, 1.0f / 512.0f, 0, &bias, EpilogueActivateType::None);
+        const int32_t want[4] = {127, 127, -128, -128};
+        for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_EQ(got[static_cast<size_t>(i)], want[i]); }
+    }
+    {
+        // The same values on a u8 destination: 256 saturates at 255, 128 fits,
+        // and the two negatives hit the 0 floor.
+        const int32_t bias = 5;
+        const auto got = run(DataType::u8, 1.0f / 512.0f, 0, &bias, EpilogueActivateType::None);
+        const int32_t want[4] = {255, 128, 0, 0};
+        for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_EQ(got[static_cast<size_t>(i)], want[i]); }
+    }
+    {
+        // Relu runs on the int32 value, before the requant: all-negative → 0.
+        const int32_t bias = 0;
+        const auto got = run(DataType::u8, 0.125f, 0, &bias, EpilogueActivateType::Relu);
+        const int32_t want[4] = {0, 0, 0, 0};
+        for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_EQ(got[static_cast<size_t>(i)], want[i]); }
+    }
+}
+
+/// Integer destinations over the same geometry spread as the fp route.
+NNOPS_TEST(conv2d_i8_int_out_matches_ref) {
+    std::vector<Case> cases;
+
+    // ---- s8 out / s8 act, asymmetric weight, int32 bias ----
+    {
+        Case c;
+        c.ishape = {1, 4, 8, 8};
+        c.wshape = {8, 4, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.act = DataType::s8;
+        c.zp_x = -9;
+        c.out = DataType::s8;
+        c.asym_w = true;
+        c.bias = true;
+        c.s_out = 0.03125f;
+        c.zp_out = -7;
+        cases.push_back(c);
+    }
+    // ---- u8 out / u8 act with the classic zp 128 ----
+    {
+        Case c;
+        c.ishape = {1, 4, 8, 8};
+        c.wshape = {8, 4, 3, 3};
+        c.kh = c.kw = 3;
+        c.act = DataType::u8;
+        c.zp_x = 128;
+        c.out = DataType::u8;
+        c.bias = true;
+        c.zp_out = 128;
+        cases.push_back(c);
+    }
+    // ---- u8 out, no bias: the compensate-only epilogue ----
+    {
+        Case c;
+        c.ishape = {2, 5, 7, 7};
+        c.wshape = {6, 5, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.act = DataType::u8;
+        c.zp_x = 173;
+        c.out = DataType::u8;
+        c.asym_w = true;
+        c.zp_out = 3;
+        cases.push_back(c);
+    }
+    // ---- asymmetric activation, symmetric weight: the per-channel part of the
+    //      compensation folds into the bias (no column sweep, no per-element
+    //      compensation), so the result must still equal the reference exactly.
+    //      zp_eff = 173 − 128 = 45 here, so that fold is not the identity.
+    {
+        Case c;
+        c.ishape = {1, 4, 9, 9};
+        c.wshape = {8, 4, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.act = DataType::u8;
+        c.zp_x = 173;
+        c.out = DataType::s8;
+        c.bias = true;
+        c.zp_out = -7;
+        cases.push_back(c);
+    }
+    // ---- the same fold with no bias at all: the vector is the correction only ----
+    {
+        Case c;
+        c.ishape = {2, 3, 8, 8};
+        c.wshape = {5, 3, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.act = DataType::s8;
+        c.zp_x = -11;                     // zp_eff = −11
+        c.out = DataType::u8;
+        c.zp_out = 128;
+        cases.push_back(c);
+    }
+    // ---- Relu before the requant ----
+    {
+        Case c;
+        c.ishape = {1, 6, 7, 7};
+        c.wshape = {8, 6, 3, 3};
+        c.kh = c.kw = 3;
+        c.act = DataType::s8;
+        c.out = DataType::s8;
+        c.ep = EpilogueActivateType::Relu;
+        c.bias = true;
+        c.s_out = 0.0625f;
+        cases.push_back(c);
+    }
+    // ---- fp32 activation quantized to s8, s8 out ----
+    {
+        Case c;
+        c.ishape = {1, 4, 8, 8};
+        c.wshape = {8, 4, 3, 3};
+        c.kh = c.kw = 3;
+        c.act = DataType::f32;
+        c.act_q = DataType::s8;
+        c.out = DataType::s8;
+        c.bias = true;
+        cases.push_back(c);
+    }
+    // ---- f16 activation quantized to u8, u8 out ----
+    {
+        Case c;
+        c.ishape = {1, 4, 8, 8};
+        c.wshape = {8, 4, 3, 3};
+        c.kh = c.kw = 3;
+        c.act = DataType::f16;
+        c.act_q = DataType::u8;
+        c.zp_x = 117;
+        c.out = DataType::u8;
+        c.zp_out = 120;
+        cases.push_back(c);
+    }
+    // ---- groups = 2 (bias indexed per output channel) ----
+    {
+        Case c;
+        c.ishape = {1, 4, 8, 8};
+        c.wshape = {8, 2, 3, 3};
+        c.kh = c.kw = 3;
+        c.groups = 2;
+        c.act = DataType::s8;
+        c.out = DataType::s8;
+        c.bias = true;
+        c.asym_w = true;
+        cases.push_back(c);
+    }
+    // ---- 1x1 pointwise, u8 out ----
+    {
+        Case c;
+        c.ishape = {1, 32, 6, 6};
+        c.wshape = {16, 32, 1, 1};
+        c.kh = c.kw = 1;
+        c.act = DataType::u8;
+        c.zp_x = 128;
+        c.out = DataType::u8;
+        c.zp_out = 128;
+        c.bias = true;
+        cases.push_back(c);
+    }
+    // ---- several oc-blocks / ic-blocks, saturation-heavy scale ----
+    {
+        Case c;
+        c.ishape = {1, 16, 12, 12};
+        c.wshape = {160, 16, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.act = DataType::u8;
+        c.zp_x = 128;
+        c.out = DataType::s8;
+        c.asym_w = true;
+        c.bias = true;
+        c.s_out = 0.001953125f;   // req ×4 — most outputs clamp
+        cases.push_back(c);
+    }
+    // ---- pitched input, integer output ----
+    {
+        Case c;
+        c.ishape = {1, 4, 8, 7};
+        c.wshape = {8, 4, 3, 3};
+        c.kh = c.kw = 3;
+        c.ph = c.pw = 1;
+        c.in_pitch = 12;
+        c.act = DataType::s8;
+        c.out = DataType::s8;
+        c.bias = true;
+        cases.push_back(c);
+    }
+
+    for (size_t i = 0; i < cases.size(); ++i) {
+        cases[i].seed = 5000 + i;
+        expect_matches_ref(cases[i], {}, static_cast<int>(i));
+    }
+
+    // Threading: an oc-block's epilogue must stay within its own task.
+    for (int nthreads : {2, 4}) {
+        SimplePool pool(nthreads);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        for (size_t i = 0; i < cases.size(); ++i) {
+            expect_matches_ref(cases[i], ctx, static_cast<int>(i));
+        }
+    }
+}
+
+// ============================================================
+// add_to (reference-only path)
+// ============================================================
+
+NNOPS_TEST(conv2d_i8_add_to_matches_ref) {
+    Case c;
+    c.ishape = {1, 4, 7, 7};
+    c.wshape = {6, 4, 3, 3};
+    c.kh = c.kw = 3;
+    c.ph = c.pw = 1;
+    c.act = DataType::u8;
+    c.zp_x = 128;
+    c.asym_w = true;
+    c.add_to = true;
+    c.ep = EpilogueActivateType::Relu;
+    c.seed = 3000;
+    expect_matches_ref(c);
+
+    // The same case without add_to must differ: seed_output() lays down a
+    // different baseline, so equality would mean add_to was ignored.
+    Case plain = c;
+    plain.add_to = false;
+    const Result with_add = run_route(c, {}, false);
+    const Result without  = run_route(plain, {}, false);
+    NNOPS_EXPECT_FALSE(std::memcmp(with_add.buf.data(), without.buf.data(),
+                                   with_add.buf.size()) == 0);
+}
+
+// ============================================================
+// Threading: identical bits across thread counts
+// ============================================================
 
 NNOPS_TEST(conv2d_i8_threaded_matches_serial) {
     struct TCase { std::array<int64_t, 4> ishape; std::array<int64_t, 4> wshape;
@@ -797,6 +1098,18 @@ NNOPS_TEST(conv2d_i8_output_desc) {
     NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f16);
     c.act = DataType::f32;
     NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f32);
+
+    // An integer output comes from attributes.output_dtype whatever the
+    // activation storage is, fp included.
+    c.out = DataType::s8;
+    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::s8);
+    c.out = DataType::u8;
+    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::u8);
+    c.act = DataType::f16;
+    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::u8);
+    c.act = DataType::s8;
+    NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::u8);
+    c.out = DataType::f32;
 
     // Pre-quantized activation → attributes.output_dtype.
     c.act = DataType::u8;

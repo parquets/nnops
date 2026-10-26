@@ -1,19 +1,22 @@
 /// @file linear.cpp
 /// @brief CPU Linear: output = epilogue(X × Wᵀ + bias), optional add_to.
 ///
-/// Linear is a MatMul with a transposed weight, an optional per-column bias and
-/// an fp output even when the operands are quantized, so it drives the MatMul
-/// kernel instead of duplicating the GEMM:
+/// Linear is a MatMul with a transposed weight and an optional per-column bias,
+/// so it drives the MatMul kernel instead of duplicating the GEMM:
 ///
 ///   - f32/f16 X and W: MatMul's fp route; the output follows X.
-///   - u8|s8 X × s8 W:  MatMul's int8 route with an fp output, which dequantizes
-///     every int32 accumulate with X's and W's QuantParams.
+///   - u8|s8 X × s8 W:  MatMul's int8 route, with the output dtype taken from
+///     `output_dtype` — f32/f16 dequantizes every int32 accumulate with X's and
+///     W's QuantParams, s32/s8/u8 keeps it integral (requantizing for the last
+///     two with the output's QuantParams).
 ///
 /// Bias and the activation are MatMul's now: it adds the bias between the
-/// product and the epilogue on every route with an fp output. Linear forwards
-/// its third input and sets the epilogue; the only thing left here is add_to,
-/// which rides MatMul's beta when the residual must not pass through the
-/// activation, and otherwise goes through a compact M×N temporary.
+/// product and the epilogue (an fp bias on the fp outputs, an int32 bias in the
+/// int8 output pass on the integer ones). Linear forwards its third input and
+/// sets the epilogue; the only thing left here is add_to, which rides MatMul's
+/// beta when the residual must not pass through the activation, and otherwise
+/// goes through a compact M×N temporary. add_to on an integer output is not
+/// implemented (the residual would need its own requantized add).
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
@@ -31,11 +34,20 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-/// The fp output type the Linear resolves. fp operands keep their own dtype;
-/// the quantized path always produces fp, with f16 selected by the attribute.
+/// The output type the Linear resolves. fp operands keep their own dtype; the
+/// quantized path follows `output_dtype` — f32/f16 dequantizes, s32/s8/u8 keeps
+/// the result integral — with anything else falling back to f32.
 DataType linear_output_dtype(const LinearAttributes& attrs, DataType x_dt) noexcept {
     if (x_dt == DataType::f32 || x_dt == DataType::f16) { return x_dt; }
-    return (attrs.output_dtype == DataType::f16) ? DataType::f16 : DataType::f32;
+    switch (attrs.output_dtype) {
+    case DataType::f16:
+    case DataType::s32:
+    case DataType::s8:
+    case DataType::u8:
+        return attrs.output_dtype;
+    default:
+        return DataType::f32;
+    }
 }
 
 /// Raw data pointer of a view, for building a promoted (rank-1 → rank-2) view.
@@ -89,8 +101,14 @@ void linear_cpu(const LinearAttributes& attrs,
     const bool quant = is_int8_matmul(x_dt, w_dt);
     NNOPS_ASSERT(quant || (x_dt == w_dt &&
                            (x_dt == DataType::f32 || x_dt == DataType::f16)));
+    // Integer output -> int32 bias (MatMul's rule); fp output -> the output
+    // dtype. add_to needs a quantized residual add, which does not exist yet.
+    const bool int_out = out_dt == DataType::s32 || out_dt == DataType::s8 ||
+                         out_dt == DataType::u8;
+    NNOPS_ASSERT_MSG(!(attrs.add_to && int_out),
+                     "Linear: add_to needs an fp output");
     if (has_bias) {
-        NNOPS_ASSERT(inputs[2].data_type() == out_dt);
+        NNOPS_ASSERT(inputs[2].data_type() == (int_out ? DataType::s32 : out_dt));
         NNOPS_ASSERT(inputs[2].numel() >= w.shape(0));
     }
 
@@ -106,9 +124,11 @@ void linear_cpu(const LinearAttributes& attrs,
                       K * static_cast<int64_t>(data_type_size(x_dt)),
                       x.layout(), x.quant_params());
         const int64_t os[2] = {1, N};
+        // The quant params travel with the view: an s8/u8 output requantizes
+        // with them.
         out_row.emplace(std::span<const int64_t>(os, 2), out_dt, view_data(output),
                         N * static_cast<int64_t>(data_type_size(out_dt)),
-                        output.layout());
+                        output.layout(), output.quant_params());
     }
     TensorView& ov = out_row ? *out_row : output;
 

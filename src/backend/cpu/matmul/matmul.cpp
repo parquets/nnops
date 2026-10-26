@@ -227,10 +227,11 @@ struct I8Route {
         tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, lo, hi);
     }
 
-    /// The s32 output, or the M×N temporary an s8 output requantizes from.
+    /// The s32 output, or the M×N temporary an s8/u8 output requantizes from.
     static Acc* c_base(TensorView& output, int64_t c_off, void* accum) {
-        return output.data_type() == DataType::s8 ? static_cast<Acc*>(accum)
-                                                  : output.ptr<Acc>() + c_off;
+        const DataType dt = output.data_type();
+        return (dt == DataType::s8 || dt == DataType::u8)
+            ? static_cast<Acc*>(accum) : output.ptr<Acc>() + c_off;
     }
 
     static void zero_c(Acc* c, int ldc, int M, int N) {
@@ -239,9 +240,10 @@ struct I8Route {
         }
     }
 
-    /// s8 output only: the accumulator appended after the plan's scratch.
+    /// An s8/u8 output only: the accumulator appended after the plan's scratch.
     static size_t extra_workspace(const TensorView& output) {
-        return output.data_type() == DataType::s8 ? accum_bytes(output) : 0;
+        const DataType dt = output.data_type();
+        return (dt == DataType::s8 || dt == DataType::u8) ? accum_bytes(output) : 0;
     }
 
     static void epilogue_tile(const EpilogueParams& p, Acc* c, int ldc,
@@ -453,7 +455,9 @@ void matmul_block(const MatMulAttributes& attrs,
 /// kernels are in simd_int8_reduce.hpp — this only owns the slab split.
 ///
 /// B is always int8; @p a_u8 selects A's element type — a u8 A must be summed
-/// unsigned, since the compensation is over the true value.
+/// unsigned, since the compensation is over the true value. A null @p r_a or
+/// @p r_b skips that sweep: each reduction feeds one half of the compensation,
+/// and a half that is folded away or zero needs neither the sum nor the read.
 void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda,
                              const int8_t* b_ptr, int64_t ldb,
                              const MatMulAttributes& attrs,
@@ -490,8 +494,8 @@ void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda,
         });
     };
 
-    reduce(a_ptr, a_u8, lda, M, /*rows=*/!attrs.transpose_a, r_a);
-    reduce(b_ptr, /*u8=*/false, ldb, N, /*rows=*/attrs.transpose_b, r_b);
+    if (r_a != nullptr) { reduce(a_ptr, a_u8, lda, M, /*rows=*/!attrs.transpose_a, r_a); }
+    if (r_b != nullptr) { reduce(b_ptr, /*u8=*/false, ldb, N, /*rows=*/attrs.transpose_b, r_b); }
 }
 
 /// True when some zero point is non-zero. A per-row / per-column buffer wins
@@ -576,9 +580,10 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const int ldc_out = static_cast<int>(output.row_stride_elems());
 
     // int8 accumulates raw int32: the s32 output in place, or a compact M×N
-    // temporary the output pass rewrites — s8 requant, or fp dequant.
-    const bool out_s8 = !R::is_fp && output.data_type() == DataType::s8;
-    const bool compact_acc = out_s8 || (!R::is_fp && R::is_dq);
+    // temporary the output pass rewrites — s8/u8 requant, or fp dequant.
+    const DataType odt_t = output.data_type();
+    const bool out_q = !R::is_fp && (odt_t == DataType::s8 || odt_t == DataType::u8);
+    const bool compact_acc = out_q || (!R::is_fp && R::is_dq);
     const int ldc = compact_acc ? static_cast<int>(N) : ldc_out;
 
     const typename R::AElem* a_base = a.ptr<typename R::AElem>();
@@ -591,6 +596,15 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
         const DataType a_dt = R::a_eff_type(attrs, a);
         a_biased = (int8_a_pack_bias(a_dt) != 0);
         a_bias_offset = int8_epilogue_offset(a_dt);
+    }
+
+    // The integer bias: an int32 [N] column vector the output pass adds after
+    // the zero-point compensation and before Relu. It is not scaled by alpha,
+    // which only rides the RHS pack. The dequantizing route has no int32 bias —
+    // its optional bias is the fp output-typed one in inputs[2].
+    [[maybe_unused]] const int32_t* int_bias = nullptr;
+    if constexpr (!R::is_fp && !R::is_dq) {
+        if (inputs.size() > 2) { int_bias = inputs[2].ptr<int32_t>(); }
     }
 
     // plan.ldd_b is the full-Kc stride used for *sizing*; each k-block packs at
@@ -623,43 +637,66 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                        : split_block_count(Mi, mc);
 
     // The reduction sweep and the epilogue exist only to apply quantization:
-    // with no zero points, no activation, no s8 output and no A shift left to
-    // withdraw, both are arithmetic identities (compensate reduces to `raw`).
+    // with no zero points, no activation, no integer destination and no A shift
+    // left to withdraw, both are arithmetic identities (compensate reduces to
+    // `raw`).
     // They are not free — a full sweep of A and B up front, then a pass over
     // every element of C — and at shallow K that fixed cost is what keeps the
     // call off the kernel rate.
-    // Two separate gates. `int8_ep` says the output pass runs on the last-k
-    // tile; `int8_passes` says the reductions that feed its compensation are
-    // needed. They differ only on the dq route, whose output pass is the
-    // dequant multiply and therefore always runs, while the sweep is pure
-    // overhead whenever compensate() is the identity: both subtractive terms
-    // vanish when a_bias_offset + zp_a == 0 for every row and every zp_b is
-    // zero, which is the ordinary symmetric s8 W8A8 setup.
+    // Two kinds of gate. `int8_ep` says the output pass runs on the last-k tile;
+    // the sweep flags say which reductions feed it. They differ only on the dq
+    // route, whose output pass is the dequant multiply and therefore always
+    // runs, while a sweep is pure overhead whenever its half of compensate() is
+    // zero or folded away.
+    //
+    // The compensation has two independent halves (see DqEpilogueParams), and
+    // each needs its own reduction:
+    //   col_term → −(a_bias_offset + zp_a)·r_b[n]   sweeps B
+    //   row half → −(r_a − k·zp_a)·zp_b[n]          sweeps A
+    // The row half is a row constant whenever zp_b is per-tensor, so it is
+    // folded into a per-row int32 once (row_fold) instead of applied at every
+    // element; a per-channel zp_b has no such fold and stays in the epilogue.
     bool int8_ep = false;
-    bool int8_passes = false;
-    std::vector<int32_t> r_a, r_b;
+    bool col_term = false;       // the column half is non-zero for some row
+    bool sweep_a = false;        // Σ_k A[m,k] is needed
+    bool sweep_b = false;        // Σ_k B[k,n] is needed
+    bool fold_row = false;       // the row half is folded into r_fold
+    std::vector<int32_t> r_a, r_b, r_fold;
     if constexpr (!R::is_fp) {
         const QuantParams& qa = a.quant_params();
         const QuantParams& qb = b.quant_params();
+        // The two questions are separate, and the answers are the two gate
+        // conditions: a u8 activation against symmetric weights only needs r_b,
+        // an s8 activation against asymmetric weights only needs r_a, and the
+        // fully symmetric setup needs neither.
+        col_term = any_zp_differs(qa.zero_point_data, qa.zero_point, qa.num_scales,
+                                  Mi, -a_bias_offset);
+        const bool row_half = any_zp_nonzero(qb.zero_point_data, qb.zero_point,
+                                             qb.num_scales, Ni);
+        // One int32 per row needs one zp_b: a per-channel array folds only when
+        // every channel shares its value, which is not worth scanning for.
+        fold_row = row_half && qb.zero_point_data == nullptr;
+        sweep_a = row_half;
+        sweep_b = col_term;
         if constexpr (R::is_dq) {
             int8_ep = true;
-            int8_passes = dq_needs_compensation(a, b, a_bias_offset, Mi, Ni);
             if constexpr (R::fused_a) {
                 // matmul_dq only fuses the identity case: the pack has no way
                 // to accumulate r_a, and A_q (which the sweep reads) is gone.
-                NNOPS_ASSERT(!int8_passes);
+                NNOPS_ASSERT(!sweep_a && !sweep_b);
             }
         } else {
-            int8_passes = out_s8 || a_bias_offset != 0 ||
-                          attrs.epilogue.type != EpilogueActivateType::None ||
-                          qa.zero_point != 0 || qb.zero_point != 0 ||
-                          qa.zero_point_data != nullptr || qb.zero_point_data != nullptr;
-            int8_ep = int8_passes;
+            // The output pass has its own reasons to run even when no sweep
+            // does: it is where an integer destination, the bias and Relu are
+            // applied. An integer destination is not itself a reason to sweep —
+            // a symmetric s8 W8A8 setup requantizes straight from the raw
+            // accumulate.
+            int8_ep = sweep_a || sweep_b || out_q || int_bias != nullptr ||
+                      attrs.epilogue.type != EpilogueActivateType::None;
         }
-        if (int8_passes) {
-            r_a.resize(static_cast<size_t>(Mi));
-            r_b.resize(static_cast<size_t>(Ni));
-        }
+        if (sweep_a) { r_a.resize(static_cast<size_t>(Mi)); }
+        if (sweep_b) { r_b.resize(static_cast<size_t>(Ni)); }
+        if (fold_row) { r_fold.resize(static_cast<size_t>(Mi)); }
     }
 
     // The int8 output pass rides on the last k-block's tile, exactly where fp
@@ -672,8 +709,8 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
         if (int8_ep) {
             const QuantParams& qa = a.quant_params();
             const QuantParams& qb = b.quant_params();
-            ip.r_a = int8_passes ? r_a.data() : nullptr;
-            ip.r_b = int8_passes ? r_b.data() : nullptr;
+            ip.r_a = sweep_a ? r_a.data() : nullptr;
+            ip.r_b = sweep_b ? r_b.data() : nullptr;
             ip.s_a = qa.scale_data;
             ip.s_a_scalar = qa.scale;
             ip.zp_a = qa.zero_point_data;
@@ -686,7 +723,9 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
             ip.k = Ki;
             ip.ldc_out = ldc_out;
             if constexpr (R::is_dq) {
-                ip.compensate = int8_passes;
+                ip.compensate = sweep_a && !fold_row;  // row half, per element
+                ip.col_term = col_term;
+                ip.row_off = fold_row ? r_fold.data() : nullptr;
                 ip.act_u8 = R::a_eff_type(attrs, a) == DataType::u8;
                 ip.ep = &attrs.epilogue;
                 // The dequantize pass is this route's accumulator: the bias
@@ -699,6 +738,13 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 ip.out_scale = quant_scale_at(qc, 0);  // requant only
                 ip.zp_out = quant_zp_at(qc, 0);
                 ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
+                ip.compensate = sweep_a && !fold_row;  // row half, per element
+                ip.col_term = col_term;
+                ip.col_bias = int_bias;   // per-column: MatMul's [N] bias
+                // The folded row half is an int32 added before the requant,
+                // which is what the per-row bias slot already is (MatMul's own
+                // bias is per-column, so the slot is free here).
+                ip.bias = fold_row ? r_fold.data() : nullptr;
             }
         }
     }
@@ -717,10 +763,11 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
             // no pass: its first k-block runs the zero_mode kernel.
             R::zero_c(c_p, ldc, Mi, Ni);
             if constexpr (!R::fused_a) {
-                if (int8_passes) {
+                if (sweep_a || sweep_b) {
                     compute_int8_reductions(a_p, R::a_eff_type(attrs, a) == DataType::u8,
                                             lda, b_src.ptr, ldb, attrs, M, N, K,
-                                            r_a.data(), r_b.data(), ctx);
+                                            sweep_a ? r_a.data() : nullptr,
+                                            sweep_b ? r_b.data() : nullptr, ctx);
                 }
             }
             if (int8_ep) {
@@ -735,8 +782,22 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
                     ip.s_a = qa_b.scale_data ? qa_b.scale_data + row_base : nullptr;
                     ip.zp_a = qa_b.zero_point_data ? qa_b.zero_point_data + row_base
                                                    : nullptr;
-                } else if (out_s8) {
-                    ip.out = output.ptr<int8_t>() + c_offset;
+                } else if (out_q) {
+                    const bool as_u8 = (odt_t == DataType::u8);
+                    ip.out = as_u8 ? nullptr : output.ptr<int8_t>() + c_offset;
+                    ip.out_u8 = as_u8 ? output.ptr<uint8_t>() + c_offset : nullptr;
+                }
+                if (fold_row) {
+                    // −zp_b·(r_a[m] − k·zp_a[m]) for this batch's rows, read
+                    // exactly as the epilogue would read them, so folding the
+                    // term out is bit-identical to applying it per element. A
+                    // per-tensor zp_b is the whole reason this fold exists.
+                    for (int64_t m = 0; m < Mi; ++m) {
+                        const int32_t zp_a_m = int8_zp_at(ip.zp_a, ip.zp_a_scalar, m);
+                        r_fold[static_cast<size_t>(m)] =
+                            -ip.zp_b_scalar *
+                            (r_a[static_cast<size_t>(m)] - ip.k * zp_a_m);
+                    }
                 }
             }
         }
@@ -1002,15 +1063,16 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
     auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count(),
                                 ctx.cpu.thread_slot_count() > 0);
 
-    // int8: tiled for s32 / s8 outputs, reference otherwise. An s8 output adds
-    // an int32 M×N accumulator after the scratch.
+    // int8: tiled for s32 / s8 / u8 outputs, reference otherwise. A quantized
+    // output adds an int32 M×N accumulator after the scratch.
     if (is_int8_matmul(dt_a, dt_b)) {
         const DataType odt = output.data_type();
         // An fp output dequantizes the same int32 accumulate instead of
         // returning or requantizing it — the "already-quantized A" entry point
         // mirrors the fp-activation one, sharing the epilogue kernel.
         const bool out_fp = (odt == DataType::f32 || odt == DataType::f16);
-        const bool out_ok = (odt == DataType::s32) || (odt == DataType::s8) || out_fp;
+        const bool out_ok = (odt == DataType::s32) || (odt == DataType::s8) ||
+                            (odt == DataType::u8) || out_fp;
         if (out_ok) {
             NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
             if (out_fp && odt == DataType::f32) {
@@ -1068,17 +1130,25 @@ void matmul_cpu(const MatMulAttributes& attrs,
         return;
     }
 
-    // An optional [N] bias. Every fp-output route consumes it where its
+    // An optional [N] bias, typed by the output branch. An fp output
+    // (f32/f16) carries an fp bias: every fp-output route consumes it where its
     // accumulator is seeded — the fp kernels with beta·C_old + bias before the
     // first k-block, the dequantizing int8 route between the dequantize and the
-    // clip — so the dispatch always runs with the bias in reach and the normal
-    // last-k clamp and epilogue stay in place. Bias is not scaled by alpha,
-    // which only rides the RHS pack.
+    // clip. An integer output (s32/s8/u8) carries an int32 bias instead, added
+    // by the int8 output pass after the compensation and before Relu. Bias is
+    // not scaled by alpha, which only rides the RHS pack.
     const TensorView& bias = inputs[2];
     const DataType odt = output.data_type();
-    NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16,
-                     "MatMul: a bias needs an fp output (s32/s8 carries no bias)");
-    NNOPS_ASSERT(bias.data_type() == odt);
+    const bool int_out = odt == DataType::s32 || odt == DataType::s8 ||
+                         odt == DataType::u8;
+    if (int_out) {
+        NNOPS_ASSERT_MSG(bias.data_type() == DataType::s32,
+                         "MatMul: an integer output (s32/s8/u8) takes an int32 bias");
+    } else {
+        NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16,
+                         "MatMul: the bias needs an fp or integer output");
+        NNOPS_ASSERT(bias.data_type() == odt);
+    }
     NNOPS_ASSERT(bias.numel() >= output.shape(output.rank() - 1));
 
     matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);

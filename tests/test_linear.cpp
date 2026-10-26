@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <vector>
 
@@ -432,4 +433,77 @@ NNOPS_TEST(linear_quant_output_dtype) {
     auto f16_op = Linear::create(attrs, Backend::CPU);
     auto f16_out = f16_op->getOutputTensorDesc(desc_arr);
     NNOPS_EXPECT_EQ(f16_out[0].dtype, DataType::f16);
+
+    // Integer outputs are also resolved from output_dtype.
+    for (DataType odt : {DataType::s32, DataType::s8, DataType::u8}) {
+        LinearAttributes iattrs;
+        iattrs.output_dtype = odt;
+        auto op = Linear::create(iattrs, Backend::CPU);
+        NNOPS_EXPECT_EQ(op->getOutputTensorDesc(desc_arr)[0].dtype, odt);
+    }
+}
+
+NNOPS_TEST(linear_int8_output_matches_ref) {
+    // Integer outputs: s32 (compensated accumulate), s8 and u8 (requantized),
+    // each with an int32 [N] bias and Relu. Per-token X, per-channel W, and
+    // K spanning several k-blocks — kernel against linear_ref, bit for bit.
+    for (DataType odt : {DataType::s32, DataType::s8, DataType::u8}) {
+        const int64_t M = 5, K = 600, N = 13;
+        auto xv = random_s8(M * K, 41);
+        auto wv = random_s8(N * K, 42);
+
+        std::vector<float> xs(static_cast<size_t>(M));
+        std::vector<int32_t> xzp(static_cast<size_t>(M));
+        std::vector<float> ws(static_cast<size_t>(N));
+        std::vector<int32_t> wzp(static_cast<size_t>(N));
+        for (int64_t i = 0; i < M; ++i) {
+            xs[static_cast<size_t>(i)] = 0.01f + 0.001f * static_cast<float>(i);
+            xzp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 7) - 3;
+        }
+        for (int64_t i = 0; i < N; ++i) {
+            ws[static_cast<size_t>(i)] = 0.005f + 0.001f * static_cast<float>(i);
+            wzp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 5) - 2;
+        }
+
+        const int64_t xshape[] = {M, K};
+        const int64_t wshape[] = {N, K};
+        auto x = make_view(xshape, DataType::s8, xv.data(),
+                           quant_arrays(QuantGranularity::PerToken,
+                                        xs.data(), xzp.data(), M));
+        auto w = make_view(wshape, DataType::s8, wv.data(),
+                           quant_arrays(QuantGranularity::PerChannel,
+                                        ws.data(), wzp.data(), N));
+
+        std::vector<int32_t> bias_buf(static_cast<size_t>(N));
+        nnops::test::XorShift128 rng(43);
+        for (auto& b : bias_buf) {
+            b = static_cast<int32_t>(rng.next_u64() % 20001) - 10000;
+        }
+        const int64_t bshape[] = {N};
+        TensorView b(bshape, DataType::s32, bias_buf.data());
+
+        LinearAttributes attrs;
+        attrs.output_dtype = odt;
+        attrs.epilogue.type = EpilogueActivateType::Relu;
+
+        auto op = Linear::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {x.desc(), w.desc()};
+        const TensorDesc od = op->getOutputTensorDesc(descs)[0];
+        NNOPS_EXPECT_EQ(od.dtype, odt);
+
+        // 1024 is a power of two: the requant scale adds no rounding of its own.
+        const QuantParams oq = per_tensor(1024.0f, odt == DataType::u8 ? 128 : -7);
+        std::vector<uint8_t> got(static_cast<size_t>(od.nbytes()), 0);
+        std::vector<uint8_t> want(static_cast<size_t>(od.nbytes()), 0);
+        const auto shape = std::span<const int64_t>(od.dims.data(),
+                                                    static_cast<size_t>(od.rank));
+        TensorView og(shape, odt, got.data(), TensorLayout::NCHW, oq);
+        TensorView ow(shape, odt, want.data(), TensorLayout::NCHW, oq);
+
+        const TensorView ins[] = {x, w, b};
+        op->compute(og, ins);
+        nnops::backend::cpu::reference::linear_ref(attrs, ow, ins, {}, nullptr);
+
+        NNOPS_EXPECT_EQ(std::memcmp(got.data(), want.data(), got.size()), 0);
+    }
 }

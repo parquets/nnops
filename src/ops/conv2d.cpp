@@ -82,13 +82,17 @@ std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
         static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs);
 
-    // The quantized route writes fp output. A fp activation already carries the
-    // output dtype (shape inference copies the input dtype); a pre-quantized
-    // activation (u8/s8) leaves it to attributes.output_dtype.
+    // The quantized route writes either an integer destination (s8/u8, taken
+    // from attributes.output_dtype) or an fp one — the fp activation's own
+    // dtype, or output_dtype for a pre-quantized (u8/s8) activation. An
+    // unsupported request is passed through untouched, so the kernel plan can
+    // refuse it instead of silently running another route.
     if (inputs.size() > 1 && is_quantized_conv2d(inputs[1].dtype)) {
         const DataType act = inputs[0].dtype;
         const bool fp_act = (act == DataType::f32 || act == DataType::f16);
-        outs[0].dtype = fp_act ? act : attrs_.output_dtype;
+        const DataType odt = attrs_.output_dtype;
+        const bool int_out = odt == DataType::s8 || odt == DataType::u8;
+        outs[0].dtype = (int_out || !fp_act) ? odt : act;
     }
     return outs;
 }

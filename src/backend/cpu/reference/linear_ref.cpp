@@ -6,9 +6,11 @@
 ///
 /// Supported operand combinations, matching the operator's contract:
 ///   - f32/f16 input and weight          → output follows the input dtype
-///   - u8/s8 input × s8 weight (quantized) → output f32 or f16
+///   - u8/s8 input × s8 weight (quantized) → output f32/f16, or s32/s8/u8
 ///
-/// The quantized path uses the same expression as MatMul's int8 epilogue:
+/// An integer output takes an int32 [N] bias and runs MatMul's integer output
+/// pass (compensate, bias, Relu, requant). The quantized path uses the same
+/// expression as MatMul's int8 epilogue:
 ///
 ///   acc = Σ_k (x[m,k] − zp_x[m]) · (w[n,k] − zp_w[n])
 ///   f   = acc · s_x[m] · s_w[n]
@@ -22,6 +24,7 @@
 #include "nnops/detail/half.hpp"
 #include "../simd_kernel/simd_epilogue.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 #include <vector>
@@ -72,15 +75,28 @@ void linear_ref_impl(const LinearAttributes& attrs,
     const int64_t rows = (x.rank() >= 2) ? x.total_rows() : 1;
 
     // The element types select the path: integral operands are the quantized
-    // (u8|s8 × s8) case, floating-point operands the fp case.
-    constexpr bool quant = std::is_integral_v<XT>;
-    NNOPS_ASSERT(!has_bias || inputs[2].data_type() == output.data_type());
-    NNOPS_ASSERT(output.data_type() == DataType::f32 ||
+    // (u8|s8 × s8) case, floating-point operands the fp case. An integral CT is
+    // the quantized path's integer destination (s32 / s8 / u8), where the bias
+    // is an int32 and Relu + the requant replace the fp epilogue.
+    constexpr bool quant   = std::is_integral_v<XT>;
+    constexpr bool int_out = std::is_integral_v<CT>;
+    NNOPS_ASSERT(!has_bias || inputs[2].data_type() ==
+                                 (int_out ? DataType::s32 : output.data_type()));
+    NNOPS_ASSERT(int_out || output.data_type() == DataType::f32 ||
                  output.data_type() == DataType::f16);
+    NNOPS_ASSERT(!attrs.add_to || !int_out);
 
     const QuantParams& qx = x.quant_params();
     const QuantParams& qw = w.quant_params();
-    const CT* bias = has_bias ? inputs[2].ptr<CT>() : nullptr;
+    [[maybe_unused]] const CT* bias =
+        (has_bias && !int_out) ? inputs[2].ptr<CT>() : nullptr;
+    [[maybe_unused]] const int32_t* int_bias =
+        (has_bias && int_out) ? inputs[2].ptr<int32_t>() : nullptr;
+
+    // The output requant's parameters, read only for an integral destination.
+    [[maybe_unused]] const QuantParams& qc = output.quant_params();
+    [[maybe_unused]] const float out_scale = scale_at(qc, 0);
+    [[maybe_unused]] const int32_t zp_out = zp_at(qc, 0);
 
     // Raw reductions of W: r_b[n] = Σ_k W[n,k]. Needed only on the quantized
     // path (the compensation subtracts zp_w·r_x + zp_x·r_w).
@@ -121,6 +137,23 @@ void linear_ref_impl(const LinearAttributes& attrs,
                 const int32_t acc = matmul_int8_compensate(
                     raw, 0, zp_x, zp_w, r_a, r_b[static_cast<size_t>(n)],
                     static_cast<int32_t>(K));
+                if constexpr (int_out) {
+                    // Same order as MatMul's integer output pass: compensate,
+                    // bias, Relu, requant.
+                    int32_t v = acc;
+                    if (int_bias != nullptr) { v += int_bias[n]; }
+                    if (attrs.epilogue.type == EpilogueActivateType::Relu) {
+                        v = std::max(v, 0);
+                    }
+                    if constexpr (std::is_same_v<CT, int32_t>) {
+                        orow[n] = v;
+                    } else {
+                        const float req = matmul_int8_requant_scale(
+                            scale_at(qx, row), scale_at(qw, n), out_scale);
+                        orow[n] = matmul_int8_requant<CT>(v, req, zp_out);
+                    }
+                    continue;
+                }
                 f = static_cast<float>(acc) *
                     (scale_at(qx, row) * scale_at(qw, n));
             } else {
@@ -145,10 +178,12 @@ void linear_ref_out(const LinearAttributes& attrs,
                     std::span<const TensorView> inputs,
                     const ComputeContext& ctx)
 {
-    if (output.data_type() == DataType::f16) {
-        linear_ref_impl<XT, WT, half>(attrs, output, inputs, ctx);
-    } else {
-        linear_ref_impl<XT, WT, float>(attrs, output, inputs, ctx);
+    switch (output.data_type()) {
+    case DataType::f16: linear_ref_impl<XT, WT, half>(attrs, output, inputs, ctx); break;
+    case DataType::s32: linear_ref_impl<XT, WT, int32_t>(attrs, output, inputs, ctx); break;
+    case DataType::s8:  linear_ref_impl<XT, WT, int8_t>(attrs, output, inputs, ctx); break;
+    case DataType::u8:  linear_ref_impl<XT, WT, uint8_t>(attrs, output, inputs, ctx); break;
+    default:            linear_ref_impl<XT, WT, float>(attrs, output, inputs, ctx); break;
     }
 }
 

@@ -1031,6 +1031,107 @@ void bench_i8_u8_ab(const char* tag, int64_t M, int64_t K, int64_t N,
     std::printf("    median:   s8=%7.1f  u8=%7.1f   u8/s8=%.3f\n", ms, mu, mu / ms);
 }
 
+// ---- integer destinations: s32 vs s8 vs u8 ---------------------------------
+//
+// The same GEMM, the same operands, three output dtypes and one int32 bias
+// each. What differs is the output pass alone:
+//
+//   s32  a bias-only pass over the raw accumulate, in place. No reductions:
+//        `int8_passes` stays off when the compensation is the identity and a
+//        bias alone is no reason to run them (int8_epilogue_row_bias).
+//   s8   the reductions sweep has to run (the requant reads r_a / r_b), then
+//   u8   compensate + bias + requant + the saturating pack, per element.
+//
+// So s8/s32 is what an integer destination costs over the raw accumulate, and
+// u8/s8 is the price of the wider clamp (packus vs packs) alone. The zero
+// points are symmetric, i.e. the common W8A8 case.
+void bench_i8_out_ab(const char* tag, int64_t M, int64_t K, int64_t N,
+                     int rounds = 5, int iters = 20) {
+    auto [a_buf, a] = make_tensor_i8(M, K, 1);
+    auto [b_buf, b] = make_tensor_i8(K, N, 2);
+
+    std::vector<int32_t> bias_buf(static_cast<size_t>(N));
+    {
+        nnops::test::XorShift128 rng(3);
+        for (auto& v : bias_buf) { v = static_cast<int32_t>(rng.next_u64() % 4096) - 2048; }
+    }
+    const int64_t bshape[] = {N};
+    TensorView bias(bshape, DataType::s32, bias_buf.data());
+
+    // The requant reads the output's own scale / zero point.
+    auto per_tensor = [](float s, int32_t zp) {
+        QuantParams qp;
+        qp.granularity = QuantGranularity::PerTensor;
+        qp.scale = s;
+        qp.zero_point = zp;
+        return qp;
+    };
+    const QuantParams oq_s8 = per_tensor(0.25f, -7);
+    const QuantParams oq_u8 = per_tensor(0.25f, 128);
+
+    MatMulAttributes attrs_s32{}, attrs_s8{}, attrs_u8{};
+    attrs_s32.output_dtype = DataType::s32;
+    attrs_s8.output_dtype = DataType::s8;
+    attrs_u8.output_dtype = DataType::u8;
+    auto op_s32 = MatMul::create(attrs_s32, Backend::CPU);
+    auto op_s8 = MatMul::create(attrs_s8, Backend::CPU);
+    auto op_u8 = MatMul::create(attrs_u8, Backend::CPU);
+
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    const TensorDesc od_s32 = op_s32->getOutputTensorDesc(arr)[0];
+    const TensorDesc od_s8 = op_s8->getOutputTensorDesc(arr)[0];
+    const TensorDesc od_u8 = op_u8->getOutputTensorDesc(arr)[0];
+
+    std::vector<int32_t> out_s32(static_cast<size_t>(od_s32.numel()));
+    std::vector<int8_t> out_s8(static_cast<size_t>(od_s8.numel()));
+    std::vector<uint8_t> out_u8(static_cast<size_t>(od_u8.numel()));
+    const int64_t oshape[] = {M, N};
+    const std::span<const int64_t> ospan(oshape, 2);
+    auto vout_s32 = test::make_planar(od_s32, out_s32.data());
+    auto vout_s8 = TensorView(ospan, DataType::s8, out_s8.data(),
+                              TensorLayout::NCHW, oq_s8);
+    auto vout_u8 = TensorView(ospan, DataType::u8, out_u8.data(),
+                              TensorLayout::NCHW, oq_u8);
+
+    const TensorView ins[] = {a, b, bias};
+    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
+                       * static_cast<double>(K);
+
+    auto timed = [&](auto&& fn) {
+        for (int i = 0; i < 2; ++i) { fn(); }
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { fn(); }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        return flops * iters / (ms * 1e6);
+    };
+
+    std::printf("  int8 out-dtype A/B  %s  %lldx%lldx%lld  1T  rounds=%d iters=%d\n",
+                tag, static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+
+    std::vector<double> v32, v8, vu8;
+    for (int r = 0; r < rounds; ++r) {
+        const double g32 = timed([&] { op_s32->compute(vout_s32, ins, {}, nullptr); });
+        const double g8  = timed([&] { op_s8->compute(vout_s8, ins, {}, nullptr); });
+        const double gu8 = timed([&] { op_u8->compute(vout_u8, ins, {}, nullptr); });
+        v32.push_back(g32);
+        v8.push_back(g8);
+        vu8.push_back(gu8);
+        std::printf("    round %d:  s32=%7.1f  s8=%7.1f  u8=%7.1f   s8/s32=%.3f"
+                    "  u8/s32=%.3f\n", r, g32, g8, gu8, g8 / g32, gu8 / g32);
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double m32 = median(v32), m8 = median(v8), mu8 = median(vu8);
+    std::printf("    median:   s32=%7.1f  s8=%7.1f  u8=%7.1f   s8/s32=%.3f"
+                "  u8/s32=%.3f  u8/s8=%.3f\n",
+                m32, m8, mu8, m8 / m32, mu8 / m32, mu8 / m8);
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -1405,6 +1506,26 @@ NNOPS_BENCH(matmul_u8s8_vs_s8_ab) {
 }
 
 // ============================================================
+// int8 with an integer destination (s32 / s8 / u8) + int32 bias
+// ============================================================
+
+NNOPS_BENCH(matmul_i8_out_256) {
+    // Small enough that the output pass is a real share of the call.
+    bench_i8_out_ab("nn", 256, 256, 256);
+}
+
+NNOPS_BENCH(matmul_i8_out_large) {
+    // GEMM-bound: the same pass amortized over 4x the work.
+    bench_i8_out_ab("nn", 1024, 512, 1024);
+}
+
+NNOPS_BENCH(matmul_i8_out_decode) {
+    // One token against the weight: the pass is M rows, the GEMM is M·K·N, so
+    // this is where s8 should cost the most relative to s32.
+    bench_i8_out_ab("nn", 8, 4096, 4096);
+}
+
+// ============================================================
 // Q5_1 weights — llama.cpp block stream on the RHS
 // ============================================================
 
@@ -1697,6 +1818,11 @@ double time_budget_gflops(F&& f, double flops, double budget_ms) {
 /// Everything one dq case needs. A is fp with offline QuantParams attached, B is
 /// s8 with a per-output-channel scale, and a dense fp copy of B is kept so the
 /// fp-route side of an A/B multiplies exactly the same weights.
+///
+/// @p b_zp is the weight zero point: 0 keeps B's per-channel array (all zeros,
+/// the symmetric checkpoint layout), while a non-zero value declares one zp for
+/// the whole tensor and no per-channel array — the shape whose per-element
+/// compensation half folds into a per-row offset.
 template <typename T>
 struct DqCase {
     int64_t M, K, N;
@@ -1713,7 +1839,8 @@ struct DqCase {
     TensorView ins[2], ins_fp[2];
 
     DqCase(int64_t m, int64_t k, int64_t n, bool transpose_b,
-           QuantGranularity g, DataType qdt)
+           QuantGranularity g, DataType qdt, int32_t b_zp = 0,
+           bool b_zp_per_channel = false)
         : M(m), K(k), N(n), tb(transpose_b), gran(g), act_dt(qdt)
     {
         nnops::test::XorShift128 rng(1);
@@ -1767,8 +1894,18 @@ struct DqCase {
         qb.granularity = QuantGranularity::PerChannel;
         qb.scale = s_b[0];
         qb.scale_data = s_b.data();
-        qb.zero_point_data = zp_b.data();
         qb.num_scales = N;
+        if (b_zp == 0) {
+            qb.zero_point_data = zp_b.data();
+        } else if (b_zp_per_channel) {
+            std::fill(zp_b.begin(), zp_b.end(), b_zp);
+            qb.zero_point_data = zp_b.data();
+        } else {
+            // One zp for the whole tensor, no per-channel array: the
+            // compensation's per-element half is then a row constant.
+            // num_scales still describes the per-channel scales above.
+            qb.zero_point = b_zp;
+        }
 
         // The fp route's B: exactly the values the s8 B represents.
         bf_buf.resize(b_buf.size());
@@ -2104,6 +2241,97 @@ NNOPS_BENCH(matmul_dq_per_tensor_large) {
     // instead of a row vector. Same kernel, one load fewer per row.
     bench_dq_case<float>("dq/f32 nn 1024x512x1024 per-tensor", 1024, 512, 1024,
                          /*tb=*/false, QuantGranularity::PerTensor);
+}
+
+/// The weight zero point: 0 (a per-channel array of zeros, the symmetric
+/// checkpoint layout) against one non-zero zp for the tensor. Both arms carry a
+/// u8 activation, so the column half of the compensation is live in both and
+/// only the row half differs — the folded one. That is the whole point of the
+/// fold: the term is a row constant, so it is applied once per output row
+/// (into a per-row int32) instead of once per element, and the A reduction
+/// skips nothing it still needs. A non-zero-zp arm slower than its twin means
+/// the per-element term or the B sweep came back.
+template <typename T>
+void bench_dq_weight_zp_ab(int64_t M, int64_t K, int64_t N, bool tb, int nt,
+                           DataType act_dt = DataType::u8, int32_t b_zp = -5,
+                           bool b_zp_per_channel = false,
+                           int rounds = 3, double budget_ms = 150.0) {
+    DqCase<T> sym(M, K, N, tb, QuantGranularity::PerToken, act_dt, /*b_zp=*/0);
+    DqCase<T> fold(M, K, N, tb, QuantGranularity::PerToken, act_dt, b_zp,
+                   b_zp_per_channel);
+
+    MatMulAttributes attrs{};
+    attrs.transpose_b = tb;
+    attrs.act_quant_dtype = act_dt;
+    auto op_sym = MatMul::create(attrs, Backend::CPU);
+    auto op_fold = MatMul::create(attrs, Backend::CPU);
+
+    SimplePool pool(nt);
+    ComputeContext ctx;
+    if (nt > 1) { ctx.cpu = pool.cpu; }
+    const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+    const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N)
+                       * static_cast<double>(K);
+    auto time_sym = [&] {
+        return time_budget_gflops(
+            [&] { op_sym->compute(sym.c, sym.ins, use_ctx, nullptr); }, flops, budget_ms);
+    };
+    auto time_fold = [&] {
+        return time_budget_gflops(
+            [&] { op_fold->compute(fold.c, fold.ins, use_ctx, nullptr); }, flops, budget_ms);
+    };
+
+    std::printf("  dq weight zp  %s  %lldx%lldx%lld  %dT  act=%s  zp_b=%d%s  rounds=%d\n",
+                tb ? "tb" : "nn", static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), nt,
+                act_dt == DataType::u8 ? "u8" : "s8", b_zp,
+                b_zp_per_channel ? " per-channel" : "", rounds);
+
+    std::vector<double> vs, vf, vnull;
+    for (int r = 0; r < rounds; ++r) {
+        // A B A B, and the per-round minimum for each arm: the second A is the
+        // null control (same op, same buffers) and sets the noise floor.
+        const double s1 = time_sym();
+        const double f1 = time_fold();
+        const double s2 = time_sym();
+        const double f2 = time_fold();
+        vs.push_back(std::min(s1, s2));
+        vf.push_back(std::min(f1, f2));
+        vnull.push_back(std::abs(s2 - s1) / std::min(s1, s2) * 100.0);
+        std::printf("    round %d:  zp0=%7.1f  zp5=%7.1f   zp5/zp0=%.3f   null %.1f%%\n",
+                    r, vs.back(), vf.back(), vf.back() / vs.back(), vnull.back());
+    }
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double ms = median(vs), mf = median(vf), mn = median(vnull);
+    std::printf("    median:   zp0=%7.1f  zp5=%7.1f   zp5/zp0=%.3f   null %.1f%%%s\n",
+                ms, mf, mf / ms, mn, std::abs(mf - ms) / ms * 100.0 > mn
+                                       ? "" : "  (within noise)");
+}
+
+NNOPS_BENCH(matmul_dq_weight_zp_ab) {
+    // 256^3 on one thread: the output pass is a real share of the call. (At 4T
+    // a call this short is all pool spawn — see the file header.)
+    bench_dq_weight_zp_ab<float>(256, 256, 256, /*tb=*/false, 1);
+    // The measured shape, both thread counts: the fold's per-row work is
+    // amortized over a full-size GEMM here, so the ratio should sit at 1.
+    bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 1);
+    bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 4);
+    // Decode: one output row, so the A sweep the fold keeps is O(K) and the
+    // per-element term it retires is O(N) — the shape where a stale B sweep
+    // would be pure overhead.
+    bench_dq_weight_zp_ab<float>(1, 4096, 4096, /*tb=*/true, 1);
+    // Per-channel asymmetric weights under symmetric activations: no fold (it
+    // needs one zp_b), but the column half is identically zero, so B is not
+    // swept at all — the mirror image of the u8 rows above.
+    bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 1, DataType::s8, -5,
+                                 /*b_zp_per_channel=*/true);
+    bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 4, DataType::s8, -5,
+                                 /*b_zp_per_channel=*/true);
 }
 
 NNOPS_BENCH(matmul_dq_vs_fp_ab_nn) {

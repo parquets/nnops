@@ -336,6 +336,56 @@ NNOPS_TEST(matmul_dq_per_token_transpose_b_matches_ref) {
     expect_dq_matches_ref<float>(attrs, descs[0], ins);
 }
 
+NNOPS_TEST(matmul_dq_per_tensor_b_zp_symmetric_a_matches_ref) {
+    // Symmetric A and a per-tensor (not per-channel) non-zero zp_b: the whole
+    // compensation is a row constant, so the dispatch folds it into a per-row
+    // offset and sweeps neither A nor B.
+    constexpr int64_t M = 12, K = 20, N = 16;
+    Quad q = make_quad(M, K, N, 105);
+    TensorView a = make_q(M, K, DataType::f32, q.a.data(), per_tensor(0.03f, 0));
+    TensorView b = make_q(K, N, DataType::s8, q.b.data(), per_tensor(0.006f, -7));
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    const TensorView ins[] = {a, b};
+    expect_dq_matches_ref<float>(attrs, descs[0], ins);
+}
+
+NNOPS_TEST(matmul_dq_per_tensor_b_zp_asymmetric_a_matches_ref) {
+    // Both halves live: the column term sweeps B, while the per-element term is
+    // still a row constant and folds — r_a then feeds only the fold.
+    constexpr int64_t M = 10, K = 18, N = 14;
+    Quad q = make_quad(M, K, N, 106);
+    TensorView a = make_q(M, K, DataType::f32, q.a.data(), per_token(q.a_s.data(), q.a_zp.data(), M));
+    TensorView b = make_q(K, N, DataType::s8, q.b.data(), per_tensor(0.006f, 5));
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    const TensorView ins[] = {a, b};
+    expect_dq_matches_ref<float>(attrs, descs[0], ins);
+}
+
+NNOPS_TEST(matmul_dq_symmetric_a_per_channel_b_matches_ref) {
+    // A symmetric, so the column term is identically zero and the B sweep is
+    // skipped; the per-element half has no row fold (zp_b varies per channel)
+    // and is still applied element by element.
+    constexpr int64_t M = 13, K = 21, N = 17;
+    Quad q = make_quad(M, K, N, 107);
+    TensorView a = make_q(M, K, DataType::f32, q.a.data(), per_tensor(0.03f, 0));
+    TensorView b = make_q(K, N, DataType::s8, q.b.data(), per_channel(q.b_s.data(), q.b_zp.data(), N));
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    const TensorView ins[] = {a, b};
+    expect_dq_matches_ref<float>(attrs, descs[0], ins);
+}
+
 NNOPS_TEST(matmul_dq_u8_target_matches_ref) {
     // act_quant_dtype = u8: the pack shifts A into signed range for the
     // signed-dot kernels, and the shift comes back out of the accumulator.

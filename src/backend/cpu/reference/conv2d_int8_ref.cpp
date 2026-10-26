@@ -1,20 +1,22 @@
 /// @file conv2d_int8_ref.cpp
 /// @brief Naive CPU reference for the quantized Conv2D route — s8 weight ×
-///        u8/s8/f16/f32 activation → f32/f16 output (planar NCHW).
+///        u8/s8/f16/f32 activation → f32/f16 or s8/u8 output (planar NCHW).
 ///
 /// The correctness baseline for conv2d_int8.cpp, and the only implementation of
 /// `add_to` (the tiled route would have to fold the pre-existing output into the
 /// accumulator). Naive seven-level loop with per-sample parallelism.
 ///
 /// Every step after the integer dot product is written to match the tiled
-/// kernel's dq_epilogue_tile expression for expression — same dequantize, same
-/// bias-then-clip order, same activation — so the two agree bit for bit. The
-/// activation quantization uses the same arithmetic as
-/// quant_kernel::quantization<T> (`x · (1/scale) + zero`, round-to-nearest-even,
-/// clamp to the storage range).
+/// kernel's epilogue expression for expression, so the two agree bit for bit:
+/// for an fp destination dq_epilogue_tile (same dequantize, same bias-then-clip
+/// order, same activation), for an integer destination int8_epilogue_tile
+/// (int32 bias, Relu, requant by the output's QuantParams). The activation
+/// quantization uses the same arithmetic as quant_kernel::quantization<T>
+/// (`x · (1/scale) + zero`, round-to-nearest-even, clamp to the storage range).
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"
+#include "nnops/detail/assert.hpp"
 #include "../simd_kernel/simd_epilogue.hpp"
 
 #include <algorithm>
@@ -46,6 +48,9 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
 {
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
     constexpr bool kU8    = std::is_same_v<TDst, uint8_t>;
+    /// An integer destination: the compensated accumulate is requantized with
+    /// the output's QuantParams instead of dequantized, and the bias is int32.
+    constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
     const auto& input  = inputs[0];
     const auto& weight = inputs[1];
@@ -89,8 +94,16 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
 
     const auto* in_ptr  = input.ptr<TAct>();
     const auto* w_ptr   = weight.ptr<int8_t>();
-    const auto* b_ptr   = has_bias ? inputs[2].ptr<TOut>() : nullptr;
+    [[maybe_unused]] const TOut* b_ptr =
+        (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    [[maybe_unused]] const int32_t* b_i32 =
+        (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
     auto*       out_ptr = output.ptr<TOut>();
+    // The requant's output parameters, read only for an integer destination.
+    [[maybe_unused]] const QuantParams& qc = output.quant_params();
+    [[maybe_unused]] const float out_scale = quant_scale_at(qc, 0);
+    [[maybe_unused]] const int32_t zp_out = quant_zp_at(qc, 0);
+    NNOPS_ASSERT(!attrs.add_to || !kIntOut);
 
     const auto compute_sample = [&](int64_t n) {
         for (int64_t g = 0; g < G; ++g) {
@@ -133,21 +146,32 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
                             }
                         }
 
-                        // ---- same tail as dq_epilogue_row -------------------
-                        float f = static_cast<float>(acc) * (s_w * s_x);
-                        if (has_bias) {
-                            f += s_load(&b_ptr[oc_global]);
-                        }
-                        f = std::min(std::max(f, attrs.epilogue.min_clip),
-                                     attrs.epilogue.max_clip);
-                        f = apply_epilogue(attrs.epilogue, f, oc_global);
-
                         const int64_t out_idx =
                             ((n * OC + oc_global) * OH + oh) * out_row_stride + ow;
-                        if (attrs.add_to) {
-                            f += s_load(&out_ptr[out_idx]);
+                        if constexpr (kIntOut) {
+                            // ---- same tail as int8_epilogue_row_quant --------
+                            int32_t v = acc;
+                            if (has_bias) { v += b_i32[oc_global]; }
+                            if (attrs.epilogue.type == EpilogueActivateType::Relu) {
+                                v = std::max(v, 0);
+                            }
+                            const float req = matmul_int8_requant_scale(s_w, s_x, out_scale);
+                            out_ptr[out_idx] = matmul_int8_requant<TOut>(v, req, zp_out);
+                        } else {
+                            // ---- same tail as dq_epilogue_row -----------------
+                            float f = static_cast<float>(acc) * (s_w * s_x);
+                            if (has_bias) {
+                                f += s_load(&b_ptr[oc_global]);
+                            }
+                            f = std::min(std::max(f, attrs.epilogue.min_clip),
+                                         attrs.epilogue.max_clip);
+                            f = apply_epilogue(attrs.epilogue, f, oc_global);
+
+                            if (attrs.add_to) {
+                                f += s_load(&out_ptr[out_idx]);
+                            }
+                            s_store(&out_ptr[out_idx], f);
                         }
-                        s_store(&out_ptr[out_idx], f);
                     }
                 }
             }
@@ -155,6 +179,40 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
     };
 
     ctx.cpu.run(0, N, [&](int64_t n) { compute_sample(n); });
+}
+
+/// Destination dispatch: fp output as stored, integer output requantized.
+template <class TAct, class TDst>
+void conv2d_int8_ref_dst(const Conv2DAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx)
+{
+    switch (output.data_type()) {
+    case DataType::f16: conv2d_int8_ref_impl<TAct, TDst, half>(attrs, output, inputs, ctx);    break;
+    case DataType::s8:  conv2d_int8_ref_impl<TAct, TDst, int8_t>(attrs, output, inputs, ctx);  break;
+    case DataType::u8:  conv2d_int8_ref_impl<TAct, TDst, uint8_t>(attrs, output, inputs, ctx); break;
+    default:            conv2d_int8_ref_impl<TAct, TDst, float>(attrs, output, inputs, ctx);   break;
+    }
+}
+
+template <class TAct>
+void conv2d_int8_ref_act(const Conv2DAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx)
+{
+    // Same storage selection as the tiled route: fp activations are quantized to
+    // act_quant_dtype, pre-quantized ones are used as stored.
+    const DataType act_dt = inputs[0].data_type();
+    const bool u8 = (act_dt == DataType::u8)
+                 || ((act_dt == DataType::f32 || act_dt == DataType::f16) &&
+                     attrs.act_quant_dtype == DataType::u8);
+    if (u8) {
+        conv2d_int8_ref_dst<TAct, uint8_t>(attrs, output, inputs, ctx);
+    } else {
+        conv2d_int8_ref_dst<TAct, int8_t>(attrs, output, inputs, ctx);
+    }
 }
 
 }  // anonymous namespace
@@ -165,30 +223,10 @@ void conv2d_int8_ref(const Conv2DAttributes& attrs,
                      const ComputeContext& ctx,
                      void* /*workspace*/)
 {
-    // Same storage selection as the tiled route: fp activations are quantized to
-    // act_quant_dtype, pre-quantized ones are used as stored.
     const DataType act_dt = inputs[0].data_type();
-    const bool u8 = (act_dt == DataType::u8)
-                 || ((act_dt == DataType::f32 || act_dt == DataType::f16) &&
-                     attrs.act_quant_dtype == DataType::u8);
-    const bool f16_out = output.data_type() == DataType::f16;
 
 #define NNOPS_CONV2D_I8_REF_ACT(TAct)                                          \
-    do {                                                                       \
-        if (u8) {                                                              \
-            if (f16_out) {                                                     \
-                conv2d_int8_ref_impl<TAct, uint8_t, half>(attrs, output, inputs, ctx); \
-            } else {                                                           \
-                conv2d_int8_ref_impl<TAct, uint8_t, float>(attrs, output, inputs, ctx); \
-            }                                                                  \
-        } else {                                                               \
-            if (f16_out) {                                                     \
-                conv2d_int8_ref_impl<TAct, int8_t, half>(attrs, output, inputs, ctx); \
-            } else {                                                           \
-                conv2d_int8_ref_impl<TAct, int8_t, float>(attrs, output, inputs, ctx); \
-            }                                                                  \
-        }                                                                      \
-    } while (0)
+    conv2d_int8_ref_act<TAct>(attrs, output, inputs, ctx)
 
     switch (act_dt) {
     case DataType::u8:  NNOPS_CONV2D_I8_REF_ACT(uint8_t); break;
