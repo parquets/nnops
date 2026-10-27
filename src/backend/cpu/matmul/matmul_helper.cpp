@@ -4,6 +4,7 @@
 
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/q5_1.hpp"
 #include "nnops/detail/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
@@ -221,8 +222,9 @@ void tile_pack_rhs(bool trans, int nc, int kc,
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
 
-// ---- Q5_1 RHS -----------------------------------------------------------
-// The panel layout matches tile_pack_rhs, so the MMA route knows no Q5_1.
+// ---- Block-packed RHS (q5_1 / q4_1) --------------------------------------
+// The panel layout matches tile_pack_rhs, so the MMA route knows no block
+// format: it reads the same uniform panels whichever stream they came from.
 
 #ifdef NNOPS_ARCH_X86_64
 
@@ -240,27 +242,48 @@ void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
                               src_row_blocks, scale);
 }
 
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
+    arch::pack_q4_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                               src_row_blocks, scale);
+}
+
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
+    arch::pack_q4_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                              src_row_blocks, scale);
+}
+
 #else
 
-/// Portable fallback for arches without a vectorized Q5_1 pack.
+/// Portable fallback for arches without a vectorized block pack.
 ///
 /// The panel width must be the active arch's float RHS panel width, because the
 /// workspace stride (ldd_b) and the MMA kernels are sized from it — it is not
 /// the same on every arch (aarch64 f32 uses nr_f32[0] = 12, both x86 widths and
 /// the aarch64 f16 one are 16).
 template <class T>
-constexpr int q5_1_panel_nr() noexcept {
+constexpr int block_panel_nr() noexcept {
     if constexpr (std::is_same_v<T, float>) { return NR_MAX_F32; }
     else { return NR_MAX_F16; }
 }
 
-template <class T>
-void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int kc,
-                               T* dst, int ldd, const void* src, int64_t row_blocks,
-                               float scale) {
-    constexpr int NR = q5_1_panel_nr<T>();
+/// Values per block of both formats. The scalar pack below indexes blocks with
+/// shifts, which is the 32-value layout q5_1 and q4_1 share.
+constexpr int kBlockElems = 32;
+static_assert(q5_1_block_elems == kBlockElems && q4_1_block_elems == kBlockElems,
+              "tile_pack_rhs_block_scalar indexes 32-value blocks");
+
+/// One block-packed format's row decoder: unpack(block_ptr, float out[]).
+template <class T, class Unpack>
+void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, int kc,
+                                T* dst, int ldd, const void* src, int64_t row_blocks,
+                                float scale, size_t block_bytes, Unpack unpack) {
+    constexpr int NR = block_panel_nr<T>();
     const uint8_t* base = static_cast<const uint8_t*>(src);
-    const int64_t row_bytes = row_blocks * static_cast<int64_t>(q5_1_block_bytes);
+    const int64_t row_bytes = row_blocks * static_cast<int64_t>(block_bytes);
 
     auto store = [](T* p, float v) {
         if constexpr (std::is_same_v<T, float>) { *p = v; }
@@ -275,11 +298,11 @@ void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int
             for (int j = 0; j < nr; ++j) {
                 const int row = trans ? (n_start + n + j) : (k_start + k);
                 const int col = trans ? (k_start + k)     : (n_start + n + j);
-                float vals[q5_1_block_elems];
-                q5_1_unpack_block(base + static_cast<int64_t>(row) * row_bytes
-                                       + static_cast<int64_t>(col >> 5) * q5_1_block_bytes,
-                                  vals);
-                store(&o[j], vals[col & 31] * scale);
+                float vals[kBlockElems];
+                unpack(base + static_cast<int64_t>(row) * row_bytes
+                            + static_cast<int64_t>(col / kBlockElems) * block_bytes,
+                       vals);
+                store(&o[j], vals[col % kBlockElems] * scale);
             }
             for (int j = nr; j < NR; ++j) { o[j] = T{}; }
         }
@@ -291,18 +314,60 @@ void tile_pack_rhs_q5_1_scalar(bool trans, int n_start, int nc, int k_start, int
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
                         float* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale) {
-    tile_pack_rhs_q5_1_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                     src, src_row_blocks, scale);
+    tile_pack_rhs_block_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
+                                      src, src_row_blocks, scale,
+                                      q5_1_block_bytes, q5_1_unpack_block);
 }
 
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
                         half* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale) {
-    tile_pack_rhs_q5_1_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                    src, src_row_blocks, scale);
+    tile_pack_rhs_block_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
+                                     src, src_row_blocks, scale,
+                                     q5_1_block_bytes, q5_1_unpack_block);
+}
+
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
+    tile_pack_rhs_block_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
+                                      src, src_row_blocks, scale,
+                                      q4_1_block_bytes, q4_1_unpack_block);
+}
+
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
+                        float scale) {
+    tile_pack_rhs_block_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
+                                     src, src_row_blocks, scale,
+                                     q4_1_block_bytes, q4_1_unpack_block);
 }
 
 #endif
+
+void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc, int k_start,
+                         int kc, float* dst, int ldd, const void* src,
+                         int64_t src_row_blocks, float scale) {
+    if (dt == DataType::q4_1) {
+        tile_pack_rhs_q4_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                           src_row_blocks, scale);
+    } else {
+        tile_pack_rhs_q5_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                           src_row_blocks, scale);
+    }
+}
+
+void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc, int k_start,
+                         int kc, half* dst, int ldd, const void* src,
+                         int64_t src_row_blocks, float scale) {
+    if (dt == DataType::q4_1) {
+        tile_pack_rhs_q4_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                           src_row_blocks, scale);
+    } else {
+        tile_pack_rhs_q5_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                           src_row_blocks, scale);
+    }
+}
 
 void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc,
                    const float* packed_a, const float* b,
@@ -574,11 +639,12 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
 
-    // A Q5_1 B is self-describing, so A only has to be a float type.
-    const bool q5_1_rhs = (dt_b == DataType::q5_1) &&
-                          (dt_a == DataType::f32 || dt_a == DataType::f16);
+    // A block-packed B (q5_1/q4_1) is self-describing, so A only has to be a
+    // float type.
+    const bool block_rhs = is_block_packed_dtype(dt_b) &&
+                           (dt_a == DataType::f32 || dt_a == DataType::f16);
     const bool int8_pair = is_int8_matmul(dt_a, dt_b);
-    if (dt_a != dt_b && !q5_1_rhs && !int8_pair) {
+    if (dt_a != dt_b && !block_rhs && !int8_pair) {
         return plan;
     }
 

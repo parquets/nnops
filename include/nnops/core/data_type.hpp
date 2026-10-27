@@ -28,6 +28,12 @@ enum class DataType : uint8_t {
                   ///< backend's vectorized pack kernels live in
                   ///< src/backend/cpu/x86_64/pack_q5_1.hpp. See q5_1_block_*
                   ///< for sizing.
+    q4_1    = 12, ///< llama.cpp Q4_1 block format: 32 values in a 20-byte block
+                  ///< (fp16 d, fp16 m, 16 nibble bytes). The affine sibling of
+                  ///< q5_1 without the 5th bit: value j = d·q + m, q in [0, 15].
+                  ///< Decode with pack_q4() in <nnops/detail/q4_1.hpp>; the
+                  ///< vectorized pack kernels live in
+                  ///< src/backend/cpu/x86_64/pack_q4_1.hpp. See q4_1_block_*.
 };
 
 /// Compile-time traits for each DataType.
@@ -118,11 +124,18 @@ struct DataTypeTraits<DataType::q5_1> {
     static constexpr const char* name = "q5_1";
 };
 
+template <>
+struct DataTypeTraits<DataType::q4_1> {
+    using ctype = uint8_t;   ///< block storage; 32 values per 20-byte block
+    static constexpr size_t size = 0;  ///< block-packed — use q4_1_block_bytes
+    static constexpr const char* name = "q4_1";
+};
+
 // ---- Block-packed formats ------------------------------------------------
 //
-// q5_1 has no per-element storage unit: values live in 32-element blocks of
-// 24 bytes, so data_type_size() returns 0 (like the 4-bit types) and every
-// row/stride computation must go through data_type_row_bytes() /
+// q5_1/q4_1 have no per-element storage unit: values live in 32-element blocks
+// of 24/20 bytes, so data_type_size() returns 0 (like the 4-bit types) and
+// every row/stride computation must go through data_type_row_bytes() /
 // data_type_stride_unit() instead of multiplying by the element size.
 
 /// Elements covered by one Q5_1 block.
@@ -131,10 +144,34 @@ inline constexpr int64_t q5_1_block_elems = 32;
 /// Bytes of one Q5_1 block: fp16 d, fp16 m, 4-byte 5th-bit mask, 16 nibbles.
 inline constexpr size_t q5_1_block_bytes = 24;
 
+/// Elements covered by one Q4_1 block (the same 32 as Q5_1).
+inline constexpr int64_t q4_1_block_elems = 32;
+
+/// Bytes of one Q4_1 block: fp16 d, fp16 m, 16 nibbles.
+inline constexpr size_t q4_1_block_bytes = 20;
+
 /// Whether the type stores values in fixed-size blocks rather than as a
 /// whole number of bytes per element.
 constexpr bool is_block_packed_dtype(DataType dt) noexcept {
-    return dt == DataType::q5_1;
+    return dt == DataType::q5_1 || dt == DataType::q4_1;
+}
+
+/// Bytes of one block of a block-packed dtype; 0 for every other type.
+constexpr size_t data_type_block_bytes(DataType dt) noexcept {
+    switch (dt) {
+    case DataType::q5_1: return q5_1_block_bytes;
+    case DataType::q4_1: return q4_1_block_bytes;
+    default:             return 0;
+    }
+}
+
+/// Values covered by one block of a block-packed dtype; 0 for every other type.
+constexpr int64_t data_type_block_elems(DataType dt) noexcept {
+    switch (dt) {
+    case DataType::q5_1: return q5_1_block_elems;
+    case DataType::q4_1: return q4_1_block_elems;
+    default:             return 0;
+    }
 }
 
 /// Returns the size in bytes of a single element of the given DataType.
@@ -152,28 +189,29 @@ constexpr size_t data_type_size(DataType dt) noexcept {
     case DataType::s4:   return 0;  // sub-byte: 2 elems/byte (use packed helpers)
     case DataType::u4:   return 0;  // sub-byte: 2 elems/byte (use packed helpers)
     case DataType::q5_1: return 0;  // block-packed: 32 elems / 24-byte block
+    case DataType::q4_1: return 0;  // block-packed: 32 elems / 20-byte block
     }
     return 0;
 }
 
 /// Storage unit of one row step: the element size for ordinary types, or the
-/// block size for block-packed types (q5_1 → 24 bytes). Zero means the type
-/// has no single-unit storage (s4/u4 nibbles).
+/// block size for block-packed types (q5_1 → 24 bytes, q4_1 → 20). Zero means
+/// the type has no single-unit storage (s4/u4 nibbles).
 constexpr size_t data_type_stride_unit(DataType dt) noexcept {
-    return is_block_packed_dtype(dt) ? q5_1_block_bytes : data_type_size(dt);
+    return is_block_packed_dtype(dt) ? data_type_block_bytes(dt) : data_type_size(dt);
 }
 
 /// Bytes occupied by one row of @p cols logical elements.
 ///
 /// Ordinary types: cols × elem_size. Sub-byte types: ceil(cols / 2).
-/// Q5_1: ceil(cols / 32) × 24.
+/// Block-packed types: ceil(cols / block_elems) × block_bytes.
 constexpr size_t data_type_row_bytes(DataType dt, int64_t cols) noexcept {
     if (cols <= 0) {
         return 0;
     }
-    if (dt == DataType::q5_1) {
-        return static_cast<size_t>((cols + q5_1_block_elems - 1) / q5_1_block_elems)
-             * q5_1_block_bytes;
+    if (const size_t bb = data_type_block_bytes(dt); bb != 0) {
+        const int64_t be = data_type_block_elems(dt);
+        return static_cast<size_t>((cols + be - 1) / be) * bb;
     }
     if (dt == DataType::s4 || dt == DataType::u4) {
         return static_cast<size_t>((cols + 1) / 2);
@@ -186,8 +224,9 @@ constexpr size_t data_type_row_bytes(DataType dt, int64_t cols) noexcept {
 ///
 /// FP8 types (f8_e4m3, f8_e5m2) are NOT included here — they are
 /// floating-point formats that don't use integer zero_point semantics.
-/// Neither is q5_1: its per-block (d, m) are embedded in the data itself, so
-/// it needs no QuantParams and is not part of this scale/zero_point family.
+/// Neither are q5_1/q4_1: their per-block (d, m) are embedded in the data
+/// itself, so they need no QuantParams and are not part of this
+/// scale/zero_point family.
 constexpr bool is_quantized_dtype(DataType dt) noexcept {
     switch (dt) {
     case DataType::s8:
@@ -208,6 +247,7 @@ constexpr int data_type_bits(DataType dt) noexcept {
     case DataType::s4:  return 4;
     case DataType::u4:  return 4;
     case DataType::q5_1: return 5;
+    case DataType::q4_1: return 4;
     case DataType::s8:  return 8;
     case DataType::u8:  return 8;
     case DataType::f8_e4m3: return 8;

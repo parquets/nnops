@@ -10,7 +10,7 @@
 /// use the arch's naive SIMD kernel / direct GEMV instead of the plan; a Q5_1 B
 /// at small M decodes straight into its dot product. Those routes sweep the
 /// product in one pass and share nothing with the skeleton, so they live in
-/// matmul_small.cpp and matmul_q5_fused.cpp (see matmul_internal.h).
+/// matmul_small.cpp and matmul_qblock_fused.cpp (see matmul_internal.h).
 ///
 /// int8 accumulates raw int32 and recovers the product in one epilogue pass.
 
@@ -84,20 +84,26 @@ struct FpRoute {
         return std::is_same_v<T, float> ? GEOM_F32 : GEOM_F16;
     }
 
-    /// B for one batch element: a dense view or a Q5_1 block stream.
+    /// B for one batch element: a dense view or a block-packed stream
+    /// (q5_1/q4_1), which names its dtype because the block size differs.
     struct B {
         const void* ptr;
         int ldb;
-        bool q51;
+        DataType block_dt;   ///< f32/f16 for a dense view
         int64_t row_blocks;
+
+        bool blocked() const noexcept { return is_block_packed_dtype(block_dt); }
     };
 
-    static B b_source(const TensorView& b, int64_t b_off, int ldb, bool q51) {
-        if (q51) {
-            return {q5_rhs_at(static_cast<const uint8_t*>(b.ptr<void>()), b_off),
-                    ldb, true, static_cast<int64_t>(ldb)};
+    static B b_source(const TensorView& b, int64_t b_off, int ldb,
+                      DataType block_dt) {
+        if (is_block_packed_dtype(block_dt)) {
+            return {block_rhs_at(static_cast<const uint8_t*>(b.ptr<void>()), b_off,
+                                 block_dt),
+                    ldb, block_dt, static_cast<int64_t>(ldb)};
         }
-        return {static_cast<const void*>(b.ptr<T>() + b_off), ldb, false, 0};
+        return {static_cast<const void*>(b.ptr<T>() + b_off), ldb,
+                std::is_same_v<T, float> ? DataType::f32 : DataType::f16, 0};
     }
 
     static int ldd_b(int kc) { return static_cast<int>(geom().ldd_b(kc)); }
@@ -116,9 +122,9 @@ struct FpRoute {
     static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc,
                        int n_start, int nc, Elem* dst, int ldd, bool /*a_biased*/) {
         // The packer takes the tile origin in block units, not elements.
-        if (b.q51) {
-            tile_pack_rhs_q5_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
-                               b.ptr, b.row_blocks, attrs.alpha);
+        if (b.blocked()) {
+            tile_pack_rhs_block(b.block_dt, attrs.transpose_b, n_start, nc, k, kc,
+                                dst, ldd, b.ptr, b.row_blocks, attrs.alpha);
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
@@ -190,7 +196,8 @@ struct I8Route {
 
     struct B { const int8_t* ptr; int ldb; };
 
-    static B b_source(const TensorView& b, int64_t b_off, int ldb, bool /*q51*/) {
+    static B b_source(const TensorView& b, int64_t b_off, int ldb,
+                      DataType /*block_dt*/) {
         return {b.ptr<int8_t>() + b_off, ldb};
     }
 
@@ -557,7 +564,9 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const auto& b = inputs[1];
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 
-    const bool b_q51 = R::is_fp && (b.data_type() == DataType::q5_1);
+    // Only the fp routes carry a B; a block-packed one (q5_1/q4_1) says which
+    // format so the shared packer can decode it.
+    const DataType b_block_dt = R::is_fp ? b.data_type() : DataType::f32;
 
     // Optional per-column bias, fp only: the first k-block of every tile primes
     // C with beta·C_old + bias, so it rides the tile pass instead of a sweep
@@ -755,7 +764,7 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
         batch.offsets(bi, output, a_offset, b_offset, c_offset);
 
         const typename R::AElem* a_p = a_base + a_offset;
-        const typename R::B b_src = R::b_source(b, b_offset, ldb, b_q51);
+        const typename R::B b_src = R::b_source(b, b_offset, ldb, b_block_dt);
         Acc* c_p = R::c_base(output, c_offset, accum);
 
         if constexpr (!R::is_fp) {
@@ -1012,11 +1021,12 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
 #if defined(NNOPS_ARCH_X86_64)
-    // Small-M Q5_1: decode straight into the reduction, before the plan and the
-    // scratch. Only a transposed A is out of reach.
-    if (dt_a == DataType::f32 && dt_b == DataType::q5_1 && !attrs_n.transpose_a) {
+    // Small-M block quant (Q5_1/Q4_1): decode straight into the reduction,
+    // before the plan and the scratch. Only a transposed A is out of reach.
+    if (dt_a == DataType::f32 && is_block_packed_dtype(dt_b) &&
+        !attrs_n.transpose_a) {
         const auto [M, N, K] = matmul_dims(attrs_n, a, b);
-        if (matmul_q5_fused(attrs_n, output, inputs, ctx,
+        if (matmul_qblock_fused(attrs_n, output, inputs, ctx,
                             static_cast<int>(M), static_cast<int>(N),
                             static_cast<int>(K))) {
             return;
@@ -1026,7 +1036,7 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
 
     // A dense f32/f16 product that is small enough (or narrow enough) skips the
     // plan: no pack, no tiles, no scratch. The thresholds live with the kernels.
-    const bool b_q51 = (dt_b == DataType::q5_1);
+    const bool b_block = is_block_packed_dtype(dt_b);
     const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
     if (matmul_small_fp(attrs_n, output, inputs, ctx)) {
         return;
@@ -1097,9 +1107,10 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
         return;
     }
 
-    // Past the int8 branch: only f32/f16 have a fused kernel, plus a Q5_1 B
-    // (its blocks decode to A's type in the RHS pack).
-    const bool supported = float_a && (dt_b == dt_a || b_q51);
+    // Past the int8 branch: only f32/f16 have a fused kernel, plus a
+    // block-packed B (q5_1/q4_1), whose blocks decode to A's type in the RHS
+    // pack.
+    const bool supported = float_a && (dt_b == dt_a || b_block);
     if (!supported) {
         reference::matmul_ref(attrs_n, output, inputs, ctx, nullptr);
         return;

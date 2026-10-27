@@ -42,8 +42,8 @@ struct TensorDesc {
     TensorLayout layout = TensorLayout::NCHW;
 
     /// Actual row stride in elements (source view pitch / elem_size).
-    /// For block-packed types (q5_1) the unit is a 24-byte block, not an
-    /// element. 0 = unknown → consumers must treat the tensor as compact.
+    /// For block-packed types (q5_1/q4_1) the unit is a 24/20-byte block, not
+    /// an element. 0 = unknown → consumers must treat the tensor as compact.
     int64_t row_stride_elems = 0;
 
     /// Total number of logical elements.
@@ -69,7 +69,7 @@ struct TensorDesc {
 
     /// Total storage size in bytes (logical elements, with channel rounding).
     /// Does NOT include per-row pitch padding — call storage_bytes() for that.
-    /// Block-packed types (q5_1) round the innermost dimension up to whole blocks.
+    /// Block-packed types (q5_1/q4_1) round the innermost dimension up to whole blocks.
     size_t nbytes() const noexcept {
         if (data_type_size(dtype) == 0) {
             if (rank <= 0) {

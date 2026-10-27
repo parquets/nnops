@@ -8,9 +8,11 @@
 /// own files — the same variant-per-file split Conv2D uses
 /// (conv2d_im2col / conv2d_winograd):
 ///
-///   - matmul_small.cpp    — the naive SIMD kernel below GEMM_FAST_PATH_THRESHOLD
-///                           MACs, and the direct GEMV at M <= GEMV_M_MAX;
-///   - matmul_q5_fused.cpp — the x86-only fused Q5_1 decode route (M <= 16).
+///   - matmul_small.cpp         — the naive SIMD kernel below
+///                                GEMM_FAST_PATH_THRESHOLD MACs, and the direct
+///                                GEMV at M <= GEMV_M_MAX;
+///   - matmul_qblock_fused.cpp  — the x86-only fused Q5_1/Q4_1 decode route
+///                                (M <= 16).
 ///
 /// They stay out of the driver because neither packs, blocks, splits or touches
 /// the routes: each sweeps the product in one pass. What they do share with the
@@ -57,9 +59,12 @@ inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
              attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };
 }
 
-/// Q5_1 B for a batch element; BatchWalk yields block offsets, not bytes.
-inline const uint8_t* q5_rhs_at(const uint8_t* base, int64_t block_off) noexcept {
-    return base + block_off * static_cast<int64_t>(q5_1_block_bytes);
+/// A block-packed B (q5_1/q4_1) for a batch element. BatchWalk's offsets and
+/// the row pitch already count in blocks, so only the block size turns a
+/// block offset into bytes.
+inline const uint8_t* block_rhs_at(const uint8_t* base, int64_t block_off,
+                                   DataType dt) noexcept {
+    return base + block_off * static_cast<int64_t>(data_type_stride_unit(dt));
 }
 
 /// Broadcast batch dims (as matmul_ref) and map a flat index to per-operand
@@ -131,12 +136,12 @@ bool matmul_small_fp(const MatMulAttributes& attrs,
                      const ComputeContext& ctx);
 
 #if defined(NNOPS_ARCH_X86_64)
-/// Whole product through the fused Q5_1 kernels; false if not applicable.
-bool matmul_q5_fused(const MatMulAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     int M, int N, int K);
+/// Whole product through the fused Q5_1/Q4_1 kernels; false if not applicable.
+bool matmul_qblock_fused(const MatMulAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx,
+                         int M, int N, int K);
 #endif
 
 }  // namespace nnops::backend::cpu
