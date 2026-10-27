@@ -11,6 +11,7 @@
 #include "nnops/ops/attention.hpp"
 #include "backend/cpu/attention/attention.h"        // get_attention_plan, AttentionPlan
 #include "common/bench_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 
@@ -29,9 +30,16 @@ using cpu::half;
 
 namespace {
 
-// Minimal fixed-size thread pool exposing a CpuBackend (same as bench_matmul).
-struct SimplePool {
-    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+// The bench's CpuBackend: an OpenMP thread team when the build has one (and
+// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
+// behind the same hooks, so a table differs only in its scheduler —
+// see common/cpu_pool.hpp.
+struct BenchPool {
+    explicit BenchPool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
             this->parallel_for(begin, end, body);
         };
@@ -140,7 +148,7 @@ void run_attention(const AttentionCase& c, const std::vector<int>& threads, int 
     auto compute = [&](const ComputeContext& ctx) { op->compute(output, ins, ctx, nullptr); };
     std::vector<double> gflops;
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};

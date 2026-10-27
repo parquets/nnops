@@ -10,6 +10,7 @@ option(NNOPS_BUILD_TESTS      "Build unit tests"           ON)
 option(NNOPS_BUILD_BENCHMARKS "Build benchmarks"           ON)
 option(NNOPS_BUILD_CUDA       "Build CUDA backend"         OFF)
 option(NNOPS_BUILD_VULKAN     "Build Vulkan backend"       OFF)
+option(NNOPS_OPENMP           "Build the OpenMP CpuBackend adapter" OFF)
 
 # ---- C++ Standard ----
 set(CMAKE_CXX_STANDARD 23)
@@ -38,6 +39,18 @@ target_include_directories(nnops INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(nnops INTERFACE cxx_std_23)
+
+# ---- OpenMP (optional) ----
+# The library owns no thread pool (CpuBackend is three hooks); this option only
+# decides whether nnops/core/openmp_backend.hpp has an OpenMP runtime to bind
+# its parallel_for to. Linking it INTERFACE is what gives consumers the
+# -fopenmp / /openmp flag that defines _OPENMP in their translation units, so an
+# installed build without the option still compiles the header as a sequential
+# no-op.
+if(NNOPS_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(nnops INTERFACE OpenMP::OpenMP_CXX)
+endif()
 
 # ---- Source subdirectories ----
 add_subdirectory(src)

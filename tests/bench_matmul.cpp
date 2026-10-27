@@ -16,6 +16,7 @@
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
 #include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 
@@ -39,9 +40,16 @@ namespace cpu = nnops::backend::cpu;
 
 namespace {
 
-// Minimal fixed-size thread pool exposing a CpuBackend (same as the test).
-struct SimplePool {
-    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+// The bench's CpuBackend: an OpenMP thread team when the build has one (and
+// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
+// behind the same hooks, so a table differs only in its scheduler —
+// see common/cpu_pool.hpp.
+struct BenchPool {
+    explicit BenchPool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
             this->parallel_for(begin, end, body);
         };
@@ -219,7 +227,7 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     rep.threads = threads;
 
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -321,7 +329,7 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     rep.threads = threads;
 
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -404,7 +412,7 @@ GeMMReport run_geMM_q5(const GeMMCase& c, const std::vector<int>& threads, int i
     rep.threads = threads;
 
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -655,7 +663,7 @@ void sweep_fp(const char* tag, const std::vector<SweepShape>& shapes,
         SweepOp<T> g(s.M, s.K, s.N, 7, meta_threads);
         std::vector<double> gflops;
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
             gflops.push_back(g.time_budget(ctx, target_ms));
@@ -730,7 +738,7 @@ void sweep_i8(const std::vector<SweepShape>& shapes, const std::vector<int>& thr
         SweepOpI8 g(s.M, s.K, s.N, 7, meta_threads, a_dt);
         std::vector<double> gops;
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
             gops.push_back(g.time_budget(ctx, target_ms));
@@ -816,7 +824,7 @@ void sweep_q5(const char* tag, const std::vector<SweepShape>& shapes,
         std::vector<double> gflops;
         double bw_first = 0.0, bw_last = 0.0;
         for (size_t i = 0; i < threads.size(); ++i) {
-            SimplePool pool(threads[i]);
+            BenchPool pool(threads[i]);
             ComputeContext ctx;
             if (threads[i] > 1) { ctx.cpu = pool.cpu; }
             double gbps = 0.0;
@@ -858,7 +866,7 @@ void m_ladder_q5(int64_t K, int64_t N, const std::vector<int64_t>& ms,
         for (int nt : threads) {
             SweepOpQ5<float> q(M, K, N, 7, nt, tb);
             SweepOp<float> d(M, K, N, 7, nt, tb);
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
 
@@ -1450,7 +1458,7 @@ void bench_gemv_dtype(const char* tag) {
         std::printf("      direct ladder:");
         const ComputeContext serial{};
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
             const ComputeContext& use_ctx = (nt > 1) ? ctx : serial;
@@ -1682,7 +1690,7 @@ NNOPS_BENCH(matmul_q5_fused_ab) {
             std::printf("   %5lld |", static_cast<long long>(M));
             for (int nt : threads) {
                 SweepOpQ5<float> q(M, K, N, 7, nt, tb != 0);
-                SimplePool pool(nt);
+                BenchPool pool(nt);
                 ComputeContext ctx;
                 if (nt > 1) { ctx.cpu = pool.cpu; }
 
@@ -1775,7 +1783,7 @@ NNOPS_BENCH(matmul_q5_vs_f16_ab_large) {
 //   - dq/dense is ~3.3 at 1T for f32 activations and ~3.3 for f16 at 4T: the
 //     dense B is only half as wide there, but the f16 dense route also scales
 //     worse across threads.
-//   - the 8T/20T columns sag for *every* route in this file because SimplePool
+//   - the 8T/20T columns sag for *every* route in this file because BenchPool
 //     spawns its workers per call; and dq makes one more `ctx.cpu.run` than
 //     int8, so it sags a little earlier. Read the 1T column and the ratio
 //     columns, not the high-thread columns.
@@ -1974,7 +1982,7 @@ GeMMReport run_geMM_dq(DqCase<T>& dc, const char* name,
     rep.threads = threads;
 
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -2042,7 +2050,7 @@ void sweep_dq(const char* tag, const std::vector<SweepShape>& shapes,
                            * static_cast<double>(s.K);
         std::vector<double> g;
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
             g.push_back(time_budget_gflops(
@@ -2074,7 +2082,7 @@ void bench_dq_vs_fp_ab(int64_t M, int64_t K, int64_t N, bool tb = false,
     auto op_dq = MatMul::create(attrs_dq, Backend::CPU);
     auto op_fp = MatMul::create(attrs_fp, Backend::CPU);
 
-    SimplePool pool(nt);
+    BenchPool pool(nt);
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
     const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -2266,7 +2274,7 @@ void bench_dq_weight_zp_ab(int64_t M, int64_t K, int64_t N, bool tb, int nt,
     auto op_sym = MatMul::create(attrs, Backend::CPU);
     auto op_fold = MatMul::create(attrs, Backend::CPU);
 
-    SimplePool pool(nt);
+    BenchPool pool(nt);
     ComputeContext ctx;
     if (nt > 1) { ctx.cpu = pool.cpu; }
     const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -2362,7 +2370,7 @@ NNOPS_BENCH(matmul_dq_vs_fp_sweep) {
     std::printf("  dq vs dense f32-act  nn  budget=100 ms/cell   (GFLOPS)\n");
     std::printf("   %5s | %9s %9s %7s | %9s %9s %7s\n", "size",
                 "dq 1T", "f32 1T", "dq/f32", "dq 4T", "f32 4T", "dq/f32");
-    // Caveat for the 4T columns: SimplePool spawns its workers per call, and dq
+    // Caveat for the 4T columns: BenchPool spawns its workers per call, and dq
     // issues one more ctx.cpu.run than the fp route, so below ~768 the 4T ratio
     // measures pool start-up. The 1T ratio is the honest curve.
     for (int64_t S : sizes) {
@@ -2376,7 +2384,7 @@ NNOPS_BENCH(matmul_dq_vs_fp_sweep) {
 
         std::printf("   %5lld |", static_cast<long long>(S));
         for (int nt : {1, 4}) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
             const double g_dq = time_budget_gflops(

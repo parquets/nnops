@@ -35,6 +35,7 @@
 #include "nnops/core/quant_params.hpp"
 #include "nnops/detail/half.hpp"
 #include "common/bench_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
 
 #include <algorithm>
@@ -55,10 +56,16 @@ namespace {
 
 using SteadyClock = std::chrono::high_resolution_clock;
 
-// Minimal fixed-size thread pool exposing a CpuBackend (same as the other
-// bench files: one worker per thread, spawned per parallel_for).
-struct SimplePool {
-    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+// The bench's CpuBackend: an OpenMP thread team when the build has one (and
+// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
+// behind the same hooks, so a table differs only in its scheduler —
+// see common/cpu_pool.hpp.
+struct BenchPool {
+    explicit BenchPool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
             this->parallel_for(begin, end, body);
         };
@@ -236,7 +243,7 @@ void bench_fp_vs_matmul(const char* tag, const std::vector<Shape>& shapes,
         std::printf("   %5lld %5lld %5lld |", static_cast<long long>(s.M),
                     static_cast<long long>(s.K), static_cast<long long>(s.N));
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
 
@@ -384,7 +391,7 @@ template <typename OutT>
 void bench_quant_row(const Shape& s, DataType a_dt, DataType out_dt, int nt,
                      double target_ms, int rounds, bool with_bias = false) {
     QuantProblem<OutT> p(s, a_dt, out_dt, 1, with_bias);
-    SimplePool pool(nt);
+    BenchPool pool(nt);
     ComputeContext ctx;
     if (nt > 1) { ctx.cpu = pool.cpu; }
 
@@ -588,7 +595,7 @@ NNOPS_BENCH(linear_threads) {
         std::printf("   %5lld %5lld %5lld |", static_cast<long long>(s.M),
                     static_cast<long long>(s.K), static_cast<long long>(s.N));
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
             std::printf(" %7.1f", p.run(*p.linear, ctx, kBudgetMs));

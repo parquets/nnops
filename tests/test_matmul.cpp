@@ -11,6 +11,7 @@
 #include "nnops/core/quant_params.hpp"
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan — to pin the pack_a route
 #include "common/test_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
@@ -2135,6 +2136,12 @@ make_padded_f32(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) 
 // into ComputeContext.
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
+        // runs under the same bit-exact comparisons as the kernels.
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
             this->parallel_for(begin, end, body);
         };

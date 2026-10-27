@@ -6,6 +6,7 @@
 #include "backend/cpu/matmul/matmul_helper.h" // nr_max_flt / mma_pack_align / tile_pack_rhs
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "common/test_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
@@ -329,6 +330,12 @@ void conv2d_ref(const Conv2DAttributes& attrs,
 // worker runs body(i) until the range is exhausted.
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
+        // runs under the same bit-exact comparisons as the kernels.
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
             this->parallel_for(begin, end, body);
         };

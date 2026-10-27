@@ -868,6 +868,49 @@ the M-split.
   residency but break the thread-count-invariant workspace formula; noted as a future
   tuning point.
 
+### 7.1 The scheduler is part of the measurement
+
+`ctx.cpu.run` is the only parallelism the kernels see; nnops owns no pool, so how
+fast a short call is depends on what the caller installs. Two providers were
+compared in one binary (`NNOPS_BENCH_OMP` picks): a pool that spawns and joins its
+workers inside every `parallel_for`, and
+`nnops::openmp_backend(n)` (`include/nnops/core/openmp_backend.hpp`), a
+persistent team behind `#pragma omp parallel for schedule(static) num_threads(n)`.
+
+On the i5-13600KF this was written on (6 P-cores with SMT + 8 E-cores, 20 logical),
+interleaved A/B, medians of 3 rounds, spawn-pool / OpenMP:
+
+| case | 1T | 2T | 4T | 8T | 20T |
+| --- | --- | --- | --- | --- | --- |
+| int8 1024x512x1024 (15 blocks) | 538 / 539 | 826 / 921 | 1171 / **1573** | 1221 / 823 | 479 / **1256** |
+| dq f32 1024x512x1024 | 477 / 466 | 746 / 862 | 1091 / **1515** | 1125 / 787 | 477 / **1184** |
+| f32 1024x512x1024 | 144 / 144 | 272 / 282 | 492 / 535 | 560 / 383 | 639 / 572 |
+| attention f32 B2 S128 H8 D64 | 108 / 105 | 170 / 218 | 221 / **432** | 232 / 279 | 121 / **525** |
+| conv i8 u8 3x3 56x56 -> 64 | 341 / 334 | 532 / 683 | 726 / **1152** | 716 / 645 | 413 / **988** |
+| Linear 128x4096x4096 | 121 / 122 | 228 / 206 | 385 / 394 | 599 / 425 | 805 / 552 |
+
+Two findings, both bigger than most kernel tuning:
+
+1. **Short calls at high thread counts are spawn-bound, not kernel-bound.** At
+   20T the spawn pool pays ~450 us of `CreateThread`/`join` inside every `run`;
+   on the 15-block int8 GEMM that is the whole call (479 GFLOPS vs 1256). The
+   attention decode-shaped rows — many small regions per call — gain 4.3x. This
+   is the same effect that made the Conv2D `r_a` sweep serial (§6.2): a second
+   `run` cost more than the pass.
+2. **`schedule(static)` beat `schedule(dynamic)` by 10-20% on conv** with OpenMP:
+   the operators already balance blocks against `thread_count()`, so a contiguous
+   chunk keeps a worker's scratch and its operand slice local, and dynamic buys
+   nothing back on the E-cores.
+
+**MSVC's vcomp spins between regions**, and on this hybrid part that costs about
+half the throughput at 8T (int8: 823 GFLOPS vs 1506 for the spawn pool's 1221).
+`OMP_WAIT_POLICY=PASSIVE` restores it (8T becomes 1.26-1.32x over the spawn pool);
+1T/4T/20T were unaffected. That is an embedder-side setting — an application that
+calls in continuously may want the spin back for wake-up latency. Note also that
+nothing past 8T scales on this chip: the 8 E-cores are much slower than the 6 P-cores,
+so the 20T column is 20 logical threads over 14 physical cores, and the best cells
+sit at 4-8T.
+
 ---
 
 ## 8. Key Design Decisions

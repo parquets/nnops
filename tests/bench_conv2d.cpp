@@ -22,6 +22,7 @@
 #include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
 #include "backend/cpu/conv/conv2d_winograd.h" // get_conv2d_winograd_plan
 #include "common/bench_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 
@@ -45,9 +46,16 @@ namespace cpu = nnops::backend::cpu;
 
 namespace {
 
-// Minimal fixed-size thread pool exposing a CpuBackend (same as bench_matmul).
-struct SimplePool {
-    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+// The bench's CpuBackend: an OpenMP thread team when the build has one (and
+// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
+// behind the same hooks, so a table differs only in its scheduler —
+// see common/cpu_pool.hpp.
+struct BenchPool {
+    explicit BenchPool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
             this->parallel_for(begin, end, body);
         };
@@ -154,7 +162,7 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
     auto compute = [&](const ComputeContext& ctx) { op->compute(output, ins, ctx, nullptr); };
     std::vector<double> gflops;
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -286,7 +294,7 @@ void run_depthwise(const DepthwiseCase& c, const std::vector<int>& threads, int 
     };
     std::vector<double> gflops;
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -454,7 +462,7 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
                 (long long)OH, (long long)OW, c.f16 ? "f16" : "f32");
 
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -775,7 +783,7 @@ void run_conv2d_i8(const Conv2DI8Case& c, const std::vector<int>& threads, int i
 
     std::vector<double> gops;
     for (int nt : threads) {
-        SimplePool pool(nt);
+        BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -813,7 +821,7 @@ struct AbResult {
 
 template <class FA, class FB>
 AbResult measure_ab(int nt, FA&& a, FB&& b, int iters, int rounds) {
-    SimplePool pool(nt);
+    BenchPool pool(nt);
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
     const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -971,12 +979,15 @@ void bench_conv2d_i8_act_zp(const Conv2DCase& c, int iters, int rounds) {
 // the flat 20 the point cases use: a 7x7 at 112x112 is orders of magnitude more
 // work per call than a 1x1 at 7x7, so no single iteration count covers both.
 //
-// Caveat on the multi-thread columns: SimplePool spawns and joins its workers
-// inside every parallel_for, so each call pays thread start-up once. Measured on
-// this host that is ~450 us at 20 threads — around a quarter of the f32 3x3 row
-// in the first table, and the reason the smallest rows' 8T/20T cells read low.
-// The 5x5/7x7 rows do 25/9 and 49/9 of the 3x3's work per call and are far less
-// affected; read the small-shape 20T cells as a lower bound on the kernel.
+// Caveat on the multi-thread columns: with the spawn-per-call pool
+// (NNOPS_BENCH_OMP=0) each BenchPool call joins and starts its workers, so every
+// call pays thread start-up once. Measured on this host that is ~450 us at 20
+// threads — around a quarter of the f32 3x3 row in the first table, and the
+// reason the smallest rows' 8T/20T cells read low. The 5x5/7x7 rows do 25/9 and
+// 49/9 of the 3x3's work per call and are far less affected; read the
+// small-shape 20T cells as a lower bound on the kernel. An OpenMP build (the
+// bench default, see common/cpu_pool.hpp) removes that start-up, so the same
+// cells then measure the kernel plus the per-call barrier.
 
 struct ConvSweepShape {
     int64_t N, IC, IH, OC, K;    // square kernel; plane is IH x IW
@@ -1102,7 +1113,7 @@ void sweep_conv(const char* tag, const std::vector<ConvSweepShape>& shapes,
         seed += 2;
         std::vector<double> gflops;
         for (int nt : threads) {
-            SimplePool pool(nt);
+            BenchPool pool(nt);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
             const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
@@ -1405,7 +1416,7 @@ NNOPS_BENCH(conv2d_f16_kernel_sweep) {
 //
 // Single thread only: at one thread every thread-count knob disappears from
 // both harnesses — no pool geometry, no per-call thread creation (this harness's
-// SimplePool spawns its workers inside every parallel_for, which at 8T/20T costs
+// BenchPool spawns its workers inside every parallel_for, which at 8T/20T costs
 // more than the small rows below take in total). The rate printed here is the
 // kernel, and the kernel is the only thing the two implementations can be
 // compared on without also measuring the harnesses.
