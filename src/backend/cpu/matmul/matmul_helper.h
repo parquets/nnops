@@ -33,6 +33,8 @@
 #elif defined(NNOPS_ARCH_AARCH64)
 #include "backend/cpu/aarch64/pack_f16.hpp"
 #include "backend/cpu/aarch64/pack_f32.hpp"
+#include "backend/cpu/aarch64/pack_q5_1.hpp"
+#include "backend/cpu/aarch64/pack_q4_1.hpp"
 #include "backend/cpu/aarch64/mma_f16.hpp"
 #include "backend/cpu/aarch64/mma_f32.hpp"
 #include "backend/cpu/aarch64/pack_dp4a_i8.hpp"
@@ -68,6 +70,14 @@ constexpr int NR_MAX_F16 = arch::nr_f16[0];
 static_assert(arch::q5_1_nr_max == NR_MAX_F32 && arch::q5_1_nr_max == NR_MAX_F16,
               "Q5_1 RHS panel width must match the float RHS panel width");
 static_assert(arch::q4_1_nr_max == NR_MAX_F32 && arch::q4_1_nr_max == NR_MAX_F16,
+              "Q4_1 RHS panel width must match the float RHS panel width");
+#elif defined(NNOPS_ARCH_AARCH64)
+// Same contract, but the two AArch64 widths differ (12 for f32, 16 for f16).
+static_assert(arch::q5_1_nr_max<float> == NR_MAX_F32 &&
+              arch::q5_1_nr_max<half> == NR_MAX_F16,
+              "Q5_1 RHS panel width must match the float RHS panel width");
+static_assert(arch::q4_1_nr_max<float> == NR_MAX_F32 &&
+              arch::q4_1_nr_max<half> == NR_MAX_F16,
               "Q4_1 RHS panel width must match the float RHS panel width");
 #endif
 

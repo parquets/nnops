@@ -22,9 +22,10 @@
 /// `pack_q4` fuses the nibble unpacking with the dequantization and the
 /// f32 → f16 narrowing: each block is read once and the values are written
 /// straight to the output, with no intermediate quantized buffer. This is the
-/// portable scalar reference; the CPU backend uses the AVX2 implementation in
-/// src/backend/cpu/x86_64/pack_q4_1.hpp, which also packs GEMM RHS panels
-/// straight from the block stream.
+/// portable scalar reference; the CPU backend's GEMM route uses the AVX2
+/// implementation in src/backend/cpu/x86_64/pack_q4_1.hpp and the NEON one in
+/// src/backend/cpu/aarch64/pack_q4_1.hpp, both of which decode each block once
+/// per row and pack the RHS panels straight from the block stream.
 ///
 /// The count need not be a multiple of 32: a trailing partial block is decoded
 /// only up to `count`, which lets a tensor whose innermost dimension is not

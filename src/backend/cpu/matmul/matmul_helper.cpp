@@ -226,7 +226,12 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 // The panel layout matches tile_pack_rhs, so the MMA route knows no block
 // format: it reads the same uniform panels whichever stream they came from.
 
-#ifdef NNOPS_ARCH_X86_64
+// Both formats are 32-value blocks; the scalar fallback below indexes them with
+// shifts, and the arch packers assume the same width when slicing rows.
+static_assert(q5_1_block_elems == 32 && q4_1_block_elems == 32,
+              "the block RHS packers assume 32-value blocks");
+
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 
 void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
                         float* dst, int ldd, const void* src, int64_t src_row_blocks,
@@ -263,18 +268,17 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 /// The panel width must be the active arch's float RHS panel width, because the
 /// workspace stride (ldd_b) and the MMA kernels are sized from it — it is not
 /// the same on every arch (aarch64 f32 uses nr_f32[0] = 12, both x86 widths and
-/// the aarch64 f16 one are 16).
+/// the aarch64 f16 one are 16). The arch packers in x86_64/pack_q5_1.hpp and
+/// aarch64/pack_q5_1.hpp write this same layout, but decode each block once per
+/// row rather than once per element and panel.
 template <class T>
 constexpr int block_panel_nr() noexcept {
     if constexpr (std::is_same_v<T, float>) { return NR_MAX_F32; }
     else { return NR_MAX_F16; }
 }
 
-/// Values per block of both formats. The scalar pack below indexes blocks with
-/// shifts, which is the 32-value layout q5_1 and q4_1 share.
+/// Values per block of both formats, for the shift-based block indexing below.
 constexpr int kBlockElems = 32;
-static_assert(q5_1_block_elems == kBlockElems && q4_1_block_elems == kBlockElems,
-              "tile_pack_rhs_block_scalar indexes 32-value blocks");
 
 /// One block-packed format's row decoder: unpack(block_ptr, float out[]).
 template <class T, class Unpack>
