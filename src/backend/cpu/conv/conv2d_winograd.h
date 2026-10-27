@@ -52,7 +52,7 @@
 /// so the residual simply reads the pre-existing output in place during
 /// write-back.
 ///
-/// This kernel must never route to reference::conv2d_ref — U is rank-3 with
+/// This kernel must never route to conv2d_cpu — U is rank-3 with
 /// dims[0] == 16, and the reference would read it as an OC of 16 and silently
 /// compute garbage. A dtype mismatch is a hard assert.
 ///

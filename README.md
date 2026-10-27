@@ -100,7 +100,7 @@ Two patterns worth knowing:
 |---|---|
 | Convolution | `Conv2D`, `Conv3D`, `DepthwiseConv2D`, `TransposeConv2D` |
 | Matrix / linear | `MatMul` (f32 / f16 / s8×s8), `Linear`, `QuantLinear` |
-| Attention | `Attention`, `CausalAttention`, `LinearAttention` |
+| Attention | `Attention`, `LinearAttention` |
 | Normalization | `LayerNorm`, `RMSNorm`, `BatchNorm`, `Softmax` (softmax & log-softmax) |
 | Element-wise | `Eltwise` (add/sub/mul/div), `Unary` (exp/log/sin/cos/tan/tanh/abs/neg/sqrt), `Activation` (relu/leaky_relu/sigmoid/tanh/gelu/silu/hard_swish/elu), `Clamp` |
 | Reduction | `Reduce` (sum/mean/max/min), `ArgMinMax`, `TopK`, `CumSum` |

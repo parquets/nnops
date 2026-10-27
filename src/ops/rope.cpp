@@ -3,78 +3,15 @@
 
 #include "nnops/ops/rope.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void rope_ref(const RoPEAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace);
-}
+NNOPS_DECLARE_CPU(RoPEAttributes, rope_cpu)
 
-namespace backend::cpu {
-    void rope_cpu(const RoPEAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void rope_cuda(const RoPEAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx,
-                   void* workspace);
-}
-#endif
-
-struct RoPE::Impl {
-    using KernelFn = void (*)(const RoPEAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-RoPE::~RoPE() = default;
-
-
-namespace {
-auto resolve_rope_kernel(Backend backend) -> RoPE::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::rope_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::rope_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<RoPE> RoPE::create(const RoPEAttributes& attrs,
-                                    Backend backend)
-{
-    return std::unique_ptr<RoPE>(new RoPE(attrs, backend));
-}
-
-RoPE::RoPE(const RoPEAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_rope_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(RoPE, RoPEAttributes,
+        backend::cpu::rope_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> RoPE::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

@@ -3,74 +3,15 @@
 
 #include "nnops/ops/clamp.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void clamp_ref(const ClampAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(ClampAttributes, clamp_cpu)
 
-namespace backend::cpu {
-    void clamp_cpu(const ClampAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void clamp_cuda(const ClampAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
-#endif
-
-struct Clamp::Impl {
-    using KernelFn = void (*)(const ClampAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Clamp::~Clamp() = default;
-
-
-namespace {
-auto resolve_clamp_kernel(Backend backend) -> Clamp::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::clamp_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::clamp_cuda;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Clamp> Clamp::create(const ClampAttributes& attrs,
-                                       Backend backend)
-{
-    return std::unique_ptr<Clamp>(new Clamp(attrs, backend));
-}
-
-Clamp::Clamp(const ClampAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_clamp_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Clamp, ClampAttributes,
+        backend::cpu::clamp_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Clamp::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

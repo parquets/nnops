@@ -3,60 +3,15 @@
 
 #include "nnops/ops/conv3d.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void conv3d_ref(const Conv3DAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(Conv3DAttributes, conv3d_cpu)
 
-struct Conv3D::Impl {
-    using KernelFn = void (*)(const Conv3DAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Conv3D::~Conv3D() = default;
-
-
-namespace {
-auto resolve_conv3d_kernel(Backend backend) -> Conv3D::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::reference::conv3d_ref;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Conv3D> Conv3D::create(const Conv3DAttributes& attrs,
-                                        Backend backend)
-{
-    return std::unique_ptr<Conv3D>(new Conv3D(attrs, backend));
-}
-
-Conv3D::Conv3D(const Conv3DAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_conv3d_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Conv3D, Conv3DAttributes,
+        backend::cpu::conv3d_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Conv3D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
@@ -80,7 +35,20 @@ void Conv3D::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!inputs[1].is_empty());
     NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+    // auto_pad lives in the descriptor; kernels only see explicit leading padding.
+    Conv3DAttributes attrs = attrs_;
+    if (attrs.auto_pad != Conv3DAttributes::AutoPad::NOTSET) {
+        const int ap = static_cast<int>(attrs.auto_pad);
+        for (int i = 0; i < 3; ++i) {
+            attrs.padding[static_cast<size_t>(i)] = resolve_leading_padding(
+                inputs[0].shape(2 + i), attrs.kernel_size[static_cast<size_t>(i)],
+                attrs.stride[static_cast<size_t>(i)], attrs.dilation[static_cast<size_t>(i)],
+                attrs.padding[static_cast<size_t>(i)], ap);
+        }
+        attrs.auto_pad = Conv3DAttributes::AutoPad::NOTSET;
+    }
+
+    impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
 }
 
 }  // namespace nnops

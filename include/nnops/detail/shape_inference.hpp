@@ -75,6 +75,35 @@ inline int64_t compute_spatial_output_size(
     }
 }
 
+/// Resolve auto_pad into explicit leading padding for one spatial dimension.
+///
+/// Kernels index `i = o*stride + k*dilation - pad_before` and treat anything
+/// outside [0, input_size) as zero, so the trailing half never has to be
+/// represented — it only affects the output size. Returns pad_before, or the
+/// explicit padding when auto_pad == 0.
+inline int64_t resolve_leading_padding(
+    int64_t input_size,
+    int64_t kernel,
+    int64_t stride,
+    int64_t dilation,
+    int64_t padding,
+    int auto_pad) noexcept
+{
+    switch (auto_pad) {
+    case 1: // SAME_UPPER: extra padding goes after
+    case 2: { // SAME_LOWER: extra padding goes before
+        const int64_t eff = dilation * (kernel - 1) + 1;
+        const int64_t total = std::max<int64_t>(
+            0, (ceil_div(input_size, stride) - 1) * stride + eff - input_size);
+        return (auto_pad == 1) ? total / 2 : total - total / 2;
+    }
+    case 3: // VALID
+        return 0;
+    default: // NOTSET
+        return padding;
+    }
+}
+
 /// Compute the broadcast output shape for two tensors with numpy semantics.
 ///
 /// Aligns shapes from the right; each dimension is the max of the two.
@@ -428,23 +457,6 @@ inline std::vector<TensorDesc> identity_output_shape(
     out.layout = in.layout;
     out.dtype  = in.dtype;
     out.dims   = in.dims;
-
-    return {out};
-}
-
-/// CausalAttention shape inference.
-/// Q: [B, H, Sq, D]
-/// Returns: same shape as Q (output shape == Q shape)
-inline std::vector<TensorDesc> causal_attention_output_shape(
-    std::span<const TensorDesc> inputs)
-{
-    const auto& q = inputs[0];
-
-    TensorDesc out;
-    out.rank   = q.rank;
-    out.layout = q.layout;
-    out.dtype  = q.dtype;
-    out.dims   = q.dims;
 
     return {out};
 }

@@ -80,9 +80,9 @@ struct LinearAttentionAttributes {
 ///
 /// `scale` defaults to `1/sqrt(head_dim)` when the attribute is 0.
 ///
-/// Unlike CausalAttention which stores all past K/V in a growing cache,
-/// LinearAttention maintains a fixed-size recurrent state matrix [D, D] per head.
-/// State is placed in outputs (like K_cache / V_cache in CausalAttention):
+/// Unlike Attention which keeps all past K/V in a growing cache, LinearAttention
+/// maintains a fixed-size recurrent state matrix [D, D] per head.
+/// State is placed in outputs (like Attention's K_cache / V_cache):
 /// the caller initializes it once (to zeros or a checkpoint), then passes the
 /// same buffer every step. The kernel reads the old state and overwrites it
 /// with the new state in-place.

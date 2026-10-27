@@ -3,6 +3,7 @@
 
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
@@ -14,19 +15,6 @@ namespace backend::cpu {
                              const ComputeContext& ctx,
                              void* workspace);
     void dequantize_linear_cpu(const QuantLinearAttributes& attrs,
-                               TensorView& output,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx,
-                               void* workspace);
-}
-
-namespace backend::cpu::reference {
-    void quantize_linear_ref(const QuantLinearAttributes& attrs,
-                             TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx,
-                             void* workspace);
-    void dequantize_linear_ref(const QuantLinearAttributes& attrs,
                                TensorView& output,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,
@@ -75,11 +63,7 @@ auto resolve_quantize_kernel(Backend backend) -> QuantizeLinear::Impl::KernelFn
 }
 }
 
-std::unique_ptr<QuantizeLinear> QuantizeLinear::create(
-    const QuantLinearAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<QuantizeLinear>(new QuantizeLinear(attrs, backend));
-}
+NNOPS_OP_CREATE(QuantizeLinear, QuantLinearAttributes)
 
 QuantizeLinear::QuantizeLinear(const QuantLinearAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
@@ -133,16 +117,18 @@ auto resolve_dequantize_kernel(Backend backend) -> DequantizeLinear::Impl::Kerne
 }
 }
 
-std::unique_ptr<DequantizeLinear> DequantizeLinear::create(
-    const QuantLinearAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<DequantizeLinear>(new DequantizeLinear(attrs, backend));
-}
+NNOPS_OP_CREATE(DequantizeLinear, QuantLinearAttributes)
 
 DequantizeLinear::DequantizeLinear(const QuantLinearAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
     impl_->kernel_fn = resolve_dequantize_kernel(backend);
+
+    // The shared attribute default is s8 (QuantizeLinear's output); a
+    // dequantize output is always float, so an integer request means f32.
+    if (attrs_.output_dtype != DataType::f32 && attrs_.output_dtype != DataType::f16) {
+        attrs_.output_dtype = DataType::f32;
+    }
 }
 
 std::vector<TensorDesc> DequantizeLinear::getOutputTensorDesc(

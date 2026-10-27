@@ -1,5 +1,5 @@
-/// @file cumsum_ref.cpp
-/// @brief Naive CPU reference implementation of cumulative sum.
+/// @file cumsum.cpp
+/// @brief CPU CumSum kernel.
 ///
 /// Decomposes the tensor along axis into upper/lower dims and applies
 /// recurrence: out[i] = in[i-1] + out[i-1] (exclusive) or + in[i] (inclusive).
@@ -8,9 +8,9 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
 
-namespace nnops::backend::cpu::reference {
+namespace nnops::backend::cpu {
 
-void cumsum_ref(const CumSumAttributes& attrs,
+void cumsum_cpu(const CumSumAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -106,4 +106,4 @@ void cumsum_ref(const CumSumAttributes& attrs,
     }
 }
 
-}  // namespace nnops::backend::cpu::reference
+}  // namespace nnops::backend::cpu

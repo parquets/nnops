@@ -3,6 +3,7 @@
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/conv/conv2d_im2col.h"
 #include "backend/cpu/conv/conv2d_winograd.h"
@@ -63,11 +64,7 @@ void wino_pack_weight(const TensorView& weight, TensorView& u_out,
 }
 }  // anonymous namespace
 
-std::unique_ptr<Conv2D> Conv2D::create(const Conv2DAttributes& attrs,
-                                        Backend backend)
-{
-    return std::unique_ptr<Conv2D>(new Conv2D(attrs, backend));
-}
+NNOPS_OP_CREATE(Conv2D, Conv2DAttributes)
 
 Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
@@ -120,14 +117,27 @@ void Conv2D::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!inputs[1].is_empty());
     NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
+    // auto_pad lives in the descriptor; kernels only see explicit leading padding.
+    Conv2DAttributes attrs = attrs_;
+    if (attrs.auto_pad != Conv2DAttributes::AutoPad::NOTSET) {
+        const int ap = static_cast<int>(attrs.auto_pad);
+        attrs.padding[0] = resolve_leading_padding(
+            inputs[0].shape(2), attrs.kernel_size[0], attrs.stride[0],
+            attrs.dilation[0], attrs.padding[0], ap);
+        attrs.padding[1] = resolve_leading_padding(
+            inputs[0].shape(3), attrs.kernel_size[1], attrs.stride[1],
+            attrs.dilation[1], attrs.padding[1], ap);
+        attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
+    }
+
     // Winograd has no integer counterpart, so the quantized route always runs
     // the im2col kernel — including for the k3s1 geometry Winograd would take.
     if (backend_ == Backend::CPU && is_quantized_conv2d(inputs[1].data_type())) {
-        backend::cpu::conv2d_im2col_kernel(attrs_, output, inputs, ctx, workspace);
+        backend::cpu::conv2d_im2col_kernel(attrs, output, inputs, ctx, workspace);
         return;
     }
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+    impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
 }
 
 void Conv2D::prepackWeights(std::span<const TensorView> inputs,

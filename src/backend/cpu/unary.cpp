@@ -73,7 +73,7 @@ void unary_quant_impl(const UnaryAttributes& attrs,
                       const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    NNOPS_ASSERT(!attrs.add_to);
+    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
 
     quantized_unary_transform(inputs[0], output, ctx,
         [&](float* scratch, int h, int w) {
@@ -102,12 +102,12 @@ void unary_cpu(const UnaryAttributes& attrs,
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).
     NNOPS_ASSERT(in_is_int && out_is_int);
 
-    // Round/Ceil/Floor are float-meaning ops — no quantized-dtype support.
-    if (attrs.type == UnaryType::Round ||
-        attrs.type == UnaryType::Ceil  ||
-        attrs.type == UnaryType::Floor) {
-        NNOPS_ASSERT(!"unary_cpu: Round/Ceil/Floor do not support quantized data types");
-    }
+    // Round/Ceil/Floor have no quantized meaning; refuse instead of falling
+    // through to unary_quant_impl.
+    NNOPS_CHECK_MSG(attrs.type != UnaryType::Round &&
+                    attrs.type != UnaryType::Ceil &&
+                    attrs.type != UnaryType::Floor,
+                    "unary_cpu: Round/Ceil/Floor do not support quantized data types");
 
     unary_quant_impl(attrs, output, inputs, ctx);
 }

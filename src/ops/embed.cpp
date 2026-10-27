@@ -3,74 +3,15 @@
 
 #include "nnops/ops/embed.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void embed_ref(const EmbedAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(EmbedAttributes, embed_cpu)
 
-namespace backend::cpu {
-    void embed_cpu(const EmbedAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void embed_cuda(const EmbedAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
-#endif
-
-struct Embed::Impl {
-    using KernelFn = void (*)(const EmbedAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Embed::~Embed() = default;
-
-
-namespace {
-auto resolve_embed_kernel(Backend backend) -> Embed::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::embed_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::embed_cuda;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Embed> Embed::create(const EmbedAttributes& attrs,
-                                       Backend backend)
-{
-    return std::unique_ptr<Embed>(new Embed(attrs, backend));
-}
-
-Embed::Embed(const EmbedAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_embed_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Embed, EmbedAttributes,
+        backend::cpu::embed_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Embed::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
@@ -91,9 +32,9 @@ void Embed::compute(std::span<TensorView> outputs,
                       const ComputeContext& ctx,
                       void* workspace)
 {
-    auto& output = outputs[0];
     NNOPS_ASSERT(outputs.size() == 1);
     NNOPS_ASSERT(inputs.size() == 2);
+    auto& output = outputs[0];
     NNOPS_ASSERT(!output.is_empty());
 
     const auto& weight  = inputs[0];

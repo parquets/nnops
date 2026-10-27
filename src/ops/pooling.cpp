@@ -3,70 +3,16 @@
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu {
-    void pooling_cpu(const PoolingAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
+NNOPS_DECLARE_CPU(PoolingAttributes, pooling_cpu)
+NNOPS_DECLARE_CUDA(PoolingAttributes, pooling_cuda)
 
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void pooling_cuda(const PoolingAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace);
-}
-#endif
-
-struct Pooling::Impl {
-    using KernelFn = void (*)(const PoolingAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Pooling::~Pooling() = default;
-
-
-namespace {
-auto resolve_pooling_kernel(Backend backend) -> Pooling::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::pooling_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::pooling_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Pooling> Pooling::create(const PoolingAttributes& attrs,
-                                          Backend backend)
-{
-    return std::unique_ptr<Pooling>(new Pooling(attrs, backend));
-}
-
-Pooling::Pooling(const PoolingAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_pooling_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Pooling, PoolingAttributes,
+        backend::cpu::pooling_cpu, NNOPS_IF_CUDA(backend::cuda::pooling_cuda), nullptr)
 
 std::vector<TensorDesc> Pooling::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
@@ -90,7 +36,22 @@ void Pooling::compute(std::span<TensorView> outputs,
     NNOPS_ASSERT(!input.is_empty());
     NNOPS_ASSERT(is_layout_supported(input.layout(), LayoutSupport::PackedOnly));
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, nullptr);
+    // auto_pad lives in the descriptor; kernels only see explicit leading padding.
+    PoolingAttributes attrs = attrs_;
+    if (attrs.auto_pad != PoolingAttributes::AutoPad::NOTSET) {
+        const int ap = static_cast<int>(attrs.auto_pad);
+        const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
+        for (int i = 0; i < srank; ++i) {
+            // 2D uses [1],[2]; 3D uses [0],[1],[2].
+            const size_t ai = static_cast<size_t>(3 - srank + i);
+            attrs.padding[ai] = resolve_leading_padding(
+                input.shape(2 + i), attrs.kernel_shape[ai], attrs.stride[ai],
+                attrs.dilation[ai], attrs.padding[ai], ap);
+        }
+        attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET;
+    }
+
+    impl_->kernel_fn(attrs, output, inputs, ctx, nullptr);
 }
 
 }  // namespace nnops

@@ -22,7 +22,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
-#include "../simd_kernel/simd_epilogue.hpp"
+#include "simd_kernel/simd_epilogue.hpp"
 
 #include <algorithm>
 #include <cstdint>

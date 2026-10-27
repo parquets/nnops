@@ -2,8 +2,7 @@
 /// @brief CPU LinearAttention kernel — gated delta recurrence, SIMD-accelerated.
 ///
 /// Per (batch, kv head), a state matrix S[D, D] is carried over the sequence and
-/// each token runs one fused pass (see reference/linear_attention_ref.cpp for
-/// the scalar statement of the same math):
+/// each token runs one fused pass:
 ///
 ///   S[i][:] *= exp(Gate[t, i])                 1. decay the state
 ///   r[j]     = sum_i S[i][j] * k[i]            2. retrieval, on the decayed S
@@ -38,14 +37,6 @@
 
 #include <cmath>
 #include <span>
-
-namespace nnops::backend::cpu::reference {
-extern void linear_attention_ref(const LinearAttentionAttributes& attrs,
-                                 std::span<TensorView> outputs,
-                                 std::span<const TensorView> inputs,
-                                 const ComputeContext& ctx,
-                                 void* workspace);
-}
 
 namespace nnops::backend::cpu {
 namespace {
@@ -327,9 +318,7 @@ void linear_attention_cpu(const LinearAttentionAttributes& attrs,
     case DataType::f16: linear_attention_impl<half>(attrs, outputs, inputs, ctx);  return;
     default: break;
     }
-    // Only f32/f16 have kernels; everything else falls back to the reference
-    // (which asserts in debug and is the correctness baseline in release).
-    reference::linear_attention_ref(attrs, outputs, inputs, ctx, workspace);
+    NNOPS_CHECK_MSG(false, "LinearAttention: only f32 and f16 inputs are supported");
 }
 
 }  // namespace nnops::backend::cpu

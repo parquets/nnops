@@ -3,18 +3,10 @@
 
 #include "nnops/ops/topk.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
-
-namespace backend::cpu::reference {
-    void topk_ref(const TopKAttributes& attrs,
-                  TensorView& values,
-                  TensorView& indices,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace);
-}
 
 namespace backend::cpu {
     void topk_cpu(const TopKAttributes& attrs,
@@ -64,11 +56,7 @@ auto resolve_topk_kernel(Backend backend) -> TopK::Impl::KernelFn
 }
 }  // anonymous namespace
 
-std::unique_ptr<TopK> TopK::create(const TopKAttributes& attrs,
-                                     Backend backend)
-{
-    return std::unique_ptr<TopK>(new TopK(attrs, backend));
-}
+NNOPS_OP_CREATE(TopK, TopKAttributes)
 
 TopK::TopK(const TopKAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)

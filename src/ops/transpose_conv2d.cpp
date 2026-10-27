@@ -3,61 +3,15 @@
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu {
-    void transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
-                               TensorView& output,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx,
-                               void* workspace);
-}
+NNOPS_DECLARE_CPU(TransposeConv2DAttributes, transpose_conv2d_cpu)
 
-struct TransposeConv2D::Impl {
-    using KernelFn = void (*)(const TransposeConv2DAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-TransposeConv2D::~TransposeConv2D() = default;
-
-
-namespace {
-auto resolve_transpose_conv2d_kernel(Backend backend) -> TransposeConv2D::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::transpose_conv2d_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<TransposeConv2D> TransposeConv2D::create(
-    const TransposeConv2DAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<TransposeConv2D>(new TransposeConv2D(attrs, backend));
-}
-
-TransposeConv2D::TransposeConv2D(const TransposeConv2DAttributes& attrs,
-                                   Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_transpose_conv2d_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(TransposeConv2D, TransposeConv2DAttributes,
+        backend::cpu::transpose_conv2d_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> TransposeConv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

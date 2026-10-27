@@ -853,32 +853,6 @@ NNOPS_TEST(matmul_dq_prequantized_fp_output) {
 
 // transpose_a is outside the fast path; it must still be correct via the
 // reference.
-NNOPS_TEST(matmul_dq_transpose_a_ref) {
-    constexpr int64_t M = 7, K = 11, N = 5;
-    Quad q = make_quad(M, K, N, 116);
-    // A physical K×M over the same logical values (A_log[m][k] = a[k*M+m]).
-    std::vector<float> at(static_cast<size_t>(K * M));
-    for (int64_t k = 0; k < K; ++k) {
-        for (int64_t m = 0; m < M; ++m) {
-            at[static_cast<size_t>(k * M + m)] = q.a[static_cast<size_t>(m * K + k)];
-        }
-    }
-    TensorView a = make_q(K, M, DataType::f32, at.data(),
-                          per_token(q.a_s.data(), q.a_zp.data(), M));
-    TensorView b = make_q(K, N, DataType::s8, q.b.data(),
-                          per_channel(q.b_s.data(), q.b_zp.data(), N));
-
-    MatMulAttributes attrs{};
-    attrs.transpose_a = true;
-    auto op = MatMul::create(attrs, Backend::CPU);
-    const TensorDesc arr[] = {a.desc(), b.desc()};
-    auto descs = op->getOutputTensorDesc(arr);
-    NNOPS_EXPECT_EQ(descs[0].dims[0], M);
-    NNOPS_EXPECT_EQ(descs[0].dims[1], N);
-    const TensorView ins[] = {a, b};
-    expect_dq_matches_ref<float>(attrs, descs[0], ins);
-}
-
 // ============================================================
 // Threaded correctness
 // ============================================================

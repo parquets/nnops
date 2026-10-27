@@ -3,66 +3,14 @@
 
 #include "nnops/ops/flatten.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void flatten_ref(const FlattenAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
+NNOPS_DECLARE_CPU(FlattenAttributes, flatten_cpu)
 
-namespace backend::cpu {
-    void flatten_cpu(const FlattenAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
-struct Flatten::Impl {
-    using KernelFn = void (*)(const FlattenAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Flatten::~Flatten() = default;
-
-namespace {
-auto resolve_flatten_kernel(Backend backend) -> Flatten::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::flatten_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Flatten> Flatten::create(const FlattenAttributes& attrs,
-                                           Backend backend)
-{
-    return std::unique_ptr<Flatten>(new Flatten(attrs, backend));
-}
-
-Flatten::Flatten(const FlattenAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_flatten_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Flatten, FlattenAttributes,
+        backend::cpu::flatten_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Flatten::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

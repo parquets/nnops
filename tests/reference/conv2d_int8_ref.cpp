@@ -17,7 +17,7 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
-#include "../simd_kernel/simd_epilogue.hpp"
+#include "simd_kernel/simd_epilogue.hpp"
 
 #include <algorithm>
 #include <cmath>

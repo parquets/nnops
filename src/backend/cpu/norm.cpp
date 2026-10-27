@@ -554,7 +554,7 @@ void group_norm_impl(const NormAttributes& attrs,
 // This is only defined for axis == rank-1, where one normalization row is
 // exactly one quantization row (the unit of a PerToken scale/zero_point) —
 // that is what lets a single row be dequantized, normalized and written back
-// without staging the whole tensor. PerChannel / PerBlock have no meaning over
+// without staging the whole tensor. PerChannel has no meaning over
 // the trailing axis, and BatchNorm / GroupNorm are not supported because their
 // reduction units don't line up with quantization rows.
 //
@@ -740,7 +740,7 @@ void norm_quant_impl(const NormAttributes& attrs,
 
     // add_to would require dequantizing, accumulating and requantizing the
     // pre-existing output — not supported on this path.
-    NNOPS_ASSERT(!attrs.add_to);
+    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
 
     NNOPS_ASSERT(X.is_quantized());
     NNOPS_ASSERT(X.channel_pack_size() == 1);  // planar layouts only

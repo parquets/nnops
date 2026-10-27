@@ -3,78 +3,16 @@
 
 #include "nnops/ops/softmax.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu {
-    void softmax_cpu(const SoftmaxAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
+NNOPS_DECLARE_CPU(SoftmaxAttributes, softmax_cpu)
+NNOPS_DECLARE_CUDA(SoftmaxAttributes, softmax_cuda)
 
-namespace backend::cpu::reference {
-    void softmax_ref(const SoftmaxAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void softmax_cuda(const SoftmaxAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
-#endif
-
-struct Softmax::Impl {
-    using KernelFn = void (*)(const SoftmaxAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Softmax::~Softmax() = default;
-
-
-namespace {
-auto resolve_softmax_kernel(Backend backend) -> Softmax::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::softmax_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::softmax_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Softmax> Softmax::create(const SoftmaxAttributes& attrs,
-                                          Backend backend)
-{
-    return std::unique_ptr<Softmax>(new Softmax(attrs, backend));
-}
-
-Softmax::Softmax(const SoftmaxAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_softmax_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Softmax, SoftmaxAttributes,
+        backend::cpu::softmax_cpu, NNOPS_IF_CUDA(backend::cuda::softmax_cuda), nullptr)
 
 std::vector<TensorDesc> Softmax::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

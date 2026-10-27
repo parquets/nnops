@@ -379,7 +379,7 @@ void conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                             const ComputeContext& ctx,
                             void* /*workspace*/)
 {
-    // Never fall back to reference::conv2d_ref: U is rank-3 with dims[0] == 16
+    // Never route to conv2d_cpu here: U is rank-3 with dims[0] == 16
     // and the reference would read it as an OC of 16.
     NNOPS_ASSERT(inputs.size() >= 2);
     const DataType dt = inputs[0].data_type();

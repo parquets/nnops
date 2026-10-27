@@ -64,7 +64,7 @@ void eltwise_quant_impl(const EltwiseAttributes& attrs,
                         const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    NNOPS_ASSERT(!attrs.add_to);
+    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
 
     quantized_binary_transform(inputs[0], inputs[1], output, ctx,
         [&](float* a, float* b, int h, int w) {

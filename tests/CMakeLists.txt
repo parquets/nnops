@@ -16,7 +16,6 @@ set(TEST_SOURCES
     test_linear.cpp
     test_pack_mma.cpp
     test_attention.cpp
-    test_causal_attention.cpp
     test_clamp.cpp
     test_softmax.cpp
     test_cumsum.cpp
@@ -51,12 +50,35 @@ set(TEST_SOURCES
     test_mma_packed.cpp
 )
 
+# Reference kernels that only the tests need, as ground truth for the fast paths.
+add_library(nnops_test_reference STATIC
+    reference/attention_ref.cpp
+    reference/concat_ref.cpp
+    reference/conv2d_int8_ref.cpp
+    reference/conv2d_ref.cpp
+    reference/depthwise_conv_ref.cpp
+    reference/flatten_ref.cpp
+    reference/linear_attention_ref.cpp
+    reference/linear_ref.cpp
+    reference/matmul_dq_ref.cpp
+    reference/matmul_int8_ref.cpp
+    reference/matmul_ref.cpp
+    reference/moe_ref.cpp
+    reference/norm_ref.cpp
+    reference/pooling_ref.cpp
+    reference/resize_ref.cpp
+    reference/transpose_conv2d_ref.cpp
+)
+target_link_libraries(nnops_test_reference PRIVATE nnops_cpu)
+target_include_directories(nnops_test_reference PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/backend/cpu)
+
 # Each test file links against `common/test_harness.cpp` (which supplies main)
 # and becomes its own runnable demo. Every demo is also registered with CTest.
 function(nnops_add_test_demo src)
     get_filename_component(name "${src}" NAME_WE)   # strip .cpp → e.g. test_matmul
     add_executable(${name} "${src}" common/test_harness.cpp)
-    target_link_libraries(${name} PRIVATE nnops_cpu)
+    target_link_libraries(${name} PRIVATE nnops_cpu nnops_test_reference)
     if(NNOPS_BUILD_CUDA)
         target_link_libraries(${name} PRIVATE CUDA::cudart)
     endif()
@@ -93,7 +115,7 @@ if(NNOPS_BUILD_BENCHMARKS)
     function(nnops_add_bench_demo src)
         get_filename_component(name "${src}" NAME_WE)   # strip .cpp → e.g. bench_matmul
         add_executable(${name} "${src}" common/bench_harness.cpp)
-        target_link_libraries(${name} PRIVATE nnops_cpu)
+        target_link_libraries(${name} PRIVATE nnops_cpu nnops_test_reference)
         target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
     endfunction()
 

@@ -3,78 +3,16 @@
 
 #include "nnops/ops/reduce.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu {
-    void reduce_cpu(const ReduceAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(ReduceAttributes, reduce_cpu)
+NNOPS_DECLARE_CUDA(ReduceAttributes, reduce_cuda)
 
-namespace backend::cpu::reference {
-    void reduce_ref(const ReduceAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void reduce_cuda(const ReduceAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-#endif
-
-struct Reduce::Impl {
-    using KernelFn = void (*)(const ReduceAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Reduce::~Reduce() = default;
-
-
-namespace {
-auto resolve_reduce_kernel(Backend backend) -> Reduce::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::reduce_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::reduce_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Reduce> Reduce::create(const ReduceAttributes& attrs,
-                                        Backend backend)
-{
-    return std::unique_ptr<Reduce>(new Reduce(attrs, backend));
-}
-
-Reduce::Reduce(const ReduceAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_reduce_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Reduce, ReduceAttributes,
+        backend::cpu::reduce_cpu, NNOPS_IF_CUDA(backend::cuda::reduce_cuda), nullptr)
 
 std::vector<TensorDesc> Reduce::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

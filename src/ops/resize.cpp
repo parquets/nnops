@@ -3,68 +3,15 @@
 
 #include "nnops/ops/resize.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void resize_ref(const ResizeAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(ResizeAttributes, resize_cpu)
 
-namespace backend::cpu {
-    void resize_cpu(const ResizeAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
-
-struct Resize::Impl {
-    using KernelFn = void (*)(const ResizeAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Resize::~Resize() = default;
-
-
-namespace {
-auto resolve_resize_kernel(Backend backend) -> Resize::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::resize_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Resize> Resize::create(const ResizeAttributes& attrs,
-                                        Backend backend)
-{
-    return std::unique_ptr<Resize>(new Resize(attrs, backend));
-}
-
-Resize::Resize(const ResizeAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_resize_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Resize, ResizeAttributes,
+        backend::cpu::resize_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Resize::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

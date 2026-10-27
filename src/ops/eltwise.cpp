@@ -3,88 +3,17 @@
 
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void eltwise_ref(const EltwiseAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
+NNOPS_DECLARE_CPU(EltwiseAttributes, eltwise_cpu)
+NNOPS_DECLARE_CUDA(EltwiseAttributes, eltwise_cuda)
+NNOPS_DECLARE_VULKAN(EltwiseAttributes, eltwise_vulkan)
 
-namespace backend::cpu {
-    void eltwise_cpu(const EltwiseAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void eltwise_cuda(const EltwiseAttributes& attrs,
-                        TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx,
-                        void* workspace);
-}
-#endif
-
-#ifdef NNOPS_HAS_VULKAN
-namespace backend::vulkan {
-    void eltwise_vulkan(const EltwiseAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         void* workspace);
-}
-#endif
-
-struct Eltwise::Impl {
-    using KernelFn = void (*)(const EltwiseAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Eltwise::~Eltwise() = default;
-
-
-namespace {
-auto resolve_eltwise_kernel(Backend backend) -> Eltwise::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::eltwise_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::eltwise_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return backend::vulkan::eltwise_vulkan;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Eltwise> Eltwise::create(const EltwiseAttributes& attrs,
-                                           Backend backend)
-{
-    return std::unique_ptr<Eltwise>(new Eltwise(attrs, backend));
-}
-
-Eltwise::Eltwise(const EltwiseAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_eltwise_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Eltwise, EltwiseAttributes,
+        backend::cpu::eltwise_cpu, NNOPS_IF_CUDA(backend::cuda::eltwise_cuda), NNOPS_IF_VULKAN(backend::vulkan::eltwise_vulkan))
 
 std::vector<TensorDesc> Eltwise::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

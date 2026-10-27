@@ -38,8 +38,7 @@ public:
     /// memory planners to pre-allocate output buffers.
     ///
     /// Most operators produce exactly one output. These produce more:
-    /// CausalAttention (output + KV cache), LinearAttention (output + state),
-    /// TopK (values + indices).
+    /// LinearAttention (output + state), TopK (values + indices).
     ///
     /// @param inputs  Input tensor descriptors (shapes + dtype + layout).
     /// @return        Output tensor descriptors. Size is typically 1.

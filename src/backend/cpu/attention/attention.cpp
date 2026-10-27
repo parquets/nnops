@@ -30,15 +30,6 @@
 
 namespace nnops::backend::cpu {
 
-// Forward-declare the reference kernel for the fallback paths.
-namespace reference {
-void attention_ref(const AttentionAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx,
-                   void* workspace);
-}
-
 namespace {
 
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
@@ -679,16 +670,8 @@ void attention_cpu(const AttentionAttributes& attrs,
         return;
     }
 
-    // Mismatched dtypes: the f32 reference is the correctness baseline (no
-    // scratch). f16 has no reference, so a dtype mismatch there is a hard error
-    // (mirroring conv2d_im2col_kernel) rather than a silent f32 misread.
-    if (dt == DataType::f32) {
-        reference::attention_ref(attrs, output, inputs, ctx, nullptr);
-        return;
-    }
-
-    NNOPS_ASSERT(!"attention_cpu: f16 Attention dtype mismatch "
-                   "(f16 Q requires matching f16 K/V/output/mask)");
+    NNOPS_CHECK_MSG(false,
+                    "Attention: Q, K, V, output and mask dtypes must match");
 }
 
 }  // namespace nnops::backend::cpu

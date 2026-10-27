@@ -99,20 +99,23 @@ void pooling_impl(const PoolingAttributes& attrs,
         const T* in_base  = in_ptr + n * C8 * in_ch_stride + c8 * in_ch_stride;
         T* out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
 
+        // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
+        k::PoolingKernelParams pc = p;
+
         for (int64_t od = 0; od < OD; ++od) {
-            T* out_d = out_base + od * p.out_row_stride * OH;
+            T* out_d = out_base + od * pc.out_row_stride * OH;
 
             int64_t oh = 0;
             for (; oh + 3 < OH; oh += 4) {
-                p.od = od;
-                p.oh = oh;
-                pool_h4_fn(out_d + oh * p.out_row_stride, in_base, p, avg_scale, attrs.add_to);
+                pc.od = od;
+                pc.oh = oh;
+                pool_h4_fn(out_d + oh * pc.out_row_stride, in_base, pc, avg_scale, attrs.add_to);
             }
             for (; oh < OH; ++oh) {
-                p.od = od;
-                p.oh = oh;
-                pool_h1_fn(out_d + oh * p.out_row_stride, in_base,
-                           p, avg_scale, attrs.add_to);
+                pc.od = od;
+                pc.oh = oh;
+                pool_h1_fn(out_d + oh * pc.out_row_stride, in_base,
+                           pc, avg_scale, attrs.add_to);
             }
         }
     };
@@ -204,53 +207,56 @@ void pooling_impl_quant(const PoolingAttributes& attrs,
         const InT* in_base  = in_ptr + n * C8 * in_ch_stride + c8 * in_ch_stride;
         OutT* out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
 
+        // Per-task copy (see above).
+        k::PoolingKernelParams pc = p;
+
         for (int64_t od = 0; od < OD; ++od) {
-            OutT* out_d = out_base + od * p.out_row_stride * OH;
+            OutT* out_d = out_base + od * pc.out_row_stride * OH;
 
             int64_t oh = 0;
             if (use_fast) {
                 // Only instantiated when InT == OutT (guaranteed by use_fast).
                 if constexpr (std::is_same_v<InT, OutT>) {
                     for (; oh + 3 < OH; oh += 4) {
-                        p.od = od;
-                        p.oh = oh;
-                        k::maxpool_h4_quant_fast<InT>(out_d + oh * p.out_row_stride,
-                                                   in_base, p, out_zero);
+                        pc.od = od;
+                        pc.oh = oh;
+                        k::maxpool_h4_quant_fast<InT>(out_d + oh * pc.out_row_stride,
+                                                   in_base, pc, out_zero);
                     }
                     for (; oh < OH; ++oh) {
-                        p.od = od;
-                        p.oh = oh;
-                        k::maxpool_h1_quant_fast<InT>(out_d + oh * p.out_row_stride,
-                                                   in_base, p, out_zero);
+                        pc.od = od;
+                        pc.oh = oh;
+                        k::maxpool_h1_quant_fast<InT>(out_d + oh * pc.out_row_stride,
+                                                   in_base, pc, out_zero);
                     }
                 }
             } else if (attrs.type == PoolingType::Max) {
                 for (; oh + 3 < OH; oh += 4) {
-                    p.od = od;
-                    p.oh = oh;
-                    k::maxpool_h4_quant<InT, OutT>(out_d + oh * p.out_row_stride, in_base, p,
+                    pc.od = od;
+                    pc.oh = oh;
+                    k::maxpool_h4_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
                                                in_scale, in_zero, out_scale, out_zero,
                                                attrs.add_to);
                 }
                 for (; oh < OH; ++oh) {
-                    p.od = od;
-                    p.oh = oh;
-                    k::maxpool_h1_quant<InT, OutT>(out_d + oh * p.out_row_stride, in_base, p,
+                    pc.od = od;
+                    pc.oh = oh;
+                    k::maxpool_h1_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
                                                in_scale, in_zero, out_scale, out_zero,
                                                attrs.add_to);
                 }
             } else {
                 for (; oh + 3 < OH; oh += 4) {
-                    p.od = od;
-                    p.oh = oh;
-                    k::avgpool_h4_quant<InT, OutT>(out_d + oh * p.out_row_stride, in_base, p,
+                    pc.od = od;
+                    pc.oh = oh;
+                    k::avgpool_h4_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
                                                avg_scale, in_scale, in_zero, out_scale,
                                                out_zero, attrs.add_to);
                 }
                 for (; oh < OH; ++oh) {
-                    p.od = od;
-                    p.oh = oh;
-                    k::avgpool_h1_quant<InT, OutT>(out_d + oh * p.out_row_stride, in_base, p,
+                    pc.od = od;
+                    pc.oh = oh;
+                    k::avgpool_h1_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
                                                avg_scale, in_scale, in_zero, out_scale,
                                                out_zero, attrs.add_to);
                 }

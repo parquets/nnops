@@ -3,61 +3,16 @@
 
 #include "nnops/ops/attention.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/attention/attention.h"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void attention_ref(const AttentionAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace);
-}
+NNOPS_DECLARE_CPU(AttentionAttributes, attention_cpu)
 
-struct Attention::Impl {
-    using KernelFn = void (*)(const AttentionAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Attention::~Attention() = default;
-
-
-namespace {
-auto resolve_attention_kernel(Backend backend) -> Attention::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::attention_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Attention> Attention::create(const AttentionAttributes& attrs,
-                                              Backend backend)
-{
-    return std::unique_ptr<Attention>(new Attention(attrs, backend));
-}
-
-Attention::Attention(const AttentionAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_attention_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Attention, AttentionAttributes,
+        backend::cpu::attention_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Attention::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

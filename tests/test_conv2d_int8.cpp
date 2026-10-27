@@ -974,34 +974,6 @@ NNOPS_TEST(conv2d_i8_int_out_matches_ref) {
 }
 
 // ============================================================
-// add_to (reference-only path)
-// ============================================================
-
-NNOPS_TEST(conv2d_i8_add_to_matches_ref) {
-    Case c;
-    c.ishape = {1, 4, 7, 7};
-    c.wshape = {6, 4, 3, 3};
-    c.kh = c.kw = 3;
-    c.ph = c.pw = 1;
-    c.act = DataType::u8;
-    c.zp_x = 128;
-    c.asym_w = true;
-    c.add_to = true;
-    c.ep = EpilogueActivateType::Relu;
-    c.seed = 3000;
-    expect_matches_ref(c);
-
-    // The same case without add_to must differ: seed_output() lays down a
-    // different baseline, so equality would mean add_to was ignored.
-    Case plain = c;
-    plain.add_to = false;
-    const Result with_add = run_route(c, {}, false);
-    const Result without  = run_route(plain, {}, false);
-    NNOPS_EXPECT_FALSE(std::memcmp(with_add.buf.data(), without.buf.data(),
-                                   with_add.buf.size()) == 0);
-}
-
-// ============================================================
 // Threading: identical bits across thread counts
 // ============================================================
 

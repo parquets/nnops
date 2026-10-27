@@ -46,7 +46,8 @@ struct QuantLinearAttributes {
     int64_t axis = -1;
 
     /// For QuantizeLinear: output integer type (s8 or u8).
-    /// For DequantizeLinear: output float type (f32 or f16).
+    /// For DequantizeLinear: output float type (f32 or f16); anything else
+    /// resolves to f32 at construction.
     DataType output_dtype = DataType::s8;
 };
 

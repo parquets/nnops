@@ -42,15 +42,6 @@
 #include <cstring>
 #include <vector>
 
-// Forward-declare the reference kernel for the unsupported-dtype fallback.
-namespace nnops::backend::cpu::reference {
-extern void moe_ref(const MoEAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
-
 namespace nnops::backend::cpu {
 namespace {
 
@@ -272,7 +263,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
             std::fill(used.begin(), used.end(), 0);
             for (int64_t j = 0; j < k; ++j) {
                 // Scan ascending with a strict '>', so an exact tie keeps the
-                // lower expert index — matches reference::moe_ref.
+                // lower expert index.
                 int64_t best = -1;
                 for (int64_t e = 0; e < E; ++e) {
                     if (used[static_cast<size_t>(e)]) { continue; }
@@ -456,9 +447,7 @@ void moe_cpu(const MoEAttributes& attrs,
     case DataType::f16: moe_cpu_impl<half>(attrs, output, inputs, ctx);  return;
     default: break;
     }
-    // Only f32/f16 have kernels; everything else falls back to the reference
-    // (which asserts in debug and is the correctness baseline in release).
-    reference::moe_ref(attrs, output, inputs, ctx, workspace);
+    NNOPS_CHECK_MSG(false, "MoE: only f32 and f16 inputs are supported");
 }
 
 }  // namespace nnops::backend::cpu

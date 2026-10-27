@@ -3,60 +3,15 @@
 
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu {
-    void grid_sample_cpu(const GridSampleAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         void* workspace);
-}
+NNOPS_DECLARE_CPU(GridSampleAttributes, grid_sample_cpu)
 
-struct GridSample::Impl {
-    using KernelFn = void (*)(const GridSampleAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-GridSample::~GridSample() = default;
-
-
-namespace {
-auto resolve_grid_sample_kernel(Backend backend) -> GridSample::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::grid_sample_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<GridSample> GridSample::create(const GridSampleAttributes& attrs,
-                                                 Backend backend)
-{
-    return std::unique_ptr<GridSample>(new GridSample(attrs, backend));
-}
-
-GridSample::GridSample(const GridSampleAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_grid_sample_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(GridSample, GridSampleAttributes,
+        backend::cpu::grid_sample_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> GridSample::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

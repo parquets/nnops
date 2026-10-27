@@ -3,6 +3,7 @@
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 
 namespace nnops {
 
@@ -56,11 +57,7 @@ auto resolve_linear_attention_kernel(Backend backend) -> LinearAttention::Impl::
 }
 }  // anonymous namespace
 
-std::unique_ptr<LinearAttention> LinearAttention::create(
-    const LinearAttentionAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<LinearAttention>(new LinearAttention(attrs, backend));
-}
+NNOPS_OP_CREATE(LinearAttention, LinearAttentionAttributes)
 
 LinearAttention::LinearAttention(const LinearAttentionAttributes& attrs,
                                    Backend backend)

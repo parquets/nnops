@@ -3,88 +3,17 @@
 
 #include "nnops/ops/unary.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void unary_ref(const UnaryAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(UnaryAttributes, unary_cpu)
+NNOPS_DECLARE_CUDA(UnaryAttributes, unary_cuda)
+NNOPS_DECLARE_VULKAN(UnaryAttributes, unary_vulkan)
 
-namespace backend::cpu {
-    void unary_cpu(const UnaryAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void unary_cuda(const UnaryAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
-#endif
-
-#ifdef NNOPS_HAS_VULKAN
-namespace backend::vulkan {
-    void unary_vulkan(const UnaryAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace);
-}
-#endif
-
-struct Unary::Impl {
-    using KernelFn = void (*)(const UnaryAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Unary::~Unary() = default;
-
-
-namespace {
-auto resolve_unary_kernel(Backend backend) -> Unary::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::unary_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::unary_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return backend::vulkan::unary_vulkan;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Unary> Unary::create(const UnaryAttributes& attrs,
-                                       Backend backend)
-{
-    return std::unique_ptr<Unary>(new Unary(attrs, backend));
-}
-
-Unary::Unary(const UnaryAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_unary_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Unary, UnaryAttributes,
+        backend::cpu::unary_cpu, NNOPS_IF_CUDA(backend::cuda::unary_cuda), NNOPS_IF_VULKAN(backend::vulkan::unary_vulkan))
 
 std::vector<TensorDesc> Unary::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

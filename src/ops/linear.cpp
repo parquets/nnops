@@ -4,68 +4,15 @@
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu {
-    void linear_cpu(const LinearAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(LinearAttributes, linear_cpu)
 
-namespace backend::cpu::reference {
-    void linear_ref(const LinearAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
-
-struct Linear::Impl {
-    using KernelFn = void (*)(const LinearAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Linear::~Linear() = default;
-
-
-namespace {
-auto resolve_linear_kernel(Backend backend) -> Linear::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::linear_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Linear> Linear::create(const LinearAttributes& attrs,
-                                        Backend backend)
-{
-    return std::unique_ptr<Linear>(new Linear(attrs, backend));
-}
-
-Linear::Linear(const LinearAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_linear_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Linear, LinearAttributes,
+        backend::cpu::linear_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Linear::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

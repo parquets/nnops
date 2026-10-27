@@ -3,73 +3,15 @@
 
 #include "nnops/ops/slice.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void slice_ref(const SliceAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
+NNOPS_DECLARE_CPU(SliceAttributes, slice_cpu)
 
-namespace backend::cpu {
-    void slice_cpu(const SliceAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void slice_cuda(const SliceAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-#endif
-
-struct Slice::Impl {
-    using KernelFn = void (*)(const SliceAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Slice::~Slice() = default;
-
-namespace {
-auto resolve_slice_kernel(Backend backend) -> Slice::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::slice_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::slice_cuda;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Slice> Slice::create(const SliceAttributes& attrs,
-                                       Backend backend)
-{
-    return std::unique_ptr<Slice>(new Slice(attrs, backend));
-}
-
-Slice::Slice(const SliceAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_slice_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Slice, SliceAttributes,
+        backend::cpu::slice_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Slice::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

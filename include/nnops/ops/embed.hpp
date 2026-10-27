@@ -36,7 +36,7 @@ struct EmbedAttributes {
 /// quantization is supported: one (scale, zero_point) per vocab entry.
 /// PerToken does this directly; PerChannel — for the 2D weight
 /// [vocab_size, dim], quantizing along axis 0 (the vocab entry) — is
-/// identical to PerToken. PerTensor and PerBlock are rejected.
+/// identical to PerToken. PerTensor is rejected.
 ///
 /// Inputs (2):
 ///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, s8, u8)

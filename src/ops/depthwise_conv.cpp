@@ -9,6 +9,7 @@
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
@@ -20,61 +21,13 @@ namespace nnops {
 
 using namespace simd;
 
-namespace backend::cpu::reference {
-    void depthwise_conv_ref(const DepthwiseConvAttributes& attrs,
-                             TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx,
-                             void* workspace);
-}
+NNOPS_DECLARE_CPU(DepthwiseConvAttributes, depthwise_conv_cpu)
+NNOPS_DECLARE_CUDA(DepthwiseConvAttributes, depthwise_conv_cuda)
 
-namespace backend::cpu {
-    void depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
-                             TensorView& output,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx,
-                             void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void depthwise_conv_cuda(const DepthwiseConvAttributes& attrs,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx,
-                              void* workspace);
-}
-#endif
-
-struct DepthwiseConv::Impl {
-    using KernelFn = void (*)(const DepthwiseConvAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-DepthwiseConv::~DepthwiseConv() = default;
-
+NNOPS_OP_BOILERPLATE(DepthwiseConv, DepthwiseConvAttributes,
+        backend::cpu::depthwise_conv_cpu, NNOPS_IF_CUDA(backend::cuda::depthwise_conv_cuda), nullptr)
 
 namespace {
-auto resolve_depthwise_conv_kernel(Backend backend) -> DepthwiseConv::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::depthwise_conv_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::depthwise_conv_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
 
 // ============================================================
 // Prepack helpers — SIMD-optimized weight & bias packing (2D + 3D)
@@ -352,18 +305,6 @@ void prepack_dwconv_bias(const TensorView& bias_nchw,
 }
 
 }  // anonymous namespace
-
-std::unique_ptr<DepthwiseConv> DepthwiseConv::create(
-    const DepthwiseConvAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<DepthwiseConv>(new DepthwiseConv(attrs, backend));
-}
-
-DepthwiseConv::DepthwiseConv(const DepthwiseConvAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_depthwise_conv_kernel(backend);
-}
 
 std::vector<TensorDesc> DepthwiseConv::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

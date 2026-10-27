@@ -3,67 +3,15 @@
 
 #include "nnops/ops/moe.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void moe_ref(const MoEAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* workspace);
-}
+NNOPS_DECLARE_CPU(MoEAttributes, moe_cpu)
 
-namespace backend::cpu {
-    void moe_cpu(const MoEAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx,
-                 void* workspace);
-}
-
-struct MoE::Impl {
-    using KernelFn = void (*)(const MoEAttributes&,
-                              TensorView&,
-                              std::span<const TensorView>,
-                              const ComputeContext&,
-                              void*);
-    KernelFn kernel_fn = nullptr;
-};
-MoE::~MoE() = default;
-
-
-namespace {
-auto resolve_moe_kernel(Backend backend) -> MoE::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::moe_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return nullptr;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<MoE> MoE::create(const MoEAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<MoE>(new MoE(attrs, backend));
-}
-
-MoE::MoE(const MoEAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_moe_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(MoE, MoEAttributes,
+        backend::cpu::moe_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> MoE::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

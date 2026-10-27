@@ -30,25 +30,6 @@
 #include <utility>
 #include <vector>
 
-// Forward-declare reference kernels for the fallback paths.
-namespace nnops::backend::cpu::reference {
-extern void matmul_ref(const MatMulAttributes& attrs,
-                       TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace);
-extern void matmul_int8_ref(const MatMulAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
-                            void* workspace);
-extern void matmul_dq_ref(const MatMulAttributes& attrs,
-                          TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx,
-                          void* workspace);
-}
-
 namespace nnops::backend::cpu {
 
 namespace {
@@ -577,11 +558,8 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
     }
 
     if constexpr (R::is_fp) {
-        // No scratch to pack into: the reference is the only route left.
-        if (workspace == nullptr) {
-            reference::matmul_ref(attrs, output, inputs, ctx, nullptr);
-            return;
-        }
+        NNOPS_CHECK_MSG(workspace != nullptr,
+                        "MatMul: the fp routes need a scratch workspace");
     }
 
     const int lda = static_cast<int>(a.row_stride_elems());
@@ -1045,21 +1023,16 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
     // Offline-quantized activations × s8 weights: quantize A with its own
     // per-tensor / per-token parameters, run the int8 GEMM, dequantize into A's
     // dtype. Without active parameters the pair has no defined semantics — a
-    // float A is not a quantized tensor to dequantize — so it takes the
-    // reference rather than misreading the int8 weights as floats.
+    // float A is not a quantized tensor to dequantize — so it is rejected
+    // rather than misreading the int8 weights as floats.
     if (float_a && dt_b == DataType::s8) {
         const QuantParams& qp = a.quant_params();
         const bool qp_ok = qp.is_active() &&
                            (qp.granularity == QuantGranularity::PerTensor ||
                             qp.granularity == QuantGranularity::PerToken);
-        if (!qp_ok || attrs_n.transpose_a) {
-            NNOPS_ASSERT_MSG(qp_ok,
-                             "MatMul: fp A x s8 B needs per-tensor or per-token "
-                             "QuantParams on A");
-            // transpose_a has no packed A_q path yet; the reference is exact.
-            reference::matmul_dq_ref(attrs_n, output, inputs, ctx, nullptr);
-            return;
-        }
+        NNOPS_CHECK_MSG(qp_ok && !attrs_n.transpose_a,
+                        "MatMul: fp A x s8 B needs per-tensor or per-token "
+                        "QuantParams on A, and no transpose_a");
         NNOPS_ASSERT(output.data_type() == dt_a);
         if (dt_a == DataType::f32) {
             matmul_dq<float>(attrs_n, output, inputs, ctx);
@@ -1073,8 +1046,8 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
     auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count(),
                                 ctx.cpu.thread_slot_count() > 0);
 
-    // int8: tiled for s32 / s8 / u8 outputs, reference otherwise. A quantized
-    // output adds an int32 M×N accumulator after the scratch.
+    // int8: tiled for s32 / s8 / u8 / fp outputs. A quantized output adds an
+    // int32 M×N accumulator after the scratch.
     if (is_int8_matmul(dt_a, dt_b)) {
         const DataType odt = output.data_type();
         // An fp output dequantizes the same int32 accumulate instead of
@@ -1102,7 +1075,8 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
                                                scratch.get());
             }
         } else {
-            reference::matmul_int8_ref(attrs_n, output, inputs, ctx, nullptr);
+            NNOPS_CHECK_MSG(false,
+                            "MatMul: int8 x int8 needs a s32/s8/u8/f32/f16 output");
         }
         return;
     }
@@ -1110,11 +1084,8 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
     // Past the int8 branch: only f32/f16 have a fused kernel, plus a
     // block-packed B (q5_1/q4_1), whose blocks decode to A's type in the RHS
     // pack.
-    const bool supported = float_a && (dt_b == dt_a || b_block);
-    if (!supported) {
-        reference::matmul_ref(attrs_n, output, inputs, ctx, nullptr);
-        return;
-    }
+    NNOPS_CHECK_MSG(float_a && (dt_b == dt_a || b_block),
+                    "MatMul: unsupported dtype combination");
 
     PoolPtr scratch(plan.workspace_size);
 

@@ -37,7 +37,7 @@
 /// and stride_elems() semantics need adjustment — see data_type_size() which
 /// returns 0 for sub-byte types to flag that packed-element helpers are required.
 ///
-/// ## Four granularities (matching ONNX conventions)
+/// ## Three granularities (matching ONNX conventions)
 ///
 ///   PerTensor:  one (scale, zero_point) for the entire tensor.
 ///               Uses the scalar `scale` and `zero_point` fields directly.
@@ -49,12 +49,6 @@
 ///   PerChannel: one (scale, zero_point) per channel (axis=1).
 ///               `scale_data` and `zero_point_data` point to arrays of
 ///               length `num_scales`, where num_scales = shape[1] (channels).
-///
-///   PerBlock:   one (scale, zero_point) per physical KV-cache block, indexed
-///               by block number — the block (PagedAttention-style) KV-cache
-///               quantization CausalAttention uses. The block size is
-///               `QuantParams::block_size`. (Weight-only grouped Q4/Q8 GEMM
-///               would reuse these fields but is not implemented.)
 ///
 /// ## Design notes
 ///
@@ -80,7 +74,6 @@ enum class QuantGranularity : uint8_t {
     PerTensor  = 0,  ///< single (scale, zero_point) for the whole tensor
     PerToken   = 1,  ///< one (scale, zero_point) per row (token-level)
     PerChannel = 2,  ///< one (scale, zero_point) per channel (axis=1)
-    PerBlock   = 3,  ///< one (scale, zero_point) per physical block (used by KV-cache block quantization)
 };
 
 /// Lightweight quantization metadata (non-owning, like TensorView).
@@ -120,23 +113,7 @@ struct QuantParams {
     /// Number of entries in scale_data / zero_point_data.
     /// For PerToken:   equals the number of rows (total_rows()).
     /// For PerChannel: equals the number of channels (shape[1]).
-    /// For PerBlock:   equals the number of KV-cache blocks.
     int64_t num_scales = 0;
-
-    /// For PerBlock granularity: number of contiguous elements (along the
-    /// innermost / K dimension) covered by each (scale, zero_point) pair.
-    /// 0 means "not block-quantized" (PerTensor / PerToken / PerChannel).
-    ///
-    /// The packed bit width of each element within a block is NOT stored here —
-    /// it comes from the storage DataType (TensorView::data_type()) via
-    /// data_type_bits(): s4/u4 → 4 bits (Q4), s8/u8 → 8 bits (Q8).
-    int64_t block_size = 0;
-
-    /// Whether these parameters describe block quantization — PerBlock
-    /// granularity with a non-zero block_size.
-    bool is_block_quantized() const noexcept {
-        return granularity == QuantGranularity::PerBlock && block_size > 0;
-    }
 
     /// Whether these parameters represent an active quantization.
     /// Returns true when the tensor data should be dequantized before use.

@@ -97,21 +97,24 @@ void dwconv_impl_nchwc8(
         const T* w_base   = pw_ptr + c8 * KD * KH * KW * 8;
         const T* bias_vec = pb_ptr ? pb_ptr + c8 * 8 : nullptr;
 
+        // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
+        k::DwConvParams pc = p;
+
         for (int64_t od = 0; od < OD; ++od) {
             T* out_d = out_base + od * out_d_stride;
 
             int64_t oh = 0;
             for (; oh + 3 < OH; oh += 4) {
-                p.od = od;
-                p.oh = oh;
-                k::dwconv_h4(out_d + oh * p.out_row_stride, in_base, w_base, bias_vec,
-                               p, attrs.epilogue, attrs.add_to);
+                pc.od = od;
+                pc.oh = oh;
+                k::dwconv_h4(out_d + oh * pc.out_row_stride, in_base, w_base, bias_vec,
+                               pc, attrs.epilogue, attrs.add_to);
             }
             for (; oh < OH; ++oh) {
-                p.od = od;
-                p.oh = oh;
-                k::dwconv_h1(out_d + oh * p.out_row_stride, in_base, w_base, bias_vec,
-                               p, attrs.epilogue, attrs.add_to);
+                pc.od = od;
+                pc.oh = oh;
+                k::dwconv_h1(out_d + oh * pc.out_row_stride, in_base, w_base, bias_vec,
+                               pc, attrs.epilogue, attrs.add_to);
             }
         }
     };
@@ -187,13 +190,13 @@ void dwconv_impl_nchwc8_quant(
     const int64_t PH  = attrs.padding[1];
     const int64_t PW  = attrs.padding[2];
 
-    // Quantization parameters: activation PerTensor, weight PerChannel.
-    // Depthwise weights are always PerChannel-quantized (one scale/zero_point
-    // per channel); no other granularity is supported.
+    // Activation PerTensor, weight PerChannel — the only supported granularity,
+    // and scale_data is dereferenced per channel below.
     const auto& in_qp  = input.quant_params();
     const auto& out_qp = output.quant_params();
     const auto& w_qp   = packed_weight.quant_params();
-    NNOPS_ASSERT(w_qp.granularity == QuantGranularity::PerChannel);
+    NNOPS_CHECK(w_qp.granularity == QuantGranularity::PerChannel &&
+                w_qp.scale_data != nullptr);
     const float in_scale  = in_qp.scale;
     const float in_zero   = static_cast<float>(in_qp.zero_point);
     const float out_scale = out_qp.scale;
@@ -257,23 +260,26 @@ void dwconv_impl_nchwc8_quant(
             v_store(&wq[k * 8], k::dequantize_channel(&w_base[k * 8], w_scale8, w_zero8));
         }
 
+        // Per-task copy (see above).
+        k::DwConvParams pc = p;
+
         for (int64_t od = 0; od < OD; ++od) {
             OutT* out_d = out_base + od * out_d_stride;
 
             int64_t oh = 0;
             for (; oh + 3 < OH; oh += 4) {
-                p.od = od;
-                p.oh = oh;
-                k::dwconv_h4_quant<InT, OutT>(out_d + oh * p.out_row_stride, in_base, wq,
-                                           bias_vec, p, attrs.epilogue, attrs.add_to,
+                pc.od = od;
+                pc.oh = oh;
+                k::dwconv_h4_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, wq,
+                                           bias_vec, pc, attrs.epilogue, attrs.add_to,
                                            in_scale, in_zero,
                                            out_scale, out_zero);
             }
             for (; oh < OH; ++oh) {
-                p.od = od;
-                p.oh = oh;
-                k::dwconv_h1_quant<InT, OutT>(out_d + oh * p.out_row_stride, in_base, wq,
-                                           bias_vec, p, attrs.epilogue, attrs.add_to,
+                pc.od = od;
+                pc.oh = oh;
+                k::dwconv_h1_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, wq,
+                                           bias_vec, pc, attrs.epilogue, attrs.add_to,
                                            in_scale, in_zero,
                                            out_scale, out_zero);
             }

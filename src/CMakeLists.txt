@@ -5,7 +5,6 @@ target_link_libraries(nnops_cpu PUBLIC nnops)
 # Gather CPU sources explicitly (no file(GLOB))
 set(NNOPS_CPU_SOURCES
     # Operator dispatch layer
-    ops/causal_attention.cpp
     ops/clamp.cpp
     ops/conv2d.cpp
     ops/activation.cpp
@@ -88,46 +87,14 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/conv2d_im2col_int8.cpp
     backend/cpu/conv/depthwise_conv.cpp
+    backend/cpu/conv/conv3d.cpp
 
-    # CPU tiled attention kernels (fused QK^T + softmax + AV; causal and linear
-    # attention live alongside it)
+    # CPU tiled attention kernels (fused QK^T + softmax + AV; linear attention
+    # lives alongside it)
     backend/cpu/attention/attention.cpp
-    backend/cpu/attention/causal_attention.cpp
     backend/cpu/attention/linear_attention.cpp
 
-    # CPU reference kernels (always compiled — correctness baseline)
-    backend/cpu/reference/conv2d_ref.cpp
-    backend/cpu/reference/conv2d_int8_ref.cpp
-    backend/cpu/reference/activation_ref.cpp
-    backend/cpu/reference/pooling_ref.cpp
-    backend/cpu/reference/linear_ref.cpp
-    backend/cpu/reference/matmul_ref.cpp
-    backend/cpu/reference/matmul_int8_ref.cpp
-    backend/cpu/reference/matmul_dq_ref.cpp
-    backend/cpu/reference/attention_ref.cpp
-    backend/cpu/reference/causal_attention_ref.cpp
-    backend/cpu/reference/clamp_ref.cpp
-    backend/cpu/reference/softmax_ref.cpp
-    backend/cpu/reference/cumsum_ref.cpp
-    backend/cpu/reference/norm_ref.cpp
-    backend/cpu/reference/conv3d_ref.cpp
-    backend/cpu/reference/depthwise_conv_ref.cpp
-    backend/cpu/reference/eltwise_ref.cpp
-    backend/cpu/reference/embed_ref.cpp
-    backend/cpu/reference/permute_ref.cpp
-    backend/cpu/reference/slice_ref.cpp
-    backend/cpu/reference/unary_ref.cpp
-    backend/cpu/reference/reduce_ref.cpp
-    backend/cpu/reference/resize_ref.cpp
-    backend/cpu/reference/quant_linear_ref.cpp
-    backend/cpu/reference/concat_ref.cpp
-    backend/cpu/reference/argminmax_ref.cpp
-    backend/cpu/reference/topk_ref.cpp
-    backend/cpu/reference/rope_ref.cpp
-    backend/cpu/reference/flatten_ref.cpp
-    backend/cpu/reference/transpose_conv2d_ref.cpp
-    backend/cpu/reference/moe_ref.cpp
-    backend/cpu/reference/linear_attention_ref.cpp
+    backend/cpu/cumsum.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})

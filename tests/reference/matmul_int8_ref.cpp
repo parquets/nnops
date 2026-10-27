@@ -14,7 +14,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
-#include "../simd_kernel/simd_epilogue.hpp"
+#include "simd_kernel/simd_epilogue.hpp"
 
 #include <algorithm>
 #include <cstdint>

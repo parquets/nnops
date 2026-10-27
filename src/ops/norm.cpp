@@ -3,65 +3,17 @@
 
 #include "nnops/ops/norm.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void norm_ref(const NormAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace);
-}
+NNOPS_DECLARE_CPU(NormAttributes, norm_cpu)
 
-namespace backend::cpu {
-    void norm_cpu(const NormAttributes& attrs,
-                  TensorView& output,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void norm_cuda(const NormAttributes& attrs,
-                   TensorView& output,
-                   std::span<const TensorView> inputs,
-                   const ComputeContext& ctx,
-                   void* workspace);
-}
-#endif
-
-struct Norm::Impl {
-    using KernelFn = void (*)(const NormAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Norm::~Norm() = default;
-
+NNOPS_OP_BOILERPLATE(Norm, NormAttributes,
+        backend::cpu::norm_cpu, nullptr, nullptr)
 
 namespace {
-auto resolve_norm_kernel(Backend backend) -> Norm::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::norm_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::norm_cuda;
-#endif
-#ifdef NNOPS_HAS_VULKAN
-    case Backend::Vulkan:
-        return nullptr;
-#endif
-    default:
-        return nullptr;
-    }
-}
 
 /// Expected input count range for each norm type, as {min_inputs, max_inputs}.
 std::pair<int, int> norm_input_range(NormType type) {
@@ -75,17 +27,6 @@ std::pair<int, int> norm_input_range(NormType type) {
     return {0, 0};
 }
 }  // anonymous namespace
-
-std::unique_ptr<Norm> Norm::create(const NormAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<Norm>(new Norm(attrs, backend));
-}
-
-Norm::Norm(const NormAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_norm_kernel(backend);
-}
 
 std::vector<TensorDesc> Norm::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

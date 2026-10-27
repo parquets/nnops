@@ -3,6 +3,7 @@
 
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/layout_convert.hpp"
 
@@ -64,11 +65,7 @@ auto resolve_layout_convert_kernel(Backend backend)
 }
 }  // anonymous namespace
 
-std::unique_ptr<LayoutConvert> LayoutConvert::create(
-    const LayoutConvertAttributes& attrs, Backend backend)
-{
-    return std::unique_ptr<LayoutConvert>(new LayoutConvert(attrs, backend));
-}
+NNOPS_OP_CREATE(LayoutConvert, LayoutConvertAttributes)
 
 LayoutConvert::LayoutConvert(const LayoutConvertAttributes& attrs,
                                Backend backend)

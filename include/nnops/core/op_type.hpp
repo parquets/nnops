@@ -3,7 +3,7 @@
 /// @brief OpType enum identifying different operator types.
 ///
 /// Loosely tracks ONNX op naming, but several entries have no ONNX op behind
-/// them (CausalAttention, LinearAttention, MoE, Norm, GroupNorm, …). Nothing in
+/// them (LinearAttention, MoE, Norm, GroupNorm, …). Nothing in
 /// the library maps these to ONNX names; the enum is this library's own.
 
 #include <cstdint>
@@ -39,16 +39,15 @@ enum class OpType : uint8_t {
     TopK            = 24,
     RoPE            = 25,
     Flatten         = 26,
-    CausalAttention = 27,
-    Clamp           = 28,
-    Embed           = 29,
-    Permute         = 30,
-    Slice           = 31,
-    GroupNorm       = 32,
-    TransposeConv2D = 33,
-    LinearAttention = 34,
-    Norm = 35,
-    MoE     = 36,
+    Clamp           = 27,
+    Embed           = 28,
+    Permute         = 29,
+    Slice           = 30,
+    GroupNorm       = 31,
+    TransposeConv2D = 32,
+    LinearAttention = 33,
+    Norm            = 34,
+    MoE             = 35,
 };
 
 }  // namespace nnops

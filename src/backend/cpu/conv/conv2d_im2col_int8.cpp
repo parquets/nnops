@@ -82,15 +82,6 @@
 
 namespace nnops::backend::cpu {
 
-// Forward-declare the reference kernel for the fallback paths.
-namespace reference {
-void conv2d_int8_ref(const Conv2DAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
 namespace {
 
 namespace k = nnops::kernel;  // pure SIMD kernels: im2col, int8 reductions
@@ -636,14 +627,11 @@ void conv2d_int8_kernel(const Conv2DAttributes& attrs,
     const Conv2DPlan plan = get_conv2d_plan(attrs, descs, outs, ctx.cpu.thread_count(),
                                             ctx.cpu.thread_slot_count() > 0);
 
-    // A zeroed plan is the "unsupported" answer: an unknown dtype combination,
-    // or `add_to`, which only the reference folds (it seeds the accumulator with
-    // the pre-existing output). The reference is the correctness baseline for
-    // every combination the plan accepts, too.
-    if (plan.icn_block <= 0) {
-        reference::conv2d_int8_ref(attrs, output, inputs, ctx, nullptr);
-        return;
-    }
+    // A zeroed plan means an unknown dtype combination, or `add_to`, which the
+    // int8 kernel does not fold into its accumulator.
+    NNOPS_CHECK_MSG(plan.icn_block > 0,
+                    "Conv2D: unsupported dtype combination, or add_to on the "
+                    "quantized route");
 
     PoolPtr scratch(plan.workspace_size);
     void* ws = scratch.get();

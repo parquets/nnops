@@ -1,5 +1,5 @@
-/// @file conv3d_ref.cpp
-/// @brief Naive CPU reference implementation of 3D convolution (NCDHW layout).
+/// @file conv3d.cpp
+/// @brief CPU Conv3D kernel (NCDHW layout).
 ///
 /// This is the correctness baseline. Uses a straightforward 9-level nested loop
 /// with per-sample parallelism via the external parallel_for hook.
@@ -8,9 +8,9 @@
 #include "nnops/core/parallel_for.hpp"
 #include "../simd_kernel/simd_epilogue.hpp"
 
-namespace nnops::backend::cpu::reference {
+namespace nnops::backend::cpu {
 
-void conv3d_ref(const Conv3DAttributes& attrs,
+void conv3d_cpu(const Conv3DAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -112,4 +112,4 @@ void conv3d_ref(const Conv3DAttributes& attrs,
             [&](int64_t n) { compute_sample(n); });
 }
 
-}  // namespace nnops::backend::cpu::reference
+}  // namespace nnops::backend::cpu

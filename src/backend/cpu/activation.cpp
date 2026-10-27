@@ -66,7 +66,7 @@ void activation_quant_impl(const ActivationAttributes& attrs,
                            const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    NNOPS_ASSERT(!attrs.add_to);
+    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
 
     quantized_unary_transform(inputs[0], output, ctx,
         [&](float* scratch, int h, int w) {

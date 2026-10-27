@@ -3,73 +3,15 @@
 
 #include "nnops/ops/permute.hpp"
 #include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
 namespace nnops {
 
-namespace backend::cpu::reference {
-    void permute_ref(const PermuteAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
+NNOPS_DECLARE_CPU(PermuteAttributes, permute_cpu)
 
-namespace backend::cpu {
-    void permute_cpu(const PermuteAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace);
-}
-
-#ifdef NNOPS_HAS_CUDA
-namespace backend::cuda {
-    void permute_cuda(const PermuteAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx,
-                      void* workspace);
-}
-#endif
-
-struct Permute::Impl {
-    using KernelFn = void (*)(const PermuteAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
-    KernelFn kernel_fn = nullptr;
-};
-Permute::~Permute() = default;
-
-namespace {
-auto resolve_permute_kernel(Backend backend) -> Permute::Impl::KernelFn
-{
-    switch (backend) {
-    case Backend::CPU:
-        return backend::cpu::permute_cpu;
-#ifdef NNOPS_HAS_CUDA
-    case Backend::CUDA:
-        return backend::cuda::permute_cuda;
-#endif
-    default:
-        return nullptr;
-    }
-}
-}  // anonymous namespace
-
-std::unique_ptr<Permute> Permute::create(const PermuteAttributes& attrs,
-                                           Backend backend)
-{
-    return std::unique_ptr<Permute>(new Permute(attrs, backend));
-}
-
-Permute::Permute(const PermuteAttributes& attrs, Backend backend)
-    : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
-{
-    impl_->kernel_fn = resolve_permute_kernel(backend);
-}
+NNOPS_OP_BOILERPLATE(Permute, PermuteAttributes,
+        backend::cpu::permute_cpu, nullptr, nullptr)
 
 std::vector<TensorDesc> Permute::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

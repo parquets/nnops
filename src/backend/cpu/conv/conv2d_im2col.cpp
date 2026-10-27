@@ -31,15 +31,6 @@
 
 namespace nnops::backend::cpu {
 
-// Forward-declare the reference kernel for the fallback paths.
-namespace reference {
-void conv2d_ref(const Conv2DAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* workspace);
-}
-
 namespace {
 
 using namespace nnops::simd;
@@ -668,15 +659,7 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
         return;
     }
 
-    // Mismatched dtypes: the f32 reference is the correctness baseline (no
-    // scratch). f16 has no reference, so a dtype mismatch there is a hard error.
-    if (dt == DataType::f32) {
-        reference::conv2d_ref(attrs, output, inputs, ctx, nullptr);
-        return;
-    }
-
-    NNOPS_ASSERT(!"conv2d_im2col_kernel: f16 Conv2D dtype mismatch "
-                   "(f16 input requires an f16 weight and f16 output)");
+    NNOPS_CHECK_MSG(false, "Conv2D: input, weight and output dtypes must match");
 }
 
 }  // namespace nnops::backend::cpu
