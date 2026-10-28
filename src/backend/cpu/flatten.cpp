@@ -89,7 +89,7 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
     }
 }
 
-void flatten_cpu(const FlattenAttributes& attrs,
+Status flatten_cpu(const FlattenAttributes& attrs,
                   TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& /*ctx*/,
@@ -99,6 +99,7 @@ void flatten_cpu(const FlattenAttributes& attrs,
         using T = typename decltype(tag)::type;
         flatten_impl<T>(attrs, output, inputs);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

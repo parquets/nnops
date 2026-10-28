@@ -288,7 +288,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
     }
 }
 
-void quantize_linear_cpu(const QuantLinearAttributes& attrs,
+Status quantize_linear_cpu(const QuantLinearAttributes& attrs,
                          TensorView& output,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
@@ -298,9 +298,10 @@ void quantize_linear_cpu(const QuantLinearAttributes& attrs,
         using T = typename decltype(tag)::type;
         quantize_linear_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
-void dequantize_linear_cpu(const QuantLinearAttributes& attrs,
+Status dequantize_linear_cpu(const QuantLinearAttributes& attrs,
                            TensorView& output,
                            std::span<const TensorView> inputs,
                            const ComputeContext& ctx,
@@ -310,6 +311,7 @@ void dequantize_linear_cpu(const QuantLinearAttributes& attrs,
         using T = typename decltype(tag)::type;
         dequantize_linear_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

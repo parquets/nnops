@@ -6,6 +6,8 @@
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/op_type.hpp"
+#include "nnops/core/status.hpp"
+#include "nnops/detail/small_vector.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +58,21 @@ public:
         return 0;
     }
 
+    /// Check the call against the operator's contract, from descriptors only —
+    /// no data is read, nothing is written. Graph engines run this over every
+    /// node before allocating buffers, so a malformed graph fails at plan time
+    /// instead of halfway through execution.
+    ///
+    /// compute() runs the same check first, so the rules live in one place.
+    /// Default: ok (nothing to check beyond the tensor count).
+    virtual Status validate(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const
+    {
+        (void)inputs;
+        (void)outputs;
+        return Status::ok;
+    }
+
     /// Execute the operator (primary virtual — multi-output).
     ///
     /// @param outputs   Pre-allocated output tensors. User manages memory.
@@ -65,20 +82,22 @@ public:
     /// @param ctx       Backend-specific execution context (stream, thread pool, etc.)
     /// @param workspace Optional pre-allocated scratch buffer of at least
     ///                  getWorkspaceSize() bytes. May be nullptr if size == 0.
-    virtual void compute(std::span<TensorView> outputs,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx = {},
-                         void* workspace = nullptr) = 0;
+    /// @return          ok, or the first failed contract check. Nothing is
+    ///                  written to the outputs on error.
+    virtual Status compute(std::span<TensorView> outputs,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx = {},
+                           void* workspace = nullptr) = 0;
 
     /// Convenience overload for single-output operators.
     /// Calls the span-based virtual above — no override needed in subclasses.
-    void compute(TensorView& output,
-                 std::span<const TensorView> inputs,
-                 const ComputeContext& ctx = {},
-                 void* workspace = nullptr)
+    Status compute(TensorView& output,
+                   std::span<const TensorView> inputs,
+                   const ComputeContext& ctx = {},
+                   void* workspace = nullptr)
     {
         TensorView outputs[] = {output};
-        compute(std::span<TensorView>(outputs), inputs, ctx, workspace);
+        return compute(std::span<TensorView>(outputs), inputs, ctx, workspace);
     }
 
     /// Prepack weights into an optimized format for the target backend.
@@ -122,6 +141,33 @@ public:
 
     /// Returns the backend this operator was created for.
     virtual Backend getBackend() const = 0;
+
+protected:
+    /// Build descriptors from the call's views (inline storage, no heap) and
+    /// run validate(). Implementations call this first in compute().
+    Status validate_views(std::span<TensorView> outputs,
+                          std::span<const TensorView> inputs) const
+    {
+        // Inline for every operator's fixed arity (MoE, at nine, is the widest).
+        constexpr size_t kInline = 16;
+        if (inputs.size() <= kInline && outputs.size() <= kInline) {
+            detail::SmallVector<TensorDesc, kInline> in_d;
+            detail::SmallVector<TensorDesc, kInline> out_d;
+            for (const auto& v : inputs) { in_d.push_back(v.desc()); }
+            for (const auto& v : outputs) { out_d.push_back(v.desc()); }
+            return validate(std::span<const TensorDesc>(in_d.data(), in_d.size()),
+                            std::span<const TensorDesc>(out_d.data(), out_d.size()));
+        }
+        // Wider than inline (a very wide Concat): pay one allocation rather
+        // than reject a legal call.
+        std::vector<TensorDesc> in_d;
+        std::vector<TensorDesc> out_d;
+        in_d.reserve(inputs.size());
+        out_d.reserve(outputs.size());
+        for (const auto& v : inputs) { in_d.push_back(v.desc()); }
+        for (const auto& v : outputs) { out_d.push_back(v.desc()); }
+        return validate(in_d, out_d);
+    }
 };
 
 }  // namespace nnops

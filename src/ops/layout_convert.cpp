@@ -10,16 +10,16 @@
 namespace nnops {
 
 namespace {
-    void layout_convert_cpu(TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const LayoutConvertAttributes& attrs,
-                            const ComputeContext& ctx)
+    Status layout_convert_cpu(TensorView& output,
+                              std::span<const TensorView> inputs,
+                              const LayoutConvertAttributes& attrs,
+                              const ComputeContext& ctx)
     {
         auto& input = inputs[0];
         TensorLayout src_layout = input.layout();
         TensorLayout dst_layout = output.layout();
 
-        NNOPS_ASSERT(src_layout != dst_layout);
+        if (src_layout == dst_layout) { return Status::invalid_argument; }
 
         // 2D: NCHW ↔ NCHWC8
         if (src_layout == TensorLayout::NCHW && dst_layout == TensorLayout::NCHWC8) {
@@ -34,16 +34,17 @@ namespace {
             unpack_ncdhwc8_to_ncdhw(input, output, ctx);
         }
         else {
-            NNOPS_ASSERT(!"layout_convert_cpu: unsupported layout pair");
+            return Status::unsupported;
         }
+        return Status::ok;
     }
 }  // anonymous namespace
 
 struct LayoutConvert::Impl {
-    using KernelFn = void (*)(TensorView&,
-                               std::span<const TensorView>,
-                               const LayoutConvertAttributes&,
-                               const ComputeContext&);
+    using KernelFn = Status (*)(TensorView&,
+                                std::span<const TensorView>,
+                                const LayoutConvertAttributes&,
+                                const ComputeContext&);
     KernelFn kernel_fn = nullptr;
 };
 LayoutConvert::~LayoutConvert() = default;
@@ -81,19 +82,24 @@ std::vector<TensorDesc> LayoutConvert::getOutputTensorDesc(
     return {layout_convert_output_shape(inputs, attrs_.target_layout)};
 }
 
-void LayoutConvert::compute(std::span<TensorView> outputs,
-                             std::span<const TensorView> inputs,
-                             const ComputeContext& ctx,
-                             void* workspace)
+Status LayoutConvert::validate(std::span<const TensorDesc> inputs,
+                               std::span<const TensorDesc> outputs) const
+{
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    // Converting a layout to itself is a caller mistake, not a no-op.
+    return detail::require(inputs[0].layout != outputs[0].layout);
+}
+
+Status LayoutConvert::compute(std::span<TensorView> outputs,
+                              std::span<const TensorView> inputs,
+                              const ComputeContext& ctx,
+                              void* workspace)
 {
     (void) workspace;
-    NNOPS_ASSERT(inputs.size() == 1);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-
-    impl_->kernel_fn(output, inputs, attrs_, ctx);
+    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(outputs[0], inputs, attrs_, ctx);
 }
 
 }  // namespace nnops

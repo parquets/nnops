@@ -126,7 +126,7 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
 /// Falls back to the reference kernel for f32 when the dtypes do not match (the
 /// reference is f32-only). Scratch is pooled internally (sized by
 /// get_conv2d_plan); @p workspace is vestigial.
-void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
+Status conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
@@ -143,7 +143,7 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
 /// same route as a pre-quantized one — including pointwise. `add_to` and every
 /// unsupported combination go to the reference. Called from
 /// conv2d_im2col_kernel when the weight is s8.
-void conv2d_int8_kernel(const Conv2DAttributes& attrs,
+Status conv2d_int8_kernel(const Conv2DAttributes& attrs,
                         TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,

@@ -285,7 +285,7 @@ void layer_norm_cuda_impl(
 // Entry point
 // ============================================================
 
-void layer_norm_cuda(
+Status layer_norm_cuda(
     const LayerNormAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -296,13 +296,14 @@ void layer_norm_cuda(
     switch (dtype) {
     case DataType::f32:
         layer_norm_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         layer_norm_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"layer_norm_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

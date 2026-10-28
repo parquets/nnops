@@ -39,7 +39,7 @@ void clamp_impl(const ClampAttributes& attrs,
         });
 }
 
-void clamp_cpu(const ClampAttributes& attrs,
+Status clamp_cpu(const ClampAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
@@ -49,6 +49,7 @@ void clamp_cpu(const ClampAttributes& attrs,
         using T = typename decltype(tag)::type;
         clamp_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

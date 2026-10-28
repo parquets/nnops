@@ -124,7 +124,7 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
 /// inputs[1] must be the prepacked U produced by Conv2D::prepackWeights. Scratch
 /// is pooled internally (sized by get_conv2d_winograd_plan); @p workspace is
 /// vestigial.
-void conv2d_winograd_kernel(const Conv2DAttributes& attrs,
+Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                             TensorView& output,
                             std::span<const TensorView> inputs,
                             const ComputeContext& ctx,

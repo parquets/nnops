@@ -10,7 +10,7 @@
 
 namespace nnops::backend::cpu {
 
-void cumsum_cpu(const CumSumAttributes& attrs,
+Status cumsum_cpu(const CumSumAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -104,6 +104,7 @@ void cumsum_cpu(const CumSumAttributes& attrs,
 
         ctx.cpu.run(0, upper_dim_count, process_slice);
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

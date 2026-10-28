@@ -314,25 +314,25 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 // and planar (pack == 1) layouts are supported — packed channel layouts with
 // quantized input are not defined.
 
-void softmax_quant_input_impl(const SoftmaxAttributes& attrs,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx,
-                              void* workspace)
+Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
+                                TensorView& output,
+                                std::span<const TensorView> inputs,
+                                const ComputeContext& ctx,
+                                void* workspace)
 {
     const auto& X = inputs[0];
     const int64_t numel = X.numel();
     const int64_t rank = X.rank();
-    NNOPS_ASSERT(rank >= 1);
+    NNOPS_ASSERT(rank >= 1);   // Softmax::validate
 
     const DataType in_dtype  = X.data_type();             // s8 or u8
     const DataType out_dtype = output.data_type();        // f32 or f16
     NNOPS_ASSERT(is_quantized_dtype(in_dtype));
     NNOPS_ASSERT(out_dtype == DataType::f32 || out_dtype == DataType::f16);
 
-    // Quantized softmax is only defined over planar layouts.
+    // Quantized softmax is only defined over planar layouts (Softmax::validate).
     NNOPS_ASSERT(X.channel_pack_size() == 1);
-    NNOPS_ASSERT(workspace != nullptr);
+    if (workspace == nullptr) { return Status::out_of_memory; }
 
     const QuantParams& qp = X.quant_params();
     const bool per_token = qp.granularity == QuantGranularity::PerToken
@@ -393,13 +393,14 @@ void softmax_quant_input_impl(const SoftmaxAttributes& attrs,
             s_store(&out[i], y_f32[i]);
         }
     }
+    return Status::ok;
 }
 
 // ============================================================
 // Entry point with dtype dispatch
 // ============================================================
 
-void softmax_cpu(const SoftmaxAttributes& attrs,
+Status softmax_cpu(const SoftmaxAttributes& attrs,
                   TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
@@ -424,13 +425,14 @@ void softmax_cpu(const SoftmaxAttributes& attrs,
         }
         PoolPtr scratch(ws);
 
-        softmax_quant_input_impl(attrs, output, inputs, ctx, scratch.get());
-        return;
+        return softmax_quant_input_impl(attrs, output, inputs, ctx,
+                                        scratch.get());
     }
     dispatch_f32_f16(dtype, "softmax_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
         softmax_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

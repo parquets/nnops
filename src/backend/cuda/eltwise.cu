@@ -823,7 +823,7 @@ void eltwise_cuda_impl(
 // Entry point
 // ============================================================
 
-void eltwise_cuda(
+Status eltwise_cuda(
     const EltwiseAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -834,13 +834,14 @@ void eltwise_cuda(
     switch (dtype) {
     case DataType::f32:
         eltwise_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         eltwise_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"eltwise_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

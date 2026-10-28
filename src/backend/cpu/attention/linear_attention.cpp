@@ -307,18 +307,18 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
 
 }  // anonymous namespace
 
-void linear_attention_cpu(const LinearAttentionAttributes& attrs,
+Status linear_attention_cpu(const LinearAttentionAttributes& attrs,
                           std::span<TensorView> outputs,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
                           void* workspace)
 {
     switch (inputs[0].data_type()) {
-    case DataType::f32: linear_attention_impl<float>(attrs, outputs, inputs, ctx); return;
-    case DataType::f16: linear_attention_impl<half>(attrs, outputs, inputs, ctx);  return;
+    case DataType::f32: linear_attention_impl<float>(attrs, outputs, inputs, ctx); return Status::ok;
+    case DataType::f16: linear_attention_impl<half>(attrs, outputs, inputs, ctx);  return Status::ok;
     default: break;
     }
-    NNOPS_CHECK_MSG(false, "LinearAttention: only f32 and f16 inputs are supported");
+    return Status::unsupported;
 }
 
 }  // namespace nnops::backend::cpu

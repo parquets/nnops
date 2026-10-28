@@ -138,6 +138,9 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    Status validate(std::span<const TensorDesc> inputs,
+                    std::span<const TensorDesc> outputs) const override;
+
     /// Always 0: the CPU tiled im2col + GEMM kernel pools its scratch
     /// internally.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
@@ -151,7 +154,7 @@ public:
     /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
-    void compute(std::span<TensorView> outputs,
+    Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

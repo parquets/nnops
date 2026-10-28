@@ -363,7 +363,7 @@ void reduce_impl(const ReduceAttributes& attrs,
                               num_outer, reduce_size, num_inner, ctx);
 }
 
-void reduce_cpu(const ReduceAttributes& attrs,
+Status reduce_cpu(const ReduceAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -373,6 +373,7 @@ void reduce_cpu(const ReduceAttributes& attrs,
         using T = typename decltype(tag)::type;
         reduce_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

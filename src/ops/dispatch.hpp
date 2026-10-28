@@ -17,8 +17,10 @@
 
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
+#include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/validate.hpp"
 
 #if defined(NNOPS_HAS_CUDA)
 #define NNOPS_IF_CUDA(x) x
@@ -37,16 +39,16 @@
      const ComputeContext&, void*)
 
 #define NNOPS_DECLARE_CPU(Attrs, fn)                                   \
-    namespace backend::cpu { void fn NNOPS_KERNEL_ARGS(Attrs); }
+    namespace backend::cpu { Status fn NNOPS_KERNEL_ARGS(Attrs); }
 #define NNOPS_DECLARE_CUDA(Attrs, fn)                                  \
-    namespace backend::cuda { void fn NNOPS_KERNEL_ARGS(Attrs); }
+    namespace backend::cuda { Status fn NNOPS_KERNEL_ARGS(Attrs); }
 #define NNOPS_DECLARE_VULKAN(Attrs, fn)                                \
-    namespace backend::vulkan { void fn NNOPS_KERNEL_ARGS(Attrs); }
+    namespace backend::vulkan { Status fn NNOPS_KERNEL_ARGS(Attrs); }
 
 /// The op's Impl (one function pointer) and its out-of-line destructor.
 #define NNOPS_KERNEL_IMPL(Op, Attrs)                                   \
     struct Op::Impl {                                                  \
-        using KernelFn = void (*) NNOPS_KERNEL_ARGS(Attrs);            \
+        using KernelFn = Status (*) NNOPS_KERNEL_ARGS(Attrs);          \
         KernelFn kernel_fn = nullptr;                                  \
     };                                                                 \
     Op::~Op() = default;
@@ -75,10 +77,8 @@
      (be) == Backend::CUDA   ? static_cast<Fn>(cuda)   :               \
      (be) == Backend::Vulkan ? static_cast<Fn>(vulkan) : nullptr)
 
-/// Resolve one backend's kernel, failing loudly when the backend has none.
+/// Resolve one backend's kernel. A backend with no kernel resolves to nullptr:
+/// the op is still constructible, and compute() reports Status::unsupported
+/// instead of aborting the host process at create() time.
 #define NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan)                   \
-    [] (Backend b) -> Fn {                                             \
-        const Fn fn = NNOPS_PICK_KERNEL(Fn, b, cpu, cuda, vulkan);     \
-        NNOPS_CHECK_MSG(fn != nullptr, #Op ": backend has no kernel"); \
-        return fn;                                                     \
-    }(be)
+    NNOPS_PICK_KERNEL(Fn, be, cpu, cuda, vulkan)

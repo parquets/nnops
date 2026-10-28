@@ -708,77 +708,91 @@ void norm_quant_rows(const NormAttributes& attrs,
 }
 
 /// Dispatch the quantized path on the norm type (LayerNorm / RMSNorm / L2Norm).
-void norm_quant_dispatch(const NormAttributes& attrs,
-                         TensorView& output,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         bool has_bias)
+/// BatchNorm has no dequantize-compute-requantize form.
+Status norm_quant_dispatch(const NormAttributes& attrs,
+                           TensorView& output,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx,
+                           bool has_bias)
 {
     switch (attrs.type) {
     case NormType::LayerNorm:
         norm_quant_rows<true, true>(attrs, output, inputs, ctx, has_bias);
-        return;
+        return Status::ok;
     case NormType::RMSNorm:
         norm_quant_rows<false, true>(attrs, output, inputs, ctx, false);
-        return;
+        return Status::ok;
     case NormType::L2Norm:
         norm_quant_rows<false, false>(attrs, output, inputs, ctx, false);
-        return;
+        return Status::ok;
     default:
-        break;
+        return Status::unsupported;
     }
-    NNOPS_ASSERT(!"norm_cpu: quantized input is only supported for LayerNorm/RMSNorm/L2Norm");
 }
 
 /// Validate a quantized-input call and dispatch it.
-void norm_quant_impl(const NormAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx)
+Status norm_quant_impl(const NormAttributes& attrs,
+                        TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx)
 {
     const auto& X = inputs[0];
 
     // add_to would require dequantizing, accumulating and requantizing the
     // pre-existing output — not supported on this path.
-    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
+    if (attrs.add_to) { return Status::unsupported; }
 
-    NNOPS_ASSERT(X.is_quantized());
-    NNOPS_ASSERT(X.channel_pack_size() == 1);  // planar layouts only
+    // The quant parameters live on the view, so validate() cannot see them:
+    // they are checked here, before anything is dereferenced.
+    if (!X.is_quantized()) { return Status::invalid_argument; }
+    if (X.channel_pack_size() != 1) { return Status::unsupported; }
 
     const auto& x_qp = X.quant_params();
-    NNOPS_ASSERT(x_qp.granularity == QuantGranularity::PerTensor
-              || x_qp.granularity == QuantGranularity::PerToken);
+    if (x_qp.granularity != QuantGranularity::PerTensor &&
+        x_qp.granularity != QuantGranularity::PerToken) {
+        return Status::unsupported;
+    }
 
     const auto dims = compute_norm_dims(X, attrs.axis);
-    NNOPS_ASSERT_MSG(dims.is_contiguous_tail,
-                     "norm_cpu: quantized input requires axis == rank-1");
-    if (x_qp.granularity == QuantGranularity::PerToken) {
-        NNOPS_ASSERT(x_qp.scale_data != nullptr);
-        NNOPS_ASSERT(x_qp.num_scales >= dims.num_rows);
+    if (!dims.is_contiguous_tail) {
+        // The per-row dequantization walks the row as one contiguous run.
+        return Status::unsupported;
+    }
+    if (x_qp.granularity == QuantGranularity::PerToken &&
+        (x_qp.scale_data == nullptr || x_qp.num_scales < dims.num_rows)) {
+        return Status::invalid_argument;
     }
 
     const DataType y_dtype = output.data_type();
-    NNOPS_ASSERT(y_dtype == DataType::f32 || y_dtype == DataType::f16
-              || is_quantized_dtype(y_dtype));
+    if (y_dtype != DataType::f32 && y_dtype != DataType::f16 &&
+        !is_quantized_dtype(y_dtype)) {
+        return Status::unsupported;
+    }
     if (is_quantized_dtype(y_dtype)) {
-        NNOPS_ASSERT(output.is_quantized());
+        if (!output.is_quantized()) { return Status::invalid_argument; }
         const auto& y_qp = output.quant_params();
-        NNOPS_ASSERT(y_qp.granularity == QuantGranularity::PerTensor
-                  || y_qp.granularity == QuantGranularity::PerToken);
-        if (y_qp.granularity == QuantGranularity::PerToken) {
-            NNOPS_ASSERT(y_qp.scale_data != nullptr);
-            NNOPS_ASSERT(y_qp.num_scales >= dims.num_rows);
+        if (y_qp.granularity != QuantGranularity::PerTensor &&
+            y_qp.granularity != QuantGranularity::PerToken) {
+            return Status::unsupported;
+        }
+        if (y_qp.granularity == QuantGranularity::PerToken &&
+            (y_qp.scale_data == nullptr || y_qp.num_scales < dims.num_rows)) {
+            return Status::invalid_argument;
         }
     }
 
     // scale (LayerNorm / RMSNorm) and bias stay f32 on this path; L2Norm has
     // neither, so inputs[1] may not exist.
-    if (inputs.size() >= 2) { NNOPS_ASSERT(inputs[1].data_type() == DataType::f32); }
+    if (inputs.size() >= 2 && inputs[1].data_type() != DataType::f32) {
+        return Status::invalid_argument;
+    }
     const bool has_bias = (inputs.size() >= 3 && !inputs[2].is_empty());
-    if (has_bias) { NNOPS_ASSERT(inputs[2].data_type() == DataType::f32); }
+    if (has_bias && inputs[2].data_type() != DataType::f32) {
+        return Status::invalid_argument;
+    }
 
     // The compute type is always f32; the output dtype only picks the store.
-    norm_quant_dispatch(attrs, output, inputs, ctx, has_bias);
+    return norm_quant_dispatch(attrs, output, inputs, ctx, has_bias);
 }
 
 }  // anonymous namespace
@@ -813,7 +827,7 @@ void norm_impl(const NormAttributes& attrs,
     NNOPS_ASSERT(!"norm_cpu: unknown norm type");
 }
 
-void norm_cpu(const NormAttributes& attrs,
+Status norm_cpu(const NormAttributes& attrs,
               TensorView& output,
               std::span<const TensorView> inputs,
               const ComputeContext& ctx,
@@ -824,14 +838,14 @@ void norm_cpu(const NormAttributes& attrs,
     // s8/u8 input: dequantize per row and run the float norm kernels on it.
     // Scratch is pooled internally, so getWorkspaceSize stays 0.
     if (is_quantized_dtype(x_dtype)) {
-        norm_quant_impl(attrs, output, inputs, ctx);
-        return;
+        return norm_quant_impl(attrs, output, inputs, ctx);
     }
 
     dispatch_f32_f16(x_dtype, "norm_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
         norm_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

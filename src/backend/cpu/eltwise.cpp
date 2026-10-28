@@ -58,21 +58,22 @@ void eltwise_impl(const EltwiseAttributes& attrs,
         });
 }
 
-void eltwise_quant_impl(const EltwiseAttributes& attrs,
-                        TensorView& output,
-                        std::span<const TensorView> inputs,
-                        const ComputeContext& ctx)
+Status eltwise_quant_impl(const EltwiseAttributes& attrs,
+                           TensorView& output,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
+    if (attrs.add_to) { return Status::unsupported; }
 
     quantized_binary_transform(inputs[0], inputs[1], output, ctx,
         [&](float* a, float* b, int h, int w) {
             apply_eltwise_flt<float>(attrs.type, a, b, a, h, w, w, w, w, false);
         });
+    return Status::ok;
 }
 
-void eltwise_cpu(const EltwiseAttributes& attrs,
+Status eltwise_cpu(const EltwiseAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,
@@ -87,13 +88,13 @@ void eltwise_cpu(const EltwiseAttributes& attrs,
             using T = typename decltype(tag)::type;
             eltwise_impl<T>(attrs, output, inputs, ctx);
         });
-        return;
+        return Status::ok;
     }
 
     // Quantized path: both inputs and the output must be s8/u8 (no float↔int mixing).
     NNOPS_ASSERT(in_is_int && out_is_int);
 
-    eltwise_quant_impl(attrs, output, inputs, ctx);
+    return eltwise_quant_impl(attrs, output, inputs, ctx);
 }
 
 }  // namespace nnops::backend::cpu

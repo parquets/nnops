@@ -65,12 +65,15 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    Status validate(std::span<const TensorDesc> inputs,
+                    std::span<const TensorDesc> outputs) const override;
+
     /// inputs[0] = input tensor (NCDHW)
     /// inputs[1] = weight tensor [OC, IC/G, KD, KH, KW] — ONNX-style, also when grouped
     /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
-    void compute(std::span<TensorView> outputs,
+    Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

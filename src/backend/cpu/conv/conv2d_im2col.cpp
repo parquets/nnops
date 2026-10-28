@@ -618,7 +618,7 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
 //  Public API
 // =========================================================================
 
-void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
+Status conv2d_im2col_kernel(const Conv2DAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
@@ -628,7 +628,7 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
     // activation dtype is; it owns its own fallbacks.
     if (is_quantized_conv2d(inputs[1].data_type())) {
         conv2d_int8_kernel(attrs, output, inputs, ctx, workspace);
-        return;
+        return Status::ok;
     }
 
     const DataType dt = inputs[0].data_type();
@@ -656,10 +656,11 @@ void conv2d_im2col_kernel(const Conv2DAttributes& attrs,
         } else {
             conv2d_im2col_impl<half>(attrs, output, inputs, ctx, plan, scratch.as<half>());
         }
-        return;
+        return Status::ok;
     }
 
-    NNOPS_CHECK_MSG(false, "Conv2D: input, weight and output dtypes must match");
+    // Input, weight and output dtypes must match; a mismatch has no kernel.
+    return Status::unsupported;
 }
 
 }  // namespace nnops::backend::cpu

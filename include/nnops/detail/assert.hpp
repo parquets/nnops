@@ -2,20 +2,28 @@
 /// @file assert.hpp
 /// @brief Minimal assertion utility for nnops.
 ///
+/// These are for *internal invariants* — a state the library's own code
+/// established and then relies on. Anything a caller can get wrong is reported
+/// with a returned Status instead (see nnops/core/status.hpp and
+/// nnops/detail/validate.hpp): an assert is compiled out under NDEBUG, which
+/// would turn a malformed call into an out-of-bounds access, and an abort takes
+/// the host process down with it.
+///
 /// Two levels, both compiled out under NDEBUG:
-///   - NNOPS_ASSERT(_MSG) aborts. For contract violations.
+///   - NNOPS_ASSERT(_MSG) aborts. For internal invariants.
 ///   - NNOPS_WARN_MSG     only prints. For configurations that are legal but
 ///                        usually a mistake — an abort there would be wrong.
 ///
-/// NNOPS_CHECK_MSG is the NDEBUG-proof subset: use it where continuing would
-/// corrupt memory or silently produce wrong output (an unsupported dtype on a
-/// path that has no fallback, a missing backend kernel).
+/// NNOPS_CHECK_MSG is the NDEBUG-proof form of NNOPS_ASSERT: it stays live in
+/// release builds. Nothing in src/ uses it any more — the caller-facing checks
+/// it used to guard now return Status — so reserve it for an invariant whose
+/// violation in release would corrupt memory and cannot be reported.
 
 #include <cstdio>
 #include <cstdlib>
 
-// Always-on contract check — for preconditions whose violation would read or
-// write the wrong memory rather than merely be a caller bug.
+// Always-on internal-invariant check — for a state whose violation would read
+// or write the wrong memory in release, where NNOPS_ASSERT no longer exists.
 #define NNOPS_CHECK_MSG(cond, msg)                                       \
   do {                                                                   \
     if (!(cond)) {                                                       \

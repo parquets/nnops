@@ -373,7 +373,7 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
 //  Public API
 // =========================================================================
 
-void conv2d_winograd_kernel(const Conv2DAttributes& attrs,
+Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                             TensorView& output,
                             std::span<const TensorView> inputs,
                             const ComputeContext& ctx,
@@ -413,6 +413,7 @@ void conv2d_winograd_kernel(const Conv2DAttributes& attrs,
     } else {
         conv2d_winograd_impl<half>(attrs, output, inputs, ctx, plan, scratch.as<half>());
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

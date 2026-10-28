@@ -108,7 +108,7 @@ void slice_impl(const SliceAttributes& attrs,
 
 }  // anonymous namespace
 
-void slice_cpu(const SliceAttributes& attrs,
+Status slice_cpu(const SliceAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -118,6 +118,7 @@ void slice_cpu(const SliceAttributes& attrs,
         using T = typename decltype(tag)::type;
         slice_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

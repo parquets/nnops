@@ -57,6 +57,9 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    Status validate(std::span<const TensorDesc> inputs,
+                    std::span<const TensorDesc> outputs) const override;
+
     /// Workspace (bytes) required by Embed. Always 0: int8/uint8 weight is
     /// dequantized directly into the f32 or f16 output (f16 via a fused
     /// half-output kernel), so no staging buffer is needed.
@@ -65,7 +68,7 @@ public:
 
     using OpBase::compute;
 
-    void compute(std::span<TensorView> outputs,
+    Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

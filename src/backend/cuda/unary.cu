@@ -244,7 +244,7 @@ void unary_cuda_impl(
 // Entry point
 // ============================================================
 
-void unary_cuda(
+Status unary_cuda(
     const UnaryAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -255,13 +255,14 @@ void unary_cuda(
     switch (dtype) {
     case DataType::f32:
         unary_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         unary_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"unary_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

@@ -79,7 +79,7 @@ void residual_add(TensorView& out, const TensorView& src, const ComputeContext& 
 
 }  // anonymous namespace
 
-void linear_cpu(const LinearAttributes& attrs,
+Status linear_cpu(const LinearAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -163,10 +163,11 @@ void linear_cpu(const LinearAttributes& attrs,
         } else {
             residual_add<half>(ov, mt, ctx);
         }
-        return;
+        return Status::ok;
     }
 
     matmul_cpu(ma, ov, min, ctx, workspace);
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

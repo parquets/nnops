@@ -316,7 +316,7 @@ void softmax_cuda_impl(
 // Entry point (dtype dispatch)
 // ============================================================
 
-void softmax_cuda(
+Status softmax_cuda(
     const SoftmaxAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -327,13 +327,14 @@ void softmax_cuda(
     switch (dtype) {
     case DataType::f32:
         softmax_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         softmax_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"softmax_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

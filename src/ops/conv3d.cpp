@@ -21,19 +21,23 @@ std::vector<TensorDesc> Conv3D::getOutputTensorDesc(
         static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs)};
 }
 
-void Conv3D::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status Conv3D::validate(std::span<const TensorDesc> inputs,
+                        std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 2);
-    NNOPS_ASSERT(inputs.size() <= 3);  // input, weight [, bias]
-    NNOPS_ASSERT(outputs.size() == 1);
+    // input, weight [, bias]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+}
+
+Status Conv3D::compute(std::span<TensorView> outputs,
+                       std::span<const TensorView> inputs,
+                       const ComputeContext& ctx,
+                       void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
     auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[1].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
     // auto_pad lives in the descriptor; kernels only see explicit leading padding.
     Conv3DAttributes attrs = attrs_;
@@ -48,7 +52,8 @@ void Conv3D::compute(std::span<TensorView> outputs,
         attrs.auto_pad = Conv3DAttributes::AutoPad::NOTSET;
     }
 
-    impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
 }
 
 }  // namespace nnops

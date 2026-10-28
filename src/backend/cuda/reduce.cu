@@ -238,7 +238,7 @@ void reduce_cuda_impl(
 // Entry point
 // ============================================================
 
-void reduce_cuda(const ReduceAttributes& attrs,
+Status reduce_cuda(const ReduceAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
@@ -250,14 +250,14 @@ void reduce_cuda(const ReduceAttributes& attrs,
     switch (input.data_type()) {
     case DataType::f32:
         reduce_cuda_impl<float>(attrs, output, input, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         reduce_cuda_impl<__half>(attrs, output, input, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(false && "Reduce CUDA: unsupported data type");
-        break;
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

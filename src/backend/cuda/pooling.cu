@@ -211,7 +211,7 @@ void pooling_cuda_impl(
 // Entry point
 // ============================================================
 
-void pooling_cuda(
+Status pooling_cuda(
     const PoolingAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -222,13 +222,14 @@ void pooling_cuda(
     switch (dtype) {
     case DataType::f32:
         pooling_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         pooling_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"pooling_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

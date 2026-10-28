@@ -23,7 +23,7 @@ namespace nnops::backend::cpu {
 ///
 /// s8×s8 has its own fused int8 path; every other dtype with no fused path
 /// falls back to the reference kernel.
-void matmul_cpu(const MatMulAttributes& attrs,
+Status matmul_cpu(const MatMulAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,

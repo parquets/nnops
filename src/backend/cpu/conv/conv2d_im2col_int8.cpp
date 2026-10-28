@@ -613,7 +613,7 @@ void conv2d_int8_out(const Conv2DAttributes& attrs,
 
 }  // anonymous namespace
 
-void conv2d_int8_kernel(const Conv2DAttributes& attrs,
+Status conv2d_int8_kernel(const Conv2DAttributes& attrs,
                         TensorView& output,
                         std::span<const TensorView> inputs,
                         const ComputeContext& ctx,
@@ -629,9 +629,7 @@ void conv2d_int8_kernel(const Conv2DAttributes& attrs,
 
     // A zeroed plan means an unknown dtype combination, or `add_to`, which the
     // int8 kernel does not fold into its accumulator.
-    NNOPS_CHECK_MSG(plan.icn_block > 0,
-                    "Conv2D: unsupported dtype combination, or add_to on the "
-                    "quantized route");
+    if (plan.icn_block <= 0) { return Status::unsupported; }
 
     PoolPtr scratch(plan.workspace_size);
     void* ws = scratch.get();
@@ -640,11 +638,13 @@ void conv2d_int8_kernel(const Conv2DAttributes& attrs,
     case DataType::f32: conv2d_int8_out<float>(attrs, output, inputs, ctx, plan, ws); break;
     case DataType::f16: conv2d_int8_out<half>(attrs, output, inputs, ctx, plan, ws); break;
     case DataType::u8:  conv2d_int8_out<uint8_t>(attrs, output, inputs, ctx, plan, ws); break;
-    default:
-        NNOPS_ASSERT(inputs[0].data_type() == DataType::s8);
+    case DataType::s8:
         conv2d_int8_out<int8_t>(attrs, output, inputs, ctx, plan, ws);
         break;
+    default:
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

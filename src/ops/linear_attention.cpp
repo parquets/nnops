@@ -8,7 +8,7 @@
 namespace nnops {
 
 namespace backend::cpu {
-    void linear_attention_cpu(const LinearAttentionAttributes& attrs,
+    Status linear_attention_cpu(const LinearAttentionAttributes& attrs,
                               std::span<TensorView> outputs,
                               std::span<const TensorView> inputs,
                               const ComputeContext& ctx,
@@ -17,7 +17,7 @@ namespace backend::cpu {
 
 #ifdef NNOPS_HAS_CUDA
 namespace backend::cuda {
-    void linear_attention_cuda(const LinearAttentionAttributes& attrs,
+    Status linear_attention_cuda(const LinearAttentionAttributes& attrs,
                                std::span<TensorView> outputs,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,
@@ -28,7 +28,7 @@ namespace backend::cuda {
 struct LinearAttention::Impl {
     // `outputs` is a span, not a single view: the operator's recurrent State
     // lives in outputs[1], and it has to reach the kernel.
-    using KernelFn = void (*)(const LinearAttentionAttributes&,
+    using KernelFn = Status (*)(const LinearAttentionAttributes&,
                               std::span<TensorView>,
                               std::span<const TensorView>,
                               const ComputeContext&,
@@ -88,66 +88,85 @@ std::vector<TensorDesc> LinearAttention::getOutputTensorDesc(
     return {out_desc, state_desc};
 }
 
-void LinearAttention::compute(std::span<TensorView> outputs,
-                               std::span<const TensorView> inputs,
-                               const ComputeContext& ctx,
-                               void* workspace)
+Status LinearAttention::validate(std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 4 && inputs.size() <= 6);
-    NNOPS_ASSERT(outputs.size() == 2);
+    // Q, K, V, Gate [, conv_weights [, beta]]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 4, 6, 2));
 
-    NNOPS_ASSERT(!inputs[0].is_empty());   // Q
-    NNOPS_ASSERT(!inputs[1].is_empty());   // K
-    NNOPS_ASSERT(!inputs[2].is_empty());   // V
-    NNOPS_ASSERT(!inputs[3].is_empty());   // Gate
-    NNOPS_ASSERT(!outputs[0].is_empty());  // Output
-    NNOPS_ASSERT(!outputs[1].is_empty());  // State
+    const DataType dt = inputs[0].dtype;
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(dt)) {
+        return Status::unsupported;
+    }
+    for (size_t i = 1; i < 4; ++i) {
+        if (inputs[i].dtype != dt) { return Status::invalid_argument; }
+    }
+    if (outputs[0].dtype != dt || outputs[1].dtype != dt) {
+        return Status::invalid_argument;
+    }
 
-    // Structural validation, mirroring the kernel's own derivation. This guards
-    // the *contract* — it catches a mis-wired graph in debug builds, it does not
-    // validate data. Remember NNOPS_ASSERT compiles away under NDEBUG.
-    const DataType dt = inputs[0].data_type();
-    NNOPS_ASSERT(dt == DataType::f32 || dt == DataType::f16);
-    NNOPS_ASSERT(inputs[1].data_type() == dt && inputs[2].data_type() == dt &&
-                 inputs[3].data_type() == dt && outputs[0].data_type() == dt &&
-                 outputs[1].data_type() == dt);
-
-    NNOPS_ASSERT(inputs[0].rank() == 4);
-    const int64_t B    = inputs[0].shape(0);
-    const int64_t H    = inputs[0].shape(1);
-    const int64_t S    = inputs[0].shape(2);
-    const int64_t D    = inputs[0].shape(3);
-    const int64_t H_kv = attrs_.num_kv_heads > 0 ? attrs_.num_kv_heads : H;
-    NNOPS_ASSERT(H_kv > 0 && H % H_kv == 0);
+    if (inputs[0].rank != 4) { return Status::invalid_argument; }
+    const int64_t b = inputs[0].dims[0];
+    const int64_t h = inputs[0].dims[1];
+    const int64_t s = inputs[0].dims[2];
+    const int64_t d = inputs[0].dims[3];
+    const int64_t h_kv = attrs_.num_kv_heads > 0 ? attrs_.num_kv_heads : h;
+    if (h_kv <= 0 || h % h_kv != 0) { return Status::invalid_argument; }
 
     // K/V/Gate share the kv-head geometry: [B, H_kv, S, D].
-    for (int i = 1; i <= 3; ++i) {
-        NNOPS_ASSERT(inputs[i].shape(0) == B && inputs[i].shape(1) == H_kv &&
-                     inputs[i].shape(2) == S && inputs[i].shape(3) == D);
+    for (size_t i = 1; i <= 3; ++i) {
+        const auto& t = inputs[i];
+        if (t.rank != 4 || t.dims[0] != b || t.dims[1] != h_kv ||
+            t.dims[2] != s || t.dims[3] != d) {
+            return Status::invalid_argument;
+        }
     }
-    NNOPS_ASSERT(outputs[0].shape(0) == B && outputs[0].shape(1) == H &&
-                 outputs[0].shape(2) == S && outputs[0].shape(3) == D);
-    NNOPS_ASSERT(outputs[1].shape(0) == B && outputs[1].shape(1) == H_kv &&
-                 outputs[1].shape(2) == D && outputs[1].shape(3) == D);
-
-    if (inputs.size() > 4 && !inputs[4].is_empty()) {   // conv weights
-        NNOPS_ASSERT(inputs[4].data_type() == dt);
-        NNOPS_ASSERT(inputs[4].shape(0) == (H + 2 * H_kv) * D &&
-                     inputs[4].shape(1) == 1 &&
-                     inputs[4].shape(2) == attrs_.conv_kernel_size);
+    // Output is [B, H, S, D]; the recurrent State is [B, H_kv, D, D].
+    if (outputs[0].rank != 4 || outputs[0].dims[0] != b || outputs[0].dims[1] != h ||
+        outputs[0].dims[2] != s || outputs[0].dims[3] != d) {
+        return Status::invalid_argument;
     }
-    if (inputs.size() > 5 && !inputs[5].is_empty()) {   // beta
-        NNOPS_ASSERT(inputs[5].data_type() == dt);
-        NNOPS_ASSERT(inputs[5].shape(0) == B && inputs[5].shape(1) == H_kv &&
-                     inputs[5].shape(2) == S);
+    if (outputs[1].rank != 4 || outputs[1].dims[0] != b ||
+        outputs[1].dims[1] != h_kv || outputs[1].dims[2] != d ||
+        outputs[1].dims[3] != d) {
+        return Status::invalid_argument;
     }
 
-    // Vulkan has no LinearAttention kernel and resolves to nullptr — the assert
-    // documents that invariant (and, like every other guard here, compiles away
-    // under NDEBUG). CPU and CUDA always resolve to a real kernel.
-    NNOPS_ASSERT(impl_->kernel_fn != nullptr);
+    // Optional tails. An omitted slot arrives as an empty view, whose descriptor
+    // has rank 0 — treat that as "absent" rather than as a malformed tensor.
+    if (inputs.size() > 4 && inputs[4].rank != 0) {   // [(H + 2*H_kv) * D, 1, K]
+        const auto& w = inputs[4];
+        if (w.dtype != dt || w.rank != 3 ||
+            w.dims[0] != (h + 2 * h_kv) * d || w.dims[1] != 1 ||
+            w.dims[2] != attrs_.conv_kernel_size) {
+            return Status::invalid_argument;
+        }
+    }
+    if (inputs.size() > 5 && inputs[5].rank != 0) {   // beta: [B, H_kv, S]
+        const auto& beta = inputs[5];
+        if (beta.dtype != dt || beta.rank != 3 || beta.dims[0] != b ||
+            beta.dims[1] != h_kv || beta.dims[2] != s) {
+            return Status::invalid_argument;
+        }
+    }
+    return Status::ok;
+}
 
-    impl_->kernel_fn(attrs_, outputs, inputs, ctx, workspace);
+Status LinearAttention::compute(std::span<TensorView> outputs,
+                                std::span<const TensorView> inputs,
+                                const ComputeContext& ctx,
+                                void* workspace)
+{
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 4, 6, 2));
+    for (size_t i = 0; i < 4; ++i) {
+        if (inputs[i].is_empty()) { return Status::invalid_argument; }
+    }
+    if (outputs[0].is_empty() || outputs[1].is_empty()) {
+        return Status::invalid_argument;
+    }
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs, inputs, ctx, workspace);
 }
 
 }  // namespace nnops

@@ -45,6 +45,7 @@ set(TEST_SOURCES
     test_transpose_conv2d.cpp
     test_moe.cpp
     test_cpu_backend.cpp
+    test_status.cpp
     test_cpu_features.cpp
     test_memory_pool.cpp
     test_mma_packed.cpp

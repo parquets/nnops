@@ -325,7 +325,7 @@ void depthwise_conv_cuda_3d_impl(
 // Unified entry point
 // ============================================================
 
-void depthwise_conv_cuda(
+Status depthwise_conv_cuda(
     const DepthwiseConvAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -343,16 +343,17 @@ void depthwise_conv_cuda(
             depthwise_conv_cuda_3d_impl<float>(attrs, output, inputs, ctx);
         else
             depthwise_conv_cuda_2d_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         if (srank == 3)
             depthwise_conv_cuda_3d_impl<__half>(attrs, output, inputs, ctx);
         else
             depthwise_conv_cuda_2d_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"depthwise_conv_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

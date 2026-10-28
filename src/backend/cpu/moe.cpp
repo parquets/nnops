@@ -421,7 +421,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
 }  // anonymous namespace
 
-void moe_cpu(const MoEAttributes& attrs,
+Status moe_cpu(const MoEAttributes& attrs,
              TensorView& output,
              std::span<const TensorView> inputs,
              const ComputeContext& ctx,
@@ -443,11 +443,11 @@ void moe_cpu(const MoEAttributes& attrs,
                    "systematically smaller than under softmax");
 
     switch (inputs[0].data_type()) {
-    case DataType::f32: moe_cpu_impl<float>(attrs, output, inputs, ctx); return;
-    case DataType::f16: moe_cpu_impl<half>(attrs, output, inputs, ctx);  return;
+    case DataType::f32: moe_cpu_impl<float>(attrs, output, inputs, ctx); return Status::ok;
+    case DataType::f16: moe_cpu_impl<half>(attrs, output, inputs, ctx);  return Status::ok;
     default: break;
     }
-    NNOPS_CHECK_MSG(false, "MoE: only f32 and f16 inputs are supported");
+    return Status::unsupported;
 }
 
 }  // namespace nnops::backend::cpu

@@ -35,23 +35,35 @@ size_t Softmax::getWorkspaceSize(std::span<const TensorDesc> inputs,
     return 0;
 }
 
-void Softmax::compute(std::span<TensorView> outputs,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx,
-                       void* workspace)
+Status Softmax::validate(std::span<const TensorDesc> inputs,
+                         std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 1);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    NNOPS_TRY(detail::check_rank(inputs[0].rank, 1));
+    if (!(attrs_.temperature > 0.0f)) { return Status::invalid_argument; }
 
-    if (is_quantized_dtype(inputs[0].data_type())) {
-        NNOPS_ASSERT(output.data_type() == DataType::f32 ||
-                     output.data_type() == DataType::f16);
+    if (is_quantized_dtype(inputs[0].dtype)) {
+        // A quantized input is dequantized first, so the output must be float.
+        if (!detail::dtype_in<DataType::f32, DataType::f16>(outputs[0].dtype)) {
+            return Status::invalid_argument;
+        }
+        // And the dequantizing walk is only defined over planar layouts.
+        return detail::require(
+            is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly),
+            Status::unsupported);
     }
+    return Status::ok;
+}
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status Softmax::compute(std::span<TensorView> outputs,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx,
+                        void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

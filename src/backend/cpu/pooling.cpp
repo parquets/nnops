@@ -270,7 +270,7 @@ void pooling_impl_quant(const PoolingAttributes& attrs,
 
 }  // anonymous namespace
 
-void pooling_cpu(const PoolingAttributes& attrs,
+Status pooling_cpu(const PoolingAttributes& attrs,
                   TensorView& output,
                   std::span<const TensorView> inputs,
                   const ComputeContext& ctx,
@@ -281,10 +281,10 @@ void pooling_cpu(const PoolingAttributes& attrs,
     switch (dtype) {
     case DataType::f32:
         pooling_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         pooling_impl<half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::s8:
         if (odtype == DataType::s8) {
             pooling_impl_quant<int8_t, int8_t>(attrs, output, inputs, ctx);
@@ -293,7 +293,7 @@ void pooling_cpu(const PoolingAttributes& attrs,
         } else {
             NNOPS_ASSERT(!"pooling_cpu: s8 input requires s8/u8 output");
         }
-        return;
+        return Status::ok;
     case DataType::u8:
         if (odtype == DataType::s8) {
             pooling_impl_quant<uint8_t, int8_t>(attrs, output, inputs, ctx);
@@ -302,10 +302,11 @@ void pooling_cpu(const PoolingAttributes& attrs,
         } else {
             NNOPS_ASSERT(!"pooling_cpu: u8 input requires s8/u8 output");
         }
-        return;
+        return Status::ok;
     default:
         NNOPS_ASSERT(!"pooling_cpu: unsupported data type");
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

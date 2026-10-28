@@ -123,7 +123,7 @@ void grid_sample_impl_nchwc8(const GridSampleAttributes& attrs,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
 }
 
-void grid_sample_cpu(const GridSampleAttributes& attrs,
+Status grid_sample_cpu(const GridSampleAttributes& attrs,
                      TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
@@ -133,6 +133,7 @@ void grid_sample_cpu(const GridSampleAttributes& attrs,
         using T = typename decltype(tag)::type;
         grid_sample_impl_nchwc8<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

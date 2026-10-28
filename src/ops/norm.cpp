@@ -40,21 +40,24 @@ std::vector<TensorDesc> Norm::getOutputTensorDesc(
     return out;
 }
 
-void Norm::compute(std::span<TensorView> outputs,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace)
+Status Norm::validate(std::span<const TensorDesc> inputs,
+                      std::span<const TensorDesc> outputs) const
 {
     const auto [min_n, max_n] = norm_input_range(attrs_.type);
-    NNOPS_ASSERT(inputs.size() >= static_cast<size_t>(min_n));
-    NNOPS_ASSERT(inputs.size() <= static_cast<size_t>(max_n));
-    NNOPS_ASSERT(outputs.size() == 1);
+    return detail::check_counts(inputs.size(), outputs.size(),
+                                static_cast<size_t>(min_n),
+                                static_cast<size_t>(max_n), 1);
+}
 
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());  // X
-
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status Norm::compute(std::span<TensorView> outputs,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

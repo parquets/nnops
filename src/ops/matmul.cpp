@@ -38,31 +38,38 @@ std::vector<TensorDesc> MatMul::getOutputTensorDesc(
     return out;
 }
 
-void MatMul::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status MatMul::validate(std::span<const TensorDesc> inputs,
+                        std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);  // A, B, [bias]
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[1].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
+    // A, B, [bias]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    if (!is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly)) {
+        return Status::invalid_argument;
+    }
 
     const auto& a = inputs[0];
     const auto& b = inputs[1];
-    const int64_t a_rank = a.rank();
-    const int64_t b_rank = b.rank();
-    NNOPS_ASSERT(a_rank >= 2);
-    NNOPS_ASSERT(b_rank >= 2);
+    NNOPS_TRY(detail::check_rank(a.rank, 2));
+    NNOPS_TRY(detail::check_rank(b.rank, 2));
 
-    const int64_t Ka = attrs_.transpose_a ? a.shape(a_rank - 2) : a.shape(a_rank - 1);
-    const int64_t Kb = attrs_.transpose_b ? b.shape(b_rank - 1) : b.shape(b_rank - 2);
-    NNOPS_ASSERT(Ka == Kb);
+    const int64_t k_a = attrs_.transpose_a
+        ? a.dims[static_cast<size_t>(a.rank - 2)]
+        : a.dims[static_cast<size_t>(a.rank - 1)];
+    const int64_t k_b = attrs_.transpose_b
+        ? b.dims[static_cast<size_t>(b.rank - 1)]
+        : b.dims[static_cast<size_t>(b.rank - 2)];
+    return detail::require(k_a == k_b);
+}
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status MatMul::compute(std::span<TensorView> outputs,
+                       std::span<const TensorView> inputs,
+                       const ComputeContext& ctx,
+                       void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

@@ -187,7 +187,7 @@ void activation_cuda_impl(
 // Entry point
 // ============================================================
 
-void activation_cuda(
+Status activation_cuda(
     const ActivationAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -198,13 +198,14 @@ void activation_cuda(
     switch (dtype) {
     case DataType::f32:
         activation_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         activation_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"activation_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

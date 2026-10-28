@@ -8,6 +8,7 @@
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "nnops/core/backend.hpp"
+#include "nnops/core/status.hpp"
 #include "nnops/core/op_type.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/core/compute_context.hpp"

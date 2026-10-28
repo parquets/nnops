@@ -67,21 +67,22 @@ void unary_impl(const UnaryAttributes& attrs,
         });
 }
 
-void unary_quant_impl(const UnaryAttributes& attrs,
-                      TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx)
+Status unary_quant_impl(const UnaryAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
+    if (attrs.add_to) { return Status::unsupported; }
 
     quantized_unary_transform(inputs[0], output, ctx,
         [&](float* scratch, int h, int w) {
             apply_unary_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false);
         });
+    return Status::ok;
 }
 
-void unary_cpu(const UnaryAttributes& attrs,
+Status unary_cpu(const UnaryAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
@@ -96,7 +97,7 @@ void unary_cpu(const UnaryAttributes& attrs,
             using T = typename decltype(tag)::type;
             unary_impl<T>(attrs, output, inputs, ctx);
         });
-        return;
+        return Status::ok;
     }
 
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).
@@ -104,12 +105,12 @@ void unary_cpu(const UnaryAttributes& attrs,
 
     // Round/Ceil/Floor have no quantized meaning; refuse instead of falling
     // through to unary_quant_impl.
-    NNOPS_CHECK_MSG(attrs.type != UnaryType::Round &&
-                    attrs.type != UnaryType::Ceil &&
-                    attrs.type != UnaryType::Floor,
-                    "unary_cpu: Round/Ceil/Floor do not support quantized data types");
+    if (attrs.type == UnaryType::Round || attrs.type == UnaryType::Ceil ||
+        attrs.type == UnaryType::Floor) {
+        return Status::unsupported;
+    }
 
-    unary_quant_impl(attrs, output, inputs, ctx);
+    return unary_quant_impl(attrs, output, inputs, ctx);
 }
 
 }  // namespace nnops::backend::cpu

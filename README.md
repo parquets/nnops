@@ -112,10 +112,53 @@ Two patterns worth knowing:
 - **Epilogue** — Conv/MatMul/Linear accept an `Epilogue` (ReLU, GELU, SiLU, …) applied during output write-back, fusing the activation into the kernel with no extra launch.
 - **`add_to`** — most operators take `add_to{false}`; when `true`, the result is *added* to the existing output buffer instead of overwriting it, so residual/skip connections need no separate add kernel.
 
+## Error handling
+
+`compute()` returns a `Status` — never throws, never aborts on a bad call. Ignoring
+the result still compiles, so code written before the contract existed keeps
+working unchanged.
+
+```cpp
+#include "nnops/core/status.hpp"
+
+const Status st = op->compute(output, inputs, ctx, workspace);
+if (is_error(st)) {
+    // to_string(st) -> "invalid_argument", "unsupported", ...
+    return st;
+}
+```
+
+| Code | Meaning |
+|---|---|
+| `ok` | Success (the zero value). |
+| `invalid_argument` | Malformed call: wrong tensor count, empty view, rank/dtype/layout, bad attribute. |
+| `unsupported` | Well-formed but no kernel for it: dtype, layout, granularity, an `add_to` on a path without it, or a backend with no kernel for this op. |
+| `not_initialized` | Missing workspace or unpacked weights. |
+| `out_of_memory` | A scratch allocation failed. |
+| `internal` | Library bug. |
+
+The checks run at two levels:
+
+- **`validate(inputs, outputs)`** takes `TensorDesc`s only — no data is read or
+  written. Graph engines run it over every node before allocating buffers, so a
+  malformed graph fails at plan time. `getOutputTensorDesc` plus `validate` is
+  enough to accept or reject a graph without any tensor data.
+- **`compute(...)`** runs the same descriptor rules (they live in one place) plus
+  the view-level ones: whether there is data behind each descriptor, the quant
+  parameters, and whether the resolved kernel exists. `create()` never fails —
+  a backend with no kernel for an operator still constructs, and `compute()`
+  reports `unsupported`.
+
+A rejected call writes nothing to the outputs, so the caller can correct the call
+and retry without re-initializing the destination. `NNOPS_ASSERT` remains for
+internal invariants (a bug in the library, not in the caller), and is compiled
+out under `NDEBUG`; caller-facing checks are the returned `Status`, live in every
+build.
+
 ## Design overview
 
 ```
-include/nnops/core/     DataType, TensorView, OpBase, Backend, ComputeContext, Epilogue
+include/nnops/core/     DataType, TensorView, OpBase, Backend, ComputeContext, Epilogue, Status
 include/nnops/ops/      Operator headers (one per op)
 src/ops/                Dispatch layer — create() factory + backend switch
 src/backend/cpu/        SIMD kernels, reference kernels, tiled GEMM/Conv/Attention

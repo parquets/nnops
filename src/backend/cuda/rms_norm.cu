@@ -228,7 +228,7 @@ void rms_norm_cuda_impl(
 // Entry point
 // ============================================================
 
-void rms_norm_cuda(
+Status rms_norm_cuda(
     const RMSNormAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -239,13 +239,14 @@ void rms_norm_cuda(
     switch (dtype) {
     case DataType::f32:
         rms_norm_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         rms_norm_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"rms_norm_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

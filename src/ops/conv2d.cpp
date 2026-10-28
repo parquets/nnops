@@ -12,11 +12,11 @@
 namespace nnops {
 
 struct Conv2D::Impl {
-    using KernelFn = void (*)(const Conv2DAttributes&,
-                               TensorView&,
-                               std::span<const TensorView>,
-                               const ComputeContext&,
-                               void*);
+    using KernelFn = Status (*)(const Conv2DAttributes&,
+                                TensorView&,
+                                std::span<const TensorView>,
+                                const ComputeContext&,
+                                void*);
     KernelFn kernel_fn = nullptr;
 };
 Conv2D::~Conv2D() = default;
@@ -103,19 +103,23 @@ size_t Conv2D::getWorkspaceSize(std::span<const TensorDesc> inputs,
     return 0;
 }
 
-void Conv2D::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status Conv2D::validate(std::span<const TensorDesc> inputs,
+                        std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 2);
-    NNOPS_ASSERT(inputs.size() <= 3);  // input, weight [, bias]
-    NNOPS_ASSERT(outputs.size() == 1);
+    // input, weight [, bias]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+}
+
+Status Conv2D::compute(std::span<TensorView> outputs,
+                       std::span<const TensorView> inputs,
+                       const ComputeContext& ctx,
+                       void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
     auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[1].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
 
     // auto_pad lives in the descriptor; kernels only see explicit leading padding.
     Conv2DAttributes attrs = attrs_;
@@ -133,11 +137,11 @@ void Conv2D::compute(std::span<TensorView> outputs,
     // Winograd has no integer counterpart, so the quantized route always runs
     // the im2col kernel — including for the k3s1 geometry Winograd would take.
     if (backend_ == Backend::CPU && is_quantized_conv2d(inputs[1].data_type())) {
-        backend::cpu::conv2d_im2col_kernel(attrs, output, inputs, ctx, workspace);
-        return;
+        return backend::cpu::conv2d_im2col_kernel(attrs, output, inputs, ctx, workspace);
     }
 
-    impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
 }
 
 void Conv2D::prepackWeights(std::span<const TensorView> inputs,

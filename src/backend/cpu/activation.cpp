@@ -60,22 +60,23 @@ void activation_impl(const ActivationAttributes& attrs,
         });
 }
 
-void activation_quant_impl(const ActivationAttributes& attrs,
-                           TensorView& output,
-                           std::span<const TensorView> inputs,
-                           const ComputeContext& ctx)
+Status activation_quant_impl(const ActivationAttributes& attrs,
+                              TensorView& output,
+                              std::span<const TensorView> inputs,
+                              const ComputeContext& ctx)
 {
     // add_to is only meaningful on the float (non-quantized) path.
-    NNOPS_CHECK(!attrs.add_to);  // no accumulate on the quantized path
+    if (attrs.add_to) { return Status::unsupported; }
 
     quantized_unary_transform(inputs[0], output, ctx,
         [&](float* scratch, int h, int w) {
             apply_activation_flt<float>(attrs.type, scratch, scratch, h, w, w, w, false,
                                         attrs.alpha, attrs.beta);
         });
+    return Status::ok;
 }
 
-void activation_cpu(const ActivationAttributes& attrs,
+Status activation_cpu(const ActivationAttributes& attrs,
                      TensorView& output,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx,
@@ -90,13 +91,13 @@ void activation_cpu(const ActivationAttributes& attrs,
             using T = typename decltype(tag)::type;
             activation_impl<T>(attrs, output, inputs, ctx);
         });
-        return;
+        return Status::ok;
     }
 
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).
     NNOPS_ASSERT(in_is_int && out_is_int);
 
-    activation_quant_impl(attrs, output, inputs, ctx);
+    return activation_quant_impl(attrs, output, inputs, ctx);
 }
 
 }  // namespace nnops::backend::cpu

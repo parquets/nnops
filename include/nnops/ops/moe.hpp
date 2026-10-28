@@ -217,6 +217,9 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    Status validate(std::span<const TensorDesc> inputs,
+                    std::span<const TensorDesc> outputs) const override;
+
     /// Workspace (bytes) required by MoE. Always 0: the op stages the expanded
     /// top-K tokens and per-expert intermediate activations in its own pooled
     /// scratch, like MatMul/Attention/Conv2D — the caller allocates nothing.
@@ -225,7 +228,7 @@ public:
 
     using OpBase::compute;
 
-    void compute(std::span<TensorView> outputs,
+    Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

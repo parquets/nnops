@@ -532,7 +532,7 @@ inline bool dq_needs_compensation(const TensorView& a, const TensorView& b,
 // marked inline; B hoisting on an M-split is a route property.
 
 template <class R>
-void matmul_dispatch_tiled(const MatMulAttributes& attrs,
+Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                            TensorView& output,
                            std::span<const TensorView> inputs,
                            const ComputeContext& ctx,
@@ -557,9 +557,10 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
         if (inputs.size() > 2) { bias = inputs[2].ptr<typename R::Elem>(); }
     }
 
+    // The fp routes pack into the scratch; a null buffer here means the pool
+    // refused it, and the first pack would fault rather than report.
     if constexpr (R::is_fp) {
-        NNOPS_CHECK_MSG(workspace != nullptr,
-                        "MatMul: the fp routes need a scratch workspace");
+        if (workspace == nullptr) { return Status::out_of_memory; }
     }
 
     const int lda = static_cast<int>(a.row_stride_elems());
@@ -832,6 +833,7 @@ void matmul_dispatch_tiled(const MatMulAttributes& attrs,
             });
         }
     }
+    return Status::ok;
 }
 
 // =========================================================================
@@ -906,7 +908,7 @@ void quantize_activation(const TensorView& a, TensorView& aq,
 /// lda, the reductions and the arch pack bias (derived from A_q's dtype) are
 /// all correct with no plan changes.
 template <class T>
-void matmul_dq(const MatMulAttributes& attrs, TensorView& output,
+Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
                std::span<const TensorView> inputs, const ComputeContext& ctx)
 {
     const auto& a = inputs[0];
@@ -938,9 +940,8 @@ void matmul_dq(const MatMulAttributes& attrs, TensorView& output,
         !dq_needs_compensation(a, b, a_bias_offset, M, N)) {
         PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
                         + DqRoute<T, T>::extra_workspace(output));
-        matmul_dispatch_tiled<DqRoute<T, T>>(attrs, output, inputs, ctx, plan,
-                                             scratch.get());
-        return;
+        return matmul_dispatch_tiled<DqRoute<T, T>>(attrs, output, inputs, ctx,
+                                                    plan, scratch.get());
     }
 
     PoolPtr aq_buf(static_cast<size_t>(a.numel()));
@@ -952,13 +953,12 @@ void matmul_dq(const MatMulAttributes& attrs, TensorView& output,
                     + DqRoute<T>::extra_workspace(output));
     if (inputs.size() > 2) {
         const TensorView ins[] = {aq, b, inputs[2]};
-        matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
-                                          scratch.get());
-    } else {
-        const TensorView ins[] = {aq, b};
-        matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
-                                          scratch.get());
+        return matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
+                                                 scratch.get());
     }
+    const TensorView ins[] = {aq, b};
+    return matmul_dispatch_tiled<DqRoute<T>>(attrs, output, ins, ctx, plan,
+                                             scratch.get());
 }
 
 }  // anonymous namespace
@@ -973,7 +973,7 @@ namespace {
 /// output: the fp kernels seed their accumulator with it, the dequantizing int8
 /// route adds it inside its output pass. The raw integer outputs reject it (see
 /// matmul_cpu).
-void matmul_dispatch_impl(const MatMulAttributes& attrs,
+Status matmul_dispatch_impl(const MatMulAttributes& attrs,
                           TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx,
@@ -1007,7 +1007,7 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
         if (matmul_qblock_fused(attrs_n, output, inputs, ctx,
                             static_cast<int>(M), static_cast<int>(N),
                             static_cast<int>(K))) {
-            return;
+            return Status::ok;
         }
     }
 #endif
@@ -1017,7 +1017,7 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
     const bool b_block = is_block_packed_dtype(dt_b);
     const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
     if (matmul_small_fp(attrs_n, output, inputs, ctx)) {
-        return;
+        return Status::ok;
     }
 
     // Offline-quantized activations × s8 weights: quantize A with its own
@@ -1030,16 +1030,13 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
         const bool qp_ok = qp.is_active() &&
                            (qp.granularity == QuantGranularity::PerTensor ||
                             qp.granularity == QuantGranularity::PerToken);
-        NNOPS_CHECK_MSG(qp_ok && !attrs_n.transpose_a,
-                        "MatMul: fp A x s8 B needs per-tensor or per-token "
-                        "QuantParams on A, and no transpose_a");
+        if (!qp_ok) { return Status::invalid_argument; }
+        if (attrs_n.transpose_a) { return Status::unsupported; }
         NNOPS_ASSERT(output.data_type() == dt_a);
         if (dt_a == DataType::f32) {
-            matmul_dq<float>(attrs_n, output, inputs, ctx);
-        } else {
-            matmul_dq<half>(attrs_n, output, inputs, ctx);
+            return matmul_dq<float>(attrs_n, output, inputs, ctx);
         }
-        return;
+        return matmul_dq<half>(attrs_n, output, inputs, ctx);
     }
 
     // Worker ids → one scratch slot per thread instead of per m-block.
@@ -1056,51 +1053,49 @@ void matmul_dispatch_impl(const MatMulAttributes& attrs,
         const bool out_fp = (odt == DataType::f32 || odt == DataType::f16);
         const bool out_ok = (odt == DataType::s32) || (odt == DataType::s8) ||
                             (odt == DataType::u8) || out_fp;
-        if (out_ok) {
-            NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
-            if (out_fp && odt == DataType::f32) {
-                PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                                + DqRoute<float>::extra_workspace(output));
-                matmul_dispatch_tiled<DqRoute<float>>(attrs_n, output, inputs, ctx,
-                                                      plan, scratch.get());
-            } else if (out_fp) {
-                PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                                + DqRoute<half>::extra_workspace(output));
-                matmul_dispatch_tiled<DqRoute<half>>(attrs_n, output, inputs, ctx,
-                                                     plan, scratch.get());
-            } else {
-                PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                                + I8Route::extra_workspace(output));
-                matmul_dispatch_tiled<I8Route>(attrs_n, output, inputs, ctx, plan,
-                                               scratch.get());
-            }
-        } else {
-            NNOPS_CHECK_MSG(false,
-                            "MatMul: int8 x int8 needs a s32/s8/u8/f32/f16 output");
+        if (!out_ok) {
+            // int8 x int8 needs a s32/s8/u8/f32/f16 output.
+            return Status::unsupported;
         }
-        return;
+        NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
+        if (out_fp && odt == DataType::f32) {
+            PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
+                            + DqRoute<float>::extra_workspace(output));
+            return matmul_dispatch_tiled<DqRoute<float>>(
+                attrs_n, output, inputs, ctx, plan, scratch.get());
+        }
+        if (out_fp) {
+            PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
+                            + DqRoute<half>::extra_workspace(output));
+            return matmul_dispatch_tiled<DqRoute<half>>(
+                attrs_n, output, inputs, ctx, plan, scratch.get());
+        }
+        PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
+                        + I8Route::extra_workspace(output));
+        return matmul_dispatch_tiled<I8Route>(attrs_n, output, inputs, ctx, plan,
+                                              scratch.get());
     }
 
     // Past the int8 branch: only f32/f16 have a fused kernel, plus a
     // block-packed B (q5_1/q4_1), whose blocks decode to A's type in the RHS
     // pack.
-    NNOPS_CHECK_MSG(float_a && (dt_b == dt_a || b_block),
-                    "MatMul: unsupported dtype combination");
+    if (!float_a || (dt_b != dt_a && !b_block)) {
+        return Status::unsupported;
+    }
 
     PoolPtr scratch(plan.workspace_size);
 
     if (dt_a == DataType::f32) {
-        matmul_dispatch_tiled<FpRoute<float>>(attrs_n, output, inputs, ctx, plan,
-                                              scratch.get());
-    } else {
-        matmul_dispatch_tiled<FpRoute<half>>(attrs_n, output, inputs, ctx, plan,
-                                             scratch.get());
+        return matmul_dispatch_tiled<FpRoute<float>>(attrs_n, output, inputs, ctx,
+                                                     plan, scratch.get());
     }
+    return matmul_dispatch_tiled<FpRoute<half>>(attrs_n, output, inputs, ctx, plan,
+                                                scratch.get());
 }
 
 }  // anonymous namespace
 
-void matmul_cpu(const MatMulAttributes& attrs,
+Status matmul_cpu(const MatMulAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -1108,8 +1103,7 @@ void matmul_cpu(const MatMulAttributes& attrs,
 {
     NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);
     if (inputs.size() < 3) {
-        matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
-        return;
+        return matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
     }
 
     // An optional [N] bias, typed by the output branch. An fp output
@@ -1133,7 +1127,7 @@ void matmul_cpu(const MatMulAttributes& attrs,
     }
     NNOPS_ASSERT(bias.numel() >= output.shape(output.rank() - 1));
 
-    matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
+    return matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
 }
 
 }  // namespace nnops::backend::cpu

@@ -10,7 +10,7 @@
 
 namespace nnops::backend::cpu {
 
-void conv3d_cpu(const Conv3DAttributes& attrs,
+Status conv3d_cpu(const Conv3DAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -110,6 +110,7 @@ void conv3d_cpu(const Conv3DAttributes& attrs,
 
     ctx.cpu.run(0, N,
             [&](int64_t n) { compute_sample(n); });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

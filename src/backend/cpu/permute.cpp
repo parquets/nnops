@@ -138,7 +138,7 @@ void permute_impl(const PermuteAttributes& attrs,
     ctx.cpu.run(0, outer_total, body);
 }
 
-void permute_cpu(const PermuteAttributes& attrs,
+Status permute_cpu(const PermuteAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
@@ -171,7 +171,7 @@ void permute_cpu(const PermuteAttributes& attrs,
             using T = typename decltype(tag)::type;
             permute_last_two_swap_impl<T>(output, inputs, ctx);
         });
-        return;
+        return Status::ok;
     }
 
     // General path
@@ -179,6 +179,7 @@ void permute_cpu(const PermuteAttributes& attrs,
         using T = typename decltype(tag)::type;
         permute_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

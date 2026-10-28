@@ -19,20 +19,23 @@ std::vector<TensorDesc> GridSample::getOutputTensorDesc(
     return grid_sample_output_shape(inputs);
 }
 
-void GridSample::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status GridSample::validate(std::span<const TensorDesc> inputs,
+                            std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 2);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[1].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PackedOnly));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PackedOnly));
+}
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status GridSample::compute(std::span<TensorView> outputs,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx,
+                           void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 2, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

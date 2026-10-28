@@ -627,7 +627,7 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
 //  Public API
 // =========================================================================
 
-void attention_cpu(const AttentionAttributes& attrs,
+Status attention_cpu(const AttentionAttributes& attrs,
                       TensorView& output,
                       std::span<const TensorView> inputs,
                       const ComputeContext& ctx,
@@ -667,11 +667,11 @@ void attention_cpu(const AttentionAttributes& attrs,
                 attention_impl<float>(attrs, output, inputs, ctx, plan, scratch.as<float>());
             }
         }
-        return;
+        return Status::ok;
     }
 
-    NNOPS_CHECK_MSG(false,
-                    "Attention: Q, K, V, output and mask dtypes must match");
+    // Q, K, V, output and the mask (when present) must share one float dtype.
+    return Status::unsupported;
 }
 
 }  // namespace nnops::backend::cpu

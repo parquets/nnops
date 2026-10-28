@@ -69,7 +69,7 @@ void argminmax_impl(const ArgMinMaxAttributes& attrs,
     }
 }
 
-void argmax_cpu(const ArgMinMaxAttributes& attrs,
+Status argmax_cpu(const ArgMinMaxAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& /*ctx*/,
@@ -79,9 +79,10 @@ void argmax_cpu(const ArgMinMaxAttributes& attrs,
         using T = typename decltype(tag)::type;
         argminmax_impl<T>(attrs, output, inputs);
     });
+    return Status::ok;
 }
 
-void argmin_cpu(const ArgMinMaxAttributes& attrs,
+Status argmin_cpu(const ArgMinMaxAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
@@ -90,6 +91,7 @@ void argmin_cpu(const ArgMinMaxAttributes& attrs,
     ArgMinMaxAttributes a = attrs;
     a.type = ArgMinMaxType::Min;
     argmax_cpu(a, output, inputs, ctx, workspace);
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

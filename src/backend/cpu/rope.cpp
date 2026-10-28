@@ -143,7 +143,7 @@ void rope_impl(const RoPEAttributes& attrs,
     ctx.cpu.run(0, outer_count, process_outer);
 }
 
-void rope_cpu(const RoPEAttributes& attrs,
+Status rope_cpu(const RoPEAttributes& attrs,
               TensorView& output,
               std::span<const TensorView> inputs,
               const ComputeContext& ctx,
@@ -153,6 +153,7 @@ void rope_cpu(const RoPEAttributes& attrs,
         using T = typename decltype(tag)::type;
         rope_impl<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

@@ -27,33 +27,42 @@ size_t MoE::getWorkspaceSize(std::span<const TensorDesc> /*inputs*/,
     return 0;
 }
 
-void MoE::compute(std::span<TensorView> outputs,
-                  std::span<const TensorView> inputs,
-                  const ComputeContext& ctx,
-                  void* workspace)
+Status MoE::validate(std::span<const TensorDesc> inputs,
+                     std::span<const TensorDesc> outputs) const
 {
-    // At least 5 inputs (input, router_probs, fc1_w, fc1_b, fc2_w); fc1_b may
-    // be empty. The fc2_b and SwiGLU fc3 pair / router_weights tail are also
-    // optional and may be omitted entirely or passed as an empty TensorView.
-    NNOPS_ASSERT(inputs.size() >= 5);
-    NNOPS_ASSERT(inputs.size() <= 9);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
+    // At least 5 inputs (input, router_probs, fc1_w, fc1_b, fc2_w); fc1_b and
+    // the tail may be omitted or passed as an empty view, so only the count
+    // bounds and the required head are checked here.
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 5, 9, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+}
 
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        if (inputs[i].is_empty()) { continue; }
-        NNOPS_ASSERT(inputs[i].data_type() == inputs[0].data_type());
+Status MoE::compute(std::span<TensorView> outputs,
+                    std::span<const TensorView> inputs,
+                    const ComputeContext& ctx,
+                    void* workspace)
+{
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 5, 9, 1));
+    if (outputs[0].is_empty()) { return Status::invalid_argument; }
+
+    // Required: input, router_probs, fc1_w, fc2_w. fc1_b sits at index 3 and
+    // may be empty.
+    for (size_t i : {size_t{0}, size_t{1}, size_t{2}, size_t{4}}) {
+        if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }
-    NNOPS_ASSERT(inputs[0].data_type() == DataType::f32 ||
-                 inputs[0].data_type() == DataType::f16);
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[1].is_empty());
-    NNOPS_ASSERT(!inputs[2].is_empty());
-    NNOPS_ASSERT(!inputs[4].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
-
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+    const DataType dt0 = inputs[0].data_type();
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(dt0)) {
+        return Status::unsupported;
+    }
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (!inputs[i].is_empty() && inputs[i].data_type() != dt0) {
+            return Status::invalid_argument;
+        }
+    }
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

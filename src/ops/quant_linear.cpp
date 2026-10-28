@@ -9,12 +9,12 @@
 namespace nnops {
 
 namespace backend::cpu {
-    void quantize_linear_cpu(const QuantLinearAttributes& attrs,
+    Status quantize_linear_cpu(const QuantLinearAttributes& attrs,
                              TensorView& output,
                              std::span<const TensorView> inputs,
                              const ComputeContext& ctx,
                              void* workspace);
-    void dequantize_linear_cpu(const QuantLinearAttributes& attrs,
+    Status dequantize_linear_cpu(const QuantLinearAttributes& attrs,
                                TensorView& output,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,
@@ -23,12 +23,12 @@ namespace backend::cpu {
 
 #ifdef NNOPS_HAS_CUDA
 namespace backend::cuda {
-    void quantize_linear_cuda(const QuantLinearAttributes& attrs,
+    Status quantize_linear_cuda(const QuantLinearAttributes& attrs,
                               TensorView& output,
                               std::span<const TensorView> inputs,
                               const ComputeContext& ctx,
                               void* workspace);
-    void dequantize_linear_cuda(const QuantLinearAttributes& attrs,
+    Status dequantize_linear_cuda(const QuantLinearAttributes& attrs,
                                 TensorView& output,
                                 std::span<const TensorView> inputs,
                                 const ComputeContext& ctx,
@@ -37,7 +37,7 @@ namespace backend::cuda {
 #endif
 
 struct QuantizeLinear::Impl {
-    using KernelFn = void (*)(const QuantLinearAttributes&,
+    using KernelFn = Status (*)(const QuantLinearAttributes&,
                                TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
@@ -77,21 +77,25 @@ std::vector<TensorDesc> QuantizeLinear::getOutputTensorDesc(
     return quantize_linear_output_shape(inputs, attrs_.output_dtype);
 }
 
-void QuantizeLinear::compute(std::span<TensorView> outputs,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx,
-                              void* workspace)
+Status QuantizeLinear::validate(std::span<const TensorDesc> inputs,
+                                std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 3);
-    NNOPS_ASSERT(outputs.size() == 1);
-    NNOPS_ASSERT(!outputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
+    return detail::check_counts(inputs.size(), outputs.size(), 3, 3, 1);
+}
 
-    impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
+Status QuantizeLinear::compute(std::span<TensorView> outputs,
+                                std::span<const TensorView> inputs,
+                                const ComputeContext& ctx,
+                                void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 struct DequantizeLinear::Impl {
-    using KernelFn = void (*)(const QuantLinearAttributes&,
+    using KernelFn = Status (*)(const QuantLinearAttributes&,
                                TensorView&,
                                std::span<const TensorView>,
                                const ComputeContext&,
@@ -137,17 +141,21 @@ std::vector<TensorDesc> DequantizeLinear::getOutputTensorDesc(
     return dequantize_linear_output_shape(inputs, attrs_.output_dtype);
 }
 
-void DequantizeLinear::compute(std::span<TensorView> outputs,
-                                std::span<const TensorView> inputs,
-                                const ComputeContext& ctx,
-                                void* workspace)
+Status DequantizeLinear::validate(std::span<const TensorDesc> inputs,
+                                  std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 3);
-    NNOPS_ASSERT(outputs.size() == 1);
-    NNOPS_ASSERT(!outputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
+    return detail::check_counts(inputs.size(), outputs.size(), 3, 3, 1);
+}
 
-    impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
+Status DequantizeLinear::compute(std::span<TensorView> outputs,
+                                 std::span<const TensorView> inputs,
+                                 const ComputeContext& ctx,
+                                 void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 3, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

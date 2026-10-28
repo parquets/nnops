@@ -187,7 +187,7 @@ void batch_norm_cuda_impl(
 // Entry point
 // ============================================================
 
-void batch_norm_cuda(
+Status batch_norm_cuda(
     const BatchNormAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -198,13 +198,14 @@ void batch_norm_cuda(
     switch (dtype) {
     case DataType::f32:
         batch_norm_cuda_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         batch_norm_cuda_impl<__half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     default:
-        NNOPS_ASSERT(!"batch_norm_cuda: unsupported data type (only f32 and f16)");
+        return Status::unsupported;
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

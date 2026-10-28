@@ -143,7 +143,7 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
 }
 
-void resize_cpu(const ResizeAttributes& attrs,
+Status resize_cpu(const ResizeAttributes& attrs,
                 TensorView& output,
                 std::span<const TensorView> inputs,
                 const ComputeContext& ctx,
@@ -153,6 +153,7 @@ void resize_cpu(const ResizeAttributes& attrs,
         using T = typename decltype(tag)::type;
         resize_impl_nchwc8<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

@@ -19,34 +19,37 @@ std::vector<TensorDesc> RoPE::getOutputTensorDesc(
     return identity_output_shape(inputs);
 }
 
-void RoPE::compute(std::span<TensorView> outputs,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace)
+Status RoPE::validate(std::span<const TensorDesc> inputs,
+                      std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 1);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
 
-    const auto& X = inputs[0];
-    const int64_t rank = X.rank();
-    NNOPS_ASSERT(rank >= 2);
-    NNOPS_ASSERT(X.shape(rank - 1) % 2 == 0);  // head_dim must be even
+    const auto& x = inputs[0];
+    NNOPS_TRY(detail::check_rank(x.rank, 2));
+    const int64_t head_dim = x.dims[static_cast<size_t>(x.rank - 1)];
+    if (head_dim % 2 != 0) { return Status::invalid_argument; }  // must be even
 
     if (!attrs_.mrope_section_dims.empty()) {
         int64_t total = 0;
-        for (auto d : attrs_.mrope_section_dims) {
-            total += d;
-        }
-        NNOPS_ASSERT(total == X.shape(rank - 1));
-        if (!attrs_.mrope_section_bases.empty()) {
-            NNOPS_ASSERT(attrs_.mrope_section_bases.size() == attrs_.mrope_section_dims.size());
+        for (auto d : attrs_.mrope_section_dims) { total += d; }
+        if (total != head_dim) { return Status::invalid_argument; }
+        if (!attrs_.mrope_section_bases.empty() &&
+            attrs_.mrope_section_bases.size() != attrs_.mrope_section_dims.size()) {
+            return Status::invalid_argument;
         }
     }
+    return Status::ok;
+}
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status RoPE::compute(std::span<TensorView> outputs,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

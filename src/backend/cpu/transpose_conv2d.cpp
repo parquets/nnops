@@ -231,7 +231,7 @@ void tconv2d_impl_nchwc8(
 // Entry point with dtype dispatch
 // ============================================================
 
-void transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
+Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
                            TensorView& output,
                            std::span<const TensorView> inputs,
                            const ComputeContext& ctx,
@@ -241,6 +241,7 @@ void transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
         using T = typename decltype(tag)::type;
         tconv2d_impl_nchwc8<T>(attrs, output, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

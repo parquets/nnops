@@ -9,7 +9,7 @@
 namespace nnops {
 
 namespace backend::cpu {
-    void topk_cpu(const TopKAttributes& attrs,
+    Status topk_cpu(const TopKAttributes& attrs,
                   TensorView& values,
                   TensorView& indices,
                   std::span<const TensorView> inputs,
@@ -19,7 +19,7 @@ namespace backend::cpu {
 
 #ifdef NNOPS_HAS_CUDA
 namespace backend::cuda {
-    void topk_cuda(const TopKAttributes& attrs,
+    Status topk_cuda(const TopKAttributes& attrs,
                    TensorView& values,
                    TensorView& indices,
                    std::span<const TensorView> inputs,
@@ -29,7 +29,7 @@ namespace backend::cuda {
 #endif
 
 struct TopK::Impl {
-    using KernelFn = void (*)(const TopKAttributes&,
+    using KernelFn = Status (*)(const TopKAttributes&,
                                TensorView&,
                                TensorView&,
                                std::span<const TensorView>,
@@ -70,21 +70,36 @@ std::vector<TensorDesc> TopK::getOutputTensorDesc(
     return topk_output_shape(attrs_.axis, attrs_.k, inputs);
 }
 
-void TopK::compute(std::span<TensorView> outputs,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx,
-                    void* workspace)
+Status TopK::validate(std::span<const TensorDesc> inputs,
+                      std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 1);
-    NNOPS_ASSERT(outputs.size() == 2);
-    auto& values  = outputs[0];
-    auto& indices = outputs[1];
-    NNOPS_ASSERT(!values.is_empty());
-    NNOPS_ASSERT(!indices.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 2));
 
-    impl_->kernel_fn(attrs_, values, indices, inputs, ctx, workspace);
+    const auto& in = inputs[0];
+    NNOPS_TRY(detail::check_rank(in.rank, 1, TensorDesc::kMaxRank));
+    if (attrs_.k < 1) { return Status::invalid_argument; }
+
+    // A negative axis wraps from the end, as everywhere else in the library.
+    const int64_t ax = attrs_.axis < 0 ? attrs_.axis + in.rank : attrs_.axis;
+    if (ax < 0 || ax >= in.rank) { return Status::invalid_argument; }
+    // Selecting more elements than the axis holds would read past the row.
+    if (attrs_.k > in.dims[static_cast<size_t>(ax)]) {
+        return Status::invalid_argument;
+    }
+
+    return detail::require(
+        is_layout_supported(in.layout, LayoutSupport::PlanarOnly));
+}
+
+Status TopK::compute(std::span<TensorView> outputs,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx,
+                     void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 2));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], outputs[1], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

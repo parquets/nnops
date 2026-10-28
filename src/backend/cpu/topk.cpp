@@ -123,7 +123,7 @@ void topk_impl(const TopKAttributes& attrs,
     ctx.cpu.run(0, outer_dims, process_outer);
 }
 
-void topk_cpu(const TopKAttributes& attrs,
+Status topk_cpu(const TopKAttributes& attrs,
                TensorView& values,
                TensorView& indices,
                std::span<const TensorView> inputs,
@@ -134,6 +134,7 @@ void topk_cpu(const TopKAttributes& attrs,
         using T = typename decltype(tag)::type;
         topk_impl<T>(attrs, values, indices, inputs, ctx);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

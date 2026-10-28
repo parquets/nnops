@@ -142,7 +142,7 @@ void dwconv_impl_nchwc8(
 constexpr int64_t kMaxQuantKernelTaps = 9 * 9 * 9;  // 729
 
 template <typename InT, typename OutT>
-void dwconv_impl_nchwc8_quant(
+Status dwconv_impl_nchwc8_quant(
     const DepthwiseConvAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -172,8 +172,8 @@ void dwconv_impl_nchwc8_quant(
     // dequantized-weight buffer below.
     const int64_t num_taps = KD * KH * KW;
     if (num_taps > kMaxQuantKernelTaps) {
-        NNOPS_ASSERT(!"depthwise_conv quant: kernel taps exceed 9x9x9");
-        return;
+        // The dequantized-weight stack buffer is sized for 9x9x9.
+        return Status::unsupported;
     }
 
     const int64_t OD  = (srank == 3) ? output.shape(2) : 1;
@@ -195,8 +195,10 @@ void dwconv_impl_nchwc8_quant(
     const auto& in_qp  = input.quant_params();
     const auto& out_qp = output.quant_params();
     const auto& w_qp   = packed_weight.quant_params();
-    NNOPS_CHECK(w_qp.granularity == QuantGranularity::PerChannel &&
-                w_qp.scale_data != nullptr);
+    if (w_qp.granularity != QuantGranularity::PerChannel ||
+        w_qp.scale_data == nullptr) {
+        return Status::invalid_argument;
+    }
     const float in_scale  = in_qp.scale;
     const float in_zero   = static_cast<float>(in_qp.zero_point);
     const float out_scale = out_qp.scale;
@@ -289,13 +291,14 @@ void dwconv_impl_nchwc8_quant(
     const int64_t N_C8 = N * C8;
     ctx.cpu.run(0, N_C8,
             [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
+    return Status::ok;
 }
 
 // ============================================================
 // Entry point with dtype dispatch
 // ============================================================
 
-void depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
+Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
                          TensorView& output,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx,
@@ -306,30 +309,28 @@ void depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
     switch (dtype) {
     case DataType::f32:
         dwconv_impl_nchwc8<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::f16:
         dwconv_impl_nchwc8<half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     case DataType::s8:
         if (odtype == DataType::s8) {
-            dwconv_impl_nchwc8_quant<int8_t, int8_t>(attrs, output, inputs, ctx);
-        } else if (odtype == DataType::u8) {
-            dwconv_impl_nchwc8_quant<int8_t, uint8_t>(attrs, output, inputs, ctx);
-        } else {
-            NNOPS_ASSERT(!"depthwise_conv_cpu: s8 input requires s8/u8 output");
+            return dwconv_impl_nchwc8_quant<int8_t, int8_t>(attrs, output, inputs, ctx);
         }
-        return;
+        if (odtype == DataType::u8) {
+            return dwconv_impl_nchwc8_quant<int8_t, uint8_t>(attrs, output, inputs, ctx);
+        }
+        return Status::unsupported;   // s8 input requires a s8/u8 output
     case DataType::u8:
         if (odtype == DataType::s8) {
-            dwconv_impl_nchwc8_quant<uint8_t, int8_t>(attrs, output, inputs, ctx);
-        } else if (odtype == DataType::u8) {
-            dwconv_impl_nchwc8_quant<uint8_t, uint8_t>(attrs, output, inputs, ctx);
-        } else {
-            NNOPS_ASSERT(!"depthwise_conv_cpu: u8 input requires s8/u8 output");
+            return dwconv_impl_nchwc8_quant<uint8_t, int8_t>(attrs, output, inputs, ctx);
         }
-        return;
+        if (odtype == DataType::u8) {
+            return dwconv_impl_nchwc8_quant<uint8_t, uint8_t>(attrs, output, inputs, ctx);
+        }
+        return Status::unsupported;   // u8 input requires a s8/u8 output
     default:
-        NNOPS_ASSERT(!"depthwise_conv_cpu: unsupported data type (only f32, f16, s8, u8)");
+        return Status::unsupported;
     }
 }
 

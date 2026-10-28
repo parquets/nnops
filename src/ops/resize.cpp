@@ -21,19 +21,23 @@ std::vector<TensorDesc> Resize::getOutputTensorDesc(
         std::span<const int64_t>(os.data(), os.size()), inputs)};
 }
 
-void Resize::compute(std::span<TensorView> outputs,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* workspace)
+Status Resize::validate(std::span<const TensorDesc> inputs,
+                        std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() == 1);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PackedOnly));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PackedOnly));
+}
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status Resize::compute(std::span<TensorView> outputs,
+                       std::span<const TensorView> inputs,
+                       const ComputeContext& ctx,
+                       void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 1, 1, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

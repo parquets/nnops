@@ -29,22 +29,30 @@ size_t Attention::getWorkspaceSize(std::span<const TensorDesc> inputs,
     return 0;
 }
 
-void Attention::compute(std::span<TensorView> outputs,
-                         std::span<const TensorView> inputs,
-                         const ComputeContext& ctx,
-                         void* workspace)
+Status Attention::validate(std::span<const TensorDesc> inputs,
+                           std::span<const TensorDesc> outputs) const
 {
-    NNOPS_ASSERT(inputs.size() >= 3);
-    NNOPS_ASSERT(inputs.size() <= 4);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-    NNOPS_ASSERT(!inputs[0].is_empty());
-    NNOPS_ASSERT(!inputs[1].is_empty());
-    NNOPS_ASSERT(!inputs[2].is_empty());
-    NNOPS_ASSERT(is_layout_supported(inputs[0].layout(), LayoutSupport::PlanarOnly));
+    // Q, K, V [, mask]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 4, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+}
 
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+Status Attention::compute(std::span<TensorView> outputs,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx,
+                          void* workspace)
+{
+    // The optional mask is allowed to arrive as an empty view (meaning absent),
+    // so only the three required inputs are checked for data.
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 4, 1));
+    for (size_t i = 0; i < 3; ++i) {
+        if (inputs[i].is_empty()) { return Status::invalid_argument; }
+    }
+    if (outputs[0].is_empty()) { return Status::invalid_argument; }
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops

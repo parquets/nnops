@@ -86,9 +86,12 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    Status validate(std::span<const TensorDesc> inputs,
+                    std::span<const TensorDesc> outputs) const override;
+
     using OpBase::compute;
 
-    void compute(std::span<TensorView> outputs,
+    Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
@@ -130,9 +133,12 @@ public:
     std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const override;
 
+    Status validate(std::span<const TensorDesc> inputs,
+                    std::span<const TensorDesc> outputs) const override;
+
     using OpBase::compute;
 
-    void compute(std::span<TensorView> outputs,
+    Status compute(std::span<TensorView> outputs,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;

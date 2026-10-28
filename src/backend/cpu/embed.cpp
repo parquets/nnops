@@ -156,7 +156,7 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
 
 }  // anonymous namespace
 
-void embed_cpu(const EmbedAttributes& attrs,
+Status embed_cpu(const EmbedAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx,
@@ -167,11 +167,11 @@ void embed_cpu(const EmbedAttributes& attrs,
 
     if (w_dtype == DataType::f32) {
         embed_direct_impl<float>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     }
     if (w_dtype == DataType::f16) {
         embed_direct_impl<half>(attrs, output, inputs, ctx);
-        return;
+        return Status::ok;
     }
 
     // Int8/uint8 weight: dequantize to f32 or f16 output.
@@ -183,6 +183,7 @@ void embed_cpu(const EmbedAttributes& attrs,
     } else {
         NNOPS_ASSERT(!"embed_cpu: unsupported weight dtype");
     }
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

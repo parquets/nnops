@@ -294,7 +294,7 @@ void concat_impl(const ConcatAttributes& attrs,
     }
 }
 
-void concat_cpu(const ConcatAttributes& attrs,
+Status concat_cpu(const ConcatAttributes& attrs,
                  TensorView& output,
                  std::span<const TensorView> inputs,
                  const ComputeContext& /*ctx*/,
@@ -304,6 +304,7 @@ void concat_cpu(const ConcatAttributes& attrs,
         using T = typename decltype(tag)::type;
         concat_impl<T>(attrs, output, inputs);
     });
+    return Status::ok;
 }
 
 }  // namespace nnops::backend::cpu

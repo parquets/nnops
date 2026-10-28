@@ -19,17 +19,21 @@ std::vector<TensorDesc> Concat::getOutputTensorDesc(
     return concat_output_shape(attrs_.axis, inputs);
 }
 
-void Concat::compute(std::span<TensorView> outputs,
+Status Concat::validate(std::span<const TensorDesc> inputs,
+                        std::span<const TensorDesc> outputs) const
+{
+    return detail::check_counts(inputs.size(), outputs.size(), 2, size_t(-1), 1);
+}
+
+Status Concat::compute(std::span<TensorView> outputs,
                        std::span<const TensorView> inputs,
                        const ComputeContext& ctx,
                        void* workspace)
 {
-    NNOPS_ASSERT(inputs.size() >= 2);
-    NNOPS_ASSERT(outputs.size() == 1);
-    auto& output = outputs[0];
-    NNOPS_ASSERT(!output.is_empty());
-
-    impl_->kernel_fn(attrs_, output, inputs, ctx, workspace);
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, size_t(-1), 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
 }
 
 }  // namespace nnops
