@@ -1492,6 +1492,11 @@ NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
         { 64, 56, 128, 3, 2, 20, 128, 2, 1},
         // One filter block cannot be split at all — 20 threads must make do.
         { 64, 56,  64, 3, 1, 20,  64, 4, 1},
+        // A plane whose block count is ODD: 17 rows over two-row blocks is 9,
+        // so 20 threads want 2 chunks (18 tasks, one wave) and the ceiling
+        // would pick 3 (27 tasks, a second wave of seven that the barrier waits
+        // on — 152 against 226 GFLOPS in bench_conv2d's odd-plane rows).
+        { 64, 17,  64, 3, 1, 20,  64, 2, 2},
     };
 
     float placeholder = 0.0f;

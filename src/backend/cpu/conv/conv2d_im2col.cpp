@@ -589,7 +589,14 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // Gated like the oh-block halving: split only while more than half the pool
     // is idle. A 56-plane already fills 14 threads on its own, and a split there
     // would duplicate the gather for nothing. The quantized route keeps the
-    // single axis — its driver and accumulator layout are per-oh-chunk.
+    // single axis — its driver and accumulator layout is per-oh-chunk.
+    //
+    // The chunk count is the NEAREST whole number to nt/plane_tasks, not the
+    // ceiling (the same rule, and the same reason, as the winograd plan's). An
+    // odd plane count is where the difference shows: a 9-block plane at 20
+    // threads wants 2 chunks (18 tasks, one wave), and ceil picks 3 (27 tasks,
+    // a second wave of 7 that the barrier waits on) — measured 152 vs 226
+    // GFLOPS on a 17x17 plane, so the ceiling is not a rounding detail.
     plan.oc_chunks = 1;
     if (!quant) {
         // Two M-panels per task is the floor, mirroring the oh-block's two
@@ -599,8 +606,8 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
         const int64_t plane_tasks = NG * plan.oh_chunks;
         if (2 * plane_tasks < nt) {
             const int64_t max_chunks = std::max<int64_t>(1, oc_per_group / (2 * mr));
-            plan.oc_chunks = std::clamp<int64_t>((nt + plane_tasks - 1) / plane_tasks,
-                                                 1, max_chunks);
+            const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
+            plan.oc_chunks = std::clamp<int64_t>(want, 1, max_chunks);
         }
     }
 

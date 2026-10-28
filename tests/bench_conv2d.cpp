@@ -1501,6 +1501,21 @@ NNOPS_BENCH(conv2d_f32_resnet50_stack) {
     }, sweep_threads(), 250.0);
 }
 
+NNOPS_BENCH(conv2d_f32_odd_plane_tasks) {
+    // The planes whose oh-block count is odd, which is where the filter-axis
+    // chunk rule is observable. Rounding the task count up to fill the pool
+    // overshoots on these: a 9-block plane at 20 threads is 27 tasks with the
+    // ceiling (a second wave of 7 that the barrier waits on) against 18 with
+    // the nearest whole number (one wave), and that reads 152 vs 226 GFLOPS.
+    // The 11- and 13-block rows are the other side: the split's gate (idle
+    // pool) leaves them on the plane axis alone at every thread count here.
+    sweep_conv<float>("f32 odd plane", {
+        {1, 64, 17, 64, 3},   // 17 rows / oh_block 2 -> 9 blocks
+        {1, 64, 21, 64, 3},   // 11 blocks
+        {1, 64, 25, 64, 3},   // 13 blocks
+    }, sweep_threads(), 120.0);
+}
+
 NNOPS_BENCH(conv2d_f32_resnet18_stack) {
     sweep_conv<float>("f32 resnet18", {
         {1,   3, 224,  64, 7, /*S=*/2},                        // conv1
