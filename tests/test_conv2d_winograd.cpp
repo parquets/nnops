@@ -378,7 +378,8 @@ void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
                      Conv2DAttributes attrs, bool has_bias,
                      float fill_out = 0.0f,
                      const ComputeContext* ctx = nullptr,
-                     float rtol = 1e-4f, float atol = 1e-4f)
+                     float rtol = 1e-4f, float atol = 1e-4f,
+                     ConvAlgorithm algorithm = ConvAlgorithm::Winograd)
 {
     auto [in_buf, in_view] = test::make_random_tensor(
         std::span<const int64_t>(in_shape.begin(), in_shape.size()), -1.0f, 1.0f, 101);
@@ -398,7 +399,7 @@ void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
     std::vector<TensorDesc> descs = {in_view.desc(), w_view.desc()};
     if (has_bias) { descs.push_back(bias_view.desc()); }
 
-    attrs.algorithm = ConvAlgorithm::Winograd;
+    attrs.algorithm = algorithm;
     auto op = Conv2D::create(attrs, Backend::CPU);
     const auto outs = op->getOutputTensorDesc(descs);
     const int64_t on = desc_numel(outs[0]);
@@ -447,6 +448,50 @@ void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
 }
 
 }  // anonymous namespace
+
+// ---- selection policy and the Auto algorithm ------------------------------
+
+NNOPS_TEST(wino_applicable_thresholds) {
+    Conv2DAttributes a;
+    a.kernel_size = {3, 3};
+    a.padding = {1, 1};
+
+    // Every condition met: k3s1, 32 channels, a 14x14 input.
+    NNOPS_EXPECT_TRUE(winograd_applicable(a, 32, 14, 14));
+    NNOPS_EXPECT_TRUE(winograd_applicable(a, 512, 56, 56));
+
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 31, 14, 14));  // too few channels
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 13, 14));  // too short
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 14, 13));  // too narrow
+
+    Conv2DAttributes k1 = a;
+    k1.kernel_size = {1, 1};
+    NNOPS_EXPECT_FALSE(winograd_applicable(k1, 64, 28, 28));
+
+    Conv2DAttributes s2 = a;
+    s2.stride = {2, 2};
+    NNOPS_EXPECT_FALSE(winograd_applicable(s2, 64, 28, 28));
+
+    Conv2DAttributes d2 = a;
+    d2.dilation = {2, 2};
+    NNOPS_EXPECT_FALSE(winograd_applicable(d2, 64, 28, 28));
+
+    // The caller's off switch: ImplicitGemm keeps the prepack from happening.
+    Conv2DAttributes off = a;
+    off.algorithm = ConvAlgorithm::ImplicitGemm;
+    NNOPS_EXPECT_FALSE(winograd_applicable(off, 64, 28, 28));
+}
+
+NNOPS_TEST(wino_auto_follows_the_weight) {
+    // Auto is the default: handing it the prepacked U is what selects Winograd.
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    NNOPS_EXPECT_TRUE(attrs.algorithm == ConvAlgorithm::Auto);
+    wino_vs_ref_f32({1, 4, 8, 8}, {6, 4, 3, 3}, attrs, /*has_bias=*/false,
+                    0.0f, nullptr, 1e-4f, 1e-4f, ConvAlgorithm::Auto);
+}
 
 NNOPS_TEST(wino_matches_ref_plain) {
     Conv2DAttributes attrs;

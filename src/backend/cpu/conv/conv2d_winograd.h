@@ -63,10 +63,11 @@
 /// control, medians of 3): f32 is ahead from 32 channels up — ~1.2x at 32,
 /// ~1.3-1.45x at 64 and ~1.55-1.6x at 256 — and a wash at 8; f16 reaches
 /// ~1.35x at 64 and ~1.6-1.7x at 256. A batch-4 quad is ~1.35-1.45x, because
-/// the batch axis is now in the task grid. Selecting Winograd is therefore the
-/// caller's explicit choice
-/// (ConvAlgorithm::Winograd — there is no Auto), never something this path
-/// decides for them.
+/// the batch axis is now in the task grid. So whether a conv is worth
+/// transforming is the caller's decision, taken once when it prepacks —
+/// winograd_applicable() is that policy (the caller allows it, k3s1, at least
+/// 32 input channels per group, at least a 14x14 input); ConvAlgorithm::Auto
+/// then only follows the weight it is given.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"

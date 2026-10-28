@@ -21,9 +21,16 @@ namespace nnops {
 /// minimal-filtering fast path: it is only valid for k3s1 (dilation 1) and
 /// requires the caller to run prepackWeights first (compute then takes the
 /// transformed weight U as inputs[1], not the raw weight).
+///
+/// Auto follows the weight it is handed — U means Winograd, a raw filter means
+/// im2col — so a caller that predates the enum, or that simply prepacks when
+/// winograd_applicable() says so, needs no other attribute. What Auto does not
+/// do is decide the prepack: that stays the caller's call, because it is the
+/// one that allocates U.
 enum class ConvAlgorithm : uint8_t {
-    ImplicitGemm = 0,  ///< Tiled im2col + GEMM (default; supports any geometry)
+    ImplicitGemm = 0,  ///< Tiled im2col + GEMM (supports any geometry)
     Winograd,          ///< F(2×2, 3×3) Winograd, k3s1 only, requires prepacked U
+    Auto,              ///< Winograd for a prepacked U, im2col otherwise (default)
 };
 
 /// True for the quantized Conv2D route: an s8 weight (per-channel QuantParams)
@@ -101,16 +108,42 @@ struct Conv2DAttributes {
     /// pre-quantized activations keep their storage type.
     DataType act_quant_dtype = DataType::s8;
 
-    /// Kernel-selection hint for the CPU backend (default preserves today's
-    /// tiled im2col path, so existing callers are unaffected).
+    /// Kernel-selection hint for the CPU backend.
     ///
     /// Winograd is only honoured for k3s1 (KH == KW == 3, stride 1, dilation 1)
     /// with a raw f32/f16 weight, and it requires the transformed weight U —
     /// produced by prepackWeights — as inputs[1] of compute(). Shape inference
     /// is unaffected: getOutputTensorDesc still reads the *raw* weight desc, so
     /// the caller passes the raw weight for shape inference and U for compute.
-    ConvAlgorithm algorithm = ConvAlgorithm::ImplicitGemm;
+    ConvAlgorithm algorithm = ConvAlgorithm::Auto;
 };
+
+/// The Winograd selection policy — what a caller checks before prepackWeights,
+/// which is what actually turns the route on (compute() only follows the weight
+/// it is given, since im2col cannot read U).
+///
+/// All four have to hold:
+///
+///   * The caller allows it: attrs.algorithm is Auto or Winograd. ImplicitGemm
+///     is the off switch — it keeps the prepack from happening at all.
+///   * k3s1 — the kernel implements F(2×2, 3×3) only (dilation 1 included).
+///   * At least 32 input channels per group. The input/output transforms cost a
+///     fixed amount per tile per channel, so the 2.25x multiply saving needs a
+///     wide K to pay for them: a wash at 8 channels, ~1.2x at 32, 1.5-1.6x at
+///     128-256.
+///   * At least 14x14 of input. Below that the kernel's 8-lane tile packing
+///     inflates the GEMM's N more than the multiply saving is worth — a 7x7
+///     output packs its 4 real tile columns to 8 and runs 0.65x the speed of
+///     im2col, while 14x14 packs 7 to 8 (14% waste) and keeps a 1.15x lead.
+inline bool winograd_applicable(const Conv2DAttributes& attrs,
+                                int64_t ic_per_group, int64_t ih, int64_t iw)
+{
+    return attrs.algorithm != ConvAlgorithm::ImplicitGemm &&
+           attrs.kernel_size[0] == 3 && attrs.kernel_size[1] == 3 &&
+           attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
+           attrs.dilation[0] == 1 && attrs.dilation[1] == 1 &&
+           ic_per_group >= 32 && ih >= 14 && iw >= 14;
+}
 
 /// Conv2D operator (class-based API).
 ///

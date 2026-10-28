@@ -140,8 +140,18 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         return backend::cpu::conv2d_im2col_kernel(attrs, output, inputs, ctx, workspace);
     }
 
-    if (!impl_->kernel_fn) { return Status::unsupported; }
-    return impl_->kernel_fn(attrs, output, inputs, ctx, workspace);
+    // Auto reads the weight it was handed: U can only be multiplied in the
+    // transform domain, and a raw filter has no U to use.
+    auto kernel_fn = impl_->kernel_fn;
+    if (attrs.algorithm == ConvAlgorithm::Auto) {
+        attrs.algorithm = (inputs[1].layout() == TensorLayout::PackedWinoWeight)
+                              ? ConvAlgorithm::Winograd
+                              : ConvAlgorithm::ImplicitGemm;
+        kernel_fn = resolve_conv2d_kernel(backend_, attrs.algorithm);
+    }
+
+    if (!kernel_fn) { return Status::unsupported; }
+    return kernel_fn(attrs, output, inputs, ctx, workspace);
 }
 
 void Conv2D::prepackWeights(std::span<const TensorView> inputs,
@@ -152,8 +162,9 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
 
     // compute() receives U and cannot fall back to the raw-weight im2col path,
     // so every unsupported configuration has to fail here, at prepack time.
-    NNOPS_ASSERT(attrs_.algorithm == ConvAlgorithm::Winograd &&
-                 "Conv2D::prepackWeights: attrs.algorithm must be Winograd");
+    NNOPS_ASSERT((attrs_.algorithm == ConvAlgorithm::Winograd ||
+                  attrs_.algorithm == ConvAlgorithm::Auto) &&
+                 "Conv2D::prepackWeights: attrs.algorithm must be Winograd or Auto");
     NNOPS_ASSERT(attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
                  attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
                  attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1 &&
