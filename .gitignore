@@ -32,3 +32,6 @@ cmake_install.cmake
 compile_commands.json
 CTestTestfile.cmake
 __pycache__/
+
+# Exported model artifacts (regenerate with models/export/export_model.py)
+models/data/

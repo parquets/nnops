@@ -190,6 +190,11 @@ scripts/run_tests.sh Release
 
 Tests use a self-contained harness (XorShift128 RNG, `allclose` comparison) — no external test framework.
 
+`models/` holds end-to-end network tests — ResNet-18 and MobileNetV2 rebuilt
+from nnops operators and compared layer by layer against PyTorch. They read
+artifacts exported by `models/export/export_model.py` and skip (exit 77) when
+those are absent; see [models/README.md](models/README.md).
+
 ## Benchmarks
 
 Each `tests/bench_*.cpp` builds into its own standalone benchmark executable, mirroring

@@ -8,6 +8,7 @@ project(nnops
 # ---- Options ----
 option(NNOPS_BUILD_TESTS      "Build unit tests"           ON)
 option(NNOPS_BUILD_BENCHMARKS "Build benchmarks"           ON)
+option(NNOPS_BUILD_MODELS     "Build the end-to-end model tests" ON)
 option(NNOPS_BUILD_CUDA       "Build CUDA backend"         OFF)
 option(NNOPS_BUILD_VULKAN     "Build Vulkan backend"       OFF)
 option(NNOPS_OPENMP           "Build the OpenMP CpuBackend adapter" OFF)
@@ -77,4 +78,10 @@ install(DIRECTORY include/nnops DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(NNOPS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ---- End-to-end model tests (need exported artifacts, see models/README.md) ----
+if(NNOPS_BUILD_MODELS)
+    enable_testing()
+    add_subdirectory(models)
 endif()
