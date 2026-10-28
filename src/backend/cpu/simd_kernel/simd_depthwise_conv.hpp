@@ -16,6 +16,7 @@
 #include "simd_access.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 namespace nnops::kernel {
 
@@ -103,72 +104,235 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 // latency hides behind itself. The rows do not share loads (each reads its own
 // input row), so unlike the packed kernel this buys no bandwidth — only ILP.
 
+/// Lane masks for the plane's two edge width vectors. A vector at the first or
+/// last output position reads past the row — the left pad or the right tail —
+/// and the general path pays for that with planar_load's per-lane scalar loop.
+/// Zeroing the invalid lanes turns the same vector load into a valid one, and
+/// because the mask is the same for every output row it folds into the tap's
+/// broadcast weight: the R-row loop is then the interior loop, a load and an
+/// FMA, rather than eight scalar iterations per tap.
+///
+/// Only the edge vectors can use it. A middle vector that is not interior (a
+/// kernel wide enough to span a whole vector) still takes the scalar path,
+/// which is what `e == -1` in the kernel means. Built once per operator call;
+/// `needed[e*KW+kw] == 0` says the mask is all ones, and the multiply is
+/// skipped. The masked load reads up to PW before the row start and up to
+/// L-1+(KW-1)*DW past its end, which is inside the tensor for every row but the
+/// first and last — the driver clears `masks` for those two row blocks. Those
+/// lanes are real tensor neighbours, not zeros, so a non-finite value there
+/// would reach the FMA (0 × NaN); the reference path never reads them.
+struct DwPlanarEdges {
+    const void* masks = nullptr;      ///< [2][KW][L] elements of T
+    const uint8_t* needed = nullptr;  ///< [2][KW]
+    int64_t kw = 0;
+    int64_t last_ow = 0;              ///< ow of the final width vector
+};
+
+/// Fill `masks` ([2*MaxKw*L] elements of T) and `needed` ([2*MaxKw]) from `p` and
+/// return the descriptor. The buffers stay the caller's; the result carries no
+/// pointer of its own lifetime, so the caller may copy it per task and null
+/// `masks` out. Returns a descriptor with `masks == nullptr` for the shapes the
+/// masks do not serve — a stride the even-load cannot express, or a kernel past
+/// the caller's cap — which is the same thing as asking for the general path.
+template <int64_t MaxKw, typename T>
+inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, uint8_t* needed)
+{
+    constexpr int64_t L = simd_lane_for<T>;
+    DwPlanarEdges edges;
+    if ((p.SW != 1 && p.SW != 2) || p.KW > MaxKw) {
+        return edges;
+    }
+
+    const int64_t last_ow = ((p.OW + L - 1) / L - 1) * L;
+    // One vector is both edges; `e` in the kernel resolves to 0 for it and the
+    // two masks below come out identical, so nothing special is needed.
+    const int64_t ow_edge[2] = {0, last_ow};
+    for (int64_t e = 0; e < 2; ++e) {
+        for (int64_t kw = 0; kw < p.KW; ++kw) {
+            T* mk = masks + (e * p.KW + kw) * L;
+            bool all = true;
+            for (int64_t l = 0; l < L; ++l) {
+                const int64_t col = (ow_edge[e] + l) * p.SW + kw * p.DW - p.PW;
+                const bool ok = col >= 0 && col < p.IW;
+                mk[l] = ok ? static_cast<T>(1) : static_cast<T>(0);
+                all = all && ok;
+            }
+            // All lanes valid: the multiply would be by ones.
+            needed[e * p.KW + kw] = all ? 0 : 1;
+        }
+    }
+
+    edges.masks   = masks;
+    edges.needed  = needed;
+    edges.kw      = p.KW;
+    edges.last_ow = last_ow;
+    return edges;
+}
+
+/// Copy `n` elements, 1 <= n < L. The count is a runtime value but has only
+/// L-1 possibilities, all known to the caller, so the switch collapses each one
+/// to a single block move — the per-lane loop it replaces was a load and a
+/// store per element.
+template <typename T>
+inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
+{
+    switch (n) {
+        case 1: std::memcpy(dst, src, 1 * sizeof(T)); break;
+        case 2: std::memcpy(dst, src, 2 * sizeof(T)); break;
+        case 3: std::memcpy(dst, src, 3 * sizeof(T)); break;
+        case 4: std::memcpy(dst, src, 4 * sizeof(T)); break;
+        case 5: std::memcpy(dst, src, 5 * sizeof(T)); break;
+        case 6: std::memcpy(dst, src, 6 * sizeof(T)); break;
+        case 7: std::memcpy(dst, src, 7 * sizeof(T)); break;
+        case 8: std::memcpy(dst, src, 8 * sizeof(T)); break;
+        default: break;
+    }
+}
+
 /// R output rows per call, one width-vector accumulate per row. T is the
 /// element type; the accumulate and the epilogue ride it.
-template <int R, typename T>
+///
+/// SW is the width stride when the caller knows it (1 or 2), 0 when it does
+/// not. It is a template argument because everything it decides — which load
+/// form the taps take, how wide a vector is in the input, hence where the
+/// interior begins — would otherwise be a branch inside the tap loop, and the
+/// tap loop is a load and an FMA.
+template <int R, int SW, typename T>
 inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
                                const DwConvParams& p, const Epilogue& epilogue,
-                               bool add_to)
+                               bool add_to, const DwPlanarEdges& edges)
 {
     constexpr int64_t L = simd_lane_for<T>;
     const T zero = static_cast<T>(0);
+    const auto v_bias = v_set1(out, bias);
+
+    const int64_t sw = (SW != 0) ? SW : p.SW;
+    const auto load_row = [&](const T* src) {
+        if constexpr (SW == 1) {
+            return v_load(src);
+        } else if constexpr (SW == 2) {
+            return v_load_even(src);
+        } else {
+            return (p.SW == 1) ? v_load(src) : v_load_even(src);
+        }
+    };
+
+    // Every input row this call touches, one entry per (kd, kh, r), null where
+    // the row does not exist. The width loop is the inner one, so the four
+    // int64 multiplies that build these addresses used to be paid once per
+    // output vector — more scalar work than the nine taps above them. A table
+    // read replaces them. Kernels past the cap keep the arithmetic inline.
+    constexpr int64_t kMaxTapRows = 256;   // (kd, kh, r): 8x8 with R=4 fits
+    const T* row_tab[kMaxTapRows];
+    // It is worth building only when a row spans more than one width vector:
+    // at one vector the table costs more to fill than the arithmetic it saves.
+    // Measured either side of the gate (1T GFLOPS, 3x3): a two-vector row is a
+    // wash (14.0 vs 14.3), four vectors pay 18.5 vs 13.1, and a 112-wide plane
+    // 28.3 vs 13.8.
+    const int64_t nvec = (p.OW + L - 1) / L;
+    const bool have_tab = (p.KD * p.KH * R <= kMaxTapRows) && (nvec >= 2);
+    bool all_rows = have_tab;
+    if (have_tab) {
+        int64_t t = 0;
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            const T* in_d = in + id * p.in_d_stride;
+            const bool d_ok = (id >= 0 && id < p.ID);
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                for (int r = 0; r < R; ++r) {
+                    const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                    const bool ok = d_ok && (p.oh + r < p.OH) &&
+                                    ih >= 0 && ih < p.IH;
+                    row_tab[t++] = ok ? in_d + ih * p.in_row_stride : nullptr;
+                    all_rows = all_rows && ok;
+                }
+            }
+        }
+    }
+
+    // Horizontal interior span, also per call: the vector at ow is interior
+    // when everything it touches is inside the row. v_load_even deinterleaves
+    // 2L elements to produce L outputs, so a stride-2 vector reads twice the
+    // width a stride-1 one does — the same guard planar_load uses.
+    const int64_t span  = (sw == 2) ? 2 * L : L;
+    const int64_t need  = (p.KW - 1) * p.DW + span;    // past the first column
+    const int64_t ow_lo = (p.PW + sw - 1) / sw;        // first ow with iw >= 0
+    const int64_t ow_hi = (p.IW + p.PW - need >= 0)
+                              ? (p.IW + p.PW - need) / sw : -1;
 
     for (int64_t ow = 0; ow < p.OW; ow += L) {
         decltype(v_set1(out, bias)) acc[R];
-        for (int r = 0; r < R; ++r) { acc[r] = v_set1(out, bias); }
+        for (int r = 0; r < R; ++r) { acc[r] = v_bias; }
 
         // Does this whole width vector — every lane, every row, every tap —
         // land inside the input? Then the taps need no bounds test and no
         // scalar fill: one branch per vector instead of one per tap. That is
         // the interior nn_compute reaches by peeling the padded border off at
-        // the driver; here the same test is cheap enough to do per vector, so
-        // a caller pays nothing and the border keeps the general path.
-        // v_load_even deinterleaves 2L elements to produce one vector, so a
-        // stride-2 vector touches twice the width a stride-1 one does — the
-        // same guard planar_load uses on its fast path.
-        const int64_t iw_first = ow * p.SW - p.PW;
-        const int64_t span     = (p.SW == 2) ? 2 * L : L;
-        const int64_t iw_end   = iw_first + (p.KW - 1) * p.DW + span;
-        bool interior = (p.SW == 1 || p.SW == 2) && iw_first >= 0 && iw_end <= p.IW;
-        for (int r = 0; interior && r < R; ++r) {
-            const int64_t ih0 = (p.oh + r) * p.SH - p.PH;
-            interior = (p.oh + r < p.OH) && ih0 >= 0 &&
-                       ih0 + (p.KH - 1) * p.DH < p.IH;
-        }
+        // the driver; here the same test is cheap enough to do per vector.
+        const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
+
+        // Which edge vector this is: 0 first, 1 last, -1 neither. Only those
+        // two carry a mask; a single-vector plane has one mask for both.
+        const int64_t e = (ow == 0) ? 0 : ((ow == edges.last_ow) ? 1 : -1);
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
-            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) { continue; }
-            const T* in_d = in + id * p.in_d_stride;
-
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 const T* row[R];
-                bool ok[R];
-                for (int r = 0; r < R; ++r) {
-                    const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                    ok[r] = (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
-                    row[r] = in_d + ih * p.in_row_stride;
+                if (have_tab) {
+                    const int64_t t = (kd * p.KH + kh) * R;
+                    for (int r = 0; r < R; ++r) { row[r] = row_tab[t + r]; }
+                } else {
+                    const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+                    if (id < 0 || id >= p.ID) { continue; }
+                    const T* in_d = in + id * p.in_d_stride;
+                    for (int r = 0; r < R; ++r) {
+                        const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                        const bool ok = (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
+                        row[r] = ok ? in_d + ih * p.in_row_stride : nullptr;
+                    }
                 }
                 const T* w_row = w + (kd * p.KH + kh) * p.KW;
 
                 if (interior) {
                     for (int64_t kw = 0; kw < p.KW; ++kw) {
-                        const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
+                        const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
                         const auto vk = v_set1(out, s_load(&w_row[kw]));
                         for (int r = 0; r < R; ++r) {
-                            const T* src = row[r] + iw0;
-                            acc[r] = v_fmadd(
-                                (p.SW == 1) ? v_load(src) : v_load_even(src), vk, acc[r]);
+                            acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
+                        }
+                    }
+                    continue;
+                }
+
+                // Edge vector with a precomputed mask. This is what keeps a
+                // narrow plane — where EVERY width vector is an edge — out of
+                // the per-lane scalar fallback below.
+                if (edges.masks != nullptr && e >= 0) {
+                    for (int64_t kw = 0; kw < p.KW; ++kw) {
+                        const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
+                        // The mask zeroes exactly the lanes this tap would read
+                        // from outside the row, and it is the same for every
+                        // row — so it folds into the broadcast weight, once per
+                        // tap, and the R-row loop stays the interior one:
+                        // a load and an FMA, no extra multiply.
+                        auto vk = v_set1(out, s_load(&w_row[kw]));
+                        if (edges.needed[e * edges.kw + kw]) {
+                            vk = v_mul(vk, v_load(static_cast<const T*>(edges.masks) +
+                                                  (e * edges.kw + kw) * L));
+                        }
+                        for (int r = 0; r < R; ++r) {
+                            if (row[r] == nullptr) { continue; }
+                            acc[r] = v_fmadd(load_row(row[r] + iw0), vk, acc[r]);
                         }
                     }
                     continue;
                 }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
+                    const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
                     const auto vk = v_set1(out, s_load(&w_row[kw]));
                     for (int r = 0; r < R; ++r) {
-                        if (!ok[r]) { continue; }
+                        if (row[r] == nullptr) { continue; }
                         acc[r] = v_fmadd(planar_load(row[r], iw0, p.SW, p.IW, zero),
                                          vk, acc[r]);
                     }
@@ -184,11 +348,19 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
             if (lanes == L) {
                 v_store_add(dst, v, add_to);
             } else {
+                // The last vector of a row is short by a fixed amount, so the
+                // store is a block copy of that many elements, not a per-lane
+                // loop: on a 7-wide plane this is the whole row's store, and
+                // the loop was costing more than the nine taps above it.
                 alignas(32) T tmp[L];
-                v_store(tmp, v);
-                for (int64_t l = 0; l < lanes; ++l) {
-                    s_store_add(dst + l, s_load(&tmp[l]), add_to);
+                if (add_to) {
+                    alignas(32) T cur[L] = {};
+                    dwconv_copy_prefix<T>(cur, dst, lanes);
+                    v_store(tmp, v_add(v, v_load(cur)));
+                } else {
+                    v_store(tmp, v);
                 }
+                dwconv_copy_prefix<T>(dst, tmp, lanes);
             }
         }
     }
@@ -201,18 +373,26 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
 template <typename T>
 inline void dwconv_planar_h4(T* out, const T* in, const T* w, float bias,
                              const DwConvParams& p, const Epilogue& epilogue,
-                             bool add_to)
+                             bool add_to, const DwPlanarEdges& edges)
 {
-    dwconv_planar_rows<4>(out, in, w, bias, p, epilogue, add_to);
+    switch (p.SW) {
+        case 1:  dwconv_planar_rows<4, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 2:  dwconv_planar_rows<4, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        default: dwconv_planar_rows<4, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
+    }
 }
 
 /// One row — the tail of an h4 loop, and the whole kernel for a single-row call.
 template <typename T>
 inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
                           const DwConvParams& p, const Epilogue& epilogue,
-                          bool add_to)
+                          bool add_to, const DwPlanarEdges& edges)
 {
-    dwconv_planar_rows<1>(out, in, w, bias, p, epilogue, add_to);
+    switch (p.SW) {
+        case 1:  dwconv_planar_rows<1, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 2:  dwconv_planar_rows<1, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        default: dwconv_planar_rows<1, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
+    }
 }
 
 template <typename T>

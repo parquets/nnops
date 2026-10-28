@@ -97,6 +97,21 @@ void dwconv_impl(
     p.in_d_stride    = in_d_stride;
     p.in_row_stride  = in_row_stride;
 
+    // Planar edge masks. The first and last width vectors of a row are the only
+    // ones that read past it, and on a narrow plane they are the only ones
+    // there are — that is exactly where planar_load's per-lane scalar loop used
+    // to eat the whole kernel. A mask zeroes the lanes that fall outside the
+    // row, so the same vector load stays valid and a tap costs a load and an
+    // FMA instead of eight scalar iterations. It depends only on (edge, tap),
+    // never on the row, so it is built once here for the whole call.
+    constexpr int64_t kMaskLanes = simd_lane_for<T>;
+    constexpr int64_t kMaskMaxKw = 16;
+    uint8_t edge_needed[2 * kMaskMaxKw] = {};
+    alignas(32) T edge_masks[2 * kMaskMaxKw * kMaskLanes] = {};
+    const k::DwPlanarEdges edges = packed
+        ? k::DwPlanarEdges{}
+        : k::dwconv_planar_edge_masks<kMaskMaxKw, T>(p, edge_masks, edge_needed);
+
     // Per-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
     const auto compute_block = [&](int64_t n, int64_t blk) {
         const T* in_base  = in_ptr  + n * blocks * in_ch_stride  + blk * in_ch_stride;
@@ -110,6 +125,16 @@ void dwconv_impl(
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::DwConvParams pc = p;
 
+        // The masked load reads up to PW before the row start and up to
+        // L-1+(KW-1)*DW past its end, which lands in the neighbouring row — and
+        // is harmless there, since those lanes are masked to zero — for every
+        // row but the tensor's first and last. Those two blocks keep the
+        // bounds-checked path; that is one channel of a batch, once.
+        k::DwPlanarEdges blk_edges = edges;
+        if ((n == 0 && blk == 0) || (n == N - 1 && blk == blocks - 1)) {
+            blk_edges.masks = nullptr;
+        }
+
         for (int64_t od = 0; od < OD; ++od) {
             T* out_d = out_base + od * out_d_stride;
 
@@ -121,13 +146,14 @@ void dwconv_impl(
                     pc.od = od;
                     pc.oh = oh;
                     k::dwconv_planar_h4(out_d + oh * pc.out_row_stride, in_base,
-                                        w_base, bias, pc, attrs.epilogue, attrs.add_to);
+                                        w_base, bias, pc, attrs.epilogue, attrs.add_to,
+                                        blk_edges);
                 }
                 for (; oh < OH; ++oh) {
                     pc.od = od;
                     pc.oh = oh;
                     k::dwconv_planar(out_d + oh * pc.out_row_stride, in_base, w_base,
-                                     bias, pc, attrs.epilogue, attrs.add_to);
+                                     bias, pc, attrs.epilogue, attrs.add_to, blk_edges);
                 }
                 continue;
             }

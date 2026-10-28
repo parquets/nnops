@@ -131,6 +131,9 @@ struct DepthwiseCase {
     const char* name;
     int64_t C, IH, IW;
     int64_t KH = 3, KW = 3, SH = 1, SW = 1, PH = 1, PW = 1;
+    /// The model's depthwise stages ride a relu6 epilogue; the plain cases do
+    /// not. Kept on the case so the two can be compared in one run.
+    bool relu6 = false;
 };
 
 void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters,
@@ -148,6 +151,7 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     attrs.stride      = {1, c.SH, c.SW};
     attrs.dilation    = {1, 1, 1};
     attrs.padding     = {0, c.PH, c.PW};
+    if (c.relu6) { attrs.epilogue.type = nnops::EpilogueActivateType::Relu6; }
 
     // ---- planar arm: the tensors as they come out of a PyTorch model ----
     auto planar_op = DepthwiseConv::create(attrs, Backend::CPU);
@@ -261,9 +265,15 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
 // h1, exactly as the driver does.
 
 /// One channel's worth of the driver's planar loop, over the whole plane.
+///
+/// Edge masks are built the way the driver builds them — once per call from the
+/// shape — and then handed to every channel. The first and last channel plane
+/// are the tensor's first and last there, so they keep the bounds-checked path,
+/// exactly as the driver's block test does.
 void planar_kernel(const float* in, float* out, const float* w, const float* b,
                    const DepthwiseCase& c, int64_t OH, int64_t OW, bool h4) {
     const Epilogue ep{};
+    constexpr int64_t kMaskMaxKw = 16;
 
     for (int64_t ch = 0; ch < c.C; ++ch) {
         k::DwConvParams p{};
@@ -278,6 +288,12 @@ void planar_kernel(const float* in, float* out, const float* w, const float* b,
         p.in_row_stride  = c.IW;
         p.od = 0;
 
+        uint8_t needed[2 * kMaskMaxKw] = {};
+        alignas(32) float masks[2 * kMaskMaxKw * 8] = {};
+        k::DwPlanarEdges edges =
+            k::dwconv_planar_edge_masks<kMaskMaxKw, float>(p, masks, needed);
+        if (ch == 0 || ch == c.C - 1) { edges.masks = nullptr; }
+
         const float* in_c  = in  + ch * c.IH * c.IW;
         float*       out_c = out + ch * OH * OW;
         const float* w_c   = w   + ch * c.KH * c.KW;
@@ -286,12 +302,12 @@ void planar_kernel(const float* in, float* out, const float* w, const float* b,
         if (h4) {
             for (; oh + 3 < OH; oh += 4) {
                 p.oh = oh;
-                k::dwconv_planar_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false);
+                k::dwconv_planar_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
             }
         }
         for (; oh < OH; ++oh) {
             p.oh = oh;
-            k::dwconv_planar(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false);
+            k::dwconv_planar(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
         }
     }
 }
@@ -397,5 +413,85 @@ NNOPS_BENCH(depthwise_planar_unroll) {
 
     for (const auto& c : cases) {
         run_unroll_case(c, iters, rounds);
+    }
+}
+
+// ============================================================
+// MobileNetV2's actual depthwise mix
+// ============================================================
+//
+// The seventeen stages as the model runs them (the expansion conv decides the
+// channel count: 6x the block width), each one a separate operator call there.
+// The sum is what the model's `depthwise_fused` row should read if the kernel
+// rate holds at these shapes; the difference is per-call cost. Reference FLOPs
+// are printed so the two can be compared without redoing the arithmetic.
+
+NNOPS_BENCH(depthwise_planar_mobilenet) {
+    const std::vector<int> threads = bench_threads();
+    const int iters = 20;
+    const int rounds = 5;
+
+    std::printf("depthwise planar: MobileNetV2's seventeen stages, 3x3 p1\n");
+    std::printf("  pool=%s  threads=", test::bench_pool_name());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
+    }
+
+    const DepthwiseCase cases[] = {
+        {"f1   16@112 s1",    16, 112, 112, 3, 3, 1, 1, 1, 1, true},
+        {"f2  144@112 s2",   144, 112, 112, 3, 3, 2, 2, 1, 1, true},
+        {"f3  144@56  s1",   144,  56,  56, 3, 3, 1, 1, 1, 1, true},
+        {"f4  192@56  s2",   192,  56,  56, 3, 3, 2, 2, 1, 1, true},
+        {"f5  192@28  s1",   192,  28,  28, 3, 3, 1, 1, 1, 1, true},
+        {"f6  192@28  s1",   192,  28,  28, 3, 3, 1, 1, 1, 1, true},
+        {"f7  384@28  s2",   384,  28,  28, 3, 3, 2, 2, 1, 1, true},
+        {"f8  384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
+        {"f9  384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
+        {"f10 384@14  s1",   384,  14,  14, 3, 3, 1, 1, 1, 1, true},
+        {"f11 576@14  s1",   576,  14,  14, 3, 3, 1, 1, 1, 1, true},
+        {"f12 576@14  s1",   576,  14,  14, 3, 3, 1, 1, 1, 1, true},
+        {"f13 576@14  s1",   576,  14,  14, 3, 3, 1, 1, 1, 1, true},
+        {"f14 960@14  s2",   960,  14,  14, 3, 3, 2, 2, 1, 1, true},
+        {"f15 960@7   s1",   960,   7,   7, 3, 3, 1, 1, 1, 1, true},
+        {"f16 960@7   s1",   960,   7,   7, 3, 3, 1, 1, 1, 1, true},
+        {"f17 1920@7  s1",  1920,   7,   7, 3, 3, 1, 1, 1, 1, true},
+    };
+
+    for (const auto& c : cases) {
+        run_case(c, threads, iters, rounds);
+    }
+}
+
+// ============================================================
+// Narrow planes: the masked edge load, and what the width tail costs
+// ============================================================
+//
+// Widths 7 and 14 are MobileNetV2's last two stages; 8, 15 and 16 are the same
+// plane one element wider, i.e. the same number of taps and the nearest width
+// whose last vector is full. The pairs (7,8), (15,16) are therefore a direct
+// read on the scalar store tail, with the edge masking held constant.
+
+NNOPS_BENCH(depthwise_planar_narrow) {
+    const std::vector<int> threads = bench_threads();
+    const int iters = 20;
+    const int rounds = 5;
+
+    std::printf("depthwise planar: narrow widths, masked edges\n");
+    std::printf("  pool=%s  threads=", test::bench_pool_name());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
+    }
+
+    const DepthwiseCase cases[] = {
+        {"dw 3x3 C=960 @7  s1",  960,  7,  7},
+        {"dw 3x3 C=960 @8  s1",  960,  8,  8},
+        {"dw 3x3 C=960 @9  s1",  960,  9,  9},
+        {"dw 3x3 C=576 @14 s1",  576, 14, 14},
+        {"dw 3x3 C=576 @15 s1",  576, 15, 15},
+        {"dw 3x3 C=576 @16 s1",  576, 16, 16},
+    };
+
+    for (const auto& c : cases) {
+        run_case(c, threads, iters, rounds);
     }
 }
