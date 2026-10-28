@@ -35,45 +35,122 @@ struct DwConvParams {
 
 /// R output rows per call. W is the packed-weight element type; Tag only picks
 /// the epilogue's f32/f16 overload. Both are deduced by the wrappers below.
+///
+/// The width loop is the innermost one, so everything that depends only on the
+/// tap — the input row it reads, the output position it lands on — is hoisted
+/// out of it, the way the planar sibling hoists its row table and the MLAS
+/// NCHWc kernel peels its padding:
+///
+///   * one row pointer per (kd, kh, r), built once per call and already biased
+///     by the left pad, so a tap's address is `row + ow*SW + kw*DW` with no
+///     index arithmetic and no 64-bit product left in the loop;
+///   * an interior span of output positions whose every tap is inside the
+///     input row, where the tap loop takes no bounds test and no null test at
+///     all — one branch per position instead of one per tap.
+///
+/// The null test is what the border costs: it can only be skipped when every
+/// row of the group exists, so the first and last row group of a plane (and the
+/// short group at its bottom) keep the checked path.
+///
+/// Two things were measured against this shape and lost. Peeling the padded
+/// rows out of the groups (a one-row schedule above and below the interior
+/// span) costs a quarter of the ILP per row and made every stage 14-22%
+/// slower. Running two output positions per iteration shares the weight
+/// vectors but needs eight live accumulators, and either the register file or
+/// this compiler's allocation gives it back — 24 GFLOPS against 35.
 template <int R, typename W, typename Tag, typename Src, typename Dst, typename V>
 inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                         const Epilogue& epilogue, const Src& src, const Dst& dst,
                         const V& vbias)
 {
+    using InPtr = const typename Src::elem*;
+    constexpr int64_t kLane = 8;          // channels per packed block == lanes
+    constexpr int64_t kMaxTapRows = 256;  // (kd, kh, r): 8x8 with R = 4 fits
+
+    const int64_t nrow = p.KD * p.KH;
+    InPtr row_base[kMaxTapRows];
+    const bool have_tab = (nrow * R <= kMaxTapRows);
+    bool all_rows = have_tab;
+    if (have_tab) {
+        int64_t t = 0;
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            const bool d_ok = (id >= 0 && id < p.ID);
+            const InPtr in_d = src.ptr_at(id * p.in_d_stride - p.PW * kLane);
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                for (int r = 0; r < R; ++r) {
+                    const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                    const bool ok = d_ok && (p.oh + r < p.OH) &&
+                                    ih >= 0 && ih < p.IH;
+                    row_base[t++] = ok ? in_d + ih * p.in_row_stride : nullptr;
+                    all_rows = all_rows && ok;
+                }
+            }
+        }
+    }
+
+    // The output positions whose whole kernel footprint is inside the input
+    // row: the smallest tap offset is ow*SW - PW, the largest ow*SW +
+    // (KW-1)*DW - PW, so the span is [ceil(PW/SW), floor((IW-1+PW-(KW-1)*DW)/SW)].
+    const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
+    const int64_t last_hi = p.IW - 1 + p.PW - (p.KW - 1) * p.DW;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
+
+    // Tap offsets are measured from the padded row start, so the valid range is
+    // [PW, IW + PW) — the row pointers already absorbed the bias.
+    const int64_t off_ok_lo = p.PW;
+    const int64_t off_ok_hi = p.IW + p.PW;
+
     for (int64_t ow = 0; ow < p.OW; ++ow) {
         V acc[R];
         for (int r = 0; r < R; ++r) {
             acc[r] = vbias;
         }
 
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            const int64_t d_off = id * p.in_d_stride;
+        const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
+        const int64_t ow_off = ow * p.SW;
 
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
             for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih[R];
-                bool ok[R];
-                for (int r = 0; r < R; ++r) {
-                    ih[r] = (p.oh + r) * p.SH + kh * p.DH - p.PH;
-                    ok[r] = (p.oh + r < p.OH) && ih[r] >= 0 && ih[r] < p.IH;
+                const W* w_row = w + (kd * p.KH + kh) * p.KW * kLane;
+                InPtr row[R];
+                if (have_tab) {
+                    const int64_t t = (kd * p.KH + kh) * R;
+                    for (int r = 0; r < R; ++r) { row[r] = row_base[t + r]; }
+                } else {
+                    const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+                    if (id < 0 || id >= p.ID) { continue; }
+                    const InPtr in_d = src.ptr_at(id * p.in_d_stride - p.PW * kLane);
+                    for (int r = 0; r < R; ++r) {
+                        const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                        const bool ok = (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
+                        row[r] = ok ? in_d + ih * p.in_row_stride : nullptr;
+                    }
+                }
+
+                if (interior) {
+                    for (int64_t kw = 0; kw < p.KW; ++kw) {
+                        const V vk = v_load(w_row + kw * kLane);
+                        const int64_t at = (ow_off + kw * p.DW) * kLane;
+                        for (int r = 0; r < R; ++r) {
+                            acc[r] = v_fmadd(src.load_ptr(row[r] + at), vk, acc[r]);
+                        }
+                    }
+                    continue;
                 }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    const int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
+                    const int64_t off = ow_off + kw * p.DW;
+                    if (off < off_ok_lo || off >= off_ok_hi) {
                         continue;
                     }
-                    const V vk = v_load(w + (kd * p.KH * p.KW + kh * p.KW + kw) * 8);
-
+                    const V vk = v_load(w_row + kw * kLane);
+                    const int64_t at = off * kLane;
                     for (int r = 0; r < R; ++r) {
-                        if (!ok[r]) {
+                        if (row[r] == nullptr) {
                             continue;
                         }
-                        acc[r] = v_fmadd(src.load_at(d_off + ih[r] * p.in_row_stride + iw * 8),
-                                         vk, acc[r]);
+                        acc[r] = v_fmadd(src.load_ptr(row[r] + at), vk, acc[r]);
                     }
                 }
             }

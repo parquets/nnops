@@ -17,19 +17,27 @@ using namespace simd;
 
 template <typename T>
 struct FpSrc {
+    using elem = T;
     const T* in;    // also picks the v_set1/v_zero overload
 
+    const T* ptr_at(int64_t off) const { return in + off; }
     auto load_at(int64_t off) const { return v_load(in + off); }
+    /// Load through an address the caller already built — the spatial kernels
+    /// keep a per-tap row pointer so the width loop does no address arithmetic.
+    auto load_ptr(const T* p) const { return v_load(p); }
     auto zero() const { return v_zero(in); }
     auto set1(float s) const { return v_set1(in, s); }
 };
 
 template <typename InT>
 struct QuantSrc {
+    using elem = InT;
     const InT* in;
     float scale, zero_pt;
 
+    const InT* ptr_at(int64_t off) const { return in + off; }
     v_f32x8 load_at(int64_t off) const { return dequantize_tensor(in + off, scale, zero_pt); }
+    v_f32x8 load_ptr(const InT* p) const { return dequantize_tensor(p, scale, zero_pt); }
     v_f32x8 zero() const { return v_zero_f32x8(); }
     v_f32x8 set1(float s) const { return v_set1_f32x8(s); }
 };
