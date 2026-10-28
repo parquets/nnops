@@ -34,6 +34,28 @@ struct QuantSrc {
     v_f32x8 set1(float s) const { return v_set1_f32x8(s); }
 };
 
+/// Load one input row into a vector whose lanes are consecutive output
+/// positions — lane l reads input column iw0 + l*sw. Used by the planar
+/// (NCHW/NCDHW) spatial kernels, where the lane spans output width instead of
+/// channels, so an out-of-range column has to be filled with the accumulate's
+/// identity (@p fill) rather than skipped. Unit and doubled stride take a
+/// plain (or deinterleaving) load; any other stride gathers scalar-wise.
+template <typename T>
+inline auto planar_load(const T* row, int64_t iw0, int64_t sw, int64_t iw, T fill)
+{
+    constexpr int64_t L = simd_lane_for<T>;
+    if (iw0 >= 0) {
+        if (sw == 1 && iw0 + L <= iw) { return v_load(row + iw0); }
+        if (sw == 2 && iw0 + 2 * L <= iw) { return v_load_even(row + iw0); }
+    }
+    T tmp[L];
+    for (int64_t l = 0; l < L; ++l) {
+        const int64_t i = iw0 + l * sw;
+        tmp[l] = (i >= 0 && i < iw) ? row[i] : fill;
+    }
+    return v_load(tmp);
+}
+
 /// Store R rows below the current one — r == 0 is the current output row.
 template <typename T>
 struct FpDst {

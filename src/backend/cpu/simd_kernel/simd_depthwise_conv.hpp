@@ -1,8 +1,11 @@
 #pragma once
 /// @file simd_depthwise_conv.hpp
-/// @brief SIMD kernels for 2D/3D depthwise convolution (NCHWC8/NCDHWC8 only).
+/// @brief SIMD kernels for 2D/3D depthwise convolution, packed and planar.
 ///
-/// Weights are prepacked into dense [C8, (KD,) KH, KW, 8] form. Rank is
+/// Packed (NCHWC8/NCDHWC8) weights are prepacked into dense [C8, (KD,) KH, KW, 8]
+/// form and the lane is a channel; planar (NCHW/NCDHW) input reads the raw
+/// [C, 1, (KD,) KH, KW] filter and vectorizes along output width instead.
+/// Rank is
 /// auto-detected: 2D is KD=OD=ID=1, which degenerates the depth loop.
 /// One driver covers h4/h1 and f32/f16/quant; padding is bounds-checked
 /// in-kernel, and all C8 blocks run SIMD since pad channels are zero.
@@ -80,6 +83,60 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                 continue;
             }
             dst.store(r, ow, nnops::backend::cpu::apply_epilogue_vec(epilogue, tag, acc[r]));
+        }
+    }
+}
+
+// ============================================================
+// Planar (NCHW/NCDHW) driver — the SIMD lane spans output width
+// ============================================================
+//
+// The weight is the raw per-channel filter [C, 1, (KD,) KH, KW]: one scalar
+// per tap, broadcast into the accumulate, instead of the packed 8-lane form.
+// Padding is zero-filled per lane (planar_load), and a row's last block stores
+// through a scalar tail. One output row per call — there is no C8 block to
+// amortize an h4 over, and a width-vectorized row does not share loads between
+// output rows the way the packed kernel shares channel lanes.
+
+template <typename T>
+inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
+                          const DwConvParams& p, const Epilogue& epilogue,
+                          bool add_to)
+{
+    constexpr int64_t L = simd_lane_for<T>;
+    const T zero = static_cast<T>(0);
+
+    for (int64_t ow = 0; ow < p.OW; ow += L) {
+        auto acc = v_set1(out, bias);
+
+        for (int64_t kd = 0; kd < p.KD; ++kd) {
+            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            if (id < 0 || id >= p.ID) { continue; }
+
+            for (int64_t kh = 0; kh < p.KH; ++kh) {
+                const int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
+                if (ih < 0 || ih >= p.IH) { continue; }
+                const T* row = in + id * p.in_d_stride + ih * p.in_row_stride;
+                const T* w_row = w + (kd * p.KH + kh) * p.KW;
+
+                for (int64_t kw = 0; kw < p.KW; ++kw) {
+                    const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
+                    acc = v_fmadd(planar_load(row, iw0, p.SW, p.IW, zero),
+                                  v_set1(out, s_load(&w_row[kw])), acc);
+                }
+            }
+        }
+
+        const auto v = nnops::backend::cpu::apply_epilogue_vec(epilogue, out, acc);
+        const int64_t lanes = (p.OW - ow < L) ? p.OW - ow : L;
+        if (lanes == L) {
+            v_store_add(out + ow, v, add_to);
+        } else {
+            alignas(32) T tmp[L];
+            v_store(tmp, v);
+            for (int64_t l = 0; l < lanes; ++l) {
+                s_store_add(out + ow + l, s_load(&tmp[l]), add_to);
+            }
         }
     }
 }

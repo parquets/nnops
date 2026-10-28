@@ -1,6 +1,7 @@
 #pragma once
 /// @file depthwise_conv.hpp
-/// @brief DepthwiseConv operator — depthwise separable 2D/3D convolution (NCHWC8/NCDHWC8 layout).
+/// @brief DepthwiseConv operator — depthwise separable 2D/3D convolution, on
+///        either a planar (NCHW/NCDHW) or a packed (NCHWC8/NCDHWC8) tensor.
 ///
 /// Depthwise convolution applies a separate filter to each input channel independently.
 /// There is no cross-channel mixing. This is the first step of a depthwise-separable
@@ -10,6 +11,9 @@
 ///   2D (rank 4): Input [N, C, IH, IW], Weight [C, 1, KH, KW]
 ///   3D (rank 5): Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW]
 /// Output channels equal input channels. Optional bias: [C].
+///
+/// A packed input takes the weights prepacked by prepackWeights(); a planar
+/// input takes the raw weight and bias, and supports f32/f16 only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -56,8 +60,8 @@ struct DepthwiseConvAttributes {
 
 /// DepthwiseConv operator (class-based API).
 ///
-/// Channel-packed layouts only (NCHWC8 / NCDHWC8); each input channel is
-/// convolved with its own independent filter, with no cross-channel mixing.
+/// Each input channel is convolved with its own independent filter, with no
+/// cross-channel mixing; the input's layout (planar or packed) is the output's.
 ///
 /// 2D: Input [N, C, IH, IW], Weight [C, 1, KH, KW], Output [N, C, OH, OW].
 /// 3D: Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW], Output [N, C, OD, OH, OW].
@@ -91,7 +95,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::DepthwiseConv; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
 
     const DepthwiseConvAttributes& attributes() const noexcept { return attrs_; }
 

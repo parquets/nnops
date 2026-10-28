@@ -1,9 +1,12 @@
 /// @file depthwise_conv.cpp
-/// @brief SIMD-optimized CPU implementation of 2D/3D depthwise convolution (NCHWC8/NCDHWC8 only).
+/// @brief SIMD-optimized CPU implementation of 2D/3D depthwise convolution, in
+///        both the packed (NCHWC8/NCDHWC8) and the planar (NCHW/NCDHW) layout.
 ///
-/// Input/output are always channel-packed (NCHWC8 or NCDHWC8). Weights are prepacked
-/// by the operator dispatch layer into dense [C8, (KD,) KH, KW, 8] format before
-/// reaching this backend.
+/// Packed input takes weights prepacked by the operator dispatch layer into
+/// dense [C8, (KD,) KH, KW, 8] form and vectorizes across channels within a C8
+/// block. Planar input takes the raw [C, 1, (KD,) KH, KW] filter, one channel
+/// plane at a time, and vectorizes along output width. Quantized depthwise
+/// conv is packed-only.
 ///
 /// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
 /// A single unified kernel handles both 2D and 3D: the KD loop is always present;
@@ -27,21 +30,24 @@ namespace k = nnops::kernel;
 // ============================================================
 
 template <typename T>
-void dwconv_impl_nchwc8(
+void dwconv_impl(
     const DepthwiseConvAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
     const ComputeContext& ctx)
 {
     const auto& input  = inputs[0];
-    const auto& packed_weight = inputs[1];
+    const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
+    const bool packed   = is_channel_packed(input.layout());
 
     const int64_t rank  = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
-    const int64_t N  = input.shape(0);
-    const int64_t C8 = input.num_channel_blocks();
+    // Channel blocks: C8 blocks when packed, one per channel when planar. The
+    // block strides below describe both.
+    const int64_t N      = input.shape(0);
+    const int64_t blocks = input.num_channel_blocks();
 
     // Spatial dims (auto-detect 2D vs 3D)
     const int64_t ID  = (srank == 3) ? input.shape(2) : 1;
@@ -68,8 +74,8 @@ void dwconv_impl_nchwc8(
 
     auto* out_ptr = output.ptr<T>();
     const auto* in_ptr  = input.ptr<T>();
-    const auto* pw_ptr  = packed_weight.ptr<T>();
-    const auto* pb_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
+    const auto* w_ptr   = weight.ptr<T>();
+    const auto* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
     const int64_t in_row_stride  = input.row_stride_elems();
     const int64_t in_d_stride    = IH * in_row_stride;
@@ -77,6 +83,7 @@ void dwconv_impl_nchwc8(
     const int64_t out_d_stride   = OH * out_row_stride;
     const int64_t in_ch_stride   = input.channel_block_stride_elems();
     const int64_t out_ch_stride  = output.channel_block_stride_elems();
+    const int64_t taps           = KD * KH * KW;
 
     // Kernel params (od/oh updated per call)
     k::DwConvParams p{};
@@ -90,18 +97,31 @@ void dwconv_impl_nchwc8(
     p.in_d_stride    = in_d_stride;
     p.in_row_stride  = in_row_stride;
 
-    // Per-C8-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
-    const auto compute_c8 = [&](int64_t n, int64_t c8) {
-        const T* in_base  = in_ptr  + n * C8 * in_ch_stride  + c8 * in_ch_stride;
-        T*       out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
-        const T* w_base   = pw_ptr + c8 * KD * KH * KW * 8;
-        const T* bias_vec = pb_ptr ? pb_ptr + c8 * 8 : nullptr;
+    // Per-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
+    const auto compute_block = [&](int64_t n, int64_t blk) {
+        const T* in_base  = in_ptr  + n * blocks * in_ch_stride  + blk * in_ch_stride;
+        T*       out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
+        // Packed weights are [C8, (KD,) KH, KW, 8] with a per-lane bias vector;
+        // planar ones are the raw [C, 1, (KD,) KH, KW] filter and a scalar bias.
+        const T* w_base   = w_ptr + blk * taps * (packed ? 8 : 1);
+        const T* bias_vec = (packed && b_ptr) ? b_ptr + blk * 8 : nullptr;
+        const float bias  = (!packed && b_ptr) ? s_load(&b_ptr[blk]) : 0.0f;
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::DwConvParams pc = p;
 
         for (int64_t od = 0; od < OD; ++od) {
             T* out_d = out_base + od * out_d_stride;
+
+            if (!packed) {
+                for (int64_t oh = 0; oh < OH; ++oh) {
+                    pc.od = od;
+                    pc.oh = oh;
+                    k::dwconv_planar(out_d + oh * pc.out_row_stride, in_base, w_base,
+                                     bias, pc, attrs.epilogue, attrs.add_to);
+                }
+                continue;
+            }
 
             int64_t oh = 0;
             for (; oh + 3 < OH; oh += 4) {
@@ -119,9 +139,8 @@ void dwconv_impl_nchwc8(
         }
     };
 
-    const int64_t N_C8 = N * C8;
-    ctx.cpu.run(0, N_C8,
-            [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
+    ctx.cpu.run(0, N * blocks,
+            [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
 }
 
 // ============================================================
@@ -306,12 +325,20 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
 {
     const auto dtype = inputs[0].data_type();
     const auto odtype = output.data_type();
+
+    // Quantized depthwise conv is packed-only: its dequantize-on-load kernels
+    // place the lane on a C8 channel block, which a planar plane does not have.
+    if (!is_channel_packed(inputs[0].layout()) &&
+        (dtype == DataType::s8 || dtype == DataType::u8)) {
+        return Status::unsupported;
+    }
+
     switch (dtype) {
     case DataType::f32:
-        dwconv_impl_nchwc8<float>(attrs, output, inputs, ctx);
+        dwconv_impl<float>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::f16:
-        dwconv_impl_nchwc8<half>(attrs, output, inputs, ctx);
+        dwconv_impl<half>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::s8:
         if (odtype == DataType::s8) {

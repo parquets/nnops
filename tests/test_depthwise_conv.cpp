@@ -193,6 +193,63 @@ static void test_nchwc8_vs_ref(
 }
 
 // ============================================================
+// Planar (NCHW/NCDHW) path — no prepack, no layout conversion: the operator
+// takes the graph's tensors as they are, and reads the raw filter
+// ============================================================
+
+static void test_planar_vs_ref(const std::vector<int64_t>& in_shape,
+                               const std::vector<int64_t>& w_shape,
+                               const DepthwiseConvAttributes& attrs,
+                               bool has_bias = false)
+{
+    auto [in_vec, in] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w]  = test::make_random_tensor(w_shape);
+    std::vector<float> b_vec;
+    TensorView b;
+    if (has_bias) {
+        auto p = test::make_random_tensor({w_shape[0]});
+        b_vec = std::move(p.first);
+        b = p.second;
+    }
+
+    auto dw_op = DepthwiseConv::create(attrs, Backend::CPU);
+
+    TensorDesc in_desc = in.desc();
+    TensorDesc w_desc  = w.desc();
+    const TensorDesc desc_arr[] = {in_desc, w_desc};
+    auto out_descs = dw_op->getOutputTensorDesc(desc_arr);
+
+    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = test::make_planar(out_descs[0], out_buf.data());
+    std::vector<float> ref_buf(out_buf.size());
+    auto ref = test::make_planar(out_descs[0], ref_buf.data());
+    if (attrs.add_to) {
+        std::fill(out_buf.begin(), out_buf.end(), 1.0f);
+        std::fill(ref_buf.begin(), ref_buf.end(), 1.0f);
+    }
+
+    {
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ref_ins[] = {in, w, b};
+            backend::cpu::reference::depthwise_conv_ref(attrs, ref, ref_ins, ctx, nullptr);
+        } else {
+            const TensorView ref_ins[] = {in, w};
+            backend::cpu::reference::depthwise_conv_ref(attrs, ref, ref_ins, ctx, nullptr);
+        }
+    }
+
+    if (has_bias) {
+        const TensorView ins[] = {in, w, b};
+        NNOPS_EXPECT_TRUE(is_ok(dw_op->compute(out, ins)));
+    } else {
+        const TensorView ins[] = {in, w};
+        NNOPS_EXPECT_TRUE(is_ok(dw_op->compute(out, ins)));
+    }
+    NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-4f, 1e-4f));
+}
+
+// ============================================================
 // Hand-verified small tests (check exact expected values)
 // ============================================================
 
@@ -1127,6 +1184,55 @@ NNOPS_TEST(dwconv_nchwc8_vs_ref_1x1_kernel_stride2) {
 }
 
 // ============================================================
+// Planar (NCHW/NCDHW) vs Reference
+// ============================================================
+
+NNOPS_TEST(dwconv_planar_vs_ref_basic) {
+    // Partial C8 (4 channels) and an odd width (15) exercise the plane loop
+    // and the scalar tail.
+    test_planar_vs_ref({1, 4, 12, 15}, {4, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_planar_vs_ref_padding_stride2) {
+    // Padding on both W edges plus the deinterleaving load.
+    test_planar_vs_ref({1, 6, 14, 13}, {6, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}});
+}
+
+NNOPS_TEST(dwconv_planar_vs_ref_dilation) {
+    test_planar_vs_ref({1, 4, 10, 10}, {4, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_planar_vs_ref_bias) {
+    test_planar_vs_ref({2, 8, 8, 8}, {8, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true);
+}
+
+NNOPS_TEST(dwconv_planar_vs_ref_add_to) {
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    test_planar_vs_ref({1, 3, 8, 8}, {3, 1, 3, 3}, attrs);
+}
+
+NNOPS_TEST(dwconv_planar_vs_ref_relu_epilogue) {
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_planar_vs_ref({1, 5, 6, 11}, {5, 1, 3, 3}, attrs);
+}
+
+NNOPS_TEST(dwconv_planar_vs_ref_1x1_kernel_stride2) {
+    test_planar_vs_ref({1, 8, 9, 9}, {8, 1, 1, 1},
+        DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
+}
+
+NNOPS_TEST(dwconv_planar_3d_vs_ref) {
+    test_planar_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
+        DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
+}
+
+// ============================================================
 // Direct NCHWC8 data test — bypasses LayoutConvert/prepack
 // ============================================================
 
@@ -1805,4 +1911,30 @@ NNOPS_TEST(dwconv_q_multi_c8) {
     dwconv_q_test<int8_t, int8_t>({1, 17, 5, 5}, {17, 1, 2, 2}, attrs,
         make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 0), false);
+}
+
+// ============================================================
+// Layout contract — the planar path reads the raw filter, so a prepacked
+// weight is rejected at descriptor level instead of being misread
+// ============================================================
+
+NNOPS_TEST(dwconv_planar_rejects_packed_weight) {
+    TensorDesc in;
+    in.rank = 4;
+    for (int64_t d : {1, 4, 8, 8}) { in.dims.push_back(d); }
+
+    TensorDesc w;
+    w.rank   = 4;
+    w.layout = TensorLayout::PackedWeight;
+    for (int64_t d : {1, 3, 3, 8}) { w.dims.push_back(d); }
+
+    TensorDesc out;
+    out.rank = 4;
+    for (int64_t d : {1, 4, 6, 6}) { out.dims.push_back(d); }
+
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    auto op = DepthwiseConv::create(attrs, Backend::CPU);
+    const TensorDesc ins[] = {in, w};
+    const TensorDesc outs[] = {out};
+    NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::unsupported);
 }

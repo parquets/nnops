@@ -72,6 +72,12 @@ constexpr bool is_channel_packed(TensorLayout layout) noexcept {
     return layout_channel_pack(layout) > 1;
 }
 
+/// Returns true for the planar spatial layouts (NCHW, NCDHW) — the activations
+/// a graph arrives in, as opposed to weight layouts.
+constexpr bool is_planar_spatial(TensorLayout layout) noexcept {
+    return layout == TensorLayout::NCHW || layout == TensorLayout::NCDHW;
+}
+
 /// Returns the expected spatial rank encoded in the layout name.
 /// NCHW* → 2 (H, W), NCDHW* → 3 (D, H, W).
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {

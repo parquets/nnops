@@ -1,9 +1,11 @@
 /// @file depthwise_conv.cpp
 /// @brief DepthwiseConv operator dispatch — connects class API to backend implementations.
 ///
-/// Input/output are always NCHWC8/NCDHWC8. Weights are prepacked via prepackWeights()
-/// before compute(). The prepack step converts raw NCHW/NCDHW weight [C, 1, (KD,) KH, KW]
-/// to dense [C8, (KD,) KH, KW, 8] format for efficient SIMD access.
+/// Packed (NCHWC8/NCDHWC8) input takes weights prepacked via prepackWeights():
+/// the prepack step converts a raw NCHW/NCDHW weight [C, 1, (KD,) KH, KW] to
+/// dense [C8, (KD,) KH, KW, 8] format for efficient SIMD access, and the bias
+/// to [C8, 8]. Planar (NCHW/NCDHW) input reads the raw weight and bias [C]
+/// directly, so no prepack step is involved.
 ///
 /// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
 
@@ -381,10 +383,20 @@ void DepthwiseConv::prepackWeights(std::span<const TensorView> inputs,
 Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
                                std::span<const TensorDesc> outputs) const
 {
-    // input, prepacked_weight [, prepacked_bias]
+    // input, weight [, bias] — prepacked when the input is packed
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PackedOnly));
+    const auto& in = inputs[0];
+    if (!is_planar_spatial(in.layout)) {
+        return detail::require(
+            is_layout_supported(in.layout, LayoutSupport::PackedOnly));
+    }
+    // Planar input has f32/f16 kernels, and it reads the raw filter: a packed
+    // weight belongs to the packed path.
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(in.dtype)) {
+        return Status::unsupported;
+    }
+    return detail::require(inputs[1].layout != TensorLayout::PackedWeight,
+                           Status::unsupported);
 }
 
 Status DepthwiseConv::compute(std::span<TensorView> outputs,
