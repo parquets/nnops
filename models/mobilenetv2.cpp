@@ -37,10 +37,44 @@ using nnops::TensorView;
 
 Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
 {
-    return model::batch_norm(x, m.at(prefix + ".weight"),
-                             m.at(prefix + ".bias"),
-                             m.at(prefix + ".running_mean"),
-                             m.at(prefix + ".running_var"));
+    return model::batch_norm(x, model::batch_norm_params(m, prefix));
+}
+
+/// conv -> BN -> relu6, as one operator call when fusion is on: the BN folds
+/// into the weight and a bias, and the relu6 becomes the conv's epilogue. With
+/// None the same path is conv -> BN only (the projection stages).
+Buf conv_bn(const ModelArtifact& m, const TensorView& x, const std::string& conv,
+            const std::string& bn, nnops::EpilogueActivateType act,
+            int64_t kernel, int64_t stride, int64_t pad)
+{
+    if (model::fuse_enabled()) {
+        return model::conv2d_bn_act(x, m.at(conv + ".weight"),
+                                    model::batch_norm_params(m, bn), act,
+                                    kernel, stride, pad);
+    }
+    Buf y = model::conv2d(x, m.at(conv + ".weight"), kernel, stride, pad);
+    y = norm(m, bn, y.view);
+    switch (act) {
+    case nnops::EpilogueActivateType::None:  return y;
+    case nnops::EpilogueActivateType::Relu6: return model::relu6(y.view);
+    default: std::abort();  // not used by this network
+    }
+}
+
+/// depthwise -> BN -> relu6, fused the same way. The filter is [C, 1, KH, KW]
+/// and the BN is per channel, which is the filter's own axis.
+Buf dw_bn_relu6(const ModelArtifact& m, const TensorView& x, const std::string& dw,
+                const std::string& bn, int64_t kernel, int64_t stride, int64_t pad)
+{
+    if (model::fuse_enabled()) {
+        return model::depthwise_bn_act(x, m.at(dw),
+                                       model::batch_norm_params(m, bn),
+                                       nnops::EpilogueActivateType::Relu6,
+                                       kernel, stride, pad);
+    }
+    Buf y = model::depthwise_conv(x, m.at(dw), kernel, stride, pad);
+    y = norm(m, bn, y.view);
+    return model::relu6(y.view);
 }
 
 /// One InvertedResidual. @p t is the expansion ratio (the expand stage is
@@ -53,23 +87,22 @@ Buf inverted_residual(const ModelArtifact& m, const std::string& prefix,
     // With no expansion the depthwise stage is conv[0] instead of conv[1].
     const std::string dw = (t != 1) ? c + "1.0.weight" : c + "0.0.weight";
     const std::string dw_bn = (t != 1) ? c + "1.1" : c + "0.1";
-    const std::string proj = (t != 1) ? c + "2.weight" : c + "1.weight";
+    const std::string proj_conv = (t != 1) ? c + "2" : c + "1";
     const std::string proj_bn = (t != 1) ? c + "3" : c + "2";
 
     Buf expand;
     const TensorView* stage_in = &x;
     if (t != 1) {
-        expand = model::conv2d(x, m.at(c + "0.0.weight"), 1, 1, 0);
-        expand = norm(m, c + "0.1", expand.view);
-        expand = model::relu6(expand.view);
+        expand = conv_bn(m, x, c + "0.0", c + "0.1",
+                         nnops::EpilogueActivateType::Relu6, 1, 1, 0);
         stage_in = &expand.view;
     }
 
-    Buf y = model::depthwise_conv(*stage_in, m.at(dw), 3, stride, 1);
-    y = norm(m, dw_bn, y.view);
-    y = model::relu6(y.view);
-    y = model::conv2d(y.view, m.at(proj), 1, 1, 0);
-    y = norm(m, proj_bn, y.view);
+    Buf y = dw_bn_relu6(m, *stage_in, dw, dw_bn, 3, stride, 1);
+    // The projection has no activation after it, and that is still a fusion:
+    // the BN merges into the conv, so one pass instead of two.
+    y = conv_bn(m, y.view, proj_conv, proj_bn,
+                nnops::EpilogueActivateType::None, 1, 1, 0);
 
     if (residual) { y = model::add(y.view, x); }
     return y;
@@ -90,9 +123,8 @@ constexpr BlockSpec kSetting[] = {
 int forward(const ModelArtifact& m, ModelCheck& check)
 {
     Buf act = model::layer("features.0", [&] {
-        Buf y = model::conv2d(m.at("input"), m.at("features.0.0.weight"), 3, 2, 1);
-        y = norm(m, "features.0.1", y.view);
-        return model::relu6(y.view);
+        return conv_bn(m, m.at("input"), "features.0.0", "features.0.1",
+                       nnops::EpilogueActivateType::Relu6, 3, 2, 1);
     });
     check.compare("features.0", act.view, m.at("ref.features.0"));
 
@@ -114,9 +146,8 @@ int forward(const ModelArtifact& m, ModelCheck& check)
     }
 
     act = model::layer("features.18", [&] {
-        Buf y = model::conv2d(act.view, m.at("features.18.0.weight"), 1, 1, 0);
-        y = norm(m, "features.18.1", y.view);
-        return model::relu6(y.view);
+        return conv_bn(m, act.view, "features.18.0", "features.18.1",
+                       nnops::EpilogueActivateType::Relu6, 1, 1, 0);
     });
     check.compare("features.18", act.view, m.at("ref.features.18"));
 
@@ -158,8 +189,9 @@ int main(int argc, char** argv)
         return 77;
     }
 
-    std::printf("mobilenetv2: %zu tensors from %s\n", artifact.count(),
-                dir.c_str());
+    std::printf("mobilenetv2: %zu tensors from %s (conv+bn+relu6 %s)\n",
+                artifact.count(), dir.c_str(),
+                model::fuse_enabled() ? "folded" : "unfused");
     // The untimed pass is the model-load step: it prepacks any Winograd weights
     // (and first-touches every buffer), so the number below is the steady state.
     { ModelCheck warm(atol, rtol, /*verbose=*/false); forward(artifact, warm); }
