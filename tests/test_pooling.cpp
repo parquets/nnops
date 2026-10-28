@@ -200,6 +200,64 @@ static void test_nchwc8_3d_vs_nchw(
 }
 
 // ============================================================
+// Planar path — the operator takes NCHW/NCDHW as it is, no layout conversion
+// ============================================================
+
+template <typename T>
+static void test_planar_vs_ref(const PoolingAttributes& attrs, TensorView in_planar)
+{
+    auto pool_op = Pooling::create(attrs);
+    TensorDesc in_desc = in_planar.desc();
+    const TensorDesc in_arr[] = {in_desc};
+    auto out_descs = pool_op->getOutputTensorDesc(in_arr);
+
+    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = test::make_planar(out_descs[0], out_buf.data());
+
+    std::vector<T> ref_buf(out_buf.size());
+    auto ref = test::make_planar(out_descs[0], ref_buf.data());
+    if (attrs.add_to) {
+        for (auto& v : out_buf) { simd::s_store(&v, 1.0f); }
+        for (auto& v : ref_buf) { simd::s_store(&v, 1.0f); }
+    }
+    {
+        ComputeContext ctx;
+        const TensorView ref_ins[] = {in_planar};
+        backend::cpu::reference::pooling_ref(attrs, ref, ref_ins, ctx, nullptr);
+    }
+
+    const TensorView ins[] = {in_planar};
+    NNOPS_EXPECT_TRUE(is_ok(pool_op->compute(out, ins)));
+
+    // allclose compares f32 storage, so an f16 pair goes through f32 first.
+    if constexpr (std::is_same_v<T, float>) {
+        NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-4f, 1e-4f));
+    } else {
+        const float tol = 5e-3f;   // f16 accumulate: the sum runs in half lanes
+        const auto a = test::f16_to_f32(out_buf);
+        const auto b = test::f16_to_f32(ref_buf);
+        for (size_t i = 0; i < a.size(); ++i) {
+            NNOPS_EXPECT_NEAR(a[i], b[i], tol);
+        }
+    }
+}
+
+/// f32 random input, the common case.
+static void test_planar_f32(const std::vector<int64_t>& shape,
+                            const PoolingAttributes& attrs)
+{
+    auto [in_vec, in] = test::make_random_tensor(shape);
+    test_planar_vs_ref<float>(attrs, in);
+}
+
+static void test_planar_f16(const std::vector<int64_t>& shape,
+                            const PoolingAttributes& attrs)
+{
+    auto [in_vec, in] = test::make_random_f16_tensor(shape);
+    test_planar_vs_ref<backend::cpu::half>(attrs, in);
+}
+
+// ============================================================
 // 2D Basic deterministic tests (hardcoded values)
 // ============================================================
 
@@ -723,6 +781,232 @@ NNOPS_TEST(pooling_nchwc8_3d_random) {
 }
 
 // ============================================================
+// Planar (NCHW/NCDHW) tests — the operator on the tensor as a graph hands it
+// over, compared straight against the scalar reference
+// ============================================================
+
+NNOPS_TEST(pooling_planar_max_padding) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.padding      = {0, 1, 1};
+    test_planar_f32({1, 3, 15, 15}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_max_stride2_odd_width) {
+    // Stride 2 takes the deinterleaving load; W=13 leaves a partial last block.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride       = {1, 2, 2};
+    attrs.padding      = {0, 1, 1};
+    test_planar_f32({2, 4, 16, 13}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_avg_padding) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.padding      = {0, 1, 1};
+    test_planar_f32({1, 5, 12, 9}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_avg_exclude_pad) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.exclude_pad = true;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.padding      = {0, 1, 1};
+    test_planar_f32({1, 2, 10, 11}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_avg_stride2) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+    test_planar_f32({1, 3, 17, 9}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_add_to) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.padding      = {0, 1, 1};
+    attrs.add_to = true;
+    test_planar_f32({1, 3, 8, 8}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_f16) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.padding      = {0, 1, 1};
+    test_planar_f16({1, 3, 10, 10}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_3d_max) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.kernel_shape = {3, 3, 3};
+    attrs.padding      = {1, 1, 1};
+    test_planar_f32({1, 2, 6, 9, 11}, attrs);
+}
+
+NNOPS_TEST(pooling_planar_3d_avg) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.kernel_shape = {2, 2, 2};
+    attrs.stride       = {2, 2, 2};
+    test_planar_f32({1, 2, 6, 8, 10}, attrs);
+}
+
+// ============================================================
+// Global pooling — the window is the whole extent, so every spatial axis of
+// the output is 1 and the window fields are not read
+// ============================================================
+
+NNOPS_TEST(pooling_global_deterministic) {
+    const int64_t shape[] = {1, 2, 2, 2};
+    float data[8] = {1, 2, 3, 4, -1, -2, -8, -4};
+    TensorView in(shape, DataType::f32, data, TensorLayout::NCHW);
+
+    const int64_t oshape[] = {1, 2, 1, 1};
+    float out_buf[2] = {0.0f, 0.0f};
+    TensorView out(oshape, DataType::f32, out_buf, TensorLayout::NCHW);
+    const TensorView views[] = {in};
+
+    PoolingAttributes avg;
+    avg.type = PoolingType::Average;
+    avg.global = true;
+    auto avg_op = Pooling::create(avg);
+    NNOPS_EXPECT_TRUE(is_ok(avg_op->compute(out, views)));
+    NNOPS_EXPECT_NEAR(out_buf[0], 2.5f, 1e-6f);    // (1 + 2 + 3 + 4) / 4
+    NNOPS_EXPECT_NEAR(out_buf[1], -3.75f, 1e-6f);  // (-1 - 2 - 8 - 4) / 4
+
+    // Max ignores the window fields too: a kernel_shape/stride/padding triple
+    // that could not produce a 1x1 output still pools the whole plane.
+    PoolingAttributes mx;
+    mx.type = PoolingType::Max;
+    mx.global = true;
+    mx.kernel_shape = {1, 9, 9};
+    mx.stride = {1, 3, 3};
+    mx.padding = {0, 2, 2};
+    auto mx_op = Pooling::create(mx);
+    NNOPS_EXPECT_TRUE(is_ok(mx_op->compute(out, views)));
+    NNOPS_EXPECT_NEAR(out_buf[0], 4.0f, 1e-6f);
+    NNOPS_EXPECT_NEAR(out_buf[1], -1.0f, 1e-6f);
+
+    // Shape follows the input alone.
+    TensorDesc d = in.desc();
+    const TensorDesc descs[] = {d};
+    auto out_descs = mx_op->getOutputTensorDesc(descs);
+    NNOPS_EXPECT_TRUE(out_descs[0].rank == 4 && out_descs[0].dims[2] == 1 &&
+                      out_descs[0].dims[3] == 1);
+}
+
+NNOPS_TEST(pooling_global_planar_shapes) {
+    // Widths picked to hit the 4x-unrolled body (W >= 32), the 8-lane body and
+    // the scalar tail; C = 5 also leaves a partial NCHWC8 block.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.global = true;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.stride = {1, 2, 2};
+    attrs.padding = {0, 1, 1};
+
+    test_planar_f32({1, 5, 7, 37}, attrs);
+    test_planar_f32({2, 3, 9, 13}, attrs);
+    test_planar_f32({1, 1, 5, 3}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f32({1, 5, 7, 37}, mx);
+    test_planar_f32({2, 3, 9, 13}, mx);
+}
+
+NNOPS_TEST(pooling_global_planar_f16) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.global = true;
+    test_planar_f16({1, 3, 10, 10}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f16({1, 3, 10, 10}, mx);
+}
+
+NNOPS_TEST(pooling_global_planar_3d) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.global = true;
+    test_planar_f32({1, 2, 4, 6, 9}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f32({1, 2, 4, 6, 9}, mx);
+}
+
+NNOPS_TEST(pooling_global_add_to) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.global = true;
+    attrs.add_to = true;
+    test_planar_f32({1, 3, 8, 8}, attrs);
+}
+
+/// Packed (NCHWC8) global pooling: the lanes are the eight channels, so this
+/// is the one path where the reduction ends in a vector store.
+NNOPS_TEST(pooling_global_packed) {
+    const std::vector<int64_t> shape = {2, 11, 9, 13};
+    auto [in_vec, in_nchw] = test::make_random_tensor(shape);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.global = true;
+
+    std::vector<float> ref_buf(2 * 11, 0.0f);
+    const std::vector<int64_t> oshape = {2, 11, 1, 1};
+    TensorView ref(oshape, DataType::f32, ref_buf.data(), TensorLayout::NCHW);
+    {
+        ComputeContext ctx;
+        const TensorView ref_ins[] = {in_nchw};
+        backend::cpu::reference::pooling_ref(attrs, ref, ref_ins, ctx, nullptr);
+    }
+
+    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    TensorDesc in_desc = in_nchw.desc();
+    const TensorDesc desc_arr[] = {in_desc};
+    auto pack_descs = pack_op->getOutputTensorDesc(desc_arr);
+    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
+    auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
+    const TensorView pack_ins[] = {in_nchw};
+    pack_op->compute(in_c8, pack_ins);
+
+    auto pool_op = Pooling::create(attrs);
+    TensorDesc c8_desc = in_c8.desc();
+    const TensorDesc pool_in_arr[] = {c8_desc};
+    auto pool_descs = pool_op->getOutputTensorDesc(pool_in_arr);
+    NNOPS_EXPECT_TRUE(pool_descs[0].rank == 4 && pool_descs[0].dims[2] == 1 &&
+                      pool_descs[0].dims[3] == 1);
+    std::vector<char> pool_buf(pool_descs[0].storage_bytes());
+    auto out_c8 = test::make_packed(pool_descs[0], pool_buf.data());
+    const TensorView pool_ins[] = {in_c8};
+    NNOPS_EXPECT_TRUE(is_ok(pool_op->compute(out_c8, pool_ins)));
+
+    auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
+    TensorDesc c8_out_desc = out_c8.desc();
+    const TensorDesc unpack_in_arr[] = {c8_out_desc};
+    auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
+    std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
+    auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
+    const TensorView unpack_ins[] = {out_c8};
+    unpack_op->compute(res_nchw, unpack_ins);
+
+    NNOPS_EXPECT_TRUE(test::allclose(res_nchw, ref, 1e-4f, 1e-4f));
+}
+
+// ============================================================
 // Quantized pooling (s8/u8, PerTensor activation) — NCHWC8 SIMD
 // vs NCHW reference. MaxPooling with matching dtype/scale/zp takes
 // the raw-integer fast path; everything else uses the float path.
@@ -892,4 +1176,47 @@ NNOPS_TEST(pooling_q_partial_c8) {
     attrs.stride       = {1, 2, 2};
     pooling_q_test<int8_t, int8_t>({1, 5, 6, 6}, attrs,
         make_per_tensor_q(1.0f, 0), make_per_tensor_q(1.0f, 0));
+}
+
+NNOPS_TEST(pooling_q_global) {
+    // The quantized kernels have no whole-plane form: the global window is
+    // spelled out as the full extent and the window walk reduces it.
+    const auto qp = make_per_tensor_q(1.0f, 0);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.global = true;
+    pooling_q_test<int8_t, int8_t>({2, 11, 9, 13}, attrs, qp, qp);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    pooling_q_test<int8_t, int8_t>({2, 11, 9, 13}, mx, qp, qp);
+}
+
+// ============================================================
+// Layout contract — a quantized plane has no kernel, and the descriptor-level
+// validate() says so before anything is allocated
+// ============================================================
+
+NNOPS_TEST(pooling_planar_rejects_quantized) {
+    TensorDesc in;
+    in.rank   = 4;
+    in.layout = TensorLayout::NCHW;
+    in.dtype  = DataType::s8;
+    for (int64_t d : {1, 4, 8, 8}) { in.dims.push_back(d); }
+
+    TensorDesc out;
+    out.rank   = 4;
+    out.layout = TensorLayout::NCHW;
+    out.dtype  = DataType::s8;
+    for (int64_t d : {1, 4, 4, 4}) { out.dims.push_back(d); }
+
+    PoolingAttributes attrs;
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.stride       = {1, 2, 2};
+
+    auto op = Pooling::create(attrs);
+    const TensorDesc ins[] = {in};
+    const TensorDesc outs[] = {out};
+    NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::unsupported);
 }

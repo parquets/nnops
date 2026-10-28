@@ -70,17 +70,21 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const int64_t KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
-    const int64_t KH = attrs.kernel_shape[1];
-    const int64_t KW = attrs.kernel_shape[2];
+    // A global window is the full extent, unpadded and undilated: the same
+    // window walk, which keeps this reference independent of the backend's
+    // whole-plane shortcut.
+    const bool glb = attrs.global;
+    const int64_t KD = glb ? ID : ((srank == 3) ? attrs.kernel_shape[0] : 1);
+    const int64_t KH = glb ? IH : attrs.kernel_shape[1];
+    const int64_t KW = glb ? IW : attrs.kernel_shape[2];
 
-    const int64_t SD = (srank == 3) ? attrs.stride[0] : 1;
-    const int64_t SH = attrs.stride[1];
-    const int64_t SW = attrs.stride[2];
+    const int64_t SD = glb ? 1 : ((srank == 3) ? attrs.stride[0] : 1);
+    const int64_t SH = glb ? 1 : attrs.stride[1];
+    const int64_t SW = glb ? 1 : attrs.stride[2];
 
-    const int64_t PD = (srank == 3) ? attrs.padding[0] : 0;
-    const int64_t PH = attrs.padding[1];
-    const int64_t PW = attrs.padding[2];
+    const int64_t PD = glb ? 0 : ((srank == 3) ? attrs.padding[0] : 0);
+    const int64_t PH = glb ? 0 : attrs.padding[1];
+    const int64_t PW = glb ? 0 : attrs.padding[2];
 
     const auto* in_ptr  = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
@@ -192,17 +196,19 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const int64_t KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
-    const int64_t KH = attrs.kernel_shape[1];
-    const int64_t KW = attrs.kernel_shape[2];
+    // A global window is the full extent (see the fp reference above).
+    const bool glb = attrs.global;
+    const int64_t KD = glb ? ID : ((srank == 3) ? attrs.kernel_shape[0] : 1);
+    const int64_t KH = glb ? IH : attrs.kernel_shape[1];
+    const int64_t KW = glb ? IW : attrs.kernel_shape[2];
 
-    const int64_t SD = (srank == 3) ? attrs.stride[0] : 1;
-    const int64_t SH = attrs.stride[1];
-    const int64_t SW = attrs.stride[2];
+    const int64_t SD = glb ? 1 : ((srank == 3) ? attrs.stride[0] : 1);
+    const int64_t SH = glb ? 1 : attrs.stride[1];
+    const int64_t SW = glb ? 1 : attrs.stride[2];
 
-    const int64_t PD = (srank == 3) ? attrs.padding[0] : 0;
-    const int64_t PH = attrs.padding[1];
-    const int64_t PW = attrs.padding[2];
+    const int64_t PD = glb ? 0 : ((srank == 3) ? attrs.padding[0] : 0);
+    const int64_t PH = glb ? 0 : attrs.padding[1];
+    const int64_t PW = glb ? 0 : attrs.padding[2];
 
     const auto& in_qp  = input.quant_params();
     const auto& out_qp = output.quant_params();

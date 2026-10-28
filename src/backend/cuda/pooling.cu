@@ -218,6 +218,10 @@ Status pooling_cuda(
     const ComputeContext& ctx,
     void* /*workspace*/)
 {
+    // Global pooling has no whole-plane kernel here yet; the CUDA kernel walks
+    // a window, so say so rather than pool with an unread kernel_shape.
+    if (attrs.global) { return Status::unsupported; }
+
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
     case DataType::f32:

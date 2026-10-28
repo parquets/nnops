@@ -1,6 +1,10 @@
 #pragma once
 /// @file pooling.hpp
-/// @brief Pooling operator — 2D/3D spatial pooling, packed NCHWC8/NCDHWC8 layout.
+/// @brief Pooling operator — 2D/3D spatial pooling on either a planar
+///        (NCHW/NCDHW) or a packed (NCHWC8/NCDHWC8) tensor.
+///
+/// The input's layout is the output's: NCHW stays NCHW. Planar input supports
+/// f32/f16; quantized (s8/u8) pooling is packed-only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -56,6 +60,13 @@ struct PoolingAttributes {
     /// If true, add result to existing output buffer instead of overwriting.
     bool add_to = false;
 
+    /// Global pooling: the window is the whole spatial extent, so every spatial
+    /// axis of the output is 1 (PyTorch's AdaptiveAvgPool2d(1), ONNX's
+    /// GlobalAveragePool/GlobalMaxPool). kernel_shape, stride, padding,
+    /// dilation and auto_pad are not consulted; @c type still says max or
+    /// average. The CPU backend scans each plane directly for f32/f16.
+    bool global = false;
+
     /// Returns the spatial rank (2 or 3) inferred from the input tensor rank.
     /// For a 4D input (NCHW), returns 2. For a 5D input (NCDHW), returns 3.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
@@ -67,6 +78,7 @@ struct PoolingAttributes {
 ///
 /// 2D: Input [N, C, IH, IW] → Output [N, C, OH, OW]
 /// 3D: Input [N, C, ID, IH, IW] → Output [N, C, OD, OH, OW]
+/// Global: Output [N, C, 1, 1] (or [N, C, 1, 1, 1] in 3D).
 class Pooling : public OpBase {
 public:
     static std::unique_ptr<Pooling> create(const PoolingAttributes& attrs,
@@ -91,7 +103,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Pooling; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::Any; }
 
     const PoolingAttributes& attributes() const noexcept { return attrs_; }
 

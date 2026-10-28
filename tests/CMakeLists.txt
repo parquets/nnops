@@ -124,6 +124,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_matmul.cpp
         bench_linear.cpp
         bench_conv2d.cpp
+        bench_pooling.cpp
         bench_attention.cpp
         bench_mma_packed.cpp
     )

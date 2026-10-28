@@ -1,18 +1,22 @@
 /// @file pooling.cpp
-/// @brief SIMD-optimized CPU implementation of 2D/3D spatial pooling (NCHWC8 only).
+/// @brief SIMD-optimized CPU implementation of 2D/3D spatial pooling, in both
+///        the packed (NCHWC8/NCDHWC8) and the planar (NCHW/NCDHW) layout.
 ///
 /// Key design decisions:
-///   1. All C8 blocks (including partial) use SIMD h4/h1 kernels — pad channels in
-///      NCHWC8 input are zero, so SIMD operates correctly on all 8 lanes
-///      (max ignores pad zeros, avg accumulates zero = no contribution).
+///   1. The layout picks the vector lane. Packed: all C8 blocks (including
+///      partial) use SIMD h4/h1 kernels — pad channels in NCHWC8 input are
+///      zero, so SIMD operates correctly on all 8 lanes (max ignores pad
+///      zeros, avg accumulates zero = no contribution). Planar: one channel
+///      plane at a time, the lane runs along output width.
 ///   2. SIMD kernels handle exclude_pad via in-kernel per-position valid_count.
-///   3. Height-4 blocking: process 4 output rows at once (h4), remainder with h1.
+///   3. Height-4 blocking for packed rows (4 output rows per call), remainder
+///      with h1; a planar row has no h4 form.
 ///   4. In-kernel bounds checking for all kernel positions — no pre-splitting.
 ///   5. All SW values supported — offset math is just integer arithmetic.
-///   6. N*C8 parallel dispatch.
+///   6. N*blocks parallel dispatch (blocks = C8 for packed, C for planar).
 ///   7. Params passed by const reference (unified across all kernels).
 ///
-/// NCHW->NCHWC8 conversion is handled at the operator dispatch layer (src/ops/pooling.cpp).
+/// Quantized pooling is packed-only; layout conversion is the caller's job.
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -39,8 +43,11 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t rank  = input.rank();
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
-    const int64_t N  = input.shape(0);
-    const int64_t C8 = input.num_channel_blocks();
+    // Channel blocks: C8 blocks when packed, one per channel when planar. The
+    // block strides below describe both, so only the row kernel differs.
+    const int64_t N      = input.shape(0);
+    const int64_t blocks = input.num_channel_blocks();
+    const bool packed    = is_channel_packed(input.layout());
 
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH = input.shape(srank);
@@ -89,15 +96,18 @@ void pooling_impl(const PoolingAttributes& attrs,
     // Select SIMD kernels (all C8 blocks use SIMD)
     using PoolingFn = void (*)(T*, const T*, const k::PoolingKernelParams&,
                                 float, bool);
-    const PoolingFn pool_h4_fn = (attrs.type == PoolingType::Max)
-        ? k::maxpool_h4<T> : k::avgpool_h4<T>;
-    const PoolingFn pool_h1_fn = (attrs.type == PoolingType::Max)
-        ? k::maxpool_h1<T> : k::avgpool_h1<T>;
+    const bool is_max = (attrs.type == PoolingType::Max);
+    const PoolingFn pool_h4_fn = is_max ? k::maxpool_h4<T> : k::avgpool_h4<T>;
+    // A planar row is vectorized along W, so it has no h4 form: the h4 slot is
+    // only reached when packed, and the h1 slot carries the layout's kernel.
+    const PoolingFn pool_h1_fn = packed
+        ? (is_max ? k::maxpool_h1<T> : k::avgpool_h1<T>)
+        : (is_max ? k::maxpool_planar<T> : k::avgpool_planar<T>);
 
-    // Per-C8-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
-    const auto compute_c8 = [&](int64_t n, int64_t c8) {
-        const T* in_base  = in_ptr + n * C8 * in_ch_stride + c8 * in_ch_stride;
-        T* out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
+    // Per-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
+    const auto compute_block = [&](int64_t n, int64_t blk) {
+        const T* in_base  = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
+        T* out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
 
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::PoolingKernelParams pc = p;
@@ -106,10 +116,13 @@ void pooling_impl(const PoolingAttributes& attrs,
             T* out_d = out_base + od * pc.out_row_stride * OH;
 
             int64_t oh = 0;
-            for (; oh + 3 < OH; oh += 4) {
-                pc.od = od;
-                pc.oh = oh;
-                pool_h4_fn(out_d + oh * pc.out_row_stride, in_base, pc, avg_scale, attrs.add_to);
+            if (packed) {
+                for (; oh + 3 < OH; oh += 4) {
+                    pc.od = od;
+                    pc.oh = oh;
+                    pool_h4_fn(out_d + oh * pc.out_row_stride, in_base, pc, avg_scale,
+                               attrs.add_to);
+                }
             }
             for (; oh < OH; ++oh) {
                 pc.od = od;
@@ -120,8 +133,87 @@ void pooling_impl(const PoolingAttributes& attrs,
         }
     };
 
-    ctx.cpu.run(0, N * C8,
-            [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
+    ctx.cpu.run(0, N * blocks,
+            [&](int64_t tid) { compute_block(tid / blocks, tid % blocks); });
+}
+
+// ============================================================
+// Global pooling — one output per channel plane, no window walk
+// ============================================================
+
+template <bool IsMax, typename T>
+void pooling_global_impl(const PoolingAttributes& attrs,
+                         TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx)
+{
+    const auto& input = inputs[0];
+    const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
+    const int64_t N      = input.shape(0);
+    const int64_t blocks = input.num_channel_blocks();
+    const bool packed    = is_channel_packed(input.layout());
+
+    k::PoolingKernelParams p{};
+    p.ID = (srank == 3) ? input.shape(2) : 1;
+    p.IH = input.shape(srank);
+    p.IW = input.shape(srank + 1);
+    p.in_d_stride   = p.IH * input.row_stride_elems();
+    p.in_row_stride = input.row_stride_elems();
+
+    const double count = static_cast<double>(p.ID) * p.IH * p.IW;
+    const float scale = (count > 0.0) ? static_cast<float>(1.0 / count) : 0.0f;
+
+    const int64_t in_ch_stride  = input.channel_block_stride_elems();
+    const int64_t out_ch_stride = output.channel_block_stride_elems();
+    const auto* in_ptr = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
+
+    ctx.cpu.run(0, N * blocks, [&](int64_t tid) {
+        const T* in_base = in_ptr + tid * in_ch_stride;
+        T* out_base = out_ptr + tid * out_ch_stride;
+
+        if (packed) {
+            k::global_store(out_base, k::global_packed<IsMax>(in_base, p, scale),
+                            attrs.add_to);
+        } else {
+            s_store_add(out_base, k::global_planar<IsMax>(in_base, p, scale),
+                        attrs.add_to);
+        }
+    });
+}
+
+/// The fp driver: a native plane scan when global, the window walk otherwise.
+template <typename T>
+void pooling_fp(const PoolingAttributes& attrs,
+                TensorView& output,
+                std::span<const TensorView> inputs,
+                const ComputeContext& ctx)
+{
+    if (!attrs.global) {
+        pooling_impl<T>(attrs, output, inputs, ctx);
+    } else if (attrs.type == PoolingType::Max) {
+        pooling_global_impl<true, T>(attrs, output, inputs, ctx);
+    } else {
+        pooling_global_impl<false, T>(attrs, output, inputs, ctx);
+    }
+}
+
+/// A global window spelled out as the full extent. The quantized kernels have
+/// no whole-plane form, but reducing a window that covers the input is the
+/// same reduction — the walk just costs its per-tap bounds checks.
+inline PoolingAttributes full_extent_window(PoolingAttributes attrs,
+                                            const TensorView& in)
+{
+    const int64_t srank = PoolingAttributes::spatial_rank(in.rank());
+    const auto first = static_cast<size_t>(3 - srank);
+    for (int64_t d = 0; d < srank; ++d) {
+        attrs.kernel_shape[first + static_cast<size_t>(d)] = in.shape(2 + d);
+        attrs.stride[first + static_cast<size_t>(d)]   = 1;
+        attrs.padding[first + static_cast<size_t>(d)]  = 0;
+        attrs.dilation[first + static_cast<size_t>(d)] = 1;
+    }
+    attrs.global = false;
+    return attrs;
 }
 
 // ============================================================
@@ -278,27 +370,39 @@ Status pooling_cpu(const PoolingAttributes& attrs,
 {
     const auto dtype  = inputs[0].data_type();
     const auto odtype = output.data_type();
+    const bool quant = (dtype == DataType::s8 || dtype == DataType::u8);
+
+    // Quantized pooling is packed-only: its dequantize-on-load kernels place
+    // the lane on a C8 channel block, which a planar plane does not have.
+    if (quant && !is_channel_packed(inputs[0].layout())) {
+        return Status::unsupported;
+    }
+    // ...and it has no whole-plane form, so a global request takes the window
+    // walk with the window spelled out as the full extent.
+    const PoolingAttributes qattrs =
+        (quant && attrs.global) ? full_extent_window(attrs, inputs[0]) : attrs;
+
     switch (dtype) {
     case DataType::f32:
-        pooling_impl<float>(attrs, output, inputs, ctx);
+        pooling_fp<float>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::f16:
-        pooling_impl<half>(attrs, output, inputs, ctx);
+        pooling_fp<half>(attrs, output, inputs, ctx);
         return Status::ok;
     case DataType::s8:
         if (odtype == DataType::s8) {
-            pooling_impl_quant<int8_t, int8_t>(attrs, output, inputs, ctx);
+            pooling_impl_quant<int8_t, int8_t>(qattrs, output, inputs, ctx);
         } else if (odtype == DataType::u8) {
-            pooling_impl_quant<int8_t, uint8_t>(attrs, output, inputs, ctx);
+            pooling_impl_quant<int8_t, uint8_t>(qattrs, output, inputs, ctx);
         } else {
             NNOPS_ASSERT(!"pooling_cpu: s8 input requires s8/u8 output");
         }
         return Status::ok;
     case DataType::u8:
         if (odtype == DataType::s8) {
-            pooling_impl_quant<uint8_t, int8_t>(attrs, output, inputs, ctx);
+            pooling_impl_quant<uint8_t, int8_t>(qattrs, output, inputs, ctx);
         } else if (odtype == DataType::u8) {
-            pooling_impl_quant<uint8_t, uint8_t>(attrs, output, inputs, ctx);
+            pooling_impl_quant<uint8_t, uint8_t>(qattrs, output, inputs, ctx);
         } else {
             NNOPS_ASSERT(!"pooling_cpu: u8 input requires s8/u8 output");
         }

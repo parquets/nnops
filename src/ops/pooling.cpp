@@ -1,5 +1,6 @@
 /// @file pooling.cpp
-/// @brief Pooling operator dispatch — input/output always NCHWC8/NCDHWC8, direct pass-through.
+/// @brief Pooling operator dispatch — packed or planar I/O, direct pass-through
+///        (output layout follows the input's).
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -17,6 +18,20 @@ NNOPS_OP_BOILERPLATE(Pooling, PoolingAttributes,
 std::vector<TensorDesc> Pooling::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
+    if (attrs_.global) {
+        // Every spatial axis pools to one; the window fields are not read, so
+        // the generic convolution is not run either.
+        const auto& in = inputs[0];
+        TensorDesc out;
+        out.rank   = in.rank;
+        out.layout = in.layout;
+        out.dtype  = in.dtype;
+        out.dims.resize(static_cast<size_t>(in.rank));
+        out.dims[0] = in.dims[0];
+        out.dims[1] = in.dims[1];
+        for (int64_t d = 2; d < in.rank; ++d) { out.dims[static_cast<size_t>(d)] = 1; }
+        return {out};
+    }
     return {pooling_output_shape(
         attrs_.kernel_shape, attrs_.stride, attrs_.dilation, attrs_.padding,
         static_cast<int>(attrs_.auto_pad), inputs)};
@@ -26,8 +41,14 @@ Status Pooling::validate(std::span<const TensorDesc> inputs,
                          std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
-    return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PackedOnly));
+    const auto& in = inputs[0];
+    if (is_planar_spatial(in.layout)) {
+        // Planar pooling has f32/f16 kernels; quantized planes do not.
+        return detail::require(
+            detail::dtype_in<DataType::f32, DataType::f16>(in.dtype),
+            Status::unsupported);
+    }
+    return detail::require(is_layout_supported(in.layout, LayoutSupport::PackedOnly));
 }
 
 Status Pooling::compute(std::span<TensorView> outputs,
@@ -43,7 +64,10 @@ Status Pooling::compute(std::span<TensorView> outputs,
 
     // auto_pad lives in the descriptor; kernels only see explicit leading padding.
     PoolingAttributes attrs = attrs_;
-    if (attrs.auto_pad != PoolingAttributes::AutoPad::NOTSET) {
+    if (attrs.global) {
+        // The window is the whole extent, so there is no padding to resolve.
+        attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET;
+    } else if (attrs.auto_pad != PoolingAttributes::AutoPad::NOTSET) {
         const int ap = static_cast<int>(attrs.auto_pad);
         const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
         for (int i = 0; i < srank; ++i) {
