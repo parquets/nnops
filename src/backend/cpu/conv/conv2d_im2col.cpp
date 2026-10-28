@@ -207,6 +207,30 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     T* pack_base = static_cast<T*>(workspace) + plan.num_slots * orig_size;
 
     const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
+
+    // A pure clamp needs no epilogue pass. The MMA store already applies its
+    // min/max bounds — MatMul folds Relu into them the same way (matmul.cpp's
+    // attrs_n switch) — so Relu/Relu6, which is every activation in
+    // MobileNetV2, costs one read+write less per output tile. Measured 11% of
+    // the conv2d row at one thread, interleaved; the checkpoints are
+    // bit-identical, so this is the same arithmetic in a different place.
+    //
+    // add_to is the exception: the residual is added *after* the activation
+    // (epilogue(bias + Σ) then += orig), so it needs the tile back in memory.
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    float clamp_lo = -kInf;
+    float clamp_hi = kInf;
+    bool epilogue_folded = false;
+    if (!attrs.add_to) {
+        switch (attrs.epilogue.type) {
+        case EpilogueActivateType::Relu:  clamp_lo = 0.0f; epilogue_folded = true; break;
+        case EpilogueActivateType::Relu6: clamp_lo = 0.0f; clamp_hi = 6.0f;
+                                          epilogue_folded = true; break;
+        default: break;
+        }
+    }
+    const bool epilogue_pass = epilogue_active && !epilogue_folded;
+
     // Nothing to seed the accumulator with (no bias tensor, no residual to fold
     // in) → the first icn block starts from zero inside the micro-kernel instead
     // of being pre-filled over the whole tile first. matmul.cpp takes the same
@@ -307,7 +331,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     if (icn == 0 && seed_needed) {
                         // add_to + non-identity epilogue needs the original
                         // output preserved (epilogue(bias + Σ) then += orig).
-                        if (attrs.add_to && epilogue_active) {
+                        if (attrs.add_to && epilogue_pass) {
                             tile_save<T>(orig, tile, static_cast<int>(ocn_step),
                                          static_cast<int>(ocnc), static_cast<int>(roi_area));
                         }
@@ -318,6 +342,9 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                     }
 
                     const T* a = weight_ptr + icn * karea + ocn * w_ocn_step;
+                    // Only the final ic-block clamps: partial sums accumulate
+                    // unclamped (kblock_clamp in matmul_internal.h).
+                    const bool clamp_here = is_last_icn && epilogue_folded;
                     // An unseeded first block overwrites C outright; every
                     // later block (and every seeded one) accumulates.
                     tile_mma_direct(static_cast<int>(ocnc), static_cast<int>(roi_area),
@@ -325,13 +352,13 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                                             tile, static_cast<int>(ocn_step),
                                             a, static_cast<int>(w_ocn_step),
                                             pack_b,
-                                            -std::numeric_limits<float>::infinity(),
-                                            std::numeric_limits<float>::infinity(),
+                                            clamp_here ? clamp_lo : -kInf,
+                                            clamp_here ? clamp_hi : kInf,
                                             /*zero_mode=*/icn == 0 && !seed_needed);
 
                     // An identity epilogue is a whole-tile copy-back — skip it
                     // (matmul.cpp guards the same call the same way).
-                    if (is_last_icn && epilogue_active) {
+                    if (is_last_icn && epilogue_pass) {
                         epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                             tile, static_cast<int>(ocn_step),
                                             static_cast<const T*>(nullptr), attrs.epilogue,
