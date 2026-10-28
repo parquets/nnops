@@ -19,6 +19,7 @@
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <atomic>
@@ -318,6 +319,87 @@ NNOPS_TEST(wino_plan_gates_on_geometry) {
                         d2, ins, outs, 1, false).workspace_size, 0u);
 }
 
+NNOPS_TEST(wino_plan_splits_the_filter_rows) {
+    // A 14x14 plane is 7 tile rows and one 8-wide tile block — 7 tasks, and the
+    // tile axis has nothing left to give. The plan grows a second axis on the
+    // filter rows: the nearest whole number of chunks to nt/plane_tasks, floored
+    // at two M-panels of work each so the repeated halo + input transform stays
+    // amortized.
+    std::vector<float> in_buf(256 * 14 * 14, 0.0f);
+    std::vector<float> out_buf(256 * 14 * 14, 0.0f);
+    std::vector<float> u_buf(16 * 256 * 256, 0.0f);
+    const int64_t ishape[] = {1, 256, 14, 14};
+    const int64_t oshape[] = {1, 256, 14, 14};
+    const int64_t ushape[] = {16, 256, 256};
+    TensorView input(ishape, DataType::f32, in_buf.data());
+    TensorView output(oshape, DataType::f32, out_buf.data());
+    TensorView u(ushape, DataType::f32, u_buf.data(),
+                 256 * static_cast<int64_t>(sizeof(float)),
+                 TensorLayout::PackedWinoWeight);
+    const TensorDesc ins[] = {input.desc(), u.desc()};
+    const TensorDesc outs[] = {output.desc()};
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    const auto plan = [&](int nt) {
+        return nnops::backend::cpu::get_conv2d_winograd_plan(attrs, ins, outs, nt, true);
+    };
+
+    // TH 7 · one tile block = 7 plane tasks. Rounding, not ceiling: 16 threads
+    // want 2 chunks (14 tasks, one wave), and 3 would run a straggler.
+    struct Row { int nt; int64_t chunks; };
+    for (const Row& r : {Row{1, 1}, Row{4, 1}, Row{8, 1}, Row{12, 2},
+                         Row{14, 2}, Row{16, 2}, Row{20, 3}, Row{28, 4}}) {
+        const auto p = plan(r.nt);
+        NNOPS_EXPECT_EQ(p.oc_chunks, r.chunks);
+        NNOPS_EXPECT_EQ(p.num_tasks, 7 * r.chunks);
+        NNOPS_EXPECT_EQ(p.num_slots, std::min<int64_t>(r.nt, p.num_tasks));
+        // Every task keeps at least two M-panels (6 rows each on x86_64 f32).
+        NNOPS_EXPECT_TRUE(256 / p.oc_chunks >= 2 * 6);
+    }
+
+    // A plane that already fills the pool keeps the single dispatch: 56 tasks.
+    std::vector<float> in56(64 * 56 * 56, 0.0f);
+    std::vector<float> out56(64 * 56 * 56, 0.0f);
+    std::vector<float> u56(16 * 64 * 64, 0.0f);
+    const int64_t i56[] = {1, 64, 56, 56};
+    const int64_t o56[] = {1, 64, 56, 56};
+    const int64_t u56s[] = {16, 64, 64};
+    TensorView in_v(i56, DataType::f32, in56.data());
+    TensorView out_v(o56, DataType::f32, out56.data());
+    TensorView u_v(u56s, DataType::f32, u56.data(),
+                   64 * static_cast<int64_t>(sizeof(float)),
+                   TensorLayout::PackedWinoWeight);
+    const TensorDesc ins56[] = {in_v.desc(), u_v.desc()};
+    const TensorDesc outs56[] = {out_v.desc()};
+    const auto wide = nnops::backend::cpu::get_conv2d_winograd_plan(
+        attrs, ins56, outs56, 20, true);
+    NNOPS_EXPECT_EQ(wide.oc_chunks, int64_t{1});
+    NNOPS_EXPECT_EQ(wide.num_tasks, int64_t{56});
+
+    // And the floor stops it: 16 filter rows cannot be cut into two 12-row
+    // tasks, so the starved 7-task grid stays as it is.
+    std::vector<float> in16(16 * 14 * 14, 0.0f);
+    std::vector<float> out16(16 * 14 * 14, 0.0f);
+    std::vector<float> u16(16 * 16 * 16, 0.0f);
+    const int64_t i16[] = {1, 16, 14, 14};
+    const int64_t o16[] = {1, 16, 14, 14};
+    const int64_t u16s[] = {16, 16, 16};
+    TensorView i16v(i16, DataType::f32, in16.data());
+    TensorView o16v(o16, DataType::f32, out16.data());
+    TensorView u16v(u16s, DataType::f32, u16.data(),
+                    16 * static_cast<int64_t>(sizeof(float)),
+                    TensorLayout::PackedWinoWeight);
+    const TensorDesc ins16[] = {i16v.desc(), u16v.desc()};
+    const TensorDesc outs16[] = {o16v.desc()};
+    const auto narrow = nnops::backend::cpu::get_conv2d_winograd_plan(
+        attrs, ins16, outs16, 20, true);
+    NNOPS_EXPECT_EQ(narrow.oc_chunks, int64_t{1});
+    NNOPS_EXPECT_EQ(narrow.num_tasks, int64_t{7});
+}
+
 // ============================================================
 // End-to-end: Winograd vs conv2d_ref
 // ============================================================
@@ -589,6 +671,32 @@ NNOPS_TEST(wino_matches_ref_threaded) {
     ctx.cpu = pool.cpu;
     wino_vs_ref_f32({1, 8, 12, 12}, {8, 8, 3, 3}, attrs, /*has_bias=*/true,
                     /*fill_out=*/0.0f, &ctx);
+}
+
+NNOPS_TEST(wino_oc_split_matches_ref) {
+    // A 6x6 output plane is 3 tile rows and one tile block, so a 6-thread pool
+    // splits the filter rows in two and the tasks write disjoint oc ranges.
+    // Each output element is still computed by exactly one task with the same
+    // arithmetic order as the serial run, so this is the shape that would catch
+    // a mis-sliced oc range (an unfixed `ocnc` clipping the loop to one block
+    // shows up here as the back half of the filter never being applied).
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    SimplePool pool(6);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    wino_vs_ref_f32({1, 64, 6, 6}, {64, 64, 3, 3}, attrs, /*has_bias=*/true,
+                    /*fill_out=*/0.0f, &ctx);
+
+    // Same shape through 12 threads: the chunk count moves (2 -> 4), the answer
+    // does not.
+    SimplePool pool12(12);
+    ComputeContext ctx12;
+    ctx12.cpu = pool12.cpu;
+    wino_vs_ref_f32({1, 64, 6, 6}, {64, 64, 3, 3}, attrs, /*has_bias=*/true,
+                    /*fill_out=*/0.0f, &ctx12);
 }
 
 NNOPS_TEST(wino_threads_bit_identical_batch_groups) {

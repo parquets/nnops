@@ -28,6 +28,7 @@
 #include <omp.h>
 #endif
 
+#include <algorithm>
 #include <cstdint>
 
 #include "nnops/core/parallel_for.hpp"
@@ -69,6 +70,17 @@ inline CpuBackend openmp_backend(int nthreads = 0) {
     CpuBackend b;
 #if defined(_OPENMP)
     b.parallel_for = [nthreads](int64_t begin, int64_t end, const ParallelForBody& body) {
+        if (end <= begin) { return; }
+        // The team size is pinned, deliberately: it is the *item* count that
+        // should follow the pool, never the other way round. Sizing the team
+        // from the work (min(nthreads, end - begin)) looks right for an idle
+        // worker and measures far worse on vcomp: a region whose num_threads
+        // differs from the one before it tears the team down and rebuilds it,
+        // and at 20 threads that is ~0.7 ms per transition. On the ResNet-18
+        // runner it cost 6 ms of an 18 ms forward — every op that followed a
+        // narrow one paid for the rebuild. So a caller with few items should
+        // give the pool more tasks (the conv plan splits its oc-blocks for
+        // exactly this, conv2d_im2col.cpp) rather than shrink the team.
         const int nt = nthreads > 0 ? nthreads : omp_get_max_threads();
 #pragma omp parallel for schedule(static) num_threads(nt)
         for (int64_t i = begin; i < end; ++i) {

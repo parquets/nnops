@@ -6,9 +6,10 @@
 ///
 /// For each (batch, group) the output spatial plane is split into oh-blocks;
 /// when (batch, group) alone under-subscribes the pool the oh-blocks are
-/// partitioned into parallel chunks (plan.oh_chunks). The report shows the block
-/// geometry (icn/ocn/oh_block), the resulting oh-block count, and the total
-/// parallel task count (N*G*oh_chunks).
+/// partitioned into parallel chunks (plan.oh_chunks), and a plane too small to
+/// fill the pool that way also splits its oc-blocks (plan.oc_chunks). The report
+/// shows the block geometry (icn/ocn/oh_block), the resulting oh-block count,
+/// and the total task count (N*G*oh_chunks*oc_chunks).
 ///
 /// Cases are point-shaped — one named network layer per bench — plus, at the end,
 /// kernel-area sweep tables: one shape walked across kernel size, plane size and
@@ -152,11 +153,11 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
                 (long long)c.OC, (long long)icg, (long long)c.KH, (long long)c.KW,
                 (long long)c.N, (long long)c.OC, (long long)OH, (long long)OW,
                 c.f16 ? "f16" : "f32");
-    std::printf("    icn=%lld ocn=%lld oh_block=%lld oh_blocks=%lld  tasks=N*G*oh_chunks=%lld"
+    std::printf("    icn=%lld ocn=%lld oh_block=%lld oh_blocks=%lld  tasks=N*G*oh_chunks*oc_chunks=%lld"
                 "  ws=%zuB%s\n",
                 (long long)plan.icn_block, (long long)plan.ocn_block,
                 (long long)plan.oh_block, (long long)plan.num_oh_blocks,
-                (long long)(c.N * c.groups * plan.oh_chunks), plan.workspace_size,
+                (long long)(c.N * c.groups * plan.oh_chunks * plan.oc_chunks), plan.workspace_size,
                 plan.pointwise ? "  pointwise(no col buffer)" : "");
 
     auto compute = [&](const ComputeContext& ctx) { op->compute(output, ins, ctx, nullptr); };
@@ -447,12 +448,13 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
                                                                   threads.end());
         const auto wp = cpu::get_conv2d_winograd_plan(base, wd, wo_arr, max_nt, true);
         std::printf("    wino: tiles=%lldx%lld(pad %lld) icn=%lld ocn=%lld tile_blk=%lld"
-                    " tasks=%lld x %lld slots, slot=%lld el, ws=%zuB\n",
+                    " occ=%lld tasks=%lld x %lld slots, slot=%lld el, ws=%zuB\n",
                     (long long)wp.num_tile_rows, (long long)wp.num_tile_cols,
                     (long long)wp.num_tile_cols_pad, (long long)wp.icn_block,
                     (long long)wp.ocn_block, (long long)wp.tile_block,
-                    (long long)wp.num_tasks, (long long)wp.num_slots,
-                    (long long)wp.slot_size, wp.workspace_size);
+                    (long long)wp.oc_chunks, (long long)wp.num_tasks,
+                    (long long)wp.num_slots, (long long)wp.slot_size,
+                    wp.workspace_size);
     }
 
     std::printf("  %s\n", c.name);
@@ -774,11 +776,11 @@ void run_conv2d_i8(const Conv2DI8Case& c, const std::vector<int>& threads, int i
                 c.bias ? "  +bias" : "", c.asym_w ? "  asym-w" : "",
                 c.act == DataType::f32 || c.act == DataType::f16
                     ? (c.act_q == DataType::u8 ? "  quant->u8" : "  quant->s8") : "");
-    std::printf("    icn=%lld ocn=%lld oh_block=%lld oh_blocks=%lld  tasks=N*G*oh_chunks=%lld"
+    std::printf("    icn=%lld ocn=%lld oh_block=%lld oh_blocks=%lld  tasks=N*G*oh_chunks*oc_chunks=%lld"
                 "  ws=%zuB%s\n",
                 (long long)b.plan.icn_block, (long long)b.plan.ocn_block,
                 (long long)b.plan.oh_block, (long long)b.plan.num_oh_blocks,
-                (long long)(c.N * c.groups * b.plan.oh_chunks), b.plan.workspace_size,
+                (long long)(c.N * c.groups * b.plan.oh_chunks * b.plan.oc_chunks), b.plan.workspace_size,
                 b.plan.pointwise ? "  pointwise(no col buffer)" : "");
 
     std::vector<double> gops;
@@ -1044,7 +1046,7 @@ struct ConvSweepOp {
         ocn   = plan.ocn_block;
         ohb   = plan.oh_block;
         blks  = s.N * s.groups * plan.num_oh_blocks;
-        tasks = s.N * s.groups * plan.oh_chunks;
+        tasks = s.N * s.groups * plan.oh_chunks * plan.oc_chunks;
         pw    = plan.pointwise;
 
         const int64_t OH = out_descs[0].dims[2], OW = out_descs[0].dims[3];
@@ -1310,6 +1312,19 @@ NNOPS_BENCH(conv2d_wino_f32_8ch_degenerate) {
     // The floor: at 8 channels the transforms eat the 2.25x multiply saving, so
     // this is the case where Winograd is only at parity with im2col.
     bench_wino_case({"f32 wino 1x8x56x56 -> 8 x 3x3 s1 p1 (degenerate)", 1, 8, 56, 56, 8});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_28x28_128ch) {
+    // ResNet-18 layer2.x: 14 tile rows × 1 tile block = 14 tasks, i.e. just
+    // under this host's 20 logical CPUs. The plane that starts to starve.
+    bench_wino_case({"f32 wino 1x128x28x28 -> 128 x 3x3 s1 p1", 1, 128, 28, 28, 128});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_14x14_256ch) {
+    // ResNet-18 layer3.x: 7 tile rows and one 8-wide tile block — 7 tasks for
+    // the whole pool, and the tile axis has no room left (TW_pad is already one
+    // vector). The oc axis is the only supply this shape has.
+    bench_wino_case({"f32 wino 1x256x14x14 -> 256 x 3x3 s1 p1", 1, 256, 14, 14, 256});
 }
 
 NNOPS_BENCH(conv2d_wino_f32_pad0_odd) {

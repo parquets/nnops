@@ -118,7 +118,7 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     const int64_t ocn_block  = plan.ocn_block;
     const int64_t tile_block = plan.tile_block;
     const int64_t num_tile_blocks = plan.num_tile_blocks;
-    const int64_t num_oc_blocks   = plan.num_oc_blocks;
+    const int64_t oc_chunks       = plan.oc_chunks;
 
     T* out_ptr = output.ptr<T>();
     const T* in_ptr = input.ptr<T>();
@@ -152,12 +152,18 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
     const int nslots = ctx.cpu.thread_slot_count();
     const bool per_thread = nslots > 0 && plan.num_slots < num_tasks;
 
-    // One task = one (batch, group, tile row, tile block): build the halo strip
-    // its tiles read, transform it, run the 16 GEMMs for every oc block of that
-    // group, and write the tiles back. Tile rows and blocks are disjoint, so the
-    // whole convolution is one dispatch with no phase between them.
+    // One task = one (batch, group, tile row, tile block, oc-chunk): build the
+    // halo strip its tiles read, transform it, run the 16 GEMMs for its own
+    // slice of the filter, and write those tiles back. Tile rows, blocks and oc
+    // ranges are disjoint, so the whole convolution is one dispatch with no
+    // phase between them.
     const auto run_task = [&](int64_t t) {
         int64_t idx = t;
+        // The oc-chunk varies fastest: the chunks of one plane are adjacent in
+        // task order, so the pool hands them out together. They rebuild the same
+        // halo strip, and whichever arrives second finds those input lines in
+        // L2 — ordering them apart would turn a shared read into n_planes reads.
+        const int64_t oc_chunk = idx % oc_chunks; idx /= oc_chunks;
         const int64_t tb = idx % num_tile_blocks; idx /= num_tile_blocks;
         const int64_t th = idx % TH;              idx /= TH;
         const int64_t g  = idx % G;               idx /= G;
@@ -165,6 +171,14 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
 
         const int64_t tw0 = tb * tile_block;
         const int64_t nc  = std::min(tile_block, TW_pad - tw0);
+
+        // This task's filter rows, also disjoint. An even split of the rows (not
+        // of the oc-block list): the task count is what the pool wants, and an
+        // even row split keeps the tasks within one row of each other — a block
+        // split leaves the last task with two blocks while its neighbours run
+        // one, and the barrier is set by the slowest.
+        const int64_t oc_lo = oc_chunk * oc_per_group / oc_chunks;
+        const int64_t oc_hi = (oc_chunk + 1) * oc_per_group / oc_chunks;
 
         const int64_t slot = per_thread
             ? static_cast<int64_t>(ctx.cpu.current_thread_id())
@@ -201,9 +215,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
             }
         }
 
-        for (int64_t ob = 0; ob < num_oc_blocks; ++ob) {
-            const int64_t ocn0 = ob * ocn_block;
-            const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn0);
+        for (int64_t ocn0 = oc_lo; ocn0 < oc_hi; ocn0 += ocn_block) {
+            const int64_t ocnc = std::min(ocn_block, oc_hi - ocn0);
 
             // Accumulate over the input channels: M_p is zeroed on the first ic
             // block (zero_mode) and accumulated after. Bias is deliberately NOT
@@ -327,14 +340,48 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
     plan.ocn_block  = std::min<int64_t>(64, oc_per_group);
     plan.tile_block = std::clamp<int64_t>(TW_pad, 8, 16);
 
-    plan.num_oc_blocks   = (oc_per_group + plan.ocn_block - 1) / plan.ocn_block;
     plan.num_tile_blocks = (TW_pad + plan.tile_block - 1) / plan.tile_block;
 
     // One task per (batch, group, tile row, tile block). The batch and group
     // axes are part of the task grid, not a serial loop around one dispatch, so
     // N·G also counts towards filling the pool.
     const int64_t NB = (in.dims[0] > 0) ? in.dims[0] : 1;
-    plan.num_tasks  = NB * G * TH * plan.num_tile_blocks;
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+    const int64_t plane_tasks = NB * G * TH * plan.num_tile_blocks;
+
+    // Second parallel axis: the filter rows, exactly as Conv2D's im2col plan
+    // grows one (conv2d_im2col.cpp). A 14x14 output plane is 7 tile rows and one
+    // 8-wide tile block, so the grid is 7 tasks — and the tile axis has nothing
+    // left to give, because TW_pad is already one vector wide. Measured on this
+    // host (bench_conv2d conv2d_wino_f32_14x14_256ch, ResNet-18's layer3.x): 20
+    // threads ran that layer FASTER at 4 threads than at 20 — 0.45 vs 0.59 ms —
+    // because 7 tasks over 20 workers leaves each task alone on a core, the
+    // spread over the slow E-cores decides the time, and im2col's 390 GFLOPS
+    // pulls ahead of winograd's 198.
+    //
+    // What a chunk costs is the halo strip it rebuilds and the input transform
+    // it repeats — the two phases the task-local scratch was fused to avoid
+    // sharing. That is IC·4·halo_ld copies plus ~32 adds per tile per channel,
+    // against a GEMM of 16·M·tiles·IC MACs: on the shape that matters here the
+    // duplicate is under a percent of the task, so 3 chunks cost ~2% and buy
+    // the whole pool. It is NOT free at the M floor below, which is where it
+    // has to stop.
+    //
+    // The chunk count is the NEAREST whole number to nt/plane_tasks, not the
+    // ceiling. Splitting past the pool buys nothing and costs a whole second
+    // wave: 16 threads on this 7-task plane want 2 chunks (14 tasks, one wave),
+    // and ceil would pick 3 (21 tasks, one straggler) — 0.35 vs 0.48 ms on the
+    // case above. Below 1.5·plane_tasks the round lands on 1 and the plane keeps
+    // the single dispatch it always had, which is what 8 threads want too.
+    // The floor is two M-panels of work per task.
+    plan.oc_chunks = 1;
+    if (plane_tasks < nt) {
+        const int64_t mr = (dt == DataType::f16) ? MR_MAX_F16 : MR_MAX_F32;
+        const int64_t max_chunks = std::max<int64_t>(1, oc_per_group / (2 * mr));
+        const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
+        plan.oc_chunks = std::clamp<int64_t>(want, 1, max_chunks);
+    }
+    plan.num_tasks  = plane_tasks * plan.oc_chunks;
     plan.halo_ld    = 2 * plan.tile_block + 2;   // padded columns per strip
     plan.halo_rows  = kWinoAlpha;                // the 4 window rows of one tile row
 
@@ -361,7 +408,6 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
     // Slots: one per worker when the caller reports worker ids, else one per
     // task (the same convention Conv2D's im2col plan uses — without a worker id
     // there is no way to pick a slot that two concurrent tasks will not share).
-    const int64_t nt = std::max<int64_t>(num_threads, 1);
     plan.num_slots = (use_thread_slots && nt < plan.num_tasks) ? nt : plan.num_tasks;
 
     plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size)

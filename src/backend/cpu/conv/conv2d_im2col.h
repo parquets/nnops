@@ -20,12 +20,15 @@
 /// K is the whole ic_per_group in one pass. MLAS takes the same route
 /// (convolve.cpp:1654, MlasConvAlgorithmGemmDirect, on K == InputChannels).
 ///
-/// Work is split at (batch, group, oh-chunk) granularity: when (batch, group)
-/// alone cannot fill the thread pool (the common batch=1 / groups=1 case), the
-/// oh-blocks are partitioned into parallel chunks. Scratch is indexed by thread
-/// id when the backend reports worker ids; otherwise each chunk owns its own
-/// im2col scratch. Output tiles are disjoint, so the result is bit-identical to
-/// serial execution.
+/// Work is split at (batch, group, oh-chunk, oc-chunk) granularity: when
+/// (batch, group) alone cannot fill the thread pool (the common batch=1 /
+/// groups=1 case), the oh-blocks are partitioned into parallel chunks, and a
+/// plane too small to feed the pool that way also partitions its filter rows —
+/// the axis MLAS grows to on the same shapes (convolve.cpp:1691), and the one
+/// that does not duplicate weight traffic. Scratch is indexed by thread id when
+/// the backend reports worker ids; otherwise each task owns its own im2col
+/// scratch. Output tiles are disjoint, so the result is bit-identical to serial
+/// execution.
 ///
 /// Bias is fused into the accumulator init; the epilogue (activation) is
 /// applied in-place after the last ic-block; `add_to` follows the reference
@@ -78,6 +81,10 @@ struct Conv2DPlan {
     int64_t oh_block  = 0;         ///< output-row block
     int64_t num_oh_blocks = 1;     ///< ceil(OH / oh_block)
     int64_t oh_chunks     = 1;     ///< parallel oh-chunks per (batch, group)
+    int64_t oc_chunks     = 1;     ///< oc-blocks per task, i.e. the task grid is
+                                   ///< N·G × oh_chunks × oc_chunks. Only the
+                                   ///< floating-point route splits oc (see the
+                                   ///< plan); the quantized route keeps 1.
     int64_t num_slots = 0;         ///< scratch slots (worker threads, else tasks)
     int64_t col_size  = 0;         ///< im2col scratch elements per slot (0 → pointwise,
                                    ///< or the fp route, whose gather is fused with

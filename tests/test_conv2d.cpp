@@ -1466,6 +1466,104 @@ NNOPS_TEST(conv2d_wide_frame_plan) {
     }
 }
 
+NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
+    // A small output plane cannot fill a wide pool from its oh-blocks alone: a
+    // 7x7 plane is two four-row blocks and that is the whole supply. The plan
+    // therefore splits the filter rows as well, so the task grid is
+    // (batch, group) x oh-chunks x oc-chunks. These are the tails of a 224
+    // ResNet-18, where that supply is the difference between two working threads
+    // and a full pool, plus the cases that must stay on the plane axis alone.
+    struct Case {
+        int64_t IC, IH, OC, K, S, nt;
+        int64_t want_ocn, want_ohb, want_oc_chunks;
+    };
+    const Case cases[] = {
+        // 14x14 plane, 512 filters: two oh-blocks, so the pool is starved and
+        // the filter rows split until it is fed (20 threads / 2 tasks = 10).
+        {256, 14, 512, 3, 2, 20, 128, 4, 10},
+        // Same plane at 4 threads: two tasks already keep half the pool busy,
+        // so the plane axis stays on its own.
+        {256, 14, 512, 3, 2,  4, 128, 4, 1},
+        // 7x7 plane, 512 filters, 20 threads: still two oh-blocks (the halving
+        // floor is two N panels wide), so the filter axis takes the whole load.
+        {512,  7, 512, 3, 1, 20, 128, 4, 10},
+        // 56x56 plane: fourteen oh-chunks fill the pool on their own and a
+        // filter split there would re-gather B for nothing.
+        { 64, 56, 128, 3, 2, 20, 128, 2, 1},
+        // One filter block cannot be split at all — 20 threads must make do.
+        { 64, 56,  64, 3, 1, 20,  64, 4, 1},
+    };
+
+    float placeholder = 0.0f;
+    for (const Case& c : cases) {
+        const int64_t ishape[] = {1, c.IC, c.IH, c.IH};
+        const int64_t wshape[] = {c.OC, c.IC, c.K, c.K};
+        TensorView input(ishape, DataType::f32, &placeholder);
+        TensorView weight(wshape, DataType::f32, &placeholder);
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.K, c.K};
+        attrs.stride      = {c.S, c.S};
+        attrs.padding     = {c.K / 2, c.K / 2};
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+        const TensorDesc descs[] = {input.desc(), weight.desc()};
+        const auto out_descs = op->getOutputTensorDesc(descs);
+        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+            attrs, descs, out_descs, c.nt, /*use_thread_slots=*/true);
+
+        NNOPS_EXPECT_EQ(plan.ocn_block, c.want_ocn);
+        NNOPS_EXPECT_EQ(plan.oh_block, c.want_ohb);
+        NNOPS_EXPECT_EQ(plan.oc_chunks, c.want_oc_chunks);
+        // Slots follow the task grid, which now counts the filter axis.
+        const int64_t tasks = plan.oh_chunks * plan.oc_chunks;
+        NNOPS_EXPECT_EQ(plan.num_slots, std::min<int64_t>(c.nt, tasks));
+        // Every task must own at least one filter row: the even split floors.
+        NNOPS_EXPECT_TRUE(c.OC / plan.oc_chunks >= 2 * 6);
+    }
+}
+
+NNOPS_TEST(conv2d_small_plane_oc_split_matches_ref) {
+    // The filter split is only a partition of the oc loop, so every thread
+    // configuration must reproduce the serial result — and the 20-thread plan
+    // here really does split (ten filter chunks of a 14x14 plane).
+    const int64_t ishape[] = {1, 32, 14, 14};
+    const int64_t wshape[] = {64, 32, 3, 3};
+    auto [in_vec, input]   = test::make_random_tensor(ishape, -1.0f, 1.0f, 901);
+    auto [w_vec, weight]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 902);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.padding     = {1, 1};
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc()};
+    std::vector<TensorView> ins   = {input, weight};
+    auto op = Conv2D::create(attrs, Backend::CPU);
+    const auto out_descs = op->getOutputTensorDesc(descs);
+    const auto plan = nnops::backend::cpu::get_conv2d_plan(
+        attrs, descs, out_descs, 20, /*use_thread_slots=*/true);
+    NNOPS_EXPECT_TRUE(plan.oc_chunks > 1);
+
+    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
+    TensorView ref = test::make_planar(out_descs[0], ref_buf.data());
+    {
+        NNOPS_EXPECT_EQ(op->compute(ref, ins, ComputeContext{}, nullptr), Status::ok);
+    }
+
+    for (int nt : {2, 4, 20}) {
+        std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
+        TensorView out = test::make_planar(out_descs[0], out_buf.data());
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        NNOPS_EXPECT_EQ(op->compute(out, ins, ctx, nullptr), Status::ok);
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            NNOPS_EXPECT_NEAR(out_buf[i], ref_buf[i], 1e-5f);
+        }
+    }
+}
+
 NNOPS_TEST(conv2d_wide_frame_matches_ref) {
     // 1280x720 through a 3x3 layer and a 1x1 pointwise layer — VGG16's first
     // conv and ResNet50's conv2_x 1x1 at that frame size. The tiled path runs

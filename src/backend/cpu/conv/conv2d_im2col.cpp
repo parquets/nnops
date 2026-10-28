@@ -162,6 +162,7 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     const int64_t oh_block  = plan.oh_block;
     const int64_t num_oh_blocks = plan.num_oh_blocks;
     const int64_t oh_chunks     = plan.oh_chunks;
+    const int64_t oc_chunks     = plan.oc_chunks;
 
     // Strides (elements).
     const int64_t icn_step = IH * in_row_stride;         // between input channels
@@ -196,7 +197,8 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     constexpr int esz    = static_cast<int>(sizeof(T));
 
     const int64_t NG = N * G;
-    const int64_t total = NG * oh_chunks;
+    const int64_t chunks_per_ng = plan.oh_chunks * plan.oc_chunks;
+    const int64_t total = NG * chunks_per_ng;
 
     const int nslots = ctx.cpu.thread_slot_count();
     const bool per_thread = nslots > 0 && nslots < total;
@@ -212,8 +214,12 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
     const bool seed_needed = has_bias || attrs.add_to;
 
     const auto run_task = [&](int64_t t) {
-        const int64_t ng    = t / oh_chunks;
-        const int64_t chunk = t % oh_chunks;
+        const int64_t ng      = t / chunks_per_ng;
+        const int64_t rem     = t % chunks_per_ng;
+        // The oc-chunk varies fastest: neighbours in task order then cover
+        // different filter rows, so their weight streams differ.
+        const int64_t chunk    = rem / oc_chunks;
+        const int64_t oc_chunk = rem % oc_chunks;
         const int64_t n = ng / G;
         const int64_t g = ng % G;
 
@@ -230,6 +236,12 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
         // chunks, so output tiles never overlap → bit-identical to serial).
         const int64_t b0 = chunk * num_oh_blocks / oh_chunks;
         const int64_t b1 = (chunk + 1) * num_oh_blocks / oh_chunks;
+
+        // This task's oc range, likewise disjoint. An even split of the filter
+        // rows (not of the oc-block list): the task count is what the pool
+        // wants, and the ranges land within one row of each other.
+        const int64_t oc_lo = oc_chunk * oc_per_group / oc_chunks;
+        const int64_t oc_hi = (oc_chunk + 1) * oc_per_group / oc_chunks;
 
         for (int64_t b = b0; b < b1; ++b) {
             const int64_t oh       = b * oh_block;
@@ -288,8 +300,8 @@ void conv2d_im2col_impl(const Conv2DAttributes& attrs,
                                   pack_b, ldd_b, b_src, static_cast<int>(icn_step), 1.0f);
                 }
 
-                for (int64_t ocn = 0; ocn < oc_per_group; ocn += ocn_block) {
-                    const int64_t ocnc = std::min(ocn_block, oc_per_group - ocn);
+                for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
+                    const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
                     T* tile = tile_base + ocn * ocn_step;
 
                     if (icn == 0 && seed_needed) {
@@ -555,6 +567,43 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // chunk count at the number of oh-blocks.
     plan.oh_chunks = std::clamp<int64_t>((nt + NG - 1) / NG, 1, plan.num_oh_blocks);
 
+    // Second parallel axis: the filter rows. The oh split above cannot fill a
+    // wide pool on a small output plane — a 7x7 plane is two oh-blocks of four
+    // rows and that is the whole supply, so 20 threads run two tasks and
+    // eighteen sit in the barrier (layer4 of a 224 ResNet-18 lost 155 -> 68
+    // GFLOPS going from 4 threads to 20). MLAS answers this on the filter axis:
+    // when the filter count outnumbers the output plane it expands the plane
+    // once and hands the filter rows to the threaded GEMM (convolve.cpp:1691,
+    // ExpandThenGemm), which slices M down to its own panel height; its
+    // plane-splitting route (ExpandThenGemmSegmented) is for the wide case.
+    // Here the plane chunks stay as they are and the filter rows become
+    // additional tasks, so the grid is (batch, group) × oh-chunks × oc-chunks.
+    //
+    // This is the axis to spend first: each oc-chunk reads a *distinct* slice of
+    // the filter, so the weight traffic is unchanged, whereas another oh-chunk
+    // re-reads the same rows. What it does duplicate is the B gather — one copy
+    // per oc-chunk where the single-axis loop packed one and re-read it per
+    // oc-block. That is K·N against the GEMM's 2·M·N·K flops, i.e. ~1/(2·M) of
+    // the work per duplicate: a few percent on the 50-row tasks below.
+    //
+    // Gated like the oh-block halving: split only while more than half the pool
+    // is idle. A 56-plane already fills 14 threads on its own, and a split there
+    // would duplicate the gather for nothing. The quantized route keeps the
+    // single axis — its driver and accumulator layout are per-oh-chunk.
+    plan.oc_chunks = 1;
+    if (!quant) {
+        // Two M-panels per task is the floor, mirroring the oh-block's two
+        // N-panels: below it the per-task overheads (bias seed, epilogue, the
+        // re-gathered B panel) stop being amortized.
+        const int64_t mr = (dt == DataType::f16) ? MR_MAX_F16 : MR_MAX_F32;
+        const int64_t plane_tasks = NG * plan.oh_chunks;
+        if (2 * plane_tasks < nt) {
+            const int64_t max_chunks = std::max<int64_t>(1, oc_per_group / (2 * mr));
+            plan.oc_chunks = std::clamp<int64_t>((nt + plane_tasks - 1) / plane_tasks,
+                                                 1, max_chunks);
+        }
+    }
+
     // The fp route fuses the gather with the pack (tiled_im2col_2d_packed), so
     // it never materializes the col matrix; the quantized route still builds
     // one and packs it separately.
@@ -583,7 +632,7 @@ Conv2DPlan get_conv2d_plan(const Conv2DAttributes& attrs,
     // Scratch slots: one per worker thread when the backend reports thread ids and
     // that is fewer than the task count (thread_id-indexed, reused across every
     // task a thread claims); else one per parallel task.
-    const int64_t total = NG * plan.oh_chunks;
+    const int64_t total = NG * plan.oh_chunks * plan.oc_chunks;
     plan.num_slots = (use_thread_slots && nt < total) ? nt : total;
 
     // col/orig/pack_b for the whole plan, in elements on the fp route and in

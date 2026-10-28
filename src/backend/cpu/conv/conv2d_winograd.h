@@ -14,11 +14,12 @@
 /// nr_max-wide panels (tile_pack_rhs) and the GEMM runs through
 /// tile_mma_direct, the same route MatMul uses.
 ///
-/// Structure: ONE dispatch over (batch, group, tile row, tile block). Each task
-/// is self-contained — it builds the padded halo strip its tiles read, transforms
-/// it into that task's V, runs the 16 GEMMs for every oc block of the group into
-/// M, and writes those tiles back. Tile rows and blocks are disjoint, so no task
-/// reads another's scratch and the phases need no barrier between them.
+/// Structure: ONE dispatch over (batch, group, tile row, tile block, oc-chunk).
+/// Each task is self-contained — it builds the padded halo strip its tiles read,
+/// transforms it into that task's V, runs the 16 GEMMs for its slice of the
+/// filter into M, and writes those tiles back. Tile rows, blocks and oc ranges
+/// are disjoint, so no task reads another's scratch and the phases need no
+/// barrier between them.
 ///
 /// Task-local scratch is what makes that possible: the halo strip, V and M all
 /// live in one per-slot block, instead of the kernel-wide halo + V planes the
@@ -34,11 +35,20 @@
 /// completion counter in the body is therefore a deadlock waiting for a caller.
 ///
 /// Why not keep the phases and fuse only the halo: folding phase A into phase B
-/// means every oc-block task repeats the whole input transform for its tiles. At
-/// 256 channels that is 4x the transform work, more than a dispatch costs. Rows
-/// and blocks are the only axes that partition tiles without repeating work, so
-/// they are the only axes in the grid; the oc axis stays inside a task and the
-/// batch/group axes join the grid.
+/// means every oc-block task repeats the whole input transform for its tiles.
+/// Rows and blocks are the axes that partition tiles without repeating any work,
+/// so they lead the grid, and the batch/group axes join them.
+///
+/// The oc axis is the exception, taken only when the pool would otherwise idle:
+/// it re-does the halo and the input transform per chunk (the two things the
+/// task-local scratch exists to do once), so it is spent last and stops at two
+/// M-panels of work per task. It is what a 14x14 plane needs — 7 tile rows and
+/// one 8-wide tile block leave the tile axis nothing to give, and on this host
+/// 20 threads ran ResNet-18's layer3.x faster at 4 threads than at 20 until the
+/// filter rows were split (bench_conv2d conv2d_wino_f32_14x14_256ch). The
+/// duplicated transform measures ~1% of such a task, not the 4x the first
+/// estimate feared; the reason to spend it last is that it is the only axis that
+/// repeats anything at all.
 ///
 /// Numeric order (each one is load-bearing):
 ///   * bias is NOT folded into M — M is a transform-domain accumulator and
@@ -93,9 +103,13 @@ struct Conv2DWinogradPlan {
     int64_t ocn_block = 0;   ///< output-channel (GEMM M) block
     int64_t tile_block = 0;  ///< tiles per task within one tile row (8 or 16)
 
-    int64_t num_oc_blocks = 1;     ///< ceil(oc_per_group / ocn_block)
     int64_t num_tile_blocks = 1;   ///< ceil(TW_pad / tile_block)
-    int64_t num_tasks = 0;         ///< N · G · TH · num_tile_blocks
+    int64_t oc_chunks = 1;         ///< parallel filter-row chunks per plane, i.e.
+                                   ///< the task grid is N·G × TH ×
+                                   ///< num_tile_blocks × oc_chunks. 1 unless the
+                                   ///< plane is too small to fill the pool (see
+                                   ///< the plan)
+    int64_t num_tasks = 0;         ///< N · G · TH · num_tile_blocks · oc_chunks
 
     // ---- scratch (elements, not bytes), all per slot ----
     int64_t num_slots = 0;    ///< worker threads, else tasks
