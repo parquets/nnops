@@ -1,27 +1,20 @@
 #pragma once
 /// @file simd_depthwise_conv.hpp
-/// @brief SIMD kernel functions for 2D/3D depthwise convolution (NCHWC8/NCDHWC8 only).
+/// @brief SIMD kernels for 2D/3D depthwise convolution (NCHWC8/NCDHWC8 only).
 ///
-/// Weights are prepacked into dense [C8, (KD,) KH, KW, 8] format.
-/// Spatial rank is auto-detected: 2D uses KD=1/OD=1/ID=1 (loop degenerates).
-///
-/// Key design (following the pooling.cpp pattern):
-///   1. Single DwConvParams struct with full 3D fields — 2D uses KD=1/OD=1/ID=1.
-///   2. Single set of h4/h1 SIMD kernels with built-in KD loop.
-///   3. All C8 blocks use SIMD — pad channels are zero.
-///   4. Weights loaded as vectors (8 channels at once) from prepacked buffer.
-///   5. Epilogue activation fused in-kernel via apply_epilogue_vec.
+/// Weights are prepacked into dense [C8, (KD,) KH, KW, 8] form. Rank is
+/// auto-detected: 2D is KD=OD=ID=1, which degenerates the depth loop.
+/// One driver covers h4/h1 and f32/f16/quant; padding is bounds-checked
+/// in-kernel, and all C8 blocks run SIMD since pad channels are zero.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
 #include "simd_epilogue.hpp"
-#include "simd_quant.hpp"
+#include "simd_access.hpp"
 
 #include <cstdint>
 
 namespace nnops::kernel {
-
-using namespace simd;
 
 struct DwConvParams {
     int64_t ID, IH, IW;           // input spatial dims
@@ -36,275 +29,114 @@ struct DwConvParams {
     int64_t in_row_stride;        // input row stride (elems)
 };
 
-template <typename T>
-inline void dwconv_h4(
-    T* output, const T* input, const T* w_base,
-    const T* bias_vec,            // nullptr or pointer to 8 bias values
-    const DwConvParams& p,
-    const Epilogue& epilogue,
-    bool add_to)
+/// R output rows per call. W is the packed-weight element type; Tag only picks
+/// the epilogue's f32/f16 overload. Both are deduced by the wrappers below.
+template <int R, typename W, typename Tag, typename Src, typename Dst, typename V>
+inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
+                        const Epilogue& epilogue, const Src& src, const Dst& dst,
+                        const V& vbias)
 {
-    const T* type_tag = output;
-    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero(type_tag);
-
     for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc0 = vbias;
-        auto vacc1 = vbias;
-        auto vacc2 = vbias;
-        auto vacc3 = vbias;
+        V acc[R];
+        for (int r = 0; r < R; ++r) {
+            acc[r] = vbias;
+        }
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
             if (id < 0 || id >= p.ID) {
                 continue;
             }
-            int64_t d_off = id * p.in_d_stride;
+            const int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
+                int64_t ih[R];
+                bool ok[R];
+                for (int r = 0; r < R; ++r) {
+                    ih[r] = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                    ok[r] = (p.oh + r < p.OH) && ih[r] >= 0 && ih[r] < p.IH;
+                }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    const int64_t iw = ow * p.SW + kw * p.DW - p.PW;
                     if (iw < 0 || iw >= p.IW) {
                         continue;
                     }
-                    int64_t w_off = iw * 8;
+                    const V vk = v_load(w + (kd * p.KH * p.KW + kh * p.KW + kw) * 8);
 
-                    auto vk = v_load(&w_base[(kd * p.KH * p.KW + kh * p.KW + kw) * 8]);
-
-                    if (v0) {
-                        vacc0 = v_fmadd(v_load(input + d_off + ih0 * p.in_row_stride + w_off), vk, vacc0);
-                    }
-                    if (v1) {
-                        vacc1 = v_fmadd(v_load(input + d_off + ih1 * p.in_row_stride + w_off), vk, vacc1);
-                    }
-                    if (v2) {
-                        vacc2 = v_fmadd(v_load(input + d_off + ih2 * p.in_row_stride + w_off), vk, vacc2);
-                    }
-                    if (v3) {
-                        vacc3 = v_fmadd(v_load(input + d_off + ih3 * p.in_row_stride + w_off), vk, vacc3);
+                    for (int r = 0; r < R; ++r) {
+                        if (!ok[r]) {
+                            continue;
+                        }
+                        acc[r] = v_fmadd(src.load_at(d_off + ih[r] * p.in_row_stride + iw * 8),
+                                         vk, acc[r]);
                     }
                 }
             }
         }
 
-        vacc0 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc0);
-        vacc1 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc1);
-        vacc2 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc2);
-        vacc3 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc3);
-
-        if (p.oh + 0 < p.OH) {
-            v_store_add(output + 0 * p.out_row_stride + ow * 8, vacc0, add_to);
-        }
-        if (p.oh + 1 < p.OH) {
-            v_store_add(output + 1 * p.out_row_stride + ow * 8, vacc1, add_to);
-        }
-        if (p.oh + 2 < p.OH) {
-            v_store_add(output + 2 * p.out_row_stride + ow * 8, vacc2, add_to);
-        }
-        if (p.oh + 3 < p.OH) {
-            v_store_add(output + 3 * p.out_row_stride + ow * 8, vacc3, add_to);
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
+            dst.store(r, ow, nnops::backend::cpu::apply_epilogue_vec(epilogue, tag, acc[r]));
         }
     }
+}
+
+// ============================================================
+// Public kernels — unchanged signatures
+// ============================================================
+
+template <typename T>
+inline void dwconv_h4(T* output, const T* input, const T* w_base,
+                      const T* bias_vec, const DwConvParams& p,
+                      const Epilogue& epilogue, bool add_to)
+{
+    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero(output);
+    dwconv_rows<4>(p, w_base, output, epilogue,
+                   FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to}, vbias);
 }
 
 template <typename T>
-inline void dwconv_h1(
-    T* output, const T* input, const T* w_base,
-    const T* bias_vec,
-    const DwConvParams& p,
-    const Epilogue& epilogue,
-    bool add_to)
+inline void dwconv_h1(T* output, const T* input, const T* w_base,
+                      const T* bias_vec, const DwConvParams& p,
+                      const Epilogue& epilogue, bool add_to)
 {
-    const T* type_tag = output;
-    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero(type_tag);
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc = vbias;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    auto vk = v_load(&w_base[(kd * p.KH * p.KW + kh * p.KW + kw) * 8]);
-                    vacc = v_fmadd(v_load(input + d_off + ih * p.in_row_stride + w_off), vk, vacc);
-                }
-            }
-        }
-
-        vacc = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc);
-        v_store_add(output + ow * 8, vacc, add_to);
-    }
+    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero(output);
+    dwconv_rows<1>(p, w_base, output, epilogue,
+                   FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to}, vbias);
 }
 
-// Dequantize-on-load / requantize-on-store around the same float SIMD
-// accumulation as the f32/f16 kernels. The activation is PerTensor-quantized
-// (broadcast scale/zero_point); the weight is PerChannel-quantized (per-lane
-// scale/zero_point, with pad lanes neutralized by scale == 0). The shared
-// dequant/requant helpers live in simd_quant.hpp (dequantize_tensor /
-// dequantize_channel / requantize_store).
+// Quantized: the weights arrive already dequantized (f32, per-channel, with pad
+// lanes neutralized by scale 0), so the accumulate is the same f32 FMA.
 
 template <typename InT, typename OutT>
-inline void dwconv_h4_quant(
-    OutT* output, const InT* input, const float* wq,  // precomputed dequantized weights
-    const float* bias_vec,            // f32 bias (nullptr or 8 values)
-    const DwConvParams& p,
-    const Epilogue& epilogue,
-    bool add_to,
-    float in_scale, float in_zero,
-    float out_scale, float out_zero)
+inline void dwconv_h4_quant(OutT* output, const InT* input, const float* wq,
+                            const float* bias_vec, const DwConvParams& p,
+                            const Epilogue& epilogue, bool add_to,
+                            float in_scale, float in_zero,
+                            float out_scale, float out_zero)
 {
     const auto vbias = bias_vec ? v_load(bias_vec) : v_zero_f32x8();
-    float type_tag_storage = 0.0f;
-    const float* type_tag = &type_tag_storage;
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc0 = vbias;
-        auto vacc1 = vbias;
-        auto vacc2 = vbias;
-        auto vacc3 = vbias;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    auto vk = v_load(&wq[(kd * p.KH * p.KW + kh * p.KW + kw) * 8]);
-
-                    if (v0) {
-                        vacc0 = v_fmadd(dequantize_tensor(input + d_off + ih0 * p.in_row_stride + w_off,
-                                                      in_scale, in_zero), vk, vacc0);
-                    }
-                    if (v1) {
-                        vacc1 = v_fmadd(dequantize_tensor(input + d_off + ih1 * p.in_row_stride + w_off,
-                                                      in_scale, in_zero), vk, vacc1);
-                    }
-                    if (v2) {
-                        vacc2 = v_fmadd(dequantize_tensor(input + d_off + ih2 * p.in_row_stride + w_off,
-                                                      in_scale, in_zero), vk, vacc2);
-                    }
-                    if (v3) {
-                        vacc3 = v_fmadd(dequantize_tensor(input + d_off + ih3 * p.in_row_stride + w_off,
-                                                      in_scale, in_zero), vk, vacc3);
-                    }
-                }
-            }
-        }
-
-        // Epilogue in float space, then requantize.
-        vacc0 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc0);
-        vacc1 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc1);
-        vacc2 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc2);
-        vacc3 = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc3);
-
-        if (p.oh + 0 < p.OH) {
-            requantize_store(output + 0 * p.out_row_stride + ow * 8, vacc0,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 1 < p.OH) {
-            requantize_store(output + 1 * p.out_row_stride + ow * 8, vacc1,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 2 < p.OH) {
-            requantize_store(output + 2 * p.out_row_stride + ow * 8, vacc2,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 3 < p.OH) {
-            requantize_store(output + 3 * p.out_row_stride + ow * 8, vacc3,
-                           out_scale, out_zero, add_to);
-        }
-    }
+    dwconv_rows<4>(p, wq, &out_scale, epilogue,
+                   QuantSrc<InT>{input, in_scale, in_zero},
+                   QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to},
+                   vbias);
 }
 
 template <typename InT, typename OutT>
-inline void dwconv_h1_quant(
-    OutT* output, const InT* input, const float* wq,  // precomputed dequantized weights
-    const float* bias_vec,
-    const DwConvParams& p,
-    const Epilogue& epilogue,
-    bool add_to,
-    float in_scale, float in_zero,
-    float out_scale, float out_zero)
+inline void dwconv_h1_quant(OutT* output, const InT* input, const float* wq,
+                            const float* bias_vec, const DwConvParams& p,
+                            const Epilogue& epilogue, bool add_to,
+                            float in_scale, float in_zero,
+                            float out_scale, float out_zero)
 {
     const auto vbias = bias_vec ? v_load(bias_vec) : v_zero_f32x8();
-    float type_tag_storage = 0.0f;
-    const float* type_tag = &type_tag_storage;
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc = vbias;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    auto vk = v_load(&wq[(kd * p.KH * p.KW + kh * p.KW + kw) * 8]);
-                    vacc = v_fmadd(dequantize_tensor(input + d_off + ih * p.in_row_stride + w_off,
-                                                  in_scale, in_zero), vk, vacc);
-                }
-            }
-        }
-
-        vacc = nnops::backend::cpu::apply_epilogue_vec(epilogue, type_tag, vacc);
-        requantize_store(output + ow * 8, vacc, out_scale, out_zero, add_to);
-    }
+    dwconv_rows<1>(p, wq, &out_scale, epilogue,
+                   QuantSrc<InT>{input, in_scale, in_zero},
+                   QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to},
+                   vbias);
 }
 
 }  // namespace nnops::kernel

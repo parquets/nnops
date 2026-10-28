@@ -1,19 +1,15 @@
 #pragma once
 /// @file simd_pooling.hpp
-/// @brief SIMD kernel functions for 2D/3D spatial pooling (NCHWC8 only).
+/// @brief SIMD kernels for 2D/3D spatial pooling (NCHWC8 only).
 ///
-/// Key design:
-///   1. All C8 blocks (including partial) use SIMD h4/h1 kernels — pad channels in
-///      NCHWC8 input are zero, so SIMD operates correctly on all 8 lanes
-///      (max ignores pad zeros, avg accumulates zero = no contribution).
-///   2. SIMD kernels handle exclude_pad via in-kernel per-position valid_count.
-///   3. Height-4 blocking: process 4 output rows at once (h4), remainder with h1.
-///   4. In-kernel bounds checking for all kernel positions — no pre-splitting.
-///   5. All SW values supported — offset math is just integer arithmetic.
-///   6. Params passed by const reference (unified across all kernels).
+/// One driver covers every variant: the row count (h4/h1), the accumulate
+/// (max/avg), and the element type (f32/f16 vs dequantize/requantize) are all
+/// template parameters. Every C8 block — partial ones included — runs the SIMD
+/// path, since NCHWC8 pads channels with zeros (max ignores them, avg adds 0).
+/// Bounds are checked in-kernel, so any stride/padding combination works.
 
 #include "nnops/detail/simd/simd.hpp"
-#include "simd_quant.hpp"
+#include "simd_access.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -42,674 +38,228 @@ struct PoolingKernelParams {
 };
 
 // ============================================================
-// MaxPooling SIMD kernels (bounds-checked, any SW)
+// The driver: R output rows at a time, IsMax picks the accumulate
 // ============================================================
 
-template <typename T>
-inline void maxpool_h4(
-    T* output, const T* input,
-    const PoolingKernelParams& p,
-    float /*scale*/, bool add_to)
+template <int R, bool IsMax, typename Src, typename Dst>
+inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
+                      const Src& src, const Dst& dst)
 {
-    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
-    const auto vinit = v_set1(input, neg_inf);
-    const auto vzero = v_set1(input, 0.0f);
+    using V = decltype(src.zero());
+    const V vzero = src.zero();
 
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc0 = vinit, vacc1 = vinit, vacc2 = vinit, vacc3 = vinit;
-        bool any0 = false, any1 = false, any2 = false, any3 = false;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    if (v0) { vacc0 = v_max(vacc0, v_load(input + d_off + ih0 * p.in_row_stride + w_off)); any0 = true; }
-                    if (v1) { vacc1 = v_max(vacc1, v_load(input + d_off + ih1 * p.in_row_stride + w_off)); any1 = true; }
-                    if (v2) { vacc2 = v_max(vacc2, v_load(input + d_off + ih2 * p.in_row_stride + w_off)); any2 = true; }
-                    if (v3) { vacc3 = v_max(vacc3, v_load(input + d_off + ih3 * p.in_row_stride + w_off)); any3 = true; }
-                }
-            }
-        }
-
-        if (!any0) {
-            vacc0 = vzero;
-        }
-        if (!any1) {
-            vacc1 = vzero;
-        }
-        if (!any2) {
-            vacc2 = vzero;
-        }
-        if (!any3) {
-            vacc3 = vzero;
-        }
-
-        if (p.oh + 0 < p.OH) {
-            T* out0 = output + 0 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc0 = v_add(vacc0, v_load(out0));
-            }
-            v_store(out0, vacc0);
-        }
-        if (p.oh + 1 < p.OH) {
-            T* out1 = output + 1 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc1 = v_add(vacc1, v_load(out1));
-            }
-            v_store(out1, vacc1);
-        }
-        if (p.oh + 2 < p.OH) {
-            T* out2 = output + 2 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc2 = v_add(vacc2, v_load(out2));
-            }
-            v_store(out2, vacc2);
-        }
-        if (p.oh + 3 < p.OH) {
-            T* out3 = output + 3 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc3 = v_add(vacc3, v_load(out3));
-            }
-            v_store(out3, vacc3);
-        }
+    V vinit;
+    if constexpr (IsMax) {
+        vinit = src.set1(-std::numeric_limits<float>::infinity());
+    } else {
+        vinit = vzero;
     }
-}
-
-template <typename T>
-inline void maxpool_h1(
-    T* output, const T* input,
-    const PoolingKernelParams& p,
-    float /*scale*/, bool add_to)
-{
-    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
-    const auto vinit = v_set1(input, neg_inf);
-    const auto vzero = v_set1(input, 0.0f);
 
     for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc = vinit;
-        bool any = false;
+        V acc[R];
+        int64_t cnt[R] = {};
+        for (int r = 0; r < R; ++r) {
+            acc[r] = vinit;
+        }
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
             if (id < 0 || id >= p.ID) {
                 continue;
             }
-            int64_t d_off = id * p.in_d_stride;
+            const int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
+                int64_t ih[R];
+                bool ok[R];
+                for (int r = 0; r < R; ++r) {
+                    ih[r] = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                    ok[r] = (p.oh + r < p.OH) && ih[r] >= 0 && ih[r] < p.IH;
                 }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    const int64_t iw = ow * p.SW + kw * p.DW - p.PW;
                     if (iw < 0 || iw >= p.IW) {
                         continue;
                     }
-                    vacc = v_max(vacc, v_load(input + d_off + ih * p.in_row_stride + iw * 8));
-                    any = true;
+                    for (int r = 0; r < R; ++r) {
+                        if (!ok[r]) {
+                            continue;
+                        }
+                        const V v = src.load_at(d_off + ih[r] * p.in_row_stride + iw * 8);
+                        acc[r] = IsMax ? v_max(acc[r], v) : v_add(acc[r], v);
+                        ++cnt[r];
+                    }
                 }
             }
         }
 
-        if (!any) {
-            vacc = vzero;
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
+            if constexpr (IsMax) {
+                if (cnt[r] == 0) {
+                    acc[r] = vzero;
+                }
+            } else if (p.exclude_pad) {
+                if (cnt[r] > 0) {
+                    acc[r] = v_mul(acc[r], src.set1(1.0f / static_cast<float>(cnt[r])));
+                }
+            } else {
+                acc[r] = v_mul(acc[r], src.set1(avg_scale));
+            }
+            dst.store(r, ow, acc[r]);
         }
-
-        T* out_r = output + ow * 8;
-        if (add_to) {
-            vacc = v_add(vacc, v_load(out_r));
-        }
-        v_store(out_r, vacc);
     }
 }
 
 // ============================================================
-// AvgPooling SIMD kernels (bounds-checked, any SW)
+// MaxPool raw-integer fast path (input and output share scale + zero_point)
 // ============================================================
 
-template <typename T>
-inline void avgpool_h4(
-    T* output, const T* input,
-    const PoolingKernelParams& p,
-    float scale, bool add_to)
-{
-    const auto vscale = v_set1(input, scale);
-    const auto vzero  = v_set1(input, 0.0f);
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc0 = vzero, vacc1 = vzero, vacc2 = vzero, vacc3 = vzero;
-        int64_t cnt0 = 0, cnt1 = 0, cnt2 = 0, cnt3 = 0;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    if (v0) { vacc0 = v_add(vacc0, v_load(input + d_off + ih0 * p.in_row_stride + w_off)); cnt0++; }
-                    if (v1) { vacc1 = v_add(vacc1, v_load(input + d_off + ih1 * p.in_row_stride + w_off)); cnt1++; }
-                    if (v2) { vacc2 = v_add(vacc2, v_load(input + d_off + ih2 * p.in_row_stride + w_off)); cnt2++; }
-                    if (v3) { vacc3 = v_add(vacc3, v_load(input + d_off + ih3 * p.in_row_stride + w_off)); cnt3++; }
-                }
-            }
-        }
-
-        // Apply scale: exclude_pad → divide by valid count; else use fixed scale
-        if (p.exclude_pad) {
-            if (cnt0 > 0) {
-                vacc0 = v_mul(vacc0, v_set1(input, 1.0f / static_cast<float>(cnt0)));
-            }
-            if (cnt1 > 0) {
-                vacc1 = v_mul(vacc1, v_set1(input, 1.0f / static_cast<float>(cnt1)));
-            }
-            if (cnt2 > 0) {
-                vacc2 = v_mul(vacc2, v_set1(input, 1.0f / static_cast<float>(cnt2)));
-            }
-            if (cnt3 > 0) {
-                vacc3 = v_mul(vacc3, v_set1(input, 1.0f / static_cast<float>(cnt3)));
-            }
-        } else {
-            vacc0 = v_mul(vacc0, vscale);
-            vacc1 = v_mul(vacc1, vscale);
-            vacc2 = v_mul(vacc2, vscale);
-            vacc3 = v_mul(vacc3, vscale);
-        }
-
-        if (p.oh + 0 < p.OH) {
-            T* out0 = output + 0 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc0 = v_add(vacc0, v_load(out0));
-            }
-            v_store(out0, vacc0);
-        }
-        if (p.oh + 1 < p.OH) {
-            T* out1 = output + 1 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc1 = v_add(vacc1, v_load(out1));
-            }
-            v_store(out1, vacc1);
-        }
-        if (p.oh + 2 < p.OH) {
-            T* out2 = output + 2 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc2 = v_add(vacc2, v_load(out2));
-            }
-            v_store(out2, vacc2);
-        }
-        if (p.oh + 3 < p.OH) {
-            T* out3 = output + 3 * p.out_row_stride + ow * 8;
-            if (add_to) {
-                vacc3 = v_add(vacc3, v_load(out3));
-            }
-            v_store(out3, vacc3);
-        }
-    }
-}
-
-template <typename T>
-inline void avgpool_h1(
-    T* output, const T* input,
-    const PoolingKernelParams& p,
-    float scale, bool add_to)
-{
-    const auto vscale = v_set1(input, scale);
-    const auto vzero  = v_set1(input, 0.0f);
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc = vzero;
-        int64_t valid_count = 0;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    vacc = v_add(vacc, v_load(input + d_off + ih * p.in_row_stride + iw * 8));
-                    valid_count++;
-                }
-            }
-        }
-
-        if (p.exclude_pad && valid_count > 0) {
-            vacc = v_mul(vacc, v_set1(input, 1.0f / static_cast<float>(valid_count)));
-        } else if (!p.exclude_pad) {
-            vacc = v_mul(vacc, vscale);
-        }
-
-        T* out_r = output + ow * 8;
-        if (add_to) {
-            vacc = v_add(vacc, v_load(out_r));
-        }
-        v_store(out_r, vacc);
-    }
-}
-
-// ============================================================
-// Quantized pooling (s8/u8 input/output, float accumulate)
-// ============================================================
-//
-// Dequantize-on-load / requantize-on-store around the same float SIMD
-// accumulation as the f32/f16 kernels. The activation is PerTensor-quantized
-// (broadcast scale/zero_point). MaxPooling additionally has a raw-integer fast
-// path when input and output share the same scale and zero_point (no
-// dequantization needed). The shared dequant/requant helpers live in
-// simd_quant.hpp (dequantize_tensor / requantize_store).
-
-// ---- MaxPooling: float path (input/output scales differ, or add_to) ----
-
-template <typename InT, typename OutT>
-inline void maxpool_h4_quant(
-    OutT* output, const InT* input,
-    const PoolingKernelParams& p,
-    float in_scale, float in_zero,
-    float out_scale, float out_zero, bool add_to)
-{
-    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
-    const auto vinit = v_set1_f32x8(neg_inf);
-    const auto vzero = v_zero_f32x8();
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc0 = vinit, vacc1 = vinit, vacc2 = vinit, vacc3 = vinit;
-        bool any0 = false, any1 = false, any2 = false, any3 = false;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    if (v0) { vacc0 = v_max(vacc0, dequantize_tensor(input + d_off + ih0 * p.in_row_stride + w_off, in_scale, in_zero)); any0 = true; }
-                    if (v1) { vacc1 = v_max(vacc1, dequantize_tensor(input + d_off + ih1 * p.in_row_stride + w_off, in_scale, in_zero)); any1 = true; }
-                    if (v2) { vacc2 = v_max(vacc2, dequantize_tensor(input + d_off + ih2 * p.in_row_stride + w_off, in_scale, in_zero)); any2 = true; }
-                    if (v3) { vacc3 = v_max(vacc3, dequantize_tensor(input + d_off + ih3 * p.in_row_stride + w_off, in_scale, in_zero)); any3 = true; }
-                }
-            }
-        }
-
-        if (!any0) { vacc0 = vzero; }
-        if (!any1) { vacc1 = vzero; }
-        if (!any2) { vacc2 = vzero; }
-        if (!any3) { vacc3 = vzero; }
-
-        if (p.oh + 0 < p.OH) {
-            requantize_store(output + 0 * p.out_row_stride + ow * 8, vacc0,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 1 < p.OH) {
-            requantize_store(output + 1 * p.out_row_stride + ow * 8, vacc1,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 2 < p.OH) {
-            requantize_store(output + 2 * p.out_row_stride + ow * 8, vacc2,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 3 < p.OH) {
-            requantize_store(output + 3 * p.out_row_stride + ow * 8, vacc3,
-                           out_scale, out_zero, add_to);
-        }
-    }
-}
-
-template <typename InT, typename OutT>
-inline void maxpool_h1_quant(
-    OutT* output, const InT* input,
-    const PoolingKernelParams& p,
-    float in_scale, float in_zero,
-    float out_scale, float out_zero, bool add_to)
-{
-    constexpr float neg_inf = -std::numeric_limits<float>::infinity();
-    const auto vinit = v_set1_f32x8(neg_inf);
-    const auto vzero = v_zero_f32x8();
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc = vinit;
-        bool any = false;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    vacc = v_max(vacc, dequantize_tensor(input + d_off + ih * p.in_row_stride + iw * 8, in_scale, in_zero));
-                    any = true;
-                }
-            }
-        }
-
-        if (!any) {
-            vacc = vzero;
-        }
-
-        requantize_store(output + ow * 8, vacc, out_scale, out_zero, add_to);
-    }
-}
-
-// ---- MaxPooling: raw-integer fast path (input/output share scale+zero_point) ----
-
-template <typename T>
-inline void maxpool_h4_quant_fast(
-    T* output, const T* input,
-    const PoolingKernelParams& p,
-    float out_zero)
+template <int R, typename T>
+inline void maxpool_fast(T* output, const T* input,
+                         const PoolingKernelParams& p, float out_zero)
 {
     constexpr T min_val = std::numeric_limits<T>::lowest();
     const T z = static_cast<T>(out_zero);
 
     for (int64_t ow = 0; ow < p.OW; ++ow) {
-        T acc0[8], acc1[8], acc2[8], acc3[8];
-        for (int i = 0; i < 8; ++i) {
-            acc0[i] = min_val;
-            acc1[i] = min_val;
-            acc2[i] = min_val;
-            acc3[i] = min_val;
-        }
-        bool any0 = false, any1 = false, any2 = false, any3 = false;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    int64_t w_off = iw * 8;
-
-                    if (v0) { quant_kernel::max_8<T>(acc0, acc0, input + d_off + ih0 * p.in_row_stride + w_off); any0 = true; }
-                    if (v1) { quant_kernel::max_8<T>(acc1, acc1, input + d_off + ih1 * p.in_row_stride + w_off); any1 = true; }
-                    if (v2) { quant_kernel::max_8<T>(acc2, acc2, input + d_off + ih2 * p.in_row_stride + w_off); any2 = true; }
-                    if (v3) { quant_kernel::max_8<T>(acc3, acc3, input + d_off + ih3 * p.in_row_stride + w_off); any3 = true; }
-                }
-            }
-        }
-
-        if (!any0) { for (int i = 0; i < 8; ++i) acc0[i] = z; }
-        if (!any1) { for (int i = 0; i < 8; ++i) acc1[i] = z; }
-        if (!any2) { for (int i = 0; i < 8; ++i) acc2[i] = z; }
-        if (!any3) { for (int i = 0; i < 8; ++i) acc3[i] = z; }
-
-        if (p.oh + 0 < p.OH) { std::memcpy(output + 0 * p.out_row_stride + ow * 8, acc0, 8); }
-        if (p.oh + 1 < p.OH) { std::memcpy(output + 1 * p.out_row_stride + ow * 8, acc1, 8); }
-        if (p.oh + 2 < p.OH) { std::memcpy(output + 2 * p.out_row_stride + ow * 8, acc2, 8); }
-        if (p.oh + 3 < p.OH) { std::memcpy(output + 3 * p.out_row_stride + ow * 8, acc3, 8); }
-    }
-}
-
-template <typename T>
-inline void maxpool_h1_quant_fast(
-    T* output, const T* input,
-    const PoolingKernelParams& p,
-    float out_zero)
-{
-    constexpr T min_val = std::numeric_limits<T>::lowest();
-    const T z = static_cast<T>(out_zero);
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        T acc[8];
-        for (int i = 0; i < 8; ++i) {
-            acc[i] = min_val;
-        }
-        bool any = false;
-
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
-
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
-
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    quant_kernel::max_8<T>(acc, acc, input + d_off + ih * p.in_row_stride + iw * 8);
-                    any = true;
-                }
-            }
-        }
-
-        if (!any) {
+        T acc[R][8];
+        bool any[R] = {};
+        for (int r = 0; r < R; ++r) {
             for (int i = 0; i < 8; ++i) {
-                acc[i] = z;
+                acc[r][i] = min_val;
             }
         }
 
-        std::memcpy(output + ow * 8, acc, 8);
-    }
-}
-
-// ---- AvgPooling: float path (no fast path; always dequant/accum/requant) ----
-
-template <typename InT, typename OutT>
-inline void avgpool_h4_quant(
-    OutT* output, const InT* input,
-    const PoolingKernelParams& p,
-    float scale,
-    float in_scale, float in_zero,
-    float out_scale, float out_zero, bool add_to)
-{
-    const auto vscale = v_set1_f32x8(scale);
-    const auto vzero  = v_zero_f32x8();
-
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc0 = vzero, vacc1 = vzero, vacc2 = vzero, vacc3 = vzero;
-        int64_t cnt0 = 0, cnt1 = 0, cnt2 = 0, cnt3 = 0;
-
         for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
+            const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
             if (id < 0 || id >= p.ID) {
                 continue;
             }
-            int64_t d_off = id * p.in_d_stride;
+            const int64_t d_off = id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih0 = (p.oh + 0) * p.SH + kh * p.DH - p.PH;
-                int64_t ih1 = (p.oh + 1) * p.SH + kh * p.DH - p.PH;
-                int64_t ih2 = (p.oh + 2) * p.SH + kh * p.DH - p.PH;
-                int64_t ih3 = (p.oh + 3) * p.SH + kh * p.DH - p.PH;
-                bool v0 = (p.oh + 0 < p.OH) && ih0 >= 0 && ih0 < p.IH;
-                bool v1 = (p.oh + 1 < p.OH) && ih1 >= 0 && ih1 < p.IH;
-                bool v2 = (p.oh + 2 < p.OH) && ih2 >= 0 && ih2 < p.IH;
-                bool v3 = (p.oh + 3 < p.OH) && ih3 >= 0 && ih3 < p.IH;
+                int64_t ih[R];
+                bool ok[R];
+                for (int r = 0; r < R; ++r) {
+                    ih[r] = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                    ok[r] = (p.oh + r < p.OH) && ih[r] >= 0 && ih[r] < p.IH;
+                }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
+                    const int64_t iw = ow * p.SW + kw * p.DW - p.PW;
                     if (iw < 0 || iw >= p.IW) {
                         continue;
                     }
-                    int64_t w_off = iw * 8;
-
-                    if (v0) { vacc0 = v_add(vacc0, dequantize_tensor(input + d_off + ih0 * p.in_row_stride + w_off, in_scale, in_zero)); cnt0++; }
-                    if (v1) { vacc1 = v_add(vacc1, dequantize_tensor(input + d_off + ih1 * p.in_row_stride + w_off, in_scale, in_zero)); cnt1++; }
-                    if (v2) { vacc2 = v_add(vacc2, dequantize_tensor(input + d_off + ih2 * p.in_row_stride + w_off, in_scale, in_zero)); cnt2++; }
-                    if (v3) { vacc3 = v_add(vacc3, dequantize_tensor(input + d_off + ih3 * p.in_row_stride + w_off, in_scale, in_zero)); cnt3++; }
+                    for (int r = 0; r < R; ++r) {
+                        if (!ok[r]) {
+                            continue;
+                        }
+                        quant_kernel::max_8<T>(acc[r], acc[r],
+                                input + d_off + ih[r] * p.in_row_stride + iw * 8);
+                        any[r] = true;
+                    }
                 }
             }
         }
 
-        if (p.exclude_pad) {
-            if (cnt0 > 0) { vacc0 = v_mul(vacc0, v_set1_f32x8(1.0f / static_cast<float>(cnt0))); }
-            if (cnt1 > 0) { vacc1 = v_mul(vacc1, v_set1_f32x8(1.0f / static_cast<float>(cnt1))); }
-            if (cnt2 > 0) { vacc2 = v_mul(vacc2, v_set1_f32x8(1.0f / static_cast<float>(cnt2))); }
-            if (cnt3 > 0) { vacc3 = v_mul(vacc3, v_set1_f32x8(1.0f / static_cast<float>(cnt3))); }
-        } else {
-            vacc0 = v_mul(vacc0, vscale);
-            vacc1 = v_mul(vacc1, vscale);
-            vacc2 = v_mul(vacc2, vscale);
-            vacc3 = v_mul(vacc3, vscale);
-        }
-
-        if (p.oh + 0 < p.OH) {
-            requantize_store(output + 0 * p.out_row_stride + ow * 8, vacc0,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 1 < p.OH) {
-            requantize_store(output + 1 * p.out_row_stride + ow * 8, vacc1,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 2 < p.OH) {
-            requantize_store(output + 2 * p.out_row_stride + ow * 8, vacc2,
-                           out_scale, out_zero, add_to);
-        }
-        if (p.oh + 3 < p.OH) {
-            requantize_store(output + 3 * p.out_row_stride + ow * 8, vacc3,
-                           out_scale, out_zero, add_to);
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) {
+                continue;
+            }
+            if (!any[r]) {
+                for (int i = 0; i < 8; ++i) {
+                    acc[r][i] = z;
+                }
+            }
+            std::memcpy(output + r * p.out_row_stride + ow * 8, acc[r], 8);
         }
     }
 }
 
-template <typename InT, typename OutT>
-inline void avgpool_h1_quant(
-    OutT* output, const InT* input,
-    const PoolingKernelParams& p,
-    float scale,
-    float in_scale, float in_zero,
-    float out_scale, float out_zero, bool add_to)
+// ============================================================
+// Public kernels — unchanged signatures, one line each
+// ============================================================
+
+template <typename T>
+inline void maxpool_h4(T* output, const T* input, const PoolingKernelParams& p,
+                       float, bool add_to)
 {
-    const auto vscale = v_set1_f32x8(scale);
-    const auto vzero  = v_zero_f32x8();
+    pool_rows<4, true>(p, 0.0f, FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to});
+}
 
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        auto vacc = vzero;
-        int64_t valid_count = 0;
+template <typename T>
+inline void maxpool_h1(T* output, const T* input, const PoolingKernelParams& p,
+                       float, bool add_to)
+{
+    pool_rows<1, true>(p, 0.0f, FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to});
+}
 
-        for (int64_t kd = 0; kd < p.KD; ++kd) {
-            int64_t id = p.od * p.SD + kd * p.DD - p.PD;
-            if (id < 0 || id >= p.ID) {
-                continue;
-            }
-            int64_t d_off = id * p.in_d_stride;
+template <typename T>
+inline void avgpool_h4(T* output, const T* input, const PoolingKernelParams& p,
+                       float scale, bool add_to)
+{
+    pool_rows<4, false>(p, scale, FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to});
+}
 
-            for (int64_t kh = 0; kh < p.KH; ++kh) {
-                int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) {
-                    continue;
-                }
+template <typename T>
+inline void avgpool_h1(T* output, const T* input, const PoolingKernelParams& p,
+                       float scale, bool add_to)
+{
+    pool_rows<1, false>(p, scale, FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to});
+}
 
-                for (int64_t kw = 0; kw < p.KW; ++kw) {
-                    int64_t iw = ow * p.SW + kw * p.DW - p.PW;
-                    if (iw < 0 || iw >= p.IW) {
-                        continue;
-                    }
-                    vacc = v_add(vacc, dequantize_tensor(input + d_off + ih * p.in_row_stride + iw * 8, in_scale, in_zero));
-                    valid_count++;
-                }
-            }
-        }
+template <typename InT, typename OutT>
+inline void maxpool_h4_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
+                             float in_scale, float in_zero,
+                             float out_scale, float out_zero, bool add_to)
+{
+    pool_rows<4, true>(p, 0.0f, QuantSrc<InT>{input, in_scale, in_zero},
+                       QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to});
+}
 
-        if (p.exclude_pad && valid_count > 0) {
-            vacc = v_mul(vacc, v_set1_f32x8(1.0f / static_cast<float>(valid_count)));
-        } else if (!p.exclude_pad) {
-            vacc = v_mul(vacc, vscale);
-        }
+template <typename InT, typename OutT>
+inline void maxpool_h1_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
+                             float in_scale, float in_zero,
+                             float out_scale, float out_zero, bool add_to)
+{
+    pool_rows<1, true>(p, 0.0f, QuantSrc<InT>{input, in_scale, in_zero},
+                       QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to});
+}
 
-        requantize_store(output + ow * 8, vacc, out_scale, out_zero, add_to);
-    }
+template <typename InT, typename OutT>
+inline void avgpool_h4_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
+                             float scale, float in_scale, float in_zero,
+                             float out_scale, float out_zero, bool add_to)
+{
+    pool_rows<4, false>(p, scale, QuantSrc<InT>{input, in_scale, in_zero},
+                        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to});
+}
+
+template <typename InT, typename OutT>
+inline void avgpool_h1_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
+                             float scale, float in_scale, float in_zero,
+                             float out_scale, float out_zero, bool add_to)
+{
+    pool_rows<1, false>(p, scale, QuantSrc<InT>{input, in_scale, in_zero},
+                        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to});
+}
+
+template <typename T>
+inline void maxpool_h4_quant_fast(T* output, const T* input,
+                                  const PoolingKernelParams& p, float out_zero)
+{
+    maxpool_fast<4>(output, input, p, out_zero);
+}
+
+template <typename T>
+inline void maxpool_h1_quant_fast(T* output, const T* input,
+                                  const PoolingKernelParams& p, float out_zero)
+{
+    maxpool_fast<1>(output, input, p, out_zero);
 }
 
 }  // namespace nnops::kernel
