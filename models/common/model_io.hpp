@@ -25,12 +25,63 @@
 
 namespace model {
 
+namespace detail {
+
+/// The activation free list: one plain `vector<float>` per distinct element
+/// count. A runner allocates the same handful of shapes on every forward pass,
+/// so from the second pass on every activation handed out is the block the
+/// previous pass returned — no `malloc`, no first-touch page faults, and no
+/// zero-fill (`vector` zeroes on construction, not on reuse).
+///
+/// Keyed on the exact word count, not a size class: `Buf::data.size()` is what
+/// the BN fold divides by the output-channel count, and a padded block would
+/// silently change that. The pool holds ~6 blocks for these networks.
+///
+/// Never destroyed: the weight-fold and Winograd-U caches are function-local
+/// statics in net_ops.hpp that destroy their `Buf`s at exit, and a `Buf` gives
+/// its block back here. This static is still alive then; the alternative is a
+/// destruction-order dependency between two translation-unit-local caches.
+/// Deliberately single-threaded — a runner drives its network from one thread.
+inline std::vector<std::vector<float>>& block_pool()
+{
+    static auto* pool = new std::vector<std::vector<float>>();
+    return *pool;
+}
+
+inline std::vector<float> take_block(size_t words)
+{
+    auto& pool = block_pool();
+    for (auto it = pool.begin(); it != pool.end(); ++it) {
+        if (it->size() == words) {
+            std::vector<float> block = std::move(*it);
+            pool.erase(it);
+            return block;
+        }
+    }
+    return std::vector<float>(words);
+}
+
+inline void give_block(std::vector<float> block)
+{
+    if (block.empty()) { return; }
+    block_pool().push_back(std::move(block));
+}
+
+}  // namespace detail
+
 /// A forward-pass activation: the storage and, over it, the view an operator
 /// reads and writes.
 ///
 /// Non-copyable on purpose — the view points into `data`, so a copy would leave
 /// the view dangling on the original buffer. Moving is safe: a vector move
 /// keeps its heap block, so the pointer stays valid.
+///
+/// A dying `Buf` hands its block back to the free list, and a move-assignment
+/// releases the target's block the same way; that is what makes the steady
+/// state allocation-free. The contents are then left over from the previous
+/// pass, which is harmless because every operator in these networks writes its
+/// whole output — and it makes a kernel that does not stand out as a mismatch
+/// instead of hiding behind a zero.
 struct Buf {
     std::vector<float> data;
     nnops::TensorView view;
@@ -38,14 +89,28 @@ struct Buf {
     Buf() = default;
     Buf(const Buf&) = delete;
     Buf& operator=(const Buf&) = delete;
-    Buf(Buf&&) noexcept = default;
-    Buf& operator=(Buf&&) noexcept = default;
+    Buf(Buf&& other) noexcept : data(std::move(other.data)), view(other.view)
+    {
+        other.view = nnops::TensorView{};
+    }
+    Buf& operator=(Buf&& other) noexcept
+    {
+        if (this != &other) {
+            detail::give_block(std::move(data));
+            data = std::move(other.data);
+            view = other.view;
+            other.view = nnops::TensorView{};
+        }
+        return *this;
+    }
+    ~Buf() { detail::give_block(std::move(data)); }
 
     float* ptr() { return data.data(); }
     const float* ptr() const { return data.data(); }
 };
 
-/// Allocate a zeroed buffer described by @p desc and a view over it.
+/// Allocate a buffer described by @p desc and a view over it. A recycled block
+/// when one of this exact size is on the free list; a zeroed one otherwise.
 ///
 /// A packed layout (NCHWC8) pads every row to the descriptor's pitch, so the
 /// view has to be built with that pitch and the storage with that many words —
@@ -59,7 +124,7 @@ inline Buf alloc(const nnops::TensorDesc& desc)
     const size_t words = packed
         ? (desc.storage_bytes() + sizeof(float) - 1) / sizeof(float)
         : static_cast<size_t>(desc.numel());
-    buf.data.assign(words, 0.0f);
+    buf.data = detail::take_block(words);
     if (packed) {
         buf.view = nnops::TensorView(shape, desc.dtype, buf.data.data(),
                                      desc.row_pitch(), desc.layout);

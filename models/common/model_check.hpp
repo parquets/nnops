@@ -11,6 +11,7 @@
 /// worth quoting for a whole-network comparison.
 
 #include "model_io.hpp"
+#include "nnops/detail/simd/simd.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +20,70 @@
 #include <vector>
 
 namespace model {
+
+namespace detail {
+
+/// One sweep of the comparison, over @p n elements eight at a time.
+struct Diff {
+    float max_abs = 0.0f;
+    float ref_scale = 0.0f;
+    float margin = 0.0f;  ///< max over i of |a-e| - (atol + rtol·|e|)
+};
+
+/// The two maxima the report needs, plus the worst tolerance margin.
+///
+/// Reporting the margin instead of counting failures is what keeps the loop
+/// branch-free: a checkpoint that passes — nearly all of them, on every run —
+/// is settled in one pass over the data, and only a failing one pays for the
+/// second pass that counts the offending elements.
+///
+/// The arithmetic is f32, which is the check's whole cost: the checkpoints
+/// differ by ~1e-6 relative and the tolerance is 1e-3, so a comparison that
+/// rounds in its last bit cannot flip a verdict. (A checkpoint within one ulp
+/// of its threshold is not a verdict worth trusting in either precision.)
+inline Diff sweep(const float* a, const float* e, int64_t n, float atol,
+                  float rtol)
+{
+    using namespace nnops::simd;
+    const v_f32x8 vatol = v_set1_f32x8(atol);
+    const v_f32x8 vrtol = v_set1_f32x8(rtol);
+    v_f32x8 vmax_err = v_zero_f32x8();
+    v_f32x8 vref_scale = v_zero_f32x8();
+    v_f32x8 vmargin = v_set1_f32x8(-3.0e38f);
+
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const v_f32x8 va = v_load_f32x8(a + i);
+        const v_f32x8 ve = v_load_f32x8(e + i);
+        const v_f32x8 err = v_abs(v_sub(va, ve));
+        const v_f32x8 want = v_abs(ve);
+        vmax_err = v_max(vmax_err, err);
+        vref_scale = v_max(vref_scale, want);
+        vmargin = v_max(vmargin, v_sub(err, v_add(vatol, v_mul(vrtol, want))));
+    }
+
+    // Horizontal reduction, scalar: eight lanes, then the ragged tail.
+    float lanes[8];
+    float max_err = 0.0f;
+    v_store(lanes, vmax_err);
+    for (int l = 0; l < 8; ++l) { max_err = std::max(max_err, lanes[l]); }
+    float ref_scale = 0.0f;
+    v_store(lanes, vref_scale);
+    for (int l = 0; l < 8; ++l) { ref_scale = std::max(ref_scale, lanes[l]); }
+    float margin = -3.0e38f;
+    v_store(lanes, vmargin);
+    for (int l = 0; l < 8; ++l) { margin = std::max(margin, lanes[l]); }
+    for (; i < n; ++i) {
+        const float err = std::fabs(a[i] - e[i]);
+        const float want = std::fabs(e[i]);
+        max_err = std::max(max_err, err);
+        ref_scale = std::max(ref_scale, want);
+        margin = std::max(margin, err - (atol + rtol * want));
+    }
+    return Diff{max_err, ref_scale, margin};
+}
+
+}  // namespace detail
 
 struct CheckRow {
     std::string name;
@@ -75,12 +140,19 @@ public:
         const auto* a = actual.ptr<float>();
         const auto* e = expected.ptr<float>();
         const int64_t n = actual.numel();
-        for (int64_t i = 0; i < n; ++i) {
-            const double want = e[i];
-            const double err = std::fabs(static_cast<double>(a[i]) - want);
-            row.max_abs = std::max(row.max_abs, err);
-            row.ref_scale = std::max(row.ref_scale, std::fabs(want));
-            if (err > atol_ + rtol_ * std::fabs(want)) { ++row.bad; }
+        const auto atol = static_cast<float>(atol_);
+        const auto rtol = static_cast<float>(rtol_);
+        const detail::Diff d = detail::sweep(a, e, n, atol, rtol);
+        row.max_abs = d.max_abs;
+        row.ref_scale = d.ref_scale;
+        if (d.margin > 0.0f) {
+            // Some element is outside the tolerance; count them. Only a failing
+            // checkpoint gets here, and it is the one that wants the count.
+            for (int64_t i = 0; i < n; ++i) {
+                if (std::fabs(a[i] - e[i]) > atol + rtol * std::fabs(e[i])) {
+                    ++row.bad;
+                }
+            }
         }
 
         if (verbose_) {

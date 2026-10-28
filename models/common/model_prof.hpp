@@ -107,8 +107,8 @@ inline void prof_reset()
 }
 
 /// Print both tables against @p total_ms, the runner's own forward timing.
-/// The layer table's last row is what the layers do not explain: the
-/// per-checkpoint comparison, the pool between stages, and the frees.
+/// The layer table's last row is what the layers do not explain, which after
+/// the activation free list is essentially the per-checkpoint comparison.
 inline void prof_report(const char* title, double total_ms)
 {
     detail::enabled() = false;

@@ -4,8 +4,9 @@
 ///        needs: shape inference, buffer allocation and execution in one call.
 ///
 /// The model runners read like the PyTorch definition of the network — that is
-/// the point. Every wrapper returns a freshly allocated activation; nothing is
-/// reused, so a runner can hold intermediates for the per-layer comparison.
+/// the point. Every wrapper hands back its own activation, so a runner can hold
+/// intermediates for the per-layer comparison; the storage under it comes from
+/// the free list in model_io.hpp, so a steady-state pass allocates nothing.
 
 #include "nnops/core/openmp_backend.hpp"
 #include "nnops/ops/activation.hpp"
