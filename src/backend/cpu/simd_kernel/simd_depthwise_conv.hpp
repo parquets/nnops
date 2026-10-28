@@ -94,48 +94,101 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 // The weight is the raw per-channel filter [C, 1, (KD,) KH, KW]: one scalar
 // per tap, broadcast into the accumulate, instead of the packed 8-lane form.
 // Padding is zero-filled per lane (planar_load), and a row's last block stores
-// through a scalar tail. One output row per call — there is no C8 block to
-// amortize an h4 over, and a width-vectorized row does not share loads between
-// output rows the way the packed kernel shares channel lanes.
+// through a scalar tail.
+//
+// R output rows per call, for the same reason the packed kernel takes four: a
+// ready-made row-modulo-R loop with ONE accumulator is a chain of KD·KH·KW
+// dependent FMAs — 9 of them for a 3x3, four cycles each — and the taps have
+// nothing to interleave. Four rows give four independent chains, so the FMA
+// latency hides behind itself. The rows do not share loads (each reads its own
+// input row), so unlike the packed kernel this buys no bandwidth — only ILP.
 
-template <typename T>
-inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
-                          const DwConvParams& p, const Epilogue& epilogue,
-                          bool add_to)
+/// R output rows per call, one width-vector accumulate per row. T is the
+/// element type; the accumulate and the epilogue ride it.
+template <int R, typename T>
+inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
+                               const DwConvParams& p, const Epilogue& epilogue,
+                               bool add_to)
 {
     constexpr int64_t L = simd_lane_for<T>;
     const T zero = static_cast<T>(0);
 
     for (int64_t ow = 0; ow < p.OW; ow += L) {
-        auto acc = v_set1(out, bias);
+        decltype(v_set1(out, bias)) acc[R];
+        for (int r = 0; r < R; ++r) { acc[r] = v_set1(out, bias); }
+
+        // Does this whole width vector — every lane, every row, every tap —
+        // land inside the input? Then the taps need no bounds test and no
+        // scalar fill: one branch per vector instead of one per tap. That is
+        // the interior nn_compute reaches by peeling the padded border off at
+        // the driver; here the same test is cheap enough to do per vector, so
+        // a caller pays nothing and the border keeps the general path.
+        // v_load_even deinterleaves 2L elements to produce one vector, so a
+        // stride-2 vector touches twice the width a stride-1 one does — the
+        // same guard planar_load uses on its fast path.
+        const int64_t iw_first = ow * p.SW - p.PW;
+        const int64_t span     = (p.SW == 2) ? 2 * L : L;
+        const int64_t iw_end   = iw_first + (p.KW - 1) * p.DW + span;
+        bool interior = (p.SW == 1 || p.SW == 2) && iw_first >= 0 && iw_end <= p.IW;
+        for (int r = 0; interior && r < R; ++r) {
+            const int64_t ih0 = (p.oh + r) * p.SH - p.PH;
+            interior = (p.oh + r < p.OH) && ih0 >= 0 &&
+                       ih0 + (p.KH - 1) * p.DH < p.IH;
+        }
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
             if (id < 0 || id >= p.ID) { continue; }
+            const T* in_d = in + id * p.in_d_stride;
 
             for (int64_t kh = 0; kh < p.KH; ++kh) {
-                const int64_t ih = p.oh * p.SH + kh * p.DH - p.PH;
-                if (ih < 0 || ih >= p.IH) { continue; }
-                const T* row = in + id * p.in_d_stride + ih * p.in_row_stride;
+                const T* row[R];
+                bool ok[R];
+                for (int r = 0; r < R; ++r) {
+                    const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
+                    ok[r] = (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
+                    row[r] = in_d + ih * p.in_row_stride;
+                }
                 const T* w_row = w + (kd * p.KH + kh) * p.KW;
+
+                if (interior) {
+                    for (int64_t kw = 0; kw < p.KW; ++kw) {
+                        const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
+                        const auto vk = v_set1(out, s_load(&w_row[kw]));
+                        for (int r = 0; r < R; ++r) {
+                            const T* src = row[r] + iw0;
+                            acc[r] = v_fmadd(
+                                (p.SW == 1) ? v_load(src) : v_load_even(src), vk, acc[r]);
+                        }
+                    }
+                    continue;
+                }
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
                     const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
-                    acc = v_fmadd(planar_load(row, iw0, p.SW, p.IW, zero),
-                                  v_set1(out, s_load(&w_row[kw])), acc);
+                    const auto vk = v_set1(out, s_load(&w_row[kw]));
+                    for (int r = 0; r < R; ++r) {
+                        if (!ok[r]) { continue; }
+                        acc[r] = v_fmadd(planar_load(row[r], iw0, p.SW, p.IW, zero),
+                                         vk, acc[r]);
+                    }
                 }
             }
         }
 
-        const auto v = nnops::backend::cpu::apply_epilogue_vec(epilogue, out, acc);
         const int64_t lanes = (p.OW - ow < L) ? p.OW - ow : L;
-        if (lanes == L) {
-            v_store_add(out + ow, v, add_to);
-        } else {
-            alignas(32) T tmp[L];
-            v_store(tmp, v);
-            for (int64_t l = 0; l < lanes; ++l) {
-                s_store_add(out + ow + l, s_load(&tmp[l]), add_to);
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) { continue; }
+            const auto v = nnops::backend::cpu::apply_epilogue_vec(epilogue, out, acc[r]);
+            T* dst = out + r * p.out_row_stride + ow;
+            if (lanes == L) {
+                v_store_add(dst, v, add_to);
+            } else {
+                alignas(32) T tmp[L];
+                v_store(tmp, v);
+                for (int64_t l = 0; l < lanes; ++l) {
+                    s_store_add(dst + l, s_load(&tmp[l]), add_to);
+                }
             }
         }
     }
@@ -144,6 +197,23 @@ inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
 // ============================================================
 // Public kernels — unchanged signatures
 // ============================================================
+
+template <typename T>
+inline void dwconv_planar_h4(T* out, const T* in, const T* w, float bias,
+                             const DwConvParams& p, const Epilogue& epilogue,
+                             bool add_to)
+{
+    dwconv_planar_rows<4>(out, in, w, bias, p, epilogue, add_to);
+}
+
+/// One row — the tail of an h4 loop, and the whole kernel for a single-row call.
+template <typename T>
+inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
+                          const DwConvParams& p, const Epilogue& epilogue,
+                          bool add_to)
+{
+    dwconv_planar_rows<1>(out, in, w, bias, p, epilogue, add_to);
+}
 
 template <typename T>
 inline void dwconv_h4(T* output, const T* input, const T* w_base,

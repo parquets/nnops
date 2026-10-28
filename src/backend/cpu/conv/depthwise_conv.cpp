@@ -114,7 +114,16 @@ void dwconv_impl(
             T* out_d = out_base + od * out_d_stride;
 
             if (!packed) {
-                for (int64_t oh = 0; oh < OH; ++oh) {
+                // Four rows per call, for the ILP: a single row's taps form one
+                // dependent FMA chain. Rows past OH are skipped in-kernel.
+                int64_t oh = 0;
+                for (; oh + 3 < OH; oh += 4) {
+                    pc.od = od;
+                    pc.oh = oh;
+                    k::dwconv_planar_h4(out_d + oh * pc.out_row_stride, in_base,
+                                        w_base, bias, pc, attrs.epilogue, attrs.add_to);
+                }
+                for (; oh < OH; ++oh) {
                     pc.od = od;
                     pc.oh = oh;
                     k::dwconv_planar(out_d + oh * pc.out_row_stride, in_base, w_base,
