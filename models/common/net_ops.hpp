@@ -7,6 +7,7 @@
 /// the point. Every wrapper returns a freshly allocated activation; nothing is
 /// reused, so a runner can hold intermediates for the per-layer comparison.
 
+#include "nnops/core/openmp_backend.hpp"
 #include "nnops/ops/activation.hpp"
 #include "nnops/ops/clamp.hpp"
 #include "nnops/ops/conv2d.hpp"
@@ -35,13 +36,33 @@ using nnops::DataType;
 using nnops::TensorDesc;
 using nnops::TensorView;
 
-/// The ComputeContext every wrapper hands to compute(). Default: no hooks, i.e.
-/// the sequential backend — which is what the model runners measure. A
-/// model-level bench installs a thread pool here rather than plumbing a context
-/// through every wrapper.
+/// Worker count for the runners from NNOPS_MODEL_THREADS, or 0 when the
+/// variable is unset — which leaves the context alone, so the default stays the
+/// sequential backend (what the runners check against PyTorch) and a bench that
+/// installed its own pool keeps it.
+inline int model_threads()
+{
+    static const int n = [] {
+        const char* s = std::getenv("NNOPS_MODEL_THREADS");
+        if (s == nullptr) { return 0; }
+        const long v = std::strtol(s, nullptr, 10);
+        return (v > 0) ? static_cast<int>(v) : 0;
+    }();
+    return n;
+}
+
+/// The ComputeContext every wrapper hands to compute(). A model-level bench
+/// installs a thread pool here rather than plumbing a context through every
+/// wrapper; so does the NNOPS_MODEL_THREADS switch above.
 inline nnops::ComputeContext& context()
 {
     static nnops::ComputeContext ctx;
+    static int installed = -1;
+    const int want = model_threads();
+    if (want != 0 && want != installed) {
+        ctx.cpu = (want > 1) ? nnops::openmp_backend(want) : nnops::CpuBackend{};
+        installed = want;
+    }
     return ctx;
 }
 
