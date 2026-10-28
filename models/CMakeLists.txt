@@ -22,3 +22,13 @@ foreach(src ${MODEL_SOURCES})
     add_test(NAME model_${name} COMMAND model_${name})
     set_tests_properties(model_${name} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+
+# ---- Fusion bench ----
+#
+# conv -> BN -> activation as three operator calls against one folded call, on
+# the layer shapes the runners above execute. Timings, not a test: no artifact
+# needed, so it is registered as an executable only.
+add_executable(model_bench_conv_fusion bench_conv_fusion.cpp)
+target_link_libraries(model_bench_conv_fusion PRIVATE nnops_cpu)
+target_include_directories(model_bench_conv_fusion PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
