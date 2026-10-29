@@ -100,7 +100,7 @@ template <typename T>
 using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float);
 template <typename T>
 using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
-                          float, float);
+                          float, float, const T*);
 
 // ---- level tables ---------------------------------------------------------
 
@@ -156,49 +156,63 @@ auto ab_fn(int level, bool zero_mode) {
 }
 
 template <typename T>
-auto b_fn(int level, bool zero_mode) {
+auto b_fn(int level, bool zero_mode, bool with_bias) {
 #if defined(NNOPS_ARCH_X86_64)
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return zero_mode ? mma_packed_b_mr6_nr16_mrxncxkc_f32<true>
-                                 : mma_packed_b_mr6_nr16_mrxncxkc_f32<false>;
-        case 4: return zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f32<true>
-                                 : mma_packed_b_mr4_nr16_mrxncxkc_f32<false>;
-        case 2: return zero_mode ? mma_packed_b_mr2_nr16_mrxncxkc_f32<true>
-                                 : mma_packed_b_mr2_nr16_mrxncxkc_f32<false>;
-        default: return zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f32<true>
-                                  : mma_packed_b_mr1_nr16_mrxncxkc_f32<false>;
+        case 6: return with_bias ? mma_packed_b_mr6_nr16_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_packed_b_mr6_nr16_mrxncxkc_f32<true, false>
+                                 : mma_packed_b_mr6_nr16_mrxncxkc_f32<false, false>;
+        case 4: return with_bias ? mma_packed_b_mr4_nr16_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f32<true, false>
+                                 : mma_packed_b_mr4_nr16_mrxncxkc_f32<false, false>;
+        case 2: return with_bias ? mma_packed_b_mr2_nr16_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_packed_b_mr2_nr16_mrxncxkc_f32<true, false>
+                                 : mma_packed_b_mr2_nr16_mrxncxkc_f32<false, false>;
+        default: return with_bias ? mma_packed_b_mr1_nr16_mrxncxkc_f32<true, true>
+                                  : zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f32<true, false>
+                                  : mma_packed_b_mr1_nr16_mrxncxkc_f32<false, false>;
         }
     } else {
         switch (level) {
-        case 6: return zero_mode ? mma_packed_b_mr6_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_b_mr6_nr16_mrxncxkc_f16<false>;
-        case 4: return zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_b_mr4_nr16_mrxncxkc_f16<false>;
-        case 2: return zero_mode ? mma_packed_b_mr2_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_b_mr2_nr16_mrxncxkc_f16<false>;
-        default: return zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true>
-                                  : mma_packed_b_mr1_nr16_mrxncxkc_f16<false>;
+        case 6: return with_bias ? mma_packed_b_mr6_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_packed_b_mr6_nr16_mrxncxkc_f16<true, false>
+                                 : mma_packed_b_mr6_nr16_mrxncxkc_f16<false, false>;
+        case 4: return with_bias ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, false>
+                                 : mma_packed_b_mr4_nr16_mrxncxkc_f16<false, false>;
+        case 2: return with_bias ? mma_packed_b_mr2_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_packed_b_mr2_nr16_mrxncxkc_f16<true, false>
+                                 : mma_packed_b_mr2_nr16_mrxncxkc_f16<false, false>;
+        default: return with_bias ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, true>
+                                  : zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, false>
+                                  : mma_packed_b_mr1_nr16_mrxncxkc_f16<false, false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return zero_mode ? mma_packed_b_mr8_nr12_mrxncxkc_f32<true>
-                                 : mma_packed_b_mr8_nr12_mrxncxkc_f32<false>;
-        case 4: return zero_mode ? mma_packed_b_mr4_nr12_mrxncxkc_f32<true>
-                                 : mma_packed_b_mr4_nr12_mrxncxkc_f32<false>;
-        default: return zero_mode ? mma_packed_b_mr1_nr12_mrxncxkc_f32<true>
-                                  : mma_packed_b_mr1_nr12_mrxncxkc_f32<false>;
+        case 8: return with_bias ? mma_packed_b_mr8_nr12_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_packed_b_mr8_nr12_mrxncxkc_f32<true, false>
+                                 : mma_packed_b_mr8_nr12_mrxncxkc_f32<false, false>;
+        case 4: return with_bias ? mma_packed_b_mr4_nr12_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_packed_b_mr4_nr12_mrxncxkc_f32<true, false>
+                                 : mma_packed_b_mr4_nr12_mrxncxkc_f32<false, false>;
+        default: return with_bias ? mma_packed_b_mr1_nr12_mrxncxkc_f32<true, true>
+                                  : zero_mode ? mma_packed_b_mr1_nr12_mrxncxkc_f32<true, false>
+                                  : mma_packed_b_mr1_nr12_mrxncxkc_f32<false, false>;
         }
     } else {
         switch (level) {
-        case 8: return zero_mode ? mma_packed_b_mr8_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_b_mr8_nr16_mrxncxkc_f16<false>;
-        case 4: return zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_b_mr4_nr16_mrxncxkc_f16<false>;
-        default: return zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true>
-                                  : mma_packed_b_mr1_nr16_mrxncxkc_f16<false>;
+        case 8: return with_bias ? mma_packed_b_mr8_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_packed_b_mr8_nr16_mrxncxkc_f16<true, false>
+                                 : mma_packed_b_mr8_nr16_mrxncxkc_f16<false, false>;
+        case 4: return with_bias ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, false>
+                                 : mma_packed_b_mr4_nr16_mrxncxkc_f16<false, false>;
+        default: return with_bias ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, true>
+                                  : zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, false>
+                                  : mma_packed_b_mr1_nr16_mrxncxkc_f16<false, false>;
         }
     }
 #endif
@@ -242,7 +256,8 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
             const std::vector<T>& b, const std::vector<T>& b_raw,
             const std::vector<T>& a, int nc, int kc, int ldc, int mr, int MR,
             int ldb, int nslots, float clamp_min, float clamp_max,
-            bool zero_mode, Kind kind, AAt a_at, const char* what) {
+            bool zero_mode, const std::vector<T>* bias_row, Kind kind,
+            AAt a_at, const char* what) {
     const float tol = tolerance<T>();
     const int live = std::min(mr, MR);
     // Sentinels as they actually sit in T: f16 may round the literals.
@@ -294,13 +309,18 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
                            to_float(b_raw[static_cast<size_t>(k) * nc + col]);
                 }
             }
+            // A bias row replaces both the zero and the C read: the kernel
+            // starts its accumulator there, so it is added at the accumulator's
+            // own precision (f16 on aarch64 fp16, f32 everywhere else).
             float ref;
-            if constexpr (f16_accum) {
-                const float acc_c = zero_mode
+            if (bias_row != nullptr) {
+                const float start = to_float((*bias_row)[static_cast<size_t>(r)]);
+                ref = f16_accum ? to_float(from_float<T>(start + acc)) : start + acc;
+            } else if constexpr (f16_accum) {
+                ref = zero_mode
                     ? acc
                     : to_float(from_float<T>(
                           to_float(c0[static_cast<size_t>(r) * ldc + col]) + acc));
-                ref = acc_c;
             } else {
                 ref = zero_mode
                     ? acc
@@ -374,15 +394,15 @@ void check_ab(AbKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
     fn(mr, nc, kc, c.data(), ldc, a.data(), b.data(), clamp_min, clamp_max);
 
     verify<T>(c, c0, b, b_raw, a, nc, kc, ldc, mr, level, ldb, nslots,
-              clamp_min, clamp_max, zero_mode, Kind::Ab,
+              clamp_min, clamp_max, zero_mode, nullptr, Kind::Ab,
               [&](int k, int r) { return a[static_cast<size_t>(k) * level + r]; },
               "packed_ab");
 }
 
 /// One packed-B case: A is row-major with row pitch lda, B is packed.
 template <typename T>
-void check_b(BKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
-             int lda, int ldc, float clamp_min, float clamp_max) {
+void check_b(BKernel<T> fn, int level, bool zero_mode, bool with_bias, int mr,
+             int nc, int kc, int lda, int ldc, float clamp_min, float clamp_max) {
     const int panel = panel_width<T>();
     const int ldb = static_cast<int>(mma_pack_align(panel * kc * sizeof(T)) / sizeof(T));
     const int nslots = panel_slots(nc, panel);
@@ -409,10 +429,15 @@ void check_b(BKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
     }
     const std::vector<T> c0 = c;
 
-    fn(mr, nc, kc, c.data(), ldc, a.data(), lda, b.data(), clamp_min, clamp_max);
+    std::vector<T> bias_row(with_bias ? level : 0);
+    for (auto& v : bias_row) { v = from_float<T>(rnd()); }
+
+    fn(mr, nc, kc, c.data(), ldc, a.data(), lda, b.data(), clamp_min, clamp_max,
+       with_bias ? bias_row.data() : nullptr);
 
     verify<T>(c, c0, b, b_raw, a, nc, kc, ldc, mr, level, ldb, nslots,
-              clamp_min, clamp_max, zero_mode, Kind::B,
+              clamp_min, clamp_max, zero_mode, with_bias ? &bias_row : nullptr,
+              Kind::B,
               [&](int k, int r) { return a[static_cast<size_t>(r) * lda + k]; },
               "packed_b");
 }
@@ -428,12 +453,17 @@ void run_suite(Kind kind) {
                     for (int li = 0; li < MR_COUNT; ++li) {
                         const int level = MR_LEVELS[li];
                         for (int mr = 1; mr <= level; ++mr) {
-                            for (bool z : {false, true}) {
+                            for (int zi = 0; zi < 3; ++zi) {
+                                // zi 0/1: the zero_mode pair; zi 2: the bias
+                                // row, which only exists on the overwrite path.
+                                const bool z = zi != 0;
+                                const bool b = zi == 2;
+                                if (kind == Kind::Ab && b) { continue; }
                                 if (kind == Kind::Ab) {
                                     check_ab<T>(ab_fn<T>(level, z), level, z, mr, nc,
                                                 kc, ldc, clamps[cl][0], clamps[cl][1]);
                                 } else {
-                                    check_b<T>(b_fn<T>(level, z), level, z, mr, nc,
+                                    check_b<T>(b_fn<T>(level, z, b), level, z, b, mr, nc,
                                                kc, kc + 3, ldc,
                                                clamps[cl][0], clamps[cl][1]);
                                 }

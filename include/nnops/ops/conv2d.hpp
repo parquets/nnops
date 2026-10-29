@@ -179,11 +179,14 @@ public:
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 
-    /// inputs[0] = input tensor (NCHW)
+    /// inputs[0] = input tensor (NCHW, or NHWC for a channel-last activation)
     /// inputs[1] = weight tensor [OC, IC/G, KH, KW] — ONNX-style, also when
-    ///             grouped. When attrs.algorithm == Winograd this is instead the
-    ///             prepacked transform-domain weight U [16, OC, IC/G] returned
-    ///             by prepackWeights.
+    ///             grouped. Stored OIHW (planar) for a planar activation and
+    ///             HWIO (TensorFlow's [KH, KW, IC/G, OC]) for an NHWC one — in
+    ///             that order the tensor's *shape* is the filter itself; the two
+    ///             must pair, see validate(). When attrs.algorithm == Winograd this is instead
+    ///             the prepacked transform-domain weight U [16, OC, IC/G]
+    ///             returned by prepackWeights.
     /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
@@ -208,7 +211,10 @@ public:
 
     OpType  getOpType()  const override { return OpType::Conv2D; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override
+    {
+        return LayoutSupport::PlanarOrChannelLast;
+    }
 
     const Conv2DAttributes& attributes() const noexcept { return attrs_; }
 

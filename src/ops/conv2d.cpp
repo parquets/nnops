@@ -5,7 +5,7 @@
 #include "nnops/detail/assert.hpp"
 #include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
-#include "backend/cpu/conv/conv2d_im2col.h"
+#include "backend/cpu/conv/conv2d_implicit_gemm.h"
 #include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
 
@@ -31,7 +31,7 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
     }
     switch (backend) {
     case Backend::CPU:
-        return backend::cpu::conv2d_im2col_kernel;
+        return backend::cpu::conv2d_implicit_gemm_kernel;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
         return nullptr;
@@ -75,9 +75,13 @@ Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
 std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
+    // The channel-last weight is TensorFlow's [KH, KW, IC/G, OC], so the output
+    // channel count is its last axis rather than its first.
+    const bool wt_hwio = inputs.size() > 1 &&
+        is_channel_last_weight(inputs[1].layout);
     std::vector<TensorDesc> outs = conv2d_output_shape(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
-        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs);
+        static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs, wt_hwio);
 
     // The quantized route writes either an integer destination (s8/u8, taken
     // from attributes.output_dtype) or an fp one — the fp activation's own
@@ -108,8 +112,17 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
 {
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    NNOPS_TRY(detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOrChannelLast)));
+    NNOPS_TRY(detail::require(
+        is_layout_supported(inputs[1].layout, LayoutSupport::PlanarOrChannelLast)));
+    // The weight must be stored in the order that pairs with the activation:
+    // the channel-last kernel reads HWIO (the output channel is the run), the
+    // planar one OIHW. Converting is the caller's job, once per model, at load
+    // time — a weight reshaped per call would pay that copy on every inference.
     return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+        is_channel_last(inputs[0].layout) ==
+        is_channel_last_weight(inputs[1].layout));
 }
 
 Status Conv2D::compute(std::span<TensorView> outputs,
@@ -134,10 +147,16 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
     }
 
-    // Winograd has no integer counterpart, so the quantized route always runs
-    // the im2col kernel — including for the k3s1 geometry Winograd would take.
-    if (backend_ == Backend::CPU && is_quantized_conv2d(inputs[1].data_type())) {
-        return backend::cpu::conv2d_im2col_kernel(attrs, output, inputs, ctx, workspace);
+    // Two cases always run the implicit-GEMM kernel, whatever the algorithm
+    // says, because Winograd has neither a channel-last form nor an integer
+    // counterpart: a channel-last activation (the kernel then keeps the pixel
+    // axis on M and reads the HWIO weight) and an s8 weight (the quantized
+    // driver). The kernel dispatches on both itself.
+    if (backend_ == Backend::CPU &&
+        (is_channel_last(inputs[0].layout()) ||
+         is_quantized_conv2d(inputs[1].data_type()))) {
+        return backend::cpu::conv2d_implicit_gemm_kernel(attrs, output, inputs, ctx,
+                                                         workspace);
     }
 
     // Auto reads the weight it was handed: U can only be multiplied in the
@@ -174,7 +193,10 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& weight = inputs[0];
     NNOPS_ASSERT(weight.rank() == 4);
-    NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOnly));
+    // The transform reads OIHW taps; a channel-last (HWIO) weight has no
+    // Winograd route at all — that layout runs the implicit GEMM.
+    NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOnly) &&
+                 !is_channel_last_weight(weight.layout()));
 
     // Weight: [OC, IC/G, 3, 3]
     const int64_t OC  = weight.shape(0);

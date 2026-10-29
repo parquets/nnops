@@ -11,6 +11,7 @@ set(TEST_SOURCES
     test_conv2d.cpp
     test_conv2d_winograd.cpp
     test_conv2d_int8.cpp
+    test_conv2d_nhwc.cpp
     test_activation.cpp
     test_pooling.cpp
     test_linear.cpp
@@ -124,6 +125,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_matmul.cpp
         bench_linear.cpp
         bench_conv2d.cpp
+        bench_conv2d_nhwc.cpp
         bench_depthwise.cpp
         bench_pooling.cpp
         bench_attention.cpp

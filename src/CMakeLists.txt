@@ -80,12 +80,12 @@ set(NNOPS_CPU_SOURCES
     # an fp output for quantized operands; it drives matmul.cpp above.
     backend/cpu/matmul/linear.cpp
 
-    # CPU convolution kernels: im2col + GEMM (planar NCHW), the int8 route, the
-    # Winograd F(2x2,3x3) route, and the depthwise kernel (one file, but it is
-    # the conv family's third shape)
-    backend/cpu/conv/conv2d_im2col.cpp
+    # CPU convolution kernels: the implicit-GEMM route (both layouts — planar
+    # NCHW and channel-last NHWC, fp and quantized, one file since they share a
+    # plan, a scratch layout and a driver), the Winograd F(2x2,3x3) route, and
+    # the depthwise kernel.
+    backend/cpu/conv/conv2d_implicit_gemm.cpp
     backend/cpu/conv/conv2d_winograd.cpp
-    backend/cpu/conv/conv2d_im2col_int8.cpp
     backend/cpu/conv/depthwise_conv.cpp
     backend/cpu/conv/conv3d.cpp
 

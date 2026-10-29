@@ -2,7 +2,7 @@
 /// Uses Conv2D class API exclusively.
 
 #include "nnops/ops/conv2d.hpp"
-#include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
+#include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
 #include "backend/cpu/matmul/matmul_helper.h" // nr_max_flt / mma_pack_align / tile_pack_rhs
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"
 #include "common/test_harness.hpp"
@@ -27,9 +27,9 @@ using nnops::backend::cpu::half;
 
 /// Packed-B scratch (elements per slot) a float conv plan must reserve: the
 /// plan's im2col block — icn_block channels x karea taps x oh_block rows x OW
-/// columns — re-laid out in nr_max-wide panels. Mirrors get_conv2d_plan;
+/// columns — re-laid out in nr_max-wide panels. Mirrors get_conv2d_implicit_gemm_plan;
 /// nr_max is arch-dependent (12 on aarch64, 16 on x86_64).
-static int64_t expected_pack_size(const nnops::backend::cpu::Conv2DPlan& plan,
+static int64_t expected_pack_size(const nnops::backend::cpu::Conv2DGemmPlan& plan,
                                   int64_t karea, int64_t out_w) {
     constexpr int nr = nnops::backend::cpu::nr_max_flt<float>();
     const int64_t kdim = plan.icn_block * karea;
@@ -984,7 +984,7 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
         const TensorDesc descs[] = {input.desc(), weight.desc()};
         const auto out_descs = op->getOutputTensorDesc(descs);
 
-        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
 
         // Every rung must stay on the im2col path — that is what makes the
@@ -1151,7 +1151,7 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
         const TensorDesc descs[] = {input.desc(), weight.desc()};
         const auto out_descs = op->getOutputTensorDesc(descs);
 
-        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, c.nthreads, /*use_thread_slots=*/false);
 
         NNOPS_EXPECT_EQ(plan.oh_block, c.want_oh_block);
@@ -1213,7 +1213,7 @@ NNOPS_TEST(conv2d_pointwise_routing) {
         auto op = Conv2D::create(attrs, Backend::CPU);
         const TensorDesc descs[] = {input.desc(), weight.desc()};
         const auto out_descs = op->getOutputTensorDesc(descs);
-        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
 
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
@@ -1266,7 +1266,7 @@ NNOPS_TEST(conv2d_pointwise_routing) {
                        Wpad * static_cast<int64_t>(sizeof(float)));
 
     const TensorDesc pdescs[] = {pitched.desc(), w32.desc()};
-    const auto pplan = nnops::backend::cpu::get_conv2d_plan(
+    const auto pplan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
         attrs, pdescs, od, /*num_threads=*/1, /*use_thread_slots=*/false);
     NNOPS_EXPECT_FALSE(pplan.pointwise);
     // Still the 1x1 rung of the ic-block ladder, with the packed-B scratch back
@@ -1447,7 +1447,7 @@ NNOPS_TEST(conv2d_wide_frame_plan) {
         auto op = Conv2D::create(attrs, Backend::CPU);
         const TensorDesc descs[] = {input.desc(), weight.desc()};
         const auto out_descs = op->getOutputTensorDesc(descs);
-        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, c.nt, /*use_thread_slots=*/false);
 
         NNOPS_EXPECT_EQ(out_descs[0].dims[2], c.want_oh);
@@ -1514,7 +1514,7 @@ NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
         auto op = Conv2D::create(attrs, Backend::CPU);
         const TensorDesc descs[] = {input.desc(), weight.desc()};
         const auto out_descs = op->getOutputTensorDesc(descs);
-        const auto plan = nnops::backend::cpu::get_conv2d_plan(
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, c.nt, /*use_thread_slots=*/true);
 
         NNOPS_EXPECT_EQ(plan.ocn_block, c.want_ocn);
@@ -1546,7 +1546,7 @@ NNOPS_TEST(conv2d_small_plane_oc_split_matches_ref) {
     std::vector<TensorView> ins   = {input, weight};
     auto op = Conv2D::create(attrs, Backend::CPU);
     const auto out_descs = op->getOutputTensorDesc(descs);
-    const auto plan = nnops::backend::cpu::get_conv2d_plan(
+    const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
         attrs, descs, out_descs, 20, /*use_thread_slots=*/true);
     NNOPS_EXPECT_TRUE(plan.oc_chunks > 1);
 
@@ -1603,7 +1603,7 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
     // col budget still allows 7 rows and the growth loop takes them (the same
     // plane at IC 64 is pinned to 4 — see conv2d_wide_frame_plan). Either way
     // the plane is walked in a hundred-odd blocks of a few rows.
-    const auto plan = nnops::backend::cpu::get_conv2d_plan(attrs, descs, out_descs, 1, false);
+    const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(attrs, descs, out_descs, 1, false);
     NNOPS_EXPECT_EQ(plan.oh_block, int64_t{7});
     NNOPS_EXPECT_EQ(plan.num_oh_blocks, int64_t{103});
 
@@ -1669,7 +1669,7 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
         std::vector<TensorView> pins   = {p_in, p_w};
         auto pop = Conv2D::create(pattrs, Backend::CPU);
         auto pouts = pop->getOutputTensorDesc(pdescs);
-        NNOPS_EXPECT_TRUE(nnops::backend::cpu::get_conv2d_plan(
+        NNOPS_EXPECT_TRUE(nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             pattrs, pdescs, pouts, 4, /*use_thread_slots=*/false).pointwise);
 
         const int64_t pn = pouts[0].numel();

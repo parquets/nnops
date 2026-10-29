@@ -75,7 +75,7 @@ template <> struct TileTraits<float> {
     static constexpr const auto& trans() { return pack_trans_f32_fn; }
     static constexpr const auto& copy()  { return pack_copy_f32_fn; }
     template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f32<Z>; }
-    template <bool Z> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z>; }
+    template <bool Z, bool B> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z, B>; }
 };
 
 template <> struct TileTraits<half> {
@@ -85,7 +85,7 @@ template <> struct TileTraits<half> {
     static constexpr const auto& trans() { return pack_trans_f16_fn; }
     static constexpr const auto& copy()  { return pack_copy_f16_fn; }
     template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f16<Z>; }
-    template <bool Z> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z>; }
+    template <bool Z, bool B> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, B>; }
 };
 
 /// 64-byte-aligned panel stride, in elements.
@@ -184,17 +184,21 @@ void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
     });
 }
 
-/// Same walk, A read raw through @p lda.
-template <class T, bool Zero>
+/// Same walk, A read raw through @p lda. `Bias` lets the accumulator start at
+/// a per-row value instead of zero, which is what removes a whole write+read of
+/// the output tile from Conv2D (the bias seed): the kernel's row index *is* the
+/// output channel, so the bias row rides in at panel granularity.
+template <class T, bool Zero, bool Bias>
 void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                           const T* a, int lda, const T* b,
-                          float clamp_min, float clamp_max) {
+                          float clamp_min, float clamp_max, const T* bias) {
     using Tr = TileTraits<T>;
-    const auto& fns = Tr::template mma_direct<Zero>();
+    const auto& fns = Tr::template mma_direct<Zero, Bias>();
 
     int m = 0;
     walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
-        fns[level](s, Nc, Kc, c + m * ldc, ldc, a + m * lda, lda, b, clamp_min, clamp_max);
+        fns[level](s, Nc, Kc, c + m * ldc, ldc, a + m * lda, lda, b, clamp_min, clamp_max,
+                   Bias ? bias + m : nullptr);
     });
 }
 
@@ -207,9 +211,13 @@ void dispatch_mma_pack(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
 
 template <class T>
 void dispatch_mma_direct(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
-                         const T* a, int lda, const T* b, float lo, float hi) {
-    if (zero_mode) { tile_mma_direct_impl<T, true>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi); }
-    else           { tile_mma_direct_impl<T, false>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi); }
+                         const T* a, int lda, const T* b, float lo, float hi,
+                         const T* bias) {
+    // A bias implies the overwrite path: the tile is built from the bias, so
+    // there is nothing in C to accumulate onto.
+    if (bias != nullptr) { tile_mma_direct_impl<T, true, true>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, bias); }
+    else if (zero_mode)  { tile_mma_direct_impl<T, true, false>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
+    else                 { tile_mma_direct_impl<T, false, false>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
 }
 
 void tile_pack_rhs(bool trans, int nc, int kc,
@@ -387,14 +395,14 @@ void tile_mma_pack(int Mc, int Nc, int Kc, half* c, int ldc,
 
 void tile_mma_direct(int Mc, int Nc, int Kc, float* c, int ldc,
                      const float* a, int lda, const float* b,
-                     float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max);
+                     float clamp_min, float clamp_max, bool zero_mode, const float* bias) {
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max, bias);
 }
 
 void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
                      const half* a, int lda, const half* b,
-                     float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max);
+                     float clamp_min, float clamp_max, bool zero_mode, const half* bias) {
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max, bias);
 }
 
 // =========================================================================
@@ -574,6 +582,36 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
     walk_levels(m, mc, MR_I8, [&](int level, int s) {
         fns[level](s, nc, kc, c + m * ldc, ldc, packed_a, packed_b, clamp_min, clamp_max);
         packed_a += ldd_a;
+    });
+}
+
+/// The same walk over the store-only kernels: C is a destination, not a
+/// partial sum, so the caller's zero fill of the tile disappears.
+void tile_mma_pack_i8_zero(int mc, int nc, int kc,
+                           int32_t* c, int ldc,
+                           const int8_t* packed_a, const int8_t* packed_b,
+                           int32_t clamp_min, int32_t clamp_max) {
+    const int ldd_a = static_cast<int>(GEOM_I8.ldd_a(kc));
+    const auto& fns = mma_pack_fns_i8<true>;
+
+    int m = 0;
+    walk_levels(m, mc, MR_I8, [&](int level, int s) {
+        fns[level](s, nc, kc, c + m * ldc, ldc, packed_a, packed_b, clamp_min, clamp_max);
+        packed_a += ldd_a;
+    });
+}
+
+void tile_mma_direct_i8(int mc, int nc, int kc,
+                        int32_t* c, int ldc,
+                        const int8_t* a, int lda, const int8_t* packed_b,
+                        int32_t clamp_min, int32_t clamp_max) {
+    const auto& fns = mma_direct_fns_i8<false>;
+
+    // Same MR cascade as the packed route; only the A operand moves.
+    int m = 0;
+    walk_levels(m, mc, MR_I8, [&](int level, int s) {
+        fns[level](s, nc, kc, c + m * ldc, ldc, a + m * lda, lda, packed_b,
+                   clamp_min, clamp_max);
     });
 }
 

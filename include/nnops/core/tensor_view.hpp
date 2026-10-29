@@ -85,13 +85,22 @@ struct TensorDesc {
     /// Row pitch (byte stride between consecutive rows).
     /// For rank < 2, returns the storage unit (element or block size).
     /// For packed layouts, pitch = align_up(W × pack × unit, alignment).
+    /// For channel-last layouts the row is one spatial line (W pixels × C
+    /// channels), so pitch = align_up(W × C × unit, alignment).
     int64_t row_pitch(int64_t alignment = 32) const noexcept {
         if (rank < 2) {
             return static_cast<int64_t>(data_type_stride_unit(dtype));
         }
-        int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
-        int64_t W = dims[static_cast<size_t>(rank - 1)];
-        int64_t row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W)) * pack;
+        int64_t row_bytes;
+        if (is_channel_last(layout)) {
+            const int64_t W = dims[static_cast<size_t>(rank - 1)];
+            const int64_t C = dims[1];
+            row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W * C));
+        } else {
+            const int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
+            const int64_t W = dims[static_cast<size_t>(rank - 1)];
+            row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W)) * pack;
+        }
         return ((row_bytes + alignment - 1) / alignment) * alignment;
     }
 
@@ -100,12 +109,10 @@ struct TensorDesc {
         if (rank < 2) {
             return nbytes();
         }
-        int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
-        int64_t W = dims[static_cast<size_t>(rank - 1)];
-        int64_t row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W)) * pack;
-        int64_t aligned_row = ((row_bytes + alignment - 1) / alignment) * alignment;
+        const int64_t aligned_row = row_pitch(alignment);
         int64_t rows = dims[0];
-        if (rank >= 2) {
+        if (!is_channel_last(layout)) {
+            const int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
             rows *= ((dims[1] + pack - 1) / pack);
         }
         for (int64_t d = 2; d < rank - 1; ++d) {
@@ -136,9 +143,12 @@ public:
         shape_ = shape;
         if (rank_ >= 2) {
             // pitch = bytes of the innermost dimension (whole blocks for
-            // block-packed types such as q5_1)
-            pitch_ = static_cast<int64_t>(
-                data_type_row_bytes(dtype, shape_[static_cast<size_t>(rank_ - 1)]));
+            // block-packed types such as q5_1). Channel-last stores one whole
+            // spatial line per row: W pixels × C channels.
+            const int64_t row_elems = is_channel_last(layout)
+                ? shape_[1] * shape_[static_cast<size_t>(rank_ - 1)]
+                : shape_[static_cast<size_t>(rank_ - 1)];
+            pitch_ = static_cast<int64_t>(data_type_row_bytes(dtype, row_elems));
         } else if (rank_ == 1) {
             // 1D tensor: pitch = storage unit of one value
             pitch_ = static_cast<int64_t>(data_type_stride_unit(dtype));
@@ -159,12 +169,15 @@ public:
         NNOPS_ASSERT(shape.size() <= kMaxRank);
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
-        // Validate pitch for packed layouts: must hold at least
-        // last_dim * pack_size elements per row.
+        // Validate pitch: a row must hold at least last_dim * pack_size
+        // elements (packed), or C × last_dim elements (channel-last).
         const int64_t pack = layout_channel_pack(layout);
         if (rank_ >= 2) {
-            const int64_t min_pitch = static_cast<int64_t>(
-                data_type_row_bytes(dtype, shape_[static_cast<size_t>(rank_ - 1)])) * pack;
+            const int64_t row_elems = is_channel_last(layout)
+                ? shape_[1] * shape_[static_cast<size_t>(rank_ - 1)]
+                : shape_[static_cast<size_t>(rank_ - 1)];
+            const int64_t min_pitch =
+                static_cast<int64_t>(data_type_row_bytes(dtype, row_elems)) * pack;
             NNOPS_ASSERT(pitch_ >= min_pitch);
         }
     }
@@ -287,6 +300,18 @@ public:
     /// For higher dims: shape[dim+1] * stride(dim+1).
     int64_t stride_elems(int64_t dim) const noexcept {
         NNOPS_ASSERT(dim >= 0 && dim < rank_);
+        // Channel-last: the physical order is [N][spatial…][C], so the
+        // logical dims are not in memory order. C (dim 1) is the innermost
+        // axis; a step in a spatial dim moves a whole C block; N strides the
+        // whole rest of the tensor.
+        if (is_channel_last(layout_)) {
+            if (dim == 1) { return 1; }
+            int64_t s = shape_[1];
+            for (int64_t i = dim + 1; i < rank_; ++i) {
+                if (i != 1) { s *= shape_[static_cast<size_t>(i)]; }
+            }
+            return s;
+        }
         // Innermost dimension: for packed layouts, each logical step spans
         // the pack lane (e.g., 8 for NCHWC8); for planar, stride is 1.
         if (dim == rank_ - 1) {
@@ -331,6 +356,9 @@ public:
         if (rank_ < 2) {
             return 1;
         }
+        if (is_channel_last(layout_)) {
+            return 1;  // channels are contiguous, never blocked
+        }
         int64_t pack = channel_pack_size();
         if (pack <= 1) {
             return shape_[1]; // planar: each channel is its own "block"
@@ -357,9 +385,17 @@ public:
     /// NCHW:  N * C * H.
     /// NCHWC8: N * ceil(C/8) * H.
     /// NCDHWC8: N * ceil(C/8) * D * H.
+    /// NHWC: N * H (the channel axis lives inside a row).
     int64_t total_rows() const noexcept {
         if (rank_ < 1) {
             return 0;
+        }
+        if (is_channel_last(layout_)) {
+            int64_t rows = shape_[0];
+            for (int64_t d = 2; d < rank_ - 1; ++d) {
+                rows *= shape_[static_cast<size_t>(d)];
+            }
+            return rows;
         }
         int64_t rows = shape_[0];  // N
         // Channel blocks only matter when there are spatial dims (rank >= 3).

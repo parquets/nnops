@@ -2,17 +2,22 @@
 /// @file simd_im2col.hpp
 /// @brief SIMD im2col kernels — the "unrolled input" step of im2col+GEMM conv.
 ///
-/// Three kernels build the B operand consumed by the GEMM:
+/// Five kernels build the gathered operand of a conv-as-GEMM — three for the
+/// planar routes (NCHW Conv2D, NCDHW Conv3D) and two for the channel-last one:
 ///   tiled_im2col_2d         — NCHW  Conv2D: col_data[ic*karea2d][roi_h*roi_w]
 ///   tiled_im2col_2d_packed  — the same gather, written straight into the
 ///                             uniform packed-B panels (fused im2col + pack);
 ///                             the panel width is a template parameter, so a
 ///                             full panel row is an unrolled store sequence
 ///   tiled_im2col_3d         — NCDHW Conv3D: col_data[ic*karea3d][roi_d*roi_h*roi_w]
+///   tiled_im2col_nhwc       — NHWC  Conv2D: a_tile[pixel][tap*icnc + ic]
+///   tiled_im2col_nhwc_i8    — the same gather, into s8 (or a dst of the
+///                             caller's int8 type) for the quantized route
 ///
-/// Each row (ic, kd, kh, kw) holds the input spatial positions gathered for one
-/// input channel and one kernel tap, across the current output block (the roi).
-/// Positions that fall outside the input (padding) are zero-filled.
+/// On the planar routes each row of the gathered operand is one
+/// (ic, kd, kh, kw) and holds the input spatial positions across the current
+/// output block (the roi). Positions that fall outside the input (padding) are
+/// zero-filled.
 ///
 /// Padding convention (mirrors nn_compute tiled_im2col_2d):
 ///   * *local* padding — the padding remaining inside this block (roi_pad_*)
@@ -20,6 +25,12 @@
 ///   * *global* padding — the operator's padding (PD/PH/PW) — determines where
 ///     the valid region *ends* (`*_end` bounds) and the actual input addressing
 ///     (`id_paded`/`ih_paded`/`iw_paded`).
+///
+/// The channel-last pair flips those roles: one output pixel is one row and the
+/// k axis runs tap-major (k = tap × icnc + local_ic) within an input-channel
+/// block. A tap of a channel-last input is a contiguous channel run, so a gather
+/// is `karea` straight copies per row — the same copy the 1x1 route reads for
+/// free.
 ///
 /// Mixing these up (using the local padding for the input addressing) produces
 /// off-by-padding input rows on every block after the first.
@@ -29,10 +40,12 @@
 ///
 /// `tiled_im2col_2d` writes the input values through unchanged, with a
 /// configurable pad value. That is all the quantized Conv2D route needs: it
-/// quantizes an fp activation into a plane up front (conv2d_im2col_int8.cpp,
+/// quantizes an fp activation into a plane up front (conv2d_implicit_gemm.cpp,
 /// quantize_plane) and gathers bytes from then on, so no store policy other
 /// than "copy" is required.
 
+#include "backend/cpu/common/common_utils.hpp"
+#include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
 #include <algorithm>
@@ -448,6 +461,260 @@ inline void tiled_im2col_3d(
                     }
                 }
             }
+        }
+    }
+}
+
+// ---- channel-last (NHWC) gathers ------------------------------------------
+//
+// One output pixel becomes one A row; the k axis is tap-major within the ic
+// block: k = tap × icnc + (ic − icn). A tap of the channel-last input is a
+// contiguous channel run, so every tile row is written as karea straight copies
+// of `icnc` elements — the same access shape the 1x1 route gets for free.
+//
+// The order matters beyond the copy itself: it is also the weight's own order
+// (HWIO: [kh][kw][ic][oc]), which is what lets the B packer read the weight
+// through the ordinary panel packer instead of a transposing one.
+
+/// Gather one pixel tile of one ic block into A: row m is the patch of output
+/// pixel (oh, ow0 + m), k = tap × icnc + local_ic. @p in points at the block's
+/// first channel of pixel (0, 0); @p pad fills taps that fall outside the input.
+/// @p p0 is that pixel as a flat index (oh × OW + ow0) and @p flat lets the tile
+/// walk past the end of a row into the next one — legal only when the rows are
+/// dense, which is where a short plane stops paying MR granularity for tiles the
+/// width cannot fill.
+template <class T>
+inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
+                              const T* NNOPS_RESTRICT in,
+                              int64_t in_row_stride, int64_t ic_stride, T pad,
+                              int64_t p0, int OW, bool flat, int mc,
+                              int IH, int IW, int KH, int KW, int SH, int SW,
+                              int DH, int DW, int PH, int PW, int icnc,
+                              int karea) noexcept
+{
+    using namespace nnops::simd;
+    constexpr int L = simd_lane_for<T>;
+    // A whole vector per step whenever the channel run is a multiple of the
+    // lane count — which every block of the ladder except a tail is. The
+    // element loop this replaces was as expensive as the GEMM it feeds.
+    const bool vec = (icnc % L) == 0;
+    const float pad_f = [&] {
+        if constexpr (std::is_same_v<T, float>) { return pad; }
+        else { return half_to_float(pad); }
+    }();
+    const auto copy_run = [=](T* dst, const T* src) noexcept {
+        if (!vec) {
+            // A short channel run (a tail block, the border taps of a narrow-IC
+            // layer) still copies as one block — the element loop this replaces
+            // was as expensive as the GEMM it feeds.
+            if (src) { for (int j = 0; j < icnc; ++j) { dst[j] = src[j]; } }
+            else     { for (int j = 0; j < icnc; ++j) { dst[j] = pad; } }
+            return;
+        }
+        if (src) {
+            for (int j = 0; j < icnc; j += L) { v_store(dst + j, v_load(src + j)); }
+        } else {
+            const auto vp = v_set1(dst, pad_f);
+            for (int j = 0; j < icnc; j += L) { v_store(dst + j, vp); }
+        }
+    };
+
+    int64_t oh = p0 / OW;
+    int ow = static_cast<int>(p0 - oh * OW);
+    // When every channel of a pixel is in this block and the taps of a filter row
+    // are adjacent, that row of taps is one run of `KW × icnc` elements in both
+    // the input and the A row — the k order is tap-major, which is exactly the
+    // input's own order. One copy per filter row instead of one per tap.
+    const bool tap_run = (DW == 1) && (ic_stride == icnc);
+    const auto copy_span = [=](T* dst, const T* src, int n) noexcept {
+        if (!src) {
+            const auto vp = v_set1(dst, pad_f);
+            int j = 0;
+            if (vec) { for (; j + L <= n; j += L) { v_store(dst + j, vp); } }
+            for (; j < n; ++j) { dst[j] = pad; }
+            return;
+        }
+        if (n >= L) {
+            int j = 0;
+            for (; j + L <= n; j += L) { v_store(dst + j, v_load(src + j)); }
+            // The tail rides on one overlapping vector rather than going scalar.
+            if (j < n) { v_store(dst + n - L, v_load(src + n - L)); }
+        } else {
+            for (int j = 0; j < n; ++j) { dst[j] = src[j]; }
+        }
+    };
+    for (int m = 0; m < mc; ++m, ++ow) {
+        if (flat && ow == OW) { ow = 0; ++oh; }
+        const int64_t ih0 = oh * SH - PH;
+        const int64_t iw0 = static_cast<int64_t>(ow) * SW - PW;
+        T* row = a + static_cast<int64_t>(m) * lda;
+        if (tap_run) {
+            for (int kh = 0; kh < KH; ++kh) {
+                const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;
+                T* dst = row + static_cast<int64_t>(kh) * KW * icnc;
+                if (ih < 0 || ih >= IH) {
+                    copy_span(dst, nullptr, KW * icnc);
+                    continue;
+                }
+                const T* hrow = in + ih * in_row_stride;
+                if (iw0 >= 0 && iw0 + KW <= IW) {
+                    copy_span(dst, hrow + iw0 * ic_stride, KW * icnc);
+                } else {
+                    for (int kw = 0; kw < KW; ++kw) {
+                        const int64_t iw = iw0 + kw;
+                        copy_run(dst + kw * icnc,
+                                 (iw >= 0 && iw < IW) ? hrow + iw * ic_stride : nullptr);
+                    }
+                }
+            }
+            continue;
+        }
+        int t = 0;
+        for (int kh = 0; kh < KH; ++kh) {
+            const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;
+            const bool h_ok = (ih >= 0 && ih < IH);
+            const T* hrow = in + ih * in_row_stride;
+            for (int kw = 0; kw < KW; ++kw, ++t) {
+                const int64_t iw = iw0 + static_cast<int64_t>(kw) * DW;
+                T* dst = row + static_cast<int64_t>(t) * icnc;
+                copy_run(dst, (h_ok && iw >= 0 && iw < IW) ? hrow + iw * ic_stride
+                                                           : nullptr);
+            }
+        }
+    }
+}
+
+/// The same gather for the quantized route: A is s8 bytes and the source is
+/// always *bytes* (a materialized plane is already s8, a pre-quantized
+/// activation is u8 or s8), with the A shift applied on the way through. @p xr
+/// is the XOR (+0x80 for a u8 source, 0 otherwise) that puts the byte in signed
+/// range, and @p pad is the zero point that fills taps outside the input. The k
+/// tail up to @p kdim4 is zeroed so the direct-A kernel — which reads whole
+/// 4-byte groups and must be handed a multiple of 4 — sees a zero product there
+/// (the B panel is zero-padded over the same range).
+///
+/// @p p0 / @p flat mean exactly what they do in the fp gather.
+inline void tiled_im2col_nhwc_i8(int8_t* NNOPS_RESTRICT a, int lda,
+                                 const uint8_t* NNOPS_RESTRICT in,
+                                 int64_t in_row_stride, int64_t ic_stride,
+                                 uint8_t xr, uint8_t pad,
+                                 int64_t p0, int OW, bool flat, int mc,
+                                 int IH, int IW, int KH, int KW, int SH, int SW,
+                                 int DH, int DW, int PH, int PW,
+                                 int icnc, int karea, int kdim, int kdim4) noexcept
+{
+    // The channel run of one tap is the whole copy, and the block ladder hands
+    // it to us in whole 8-byte chunks (16 for every karea <= 9 filter): one
+    // 8-byte load/xor/store per chunk instead of a byte loop, which is what
+    // used to make the gather as expensive as the GEMM it feeds.
+    const uint64_t xr64 = static_cast<uint64_t>(xr) * 0x0101010101010101ULL;
+    const uint8_t pv   = static_cast<uint8_t>(pad ^ xr);
+    // @p src == nullptr fills the run with the padded value instead.
+    const auto copy_run = [xr, xr64, pv, icnc](int8_t* dst, const uint8_t* src) noexcept {
+        if (icnc == 16) {
+            uint64_t a0 = 0, a1 = 0;
+            if (src) {
+                std::memcpy(&a0, src, 8);
+                std::memcpy(&a1, src + 8, 8);
+                a0 ^= xr64;
+                a1 ^= xr64;
+            } else {
+                a0 = a1 = static_cast<uint64_t>(pv) * 0x0101010101010101ULL;
+            }
+            std::memcpy(dst, &a0, 8);
+            std::memcpy(dst + 8, &a1, 8);
+        } else if (icnc == 8) {
+            uint64_t a0 = src ? 0 : static_cast<uint64_t>(pv) * 0x0101010101010101ULL;
+            if (src) {
+                std::memcpy(&a0, src, 8);
+                a0 ^= xr64;
+            }
+            std::memcpy(dst, &a0, 8);
+        } else if (src) {
+            for (int j = 0; j < icnc; ++j) { dst[j] = static_cast<int8_t>(src[j] ^ xr); }
+        } else {
+            std::memset(dst, pv, static_cast<size_t>(icnc));
+        }
+    };
+
+    // When every channel of a pixel is in this block and the taps of a filter row
+    // are adjacent in the input, that row of taps is one run in both the input
+    // and the A row (k is tap-major, the input's own order): one XOR copy per
+    // filter row instead of one per tap. The 3-channel stem is the case this
+    // exists for — 21 bytes a row instead of seven 3-byte runs.
+    const bool tap_run = (DW == 1) && (ic_stride == icnc);
+    const auto xor_span = [xr, xr64, pv](int8_t* dst, const uint8_t* src, int n) noexcept {
+        int j = 0;
+        if (!src) {
+            for (; j + 8 <= n; j += 8) { std::memset(dst + j, pv, 8); }
+            for (; j < n; ++j) { dst[j] = static_cast<int8_t>(pv); }
+            return;
+        }
+        for (; j + 8 <= n; j += 8) {
+            uint64_t v = 0;
+            std::memcpy(&v, src + j, 8);
+            v ^= xr64;
+            std::memcpy(dst + j, &v, 8);
+        }
+        if (j < n) {
+            if (n >= 8) {
+                // The tail rides on one overlapping 8-byte copy.
+                j = n - 8;
+                uint64_t v = 0;
+                std::memcpy(&v, src + j, 8);
+                v ^= xr64;
+                std::memcpy(dst + j, &v, 8);
+            } else {
+                for (; j < n; ++j) { dst[j] = static_cast<int8_t>(src[j] ^ xr); }
+            }
+        }
+    };
+
+    int64_t oh = p0 / OW;
+    int ow = static_cast<int>(p0 - oh * OW);
+    for (int m = 0; m < mc; ++m, ++ow) {
+        if (flat && ow == OW) { ow = 0; ++oh; }
+        const int64_t ih0 = oh * SH - PH;
+        const int64_t iw0 = static_cast<int64_t>(ow) * SW - PW;
+        int8_t* row = a + static_cast<int64_t>(m) * lda;
+        if (tap_run) {
+            for (int kh = 0; kh < KH; ++kh) {
+                const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;
+                int8_t* dst = row + static_cast<int64_t>(kh) * KW * icnc;
+                if (ih < 0 || ih >= IH) {
+                    xor_span(dst, nullptr, KW * icnc);
+                    continue;
+                }
+                const uint8_t* hrow = in + ih * in_row_stride;
+                if (iw0 >= 0 && iw0 + KW <= IW) {
+                    xor_span(dst, hrow + iw0 * ic_stride, KW * icnc);
+                } else {
+                    for (int kw = 0; kw < KW; ++kw) {
+                        const int64_t iw = iw0 + kw;
+                        copy_run(dst + kw * icnc,
+                                 (iw >= 0 && iw < IW) ? hrow + iw * ic_stride : nullptr);
+                    }
+                }
+            }
+            if (kdim4 > kdim) {
+                std::memset(row + kdim, 0, static_cast<size_t>(kdim4 - kdim));
+            }
+            continue;
+        }
+        int t = 0;
+        for (int kh = 0; kh < KH; ++kh) {
+            const int64_t ih = ih0 + static_cast<int64_t>(kh) * DH;
+            const bool h_ok = (ih >= 0 && ih < IH);
+            const uint8_t* hrow = in + ih * in_row_stride;
+            for (int kw = 0; kw < KW; ++kw, ++t) {
+                const int64_t iw = iw0 + static_cast<int64_t>(kw) * DW;
+                int8_t* dst = row + static_cast<int64_t>(t) * icnc;
+                copy_run(dst, (h_ok && iw >= 0 && iw < IW)
+                                  ? hrow + iw * ic_stride : nullptr);
+            }
+        }
+        if (kdim4 > kdim) {
+            std::memset(row + kdim, 0, static_cast<size_t>(kdim4 - kdim));
         }
     }
 }

@@ -517,10 +517,18 @@ void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc,
                          const void* src, int64_t src_row_blocks, float scale);
 
 // B is always packed here; panels advance by the aligned nr_max*kc stride.
+//
+// `bias`, when given, is a per-row vector (one value per M row) that the
+// accumulator starts from instead of zero — the tile is then *built*, so
+// `zero_mode` is implied and `c` is never read. Pass it on the block that
+// builds the tile and only that one: a later k-block would re-seed and drop the
+// partial sum. Conv2D uses it to drop its bias seed, a whole write+read of the
+// output tile that existed only to put the bias where the first k-block could
+// accumulate onto it.
 void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr);
 void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr);
 
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
@@ -582,6 +590,26 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
                       int32_t* c, int ldc,
                       const int8_t* packed_a, const int8_t* packed_b,
                       int32_t clamp_min, int32_t clamp_max);
+
+// The same call for a tile's *first* K block, where C is written rather than
+// read: the accumulators are stored instead of loaded and added, so the tile
+// does not have to be zeroed first. They still start at the panel's -128·Σb
+// correction, so the result is the one the accumulate form produces from a
+// zeroed tile.
+void tile_mma_pack_i8_zero(int mc, int nc, int kc,
+                           int32_t* c, int ldc,
+                           const int8_t* packed_a, const int8_t* packed_b,
+                           int32_t clamp_min, int32_t clamp_max);
+
+// Accumulate C[mc][nc] += A[mc][Kc] × B_packed[Kc][nc] (int32) with A read
+// row-major straight from memory (`lda` in int8 elements, one row per M panel;
+// kc must be a multiple of 4, the panel's group size). The int8 mirror of
+// tile_mma_direct: Conv2D's channel-last route gathers its activations into A,
+// so there is no A panel to build.
+void tile_mma_direct_i8(int mc, int nc, int kc,
+                        int32_t* c, int ldc,
+                        const int8_t* a, int lda, const int8_t* packed_b,
+                        int32_t clamp_min, int32_t clamp_max);
 
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
 void xor0x80_i8(int8_t* p, int nbytes);

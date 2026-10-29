@@ -13,7 +13,7 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
-#include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
+#include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -1126,7 +1126,7 @@ NNOPS_TEST(conv2d_i8_plan) {
         auto op = Conv2D::create(f.attrs, Backend::CPU);
         auto outs = op->getOutputTensorDesc(ins);
         const TensorDesc o[] = {outs[0]};
-        return backend::cpu::get_conv2d_plan(f.attrs, ins, o, 1, false);
+        return backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, o, 1, false);
     };
 
     // Pointwise: a dense 1x1 activation reads the plane directly, so there is
@@ -1144,8 +1144,10 @@ NNOPS_TEST(conv2d_i8_plan) {
         NNOPS_EXPECT_TRUE(p.acc_size > 0);
         NNOPS_EXPECT_TRUE(p.pack_size > 0);
         NNOPS_EXPECT_TRUE(p.pack_a_size > 0);
-        NNOPS_EXPECT_TRUE(p.workspace_size >= static_cast<size_t>(
-            p.acc_offset + p.num_slots * p.acc_size * 4));
+        const auto sc = backend::cpu::gemm_scratch_layout(p, 1);
+        NNOPS_EXPECT_EQ(sc.total, static_cast<int64_t>(p.workspace_size));
+        NNOPS_EXPECT_TRUE(sc.off_acc + p.num_slots * p.acc_size * 4 <=
+                          static_cast<int64_t>(p.workspace_size));
     }
 
     // An fp activation is materialized as a compact int8 plane first, so the
@@ -1157,13 +1159,16 @@ NNOPS_TEST(conv2d_i8_plan) {
         NNOPS_EXPECT_EQ(p.col_size, 0);
         NNOPS_EXPECT_EQ(p.quant_size, 1 * 32 * 5 * 5);
         NNOPS_EXPECT_TRUE(p.workspace_size >= static_cast<size_t>(p.quant_size));
-        // The layout contract the kernel relies on: acc_offset/pack_a_offset are
-        // absolute offsets from the arena start, i.e. they already sit past the
-        // plane and past every per-slot col/orig/pack region.
-        NNOPS_EXPECT_TRUE(p.acc_offset >=
-                          p.quant_size + p.num_slots * (p.col_size + p.orig_size + p.pack_size));
-        NNOPS_EXPECT_TRUE(p.pack_a_offset + p.num_slots * p.pack_a_size <=
-                          static_cast<int64_t>(p.workspace_size));
+        // The layout contract the kernel relies on: the plane sits at the arena's
+        // front, the slots start past it, and the acc / packed-A regions are
+        // absolute offsets that already account for both — and the plan's
+        // workspace_size *is* the layout's total, so the sizing and the kernel's
+        // pointers cannot drift.
+        const auto sc = backend::cpu::gemm_scratch_layout(p, 1);
+        NNOPS_EXPECT_EQ(sc.off_acc, sc.head + p.num_slots * sc.slot_stride);
+        NNOPS_EXPECT_TRUE(sc.head >= p.quant_size);
+        NNOPS_EXPECT_EQ(sc.off_pack_a + p.num_slots * p.pack_a_size,
+                        static_cast<int64_t>(p.workspace_size));
     }
 
     // A pitched input leaves pointwise (the im2col path walks the pitch) — but
@@ -1199,7 +1204,7 @@ NNOPS_TEST(conv2d_i8_plan) {
         const int64_t whole = 4 * 16 * 20 * 20;
         for (bool slots : {false, true}) {
             for (int nt : {1, 4}) {
-                const auto p = backend::cpu::get_conv2d_plan(f.attrs, ins, o, nt, slots);
+                const auto p = backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, o, nt, slots);
                 NNOPS_EXPECT_EQ(p.quant_size, whole);
             }
         }
@@ -1237,8 +1242,8 @@ NNOPS_TEST(conv2d_i8_plan) {
         auto op = Conv2D::create(f.attrs, Backend::CPU);
         auto outs = op->getOutputTensorDesc(ins);
         const TensorDesc o[] = {outs[0]};
-        const auto p1 = backend::cpu::get_conv2d_plan(f.attrs, ins, o, 1, false);
-        const auto p4 = backend::cpu::get_conv2d_plan(f.attrs, ins, o, 4, true);
+        const auto p1 = backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, o, 1, false);
+        const auto p4 = backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, o, 4, true);
         NNOPS_EXPECT_TRUE(p4.workspace_size >= p1.workspace_size);
         NNOPS_EXPECT_TRUE(p4.num_slots <= 4);
     }

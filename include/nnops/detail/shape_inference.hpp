@@ -143,7 +143,9 @@ inline detail::SmallVector<int64_t, TensorDesc::kMaxRank> compute_broadcast_shap
 
 /// Conv2D shape inference.
 /// inputs[0] = input  [N, IC, IH, IW]
-/// inputs[1] = weight [OC, IC/G, KH, KW]
+/// inputs[1] = weight [OC, IC/G, KH, KW] — or, for the channel-last weight
+///             (TensorLayout::HWIO, TensorFlow's filter order),
+///             [KH, KW, IC/G, OC]; @p weight_hwio selects the reading.
 /// inputs[2] = bias   [OC] (optional)
 /// Returns: [N, OC, OH, OW]
 inline std::vector<TensorDesc> conv2d_output_shape(
@@ -153,10 +155,11 @@ inline std::vector<TensorDesc> conv2d_output_shape(
     std::span<const int64_t> padding,
     int auto_pad,
     int64_t groups,
-    std::span<const TensorDesc> inputs)
+    std::span<const TensorDesc> inputs,
+    bool weight_hwio = false)
 {
     const auto& in = inputs[0];  // [N, IC, IH, IW]
-    const auto& wt = inputs[1];  // [OC, IC/G, KH, KW]
+    const auto& wt = inputs[1];  // [OC, IC/G, KH, KW] or [KH, KW, IC/G, OC]
 
     TensorDesc out;
     out.rank   = 4;
@@ -165,7 +168,7 @@ inline std::vector<TensorDesc> conv2d_output_shape(
 
     out.dims.resize(4);
     out.dims[0] = in.dims[0];  // N
-    out.dims[1] = wt.dims[0];  // OC
+    out.dims[1] = weight_hwio ? wt.dims[3] : wt.dims[0];  // OC
 
     out.dims[2] = compute_spatial_output_size(
         in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);

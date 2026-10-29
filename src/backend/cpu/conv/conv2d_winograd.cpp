@@ -350,7 +350,7 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
     const int64_t plane_tasks = NB * G * TH * plan.num_tile_blocks;
 
     // Second parallel axis: the filter rows, exactly as Conv2D's im2col plan
-    // grows one (conv2d_im2col.cpp). A 14x14 output plane is 7 tile rows and one
+    // grows one (conv2d_implicit_gemm.cpp). A 14x14 output plane is 7 tile rows and one
     // 8-wide tile block, so the grid is 7 tasks — and the tile axis has nothing
     // left to give, because TW_pad is already one vector wide. Measured on this
     // host (bench_conv2d conv2d_wino_f32_14x14_256ch, ResNet-18's layer3.x): 20

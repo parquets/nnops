@@ -20,7 +20,7 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/ops/layout_convert.hpp"
-#include "backend/cpu/conv/conv2d_im2col.h"   // get_conv2d_plan, Conv2DPlan
+#include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
 #include "backend/cpu/conv/conv2d_winograd.h" // get_conv2d_winograd_plan
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
@@ -141,7 +141,7 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
 
     // Plan resolved at the largest thread count (shows the max oh-chunk split).
     // The bench pool reports thread ids, so the per-thread scratch sizing applies.
-    const cpu::Conv2DPlan plan = cpu::get_conv2d_plan(attrs, descs, out_descs, threads.back(),
+    const cpu::Conv2DGemmPlan plan = cpu::get_conv2d_implicit_gemm_plan(attrs, descs, out_descs, threads.back(),
                                                       /*use_thread_slots=*/true);
 
     std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
@@ -672,7 +672,7 @@ struct I8Op {
         // Resolved at the thread count the pair runs on, with per-thread scratch
         // sized in — the bench pool reports thread ids. A single thread runs on
         // a bare ComputeContext, which reports none, so it is sized per task.
-        plan = cpu::get_conv2d_plan(attrs, descs, outs, plan_threads,
+        plan = cpu::get_conv2d_implicit_gemm_plan(attrs, descs, outs, plan_threads,
                                     /*use_thread_slots=*/plan_threads > 1);
         work = 2.0 * static_cast<double>(N) * OC * OH * OW *
                static_cast<double>(icg) * c.KH * c.KW;
@@ -689,7 +689,7 @@ struct I8Op {
     std::vector<TensorView> ins;
     TensorView out;
     std::unique_ptr<Conv2D> op;
-    cpu::Conv2DPlan plan{};
+    cpu::Conv2DGemmPlan plan{};
     int64_t OH = 0, OW = 0, icg = 0;
     double work = 0.0;   // MACs per call
 };
@@ -1040,7 +1040,7 @@ struct ConvSweepOp {
         out = test::make_planar(out_descs[0], out_buf.data());
         ins = {in, w};
 
-        const cpu::Conv2DPlan plan = cpu::get_conv2d_plan(
+        const cpu::Conv2DGemmPlan plan = cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, meta_threads, /*use_thread_slots=*/true);
         icn   = plan.icn_block;
         ocn   = plan.ocn_block;

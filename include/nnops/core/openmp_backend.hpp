@@ -80,7 +80,7 @@ inline CpuBackend openmp_backend(int nthreads = 0) {
         // runner it cost 6 ms of an 18 ms forward — every op that followed a
         // narrow one paid for the rebuild. So a caller with few items should
         // give the pool more tasks (the conv plan splits its oc-blocks for
-        // exactly this, conv2d_im2col.cpp) rather than shrink the team.
+        // exactly this, conv2d_implicit_gemm.cpp) rather than shrink the team.
         const int nt = nthreads > 0 ? nthreads : omp_get_max_threads();
 #pragma omp parallel for schedule(static) num_threads(nt)
         for (int64_t i = begin; i < end; ++i) {

@@ -229,12 +229,13 @@ inline void mma_packed_ab_mr8_nr16_mrxncxkc_f16(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 inline void mma_packed_b_mr8_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
     const float16_t* NNOPS_RESTRICT A, int lda,
     const float16_t* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
@@ -259,16 +260,24 @@ inline void mma_packed_b_mr8_nr16_mrxncxkc_f16(
     const float16x8_t vmin = vdupq_n_f16(cmin);
     const float16x8_t vmax = vdupq_n_f16(cmax);
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        float16x8_t v = vdupq_n_f16(0.0f16);
+        if constexpr (with_bias) { v = vdupq_n_f16(bias[r]); }
+        return v;
+    };
     int n = 0;
     for (; n < nc - 15; n += 16) {
-        float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = c00;
-        float16x8_t c10 = vdupq_n_f16(0.0f16), c11 = c10;
-        float16x8_t c20 = vdupq_n_f16(0.0f16), c21 = c20;
-        float16x8_t c30 = vdupq_n_f16(0.0f16), c31 = c30;
-        float16x8_t c40 = vdupq_n_f16(0.0f16), c41 = c40;
-        float16x8_t c50 = vdupq_n_f16(0.0f16), c51 = c50;
-        float16x8_t c60 = vdupq_n_f16(0.0f16), c61 = c60;
-        float16x8_t c70 = vdupq_n_f16(0.0f16), c71 = c70;
+        float16x8_t c00 = init_row(0), c01 = c00;
+        float16x8_t c10 = init_row(r1), c11 = c10;
+        float16x8_t c20 = init_row(r2), c21 = c20;
+        float16x8_t c30 = init_row(r3), c31 = c30;
+        float16x8_t c40 = init_row(r4), c41 = c40;
+        float16x8_t c50 = init_row(r5), c51 = c50;
+        float16x8_t c60 = init_row(r6), c61 = c60;
+        float16x8_t c70 = init_row(r7), c71 = c70;
 
         const float16_t* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float16_t* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -361,14 +370,14 @@ inline void mma_packed_b_mr8_nr16_mrxncxkc_f16(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = c00;
-        float16x8_t c10 = vdupq_n_f16(0.0f16), c11 = c10;
-        float16x8_t c20 = vdupq_n_f16(0.0f16), c21 = c20;
-        float16x8_t c30 = vdupq_n_f16(0.0f16), c31 = c30;
-        float16x8_t c40 = vdupq_n_f16(0.0f16), c41 = c40;
-        float16x8_t c50 = vdupq_n_f16(0.0f16), c51 = c50;
-        float16x8_t c60 = vdupq_n_f16(0.0f16), c61 = c60;
-        float16x8_t c70 = vdupq_n_f16(0.0f16), c71 = c70;
+        float16x8_t c00 = init_row(0), c01 = c00;
+        float16x8_t c10 = init_row(r1), c11 = c10;
+        float16x8_t c20 = init_row(r2), c21 = c20;
+        float16x8_t c30 = init_row(r3), c31 = c30;
+        float16x8_t c40 = init_row(r4), c41 = c40;
+        float16x8_t c50 = init_row(r5), c51 = c50;
+        float16x8_t c60 = init_row(r6), c61 = c60;
+        float16x8_t c70 = init_row(r7), c71 = c70;
 
         const float16_t* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float16_t* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -619,12 +628,13 @@ inline void mma_packed_ab_mr4_nr16_mrxncxkc_f16(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 inline void mma_packed_b_mr4_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
     const float16_t* NNOPS_RESTRICT A, int lda,
     const float16_t* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
@@ -641,12 +651,20 @@ inline void mma_packed_b_mr4_nr16_mrxncxkc_f16(
     const float16x8_t vmin = vdupq_n_f16(cmin);
     const float16x8_t vmax = vdupq_n_f16(cmax);
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        float16x8_t v = vdupq_n_f16(0.0f16);
+        if constexpr (with_bias) { v = vdupq_n_f16(bias[r]); }
+        return v;
+    };
     int n = 0;
     for (; n < nc - 15; n += 16) {
-        float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = c00;
-        float16x8_t c10 = vdupq_n_f16(0.0f16), c11 = c10;
-        float16x8_t c20 = vdupq_n_f16(0.0f16), c21 = c20;
-        float16x8_t c30 = vdupq_n_f16(0.0f16), c31 = c30;
+        float16x8_t c00 = init_row(0), c01 = c00;
+        float16x8_t c10 = init_row(r1), c11 = c10;
+        float16x8_t c20 = init_row(r2), c21 = c20;
+        float16x8_t c30 = init_row(r3), c31 = c30;
 
         const float16_t* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float16_t* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -703,10 +721,10 @@ inline void mma_packed_b_mr4_nr16_mrxncxkc_f16(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = c00;
-        float16x8_t c10 = vdupq_n_f16(0.0f16), c11 = c10;
-        float16x8_t c20 = vdupq_n_f16(0.0f16), c21 = c20;
-        float16x8_t c30 = vdupq_n_f16(0.0f16), c31 = c30;
+        float16x8_t c00 = init_row(0), c01 = c00;
+        float16x8_t c10 = init_row(r1), c11 = c10;
+        float16x8_t c20 = init_row(r2), c21 = c20;
+        float16x8_t c30 = init_row(r3), c31 = c30;
 
         const float16_t* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float16_t* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -884,12 +902,13 @@ inline void mma_packed_ab_mr1_nr16_mrxncxkc_f16(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, float16_t* NNOPS_RESTRICT C, int ldc,
     const float16_t* NNOPS_RESTRICT A, int lda,
     const float16_t* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float16_t* NNOPS_RESTRICT bias = nullptr) noexcept {
     (void)mr;    // one row, so the row count never varies
     (void)lda;   // A is read consecutively along its single row
     (void)ldc;   // one row, so the C row stride never applies
@@ -902,9 +921,17 @@ inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
     const float16x8_t vmin = vdupq_n_f16(cmin);
     const float16x8_t vmax = vdupq_n_f16(cmax);
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        float16x8_t v = vdupq_n_f16(0.0f16);
+        if constexpr (with_bias) { v = vdupq_n_f16(bias[r]); }
+        return v;
+    };
     int n = 0;
     for (; n < nc - 15; n += 16) {
-        float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = c00;
+        float16x8_t c00 = init_row(0), c01 = c00;
 
         const float16_t* NNOPS_RESTRICT a_ptr = A;
         const float16_t* NNOPS_RESTRICT b_ptr = B;
@@ -933,7 +960,7 @@ inline void mma_packed_b_mr1_nr16_mrxncxkc_f16(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float16x8_t c00 = vdupq_n_f16(0.0f16), c01 = c00;
+        float16x8_t c00 = init_row(0), c01 = c00;
 
         const float16_t* NNOPS_RESTRICT a_ptr = A;
         const float16_t* NNOPS_RESTRICT b_ptr = B;
@@ -992,10 +1019,10 @@ inline constexpr auto mma_pack_fns_f16 = std::array{
     &mma_packed_ab_mr4_nr16_mrxncxkc_f16<Z>,
     &mma_packed_ab_mr1_nr16_mrxncxkc_f16<Z>};
 
-template <bool Z>
+template <bool Z, bool B = false>
 inline constexpr auto mma_direct_fns_f16 = std::array{
-    &mma_packed_b_mr8_nr16_mrxncxkc_f16<Z>,
-    &mma_packed_b_mr4_nr16_mrxncxkc_f16<Z>,
-    &mma_packed_b_mr1_nr16_mrxncxkc_f16<Z>};
+    &mma_packed_b_mr8_nr16_mrxncxkc_f16<Z, B>,
+    &mma_packed_b_mr4_nr16_mrxncxkc_f16<Z, B>,
+    &mma_packed_b_mr1_nr16_mrxncxkc_f16<Z, B>};
 
 }  // namespace nnops::backend::cpu::aarch64

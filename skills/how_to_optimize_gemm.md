@@ -707,8 +707,9 @@ multi-threaded measurement shows.
 
 The same W8A8 shape one level up: the weight is A (M = OC/G, K = IC/G·karea,
 s8 with per-output-channel parameters) and the im2col tile is B (N =
-oh_block·OW, same K, s8/u8 per-tensor). `conv2d_im2col_kernel` forwards to
-`conv2d_int8_kernel` ([conv2d_im2col_int8.cpp](../src/backend/cpu/conv/conv2d_im2col_int8.cpp))
+oh_block·OW, same K, s8/u8 per-tensor). `conv2d_implicit_gemm_kernel` forwards
+to the planar route's `conv2d_planar_int8_run`
+([conv2d_implicit_gemm.cpp](../src/backend/cpu/conv/conv2d_implicit_gemm.cpp))
 whenever `is_quantized_conv2d(w)`, so the operator, the plan, the
 (batch, group, oh-chunk) decomposition and the scratch slots are unchanged; the
 plan only grows an int32 accumulator (`acc_size`) and a packed-weight region

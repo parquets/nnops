@@ -116,7 +116,7 @@ template <typename T>
 using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float);
 template <typename T>
 using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
-                          float, float);
+                          float, float, const T*);
 
 template <typename T>
 AbKernel<T> ab_fn(int level) {
@@ -158,31 +158,31 @@ BKernel<T> b_fn(int level) {
 #ifdef NNOPS_ARCH_X86_64
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return mma_packed_b_mr6_nr16_mrxncxkc_f32<false>;
-        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f32<false>;
-        case 2: return mma_packed_b_mr2_nr16_mrxncxkc_f32<false>;
-        default: return mma_packed_b_mr1_nr16_mrxncxkc_f32<false>;
+        case 6: return mma_packed_b_mr6_nr16_mrxncxkc_f32<false, false>;
+        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f32<false, false>;
+        case 2: return mma_packed_b_mr2_nr16_mrxncxkc_f32<false, false>;
+        default: return mma_packed_b_mr1_nr16_mrxncxkc_f32<false, false>;
         }
     } else {
         switch (level) {
-        case 6: return mma_packed_b_mr6_nr16_mrxncxkc_f16<false>;
-        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f16<false>;
-        case 2: return mma_packed_b_mr2_nr16_mrxncxkc_f16<false>;
-        default: return mma_packed_b_mr1_nr16_mrxncxkc_f16<false>;
+        case 6: return mma_packed_b_mr6_nr16_mrxncxkc_f16<false, false>;
+        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f16<false, false>;
+        case 2: return mma_packed_b_mr2_nr16_mrxncxkc_f16<false, false>;
+        default: return mma_packed_b_mr1_nr16_mrxncxkc_f16<false, false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return mma_packed_b_mr8_nr12_mrxncxkc_f32<false>;
-        case 4: return mma_packed_b_mr4_nr12_mrxncxkc_f32<false>;
-        default: return mma_packed_b_mr1_nr12_mrxncxkc_f32<false>;
+        case 8: return mma_packed_b_mr8_nr12_mrxncxkc_f32<false, false>;
+        case 4: return mma_packed_b_mr4_nr12_mrxncxkc_f32<false, false>;
+        default: return mma_packed_b_mr1_nr12_mrxncxkc_f32<false, false>;
         }
     } else {
         switch (level) {
-        case 8: return mma_packed_b_mr8_nr16_mrxncxkc_f16<false>;
-        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f16<false>;
-        default: return mma_packed_b_mr1_nr16_mrxncxkc_f16<false>;
+        case 8: return mma_packed_b_mr8_nr16_mrxncxkc_f16<false, false>;
+        case 4: return mma_packed_b_mr4_nr16_mrxncxkc_f16<false, false>;
+        default: return mma_packed_b_mr1_nr16_mrxncxkc_f16<false, false>;
         }
     }
 #endif
@@ -257,7 +257,7 @@ void bench_b(const char* dtype, int kc) {
     for (int mr = 1; mr <= MR; ++mr) {
         const double g = time_kernel<T>(
             [&](T* c) {
-                fn(mr, NR, kc, c, NR, A.data(), lda, B.data(), -1e30f, 1e30f);
+                fn(mr, NR, kc, c, NR, A.data(), lda, B.data(), -1e30f, 1e30f, nullptr);
             },
             mr, MR, NR, NR, kc, REPS);
         std::printf("      mr=%d/%d  %8.1f GFLOPS\n", mr, MR, g);
@@ -348,7 +348,7 @@ void bench_nc_b(const char* dtype) {
         const int reps = reps_for(MR, nc, NC_KC);
         const double g = time_kernel<T>(
             [&](T* c) {
-                fn(MR, nc, NC_KC, c, NC_LDC, A.data(), lda, B.data(), -1e30f, 1e30f);
+                fn(MR, nc, NC_KC, c, NC_LDC, A.data(), lda, B.data(), -1e30f, 1e30f, nullptr);
             },
             MR, MR, nc, NC_LDC, NC_KC, reps);
         rows.push_back({nc, g});
@@ -434,7 +434,7 @@ void bench_large_nc_b(const char* dtype) {
         fill_random<T>(B.data(), B.size(), 0xF00D ^ static_cast<uint64_t>(nc));
         return time_kernel<T>(
             [&](T* c) {
-                fn(MR, nc, NC_KC, c, nc, A.data(), lda, B.data(), -1e30f, 1e30f);
+                fn(MR, nc, NC_KC, c, nc, A.data(), lda, B.data(), -1e30f, 1e30f, nullptr);
             },
             MR, MR, nc, nc, NC_KC, reps);
     });

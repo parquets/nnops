@@ -6,7 +6,7 @@
 /// plan-driven dispatch and the public entry point. The two alternate routes
 /// that bypass the plan altogether are self-contained enough to live in their
 /// own files — the same variant-per-file split Conv2D uses
-/// (conv2d_im2col / conv2d_winograd):
+/// (conv2d_implicit_gemm / conv2d_winograd):
 ///
 ///   - matmul_small.cpp         — the naive SIMD kernel below
 ///                                GEMM_FAST_PATH_THRESHOLD MACs, and the direct

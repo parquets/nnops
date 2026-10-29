@@ -1035,12 +1035,13 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     // Rows past `mr` alias the last live row in both A and C: they compute a
     // duplicate of it and store it back to the same place, so a partial-M tile
@@ -1060,6 +1061,15 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        __m256 v = _mm256_setzero_ps();
+        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
+        return v;
+    };
+
     int n = 0;
 
     for(; n < nc - 15; n += 16) {
@@ -1070,18 +1080,18 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         const float* a4_ptr = A + r4 * lda;
         const float* a5_ptr = A + r5 * lda;
 
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc2x01234567 = v_acc0x01234567;
-        __m256 v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc3x01234567 = v_acc0x01234567;
-        __m256 v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc4x01234567 = v_acc0x01234567;
-        __m256 v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc5x01234567 = v_acc0x01234567;
-        __m256 v_acc5x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init_row(0);
+        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc1x01234567 = init_row(r1);
+        __m256 v_acc1x89abcdef = v_acc1x01234567;
+        __m256 v_acc2x01234567 = init_row(r2);
+        __m256 v_acc2x89abcdef = v_acc2x01234567;
+        __m256 v_acc3x01234567 = init_row(r3);
+        __m256 v_acc3x89abcdef = v_acc3x01234567;
+        __m256 v_acc4x01234567 = init_row(r4);
+        __m256 v_acc4x89abcdef = v_acc4x01234567;
+        __m256 v_acc5x01234567 = init_row(r5);
+        __m256 v_acc5x89abcdef = v_acc5x01234567;
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1178,17 +1188,17 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         const float* a3_ptr = A + r3 * lda;
         const float* a4_ptr = A + r4 * lda;
         const float* a5_ptr = A + r5 * lda;
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init_row(0);
         __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
+        __m256 v_acc1x01234567 = init_row(r1);
         __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = _mm256_setzero_ps();
+        __m256 v_acc2x01234567 = init_row(r2);
         __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = _mm256_setzero_ps();
+        __m256 v_acc3x01234567 = init_row(r3);
         __m256 v_acc3x89abcdef = v_acc3x01234567;
-        __m256 v_acc4x01234567 = _mm256_setzero_ps();
+        __m256 v_acc4x01234567 = init_row(r4);
         __m256 v_acc4x89abcdef = v_acc4x01234567;
-        __m256 v_acc5x01234567 = _mm256_setzero_ps();
+        __m256 v_acc5x01234567 = init_row(r5);
         __m256 v_acc5x89abcdef = v_acc5x01234567;
 
         const float* b_ptr = B;
@@ -1418,12 +1428,13 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     // Rows past `mr` alias the last live row in both A and C: they compute a
     // duplicate of it and store it back to the same place, so a partial-M tile
@@ -1439,6 +1450,15 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        __m256 v = _mm256_setzero_ps();
+        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
+        return v;
+    };
+
     int n = 0;
 
     for(; n < nc - 15; n += 16) {
@@ -1447,14 +1467,14 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         const float* a2_ptr = A + r2 * lda;
         const float* a3_ptr = A + r3 * lda;
 
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc2x01234567 = v_acc0x01234567;
-        __m256 v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc3x01234567 = v_acc0x01234567;
-        __m256 v_acc3x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init_row(0);
+        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc1x01234567 = init_row(r1);
+        __m256 v_acc1x89abcdef = v_acc1x01234567;
+        __m256 v_acc2x01234567 = init_row(r2);
+        __m256 v_acc2x89abcdef = v_acc2x01234567;
+        __m256 v_acc3x01234567 = init_row(r3);
+        __m256 v_acc3x89abcdef = v_acc3x01234567;
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1528,13 +1548,13 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         const float* a1_ptr = A + r1 * lda;
         const float* a2_ptr = A + r2 * lda;
         const float* a3_ptr = A + r3 * lda;
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init_row(0);
         __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
+        __m256 v_acc1x01234567 = init_row(r1);
         __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = _mm256_setzero_ps();
+        __m256 v_acc2x01234567 = init_row(r2);
         __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = _mm256_setzero_ps();
+        __m256 v_acc3x01234567 = init_row(r3);
         __m256 v_acc3x89abcdef = v_acc3x01234567;
 
         const float* b_ptr = B;
@@ -1711,12 +1731,13 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     // Rows past `mr` alias the last live row in both A and C: they compute a
     // duplicate of it and store it back to the same place, so a partial-M tile
@@ -1728,16 +1749,25 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        __m256 v = _mm256_setzero_ps();
+        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
+        return v;
+    };
+
     int n = 0;
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
 
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init_row(0);
+        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc1x01234567 = init_row(r1);
+        __m256 v_acc1x89abcdef = v_acc1x01234567;
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1788,9 +1818,9 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
         // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init_row(0);
         __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
+        __m256 v_acc1x01234567 = init_row(r1);
         __m256 v_acc1x89abcdef = v_acc1x01234567;
 
         const float* b_ptr = B;
@@ -1914,12 +1944,13 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, bool with_bias = false>
 void mma_packed_b_mr1_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     (void)mr;   // one row, so the row count never varies
     (void)ldc;  // one row, so neither the A nor the C row stride applies
@@ -1929,13 +1960,22 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
+    // Row initial value: the bias when this call folds it (tile_mma_direct's
+    // bias argument), zero otherwise. A row past `mr` aliases the last live
+    // row in A and C, so the same alias index keeps this read in range.
+    const auto init_row = [&](int r) {
+        __m256 v = _mm256_setzero_ps();
+        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
+        return v;
+    };
+
     int n = 0;
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A;
 
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init_row(0);
+        __m256 v_acc0x89abcdef = v_acc0x01234567;
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1975,7 +2015,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
         // one 8-lane read; a wider tail reads both halves and reuses the
         // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init_row(0);
         __m256 v_acc0x89abcdef = v_acc0x01234567;
 
         const float* b_ptr = B;
@@ -2082,10 +2122,10 @@ inline constexpr auto mma_pack_fns_f32 = std::array{
     &mma_packed_ab_mr4_nr16_mrxncxkc_f32<Z>,
     &mma_packed_ab_mr1_nr16_mrxncxkc_f32<Z>};
 
-template <bool Z>
+template <bool Z, bool B = false>
 inline constexpr auto mma_direct_fns_f32 = std::array{
-    &mma_packed_b_mr6_nr16_mrxncxkc_f32<Z>,
-    &mma_packed_b_mr4_nr16_mrxncxkc_f32<Z>,
-    &mma_packed_b_mr1_nr16_mrxncxkc_f32<Z>};
+    &mma_packed_b_mr6_nr16_mrxncxkc_f32<Z, B>,
+    &mma_packed_b_mr4_nr16_mrxncxkc_f32<Z, B>,
+    &mma_packed_b_mr1_nr16_mrxncxkc_f32<Z, B>};
 
 }
