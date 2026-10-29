@@ -1513,20 +1513,21 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     constexpr float kInf = std::numeric_limits<float>::infinity();
 
     // ---- the finish decision ----------------------------------------------
-    // A pure clamp with no bias and no residual folds into the MMA store, the
-    // same fold the planar route makes. Everything else needs a pass over the
-    // finished tile: the bias is per *column* here (the accumulator's rows are
-    // pixels), so the micro-kernel's per-row seed cannot carry it.
+    // A pure clamp folds into the MMA store, the same fold the planar route
+    // makes. That includes the biased case: the bias is per *column* here (the
+    // accumulator's rows are pixels), so it cannot ride the micro-kernel's
+    // per-row seed, but it can be written into the tile before the first k
+    // block — which leaves the clamp with nothing else to do.
     float clamp_lo = -kInf;
     float clamp_hi = kInf;
     bool epi_folded = false;
     if (!attrs.add_to) {
         switch (attrs.epilogue.type) {
         case EpilogueActivateType::Relu:
-            if (!has_bias) { clamp_lo = 0.0f; epi_folded = true; }
+            clamp_lo = 0.0f; epi_folded = true;
             break;
         case EpilogueActivateType::Relu6:
-            if (!has_bias) { clamp_lo = 0.0f; clamp_hi = 6.0f; epi_folded = true; }
+            clamp_lo = 0.0f; clamp_hi = 6.0f; epi_folded = true;
             break;
         default:
             break;
@@ -1540,14 +1541,16 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     // *after* it, so the original tile is preserved instead.
     const bool keep_orig = attrs.add_to && epi_pass;
 
-    // The seed is where the bias is added on the add_to route (it is per column,
-    // so the micro-kernel cannot do it): the accumulator then starts at
-    // `bias [+ residual]` and the epilogue must not add the bias a second time.
-    // Everywhere else the MMA overwrites the tile and the bias rides in the
-    // finish pass. With add_to the tile is always pre-loaded, so the MMA must
-    // never zero it.
+    // The tile is seeded with the bias on *every* route (it is per column, so
+    // the micro-kernel's per-row seed cannot carry it): add_to's seed also
+    // carries the residual, everything else is the bias row alone. The seed is
+    // a plain store, where the finish pass it replaces read the tile back as
+    // well — and it is what lets the clamp fold, which is every conv in
+    // MobileNetV2. With a seed the tile is pre-loaded, so the MMA must never
+    // zero it.
     const bool seed_bias = attrs.add_to && has_bias;
-    const bool need_epi  = epi_pass || (has_bias && !attrs.add_to);
+    const bool bias_seed = has_bias && !attrs.add_to;
+    const bool need_epi  = epi_pass;
 
     // ---- block geometry ----------------------------------------------------
     const int64_t num_ic_blocks = (ic_per_group + icn_block - 1) / icn_block;
@@ -1744,19 +1747,26 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                                 tile_zero<T>(tile, static_cast<int>(OC), mc,
                                              static_cast<int>(ocnc));
                             }
+                        } else if (icn == 0 && bias_seed) {
+                            // Bias only: a store per element, against the load
+                            // and store the finish pass would have spent on the
+                            // same tile. The MMA then accumulates onto it.
+                            tile_seed<T>(tile, static_cast<int>(OC), mc,
+                                         static_cast<int>(ocnc), bias_g + ocn,
+                                         /*add=*/false);
                         }
 
                         tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
                                         tile, static_cast<int>(OC),
                                         a, lda, b_panel, c_lo, c_hi,
-                                        /*zero_mode=*/icn == 0 && !attrs.add_to,
+                                        /*zero_mode=*/icn == 0 && !attrs.add_to &&
+                                                       !bias_seed,
                                         nullptr);
 
                         if (is_last_icn && need_epi) {
                             epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,
                                                 static_cast<int>(OC),
-                                                (has_bias && !attrs.add_to)
-                                                    ? bias_g + ocn : nullptr,
+                                                nullptr,
                                                 attrs.epilogue,
                                                 keep_orig ? orig_tile : nullptr,
                                                 keep_orig);
@@ -2449,7 +2459,14 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     plan.pointwise = (karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
                       attrs.padding[0] == 0 && attrs.padding[1] == 0);
 
-    plan.icn_block = std::min<int64_t>(get_ic_block_nhwc(karea, ic_per_group),
+    // The ladder's cap exists for the gathered routes, whose A panel is
+    // icn_block * karea wide. A pointwise route reads the pixels in place and
+    // has no A panel at all, so K runs the whole channel count in one pass —
+    // the same rule the planar plan uses. Splitting 576 into 256+256+64 costs
+    // three accumulator passes for the headroom nothing uses.
+    plan.icn_block = plan.pointwise
+                   ? ic_per_group
+                   : std::min<int64_t>(get_ic_block_nhwc(karea, ic_per_group),
                                        ic_per_group);
     // Balance the oc blocks instead of taking kOcnBlock and leaving a sliver: the
     // accumulator fill, the A pack and the epilogue are per oc block, so an
@@ -2550,7 +2567,12 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     const int64_t shared_elems =
         G * (nfull_ic * num_oc_blocks * set_full
              + (tail_ic ? num_oc_blocks * set_tail : 0));
-    const bool shared = shared_elems * esz <= kPrepackCap;
+    // One set per (ic block, oc block), and a block is ocn_block wide — but the
+    // filter split divides N evenly, not in blocks (that is the point of it: 96
+    // oc split seven ways is the shape a starved plane wants). Such a task's
+    // columns straddle two blocks, which one set cannot serve, so a split
+    // filter axis packs per task instead.
+    const bool shared = shared_elems * esz <= kPrepackCap && plan.oc_chunks == 1;
 
     plan.shared_elems = shared ? shared_elems : 0;
     plan.pack_size = shared ? 0 : set_full;

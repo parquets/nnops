@@ -58,10 +58,20 @@ struct RowGeometry {
 };
 
 /// Derive the row geometry shared by every element-wise float kernel.
+///
+/// A channel-last tensor's "row" is one whole spatial line — W pixels × C
+/// channels, which is also its pitch — and there are N × H of them
+/// (`total_rows()` already counts that way). Without this, last_dim would be W
+/// and the kernel would rewrite the first W elements of every pixel line.
 inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& output) {
     const int64_t total = input.numel();
     const int64_t rank  = input.rank();
-    const int64_t last_dim = (rank >= 1) ? input.shape(rank - 1) * input.channel_pack_size() : 1;
+    int64_t last_dim = 1;
+    if (rank >= 1) {
+        last_dim = (rank >= 3 && is_channel_last(input.layout()))
+                       ? input.shape(1) * input.shape(rank - 1)
+                       : input.shape(rank - 1) * input.channel_pack_size();
+    }
     const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;
     return { last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems() };
 }

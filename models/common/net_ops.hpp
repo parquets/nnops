@@ -19,6 +19,7 @@
 #include "nnops/ops/norm.hpp"
 #include "nnops/ops/pooling.hpp"
 
+#include "model_check.hpp"
 #include "model_io.hpp"
 #include "model_prof.hpp"
 
@@ -50,6 +51,25 @@ inline int model_threads()
         return (v > 0) ? static_cast<int>(v) : 0;
     }();
     return n;
+}
+
+/// True when the runners should build their graph channel-last — NHWC
+/// activations with the TensorFlow filter orders (HWIO for a conv, HWCM for a
+/// depthwise) — from NNOPS_MODEL_LAYOUT=nhwc.
+///
+/// Off by default: the checkpoints recorded in the artifact are NCHW, so the
+/// channel-last arm converts its activations back to compare (see
+/// planar_copy_of below). A channel-last runner also has to fold the BN: the
+/// Norm operator is planar, and here the fold is what the fused path does
+/// anyway.
+inline bool channel_last()
+{
+    static const bool on = [] {
+        const char* s = std::getenv("NNOPS_MODEL_LAYOUT");
+        if (s == nullptr) { return false; }
+        return std::strcmp(s, "nhwc") == 0 || std::strcmp(s, "NHWC") == 0;
+    }();
+    return on;
 }
 
 /// The ComputeContext every wrapper hands to compute(). A model-level bench
@@ -84,10 +104,114 @@ Buf run(const char* what, Op& op, std::span<const TensorView> inputs)
     return out;
 }
 
+namespace detail {
+
+/// A filter reordered into the order a channel-last activation reads.
+struct WeightCopy {
+    std::vector<int64_t> shape;  ///< the source's, to catch a reused address
+    Buf buf;
+};
+
+/// The copy already made from @p w, or nullptr. Same key and the same guard as
+/// folded(): the artifact hands out one view per tensor, so the address
+/// identifies it — but only while the tensor is alive, hence the shape check.
+inline const TensorView* find_copy(std::map<const void*, WeightCopy>& cache,
+                                   const TensorView& w)
+{
+    auto it = cache.find(w.ptr<float>());
+    if (it == cache.end()) { return nullptr; }
+    bool same = static_cast<int64_t>(it->second.shape.size()) == w.rank();
+    for (int64_t d = 0; same && d < w.rank(); ++d) {
+        same = it->second.shape[static_cast<size_t>(d)] == w.shape(d);
+    }
+    return same ? &it->second.buf.view : nullptr;
+}
+
+inline const TensorView& store_copy(std::map<const void*, WeightCopy>& cache,
+                                    const TensorView& w, Buf buf)
+{
+    WeightCopy& slot = cache[w.ptr<float>()];
+    slot.shape.assign(w.shape(), w.shape() + w.rank());
+    slot.buf = std::move(buf);
+    return slot.buf.view;
+}
+
+}  // namespace detail
+
+/// The conv filter in TensorFlow's order — torch's [OC, IC/G, KH, KW] to
+/// [KH, KW, IC/G, OC] — which is what a channel-last activation reads: the
+/// output channel is the contiguous axis, so a B panel is a copy, not a gather.
+/// A load-time transform cached per weight buffer, like the Winograd U below.
+inline const TensorView& hwio_weight(const TensorView& w)
+{
+    static std::map<const void*, detail::WeightCopy> cache;
+    if (const TensorView* hit = detail::find_copy(cache, w)) { return *hit; }
+
+    const int64_t OC  = w.shape(0);
+    const int64_t ICG = w.shape(1);
+    const int64_t KH  = w.shape(2);
+    const int64_t KW  = w.shape(3);
+    TensorDesc d;
+    d.rank = 4;
+    d.dtype = w.data_type();
+    d.layout = nnops::TensorLayout::HWIO;
+    d.dims.resize(4);
+    d.dims[0] = KH; d.dims[1] = KW; d.dims[2] = ICG; d.dims[3] = OC;
+    Buf buf = alloc(d);
+
+    // Writes are the contiguous run, reads are a column of the source: one
+    // output channel's K values are ICG·KH·KW apart.
+    const float* src = w.ptr<float>();
+    float* dst = buf.ptr();
+    const int64_t taps = KH * KW;
+    for (int64_t t = 0; t < taps; ++t) {
+        for (int64_t i = 0; i < ICG; ++i) {
+            const float* s = src + i * taps + t;
+            float* o = dst + (t * ICG + i) * OC;
+            for (int64_t c = 0; c < OC; ++c) { o[c] = s[c * ICG * taps]; }
+        }
+    }
+    return detail::store_copy(cache, w, std::move(buf));
+}
+
+/// The depthwise filter in TensorFlow's order — torch's [C, 1, KH, KW] to
+/// [KH, KW, C] — the order whose tap stride *is* the channel count, so one
+/// vector load is one tap of eight channels.
+inline const TensorView& hwcm_weight(const TensorView& w)
+{
+    static std::map<const void*, detail::WeightCopy> cache;
+    if (const TensorView* hit = detail::find_copy(cache, w)) { return *hit; }
+
+    const int64_t C  = w.shape(0);
+    const int64_t KH = w.shape(2);
+    const int64_t KW = w.shape(3);
+    TensorDesc d;
+    d.rank = 3;
+    d.dtype = w.data_type();
+    d.layout = nnops::TensorLayout::HWCM;
+    d.dims.resize(3);
+    d.dims[0] = KH; d.dims[1] = KW; d.dims[2] = C;
+    Buf buf = alloc(d);
+
+    const float* src = w.ptr<float>();
+    float* dst = buf.ptr();
+    const int64_t taps = KH * KW;
+    for (int64_t t = 0; t < taps; ++t) {
+        for (int64_t c = 0; c < C; ++c) {
+            dst[t * C + c] = src[c * taps + t];
+        }
+    }
+    return detail::store_copy(cache, w, std::move(buf));
+}
+
 /// The Winograd-transformed copy of a 3×3 weight (U = G·g·Gᵀ), made once per
 /// weight buffer — the artifact hands out one view per tensor, so the pointer
 /// identifies it, and a runner that calls conv2d per layer pays for the
 /// transform once.
+///
+/// The weight's layout picks the U form: OIHW gives the planar [16][OC][IC/G],
+/// HWIO the channel-last panels, so a channel-last caller passes the HWIO view
+/// (a distinct buffer, hence a distinct cache entry).
 inline const TensorView& winograd_weight(const TensorView& w,
                                          const nnops::Conv2DAttributes& attrs)
 {
@@ -116,6 +240,11 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
                       const char* wino_row = "conv2d/wino",
                       const char* gemm_row = "conv2d/im2col")
 {
+    // The layout of the activation picks the filter order: torch's OIHW for a
+    // planar input, HWIO for a channel-last one. Both read the same numbers —
+    // the copy is a load-time transform, cached per weight buffer.
+    const TensorView wl =
+        nnops::is_channel_last(x.layout()) ? hwio_weight(w) : w;
     const bool wino = nnops::winograd_applicable(
         attrs, x.shape(1) / attrs.groups, x.shape(2), x.shape(3));
     // The route is in the row name, so the profile can price the two against
@@ -123,9 +252,9 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // a folded conv and a plain one do not share a line.
     ProfScope prof(wino ? wino_row : gemm_row);
     auto op = nnops::Conv2D::create(attrs, Backend::CPU);
-    const TensorView u = wino ? winograd_weight(w, attrs) : w;
+    const TensorView u = wino ? winograd_weight(wl, attrs) : wl;
 
-    TensorDesc in_desc[3] = {x.desc(), w.desc()};
+    TensorDesc in_desc[3] = {x.desc(), wl.desc()};
     TensorView in[3] = {x, u};
     size_t n = 2;
     if (b) {
@@ -164,6 +293,14 @@ inline Buf conv2d(const TensorView& x, const TensorView& w,
     return conv2d_run(x, w, nullptr, attrs);
 }
 
+/// The depthwise filter in the order @p x's layout reads: torch's
+/// [C, 1, KH, KW] as it is for a planar activation, HWCM [KH, KW, C] for a
+/// channel-last one. Either way no prepack step is involved.
+inline TensorView depthwise_weight(const TensorView& x, const TensorView& w)
+{
+    return nnops::is_channel_last(x.layout()) ? hwcm_weight(w) : w;
+}
+
 /// Depthwise 2D convolution. The torch weight [C, 1, KH, KW] and bias [C] go in
 /// as they are: a planar (NCHW) input takes the raw filter, with no prepack.
 inline Buf depthwise_conv(const TensorView& x, const TensorView& w, const TensorView& b,
@@ -174,7 +311,7 @@ inline Buf depthwise_conv(const TensorView& x, const TensorView& w, const Tensor
     attrs.stride = {1, stride, stride};
     attrs.padding = {0, pad, pad};
     auto op = nnops::DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView in[] = {x, w, b};
+    const TensorView in[] = {x, depthwise_weight(x, w), b};
     return run("depthwise_conv", *op, in);
 }
 
@@ -186,7 +323,7 @@ inline Buf depthwise_conv(const TensorView& x, const TensorView& w,
     attrs.stride = {1, stride, stride};
     attrs.padding = {0, pad, pad};
     auto op = nnops::DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView in[] = {x, w};
+    const TensorView in[] = {x, depthwise_weight(x, w)};
     return run("depthwise_conv", *op, in);
 }
 
@@ -380,7 +517,7 @@ inline Buf depthwise_bn_act(const TensorView& x, const TensorView& w,
     attrs.epilogue.type = act;
     const detail::Folded& f = detail::folded(w, bn);
     auto op = nnops::DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView in[] = {x, f.weight.view, f.bias.view};
+    const TensorView in[] = {x, depthwise_weight(x, f.weight.view), f.bias.view};
     return run("depthwise_fused", *op, in);
 }
 
@@ -400,8 +537,9 @@ inline Buf to_layout(const TensorView& x, nnops::TensorLayout target)
     return run("layout_convert", *op, in);
 }
 
-/// MaxPool2d, straight on the NCHW tensor — the pooling kernels take planar
-/// input, so the runner stays in the layout the PyTorch references use.
+/// MaxPool2d on the tensor as it is: the pooling operator reads a planar input
+/// on its planar route and a channel-last one on its channel-last route, so the
+/// runner's layout carries through.
 inline Buf max_pool(const TensorView& x, int64_t kernel, int64_t stride,
                     int64_t pad)
 {
@@ -435,11 +573,91 @@ inline Buf linear(const TensorView& x, const TensorView& w, const TensorView& b)
 }
 
 /// A [N, C, 1, 1] pooled tensor seen as [N, C] — the reshape is a no-op on
-/// contiguous data, and Linear takes its reduction over the last axis.
+/// contiguous data, and Linear takes its reduction over the last axis. True in
+/// either layout: a global pool has one pixel, so [N][1][1][C] is [N][C] too.
 inline TensorView flatten_to_2d(TensorView& pooled)
 {
     const int64_t shape[] = {pooled.shape(0), pooled.shape(1)};
     return TensorView(shape, pooled.data_type(), pooled.ptr<uint8_t>());
+}
+
+/// @p x — [N, C, H, W] — with its pixels on the inside, the graph boundary of a
+/// channel-last run. Copied channel by channel: the artifact's tensors are
+/// planar, and this runs once per forward on the 3×224×224 input.
+inline Buf to_channel_last(const TensorView& x)
+{
+    const int64_t N = x.shape(0), C = x.shape(1);
+    const int64_t H = x.shape(2), W = x.shape(3);
+    TensorDesc d;
+    d.rank = 4;
+    d.dtype = x.data_type();
+    d.layout = nnops::TensorLayout::NHWC;
+    d.dims.resize(4);
+    d.dims[0] = N; d.dims[1] = C; d.dims[2] = H; d.dims[3] = W;
+    Buf out = alloc(d);
+
+    const float* src = x.ptr<float>();
+    float* dst = out.ptr();
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            const float* s = src + (n * C + c) * H * W;
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t w = 0; w < W; ++w) {
+                    dst[((n * H + h) * W + w) * C + c] = s[h * W + w];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/// The inverse, for a comparison against the planar checkpoints in the
+/// artifact. Verification only — a timed pass does not call it.
+inline Buf planar_copy_of(const TensorView& x)
+{
+    const int64_t N = x.shape(0), C = x.shape(1);
+    const int64_t H = x.shape(2), W = x.shape(3);
+    const int64_t shape[] = {N, C, H, W};
+    TensorDesc d;
+    d.rank = 4;
+    d.dtype = x.data_type();
+    d.layout = nnops::TensorLayout::NCHW;
+    d.dims.resize(4);
+    d.dims[0] = N; d.dims[1] = C; d.dims[2] = H; d.dims[3] = W;
+    Buf out = alloc(d);
+
+    const float* src = x.ptr<float>();
+    float* dst = out.ptr();
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            float* o = dst + (n * C + c) * H * W;
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t w = 0; w < W; ++w) {
+                    o[h * W + w] = src[((n * H + h) * W + w) * C + c];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/// Compare @p actual against the artifact's planar @p expected, reordering a
+/// channel-last activation first — every checkpoint in an artifact is NCHW.
+inline void compare_checkpoint(ModelCheck& check, const std::string& name,
+                               const TensorView& actual, const TensorView& expected)
+{
+    if (actual.layout() == nnops::TensorLayout::NHWC) {
+        // The conversion's cost belongs to the check, so the profiler sees it
+        // in (other) only on a verification pass — but it is a full transpose
+        // of every activation, so a disabled check has to skip it, not just
+        // skip the sweep it feeds (0.6 ms of a 3.2 ms MobileNetV2 pass at 20
+        // threads, all of it charged to the channel-last arm).
+        if (!check.enabled()) { return; }
+        const Buf planar = planar_copy_of(actual);
+        check.compare(name, planar.view, expected);
+        return;
+    }
+    check.compare(name, actual, expected);
 }
 
 }  // namespace model

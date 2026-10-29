@@ -15,6 +15,12 @@
 /// Usage:  model_resnet18 [artifact-dir] [--atol X] [--rtol Y]
 /// Exit:   0 all checkpoints pass, 1 a checkpoint failed, 77 no artifact
 ///         (the test is skipped — export it first, see models/README.md).
+///
+/// NNOPS_MODEL_LAYOUT=nhwc runs the same graph with every activation
+/// channel-last (see net_ops.hpp): the convs read HWIO filters, the maxpool its
+/// channel-last route, and each checkpoint is reordered back to NCHW before it
+/// is compared. Only the BN fold is mandatory there — the Norm operator is
+/// planar — which the fused path does anyway.
 
 #include "common/model_check.hpp"
 #include "common/model_io.hpp"
@@ -85,7 +91,7 @@ Buf basic_block(const ModelArtifact& m, const std::string& prefix,
 
 /// Run the network and compare every recorded checkpoint. Each row of the
 /// profile table is one checkpoint, timed without the comparison itself.
-int forward(const ModelArtifact& m, ModelCheck& check)
+int forward(const ModelArtifact& m, ModelCheck& check, const TensorView& input)
 {
     // Stem: conv1 -> bn1 -> relu. Fused, that is one call and its output is the
     // checkpoint after the relu, so the three-intermediate comparison collapses
@@ -93,25 +99,25 @@ int forward(const ModelArtifact& m, ModelCheck& check)
     Buf act;
     if (model::fuse_enabled()) {
         act = model::layer("conv1_bn1_relu", [&] {
-            return conv_bn(m, m.at("input"), "conv1", "bn1",
+            return conv_bn(m, input, "conv1", "bn1",
                            nnops::EpilogueActivateType::Relu, 7, 2, 3);
         });
-        check.compare("relu", act.view, m.at("ref.relu"));
+        model::compare_checkpoint(check, "relu", act.view, m.at("ref.relu"));
     } else {
         act = model::layer("conv1", [&] {
-            return model::conv2d(m.at("input"), m.at("conv1.weight"), 7, 2, 3);
+            return model::conv2d(input, m.at("conv1.weight"), 7, 2, 3);
         });
-        check.compare("conv1", act.view, m.at("ref.conv1"));
+        model::compare_checkpoint(check, "conv1", act.view, m.at("ref.conv1"));
 
         act = model::layer("bn1", [&] { return norm(m, "bn1", act.view); });
-        check.compare("bn1", act.view, m.at("ref.bn1"));
+        model::compare_checkpoint(check, "bn1", act.view, m.at("ref.bn1"));
 
         act = model::layer("relu", [&] { return model::relu(act.view); });
-        check.compare("relu", act.view, m.at("ref.relu"));
+        model::compare_checkpoint(check, "relu", act.view, m.at("ref.relu"));
     }
 
     act = model::layer("maxpool", [&] { return model::max_pool(act.view, 3, 2, 1); });
-    check.compare("maxpool", act.view, m.at("ref.maxpool"));
+    model::compare_checkpoint(check, "maxpool", act.view, m.at("ref.maxpool"));
 
     // layer1 keeps the resolution; the other stages start with stride 2.
     const int64_t stage_stride[4] = {1, 2, 2, 2};
@@ -123,7 +129,7 @@ int forward(const ModelArtifact& m, ModelCheck& check)
             Buf out = model::layer(p.c_str(), [&] {
                 return basic_block(m, p, act.view, stride, stride != 1);
             });
-            check.compare(p, out.view, m.at("ref." + p));
+            model::compare_checkpoint(check, p, out.view, m.at("ref." + p));
             act = std::move(out);
         }
     }
@@ -131,13 +137,13 @@ int forward(const ModelArtifact& m, ModelCheck& check)
     Buf pooled = model::layer("avgpool", [&] {
         return model::global_avg_pool(act.view);
     });
-    check.compare("avgpool", pooled.view, m.at("ref.avgpool"));
+    model::compare_checkpoint(check, "avgpool", pooled.view, m.at("ref.avgpool"));
 
     Buf logits = model::layer("logits", [&] {
         return model::linear(model::flatten_to_2d(pooled.view),
                              m.at("fc.weight"), m.at("fc.bias"));
     });
-    check.compare("logits", logits.view, m.at("ref.logits"));
+    model::compare_checkpoint(check, "logits", logits.view, m.at("ref.logits"));
     return 0;
 }
 
@@ -167,19 +173,41 @@ int main(int argc, char** argv)
         return 77;
     }
 
-    std::printf("resnet18: %zu tensors from %s (conv+bn+relu %s)\n", artifact.count(),
-                dir.c_str(), model::fuse_enabled() ? "folded" : "unfused");
+    const bool channel_last = model::channel_last();
+    if (channel_last && !model::fuse_enabled()) {
+        // The Norm operator reads planar tensors, so a channel-last graph has
+        // to fold the BN into the conv — which is what fusion already does.
+        std::fprintf(stderr,
+                     "resnet18: NNOPS_MODEL_LAYOUT=nhwc needs the BN fold "
+                     "(unset NNOPS_MODEL_FUSE)\n");
+        return 2;
+    }
+    Buf cl_input;
+    TensorView input = artifact.at("input");
+    if (channel_last) {
+        cl_input = model::to_channel_last(input);
+        input = cl_input.view;
+    }
+
+    std::printf("resnet18: %zu tensors from %s (conv+bn+relu %s, %s)\n",
+                artifact.count(), dir.c_str(),
+                model::fuse_enabled() ? "folded" : "unfused",
+                channel_last ? "nhwc" : "nchw");
     // The untimed pass is the model-load step: it prepacks the Winograd weights
-    // (and first-touches every buffer), so the number below is the steady state.
-    { ModelCheck warm(atol, rtol, /*verbose=*/false); forward(artifact, warm); }
-    ModelCheck check(atol, rtol);
+    // (and first-touches every buffer) and it is the pass that checks every
+    // checkpoint, so the number below is the steady state with no comparison in
+    // it — which is what torch and ORT report.
+    ModelCheck verify(atol, rtol);
+    forward(artifact, verify, input);
+    ModelCheck timed(atol, rtol, /*verbose=*/false);
+    timed.set_enabled(false);
     model::prof_reset();
     const auto t0 = std::chrono::steady_clock::now();
-    forward(artifact, check);
+    forward(artifact, timed, input);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
     std::printf("forward: %.1f ms\n", ms);
     model::prof_report("resnet18", ms);
-    return check.report("resnet18") == 0 ? 0 : 1;
+    return verify.report("resnet18") == 0 ? 0 : 1;
 }

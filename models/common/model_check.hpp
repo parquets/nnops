@@ -104,10 +104,18 @@ public:
     ModelCheck(double atol, double rtol, bool verbose = true)
         : atol_(atol), rtol_(rtol), verbose_(verbose) {}
 
+    /// Turn the comparison off. A timed pass wants the model's own time and
+    /// nothing else, so a runner that has already verified its checkpoints on
+    /// an untimed pass runs the clocked one with this set — the sweep over
+    /// every activation is 8-11% of a pass, which torch and ORT do not pay.
+    void set_enabled(bool on) { enabled_ = on; }
+    bool enabled() const { return enabled_; }
+
     /// Compare @p actual against the artifact tensor @p ref_name.
     void compare(const std::string& name, const nnops::TensorView& actual,
                  const nnops::TensorView& expected)
     {
+        if (!enabled_) { return; }
         CheckRow row;
         row.name = name;
 
@@ -207,6 +215,7 @@ private:
     double atol_;
     double rtol_;
     bool verbose_;
+    bool enabled_ = true;
     std::vector<CheckRow> rows_;
 };
 

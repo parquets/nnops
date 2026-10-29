@@ -445,6 +445,15 @@ NNOPS_TEST(conv2d_nhwc_fp_matches_ref) {
         // A 1x1 with a kernel-size-1 attribute but a pitched (non-pointwise)
         // geometry is not reachable here — stride 2 keeps it on the gather.
         {{{1, 32, 12, 12},  16, 1, 1, 2, 2, 0, 0, 1, 1, 1, false}, 21},
+
+        // ---- full-size planes: a ResNet stage -----------------------------
+        // Every case above fits a handful of tiles; these are the shapes the
+        // model runners actually call, where a plane is thousands of pixels
+        // and the pixel blocks, not the filter, are what the grid runs out of.
+        {{{1, 64, 56, 56},  64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  22},
+        {{{1, 64, 112, 112}, 64, 3, 3, 2, 2, 1, 1, 1, 1, 1, false}, 23},
+        {{{1, 128, 28, 28}, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   24},
+        {{{1, 64, 56, 56}, 256, 1, 1, 1, 1, 0, 0, 1, 1, 1, false},  25},
     };
 
     for (size_t i = 0; i < std::size(cases); ++i) {
@@ -796,8 +805,16 @@ NNOPS_TEST(conv2d_nhwc_threaded_matches_serial) {
         {{{1, 16, 28, 28}, 256, 3, 3, 2, 2, 1, 1, 1, 1, 1, false}, 62},
         {{{1, 128, 16, 16}, 192, 1, 1, 1, 1, 0, 0, 1, 1, 1, true}, 63},
         {{{2, 40, 14, 14},  64, 3, 3, 1, 1, 1, 1, 1, 1, 1, false}, 64},
+        // The model runners' hard cases: a plane small enough that the task
+        // grid runs out of rows and splits on the filter axis as well.
+        {{{1, 64, 56, 56},  64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  65},
+        {{{1, 128, 28, 28}, 256, 3, 3, 2, 2, 1, 1, 1, 1, 1, false}, 66},
+        {{{1, 256, 14, 14}, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  67},
+        {{{1, 192, 14, 14},  64, 1, 1, 1, 1, 0, 0, 1, 1, 1, false}, 68},
+        {{{1, 512, 7, 7},   512, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},   69},
     };
 
+    int case_i = 0;
     for (const auto& cs : cases) {
         const FpCase& c = cs.c;
         const int64_t N = c.ishape[0], IC = c.ishape[1];
@@ -855,7 +872,7 @@ NNOPS_TEST(conv2d_nhwc_threaded_matches_serial) {
         auto threaded_out = make_out(threaded_buf);
         op->compute(serial_out, ins, {}, nullptr);
 
-        for (int nthreads : {2, 4}) {
+        for (int nthreads : {2, 4, 8, 20}) {
             SimplePool pool(nthreads);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
@@ -864,9 +881,14 @@ NNOPS_TEST(conv2d_nhwc_threaded_matches_serial) {
                             static_cast<size_t>(out_n) * sizeof(float)) != 0) {
                 throw std::runtime_error(
                     "conv2d_nhwc threaded run differs from serial at " +
-                    std::to_string(nthreads) + " threads");
+                    std::to_string(nthreads) + " threads, case " +
+                    std::to_string(case_i) + " (" + std::to_string(IC) + "x" +
+                    std::to_string(IH) + "x" + std::to_string(IW) + " -> " +
+                    std::to_string(c.oc) + "ch, " + std::to_string(c.kh) + "x" +
+                    std::to_string(c.kw) + " s" + std::to_string(c.sh) + ")");
             }
         }
+        ++case_i;
     }
 }
 
