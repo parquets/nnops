@@ -56,6 +56,9 @@ enum class TensorLayout : uint8_t {
     // ---- Winograd-transformed weight ----
     PackedWinoWeight = 9,  ///< [16, OC, IC/G] — F(2,3) Winograd-transformed weight U
                            ///< (one 4×4 transform-domain kernel per position p ∈ [0,16))
+                           ///< for a *planar* activation, where OC is the GEMM's M.
+                           ///< The channel-last form of the same U is
+                           ///< PackedWinoWeightLast.
 
     // ---- Channel-last (NHWC family) ----
     NHWC      = 10,  ///< logical [N, C, H, W], stored [N, H, W, C]
@@ -69,6 +72,20 @@ enum class TensorLayout : uint8_t {
                      ///< channel is the contiguous axis, which is what the
                      ///< channel-last kernel's B panels want: a filter tap for
                      ///< one input channel is one contiguous OC-length run.
+
+    // ---- Winograd-transformed weight, channel-last ----
+    PackedWinoWeightLast = 13,  ///< the same U for a channel-last activation,
+                                ///< stored as the GEMM's own B panels:
+                                ///< [16][⌈IC/G ÷ KC⌉][G·⌈OC/G ÷ nr⌉][ldd], each
+                                ///< panel [KC][nr] k-major with OC zero-padded to
+                                ///< whole panels (there the *pixels* are the
+                                ///< GEMM's M and the output channels its N, so
+                                ///< the transform is tile-major). KC divides IC/G
+                                ///< and is at most 128; nr is the arch's panel
+                                ///< width. Prepacked weights are opaque blobs to
+                                ///< every consumer outside the Winograd kernel —
+                                ///< this tag is a promise about *which* kernel,
+                                ///< not a layout anyone else may index.
 };
 
 
@@ -85,6 +102,7 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::NCDHWC32: return 32;
     case TensorLayout::PackedWeight: return 1;
     case TensorLayout::PackedWinoWeight: return 1;
+    case TensorLayout::PackedWinoWeightLast: return 1;
     case TensorLayout::NHWC:     return 1;
     case TensorLayout::NDHWC:    return 1;
     case TensorLayout::HWIO:     return 1;
@@ -122,6 +140,15 @@ constexpr bool is_unpacked(TensorLayout layout) noexcept {
     return !is_channel_packed(layout);
 }
 
+/// Returns true for either form of the Winograd-transformed weight — the
+/// prepacked U a Winograd kernel consumes. The two forms pair with the two
+/// activation layouts (see Conv2D::validate): planar U with NCHW, the panel
+/// form with NHWC.
+constexpr bool is_wino_weight(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedWinoWeight ||
+           layout == TensorLayout::PackedWinoWeightLast;
+}
+
 /// Returns the expected spatial rank encoded in the layout name.
 /// NCHW* → 2 (H, W), NCDHW* → 3 (D, H, W).
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
@@ -132,6 +159,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::NCHWC32:
     case TensorLayout::PackedWeight:
     case TensorLayout::PackedWinoWeight:
+    case TensorLayout::PackedWinoWeightLast:
     case TensorLayout::NHWC:
     case TensorLayout::HWIO:
         return 2;

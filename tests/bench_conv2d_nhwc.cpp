@@ -434,7 +434,172 @@ void run_table(const char* title, MakeOp make_op) {
     }
 }
 
+// ============================================================
+// Channel-last Winograd vs channel-last implicit GEMM
+// ============================================================
+//
+// A is the implicit-GEMM route reading the raw HWIO filter — what a channel-last
+// conv runs without Winograd; B is the Winograd route on the same activation
+// and the same filter, transformed once into the U B-panels outside every
+// timer. Both write the same NHWC output, so the row is purely the algorithm.
+//
+// Only k3s1 can route to Winograd, so the list is the k3s1 half of the layer
+// sweep plus the small planes ResNet/MobileNet end on — the question is where
+// the policy should stop, and 14x14/7x7 is where it stops.
+
+const std::vector<Shape>& wino_sweep() {
+    static const std::vector<Shape> s = {
+        {"conv 3x3 s1  224x224   3->64", 1,    3, 224, 224,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  224x224  64->64", 1,   64, 224, 224,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1 112x112  32->32",  1,   32, 112, 112,   32, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1 112x112  64->64",  1,   64, 112, 112,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  56x56  32->32",   1,   32,  56,  56,   32, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  56x56  64->64",   1,   64,  56,  56,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  56x56 128->128",  1,  128,  56,  56,  128, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  56x56 256->256",  1,  256,  56,  56,  256, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  28x28  32->32",   1,   32,  28,  28,   32, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  28x28  64->64",   1,   64,  28,  28,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  28x28 128->128",  1,  128,  28,  28,  128, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  28x28 256->256",  1,  256,  28,  28,  256, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  28x28 512->512",  1,  512,  28,  28,  512, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  14x14  32->32",   1,   32,  14,  14,   32, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  14x14  64->64",   1,   64,  14,  14,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  14x14 128->128",  1,  128,  14,  14,  128, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  14x14 256->256",  1,  256,  14,  14,  256, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1   7x7   64->64",   1,   64,   7,   7,   64, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1   7x7  256->256",  1,  256,   7,   7,  256, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1   7x7  512->512",  1,  512,   7,   7,  512, 3, 3, 1, 1, 1, 1},
+        {"conv 3x3 s1  28x28 128->128 n4", 4, 128, 28,  28,  128, 3, 3, 1, 1, 1, 1},
+    };
+    return s;
+}
+
+template <class T>
+struct AbWino {
+    explicit AbWino(const Shape& c) : s(c) {
+        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t wsh[] = {c.KH, c.KW, c.IC, c.OC};   // HWIO
+        constexpr DataType dt = dtype_of<T>();
+
+        // The activation and the filter are generated planar and converted once:
+        // both routes then see identical values, and the conversion is outside
+        // every timed region.
+        const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
+        const auto w32  = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
+        in_cl = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+                                      c.N, c.IC, c.IH, c.IW);
+        w_hwio = w32;   // already [KH][KW][IC][OC]
+
+        in_v = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
+                          TensorLayout::NHWC);
+        w_v  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_hwio.data(),
+                          TensorLayout::HWIO);
+
+        Conv2DAttributes attrs{};
+        attrs.kernel_size = {c.KH, c.KW};
+        attrs.stride = {c.SH, c.SW};
+        attrs.padding = {c.PH, c.PW};
+        attrs.groups = c.groups;
+        im_attrs = attrs;
+        im_attrs.algorithm = ConvAlgorithm::ImplicitGemm;
+        wn_attrs = attrs;
+        wn_attrs.algorithm = ConvAlgorithm::Winograd;
+        im_op = Conv2D::create(im_attrs, Backend::CPU);
+        wn_op = Conv2D::create(wn_attrs, Backend::CPU);
+
+        const TensorDesc d0[] = {in_v.desc(), w_v.desc()};
+        const auto od = im_op->getOutputTensorDesc(d0);
+        out_desc = od[0];
+        OH = od[0].dims[2];
+        OW = od[0].dims[3];
+        const int64_t ntiles = ((OH + 1) / 2) * ((OW + 1) / 2);
+        work_im = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * c.IC * 9.0;
+        work_wn = 2.0 * static_cast<double>(c.N) * c.OC * ntiles * c.IC * 16.0;
+
+        out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_v = test::make_planar(out_desc, out_buf.data());
+
+        // Prepack U (query -> allocate -> pack), once and outside every timer.
+        {
+            TensorView q;
+            TensorView wi[] = {w_v};
+            TensorView wo[] = {q};
+            wn_op->prepackWeights(wi, wo);
+            q = wo[0];
+            u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(T)), T{});
+            u_v = TensorView(q.shape_span(), q.data_type(), u_buf.data(), q.pitch(),
+                             q.layout());
+            TensorView wi2[] = {w_v};
+            TensorView wo2[] = {u_v};
+            wn_op->prepackWeights(wi2, wo2);
+        }
+    }
+
+    void run_im(const ComputeContext& ctx) {
+        const TensorView ins[] = {in_v, w_v};
+        im_op->compute(std::span<TensorView>(&out_v, 1), ins, ctx, nullptr);
+    }
+    void run_wn(const ComputeContext& ctx) {
+        const TensorView ins[] = {in_v, u_v};
+        wn_op->compute(std::span<TensorView>(&out_v, 1), ins, ctx, nullptr);
+    }
+
+    Shape s;
+    int64_t OH = 0, OW = 0;
+    double work_im = 0.0, work_wn = 0.0;
+    Conv2DAttributes im_attrs, wn_attrs;
+    std::unique_ptr<Conv2D> im_op, wn_op;
+    std::vector<T> in_cl, w_hwio, u_buf, out_buf;
+    TensorView in_v, w_v, u_v, out_v;
+    TensorDesc out_desc{};
+};
+
+template <class T>
+void run_wino_table(const char* title) {
+    const int iters = 10, rounds = 3;
+    std::printf("\n== %s ==\n", title);
+    for (int nt : bench_threads()) {
+        std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
+        std::printf("    %-32s %8s %8s | %8s %8s | %s | %s\n",
+                    "layer", "im gemm ms", "GFLOPS", "wino ms", "GFLOPS",
+                    "wino time", "verdict");
+        int wins = 0, losses = 0, ties = 0;
+        double tot_im = 0.0, tot_wn = 0.0;
+        for (const auto& c : wino_sweep()) {
+            auto op = std::make_unique<AbWino<T>>(c);
+            const AbResult r = measure_ab(nt,
+                [&](const ComputeContext& x) { op->run_im(x); },
+                [&](const ComputeContext& x) { op->run_wn(x); },
+                iters, rounds);
+            const double ratio = r.b_ms / r.a_ms;
+            const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
+            const char* verdict = !real ? "tie (noise)"
+                                : (ratio < 1.0 ? "wino wins" : "im gemm wins");
+            if (!real) { ++ties; } else if (ratio < 1.0) { ++wins; } else { ++losses; }
+            tot_im += r.a_ms;
+            tot_wn += r.b_ms;
+            std::printf("    %-32s %8.3f %8.1f | %8.3f %8.1f | %8.2fx | %s\n",
+                        c.name, r.a_ms, op->work_im / r.a_ms / 1e6,
+                        r.b_ms, op->work_wn / r.b_ms / 1e6, ratio, verdict);
+        }
+        std::printf("    %-32s %8.3f %8s | %8.3f %8s | %8.2fx | "
+                    "%d win, %d lose, %d tie\n",
+                    "sum of the layers", tot_im, "", tot_wn, "",
+                    tot_wn / tot_im, wins, losses, ties);
+    }
+}
+
 }  // namespace
+
+NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f32) {
+    run_wino_table<float>(
+        "f32: channel-last implicit GEMM (HWIO) vs channel-last Winograd (U panels)");
+}
+
+NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f16) {
+    run_wino_table<half>(
+        "f16: channel-last implicit GEMM (HWIO) vs channel-last Winograd (U panels)");
+}
 
 NNOPS_BENCH(conv2d_nhwc_vs_nchw_f32) {
     run_table("f32: planar (NCHW+OIHW) vs channel-last (NHWC+HWIO)",

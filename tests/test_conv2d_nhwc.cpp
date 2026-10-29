@@ -12,6 +12,7 @@
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
+#include "backend/cpu/conv/conv2d_winograd.h"
 #include "common/cpu_pool.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -152,7 +153,8 @@ struct FpResult {
 /// sides start from the same residual, permuted into their own order.
 FpResult run_fp_case(const FpCase& c, DataType dt,
                      EpilogueActivateType ep = EpilogueActivateType::None,
-                     bool add_to = false, uint64_t seed = 900)
+                     bool add_to = false, uint64_t seed = 900,
+                     ConvAlgorithm alg = ConvAlgorithm::Auto)
 {
     const int64_t N = c.ishape[0], IC = c.ishape[1];
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
@@ -181,6 +183,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
     attrs.groups      = c.groups;
     attrs.epilogue.type = ep;
     attrs.add_to      = add_to;
+    attrs.algorithm   = alg;
 
     auto op = Conv2D::create(attrs, Backend::CPU);
 
@@ -234,7 +237,29 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
                             TensorLayout::NHWC);
             TensorView w_v(std::span<const int64_t>(wsh_cl, 4), dtt, w_buf.data(),
                            TensorLayout::HWIO);
-            std::vector<TensorView> ins = {in_v, w_v};
+
+            // Winograd consumes a prepacked U, not the raw HWIO filter: query
+            // its panels from the op, lay them out, then let the op fill them.
+            // The channel-last U is the GEMM's B panels, so its rank and shape
+            // are the kernel's, not U[16][OC][IC/G].
+            std::vector<T> u_buf;
+            TensorView u_v;
+            if (alg == ConvAlgorithm::Winograd) {
+                TensorView empty;
+                const TensorView w_q[] = {w_v};
+                TensorView o_q[] = {empty};
+                op->prepackWeights(w_q, o_q);
+                const TensorView q = o_q[0];
+                u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(T)), T{});
+                u_v = TensorView(q.shape_span(), dtt, u_buf.data(), q.pitch(),
+                                 q.layout());
+                const TensorView w_f[] = {w_v};
+                TensorView o_f[] = {u_v};
+                op->prepackWeights(w_f, o_f);
+            }
+
+            std::vector<TensorView> ins = {in_v};
+            ins.push_back(alg == ConvAlgorithm::Winograd ? u_v : w_v);
             std::vector<T> b_buf;
             if (c.bias) {
                 b_buf.resize(static_cast<size_t>(c.oc));
@@ -272,9 +297,10 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
 /// Throw when the worst scaled deviation exceeds @p tol.
 void expect_fp_close(const FpCase& c, DataType dt, float tol,
                      EpilogueActivateType ep = EpilogueActivateType::None,
-                     bool add_to = false, uint64_t seed = 900, int idx = -1)
+                     bool add_to = false, uint64_t seed = 900, int idx = -1,
+                     ConvAlgorithm alg = ConvAlgorithm::Auto)
 {
-    const FpResult r = run_fp_case(c, dt, ep, add_to, seed);
+    const FpResult r = run_fp_case(c, dt, ep, add_to, seed, alg);
     if (r.worst > tol) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
@@ -492,6 +518,273 @@ NNOPS_TEST(conv2d_nhwc_fp_epilogues) {
     expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu6, true, 604);
     expect_fp_close(no_bias, DataType::f16, nnops::test::kF16AccumTol,
                     EpilogueActivateType::Relu, true, 605);
+}
+
+// ============================================================
+// Winograd F(2×2, 3×3) on the channel-last route
+// ============================================================
+//
+// The winograd kernel here is the same f2,3 transform as the planar one with
+// the GEMM's operands swapped: the pixels are M and the output channels N, so
+// U is prepacked into the MMA's B panels instead of the [16][OC][IC/G] planes.
+// Everything else — the epilogue, the bias, the residual — must land on exactly
+// the values the reference computes, which is what these cases check.
+
+NNOPS_TEST(conv2d_nhwc_wino_matches_ref) {
+    struct Case { FpCase c; uint64_t seed; };
+    const Case f32_cases[] = {
+        // The shapes Winograd is selected for: >= 32 channels per group and a
+        // plane of at least 14x14.
+        {{{1, 32, 16, 16},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   71},
+        {{{1, 64, 14, 14},  64, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  72},
+        // Several oc blocks (256 > kOcnBlock 64) over a small plane.
+        {{{1, 32, 14, 14}, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   73},
+        // Odd OC: the last panel is mostly the zero padding prepack wrote.
+        {{{1, 32, 15, 15},   5, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   74},
+        // IC/G 40 is not a multiple of the vector, and 13x15 is odd on both
+        // axes: the last tile of every row and of the last row are partial.
+        {{{2, 40, 13, 15},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  75},
+        // groups 2 (IC/G 8, OC/G 4 — a single narrow panel per group).
+        {{{1, 16, 20, 20},   8, 3, 3, 1, 1, 1, 1, 1, 1, 2, true},   76},
+        // A single channel per group (IC/G 1) and a filter over the whole plane.
+        {{{1, 2, 10, 10},    4, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},  77},
+        // IC 256 = two k-blocks of 128 at f32's 256 cap → exactly one; 512 → two.
+        {{{1, 512, 8, 8},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   78},
+        // pad 0 (OH = IH − 2) and pad 2.
+        {{{1, 32, 18, 18},  16, 3, 3, 1, 1, 0, 0, 1, 1, 1, false},  79},
+        {{{1, 32, 12, 12},  16, 3, 3, 1, 1, 2, 2, 1, 1, 1, true},   80},
+    };
+    for (size_t i = 0; i < std::size(f32_cases); ++i) {
+        expect_fp_close(f32_cases[i].c, DataType::f32, 2e-4f,
+                        EpilogueActivateType::None, false, f32_cases[i].seed,
+                        static_cast<int>(i), ConvAlgorithm::Winograd);
+    }
+
+    // f16: the transform runs in f32 and only the accumulator is narrowed, so
+    // the tolerance is the shared f16 one.
+    const Case f16_cases[] = {
+        {{{1, 32, 16, 16},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   81},
+        {{{1, 64, 14, 14},  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  82},
+        {{{1, 40, 13, 15},  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   83},
+        {{{2, 16, 20, 20},   8, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},  84},
+    };
+    for (size_t i = 0; i < std::size(f16_cases); ++i) {
+        expect_fp_close(f16_cases[i].c, DataType::f16, nnops::test::kF16AccumTol,
+                        EpilogueActivateType::None, false, f16_cases[i].seed,
+                        static_cast<int>(i), ConvAlgorithm::Winograd);
+    }
+}
+
+NNOPS_TEST(conv2d_nhwc_wino_epilogues) {
+    // Bias and epilogue are applied to the real 2×2 outputs of the transform, in
+    // a single write-back — the same contract the planar route keeps.
+    const FpCase c = {{1, 32, 15, 14}, 24, 3, 3, 1, 1, 1, 1, 1, 1, 1, true};
+    const EpilogueActivateType eps[] = {
+        EpilogueActivateType::None,      EpilogueActivateType::Relu,
+        EpilogueActivateType::Relu6,     EpilogueActivateType::Gelu,
+        EpilogueActivateType::Sigmoid,   EpilogueActivateType::Tanh,
+        EpilogueActivateType::LeakyRelu, EpilogueActivateType::Silu,
+        EpilogueActivateType::HardSwish, EpilogueActivateType::Elu,
+    };
+    for (size_t i = 0; i < std::size(eps); ++i) {
+        expect_fp_close(c, DataType::f32, 2e-4f, eps[i], false, 700 + i,
+                        static_cast<int>(i), ConvAlgorithm::Winograd);
+        expect_fp_close(c, DataType::f32, 2e-4f, eps[i], true, 800 + i,
+                        static_cast<int>(i) + 100, ConvAlgorithm::Winograd);
+    }
+    FpCase no_bias = c;
+    no_bias.bias = false;
+    expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu6,
+                    false, 900, -1, ConvAlgorithm::Winograd);
+    expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu,
+                    true, 901, -1, ConvAlgorithm::Winograd);
+}
+
+NNOPS_TEST(conv2d_nhwc_wino_hand_exact) {
+    // A 3x3 filter whose only nonzero tap is the center, and per-channel deltas:
+    // out[oc] == in[oc] pixel for pixel. That pins the pixel mapping (the tile
+    // flattening and the 2x2 write-back), the channel mapping (the GEMM's N and
+    // the panels' columns) and the transform round trip in one case.
+    constexpr int64_t IC = 8, OC = 8, H = 4, W = 4;
+    const int64_t ish[] = {1, IC, H, W};
+    const int64_t wsh[] = {3, 3, IC, OC};
+    std::vector<float> in_buf(static_cast<size_t>(IC * H * W)), w_buf(9 * IC * OC, 0.0f);
+    for (int64_t h = 0; h < H; ++h) {
+        for (int64_t w = 0; w < W; ++w) {
+            for (int64_t c = 0; c < IC; ++c) {
+                in_buf[static_cast<size_t>((h * W + w) * IC + c)] =
+                    0.25f * static_cast<float>(h * 100 + w * 10 + c + 1);
+            }
+        }
+    }
+    for (int64_t c = 0; c < OC; ++c) { w_buf[static_cast<size_t>((4 * IC + c) * OC + c)] = 1.0f; }
+
+    TensorView in_v(std::span<const int64_t>(ish, 4), DataType::f32, in_buf.data(),
+                    TensorLayout::NHWC);
+    TensorView w_v(std::span<const int64_t>(wsh, 4), DataType::f32, w_buf.data(),
+                   TensorLayout::HWIO);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.padding = {1, 1};
+    attrs.algorithm = ConvAlgorithm::Winograd;
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    TensorView q;
+    const TensorView wq[] = {w_v};
+    TensorView oq[] = {q};
+    op->prepackWeights(wq, oq);
+    std::vector<float> u_buf(static_cast<size_t>(oq[0].storage_bytes() / sizeof(float)), 0.0f);
+    TensorView u_v(oq[0].shape_span(), DataType::f32, u_buf.data(), oq[0].pitch(),
+                   oq[0].layout());
+    const TensorView wf[] = {w_v};
+    TensorView of[] = {u_v};
+    op->prepackWeights(wf, of);
+
+    const int64_t osh[] = {1, OC, H, W};
+    std::vector<float> out_buf(static_cast<size_t>(OC * H * W), 0.0f);
+    TensorView out_v(std::span<const int64_t>(osh, 4), DataType::f32, out_buf.data(),
+                     TensorLayout::NHWC);
+    const TensorView ins[] = {in_v, u_v};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out_v, ins)));
+
+    for (size_t i = 0; i < in_buf.size(); ++i) {
+        if (std::abs(out_buf[i] - in_buf[i]) > 1e-5f) {
+            std::printf("elem %zu (pixel %zu, ch %zu): got %g want %g\n", i,
+                        i / static_cast<size_t>(IC), i % static_cast<size_t>(IC),
+                        double(out_buf[i]), double(in_buf[i]));
+            NNOPS_EXPECT_NEAR(out_buf[i], in_buf[i], 1e-5f);
+            break;
+        }
+    }
+}
+
+NNOPS_TEST(conv2d_nhwc_wino_prepack_matches_planar) {
+    // Both U forms hold the same G g Gᵀ — the channel-last one is just the GEMM's
+    // B panels, so entry (p, kb, g·jb + j, k, col) must equal the planar U's
+    // (p, oc, ic) for oc = (g·jb + j)·nr + col, ic = kb·kc + k. That equality is
+    // the whole prepack contract, and the kernel cannot be right without it.
+    const int64_t IC = 40, OC = 24, G = 1;   // no vector multiple either way
+    const int64_t ICG = IC / G, OCG = OC / G;
+    const int64_t wsh[] = {OC, ICG, 3, 3};           // OIHW
+    const int64_t wsh_cl[] = {3, 3, ICG, OC};        // HWIO
+    auto [w32v, w32] = test::make_random_tensor(
+        std::span<const int64_t>(wsh, 4), -1.0f, 1.0f, 909);
+    const auto w_cl = test::oihw_to_hwio<float>(w32v, OC, ICG, 3, 3);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.padding = {1, 1};
+    attrs.groups = G;
+    attrs.algorithm = ConvAlgorithm::Winograd;
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    // Prepack both forms from the same values.
+    TensorView w_pl(wsh, DataType::f32, w32v.data()),
+               w_cl_v(std::span<const int64_t>(wsh_cl, 4), DataType::f32,
+                      const_cast<float*>(w_cl.data()), TensorLayout::HWIO);
+    std::vector<float> u_pl_buf, u_cl_buf;
+    TensorView u_pl, u_cl;
+    {
+        TensorView q;
+        const TensorView in1[] = {w_pl};
+        TensorView o1[] = {q};
+        op->prepackWeights(in1, o1);
+        const TensorView qp = o1[0];
+        u_pl_buf.assign(static_cast<size_t>(qp.storage_bytes() / sizeof(float)), 0.0f);
+        u_pl = TensorView(qp.shape_span(), DataType::f32, u_pl_buf.data(), qp.pitch(),
+                          qp.layout());
+        const TensorView in2[] = {w_pl};
+        TensorView o2[] = {u_pl};
+        op->prepackWeights(in2, o2);
+
+        TensorView q2;
+        const TensorView in3[] = {w_cl_v};
+        TensorView o3[] = {q2};
+        op->prepackWeights(in3, o3);
+        const TensorView qc = o3[0];
+        u_cl_buf.assign(static_cast<size_t>(qc.storage_bytes() / sizeof(float)), 0.0f);
+        u_cl = TensorView(qc.shape_span(), DataType::f32, u_cl_buf.data(), qc.pitch(),
+                          qc.layout());
+        const TensorView in4[] = {w_cl_v};
+        TensorView o4[] = {u_cl};
+        op->prepackWeights(in4, o4);
+    }
+    NNOPS_EXPECT_EQ(static_cast<int64_t>(u_pl.layout()),
+                    static_cast<int64_t>(TensorLayout::PackedWinoWeight));
+    NNOPS_EXPECT_EQ(static_cast<int64_t>(u_cl.layout()),
+                    static_cast<int64_t>(TensorLayout::PackedWinoWeightLast));
+
+    const auto ug = backend::cpu::wino_channel_last_u(ICG, OCG, G, DataType::f32);
+    const float* pl = u_pl_buf.data();   // [p][oc][ic], row stride ICG
+    const float* cl = u_cl_buf.data();
+    for (int64_t p = 0; p < 16; ++p) {
+        for (int64_t oc = 0; oc < OCG; ++oc) {
+            for (int64_t ic = 0; ic < ICG; ++ic) {
+                const int64_t kb = ic / ug.kc, k = ic - kb * ug.kc;
+                const int64_t j = oc / ug.nr, col = oc - j * ug.nr;
+                const float want = pl[(p * OC + oc) * ICG + ic];
+                const float got = cl[p * ug.plane + (kb * ug.jbg + j) * ug.ldd
+                                     + k * ug.nr + col];
+                if (got != want) {
+                    NNOPS_EXPECT_NEAR(got, want, 1e-6f);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+NNOPS_TEST(conv2d_nhwc_wino_plan_and_auto) {
+    // Auto follows the prepacked U it is handed, whichever form it is: the
+    // planar U pairs with a planar activation and the panels with a channel-last
+    // one, and a mismatched pair must not resolve to a plan at all.
+    const int64_t ishape[] = {1, 32, 16, 16};
+    const int64_t oshape[] = {1, 32, 14, 14};
+    std::vector<float> in_buf(32 * 16 * 16, 0.5f);
+    std::vector<float> out_buf(32 * 14 * 14, 0.0f);
+    TensorView input(std::span<const int64_t>(ishape, 4), DataType::f32,
+                     in_buf.data(), TensorLayout::NHWC);
+    TensorView output(std::span<const int64_t>(oshape, 4), DataType::f32,
+                      out_buf.data(), TensorLayout::NHWC);
+
+    const backend::cpu::WinoChannelLastU ug =
+        backend::cpu::wino_channel_last_u(32, 32, 1, DataType::f32);
+    NNOPS_EXPECT_EQ(ug.nr, int64_t{16});
+    NNOPS_EXPECT_EQ(ug.kc, int64_t{32});   // one k-block: 32 divides 32
+    NNOPS_EXPECT_EQ(ug.nb, int64_t{1});
+    NNOPS_EXPECT_EQ(ug.jb, int64_t{2});
+    NNOPS_EXPECT_EQ(ug.jbg, int64_t{2});
+
+    const int64_t u_shape[] = {16, ug.nb, ug.jbg, ug.ldd};
+    std::vector<float> u_buf(static_cast<size_t>(ug.total), 0.0f);
+    TensorView u(std::span<const int64_t>(u_shape, 4), DataType::f32, u_buf.data(),
+                 ug.ldd * static_cast<int64_t>(sizeof(float)),
+                 TensorLayout::PackedWinoWeightLast);
+    // Fill the panels with the identity-free garbage a memset leaves: all zero
+    // is a valid U, so the plan is all this case is about.
+    const TensorDesc ins[] = {input.desc(), u.desc()};
+    const TensorDesc outs[] = {output.desc()};
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.padding = {1, 1};
+
+    const auto plan = backend::cpu::get_conv2d_winograd_plan(attrs, ins, outs, 1, false);
+    NNOPS_EXPECT_TRUE(plan.route == backend::cpu::Conv2DWinogradRoute::ChannelLast);
+    NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
+    NNOPS_EXPECT_EQ(plan.icn_block, ug.kc);
+    NNOPS_EXPECT_EQ(plan.num_tiles, int64_t{7 * 7});
+
+    // A planar U with a channel-last activation has no route.
+    const int64_t pu_shape[] = {16, 32, 32};
+    std::vector<float> pu_buf(16 * 32 * 32, 0.0f);
+    TensorView pu(std::span<const int64_t>(pu_shape, 3), DataType::f32, pu_buf.data(),
+                  32 * static_cast<int64_t>(sizeof(float)),
+                  TensorLayout::PackedWinoWeight);
+    const TensorDesc bad[] = {input.desc(), pu.desc()};
+    NNOPS_EXPECT_EQ(backend::cpu::get_conv2d_winograd_plan(attrs, bad, outs, 1, false)
+                        .workspace_size, 0u);
 }
 
 NNOPS_TEST(conv2d_nhwc_threaded_matches_serial) {

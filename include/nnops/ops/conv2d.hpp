@@ -131,10 +131,21 @@ struct Conv2DAttributes {
 ///     fixed amount per tile per channel, so the 2.25x multiply saving needs a
 ///     wide K to pay for them: a wash at 8 channels, ~1.2x at 32, 1.5-1.6x at
 ///     128-256.
-///   * At least 14x14 of input. Below that the kernel's 8-lane tile packing
-///     inflates the GEMM's N more than the multiply saving is worth — a 7x7
-///     output packs its 4 real tile columns to 8 and runs 0.65x the speed of
+///   * At least 14x14 of input. Below that the planar kernel's 8-lane tile
+///     packing inflates the GEMM's N more than the multiply saving is worth — a
+///     7x7 output packs its 4 real tile columns to 8 and runs 0.65x the speed of
 ///     im2col, while 14x14 packs 7 to 8 (14% waste) and keeps a 1.15x lead.
+///
+/// The channel-last route clears every one of those by a wider margin, because
+/// it has neither of the two costs the planar thresholds are really about: no
+/// deinterleaving load, no strided column store, and no 8-lane tile packing (its
+/// tiles are flattened, so a 7x7 plane's 16 tiles are exactly 16). Measured
+/// against the channel-last implicit GEMM on the same layer (bench_conv2d_nhwc,
+/// medians of 3 with a null control): 0.46-0.77x of its time at every IC >= 32
+/// shape from 7x7 to 224x224, 1T through 20T, f32 and f16 — 7x7 included, and a
+/// 3-channel stem is 2.8x worse. So the shared floor stays at 14x14: a policy
+/// with one signature can only be as permissive as the route that constrains
+/// it, and that costs the channel-last route nothing it was asked for.
 inline bool winograd_applicable(const Conv2DAttributes& attrs,
                                 int64_t ic_per_group, int64_t ih, int64_t iw)
 {
