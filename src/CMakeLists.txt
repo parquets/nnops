@@ -49,7 +49,6 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/activation.cpp
     backend/cpu/clamp.cpp
     backend/cpu/norm.cpp
-    backend/cpu/pooling.cpp
     backend/cpu/softmax.cpp
     backend/cpu/eltwise.cpp
     backend/cpu/embed.cpp
@@ -82,11 +81,13 @@ set(NNOPS_CPU_SOURCES
 
     # CPU convolution kernels: the implicit-GEMM route (both layouts — planar
     # NCHW and channel-last NHWC, fp and quantized, one file since they share a
-    # plan, a scratch layout and a driver), the Winograd F(2x2,3x3) route, and
-    # the depthwise kernel.
+    # plan, a scratch layout and a driver), the Winograd F(2x2,3x3) route, the
+    # depthwise kernel and pooling (which sweeps the same windows the two above
+    # do, and shares their channel-lane / width-lane split).
     backend/cpu/conv/conv2d_implicit_gemm.cpp
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/depthwise_conv.cpp
+    backend/cpu/conv/pooling.cpp
     backend/cpu/conv/conv3d.cpp
 
     # CPU tiled attention kernels (fused QK^T + softmax + AV; linear attention

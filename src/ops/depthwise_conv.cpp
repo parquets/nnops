@@ -386,6 +386,19 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
     // input, weight [, bias] — prepacked when the input is packed
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     const auto& in = inputs[0];
+    if (is_channel_last(in.layout)) {
+        // The channel-lane kernel loads one tap of eight channels as a single
+        // vector, which the planar filter [C, 1, KH, KW] cannot give it (a
+        // tap's channels are C elements apart). The raw HWCM filter
+        // [KH][KW][C] is TensorFlow's depthwise order and already is that
+        // access pattern, so no prepack step is involved.
+        if (inputs[1].layout != TensorLayout::HWCM) {
+            return Status::unsupported;
+        }
+        return detail::require(
+            detail::dtype_in<DataType::f32, DataType::f16,
+                             DataType::s8, DataType::u8>(in.dtype));
+    }
     if (!is_planar_spatial(in.layout)) {
         return detail::require(
             is_layout_supported(in.layout, LayoutSupport::PackedOnly));

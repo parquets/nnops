@@ -52,6 +52,55 @@ std::vector<T> nhwc_to_nchw(std::span<const T> src,
     return dst;
 }
 
+/// [N][C][S] → [N][S][C] over a flat spatial extent @p S — the 2D and 3D
+/// channel-last layouts alike, whose row strides the callers do not care about
+/// because only the element order matters.
+template <class T>
+std::vector<T> to_channel_last(std::span<const T> src,
+                               int64_t N, int64_t C, int64_t S)
+{
+    std::vector<T> dst(src.size());
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            const T* s = src.data() + (n * C + c) * S;
+            T* d = dst.data() + n * S * C + c;
+            for (int64_t i = 0; i < S; ++i) { d[i * C] = s[i]; }
+        }
+    }
+    return dst;
+}
+
+/// [N][S][C] → [N][C][S] — the inverse of to_channel_last.
+template <class T>
+std::vector<T> to_channel_first(std::span<const T> src,
+                                int64_t N, int64_t C, int64_t S)
+{
+    std::vector<T> dst(src.size());
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            T* d = dst.data() + (n * C + c) * S;
+            const T* s = src.data() + n * S * C + c;
+            for (int64_t i = 0; i < S; ++i) { d[i] = s[i * C]; }
+        }
+    }
+    return dst;
+}
+
+/// The depthwise filter [C][(KD)KH KW] → HWCM [(KD)][KH][KW][C] — TensorFlow's
+/// depthwise order with the multiplier dropped. A plain transpose of the
+/// C-by-taps matrix; the multipliers of the shape are the caller's business,
+/// since the kernel reads only the flat tap-major order.
+template <class T>
+std::vector<T> depthwise_to_hwcm(std::span<const T> src, int64_t C, int64_t taps)
+{
+    std::vector<T> dst(src.size());
+    for (int64_t c = 0; c < C; ++c) {
+        const T* s = src.data() + c * taps;
+        for (int64_t t = 0; t < taps; ++t) { dst[t * C + c] = s[t]; }
+    }
+    return dst;
+}
+
 /// OIHW [OC][ICG][KH][KW] → HWIO [KH][KW][ICG][OC] (TensorFlow's filter).
 template <class T>
 std::vector<T> oihw_to_hwio(std::span<const T> src,

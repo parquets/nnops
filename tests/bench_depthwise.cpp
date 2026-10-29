@@ -27,6 +27,7 @@
 #include "backend/cpu/simd_kernel/simd_depthwise_conv.hpp"
 #include "nnops/ops/layout_convert.hpp"
 #include "common/bench_harness.hpp"
+#include "common/channel_last.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
 #include "common/test_helpers.hpp"
@@ -206,9 +207,31 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         packed_op->compute(outs, packed_in, ctx);
     };
 
-    // ---- agreement: the two kernels must be computing the same function ----
+    // ---- nhwc arm: TensorFlow's orders, converted once like a real graph ----
+    auto in_cl_vec = test::to_channel_last<float>(
+        std::span<const float>(in_vec.data(), in_vec.size()), 1, c.C, c.IH * c.IW);
+    auto w_cl_vec = test::depthwise_to_hwcm<float>(
+        std::span<const float>(w_vec.data(), w_vec.size()), c.C, c.KH * c.KW);
+    TensorView nhwc_in_v(ishape, DataType::f32, in_cl_vec.data(), TensorLayout::NHWC);
+    const int64_t w_cl_shape[] = {1, c.KH, c.KW, c.C};
+    TensorView nhwc_w_v(std::span<const int64_t>(w_cl_shape, 4), DataType::f32,
+                        w_cl_vec.data(), TensorLayout::HWCM);
+
+    auto nhwc_op = DepthwiseConv::create(attrs, Backend::CPU);
+    const TensorView nhwc_in[] = {nhwc_in_v, nhwc_w_v, b_nchw};
+    const TensorDesc nhwc_in_desc[] = {nhwc_in_v.desc(), nhwc_w_v.desc(), b_nchw.desc()};
+    auto nhwc_out_desc = nhwc_op->getOutputTensorDesc(nhwc_in_desc)[0];
+    std::vector<float> nhwc_out_buf(static_cast<size_t>(nhwc_out_desc.numel()));
+    auto nhwc_out = test::make_planar(nhwc_out_desc, nhwc_out_buf.data());
+    const auto nhwc_call = [&](const ComputeContext& ctx) {
+        TensorView outs[] = {nhwc_out};
+        nhwc_op->compute(outs, nhwc_in, ctx);
+    };
+
+    // ---- agreement: every arm must be computing the same function ----
     planar_call(ComputeContext{});
     packed_call(ComputeContext{});
+    nhwc_call(ComputeContext{});
     std::vector<float> packed_as_planar(static_cast<size_t>(planar_out_desc.numel()));
     auto packed_nchw = test::make_planar(planar_out_desc, packed_as_planar.data());
     {
@@ -219,15 +242,20 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     }
     const double d = max_abs_diff(planar_out_buf.data(), packed_as_planar.data(),
                                   planar_out_desc.numel());
+    auto nhwc_as_planar = test::to_channel_first<float>(
+        std::span<const float>(nhwc_out_buf.data(), nhwc_out_buf.size()),
+        1, c.C, OH * OW);
+    const double d_cl = max_abs_diff(planar_out_buf.data(), nhwc_as_planar.data(),
+                                     planar_out_desc.numel());
 
     const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
     std::printf("  %s\n", c.name);
     std::printf("    in[1,%lld,%lld,%lld] w[%lld,1,%lldx%lld] s%lld p%lld -> out[1,%lld,%lld,%lld]"
-                "  |planar - packed| = %.2e\n",
+                "  |planar - packed| = %.2e  |planar - nhwc| = %.2e\n",
                 (long long)c.C, (long long)c.IH, (long long)c.IW,
                 (long long)c.C, (long long)c.KH, (long long)c.KW,
                 (long long)c.SH, (long long)c.PH,
-                (long long)c.C, (long long)OH, (long long)OW, d);
+                (long long)c.C, (long long)OH, (long long)OW, d, d_cl);
 
     for (int nt : threads) {
         BenchPool pool(nt);
@@ -237,20 +265,25 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
 
         planar_call(use_ctx);                // warm-up / first touch
         packed_call(use_ctx);
+        nhwc_call(use_ctx);
 
-        std::vector<double> a1, b, a2;
+        std::vector<double> a1, b, cl, a2;
         for (int r = 0; r < rounds; ++r) {
             a1.push_back(time_us([&] { planar_call(use_ctx); }, iters));
             b.push_back(time_us([&] { packed_call(use_ctx); }, iters));
+            cl.push_back(time_us([&] { nhwc_call(use_ctx); }, iters));
             a2.push_back(time_us([&] { planar_call(use_ctx); }, iters));
         }
         const double tp = median_of(a1);
         const double tk = median_of(b);
+        const double tc = median_of(cl);
         const double null_gap = (median_of(a2) / tp - 1.0) * 100.0;
 
         std::printf("    %2dT  planar %8.1f us (%6.1f GFLOPS) | packed %8.1f us (%6.1f GFLOPS)"
-                    " | %5.2fx  (null %+4.1f%%)\n",
-                    nt, tp, flops / (tp * 1e3), tk, flops / (tk * 1e3), tp / tk, null_gap);
+                    " | nhwc %8.1f us (%6.1f GFLOPS) | planar/nhwc %5.2fx"
+                    " packed/nhwc %5.2fx  (null %+4.1f%%)\n",
+                    nt, tp, flops / (tp * 1e3), tk, flops / (tk * 1e3),
+                    tc, flops / (tc * 1e3), tp / tc, tk / tc, null_gap);
     }
 }
 
@@ -371,7 +404,10 @@ NNOPS_BENCH(depthwise_planar_vs_packed) {
     }
 
     const DepthwiseCase cases[] = {
+        {"dw 3x3 C=8   @112 s1",    8, 112, 112},   // one block: NHWC == packed
+        {"dw 3x3 C=16  @112 s1",   16, 112, 112},
         {"dw 3x3 C=32  @112 s1",   32, 112, 112},
+        {"dw 3x3 C=64  @112 s1",   64, 112, 112},
         {"dw 3x3 C=96  @112 s2",   96, 112, 112, 3, 3, 2, 2},
         {"dw 3x3 C=144 @56  s1",  144,  56,  56},
         {"dw 3x3 C=240 @28  s1",  240,  28,  28},

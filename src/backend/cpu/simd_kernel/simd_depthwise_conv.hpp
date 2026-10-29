@@ -29,8 +29,18 @@ struct DwConvParams {
     int64_t DD, DH, DW;           // dilation
     int64_t PD, PH, PW;           // padding
     int64_t out_row_stride;       // output row stride (elems)
+    int64_t ow0 = 0;              // first output column this call covers
+    int64_t ow_end = -1;          // one past the last; negative means OW
     int64_t in_d_stride;          // input depth stride (elems)
     int64_t in_row_stride;        // input row stride (elems)
+    int64_t pix_stride = 8;       // elems between adjacent pixels: 8 for a
+                                  // channel-packed block, the channel count for
+                                  // a channel-last plane
+    int64_t w_tap_stride = 8;     // elems between adjacent filter taps: 8 for a
+                                  // packed [C8, KH, KW, 8] block, the channel
+                                  // count for a raw [KH][KW][C] filter (and 8
+                                  // for the dequantized staging block built
+                                  // from one)
 };
 
 /// R output rows per call. W is the packed-weight element type; Tag only picks
@@ -58,13 +68,26 @@ struct DwConvParams {
 /// slower. Running two output positions per iteration shares the weight
 /// vectors but needs eight live accumulators, and either the register file or
 /// this compiler's allocation gives it back — 24 GFLOPS against 35.
-template <int R, typename W, typename Tag, typename Src, typename Dst, typename V>
+template <int R, int NV, typename W, typename Tag, typename Src, typename Dst, typename V>
 inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
-                        const Epilogue& epilogue, const Src& src, const Dst& dst,
-                        const V& vbias)
+                        const Epilogue& epilogue, const Src (&srcs)[NV],
+                        const Dst (&dsts)[NV], const V (&vbias)[NV])
 {
     using InPtr = const typename Src::elem*;
-    constexpr int64_t kLane = 8;          // channels per packed block == lanes
+    // The pixel and the filter tap are both "one vector of channels" apart in
+    // the packed layout, and both "the channel count" apart in a channel-last
+    // plane, so the two strides are all that separate the two routes.
+    //
+    // NV is how many adjacent channel vectors of one pixel a call covers. The
+    // packed route is always 1 (a block is one vector, and its planes are
+    // dense); a channel-last plane wants 2, because a 64-byte cache line holds
+    // two vectors and a single-vector call leaves the other half of every line
+    // to a later pass — 2x the line traffic for the same arithmetic. Because
+    // the row table is built from vector 0 and the access policies load the
+    // address they are handed, vector k's channels are added here.
+    const int64_t pix = p.pix_stride;
+    const int64_t wtap = p.w_tap_stride;
+    constexpr int64_t kVec = kChannelLanes;
     constexpr int64_t kMaxTapRows = 256;  // (kd, kh, r): 8x8 with R = 4 fits
 
     const int64_t nrow = p.KD * p.KH;
@@ -76,7 +99,7 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
             const bool d_ok = (id >= 0 && id < p.ID);
-            const InPtr in_d = src.ptr_at(id * p.in_d_stride - p.PW * kLane);
+            const InPtr in_d = srcs[0].ptr_at(id * p.in_d_stride - p.PW * pix);
             for (int64_t kh = 0; kh < p.KH; ++kh) {
                 for (int r = 0; r < R; ++r) {
                     const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
@@ -101,10 +124,11 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
     const int64_t off_ok_lo = p.PW;
     const int64_t off_ok_hi = p.IW + p.PW;
 
-    for (int64_t ow = 0; ow < p.OW; ++ow) {
-        V acc[R];
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+    for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
+        V acc[R][NV];
         for (int r = 0; r < R; ++r) {
-            acc[r] = vbias;
+            for (int k = 0; k < NV; ++k) { acc[r][k] = vbias[k]; }
         }
 
         const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
@@ -112,16 +136,16 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
             for (int64_t kh = 0; kh < p.KH; ++kh) {
-                const W* w_row = w + (kd * p.KH + kh) * p.KW * kLane;
+                const W* w_row = w + (kd * p.KH + kh) * p.KW * wtap;
                 InPtr row[R];
                 if (have_tab) {
                     const int64_t t = (kd * p.KH + kh) * R;
-                    for (int r = 0; r < R; ++r) { row[r] = row_base[t + r]; }
+                    for (int64_t r = 0; r < R; ++r) { row[r] = row_base[t + r]; }
                 } else {
                     const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
                     if (id < 0 || id >= p.ID) { continue; }
-                    const InPtr in_d = src.ptr_at(id * p.in_d_stride - p.PW * kLane);
-                    for (int r = 0; r < R; ++r) {
+                    const InPtr in_d = srcs[0].ptr_at(id * p.in_d_stride - p.PW * pix);
+                    for (int64_t r = 0; r < R; ++r) {
                         const int64_t ih = (p.oh + r) * p.SH + kh * p.DH - p.PH;
                         const bool ok = (p.oh + r < p.OH) && ih >= 0 && ih < p.IH;
                         row[r] = ok ? in_d + ih * p.in_row_stride : nullptr;
@@ -130,10 +154,13 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 
                 if (interior) {
                     for (int64_t kw = 0; kw < p.KW; ++kw) {
-                        const V vk = v_load(w_row + kw * kLane);
-                        const int64_t at = (ow_off + kw * p.DW) * kLane;
-                        for (int r = 0; r < R; ++r) {
-                            acc[r] = v_fmadd(src.load_ptr(row[r] + at), vk, acc[r]);
+                        const int64_t at = (ow_off + kw * p.DW) * pix;
+                        for (int k = 0; k < NV; ++k) {
+                            const V vk = v_load(w_row + kw * wtap + k * kVec);
+                            for (int r = 0; r < R; ++r) {
+                                acc[r][k] = v_fmadd(srcs[k].load_ptr(row[r] + at + k * kVec), vk,
+                                                    acc[r][k]);
+                            }
                         }
                     }
                     continue;
@@ -144,13 +171,16 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                     if (off < off_ok_lo || off >= off_ok_hi) {
                         continue;
                     }
-                    const V vk = v_load(w_row + kw * kLane);
-                    const int64_t at = off * kLane;
-                    for (int r = 0; r < R; ++r) {
-                        if (row[r] == nullptr) {
-                            continue;
+                    const int64_t at = off * pix;
+                    for (int k = 0; k < NV; ++k) {
+                        const V vk = v_load(w_row + kw * wtap + k * kVec);
+                        for (int r = 0; r < R; ++r) {
+                            if (row[r] == nullptr) {
+                                continue;
+                            }
+                            acc[r][k] = v_fmadd(srcs[k].load_ptr(row[r] + at + k * kVec), vk,
+                                                acc[r][k]);
                         }
-                        acc[r] = v_fmadd(src.load_ptr(row[r] + at), vk, acc[r]);
                     }
                 }
             }
@@ -160,7 +190,11 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
             if (p.oh + r >= p.OH) {
                 continue;
             }
-            dst.store(r, ow, nnops::backend::cpu::apply_epilogue_vec(epilogue, tag, acc[r]));
+            for (int k = 0; k < NV; ++k) {
+                dsts[k].store(r, ow,
+                              nnops::backend::cpu::apply_epilogue_vec(epilogue, tag,
+                                                                      acc[r][k]));
+            }
         }
     }
 }
@@ -477,9 +511,11 @@ inline void dwconv_h4(T* output, const T* input, const T* w_base,
                       const T* bias_vec, const DwConvParams& p,
                       const Epilogue& epilogue, bool add_to)
 {
-    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero(output);
-    dwconv_rows<4>(p, w_base, output, epilogue,
-                   FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to}, vbias);
+    const auto vb = bias_vec ? v_load(bias_vec) : v_zero(output);
+    const decltype(vb) vbias[1] = {vb};
+    const FpSrc<T> src[1] = {FpSrc<T>{input}};
+    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
+    dwconv_rows<4, 1>(p, w_base, output, epilogue, src, dst, vbias);
 }
 
 template <typename T>
@@ -487,9 +523,11 @@ inline void dwconv_h1(T* output, const T* input, const T* w_base,
                       const T* bias_vec, const DwConvParams& p,
                       const Epilogue& epilogue, bool add_to)
 {
-    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero(output);
-    dwconv_rows<1>(p, w_base, output, epilogue,
-                   FpSrc<T>{input}, FpDst<T>{output, p.out_row_stride, add_to}, vbias);
+    const auto vb = bias_vec ? v_load(bias_vec) : v_zero(output);
+    const decltype(vb) vbias[1] = {vb};
+    const FpSrc<T> src[1] = {FpSrc<T>{input}};
+    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
+    dwconv_rows<1, 1>(p, w_base, output, epilogue, src, dst, vbias);
 }
 
 // Quantized: the weights arrive already dequantized (f32, per-channel, with pad
@@ -502,11 +540,11 @@ inline void dwconv_h4_quant(OutT* output, const InT* input, const float* wq,
                             float in_scale, float in_zero,
                             float out_scale, float out_zero)
 {
-    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero_f32x8();
-    dwconv_rows<4>(p, wq, &out_scale, epilogue,
-                   QuantSrc<InT>{input, in_scale, in_zero},
-                   QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to},
-                   vbias);
+    const v_f32x8 vbias[1] = {bias_vec ? v_load(bias_vec) : v_zero_f32x8()};
+    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
+    const QuantDst<OutT> dst[1] = {
+        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
+    dwconv_rows<4, 1>(p, wq, &out_scale, epilogue, src, dst, vbias);
 }
 
 template <typename InT, typename OutT>
@@ -516,11 +554,136 @@ inline void dwconv_h1_quant(OutT* output, const InT* input, const float* wq,
                             float in_scale, float in_zero,
                             float out_scale, float out_zero)
 {
-    const auto vbias = bias_vec ? v_load(bias_vec) : v_zero_f32x8();
-    dwconv_rows<1>(p, wq, &out_scale, epilogue,
-                   QuantSrc<InT>{input, in_scale, in_zero},
-                   QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to},
-                   vbias);
+    const v_f32x8 vbias[1] = {bias_vec ? v_load(bias_vec) : v_zero_f32x8()};
+    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
+    const QuantDst<OutT> dst[1] = {
+        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
+    dwconv_rows<1, 1>(p, wq, &out_scale, epilogue, src, dst, vbias);
+}
+
+// ============================================================
+// Channel-last (NHWC/NDHWC) entry points
+// ============================================================
+//
+// These are the packed kernel (dwconv_rows) with two runtime strides instead of
+// the C8 constants: a pixel is C elements away, because a pixel holds all of
+// the plane's channels, and a filter tap is C elements away too, because the
+// weight is the raw HWCM filter [tap][C] — TensorFlow's depthwise order with
+// the multiplier dropped. No prepack step is involved: the layout already is
+// the access pattern.
+//
+// The driver also keeps the packed route's shape — four output rows per call
+// for the ILP, one channel block per call — and that is not incidental. A
+// first cut gave the channel-last route its own kernel with NC pixels in flight
+// down the contiguous axis, one output row per task, one task per (row, block).
+// It measured 1.4-1.9x slower than the packed kernel on every shape, and at
+// C = 8 — where the two layouts are byte-identical, so only the kernel differs
+// — it was still 1.4x slower: the column sweep needs eight live accumulators to
+// cover the same four pixels the row sweep gets from four, and the per-block
+// call rebuilt the row table and re-walked the row for each of the C/8 blocks.
+
+/// @p out_rows is the output row base advanced by the channel block, @p in_img
+/// the image base advanced by the same, @p w_tap0 the block's first channel of
+/// the tap-major weight, and @p lanes how many channels the call covers — up to
+/// 16, which is a whole 64-byte line of f32.
+///
+/// Sixteen channels run as two vectors. One vector per call is what the packed
+/// route does, and it is free there because a block's plane is dense; on a
+/// channel-last plane the second half of every line belongs to the next block,
+/// so a one-vector call leaves it for a later pass — two touches per line where
+/// the packed route has one.
+template <int R, typename T>
+inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
+                        const T* bias_vec, const DwConvParams& p,
+                        const Epilogue& epilogue, bool add_to, int64_t lanes)
+{
+    if (lanes > kChannelLanes) {
+        const auto vb0 = bias_vec ? v_load(bias_vec) : v_zero(out_rows);
+        const auto vb1 = bias_vec ? v_load(bias_vec + kChannelLanes) : v_zero(out_rows);
+        const decltype(vb0) vbias[2] = {vb0, vb1};
+        const FpSrc<T, true> src[2] = {
+            FpSrc<T, true>{in_img, kChannelLanes},
+            FpSrc<T, true>{in_img + kChannelLanes, kChannelLanes}};
+        const FpDst<T, true> dst[2] = {
+            FpDst<T, true>{out_rows, p.out_row_stride, add_to, p.pix_stride,
+                           kChannelLanes},
+            FpDst<T, true>{out_rows + kChannelLanes, p.out_row_stride, add_to,
+                           p.pix_stride, kChannelLanes}};
+        dwconv_rows<R, 2>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+        return;
+    }
+    const auto vb = bias_vec ? load_lanes(bias_vec, lanes) : v_zero(out_rows);
+    const decltype(vb) vbias[1] = {vb};
+    if (lanes == kChannelLanes) {
+        const FpSrc<T, true> src[1] = {FpSrc<T, true>{in_img, lanes}};
+        const FpDst<T, true> dst[1] = {
+            FpDst<T, true>{out_rows, p.out_row_stride, add_to, p.pix_stride, lanes}};
+        dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+    } else {
+        const FpSrc<T, false> src[1] = {FpSrc<T, false>{in_img, lanes}};
+        const FpDst<T, false> dst[1] = {
+            FpDst<T, false>{out_rows, p.out_row_stride, add_to, p.pix_stride, lanes}};
+        dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+    }
+}
+
+/// Quantized channel-last. The HWCM filter is s8/u8, so this block's taps are
+/// dequantized once per call into a staging block — nine vectors for a 3x3
+/// against the row group's thousands of FMAs — and the kernel is then the f32
+/// one above. Pad lanes are neutralized with scale 0, the convention the packed
+/// route used: the byte they read is the neighbouring channel, and 0 * it is 0.
+constexpr int64_t kMaxLastQuantTaps = 9 * 9 * 9;  // 729
+
+template <int R, typename InT, typename OutT>
+inline void dwconv_last_quant(OutT* out_rows, const InT* in_img, const InT* w_tap0,
+                              const float* w_scale, const int32_t* w_zero,
+                              const float* bias_vec, const DwConvParams& p,
+                              const Epilogue& epilogue, bool add_to, int64_t lanes,
+                              float in_scale, float in_zero,
+                              float out_scale, float out_zero)
+{
+    const int64_t taps = p.KD * p.KH * p.KW;
+    if (taps > kMaxLastQuantTaps) { return; }   // the driver rejects this shape
+    const int64_t C = p.pix_stride;
+
+    alignas(32) float w_scale8[kChannelLanes];
+    alignas(32) float w_zero8[kChannelLanes];
+    for (int64_t l = 0; l < kChannelLanes; ++l) {
+        const bool live = (l < lanes) && (w_scale != nullptr);
+        w_scale8[l] = live ? w_scale[l] : 0.0f;
+        w_zero8[l]  = (live && w_zero != nullptr)
+                          ? static_cast<float>(w_zero[l]) : 0.0f;
+    }
+
+    alignas(32) float wq[kMaxLastQuantTaps * kChannelLanes];
+    for (int64_t t = 0; t < taps; ++t) {
+        InT wt[kChannelLanes] = {};
+        std::memcpy(wt, w_tap0 + t * C, static_cast<size_t>(lanes) * sizeof(InT));
+        v_store(&wq[t * kChannelLanes], dequantize_channel(wt, w_scale8, w_zero8));
+    }
+
+    // The staging block is dense 8-lane taps, so the tap stride is the vector
+    // width even though the plane's pixel stride is the channel count.
+    DwConvParams pq = p;
+    pq.w_tap_stride = kChannelLanes;
+
+    const v_f32x8 vbias[1] = {bias_vec ? load_lanes(bias_vec, lanes)
+                                       : v_zero_f32x8()};
+    if (lanes == kChannelLanes) {
+        const QuantSrc<InT, true> src[1] = {QuantSrc<InT, true>{in_img, in_scale,
+                                                                in_zero, lanes}};
+        const QuantDst<OutT, true> dst[1] = {
+            QuantDst<OutT, true>{out_rows, p.out_row_stride, out_scale, out_zero,
+                                 add_to, p.pix_stride, lanes}};
+        dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias);
+    } else {
+        const QuantSrc<InT, false> src[1] = {QuantSrc<InT, false>{in_img, in_scale,
+                                                                  in_zero, lanes}};
+        const QuantDst<OutT, false> dst[1] = {
+            QuantDst<OutT, false>{out_rows, p.out_row_stride, out_scale, out_zero,
+                                  add_to, p.pix_stride, lanes}};
+        dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias);
+    }
 }
 
 }  // namespace nnops::kernel

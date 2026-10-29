@@ -1,6 +1,6 @@
 /// @file pooling.cpp
-/// @brief Pooling operator dispatch — packed or planar I/O, direct pass-through
-///        (output layout follows the input's).
+/// @brief Pooling operator dispatch — planar, packed or channel-last I/O, direct
+///        pass-through (output layout follows the input's).
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -47,6 +47,13 @@ Status Pooling::validate(std::span<const TensorDesc> inputs,
         return detail::require(
             detail::dtype_in<DataType::f32, DataType::f16>(in.dtype),
             Status::unsupported);
+    }
+    if (is_channel_last(in.layout)) {
+        // The lane is the channel, so the channel-lane kernels cover the whole
+        // type menu: f32/f16 and the quantized s8/u8 pairs.
+        return detail::require(
+            detail::dtype_in<DataType::f32, DataType::f16,
+                             DataType::s8, DataType::u8>(in.dtype));
     }
     return detail::require(is_layout_supported(in.layout, LayoutSupport::PackedOnly));
 }

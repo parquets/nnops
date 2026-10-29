@@ -86,6 +86,17 @@ enum class TensorLayout : uint8_t {
                                 ///< every consumer outside the Winograd kernel —
                                 ///< this tag is a promise about *which* kernel,
                                 ///< not a layout anyone else may index.
+
+    // ---- Channel-last depthwise weight ----
+    HWCM = 14,  ///< [KH][KW][C] (3D: [KD][KH][KW][C]) — TensorFlow's depthwise
+                ///< filter [KH, KW, C, M] with the multiplier M == 1, which is
+                ///< what this operator requires (OC == IC). Like HWIO for a
+                ///< dense conv, the tensor's *shape* is the filter itself, and
+                ///< it pairs with a channel-last activation: one vector per tap
+                ///< is 8 consecutive channels of that tap, which is exactly
+                ///< what the channel-lane kernel loads. The planar filter
+                ///< [C, 1, (KD,) KH, KW] stores a tap's channels C elements
+                ///< apart, so it cannot serve that kernel.
 };
 
 
@@ -103,6 +114,7 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::PackedWeight: return 1;
     case TensorLayout::PackedWinoWeight: return 1;
     case TensorLayout::PackedWinoWeightLast: return 1;
+    case TensorLayout::HWCM:     return 1;
     case TensorLayout::NHWC:     return 1;
     case TensorLayout::NDHWC:    return 1;
     case TensorLayout::HWIO:     return 1;
@@ -134,6 +146,12 @@ constexpr bool is_channel_last_weight(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWIO;
 }
 
+/// Returns true for the channel-last *depthwise* filter (HWCM) — [KH][KW][C],
+/// the weight order that pairs with a channel-last activation.
+constexpr bool is_depthwise_weight_last(TensorLayout layout) noexcept {
+    return layout == TensorLayout::HWCM;
+}
+
 /// Returns true for the activation layouts with no channel blocking: planar
 /// (NCHW, NCDHW) and channel-last (NHWC, NDHWC). Weight layouts are planar.
 constexpr bool is_unpacked(TensorLayout layout) noexcept {
@@ -158,6 +176,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::NCHWC16:
     case TensorLayout::NCHWC32:
     case TensorLayout::PackedWeight:
+    case TensorLayout::HWCM:
     case TensorLayout::PackedWinoWeight:
     case TensorLayout::PackedWinoWeightLast:
     case TensorLayout::NHWC:

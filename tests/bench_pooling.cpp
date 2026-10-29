@@ -21,11 +21,13 @@
 #include "nnops/ops/pooling.hpp"
 #include "nnops/ops/reduce.hpp"
 #include "common/bench_harness.hpp"
+#include "common/channel_last.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
 #include "common/test_helpers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -285,6 +287,217 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
     }
 }
 
+// ============================================================
+// Layouts: NHWC against NCHW and the C8 pack
+// ============================================================
+//
+// The channel-lane kernels put one pixel's eight channels in a vector. NCHWC8
+// and NHWC differ only in how the plane is laid out around that pixel — eight
+// channels dense per pixel, or all C of them — so they present the kernel the
+// same access pattern and must land within noise of each other. This bench
+// holds shape and kernel fixed and varies only the layout.
+//
+// Two questions a pooler asks are timed for each layout: the whole-plane mean
+// (attrs.global, the scan a model runner calls) and the whole-plane max (a
+// window over the full extent, which is the only route max pooling has).
+
+struct LayoutCase {
+    const char* name;
+    int64_t C, H, W;
+    bool f16 = false;
+};
+
+template <typename T>
+void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
+                     int rounds, int iters)
+{
+    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    const int64_t shape[] = {1, c.C, c.H, c.W};
+    auto [in_vec, in_nchw] = make_random<T>(shape, 11);
+
+    // NCHWC8: eight channels dense per pixel, the tail block zero-padded.
+    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    TensorDesc in_desc = in_nchw.desc();
+    const TensorDesc pack_in[] = {in_desc};
+    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
+    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
+    auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
+    {
+        const TensorView p_ins[] = {in_nchw};
+        TensorView p_outs[] = {in_c8};
+        pack_op->compute(p_outs, p_ins);
+    }
+
+    // NHWC: all C channels dense per pixel.
+    auto cl_vec = test::to_channel_last<T>(
+        std::span<const T>(in_vec.data(), in_vec.size()), 1, c.C, c.H * c.W);
+    TensorView in_cl(shape, dt, cl_vec.data(), TensorLayout::NHWC);
+
+    const TensorView* ins[3] = {&in_nchw, &in_c8, &in_cl};
+    const char* const names[3] = {"NCHW", "NCHWC8", "NHWC"};
+
+    struct Arm {
+        TensorView in;
+        std::unique_ptr<Pooling> op;
+        std::vector<T> buf;
+        TensorView out;
+    };
+
+    auto make_mode = [&](const PoolingAttributes& attrs) {
+        std::array<Arm, 3> arms;
+        for (int i = 0; i < 3; ++i) {
+            arms[i].in = *ins[i];
+            arms[i].op = Pooling::create(attrs, Backend::CPU);
+            TensorDesc d = ins[i]->desc();
+            const TensorDesc ad[] = {d};
+            auto od = arms[i].op->getOutputTensorDesc(ad);
+            const int64_t storage = od[0].storage_bytes() / static_cast<int64_t>(sizeof(T));
+            arms[i].buf.assign(static_cast<size_t>(std::max(od[0].numel(), storage)), T{});
+            arms[i].out = is_channel_packed(od[0].layout)
+                ? test::make_packed(od[0], arms[i].buf.data())
+                : test::make_planar(od[0], arms[i].buf.data());
+        }
+        return arms;
+    };
+
+    PoolingAttributes avg_attrs;
+    avg_attrs.type = PoolingType::Average;
+    avg_attrs.global = true;
+    // 3x3 stride 2 with one pad: the stem max-pool every ImageNet CNN runs, and
+    // the only window shape that shows up in the models this bench stands in
+    // for. A full-extent window would time a reduction, not a pooling.
+    PoolingAttributes max_attrs;
+    max_attrs.type = PoolingType::Max;
+    max_attrs.kernel_shape = {1, 3, 3};
+    max_attrs.stride = {1, 2, 2};
+    max_attrs.padding = {0, 1, 1};
+
+    auto avg_arms = make_mode(avg_attrs);
+    auto max_arms = make_mode(max_attrs);
+    const char* const mode_names[2] = {"avg (global)", "max 3x3 s2"};
+
+    // Ground truth: the plane's mean and its max, computed on the host from the
+    // planar input. Every arm of every mode has to land on these — an arm that
+    // writes nothing would otherwise time as a win.
+    const int64_t plane = c.H * c.W;
+    std::vector<T> want_avg(static_cast<size_t>(c.C));
+    for (int64_t ch = 0; ch < c.C; ++ch) {
+        double sum = 0.0;
+        const T* p = in_vec.data() + ch * plane;
+        for (int64_t k = 0; k < plane; ++k) {
+            sum += static_cast<double>(simd::s_load(p + k));
+        }
+        simd::s_store(&want_avg[static_cast<size_t>(ch)],
+                      static_cast<float>(sum / static_cast<double>(plane)));
+    }
+
+    // The window reference: the planar max over a 3x3 stride-2 padded window.
+    const int64_t OH = (c.H + 2 - 3) / 2 + 1;
+    const int64_t OW = (c.W + 2 - 3) / 2 + 1;
+    std::vector<T> want_max(static_cast<size_t>(c.C * OH * OW));
+    for (int64_t ch = 0; ch < c.C; ++ch) {
+        const T* p = in_vec.data() + ch * plane;
+        for (int64_t oh = 0; oh < OH; ++oh) {
+            for (int64_t ow = 0; ow < OW; ++ow) {
+                double hi = -1e30;
+                for (int64_t kh = 0; kh < 3; ++kh) {
+                    const int64_t ih = oh * 2 + kh - 1;
+                    if (ih < 0 || ih >= c.H) { continue; }
+                    for (int64_t kw = 0; kw < 3; ++kw) {
+                        const int64_t iw = ow * 2 + kw - 1;
+                        if (iw < 0 || iw >= c.W) { continue; }
+                        hi = std::max(hi, static_cast<double>(
+                                          simd::s_load(p + ih * c.W + iw)));
+                    }
+                }
+                simd::s_store(&want_max[static_cast<size_t>((ch * OH + oh) * OW + ow)],
+                              static_cast<float>(hi));
+            }
+        }
+    }
+
+    std::printf("  %-28s [1,%lld,%lld,%lld] %s\n", c.name, (long long)c.C,
+                (long long)c.H, (long long)c.W, c.f16 ? "f16" : "f32");
+
+    for (int nt : threads) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use = (nt > 1) ? ctx : ComputeContext{};
+
+        for (int m = 0; m < 2; ++m) {
+            auto& arms = (m == 0) ? avg_arms : max_arms;
+            const std::vector<T>& want = (m == 0) ? want_avg : want_max;
+
+            auto run = [&](int i) {
+                TensorView o[] = {arms[i].out};
+                const TensorView x[] = {arms[i].in};
+                return arms[i].op->compute(o, x, use, nullptr);
+            };
+
+            const bool ok[3] = {is_ok(run(0)), is_ok(run(1)), is_ok(run(2))};
+            if (nt == threads.front()) {
+                const double tol = c.f16 ? 2e-3 : 1e-4;
+                for (int i = 0; i < 3; ++i) {
+                    if (!ok[i]) {
+                        std::printf("    !! %s/%s refused\n", mode_names[m], names[i]);
+                        continue;
+                    }
+                    // The packed layouts order an activation by block and then
+                    // lane, so a channel's elements are 8-blocked in the flat
+                    // buffer; NCHW and NHWC both read straight through.
+                    const bool pk = is_channel_packed(arms[i].out.layout());
+                    double worst = 0.0;
+                    int64_t at = 0;
+                    for (int64_t ch = 0; ch < c.C; ++ch) {
+                        for (int64_t e = 0; e < ((m == 0) ? 1 : OH * OW); ++e) {
+                            const bool cl =
+                                arms[i].out.layout() == TensorLayout::NHWC;
+                            int64_t k = (m == 0) ? ch : ch * OH * OW + e;
+                            if (pk) {
+                                const int64_t blk = ch / 8, lane = ch % 8;
+                                k = (m == 0) ? blk * 8 + lane
+                                             : (blk * OH * OW + e) * 8 + lane;
+                            } else if (cl) {
+                                // Channel-last: a pixel's channels are dense.
+                                k = (m == 0) ? ch : e * c.C + ch;
+                            }
+                            const double got = static_cast<double>(
+                                simd::s_load(arms[i].buf.data() + k));
+                            const double have = static_cast<double>(simd::s_load(
+                                &want[static_cast<size_t>((m == 0) ? ch
+                                                                  : ch * OH * OW + e)]));
+                            const double d = std::abs(got - have);
+                            if (d > worst) { worst = d; at = ch; }
+                        }
+                    }
+                    if (worst > tol) {
+                        std::printf("    !! %s/%s off by %.3g @%lld\n", mode_names[m],
+                                    names[i], worst, (long long)at);
+                    }
+                }
+            }
+
+            std::vector<double> a1, b, cl, a2;
+            for (int r = 0; r < rounds; ++r) {
+                a1.push_back(time_us(iters, [&] { run(0); }));
+                b.push_back(time_us(iters, [&] { run(1); }));
+                cl.push_back(time_us(iters, [&] { run(2); }));
+                a2.push_back(time_us(iters, [&] { run(0); }));
+            }
+            const double tp = median(a1);
+            const double tk = median(b);
+            const double tc = median(cl);
+            const double null_gap = (median(a2) / tp - 1.0) * 100.0;
+
+            std::printf("    %-12s %2dT  NCHW %8.2f us | NCHWC8 %8.2f us (%5.2fx)"
+                        " | NHWC %8.2f us (%5.2fx) | packed/nhwc %5.2fx  (null %+4.1f%%)\n",
+                        mode_names[m], nt, tp, tk, tp / tk, tc, tp / tc, tk / tc,
+                        null_gap);
+        }
+    }
+}
+
 }  // namespace
 
 NNOPS_BENCH(pooling_global) {
@@ -312,6 +525,34 @@ NNOPS_BENCH(pooling_global) {
             run_case<half>(c, threads, rounds, iters);
         } else {
             run_case<float>(c, threads, rounds, iters);
+        }
+    }
+}
+
+NNOPS_BENCH(pooling_layouts) {
+    const std::vector<int> threads = bench_threads();
+    const int rounds = 5;
+    const int iters = 50;
+
+    std::printf("pooling layouts: NCHW, NCHWC8 and NHWC over one shape and kernel\n");
+    std::printf("  pool=%s threads=", nnops::test::bench_pool_name());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
+    }
+
+    const LayoutCase cases[] = {
+        {"resnet18 avgpool",      512,  7,  7},
+        {"mobilenetv2 avgpool",  1280,  7,  7},
+        {"backbone plane 56x56",  256, 56, 56},
+        {"narrow 100 channels",   100, 14, 14},
+        {"resnet18 avgpool f16",  512,  7,  7, true},
+    };
+
+    for (const auto& c : cases) {
+        if (c.f16) {
+            run_layout_case<half>(c, threads, rounds, iters);
+        } else {
+            run_layout_case<float>(c, threads, rounds, iters);
         }
     }
 }
