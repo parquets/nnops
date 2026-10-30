@@ -17,9 +17,12 @@
 /// The shapes are the layers a channel-last framework actually runs — 1x1
 /// expansions and projections, 3x3 stacks, 5x5/7x7 stems, grouped and batched
 /// layers — because that is the population the layout has to win on, not one
-/// square.
+/// square. The depthwise row is the one exception to "Conv2D": it runs the
+/// DepthwiseConv operator, whose two layouts are the shapes a depthwise layer
+/// actually dispatches with (see bench_depthwise for that operator's own table).
 
 #include "nnops/ops/conv2d.hpp"
+#include "nnops/ops/depthwise_conv.hpp"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"
 #include "common/cpu_pool.hpp"
@@ -153,6 +156,10 @@ struct Shape {
     const char* name;
     int64_t N, IC, IH, IW, OC, KH, KW;
     int64_t SH = 1, SW = 1, PH = 0, PW = 0, groups = 1;
+    /// Depthwise layers run on the DepthwiseConv operator, not Conv2D with
+    /// groups == IC: the two are different kernels, and routing the row through
+    /// Conv2D measures a shape that operator never sees.
+    bool dw = false;
 };
 
 /// ResNet / MobileNet / Inception layer shapes, a few per family, plus the
@@ -178,7 +185,7 @@ const std::vector<Shape>& sweep() {
         {"conv 5x5 s2 56x56  16->32",       1,   16,  56,  56,   32, 5, 5, 2, 2, 2, 2},
         // ---- grouped / batched ----------------------------------------------
         {"group 3x3 56x56 128->128 g4",     1,  128,  56,  56,  128, 3, 3, 1, 1, 1, 1, 4},
-        {"depthwise-shaped 3x3 112x112 32", 1,   32, 112, 112,   32, 3, 3, 1, 1, 1, 1, 32},
+        {"depthwise 3x3 112x112 32",        1,   32, 112, 112,   32, 3, 3, 1, 1, 1, 1, 32, true},
         {"conv 3x3 s1 14x14 128->128 n8",   8,  128,  14,  14,  128, 3, 3, 1, 1, 1, 1},
     };
     return s;
@@ -193,6 +200,16 @@ constexpr DataType dtype_of() {
     return std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
 }
 
+/// One table row: the same layer run through each layout's entry point. A row is
+/// a conv or a depthwise conv, and the table does not care which — only that the
+/// two arms compute the same function on the layout each one wants.
+struct AbLayer {
+    virtual ~AbLayer() = default;
+    virtual void run_nchw(const ComputeContext&) = 0;
+    virtual void run_nhwc(const ComputeContext&) = 0;
+    double work = 0.0;   ///< 2 * MACs, for the GFLOPS column
+};
+
 template <class T>
 std::vector<T> random_vec(std::span<const int64_t> shape, uint64_t seed) {
     if constexpr (std::is_same_v<T, float>) {
@@ -205,7 +222,7 @@ std::vector<T> random_vec(std::span<const int64_t> shape, uint64_t seed) {
 }
 
 template <class T>
-struct AbFp {
+struct AbFp : AbLayer {
     explicit AbFp(const Shape& c) : s(c) {
         icg = c.IC / c.groups;
         const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
@@ -255,20 +272,98 @@ struct AbFp {
                               out_nhwc_buf.data(), TensorLayout::NHWC);
     }
 
-    void run_nchw(const ComputeContext& ctx) {
+    void run_nchw(const ComputeContext& ctx) override {
         const TensorView ins[] = {in_nchw, w_nchw, b_v};
         op->compute(std::span<TensorView>(&out_nchw, 1), ins, ctx, nullptr);
     }
-    void run_nhwc(const ComputeContext& ctx) {
+    void run_nhwc(const ComputeContext& ctx) override {
         const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
         op->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
     }
 
     Shape s;
     int64_t icg = 1, OH = 0, OW = 0;
-    double work = 0.0;
     std::unique_ptr<Conv2D> op;
     std::vector<T> in_planar, w_planar, in_cl, w_cl, bias;
+    std::vector<T> out_nchw_buf, out_nhwc_buf;
+    TensorView in_nchw, w_nchw, in_nhwc, w_nhwc, b_v;
+    TensorView out_nchw, out_nhwc;
+};
+
+// ============================================================
+// Depthwise A/B: the DepthwiseConv operator in both layouts
+// ============================================================
+//
+// The same layer as the conv rows, but on the operator a depthwise layer
+// actually dispatches to: planar takes NCHW + a [C][1][KH][KW] filter, the
+// channel-last arm takes NHWC + TensorFlow's HWCM filter. Feeding this shape to
+// Conv2D with groups == IC instead measures a route no model uses.
+
+template <class T>
+struct AbDw : AbLayer {
+    explicit AbDw(const Shape& c) : s(c) {
+        const int64_t C = c.IC;
+        const int64_t ish[]    = {c.N, C, c.IH, c.IW};
+        const int64_t wsh[]    = {C, 1, c.KH, c.KW};          // [C][1][KH][KW]
+        const int64_t wsh_cl[] = {c.KH, c.KW, C, 1};          // HWCM
+        const int64_t bsh[]    = {C};
+        constexpr DataType dt = dtype_of<T>();
+
+        const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
+        const auto w32  = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
+        bias = random_vec<T>(std::span<const int64_t>(bsh, 1), 3);
+        in_planar = in32;
+        in_cl     = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+                                          c.N, C, c.IH, c.IW);
+        w_planar  = w32;
+        w_hwcm    = test::depthwise_to_hwcm<T>(std::span<const T>(w32.data(), w32.size()),
+                                               C, c.KH * c.KW);
+
+        in_nchw = TensorView(std::span<const int64_t>(ish, 4), dt, in_planar.data(),
+                             TensorLayout::NCHW);
+        w_nchw  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_planar.data(),
+                             TensorLayout::NCHW);
+        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
+                             TensorLayout::NHWC);
+        w_nhwc  = TensorView(std::span<const int64_t>(wsh_cl, 4), dt, w_hwcm.data(),
+                             TensorLayout::HWCM);
+        b_v     = TensorView(std::span<const int64_t>(bsh, 1), dt, bias.data());
+
+        DepthwiseConvAttributes attrs{};
+        attrs.kernel_size = {1, c.KH, c.KW};
+        attrs.stride      = {1, c.SH, c.SW};
+        attrs.dilation    = {1, 1, 1};
+        attrs.padding     = {0, c.PH, c.PW};
+        op_nchw = DepthwiseConv::create(attrs, Backend::CPU);
+        op_nhwc = DepthwiseConv::create(attrs, Backend::CPU);
+
+        const TensorDesc d0[] = {in_nchw.desc(), w_nchw.desc(), b_v.desc()};
+        const auto od = op_nchw->getOutputTensorDesc(d0);
+        OH = od[0].dims[2];
+        OW = od[0].dims[3];
+        work = 2.0 * static_cast<double>(c.N) * C * OH * OW * c.KH * c.KW;
+
+        out_nchw_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_nchw = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_nchw_buf.data(), TensorLayout::NCHW);
+        out_nhwc = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_nhwc_buf.data(), TensorLayout::NHWC);
+    }
+
+    void run_nchw(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_nchw, w_nchw, b_v};
+        op_nchw->compute(std::span<TensorView>(&out_nchw, 1), ins, ctx, nullptr);
+    }
+    void run_nhwc(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
+        op_nhwc->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
+    }
+
+    Shape s;
+    int64_t OH = 0, OW = 0;
+    std::unique_ptr<DepthwiseConv> op_nchw, op_nhwc;
+    std::vector<T> in_planar, w_planar, in_cl, w_hwcm, bias;
     std::vector<T> out_nchw_buf, out_nhwc_buf;
     TensorView in_nchw, w_nchw, in_nhwc, w_nhwc, b_v;
     TensorView out_nchw, out_nhwc;
@@ -278,7 +373,7 @@ struct AbFp {
 // Quantized A/B: s8 weight, u8 activation, f32 output
 // ============================================================
 
-struct AbI8 {
+struct AbI8 : AbLayer {
     explicit AbI8(const Shape& c) : s(c) {
         icg = c.IC / c.groups;
         const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
@@ -372,18 +467,17 @@ struct AbI8 {
         return std::min(std::max(q, -128), 127);
     }
 
-    void run_nchw(const ComputeContext& ctx) {
+    void run_nchw(const ComputeContext& ctx) override {
         const TensorView ins[] = {in_nchw, w_nchw, b_v};
         op->compute(std::span<TensorView>(&out_nchw, 1), ins, ctx, nullptr);
     }
-    void run_nhwc(const ComputeContext& ctx) {
+    void run_nhwc(const ComputeContext& ctx) override {
         const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
         op->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
     }
 
     Shape s;
     int64_t icg = 1, OH = 0, OW = 0;
-    double work = 0.0;
     std::unique_ptr<Conv2D> op;
     std::vector<uint8_t> act_planar, act_cl;
     std::vector<int8_t> w_oihw, w_hwio;
@@ -399,8 +493,9 @@ struct AbI8 {
 // ============================================================
 
 /// One table: every layer at every thread count, planar vs channel-last.
-template <class MakeOp>
-void run_table(const char* title, MakeOp make_op) {
+/// @p make_dw builds the depthwise rows (nullptr for a table with no such arm).
+template <class MakeOp, class MakeDw>
+void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
     const int iters = 10, rounds = 3;
     std::printf("\n== %s ==\n", title);
     for (int nt : bench_threads()) {
@@ -411,7 +506,8 @@ void run_table(const char* title, MakeOp make_op) {
         int wins = 0, losses = 0, ties = 0;
         double tot_planar = 0.0, tot_cl = 0.0;
         for (const auto& c : sweep()) {
-            auto op = make_op(c);
+            std::unique_ptr<AbLayer> op = c.dw ? make_dw(c) : make_op(c);
+            if (!op) { continue; }   // this table has no arm for the row
             const AbResult r = measure_ab(nt,
                 [&](const ComputeContext& x) { op->run_nchw(x); },
                 [&](const ComputeContext& x) { op->run_nhwc(x); },
@@ -709,15 +805,30 @@ NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f16) {
 
 NNOPS_BENCH(conv2d_nhwc_vs_nchw_f32) {
     run_table("f32: planar (NCHW+OIHW) vs channel-last (NHWC+HWIO)",
-              [](const Shape& c) { return std::make_unique<AbFp<float>>(c); });
+              [](const Shape& c) -> std::unique_ptr<AbLayer> {
+                  return std::make_unique<AbFp<float>>(c);
+              },
+              [](const Shape& c) -> std::unique_ptr<AbLayer> {
+                  return std::make_unique<AbDw<float>>(c);
+              });
 }
 
 NNOPS_BENCH(conv2d_nhwc_vs_nchw_f16) {
     run_table("f16: planar (NCHW+OIHW) vs channel-last (NHWC+HWIO)",
-              [](const Shape& c) { return std::make_unique<AbFp<half>>(c); });
+              [](const Shape& c) -> std::unique_ptr<AbLayer> {
+                  return std::make_unique<AbFp<half>>(c);
+              },
+              [](const Shape& c) -> std::unique_ptr<AbLayer> {
+                  return std::make_unique<AbDw<half>>(c);
+              });
 }
 
 NNOPS_BENCH(conv2d_nhwc_vs_nchw_int8) {
     run_table("int8: s8 weight x u8 activation -> f32, planar vs channel-last",
-              [](const Shape& c) { return std::make_unique<AbI8>(c); });
+              [](const Shape& c) -> std::unique_ptr<AbLayer> {
+                  return std::make_unique<AbI8>(c);
+              },
+              // A quantized depthwise arm needs a per-channel weight zero-point
+              // and its own output type; bench_depthwise owns that comparison.
+              [](const Shape&) -> std::unique_ptr<AbLayer> { return nullptr; });
 }
