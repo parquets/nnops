@@ -83,6 +83,23 @@ public:
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
 
+    /// Pack the weight once, for compute() to read in place.
+    ///
+    /// Same two-step contract as Conv2D: an empty outputs[0] is the query (the
+    /// descriptor to allocate), a filled one is the pack, and the buffer stays
+    /// the caller's. What it removes is the per-call RHS pack — the weight,
+    /// packed into the GEMM's uniform nr-wide panels over its whole K, which
+    /// the kernel then reads where it lies. That is also why the product's
+    /// alpha has to be 1 (a prepacked B cannot carry a per-call scale).
+    ///
+    /// inputs[0] is the raw weight [N, K] — the same tensor compute() would be
+    /// handed. f32/f16 only; a quantized weight has no packed form (its panels
+    /// would have to carry the int32 column sums too), and the query returns an
+    /// empty view for it.
+    void prepackWeights(std::span<const TensorView> inputs,
+                        std::span<TensorView> outputs,
+                        const ComputeContext& ctx = {}) override;
+
     OpType  getOpType()  const override { return OpType::Linear; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }

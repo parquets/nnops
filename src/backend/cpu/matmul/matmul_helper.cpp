@@ -412,6 +412,195 @@ void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
 }
 
 // =========================================================================
+//  Prepacked RHS — the same tile, one kernel call per panel
+// =========================================================================
+// The MMA derives its panel stride from the k-block length it is given; a
+// prepacked blob's stride comes from the whole K. So the caller's stride wins
+// and the kernel is handed one panel at a time. A panel is nr_max wide in the
+// blob even when it holds fewer live columns (the packer zero-fills the rest),
+// and the kernel's own tail path reads a whole panel, so a short panel needs no
+// special case.
+
+template <class T, bool Zero>
+void tile_mma_pack_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
+                            const T* packed_a, const T* b, int64_t ldb,
+                            float clamp_min, float clamp_max) {
+    using Tr = TileTraits<T>;
+    const auto& fns = Tr::template mma_pack<Zero>();
+    constexpr int nr = Tr::nr()[0];
+    const int ldd_a = panel_stride<T>(Tr::mr()[0], Kc);
+
+    int m = 0;
+    walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
+        for (int n = 0; n < Nc; n += nr) {
+            const int w = std::min<int>(nr, Nc - n);
+            fns[level](s, w, Kc, c + m * ldc + n, ldc, packed_a,
+                       b + (static_cast<int64_t>(n) / nr) * ldb, clamp_min, clamp_max);
+        }
+        packed_a += ldd_a;
+    });
+}
+
+template <class T, bool Zero>
+void tile_mma_direct_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
+                              const T* a, int lda, const T* b, int64_t ldb,
+                              float clamp_min, float clamp_max) {
+    using Tr = TileTraits<T>;
+    const auto& fns = Tr::template mma_direct<Zero, 0>();
+    constexpr int nr = Tr::nr()[0];
+
+    int m = 0;
+    walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
+        for (int n = 0; n < Nc; n += nr) {
+            const int w = std::min<int>(nr, Nc - n);
+            fns[level](s, w, Kc, c + m * ldc + n, ldc, a + m * lda, lda,
+                       b + (static_cast<int64_t>(n) / nr) * ldb, clamp_min, clamp_max,
+                       nullptr);
+        }
+    });
+}
+
+template <class T>
+void dispatch_mma_pack_ldb(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
+                           const T* a, const T* b, int64_t ldb, float lo, float hi) {
+    if (zero_mode) { tile_mma_pack_ldb_impl<T, true>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi); }
+    else           { tile_mma_pack_ldb_impl<T, false>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi); }
+}
+
+template <class T>
+void dispatch_mma_direct_ldb(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
+                             const T* a, int lda, const T* b, int64_t ldb,
+                             float lo, float hi) {
+    if (zero_mode) { tile_mma_direct_ldb_impl<T, true>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi); }
+    else           { tile_mma_direct_ldb_impl<T, false>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi); }
+}
+
+void tile_mma_pack_ldb(int Mc, int Nc, int Kc, float* c, int ldc,
+                       const float* a, const float* b, int64_t ldb,
+                       float clamp_min, float clamp_max, bool zero_mode) {
+    dispatch_mma_pack_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, b, ldb, clamp_min, clamp_max);
+}
+
+void tile_mma_pack_ldb(int Mc, int Nc, int Kc, half* c, int ldc,
+                       const half* a, const half* b, int64_t ldb,
+                       float clamp_min, float clamp_max, bool zero_mode) {
+    dispatch_mma_pack_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, b, ldb, clamp_min, clamp_max);
+}
+
+void tile_mma_direct_ldb(int Mc, int Nc, int Kc, float* c, int ldc,
+                         const float* a, int lda, const float* b, int64_t ldb,
+                         float clamp_min, float clamp_max, bool zero_mode) {
+    dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max);
+}
+
+void tile_mma_direct_ldb(int Mc, int Nc, int Kc, half* c, int ldc,
+                         const half* a, int lda, const half* b, int64_t ldb,
+                         float clamp_min, float clamp_max, bool zero_mode) {
+    dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max);
+}
+
+// ---- the blob ---------------------------------------------------------
+
+MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept {
+    MatMulPackedB g;
+    if (N <= 0 || K <= 0) { return g; }
+    if (dtype != DataType::f32 && dtype != DataType::f16) { return g; }
+
+    const int64_t nr = (dtype == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32;
+    const int64_t esz = static_cast<int64_t>(data_type_size(dtype));
+    g.nr = nr;
+    // The same aligned slot the per-call pack uses, only at the whole K.
+    g.ldd = static_cast<int64_t>(
+        mma_pack_align(static_cast<size_t>(nr * K) * static_cast<size_t>(esz))) / esz;
+    g.np = (N + nr - 1) / nr;
+    g.total = g.np * g.ldd;
+    return g;
+}
+
+namespace {
+
+/// N and K of a raw B, in the order @p transpose_b describes.
+inline void raw_b_extent(const TensorDesc& raw, bool transpose_b,
+                         int64_t& N, int64_t& K) noexcept {
+    const size_t r = static_cast<size_t>(raw.rank);
+    N = transpose_b ? raw.dims[r - 2] : raw.dims[r - 1];
+    K = transpose_b ? raw.dims[r - 1] : raw.dims[r - 2];
+}
+
+/// ⌈total / N⌉ × N — the descriptor's numel, and so the blob's allocation.
+inline int64_t packed_b_numel(const MatMulPackedB& g, int64_t N) noexcept {
+    return ((g.total + N - 1) / N) * N;
+}
+
+}  // namespace
+
+TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b) {
+    TensorDesc d;
+    if (raw.rank < 2) { return d; }
+
+    int64_t N = 0, K = 0;
+    raw_b_extent(raw, transpose_b, N, K);
+    const MatMulPackedB g = matmul_packed_b_geom(N, K, raw.dtype);
+    if (!g.ok()) { return d; }
+
+    d.rank = 2;
+    d.dtype = raw.dtype;
+    d.layout = TensorLayout::PackedB;
+    d.dims.resize(2);
+    d.dims[0] = N;
+    d.dims[1] = packed_b_numel(g, N) / N;
+    d.row_stride_elems = d.dims[1];
+    return d;
+}
+
+bool matmul_packed_b_matches(const TensorDesc& packed, int64_t K) noexcept {
+    if (!is_packed_matmul_b(packed.layout) || packed.rank < 2) { return false; }
+    const int64_t N = packed.dims[0];
+    const MatMulPackedB g = matmul_packed_b_geom(N, K, packed.dtype);
+    return g.ok() && packed.numel() == packed_b_numel(g, N);
+}
+
+void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
+                          bool transpose_b, const ComputeContext& ctx) {
+    const DataType dt = packed.data_type();
+    const bool trans = transpose_b;
+    const int64_t N = trans ? raw.shape(raw.rank() - 2) : raw.shape(raw.rank() - 1);
+    const int64_t K = trans ? raw.shape(raw.rank() - 1) : raw.shape(raw.rank() - 2);
+    const MatMulPackedB g = matmul_packed_b_geom(N, K, dt);
+    NNOPS_ASSERT(g.ok() && "matmul_packed_b_pack: no packed form for this B");
+    NNOPS_ASSERT(packed.numel() == packed_b_numel(g, N) &&
+                 "matmul_packed_b_pack: the buffer does not match the geometry");
+
+    const int64_t lds = raw.row_stride_elems();
+    const int ldd = static_cast<int>(g.ldd);
+    const int lds_i = static_cast<int>(lds);
+    const int kc = static_cast<int>(K);
+
+    // One panel per task: panels are independent, and each one-pack is the
+    // same kernel the per-call route runs on a k-block.
+    const int64_t tasks = std::min<int64_t>(g.np,
+        std::max<int64_t>(ctx.cpu.thread_count(), 1));
+    ctx.cpu.run(0, tasks, [&](int64_t t) {
+        const int64_t p0 = t * g.np / tasks;
+        const int64_t p1 = (t + 1) * g.np / tasks;
+        for (int64_t p = p0; p < p1; ++p) {
+            const int64_t n_start = p * g.nr;
+            const int w = static_cast<int>(std::min<int64_t>(g.nr, N - n_start));
+            const int64_t src_off = trans ? n_start * lds : n_start;
+            if (dt == DataType::f32) {
+                const float* src = raw.ptr<float>() + src_off;
+                float* dst = packed.ptr<float>() + p * g.ldd;
+                tile_pack_rhs(trans, w, kc, dst, ldd, src, lds_i, 1.0f);
+            } else {
+                const half* src = raw.ptr<half>() + src_off;
+                half* dst = packed.ptr<half>() + p * g.ldd;
+                tile_pack_rhs(trans, w, kc, dst, ldd, src, lds_i, 1.0f);
+            }
+        }
+    });
+}
+
+// =========================================================================
 //  int8 (s8×s8) pack + MMA dispatch
 // =========================================================================
 // Same split as the float route. x86's VNNI bias lives entirely in the packed
@@ -707,12 +896,25 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const int64_t b_rank = b_desc.rank;
     NNOPS_ASSERT(a_rank >= 2 && b_rank >= 2);
 
+    // A PackedB leads with N and carries no K (the blob is addressed from K,
+    // not shaped by it), so both come from where they actually live: N from the
+    // descriptor's first dim, K from A — which the product requires to agree
+    // anyway.
+    const bool packed_b = is_packed_matmul_b(b_desc.layout);
+    if (packed_b && !(dt_a == DataType::f32 || dt_a == DataType::f16)) {
+        return plan;  // the packed RHS is a float-panel product only
+    }
+
     const int64_t M = attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 1)]
                                         : a_desc.dims[static_cast<size_t>(a_rank - 2)];
-    const int64_t N = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
-                                        : b_desc.dims[static_cast<size_t>(b_rank - 1)];
-    const int64_t K = attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
-                                        : b_desc.dims[static_cast<size_t>(b_rank - 2)];
+    const int64_t N = packed_b ? b_desc.dims[0]
+                   : attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 2)]
+                                       : b_desc.dims[static_cast<size_t>(b_rank - 1)];
+    const int64_t K = packed_b
+        ? (attrs.transpose_a ? a_desc.dims[static_cast<size_t>(a_rank - 2)]
+                             : a_desc.dims[static_cast<size_t>(a_rank - 1)])
+        : (attrs.transpose_b ? b_desc.dims[static_cast<size_t>(b_rank - 1)]
+                             : b_desc.dims[static_cast<size_t>(b_rank - 2)]);
 
     // Pack A for correctness (transpose_a), for int8, or for a deep K.
     plan.pack_a = geom->packs_a_always || attrs.transpose_a || (K > PACK_A_K_THRESHOLD);
@@ -743,7 +945,12 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const int64_t num_m_blocks = split_block_count(M, plan.mc);
     const int64_t num_n_blocks = (N + plan.nc - 1) / plan.nc;
 
-    if (split_m) {
+    if (packed_b) {
+        // The B side is the caller's blob: no slice, no slots, nothing to pack.
+        plan.num_slots = 0;
+        plan.np_slice = 0;
+        plan.workspace_size = 0;
+    } else if (split_m) {
         if (geom->hoists_b_m_split) {
             plan.num_slots = 1;
         } else {

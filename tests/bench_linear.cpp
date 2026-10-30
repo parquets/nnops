@@ -487,6 +487,93 @@ NNOPS_BENCH(linear_bias_epilogue) {
 }
 
 // ============================================================
+// The prepacked weight — what prepackWeights() takes out of the call
+// ============================================================
+//
+// Each call packs W into the GEMM's uniform panels before the first k-block; a
+// weight packed once at load time is read in place instead. The rows are the
+// same Linear against the same numbers, so the ratio is exactly the pack.
+
+template <typename T>
+void bench_prepack_vs_raw(const char* tag, const std::vector<Shape>& shapes,
+                          const std::vector<int>& threads, double target_ms,
+                          int rounds) {
+    std::printf("  %s Linear, weight packed once vs packed per call  "
+                "budget=%.0f ms/cell  rounds=%d\n", tag, target_ms, rounds);
+    std::printf("   %5s %5s %5s |", "M", "K", "N");
+    for (int nt : threads) {
+        std::printf("  %2dT:  packed     raw    P/R |", nt);
+    }
+    std::printf("\n");
+
+    for (const Shape& s : shapes) {
+        // Two identical problems (same seed): one keeps the raw weight, the
+        // other is handed the blob. Distinct buffers, the same numbers.
+        FpProblem<T> raw(s, LinearAttributes{}, /*with_bias=*/false);
+        FpProblem<T> pk(s, LinearAttributes{}, /*with_bias=*/false);
+
+        // Pack once, outside every timer — what a graph engine does at load.
+        auto op = Linear::create(LinearAttributes{}, Backend::CPU);
+        TensorView query;
+        const TensorView win[] = {raw.ins[1]};
+        TensorView q[] = {query};
+        op->prepackWeights(win, q);
+        // 64-byte aligned like every buffer the pool hands out: a packed panel
+        // that starts 16 bytes into a line splits half its vector loads.
+        std::vector<std::byte> hold(
+            static_cast<size_t>(q[0].desc().numel()) * sizeof(T) + 64);
+        const size_t mis = reinterpret_cast<uintptr_t>(hold.data()) % 64;
+        T* blob = reinterpret_cast<T*>(hold.data() + ((64 - mis) % 64));
+        TensorView packed(q[0].shape_span(), dtype_of<T>(), blob,
+                          q[0].pitch(), q[0].layout());
+        TensorView pack[] = {packed};
+        op->prepackWeights(win, pack);
+        pk.ins[1] = packed;
+
+        std::printf("   %5lld %5lld %5lld |", static_cast<long long>(s.M),
+                    static_cast<long long>(s.K), static_cast<long long>(s.N));
+        for (int nt : threads) {
+            BenchPool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+
+            std::vector<double> vp, vr;
+            for (int r = 0; r < rounds; ++r) {
+                vp.push_back(pk.run(*pk.linear, ctx, target_ms));
+                vr.push_back(raw.run(*raw.linear, ctx, target_ms));
+            }
+            const double gp = median(vp), gr = median(vr);
+            std::printf(" %9.1f %9.1f %5.3f |", gp, gr, gr > 0.0 ? gp / gr : 0.0);
+        }
+        std::printf("\n");
+    }
+}
+
+NNOPS_BENCH(linear_prepacked_weight) {
+    // P/R below 1 is not a defect in the blob: at a large M the per-call pack
+    // is a pass over B that leaves the panels it just wrote in L2, so the GEMM
+    // that follows reads them from L2 while the blob arm re-reads them from
+    // L3. The loss tracks that working set — 512^2 panels (1 MB) tie, 1024^2
+    // (4 MB) lose 11%, 2048^2 (16 MB) lose 13% — and it needs a large M to
+    // show, because that is the only regime where one pack pass is cheaper
+    // than the GEMM's own B reads. Alignment is not the cause (a 64-byte
+    // aligned blob measures the same as the 16-byte one).
+    const std::vector<Shape> shapes{
+        {1, 4096, 4096},     // decode: the per-call pack reads a 64 MB weight
+        {8, 4096, 4096},     // small speculative batch
+        {128, 4096, 4096},   // prefill: the pack amortizes over the rows
+        {1024, 1024, 1024},  // square, FLOP bound: the shape class that loses
+        {1, 1280, 1000},     // MobileNetV2's logits
+        {512, 512, 512},     // 1 MB of panels — fits L2, so the arms tie
+        {2048, 2048, 2048},  // 16 MB — the loss grows with the working set
+    };
+    bench_prepack_vs_raw<float>("f32", shapes, {1, 4}, /*target_ms=*/100.0,
+                                /*rounds=*/3);
+    bench_prepack_vs_raw<half>("f16", shapes, {1, 4}, /*target_ms=*/100.0,
+                               /*rounds=*/3);
+}
+
+// ============================================================
 // f16 — the same pairing
 // ============================================================
 

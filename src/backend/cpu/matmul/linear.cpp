@@ -166,8 +166,10 @@ Status linear_cpu(const LinearAttributes& attrs,
         return Status::ok;
     }
 
-    matmul_cpu(ma, ov, min, ctx, workspace);
-    return Status::ok;
+    // MatMul's status is Linear's: a prepacked weight that does not match the
+    // activation (packed at another K) is rejected there, and a caller must see
+    // that refusal rather than a silent ok.
+    return matmul_cpu(ma, ov, min, ctx, workspace);
 }
 
 }  // namespace nnops::backend::cpu

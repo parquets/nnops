@@ -684,10 +684,41 @@ inline Buf global_avg_pool(const TensorView& x)
     return run("global_avg_pool", *op, in);
 }
 
+/// The Linear weight packed once, for compute() to read in place — the same
+/// two-step contract and the same pointer-keyed cache as the conv filters
+/// above. What it removes is the per-call RHS pack: every forward would
+/// otherwise repack the whole [N, K] weight into the GEMM's uniform panels.
+///
+/// A weight with no packed form (a quantized one) comes back raw, which is
+/// what compute() takes anyway.
+inline const TensorView& packed_linear_weight(const TensorView& w)
+{
+    static std::map<const void*, Buf> cache;
+    auto it = cache.find(w.ptr<float>());
+    if (it != cache.end()) { return it->second.view; }
+
+    auto op = nnops::Linear::create(nnops::LinearAttributes{}, Backend::CPU);
+    TensorView query;
+    const TensorView in[] = {w};
+    TensorView q[] = {query};
+    op->prepackWeights(in, q);
+    // The query answers with nothing (rank 0) when there is no packed form.
+    if (q[0].rank() < 2) { return w; }
+
+    Buf blob = alloc(q[0].desc(), w.quant_params());
+    TensorView pack[] = {blob.view};
+    op->prepackWeights(in, pack);
+
+    return cache.emplace(w.ptr<float>(), std::move(blob)).first->second.view;
+}
+
 inline Buf linear(const TensorView& x, const TensorView& w, const TensorView& b)
 {
     auto op = nnops::Linear::create(nnops::LinearAttributes{}, Backend::CPU);
-    const TensorView in[] = {x, w, b};
+    // Shape inference reads the raw weight's [N, K]; only compute() sees the
+    // panels — the descriptor leads with N, so the output shape is the same.
+    const TensorView wl = prepack_enabled() ? packed_linear_weight(w) : w;
+    const TensorView in[] = {x, wl, b};
     return run("linear", *op, in);
 }
 

@@ -130,6 +130,19 @@ public:
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
 
+    /// Pack the B operand once, for compute() to read in place — the two-step
+    /// contract Conv2D and Linear use (empty outputs[0] = query, filled = pack,
+    /// the buffer stays the caller's).
+    ///
+    /// inputs[0] is the raw B, in the order `attributes().transpose_b` says.
+    /// The blob is indexed only by a prepacked-B compute(): it leads with N
+    /// ([N, ⌈elems / N⌉]), which is the number shape inference reads, and the
+    /// panel geometry follows from N, K and the dtype. f32/f16 only; any other
+    /// dtype queries an empty view. alpha must be 1 for a prepacked product.
+    void prepackWeights(std::span<const TensorView> inputs,
+                        std::span<TensorView> outputs,
+                        const ComputeContext& ctx = {}) override;
+
     OpType  getOpType()  const override { return OpType::MatMul; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }

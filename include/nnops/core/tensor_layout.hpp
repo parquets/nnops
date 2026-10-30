@@ -122,6 +122,28 @@ enum class TensorLayout : uint8_t {
     // plus the filter's own dims, never indexed by hand.
     PackedOIHW = 15,  ///< planar activation's prepacked filter (see above)
     PackedHWIO = 16,  ///< channel-last activation's prepacked filter (see above)
+
+    // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
+    //
+    // The GEMM's B operand, packed over its *whole* K once at load time
+    // instead of into pooled scratch on every call. It is the same uniform
+    // panel layout the packers write — ceil(N / nr) panels of nr columns, each
+    // [K][nr] k-major with the columns past N zero-filled, panels `ldd`
+    // elements apart — where the RHS pack builds the same bytes for a k-block
+    // of kc. Two things follow from packing at full K, and both are the point:
+    //
+    //   * `ldd` is a function of K, not of the call's k-block, so the plan's
+    //     kc stays free (it depends on M, N and the worker count) and nothing
+    //     has to agree with it. The MMA is handed the stride and walks one
+    //     panel at a time; see tile_mma_pack_ldb.
+    //   * alpha cannot ride the RHS pack any more (the pack is load-time and
+    //     alpha is per call), so a prepacked B requires alpha == 1.
+    //
+    // The descriptor's shape is [N, ⌈elements / N⌉]: N first, because shape
+    // inference reads the output's last dim from it, then whatever the panel
+    // padding needs — the same convention as the conv blobs above. The panel
+    // geometry is resolved from (N, K, dtype), never indexed by hand.
+    PackedB = 17,
 };
 
 
@@ -145,6 +167,7 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::HWIO:     return 1;
     case TensorLayout::PackedOIHW: return 1;
     case TensorLayout::PackedHWIO: return 1;
+    case TensorLayout::PackedB:  return 1;
     }
     return 1;
 }
@@ -203,6 +226,14 @@ constexpr bool is_packed_conv_weight(TensorLayout layout) noexcept {
            layout == TensorLayout::PackedHWIO;
 }
 
+/// Returns true for the prepacked matmul RHS — the operand MatMul/Linear
+/// prepackWeights builds over the whole K. Opaque: only the matmul kernel that
+/// packed it indexes it, and it is addressed by the geometry matmul_packed_b_geom
+/// resolves from the descriptor's own N and the activation's K.
+constexpr bool is_packed_matmul_b(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedB;
+}
+
 /// Returns the expected spatial rank encoded in the layout name.
 /// NCHW* → 2 (H, W), NCDHW* → 3 (D, H, W).
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
@@ -219,6 +250,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::HWIO:
     case TensorLayout::PackedOIHW:
     case TensorLayout::PackedHWIO:
+    case TensorLayout::PackedB:
         return 2;
     case TensorLayout::NCDHW:
     case TensorLayout::NCDHWC8:

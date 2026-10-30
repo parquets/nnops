@@ -404,9 +404,14 @@ inline std::vector<TensorDesc> matmul_output_shape(
     const int64_t K_a = a.dims[static_cast<size_t>(ra - 1)];  // K (or M if transpose_a)
     const int64_t M   = transpose_a ? K_a : a.dims[static_cast<size_t>(ra - 2)];
 
-    // Extract K_b, N from B
-    const int64_t K_b = transpose_b ? b.dims[static_cast<size_t>(rb - 1)] : b.dims[static_cast<size_t>(rb - 2)];
-    const int64_t N   = transpose_b ? b.dims[static_cast<size_t>(rb - 2)] : b.dims[static_cast<size_t>(rb - 1)];
+    // Extract K_b, N from B. A prepacked B (MatMul::prepackWeights) leads with
+    // N whatever its source order, and carries no K — the blob is addressed
+    // from K, not shaped by it (see TensorLayout::PackedB).
+    const bool packed_b = is_packed_matmul_b(b.layout);
+    const int64_t K_b = packed_b ? K_a
+        : transpose_b ? b.dims[static_cast<size_t>(rb - 1)] : b.dims[static_cast<size_t>(rb - 2)];
+    const int64_t N   = packed_b ? b.dims[0]
+        : transpose_b ? b.dims[static_cast<size_t>(rb - 2)] : b.dims[static_cast<size_t>(rb - 1)];
 
     (void)K_a; (void)K_b; // Validation done by caller
 

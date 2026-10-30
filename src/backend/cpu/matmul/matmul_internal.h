@@ -54,6 +54,14 @@ struct MatMulDims { int64_t M, N, K; };
 
 inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
                               const TensorView& a, const TensorView& b) noexcept {
+    // A packed RHS (see matmul_helper.h) leads with N and has no K of its own —
+    // the blob is addressed from K, not shaped by it — so K comes from A.
+    const int64_t k_a = attrs.transpose_a ? a.shape(a.rank() - 2)
+                                          : a.shape(a.rank() - 1);
+    if (is_packed_matmul_b(b.layout())) {
+        return { attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
+                 b.shape(0), k_a };
+    }
     return { attrs.transpose_a ? a.shape(a.rank() - 1) : a.shape(a.rank() - 2),
              attrs.transpose_b ? b.shape(b.rank() - 2) : b.shape(b.rank() - 1),
              attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };

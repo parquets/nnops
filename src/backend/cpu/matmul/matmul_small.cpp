@@ -208,6 +208,9 @@ bool matmul_small_fp(const MatMulAttributes& attrs,
     const DataType dt_a = a.data_type();
     const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
     if (!float_a || b.data_type() != dt_a) { return false; }
+    // A prepacked RHS is panel-formatted, not a row-major matrix: both small
+    // routes here read B as rows of N. It goes to the tiled route instead.
+    if (is_packed_matmul_b(b.layout())) { return false; }
 
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 

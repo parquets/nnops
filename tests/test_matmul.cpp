@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <vector>
 #include <thread>
 #include <cmath>
@@ -3152,4 +3153,166 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
 
     run(float{});
     run(half{});
+}
+
+// ============================================================
+// The prepacked B — MatMul::prepackWeights
+// ============================================================
+//
+// Packing B once at load time takes the per-call RHS pack out of the GEMM and
+// changes nothing else — the same uniform panels, the same k-blocks, the same
+// accumulation order — so where the raw B also takes the tiled GEMM the two
+// products must agree to the bit. Below the small product's thresholds the raw
+// B takes the pack-free kernel instead (a prepacked B is panel-formatted and
+// cannot), and there the two are compared as numbers.
+
+NNOPS_TEST(matmul_prepacked_b) {
+    namespace cpu = nnops::backend::cpu;
+
+    struct Case {
+        int64_t B, M, K, N;
+        bool tb;
+        bool bitwise;
+    };
+    const Case cases[] = {
+        {1,  5,   37,  19, false, true},   // tails on both axes
+        {1,  5,   37,  19, true,  true},   // the same product, B stored [N, K]
+        {1,  1,    8,   5, true,  false},  // one row: the raw B is a GEMV
+        {3, 16,  300,  48, false, true},   // batched A, several k-blocks
+        {2, 64,  256,  96, true,  true},   // a layer shape, B broadcast
+        {1,  4, 1024,  17, false, false},  // deep K, M = 4: the raw B is a GEMV
+    };
+
+    const auto run = [&](auto dtype_tag) {
+        using T = decltype(dtype_tag);
+        const DataType dt = std::is_same_v<T, float> ? DataType::f32
+                                                    : DataType::f16;
+        const auto cast = [](float v) -> T {
+            if constexpr (std::is_same_v<T, float>) { return v; }
+            else { return cpu::float_to_half(v); }
+        };
+
+        for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            const Case& c = cases[ci];
+            const int64_t ashape[] = {c.B, c.M, c.K};
+            const int64_t bshape[] = {c.tb ? c.N : c.K, c.tb ? c.K : c.N};
+
+            std::vector<T> av(static_cast<size_t>(c.B * c.M * c.K));
+            std::vector<T> bv(static_cast<size_t>(c.K * c.N));
+            nnops::test::XorShift128 rng(500 + 10 * static_cast<uint64_t>(ci));
+            for (auto& e : av) { e = cast(rng.next_float()); }
+            for (auto& e : bv) { e = cast(rng.next_float()); }
+
+            TensorView a(ashape, dt, av.data());
+            TensorView b(bshape, dt, bv.data());
+
+            MatMulAttributes attrs;
+            attrs.transpose_b = c.tb;
+            auto op = MatMul::create(attrs, Backend::CPU);
+
+            const TensorDesc descs[] = {a.desc(), b.desc()};
+            const auto od = op->getOutputTensorDesc(descs);
+
+            std::vector<T> raw(static_cast<size_t>(od[0].numel()));
+            std::vector<T> pk(static_cast<size_t>(od[0].numel()));
+            auto ro = nnops::test::make_planar(od[0], raw.data());
+            auto po = nnops::test::make_planar(od[0], pk.data());
+
+            const TensorView ins[] = {a, b};
+            NNOPS_EXPECT_EQ(op->compute(ro, ins, {}, nullptr), Status::ok);
+
+            // ---- two-step contract: query, allocate, fill
+            TensorView q;
+            const TensorView bq[] = {b};
+            TensorView oq[] = {q};
+            op->prepackWeights(bq, oq);
+            q = oq[0];
+            // A query answer carries no storage (as Conv2D's does): the rank
+            // is what separates it from "this B has no packed form".
+            NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
+            NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
+                            static_cast<int>(TensorLayout::PackedB));
+            // Leading N: shape inference reads it, and it is what the panel
+            // count is built from.
+            NNOPS_EXPECT_EQ(q.shape(0), c.N);
+            NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
+
+            std::vector<T> blob(static_cast<size_t>(q.desc().numel()));
+            TensorView packed(q.shape_span(), q.data_type(), blob.data(),
+                              q.pitch(), q.layout());
+            const TensorView bp[] = {b};
+            TensorView opk[] = {packed};
+            op->prepackWeights(bp, opk);
+
+            // The blob's descriptor resolves the same product shape as the raw
+            // B did.
+            const TensorDesc pdescs[] = {a.desc(), packed.desc()};
+            const auto pod = op->getOutputTensorDesc(pdescs);
+            NNOPS_EXPECT_EQ(pod[0].rank, od[0].rank);
+            for (int64_t d = 0; d < od[0].rank; ++d) {
+                NNOPS_EXPECT_EQ(pod[0].dims[static_cast<size_t>(d)],
+                                od[0].dims[static_cast<size_t>(d)]);
+            }
+
+            const TensorView pins[] = {a, packed};
+            NNOPS_EXPECT_EQ(op->compute(po, pins, {}, nullptr), Status::ok);
+
+            if (c.bitwise) {
+                NNOPS_EXPECT_TRUE(std::memcmp(raw.data(), pk.data(),
+                                              raw.size() * sizeof(T)) == 0);
+                continue;
+            }
+            const float tol = std::is_same_v<T, float> ? 1e-5f : kF16AccumTol;
+            const auto to_f = [](T v) -> float {
+                if constexpr (std::is_same_v<T, float>) { return v; }
+                else { return cpu::half_to_float(v); }
+            };
+            for (size_t i = 0; i < raw.size(); ++i) {
+                const float e = to_f(raw[i]);
+                NNOPS_EXPECT_NEAR(to_f(pk[i]), e, tol * std::max(1.0f, std::abs(e)));
+            }
+        }
+    };
+
+    run(float{});
+    run(half{});
+}
+
+NNOPS_TEST(matmul_prepacked_b_contract_errors) {
+    const int64_t bshape[] = {37, 19};
+    auto [bv, b] = test::make_random_tensor({37, 19}, -1.0f, 1.0f, 61);
+
+    auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
+    TensorView q;
+    const TensorView bq[] = {b};
+    TensorView oq[] = {q};
+    op->prepackWeights(bq, oq);
+    q = oq[0];
+
+    std::vector<float> blob(static_cast<size_t>(q.desc().numel()));
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout());
+    const TensorView bp[] = {b};
+    TensorView opk[] = {packed};
+    op->prepackWeights(bp, opk);
+
+    // The blob carries no K (only N), so a caller who packs against one K and
+    // computes against another is refused rather than read past the panels.
+    auto [av, a] = test::make_random_tensor({4, 31}, -1.0f, 1.0f, 62);
+    const int64_t oshape[] = {4, 19};
+    std::vector<float> obuf(static_cast<size_t>(4 * 19));
+    TensorView out(oshape, DataType::f32, obuf.data());
+    const TensorView ins[] = {a, packed};
+    NNOPS_EXPECT_EQ(op->compute(out, ins, {}, nullptr),
+                    Status::invalid_argument);
+
+    // alpha rode the per-call RHS pack: a load-time blob has no slot for it.
+    MatMulAttributes scaled;
+    scaled.alpha = 2.0f;
+    auto sop = MatMul::create(scaled, Backend::CPU);
+    const int64_t ok_a[] = {4, 37};
+    std::vector<float> abuf2(static_cast<size_t>(4 * 37), 1.0f);
+    TensorView a2(ok_a, DataType::f32, abuf2.data());
+    const TensorView sins[] = {a2, packed};
+    NNOPS_EXPECT_EQ(sop->compute(out, sins, {}, nullptr), Status::unsupported);
 }

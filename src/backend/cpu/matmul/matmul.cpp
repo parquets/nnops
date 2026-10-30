@@ -90,6 +90,9 @@ struct FpRoute {
     static int ldd_b(int kc) { return static_cast<int>(geom().ldd_b(kc)); }
     static int ldd_a(int kc) { return static_cast<int>(geom().ldd_a(kc)); }
 
+    /// Width of one RHS panel — the unit a prepacked B is walked in.
+    static constexpr int b_panel_w() { return nr_max_flt<T>(); }
+
     static std::pair<Clamp, Clamp> clamp(const MatMulAttributes& attrs, bool last_k) {
         return kblock_clamp(attrs, last_k);
     }
@@ -116,16 +119,20 @@ struct FpRoute {
         tile_pack_rhs(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, attrs.alpha);
     }
 
+    /// @p ldb > 0 means @p pb is a prepacked blob: panels sit at that stride,
+    /// not at the one the kernel derives from kc (see tile_mma_pack_ldb).
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool zero_mode) {
-        tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, lo, hi, zero_mode);
+                         bool zero_mode, int64_t ldb = 0) {
+        if (ldb > 0) { tile_mma_pack_ldb(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode); }
+        else         { tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, lo, hi, zero_mode); }
     }
 
     static void mma_direct(int mc, int nc, int kc, Acc* c, int ldc,
                            const Elem* a, int lda, const Elem* pb,
-                           Clamp lo, Clamp hi, bool zero_mode) {
-        tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, lo, hi, zero_mode);
+                           Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = 0) {
+        if (ldb > 0) { tile_mma_direct_ldb(mc, nc, kc, c, ldc, a, lda, pb, ldb, lo, hi, zero_mode); }
+        else         { tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, lo, hi, zero_mode); }
     }
 
     /// C row of a batch element plus the two fp-only in-place passes.
@@ -185,6 +192,11 @@ struct I8Route {
     static int ldd_b(int kc) { return static_cast<int>(geom().ldd_b(kc)); }
     static int ldd_a(int kc) { return static_cast<int>(geom().ldd_a(kc)); }
 
+    /// int8 has no prepacked RHS (a quantized blob would have to carry the
+    /// column sums the panel's correction block holds), so the stride argument
+    /// is always 0 here; see MatMulPackedB.
+    static constexpr int b_panel_w() { return NR_MAX_I8; }
+
     static std::pair<Clamp, Clamp> clamp(const MatMulAttributes&, bool) {
         return {INT32_MIN, INT32_MAX};
     }
@@ -211,7 +223,9 @@ struct I8Route {
 
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool /*zero_mode*/) {
+                         bool /*zero_mode*/, int64_t ldb = 0) {
+        NNOPS_ASSERT(ldb == 0 && "int8 has no prepacked RHS");
+        (void)ldb;
         tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, lo, hi);
     }
 
@@ -349,7 +363,9 @@ void matmul_tile(const MatMulAttributes& attrs,
                  bool pack_a, const typename R::Elem* packed_b,
                  typename R::Elem* pack_a_slice, bool a_biased,
                  const typename R::EpilogueParams* ip,
-                 const typename R::Elem* bias)
+                 const typename R::Elem* bias,
+                 const typename R::Elem* prepacked_b = nullptr,
+                 int64_t prepacked_ldd = 0)
 {
     using Acc = typename R::Acc;
 
@@ -384,14 +400,26 @@ void matmul_tile(const MatMulAttributes& attrs,
                 R::scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
             }
         }
+        // The RHS the MMA reads: the k-block's slice of the packed scratch, or
+        // — for a prepacked blob — that block's slice of the tile's first
+        // panel, from which one kernel call per panel walks the stride.
+        const typename R::Elem* b_tile = packed_b;
+        int64_t b_ldb = 0;
+        if (prepacked_b != nullptr) {
+            const int64_t panel0 = n_start / R::b_panel_w();
+            b_tile = prepacked_b + panel0 * prepacked_ldd
+                   + static_cast<int64_t>(k) * R::b_panel_w();
+            b_ldb = prepacked_ldd;
+        }
+
         if (pack_a) {
             R::pack_a(attrs.transpose_a, actual_mc, actual_kc,
                       pack_a_slice, ldd_a, a_src, lda, a_biased, ip, m);
             R::mma_pack(actual_mc, n_count, actual_kc,
-                        c_tile, ldc, pack_a_slice, packed_b, cmin, cmax, zero_mode);
+                        c_tile, ldc, pack_a_slice, b_tile, cmin, cmax, zero_mode, b_ldb);
         } else if constexpr (R::has_direct_a) {
             R::mma_direct(actual_mc, n_count, actual_kc,
-                          c_tile, ldc, a_src, lda, packed_b, cmin, cmax, zero_mode);
+                          c_tile, ldc, a_src, lda, b_tile, cmin, cmax, zero_mode, b_ldb);
         }
         if constexpr (R::is_fp) {
             if (epilogue) { R::epilogue(attrs, c_tile, ldc, actual_mc, n_count); }
@@ -418,18 +446,23 @@ void matmul_block(const MatMulAttributes& attrs,
                   typename R::Elem* pack_a_slice,
                   bool pack_a, bool a_biased,
                   const typename R::EpilogueParams* ip,
-                  const typename R::Elem* bias)
+                  const typename R::Elem* bias,
+                  const typename R::Elem* prepacked_b = nullptr,
+                  int64_t prepacked_ldd = 0)
 {
     for (int k = 0; k < K; k += kc) {
         const int actual_kc = std::min(kc, K - k);
         const bool last_k = (k + kc >= K);
-        const int ldd_b = R::ldd_b(actual_kc);
-        R::pack_b(attrs, b_src, k, actual_kc, n_start, n_count,
-                  pack_b_slice, ldd_b, a_biased);
+        // A prepacked RHS is already packed for every k-block: no pack here.
+        if (prepacked_b == nullptr) {
+            const int ldd_b = R::ldd_b(actual_kc);
+            R::pack_b(attrs, b_src, k, actual_kc, n_start, n_count,
+                      pack_b_slice, ldd_b, a_biased);
+        }
         matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
                        k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice,
-                       a_biased, ip, bias);
+                       a_biased, ip, bias, prepacked_b, prepacked_ldd);
     }
 }
 
@@ -558,9 +591,21 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     }
 
     // The fp routes pack into the scratch; a null buffer here means the pool
-    // refused it, and the first pack would fault rather than report.
+    // refused it, and the first pack would fault rather than report. A
+    // prepacked RHS with no packed A has no scratch at all.
     if constexpr (R::is_fp) {
-        if (workspace == nullptr) { return Status::out_of_memory; }
+        if (plan.workspace_size > 0 && workspace == nullptr) {
+            return Status::out_of_memory;
+        }
+    }
+
+    // A caller-supplied RHS: the blob's panels are walked in place, at the
+    // stride its own full-K pack gave them.
+    const typename R::Elem* prepacked_b = nullptr;
+    int64_t prepacked_ldd = 0;
+    if (is_packed_matmul_b(b.layout())) {
+        prepacked_b = b.ptr<typename R::Elem>();
+        prepacked_ldd = matmul_packed_b_geom(N, K, b.data_type()).ldd;
     }
 
     const int lda = static_cast<int>(a.row_stride_elems());
@@ -800,7 +845,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null, bias);
+                                ip_or_null, bias, prepacked_b, prepacked_ldd);
             });
         } else if constexpr (R::hoists_b_m_split) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
@@ -816,7 +861,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                    mr.start, mr.count, mc, 0, Ni,
                                    k, actual_kc, last_k, plan.pack_a, pack_b_base,
                                    pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                   a_biased, ip_or_null, bias);
+                                   a_biased, ip_or_null, bias,
+                                   prepacked_b, prepacked_ldd);
                 });
             }
         } else {
@@ -829,7 +875,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null, bias);
+                                ip_or_null, bias, prepacked_b, prepacked_ldd);
             });
         }
     }
@@ -988,6 +1034,20 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
 
     const auto dt_a = a.data_type();
     const auto dt_b = b.data_type();
+
+    // A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob:
+    // same dtype as A, f32 or f16, and alpha 1 — alpha rode the per-call RHS
+    // pack, and a load-time blob has no per-call slot for it. Its numel is the
+    // one thing that can be wrong about it (a blob packed against another K),
+    // so it is checked here rather than trusted.
+    if (is_packed_matmul_b(b.layout())) {
+        if (dt_a != dt_b || (dt_a != DataType::f32 && dt_a != DataType::f16)) {
+            return Status::unsupported;
+        }
+        if (attrs.alpha != 1.0f) { return Status::unsupported; }
+        const MatMulDims d = matmul_dims(attrs, a, b);
+        if (!matmul_packed_b_matches(b.desc(), d.K)) { return Status::invalid_argument; }
+    }
 
     // Fold pure-clamp activations into min_clip/max_clip, which kblock_clamp
     // (and the Q5 route) read directly.

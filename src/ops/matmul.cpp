@@ -7,6 +7,9 @@
 #include "nnops/detail/shape_inference.hpp"
 
 #include "backend/cpu/matmul/matmul.h"
+#include "backend/cpu/matmul/matmul_helper.h"
+
+#include <vector>
 
 namespace nnops {
 
@@ -55,10 +58,51 @@ Status MatMul::validate(std::span<const TensorDesc> inputs,
     const int64_t k_a = attrs_.transpose_a
         ? a.dims[static_cast<size_t>(a.rank - 2)]
         : a.dims[static_cast<size_t>(a.rank - 1)];
+    // A prepacked B carries no K (the blob is addressed from it, not shaped by
+    // it): the product's K is A's, and the blob's own coherence — was it packed
+    // against this K — is the backend's check.
+    if (is_packed_matmul_b(b.layout)) { return Status::ok; }
+
     const int64_t k_b = attrs_.transpose_b
         ? b.dims[static_cast<size_t>(b.rank - 1)]
         : b.dims[static_cast<size_t>(b.rank - 2)];
     return detail::require(k_a == k_b);
+}
+
+void MatMul::prepackWeights(std::span<const TensorView> inputs,
+                            std::span<TensorView> outputs,
+                            const ComputeContext& ctx)
+{
+    NNOPS_ASSERT(inputs.size() >= 1);
+    NNOPS_ASSERT(outputs.size() >= 1);
+    const auto& raw = inputs[0];
+    NNOPS_ASSERT(raw.rank() >= 2);
+
+    const TensorDesc d = backend::cpu::matmul_packed_b_desc(raw.desc(),
+                                                            attrs_.transpose_b);
+    std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
+    const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
+
+    if (outputs[0].is_empty()) {
+        // No packed form (neither f32 nor f16) is an empty answer, not a
+        // failure: a graph engine asks unconditionally.
+        if (d.rank <= 0) { return; }
+        outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz,
+                                d.layout, raw.quant_params());
+        return;
+    }
+
+    NNOPS_ASSERT(d.rank > 0 &&
+                 "MatMul::prepackWeights: this B has no packed form (f32/f16 only)");
+    NNOPS_ASSERT(attrs_.alpha == 1.0f &&
+                 "MatMul::prepackWeights: a prepacked B cannot carry alpha "
+                 "(it rode the per-call RHS pack)");
+    NNOPS_ASSERT(outputs[0].layout() == d.layout &&
+                 outputs[0].rank() == d.rank &&
+                 outputs[0].shape(0) == shape[0] &&
+                 outputs[0].shape(1) == shape[1] &&
+                 "MatMul::prepackWeights: the packed buffer does not match the geometry");
+    backend::cpu::matmul_packed_b_pack(raw, outputs[0], attrs_.transpose_b, ctx);
 }
 
 Status MatMul::compute(std::span<TensorView> outputs,

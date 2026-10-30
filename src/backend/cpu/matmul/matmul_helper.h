@@ -10,6 +10,7 @@
 #include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / NNOPS_ARCH_AARCH64
 #include "nnops/ops/matmul.hpp"                // MatMulAttributes
 #include "nnops/core/tensor_view.hpp"          // TensorDesc
+#include "nnops/core/compute_context.hpp"      // ComputeContext (prepack)
 #include "backend/cpu/common/common_utils.hpp" // align_up
 
 #include <algorithm>
@@ -537,6 +538,24 @@ void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, 
 void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
 void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
 
+// ---- Prepacked RHS: the same panels, at a caller-chosen stride ----------
+//
+// A PackedB blob holds the panels above for the *whole* K, so its panel stride
+// is ldd = align(nr_max·K·esz) — a function of K, while the MMA derives its own
+// stride from the k-block it is given, and the plan's k-block length depends on
+// M and the worker count. Rather than force the two to agree, these variants
+// take the stride and walk one panel per kernel call: k block `k` of panel `p`
+// starts at `b + p·ldb` and holds kc columns, which is exactly the sub-panel a
+// k-block needs. Everything else — the A cascade, the clamp, the store — is the
+// same kernel.
+//
+// One call per panel is the price; it is a prologue and a function call per
+// nr_max columns, against a pack of the whole tile per call.
+void tile_mma_pack_ldb(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_pack_ldb(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_direct_ldb(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_direct_ldb(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
+
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
 void tile_scale(half* c, int ldc, float scale, int M, int N);
@@ -620,6 +639,52 @@ void tile_mma_direct_i8(int mc, int nc, int kc,
 
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
 void xor0x80_i8(int8_t* p, int nbytes);
+
+// =========================================================================
+//  Prepacked RHS (MatMul / Linear ::prepackWeights)
+// =========================================================================
+//
+// The blobs, the descriptors and the addressing — one source of truth for the
+// query the ops hand back, the pack, and the kernel that later reads it.
+//
+// The layout is the per-call one, one level up: ceil(N/nr_max) uniform panels of
+// nr_max columns, each [K][nr_max] k-major with the columns past N zero-filled,
+// panels `ldd` elements apart. Packing at full K is what makes the blob
+// independent of the plan (kc follows M and the worker count); it is also why
+// alpha — a per-call scale that otherwise rides the RHS pack — is required to be
+// 1 on this route.
+
+struct MatMulPackedB {
+    int64_t nr = 0;     ///< panel width (the arch's uniform RHS width)
+    int64_t ldd = 0;    ///< panel stride, elements, at the whole K
+    int64_t np = 0;     ///< ceil(N / nr)
+    int64_t total = 0;  ///< np × ldd — the blob, in elements
+
+    bool ok() const noexcept { return total > 0; }
+};
+
+/// The blob's geometry for a product N wide and K deep. `ok()` is false for a
+/// dtype without a float RHS route (and for a non-positive extent).
+MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept;
+
+/// The descriptor the blob is allocated from — the query half of the two-step
+/// prepack. Shape [N, ⌈elements / N⌉], like the conv blobs: N leads, because
+/// that is the number shape inference reads (Linear's output width, MatMul's N
+/// under transpose_b), followed by whatever the panel padding needs. Rank 0 for
+/// a B with no packed form.
+///
+/// @p transpose_b says how @p raw is ordered: [N, K] (Linear's weight, and
+/// MatMul's transposed B) or [K, N].
+TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b);
+
+/// True when @p packed is a coherent blob for a product K deep — its numel is
+/// the geometry's. That single check is what catches a blob packed against a
+/// different K, which is otherwise indistinguishable from a correct one.
+bool matmul_packed_b_matches(const TensorDesc& packed, int64_t K) noexcept;
+
+/// Fill @p packed, sized from matmul_packed_b_desc, from the raw B.
+void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
+                          bool transpose_b, const ComputeContext& ctx);
 
 struct MatMulPlan {
     int64_t mc, nc, kc;       // tile sizes

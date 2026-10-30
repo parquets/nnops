@@ -24,6 +24,7 @@
 using namespace nnops;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
+using nnops::backend::cpu::float_to_half;
 
 namespace nnops::backend::cpu::reference {
 void linear_ref(const LinearAttributes& attrs,
@@ -506,4 +507,192 @@ NNOPS_TEST(linear_int8_output_matches_ref) {
 
         NNOPS_EXPECT_EQ(std::memcmp(got.data(), want.data(), got.size()), 0);
     }
+}
+
+// ============================================================
+// The prepacked weight — Linear::prepackWeights
+// ============================================================
+//
+// The weight packed once at load time is the same product as the raw one: this
+// route removes the per-call RHS pack and nothing else, so on shapes that the
+// GEMM tiles both ways the two outputs must agree to the bit — same panels,
+// same k-blocks, same order. Below the small product's thresholds the raw
+// weight takes the pack-free kernel instead (a prepacked B is panel-formatted
+// and cannot), so there the two are compared as numbers.
+
+namespace {
+
+struct PrepackShape {
+    int64_t M, K, N;
+    bool bias, relu;
+};
+
+/// Run one shape twice — raw weight, then the same weight through the two-step
+/// contract — and require the two outputs to agree (@p bitwise: the raw weight
+/// takes the tiled GEMM too, so not a single bit may move).
+template <class T>
+void check_prepacked_weight(const PrepackShape& c, uint64_t seed,
+                            bool bitwise = true)
+{
+    const DataType dt = std::is_same_v<T, half> ? DataType::f16 : DataType::f32;
+    const int64_t ishape[] = {c.M, c.K};
+    const int64_t wshape[] = {c.N, c.K};
+    const int64_t bshape[] = {c.N};
+
+    auto fill = [](std::vector<T>& v, float lo, float hi, uint64_t s) {
+        nnops::test::XorShift128 rng(s);
+        for (auto& e : v) {
+            const float f = lo + (hi - lo) *
+                static_cast<float>(rng.next_u64() % 10001) / 10000.0f;
+            if constexpr (std::is_same_v<T, half>) { e = float_to_half(f); }
+            else { e = f; }
+        }
+    };
+
+    std::vector<T> xv(static_cast<size_t>(c.M * c.K));
+    std::vector<T> wv(static_cast<size_t>(c.N * c.K));
+    std::vector<T> bv(static_cast<size_t>(c.N));
+    fill(xv, -1.0f, 1.0f, seed);
+    fill(wv, -1.0f, 1.0f, seed + 1);
+    fill(bv, -0.5f, 0.5f, seed + 2);
+
+    TensorView x(ishape, dt, xv.data());
+    TensorView weight(wshape, dt, wv.data());
+    TensorView bias;
+    if (c.bias) { bias = TensorView(bshape, dt, bv.data()); }
+
+    LinearAttributes attrs;
+    if (c.relu) { attrs.epilogue.type = EpilogueActivateType::Relu; }
+    auto op = Linear::create(attrs, Backend::CPU);
+
+    std::vector<TensorView> ins = {x, weight};
+    if (c.bias) { ins.push_back(bias); }
+    std::vector<TensorDesc> descs;
+    for (const auto& t : ins) { descs.push_back(t.desc()); }
+    const TensorDesc od = op->getOutputTensorDesc(descs)[0];
+
+    std::vector<T> got(static_cast<size_t>(od.numel()));
+    std::vector<T> want(static_cast<size_t>(od.numel()));
+    const auto oshape = std::span<const int64_t>(od.dims.data(),
+                                                 static_cast<size_t>(od.rank));
+    TensorView og(oshape, od.dtype, got.data());
+    TensorView ow(oshape, od.dtype, want.data());
+
+    // The raw weight: the reference for this route.
+    NNOPS_EXPECT_EQ(op->compute(og, ins, {}, nullptr), Status::ok);
+
+    // ---- two-step contract: query the packed descriptor, allocate, fill
+    TensorView q;
+    const TensorView wq[] = {weight};
+    TensorView oq[] = {q};
+    op->prepackWeights(wq, oq);
+    q = oq[0];
+    // A query answer carries no storage (as Conv2D's does): the rank is what
+    // separates it from "this weight has no packed form".
+    NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
+    NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
+                    static_cast<int>(TensorLayout::PackedB));
+    // The descriptor leads with N — the dim shape inference reads — and its
+    // numel is exactly the buffer a caller sizes (net_io's alloc does).
+    NNOPS_EXPECT_EQ(q.shape(0), c.N);
+    NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
+    NNOPS_EXPECT_EQ(q.data_type(), dt);
+
+    std::vector<T> blob(static_cast<size_t>(q.desc().numel()));
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout());
+    const TensorView wp[] = {weight};
+    TensorView opk[] = {packed};
+    op->prepackWeights(wp, opk);
+
+    std::vector<TensorView> pins = ins;
+    pins[1] = packed;
+    NNOPS_EXPECT_EQ(op->compute(ow, pins, {}, nullptr), Status::ok);
+
+    if (bitwise) {
+        NNOPS_EXPECT_TRUE(std::memcmp(got.data(), want.data(),
+                                      got.size() * sizeof(T)) == 0);
+        return;
+    }
+    const float tol = std::is_same_v<T, half> ? test::kF16AccumTol : 1e-5f;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const float e = to_f(want[i]);
+        NNOPS_EXPECT_NEAR(to_f(got[i]), e, tol * std::max(1.0f, std::abs(e)));
+    }
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(linear_prepacked_weight) {
+    // Shapes chosen for the pack's own seams: a partial n panel, a K that is
+    // not a multiple of the k-block, N below one panel, and a deep K where A
+    // gets packed too.
+    struct Row { PrepackShape s; bool bitwise; };
+    const Row cases[] = {
+        // Odd on every side: both tails. Above the small-product threshold and
+        // M > 4, so the raw weight takes the tiled GEMM too.
+        {{  7,   37,  19, true,  false}, true},
+        // N below one panel and one row: below the small-product threshold the
+        // raw weight runs the pack-free kernel instead — a prepacked B is
+        // panel-formatted and cannot — so only the numbers are compared.
+        {{  1,    8,   5, false, false}, false},
+        {{ 33,  300,  48, true,  true},  true},   // several k-blocks, Relu
+        {{ 64,  256,  96, false, false}, true},   // a layer shape, no bias
+        {{  5, 1024,  17, true,  false}, true},   // deep K: pack_a on, narrow N
+    };
+
+    const size_t ncases = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < ncases; ++i) {
+        const uint64_t seed = 700 + 10 * static_cast<uint64_t>(i);
+        check_prepacked_weight<float>(cases[i].s, seed, cases[i].bitwise);
+        check_prepacked_weight<half>(cases[i].s, seed + 5, cases[i].bitwise);
+    }
+}
+
+NNOPS_TEST(linear_prepacked_weight_wrong_k) {
+    // The blob carries no K (its descriptor only knows N), so a caller who packs
+    // against one K and computes against another must be refused rather than
+    // read past its panels.
+    const int64_t wshape[] = {16, 37};
+    auto [wv, weight] = test::make_random_tensor({16, 37}, -1.0f, 1.0f, 41);
+
+    auto op = Linear::create(Backend::CPU);
+    TensorView q;
+    const TensorView wq[] = {weight};
+    TensorView oq[] = {q};
+    op->prepackWeights(wq, oq);
+    q = oq[0];
+
+    std::vector<float> blob(static_cast<size_t>(q.desc().numel()));
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout());
+    const TensorView wp[] = {weight};
+    TensorView opk[] = {packed};
+    op->prepackWeights(wp, opk);
+
+    auto [xv, x] = test::make_random_tensor({4, 32}, -1.0f, 1.0f, 42);  // K = 32, not 37
+    const int64_t oshape[] = {4, 16};
+    std::vector<float> obuf(static_cast<size_t>(4 * 16));
+    TensorView out(oshape, DataType::f32, obuf.data());
+
+    const TensorView ins[] = {x, packed};
+    NNOPS_EXPECT_EQ(op->compute(out, ins, {}, nullptr),
+                    Status::invalid_argument);
+}
+
+NNOPS_TEST(linear_prepacked_weight_quantized_has_no_blob) {
+    // A quantized weight has no packed form (its panels would have to carry the
+    // int32 column sums too), so the query answers with nothing — a graph
+    // engine asks unconditionally.
+    const int64_t wshape[] = {8, 16};
+    std::vector<int8_t> wv(static_cast<size_t>(8 * 16), 3);
+    TensorView weight(wshape, DataType::s8, wv.data());
+
+    auto op = Linear::create(Backend::CPU);
+    TensorView q;
+    const TensorView wq[] = {weight};
+    TensorView oq[] = {q};
+    op->prepackWeights(wq, oq);
+    NNOPS_EXPECT_TRUE(oq[0].is_empty());
+    NNOPS_EXPECT_EQ(oq[0].rank(), int64_t(0));
 }
