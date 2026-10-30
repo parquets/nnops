@@ -1,5 +1,21 @@
 /// @file test_eltwise.cpp
-/// @brief Unit tests for Eltwise operator (CPU backend).
+/// @brief Eltwise operator unit tests, CPU backend.
+///
+/// Desk-checked scalar cases for Add/Sub/Mul/Div/Min/Max/Pow with hand-computed
+/// expectations, then a random-data sweep for Add/Mul/Min/Max/Pow checked
+/// against the scalar expression. `add_to` is the accumulating form: the output
+/// view arrives pre-filled and the op adds into it instead of overwriting.
+///
+/// The f16 cases cover Add and Mul through the half-precision path. Their
+/// inputs are rounded to fp16 before the op while the reference is the
+/// unrounded f32 expression, so their tolerances widen to 5e-2 (Add) and 3e-2
+/// (Mul); f32 random cases hold 1e-4 and the desk-checked Pow holds 1e-5.
+///
+/// The quantized cases are the fused dequant → op → requant path: both input
+/// views and the output view already carry QuantParams over pre-quantized data,
+/// PerTensor and PerToken (here one scale per row of a rank-2 tensor) both
+/// appear, and the u8 case is asymmetric with zero_point 128. `add_to` is never
+/// set on them — only the float paths exercise it.
 
 #include "nnops/ops/eltwise.hpp"
 #include "common/test_harness.hpp"
@@ -11,10 +27,6 @@
 #include <cmath>
 
 using namespace nnops;
-
-// ============================================================
-// Hand-verified tests
-// ============================================================
 
 NNOPS_TEST(eltwise_add_1d) {
     const int64_t shape[] = {4};
@@ -174,15 +186,10 @@ NNOPS_TEST(eltwise_add_to) {
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
-    // output = original + (a + b)
     NNOPS_EXPECT_NEAR(out_data[0], 10.0f + 2.0f + 1.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(out_data[1], 20.0f + 3.0f + 2.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(out_data[2], 30.0f + 4.0f + 3.0f, 1e-6f);
 }
-
-// ============================================================
-// Random data tests
-// ============================================================
 
 NNOPS_TEST(eltwise_random_add) {
     auto [a_vec, a] = test::make_random_tensor({1000}, -10.0f, 10.0f, 42);
@@ -240,10 +247,6 @@ NNOPS_TEST(eltwise_random_mul) {
     }
 }
 
-// ============================================================
-// 2D tests
-// ============================================================
-
 NNOPS_TEST(eltwise_2d_add) {
     const int64_t shape[] = {2, 3};
     float a_data[] = {1, 2, 3, 4, 5, 6};
@@ -276,10 +279,6 @@ NNOPS_TEST(eltwise_2d_add) {
         NNOPS_EXPECT_NEAR(out_data[i], 7.0f, 1e-6f);
     }
 }
-
-// ============================================================
-// Min / Max tests
-// ============================================================
 
 NNOPS_TEST(eltwise_min_1d) {
     const int64_t shape[] = {4};
@@ -370,7 +369,6 @@ NNOPS_TEST(eltwise_min_add_to) {
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
-    // output = original + min(a, b)
     NNOPS_EXPECT_NEAR(out_data[0], 100.0f + 1.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(out_data[1], 200.0f + 4.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(out_data[2], 300.0f + 5.0f, 1e-6f);
@@ -423,10 +421,6 @@ NNOPS_TEST(eltwise_random_max) {
         NNOPS_EXPECT_NEAR(out_buf[i], expected, 1e-4f);
     }
 }
-
-// ============================================================
-// Pow tests
-// ============================================================
 
 NNOPS_TEST(eltwise_pow_1d) {
     const int64_t shape[] = {4};
@@ -574,10 +568,6 @@ NNOPS_TEST(eltwise_min_max_2d) {
     NNOPS_EXPECT_NEAR(max_out[5], 7.0f, 1e-6f);  // max(7, 3)
 }
 
-// ============================================================
-// f16 tests — exercise the SIMD f16 code path
-// ============================================================
-
 NNOPS_TEST(eltwise_random_add_f16) {
     auto [a_f32_vec, _a] = test::make_random_tensor({500}, -10.0f, 10.0f, 600);
     auto [b_f32_vec, _b] = test::make_random_tensor({500}, -10.0f, 10.0f, 601);
@@ -647,12 +637,9 @@ NNOPS_TEST(eltwise_random_mul_f16) {
     }
 }
 
-// ============================================================
-// Quantized input/output tests (fused dequant → op → quant)
-// ============================================================
-
 NNOPS_TEST(eltwise_quant_per_tensor_add_s8) {
-    // s8 → s8 (fused), per-tensor scale=1/zp=0, Add.
+    // PerTensor, scale 1 / zero_point 0: dequant and requant cancel, so the
+    // integer result is the plain sum of the codes.
     const int64_t shape[] = {4};
     int8_t a_data[] = {1, 2, 3, 4};
     int8_t b_data[] = {5, 6, 7, 8};
@@ -680,7 +667,7 @@ NNOPS_TEST(eltwise_quant_per_tensor_add_s8) {
 }
 
 NNOPS_TEST(eltwise_quant_per_token_sub_s8) {
-    // Per-token s8 → s8 (fused), Sub, distinct per-row scales.
+    // PerToken, one scale per row: 0.5 then 0.25.
     const int64_t shape[] = {2, 3};
     int8_t a_data[] = {6, 9, 12,  15, 18, 21};
     int8_t b_data[] = {1, 2, 3,   4, 5, 6};
@@ -712,7 +699,7 @@ NNOPS_TEST(eltwise_quant_per_token_sub_s8) {
 }
 
 NNOPS_TEST(eltwise_quant_per_tensor_add_u8) {
-    // Asymmetric u8 → u8 (fused), Add. scale=0.5, zp=128.
+    // Asymmetric u8: scale 0.5, zero_point 128.
     const int64_t shape[] = {3};
     uint8_t a_data[] = {128, 129, 130};
     uint8_t b_data[] = {128, 130, 132};

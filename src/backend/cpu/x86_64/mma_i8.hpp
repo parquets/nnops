@@ -3,25 +3,27 @@
 /// @brief x86_64 VNNI int8×int8 → int32 mrxncxkc MMA (matrix micro-accumulate)
 ///        kernels.
 ///
-/// One call covers the whole N side of one M panel: it computes
-/// C[mr][nc] += A[mr][kc] × B[kc][nc] panel by panel and clamps every int32
-/// result to [clamp_min, clamp_max]. This is the int8 sibling of
-/// mma_f32.hpp / mma_f16.hpp, and takes the same runtime panel height `mr` and
-/// the same partial-M convention: rows past `mr` reuse the last live row's
-/// index and C row (they compute a duplicate and store it back to the same
-/// place), so a short panel needs no per-row guards.
+/// One call covers the whole N side of one M panel: C[mr][nc] += A[mr][kc] ×
+/// B[kc][nc] panel by panel, every int32 result clamped to [clamp_min, clamp_max]
+/// once the sum is finished. The int8 sibling of mma_f32.hpp / mma_f16.hpp,
+/// taking the same runtime panel height `mr` and the same partial-M convention:
+/// rows past `mr` reuse the last live row's index and C row (they compute a
+/// duplicate and store it back to the same place; the XNNPACK broadcast
+/// convention), so a short panel needs no per-row guards. `zero_mode` false
+/// accumulates into C, true overwrites it; there is no bias seed argument -- the
+/// panel's column sums are the only seed.
 ///
-/// Both operand routes exist, as in the float files:
+/// Two A routes, as in the float files; B is always packed, always VNNI order.
 ///   - `mma_packed_ab_*` takes a packed A: four consecutive k per int32, with
 ///     the kernel's MR row slots interleaved inside each k group --
 ///     [ceil(kc/4)][MR] int32s, in a mma_pack_align(MR*kbytes)-byte slot; only
 ///     the first `mr` slots of a short panel are read.
-///   - `mma_packed_b_*` reads A row-major through `lda` (in int8 elements). The
-///     four consecutive k of one row are already the dword dpbusd wants, so no
-///     packing is needed -- but a row-major row has no zero-filled final group,
-///     so these require kc % 4 == 0.
-///   B is always packed, and always in VNNI order:
-///   - ceil(nc/16) uniform 16-column panels, each byte-group
+///   - `mma_packed_b_*` reads A row-major through `lda` (in int8 elements): the
+///     four consecutive k of one row are already the dword dpbusd wants, so the
+///     broadcast is one unaligned 4-byte load (no penalty on x86) rather than a
+///     packed panel -- but a row-major row has no zero-filled final group, so
+///     these require kc % 4 == 0.
+///   - B is ceil(nc/16) uniform 16-column panels, each byte-group
 ///     [ceil(kc/4)][16][4] -- one int32 per column per k group -- followed by
 ///     16 int32 of column sums. The data half is 16*ceil(kc/4)*4 =
 ///     64*ceil(kc/4) bytes, itself a multiple of the 64-byte mma_pack_align
@@ -32,21 +34,29 @@
 /// can always read all 16 columns at the uniform stride and discard the dead
 /// ones. `kc` is the number of int8 elements; on the packed route a final
 /// partial group (1..3) is consumed as a whole zero-padded group, matching what
-/// the packers write.
+/// the packers write. After the whole panels the N tail splits 8/4/2/1 lanes
+/// out of the same accumulators -- lane j is column j, so it is a lo/hi split;
+/// a tail wider than 8 runs both 8-lane halves in one k loop instead of two,
+/// and the 2-wide step keeps an unclamped copy of lanes 2,3 because the 1-wide
+/// step still stores them.
 ///
 /// Operand contract: B is int8; A is int8 or uint8, and the kernels return the
 /// exact integer dot product either way (what MatMulInteger wants, before
 /// zero-point compensation). vpdpbusd is u8×s8, so:
 ///   - s8 A: the A pack stores every byte biased by +128 (XOR 0x80) and the
-///     kernel folds -128·Σ_k B[k][n] back out.
+///     kernel folds -128·Σ_k B[k][n] back out. The direct-A route has no packer
+///     to bias it, so it XORs each broadcast group in the kernel and is s8 only.
 ///   - u8 A: the A pack stores the bytes as they are; nothing to fold, so the
 ///     B panel's correction block is zeroed and the accumulators start at zero.
 /// That sum is a property of the B panel, not of A, so the B packer writes it
 /// once per panel as 16 int32 right after the panel's data (see
-/// mma_i8_b_panel_sums). The kernel starts its accumulators at -128·sum instead
-/// of zero, which costs nothing in the k loop. The direct-A route has no packer
-/// to bias it, so each broadcast group is XORed in the kernel -- i.e. that route
-/// is s8 A only.
+/// mma_i8_b_panel_sums), and the kernel starts its accumulators at -128·sum
+/// instead of zero, which costs nothing in the k loop.
+///
+/// Build: the kernels need VNNI -- AVX-VNNI, or AVX512-VNNI with AVX512VL for the
+/// 256-bit form. A build with neither cannot run them at all, so mma_i8_dp256 is a
+/// hard #error rather than a silent no-op; MSVC has no /arch switch for VNNI, so
+/// CMake defines __AVXVNNI__ by hand.
 ///
 /// Tile sizes (x86_64-optimised): M ∈ {6, 4, 1}    N: 16 plus an in-kernel tail.
 
@@ -58,10 +68,6 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-// vpdpbusd: acc + sum of 4 u8×s8 products per 32-bit lane. The build always
-// defines __AVXVNNI__ on x86_64 (MSVC has no /arch switch for it, so CMake adds
-// the macro by hand); a build without VNNI cannot run these kernels at all, so
-// fail loudly instead of quietly accumulating nothing.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 inline __m256i mma_i8_dp256(__m256i acc, __m256i a, __m256i b) noexcept {
     return _mm256_dpbusd_epi32(acc, a, b);
@@ -74,11 +80,7 @@ inline __m256i mma_i8_dp256(__m256i acc, __m256i a, __m256i b) noexcept {
 #error "mma_i8.hpp requires AVX-VNNI (vpdpbusd)"
 #endif
 
-/// One k group of a row-major A row as a VNNI operand: the four int8 values
-/// plus the +128 bias that turns the signed row into vpdpbusd's unsigned
-/// operand. The 4-byte load is unaligned whenever `lda` is not a multiple of 4;
-/// x86 has no penalty for that, and this is the same int32 read the dp4a pack
-/// kernels use.
+/// A row-major A row's 4-k group, biased into vpdpbusd's unsigned operand.
 inline __m256i mma_i8_bcast_group(const int8_t* p) noexcept {
     return _mm256_set1_epi32(*reinterpret_cast<const int32_t*>(p) ^ 0x80808080);
 }
@@ -86,22 +88,13 @@ inline __m256i mma_i8_bcast_group(const int8_t* p) noexcept {
 /// Packed-B panel width: the kernels' uniform nr.
 inline constexpr int mma_i8_nr_max = 16;
 
-/// Bytes a packed-B panel carries past its nr*kbytes payload: one int32 of
-/// column sums per column.
+/// Bytes a packed-B panel carries past its payload: one int32 of column sums per column.
 inline constexpr int mma_i8_b_panel_tail = mma_i8_nr_max * 4;
 
-/// The kernels seed their accumulators from the panel's trailing block, i.e.
-/// they fold the A bias per panel. matmul_helper uses this to decide how much
-/// of a u8 A's -128 shift the epilogue still has to correct (nothing here).
+/// The kernels fold the A bias per panel, so matmul_helper's epilogue corrects none of it.
 inline constexpr bool mma_i8_folds_a_bias = true;
 
-/// Column sums of one packed-B panel, written by the pack step. Every 32-bit
-/// lane of the panel holds four consecutive k of one column, so accumulating
-/// it against an all-ones u8 vector gives exactly that column's k sum.
-///
-/// @p a_biased is the A pack's +128 shift for this GEMM: when it is set the
-/// block holds the sums (the kernel turns them into -128·Σb), otherwise it is
-/// zeroed and the accumulators start at zero, which is what a u8 A wants.
+/// Column sums of one packed-B panel; @p a_biased selects the s8-A sums or a zeroed block.
 inline void mma_i8_b_panel_sums(int8_t* panel, int kbytes, bool a_biased) noexcept {
     __m256i s0 = _mm256_setzero_si256();
     __m256i s1 = _mm256_setzero_si256();
@@ -117,20 +110,12 @@ inline void mma_i8_b_panel_sums(int8_t* panel, int kbytes, bool a_biased) noexce
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(panel + 16 * kbytes + 32), s1);
 }
 
-/// An accumulator's starting value for one packed-B panel: -128 times the
-/// panel's column sums, i.e. the correction that cancels the +128 A bias over
-/// the k loop. For a u8 A the block is zeroed and this is the plain zero the
-/// accumulators used to start at. `off` picks the low (0) or high (32) half of
-/// the 16 columns.
+/// An accumulator's seed for one packed-B panel: -128 × its column sums, or zero; `off` picks the low (0) or high (32) half.
 inline __m256i mma_i8_bias_fix(const int8_t* panel, int kbytes, int off) noexcept {
     const __m256i sums = _mm256_loadu_si256(
         reinterpret_cast<const __m256i*>(panel + 16 * kbytes + off));
     return _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_slli_epi32(sums, 7));
 }
-
-// =========================================================================
-//  mr = 6
-// =========================================================================
 
 template <bool zero_mode = false>
 void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
@@ -139,9 +124,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
     const int8_t* NNOPS_RESTRICT B,
     int32_t clamp_min, int32_t clamp_max) noexcept {
 
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK 6x16 broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -157,10 +139,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
 
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
-    // 16 columns x kbytes bytes per panel, i.e. 64 bytes per k group -- already
-    // a whole mma_pack_align slot, so no padding between panels.
-    // Panel slot: 16 columns x kbytes of data, then the 16 int32 of column
-    // sums the accumulator is seeded from.
     const int ldb = static_cast<int>(mma_pack_align(16 * kbytes + mma_i8_b_panel_tail));
 
     int n = 0;
@@ -274,14 +252,10 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
     }
 
     int rem = nc - n;
-    const bool tail_hi = rem > 8;  // the tail k loop filled both halves
+    const bool tail_hi = rem > 8;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the packer
-        // zero-fills the columns past `nc`, so both halves can always be read at
-        // the same 64-byte stride. At most 8 columns fit one 8-lane read; a
-        // wider tail reads both halves and reuses the full-panel body, so it
-        // costs one k loop instead of two.
+        // A tail wider than 8 reads both halves in one k loop instead of two.
         __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
         __m256i v_acc0x89abcdef = mma_i8_bias_fix(B, kbytes, 32);
         __m256i v_acc1x01234567 = v_acc0x01234567;
@@ -387,10 +361,8 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3
-            // columns sit at lane 0 of the high half. A tail wider than 8 kept
-            // accumulating into the high half, so that is the one it starts from.
+            // Lane j is column j, so the 4/2/1 ladder is a lo/hi split of one
+            // accumulator; a tail wider than 8 accumulated in the high half.
             const __m256i v_acc0 = tail_hi ? v_acc0x89abcdef : v_acc0x01234567;
             const __m256i v_acc1 = tail_hi ? v_acc1x89abcdef : v_acc1x01234567;
             const __m256i v_acc2 = tail_hi ? v_acc2x89abcdef : v_acc2x01234567;
@@ -454,8 +426,7 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
+                // The 4-wide clamp below would corrupt lanes 2,3 that the 1-wide step stores.
                 const __m128i v_rest0 = v_acc0x0123;
                 const __m128i v_rest1 = v_acc1x0123;
                 const __m128i v_rest2 = v_acc2x0123;
@@ -533,10 +504,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
     }
 }
 
-// =========================================================================
-//  mr = 4
-// =========================================================================
-
 template <bool zero_mode = false>
 void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
@@ -555,8 +522,6 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
 
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
-    // Panel slot: 16 columns x kbytes of data, then the 16 int32 of column
-    // sums the accumulator is seeded from.
     const int ldb = static_cast<int>(mma_pack_align(16 * kbytes + mma_i8_b_panel_tail));
 
     int n = 0;
@@ -641,7 +606,7 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
     }
 
     int rem = nc - n;
-    const bool tail_hi = rem > 8;  // the tail k loop filled both halves
+    const bool tail_hi = rem > 8;
 
     if (rem > 0) {
         __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
@@ -830,10 +795,6 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
     }
 }
 
-// =========================================================================
-//  mr = 1
-// =========================================================================
-
 template <bool zero_mode = false>
 void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
@@ -846,8 +807,6 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
 
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
-    // Panel slot: 16 columns x kbytes of data, then the 16 int32 of column
-    // sums the accumulator is seeded from.
     const int ldb = static_cast<int>(mma_pack_align(16 * kbytes + mma_i8_b_panel_tail));
 
     int n = 0;
@@ -889,7 +848,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
     }
 
     int rem = nc - n;
-    const bool tail_hi = rem > 8;  // the tail k loop filled both halves
+    const bool tail_hi = rem > 8;
 
     if (rem > 0) {
         __m256i v_acc0x01234567 = mma_i8_bias_fix(B, kbytes, 0);
@@ -991,19 +950,6 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
     }
 }
 
-// =========================================================================
-//  Direct-A (row-major A) variants
-// =========================================================================
-//
-// `lda` is the A row stride in int8 elements. These read each row's 4-k groups
-// straight from memory instead of from a packed panel, so kc must be a
-// multiple of 4 -- a row-major row has no zero-filled final group to fall back
-// on.
-
-// =========================================================================
-//  mr = 6, direct A
-// =========================================================================
-
 template <bool zero_mode = false>
 void mma_packed_b_mr6_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
@@ -1025,7 +971,6 @@ void mma_packed_b_mr6_nr16_mrxncxkc_i8(
     int32_t* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
 
     const int kg = kc >> 2;
-    // Panel slot: 16 columns x kc of data, then the 16 int32 of column sums.
     const int ldb = static_cast<int>(mma_pack_align(16 * kc + mma_i8_b_panel_tail));
 
     int n = 0;
@@ -1414,10 +1359,6 @@ void mma_packed_b_mr6_nr16_mrxncxkc_i8(
     }
 }
 
-// =========================================================================
-//  mr = 4, direct A
-// =========================================================================
-
 template <bool zero_mode = false>
 void mma_packed_b_mr4_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
@@ -1435,7 +1376,6 @@ void mma_packed_b_mr4_nr16_mrxncxkc_i8(
     int32_t* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
     const int kg = kc >> 2;
-    // Panel slot: 16 columns x kc of data, then the 16 int32 of column sums.
     const int ldb = static_cast<int>(mma_pack_align(16 * kc + mma_i8_b_panel_tail));
 
     int n = 0;
@@ -1726,10 +1666,6 @@ void mma_packed_b_mr4_nr16_mrxncxkc_i8(
     }
 }
 
-// =========================================================================
-//  mr = 1, direct A
-// =========================================================================
-
 template <bool zero_mode = false>
 void mma_packed_b_mr1_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
@@ -1741,7 +1677,6 @@ void mma_packed_b_mr1_nr16_mrxncxkc_i8(
     int32_t* c0_ptr = C;
 
     const int kg = kc >> 2;
-    // Panel slot: 16 columns x kc of data, then the 16 int32 of column sums.
     const int ldb = static_cast<int>(mma_pack_align(16 * kc + mma_i8_b_panel_tail));
 
     int n = 0;
@@ -1887,17 +1822,14 @@ void mma_packed_b_mr1_nr16_mrxncxkc_i8(
     }
 }
 
-// ---- dispatch table ------------------------------------------------------
-// Rows are the MR levels {6,4,1} (MR_I8 on x86_64); every kernel takes the
-// runtime panel height, so a remainder panel below its own MR runs through the
-// level above it. The packed table is what matmul_helper's int8 route walks.
+/// MR levels {6,4,1} (MR_I8); a remainder panel runs through the level above it.
 template <bool Z>
 inline constexpr auto mma_pack_fns_i8 = std::array{
     &mma_packed_ab_mr6_nr16_mrxncxkc_i8<Z>,
     &mma_packed_ab_mr4_nr16_mrxncxkc_i8<Z>,
     &mma_packed_ab_mr1_nr16_mrxncxkc_i8<Z>};
 
-// Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
+/// Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
 template <bool Z>
 inline constexpr auto mma_direct_fns_i8 = std::array{
     &mma_packed_b_mr6_nr16_mrxncxkc_i8<Z>,

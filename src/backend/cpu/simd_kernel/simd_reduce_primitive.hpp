@@ -1,16 +1,18 @@
 #pragma once
 /// @file simd_reduce_primitive.hpp
-/// @brief Shared reduction primitives for contiguous rows.
+/// @brief Shared "reduce a contiguous row to a scalar" primitives.
 ///
-/// The Reduce, Softmax and Norm kernels share the same "multi-accumulator
-/// reduce a contiguous row to a scalar" pattern (4-wide ILP, 2-wide, 1-wide,
-/// scalar tail) and the same horizontal max/min/sum reductions. This header
-/// is the single source of truth for that pattern:
+/// Reduce, Softmax and Norm share this pattern: 4-wide ILP → 2-wide → 1-wide
+/// SIMD → scalar tail, plus horizontal max/min/sum. This header is its single
+/// source of truth.
 ///
-///   - ReduceAdd / ReduceMax / ReduceMin: tag types capturing a reduction's
-///     identity, vector combine, horizontal reduction and scalar combine.
-///   - row_reduce<T, Op>: generic 4→2→1 multi-accumulator reduce to scalar.
-///   - row_reduce_sum_sq<T>: fused sum + sum-of-squares reduce.
+///   - ReduceAdd / ReduceMax / ReduceMin: tag types carrying a reduction's
+///     identity, vector combine, horizontal reduction and scalar combine. The
+///     vector members are templates, so one tag serves both v_f32x8 and v_f16x8.
+///   - row_reduce<T, Op>: generic multi-accumulator reduce to scalar. The
+///     accumulate order is fixed, so sum results are bit-identical for all users.
+///   - row_reduce_sum_sq<T>: fused sum + sum-of-squares reduce; returns floats
+///     regardless of T (fp16 values are promoted).
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
@@ -27,8 +29,6 @@ using namespace simd;
 // Reduction op tags
 // ============================================================
 
-/// The vector-level members are templates so a single tag works for both
-/// v_f32x8 and v_f16x8; the compiler instantiates only the width it needs.
 struct ReduceAdd {
     template <typename P>
     static auto vec_identity(const P* p) { return v_zero(p); }
@@ -67,17 +67,12 @@ struct ReduceMin {
 // Contiguous row reduction
 // ============================================================
 
-/// Reduce one contiguous row to a scalar via multi-accumulator unrolling:
-/// 4-wide ILP → 2-wide → 1-wide SIMD → scalar tail. `Op` supplies the
-/// reduction semantics (ReduceAdd/ReduceMax/ReduceMin); the accumulate order
-/// is fixed so sum results are bit-identical across all users.
 template <typename T, typename Op>
 inline float row_reduce(const T* x, int64_t n)
 {
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    // ---- Stage 1: 4-wide ILP ----
     auto a0 = Op::vec_identity(x);
     auto a1 = Op::vec_identity(x);
     auto a2 = Op::vec_identity(x);
@@ -90,7 +85,6 @@ inline float row_reduce(const T* x, int64_t n)
     }
     auto acc = Op::combine(Op::combine(a0, a1), Op::combine(a2, a3));
 
-    // ---- Stage 2: 2-wide ----
     auto a4 = Op::vec_identity(x);
     auto a5 = Op::vec_identity(x);
     for (; i + 2 * L <= n; i += 2 * L) {
@@ -99,25 +93,17 @@ inline float row_reduce(const T* x, int64_t n)
     }
     acc = Op::combine(acc, Op::combine(a4, a5));
 
-    // ---- Stage 3: 1-wide ----
     for (; i + L <= n; i += L) {
         acc = Op::combine(acc, v_load(x + i));
     }
     float s = Op::horizontal(acc);
 
-    // ---- Stage 4: scalar tail ----
     for (; i < n; ++i) {
         s = Op::combine_scalar(s, s_load(&x[i]));
     }
     return s;
 }
 
-/// SIMD sum + sum-of-squares reduction over n contiguous elements.
-///
-/// Uses 4-wide multi-accumulator unrolling for ILP, then falls back
-/// through 2-wide → 1-wide SIMD → scalar tail.
-///
-/// Returns {sum, sum_sq} as float regardless of T (fp16 values are promoted).
 template <typename T>
 inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
 {
@@ -126,7 +112,6 @@ inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
     float sum = 0.0f;
     float sum_sq = 0.0f;
 
-    // ---- Stage 1: 4-wide SIMD reduction (ILP ×4) ----
     {
         auto v_sum0 = v_zero(x);
         auto v_sum_sq0 = v_zero(x);
@@ -155,7 +140,6 @@ inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
         auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
                               v_add(v_sum_sq2, v_sum_sq3));
 
-        // ---- Stage 2: 2-wide SIMD ----
         auto v_sum4 = v_zero(x);
         auto v_sum_sq4 = v_zero(x);
         auto v_sum5 = v_zero(x);
@@ -171,7 +155,6 @@ inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
         v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
         v_sum_sq = v_add(v_sum_sq, v_add(v_sum_sq4, v_sum_sq5));
 
-        // ---- Stage 3: 1-wide SIMD ----
         for (; i + L <= n; i += L) {
             auto v = v_load(x + i);
             v_sum = v_add(v_sum, v);
@@ -182,7 +165,6 @@ inline std::pair<float, float> row_reduce_sum_sq(const T* x, int64_t n)
         sum_sq = v_reduce_sum(v_sum_sq);
     }
 
-    // ---- Stage 4: scalar tail ----
     for (; i < n; ++i) {
         float xv = s_load(&x[i]);
         sum += xv;

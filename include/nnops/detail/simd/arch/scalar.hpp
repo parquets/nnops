@@ -1,10 +1,23 @@
 #pragma once
 /// @file scalar.hpp
-/// @brief Scalar C++ fallback for SIMD vector types.
+/// @brief Scalar C++ fallback for the SIMD vector types.
 ///
-/// Provides pure C++ implementations of all vector operations.
-/// Used when no SIMD ISA is available at compile time, and as a
-/// correctness reference for testing vectorized kernels.
+/// Every operation is a plain element loop. This is what the vector types
+/// degrade to when no ISA is selected, and the reference the vectorized
+/// kernels are checked against.
+///
+/// f16 is stored as raw binary16 bits, and every arithmetic operation widens
+/// to f32, computes, then rounds back — the same convert/compute/convert shape
+/// as the x86 F16C path. The conversion itself is the onnxruntime MLAS bit
+/// trick (no hardware conversion): subnormals are renormalized by adding and
+/// subtracting a magic float.
+///
+/// Comparisons return 0xFFFFFFFF (a NaN bit pattern) for true and 0 for false,
+/// the SSE/NEON compare convention, so compare results match the SIMD backends
+/// bit for bit.
+///
+/// v_s8x16 and v_u8x16 are storage only — load, store, set1, zero. No scalar
+/// int8 arithmetic is provided.
 
 #include <cstdint>
 #include <cstring>
@@ -17,7 +30,7 @@ namespace arch {
 namespace scalar {
 
 // ============================================================
-// v_f32x4 — 128-bit float vector (4 floats), scalar emulation
+// v_f32x4 — 4 floats, stored as float[4]
 // ============================================================
 struct v_f32x4 {
     float v[4];
@@ -32,7 +45,7 @@ struct v_f32x4 {
 };
 
 // ============================================================
-// v_f32x8 — 256-bit float vector (8 floats), scalar emulation
+// v_f32x8 — 8 floats, stored as float[8]
 // ============================================================
 struct v_f32x8 {
     float v[8];
@@ -50,9 +63,6 @@ struct v_f32x8 {
     float& operator[](int i) { return v[i]; }
 };
 
-// ============================================================
-// v_f32x4 operations
-// ============================================================
 inline v_f32x4 v_load_f32x4(const float* p) {
     return v_f32x4(p[0], p[1], p[2], p[3]);
 }
@@ -92,9 +102,7 @@ inline v_f32x4 v_neg(const v_f32x4& a) {
     return v_f32x4(-a[0], -a[1], -a[2], -a[3]);
 }
 
-// Comparison: returns 0xFFFFFFFF (NaN as float) for true, 0x00000000 for false.
-// This matches the SSE _mm_cmplt_ps / NEON vcltq_f32 convention so that
-// results are bit-identical between scalar and SIMD backends.
+// All-ones (NaN) mask for true, zero for false — the SSE/NEON convention.
 namespace {
 inline float _scalar_mask(bool cond) {
     uint32_t v = cond ? 0xFFFFFFFFu : 0u;
@@ -162,9 +170,6 @@ inline float v_reduce_min(const v_f32x4& a) {
     return std::min({a[0], a[1], a[2], a[3]});
 }
 
-// ============================================================
-// v_f32x8 operations
-// ============================================================
 inline v_f32x8 v_load_f32x8(const float* p) {
     return v_f32x8(p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
 }
@@ -300,35 +305,25 @@ inline float v_reduce_min(const v_f32x8& a) {
 }
 
 // ============================================================
-// Float16 conversion utilities (IEEE 754 binary16 <-> binary32)
-// Optimized using onnxruntime MLAS techniques:
-//   - Denorm magic: float addition hardware normalizes subnormals
-//   - Combined bias+rounding: single v_add for bias adjust + rounding
-//   - Magic subtraction: FP subtraction renormalizes half->float subnormals
+// binary16 <-> binary32 — onnxruntime MLAS bit tricks
 // ============================================================
 namespace {
 
 inline float f16_to_f32(uint16_t val) {
-    // onnxruntime MLAS_Half2Float technique:
-    // 1. Shift mantissa+exponent into f32 position (<< 13)
-    // 2. Add bias adjustment (127-15) << 23
-    // 3. For subnormals: promote to normal (+1<<23), then subtract magic to renormalize
-    // 4. For Inf/NaN: extra exponent adjustment
+    constexpr uint32_t magic_val = 113u << 23;      // magic float for subnormal renormalization
+    constexpr uint32_t shifted_exp_mask = 0x7C00u << 13;
 
-    constexpr uint32_t magic_val = 113u << 23;     // magic for subnormal renormalization
-    constexpr uint32_t shifted_exp_mask = 0x7C00u << 13;  // exponent field after shift
-
-    uint32_t bits = (val & 0x7FFFu) << 13;          // mantissa + exponent
-    uint32_t v_exp = shifted_exp_mask & bits;          // extract exponent
-    bits += (127u - 15u) << 23;                      // adjust bias: f16→f32
+    uint32_t bits = (val & 0x7FFFu) << 13;
+    uint32_t v_exp = shifted_exp_mask & bits;
+    bits += (127u - 15u) << 23;
 
     if (v_exp == shifted_exp_mask) {
-        // Inf/NaN: need extra exponent adjustment
+        // Inf/NaN: one more exponent step
         bits += (128u - 16u) << 23;
     } else if (v_exp == 0) {
         // Zero or subnormal
         if (bits != 0) {
-            // Subnormal: promote to normal and renormalize via FP subtraction
+            // Subnormal: promote to normal, then renormalize with an FP subtract
             bits += 1u << 23;
             float f;
             std::memcpy(&f, &bits, sizeof(f));
@@ -339,7 +334,7 @@ inline float f16_to_f32(uint16_t val) {
         }
     }
 
-    bits |= (val & 0x8000u) << 16;  // sign bit
+    bits |= (val & 0x8000u) << 16;
 
     float result;
     std::memcpy(&result, &bits, sizeof(result));
@@ -347,13 +342,6 @@ inline float f16_to_f32(uint16_t val) {
 }
 
 inline uint16_t f32_to_f16(float ff) {
-    // onnxruntime MLAS_Float2Half technique:
-    // 1. For subnormals: v_add denorm_magic float, then subtract its integer form
-    //    → FP addition hardware normalizes and rounds correctly
-    // 2. For normals: single v_add of bias_adjust + 0xFFF + mant_odd
-    //    → rounds and adjusts bias in one step, then shift >> 13
-    // 3. For Inf/NaN: threshold check → preset values
-
     constexpr uint32_t f32infty_u   = 255u << 23;
     constexpr uint32_t f16max_u     = (127u + 16u) << 23;  // 2^16 cutoff: at/above this the value maps to Inf/NaN
     constexpr uint32_t denorm_magic = ((127u - 15u) + (23u - 10u) + 1u) << 23;
@@ -363,7 +351,7 @@ inline uint16_t f32_to_f16(float ff) {
     std::memcpy(&bits, &ff, sizeof(bits));
 
     uint32_t sign = bits & sign_mask;
-    bits ^= sign;  // work with absolute value
+    bits ^= sign;
 
     uint16_t val;
     if (bits >= f16max_u) {
@@ -372,8 +360,7 @@ inline uint16_t f32_to_f16(float ff) {
                                   : 0x7C00u; // Inf
     } else {
         if (bits < (113u << 23)) {
-            // Subnormal or zero: use magic float trick
-            // FP addition with round-to-nearest-even normalizes the mantissa
+            // Subnormal or zero: the magic float add normalizes and rounds
             float f;
             std::memcpy(&f, &bits, sizeof(f));
             float magic_f;
@@ -383,10 +370,9 @@ inline uint16_t f32_to_f16(float ff) {
             std::memcpy(&bits, &f, sizeof(bits));
             val = static_cast<uint16_t>(bits - magic_u);
         } else {
-            // Normal number: bias adjustment + rounding in one step
             uint32_t mant_odd = (bits >> 13) & 1u;  // resulting mantissa LSB for round-to-even
             bits += ((15u - 127u) << 23) + 0xFFFu;  // bias adjust + rounding constant
-            bits += mant_odd;                         // round to nearest even
+            bits += mant_odd;
             val = static_cast<uint16_t>(bits >> 13);
         }
     }
@@ -398,7 +384,7 @@ inline uint16_t f32_to_f16(float ff) {
 } // anonymous namespace
 
 // ============================================================
-// v_f16x8 — 128-bit float16 vector (8 half floats), scalar emulation
+// v_f16x8 — 8 halves, stored as raw binary16 bits in uint16_t[8]
 // ============================================================
 struct v_f16x8 {
     uint16_t bits[8];
@@ -411,9 +397,6 @@ struct v_f16x8 {
     }
 };
 
-// ============================================================
-// v_f16x8 operations
-// ============================================================
 inline v_f16x8 v_load_f16x8(const uint16_t* p) {
     return v_f16x8(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
 }
@@ -428,7 +411,6 @@ inline v_f16x8 v_zero_f16x8() {
     return v_f16x8(0, 0, 0, 0, 0, 0, 0, 0);
 }
 
-// FP16 <-> FP32 conversion
 inline v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
     return v_f32x8(
         f16_to_f32(a.bits[0]), f16_to_f32(a.bits[1]),
@@ -496,14 +478,14 @@ inline v_f16x8 v_max(const v_f16x8& a, const v_f16x8& b) {
 inline v_f16x8 v_abs(const v_f16x8& a) {
     v_f16x8 r;
     for (int i = 0; i < 8; ++i) {
-        r.bits[i] = a.bits[i] & 0x7FFFu;  // clear sign bit
+        r.bits[i] = a.bits[i] & 0x7FFFu;
     }
     return r;
 }
 inline v_f16x8 v_neg(const v_f16x8& a) {
     v_f16x8 r;
     for (int i = 0; i < 8; ++i) {
-        r.bits[i] = a.bits[i] ^ 0x8000u;  // flip sign bit
+        r.bits[i] = a.bits[i] ^ 0x8000u;
     }
     return r;
 }
@@ -544,7 +526,6 @@ inline float v_reduce_min(const v_f16x8& a) {
     return best;
 }
 
-// Transcendental math for v_f16x8
 inline v_f16x8 v_exp(const v_f16x8& a) {
     v_f16x8 r;
     for (int i = 0; i < 8; ++i) {
@@ -589,16 +570,15 @@ inline v_f16x8 v_tanh(const v_f16x8& a) {
 }
 
 // ============================================================
-// Deinterleave (stride-2 gather) — pair types
+// Stride-2 gather — three spellings of one load. v_deinterleave_* reads 2N
+// elements and returns the {even, odd} pair; v_load_even_* / v_load_odd_*
+// return one half of it; v_load_stride2_even_* / v_load_stride2_odd_* are the
+// same two functions under explicit names.
 // ============================================================
 
 struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
 struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
 struct v_f16x8x2_t { v_f16x8 even; v_f16x8 odd; };
-
-// ============================================================
-// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
-// ============================================================
 
 inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
     return {v_f32x4(src[0], src[2], src[4], src[6]),
@@ -619,10 +599,6 @@ inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
                      src[9], src[11],src[13],src[15])};
 }
 
-// ============================================================
-// 方案 B: v_load_even_* / v_load_odd_*
-// ============================================================
-
 inline v_f32x4 v_load_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
 }
@@ -641,10 +617,6 @@ inline v_f16x8 v_load_even_f16x8(const uint16_t* src) {
 inline v_f16x8 v_load_odd_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).odd;
 }
-
-// ============================================================
-// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_*
-// ============================================================
 
 inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
@@ -666,10 +638,10 @@ inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
 }
 
 // ============================================================
-// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
+// 8×8 transpose, in place — 8 registers of rows in, the same 8 holding
+// columns out (f32x8 and f16x8)
 // ============================================================
 
-/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
     float tmp[8][8];
@@ -723,10 +695,8 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     }
 }
 
-/// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
 inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
                              v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
-    // Scalar: read 8×8 into temp, write back transposed
     uint16_t tmp[8][8];
     for (int i = 0; i < 8; ++i) {
         tmp[0][i] = r0.bits[i];
@@ -779,7 +749,7 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
 }
 
 // ============================================================
-// v_s8x16 — 128-bit signed int8 vector (16 bytes), scalar emulation
+// v_s8x16 — 16 int8, stored as int8_t[16]
 // ============================================================
 struct v_s8x16 {
     int8_t v[16];
@@ -810,7 +780,7 @@ inline v_s8x16 v_set1_s8x16(int8_t s)  { return v_s8x16(s); }
 inline v_s8x16 v_zero_s8x16()         { return v_s8x16(0); }
 
 // ============================================================
-// v_u8x16 — 128-bit unsigned int8 vector (16 bytes), scalar emulation
+// v_u8x16 — 16 uint8, stored as uint8_t[16]
 // ============================================================
 struct v_u8x16 {
     uint8_t v[16];

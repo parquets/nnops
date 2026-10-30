@@ -1,22 +1,12 @@
 #pragma once
 /// @file layout_dispatch.hpp
-/// @brief LayoutDispatch — shared utility for routing operator compute()
-///        calls with automatic pack/unpack around a single NCHW kernel.
+/// @brief LayoutDispatch — routes an operator's compute() through automatic
+///        pack/unpack around a single NCHW kernel.
 ///
-/// Usage (in src/ops/<name>.cpp):
-///
-///   #include "backend/cpu/common/layout_dispatch.hpp"
-///
-///   void Operator::compute(span<TensorView> outputs,
-///                          span<const TensorView> inputs,
-///                          const ComputeContext& ctx, void* workspace) {
-///       LayoutDispatch ld(inputs[0].layout(), outputs[0].layout());
-///       dispatch_layout(ld, impl_->kernel, outputs[0], inputs, ctx, workspace);
-///   }
-///
-///   size_t Operator::getWorkspaceSize(...) const override {
-///       return layout_dispatch_workspace(inputs[0].desc(), outputs[0].desc());
-///   }
+/// Use it in src/ops/<name>.cpp: build a LayoutDispatch from the input and
+/// output layouts, call dispatch_layout(ld, impl_->kernel, outputs[0], inputs,
+/// ctx, workspace), and size the workspace with
+/// layout_dispatch_workspace(inputs[0].desc(), outputs[0].desc()).
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -35,29 +25,21 @@ struct LayoutDispatch {
         : in_packed(is_channel_packed(in))
         , out_packed(is_channel_packed(out)) {}
 
-    /// Does the dispatch need to unpack the input before calling the kernel?
     bool needs_input_unpack() const { return in_packed; }
 
-    /// Does the dispatch need to pack the output after calling the kernel?
     bool needs_output_pack() const { return out_packed; }
 
-    /// Does this combination require workspace temp buffers?
     bool needs_workspace() const { return in_packed || out_packed; }
 };
 
 /// Route a compute call through layout conversion as needed.
 ///
-/// `kernel` is the operator's compute function. It always receives NCHW
-/// (unpacked) inputs and produces NCHW outputs. This function transparently
-/// unpacks the channel-packed first input (inputs[0]) before calling the
-/// kernel, and packs the output after if the user requested a packed output
-/// layout.
-///
-/// Workspace layout (when needed):
-///   [temp_input buffer (if in_packed)] [temp_output buffer (if out_packed)]
-///
-/// @tparam KernelFn  void(TensorView& output, span<const TensorView> inputs,
-///                         const ComputeContext& ctx, void* workspace)
+/// `kernel` always receives NCHW (unpacked) inputs and produces an NCHW output:
+/// this unpacks the channel-packed inputs[0] first and packs the output after
+/// if a packed output was requested. Workspace layout when conversion is needed:
+///   [temp_input (if in_packed)] [temp_output (if out_packed)]
+/// That workspace is consumed here, so the kernel is called with nullptr; with
+/// no conversion it gets the caller's workspace untouched.
 template <typename KernelFn>
 void dispatch_layout(const LayoutDispatch& ld,
                      KernelFn kernel,
@@ -67,7 +49,6 @@ void dispatch_layout(const LayoutDispatch& ld,
                      void* workspace)
 {
     if (!ld.needs_input_unpack() && !ld.needs_output_pack()) {
-        // NCHW → NCHW: direct call, zero overhead
         kernel(output, inputs, ctx, workspace);
         return;
     }
@@ -95,15 +76,14 @@ void dispatch_layout(const LayoutDispatch& ld,
                                        ws, TensorLayout::NCHW);
     }
 
-    kernel(effective_output, effective_inputs, ctx,
-           /* remaining workspace — only for kernel's own use */ nullptr);
+    kernel(effective_output, effective_inputs, ctx, nullptr);
 
     if (ld.needs_output_pack()) {
         pack_nchw_to_nchwc8(effective_output, output, ctx);
     }
 }
 
-/// Compute workspace bytes needed for layout conversion temp buffers.
+/// Workspace bytes for the layout-conversion temp buffers.
 inline size_t layout_dispatch_workspace(const TensorDesc& input,
                                          const TensorDesc& output) {
     LayoutDispatch ld(input.layout, output.layout);

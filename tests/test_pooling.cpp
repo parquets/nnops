@@ -1,12 +1,11 @@
-/// Unit tests for Pooling operator — planar (NCHW/NCDHW) and channel-last
-/// (NHWC/NDHWC).
+/// Unit tests for Pooling — planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC).
 ///
-/// Planar: the operator takes the tensor as a graph hands it over, and the
-/// result is compared with the scalar reference kernel (plus a few
-/// hand-computed windows).
+/// Planar: the operator takes the tensor in the layout the graph hands it, and
+/// the result is compared against the scalar reference kernel, plus a few
+/// hand-computed windows that pin the arithmetic on their own.
 ///
-/// Channel-last: the same values in both orders — the planar reference holds
-/// the truth, the channel-last run is converted back for the comparison.
+/// Channel-last: the planar reference holds the truth; the channel-last run is
+/// converted back to planar for the comparison.
 
 #include "nnops/ops/pooling.hpp"
 
@@ -32,11 +31,6 @@ namespace nnops::backend::cpu::reference {
                      const ComputeContext& ctx,
                      void* workspace);
 }
-
-// ============================================================
-// Planar path — the operator takes NCHW/NCDHW as it is, and the reference
-// kernel is the thing to agree with
-// ============================================================
 
 template <typename T>
 static void test_planar_vs_ref(const PoolingAttributes& attrs, TensorView in_planar)
@@ -77,7 +71,6 @@ static void test_planar_vs_ref(const PoolingAttributes& attrs, TensorView in_pla
     }
 }
 
-/// f32 random input, the common case.
 static void test_planar_f32(const std::vector<int64_t>& shape,
                             const PoolingAttributes& attrs)
 {
@@ -93,8 +86,7 @@ static void test_planar_f16(const std::vector<int64_t>& shape,
 }
 
 // ============================================================
-// 2D hand-computed windows — no reference kernel in the loop, so these pin the
-// arithmetic itself rather than agreement between two implementations
+// 2D hand-computed windows — no reference kernel, so these pin the arithmetic
 // ============================================================
 
 NNOPS_TEST(pooling_2d_max_basic) {
@@ -173,8 +165,7 @@ NNOPS_TEST(pooling_2d_average_exclude_pad) {
 }
 
 NNOPS_TEST(pooling_2d_class_api) {
-    // Two instances: create() must not hand out shared state, so both runs
-    // agree with each other and with the hand-computed window.
+    // Two instances: create() shares no state, so both must match the window.
     const int64_t shape[] = {1, 1, 4, 4};
     float in_data[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     TensorView in(shape, DataType::f32, in_data, TensorLayout::NCHW);
@@ -204,8 +195,7 @@ NNOPS_TEST(pooling_2d_class_api) {
 }
 
 // ============================================================
-// Planar shape coverage — the widths, channel counts and batch sizes the
-// channel-packed cases used to sweep
+// Planar shape coverage — widths, channel counts and batch sizes
 // ============================================================
 
 NNOPS_TEST(pooling_planar_batch_stride2_wide) {
@@ -224,8 +214,7 @@ NNOPS_TEST(pooling_planar_large_input) {
 }
 
 NNOPS_TEST(pooling_planar_many_channels) {
-    // C = 20: each plane is pooled on its own, so the plane loop is what this
-    // sweeps.
+    // C = 20: each plane is pooled on its own, so this sweeps the plane loop.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 3, 3};
@@ -239,7 +228,7 @@ NNOPS_TEST(pooling_planar_single_channel) {
     test_planar_f32({1, 1, 4, 4}, attrs);
 }
 // ============================================================
-// 3D hand-computed windows
+// 3D pooling — hand-computed windows, plus depth-only padding vs the reference
 // ============================================================
 
 NNOPS_TEST(pooling_3d_max_basic) {
@@ -302,10 +291,8 @@ NNOPS_TEST(pooling_planar_3d_padding) {
     test_planar_f32({1, 1, 4, 8, 8}, attrs);
 }
 
-
 // ============================================================
-// Planar (NCHW/NCDHW) tests — the operator on the tensor as a graph hands it
-// over, compared straight against the scalar reference
+// Planar window walk — padding, stride, exclude_pad, add_to, f16, 3D
 // ============================================================
 
 NNOPS_TEST(pooling_planar_max_padding) {
@@ -317,7 +304,8 @@ NNOPS_TEST(pooling_planar_max_padding) {
 }
 
 NNOPS_TEST(pooling_planar_max_stride2_odd_width) {
-    // Stride 2 takes the deinterleaving load; W=13 leaves a partial last block.
+    // Stride 2 with an odd width: the deinterleaving load needs a 16-column
+    // span, so this falls to the scalar gather, and OW=7 is a short last block.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 3, 3};
@@ -385,8 +373,8 @@ NNOPS_TEST(pooling_planar_3d_avg) {
 }
 
 // ============================================================
-// Global pooling — the window is the whole extent, so every spatial axis of
-// the output is 1 and the window fields are not read
+// Global pooling — the window is the whole extent, so one output pixel per
+// plane and the window fields are not read
 // ============================================================
 
 NNOPS_TEST(pooling_global_deterministic) {
@@ -429,8 +417,8 @@ NNOPS_TEST(pooling_global_deterministic) {
 }
 
 NNOPS_TEST(pooling_global_planar_shapes) {
-    // Widths picked to hit the 4x-unrolled body (W >= 32), the 8-lane body and
-    // the scalar tail; C = 5 leaves an odd plane count over the batch.
+    // Widths picked to hit the 4x-unrolled body (a plane of at least 32
+    // elements), the 8-lane body and the scalar tail; C = 5 gives five planes.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Average;
     attrs.global = true;
@@ -478,11 +466,9 @@ NNOPS_TEST(pooling_global_add_to) {
     test_planar_f32({1, 3, 8, 8}, attrs);
 }
 
-
 // ============================================================
-// Quantized pooling (s8/u8, PerTensor activation) — channel-last only: the
-// quantization axis is the channel, which a planar plane does not keep
-// together (pooling_planar_rejects_quantized pins the rejection)
+// Quantized pooling (s8/u8, PerTensor) — channel-last only: the kernel lanes the
+// channel, where a planar plane lanes output width
 // ============================================================
 
 static QuantParams make_per_tensor_q(float scale, int32_t zp) {
@@ -493,12 +479,7 @@ static QuantParams make_per_tensor_q(float scale, int32_t zp) {
     return qp;
 }
 
-
-// ============================================================
-// Layout contract — a quantized plane has no kernel, and the descriptor-level
-// validate() says so before anything is allocated
-// ============================================================
-
+// validate() rejects a quantized planar tensor at the descriptor level.
 NNOPS_TEST(pooling_planar_rejects_quantized) {
     TensorDesc in;
     in.rank   = 4;
@@ -523,9 +504,9 @@ NNOPS_TEST(pooling_planar_rejects_quantized) {
 }
 
 // ============================================================
-// Channel-last (NHWC/NDHWC) pooling — the lane is the channel, so the plane
-// is stored [N][H][W][C]. Every case keeps one copy in each order and compares
-// the channel-last result, converted back, against the planar reference.
+// Channel-last (NHWC/NDHWC) pooling — the lane is the channel, so a plane is
+// stored [N][H][W][C]. Each case keeps a copy in both orders and compares the
+// channel-last result, converted back, against the planar reference.
 // ============================================================
 
 /// Product of the spatial dims of a [N, C, (D,) H, W] shape.
@@ -620,8 +601,8 @@ NNOPS_TEST(pooling_nhwc_max_padding) {
 }
 
 NNOPS_TEST(pooling_nhwc_max_stride2_odd_width) {
-    // Odd width and a partial block (C=5) at once: the tail of every row is
-    // shorter than a vector, and the row group never fills a full W block.
+    // Odd width and a short channel block (C=5) at once: the 16-lane chunk
+    // runs with five live lanes.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 3, 3};
@@ -667,8 +648,8 @@ NNOPS_TEST(pooling_nhwc_f16) {
 }
 
 NNOPS_TEST(pooling_nhwc_global) {
-    // The whole-plane form: one pixel out per image, so a poor task split
-    // (many workers against few rows) has nothing left but the channel axis.
+    // The whole-plane form: one pixel out per image, so with few rows the
+    // split has nothing but the channel axis.
     PoolingAttributes attrs;
     attrs.type   = PoolingType::Average;
     attrs.global = true;
@@ -783,7 +764,8 @@ NNOPS_TEST(pooling_q_nhwc_max_fast_path) {
 }
 
 NNOPS_TEST(pooling_q_nhwc_max_short_block) {
-    // C=5: the last block is three lanes, so it takes the dequantize path.
+    // C=5: the block is five lanes, short of the eight-lane fast path, so it
+    // dequantizes.
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
     attrs.kernel_shape = {1, 2, 2};

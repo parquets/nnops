@@ -1,9 +1,26 @@
 #pragma once
 /// @file sse.hpp
-/// @brief SSE4.1 backend for 128-bit float32 vector operations (v_f32x4).
+/// @brief x86_64 SSE4.1/AVX2/F16C backend for the 128-bit vector types.
 ///
-/// Maps v_f32x4 to __m128 and implements all operations using SSE intrinsics.
-/// Always available on x86_64 (SSE4.1 is baseline on all modern CPUs).
+/// v_f32x4 is one __m128, v_f32x8 is two of them, and v_s8x16 / v_u8x16 are
+/// __m128i. SSE4.1 is baseline on the target.
+///
+/// The v_f16x8 path (guarded by __F16C__) converts rather than computes in
+/// fp16: arithmetic widens to fp32, runs one AVX/AVX2 instruction and narrows
+/// back (v_abs/v_neg stay bitwise). Its transcendentals come from
+/// avx2_mathfunc.hpp, which must be included at file scope — inside
+/// `namespace sse` it nests into sse::nnops::simd::arch::avx2 and the `avx2::`
+/// lookups below fail.
+///
+/// Only the narrowing conversion (v_cvt_f32_to_f16) is defined here; the
+/// widening one lives in the f16 layer, where its fp32 return is arch::avx2's
+/// single __m256, not this namespace's lo/hi v_f32x8. Two overloads would then
+/// share a parameter type, and ADL on a v_f16x8 argument reaches this
+/// namespace, so the call would be ambiguous rather than shadowed.
+///
+/// The fp16 8x8 transpose must double its interleave granularity
+/// (16 -> 32 -> 64 bit) each stage; keeping 16-bit throughout is a bit
+/// reversal, not a transpose.
 
 #if !defined(NNOPS_ARCH_X86_64)
   #error "sse.hpp requires x86_64 architecture"
@@ -15,11 +32,6 @@
 #include <algorithm>
 #include "sse_mathfunc.hpp"
 
-// The F16C fp16 path (below) widens to fp32 and uses the AVX2 transcendental
-// math functions. avx2_mathfunc.hpp opens `namespace nnops::simd::arch::avx2`,
-// so it must be included here at file scope — NOT inside the `namespace sse`
-// block below, which would nest it into sse::nnops::simd::arch::avx2 and break
-// the sibling `avx2::` lookup in the v_f16x8 transcendental ops.
 #if defined(__F16C__)
 #include "avx2_mathfunc.hpp"
 #endif
@@ -42,8 +54,8 @@ struct v_f32x4 {
         : val(_mm_setr_ps(v0, v1, v2, v3)) {}
 
     float operator[](int i) const {
-        // Spill to a stack array: a runtime lane index rules out the extract
-        // intrinsics, which require a compile-time immediate.
+        // A runtime lane index rules out the extract intrinsics (they need a
+        // compile-time immediate).
         float tmp[4];
         _mm_storeu_ps(tmp, val);
         return tmp[i];
@@ -90,7 +102,7 @@ inline v_f32x4 v_div(const v_f32x4& a, const v_f32x4& b) {
     return v_f32x4(_mm_div_ps(a.val, b.val));
 }
 inline v_f32x4 v_fmadd(const v_f32x4& a, const v_f32x4& b, const v_f32x4& c) {
-    // SSE has no FMA — use v_mul+v_add. The AVX/FMA3 path provides true FMA.
+    // SSE has no FMA; the AVX2 build supplies the fused form.
     return v_f32x4(_mm_add_ps(_mm_mul_ps(a.val, b.val), c.val));
 }
 
@@ -134,7 +146,6 @@ inline v_f32x4 v_sqrt(const v_f32x4& a) {
     return v_f32x4(_mm_sqrt_ps(a.val));
 }
 
-// RCP and RSQRT approximations
 inline v_f32x4 v_rcp(const v_f32x4& a) {
     return v_f32x4(_mm_rcp_ps(a.val));
 }
@@ -142,7 +153,6 @@ inline v_f32x4 v_rsqrt(const v_f32x4& a) {
     return v_f32x4(_mm_rsqrt_ps(a.val));
 }
 
-// Transcendental math functions (delegated to sse_mathfunc.hpp)
 inline v_f32x4 v_exp(const v_f32x4& a) {
     return v_f32x4(exp_ps(a.val));
 }
@@ -168,7 +178,6 @@ inline float v_reduce_sum(const v_f32x4& a) {
     return _mm_cvtss_f32(t);
 }
 
-// Horizontal max/min — same pairwise shuffle reduction as v_reduce_sum
 inline float v_reduce_max(const v_f32x4& a) {
     __m128 t = _mm_max_ps(a.val, _mm_movehl_ps(a.val, a.val));
     t = _mm_max_ps(t, _mm_shuffle_ps(t, t, 1));
@@ -238,7 +247,6 @@ inline v_f32x8 v_sqrt(const v_f32x8& a) {
     return v_f32x8(_mm_sqrt_ps(a.lo), _mm_sqrt_ps(a.hi));
 }
 
-// Compare operations for v_f32x8 (emulated)
 inline v_f32x8 v_cmplt(const v_f32x8& a, const v_f32x8& b) {
     return v_f32x8(_mm_cmplt_ps(a.lo, b.lo), _mm_cmplt_ps(a.hi, b.hi));
 }
@@ -246,7 +254,6 @@ inline v_f32x8 v_cmpgt(const v_f32x8& a, const v_f32x8& b) {
     return v_f32x8(_mm_cmpgt_ps(a.lo, b.lo), _mm_cmpgt_ps(a.hi, b.hi));
 }
 
-// Bitwise operations for v_f32x8 (emulated)
 inline v_f32x8 v_and(const v_f32x8& a, const v_f32x8& b) {
     return v_f32x8(_mm_and_ps(a.lo, b.lo), _mm_and_ps(a.hi, b.hi));
 }
@@ -254,7 +261,6 @@ inline v_f32x8 v_or(const v_f32x8& a, const v_f32x8& b) {
     return v_f32x8(_mm_or_ps(a.lo, b.lo), _mm_or_ps(a.hi, b.hi));
 }
 
-// Transcendental math functions for v_f32x8 (lane-wise via v_f32x4)
 inline v_f32x8 v_exp(const v_f32x8& a) {
     return v_f32x8(exp_ps(a.lo), exp_ps(a.hi));
 }
@@ -288,11 +294,8 @@ inline float v_reduce_min(const v_f32x8& a) {
 }
 
 // ============================================================
-// v_f16x8 — 128-bit fp16 vector, backed by __m128i
-//
-// Uses F16C intrinsics (_mm256_cvtph_ps / _mm256_cvtps_ph) for
-// convert→compute→convert: widen fp16→fp32, compute with AVX/AVX2,
-// narrow fp32→fp16. Assumes target CPU supports F16C, AVX2, FMA3.
+// v_f16x8 — 128-bit fp16 vector, backed by __m128i (F16C: assumes a CPU with
+// _mm256_cvtph_ps / _mm256_cvtps_ph, AVX2 and FMA3)
 // ============================================================
 #if defined(__F16C__)
 
@@ -323,21 +326,11 @@ inline __m256 to_m256(const v_f32x8& a) {
         _mm256_castps128_ps256(a.lo), a.hi, 1);
 }
 
-// Conversion: v_f32x8 → v_f16x8
-//
-// Only the narrowing direction is defined here. The widening one lives in the
-// f16 layer (vec_f16x8.hpp) instead, because the f32 type it must return is not
-// this namespace's v_f32x8 on an AVX build — it is arch::avx2's single __m256,
-// not the lo/hi __m128 pair below. A definition here would have the same
-// parameter type as that one, and ADL on a v_f16x8 argument reaches this
-// namespace, so the two could not coexist: the call would be ambiguous rather
-// than shadowed. Keep the widen out of arch::sse.
 inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     __m256 f32 = to_m256(a);
     return v_f16x8(_mm256_cvtps_ph(f32, 0));
 }
 
-// Helper: convert both args, apply __m256 op, convert back
 #define NNOPS_F16X8_BINOP(name, op) \
 inline v_f16x8 name(const v_f16x8& a, const v_f16x8& b) { \
     __m256 fa = _mm256_cvtph_ps(a.val); \
@@ -354,7 +347,6 @@ NNOPS_F16X8_BINOP(v_max, _mm256_max_ps)
 
 #undef NNOPS_F16X8_BINOP
 
-// v_fmadd: a*b + c (fused multiply-add via FMA3)
 inline v_f16x8 v_fmadd(const v_f16x8& a, const v_f16x8& b, const v_f16x8& c) {
     __m256 fa = _mm256_cvtph_ps(a.val);
     __m256 fb = _mm256_cvtph_ps(b.val);
@@ -362,19 +354,15 @@ inline v_f16x8 v_fmadd(const v_f16x8& a, const v_f16x8& b, const v_f16x8& c) {
     return v_f16x8(_mm256_cvtps_ph(_mm256_fmadd_ps(fa, fb, fc), 0));
 }
 
-// Sign operations (bitwise on fp16 bits)
 inline v_f16x8 v_abs(const v_f16x8& a) {
-    // Clear sign bit: ~0x8000 & val
     return v_f16x8(_mm_andnot_si128(_mm_set1_epi16(0x8000), a.val));
 }
 inline v_f16x8 v_neg(const v_f16x8& a) {
-    // Flip sign bit
     return v_f16x8(_mm_xor_si128(a.val, _mm_set1_epi16(0x8000)));
 }
 
-// Comparisons — returns 0xFFFF per lane (true) or 0x0000 (false)
-// Strategy: convert to fp32, compare → 0xFFFFFFFF/0x00000000 mask,
-// shift right by 16, then pack 32-bit lanes to 16-bit.
+// Returns 0xFFFF per lane (true) or 0x0000: compare in fp32, shift the all-ones
+// 32-bit mask right by 16, then pack the lanes.
 inline v_f16x8 v_cmplt(const v_f16x8& a, const v_f16x8& b) {
     __m256 fa = _mm256_cvtph_ps(a.val);
     __m256 fb = _mm256_cvtph_ps(b.val);
@@ -397,7 +385,6 @@ inline v_f16x8 v_rcp(const v_f16x8& a) {
     return v_f16x8(_mm256_cvtps_ph(_mm256_rcp_ps(f32), 0));
 }
 
-// Transcendental math — widen to fp32, use AVX2 math functions, narrow back
 inline v_f16x8 v_exp(const v_f16x8& a) {
     __m256 f32 = _mm256_cvtph_ps(a.val);
     return v_f16x8(_mm256_cvtps_ph(avx2::exp256_ps(f32), 0));
@@ -423,7 +410,6 @@ inline v_f16x8 v_tanh(const v_f16x8& a) {
     return v_f16x8(_mm256_cvtps_ph(avx2::tanh256_ps(f32), 0));
 }
 
-// Horizontal reductions — widen to fp32, then pairwise reduce
 inline float v_reduce_sum(const v_f16x8& a) {
     __m256 f32 = _mm256_cvtph_ps(a.val);
     __m128 lo = _mm256_castps256_ps128(f32);
@@ -507,15 +493,11 @@ inline v_u8x16 v_set1_u8x16(uint8_t s)  { return v_u8x16(_mm_set1_epi8(static_ca
 inline v_u8x16 v_zero_u8x16()         { return v_u8x16(_mm_setzero_si128()); }
 
 // ============================================================
-// Deinterleave (stride-2 gather) — pair types
+// Deinterleave (stride-2 gather) — load 2N elements, return {even, odd}
 // ============================================================
 
 struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
 struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
-
-// ============================================================
-// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
-// ============================================================
 
 /// @brief Load 8 contiguous f32s, return {a0,a2,a4,a6}, {a1,a3,a5,a7}.
 inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
@@ -535,10 +517,6 @@ inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
             v_f32x8(lo.odd.val,  hi.odd.val)};
 }
 
-// ============================================================
-// 方案 B: v_load_even_* / v_load_odd_*
-// ============================================================
-
 inline v_f32x4 v_load_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
 }
@@ -551,10 +529,6 @@ inline v_f32x8 v_load_even_f32x8(const float* src) {
 inline v_f32x8 v_load_odd_f32x8(const float* src) {
     return v_deinterleave_f32x8(src).odd;
 }
-
-// ============================================================
-// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_*
-// ============================================================
 
 inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
@@ -578,16 +552,13 @@ inline v_f32x8 v_load_stride2_odd_f32x8(const float* src) {
 struct v_f16x8x2_t { v_f16x8 even; v_f16x8 odd; };
 
 /// @brief Load 16 contiguous f16s, return {h0,h2,...,h14}, {h1,h3,...,h15}.
-///
-/// Strategy: convert to f32, deinterleave with UNPCK cascade, convert back.
+/// Widens to f32, deinterleaves with the UNPCK cascade, narrows back.
 inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
-    // Load 2×8 f16 → convert to 2×8 f32
     __m256 flo = _mm256_cvtph_ps(
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(src)));
     __m256 fhi = _mm256_cvtph_ps(
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 8)));
 
-    // Deinterleave each 128-bit half of flo/fhi via UNPCK cascade
     __m128 flo_lo = _mm256_castps256_ps128(flo);       // f0,f1,f2,f3
     __m128 flo_hi = _mm256_extractf128_ps(flo, 1);      // f4,f5,f6,f7
     __m128 fhi_lo = _mm256_castps256_ps128(fhi);        // f8,f9,f10,f11
@@ -621,7 +592,6 @@ inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
             v_f16x8(_mm256_cvtps_ph(odd_f,  0))};
 }
 
-// 方案 B — f16
 inline v_f16x8 v_load_even_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).even;
 }
@@ -629,7 +599,6 @@ inline v_f16x8 v_load_odd_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).odd;
 }
 
-// 方案 C — f16
 inline v_f16x8 v_load_stride2_even_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).even;
 }
@@ -673,11 +642,6 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
 
 #if defined(__F16C__)
 /// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
-///
-/// Three interleave stages, each widening the granularity: 16-bit pairs,
-/// then 32-bit quads, then 64-bit octets. Using epi16 in every stage (the
-/// naive NEON-zip mirror) would yield a bit-reversal permutation instead of
-/// a transpose; the granularity must double each round.
 inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
                              v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
     // Stage 1: transpose 2×2 blocks (16-bit interleave of low/high halves)

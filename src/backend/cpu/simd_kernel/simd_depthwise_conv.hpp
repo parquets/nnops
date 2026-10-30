@@ -2,13 +2,59 @@
 /// @file simd_depthwise_conv.hpp
 /// @brief SIMD kernels for 2D/3D depthwise convolution, planar and channel-last.
 ///
-/// Channel-last (NHWC/NDHWC) input reads the raw HWCM filter [KH][KW][C] and
-/// puts the SIMD lane on the channel; planar (NCHW/NCDHW) input reads the raw
-/// [C, 1, (KD,) KH, KW] filter and vectorizes along output width instead.
-/// Rank is
-/// auto-detected: 2D is KD=OD=ID=1, which degenerates the depth loop.
-/// One driver covers h4/h1 and f32/f16/quant; padding is bounds-checked
-/// in-kernel.
+/// Two drivers, split by the axis the lane takes.
+///
+/// Channel-last (NHWC/NDHWC) reads the raw HWCM filter [KD][KH][KW][C] — TF's
+/// depthwise order with the multiplier dropped — and puts the lane on the channel.
+/// The pixel stride and the tap stride are both the channel count, set by the
+/// driver; no prepack is involved, because the layout already is the access
+/// pattern. A call covers NV adjacent channel vectors, 2 where the channels allow,
+/// since a 64-byte line holds two f32 vectors and a one-vector call leaves the
+/// other half of every line to a later pass — 2x the line traffic for the same
+/// arithmetic.
+///
+/// Planar (NCHW/NCDHW) reads the raw [C, 1, (KD,) KH, KW] filter — one scalar per
+/// tap, broadcast into the accumulate — and puts the lane on the output width.
+///
+/// Both run R = 4 output rows per call, R = 1 for a tail. Planar needs it for ILP
+/// alone: one row's taps are a chain of KD*KH*KW dependent FMAs with nothing to
+/// interleave, and four rows are four independent chains. A KD of 1 — the 2D
+/// case — degenerates the depth loop, and padding is bounds-checked in-kernel.
+///
+/// Everything that depends only on the tap is hoisted out of the tap loops: a row
+/// pointer per (kd, kh, r), left-pad-biased on the channel-last path, and an
+/// interior span of output positions whose every tap is inside the row, where the
+/// tap loop takes no bounds test and no null test — one branch per position instead
+/// of one per tap.
+/// The null test (does this input row exist) can only be skipped when every row of
+/// the group does, so a group whose window reaches past the plane keeps the
+/// checked path.
+///
+/// Three shapes were measured against this and lost: peeling the padded rows out
+/// of the groups costs a quarter of the ILP per row and ran 14-22% slower; two
+/// output positions per iteration share the weight vectors but need eight live
+/// accumulators and reached 24 GFLOPS against 35; a channel-last column sweep ran
+/// 1.4-1.9x slower at every shape, 1.4x even at C = 8 where only the kernel
+/// differs.
+///
+/// The planar row table is gated on a row spanning at least two width vectors —
+/// at one it costs more to fill than the arithmetic it saves (1T GFLOPS, 3x3: two
+/// vectors 14.0 vs 14.3, four 18.5 vs 13.1, a 112-wide plane 28.3 vs 13.8). Its
+/// edge vectors take a lane mask instead, folded into the tap's broadcast weight;
+/// those lanes are real tensor neighbours, not zeros, so a non-finite value there
+/// would reach the FMA as 0 * NaN, and the driver nulls the mask for the tensor's
+/// first and last channel block.
+///
+/// The channel-last 3x3 kernels hold the nine taps in registers —
+/// `dwconv_last3x3` for one channel vector, `dwconv_last3x3_16` for two, which
+/// cannot hoist eighteen tap vectors and reloads one per column to feed four rows
+/// and both halves. Sixteen channels is what the driver asks for: a pixel's 16
+/// f32 is one 64-byte line, so a sweep touches every line once, where an
+/// 8-channel block pays two sweeps for the same bytes.
+///
+/// Quantized channel-last dequantizes this block's taps once per call into a dense
+/// staging block (9 vectors for a 3x3 against the group's thousands of FMAs), then
+/// runs `dwconv_rows` on the f32 weights; a pad lane gets scale 0.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
@@ -33,62 +79,24 @@ struct DwConvParams {
     int64_t ow_end = -1;          // one past the last; negative means OW
     int64_t in_d_stride;          // input depth stride (elems)
     int64_t in_row_stride;        // input row stride (elems)
-    int64_t pix_stride = 8;       // elems between adjacent pixels: the channel
-                                  // count on a channel-last plane, set by the
-                                  // driver
-    int64_t w_tap_stride = 8;     // elems between adjacent filter taps: the
-                                  // channel count for a raw [KH][KW][C] filter
-                                  // (and 8 for the dequantized staging block
-                                  // built from one — see dwconv_last_quant)
+    int64_t pix_stride = 8;       // elems between pixels (= C, set by the driver)
+    int64_t w_tap_stride = 8;     // elems between taps (= C of a raw HWCM filter,
+                                  // 8 in the dequantized staging block)
 };
 
-/// R output rows per call. W is the weight element type; Tag only picks the
-/// epilogue's f32/f16 overload. Both are deduced by the wrappers below.
-///
-/// The width loop is the innermost one, so everything that depends only on the
-/// tap — the input row it reads, the output position it lands on — is hoisted
-/// out of it, the way the planar sibling hoists its row table and the MLAS
-/// NCHWc kernel peels its padding:
-///
-///   * one row pointer per (kd, kh, r), built once per call and already biased
-///     by the left pad, so a tap's address is `row + ow*SW + kw*DW` with no
-///     index arithmetic and no 64-bit product left in the loop;
-///   * an interior span of output positions whose every tap is inside the
-///     input row, where the tap loop takes no bounds test and no null test at
-///     all — one branch per position instead of one per tap.
-///
-/// The null test is what the border costs: it can only be skipped when every
-/// row of the group exists, so the first and last row group of a plane (and the
-/// short group at its bottom) keep the checked path.
-///
-/// Two things were measured against this shape and lost. Peeling the padded
-/// rows out of the groups (a one-row schedule above and below the interior
-/// span) costs a quarter of the ILP per row and made every stage 14-22%
-/// slower. Running two output positions per iteration shares the weight
-/// vectors but needs eight live accumulators, and either the register file or
-/// this compiler's allocation gives it back — 24 GFLOPS against 35.
+/// R output rows per call; W is the weight type and Tag picks the epilogue overload.
 template <int R, int NV, typename W, typename Tag, typename Src, typename Dst, typename V>
 inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                         const Epilogue& epilogue, const Src (&srcs)[NV],
                         const Dst (&dsts)[NV], const V (&vbias)[NV])
 {
     using InPtr = const typename Src::elem*;
-    // The pixel and the filter tap are both "the channel count" apart on a
-    // channel-last plane, so the two strides in @c DwConvParams are what the
-    // driver sets and the kernel never derives.
-    //
-    // NV is how many adjacent channel vectors of one pixel a call covers. A
-    // channel-last plane wants 2 where the channels allow it, because a 64-byte
-    // cache line holds two vectors and a single-vector call leaves the other
-    // half of every line to a later pass — 2x the line traffic for the same
-    // arithmetic. Because
-    // the row table is built from vector 0 and the access policies load the
-    // address they are handed, vector k's channels are added here.
     const int64_t pix = p.pix_stride;
     const int64_t wtap = p.w_tap_stride;
     constexpr int64_t kVec = kChannelLanes;
     constexpr int64_t kMaxTapRows = 256;  // (kd, kh, r): 8x8 with R = 4 fits
 
+    // The row table is built from vector 0's base, so vector k adds k*kVec to it.
     const int64_t nrow = p.KD * p.KH;
     InPtr row_base[kMaxTapRows];
     const bool have_tab = (nrow * R <= kMaxTapRows);
@@ -111,15 +119,13 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
         }
     }
 
-    // The output positions whose whole kernel footprint is inside the input
-    // row: the smallest tap offset is ow*SW - PW, the largest ow*SW +
-    // (KW-1)*DW - PW, so the span is [ceil(PW/SW), floor((IW-1+PW-(KW-1)*DW)/SW)].
+    // Interior columns: every tap offset ow*SW + kw*DW - PW lands in [0, IW).
     const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
     const int64_t last_hi = p.IW - 1 + p.PW - (p.KW - 1) * p.DW;
     const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
 
-    // Tap offsets are measured from the padded row start, so the valid range is
-    // [PW, IW + PW) — the row pointers already absorbed the bias.
+    // Row pointers have already absorbed -PW*pix, so a valid tap offset is
+    // [PW, IW + PW).
     const int64_t off_ok_lo = p.PW;
     const int64_t off_ok_hi = p.IW + p.PW;
 
@@ -201,36 +207,8 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 // ============================================================
 // Planar (NCHW/NCDHW) driver — the SIMD lane spans output width
 // ============================================================
-//
-// The weight is the raw per-channel filter [C, 1, (KD,) KH, KW]: one scalar
-// per tap, broadcast into the accumulate, instead of the packed 8-lane form.
-// Padding is zero-filled per lane (planar_load), and a row's last block stores
-// through a scalar tail.
-//
-// R output rows per call, for the same reason the packed kernel takes four: a
-// ready-made row-modulo-R loop with ONE accumulator is a chain of KD·KH·KW
-// dependent FMAs — 9 of them for a 3x3, four cycles each — and the taps have
-// nothing to interleave. Four rows give four independent chains, so the FMA
-// latency hides behind itself. The rows do not share loads (each reads its own
-// input row), so unlike the packed kernel this buys no bandwidth — only ILP.
 
-/// Lane masks for the plane's two edge width vectors. A vector at the first or
-/// last output position reads past the row — the left pad or the right tail —
-/// and the general path pays for that with planar_load's per-lane scalar loop.
-/// Zeroing the invalid lanes turns the same vector load into a valid one, and
-/// because the mask is the same for every output row it folds into the tap's
-/// broadcast weight: the R-row loop is then the interior loop, a load and an
-/// FMA, rather than eight scalar iterations per tap.
-///
-/// Only the edge vectors can use it. A middle vector that is not interior (a
-/// kernel wide enough to span a whole vector) still takes the scalar path,
-/// which is what `e == -1` in the kernel means. Built once per operator call;
-/// `needed[e*KW+kw] == 0` says the mask is all ones, and the multiply is
-/// skipped. The masked load reads up to PW before the row start and up to
-/// L-1+(KW-1)*DW past its end, which is inside the tensor for every row but the
-/// first and last — the driver clears `masks` for those two row blocks. Those
-/// lanes are real tensor neighbours, not zeros, so a non-finite value there
-/// would reach the FMA (0 × NaN); the reference path never reads them.
+/// Lane masks for the plane's two edge width vectors.
 struct DwPlanarEdges {
     const void* masks = nullptr;      ///< [2][KW][L] elements of T
     const uint8_t* needed = nullptr;  ///< [2][KW]
@@ -238,12 +216,8 @@ struct DwPlanarEdges {
     int64_t last_ow = 0;              ///< ow of the final width vector
 };
 
-/// Fill `masks` ([2*MaxKw*L] elements of T) and `needed` ([2*MaxKw]) from `p` and
-/// return the descriptor. The buffers stay the caller's; the result carries no
-/// pointer of its own lifetime, so the caller may copy it per task and null
-/// `masks` out. Returns a descriptor with `masks == nullptr` for the shapes the
-/// masks do not serve — a stride the even-load cannot express, or a kernel past
-/// the caller's cap — which is the same thing as asking for the general path.
+/// Fill `masks` ([2*MaxKw*L] elements of T) and `needed` ([2*MaxKw]) from `p`.
+/// `masks == nullptr` is the general path; the buffers stay the caller's.
 template <int64_t MaxKw, typename T>
 inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, uint8_t* needed)
 {
@@ -254,8 +228,8 @@ inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, u
     }
 
     const int64_t last_ow = ((p.OW + L - 1) / L - 1) * L;
-    // One vector is both edges; `e` in the kernel resolves to 0 for it and the
-    // two masks below come out identical, so nothing special is needed.
+    // One vector is both edges; e resolves to 0 for it and the two masks below
+    // come out identical.
     const int64_t ow_edge[2] = {0, last_ow};
     for (int64_t e = 0; e < 2; ++e) {
         for (int64_t kw = 0; kw < p.KW; ++kw) {
@@ -267,7 +241,6 @@ inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, u
                 mk[l] = ok ? static_cast<T>(1) : static_cast<T>(0);
                 all = all && ok;
             }
-            // All lanes valid: the multiply would be by ones.
             needed[e * p.KW + kw] = all ? 0 : 1;
         }
     }
@@ -279,10 +252,7 @@ inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, u
     return edges;
 }
 
-/// Copy `n` elements, 1 <= n < L. The count is a runtime value but has only
-/// L-1 possibilities, all known to the caller, so the switch collapses each one
-/// to a single block move — the per-lane loop it replaces was a load and a
-/// store per element.
+/// Copy `n` elements, 1 <= n < L, as one switch-selected block move.
 template <typename T>
 inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
 {
@@ -299,14 +269,9 @@ inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
     }
 }
 
-/// R output rows per call, one width-vector accumulate per row. T is the
-/// element type; the accumulate and the epilogue ride it.
-///
-/// SW is the width stride when the caller knows it (1 or 2), 0 when it does
-/// not. It is a template argument because everything it decides — which load
-/// form the taps take, how wide a vector is in the input, hence where the
-/// interior begins — would otherwise be a branch inside the tap loop, and the
-/// tap loop is a load and an FMA.
+/// R output rows per call, one width-vector accumulate per row. @p SW is the width
+/// stride when the caller knows it (1 or 2) and 0 when it does not, so the choice
+/// stays out of the tap loop.
 template <int R, int SW, typename T>
 inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
                                const DwConvParams& p, const Epilogue& epilogue,
@@ -328,17 +293,13 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
     };
 
     // Every input row this call touches, one entry per (kd, kh, r), null where
-    // the row does not exist. The width loop is the inner one, so the four
-    // int64 multiplies that build these addresses used to be paid once per
-    // output vector — more scalar work than the nine taps above them. A table
-    // read replaces them. Kernels past the cap keep the arithmetic inline.
+    // the row does not exist; a table read replaces address arithmetic that
+    // would otherwise be paid per output vector.
     constexpr int64_t kMaxTapRows = 256;   // (kd, kh, r): 8x8 with R=4 fits
     const T* row_tab[kMaxTapRows];
-    // It is worth building only when a row spans more than one width vector:
-    // at one vector the table costs more to fill than the arithmetic it saves.
-    // Measured either side of the gate (1T GFLOPS, 3x3): a two-vector row is a
-    // wash (14.0 vs 14.3), four vectors pay 18.5 vs 13.1, and a 112-wide plane
-    // 28.3 vs 13.8.
+    // Worth building only when a row spans more than one width vector
+    // (measured 1T GFLOPS, 3x3: two vectors 14.0 vs 14.3, four 18.5 vs 13.1,
+    // a 112-wide plane 28.3 vs 13.8).
     const int64_t nvec = (p.OW + L - 1) / L;
     const bool have_tab = (p.KD * p.KH * R <= kMaxTapRows) && (nvec >= 2);
     bool all_rows = have_tab;
@@ -360,10 +321,8 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
         }
     }
 
-    // Horizontal interior span, also per call: the vector at ow is interior
-    // when everything it touches is inside the row. v_load_even deinterleaves
-    // 2L elements to produce L outputs, so a stride-2 vector reads twice the
-    // width a stride-1 one does — the same guard planar_load uses.
+    // A stride-2 vector reads 2L inputs to produce L outputs, so the interior
+    // guard widens with it — the same bound planar_load uses.
     const int64_t span  = (sw == 2) ? 2 * L : L;
     const int64_t need  = (p.KW - 1) * p.DW + span;    // past the first column
     const int64_t ow_lo = (p.PW + sw - 1) / sw;        // first ow with iw >= 0
@@ -374,15 +333,10 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
         decltype(v_set1(out, bias)) acc[R];
         for (int r = 0; r < R; ++r) { acc[r] = v_bias; }
 
-        // Does this whole width vector — every lane, every row, every tap —
-        // land inside the input? Then the taps need no bounds test and no
-        // scalar fill: one branch per vector instead of one per tap. That is
-        // the interior nn_compute reaches by peeling the padded border off at
-        // the driver; here the same test is cheap enough to do per vector.
+        // Every lane of every tap inside the row: no bounds test, no scalar fill.
         const bool interior = all_rows && ow >= ow_lo && ow <= ow_hi;
 
-        // Which edge vector this is: 0 first, 1 last, -1 neither. Only those
-        // two carry a mask; a single-vector plane has one mask for both.
+        // Which edge vector this is: 0 first, 1 last, -1 neither.
         const int64_t e = (ow == 0) ? 0 : ((ow == edges.last_ow) ? 1 : -1);
 
         for (int64_t kd = 0; kd < p.KD; ++kd) {
@@ -414,17 +368,14 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
                     continue;
                 }
 
-                // Edge vector with a precomputed mask. This is what keeps a
-                // narrow plane — where EVERY width vector is an edge — out of
-                // the per-lane scalar fallback below.
+                // The precomputed mask is what keeps a narrow plane — where
+                // every vector is an edge — out of the scalar fallback below.
                 if (edges.masks != nullptr && e >= 0) {
                     for (int64_t kw = 0; kw < p.KW; ++kw) {
                         const int64_t iw0 = ow * sw + kw * p.DW - p.PW;
-                        // The mask zeroes exactly the lanes this tap would read
-                        // from outside the row, and it is the same for every
-                        // row — so it folds into the broadcast weight, once per
-                        // tap, and the R-row loop stays the interior one:
-                        // a load and an FMA, no extra multiply.
+                        // The mask zeroes exactly the lanes this tap reads from
+                        // outside the row and is the same for every row, so it
+                        // folds into the broadcast weight once per tap.
                         auto vk = v_set1(out, s_load(&w_row[kw]));
                         if (edges.needed[e * edges.kw + kw]) {
                             vk = v_mul(vk, v_load(static_cast<const T*>(edges.masks) +
@@ -458,10 +409,9 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
             if (lanes == L) {
                 v_store_add(dst, v, add_to);
             } else {
-                // The last vector of a row is short by a fixed amount, so the
-                // store is a block copy of that many elements, not a per-lane
-                // loop: on a 7-wide plane this is the whole row's store, and
-                // the loop was costing more than the nine taps above it.
+                // The short last vector is a block copy of `lanes` elements, not
+                // a per-lane loop: on a 7-wide plane it is the whole row's
+                // store, and the loop cost more than the nine taps above it.
                 alignas(32) T tmp[L];
                 if (add_to) {
                     alignas(32) T cur[L] = {};
@@ -477,7 +427,7 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
 }
 
 // ============================================================
-// Public kernels — unchanged signatures
+// Public kernels
 // ============================================================
 
 template <typename T>
@@ -509,79 +459,27 @@ inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
 // Channel-last (NHWC/NDHWC) entry points
 // ============================================================
 //
-// These are the channel-lane driver (dwconv_rows) with two runtime strides: a
-// pixel is C elements away, because a pixel holds all of the plane's channels,
-// and a filter tap is C elements away too, because the weight is the raw HWCM
-// filter [tap][C] — TensorFlow's depthwise order with the multiplier dropped.
-// No prepack step is involved: the layout already is the access pattern.
-//
-// The driver also keeps the channel-lane route's shape — four output rows per
-// call for the ILP, one channel block per call — and that is not incidental. A
-// first cut gave the channel-last route its own kernel with NC pixels in flight
-// down the contiguous axis, one output row per task, one task per (row, block).
-// It measured 1.4-1.9x slower than the channel-block kernel on every shape, and
-// at C = 8 — where a pixel is exactly one vector, so only the kernel differs —
-// it was still 1.4x slower: the column sweep needs eight live accumulators to
-// cover the same four pixels the row sweep gets from four, and the per-block
-// call rebuilt the row table and re-walked the row for each of the C/8 blocks.
+// out_rows and in_img are the bases advanced by the channel block, w_tap0 the
+// block's first channel of the tap-major weight, and lanes how many channels the
+// call covers — up to 16, a whole 64-byte line of f32. A 3x3 takes
+// dwconv_last3x3 at one vector and dwconv_last3x3_16 at two.
 
-/// @p out_rows is the output row base advanced by the channel block, @p in_img
-/// the image base advanced by the same, @p w_tap0 the block's first channel of
-/// the tap-major weight, and @p lanes how many channels the call covers — up to
-/// 16, which is a whole 64-byte line of f32.
-///
-/// Sixteen channels run as two vectors. One vector per call is what the packed
-/// route does, and it is free there because a block's plane is dense; on a
-/// channel-last plane the second half of every line belongs to the next block,
-/// so a one-vector call leaves it for a later pass — two touches per line where
-/// the packed route has one.
-///
-/// **A 3x3 takes a specialised kernel at both widths** (2026-10-30):
-/// `dwconv_last3x3` below for one vector of channels and `dwconv_last3x3_16`
-/// for two. Both hoist the row table and drop the per-tap pointer arithmetic.
-/// The sixteen-channel one is what the driver asks for: an eight-channel block
-/// touches every 64-byte line twice, and a strided half-line sweep of a plane
-/// costs exactly what a full sweep of it costs (measured — a half-used-line read
-/// runs at the plane's full time), so the narrow route pays twice the memory for
-/// the same FMAs and no kernel-level win buys that back.
-
-/// True when the shape takes the register-hoisted 3x3 kernels below: one depth
-/// plane, a 3x3 filter, no dilation. The vertical stride is not a condition — a
-/// 2x2 stride reads `R·SH + KH - 1` distinct input rows instead of `R + 2` and
-/// is still one row table — but a vertical stride of 3 or more is not common
-/// enough to instantiate.
+/// One depth plane, 3x3, no dilation, vertical stride 1 or 2 — a larger one would
+/// still fit one row table but is not common enough to instantiate.
 inline bool dwconv_last3x3_ok(const DwConvParams& p)
 {
     return p.KD == 1 && p.KH == 3 && p.KW == 3 && p.DH == 1 && p.DW == 1 &&
            (p.SH == 1 || p.SH == 2);
 }
 
-/// One 8-channel vector of a 3x3 depthwise filter, R output rows per call, with
-/// the nine tap vectors held in registers for the whole width sweep.
+/// One channel vector of a 3x3 filter, R output rows per call, with the nine tap
+/// vectors held in registers for the whole width sweep — the generic kernel
+/// reloads them every column, and the tap plus accumulator count is 13 of the 16
+/// ymm registers, which is why the two-vector variant cannot do the same.
 ///
-/// This is what the generic kernel above cannot do. It walks the taps inside
-/// the column loop, so every column reloads all nine weight vectors, and
-/// re-derives the row pointer for each (kh, r) — nine weight loads and
-/// twelve pointer fetches per column on top of the thirty-six input loads. The
-/// taps are loop-invariant in `ow` and belong in registers; the reason they are
-/// not is the register file: nine taps plus four accumulators is thirteen of
-/// the sixteen ymm registers, and the sixteen-channel call wants eight
-/// accumulators, which would be twenty-six — `dwconv_last3x3_16` below is how
-/// that constraint is met, by reloading a tap per column and letting one load
-/// feed four rows and both halves.
-///
-/// So the width-one trade is channels for taps: one vector per call, taps
-/// hoisted. It costs a second walk over every cache line's other half, which is
-/// why the driver never asks for it on a 3x3 — the sixteen-channel kernel below
-/// is that route's answer, and this one is what a plane narrower than sixteen
-/// channels falls back to.
-///
-/// @p SH is the vertical stride, needed because it decides how many distinct
-/// input rows the group reads: output row r with filter row kh is input row
-/// `oh·SH + r·SH + kh - PH`, so the table is `R·SH + 2` entries and a tap's row
-/// is `row[r·SH + kh]` — compile-time indices, no arithmetic in the loop. The
-/// horizontal stride stays a runtime value: it costs one scalar product per
-/// column, which the loop below has slack for.
+/// @p SH decides the table: output row r with filter row kh is input row
+/// `oh*SH + r*SH + kh - PH`, so there are R*SH + 2 entries and a tap's row is
+/// `row[r*SH + kh]` — compile-time indices. The horizontal stride stays runtime.
 template <int R, int SH, typename T>
 inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
                            const T* bias_vec, const DwConvParams& p,
@@ -597,7 +495,7 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
     for (int t = 0; t < 9; ++t) { wt[t] = v_load(w_tap0 + t * wtap); }
 
     // One row pointer per distinct input row of the group, biased by the left
-    // pad so a tap's address is `row + (ow·SW + kw)·pix`.
+    // pad so a tap's address is `row + (ow*SW + kw)*pix`.
     constexpr int64_t kRows = R * SH + 2;
     const T* row[kRows];
     bool all_rows = true;
@@ -655,16 +553,11 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
     }
 }
 
-/// The two-vector 3x3: sixteen channels, the same nine taps and the same row
-/// table, eight accumulators for a four-row group, and the weight vectors loaded
-/// per tap inside the column loop — there is no room to hoist them (eight
-/// accumulators plus eighteen tap vectors is twenty-six of sixteen registers),
-/// but one weight load then feeds four rows and both halves, so a tap costs ten
-/// loads for eight FMAs and the loop stays off the two-load-per-cycle floor.
-///
-/// This is the chunk width the memory system wants: a pixel's sixteen f32 are
-/// one 64-byte line, so one sweep of the block loop touches every line once.
-/// The eight-channel kernel above pays two sweeps for the same bytes.
+/// The two-vector 3x3: sixteen channels, the same row table and eight
+/// accumulators, with the tap vectors loaded per column inside the width loop —
+/// eighteen of them plus eight accumulators is twenty-six registers — but one
+/// weight load then feeds four rows and both halves, so a tap is ten loads for
+/// eight FMAs.
 template <int R, int SH, typename T>
 inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
                               const T* bias_vec, const DwConvParams& p,
@@ -812,13 +705,10 @@ inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
     }
 }
 
-/// Quantized channel-last. The HWCM filter is s8/u8, so this block's taps are
-/// dequantized once per call into a staging block — nine vectors for a 3x3
-/// against the row group's thousands of FMAs — and the kernel is then the f32
-/// one above. Pad lanes are neutralized with scale 0, the convention the packed
-/// route used: the byte they read is the neighbouring channel, and 0 * it is 0.
 constexpr int64_t kMaxLastQuantTaps = 9 * 9 * 9;  // 729
 
+/// Dequantize this block's taps once per call into a staging block, then run the
+/// f32 kernel. Pad lanes get scale 0.
 template <int R, typename InT, typename OutT>
 inline void dwconv_last_quant(OutT* out_rows, const InT* in_img, const InT* w_tap0,
                               const float* w_scale, const int32_t* w_zero,
@@ -848,7 +738,7 @@ inline void dwconv_last_quant(OutT* out_rows, const InT* in_img, const InT* w_ta
     }
 
     // The staging block is dense 8-lane taps, so the tap stride is the vector
-    // width even though the plane's pixel stride is the channel count.
+    // width even though the pixel stride is the channel count.
     DwConvParams pq = p;
     pq.w_tap_stride = kChannelLanes;
 

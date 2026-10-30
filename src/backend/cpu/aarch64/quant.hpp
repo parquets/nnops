@@ -2,24 +2,21 @@
 /// @file quant.hpp
 /// @brief AArch64 NEON int8 / uint8 quantization and dequantization kernels.
 ///
-/// Raw-intrinsic per-token (per-row) quantization for GEMM input preparation,
-/// the NEON counterpart to `x86_64/quant.hpp`. Each row carries its own `scale`
-/// and optional `zero_point`; `zero == nullptr` means all-zero.
+/// Per-token (per-row) quantization for GEMM input preparation, the NEON
+/// counterpart to `x86_64/quant.hpp`. Each row carries its own `scale` and an
+/// optional `zero_point`; `zero == nullptr` means all-zero.
 ///
-///   - quantization:   f32 → s8/u8,  `dst = clamp(round(src * (1/scale) + zero), min, max)`
-///   - dequantization: s8/u8 → f32,  `dst = (src - zero) * scale`
+///   - quantization:   f32/f16 → s8/u8, `dst = clamp(round(src / scale + zero), min, max)`
+///   - dequantization: s8/u8 → f32/f16, `dst = (src - zero) * scale`
 ///
-/// Both functions are templated on the integer type `T` (int8_t for s8, uint8_t
-/// for u8); the clamp range is [-128, 127] for s8 and [0, 255] for u8. The
-/// `zero` parameter makes the kernel asymmetric-capable; symmetric quantization
-/// is simply the `zero == nullptr` (all-zero) case.
+/// `T` is int8_t (clamp [-128, 127]) or uint8_t (clamp [0, 255]). The block
+/// primitive is 16 values wide (128-bit NEON); the loops unroll it 2× to 32.
+/// Narrowing saturates in two stages (i32 → i16 → i8 / u8) via `vqmovn` /
+/// `vqmovun`, and rounding is round-to-nearest-even (`vcvtnq_s32_f32` /
+/// `std::nearbyintf`), matching `_mm_cvtps_epi32`.
 ///
-/// Unlike the x86_64 version there is no separate 32-wide block: NEON registers
-/// are 128-bit (4 f32 / 16 i8), so a single 16-wide block is used for the whole
-/// vector loop. Rounding is round-to-nearest-even (`vcvtnq_s32_f32` /
-/// `std::nearbyintf`), matching `_mm_cvtps_epi32`. Narrowing saturates in two
-/// stages (i32 → i16 → i8 / u8) via `vqmovn`/`vqmovun`, which is correct because
-/// the int8 range is a subset of the int16 range.
+/// Also here: `requantize_8` and `max_8`, the 8-lane primitives the channel-lane
+/// quantize and pooling paths use.
 ///
 /// Reference (x86_64 semantics): nn_compute/src/cpu/kernel/quant/x86_64/quant_impl.hpp
 
@@ -42,12 +39,8 @@ using nnops::backend::cpu::float_to_half;
 //  Block helpers — register-level quantize / dequantize primitives
 // =========================================================================
 
-/// Quantize 16 floats (4×float32x4_t) to 16 int8 (1×int8x16_t), natural order.
-///
-/// Each lane computes `zero + d * inv_scale` via fused multiply-add, rounds to
-/// nearest even (`vcvtnq_s32_f32`), then narrows i32 → i16 → i8 with saturating
-/// `vqmovn`. The u8 path uses `vqmovun_s16` for the final signed→unsigned
-/// narrowing to [0, 255].
+/// Quantize 16 floats (4×float32x4_t) to 16 int8 (1×int8x16_t) in natural order;
+/// each lane is one FMA `zero + d * inv_scale`.
 template <bool Q_U8>
 inline int8x16_t quant_block16_f32_i8(float32x4_t d0, float32x4_t d1, float32x4_t d2, float32x4_t d3,
                                       float32x4_t inv_scale, float32x4_t zero) noexcept {
@@ -72,10 +65,8 @@ inline int8x16_t quant_block16_f32_i8(float32x4_t d0, float32x4_t d1, float32x4_
     }
 }
 
-/// Widen 8 int8 (int8x8_t) to 8 int32 (2×int32x4_t).
-///
-/// The u8 path reinterprets the bytes as unsigned before widening, so values
-/// ≥ 128 (which read as negative int8) recover their true unsigned magnitude.
+/// Widen 8 int8 (int8x8_t) to 8 int32 (2×int32x4_t); the u8 path reinterprets
+/// as unsigned first, so bytes ≥ 128 recover their true magnitude.
 template <bool Q_U8>
 inline void widen8_i8_to_i32(int8x8_t v, int32x4_t& lo, int32x4_t& hi) noexcept {
     if constexpr (Q_U8) {
@@ -90,10 +81,8 @@ inline void widen8_i8_to_i32(int8x8_t v, int32x4_t& lo, int32x4_t& hi) noexcept 
 }
 
 /// Dequantize 16 int8 (1×int8x16_t) to 16 floats (4×float32x4_t).
-///
-/// Uses FMA: `i_f32 * scale + neg_zero_scale` where `neg_zero_scale = -zero * scale`
-/// is precomputed once per row. This replaces the two-instruction `sub + mul` with
-/// a single fused multiply-add, saving one arithmetic instruction per 4-wide lane.
+/// `neg_zero_scale = -zero * scale` is precomputed per row so each lane is the
+/// single FMA `i_f32 * scale + neg_zero_scale`.
 template <bool Q_U8>
 inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t neg_zero_scale,
                                    float32x4_t& res0, float32x4_t& res1,
@@ -111,16 +100,8 @@ inline void dequant_block16_i8_f32(int8x16_t v, float32x4_t scale, float32x4_t n
 //  Top-level per-token quantize / dequantize (s8 and u8)
 // =========================================================================
 
-/// Quantize an M×N f32 matrix to integer `T`, one (scale, zero_point) per row.
-///
-/// `T` is int8_t (s8, clamp [-128, 127]) or uint8_t (u8, clamp [0, 255]).
-/// `scale` has M entries; `zero` has M entries or is nullptr (all-zero). `dst`
-/// is written with row stride `dr_step` elements, `src` read with `sr_step`
-/// elements. SIMD and scalar tails round to nearest-even (`vcvtnq_s32_f32` /
-/// `std::nearbyintf`) and saturate to the type's range.
-///
-/// The inner loop is unrolled 2× (32 elements per iteration) to reduce loop
-/// overhead on medium-to-large N.
+/// Quantize an M×N f32 matrix to integer `T`, one (scale, zero_point) per row;
+/// `dst`/`src` use row strides `dr_step`/`sr_step`.
 template <typename T>
 inline void quantization(int M, int N,
                          T* NNOPS_RESTRICT dst, int dr_step,
@@ -144,7 +125,6 @@ inline void quantization(int M, int N,
         const float* src_ptr = src + m * sr_step;
 
         int n = 0;
-        // 32-wide unrolled path: two 16-wide blocks per iteration
         for (; n + 32 <= N; n += 32) {
             const float32x4_t d0 = vld1q_f32(src_ptr + n + 0);
             const float32x4_t d1 = vld1q_f32(src_ptr + n + 4);
@@ -159,7 +139,6 @@ inline void quantization(int M, int N,
             vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 0), q0);
             vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 16), q1);
         }
-        // 16-wide path for the remaining ≥16 tail
         for (; n + 16 <= N; n += 16) {
             const float32x4_t d0 = vld1q_f32(src_ptr + n + 0);
             const float32x4_t d1 = vld1q_f32(src_ptr + n + 4);
@@ -181,16 +160,8 @@ inline void quantization(int M, int N,
 //  Top-level per-token quantize with half (f16) input
 // =========================================================================
 
-/// Quantize an M×N f16 matrix to integer `T`, one (scale, zero_point) per row.
-///
-/// The half input is widened to f32 with the NEON fp16→fp32 conversion
-/// (`vcvt_f32_f16` / `vcvt_high_f32_f16`) and then run through the same
-/// f32→int8 arithmetic as the f32 `quantization<T>` overload. Rounding and
-/// clamping are identical (round-to-nearest-even, saturating to `T`'s range).
-/// `T` is int8_t (s8) or uint8_t (u8).
-///
-/// The inner loop is unrolled 2× (32 elements per iteration) to reduce loop
-/// overhead on medium-to-large N.
+/// f16 input variant of `quantization<T>`: widen half → f32 (`vcvt_f32_f16` /
+/// `vcvt_high_f32_f16`), then the same arithmetic, rounding and clamping.
 template <typename T>
 inline void quantization(int M, int N,
                          T* NNOPS_RESTRICT dst, int dr_step,
@@ -214,7 +185,6 @@ inline void quantization(int M, int N,
         const half* src_ptr = src + m * sr_step;
 
         int n = 0;
-        // 32-wide unrolled path: load 32 halfs, convert to 32 floats, quantize to 32 int8
         for (; n + 32 <= N; n += 32) {
             const float16x8_t h0 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 0));
             const float16x8_t h1 = vld1q_f16(reinterpret_cast<const float16_t*>(src_ptr + n + 8));
@@ -253,16 +223,11 @@ inline void quantization(int M, int N,
 }
 
 // =========================================================================
-//  8-wide primitives (8 lanes = 8 bytes = one 64-bit group)
-//
-// These operate on eight adjacent channel lanes — the granularity the
-// channel-lane quantized kernels use.
+//  8-wide primitives — eight adjacent channel lanes, one 64-bit group
 // =========================================================================
 
-/// Requantize 8 floats to 8 int8/uint8 with a broadcast (per-tensor) scale and
-/// zero_point: `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
-/// Rounding is round-to-nearest-even (`vcvtnq_s32_f32`), matching the per-token
-/// `quantization<T>` path and the x86_64 `requantize_8`.
+/// Requantize 8 floats with a broadcast scale/zero_point into 8 int8/uint8:
+/// `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
 template <typename T>
 inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
                          float inv_scale, float zero) noexcept {
@@ -285,9 +250,9 @@ inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
     vst1_s8(reinterpret_cast<int8_t*>(dst), i8);
 }
 
-/// Per-lane maximum of two 8-wide int8/uint8 vectors (raw integer max, no
-/// dequantization). Used by the MaxPooling fast path, which is valid when input
-/// and output share the same scale and zero_point.
+/// Per-lane maximum of two 8-wide int8/uint8 vectors — raw integer max, no
+/// dequantization, which is why MaxPooling uses it only when in and out share
+/// scale and zero_point.
 template <typename T>
 inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
                   const T* NNOPS_RESTRICT b) noexcept {
@@ -307,14 +272,7 @@ inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
 }
 
 /// Dequantize an M×N integer matrix of type `T` to f32, one (scale, zero_point)
-/// per row.
-///
-/// `T` is int8_t (s8) or uint8_t (u8). `scale` and `zero` each have M entries
-/// (or `zero` is nullptr for all-zero).
-///
-/// The inner loop is unrolled 2× (32 elements per iteration) and uses a single
-/// FMA per 4-wide lane (`neg_zero_scale + i_f32 * scale`) instead of the
-/// two-instruction `sub + mul` sequence.
+/// per row; `dst`/`src` use row strides `dr_step`/`sr_step`.
 template <typename T>
 inline void dequantization(int M, int N,
                            float* NNOPS_RESTRICT dst, int dr_step,
@@ -328,8 +286,7 @@ inline void dequantization(int M, int N,
     for (int m = 0; m < M; ++m) {
         const float scale_val = scale[m];
         const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
-        // Precompute neg_zero_scale = -zero * scale so the inner loop can use a
-        // single FMA: fma(neg_zero_scale, i_f32, scale) = i_f32*scale - zero*scale
+        // neg_zero_scale turns (i - zero) * scale into one FMA per 4-wide lane.
         const float neg_zero_scale = -zero_val * scale_val;
 
         const float32x4_t v_scale = vdupq_n_f32(scale_val);
@@ -339,7 +296,6 @@ inline void dequantization(int M, int N,
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
-        // 32-wide unrolled path: two 16-wide blocks per iteration
         for (; n + 32 <= N; n += 32) {
             const int8x16_t v0 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 0));
             const int8x16_t v1 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 16));
@@ -374,15 +330,8 @@ inline void dequantization(int M, int N,
 //  Top-level per-token dequantize with half (f16) output
 // =========================================================================
 
-/// Dequantize an M×N integer matrix of type `T` to f16, one (scale, zero_point)
-/// per row.
-///
-/// The integer input is widened and dequantized to f32 with the same arithmetic
-/// as the f32 `dequantization<T>`, then narrowed to f16 with the NEON fp32→fp16
-/// conversion (`vcvt_f16_f32`). `T` is int8_t (s8) or uint8_t (u8).
-///
-/// The inner loop is unrolled 2× (32 elements per iteration) and uses a single
-/// FMA per 4-wide lane.
+/// f16 output variant of `dequantization<T>`: dequantize in f32, then narrow to
+/// f16 (`vcvt_f16_f32`).
 template <typename T>
 inline void dequantization(int M, int N,
                            half* NNOPS_RESTRICT dst, int dr_step,
@@ -405,7 +354,6 @@ inline void dequantization(int M, int N,
         const T* src_ptr = src + m * sr_step;
 
         int n = 0;
-        // 32-wide unrolled path
         for (; n + 32 <= N; n += 32) {
             const int8x16_t v0 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 0));
             const int8x16_t v1 = vld1q_s8(reinterpret_cast<const int8_t*>(src_ptr + n + 16));

@@ -1,12 +1,22 @@
 #pragma once
 /// @file simd_softmax.hpp
-/// @brief SIMD kernel functions for softmax / log-softmax.
+/// @brief SIMD softmax / log-softmax kernels.
 ///
-/// Kernel architecture:
-///   - softmax_per_lane:                unified per-lane 3-pass kernel (max -> exp + sum -> norm)
-///                                      for all strided-access variants
-///   - softmax_process_packed_channel:  per-lane + partial last-block scalar correction
-///   - softmax_process_standard_row:    horizontal SIMD reduction for contiguous tail
+/// softmax_per_lane is the unified 3-pass kernel — max, then exp((x-max)/T) plus
+/// its sum, then normalize — over D elements strided by `stride`. Every per-lane
+/// variant (packed row, packed column, strided axis) is this kernel and differs
+/// only in the stride. softmax_process_packed_channel adds a scalar per-lane
+/// correction over a partial last C8 block, whose padded zeros must not perturb
+/// the max, sum or normalization.
+///
+/// softmax_process_standard_row is structurally different: horizontal
+/// v_reduce_max / v_reduce_sum over one contiguous row. HasMask fuses an
+/// additive mask (softmax(x + mask)) without materializing x+mask, saving a full
+/// buffer pass; `mask` is read only when HasMask is true, and y may alias x.
+///
+/// softmax_row_max and softmax_row_exp_sum are the per-tile steps of the tiled
+/// (FlashAttention) online softmax: the caller keeps the running max/sum across
+/// KV tiles and does the final normalization itself.
 ///
 /// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
@@ -20,12 +30,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Per-lane SIMD softmax: each SIMD lane is an independent 3-pass softmax
-/// over D strided elements.
-///
-/// Algorithm: max → exp((x - max) / T) + sum → normalize.
-/// All per-lane softmax variants (packed row, packed column, strided axis)
-/// reduce to this single kernel — the only difference is the stride value.
 template <typename T>
 inline void softmax_per_lane(
     const T* x, T* y,
@@ -34,13 +38,11 @@ inline void softmax_per_lane(
 {
     auto v_inv_T = v_set1(x, inv_T);
 
-    // Pass 1: per-lane max
     auto v_max_vec = v_set1(x, -std::numeric_limits<float>::infinity());
     for (int64_t k = 0; k < D; ++k) {
         v_max_vec = v_max(v_max_vec, v_load(x + k * stride));
     }
 
-    // Pass 2: exp((x - max) / T) + per-lane sum
     auto v_sum_vec = v_zero(x);
     auto v_neg_max = v_neg(v_max_vec);
     for (int64_t k = 0; k < D; ++k) {
@@ -53,7 +55,6 @@ inline void softmax_per_lane(
         v_sum_vec = v_add(v_sum_vec, v);
     }
 
-    // Pass 3: normalize
     if (log_softmax) {
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
         for (int64_t k = 0; k < D; ++k) {
@@ -68,13 +69,6 @@ inline void softmax_per_lane(
     }
 }
 
-/// Channel-wise softmax for NCHWC8 / NCDHWC8 packed layout.
-///
-/// This is the only per-lane variant that needs special handling: when the
-/// last C8 block is partial (valid_lanes < pack), padded zeros must not
-/// perturb the per-lane max / sum / normalization. Full blocks are processed
-/// via the same 3-pass algorithm as softmax_per_lane; the partial last block
-/// uses scalar per-lane correction.
 template <typename T>
 inline void softmax_process_packed_channel(
     const T* x_chan, T* y_chan,
@@ -92,9 +86,6 @@ inline void softmax_process_packed_channel(
         return s_load(&buf[l]);
     };
 
-    // ============================================================
-    // Pass 1: per-lane max over full blocks + partial block
-    // ============================================================
     auto v_max_vec = v_set1(x_chan, -std::numeric_limits<float>::infinity());
     for (int64_t c = 0; c < full_blocks; ++c) {
         v_max_vec = v_max(v_max_vec, v_load(x_chan + c * stride));
@@ -111,9 +102,6 @@ inline void softmax_process_packed_channel(
         v_max_vec = v_load(tmp);
     }
 
-    // ============================================================
-    // Pass 2: exp((x - max) / T) + per-lane sum
-    // ============================================================
     auto v_sum_vec = v_zero(x_chan);
     auto v_neg_max = v_neg(v_max_vec);
 
@@ -141,9 +129,6 @@ inline void softmax_process_packed_channel(
         v_sum_vec = v_load(tmp);
     }
 
-    // ============================================================
-    // Pass 3: normalize
-    // ============================================================
     if (log_softmax) {
         auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
         for (int64_t c = 0; c < full_blocks; ++c) {
@@ -177,9 +162,6 @@ inline void softmax_process_packed_channel(
 }
 
 
-/// Value of the softmax element at index i: x[i] (unmasked) or x[i] + mask[i]
-/// (masked). `if constexpr` selects the form, so the masked path never reads
-/// `mask` when HasMask is false.
 template <typename T, bool HasMask>
 inline auto softmax_xm(const T* x, const T* mask, int64_t i) {
     if constexpr (HasMask) {
@@ -189,7 +171,6 @@ inline auto softmax_xm(const T* x, const T* mask, int64_t i) {
     }
 }
 
-/// Scalar form of softmax_xm.
 template <typename T, bool HasMask>
 inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i) {
     if constexpr (HasMask) {
@@ -199,14 +180,6 @@ inline float softmax_xm_scalar(const T* x, const T* mask, int64_t i) {
     }
 }
 
-/// Shared core of the standard-row softmax (contiguous tail, pack == 1).
-///
-/// Uses horizontal SIMD reduction (v_reduce_max / v_reduce_sum), not per-lane
-/// SIMD — structurally different from softmax_per_lane. `HasMask` selects
-/// whether an additive mask is fused in (softmax(x + mask)) without
-/// materializing the sum, saving one full-buffer pass versus an explicit
-/// `x += mask` before a plain softmax. `mask` is only read when HasMask is
-/// true (may be null otherwise); y may alias x (in-place).
 template <typename T, bool HasMask>
 inline void softmax_process_standard_row_impl(
     const T* x, const T* mask, T* y,
@@ -216,7 +189,6 @@ inline void softmax_process_standard_row_impl(
     constexpr int L = simd_lane_for<T>;
     int64_t i = 0;
 
-    // Pass 1: Max reduction (temperature doesn't affect max)
     float max_val = -std::numeric_limits<float>::infinity();
     {
         auto v_max_val = v_set1(x, max_val);
@@ -232,7 +204,6 @@ inline void softmax_process_standard_row_impl(
 
     const float neg_max = -max_val;
 
-    // Pass 2: Sum of exp((x - max) / T)
     float sum_exp = 0.0f;
     i = 0;
     const bool store_exp = !log_softmax;
@@ -258,7 +229,6 @@ inline void softmax_process_standard_row_impl(
         sum_exp += val;
     }
 
-    // Pass 3: Normalize
     i = 0;
     if (log_softmax) {
         const float bias = neg_max * inv_T - std::log(sum_exp);
@@ -290,7 +260,6 @@ inline void softmax_process_standard_row_impl(
     }
 }
 
-/// Standard-row softmax (no mask).
 template <typename T>
 inline void softmax_process_standard_row(
     const T* x, T* y,
@@ -300,7 +269,6 @@ inline void softmax_process_standard_row(
     softmax_process_standard_row_impl<T, false>(x, nullptr, y, D, log_softmax, inv_T);
 }
 
-/// Masked standard-row softmax: softmax(x + mask) without materializing the sum.
 template <typename T>
 inline void mask_softmax_process_standard_row(
     const T* x, const T* mask, T* y,
@@ -310,20 +278,13 @@ inline void mask_softmax_process_standard_row(
     softmax_process_standard_row_impl<T, true>(x, mask, y, D, log_softmax, inv_T);
 }
 
-/// Row maximum of one contiguous row — building block of the tiled
-/// (FlashAttention) online-softmax, where the caller tracks the running max
-/// across KV tiles instead of materializing the full softmax row.
 template <typename T>
 inline float softmax_row_max(const T* x, int64_t n)
 {
     return row_reduce<T, ReduceMax>(x, n);
 }
 
-/// Scaled exp + sum of one contiguous row referenced to an externally supplied
-/// running max `ref_max` (the max of this row across all KV tiles processed so
-/// far): writes y[i] = exp((x[i] - ref_max) * inv_T) and returns sum(y). The
-/// caller owns the running max/sum and the final normalization; this is the
-/// per-tile update step of the tiled (FlashAttention) online-softmax.
+/// y[i] = exp((x[i] - ref_max) * inv_T); returns sum(y).
 template <typename T>
 inline float softmax_row_exp_sum(const T* x, T* y, int64_t n, float ref_max, float inv_T)
 {

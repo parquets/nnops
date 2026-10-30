@@ -1,10 +1,24 @@
-/// Unit tests for the LinearAttention operator.
+/// @file test_linear_attention.cpp
+/// @brief Unit tests for the LinearAttention operator.
 ///
 /// The SIMD kernel is checked against `reference::linear_attention_ref`, which
 /// lives in its own translation unit and shares no code with it — so agreement
 /// is evidence about the math rather than about a shared bug. On top of that sit
-/// a hand-computed case, a set of invariants (incremental decoding, causality of
-/// the convolution, decay semantics), an f16 case, and a genuinely threaded run.
+/// a hand-computed case, invariants (incremental decoding, conv causality, the
+/// decay/gate semantics), an f16 case, and a genuinely threaded run.
+///
+/// Two things the tests pin that a kernel-vs-reference compare cannot:
+///  - Optional input slots are positional: conv_w is index 4, beta is index 5.
+///    A beta supplied in the fifth slot is read as conv taps, and both sides
+///    misread the list identically, so the compare still passes.
+///  - outputs[1] (the state) is read, then overwritten in place; decoding one
+///    token at a time (each call S == 1) is what pins the in-place update.
+///
+/// The absolute tolerance is what decides near zero: the delta step subtracts
+/// two nearly equal quantities (`v[j] - r[j]`), so a near-zero entry carries an
+/// absolute error set by the magnitude of the terms that cancelled — ~eps times
+/// the largest state entry, not eps times its own. A problem whose state grows
+/// past order 1 therefore needs a looser atol.
 
 #include "nnops/ops/linear_attention.hpp"
 #include "common/test_harness.hpp"
@@ -22,8 +36,7 @@
 
 using namespace nnops;
 
-// Reference kernel for comparison (test-local declaration, following the
-// test_moe.cpp / test_matmul.cpp pattern).
+// Test-local declaration; the reference is defined in its own translation unit.
 namespace nnops::backend::cpu::reference {
 void linear_attention_ref(const LinearAttentionAttributes& attrs,
                           std::span<TensorView> outputs,
@@ -32,15 +45,14 @@ void linear_attention_ref(const LinearAttentionAttributes& attrs,
                           void* workspace);
 }
 
-// Minimal fixed-size thread pool exposing a CpuBackend (test_conv2d.cpp /
-// test_moe.cpp pattern). Items in [begin, end) are claimed via an atomic
-// counter. Without a pool like this the op would be exercised only through the
-// default ComputeContext, whose `run()` degrades to a sequential loop — the
-// parallel path would never execute.
+// Minimal fixed-size pool exposing a CpuBackend; items in [begin, end) are
+// claimed via an atomic counter. Without it the op only ever runs through the
+// default ComputeContext, whose `run()` is sequential — the parallel path would
+// never execute.
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
-        // runs under the same bit-exact comparisons as the kernels.
+        // OpenMP when the build has it, so the adapter runs under the same
+        // comparisons as the kernels.
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
             return;
@@ -72,7 +84,6 @@ struct SimplePool {
         for (auto& w : workers) { w.join(); }
     }
 
-    /// A ComputeContext wired to this pool's hooks.
     ComputeContext context() const {
         ComputeContext c;
         c.cpu = cpu;
@@ -103,8 +114,8 @@ inline TensorView f16_view(std::vector<half>& buf, const std::vector<int64_t>& s
                       DataType::f16, buf.data(), TensorLayout::NCHW);
 }
 
-/// One LinearAttention problem: attributes, every input buffer, and the initial
-/// recurrent state. Shapes are derived from (B, H, H_kv, S, D).
+/// Attributes, input buffers and initial state for one problem; shapes derive
+/// from (B, H, H_kv, S, D).
 struct Problem {
     LinearAttentionAttributes attrs;
     int64_t B = 1, H = 1, H_kv = 1, S = 4, D = 8;
@@ -126,8 +137,8 @@ void fill(std::vector<float>& buf, int64_t n, float lo, float hi, uint64_t seed)
     rng.fill_float(buf.data(), n, lo, hi);
 }
 
-/// Random problem. `gate_lo/hi` control the decay: exponentiate the gate, so a
-/// range of ~[-2, 0] gives decay factors in ~[0.14, 1].
+/// Random problem. `gate_lo/hi` bound the gate, which the kernel exponentiates:
+/// [-2, 0] gives decay factors around [0.14, 1].
 Problem make_problem(LinearAttentionAttributes attrs, int64_t B, int64_t H, int64_t H_kv,
                      int64_t S, int64_t D, int64_t CK = 0, bool has_beta = false,
                      float gate_lo = -2.0f, float gate_hi = 0.0f, uint64_t seed = 7)
@@ -173,9 +184,8 @@ Result run(Problem& p, bool use_reference, const ComputeContext& ctx = {})
 
     std::vector<TensorView> outputs = {o, st};
     std::vector<TensorView> ins = {q, k, v, g};
-    // The optional slots are positional (conv_w is index 4, beta is index 5),
-    // so conv_w's slot has to be occupied — by an empty view — whenever beta is
-    // supplied. Pushing beta alone would alias it into the conv_w slot.
+    // Optional slots are positional (conv_w is 4, beta is 5), so conv_w must be
+    // occupied — by an empty view — whenever beta is supplied.
     TensorView cw, bt;
     if (p.CK > 0) { cw = f32_view(p.conv_w, p.sh_cw()); }
     if (p.CK > 0 || p.has_beta) { ins.push_back(cw); }
@@ -193,15 +203,8 @@ Result run(Problem& p, bool use_reference, const ComputeContext& ctx = {})
     return r;
 }
 
-/// Kernel vs reference on the same data, for both outputs.
-///
-/// `atol` is in absolute terms, and for the recurrence that is the meaningful
-/// one: the retrieval/delta step subtracts two nearly equal quantities
-/// (`v[j] - r[j]`), so an entry that ends up near zero still carries an absolute
-/// error set by the magnitude of the terms that cancelled — roughly `eps` times
-/// the largest state entry, not `eps` times its own. The default atol only has
-/// to cover a state of order 1; a problem whose state grows larger needs a
-/// larger one to be comparable at all.
+/// Kernel vs reference on the same data, for both outputs. `atol` is absolute;
+/// see the file header for why that is the meaningful measure here.
 void expect_kernel_matches_reference(Problem& p, const ComputeContext& ctx = {},
                                      const std::string& what = "linear_attention",
                                      float atol = 1e-6f)
@@ -329,23 +332,19 @@ NNOPS_TEST(linear_attention_shape_inference) {
 // Hand-computed case — pins the whole pipeline
 // ============================================================
 //
-// B = H = H_kv = 1, D = 2, S = 2, no convolution, no beta (=> 1.0), gate = 0
-// (so exp(gate) = 1, i.e. no decay), scale = 1, initial state = 0.
+// B = H = H_kv = 1, D = 2, S = 2, no conv, no beta (=> 1.0), gate = 0 (no
+// decay), scale = 1, initial state = 0.
 //
 //   q0 = [1, 1]  k0 = [1, 2]  v0 = [3, 4]
 //   q1 = [1, 0]  k1 = [1, 1]  v1 = [1, 0]
 //
-// t = 0: S = 0, so r = 0 and d = v0. S = k0 (x) v0 = [[3, 4], [6, 8]].
-//        o0 = q0 . S = [1*3 + 1*6, 1*4 + 1*8] = [9, 12].
-// t = 1: r[j] = S[0][j]*k1[0] + S[1][j]*k1[1] = S[0][j] + S[1][j] = [9, 12].
-//        d = v1 - r = [1-9, 0-12] = [-8, -12].
-//        S += k1 (x) d, k1 = [1, 1]:
-//          row 0: [3, 4]   + [-8, -12] = [-5, -8]
-//          row 1: [6, 8]   + [-8, -12] = [-2, -4]
-//        o1 = q1 . S_new = row 0 = [-5, -8].
+// t = 0: r = 0, so d = v0 and S = k0 (x) v0 = [[3, 4], [6, 8]];
+//        o0 = q0 . S = [9, 12].
+// t = 1: r = S[0] + S[1] = [9, 12], d = v1 - r = [-8, -12];
+//        S += k1 (x) d = [[-5, -8], [-2, -4]], o1 = q1 . S = [-5, -8].
 //
-// The delta term matters here: d != v at t = 1, so a kernel that dropped the
-// (V - K@S) correction would produce o1 = [1, 0] and be caught.
+// d != v at t = 1, so a kernel that dropped the (V - K@S) correction would
+// produce o1 = [1, 0] and be caught.
 
 NNOPS_TEST(linear_attention_hand_computed) {
     Problem p;
@@ -382,8 +381,7 @@ NNOPS_TEST(linear_attention_hand_computed) {
 // ============================================================
 
 NNOPS_TEST(linear_attention_matches_reference_basic) {
-    // No GQA, moderate D, sequence long enough for the state to stop being
-    // dominated by the initial value.
+    // No GQA; S is long enough for the state to stop being dominated by state0.
     LinearAttentionAttributes a;
     a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 2;
     Problem p = make_problem(a, /*B=*/2, /*H=*/2, /*H_kv=*/2, /*S=*/6, /*D=*/16);
@@ -391,8 +389,8 @@ NNOPS_TEST(linear_attention_matches_reference_basic) {
 }
 
 NNOPS_TEST(linear_attention_matches_reference_gqa) {
-    // 4 query heads over 2 kv heads: the group's query heads each read the same
-    // state, and the decay comes from the single shared per-kv-head gate.
+    // 4 query heads over 2 kv heads: each group reads one state and one shared
+    // per-kv-head gate.
     LinearAttentionAttributes a;
     a.head_dim = 32; a.num_heads = 4; a.num_kv_heads = 2;
     Problem p = make_problem(a, /*B=*/2, /*H=*/4, /*H_kv=*/2, /*S=*/5, /*D=*/32);
@@ -405,14 +403,10 @@ NNOPS_TEST(linear_attention_matches_reference_odd_head_dim) {
     LinearAttentionAttributes a;
     a.head_dim = 100; a.num_heads = 3; a.num_kv_heads = 3;
     Problem p = make_problem(a, /*B=*/1, /*H=*/3, /*H_kv=*/3, /*S=*/4, /*D=*/100);
-    // The tail-free stages reduce in different orders here (vector blocks of
-    // eight, then a scalar tail) on top of fma-vs-mul-add, and a 100-wide
-    // recurrence lets the state reach ~25. The measured kernel/reference gap is
-    // 4.8e-7 at S=1, 1.4e-6 at S=2 and 2.0e-5 at S=4 — i.e. it tracks the state
-    // magnitude (2e-5/24.4 is under 8 ulp), which is exactly the absolute error
-    // a cancelling `v[j] - r[j]` leaves on a near-zero entry. An atol of 1e-4 is
-    // therefore about four ulp of the largest state entry: loose enough to admit
-    // reordering, far too tight to hide a real indexing or recurrence error.
+    // Reordered accumulation (vector blocks of eight, then a scalar tail, on top
+    // of fma-vs-mul-add) and a state that grows past order 1: the absolute error
+    // scales with the state, so 1e-4 — still far too tight to hide a real
+    // indexing or recurrence error.
     expect_kernel_matches_reference(p, {}, "odd_head_dim", 1e-4f);
 }
 
@@ -464,8 +458,7 @@ NNOPS_TEST(linear_attention_matches_reference_explicit_scale) {
 // Threaded run
 // ============================================================
 //
-// B * H_kv = 8 independent state matrices over a 4-worker pool. Without a real
-// pool the kernel's parallel path is never entered.
+// B * H_kv = 8 independent state matrices over a 4-worker pool.
 
 NNOPS_TEST(linear_attention_matches_reference_threaded) {
     LinearAttentionAttributes a;
@@ -482,15 +475,13 @@ NNOPS_TEST(linear_attention_matches_reference_threaded) {
 // Invariants
 // ============================================================
 
-// Feeding the sequence one token at a time, carrying the State forward, must
-// reproduce the whole-sequence run. This is the operator's core contract for
-// incremental decoding — and with `S == 1` it is also the only thing that pins
-// the "read the old state, overwrite in place" semantics of outputs[1].
+// Feeding the sequence one token at a time, carrying the state forward, must
+// reproduce the whole-sequence run — the core contract for incremental decoding.
 //
 // B = H = H_kv = 1 keeps each token's slice contiguous, so a per-token view is
-// just a pointer offset. (With a convolution this would not hold: a length-1
-// call has no left context to convolve against. Convolution and incremental
-// decoding are therefore mutually exclusive — see linear_attention.hpp.)
+// just a pointer offset. A convolution would break that: a length-1 call has no
+// left context, so convolution and incremental decoding are mutually exclusive
+// (see linear_attention.hpp).
 NNOPS_TEST(linear_attention_incremental_decode_matches_full_sequence) {
     LinearAttentionAttributes a;
     a.head_dim = 8; a.num_heads = 1; a.num_kv_heads = 1;
@@ -502,7 +493,6 @@ NNOPS_TEST(linear_attention_incremental_decode_matches_full_sequence) {
 
     Result full = run(p, /*use_reference=*/false);
 
-    // Step the same problem one token at a time.
     std::vector<float> got_out(static_cast<size_t>(S * D), 0.0f);
     std::vector<float> state = p.state0;
 
@@ -529,8 +519,8 @@ NNOPS_TEST(linear_attention_incremental_decode_matches_full_sequence) {
                       DataType::f32, state.data(), TensorLayout::NCHW);
 
         std::vector<TensorView> outputs = {o, st};
-        // Empty conv_w slot: this problem has beta but no convolution, and the
-        // optional slots are positional.
+        // Empty conv_w slot: this problem has beta but no conv, and the slots
+        // are positional.
         std::vector<TensorView> ins = {q, k, v, g, TensorView{}, b};
         auto op = LinearAttention::create(a, Backend::CPU);
         op->compute(outputs, ins, {}, nullptr);
@@ -545,8 +535,8 @@ NNOPS_TEST(linear_attention_incremental_decode_matches_full_sequence) {
     }
 }
 
-// The carried state must actually be read, not assumed zero. Running from a
-// nonzero state has to differ from running from a cold one.
+// The carried state must actually be read: running from a nonzero state has to
+// differ from running from a cold one.
 NNOPS_TEST(linear_attention_initial_state_is_read) {
     LinearAttentionAttributes a;
     a.head_dim = 8; a.num_heads = 2; a.num_kv_heads = 2;
@@ -568,13 +558,10 @@ NNOPS_TEST(linear_attention_initial_state_is_read) {
     expect_kernel_matches_reference(p, {}, "initial_state");
 }
 
-// beta occupies index 5 — the *sixth* slot — and the default is 1.0. Both halves
-// of that are pinned here, because the failure mode is silent: a beta supplied
-// as the fifth entry lands in the conv_w slot and gets read as tap weights, and
-// a kernel-vs-reference comparison cannot see it (both sides misread the list
-// identically, and neither has a conv to disagree about). Concretely, an
-// implementation that aliased the two slots would multiply the outputs by a
-// five-tap convolution of all-ones weights rather than by beta.
+// beta sits at index 5 and defaults to 1.0; both halves are pinned here because
+// the failure mode is silent — a beta in the fifth slot is read as conv taps,
+// and a kernel-vs-reference compare cannot see it, since both sides misread the
+// list identically and neither has a conv to disagree about.
 NNOPS_TEST(linear_attention_beta_default_is_one) {
     LinearAttentionAttributes a;
     a.head_dim = 8; a.num_heads = 2; a.num_kv_heads = 1;
@@ -685,11 +672,10 @@ NNOPS_TEST(linear_attention_conv_is_causal) {
 // f16
 // ============================================================
 //
-// The kernel takes f16 input/output; the reference computes in f32 on the exact
-// values those f16 inputs represent (so the comparison isolates accumulation,
-// not input quantization). Everything inside the kernel accumulates in f32
-// anyway — f16 only appears at the I/O boundary — so the error is bounded by a
-// couple of roundings, well inside kF16AccumTol.
+// The reference computes in f32 on the exact values the f16 inputs represent, so
+// the comparison isolates accumulation from input quantization. The kernel
+// accumulates in f32 anyway — f16 only appears at the I/O boundary — so the
+// error is a couple of roundings, well inside kF16AccumTol.
 
 NNOPS_TEST(linear_attention_f16_matches_reference) {
     LinearAttentionAttributes a;

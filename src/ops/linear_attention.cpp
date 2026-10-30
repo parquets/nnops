@@ -1,5 +1,17 @@
 /// @file linear_attention.cpp
 /// @brief LinearAttention operator dispatch.
+///
+/// Gated delta-rule linear attention with an optional causal conv1d over the
+/// packed Q | K | V channels. Inputs are Q, K, V, Gate [, conv_weights [, beta]],
+/// f32 or f16; num_kv_heads defaults to num_heads, and under GQA (H % H_kv == 0)
+/// K, V and Gate take the kv-head geometry [B, H_kv, S, D], beta [B, H_kv, S],
+/// while the output stays [B, H, S, D].
+///
+/// The operator has two outputs, so the kernel takes the whole span: the
+/// attention output and the recurrent State [B, H_kv, D, D], which the kernel
+/// carries across the sequence. Optional tails arrive as empty views with rank
+/// 0 -- absent, not malformed -- and conv_weights come shaped
+/// [(H + 2*H_kv) * D, 1, K].
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
@@ -26,8 +38,6 @@ namespace backend::cuda {
 #endif
 
 struct LinearAttention::Impl {
-    // `outputs` is a span, not a single view: the operator's recurrent State
-    // lives in outputs[1], and it has to reach the kernel.
     using KernelFn = Status (*)(const LinearAttentionAttributes&,
                               std::span<TensorView>,
                               std::span<const TensorView>,
@@ -70,9 +80,6 @@ std::vector<TensorDesc> LinearAttention::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
     NNOPS_ASSERT(inputs.size() >= 4);
-    // outputs[0] = same shape as Q
-    // outputs[1] = State shape: [B, H_kv, D, D]
-    //   D = head_dim from attributes (not derivable from Q alone when H_kv != H)
     const auto& Q = inputs[0];
     int64_t B  = Q.dims[0];
     int64_t H_kv = attrs_.num_kv_heads > 0 ? attrs_.num_kv_heads : attrs_.num_heads;
@@ -113,7 +120,6 @@ Status LinearAttention::validate(std::span<const TensorDesc> inputs,
     const int64_t h_kv = attrs_.num_kv_heads > 0 ? attrs_.num_kv_heads : h;
     if (h_kv <= 0 || h % h_kv != 0) { return Status::invalid_argument; }
 
-    // K/V/Gate share the kv-head geometry: [B, H_kv, S, D].
     for (size_t i = 1; i <= 3; ++i) {
         const auto& t = inputs[i];
         if (t.rank != 4 || t.dims[0] != b || t.dims[1] != h_kv ||
@@ -121,7 +127,6 @@ Status LinearAttention::validate(std::span<const TensorDesc> inputs,
             return Status::invalid_argument;
         }
     }
-    // Output is [B, H, S, D]; the recurrent State is [B, H_kv, D, D].
     if (outputs[0].rank != 4 || outputs[0].dims[0] != b || outputs[0].dims[1] != h ||
         outputs[0].dims[2] != s || outputs[0].dims[3] != d) {
         return Status::invalid_argument;
@@ -132,8 +137,6 @@ Status LinearAttention::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
 
-    // Optional tails. An omitted slot arrives as an empty view, whose descriptor
-    // has rank 0 — treat that as "absent" rather than as a malformed tensor.
     if (inputs.size() > 4 && inputs[4].rank != 0) {   // [(H + 2*H_kv) * D, 1, K]
         const auto& w = inputs[4];
         if (w.dtype != dt || w.rank != 3 ||

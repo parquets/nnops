@@ -1,15 +1,68 @@
 /// @file bench_matmul.cpp
-/// @brief MatMul micro-benchmarks — pack decision + thread scaling.
+/// @brief MatMul micro-benchmarks — route decisions, weight formats, thread scaling.
 ///
-/// Every case runs the plan-driven fused path (B always packed, A packed only on
-/// transpose_a or a deep K) across {nn, ta, tb, tatb} and padded
-/// strides. For each case the harness reports:
-///   - the split direction (NKM when split on N, MKN when split on M),
-///   - the resolved tile sizes (mc, nc) and block count from get_matmul_plan(),
-///   - GFLOPS at 1, 2, 4, 8 and hardware threads.
+/// Most cases run the plan-driven path: B packed, A packed on transpose_a, K >
+/// PACK_A_K_THRESHOLD or an int8 A (the row pitch never enters that decision),
+/// across {nn, ta, tb, tatb} and padded strides; the GEMV, small-GEMM and fused
+/// block-decode cases deliberately take the pack-free route. Point cases report
+/// the split direction (NKM / MKN), the resolved (mc, nc, kc) and block count
+/// from get_matmul_plan(), and GFLOPS at 1, 2, 4, 8 and hardware threads. The
+/// sweeps print the same binary as a table, answering "at what size" rather than
+/// "which route". Units are GFLOPS (GOPS for int8, ns/call for the small-GEMM
+/// case, Gvalues/s for the pack and decode probes).
 ///
-/// The point is to see where block-granularity threading scales (and where it
-/// can't — e.g. when Nc is so large that an N-split yields only one block).
+/// Reading the tables:
+///   - BenchPool is an OpenMP team when the build has one (unless
+///     NNOPS_BENCH_OMP opts out), otherwise a pool that spawns its workers per
+///     call. That spawn is why the 8T/20T columns sag for *every* route here;
+///     the dq materialized path adds a quantize `ctx.cpu.run`, so it sags a
+///     little earlier.
+///   - The host drifts: two separate runs of the *same* route differ by >30% on
+///     a fanless machine, and sustained 4T load drops it into throttled episodes
+///     lasting seconds, during which both arms read 4-5x slow. Every A/B here
+///     builds both arms up front and interleaves them round by round in one
+///     process; a row whose multi-threaded numbers matter has its own
+///     registration so it can be run in its own process. Read the ratios and the
+///     medians, not the absolute GFLOPS.
+///   - Order matters as much as drift: the route measured second inherits the
+///     first one's cache and bandwidth state and reads up to 2x slower. Every
+///     A/B interleaves both arms in one process; the dq, fused-vs-packed and
+///     granularity loops also swap which arm goes first each round.
+///   - Sweep cells use a wall-clock budget instead of a fixed count — twenty
+///     iterations is ~30 s at 2048^3 and under a millisecond at 64^3 — and a
+///     fixed budget also leaves every row on the machine for the same time.
+///   - Sweep tile columns are the plan resolved at the *largest* pool in the
+///     row: kc shares the residency budget with mc and nc, so the plan is
+///     per-pool (the fp and q4 point cases report the 1-thread plan instead).
+///
+/// 256^3 resolves to two M-blocks, so its 20T column measures thread-pool
+/// start-up rather than the kernel; finding the knee between the two is what the
+/// size sweeps are for.
+///
+/// Q4_1 right-hand side: B is a llama.cpp block stream (20 bytes per 32 values)
+/// and the pack step decodes blocks straight into the GEMM's packed panels, so no
+/// dense dequantized B is ever materialised. The arithmetic stays f32 (f16 for an
+/// f16 A), which keeps these rows comparable with the dense ones; what is under
+/// test is 0.625 bytes/value against 4 or 2 — pack/decode cost traded against
+/// weight bandwidth. The GEMV gate and the fused small-M kernels are the two ends
+/// of that trade, and the balance shifts with M.
+///
+/// dq route (fp activations × s8 weights, fp out): quantization parameters are
+/// fixed offline, A arrives as f32/f16, B is s8 with one scale per output
+/// channel, C comes back in A's dtype. The materialized call does three passes —
+/// quantize A, run the int8 GEMM, dequantize the accumulate — yet the GFLOPS are
+/// still 2·M·N·K, so a dq row reads directly against the dense fp row of the
+/// same shape. The s8 A rows are symmetric (zp 0), making the compensation the
+/// identity and letting the A pack quantize on its own during an M-split with no
+/// A_q materialised; the u8 rows (zp 128) keep the materialised A_q. The fused
+/// pack drops the quantize pass and its `ctx.cpu.run`: measured +1/+4/+14/+20%
+/// at 1/2/4/8T on 1024x512x1024, a wash at 256^3 1T (the win scales with thread
+/// count, not FLOPs). Baseline on the dev host: dq/dense is ~3.3 at 1T for f32
+/// activations and ~3.3 at 4T for f16 (the dense B is only half as wide there,
+/// but the f16 dense route also scales worse); 1024x512x1024 dq runs at ~87% of
+/// matmul_i8_nn_large on one thread — the int32 accumulator round trip plus the
+/// quantize pass — and skipping the reduction sweep on the identity compensation
+/// is worth +13% at 256^3, one thread.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q4_1.hpp"         // q4_1_block, float_to_half, half_to_bits
@@ -40,10 +93,8 @@ namespace cpu = nnops::backend::cpu;
 
 namespace {
 
-// The bench's CpuBackend: an OpenMP thread team when the build has one (and
-// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
-// behind the same hooks, so a table differs only in its scheduler —
-// see common/cpu_pool.hpp.
+// The bench's CpuBackend: OpenMP team or spawn-per-call pool, behind the same
+// hooks; a table differs only in its scheduler (see common/cpu_pool.hpp).
 struct BenchPool {
     explicit BenchPool(int nthreads) : nthreads_(nthreads) {
         if (nnops::test::bench_use_openmp()) {
@@ -79,8 +130,7 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
-// Build a [rows, cols] tensor of type T with an explicit row pitch (elements);
-// only the logical region is filled (padding lanes stay 0).
+/// [rows, cols] tensor of T with an explicit row pitch; padding lanes stay 0.
 template <typename T>
 std::pair<std::vector<T>, TensorView>
 make_tensor(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
@@ -106,10 +156,8 @@ make_tensor(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
     return {std::move(buf), tv};
 }
 
-// Build a compact [rows, cols] int8 tensor (s8 by default, u8 on request; the
-// buffer is bytes either way). Quant params are left at the default identity
-// (zp=0, scale=1), so the int8 kernel accumulates the raw dot product — the
-// qgemm / MatMulInteger analog — with a trivial zero-point compensation.
+/// Compact i8 tensor (s8 by default, u8 on request) with identity quant params,
+/// so the kernel accumulates the raw dot — the qgemm / MatMulInteger analog.
 std::pair<std::vector<int8_t>, TensorView>
 make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed,
                DataType dt = DataType::s8) {
@@ -125,10 +173,8 @@ make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed,
     return {std::move(buf), tv};
 }
 
-// Build a compact [rows, cols] Q4_1 (llama.cpp block) tensor: 32 four-bit
-// quants per 20-byte block, with a per-block fp16 scale/offset in the block
-// itself. Only the storage matters here, but the quants and d/m are drawn from
-// realistic ranges so no lane is denormal or inf.
+/// Compact Q4_1 [rows, cols] block stream (32 four-bit quants per 20-byte block);
+/// realistic d/m so no lane is denormal or inf.
 std::pair<std::vector<uint8_t>, TensorView>
 make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed) {
     const int64_t blocks_per_row = (cols + q4_1_block_elems - 1) / q4_1_block_elems;
@@ -170,7 +216,7 @@ struct GeMMCase {
 
 struct GeMMReport {
     const char* name;
-    const char* route;   // "NKM-fused" (fp) or "int8-NKM"
+    const char* route;   // "NKM"/"MKN", format-prefixed on the quantized rows
     const char* unit;    // "GFLOPS" or "GOPS"
     bool pack_a, pack_b;
     int mc, nc, kc;
@@ -180,7 +226,6 @@ struct GeMMReport {
     std::vector<double> gflops;
 };
 
-// Time one case at the given thread counts; fills the report.
 template <typename T>
 GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iters) {
     const int64_t a_rows = c.ta ? c.K : c.M;
@@ -201,7 +246,6 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // --- static metadata from the plan (mirrors matmul_cpu) ---
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
@@ -228,7 +272,7 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-        // Warm-up (also faults/allocates pages).
+        // Warm-up; also faults the pages.
         for (int i = 0; i < 2; ++i) {
             op->compute(output, ins, use_ctx, nullptr);
         }
@@ -276,8 +320,7 @@ void bench_case(const GeMMCase& c) {
     print_report(rep);
 }
 
-// Time one int8 (s8|u8 × s8 → s32) case; mirrors run_geMM but uses the int8
-// panel constants and a s32 output buffer. GFLOPS is relabeled GOPS for int8.
+/// int8 (s8|u8 × s8 → s32) twin of run_geMM; the unit is GOPS.
 GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int iters) {
     const int64_t a_rows = c.ta ? c.K : c.M;
     const int64_t a_cols = c.ta ? c.M : c.K;
@@ -298,11 +341,7 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     const TensorDesc arr[] = {a_desc, b_desc};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // Static metadata from the plan, exactly as matmul_cpu builds it. The
-    // int8 path is plan-driven like fp, so mc/nc/blocks are what the kernel
-    // actually runs — resolvable only for a given pool size. Report the largest
-    // pool in the row: those numbers describe the (fastest) run printed last,
-    // whereas the 1-thread plan would describe no run at all.
+    // Tiles are per-pool, so describe the largest pool's plan.
     const int meta_threads = *std::max_element(threads.begin(), threads.end());
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, meta_threads);
 
@@ -314,7 +353,7 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     rep.name = c.name;
     rep.route = plan.split_n ? "int8-NKM" : "int8-MKN";
     rep.unit = "GOPS";
-    rep.pack_a = plan.pack_a;   // int8 always packs both A and B
+    rep.pack_a = plan.pack_a;
     rep.pack_b = true;
     rep.mc = static_cast<int>(plan.mc);
     rep.nc = static_cast<int>(plan.nc);
@@ -359,13 +398,8 @@ void bench_i8_case(const GeMMCase& c) {
 
 // ---- Q4_1 right-hand side --------------------------------------------------
 //
-// B is a llama.cpp block stream (20 bytes per 32 values) rather than floats.
-// The pack step decodes blocks straight into the GEMM's packed panels, so the
-// kernel never materialises a dense dequantized B; the arithmetic is still f32
-// (or f16 for an f16 A), which is what keeps these GFLOPS comparable with the
-// f32/f16 rows above. The difference under test is that B arrives at 0.625
-// bytes/value instead of 4 (f32) or 2 (f16), so the pack/decode cost trades
-// against weight bandwidth — the balance shifts with M.
+// B arrives at 0.625 bytes/value instead of 4 (f32) or 2 (f16); the file header
+// covers what the pack step does with it.
 template <typename T>
 GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int iters) {
     const int64_t a_rows = c.ta ? c.K : c.M;
@@ -443,17 +477,9 @@ void bench_q4_case(const GeMMCase& c) {
 
 // ---- controlled A/B between two routes ------------------------------------
 //
-// bench_case() runs each route as its own case, so the two numbers are taken in
-// different thermal/frequency states — on a fanless host, two runs of the *same*
-// route differ by >30%, which swamps the pack_a=0 vs pack_a=1 gap this suite
-// exists to expose. This builds both routes up front and alternates them round
-// by round inside one process, so the ratio is measured under matched
-// conditions. Read the per-round ratios, not the absolute GFLOPS.
-//
 // The A-side of each pair is built to take the unpacked-A ("direct") route and
-// the B-side the packed route. Packing A is forced by transpose_a (required for
-// correctness) or by K > PACK_A_K_THRESHOLD; the row pitch never enters the
-// decision, so a pad_a/pad_b pair past the threshold still runs one route twice.
+// the B-side the packed route; a pad_a/pad_b pair past the threshold runs one
+// route twice, since the row pitch never enters the pack decision.
 template <typename T>
 struct RouteAB {
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
@@ -503,8 +529,8 @@ struct RouteAB {
     }
 };
 
-/// Build two routes, alternate them round by round, and report the per-round
-/// ratio plus the median. @p la is the expected unpacked-A (direct) side.
+/// Interleaves @p la and @p lb round by round and reports per-round ratios plus
+/// the median; @p la is the expected unpacked-A (direct) side.
 template <typename T>
 void bench_route_ab(const char* tag, const char* la, const char* lb,
                     int64_t M, int64_t K, int64_t N,
@@ -540,23 +566,9 @@ void bench_route_ab(const char* tag, const char* la, const char* lb,
 
 // ---- size / shape sweeps ---------------------------------------------------
 //
-// The point cases above each pin one shape. That answers the routing questions
-// but not the one the 20T column kept raising: 256^3 resolves to two M-blocks,
-// so its 20T row measures the thread pool start-up, not the kernel, and the
-// useful question is where the knee between "pool dominates" and "kernel
-// dominates" sits. These sweep it.
-//
-// Iterations are adaptive here — every cell runs until a fixed wall-clock
-// budget elapses — rather than the flat 20 the point cases use. At 2048^3
-// twenty iterations is ~30 s per thread count; at 64^3 it is well under a
-// millisecond, too short to time at all. A fixed budget also leaves every row
-// on the machine for the same wall time, which is what makes the rows
-// comparable on a host that drifts under load (see the A/B section above for
-// how much it drifts).
-//
-// The tile columns are the plan resolved at the *largest* pool in the row, not
-// at 1 thread: kc shares the residency budget with mc and nc, so the plan is
-// per-pool, and the widest pool is the run whose block count bounds the others.
+// Point cases pin one shape each; these walk the knee between "pool dominates"
+// and "kernel dominates", with a wall-clock budget per cell and the tiles
+// resolved at the largest pool in the row (both explained in the file header).
 
 struct SweepShape { int64_t M, K, N; };
 
@@ -630,9 +642,8 @@ struct SweepOp {
     }
 
     /// GFLOPS of one budgeted block: warm up, then iterate until @p target_ms
-    /// of wall time has elapsed. One block rather than a median of blocks —
-    /// at ~100 ms a block is long enough that the spread within it sits far
-    /// below the between-size differences this table is read for.
+    /// elapses. One block is long enough that its spread sits below the
+    /// between-size differences this table is read for.
     double time_budget(const ComputeContext& ctx, double target_ms) {
         for (int i = 0; i < 2; ++i) { op->compute(out, ins, ctx, nullptr); }
         const auto t0 = std::chrono::high_resolution_clock::now();
@@ -668,7 +679,7 @@ void sweep_fp(const char* tag, const std::vector<SweepShape>& shapes,
     }
 }
 
-/// The int8 counterpart. Same shape as SweepOp, on the s8|u8 × s8 → s32 path.
+/// int8 counterpart of SweepOp, on the s8|u8 × s8 → s32 path.
 struct SweepOpI8 {
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
 
@@ -786,9 +797,8 @@ struct SweepOpQ4 {
         flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
     }
 
-    /// GFLOPS of one budgeted block, plus the effective weight bandwidth:
-    /// the block stream is swept once per call, so b_bytes / time is what the
-    /// pack step actually pulls through the cache hierarchy.
+    /// GFLOPS of one budgeted block, plus the weight bandwidth it pulls: the
+    /// block stream is swept once per call, so this is b_bytes / time.
     double time_budget(const ComputeContext& ctx, double target_ms, double* gbps) {
         for (int i = 0; i < 2; ++i) { op->compute(out, ins, ctx, nullptr); }
         const auto t0 = std::chrono::high_resolution_clock::now();
@@ -835,17 +845,14 @@ void sweep_q4(const char* tag, const std::vector<SweepShape>& shapes,
     }
 }
 
-/// M ladder at a fixed KxN: the packed B panel is reused once per row, so the
-/// decode cost per FLOP falls as 1/M until the MMA (or memory) takes over.
-/// Each M gets a plan resolved at the thread count it is timed with, and the
-/// dense f32 twin is built for the same shape so the ratio shows the knee
-/// rather than the host's absolute speed.
+/// M ladder at a fixed KxN: the packed B panel is reused once per output row, so
+/// the decode cost per FLOP falls as 1/M until the MMA (or memory) takes over.
+/// The dense f32 twin is built at the same thread count so the ratio shows the
+/// knee, not the host's absolute speed.
 ///
-/// @p packed pins the block format to the packed route (the fused small-M
-/// kernels off), so the small-M cells compare a format against dense f32
-/// rather than two routes. The dense arm has no such switch — it takes the
-/// pack-free GEMV to M = 4 regardless, which is what the operator does for a
-/// dense B.
+/// @p packed pins the block format to the packed route (the fused small-M kernels
+/// off), so the small-M cells compare formats, not routes; the dense arm has no
+/// such switch and GEMVs to M = 4 regardless.
 void m_ladder_q4(int64_t K, int64_t N, const std::vector<int64_t>& ms,
                  const std::vector<int>& threads, double target_ms,
                  bool tb = false, bool packed = false) {
@@ -885,9 +892,7 @@ void m_ladder_q4(int64_t K, int64_t N, const std::vector<int64_t>& ms,
             if (packed) { cpu::qblock_fused_max_m_override = 0; }
 #endif
 
-            // Alternate the two formats round by round: on this host a run of
-            // one format drifts a few percent against the next, which is the
-            // same order as the ratio being measured.
+            // Interleave the formats: host drift is the same order as the ratio.
             std::vector<double> vq, vd;
             double gbps = 0.0;
             for (int r = 0; r < 3; ++r) {
@@ -905,11 +910,9 @@ void m_ladder_q4(int64_t K, int64_t N, const std::vector<int64_t>& ms,
     }
 }
 
-/// Same A, two weight formats: dense and Q4_1, alternated round by round so the
-/// ratio is measured under matched thermal conditions (see the A-side A/B
-/// section above). With M small the pair is weight-bandwidth bound and Q4_1
-/// should win outright; as M grows the decode overhead is amortised over more
-/// FLOPs and the gap narrows toward the pack cost.
+/// Same A, dense vs Q4_1 B, interleaved round by round. Small M is
+/// weight-bandwidth bound and Q4_1 wins outright; as M grows the decode is
+/// amortised over more FLOPs and the gap narrows toward the pack cost.
 template <typename T>
 void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
                        int rounds = 5, int iters = 20) {
@@ -983,12 +986,11 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
                 dense, mq / mf);
 }
 
-// Interleaved A/B of the two activation dtypes at identical memory: one byte
-// buffer is viewed as s8 and as u8, so the only difference is the dtype
-// contract. On x86 the s8 A pack XORs every byte into unsigned range and the B
-// packer writes the column sums the accumulators are seeded from; the u8 A
-// packs verbatim and the sums block is zeroed. The kernel itself is the same
-// code on both sides, so this measures the cost of the bias bookkeeping alone.
+// Interleaved A/B of the two activation dtypes over identical memory: one byte
+// buffer viewed as s8 and as u8. On x86 the s8 A pack XORs every byte into
+// unsigned range and the B packer writes the column sums the accumulators are
+// seeded from; u8 packs verbatim and zeroes that block. Same kernel both sides,
+// so this is the bias bookkeeping alone.
 void bench_i8_u8_ab(const char* tag, int64_t M, int64_t K, int64_t N,
                     int rounds = 5, int iters = 20) {
     std::vector<int8_t> a_bytes(static_cast<size_t>(M * K));
@@ -1060,18 +1062,15 @@ void bench_i8_u8_ab(const char* tag, int64_t M, int64_t K, int64_t N,
 
 // ---- integer destinations: s32 vs s8 vs u8 ---------------------------------
 //
-// The same GEMM, the same operands, three output dtypes and one int32 bias
-// each. What differs is the output pass alone:
-//
-//   s32  a bias-only pass over the raw accumulate, in place. No reductions:
-//        `int8_passes` stays off when the compensation is the identity and a
-//        bias alone is no reason to run them (int8_epilogue_row_bias).
-//   s8   the reductions sweep has to run (the requant reads r_a / r_b), then
+// Same GEMM, same operands, only the output pass differs:
+//   s32  a bias-only pass over the raw accumulate, in place — no reductions,
+//        since `int8_passes` stays off when the compensation is the identity
+//        and a bias alone is no reason to run it (int8_epilogue_row_bias);
+//   s8   the reductions sweep (the requant reads r_a / r_b), then
 //   u8   compensate + bias + requant + the saturating pack, per element.
 //
-// So s8/s32 is what an integer destination costs over the raw accumulate, and
-// u8/s8 is the price of the wider clamp (packus vs packs) alone. The zero
-// points are symmetric, i.e. the common W8A8 case.
+// s8/s32 is what an integer destination costs over the raw accumulate; u8/s8 is
+// the wider clamp (packus vs packs) alone. Zero points are symmetric (W8A8).
 void bench_i8_out_ab(const char* tag, int64_t M, int64_t K, int64_t N,
                      int rounds = 5, int iters = 20) {
     auto [a_buf, a] = make_tensor_i8(M, K, 1);
@@ -1174,10 +1173,8 @@ NNOPS_BENCH(matmul_f32_nn_direct_large) {
 }
 
 NNOPS_BENCH(matmul_f32_route_ab) {
-    // Paired with matmul_f32_nn_direct_large / matmul_f32_ta_mkn, which measure
-    // the same shapes but in separate, individually-unreliable runs. On aarch64
-    // the two routes also differ in M panel height (pack mr=8, direct mr=6), so
-    // the nn/ta ratio folds in the narrower direct panel.
+    // Paired with matmul_f32_nn_direct_large / matmul_f32_ta_mkn; packed and
+    // direct share the M panel cascade, so nn/ta isolates pack-vs-direct alone.
     bench_route_ab<float>("f32", "nn", "ta", 1024, 512, 1024,
                           /*ta_a=*/false, /*pad_a=*/0,
                           /*ta_b=*/true,  /*pad_b=*/0);
@@ -1196,15 +1193,13 @@ NNOPS_BENCH(matmul_f32_tatb_nkm) {
 }
 
 NNOPS_BENCH(matmul_f32_padded_b_stride) {
-    // Wide non-transposed B row stride forces pack_b via the stride heuristic.
     bench_case({"nn pad_b stride pack_b", 1024, 512, 1024, /*ta=*/false, /*tb=*/false,
                 /*pad_a=*/0, /*pad_b=*/4096});
 }
 
 NNOPS_BENCH(matmul_f32_n_split) {
-    // N > M takes the N-split (NKM), where each n-block packs its own B slice.
-    // N is not a multiple of nc, so the last block packs a short tile — the case
-    // the packed-B slice sizing is about (see num_panels_max).
+    // N > M takes the N-split (NKM), each n-block packing its own B slice; N is
+    // not a multiple of nc, so the last block packs a short tile.
     bench_case({"nn 256x512x10240 N-split", 256, 512, 10240});
 }
 
@@ -1222,9 +1217,8 @@ NNOPS_BENCH(matmul_f16_ta) {
                 /*pad_a=*/0, /*pad_b=*/0, /*f16=*/true});
 }
 
-// f16 pack-vs-direct, measured under matched conditions (see bench_route_ab).
-// Unlike f32, f16 tiles M identically on both routes (mr={8,4,1}; there is no
-// mr_f16_direct), so the ratio here is not tangled up with panel height.
+// As for f32, packed and direct tile M with the same cascade, so the ratio is
+// not tangled up with panel height.
 NNOPS_BENCH(matmul_f16_route_ab) {
     bench_route_ab<half>("f16", "nn", "ta", 512, 512, 256,
                          /*ta_a=*/false, /*pad_a=*/0,
@@ -1239,10 +1233,9 @@ NNOPS_BENCH(matmul_f16_route_ab_large) {
 }
 
 NNOPS_BENCH(matmul_f16_route_ab_deep_k) {
-    // Deep K. K > PACK_A_K_THRESHOLD packs A on *both* sides — this measures
-    // packed vs packed-transposed, not pack vs direct (the plan prints nn=1
-    // ta=1). A direct route is unreachable at this depth without raising the
-    // threshold.
+    // K > PACK_A_K_THRESHOLD packs A on *both* sides: packed vs
+    // packed-transposed, not pack vs direct (the plan prints nn=1 ta=1). A
+    // direct route is unreachable at this depth without raising the threshold.
     bench_route_ab<half>("f16 deep-K (both packed)", "nn", "ta", 512, 2048, 512,
                          /*ta_a=*/false, /*pad_a=*/0,
                          /*ta_b=*/true,  /*pad_b=*/0,
@@ -1250,10 +1243,10 @@ NNOPS_BENCH(matmul_f16_route_ab_deep_k) {
 }
 
 NNOPS_BENCH(matmul_f16_a_pitch_sweep) {
-    // How much a wide A row pitch costs the *direct* route. K is below
-    // PACK_A_K_THRESHOLD, so pack_a=0 at every pitch and the only variable is
-    // the row footprint the direct reads scatter across. Rounds are interleaved
-    // across all pitches so the comparison is thermal-matched.
+    // What a wide A row pitch costs the *direct* route: K is below
+    // PACK_A_K_THRESHOLD, so pack_a=0 at every pitch and the row footprint the
+    // direct reads scatter across is the only variable. Rounds interleave the
+    // pitches, so the comparison is thermal-matched.
     const int64_t M = 512, K = 512, N = 256;
     const int64_t pads[] = {0, 128, 256, 384, 512, 513, 640, 1024, 3072};
     const int rounds = 5, iters = 20;
@@ -1287,11 +1280,9 @@ NNOPS_BENCH(matmul_f16_a_pitch_sweep) {
 }
 
 NNOPS_BENCH(matmul_f16_pack_k_flip) {
-    // The pack-A threshold crossed. Layout and M/N are held fixed and K goes
-    // from PACK_A_K_THRESHOLD to +1 — a 0.1% work difference that flips pack_a
-    // from 0 to 1 — so the interleaved ratio is what the threshold buys at the
-    // boundary. Rounds alternate the two routes in one process (see
-    // bench_route_ab).
+    // K goes from PACK_A_K_THRESHOLD to +1 — a 0.1% work difference that flips
+    // pack_a from 0 to 1 — so the interleaved ratio is what the threshold buys
+    // at the boundary.
     const int64_t M = 512, N = 256;
     const int64_t k_direct = cpu::PACK_A_K_THRESHOLD;
     const int64_t k_packed = cpu::PACK_A_K_THRESHOLD + 1;
@@ -1325,10 +1316,9 @@ NNOPS_BENCH(matmul_f16_pack_k_flip) {
                 median(vd), median(vp), median(vd) / median(vp));
 }
 
-// Small GEMMs (M*N*K below GEMM_FAST_PATH_THRESHOLD) take the per-arch naive
-// SIMD kernel instead of the scalar reference. Interleaved A/B in one process,
-// as elsewhere — but the unit is ns/call, since at these sizes the call overhead
-// and not the FLOPs sets the time.
+// Below GEMM_FAST_PATH_THRESHOLD the per-arch naive SIMD kernel replaces the
+// scalar reference. ns/call, because at these sizes the call overhead and not
+// the FLOPs sets the time.
 namespace nnops::backend::cpu::reference {
 void matmul_ref(const MatMulAttributes& attrs,
                 TensorView& output,
@@ -1386,14 +1376,12 @@ NNOPS_BENCH(matmul_small_naive_ab) {
     }
 }
 
-// GEMV (M <= 4): the packed route sweeps B twice (write the packed copy, then
-// read it back) for a handful of output rows; the direct route streams B once.
-// Three direct layouts are timed: B as [K][N] with a cache-resident B (the
-// register tile), B as [K][N] at 64 MB (the streaming kernel), and B as [N][K]
-// (transpose_b, the decode layout). The packed side is forced by handing the
-// same GEMM over as ta+tb, which is the one layout the direct kernel declines.
-// Interleaved A/B at 1T, then a thread ladder for the direct route (its N
-// blocks are the parallel unit).
+// GEMV (M <= 4): the packed route sweeps B twice (write the packed copy, read it
+// back) for a handful of output rows, the direct route streams B once. Three
+// direct layouts are timed — [K][N] cache-resident, [K][N] at 64 MB, and [N][K]
+// (transpose_b, the decode layout) — with the packed side forced by ta+tb, the
+// one layout the direct kernel declines. Interleaved at 1T, then a thread ladder
+// for the direct route.
 template <typename T>
 void bench_gemv_dtype(const char* tag) {
     struct Shape { int64_t M, N, K; };
@@ -1472,8 +1460,7 @@ void bench_gemv_dtype(const char* tag) {
                     static_cast<long long>(s.K), flops / md, flops / mt, flops / mp,
                     mp / md, mp / mt);
 
-        // The direct route splits N across threads instead of batching the
-        // packing work, so its ladder starts at one row of output.
+        // The direct route's parallel unit is an N block, not a packing task.
         std::printf("      direct ladder:");
         const ComputeContext serial{};
         for (int nt : threads) {
@@ -1508,13 +1495,14 @@ NNOPS_BENCH(matmul_i8_nn_256) {
 }
 
 NNOPS_BENCH(matmul_i8_tb_large) {
-    // LLM-style A @ W^T (transpose_b): weight-B is [N, K] per-token.
+    // LLM-style A @ W^T (transpose_b): the weight is [N][K], one row per output
+    // channel.
     bench_i8_case({"i8 tb 1024x512x1024", 1024, 512, 1024, /*ta=*/false, /*tb=*/true});
 }
 
 NNOPS_BENCH(matmul_u8s8_nn_large) {
-    // Same shape as matmul_i8_nn_large with a u8 activation, so the two rows
-    // answer "what does the unsigned-A contract cost?" from the same table.
+    // Same shape as matmul_i8_nn_large with a u8 activation: what the
+    // unsigned-A contract costs, from the same table.
     bench_i8_case({"u8s8 nn 1024x512x1024", 1024, 512, 1024,
                    /*ta=*/false, /*tb=*/false, /*pad_a=*/0, /*pad_b=*/0,
                    /*f16=*/false, DataType::u8});
@@ -1527,8 +1515,8 @@ NNOPS_BENCH(matmul_u8s8_tb_large) {
 }
 
 NNOPS_BENCH(matmul_u8s8_vs_s8_ab) {
-    // Interleaved, same process, identical A bytes: the dtype is the only
-    // variable, so the ratio is the bias bookkeeping and nothing else.
+    // Identical A bytes, the dtype the only variable: the ratio is the bias
+    // bookkeeping and nothing else.
     bench_i8_u8_ab("nn", 1024, 512, 1024);
 }
 
@@ -1547,8 +1535,8 @@ NNOPS_BENCH(matmul_i8_out_large) {
 }
 
 NNOPS_BENCH(matmul_i8_out_decode) {
-    // One token against the weight: the pass is M rows, the GEMM is M·K·N, so
-    // this is where s8 should cost the most relative to s32.
+    // One token: the pass is M rows, the GEMM is M·K·N, so s8 costs the most
+    // relative to s32 here.
     bench_i8_out_ab("nn", 8, 4096, 4096);
 }
 
@@ -1580,19 +1568,17 @@ NNOPS_BENCH(matmul_q4_f16_tb) {
 }
 
 NNOPS_BENCH(matmul_q4_decode) {
-    // One token. There is almost no A-side work, so this row is the weight
-    // stream's bandwidth limit: the block bytes swept per call are printed as
-    // "B=... MB" next to the tile sizes.
+    // One token, almost no A-side work: the weight stream's bandwidth limit.
+    // The block bytes swept per call print as "B=... MB" next to the tiles.
     bench_q4_case<float>({"q4/f32 decode 1x4096x4096", 1, 4096, 4096,
                           /*ta=*/false, /*tb=*/true});
 }
 
 NNOPS_BENCH(matmul_q4_pack_only) {
-    // Isolate the RHS pack from the MMA at the decode shape: the same tile
-    // decomposition matmul_block_fused walks (n-block × k-block, row-major B),
-    // but no A pack and no micro-kernel. One sweep is one full-B pass, i.e. the
-    // pack half of a single matmul call — this is what dominates when M = 1 and
-    // the packed panel has no second row to be reused by.
+    // Isolate the RHS pack from the MMA at the decode shape: the same n-block ×
+    // k-block walk as matmul_block_fused, no A pack, no micro-kernel. One sweep
+    // is one full-B pass — the pack half of a call, which dominates when M = 1
+    // and the packed panel has no second row to be reused by.
     constexpr int64_t K = 4096, N = 4096;
     auto [av, a] = make_tensor<float>(1, K, K, 1);
     auto [fv, f] = make_tensor<float>(K, N, N, 2);   // dense f32 twin
@@ -1632,10 +1618,9 @@ NNOPS_BENCH(matmul_q4_pack_only) {
         }
     };
 
-    // [arm][trans][scale]: scale 1 is the plain pack, scale 2 the alpha path.
-    // Both arms scale as they store (dense per element, Q4_1 by folding the
-    // factor into the block's d and m), so alpha costs a couple of multiplies
-    // per block, not a second sweep over the panel.
+    // [arm][trans][scale]; scale 2 is the alpha path. Both arms scale as they
+    // store (dense per element, Q4_1 folded into the block's d and m), so alpha
+    // costs a multiply per block, not a second sweep over the panel.
     const int iters = 20;
     double ms[kArms][2][2] = {};
     for (int arm = 0; arm < kArms; ++arm) {
@@ -1686,12 +1671,10 @@ NNOPS_BENCH(matmul_q4_m_ladder) {
 
 NNOPS_BENCH(matmul_qblock_fused_ab) {
 #if defined(NNOPS_ARCH_X86_64)
-    // The fused route against the packed route, alternated round by round in
-    // one process (the only way this host gives a stable ratio). The fused row
-    // forces the fused route for every M so the table shows where it stops
-    // winning; the shipped gate (Q4Block::fused_max_m_trans/copy) is the crossover
-    // itself, measured per layout. Override < 0 keeps the built-in limits,
-    // 0 forces the packed route, > 0 overrides the M limit.
+    // Fused vs packed, alternated in one process. The fused arm forces the fused
+    // route for every M, so the table shows where it stops winning; the shipped
+    // gate is Q4Block::fused_max_m_trans/copy. Override < 0 keeps the built-in
+    // limits, 0 forces packed, > 0 overrides the M limit.
     const int64_t K = 4096, N = 4096;
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128};
     const std::vector<int> threads{1, 4};
@@ -1719,10 +1702,8 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
                 ComputeContext ctx;
                 if (nt > 1) { ctx.cpu = pool.cpu; }
 
-                // Order matters as much as host drift: the route measured
-                // second inherits the other one's cache/bandwidth state and
-                // reads up to 2x slower. Alternate the order per round and
-                // take the median of four samples each.
+                // The route measured second inherits the other's cache state
+                // and reads up to 2x slower, so alternate it per round.
                 std::vector<double> vf, vp;
                 for (int r = 0; r < 4; ++r) {
                     const bool fused_first = (r % 2) == 0;
@@ -1749,13 +1730,12 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
 }
 
 NNOPS_BENCH(matmul_q4_vs_f32_gemv) {
-    // The decode menu with both arms in their pack-free form. At M <= 4 a dense
-    // f32 B goes through matmul_gemv (B streamed once, never packed) and a q4_1
-    // B through the fused block decode (x86_64; on aarch64 the block side falls
-    // back to the packed route, so only the x86 ratio is the fused one). That
+    // Both arms pack-free: at M <= 4 a dense f32 B goes through matmul_gemv (B
+    // streamed once, never packed) and a q4_1 B through the fused block decode
+    // (x86_64; on aarch64 the block side falls back to the packed route). That
     // pair is the whole trade at batch 1: 6.4x fewer weight bytes against a
-    // per-element decode. Above M = 4 the dense side leaves this route for the
-    // packed one, which is matmul_q4_m_ladder's comparison, not this one.
+    // per-element decode. Above M = 4 the dense side leaves this route, which is
+    // matmul_q4_m_ladder's comparison, not this one.
     const std::vector<int64_t> ms{1, 2, 4};
     const std::vector<int> threads{1, 2, 4, 8};
     m_ladder_q4(4096, 4096, ms, threads, 60.0);
@@ -1767,10 +1747,9 @@ NNOPS_BENCH(matmul_q4_vs_f32_gemv) {
 }
 
 NNOPS_BENCH(matmul_q4_f32_packed) {
-    // Format-only: the block format pinned to the packed route so the small-M
+    // Format-only: the block format pinned to the packed route, so the small-M
     // cells compare Q4_1 against dense f32 rather than two routes. The dense
-    // f32 arm is unchanged — no switch exists for its GEMV, which is the route
-    // a dense B takes to M = 4 anyway.
+    // arm has no switch — its GEMV is the route a dense B takes to M = 4 anyway.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16};
     const std::vector<int> threads{1, 8};
     m_ladder_q4(4096, 4096, ms, threads, 40.0, false, /*packed=*/true);
@@ -1780,8 +1759,8 @@ NNOPS_BENCH(matmul_q4_f32_packed) {
 }
 
 NNOPS_BENCH(matmul_q4_m_ladder_tb) {
-    // Same ladder against a [N][K] weight (the Linear layout), which is the one
-    // the fused dot kernel serves.
+    // Same ladder against a [N][K] weight (the Linear layout): the fused dot
+    // kernel's shape.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128, 256};
     m_ladder_q4(4096, 4096, ms, {1, 4}, 100.0, /*tb=*/true);
     m_ladder_q4(2048, 2048, ms, {1, 4}, 100.0, /*tb=*/true);
@@ -1804,60 +1783,14 @@ NNOPS_BENCH(matmul_q4_vs_f16_ab_large) {
 // Offline-quantized fp activations × s8 weights (W8A8, fp in / fp out)
 // ============================================================
 //
-// The deployment shape this route serves: the activation quantization
-// parameters are fixed offline (calibration), A arrives as f32/f16, B is s8,
-// and C must come back in A's dtype. Every call then does three pieces of work
-// — quantize A (M×K fp reads, one byte written per element), run the int8 GEMM,
-// dequantize the int32 accumulate — yet the GFLOPS below are still computed
-// from 2·M·N·K, so a dq row reads directly against the dense fp row of the same
-// shape. That comparison is the reason the route exists, and
-// `matmul_dq_vs_fp_ab` is where it is measured under matched conditions.
-//
-// A carries its parameters in QuantParams (per-token arrays for the point
-// cases, per-tensor for the granularity split); B carries one scale per output
-// channel, the layout a W8A8 checkpoint loads in.
-//
-// Which A path a row takes: the s8 rows below are symmetric (zp_a = 0, zp_b
-// all zero), so the compensation is the identity; on an M-split the A pack then
-// quantizes the fp activations itself and no A_q is ever materialized. The u8
-// rows (zp_a = 128) need the compensation, so they keep the materialized A_q —
-// every fifth row is the other route, which is deliberate.
-//
-// Baseline on the dev host (Release, 20 logical cores), as a regression guard:
-//   - 1024x512x1024 dq is ~87% of the same-shape `matmul_i8_nn_large` GOPS at
-//     1T. The difference is the int32 accumulator round trip plus whatever the
-//     quantize pass leaves on the table.
-//     The reduction sweep is skipped whenever the compensation is the identity
-//     — a_bias_offset + zp_a == 0 for every row and every zp_b == 0 — worth
-//     +3% here and +13% at 256^3 on one thread, plus one fewer `ctx.cpu.run`.
-//     Fusing the quantization into the A pack (same identity case, M-split
-//     only) removes the remaining pass: interleaved A/B, 8 rounds per config,
-//     1024x512x1024 f32 nn: 1T 455→461 (+1%), 2T 710→740 (+4%), 4T 978→1115
-//     (+14%), 8T 936→1119 (+20%). At 256^3 1T it is a wash (~±1%); the win is
-//     the dropped `ctx.cpu.run`, which is why it grows with thread count and
-//     shrinks to nothing at one thread.
-//   - dq/dense is ~3.3 at 1T for f32 activations and ~3.3 for f16 at 4T: the
-//     dense B is only half as wide there, but the f16 dense route also scales
-//     worse across threads.
-//   - the 8T/20T columns sag for *every* route in this file because BenchPool
-//     spawns its workers per call; and dq makes one more `ctx.cpu.run` than
-//     int8, so it sags a little earlier. Read the 1T column and the ratio
-//     columns, not the high-thread columns.
-//   - under sustained 4T load this host drops into throttled episodes lasting
-//     seconds, during which *both* routes read ~4-5x slow, so whichever row is
-//     in flight takes the hit. With all four A/B rows in one process the f16
-//     row (measured last) read dense=55 / dq=145 in three consecutive runs;
-//     moved to the front it read dense=241 / dq=646, and the row that ended up
-//     last (tb) sagged by the same factor instead. So each A/B row has its own
-//     registration (`matmul_dq_vs_fp_ab_nn`, `_tb`, `_f16`) and should be run
-//     in its own process when the multi-threaded numbers matter. The 1T rows
-//     are stable in any process layout.
+// The deployment shape and the s8/u8 A-path split are in the file header. A
+// carries QuantParams (per-token for the point cases, per-tensor for the
+// granularity split); B one scale per output channel. Each case keeps a dense fp
+// copy of B, so dq/dense multiplies exactly the same weights.
 
 /// Run @p f until @p budget_ms elapses (at least once); return ms per call.
-/// At the sizes below a fixed iteration count is either too short to time or
-/// far too long, and a wall-clock budget also leaves every row of a ladder on
-/// the machine for the same time, which is what makes the rows comparable on a
-/// host that drifts under load.
+/// A wall-clock budget leaves every row of a ladder on the machine the same
+/// time, which is what makes the rows comparable on a host that drifts.
 template <typename F>
 double time_budget_ms(F&& f, double budget_ms) {
     f();
@@ -1879,14 +1812,13 @@ double time_budget_gflops(F&& f, double flops, double budget_ms) {
     return flops / (time_budget_ms(std::forward<F>(f), budget_ms) * 1e6);
 }
 
-/// Everything one dq case needs. A is fp with offline QuantParams attached, B is
-/// s8 with a per-output-channel scale, and a dense fp copy of B is kept so the
-/// fp-route side of an A/B multiplies exactly the same weights.
+/// Everything one dq case needs: fp A with offline QuantParams, s8 B with a
+/// per-output-channel scale, and a dense fp copy of B.
 ///
 /// @p b_zp is the weight zero point: 0 keeps B's per-channel array (all zeros,
-/// the symmetric checkpoint layout), while a non-zero value declares one zp for
-/// the whole tensor and no per-channel array — the shape whose per-element
-/// compensation half folds into a per-row offset.
+/// the symmetric layout); non-zero declares one zp for the whole tensor and no
+/// per-channel array — the shape whose per-element half folds into a per-row
+/// offset.
 template <typename T>
 struct DqCase {
     int64_t M, K, N;
@@ -1910,7 +1842,7 @@ struct DqCase {
         nnops::test::XorShift128 rng(1);
         constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
 
-        // --- A: activations in the range a real layer produces ---
+        // A
         {
             std::vector<float> f(static_cast<size_t>(M * K));
             for (auto& v : f) { v = rng.next_float(-1.0f, 1.0f); }
@@ -1921,9 +1853,7 @@ struct DqCase {
             }
         }
 
-        // Offline activation parameters: a scale that only just covers [-1, 1],
-        // so most of the integer range is in use, varied per row so nothing
-        // folds at compile time.
+        // Offline A scale just covers [-1, 1], varied per row so nothing folds.
         const float span = (act_dt == DataType::u8) ? 2.0f / 255.0f : 1.0f / 127.0f;
         const int32_t zp0 = (act_dt == DataType::u8) ? 128 : 0;
         const bool per_token = (gran == QuantGranularity::PerToken);
@@ -1942,9 +1872,9 @@ struct DqCase {
             qa.num_scales = M;
         }
 
-        // --- B: s8 weights, one scale per output column. A second generator
-        // keeps B identical between a per-token and a per-tensor case, since
-        // the two consume a different number of draws for A's parameters. ---
+        // B: s8 weights. A second generator keeps B identical between a
+        // per-token and a per-tensor case, which draw different numbers of
+        // values for A's parameters.
         nnops::test::XorShift128 rng_b(2);
         const int64_t b_rows = tb ? N : K;
         const int64_t b_cols = tb ? K : N;
@@ -1965,9 +1895,8 @@ struct DqCase {
             std::fill(zp_b.begin(), zp_b.end(), b_zp);
             qb.zero_point_data = zp_b.data();
         } else {
-            // One zp for the whole tensor, no per-channel array: the
-            // compensation's per-element half is then a row constant.
-            // num_scales still describes the per-channel scales above.
+            // One zp for the whole tensor, no per-channel array: the per-element
+            // half becomes a row constant (num_scales still describes the scales).
             qb.zero_point = b_zp;
         }
 
@@ -1983,7 +1912,7 @@ struct DqCase {
             }
         }
 
-        // --- views (compact pitches) ---
+        // views (compact pitches)
         const int64_t as[] = {M, K};
         const int64_t bs[] = {b_rows, b_cols};
         const int64_t cs[] = {M, N};
@@ -2016,8 +1945,8 @@ GeMMReport run_geMM_dq(DqCase<T>& dc, const char* name,
     attrs.act_quant_dtype = dc.act_dt;
     auto op = MatMul::create(attrs, Backend::CPU);
 
-    // The backend plans off the compact A_q desc, so mirror that here: the
-    // reported tile sizes and split direction are the ones that actually run.
+    // The backend plans off the compact A_q desc, so the reported tiles are the
+    // ones that actually run.
     const int meta_threads = *std::max_element(threads.begin(), threads.end());
     const cpu::MatMulPlan plan =
         cpu::get_matmul_plan(attrs, dc.aq.desc(), dc.b.desc(), meta_threads);
@@ -2075,11 +2004,9 @@ void bench_dq_case(const char* name, int64_t M, int64_t K, int64_t N,
     print_report(run_geMM_dq(dc, name, threads, iters));
 }
 
-/// One dq problem per shape, all thread counts, as a table — the counterpart of
-/// `sweep_i8`, so the two tables can be read side by side. Every row includes
-/// the quantize pass and the dequantizing epilogue, which is what makes the
-/// per-size gap against `matmul_i8_size_sweep` the cost of the fp activation
-/// boundary rather than of the GEMM.
+/// Table counterpart of `sweep_i8`. Every row includes the quantize pass and the
+/// dequantizing epilogue, so the per-size gap against `matmul_i8_size_sweep` is
+/// the fp activation boundary, not the GEMM.
 template <typename T>
 void sweep_dq(const char* tag, const std::vector<SweepShape>& shapes,
               const std::vector<int>& threads, double target_ms,
@@ -2119,10 +2046,8 @@ void sweep_dq(const char* tag, const std::vector<SweepShape>& shapes,
     }
 }
 
-/// Interleaved A/B: the same A and the same weight values, once as dense fp B
-/// (the fp route) and once as s8 B (the dq route). Reports dq/fp — the ratio is
-/// what the quantization pass and the smaller B have to pay for against a
-/// wider GEMM, so >1 means the dq route is the faster way to get these numbers.
+/// Same A and same weight values, once as dense fp B and once as s8 B. Reports
+/// dq/fp; >1 means dq is the faster way to get these numbers.
 template <typename T>
 void bench_dq_vs_fp_ab(int64_t M, int64_t K, int64_t N, bool tb = false,
                        QuantGranularity gran = QuantGranularity::PerToken,
@@ -2165,8 +2090,8 @@ void bench_dq_vs_fp_ab(int64_t M, int64_t K, int64_t N, bool tb = false,
 
     std::vector<double> vd, vf;
     for (int r = 0; r < rounds; ++r) {
-        // Alternate which route is measured first: the one measured second
-        // inherits the other's cache state and reads slower.
+        // Alternate which route goes first: the second inherits the other's
+        // cache state and reads slower.
         const bool dq_first = (r % 2) == 0;
         const double t1 = dq_first ? time_dq() : time_fp();
         const double t2 = dq_first ? time_fp() : time_dq();
@@ -2185,10 +2110,8 @@ void bench_dq_vs_fp_ab(int64_t M, int64_t K, int64_t N, bool tb = false,
                 md, mf, md / mf);
 }
 
-/// PerTensor vs PerToken parameters over identical tensors. The GEMM, the
-/// quantize pass and the output pass are the same code; the only difference is
-/// whether the epilogue broadcasts one (scale, zp) or loads a per-row vector,
-/// so the ratio isolates that.
+/// PerTensor vs PerToken over identical tensors: the only difference is whether
+/// the epilogue broadcasts one (scale, zp) or loads a per-row vector.
 template <typename T>
 void bench_dq_granularity_ab(int64_t M, int64_t K, int64_t N,
                              int rounds = 3, double budget_ms = 150.0) {
@@ -2235,22 +2158,19 @@ void bench_dq_granularity_ab(int64_t M, int64_t K, int64_t N,
                 mt, mn, mt / mn);
 }
 
-// ---- dq point cases -------------------------------------------------------
-
 NNOPS_BENCH(matmul_dq_f32_nn_large) {
-    // The main case: a prefill-sized activation against a W8A8 weight.
     bench_dq_case<float>("dq/f32 nn 1024x512x1024", 1024, 512, 1024);
 }
 
 NNOPS_BENCH(matmul_dq_f32_tb_large) {
-    // LLM-style A @ W^T: the weight is stored [N][K], as a checkpoint loads it.
-    // The per-channel scale still indexes the output column.
+    // A @ W^T from a checkpoint ([N][K]); the per-channel scale still indexes the
+    // output column.
     bench_dq_case<float>("dq/f32 tb 1024x512x1024", 1024, 512, 1024, /*tb=*/true);
 }
 
 NNOPS_BENCH(matmul_dq_f32_nn_256) {
-    // Smallest useful shape: the quantize pass (M×K) and the dequantize pass
-    // (M×N) are a much larger share of the call than at 1024x512x1024.
+    // Smallest useful shape: the quantize (M×K) and dequantize (M×N) passes are a
+    // much larger share.
     bench_dq_case<float>("dq/f32 nn 256^3", 256, 256, 256);
 }
 
@@ -2263,8 +2183,8 @@ NNOPS_BENCH(matmul_dq_f32_tb_256) {
 }
 
 NNOPS_BENCH(matmul_dq_f32_odd_n) {
-    // N=1000 is not a multiple of nc (240) or of the 16-wide B panel, so the
-    // last n-block runs the masked pack and the epilogue's scalar tail.
+    // N=1000 is not a multiple of nc or of the 16-wide B panel, so the last
+    // n-block runs the masked pack and the epilogue's scalar tail.
     bench_dq_case<float>("dq/f32 nn 1024x512x1000", 1024, 512, 1000);
 }
 
@@ -2289,8 +2209,7 @@ NNOPS_BENCH(matmul_dq_f16_tb) {
 }
 
 NNOPS_BENCH(matmul_dq_u8_act_large) {
-    // u8 activations (zp=128): on x86 the pack folds no bias, on aarch64 the
-    // u8→s8 pack XORs — either way the epilogue is unchanged.
+    // u8 activations (zp=128): the materialized-A_q path.
     bench_dq_case<float>("dq/u8act nn 1024x512x1024", 1024, 512, 1024,
                          /*tb=*/false, QuantGranularity::PerToken, DataType::u8);
 }
@@ -2308,13 +2227,11 @@ NNOPS_BENCH(matmul_dq_per_tensor_large) {
 }
 
 /// The weight zero point: 0 (a per-channel array of zeros, the symmetric
-/// checkpoint layout) against one non-zero zp for the tensor. Both arms carry a
-/// u8 activation, so the column half of the compensation is live in both and
-/// only the row half differs — the folded one. That is the whole point of the
-/// fold: the term is a row constant, so it is applied once per output row
-/// (into a per-row int32) instead of once per element, and the A reduction
-/// skips nothing it still needs. A non-zero-zp arm slower than its twin means
-/// the per-element term or the B sweep came back.
+/// checkpoint layout) against one non-zero zp for the tensor, both with a u8
+/// activation, so the column half of the compensation is live on both sides and
+/// only the row half — the folded one — differs. The fold applies a row constant
+/// once per output row instead of once per element; a non-zero-zp arm slower
+/// than its twin means the per-element term or the B sweep came back.
 template <typename T>
 void bench_dq_weight_zp_ab(int64_t M, int64_t K, int64_t N, bool tb, int nt,
                            DataType act_dt = DataType::u8, int32_t b_zp = -5,
@@ -2378,20 +2295,17 @@ void bench_dq_weight_zp_ab(int64_t M, int64_t K, int64_t N, bool tb, int nt,
 }
 
 NNOPS_BENCH(matmul_dq_weight_zp_ab) {
-    // 256^3 on one thread: the output pass is a real share of the call. (At 4T
-    // a call this short is all pool spawn — see the file header.)
+    // 256^3 on one thread: the output pass is a real share of the call.
     bench_dq_weight_zp_ab<float>(256, 256, 256, /*tb=*/false, 1);
-    // The measured shape, both thread counts: the fold's per-row work is
-    // amortized over a full-size GEMM here, so the ratio should sit at 1.
+    // Full-size GEMM: the fold's per-row work is amortized, so the ratio should
+    // sit at 1.
     bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 1);
     bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 4);
-    // Decode: one output row, so the A sweep the fold keeps is O(K) and the
-    // per-element term it retires is O(N) — the shape where a stale B sweep
-    // would be pure overhead.
+    // Decode: the A sweep the fold keeps is O(K), the per-element term it
+    // retires is O(N).
     bench_dq_weight_zp_ab<float>(1, 4096, 4096, /*tb=*/true, 1);
     // Per-channel asymmetric weights under symmetric activations: no fold (it
-    // needs one zp_b), but the column half is identically zero, so B is not
-    // swept at all — the mirror image of the u8 rows above.
+    // needs one zp_b), but the column half is zero, so B is never swept.
     bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 1, DataType::s8, -5,
                                  /*b_zp_per_channel=*/true);
     bench_dq_weight_zp_ab<float>(1024, 512, 1024, /*tb=*/true, 4, DataType::s8, -5,
@@ -2399,8 +2313,7 @@ NNOPS_BENCH(matmul_dq_weight_zp_ab) {
 }
 
 NNOPS_BENCH(matmul_dq_vs_fp_ab_nn) {
-    // The reason the route exists: same A, same weight values, s8 B vs a dense
-    // B. Read the ratio, not the absolute GFLOPS.
+    // Same A, same weight values: s8 B vs a dense B. Read the ratio.
     for (int nt : {1, 4}) {
         bench_dq_vs_fp_ab<float>(1024, 512, 1024, /*tb=*/false,
                                  QuantGranularity::PerToken, nt);
@@ -2418,17 +2331,15 @@ NNOPS_BENCH(matmul_dq_vs_fp_ab_f16) {
 }
 
 NNOPS_BENCH(matmul_dq_vs_fp_sweep) {
-    // The same comparison as a table over the square ladder: dq/dense is the
-    // shape of the route's value, and it moves with the B footprint (B is
-    // 4x smaller as s8, so the win grows until the GEMM stops being
-    // bandwidth bound and shrinks again once both fit in cache).
+    // The same comparison as a table over the square ladder: dq/dense moves with
+    // the B footprint (B is 4x smaller as s8), so the win grows until the GEMM
+    // stops being bandwidth bound and shrinks once both fit in cache.
     const std::vector<int64_t> sizes{128, 256, 384, 512, 768, 1024, 1536};
     std::printf("  dq vs dense f32-act  nn  budget=100 ms/cell   (GFLOPS)\n");
     std::printf("   %5s | %9s %9s %7s | %9s %9s %7s\n", "size",
                 "dq 1T", "f32 1T", "dq/f32", "dq 4T", "f32 4T", "dq/f32");
-    // Caveat for the 4T columns: BenchPool spawns its workers per call, and dq
-    // issues one more ctx.cpu.run than the fp route, so below ~768 the 4T ratio
-    // measures pool start-up. The 1T ratio is the honest curve.
+    // Below ~768 the 4T ratio is pool start-up (dq issues one more
+    // ctx.cpu.run); the 1T ratio is the honest curve.
     for (int64_t S : sizes) {
         DqCase<float> dc(S, S, S, /*tb=*/false, QuantGranularity::PerToken, DataType::s8);
         MatMulAttributes a_dq{};
@@ -2454,9 +2365,8 @@ NNOPS_BENCH(matmul_dq_vs_fp_sweep) {
 }
 
 NNOPS_BENCH(matmul_dq_size_sweep) {
-    // The square ladder of matmul_i8_size_sweep, so the two tables read side by
-    // side: the gap at each size is the quantize pass plus the int32
-    // accumulator round trip.
+    // matmul_i8_size_sweep's ladder, so the two tables read side by side; the gap
+    // at each size is the quantize pass plus the int32 accumulator round trip.
     sweep_dq<float>("f32", {
         {128, 128, 128},    {192, 192, 192},    {256, 256, 256},   {384, 384, 384},
         {512, 512, 512},    {768, 768, 768},    {1024, 1024, 1024},
@@ -2482,9 +2392,8 @@ NNOPS_BENCH(matmul_dq_f16_size_sweep) {
 }
 
 NNOPS_BENCH(matmul_dq_rect_sweep) {
-    // Rectangles rather than cubes: the corners where one dimension is 1 or far
-    // from the tile size, so the plan changes shape (M-split vs N-split, a
-    // single k-block vs many).
+    // Rectangles, not cubes: corners where one dimension is 1 or far from the
+    // tile size, so the plan changes shape.
     sweep_dq<float>("f32", {
         {1, 512, 4096},   {1, 4096, 4096},   {16, 4096, 4096},  {64, 4096, 4096},
         {1024, 256, 64},  {1024, 512, 1000}, {128, 512, 4096},  {4096, 256, 256},
@@ -2497,9 +2406,9 @@ NNOPS_BENCH(matmul_dq_granularity_ab) {
 }
 
 NNOPS_BENCH(matmul_dq_quantize_only) {
-    // The quantize pass on its own, against the full dq call on the same
-    // shape: how much of a call the fp→int8 conversion is. If this share ever
-    // matters, the pass folds into A's pack (see skills/how_to_optimize_gemm.md).
+    // The quantize pass alone against the full dq call on the same shape: how
+    // much of a call the fp→int8 conversion is. If this share ever matters, the
+    // pass folds into A's pack (see skills/how_to_optimize_gemm.md).
     constexpr int64_t M = 1024, K = 512, N = 1024;
     std::vector<float>  src(static_cast<size_t>(M * K));
     std::vector<int8_t> dst(src.size());
@@ -2535,9 +2444,9 @@ NNOPS_BENCH(matmul_dq_quantize_only) {
 NNOPS_BENCH(matmul_dq_m_ladder) {
     // Decode-to-prefill sweep. At small M both routes stream B and the dq side
     // wins only on B's width — it has no GEMV kernel, so it runs the tiled GEMM
-    // for one row — which is why the ratio sits near 1.2 until M is large
-    // enough for the int8 FLOP rate to matter (K=N=2048 keeps B at 4 MB: out of
-    // L2, in L3). Measured on the dev host: 1.2, 1.2, 2.6, 2.9, 3.4, 3.6.
+    // for one row — hence a ratio near 1.2 until M is large enough for the int8
+    // FLOP rate to matter (K=N=2048 keeps B at 4 MB: out of L2, in L3). On the
+    // dev host the ratios climb 1.2, 1.2, 2.6, 2.9, 3.4, 3.6.
     const std::vector<int64_t> ms{1, 4, 16, 64, 256, 1024};
     for (int64_t M : ms) {
         bench_dq_vs_fp_ab<float>(M, 2048, 2048, /*tb=*/false,
@@ -2550,14 +2459,12 @@ NNOPS_BENCH(matmul_dq_m_ladder) {
 // Size and shape sweeps — where the thread pool starts to pay
 // ============================================================
 //
-// Same binary, same shapes as above but read as a table instead of one case at
-// a time: the point cases answer "which route", these answer "at what size".
-// Everything is capped at 2048^3.
+// Same binary, read as a table: the point cases answer "which route", these
+// answer "at what size". Everything is capped at 2048^3.
 
 NNOPS_BENCH(matmul_f32_size_sweep) {
     // Square, doubling-ish from 64 to the 2048 cap. The left end is where the
-    // pool has nothing to hand out (256^3 = 2 M-blocks, which is why its point
-    // case reads 0.48x at 20T) and the right end is past L2/L3.
+    // pool has nothing to hand out (256^3 = 2 M-blocks), the right end past L2/L3.
     sweep_fp<float>("f32", {
         {64, 64, 64},       {96, 96, 96},       {128, 128, 128},   {192, 192, 192},
         {256, 256, 256},    {384, 384, 384},    {512, 512, 512},   {768, 768, 768},
@@ -2566,9 +2473,8 @@ NNOPS_BENCH(matmul_f32_size_sweep) {
 }
 
 NNOPS_BENCH(matmul_f32_shape_sweep) {
-    // Asymmetric shapes, each isolating one axis as the one that has to carry
-    // the parallelism. M=1 decode is the extreme: there is no M to split at
-    // all, so the block count is whatever N yields.
+    // Asymmetric shapes, each isolating one axis as the one that must carry the
+    // parallelism; at M=1 the block count is whatever N yields.
     sweep_fp<float>("f32", {
         {1, 2048, 2048},      // decode: one token, M is not a splittable axis
         {16, 2048, 2048},     // small-batch decode
@@ -2589,9 +2495,8 @@ NNOPS_BENCH(matmul_f16_size_sweep) {
 }
 
 NNOPS_BENCH(matmul_i8_size_sweep) {
-    // The int8 point case 256^3 collapses to 0.08x at 20T (mc=24, nc=240, 11
-    // blocks — the kc budget shrinks the tiles as the pool grows). This walks
-    // the same curve at a size where the tiles have room as well.
+    // The int8 point case 256^3 collapses at 20T (the kc budget shrinks the tiles
+    // as the pool grows); this walks the same curve where the tiles have room.
     sweep_i8({
         {128, 128, 128},    {192, 192, 192},    {256, 256, 256},   {384, 384, 384},
         {512, 512, 512},    {768, 768, 768},    {1024, 1024, 1024},
@@ -2611,8 +2516,7 @@ NNOPS_BENCH(matmul_q4_size_sweep) {
 
 NNOPS_BENCH(matmul_q4_decode_sweep) {
     // Decode-shaped rows: M stays small while K and N grow, so B is the whole
-    // working set and the weight-BW line is the real limit. The M ladder at
-    // fixed 4096^2 shows where the decode cost stops dominating.
+    // working set and the weight-BW line is the real limit.
     sweep_q4<float>("f32 decode", {
         {1, 1024, 1024},  {1, 2048, 2048},  {1, 4096, 4096},
         {16, 4096, 4096}, {64, 4096, 4096}, {256, 4096, 4096},
@@ -2678,15 +2582,12 @@ NNOPS_BENCH(matmul_q4_decode_rate) {
 // ---- bias A/B --------------------------------------------------------------
 //
 // A biased call costs the kernels nothing: matmul_cpu strips the activation (and
-// the Relu/Relu6 clamp fold) from the attrs it dispatches with, runs the bare
-// product, then sweeps C once with epilogue_inplace(bias, activation). The price
-// is that one extra read-modify-write pass over M×N plus a third input span —
-// invisible next to a large GEMM, and only worth measuring at decode shapes,
-// where M×N output traffic is comparable to the arithmetic.
-//
-// The four variants share the operands and alternate round by round in one
-// process, so `bias/plain` is a real ratio and not a thermal artifact (see the
-// route A/B note above for how far this host drifts between separate runs).
+// the Relu/Relu6 fold) from the attrs it dispatches with, runs the bare product,
+// then sweeps C once with epilogue_inplace(bias, activation). The price is one
+// extra read-modify-write pass over M×N plus a third input span — invisible next
+// to a large GEMM, worth measuring only at decode shapes. The four variants
+// alternate round by round in one process, so bias/plain is not a thermal
+// artifact.
 
 template <typename T>
 struct BiasAB {
@@ -2794,12 +2695,10 @@ void bench_bias_ab(const char* tag, int64_t M, int64_t K, int64_t N,
 
 // ---- alpha A/B -------------------------------------------------------------
 //
-// On the tiled route alpha is folded into the RHS pack — every k-block of the
-// panel is scaled, so the dot product comes out scaled and the MMA never sees
-// it. The small-M kernels have no pack to ride, so they scale the finished
-// accumulator instead: one multiply per output element, which is what a decode
-// shape (M=1) measures. Variants alternate round by round in one process, as
-// with the bias A/B.
+// On the tiled route alpha folds into the RHS pack, so the dot product comes out
+// scaled and the MMA never sees it. The small-M kernels have no pack to ride and
+// scale the finished accumulator instead: one multiply per output element, which
+// is what M=1 measures.
 
 template <typename T>
 struct AlphaAB {
@@ -2903,9 +2802,8 @@ NNOPS_BENCH(matmul_alpha_ab) {
 }
 
 NNOPS_BENCH(matmul_bias_ab) {
-    // Decode / prefill / square, then Linear's transposed-weight layout. `iters`
-    // is scaled so each timing lands in the 50-250 ms range: the output-pass
-    // delta is what we are after and it would drown in a 2 ms sample.
+    // Decode / prefill / square, then Linear's transposed layout. `iters` keeps
+    // each timing at 50-250 ms; the output-pass delta drowns in a 2 ms sample.
     bench_bias_ab<float>("f32", 1, 4096, 4096, false, 6, 30);
     bench_bias_ab<float>("f32", 128, 4096, 4096, false, 6, 4);
     bench_bias_ab<float>("f32", 1024, 1024, 1024, false, 6, 8);

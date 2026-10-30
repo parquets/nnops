@@ -2,19 +2,14 @@
 /// @file quant_linear.hpp
 /// @brief QuantizeLinear / DequantizeLinear operators.
 ///
-/// QuantizeLinear:  float (f32/f16) → integer (s8/u8)
-///   y = clamp(round(x / scale) + zero_point, type_min, type_max)
+/// QuantizeLinear:   y = clamp(round(x / scale) + zero_point, type_min, type_max)
+/// DequantizeLinear: y = (x - zero_point) * scale
 ///
-/// DequantizeLinear: integer (s8/u8) → float (f32/f16)
-///   y = (x - zero_point) * scale
-///
-/// Three granularities — PerTensor, PerToken, PerChannel — selected by the
-/// `axis` attribute and the scale shape (matching ONNX conventions).
-/// See QuantLinearAttributes::axis for the exact rules.
-///
-/// Supported layouts: NCHW, NCDHW, NCHWC8, NCDHWC8
-/// Supported float types: f32, f16
-/// Supported integer types: s8, u8
+/// Three granularities — PerTensor, PerToken, PerChannel — picked from the
+/// scale shape and `axis` (ONNX conventions); see resolve_quant_granularity.
+/// Layout-agnostic: the kernels treat the tensor as a flat row-major numel()
+/// array, so packed and planar are not distinguished. Floats f32/f16;
+/// integers s8/u8.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -27,35 +22,19 @@
 
 namespace nnops {
 
-/// Attributes shared by QuantizeLinear and DequantizeLinear.
 struct QuantLinearAttributes {
-    /// Quantization axis — selects the granularity of scale/zero_point:
-    ///
-    ///   -1 (default): PerToken — one (scale, zero_point) per ROW. The last
-    ///                 (innermost) dimension is the quantization unit: every
-    ///                 element in the same row shares one parameter, different
-    ///                 rows do not. For x of shape [..., H], scale/zero_point
-    ///                 have numel(x)/H entries. Activation-quantization mode.
-    ///
-    ///   >= 0:         PerChannel — one (scale, zero_point) per channel along
-    ///                 `axis` (shape[axis] entries), broadcast across all other
-    ///                 dims. WEIGHTS ONLY: reserved for weight tensors.
-    ///
-    ///   When scale/zero_point are scalars (numel == 1), the result is
-    ///   PerTensor regardless of `axis`.
+    /// -1: PerToken — one param per innermost row (for [..., H], numel/H
+    ///     entries). >= 0: PerChannel — one param per index along `axis`,
+    ///     broadcast over the rest; intended for weights. A scalar scale
+    ///     (numel == 1) is PerTensor regardless of `axis`.
     int64_t axis = -1;
 
-    /// For QuantizeLinear: output integer type (s8 or u8).
-    /// For DequantizeLinear: output float type (f32 or f16); anything else
-    /// resolves to f32 at construction.
+    /// QuantizeLinear: output integer type (s8/u8). DequantizeLinear: output
+    /// float type (f32/f16; anything else resolves to f32 at construction).
     DataType output_dtype = DataType::s8;
 };
 
-/// Resolve the effective quantization granularity from the scale tensor and
-/// the `axis` attribute:
-///   - scalar scale (numel <= 1)  → PerTensor
-///   - axis < 0                   → PerToken  (per-row, last dim)
-///   - axis >= 0                  → PerChannel (per-axis, weights only)
+/// Scalar scale → PerTensor, axis < 0 → PerToken, else PerChannel.
 inline QuantGranularity resolve_quant_granularity(const TensorView& scale,
                                                   int64_t axis) {
     if (scale.numel() <= 1) {
@@ -64,15 +43,7 @@ inline QuantGranularity resolve_quant_granularity(const TensorView& scale,
     return (axis < 0) ? QuantGranularity::PerToken : QuantGranularity::PerChannel;
 }
 
-/// QuantizeLinear operator.
-///
-/// Inputs:
-///   [0] x:           input tensor (f32 or f16)
-///   [1] y_scale:     scale tensor (f32, scalar or 1D per-channel)
-///   [2] y_zero_point: zero_point tensor (s8 or u8, same shape as y_scale)
-///
-/// Output:
-///   y: quantized tensor (s8 or u8, same shape as x)
+/// x (f32/f16), y_scale (f32), y_zero_point (s8/u8) → y (s8/u8).
 class QuantizeLinear : public OpBase {
 public:
     static std::unique_ptr<QuantizeLinear> create(
@@ -111,15 +82,7 @@ private:
     Backend backend_;
 };
 
-/// DequantizeLinear operator.
-///
-/// Inputs:
-///   [0] x:            input tensor (s8 or u8)
-///   [1] x_scale:      scale tensor (f32, scalar or 1D per-channel)
-///   [2] x_zero_point:  zero_point tensor (s8 or u8, same shape as x_scale)
-///
-/// Output:
-///   y: dequantized tensor (f32 or f16, same shape as x)
+/// x (s8/u8), x_scale (f32), x_zero_point (s8/u8) → y (f32/f16).
 class DequantizeLinear : public OpBase {
 public:
     static std::unique_ptr<DequantizeLinear> create(

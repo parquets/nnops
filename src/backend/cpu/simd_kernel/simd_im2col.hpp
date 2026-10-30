@@ -1,48 +1,39 @@
 #pragma once
 /// @file simd_im2col.hpp
-/// @brief SIMD im2col kernels — the "unrolled input" step of im2col+GEMM conv.
+/// @brief SIMD im2col gathers — the gathered operand of a conv-as-GEMM.
 ///
-/// Five kernels build the gathered operand of a conv-as-GEMM — three for the
-/// planar routes (NCHW Conv2D, NCDHW Conv3D) and two for the channel-last one:
-///   tiled_im2col_2d         — NCHW  Conv2D: col_data[ic*karea2d][roi_h*roi_w]
-///   tiled_im2col_2d_packed  — the same gather, written straight into the
-///                             uniform packed-B panels (fused im2col + pack);
-///                             the panel width is a template parameter, so a
-///                             full panel row is an unrolled store sequence
-///   tiled_im2col_3d         — NCDHW Conv3D: col_data[ic*karea3d][roi_d*roi_h*roi_w]
-///   tiled_im2col_nhwc       — NHWC  Conv2D: a_tile[pixel][tap*icnc + ic]
-///   tiled_im2col_nhwc_i8    — the same gather, into s8 (or a dst of the
-///                             caller's int8 type) for the quantized route
+/// Two families:
+///  - planar (NCHW Conv2D, NCDHW Conv3D): one row per (ic, tap), the row
+///    spanning the current output block (the roi). tiled_im2col_2d writes a
+///    row-major col matrix [ic*karea][roi_area]; tiled_im2col_2d_packed writes
+///    the same values straight into the uniform NR-wide B panels the MMA
+///    consumes (column n of k row at dst[(n/NR)*ldd + k*NR + n%NR]), dropping
+///    the materialize-then-pack round trip. Out-of-input positions store `pad`.
+///  - channel-last (NHWC Conv2D): one row per output pixel, k tap-major
+///    (k = tap*icnc + ic). A tap is a contiguous channel run, so a row is
+///    karea straight copies — the same access the 1x1 route reads for free —
+///    and that order is the weight's own (HWIO), so the ordinary panel packer
+///    reads B. Adjacent taps of one filter row merge into a single KW*icnc span
+///    when DW == 1 and ic_stride == icnc. tiled_im2col_nhwc_i8 is the same
+///    gather into s8 for the quantized route: bytes in, XORed by `xr`, the zero
+///    point as `pad`, and the k tail zeroed to kdim4 for the direct-A MMA.
 ///
-/// On the planar routes each row of the gathered operand is one
-/// (ic, kd, kh, kw) and holds the input spatial positions across the current
-/// output block (the roi). Positions that fall outside the input (padding) are
-/// zero-filled.
+/// Address arguments are element strides, not bytes: icn_step between input
+/// channels, ih_step between input rows (the padded row pitch), plus id_step
+/// between depth slices on the 3D route. `pad` / `pad_value` is 0 on the fp
+/// routes and the activation zero point on the pre-quantized one.
 ///
-/// Padding convention (mirrors nn_compute tiled_im2col_2d):
-///   * *local* padding — the padding remaining inside this block (roi_pad_*)
-///     — determines where the valid region *starts* (the `*_beg` bounds).
-///   * *global* padding — the operator's padding (PD/PH/PW) — determines where
-///     the valid region *ends* (`*_end` bounds) and the actual input addressing
-///     (`id_paded`/`ih_paded`/`iw_paded`).
+/// Padding: the *local* pad (the part inside this block) says where the valid
+/// region starts; the *global* pad (the operator's PD/PH/PW) says where it ends
+/// and what the input address is. Mixing them yields off-by-padding input rows
+/// on every block after the first.
 ///
-/// The channel-last pair flips those roles: one output pixel is one row and the
-/// k axis runs tap-major (k = tap × icnc + local_ic) within an input-channel
-/// block. A tap of a channel-last input is a contiguous channel run, so a gather
-/// is `karea` straight copies per row — the same copy the 1x1 route reads for
-/// free.
-///
-/// Mixing these up (using the local padding for the input addressing) produces
-/// off-by-padding input rows on every block after the first.
-///
-/// The innermost (width) copy uses an L-wide SIMD loop when stride_w == 1 (the
-/// dominant case); otherwise a scalar loop advancing by stride_w.
-///
-/// `tiled_im2col_2d` writes the input values through unchanged, with a
-/// configurable pad value. That is all the quantized Conv2D route needs: it
-/// quantizes an fp activation into a plane up front (conv2d_implicit_gemm.cpp,
-/// quantize_plane) and gathers bytes from then on, so no store policy other
-/// than "copy" is required.
+/// The fused pack zero-fills the columns past roi_area in the last panel,
+/// because the MMA reads all NR lanes of every panel row. A panel row is the
+/// unit of work, so it takes a compile-time store sequence: a dynamic-length
+/// loop cannot be unrolled, and it measured ~3x per row. Width copies use an
+/// L-wide SIMD loop at stride_w == 1 (the dominant case), a scalar stride_w
+/// loop otherwise.
 
 #include "backend/cpu/common/common_utils.hpp"
 #include "nnops/detail/half.hpp"
@@ -59,8 +50,7 @@ using namespace simd;
 
 namespace detail {
 
-/// Write @p n copies of @p pad at @p d. The zero case — every fp route — takes
-/// the memset path; the pre-quantized int8 route can pass a zero point.
+/// Write @p n copies of @p pad at @p d; the zero value takes the memset path.
 template <class T>
 inline void im2col_fill_pad(T* d, int n, T pad) noexcept {
     if constexpr (std::is_integral_v<T>) {
@@ -79,10 +69,8 @@ inline void im2col_fill_pad(T* d, int n, T pad) noexcept {
     }
 }
 
-/// Copy policy: write the gathered values (and `pad` outside the input)
-/// unchanged into a row-major [K][roi_area] col matrix. `pad` is the value
-/// standing in for a zero input sample, which is the activation zero point on
-/// the pre-quantized route.
+/// Copy policy: a row-major [K][roi_area] col matrix, `pad` outside the input
+/// (`pad` is the activation zero point on the pre-quantized route).
 template <class T>
 struct Im2colCopy {
     using src_t = T;
@@ -92,12 +80,11 @@ struct Im2colCopy {
     int roi_area;  ///< columns per k row
     T pad;
 
-    /// Columns [n0, n0+n) of k row.
     void fill(int k, int n0, int n) const noexcept {
         fill_run(col + static_cast<int64_t>(k) * roi_area + n0, n);
     }
 
-    /// Columns [n0, n0+n) of k row, gathered from @p s with @p step.
+    /// Columns [n0, n0+n) of k row, gathered from @p s with source stride @p step.
     void emit(int k, int n0, const T* s, int n, int step) const noexcept {
         emit_run(col + static_cast<int64_t>(k) * roi_area + n0, s, n, step);
     }
@@ -126,13 +113,8 @@ private:
 };
 
 /// Store one full panel row (NR elements) with a compile-time store count.
-/// A dynamic-length loop (`for (; i + L <= n; ...)` with n <= NR) cannot be
-/// unrolled and issues a scalar tail; measured on the fused gather it costs
-/// ~3x per panel row, and one panel row is the unit of work here.
-///
-/// NR is the arch's nr_max for T: 12 (f32, aarch64) does not divide the
-/// 8-lane vector, so it takes three 4-lane stores; 16 (f32 x86, f16) takes
-/// two 8-lane stores.
+/// NR is the arch's nr_max for T: 12 (aarch64 f32) does not divide the 8-lane
+/// vector, so it takes three 4-lane stores; 16 (x86 f32, f16) two 8-lane ones.
 template <class T, int NR>
 inline void pack_panel_zero(T* d) noexcept {
     constexpr int L = simd_lane_for<T>;
@@ -160,12 +142,10 @@ inline void pack_panel_copy(T* d, const T* s) noexcept {
     }
 }
 
-/// Scatter policy: write the gathered values straight into the uniform
-/// NR-wide B panels the MMA consumes (the layout tile_pack_rhs produces:
-/// column n of k row lives at dst[(n / NR) * ldd + k * NR + (n % NR)]), so
-/// the row-major col matrix is never materialized. A run of columns is cut at
-/// the panel boundaries; a piece that fills a whole panel row goes through the
-/// compile-time store, the two partial pieces at a run's ends stay dynamic.
+/// Scatter policy: the gathered values go straight into the uniform NR-wide B
+/// panels (tile_pack_rhs's layout), so the col matrix is never materialized.
+/// Runs are cut at panel boundaries — a whole panel row takes the compile-time
+/// store, the partial pieces at a run's ends stay dynamic.
 template <class T, int NR>
 struct Im2colPack {
     using src_t = T;
@@ -175,7 +155,6 @@ struct Im2colPack {
     int ldd;  ///< panel stride (elements)
     T pad;
 
-    /// Columns [n0, n0+n) of k row.
     void fill(int k, int n0, int n) const noexcept {
         if (n <= 0) { return; }
         int p   = n0 / NR;
@@ -198,7 +177,7 @@ struct Im2colPack {
         }
     }
 
-    /// Columns [n0, n0+n) of k row, gathered from @p s with @p step.
+    /// Columns [n0, n0+n) of k row, gathered from @p s with source stride @p step.
     void emit(int k, int n0, const T* s, int n, int step) const noexcept {
         if (n <= 0) { return; }
         int p   = n0 / NR;
@@ -240,9 +219,8 @@ private:
     }
 };
 
-/// The shared index/bounds walk: for every (channel, tap, roi row) it fills the
-/// padded faces and hands the valid run to the store policy, which decides
-/// where k row / column n lands.
+/// The shared walk over (channel, tap, roi row): fills the padded faces, hands
+/// each valid run to the Store policy.
 template <class Store>
 inline void im2col_2d_walk(
     const typename Store::src_t* input,
@@ -300,19 +278,8 @@ inline void im2col_2d_walk(
 
 }  // namespace detail
 
-/// 2D im2col for NCHW convolution.
-///
-/// Builds col_data[ic*karea][roi_w*roi_h] where karea = kernel_h*kernel_w and
-/// the roi is an output window at (roi_x, roi_y) of size roi_w×roi_h. Row
-/// (ic*karea + kh*kernel_w + kw) holds the spatial positions for that
-/// (channel, tap); positions outside the input hold @p pad_value.
-///
-/// Strides are in elements: icn_step between input channels, ih_step between
-/// input rows (the padded row pitch).
-///
-/// @p pad_value is what an out-of-input sample stores. It is 0 for the fp conv
-/// route; the pre-quantized activation route passes its activation zero point,
-/// since a quantized tensor represents the real value 0 as `zero_point`.
+/// NCHW Conv2D gather into the row-major col matrix
+/// col_data[ic*karea + kh*kernel_w + kw][roi_h*roi_w].
 template <class T>
 inline void tiled_im2col_2d(
     T* col_data, const T* input,
@@ -335,21 +302,10 @@ inline void tiled_im2col_2d(
                            detail::Im2colCopy<T>{col_data, roi_w * roi_h, pad_value});
 }
 
-/// 2D im2col that writes the uniform packed-B panels directly, fusing the
-/// gather with the pack step (tile_pack_rhs) the GEMM route would otherwise
-/// run: column n of k row lands at packed[(n/nr)*ldd + k*nr + (n%nr)].
-///
-/// The gather and the pack move the same elements, so materializing the
-/// row-major col matrix in between only adds a write and a re-read of the whole
-/// block — exactly the two passes the fused kernel drops. Columns past
-/// roi_area in the last panel are zero-filled, because the MMA loads all nr
-/// lanes of every panel row (tile_pack_rhs zero-fills them the same way).
-///
+/// The same gather into the packed-B panels, so the col matrix never exists.
 /// @p ldd is the panel stride in elements (mma_pack_align(NR*kdim*esz)/esz);
-/// @p NR is the panel width the MMA consumes for this dtype (nr_max_flt<T>),
-/// taken as a template parameter so a full panel row is a fixed, unrolled
-/// store sequence. The arguments from @p input on are identical to
-/// tiled_im2col_2d.
+/// @p NR is nr_max_flt<T>(). Columns past roi_area in the last panel are
+/// zero-filled, since the MMA loads all NR lanes of every panel row.
 template <class T, int NR>
 inline void tiled_im2col_2d_packed(
     T* packed, int ldd, const T* input,
@@ -371,9 +327,8 @@ inline void tiled_im2col_2d_packed(
                            kernel_h, kernel_w, stride_h, stride_w,
                            dilate_h, dilate_w, store);
 
-    // Tail of the last panel: the columns outside the ROI, which fill() above
-    // never reaches (it only walks [0, roi_area)). One panel's worth at most,
-    // NR - (roi_area % NR) per k row.
+    // Tail of the last panel: columns past the ROI, which the walk never
+    // reaches — NR - (roi_area % NR) per k row.
     const int roi_area = roi_w * roi_h;
     const int tail = roi_area % NR;
     if (tail != 0) {
@@ -384,20 +339,11 @@ inline void tiled_im2col_2d_packed(
     }
 }
 
-/// 3D im2col for NCDHW convolution.
-///
-/// Builds col_data[ic*karea3d][roi_d*roi_h*roi_w] where
-/// karea3d = kernel_d*kernel_h*kernel_w and the roi is an output window at
-/// (roi_od, roi_oh, roi_ow) of size roi_d×roi_h×roi_w. Row
-/// (ic*karea3d + (kd*kernel_h + kh)*kernel_w + kw) holds the spatial positions
-/// for that (channel, tap); positions outside the input are zero.
-///
-/// Unlike the 2D kernel (which zero-fills only the padded faces), this kernel
-/// zeroes the whole row then copies the valid interior — simpler and clearly
-/// correct for the 6-face/12-edge padding structure of a 3D block.
-///
-/// Strides are in elements: icn_step between input channels, id_step between
-/// input depth slices, ih_step between input rows.
+/// NCDHW Conv3D gather into
+/// col_data[ic*karea3d + (kd*kernel_h + kh)*kernel_w + kw][roi_d*roi_h*roi_w];
+/// out-of-input positions are zero. Unlike the 2D kernel, which fills only the
+/// padded faces, this one zeroes each row and copies the valid interior —
+/// simpler for the 6-face/12-edge padding of a 3D block.
 template <class T>
 inline void tiled_im2col_3d(
     T* col_data, const T* input,
@@ -434,7 +380,6 @@ inline void tiled_im2col_3d(
 
                     T* col_ptr = col_data + (ic * karea + (kd * kernel_h + kh) * kernel_w + kw) * roi_volume;
 
-                    // Zero the whole row, then copy the valid interior.
                     std::memset(col_ptr, 0, sizeof(T) * static_cast<size_t>(roi_volume));
 
                     int id_paded = (od_beg + roi_od) * stride_d - pad_d_global + ikd;
@@ -466,23 +411,11 @@ inline void tiled_im2col_3d(
 }
 
 // ---- channel-last (NHWC) gathers ------------------------------------------
-//
-// One output pixel becomes one A row; the k axis is tap-major within the ic
-// block: k = tap × icnc + (ic − icn). A tap of the channel-last input is a
-// contiguous channel run, so every tile row is written as karea straight copies
-// of `icnc` elements — the same access shape the 1x1 route gets for free.
-//
-// The order matters beyond the copy itself: it is also the weight's own order
-// (HWIO: [kh][kw][ic][oc]), which is what lets the B packer read the weight
-// through the ordinary panel packer instead of a transposing one.
 
 /// Gather one pixel tile of one ic block into A: row m is the patch of output
-/// pixel (oh, ow0 + m), k = tap × icnc + local_ic. @p in points at the block's
-/// first channel of pixel (0, 0); @p pad fills taps that fall outside the input.
-/// @p p0 is that pixel as a flat index (oh × OW + ow0) and @p flat lets the tile
-/// walk past the end of a row into the next one — legal only when the rows are
-/// dense, which is where a short plane stops paying MR granularity for tiles the
-/// width cannot fill.
+/// pixel (oh, ow0 + m). @p p0 is that pixel's flat index (oh × OW + ow0);
+/// @p flat walks the tile past a row end into the next, legal only because the
+/// rows are dense.
 template <class T>
 inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
                               const T* NNOPS_RESTRICT in,
@@ -494,9 +427,9 @@ inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
 {
     using namespace nnops::simd;
     constexpr int L = simd_lane_for<T>;
-    // A whole vector per step whenever the channel run is a multiple of the
-    // lane count — which every block of the ladder except a tail is. The
-    // element loop this replaces was as expensive as the GEMM it feeds.
+    // A whole vector per step when the channel run is a lane multiple — every
+    // ladder block but a tail. The element loop this replaces cost as much as
+    // the GEMM it feeds.
     const bool vec = (icnc % L) == 0;
     const float pad_f = [&] {
         if constexpr (std::is_same_v<T, float>) { return pad; }
@@ -504,9 +437,6 @@ inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
     }();
     const auto copy_run = [=](T* dst, const T* src) noexcept {
         if (!vec) {
-            // A short channel run (a tail block, the border taps of a narrow-IC
-            // layer) still copies as one block — the element loop this replaces
-            // was as expensive as the GEMM it feeds.
             if (src) { for (int j = 0; j < icnc; ++j) { dst[j] = src[j]; } }
             else     { for (int j = 0; j < icnc; ++j) { dst[j] = pad; } }
             return;
@@ -521,10 +451,9 @@ inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
 
     int64_t oh = p0 / OW;
     int ow = static_cast<int>(p0 - oh * OW);
-    // When every channel of a pixel is in this block and the taps of a filter row
-    // are adjacent, that row of taps is one run of `KW × icnc` elements in both
-    // the input and the A row — the k order is tap-major, which is exactly the
-    // input's own order. One copy per filter row instead of one per tap.
+    // With the whole channel block in hand and no dilation, the taps of one
+    // filter row are a single KW × icnc run in both the input and the A row —
+    // k is tap-major, the input's own order. One copy per row, not per tap.
     const bool tap_run = (DW == 1) && (ic_stride == icnc);
     const auto copy_span = [=](T* dst, const T* src, int n) noexcept {
         if (!src) {
@@ -584,16 +513,12 @@ inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
     }
 }
 
-/// The same gather for the quantized route: A is s8 bytes and the source is
-/// always *bytes* (a materialized plane is already s8, a pre-quantized
-/// activation is u8 or s8), with the A shift applied on the way through. @p xr
-/// is the XOR (+0x80 for a u8 source, 0 otherwise) that puts the byte in signed
-/// range, and @p pad is the zero point that fills taps outside the input. The k
-/// tail up to @p kdim4 is zeroed so the direct-A kernel — which reads whole
-/// 4-byte groups and must be handed a multiple of 4 — sees a zero product there
-/// (the B panel is zero-padded over the same range).
-///
-/// @p p0 / @p flat mean exactly what they do in the fp gather.
+/// The quantized twin: s8 A over a byte source with the shift applied on the
+/// way through — @p xr is the XOR (+0x80 for u8, 0 otherwise) that puts a byte
+/// in signed range, @p pad the zero point outside the input. The k tail to
+/// @p kdim4 is zeroed so the direct-A kernel, which reads whole 4-byte groups,
+/// sees a zero product there (the B panel is zero-padded over the same range).
+/// @p p0 / @p flat mean what they do in the fp gather.
 inline void tiled_im2col_nhwc_i8(int8_t* NNOPS_RESTRICT a, int lda,
                                  const uint8_t* NNOPS_RESTRICT in,
                                  int64_t in_row_stride, int64_t ic_stride,
@@ -603,13 +528,12 @@ inline void tiled_im2col_nhwc_i8(int8_t* NNOPS_RESTRICT a, int lda,
                                  int DH, int DW, int PH, int PW,
                                  int icnc, int karea, int kdim, int kdim4) noexcept
 {
-    // The channel run of one tap is the whole copy, and the block ladder hands
-    // it to us in whole 8-byte chunks (16 for every karea <= 9 filter): one
-    // 8-byte load/xor/store per chunk instead of a byte loop, which is what
-    // used to make the gather as expensive as the GEMM it feeds.
+    // The channel run of one tap is the whole copy; the 8- and 16-wide blocks
+    // take one 8-byte (two for 16) load/xor/store instead of a byte loop, which
+    // is what used to make the gather as expensive as the GEMM it feeds.
     const uint64_t xr64 = static_cast<uint64_t>(xr) * 0x0101010101010101ULL;
     const uint8_t pv   = static_cast<uint8_t>(pad ^ xr);
-    // @p src == nullptr fills the run with the padded value instead.
+    // src == nullptr fills the run with the padded value instead.
     const auto copy_run = [xr, xr64, pv, icnc](int8_t* dst, const uint8_t* src) noexcept {
         if (icnc == 16) {
             uint64_t a0 = 0, a1 = 0;
@@ -637,11 +561,9 @@ inline void tiled_im2col_nhwc_i8(int8_t* NNOPS_RESTRICT a, int lda,
         }
     };
 
-    // When every channel of a pixel is in this block and the taps of a filter row
-    // are adjacent in the input, that row of taps is one run in both the input
-    // and the A row (k is tap-major, the input's own order): one XOR copy per
-    // filter row instead of one per tap. The 3-channel stem is the case this
-    // exists for — 21 bytes a row instead of seven 3-byte runs.
+    // Same filter-row merge as the fp gather: one XOR copy per row instead of
+    // one per tap, which matters most when icnc is small and each per-tap run
+    // is only a few bytes.
     const bool tap_run = (DW == 1) && (ic_stride == icnc);
     const auto xor_span = [xr, xr64, pv](int8_t* dst, const uint8_t* src, int n) noexcept {
         int j = 0;

@@ -3,27 +3,25 @@
 /// @brief AArch64 NEON Q4_1 decode and packed-B kernels.
 ///
 /// Q4_1 is llama.cpp's affine 4-bit block format: 32 values in 20 bytes — an
-/// fp16 delta `d`, an fp16 minimum `m`, and 16 bytes of nibbles (low nibble of
-/// byte j is value j, high nibble is value j + 16). Value j is `d * q + m` with
-/// q in [0, 15]: two nibble vectors per block and an affine (d, m) decode, so
-/// a block covers 32 values in 20 bytes. The block layout and the portable
-/// scalar reference live in <nnops/detail/q4_1.hpp>.
+/// fp16 delta `d`, an fp16 minimum `m`, then 16 nibble bytes (byte j's low
+/// nibble is value j, its high nibble value j + 16). Value j is `d * q + m`
+/// with q in [0, 15]. The layout and the portable scalar reference live in
+/// <nnops/detail/q4_1.hpp>.
 ///
-/// `pack_q4_1_rhs` is the GEMM-side entry point: it fuses unpack + dequantize
-/// + f16 narrowing into the RHS panel pack, so a Q4_1 weight never passes
-/// through an intermediate dense buffer. It writes the same uniform
-/// `nr_max`-wide, `[k][nr]`-major panels the f32/f16 packers write, which is
-/// what lets MatMul treat a Q4_1 B as just another packed-B source — the MMA
-/// route knows nothing about the format.
+/// `pack_q4_1_rhs` is the GEMM-side entry point: it fuses decode + the f16
+/// narrowing into the RHS panel pack, so a Q4_1 weight never passes through an
+/// intermediate dense buffer. It writes the same uniform `nr_max`-wide,
+/// `[k][nr]`-major panels the f32/f16 packers write, which is what lets MatMul
+/// treat a Q4_1 B as just another packed-B source — the MMA route knows nothing
+/// about the format. `scale` (MatMul's alpha) folds into each block's `d` and
+/// `m`: two multiplies per 32 values, not one per element.
 ///
-/// Unlike x86_64, whose f32 and f16 RHS panels are both 16 wide, AArch64's are
-/// nr_f32[0] = 12 and nr_f16[0] = 16, so the panel width here is a per element
-/// type constant rather than one number.
+/// The panel width is a per element type constant here: aarch64's nr_f32[0] is
+/// 12 and nr_f16[0] is 16, where x86_64 uses 16 for both.
 ///
-/// The pad lanes of a tail panel (past its live width) are zero-filled here,
-/// unlike the transposing f32/f16 packers, which alias the last live row: a
-/// Q4_1 decode has no row to alias, and the MMA kernels only store live
-/// columns anyway.
+/// A tail panel's lanes past its live width are zero-filled, unlike the
+/// transposing f32/f16 packers, which alias the last live row: a Q4_1 decode has
+/// no row to alias, and the MMA kernels only store live columns anyway.
 
 #include <arm_neon.h>
 
@@ -44,14 +42,7 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_from_bits;
 using nnops::backend::cpu::half_to_float;
 
-/// Decode one block into 32 f32 or f16 values (f16 rounds once per element).
-///
-/// The nibble bytes are widened once into four 8-lane halves of 16-bit quants,
-/// then each half is widened to 32-bit floats for the `q·d + m` FMA.
-///
-/// @param scale multiplies the whole block: the decode is `q·d + m`, so scaling
-///              `d` and `m` once per block scales all 32 values — MatMul's alpha
-///              without a per-element pass.
+/// Decode one block into 32 f32 or f16 values; f16 rounds once per element.
 template <class T>
 inline void decode_q4_1_block(const uint8_t* p, T* out,
                               float scale = 1.0f) noexcept {
@@ -75,7 +66,6 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
     const uint8x16_t lo = vandq_u8(qs, vdupq_n_u8(0x0F));
     const uint8x16_t hi = vshrq_n_u8(qs, 4);
 
-    // One group is eight consecutive values: q·d + m, then the f32 or f16 store.
     auto emit = [&](int g, uint16x8_t nib) {
         const float32x4_t v0 =
             vfmaq_f32(vm, vcvtq_f32_u32(vmovl_u16(vget_low_u16(nib))), vd);
@@ -97,23 +87,17 @@ inline void decode_q4_1_block(const uint8_t* p, T* out,
 }
 
 // =========================================================================
-//  Packed-B panels
+//  Packed-B panels — the uniform `nr_max`-wide panels the mrxncxkc kernels read
 // =========================================================================
-//
-// Panels are the uniform `nr_max`-wide kind the mrxncxkc MMA kernels read:
-// ceil(nc/nr_max) panels of `kc` rows, each row `nr_max` live lanes, all at
-// the caller's aligned panel stride `ldd` (elements). A tail panel's lanes
-// past its live width are zero-filled.
 
-/// Panel width the MatMul pack route uses on aarch64, per element type:
-/// nr_f32[0] = 12 for f32, nr_f16[0] = 16 for f16.
+/// Panel width per element type: nr_f32[0] (12) for f32, nr_f16[0] (16) for f16.
 template <class T>
 inline constexpr int q4_1_nr_max = std::is_same_v<T, float> ? nr_f32[0]
                                                              : nr_f16[0];
 
-/// Row-major B (phys [K][N]): panel columns [n_start, n_start + width) of rows
-/// [k_start, k_start + kc). A panel can straddle two 32-value blocks, so at
-/// most two block decodes feed one row. @p width is ignored when NR > 0.
+/// Row-major B (phys [K][N]): a panel is columns [n_start, +width) of rows
+/// [k_start, +kc); it straddles at most two 32-value blocks. Width is ignored
+/// when NR > 0.
 template <class T, int NR>
 void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
                           int k_start, int kc, int n_start, int width,
@@ -150,10 +134,9 @@ void pack_q4_1_copy_panel(T* out, const uint8_t* src, int64_t row_blocks,
     }
 }
 
-/// Transposed B (phys [N][K]): panel rows [n_start, n_start + width) of columns
-/// [k_start, k_start + kc). Each source row is swept linearly, so every block
-/// decode yields up to 32 consecutive k values — the efficient direction for
-/// Linear's [N][K] weights.
+/// Transposed B (phys [N][K]): panel rows [n_start, +width) of columns
+/// [k_start, +kc). Each source row is swept linearly, so one decode yields up
+/// to 32 consecutive k values — the efficient direction for Linear's weights.
 template <class T, int NR>
 void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
                            int k_start, int kc, int n_start, int width,
@@ -184,8 +167,7 @@ void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
         }
     }
 
-    // Lanes past the live width: never read, never stored to C, but keep the
-    // panel fully defined so the workspace is deterministic.
+    // Lanes past the live width never reach C, but zeroing them keeps the workspace deterministic.
     for (int k = 0; k < kc; ++k) {
         T* o = out + static_cast<int64_t>(k) * kPanel;
         for (int j = nb; j < kPanel; ++j) {
@@ -194,20 +176,9 @@ void pack_q4_1_trans_panel(T* out, const uint8_t* src, int64_t row_blocks,
     }
 }
 
-/// Pack the Q4_1 RHS into uniform panels for one k-block.
-///
-/// @param trans      true when B is physically [N][K], false for [K][N].
-/// @param n_start    first logical column of this tile.
-/// @param nc         live columns in the tile.
-/// @param k_start    first logical k of the k-block.
-/// @param kc         k length of the block.
-/// @param dst        first panel; panels advance by @p ldd elements.
-/// @param ldd        aligned panel stride in elements (nr_max * kc rounded).
-/// @param src        first block of the batch element's B.
-/// @param row_blocks 20-byte blocks per physical row (the B row pitch / 20).
-/// @param scale      MatMul alpha. It folds into each block's `d` and `m`
-///                   (two multiplies per 32 weights), so the pack itself does
-///                   no extra work per element.
+/// Pack one k-block of the Q4_1 RHS into uniform panels. @p trans means B is
+/// physically [N][K]; @p dst steps by @p ldd (64-byte-aligned nr_max * kc) per
+/// panel, and @p row_blocks is the B row pitch in 20-byte blocks.
 template <class T>
 void pack_q4_1_rhs(bool trans, int n_start, int nc, int k_start, int kc,
                    T* dst, int ldd, const void* src, int64_t row_blocks,

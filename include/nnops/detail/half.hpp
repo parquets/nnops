@@ -2,53 +2,42 @@
 /// @file half.hpp
 /// @brief IEEE 754 binary16 (half-precision) type and conversion utilities.
 ///
-/// On x86_64 this is a custom uint16_t wrapper with software conversion
-/// routines (used with F16C intrinsics in micro-kernels).
+/// On x86_64/generic, half is a uint16_t wrapper with software conversion
+/// routines (kernels pair it with F16C intrinsics). On AArch64 it is the native
+/// __fp16 and the compiler does the conversions.
 ///
-/// On AArch64, half is the native __fp16 type and conversions are trivial
-/// (the compiler handles fp16↔fp32 natively).
+/// Because `half(bits)` is a *numeric* conversion of the integer where half is
+/// __fp16, raw binary16 storage goes through half_from_bits() / half_to_bits(),
+/// which reinterpret the bits (memcpy on AArch64).
 
 #include <cstdint>
-
-// =========================================================================
-//  Architecture dispatch: native __fp16 (AArch64) vs uint16_t wrapper
-// =========================================================================
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(NNOPS_ARCH_AARCH64)
 
 namespace nnops::backend::cpu {
 
-/// @brief Half-precision floating-point value — native __fp16 on AArch64.
 using half = __fp16;
 
-/// @brief Convert a binary16 value to float32.
 inline float half_to_float(half h) noexcept {
     return static_cast<float>(h);
 }
 
-/// @brief Convert a float32 value to binary16.
 inline half float_to_half(float f) noexcept {
     return static_cast<__fp16>(f);
 }
 
-/// @brief Reinterpret a half as its IEEE 754 binary16 bit pattern.
 inline uint16_t half_to_bits(half h) noexcept {
     uint16_t bits;
     __builtin_memcpy(&bits, &h, sizeof(bits));
     return bits;
 }
 
-/// @brief Build a half from its IEEE 754 binary16 bit pattern.
-///
-/// `half(bits)` would be a *numeric* conversion of the integer on AArch64
-/// (half is __fp16 there), so raw cache storage must be reinterpreted instead.
 inline half half_from_bits(uint16_t bits) noexcept {
     half h;
     __builtin_memcpy(&h, &bits, sizeof(bits));
     return h;
 }
 
-/// @brief Convert array of fp16 to fp32 / fp32 to fp16.
 inline void convert_half_to_float(float* dst, const half* src, int n) noexcept {
     for (int i = 0; i < n; ++i) {
         dst[i] = static_cast<float>(src[i]);
@@ -67,10 +56,8 @@ inline void convert_float_to_half(half* dst, const float* src, int n) noexcept {
 
 namespace nnops::backend::cpu {
 
-/// @brief Half-precision (binary16) value stored in a uint16_t.
-///
-/// This is a trivial wrapper so that overload resolution and type safety
-/// work for MMA/Pack dispatch on fp16. The raw bits follow IEEE 754.
+/// binary16 stored in a uint16_t: a distinct type so fp16 overload resolution
+/// and type safety work for MMA/Pack dispatch. The raw bits are IEEE 754.
 struct half {
     uint16_t bits;
 
@@ -78,8 +65,6 @@ struct half {
     explicit constexpr half(uint16_t b) noexcept : bits(b) {}
 };
 
-/// @brief Convert an IEEE 754 binary16 value to float32.
-///
 /// Handles normals, subnormals, zero, infinity, and NaN.
 inline float half_to_float(half h) noexcept {
     constexpr uint32_t magic_val = 113U << 23;
@@ -99,14 +84,12 @@ inline float half_to_float(half h) noexcept {
         o.f -= magic.f;  // renormalize subnormal
     }
 
-    o.u |= (static_cast<uint32_t>(h.bits) & 0x8000U) << 16;  // sign
+    o.u |= (static_cast<uint32_t>(h.bits) & 0x8000U) << 16;
     return o.f;
 }
 
-/// @brief Convert a float32 value to IEEE 754 binary16.
-///
-/// Rounds to nearest even. Handles overflow to infinity, subnormals,
-/// and NaN (canonicalized to qNaN, payload dropped).
+/// Rounds to nearest even; overflow goes to infinity and NaN is canonicalized
+/// to qNaN with its payload dropped.
 inline half float_to_half(float f) noexcept {
     constexpr uint32_t f32infty_u = 255U << 23;
     constexpr uint32_t f16max_u   = (127U + 16U) << 23;
@@ -121,7 +104,6 @@ inline half float_to_half(float f) noexcept {
 
     uint16_t bits;
     if (x.u >= f16max_u) {
-        // Inf or NaN: all exponent bits set
         bits = (x.u > f32infty_u) ? static_cast<uint16_t>(0x7e00)   // NaN → qNaN
                                   : static_cast<uint16_t>(0x7c00);  // Inf
     } else {
@@ -143,18 +125,14 @@ inline half float_to_half(float f) noexcept {
     return half{bits};
 }
 
-/// @brief Reinterpret a half as its IEEE 754 binary16 bit pattern.
 inline uint16_t half_to_bits(half h) noexcept {
     return h.bits;
 }
 
-/// @brief Build a half from its IEEE 754 binary16 bit pattern.
 inline half half_from_bits(uint16_t bits) noexcept {
     return half(bits);
 }
 
-/// @brief Convert array of fp16 to fp32 (scalar loop).
-/// @{
 inline void convert_half_to_float(float* dst, const half* src, int n) noexcept {
     for (int i = 0; i < n; ++i) {
         dst[i] = half_to_float(src[i]);
@@ -166,7 +144,6 @@ inline void convert_float_to_half(half* dst, const float* src, int n) noexcept {
         dst[i] = float_to_half(src[i]);
     }
 }
-/// @}
 
 }  // namespace nnops::backend::cpu
 

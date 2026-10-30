@@ -1,6 +1,13 @@
 #pragma once
 /// @file attention.hpp
-/// @brief Multi-head scaled dot-product Attention operator.
+/// @brief Multi-head scaled dot-product Attention.
+///
+/// scores = Q·Kᵀ·scale (+ mask, if given); output = softmax(scores, last dim)·V.
+/// Q/K/V arrive as [B, S, H·D] (reshaped internally to [B, H, S, D]) or already
+/// as [B, H, S, D]; inputs[0..2] = Q, K, V and inputs[3] = optional additive
+/// mask, flat [Sq, Sk] and shared by every batch and head. scale = 0 means
+/// 1/sqrt(head_dim). num_group is accepted but not implemented — K/V use
+/// num_heads (standard MHA). Planar layouts only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -14,35 +21,11 @@ namespace nnops {
 
 /// Attributes for the multi-head attention operator.
 struct AttentionAttributes {
-    /// Number of attention heads.
     int64_t num_heads = 8;
-
-    /// Scaling factor applied to QK^T before softmax.
-    /// If 0, auto-computed as 1/sqrt(head_dim).
     float scale = 0.0f;
-
-    /// Number of key-value head groups for GQA (Grouped Query Attention).
-    /// When 0 (default), equals num_heads (standard MHA).
-    /// When < num_heads, KV heads are shared across query head groups.
     int64_t num_group = 0;
 };
 
-/// Multi-head scaled dot-product Attention operator (class-based API).
-///
-/// Computes:
-///   scores = Q @ K^T * scale
-///   if mask provided: scores += mask
-///   attn_weights = softmax(scores, dim=-1)
-///   output = attn_weights @ V
-///
-/// Input layout (both supported):
-///   [B, S, H*D]  — merged heads, operator reshapes to [B, H, S, D] internally
-///   [B, H, S, D] — explicit per-head layout
-///
-/// inputs[0] = Q (query)
-/// inputs[1] = K (key)
-/// inputs[2] = V (value)
-/// inputs[3] = mask (optional, broadcastable to [B, 1, Sq, Sk] or [B, H, Sq, Sk])
 class Attention : public OpBase {
 public:
     static std::unique_ptr<Attention> create(const AttentionAttributes& attrs,

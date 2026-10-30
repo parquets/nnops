@@ -1,11 +1,48 @@
-/// Unit tests for MatMul operator — class API with CPU reference.
+/// @file test_matmul.cpp
+/// @brief MatMul operator tests — the class API against the CPU reference.
 ///
-/// All tests use the MatMul class interface:
+/// Most tests drive the public shape:
 ///   1. auto op = MatMul::create(attrs, Backend::CPU);
 ///   2. const TensorDesc arr[] = {a_desc, b_desc}; auto descs = op->getOutputTensorDesc(arr);
 ///   3. Validate descs[0].rank/dims/layout/dtype
 ///   4. Create output via nnops::test::make_planar(descs[0], buf.data())
 ///   5. const TensorView ins[] = {a, b}; op->compute(out, ins);
+/// The plan-only tests skip 1-5 and call get_matmul_plan directly;
+/// matmul_naive_kernel_layouts calls arch::matmul_naive the same way.
+///
+/// Oracles: reference::matmul_ref (f32; declared test-locally, following the
+/// test_concat.cpp pattern) and matmul_dq_ref, which backs only the fp-A
+/// dequantizing route. The hand-computed cases pin the elementwise contract
+/// independently of either: C = epilogue(alpha*A*B + bias + beta*C_old), with
+/// the bias between product and activation, and clamp and activation both on
+/// the finished sum. alpha scales the product alone; the int8 accumulator has no
+/// alpha of its own, so that route ignores it.
+///
+/// f16 is compared against the f32 reference on the same values with the
+/// arch-aware kF16AccumTol (x86 fp32 accumulators vs native fp16 on aarch64).
+/// matmul_f16_deep_k_accumulation bounds a 4096-long reduction relatively
+/// instead — max |ref| is ~80 there, so an absolute tolerance would not catch a
+/// broken accumulation.
+///
+/// Beyond elementwise results the file pins the CPU plan: the closed-form
+/// num_panels / num_panels_max against the stepwise loops they replace, the
+/// tile rule's four constraints, and that the packed-A region and N-split panels
+/// hold every tile a dispatch can hand the pack (the {8,4,1} panel decomposition
+/// is not monotonic in mc). Threading must be bit-identical to serial: blocks
+/// write disjoint C tiles and no reduction is reordered.
+///
+/// The prepacked-B (MatMul::prepackWeights) contract: an empty output view is a
+/// query whose answer is a rank-2 PackedB carrying no storage; a packed B must
+/// agree bit-for-bit with a raw B that also takes the tiled GEMM — same panels,
+/// same k-blocks, same accumulation order, only when the pack runs moves — and
+/// only approximately where the raw B would have taken a pack-free kernel. A
+/// blob has no K and no alpha slot, so wrong-K computes and alpha calls are
+/// refused.
+///
+/// Helpers: make_padded_f32 / make_matmul_inputs build wide-stride views with
+/// zero padding lanes, so a stray read of padding corrupts the comparison;
+/// SimplePool is a fixed-size claim-per-item pool injected through
+/// ComputeContext, riding the OpenMP adapter when the build has it.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/quant_params.hpp"
@@ -25,8 +62,6 @@
 
 using namespace nnops;
 
-// Reference kernels for comparison (test-local declarations, following the
-// test_concat.cpp pattern).
 namespace nnops::backend::cpu::reference {
 void matmul_ref(const MatMulAttributes& attrs,
                 TensorView& output,
@@ -40,25 +75,16 @@ void matmul_dq_ref(const MatMulAttributes& attrs,
                    void* workspace);
 }
 
-// f16 GEMM comparison tolerance: the arch-aware shared constant from
-// common/test_helpers.hpp (x86 fp32 accumulators vs aarch64 native fp16).
 using nnops::test::kF16AccumTol;
-
-// ============================================================
-// Basic 2D MatMul
-// ============================================================
 
 NNOPS_TEST(matmul_basic_2d) {
     // A: [2, 3], B: [3, 2]  →  C: [2, 2]
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
 
-    // A = [[1, 2, 3],
-    //      [4, 5, 6]]
+    // A = [[1, 2, 3], [4, 5, 6]]
     float a_data[6] = {1, 2, 3, 4, 5, 6};
-    // B = [[1, 0],
-    //      [0, 1],
-    //      [1, 1]]
+    // B = [[1, 0], [0, 1], [1, 1]]
     float b_data[6] = {1, 0, 0, 1, 1, 1};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -95,24 +121,14 @@ NNOPS_TEST(matmul_basic_2d) {
     NNOPS_EXPECT_NEAR(c[3], 11.0f, 1e-6f);
 }
 
-// ============================================================
-// Transpose A
-// ============================================================
-
 NNOPS_TEST(matmul_transpose_a) {
-    // A phys: [3, 2]  →  logical A^T: [2, 3]
-    // B:      [3, 2]
-    // C:      [2, 2]
+    // A phys [3, 2] → logical A^T [2, 3]; B: [3, 2]; C: [2, 2]
     const int64_t ashape[] = {3, 2};
     const int64_t bshape[] = {3, 2};
 
-    // Physical A = [[1, 2],     Logical A^T = [[1, 3, 5],
-    //               [3, 4],                    [2, 4, 6]]
-    //               [5, 6]]
+    // Physical A = [[1, 2], [3, 4], [5, 6]] → logical A^T = [[1, 3, 5], [2, 4, 6]]
     float a_data[6] = {1, 2, 3, 4, 5, 6};
-    // B = [[1, 0],
-    //      [0, 1],
-    //      [1, 1]]
+    // B = [[1, 0], [0, 1], [1, 1]]
     float b_data[6] = {1, 0, 0, 1, 1, 1};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -150,23 +166,14 @@ NNOPS_TEST(matmul_transpose_a) {
     NNOPS_EXPECT_NEAR(c[3], 10.0f, 1e-6f);
 }
 
-// ============================================================
-// Transpose B
-// ============================================================
-
 NNOPS_TEST(matmul_transpose_b) {
-    // A:      [2, 3]
-    // B phys: [2, 3]  →  logical B^T: [3, 2]
-    // C:      [2, 2]
+    // A: [2, 3]; B phys: [2, 3] → logical B^T: [3, 2]; C: [2, 2]
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {2, 3};
 
-    // A = [[1, 2, 3],
-    //      [4, 5, 6]]
+    // A = [[1, 2, 3], [4, 5, 6]]
     float a_data[6] = {1, 2, 3, 4, 5, 6};
-    // Physical B = [[1, 0, 0],    Logical B^T = [[1, 0],
-    //               [0, 1, 0]]                   [0, 1],
-    //                                            [0, 0]]
+    // Physical B = [[1, 0, 0], [0, 1, 0]] → logical B^T = [[1, 0], [0, 1], [0, 0]]
     float b_data[6] = {1, 0, 0, 0, 1, 0};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -204,24 +211,14 @@ NNOPS_TEST(matmul_transpose_b) {
     NNOPS_EXPECT_NEAR(c[3], 5.0f, 1e-6f);
 }
 
-// ============================================================
-// Transpose Both
-// ============================================================
-
 NNOPS_TEST(matmul_transpose_both) {
-    // A phys: [3, 2]  →  logical A^T: [2, 3]
-    // B phys: [2, 3]  →  logical B^T: [3, 2]
-    // C:      [2, 2]
+    // A phys [3, 2] → A^T [2, 3]; B phys [2, 3] → B^T [3, 2]; C: [2, 2]
     const int64_t ashape[] = {3, 2};
     const int64_t bshape[] = {2, 3};
 
-    // Physical A = [[1, 2],     A^T logical = [[1, 3, 5],
-    //               [3, 4],                    [2, 4, 6]]
-    //               [5, 6]]
+    // Physical A = [[1, 2], [3, 4], [5, 6]] → A^T = [[1, 3, 5], [2, 4, 6]]
     float a_data[6] = {1, 2, 3, 4, 5, 6};
-    // Physical B = [[1, 0, 0],   B^T logical = [[1, 0],
-    //               [0, 1, 0]]                   [0, 1],
-    //                                            [0, 0]]
+    // Physical B = [[1, 0, 0], [0, 1, 0]] → B^T = [[1, 0], [0, 1], [0, 0]]
     float b_data[6] = {1, 0, 0, 0, 1, 0};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -260,21 +257,15 @@ NNOPS_TEST(matmul_transpose_both) {
     NNOPS_EXPECT_NEAR(c[3], 4.0f, 1e-6f);
 }
 
-// ============================================================
-// Batch MatMul (3D × 3D)
-// ============================================================
-
 NNOPS_TEST(matmul_batch_3d) {
     // A: [2, 2, 3], B: [2, 3, 2]  →  C: [2, 2, 2]
     const int64_t ashape[] = {2, 2, 3};
     const int64_t bshape[] = {2, 3, 2};
 
-    // Batch 0 A = [[1,2,3],[4,5,6]]
-    // Batch 1 A = [[7,8,9],[10,11,12]]
+    // Batch 0 A = [[1,2,3],[4,5,6]]; batch 1 A = [[7,8,9],[10,11,12]]
     float a_data[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
 
-    // Batch 0 B = [[1,0],[0,1],[1,1]]
-    // Batch 1 B = [[1,0],[0,1],[0,0]]
+    // Batch 0 B = [[1,0],[0,1],[1,1]]; batch 1 B = [[1,0],[0,1],[0,0]]
     float b_data[12] = {1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -318,18 +309,13 @@ NNOPS_TEST(matmul_batch_3d) {
     NNOPS_EXPECT_NEAR(c[7], 11.0f, 1e-6f);  // dot({10,11,12}, {0,1,0})
 }
 
-// ============================================================
-// Broadcast A across batch (2D A × 3D B)
-// ============================================================
-
 NNOPS_TEST(matmul_broadcast_a_2d_x_3d) {
     // A: [2, 3] broadcast × B: [3, 3, 3]  →  C: [3, 2, 3]
     // (M=2, K=3 from A; N=3 from B; batch=3 from B)
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 3, 3};
 
-    // A = [[1, 0, 0],
-    //      [0, 1, 0]]
+    // A = [[1, 0, 0], [0, 1, 0]]
     float a_data[6] = {1, 0, 0, 0, 1, 0};
 
     // B batch 0 = identity-like: [[1,0,0],[0,1,0],[0,0,1]]
@@ -394,27 +380,19 @@ NNOPS_TEST(matmul_broadcast_a_2d_x_3d) {
     NNOPS_EXPECT_NEAR(c[17], 0.0f, 1e-6f);
 }
 
-// ============================================================
-// Broadcast B across batch (3D A × 2D B)
-// ============================================================
-
 NNOPS_TEST(matmul_broadcast_b_3d_x_2d) {
     // A: [3, 2, 3] × B: [3, 2]  →  C: [3, 2, 2]
     const int64_t ashape[] = {3, 2, 3};
     const int64_t bshape[] = {3, 2};
 
-    // A batch 0 = [[1,2,3],[4,5,6]]
-    // A batch 1 = [[1,0,0],[0,1,0]]
-    // A batch 2 = [[0,0,0],[0,0,0]]
+    // A batches: [[1,2,3],[4,5,6]]; [[1,0,0],[0,1,0]]; zeros
     float a_data[18] = {
         1,2,3, 4,5,6,
         1,0,0, 0,1,0,
         0,0,0, 0,0,0,
     };
 
-    // B = [[1, 0],
-    //      [0, 1],
-    //      [1, 1]]
+    // B = [[1, 0], [0, 1], [1, 1]]
     float b_data[6] = {1, 0, 0, 1, 1, 1};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -451,11 +429,8 @@ NNOPS_TEST(matmul_broadcast_b_3d_x_2d) {
     NNOPS_EXPECT_NEAR(c[2], 10.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[3], 11.0f, 1e-6f);
 
-    // Batch 1: A = [[1,0,0],[0,1,0]], B same
-    // C[0,0] = dot({1,0,0},{1,0,1}) = 1
-    // C[0,1] = dot({1,0,0},{0,1,1}) = 0
-    // C[1,0] = dot({0,1,0},{1,0,1}) = 0
-    // C[1,1] = dot({0,1,0},{0,1,1}) = 1
+    // Batch 1: A = [[1,0,0],[0,1,0]] against the same B → C[0,0]=1,
+    // C[1,1]=1, off-diagonal 0.
     NNOPS_EXPECT_NEAR(c[4], 1.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[5], 0.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[6], 0.0f, 1e-6f);
@@ -468,33 +443,23 @@ NNOPS_TEST(matmul_broadcast_b_3d_x_2d) {
     NNOPS_EXPECT_NEAR(c[11], 0.0f, 1e-6f);
 }
 
-// ============================================================
-// Multi-dim broadcast (higher rank)
-// ============================================================
-
 NNOPS_TEST(matmul_broadcast_multi_dim) {
-    // A: [2, 1, 3, 4]  →  batch = [2, 1, 3], M=3, K=4
-    // B: [1, 4, 4, 2]  →  batch = [1, 4, 4], K=4, N=2
-    // broadcast batch: [2, 4, 3]
-    // C: [2, 4, 3, 2]
+    // A: [2,1,3,4] → batch [2,1,3], M=3, K=4
+    // B: [1,4,4,2] → batch [1,4,4], K=4, N=2 → broadcast batch [2,4,3]
+    // C: [2,4,3,2]
     const int64_t ashape[] = {2, 1, 3, 4};
     const int64_t bshape[] = {1, 4, 4, 2};
 
-    // A[0,0,:,:] = [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
-    // A[1,0,:,:] = [[0,0,0,1],[0,0,0,0],[0,0,0,0]]
-    // Total elements: 2*1*3*4 = 24
+    // A[0,0] is a 3x4 one-hot (diagonal); A[1,0] has a single 1 at (0,3).
+    // Total elements: 2*1*3*4 = 24.
     std::vector<float> a_data(24, 0.0f);
     a_data[0] = 1.0f;                       // A[0,0,0,0]
     a_data[5] = 1.0f;                       // A[0,0,1,1]
     a_data[10] = 1.0f;                      // A[0,0,2,2]
     a_data[15] = 1.0f;                      // A[1,0,0,3]
-    // Everything else is 0
 
-    // B[0,0,:,:] = [[1,0],[0,1],[0,0],[0,0]]
-    // B[0,1,:,:] = [[0,0],[0,0],[1,0],[0,1]]
-    // B[0,2,:,:] = [[0,0],[0,0],[0,0],[0,0]]
-    // B[0,3,:,:] = [[1,1],[1,1],[1,1],[1,1]]
-    // Total elements: 1*4*4*2 = 32
+    // B[0,0] = I rows 0-1; B[0,1] has 1s at (2,0) and (3,1); B[0,2] = 0;
+    // B[0,3] = all ones. Total elements: 1*4*4*2 = 32.
     std::vector<float> b_data(32, 0.0f);
     // B[0,0,:,:]: row 0=[1,0], row 1=[0,1]
     b_data[0] = 1.0f; b_data[3] = 1.0f;
@@ -535,22 +500,12 @@ NNOPS_TEST(matmul_broadcast_multi_dim) {
 
     float* c = out_buf.data();
 
-    // Check all outputs are finite (no NaN/Inf)
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(c[i]));
         NNOPS_EXPECT_TRUE(!std::isinf(c[i]));
     }
 
-    // Verify specific positions:
-    // C[b0=0, b1=0, :, :] = A[0,0,:,:] × B[0,0,:,:]
-    // A[0,0] has 1s at (0,0), (1,1), (2,2)
-    // B[0,0] has 1s at (0,0), (1,1)
-    // C[0,0,0,0] = dot({1,0,0,0}, {1,0,0,0}) = 1
-    // C[0,0,0,1] = dot({1,0,0,0}, {0,1,0,0}) = 0
-    // C[0,0,1,0] = dot({0,1,0,0}, {1,0,0,0}) = 0
-    // C[0,0,1,1] = dot({0,1,0,0}, {0,1,0,0}) = 1
-    // C[0,0,2,0] = dot({0,0,1,0}, {1,0,0,0}) = 0
-    // C[0,0,2,1] = dot({0,0,1,0}, {0,1,0,0}) = 0
+    // C[0,0] = A[0,0] × B[0,0]: both diagonal, so C[0,0] = I and the rest 0.
     int64_t s0 = 0;  // offset for b0=0, b1=0: 0*4*3*2 + 0*3*2 = 0
     NNOPS_EXPECT_NEAR(c[s0 + 0], 1.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[s0 + 1], 0.0f, 1e-6f);
@@ -559,58 +514,33 @@ NNOPS_TEST(matmul_broadcast_multi_dim) {
     NNOPS_EXPECT_NEAR(c[s0 + 4], 0.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[s0 + 5], 0.0f, 1e-6f);
 
-    // C[b0=0, b1=1, :, :] = A[0,0,:,:] × B[0,1,:,:]
-    // B[0,1] has 1s at (2,0) and (3,1)
-    // C[0,1,0,0] = dot({1,0,0,0}, {0,0,1,0}) = 0
-    // C[0,1,0,1] = dot({1,0,0,0}, {0,0,0,1}) = 0
-    // C[0,1,2,0] = dot({0,0,1,0}, {0,0,1,0}) = 1
-    // C[0,1,2,1] = dot({0,0,1,0}, {0,0,0,1}) = 0
+    // C[0,1] = A[0,0] × B[0,1]: B's 1 at (2,0) meets A's row 2 → C[2,0] = 1.
     int64_t s1 = 1 * 3 * 2;  // b0=0, b1=1: offset = 1 * (M*N)
     NNOPS_EXPECT_NEAR(c[s1 + 4], 1.0f, 1e-6f);   // C[0,1,2,0] = 1
     NNOPS_EXPECT_NEAR(c[s1 + 5], 0.0f, 1e-6f);   // C[0,1,2,1] = 0
 
-    // C[b0=0, b1=3, :, :] = A[0,0,:,:] × B[0,3,:,:]
-    // B[0,3] is all ones
-    // C[0,3,0,0] = dot({1,0,0,0}, {1,1,1,1}) = 1
-    // C[0,3,0,1] = dot({1,0,0,0}, {1,1,1,1}) = 1
-    // C[0,3,1,0] = dot({0,1,0,0}, {1,1,1,1}) = 1
-    // C[0,3,1,1] = dot({0,1,0,0}, {1,1,1,1}) = 1
-    // C[0,3,2,0] = dot({0,0,1,0}, {1,1,1,1}) = 1
-    // C[0,3,2,1] = dot({0,0,1,0}, {1,1,1,1}) = 1
+    // B[0,3] is all ones and A[0,0] has one 1 per row, so C[0,3] is all 1.
     int64_t s3 = 3 * 3 * 2;  // b0=0, b1=3
     for (int j = 0; j < 6; ++j) {
         NNOPS_EXPECT_NEAR(c[s3 + j], 1.0f, 1e-6f);
     }
 
-    // C[b0=1, b1=0, :, :] = A[1,0,:,:] × B[0,0,:,:]
-    // A[1,0] has 1 at (0,3) only, B[0,0] has 1s at (0,0) and (1,1)
-    // C[1,0,0,0] = dot({0,0,0,1}, {1,0,0,0}) = 0
-    // C[1,0,0,1] = dot({0,0,0,1}, {0,1,0,0}) = 0
+    // A[1,0]'s single 1 is at (0,3), which B[0,0] has no column for → 0.
     int64_t s10 = 1 * 4 * 3 * 2 + 0 * 3 * 2;  // b0=1, b1=0
     NNOPS_EXPECT_NEAR(c[s10 + 0], 0.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[s10 + 1], 0.0f, 1e-6f);
 
-    // C[b0=1, b1=1, :, :] = A[1,0,:,:] × B[0,1,:,:]
-    // A[1,0] has 1 at (0,3) only, B[0,1] has 1 at (3,1) only
-    // C[1,1,0,1] = dot({0,0,0,1}, {0,0,0,1}) = 1
+    // A[1,0] · B[0,1]: the 1s line up at column 3 → C[1,1,0,1] = 1.
     int64_t s11 = 1 * 4 * 3 * 2 + 1 * 3 * 2;  // b0=1, b1=1
     NNOPS_EXPECT_NEAR(c[s11 + 1], 1.0f, 1e-6f);
 
-    // C[b0=1, b1=3, :, :] = A[1,0,:,:] × B[0,3,:,:]
-    // A[1,0] row 0 = {0,0,0,1}, B[0,3] all ones
-    // C[1,3,0,0] = dot({0,0,0,1}, {1,1,1,1}) = 1
-    // C[1,3,0,1] = dot({0,0,0,1}, {1,1,1,1}) = 1
-    // C[1,3,1,:] = 0, C[1,3,2,:] = 0 (A rows 1,2 are all zero)
+    // B[0,3] all ones: C[1,3,0,:] = {1,1}, rows 1-2 zero (A rows 1,2 are 0).
     int64_t s13 = 1 * 4 * 3 * 2 + 3 * 3 * 2;  // b0=1, b1=3
     NNOPS_EXPECT_NEAR(c[s13 + 0], 1.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[s13 + 1], 1.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[s13 + 2], 0.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[s13 + 3], 0.0f, 1e-6f);
 }
-
-// ============================================================
-// Beta (add to existing output — fused C_out = A×B + beta*C_old)
-// ============================================================
 
 NNOPS_TEST(matmul_beta_add_to_output) {
     // A: [2, 3], B: [3, 2]  →  C: [2, 2]
@@ -657,13 +587,8 @@ NNOPS_TEST(matmul_beta_add_to_output) {
     NNOPS_EXPECT_NEAR(c[3], 16.0f, 1e-6f);
 }
 
-// ============================================================
-// Beta = 0 (default — overwrite output)
-// ============================================================
-
 NNOPS_TEST(matmul_beta_zero_overwrite) {
     // A: [2, 3], B: [3, 2]  →  C: [2, 2]
-    // Default beta=0 means C is fully overwritten (old values ignored).
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
 
@@ -685,7 +610,7 @@ NNOPS_TEST(matmul_beta_zero_overwrite) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    // Pre-fill with garbage: should be ignored since beta=0
+    // garbage: beta=0 must ignore it
     for (auto& v : out_buf) {
         v = 999.0f;
     }
@@ -702,22 +627,15 @@ NNOPS_TEST(matmul_beta_zero_overwrite) {
     NNOPS_EXPECT_NEAR(c[3], 11.0f, 1e-6f);
 }
 
-// ============================================================
-// Epilogue: RELU
-// ============================================================
-
 NNOPS_TEST(matmul_epilogue_relu) {
     // A: [2, 3], B: [3, 2]  →  C: [2, 2]
-    // Using B that produces both positive and negative outputs.
+    // B answers both signs so Relu has work to do.
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
 
-    // A = [[ 1,  2,  3],
-    //      [-4, -5, -6]]
+    // A = [[1, 2, 3], [-4, -5, -6]]
     float a_data[6] = {1, 2, 3, -4, -5, -6};
-    // B = [[ 1, -1],
-    //      [ 1, -1],
-    //      [ 1, -1]]
+    // B = [[1, -1], [1, -1], [1, -1]]
     float b_data[6] = {1, -1, 1, -1, 1, -1};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -744,19 +662,12 @@ NNOPS_TEST(matmul_epilogue_relu) {
     op->compute(output, ins);
 
     float* c = out_buf.data();
-    // A×B before RELU:
-    // Row 0: dot({1,2,3}, {1,1,1})=6, dot({1,2,3}, {-1,-1,-1})=-6
-    // Row 1: dot({-4,-5,-6}, {1,1,1})=-15, dot({-4,-5,-6}, {-1,-1,-1})=15
-    // After RELU:
+    // A×B = [[6,-6],[-15,15]] (row sums over ±1 columns), then Relu.
     NNOPS_EXPECT_NEAR(c[0], 6.0f, 1e-6f);    // relu(6) = 6
     NNOPS_EXPECT_NEAR(c[1], 0.0f, 1e-6f);    // relu(-6) = 0
     NNOPS_EXPECT_NEAR(c[2], 0.0f, 1e-6f);    // relu(-15) = 0
     NNOPS_EXPECT_NEAR(c[3], 15.0f, 1e-6f);   // relu(15) = 15
 }
-
-// ============================================================
-// Epilogue + Beta together
-// ============================================================
 
 NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     // A: [1, 2], B: [2, 2]  →  C: [1, 2]
@@ -765,8 +676,7 @@ NNOPS_TEST(matmul_epilogue_relu_with_beta) {
 
     // A = [[1, -2]]
     float a_data[2] = {1, -2};
-    // B = [[3, -4],
-    //      [5, -6]]
+    // B = [[3, -4], [5, -6]]
     float b_data[4] = {3, -4, 5, -6};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -796,21 +706,13 @@ NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     op->compute(output, ins);
 
     float* c = out_buf.data();
-    // A×B before epilogue:
-    // C[0] = dot({1,-2}, {3,5}) = 1*3 + (-2)*5 = 3 - 10 = -7
-    // C[1] = dot({1,-2}, {-4,-6}) = 1*(-4) + (-2)*(-6) = -4 + 12 = 8
-    // After beta: -7 + 0.5*10 = -2  → relu(-2) = 0
-    //             8 + 0.5*10 = 13  → relu(13) = 13
+    // A×B = [[-7,8]]; +0.5·10 → [[-2,13]] → relu → [[0,13]].
     NNOPS_EXPECT_NEAR(c[0], 0.0f, 1e-6f);
     NNOPS_EXPECT_NEAR(c[1], 13.0f, 1e-6f);
 }
 
 // ============================================================
 // Bias — the optional third input
-//
-// C = epilogue(A×B + bias + beta×C_old), the bias broadcast down the columns.
-// The order matters: it sits between the product and the activation, so Relu
-// must see (product + bias), not product.
 // ============================================================
 
 namespace {
@@ -829,8 +731,7 @@ TensorView quant_view(const int64_t* shape, int64_t rank, DataType dt, void* dat
                       dt, data, TensorLayout::NCHW, qp);
 }
 
-/// Run a MatMul and matmul_ref over the same f32 operands and require
-/// agreement. @p initial optionally seeds C in both outputs (for beta).
+/// Run MatMul and matmul_ref on the same f32 operands; @p initial seeds C for beta.
 void expect_matches_ref(const MatMulAttributes& attrs,
                         const std::vector<TensorView>& ins,
                         std::span<const float> initial = {},
@@ -904,10 +805,8 @@ NNOPS_TEST(matmul_bias_basic_2d) {
 }
 
 NNOPS_TEST(matmul_bias_precedes_activation) {
-    // Same product as matmul_epilogue_relu: [[6,-6],[-15,15]].
-    // With bias [-10,10]: relu(6-10)=0, relu(-6+10)=4, relu(-15-10)=0,
-    // relu(15+10)=25. Adding the bias after the Relu instead would give
-    // [[0,10],[0,25]] — the 4 in cell [0,1] pins the order.
+    // relu(6-10)=0, relu(-6+10)=4, relu(-15-10)=0, relu(15+10)=25.
+    // Adding the bias after Relu would give [[-4,10],[-10,25]] — the 4 pins the order.
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
     const int64_t bias_shape[] = {2};
@@ -970,8 +869,7 @@ NNOPS_TEST(matmul_bias_with_beta) {
 }
 
 NNOPS_TEST(matmul_bias_tiled_with_beta) {
-    // A tiled shape, a random bias and beta = 1.5 over a seeded C — the
-    // accumulate-into-C path under a biased call, against matmul_ref.
+    // Tiled shape, random bias, beta = 1.5 over a seeded C — the accumulate-into-C path.
     auto [av, a] = test::make_random_tensor({37, 65}, -1.0f, 1.0f, 910);
     auto [bv, b] = test::make_random_tensor({65, 41}, -1.0f, 1.0f, 911);
     auto [zbv, bias] = test::make_random_tensor({41}, -0.5f, 0.5f, 912);
@@ -983,8 +881,7 @@ NNOPS_TEST(matmul_bias_tiled_with_beta) {
 }
 
 NNOPS_TEST(matmul_bias_transpose_b) {
-    // [M,K] × [N,K] (transpose_b) — the Linear weight layout — with a bias
-    // over the N columns.
+    // [M, K] × [N, K] (transpose_b, the Linear weight layout), biased over N.
     auto [av, a] = test::make_random_tensor({23, 71}, -1.0f, 1.0f, 920);
     auto [bvt, bt] = test::make_random_tensor({19, 71}, -1.0f, 1.0f, 921);
     auto [zbv, bias] = test::make_random_tensor({19}, -0.5f, 0.5f, 922);
@@ -995,8 +892,7 @@ NNOPS_TEST(matmul_bias_transpose_b) {
 }
 
 NNOPS_TEST(matmul_bias_batched_broadcast) {
-    // C[2,3,5] from a 3D A and a 2D B: the bias broadcasts over both the batch
-    // and the M axis.
+    // C[2,3,5] from 3D A × 2D B: the bias broadcasts over batch and M too.
     {
         auto [av, a] = test::make_random_tensor({2, 3, 8}, -1.0f, 1.0f, 930);
         auto [bv, b] = test::make_random_tensor({8, 5}, -1.0f, 1.0f, 931);
@@ -1013,8 +909,7 @@ NNOPS_TEST(matmul_bias_batched_broadcast) {
 }
 
 NNOPS_TEST(matmul_bias_small_and_gemv_routes) {
-    // M=1 decode (GEMV), a single output column, and a K that is not a
-    // multiple of the pack width.
+    // M=1 decode, a single output column, and a K off the pack width.
     {
         auto [av, a] = test::make_random_tensor({1, 17}, -1.0f, 1.0f, 940);
         auto [bv, b] = test::make_random_tensor({17, 13}, -1.0f, 1.0f, 941);
@@ -1028,8 +923,8 @@ NNOPS_TEST(matmul_bias_small_and_gemv_routes) {
         expect_matches_ref(MatMulAttributes{}, {a, b, bias});
     }
     {
-        // The streaming GEMV route (M <= 4, above the naive MAC threshold),
-        // with beta and alpha riding the same accumulator prime as the bias.
+        // The streaming GEMV route (M <= 4, above the naive MAC threshold);
+        // beta and alpha ride the same accumulator prime as the bias.
         auto [av, a] = test::make_random_tensor({2, 128}, -1.0f, 1.0f, 946);
         auto [bv, b] = test::make_random_tensor({128, 256}, -1.0f, 1.0f, 947);
         auto [zbv, bias] = test::make_random_tensor({256}, -0.5f, 0.5f, 948);
@@ -1044,9 +939,7 @@ NNOPS_TEST(matmul_bias_small_and_gemv_routes) {
 }
 
 NNOPS_TEST(matmul_bias_f16) {
-    // f16 operands and an f16 bias, against the f32 reference on the same
-    // values (f16 is computed in f32 on x86 and native f16 on aarch64, so the
-    // comparison uses the shared accumulate tolerance).
+    // f16 operands and bias against the f32 reference on the same values.
     auto [a32, _] = test::make_random_tensor({12, 40}, -1.0f, 1.0f, 950);
     auto [b32, __] = test::make_random_tensor({40, 9}, -1.0f, 1.0f, 951);
     auto [z32, ___] = test::make_random_tensor({9}, -0.5f, 0.5f, 952);
@@ -1091,11 +984,9 @@ NNOPS_TEST(matmul_bias_f16) {
 }
 
 NNOPS_TEST(matmul_bias_int8_dequant) {
-    // s8 × s8 → f32: the bias lands on the dequantized accumulate, before the
-    // activation. C = acc·(0.5·0.25) + bias, then Relu.
-    //   acc = [[1,2],[3,4]]  →  [[0.125,0.25],[0.375,0.5]]
-    //   +bias [1,-1]         →  [[1.125,-0.75],[1.375,-0.5]]
-    //   relu                 →  [[1.125,0],[1.375,0]]
+    // s8 × s8 → f32, bias on the dequantized accumulate before Relu:
+    //   acc·(0.5·0.25) = [[0.125,0.25],[0.375,0.5]], +[1,-1],
+    //   relu → [[1.125,0],[1.375,0]]
     const int64_t ashape[] = {2, 2};
     const int64_t bshape[] = {2, 2};
     const int64_t bias_shape[] = {2};
@@ -1133,10 +1024,8 @@ NNOPS_TEST(matmul_bias_int8_dequant) {
 }
 
 NNOPS_TEST(matmul_bias_fp_activation_dq) {
-    // fp A (offline per-token params) × s8 B (per-channel): the dequantizing
-    // route, biased. matmul_dq_ref carries the same bias-then-activation order,
-    // so the two agree to the last bit; the tolerance only absorbs the
-    // multiply order.
+    // fp A (per-token) × s8 B (per-channel) on the dequantizing route;
+    // matmul_dq_ref carries the same bias-then-activation order.
     const int64_t M = 6, K = 32, N = 13;
     auto [av, a_f32] = test::make_random_tensor({M, K}, -2.0f, 2.0f, 960);
 
@@ -1200,10 +1089,8 @@ NNOPS_TEST(matmul_bias_fp_activation_dq) {
 }
 
 NNOPS_TEST(matmul_bias_clip_bounds) {
-    // The epilogue's clamp bounds belong to the same slot as the bias:
-    // C = clamp(A×B + bias, -15, 15). Product [[4,5],[10,11]], +[10,-20]
-    // gives [[14,-15],[20,-9]], which the bounds pull to [[14,-15],[15,-9]].
-    // A biased call runs its kernels with a neutral epilogue, so this pins
+    // C = clamp(A×B + bias): [[4,5],[10,11]] + [10,-20] = [[14,-15],[20,-9]]
+    // → [[14,-15],[15,-9]]. A biased call runs neutral kernels, so this pins
     // that the post-pass still applies the caller's bounds.
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
@@ -1237,8 +1124,7 @@ NNOPS_TEST(matmul_bias_clip_bounds) {
 }
 
 NNOPS_TEST(matmul_bias_relu6) {
-    // Bias then Relu6 — both ends of the activation are hit:
-    // [[4,5],[10,11]] + [10,-20] = [[14,-15],[20,-9]] → [[6,0],[6,0]].
+    // Bias then Relu6, both ends hit: [[14,-15],[20,-9]] → [[6,0],[6,0]].
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
     const int64_t bias_shape[] = {2};
@@ -1270,8 +1156,7 @@ NNOPS_TEST(matmul_bias_relu6) {
 }
 
 NNOPS_TEST(matmul_bias_transpose_a) {
-    // The same product as matmul_bias_basic_2d with A stored [K, M], which
-    // takes the transposed-A pack. A^T = [[1,2,3],[4,5,6]].
+    // Same product as matmul_bias_basic_2d with A stored [K, M] (transposed-A pack).
     const int64_t ashape[] = {3, 2};
     const int64_t bshape[] = {3, 2};
     const int64_t bias_shape[] = {2};
@@ -1305,12 +1190,9 @@ NNOPS_TEST(matmul_bias_transpose_a) {
 }
 
 NNOPS_TEST(matmul_bias_int8_dequant_clip) {
-    // The dequantizing int8 route with clip bounds and an activation: the order
-    // is dequantize → bias → clamp → activate, the same expression
-    // matmul_dq_ref evaluates.
-    //   acc = [[1,2],[3,4]] · (0.5·0.25) = [[0.125,0.25],[0.375,0.5]]
-    //   +[1,-1]  = [[1.125,-0.75],[1.375,-0.5]]
-    //   clamp -1..1 → [[1,-0.75],[1,-0.5]] → relu → [[1,0],[1,0]]
+    // dequantize → bias → clamp → activate:
+    //   acc·(0.5·0.25) = [[0.125,0.25],[0.375,0.5]], +[1,-1],
+    //   clamp -1..1 then relu → [[1,0],[1,0]]
     const int64_t ashape[] = {2, 2};
     const int64_t bshape[] = {2, 2};
     const int64_t bias_shape[] = {2};
@@ -1337,8 +1219,7 @@ NNOPS_TEST(matmul_bias_int8_dequant_clip) {
     std::vector<float> got(static_cast<size_t>(descs[0].numel()));
     auto og = nnops::test::make_planar(descs[0], got.data());
 
-    // No reference comparison here: matmul_dq_ref only backs the fp-A route,
-    // so for a quantized A the hand-computed values below are the spec.
+    // matmul_dq_ref only backs the fp-A route, so these hand-computed values are the spec.
     const TensorView ins[] = {a, b, bias};
     op->compute(og, ins);
 
@@ -1351,15 +1232,10 @@ NNOPS_TEST(matmul_bias_int8_dequant_clip) {
 // ============================================================
 // alpha: C = epilogue(alpha·(A×B) + bias + beta·C_old)
 // ============================================================
-//
-// alpha scales the product only — neither the bias nor beta·C_old. The
-// reference kernel honours the same attributes, so it is the oracle for the
-// routes; the hand-computed cases below pin the order independently.
 
 NNOPS_TEST(matmul_alpha_fp_routes) {
-    // One case per routing decision: the packed MMA tile (NN, NT, and a
-    // multi-k-block TT), the small-M kernels, and the direct GEMV. alpha ∉
-    // {0, 1} on every one.
+    // One case per routing decision (packed MMA tile NN/NT/TT, small-M, GEMV);
+    // alpha ∉ {0, 1} on every one.
     struct Case {
         int64_t M, N, K;
         bool ta, tb;
@@ -1423,10 +1299,9 @@ NNOPS_TEST(matmul_alpha_fp_routes) {
 }
 
 NNOPS_TEST(matmul_alpha_scales_product_only) {
-    // A×B = [[4,5],[10,11]]. With alpha = 2: [[8,10],[20,22]].
-    //   + bias [10,-20]  → [[18,-10],[30,2]]      (bias is not scaled)
-    //   + beta·C_old with beta = 1, C_old = [[1,2],[3,4]]
-    //                    → [[19,-8],[33,6]]       (C_old is not scaled either)
+    // A×B = [[4,5],[10,11]], alpha = 2 → [[8,10],[20,22]], +bias [10,-20]
+    // → [[18,-10],[30,2]], +C_old [[1,2],[3,4]] → [[19,-8],[33,6]].
+    // Neither the bias nor C_old is scaled.
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
     const int64_t bias_shape[] = {2};
@@ -1461,9 +1336,8 @@ NNOPS_TEST(matmul_alpha_scales_product_only) {
 }
 
 NNOPS_TEST(matmul_alpha_before_activation) {
-    // The clamp/activation sees alpha·(A×B) + bias, not the raw product:
-    // alpha=2, bias [10,-20] → [[18,-10],[30,2]] → clamp -15..15
-    // → [[15,-10],[15,2]] → relu → [[15,0],[15,2]].
+    // The clamp/activation sees alpha·(A×B) + bias: [[18,-10],[30,2]] →
+    // clamp -15..15 → relu → [[15,0],[15,2]].
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
     const int64_t bias_shape[] = {2};
@@ -1498,8 +1372,7 @@ NNOPS_TEST(matmul_alpha_before_activation) {
 }
 
 NNOPS_TEST(matmul_alpha_f16) {
-    // f16 operands, alpha folded into the f16 RHS pack. The oracle is the f32
-    // reference on the same values, hence the arch-aware f16 tolerance.
+    // f16 operands, alpha folded into the f16 RHS pack.
     auto [a32, _] = test::make_random_tensor({12, 40}, -1.0f, 1.0f, 960);
     auto [b32, __] = test::make_random_tensor({40, 9}, -1.0f, 1.0f, 961);
     auto a_f16 = test::f32_to_f16(a32);
@@ -1540,8 +1413,7 @@ NNOPS_TEST(matmul_alpha_f16) {
 }
 
 NNOPS_TEST(matmul_alpha_ignored_on_integer_route) {
-    // alpha is a floating-point scale; the int8 accumulator has none of its
-    // own, so the integer route ignores it (see MatMulAttributes::alpha).
+    // alpha is a floating-point scale; the int8 accumulator has none of its own.
     const int64_t ashape[] = {2, 2};
     const int64_t bshape[] = {2, 2};
 
@@ -1575,10 +1447,6 @@ NNOPS_TEST(matmul_alpha_ignored_on_integer_route) {
     NNOPS_EXPECT_NEAR(plain[0], 0.125f, 1e-6f);
     NNOPS_EXPECT_NEAR(plain[3], 0.5f, 1e-6f);
 }
-
-// ============================================================
-// Single-element dot product (M=1, N=1)
-// ============================================================
 
 NNOPS_TEST(matmul_1x1_dot) {
     // A: [1, 4], B: [4, 1]  →  C: [1, 1]
@@ -1616,10 +1484,6 @@ NNOPS_TEST(matmul_1x1_dot) {
     NNOPS_EXPECT_NEAR(out_buf[0], 70.0f, 1e-6f);
 }
 
-// ============================================================
-// Square matrices
-// ============================================================
-
 NNOPS_TEST(matmul_square) {
     // A: [3, 3], B: [3, 3]  →  C: [3, 3]
     const int64_t ashape[] = {3, 3};
@@ -1627,9 +1491,7 @@ NNOPS_TEST(matmul_square) {
 
     // A = identity
     float a_data[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    // B = [[1, 2, 3],
-    //      [4, 5, 6],
-    //      [7, 8, 9]]
+    // B = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
     float b_data[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 
     TensorView a(ashape, DataType::f32, a_data);
@@ -1669,10 +1531,6 @@ NNOPS_TEST(matmul_square) {
     NNOPS_EXPECT_NEAR(c[8], 9.0f, 1e-6f);
 }
 
-// ============================================================
-// Random data — validate shape inference and no NaN/Inf
-// ============================================================
-
 NNOPS_TEST(matmul_random) {
     auto [a_vec, a] = test::make_random_tensor({8, 16});
     auto [b_vec, b] = test::make_random_tensor({16, 32});
@@ -1704,10 +1562,6 @@ NNOPS_TEST(matmul_random) {
         NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
     }
 }
-
-// ============================================================
-// Random batch matmul — validate no NaN/Inf
-// ============================================================
 
 NNOPS_TEST(matmul_random_batch) {
     auto [a_vec, a] = test::make_random_tensor({4, 8, 16});
@@ -1742,10 +1596,6 @@ NNOPS_TEST(matmul_random_batch) {
     }
 }
 
-// ============================================================
-// Random with transpose_a — validate no NaN/Inf
-// ============================================================
-
 NNOPS_TEST(matmul_random_transpose_a) {
     auto [a_vec, a] = test::make_random_tensor({16, 8});   // phys [K, M]
     auto [b_vec, b] = test::make_random_tensor({16, 32});  // [K, N]
@@ -1777,10 +1627,6 @@ NNOPS_TEST(matmul_random_transpose_a) {
         NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
     }
 }
-
-// ============================================================
-// Random with transpose_b — validate no NaN/Inf
-// ============================================================
 
 NNOPS_TEST(matmul_random_transpose_b) {
     auto [a_vec, a] = test::make_random_tensor({8, 16});   // [M, K]
@@ -1817,11 +1663,7 @@ NNOPS_TEST(matmul_random_transpose_b) {
 // ============================================================
 // Fused path — SIMD pack + MMA kernels
 // ============================================================
-//
-// These tests exercise the fused pack + MMA path (packed A lives on the kernel
-// stack, packed B in kernel-pooled scratch), and results are compared against
-// matmul_ref. Scratch is pooled internally by the operator, so compute() is
-// called with a null workspace pointer.
+// packed A on the kernel stack, packed B in pooled scratch; compute() takes a null workspace.
 
 NNOPS_TEST(matmul_packed_transpose_both_workspace) {
     auto [a_vec, a] = test::make_random_tensor({13, 21});   // phys [K, M] (transpose_a)
@@ -1846,7 +1688,6 @@ NNOPS_TEST(matmul_packed_transpose_both_workspace) {
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
-    // Reference oracle on a separate buffer.
     std::vector<float> ref_buf(descs[0].numel());
     auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
@@ -1855,9 +1696,8 @@ NNOPS_TEST(matmul_packed_transpose_both_workspace) {
 }
 
 NNOPS_TEST(matmul_packed_multiple_kblocks) {
-    // K = 300 > the plan's f32 k-block (128 here, capped at 256): exercises
-    // multi-k-block accumulation and the last-k-block epilogue/clamp logic in
-    // the packed path.
+    // K = 300 spans several 128-wide k-blocks (KC_CAP_F32): multi-k-block
+    // accumulation and the last-k epilogue/clamp in the packed path.
     auto [a_vec, a] = test::make_random_tensor({6, 300});    // [M, K]
     auto [b_vec, b] = test::make_random_tensor({9, 300});    // phys [N, K]
 
@@ -1886,8 +1726,7 @@ NNOPS_TEST(matmul_packed_multiple_kblocks) {
 }
 
 NNOPS_TEST(matmul_packed_beta_relu_workspace) {
-    // Beta + Relu epilogue in the packed path must match reference semantics:
-    // C = relu(A×B + beta×C_old).
+    // Beta + Relu in the packed path: C = relu(A×B + beta×C_old).
     auto [a_vec, a] = test::make_random_tensor({64, 64});  // [M, K]
     auto [b_vec, b] = test::make_random_tensor({32, 64});  // phys [N, K]
 
@@ -1952,9 +1791,7 @@ NNOPS_TEST(matmul_packed_batched_workspace) {
 }
 
 NNOPS_TEST(matmul_packed_f16_workspace) {
-    // f16 transpose_a through the fused path (A packed on the stack, B packed
-    // in kernel-pooled scratch), compared against the f32 reference computed
-    // from the f16 inputs (loose tolerance for f16).
+    // f16 transpose_a through the fused path, against the f32 reference.
     auto [a_f32, _] = test::make_random_tensor({7, 6}, -1.0f, 1.0f, 777);  // phys [K, M]
     auto [b_f32, __] = test::make_random_tensor({7, 5}, -1.0f, 1.0f, 888);  // [K, N]
     auto a_f16 = test::f32_to_f16(a_f32);
@@ -1981,7 +1818,6 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
-    // f32 reference on converted buffers.
     const int64_t a32_shape[] = {7, 6};
     const int64_t b32_shape[] = {7, 5};
     TensorView a32(a32_shape, DataType::f32, a_f32.data());
@@ -2002,11 +1838,9 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
 NNOPS_TEST(matmul_f16_deep_k_accumulation) {
     namespace cpu = nnops::backend::cpu;
 
-    // On aarch64 the f16 kernel accumulates in f16 (mma_pack_8x8_f16 keeps
-    // float16x8_t accumulators), so kc bounds how many products round into the
-    // accumulator before the C read-modify-write. The shared tile rule settles
-    // this shape on kc = 128 (KC_CAP_F16), so pin the deep-K worst case against
-    // the reference rather than assuming the accumulation still holds.
+    // aarch64's f16 kernel accumulates in f16, so kc bounds how many products
+    // round into the accumulator before the C read-modify-write; this shape
+    // settles on kc = 128 (KC_CAP_F16). Pin the deep-K worst case.
     const int64_t M = 64, K = 4096, N = 64;
     auto [a_f32, _]  = test::make_random_tensor({M, K}, -1.0f, 1.0f, 4242);
     auto [b_f32, __] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 4243);
@@ -2023,8 +1857,7 @@ NNOPS_TEST(matmul_f16_deep_k_accumulation) {
     const TensorDesc arr[] = {a.desc(), b.desc()};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // Pin the kc this shape actually gets; if the rule moves it the test still
-    // checks correctness, it just stops covering this accumulation depth.
+    // Pin the kc this shape gets; if the rule moves it, the test still checks correctness.
     const auto plan = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1);
 
     std::vector<cpu::half> out_buf(descs[0].numel());
@@ -2052,20 +1885,17 @@ NNOPS_TEST(matmul_f16_deep_k_accumulation) {
     }
     NNOPS_EXPECT_EQ(plan.kc, int64_t{128});
 
-    // The deviation scales with the output magnitude — max |ref| is ~80 here
-    // from a 4096-long reduction — so the absolute kF16AccumTol the small-GEMM
-    // f16 tests use does not apply. Bound it relative to that magnitude instead.
+    // max |ref| is ~80 from a 4096-long reduction, so the absolute kF16AccumTol
+    // of the small-GEMM f16 tests does not apply; bound relative instead.
     // Measured: 0.23% at kc = 128 (0.29% at kc = 256, which the rule no longer
-    // reaches here). The bound has ~2x headroom, so it catches a real
-    // accumulation break, not drift.
+    // reaches); ~2x headroom, so it catches a broken accumulation, not drift.
     NNOPS_EXPECT_TRUE(worst <= 0.005f * maxref);
 }
 
 NNOPS_TEST(matmul_f16_transpose_b_packed) {
-    // f16 transpose_b through the packed path — the route that transposes B into
-    // the pooled panel scratch. The shape makes N hit a full 16-wide panel plus
-    // a narrow tail (25 = 16 + 9; x86 zero-pads that tail, aarch64 decomposes it
-    // into 8 + 1) and K exercise an 8-block plus a scalar tail (13 = 8 + 5).
+    // f16 transpose_b through the packed path (B into the pooled panel
+    // scratch). N = 25 = 16 + 9 (x86 zero-pads the tail, aarch64 splits 8 + 1)
+    // and K = 13 = 8 + 5 exercise the panel and k tails.
     auto [a_f32, _]  = test::make_random_tensor({7, 13},  -1.0f, 1.0f, 901);  // [M, K]
     auto [b_f32, __] = test::make_random_tensor({25, 13}, -1.0f, 1.0f, 902);  // phys [N, K]
     auto a_f16 = test::f32_to_f16(a_f32);
@@ -2091,7 +1921,6 @@ NNOPS_TEST(matmul_f16_transpose_b_packed) {
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
-    // f32 reference on the same values.
     const int64_t a32_shape[] = {7, 13};
     const int64_t b32_shape[] = {25, 13};
     TensorView a32(a32_shape, DataType::f32, a_f32.data());
@@ -2113,9 +1942,7 @@ NNOPS_TEST(matmul_f16_transpose_b_packed) {
 // Pack-decision + threading helpers
 // ============================================================
 
-// Build a 2D TensorView with an explicit row pitch (elements), filling only the
-// logical [rows, cols] region with random data (padding lanes stay 0 so any
-// accidental read of padding would corrupt the comparison).
+// Explicit row pitch; padding lanes stay 0 so a stray read corrupts the comparison.
 static std::pair<std::vector<float>, TensorView>
 make_padded_f32(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
     std::vector<float> buf(static_cast<size_t>(rows * pitch_elems), 0.0f);
@@ -2131,14 +1958,11 @@ make_padded_f32(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) 
     return {std::move(buf), tv};
 }
 
-// Minimal fixed-size thread pool exposing a CpuBackend. Items in [begin, end)
-// are claimed via an atomic counter; each worker runs body(i) until the range
-// is exhausted. Exposes parallel_for + num_threads + thread_id for injection
+// Minimal fixed-size claim-per-item pool exposing a CpuBackend for injection
 // into ComputeContext.
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
-        // runs under the same bit-exact comparisons as the kernels.
+        // OpenMP when the build has it, so the adapter runs the same bit-exact comparisons.
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
             return;
@@ -2177,9 +2001,8 @@ struct SimplePool {
 // ============================================================
 
 NNOPS_TEST(matmul_padded_b_stride_pack_b_workspace) {
-    // Non-transposed B with a wide row stride: pack_b triggers on stride
-    // (M > mc re-reads B, ldb > 1024 page-scattered); the packed-B scratch is
-    // pooled internally and sized for the whole N (multiple n-blocks tile it).
+    // Wide row stride on non-transposed B: pack_b triggers (M > mc re-reads B,
+    // ldb > 1024 is page-scattered); the pooled scratch is sized for all of N.
     const int64_t M = 256, K = 128, N = 2048;
     auto [a_vec, a] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 101);
     auto [b_vec, b] = make_padded_f32(K, N, /*pitch_elems=*/4096, 202);
@@ -2207,8 +2030,9 @@ NNOPS_TEST(matmul_padded_b_stride_pack_b_workspace) {
 }
 
 NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
-    // f16 variant: stride threshold is 2048 (4096/sizeof(half)), so a 4096-elem
-    // pitch on B triggers pack_b; the packed result must match the f32 reference.
+    // f16 variant: B is padded to a 4096-element (8 KB) row pitch, so the B
+    // pack reads rows two pages apart. B is packed on every tiled route, so
+    // this is the packer's pitch handling rather than a stride-gated branch.
     const int64_t M = 256, K = 256, N = 1024;
     const int64_t pitch_elems = 4096;
 
@@ -2257,8 +2081,9 @@ NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
 }
 
 NNOPS_TEST(matmul_padded_a_stride_correctness) {
-    // Wide row stride on A (> 1024) triggers pack_a; the packed result must
-    // match the reference computed from the padded (wide-stride) source.
+    // Wide row stride on A on the direct-A route: K = 512 is under
+    // PACK_A_K_THRESHOLD, so the MMA reads A at the caller's pitch rather than
+    // from a packed panel; the reference reads the same padded source.
     const int64_t M = 512, K = 512, N = 512;
     auto [a_vec, a] = make_padded_f32(M, K, /*pitch_elems=*/2048, 707);
     auto [b_vec, b] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 808);
@@ -2286,15 +2111,10 @@ NNOPS_TEST(matmul_padded_a_stride_correctness) {
 }
 
 NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
-    // The complement of matmul_padded_a_stride_correctness: a *compact*
-    // non-transposed A stays on the unpacked-A (pack_a=0) route, and that route
-    // decomposes M by the shared MR_F32 table, {8,4,1} on aarch64, so Mc splits
-    // as 8a + 4b + 1c. Walk M across that boundary and K across both the
-    // 4-wide inner unroll and the plan's k-block (128 for these shapes), so the
-    // tall tile, the 4/1 remainder kernels and the scalar k-tail are each
-    // checked against the reference.
-    // N walks the nr panel widths too — the kernel is selected per (mr, nr), so
-    // 13 exercises the 12+1 columns and 17 the 12+4+1 ones.
+    // A compact non-transposed A stays on the unpacked-A (pack_a=0) route,
+    // which decomposes M by MR_F32 ({6,4,1} on x86, {8,4,1} on aarch64). M walks
+    // those boundaries, K the 4-wide unroll and the 128 k-block, N the panel
+    // tail widths, each tile against the reference.
     const int64_t Ms[] = {1, 5, 6, 7, 8, 13, 143, 144, 145};
     const int64_t Ks[] = {1, 3, 4, 7, 128, 129};
     const int64_t Ns[] = {1, 13, 17};
@@ -2308,10 +2128,8 @@ NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
                 MatMulAttributes attrs{};
                 auto op = MatMul::create(attrs, Backend::CPU);
 
-                // Pin the route. A compact non-transposed A stays direct only
-                // while K <= PACK_A_K_THRESHOLD; if that threshold is ever
-                // retuned below K the test would silently start covering the
-                // packed kernels instead of the direct ones.
+                // Pin the route: direct only while K <= PACK_A_K_THRESHOLD; else
+                // the test silently covers the packed kernels instead.
                 const auto plan = nnops::backend::cpu::get_matmul_plan(
                     attrs, a.desc(), b.desc(), 1);
                 if (plan.pack_a) {
@@ -2344,14 +2162,10 @@ NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
 }
 
 NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
-    // f16 complement of matmul_f32_nn_direct_tile_remainders: a compact
-    // non-transposed A stays on the unpacked-A (pack_a=0) route. f16 has no
-    // mr_f16_direct — the direct kernels read row-major A at the same height
-    // they pack — so the route decomposes M with MR_F16 = {8,4,1}, i.e. 8a+4b+1c,
-    // not the f32 direct {6,4,1}. Walk M across those boundaries, K across the
-    // 4-wide inner unroll and the plan's k-block (128 for these shapes; the cap
-    // is 256), and N across the NR_F16 = {16,8,1} panel widths, checking each
-    // tile against the f32 reference.
+    // f16 complement: a compact non-transposed A stays on the unpacked-A
+    // (pack_a=0) route, which decomposes M by MR_F16 (the same table as MR_F32).
+    // M walks those boundaries, K the 4-wide unroll and the 128 k-block, N the
+    // NR_F16 = {16,8,1} panel widths, each tile against the f32 reference.
     const int64_t Ms[] = {1, 4, 5, 8, 9, 12, 13, 143, 144, 145};
     const int64_t Ks[] = {1, 3, 4, 5, 128, 129};
     const int64_t Ns[] = {1, 17, 25};  // 16+1 and 16+8+1
@@ -2372,10 +2186,8 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
                 MatMulAttributes attrs{};
                 auto op = MatMul::create(attrs, Backend::CPU);
 
-                // Pin the route. This stays direct only while
-                // K <= PACK_A_K_THRESHOLD; if that threshold is ever retuned
-                // below K the test would silently start covering the packed
-                // kernels instead.
+                // Pin the route: direct only while K <= PACK_A_K_THRESHOLD; else
+                // the test silently covers the packed kernels instead.
                 const auto plan = nnops::backend::cpu::get_matmul_plan(
                     attrs, a.desc(), b.desc(), 1);
                 if (plan.pack_a) {
@@ -2394,7 +2206,6 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
                 const TensorView ins[] = {a, b};
                 op->compute(output, ins, {}, nullptr);
 
-                // f32 reference computed from the f16 inputs (loose f16 tol).
                 const int64_t a32_shape[] = {M, K};
                 const int64_t b32_shape[] = {K, N};
                 TensorView a32(a32_shape, DataType::f32, a_f32.data());
@@ -2423,8 +2234,8 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
 }
 
 NNOPS_TEST(matmul_mkn_transpose_a_multik) {
-    // transpose_a → pack_a (NKM order, B always packed). Multi-k and multi-m
-    // blocks exercise beta@k==0, Relu clamp, and the last-k epilogue.
+    // transpose_a → pack_a (NKM order, B always packed); multi-k/multi-m exercise
+    // beta@k==0, Relu clamp, the last-k epilogue.
     const int64_t K = 300, M = 256, N = 128;
     auto [a_vec, a] = test::make_random_tensor({K, M}, -1.0f, 1.0f, 505);  // phys [K, M]
     auto [b_vec, b] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 606);  // [K, N]
@@ -2472,7 +2283,7 @@ MatmulInputs make_matmul_inputs(int64_t M, int64_t K, int64_t N,
     std::vector<float> b_buf;
     TensorView b;
     if (pad_b) {
-        const int64_t pitch = b_cols + 2048;  // wide stride (> 1024 → pack_b)
+        const int64_t pitch = b_cols + 2048;  // wide pitch: the B pack's rows span pages
         b_buf.assign(static_cast<size_t>(b_rows * pitch), 0.0f);
         nnops::test::XorShift128 rng(seed + 1);
         for (int64_t r = 0; r < b_rows; ++r) {
@@ -2493,8 +2304,7 @@ MatmulInputs make_matmul_inputs(int64_t M, int64_t K, int64_t N,
 }  // anonymous namespace
 
 NNOPS_TEST(matmul_threaded_matches_serial) {
-    // Threading is bit-identical to serial: blocks write disjoint C tiles with
-    // no reductions, so the thread count must not change any result.
+    // Threading must be bit-identical: disjoint C tiles, no reduction reordered.
     const int64_t M = 200, K = 160, N = 300;
 
     struct Case { const char* name; bool ta; bool tb; bool pad_b; };
@@ -2522,12 +2332,10 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
 
             const TensorView ins[] = {in.a, in.b};
 
-            // Serial (no parallelism hook).
             std::vector<float> serial_buf(descs[0].numel());
             auto serial_out = test::make_planar(descs[0], serial_buf.data());
             op->compute(serial_out, ins, {}, nullptr);
 
-            // Threaded via SimplePool.
             SimplePool pool(nthreads);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
@@ -2535,7 +2343,6 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
             auto threaded_out = test::make_planar(descs[0], threaded_buf.data());
             op->compute(threaded_out, ins, ctx, nullptr);
 
-            // Bit-identical: disjoint C tiles, no reductions.
             for (int64_t i = 0; i < descs[0].numel(); ++i) {
                 if (serial_buf[static_cast<size_t>(i)] != threaded_buf[static_cast<size_t>(i)]) {
                     throw std::runtime_error(
@@ -2545,7 +2352,6 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
                 }
             }
 
-            // Both match the reference.
             std::vector<float> ref_buf(descs[0].numel());
             auto ref_out = test::make_planar(descs[0], ref_buf.data());
             nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
@@ -2557,18 +2363,10 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
 NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
     namespace cpu = nnops::backend::cpu;
 
-    // The packed-A region must hold the panels of whatever mc the dispatch
-    // actually picks — a per-block height <= plan.mc, not plan.mc itself. The
-    // greedy {mr,..,1} decomposition the pack emits is NOT monotonic in mc, so
-    // sizing the region at num_panels(plan.mc, mr) under-counts: {8,4,1} needs
-    // 21 panels at mc = 143 (17×8 + 4 + 1 + 1 + 1) but only 18 at mc = 144, so
-    // a region sized for a 144-row tile overruns by 3 panels when the shape
-    // clips the last block to 143 rows.
-    //
-    // The tile used to be a stack array sized at the compile-time worst case;
-    // it is now a slot in the plan's workspace, so this pins the plan's own
-    // arithmetic. Heights straddle the {8,4,1} boundary so the non-monotonic
-    // case is really reached, and transpose_a forces the packed-A route.
+    // The packed-A region must hold the panels of the per-block height the
+    // dispatch picks (<= plan.mc, not plan.mc itself): the {8,4,1} decomposition
+    // is not monotonic — on aarch64 143 rows need 21 panels and 144 only 18 — so
+    // sizing at num_panels(plan.mc) under-counts. transpose_a forces pack_a.
     for (int64_t M : {int64_t{143}, int64_t{144}, int64_t{145}, int64_t{572},
                       int64_t{1024}, int64_t{1152}}) {
         MatmulInputs in = make_matmul_inputs(M, 128, 64, /*ta=*/true, false, false, 7);
@@ -2581,11 +2379,9 @@ NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
             const auto plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, nt);
             NNOPS_EXPECT_TRUE(plan.pack_a);
 
-            // The worst panel count over every height the block can hand the
-            // pack, demanded at the widest stride it can use: the kernel packs
-            // at actual_kc <= plan.kc, and ldd_a grows with kc, so plan.ldd_a
-            // is the bound. This is the whole invariant — num_panels_max, not
-            // num_panels(plan.mc, ..).
+            // Worst panel count over every height the block can hand the pack,
+            // at plan.ldd_a (the widest stride, since actual_kc <= plan.kc):
+            // num_panels_max, not num_panels(plan.mc, ..).
             int worst = 0;
             for (int mc = 1; mc <= static_cast<int>(plan.mc); ++mc) {
                 const int c = cpu::num_panels(mc, cpu::MR_F32);
@@ -2593,9 +2389,8 @@ NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
             }
             NNOPS_EXPECT_EQ(plan.np_a, int64_t{worst});
 
-            // Geometry: sized from the plan's own kc, and every part of the
-            // region 64-byte aligned so the slots after it stay aligned (the
-            // pack/MMA kernels assume that alignment).
+            // Geometry from the plan's own kc; the region is 64-byte aligned so
+            // the slots after it stay aligned (the pack/MMA kernels assume it).
             const int64_t ldd_a = static_cast<int64_t>(
                 cpu::mma_pack_align(cpu::MR_MAX_F32 * static_cast<int>(plan.kc) * 4) / 4);
             NNOPS_EXPECT_EQ(plan.ldd_a, ldd_a);
@@ -2611,19 +2406,12 @@ NNOPS_TEST(matmul_packed_a_region_holds_every_tile_height) {
 NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
     namespace cpu = nnops::backend::cpu;
 
-    // num_panels and num_panels_max are now closed
-    // forms of the loops they used to run: "take nr[s] panels while they fit"
-    // leaves `rem % nr[s]` behind, so that loop is the quotient chain; and the
-    // largest count over every width in [1, n] sits at one of two points (a full
-    // q = n/nr[0], or a short q-1 with a worst-case remainder) rather than
-    // anywhere in the range.
-    //
-    // The rewrite is what takes the per-plan path from O(n*levels) to
-    // O(levels) — the scan ran at n = the tile width (up to NC_MAX) on every
-    // get_matmul_plan and every attention tile sizing, 2.6 us at n = 1024 for
-    // {12,4,1}. It is worth exactly nothing if the recursion is wrong, so pin
-    // both identities against the loops themselves, for every NR/MR list the
-    // kernels use, past every width the tiling heuristic can ask for.
+    // num_panels/num_panels_max are closed forms of the stepwise loops: "take
+    // nr[s] while it fits" leaves rem % nr[s], so it is the quotient chain, and
+    // the max over [1, n] sits at q = n/nr[0] or a short q-1 with a worst-case
+    // remainder. Closed form is O(levels) where the scan was O(n*levels) — 2.6 us
+    // at n = 1024 for {12,4,1} — and worth nothing if the recursion is wrong,
+    // so pin both against the loops for every NR/MR list and every width.
     auto stepwise = [](int n, const int* nr, int levels) {
         int count = 0;
         int i = 0;
@@ -2651,14 +2439,9 @@ NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
 NNOPS_TEST(matmul_tile_rule_properties) {
     namespace cpu = nnops::backend::cpu;
 
-    // One rule now picks mc/nc/kc for every dtype: maximise the tile's reuse
-    // subject to (a) the aggregate L2 the concurrent blocks occupy, (b) an L1
-    // prefetch-residency bound, (c) the MC_MAX / NC_MAX ceiling, and (d) the
-    // panel grids — mc on MC_ALIGN, nc on NC_ALIGN, kc on KC_ALIGN. Pin all
-    // four so a change to the rule has to say so here instead of drifting.
-    //
-    // This is the guard on the rule itself; matmul_threaded_matches_serial
-    // remains the guard on its output.
+    // One rule picks mc/nc/kc for every dtype, maximising reuse subject to:
+    // (a) aggregate L2 of concurrent blocks, (b) L1 prefetch residency,
+    // (c) MC_MAX/NC_MAX, (d) the MC/NC/KC alignment grids. Pin all four.
     struct Dtype {
         DataType dt;
         int mr_max, nr_max;
@@ -2692,9 +2475,8 @@ NNOPS_TEST(matmul_tile_rule_properties) {
                     for (int64_t nt : nts) {
                         const auto p = cpu::get_matmul_plan(attrs, ad, bd, nt);
 
-                        // (c) ceiling, and (d) grid: below the align width the
-                        // tile sits on the mr/nr grid instead, so only the
-                        // large-tile case pins the alignment exactly.
+                        // (c) ceiling, (d) grid: below the align width the tile
+                        // sits on the mr/nr grid, so only large tiles pin the alignment.
                         NNOPS_EXPECT_TRUE(p.mc <= cpu::MC_MAX);
                         NNOPS_EXPECT_TRUE(p.mc % cpu::MC_ALIGN == 0 ||
                                           p.mc < cpu::MC_ALIGN);
@@ -2707,15 +2489,13 @@ NNOPS_TEST(matmul_tile_rule_properties) {
                         NNOPS_EXPECT_TRUE(p.kc <= d.kc_cap);
                         NNOPS_EXPECT_TRUE(p.kc <= K);
 
-                        // (b) prefetch residency: mr_max rows of A plus the
-                        // current and next nr_max columns of B fit in L1.
+                        // (b) prefetch residency: mr_max rows of A + 2·nr_max columns of B in L1.
                         NNOPS_EXPECT_TRUE((d.mr_max + 2 * static_cast<int64_t>(d.nr_max)) *
                                               p.kc * d.esz <= l1);
 
-                        // (a) aggregate L2 the concurrent blocks occupy. The
-                        // KC_MIN floor is the one escape — it can raise kc back
-                        // over the budget for a very large span at a high thread
-                        // count — so a floor hit is exempt rather than failing.
+                        // (a) aggregate L2. KC_MIN is the one escape — it can
+                        // raise kc back over the budget for a very large span at
+                        // high thread count — so a floor hit is exempt.
                         const bool floored =
                             p.kc == std::min<int64_t>(cpu::KC_MIN, K);
                         NNOPS_EXPECT_TRUE(floored ||
@@ -2730,27 +2510,21 @@ NNOPS_TEST(matmul_tile_rule_properties) {
 NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
     namespace cpu = nnops::backend::cpu;
 
-    // The N-side sibling of matmul_packed_a_stack_holds_every_tile_height. The
-    // N-split packs each n-block's B into its own slice, indexed by the
-    // dispatch as `blk * np_slice * ldd_b`. Only the blocks before the last are
-    // exactly nc wide — the last packs N mod nc columns. The uniform route
-    // emits ceil(n/nr_max) panels for n columns, so the widest tile (nc) is
-    // also the worst case, and np_slice must cover it. A tile below nc emits
-    // fewer panels, never more.
-    //
-    // These shapes resolve kc == K (256), so the kernel's per-k-block panel
-    // stride equals plan.ldd_b and the demand checked below is exact, not merely
-    // bounded. If the rule ever drops kc below K here the check still holds, it
-    // just stops being tight — the np_slice guard above is what pins the sizing.
+    // N-side sibling of matmul_packed_a_region_holds_every_tile_height. The
+    // N-split packs each n-block's B into its own slice, indexed as
+    // blk*np_slice*ldd_b; the last block holds N mod nc columns, so the widest
+    // tile (nc) is the worst case and np_slice must cover ceil(n/nr_max) panels.
+    // K = 256 is exactly two 128-wide k-blocks, so every block packs at
+    // plan.kc and the demand below is exact; if the rule ever trims kc the
+    // check stays valid but stops being tight.
     for (int64_t N : {int64_t{2000}, int64_t{2001}, int64_t{2047}, int64_t{2048}}) {
         MatmulInputs in = make_matmul_inputs(64, 256, N, false, false, false, 3);
         MatMulAttributes attrs{};
         const auto plan = cpu::get_matmul_plan(attrs, in.a.desc(), in.b.desc(), 4);
 
         NNOPS_EXPECT_TRUE(plan.split_n);
-        // The A row stride is K = 256, so this is the direct-A route and the
-        // packed-A region is empty — the offsets checked below are then pure
-        // packed-B, which is what makes them exact rather than merely bounded.
+        // A's row stride is K = 256, so this is the direct-A route and the
+        // packed-A region empty; the offsets below are pure packed-B, hence exact.
         NNOPS_EXPECT_TRUE(!plan.pack_a);
         NNOPS_EXPECT_EQ(plan.num_slots, (N + plan.nc - 1) / plan.nc);
 
@@ -2761,8 +2535,7 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
         };
         NNOPS_EXPECT_EQ(plan.np_slice, panels_for(plan.nc));
 
-        // Every block, at the offset the dispatch gives it, stays inside the
-        // workspace the plan hands over.
+        // Every block, at its dispatch offset, stays inside the workspace.
         const int64_t nb = (N + plan.nc - 1) / plan.nc;
         const int64_t capacity = plan.workspace_size / static_cast<int64_t>(sizeof(float));
         for (int64_t blk = 0; blk < nb; ++blk) {
@@ -2775,23 +2548,15 @@ NNOPS_TEST(matmul_n_split_slice_holds_every_tile_width) {
 }
 
 NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
-    // End-to-end cover for the {8,4,1} non-monotonicity the region sizing is
-    // there for: a short final block packs more panels than the tile's own
-    // height does (143 rows -> 21 panels, 144 -> 18), so a region sized at
-    // num_panels(plan.mc) is the one that overruns. mc is a multiple of
-    // MC_ALIGN = 24, and the worst count always sits one row under it (24k-1
-    // needs 3k+3 panels, 24k only 3k), so num_panels_max exceeds
-    // num_panels(plan.mc) for every tile the rule produces — which is why
-    // sizing must use the former.
-    //
-    // Both shapes reach the pack through the packed-A kernel (transpose_a) with
-    // K == plan.kc, so the pack uses the full-Kc stride the region is sized at.
-    // The rule sizes the M-split so the block count is a multiple of the worker
-    // count, which makes the last block exactly mc-1 rows here — the worst case
-    // is not hypothetical, it is what these two shapes actually pack:
-    //   - M = 575 with 4 workers: mc = 144 (575/4 rounded up to the 24-grid),
+    // End-to-end cover for that non-monotonicity: the last block is exactly
+    // mc-1 rows, the worst case the region must hold. mc is a multiple of
+    // MC_ALIGN = 24 and the worst count sits one row under it (24k-1 needs
+    // 3k+3 panels, 24k only 3k), so num_panels_max exceeds num_panels(plan.mc)
+    // by construction. Both shapes reach the pack via transpose_a with K ==
+    // plan.kc, so the pack uses the full-kc stride the region is sized at.
+    //   - M = 575, 4 workers: mc = 144 (575/4 rounded up to the 24-grid),
     //     blocks 144,144,144,143.
-    //   - M = 287 with 2 workers: mc = 144, blocks 144,143.
+    //   - M = 287, 2 workers: mc = 144, blocks 144,143.
     struct Case { int64_t M; int nthreads; int64_t want_mc; };
     const Case cases[] = {
         {575, 4, 144},
@@ -2813,16 +2578,15 @@ NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
         auto descs = op->getOutputTensorDesc(arr);
 
         // Pin the premise: if the tile-shrink or clamp rule changes, these stop
-        // covering the bad remainder and the test should say so.
+        // covering the bad remainder.
         const auto plan = nnops::backend::cpu::get_matmul_plan(attrs, a_desc, b_desc,
                                                                c.nthreads);
         NNOPS_EXPECT_EQ(plan.mc, c.want_mc);
         NNOPS_EXPECT_TRUE(plan.pack_a);
         NNOPS_EXPECT_EQ(plan.np_a,
                         int64_t{nnops::backend::cpu::num_panels_max(static_cast<int>(plan.mc), nnops::backend::cpu::MR_F32)});
-        // And np_a really does exceed num_panels(plan.mc) — the count a naive
-        // region sizing would use, and the one that would put the short block's
-        // extra panels past the end of the region.
+        // np_a really does exceed num_panels(plan.mc), the naive sizing that
+        // would put the short block's extra panels past the region end.
         NNOPS_EXPECT_TRUE(plan.np_a >
                           nnops::backend::cpu::num_panels(static_cast<int>(plan.mc),
                                                           nnops::backend::cpu::MR_F32));
@@ -2843,21 +2607,11 @@ NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
 }
 
 NNOPS_TEST(matmul_threaded_multi_block_slots) {
-    // M-split with far more m-blocks than workers. The packed-B scratch is one
-    // slot per worker thread, so a thread reuses its slot across every block it
-    // claims rather than owning one slice per block. The case above uses
-    // M=200/N=300, where the split collapses to a single block, so this is the
-    // one that actually exercises slot reuse. The result must stay bit-identical
-    // to serial: blocks write disjoint C tiles and no reduction is reordered.
-    //
-    // The rule now sizes the M-split so the block count is a multiple of the
-    // worker count (balance_tile), so blocks == nthreads whenever M is under
-    // MC_MAX * nthreads = 768 * nthreads — and with one block per thread there
-    // is nothing to reuse a slot across. Slot mode therefore needs a big M now,
-    // not the M=1024 the old rule shrank to 8 blocks: every row below is in the
-    // thousands. The "ta" rows are the same shape as the "nn" ones with A
-    // stored transposed, so they reach the pack by the other route rather than
-    // by a different block count.
+    // M-split with far more m-blocks than workers, so a thread reuses its
+    // packed-B slot across the blocks it claims. balance_tile makes blocks ==
+    // nthreads below MC_MAX * nthreads = 768 * nthreads, so slot mode needs a big
+    // M; every row below is in the thousands. The "ta" rows carry the same shape
+    // as "nn" with A stored transposed. The result must stay bit-identical.
     struct Case { const char* name; int64_t M, K, N; bool ta; int nthreads; };
     const Case cases[] = {
         {"nn",      4096, 128, 512, false, 2},
@@ -2881,8 +2635,8 @@ NNOPS_TEST(matmul_threaded_multi_block_slots) {
         auto descs = op->getOutputTensorDesc(arr);
         const TensorView ins[] = {in.a, in.b};
 
-        // Guard against the test going vacuous: the plan must really be in
-        // slot mode (fewer slots than blocks) for this shape and pool.
+        // Guard against a vacuous test: the plan must really be in slot mode
+        // (fewer slots than blocks).
         const auto plan = nnops::backend::cpu::get_matmul_plan(
             attrs, in.a.desc(), in.b.desc(), c.nthreads, /*use_thread_slots=*/true);
         const int64_t num_blocks =
@@ -2917,8 +2671,7 @@ NNOPS_TEST(matmul_threaded_multi_block_slots) {
 }
 
 NNOPS_TEST(matmul_threaded_batched) {
-    // Batched matmul with the threading pool: each batch element parallelizes
-    // independently; the result must still match the reference.
+    // Batched matmul through the threading pool; each batch element parallelizes independently.
     const int64_t B = 3, M = 96, K = 128, N = 160;
     auto [a_vec, a] = test::make_random_tensor({B, M, K}, -1.0f, 1.0f, 909);
     auto [b_vec, b] = test::make_random_tensor({B, K, N}, -1.0f, 1.0f, 1010);
@@ -2952,10 +2705,9 @@ NNOPS_TEST(matmul_threaded_batched) {
 // ============================================================
 
 NNOPS_TEST(matmul_naive_kernel_layouts) {
-    // The small-GEMM kernel bypasses the operator, so its own coverage has to
-    // name the layouts: all four transpose combinations, N on both sides of the
-    // vector width (wide sweep vs per-output dots), k tails, padded pitches on A,
-    // B and C, and beta folded into the output.
+    // The small-GEMM kernel bypasses the operator, so its coverage names the
+    // layouts: all four transpose pairs, N on both sides of the vector width, k
+    // tails, padded pitches on A/B/C, and beta folded into C.
     namespace cpu = nnops::backend::cpu;
     using cpu::half;
 
@@ -3039,13 +2791,12 @@ NNOPS_TEST(matmul_naive_kernel_layouts) {
 // ============================================================
 
 NNOPS_TEST(matmul_gemv_route_layouts) {
-    // Small M leaves the packed route entirely: the direct kernel streams B
-    // once. Every shape below is far above GEMM_FAST_PATH_THRESHOLD, so each
-    // really takes that route — except ta+tb, which the kernel declines and the
-    // packed path must still answer. Covered: both dtypes, every transpose
-    // pair, k and n tails, N on both sides of the 1024-wide GEMV block, beta, a
-    // Relu epilogue, a broadcast batch, and B either side of the size cutoff
-    // that switches the nn kernel from the register tile to the stream.
+    // Small M leaves the packed route: the direct kernel streams B once. Every
+    // shape below is far above GEMM_FAST_PATH_THRESHOLD, so each takes it —
+    // except ta+tb, which the kernel declines and the packed path answers.
+    // Covers both dtypes, all transpose pairs, k/n tails, both sides of the
+    // 1024-wide GEMV block, beta, Relu, a broadcast batch, and B over the 24 MB
+    // cutoff that switches the nn kernel from register tile to stream.
     namespace cpu = nnops::backend::cpu;
     using cpu::half;
 
@@ -3060,9 +2811,9 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
         {4, 33,   4096, false, false, false, true,  false},
         {1, 700,  900,  false, false, true,  false, true},
         {2, 100,  700,  true,  true,  false, false, false},
-        // B over the 24 MB cutoff at f32 (25 MB) and at f16 (25 MB), which is
-        // the streaming kernel at M=2 and M=1 respectively; 3073 leaves a k
-        // row below the unroll depth.
+        // B over the 24 MB cutoff at f32 (25 MB) and f16 (25 MB) — the streaming
+        // kernel at M=2 and M=1 respectively; 3073 leaves a k row below the
+        // unroll depth.
         {2, 2048, 3073, false, false, false, true,  false},
         {1, 4096, 3073, false, false, false, false, false},
     };
@@ -3089,8 +2840,7 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
             const int64_t b_cols = c.tb ? c.K : c.N;
             const int64_t batch = c.batch ? 2 : 1;
 
-            // The reference is f32-only, so it reads f32 mirrors of the same
-            // values (the f16 inputs are already rounded to what the op saw).
+            // The reference is f32-only, so it reads f32 mirrors of the same values.
             nnops::test::XorShift128 rng(31);
             std::vector<float> af32(static_cast<size_t>(batch * a_rows * a_cols));
             std::vector<float> bf32(static_cast<size_t>(batch * b_rows * b_cols));
@@ -3158,13 +2908,6 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
 // ============================================================
 // The prepacked B — MatMul::prepackWeights
 // ============================================================
-//
-// Packing B once at load time takes the per-call RHS pack out of the GEMM and
-// changes nothing else — the same uniform panels, the same k-blocks, the same
-// accumulation order — so where the raw B also takes the tiled GEMM the two
-// products must agree to the bit. Below the small product's thresholds the raw
-// B takes the pack-free kernel instead (a prepacked B is panel-formatted and
-// cannot), and there the two are compared as numbers.
 
 NNOPS_TEST(matmul_prepacked_b) {
     namespace cpu = nnops::backend::cpu;
@@ -3177,7 +2920,7 @@ NNOPS_TEST(matmul_prepacked_b) {
     const Case cases[] = {
         {1,  5,   37,  19, false, true},   // tails on both axes
         {1,  5,   37,  19, true,  true},   // the same product, B stored [N, K]
-        {1,  1,    8,   5, true,  false},  // one row: the raw B is a GEMV
+        {1,  1,    8,   5, true,  false},  // 40 MACs: the raw B takes the naive small kernel
         {3, 16,  300,  48, false, true},   // batched A, several k-blocks
         {2, 64,  256,  96, true,  true},   // a layer shape, B broadcast
         {1,  4, 1024,  17, false, false},  // deep K, M = 4: the raw B is a GEMV
@@ -3227,13 +2970,11 @@ NNOPS_TEST(matmul_prepacked_b) {
             TensorView oq[] = {q};
             op->prepackWeights(bq, oq);
             q = oq[0];
-            // A query answer carries no storage (as Conv2D's does): the rank
-            // is what separates it from "this B has no packed form".
+            // A query answer carries no storage; rank separates it from "no packed form".
             NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
             NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
                             static_cast<int>(TensorLayout::PackedB));
-            // Leading N: shape inference reads it, and it is what the panel
-            // count is built from.
+            // Leading N: what shape inference reads and the panel count is built from.
             NNOPS_EXPECT_EQ(q.shape(0), c.N);
             NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
 
@@ -3244,8 +2985,6 @@ NNOPS_TEST(matmul_prepacked_b) {
             TensorView opk[] = {packed};
             op->prepackWeights(bp, opk);
 
-            // The blob's descriptor resolves the same product shape as the raw
-            // B did.
             const TensorDesc pdescs[] = {a.desc(), packed.desc()};
             const auto pod = op->getOutputTensorDesc(pdescs);
             NNOPS_EXPECT_EQ(pod[0].rank, od[0].rank);
@@ -3296,8 +3035,8 @@ NNOPS_TEST(matmul_prepacked_b_contract_errors) {
     TensorView opk[] = {packed};
     op->prepackWeights(bp, opk);
 
-    // The blob carries no K (only N), so a caller who packs against one K and
-    // computes against another is refused rather than read past the panels.
+    // The blob carries no K (only N), so a mismatched-K compute is refused
+    // rather than reading past the panels.
     auto [av, a] = test::make_random_tensor({4, 31}, -1.0f, 1.0f, 62);
     const int64_t oshape[] = {4, 19};
     std::vector<float> obuf(static_cast<size_t>(4 * 19));

@@ -1,6 +1,15 @@
 #pragma once
 /// @file compute_context.hpp
 /// @brief ComputeContext — backend-specific execution parameters.
+///
+/// Each backend reads only the fields it cares about. Nothing in the library
+/// dispatches on expected_backend — an operator is bound to its backend at
+/// creation — so it is informational for callers and tests.
+///
+/// Vulkan: vulkan_descriptor_pool must be created with
+/// VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, since per-call descriptor
+/// sets are allocated from it and freed. vulkan_buffers holds one VkBuffer per
+/// tensor, inputs first — [A, B, output] for eltwise, [input, output] for unary.
 
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/core/backend.hpp"
@@ -9,36 +18,25 @@
 namespace nnops {
 
 /// Execution context passed to operator compute() calls.
-/// Each backend reads only the fields it cares about.
 struct ComputeContext {
-    /// Backend this context was prepared for. Default: CPU.
-    /// Nothing in the library dispatches on it — an operator is bound to its
-    /// backend at creation — so it is informational for callers and tests.
+    /// Backend this context was prepared for (informational).
     Backend expected_backend = Backend::CPU;
 
-    /// CPU execution backend: parallelism + worker-count / thread-id hooks.
+    /// CPU hooks: parallelism, worker count, thread id.
     CpuBackend cpu;
 
-    /// CUDA stream (cudaStream_t), opaque pointer.
-    void* cuda_stream = nullptr;
+    void* cuda_stream = nullptr;  ///< cudaStream_t, opaque.
 
     // ---- Vulkan backend fields ----
-    /// VkCommandBuffer to record dispatch commands into.
-    void* vulkan_cmd_buffer = nullptr;
+    void* vulkan_cmd_buffer = nullptr;  ///< VkCommandBuffer.
 
-    /// VkDevice handle, used for pipeline creation and descriptor set allocation.
-    void* vulkan_device = nullptr;
+    void* vulkan_device = nullptr;  ///< VkDevice.
 
-    /// VkDescriptorPool for allocating per-call descriptor sets.
-    /// Must be created with VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT.
-    void* vulkan_descriptor_pool = nullptr;
+    void* vulkan_descriptor_pool = nullptr;  ///< VkDescriptorPool; see header.
 
-    /// Array of VkBuffer handles, one per tensor (inputs first, then outputs).
-    /// For eltwise: [A, B, output]; for unary: [input, output].
-    const void* vulkan_buffers = nullptr;
+    const void* vulkan_buffers = nullptr;  ///< VkBuffer handles, inputs first; see header.
 
-    /// Number of entries in vulkan_buffers array.
-    int vulkan_buffers_count = 0;
+    int vulkan_buffers_count = 0;  ///< Entries in vulkan_buffers.
 };
 
 }  // namespace nnops

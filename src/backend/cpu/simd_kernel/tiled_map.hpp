@@ -36,11 +36,7 @@ inline auto apply_array(Fn& fn, const Arr& arr, std::index_sequence<I...>) -> de
     return fn(std::get<I>(arr)...);
 }
 
-/// Row-tiled mapper with a SIMD inner loop and scalar tail, for a `Nin`-ary op.
-///
-/// `in` holds the `Nin` input base pointers; `in_pitch` the corresponding row
-/// strides (elements). The output is written at `out` with row stride
-/// `out_pitch`. When `add_to`, the result is accumulated onto the output.
+/// Row-tiled SIMD loop plus a scalar tail for a `Nin`-ary op; `add_to` accumulates onto `out`.
 template <typename T, int Nin, typename SimdK, typename ScalarK>
 inline void tiled_map_simd(const std::array<const T*, Nin>& in,
                            const std::array<int64_t, Nin>& in_pitch,

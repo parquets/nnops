@@ -1,6 +1,9 @@
-/// Unit tests for RoPE operator (CPU optimized + reference).
-/// Covers standard RoPE (interleaved and split-half), mRoPE, various shapes,
-/// edge cases.
+/// @file test_rope.cpp
+/// @brief Unit tests for RoPE, checked against a scalar reference.
+///
+/// Covers the interleaved and split-half layouts, mRoPE sections with
+/// per-section bases, 2-D through 4-D shapes, the f16 path, and the edge cases
+/// (zero input, single position).
 
 #include "nnops/ops/rope.hpp"
 #include "common/test_harness.hpp"
@@ -14,7 +17,7 @@
 using namespace nnops;
 
 // ============================================================
-// Helper: scalar RoPE reference for verification
+// Helper: scalar RoPE reference
 // ============================================================
 
 static float rope_theta(int64_t pos, int64_t pair_idx, int64_t head_dim,
@@ -62,7 +65,6 @@ static void compute_rope_ref(const float* x, float* y,
 // ============================================================
 
 NNOPS_TEST(rope_simple_interleaved) {
-    // 2 positions, head_dim=4 (2 pairs), base=1.0 for simple angles
     const int64_t shape[] = {2, 4};
     float x_data[] = {1.0f, 0.0f, 2.0f, 0.0f,
                       0.0f, 1.0f, 0.0f, 2.0f};
@@ -74,7 +76,6 @@ NNOPS_TEST(rope_simple_interleaved) {
     attrs.interleaved = true;
     auto op = RoPE::create(attrs, Backend::CPU);
 
-    // Validate output descriptor
     auto d_x = x.desc();
     const TensorDesc desc_arr[] = {d_x};
     auto descs = op->getOutputTensorDesc(desc_arr);
@@ -113,7 +114,6 @@ NNOPS_TEST(rope_simple_interleaved) {
 }
 
 NNOPS_TEST(rope_simple_splithalf) {
-    // 1 position, head_dim=4, base=10000
     const int64_t shape[] = {1, 4};
     float x_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
 
@@ -169,7 +169,6 @@ NNOPS_TEST(rope_random_interleaved) {
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
-    // Compute reference
     std::vector<float> ref(static_cast<size_t>(N), 0.0f);
     compute_rope_ref(in_vec.data(), ref.data(), seq_len, head_dim,
                      10000.0f, true);
@@ -215,7 +214,6 @@ NNOPS_TEST(rope_random_splithalf) {
 // ============================================================
 
 NNOPS_TEST(rope_3d_batch) {
-    // [B=2, S=3, D=8]
     const int64_t shape[] = {2, 3, 8};
     auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, 102);
 
@@ -237,13 +235,12 @@ NNOPS_TEST(rope_3d_batch) {
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
-    // Verify batch 0 and batch 1 get same rotation for same position
-    // (position-dependent, not batch-dependent)
+    // Only a finiteness check here; the rotation itself is covered by the
+    // reference tests.
     for (int b = 0; b < 2; ++b) {
         for (int s = 0; s < 3; ++s) {
             for (int d = 0; d < 8; ++d) {
                 int idx = b * (3 * 8) + s * 8 + d;
-                // Result should be non-zero for non-trivial input
                 NNOPS_EXPECT_TRUE(std::isfinite(out_buf[static_cast<size_t>(idx)]));
             }
         }
@@ -251,7 +248,6 @@ NNOPS_TEST(rope_3d_batch) {
 }
 
 NNOPS_TEST(rope_4d_multihead) {
-    // [B=2, H=4, S=3, D=8]
     const int64_t shape[] = {2, 4, 3, 8};
     auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, 103);
 
@@ -274,7 +270,6 @@ NNOPS_TEST(rope_4d_multihead) {
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
-    // Compare against reference per (batch, head)
     std::vector<float> ref(static_cast<size_t>(2 * 4 * 3 * 8), 0.0f);
     for (int b = 0; b < 2; ++b) {
         for (int h = 0; h < 4; ++h) {
@@ -287,10 +282,6 @@ NNOPS_TEST(rope_4d_multihead) {
         NNOPS_EXPECT_NEAR(out_buf[i], ref[i], 1e-4f);
     }
 }
-
-// ============================================================
-// Different base frequencies
-// ============================================================
 
 NNOPS_TEST(rope_different_bases) {
     // 2 positions: pos=0 gives identity for all bases,
@@ -314,7 +305,7 @@ NNOPS_TEST(rope_different_bases) {
     const TensorView x_arr[] = {x};
     op1->compute(y1, x_arr);
 
-    // base=1000000.0: theta ≈ 0, cos≈1, sin≈0 → practically identity
+    // base=1000000.0: pair 1's theta ≈ 0, so only that pair stays near-identity
     RoPEAttributes attrs2;
     attrs2.base = 1000000.0f;
     auto op2 = RoPE::create(attrs2, Backend::CPU);
@@ -323,7 +314,6 @@ NNOPS_TEST(rope_different_bases) {
     auto y2 = test::make_planar(d[0], out2.data());
     op2->compute(y2, x_arr);
 
-    // Different bases should produce different results
     float diff = 0.0f;
     for (size_t i = 0; i < out1.size(); ++i) {
         diff += std::abs(out1[i] - out2[i]);
@@ -347,7 +337,7 @@ NNOPS_TEST(mrope_two_sections_same_base) {
     RoPEAttributes attrs;
     attrs.base = 10000.0f;
     attrs.interleaved = true;
-    attrs.mrope_section_dims = {8};  // single section covering entire head_dim
+    attrs.mrope_section_dims = {8};
     auto op = RoPE::create(attrs, Backend::CPU);
 
     auto dx = x.desc();
@@ -358,8 +348,6 @@ NNOPS_TEST(mrope_two_sections_same_base) {
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
-    // Should give the same result as standard RoPE with head_dim=8
-    // (same section dim = same frequency formula)
     RoPEAttributes attrs_std;
     attrs_std.base = 10000.0f;
     attrs_std.interleaved = true;
@@ -376,15 +364,14 @@ NNOPS_TEST(mrope_two_sections_same_base) {
 }
 
 NNOPS_TEST(mrope_different_bases) {
-    // head_dim=4, sections=[2,2], bases=[1.0, 1000000.0]
-    // First pair rotates by pos, second pair is essentially identity
+    // One pair per section, each at exponent 0: theta = pos for either base.
     const int64_t shape[] = {1, 4};
     float x_data[] = {1.0f, 0.0f, 1.0f, 0.0f};
 
     TensorView x(shape, DataType::f32, x_data);
 
     RoPEAttributes attrs;
-    attrs.base = 1.0f;  // default for sections without explicit base
+    attrs.base = 1.0f;  // fallback when mrope_section_bases is empty
     attrs.interleaved = true;
     attrs.mrope_section_dims = {2, 2};
     attrs.mrope_section_bases = {1.0f, 1000000.0f};
@@ -426,14 +413,12 @@ NNOPS_TEST(rope_zero_input) {
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
-    // All zeros → all zeros
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_buf[i], 0.0f, 1e-6f);
     }
 }
 
 NNOPS_TEST(rope_single_position) {
-    // seq_len=1, head_dim=8
     const int64_t shape[] = {1, 8};
     float x_data[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
 
@@ -480,10 +465,6 @@ NNOPS_TEST(rope_large_head_dim) {
     }
 }
 
-// ============================================================
-// Class API
-// ============================================================
-
 NNOPS_TEST(rope_class_api) {
     const int64_t shape[] = {1, 4};
     float x_data[] = {1.0f, 0.0f, 2.0f, 0.0f};
@@ -508,19 +489,11 @@ NNOPS_TEST(rope_class_api) {
     NNOPS_EXPECT_NEAR(out_data[3], 0.0f, 1e-5f);
 }
 
-// ============================================================
-// OpType verification
-// ============================================================
-
 NNOPS_TEST(rope_op_type) {
     auto op = RoPE::create(Backend::CPU);
     NNOPS_EXPECT_EQ(op->getOpType(), OpType::RoPE);
     NNOPS_EXPECT_EQ(op->getBackend(), Backend::CPU);
 }
-
-// ============================================================
-// f16 test — exercise the SIMD f16 code path
-// ============================================================
 
 NNOPS_TEST(rope_random_interleaved_f16) {
     const int64_t seq_len = 6;
@@ -549,7 +522,6 @@ NNOPS_TEST(rope_random_interleaved_f16) {
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
-    // Compute f32 reference
     std::vector<float> ref(static_cast<size_t>(N), 0.0f);
     compute_rope_ref(f32_vec.data(), ref.data(), seq_len, head_dim,
                      10000.0f, true);

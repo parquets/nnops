@@ -1,12 +1,13 @@
 #pragma once
 /// @file simd_mul_add_reduce.hpp
-/// @brief Fused multiply-add + sum / sum-of-squares primitives for a scaled
-/// residual add fused with normalization statistics.
-///
-/// For one contiguous row, write out[i] = a[i] + b[i] * scale while
-/// simultaneously accumulating that row's sum and sum-of-squares, so the
-/// subsequent normalize pass can derive mean/var (LayerNorm) or rms (RMSNorm)
+/// @brief Scaled residual add fused with a row's sum and sum-of-squares:
+/// out[i] = a[i] + b[i] * scale, accumulating both statistics in the same pass
+/// so a following normalize can derive mean/var (LayerNorm) or rms (RMSNorm)
 /// without re-reading the row.
+///
+/// 4-wide multi-accumulator unrolling for ILP, then 2-wide → 1-wide SIMD →
+/// scalar tail. Both statistics are returned as float regardless of T, though
+/// a half input accumulates in half lanes; the output is written back in T.
 
 #include "nnops/detail/simd/simd.hpp"
 
@@ -16,15 +17,7 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Fused multiply-add + reduce over n contiguous elements.
-///
-/// Computes `out[i] = a[i] + b[i] * scale` for i in [0, n) and returns
-/// `{sum, sum_sq}` where sum = Σ out[i], sum_sq = Σ out[i]².
-///
-/// Both statistics are returned as float regardless of T (fp16 inputs are
-/// promoted); the output is written back in T. Uses 4-wide multi-accumulator
-/// unrolling for ILP, then 2-wide → 1-wide SIMD → scalar tail — the same
-/// shape as row_reduce_sum_sq in simd_reduce_primitive.hpp.
+/// Returns {sum, sum_sq} of `out` over n contiguous elements, both float.
 template <typename T>
 inline std::pair<float, float> mul_add_reduce_square_sum(
     const T* a, const T* b, float scale, T* out, int64_t n)
@@ -35,7 +28,6 @@ inline std::pair<float, float> mul_add_reduce_square_sum(
     float sum = 0.0f;
     float sum_sq = 0.0f;
 
-    // ---- Stage 1: 4-wide SIMD (ILP ×4) ----
     {
         auto v_sum0 = v_zero(a);
         auto v_sum_sq0 = v_zero(a);
@@ -68,7 +60,6 @@ inline std::pair<float, float> mul_add_reduce_square_sum(
         auto v_sum_sq = v_add(v_add(v_sum_sq0, v_sum_sq1),
                               v_add(v_sum_sq2, v_sum_sq3));
 
-        // ---- Stage 2: 2-wide SIMD ----
         auto v_sum4 = v_zero(a);
         auto v_sum_sq4 = v_zero(a);
         auto v_sum5 = v_zero(a);
@@ -86,7 +77,6 @@ inline std::pair<float, float> mul_add_reduce_square_sum(
         v_sum = v_add(v_sum, v_add(v_sum4, v_sum5));
         v_sum_sq = v_add(v_sum_sq, v_add(v_sum_sq4, v_sum_sq5));
 
-        // ---- Stage 3: 1-wide SIMD ----
         for (; i + L <= n; i += L) {
             auto v = v_fmadd(v_load(b + i), v_scale, v_load(a + i));
             v_store(out + i, v);
@@ -98,7 +88,6 @@ inline std::pair<float, float> mul_add_reduce_square_sum(
         sum_sq = v_reduce_sum(v_sum_sq);
     }
 
-    // ---- Stage 4: scalar tail ----
     for (; i < n; ++i) {
         float s = s_load(&a[i]) + s_load(&b[i]) * scale;
         s_store(&out[i], s);

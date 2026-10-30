@@ -1,6 +1,16 @@
 #pragma once
 /// @file op_base.hpp
 /// @brief OpBase — abstract base class for all operator implementations.
+///
+/// An operator never allocates a caller buffer: compute() takes pre-allocated outputs,
+/// inputs, a ComputeContext, and a user workspace of getWorkspaceSize() bytes.
+/// getOutputTensorDesc() infers each output's shape, dtype and layout from the
+/// input descriptors (no data is read), which is what a graph engine needs to
+/// plan buffers. validate() is the descriptor-only twin of compute()'s contract
+/// check, so a malformed graph fails at plan time and the rules live in one
+/// place. prepackWeights() is dual-behavior: an empty outputs[0] (is_empty() is
+/// the query) is filled with shape/dtype/layout/pitch to allocate against, while
+/// a populated one receives the packed weight data.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -17,54 +27,24 @@
 namespace nnops {
 
 /// Abstract base class for all operators.
-///
-/// Each operator:
-///   - Is created via a static create() factory method.
-///   - Reports its workspace requirements via getWorkspaceSize().
-///   - Executes via compute(), which takes pre-allocated output tensors,
-///     input tensors, a compute context, and a user-provided workspace buffer.
-///   - Does NOT internally allocate memory — the user manages all buffers.
-///   - Provides shape and layout inference via getOutputTensorDesc() — given input
-///     TensorDescs (shapes + dtype, no data), returns the expected output
-///     TensorDescs. This enables graph-level shape propagation and memory
-///     planning before execution.
 class OpBase {
 public:
     virtual ~OpBase() = default;
 
-    /// Compute the output tensor descriptors from input tensor descriptors.
-    ///
-    /// This is pure shape inference — no data buffers are accessed. The
-    /// returned TensorDesc values describe the expected shape, dtype, and
-    /// layout of each output tensor. Used by graph engines and runtime
-    /// memory planners to pre-allocate output buffers.
-    ///
-    /// Most operators produce exactly one output. These produce more:
-    /// LinearAttention (output + state), TopK (values + indices).
-    ///
-    /// @param inputs  Input tensor descriptors (shapes + dtype + layout).
-    /// @return        Output tensor descriptors. Size is typically 1.
+    /// Infer output descriptors from input descriptors; no data is read.
     virtual std::vector<TensorDesc> getOutputTensorDesc(
         std::span<const TensorDesc> inputs) const = 0;
 
-    /// Returns the workspace size in bytes required by this operator.
-    /// Receives input/output tensor descriptors (shapes + dtype, no data) to
-    /// compute workspace from actual dimensions. Analogous to TensorRT's
-    /// IPluginV2DynamicExt::getWorkspaceSize.
-    /// Default returns 0 — override only if the operator needs scratch memory.
+    /// Workspace bytes required; receives descriptors (shapes + dtype, no data).
+    /// Default 0 — override only if the operator needs scratch memory.
     virtual size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                                     std::span<const TensorDesc> outputs) const
     {
         return 0;
     }
 
-    /// Check the call against the operator's contract, from descriptors only —
-    /// no data is read, nothing is written. Graph engines run this over every
-    /// node before allocating buffers, so a malformed graph fails at plan time
-    /// instead of halfway through execution.
-    ///
-    /// compute() runs the same check first, so the rules live in one place.
-    /// Default: ok (nothing to check beyond the tensor count).
+    /// Check the call from descriptors only — no data read, nothing written.
+    /// Default: ok.
     virtual Status validate(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const
     {
@@ -73,24 +53,13 @@ public:
         return Status::ok;
     }
 
-    /// Execute the operator (primary virtual — multi-output).
-    ///
-    /// @param outputs   Pre-allocated output tensors. User manages memory.
-    ///                  Single-output operators use outputs[0].
-    /// @param inputs    Input tensors (immutable during compute). Number and
-    ///                  meaning depend on the specific operator.
-    /// @param ctx       Backend-specific execution context (stream, thread pool, etc.)
-    /// @param workspace Optional pre-allocated scratch buffer of at least
-    ///                  getWorkspaceSize() bytes. May be nullptr if size == 0.
-    /// @return          ok, or the first failed contract check. Nothing is
-    ///                  written to the outputs on error.
+    /// Execute the operator; on error nothing is written to the outputs.
     virtual Status compute(std::span<TensorView> outputs,
                            std::span<const TensorView> inputs,
                            const ComputeContext& ctx = {},
                            void* workspace = nullptr) = 0;
 
     /// Convenience overload for single-output operators.
-    /// Calls the span-based virtual above — no override needed in subclasses.
     Status compute(TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx = {},
@@ -100,22 +69,7 @@ public:
         return compute(std::span<TensorView>(outputs), inputs, ctx, workspace);
     }
 
-    /// Prepack weights into an optimized format for the target backend.
-    ///
-    /// Dual-behavior API — the caller discovers the required buffer, then
-    /// fills it, in two steps:
-    ///
-    ///   Step 1 — query shape/size: pass an empty outputs[0] (is_empty()
-    ///   returns true). The function fills outputs[0] with shape, dtype,
-    ///   layout, and pitch so the caller can allocate the exact buffer.
-    ///
-    ///   Step 2 — perform prepack: pass an outputs[0] whose data pointer
-    ///   points to a buffer of at least the size described in step 1.
-    ///   The function writes the prepacked weight data into that buffer.
-    ///
-    /// @param inputs   Raw weight tensor(s) in standard layout (e.g. NCHW).
-    /// @param outputs  outputs[0] — empty (query) or pre-allocated (prepack).
-    /// @param ctx      Compute context (may be unused).
+    /// Query (empty outputs[0]) or perform (populated) the weight prepack.
     virtual void prepackWeights(std::span<const TensorView> inputs,
                                 std::span<TensorView> outputs,
                                 const ComputeContext& ctx = {})
@@ -125,30 +79,21 @@ public:
         (void)ctx;
     }
 
-    /// Returns the layout support category for this operator instance.
-    ///
-    /// Tells graph compilers and runtime validators which layouts this operator
-    /// can handle. The value is specific to the backend this instance was created
-    /// for — the same operator type may return different LayoutSupport for
-    /// different backends (e.g. CPU SIMD = PackedOnly, CPU Reference = PlanarOnly).
-    ///
-    /// Default: LayoutSupport::Any (most operators handle any layout transparently
-    /// via pitch-aware row processing).
+    /// Layout capabilities this instance accepts; backend-specific. Default Any.
     virtual LayoutSupport getLayoutSupport() const noexcept { return LayoutSupport::Any; }
 
-    /// Returns the ONNX-style operation type identifier.
+    /// ONNX-style operation type identifier.
     virtual OpType getOpType() const = 0;
 
-    /// Returns the backend this operator was created for.
+    /// Backend this operator was created for.
     virtual Backend getBackend() const = 0;
 
 protected:
-    /// Build descriptors from the call's views (inline storage, no heap) and
-    /// run validate(). Implementations call this first in compute().
+    /// Build descriptors from the call's views (inline, no heap) and run validate().
     Status validate_views(std::span<TensorView> outputs,
                           std::span<const TensorView> inputs) const
     {
-        // Inline for every operator's fixed arity (MoE, at nine, is the widest).
+        // Inline covers every operator's fixed arity (MoE, at nine, is the widest).
         constexpr size_t kInline = 16;
         if (inputs.size() <= kInline && outputs.size() <= kInline) {
             detail::SmallVector<TensorDesc, kInline> in_d;
@@ -158,8 +103,7 @@ protected:
             return validate(std::span<const TensorDesc>(in_d.data(), in_d.size()),
                             std::span<const TensorDesc>(out_d.data(), out_d.size()));
         }
-        // Wider than inline (a very wide Concat): pay one allocation rather
-        // than reject a legal call.
+        // Wider than inline (a very wide Concat): one allocation, not a rejection.
         std::vector<TensorDesc> in_d;
         std::vector<TensorDesc> out_d;
         in_d.reserve(inputs.size());

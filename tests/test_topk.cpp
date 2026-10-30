@@ -1,5 +1,9 @@
 /// @file test_topk.cpp
-/// @brief Unit tests for TopK operator (CPU backend).
+/// @brief TopK on the CPU backend: values and indices along an axis.
+///
+/// Each hand-checked case spells out the values it expects and where they come
+/// from; the random cases rebuild the answer by sorting. Covers k, negative-axis
+/// wrap, sorted and unsorted, and the (Values, Indices) outputs.
 
 #include "nnops/ops/topk.hpp"
 #include "common/test_harness.hpp"
@@ -120,11 +124,9 @@ NNOPS_TEST(topk_1d_unsorted) {
     op->compute(outs, ins);
 
     // Unsorted: top 3 values are 10, 8, 6 (any order)
-    // Verify the set
     float found_vals[3] = {val_buf[0], val_buf[1], val_buf[2]};
     int64_t found_idx[3] = {idx_buf[0], idx_buf[1], idx_buf[2]};
 
-    // Check each expected value appears
     bool has_10 = false, has_8 = false, has_6 = false;
     for (int i = 0; i < 3; ++i) {
         if (found_vals[i] == 10.0f) {
@@ -141,7 +143,6 @@ NNOPS_TEST(topk_1d_unsorted) {
     NNOPS_EXPECT_TRUE(has_8);
     NNOPS_EXPECT_TRUE(has_6);
 
-    // Check indices match values
     for (int i = 0; i < 3; ++i) {
         NNOPS_EXPECT_NEAR(data[found_idx[i]], found_vals[i], 1e-6f);
     }
@@ -391,7 +392,6 @@ NNOPS_TEST(topk_random_vs_ref) {
 
     // Verify each row's top-5 by brute force
     for (int64_t r = 0; r < 5; ++r) {
-        // Build sorted pairs for this row
         struct Pair { float v; int64_t i; };
         std::vector<Pair> pairs(20);
         for (int64_t c = 0; c < 20; ++c) {
@@ -568,10 +568,6 @@ NNOPS_TEST(topk_class_api) {
     NNOPS_EXPECT_NEAR(val_buf[2], 4.0f, 1e-6f);
     NNOPS_EXPECT_EQ(idx_buf[2], 2);
 }
-
-// ============================================================
-// OpType
-// ============================================================
 
 NNOPS_TEST(topk_op_type) {
     auto op = TopK::create(Backend::CPU);

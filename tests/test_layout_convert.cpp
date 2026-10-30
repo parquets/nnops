@@ -1,5 +1,12 @@
-/// Unit tests for layout conversion (NCHW <-> NCHWC8, NCDHW <-> NCDHWC8).
-/// All conversions use the LayoutConvert operator class exclusively.
+/// @file test_layout_convert.cpp
+/// @brief LayoutConvert tests — NCHW <-> NCHWC8 (2D) and NCDHW <-> NCDHWC8 (3D).
+///
+/// The round-trip cases drive the LayoutConvert operator class in both
+/// directions and check the result bit-exact against the planar input: f32, f16,
+/// and partial C8 (the trailing block is zero-padded on pack and unpack drops
+/// the pad lanes). The others pin TensorDesc::storage_bytes() row alignment,
+/// the shape/layout inference done by getOutputTensorDesc(), and the op's
+/// OpType/Backend.
 
 #include "nnops/ops/layout_convert.hpp"
 #include "nnops/detail/half.hpp"
@@ -12,11 +19,10 @@
 #include <vector>
 
 using namespace nnops;
-using namespace nnops::backend::cpu;  // for half, float_to_half, half_to_float
+using namespace nnops::backend::cpu;  // for float_to_half / half_to_bits
 
 namespace {
 
-/// Fill a planar NCHW f32 tensor with deterministic sequential values.
 inline void fill_sequential_f32(TensorView& tv) {
     float* p = tv.ptr<float>();
     const int64_t N = tv.shape(0), C = tv.shape(1);
@@ -36,7 +42,6 @@ inline void fill_sequential_f32(TensorView& tv) {
     }
 }
 
-/// Fill a planar NCHW f16 tensor with deterministic sequential values.
 inline void fill_sequential_f16(TensorView& tv) {
     const int64_t N = tv.shape(0), C = tv.shape(1);
     const int64_t H = tv.shape(2), W = tv.shape(3);
@@ -57,7 +62,6 @@ inline void fill_sequential_f16(TensorView& tv) {
     }
 }
 
-/// Fill a planar NCDHW f32 tensor with deterministic sequential values.
 inline void fill_sequential_3d_f32(TensorView& tv) {
     float* p = tv.ptr<float>();
     const int64_t N = tv.shape(0), C = tv.shape(1), D = tv.shape(2);
@@ -80,8 +84,7 @@ inline void fill_sequential_3d_f32(TensorView& tv) {
     }
 }
 
-/// Compare two planar tensors element-by-element (bit-exact).
-/// Both tensors must be densely packed (as from make_planar).
+/// Bit-exact compare; both tensors must be densely packed (make_planar).
 template <typename T>
 bool tensors_equal(const TensorView& a, const TensorView& b) {
     if (a.rank() != b.rank()) {
@@ -106,7 +109,6 @@ bool tensors_equal(const TensorView& a, const TensorView& b) {
     return true;
 }
 
-/// Build a 4D TensorDesc.
 inline TensorDesc make_desc_4d(int64_t N, int64_t C, int64_t H, int64_t W,
                                 DataType dtype, TensorLayout layout) {
     TensorDesc desc;
@@ -121,7 +123,6 @@ inline TensorDesc make_desc_4d(int64_t N, int64_t C, int64_t H, int64_t W,
     return desc;
 }
 
-/// Build a 5D TensorDesc.
 inline TensorDesc make_desc_5d(int64_t N, int64_t C, int64_t D, int64_t H, int64_t W,
                                 DataType dtype, TensorLayout layout) {
     TensorDesc desc;
@@ -144,14 +145,12 @@ inline TensorDesc make_desc_5d(int64_t N, int64_t C, int64_t D, int64_t H, int64
 // ============================================================
 
 NNOPS_TEST(layout_convert_roundtrip_f32) {
-    // N=2, C=16, H=3, W=4
     auto input_desc = make_desc_4d(2, 16, 3, 4, DataType::f32, TensorLayout::NCHW);
 
     std::vector<float> input_data(input_desc.numel());
     auto input = nnops::test::make_planar(input_desc, input_data.data());
     fill_sequential_f32(input);
 
-    // Pack: NCHW -> NCHWC8
     auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
     const TensorDesc pack_in_descs[] = { input_desc };
     auto packed_descs = pack_op->getOutputTensorDesc(pack_in_descs);
@@ -164,7 +163,6 @@ NNOPS_TEST(layout_convert_roundtrip_f32) {
     const TensorView pack_ins[] = { input };
     pack_op->compute(packed, pack_ins);
 
-    // Unpack: NCHWC8 -> NCHW
     auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
     const TensorDesc unpack_in_descs[] = { packed_descs[0] };
     auto unpacked_descs = unpack_op->getOutputTensorDesc(unpack_in_descs);
@@ -185,7 +183,6 @@ NNOPS_TEST(layout_convert_roundtrip_f32) {
 // ============================================================
 
 NNOPS_TEST(layout_convert_roundtrip_partial_c8_f32) {
-    // C=20 - last C8 block has 4 valid channels + 4 zero-padded
     auto input_desc = make_desc_4d(1, 20, 2, 3, DataType::f32, TensorLayout::NCHW);
 
     std::vector<float> input_data(input_desc.numel());
@@ -220,7 +217,6 @@ NNOPS_TEST(layout_convert_roundtrip_partial_c8_f32) {
 // ============================================================
 
 NNOPS_TEST(layout_convert_roundtrip_single_channel_f32) {
-    // C=1 - highly partial C8 block
     auto input_desc = make_desc_4d(1, 1, 4, 5, DataType::f32, TensorLayout::NCHW);
 
     std::vector<float> input_data(input_desc.numel());
@@ -289,14 +285,12 @@ NNOPS_TEST(layout_convert_roundtrip_f16) {
 // ============================================================
 
 NNOPS_TEST(layout_convert_roundtrip_3d_f32) {
-    // N=1, C=16, D=2, H=3, W=4
     auto input_desc = make_desc_5d(1, 16, 2, 3, 4, DataType::f32, TensorLayout::NCDHW);
 
     std::vector<float> input_data(input_desc.numel());
     auto input = nnops::test::make_planar(input_desc, input_data.data());
     fill_sequential_3d_f32(input);
 
-    // Pack: NCDHW -> NCDHWC8
     auto pack_op = LayoutConvert::create(TensorLayout::NCDHWC8);
     const TensorDesc pack_in_descs[] = { input_desc };
     auto packed_descs = pack_op->getOutputTensorDesc(pack_in_descs);
@@ -309,7 +303,6 @@ NNOPS_TEST(layout_convert_roundtrip_3d_f32) {
     const TensorView pack_ins[] = { input };
     pack_op->compute(packed, pack_ins);
 
-    // Unpack: NCDHWC8 -> NCDHW
     auto unpack_op = LayoutConvert::create(TensorLayout::NCDHW);
     const TensorDesc unpack_in_descs[] = { packed_descs[0] };
     auto unpacked_descs = unpack_op->getOutputTensorDesc(unpack_in_descs);
@@ -355,7 +348,7 @@ NNOPS_TEST(storage_bytes_needs_alignment) {
     desc.dims[0] = 1;
     desc.dims[1] = 8;
     desc.dims[2] = 2;
-    desc.dims[3] = 7;  // W=7
+    desc.dims[3] = 7;
     desc.dtype = DataType::f32;
     desc.layout = TensorLayout::NCHWC8;
 

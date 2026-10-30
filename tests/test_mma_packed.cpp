@@ -2,20 +2,16 @@
 /// @brief Correctness tests for the x86_64 / aarch64 packed-AB and packed-B
 ///        mrxncxkc MMA kernels.
 ///
-/// Covers f32 and f16 at the arch's MR levels (x86_64: {6, 4, 2, 1}; aarch64:
-/// {8, 4, 1}) against a uniform packed-B panel width (x86_64: 16; aarch64: 12
-/// for f32, 16 for f16). Every kernel takes a runtime `mr`, so a tile of any
-/// height up to its own MR is served by the same code: rows past `mr` alias row
-/// mr-1 in A and C, compute a duplicate of it, and store it back to the same
-/// place. B is laid out as the packer writes it: `ceil(nc/panel)` panel-wide
-/// slots, the last one zero-padded past `nc`, each in one aligned slot.
+/// f32 and f16 at the arch's MR levels (x86_64 {6, 4, 2, 1}; aarch64 {8, 4, 1})
+/// against a uniform packed-B panel width (x86_64 16; aarch64 12 for f32, 16 for
+/// f16). A kernel takes a runtime `mr`, so any tile height up to its MR is the
+/// same code: rows past `mr` alias row mr-1 in A and C, recompute a duplicate,
+/// and store to the same place. B is the packer's layout: ceil(nc/panel)
+/// panel-wide slots, the last zero-padded past `nc`, each in one aligned slot.
 ///
-/// Each case checks:
-///   - live rows/columns match a scalar reference (clamp, beta == 1 add, and
-///     for f16 the round-trip through fp16 storage),
-///   - columns >= nc are untouched,
-///   - rows >= mr are untouched (they share row mr-1's C pointer),
-///   - the C tail and the B tail keep their sentinels.
+/// Each case checks: live rows/columns against a scalar reference (clamp, the
+/// beta == 1 add, and for f16 the round-trip through fp16 storage); columns
+/// >= nc and rows >= mr untouched; and the C and B sentinel tails.
 
 #include "common/test_harness.hpp"
 #include "nnops/detail/simd.hpp"
@@ -95,7 +91,6 @@ template <typename T> constexpr int panel_width() noexcept {
     }
 }
 
-/// Kernel signatures at every tile height (mr is first, as in XNNPACK).
 template <typename T>
 using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float);
 template <typename T>
@@ -222,13 +217,10 @@ auto b_fn(int level, bool zero_mode, bool with_bias) {
 
 float rnd() { return static_cast<float>(std::rand() % 2001 - 1000) / 250.f; }
 
-/// Number of uniform packed-B panels the packer lays down for `nc` columns.
 int panel_slots(int nc, int panel) { return (nc + panel - 1) / panel; }
 
-/// B in packed-panel form: every slot is a full `panel`-wide panel in an `ldb`
-/// slot, with the columns past `nc` zero-filled, and a sentinel tail after the
-/// last slot. The uniform width is what lets the kernel read `panel` values per
-/// k even for a narrow tail.
+/// Packed B: every slot `panel` wide, columns past `nc` zero-filled, a sentinel
+/// tail after the last slot.
 template <typename T>
 std::vector<T> make_packed_b(const std::vector<T>& b_raw, int nc, int kc,
                              int ldb, int nslots, int panel) {
@@ -248,9 +240,7 @@ std::vector<T> make_packed_b(const std::vector<T>& b_raw, int nc, int kc,
     return b;
 }
 
-/// Shared result check. `a_at(k, r)` returns the A element the reference
-/// multiplies, which is [kc][MR] packed for an AB kernel and [r][k] row-major
-/// for a B kernel.
+/// Shared result check; @p a_at(k, r) yields the A element the kernel reads.
 template <typename T, typename AAt>
 void verify(const std::vector<T>& c, const std::vector<T>& c0,
             const std::vector<T>& b, const std::vector<T>& b_raw,
@@ -280,10 +270,9 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
         throw std::runtime_error(msg);
     };
 
-    // aarch64 fp16 kernels accumulate in f16 (x86_64 and every f32 kernel
-    // accumulate in f32). Match that in the reference: kc products of mixed
-    // sign can cancel to near zero, and an f32 reference then disagrees with
-    // the f16 kernel by far more than the relative tolerance allows.
+    // aarch64 fp16 kernels accumulate in f16 (all else in f32). Match that in
+    // the reference: mixed-sign products can cancel to near zero, where an f32
+    // reference would disagree by more than the relative tolerance allows.
 #if defined(NNOPS_ARCH_AARCH64)
     constexpr bool f16_accum = std::is_same_v<T, half>;
 #else
@@ -310,8 +299,7 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
                 }
             }
             // A bias row replaces both the zero and the C read: the kernel
-            // starts its accumulator there, so it is added at the accumulator's
-            // own precision (f16 on aarch64 fp16, f32 everywhere else).
+            // starts its accumulator there, at the accumulator's own precision.
             float ref;
             if (bias_row != nullptr) {
                 const float start = to_float((*bias_row)[static_cast<size_t>(r)]);
@@ -368,9 +356,9 @@ void check_ab(AbKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
 
     std::vector<T> a(static_cast<size_t>(kc) * level);
     for (auto& v : a) { v = from_float<T>(rnd()); }
-    // Rows past `mr` alias row mr-1, exactly as pack_trans_* lays them down:
-    // the AB kernels read all MR lanes of A, and the extra rows must compute
-    // duplicates that the aliased C row pointers can store idempotently.
+    // Rows past `mr` alias row mr-1, as pack_trans_* lays them down: the AB
+    // kernels read all MR lanes of A, and the extra rows must compute duplicates
+    // the aliased C row pointers store idempotently.
     const int last = (mr > 1) ? mr - 1 : 0;
     for (int k = 0; k < kc; ++k) {
         for (int r = mr; r < level; ++r) {
@@ -454,8 +442,8 @@ void run_suite(Kind kind) {
                         const int level = MR_LEVELS[li];
                         for (int mr = 1; mr <= level; ++mr) {
                             for (int zi = 0; zi < 3; ++zi) {
-                                // zi 0/1: the zero_mode pair; zi 2: the bias
-                                // row, which only exists on the overwrite path.
+                                // zi 0/1: the zero_mode pair; zi 2: the bias row
+                                // (overwrite path only).
                                 const bool z = zi != 0;
                                 const bool b = zi == 2;
                                 if (kind == Kind::Ab && b) { continue; }

@@ -2,10 +2,21 @@
 /// @file embed.hpp
 /// @brief Embed operator — embedding table lookup (gather).
 ///
-/// Looks up embedding vectors from a weight table by integer indices.
-/// This is the first step in every LLM/VLM/VLA: token IDs → dense vectors.
+/// output[...] = weight[clamp(indices[...], 0, V-1)], V = weight.shape(0), with
+/// D following the index shape.
 ///
-/// Supports Planar layout only. For packed layouts, use LayoutConvert first.
+/// An f32/f16 weight is copied row by row. An s8/u8 weight is dequantized per
+/// row straight into the f32 or f16 output in one pass, so the op needs no
+/// workspace. Only per-row quantization applies: PerToken, or PerChannel on a
+/// 2D [V, D] weight (axis 0 is the vocab entry, so it is the same thing);
+/// PerTensor is rejected.
+///
+/// Planar only — pack/unpack with LayoutConvert first.
+///
+///   inputs[0] weight   [V, D]       f32 | f16 | s8 | u8
+///   inputs[1] indices  [...]        s64 | s32
+///   outputs[0] output  [<indices dims>, D]
+///                      the weight's dtype, f32 or f16 when the weight is int
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -17,34 +28,10 @@
 
 namespace nnops {
 
-/// Attributes for the Embed operator.
 struct EmbedAttributes {
     // Reserved for future: float scale, int64_t padding_idx, etc.
 };
 
-/// Embedding table lookup operator.
-///
-/// Computes: output[...] = weight[clamp(indices[...], 0, V-1)]
-/// where V = weight.shape(0).
-///
-/// Supports direct lookup (f32/f16 weight) and int8/uint8 quantized weight
-/// with per-row dequantization via weight.quant_params():
-///   output[j] = (weight[idx, j] - zero_point[idx]) * scale[idx]
-///
-/// Quantization parameters (scale, zero_point, granularity) are stored in
-/// the weight tensor via TensorView::QuantParams. Only per-row (per-token)
-/// quantization is supported: one (scale, zero_point) per vocab entry.
-/// PerToken does this directly; PerChannel — for the 2D weight
-/// [vocab_size, dim], quantizing along axis 0 (the vocab entry) — is
-/// identical to PerToken. PerTensor is rejected.
-///
-/// Inputs (2):
-///   inputs[0] = weight   [vocab_size, dim]  (f32, f16, s8, u8)
-///   inputs[1] = indices  [*]                (s64 or s32)
-///
-/// Outputs (1):
-///   outputs[0] = output  [*indices_shape..., dim]
-///                dtype = weight dtype (f32/f16), or f32/f16 when weight is int8
 class Embed : public OpBase {
 public:
     static std::unique_ptr<Embed> create(const EmbedAttributes& attrs = {},
@@ -60,9 +47,6 @@ public:
     Status validate(std::span<const TensorDesc> inputs,
                     std::span<const TensorDesc> outputs) const override;
 
-    /// Workspace (bytes) required by Embed. Always 0: int8/uint8 weight is
-    /// dequantized directly into the f32 or f16 output (f16 via a fused
-    /// half-output kernel), so no staging buffer is needed.
     size_t getWorkspaceSize(std::span<const TensorDesc> inputs,
                             std::span<const TensorDesc> outputs) const override;
 
@@ -82,7 +66,7 @@ public:
 
     const EmbedAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in embed.cpp (Pimpl pattern)
+    struct Impl;
     ~Embed();
 
 private:

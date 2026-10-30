@@ -1,24 +1,22 @@
 /// @file pooling.cpp
-/// @brief SIMD-optimized CPU implementation of 2D/3D spatial pooling in the
-///        planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC) layouts.
+/// @brief SIMD CPU 2D/3D pooling, planar (NCHW/NCDHW) and channel-last
+///        (NHWC/NDHWC).
 ///
-/// Key design decisions:
-///   1. The layout picks the vector lane. Channel-last: the lane is the
-///      channel, and a plane's last block runs short. Planar: one channel plane
-///      at a time, the lane runs along output width.
-///   2. SIMD kernels handle exclude_pad via in-kernel per-position valid_count.
-///   3. Height-4 blocking (4 output rows per call) on the channel lane; the row
-///      driver skips rows past OH, so the channel-last route needs no h1 tail.
-///      A planar row has no h4 form.
-///   4. In-kernel bounds checking for all kernel positions — no pre-splitting.
-///   5. All SW values supported — offset math is just integer arithmetic.
-///   6. Task grid: (n, block) when global, and (n, od, row group) with the
-///      channel blocks swept inside the task when channel-last — see
-///      pooling_last_impl.
-///   7. Params passed by const reference (unified across all kernels).
+/// The layout picks the lane: planar walks one channel plane at a time with the
+/// lane on output width, channel-last puts the lane on channels and a plane's
+/// last block runs short. The fp channel-last route pools four output rows per
+/// call (the row driver skips rows past OH, so there is no h1 tail) and sweeps
+/// every channel chunk of a row group inside one task over a width strip cut to
+/// fit L2, so the group's window is walked once and stays resident across the
+/// sweep. When the grid cannot fill the pool the channel axis splits a group, by
+/// makespan rather than by pool width, so the task count divides evenly and runs
+/// one wave. The kernels bounds-test their own window positions rather than
+/// relying on a driver-side split; exclude_pad is an in-kernel valid-count
+/// divide, and any SW is just integer arithmetic.
 ///
-/// Quantized pooling runs on the channel lane, so it covers the channel-last
-/// layout; on planar it stays unsupported.
+/// Quantized pooling lives on the channel lane, so it covers only channel-last;
+/// planar is unsupported. It has no whole-plane form either, so a global
+/// request is turned into the full-extent window walk.
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -77,7 +75,6 @@ void pooling_impl(const PoolingAttributes& attrs,
     auto* out_ptr = output.ptr<T>();
     const auto* in_ptr = input.ptr<T>();
 
-    // Kernel params (shared across all calls, od/oh updated per call)
     k::PoolingKernelParams p{};
     p.ID = ID; p.IH = IH; p.IW = IW;
     p.OH = OH; p.OW = OW;
@@ -126,20 +123,6 @@ void pooling_impl(const PoolingAttributes& attrs,
 // ============================================================
 // Channel-last (NHWC/NDHWC) pooling — the lane spans channels
 // ============================================================
-//
-// The kernel is the channel-lane one (pool_last): the lane is the channel and
-// the window walk is the same at any pixel distance. What the layout decides is
-// the grid. On a channel-last plane a cache line holds a run of one pixel's
-// channels, so a
-// (n, block) task per block would make every line be fetched C/8 times over —
-// the pixel is only whole across the channel blocks. A task therefore owns a
-// group of four output rows *and* every channel block of them: the row group's
-// window (at most (4*SH + KH - SH) input rows) stays in cache for one sweep,
-// and the plane is read once.
-//
-// When the plane is too short to fill the pool (seven 7x7 rows against twenty
-// workers) the channel axis picks up the rest, nearest-rounded rather than
-// ceiled so the pool runs one wave.
 
 template <bool IsMax, typename T>
 void pooling_last_impl(const PoolingAttributes& attrs,
@@ -153,7 +136,7 @@ void pooling_last_impl(const PoolingAttributes& attrs,
     const int64_t N = input.shape(0);
     const int64_t C = input.shape(1);
     // Sixteen channels a chunk, not eight: a pixel's 16 f32 are one 64-byte
-    // line, and a chunk that spans a whole line touches it once instead of
+    // line, and a chunk spanning a whole line touches it once rather than
     // leaving the other half for the next chunk to fetch again.
     const int64_t nblocks = (C + 15) / 16;
 
@@ -190,10 +173,9 @@ void pooling_last_impl(const PoolingAttributes& attrs,
     auto* out_ptr = output.ptr<T>();
     const auto* in_ptr = input.ptr<T>();
 
-    // A task is a strip of four output rows: the row group's window is
-    // (4*SH + KH - SH) input rows of IW*C elements, and every channel chunk
-    // walks it again. Cutting the width so a strip fits L2 keeps it resident
-    // across the chunk sweep, which is what the sweep is for.
+    // A task is a strip of four output rows: the group's window is
+    // 4*SH + (KH-1)*DH input rows of IW*C elements and every channel chunk walks
+    // it again, so the width is cut to fit L2 and stay resident across the sweep.
     const int64_t hgroups = (OH + 3) / 4;   // four output rows per task
     const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;
     constexpr int64_t kStripBytes = 128 * 1024;
@@ -209,9 +191,6 @@ void pooling_last_impl(const PoolingAttributes& attrs,
     const int64_t strips = (OW + strip - 1) / strip;
     const int64_t groups  = N * OD * hgroups * strips;
     const int64_t nt = ctx.cpu.thread_count();
-    // The channel axis only splits when the grid cannot fill the pool, and the
-    // split is picked by makespan rather than by pool width: a task count the
-    // pool cannot divide evenly costs a whole extra wave.
     int64_t cchunks = 1;
     if (groups < nt && nblocks > 1) {
         int64_t best_cost = 0;
@@ -252,8 +231,8 @@ void pooling_last_impl(const PoolingAttributes& attrs,
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
         for (int64_t blk = blk0; blk < blk1; ++blk) {
             const int64_t c0 = blk * 16;
-            // A chunk of 16 channels is one call; a ragged tail of 9..15 has no
-            // single policy shape, so it runs as an 8-lane call and its remainder.
+            // More than sixteen remaining takes a 16-lane call; a tail of 9..16
+            // runs as an 8-lane call plus its remainder.
             int64_t seg_off[2] = {0, 0};
             int64_t seg_lanes[2] = {C - c0, 0};
             int nseg = 1;
@@ -294,10 +273,9 @@ void pooling_global_impl(const PoolingAttributes& attrs,
     const int64_t N      = input.shape(0);
     const int64_t C      = input.shape(1);
     const bool last      = is_channel_last(input.layout());
-    // Blocks: one per channel plane for planar, ceil(C/16) for a channel-last
-    // one. A channel-last task reads kGlobalCh channels of one pixel per visit:
-    // 16 f32 is a whole 64-byte line, so the plane is fetched once rather than
-    // twice, and a task still has work small enough to split across the pool.
+    // Blocks: one per channel plane for planar, ceil(C/16) for channel-last. A
+    // channel-last task reads sixteen channels — one 64-byte line of f32 — per
+    // pixel, so the plane is fetched once and still splits across the pool.
     constexpr int64_t kGlobalCh = 16;
     const int64_t blocks = last ? (C + kGlobalCh - 1) / kGlobalCh
                                 : input.num_channel_blocks();
@@ -326,10 +304,8 @@ void pooling_global_impl(const PoolingAttributes& attrs,
         const int64_t blk = tid % blocks;
 
         if (last) {
-            // A task that reads a whole line per pixel takes the plane in one
-            // pass instead of leaving the other half of every line to another
-            // one. A ragged tail of 9..15 channels has no single shape, so it
-            // runs as an 8-lane task and its remainder.
+            // A full sixteen lanes load unmasked; 9..15 mask the second vector;
+            // eight or fewer take one.
             const int64_t c0    = blk * kGlobalCh;
             const int64_t lanes = std::min<int64_t>(kGlobalCh, C - c0);
             const T* in_base  = in_ptr + n * in_ch_stride + c0;
@@ -381,9 +357,8 @@ void pooling_fp(const PoolingAttributes& attrs,
     }
 }
 
-/// A global window spelled out as the full extent. The quantized kernels have
-/// no whole-plane form, but reducing a window that covers the input is the
-/// same reduction — the walk just costs its per-tap bounds checks.
+/// A global window spelled out as the full extent: the quantized kernels have no
+/// whole-plane form, so the full window is walked instead.
 inline PoolingAttributes full_extent_window(PoolingAttributes attrs,
                                             const TensorView& in)
 {
@@ -403,17 +378,14 @@ inline PoolingAttributes full_extent_window(PoolingAttributes attrs,
 // Quantized pooling (s8/u8 input/output)
 // ============================================================
 //
-// Activation is PerTensor-quantized (broadcast scale/zero_point). Values are
-// dequantized to float, pooled, and requantized on store (round-to-nearest-even).
-// MaxPooling additionally takes a raw-integer fast path when input and output
-// share the same dtype, scale and zero_point (and !add_to) — then `max` in the
-// integer domain matches `max` in the float domain exactly.
+// PerTensor activation: values are dequantized to float, pooled, and requantized
+// on store (round-to-nearest-even). MaxPooling takes a raw-integer fast path
+// when input and output share dtype, scale and zero_point (and !add_to) — then
+// `max` is exact in the integer domain.
 
-/// Channel-last quantized pooling — the fp grid (see pooling_last_impl) and the
-/// same dequantize/requantize kernels, with the raw-integer max kept for the
-/// full blocks: an 8-lane integer max is exact when input and output share their
-/// scale and zero point, and a short last block takes the general path instead
-/// of a masked copy of it.
+/// Channel-last quantized pooling: the fp four-row grid without the width
+/// strip, over dequantize/requantize kernels; full blocks keep the raw-integer
+/// max (exact when scales and zero points match).
 template <bool IsMax, typename InT, typename OutT>
 void pooling_last_impl_quant(const PoolingAttributes& attrs,
                              TensorView& output,
@@ -520,8 +492,7 @@ void pooling_last_impl_quant(const PoolingAttributes& attrs,
     });
 }
 
-/// Layout dispatch shared by the four quantized instantiations. Quantized
-/// pooling is channel-lane only, so there is one route and a type dispatch.
+/// Dispatch the one quantized route over max/avg.
 template <typename InT, typename OutT>
 void pooling_quant(const PoolingAttributes& attrs,
                    TensorView& output,
@@ -547,13 +518,12 @@ Status pooling_cpu(const PoolingAttributes& attrs,
     const auto odtype = output.data_type();
     const bool quant = (dtype == DataType::s8 || dtype == DataType::u8);
 
-    // Quantized pooling lives on the channel lane, so it needs a layout that
-    // has one: channel-last. A planar plane has no channel vector.
+    // Quantized pooling needs a channel lane: channel-last only.
     if (quant && !is_channel_last(inputs[0].layout())) {
         return Status::unsupported;
     }
-    // ...and it has no whole-plane form, so a global request takes the window
-    // walk with the window spelled out as the full extent.
+    // ...and with no whole-plane form, a global request is walked as the full
+    // extent window.
     const PoolingAttributes qattrs =
         (quant && attrs.global) ? full_extent_window(attrs, inputs[0]) : attrs;
 

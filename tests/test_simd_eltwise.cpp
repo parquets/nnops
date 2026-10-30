@@ -1,5 +1,11 @@
-/// @file test_tiled_eltwise.cpp
-/// @brief Unit tests for tiled eltwise SIMD kernels (simd_kernel/simd_eltwise.hpp).
+/// @file test_simd_eltwise.cpp
+/// @brief Unit tests for the tiled binary eltwise SIMD kernels
+/// (simd_kernel/simd_eltwise.hpp).
+///
+/// Each op is checked against a scalar row-by-row reference over a random
+/// fixed-seed tile: padded and mismatched pitches, add_to (the output is
+/// pre-seeded with 0.1 so accumulation is visible), and a 10x31 tile.
+/// min/max compare exactly, the rest at 1e-4.
 
 #include "../src/backend/cpu/simd_kernel/simd_eltwise.hpp"
 #include "common/test_harness.hpp"
@@ -9,10 +15,6 @@
 #include <random>
 
 using namespace nnops::kernel;
-
-// ------------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------------
 
 static std::mt19937 rng(43);
 
@@ -59,11 +61,9 @@ static void verify_kernel(const char* test_name,
         }
     }
 
-    // Tiled kernel
     kernel(a_in.data(), b_in.data(), out.data(),
            m, n, a_pitch, b_pitch, out_pitch, add_to);
 
-    // Compare
     for (int64_t r = 0; r < m; ++r) {
         float* out_row = out.data() + r * out_pitch;
         float* exp_row = expected.data() + r * out_pitch;
@@ -146,7 +146,7 @@ NNOPS_TEST(tiled_eltwise_max) {
 }
 
 // ============================================================
-// Scalar-only kernel test
+// pow — exp(b * log(a)) under the hood
 // ============================================================
 
 NNOPS_TEST(tiled_eltwise_pow) {

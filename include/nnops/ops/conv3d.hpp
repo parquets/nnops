@@ -1,6 +1,10 @@
 #pragma once
 /// @file conv3d.hpp
-/// @brief Conv3D operator — 3D convolution with NCDHW layout.
+/// @brief 3D convolution with NCDHW layout.
+///
+/// Input [N, IC, ID, IH, IW], weight [OC, IC/G, KD, KH, KW] (ONNX-style, also
+/// when grouped), output [N, OC, OD, OH, OW], optional bias [OC]. Grouped and
+/// dilated; planar layouts only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -16,22 +20,12 @@ namespace nnops {
 
 /// Attributes describing a 3D convolution.
 struct Conv3DAttributes {
-    /// Kernel size along depth, height, and width.
     std::array<int64_t, 3> kernel_size = {1, 1, 1};
-
-    /// Stride along depth, height, and width.
     std::array<int64_t, 3> stride = {1, 1, 1};
-
-    /// Dilation along depth, height, and width.
     std::array<int64_t, 3> dilation = {1, 1, 1};
-
-    /// Symmetric zero-padding along depth, height, and width.
     std::array<int64_t, 3> padding = {0, 0, 0};
-
-    /// Number of groups for grouped / depthwise convolution.
     int64_t groups = 1;
 
-    /// Convenience enum for automatic padding computation.
     enum class AutoPad : uint8_t {
         NOTSET = 0,
         SAME_UPPER,
@@ -40,19 +34,12 @@ struct Conv3DAttributes {
     };
     AutoPad auto_pad = AutoPad::NOTSET;
 
-    /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// Accumulate into the existing output instead of overwriting.
     bool add_to = false;
 };
 
-/// Conv3D operator (class-based API).
-///
-/// Supports NCDHW layout with grouped and dilated convolution.
-/// Input: [N, IC, ID, IH, IW], Weight: [OC, IC/G, KD, KH, KW].
-/// Output: [N, OC, OD, OH, OW].
-/// Optional bias: [OC].
 class Conv3D : public OpBase {
 public:
     static std::unique_ptr<Conv3D> create(const Conv3DAttributes& attrs,
@@ -68,9 +55,6 @@ public:
     Status validate(std::span<const TensorDesc> inputs,
                     std::span<const TensorDesc> outputs) const override;
 
-    /// inputs[0] = input tensor (NCDHW)
-    /// inputs[1] = weight tensor [OC, IC/G, KD, KH, KW] — ONNX-style, also when grouped
-    /// inputs[2] = bias tensor [OC] (optional)
     using OpBase::compute;
 
     Status compute(std::span<TensorView> outputs,

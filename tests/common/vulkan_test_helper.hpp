@@ -1,16 +1,15 @@
 /// @file vulkan_test_helper.hpp
-/// @brief Minimal Vulkan test infrastructure for operator testing.
+/// @brief Self-contained Vulkan compute environment for operator tests.
 ///
-/// Creates a self-contained Vulkan compute environment:
-///   - Instance, device, compute queue
-///   - Command pool and descriptor pool
-///   - Buffer creation / host↔device transfer helpers
-///
-/// Designed for correctness tests: create device buffers, run Vulkan operators,
-/// read back results, and compare against CPU reference.
-///
-/// All resources are destroyed on destruction. Use only when NNOPS_HAS_VULKAN
-/// is defined.
+/// Creates an instance, a physical device, a device with one compute queue, a
+/// command pool and a descriptor pool. Buffers are host-visible, host-coherent
+/// and permanently mapped, so a copy is a memcpy with a flush after it (to the
+/// device) or an invalidate before it (from the device). The descriptor pool is
+/// reset after every submit_and_wait (the queue is idle there), which is how
+/// successive dispatches reuse it. The 16-bit-storage extension is enabled only
+/// on the non-discrete fallback path (so supports_fp16() is false whenever a
+/// discrete GPU is present); the environment's handles are released in
+/// ~VulkanTestEnv. Only compiled under NNOPS_HAS_VULKAN.
 
 #pragma once
 
@@ -27,14 +26,9 @@
 
 namespace nnops::test {
 
-/// Opaque helper to clean up Vulkan pipeline cache for a device.
-/// Implemented in vulkan_test_helper.cpp to avoid including
-/// backend/vulkan/vulkan_common.hpp from this header.
+/// Drops the process-wide cache's pipelines for `device`; defined in the .cpp so
+/// vulkan_common.hpp stays out of this header.
 void vulkan_pipeline_cache_cleanup(VkDevice device);
-
-// ============================================================
-// RAII Vulkan test environment
-// ============================================================
 
 class VulkanTestEnv {
 public:
@@ -49,9 +43,7 @@ public:
     ~VulkanTestEnv() {
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
-            // Pipeline cache cleanup is handled by vulkan_common.cpp.
-            // Forward-call through an opaque helper to avoid including
-            // vulkan_common.hpp from this public test header.
+            // Before vkDestroyDevice: the cached pipelines belong to this device.
             vulkan_pipeline_cache_cleanup(device_);
         }
         if (desc_pool_ != VK_NULL_HANDLE) {
@@ -77,8 +69,7 @@ public:
 
     // ---- Buffer helpers ----
 
-    /// Create a storage buffer and allocate+map device memory.
-    /// Returns VkBuffer + VkDeviceMemory pair.
+    /// A storage buffer whose memory is host-coherent and stays mapped.
     struct Buffer {
         VkBuffer       buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -100,7 +91,6 @@ public:
 
         VK_CHECK(vkCreateBuffer(device_, &bci, nullptr, &buf.buffer));
 
-        // Allocate memory
         VkMemoryRequirements mem_req;
         vkGetBufferMemoryRequirements(device_, buf.buffer, &mem_req);
 
@@ -133,11 +123,9 @@ public:
         buf = {};
     }
 
-    /// Copy host data to device buffer (blocking).
     void copy_to_device(Buffer& buf, const void* data, size_t size) {
         memcpy(buf.mapped, data, size);
-        // Host-coherent memory: no explicit flush needed for reads by GPU
-        // But for correctness, add a memory barrier
+        // The memory is HOST_COHERENT, so no flush is required; kept defensively.
         VkMappedMemoryRange range = {};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
         range.memory = buf.memory;
@@ -146,7 +134,6 @@ public:
         vkFlushMappedMemoryRanges(device_, 1, &range);
     }
 
-    /// Copy device buffer data to host (blocking).
     void copy_from_device(Buffer& buf, void* data, size_t size) {
         VkMappedMemoryRange range = {};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -159,7 +146,6 @@ public:
 
     // ---- Command submission ----
 
-    /// Begin recording into a fresh command buffer.
     VkCommandBuffer begin_cmd() {
         VkCommandBufferAllocateInfo ai = {};
         ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -176,8 +162,7 @@ public:
         return cmd_buf_;
     }
 
-    /// End recording, submit, wait, free the command buffer, and reset the
-    /// descriptor pool so that subsequent dispatches can reuse it.
+    /// Submits, waits, frees the command buffer, and resets the descriptor pool.
     void submit_and_wait() {
         VK_CHECK(vkEndCommandBuffer(cmd_buf_));
 
@@ -192,8 +177,7 @@ public:
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd_buf_);
         cmd_buf_ = VK_NULL_HANDLE;
 
-        // Reset descriptor pool to reclaim all allocated descriptor sets.
-        // Safe because the queue is idle — no command buffers are in flight.
+        // Safe: the queue is idle, so no set can still be in flight.
         vkResetDescriptorPool(device_, desc_pool_, 0);
     }
 
@@ -219,7 +203,7 @@ private:
         std::vector<VkPhysicalDevice> devices(count);
         vkEnumeratePhysicalDevices(instance_, &count, devices.data());
 
-        // Prefer discrete GPU
+        // Prefer a discrete GPU; otherwise keep the first device.
         for (auto& d : devices) {
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(d, &props);
@@ -228,9 +212,10 @@ private:
                 return;
             }
         }
-        physical_device_ = devices[0]; // fallback
+        physical_device_ = devices[0];
 
-        // Query device extension support for fp16 storage
+        // Only reached on this fallback path: a discrete GPU returns above, so
+        // supports_16bit_storage_ stays false on machines that have one.
         uint32_t ext_count = 0;
         vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &ext_count, nullptr);
         std::vector<VkExtensionProperties> exts(ext_count);
@@ -244,7 +229,6 @@ private:
     }
 
     void create_device() {
-        // Find compute queue family
         uint32_t count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &count, nullptr);
         std::vector<VkQueueFamilyProperties> qfps(count);
@@ -265,7 +249,6 @@ private:
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
 
-        // Conditionally enable 16-bit storage for fp16 support
         VkPhysicalDevice16BitStorageFeatures storage_features = {};
         storage_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
         storage_features.storageBuffer16BitAccess = VK_TRUE;
@@ -304,9 +287,6 @@ private:
 
         VkDescriptorPoolCreateInfo ci = {};
         ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        // Use FREE_DESCRIPTOR_SET_BIT so individual sets can be freed if needed,
-        // but we also reset the whole pool after each submit_and_wait to reclaim
-        // all sets simply. The reset is safe because the queue is idle at that point.
         ci.maxSets = 256;
         ci.poolSizeCount = 1;
         ci.pPoolSizes = pool_sizes;

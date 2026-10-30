@@ -1,6 +1,11 @@
 #pragma once
 /// @file activation.hpp
-/// @brief Activation operator — element-wise activation functions.
+/// @brief Element-wise Activation operator.
+///
+/// output[i] = f(input[i]); input and output have the same shape and dtype.
+/// Quantized s8/u8 → s8/u8 is a fused dequantize → f32 activation → requantize
+/// path; both operands must be quantized, and only PerTensor / PerToken
+/// granularity is supported.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -14,14 +19,14 @@ namespace nnops {
 
 /// Supported activation types.
 enum class ActivationType : uint8_t {
-    Relu,       ///< f(x) = max(0, x)
-    LeakyRelu,  ///< f(x) = x > 0 ? x : alpha * x
-    Sigmoid,    ///< f(x) = 1 / (1 + exp(-x))
-    Tanh,       ///< f(x) = tanh(x)
-    Gelu,       ///< f(x) ≈ x * Phi(x), tanh approximation
-    Silu,       ///< f(x) = x * sigmoid(x) (Swish)
-    HardSwish,  ///< f(x) = x * relu6(x + 3) * beta / 6
-    Elu,        ///< f(x) = x > 0 ? x : alpha * (exp(x) - 1)
+    Relu,
+    LeakyRelu,  ///< x > 0 ? x : alpha * x
+    Sigmoid,
+    Tanh,
+    Gelu,       ///< tanh approximation
+    Silu,       ///< x * sigmoid(x) (Swish)
+    HardSwish,  ///< x * relu6(x + 3) * beta / 6
+    Elu,        ///< x > 0 ? x : alpha * (exp(x) - 1)
 };
 
 /// Attributes for the Activation operator.
@@ -34,15 +39,6 @@ struct ActivationAttributes {
     bool add_to = false;
 };
 
-/// Activation operator (class-based API).
-///
-/// Element-wise operation: output[i] = f(input[i]).
-/// Input and output must have the same shape and data type.
-///
-/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
-/// quantized input is dequantized, the activation is applied in f32, and the
-/// result is re-quantized (f32 → int). Both input and output must be quantized.
-/// Only PerTensor / PerToken quantization granularity is supported.
 class Activation : public OpBase {
 public:
     static std::unique_ptr<Activation> create(const ActivationAttributes& attrs,

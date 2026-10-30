@@ -1,5 +1,12 @@
-/// @file test_tiled_unary.cpp
-/// @brief Unit tests for tiled unary SIMD kernels (simd_kernel/simd_unary.hpp).
+/// @file test_simd_unary.cpp
+/// @brief Unit tests for the tiled unary SIMD kernels
+/// (simd_kernel/simd_unary.hpp).
+///
+/// Each op is checked against a scalar row-by-row reference over a random
+/// fixed-seed tile: padded and mismatched pitches, add_to (the output is
+/// pre-seeded with 0.1 so accumulation is visible), a single-element row,
+/// and a 10x31 tile. The exact-comparison cases are round, ceil, floor and
+/// sign; recip carries a 2e-4 tolerance because v_rcp is approximate on x86.
 
 #include "../src/backend/cpu/simd_kernel/simd_unary.hpp"
 #include "common/test_harness.hpp"
@@ -9,10 +16,6 @@
 #include <random>
 
 using namespace nnops::kernel;
-
-// ------------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------------
 
 static std::mt19937 rng(42);
 
@@ -57,10 +60,8 @@ static void verify_kernel(const char* test_name,
         }
     }
 
-    // Tiled kernel
     kernel(input.data(), out.data(), m, n, in_pitch, out_pitch, add_to);
 
-    // Compare
     for (int64_t r = 0; r < m; ++r) {
         float* out_row = out.data() + r * out_pitch;
         float* exp_row = expected.data() + r * out_pitch;
@@ -147,7 +148,8 @@ NNOPS_TEST(tiled_unary_neg) {
 }
 
 // ============================================================
-// Scalar-only kernel tests (erf, round, ceil, floor, recip, sign)
+// Scalar-only kernels (erf, round, ceil, floor, sign); recip goes
+// through v_rcp (approximate on x86).
 // ============================================================
 
 NNOPS_TEST(tiled_unary_erf) {
@@ -208,7 +210,6 @@ NNOPS_TEST(tiled_unary_sign) {
 // ============================================================
 
 NNOPS_TEST(tiled_unary_pitch_gt_n) {
-    // 3 rows, 7 cols, pitch=16 (padded)
     auto input = random_f32(3 * 16, -2.0f, 2.0f);
     verify_kernel("exp pitch>n", input, 3, 7, 16, 16, false,
         [](const float* in, float* out, int64_t m, int64_t n,
@@ -217,7 +218,6 @@ NNOPS_TEST(tiled_unary_pitch_gt_n) {
 }
 
 NNOPS_TEST(tiled_unary_mismatched_pitch) {
-    // in_pitch != out_pitch
     auto input = random_f32(2 * 16, -2.0f, 2.0f);
     verify_kernel("exp mismatched pitch", input, 2, 6, 16, 8, false,
         [](const float* in, float* out, int64_t m, int64_t n,
@@ -234,7 +234,6 @@ NNOPS_TEST(tiled_unary_add_to) {
 }
 
 NNOPS_TEST(tiled_unary_single_col) {
-    // Single element per row with pitch=4
     auto input = random_f32(5 * 4, -2.0f, 2.0f);
     verify_kernel("sqrt single col", input, 5, 1, 4, 4, false,
         [](const float* in, float* out, int64_t m, int64_t n,
@@ -243,7 +242,6 @@ NNOPS_TEST(tiled_unary_single_col) {
 }
 
 NNOPS_TEST(tiled_unary_large_tile) {
-    // Larger tile: 10 rows, 31 cols, pitch=64
     auto input = random_f32(10 * 64, -2.0f, 2.0f);
     verify_kernel("exp large tile", input, 10, 31, 64, 64, false,
         [](const float* in, float* out, int64_t m, int64_t n,

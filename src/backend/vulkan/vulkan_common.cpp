@@ -1,14 +1,19 @@
 /// @file vulkan_common.cpp
-/// @brief Implementation of Vulkan pipeline cache and dispatch helpers.
+/// @brief Vulkan pipeline cache and the descriptor/push-constant dispatch helper.
+///
+/// Pipelines are built outside the cache mutex, since vkCreateComputePipelines is
+/// expensive and must not block other dispatches; the map is re-checked under the
+/// lock afterwards, and a racer that lost destroys its own pipeline. Every binding
+/// is a whole storage buffer (VK_WHOLE_SIZE) created at index i to match the shader.
+///
+/// The cache keys on the device handle, so destroy_device_pipelines() must run
+/// before vkDestroyDevice, and clear() uses each key's own device and so assumes
+/// every device still in the map is alive.
 
 #include "vulkan_common.hpp"
 #include <cstring>
 
 namespace nnops::backend::vulkan {
-
-// ============================================================
-// VulkanPipelineCache implementation
-// ============================================================
 
 VulkanPipeline VulkanPipelineCache::get_or_create(const PipelineKey& key) {
     {
@@ -19,15 +24,12 @@ VulkanPipeline VulkanPipelineCache::get_or_create(const PipelineKey& key) {
         }
     }
 
-    // Create pipeline outside lock (expensive, don't want to block others)
     VulkanPipeline pipeline = create_pipeline(key);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Double-check: another thread may have created it while we were working
         auto it = cache_.find(key);
         if (it != cache_.end()) {
-            // Destroy the one we just created (wasted work but correct)
             if (pipeline.pipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(key.device, pipeline.pipeline, nullptr);
                 vkDestroyPipelineLayout(key.device, pipeline.layout, nullptr);
@@ -45,7 +47,6 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
 
     VkDevice device = key.device;
 
-    // ---- Step 1: Create shader module ----
     VkShaderModuleCreateInfo shader_ci = {};
     shader_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_ci.codeSize = key.spirv_size;
@@ -58,8 +59,6 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
         return result;
     }
 
-    // ---- Step 2: Create descriptor set layout ----
-    // All bindings are storage buffers (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
     VkDescriptorSetLayoutBinding* bindings =
         new VkDescriptorSetLayoutBinding[key.num_bindings]();
 
@@ -83,7 +82,6 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
         return result;
     }
 
-    // ---- Step 3: Create pipeline layout ----
     VkPushConstantRange pc_range = {};
     pc_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pc_range.offset = 0;
@@ -104,7 +102,6 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
         return result;
     }
 
-    // ---- Step 4: Create compute pipeline with specialization constants ----
     VkSpecializationMapEntry spec_entries[2] = {};
     spec_entries[0].constantID = 0;
     spec_entries[0].offset = 0;
@@ -136,7 +133,7 @@ VulkanPipeline VulkanPipelineCache::create_pipeline(const PipelineKey& key) {
     res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_ci,
                                    nullptr, &result.pipeline);
 
-    // Shader module can be destroyed after pipeline creation
+    // A shader module may be destroyed once the pipeline that used it exists.
     vkDestroyShaderModule(device, shader_module, nullptr);
 
     if (res != VK_SUCCESS) {
@@ -168,9 +165,8 @@ void VulkanPipelineCache::destroy_device_pipelines(VkDevice device) {
 }
 
 void VulkanPipelineCache::clear() {
-    // Must have collected all devices before clearing
     std::lock_guard<std::mutex> lock(mutex_);
-    // We don't track all devices, so we can only destroy by iterating
+    // Each key carries its own device, so those devices must still be alive.
     for (auto& [key, p] : cache_) {
         vkDestroyPipeline(key.device, p.pipeline, nullptr);
         vkDestroyPipelineLayout(key.device, p.layout, nullptr);
@@ -183,10 +179,6 @@ VulkanPipelineCache::~VulkanPipelineCache() {
     clear();
 }
 
-// ============================================================
-// vulkan_record_dispatch
-// ============================================================
-
 void vulkan_record_dispatch(
     VkCommandBuffer        cmd,
     VkDevice               device,
@@ -198,7 +190,6 @@ void vulkan_record_dispatch(
     uint32_t               pc_size,
     uint32_t               total_elements)
 {
-    // ---- Step 1: Allocate descriptor set ----
     VkDescriptorSetAllocateInfo alloc_info = {};
     alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     alloc_info.descriptorPool = pool;
@@ -212,7 +203,6 @@ void vulkan_record_dispatch(
         return;
     }
 
-    // ---- Step 2: Update descriptor set with buffer info ----
     VkDescriptorBufferInfo* buf_infos = new VkDescriptorBufferInfo[num_buffers]();
     VkWriteDescriptorSet* writes = new VkWriteDescriptorSet[num_buffers]();
 
@@ -234,16 +224,13 @@ void vulkan_record_dispatch(
     delete[] writes;
     delete[] buf_infos;
 
-    // ---- Step 3: Bind pipeline and descriptor set ----
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipeline.layout, 0, 1, &desc_set, 0, nullptr);
 
-    // ---- Step 4: Push constants ----
     vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, pc_size, push_constants);
 
-    // ---- Step 5: Dispatch ----
     uint32_t group_count = ceil_div(total_elements, static_cast<uint32_t>(kVulkanWorkgroupSize));
     vkCmdDispatch(cmd, group_count, 1, 1);
 }

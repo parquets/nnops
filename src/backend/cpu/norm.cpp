@@ -1,14 +1,29 @@
 /// @file norm.cpp
-/// @brief SIMD-optimized CPU implementation of normalization operators.
+/// @brief SIMD CPU normalization — BatchNorm, LayerNorm, RMSNorm, GroupNorm,
+///        L2Norm — dispatched on NormAttributes::type.
 ///
-/// Covers BatchNorm, LayerNorm, RMSNorm, GroupNorm, and L2Norm, dispatched
-/// on NormAttributes::type. All share the consolidated SIMD kernels in
-/// simd_kernel/simd_norm.hpp.
+/// f32 and f16 share one templated implementation per type, over the SIMD row
+/// kernels in simd_kernel/simd_norm.hpp. LayerNorm / RMSNorm / L2Norm run the
+/// vectorized row path at axis == rank-1 (is_contiguous_tail) and fall back to
+/// a scalar loop over precomputed inner offsets on any other axis. BatchNorm
+/// with channel_pack_size() > 1 walks rows and picks the pack block from the
+/// row index; GroupNorm reduces one (sample, group) at a time.
 ///
-/// Supports f32 and f16 via a single templated implementation per type.
-///
-/// Also supports s8/u8 (quantized) input for LayerNorm / RMSNorm / L2Norm over
-/// the trailing axis — see the "Quantized input" section below.
+/// s8/u8 input is supported for LayerNorm / RMSNorm / L2Norm over the trailing
+/// axis: each integer row is dequantized to f32 by the arch quant.hpp per-row
+/// kernel and the same SIMD row kernels then run on it — no new kernel is
+/// needed. The unit is one row, which is exactly one quantization row (what a
+/// PerToken scale/zero_point addresses), and that is what lets a row be
+/// dequantized, normalized and written back without staging the tensor.
+/// PerChannel has no meaning over the trailing axis, and BatchNorm / GroupNorm
+/// are out because their reduction units do not line up with quantization rows.
+/// The compute type is always f32 and scale / bias stay f32; an f16 output is
+/// narrowed on store. An f32 output is dequantized and normalized in place in
+/// its own row; f16 and s8/u8 outputs stage each row in a pooled f32 buffer and
+/// convert on write-back — for s8/u8, requantizing with the output view's own
+/// (scale, zero_point). The buffer is pooled, so getWorkspaceSize stays 0.
+/// add_to is rejected here — it would mean accumulating into a pre-existing
+/// quantized output.
 
 #include "nnops/ops/norm.hpp"
 #include "nnops/detail/assert.hpp"
@@ -46,9 +61,7 @@ namespace {
 // Shared helpers
 // ============================================================
 
-/// Pre-compute element offsets for non-contiguous normalization axes.
-/// Maps a flattened inner index (0..norm_size-1) to its stride offset
-/// within the tensor, handling arbitrary multi-dimensional layouts.
+/// Flattened inner index -> stride offset (non-trailing axis).
 inline std::vector<int64_t> compute_inner_offsets(
     const TensorView& X, int64_t axis, int64_t norm_size)
 {
@@ -545,28 +558,9 @@ void group_norm_impl(const NormAttributes& attrs,
 // ============================================================
 // Quantized input (s8/u8): LayerNorm / RMSNorm / L2Norm
 // ============================================================
-//
-// The integer row is dequantized to f32 by the arch quant.hpp per-row kernel and
-// the existing SIMD norm row kernels then run on that row buffer, so no new
-// kernel is needed. The compute type is always f32 — an f16 output is narrowed
-// on store, matching what the f16 float path does internally anyway.
-//
-// This is only defined for axis == rank-1, where one normalization row is
-// exactly one quantization row (the unit of a PerToken scale/zero_point) —
-// that is what lets a single row be dequantized, normalized and written back
-// without staging the whole tensor. PerChannel has no meaning over
-// the trailing axis, and BatchNorm / GroupNorm are not supported because their
-// reduction units don't line up with quantization rows.
-//
-// Row buffer: an f32 output is dequantized and normalized in place in the output
-// row, so it needs no scratch at all. An f16 or s8/u8 output stages each row in
-// a pooled f32 buffer and converts on write-back — requantizing with the output
-// TensorView's own (scale, zero_point). The staging buffer comes from the CPU
-// memory pool, so getWorkspaceSize stays 0.
 
-/// Resolve the (scale, zero_point) of row @p row: the per-row buffers when
-/// present, else the per-tensor scalars. Matches TensorView's PerToken /
-/// PerTensor convention (a missing zero_point buffer means zero).
+/// Row (scale, zero_point): the per-row buffers when present, else the
+/// per-tensor scalars; a missing zero_point buffer means zero.
 inline void row_qparam(const QuantParams& qp, int64_t row, float& scale, float& zp)
 {
     if (qp.scale_data != nullptr) {
@@ -580,7 +574,6 @@ inline void row_qparam(const QuantParams& qp, int64_t row, float& scale, float& 
     }
 }
 
-/// Dequantize one contiguous row of `n` s8/u8 values into a T row.
 template <typename T, typename InT>
 inline void dequant_row(T* dst, const InT* src, int64_t n, float scale, float zp)
 {
@@ -588,7 +581,6 @@ inline void dequant_row(T* dst, const InT* src, int64_t n, float scale, float zp
     quant_kernel::dequantization<InT>(1, n_i, dst, n_i, src, n_i, &scale, &zp);
 }
 
-/// Requantize one contiguous row of `n` f32 values into an s8/u8 row.
 template <typename OutT>
 inline void requant_row(OutT* dst, const float* src, int64_t n, float scale, float zp)
 {
@@ -596,8 +588,8 @@ inline void requant_row(OutT* dst, const float* src, int64_t n, float scale, flo
     quant_kernel::quantization<OutT>(1, n_i, dst, n_i, src, n_i, &scale, &zp);
 }
 
-/// Per-row fused kernel: dequantize row -> normalize in place -> write back.
-/// `HasMean` / `HasScale` select the LayerNorm / RMSNorm / L2Norm variants.
+/// Per row: dequantize -> normalize in place -> write back; HasMean / HasScale
+/// pick the LayerNorm / RMSNorm / L2Norm variants.
 template <bool HasMean, bool HasScale>
 void norm_quant_rows(const NormAttributes& attrs,
                      TensorView& output,
@@ -607,9 +599,7 @@ void norm_quant_rows(const NormAttributes& attrs,
 {
     const auto& X = inputs[0];
 
-    // L2Norm has no scale input; HasScale is false for it, so s_ptr and
-    // scale_is_scalar are never used there — but they must not be formed from
-    // an out-of-range inputs[1].
+    // L2Norm has no scale input, so inputs[1] must not be formed blindly.
     const bool has_scale = (inputs.size() >= 2);
     const auto* s_ptr = has_scale ? inputs[1].ptr<float>() : nullptr;
     const bool scale_is_scalar = has_scale && (inputs[1].numel() == 1);
@@ -628,7 +618,6 @@ void norm_quant_rows(const NormAttributes& attrs,
 
     const int64_t n = dims.norm_size;
 
-    // scale / bias are f32 on this path (asserted in norm_quant_impl).
     const auto* b_ptr = (has_bias && !inputs[2].is_empty()) ? inputs[2].ptr<float>() : nullptr;
 
     const auto process_row = [&](int64_t row) {
@@ -637,8 +626,6 @@ void norm_quant_rows(const NormAttributes& attrs,
         float x_scale, x_zp;
         row_qparam(x_qp, row, x_scale, x_zp);
 
-        // f32 output: dequantize and normalize straight in the output row, no
-        // scratch. f16 / s8 / u8 output: stage the row in a pooled f32 buffer.
         PoolPtr rowbuf_owner;
         float* rowbuf;
         if (out_is_f32) {
@@ -670,8 +657,7 @@ void norm_quant_rows(const NormAttributes& attrs,
             inv_norm = 1.0f / std::sqrt(sum_sq + epsilon);
         }
 
-        // Normalize in place — x and y share the row buffer. add_to is rejected
-        // on the quantized path, so the plain (overwrite) store is used.
+        // In place: rowbuf is source and destination; add_to is rejected here.
         if constexpr (HasScale) {
             if (b_ptr != nullptr) {
                 kernel::norm_apply_row<float, HasMean, true, true>(
@@ -685,7 +671,7 @@ void norm_quant_rows(const NormAttributes& attrs,
                 rowbuf, rowbuf, n, mean_val, inv_norm, nullptr, nullptr, false, false);
         }
 
-        if (out_is_f32) { return; }  // already written in place
+        if (out_is_f32) { return; }
 
         if (out_is_f16) {
             half* y_row = output.ptr<half>(row_idx);
@@ -707,8 +693,7 @@ void norm_quant_rows(const NormAttributes& attrs,
     ctx.cpu.run(0, dims.num_rows, process_row);
 }
 
-/// Dispatch the quantized path on the norm type (LayerNorm / RMSNorm / L2Norm).
-/// BatchNorm has no dequantize-compute-requantize form.
+/// Dispatch the quantized path on the norm type; BatchNorm has no such form.
 Status norm_quant_dispatch(const NormAttributes& attrs,
                            TensorView& output,
                            std::span<const TensorView> inputs,
@@ -730,7 +715,7 @@ Status norm_quant_dispatch(const NormAttributes& attrs,
     }
 }
 
-/// Validate a quantized-input call and dispatch it.
+/// Validate the quantized-input call before dispatching it.
 Status norm_quant_impl(const NormAttributes& attrs,
                         TensorView& output,
                         std::span<const TensorView> inputs,
@@ -738,12 +723,11 @@ Status norm_quant_impl(const NormAttributes& attrs,
 {
     const auto& X = inputs[0];
 
-    // add_to would require dequantizing, accumulating and requantizing the
-    // pre-existing output — not supported on this path.
+    // add_to would mean accumulating into a pre-existing quantized output.
     if (attrs.add_to) { return Status::unsupported; }
 
-    // The quant parameters live on the view, so validate() cannot see them:
-    // they are checked here, before anything is dereferenced.
+    // Quant params live on the view, so descriptor-only validate() cannot see
+    // them; check them here, before anything is dereferenced.
     if (!X.is_quantized()) { return Status::invalid_argument; }
     if (X.channel_pack_size() != 1) { return Status::unsupported; }
 
@@ -781,8 +765,7 @@ Status norm_quant_impl(const NormAttributes& attrs,
         }
     }
 
-    // scale (LayerNorm / RMSNorm) and bias stay f32 on this path; L2Norm has
-    // neither, so inputs[1] may not exist.
+    // L2Norm has no scale or bias, so inputs[1] may not exist.
     if (inputs.size() >= 2 && inputs[1].data_type() != DataType::f32) {
         return Status::invalid_argument;
     }
@@ -791,7 +774,6 @@ Status norm_quant_impl(const NormAttributes& attrs,
         return Status::invalid_argument;
     }
 
-    // The compute type is always f32; the output dtype only picks the store.
     return norm_quant_dispatch(attrs, output, inputs, ctx, has_bias);
 }
 
@@ -835,8 +817,6 @@ Status norm_cpu(const NormAttributes& attrs,
 {
     const DataType x_dtype = inputs[0].data_type();
 
-    // s8/u8 input: dequantize per row and run the float norm kernels on it.
-    // Scratch is pooled internally, so getWorkspaceSize stays 0.
     if (is_quantized_dtype(x_dtype)) {
         return norm_quant_impl(attrs, output, inputs, ctx);
     }

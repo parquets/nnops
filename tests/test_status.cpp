@@ -1,10 +1,10 @@
 /// @file test_status.cpp
 /// @brief The error contract: Status values, the shared check helpers, and the
-///        failure paths of every operator's validate()/compute() pair.
+///        validate()/compute() failure paths of the operators covered here.
 ///
 /// The point of these tests is that a malformed call *returns*, and returns a
 /// specific code — no abort, no out-of-bounds access, no write to the output.
-/// Each case is one rule from one op; together they pin the split between
+/// Each op case is one rule from one op; together they pin the split between
 /// validate() (descriptors only, usable at graph-plan time) and compute()
 /// (views, i.e. whether there is data behind the descriptors).
 
@@ -58,7 +58,6 @@ TensorDesc desc_of(std::initializer_list<int64_t> dims,
 // ============================================================
 
 NNOPS_TEST(status_value_type) {
-    // ok is the zero value, so a zero-initialized status means success.
     NNOPS_EXPECT_EQ(static_cast<uint8_t>(Status::ok), 0);
     NNOPS_EXPECT_TRUE(is_ok(Status::ok));
     NNOPS_EXPECT_TRUE(!is_error(Status::ok));
@@ -68,7 +67,6 @@ NNOPS_TEST(status_value_type) {
     NNOPS_EXPECT_TRUE(is_error(Status::out_of_memory));
     NNOPS_EXPECT_TRUE(is_error(Status::internal));
 
-    // Every code has a distinct, non-empty name.
     NNOPS_EXPECT_EQ(std::string(to_string(Status::ok)), std::string("ok"));
     NNOPS_EXPECT_EQ(std::string(to_string(Status::invalid_argument)),
                     std::string("invalid_argument"));
@@ -103,13 +101,11 @@ NNOPS_TEST(status_helpers) {
     NNOPS_EXPECT_TRUE(is_ok(check_rank(3, 1, 3)));
     NNOPS_EXPECT_TRUE(is_error(check_rank(4, 1, 3)));
 
-    // dtype_in is a fold over the listed types.
-    // (The extra parentheses keep the template's comma out of the macro's
-    // argument list.)
+    // The extra parentheses keep the template's comma out of the macro's
+    // argument list.
     NNOPS_EXPECT_TRUE((detail::dtype_in<DataType::f32, DataType::f16>(DataType::f16)));
     NNOPS_EXPECT_TRUE((!detail::dtype_in<DataType::f32, DataType::f16>(DataType::s8)));
 
-    // require picks the code it is handed.
     NNOPS_EXPECT_TRUE(is_ok(detail::require(true)));
     NNOPS_EXPECT_TRUE(detail::require(false) == Status::invalid_argument);
     NNOPS_EXPECT_TRUE(detail::require(false, Status::unsupported) ==
@@ -157,8 +153,7 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(vec_in, out) == Status::invalid_argument);
     }
 
-    // Permute: the permutation must be exactly one entry per axis, and the
-    // output shape must be the permuted input shape.
+    // Permute: one entry per axis, and the output is the permuted input shape.
     {
         const int64_t p_short[] = {2, 1};   // the input below has rank 3
         PermuteAttributes attrs;
@@ -206,8 +201,7 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(in, bad) == Status::invalid_argument);
     }
 
-    // LayoutConvert: converting to the layout it is already in is a no-op the
-    // caller should not have asked for.
+    // LayoutConvert: converting to the current layout is rejected, not a no-op.
     {
         auto op = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
         const TensorDesc same[] = {desc_of({2, 3}, DataType::f32, TensorLayout::NCHW)};
@@ -216,8 +210,7 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(other, same) == Status::ok);
     }
 
-    // Embed: indices must be integer; an unknown weight dtype is unsupported
-    // rather than malformed.
+    // Embed: non-integer indices are malformed; an unknown weight dtype is unsupported.
     {
         auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
         const TensorDesc bad_idx[] = {desc_of({8, 4}), desc_of({2}, DataType::f32)};
@@ -231,8 +224,7 @@ NNOPS_TEST(status_validate_descriptors_only) {
         NNOPS_EXPECT_TRUE(op->validate(odd_w, out) == Status::unsupported);
     }
 
-    // Softmax: a quantized input is dequantized first, so an integer output
-    // has no meaning.
+    // Softmax dequantizes, so an integer output has no meaning.
     {
         auto op = Softmax::create(SoftmaxAttributes{}, Backend::CPU);
         // Note that a descriptor has no quant parameters — they live on the
@@ -262,7 +254,8 @@ NNOPS_TEST(status_input_count) {
                                none, none, none, none};
     const std::span<TensorView> one_out(out, 1);
 
-    // Arity from one to three inputs, with no optional slot.
+    // Fixed arity for Activation (1) and Eltwise (2); MatMul and Conv2D also
+    // take an optional bias.
     {
         auto op = Activation::create(ActivationAttributes{}, Backend::CPU);
         NNOPS_EXPECT_TRUE(op->compute(one_out, std::span<const TensorView>(in2)) ==
@@ -316,9 +309,8 @@ NNOPS_TEST(status_input_count) {
 }
 
 NNOPS_TEST(status_empty_view) {
-    // Right count, but a placeholder in the data slot. compute() owns this
-    // rule: a descriptor may legitimately carry no data (an optional input, a
-    // plan), but a call that reaches a kernel may not.
+    // Right count, placeholder data: a descriptor may legitimately carry none
+    // (an optional input, a plan), but a call that reaches a kernel may not.
     const int64_t shape[] = {4};
     float buf[4] = {};
     TensorView live(shape, DataType::f32, buf);
@@ -371,8 +363,7 @@ NNOPS_TEST(status_topk_rules) {
 }
 
 NNOPS_TEST(status_unsupported_dtype) {
-    // A well-formed call the backend has no kernel for is "unsupported", not a
-    // malformed argument.
+    // A well-formed call with no kernel is "unsupported", not malformed.
     {
         auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
         // A is f32 and B is s32: the fp route wants B in A's type (or a block
@@ -409,9 +400,8 @@ NNOPS_TEST(status_unsupported_dtype) {
 }
 
 NNOPS_TEST(status_missing_backend_kernel) {
-    // An op created for a backend that has no kernel for it is constructible:
-    // the failure surfaces at compute(), as unsupported. (The CPU backend has
-    // kernels for every operator; Vulkan has them for eltwise and unary only.)
+    // An op for a backend with no kernel is constructible; the failure surfaces
+    // at compute() as unsupported. (Vulkan has kernels for eltwise and unary only.)
     const int64_t shape[] = {4};
     float buf[4] = {};
     TensorView live(shape, DataType::f32, buf);

@@ -3,23 +3,22 @@
 /// @brief AArch64 NEON fused pack + per-row quantize kernels for GEMM LHS/RHS.
 ///
 /// These kernels fuse the f32→i8 quantization step into the GEMM packing step,
-/// eliminating the intermediate quantized-but-unpacked buffer and halving the
-/// memory traffic (one pass instead of quantize + pack).
+/// so the intermediate quantized-but-unpacked buffer of a separate quantize +
+/// pack never exists (one pass instead of two).
 ///
 /// Two transform families, mirroring pack_f32 / pack_dp4a_i8:
 ///   - pack_quant_trans_nN (LHS/A): reads N f32 rows (stride ir_step), quantizes
 ///     each row independently with its own scale/zero (broadcast across all K),
-///     narrows to int8, then packs 4 consecutive K values from the SAME row into
-///     each int32 to match the SDOT dp4a interleaved format.
-///   - pack_quant_copy_nN (RHS/B): reads N-column f32 rows, quantizes with
-///     K-shared scale/zero (broadcast across all K), groups each 4-k block into
-///     contiguous 4-i8 runs per column.
+///     then packs 4 consecutive K values from the SAME row into each int32 to
+///     match the SDOT dp4a interleaved format.
+///   - pack_quant_copy_nN (RHS/B): reads K rows of N f32 columns, quantizes with
+///     one scale/zero shared by the whole K extent, and groups each 4-k block
+///     into contiguous 4-i8 runs per column.
 ///
 /// Quantization: dst = clamp(round(src * inv_scale) + zero_point, qmin, qmax)
-/// where inv_scale = 1.0f / scale, zero_point is int32_t.
-/// Rounding is round-to-nearest-even.  zero_point is added in the integer
-/// domain after rounding.
-/// Templated on Q_U8 (false=s8/int8_t, true=u8/uint8_t).
+/// where inv_scale = 1.0f / scale and zero_point is int32_t. Rounding is
+/// round-to-nearest-even. zero_point is added in the integer domain after
+/// rounding. Templated on Q_U8 (false=s8/int8_t, true=u8/uint8_t).
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/aarch64/pack_quant_i8.hpp
 
@@ -34,11 +33,7 @@
 namespace nnops::backend::cpu::aarch64 {
 
 // =========================================================================
-//  Per-lane quantization helpers.
-//
-//  After transpose, each float32x4_t lane comes from a different input row,
-//  so each lane needs its own scale/zero.  We use mul+add (not FMA) because
-//  the scale and zero are per-lane, not broadcast.
+//  Per-lane quantization helpers — scale and zero_point may differ per lane
 // =========================================================================
 
 template <bool Q_U8 = false>
@@ -46,7 +41,6 @@ inline int8x16_t quant_trans_block_4x4_f32_i8(
     float32x4_t d0, float32x4_t d1, float32x4_t d2, float32x4_t d3,
     const float32x4_t& v_inv_scale, const float32x4_t& v_zero) noexcept
 {
-    // Per-lane: dst = src * inv_scale + zero
     d0 = vaddq_f32(vmulq_f32(d0, v_inv_scale), v_zero);
     d1 = vaddq_f32(vmulq_f32(d1, v_inv_scale), v_zero);
     d2 = vaddq_f32(vmulq_f32(d2, v_inv_scale), v_zero);
@@ -71,8 +65,7 @@ inline int8x16_t quant_trans_block_4x4_f32_i8(
     }
 }
 
-/// Quantize 4 floats (one float32x4_t) with per-lane scale/zero into int32x4_t.
-/// Used for the pack_copy path where each K position has its own scale.
+/// Quantize one float32x4_t with per-lane scale/zero into int32x4_t, unclamped.
 template <bool Q_U8 = false>
 inline int32x4_t quant_4f32_to_i32(float32x4_t d,
                                     float32x4_t v_inv_scale,
@@ -103,14 +96,8 @@ inline int8x16_t narrow_4i32_to_i8(int32x4_t i0, int32x4_t i1,
 // =========================================================================
 //  LHS pack + quantize  (f32 → i8, per-row scale/zero_point)
 //
-//  Each row is quantized independently with its own scale/zero_point
-//  (broadcast across all K elements).  K step = 4 (float32x4_t).
-//  Quantization: round(src * inv_scale) + zero_point.
-//  After narrowing, 4 consecutive K values from the SAME row are packed
-//  into each int32, matching the SDOT dp4a interleaved format:
-//    out_i32[0] = [q(r0_k0), q(r0_k1), q(r0_k2), q(r0_k3)]
-//    out_i32[1] = [q(r1_k0), q(r1_k1), q(r1_k2), q(r1_k3)]
-//    ...
+//  K step = 4. Four consecutive K values of one row share an int32, the SDOT
+//  dp4a interleaved format; row i's group starts at out_i32[i].
 // =========================================================================
 
 template <bool Q_U8 = false>
@@ -370,9 +357,8 @@ inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
 // =========================================================================
 //  RHS Copy pack + quantize  (f32 → i8, K-shared scale/zero_point)
 //
-//  Scale/zero_point is broadcast across all K elements (single scale/zero_point
-//  for the entire K dimension).  K step = 4 (group 4 consecutive K elements).
-//  Quantization: round(src * inv_scale) + zero_point.
+//  One scale[0]/zero[0] serves the whole K extent. K step = 4: each group is
+//  four consecutive k of one column, stored contiguously.
 // =========================================================================
 
 template <bool Q_U8 = false>
@@ -543,7 +529,6 @@ inline void pack_quant_copy_n12_i8(void* NNOPS_RESTRICT output,
             return vqmovn_s16(s);
         };
 
-        // First 8 columns: quantize per-row, interleave via vst4_s8
         {
             int8x8_t r0 = quant_row8(0);
             int8x8_t r1 = quant_row8(1);
@@ -557,7 +542,6 @@ inline void pack_quant_copy_n12_i8(void* NNOPS_RESTRICT output,
             out_i8 += 4 * 8;
         }
 
-        // Remaining 4 columns: scalar interleaved
         for (int x = 8; x < 12; ++x) {
             out_i8[0] = static_cast<int8_t>(std::min(std::max(
                 static_cast<int32_t>(std::nearbyintf(input[0 * ir_step + x] * inv_s)) + zp_val, qmin), qmax));

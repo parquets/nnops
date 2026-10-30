@@ -1,17 +1,20 @@
 /// @file depthwise_conv.cpp
-/// @brief SIMD-optimized CPU implementation of 2D/3D depthwise convolution in
-///        the planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC) layouts.
+/// @brief SIMD CPU depthwise 2D/3D convolution, planar (NCHW/NCDHW) and
+///        channel-last (NHWC/NDHWC).
 ///
-/// Planar input takes the raw [C, 1, (KD,) KH, KW] filter, one channel plane at
-/// a time, and vectorizes along output width. Channel-last input takes the raw
-/// HWCM filter [KH][KW][C] and vectors across channels, sweeping the channel
-/// blocks of a row group inside the task so a pixel's channels are consumed
-/// while its cache lines are hot (see dwconv_last_impl). Quantized depthwise
-/// conv does not exist on the planar route.
+/// Planar keeps the raw [C, 1, (KD,) KH, KW] filter, takes one channel plane at
+/// a time, and puts the SIMD lane on output width. Channel-last keeps the raw
+/// HWCM filter [KH][KW][C] (TF depthwise order, multiplier dropped) and puts the
+/// lane on channels; all channel blocks of a row group are swept inside one
+/// task so the group's input rows stay in cache across the sweep. No prepack
+/// step is involved — the storage order already is the access pattern. A task
+/// owns a strip of four rows cut to fit L2, and when the grid cannot fill the
+/// pool the filter axis splits a strip into channel chunks. Quantized depthwise
+/// exists only on the channel lane.
 ///
-/// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
-/// A single unified kernel handles both 2D and 3D: the KD loop is always present;
-/// for 2D, KD=1 so it degenerates to a single no-op iteration.
+/// Spatial rank comes from the input rank (4 → 2D, 5 → 3D). One kernel covers
+/// both: the KD loop is always present, and for 2D KD = 1 makes it a single
+/// iteration.
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -49,7 +52,6 @@ void dwconv_impl(
     const int64_t N      = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
 
-    // Spatial dims (auto-detect 2D vs 3D)
     const int64_t ID  = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH  = input.shape(srank);
     const int64_t IW  = input.shape(srank + 1);
@@ -85,7 +87,6 @@ void dwconv_impl(
     const int64_t out_ch_stride  = output.channel_block_stride_elems();
     const int64_t taps           = KD * KH * KW;
 
-    // Kernel params (od/oh updated per call)
     k::DwConvParams p{};
     p.ID = ID; p.IH = IH; p.IW = IW;
     p.OH = OH; p.OW = OW;
@@ -97,13 +98,10 @@ void dwconv_impl(
     p.in_d_stride    = in_d_stride;
     p.in_row_stride  = in_row_stride;
 
-    // Planar edge masks. The first and last width vectors of a row are the only
-    // ones that read past it, and on a narrow plane they are the only ones
-    // there are — that is exactly where planar_load's per-lane scalar loop used
-    // to eat the whole kernel. A mask zeroes the lanes that fall outside the
-    // row, so the same vector load stays valid and a tap costs a load and an
-    // FMA instead of eight scalar iterations. It depends only on (edge, tap),
-    // never on the row, so it is built once here for the whole call.
+    // Planar edge masks: only the first and last width vector of a row read past
+    // it, and a mask zeroes the lanes outside the row so a tap stays a load and
+    // an FMA instead of a per-lane scalar loop. The mask depends only on
+    // (edge, tap), never on the row, so it is built once for the whole call.
     constexpr int64_t kMaskLanes = simd_lane_for<T>;
     constexpr int64_t kMaskMaxKw = 16;
     uint8_t edge_needed[2 * kMaskMaxKw] = {};
@@ -121,11 +119,9 @@ void dwconv_impl(
         // Per-task copy: `p` is shared by every worker, so od/oh cannot live in it.
         k::DwConvParams pc = p;
 
-        // The masked load reads up to PW before the row start and up to
-        // L-1+(KW-1)*DW past its end, which lands in the neighbouring row — and
-        // is harmless there, since those lanes are masked to zero — for every
-        // row but the tensor's first and last. Those two blocks keep the
-        // bounds-checked path; that is one channel of a batch, once.
+        // The masked load reaches into the neighbouring row, harmlessly, since
+        // those lanes are masked to zero — except at the tensor's first and
+        // last row blocks, which keep the bounds-checked path.
         k::DwPlanarEdges blk_edges = edges;
         if ((n == 0 && blk == 0) || (n == N - 1 && blk == blocks - 1)) {
             blk_edges.masks = nullptr;
@@ -134,8 +130,8 @@ void dwconv_impl(
         for (int64_t od = 0; od < OD; ++od) {
             T* out_d = out_base + od * out_d_stride;
 
-            // Four rows per call, for the ILP: a single row's taps form one
-            // dependent FMA chain. Rows past OH are skipped in-kernel.
+            // Four rows per call: one row's taps are a single dependent FMA
+            // chain. Rows past OH are skipped in-kernel.
             int64_t oh = 0;
             for (; oh + 3 < OH; oh += 4) {
                 pc.od = od;
@@ -160,22 +156,6 @@ void dwconv_impl(
 // ============================================================
 // Channel-last (NHWC/NDHWC) depthwise — the lane spans channels
 // ============================================================
-//
-// One task per output row, and every channel block of that row is swept before
-// the task moves on: a row of a channel-last plane is IW*C elements and stays
-// in cache across the block sweep, so the plane is still read exactly once.
-// Splitting the grid by channel block would re-read every cache line C/8
-// times.
-//
-// The weight is the raw HWCM filter [KH][KW][C] (TensorFlow's depthwise order
-// with the multiplier dropped), whose tap stride is the channel count: one
-// vector per tap is 8 consecutive channels of that tap, which is what the
-// channel-lane kernel loads. No prepack step is involved — the layout already
-// is the access pattern.
-//
-// When the plane is too short to fill the pool (seven 7x7 rows against twenty
-// workers) the filter axis picks up the rest: the rows are split into channel
-// chunks, nearest-rounded rather than ceiled so the pool runs one wave.
 
 template <typename T>
 void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
@@ -219,12 +199,11 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     p.pix_stride     = C;   // a pixel holds all C channels, and so does a tap
     p.w_tap_stride   = C;   // the raw HWCM filter is [tap][C]
 
-    // Sixteen channels a chunk, always. A pixel's sixteen f32 are one 64-byte
-    // line, so a sweep of the block loop touches every line exactly once; an
-    // eight-channel chunk would touch each line twice for the same bytes, and a
-    // strided sweep costs what a full one costs (measured: half-line reads of a
-    // plane run at the plane's full time). The 3x3 kernel answers that by taking
-    // both halves of the pixel in one call.
+    // Sixteen channels a chunk: a pixel's sixteen f32 are one 64-byte line, so
+    // the block sweep touches every line exactly once. An eight-channel chunk
+    // touches each line twice, and a strided sweep costs what a full one does
+    // (measured: half-line reads of a plane run at the plane's full time). The
+    // 3x3 kernel takes both halves of the pixel in one call instead.
     constexpr int64_t chunk = 16;
     const int64_t nblocks = (C + chunk - 1) / chunk;
 
@@ -235,17 +214,12 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
 
     const int64_t out_d_stride = OH * p.out_row_stride;
 
-    // Four output rows per task: one row's taps are a dependent FMA chain,
-    // four rows are four independent ones. The last group of a plane shorter
-    // than a multiple of four runs single rows.
-    //
-    // The task is a *strip* of those four rows, not the whole width. A channel-
-    // last row group is (4*SH + KH) input rows of IW*C elements, and every one
-    // of the C/8 block sweeps walks it again; at C=256 on a 300-wide plane that
-    // is 1.8 MB per group and each sweep came back from DRAM, which measured
-    // 3x slower. Cutting the width so a strip's working set fits L2 keeps the
-    // group resident across the block loop, which is the whole point of
-    // sweeping the blocks inside the row.
+    // Four output rows per task: one row's taps are a dependent FMA chain, four
+    // rows are four independent ones. The task is a *strip* of them, not the
+    // whole width: a group's 4*SH + (KH-1)*DH input rows are IW*C each and every
+    // block sweep walks them again — 1.8 MB at C=256 on a 300-wide plane, so
+    // each sweep came back from DRAM and measured 3x slower. A strip that fits
+    // L2 stays resident across the sweep.
     const int64_t hgroups = (OH + 3) / 4;
     const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;  // rows a group reads
     constexpr int64_t kStripBytes = 128 * 1024;
@@ -261,12 +235,10 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     const int64_t strips  = (OW + strip - 1) / strip;
     const int64_t groups  = N * OD * hgroups * strips;
     const int64_t nt = ctx.cpu.thread_count();
-    // The filter axis only splits a group when the grid cannot fill the pool;
-    // one chunk means the block loop runs inside the task, which is what keeps
-    // the strip in cache. The split is picked by makespan, not by pool width: a
-    // task count the pool cannot divide evenly costs a whole extra wave (21
-    // tasks on 20 workers run in two), which is worth more than the idle
-    // threads a smaller split leaves behind.
+    // The filter axis splits a group only when the grid cannot fill the pool;
+    // one chunk keeps the block loop inside the task and the strip in cache. The
+    // split is picked by makespan, not pool width: a count the pool cannot
+    // divide evenly costs a whole extra wave (21 tasks on 20 workers run in two).
     int64_t chunks = 1;
     if (groups < nt && nblocks > 1) {
         int64_t best_cost = 0;
@@ -298,8 +270,8 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
         pc.ow_end = std::min(pc.ow0 + strip, OW);
 
         const T* in_img = in_ptr + n * ID * p.in_d_stride;
-        // The kernel indexes the store by the absolute column, so the base stays at
-    // the row start even though the loop covers only this strip.
+        // The kernel indexes the store by the absolute column, so the base stays
+        // at the row start even though the loop covers only this strip.
     T* out_rows = out_ptr + n * OD * out_d_stride + od * out_d_stride
                 + pc.oh * p.out_row_stride;
 
@@ -308,15 +280,11 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
         for (int64_t blk = blk0; blk < blk1; ++blk) {
             const int64_t c0 = blk * chunk;
-            // One call per block, at the block's own width — full blocks are
-            // `chunk` wide, only the plane's last one is short. That is what the
-            // two-vector 3x3 kernel is for; handing it the whole remaining
-            // channel count instead (`C - c0`) silently sends every full block
-            // down the generic two-vector path, which covers sixteen channels
-            // but re-derives the row pointers and reloads the taps per column.
-            // The exception is 9..15 channels of a sixteen-wide block, which has
-            // no single policy shape (two 8-lane vectors would read past the last
-            // channel), so it runs as an 8-lane call and its remainder.
+            // One call per block at its own width: full blocks are `chunk` wide,
+            // only the last is short. Passing `C - c0` instead silently sends
+            // every block but the last down the generic two-vector path. A 9..15
+            // tail runs as an 8-lane call and its remainder, because two 8-lane
+            // vectors would read past the last channel.
             const int64_t rem = std::min(C - c0, chunk);
             int64_t seg_off[2] = {0, 0};
             int64_t seg_lanes[2] = {rem, 0};
@@ -355,9 +323,9 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
 // Channel-last depthwise, quantized (s8/u8 activation, s8/u8 weight)
 // ============================================================
 //
-// Same task grid and the same kernel as the fp route; the weight is HWCM s8/u8
-// and is dequantized per row per block into a staging vector (see
-// dwconv_last_quant). The activation is PerTensor and the weight PerChannel.
+// Same task grid as the fp route; the HWCM weight is dequantized per row per
+// block into a staging vector (see dwconv_last_quant). The activation is
+// PerTensor and the weight PerChannel.
 
 template <typename InT, typename OutT>
 Status dwconv_last_impl_quant(const DepthwiseConvAttributes& attrs, TensorView& output,
@@ -428,7 +396,6 @@ Status dwconv_last_impl_quant(const DepthwiseConvAttributes& attrs, TensorView& 
 
     const int64_t out_d_stride = OH * p.out_row_stride;
 
-    // Four output rows per task, as on the fp route and for the same reason.
     const int64_t hgroups = (OH + 3) / 4;
     const int64_t in_rows = 4 * p.SH + (p.KH - 1) * p.DH;  // rows a group reads
     constexpr int64_t kStripBytes = 128 * 1024;

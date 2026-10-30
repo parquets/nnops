@@ -5,7 +5,7 @@
 /// quantization parameters against an int8 B. A is quantized in place of the
 /// GEMM into `attrs.act_quant_dtype` (s8 or u8) with the caller's offline
 /// parameters, the int8 GEMM produces the MatMulInteger accumulate, and the
-/// accumulate is dequantized back to A's floating-point dtype:
+/// accumulate is dequantized back into A's dtype, which is also the output's:
 ///
 ///   A_q[m,k] = clamp(rne(A[m,k] * (1/s_a[m]) + zp_a[m]), qmin, qmax)
 ///   acc      = Σ_k (A_q[m,k] − zp_a[m]) · (B[k,n] − zp_b[n])
@@ -15,8 +15,8 @@
 /// same fused `x·(1/s) + zp`, the same f32 dequant multiply, the same float→half
 /// narrowing. Supports N-D batch matmul with numpy-style broadcasting.
 ///
-/// `transpose_a` is not part of the fast path, but it is well defined here, so
-/// the backend routes that combination to this kernel.
+/// `transpose_a` is outside the fast path, but the indexing here is general:
+/// it reads A as K×M when transposed and B as N×K when `transpose_b` is set.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -45,12 +45,12 @@ inline float scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
-// The quantization pass the tiled kernel runs, one element at a time.
+// One element of the tiled kernel's quantization pass.
 template <class QInt>
 inline QInt quantize_value(float x, float inv_scale, float zero) noexcept {
     constexpr int32_t qmin = std::is_same_v<QInt, uint8_t> ? 0 : -128;
     constexpr int32_t qmax = std::is_same_v<QInt, uint8_t> ? 255 : 127;
-    // Same fused multiply-add as the arch's vfmaq_f32 / _mm256_fmadd_ps.
+    // Same fused multiply-add the arch quant kernels use (vfmaq / fmadd).
     const float v = std::fmaf(x, inv_scale, zero);
     int32_t q = static_cast<int32_t>(std::nearbyintf(v));  // round-to-nearest-even
     q = std::min(std::max(q, qmin), qmax);
@@ -86,7 +86,6 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
     const int64_t b_row_stride = b.row_stride_elems();
     const int64_t c_row_stride = output.row_stride_elems();
 
-    // The op resolves the output dtype from A on this path (fp in, fp out).
     NNOPS_ASSERT(output.data_type() == a.data_type());
     AT* c_base = output.ptr<AT>();
 
@@ -94,8 +93,8 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
     const QuantParams& qb = b.quant_params();
     const Epilogue&    ep = attrs.epilogue;
 
-    // Optional per-column bias in the fp output dtype, applied after the
-    // dequantize and before the clamp/activation.
+    // Optional per-column bias, in the fp output dtype, sitting between the
+    // dequantize and the clamp.
     const bool has_bias = inputs.size() > 2;
     const AT* bias = has_bias ? inputs[2].ptr<AT>() : nullptr;
     NNOPS_ASSERT(!has_bias || inputs[2].numel() >= N);
@@ -131,8 +130,6 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
         total_batch *= batch_out_shape[i];
     }
 
-    // Read one A element as float — the arch quant kernels widen f16 with F16C,
-    // which is the same exact conversion half_to_float performs.
     const auto a_load = [](const AT* a_ptr, int64_t elem) -> float {
         if constexpr (std::is_same_v<AT, half>) {
             return half_to_float(a_ptr[elem]);
@@ -143,7 +140,7 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
 
     const auto gemm_2d = [&](const AT* a_ptr, int64_t a_row_base,
                              const int8_t* b_ptr, int64_t c_offset) {
-        // Raw reductions over B (A's must come from the quantized values).
+        // Raw reductions over B; A's must come from the quantized values.
         std::vector<int32_t> r_b(static_cast<size_t>(N), 0);
         for (int64_t n = 0; n < N; ++n) {
             int32_t s = 0;
@@ -161,7 +158,6 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
             const float   s_a  = scale_at(qa, a_row_base + m);
             const float   inv  = 1.0f / s_a;
 
-            // 1. Quantize this A row.
             int32_t r_a = 0;
             for (int64_t k = 0; k < K; ++k) {
                 const float x = a_load(a_ptr, attrs.transpose_a ? k * a_row_stride + m
@@ -170,8 +166,8 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
                 r_a += static_cast<int32_t>(aq[static_cast<size_t>(k)]);
             }
 
-            // 2. int8 dot product + zero-point compensation (no pack bias here:
-            //    the reference multiplies the stored values directly).
+            // int8 dot product + zero-point compensation; the reference
+            // multiplies the stored values directly, so the pack bias is 0.
             for (int64_t n = 0; n < N; ++n) {
                 int32_t raw = 0;
                 for (int64_t k = 0; k < K; ++k) {
@@ -185,8 +181,6 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
                     raw, 0, zp_a, zp_b, r_a, r_b[static_cast<size_t>(n)],
                     static_cast<int32_t>(K));
 
-                // 3. Dequantize, bias, clip, activate — the SIMD kernel's exact
-                //    order (the bias sits between the product and the clamp).
                 const float scale = s_a * scale_at(qb, n);
                 float f = static_cast<float>(acc) * scale;
                 if (bias != nullptr) { f += a_load(bias, n); }
@@ -230,8 +224,8 @@ void matmul_dq_ref_impl(const MatMulAttributes& attrs,
             c_offset += coord * output.stride_elems(d);
         }
 
-        // Per-token arrays are indexed by A's global row; every batch stride is
-        // a whole number of rows, so the division is exact.
+        // Per-token arrays index A's global row; every batch stride is a whole
+        // number of rows, so the division is exact.
         gemm_2d(a_base + a_offset, a_offset / a_row_stride,
                 b_base + b_offset, c_offset);
     }

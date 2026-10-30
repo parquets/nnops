@@ -1,10 +1,18 @@
 /// @file test_eltwise_vulkan.cpp
-/// @brief Unit tests for Eltwise operator (Vulkan GPU backend).
+/// @brief Eltwise operator unit tests, Vulkan backend.
 ///
-/// Each test:
-///   1. Computes the expected result on CPU (reference)
-///   2. Runs the same computation via the Vulkan backend
-///   3. Reads back GPU results and compares against CPU reference
+/// Each case runs the op once on the Vulkan backend (through run_eltwise_vulkan
+/// for f32, run_eltwise_vulkan_f16 for f16) and compares the read-back result
+/// against a host reference. For f32 that reference is the plain arithmetic on
+/// the same values. For f16 it is compute_eltwise_f16_ref, which rounds both
+/// inputs to fp16, evaluates in float and rounds the result back — so it checks
+/// the backend's rounding as well as the arithmetic. Tolerances: 1e-4 f32 (1e-3
+/// on the large Mul sweep), 1e-3 f16.
+///
+/// The backend reads the VkBuffers set on the ComputeContext and never the
+/// TensorView data pointer, so the views handed to compute() exist only to carry
+/// shape and dtype. The N = 12345 cases in both sections push past the shaders'
+/// 256-wide workgroup, so the dispatch spans more than one workgroup.
 
 #ifdef NNOPS_HAS_VULKAN
 
@@ -22,10 +30,6 @@
 
 using namespace nnops;
 
-// ============================================================
-// Helper: run eltwise on Vulkan backend
-// ============================================================
-
 static std::vector<float> run_eltwise_vulkan(
     const float* a_data, const float* b_data,
     int64_t numel, EltwiseType op_type, bool add_to = false,
@@ -35,12 +39,10 @@ static std::vector<float> run_eltwise_vulkan(
 
     size_t buf_size = numel * sizeof(float);
 
-    // Create device buffers
     auto buf_a = env.create_buffer(buf_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto buf_b = env.create_buffer(buf_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto buf_o = env.create_buffer(buf_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    // Copy input data to device
     env.copy_to_device(buf_a, a_data, buf_size);
     env.copy_to_device(buf_b, b_data, buf_size);
     if (init_out) {
@@ -50,7 +52,6 @@ static std::vector<float> run_eltwise_vulkan(
         env.copy_to_device(buf_o, zeros.data(), buf_size);
     }
 
-    // Build Vulkan ComputeContext
     ComputeContext ctx;
     ctx.expected_backend = Backend::Vulkan;
     ctx.vulkan_device = env.device();
@@ -62,21 +63,17 @@ static std::vector<float> run_eltwise_vulkan(
     ctx.vulkan_buffers = bufs;
     ctx.vulkan_buffers_count = 3;
 
-    // Create operator
     EltwiseAttributes attrs;
     attrs.type = op_type;
     attrs.add_to = add_to;
     auto op = Eltwise::create(attrs, Backend::Vulkan);
 
-    // Record and submit
     VkCommandBuffer cmd = env.begin_cmd();
     ctx.vulkan_cmd_buffer = cmd;
 
     const int64_t shape[] = {numel};
-    // We need TensorViews for the operator API — but Vulkan backend doesn't
-    // read from the data pointer, it reads from VkBuffers. We still need
-    // valid TensorViews for shape/numel metadata.
-    // Use dummy pointers — the Vulkan backend ignores the data pointer.
+    // The operator API still wants TensorViews; only their shape and dtype are
+    // read, so the data pointers below are dummies.
     TensorView a_view(shape, DataType::f32, const_cast<float*>(a_data));
     TensorView b_view(shape, DataType::f32, const_cast<float*>(b_data));
     TensorView o_view(shape, DataType::f32, nullptr);  // data ptr unused
@@ -86,21 +83,15 @@ static std::vector<float> run_eltwise_vulkan(
 
     env.submit_and_wait();
 
-    // Read back result
     std::vector<float> result(numel);
     env.copy_from_device(buf_o, result.data(), buf_size);
 
-    // Cleanup
     env.destroy_buffer(buf_a);
     env.destroy_buffer(buf_b);
     env.destroy_buffer(buf_o);
 
     return result;
 }
-
-// ============================================================
-// Tests: Vulkan vs CPU reference
-// ============================================================
 
 NNOPS_TEST(eltwise_vulkan_add_1d) {
     const int N = 256;
@@ -175,7 +166,6 @@ NNOPS_TEST(eltwise_vulkan_large_add) {
 }
 
 NNOPS_TEST(eltwise_vulkan_many_elements) {
-    // Test with >256 elements to verify multi-workgroup dispatch
     const int N = 12345;
     auto [a_vec, a_view] = test::make_random_tensor({N}, -5.0f, 5.0f, 789);
     auto [b_vec, b_view] = test::make_random_tensor({N}, -5.0f, 5.0f, 101);
@@ -187,15 +177,10 @@ NNOPS_TEST(eltwise_vulkan_many_elements) {
     }
 }
 
-// ============================================================
-// fp16 (half-precision) tests
-// ============================================================
-
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-/// Helper: convert float array to fp16 uint16_t array
 static std::vector<uint16_t> floats_to_f16(const float* src, int64_t n) {
     std::vector<uint16_t> result(n);
     for (int64_t i = 0; i < n; ++i) {
@@ -204,7 +189,6 @@ static std::vector<uint16_t> floats_to_f16(const float* src, int64_t n) {
     return result;
 }
 
-/// Helper: convert fp16 uint16_t array to float array
 static std::vector<float> f16_to_floats(const uint16_t* src, int64_t n) {
     std::vector<float> result(n);
     for (int64_t i = 0; i < n; ++i) {
@@ -213,8 +197,7 @@ static std::vector<float> f16_to_floats(const uint16_t* src, int64_t n) {
     return result;
 }
 
-/// Helper: run eltwise on Vulkan backend with f16 data
-/// Returns fp16 results converted to float for comparison.
+/// f16 results come back as float: read back as uint16_t, converted per element.
 static std::vector<float> run_eltwise_vulkan_f16(
     const float* a_data, const float* b_data,
     int64_t numel, EltwiseType op_type, bool add_to = false,
@@ -222,7 +205,6 @@ static std::vector<float> run_eltwise_vulkan_f16(
 {
     test::VulkanTestEnv env;
 
-    // Convert float inputs to fp16
     auto a_f16 = floats_to_f16(a_data, numel);
     auto b_f16 = floats_to_f16(b_data, numel);
     std::vector<uint16_t> o_f16(numel, 0);
@@ -260,8 +242,7 @@ static std::vector<float> run_eltwise_vulkan_f16(
     ctx.vulkan_cmd_buffer = cmd;
 
     const int64_t shape[] = {numel};
-    // Use a dummy uint16_t pointer for TensorView; Vulkan backend ignores data ptr
-    uint16_t dummy = 0;
+    uint16_t dummy = 0;   // as in the f32 helper: only shape and dtype are read
     TensorView a_view(shape, DataType::f16, &dummy);
     TensorView b_view(shape, DataType::f16, &dummy);
     TensorView o_view(shape, DataType::f16, nullptr);
@@ -271,7 +252,6 @@ static std::vector<float> run_eltwise_vulkan_f16(
 
     env.submit_and_wait();
 
-    // Read back fp16 result
     std::vector<uint16_t> result_f16(numel);
     env.copy_from_device(buf_o, result_f16.data(), buf_size);
 
@@ -282,8 +262,8 @@ static std::vector<float> run_eltwise_vulkan_f16(
     return f16_to_floats(result_f16.data(), numel);
 }
 
-/// Helper: compute fp16 reference result.
-/// Converts inputs to fp16, computes in float, converts back to fp16.
+/// Rounds inputs to fp16 and the result back, so it models the backend's
+/// precision loss rather than just the arithmetic.
 static std::vector<float> compute_eltwise_f16_ref(
     const float* a, const float* b, int64_t n,
     EltwiseType op_type, bool add_to = false,
@@ -301,7 +281,7 @@ static std::vector<float> compute_eltwise_f16_ref(
         case EltwiseType::Div: r = va / vb; break;
         case EltwiseType::Min: r = va < vb ? va : vb; break;
         case EltwiseType::Max: r = va > vb ? va : vb; break;
-        default: r = 0;
+        default: r = 0;   // Pow is not exercised in f16; it would land here
         }
         if (add_to && init) {
             float init_f16 = half_to_float(float_to_half(init[i]));

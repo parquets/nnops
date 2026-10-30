@@ -2,23 +2,27 @@
 /// @file pack_dp4a_i8.hpp
 /// @brief x86_64 int8 (dp4a) pack kernels for GEMM LHS/RHS.
 ///
-/// These kernels repack quantised int8 data into the layout consumed by the
-/// int8 dot-product (dp4a / VNNI) micro-kernels. They perform pure data
-/// movement — no dot product happens here. `scale` is accepted for signature
-/// parity with the f32/f16 packs but ignored (quantisation is handled by the
-/// caller). Four int8 elements are packed into each int32 to match the 4-wide
-/// dot-product accumulator.
+/// Pure data movement into the layout the int8 dot-product (dp4a / VNNI)
+/// micro-kernels read: four consecutive k of one A row (one B column) land in
+/// one int32, matching the 4-wide accumulator. `scale` is accepted for
+/// signature parity with the f32/f16 packs and ignored — quantisation is the
+/// caller's job. Only AVX2-level `_si256`/`_si128` intrinsics are used; the
+/// pack step needs no dot-product instruction.
 ///
-/// Two transform families, mirroring pack_f32/pack_f16:
-///   - pack_trans_nN (LHS/A): reads N int8 rows (stride ir_step), transposes
-///     N×K blocks, packs 4 int8 per int32, writes contiguously.
-///   - pack_copy_nN (RHS/B): reads N-column rows, groups each 4-k block into
-///     contiguous 4-int8 runs per column.
+/// Two families, mirroring pack_f32/pack_f16:
+///   - pack_trans_nN (LHS/A): reads N rows (stride ir_step), transposes each
+///     N x K block, and writes ceil(K/4) x N int32 — one int32 per 4
+///     consecutive k of each row, k-block major. The vector panels (4/6/8/12/16
+///     rows) walk k in steps of 32 through the f32 transposes, while n1 is a
+///     plain k walk (ir_step unused). K past the live length is zero-filled to
+///     the next multiple of 4, and no loop reads past K.
+///   - pack_copy_nN (RHS/B): rows are contiguous; each 4-k block is written as
+///     a 4-int8 run per column.
 ///
-/// Unlike the reference (which uses the AVX512 `_mm*_epi8`/`_mm*_epi32` load and
-/// store aliases), these kernels use the portable `_si256`/`_si128` intrinsics
-/// so they compile under the baseline AVX2 ISA — the pack step needs no
-/// dot-product instruction.
+/// The 16-wide panels of both families take a live width `nr <= 16`. Below 16
+/// a scalar pass reads only rows/columns below `nr` (and k < K) and zero-fills
+/// the rest, so a short last panel never runs past the tensor; full width takes
+/// the vector route.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/x86_64/pack_dp4a_i8.hpp
 
@@ -29,9 +33,7 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-// =========================================================================
-//  LHS Transpose pack (int8)  —  4 int8 packed per int32 (K step = 32)
-// =========================================================================
+// ---- LHS transpose pack (int8): N rows x K, 4 int8 per int32 -------------
 
 inline void pack_trans_n1_dp4a_i8(void* NNOPS_RESTRICT output,
                                   const void* NNOPS_RESTRICT input,
@@ -446,10 +448,7 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 16-wide panel of a transposed B (16 source rows of K), at a live
-/// width `nr <= 16`. The narrow last panel is a scalar pass that touches only
-/// the live rows and zero-fills the rest, so it never reads a column that is
-/// not there; the full-width path stays the vector transpose.
+/// @brief 16-wide LHS panel at live width `nr`; short panels go scalar.
 inline void pack_trans_n16_dp4a_i8(void* NNOPS_RESTRICT output,
                                    const void* NNOPS_RESTRICT input,
                                    int ir_step, int K, float scale,
@@ -643,9 +642,7 @@ inline void pack_trans_n16_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-// =========================================================================
-//  RHS Copy pack (int8)  —  contiguous-row copy, 4 int8 grouped per column
-// =========================================================================
+// ---- RHS copy pack (int8): contiguous rows, 4 int8 per column group ------
 
 inline void pack_copy_n1_dp4a_i8(void* NNOPS_RESTRICT output,
                                  const void* NNOPS_RESTRICT input,
@@ -787,9 +784,7 @@ inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 16-wide panel of a row-major B (K source rows of N), at a live width
-/// `nr <= 16`. Columns past `nr` are zero-filled; the narrow pass reads only
-/// the live ones, so a short last panel never runs past the tensor.
+/// @brief 16-wide RHS panel at live width `nr`; short panels go scalar.
 inline void pack_copy_n16_dp4a_i8(void* NNOPS_RESTRICT output,
                                   const void* NNOPS_RESTRICT input,
                                   int ir_step, int K, float scale,

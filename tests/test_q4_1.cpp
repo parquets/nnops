@@ -1,13 +1,10 @@
 /// Unit tests for the llama.cpp Q4_1 block decoder (`pack_q4`).
 ///
-/// The tests build blocks the same way llama.cpp's quantize_row_q4_1_ref does
-/// (4-bit quants → 16 nibble bytes, no mask), then check that pack_q4 recovers
-/// `d * q + m` for every lane, including:
-///   - the low/high split of a block (values j and j + 16 share byte j),
-///   - every quant value 0..15 in both nibble halves,
-///   - f32 and f16 destinations,
-///   - a partial trailing block and multiple blocks with different d/m,
-///   - an unaligned source pointer.
+/// Blocks are built in llama.cpp's layout — 16 nibble bytes, value j in the low
+/// nibble of byte j and value j + 16 in the high — then `pack_q4` must recover
+/// `d * q + m` for every lane. The cases cover every quant value 0..15 in both
+/// nibble halves, f32 and f16 destinations, a partial trailing block, multiple
+/// blocks with different d/m, and an unaligned source pointer.
 
 #include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / _AARCH64
@@ -32,7 +29,7 @@ struct BuiltBlock {
     float m = 0.0f;  ///< m after its f16 round-trip
 };
 
-/// Encode 32 quants (0..15) into one block, exactly as llama.cpp does.
+/// Encode 32 quants (0..15) into one block in llama.cpp's nibble order.
 BuiltBlock make_block(const int q[32], float d, float m) {
     BuiltBlock b;
     b.d = half_to_float(float_to_half(d));
@@ -48,8 +45,7 @@ BuiltBlock make_block(const int q[32], float d, float m) {
     return b;
 }
 
-/// llama.cpp's dequantize_row_q4_1, transliterated: an independent check of
-/// the nibble order (value j from the low nibble, j + 16 from the high one).
+/// llama.cpp's dequantize_row_q4_1, transliterated as an independent check of the nibble order.
 void reference_decode(const q4_1_block& blk, float* y) {
     const float d = half_to_float(backend::cpu::half_from_bits(blk.d));
     const float m = half_to_float(backend::cpu::half_from_bits(blk.m));
@@ -63,8 +59,7 @@ void reference_decode(const q4_1_block& blk, float* y) {
     }
 }
 
-/// Fill a byte buffer with @p nblocks encoded blocks, returning the expected
-/// logical values alongside so a test can compare element by element.
+/// Encode @p nblocks blocks and return the expected logical values alongside.
 std::vector<uint8_t> build_blocks(int nblocks, std::vector<float>& expected) {
     std::vector<uint8_t> bytes(static_cast<size_t>(nblocks) * q4_1_block_bytes);
     expected.clear();
@@ -94,10 +89,7 @@ std::vector<uint8_t> build_blocks(int nblocks, std::vector<float>& expected) {
     return bytes;
 }
 
-/// A row-major matrix of Q4_1 blocks plus its logical f32 values.
-///
-/// Rows are padded to whole blocks, exactly like data_type_row_bytes() and the
-/// dense TensorView pitch: `blocks_per_row * 20` bytes per row.
+/// A row-major matrix of Q4_1 blocks plus its decoded f32 values.
 struct Q4Matrix {
     std::vector<uint8_t> bytes;
     std::vector<float>   decoded;  ///< rows × cols, row-major
@@ -178,7 +170,6 @@ NNOPS_TEST(q4_1_pack_matches_llama_reference) {
         NNOPS_EXPECT_EQ(out[i], expected[i]);
     }
 
-    // And the transliterated ggml loop agrees block by block.
     for (int b = 0; b < 4; ++b) {
         q4_1_block blk;
         std::memcpy(&blk, bytes.data() + static_cast<size_t>(b) * q4_1_block_bytes,

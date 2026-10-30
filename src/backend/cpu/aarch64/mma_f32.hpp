@@ -2,20 +2,30 @@
 /// @file mma_f32.hpp
 /// @brief AArch64 NEON float32 mrxncxkc MMA kernels over uniform 12-wide B.
 ///
-/// The runtime-M kernel: the tile height comes in as `mr` (1..8) and the
-/// column count as `nc`, so one kernel serves every panel the largest-first M
-/// decomposition emits ({8, 4, 1}) instead of one per width.
+/// One kernel per MR level ({8, 4, 1}). The tile height comes in as `mr`
+/// (1..8) and the column count as `nc`, so each level's kernel serves every
+/// panel the largest-first M decomposition emits instead of needing a kernel
+/// per height.
 ///
 /// A and B may both be packed (`mma_packed_ab_*`) or only B packed while A is
-/// read row-major (`mma_packed_b_*`). Packed B is uniform: ceil(nc / 12)
-/// panels, every one a full 12 columns wide with the columns past `nc`
-/// zero-filled, each in a mma_pack_align(12*kc*sizeof(float))-byte slot
-/// (12*kc floats). That lets the kernel read 12 floats per k at every column,
-/// so a tail wider than 4 costs one k-loop instead of two.
+/// read row-major (`mma_packed_b_*`); `zero_mode` drops the C read-add. Packed
+/// B is uniform: ceil(nc / 12) panels, every one a full 12 columns wide, each
+/// in a mma_pack_align(12*kc*sizeof(float))-byte slot (12*kc floats). The
+/// columns past `nc` are padding the tail's store discards, so the tail always
+/// works one panel wide: a tail wider than 4 reuses the full-panel body, a
+/// narrower one reads its first vector only.
 ///
-/// Rows past `mr` alias the last live row — the convention pack_trans_* fills
-/// on the A side and the C row pointers repeat here — so a partial-M tile
-/// needs no per-row guards.
+/// Rows past `mr` alias the last live row in A and C -- the convention the
+/// packers fill on the A side and the C row pointers repeat -- so a partial-M
+/// tile needs no per-row guards; only the tail's store loop stops at `mr`.
+///
+/// Bias seed (`mma_packed_b_*`): 1 is per-row (`bias[r]`) -- the planar route,
+/// where a row is an output channel; 2 is per-column (`bias + n + off`) -- the
+/// channel-last shape, where rows are pixels and the bias lands on the panel's
+/// lanes. Seeding each row's three panel vectors costs a few loads, where
+/// priming the tile first would cost a full output write and read-back. Seed 2
+/// loads a whole 12-lane panel even on a short tail, since `n` is its start.
+/// The mr1 kernels ignore `mr` and `ldc`, and the packed-B one `lda` too.
 
 #include <array>
 #include <arm_neon.h>
@@ -24,9 +34,7 @@
 
 namespace nnops::backend::cpu::aarch64 {
 
-// =========================================================================
-//  mr=8  kernels
-// =========================================================================
+// ---- A and B both packed ----
 
 template <bool zero_mode = false>
 inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
@@ -163,10 +171,6 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        // The tail is one full 12-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so all three vectors can
-        // always be read. A tail wider than 4 needs the second vector, so it
-        // reuses the full-panel body; a narrower one reads the first only.
         float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
         float32x4_t c10 = vdupq_n_f32(0.0f), c11 = c10, c12 = c10;
         float32x4_t c20 = vdupq_n_f32(0.0f), c21 = c20, c22 = c20;
@@ -240,8 +244,6 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
         };
         float* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
                                            c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        // Only the live rows are stored; the alias rows past `mr` would write
-        // a duplicate of the last one back over itself.
         for (int r = 0; r < mr; ++r) {
             float* NNOPS_RESTRICT cp = c_rows[r];
             int rr = rem;
@@ -533,9 +535,7 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
     }
 }
 
-// =========================================================================
-//  mr=8/4/1  kernels, raw A — only B packed
-// =========================================================================
+// ---- only B packed, A read row-major ----
 
 template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
@@ -568,13 +568,6 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's lanes, so it costs the panel's loads where seeding the tile first
-    // costs a full write and read-back of the output. `off` is the lane offset
-    // inside the panel. A row past `mr` aliases the last live row in A and C, so
-    // the same alias index keeps the row seed in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
         else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
@@ -846,13 +839,6 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's lanes, so it costs the panel's loads where seeding the tile first
-    // costs a full write and read-back of the output. `off` is the lane offset
-    // inside the panel. A row past `mr` aliases the last live row in A and C, so
-    // the same alias index keeps the row seed in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
         else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
@@ -1022,9 +1008,9 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    (void)mr;    // one row, so the row count never varies
-    (void)lda;   // A is read consecutively along its single row
-    (void)ldc;   // one row, so the C row stride never applies
+    (void)mr;
+    (void)lda;
+    (void)ldc;
 
     float* NNOPS_RESTRICT c0_ptr = C;
 
@@ -1034,13 +1020,6 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's lanes, so it costs the panel's loads where seeding the tile first
-    // costs a full write and read-back of the output. `off` is the lane offset
-    // inside the panel. A row past `mr` aliases the last live row in A and C, so
-    // the same alias index keeps the row seed in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
         else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
@@ -1135,8 +1114,6 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
 }
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
-// Rows are the MR levels {8,4,1}; every kernel takes the runtime panel height,
-// so a remainder panel below its own MR runs through the level above it.
 template <bool Z>
 inline constexpr auto mma_pack_fns_f32 = std::array{
     &mma_packed_ab_mr8_nr12_mrxncxkc_f32<Z>,

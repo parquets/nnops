@@ -1,14 +1,16 @@
-/// Unit tests for the Winograd F(2×2, 3×3) Conv2D path (k3s1).
+/// @file test_conv2d_winograd.cpp
+/// @brief Unit tests for the Winograd F(2×2, 3×3) Conv2D path (k3s1).
 ///
-/// Three layers:
-///   1. the three transforms against naive scalar references taken straight
-///      from the F(2,3) definition,
-///   2. the prepack contract (query metadata, k3s1 assert),
-///   3. end-to-end Winograd vs conv2d_ref on the *raw* weight.
+/// The three transforms are checked against naive scalar references written
+/// longhand from the F(2,3) definition; then the prepack contract (query
+/// metadata, explicit pitch) and the plan's admission and filter-row split;
+/// then end-to-end Winograd vs conv2d_ref on the *raw* weight, f32 and f16,
+/// plus winograd_applicable's policy and a serial-vs-pooled run.
 ///
-/// Winograd and direct convolution are algebraically equal but not
-/// bit-identical (the transform reorders the sums and, at f16, adds a rounding
-/// step), so every end-to-end comparison is tolerance-based.
+/// Winograd and direct convolution are algebraically equal but not bit-identical
+/// (the transform reorders the sums and, at f16, adds a rounding step), so every
+/// comparison against conv2d_ref is tolerance-based. The serial-vs-pooled check
+/// is exact instead: same per-element operation order, different task split.
 
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_winograd.h"
@@ -30,8 +32,8 @@
 using namespace nnops;
 using nnops::backend::cpu::half;
 
-// Reference kernel (test-local declaration, following the test_conv2d.cpp and
-// test_matmul.cpp pattern — the reference is not exported through a header).
+// Reference kernel, test-local as in test_conv2d.cpp / test_matmul.cpp (it is
+// not exported through a header).
 namespace nnops::backend::cpu::reference {
 void conv2d_ref(const Conv2DAttributes& attrs,
                 TensorView& output,
@@ -45,8 +47,7 @@ void conv2d_ref(const Conv2DAttributes& attrs,
 // ============================================================
 //
 // Bᵀ is applied as (d·B) then (Bᵀ·e); Aᵀ as (Aᵀ·m) then (·A); G as written.
-// Written out longhand so a typo in simd_winograd.hpp cannot hide behind a
-// shared helper.
+// Longhand, so a typo in simd_winograd.hpp cannot hide behind a shared helper.
 
 static void naive_btdb(const float d[4][4], float v[4][4]) {
     static const float Bt[4][4] = {
@@ -164,8 +165,8 @@ NNOPS_TEST(wino_input_transform_matches_naive) {
     test::XorShift128 rng(7);
     for (auto& x : halo) { x = rng.next_float(-3.0f, 3.0f); }
 
-    // Two column groups: tw0 = 0 and tw0 = 8 (pw0 = 0 and 16). The second one
-    // is the group whose loads reach the end of the padded row.
+    // Two column groups, tw0 = 0 and 8 (pw0 = 0 and 16); the second one's loads
+    // reach the end of the padded row.
     for (int tw0 : {0, 8}) {
         std::vector<float> v(16 * kTiles, -99.0f);
         nnops::kernel::winograd_input_tile8<float>(halo.data(), kHaloW,
@@ -235,7 +236,8 @@ NNOPS_TEST(wino_output_transform_applies_bias_and_masks) {
                                                 0, kOutW, /*row1_ok=*/false,
                                                 ep, 2.0f, /*add_to=*/false);
 
-    // Column 2t gets bias only up to OW; anything past OW is untouched (5.0).
+    // row1_ok=false leaves out1 untouched (5.0); out0 takes the bias on every
+    // column below OW and nothing past it.
     for (int i = 0; i < kOutW; ++i) { NNOPS_EXPECT_NEAR(out0[i], 2.0f, 1e-6f); }
     for (int i = 0; i < kOutW; ++i) { NNOPS_EXPECT_NEAR(out1[i], 5.0f, 1e-6f); }
 }
@@ -278,9 +280,8 @@ NNOPS_TEST(wino_prepack_query) {
 
 NNOPS_TEST(wino_plan_gates_on_geometry) {
     // The plan is the single gate for "is this a Winograd configuration": a
-    // zeroed plan (workspace_size 0) means the kernel has nothing to run. This
-    // is the Release-build observable, unlike the NNOPS_ASSERTs in
-    // prepackWeights / conv2d_winograd_kernel, which compile out under NDEBUG.
+    // zeroed plan (workspace_size 0) means there is nothing to run. That is the
+    // Release-build observable — the NNOPS_ASSERTs compile out under NDEBUG.
     const int64_t ishape[] = {1, 4, 8, 8};
     const int64_t oshape[] = {1, 6, 6, 6};
     const int64_t ushape[] = {16, 6, 4};
@@ -406,12 +407,10 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
 
 namespace {
 
-// Minimal fixed-size thread pool exposing a CpuBackend (test_conv2d.cpp /
-// test_matmul.cpp pattern).
+// Minimal fixed-size thread pool exposing a CpuBackend (as in test_conv2d.cpp).
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
-        // runs under the same bit-exact comparisons as the kernels.
+        // OpenMP when the build has it (common/cpu_pool.hpp).
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
             return;
@@ -452,9 +451,9 @@ int64_t desc_numel(const TensorDesc& d) {
 }
 
 /// Run the Winograd path (prepacking U from the raw weight) and conv2d_ref on
-/// that same raw weight, then require the outputs to agree within (rtol, atol).
+/// that same raw weight; require agreement within (rtol, atol).
 ///
-/// f32 only — f16 has its own separate check below.
+/// f32 only — f16 has its own check below.
 void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
                      std::initializer_list<int64_t> w_shape,
                      Conv2DAttributes attrs, bool has_bias,
@@ -489,7 +488,7 @@ void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
     std::vector<float> out_wino(static_cast<size_t>(on), fill_out);
     auto out_view = test::make_planar(outs[0], out_wino.data());
 
-    // Prepack U.
+    // Two-step prepack: query the shape with an empty view, then fill it.
     std::vector<float> u_buf;
     TensorView u_view;
     {
@@ -592,7 +591,8 @@ NNOPS_TEST(wino_matches_ref_pad1) {
 }
 
 NNOPS_TEST(wino_matches_ref_wide) {
-    // Multi-tile-row / multi-column-group, IC and OC well above the ~16 floor.
+    // 14x18 output: 7 tile rows over a 16-wide tile block (two column groups),
+    // with bias.
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride = {1, 1};
@@ -610,7 +610,8 @@ NNOPS_TEST(wino_matches_ref_groups) {
 }
 
 NNOPS_TEST(wino_matches_ref_odd_output) {
-    // OH and OW both odd → the second row of the last tile row is out of range.
+    // OH and OW both odd: the last tile row's second output row and the last
+    // tile's second column are out of range.
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride = {1, 1};
@@ -628,8 +629,8 @@ NNOPS_TEST(wino_matches_ref_epilogue) {
 }
 
 NNOPS_TEST(wino_matches_ref_add_to) {
-    // add_to with a non-identity epilogue: the residual must be read from the
-    // pre-existing output *after* the activation, so the fill value matters.
+    // add_to with a non-identity epilogue: the residual is the pre-filled
+    // output, added *after* the activation, so fill_out is part of the answer.
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride = {1, 1};
@@ -659,9 +660,8 @@ NNOPS_TEST(wino_matches_ref_batch) {
 }
 
 NNOPS_TEST(wino_matches_ref_threaded) {
-    // Same shapes as the plain case, but through a 4-thread pool — exercises the
-    // per-thread slot indexing (thread_slot_count() > 0) and the fact that tile
-    // rows and blocks are disjoint between tasks.
+    // Through a 4-thread pool — exercises the per-thread slot indexing
+    // (thread_slot_count() > 0) and the disjointness of tile rows and blocks.
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride = {1, 1};
@@ -675,11 +675,9 @@ NNOPS_TEST(wino_matches_ref_threaded) {
 
 NNOPS_TEST(wino_oc_split_matches_ref) {
     // A 6x6 output plane is 3 tile rows and one tile block, so a 6-thread pool
-    // splits the filter rows in two and the tasks write disjoint oc ranges.
-    // Each output element is still computed by exactly one task with the same
-    // arithmetic order as the serial run, so this is the shape that would catch
-    // a mis-sliced oc range (an unfixed `ocnc` clipping the loop to one block
-    // shows up here as the back half of the filter never being applied).
+    // splits the filter rows in two and the tasks write disjoint oc ranges —
+    // the shape that catches a mis-sliced range (an `ocnc` clipped to one block
+    // shows up as the back half of the filter never being applied).
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
     attrs.stride = {1, 1};
@@ -700,12 +698,10 @@ NNOPS_TEST(wino_oc_split_matches_ref) {
 }
 
 NNOPS_TEST(wino_threads_bit_identical_batch_groups) {
-    // Batch and group are part of the task grid, so this is the one shape where
-    // tasks of *different* (batch, group) run at the same time — the plain and
-    // threaded cases above keep both at 1 and would not notice a shared scratch
-    // buffer. Each output element is produced by exactly one task, with the same
-    // per-element operation order as the serial run, so the pooled and serial
-    // results must agree bit for bit rather than within a tolerance.
+    // Batch and group are both part of the task grid, and the pooled cases above
+    // keep them at 1 — here tasks of *different* (batch, group) run at the same
+    // time, so a shared scratch buffer would show up. Each element keeps its
+    // operation order, so the two results must be bit-identical.
     auto [in_buf, in_view] = test::make_random_tensor({2, 8, 14, 16}, -1.0f, 1.0f, 71);
     auto [w_buf, w_view] = test::make_random_tensor({8, 4, 3, 3}, -0.5f, 0.5f, 72);
     auto [b_buf, b_view] = test::make_random_tensor({8}, -0.5f, 0.5f, 73);

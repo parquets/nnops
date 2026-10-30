@@ -1,14 +1,12 @@
 #pragma once
 /// @file simd_permute.hpp
-/// @brief SIMD kernel for 2D tiled transpose via v_transpose_8x8.
+/// @brief Tiled 2D transpose via v_transpose_8x8 — the core of the Permute
+/// operator's last-two-dims swap (2D transpose, batched (B,M,K)->(B,K,M),
+/// NCHW<->NHCW).
 ///
-/// Core primitive for the Permute operator: transposes an [M × K] matrix
-/// to [K × M] using 8×8 in-register SIMD transpose (unpack/permute
-/// intrinsics). Handles partial edge tiles with scalar fallback.
-///
-/// Used by all "last-two-dims swap" permute patterns:
-///   2D transpose, batched matrix transpose (B,M,K)→(B,K,M),
-///   NCHW↔NHCW, multi-head dim reordering, etc.
+/// Full 8×8 tiles transpose in registers with the unpack/permute intrinsics;
+/// partial right/bottom edge tiles fall back to a scalar element copy. The
+/// caller owns the parallelism — this takes one matrix.
 
 #include "nnops/detail/simd/simd.hpp"
 
@@ -18,25 +16,8 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Tiled 8×8 SIMD transpose of a 2D matrix (single-threaded, pure SIMD).
-///
-/// Transposes [M × K] at @p in_ptr (row stride = @p in_ld) to
-///             [K × M] at @p out_ptr (row stride = @p out_ld).
-///
-/// Tiles are processed in row-major order. Full 8×8 tiles use
-/// v_transpose_8x8 for in-register transpose; partial tiles at the
-/// right and bottom edges fall back to scalar element-wise copy.
-///
-/// The caller is responsible for parallelism (e.g. batching over
-/// leading dimensions or tiling over row groups).
-///
-/// @tparam T  Element type (f32 or f16)
-/// @param in_ptr   Pointer to input matrix
-/// @param out_ptr  Pointer to output matrix
-/// @param M        Number of rows in input (= columns in output)
-/// @param K        Number of columns in input (= rows in output)
-/// @param in_ld    Leading dimension (row stride in elements) of input
-/// @param out_ld   Leading dimension (row stride in elements) of output
+/// Transpose [M × K] at @p in_ptr (row stride @p in_ld) to [K × M] at
+/// @p out_ptr (row stride @p out_ld).
 template <typename T>
 inline void tiled_transpose_2d(const T* in_ptr, T* out_ptr,
                                 int64_t M, int64_t K,

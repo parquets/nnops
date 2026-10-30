@@ -1,11 +1,12 @@
 /// @file test_simd.cpp
 /// @brief Unit tests for the SIMD abstraction layer.
 ///
-/// Tests cover:
-///   1. CPU feature detection (at least doesn't crash, baseline features present)
-///   2. Scalar fallback — all v_f32x4 and v_f32x8 operations with known values
-///   3. Platform backend vs scalar reference — cross-validation (scalar is the oracle)
-///   4. Edge cases: zeros, negatives, large values
+/// The scalar backend is the correctness oracle: platform results are
+/// cross-checked against their scalar twins. Covers CPU feature detection,
+/// v_f32x4/v_f32x8 and v_f16x8 scalar ops on known values, f16 <-> f32
+/// conversion (including inf/NaN/subnormal), the i8/u8 lane constants and
+/// i8x16/u8x16 load/store, plus edge cases (zero division, large and
+/// subnormal values).
 
 #include "common/test_harness.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -25,7 +26,7 @@ namespace {
 constexpr float kTestVals4[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
 constexpr float kTestVals8[8] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
 constexpr float kNegVals4[4]  = { -1.0f, 0.0f, 3.5f, -4.5f };
-} // anonymous namespace
+}
 
 // ============================================================
 // 1. CPU feature detection
@@ -77,7 +78,7 @@ NNOPS_TEST(simd_scalar_f32x4_load_store) {
         NNOPS_EXPECT_NEAR(out[i], in[i], 1e-6f);
     }
 
-    // Unaligned load/v_store (offset by 1 float from aligned boundary)
+    // Unaligned load: offset by one float from an aligned boundary
     float buf[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     std::memcpy(buf + 1, in, 4 * sizeof(float));
     scal::v_f32x4 vu = scal::v_load_f32x4(buf + 1);
@@ -263,12 +264,8 @@ NNOPS_TEST(simd_scalar_f32x8_reduce_sum) {
 
 // ============================================================
 // 4. Platform backend vs scalar reference — cross-validation
-//    Compares the active platform backend (SSE on x86_64,
-//    NEON on AArch64) against the scalar fallback, which
-//    serves as the correctness oracle.
 // ============================================================
 
-// Helper: compare platform v_f32x4 result against scalar reference
 static void check_f32x4_matches_scalar(
     float plat_out[4], const float scal_out[4], const char* tag)
 {
@@ -287,12 +284,10 @@ NNOPS_TEST(simd_platform_f32x4_matches_scalar) {
     float b_buf[4] = {0.5f, 3.0f, -1.0f, 2.0f};
     float c_buf[4] = {0.1f, 0.2f, 0.3f, 0.4f};
 
-    // Platform vectors (SSE on x86_64, NEON on AArch64)
     v_f32x4 pa = v_load_f32x4(a_buf);
     v_f32x4 pb = v_load_f32x4(b_buf);
     v_f32x4 pc = v_load_f32x4(c_buf);
 
-    // Scalar reference
     scal::v_f32x4 sa = scal::v_load_f32x4(a_buf);
     scal::v_f32x4 sb = scal::v_load_f32x4(b_buf);
     scal::v_f32x4 sc = scal::v_load_f32x4(c_buf);
@@ -398,7 +393,7 @@ NNOPS_TEST(simd_edge_zero_division) {
     scal::v_f32x4 z = scal::v_load_f32x4(zero);
     scal::v_f32x4 r = scal::v_div(a, z);
 
-    // 1/0 = +Inf, 0/0 = NaN, -3/0 = -Inf — just verify we didn't crash
+    // 1/0 = +Inf, 0/0 = NaN, -3/0 = -Inf; only checking that we don't crash
     NNOPS_EXPECT_TRUE(std::isinf(r[0]));  // 1/0
     NNOPS_EXPECT_TRUE(std::isnan(r[2]));  // 0/0
 }
@@ -438,7 +433,7 @@ NNOPS_TEST(simd_edge_subnormal) {
 }
 
 // ============================================================
-// 6. FP16 — f16 <-> f32 conversion accuracy (onnxruntime-optimized)
+// 6. FP16 — f16 <-> f32 conversion accuracy
 // ============================================================
 
 NNOPS_TEST(simd_f16_f32_conversion_roundtrip) {
@@ -581,7 +576,6 @@ NNOPS_TEST(simd_platform_f16x8_cvt_matches_scalar) {
 // 8. FP16 — Edge cases
 // ============================================================
 
-
 NNOPS_TEST(simd_f16_edge_subnormal) {
     // Small value representable in f16: 1e-4 > f16 v_min positive normal (≈6.1e-5)
     float tiny = 1.0e-4f;
@@ -612,7 +606,7 @@ NNOPS_TEST(simd_lane_for_template) {
 }
 
 // ============================================================
-// 11. Int8/uint8 — lane constants
+// 9. Int8/uint8 — lane constants
 // ============================================================
 
 NNOPS_TEST(simd_i8_u8_lane_count_constants) {
@@ -621,7 +615,7 @@ NNOPS_TEST(simd_i8_u8_lane_count_constants) {
 }
 
 // ============================================================
-// 12. Int8/uint8 — scalar backend tests
+// 10. Int8/uint8 — scalar backend tests
 // ============================================================
 
 NNOPS_TEST(simd_scalar_i8x16_load_store) {
@@ -673,7 +667,7 @@ NNOPS_TEST(simd_scalar_u8x16_set1_zero) {
 }
 
 // ============================================================
-// 13. Int8/uint8 — platform vs scalar cross-validation
+// 11. Int8/uint8 — platform vs scalar cross-validation
 // ============================================================
 
 NNOPS_TEST(simd_platform_i8x16_matches_scalar) {
@@ -733,7 +727,7 @@ NNOPS_TEST(simd_platform_i8x16_zero_set1_matches_scalar) {
 }
 
 // ============================================================
-// 14. Int8/uint8 — generic v_load/v_set1/v_zero overloads
+// 12. Int8/uint8 — generic v_load/v_set1/v_zero overloads
 // ============================================================
 
 NNOPS_TEST(simd_generic_i8x16_load_zero_set1) {

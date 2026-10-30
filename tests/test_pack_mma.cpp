@@ -1,17 +1,18 @@
 /// @file test_pack_mma.cpp
-/// @brief Unit tests for the float pack/quant micro-kernels and the tiled
+/// @brief Unit tests for the f32/f16 pack and quant kernels and the tiled
 ///        pack entry points.
 ///
-/// Tests cover:
-///   1. f32 pack  — transpose & copy, SIMD + scalar-tail paths
-///   2. f16 pack  — transpose & copy (x86_64: half, aarch64: float16_t)
-///   3. f16 quantization / dequantization
-///   4. tile_pack_lhs  — the MR cascade the packed-A route uses
-///   5. tile_pack_rhs — the uniform nr_max-wide B panels
+/// Every packer takes a live source width, so one kernel serves a full panel
+/// and a tail. The transposing kernels alias their last live row into the
+/// rows past that width (the broadcast short A panels use); the copies
+/// zero-fill the columns past it. The 16-wide tests check only the lanes the
+/// MMA reads — 8 for a tail of 8 or fewer, all 16 above.
 ///
-/// The MMA kernels themselves (mma_f32.hpp / mma_f16.hpp) are covered by
-/// test_mma_packed.cpp; the per-width mma_pack/mma_direct kernels no longer
-/// exist.
+/// tile_pack_lhs walks the MR cascade (mr_f32/mr_f16 {6,4,1} on x86, {8,4,1}
+/// on aarch64), advancing ldd per panel; tile_pack_rhs cuts N into uniform
+/// nr_max-wide panels the same way. Both write the [k][panel] layout the MMA
+/// consumes; the tests round ldd up to the 64-byte slot mma_pack_align uses.
+/// The MMA kernels are tested in test_mma_packed.cpp.
 
 #include <algorithm>
 
@@ -47,7 +48,6 @@
 //  Helpers
 // =========================================================================
 
-/// Convert f16_t to float (platform-neutral).
 static float f16_to_f(f16_t v) {
 #if defined(NNOPS_ARCH_X86_64)
     return nnops::backend::cpu::half_to_float(v);
@@ -56,7 +56,6 @@ static float f16_to_f(f16_t v) {
 #endif
 }
 
-/// Convert float to f16_t (platform-neutral).
 static f16_t f_to_f16(float v) {
 #if defined(NNOPS_ARCH_X86_64)
     return nnops::backend::cpu::float_to_half(v);
@@ -66,14 +65,11 @@ static f16_t f_to_f16(float v) {
 }
 
 // =========================================================================
-//  Section 1: f32 Pack — transpose (smoke tests)
-//
-//  pack_trans produces a tiled transpose layout consumed by the GEMM
-//  tiling infrastructure. We verify: no crash, no NaN/Inf, scale applied.
+//  Section 1: f32 pack — transposing (smoke)
 // =========================================================================
 
 NNOPS_TEST(pack_f32_trans_n4_smoke) {
-    constexpr int N = 4, ir_step = 16, K = 13;  // K=13: SIMD(8) + partial + tail
+    constexpr int N = 4, ir_step = 16, K = 13;  // K=13: SIMD block + scalar k tail
     constexpr int buf_size = (K - 1) * ir_step + N;
     std::vector<float> input(buf_size, 1.0f);
     std::vector<float> output(N * K);
@@ -87,7 +83,7 @@ NNOPS_TEST(pack_f32_trans_n4_smoke) {
 }
 
 NNOPS_TEST(pack_f32_trans_n6_n8_smoke) {
-    constexpr int K = 17;  // K=17: SIMD(8)+SIMD(8)+tail(1)
+    constexpr int K = 17;  // K=17: SIMD blocks + one-k tail
     constexpr int ir_step = 24;
     {
         constexpr int N = 6;
@@ -114,11 +110,11 @@ NNOPS_TEST(pack_f32_trans_n6_n8_smoke) {
 }
 
 // =========================================================================
-//  Section 2: f32 Pack — copy
+//  Section 2: f32 pack — copy
 // =========================================================================
 
 NNOPS_TEST(pack_f32_copy_n4) {
-    constexpr int N = 4, ir_step = 6, K = 13;  // covers SIMD (K/4) + scalar tail
+    constexpr int N = 4, ir_step = 6, K = 13;  // K=13: SIMD blocks + scalar k tail
     std::vector<float> input(K * ir_step);
     for (int k = 0; k < K; ++k) {
         for (int n = 0; n < ir_step; ++n) {
@@ -129,7 +125,6 @@ NNOPS_TEST(pack_f32_copy_n4) {
     std::vector<float> output(N * K);
     pack_copy_n4_f32(output.data(), input.data(), ir_step, K, 1.0f);
 
-    // Copy layout: output[k * N + n] = input[k * ir_step + n]
     for (int k = 0; k < K; ++k) {
         for (int n = 0; n < N; ++n) {
             NNOPS_EXPECT_NEAR(output[k * N + n], input[k * ir_step + n], 1e-6f);
@@ -178,20 +173,14 @@ NNOPS_TEST(pack_f32_copy_n16) {
 
 #if defined(NNOPS_ARCH_X86_64)
 // =========================================================================
-//  Section 2b: f32 Pack — partial panels
-//
-//  A partial panel has only `w < N` live columns/rows. The transposing
-//  kernels fill rows past `mr` by aliasing the last live row (the MMA
-//  kernels' A-side broadcast); the row-major copies zero-fill columns past
-//  `nr`. The 16-wide copy writes only the lanes the MMA kernel reads: 8 for
-//  a tail of 8 or fewer, all 16 above that.
+//  Section 2b: f32 pack — partial panels
 // =========================================================================
 
 NNOPS_TEST(pack_f32_n16_pad) {
     constexpr int N = 16, K = 9, ir_step = 24;
     const float scale = 1.5f;
-    // The transposing pack reads one source row per live panel row, which can
-    // be more rows than K columns when a partial panel is wide (w up to 15).
+    // The transposing pack reads one source row per live panel row, so a wide
+    // partial panel (w up to 15) needs more rows than K.
     constexpr int rows = (N > K) ? N : K;
     std::vector<float> input(rows * ir_step);
     for (int k = 0; k < rows; ++k) {
@@ -221,7 +210,6 @@ NNOPS_TEST(pack_f32_n16_pad) {
     }
 }
 
-// The narrower kernels pad the whole panel — no lane is left unwritten.
 NNOPS_TEST(pack_f32_n8_pad) {
     constexpr int N = 8, K = 7, ir_step = 12;
     const float scale = 2.0f;
@@ -253,7 +241,7 @@ NNOPS_TEST(pack_f32_n8_pad) {
 #endif  // NNOPS_ARCH_X86_64
 
 // =========================================================================
-//  Section 3: f16 Pack — smoke + copy
+//  Section 3: f16 pack — smoke + copy
 // =========================================================================
 
 NNOPS_TEST(pack_f16_trans_smoke) {
@@ -292,7 +280,7 @@ NNOPS_TEST(pack_f16_copy_n8) {
 }
 
 #if defined(NNOPS_ARCH_X86_64)
-// Zero-padded tail panels, same contract as Section 2b.
+// Same partial-panel contract as Section 2b, in f16.
 NNOPS_TEST(pack_f16_n16_pad) {
     constexpr int N = 16, K = 9, ir_step = 24;
     const float scale = 1.5f;
@@ -311,15 +299,13 @@ NNOPS_TEST(pack_f16_n16_pad) {
 
         for (int k = 0; k < K; ++k) {
             for (int n = 0; n < read; ++n) {
-                // The copy kernel zero-fills past its live width; the
-                // transpose kernel aliases the last live row into the tail.
                 const float copy_expect =
                     (n < w) ? f16_to_f(input[k * ir_step + n]) * scale : 0.0f;
                 const int src_row = (n < w) ? n : w - 1;
                 const float trans_expect =
                     f16_to_f(input[src_row * ir_step + k]) * scale;
-                // f16 rounds the stored value once; at |x| ≈ 32 one ULP is
-                // already 1/32, so the tolerance has to clear a single step.
+                // f16 rounds the stored value once; at |x| in [32, 64) one
+                // ULP is already 1/32, so 0.05 has to clear a single step.
                 NNOPS_EXPECT_NEAR(f16_to_f(copy_out[k * N + n]), copy_expect, 0.05f);
                 NNOPS_EXPECT_NEAR(f16_to_f(trans_out[k * N + n]), trans_expect, 0.05f);
             }
@@ -329,7 +315,7 @@ NNOPS_TEST(pack_f16_n16_pad) {
 #endif  // NNOPS_ARCH_X86_64
 
 // =========================================================================
-//  Section 4: half (f16) quantization / dequantization kernels
+//  Section 4: f16 quantization / dequantization kernels
 // =========================================================================
 
 /// Scalar reference for half→int8/uint8 quantization (matches SIMD rounding).
@@ -362,7 +348,6 @@ static void ref_dequant_f16(const T* src, const float* scale, const float* zero,
     }
 }
 
-/// Shared body: half→int8/uint8 quantization vs scalar reference.
 template <typename T>
 static void check_quant_f16(int M, int N, bool with_zero) {
     std::vector<f16_t> src(M * N);
@@ -388,7 +373,6 @@ NNOPS_TEST(quant_f16_to_s8)     { check_quant_f16<int8_t>(3, 56, true); }
 NNOPS_TEST(quant_f16_to_u8)     { check_quant_f16<uint8_t>(3, 56, true); }
 NNOPS_TEST(quant_f16_to_s8_sym) { check_quant_f16<int8_t>(2, 37, false); }
 
-/// Shared body: int8/uint8→half dequantization vs scalar reference.
 template <typename T>
 static void check_dequant_f16(int M, int N, bool with_zero) {
     std::vector<T> src(M * N);
@@ -418,24 +402,13 @@ NNOPS_TEST(dequant_s8_to_f16_sym) { check_dequant_f16<int8_t>(2, 33, false); }
 // =========================================================================
 //  Section 5: tiled pack entry points (tile_pack_lhs / tile_pack_rhs)
 // =========================================================================
-//
-// tile_pack_lhs decomposes an M×K tile into the arch MR cascade (mr ∈
-// {max, 1}), placing each panel at a uniform 64-byte-aligned stride `ldd`.
-// tile_pack_rhs always cuts the N side into nr_max-wide panels, with
-// the columns past the live width zero-filled, and places each at `ldd`. Both
-// use the [K][panel] layout (k outer, m/n inner) — the exact layout the MMA
-// kernels consume. We verify both transpose and copy modes against the logical
-// A/B matrices.
 
 namespace cpu = nnops::backend::cpu;
 
-/// Verify tile_pack_lhs for one transpose mode.
 /// src is the physical matrix: [M,K] row-major when !trans, [K,M] when trans.
-/// The packed panel p (mr_p rows) must satisfy:
-///     dst[p*ldd + k*mr_p + m] = A_logical[m + m_offset_p][k]
 static void check_tile_pack_lhs(bool trans) {
-    constexpr int M = 11;   // decomposes 6+4+1 across all three mr sizes
-    constexpr int K = 13;   // SIMD(8) + partial + scalar tail
+    constexpr int M = 11;   // x86: 6+4+1, one panel at each mr level
+    constexpr int K = 13;   // SIMD blocks + scalar k tail
 
     const int lds = trans ? M : K;   // physical row stride of the source
     std::vector<float> src(M * K);
@@ -449,7 +422,7 @@ static void check_tile_pack_lhs(bool trans) {
 
     const int mr0 = cpu::MR_F32[0];
     const int ldd = (mr0 * K * 4 + 63) / 64 * 16;  // 64-byte-aligned stride
-    // Buffer must hold every panel at the aligned stride, not just M*K.
+    // Panels sit at the aligned stride, so size by panel count, not M*K.
     std::vector<float> dst(static_cast<size_t>(cpu::num_panels(M, cpu::MR_F32)) * ldd, -1.0f);
 
     cpu::tile_pack_lhs(trans, M, K, dst.data(), ldd, src.data(), lds, 1.0f);
@@ -459,7 +432,6 @@ static void check_tile_pack_lhs(bool trans) {
     int p = 0;
     for (int si = 0; si < 3; ++si) {
         for (; m_off + mr[si] <= M; m_off += mr[si], ++p) {
-            // Panel p starts at p * ldd (uniform 64-byte-aligned stride).
             const float* panel = dst.data() + p * ldd;
             for (int k = 0; k < K; ++k) {
                 for (int m = 0; m < mr[si]; ++m) {
@@ -471,16 +443,12 @@ static void check_tile_pack_lhs(bool trans) {
     }
 }
 
-/// Verify tile_pack_rhs for one transpose mode.
 /// src is the physical matrix: [K,N] row-major when !trans, [N,K] when trans.
-/// Every panel p is nr_max wide at p*ldd; with col = p*nr_max + n:
-///     dst[p*ldd + k*nr_max + n] = (col < N) ? B_logical[k][col] : 0
-/// except that the transpose packer aliases the last live row into its tail
-/// columns (same broadcast convention as a short A panel) — those columns are
-/// never stored by the MMA, so the value there is unconstrained; the test
-/// checks the alias it actually produces.
+/// The trans packer aliases its last live row into the tail columns; the copy
+/// zero-fills them. The MMA never stores those columns, so either is legal —
+/// the test checks the one each mode produces.
 static void check_tile_pack_rhs(bool trans) {
-    constexpr int N = 19;   // two full 16-wide panels + a 3-wide tail
+    constexpr int N = 19;   // x86: one 16-wide panel + a 3-wide tail
     constexpr int K = 13;
 
     const int lds = trans ? K : N;   // physical row stride of the source
@@ -496,13 +464,12 @@ static void check_tile_pack_rhs(bool trans) {
     const int nr0 = cpu::NR_F32[0];
     const int ldd = (nr0 * K * 4 + 63) / 64 * 16;  // 64-byte-aligned stride
     const int nslots = (N + nr0 - 1) / nr0;
-    // Buffer must hold every panel at the aligned stride, not just N*K.
+    // Panels sit at the aligned stride, so size by panel count, not N*K.
     std::vector<float> dst(static_cast<size_t>(nslots) * ldd, -1.0f);
 
     cpu::tile_pack_rhs(trans, N, K, dst.data(), ldd, src.data(), lds, 1.0f);
 
     for (int p = 0; p < nslots; ++p) {
-        // Panel p starts at p * ldd (uniform 64-byte-aligned stride).
         const float* panel = dst.data() + p * ldd;
         for (int k = 0; k < K; ++k) {
             for (int n = 0; n < nr0; ++n) {

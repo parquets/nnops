@@ -1,5 +1,11 @@
 /// @file attention_ref.cpp
-/// @brief Naive CPU reference implementation of multi-head scaled dot-product attention.
+/// @brief Naive CPU reference for multi-head scaled dot-product attention.
+///
+/// Rank-3 Q/K/V are [B, S, H*D] with the heads interleaved inside each row;
+/// rank-4 are [B, H, S, D]. Per head: the Q·K dot over D, scaled by attrs.scale
+/// (or 1/sqrt(D) when it is 0), plus the optional [Sq, Sk] mask, softmaxed per
+/// row, then multiplied by V into the output. B*H head-batches run in parallel,
+/// each with its own Sq×Sk score buffer.
 
 #include "nnops/ops/attention.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -17,7 +23,6 @@ namespace {
 void softmax_last_dim(float* data, int64_t rows, int64_t cols) {
     for (int64_t r = 0; r < rows; ++r) {
         float* row = data + r * cols;
-        // Find max for numerical stability
         float max_val = -std::numeric_limits<float>::infinity();
         for (int64_t c = 0; c < cols; ++c) {
             max_val = std::max(max_val, row[c]);
@@ -47,7 +52,7 @@ void attention_ref(const AttentionAttributes& attrs,
     const auto& V = inputs[2];
     const bool has_mask = inputs.size() > 3;
 
-    // Detect layout: rank 3 = [B, S, H*D], rank 4 = [B, H, S, D]
+    // Rank 3 = merged heads [B, S, H*D]; rank 4 = [B, H, S, D].
     const bool merged_heads = (Q.rank() == 3);
 
     const int64_t B  = Q.shape(0);
@@ -75,13 +80,12 @@ void attention_ref(const AttentionAttributes& attrs,
     const auto* mask_ptr = has_mask ? inputs[3].ptr<float>() : nullptr;
     auto* out_ptr = output.ptr<float>();
 
-    // Row strides in elements (from pitch, accounts for padding)
+    // Row strides come from the pitch, so they include any padding.
     const int64_t q_row_stride = Q.row_stride_elems();  // merged: >= H*D, explicit: >= D
     const int64_t k_row_stride = K.row_stride_elems();
     const int64_t v_row_stride = V.row_stride_elems();
     const int64_t o_row_stride = output.row_stride_elems();
 
-    // Helper to read Q/K/V elements accounting for merged vs. explicit layout
     auto read_elem = [&](const float* ptr, int64_t b, int64_t h,
                          int64_t s, int64_t d, int64_t row_stride, bool merged) -> float {
         if (merged) {
@@ -105,7 +109,6 @@ void attention_ref(const AttentionAttributes& attrs,
 
         std::vector<float> scores(static_cast<size_t>(Sq * Sk), 0.0f);
 
-        // Step 1: scores = Q @ K^T * scale
         for (int64_t i = 0; i < Sq; ++i) {
             for (int64_t j = 0; j < Sk; ++j) {
                 float dot = 0.0f;
@@ -118,7 +121,6 @@ void attention_ref(const AttentionAttributes& attrs,
             }
         }
 
-        // Step 2: Apply explicit mask if provided
         if (has_mask) {
             for (int64_t i = 0; i < Sq; ++i) {
                 for (int64_t j = 0; j < Sk; ++j) {
@@ -127,15 +129,14 @@ void attention_ref(const AttentionAttributes& attrs,
             }
         }
 
-        // Step 3: Softmax along last dimension
         softmax_last_dim(scores.data(), Sq, Sk);
 
-        // Step 4: output = attn @ V
         for (int64_t i = 0; i < Sq; ++i) {
             for (int64_t d = 0; d < D; ++d) {
                 float sum = 0.0f;
                 for (int64_t j = 0; j < Sk; ++j) {
                     float attn = scores[i * Sk + j];
+                    // A non-finite weight would poison the whole sum, so it is dropped.
                     if (std::isinf(attn) || std::isnan(attn)) { continue; }
                     float vv = read_elem(v_ptr, b, h, j, d, v_row_stride, merged_heads);
                     sum += attn * vv;

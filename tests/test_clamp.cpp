@@ -1,5 +1,11 @@
 /// @file test_clamp.cpp
-/// @brief Unit tests for Clamp operator (CPU backend).
+/// @brief Clamp operator tests (CPU backend) — hand-checked bounds, a missing
+///        min or max, add_to, f32/f16, and a packed NCHWC8 input.
+///
+/// Clamp is elementwise, so a re-layout cannot change a value: the packed case
+/// runs the op on NCHWC8 data and compares every element against a scalar clamp
+/// of the packed input. The class API test only checks that two independently
+/// created instances of the same attributes agree.
 
 #include "nnops/ops/clamp.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -155,10 +161,6 @@ NNOPS_TEST(clamp_random_f16) {
     }
 }
 
-// ============================================================
-// add_to test
-// ============================================================
-
 NNOPS_TEST(clamp_add_to) {
     const int64_t shape[] = {3};
     float in_data[]  = {0.0f, 5.0f, 10.0f};
@@ -185,15 +187,13 @@ NNOPS_TEST(clamp_add_to) {
 }
 
 // ============================================================
-// Packed layout test (Any layout support)
+// Packed layout (NCHWC8)
 // ============================================================
 
 NNOPS_TEST(clamp_packed_layout) {
-    // Create planar data, convert to NCHWC8, clamp, convert back, verify
     const int64_t N = 1, C = 16, H = 4, W = 4;
     auto [in_vec, input_planar] = test::make_random_tensor({N, C, H, W}, -10.0f, 10.0f, 444);
 
-    // Convert to NCHWC8
     auto lc = LayoutConvert::create(LayoutConvertAttributes{TensorLayout::NCHWC8}, Backend::CPU);
     const TensorDesc lc_in[] = {input_planar.desc()};
     auto lc_descs = lc->getOutputTensorDesc(lc_in);
@@ -207,11 +207,9 @@ NNOPS_TEST(clamp_packed_layout) {
     const TensorView lc_inputs[] = {input_planar};
     lc->compute(input_packed, lc_inputs);
 
-    // Output in same packed layout
     std::vector<float> packed_out_buf(static_cast<size_t>(packed_elems), 0.0f);
     auto output_packed = test::make_packed(lc_descs[0], packed_out_buf.data());
 
-    // Now clamp the packed tensor
     ClampAttributes attrs;
     attrs.min_val = -2.0f;
     attrs.max_val = 3.0f;
@@ -220,22 +218,15 @@ NNOPS_TEST(clamp_packed_layout) {
     const TensorView ins[] = {input_packed};
     op->compute(output_packed, ins);
 
-    // Verify each element by comparing to scalar clamp on original data
-    // Since NCHWC8 is just a re-layout, element values should match
     const float* out_ptr = output_packed.ptr<float>();
     const float* in_ptr = input_packed.ptr<float>();
     for (size_t i = 0; i < static_cast<size_t>(packed_elems); ++i) {
-        // Skip padding elements (zero-filled in NCHWC8 when C not multiple of 8)
         float inv = in_ptr[i];
         float outv = out_ptr[i];
         float expected = std::max(-2.0f, std::min(3.0f, inv));
         NNOPS_EXPECT_NEAR(outv, expected, 1e-5f);
     }
 }
-
-// ============================================================
-// Class API test
-// ============================================================
 
 NNOPS_TEST(clamp_class_api) {
     const int64_t shape[] = {4};
@@ -250,7 +241,6 @@ NNOPS_TEST(clamp_class_api) {
     attrs.min_val = 0.0f;
     attrs.max_val = 7.0f;
 
-    // Class API
     {
         auto op = Clamp::create(attrs, Backend::CPU);
         const TensorDesc in_arr[] = {d};
@@ -260,7 +250,6 @@ NNOPS_TEST(clamp_class_api) {
         op->compute(output, ins);
     }
 
-    // Class API (second instance)
     {
         auto op = Clamp::create(attrs, Backend::CPU);
         const TensorDesc in_arr[] = {d};

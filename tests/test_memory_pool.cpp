@@ -35,7 +35,6 @@ NNOPS_TEST(memory_pool_alignment_and_sizes) {
         pool.deallocate(p);
     }
 
-    // A block written and read back holds its bytes.
     int* arr = pool.allocate_typed<int>(100);
     for (int i = 0; i < 100; ++i) { arr[i] = i; }
     for (int i = 0; i < 100; ++i) { NNOPS_EXPECT_EQ(arr[i], i); }
@@ -111,7 +110,6 @@ NNOPS_TEST(memory_pool_concurrent_alloc_free) {
     for (auto& w : workers) { w.join(); }
 
     NNOPS_EXPECT_TRUE(ok.load());
-    // Every block was freed; nothing should remain handed out.
     NNOPS_EXPECT_EQ(pool.live_bytes(), size_t{0});
 }
 

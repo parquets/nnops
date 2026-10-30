@@ -1,13 +1,10 @@
 /// @file test_shape_inference.cpp
-/// @brief Tests for getOutputTensorDesc across all 16 operator types.
+/// @brief getOutputTensorDesc tests across the operator set.
 ///
-/// Every test validates:
-///   - descs[0].dims     — correct output shape
-///   - descs[0].layout   — explicit layout propagation check
-///   - descs[0].storage_bytes >= descs[0].nbytes()  — storage consistency
-///
-/// MSVC-compatible: C arrays for span args, td() helper for TensorDesc,
-/// nnops::test::make_planar / make_packed for TensorView construction.
+/// The helpers check an output descriptor's rank and dims (validate_output also
+/// pins layout) and storage_bytes >= nbytes (check_storage_consistent).
+/// Descriptor lists are passed as C arrays because MSVC cannot bind an
+/// initializer_list to std::span.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/conv3d.hpp"
@@ -34,7 +31,7 @@
 using namespace nnops;
 
 // ============================================================
-// Helper
+// Helpers
 // ============================================================
 
 static TensorDesc td(std::initializer_list<int64_t> dims,
@@ -48,15 +45,15 @@ static TensorDesc td(std::initializer_list<int64_t> dims,
     return d;
 }
 
-/// Assert storage_bytes >= nbytes for the given TensorDesc.
-/// This must hold for planar layouts (equality) and packed layouts (>=).
+/// storage_bytes() counts 32B-aligned row pitch, so it is >= nbytes() for both
+/// planar and packed layouts; the two are equal when the dense row already
+/// meets the pitch.
 static void check_storage_consistent(const TensorDesc& d) {
     size_t sb = d.storage_bytes();
     size_t nb = d.nbytes();
     NNOPS_EXPECT_TRUE(sb >= nb);
 }
 
-/// Validate dims + layout + storage consistency for a single output descriptor.
 static void validate_output(const TensorDesc& desc,
                             int64_t expected_rank,
                             std::initializer_list<int64_t> expected_dims,
@@ -71,7 +68,7 @@ static void validate_output(const TensorDesc& desc,
     check_storage_consistent(desc);
 }
 
-/// Minimal dims-only validation (for ops where layout is not predefined).
+/// Rank + dims + storage, with no layout expectation.
 static void validate_dims(const TensorDesc& desc,
                           int64_t expected_rank,
                           std::initializer_list<int64_t> expected_dims) {
@@ -118,7 +115,6 @@ NNOPS_TEST(shape_conv2d_nchwc8) {
 
     NNOPS_EXPECT_EQ(descs.size(), size_t(1));
     validate_output(descs[0], 4, {1, 128, 28, 28}, TensorLayout::NCHWC8);
-    // Packed layout: storage_bytes >= nbytes (f32 NCHWC8 rows are 32B multiples)
     NNOPS_EXPECT_TRUE(descs[0].storage_bytes() >= descs[0].nbytes());
 }
 
@@ -201,8 +197,7 @@ NNOPS_TEST(shape_conv2d_dilated) {
     const TensorDesc desc_arr[] = {in_desc, wt_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // effective kernel = dilation*(K-1)+1 = 2*2+1 = 5
-    // OH = (224-5)/1+1 = 220
+    // effective kernel 2*(3-1)+1 = 5 -> OH = (224-5)/1+1 = 220
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(220));
     NNOPS_EXPECT_EQ(descs[0].dims[3], int64_t(220));
     check_storage_consistent(descs[0]);
@@ -243,7 +238,6 @@ NNOPS_TEST(shape_conv3d_ncdhwc8) {
     // OD = (8+2-3)/1+1 = 8, OH = (56+2-3)/2+1 = 28, OW = 28
     validate_output(descs[0], 5, {1, 48, 8, 28, 28}, TensorLayout::NCDHWC8);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
-    // Packed: storage >= nbytes (f16 NCHWC8 with W=28 gives 448B row, 32B-aligned)
     NNOPS_EXPECT_TRUE(descs[0].storage_bytes() >= descs[0].nbytes());
 }
 
@@ -287,8 +281,8 @@ NNOPS_TEST(shape_depthwise_conv_2d) {
 }
 
 NNOPS_TEST(shape_depthwise_conv_2d_nhwc) {
-    // Channel-last: the dims stay the logical [N, C, H, W]; only the layout tag
-    // says the memory order, so the shape math is the planar math.
+    // Channel-last: dims stay logical [N, C, H, W]; the layout tag alone sets
+    // memory order, so the shape math is the planar math.
     auto op = DepthwiseConv::create(Backend::CPU);
     auto& attrs = const_cast<DepthwiseConvAttributes&>(op->attributes());
     attrs.kernel_size = {1, 3, 3};
@@ -884,7 +878,6 @@ NNOPS_TEST(shape_reduce_nchwc8) {
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Layout should be preserved even after reduce
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHWC8));
     validate_dims(descs[0], 3, {32, 28, 28});
 }
@@ -906,7 +899,6 @@ NNOPS_TEST(shape_dtype_propagation) {
 }
 
 NNOPS_TEST(shape_single_input_operator) {
-    // All single-input identity ops should produce one output descriptor.
     auto op = Activation::create(Backend::CPU);
 
     TensorDesc in_desc = td({1, 3, 32, 32});
@@ -937,35 +929,23 @@ NNOPS_TEST(shape_workspace_consistent) {
 }
 
 NNOPS_TEST(shape_storage_bytes_planar_equality) {
-    // For NCHW planar layout with 32B-aligned last dim that fits exactly,
-    // storage_bytes should closely match nbytes.
-    // Input: N=1, C=64, H=56, W=64 => nbytes = 1*64*56*64*4 = 917504
-    // pitch = 64 * 4 = 256 (already 32B-aligned)
-    // storage_bytes = rows * pitch = (1*64*56) * 256 = 917504
     auto op = Activation::create(Backend::CPU);
 
-    // W=8, C=8, H=8, N=1: nbytes = 1*8*8*8*4 = 2048
-    // pitch = 8 * 4 = 32 (aligned to 32)
-    // storage_bytes = (1*8*8) * 32 = 2048
+    // {1,8,8,8} f32: row 8*4 = 32B is already pitch-aligned, so
+    // nbytes = storage_bytes = 1*8*8*8*4 = 2048.
     TensorDesc in_desc = td({1, 8, 8, 8}, DataType::f32, TensorLayout::NCHW);
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Planar: storage_bytes == nbytes (no padding needed when row is 32B-aligned)
     NNOPS_EXPECT_EQ(descs[0].nbytes(), size_t(2048));
     NNOPS_EXPECT_EQ(descs[0].storage_bytes(), descs[0].nbytes());
 }
 
 NNOPS_TEST(shape_storage_bytes_packed_exceeds_nbytes) {
-    // For NCHWC8 packed layout, storage_bytes > nbytes due to row pitch alignment.
-    // f16 with odd W forces misalignment: W*pack*elem = 7*8*2 = 112 → align → 128
     auto op = Activation::create(Backend::CPU);
 
-    // C=10, W=7, f16:
-    //   nbytes = ceil(10/8)*8 * 7 * 2 = 224
-    //   row_bytes = 7*8*2 = 112, aligned_row = 128
-    //   rows = ceil(10/8) = 2
-    //   storage_bytes = 2 * 128 = 256 > 224
+    // C=10, W=7, f16: nbytes = ceil(10/8)*8 * 7 * 2 = 224; row 7*8*2 = 112
+    // pitches to 128 over 2 C-blocks -> storage_bytes = 2 * 128 = 256 > 224.
     TensorDesc in_desc = td({1, 10, 1, 7}, DataType::f16, TensorLayout::NCHWC8);
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
@@ -1044,15 +1024,12 @@ NNOPS_TEST(shape_reduce_last_axis) {
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Reducing a 1D tensor: output is scalar (rank 0)
     NNOPS_EXPECT_EQ(descs[0].rank, int64_t(0));
-    // Scalar: nbytes == storage_bytes == elem_size
     NNOPS_EXPECT_EQ(descs[0].nbytes(), size_t(4));  // f32
     check_storage_consistent(descs[0]);
 }
 
 NNOPS_TEST(shape_linear_1d) {
-    // 1D input to Linear -> output should be [N]
     auto op = Linear::create(Backend::CPU);
 
     // K=64, N=128
@@ -1061,12 +1038,7 @@ NNOPS_TEST(shape_linear_1d) {
     const TensorDesc desc_arr[] = {in_desc, wt_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // [K] × [N,K]^T  -> rank(1)=M=1? Actually, let me check shape_inference:
-    // For in_rank == 2: [M,K]. For in_rank == 1, the shape inference
-    // function takes the else branch: out.rank = in_rank = 1, batch dims
-    // preserved... but that might not be right for real 1D.
-    // Let's just test what happens.
+    // in_rank 1 takes the else branch (out.dims[0] = N); only storage is pinned.
     (void)descs;
-    // Shape depends on implementation; just check storage consistency
     check_storage_consistent(descs[0]);
 }

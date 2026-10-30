@@ -11,7 +11,7 @@
 ///   - M <= GEMV_M_MAX: packing B writes and then re-reads a whole N×K operand
 ///     for a handful of output rows; stream B once through the arch's GEMV.
 ///
-/// See matmul_internal.h for the batch walk shared with the driver.
+/// The batch walk shared with the driver lives in matmul_internal.h.
 
 #include "matmul_internal.h"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // apply_epilogue
@@ -30,11 +30,10 @@ constexpr int64_t NAIVE_PARALLEL_MACS = 32768;
 /// M at or below this takes the direct GEMV.
 constexpr int64_t GEMV_M_MAX = 4;
 
-/// C = beta·C_old + bias over every batch element, before any block runs.
-///
-/// Same accumulator-init the tiled route does in its first k-block: the kernel
-/// then accumulates the product with beta = 1, and the bias — unscaled by
-/// alpha, added before clamp and activation — is already in place.
+/// C = beta·C_old + bias over every batch element, before anything accumulates:
+/// the accumulator-init the tiled route does in its first k-block. The kernel
+/// then adds the product with beta = 1, and the bias — unscaled by alpha, added
+/// before clamp and activation — is already in place.
 template <typename T>
 void prime_bias_pass(const MatMulAttributes& attrs, TensorView& output,
                      const BatchWalk& batch, T* c_base, int ldc,
@@ -104,8 +103,8 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     const int Mi = static_cast<int>(M);
     const int Ni = static_cast<int>(N);
     const int Ki = static_cast<int>(K);
-    // The kernel picks the traversal from B's size, and the traversal decides
-    // how wide a slice is worth handing to one call (see arch::gemv_slice).
+    // B's size picks the traversal, which decides how wide a slice is worth one
+    // call (see arch::gemv_slice).
     const int span = arch::gemv_slice<T>(Mi, N, K);
     const int blocks = (Ni + span - 1) / span;
 
@@ -114,8 +113,7 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     T* c_base = output.ptr<T>();
 
     const BatchWalk batch(a, b);
-    // A bias primes C with beta·C_old + bias, so the kernel accumulates the
-    // product (beta = 1) and the epilogue pass below still runs.
+    // A bias primes C with beta·C_old + bias; the kernel then adds the product.
     const T* bias = inputs.size() > 2 ? inputs[2].ptr<T>() : nullptr;
     if (bias != nullptr) {
         prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
@@ -171,8 +169,7 @@ void matmul_naive_small(const MatMulAttributes& attrs, TensorView& output,
     T* c_base = output.ptr<T>();
 
     const BatchWalk batch(a, b);
-    // Same accumulator-init as the GEMV route: beta·C_old + bias first, then
-    // the product accumulates with beta = 1.
+    // Same accumulator-init as the GEMV route: prime, then accumulate beta = 1.
     const T* bias = inputs.size() > 2 ? inputs[2].ptr<T>() : nullptr;
     if (bias != nullptr) {
         prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
@@ -208,8 +205,8 @@ bool matmul_small_fp(const MatMulAttributes& attrs,
     const DataType dt_a = a.data_type();
     const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
     if (!float_a || b.data_type() != dt_a) { return false; }
-    // A prepacked RHS is panel-formatted, not a row-major matrix: both small
-    // routes here read B as rows of N. It goes to the tiled route instead.
+    // A prepacked RHS is panel-formatted, not a row-major matrix, and both small
+    // routes here read B as rows of N: it goes to the tiled route instead.
     if (is_packed_matmul_b(b.layout())) { return false; }
 
     const auto [M, N, K] = matmul_dims(attrs, a, b);

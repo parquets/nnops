@@ -4,12 +4,18 @@
 ///        Eltwise, Clamp) — row geometry, tiled float dispatch, and the fused
 ///        dequantize → op → quantize path.
 ///
-/// The four operators share the same shape: a pitch-aware row loop tiled into
-/// groups of TILE_M rows, dispatched via `ComputeContext::cpu.run`,
-/// plus (for Activation/Unary/Eltwise) a quantized path that dequantizes the
-/// int input(s) to f32, runs the float op, and requantizes the result. This
-/// header is the single source of truth for that boilerplate; each operator
-/// only supplies its op-type dispatch switch.
+/// The four operators share one shape: a pitch-aware row loop tiled into groups
+/// of `tile_m` rows and dispatched via `ComputeContext::cpu.run`, plus (for
+/// Activation/Unary/Eltwise) a quantized path that dequantizes the int input(s)
+/// to f32, runs the float op, and requantizes the result. This header is the
+/// single source of truth for that boilerplate; each operator supplies only its
+/// op dispatch switch.
+///
+/// Two rules the helpers encode:
+///  - A channel-last "row" is one whole spatial line — W pixels × C channels —
+///    so last_dim is shape(1) * shape(rank-1), not W.
+///  - The fused quantized paths require input and output to share one
+///    granularity (PerTensor or PerToken); the tile drivers assert it.
 ///
 /// Quantized dequant/requant delegates to the raw-intrinsic arch kernels in
 /// `x86_64/quant.hpp` / `aarch64/quant.hpp` (NOT `simd_kernel/simd_quant.hpp`).
@@ -40,16 +46,14 @@ namespace quant_kernel = x86_64;
 namespace quant_kernel = aarch64;
 #endif
 
-/// Run `body(i)` for i in [0, count) — parallelized when a hook is installed,
-/// sequential otherwise. The canonical replacement for the per-operator
-/// `ctx.cpu.run(0, count, body)` idiom.
+/// `ctx.cpu.run(0, count, body)`: parallel when a hook is installed, sequential
+/// otherwise.
 inline void run_parallel(const ComputeContext& ctx, int64_t count,
                          const ParallelForBody& body) {
     ctx.cpu.run(0, count, body);
 }
 
-/// Row-major view of a pitch-aware tensor: `num_rows` logical rows of
-/// `last_dim` elements, with input/output row strides (elements).
+/// Row-major view of a pitch-aware tensor, with input/output row strides.
 struct RowGeometry {
     int64_t last_dim;   ///< elements per row (already includes channel packing)
     int64_t num_rows;   ///< number of logical rows
@@ -58,11 +62,6 @@ struct RowGeometry {
 };
 
 /// Derive the row geometry shared by every element-wise float kernel.
-///
-/// A channel-last tensor's "row" is one whole spatial line — W pixels × C
-/// channels, which is also its pitch — and there are N × H of them
-/// (`total_rows()` already counts that way). Without this, last_dim would be W
-/// and the kernel would rewrite the first W elements of every pixel line.
 inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& output) {
     const int64_t total = input.numel();
     const int64_t rank  = input.rank();
@@ -76,8 +75,8 @@ inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& o
     return { last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems() };
 }
 
-/// Row-tiled float transform for a unary op. `apply` receives the base pointers
-/// of a ≤TILE_M-row tile and its row strides, and runs the op over it.
+/// Row-tiled unary float transform: `apply` gets a tile's base pointers and row
+/// strides, and runs the op over it.
 template <typename T, typename ApplyFn>
 void tiled_float_transform(const TensorView& input, TensorView& output,
                            const ComputeContext& ctx, ApplyFn&& apply,
@@ -100,7 +99,7 @@ void tiled_float_transform(const TensorView& input, TensorView& output,
     run_parallel(ctx, num_tiles, body);
 }
 
-/// Row-tiled float transform for a binary op (two inputs, independent strides).
+/// Row-tiled binary float transform (two inputs, independent strides).
 template <typename T, typename ApplyFn>
 void tiled_float_transform2(const TensorView& a, const TensorView& b, TensorView& out,
                             const ComputeContext& ctx, ApplyFn&& apply,
@@ -165,10 +164,6 @@ inline void quantize_tile(DataType dt, int h, int w, uint8_t* dst, int dst_strid
 }
 
 /// Fused quantized unary: dequantize input → apply op (f32, in place) → quantize.
-///
-/// Input and output must both be quantized and share the same granularity
-/// (PerTensor or PerToken). `apply(float* scratch, int h, int w)` runs the op
-/// over an h×w f32 tile in place.
 template <typename ApplyFn>
 void quantized_unary_transform(const TensorView& input, TensorView& output,
                                const ComputeContext& ctx, ApplyFn&& apply) {
@@ -226,10 +221,6 @@ void quantized_unary_transform(const TensorView& input, TensorView& output,
 }
 
 /// Fused quantized binary: dequantize A and B → apply op (f32) → quantize.
-///
-/// Both inputs and the output must be quantized and share the same granularity.
-/// `apply(float* a, float* b, int h, int w)` runs the binary op; the result is
-/// written into `a` (so `a` doubles as the result scratch).
 template <typename ApplyFn>
 void quantized_binary_transform(const TensorView& a_in, const TensorView& b_in,
                                 TensorView& output, const ComputeContext& ctx,

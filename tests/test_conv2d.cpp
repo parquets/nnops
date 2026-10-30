@@ -1,5 +1,60 @@
-/// Unit tests for Conv2D operator (CPU reference).
-/// Uses Conv2D class API exclusively.
+/// @file test_conv2d.cpp
+/// @brief Conv2D on the CPU backend: correctness against the reference, plan
+///        geometry, threading, and the prepacked-filter contract.
+///
+/// Operator tests go through the Conv2D class API (create ->
+/// getOutputTensorDesc -> compute); two sit one level down, on
+/// tiled_im2col_2d_packed against the two-step pack, and on tiled_im2col_3d.
+/// Numeric tests compare the fast path with reference::conv2d_ref, declared
+/// test-locally the way test_matmul.cpp does; the plan tests read
+/// get_conv2d_implicit_gemm_plan directly and pin the geometry, since a
+/// correctness table only observes the result and a retune would go unnoticed.
+///
+/// Threading invariant: an oh-chunk (and an oc-chunk) owns a disjoint output
+/// tile, so any thread count must reproduce the serial result bit for bit. That
+/// is what the SimplePool cases check — a per-chunk row offset or a missed halo
+/// shows up there and nowhere else.
+///
+/// Plan geometry, as it stands:
+/// - The fp route keeps no col matrix (col_size == 0): the gather writes the
+///   packed-B panels directly. Packed scratch is ceil(oh_block*OW / nr_max)
+///   panels, each mma_pack_align(nr*kdim*sizeof(float)) / sizeof(float)
+///   elements wide; nr_max is 12 on aarch64 and 16 on x86_64.
+/// - get_ic_block() picks icn_block from karea alone — 64 at 1x1, 16 through
+///   3x3, 8 through 5x5, 2 through 7x7, 1 past that — capped at ic_per_group.
+///   One GEMM call reduces over icn_block * karea, so the ladder keeps that K
+///   under ~200 on every rung instead of letting it scale with karea: a short K
+///   makes every ic-block re-read and rewrite the whole output tile and restart
+///   the packer, a long one costs col buffer.
+/// - Pointwise: a 1x1 kernel at unit stride with zero padding turns the gather
+///   into a dense row copy, so the plan drops the col buffer and lifts
+///   icn_block to the whole group. Any stride or padding rejects it, and so
+///   does a row pitch wider than IW on the fp route — the pointwise B read
+///   takes roi_area contiguous elements per channel row.
+/// - oh-block: starts at align(PH+1, kAlign) — 4 rows for 3x3 s2 p1 — and two
+///   loops move it. A col-budget loop grows it while the block's col elements
+///   fit the 256K-element scratch cap per slot (a 1280-wide plane is pinned to
+///   4 rows at IC 64 and allowed 7 at IC 3).
+///   A filter-dominated loop grows it to the whole plane when one block per
+///   (batch, group) already keeps half the pool busy and the per-group filter
+///   count exceeds the plane area — the proxy MLAS uses to pick its whole-plane
+///   ExpandThenGemm.
+/// - Small planes additionally split the filter rows: the task grid is
+///   (batch, group) x oh-chunks x oc-chunks. The chunk count is a nearest
+///   round, not a ceiling — an odd block count would otherwise add a straggler
+///   wave the barrier waits on (152 against 226 GFLOPS in bench_conv2d's
+///   odd-plane rows). The split floors at two M panels per chunk, so a narrow
+///   group cannot be split at all.
+/// - Per-slot scratch follows the *worker* count, not the reported task count,
+///   even when a backend over-subscribes the grid.
+///
+/// The prepacked filter: a planar float filter already is the GEMM's A operand,
+/// so PackedOIHW is a densified [OC][IC/G·KH·KW] copy. Prepacking is total —
+/// every supported filter has a packed form, so a graph engine can prepack
+/// unconditionally and hand the blob back to compute() — but the form follows
+/// attrs.algorithm: a k3s1 fp filter under Auto gets the Winograd U, so the
+/// prepack test pins ImplicitGemm. The output must stay byte-identical to the
+/// raw-filter run.
 
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
@@ -25,10 +80,8 @@
 using namespace nnops;
 using nnops::backend::cpu::half;
 
-/// Packed-B scratch (elements per slot) a float conv plan must reserve: the
-/// plan's im2col block — icn_block channels x karea taps x oh_block rows x OW
-/// columns — re-laid out in nr_max-wide panels. Mirrors get_conv2d_implicit_gemm_plan;
-/// nr_max is arch-dependent (12 on aarch64, 16 on x86_64).
+/// Packed-B scratch (elements) an fp plan must reserve; mirrors the planner's
+/// panel math.
 static int64_t expected_pack_size(const nnops::backend::cpu::Conv2DGemmPlan& plan,
                                   int64_t karea, int64_t out_w) {
     constexpr int nr = nnops::backend::cpu::nr_max_flt<float>();
@@ -43,8 +96,7 @@ static int64_t expected_pack_size(const nnops::backend::cpu::Conv2DGemmPlan& pla
 // ============================================================
 
 NNOPS_TEST(conv2d_basic_no_pad) {
-    // 1x1x4x4 input all-ones, 1x1x3x3 kernel all-0.5, stride=1, pad=0
-    // Expected: 2x2 output, each = 9 * (1.0 * 0.5) = 4.5
+    // 1x1x4x4 ones * 1x1x3x3 of 0.5 -> 2x2, each 9 * 0.5 = 4.5
     const int64_t ishape[] = {1, 1, 4, 4};
     const int64_t wshape[] = {1, 1, 3, 3};
 
@@ -80,7 +132,7 @@ NNOPS_TEST(conv2d_basic_no_pad) {
 }
 
 NNOPS_TEST(conv2d_with_bias) {
-    // Same as above but with bias = 0.5
+    // Same case, bias 0.5 -> 5.0
     const int64_t ishape[] = {1, 1, 4, 4};
     const int64_t wshape[] = {1, 1, 3, 3};
     const int64_t bshape[] = {1};
@@ -113,15 +165,13 @@ NNOPS_TEST(conv2d_with_bias) {
     const TensorView ins[] = {input, weight, bias};
     op->compute(out, ins);
 
-    // Each output = 4.5 + 0.5 = 5.0
     for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_NEAR(out_buf[i], 5.0f, 1e-4f);
     }
 }
 
 NNOPS_TEST(conv2d_stride_2) {
-    // 1x1x6x6 input, 1x1x3x3 kernel, stride=2, pad=0
-    // Expected: 2x2 output
+    // 1x1x6x6, 3x3, stride 2 -> 2x2 output
     const int64_t ishape[] = {1, 1, 6, 6};
     const int64_t wshape[] = {1, 1, 3, 3};
 
@@ -157,8 +207,7 @@ NNOPS_TEST(conv2d_stride_2) {
 }
 
 NNOPS_TEST(conv2d_padding_1) {
-    // 1x1x2x2 input, 1x1x3x3 kernel, stride=1, pad=1
-    // Output should be 2x2 (same spatial size)
+    // 1x1x2x2, 3x3, pad 1 -> 2x2 (same spatial size)
     const int64_t ishape[] = {1, 1, 2, 2};
     const int64_t wshape[] = {1, 1, 3, 3};
 
@@ -188,16 +237,14 @@ NNOPS_TEST(conv2d_padding_1) {
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
 
-    // Each output element sees partial kernel region (padded zeros)
-    // Top-left: only bottom-right 2x2 of kernel overlaps => 1.0 * 0.5 * 4 = 2.0
+    // Only the overlapping 2x2 of the kernel counts (padded zeros elsewhere):
+    // top-left and top-right each see 4 taps * 0.5 = 2.0.
     NNOPS_EXPECT_NEAR(out_buf[0], 2.0f, 1e-4f);
-    // Top-right: bottom-left 2x2 of kernel overlaps => 2.0
     NNOPS_EXPECT_NEAR(out_buf[1], 2.0f, 1e-4f);
 }
 
 NNOPS_TEST(conv2d_grouped) {
-    // Grouped conv with groups=2, IC=2, OC=2
-    // Each group: 1 input channel -> 1 output channel
+    // groups 2 with IC 2 / OC 2: one input channel per group
     const int64_t ishape[] = {1, 2, 3, 3};
     const int64_t wshape[] = {2, 1, 2, 2};  // [OC, IC/G, KH, KW] = [2, 1, 2, 2]
 
@@ -228,15 +275,11 @@ NNOPS_TEST(conv2d_grouped) {
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
 
-    // Each group: 1 input channel convolved with 1 filter => 4 products * 1.0 = 4.0
+    // 4 taps * 1.0 = 4.0 per output
     for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_NEAR(out_buf[i], 4.0f, 1e-4f);
     }
 }
-
-// ============================================================
-// Random comparison test
-// ============================================================
 
 NNOPS_TEST(conv2d_random_small) {
     auto [in_vec, input]   = test::make_random_tensor({1, 3, 8, 8});
@@ -262,20 +305,15 @@ NNOPS_TEST(conv2d_random_small) {
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
 
-    // Should not crash or produce NaN
+    // No reference to compare against: just require finite output.
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(out_buf[i]));
         NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
     }
 }
 
-// ============================================================
-// Class API standalone test
-// ============================================================
-
 NNOPS_TEST(conv2d_class_api) {
-    // Validate Conv2D class API with getOutputTensorDesc + make_planar pipeline.
-    // 1x1x4x4 input all-ones, 1x1x3x3 kernel all-0.5, stride=1, pad=0
+    // The getOutputTensorDesc + make_planar pipeline, on the same 4.5 case.
     const int64_t ishape[] = {1, 1, 4, 4};
     const int64_t wshape[] = {1, 1, 3, 3};
 
@@ -305,7 +343,6 @@ NNOPS_TEST(conv2d_class_api) {
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
 
-    // Expected: 2x2 output, each = 9 * (1.0 * 0.5) = 4.5
     for (int i = 0; i < 4; ++i) {
         NNOPS_EXPECT_NEAR(out_buf[i], 4.5f, 1e-4f);
     }
@@ -315,8 +352,7 @@ NNOPS_TEST(conv2d_class_api) {
 // Tiled im2col + GEMM fast path (vs reference)
 // ============================================================
 
-// Reference kernel for comparison (test-local declaration, following the
-// test_matmul.cpp pattern).
+// Reference kernel (test-local declaration, as in test_matmul.cpp).
 namespace nnops::backend::cpu::reference {
 void conv2d_ref(const Conv2DAttributes& attrs,
                 TensorView& output,
@@ -325,13 +361,12 @@ void conv2d_ref(const Conv2DAttributes& attrs,
                 void* workspace);
 }
 
-// Minimal fixed-size thread pool exposing a CpuBackend (test_matmul.cpp
-// pattern). Items in [begin, end) are claimed via an atomic counter; each
-// worker runs body(i) until the range is exhausted.
+/// Fixed-size pool over a CpuBackend (test_matmul.cpp pattern); items are
+/// claimed atomically.
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
-        // runs under the same bit-exact comparisons as the kernels.
+        // OpenMP when the build has it, so the adapter runs under the same
+        // bit-exact comparison as the kernels.
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
             return;
@@ -367,8 +402,7 @@ struct SimplePool {
 
 namespace {
 
-/// Run the fast path and the reference, and report whether every output element
-/// agrees within (rtol, atol).
+/// Fast path vs reference: true iff every output agrees within (rtol, atol).
 bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
                         const TensorView& input, const TensorView& weight,
                         const TensorView* bias,
@@ -385,12 +419,10 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    // Fast path (scratch pooled internally by the kernel).
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
     op->compute(fast_out, ins, {}, nullptr);
 
-    // Reference baseline.
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
@@ -405,9 +437,7 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
     return true;
 }
 
-/// Run one conv config on a single set of values: the f32 reference is the
-/// ground truth, and the f16 fast path runs on the same values converted to
-/// f16. Returns the max absolute deviation over the output.
+/// f16 fast path vs the f32 reference on the same values; max abs deviation.
 float conv2d_f16_case(const Conv2DAttributes& attrs,
                       const std::vector<int64_t>& ishape,
                       const std::vector<int64_t>& wshape,
@@ -428,7 +458,6 @@ float conv2d_f16_case(const Conv2DAttributes& attrs,
 
     auto op = Conv2D::create(attrs, Backend::CPU);
 
-    // f32 reference (ground truth).
     std::vector<TensorDesc> d32 = {in32.desc(), w32.desc()};
     std::vector<TensorView> i32 = {in32, w32};
     if (bias) { d32.push_back(b32.desc()); i32.push_back(b32); }
@@ -438,7 +467,6 @@ float conv2d_f16_case(const Conv2DAttributes& attrs,
     auto ref_out = test::make_planar(od32[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
 
-    // f16 fast path on the same values.
     auto in16v = test::f32_to_f16(in32v);
     auto w16v  = test::f32_to_f16(w32v);
     TensorView in16(std::span<const int64_t>(ishape), DataType::f16, in16v.data());
@@ -472,9 +500,8 @@ float conv2d_f16_case(const Conv2DAttributes& attrs,
 }  // anonymous namespace
 
 NNOPS_TEST(conv2d_im2col_matches_ref) {
-    // A spread of configs exercising stride, padding, dilation, groups, bias,
-    // and multi-block paths (ic_per_group > icn_block, oc_per_group > ocn_block)
-    // — each must match the reference to fp32 rounding.
+    // Stride, padding, dilation, groups, bias and the multi-block paths
+    // (ic_per_group > icn_block, oc_per_group > ocn_block).
     struct Case { std::array<int64_t,4> ishape; std::array<int64_t,4> wshape;
                   int64_t kh, kw, sh, sw, ph, pw, dh, dw, groups; bool bias; };
     const Case cases[] = {
@@ -488,13 +515,7 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
         {{1, 4, 8, 8},   {144, 4, 3, 3},  3, 3, 1, 1, 1, 1, 1, 1, 1, false},
         {{1, 3, 18, 18}, {6, 3, 3, 3},    3, 3, 1, 1, 1, 1, 2, 2, 1, false},
 
-        // ---- kernel area past 3x3 ------------------------------------------
-        // get_ic_block() picks icn_block from karea alone: 16 through 3x3, 8
-        // through 5x5, 2 through 7x7, 1 past that. Every case above sits on the
-        // top rung, so nothing here exercised the ic-block ladder, the narrow
-        // im2col panel it produces, or the deeper ic_per_group / icn_block walk
-        // that comes with it.
-
+        // ---- kernel area past 3x3: the ic-block ladder below the top rung ---
         // 5x5 "same" + bias — karea 25, the first rung down.
         {{1, 3, 32, 32}, {8, 3, 5, 5},     5, 5, 1, 1, 2, 2, 1, 1, 1, true},
         // 5x5 stride 2 (MobileNet-style downsample): strided gather + big kernel.
@@ -519,20 +540,15 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
         {{1, 2, 24, 24}, {4, 2, 9, 9},     9, 9, 1, 1, 4, 4, 1, 1, 1, false},
 
         // ---- filter-dominated planes ---------------------------------------
-        // 256 filters over a 14x14 plane: the expansion loop grows the oh-block
-        // to cover the whole plane, so the block is 14 rows — deliberately not a
-        // multiple of kAlign. The case above with 144 filters over 8x8 is the
-        // only other one that reaches the loop, and its OH is aligned, so this is
-        // what exercises the unaligned block end to end.
+        // 256 filters over a 14x14 plane: the expansion loop grows the block to
+        // the whole plane — 14 rows, deliberately not a multiple of kAlign, which
+        // is what exercises the unaligned block end to end.
         {{1, 16, 28, 28}, {256, 16, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
 
         // ---- 1x1 pointwise (the GEMM-direct route) --------------------------
-        // At karea 1 with unit stride and zero padding the gather degenerates to
-        // a dense row copy, so the plan drops the col buffer and reads B straight
-        // from the input. The single 1x1 row above is IC 3 / OC 6, which covers
-        // none of the variants that route actually has: IC past the 64-channel
-        // ic-block cap (one K pass instead of several), OC past ocn_block,
-        // groups (the group-relative ldb), and a batch dimension.
+        // IC past the 64-channel ic-block cap, OC past ocn_block, groups (the
+        // group-relative ldb) and a batch dim — none of which the lone 1x1 row
+        // above reaches.
         // IC 128 > 64: K spans the whole group in a single block.
         {{1, 128, 8, 8},   {192, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
         // groups 2 with icg 128: pins the group offset and the in-group ldb.
@@ -570,9 +586,8 @@ NNOPS_TEST(conv2d_im2col_matches_ref) {
 }
 
 NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
-    // Threaded vs serial bit-identical: the oh-blocks are partitioned into
-    // disjoint per-chunk output tiles, so parallel execution (SimplePool) must
-    // match the single-threaded result exactly — and both match the reference.
+    // The oh-blocks split into disjoint per-chunk output tiles, so SimplePool
+    // must match the single-threaded result exactly — and both match the ref.
     struct Case { std::array<int64_t,4> ishape; std::array<int64_t,4> wshape;
                   int64_t kh, kw, sh, sw, ph, pw, dh, dw, groups; bool bias; };
     const Case cases[] = {
@@ -584,20 +599,15 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
         // batch=2 exercises both the (batch) and the oh-chunk dimensions.
         {{2, 3, 16, 16}, {8, 3, 3, 3},   3, 3, 1, 1, 1, 1, 1, 1, 1, true},
         // 7x7: karea 49 drops icn_block to 2, so each oh-chunk re-reads the
-        // weight panel far more often — still disjoint output tiles, so the
-        // per-chunk results must stay bit-identical.
+        // weight panel far more often.
         {{1, 4, 32, 32}, {8, 4, 7, 7},   7, 7, 1, 1, 3, 3, 1, 1, 1, true},
         // 5x5 stride 2: large karea and a strided im2col gather.
         {{1, 8, 28, 28}, {16, 8, 5, 5},  5, 5, 2, 2, 2, 2, 1, 1, 1, false},
-        // filter-dominated plane: the expansion loop meets the chunk split here.
-        // At 2 threads it collapses to one whole-plane block, at 4 it stops
-        // halfway (oh_block 8, 2 blocks, 2 chunks) — both must stay bit-identical
-        // to the serial run.
+        // filter-dominated plane: the expansion loop meets the chunk split — one
+        // whole-plane block at 2 threads, oh_block 8 (2 blocks, 2 chunks) at 4.
         {{1, 16, 28, 28}, {256, 16, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1, false},
-        // 1x1 pointwise with IC past the old ic-block cap: one K pass over the
-        // whole group with B read off the input plane. The chunk split has no col
-        // buffer to absorb the row offset here, so a per-chunk B base that was
-        // wrong by even a row would break the bit-identity below.
+        // 1x1 pointwise past the ic-block cap: no col buffer to absorb the row
+        // offset, so a per-chunk B base off by even a row breaks the bit-identity.
         {{1, 128, 16, 16}, {192, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
     };
 
@@ -637,7 +647,6 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
             auto serial_out = test::make_planar(out_descs[0], serial_buf.data());
             op->compute(serial_out, ins, {}, nullptr);
 
-            // Threaded via SimplePool.
             SimplePool pool(nthreads);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
@@ -653,7 +662,6 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
                 }
             }
 
-            // Both match the reference.
             std::vector<float> ref_buf(static_cast<size_t>(out_numel));
             auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
             nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
@@ -663,8 +671,8 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
 }
 
 NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
-    // Residual + Relu epilogue: the epilogue must apply to bias + Σ, and only
-    // then be added to the pre-existing output (matching conv2d_ref exactly).
+    // Residual + Relu: the epilogue applies to bias + Σ, and only then adds the
+    // pre-existing output.
     const int64_t ishape[] = {1, 2, 10, 10};
     const int64_t wshape[] = {4, 2, 3, 3};
     const int64_t bshape[] = {4};
@@ -687,7 +695,7 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    // Pre-existing residual output (same for fast path and reference).
+    // Same pre-seeded residual for both paths.
     std::vector<int64_t> out_shape(out_descs[0].dims.data(),
                                    out_descs[0].dims.data() + out_descs[0].rank);
     auto [res_vec, _] = test::make_random_tensor(out_shape, -0.5f, 0.5f, 94);
@@ -710,14 +718,11 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
 }
 
 NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
-    // add_to with no activation: the residual is folded into the tile at
-    // icn == 0 and no epilogue runs at all — an identity epilogue would only
-    // copy the tile back over itself. The no-bias form additionally takes the
-    // zero_mode seeding path, so the accumulator must come out of the
-    // micro-kernel as bias-free Σ + residual rather than being pre-filled.
-    // Geometry: IC 32 over icn_block 16 → two icn blocks (only the first is
-    // unseeded), OC 40 under ocn_block 128 with a 4-row MR tail, and an 18x18
-    // plane split into 4-row blocks → N 72 then a 36 tail under nr 16.
+    // add_to with no activation: the residual is folded into the tile at icn == 0
+    // and no epilogue runs. The no-bias form also takes the zero_mode seeding
+    // path, so the micro-kernel must yield bias-free Σ + residual.
+    // Geometry: two icn blocks (IC 32 / icn_block 16), a 4-row MR tail (OC 40),
+    // an 18x18 plane in 4-row blocks -> N 72 then a 36 tail under nr 16.
     const int64_t oshape[] = {1, 40, 18, 18};
 
     for (bool with_bias : {true, false}) {
@@ -746,7 +751,7 @@ NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
         auto out_descs = op->getOutputTensorDesc(descs);
         const int64_t out_numel = out_descs[0].numel();
 
-        // Pre-existing residual output, identical for the fast path and the ref.
+        // Same pre-seeded residual for both paths.
         auto [res_vec, _] = test::make_random_tensor(oshape, -0.5f, 0.5f, 104);
         std::vector<float> fast_buf(static_cast<size_t>(out_numel));
         auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
@@ -767,9 +772,8 @@ NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
 }
 
 NNOPS_TEST(conv2d_im2col_epilogue_relu6) {
-    // Relu6 is a pure clamp of bias + Σ. The fast path and conv2d_ref share
-    // apply_epilogue, so comparing them proves nothing here — compare against
-    // the same convolution run with no epilogue, clamped by hand instead.
+    // Relu6 is a pure clamp of bias + Σ, and both paths share apply_epilogue, so
+    // comparing them proves nothing: clamp the no-epilogue run by hand instead.
     const int64_t ishape[] = {1, 3, 12, 12};
     const int64_t wshape[] = {6, 3, 3, 3};
     const int64_t bshape[] = {6};
@@ -812,10 +816,8 @@ NNOPS_TEST(conv2d_im2col_epilogue_relu6) {
 }
 
 NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
-    // f16 fast path against the f32 reference on the same values, across the
-    // configurations the f32 table above covers: bias, groups > 1, stride and
-    // dilation > 1, a non-square kernel, and K = C*KH*KW past KC_F16 (128) so
-    // the reduction spans multiple k-blocks.
+    // f16 on the same values as f32, with K = C*KH*KW past KC_F16 (128) so the
+    // reduction spans multiple k-blocks.
     struct Case { std::vector<int64_t> ishape, wshape;
                   int64_t kh, kw, sh, sw, ph, pw, dh, dw, groups; bool bias; };
     const Case cases[] = {
@@ -829,8 +831,8 @@ NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
         {{1, 4, 20, 20}, {8, 2, 2, 2},   2, 2, 2, 2, 1, 1, 1, 1, 2, false},
         // 1x1 pointwise + bias.
         {{1, 3, 16, 16}, {6, 3, 1, 1},   1, 1, 1, 1, 0, 0, 1, 1, 1, true},
-        // 1x1 pointwise with K = 128 = KC_F16 past the ic-block cap: the f16 side
-        // has to reduce over the whole group in one block, too.
+        // 1x1 pointwise, K = 128 = KC_F16: the f16 side reduces the whole group
+        // in one block too.
         {{1, 128, 8, 8}, {32, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
         // non-square kernel 3x5.
         {{1, 3, 18, 22}, {6, 3, 3, 5},   3, 5, 1, 1, 1, 2, 1, 1, 1, false},
@@ -841,7 +843,7 @@ NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
         // wide N (32) with groups, deeper K, no bias.
         {{1, 16, 12, 12}, {32, 8, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},
 
-        // ---- kernel area past 3x3 (the f32 table's new rows, in f16) -------
+        // ---- kernel area past 3x3: the f32 table's rows, in f16 -------------
         // 5x5, K = 8*25 = 200 > KC_F16 (128): multi-k-block with a large karea.
         {{1, 8, 16, 16}, {16, 8, 5, 5},  5, 5, 1, 1, 2, 2, 1, 1, 1, true},
         // 5x5 stride 2, groups 2.
@@ -875,11 +877,9 @@ NNOPS_TEST(conv2d_im2col_f16_matches_ref) {
 }
 
 NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
-    // The im2col gather must walk the input through the view's row pitch: the
-    // f16 input here is a padded buffer (W + 3 slack columns per row, zero
-    // filled) whose logical region holds the same values as the dense f32
-    // reference input. Any pitch-ignoring read picks up the zero slack and
-    // diverges.
+    // The gather must walk the view's row pitch: the f16 input is a padded buffer
+    // (W + 3 zero slack columns per row) holding the same logical values as the
+    // dense f32 reference input. Any pitch-ignoring read picks up the slack.
     const int64_t C = 4, H = 9, W = 11, Wpad = W + 3;
     const int64_t wshape[] = {8, C, 3, 3};
 
@@ -939,22 +939,13 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
 // ============================================================
 
 NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
-    // get_ic_block() picks icn_block from karea alone — 64 at 1x1, 16 through
-    // 3x3, 8 through 5x5, 2 through 7x7, and 1 past that. One GEMM call reduces
-    // over icn_block * karea, so the ladder exists to hold that K roughly flat
-    // (in the 144-200 range) as the kernel area grows: a short K makes every
-    // ic-block re-read and rewrite the whole output tile and restart the
-    // packer, while a long one only costs col buffer.
-    //
-    // The correctness tables above now run every rung, but they only observe the
-    // result. Pin the ladder itself, so retuning the thresholds is a visible,
-    // deliberate change rather than a silent shift in how much traffic every
-    // 5x5/7x7 in the tree generates.
+    // The correctness tables above run every rung but only observe the result.
+    // Pin the ladder itself, so a threshold retune is a visible, deliberate
+    // change rather than a silent shift in what every 5x5/7x7 in the tree costs.
     struct Ladder { int64_t kh, kw, want_icn, stride; };
     const Ladder ladder[] = {
-        // karea 1 carries stride 2 on purpose: at unit stride with zero padding a
-        // 1x1 kernel takes the plan's pointwise path, which bypasses get_ic_block
-        // altogether, so this rung needs a strided case to stay on the ladder.
+        // karea 1 carries stride 2 on purpose: at unit stride a 1x1 takes the
+        // pointwise path, which bypasses get_ic_block altogether.
         {1, 1, 64, 2},   // karea  1
         {1, 5, 16, 1},   // karea  5  — inside the band the 3x3 cases use
         {3, 3, 16, 1},   // karea  9  — that band's edge
@@ -987,15 +978,12 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
         const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
             attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
 
-        // Every rung must stay on the im2col path — that is what makes the
-        // icn_block expectation below a statement about get_ic_block rather than
-        // about the pointwise shortcut.
+        // Staying on im2col is what makes the icn_block expectation a statement
+        // about get_ic_block rather than about the pointwise shortcut.
         NNOPS_EXPECT_FALSE(plan.pointwise);
         NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
         NNOPS_EXPECT_EQ(plan.icn_block, l.want_icn);
-        // The gather writes the packed panels directly, so the fp route carries
-        // no col matrix; what the kernel is handed is the packed-B block —
-        // icn_block channels x karea taps x oh_block output rows x OW columns.
+        // No col matrix on fp: the gather writes the packed-B panels directly.
         NNOPS_EXPECT_EQ(plan.col_size, 0);
         NNOPS_EXPECT_EQ(plan.pack_size,
                         expected_pack_size(plan, l.kh * l.kw, out_descs[0].dims[3]));
@@ -1003,12 +991,10 @@ NNOPS_TEST(conv2d_large_kernel_plan_ic_block_ladder) {
 }
 
 NNOPS_TEST(conv2d_fused_im2col_pack_matches_two_step) {
-    // tiled_im2col_2d_packed must land every value on the same panel slot the
-    // two-step route does (tiled_im2col_2d into [K][roi_area], then
-    // tile_pack_rhs into nr_max-wide panels): same gather, same padding, same
-    // zero-filled tail of the last panel. Both are pure re-orderings, so the
-    // region the MMA reads must match bit for bit — on f32 and f16, and across
-    // stride, dilation, padding and a roi that is not a whole number of panels.
+    // tiled_im2col_2d_packed must land every value on the same panel slot as
+    // tiled_im2col_2d into [K][roi_area] followed by tile_pack_rhs: both are
+    // pure re-orderings, so the region the MMA reads must match bit for bit —
+    // f32 and f16, tail panel and all.
     struct Case {
         int64_t ic, ih, iw, kh, kw, sh, sw, ph, pw, dh, dw;
         int64_t oh, ohc, ow;   // roi origin (output row), roi rows, roi width
@@ -1099,14 +1085,13 @@ NNOPS_TEST(conv2d_fused_im2col_pack_matches_two_step) {
 }
 
 NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominates) {
-    // The initial oh-block is ceil((PH+1)/kAlign)*kAlign, so a 3x3 stride-2 pad-1
-    // layer starts at 4 rows however short the plane is. A small plane with many
-    // filters then issued wide-M / narrow-N GEMMs and re-read the weight panel
-    // once per block. The expansion loop mirrors the halving loop above: when one
-    // block per (batch, group) already keeps half the pool busy — so the split
-    // buys no parallelism — and the per-group filter count exceeds the plane
-    // area (the proxy MLAS uses to pick its whole-plane ExpandThenGemm), grow the
-    // block to cover the plane. These cases pin both sides of that gate.
+    // A 3x3 stride-2 pad-1 layer starts at 4 rows however short the plane is, so
+    // a small plane with many filters issued wide-M / narrow-N GEMMs and re-read
+    // the weight panel once per block. The expansion loop mirrors the halving
+    // loop: when one block per (batch, group) already keeps half the pool busy —
+    // the split buys no parallelism — and the per-group filter count exceeds the
+    // plane area (the proxy MLAS uses for its whole-plane ExpandThenGemm), grow
+    // the block to cover the plane. These cases pin both sides of that gate.
     struct Case {
         std::array<int64_t,4> ishape; std::array<int64_t,4> wshape;
         int64_t kh, kw, sh, sw, ph, pw, groups; int nthreads;
@@ -1161,8 +1146,6 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
             NNOPS_EXPECT_EQ(plan.oh_chunks, 1);
         }
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
-        // The fp route has no col matrix at all — the gather is fused with the
-        // pack — so the scratch the kernel is handed is the packed-B block.
         NNOPS_EXPECT_EQ(plan.col_size, 0);
         NNOPS_EXPECT_EQ(plan.pack_size,
                         expected_pack_size(plan, c.kh * c.kw, out_descs[0].dims[3]));
@@ -1170,11 +1153,8 @@ NNOPS_TEST(conv2d_im2col_plan_expands_the_oh_block_when_the_filter_panel_dominat
 }
 
 NNOPS_TEST(conv2d_pointwise_routing) {
-    // A 1x1 kernel at unit stride with zero padding makes the im2col gather a
-    // dense row copy, so the plan drops the col buffer (col_size 0) and lifts
-    // icn_block off the get_ic_block(1) == 64 cap to the whole group. Pin the
-    // accept side and every reject side — each reject is a case where reading B
-    // off the input plane would be wrong.
+    // The accept side plus every reject side — each reject is a case where
+    // reading B off the input plane would be wrong.
     struct Case {
         std::array<int64_t,4> ishape, wshape;
         int64_t kh, kw, sh, sw, ph, pw, groups;
@@ -1185,8 +1165,7 @@ NNOPS_TEST(conv2d_pointwise_routing) {
         {{1, 64, 8, 8},   {16, 64, 1, 1},  1, 1, 1, 1, 0, 0, 1, true},
         // icg 128 past the 64 cap: the single K block is the whole group.
         {{1, 128, 8, 8},  {16, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 1, true},
-        // groups 2 at icg 128 — no extra guard is needed for groups; the
-        // group-relative channel stride is what makes that true.
+        // groups 2 at icg 128: the group-relative channel stride needs no guard.
         {{1, 256, 8, 8},  {32, 128, 1, 1}, 1, 1, 1, 1, 0, 0, 2, true},
         // stride 2: an output row is no longer a contiguous input row.
         {{1, 64, 16, 16}, {16, 64, 1, 1},  1, 1, 2, 2, 0, 0, 1, false},
@@ -1217,8 +1196,6 @@ NNOPS_TEST(conv2d_pointwise_routing) {
             attrs, descs, out_descs, /*num_threads=*/1, /*use_thread_slots=*/false);
 
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
-        // Neither route keeps a col matrix on fp: pointwise reads B off the
-        // input plane, everything else gathers straight into the packed panels.
         NNOPS_EXPECT_EQ(plan.col_size, 0);
         NNOPS_EXPECT_EQ(plan.pack_size,
                         expected_pack_size(plan, c.kh * c.kw, out_descs[0].dims[3]));
@@ -1228,13 +1205,10 @@ NNOPS_TEST(conv2d_pointwise_routing) {
         }
     }
 
-    // A pitched input has to stay on the im2col path, and the guard is the only
-    // thing that keeps it there: the pointwise B read takes roi_area contiguous
-    // elements per channel row, which holds only when the row pitch is IW itself.
-    // So build a padded buffer — W + 3 slack columns per row, zero filled, the
-    // same logical values as the dense reference input — and check both that the
-    // plan rejects it and that the values still come out right: any
-    // pitch-ignoring read would pick up the zero slack instead.
+    // A row pitch wider than IW must fall back to im2col: the pointwise B read
+    // takes roi_area contiguous elements per channel row. Build a padded buffer
+    // and check both that the plan rejects it and that the values come out right
+    // — any pitch-ignoring read would pick up the zero slack instead.
     const int64_t C = 128, H = 9, W = 11, Wpad = W + 3;
     const int64_t ishape[] = {1, C, H, W};
     const int64_t wshape[] = {16, C, 1, 1};
@@ -1269,8 +1243,7 @@ NNOPS_TEST(conv2d_pointwise_routing) {
     const auto pplan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
         attrs, pdescs, od, /*num_threads=*/1, /*use_thread_slots=*/false);
     NNOPS_EXPECT_FALSE(pplan.pointwise);
-    // Still the 1x1 rung of the ic-block ladder, with the packed-B scratch back
-    // (the gather handles the pitch; it writes the panels directly).
+    // Still the 1x1 ladder rung, with the packed-B scratch back.
     NNOPS_EXPECT_EQ(pplan.icn_block, int64_t{64});
     NNOPS_EXPECT_EQ(pplan.col_size, 0);
     NNOPS_EXPECT_EQ(pplan.pack_size, expected_pack_size(pplan, 1, W));
@@ -1283,11 +1256,9 @@ NNOPS_TEST(conv2d_pointwise_routing) {
 }
 
 NNOPS_TEST(conv2d_pointwise_epilogue_add_to) {
-    // The pointwise route skips the im2col gather but must still run the whole
-    // epilogue chain: bias seeded into the accumulator, the activation applied to
-    // bias + Σ, and the residual add on top of that. IC 128 also makes this the
-    // single-K-pass case, where no earlier ic-block seeds the accumulator, so the
-    // zero_mode / add_to interaction is pinned too.
+    // Pointwise skips the gather but still runs the epilogue chain: bias seeded
+    // into the accumulator, activation on bias + Σ, then the residual. IC 128
+    // also makes this the single-K-pass case, so zero_mode / add_to is pinned.
     const int64_t ishape[] = {1, 128, 9, 9};
     const int64_t wshape[] = {64, 128, 1, 1};
     const int64_t bshape[] = {64};
@@ -1307,7 +1278,7 @@ NNOPS_TEST(conv2d_pointwise_epilogue_add_to) {
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    // Pre-existing residual output, identical for the fast path and the ref.
+    // Same pre-seeded residual for both paths.
     std::vector<int64_t> out_shape(out_descs[0].dims.data(),
                                    out_descs[0].dims.data() + out_descs[0].rank);
     auto [res_vec, _] = test::make_random_tensor(out_shape, -0.5f, 0.5f, 514);
@@ -1334,8 +1305,8 @@ NNOPS_TEST(conv2d_pointwise_epilogue_add_to) {
 // tiled_im2col_3d kernel correctness (vs brute-force)
 // ============================================================
 NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
-    // tiled_im2col_3d must match a naive per-position gather for a spread of
-    // stride / padding / dilation / block-origin configs.
+    // tiled_im2col_3d vs a naive per-position gather, across stride / padding /
+    // dilation / block-origin.
     struct Cfg { int ID, IH, IW, KD, KH, KW, SD, SH, SW, DD, DH, DW, PD, PH, PW;
                  int rod, roh, row, rd, rh, rw; };
     const Cfg cfgs[] = {
@@ -1365,13 +1336,12 @@ NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
         nnops::kernel::tiled_im2col_3d<float>(
             col.data(), in,
             c.rod, c.roh, c.row, c.rd, c.rh, c.rw,
-            c.PD, c.PH, c.PW,   // local padding == global (block covers from origin in first 3 cfg)
+            c.PD, c.PH, c.PW,   // same pad twice: no block starts inside the padded band
             c.PD, c.PH, c.PW,
             1, c.ID, c.IH, c.IW,
             icn_step, id_step, ih_step,
             c.KD, c.KH, c.KW, c.SD, c.SH, c.SW, c.DD, c.DH, c.DW);
 
-        // Brute-force reference.
         bool ok = true;
         for (int kd = 0; kd < c.KD && ok; ++kd) {
             for (int kh = 0; kh < c.KH && ok; ++kh) {
@@ -1404,14 +1374,10 @@ NNOPS_TEST(conv3d_im2col_kernel_matches_ref) {
 // ============================================================
 
 NNOPS_TEST(conv2d_wide_frame_plan) {
-    // A 1280-wide frame is the first plane in the suite that is not square.
-    // The plan's block heuristics are the same ones the 224 tests pin, but the
-    // width makes every OW-dependent quantity (the col panel, the N side of the
-    // GEMM, the nr panels per row) different from OH, and the row count turns
-    // the oh walk into hundreds of blocks. These are the front layers of
-    // ResNet50 / VGG16 at that frame size: the stem (7x7 s2, icn 2), VGG block1
-    // (3x3 at full resolution, icn 16), and the ResNet 1x1 expand at a quarter
-    // resolution, which takes the pointwise route with no col buffer at all.
+    // The first non-square plane in the suite: OW diverges from OH in every
+    // OW-dependent quantity (col panel, GEMM N side, nr panels per row) and the
+    // oh walk becomes hundreds of blocks. ResNet50 / VGG16 front layers: the 7x7
+    // stem, a 3x3 at full resolution, and the 1x1 expand (pointwise, no col).
     struct Case {
         int64_t N, IC, IH, IW, OC, K, S, PH, PW;
         int64_t want_oh, want_ow, want_icn, want_ocn, want_ohb, want_blocks;
@@ -1430,8 +1396,7 @@ NNOPS_TEST(conv2d_wide_frame_plan) {
     };
 
     // Shape inference and the plan read descriptors only, so one placeholder
-    // element stands in for the data pointer: a 960p VGG plane is 314 MB and
-    // nothing here would ever touch it.
+    // element stands in for the data: a 960p VGG plane is 314 MB.
     float placeholder = 0.0f;
     for (const Case& c : cases) {
         const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
@@ -1458,8 +1423,6 @@ NNOPS_TEST(conv2d_wide_frame_plan) {
         NNOPS_EXPECT_EQ(plan.num_oh_blocks, c.want_blocks);
         NNOPS_EXPECT_EQ(plan.oh_chunks, std::min<int64_t>(c.nt, c.want_blocks));
         NNOPS_EXPECT_EQ(plan.pointwise, c.want_pointwise);
-        // No col matrix on the fp route; the packed-B block the kernel is
-        // handed is icn x karea taps x oh_block rows x the frame's output width.
         NNOPS_EXPECT_EQ(plan.col_size, 0);
         NNOPS_EXPECT_EQ(plan.pack_size,
                         expected_pack_size(plan, c.K * c.K, c.want_ow));
@@ -1467,12 +1430,10 @@ NNOPS_TEST(conv2d_wide_frame_plan) {
 }
 
 NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
-    // A small output plane cannot fill a wide pool from its oh-blocks alone: a
-    // 7x7 plane is two four-row blocks and that is the whole supply. The plan
-    // therefore splits the filter rows as well, so the task grid is
-    // (batch, group) x oh-chunks x oc-chunks. These are the tails of a 224
-    // ResNet-18, where that supply is the difference between two working threads
-    // and a full pool, plus the cases that must stay on the plane axis alone.
+    // A small plane cannot fill a wide pool from its oh-blocks alone (7x7 is two
+    // four-row blocks), so the plan also splits filter rows: the task grid is
+    // (batch, group) x oh-chunks x oc-chunks. The tails of a 224 ResNet-18, plus
+    // the cases that must stay on the plane axis alone.
     struct Case {
         int64_t IC, IH, OC, K, S, nt;
         int64_t want_ocn, want_ohb, want_oc_chunks;
@@ -1490,7 +1451,8 @@ NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
         // 56x56 plane: fourteen oh-chunks fill the pool on their own and a
         // filter split there would re-gather B for nothing.
         { 64, 56, 128, 3, 2, 20, 128, 2, 1},
-        // One filter block cannot be split at all — 20 threads must make do.
+        // Same plane at OC 64 (a single filter block) and 20 threads: fourteen
+        // plane tasks already pass the half-pool gate, so no filter split.
         { 64, 56,  64, 3, 1, 20,  64, 4, 1},
         // A plane whose block count is ODD: 17 rows over two-row blocks is 9,
         // so 20 threads want 2 chunks (18 tasks, one wave) and the ceiling
@@ -1523,18 +1485,18 @@ NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
         // Slots follow the task grid, which now counts the filter axis.
         const int64_t tasks = plan.oh_chunks * plan.oc_chunks;
         NNOPS_EXPECT_EQ(plan.num_slots, std::min<int64_t>(c.nt, tasks));
-        // Every task must own at least one filter row: the even split floors.
+        // Every task keeps at least two M panels of filter rows (2 * 6): the
+        // even split floors there.
         NNOPS_EXPECT_TRUE(c.OC / plan.oc_chunks >= 2 * 6);
     }
 }
 
 NNOPS_TEST(conv2d_plan_slots_follow_workers_not_items) {
-    // A backend may hand its operators an over-subscribed task grid: the same
-    // workers, told there are `items` times as many tasks as there are of them,
-    // so a hybrid part's fast cores can claim the tail instead of idling
-    // through it. Per-slot scratch must follow the *worker* count, not that
-    // inflated figure — four times the arena for four times the items would
-    // push the pack/accumulator scratch out of cache for nothing.
+    // A backend may hand operators an over-subscribed grid — the same workers,
+    // told there are `items` times as many tasks — so a hybrid part's fast cores
+    // can claim the tail instead of idling through it. Per-slot scratch follows
+    // the *worker* count: four times the arena would push the pack/accumulator
+    // scratch out of cache for nothing.
     const int64_t ishape[] = {1, 256, 14, 14};
     const int64_t wshape[] = {256, 256, 3, 3};
     float placeholder = 0.0f;
@@ -1577,7 +1539,7 @@ NNOPS_TEST(conv2d_plan_slots_follow_workers_not_items) {
 NNOPS_TEST(conv2d_oversubscribed_grid_matches_serial) {
     // The over-subscribed grid is a scheduling choice, not a numeric one: a
     // worker claiming task 57 must produce exactly what the equal split did,
-    // including on the per-slot scratch it reuses across tasks.
+    // including on the per-slot scratch it reuses.
     const int64_t ishape[] = {1, 64, 28, 28};
     const int64_t wshape[] = {64, 64, 3, 3};
     auto [in_vec, input]   = test::make_random_tensor(ishape, -1.0f, 1.0f, 911);
@@ -1611,9 +1573,9 @@ NNOPS_TEST(conv2d_oversubscribed_grid_matches_serial) {
 }
 
 NNOPS_TEST(conv2d_small_plane_oc_split_matches_ref) {
-    // The filter split is only a partition of the oc loop, so every thread
-    // configuration must reproduce the serial result — and the 20-thread plan
-    // here really does split (ten filter chunks of a 14x14 plane).
+    // The filter split is only a partition of the oc loop, so every thread count
+    // must reproduce the serial result — and the 20-thread plan here really does
+    // split (ten filter chunks of a 14x14 plane).
     const int64_t ishape[] = {1, 32, 14, 14};
     const int64_t wshape[] = {64, 32, 3, 3};
     auto [in_vec, input]   = test::make_random_tensor(ishape, -1.0f, 1.0f, 901);
@@ -1652,15 +1614,14 @@ NNOPS_TEST(conv2d_small_plane_oc_split_matches_ref) {
 }
 
 NNOPS_TEST(conv2d_wide_frame_matches_ref) {
-    // 1280x720 through a 3x3 layer and a 1x1 pointwise layer — VGG16's first
-    // conv and ResNet50's conv2_x 1x1 at that frame size. The tiled path runs
-    // the full plane (103 oh-blocks, 80 nr panels across a row); the reference
-    // is run on a crop of the top rows and only those rows are compared, since
-    // output row r of a 3x3 reads at most input row r+1 (a 66-row crop is exact
-    // for the first 64) and a full-frame reference is not affordable. The full
-    // output is checked for thread-identity: the chunks own disjoint row
-    // ranges, so 4 threads must reproduce the serial result bit for bit — that
-    // is where a per-chunk row offset or a missed halo would show.
+    // 1280x720 through a 3x3 and through a 1x1. The tiled path runs the full
+    // plane (103 oh-blocks, 80 nr panels across a row) but a full-frame
+    // reference is not affordable, so the reference runs on the top rows and
+    // only those are compared: output row r of a 3x3 reads at most input row
+    // r+1, so a 66-row crop is exact for the first 64. The full output is then
+    // checked for thread identity — disjoint row ranges, so 4 threads must
+    // reproduce the serial result bit for bit, which is where a per-chunk row
+    // offset or a missed halo would show.
     const int64_t ishape[] = {1, 3, 720, 1280};
     const int64_t wshape[] = {8, 3, 3, 3};
     const int64_t IH = ishape[2], IW = ishape[3];
@@ -1680,11 +1641,11 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
     const int64_t OH = out_descs[0].dims[2], OW = out_descs[0].dims[3];
     const int64_t out_numel = out_descs[0].numel();
 
-    // The wide walk must actually be the one under test. With IC 3 the single
-    // ic-block is 3x9x1280 = 34560 col elements per row, so the 256K-element
-    // col budget still allows 7 rows and the growth loop takes them (the same
-    // plane at IC 64 is pinned to 4 — see conv2d_wide_frame_plan). Either way
-    // the plane is walked in a hundred-odd blocks of a few rows.
+    // The wide walk must actually be the one under test: with IC 3 the ic-block
+    // is 3x9x1280 = 34560 col elements per row, so the 256K-element col budget
+    // allows 7 rows (the same plane at IC 64 is pinned to 4 — see
+    // conv2d_wide_frame_plan). Either way it is a hundred-odd blocks of a few
+    // rows.
     const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(attrs, descs, out_descs, 1, false);
     NNOPS_EXPECT_EQ(plan.oh_block, int64_t{7});
     NNOPS_EXPECT_EQ(plan.num_oh_blocks, int64_t{103});
@@ -1736,9 +1697,9 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
     std::printf("      wide frame 3x3 (1280x720): max deviation %.6f\n", worst);
     NNOPS_EXPECT_NEAR(worst, 0.0f, 1e-4f);
 
-    // 1x1 pointwise on a 1280-wide plane: B comes straight off the input with
-    // no col buffer, so the per-chunk row base is the only thing locating B.
-    // There is no halo, so a 32-row crop is exact.
+    // 1x1 pointwise on a 1280-wide plane: B comes straight off the input with no
+    // col buffer, so the per-chunk row base is the only thing locating B. There
+    // is no halo, so a 32-row crop is exact.
     {
         const int64_t pshape[] = {1, 8, 180, 1280};
         const int64_t pwshape[] = {16, 8, 1, 1};
@@ -1798,12 +1759,6 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
 // ============================================================
 // The prepacked filter — Conv2D::prepackWeights on the planar route
 // ============================================================
-//
-// A planar float filter already *is* the GEMM's A operand, so its prepacked
-// form is a densified [OC][IC/G·KH·KW] copy: what the two-step contract buys
-// here is a total one — every supported filter has exactly one prepacked form,
-// so a graph engine can prepack unconditionally and hand the blob to compute()
-// on any route. What it must not change is a single output byte.
 
 NNOPS_TEST(conv2d_prepacked_filter) {
     struct Case {
@@ -1849,8 +1804,8 @@ NNOPS_TEST(conv2d_prepacked_filter) {
         attrs.stride      = {c.S, c.S};
         attrs.padding     = {c.PH, c.PH};
         attrs.groups      = c.G;
-        // Auto builds the Winograd U for a k3s1 fp filter; the im2col panels
-        // are what this route's prepack produces, so say which one is meant.
+        // Auto builds the Winograd U for a k3s1 fp filter; this route's prepack
+        // produces the im2col panels, so pin the algorithm.
         attrs.algorithm   = ConvAlgorithm::ImplicitGemm;
 
         auto op = Conv2D::create(attrs, Backend::CPU);
@@ -1862,7 +1817,6 @@ NNOPS_TEST(conv2d_prepacked_filter) {
         const auto od = op->getOutputTensorDesc(descs);
         const int64_t out_n = od[0].numel();
 
-        // The raw filter's output is the reference.
         std::vector<float> raw_buf(static_cast<size_t>(out_n));
         auto raw_out = test::make_planar(od[0], raw_buf.data());
         NNOPS_EXPECT_EQ(op->compute(raw_out, ins, {}, nullptr), Status::ok);
@@ -1876,10 +1830,9 @@ NNOPS_TEST(conv2d_prepacked_filter) {
         NNOPS_EXPECT_TRUE(q.rank() > 0);
         NNOPS_EXPECT_EQ(q.layout(), TensorLayout::PackedOIHW);
         NNOPS_EXPECT_EQ(q.shape(0), c.OC);
-        // Dense [OC][IC/G·KH·KW]: the copy is the whole pack, and the buffer
-        // the caller allocates is exactly that matrix.
+        // Dense [OC][IC/G·KH·KW]: the copy is the whole pack, and numel() is the
+        // buffer size the caller allocates from.
         NNOPS_EXPECT_EQ(q.shape(1), ICG * c.K * c.K);
-        // numel() is the buffer size a caller sizes its allocation from.
         NNOPS_EXPECT_EQ(q.desc().numel(), q.shape(0) * q.shape(1));
 
         std::vector<float> blob(static_cast<size_t>(q.storage_bytes() / sizeof(float)));

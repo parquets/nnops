@@ -1,23 +1,43 @@
 #pragma once
 /// @file linear_attention.hpp
-/// @brief LinearAttention operator — gated linear attention with recurrent state.
+/// @brief LinearAttention operator — gated linear attention with a recurrent
+///        state.
 ///
-/// Implements O(n) linear attention (Gated Delta Net / KDA) as an alternative
-/// to O(n²) softmax attention. Instead of an explicit KV-cache, a fixed-size
-/// recurrent hidden state matrix [head_dim, head_dim] per head is maintained
-/// and updated at each step.
+/// O(n) linear attention (Gated Delta Net / KDA) instead of O(n²) softmax: no
+/// KV cache, one fixed [D, D] state per kv head. The op is stateless — the
+/// caller owns that state as outputs[1], initializes it once and reuses it each
+/// step; the kernel reads the old state and overwrites it in place (with S == 1
+/// this is incremental decoding).
 ///
-/// The operator is stateless: all recurrent state memory is owned by the caller
-/// and passed as input/output tensors.
+/// Per (batch, kv head) and token t:
+///   1. gate_t[i] = exp(Gate[t, i]);  S[i][:] *= gate_t[i]   decay
+///   2. r[j]      = sum_i S[i][j] * k_t[i]                   retrieve (decayed S)
+///   3. d[j]      = beta_t * (v_t[j] - r[j])                 delta correction
+///   4. S[i][j]  += k_t[i] * d[j]                            rank-1 update
+///   5. o_t[j]    = scale * sum_i q_t[i] * S[i][j]           readout
+/// Steps 1-4 are per kv head, step 5 per query head: ORT's `update_rule =
+/// "gated_delta"`. llama.cpp's ggml_gated_linear_attn omits the delta term.
 ///
-/// References: onnxruntime com.microsoft::LinearAttention (the `update_rule`
-/// modes, of which this op implements `gated_delta` — ORT's default), and
-/// llama.cpp ggml_gated_linear_attn (ggml.h:2523) / ggml_gated_delta_net.
+/// Inputs (4 required, 2 optional). The optional slots are *positional*: an
+/// omitted input is an empty TensorView, so later entries shift up only when the
+/// omission is a suffix.
+///   [0] Q [B,H,S,D]   [1] K [B,H_kv,S,D]   [2] V [B,H_kv,S,D]
+///   [3] Gate [B,H_kv,S,D] log-space decay  [4] conv_w [C,1,K] optional
+///   [5] beta [B,H_kv,S] optional update rate, default 1.0
+/// `{Q,K,V,Gate,beta}` does not ask for beta without a conv — beta lands in the
+/// conv_w slot; ask with `{Q,K,V,Gate,{},beta}`.
 ///
-/// @note The default `beta` (1.0) makes this a *gated delta* rule with a
-/// `(V - K@S)` correction term. That is NOT the same as llama.cpp's
-/// ggml_gated_linear_attn, which has no such term; the two differ by
-/// `beta * K^T @ (K @ S)`.
+/// H_kv = num_kv_heads (or num_heads when 0); C = (H + 2*H_kv) * D, with the
+/// conv channels packed Q | K | V and one tap set each (depthwise), shared
+/// across the batch. Causal, zeros left of t = 0:
+/// y[t] = sum_k conv_w[:,k] * x[t-(K-1)+k]. The conv runs iff conv_w is present,
+/// and its tap count must then equal conv_kernel_size (the attribute only
+/// checks).
+///
+/// Gate has H_kv heads, not H: the state belongs to the kv head, so several
+/// query heads under GQA share one state and one decay.
+///
+/// Outputs: [0] [B,H,S,D] result, [1] [B,H_kv,D,D] state.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -29,97 +49,25 @@
 
 namespace nnops {
 
-/// Attributes for the LinearAttention (gated linear attention) operator.
-///
-/// Static configuration set at operator creation time. Dynamic per-step
-/// values (token count, sequence count) are derived from input shapes.
 struct LinearAttentionAttributes {
-    /// Per-head state dimension (S). Same dimension for Q, K, V, and Gate.
-    /// This is the key dimension that determines the recurrent state size.
+    /// Per-head state dimension (S), shared by Q, K, V and Gate.
     int64_t head_dim = 64;
 
-    /// Number of query attention heads (H).
+    /// Query heads (H).
     int64_t num_heads = 8;
 
-    /// Number of key/value heads for GQA (Grouped Query Attention).
-    /// When 0 (default), equals num_heads (standard, no grouping).
-    /// When < num_heads, each KV head is shared by num_heads/num_kv_heads query heads.
+    /// Key/value heads for GQA. 0 means num_heads (no grouping); otherwise
+    /// each kv head is shared by num_heads / num_kv_heads query heads.
     int64_t num_kv_heads = 0;
 
-    /// Scaling factor. If 0, auto-computed as 1/sqrt(head_dim).
+    /// Attention scale; 0 means 1/sqrt(head_dim).
     float scale = 0.0f;
 
-    /// Short causal convolution kernel size applied to Q, K, V before the
-    /// recurrent update. Set to 0 to disable.
-    ///
-    /// @note This is only *checked* against the supplied convolution weights —
-    /// it does not turn the convolution on. The causal conv runs iff the
-    /// optional `conv_w` input is present, in which case its tap count must
-    /// equal this attribute. Omitting `conv_w` skips the convolution entirely,
-    /// whatever this value is (so the 4-input form of the op stays valid).
+    /// Causal conv tap count, checked against conv_w — it does not enable the
+    /// conv. See the file header: the conv runs iff conv_w is present.
     int64_t conv_kernel_size = 4;
 };
 
-/// Gated Linear Attention with recurrent state (class-based API).
-///
-/// Per (batch, kv head), carrying a state matrix S[D, D] over the sequence,
-/// every token t runs a single fused pass:
-///
-///   1. gate_t[i] = exp(Gate[t, i])            apply the decay to S row-wise
-///      S[i][:]  *= gate_t[i]
-///   2. r[j]      = sum_i S[i][j] * k_t[i]     retrieval, on the *decayed* S
-///   3. d[j]      = beta_t * (v_t[j] - r[j])   delta correction
-///   4. S[i][j]  += k_t[i] * d[j]              rank-1 update
-///   5. o_t[j]    = scale * sum_i q_t[i] * S[i][j]   read out with Q
-///
-/// Q/K/V are the (optionally causal-conv'd) rows; steps 1-4 are shared by every
-/// query head in a GQA group, step 5 runs once per query head. This is exactly
-/// ORT's `update_rule = "gated_delta"`: substituting `S' = exp(g)·S` gives
-/// `S_new = S*exp(gate) + K^T * (V - K*S) * beta`, i.e. the `K @ S` term is
-/// evaluated on the decayed state.
-///
-/// `scale` defaults to `1/sqrt(head_dim)` when the attribute is 0.
-///
-/// Unlike Attention which keeps all past K/V in a growing cache, LinearAttention
-/// maintains a fixed-size recurrent state matrix [D, D] per head.
-/// State is placed in outputs (like Attention's K_cache / V_cache):
-/// the caller initializes it once (to zeros or a checkpoint), then passes the
-/// same buffer every step. The kernel reads the old state and overwrites it
-/// with the new state in-place.
-///
-/// The sequence is processed whole: with `S == 1` and a carried State, the same
-/// formulation degenerates to single-token incremental decoding.
-///
-/// Inputs (4 required, 2 optional). The optional slots are *positional*: an
-/// omitted input is marked by an empty TensorView, and everything after it
-/// shifts up only when the omission is a suffix.
-///   inputs[0] = Q      [B, H,    S, D]    query
-///   inputs[1] = K      [B, H_kv, S, D]    key
-///   inputs[2] = V      [B, H_kv, S, D]    value
-///   inputs[3] = Gate   [B, H_kv, S, D]    decay/forget gate, in log space
-///   inputs[4] = conv_w [C, 1, K]          optional; causal depthwise conv1d
-///   inputs[5] = beta   [B, H_kv, S]       optional; update rate, default 1.0
-///
-/// So `{Q,K,V,Gate,beta}` is *not* a valid way to ask for beta without a
-/// convolution: beta would land in the conv_w slot and be read as tap weights.
-/// Supply beta as the sixth entry with an empty TensorView in the fifth:
-/// `{Q,K,V,Gate,{},beta}`. Dropping conv_w is only unambiguous when beta is
-/// dropped with it.
-///
-///   where H_kv = num_kv_heads (or num_heads when the attribute is 0) and
-///   C = (H + 2*H_kv) * D. The convolution channels are packed Q | K | V, in
-///   that order, so channels [0, H*D) are Q, [H*D, H*D + H_kv*D) are K, and the
-///   rest are V. Each channel gets its own K taps (depthwise); the weights are
-///   shared across the batch. The conv is causal, with zeros left of t = 0:
-///   y[t] = sum_{k=0}^{K-1} conv_w[:, k] * x[t - (K-1) + k].
-///
-///   Note the Gate head count is H_kv, not H: the recurrent state belongs to
-///   the kv head, so the decay must too — under GQA several query heads share
-///   one state and therefore one decay.
-///
-/// Outputs (2):
-///   outputs[0] = Output [B, H,    S, D]   attention result
-///   outputs[1] = State  [B, H_kv, D, D]   recurrent state (read then overwritten)
 class LinearAttention : public OpBase {
 public:
     static std::unique_ptr<LinearAttention> create(
@@ -151,7 +99,7 @@ public:
 
     const LinearAttentionAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in linear_attention.cpp (Pimpl pattern)
+    struct Impl;
     ~LinearAttention();
 
 private:

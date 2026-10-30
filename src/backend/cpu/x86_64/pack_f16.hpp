@@ -2,16 +2,24 @@
 /// @file pack_f16.hpp
 /// @brief x86_64 F16C pack kernels for GEMM LHS/RHS (float16).
 ///
-/// Data is stored as uint16_t (half) in memory. F16C intrinsics
-/// (_mm256_cvtph_ps / _mm256_cvtps_ph) convert on the fly between the
-/// fp16 storage format and fp32 accumulators.
+/// Storage is uint16_t (half). The transposing (LHS) vector loops load 8 halves
+/// per row, convert to fp32 with F16C, run the same transpose_Nx8_f32 the f32
+/// packs use, apply `scale` (an fp32 multiply in any case), and round back to
+/// f16 on store; that transpose is what sets the panel order — the MMA kernels
+/// read [K][n] with n contiguous per k. The RHS copies scale and round the same
+/// way, a row at a time.
 ///
-/// Every kernel takes the live source width, defaulting to its own panel
-/// width N: `mr` for the transposing (LHS) kernels, `nr` for the row-major
-/// (RHS) copies. A partial panel needs no separate tail kernel — rows past
-/// `mr` alias the last live row, the same broadcast the MMA kernels apply to
-/// a short A panel, and columns past `nr` are zero-filled so a short B panel
-/// costs the runtime-width MMA kernel nothing.
+/// Every kernel takes the live source width, defaulting to its own panel width:
+/// `mr` for the transposing (LHS) kernels, `nr` for the row-major (RHS) copies.
+/// A partial panel needs no separate tail kernel:
+///   - LHS rows past `mr` alias the last live row — the same broadcast the
+///     MMA kernels apply to a short A panel — so a partial-M panel needs no
+///     padding. n1 walks k directly (`ir_step` and `mr` unused).
+///   - RHS copies read only their live columns and zero-fill the dead ones, so
+///     the 16-wide panel always presents all 16 lanes. From n4 up a short
+///     panel's load is masked at 32-bit (half-pair) granularity, with the one
+///     half that can sit in a masked-off pair spliced back in.
+/// The n24 transposing panel is scalar — there is no 24-wide transpose helper.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/x86_64/pack_f16.hpp
 
@@ -26,28 +34,18 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-// The vector loops convert to f32 and run the SAME transpose_Nx8_f32 the
-// f32 packs use, then round back to f16 on store; no extra conversions,
-// since the scale multiply already round-trips through f32. This matters
-// because the pack stores its registers linearly and the mma kernels read
-// the panel as [K][n] (n contiguous per k): only the f32 transposes
-// produce that order. A 16-bit-lane butterfly cannot express it (mr=6
-// panels interleave two k's per register).
-
 inline void pack_trans_n1_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 1) noexcept {
     for (int k = 0; k < K; ++k) {
         *output++ = float_to_half(half_to_float(input[0]) * scale);
-        input += 1;  // consecutive k within the M×K source row
+        input += 1;
     }
 }
 
 inline void pack_trans_n4_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 4) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -83,7 +81,6 @@ inline void pack_trans_n4_f16(half* NNOPS_RESTRICT output,
 
         output += 4 * 8;
     }
-    // scalar tail (p0..p3 already point at k = 8*nblocks in each row)
     for (; k < K; ++k) {
         *output++ = float_to_half(half_to_float(*p0++) * scale);
         *output++ = float_to_half(half_to_float(*p1++) * scale);
@@ -95,8 +92,6 @@ inline void pack_trans_n4_f16(half* NNOPS_RESTRICT output,
 inline void pack_trans_n6_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 6) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -157,8 +152,6 @@ inline void pack_trans_n6_f16(half* NNOPS_RESTRICT output,
 inline void pack_trans_n8_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 8) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const half* p[8];
     for (int i = 0; i < 8; ++i) {
@@ -191,14 +184,9 @@ inline void pack_trans_n8_f16(half* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 16-wide transposing panel. Rows past `mr` alias the last live row,
-/// so a partial-M panel needs no padding and the kernel never reads past the
-/// tile — only the aliased pointer list differs from the full-panel case.
 inline void pack_trans_n16_f16(half* NNOPS_RESTRICT output,
                                const half* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 16) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const half* p[16];
     for (int i = 0; i < 16; ++i) {
@@ -236,7 +224,6 @@ inline void pack_trans_n16_f16(half* NNOPS_RESTRICT output,
 inline void pack_trans_n24_f16(half* NNOPS_RESTRICT output,
                                const half* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 24) noexcept {
-    // Pure scalar path for wide N=24 panel — rarely called.
     const int last = (mr > 1) ? mr - 1 : 0;
     int row[24];
     for (int i = 0; i < 24; ++i) {
@@ -259,11 +246,6 @@ inline void pack_copy_n1_f16(half* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 4-wide row-major panel. One k loop covers every width: the load is
-/// masked at 32-bit (half-pair) granularity, and the single half that can sit
-/// in a masked-off pair is spliced back in, so a short panel never reads past
-/// its live columns. Even at full width this beats the old scalar body, where
-/// four software half<->float conversions ran per k.
 inline void pack_copy_n4_f16(half* NNOPS_RESTRICT output,
                              const half* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 4) noexcept {
@@ -285,8 +267,6 @@ inline void pack_copy_n4_f16(half* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 6-wide row-major panel (see n4). One masked 8-half load covers all
-/// six live lanes; the store is a 4-half word plus the trailing pair.
 inline void pack_copy_n6_f16(half* NNOPS_RESTRICT output,
                              const half* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 6) noexcept {
@@ -374,10 +354,6 @@ inline void pack_copy_n8_f16(half* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 16-wide row-major panel. Columns past `nr` are zero-filled so the
-/// runtime-width MMA kernels can load all 16 lanes of every k; a short panel
-/// reads through one pair-masked 32-byte load, which never touches a dead
-/// column.
 inline void pack_copy_n16_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr = 16) noexcept {

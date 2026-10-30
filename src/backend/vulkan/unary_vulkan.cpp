@@ -1,22 +1,19 @@
 /// @file unary_vulkan.cpp
 /// @brief Vulkan compute implementation of element-wise unary math operations.
 ///
-/// Uses pre-compiled SPIR-V compute shaders and specialization constants
-/// for the operation type (Exp/Log/Sin/Cos/Tan/Tanh/Abs/Neg/Sqrt) and add_to flag.
-///
-/// Supports f32 and f16 (requires VK_KHR_16bit_storage for f16).
+/// Pre-compiled SPIR-V shaders with specialization constants for the op
+/// (Exp/Log/Sin/Cos/Tan/Tanh/Abs/Neg/Sqrt) and the add_to flag. Supports f32 and
+/// f16; the f16 shader needs 16-bit storage (GL_EXT_shader_16bit_storage) and
+/// computes in fp32, widening loads and narrowing stores.
 ///
 /// Design:
-///   - One compute pipeline per (dtype, op_type, add_to) combination.
-///   - Pipelines are lazily created and cached via VulkanPipelineCache.
-///   - Per-call descriptor set allocated from user-provided pool.
-///   - All arithmetic is performed in fp32; fp16 loads widen and stores narrow.
+///   - One compute pipeline per (device, dtype, op, add_to), created lazily and
+///     cached in VulkanPipelineCache.
+///   - The descriptor set is allocated per call from the caller's pool.
 ///
-/// Requires ComputeContext fields:
-///   - vulkan_cmd_buffer:      VkCommandBuffer to record into
-///   - vulkan_device:          VkDevice handle
-///   - vulkan_descriptor_pool: VkDescriptorPool (FREE_DESCRIPTOR_SET_BIT)
-///   - vulkan_buffers:         array of VkBuffer handles [input, output]
+/// Requires ComputeContext: vulkan_cmd_buffer, vulkan_device,
+/// vulkan_descriptor_pool (FREE_DESCRIPTOR_SET_BIT), and vulkan_buffers holding
+/// [input, output].
 
 #include "vulkan_common.hpp"
 #include "unary_f32_spv.h"
@@ -25,10 +22,6 @@
 #include "nnops/detail/assert.hpp"
 
 namespace nnops::backend::vulkan {
-
-// ============================================================
-// Helpers to map enums to specialization constants
-// ============================================================
 
 static constexpr uint32_t unary_op_to_spec(UnaryType type) noexcept {
     switch (type) {
@@ -45,10 +38,6 @@ static constexpr uint32_t unary_op_to_spec(UnaryType type) noexcept {
     return 0;
 }
 
-// ============================================================
-// Entry point
-// ============================================================
-
 void unary_vulkan(
     const UnaryAttributes& attrs,
     TensorView& /*output*/,
@@ -60,7 +49,6 @@ void unary_vulkan(
     const int64_t total = input.numel();
     if (total == 0) { return; }
 
-    // ---- Select SPIR-V blob based on data type ----
     const auto dtype = input.data_type();
     const uint32_t* spirv_data = nullptr;
     size_t spirv_size = 0;
@@ -79,16 +67,13 @@ void unary_vulkan(
         return;
     }
 
-    // ---- Extract Vulkan resources from context ----
     VkCommandBuffer  cmd    = static_cast<VkCommandBuffer>(ctx.vulkan_cmd_buffer);
     VkDevice         device = static_cast<VkDevice>(ctx.vulkan_device);
     VkDescriptorPool pool   = static_cast<VkDescriptorPool>(ctx.vulkan_descriptor_pool);
 
-    // vulkan_buffers layout: [input, output]
     NNOPS_ASSERT(ctx.vulkan_buffers_count >= 2);
     const VkBuffer* bufs = static_cast<const VkBuffer*>(ctx.vulkan_buffers);
 
-    // ---- Get or create compute pipeline ----
     auto& cache = VulkanPipelineCache::instance();
     PipelineKey key = {};
     key.device       = device;
@@ -104,11 +89,9 @@ void unary_vulkan(
         return;
     }
 
-    // ---- Record dispatch commands ----
     ComputePushConstants pc = {};
     pc.total = static_cast<int32_t>(total);
 
-    // Buffer bindings: [0]=input, [1]=output
     VkBuffer dispatch_buffers[2] = { bufs[0], bufs[1] };
 
     vulkan_record_dispatch(cmd, device, pool, pipeline,

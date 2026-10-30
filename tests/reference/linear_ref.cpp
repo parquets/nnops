@@ -8,9 +8,11 @@
 ///   - f32/f16 input and weight          → output follows the input dtype
 ///   - u8/s8 input × s8 weight (quantized) → output f32/f16, or s32/s8/u8
 ///
-/// An integer output takes an int32 [N] bias and runs MatMul's integer output
-/// pass (compensate, bias, Relu, requant). The quantized path uses the same
-/// expression as MatMul's int8 epilogue:
+/// The element types pick the branch: an integral input is the quantized path,
+/// an integral output its integer destination, which takes an int32 [N] bias
+/// (no add_to) and runs MatMul's integer output pass — compensate, bias, Relu,
+/// requant. The quantized path uses the same expression as MatMul's int8
+/// epilogue:
 ///
 ///   acc = Σ_k (x[m,k] − zp_x[m]) · (w[n,k] − zp_w[n])
 ///   f   = acc · s_x[m] · s_w[n]
@@ -37,14 +39,12 @@ using nnops::backend::cpu::float_to_half;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 
-/// Read one operand element as float (half widens through F16C-equivalent).
 template <class T>
 inline float as_float(T v) noexcept {
     if constexpr (std::is_same_v<T, half>) { return half_to_float(v); }
     else { return static_cast<float>(v); }
 }
 
-/// Store one result element in the output type.
 template <class T>
 inline void store_as(T& dst, float v) noexcept {
     if constexpr (std::is_same_v<T, half>) { dst = float_to_half(v); }
@@ -58,8 +58,7 @@ inline float scale_at(const QuantParams& q, int64_t idx) noexcept {
     return (q.scale_data != nullptr) ? q.scale_data[idx] : q.scale;
 }
 
-/// XT = input element, WT = weight element (same as XT for fp, int8_t for the
-/// quantized path), CT = output element.
+/// XT/WT: input/weight element type; CT: output element type.
 template <class XT, class WT, class CT>
 void linear_ref_impl(const LinearAttributes& attrs,
                      TensorView& output,
@@ -74,10 +73,6 @@ void linear_ref_impl(const LinearAttributes& attrs,
     const int64_t N = w.shape(0);
     const int64_t rows = (x.rank() >= 2) ? x.total_rows() : 1;
 
-    // The element types select the path: integral operands are the quantized
-    // (u8|s8 × s8) case, floating-point operands the fp case. An integral CT is
-    // the quantized path's integer destination (s32 / s8 / u8), where the bias
-    // is an int32 and Relu + the requant replace the fp epilogue.
     constexpr bool quant   = std::is_integral_v<XT>;
     constexpr bool int_out = std::is_integral_v<CT>;
     NNOPS_ASSERT(!has_bias || inputs[2].data_type() ==
@@ -93,13 +88,12 @@ void linear_ref_impl(const LinearAttributes& attrs,
     [[maybe_unused]] const int32_t* int_bias =
         (has_bias && int_out) ? inputs[2].ptr<int32_t>() : nullptr;
 
-    // The output requant's parameters, read only for an integral destination.
     [[maybe_unused]] const QuantParams& qc = output.quant_params();
     [[maybe_unused]] const float out_scale = scale_at(qc, 0);
     [[maybe_unused]] const int32_t zp_out = zp_at(qc, 0);
 
-    // Raw reductions of W: r_b[n] = Σ_k W[n,k]. Needed only on the quantized
-    // path (the compensation subtracts zp_w·r_x + zp_x·r_w).
+    // Per-column W sums, r_b[n] = Σ_k W[n,k], for the zero-point compensation
+    // (quantized path only).
     std::vector<int32_t> r_b;
     if constexpr (quant) {
         r_b.resize(static_cast<size_t>(N));
@@ -138,8 +132,6 @@ void linear_ref_impl(const LinearAttributes& attrs,
                     raw, 0, zp_x, zp_w, r_a, r_b[static_cast<size_t>(n)],
                     static_cast<int32_t>(K));
                 if constexpr (int_out) {
-                    // Same order as MatMul's integer output pass: compensate,
-                    // bias, Relu, requant.
                     int32_t v = acc;
                     if (int_bias != nullptr) { v += int_bias[n]; }
                     if (attrs.epilogue.type == EpilogueActivateType::Relu) {

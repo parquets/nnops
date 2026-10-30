@@ -3,12 +3,11 @@
 ///
 /// The two routes vectorize on opposite axes:
 ///
-///   planar  the SIMD lane is output width, so one load feeds 8 positions of
-///           ONE row; there is one accumulate per row and the taps chain
-///           through it (9 dependent FMAs for a 3x3).
-///   nhwc    the SIMD lane is a channel, so one load feeds 16 channels at the
-///           same output position; four output rows are unrolled and each tap
-///           broadcasts one weight vector into four independent accumulates.
+///   planar  the lane is output width, so one load feeds 8 positions of ONE row
+///           and a 3x3 is a chain of 9 dependent FMAs.
+///   nhwc    the lane is a channel, so one load feeds 16 channels at one output
+///           position; four output rows are unrolled and each tap broadcasts one
+///           weight vector into four independent accumulates.
 ///
 /// Shape decides which wins: the channel lane wastes lanes when the channel
 /// count is small (a 7x7 plane is not the issue, a 3-channel one is), while
@@ -47,8 +46,7 @@ namespace k = nnops::kernel;
 
 namespace {
 
-// Same two schedulers as the other benches: OpenMP when the build has it (and
-// NNOPS_BENCH_OMP does not opt out), else one thread per call.
+// OpenMP when the build has it and NNOPS_BENCH_OMP allows, else spawn-per-call.
 struct BenchPool {
     explicit BenchPool(int nthreads) : nthreads_(nthreads) {
         if (test::bench_use_openmp()) {
@@ -131,8 +129,7 @@ struct DepthwiseCase {
     const char* name;
     int64_t C, IH, IW;
     int64_t KH = 3, KW = 3, SH = 1, SW = 1, PH = 1, PW = 1;
-    /// The model's depthwise stages ride a relu6 epilogue; the plain cases do
-    /// not. Kept on the case so the two can be compared in one run.
+    /// The model's stages ride relu6; the plain cases do not — one run compares both.
     bool relu6 = false;
 };
 
@@ -237,17 +234,11 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
 // The unroll itself: planar h1 against planar h4
 // ============================================================
 //
-// Same kernel family, same buffers, one variable: R. Single-threaded on
-// purpose — the question is instruction-level parallelism, and a pool would
-// only add scheduling noise on top of it. The h4 arm runs the tail rows through
-// h1, exactly as the driver does.
+// Same buffers, one variable: R. Single-threaded on purpose — the question is
+// instruction-level parallelism, and a pool would only add scheduling noise.
 
-/// One channel's worth of the driver's planar loop, over the whole plane.
-///
-/// Edge masks are built the way the driver builds them — once per call from the
-/// shape — and then handed to every channel. The first and last channel plane
-/// are the tensor's first and last there, so they keep the bounds-checked path,
-/// exactly as the driver's block test does.
+/// One channel of the driver's planar loop. The tensor's first and last channel
+/// keep the bounds-checked edge path, as the driver's block test does.
 void planar_kernel(const float* in, float* out, const float* w, const float* b,
                    const DepthwiseCase& c, int64_t OH, int64_t OW, bool h4) {
     const Epilogue ep{};
@@ -401,11 +392,9 @@ NNOPS_BENCH(depthwise_planar_unroll) {
 // MobileNetV2's actual depthwise mix
 // ============================================================
 //
-// The seventeen stages as the model runs them (the expansion conv decides the
-// channel count: 6x the block width), each one a separate operator call there.
+// The seventeen stages as the model runs them, each a separate operator call.
 // The sum is what the model's `depthwise_fused` row should read if the kernel
-// rate holds at these shapes; the difference is per-call cost. Reference FLOPs
-// are printed so the two can be compared without redoing the arithmetic.
+// rate holds at these shapes; the difference is per-call cost.
 
 NNOPS_BENCH(depthwise_planar_mobilenet) {
     const std::vector<int> threads = bench_threads();
@@ -447,10 +436,9 @@ NNOPS_BENCH(depthwise_planar_mobilenet) {
 // Narrow planes: the masked edge load, and what the width tail costs
 // ============================================================
 //
-// Widths 7 and 14 are MobileNetV2's last two stages; 8, 15 and 16 are the same
-// plane one element wider, i.e. the same number of taps and the nearest width
-// whose last vector is full. The pairs (7,8), (15,16) are therefore a direct
-// read on the scalar store tail, with the edge masking held constant.
+// 7 and 14 are MobileNetV2's last two stages; each sits beside a width whose
+// last vector is full (8 and 16). The (7,8) and (15,16) pairs therefore read the
+// scalar store tail with the edge masking held constant.
 
 NNOPS_BENCH(depthwise_planar_narrow) {
     const std::vector<int> threads = bench_threads();

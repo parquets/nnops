@@ -1,4 +1,18 @@
-/// Unit tests for Softmax operator (CPU reference / class API).
+/// @file test_softmax.cpp
+/// @brief Softmax operator tests (CPU, class API): softmax and log-softmax
+///        along an axis, temperature, f16 and quantized input.
+///
+/// NCHWC8 tensors are built from logical dims {N, C, H, W} (C is the logical
+/// channel count) over a packed physical layout: ceil(C/8) channel blocks of
+/// eight lanes, lanes contiguous per W position —
+/// [w0_l0..w0_l7, w1_l0..w1_l7, ...]. A row is W*8 elements and the tensor is
+/// N * ceil(C/8) * H rows. The expected-value loops recompute that indexing:
+/// softmax over W normalizes each lane independently, softmax over C sums each
+/// lane across the C8 blocks.
+///
+/// Quantized input (s8/u8) is dequantized before the float softmax, so the
+/// output is always floating point (f32 by default, f16 if supplied) and never
+/// requantized. PerTensor and PerToken scales are both covered.
 
 #include "nnops/ops/softmax.hpp"
 #include "common/test_harness.hpp"
@@ -13,7 +27,6 @@
 using namespace nnops;
 
 NNOPS_TEST(softmax_last_axis) {
-    // 1D input, softmax along axis 0
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
@@ -25,7 +38,6 @@ NNOPS_TEST(softmax_last_axis) {
     const TensorDesc in_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(in_arr);
 
-    // Validate output descriptor
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
@@ -37,7 +49,6 @@ NNOPS_TEST(softmax_last_axis) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // exp(1)=2.718, exp(2)=7.389, exp(3)=20.086 → sum=30.193
     float sum_exp = 0.0f;
     for (int i = 0; i < 3; ++i) {
         sum_exp += std::exp(in_data[i]);
@@ -45,12 +56,10 @@ NNOPS_TEST(softmax_last_axis) {
     NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum_exp, 1e-4f);
-    // Should sum to 1
     NNOPS_EXPECT_NEAR(out_buf[0] + out_buf[1] + out_buf[2], 1.0f, 1e-5f);
 }
 
 NNOPS_TEST(softmax_2d_axis_1) {
-    // 2x3, softmax along axis=1 (normalize rows)
     const int64_t shape[] = {2, 3};
     float in_data[]  = {1.0f, 2.0f, 3.0f, 1.0f, 1.0f, 1.0f};
 
@@ -64,7 +73,6 @@ NNOPS_TEST(softmax_2d_axis_1) {
     const TensorDesc in_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(in_arr);
 
-    // Validate output descriptor
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
@@ -77,7 +85,6 @@ NNOPS_TEST(softmax_2d_axis_1) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Row 0: same as 1D test
     float sum0 = 0.0f;
     for (int i = 0; i < 3; ++i) {
         sum0 += std::exp(in_data[i]);
@@ -85,7 +92,6 @@ NNOPS_TEST(softmax_2d_axis_1) {
     NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum0, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum0, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[2], std::exp(3.0f) / sum0, 1e-4f);
-    // Row 1: all equal → each gets 1/3
     NNOPS_EXPECT_NEAR(out_buf[3], 1.0f / 3.0f, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[4], 1.0f / 3.0f, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[5], 1.0f / 3.0f, 1e-4f);
@@ -105,7 +111,6 @@ NNOPS_TEST(softmax_log_softmax) {
     const TensorDesc in_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(in_arr);
 
-    // Validate output descriptor
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
@@ -117,8 +122,6 @@ NNOPS_TEST(softmax_log_softmax) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // log_softmax(0,1): max=1, shifted={-1,0}, exp={0.3679,1}, sum=1.3679, log_sum=0.3133
-    // out[0] = -1 - 0.3133 = -1.3133, out[1] = 0 - 0.3133 = -0.3133
     float max_val = std::max(in_data[0], in_data[1]);
     float shifted0 = in_data[0] - max_val;
     float shifted1 = in_data[1] - max_val;
@@ -138,7 +141,6 @@ NNOPS_TEST(softmax_random) {
     const TensorDesc in_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(in_arr);
 
-    // Validate output descriptor
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 8);
@@ -151,7 +153,6 @@ NNOPS_TEST(softmax_random) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Each row should sum to 1
     for (int r = 0; r < 4; ++r) {
         float row_sum = 0.0f;
         for (int c = 0; c < 8; ++c) {
@@ -163,14 +164,9 @@ NNOPS_TEST(softmax_random) {
 }
 
 // ============================================================
-// Packed layout tests (NCHWC8)
-// NCHWC8 is rank 4: [N, C, H, W] where C is the LOGICAL channel count.
-// Physical row layout: [w0_l0..w0_l7, w1_l0..w1_l7, ...]
-// num_channel_blocks = ceil(C / 8), row_stride = W * 8 elements.
-// total_rows = N * num_channel_blocks * H.
+// Packed NCHWC8 layout tests
 // ============================================================
 
-/// Helper: create NCHWC8 TensorView with correct pitch, plus buffer.
 static std::pair<std::vector<float>, TensorView>
 make_nchwc8(int64_t N, int64_t C, int64_t H, int64_t W)
 {
@@ -186,8 +182,6 @@ make_nchwc8(int64_t N, int64_t C, int64_t H, int64_t W)
     return {std::move(buf), tv};
 }
 
-/// Helper: fill NCHWC8 data with sequential values.
-/// num_c8 = ceil(C/8), row_stride = W*8.
 static void fill_nchwc8(float* data,
                          int64_t N, int64_t C, int64_t H, int64_t W,
                          float base_val, float step)
@@ -214,8 +208,6 @@ static void fill_nchwc8(float* data,
 }
 
 NNOPS_TEST(softmax_nchwc8_axis_w) {
-    // NCHWC8 [1, 8, 1, 3] — one full C8 block (C=8), W=3
-    // Softmax over W (axis=-1). Each C lane is independently normalized.
     const int64_t N = 1, C = 8, H = 1, W = 3;
     const int64_t row_stride = W * 8;  // 24
 
@@ -240,7 +232,6 @@ NNOPS_TEST(softmax_nchwc8_axis_w) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Verify: for each C lane, the 3 W positions sum to 1.
     for (int lane = 0; lane < 8; ++lane) {
         float row_sum = 0.0f;
         for (int w = 0; w < 3; ++w) {
@@ -253,7 +244,6 @@ NNOPS_TEST(softmax_nchwc8_axis_w) {
 }
 
 NNOPS_TEST(softmax_nchwc8_axis_w_log) {
-    // Same as above but log_softmax.
     const int64_t N = 1, C = 8, H = 1, W = 3;
 
     auto [in_data, input] = make_nchwc8(N, C, H, W);
@@ -282,7 +272,6 @@ NNOPS_TEST(softmax_nchwc8_axis_w_log) {
 }
 
 NNOPS_TEST(softmax_nchwc8_random) {
-    // Random NCHWC8 [2, 16, 3, 4] — two full C8 blocks (C=16).
     const int64_t N = 2, C = 16, H = 3, W = 4;
     const int64_t num_c8 = (C + 7) / 8;
     const int64_t row_stride = W * 8;
@@ -303,7 +292,6 @@ NNOPS_TEST(softmax_nchwc8_random) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // For each (n, c8, h, lane), the W values should sum to 1.
     int64_t n_stride = num_c8 * H * row_stride;
     int64_t c8_stride = H * row_stride;
     for (int64_t n = 0; n < N; ++n) {
@@ -329,11 +317,6 @@ NNOPS_TEST(softmax_nchwc8_random) {
 // ============================================================
 
 NNOPS_TEST(softmax_temperature_basic) {
-    // 1D input [1, 2, 3], T=2.0
-    // softmax(x_i, T) = exp(x_i/T) / sum(exp(x_j/T))
-    // max=3, shifted={-2/T, -1/T, 0/T} = {-1, -0.5, 0}
-    // exp: {0.3679, 0.6065, 1.0}, sum=1.9744
-    // out: {0.1863, 0.3072, 0.5065}
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
@@ -370,9 +353,6 @@ NNOPS_TEST(softmax_temperature_basic) {
 }
 
 NNOPS_TEST(softmax_temperature_sharper) {
-    // T=0.5 makes distribution sharper (more peaked)
-    // [1, 2, 3], T=0.5 → exp({-4, -2, 0}) = {0.0183, 0.1353, 1.0}
-    // sum=1.1536, out: {0.0159, 0.1173, 0.8668}
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
@@ -404,20 +384,17 @@ NNOPS_TEST(softmax_temperature_sharper) {
     NNOPS_EXPECT_NEAR(out_buf[2], e2 / sum_exp, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[0] + out_buf[1] + out_buf[2], 1.0f, 1e-5f);
 
-    // T=0.5: max value should be larger than T=1.0 case
-    // At T=1: exp(1)/sum=0.090, exp(2)/sum=0.245, exp(3)/sum=0.665
-    NNOPS_EXPECT_TRUE(out_buf[2] > 0.75f);  // sharper → higher for max
+    // T=0.5 sharpens: at T=1 the max is 0.665, so >0.75 means sharper.
+    NNOPS_EXPECT_TRUE(out_buf[2] > 0.75f);
 }
 
 NNOPS_TEST(softmax_temperature_equals_one) {
-    // T=1.0 should produce same result as default (no temperature)
     const int64_t shape[] = {2};
     float in_data[]  = {0.0f, 2.0f};
 
     TensorView input(shape, DataType::f32, in_data);
     auto d_in = input.desc();
 
-    // Default attrs (T=1)
     SoftmaxAttributes attrs_default;
     auto op_default = Softmax::create(attrs_default, Backend::CPU);
 
@@ -429,7 +406,6 @@ NNOPS_TEST(softmax_temperature_equals_one) {
     const TensorView ins[] = {input};
     op_default->compute(output_default, ins);
 
-    // Explicit T=1
     SoftmaxAttributes attrs_t1;
     attrs_t1.temperature = 1.0f;
     auto op_t1 = Softmax::create(attrs_t1, Backend::CPU);
@@ -443,10 +419,6 @@ NNOPS_TEST(softmax_temperature_equals_one) {
 }
 
 NNOPS_TEST(softmax_temperature_log) {
-    // log_softmax with temperature T=2.0 on [1, 2, 3]
-    // max=3, shifted/T: {-2/2=-1, -1/2=-0.5, 0/2=0}
-    // exp: {0.3679, 0.6065, 1.0}, sum=1.9744, log_sum=0.6803
-    // out: {-1-0.6803=-1.6803, -0.5-0.6803=-1.1803, 0-0.6803=-0.6803}
     const int64_t shape[] = {3};
     float in_data[]  = {1.0f, 2.0f, 3.0f};
 
@@ -476,13 +448,11 @@ NNOPS_TEST(softmax_temperature_log) {
     NNOPS_EXPECT_NEAR(out_buf[1], shifted[1] - log_sum, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[2], shifted[2] - log_sum, 1e-4f);
 
-    // exp of log_softmax with temperature should sum to 1
     NNOPS_EXPECT_NEAR(std::exp(out_buf[0]) + std::exp(out_buf[1]) + std::exp(out_buf[2]),
                       1.0f, 1e-4f);
 }
 
 NNOPS_TEST(softmax_temperature_random_2d) {
-    // Random 2D test: compare SIMD softmax with temperature against reference
     auto [in_vec, input] = test::make_random_tensor({4, 8}, -2.0f, 2.0f);
     auto d_in = input.desc();
 
@@ -501,7 +471,6 @@ NNOPS_TEST(softmax_temperature_random_2d) {
         const TensorView ins[] = {input};
         op->compute(output, ins);
 
-        // Each row should sum to 1 (softmax property holds for any T)
         for (int r = 0; r < 4; ++r) {
             float row_sum = 0.0f;
             for (int c = 0; c < 8; ++c) {
@@ -514,7 +483,6 @@ NNOPS_TEST(softmax_temperature_random_2d) {
 }
 
 NNOPS_TEST(softmax_temperature_nchwc8) {
-    // NCHWC8 with temperature — per-lane SIMD path
     const int64_t N = 1, C = 8, H = 1, W = 4;
     const int64_t row_stride = W * 8;
 
@@ -537,7 +505,6 @@ NNOPS_TEST(softmax_temperature_nchwc8) {
         const TensorView ins[] = {input};
         op->compute(output, ins);
 
-        // Each C lane sums to 1 across W
         for (int lane = 0; lane < 8; ++lane) {
             float sum = 0.0f;
             for (int w = 0; w < 4; ++w) {
@@ -551,8 +518,6 @@ NNOPS_TEST(softmax_temperature_nchwc8) {
 }
 
 NNOPS_TEST(softmax_nchw_axis_first) {
-    // NCHW [3, 4, 2, 2] — softmax over axis=0 (batch dimension).
-    // Uses the general scalar path. Verifies the decomposition is correct.
     const int64_t shape[] = {3, 4, 2, 2};
     const int64_t N = 3, C = 4, H = 2, W = 2;
     const int64_t total = N * C * H * W;  // 48
@@ -577,7 +542,6 @@ NNOPS_TEST(softmax_nchw_axis_first) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // For each (c, h, w) position, the 3 batch values should sum to 1.
     for (int c = 0; c < C; ++c) {
         for (int h = 0; h < H; ++h) {
             for (int w = 0; w < W; ++w) {
@@ -594,11 +558,10 @@ NNOPS_TEST(softmax_nchw_axis_first) {
 }
 
 // ============================================================
-// f16 tests — exercise the SIMD f16 code path
+// f16 tests
 // ============================================================
 
 NNOPS_TEST(softmax_random_f16) {
-    // Planar 2D f16: axis=1, 4x8
     auto [f16_buf, input] = test::make_random_f16_tensor({4, 8}, -2.0f, 2.0f);
 
     SoftmaxAttributes attrs;
@@ -617,7 +580,6 @@ NNOPS_TEST(softmax_random_f16) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Each row should sum to 1 (softmax property)
     for (int r = 0; r < 4; ++r) {
         float row_sum = 0.0f;
         for (int c = 0; c < 8; ++c) {
@@ -631,13 +593,10 @@ NNOPS_TEST(softmax_random_f16) {
 }
 
 NNOPS_TEST(softmax_nchwc8_random_f16) {
-    // NCHWC8 [2, 16, 3, 4] f16 — exercise packed SIMD path with f16
     const int64_t N = 2, C = 16, H = 3, W = 4;
 
-    // Create f32 random, then convert
     auto [f32_buf, _] = test::make_random_tensor({N, C, H, W}, -3.0f, 3.0f, 789);
 
-    // Pack to NCHWC8
     const int64_t num_c8 = (C + 7) / 8;
     const int64_t row_stride = W * 8;
     size_t total = static_cast<size_t>(N * num_c8 * H * row_stride);
@@ -681,7 +640,6 @@ NNOPS_TEST(softmax_nchwc8_random_f16) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Per-lane verification: each C lane should sum to 1 across W
     int64_t n_stride = num_c8 * H * row_stride;
     int64_t c8_stride = H * row_stride;
     for (int64_t n = 0; n < N; ++n) {
@@ -708,15 +666,13 @@ NNOPS_TEST(softmax_nchwc8_random_f16) {
 // ============================================================
 
 NNOPS_TEST(softmax_nchwc8_axis_channel) {
-    // NCHWC8 [2, 16, 3, 4] — softmax over axis=1 (channel).
-    // Exercises the Path 1b packed channel SIMD kernel.
     const int64_t N = 2, C = 16, H = 3, W = 4;
     const int64_t num_c8 = (C + 7) / 8;    // 2
     const int64_t row_stride = W * 8;       // 32
 
     auto [in_data, input] = make_nchwc8(N, C, H, W);
 
-    // Fill with varying values so that different C positions get different results
+    // Varying values so different C positions differ.
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
     for (auto& v : in_data) {
@@ -731,8 +687,6 @@ NNOPS_TEST(softmax_nchwc8_axis_channel) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // For each (n, h, w) spatial position, each of the 8 lanes independently
-    // normalizes across its C8 blocks. So per lane: sum across C8 = 1.0.
     int64_t n_stride = num_c8 * H * row_stride;
     int64_t c8_stride = H * row_stride;
     for (int64_t n = 0; n < N; ++n) {
@@ -758,7 +712,7 @@ NNOPS_TEST(softmax_nchwc8_axis_channel) {
 // ============================================================
 
 NNOPS_TEST(softmax_quant_s8_per_tensor) {
-    // s8 input, per-tensor scale=0.5/zp=0. Dequantized {1, 2, 3} → softmax.
+    // in {2, 4, 6} x scale 0.5 → dequantized {1, 2, 3}.
     const int64_t shape[] = {3};
     int8_t in_data[] = {2, 4, 6};
 
@@ -771,7 +725,6 @@ NNOPS_TEST(softmax_quant_s8_per_tensor) {
     const TensorDesc in_arr[] = {input.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
 
-    // Quantized input ⇒ output is float (f32), not int.
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(descs[0].numel());
@@ -780,7 +733,6 @@ NNOPS_TEST(softmax_quant_s8_per_tensor) {
     const TensorView ins[] = {input};
     op->compute(output, ins, {}, nullptr);
 
-    // dequant {1,2,3} → exp {2.7183, 7.3891, 20.0855}, sum 30.1929
     float sum_exp = std::exp(1.0f) + std::exp(2.0f) + std::exp(3.0f);
     NNOPS_EXPECT_NEAR(out_buf[0], std::exp(1.0f) / sum_exp, 1e-4f);
     NNOPS_EXPECT_NEAR(out_buf[1], std::exp(2.0f) / sum_exp, 1e-4f);
@@ -789,7 +741,7 @@ NNOPS_TEST(softmax_quant_s8_per_tensor) {
 }
 
 NNOPS_TEST(softmax_quant_u8_per_tensor) {
-    // Asymmetric u8 input, scale=0.5/zp=128. Dequantized {1, 2, 3}.
+    // (in - 128) * 0.5 for {130, 132, 134} → dequantized {1, 2, 3}.
     const int64_t shape[] = {3};
     uint8_t in_data[] = {130, 132, 134};
 
@@ -854,7 +806,6 @@ NNOPS_TEST(softmax_quant_s8_per_token) {
 }
 
 NNOPS_TEST(softmax_quant_s8_f16_output) {
-    // s8 input with f16 output (softmax probabilities downcast to half).
     const int64_t shape[] = {3};
     int8_t in_data[] = {2, 4, 6};
 
@@ -880,8 +831,7 @@ NNOPS_TEST(softmax_quant_s8_f16_output) {
 }
 
 NNOPS_TEST(softmax_nchwc8_axis_channel_partial_c8) {
-    // NCHWC8 [1, 10, 2, 3] — C=10 not a multiple of 8 (C8=2, valid_lanes=2).
-    // Exercises the partial-lane path in packed channel softmax.
+    // C=10 pads to 2 C8 blocks; block 1 has only 2 valid lanes.
     const int64_t N = 1, C = 10, H = 2, W = 3;
     const int64_t num_c8 = (C + 7) / 8;    // 2
     const int64_t row_stride = W * 8;       // 24
@@ -902,9 +852,8 @@ NNOPS_TEST(softmax_nchwc8_axis_channel_partial_c8) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // C=10, valid_lanes=2. All 8 lanes get softmax:
-    // Lanes 0-1: across 2 C8 blocks → sum 1
-    // Lanes 2-7: only C8 block 0 (block 1 has 0 for these lanes) → sum 1
+    // Every lane sums to 1: lanes 0-1 span both blocks; lanes 2-7 normalize over
+    // block 0 alone (the kernel ignores block 1 for them, leaving its output 0).
     int64_t n_stride = num_c8 * H * row_stride;
     int64_t c8_stride = H * row_stride;
     for (int64_t n = 0; n < N; ++n) {
@@ -918,9 +867,6 @@ NNOPS_TEST(softmax_nchwc8_axis_channel_partial_c8) {
                         NNOPS_EXPECT_TRUE(out_buf[off] >= 0.0f);
                         lane_sum += out_buf[off];
                     }
-                    // All lanes sum to 1:
-                    // - Valid lanes (0-1): softmax across 2 values
-                    // - Other lanes (2-7): softmax of 1 valid + 1 zero
                     NNOPS_EXPECT_NEAR(lane_sum, 1.0f, 1e-4f);
                 }
             }

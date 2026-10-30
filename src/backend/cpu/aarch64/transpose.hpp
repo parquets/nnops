@@ -1,14 +1,20 @@
 #pragma once
 /// @file transpose.hpp
-/// @brief ARM NEON matrix transpose primitives for GEMM micro-kernels.
+/// @brief ARM NEON transpose primitives for the GEMM packers.
 ///
-/// Three register categories are used:
-///   - float32x4_t  (4×float32) — packed float intrinsics (vzipq_f32 + vcombine_f32)
-///   - int32x4_t    (4×int32)   — packed integer intrinsics (for int8 dp4a pack)
-///   - float16x4_t / float16x8_t (4×/8×float16) — native NEON fp16
+/// The transposing packers turn rows of a source operand into k-major panels
+/// (one contiguous mr- or nr-wide row per k): load one register per source
+/// row, transpose, then store linearly. float32x4_t and int32x4_t go through
+/// vzipq_f32 / vzipq_s32 + vcombine_*; the i32 set serves the int8 dp4a pack.
+/// f16 has no 32-bit-lane zip, so the 4x4/4x8/8x8 tiles reinterpret the halves
+/// as f32 lanes and reuse the f32 zips, and the 12x8/24x8 tiles are built from
+/// float32x4 zips of the reinterpreted halves.
 ///
-/// f16 transposes use vreinterpretq_f32_f16 to reuse f32 zip-combine logic
-/// where possible, falling back to explicit vcombine_f32 for larger tiles.
+/// The shipped pack tables wire f32 4x4/8x4/12x4, f16 4x4/8x8/16x8 and i32
+/// 8x4/12x4. transpose_12x8_f16 is reachable only from pack_trans_n12_f16,
+/// which nr_f16 = {16, 8, 1} leaves out of the table, so its output order is
+/// unvalidated against an mma; the 2-way, 4x4 i32, 4x8 f16, 6x4 and 24x8
+/// helpers have no callers at all.
 ///
 /// Reference: nn_compute/src/cpu/kernel/transpose/aarch64/transpose_aarch64.hpp
 
@@ -264,11 +270,7 @@ inline void transpose_8x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, fl
     h = vreinterpretq_f16_f32(vcombine_f32(vget_high_f32(abcd1.val[1]), vget_high_f32(efgh1.val[1])));
 }
 
-/// NOTE: unreachable today — the f16 RHS cascade is nr_f16 = {16, 8, 1} and no
-/// 1x12 f16 micro-kernel exists, so pack_trans_n12_f16 is never dispatched.
-/// Its output order is therefore unvalidated against an mma; do not wire up an
-/// nr=12 f16 panel without checking it (transpose_16x8_f16 had the same shape of
-/// latent bug, see below).
+/// Unreachable today (nr_f16 = {16, 8, 1}, no nr=12 f16 kernel): unvalidated.
 inline void transpose_12x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, float16x8_t& d,
                                 float16x8_t& e, float16x8_t& f, float16x8_t& g, float16x8_t& h,
                                 float16x8_t& i, float16x8_t& j, float16x8_t& k, float16x8_t& l) noexcept {
@@ -313,13 +315,11 @@ inline void transpose_16x8_f16(float16x8_t& a, float16x8_t& b, float16x8_t& c, f
                                 float16x8_t& e, float16x8_t& f, float16x8_t& g, float16x8_t& h,
                                 float16x8_t& i, float16x8_t& j, float16x8_t& k, float16x8_t& l,
                                 float16x8_t& m, float16x8_t& n, float16x8_t& o, float16x8_t& p) noexcept {
-    // Two independent 8x8 transposes: rows 0..7 yield the low half of each of
-    // the 8 output columns, rows 8..15 the high half. Interleaving them gives
-    // the plain row-major 16-column transposed block that the packed-B
-    // convention expects — [K][nr] with ldb == nr == 16, which
-    // mma_pack_1x16_f16 reads at B + r*ldb + h*8 for the k residue r and the
-    // 8-wide half h. (A single 16-wide butterfly would produce a 4-row-block
-    // interleaved order instead, which the pack's linear stores cannot express.)
+    // Two 8x8 transposes: lo[j] is k=j across rows 0..7, hi[j] k=j across rows
+    // 8..15. Interleaving them gives one contiguous 16-half row per k — the
+    // plain [k][16] order the nr16 packed-B kernels read (halves at +0 and +8,
+    // advancing 16 per k). A single 16-wide butterfly would produce a
+    // 4-row-block interleaved order the pack's linear stores cannot express.
     float16x8_t lo[8] = {a, b, c, d, e, f, g, h};
     float16x8_t hi[8] = {i, j, k, l, m, n, o, p};
     transpose_8x8_f16(lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7]);

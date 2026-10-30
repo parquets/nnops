@@ -1,9 +1,9 @@
 /// @file norm_ref.cpp
-/// @brief Naive CPU reference implementations of normalization operators.
+/// @brief Naive CPU references for BatchNorm, LayerNorm, RMSNorm, GroupNorm and
+/// L2Norm, dispatched on NormAttributes::type.
 ///
-/// Covers BatchNorm, LayerNorm, RMSNorm, GroupNorm, and L2Norm, dispatched
-/// on NormAttributes::type. All use f32 regardless of input dtype for
-/// simplicity (matching the test harness's reference-vs-SIMD comparison).
+/// Every type reads and writes f32 whatever the input dtype: the tests
+/// dequantize to f32, run this, and requantize.
 
 #include "nnops/ops/norm.hpp"
 #include "nnops/detail/assert.hpp"
@@ -46,7 +46,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
     auto* y_ptr = output.ptr<float>();
 
     if (attrs.spatial) {
-        // ---- Spatial mode: per-channel statistics ----
+        // ---- Spatial: statistics per channel ----
         std::vector<float> ns_f(static_cast<size_t>(C));
         std::vector<float> nb_f(static_cast<size_t>(C));
         for (int64_t c = 0; c < C; ++c) {
@@ -58,7 +58,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
         const int64_t pack = X.channel_pack_size();
 
         if (pack > 1) {
-            // ---- Packed layout path (NCHWC8, NCDHWC8) ----
+            // ---- Channel-blocked layout (channel_pack_size() > 1) ----
             const int64_t c8_blocks = X.num_channel_blocks();
             std::vector<float> ns_packed(static_cast<size_t>(c8_blocks * pack), 0.0f);
             std::vector<float> nb_packed(static_cast<size_t>(c8_blocks * pack), 0.0f);
@@ -92,7 +92,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
             ctx.cpu.run(0, num_rows, process_row);
 
         } else {
-            // ---- Planar layout path (NCHW, NCDHW) ----
+            // ---- Planar layout (NCHW, NCDHW) ----
             int64_t sample_size = 1;
             if (rank >= 2) {
                 for (int64_t i = 2; i < rank; ++i) {
@@ -131,7 +131,7 @@ void batch_norm_ref_impl(const NormAttributes& attrs,
             ctx.cpu.run(0, spatial_total, body);
         }
     } else {
-        // ---- Non-spatial: per-element statistics ----
+        // ---- Non-spatial: statistics per element ----
         const int64_t total = X.numel();
         const auto body = [&](int64_t i) {
             float inv_std = 1.0f / std::sqrt(v_ptr[i] + epsilon);
@@ -201,7 +201,7 @@ void layer_norm_ref_impl(const NormAttributes& attrs,
     const auto process_row = [&](int64_t row) {
         int64_t row_base = row * outer_stride;
 
-        // Welford's online algorithm for mean and variance
+        // Welford's online algorithm for mean and variance.
         float mean_val = 0.0f;
         float M2 = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
@@ -465,10 +465,6 @@ void group_norm_ref_impl(const NormAttributes& attrs,
 }
 
 }  // anonymous namespace
-
-// ============================================================
-// Entry point — dispatch on NormAttributes::type
-// ============================================================
 
 void norm_ref(const NormAttributes& attrs,
               TensorView& output,

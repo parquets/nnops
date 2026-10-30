@@ -1,4 +1,6 @@
-/// Unit tests for Activation operator (CPU reference).
+/// @file test_activation.cpp
+/// @brief Activation (CPU): f32 activations against closed-form values, the f16
+/// path, and the fused dequant → activation → quant route.
 
 #include "nnops/ops/activation.hpp"
 #include "common/test_harness.hpp"
@@ -100,12 +102,9 @@ NNOPS_TEST(activation_sigmoid) {
     const TensorView ins[] = {input};
     op->compute(out, ins);
 
-    // sigmoid(0) = 0.5
-    NNOPS_EXPECT_NEAR(buf[0], 0.5f, 1e-6f);
-    // sigmoid(10) ≈ 0.99995
-    NNOPS_EXPECT_NEAR(buf[1], 0.99995f, 1e-4f);
-    // sigmoid(-10) ≈ 0.000045
-    NNOPS_EXPECT_NEAR(buf[2], 0.000045f, 1e-4f);
+    NNOPS_EXPECT_NEAR(buf[0], 0.5f, 1e-6f);       // sigmoid(0)
+    NNOPS_EXPECT_NEAR(buf[1], 0.99995f, 1e-4f);   // sigmoid(10)
+    NNOPS_EXPECT_NEAR(buf[2], 0.000045f, 1e-4f);  // sigmoid(-10)
 }
 
 NNOPS_TEST(activation_tanh) {
@@ -133,12 +132,9 @@ NNOPS_TEST(activation_tanh) {
     const TensorView ins[] = {input};
     op->compute(out, ins);
 
-    // tanh(0) = 0
-    NNOPS_EXPECT_NEAR(buf[0], 0.0f, 1e-6f);
-    // tanh(2) ≈ 0.9640
-    NNOPS_EXPECT_NEAR(buf[1], 0.9640f, 1e-3f);
-    // tanh(-2) ≈ -0.9640
-    NNOPS_EXPECT_NEAR(buf[2], -0.9640f, 1e-3f);
+    NNOPS_EXPECT_NEAR(buf[0], 0.0f, 1e-6f);     // tanh(0)
+    NNOPS_EXPECT_NEAR(buf[1], 0.9640f, 1e-3f);  // tanh(2)
+    NNOPS_EXPECT_NEAR(buf[2], -0.9640f, 1e-3f); // tanh(-2)
 }
 
 NNOPS_TEST(activation_gelu) {
@@ -166,10 +162,8 @@ NNOPS_TEST(activation_gelu) {
     const TensorView ins[] = {input};
     op->compute(out, ins);
 
-    // GELU(0) ≈ 0.0
-    NNOPS_EXPECT_NEAR(buf[0], 0.0f, 1e-3f);
-    // GELU(1) ≈ 0.8413
-    NNOPS_EXPECT_NEAR(buf[1], 0.8413f, 1e-3f);
+    NNOPS_EXPECT_NEAR(buf[0], 0.0f, 1e-3f);    // GELU(0)
+    NNOPS_EXPECT_NEAR(buf[1], 0.8413f, 1e-3f); // GELU(1)
 }
 
 NNOPS_TEST(activation_silu) {
@@ -197,10 +191,8 @@ NNOPS_TEST(activation_silu) {
     const TensorView ins[] = {input};
     op->compute(out, ins);
 
-    // SiLU(0) = 0 * sigmoid(0) = 0
-    NNOPS_EXPECT_NEAR(buf[0], 0.0f, 1e-6f);
-    // SiLU(1) = 1 * sigmoid(1) ≈ 0.7311
-    NNOPS_EXPECT_NEAR(buf[1], 0.7311f, 1e-3f);
+    NNOPS_EXPECT_NEAR(buf[0], 0.0f, 1e-6f);    // SiLU(0)
+    NNOPS_EXPECT_NEAR(buf[1], 0.7311f, 1e-3f); // SiLU(1)
 }
 
 NNOPS_TEST(activation_random_relu) {
@@ -271,7 +263,6 @@ NNOPS_TEST(activation_random_relu_f16) {
 // ============================================================
 
 NNOPS_TEST(activation_quant_per_tensor_relu_s8) {
-    // s8 → s8 (fused), per-tensor scale=0.5/zp=0, Relu.
     const int64_t shape[] = {6};
     int8_t in_data[] = {-4, -2, 0, 2, 4, 6};
 
@@ -298,7 +289,6 @@ NNOPS_TEST(activation_quant_per_tensor_relu_s8) {
 }
 
 NNOPS_TEST(activation_quant_per_tensor_sigmoid_s8) {
-    // s8 → s8 (fused), per-tensor scale=1/zp=0, Sigmoid.
     const int64_t shape[] = {2};
     int8_t in_data[] = {0, 2};
 
@@ -323,7 +313,6 @@ NNOPS_TEST(activation_quant_per_tensor_sigmoid_s8) {
 }
 
 NNOPS_TEST(activation_quant_per_tensor_relu_u8) {
-    // Asymmetric u8 → u8 (fused), Relu. scale=0.5, zp=128.
     const int64_t shape[] = {4};
     uint8_t in_data[] = {126, 127, 128, 129};
 

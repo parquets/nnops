@@ -1,11 +1,12 @@
 /// @file test_grid_sample.cpp
-/// @brief Tests for the GridSample operator — NCHWC8/NCDHWC8 only.
+/// @brief GridSample tests — the operator accepts packed NCHWC8 / NCDHWC8 only.
 ///
-/// All tests use the class API with LayoutConvert for pack/unpack:
-///   NCHW in → LayoutConvert(pack) → NCHWC8 → GridSample::compute → LayoutConvert(unpack) → NCHW → compare
-///
-/// Covers bilinear and nearest-neighbor interpolation with zeros, border,
-/// and reflection padding modes.
+/// Every case runs the class API end-to-end:
+///   NCHW -> LayoutConvert(pack) -> GridSample -> LayoutConvert(unpack) -> NCHW
+/// and checks the unpacked result against known values where the sample
+/// position is predictable, else only finiteness. The grid stays planar NCHW.
+/// Covers bilinear/nearest, zeros/border/reflection padding, align_corners,
+/// add_to (residual onto a pre-filled output), batch, 3D, and partial C8.
 
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -39,7 +40,6 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
     TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
-    // Pack input to NCHWC8
     auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
     {
         auto d = in_nchw.desc();
@@ -54,7 +54,6 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
         const TensorView pack_ins[] = {in_nchw};
         pack_op->compute(in_c8, pack_ins);
 
-        // GridSample on NCHWC8
         auto gs_op = GridSample::create({});
         auto d_in = in_c8.desc();
         auto d_grid = grid.desc();
@@ -69,7 +68,6 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
         const TensorView gs_ins[] = {in_c8, grid};
         gs_op->compute(out_c8, gs_ins);
 
-        // Unpack to NCHW
         auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_c8.desc();
         const TensorDesc unpack_in_arr[] = {d_out};
@@ -109,7 +107,6 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    // Pack input to NCHWC8
     auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
     {
         auto d = in_nchw.desc();
@@ -123,7 +120,6 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
         const TensorView pack_ins[] = {in_nchw};
         pack_op->compute(in_c8, pack_ins);
 
-        // GridSample on NCHWC8
         GridSampleAttributes attrs;
         attrs.align_corners = true;
         auto gs_op = GridSample::create(attrs);
@@ -144,7 +140,6 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
         const TensorView gs_ins[] = {in_c8, grid};
         gs_op->compute(out_c8, gs_ins);
 
-        // Unpack to NCHW
         auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_c8.desc();
         const TensorDesc unpack_in_arr[] = {d_out};
@@ -559,7 +554,6 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    // Pack input to NCDHWC8
     auto pack_op = LayoutConvert::create(TensorLayout::NCDHWC8);
     {
         auto d = in_ncdhw.desc();
@@ -574,7 +568,6 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
         const TensorView pack_ins[] = {in_ncdhw};
         pack_op->compute(in_c8, pack_ins);
 
-        // GridSample on NCDHWC8
         auto gs_op = GridSample::create({});
         auto d_in = in_c8.desc();
         auto d_grid = grid.desc();
@@ -589,7 +582,6 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
         const TensorView gs_ins[] = {in_c8, grid};
         gs_op->compute(out_c8, gs_ins);
 
-        // Unpack to NCDHW
         auto unpack_op = LayoutConvert::create(TensorLayout::NCDHW);
         auto d_out = out_c8.desc();
         const TensorDesc unpack_in_arr[] = {d_out};
@@ -712,7 +704,6 @@ NNOPS_TEST(grid_sample_add_to) {
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
         auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
 
-        // Pre-fill output with 0.5f for add_to
         int64_t rows = out_c8.total_rows();
         int64_t row_elems = out_c8.row_stride_elems();
         for (int64_t r = 0; r < rows; ++r) {

@@ -1,11 +1,12 @@
 /// @file depthwise_conv.cpp
-/// @brief DepthwiseConv operator dispatch — connects class API to backend implementations.
+/// @brief DepthwiseConv operator dispatch — descriptor checks and backend binding.
 ///
-/// Both layouts read the raw filter: planar (NCHW/NCDHW) takes
-/// [C, 1, (KD,) KH, KW] with a bias [C], channel-last (NHWC/NDHWC) takes the
-/// HWCM [KH][KW][C] form. No prepack step is involved in either.
-///
-/// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
+/// Both routes read the raw filter: planar (NCHW/NCDHW) the [C, 1, (KD,) KH, KW]
+/// form with a [C] bias, channel-last (NHWC/NDHWC) the HWCM [KH][KW][C] form, whose
+/// every tap is a contiguous run of C channels — the pattern the channel-lane
+/// kernel already reads a vector at a time, so no prepack is involved either way.
+/// The channel lane also covers the quantized s8/u8 pairs; the planar route is
+/// f32/f16 only. Spatial rank follows the input rank (4→2D, 5→3D).
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -37,11 +38,8 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     const auto& in = inputs[0];
     if (is_channel_last(in.layout)) {
-        // The channel-lane kernel loads one tap of eight channels as a single
-        // vector, which the planar filter [C, 1, KH, KW] cannot give it (a
-        // tap's channels are C elements apart). The raw HWCM filter
-        // [KH][KW][C] is TensorFlow's depthwise order and already is that
-        // access pattern, so no prepack step is involved.
+        // The channel lane loads a tap's channels as one vector, which the planar
+        // [C, 1, KH, KW] cannot give it (a tap's channels are C elements apart).
         if (inputs[1].layout != TensorLayout::HWCM) {
             return Status::unsupported;
         }
@@ -49,12 +47,10 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
             detail::dtype_in<DataType::f32, DataType::f16,
                              DataType::s8, DataType::u8>(in.dtype));
     }
-    // Planar is the only other route: it reads the raw filter one channel plane
-    // at a time and has f32/f16 kernels. A PackedWeight is a transformed
-    // Winograd tensor (its only producer left), never a depthwise filter, so it
-    // is rejected here rather than misread.
+    // Planar reads the raw filter one channel plane at a time, f32/f16 only.
+    // Nothing produces PackedWeight any more, so it is rejected here rather than
+    // misread as a raw filter.
     if (!is_planar_spatial(in.layout)) {
-        // Neither planar nor channel-last — a channel-packed tensor, say.
         return Status::unsupported;
     }
     return detail::require(

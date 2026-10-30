@@ -1,12 +1,9 @@
 #pragma once
 /// @file argminmax.hpp
-/// @brief ArgMax / ArgMin operators — indices of max/min along an axis.
+/// @brief ArgMax / ArgMin — index of the max/min along one axis.
 ///
-/// Computes the index (as int64) of the maximum or minimum value
-/// along a specified axis, with optional keepdims.
-///
-/// Supports NCHW, NCDHW, NCHWC8, NCDHWC8 layouts.
-/// F32 and F16 data types are supported.
+/// Returns the index as int64, with optional keepdims. Walks any strided
+/// layout via stride_elems; f32 and f16.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -20,29 +17,21 @@ namespace nnops {
 
 /// Operation type for arg reduction.
 enum class ArgMinMaxType : uint8_t {
-    Max,  ///< ArgMax: index of maximum value
-    Min,  ///< ArgMin: index of minimum value
+    Max,
+    Min,
 };
 
 /// Attributes shared by ArgMax and ArgMin.
 struct ArgMinMaxAttributes {
-    /// Reduction operation type.
     ArgMinMaxType type = ArgMinMaxType::Max;
 
-    /// Axis along which to compute argmax/argmin.
-    /// Negative values wrap from the end. Default: 0.
+    /// Axis; negative values wrap from the end.
     int64_t axis = 0;
 
-    /// If true, keep the reduced axis as a size-1 dimension.
+    /// Keep the reduced axis as size 1.
     bool keepdims = false;
 };
 
-/// ArgMax operator (class-based API).
-///
-/// Computes the index of the maximum value along the specified axis.
-///
-/// Input:  X [*]  (f32 or f16)
-/// Output: Y [*]  (int64, axis reduced or size-1 if keepdims)
 class ArgMax : public OpBase {
 public:
     static std::unique_ptr<ArgMax> create(const ArgMinMaxAttributes& attrs = {},
@@ -80,12 +69,6 @@ private:
     Backend backend_;
 };
 
-/// ArgMin operator (class-based API).
-///
-/// Computes the index of the minimum value along the specified axis.
-///
-/// Input:  X [*]  (f32 or f16)
-/// Output: Y [*]  (int64, axis reduced or size-1 if keepdims)
 class ArgMin : public OpBase {
 public:
     static std::unique_ptr<ArgMin> create(const ArgMinMaxAttributes& attrs = {},

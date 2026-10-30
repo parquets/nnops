@@ -2,25 +2,21 @@
 /// @file memory_pool.hpp
 /// @brief MemoryPool — the CPU backend's internal scratch-memory allocator.
 ///
-/// Operators currently receive their intermediate ("workspace") memory from the
-/// caller (getWorkspaceSize + a pre-allocated buffer). This pool is the internal
-/// replacement: operators allocate/free small scratch buffers through a shared
-/// process-wide singleton, and freed blocks are recycled across operators and
-/// invocations, avoiding repeated malloc/free churn.
+/// Operators receive their intermediate ("workspace") memory from the caller
+/// (getWorkspaceSize + a pre-allocated buffer); this pool is the internal
+/// replacement for the small scratch buffers inside them. Freed blocks are
+/// recycled across operators and invocations, avoiding malloc/free churn.
 ///
 /// Design:
-///   - Size-class free lists (powers of two, 64 B .. 16 MiB). allocate() rounds
-///     the request up to the next class; deallocate() returns the block to its
-///     class for reuse by the next request of a matching size.
+///   - Size-class free lists (powers of two, 64 B .. 16 MiB): allocate() rounds
+///     up to the next class; deallocate() returns the block to its class.
 ///   - Every block is 64-byte aligned (matches mma_pack_align).
-///   - Each thread keeps a small cache (one recycled block per size class), so
-///     the common "allocate one scratch buffer, free it on return" pattern hits
-///     a lock-free fast path and never touches the shared pool. A thread's cache
-///     is registered globally so release_all() can drain every thread's blocks.
-///   - Requests above 16 MiB bypass the pool and use a direct aligned alloc/free.
-///   - The free lists are bounded by a retention budget: once pooled bytes
-///     exceed it, the largest freed blocks are returned to the OS instead of
-///     being kept, so the pool's idle footprint can't grow without limit.
+///   - Each thread keeps a cache of one recycled block per size class, so the
+///     "allocate one scratch buffer, free it on return" pattern hits a lock-free
+///     fast path. Every thread cache is registered so release_all() can drain it.
+///   - Requests above 16 MiB bypass the pool (direct aligned alloc/free).
+///   - The central lists are bounded by a retention budget: past it, the largest
+///     freed blocks go back to the OS so the idle footprint stays bounded.
 ///
 /// This header is internal to the CPU backend (not part of the public nnops
 /// API). The only surface exposed to library consumers is
@@ -40,16 +36,14 @@ public:
     MemoryPool(const MemoryPool&) = delete;
     MemoryPool& operator=(const MemoryPool&) = delete;
 
-    /// Allocate @p size bytes, 64-byte aligned. Reuses a pooled block when one
-    /// is available (this thread's cache first, then the shared pool); otherwise
-    /// allocates fresh from the OS. Requests larger than the max class size
-    /// (16 MiB) are allocated directly and not recycled.
+    /// Allocate @p size bytes, 64-byte aligned: this thread's cache first, then
+    /// the shared pool, then the OS. Requests above 16 MiB are direct and not
+    /// recycled.
     void* allocate(size_t size);
 
-    /// Return a block previously obtained from allocate(). nullptr is a no-op.
-    /// The block must have come from this pool; a foreign pointer trips the
-    /// block's magic-tag assert in debug builds. Freeing the same block twice
-    /// is a programmer error but is not detected.
+    /// Return a block from allocate() (nullptr is a no-op). It must come from
+    /// this pool; a foreign pointer trips the magic-tag assert in debug builds.
+    /// Freeing the same block twice is a programmer error and is not detected.
     void deallocate(void* ptr) noexcept;
 
     /// Allocate @p count elements of type T, 64-byte aligned.

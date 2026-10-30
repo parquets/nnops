@@ -1,12 +1,17 @@
-/// Unit tests for DepthwiseConv operator — planar (NCHW/NCDHW) and
-/// channel-last (NHWC/NDHWC).
+/// @file test_depthwise_conv.cpp
+/// @brief DepthwiseConv tests — planar (NCHW/NCDHW) and channel-last
+///        (NHWC/NDHWC).
 ///
-/// Planar: the raw filter goes straight to the operator, and the output is
-/// compared with the scalar reference kernel.
+/// Planar: the raw [C, 1, (KD,) KH, KW] filter goes straight to the operator,
+/// and the output is compared with the scalar reference kernel. One case is
+/// hand-computed so the suite is not only reference against reference.
 ///
 /// Channel-last: the same values in both orders — NCHW plus the raw planar
-/// filter for the reference, NHWC plus TensorFlow's [KH][KW][C] filter for the
-/// kernel (see test_nhwc_vs_ref).
+/// filter for the reference, NHWC plus TensorFlow's [KD][KH][KW][C] filter for
+/// the kernel. The channel-last route reads the filter as the graph holds it,
+/// so the only plumbing is the transpose between the orders. A call covers 8
+/// channels, or 16 (two vectors) where the 3x3 kernel can take both halves —
+/// which the C values below pick out: sub-vector, partial, full and multi-block.
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "common/test_harness.hpp"
@@ -22,7 +27,7 @@
 
 using namespace nnops;
 
-// Forward declare the reference kernel (NCHW scalar, ground truth).
+// The reference kernel is defined in the backend, so declare it here.
 namespace nnops::backend::cpu::reference {
     void depthwise_conv_ref(const DepthwiseConvAttributes& attrs,
                             TensorView& output,
@@ -84,14 +89,13 @@ static void test_planar_vs_ref(const std::vector<int64_t>& in_shape,
 }
 
 NNOPS_TEST(dwconv_planar_vs_ref_basic) {
-    // Partial C8 (4 channels) and an odd width (15) exercise the plane loop
-    // and the scalar tail.
+    // C=4, odd output width 13: the plane loop, a last vector 5 of 8 lanes.
     test_planar_vs_ref({1, 4, 12, 15}, {4, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}});
 }
 
 NNOPS_TEST(dwconv_planar_vs_ref_padding_stride2) {
-    // Padding on both W edges plus the deinterleaving load.
+    // Both W edges padded, stride 2: the vector load deinterleaves.
     test_planar_vs_ref({1, 6, 14, 13}, {6, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}});
 }
@@ -128,9 +132,9 @@ NNOPS_TEST(dwconv_planar_3d_vs_ref) {
         DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
 }
 
-// The one hand-computed case: 3D on a planar plane, no reference kernel in the
-// loop. Everything else above compares against depthwise_conv_ref, which is a
-// second implementation and could in principle drift with the kernel.
+// The one hand-computed case: everything else compares against
+// depthwise_conv_ref, itself a second implementation that could drift with the
+// kernel.
 NNOPS_TEST(dwconv_planar_3d_hand_check) {
     // 1x2x3x3x3 input of ones, 1x2x2x2x2 kernel of 0.5, stride 1, pad 0:
     // each output = 2*2*2 taps * 1.0 * 0.5 = 4.0.
@@ -146,7 +150,6 @@ NNOPS_TEST(dwconv_planar_3d_hand_check) {
     DepthwiseConvAttributes attrs{{2, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
     auto op = DepthwiseConv::create(attrs, Backend::CPU);
 
-    // Both layouts read the raw filter, so this is the whole call.
     const TensorDesc in_desc_arr[] = {in.desc(), w.desc()};
     auto out_descs = op->getOutputTensorDesc(in_desc_arr);
 
@@ -162,8 +165,8 @@ NNOPS_TEST(dwconv_planar_3d_hand_check) {
 }
 
 // ============================================================
-// Quantized depthwise conv (s8/u8 input/output, PerTensor act,
-// PerChannel weight) — the channel lane shares these helpers.
+// Quantized depthwise conv — s8/u8 in and out, PerTensor activation and
+// output, PerChannel weight.
 // ============================================================
 
 static QuantParams make_per_tensor(float scale, int32_t zp) {
@@ -188,7 +191,7 @@ static QuantParams make_per_channel(const std::vector<float>& scales,
 
 // ============================================================
 // Layout contract — the planar path reads the raw filter, so a prepacked
-// weight is rejected at descriptor level instead of being misread
+// weight is rejected at descriptor level rather than misread.
 // ============================================================
 
 NNOPS_TEST(dwconv_planar_rejects_packed_weight) {
@@ -215,11 +218,6 @@ NNOPS_TEST(dwconv_planar_rejects_packed_weight) {
 // ============================================================
 // Channel-last (NHWC/NDHWC) depthwise conv — NHWC activation, HWCM filter
 // ============================================================
-//
-// The same values in both orders: NCHW plus the raw planar filter for the
-// scalar reference, NHWC plus TensorFlow's [KH][KW][C] filter for the kernel.
-// The channel-last route reads the filter as the graph holds it, so there is no
-// prepack step here — the only plumbing is the transpose between the orders.
 
 /// Taps of a depthwise filter, whose shape is [C, 1, (KD,) KH, KW].
 static int64_t dw_taps(const std::vector<int64_t>& w_shape)
@@ -229,8 +227,8 @@ static int64_t dw_taps(const std::vector<int64_t>& w_shape)
     return t;
 }
 
-/// Product of the spatial dims of a [N, C, (D,) H, W] shape — either a shape
-/// vector or a TensorDesc's dims, which is a SmallVector.
+/// Product of the spatial dims of an [N, C, (D,) H, W] shape — a shape vector
+/// or a TensorDesc's dims, which is a SmallVector.
 template <class Shape>
 static int64_t dw_spatial_elems(const Shape& shape)
 {
@@ -355,8 +353,7 @@ NNOPS_TEST(dwconv_nhwc_vs_ref_basic) {
 }
 
 NNOPS_TEST(dwconv_nhwc_vs_ref_partial_block) {
-    // C=5: one full vector and a three-lane tail; the odd width and height put
-    // the border path of every row group on it too.
+    // C=5: an 8-lane call with three lanes masked; OH=7 leaves a three-row group.
     test_nhwc_vs_ref<float>({1, 5, 9, 11}, {5, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}},
         false, 1e-4f);
@@ -399,8 +396,8 @@ NNOPS_TEST(dwconv_nhwc_vs_ref_1x1_stride2) {
 }
 
 NNOPS_TEST(dwconv_nhwc_vs_ref_multi_block) {
-    // C=17: two full blocks and a one-lane tail, on a plane small enough that
-    // the channel axis gets split across tasks.
+    // C=17: one full sixteen-wide block plus a one-lane block; the plane is
+    // small enough that the filter axis splits across tasks.
     test_nhwc_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         true, 1e-4f);
@@ -413,18 +410,17 @@ NNOPS_TEST(dwconv_nhwc_vs_ref_f16) {
 }
 
 NNOPS_TEST(dwconv_nhwc_vs_ref_f16_wide) {
-    // The two-vector 3x3 kernel is generic over the element type; half is a
-    // different `v_load`/`v_fmadd`, so give it its own wide case.
+    // The two-vector 3x3 kernel is generic over T; half is a different
+    // `v_load`/`v_fmadd`, so it gets its own wide case.
     test_nhwc_vs_ref<backend::cpu::half>({1, 32, 10, 10}, {32, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         true, 5e-3f);
 }
 
 NNOPS_TEST(dwconv_nhwc_vs_ref_wide_stride2) {
-    // Exactly two channel vectors with the vertical stride on: the two-vector
-    // 3x3 kernel's stride-2 instantiation, whose row table reads R·2+2 input
-    // rows instead of R+2 and therefore exercises a different row index than
-    // the stride-1 cases above.
+    // C=16 is exactly one sixteen-wide block: the two-vector 3x3 kernel's
+    // stride-2 instantiation, whose row table reads R*2+2 input rows instead of
+    // R+2 — a different index set from the stride-1 cases above.
     test_nhwc_vs_ref<float>({1, 16, 15, 15}, {16, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}},
         true, 1e-4f);
@@ -433,8 +429,8 @@ NNOPS_TEST(dwconv_nhwc_vs_ref_wide_stride2) {
 NNOPS_TEST(dwconv_nhwc_vs_ref_wide_block) {
     // C=48: three full sixteen-wide blocks, each handed to the two-vector 3x3
     // kernel at its own width. Passing the *remaining* channel count instead
-    // covers the same channels through the generic path, so only the harness's
-    // own timing notices — the values here are correct either way.
+    // routes the full blocks through the generic path — the same values, so
+    // only a timing run would notice.
     test_nhwc_vs_ref<float>({1, 48, 9, 9}, {48, 1, 3, 3},
         DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
         false, 1e-4f);

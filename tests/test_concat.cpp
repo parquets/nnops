@@ -1,8 +1,8 @@
 /// @file test_concat.cpp
-/// @brief Unit tests for Concat operator (CPU backend).
+/// @brief Unit tests for Concat (CPU), planar NCHW/NCDHW and packed NCHWC8/NCDHWC8.
 ///
-/// Tests cover planar (NCHW/NCDHW) and packed (NCHWC8/NCDHWC8) layouts,
-/// including C-axis concatenation with packed C8 lane-level merging.
+/// The packed cases are a pack → concat → unpack roundtrip compared against
+/// concat_ref on the planar inputs; the C-axis ones exercise the C8 lane merge.
 
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -16,7 +16,7 @@
 
 using namespace nnops;
 
-// Forward declaration — NCHW scalar reference used as ground truth.
+// Reference kernel, declared test-locally (not exported through a header).
 namespace nnops::backend::cpu::reference {
     void concat_ref(const ConcatAttributes& attrs,
                     TensorView& output,
@@ -27,8 +27,7 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Helper: run concat on packed data (pack → concat → unpack roundtrip)
-/// and compare against the planar reference concat.
+/// Pack → concat → unpack, compared against the planar reference concat.
 void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
                          int64_t axis,
                          DataType dtype = DataType::f32)
@@ -41,7 +40,6 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     const TensorLayout planar_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
     const TensorLayout packed_layout = (srank == 3) ? TensorLayout::NCDHWC8 : TensorLayout::NCHWC8;
 
-    // Create random planar inputs
     std::vector<std::vector<float>> in_bufs(N);
     std::vector<TensorView> in_planars(N);
     for (int64_t i = 0; i < N; ++i) {
@@ -51,11 +49,10 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
         in_planars[static_cast<size_t>(i)] = tv;
     }
 
-    // ---- Golden: reference concat on planar ----
+    // Golden: concat_ref on the planar inputs.
     ConcatAttributes attrs;
     attrs.axis = axis;
 
-    // Compute output shape
     auto op_ref = Concat::create(attrs, Backend::CPU);
     std::vector<TensorDesc> planar_descs(N);
     for (int64_t i = 0; i < N; ++i) {
@@ -76,8 +73,7 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
         backend::cpu::reference::concat_ref(attrs, out_ref, ref_ins, ctx, nullptr);
     }
 
-    // ---- Packed path: pack each input → concat → unpack ----
-    // Pack each input
+    // Packed path: pack each input, concat, unpack.
     std::vector<std::vector<char>> packed_bufs(N);
     std::vector<TensorView> in_packeds(N);
     for (int64_t i = 0; i < N; ++i) {
@@ -94,7 +90,6 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
         pack_op->compute(in_packeds[static_cast<size_t>(i)], pack_ins);
     }
 
-    // Concat on packed
     auto concat_op = Concat::create(attrs, Backend::CPU);
     std::vector<TensorDesc> packed_descs(N);
     for (int64_t i = 0; i < N; ++i) {
@@ -115,7 +110,6 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     }
     concat_op->compute(out_packed, concat_ins);
 
-    // Unpack
     auto unpack_op = LayoutConvert::create(planar_layout, Backend::CPU);
     auto od = out_packed.desc();
     const TensorDesc unpack_in[] = {od};
@@ -130,7 +124,6 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     const TensorView unpack_ins[] = {out_packed};
     unpack_op->compute(res_planar, unpack_ins);
 
-    // Compare with planar reference
     NNOPS_EXPECT_TRUE(test::allclose(res_planar, out_ref, 1e-5f, 1e-5f));
 }
 
@@ -367,7 +360,7 @@ NNOPS_TEST(concat_negative_axis) {
     TensorView b(shape_b, DataType::f32, b_data);
 
     ConcatAttributes attrs;
-    attrs.axis = -1;  // last axis
+    attrs.axis = -1;
     auto op = Concat::create(attrs, Backend::CPU);
 
     auto d_a = a.desc();
@@ -434,7 +427,7 @@ NNOPS_TEST(concat_nchw_axis1) {
 }
 
 NNOPS_TEST(concat_random_2d_ref_vs_simd) {
-    // Verify two class API instances produce identical results
+    // One op instance, two output buffers: the two runs must agree.
     const int64_t shape_a[] = {4, 7};
     const int64_t shape_b[] = {4, 5};
 
@@ -448,7 +441,6 @@ NNOPS_TEST(concat_random_2d_ref_vs_simd) {
     ConcatAttributes attrs;
     attrs.axis = 1;
 
-    // Class API
     auto op = Concat::create(attrs, Backend::CPU);
     auto d_a = a.desc();
     auto d_b = b.desc();
@@ -459,11 +451,9 @@ NNOPS_TEST(concat_random_2d_ref_vs_simd) {
     const TensorView ins[] = {a, b};
     op->compute(output1, ins);
 
-    // Class API (second instance)
     auto output2 = test::make_planar(descs[0], out_ref.data());
     op->compute(output2, ins);
 
-    // Compare
     for (int64_t i = 0; i < total_out; ++i) {
         NNOPS_EXPECT_NEAR(out_simd[i], out_ref[i], 1e-6f);
     }

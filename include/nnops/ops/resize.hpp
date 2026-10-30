@@ -1,6 +1,9 @@
 #pragma once
 /// @file resize.hpp
-/// @brief Resize operator — 2D/3D spatial interpolation, packed NCHWC8/NCDHWC8 layout.
+/// @brief Resize operator — 2D/3D spatial interpolation, packed NCHWC8/NCDHWC8.
+///
+/// Per-axis arrays are [D, H, W]; a rank-4 (2D) input reads only H/W (index 0
+/// is ignored), a rank-5 input all three.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -13,10 +16,9 @@
 
 namespace nnops {
 
-/// Supported interpolation modes.
 enum class ResizeMode : uint8_t {
-    Nearest,  ///< Nearest-neighbor interpolation
-    Linear,   ///< Bilinear (2D) / Trilinear (3D) interpolation
+    Nearest,  ///< Nearest-neighbor
+    Linear,   ///< Bilinear (2D) / trilinear (3D)
 };
 
 /// Coordinate transformation mode for mapping output coords to source coords.
@@ -26,54 +28,33 @@ enum class CoordinateTransformMode : uint8_t {
     Asymmetric,   ///< src = dst * scale
 };
 
-/// Attributes for the Resize operator (supports both 2D and 3D).
-///
-/// For 2D resize (NCHWC8 input, rank=4): output_size[1]=OH, output_size[2]=OW.
-///   output_size[0] is ignored.
-///
-/// For 3D resize (NCDHWC8 input, rank=5): all 3 elements are used (OD, OH, OW).
 struct ResizeAttributes {
     ResizeMode mode = ResizeMode::Nearest;
     CoordinateTransformMode coord_mode = CoordinateTransformMode::HalfPixel;
 
-    /// Output spatial size: [OD, OH, OW]. For 2D, only OH/OW are used.
+    /// Output spatial size [OD, OH, OW]; 2D uses OH/OW.
     std::array<int64_t, 3> output_size = {0, 0, 0};
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// If true, add into the existing output buffer instead of overwriting.
     bool add_to = false;
 
-    /// Crop region in input pixel coordinates.
-    /// crop_start = {start_d, start_h, start_w} — inclusive start.
-    /// crop_end   = {end_d,   end_h,   end_w}   — exclusive end.
-    ///
-    /// When crop_end[d] == 0, no crop is applied for that dimension
-    /// (the full input spatial extent is used).
-    ///
-    /// For 2D input (NCHWC8, rank=4), index 0 (D) is ignored
-    ///   — only crop_start[1]/[2] and crop_end[1]/[2] (H, W) are used.
-    /// For 3D input (NCDHWC8, rank=5), all three indices are used.
-    ///
-    /// Example: input [N,C,8,16,16], crop_start={2,4,4}, crop_end={6,12,12}
-    ///   → crops region d=[2,6), h=[4,12), w=[4,12), then resizes to output_size.
+    /// Crop region in input pixel coords: start inclusive, end exclusive;
+    /// crop_end[d] == 0 leaves that dimension uncropped. 2D uses H/W only.
     std::array<int64_t, 3> crop_start = {0, 0, 0};
     std::array<int64_t, 3> crop_end   = {0, 0, 0};
 
-    /// Returns true if any crop dimension is active (crop_end > 0).
+    /// True if any crop dimension is active (crop_end > 0).
     bool has_crop() const noexcept {
         return crop_end[0] > 0 || crop_end[1] > 0 || crop_end[2] > 0;
     }
 
-    /// Returns the spatial rank (2 or 3) inferred from the input tensor rank.
-    /// For a 4D input (NCHWC8), returns 2. For a 5D input (NCDHWC8), returns 3.
+    /// 2 for a rank-4 input, 3 for rank-5.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
         return input_rank - 2;  // N, C + spatial dims
     }
 };
 
-/// Resize operator (class-based API).
-///
-/// 2D: Input [N, C, IH, IW] → Output [N, C, OH, OW]
-/// 3D: Input [N, C, ID, IH, IW] → Output [N, C, OD, OH, OW]
+/// 2D: [N, C, IH, IW] → [N, C, OH, OW]; 3D adds a D axis.
 class Resize : public OpBase {
 public:
     static std::unique_ptr<Resize> create(const ResizeAttributes& attrs,
@@ -102,7 +83,7 @@ public:
 
     const ResizeAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in resize.cpp (Pimpl pattern)
+    struct Impl;  // defined in resize.cpp
     ~Resize();
 
 private:

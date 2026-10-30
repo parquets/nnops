@@ -1,17 +1,15 @@
 /// @file test_cpu_features.cpp
 /// @brief Tests for the runtime cache-size probes in CpuFeatures.
 ///
-/// A cache size is not something a test can choose — it is a property of the
-/// host — so there is no fixed value to compare against. What *can* be pinned
-/// down is that the number was actually probed rather than left at the member's
-/// default, and that it is self-consistent with the geometry a real cache has.
+/// A cache size is a property of the host, so there is no fixed value to
+/// compare against. What can be pinned down is that the number was probed
+/// rather than left at the member's default, and that it is self-consistent
+/// with the geometry a real cache has.
 ///
-/// That distinction is the whole point here, because the defaults are plausible
-/// cache sizes and a broken probe is invisible from the outside. This is not
-/// hypothetical: the x86_64 path walked CPUID leaf 4, stopped at the first
-/// level-2 entry, and returned without ever recording a level-1 one, so
-/// l1_cache_size() stayed at the 32 KiB fallback on a machine whose L1D is
-/// 48 KiB. Every consumer kept working and nothing failed.
+/// That distinction is the whole point: the defaults (32 KiB L1D, 256 KiB L2)
+/// are themselves plausible cache sizes, so a probe that silently never records
+/// a level is invisible from the outside. The x86_64 test therefore re-runs
+/// CPUID itself instead of hard-coding the answer for one machine.
 
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "common/test_harness.hpp"
@@ -27,20 +25,18 @@ using namespace nnops::simd;
 NNOPS_TEST(cpu_features_cache_sizes_are_plausible) {
     const CpuFeatures& f = CpuFeatures::get();
 
-    // Every x86_64/aarch64 part this library runs on has at least 16 KiB of L1D
-    // (the baseline ISA rules out anything older), and an L2 no smaller than the
-    // L1 — the hierarchy only ever grows outward.
+    // The baseline ISA rules out a part with less than 16 KiB of L1D, and the
+    // hierarchy only grows outward, so L2 is strictly larger.
     NNOPS_EXPECT_TRUE(f.l1_cache_size() >= size_t{16384});
     NNOPS_EXPECT_TRUE(f.l2_cache_size() > f.l1_cache_size());
 
-    // Cache sizes are set-associative geometry, so both are a whole number of
-    // KiB. A bogus decode (say, forgetting the "+1"s in the CPUID fields, which
-    // would land on 32767) fails here.
+    // Set-associative geometry makes both a whole number of KiB; a field-decode
+    // slip in the probe fails here.
     NNOPS_EXPECT_EQ(f.l1_cache_size() % size_t{1024}, size_t{0});
     NNOPS_EXPECT_EQ(f.l2_cache_size() % size_t{1024}, size_t{0});
 
     // The shared-L2 accessor falls back to the per-core value when no separate
-    // figure is known; it must never report *less* than the per-core one.
+    // figure is known, so it must never report less than the per-core one.
     NNOPS_EXPECT_TRUE(f.l2_shared_cache_size() >= f.l2_cache_size());
 }
 
@@ -59,8 +55,8 @@ NNOPS_TEST(cpu_features_cache_sizes_are_plausible) {
 namespace {
 
 /// An independent re-run of the leaf-4 walk, written from the CPUID
-/// documentation rather than by calling into cpu_features.cpp. Duplication is
-/// the point: it is the only way to tell a probed value from a defaulted one
+/// documentation rather than by calling into cpu_features.cpp. The duplication
+/// is the point: it is the only way to tell a probed value from a defaulted one
 /// without hard-coding the answer for one machine.
 void expected_x86_caches(size_t& l1_data, size_t& l2) {
     for (int subleaf = 0; ; ++subleaf) {
@@ -110,7 +106,7 @@ NNOPS_TEST(cpu_features_x86_cache_sizes_match_cpuid) {
 
 NNOPS_TEST(cpu_features_x86_cache_sizes_match_cpuid) {
     // AArch64 reads caches through the OS (getauxval / sysfs / sysctl), not
-    // CPUID, and this host may not even expose them. The invariants above still
+    // CPUID, and this host may not expose them. The invariants above still
     // apply.
 }
 

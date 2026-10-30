@@ -1,22 +1,20 @@
-/// MatMul with a Q4_1 (llama.cpp block format) right-hand side.
+/// MatMul with a Q4_1 (llama.cpp block format) right-hand side: 32 values in a
+/// 20-byte block (fp16 d, fp16 m, 16 nibble bytes), decoded inside the RHS pack
+/// so the weight never becomes a dense buffer.
 ///
-/// The RHS is stored as a stream of 20-byte blocks; MatMul decodes it straight
-/// into its uniform packed-B panels, so the comparison here is against a dense
-/// reference built from the same block stream:
+/// The reference comes from the same block stream, not the operator: encode
+/// exact-in-f16 d/m and quants, run MatMul, then recompute C from the decoded B
+/// honouring transpose_b. Those decoded values are exact in f32 and f16 alike.
 ///
-///   1. encode known 4-bit quants into blocks (d/m exact in f16),
-///   2. run MatMul with the Q4_1 B,
-///   3. compute the expected C from the *decoded* B, honouring transpose_b.
+/// Covered: both physical B layouts, M/N/K tails (K off the 32-value block, N
+/// off the RHS panel), both split directions (N > M, M >= N), f32 and f16
+/// A/output, alpha/beta, the clamp epilogue, a [N] bias, and a batched B whose
+/// per-batch offset is counted in blocks rather than elements.
 ///
-/// Covered: both physical B layouts, M/N/K tails (K not block-aligned, N not a
-/// multiple of the 16-wide panel), both split directions (N > M and M >= N),
-/// f32 and f16 A/output, and a batched B where the batch stride is counted in
-/// blocks rather than elements.
-///
-/// Q4_1 rides two routes: the packed plan (every M) and, on
-/// x86_64 at M ≤ 16 ([N][K]) / M ≤ 8 ([K][N]), the fused small-M kernels that
-/// decode straight into the reduction. The last two tests sweep the fused
-/// route's edge cases.
+/// Two routes share the file: the packed plan serves every M; on x86_64 the
+/// fused small-M kernels (fused_max_m_trans = 16 for [N][K], _copy = 8 for
+/// [K][N]) decode straight into the reduction. matmul_q4_1_small_m and
+/// matmul_q4_1_fused_small_m sweep that route's edges.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q4_1.hpp"
@@ -63,8 +61,8 @@ void encode_block(const int q[q4_1_block_elems], float d, float m,
     std::memcpy(out + 4, qs, 16);
 }
 
-/// Build one [rows, cols] Q4_1 matrix. d/m and the resulting products are
-/// exact in f16, so the decoded values are exact in f32 and f16 alike.
+/// Build one [rows, cols] Q4_1 matrix with f16-exact d/m, so the decoded values
+/// are exact too.
 Q4Matrix build_q4_matrix(int64_t rows, int64_t cols, uint32_t seed) {
     Q4Matrix m;
     m.rows = rows;
@@ -122,8 +120,7 @@ std::vector<float> gen_floats(int64_t n, uint32_t seed) {
     return v;
 }
 
-/// Expected C = A × B, with A in logical [M][K] order and B given by its
-/// decoded values and physical layout.
+/// Expected C = A × B from A in logical [M][K] order and B's decoded values.
 template <class T>
 std::vector<float> reference_matmul(const T* a, const Q4Matrix& b,
                                     int64_t M, int64_t N, int64_t K,
@@ -191,7 +188,6 @@ float apply_expected_epilogue(float v, EpilogueActivateType ep) {
 void run_case(const Case& c) {
     const int64_t M = c.M, N = c.N, K = c.K;
 
-    // A in logical [M][K] order, then the physical copy the flag asks for.
     const std::vector<float> a_f32 = gen_floats(M * K, 0x51u + static_cast<uint32_t>(M + N + K));
     std::vector<half> a_f16_logical;
     if (c.f16) {
@@ -260,8 +256,7 @@ void run_case(const Case& c) {
         return nnops::test::make_planar(descs[0], out_f32.data());
     }();
 
-    // Optional [N] bias in the output dtype, deterministic and exactly
-    // representable in f16.
+    // Optional [N] bias in the output dtype, exactly representable in f16.
     std::vector<float> bias_f32;
     std::vector<half>  bias_f16;
     const int64_t bias_shape[] = {N};
@@ -288,8 +283,8 @@ void run_case(const Case& c) {
         ? reference_matmul<half>(a_f16_logical.data(), b, M, N, K, c.transpose_b)
         : reference_matmul<float>(a_f32.data(), b, M, N, K, c.transpose_b);
 
-    // Post-accumulation semantics shared by every route: C = alpha·(A×B)
-    // + beta·C_old, then the clamp/epilogue. alpha scales the product only.
+    // Every route shares these post-accumulation semantics: C = alpha·(A×B)
+    // + beta·C_old, then the bias and the clamp/epilogue.
     for (int64_t i = 0; i < M * N; ++i) {
         float v = want[static_cast<size_t>(i)];
         if (c.alpha != 1.0f) {
@@ -310,9 +305,8 @@ void run_case(const Case& c) {
     }
 
     // The f16 route accumulates in the arch's native precision (fp32 on x86,
-    // native fp16 on aarch64), so take the shared arch-aware tolerance instead
-    // of a fixed value: near-zero results from a long cancelling reduction are
-    // exactly where the wider aarch64 error shows up.
+    // fp16 on aarch64), so use the shared arch-aware tolerance, not a fixed
+    // one: near-zero cancelling sums are where the wider aarch64 error shows.
     const float rtol = a16 ? nnops::test::kF16AccumTol : 1e-4f;
     const float atol = a16 ? nnops::test::kF16AccumTol : 1e-3f;
     float worst = 0.0f;
@@ -327,8 +321,8 @@ void run_case(const Case& c) {
     (void)worst;
 }
 
-/// Batched: A [2, M, K] × B [2, N, K] → C [2, M, N]. The B batch stride is
-/// N·ceil(K/32) *blocks*, which exercises the block-unit batch offset.
+/// Batched A [2, M, K] × B [2, N, K]: the per-batch B offset is N·ceil(K/32)
+/// blocks, exercising the block-unit batch stride.
 NNOPS_TEST(matmul_q4_1_batched) {
     constexpr int64_t B = 2, M = 4, N = 6, K = 70;
     constexpr bool transpose_b = true;
@@ -381,7 +375,7 @@ NNOPS_TEST(matmul_q4_1_batched) {
 }  // namespace
 
 NNOPS_TEST(matmul_q4_1_f32) {
-    // N > M (split on N), N a non-multiple of the 16-wide panel, K off-block.
+    // N > M (split on N), N off the RHS panel, K off-block.
     run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false});
     // M >= N (split on M), Linear-style [N][K] weight.
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false});
@@ -393,7 +387,7 @@ NNOPS_TEST(matmul_q4_1_f32) {
     run_case({17, 23, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/true});
     run_case({17, 23, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/true});
     // alpha rides the Q4_1 RHS pack (every decoded weight scaled), so the
-    // packed route needs no post-pass; both physical layouts covered.
+    // packed route needs no post-pass.
     run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false,
               0.0f, 2.5f});
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false,
@@ -401,16 +395,15 @@ NNOPS_TEST(matmul_q4_1_f32) {
     run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/false, /*transpose_a=*/false,
               0.5f, 0.5f});
     // A bias enters the accumulator as beta·C_old + bias before the first
-    // k-block, so the overwriting (beta = 0) case must still keep it, and the
-    // f16 panel scaling of alpha stays separate.
+    // k-block, so the overwriting (beta = 0) case must still keep it; the bias
+    // is added unscaled by alpha.
     run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/false, /*transpose_a=*/false,
               0.0f, 1.0f, EpilogueActivateType::None, /*bias=*/true});
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/false, /*transpose_a=*/false,
               0.5f, 2.0f, EpilogueActivateType::None, /*bias=*/true});
 }
 
-/// Decode sizes: M at or below the fused route's limits, so these are the
-/// shapes a decode step actually has.
+/// Decode-sized M, at or below the fused route's limits.
 NNOPS_TEST(matmul_q4_1_small_m) {
     run_case({1, 37, 70, /*transpose_b=*/false, false, false});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false});
@@ -418,7 +411,7 @@ NNOPS_TEST(matmul_q4_1_small_m) {
     run_case({1, 71, 160, /*transpose_b=*/true, false, false});
     run_case({4, 71, 160, /*transpose_b=*/true, false, false});
     run_case({3, 41, 33, /*transpose_b=*/true, false, false});    // partial m rows
-    run_case({8, 130, 70, /*transpose_b=*/true, false, false});   // 16-wide panel tails
+    run_case({8, 130, 70, /*transpose_b=*/true, false, false});   // panel tails
     run_case({4, 37, 70, /*transpose_b=*/true, false, false, 1.0f});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.5f});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false, 0.0f, 1.0f,
@@ -431,11 +424,10 @@ NNOPS_TEST(matmul_q4_1_small_m) {
               EpilogueActivateType::Relu6, /*bias=*/true});
 }
 
-/// The small-M fused route: Q4_1 blocks decoded straight into the reduction
-/// (no packed-B panel). [K][N] B runs the
-/// outer-product kernel (MR ≤ 2), [N][K] B the dot-product one (M ≤ 16, two
-/// 8-row panels); the cases cover row aliasing, K tails, N tiles, beta and the
-/// clamped epilogue.
+/// The fused small-M route decodes Q4_1 blocks straight into the reduction (no
+/// packed-B panel): [K][N] B runs the outer-product kernel (MR ≤ 2), [N][K] B
+/// the dot-product one (MR ≤ 8 per call). Cases cover partial-M panels, K
+/// tails, N tiles, beta and the clamped epilogue.
 NNOPS_TEST(matmul_q4_1_fused_small_m) {
     run_case({1, 37, 70, /*transpose_b=*/false, false, false});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false});
@@ -482,8 +474,8 @@ NNOPS_TEST(matmul_q4_1_f16) {
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false});
     run_case({24, 71, 160, /*transpose_b=*/true, /*f16=*/true, /*transpose_a=*/false});
     run_case({17, 23, 70, /*transpose_b=*/true, /*f16=*/true, /*transpose_a=*/true});
-    // The f16 panel is scaled in f16 after the decode, so the rounding is one
-    // more step than the f32 route's — same arch-aware tolerance.
+    // The f16 route folds alpha into each block's d/m in f32, then rounds once
+    // on store — the same arch-aware tolerance covers it.
     run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/true, /*transpose_a=*/false,
               0.0f, 2.0f});
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false,

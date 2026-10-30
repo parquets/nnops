@@ -1,17 +1,17 @@
 /// @file embed.cpp
-/// @brief SIMD-optimized CPU implementation of embedding table lookup.
+/// @brief CPU embedding lookup — a row copy for fp weights, per-row dequant for
+/// int8/uint8.
 ///
-/// Supports direct lookup (f32/f16 weight) and int8 quantized weight with
-/// per-row dequantization: output[j] = (weight[idx,j] - zp[idx]) * scale[idx].
+/// output row i is weight[indices[i]], with s32 or s64 indices clamped to
+/// [0, V-1]; the indices are the parallel axis, run through ctx.cpu.run.
 ///
-/// The core operation is copying (f32/f16) or dequantizing (int8) embedding
-/// rows, parallelized over indices via ctx.cpu.run.
-///
-/// For int8/uint8 dequantization, the per-row arithmetic is delegated to the
-/// raw arch kernels in `x86_64/quant.hpp` / `aarch64/quant.hpp`
-/// (quant_kernel::dequantization<T>), which output f32 or f16 directly. The f16
-/// path uses the fused half-output overload, dequantizing straight into the f16
-/// output in a single pass (no f32 staging workspace).
+/// An s8/u8 weight dequantizes per row: out[j] = (w[idx,j] - zp[idx]) * scale[idx],
+/// via the arch kernels (`quant_kernel::dequantization<T>` in x86_64/quant.hpp /
+/// aarch64/quant.hpp); the f16 output overload writes f16 in one pass, with no
+/// f32 staging buffer. Quantization must be per-row — PerToken does this
+/// directly, and PerChannel on the [V, dim] weight quantizes along axis 0 (the
+/// vocab entry), so it is the same thing. Per-tensor and block granularities
+/// are rejected.
 
 #include "nnops/ops/embed.hpp"
 #include "nnops/detail/assert.hpp"
@@ -84,12 +84,6 @@ void embed_direct_impl(const EmbedAttributes& /*attrs*/,
     ctx.cpu.run(0, num_indices, body);
 }
 
-// The per-row dequant arithmetic is delegated to the raw arch kernels in
-// `x86_64/quant.hpp` (AVX2+FMA) / `aarch64/quant.hpp` (NEON):
-// `quant_kernel::dequantization<T>`. The f32 overload writes f32 output; the
-// fused half-output overload dequantizes straight into f16 in a single pass —
-// no f32 staging scratch.
-
 template <typename T>  // T = weight storage type (int8_t / uint8_t)
 void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
                               TensorView& output,
@@ -100,10 +94,6 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
     const auto& indices = inputs[1];
 
     const auto& qp = weight.quant_params();
-    // Embed weight [vocab_size, dim] is quantized per-row: one (scale,
-    // zero_point) per vocab entry. PerToken does this directly; PerChannel on a
-    // 2D weight quantizes along axis 0 (the vocab entry) — identical to
-    // PerToken. Per-tensor and block quantization are not supported: reject.
     const bool per_row = (qp.granularity == QuantGranularity::PerToken)
                       || (qp.granularity == QuantGranularity::PerChannel);
     NNOPS_ASSERT(per_row);
@@ -138,8 +128,6 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
         const float s_val = qp.scale_data[idx];
         const float zp_val = has_zp ? static_cast<float>(qp.zero_point_data[idx]) : 0.0f;
 
-        // Dequantize one (M=1) row directly into the output. The f16 path uses
-        // the fused half-output overload (single pass, no staging scratch).
         if (out_f16) {
             half* dst = output.ptr<half>() + n * out_row_stride;
             quant_kernel::dequantization<T>(1, dim_i, dst, dim_i,
@@ -174,7 +162,6 @@ Status embed_cpu(const EmbedAttributes& attrs,
         return Status::ok;
     }
 
-    // Int8/uint8 weight: dequantize to f32 or f16 output.
     NNOPS_ASSERT(o_dtype == DataType::f32 || o_dtype == DataType::f16);
     if (w_dtype == DataType::s8) {
         embed_int8_dequant_impl<int8_t>(attrs, output, inputs, ctx);

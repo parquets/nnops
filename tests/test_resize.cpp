@@ -17,7 +17,7 @@
 
 using namespace nnops;
 
-// Forward declaration — NCHW scalar reference used as ground truth.
+// NCHW scalar reference — the ground truth.
 namespace nnops::backend::cpu::reference {
     void resize_ref(const ResizeAttributes& attrs,
                     TensorView& output,
@@ -35,16 +35,13 @@ void test_nchwc8_vs_nchw(const std::vector<int64_t>& in_shape,
     const int64_t rank = static_cast<int64_t>(in_shape.size());
     const int64_t srank = rank - 2;  // 2 or 3
 
-    // Determine layouts for this spatial rank.
     const TensorLayout planar_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
     const TensorLayout packed_layout = (srank == 3) ? TensorLayout::NCDHWC8 : TensorLayout::NCHWC8;
 
-    // Random planar input with correct layout for rank (NCHW for 4D, NCDHW for 5D).
     auto [in_vec, in_default] = test::make_random_tensor(in_shape);
     TensorView in_planar(in_default.shape_span(), DataType::f32,
                          in_default.ptr<float>(), planar_layout);
 
-    // ---- Golden: compute reference on planar layout ----
     std::vector<int64_t> oshape_ref = in_shape;
     if (srank == 3) {
         oshape_ref[2] = attrs.output_size[0];
@@ -75,14 +72,12 @@ void test_nchwc8_vs_nchw(const std::vector<int64_t>& in_shape,
         backend::cpu::reference::resize_ref(attrs, out_ref, ref_ins, ctx, nullptr);
     }
 
-    // ---- LayoutConvert: planar → packed ----
     {
         auto pack_op = LayoutConvert::create(packed_layout, Backend::CPU);
         auto d = in_planar.desc();
         const TensorDesc pack_in[] = {d};
         auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
 
-        // Validate pack output descriptor
         NNOPS_EXPECT_EQ(pack_descs[0].rank, rank);
         NNOPS_EXPECT_EQ(pack_descs[0].layout, packed_layout);
         NNOPS_EXPECT_EQ(pack_descs[0].dtype, DataType::f32);
@@ -94,13 +89,11 @@ void test_nchwc8_vs_nchw(const std::vector<int64_t>& in_shape,
         const TensorView pack_ins[] = {in_planar};
         pack_op->compute(in_packed, pack_ins);
 
-        // ---- Resize on packed layout ----
         auto resize_op = Resize::create(attrs, Backend::CPU);
         auto pd = in_packed.desc();
         const TensorDesc resize_in[] = {pd};
         auto resize_descs = resize_op->getOutputTensorDesc(resize_in);
 
-        // Validate resize output descriptor
         NNOPS_EXPECT_EQ(resize_descs[0].rank, rank);
         NNOPS_EXPECT_EQ(resize_descs[0].layout, packed_layout);
         NNOPS_EXPECT_EQ(resize_descs[0].dtype, DataType::f32);
@@ -125,13 +118,11 @@ void test_nchwc8_vs_nchw(const std::vector<int64_t>& in_shape,
         const TensorView resize_ins[] = {in_packed};
         resize_op->compute(out_packed, resize_ins);
 
-        // ---- LayoutConvert: packed → planar ----
         auto unpack_op = LayoutConvert::create(planar_layout, Backend::CPU);
         auto od = out_packed.desc();
         const TensorDesc unpack_in[] = {od};
         auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in);
 
-        // Validate unpack output descriptor
         NNOPS_EXPECT_EQ(unpack_descs[0].rank, rank);
         NNOPS_EXPECT_EQ(unpack_descs[0].layout, planar_layout);
         NNOPS_EXPECT_EQ(unpack_descs[0].dtype, DataType::f32);
@@ -151,15 +142,13 @@ void test_nchwc8_vs_nchw(const std::vector<int64_t>& in_shape,
         const TensorView unpack_ins[] = {out_packed};
         unpack_op->compute(res_planar, unpack_ins);
 
-        // ---- Compare with golden ----
         float rtol = (attrs.mode == ResizeMode::Linear) ? 1e-3f : 1e-4f;
         float atol = (attrs.mode == ResizeMode::Linear) ? 1e-3f : 1e-4f;
         NNOPS_EXPECT_TRUE(test::allclose(res_planar, out_ref, rtol, atol));
     }
 }
 
-/// Manual roundtrip helper for hand-verified tests with known input data.
-/// pack → resize → unpack using class API, then call the user's validation callback.
+/// pack → resize → unpack via the class API, then hand the result to the caller's validator.
 template <typename ValidateFn>
 void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
                            const std::vector<int64_t>& out_shape,
@@ -172,11 +161,10 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     const TensorLayout planar_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
     const TensorLayout packed_layout = (srank == 3) ? TensorLayout::NCDHWC8 : TensorLayout::NCHWC8;
 
-    // Copy input data into a vector (LayoutConvert reads from it).
+    // TensorView takes a mutable buffer; copy the const input.
     std::vector<float> in_buf = in_data;
     TensorView in_planar(std::span<const int64_t>(in_shape), DataType::f32, in_buf.data(), planar_layout);
 
-    // Pack
     auto pack_op = LayoutConvert::create(packed_layout, Backend::CPU);
     auto d = in_planar.desc();
     const TensorDesc pack_in[] = {d};
@@ -191,7 +179,6 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     const TensorView pack_ins[] = {in_planar};
     pack_op->compute(in_packed, pack_ins);
 
-    // Resize
     auto resize_op = Resize::create(attrs, Backend::CPU);
     auto pd = in_packed.desc();
     const TensorDesc resize_in[] = {pd};
@@ -206,7 +193,6 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     const TensorView resize_ins[] = {in_packed};
     resize_op->compute(out_packed, resize_ins);
 
-    // Unpack
     auto unpack_op = LayoutConvert::create(planar_layout, Backend::CPU);
     auto od = out_packed.desc();
     const TensorDesc unpack_in[] = {od};
@@ -221,7 +207,6 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     const TensorView unpack_ins[] = {out_packed};
     unpack_op->compute(res_planar, unpack_ins);
 
-    // Validate
     validate_fn(res_planar);
 }
 
@@ -232,7 +217,6 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
 // ============================================================
 
 NNOPS_TEST(resize_2d_nearest_upsample) {
-    // 1x1x2x2 -> 1x1x4x4, nearest with Asymmetric mode
     const std::vector<int64_t> ishape = {1, 1, 2, 2};
     const std::vector<int64_t> oshape = {1, 1, 4, 4};
     const std::vector<float> in_data = {1, 2, 3, 4};
@@ -292,7 +276,6 @@ NNOPS_TEST(resize_2d_nearest_identity) {
 // ============================================================
 
 NNOPS_TEST(resize_2d_linear_align_corners_corners_exact) {
-    // 1x1x2x2 -> 1x1x4x4, bilinear with AlignCorners
     const std::vector<int64_t> ishape = {1, 1, 2, 2};
     const std::vector<int64_t> oshape = {1, 1, 4, 4};
     const std::vector<float> in_data = {1, 2, 3, 4};
@@ -391,10 +374,6 @@ NNOPS_TEST(resize_3d_multichannel) {
     test_nchwc8_vs_nchw({1, 3, 8, 16, 16}, attrs);
 }
 
-// ============================================================
-// Add-to mode
-// ============================================================
-
 NNOPS_TEST(resize_add_to) {
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
@@ -403,10 +382,6 @@ NNOPS_TEST(resize_add_to) {
     attrs.add_to = true;
     test_nchwc8_vs_nchw({1, 1, 4, 4}, attrs);
 }
-
-// ============================================================
-// HalfPixel coordinate mode
-// ============================================================
 
 NNOPS_TEST(resize_2d_linear_half_pixel) {
     ResizeAttributes attrs;
@@ -417,7 +392,7 @@ NNOPS_TEST(resize_2d_linear_half_pixel) {
 }
 
 // ============================================================
-// Partial C8 tests (zero-padded, all C8 blocks use SIMD)
+// Partial C8 tests (zero-padded)
 // ============================================================
 
 NNOPS_TEST(resize_partial_c8_nearest) {
@@ -453,11 +428,10 @@ NNOPS_TEST(resize_multi_c8_nearest) {
 }
 
 // ============================================================
-// Crop + resize tests — crop a sub-region then resize to output
+// Crop + resize tests
 // ============================================================
 
 NNOPS_TEST(resize_2d_crop_nearest_upsample) {
-    // 1x1x8x8 input, crop center 4x4 region [2:6, 2:6], resize to 8x8
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
@@ -468,7 +442,6 @@ NNOPS_TEST(resize_2d_crop_nearest_upsample) {
 }
 
 NNOPS_TEST(resize_2d_crop_nearest_downsample) {
-    // Crop a 8x8 sub-region from 16x16, then nearest-downsample to 4x4
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
@@ -479,7 +452,6 @@ NNOPS_TEST(resize_2d_crop_nearest_downsample) {
 }
 
 NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
-    // Crop center 4x4 from 10x10, bilinear upsample to 12x12
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
@@ -490,7 +462,6 @@ NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
 }
 
 NNOPS_TEST(resize_2d_crop_bilinear_align_corners) {
-    // Crop + bilinear with AlignCorners coordinate mode
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::AlignCorners;
@@ -512,7 +483,6 @@ NNOPS_TEST(resize_2d_crop_full_image) {
 }
 
 NNOPS_TEST(resize_2d_crop_single_pixel_output) {
-    // Crop a thin 2x2 strip, resize down to 1x1 (single pixel)
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
@@ -523,7 +493,6 @@ NNOPS_TEST(resize_2d_crop_single_pixel_output) {
 }
 
 NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
-    // Crop includes top-left corner (start at origin, partial end)
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
@@ -534,7 +503,6 @@ NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
 }
 
 NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
-    // Crop includes bottom-right corner
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
@@ -545,7 +513,6 @@ NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
 }
 
 NNOPS_TEST(resize_2d_crop_multichannel) {
-    // Multi-channel crop + resize
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
@@ -556,7 +523,7 @@ NNOPS_TEST(resize_2d_crop_multichannel) {
 }
 
 NNOPS_TEST(resize_2d_crop_partial_c8) {
-    // Crop with partial C8 channels (3 channels → 1 C8 block, zero-padded)
+    // 3 channels -> one zero-padded C8 block.
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
@@ -567,7 +534,6 @@ NNOPS_TEST(resize_2d_crop_partial_c8) {
 }
 
 NNOPS_TEST(resize_2d_crop_add_to) {
-    // Crop + add_to mode
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
@@ -583,7 +549,6 @@ NNOPS_TEST(resize_2d_crop_add_to) {
 // ============================================================
 
 NNOPS_TEST(resize_3d_crop_nearest) {
-    // Crop D=[1:3), H=[2:6), W=[2:6) from 4x8x8, then nearest to 4x4x4
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
@@ -594,7 +559,6 @@ NNOPS_TEST(resize_3d_crop_nearest) {
 }
 
 NNOPS_TEST(resize_3d_crop_trilinear) {
-    // Crop center region from 8x12x12, trilinear to 4x6x6
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
@@ -616,7 +580,6 @@ NNOPS_TEST(resize_3d_crop_full_volume) {
 }
 
 NNOPS_TEST(resize_3d_crop_partial_c8) {
-    // 3D crop with partial C8 channels
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
@@ -627,7 +590,6 @@ NNOPS_TEST(resize_3d_crop_partial_c8) {
 }
 
 NNOPS_TEST(resize_3d_crop_align_corners) {
-    // 3D crop + trilinear with AlignCorners
     ResizeAttributes attrs;
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::AlignCorners;
@@ -654,7 +616,7 @@ NNOPS_TEST(resize_2d_crop_nearest_hand_verified) {
     //   dst=0 → src=0.0, round=0
     //   dst=1 → src=0.5, round=1  (std::round half-away-from-zero)
     //   dst=2 → src=1.0, round=1
-    //   dst=3 → src=1.5, round=2 → clamp(2,2)=1
+    //   dst=3 → src=1.5, round=2 → clamped to the last crop index (1)
     //
     // Expected output (4x4):
     //   6   7   7   7
@@ -707,11 +669,6 @@ NNOPS_TEST(resize_2d_crop_bilinear_hand_verified) {
     // src_h = dst * (2-1)/(3-1) = dst * 0.5
     // dst_h=0 -> src_h=0.0 (row 0, col 0), dst_h=2 -> src_h=1.0 (row 1, col 1)
     // dst_h=1 -> src_h=0.5 (interpolate row 0/1)
-    //
-    // Output:
-    //   1.0   1.5   2.0
-    //   2.5   3.0   3.5
-    //   4.0   4.5   5.0
     const std::vector<int64_t> ishape = {1, 1, 3, 3};
     const std::vector<float> in_data = {
         1, 2, 3,

@@ -1,11 +1,17 @@
 /// @file test_moe.cpp
 /// @brief Tests for the MoE operator (CPU, f32/f16).
 ///
-/// The optimized kernel is checked against `reference::moe_ref`, which shares no
-/// code with it. The top-K > 1 cases get their own tests with a *real* thread
-/// pool injected through ComputeContext — under the default (sequential) context
-/// a lost update in the router/accumulate step would never surface, so the
-/// scheduling fix would be untested.
+/// The kernel is checked against `reference::moe_ref`, which shares no code with
+/// it. Only the two threaded top-K cases inject a real thread pool
+/// (SimpleMoEPool) through ComputeContext; everything else runs on the default
+/// context, which is sequential. The pool rendezvouses its workers before any
+/// body runs, so they all start together — a broken kernel that accumulates
+/// into output[token] per expert only loses an update when two workers are
+/// inside their loops at once, so thread-creation stagger alone makes it merely
+/// probable. Measured against a knowingly broken kernel, the threaded pair
+/// caught it in about four runs out of five, hence the repeats. The structural
+/// proof lives in moe_hand_computed, which pins the two-phase arithmetic for
+/// k == 2 against an exact expected value.
 
 #include "nnops/ops/moe.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -25,8 +31,6 @@
 
 using namespace nnops;
 
-// Reference kernel for comparison (test-local declaration, following the
-// test_matmul.cpp / test_conv2d.cpp pattern).
 namespace nnops::backend::cpu::reference {
 void moe_ref(const MoEAttributes& attrs,
              TensorView& output,
@@ -35,19 +39,8 @@ void moe_ref(const MoEAttributes& attrs,
              void* workspace);
 }
 
-// Minimal fixed-size thread pool exposing a CpuBackend (test_conv2d.cpp
-// pattern). Items in [begin, end) are claimed via an atomic counter; each
-// worker runs body(i) until the range is exhausted.
-//
-// Unlike the bench/test pools this one *rendezvouses* the workers before any
-// body runs. That matters for the MoE tests: a broken kernel that accumulates
-// into output[token] from the per-expert loop only loses an update if two
-// workers are inside their accumulate loops at the same moment. With ordinary
-// thread-creation stagger the tasks fan out and a lost update is merely
-// *probable*. Measured against a knowingly-broken kernel, the stagger version
-// caught it in about two runs out of three; starting every worker at the same
-// instant improved that to about four out of five. Neither is a guarantee — see
-// the note on moe_f32_topk_threaded.
+/// Fixed-size pool whose workers rendezvous before the first body call (see the
+/// file header).
 struct SimpleMoEPool {
     explicit SimpleMoEPool(int nthreads) : nthreads_(nthreads) {
         cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
@@ -98,8 +91,8 @@ using nnops::test::XorShift128;
 // Problem setup
 // ============================================================
 
-/// One tensor of the MoE problem: the shape, and the f32 / f16 host buffers
-/// behind it. Only one of the two is live at a time (see MoEProblem::dtype).
+/// One tensor: a shape plus f32 and f16 host buffers; the problem's dtype picks
+/// the live one.
 struct Buf {
     std::vector<int64_t> shape;
     std::vector<float> f32;
@@ -119,8 +112,8 @@ struct Buf {
 
     void to_f16() { f16 = nnops::test::f32_to_f16(f32); }
 
-    /// Replace the f32 values with their f16 round-trip, so a reference run sees
-    /// exactly the numbers the f16 kernel saw.
+    /// Rewrite f32 from the f16 values, so a reference run sees the numbers the
+    /// f16 kernel saw.
     void round_trip_f16() { f32 = nnops::test::f16_to_f32(f16); }
 
     TensorView view(DataType dt) {
@@ -131,8 +124,8 @@ struct Buf {
     }
 };
 
-/// A whole MoE problem: shapes, the nine input buffers, and which optional ones
-/// are actually supplied.
+/// A whole MoE problem: shapes, the nine buffers, and which optional ones are
+/// supplied.
 struct MoEProblem {
     int64_t T = 4, H = 8, E = 2, I = 8;
     DataType dtype = DataType::f32;
@@ -141,8 +134,8 @@ struct MoEProblem {
     bool has_fc1b = true, has_fc2b = true;
     bool has_fc3w = false, has_fc3b = false, has_rw = false;
 
-    /// Build with random data. fc3w (and its bias) is only materialized when
-    /// requested — SwiGLU Separate is the only path that uses it.
+    /// Build with random data; fc3 and its bias are passed only when requested
+    /// (SwiGLU is the only path that reads them).
     void build(uint64_t seed = 1, bool with_fc3 = false) {
         input.shape  = {T, H};
         router.shape = {T, E};
@@ -188,9 +181,8 @@ struct MoEProblem {
         return bufs;
     }
 
-    /// All nine inputs, with the absent optional ones as empty views. Passing
-    /// the empties explicitly (rather than truncating) exercises the op's
-    /// `is_empty()` handling.
+    /// All nine inputs; absent optionals are empty views, so the op's
+    /// `is_empty()` handling is exercised rather than truncated away.
     std::vector<TensorView> inputs(DataType dt) {
         std::vector<TensorView> ins;
         ins.reserve(9);
@@ -213,7 +205,7 @@ struct MoEProblem {
 // Runners
 // ============================================================
 
-/// Run the op (f16) or the reference (always f32) and return the output as f32.
+/// Run the kernel at `dt` or the f32 reference, and return the output as f32.
 std::vector<float> run_moe(MoEProblem& p, const MoEAttributes& attrs,
                            const ComputeContext& ctx, DataType dt, bool use_ref)
 {
@@ -268,8 +260,8 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b)
     return worst;
 }
 
-/// allclose-style check (atol + rtol*|expected|) with a message naming the
-/// worst element, so a failure is diagnosable without a debugger.
+/// allclose-style check (atol + rtol*|expected|) naming the worst element, so a
+/// failure is diagnosable without a debugger.
 void expect_close(const std::vector<float>& got, const std::vector<float>& want,
                   float rtol, float atol, const std::string& what)
 {
@@ -296,7 +288,6 @@ void expect_close(const std::vector<float>& got, const std::vector<float>& want,
     }
 }
 
-/// Kernel vs reference on the same problem, the standard assertion of this file.
 void expect_matches_ref(MoEProblem& p, const MoEAttributes& attrs,
                         const ComputeContext& ctx = {},
                         float rtol = 1e-4f, float atol = 1e-5f,
@@ -311,8 +302,8 @@ void expect_matches_ref(MoEProblem& p, const MoEAttributes& attrs,
 // Tests
 // ============================================================
 
-// Descriptor / workspace contract: shape-preserving, dtype-preserving, and the
-// op allocates no caller-side workspace (staging comes from the internal pool).
+// Descriptor / workspace contract: shape- and dtype-preserving, and no
+// caller-side workspace (staging comes from the internal pool).
 NNOPS_TEST(moe_output_desc)
 {
     MoEAttributes attrs;
@@ -347,8 +338,8 @@ NNOPS_TEST(moe_output_desc)
 }
 
 // Small expert: M*N*K stays under GEMM_FAST_PATH_THRESHOLD, so the inner GEMMs
-// take the f32 fast path that routes to matmul_ref — the one that reads the old
-// C. Exercises the zero-before-GEMM guard against NaN-contaminated pool memory.
+// take the naive small path. expert_gemm memsets the output first, so nothing
+// left in recycled pool memory survives into the GEMM.
 NNOPS_TEST(moe_f32_small_experts)
 {
     MoEProblem p;
@@ -405,19 +396,10 @@ NNOPS_TEST(moe_f32_fc2_bias_only)
     expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe_f32_fc2_bias_only");
 }
 
-// The core top-K > 1 case, under real threads. A token served by k == E experts
-// is written by every worker: accumulating straight into output[token] from the
-// per-expert loop loses updates. E is pinned to the worker count so all experts
-// are in flight simultaneously, and the case is repeated because a lost update
-// is a timing accident, not a certainty.
-//
-// Detection is probabilistic, and deliberately so — no amount of shape tuning
-// made it deterministic. Measured against a knowingly-broken kernel (phase A
-// accumulating into the output directly), this pair of threaded tests catches it
-// in roughly four runs out of five; each run is a fresh chance. That is a
-// regression guard, not a proof. The proof is structural and lives elsewhere:
-// moe_hand_computed pins the two-phase arithmetic for k == 2 with an exact
-// expected value, and every non-threaded case compares against the reference.
+// The core top-K > 1 case under real threads: every token is served by k == E
+// experts, so all workers pass through the accumulate step. E is pinned to the
+// pool size so all experts are in flight at once; the repeats are there because
+// detection is probabilistic (see the file header).
 NNOPS_TEST(moe_f32_topk_threaded)
 {
     MoEProblem p;
@@ -643,16 +625,14 @@ NNOPS_TEST(moe_sigmoid_routing_normalized)
     NNOPS_EXPECT_TRUE(max_abs_diff(run_kernel(p, attrs), run_kernel(p, raw)) > 1e-3f);
 }
 
-// SqrtSoftplus over logits that run past the softplus guard (llama.cpp's
-// ggml_compute_softplus_f32 switches to the identity above 20 to keep
-// log1p(exp(x)) from overflowing). The reference takes the same branch, so
+// SqrtSoftplus over logits that run past the guard at 20 (above it the kernel
+// returns x instead of log1p(exp(x))). The reference takes the same branch, so
 // agreement alone proves nothing here — the finiteness check is what catches a
 // missing guard, since exp(100) is inf and sqrt(inf) is still inf.
 //
-// The logits are laid out explicitly rather than randomly: the guard only
-// matters above ln(FLT_MAX) ~ 88.7, which a uniform draw of f32 values reaches
-// only some of the time. A random fill here would be a test that passes or
-// fails by luck.
+// The logits are laid out explicitly rather than randomly: the fill here is
+// uniform over [-1, 1] and never reaches even the guard at 20, let alone the
+// ~88.7 past which a missing guard would show up as inf.
 NNOPS_TEST(moe_sqrt_softplus_routing_large_logits)
 {
     MoEProblem p;
@@ -762,9 +742,10 @@ NNOPS_TEST(moe_skewed_routing_empty_experts)
     expect_close(after, before, 0.0f, 0.0f, "moe skewed routing ignores empty experts");
 }
 
-// Ties go to the lower expert index. Both experts carry identical weights, so
-// the only thing distinguishing them is the mixing weight this test injects via
-// router_weights: rw[t, e] = e + 1. Selecting expert 0 scales by 1, expert 1 by 2.
+// Ties go to the lower expert index. Both experts carry identical weights and
+// both logits are 0, so the tie is exact; the mixing weight comes from
+// router_weights, which turns the selected index into an output scale (table A:
+// expert 0 -> 1.0, expert 1 -> 2.0).
 NNOPS_TEST(moe_tie_break_prefers_lower_index)
 {
     MoEProblem p;
@@ -814,8 +795,8 @@ NNOPS_TEST(moe_tie_break_prefers_lower_index)
     expect_close(lower, lower_ref, 1e-4f, 1e-5f, "moe tie-break");
 }
 
-// Hand-computed 2x2 case: no pooling, no accumulation subtleties, just the
-// routing arithmetic checked against numbers worked out on paper.
+// Hand-computed 2x2 case: no threading, just the routing arithmetic checked
+// against numbers worked out on paper.
 //
 //   x = [1, 2], logits = [0, 0] -> p = [0.5, 0.5], k = 2 (both, in index order)
 //   expert 0: W1 = I, W2 = I        -> out0 = [1, 2]
@@ -868,15 +849,13 @@ NNOPS_TEST(moe_single_expert)
     expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe single expert");
 }
 
-// f16: the kernel runs the whole FC1 -> activation -> FC2 chain in f16 (aarch64
-// accumulates in native fp16), while the reference computes the same problem in
-// f32. Both see bit-identical inputs — the f16 buffers are converted straight
-// back to f32 for the reference — so the tolerance only has to cover the f16
-// chain, and kF16AccumTol is the arch-specific bound the other f16 tests use.
-// It is a loose bound by design (it is sized for K near 256; this case runs
-// K = 32 twice), so the margin is wide: measured at 0.010 against a 0.2 budget
-// on aarch64. Tightening it here would just re-derive a second arch-dependent
-// constant for no extra coverage.
+// f16: the kernel runs the whole FC1 -> activation -> FC2 chain in f16, while
+// the reference recomputes the same problem in f32. Both see the same inputs —
+// the f16 buffers are converted back to f32 for the reference — so the tolerance
+// only has to cover the f16 chain, and kF16AccumTol is the arch-specific bound
+// the other f16 GEMM-family tests share (x86 widens to f32 and adds there,
+// aarch64 accumulates in native fp16). It is sized for K near 256, and this case
+// runs K = 32 twice (H = I = 32), so the margin is wide.
 NNOPS_TEST(moe_f16)
 {
     MoEProblem p;

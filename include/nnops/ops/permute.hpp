@@ -2,10 +2,9 @@
 /// @file permute.hpp
 /// @brief Permute operator — dimension reordering (transpose).
 ///
-/// Rearranges tensor dimensions according to a given permutation order.
-/// Equivalent to `np.transpose()` or `torch.permute()`.
-///
-/// Supports Planar layout only. For packed layouts, use LayoutConvert first.
+/// Equivalent to `np.transpose()` / `torch.permute()`, with
+/// output.shape[i] = input.shape[perm[i]]. Planar layout only; packed layouts
+/// must go through LayoutConvert first.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -18,21 +17,11 @@
 
 namespace nnops {
 
-/// Attributes for the Permute operator.
 struct PermuteAttributes {
-    /// Permutation order. perm[i] specifies which input dimension
-    /// maps to output dimension i.
-    /// Default: empty (caller must provide valid permutation).
+    /// perm[i] is the input dim mapped to output dim i; one entry per rank.
     detail::SmallVector<int64_t, TensorDesc::kMaxRank> perm;
 };
 
-/// Dimension reordering (transpose) operator.
-///
-/// Computes: output[d0, d1, ...] = input[perm[d0], perm[d1], ...]
-///   where output.shape[i] = input.shape[perm[i]].
-///
-/// Input:  X [*]  (any rank, planar only)
-/// Output: Y [*]  (same dtype, permuted shape, planar)
 class Permute : public OpBase {
 public:
     static std::unique_ptr<Permute> create(const PermuteAttributes& attrs,
@@ -64,7 +53,7 @@ public:
 
     const PermuteAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in permute.cpp (Pimpl pattern)
+    struct Impl;  // defined in permute.cpp
     ~Permute();
 
 private:

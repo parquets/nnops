@@ -11,12 +11,16 @@
 /// Semantics (see linear_attention.hpp for the full contract). Per (batch, kv
 /// head), carrying S[D, D] over the sequence, every token t runs:
 ///
-///   k, v, q  = causal_conv(Q/K/V rows at t)     (when conv weights are given)
+///   q, k, v = causal_conv(Q/K/V rows at t)      (when conv weights are given)
 ///   S[i][:] *= exp(Gate[t, i])                  decay the state
 ///   r[j]     = sum_i S[i][j] * k[i]             retrieval, on the decayed S
 ///   d[j]     = beta_t * (v[j] - r[j])           delta
 ///   S[i][j] += k[i] * d[j]                      rank-1 update
 ///   o[j]     = scale * sum_i q[i] * S[i][j]     readout, once per query head
+///
+/// The conv weights pack Q | K | V along the channel axis (C = (H + 2*H_kv)*D)
+/// and run causally with zeros left of t = 0. The state is carried in f32 and
+/// overwritten in place; beta is one scalar per (batch, kv head, token).
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
@@ -32,7 +36,6 @@ namespace {
 
 using nnops::backend::cpu::half;
 
-// Scalar I/O bridge: f32 in, f32 out, converting for f16.
 inline float load_f(const float* p) noexcept { return *p; }
 inline float load_f(const half* p) noexcept { return half_to_float(*p); }
 inline void store_f(float* p, float v) noexcept { *p = v; }
@@ -65,7 +68,7 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
         ? attrs.scale
         : 1.0f / std::sqrt(static_cast<float>(D));
 
-    // Element strides (planar, row-major; the trailing dim is contiguous).
+    // Element strides; the trailing dim is contiguous.
     const int64_t qs0 = Q.stride_elems(0), qs1 = Q.stride_elems(1), qs2 = Q.stride_elems(2);
     const int64_t ks0 = K.stride_elems(0), ks1 = K.stride_elems(1), ks2 = K.stride_elems(2);
     const int64_t vs0 = V.stride_elems(0), vs1 = V.stride_elems(1), vs2 = V.stride_elems(2);
@@ -79,10 +82,9 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
     const int64_t bs1  = has_beta ? inputs[5].stride_elems(1) : 0;
     const int64_t bs2  = has_beta ? inputs[5].stride_elems(2) : 0;
 
-    // Convolution channel bases. The weights pack Q | K | V along channels:
-    //   Q channels [0, H*D), K channels [H*D, H*D + H_kv*D), V after that.
-    const int64_t k_ch_base = H * D;                 // K starts right after Q
-    const int64_t v_ch_base = H * D + H_kv * D;      // V starts right after K
+    // Conv channel bases: Q is H*D wide, then K and V, H_kv*D each.
+    const int64_t k_ch_base = H * D;
+    const int64_t v_ch_base = H * D + H_kv * D;
 
     std::vector<float> Sf(static_cast<size_t>(D) * static_cast<size_t>(D));
     std::vector<float> kc(static_cast<size_t>(D));
@@ -91,10 +93,7 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
     std::vector<float> d(static_cast<size_t>(D));
     std::vector<float> acc(static_cast<size_t>(D));
 
-    // Fill dst[0..D) with the row of `src` at time t, causally convoluted when
-    // conv weights are present. `src` points at the (batch, head) origin of the
-    // sequence and `src_ts` is the stride between consecutive tokens; `ch_base`
-    // is this row's first convolution channel.
+    // Row t of `src`, causally convolved when conv weights are present.
     const T* cw = has_conv ? inputs[4].ptr<T>() : nullptr;
     auto fetch_row = [&](const T* src, int64_t src_ts, int64_t ch_base,
                          int64_t t, float* dst) {
@@ -127,7 +126,6 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
         for (int64_t hkv = 0; hkv < H_kv; ++hkv) {
             const int64_t hq0 = hkv * Gq;
 
-            // Read the carried state (f32).
             for (int64_t i = 0; i < D; ++i) {
                 for (int64_t j = 0; j < D; ++j) {
                     Sf[static_cast<size_t>(i * D + j)] =
@@ -143,14 +141,12 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
                 fetch_row(k_base, ks2, k_ch_base + hkv * D, t, kc.data());
                 fetch_row(v_base, vs2, v_ch_base + hkv * D, t, vc.data());
 
-                // 1. Decay: S[i][:] *= exp(gate[t, i]).
                 for (int64_t i = 0; i < D; ++i) {
                     const float g = std::exp(load_f(g_base + t * gs2 + i));
                     float* row = Sf.data() + i * D;
                     for (int64_t j = 0; j < D; ++j) { row[j] *= g; }
                 }
 
-                // 2. Retrieval r[j] = sum_i S[i][j] * k[i], on the decayed S.
                 std::fill(d.begin(), d.end(), 0.0f);
                 for (int64_t i = 0; i < D; ++i) {
                     const float ki = kc[static_cast<size_t>(i)];
@@ -158,7 +154,6 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
                     for (int64_t j = 0; j < D; ++j) { d[static_cast<size_t>(j)] += row[j] * ki; }
                 }
 
-                // 3. Delta d[j] = beta * (v[j] - r[j]).
                 const float beta = has_beta
                     ? load_f(inputs[5].ptr<T>() + b * bs0 + hkv * bs1 + t * bs2)
                     : 1.0f;
@@ -167,14 +162,12 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
                         beta * (vc[static_cast<size_t>(j)] - d[static_cast<size_t>(j)]);
                 }
 
-                // 4. Rank-1 update S[i][j] += k[i] * d[j].
                 for (int64_t i = 0; i < D; ++i) {
                     const float ki = kc[static_cast<size_t>(i)];
                     float* row = Sf.data() + i * D;
                     for (int64_t j = 0; j < D; ++j) { row[j] += ki * d[static_cast<size_t>(j)]; }
                 }
 
-                // 5. Readout, once per query head in this kv head's group.
                 for (int64_t g = 0; g < Gq; ++g) {
                     const int64_t hq = hq0 + g;
                     fetch_row(qp + b * qs0 + hq * qs1, qs2, hq * D, t, qc.data());

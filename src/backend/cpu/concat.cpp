@@ -1,14 +1,17 @@
 /// @file concat.cpp
-/// @brief SIMD-optimized CPU implementation of Concat.
+/// @brief SIMD copy-based CPU implementation of Concat (f32/f16).
 ///
-/// Supports both f32 and f16 via a single templated implementation.
-/// Handles all layouts (NCHW, NCDHW, NCHWC8, NCDHWC8) including
-/// C-axis concatenation for packed layouts with SIMD lane-level merge.
+/// Three paths, chosen per call in concat_impl. All operands share rank, dtype
+/// and layout (the op enforces it), so their pack sizes agree:
+///   1. packed C-axis (axis == 1, pack > 1, rank >= 3): lane-level merge. A
+///      destination channel block whose lanes all come from one input block in
+///      order is one vector copy; the rest copy lane by lane, and lanes past the
+///      last input channel are written zero.
+///   2. axis >= rank-1: SIMD-copied segments within each row.
+///   3. axis < rank-1: one memcpy per contiguous block, walking the outer
+///      dimensions with an odometer.
 ///
-/// Three code paths:
-///   1. Packed C-axis concat (axis == 1, pack > 1): SIMD lane merge
-///   2. Within-row (axis >= rank-1): SIMD copy segments within each row
-///   3. Outer axis (axis < rank-1): memcpy per contiguous block
+/// rank < 2 has no rows: path 2 runs once with last_dim = numel().
 
 #include "nnops/ops/concat.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -21,10 +24,6 @@ namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
 
-// ============================================================
-// Packed C-axis concat — SIMD lane-level merge
-// ============================================================
-
 template <typename T>
 void concat_packed_c_axis(TensorView& output,
                            std::span<const TensorView> inputs)
@@ -36,7 +35,6 @@ void concat_packed_c_axis(TensorView& output,
 
     constexpr int L = simd_lane_for<T>;
 
-    // Cumulative logical channel counts
     std::vector<int64_t> ch_start(N + 1, 0);
     for (int64_t i = 0; i < N; ++i) {
         ch_start[static_cast<size_t>(i + 1)] =
@@ -54,7 +52,6 @@ void concat_packed_c_axis(TensorView& output,
     const int64_t o_row_stride = output.row_stride_elems();
     const int64_t o_ch_stride  = output.channel_block_stride_elems();
 
-    // Precompute source mapping per output lane
     struct LaneSrc { int64_t input_idx; int64_t c8_block; int64_t lane; };
     std::vector<std::vector<LaneSrc>> lane_map(
         static_cast<size_t>(oC8),
@@ -78,7 +75,6 @@ void concat_packed_c_axis(TensorView& output,
         }
     }
 
-    // Detect full C8 block copies (all lanes sequential from one input block)
     std::vector<int64_t> full_copy_src(static_cast<size_t>(oC8), -1);
     for (int64_t c8 = 0; c8 < oC8; ++c8) {
         const auto& map = lane_map[static_cast<size_t>(c8)];
@@ -115,7 +111,6 @@ void concat_packed_c_axis(TensorView& output,
                         int64_t src_idx = full_copy_src[static_cast<size_t>(c8)];
 
                         if (src_idx >= 0) {
-                            // Full C8 block: SIMD vector copy
                             const auto& in = inputs[static_cast<size_t>(src_idx)];
                             const T* i_vec = in.ptr<T>()
                                 + n  * in.stride_elems(0)
@@ -125,7 +120,6 @@ void concat_packed_c_axis(TensorView& output,
                                 + w  * pack;
                             v_store(o_vec, v_load(i_vec));
                         } else {
-                            // Partial C8 block: lane-by-lane copy
                             const auto& map = lane_map[static_cast<size_t>(c8)];
                             for (int64_t l = 0; l < pack; ++l) {
                                 const auto& src = map[static_cast<size_t>(l)];
@@ -150,10 +144,6 @@ void concat_packed_c_axis(TensorView& output,
     }
 }
 
-// ============================================================
-// General concat path
-// ============================================================
-
 template <typename T>
 void concat_impl(const ConcatAttributes& attrs,
                   TensorView& output,
@@ -168,13 +158,11 @@ void concat_impl(const ConcatAttributes& attrs,
     const int64_t ax = (attrs.axis < 0) ? attrs.axis + rank : attrs.axis;
     const int64_t pack = inputs[0].channel_pack_size();
 
-    // ---- Packed C-axis concat (requires lane-level merge) ----
     if (ax == 1 && pack > 1 && rank >= 3) {
         concat_packed_c_axis<T>(output, inputs);
         return;
     }
 
-    // ---- Compute axis offsets ----
     std::vector<int64_t> axis_offset(static_cast<size_t>(N + 1), 0);
     for (int64_t i = 0; i < N; ++i) {
         axis_offset[static_cast<size_t>(i + 1)] =
@@ -192,7 +180,6 @@ void concat_impl(const ConcatAttributes& attrs,
     auto* o_ptr = output.ptr<T>();
 
     if (axis_splits_row) {
-        // ---- Within-row concat: SIMD-copy segments per row ----
         constexpr int L = simd_lane_for<T>;
 
         for (int64_t r = 0; r < num_rows; ++r) {
@@ -217,12 +204,10 @@ void concat_impl(const ConcatAttributes& attrs,
             }
         }
     } else {
-        // ---- Outer axis concat ----
         const int64_t n_pre = ax;
         const int64_t phys_inner = is_rank1 ? output.numel() : output.stride_elems(ax);
 
         if (n_pre == 0) {
-            // ax == 0: each input contributes entire blocks
             for (int64_t n = 0; n < N; ++n) {
                 const auto& in = inputs[static_cast<size_t>(n)];
                 const int64_t in_axis_dim = in.shape(ax);
@@ -237,10 +222,11 @@ void concat_impl(const ConcatAttributes& attrs,
                 }
             }
         } else {
-            // n_pre >= 1: odometer over outer dimensions
             std::vector<int64_t> pre_sizes(static_cast<size_t>(n_pre));
             std::vector<int64_t> pre_strides(static_cast<size_t>(n_pre));
             for (int64_t d = 0; d < n_pre; ++d) {
+                // Dim 1 is the packed channel axis: its extent is channel
+                // blocks, not logical channels.
                 if (d == 1 && pack > 1) {
                     pre_sizes[static_cast<size_t>(d)] = output.num_channel_blocks();
                 }
@@ -281,7 +267,6 @@ void concat_impl(const ConcatAttributes& attrs,
                     }
                 }
 
-                // Increment odometer
                 int64_t d = n_pre - 1;
                 while (d >= 0 && ++idx[static_cast<size_t>(d)]
                                   == pre_sizes[static_cast<size_t>(d)])

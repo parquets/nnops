@@ -1,20 +1,21 @@
 /// @file quant_linear.cpp
 /// @brief SIMD-accelerated CPU implementation of QuantizeLinear / DequantizeLinear.
 ///
-/// Strategy:
-///   - The per-row f32→s8/u8 and s8/u8→f32 arithmetic is delegated to the raw
-///     intrinsic arch kernels in `x86_64/quant.hpp` (AVX2+FMA) and
-///     `aarch64/quant.hpp` (NEON) — `quantization<T>` / `dequantization<T>`,
-///     which round half-to-even (ONNX default).
-///   - Every tensor is treated as a flat row-major `numel()` array; packed and
-///     planar layouts are NOT distinguished.
-///   - The scale/zp granularity maps to the kernel's per-row `M`×`N` shape:
-///       PerTensor  → M=1,           N=numel
-///       PerToken   → M=numel/last,  N=last (one scale per row)
-///       PerChannel → M=shape[axis], N=inner; the dimensions before `axis` are
-///                    parallelized over (the `outer` groups)
-///   - f16 input/output is converted to/from f32 at the boundary (the arch
-///     kernels operate on f32 only).
+/// The per-row f32->s8/u8 and s8/u8->f32 arithmetic is delegated to the raw
+/// intrinsic arch kernels in `x86_64/quant.hpp` (AVX2+FMA) and
+/// `aarch64/quant.hpp` (NEON) — `quantization<T>` / `dequantization<T>`;
+/// quantization rounds half-to-even (ONNX default).
+///
+/// Every tensor is treated as a flat row-major `numel()` array; packed and
+/// planar layouts are not distinguished. Granularity maps onto the kernel's
+/// per-row M x N shape:
+///   PerTensor  -> M=1,           N=numel
+///   PerToken   -> M=numel/last,  N=last (one scale per row)
+///   PerChannel -> M=shape[axis], N=inner, with the dims before `axis` as the
+///                 `outer` groups parallelized over.
+///
+/// f16 input/output is converted to/from f32 at the boundary, so this file
+/// always calls the f32 overloads.
 
 #include "nnops/ops/quant_linear.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -50,8 +51,6 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 
 namespace {
 
-/// Decompose the tensor along `axis` into outer × D × inner element counts.
-/// Dimensions before `axis` collapse into `outer`; after `axis` into `inner`.
 struct AxisDecomp {
     int64_t outer = 1;
     int64_t D = 1;
@@ -94,7 +93,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
     const DataType out_dtype = output.data_type();
     const int64_t numel = X.numel();
 
-    // Kernel launch shape per granularity: M quantized rows × N elements each.
     int64_t M;
     int64_t N;
     switch (g) {
@@ -104,7 +102,7 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         break;
     case QuantGranularity::PerToken: {
         const int64_t last_dim = X.shape(rank - 1);
-        M = numel / last_dim;   // one scale per row (last dim)
+        M = numel / last_dim;
         N = last_dim;
         break;
     }
@@ -118,7 +116,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         N = numel;
     }
 
-    // Pre-load scale/zp as float (one entry per quantized row).
     NNOPS_ASSERT(scale.numel() == M);
     std::vector<float> s_f32(static_cast<size_t>(M));
     std::vector<float> z_f32(static_cast<size_t>(M));
@@ -130,7 +127,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
-    // f16 input → f32 temp buffer.
     std::vector<float> f32_buf;
     const float* src_ptr;
     if constexpr (std::is_same_v<T, half>) {
@@ -141,7 +137,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         src_ptr = X.ptr<float>();
     }
 
-    // Per-group kernel driver, templated on the output integer type U.
     const auto run = [&](auto u_tag) {
         using U = typename decltype(u_tag)::type;
         U* dst = static_cast<U*>(output.ptr<void>());
@@ -162,7 +157,6 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
             return;
         }
 
-        // PerChannel: loop over the outer groups (dims before `axis`).
         const auto process = [&](int64_t o) {
             quant_kernel::quantization<U>(static_cast<int>(dec.D), static_cast<int>(dec.inner),
                                           dst + o * dec.D * dec.inner, static_cast<int>(dec.inner),
@@ -200,7 +194,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
     const DataType in_dtype = X.data_type();
     const int64_t numel = X.numel();
 
-    // Kernel launch shape per granularity: M quantized rows × N elements each.
     int64_t M;
     int64_t N;
     switch (g) {
@@ -210,7 +203,7 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         break;
     case QuantGranularity::PerToken: {
         const int64_t last_dim = X.shape(rank - 1);
-        M = numel / last_dim;   // one scale per row (last dim)
+        M = numel / last_dim;
         N = last_dim;
         break;
     }
@@ -224,7 +217,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         N = numel;
     }
 
-    // Pre-load scale/zp as float (one entry per quantized row).
     NNOPS_ASSERT(scale.numel() == M);
     std::vector<float> s_f32(static_cast<size_t>(M));
     std::vector<float> z_f32(static_cast<size_t>(M));
@@ -236,7 +228,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
-    // f16 output → dequant into a f32 temp buffer, then convert.
     std::vector<float> f32_buf;
     float* dst_f32;
     if constexpr (std::is_same_v<T, half>) {
@@ -246,7 +237,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         dst_f32 = output.ptr<float>();
     }
 
-    // Per-group kernel driver, templated on the input integer type U.
     const auto run = [&](auto u_tag) {
         using U = typename decltype(u_tag)::type;
         const U* src = static_cast<const U*>(X.ptr<void>());
@@ -267,7 +257,6 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
             return;
         }
 
-        // PerChannel: loop over the outer groups (dims before `axis`).
         const auto process = [&](int64_t o) {
             quant_kernel::dequantization<U>(static_cast<int>(dec.D), static_cast<int>(dec.inner),
                                             dst_f32 + o * dec.D * dec.inner, static_cast<int>(dec.inner),

@@ -1,6 +1,12 @@
-/// @file test_simd_add_fuse_norm.cpp
-/// @brief Unit tests for the fused multiply-add + sum-of-squares SIMD primitive
-/// (simd_kernel/simd_add_fuse_norm.hpp).
+/// @file test_simd_mul_add_reduce.cpp
+/// @brief Unit tests for mul_add_reduce_square_sum
+/// (simd_kernel/simd_mul_add_reduce.hpp): out[i] = a[i] + b[i] * scale,
+/// returning {sum(out), sum_sq(out)} from the same pass.
+///
+/// The float path sweeps SIMD widths and tails from n=1 to 1000; the half
+/// path checks a similar spread at fp16 tolerances. The reference
+/// accumulates in float while the half kernel accumulates in half lanes, so
+/// the sum tolerances are loose.
 
 #include "../src/backend/cpu/simd_kernel/simd_mul_add_reduce.hpp"
 #include "common/test_harness.hpp"
@@ -78,7 +84,7 @@ void check_f16(int64_t n, float scale) {
     auto [sum, sum_sq] = mul_add_reduce_square_sum<nnops::backend::cpu::half>(
         a.data(), b.data(), scale, out.data(), n);
 
-    // Reference in float; the sum output is rounded to half like the SIMD does.
+    // Reference in float; the half kernel accumulates its sums in half lanes.
     std::vector<float> exp(static_cast<size_t>(n), 0.0f);
     auto [esum, esq] = ref_mul_add_reduce_square_sum(a_f32, b_f32, scale, exp);
 

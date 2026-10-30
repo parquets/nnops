@@ -1,9 +1,6 @@
 /// @file moe_ref.cpp
-/// @brief Naive scalar CPU reference implementation of the MoE layer.
-///
-/// Mirrors onnxruntime's `com.microsoft::MoE` CPU semantics, and is the
-/// correctness oracle for the optimized kernel in `backend/cpu/moe.cpp` — it
-/// deliberately shares no code with it.
+/// @brief Naive scalar CPU reference for the MoE layer, and the correctness
+/// oracle for `backend/cpu/moe.cpp` — it deliberately shares no code with it.
 ///
 /// Per token: score the router logits over *all* experts with
 /// `attrs.router_gating` (softmax by default), take the top-K (ties toward the
@@ -12,6 +9,9 @@
 ///
 /// Scope matches the kernel: f32/f16, Relu/Gelu/Silu/Identity, and SwiGLU with
 /// the Separate (fc3) layout. Everything else is rejected.
+///
+/// Sqrt-softplus guards at 20: above it `log1p(exp(x))` already equals x in
+/// f32, and `exp(x)` overflows near 88.
 
 #include "nnops/ops/moe.hpp"
 #include "nnops/detail/assert.hpp"
@@ -26,15 +26,13 @@ namespace {
 
 using nnops::backend::cpu::half;
 
-/// Absent optional inputs arrive either as an omitted argument or as an empty
-/// TensorView (data == nullptr) — treat both as "not provided".
+/// An omitted argument and an empty TensorView both mean "not provided".
 inline bool present(std::span<const TensorView> inputs, size_t i) noexcept
 {
     return i < inputs.size() && !inputs[i].is_empty();
 }
 
-/// Scalar element read through the simd load helper, so `float` and `half` share
-/// one code path (half is __fp16 on aarch64, a struct elsewhere).
+/// Scalar load through the simd helper, so `float` and `half` share one path.
 template <typename T>
 inline float load_at(const T* base, int64_t i) noexcept
 {
@@ -49,7 +47,7 @@ inline float apply_activation(MoEActivation act, float x, float alpha, float bet
     case MoEActivation::Relu:
         return x > 0.0f ? x : 0.0f;
     case MoEActivation::Gelu:
-        // tanh approximation, identical to kernel::v_gelu / simd_activation.
+        // tanh approximation, same constants as simd_activation's v_gelu.
         return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f *
                                             (x + 0.044715f * x * x * x)));
     case MoEActivation::Silu:
@@ -64,14 +62,7 @@ inline float apply_activation(MoEActivation act, float x, float alpha, float bet
     return x;
 }
 
-/// Router score for a single logit, for the gating functions that are
-/// pointwise. Softmax normalizes across the row, so the caller computes it in
-/// full — deliberately the same split as the optimized kernel, but written
-/// independently.
-///
-/// Softplus guards at 20 because log1p(exp(x)) would overflow just above it;
-/// below the guard it loses nothing. This mirrors llama.cpp's
-/// `ggml_compute_softplus_f32`.
+/// Per-logit score; softmax normalizes across the row, so the caller does it.
 inline float gating_sigmoid(float x) noexcept
 {
     return 1.0f / (1.0f + std::exp(-x));
@@ -82,9 +73,7 @@ inline float gating_sqrt_softplus(float x) noexcept
     return std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
 }
 
-/// SwiGLU value/gate combine, matching moe.hpp's documented formula:
-///   h = gate * sigmoid(alpha * gate) * (value + beta)
-/// with both halves clamped to +/- limit first when limit is finite.
+/// SwiGLU value/gate combine, per the formula in moe.hpp.
 inline float swiglu_combine(float gate, float value, float alpha, float beta,
                             float limit) noexcept
 {
@@ -154,10 +143,8 @@ void moe_ref_impl(const MoEAttributes& attrs,
     for (int64_t t = 0; t < num_tokens; ++t) {
         const T* logits = rout_ptr + t * rout_row_stride;
 
-        // ---- score the logits over all experts (f32) ----
         switch (attrs.router_gating) {
         case MoERouterGating::Softmax: {
-            // Max-subtracted for stability; the softmax normalizes the row.
             float max_logit = load_at(logits, 0);
             for (int64_t e = 1; e < E; ++e) {
                 const float v = load_at(logits, e);
@@ -174,8 +161,8 @@ void moe_ref_impl(const MoEAttributes& attrs,
             }
         } break;
         case MoERouterGating::Sigmoid:
-            // Pointwise, and deliberately not max-subtracted: shifting the
-            // logits would change the scores rather than rescale them.
+            // Deliberately not max-subtracted: shifting the logits would
+            // change these scores rather than rescale them.
             for (int64_t e = 0; e < E; ++e) {
                 probs[static_cast<size_t>(e)] = gating_sigmoid(load_at(logits, e));
             }
@@ -187,8 +174,6 @@ void moe_ref_impl(const MoEAttributes& attrs,
             break;
         }
 
-        // ---- top-K selection: scan ascending with a strict '>', so an exact
-        // tie keeps the lower expert index ----
         for (int64_t e = 0; e < E; ++e) { used[static_cast<size_t>(e)] = 0; }
         for (int64_t j = 0; j < k; ++j) {
             int64_t best = -1;
@@ -212,7 +197,7 @@ void moe_ref_impl(const MoEAttributes& attrs,
             for (int64_t j = 0; j < k; ++j) { weights[static_cast<size_t>(j)] *= inv_wsum; }
         }
 
-        // Routed scaling, applied last so it composes with the renormalization.
+        // Applied after the renormalization, which would otherwise cancel it.
         if (attrs.routed_scaling_factor != 1.0f) {
             for (int64_t j = 0; j < k; ++j) {
                 weights[static_cast<size_t>(j)] *= attrs.routed_scaling_factor;
@@ -221,7 +206,6 @@ void moe_ref_impl(const MoEAttributes& attrs,
 
         const T* x = in_ptr + t * in_row_stride;
 
-        // ---- run the selected experts, accumulating in f32 ----
         std::vector<float> acc(static_cast<size_t>(H), 0.0f);
         for (int64_t j = 0; j < k; ++j) {
             const int64_t e = ids[static_cast<size_t>(j)];
@@ -232,7 +216,6 @@ void moe_ref_impl(const MoEAttributes& attrs,
             const T* w3 = has_fc3_w ? fc3_ptr + e * I * H : nullptr;
             const T* b3 = has_fc3_bias ? fc3b_ptr + e * I : nullptr;
 
-            // FC1 (gate), plus FC3 (value) for SwiGLU.
             for (int64_t i = 0; i < fc1_out; ++i) {
                 float s = b1 ? load_at(b1, i) : 0.0f;
                 const T* row = w1 + i * H;
@@ -252,7 +235,7 @@ void moe_ref_impl(const MoEAttributes& attrs,
             }
 
             if (is_swiglu) {
-                // Separate layout: fc1_out == I, so gate/value align elementwise.
+                // Separate layout: fc1_out == I, so gate and value align.
                 for (int64_t i = 0; i < I; ++i) {
                     gate[static_cast<size_t>(i)] = swiglu_combine(
                         gate[static_cast<size_t>(i)], value[static_cast<size_t>(i)],
@@ -266,7 +249,6 @@ void moe_ref_impl(const MoEAttributes& attrs,
                 }
             }
 
-            // FC2 (down projection) and the weighted accumulate.
             const T* w2 = fc2_ptr + e * H * I;
             const T* b2 = has_fc2_bias ? fc2b_ptr + e * H : nullptr;
             for (int64_t n = 0; n < H; ++n) {

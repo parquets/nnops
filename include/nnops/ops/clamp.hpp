@@ -1,8 +1,10 @@
 #pragma once
 /// @file clamp.hpp
-/// @brief Clamp operator — element-wise value clamping to [min, max].
+/// @brief Element-wise clamp to [min, max].
 ///
-/// Supports arbitrary layouts (Planar + Packed) via pitch-aware row processing.
+/// output[i] = max(min_val, min(max_val, input[i])). Any shape, rank or layout
+/// (Planar and Packed), processed a row at a time by row stride; output matches
+/// input.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -16,23 +18,13 @@ namespace nnops {
 
 /// Attributes for the Clamp operator.
 struct ClampAttributes {
-    /// Lower bound (values below this are set to min_val).
     float min_val = -std::numeric_limits<float>::infinity();
-
-    /// Upper bound (values above this are set to max_val).
     float max_val = std::numeric_limits<float>::infinity();
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// Accumulate into the existing output instead of overwriting.
     bool add_to = false;
 };
 
-/// Element-wise value clamping operator.
-///
-/// Computes: output[i] = clamp(input[i], min_val, max_val)
-///   = max(min_val, min(max_val, input[i]))
-///
-/// Input:  X [*]          (any shape, rank, layout)
-/// Output: Y [*]          (same shape, rank, layout, dtype)
 class Clamp : public OpBase {
 public:
     static std::unique_ptr<Clamp> create(const ClampAttributes& attrs = {},

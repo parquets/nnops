@@ -1,6 +1,6 @@
 /// @file bench_pooling.cpp
 /// @brief Global pooling micro-benchmark: the whole-plane scan against the two
-///        routes it replaced.
+///        routes it replaced, plus an NCHW-vs-NHWC layout comparison.
 ///
 /// Three arms over the same input, interleaved inside one process so the
 /// numbers share an instrument:
@@ -13,7 +13,12 @@
 ///            did before global pooling existed
 ///
 /// The shapes are the ones the two model runners actually pool, plus one wide
-/// backbone plane to show what the scan does when it is not dwarved by dispatch.
+/// backbone plane to show what the scan does when it is not dwarfed by dispatch.
+///
+/// The layouts bench holds shape and kernel fixed and varies only the memory
+/// order: NCHW keeps a plane contiguous along W, NHWC along C. It times the
+/// same two modes in each layout — the global mean and a 3x3 stride-2 max — and
+/// a null re-run of NCHW reports instrument drift.
 ///
 /// `NNOPS_BENCH_THREADS=1` (or "1,4") pins the ladder, as in the other benches.
 
@@ -160,8 +165,6 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
     auto g_out = test::make_planar(global_desc[0], g_buf.data());
     auto w_out = test::make_planar(window_desc[0], w_buf.data());
 
-    // Reduce arm: two passes over the same plane, the comparison a graph
-    // framework's Mean-of-axes lowers to.
     // Axes are rank-relative: the input is [N,C,H,W], so W is 3 and H is 2.
     auto reduce_w = Reduce::create(ReduceAttributes{ReduceType::Mean, 3, true}, Backend::CPU);
     auto reduce_h = Reduce::create(ReduceAttributes{ReduceType::Mean, 2, true}, Backend::CPU);
@@ -202,16 +205,14 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
             return is_ok(s1) ? reduce_h->compute(r_outs, mid_ins, use, nullptr) : s1;
         };
 
-        // One checked pass each: an arm that refuses the call would otherwise
-        // time as "instant" and read as a 100x win.
+        // One checked pass each: an arm that refuses would time as instant and read as a win.
         const bool ok_global = is_ok(run_global());
         const bool ok_window = is_ok(run_window());
         const bool ok_reduce = is_ok(run_reduce());
 
         // Every arm has to agree with a host-side mean, not just with each
         // other: a compute that writes nothing would otherwise time as a win.
-        // Output element i is channel i: the output is planar, one pixel per
-        // channel.
+        // The output is planar, one pixel per channel.
         if (nt == threads.front()) {
             const double tol = c.f16 ? 2e-3 : 1e-4;  // f16 lanes round over the walk
             auto worst = [&](const std::vector<T>& a, const T* want, size_t n) {
@@ -269,14 +270,6 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
 // ============================================================
 // Layouts: NHWC against NCHW
 // ============================================================
-//
-// The two routes vectorize on different axes: NCHW along the output width, the
-// channel-lane kernels along the channel. This bench holds shape and kernel
-// fixed and varies only the layout.
-//
-// Two questions a pooler asks are timed for each layout: the whole-plane mean
-// (attrs.global, the scan a model runner calls) and the whole-plane max (a
-// window over the full extent, which is the only route max pooling has).
 
 struct LayoutCase {
     const char* name;
@@ -325,9 +318,8 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
     PoolingAttributes avg_attrs;
     avg_attrs.type = PoolingType::Average;
     avg_attrs.global = true;
-    // 3x3 stride 2 with one pad: the stem max-pool every ImageNet CNN runs, and
-    // the only window shape that shows up in the models this bench stands in
-    // for. A full-extent window would time a reduction, not a pooling.
+    // 3x3 stride 2 with one pad: the stem max-pool the ImageNet CNNs run, and a
+    // full-extent window would time a reduction rather than a pooling.
     PoolingAttributes max_attrs;
     max_attrs.type = PoolingType::Max;
     max_attrs.kernel_shape = {1, 3, 3};
@@ -338,9 +330,8 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
     auto max_arms = make_mode(max_attrs);
     const char* const mode_names[2] = {"avg (global)", "max 3x3 s2"};
 
-    // Ground truth: the plane's mean and its max, computed on the host from the
-    // planar input. Every arm of every mode has to land on these — an arm that
-    // writes nothing would otherwise time as a win.
+    // Ground truth: the plane's mean and max on the host from the planar input;
+    // every arm of every mode has to land on these.
     const int64_t plane = c.H * c.W;
     std::vector<T> want_avg(static_cast<size_t>(c.C));
     for (int64_t ch = 0; ch < c.C; ++ch) {

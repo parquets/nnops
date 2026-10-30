@@ -12,21 +12,20 @@
 ///
 /// Scheduling: one task per (batch, kv head). The token loop is inherently
 /// sequential — step t+1 needs the state step t produced — so it stays serial
-/// inside a task, and the parallelism comes from the B * H_kv independent
-/// state matrices. Under GQA the G query heads sharing a kv head are read out
-/// *within* the same task: splitting them across tasks would advance one state
-/// G times.
+/// inside a task, and the parallelism comes from the B * H_kv independent state
+/// matrices. Under GQA the G query heads sharing a kv head are read out *within*
+/// the same task: splitting them across tasks would advance one state G times.
 ///
 /// SIMD: every stage is vectorized across the value dimension (j), with the key
-/// dimension (i) broadcast as a scalar. That is the shape ORT's MLAS NEON kernel
-/// uses (FusedTokenSinglePassNeon). The state, the delta, and the readout
-/// accumulators are all f32 even for f16 input — f16 only appears at the I/O
-/// boundary, where rows are widened on load and narrowed on store.
+/// dimension (i) broadcast as a scalar — the shape ORT's MLAS NEON kernel
+/// (FusedTokenSinglePassNeon) uses. The state, the delta and the readout
+/// accumulators are f32 even for f16 input; f16 appears only at the I/O
+/// boundary, where the T-typed load/store wrappers widen and narrow rows.
 ///
 /// The convolution, when weights are supplied, is a causal depthwise conv1d over
-/// the packed Q | K | V channels. Those weights are transposed once per task into
-/// a [local channel][tap][d] layout, which makes each tap a contiguous per-lane
-/// weight vector — a plain vector FMA with no gather.
+/// the packed Q | K | V channels. The weights are transposed once per task into a
+/// [local channel][tap][d] layout, so each tap is a contiguous per-lane weight
+/// vector — a plain vector FMA with no gather.
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
@@ -46,12 +45,7 @@ using namespace nnops::simd;
 
 /// Widen L consecutive T elements to an f32 vector (f16 widens, f32 is a load).
 inline v_f32x8 vload_f32(const float* p) { return v_load(p); }
-inline v_f32x8 vload_f32(const half* p) {
-    // The pointer overload of v_cvt_f16_to_f32 widens into this arch's v_f32x8,
-    // so it matches the float overload above and keeps this file free of arch
-    // intrinsics.
-    return v_cvt_f16_to_f32(p);
-}
+inline v_f32x8 vload_f32(const half* p) { return v_cvt_f16_to_f32(p); }
 
 /// Narrow an f32 vector back to T and store it.
 inline void vstore_f32(float* p, const v_f32x8& v) { v_store(p, v); }
@@ -113,7 +107,7 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
     // Convolution channel bases: the packed weights lay Q out first, then K, then V.
     const int64_t k_ch_base = H * D;
     const int64_t v_ch_base = H * D + H_kv * D;
-    const int64_t n_ch = Gq + 2;   // q heads 0..Gq-1, then K at Gq, V at Gq+1
+    const int64_t n_ch = Gq + 2;
 
     const int64_t NTasks = B * H_kv;
     ctx.cpu.run(0, NTasks, [&](int64_t task) {
@@ -122,8 +116,7 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
         const int64_t hq0 = hkv * Gq;
 
         // Per-task scratch, all f32: the state matrix, then kc / vc / qc / dv /
-        // gv row buffers. Indexed per task (not per worker) — a task owns its
-        // state exclusively.
+        // gv row buffers.
         PoolPtr state_owner(sizeof(float) * static_cast<size_t>(D) * static_cast<size_t>(D));
         PoolPtr rows_owner(sizeof(float) * static_cast<size_t>(D) * 5);
         float* Sf = state_owner.as<float>();
@@ -133,8 +126,6 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
         float* dv = qc + D;
         float* gv = dv + D;
 
-        // Convolution weights, transposed to [local channel][tap][d] so each tap
-        // is a contiguous, per-lane weight vector.
         PoolPtr wt_owner;
         float* wt = nullptr;
         if (has_conv) {
@@ -155,10 +146,7 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
             }
         }
 
-        // Fill dst[0..D) with the row of `src` at time t (optionally convoluted).
-        // `src` points at the (batch, head) origin of the sequence, `src_ts` is
-        // the stride between consecutive tokens, `lc` is this row's local
-        // convolution channel.
+        // Fill dst[0..D) with the row of `src` at time t, convolved when has_conv.
         auto fetch_row = [&](const T* src, int64_t src_ts, int64_t lc,
                              int64_t t, float* dst) {
             if (!has_conv) {
@@ -192,7 +180,6 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
             }
         };
 
-        // Read the carried state in (f32), run the sequence, write it back.
         for (int64_t i = 0; i < D; ++i) {
             const T* srow = sp + b * ts0 + hkv * ts1 + i * ts2;
             float* drow = Sf + i * D;
@@ -211,9 +198,8 @@ void linear_attention_impl(const LinearAttentionAttributes& attrs,
             fetch_row(v_base, vs2, Gq + 1, t, vc);
 
             // --- 1. Decay: S[i][:] *= exp(gate[t, i]) ---
-            // exp is evaluated a vector at a time (v_exp, Cephes-style) rather
-            // than per element: the decay touches D rows, so D scalar exps would
-            // outweigh the D*D/L vector ops it feeds.
+            // v_exp is the Cephes-style vector exp; D scalar exps would outweigh
+            // the D*D/L vector ops they feed.
             {
                 const T* g_row = g_base + t * gs2;
                 int64_t i = 0;

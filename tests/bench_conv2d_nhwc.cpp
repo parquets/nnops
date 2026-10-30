@@ -8,18 +8,24 @@
 /// layout and everything it decides: the gather's access pattern, whether a 1x1
 /// needs an im2col buffer at all, and how a pixel tile fills the GEMM.
 ///
-/// The measurement is the interleaved A/B the rest of the benches use
-/// (bench_conv2d.cpp): within a round the two alternate, the second planar run
-/// is the null control, and a verdict is only called real when it clears the
-/// drift floor. Three tables, one per value type: f32, f16, and the quantized
-/// s8-weight / u8-activation route.
+/// measure_ab is the interleaved A/B the rest of the benches use: within a round
+/// the two arms alternate, the second run of A is the null control, and a
+/// verdict is only real when it clears that drift floor. Three tables, one per
+/// value type: f32, f16, and s8-weight / u8-activation.
 ///
 /// The shapes are the layers a channel-last framework actually runs — 1x1
 /// expansions and projections, 3x3 stacks, 5x5/7x7 stems, grouped and batched
-/// layers — because that is the population the layout has to win on, not one
-/// square. The depthwise row is the one exception to "Conv2D": it runs the
-/// DepthwiseConv operator, whose two layouts are the shapes a depthwise layer
-/// actually dispatches with (see bench_depthwise for that operator's own table).
+/// layers — not one square. The depthwise row is the one exception to "Conv2D":
+/// it runs the DepthwiseConv operator, whose layouts are the ones a depthwise
+/// layer actually dispatches with (bench_depthwise has that operator's table).
+///
+/// Three more comparisons ride the same instrument:
+///  - Winograd vs implicit GEMM, both channel-last on the same activation with U
+///    prepacked outside every timer; only k3s1 routes to Winograd.
+///  - Raw filter vs Conv2D::prepackWeights, which packs the filter once outside
+///    every timer. The packed arm must never lose — the caller already paid.
+///  - MobileNetV2's convs in graph order, every call timed alone, so a row is
+///    the cold cost its neighbours leave it.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
@@ -48,7 +54,7 @@ using half = nnops::backend::cpu::half;
 namespace {
 
 // ============================================================
-// Pool / timing — the same instruments as bench_conv2d.cpp
+// Pool / timing
 // ============================================================
 
 struct BenchPool {
@@ -156,14 +162,11 @@ struct Shape {
     const char* name;
     int64_t N, IC, IH, IW, OC, KH, KW;
     int64_t SH = 1, SW = 1, PH = 0, PW = 0, groups = 1;
-    /// Depthwise layers run on the DepthwiseConv operator, not Conv2D with
-    /// groups == IC: the two are different kernels, and routing the row through
-    /// Conv2D measures a shape that operator never sees.
+    /// Depthwise rows run the DepthwiseConv operator, not Conv2D with groups == IC.
     bool dw = false;
 };
 
-/// ResNet / MobileNet / Inception layer shapes, a few per family, plus the
-/// awkward ones (a narrow plane, a wide plane, a fan-out 1x1, a batched layer).
+/// Layer shapes from ResNet / MobileNet / Inception, plus the awkward planes.
 const std::vector<Shape>& sweep() {
     static const std::vector<Shape> s = {
         // ---- 1x1: the dominant shape in a modern network --------------------
@@ -200,9 +203,7 @@ constexpr DataType dtype_of() {
     return std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
 }
 
-/// One table row: the same layer run through each layout's entry point. A row is
-/// a conv or a depthwise conv, and the table does not care which — only that the
-/// two arms compute the same function on the layout each one wants.
+/// One table row: the same layer through each layout's entry point.
 struct AbLayer {
     virtual ~AbLayer() = default;
     virtual void run_nchw(const ComputeContext&) = 0;
@@ -293,11 +294,6 @@ struct AbFp : AbLayer {
 // ============================================================
 // Depthwise A/B: the DepthwiseConv operator in both layouts
 // ============================================================
-//
-// The same layer as the conv rows, but on the operator a depthwise layer
-// actually dispatches to: planar takes NCHW + a [C][1][KH][KW] filter, the
-// channel-last arm takes NHWC + TensorFlow's HWCM filter. Feeding this shape to
-// Conv2D with groups == IC instead measures a route no model uses.
 
 template <class T>
 struct AbDw : AbLayer {
@@ -380,7 +376,7 @@ struct AbI8 : AbLayer {
         const int64_t wsh[] = {c.OC, icg, c.KH, c.KW};        // OIHW
         const int64_t wsh_cl[] = {c.KH, c.KW, icg, c.OC};     // HWIO
         const int64_t bsh[] = {c.OC};
-        const float s_x = 1.0f / 128.0f;   // exact in binary, and it fits u8
+        const float s_x = 1.0f / 128.0f;   // 2^-7, exact in binary
         const int32_t zp_x = 128;
 
         const int64_t act_n = c.N * c.IC * c.IH * c.IW;
@@ -492,8 +488,8 @@ struct AbI8 : AbLayer {
 // The tables
 // ============================================================
 
-/// One table: every layer at every thread count, planar vs channel-last.
-/// @p make_dw builds the depthwise rows (nullptr for a table with no such arm).
+/// Every layer at every thread count, planar vs channel-last. @p make_dw builds
+/// the depthwise rows; nullptr means this table has no arm for them.
 template <class MakeOp, class MakeDw>
 void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
     const int iters = 10, rounds = 3;
@@ -534,15 +530,10 @@ void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
 // Channel-last Winograd vs channel-last implicit GEMM
 // ============================================================
 //
-// A is the implicit-GEMM route reading the raw HWIO filter — what a channel-last
-// conv runs without Winograd; B is the Winograd route on the same activation
-// and the same filter, transformed once into the U B-panels outside every
-// timer. Both write the same NHWC output, so the row is purely the algorithm.
-//
-// Only k3s1 can route to Winograd, so the list is the k3s1 half of the layer
-// sweep plus the small planes ResNet/MobileNet end on — the question is where
-// the policy should stop, and 14x14/7x7 is where it stops.
+// A = implicit GEMM on the raw HWIO filter, B = Winograd with U prepacked; both
+// write the same NHWC output, so the row is purely the algorithm.
 
+/// k3s1 shapes from 224 down to 7x7 — how far the Winograd policy should reach.
 const std::vector<Shape>& wino_sweep() {
     static const std::vector<Shape> s = {
         {"conv 3x3 s1  224x224   3->64", 1,    3, 224, 224,   64, 3, 3, 1, 1, 1, 1},
@@ -577,9 +568,7 @@ struct AbWino {
         const int64_t wsh[] = {c.KH, c.KW, c.IC, c.OC};   // HWIO
         constexpr DataType dt = dtype_of<T>();
 
-        // The activation and the filter are generated planar and converted once:
-        // both routes then see identical values, and the conversion is outside
-        // every timed region.
+        // Same values on both routes, converted once outside every timer.
         const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
         const auto w32  = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
         in_cl = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
@@ -689,20 +678,15 @@ void run_wino_table(const char* title) {
 // The prepacked filter: the same call, raw vs packed
 // ============================================================
 //
-// A is the raw HWIO filter — compute() packs it once per call into the shared
-// arena, or per task when it does not fit. B is the same filter through
-// Conv2D::prepackWeights, packed once, outside every timer. Both write the same
-// output buffer, so a row prices one thing: what the per-call pack costs. It is
-// also the arm that must never win — a caller who prepacked has already paid
-// for the filter, and the packed call can only be the cheaper one.
+// A passes the raw filter, so compute() packs it once per call (per task when it
+// does not fit the arena); B passes the prepackWeights blob. Same output buffer,
+// so a row prices the per-call pack.
 
 template <class T, bool ChannelLast = true>
 struct AbPacked {
     explicit AbPacked(const Shape& c) : s(c) {
         icg = c.IC / c.groups;
         const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
-        // The two filter orders, each in the layout its activation pairs with:
-        // HWIO for NHWC, OIHW (TensorLayout::NCHW) for NCHW.
         const int64_t wsh[] = {c.KH, c.KW, icg, c.OC};   // HWIO
         const int64_t wsh_p[] = {c.OC, icg, c.KH, c.KW}; // OIHW
         const int64_t bsh[] = {c.OC};
@@ -733,8 +717,8 @@ struct AbPacked {
         attrs.stride = {c.SH, c.SW};
         attrs.padding = {c.PH, c.PW};
         attrs.groups = c.groups;
-        // Auto would build the Winograd U for a k3s1 filter, which is a
-        // different algorithm rather than a different filter order.
+        // Auto would build Winograd U for k3s1 — a different algorithm, not a
+        // different filter order.
         attrs.algorithm = ConvAlgorithm::ImplicitGemm;
         op = Conv2D::create(attrs, Backend::CPU);
 
@@ -780,9 +764,8 @@ struct AbPacked {
     TensorDesc out_desc{};
 };
 
-/// The quantized arm: an s8 filter packs into the MMA's A panels and carries
-/// the per-channel sums the epilogue compensates with, so the raw route pays
-/// both a panel pack and a sum walk per call.
+/// Same buffers as AbI8: the s8 blob is the weight panels plus the per-channel
+/// sums the epilogue compensates with.
 struct AbPackedI8 : AbI8 {
     explicit AbPackedI8(const Shape& c, bool channel_last = true) : AbI8(c) {
         Conv2DAttributes attrs{};
@@ -793,7 +776,6 @@ struct AbPackedI8 : AbI8 {
         attrs.algorithm = ConvAlgorithm::ImplicitGemm;
         p_op = Conv2D::create(attrs, Backend::CPU);
 
-        // The same operator, over whichever activation/filter pair the arm runs.
         in  = channel_last ? &in_nhwc : &in_nchw;
         w   = channel_last ? &w_nhwc  : &w_nchw;
         out = channel_last ? &out_nhwc : &out_nchw;
@@ -871,17 +853,6 @@ void run_filter_table(const char* title) {
 // ============================================================
 // The layer list as a graph: every conv cold
 // ============================================================
-//
-// The A/B above re-runs one layer until it is L2-resident, which is the right
-// instrument for the kernel and the wrong one for the network: inside a forward
-// pass a layer's input, weights and output arrive cold, and the layers around it
-// evict what it just touched. MobileNetV2's 35 convs are the list below, in the
-// order the model issues them; one pass over it is the graph's conv time.
-//
-// Same layers, same kernels — the difference from the table above is what the
-// neighbours did to the caches. It is where the small-plane expansions and the
-// big-plane head show their real cost, and it is the number a change to the
-// pointwise route has to move.
 
 const std::vector<Shape>& mobile_graph() {
     static const std::vector<Shape> s = {
@@ -926,9 +897,7 @@ const std::vector<Shape>& mobile_graph() {
 
 }  // namespace
 
-/// One pass over the conv list in graph order, every call timed on its own so a
-/// row's cost is the cold one. Rows are medians over @c passes, the total is the
-/// median pass.
+/// MobileNetV2's convs in graph order; rows and the total are medians over @c passes.
 NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
     const int passes = 5;
     std::printf("\n== f32 channel-last: MobileNetV2's convs as a graph (cold) ==\n");
@@ -1011,8 +980,8 @@ NNOPS_BENCH(conv2d_nhwc_vs_nchw_int8) {
               [](const Shape& c) -> std::unique_ptr<AbLayer> {
                   return std::make_unique<AbI8>(c);
               },
-              // A quantized depthwise arm needs a per-channel weight zero-point
-              // and its own output type; bench_depthwise owns that comparison.
+              // No quantized depthwise arm: it needs a per-channel weight
+              // zero-point and its own output type; bench_depthwise owns it.
               [](const Shape&) -> std::unique_ptr<AbLayer> { return nullptr; });
 }
 

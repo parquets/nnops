@@ -8,9 +8,20 @@
 /// registers. x86-only (the arch's mma_qblock_f32_{trans,copy}); everywhere
 /// else the packed route handles the block formats.
 ///
-/// The M limits are per layout, measured; they live on the block policy in
-/// mma_qblock.hpp. The driver asks this file to run the product and gets false
-/// back when the shape is out of range.
+/// The walk: one flat task list over (batch, n tile), a tile being two
+/// 32-value blocks; inside a tile the rows go out one panel at a time — 8 for
+/// the dot kernel, 2 for the outer product.
+///
+/// Admission is the block policy's measured per-layout M limit
+/// (arch::Q4Block::fused_max_m_trans / _copy in mma_qblock.hpp); past it the
+/// driver falls through to the packed route. qblock_fused_max_m_override is
+/// the benchmark-only cap on that test: negative keeps the policy's limits, 0
+/// disables the route (how a ladder pins itself to the packed arm), > 0 caps M.
+///
+/// A bias primes each tile with beta·C_old + bias before the k loop, so the
+/// route then always accumulates — the overwriting mode would drop the seed —
+/// and the last-k clamp and the epilogue run on the biased sum, as on the
+/// tiled route.
 
 #include "matmul_internal.h"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // tile_scale / epilogue_inplace
@@ -21,18 +32,12 @@ namespace nnops::backend::cpu {
 
 #if defined(NNOPS_ARCH_X86_64)
 
-/// Benchmark-only cap for the fused block-quant route: negative = the policy's
-/// limits, 0 = disabled, else caps M (so one process can A/B both routes).
-/// Setting 0 is how a ladder pins itself to the packed route.
 int qblock_fused_max_m_override = -1;
 
 namespace {
 
-/// Two quant blocks per worker task, which is also the copy kernel's minimum
-/// tile.
 constexpr int QBLOCK_FUSED_NTILE = 2 * arch::Q4Block::block_elems;
 
-/// Call the kernel instantiated for @p MR rows, recursing down to the live count.
 template <class BQ, bool ZERO, bool TRANS, int MR>
 inline void qblock_fused_rows(int mr, int nc, int K, float* c, int ldc,
                               const float* a, int lda, const uint8_t* B,
@@ -52,7 +57,6 @@ inline void qblock_fused_rows(int mr, int nc, int K, float* c, int ldc,
     }
 }
 
-/// One m-panel at a time: 8 rows for the dot kernel, 2 for the outer product.
 template <class BQ, bool ZERO, bool TRANS>
 inline void qblock_fused_dispatch(int M, int nc, int K, float* C, int ldc,
                                   const float* A, int lda, const uint8_t* B,
@@ -67,7 +71,6 @@ inline void qblock_fused_dispatch(int M, int nc, int K, float* C, int ldc,
     }
 }
 
-/// Select the kernel family for one n tile; ZERO is the beta == 0 case.
 template <class BQ, bool ZERO>
 inline void qblock_fused_run(bool trans, int M, int nc, int K, float* C, int ldc,
                              const float* A, int lda, const uint8_t* B,
@@ -84,7 +87,6 @@ inline void qblock_fused_run(bool trans, int M, int nc, int K, float* C, int ldc
     }
 }
 
-/// The format-independent body: one flat task list over (batch, n tile).
 template <class BQ>
 inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
                              std::span<const TensorView> inputs,
@@ -103,9 +105,6 @@ inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
 
     const auto [cmin, cmax] = kblock_clamp(attrs, /*last_k=*/true);
     const bool epilogue = has_inplace_epilogue(attrs);
-    // A bias primes each tile with beta·C_old + bias before the k loop, so this
-    // route always accumulates (the overwriting mode would drop it) and the
-    // last-k clamp + epilogue run on the biased sum, as on the tiled route.
     const float* bias = inputs.size() > 2 ? inputs[2].ptr<float>() : nullptr;
     const bool prime_c = (bias != nullptr);
     const bool scale_c = !prime_c && attrs.beta != 0.0f && attrs.beta != 1.0f;
@@ -132,8 +131,7 @@ inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
             tile_scale(c_p, ldc, attrs.beta, M, nc);
         }
 
-        // The clamp of a k-block route runs once at the end; accumulating into
-        // C instead means the clamp has to run on the sum, not on the partial.
+        // The clamp belongs on the finished sum, not on the partial.
         if (attrs.beta == 0.0f && !prime_c) {
             qblock_fused_run<BQ, true>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
                                        row_blocks, n_start, attrs.alpha, cmin,
@@ -151,7 +149,6 @@ inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
     });
 }
 
-/// One format's route: the measured per-layout M limit, then the kernels.
 template <class BQ>
 inline bool qblock_fused_try(const MatMulAttributes& attrs, TensorView& output,
                              std::span<const TensorView> inputs,

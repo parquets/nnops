@@ -1,17 +1,19 @@
 #pragma once
 /// @file epilogue.hpp
-/// @brief Epilogue type for operator fusion — apply activation functions
-///        or other post-processing during output write-back.
+/// @brief Epilogue type for operator fusion — apply activation functions or
+///        other post-processing during output write-back.
 ///
-/// This is intentionally separate from activation.hpp (ActivationType /
-/// ActivationAttributes) so that:
-///   - The standalone Activation operator stays clean (no "None" sentinel).
-///   - Future epilogue types (quantize/dequantize, clamp, etc.) have a
-///     natural home without polluting the activation concept.
+/// Deliberately separate from activation.hpp (ActivationType /
+/// ActivationAttributes): the standalone Activation operator stays free of a
+/// "None" sentinel, and future epilogue types (quantize/dequantize, clamp) have
+/// a home without polluting the activation concept. The Epilogue struct lives
+/// here so operator headers can embed it; apply_epilogue() (scalar and SIMD) is
+/// implemented in src/backend/cpu/simd_kernel/simd_epilogue.hpp.
 ///
-/// The Epilogue struct is defined here so operator headers can embed it.
-/// Implementations of apply_epilogue (scalar and SIMD) live in the CPU
-/// backend at src/backend/cpu/simd_kernel/simd_epilogue.hpp.
+/// Only the activation types are live: they are stateless and applied per
+/// element. The per-channel quantization fields are reserved — no code path
+/// reads them yet. apply_epilogue() ignores min_clip/max_clip; the MatMul kernels
+/// apply them as a clamp, and MatMul/Conv fold Relu/Relu6 into their clamp.
 
 #include <cstdint>
 
@@ -33,59 +35,32 @@ enum class EpilogueActivateType : uint8_t {
 };
 
 /// Epilogue descriptor — bundled into operator attributes.
-///
-/// Currently only the activation types are live: they are stateless and
-/// applied per-element. The per-channel quantization fields are reserved for a
-/// future Dequantize/Requantize epilogue — no code path reads them yet.
-///
-/// When type == EpilogueActivateType::None, the epilogue is identity and
-/// has zero runtime cost beyond a predictable branch.
 struct Epilogue {
     EpilogueActivateType type  = EpilogueActivateType::None;
     float                alpha = 0.0f;   ///< Slope for LeakyRelu, alpha for Elu
     float                beta  = 1.0f;   ///< Parameter for HardSwish
 
-    /// Clamp bounds. NOTE: apply_epilogue() does not apply these — they are read
-    /// by the MatMul/Conv tiled kernel, which folds Relu/Relu6 into its k-block
-    /// clamp instead of branching per element.
-    float min_clip = -std::numeric_limits<float>::infinity();
+    float min_clip = -std::numeric_limits<float>::infinity();  ///< Clamp bounds; apply_epilogue() ignores them.
     float max_clip =  std::numeric_limits<float>::infinity();
 
     // ---- Per-channel quantization parameters (reserved: Dequantize / Requantize) ----
-    /// Per-channel quantization scales. Size: quant_param_count, indexed by quant_axis.
-    const float* quant_scales = nullptr;
+    const float* quant_scales = nullptr;  ///< Size quant_param_count, indexed by quant_axis.
 
-    /// Per-channel zero points (optional — may be nullptr for symmetric quantization).
-    const int32_t* quant_zero_points = nullptr;
+    const int32_t* quant_zero_points = nullptr;  ///< Optional; nullptr for symmetric quant.
 
-    /// Number of quantization parameters (== number of channels along quant_axis).
-    /// 0 means per-tensor quantization (use quant_scales[0] / quant_zero_points[0]).
-    /// > 0 means per-channel quantization with quant_param_count channels.
-    int64_t quant_param_count = 0;
+    int64_t quant_param_count = 0;  ///< Channels along quant_axis; 0 means per-tensor.
 
-    /// Axis along which per-channel quantization is applied.
-    /// For NCHW / NCDHW convolution output: axis 1 (output channels).
-    /// For MatMul / Linear output [M, N]: axis 1 (N dimension).
-    int64_t quant_axis = 1;
+    int64_t quant_axis = 1;  ///< Axis the params apply to: 1 = conv out channels / MatMul N.
 };
 
 // ---- Scalar apply_epilogue ----
 // Defined in src/backend/cpu/simd_kernel/simd_epilogue.hpp.
 
-/// Apply an epilogue to a single scalar output value (activation types).
-/// Returns the value unchanged when type == None (identity).
+/// Apply an epilogue to a single scalar value; identity for type == None.
 float apply_epilogue(const Epilogue& ep, float x);
 
-/// Apply an epilogue to a single scalar output value at a given channel index.
-///
-/// For activation types: delegates to the scalar overload (channel is ignored).
-/// For dequantize / requantize (future): uses per-channel or per-tensor
-/// quantization parameters.
-///
-/// @param ep       Epilogue descriptor
-/// @param x        Output value to transform
-/// @param channel  Channel index along quant_axis (0-based). Only meaningful
-///                 for quantization epilogues; ignored for activation types.
+/// Apply an epilogue at a channel index. Activation types ignore @p channel;
+/// quantization epilogues (future) use per-channel or per-tensor parameters.
 float apply_epilogue(const Epilogue& ep, float x, int64_t channel);
 
 }  // namespace nnops

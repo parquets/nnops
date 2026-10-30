@@ -2,8 +2,9 @@
 /// @file slice.hpp
 /// @brief Slice operator — extract a sub-tensor along specified axes.
 ///
-/// Equivalent to `x[start:end:step, ...]` in numpy / torch.
-/// Supports Planar layout only.
+/// Equivalent to numpy/torch `x[start:end:step, ...]` on the listed axes;
+/// unlisted axes are kept in full. For each listed axis the output dim is
+/// ceil((end - start) / step) after clamping to the input extent. Planar only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -16,30 +17,21 @@
 
 namespace nnops {
 
-/// Attributes for the Slice operator.
-///
-/// Axes not listed in @p axes are kept in full (same as identity).
-/// For each axis in @p axes, output_dim = ceil((end - start) / step).
 struct SliceAttributes {
-    /// Start indices for each sliced axis (inclusive).
+    /// Start index per listed axis (inclusive).
     detail::SmallVector<int64_t, TensorDesc::kMaxRank> starts;
 
-    /// End indices for each sliced axis (exclusive).
+    /// End index per listed axis (exclusive).
     detail::SmallVector<int64_t, TensorDesc::kMaxRank> ends;
 
-    /// Which axes to slice. Default: empty (all syntactic sugar handled by caller).
+    /// Axes to slice; unlisted axes are kept whole.
     detail::SmallVector<int64_t, TensorDesc::kMaxRank> axes;
 
-    /// Step per sliced axis (must be >= 1). Default: all 1.
+    /// Step per listed axis (>= 1). Default: all 1.
     detail::SmallVector<int64_t, TensorDesc::kMaxRank> steps;
 };
 
-/// Sub-tensor extraction operator.
-///
-/// Computes: output = input[starts[0]:ends[0]:steps[0], ...] along specified axes.
-///
-/// Input:  X [*]  (any rank, planar only, f32/f16)
-/// Output: Y [*]  (same dtype, sliced shape, planar)
+/// output = input[starts[0]:ends[0]:steps[0], ...] along the listed axes.
 class Slice : public OpBase {
 public:
     static std::unique_ptr<Slice> create(const SliceAttributes& attrs,
@@ -71,7 +63,7 @@ public:
 
     const SliceAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in slice.cpp (Pimpl pattern)
+    struct Impl;  // defined in slice.cpp
     ~Slice();
 
 private:

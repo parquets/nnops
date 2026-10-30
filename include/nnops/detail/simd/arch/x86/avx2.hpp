@@ -1,13 +1,20 @@
 #pragma once
 /// @file avx2.hpp
-/// @brief AVX2 + FMA backend for 256-bit float32 vector operations (v_f32x8).
+/// @brief AVX2 + FMA backend for 256-bit float32 (v_f32x8).
 ///
-/// Requires compile-time AVX2 support (built with /arch:AVX2 or -mavx2 -mfma).
-/// The runtime dispatch (via CpuFeatures) ensures this code only executes on
-/// AVX2-capable hardware, but the code itself must be compiled with AVX2 flags.
-/// For runtime multi-ISA, compile this as a separate translation unit with custom flags.
+/// The intrinsics need the AVX2/FMA flags at compile time (/arch:AVX2 or
+/// -mavx2 -mfma); the guard below checks the target architecture only. This
+/// build passes those flags to every x86_64 TU (AVX2 is the baseline), so
+/// nothing gates this code at runtime; a multi-ISA build would have to isolate
+/// it in its own translation unit and dispatch on CpuFeatures.
 ///
-/// v_f32x4 is also provided on this platform (using the low 128 bits).
+/// The v_f32x4 defined here is a plain __m128, used by the 256-bit horizontal
+/// reductions and the deinterleave helpers; the exported simd::v_f32x4 comes
+/// from sse.hpp.
+///
+/// v_rcp and v_rsqrt are the AVX approximations (~2^-12 relative error), not
+/// exact 1/x and 1/sqrt(x); the scalar fallback's v_rcp is a real division, so
+/// the two cannot be compared bit for bit.
 
 #if !defined(NNOPS_ARCH_X86_64)
   #error "avx2.hpp requires x86_64 architecture"
@@ -62,9 +69,6 @@ struct v_f32x8 {
         : val(_mm256_setr_ps(v0, v1, v2, v3, v4, v5, v6, v7)) {}
 };
 
-// ============================================================
-// v_f32x4 operations (same API, 128-bit under the hood)
-// ============================================================
 inline v_f32x4 v_load_f32x4(const float* p) {
     return v_f32x4(_mm_loadu_ps(p));
 }
@@ -104,7 +108,7 @@ inline v_f32x4 v_and(const v_f32x4& a, const v_f32x4& b)
 inline v_f32x4 v_sqrt(const v_f32x4& a)
     { return v_f32x4(_mm_sqrt_ps(a.val)); }
 
-// Transcendental math for v_f32x4 (delegated to sse_mathfunc)
+// exp/log/sin/cos/tan/tanh delegate to sse_mathfunc
 inline v_f32x4 v_exp(const v_f32x4& a) {
     return v_f32x4(sse::exp_ps(a.val));
 }
@@ -130,7 +134,6 @@ inline float v_reduce_sum(const v_f32x4& a) {
     return _mm_cvtss_f32(t);
 }
 
-// Horizontal max/min — same pairwise shuffle reduction as v_reduce_sum
 inline float v_reduce_max(const v_f32x4& a) {
     __m128 t = _mm_max_ps(a.val, _mm_movehl_ps(a.val, a.val));
     t = _mm_max_ps(t, _mm_shuffle_ps(t, t, 1));
@@ -142,9 +145,6 @@ inline float v_reduce_min(const v_f32x4& a) {
     return _mm_cvtss_f32(t);
 }
 
-// ============================================================
-// v_f32x8 operations (native 256-bit AVX2, FMA3)
-// ============================================================
 inline v_f32x8 v_load_f32x8(const float* p) {
     return v_f32x8(_mm256_loadu_ps(p));
 }
@@ -163,7 +163,6 @@ inline v_f32x8 v_mul(const v_f32x8& a, const v_f32x8& b)
 inline v_f32x8 v_div(const v_f32x8& a, const v_f32x8& b)
     { return v_f32x8(_mm256_div_ps(a.val, b.val)); }
 
-// FMA: true fused multiply-add via FMA3
 inline v_f32x8 v_fmadd(const v_f32x8& a, const v_f32x8& b, const v_f32x8& c)
     { return v_f32x8(_mm256_fmadd_ps(a.val, b.val, c.val)); }
 inline v_f32x8 v_fmsub(const v_f32x8& a, const v_f32x8& b, const v_f32x8& c)
@@ -199,7 +198,7 @@ inline v_f32x8 v_rcp(const v_f32x8& a)
 inline v_f32x8 v_rsqrt(const v_f32x8& a)
     { return v_f32x8(_mm256_rsqrt_ps(a.val)); }
 
-// Transcendental math functions for v_f32x8 (delegated to avx2_mathfunc)
+// exp/log/sin/cos/tan/tanh delegate to avx2_mathfunc
 inline v_f32x8 v_exp(const v_f32x8& a) {
     return v_f32x8(exp256_ps(a.val));
 }
@@ -219,7 +218,8 @@ inline v_f32x8 v_tanh(const v_f32x8& a) {
     return v_f32x8(tanh256_ps(a.val));
 }
 
-// Horizontal sum: fold the two 128-bit halves, then pairwise-reduce
+// AVX shuffles do not cross the 128-bit lane boundary, so the 256-bit
+// reductions fold the two halves first and then reduce the __m128 pairwise.
 inline float v_reduce_sum(const v_f32x8& a) {
     __m128 lo = _mm256_castps256_ps128(a.val);
     __m128 hi = _mm256_extractf128_ps(a.val, 1);
@@ -227,7 +227,6 @@ inline float v_reduce_sum(const v_f32x8& a) {
     return v_reduce_sum(v_f32x4(sum128));
 }
 
-// Horizontal max — pairwise shuffle reduction
 inline float v_reduce_max(const v_f32x8& a) {
     __m128 lo = _mm256_castps256_ps128(a.val);
     __m128 hi = _mm256_extractf128_ps(a.val, 1);
@@ -235,7 +234,6 @@ inline float v_reduce_max(const v_f32x8& a) {
     return v_reduce_max(v_f32x4(max128));
 }
 
-// Horizontal min — pairwise shuffle reduction
 inline float v_reduce_min(const v_f32x8& a) {
     __m128 lo = _mm256_castps256_ps128(a.val);
     __m128 hi = _mm256_extractf128_ps(a.val, 1);
@@ -244,15 +242,12 @@ inline float v_reduce_min(const v_f32x8& a) {
 }
 
 // ============================================================
-// f32 → f16 conversion (F16C)
+// f32 → f16 (F16C). Only the narrowing direction lives here; the widening
+// v_cvt_f16_to_f32 belongs to vec_f16x8.hpp, which knows this build's
+// v_f32x8 — see the note there and in sse.hpp.
 // ============================================================
 #if defined(__F16C__)
 
-/// @brief Narrow 8 f32 lanes (__m256) to 8 f16 lanes (sse::v_f16x8).
-///
-/// The widening direction is not defined here either: it belongs to the f16
-/// layer (vec_f16x8.hpp), which is what knows this build's v_f32x8. See the
-/// note there and in arch/x86/sse.hpp.
 inline sse::v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     return sse::v_f16x8(_mm256_cvtps_ph(a.val, 0));
 }
@@ -260,18 +255,15 @@ inline sse::v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
 #endif  // defined(__F16C__)
 
 // ============================================================
-// Deinterleave (stride-2 gather) — pair types
+// Stride-2 gather — three spellings of one load. v_deinterleave_* reads 2N
+// elements and returns the {even, odd} pair; v_load_even_* / v_load_odd_*
+// return one half of it; v_load_stride2_even_* / v_load_stride2_odd_* are the
+// same two functions under explicit names.
 // ============================================================
 
-/// @brief Pair of v_f32x4 registers: even- and odd-indexed elements.
 struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
 
-/// @brief Pair of v_f32x8 registers: even- and odd-indexed elements.
 struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
-
-// ============================================================
-// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
-// ============================================================
 
 /// @brief Load 8 contiguous f32s, return {a0,a2,a4,a6}, {a1,a3,a5,a7}.
 inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
@@ -294,10 +286,6 @@ inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
     return {v_f32x8(even), v_f32x8(odd)};
 }
 
-// ============================================================
-// 方案 B: v_load_even_* / v_load_odd_* — single-result convenience
-// ============================================================
-
 inline v_f32x4 v_load_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
 }
@@ -310,10 +298,6 @@ inline v_f32x8 v_load_even_f32x8(const float* src) {
 inline v_f32x8 v_load_odd_f32x8(const float* src) {
     return v_deinterleave_f32x8(src).odd;
 }
-
-// ============================================================
-// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_* — explicit names
-// ============================================================
 
 inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
@@ -329,18 +313,16 @@ inline v_f32x8 v_load_stride2_odd_f32x8(const float* src) {
 }
 
 // ============================================================
-// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
+// 8×8 f32 transpose, in place — rows in, the same registers are columns out
 // ============================================================
 
-/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
-/// On entry, r0..r7 are rows 0..7 of the matrix. On exit, they are
-/// the transposed rows (= original columns).
+// 32-bit interleave, then an in-lane shuffle, then a 128-bit lane permute:
+// AVX2 shuffles never cross the 128-bit boundary, hence the third phase.
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
     __m256 t0, t1, t2, t3, t4, t5, t6, t7;
     __m256 s0, s1, s2, s3, s4, s5, s6, s7;
 
-    // Phase 1: interleave 32-bit lanes across pairs
     t0 = _mm256_unpacklo_ps(r0.val, r1.val);
     t1 = _mm256_unpackhi_ps(r0.val, r1.val);
     t2 = _mm256_unpacklo_ps(r2.val, r3.val);
@@ -350,7 +332,6 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     t6 = _mm256_unpacklo_ps(r6.val, r7.val);
     t7 = _mm256_unpackhi_ps(r6.val, r7.val);
 
-    // Phase 2: shuffle within 128-bit lanes
     s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1,0,1,0));  // col 0 | col 4
     s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3,2,3,2));  // col 1 | col 5
     s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1,0,1,0));
@@ -360,7 +341,6 @@ inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
     s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1,0,1,0));
     s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3,2,3,2));
 
-    // Phase 3: permute 128-bit lanes
     r0.val = _mm256_permute2f128_ps(s0, s4, 0x20);
     r1.val = _mm256_permute2f128_ps(s1, s5, 0x20);
     r2.val = _mm256_permute2f128_ps(s2, s6, 0x20);

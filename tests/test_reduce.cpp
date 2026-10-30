@@ -1,8 +1,23 @@
 /// @file test_reduce.cpp
 /// @brief Tests for the Reduce operator (Sum, Min, Max, Mean).
 ///
-/// Covers: 1D/2D/3D reductions, keepdims, all-axes, class API,
-/// and random data validation against reference.
+/// Planar 1D/2D/3D, keepdims, negative axes, NCHWC8 and f16. The 1D/2D
+/// expected values are hand-computed next to the asserts; the random-data
+/// tests build a scalar reference over the same buffer. A negative axis wraps
+/// from the end, so the negative-axis test runs axis=2 and axis=-1 on one
+/// input and compares the two outputs.
+///
+/// NCHWC8 is where the context is needed. The desc is rank 4 [N, C, H, W] with
+/// C the LOGICAL channel count, while storage is [n][c8][h][w][lane]: a row is
+/// W positions of 8 lanes, row_stride = W * 8 elements (the 32B row pitch
+/// never pads: W*8 f32 is already 32B), and c8 runs over ceil(C / 8) blocks.
+/// Reducing the last axis runs per lane, i.e. per channel, and the output just
+/// loses that extent: rank 3 [N, C, H] here, or rank 4 with the extent left at
+/// 1 under keepdims. Buffers come from desc.storage_bytes(), which is what
+/// accounts for the padded channel blocks.
+///
+/// f16 goes through the SIMD f16 path and is compared against the f32
+/// reference at 5e-2 rather than round-tripped.
 
 #include "nnops/ops/reduce.hpp"
 #include "common/test_harness.hpp"
@@ -14,7 +29,7 @@
 using namespace nnops;
 
 // ============================================================
-// 1D tests — hand-verified
+// 1D tests
 // ============================================================
 
 NNOPS_TEST(reduce_1d_sum) {
@@ -157,7 +172,7 @@ NNOPS_TEST(reduce_1d_keepdims) {
 }
 
 // ============================================================
-// 2D tests — hand-verified
+// 2D tests
 // ============================================================
 
 NNOPS_TEST(reduce_2d_axis0_sum) {
@@ -364,14 +379,13 @@ NNOPS_TEST(reduce_negative_axis) {
     const TensorView ins2[] = {input};
     op2->compute(output2, ins2);
 
-    // Results should be identical
     for (size_t i = 0; i < out1.size(); ++i) {
         NNOPS_EXPECT_NEAR(out1[i], out2[i], 1e-6f);
     }
 }
 
 // ============================================================
-// Random data tests — all 4 reduction types
+// Random data — all four types
 // ============================================================
 
 NNOPS_TEST(reduce_random_sum) {
@@ -570,15 +584,9 @@ NNOPS_TEST(reduce_3d_first_axis) {
 
 // ============================================================
 // Packed layout tests (NCHWC8)
-//
-// NCHWC8 is rank 4: [N, C, H, W] where C is the LOGICAL channel
-// count. Physical row layout: [w0_l0..w0_l7, w1_l0..w1_l7, ...].
-// num_channel_blocks = ceil(C / 8), row_stride = W * 8 elements.
-// total_rows = N * num_channel_blocks * H.
 // ============================================================
 
-/// Helper: create NCHWC8 TensorView with correct pitch, plus buffer.
-/// Creates a rank-4 tensor [N, C, H, W] with NCHWC8 layout.
+/// Rank-4 [N, C, H, W] view; the buffer is sized for padded channel blocks.
 static std::pair<std::vector<float>, TensorView>
 make_nchwc8_4d(int64_t N, int64_t C, int64_t H, int64_t W)
 {
@@ -594,7 +602,6 @@ make_nchwc8_4d(int64_t N, int64_t C, int64_t H, int64_t W)
     return {std::move(buf), tv};
 }
 
-/// Helper: create an NCHWC8 output tensor from a descriptor (handles any rank).
 static std::pair<std::vector<float>, TensorView>
 make_nchwc8_out(const TensorDesc& desc)
 {
@@ -604,7 +611,6 @@ make_nchwc8_out(const TensorDesc& desc)
     return {std::move(buf), tv};
 }
 
-/// Helper: fill NCHWC8 data with sequential values.
 static void fill_nchwc8(float* data,
                          int64_t N, int64_t C, int64_t H, int64_t W,
                          float base_val, float step)
@@ -630,7 +636,6 @@ static void fill_nchwc8(float* data,
     }
 }
 
-/// Helper: read a value from NCHWC8 physical storage at logical (n, c, h, w).
 static float read_nchwc8(const float* data,
                           int64_t N, int64_t C, int64_t H, int64_t W,
                           int64_t n, int64_t c, int64_t h, int64_t w)
@@ -646,8 +651,6 @@ static float read_nchwc8(const float* data,
 }
 
 NNOPS_TEST(reduce_nchwc8_axis_w_sum) {
-    // NCHWC8 [1, 8, 1, 4] — one full C8 block (C=8), W=4
-    // Reduce over W (axis=-1) with Sum. Each C lane is independently summed.
     const int64_t N = 1, C = 8, H = 1, W = 4;
 
     auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
@@ -674,16 +677,13 @@ NNOPS_TEST(reduce_nchwc8_axis_w_sum) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Output is rank 3 [1, 8, 1] NCHWC8.
-    // Physical storage: 8 elements at offset 0 (one position with 8 lanes).
-    // Lane l values at input: fill(0)+l=1+l, fill(8)+l=9+l, fill(16)+l=17+l, fill(24)+l=25+l
-    // Sum per lane: (1+l)+(9+l)+(17+l)+(25+l) = 4*l + 52
+    // Lane l sums (1+l)+(9+l)+(17+l)+(25+l) = 4*l + 52 into the 8 lanes at offset 0.
     for (int lane = 0; lane < 8; ++lane) {
         float expected = 4.0f * static_cast<float>(lane) + 52.0f;
         NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(lane)], expected, 1e-4f);
     }
 
-    // Also verify per-lane against direct computation from input
+    // Cross-check through read_nchwc8.
     for (int lane = 0; lane < 8; ++lane) {
         float sum = 0.0f;
         for (int w = 0; w < 4; ++w) {
@@ -694,11 +694,9 @@ NNOPS_TEST(reduce_nchwc8_axis_w_sum) {
 }
 
 NNOPS_TEST(reduce_nchwc8_axis_w_max) {
-    // NCHWC8 [1, 8, 1, 3] — per-lane max over W
     const int64_t N = 1, C = 8, H = 1, W = 3;
 
     auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-    // Fill with deliberate values so per-lane maxes are predictable
     int64_t num_c8 = (C + 7) / 8;
     int64_t row_stride = W * 8;
     int64_t c8_stride = H * row_stride;
@@ -733,7 +731,6 @@ NNOPS_TEST(reduce_nchwc8_axis_w_max) {
 }
 
 NNOPS_TEST(reduce_nchwc8_axis_w_mean) {
-    // NCHWC8 [1, 8, 1, 4] — per-lane mean over W
     const int64_t N = 1, C = 8, H = 1, W = 4;
 
     auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
@@ -762,7 +759,6 @@ NNOPS_TEST(reduce_nchwc8_axis_w_mean) {
 }
 
 NNOPS_TEST(reduce_nchwc8_axis_w_min) {
-    // NCHWC8 [1, 8, 1, 3] — per-lane min over W
     const int64_t N = 1, C = 8, H = 1, W = 3;
 
     auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
@@ -796,7 +792,7 @@ NNOPS_TEST(reduce_nchwc8_axis_w_min) {
 }
 
 NNOPS_TEST(reduce_nchwc8_random) {
-    // Random NCHWC8 [2, 16, 3, 5] — two full C8 blocks (C=16).
+    // [2, 16, 3, 5] — two full C8 blocks.
     const int64_t N = 2, C = 16, H = 3, W = 5;
     const int64_t num_c8 = (C + 7) / 8;
     const int64_t row_stride = W * 8;
@@ -812,7 +808,6 @@ NNOPS_TEST(reduce_nchwc8_random) {
     int64_t n_stride = num_c8 * H * row_stride;
     int64_t c8_stride = H * row_stride;
 
-    // Test all four reduce types over W (axis=-1)
     struct TestCase { ReduceType type; };
     TestCase cases[] = {
         {ReduceType::Sum},
@@ -834,15 +829,14 @@ NNOPS_TEST(reduce_nchwc8_random) {
         const TensorView ins[] = {input};
         op->compute(output, ins);
 
-        // Per-lane verification: for each (n, c8, h, lane), reduce over W.
-        // Output is rank 3 [N, C, H] NCHWC8, densely packed.
+        // Output is rank 3 [N, C, H]; C=16 fills whole blocks, so position pos
+        // owns the 8 lanes at pos*8 with no pitch slack.
         int64_t out_positions = static_cast<int64_t>(N) * num_c8 * H;
         for (int64_t pos = 0; pos < out_positions; ++pos) {
             int64_t n = pos / (num_c8 * H);
             int64_t c8 = (pos / H) % num_c8;
             int64_t h = pos % H;
             for (int lane = 0; lane < 8; ++lane) {
-                // Gather all W values for this lane
                 float result;
                 switch (tc.type) {
                 case ReduceType::Sum: {
@@ -898,7 +892,6 @@ NNOPS_TEST(reduce_nchwc8_random) {
 }
 
 NNOPS_TEST(reduce_nchwc8_keepdims) {
-    // NCHWC8 [1, 8, 2, 3] — reduce over W with keepdims=true
     const int64_t N = 1, C = 8, H = 2, W = 3;
 
     auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
@@ -924,7 +917,6 @@ NNOPS_TEST(reduce_nchwc8_keepdims) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Verify per-lane sums for each (n, c8, h) position
     int64_t num_c8 = (C + 7) / 8;
     int64_t in_row_stride = W * 8;
     int64_t in_c8_stride = H * in_row_stride;
@@ -953,11 +945,10 @@ NNOPS_TEST(reduce_nchwc8_keepdims) {
 }
 
 // ============================================================
-// f16 tests — exercise the SIMD f16 code path
+// f16 tests — SIMD path
 // ============================================================
 
 NNOPS_TEST(reduce_random_f16) {
-    // Planar 2D f16: test all 4 reduce types
     auto [f32_vec, _f32] = test::make_random_tensor({5, 10}, -2.0f, 2.0f, 888);
     auto f16_vec = test::f32_to_f16(f32_vec);
 
@@ -987,7 +978,6 @@ NNOPS_TEST(reduce_random_f16) {
         const TensorView ins[] = {input};
         op->compute(output, ins);
 
-        // Verify against f32 reference for each row
         for (int r = 0; r < 5; ++r) {
             float expected = 0.0f;
             switch (tc.type) {

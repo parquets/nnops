@@ -1,14 +1,12 @@
 #pragma once
 /// @file layout_convert.hpp
-/// @brief LayoutConvert operator — convert tensor data between memory layouts.
+/// @brief LayoutConvert operator — pack/unpack between planar and C8-blocked.
 ///
-/// Supports conversions between NCHW ↔ NCHWC8 (2D) and NCDHW ↔ NCDHWC8 (3D)
-/// for f32 and f16 data types. The logical shape is preserved; only the
-/// physical memory layout changes.
-///
-/// Supported layout pairs:
-///   NCHW   ↔ NCHWC8     (2D pack/unpack)
-///   NCDHW  ↔ NCDHWC8    (3D pack/unpack)
+/// NCHW ↔ NCHWC8 (2D) and NCDHW ↔ NCDHWC8 (3D). The logical shape is
+/// preserved; only the physical layout changes. On pack the trailing C8 block
+/// is zero-padded when C is not a multiple of 8; unpack drops the pad lanes.
+/// f32, f16, s8 and u8 — on the s8/u8 path the pad lanes take the activation
+/// zero point, so a padded lane dequantizes to zero contribution.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -20,18 +18,10 @@
 
 namespace nnops {
 
-/// Attributes for the LayoutConvert operator.
 struct LayoutConvertAttributes {
-    /// Target memory layout for the output tensor.
     TensorLayout target_layout = TensorLayout::NCHW;
 };
 
-/// LayoutConvert operator (class-based API).
-///
-/// Converts tensor data from the input layout to the target layout.
-/// The logical shape [N, C, (D,) H, W] is preserved; only the physical
-/// memory layout changes. For pack operations (NCHW → NCHWC8), the
-/// last C8 block is zero-padded if C is not a multiple of pack_size.
 class LayoutConvert : public OpBase {
 public:
     static std::unique_ptr<LayoutConvert> create(

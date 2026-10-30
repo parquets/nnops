@@ -1,5 +1,20 @@
 /// @file conv2d.cpp
-/// @brief Conv2D operator dispatch — connects class API to backend implementations.
+/// @brief Conv2D operator dispatch — descriptor checks, kernel selection, and
+///        the two prepacked weight products.
+///
+/// validate() makes the filter order pair with the activation: a channel-last
+/// activation takes HWIO, PackedHWIO or PackedWinoWeightLast, a planar one any
+/// other tag (a raw filter, PackedOIHW, or PackedWinoWeight). compute() forces
+/// the implicit-GEMM kernel for three cases whatever the algorithm says — a
+/// quantized (s8) filter, a prepacked im2col filter, and a raw channel-last
+/// filter — and under Auto picks Winograd only when handed U, since a raw filter
+/// has no U to multiply in the transform domain.
+///
+/// prepackWeights() produces one of two things: the Winograd U — [16][OC][IC/G]
+/// for a planar activation, [16][nb][G·jb][ldd] B panels for a channel-last one —
+/// when asked for Winograd (under Auto, only for a non-quantized k3s1 filter),
+/// and the im2col route's PackedOIHW/PackedHWIO otherwise. Both are built once at
+/// load time so compute() reads them in place instead of repacking per call.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/detail/assert.hpp"
@@ -47,9 +62,8 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
     }
 }
 
-/// Pack the raw [OC, IC/G, 3, 3] weight into U[16][OC][IC/G] = G g Gᵀ.
-/// @p ld_u / @p ld_c are the row / column strides of one 4×4 transform block
-/// inside the U buffer (p = i·4 + j maps to p·OC·ICG).
+/// Pack [OC, IC/G, 3, 3] into U[16][OC][IC/G] = G g Gᵀ; p = i·4 + j, with ld_u
+/// and ld_c the block's row and column strides.
 template <class T>
 void wino_pack_weight(const TensorView& weight, TensorView& u_out,
                       int64_t OC, int64_t ICG, int64_t ld_u, int64_t ld_c)
@@ -65,16 +79,9 @@ void wino_pack_weight(const TensorView& weight, TensorView& u_out,
     }
 }
 
-/// Pack an HWIO weight ([KH][KW][IC/G][OC], OC contiguous) into the channel-last
-/// route's B panels — the transposed product's operand, not the planar U.
-///
-/// The transform is the same G g Gᵀ: a 3×3 is gathered per (ic, oc) and written
-/// into [16][kb][g·jb + j][ldd], each panel [kc][nr] k-major, so the MMA can read
-/// it in place and no pack is ever done per call. The oc axis is padded to whole
-/// panels, so the buffer must arrive zeroed — the caller does that.
-///
-/// Scalar on purpose: prepack runs once per (ic, oc) at load time, and a
-/// vectorised gather over a transposed filter would only pay for itself there.
+/// Pack HWIO ([KH][KW][IC/G][OC], OC contiguous) into the channel-last B panels:
+/// the same G g Gᵀ, one 3×3 gather per (ic, oc), written [16][kb][g·jb + j][ldd]
+/// k-major. The oc padding must arrive zeroed. Scalar because it runs once.
 template <class T>
 void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
                            const backend::cpu::WinoChannelLastU& ug,
@@ -82,8 +89,7 @@ void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
 {
     const T* g = weight.ptr<T>();
     T* u = u_out.ptr<T>();
-    // Strides come from the dims, not the pitch: a weight is a load-time
-    // constant, so a padded one is not a case this route has to absorb.
+    // Strides come from the dims, not the pitch: a weight is a load-time constant.
     const int64_t OC  = OCG * G;
     const int64_t tap = ICG * OC;   // one filter position ([kh][kw]) of all groups
     for (int64_t gg = 0; gg < G; ++gg) {
@@ -117,19 +123,16 @@ Conv2D::Conv2D(const Conv2DAttributes& attrs, Backend backend)
 std::vector<TensorDesc> Conv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    // The channel-last weight is TensorFlow's [KH, KW, IC/G, OC], so the output
-    // channel count is its last axis rather than its first.
+    // HWIO's last axis is OC, so the channel count is the weight's last dim.
     const bool wt_hwio = inputs.size() > 1 &&
         is_channel_last_weight(inputs[1].layout);
     std::vector<TensorDesc> outs = conv2d_output_shape(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
         static_cast<int>(attrs_.auto_pad), attrs_.groups, inputs, wt_hwio);
 
-    // The quantized route writes either an integer destination (s8/u8, taken
-    // from attributes.output_dtype) or an fp one — the fp activation's own
-    // dtype, or output_dtype for a pre-quantized (u8/s8) activation. An
-    // unsupported request is passed through untouched, so the kernel plan can
-    // refuse it instead of silently running another route.
+    // The quantized route writes s8/u8 when output_dtype says so, else the fp
+    // activation's dtype (output_dtype for a pre-quantized one); an unsupported
+    // request passes through for the kernel plan to refuse.
     if (inputs.size() > 1 && is_quantized_conv2d(inputs[1].dtype)) {
         const DataType act = inputs[0].dtype;
         const bool fp_act = (act == DataType::f32 || act == DataType::f16);
@@ -158,15 +161,9 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
         is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOrChannelLast)));
     NNOPS_TRY(detail::require(
         is_layout_supported(inputs[1].layout, LayoutSupport::PlanarOrChannelLast)));
-    // The weight must be stored in the form that pairs with the activation: the
-    // channel-last kernel reads HWIO (the output channel is the run) or, once
-    // prepacked, U as B panels; the planar one OIHW or the planar U. Converting
-    // is the caller's job, once per model, at load time — a weight reshaped per
-    // call would pay that copy on every inference.
-    //
-    // The im2col route takes a raw filter *or* its prepacked form on either
-    // side (PackedHWIO pairs with a channel-last activation, PackedOIHW with a
-    // planar one), so a graph that prepacks unconditionally still validates.
+    // A raw filter or its prepacked form works on either side (PackedHWIO with a
+    // channel-last activation, PackedOIHW with a planar one), so a graph that
+    // prepacks unconditionally still validates.
     const TensorLayout wl = inputs[1].layout;
     const bool weight_last = is_channel_last_weight(wl) ||
                              wl == TensorLayout::PackedWinoWeightLast ||
@@ -196,12 +193,8 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
     }
 
-    // Three cases always run the implicit-GEMM kernel, whatever the algorithm
-    // says: a raw channel-last filter (the kernel then keeps the pixel axis on M
-    // and reads HWIO), an s8 weight (the quantized driver), and a prepacked
-    // im2col filter (PackedOIHW/PackedHWIO holds that kernel's own panels — U is
-    // the only other prepacked form, and each U form pairs with its own
-    // activation layout).
+    // A raw channel-last filter keeps the pixel axis on M; U is the only other
+    // prepacked form, each pairing with its own activation layout.
     const bool wino_u = is_wino_weight(inputs[1].layout());
     if (backend_ == Backend::CPU &&
         (is_quantized_conv2d(inputs[1].data_type()) ||
@@ -211,8 +204,7 @@ Status Conv2D::compute(std::span<TensorView> outputs,
                                                          workspace);
     }
 
-    // Auto reads the weight it was handed: U can only be multiplied in the
-    // transform domain, and a raw filter has no U to use.
+    // Auto reads the weight it was handed: a raw filter has no U to use.
     auto kernel_fn = impl_->kernel_fn;
     if (attrs.algorithm == ConvAlgorithm::Auto) {
         attrs.algorithm = wino_u ? ConvAlgorithm::Winograd
@@ -234,14 +226,9 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     NNOPS_ASSERT(weight.rank() == 4);
     NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOrChannelLast));
 
-    // Two products live behind this one call, and the algorithm picks: the
-    // Winograd U, or the im2col route's packed filter (which both its fp and
-    // int8 drivers read in place, instead of repacking per call or per task).
-    //
-    // Auto keeps producing U exactly where the Winograd transform exists — the
-    // same k3s1 fp geometry its asserts demand — because that is what a caller
-    // asking for Auto is prepared to feed back into compute(); every other
-    // geometry, and every quantized filter, gets the im2col panels.
+    // Two products live behind this one call. Auto keeps producing U exactly
+    // where the transform exists — the k3s1 fp geometry its asserts demand —
+    // because that is what an Auto caller will feed back into compute().
     const bool wino_product =
         attrs_.algorithm == ConvAlgorithm::Winograd ||
         (attrs_.algorithm == ConvAlgorithm::Auto &&
@@ -251,10 +238,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
          attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1);
 
     if (!wino_product) {
-        // ---- the im2col route's packed filter: PackedOIHW / PackedHWIO ----
-        // The descriptor is resolved from the attributes and the filter's own
-        // dims, so the query needs no activation; the kernel later resolves the
-        // identical geometry from the same function.
+        // The descriptor comes from the attributes and the filter's own dims, so
+        // the query needs no activation.
         const TensorDesc d =
             backend::cpu::conv_packed_weight_desc(attrs_, weight.desc());
         NNOPS_ASSERT(d.rank > 0 &&
@@ -264,7 +249,7 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
 
         if (outputs[0].is_empty()) {
             // The pitch is the row length in bytes: a packed filter is not
-            // channel-packed, so the default row alignment would not describe it.
+            // channel-packed, so the default alignment would not describe it.
             outputs[0] = TensorView(shape, d.dtype, nullptr,
                                     d.row_stride_elems * esz, d.layout,
                                     weight.quant_params());
@@ -282,7 +267,7 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     }
 
     // compute() receives U and cannot fall back to the raw-weight im2col path,
-    // so every unsupported configuration has to fail here, at prepack time.
+    // so every unsupported configuration must fail here, at prepack time.
     NNOPS_ASSERT((attrs_.algorithm == ConvAlgorithm::Winograd ||
                   attrs_.algorithm == ConvAlgorithm::Auto) &&
                  "Conv2D::prepackWeights: attrs.algorithm must be Winograd or Auto");
@@ -294,11 +279,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     const DataType dtype = weight.data_type();
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));
 
-    // Two filter orders, two U forms: OIHW transforms into [16][OC][IC/G] for a
-    // planar activation, HWIO (TensorFlow's order, OC contiguous) into the
-    // channel-last route's B panels. Both hold the same G g Gᵀ — only the packing
-    // differs, because the two routes run the same GEMM with its operands
-    // swapped.
+    // Both U forms hold the same G g Gᵀ — only the packing differs, because the
+    // two routes run the same GEMM with its operands swapped.
     if (is_channel_last_weight(weight.layout())) {
         // Weight: [KH, KW, IC/G, OC]
         const int64_t ICG = weight.shape(2);
@@ -312,9 +294,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
         NNOPS_ASSERT(ug.total > 0 && "Conv2D::prepackWeights: unsupported dtype");
 
         if (outputs[0].is_empty()) {
-            // ---- Query: the panels [16][nb][G·jb][ldd]. The pitch is the
-            // panel's own length — PackedWinoWeightLast is not channel-packed,
-            // so the default 32 B row alignment would not be ldd × elem_size.
+            // Query: the panels [16][nb][G·jb][ldd], pitched at ldd — not
+            // channel-packed, so the default 32 B row alignment would not fit.
             const int64_t u_shape[] = {16, ug.nb, ug.jbg, ug.ldd};
             outputs[0] = TensorView(std::span<const int64_t>(u_shape, 4), dtype,
                                     nullptr, ug.ldd * elem_size,
@@ -343,10 +324,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     const int64_t ICG = weight.shape(1);
 
     if (outputs[0].is_empty()) {
-        // ---- Query: U is [16, OC, IC/G] — one 4×4 transform-domain kernel per
-        // position. The pitch is explicit: PackedWinoWeight is not
-        // channel-packed, so TensorDesc::row_pitch() would align the row to
-        // 32 B, which is not ICG × elem_size in general.
+        // Query: U is [16, OC, IC/G], pitched at ICG × elem_size — not
+        // channel-packed, so row_pitch() would 32 B-align it instead.
         const int64_t u_shape[] = {16, OC, ICG};
         const int64_t u_pitch = ICG * elem_size;
         outputs[0] = TensorView(std::span<const int64_t>(u_shape, 3), dtype,

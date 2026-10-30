@@ -2,11 +2,20 @@
 /// @file pack_f32.hpp
 /// @brief AArch64 NEON float32 pack kernels for GEMM LHS/RHS.
 ///
-/// Pack operations reorder matrix rows/columns into micro-kernel-friendly
-/// layouts. Two fundamental transforms:
-///   - TRANSPOSE (LHS): each row is read contiguously; output is N×K packed
-///     (row striding across input, contiguous across K within each row block).
-///   - COPY (RHS): rows are contiguous in input; output keeps row-major.
+/// Repacks matrix rows/columns into the layouts the MMA micro-kernels read.
+/// Two transforms:
+///   - TRANSPOSE (LHS): reads n rows (rows at stride ir_step, k contiguous
+///     within a row), scales by `scale` and writes k-major. Rows past `mr`
+///     alias the last live row — the MMA kernels' convention — so a partial-M
+///     panel needs no padding.
+///   - COPY (RHS): input rows are contiguous; the vectorised widths take the
+///     plain loads at full width, a narrow panel (`nr` < width) reads only its
+///     live columns and zero-fills the rest. pack_trans_n6_f32 writes the same
+///     layout from a [K][N] source (k rows at stride ir_step).
+///
+/// mr_f32 = 8 is shared with the unpacked-A route: at nr=12 a 4-k unroll costs
+/// mr*nr/4 + mr + nr/4 = 35 NEON registers, over the 32 available, so the 8x12
+/// kernel runs un-unrolled instead of the direct route dropping to mr=6.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/aarch64/pack_fp32.hpp
 
@@ -18,8 +27,7 @@
 namespace nnops::backend::cpu::aarch64 {
 
 // =========================================================================
-//  LHS Transpose pack  —  panelled transpose for packed-A in GEMM
-//  pack_trans_nN_f32: reads N rows, transposes N×4 blocks, scales by `scale`.
+//  LHS transpose pack (f32)  —  N rows x 4-k block, scaled
 // =========================================================================
 
 inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
@@ -34,8 +42,6 @@ inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 4) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -61,7 +67,6 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
 
         output += 4 * 4;
     }
-    // scalar tail
     for (; k < K; ++k) {
         *output++ = *(p0++) * scale;
         *output++ = *(p1++) * scale;
@@ -73,8 +78,6 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 8) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -116,7 +119,6 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
 
         output += 4 * 8;
     }
-    // scalar tail
     for (; k < K; ++k) {
         *output++ = *(p0++) * scale;
         *output++ = *(p1++) * scale;
@@ -132,8 +134,6 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output,
                                const float* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 12) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const float* NNOPS_RESTRICT p[12];
     for (int i = 0; i < 12; ++i) {
@@ -167,8 +167,6 @@ inline void pack_trans_n12_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
                                const float* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 16) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const float* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
@@ -200,8 +198,7 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  RHS Copy pack  —  contiguous-row copy (no transpose), panels by N.
-//  pack_copy_nN_f32: reads N-element rows, copies with optional scale.
+//  RHS copy pack (f32)  —  contiguous rows, panels by N, optional scale
 // =========================================================================
 
 inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
@@ -216,8 +213,6 @@ inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
 inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 4) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float32x4_t s = vdupq_n_f32(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
@@ -265,8 +260,6 @@ inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
 inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 8) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float32x4_t s = vdupq_n_f32(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
@@ -313,8 +306,6 @@ inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
 inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr = 12) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float32x4_t s = vdupq_n_f32(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 12) {
@@ -338,8 +329,6 @@ inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
 inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr = 16) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float32x4_t s = vdupq_n_f32(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 16) {
@@ -363,8 +352,8 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  Transposed "copy" pack  —  for RHS when B is pre-transposed.
-//  These read K elements from each of N input rows (stride = ir_step).
+//  Transposed-source copy (f32)  —  source rows are k at stride ir_step;
+//  reads the `nr` live columns of each and writes them k-major.
 // =========================================================================
 
 inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
@@ -379,21 +368,12 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  Tiled pack dispatchers  —  decompose M/N into micro-panel sizes.
+//  Micro-panel size menu (f32)  —  M/N split into panel sizes; mr = LHS
+//  rows, nr = RHS columns.
 // =========================================================================
 
-/// @brief Panel sizes for f32 LHS (A matrix rows), shared by both routes.
-/// Maps {large, medium, small} micro-panel heights indexed as [m_idx].
-/// The packed route interleaves four rows per vector, so it never leaves the
-/// register file. The unpacked-A ("direct") route reads A row-major, and a 4-k
-/// unroll there holds each row's slice live across the whole unroll: the
-/// register set becomes mr*nr/4 + mr + nr/4, which at nr=12 is 35 > 32 NEON
-/// registers for mr=8 and spills on every k. The 8x12 kernel therefore runs
-/// un-unrolled, which is what lets both routes share mr=8 instead of the direct
-/// path dropping to mr=6.
 inline constexpr int mr_f32[3] = {8, 4, 1};
 
-/// @brief Panel sizes for f32 RHS (B matrix columns).
 inline constexpr int nr_f32[3] = {12, 4, 1};
 
 }  // namespace nnops::backend::cpu::aarch64

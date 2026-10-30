@@ -1,10 +1,16 @@
 /// @file depthwise_conv_ref.cpp
-/// @brief Naive CPU reference implementation of 2D/3D depthwise convolution (NCHW/NCDHW layout).
+/// @brief Naive CPU reference for 2D/3D depthwise convolution (NCHW/NCDHW).
 ///
-/// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
-/// Supports both f32 and f16 data types. Computation always done in fp32;
-/// dtype-specific load/store handled via overloaded helpers.
-/// This is the correctness baseline.
+/// The correctness baseline: plain nested loops, one task per (batch, channel),
+/// spatial rank auto-detected from the input rank (4 → 2D, 5 → 3D).
+///
+/// f32/f16 accumulate in float through s_load/s_store. The s8/u8 path
+/// dequantizes on load (activation PerTensor, weight PerChannel — asserted at
+/// entry), accumulates in float, runs the epilogue in float and requantizes on
+/// store with round-to-nearest-even, mirroring the SIMD backend's
+/// float-accumulate strategy so the two agree exactly. add_to stays in the
+/// output's own domain: fp adds, the quantized path dequantizes the existing
+/// value, adds and requantizes.
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -24,8 +30,7 @@ using nnops::simd::s_store;
 
 namespace {
 
-/// Quantize a float value to int8/uint8 with round-to-nearest-even and
-/// saturation, matching the arch `requantize_8` / `quantization<T>` semantics.
+/// float → q8 by the arch's requantize rule: round-to-nearest-even, saturating.
 template <typename OutT>
 inline OutT quantize_float(float val, float out_scale, float out_zero) {
     constexpr bool Q_U8 = std::is_same_v<OutT, uint8_t>;
@@ -239,10 +244,6 @@ void dwconv_impl_3d_ref(const DepthwiseConvAttributes& attrs,
 // ============================================================
 // Quantized reference (s8/u8 input/output, f32 bias)
 // ============================================================
-//
-// Dequantize-on-load (activation PerTensor, weight PerChannel), accumulate in
-// float, epilogue in float, requantize-on-store with round-to-nearest-even.
-// Mirrors the SIMD backend's float-accumulate strategy for exact cross-check.
 
 template <typename InT, typename OutT>
 void dwconv_impl_2d_ref_quant(const DepthwiseConvAttributes& attrs,

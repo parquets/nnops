@@ -2,9 +2,19 @@
 /// @file pack_f16.hpp
 /// @brief AArch64 NEON float16 pack kernels for GEMM LHS/RHS.
 ///
-/// Mirrors pack_f32.hpp but operates on float16 (binary16). The NEON
-/// fp16 vector arithmetic extension (ARMv8.2-A+) is required for SIMD
-/// paths; scalar fallback is used otherwise.
+/// Mirrors pack_f32.hpp on float16 (binary16) and needs the NEON fp16
+/// arithmetic extension — there is no scalar fallback. A 128-bit f16 vector is
+/// 8 columns wide (4 for the half-width loads), so the n8 and wider transpose
+/// blocks step 8 in k where the f32 pack steps 4.
+///
+/// Two families:
+///   - pack_trans_nN (LHS/A): reads n rows (rows at stride ir_step, k
+///     contiguous within a row), scales by `scale`, writes k-major. Rows past
+///     `mr` alias the last live row — the MMA kernels' convention — so a
+///     partial-M panel needs no padding.
+///   - pack_copy_nN (RHS/B): rows are contiguous; the vectorised widths take
+///     the plain loads at full width, a narrow panel (`nr` < width) reads only
+///     its live columns and zero-fills the rest in the same k loop.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/aarch64/pack_fp16.hpp
 
@@ -32,8 +42,6 @@ inline void pack_trans_n1_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 4) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -70,8 +78,6 @@ inline void pack_trans_n4_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 8) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -90,8 +96,6 @@ inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
 
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
-    // One 128-bit f16 vector is 8 columns wide, so the block advances 8 per
-    // iteration (the f32 kernel steps 4 — its vector is 4 wide).
     for (; k <= K - 8; k += 8) {
         float16x8_t v0 = vmulq_n_f16(vld1q_f16(p0), s); p0 += 8;
         float16x8_t v1 = vmulq_n_f16(vld1q_f16(p1), s); p1 += 8;
@@ -130,8 +134,6 @@ inline void pack_trans_n8_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_trans_n12_f16(float16_t* NNOPS_RESTRICT output,
                                const float16_t* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 12) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const float16_t* NNOPS_RESTRICT p[12];
     for (int i = 0; i < 12; ++i) {
@@ -165,8 +167,6 @@ inline void pack_trans_n12_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
                                const float16_t* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 16) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const float16_t* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
@@ -198,7 +198,7 @@ inline void pack_trans_n16_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  RHS Copy pack (f16)  —  contiguous-row copy, panels by N.
+//  RHS copy pack (f16)  —  contiguous rows, panels by N.
 // =========================================================================
 
 inline void pack_copy_n1_f16(float16_t* NNOPS_RESTRICT output,
@@ -214,8 +214,6 @@ inline void pack_copy_n1_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_copy_n4_f16(float16_t* NNOPS_RESTRICT output,
                              const float16_t* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 4) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     int k = 0;
     for (; k <= K - 4; k += 4) {
@@ -266,8 +264,6 @@ inline void pack_copy_n6_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
                              const float16_t* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 8) noexcept {
-    // One k loop serves every width: a full panel takes the plain load, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 8) {
@@ -285,8 +281,6 @@ inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_copy_n12_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr = 12) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 12) {
@@ -305,8 +299,6 @@ inline void pack_copy_n12_f16(float16_t* NNOPS_RESTRICT output,
 inline void pack_copy_n16_f16(float16_t* NNOPS_RESTRICT output,
                               const float16_t* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr = 16) noexcept {
-    // One k loop serves every width: a full panel takes the plain loads, a
-    // narrow one reads only its live columns and zero-fills the rest.
     const float16_t s = static_cast<float16_t>(scale);
     for (int k = 0; k < K; ++k) {
         if (nr >= 16) {
@@ -323,13 +315,11 @@ inline void pack_copy_n16_f16(float16_t* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  Panel size constants (f16)  —  tuned for AArch64 NEON.
+//  Micro-panel size menu (f16)  —  mr = LHS rows, nr = RHS columns.
 // =========================================================================
 
-/// @brief f16 LHS micro-panel heights.
 inline constexpr int mr_f16[3] = {8, 4, 1};
 
-/// @brief f16 RHS micro-panel widths.
 inline constexpr int nr_f16[3] = {16, 8, 1};
 
 }  // namespace nnops::backend::cpu::aarch64

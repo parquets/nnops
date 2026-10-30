@@ -1,10 +1,25 @@
 #pragma once
 /// @file neon.hpp
-/// @brief ARM NEON backend for 128-bit float32 vector operations (v_f32x4).
+/// @brief ARM NEON backend for 128-bit f32 (v_f32x4), f16 (v_f16x8) and int8 vectors.
 ///
-/// NEON (ASIMD) is mandatory on AArch64. Provides native 128-bit float operations.
-/// For 256-bit v_f32x8, we emulate with two 128-bit NEON registers since NEON
-/// does not natively have 256-bit vectors.
+/// NEON (ASIMD) is mandatory on AArch64; there is no 256-bit register, so
+/// v_f32x8 is emulated as two float32x4_t halves driven together. v_f16x8 is
+/// native, but its transcendentals widen to f32, run the Cephes polynomials in
+/// neon_mathfunc.hpp, and narrow back -- fp16 cannot carry the polynomial.
+///
+/// Numerical contract: the f32 v_div and v_sqrt are the correctly-rounded
+/// AArch64 FDIV/FSQRT, so they match the scalar reference and IEEE-754
+/// (x/0 -> ±inf, 0/0 -> NaN). Do not swap in vrecpeq/vrsqrteq +
+/// Newton-Raphson: they are not exact, and the rsqrt form returns NaN for
+/// sqrt(0) (0 * inf). The f32 v_rcp is 1/a for the same reason (x86 keeps a
+/// 12-bit _mm_rcp_ps, so NEON is the more accurate side here).
+///
+/// v_transpose_8x8 (f32) is four 4x4 transposes on the lo/hi halves, with the
+/// bottom-left quadrant snapshotted because it and the top-right are each
+/// other's destinations. The f16 variant interleaves with widening granularity
+/// -- ZIP f16 -> u32 -> u64, as on x86 -- since an all-f16 ZIP produces a
+/// bit-reversal, not a transpose. v_deinterleave_* use native LD2; the
+/// v_load_even_* / v_load_stride2_* families are equivalent aliases.
 ///
 /// Reference: OpenCV intrin_neon.hpp, onnxruntime MLAS NEON kernels.
 
@@ -21,9 +36,6 @@ namespace simd {
 namespace arch {
 namespace neon {
 
-// ============================================================
-// v_f32x4 — 128-bit float vector, backed by float32x4_t
-// ============================================================
 struct v_f32x4 {
     float32x4_t val;
 
@@ -36,8 +48,7 @@ struct v_f32x4 {
     }
 
     float operator[](int i) const {
-        // vgetq_lane_f32 requires a compile-time constant lane, so unroll the
-        // index with a switch (a runtime lane index is not accepted by clang).
+        // vgetq_lane_f32 needs a compile-time lane index; clang rejects a runtime one.
         switch (i) {
             case 0:  return vgetq_lane_f32(val, 0);
             case 1:  return vgetq_lane_f32(val, 1);
@@ -47,9 +58,6 @@ struct v_f32x4 {
     }
 };
 
-// ============================================================
-// v_f32x8 — 256-bit, emulated with two float32x4_t
-// ============================================================
 struct v_f32x8 {
     float32x4_t lo, hi;
 
@@ -65,9 +73,6 @@ struct v_f32x8 {
     }
 };
 
-// ============================================================
-// v_f32x4 operations
-// ============================================================
 inline v_f32x4 v_load_f32x4(const float* p) {
     return v_f32x4(vld1q_f32(p));
 }
@@ -89,17 +94,11 @@ inline v_f32x4 v_mul(const v_f32x4& a, const v_f32x4& b) {
     return v_f32x4(vmulq_f32(a.val, b.val));
 }
 
-// Division: AArch64 has a correctly-rounded vector FDIV (mandatory in
-// ARMv8-A), which matches x86 _mm_div_ps / scalar `a / b` bit-for-bit,
-// including x/0 -> ±inf and 0/0 -> NaN. Do NOT emulate this with
-// vrecpeq_f32 + Newton-Raphson: that path is slower, not exact, and turns
-// a/0 into NaN.
 inline v_f32x4 v_div(const v_f32x4& a, const v_f32x4& b) {
     return v_f32x4(vdivq_f32(a.val, b.val));
 }
 
 inline v_f32x4 v_fmadd(const v_f32x4& a, const v_f32x4& b, const v_f32x4& c) {
-    // vfmaq_f32: c + a * b (results stored in first arg convention)
     return v_f32x4(vfmaq_f32(c.val, a.val, b.val));
 }
 
@@ -141,23 +140,14 @@ inline v_f32x4 v_or(const v_f32x4& a, const v_f32x4& b) {
         vorrq_u32(vreinterpretq_u32_f32(a.val), vreinterpretq_u32_f32(b.val))));
 }
 
-// Square root: AArch64 has a correctly-rounded vector FSQRT (mandatory in
-// ARMv8-A), matching x86 _mm_sqrt_ps / std::sqrt. The old vrsqrteq_f32 +
-// 2x Newton-Raphson emulation is slower, not exact, and returns NaN for
-// sqrt(0) (0 * inf), which diverges from every other backend.
 inline v_f32x4 v_sqrt(const v_f32x4& a) {
     return v_f32x4(vsqrtq_f32(a.val));
 }
 
-// Reciprocal. Computed exactly as 1/a so the result matches the scalar
-// reference (scalar.hpp, arch::scalar::v_rcp) bit-for-bit, including
-// rcp(±0) -> ±inf. x86 keeps its 12-bit _mm_rcp_ps estimate, so NEON is
-// strictly more accurate here — not a divergence in the wrong direction.
 inline v_f32x4 v_rcp(const v_f32x4& a) {
     return v_f32x4(vdivq_f32(vdupq_n_f32(1.0f), a.val));
 }
 
-// Transcendental math functions (delegated to neon_mathfunc.hpp)
 inline v_f32x4 v_exp(const v_f32x4& a) {
     return v_f32x4(exp_ps(a.val));
 }
@@ -177,7 +167,6 @@ inline v_f32x4 v_tanh(const v_f32x4& a) {
     return v_f32x4(tanh_ps(a.val));
 }
 
-// Horizontal reductions — pairwise shuffle tree (same pattern for sum/max/min)
 inline float v_reduce_sum(const v_f32x4& a) {
     float32x2_t sum2 = vadd_f32(vget_low_f32(a.val), vget_high_f32(a.val));
     sum2 = vpadd_f32(sum2, sum2);
@@ -194,9 +183,6 @@ inline float v_reduce_min(const v_f32x4& a) {
     return vget_lane_f32(min2, 0);
 }
 
-// ============================================================
-// v_f32x8 operations (emulated with two 128-bit lanes)
-// ============================================================
 inline v_f32x8 v_load_f32x8(const float* p) {
     return v_f32x8(vld1q_f32(p), vld1q_f32(p + 4));
 }
@@ -231,21 +217,18 @@ inline v_f32x8 v_abs(const v_f32x8& a)
 inline v_f32x8 v_neg(const v_f32x8& a)
     { return v_f32x8(vnegq_f32(a.lo), vnegq_f32(a.hi)); }
 
-// Division for v_f32x8 (emulated via v_f32x4)
 inline v_f32x8 v_div(const v_f32x8& a, const v_f32x8& b) {
     v_f32x4 lo_ret = v_div(v_f32x4(a.lo), v_f32x4(b.lo));
     v_f32x4 hi_ret = v_div(v_f32x4(a.hi), v_f32x4(b.hi));
     return v_f32x8(lo_ret.val, hi_ret.val);
 }
 
-// Reciprocal for v_f32x8 (emulated via v_f32x4)
 inline v_f32x8 v_rcp(const v_f32x8& a) {
     v_f32x4 lo_ret = v_rcp(v_f32x4(a.lo));
     v_f32x4 hi_ret = v_rcp(v_f32x4(a.hi));
     return v_f32x8(lo_ret.val, hi_ret.val);
 }
 
-// Compare operations for v_f32x8 (emulated)
 inline v_f32x8 v_cmplt(const v_f32x8& a, const v_f32x8& b) {
     return v_f32x8(vreinterpretq_f32_u32(vcltq_f32(a.lo, b.lo)),
                     vreinterpretq_f32_u32(vcltq_f32(a.hi, b.hi)));
@@ -255,7 +238,6 @@ inline v_f32x8 v_cmpgt(const v_f32x8& a, const v_f32x8& b) {
                     vreinterpretq_f32_u32(vcgtq_f32(a.hi, b.hi)));
 }
 
-// Bitwise operations for v_f32x8 (emulated)
 inline v_f32x8 v_and(const v_f32x8& a, const v_f32x8& b) {
     return v_f32x8(vreinterpretq_f32_u32(
                         vandq_u32(vreinterpretq_u32_f32(a.lo), vreinterpretq_u32_f32(b.lo))),
@@ -274,7 +256,6 @@ inline v_f32x8 v_sqrt(const v_f32x8& a) {
     return v_f32x8(v_sqrt(lo).val, v_sqrt(hi).val);
 }
 
-// Transcendental math functions for v_f32x8 (lane-wise via v_f32x4 wrappers)
 inline v_f32x8 v_exp(const v_f32x8& a) {
     return v_f32x8(exp_ps(a.lo), exp_ps(a.hi));
 }
@@ -309,13 +290,8 @@ inline float v_reduce_min(const v_f32x8& a) {
     return lo < hi ? lo : hi;
 }
 
-// ============================================================
-// FP16 support — always available on AArch64
-// ============================================================
+// ---------------------------------------------------------------- float16
 
-// ============================================================
-// v_f16x8 — 128-bit float16 vector, backed by float16x8_t
-// ============================================================
 struct v_f16x8 {
     float16x8_t val;
 
@@ -329,9 +305,6 @@ struct v_f16x8 {
     }
 };
 
-// ============================================================
-// v_f16x8 operations
-// ============================================================
 inline v_f16x8 v_load_f16x8(const uint16_t* p) {
     return v_f16x8(vreinterpretq_f16_u16(vld1q_u16(p)));
 }
@@ -345,7 +318,6 @@ inline v_f16x8 v_zero_f16x8() {
     return v_f16x8(vdupq_n_f16(static_cast<float16_t>(0.0f)));
 }
 
-// FP16 <-> FP32 conversion
 inline v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
     float32x4_t f32_lo = vcvt_f32_f16(vget_low_f16(a.val));
     float32x4_t f32_hi = vcvt_f32_f16(vget_high_f16(a.val));
@@ -358,7 +330,6 @@ inline v_f16x8 v_cvt_f32_to_f16(const v_f32x8& a) {
     return v_f16x8(vcombine_f16(lo, hi));
 }
 
-// Arithmetic
 inline v_f16x8 v_add(const v_f16x8& a, const v_f16x8& b) {
     return v_f16x8(vaddq_f16(a.val, b.val));
 }
@@ -388,7 +359,6 @@ inline v_f16x8 v_neg(const v_f16x8& a) {
     return v_f16x8(vnegq_f16(a.val));
 }
 
-// Comparison
 inline v_f16x8 v_cmplt(const v_f16x8& a, const v_f16x8& b) {
     return v_f16x8(vreinterpretq_f16_u16(vcltq_f16(a.val, b.val)));
 }
@@ -404,22 +374,19 @@ inline v_f16x8 v_rcp(const v_f16x8& a) {
 }
 
 inline float v_reduce_sum(const v_f16x8& a) {
-    // Horizontal sum across all 8 lanes. vaddvq_f16 is GCC-only (clang's
-    // arm_neon.h does not provide it), so mirror the f32 pairwise reduction.
+    // vaddvq_f16 is GCC-only, so mirror the f32 pairwise reduction.
     float16x4_t sum4 = vpadd_f16(vget_low_f16(a.val), vget_high_f16(a.val));
     sum4 = vpadd_f16(sum4, sum4);
     sum4 = vpadd_f16(sum4, sum4);
     return static_cast<float>(vget_lane_f16(sum4, 0));
 }
 
-// Horizontal max/min — pairwise reduction tree (same pattern as v_reduce_sum
-// for v_f32x4, adapted for fp16 via vpmax_f16 / vpmin_f16 on halves)
 inline float v_reduce_max(const v_f16x8& a) {
     float16x4_t lo = vget_low_f16(a.val);
     float16x4_t hi = vget_high_f16(a.val);
-    float16x4_t max4 = vpmax_f16(lo, hi);    // 4 pairwise maxes across 8 lanes
-    max4 = vpmax_f16(max4, max4);             // 2 pairwise maxes → 2 values
-    max4 = vpmax_f16(max4, max4);             // final max → 1 value
+    float16x4_t max4 = vpmax_f16(lo, hi);
+    max4 = vpmax_f16(max4, max4);
+    max4 = vpmax_f16(max4, max4);
     return static_cast<float>(vget_lane_f16(max4, 0));
 }
 inline float v_reduce_min(const v_f16x8& a) {
@@ -431,14 +398,6 @@ inline float v_reduce_min(const v_f16x8& a) {
     return static_cast<float>(vget_lane_f16(min4, 0));
 }
 
-// ============================================================
-// v_f16x8 transcendental math (convert→compute→convert)
-//
-// fp16 has too little range/precision for meaningful polynomial
-// approximations. Instead, widen to fp32, call the Cephes math
-// functions, and narrow back. The conversion overhead is negligible
-// compared to the cost of computing the transcendental.
-// ============================================================
 inline v_f16x8 v_exp(const v_f16x8& a) {
     v_f32x8 fa = v_cvt_f16_to_f32(a);
     v_f32x8 fr = v_f32x8(exp_ps(fa.lo), exp_ps(fa.hi));
@@ -470,31 +429,19 @@ inline v_f16x8 v_tanh(const v_f16x8& a) {
     return v_cvt_f32_to_f16(fr);
 }
 
-// ============================================================
-// Deinterleave (stride-2 gather) — pair types
-// ============================================================
+// ---------------------------------------------------------------- deinterleave
 
-/// @brief Pair of v_f32x4 registers: even- and odd-indexed elements.
 struct v_f32x4x2_t { v_f32x4 even; v_f32x4 odd; };
-
-/// @brief Pair of v_f32x8 registers: even- and odd-indexed elements.
 struct v_f32x8x2_t { v_f32x8 even; v_f32x8 odd; };
-
-/// @brief Pair of v_f16x8 registers: even- and odd-indexed half elements.
 struct v_f16x8x2_t { v_f16x8 even; v_f16x8 odd; };
 
-// ============================================================
-// 方案 A: v_deinterleave_* — load 2×N elements, return {even, odd}
-// ============================================================
-
-/// @brief Load 8 contiguous f32s, return {a0,a2,a4,a6}, {a1,a3,a5,a7}.
-/// Uses native NEON LD2 (load 2-element structures → deinterleave).
+/// Load 8 f32s: even lanes {a0,a2,a4,a6}, odd {a1,a3,a5,a7}.
 inline v_f32x4x2_t v_deinterleave_f32x4(const float* src) {
     float32x4x2_t v = vld2q_f32(src);
     return {v_f32x4(v.val[0]), v_f32x4(v.val[1])};
 }
 
-/// @brief Load 16 contiguous f32s, return {even}, {odd} — each v_f32x8.
+/// Load 16 f32s: two v_f32x8 results, {even} and {odd}.
 inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
     v_f32x4x2_t lo = v_deinterleave_f32x4(src);
     v_f32x4x2_t hi = v_deinterleave_f32x4(src + 8);
@@ -502,17 +449,12 @@ inline v_f32x8x2_t v_deinterleave_f32x8(const float* src) {
             v_f32x8(lo.odd.val,  hi.odd.val)};
 }
 
-/// @brief Load 16 contiguous f16s, return {h0,h2,...,h14}, {h1,h3,...,h15}.
-/// Uses native NEON LD2 on float16x8_t.
+/// Load 16 f16s: two v_f16x8 results, {h0,h2,...,h14} and {h1,h3,...,h15}.
 inline v_f16x8x2_t v_deinterleave_f16x8(const uint16_t* src) {
     float16x8x2_t v = vld2q_f16(
         reinterpret_cast<const float16_t*>(src));
     return {v_f16x8(v.val[0]), v_f16x8(v.val[1])};
 }
-
-// ============================================================
-// 方案 B: v_load_even_* / v_load_odd_*
-// ============================================================
 
 inline v_f32x4 v_load_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
@@ -533,10 +475,6 @@ inline v_f16x8 v_load_odd_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).odd;
 }
 
-// ============================================================
-// 方案 C: v_load_stride2_even_* / v_load_stride2_odd_*
-// ============================================================
-
 inline v_f32x4 v_load_stride2_even_f32x4(const float* src) {
     return v_deinterleave_f32x4(src).even;
 }
@@ -556,15 +494,11 @@ inline v_f16x8 v_load_stride2_odd_f16x8(const uint16_t* src) {
     return v_deinterleave_f16x8(src).odd;
 }
 
-// ============================================================
-// 8×8 f32 transpose — 8 v_f32x8 rows → 8 v_f32x8 columns
-//
-// Decomposes into four 4×4 transposes on the lo/hi float32x4_t halves.
-// ============================================================
+// ---------------------------------------------------------------- 8x8 transpose
 
 namespace {
 
-/// 4×4 transpose of four float32x4_t vectors in-place.
+/// In-place 4x4 transpose of four float32x4_t.
 inline void transpose_4x4_f32(float32x4_t& r0, float32x4_t& r1,
                                float32x4_t& r2, float32x4_t& r3) {
     float32x4x2_t t01 = vtrnq_f32(r0, r1);   // {a0,b0,a2,b2}, {a1,b1,a3,b3}
@@ -577,44 +511,32 @@ inline void transpose_4x4_f32(float32x4_t& r0, float32x4_t& r1,
 
 }  // anonymous namespace
 
-/// @brief Transpose an 8×8 matrix of f32 held in 8 v_f32x8 registers.
 inline void v_transpose_8x8(v_f32x8& r0, v_f32x8& r1, v_f32x8& r2, v_f32x8& r3,
                              v_f32x8& r4, v_f32x8& r5, v_f32x8& r6, v_f32x8& r7) {
-    // Snapshot the bottom-left quadrant (r{4..7}.lo) before it is overwritten:
-    // it and the top-right quadrant (r{0..3}.hi) are each other's destinations,
-    // so writing top-right into r{4..7}.lo first would clobber the bottom-left
-    // source still needed by the third block (read-after-write hazard).
+    // Bottom-left must be saved: the next block writes it from the top-right,
+    // which is where this quadrant goes.
     float32x4_t t0, t1, t2, t3;
-    float32x4_t u0 = r4.lo, u1 = r5.lo, u2 = r6.lo, u3 = r7.lo;  // bottom-left
+    float32x4_t u0 = r4.lo, u1 = r5.lo, u2 = r6.lo, u3 = r7.lo;
 
-    // r{0..3}.lo → r{0..3}.lo
     t0 = r0.lo; t1 = r1.lo; t2 = r2.lo; t3 = r3.lo;
     transpose_4x4_f32(t0, t1, t2, t3);
     r0.lo = t0; r1.lo = t1; r2.lo = t2; r3.lo = t3;
 
-    // r{0..3}.hi → r{4..7}.lo
     t0 = r0.hi; t1 = r1.hi; t2 = r2.hi; t3 = r3.hi;
     transpose_4x4_f32(t0, t1, t2, t3);
     r4.lo = t0; r5.lo = t1; r6.lo = t2; r7.lo = t3;
 
-    // r{4..7}.lo (saved above) → r{0..3}.hi
     transpose_4x4_f32(u0, u1, u2, u3);
     r0.hi = u0; r1.hi = u1; r2.hi = u2; r3.hi = u3;
 
-    // r{4..7}.hi → r{4..7}.hi
     t0 = r4.hi; t1 = r5.hi; t2 = r6.hi; t3 = r7.hi;
     transpose_4x4_f32(t0, t1, t2, t3);
     r4.hi = t0; r5.hi = t1; r6.hi = t2; r7.hi = t3;
 }
 
-/// @brief Transpose an 8×8 matrix of f16 held in 8 v_f16x8 registers.
-/// Interleaves with widening granularity per stage — 16-bit (ZIP f16) → 32-bit
-/// (ZIP u32) → 64-bit (ZIP u64) — the same 2→4→8 widening used by the x86 path.
-/// Using f16 ZIP in every stage produces a bit-reversal permutation, not a
-/// transpose, so stages 2 and 3 reinterpret the lanes as wider integers first.
+/// 8x8 f16 transpose via ZIP with widening lanes: f16, then u32, then u64.
 inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
                              v_f16x8& r4, v_f16x8& r5, v_f16x8& r6, v_f16x8& r7) {
-    // Step 1: pairwise interchange (16-bit, 2×2 blocks)
     float16x8_t t0 = vzip1q_f16(r0.val, r1.val);
     float16x8_t t1 = vzip2q_f16(r0.val, r1.val);
     float16x8_t t2 = vzip1q_f16(r2.val, r3.val);
@@ -624,7 +546,6 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
     float16x8_t t6 = vzip1q_f16(r6.val, r7.val);
     float16x8_t t7 = vzip2q_f16(r6.val, r7.val);
 
-    // Step 2: interchange pairs into quads (32-bit, 4×4 blocks)
     uint32x4_t u0 = vzip1q_u32(vreinterpretq_u32_f16(t0), vreinterpretq_u32_f16(t2));  // rows 0-3, cols 0-1
     uint32x4_t u1 = vzip2q_u32(vreinterpretq_u32_f16(t0), vreinterpretq_u32_f16(t2));  // rows 0-3, cols 2-3
     uint32x4_t u2 = vzip1q_u32(vreinterpretq_u32_f16(t1), vreinterpretq_u32_f16(t3));  // rows 0-3, cols 4-5
@@ -634,20 +555,18 @@ inline void v_transpose_8x8(v_f16x8& r0, v_f16x8& r1, v_f16x8& r2, v_f16x8& r3,
     uint32x4_t u6 = vzip1q_u32(vreinterpretq_u32_f16(t5), vreinterpretq_u32_f16(t7));  // rows 4-7, cols 4-5
     uint32x4_t u7 = vzip2q_u32(vreinterpretq_u32_f16(t5), vreinterpretq_u32_f16(t7));  // rows 4-7, cols 6-7
 
-    // Step 3: interchange quads into full 8×8 transpose (64-bit)
-    r0.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u0), vreinterpretq_u64_u32(u4)));  // col 0
-    r1.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u0), vreinterpretq_u64_u32(u4)));  // col 1
-    r2.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u1), vreinterpretq_u64_u32(u5)));  // col 2
-    r3.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u1), vreinterpretq_u64_u32(u5)));  // col 3
-    r4.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u2), vreinterpretq_u64_u32(u6)));  // col 4
-    r5.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u2), vreinterpretq_u64_u32(u6)));  // col 5
-    r6.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u3), vreinterpretq_u64_u32(u7)));  // col 6
-    r7.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u3), vreinterpretq_u64_u32(u7)));  // col 7
+    r0.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u0), vreinterpretq_u64_u32(u4)));
+    r1.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u0), vreinterpretq_u64_u32(u4)));
+    r2.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u1), vreinterpretq_u64_u32(u5)));
+    r3.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u1), vreinterpretq_u64_u32(u5)));
+    r4.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u2), vreinterpretq_u64_u32(u6)));
+    r5.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u2), vreinterpretq_u64_u32(u6)));
+    r6.val = vreinterpretq_f16_u64(vzip1q_u64(vreinterpretq_u64_u32(u3), vreinterpretq_u64_u32(u7)));
+    r7.val = vreinterpretq_f16_u64(vzip2q_u64(vreinterpretq_u64_u32(u3), vreinterpretq_u64_u32(u7)));
 }
 
-// ============================================================
-// v_s8x16 — 128-bit signed int8 vector, backed by int8x16_t
-// ============================================================
+// ---------------------------------------------------------------- int8
+
 struct v_s8x16 {
     int8x16_t val;
 
@@ -665,9 +584,6 @@ inline void v_store(int8_t* p, const v_s8x16& a) {
 inline v_s8x16 v_set1_s8x16(int8_t s)  { return v_s8x16(vdupq_n_s8(s)); }
 inline v_s8x16 v_zero_s8x16()         { return v_s8x16(vdupq_n_s8(0)); }
 
-// ============================================================
-// v_u8x16 — 128-bit unsigned int8 vector, backed by uint8x16_t
-// ============================================================
 struct v_u8x16 {
     uint8x16_t val;
 

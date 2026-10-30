@@ -1,11 +1,24 @@
 #pragma once
 /// @file matmul_helper.h
-/// @brief Inner matrix multiplication — pack + MMA micro-kernel dispatch.
+/// @brief Inner matrix multiplication — the pack/MMA API and the tile geometry
+/// the planned MatMul routes and their workspaces are sized from.
 ///
-/// All arch-specific pack/mma headers share an identical API in the namespaces
-///   nnops::backend::cpu::x86_64   and   nnops::backend::cpu::aarch64.
-/// This header picks the right set via NNOPS_ARCH_* and exposes the active
-/// namespace as `arch`, so consumer code stays clean of #ifdef.
+/// All arch pack/mma headers share one API in nnops::backend::cpu::x86_64 and
+/// aarch64; this header picks the set via NNOPS_ARCH_* and exposes it as `arch`,
+/// so consumer code stays free of #ifdef. Conventions that hold for every dtype:
+///
+///  - A packs down the arch's MR cascade ({6,4,1} on x86, {8,4,1} on aarch64;
+///    int8 uses the same levels). B packs into uniform nr_max-wide panels with
+///    the columns past nc zero-filled, one mma_pack_align (64-byte) slot apart.
+///  - int8 always takes the hardware dot product (VNNI u8×s8 on x86, SDOT
+///    s8×s8 on aarch64); only the pack layout and the A-side signedness shift
+///    differ by arch — see int8_a_pack_bias.
+///  - kc is capped per dtype. The fp 128 is a precision limit on f16 (that
+///    kernel accumulates in f16; kc 256 at K=4096 moved the worst deviation
+///    0.183 -> 0.230), f32 keeping the same cap. int8's 512 is a tuning
+///    choice on an int32 accumulator: 256 measured 3-13% slower, never faster.
+///  - B is always packed. A is packed for int8, for transpose_a, or when K
+///    exceeds PACK_A_K_THRESHOLD; the split runs on N when N > M, else on M.
 
 #include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / NNOPS_ARCH_AARCH64
 #include "nnops/ops/matmul.hpp"                // MatMulAttributes
@@ -17,8 +30,6 @@
 #include <cmath>
 #include <cstddef>
 #include <type_traits>
-
-// ---- arch-specific includes --------------------------------------------
 
 #ifdef NNOPS_ARCH_X86_64
 #include "backend/cpu/x86_64/pack_f16.hpp"
@@ -45,8 +56,6 @@
 
 namespace nnops::backend::cpu {
 
-// ---- namespace alias ---------------------------------------------------
-
 #ifdef NNOPS_ARCH_X86_64
 namespace arch = x86_64;
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -64,18 +73,18 @@ constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
 
 #ifdef NNOPS_ARCH_X86_64
-// The Q4_1 RHS kernel writes the same uniform panels as the float packers, so
-// its hard-coded width must track both NR tables (16 for f32 and f16 here).
+// The Q4_1 RHS writes the float packers' uniform panels, so its hard-coded
+// width must track both NR tables — 16 for f32 and f16 here.
 static_assert(arch::q4_1_nr_max == NR_MAX_F32 && arch::q4_1_nr_max == NR_MAX_F16,
               "Q4_1 RHS panel width must match the float RHS panel width");
 #elif defined(NNOPS_ARCH_AARCH64)
-// Same contract, but the two AArch64 widths differ (12 for f32, 16 for f16).
+// Same contract; here the two widths differ (f32 12, f16 16).
 static_assert(arch::q4_1_nr_max<float> == NR_MAX_F32 &&
               arch::q4_1_nr_max<half> == NR_MAX_F16,
               "Q4_1 RHS panel width must match the float RHS panel width");
 #endif
 
-// int8 panel sizes: A keeps the arch's MR cascade, B and the MMA are uniform.
+// int8 panels: A keeps the arch's MR cascade; B and the MMA are uniform.
 #ifdef NNOPS_ARCH_X86_64
 constexpr int MR_I8[3] = {6, 4, 1};
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -85,8 +94,6 @@ constexpr int MR_I8[3] = {8, 4, 1};
 constexpr int MR_MAX_I8 = MR_I8[0];
 constexpr int NR_MAX_I8 = arch::mma_i8_nr_max;
 
-// int8 always uses the hardware dot product: VNNI (u8×s8) on x86, SDOT
-// (s8×s8) on aarch64. Only the pack layout differs by arch.
 #ifdef NNOPS_ARCH_X86_64
 static_assert(arch::mma_i8_b_panel_tail == 16 * 4, "x86 int8 B panel must be 16 wide");
 static_assert(arch::mma_i8_folds_a_bias, "x86 int8 kernels fold the A bias per panel");
@@ -97,11 +104,10 @@ static_assert(!arch::mma_i8_folds_a_bias, "aarch64 int8 kernels have no panel ta
 
 // ---- the A-side bias: signed/unsigned mismatch, per dtype and arch ----------
 //
-// s8 A on x86 shifts +128 (to u8), u8 A on aarch64 shifts -128 (to s8); the
-// other pairs are used as stored. One XOR 0x80 in the A pack, so `bias` is
-// {-128, 0, +128}. The -bias·Σ_k B[k][n] it leaves behind is folded out by
-// the B panel's correction block (x86) or by the epilogue (aarch64); see
-// mma_i8_folds_a_bias.
+// One XOR 0x80 in the A pack, so the shift is {-128, 0, +128}: s8 A on x86
+// shifts +128 (to u8), u8 A on aarch64 shifts -128 (to s8), the rest are used
+// as stored. x86 folds the -bias·Σ_k B[k][n] out in the B panel's correction
+// block, aarch64 in the epilogue (see mma_i8_folds_a_bias).
 constexpr int int8_a_pack_bias(DataType dt_a) noexcept {
 #ifdef NNOPS_ARCH_X86_64
     return (dt_a == DataType::s8) ? 128 : 0;
@@ -110,14 +116,14 @@ constexpr int int8_a_pack_bias(DataType dt_a) noexcept {
 #endif
 }
 
-/// A-side shift not already folded out by the kernels; goes to
-/// matmul_int8_compensate's u8_offset.
+/// A-side shift not already folded out by the kernels; the int8 epilogue's
+/// a_bias_offset.
 constexpr int int8_epilogue_offset(DataType dt_a) noexcept {
     return arch::mma_i8_folds_a_bias ? 0 : int8_a_pack_bias(dt_a);
 }
 
-/// Bytes of one int8 packed-B panel slot of `kc` elements: nr_max columns x
-/// ceil(kc/4) k groups, plus x86's correction block, 64-byte aligned.
+/// Bytes of one int8 packed-B panel slot: nr_max columns x ceil(kc/4) k groups,
+/// plus x86's correction block, 64-byte aligned.
 constexpr int64_t int8_panel_stride(int64_t kc) noexcept {
     const int64_t kbytes = (kc + 3) & ~int64_t{3};
     return static_cast<int64_t>(mma_pack_align(
@@ -125,8 +131,7 @@ constexpr int64_t int8_panel_stride(int64_t kc) noexcept {
         + static_cast<size_t>(arch::mma_i8_b_panel_tail)));
 }
 
-/// Largest M-panel height a float tile runs; callers modelling a working set
-/// must charge this.
+/// Largest M-panel height a float tile runs; a working-set model must charge it.
 template <class T>
 constexpr int mr_max_flt() {
     if constexpr (std::is_same_v<T, float>) {
@@ -166,7 +171,6 @@ constexpr int64_t KC_F16I4 = 256;   // fp16×int4: placeholder (future hardware)
 //     mc <= MC_MAX, nc <= NC_MAX
 // Derivation and the measured A/B: skills/how_to_optimize_gemm.md §2.1.
 
-/// Ceiling on both tile dimensions.
 constexpr int64_t MC_MAX = 768;
 constexpr int     NC_MAX = 768;
 
@@ -180,29 +184,20 @@ constexpr int NC_ALIGN = 48;
 constexpr int64_t KC_MIN   = 128;
 constexpr int64_t KC_ALIGN = 32;
 
-/// Per-dtype kc ceilings, all below what the residency budget affords.
-///
-/// 128 on fp is a precision limit: the aarch64 f16 kernel accumulates in f16,
-/// and kc 256 at K=4096 moved the worst deviation 0.183 -> 0.230. f32 shares it.
-///
-/// 512 on int8 is a tuning choice (its accumulator is int32). Capping at 256
-/// measured 3-13% slower (a second C read-modify-write per k-block) and never
-/// faster, so the plan is left to follow the cache it runs in.
 constexpr int64_t KC_CAP_F32 = 128;
 constexpr int64_t KC_CAP_F16 = 128;
 constexpr int64_t KC_CAP_I8  = 512;
 
 // =========================================================================
-//  Per-dtype plan geometry
+//  Per-dtype plan geometry — everything the plan (and matmul.cpp's tile loops)
+//  forks on for a dtype.
 // =========================================================================
-//
-// Everything the plan (and matmul.cpp's tile loops) forks on for a dtype.
 
 struct MatmulGeom {
     int      mr_max;            // widest A micro-panel (head of the MR cascade)
     int      nr_max;            // uniform B panel width
     int      elem;              // bytes per element (1 for int8)
-    int64_t  kc_cap;            // per-dtype kc ceiling (see above)
+    int64_t  kc_cap;            // per-dtype kc ceiling (KC_CAP_* above)
     bool     packs_a_always;    // int8 has no direct-A route
     bool     hoists_b_m_split;  // int8 packs B once per k-block on the M-split
     const int* mr_levels;       // the A-panel cascade
@@ -292,9 +287,9 @@ inline int64_t kc_prefetch_bound(int mr_max, int nr_max, int elem_bytes,
                         : 0;
 }
 
-/// Tile size for one dimension of a split, ≤ @p cap, picked so the block count
-/// is a multiple of @p nt. Pure reuse maximisation split a 1024-row M into 2
-/// blocks at 4 workers (0.72x). One worker keeps the cap.
+/// Tile size for one dimension of a split, ≤ @p cap and a whole number of
+/// blocks per worker. Pure reuse maximisation split a 1024-row M into 2 blocks
+/// at 4 workers (0.72x). One worker keeps the cap.
 inline int64_t balance_tile(int64_t dim, int64_t cap, int64_t align,
                             int64_t nt) noexcept {
     if (dim <= 0) { return 1; }
@@ -404,10 +399,10 @@ inline void resolve_tile_sizes(int64_t M, int64_t N, int64_t mr_max, int64_t nr_
 //  Parallel split — block count for the larger-dimension partition
 // =========================================================================
 //
-// The GEMM is split on its larger dimension and the blocks run as contiguous
-// slabs. The count is ceil(larger / mc) — deliberately coarser than MLAS's
-// complexity/64K target: the GEMM is packed-B-bandwidth bound, so smaller
-// blocks only add pack overhead and seams.
+// Blocks run as contiguous slabs of the larger dimension. The count is
+// ceil(larger / mc), deliberately coarser than MLAS's complexity/64K target:
+// the GEMM is packed-B-bandwidth bound, so smaller blocks only add pack
+// overhead and seams.
 
 inline int64_t split_block_count(int64_t larger, int64_t mc) noexcept {
     return std::max<int64_t>(1, (larger + mc - 1) / mc);
@@ -418,15 +413,15 @@ inline int64_t split_block_count(int64_t larger, int64_t mc) noexcept {
 // =========================================================================
 //
 // B is always packed. A is packed for correctness (transpose_a), for int8, or
-// when K is deep enough that its rows no longer fit a page — then a panel's
-// direct row reads scatter, and packing makes them sequential. The parallel
-// split follows MLAS: split N when N > M, else split M.
+// when K is deep enough that its rows no longer fit a page — a panel's direct
+// row reads then scatter, and packing makes them sequential. The split
+// follows MLAS: split N when N > M, else split M.
 
 /// A is packed when K exceeds this many elements.
 constexpr int64_t PACK_A_K_THRESHOLD = 1024;
 
-/// GEMMs with fewer than this many MACs take the fast path (naive reference),
-/// skipping pack/tile/threading overhead.
+/// GEMMs with fewer than this many MACs skip the plan for the arch's naive
+/// kernel (matmul_small.cpp), avoiding pack/tile/threading overhead.
 constexpr int64_t GEMM_FAST_PATH_THRESHOLD = 1024;
 
 inline bool gemm_is_small(int64_t M, int64_t N, int64_t K) noexcept {
@@ -458,31 +453,23 @@ constexpr int num_panels_max(int n, const int* nr, int levels = 3) noexcept {
     return at_q > below_q ? at_q : below_q;
 }
 
-// ---- public API --------------------------------------------------------
-//
-// Panels sit at a uniform 64-byte-aligned stride `ldd`, computed from the
-// actual k-block length. A decomposes into the arch's MR cascade; B and the
-// MMA are uniform-width.
+// ---- public API: packers and MMA kernels, `ldd` from the actual k-block ----
 void tile_pack_lhs(bool trans, int mc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_lhs(bool trans, int mc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
 // ---- uniform-width RHS panels — the only B/MMA route ---------------------
 //
-// The MMA reads nr_max B lanes at every column, so B is ceil(nc/nr_max)
-// panels, each nr_max wide (zero-filled past nc) at one aligned stride.
-// `zero_mode` picks the kernel: true overwrites C (beta == 0 on the first
-// k-block), false accumulates.
+// `zero_mode` picks the kernel: true overwrites C, false accumulates.
 void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
 // ---- Q4_1 (llama.cpp block format) RHS ----------------------------------
 //
 // A Q4_1 B is a 20-byte-block stream; the pack fuses unpack + dequantize into
-// the uniform panels above, so the MMA side is unchanged. The tile origin is
-// taken in block units (a panel can start mid-block), `src_row_blocks` is the
-// row pitch in blocks, and `scale` (alpha) multiplies every decoded weight.
-// The block unit is named everywhere through data_type_stride_unit(), so the
-// caller's tile origin, row pitch and batch offsets are already in blocks.
+// the uniform panels above, so the MMA side is unchanged. Tile origin and
+// `src_row_blocks` (row pitch) are in blocks — a panel can start mid-block —
+// and `scale` (alpha) multiplies every decoded weight. data_type_stride_unit()
+// names the block unit, so batch offsets are blocks too.
 void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         float* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale);
@@ -492,20 +479,13 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 
 // B is always packed here; panels advance by the aligned nr_max*kc stride.
 //
-// `bias`, when given, is a per-row vector (one value per M row) that the
-// accumulator starts from instead of zero — the tile is then *built*, so
-// `zero_mode` is implied and `c` is never read. Pass it on the block that
-// builds the tile and only that one: a later k-block would re-seed and drop the
-// partial sum. Conv2D uses it to drop its bias seed, a whole write+read of the
-// output tile that existed only to put the bias where the first k-block could
-// accumulate onto it.
-//
-// `col_bias` is the same idea with the axes swapped: one value per N column,
-// for a route whose M rows are pixels (channel-last Conv2D), where a row seed
-// has nothing to hold. It must be readable in whole nr_max-wide lanes past
-// `nc` — the panel is loaded as a unit and the extra lanes are dropped by the
-// store, so the caller pads its bias to the panel width. Also builds the tile:
-// pass it on the first k-block only, with `zero_mode` true.
+// `bias` (one value per M row) or `col_bias` (one per N column, for the
+// channel-last Conv2D whose rows are pixels and a row seed has nothing to hold)
+// seeds the accumulator instead of reading C, so the tile is *built*: pass it
+// on the first k-block only, or a later one re-seeds and drops the partial sum.
+// Either implies the overwrite path (`zero_mode` is ignored). `col_bias` is read
+// in whole nr_max-wide lanes past `nc` — the panel loads as a unit and the store
+// drops the extra lanes — so the caller pads it to the panel width.
 void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
 void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
 void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
@@ -513,17 +493,13 @@ void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, in
 
 // ---- Prepacked RHS: the same panels, at a caller-chosen stride ----------
 //
-// A PackedB blob holds the panels above for the *whole* K, so its panel stride
-// is ldd = align(nr_max·K·esz) — a function of K, while the MMA derives its own
-// stride from the k-block it is given, and the plan's k-block length depends on
-// M and the worker count. Rather than force the two to agree, these variants
-// take the stride and walk one panel per kernel call: k block `k` of panel `p`
-// starts at `b + p·ldb` and holds kc columns, which is exactly the sub-panel a
-// k-block needs. Everything else — the A cascade, the clamp, the store — is the
-// same kernel.
-//
-// One call per panel is the price; it is a prologue and a function call per
-// nr_max columns, against a pack of the whole tile per call.
+// A PackedB blob holds the panels above for the whole K, so its stride is
+// ldd = align(nr_max·K·esz) — a function of K — while the MMA would derive its
+// own from the k-block, whose length follows M and the worker count. These
+// variants take the stride instead: k block `k` of panel `p` starts at
+// `b + p·ldb` and holds kc columns, exactly the sub-panel a k-block needs.
+// Everything else — the A cascade, the clamp, the store — is the same kernel;
+// the price is one prologue and call per nr_max columns.
 void tile_mma_pack_ldb(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
 void tile_mma_pack_ldb(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
 void tile_mma_direct_ldb(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
@@ -543,26 +519,21 @@ void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias,
 
 // ---- int8 (s8×s8) pack + MMA --------------------------------------------
 //
-// Same shape as the float route. Panels are group-major, 4 int8 per int32
-// along K:
-//   A: [group g: row0(4B) row1(4B) ... row(MR-1)(4B)] ...
-//   B: [group g: col0(4B) col1(4B) ... col(NR-1)(4B)] ...
-// A partial final group is zero-filled. On x86 each B panel carries a trailing
-// correction block (its column sums) at int8_panel_stride; aarch64 has none.
-//
-// `a_biased` (from int8_a_pack_bias) makes the A pack XOR 0x80 and the B pack
-// write or zero that correction block.
+// Same shape as the float route, but group-major: 4 int8 per int32 along K, A as
+// [row0(4B) row1(4B) ...] and B as [col0(4B) col1(4B) ...] per group, a partial
+// final group zero-filled. On x86 each B panel carries a trailing correction
+// block (column sums) at int8_panel_stride; aarch64 has none. `a_biased` (from
+// int8_a_pack_bias) makes the A pack XOR 0x80 and the B pack write or zero that
+// block.
 void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased);
 
-// fp activations straight into the packed int8 A panel: every panel row is
-// quantised with its own offline (scale, zero_point) into a small stack buffer
-// and then packed. Produces exactly the bytes of quantise-then-pack, without
-// the full M×K intermediate. Row-major A only (the transposing pack).
-//
-// `scale` / `zero` are indexed from the panel's first row and may be null, in
-// which case the scalar applies. `u8` selects the clamp range (0..255 vs
-// -128..127) — storage only, the panel stays signed.
+// fp activations straight into the packed int8 A panel: each row is quantised
+// with its own offline (scale, zero_point) into a stack buffer and packed,
+// byte-identical to quantise-then-pack without the full M×K intermediate.
+// Row-major A only. `scale`/`zero` index from the panel's first row and may be
+// null, in which case the scalar applies; `u8` only picks the clamp range
+// (0..255 vs -128..127), the panel stays signed.
 void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
                             const float* src, int lds,
                             const float* scale, const int32_t* zero,
@@ -574,11 +545,10 @@ void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
                             float scale_scalar, int32_t zero_scalar,
                             bool u8, bool a_biased);
 
-// `src_shift` treats the source bytes as unsigned and shifts them into the
-// signed range (XOR 0x80, i.e. value − 128) as they are packed — the u8
-// activation of the quantized Conv2D route. On x86 the shift happens before the
-// panel's correction block is computed, so the sums describe the shifted bytes
-// the kernel actually multiplies.
+// `src_shift` treats the source bytes as unsigned and XORs 0x80 into the signed
+// range as they are packed — the u8 activation of the quantized Conv2D route. On
+// x86 the shift precedes the panel's correction block, so the sums describe the
+// bytes the kernel actually multiplies.
 void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased,
                       bool src_shift = false);
@@ -590,21 +560,19 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
                       const int8_t* packed_a, const int8_t* packed_b,
                       int32_t clamp_min, int32_t clamp_max);
 
-// The same call for a tile's *first* K block, where C is written rather than
-// read: the accumulators are stored instead of loaded and added, so the tile
-// does not have to be zeroed first. They still start at the panel's -128·Σb
-// correction, so the result is the one the accumulate form produces from a
-// zeroed tile.
+// The same call for a tile's *first* K block: the accumulators are stored
+// rather than loaded and added, so the caller does not zero the tile first. On
+// x86 they still start at the panel's -128·Σb correction, so the stored result
+// equals what the accumulate form gives from a zeroed tile.
 void tile_mma_pack_i8_zero(int mc, int nc, int kc,
                            int32_t* c, int ldc,
                            const int8_t* packed_a, const int8_t* packed_b,
                            int32_t clamp_min, int32_t clamp_max);
 
 // Accumulate C[mc][nc] += A[mc][Kc] × B_packed[Kc][nc] (int32) with A read
-// row-major straight from memory (`lda` in int8 elements, one row per M panel;
-// kc must be a multiple of 4, the panel's group size). The int8 mirror of
-// tile_mma_direct: Conv2D's channel-last route gathers its activations into A,
-// so there is no A panel to build.
+// row-major from memory (`lda` in int8 elements; kc must be a multiple of 4, the
+// panel's group size). The int8 mirror of tile_mma_direct: Conv2D's
+// channel-last route gathers its activations into A, so there is no panel.
 void tile_mma_direct_i8(int mc, int nc, int kc,
                         int32_t* c, int ldc,
                         const int8_t* a, int lda, const int8_t* packed_b,
@@ -618,14 +586,13 @@ void xor0x80_i8(int8_t* p, int nbytes);
 // =========================================================================
 //
 // The blobs, the descriptors and the addressing — one source of truth for the
-// query the ops hand back, the pack, and the kernel that later reads it.
+// query the ops hand back, the pack, and the kernel that reads it later.
 //
-// The layout is the per-call one, one level up: ceil(N/nr_max) uniform panels of
+// The layout is the per-call one, one level up: ceil(N/nr_max) panels of
 // nr_max columns, each [K][nr_max] k-major with the columns past N zero-filled,
-// panels `ldd` elements apart. Packing at full K is what makes the blob
-// independent of the plan (kc follows M and the worker count); it is also why
-// alpha — a per-call scale that otherwise rides the RHS pack — is required to be
-// 1 on this route.
+// `ldd` elements apart. Packing at full K is what makes the blob independent of
+// the plan (kc follows M and the worker count), and why alpha, a per-call scale
+// that otherwise rides the RHS pack, must be 1 here.
 
 struct MatMulPackedB {
     int64_t nr = 0;     ///< panel width (the arch's uniform RHS width)
@@ -637,17 +604,14 @@ struct MatMulPackedB {
 };
 
 /// The blob's geometry for a product N wide and K deep. `ok()` is false for a
-/// dtype without a float RHS route (and for a non-positive extent).
+/// dtype with no float RHS route, and for a non-positive extent.
 MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept;
 
 /// The descriptor the blob is allocated from — the query half of the two-step
-/// prepack. Shape [N, ⌈elements / N⌉], like the conv blobs: N leads, because
-/// that is the number shape inference reads (Linear's output width, MatMul's N
-/// under transpose_b), followed by whatever the panel padding needs. Rank 0 for
-/// a B with no packed form.
-///
-/// @p transpose_b says how @p raw is ordered: [N, K] (Linear's weight, and
-/// MatMul's transposed B) or [K, N].
+/// prepack. Shape [N, ⌈elements / N⌉], like the conv blobs: N leads because it
+/// is what shape inference reads (Linear's output width, MatMul's N under
+/// transpose_b). Rank 0 for a B with no packed form; @p transpose_b says @p raw
+/// is ordered [N, K] (Linear's weight, MatMul's transposed B) or [K, N].
 TensorDesc matmul_packed_b_desc(const TensorDesc& raw, bool transpose_b);
 
 /// True when @p packed is a coherent blob for a product K deep — its numel is
@@ -663,9 +627,9 @@ struct MatMulPlan {
     int64_t mc, nc, kc;       // tile sizes
     int64_t ldd_b;            // packed-B panel stride (elements) at full Kc
     int64_t np_slice;         // panels one packed-B slice holds (see get_matmul_plan)
-    bool    pack_a;           // A is packed (transpose_a, wide row stride, or int8)
+    bool    pack_a;           // A is packed (int8, transpose_a, or K > PACK_A_K_THRESHOLD)
     bool    split_n;          // split on N (else on M)
-    int64_t num_slots;        // packed-B slices allocated (<= num_blocks)
+    int64_t num_slots;        // packed-B slices allocated (<= num_blocks; 0 with a prepacked B)
     int64_t workspace_size;   // total scratch bytes: packed B, then packed A
 
     // Packed-A region: num_slots_a slots of np_a panels at the ldd_a stride
@@ -678,17 +642,17 @@ struct MatMulPlan {
 };
 
 /// Resolve the tile sizes, the split direction and the packed-A/B scratch layout.
-/// Covers f32, f16, s8|u8 A × s8 B, and a f32/f16 A with a Q4_1 B. Returns an
-/// all-zero plan for any other dtype.
+/// Covers f32, f16, s8|u8 A × s8 B, and a f32/f16 A with a Q4_1 B; all-zero for
+/// any other dtype.
 ///
 /// @p use_thread_slots: when the backend reports worker ids, one scratch slot
 /// per worker thread instead of one per block (a thread has one block live).
 ///
-/// num_slots_a has its own predicate, and the difference is load-bearing: int8
-/// hoists its B pack on the M-split (num_slots == 1) but still packs A per
-/// block, so the dispatch must index A by `num_slots_a`. One thread always
-/// gets one A slot — sizing per block would push a large M-split past the
-/// memory pool's 16 MiB ceiling into a per-call OS allocation.
+/// num_slots_a has its own predicate: int8 hoists its B pack on the M-split
+/// (num_slots == 1) but still packs A per block, so the dispatch must index A
+/// by `num_slots_a`. One thread always gets one A slot — sizing per block would
+/// push a large M-split past the memory pool's 16 MiB ceiling into a per-call
+/// OS allocation.
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,
@@ -697,9 +661,9 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
 #ifdef NNOPS_ARCH_X86_64
 /// Diagnostic cap on the fused block-quant small-M route
-/// (matmul_qblock_fused.cpp): negative keeps the built-in per-layout M limits,
-/// 0 disables the route. Benchmarks use it to A/B the
-/// fused and packed routes inside one process.
+/// (matmul_qblock_fused.cpp): negative keeps the per-layout M limits, 0 disables
+/// the route, > 0 caps M. Benchmarks use it to A/B the fused and packed routes
+/// inside one process.
 extern int qblock_fused_max_m_override;
 #endif
 

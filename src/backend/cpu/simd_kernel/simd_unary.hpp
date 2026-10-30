@@ -1,23 +1,18 @@
 #pragma once
 /// @file simd_unary.hpp
-/// @brief Tiled element-wise unary SIMD kernels for m×n sub-matrices.
+/// @brief Tiled element-wise unary SIMD kernels over an m×n sub-matrix.
 ///
-/// Each function operates on an m-row × n-column tile with pitch (stride
-/// in elements) for both input and output. The API is type-generic via
-/// v_load/v_store_add/s_load/s_store_add dispatch — instantiate with
-/// `float` or `half` (f16).
-///
-/// Only lane=8 SIMD types are used (v_f32x8 / v_f16x8), matching the
+/// Each function walks an m-row × n-column tile with a per-row pitch in
+/// elements for input and output. The API is type-generic via the
+/// v_load/v_store_add/s_load/s_store_add dispatch, so instantiate it with
+/// `float` or `half` (f16). Only lane=8 types (v_f32x8 / v_f16x8), matching the
 /// simd_lane_for<T> = 8 convention used throughout the CPU backend.
 ///
-/// Usage:
-///   #include "simd_kernel/simd_unary.hpp"
-///   using namespace nnops::kernel;
-///   exp(in_ptr, out_ptr, m, n, in_pitch, out_pitch, add_to);
+/// Every kernel supports `add_to`: true accumulates onto the output
+/// (out[i] += fn(in[i])), false overwrites it (out[i] = fn(in[i])).
 ///
-/// All kernels support the `add_to` flag: when true, the result is
-/// accumulated onto the output (out[i] += fn(in[i])); when false, the
-/// output is overwritten (out[i] = fn(in[i])).
+/// Ops without SIMD intrinsics (Erf, Round, Ceil, Floor, Sign) run through the
+/// scalar-only loop instead.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "tiled_map.hpp"
@@ -28,11 +23,6 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Row-processing helpers — thin arity adapters over tiled_map
-// ============================================================
-
-/// Row-by-row SIMD + scalar tail loop for unary ops (Nin = 1).
 template <typename T, typename SimdK, typename ScalarK>
 inline void tiled_unary_simd(
     const T* in, T* out,
@@ -46,8 +36,6 @@ inline void tiled_unary_simd(
                          simd_kernel, scalar_kernel);
 }
 
-/// Row-by-row scalar-only loop for unary ops without SIMD intrinsics
-/// (Erf, Round, Ceil, Floor, Sign).
 template <typename T, typename ScalarK>
 inline void tiled_unary_scalar(
     const T* in, T* out,
@@ -59,10 +47,6 @@ inline void tiled_unary_scalar(
     tiled_map_scalar<T, 1>({in}, {in_pitch}, out, out_pitch, m, n, add_to,
                            scalar_kernel);
 }
-
-// ============================================================
-// Tiled SIMD kernels — one function per unary operation
-// ============================================================
 
 template <typename T>
 inline void exp(
@@ -183,10 +167,6 @@ inline void recip(
         [](auto x) { return v_rcp(x); },
         [](float v) { return 1.0f / v; });
 }
-
-// ============================================================
-// Tiled scalar-only kernels — ops without SIMD intrinsics
-// ============================================================
 
 template <typename T>
 inline void erf(

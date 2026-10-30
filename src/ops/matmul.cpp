@@ -1,5 +1,18 @@
 /// @file matmul.cpp
 /// @brief MatMul operator dispatch.
+///
+/// [..., M, K] x [..., K, N] -> [..., M, N], batch dims broadcast; transpose_a
+/// and transpose_b reorder the extents. An integer pair (s8/u8 A x s8 B)
+/// resolves its output from output_dtype -- s32 for the raw MatMulInteger
+/// accumulate, s8/u8 requantized, f32/f16 dequantized -- not from A's dtype.
+///
+/// prepackWeights is a caller-driven two-step: an empty output buffer is the
+/// query (the call writes back the descriptor that sizes the blob, and rank 0 --
+/// not f32/f16, or an empty extent -- is an answer rather than a failure), then
+/// the same call fills the caller's buffer. The blob holds the whole K, which is what makes it
+/// independent of the per-call plan -- and why alpha, which otherwise rides the
+/// RHS pack, must be 1. A packed B carries N but no K: validate() takes K from
+/// A, and the backend's numel check catches a blob packed against another K.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
@@ -23,7 +36,7 @@ size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
 {
     (void)inputs;
     (void)outputs;
-    // Packed-B (and int8 accumulator) scratch is pooled internally by the CPU kernel.
+    // Packed-A/packed-B scratch is pooled inside the CPU kernel.
     return 0;
 }
 
@@ -32,8 +45,6 @@ std::vector<TensorDesc> MatMul::getOutputTensorDesc(
 {
     auto out = matmul_output_shape(attrs_.transpose_a, attrs_.transpose_b, inputs);
 
-    // Integer (s8|u8 × s8) matmul: the output follows output_dtype (s32
-    // accumulate or requantized s8), not the input dtype.
     if (is_int8_matmul(inputs[0].dtype, inputs[1].dtype)) {
         out[0].dtype = attrs_.output_dtype;
     }
@@ -58,9 +69,7 @@ Status MatMul::validate(std::span<const TensorDesc> inputs,
     const int64_t k_a = attrs_.transpose_a
         ? a.dims[static_cast<size_t>(a.rank - 2)]
         : a.dims[static_cast<size_t>(a.rank - 1)];
-    // A prepacked B carries no K (the blob is addressed from it, not shaped by
-    // it): the product's K is A's, and the blob's own coherence — was it packed
-    // against this K — is the backend's check.
+    // A packed B carries no K: its coherence is the backend's check.
     if (is_packed_matmul_b(b.layout)) { return Status::ok; }
 
     const int64_t k_b = attrs_.transpose_b
@@ -84,8 +93,6 @@ void MatMul::prepackWeights(std::span<const TensorView> inputs,
     const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 
     if (outputs[0].is_empty()) {
-        // No packed form (neither f32 nor f16) is an empty answer, not a
-        // failure: a graph engine asks unconditionally.
         if (d.rank <= 0) { return; }
         outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz,
                                 d.layout, raw.quant_params());

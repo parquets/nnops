@@ -1,14 +1,11 @@
 #pragma once
 /// @file flatten.hpp
-/// @brief Flatten operator — convert any layout to dense contiguous planar data.
+/// @brief Flatten operator — any layout to dense contiguous planar data.
 ///
-/// Takes any input tensor (any layout: NCHW, NCHWC8, NCDHW, NCDHWC8, with
-/// or without pitch padding) and produces a dense contiguous output with
-/// the same logical shape and data type.
-///
-/// This is the equivalent of `np.ascontiguousarray()` in NumPy or
-/// `.contiguous()` in PyTorch.  All channel packing is unrolled and
-/// all pitch padding is removed.
+/// The counterpart of `np.ascontiguousarray()` / `.contiguous()`: channel
+/// packing is unrolled and pitch padding removed, so the output carries the
+/// input's logical shape and dtype. Inputs may be NCHW, NCHWC8, NCDHW or
+/// NCDHWC8, padded or not; f32 and f16 only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -19,21 +16,10 @@
 
 namespace nnops {
 
-/// Attributes for the Flatten operator (currently no attributes — always
-/// produces dense planar output with the same logical shape).
 struct FlattenAttributes {
     // Reserved for future options (e.g. flatten_to_1d, target_dtype).
 };
 
-/// Flatten operator — make tensor data dense and contiguous.
-///
-/// Input:  any tensor [N, C, (D,) H, W] in any layout
-/// Output: dense planar tensor with the same logical shape and dtype
-///
-/// Key use cases:
-///   - Export a packed tensor (NCHWC8 → NCHW dense)
-///   - Remove pitch padding after aligned allocations
-///   - Prepare data for serialization or external consumers
 class Flatten : public OpBase {
 public:
     static std::unique_ptr<Flatten> create(const FlattenAttributes& attrs = {},

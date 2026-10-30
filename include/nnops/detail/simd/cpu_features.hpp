@@ -1,13 +1,20 @@
 #pragma once
 /// @file cpu_features.hpp
-/// @brief Runtime CPU feature detection via CPUID (x86) or OS queries (ARM).
+/// @brief Runtime CPU feature, cache-size and P-core detection.
 ///
-/// Pattern adapted from:
-///   - onnxruntime: cpuid_info.h / cpuid_info.cc (CPUIDInfo singleton)
-///   - OpenCV: simd_intrinsics.hpp (compile-time ISA selection)
+/// One singleton, evaluated on first access: CPUID on x86_64, OS queries on
+/// AArch64. Pattern adapted from onnxruntime's CPUIDInfo (cpuid_info.h/.cc)
+/// and OpenCV's simd_intrinsics.hpp.
 ///
-/// Provides a singleton CpuFeatures that detects available ISA levels once
-/// at first access. Used by optimized kernels to select the best code path.
+/// The cache sizes feed the kc/mc bounds, so they must describe the caches the
+/// compute runs in. On Apple Silicon the OS reports the E-core L1D and L2
+/// (64 KiB / 4 MiB on an M4) against the P-cores' 128 KiB / 16 MiB: l1_cache_size()
+/// keeps the smaller E figure because a worker can land on either cluster, while
+/// l2_shared_cache_size() surfaces the P-cluster figure that mc/nc tile against.
+/// fast_core_count() is the P-core count (Windows EfficiencyClass, macOS
+/// hw.perflevel0): the workers that run a task at the same speed. Past it the
+/// slower cores make a static split end on the slowest finisher, so 0
+/// (homogeneous or unknown) is the case that needs no over-subscription.
 
 #include <cstddef>
 #include <cstdint>
@@ -51,10 +58,7 @@ enum class CpuIsa : uint32_t {
     NEON_DOT   = 1 << 18,  ///< ARMv8.2 dot-product
 };
 
-/// Runtime CPU feature detector.
-///
-/// Usage:
-///   if (CpuFeatures::get().has(CpuIsa::AVX2)) { ... use AVX2 kernel ... }
+/// Runtime CPU feature detector (process-wide singleton).
 class CpuFeatures {
 public:
     /// Get the singleton instance (initialized on first call).
@@ -63,57 +67,29 @@ public:
         return instance;
     }
 
-    /// Check whether a specific ISA extension is supported.
     bool has(CpuIsa isa) const {
         return (features_ & static_cast<uint32_t>(isa)) != 0;
     }
 
-    /// Raw feature bitmask.
     uint32_t raw() const { return features_; }
 
-    /// L1 data cache size in bytes.
-    ///
-    /// Detected on x86_64 (CPUID leaf 4, the level-1 *data* entry) and on
-    /// AArch64 (Linux sysfs, `hw.l1dcachesize`, or GetLogicalProcessorInformation).
-    /// This feeds the kc bound, so it has to be the data cache: the instruction
-    /// cache is a different size on most parts and never holds a packed panel.
-    ///
-    /// On Apple Silicon `hw.l1dcachesize` reports the *efficiency* cluster's L1D
-    /// (64 KiB on an M4) while the performance cluster has 128 KiB. The smaller
-    /// figure is the useful one: worker threads land on either cluster, so a
-    /// working set sized for the bigger one overflows on the E cores.
-    ///
-    /// Defaults to 32768 (a typical x86 L1D) when no detection path is available
-    /// — notably on any aarch64 target that is not Linux, macOS or Windows ARM64.
+    /// L1 data cache in bytes — the data cache, since this sizes the kc bound.
+    /// On Apple Silicon this is the E-core figure (see the file header).
+    /// Defaults to 32768 when no detection path is available.
     size_t l1_cache_size() const { return l1_cache_size_; }
 
-    /// L2 cache size in bytes (per-core). Detected via CPUID on x86_64 and
-    /// OS cache queries on AArch64; defaults to 262144 (256KB) when no
-    /// detection path is available.
+    /// Per-core L2 in bytes; defaults to 262144 (256 KiB) when undetectable.
     size_t l2_cache_size() const { return l2_cache_size_; }
 
-    /// L2 in bytes shared by the cores the compute actually lands on.
-    ///
-    /// On Apple Silicon `hw.l2cachesize` reports the *efficiency* cluster's L2
-    /// (4 MiB on an M4) while the performance cluster has 16 MiB, so tiling
-    /// heuristics keyed off l2_cache_size() would size themselves against a
-    /// cache four times smaller than the one the work runs in. Equals
-    /// l2_cache_size() everywhere the two cannot differ.
+    /// L2 in bytes shared by the cores the compute lands on — on Apple Silicon
+    /// the P-cluster's figure, not the E-cluster's. Falls back to
+    /// l2_cache_size() where the two cannot differ.
     size_t l2_shared_cache_size() const {
         return l2_shared_cache_size_ ? l2_shared_cache_size_ : l2_cache_size_;
     }
 
-    /// Cores in the fastest performance class — the P-cores of a hybrid part
-    /// (i5-13600KF: 6 of 14 physical, 20 logical) — or 0 when the platform
-    /// reports no distinction between cores.
-    ///
-    /// This is the number of workers that run a task at the same speed, and it
-    /// decides whether a wider team can be handed an equal share: past it the
-    /// extra workers are noticeably slower per task, so a static split ends when
-    /// the slowest of them finishes and the fast cores idle through the tail.
-    /// 0 means "homogeneous, or the platform would not say" — where an equal
-    /// share is already balanced and nothing needs over-subscribing. Detected on
-    /// Windows (EfficiencyClass) and macOS (`hw.perflevel0`); elsewhere 0.
+    /// P-core count — the workers that run a task at the same speed; 0 when no
+    /// efficiency classes are reported.
     int fast_core_count() const { return fast_cores_; }
 
 private:
@@ -127,9 +103,6 @@ private:
     int fast_cores_ = 0;             // 0 = no efficiency classes reported
 };
 
-// ============================================================
-// Convenience free-standing check functions (inline, fast)
-// ============================================================
 inline bool cpu_has_sse4_1()  { return CpuFeatures::get().has(CpuIsa::SSE4_1); }
 inline bool cpu_has_avx()     { return CpuFeatures::get().has(CpuIsa::AVX); }
 inline bool cpu_has_avx2()    { return CpuFeatures::get().has(CpuIsa::AVX2); }

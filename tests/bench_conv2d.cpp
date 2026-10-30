@@ -1,21 +1,89 @@
 /// @file bench_conv2d.cpp
-/// @brief Conv2D (im2col + GEMM) micro-benchmark — plan + thread scaling.
+/// @brief Conv2D micro-benchmarks: the im2col+GEMM plan and its thread scaling,
+/// plus the depthwise, Winograd and int8 siblings.
 ///
-/// Mirrors bench_matmul.cpp: every case runs the plan-driven fused fast path and
-/// reports the resolved plan plus GFLOPS at 1, 2, 4, 8 and hardware threads.
+/// The im2col cases run the plan-driven fast path and print the resolved plan next
+/// to the rate: block geometry (icn/ocn/oh_block), the oh-block count, the task
+/// count (N*G*oh_chunks*oc_chunks) and the workspace. Winograd prints its own tile
+/// plan; the depthwise rows print geometry and rates only. For each (batch, group)
+/// the output plane is split into oh-blocks; when the batch alone under-subscribes
+/// the pool the oh-blocks are chunked (plan.oh_chunks), and a plane still too small
+/// splits its oc-blocks (plan.oc_chunks). Cases are point-shaped — one named layer
+/// per bench — followed by sweep tables that walk kernel size, plane size, group
+/// count and whole backbones.
 ///
-/// For each (batch, group) the output spatial plane is split into oh-blocks;
-/// when (batch, group) alone under-subscribes the pool the oh-blocks are
-/// partitioned into parallel chunks (plan.oh_chunks), and a plane too small to
-/// fill the pool that way also splits its oc-blocks (plan.oc_chunks). The report
-/// shows the block geometry (icn/ocn/oh_block), the resulting oh-block count,
-/// and the total task count (N*G*oh_chunks*oc_chunks).
+/// Blocks come from kernel *area*: get_ic_block() maps karea -> icn_block, 64 at
+/// 1x1, 16 through 3x3, 8 through 5x5, 2 through 7x7, 1 past that, and one GEMM
+/// call reduces over icn_block * karea. The sweeps hold that K roughly flat as the
+/// kernel grows — 64 -> 144 -> 200 -> 98 for 1x1 -> 3x3 -> 5x5 -> 7x7 — so the
+/// panel stays near 144-200 wide through 5x5; the 7x7 rung is left at 98 because
+/// raising its icn_block from 2 to 4 (K 98 -> 196) measured -3.8% on a 112 plane.
+/// The 1x1 rows read 64 only because IC is 64 here: they take the plan's pointwise
+/// route (pw=yes) and never build a panel, so icn is the whole channel count, not a
+/// cap. What is not flat is the traffic — the im2col write per output row is
+/// IC * karea and grows 49/9 from 3x3 to 7x7, and the weight panel is re-read once
+/// per ic-block — which is what those tables price. A dilated kernel keeps its
+/// karea: a dilated 5x5 plans like a 5x5 (icn 8) while gathering a 9-wide window.
 ///
-/// Cases are point-shaped — one named network layer per bench — plus, at the end,
-/// kernel-area sweep tables: one shape walked across kernel size, plane size and
-/// group count. The plan's block sizes are a function of kernel *area*
-/// (get_ic_block), so no single 3x3 point case can show what a 5x5 or 7x7 does to
-/// them.
+/// Measurement rules this file holds itself to:
+/// - Interleaved A/B, A B A B, with the second A as a **null control**: same op,
+///   same binary, same buffers, so an A2/A1 gap is drift and nothing else.
+///   Block-ordering the runs manufactures a regression out of that drift, so a
+///   speedup is only reported as real when it clears the null floor. Per round the
+///   min is kept and the median across rounds is reported.
+/// - time_ms() is per call, not per batch: the caller divides a per-iteration FLOP
+///   count by it, so a batch total would inflate the ms column by `iters` and
+///   shrink every rate column by that same factor.
+/// - Sweep cells run until a wall-clock budget elapses, not for a flat count: a
+///   7x7 at 112x112 is orders of magnitude more work per call than a 1x1 at 7x7.
+/// - Sweep tables resolve plan geometry at the *largest* pool in the row, not at
+///   1 thread: oh_chunks and the oh-block shrink are per-pool decisions, so the
+///   widest pool is what the narrower ones are compared against. blks
+///   (N*G*oh_blocks) is the hard task ceiling — where it sits far under the thread
+///   count, the multi-thread cells are partly measuring the pool.
+///
+/// BenchPool has two arms (see common/cpu_pool.hpp): an OpenMP team when the build
+/// has one, else a pool that spawns per call. With spawn-per-call
+/// (NNOPS_BENCH_OMP=0) every call pays thread start-up — ~450 us at 20 threads on
+/// this host, around a quarter of the f32 3x3 row and the reason the smallest rows'
+/// 8T/20T cells read low; an OpenMP build removes that start-up and those cells
+/// then measure kernel plus the per-call barrier. At 1 thread the bare
+/// ComputeContext reports no thread ids, so the scratch is sized per task.
+/// NNOPS_BENCH_THREADS=1 (or "1,4") pins the ladder: on a busy host the
+/// multi-thread cells mostly measure background load.
+///
+/// Winograd F(2,3) trades 2.25x fewer multiplies for transforms whose cost is
+/// fixed per tile and per channel, so the win grows with channel count: ahead of
+/// im2col from 32 channels up, a wash at 8 (kept as the degenerate case so a
+/// regression shows up as a number). Its rate column is the transform-domain
+/// product count — 16 GEMM positions over tiles, not OH*OW*9 per (n, oc, ic) — so
+/// the two rate columns are not comparable; the wall-time speedup is the verdict.
+/// U is prepacked once, outside every timed region.
+///
+/// The int8 rows count GOPS of int8 MACs with the same
+/// 2*N*OC*OH*OW*(IC/G)*KH*KW expression the fp rows call FLOPs, so an A/B compares
+/// wall time for the same useful work. A pre-quantized (u8/s8) activation is the
+/// deployment shape — im2col is a byte copy; an fp activation is quantized while
+/// the tile is gathered, identical MACs plus a per-element convert. An s8/u8
+/// destination requantizes on the tile with the output's QuantParams and takes an
+/// int32 bias, where the fp destination dequantizes. With symmetric weights the
+/// column coefficient is 0 (a u8 activation's zero point is shifted to zp_x - 128
+/// by the packer), leaving only the per-channel compensation, computed once per
+/// call into the bias for an integer destination and into an int32 row offset for
+/// the fp one.
+///
+/// The first twelve parity rows are onnxruntime's MLAS convolution benchmark
+/// shapes (onnxruntime/test/mlas/bench/bench_sconv.cpp: the ResNet50 set plus the
+/// TeamsModel depthwise layer), each a head-to-head with a MlasConv number on the
+/// same problem; the rows after them go past that set. The parity set runs at one
+/// thread so no pool geometry or per-call thread creation enters the measurement.
+/// The backbone stacks follow torchvision's resnet50/resnet18/vgg16 weight shapes at
+/// N=1, one row per distinct layer in execution order (VGG repeats a stage because
+/// its depth is the point; stride-2 sits on each ResNet stage's first conv — a 1x1
+/// downsample in resnet50, the leading 3x3 in resnet18). The wide-frame tables are
+/// the front stages at 1280x720/960: at 1280 wide the N side spans many nr_max
+/// panels on its own, and tensors reach ~236 MB per side (1x64x720x1280 f32), so
+/// those tables measure the memory system as much as the kernel.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
@@ -47,10 +115,7 @@ namespace cpu = nnops::backend::cpu;
 
 namespace {
 
-// The bench's CpuBackend: an OpenMP thread team when the build has one (and
-// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
-// behind the same hooks, so a table differs only in its scheduler —
-// see common/cpu_pool.hpp.
+/// The bench's CpuBackend: an OpenMP team, or a pool that spawns per call.
 struct BenchPool {
     explicit BenchPool(int nthreads) : nthreads_(nthreads) {
         if (nnops::test::bench_use_openmp()) {
@@ -86,7 +151,7 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
-// Build a random tensor of type T (float -> f32, half -> f16).
+/// float -> f32, half -> f16.
 template <typename T>
 auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     if constexpr (std::is_same_v<T, float>) {
@@ -139,8 +204,6 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
     const int64_t icg = c.IC / c.groups;
     const double flops_per_iter = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
-    // Plan resolved at the largest thread count (shows the max oh-chunk split).
-    // The bench pool reports thread ids, so the per-thread scratch sizing applies.
     const cpu::Conv2DGemmPlan plan = cpu::get_conv2d_implicit_gemm_plan(attrs, descs, out_descs, threads.back(),
                                                       /*use_thread_slots=*/true);
 
@@ -187,9 +250,7 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
     std::printf("\n");
 }
 
-/// Thread ladder for every conv bench. `NNOPS_BENCH_THREADS=1` (or "1,4") pins
-/// it: the multi-thread cells on a busy host mostly measure background load,
-/// and a pinned run is the only way to get a clean per-core number.
+/// The conv bench thread ladder; NNOPS_BENCH_THREADS="1,4" pins it.
 std::vector<int> conv_bench_threads() {
     std::vector<int> threads;
     if (const char* env = std::getenv("NNOPS_BENCH_THREADS")) {
@@ -240,7 +301,6 @@ void run_depthwise(const DepthwiseCase& c, const std::vector<int>& threads, int 
     attrs.dilation    = {1, 1, 1};
     attrs.padding     = {0, c.PH, c.PW};
 
-    // The raw filter goes straight to the operator: no pack, no prepack.
     auto dw_op = DepthwiseConv::create(attrs, Backend::CPU);
 
     const TensorView dw_in[] = {in_nchw, w_nchw};
@@ -306,15 +366,7 @@ struct WinoCase {
     bool bias = false, f16 = false;
 };
 
-/// Mean wall time of ONE call, in milliseconds.
-///
-/// Per-call, not per-batch: the caller divides a FLOP count taken per iteration
-/// by this and prints the quotient as a per-call rate, so a batch total here
-/// inflates the ms column by `iters` and the GFLOPS column by 1000/iters —
-/// 20x and 50x at the 20 iterations this section runs. The speedup column is a
-/// ratio and cancelled it, so the A/B verdicts stayed right while every
-/// absolute number was wrong. The caller's divisor was off in the same
-/// direction and was fixed in the same change.
+/// Mean wall time of one call, in ms — per call, not per batch.
 template <typename Fn>
 double time_ms(Fn&& fn, int iters) {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -324,21 +376,12 @@ double time_ms(Fn&& fn, int iters) {
            std::max(iters, 1);
 }
 
-/// Median of the per-round timings — one descheduled round should not decide
-/// the verdict for every other round.
 double median_of(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     return v[v.size() / 2];
 }
 
-/// Interleaved A/B. Within one round the two variants alternate A B A B, and the
-/// second A is the **null control**: same op, same binary, same buffers, so an
-/// A2/A1 gap is pure measurement drift (fanless thermal soak, cache state) and
-/// nothing else. Block-ordering the runs — all A, then all B — manufactures a
-/// regression out of that drift, so the variants are interleaved and a speedup
-/// is only reported as real when it clears the null floor.
-///
-/// Prepack of U happens once, outside every timed region.
+/// Winograd vs im2col, interleaved A/B with the second A as the null control.
 template <typename T>
 void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
                  int iters, int rounds) {
@@ -377,13 +420,11 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
     const int64_t OW = out_descs[0].dims[3];
     const double flops_per_iter =
         2.0 * static_cast<double>(c.N) * c.OC * OH * OW * c.IC * 9;
-    // Winograd multiplies once per transform-domain product, not per k-area
-    // term: 16 GEMM positions over tiles, instead of OH·OW·9 per (n, oc, ic).
     const int64_t TH = (OH + 1) / 2, TW_pad = ((OW + 1) / 2 + 7) / 8 * 8;
     const double flops_per_iter_wino =
         2.0 * static_cast<double>(c.N) * c.OC * (TH * TW_pad) * c.IC * 16;
 
-    // Prepack U (query -> allocate -> pack), once and outside every timer.
+    // Two-step prepack: an empty output view is the query for the size.
     std::vector<T> u_buf;
     TensorView u_view;
     {
@@ -407,9 +448,6 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
     std::vector<TensorView> wn_ins = {input, u_view};
     if (c.bias) { im_ins.push_back(bias_view); wn_ins.push_back(bias_view); }
 
-    // Report the resolved Winograd geometry (descs are the same for both ops).
-    // Planned for the widest thread count in the sweep: the scratch is per
-    // worker slot, so the serial plan is the one that would size it by task.
     {
         std::vector<TensorDesc> wd = {input.desc(), u_view.desc()};
         if (c.bias) { wd.push_back(bias_view.desc()); }
@@ -458,9 +496,6 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
         const double im = median_of(im_ms), wn = median_of(wn_ms);
         const double nf = median_of(null_pct);
         const double speedup = im / wn;
-        // The two GFLOPS columns are each variant's own useful-work rate; they
-        // are not comparable (im2col does 9/4x the multiplies). The verdict is
-        // the wall-time speedup, and only when it clears the null floor.
         const bool real = std::abs(im - wn) / im * 100.0 > nf;
 
         std::printf("    %2dT  im2col %7.3f ms (%7.1f GFLOPS) | wino %7.3f ms (%7.1f GFLOPS)"
@@ -479,17 +514,8 @@ void bench_wino_case(const WinoCase& c) {
 }
 
 // ============================================================
-// Quantized Conv2D — s8 weight × u8/s8/f32/f16 activation → fp output
+// Quantized Conv2D — s8 weight × u8/s8/f32/f16 activation → fp, s8 or u8 output
 // ============================================================
-//
-// Rates are GOPS of int8 MACs, counted with the same
-// 2·N·OC·OH·OW·(IC/G)·KH·KW expression the fp cases call FLOPs, so the A/B
-// rows below compare wall time for the same amount of useful work.
-//
-// A pre-quantized activation (u8/s8) is the deployment shape: the tensor
-// arrives quantized, so im2col is a byte copy. An fp activation is quantized
-// while the tile is gathered — identical MACs, extra work per element — and
-// `conv2d_i8_fp_act_overhead_ab` measures exactly that difference.
 
 struct Conv2DI8Case {
     const char* name;
@@ -503,7 +529,7 @@ struct Conv2DI8Case {
     int32_t zp_x = 128;               // activation zero point (u8 activations)
 };
 
-/// float → s8/u8 storage value, with the arithmetic the kernels use.
+/// float -> s8/u8 storage value, with the arithmetic the kernels use.
 int32_t quant_i8(float x, float inv_scale, int32_t zp, bool u8) {
     const float v = std::fmaf(x, inv_scale, static_cast<float>(zp));
     const int32_t q = static_cast<int32_t>(std::nearbyintf(v));
@@ -520,9 +546,8 @@ const char* dtype_name(DataType dt) {
     }
 }
 
-/// A fully built quantized convolution. Construction is the whole setup —
-/// operand storage, the views over it, the op, the output and the plan — done
-/// once outside every timed region; `run` is then the entire timed body.
+/// A fully built quantized convolution: construction is all the setup, run() is
+/// the entire timed body.
 struct I8Op {
     I8Op(const Conv2DI8Case& c, int plan_threads) {
         const int64_t N = c.N, IC = c.IC, IH = c.IH, IW = c.IW, OC = c.OC;
@@ -617,8 +642,6 @@ struct I8Op {
                                      bias.data(), TensorLayout::NCHW));
         }
 
-        // An s8/u8 destination requantizes with the output's QuantParams; the
-        // scale is a plausible product scale (s_x · s_w ≈ 1e-2 · 1e-2).
         if (int_out) {
             out_q.granularity = QuantGranularity::PerTensor;
             out_q.scale = 0.03125f;
@@ -639,9 +662,6 @@ struct I8Op {
         out = TensorView(oshape, outs[0].dtype, out_buf.data(),
                          outs[0].layout, out_q);
 
-        // Resolved at the thread count the pair runs on, with per-thread scratch
-        // sized in — the bench pool reports thread ids. A single thread runs on
-        // a bare ComputeContext, which reports none, so it is sized per task.
         plan = cpu::get_conv2d_implicit_gemm_plan(attrs, descs, outs, plan_threads,
                                     /*use_thread_slots=*/plan_threads > 1);
         work = 2.0 * static_cast<double>(N) * OC * OH * OW *
@@ -664,10 +684,7 @@ struct I8Op {
     double work = 0.0;   // MACs per call
 };
 
-/// The fp32 baseline for the A/B — the same geometry through the fp
-/// im2col+GEMM route, kept alive across rounds. `run_conv2d` builds, reports and
-/// tears everything down in one call, which is the wrong shape for an
-/// interleaved comparison.
+/// The fp32 im2col+GEMM baseline for the A/B, kept alive across rounds.
 struct Fp32Op {
     explicit Fp32Op(const Conv2DCase& c) {
         const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
@@ -780,11 +797,6 @@ void bench_conv2d_i8_case(const Conv2DI8Case& c) {
     run_conv2d_i8(c, conv_bench_threads(), 20);
 }
 
-/// Interleaved A/B, the same discipline as `run_wino_ab`: within a round the
-/// variants alternate A B A B, and the second A is the null control — same op,
-/// same binary, same buffers, so an A2/A1 gap is measurement drift and nothing
-/// else. Per round the minimum is kept and the median across rounds is
-/// reported; the verdict is called real only when it clears the null floor.
 /// One interleaved A/B measurement at @p nt threads, in per-call ms.
 struct AbResult {
     double a_ms = 0.0, b_ms = 0.0;   ///< median over rounds of the per-round min
@@ -835,8 +847,7 @@ void run_ab_pair(const char* title,
     }
 }
 
-/// The headline number: the quantized route against the fp route on the same
-/// geometry (u8 activation, which is the deployment shape).
+/// The quantized route against the fp route on the same geometry.
 void bench_conv2d_i8_vs_fp(const Conv2DCase& c, int iters, int rounds) {
     const std::vector<int> threads = conv_bench_threads();
     I8Op i8(as_i8(c, DataType::u8), threads.back());
@@ -847,14 +858,7 @@ void bench_conv2d_i8_vs_fp(const Conv2DCase& c, int iters, int rounds) {
                 threads, iters, rounds);
 }
 
-/// Integer destinations against the same geometry's fp one: an s8/u8 output
-/// requantizes on the tile (`int8_epilogue_tile`) instead of dequantizing to
-/// f32 (`dq_epilogue_tile`), so this is the cost of the requant pass — the
-/// reductions it reads run either way only when the weight's zero point is
-/// asymmetric; with the symmetric parameters here both destinations skip them
-/// (the activation's zero point, when it is not the packer's, folds into the
-/// bias / a row offset instead). Both sides carry a bias (int32 on the integer
-/// destination).
+/// s8/u8 destination vs the fp one: the cost of the requant pass.
 void bench_conv2d_i8_out(const Conv2DCase& c, DataType act, int iters, int rounds) {
     const std::vector<int> threads = conv_bench_threads();
     Conv2DI8Case base = as_i8(c, act);
@@ -883,14 +887,9 @@ void bench_conv2d_i8_out(const Conv2DCase& c, DataType act, int iters, int round
                 threads, iters, rounds);
 }
 
-/// The activation's zero point in the shifted space the packer produces:
-/// zp_eff = zp_x − 128 for a u8 activation. With symmetric weights the column
-/// coefficient (a_bias_offset + zp_a) is 0, so only the per-channel half of the
-/// compensation survives, and the route computes it once per call — into the
-/// bias for an integer destination, into an int32 row offset for the fp one.
-/// This A/B guards that fold: one convolution, zp_x 128 against 120, on both
-/// destinations. An arm slower than its twin means a reduction sweep or a
-/// per-element compensation came back.
+/// zp_x 128 against 120 on both destinations — guards the zero-point fold: an arm
+/// slower than its twin means a reduction sweep or a per-element compensation
+/// came back.
 void bench_conv2d_i8_act_zp(const Conv2DCase& c, int iters, int rounds) {
     const std::vector<int> threads = conv_bench_threads();
     Conv2DI8Case q128 = as_i8(c, DataType::u8);
@@ -923,43 +922,6 @@ void bench_conv2d_i8_act_zp(const Conv2DCase& c, int iters, int rounds) {
 // ============================================================
 // Kernel-area / shape sweeps
 // ============================================================
-//
-// The point cases above each pin one shape, and 3x3 dominates them. The one
-// thing 3x3 cannot show is what the kernel *area* does to the plan:
-// get_ic_block() maps karea -> icn_block (64 at 1x1, 16 through 3x3, 8 through
-// 5x5, 2 through 7x7, 1 past that), and a single GEMM call reduces over
-// icn_block * karea. The ladder holds that K roughly flat as the kernel grows —
-// the K column below reads 64 -> 144 -> 200 -> 98 for 1x1 -> 3x3 -> 5x5 -> 7x7 —
-// so the im2col panel handed to one GEMM stays near 144-200 wide through 5x5.
-// The 7x7 rung is left at 98: a 49 -> 4 bump measured -3.8% on a 112 plane.
-// The 1x1 rows read 64 only because IC is 64 here; they take the plan's
-// pointwise route (the pw column), so they never consult get_ic_block() and
-// never build a panel — 64 is the whole channel count, not a cap.
-//
-// What is *not* flat is the traffic: every input channel's karea taps
-// must be materialised for every output row, so the im2col write per output row
-// is IC * karea and grows 49/9 from 3x3 to 7x7, and the weight panel is re-read
-// once per ic-block (IC / icn_block of them). These tables put a number on that.
-//
-// The tile columns are the plan resolved at the *largest* pool in the row, not
-// at 1 thread: oh_chunks and the oh-block shrink are per-pool decisions, so the
-// widest pool is the geometry the narrower ones are compared against. blks
-// (N*G*oh_blocks) is the hard ceiling on tasks — where blks is far below the
-// thread count, the multi-thread columns are partly measuring the pool.
-//
-// Cells are adaptive — each runs until a wall-clock budget elapses — rather than
-// the flat 20 the point cases use: a 7x7 at 112x112 is orders of magnitude more
-// work per call than a 1x1 at 7x7, so no single iteration count covers both.
-//
-// Caveat on the multi-thread columns: with the spawn-per-call pool
-// (NNOPS_BENCH_OMP=0) each BenchPool call joins and starts its workers, so every
-// call pays thread start-up once. Measured on this host that is ~450 us at 20
-// threads — around a quarter of the f32 3x3 row in the first table, and the
-// reason the smallest rows' 8T/20T cells read low. The 5x5/7x7 rows do 25/9 and
-// 49/9 of the 3x3's work per call and are far less affected; read the
-// small-shape 20T cells as a lower bound on the kernel. An OpenMP build (the
-// bench default, see common/cpu_pool.hpp) removes that start-up, so the same
-// cells then measure the kernel plus the per-call barrier.
 
 struct ConvSweepShape {
     int64_t N, IC, IH, OC, K;    // square kernel; plane is IH x IW
@@ -1097,12 +1059,7 @@ void sweep_conv(const char* tag, const std::vector<ConvSweepShape>& shapes,
 
 }  // anonymous namespace
 
-// ============================================================
-// Routing / tiling sweep
-// ============================================================
-
 NNOPS_BENCH(conv2d_f32_resnet_first_7x7) {
-    // ResNet first layer: stride-2 downsampling, 3 -> 64 channels.
     bench_conv2d_case({"f32 resnet-first 1x3x224x224 -> 64 x 7x7 s2 p3", 1, 3, 224, 224, 64, 7, 7,
                        /*SH=*/2, /*SW=*/2, /*PH=*/3, /*PW=*/3});
 }
@@ -1113,18 +1070,15 @@ NNOPS_BENCH(conv2d_f32_resnet_block_3x3) {
 }
 
 NNOPS_BENCH(conv2d_f32_pointwise_1x1) {
-    // 1x1 bottleneck expand — large K (IC) and N (OC), karea == 1 skips im2col.
     bench_conv2d_case({"f32 pointwise 1x256x28x28 -> 512 x 1x1 s1", 1, 256, 28, 28, 512, 1, 1});
 }
 
 NNOPS_BENCH(conv2d_f32_depthwise_3x3) {
-    // Depthwise (groups == IC) 3x3 — the grouped im2col path.
     bench_conv2d_case({"f32 depthwise 1x256x28x28 -> 256 x 3x3 g256 s1 p1", 1, 256, 28, 28, 256, 3, 3,
                        /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1, /*DH=*/1, /*DW=*/1, /*groups=*/256});
 }
 
 NNOPS_BENCH(conv2d_f32_batch) {
-    // Batch=8 exercises the (batch, group) parallel dimension.
     bench_conv2d_case({"f32 batch 8x64x28x28 -> 128 x 3x3 s1 p1", 8, 64, 28, 28, 128, 3, 3,
                        /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
@@ -1148,7 +1102,6 @@ NNOPS_BENCH(conv2d_f16_pointwise_1x1) {
 }
 
 NNOPS_BENCH(conv2d_f16_grouped_3x3) {
-    // groups == IC: the grouped im2col path.
     bench_conv2d_case({"f16 depthwise 1x256x28x28 -> 256 x 3x3 g256 s1 p1", 1, 256, 28, 28, 256, 3, 3,
                        /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1, /*DH=*/1, /*DW=*/1, /*groups=*/256,
                        /*bias=*/false, /*f16=*/true});
@@ -1160,46 +1113,27 @@ NNOPS_BENCH(conv2d_f16_batch) {
                        /*bias=*/false, /*f16=*/true});
 }
 
-// ============================================================
-// Larger kernels — 5x5, 7x7
-// ============================================================
-//
-// karea drives icn_block (16 through 3x3, 8 through 5x5, 2 through 7x7), so
-// everything past 3x3 runs on a narrower im2col panel and a deeper ic-block
-// walk. The 56x56 cases deliberately share the resnet-block shape above them so
-// the rows differ in the kernel and nothing else.
-
 NNOPS_BENCH(conv2d_f32_5x5) {
-    // Same in/out shape as conv2d_f32_resnet_block_3x3 — 25/9 the FLOPs, icn 8.
     bench_conv2d_case({"f32 5x5 1x64x56x56 -> 64 x 5x5 s1 p2", 1, 64, 56, 56, 64, 5, 5,
                        /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2});
 }
 
 NNOPS_BENCH(conv2d_f32_7x7) {
-    // 49/9 of the 3x3 at the same shape, and 4x the 5x5 above it. karea 49 puts
-    // icn_block at 2: the same output is produced from a panel a quarter as wide
-    // as the 5x5's, rewritten four times as many times.
     bench_conv2d_case({"f32 7x7 1x64x56x56 -> 64 x 7x7 s1 p3", 1, 64, 56, 56, 64, 7, 7,
                        /*SH=*/1, /*SW=*/1, /*PH=*/3, /*PW=*/3});
 }
 
 NNOPS_BENCH(conv2d_f32_5x5_stride2) {
-    // MobileNet-style downsample: 5x5 stride 2 is the largest kernel that
-    // actually sits in a cheap block of a real network.
     bench_conv2d_case({"f32 5x5 s2 1x32x112x112 -> 32 x 5x5 s2 p2", 1, 32, 112, 112, 32, 5, 5,
                        /*SH=*/2, /*SW=*/2, /*PH=*/2, /*PW=*/2});
 }
 
 NNOPS_BENCH(conv2d_f32_5x5_dilated2) {
-    // karea stays 25 (icn_block 8) while the gathered window is 9 wide — the
-    // contrast case against a real 9x9, which plans icn_block 1.
     bench_conv2d_case({"f32 5x5 d2 1x64x56x56 -> 64 x 5x5 s1 p2 d2", 1, 64, 56, 56, 64, 5, 5,
                        /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2, /*DH=*/2, /*DW=*/2});
 }
 
 NNOPS_BENCH(conv2d_f32_5x5_grouped) {
-    // The im2col grouped path at 5x5 — pairs with dwconv_f32_5x5 below, which is
-    // the dedicated depthwise kernel on the same shape.
     bench_conv2d_case({"f32 depthwise 5x5 1x128x28x28 -> 128 x 5x5 g128 s1 p2",
                        1, 128, 28, 28, 128, 5, 5, /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2,
                        /*DH=*/1, /*DW=*/1, /*groups=*/128});
@@ -1217,13 +1151,7 @@ NNOPS_BENCH(conv2d_f16_7x7) {
                        /*bias=*/false, /*f16=*/true});
 }
 
-// ============================================================
-// DepthwiseConv — the dedicated planar kernel
-// ============================================================
-
 NNOPS_BENCH(dwconv_f32_3x3) {
-    // Same shape as the im2col depthwise case above (SAME padding, OH=28) —
-    // direct head-to-head.
     bench_depthwise_case({"f32 dwconv 1x256x28x28 -> 3x3 s1 p1", 1, 256, 28, 28, 3, 3,
                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
@@ -1234,7 +1162,6 @@ NNOPS_BENCH(dwconv_f32_3x3_large) {
 }
 
 NNOPS_BENCH(dwconv_f32_stride2) {
-    // MobileNet-style downsampling block.
     bench_depthwise_case({"f32 dwconv 1x256x56x56 -> 3x3 s2", 1, 256, 56, 56, 3, 3,
                           /*SH=*/2, /*SW=*/2});
 }
@@ -1249,24 +1176,12 @@ NNOPS_BENCH(dwconv_f32_batch) {
                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
 
-// ============================================================
-// Winograd F(2,3) vs im2col
-// ============================================================
-//
-// Winograd trades 2.25× fewer multiplies for transforms whose cost is fixed per
-// tile and per channel, so the win grows with the channel count: from 32 channels
-// up it is ahead of im2col here, and at 8 it is a wash. The 8-channel case is the
-// floor of the range this kernel is worth calling for — kept in the sweep so a
-// regression in the transforms shows up as a number, not an assumption.
-
 NNOPS_BENCH(conv2d_wino_f32_64ch) {
     bench_wino_case({"f32 wino 1x64x56x56 -> 64 x 3x3 s1 p1", 1, 64, 56, 56, 64});
 }
 
 NNOPS_BENCH(conv2d_wino_f32_batch4) {
-    // Batch is part of the task grid, not a serial loop around one dispatch, so
-    // N=4 should scale with threads the same way N=1 does rather than paying the
-    // per-(batch, group) phases and dispatches four times over.
+    // Batch is in the task grid, not a serial loop: N=4 should scale like N=1.
     bench_wino_case({"f32 wino 4x64x56x56 -> 64 x 3x3 s1 p1", 4, 64, 56, 56, 64});
 }
 
@@ -1279,21 +1194,16 @@ NNOPS_BENCH(conv2d_wino_f32_32ch) {
 }
 
 NNOPS_BENCH(conv2d_wino_f32_8ch_degenerate) {
-    // The floor: at 8 channels the transforms eat the 2.25x multiply saving, so
-    // this is the case where Winograd is only at parity with im2col.
     bench_wino_case({"f32 wino 1x8x56x56 -> 8 x 3x3 s1 p1 (degenerate)", 1, 8, 56, 56, 8});
 }
 
 NNOPS_BENCH(conv2d_wino_f32_28x28_128ch) {
-    // ResNet-18 layer2.x: 14 tile rows × 1 tile block = 14 tasks, i.e. just
-    // under this host's 20 logical CPUs. The plane that starts to starve.
+    // ResNet-18 layer2.x: 14 tasks for 20 CPUs — the plane that starts to starve.
     bench_wino_case({"f32 wino 1x128x28x28 -> 128 x 3x3 s1 p1", 1, 128, 28, 28, 128});
 }
 
 NNOPS_BENCH(conv2d_wino_f32_14x14_256ch) {
-    // ResNet-18 layer3.x: 7 tile rows and one 8-wide tile block — 7 tasks for
-    // the whole pool, and the tile axis has no room left (TW_pad is already one
-    // vector). The oc axis is the only supply this shape has.
+    // ResNet-18 layer3.x: 7 tasks for the whole pool; the oc axis is the only supply.
     bench_wino_case({"f32 wino 1x256x14x14 -> 256 x 3x3 s1 p1", 1, 256, 14, 14, 256});
 }
 
@@ -1313,20 +1223,7 @@ NNOPS_BENCH(conv2d_wino_f16_256ch) {
                      /*PH=*/1, /*PW=*/1, /*bias=*/false, /*f16=*/true});
 }
 
-// ============================================================
-// Kernel-area sweeps — what 5x5 and 7x7 cost against 3x3
-// ============================================================
-//
-// Same shapes, read as a table: the icn column is the plan's answer to karea,
-// and the gflops columns are what that answer buys.
-
 NNOPS_BENCH(conv2d_f32_kernel_sweep) {
-    // One shape (1x64x56x56 -> 64), one padding rule, only the kernel moves.
-    // Read icn against K: the plan trades icn_block away roughly in step with
-    // karea, so the K of one GEMM call stays in the 144-200 band while the FLOPs
-    // above it scale with karea^2. The dilated 3x3 is the outlier — karea 9
-    // (icn 16) with a 5-wide gather window, so it plans like a 3x3 and gathers
-    // like a 5x5; only the `d` column tells it apart from the row above.
     sweep_conv<float>("f32", {
         {1, 64, 56, 64, 1},                        // pointwise: karea  1, icn 64
         {1, 64, 56, 64, 3},                        // karea  9, icn 16
@@ -1337,8 +1234,7 @@ NNOPS_BENCH(conv2d_f32_kernel_sweep) {
 }
 
 NNOPS_BENCH(conv2d_f32_large_kernel_shape_sweep) {
-    // Kernel area against plane size. At 28x28 the whole plane is 7 oh-blocks,
-    // so the tasks ceiling (blks) is well under the pool; at 112x112 it is not.
+    // Kernel area against plane size: 28x28 is under the pool, 112x112 is not.
     sweep_conv<float>("f32", {
         {1, 64,  28, 64, 3},
         {1, 64,  28, 64, 5},
@@ -1350,10 +1246,8 @@ NNOPS_BENCH(conv2d_f32_large_kernel_shape_sweep) {
 }
 
 NNOPS_BENCH(conv2d_f32_5x5_group_sweep) {
-    // Groups against a fixed 5x5: raising g shrinks ic_per_group, which min()s
-    // into icn_block, so g = 16 already sits at icn_block 1 — the same rank-1
-    // panel a 9x9 reaches with g = 1. Task count rises with g throughout, so
-    // this isolates tile size from pool fill.
+    // g shrinks ic_per_group, which min()s into icn_block: g=16 halves the 5x5
+    // panel to 4, g=64 (depthwise) drops it to one channel.
     sweep_conv<float>("f32", {
         {1, 64, 28, 64, 5, 1, /*groups=*/1},
         {1, 64, 28, 64, 5, 1, /*groups=*/4},
@@ -1374,45 +1268,6 @@ NNOPS_BENCH(conv2d_f16_kernel_sweep) {
 // ============================================================
 // im2col parity set vs MLAS — single thread
 // ============================================================
-//
-// The first twelve rows are the shape set onnxruntime's MLAS convolution
-// benchmark runs (onnxruntime/test/mlas/bench/bench_sconv.cpp: the ResNet50 set
-// plus the TeamsModel depthwise layer), expressed in this harness's
-// (N, IC, IH, OC, K, stride, groups, pad, dilation) form. Each one is therefore
-// a head-to-head with an MLAS `MlasConv` number on the identical problem:
-//
-//   row                              MLAS parameters (N, G, Cpg, Fpg, I, K, P, S)
-//   1x3x224x224 -> 64 x 7x7 s2       1, 1, 3,   64,  224, 7x7, 3, 2
-//   1x64x56x56 -> 64 x 3x3           1, 1, 64,  64,  56,  3x3, 1, 1
-//   1x64x56x56 -> 256 x 1x1          1, 1, 64,  256, 56,  1x1, 0, 1
-//   1x128x28x28 -> 512 x 3x3 s2      1, 1, 128, 512, 28,  3x3, 1, 2
-//   1x256x14x14 -> 1024 x 1x1        1, 1, 256, 1024, 14, 1x1, 0, 1
-//   1x512x7x7 -> 2048 x 1x1          1, 1, 512, 2048, 7,  1x1, 0, 1
-//   1x64x56x56 -> 64 x 3x3 g64       1, 64, 1,  1,   56,  3x3, 1, 1
-//   1x24x72x72 -> 12 x 3x3 g2 p0     1, 2, 12,  6,   72,  3x3, 0, 1
-//   1x256x378x378 -> 256 3x3 g256    1, 256, 1, 1,   378, 3x3, 1, 1
-//   8x64x56x56 -> 64 x 3x3           8, 1, 64,  64,  56,  3x3, 1, 1
-//   8x64x56x56 -> 256 x 1x1          8, 1, 64,  256, 56,  1x1, 0, 1
-//   1x256x224x224 -> 256 x 3x3       1, 1, 256, 256, 224, 3x3, 1, 1
-//
-// The rows past them are the cases the MLAS set does not reach: karea 81 (the
-// plan's icn 1 floor), a small-plane depthwise layer, a depthwise 5x5, a
-// dilated 5x5 on a 112 plane, and a grouped 3x3 whose output is 4x the input.
-//
-// Single thread only: at one thread every thread-count knob disappears from
-// both harnesses — no pool geometry, no per-call thread creation (this harness's
-// BenchPool spawns its workers inside every parallel_for, which at 8T/20T costs
-// more than the small rows below take in total). The rate printed here is the
-// kernel, and the kernel is the only thing the two implementations can be
-// compared on without also measuring the harnesses.
-//
-// The 1x1 rows are the exception to "im2col" in the section title: at karea 1
-// with unit stride and zero padding both sides run the GEMM straight off the
-// input tensor (the plan's `pointwise` flag; MLAS takes
-// MlasConvAlgorithmGemmDirect), so those rows compare the GEMM underneath. They
-// are the pw=yes rows, and note what the icn column reads there: IC itself, not
-// the 64 the 1x1 rung of get_ic_block() would give — with the col buffer gone
-// the whole group fits in a single K pass.
 
 NNOPS_BENCH(conv2d_f32_im2col_parity_1t) {
     sweep_conv<float>("f32 im2col parity", {
@@ -1438,21 +1293,6 @@ NNOPS_BENCH(conv2d_f32_im2col_parity_1t) {
     }, {1}, /*target_ms=*/300.0);
 }
 
-// ============================================================
-// Classic classification backbones — full layer stacks
-// ============================================================
-//
-// The parity set above measures single layers at one thread. These walk the
-// whole stack of the three backbones people actually profile, one row per
-// distinct layer shape in execution order (N = 1, the training/inference batch
-// every published number uses). Rows that repeat inside a stage appear twice
-// only in VGG, where the depth of the stage is the point: block3 has three
-// 256-channel convs, blocks 4 and 5 have three each in VGG-16.
-//
-// Layer shapes follow torchvision's resnet50/resnet18 and vgg16 weight shapes;
-// stride-2 is on the first 1x1 of every ResNet stage (the bottleneck
-// downsample), as in the reference implementation.
-
 NNOPS_BENCH(conv2d_f32_resnet50_stack) {
     sweep_conv<float>("f32 resnet50", {
         {1,    3, 224,   64, 7, /*S=*/2},                      // conv1
@@ -1472,13 +1312,11 @@ NNOPS_BENCH(conv2d_f32_resnet50_stack) {
 }
 
 NNOPS_BENCH(conv2d_f32_odd_plane_tasks) {
-    // The planes whose oh-block count is odd, which is where the filter-axis
-    // chunk rule is observable. Rounding the task count up to fill the pool
-    // overshoots on these: a 9-block plane at 20 threads is 27 tasks with the
-    // ceiling (a second wave of 7 that the barrier waits on) against 18 with
-    // the nearest whole number (one wave), and that reads 152 vs 226 GFLOPS.
-    // The 11- and 13-block rows are the other side: the split's gate (idle
-    // pool) leaves them on the plane axis alone at every thread count here.
+    // Odd oh-block counts are where the filter-axis chunk rule is observable:
+    // rounding up to fill the pool overshoots, and a 9-block plane at 20 threads
+    // reads 152 GFLOPS with the ceiling (27 tasks, a second wave of 7) against 226
+    // with the nearest whole number (18, one wave). The 11- and 13-block rows are
+    // the other side: an idle-pool gate leaves them on the plane axis alone.
     sweep_conv<float>("f32 odd plane", {
         {1, 64, 17, 64, 3},   // 17 rows / oh_block 2 -> 9 blocks
         {1, 64, 21, 64, 3},   // 11 blocks
@@ -1520,16 +1358,6 @@ NNOPS_BENCH(conv2d_f32_vgg16_stack) {
 // ============================================================
 // Wide frames — ResNet / VGG at 1280 x 720 and 1280 x 960
 // ============================================================
-//
-// Every stack above is a 224-square plane. A frame is not square: at 1280 wide
-// the N side of the GEMM spans many nr_max panels on its own, and an oh-block
-// of 4 rows is a far smaller share of the plane, so the multi-block and
-// multi-chunk walk is much deeper than on any 224 row. These tables are the
-// front stages of each model at that frame size — the layers whose plane is
-// large enough for the width to show. Deeper stages sit at 1/8, 1/16 and 1/32
-// of the frame and are the same shapes the 224 stacks already cover. Input and
-// output tensors here are up to ~236 MB per side (1x64x720x1280 f32), so this
-// is the one table that measures the memory system as much as the kernel.
 
 NNOPS_BENCH(conv2d_f32_720p_stack) {
     sweep_conv<float>("f32 1280x720", {
@@ -1593,12 +1421,7 @@ NNOPS_BENCH(conv2d_f16_vgg16_stack) {
     }, sweep_threads(), 250.0);
 }
 
-// ============================================================
-// Quantized Conv2D — s8 weight × u8/s8/f32/f16 activation → fp output
-// ============================================================
-
 NNOPS_BENCH(conv2d_i8_u8_3x3) {
-    // Pre-quantized activation — the deployment shape: im2col is a byte copy.
     bench_conv2d_i8_case({"i8 u8-act 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                           1, 64, 56, 56, 64, 3, 3,
                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1606,7 +1429,6 @@ NNOPS_BENCH(conv2d_i8_u8_3x3) {
 }
 
 NNOPS_BENCH(conv2d_i8_f32act_3x3) {
-    // Same geometry, fp activation: quantized inside the im2col gather.
     bench_conv2d_i8_case({"i8 f32-act 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                           1, 64, 56, 56, 64, 3, 3,
                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1615,7 +1437,6 @@ NNOPS_BENCH(conv2d_i8_f32act_3x3) {
 }
 
 NNOPS_BENCH(conv2d_i8_pointwise_1x1) {
-    // 1x1 with a pre-quantized activation takes the pointwise route (no col).
     bench_conv2d_i8_case({"i8 u8-act pointwise 1x256x28x28 -> 256 x 1x1 +bias",
                           1, 256, 28, 28, 256, 1, 1,
                           /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0,
@@ -1630,7 +1451,6 @@ NNOPS_BENCH(conv2d_i8_mid_3x3) {
 }
 
 NNOPS_BENCH(conv2d_i8_groups4) {
-    // Grouped: K per group is IC/G·karea, so the ic-block count collapses.
     bench_conv2d_i8_case({"i8 u8-act grouped 1x128x56x56 -> 128 x 3x3 g4 +bias",
                           1, 128, 56, 56, 128, 3, 3,
                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1638,7 +1458,6 @@ NNOPS_BENCH(conv2d_i8_groups4) {
 }
 
 NNOPS_BENCH(conv2d_i8_f16_act_out) {
-    // f16 in, f16 out: the quantize-in-gather path with an f16 epilogue.
     bench_conv2d_i8_case({"i8 f16-act/f16-out 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                           1, 64, 56, 56, 64, 3, 3,
                           /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1647,8 +1466,6 @@ NNOPS_BENCH(conv2d_i8_f16_act_out) {
 }
 
 NNOPS_BENCH(conv2d_i8_vs_fp_ab) {
-    // The headline number: how much of the fp wall time the quantized route
-    // recovers, same geometry, same useful work.
     bench_conv2d_i8_vs_fp({"int8 vs fp32 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                            1, 64, 56, 56, 64, 3, 3,
                            /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1656,16 +1473,7 @@ NNOPS_BENCH(conv2d_i8_vs_fp_ab) {
                           10, 5);
 }
 
-// ============================================================
-// Quantized Conv2D with an integer destination (s8 / u8)
-// ============================================================
-//
-// An integer output requantizes on the tile with the output's QuantParams and
-// takes an int32 bias; the fp destination dequantizes. Same MACs, same gather,
-// same epilogue position — the difference is which per-element pass runs last.
-
 NNOPS_BENCH(conv2d_i8_out_3x3_ab) {
-    // Pre-quantized u8 activation, the deployment shape.
     bench_conv2d_i8_out({"conv2d_i8_out 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                          1, 64, 56, 56, 64, 3, 3,
                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1674,9 +1482,6 @@ NNOPS_BENCH(conv2d_i8_out_3x3_ab) {
 }
 
 NNOPS_BENCH(conv2d_i8_out_fp_act_ab) {
-    // fp activation: the quantize plane runs in addition, so this row also
-    // carries the pointwise-route question (an integer destination changes
-    // nothing about which path the tile loop takes).
     bench_conv2d_i8_out({"conv2d_i8_out f32-act 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                          1, 64, 56, 56, 64, 3, 3,
                          /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1685,7 +1490,6 @@ NNOPS_BENCH(conv2d_i8_out_fp_act_ab) {
 }
 
 NNOPS_BENCH(conv2d_i8_out_pointwise_ab) {
-    // 1x1 pointwise: the epilogue is the largest share of the call here.
     bench_conv2d_i8_out({"conv2d_i8_out pointwise 1x256x28x28 -> 256 x 1x1 +bias",
                          1, 256, 28, 28, 256, 1, 1,
                          /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0,
@@ -1694,8 +1498,6 @@ NNOPS_BENCH(conv2d_i8_out_pointwise_ab) {
 }
 
 NNOPS_BENCH(conv2d_i8_act_zp_ab) {
-    // The activation zero point the packer does not already remove: the fold
-    // that keeps it off the per-element path, on both destinations.
     bench_conv2d_i8_act_zp({"conv2d_i8 act-zp 1x64x56x56 -> 64 x 3x3 s1 p1 +bias",
                             1, 64, 56, 56, 64, 3, 3,
                             /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
@@ -1709,9 +1511,6 @@ NNOPS_BENCH(conv2d_i8_act_zp_ab) {
 }
 
 NNOPS_BENCH(conv2d_i8_fp_act_overhead_ab) {
-    // The price of quantizing on the fly: identical MACs, a conversion per
-    // gathered element. Pointwise is where it should hurt most — the 1x1 case
-    // turns im2col into a pure quantizing copy.
     const int iters = 10, rounds = 5;
     const std::vector<int> threads = conv_bench_threads();
 
@@ -1736,8 +1535,8 @@ NNOPS_BENCH(conv2d_i8_fp_act_overhead_ab) {
                /*DH=*/1, /*DW=*/1, /*groups=*/1, /*bias=*/true});
 }
 
-/// The layer ladder the comparison sweeps walk: a ResNet-ish stack plus a
-/// grouped and a batched case, every one with bias.
+/// The layer ladder the comparison sweeps walk: a ResNet-ish stack plus grouped
+/// and batched cases, all with bias.
 const std::vector<Conv2DCase>& conv_sweep_shapes() {
     static const std::vector<Conv2DCase> shapes = {
         {"1x3x224x224  -> 64  7x7 s2 p3",  1,   3, 224, 224,  64, 7, 7,
@@ -1763,11 +1562,8 @@ const std::vector<Conv2DCase>& conv_sweep_shapes() {
 }
 
 NNOPS_BENCH(conv2d_i8_vs_fp_sweep) {
-    // The two routes side by side over one network's layer ladder. Both columns
-    // count the same 2·N·OC·OH·OW·(IC/G)·KH·KW MACs, so GFLOPS and GOPS are
-    // directly comparable, and the last column is B's wall time over A's.
-    // Every row is an interleaved A/B with a null control, so a row that lands
-    // inside the noise floor says so instead of reporting drift as a win.
+    // Both columns count the same MACs, so GFLOPS and GOPS are comparable; the
+    // last column is B's wall time over A's.
     const std::vector<Conv2DCase>& shapes = conv_sweep_shapes();
 
     const int iters = 10, rounds = 3;
@@ -1793,24 +1589,17 @@ NNOPS_BENCH(conv2d_i8_vs_fp_sweep) {
                         r.b_ms, i8.work / r.b_ms / 1e6,
                         r.b_ms / r.a_ms, r.null_pct, real ? "" : " (noise)");
         }
-        // Sum of the per-layer times: the speedup a straight fp→int8 swap of the
-        // whole stack would deliver, unweighted by how often each layer runs.
+        // Summed per-layer times: an unweighted whole-stack swap speedup.
         std::printf("    %-31s %7.3f %8s | %7.3f %8s | %5.2fx |\n",
                     "sum of the layers", tot_a, "", tot_b, "", tot_b / tot_a);
     }
 }
 
 NNOPS_BENCH(conv2d_i8_fpact_vs_fp_sweep) {
-    // In-kernel quantization, priced against fp32: the same fp32 activation goes
-    // through the int8 route, which quantizes it into a byte plane up front.
-    // The fp32 column is the alternative, so `f32act/fp32` is the answer to "I
-    // cannot pre-quantize my tensors — is this route still worth it". The `u8`
-    // column is what pre-quantizing would add on top; `f32/u8` is therefore the
-    // price of quantizing on the fly.
-    //
-    // Two interleaved pairs per row (fp32 vs f32act, u8 vs f32act) rather than
-    // one three-way, so each ratio is measured against a baseline carrying the
-    // same drift.
+    // f32act/fp32 answers "cannot pre-quantize — is this route worth it"; the u8
+    // column is what pre-quantizing adds on top, so f32act/u8 is the price of
+    // quantizing on the fly. Two interleaved pairs per row, not one three-way, so
+    // each ratio carries the same drift.
     const std::vector<Conv2DCase>& shapes = conv_sweep_shapes();
 
     const int iters = 10, rounds = 3;

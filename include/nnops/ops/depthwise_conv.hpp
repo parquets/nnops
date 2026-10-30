@@ -1,20 +1,20 @@
 #pragma once
 /// @file depthwise_conv.hpp
-/// @brief DepthwiseConv operator — depthwise separable 2D/3D convolution, on
-///        either a planar (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
+/// @brief DepthwiseConv operator — per-channel 2D/3D convolution, on a planar
+///        (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
 ///
-/// Depthwise convolution applies a separate filter to each input channel independently.
-/// There is no cross-channel mixing. This is the first step of a depthwise-separable
-/// convolution (the second step being a 1x1 pointwise conv).
+/// One filter per input channel and no cross-channel mixing — the first half of
+/// a depthwise-separable convolution. The output has the input's channel count
+/// and layout; the optional bias is [C].
 ///
-/// Spatial rank is auto-detected from input tensor rank:
-///   2D (rank 4): Input [N, C, IH, IW], Weight [C, 1, KH, KW]
-///   3D (rank 5): Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW]
-/// Output channels equal input channels. Optional bias: [C].
+/// The spatial rank comes from the input rank: rank 4 is 2D
+/// (Input [N, C, IH, IW], Weight [C, 1, KH, KW]), rank 5 is 3D
+/// (Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW]).
 ///
-/// Both routes read the raw filter: a planar input [C, 1, (KD,) KH, KW] as it
-/// is, a channel-last one the HWCM [KH][KW][C] form. Planar has f32/f16 kernels
-/// only; the channel lane also covers the quantized s8/u8 pairs.
+/// Both routes read the raw filter: a planar input the [C, 1, (KD,) KH, KW]
+/// form as it is, a channel-last one the HWCM [KH][KW][C] form. The planar
+/// route has f32/f16 kernels only; the channel lane also covers the quantized
+/// s8/u8 pairs (PerTensor activation, PerChannel weight).
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -28,46 +28,27 @@
 
 namespace nnops {
 
-/// Attributes describing a depthwise convolution (2D or 3D).
-///
-/// All spatial attribute arrays have size 3: [KD, KH, KW].
-/// For 2D input, KD/SD/DD/PD are ignored.
+/// The spatial arrays are size 3, [KD, KH, KW]; for a 2D input KD/SD/DD/PD are
+/// ignored.
 struct DepthwiseConvAttributes {
-    /// Kernel size along depth, height, and width.
     std::array<int64_t, 3> kernel_size = {1, 1, 1};
 
-    /// Stride along depth, height, and width.
     std::array<int64_t, 3> stride = {1, 1, 1};
 
-    /// Dilation along depth, height, and width.
     std::array<int64_t, 3> dilation = {1, 1, 1};
 
-    /// Symmetric zero-padding along depth, height, and width.
     std::array<int64_t, 3> padding = {0, 0, 0};
 
-    /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
 
-    /// If true, add result to existing output buffer instead of overwriting.
-    /// Enables residual connections without a separate add kernel:
-    ///   output += DepthwiseConv(input)  rather than  output = DepthwiseConv(input)
+    /// Accumulate into the existing output instead of overwriting (residual).
     bool add_to = false;
 
-    /// Return the spatial rank (2 or 3) given the input tensor rank.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
         return input_rank - 2;  // 4→2, 5→3
     }
 };
 
-/// DepthwiseConv operator (class-based API).
-///
-/// Each input channel is convolved with its own independent filter, with no
-/// cross-channel mixing; the input's layout (planar or channel-last) is the
-/// output's.
-///
-/// 2D: Input [N, C, IH, IW], Weight [C, 1, KH, KW], Output [N, C, OH, OW].
-/// 3D: Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW], Output [N, C, OD, OH, OW].
-/// Optional bias: [C].
 class DepthwiseConv : public OpBase {
 public:
     static std::unique_ptr<DepthwiseConv> create(
@@ -97,7 +78,7 @@ public:
 
     const DepthwiseConvAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in depthwise_conv.cpp (Pimpl pattern)
+    struct Impl;
     ~DepthwiseConv();
 
 private:

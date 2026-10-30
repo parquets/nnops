@@ -1,6 +1,14 @@
 /// @file test_helpers.hpp
 /// @brief MSVC-compatible helpers for constructing TensorViews from TensorDescs
 /// and invoking operator APIs with explicit C arrays (MSVC lacks init-list → span).
+///
+/// kF16AccumTol is arch-specific because the f16 GEMM micro-kernels accumulate
+/// in different precisions: x86_64 widens to fp32 (F16C), adds and narrows back,
+/// so the error is ~fp32, while aarch64 keeps native f16 accumulators
+/// (vfmaq_laneq_f16) and the error grows with K to ~0.09 at K=256 (≈3-4 f16 ulp).
+/// The x86 value would be far too tight on aarch64 past a few dozen K. Shared by
+/// the f16 GEMM-family tests (matmul, conv2d, attention), which all compare an f16
+/// op against the f32 reference computed on the same input data.
 #pragma once
 
 #include "nnops/core/tensor_view.hpp"
@@ -27,15 +35,6 @@ inline TensorView make_packed(const TensorDesc& desc, void* data, int64_t alignm
 // ============================================================
 // f16 accumulation tolerance
 // ============================================================
-//
-// The f16 GEMM micro-kernels accumulate in different precisions per arch:
-//   - x86_64:  fp32 accumulators (F16C widen → FMA → narrow), error ~fp32.
-//   - aarch64: native fp16 accumulators (vfmaq_laneq_f16), so the error grows
-//              with K and reaches ~0.09 for K=256 (≈3-4 fp16 ulp of the result).
-// The tolerance is therefore arch-specific; the x86 value would be far too
-// tight on aarch64 for any K beyond a few dozen. Shared by the f16 GEMM-family
-// tests (matmul, conv2d, attention), which all compare an f16 op against the
-// f32 reference computed on the same input data.
 #if defined(NNOPS_ARCH_AARCH64)
 inline constexpr float kF16AccumTol = 2e-1f;
 #else
@@ -46,7 +45,6 @@ inline constexpr float kF16AccumTol = 5e-2f;
 // f16 test helpers
 // ============================================================
 
-/// Convert f32 vector to f16 (half) vector.
 inline std::vector<nnops::backend::cpu::half> f32_to_f16(const std::vector<float>& src) {
     std::vector<nnops::backend::cpu::half> dst(src.size());
     for (size_t i = 0; i < src.size(); ++i) {
@@ -55,7 +53,6 @@ inline std::vector<nnops::backend::cpu::half> f32_to_f16(const std::vector<float
     return dst;
 }
 
-/// Convert f16 (half) vector to f32 vector.
 inline std::vector<float> f16_to_f32(const std::vector<nnops::backend::cpu::half>& src) {
     std::vector<float> dst(src.size());
     for (size_t i = 0; i < src.size(); ++i) {
@@ -64,13 +61,12 @@ inline std::vector<float> f16_to_f32(const std::vector<nnops::backend::cpu::half
     return dst;
 }
 
-/// Create a random f16 tensor. Returns (f16_buffer, TensorView) pair.
+/// Returns (buffer, view); the buffer owns the data.
 inline std::pair<std::vector<nnops::backend::cpu::half>, TensorView>
 make_random_f16_tensor(std::span<const int64_t> shape,
                         float min = -1.0f, float max = 1.0f,
                         uint64_t seed = 12345)
 {
-    // Generate f32 random data first, then convert
     auto [f32_buf, f32_view] = make_random_tensor(shape, min, max, seed);
     auto f16_buf = f32_to_f16(f32_buf);
     TensorView view(shape, DataType::f16, f16_buf.data(), f32_view.layout());

@@ -1,5 +1,13 @@
 /// @file linear.cpp
-/// @brief Linear operator dispatch.
+/// @brief Linear operator dispatch — descriptor checks, the quantized output
+///        dtype rule, and the packed-weight prepack.
+///
+/// Linear is MatMul with a transposed RHS: the weight is [N, K] and the product is
+/// X × Wᵀ, so prepackWeights() packs MatMul's transposed RHS over the whole K at
+/// load time. For an integer GEMM (s8/u8 A against s8 B) the output dtype follows
+/// output_dtype when it names a known type — f32/f16 dequantize, s32/s8/u8 stay
+/// integral — defaulting to f32; the fp path keeps the input dtype the shape
+/// helper already set.
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
@@ -22,9 +30,6 @@ std::vector<TensorDesc> Linear::getOutputTensorDesc(
 {
     auto out = linear_output_shape(inputs);
 
-    // The quantized path's output follows output_dtype: f32/f16 dequantizes,
-    // s32/s8/u8 keeps the result integral; the fp path follows the input dtype
-    // (set by the shape helper already).
     if (is_int8_matmul(inputs[0].dtype, inputs[1].dtype)) {
         const DataType odt = attrs_.output_dtype;
         const bool known = odt == DataType::f16 || odt == DataType::f32 ||
@@ -64,19 +69,16 @@ void Linear::prepackWeights(std::span<const TensorView> inputs,
     const auto& weight = inputs[0];
     NNOPS_ASSERT(weight.rank() == 2);
 
-    // The weight is [N, K] and the product is X × Wᵀ, so this is MatMul's
-    // transposed RHS — the blob is that matrix's panels, packed over the whole
-    // K at load time (see MatMulPackedB).
     const TensorDesc d = backend::cpu::matmul_packed_b_desc(weight.desc(),
                                                             /*transpose_b=*/true);
     std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
     const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
 
     if (outputs[0].is_empty()) {
-        // ---- Query: [N, ⌈elems / N⌉], with the row length as the pitch (a
-        // packed RHS is not channel-packed, so the default alignment would not
-        // describe it). No packed form (a quantized weight) is an empty answer
-        // rather than a failure: a graph engine asks unconditionally.
+        // Query: [N, ⌈elems / N⌉] pitched at the row length — not channel-packed,
+        // so the default alignment would not describe it. A weight with no packed
+        // form answers empty rather than failing, since a graph engine asks
+        // unconditionally.
         if (d.rank <= 0) { return; }
         outputs[0] = TensorView(shape, d.dtype, nullptr, d.row_stride_elems * esz,
                                 d.layout, weight.quant_params());

@@ -1,22 +1,19 @@
-/// @file vulkan_common.hpp
-/// @brief Common utilities for Vulkan compute kernels.
-///
-/// Provides:
-///   - VulkanPipelineCache: lazy, thread-safe pipeline creation per VkDevice
-///   - VulkanDescriptorSet: one-shot descriptor set allocation and binding
-///   - Embedded SPIR-V shader data (generated at build time from .comp files)
-///   - vk_check helper macro
-///
-/// Design:
-///   - Pipelines are created once per (device, op_type, specialization) triple
-///     and cached indefinitely (destroyed only when the cache is explicitly cleared).
-///   - Descriptor sets are allocated per compute() call from a user-provided pool
-///     and freed after command recording (VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT).
-///   - Push constants carry runtime parameters (total element count).
-///   - The user provides: VkDevice, VkDescriptorPool, VkCommandBuffer, VkBuffer handles
-///     for each tensor via ComputeContext.
-
 #pragma once
+/// @file vulkan_common.hpp
+/// @brief Vulkan compute plumbing shared by the backend's operators.
+///
+/// A pipeline is cached for the process lifetime under (device, SPIR-V blob,
+/// specialization constants, binding count), since building one is expensive.
+/// Descriptor sets are one-shot: vulkan_record_dispatch allocates one
+/// per call from a caller-owned VkDescriptorPool, so ComputeContext requires
+/// that pool to carry VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT. Every
+/// binding is a whole storage buffer; the only runtime parameter is the element
+/// count, pushed as a ComputePushConstants. The caller supplies the device, pool,
+/// command buffer and per-tensor VkBuffers through ComputeContext.
+///
+/// The SPIR-V blobs are generated at build time: glslc compiles each .comp and
+/// spv_to_header.py emits a `<name>_spv.h` with `g_<name>_spv[]` and
+/// `g_<name>_spv_len`, which the operator .cpp files include.
 
 #include <vulkan/vulkan.h>
 
@@ -28,24 +25,12 @@
 
 namespace nnops::backend::vulkan {
 
-// ============================================================
-// Constants
-// ============================================================
-
 constexpr int kVulkanWorkgroupSize = 256;
-
-// ============================================================
-// ceil_div
-// ============================================================
 
 template <typename T, typename U>
 constexpr auto ceil_div(T a, U b) noexcept {
     return (a + b - 1) / b;
 }
-
-// ============================================================
-// Embedded SPIR-V shader data
-// ============================================================
 
 /// Holds pre-compiled SPIR-V binary for a compute shader.
 struct SpirvBlob {
@@ -53,24 +38,9 @@ struct SpirvBlob {
     size_t          size_bytes;
 };
 
-/// External declarations for embedded SPIR-V shaders.
-/// These are generated at build time by compiling .comp → .spv and
-/// converting to C arrays via CMake's file(READ ... HEX) mechanism.
-/// The arrays are declared in the operator .cpp files.
-///   - g_eltwise_f32_spv / g_eltwise_f32_spv_len
-///   - g_unary_f32_spv  / g_unary_f32_spv_len
-
-// ============================================================
-// Push constant struct for eltwise and unary kernels
-// ============================================================
-
 struct ComputePushConstants {
     int32_t total;  // total number of elements to process
 };
-
-// ============================================================
-// VkCheck helper macro
-// ============================================================
 
 inline void vk_check(VkResult res, const char* file, int line, const char* expr) {
     if (res != VK_SUCCESS) {
@@ -81,19 +51,11 @@ inline void vk_check(VkResult res, const char* file, int line, const char* expr)
 
 #define VK_CHECK(expr) nnops::backend::vulkan::vk_check(expr, __FILE__, __LINE__, #expr)
 
-// ============================================================
-// VulkanPipeline — all state needed to dispatch a compute shader
-// ============================================================
-
 struct VulkanPipeline {
     VkPipeline            pipeline = VK_NULL_HANDLE;
     VkPipelineLayout      layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
 };
-
-// ============================================================
-// Pipeline key — identifies a unique compute pipeline
-// ============================================================
 
 struct PipelineKey {
     VkDevice        device;
@@ -124,10 +86,6 @@ struct PipelineKeyHash {
     }
 };
 
-// ============================================================
-// VulkanPipelineCache — global, thread-safe pipeline cache
-// ============================================================
-
 class VulkanPipelineCache {
 public:
     static VulkanPipelineCache& instance() {
@@ -135,14 +93,12 @@ public:
         return cache;
     }
 
-    /// Get or create a compute pipeline.
-    /// Returns VK_NULL_HANDLE on failure.
+    /// Get or create a compute pipeline; VK_NULL_HANDLE on failure.
     VulkanPipeline get_or_create(const PipelineKey& key);
 
     /// Destroy all cached pipelines for a given device (call before vkDestroyDevice).
     void destroy_device_pipelines(VkDevice device);
 
-    /// Destroy everything.
     void clear();
 
 private:
@@ -157,21 +113,8 @@ private:
     std::unordered_map<PipelineKey, VulkanPipeline, PipelineKeyHash> cache_;
 };
 
-// ============================================================
-// Descriptor set helper — allocate, update, bind
-// ============================================================
-
-/// Allocate a descriptor set, update it with buffer handles, and bind it to
-/// the command buffer along with push constants.
-///
-/// @param cmd              VkCommandBuffer to record into.
-/// @param device           VkDevice handle.
-/// @param pool             VkDescriptorPool (must have FREE_DESCRIPTOR_SET_BIT).
-/// @param pipeline         The VulkanPipeline (layout + set_layout) to use.
-/// @param buffers          Array of VkBuffer handles for each binding.
-/// @param num_buffers      Number of buffer bindings.
-/// @param push_constants   Push constant data.
-/// @param pc_size          Size of push constant data in bytes.
+/// Allocate a descriptor set from @p pool, bind @p buffers with @p
+/// push_constants, and dispatch over @p total_elements.
 void vulkan_record_dispatch(
     VkCommandBuffer        cmd,
     VkDevice               device,

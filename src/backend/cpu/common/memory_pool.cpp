@@ -22,23 +22,18 @@ constexpr size_t kMinClass  = 64;                  // smallest pooled size
 constexpr size_t kMaxClass  = 16u * 1024u * 1024u; // 16 MiB cap
 constexpr int    kNumClasses = 19;                 // 64 B .. 16 MiB (powers of two)
 
-// Retention budget: total bytes allowed to sit in the central free lists. When
-// a free pushes the pool over this bound, the largest pooled blocks are
-// returned to the OS so the pool's footprint stays bounded. This is the knob
-// that trades reuse (fewer malloc/free calls) against held-but-idle memory: a
-// larger budget reuses more, a smaller budget returns scratch to the OS sooner.
+// Retention budget: bytes allowed in the central free lists; past it the largest
+// blocks go back to the OS, trading reuse for a bounded idle footprint.
 constexpr size_t kMaxPooledBytes = 64u * 1024u * 1024u;
 
-// Per-thread cache limit: the most payload a single thread may hold in its
-// thread-local slots before further freed blocks are pushed to the central
-// pool. One max-class block bounds worst-case retention across many threads.
+// Per-thread cap: further freed blocks go to the central pool. One max-class
+// block bounds worst-case retention across many threads.
 constexpr size_t kMaxTlsBytes = 16u * 1024u * 1024u;
 
 constexpr uint32_t kMagic = 0x4E4E4F50u;           // "NNOP" — block sanity tag
 
-// Header stored immediately before the 64-byte-aligned payload. alignas(64)
-// rounds sizeof up to 64, so `header + 1` lands the payload on a 64-byte
-// boundary (the base is already 64-aligned from the aligned operator new).
+// Header immediately before the 64-byte-aligned payload: alignas(64) rounds
+// sizeof up to 64, so `header + 1` is 64-aligned given the aligned operator new.
 struct alignas(kAlignment) PoolHeader {
     PoolHeader* next;    // central free-list link; nullptr while live / in a TLS slot
     size_t      size;    // payload bytes actually allocated (class size if pooled)
@@ -57,11 +52,10 @@ inline int class_index(size_t cls) noexcept {
     return static_cast<int>(std::countr_zero(cls) - std::countr_zero(kMinClass));
 }
 
-// A per-thread set of recycled blocks: one slot per size class. Operators
-// allocate one scratch buffer per call and free it on return, so a thread that
-// repeatedly hits the same size reuses its own slot with no lock and no
-// central-pool traffic. Slots are atomics so release_all() can drain another
-// thread's cache safely: exchange() gives each block to exactly one taker.
+// One recycled block per size class per thread: the common allocate-one-scratch,
+// free-on-return pattern reuses its own slot with no lock. Slots are atomic so
+// release_all() can drain another thread's cache safely: exchange() gives each
+// block to exactly one taker.
 struct ThreadCache {
     std::array<std::atomic<PoolHeader*>, kNumClasses> free;
     std::atomic<size_t> bytes{0};    // payload bytes cached here (for stats)
@@ -75,9 +69,8 @@ struct ThreadCache {
 /// Points at this thread's cache once created; lives for the whole thread.
 thread_local ThreadCache* t_cache = nullptr;
 
-/// On thread exit, hand this thread's still-cached blocks back to the OS. The
-/// cache node itself stays registered (owned by the pool) so other threads are
-/// never left with a dangling pointer; it simply becomes empty.
+/// On thread exit, hand this thread's cached blocks back to the OS. The node
+/// stays registered so no thread is left with a dangling pointer; it empties.
 struct TlsCacheReaper {
     ~TlsCacheReaper() {
         if (t_cache == nullptr) { return; }
@@ -114,12 +107,10 @@ struct MemoryPool::Impl {
 MemoryPool::MemoryPool() : impl_(new Impl) {}
 
 MemoryPool::~MemoryPool() {
-    // Process exit: no concurrent operators remain; drain pooled memory back to
-    // the OS. The ThreadCache registry nodes are intentionally not deleted: each
-    // was already drained by its thread's reaper, and freeing them here could
-    // race a reaper that runs after this destructor (thread-local vs. static
-    // destruction order is not guaranteed). They are ~200 B apiece, bounded by
-    // the peak thread count, and reclaimed by the OS at exit.
+    // Process exit: no concurrent operators remain, so drain pooled memory. The
+    // ThreadCache registry nodes are deliberately not deleted: their reapers may
+    // run after this destructor (thread-local vs. static destruction order is not
+    // guaranteed), they are ~200 B each, and the OS reclaims them at exit.
     release_all();
     delete impl_;
     impl_ = nullptr;
@@ -133,8 +124,7 @@ MemoryPool& MemoryPool::instance() {
 void* MemoryPool::allocate(size_t size) {
     impl_->allocations_.fetch_add(1, std::memory_order_relaxed);
 
-    // Requests above the cap bypass the pool entirely (direct aligned alloc,
-    // never recycled). Assumed not to happen for scratch, but kept as a guard.
+    // Above the cap: bypass the pool, direct aligned alloc, never recycled.
     if (size > kMaxClass) {
         PoolHeader* h = static_cast<PoolHeader*>(
             ::operator new(sizeof(PoolHeader) + size, std::align_val_t{kAlignment}));
@@ -214,10 +204,9 @@ void MemoryPool::deallocate(void* ptr) noexcept {
 
         h->next = nullptr;
 
-        // Cache in this thread's slot iff it is empty AND the thread is under
-        // its local budget; otherwise the block goes to the central free list
-        // (and may be trimmed there). The CAS makes the "empty" check atomic so
-        // a concurrent release_all() can never be overwritten by a lost block.
+        // Cache in this thread's slot iff empty and under the local budget;
+        // otherwise push to the central list (which may trim). The CAS makes the
+        // emptiness test atomic so a racing release_all() can't lose the block.
         PoolHeader* expected = nullptr;
         if (c->bytes.load(std::memory_order_relaxed) + size <= kMaxTlsBytes &&
             c->free[idx].compare_exchange_strong(expected, h,
@@ -231,8 +220,8 @@ void MemoryPool::deallocate(void* ptr) noexcept {
             impl_->central_pooled_bytes_ += size;
             ++impl_->central_pooled_blocks_;
 
-            // Bound the central footprint: return the largest surplus blocks to
-            // the OS, largest-first, so the small hot classes are kept intact.
+            // Bound the footprint: return surplus blocks largest-first, keeping
+            // the small hot classes intact.
             for (int i = kNumClasses - 1;
                  i >= 0 && impl_->central_pooled_bytes_ > kMaxPooledBytes; --i) {
                 const size_t cls = size_t{kMinClass} << i;
@@ -253,9 +242,9 @@ void MemoryPool::deallocate(void* ptr) noexcept {
 }
 
 void MemoryPool::release_all() {
-    // Drain every thread's cache first, then the central free lists. Assumes no
-    // concurrent allocate/deallocate while releasing (a force-release / teardown
-    // operation), so the two locks are taken one at a time, never nested.
+    // Drain every thread's cache, then the central lists. Assumes no concurrent
+    // allocate/deallocate (force-release / teardown), so the two locks are taken
+    // one at a time, never nested.
     {
         std::lock_guard<std::mutex> lock(impl_->registry_mutex);
         for (ThreadCache* c : impl_->thread_caches_) {

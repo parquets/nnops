@@ -2,17 +2,22 @@
 /// @file simd_access.hpp
 /// @brief Load/store policies shared by the spatial kernels (pooling, depthwise).
 ///
-/// Fp*    — the element type is the accumulator (f32 or f16).
-/// Quant* — s8/u8 activations dequantize to f32 on load, requantize on store.
-/// A kernel that takes these as template parameters needs no per-type copy.
+/// Fp* is fp (the element type is the accumulator); Quant* is s8/u8, dequantized
+/// to f32 on load and requantized on store, so a kernel templated on these needs
+/// no per-type copy.
 ///
-/// @c Full says whether the channel block is a whole vector. A channel-packed
-/// block always is (NCHWC8 pads C to a block boundary), but a channel-last
-/// plane's last block holds C % 8 channels, and an 8-wide load there would take
-/// in the neighbouring pixel's channels — in bounds, so no fault, but three
-/// lanes of garbage. The short form fills those lanes from a stack copy on
-/// load and writes element by element on store, and it is a separate
-/// instantiation, so the common path pays nothing: C % 8 == 0 never reaches it.
+/// @c Full says the channel block is a whole vector. A channel-last plane's last
+/// block holds C % 8 channels, and an 8-wide load there takes in the neighbouring
+/// pixel's channels — in bounds, so no fault, but the lanes are garbage. The short
+/// form fills those lanes from a zeroed stack copy on load and writes only the
+/// live bytes on store, and it is a separate instantiation, so the common path
+/// pays nothing: C % 8 == 0 never reaches it.
+///
+/// @c planar_load is the other lane layout — output width instead of channels:
+/// lane l reads input column iw0 + l*sw, and a lane outside the row takes @p fill,
+/// which must be the accumulate's identity so a padded tap contributes nothing.
+/// Unit and doubled stride take a plain or deinterleaving load; any other stride
+/// gathers scalar-wise.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_quant.hpp"
@@ -24,11 +29,11 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Full SIMD width for both fp vector types (v_f32x8 / v_f16x8).
+/// Lane width of v_f32x8 and v_f16x8.
 constexpr int64_t kChannelLanes = 8;
 
-/// Load up to @p lanes elements, zero-filling the rest — a channel vector whose
-/// block is short. Used for the bias and by the policies' short form.
+/// Load @p lanes elements, zero-filling the rest — a short channel block, and the
+/// bias vector.
 template <typename T>
 inline auto load_lanes(const T* p, int64_t lanes)
 {
@@ -46,8 +51,8 @@ struct FpSrc {
 
     const T* ptr_at(int64_t off) const { return in + off; }
     auto load_at(int64_t off) const { return load_ptr(in + off); }
-    /// Load through an address the caller already built — the spatial kernels
-    /// keep a per-tap row pointer so the width loop does no address arithmetic.
+    /// An address the caller built — the kernels keep a per-tap row pointer so
+    /// the width loop does no address arithmetic.
     auto load_ptr(const T* p) const {
         if constexpr (Full) {
             return v_load(p);
@@ -81,12 +86,7 @@ struct QuantSrc {
     v_f32x8 set1(float s) const { return v_set1_f32x8(s); }
 };
 
-/// Load one input row into a vector whose lanes are consecutive output
-/// positions — lane l reads input column iw0 + l*sw. Used by the planar
-/// (NCHW/NCDHW) spatial kernels, where the lane spans output width instead of
-/// channels, so an out-of-range column has to be filled with the accumulate's
-/// identity (@p fill) rather than skipped. Unit and doubled stride take a
-/// plain (or deinterleaving) load; any other stride gathers scalar-wise.
+/// One input row, lane l at input column iw0 + l*sw.
 template <typename T>
 inline auto planar_load(const T* row, int64_t iw0, int64_t sw, int64_t iw, T fill)
 {
@@ -103,10 +103,8 @@ inline auto planar_load(const T* row, int64_t iw0, int64_t sw, int64_t iw, T fil
     return v_load(tmp);
 }
 
-/// Store R rows below the current one — r == 0 is the current output row.
-/// @c pix is the element distance between two adjacent output positions: 8 for
-/// a channel-packed block (consecutive pixels of one block are a vector apart)
-/// and C for a channel-last plane (they are a whole pixel apart).
+/// Stores for R rows, r == 0 being the current output row; @c pix is the element
+/// distance between adjacent output positions (the channel count, channel-last).
 template <typename T, bool Full = true>
 struct FpDst {
     T* out;
@@ -145,9 +143,8 @@ struct QuantDst {
         if constexpr (Full) {
             requantize_store(p, v, scale, zero_pt, add_to);
         } else {
-            // Requantize into a staging vector and copy back the live bytes
-            // only: the dead lanes read and write nothing that survives, so
-            // the neighbouring pixel's channels are untouched.
+            // Stage the vector, then copy back the live bytes only: the dead
+            // lanes must not reach the neighbouring pixel's channels.
             OutT tmp[kChannelLanes] = {};
             if (add_to) {
                 std::memcpy(tmp, p, static_cast<size_t>(lanes) * sizeof(OutT));

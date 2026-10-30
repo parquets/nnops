@@ -1,14 +1,41 @@
-/// Unit tests for the quantized CPU Conv2D route:
-///   activation u8 / s8 / f16 / f32 (per-tensor QuantParams)
-///   × weight s8 (per-channel QuantParams)
-///   → f32 / f16 output.
+/// @file test_conv2d_int8.cpp
+/// @brief Bit-exactness tests for the quantized CPU Conv2D route.
 ///
-/// Every case is compared bit for bit against `conv2d_int8_ref`: the GEMM is
-/// integer, and both sides share the dequant expression, so agreement is exact
-/// (f16 outputs are compared by their bit patterns). The fp-activation cases use
-/// power-of-two activation scales, which makes `x · (1/scale)` exact — the
-/// reference's fma and the vector quant kernel's mul+add then agree bitwise as
-/// well.
+/// Route matrix: activation u8 / s8 / f16 / f32 (per-tensor QuantParams) ×
+/// weight s8 (per-channel QuantParams) → f32 / f16 / s8 / u8 output, across
+/// bias, every epilogue activation, groups, depthwise, stride/dilation, pitched
+/// input and the prepacked filter.
+///
+/// Every table-driven case is compared bit for bit against `conv2d_int8_ref`:
+/// the GEMM is integer, and both sides share the dequant expression, so
+/// agreement is exact (f16 outputs are compared by their bit patterns). The
+/// fp-activation cases use power-of-two activation scales, which makes
+/// `x · (1/scale)` exact — the reference's fma and the vector quant kernel's
+/// mul+add then agree bitwise as well.
+///
+/// Threading is part of the contract: the same case must give identical bits at
+/// 2/4/8 threads, since an oc-block's epilogue has to stay inside its own task.
+///
+/// An integer destination runs the epilogue activation on the int32 accumulator
+/// before the requant, and a per-channel compensation folds into the bias — the
+/// asymmetric-activation / symmetric-weight case uses a non-zero zp_eff so that
+/// fold is not the identity and the reference still has to match exactly.
+///
+/// The fp-activation scratch layout is pinned by conv2d_i8_fp_act_large_layout
+/// at a size where a bad offset is not absorbed by the arena's tail: the
+/// quantized plane (plan.quant_size) is quantized once per call into the front
+/// of the arena and shared across slots, every per-slot region starts past it,
+/// and acc / pack_a are absolute offsets that already account for both, the
+/// plan's workspace_size being the layout's total. Addressing acc/pack_a from
+/// the plane rather than from the arena start once put that write past the end
+/// of the allocation — silent in Release, heap corruption in a debug CRT.
+///
+/// The prepacked filter must not change the answer. Here the prepack is not
+/// cosmetic: the A operand is a set of MMA panels, so a raw filter pays a pack
+/// per task on every call, and the blob also carries the per-channel sums the
+/// epilogue compensates with — which is what keeps the packed call cheaper than
+/// the raw one rather than merely equal. The panels hold the same bytes in the
+/// layout the MMA wanted, so raw and packed must be bit-identical.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -47,10 +74,6 @@ void conv2d_int8_ref(const Conv2DAttributes& attrs,
 
 namespace {
 
-// ============================================================
-// Quantization-parameter builders
-// ============================================================
-
 QuantParams per_tensor(float scale, int32_t zp) {
     QuantParams qp;
     qp.granularity = QuantGranularity::PerTensor;
@@ -81,10 +104,6 @@ inline size_t elem_size(DataType dt) {
     return static_cast<size_t>(data_type_size(dt));
 }
 
-// ============================================================
-// One quantized convolution case
-// ============================================================
-
 struct Case {
     std::array<int64_t, 4> ishape = {1, 1, 3, 3};  // N, IC, IH, IW
     std::array<int64_t, 4> wshape = {1, 1, 2, 2};  // OC, IC/G, KH, KW
@@ -105,8 +124,7 @@ struct Case {
     uint64_t seed = 1;
 };
 
-/// Owns every buffer a case needs, then the views over them. Views are built in
-/// the constructor body, after the buffers stop changing.
+/// Owns a case's buffers and the views over them — views last, so a resize dangles.
 struct Fixture {
     Case c;
     std::vector<uint8_t> act;         // activation storage
@@ -137,8 +155,7 @@ struct Fixture {
             for (int64_t i = 0; i < N * IC * IH; ++i) {
                 for (int64_t w = 0; w < pitch; ++w) {
                     const int64_t idx = i * pitch + w;
-                    // The pitch tail is a sentinel: a kernel reading past the
-                    // row would pull this into the result.
+                    // Pitch tail sentinel: reading past the row shows up here.
                     const float x = (w < IW) ? rng.next_float(-1.0f, 1.0f) : 1000.0f;
                     if (c.act == DataType::f32) {
                         reinterpret_cast<float*>(act.data())[idx] = x;
@@ -271,8 +288,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     r.desc = outs[0];
     r.buf.assign(outs[0].nbytes(), 0);
     seed_output(r.buf, outs[0].dtype, c.seed + 3);
-    // The output view carries the requant's QuantParams for an integer
-    // destination (`make_planar` would drop them).
+    // make_planar would drop the QuantParams an integer requant needs.
     auto out = make_out_view(outs[0], r.buf.data(), f.out_q);
 
     if (reference) {
@@ -283,10 +299,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     return r;
 }
 
-/// The same call with the filter prepacked through the op's two-step contract:
-/// query the descriptor, allocate it, pack into it — the buffer stays the
-/// caller's. On this route the blob is the A panels the MMA reads in place, and
-/// it also carries the per-channel sums the epilogue compensates with.
+/// The same call with the filter prepacked through the two-step contract.
 Result run_route_prepacked(const Case& c, const ComputeContext& ctx) {
     Fixture f(c);
     std::vector<TensorDesc> ins = f.descs();
@@ -368,7 +381,6 @@ void expect_matches_ref(const Case& c, const ComputeContext& ctx = {}, int idx =
     }
 }
 
-/// A spread of geometries / dtypes that the tiled route must handle.
 Case base_case() { return Case{}; }
 
 // ============================================================
@@ -376,15 +388,8 @@ Case base_case() { return Case{}; }
 // ============================================================
 
 NNOPS_TEST(conv2d_i8_hand_exact) {
-    // input  [1,1,3,3] = 1 2 3 / 4 5 6 / 7 8 9     s8, zp_x = 2,  s_x = 0.25
-    // weight [1,1,2,2] = 1 -1 / 2 0               s8, zp_w = 1,  s_w = 0.5
-    // output [1,1,2,2]
-    //
-    //   acc(0,0) = (1-1)(1-2) + (-1-1)(2-2) + (2-1)(4-2) + (0-1)(5-2)
-    //            = 0 + 0 + 2 - 3 = -1     → -1 · (0.5·0.25) = -0.125
-    //   acc(0,1) = 0 + (-2)(1) + 3 + (-4) = -3   → -0.375
-    //   acc(1,0) = 0 - 6 + 5 - 6 = -7            → -0.875
-    //   acc(1,1) = 0 - 8 + 6 - 7 = -9            → -1.125
+    // in [1,1,3,3] = 1..9, s8 zp_x 2 s_x 0.25; w [1,1,2,2] = {1,-1,2,0}, s8
+    // zp_w 1 s_w 0.5. acc = -1, -3, -7, -9 → × (s_w·s_x) = the four values below.
     const int64_t ishape[] = {1, 1, 3, 3};
     const int64_t wshape[] = {1, 1, 2, 2};
     const int64_t bshape[] = {1};
@@ -495,7 +500,7 @@ NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
         c.asym_w = true;
         cases.push_back(c);
     }
-    // ---- fp32 activation, quantized to s8 inside the im2col gather ----
+    // ---- fp32 activation, quantized into the compact plane, then gathered ----
     {
         Case c;
         c.ishape = {1, 4, 8, 8};
@@ -529,7 +534,7 @@ NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
         c.zp_x = 117;
         cases.push_back(c);
     }
-    // ---- f16 activation → f32 output ----
+    // ---- f16 activation with an f32 output_dtype: the output stays f16 ----
     {
         Case c;
         c.ishape = {1, 3, 6, 6};
@@ -550,7 +555,8 @@ NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
         c.zp_x = 128;
         cases.push_back(c);
     }
-    // ---- 1x1 with an fp activation: pointwise is disabled, im2col quantizes ----
+    // ---- 1x1 with an fp activation: quantized into the compact plane, so it
+    //      still reaches the pointwise route ----
     {
         Case c;
         c.ishape = {1, 16, 5, 5};
@@ -605,9 +611,7 @@ NNOPS_TEST(conv2d_i8_matches_ref_all_routes) {
         c.asym_w = true;
         cases.push_back(c);
     }
-    // ---- large: several oh-blocks, oc-blocks and ic-blocks ----
-    // OC 160 > kOcnBlock splits the oc side and IC 16 > 8 the ic side, so an
-    // oc-block's partial sums have to survive more than one ic-block. ----
+    // ---- large: 160 OC over two oc-blocks (128 + 32); bias and Relu6 ----
     {
         Case c;
         c.ishape = {1, 16, 20, 20};
@@ -711,7 +715,7 @@ NNOPS_TEST(conv2d_i8_epilogues_match_ref) {
 /// Minimal fixed-size pool exposing a CpuBackend (test_conv2d.cpp pattern).
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
+        // OpenMP when the build has it (common/cpu_pool.hpp), so the adapter
         // runs under the same bit-exact comparisons as the kernels.
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
@@ -747,9 +751,8 @@ struct SimplePool {
 };
 
 NNOPS_TEST(conv2d_i8_int_out_hand_exact) {
-    // The operands of conv2d_i8_hand_exact: the compensate-free accumulate is
-    // -1, -3, -7, -9 and s_w · s_x = 0.125, so the requant scale is
-    // 0.125 / s_out exactly and every expectation below is hand-computable.
+    // conv2d_i8_hand_exact's operands: acc = -1, -3, -7, -9, s_w·s_x = 0.125,
+    // so the requant scale is exactly 0.125 / s_out.
     const int64_t ishape[] = {1, 1, 3, 3};
     const int64_t wshape[] = {1, 1, 2, 2};
     const int64_t bshape[] = {1};
@@ -809,8 +812,7 @@ NNOPS_TEST(conv2d_i8_int_out_hand_exact) {
         for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_EQ(got[static_cast<size_t>(i)], want[i]); }
     }
     {
-        // The same values on a u8 destination: 256 saturates at 255, 128 fits,
-        // and the two negatives hit the 0 floor.
+        // Same values on u8: 256 saturates at 255, 128 fits, negatives floor at 0.
         const int32_t bias = 5;
         const auto got = run(DataType::u8, 1.0f / 512.0f, 0, &bias, EpilogueActivateType::None);
         const int32_t want[4] = {255, 128, 0, 0};
@@ -872,10 +874,8 @@ NNOPS_TEST(conv2d_i8_int_out_matches_ref) {
         c.zp_out = 3;
         cases.push_back(c);
     }
-    // ---- asymmetric activation, symmetric weight: the per-channel part of the
-    //      compensation folds into the bias (no column sweep, no per-element
-    //      compensation), so the result must still equal the reference exactly.
-    //      zp_eff = 173 − 128 = 45 here, so that fold is not the identity.
+    // ---- asymmetric activation, symmetric weight: the compensation folds into
+    //      the bias, and zp_eff = 173 − 128 = 45 keeps that fold non-identity ----
     {
         Case c;
         c.ishape = {1, 4, 9, 9};
@@ -966,7 +966,7 @@ NNOPS_TEST(conv2d_i8_int_out_matches_ref) {
         c.bias = true;
         cases.push_back(c);
     }
-    // ---- several oc-blocks / ic-blocks, saturation-heavy scale ----
+    // ---- 160 OC over two oc-blocks, saturation-heavy scale ----
     {
         Case c;
         c.ishape = {1, 16, 12, 12};
@@ -1021,7 +1021,7 @@ NNOPS_TEST(conv2d_i8_threaded_matches_serial) {
     const TCase cases[] = {
         // tall plane: the oh-chunk split kicks in (1 batch, 1 group)
         {{1, 8, 32, 32}, {16, 8, 3, 3},  3, 3, 1, 1, 1, 1, 1, DataType::u8,  false},
-        // fp activation: quantization happens per tile, per thread
+        // fp activation: quantized once into the shared plane, then gathered
         {{1, 8, 24, 24}, {16, 8, 3, 3},  3, 3, 1, 1, 1, 1, 1, DataType::f32, true},
         // batch + groups: tasks spread over every dimension
         {{2, 4, 20, 20}, {8, 2, 3, 3},   3, 3, 1, 1, 1, 1, 2, DataType::s8,  false},
@@ -1066,12 +1066,8 @@ NNOPS_TEST(conv2d_i8_threaded_matches_serial) {
     }
 }
 
-// The scratch layout of the fp-activation route, at a size where a bad offset
-// is not absorbed by the arena's tail: the quantized plane (plan.quant_size,
-// 200704 B here) sits in front of every per-slot region, and the int32
-// accumulator is the largest of them. Addressing acc/pack_a from the *plane*
-// rather than from the arena start put that write past the end of the
-// allocation — silent in Release, heap corruption in a debug CRT.
+// The fp-activation scratch layout at a size (200704 B of quantized plane)
+// where a bad offset is not absorbed by the arena's tail — see the header.
 NNOPS_TEST(conv2d_i8_fp_act_large_layout) {
     for (DataType target : {DataType::s8, DataType::u8}) {
         Case c;
@@ -1117,7 +1113,7 @@ NNOPS_TEST(conv2d_i8_output_desc) {
     NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f32);
 
     // An integer output comes from attributes.output_dtype whatever the
-    // activation storage is, fp included.
+    // activation storage is.
     c.out = DataType::s8;
     NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::s8);
     c.out = DataType::u8;
@@ -1137,7 +1133,7 @@ NNOPS_TEST(conv2d_i8_output_desc) {
     c.act = DataType::s8;
     NNOPS_EXPECT_EQ(desc_of(c).dtype, DataType::f16);
 
-    // The fp route is untouched by the new attributes (f32 in → f32 out).
+    // An f32 weight takes the fp route, which ignores output_dtype.
     Case fp;
     fp.ishape = {1, 4, 6, 6};
     fp.wshape = {8, 4, 3, 3};
@@ -1167,8 +1163,8 @@ NNOPS_TEST(conv2d_i8_plan) {
         return backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, o, 1, false);
     };
 
-    // Pointwise: a dense 1x1 activation reads the plane directly, so there is
-    // no im2col buffer and K spans the whole group.
+    // Pointwise: a dense 1x1 reads the plane directly — no im2col buffer, and K
+    // spans the whole group.
     Case pw;
     pw.ishape = {1, 32, 5, 5};
     pw.wshape = {16, 32, 1, 1};
@@ -1197,11 +1193,8 @@ NNOPS_TEST(conv2d_i8_plan) {
         NNOPS_EXPECT_EQ(p.col_size, 0);
         NNOPS_EXPECT_EQ(p.quant_size, 1 * 32 * 5 * 5);
         NNOPS_EXPECT_TRUE(p.workspace_size >= static_cast<size_t>(p.quant_size));
-        // The layout contract the kernel relies on: the plane sits at the arena's
-        // front, the slots start past it, and the acc / packed-A regions are
-        // absolute offsets that already account for both — and the plan's
-        // workspace_size *is* the layout's total, so the sizing and the kernel's
-        // pointers cannot drift.
+        // The layout contract: plane at the arena's front, slots past it, and
+        // acc / packed-A as absolute offsets that already account for both.
         const auto sc = backend::cpu::gemm_scratch_layout(p, 1);
         NNOPS_EXPECT_EQ(sc.off_acc, sc.head + p.num_slots * sc.slot_stride);
         NNOPS_EXPECT_TRUE(sc.head >= p.quant_size);
@@ -1209,8 +1202,8 @@ NNOPS_TEST(conv2d_i8_plan) {
                         static_cast<int64_t>(p.workspace_size));
     }
 
-    // A pitched input leaves pointwise (the im2col path walks the pitch) — but
-    // not when the activation is fp, whose materialized plane is compact.
+    // A pitched input leaves pointwise (im2col walks the pitch) — unless the
+    // activation is fp, whose materialized plane is compact.
     pw.act = DataType::s8;
     pw.in_pitch = 8;
     {
@@ -1226,8 +1219,7 @@ NNOPS_TEST(conv2d_i8_plan) {
     }
 
     // One fp plane for the whole call, however many slots and tasks there are:
-    // the same tensor batched or threaded costs the same scratch. A per-task
-    // plane would have to duplicate the oh-chunk halos and hold more.
+    // a per-task plane would have to duplicate the oh-chunk halos and hold more.
     Case batched;
     batched.ishape = {4, 16, 20, 20};
     batched.wshape = {32, 16, 3, 3};
@@ -1292,9 +1284,8 @@ NNOPS_TEST(conv2d_i8_plan) {
 // ============================================================
 
 NNOPS_TEST(conv2d_i8_vs_fp_path) {
-    // Quantize a random f32 conv's operands, run the int8 route on the stored
-    // integers and the f32 route on the exact dequantized values, and check the
-    // difference against the quantization-error bound
+    // int8 route on stored integers vs the f32 route on the exact dequantized
+    // values, against the quantization-error bound
     //     K · ( (s_w/2)·max|a| + (max|w| + s_w/2)·(s_x/2) ).
     const int64_t ishape[] = {1, 8, 12, 12};
     const int64_t wshape[] = {16, 8, 3, 3};
@@ -1385,14 +1376,6 @@ NNOPS_TEST(conv2d_i8_vs_fp_path) {
 // ============================================================
 // The prepacked filter — Conv2D::prepackWeights on the planar int8 route
 // ============================================================
-//
-// Here the prepack is not cosmetic: the A operand is a set of MMA panels, so a
-// raw filter pays a pack per task on every call. The blob also carries the
-// per-channel sums the epilogue compensates with, which is what keeps the
-// packed call cheaper than the raw one rather than merely equal.
-//
-// What it must not do is change the answer: the panels hold the same bytes in
-// the layout the MMA wanted, so both routes have to be bit-identical.
 
 NNOPS_TEST(conv2d_i8_prepacked_filter) {
     std::vector<Case> cases;
@@ -1414,7 +1397,8 @@ NNOPS_TEST(conv2d_i8_prepacked_filter) {
     // groups 4: the per-group panel sets and the sums table both have to move
     { Case c; c.ishape = {1, 8, 8, 8}; c.wshape = {16, 2, 3, 3}; c.kh = c.kw = 3;
       c.groups = 4; c.act = DataType::u8; c.zp_x = 120; add(c); }
-    // several oc blocks (160 = 128 + 32) with an ic tail (40 = 2 · 16 + 8)
+    // several oc blocks (160 = 128 + 32) with an ic tail (40 = 2 · 16 + 8) —
+    // the partial sums span three ic blocks
     { Case c; c.ishape = {1, 40, 12, 12}; c.wshape = {160, 40, 3, 3};
       c.kh = c.kw = 3; c.act = DataType::u8; c.zp_x = 128; c.asym_w = true;
       c.bias = true; add(c); }

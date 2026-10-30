@@ -16,14 +16,9 @@
 
 namespace nnops::backend::cpu {
 
-/// Decompose a row-major flat index into a strided element offset.
-///
-/// `flat` is a linear index over the dimensions [dim_lo, dim_hi] (inclusive),
-/// each `t.shape(d)` wide, row-major with `dim_hi` innermost. `skip_dim`
-/// (default -1 = none) excludes one dimension from the walk — used by
-/// axis-wise operators that flatten "all dims except `axis`".
-///
-/// Returns sum over d of coord(d) * t.stride_elems(d).
+/// Decompose a row-major flat index over [dim_lo, dim_hi] (dim_hi innermost)
+/// into a strided element offset; `skip_dim` (-1 = none) excludes one dimension,
+/// letting axis-wise operators flatten "all dims except `axis`".
 inline int64_t decompose_flat_offset(int64_t flat, const TensorView& t,
                                      int64_t dim_lo, int64_t dim_hi,
                                      int64_t skip_dim = -1)
@@ -41,9 +36,8 @@ inline int64_t decompose_flat_offset(int64_t flat, const TensorView& t,
     return off;
 }
 
-/// Build the offset table for `count` consecutive flat indices over
-/// [dim_lo, dim_hi] (see decompose_flat_offset). Used by the general
-/// (non-contiguous) paths to map inner flat positions to strided offsets once.
+/// Offset table for `count` consecutive flat indices over [dim_lo, dim_hi]
+/// (see decompose_flat_offset); the general non-contiguous paths build it once.
 inline std::vector<int64_t> build_offsets(const TensorView& t,
                                           int64_t dim_lo, int64_t dim_hi,
                                           int64_t count)

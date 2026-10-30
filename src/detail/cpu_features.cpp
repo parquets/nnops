@@ -1,8 +1,18 @@
 /// @file cpu_features.cpp
-/// @brief Runtime CPU feature detection implementation.
+/// @brief Runtime CPU feature, cache-size and hybrid-topology detection.
 ///
-/// x86: uses CPUID instruction (eax=1 for SSE/AVX, eax=7 for AVX2/AVX512).
-/// ARM: uses OS-provided APIs (getauxval on Linux, IsProcessorFeaturePresent on Windows).
+/// x86_64 reads CPUID directly: leaf 1 / leaf 7 for the ISA bits, with the AVX
+/// family gated on the OS-enabled XCR0 state, and leaf 4's deterministic-cache
+/// walk for the L1D and L2 figures the GEMM tile solver derives kc (L1) and
+/// mc/nc (L2) from. On AArch64 the ISA comes from getauxval (HWCAP/HWCAP2) or
+/// IsProcessorFeaturePresent, and the cache sizes from sysfs, sysctl or
+/// GetLogicalProcessorInformation.
+///
+/// Every detector leaves the caller's default in place when it finds nothing, so
+/// the header's 32 KiB L1D / 256 KiB L2 stand in on a platform that reports no
+/// geometry. detect_fast_cores() returns the fast-class core count on a hybrid
+/// part and 0 when the platform reports a single class, where an equal split is
+/// already even.
 
 #include "nnops/detail/simd/cpu_features.hpp"
 
@@ -18,8 +28,6 @@
 
 namespace {
 
-// Execute CPUID with eax=leaf, ecx=subleaf. Returns true if supported.
-// We check the OS has enabled the feature via xgetbv where required.
 bool cpuid_bit(unsigned int leaf, unsigned int subleaf, unsigned int reg, unsigned int bit) {
 #if defined(_MSC_VER)
     int cpu_info[4] = {0};
@@ -33,7 +41,6 @@ bool cpuid_bit(unsigned int leaf, unsigned int subleaf, unsigned int reg, unsign
 #endif
 }
 
-// Check that the OS has enabled AVX state via XCR0.
 bool os_avx_support() {
 #if defined(_MSC_VER)
     return (_xgetbv(0) & 0x6) == 0x6;  // bits 1 (SSE) and 2 (AVX) set
@@ -56,26 +63,11 @@ bool os_avx512_support() {
 #endif
 }
 
-// Walk CPUID leaf 4 ("deterministic cache parameters") and report the first
-// level-1 *data* cache and the first level-2 cache it describes. A member is
-// left untouched if nothing matches, so the caller's default survives.
-//
-// One walk fills both because they feed one decision: the tile solver sizes kc
-// from L1 (a k-block holds one A micro-panel plus two B micro-panels there) and
-// mc/nc from L2, and both numbers have to come from the same machine. Two
-// details a naive walk gets wrong:
-//
-//   - The level-1 entry has to be the *data* cache (type 1). Type 2 is the
-//     instruction cache, which is a different size on most parts (32 KiB
-//     against the data cache's 48 KiB here) and never holds a packed panel.
-//   - The walk must not stop at the first cache it can use. Level-2 typically
-//     follows level-1 in the enumeration — but "typically" is not a guarantee,
-//     and stopping early is what left this host's L1 at the default 32 KiB.
-//
-// Leaf 4 exists on Intel Nehalem+ and AMD Bulldozer+. Older parts report
-// cache_type 0 on the first subleaf and both outputs stay as they were, which
-// is not a loss here: the library's baseline already requires AVX2 (x86) or
-// NEON (ARM), and no CPU that old has either.
+// The level-1 entry must be the *data* cache (type 1): type 2 is the instruction
+// cache and never holds a packed panel. And the walk must not stop at the first
+// cache it can use — the enumeration is not guaranteed to be level-ordered.
+// Leaf 4 is absent before Nehalem/Bulldozer; cache_type 0 then ends the walk and
+// both outputs keep their defaults.
 inline void cpuid_cache_sizes(size_t& l1_data_bytes, size_t& l2_bytes) {
     for (int subleaf = 0; ; ++subleaf) {
         int info[4] = {0};
@@ -124,14 +116,10 @@ inline void cpuid_cache_sizes(size_t& l1_data_bytes, size_t& l2_bytes) {
 
 namespace {
 
-// Read one Linux sysfs cache size, e.g. "/sys/devices/system/cpu/cpu0/cache/
-// index1/size" holding "48K". Returns 0 if the file is absent or unparseable,
-// which leaves the caller's default in place.
-//
-// cpu0 is deliberate rather than a sum over CPUs: the tile solver models the
-// caches of the core it is running on, and on the parts this targets every core
-// has the same L1 and L2. `index1` is the data cache and `index2` the unified
-// one — the kernel numbers L1I as index0.
+// Read a Linux sysfs cache size file ("48K" etc.); 0 if absent or unparseable,
+// leaving the caller's default. cpu0 rather than a sum: every core this targets
+// has the same L1 and L2. index1 is the data cache, index2 the unified one
+// (index0 is L1I).
 size_t read_sysfs_cache_size(const char* path) {
     std::FILE* fp = std::fopen(path, "r");
     if (!fp) { return 0; }
@@ -173,12 +161,9 @@ size_t read_sysfs_cache_size(const char* path) {
 
 namespace {
 
-/// Cores in the fastest efficiency class, or 0 when the platform reports no
-/// classes at all. Windows publishes one entry per physical core with an
-/// `EfficiencyClass` (higher is faster); macOS exposes the performance cluster
-/// as `hw.perflevel0.physicalcpu`. A part that reports a single class — or none
-/// — answers 0: an equal share of the work is already even there, so nothing
-/// downstream should start steering.
+/// Fast-class core count, or 0 on a single class. Windows publishes one
+/// EfficiencyClass per core; macOS exposes the P cluster as
+/// hw.perflevel0.physicalcpu.
 int detect_fast_cores() {
 #if defined(_WIN32)
     DWORD len = 0;
@@ -216,8 +201,8 @@ int detect_fast_cores() {
         perf <= 0) {
         return 0;
     }
-    // A single-perflevel Mac answers perflevel0 with the whole CPU, which is not
-    // a fast class; only a machine with a second level has one.
+    // A single-perflevel Mac answers perflevel0 with the whole CPU, so only a
+    // machine with a second level has a fast class.
     int32_t cores = 0;
     len = sizeof(cores);
     if (sysctlbyname("hw.physicalcpu", &cores, &len, nullptr, 0) == 0 &&
@@ -264,8 +249,6 @@ void CpuFeatures::detect() {
         }
     }
 
-    // ---- L1 data and L2 sizes via CPUID leaf 4 (deterministic cache params) ----
-    // Both members keep their defaults if the walk finds nothing.
     cpuid_cache_sizes(l1_cache_size_, l2_cache_size_);
 
 #elif defined(NNOPS_ARCH_AARCH64)
@@ -279,7 +262,6 @@ void CpuFeatures::detect() {
     if (hwcap & HWCAP_ASIMDDP) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_DOT);
     }
-    // FP16 vector arithmetic
     #ifdef HWCAP_FPHP
     if (hwcap & HWCAP_FPHP) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_FP16);
@@ -287,18 +269,15 @@ void CpuFeatures::detect() {
     #endif
 
 #elif defined(_WIN32)
-    // ARM64 Windows: NEON (ASIMD) is always available.
-    // Dot-product: IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE),
-    // which is the value 43 in winnt.h. Spelled numerically so this compiles
+    // NEON (ASIMD) is always available. 43 is
+    // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE, spelled numerically so this compiles
     // against SDKs that predate the enumerator.
     if (IsProcessorFeaturePresent(43)) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_DOT);
     }
 #endif
 
-    // ---- L1 data cache size detection ----
-    // x86 reads this from CPUID leaf 4 above; on aarch64 it comes from the OS.
-    // Apple's is folded into the sysctl block below, which is already open.
+    // Apple's L1D is read in the sysctl block below.
 #if defined(__linux__)
     {
         // sysfs only: there is no getauxval(AT_L1D_CACHESIZE), and HWCAP does
@@ -309,10 +288,10 @@ void CpuFeatures::detect() {
     }
 #endif
 
-    // ---- L2 cache size detection ----
 #if defined(__linux__)
     {
-        // Try getauxval(AT_L2_CACHESIZE) first (available since Linux 6.6)
+        // getauxval(AT_L2_CACHESIZE) exists since Linux 6.6; the header may not
+        // define the macro yet.
         #ifndef AT_L2_CACHESIZE
         #define AT_L2_CACHESIZE 43
         #endif
@@ -320,7 +299,6 @@ void CpuFeatures::detect() {
         if (aux_l2 > 0) {
             l2_cache_size_ = static_cast<size_t>(aux_l2);
         } else {
-            // Fallback: read Linux sysfs for per-CPU L2 cache
             const size_t l2 = read_sysfs_cache_size(
                 "/sys/devices/system/cpu/cpu0/cache/index2/size");
             if (l2 > 0) { l2_cache_size_ = l2; }
@@ -328,10 +306,9 @@ void CpuFeatures::detect() {
     }
 #elif defined(_WIN32)
     {
-        // Windows ARM64: use GetLogicalProcessorInformation. Both levels in one
-        // pass, each taking the first entry that matches. The order of the cache
-        // entries is not documented to be by level, and returning at the first
-        // L2 — as this used to — can walk past the L1 data cache.
+        // One pass collects both levels, each taking the first matching entry:
+        // the cache entries are not documented to be ordered by level, so
+        // stopping at the first L2 can walk past the L1 data cache.
         SYSTEM_LOGICAL_PROCESSOR_INFORMATION buf[256];
         DWORD len = sizeof(buf);
         if (GetLogicalProcessorInformation(buf, &len)) {
@@ -353,7 +330,6 @@ void CpuFeatures::detect() {
     }
 #elif defined(__APPLE__)
     {
-        // macOS Apple Silicon: use sysctl
         int64_t l1_size = 0;
         size_t len = sizeof(l1_size);
         if (sysctlbyname("hw.l1dcachesize", &l1_size, &len, nullptr, 0) == 0 &&
@@ -370,9 +346,9 @@ void CpuFeatures::detect() {
     }
 #endif
 
-    // hw.l2cachesize is the *efficiency* cluster's L2 on a hybrid Mac. Ask for
-    // the performance cluster's explicitly when the OS exposes it; leaving the
-    // member 0 makes l2_shared_cache_size() fall back to l2_cache_size_.
+    // On a hybrid Mac hw.l2cachesize is the *efficiency* cluster's L2; ask for the
+    // performance cluster's explicitly when the OS exposes it. Leaving the member
+    // 0 makes l2_shared_cache_size() fall back to l2_cache_size_.
 #if defined(__APPLE__)
     {
         int64_t l2_perf = 0;

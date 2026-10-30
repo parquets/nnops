@@ -10,21 +10,18 @@
 ///   4       16    qs  4-bit quants: low nibble of byte j is value j,
 ///                     high nibble is value j + 16
 ///
-/// and value j is
+///   y[j] = d * q + m,  q in [0, 15]
 ///
-///   y[j] = d * ( low4(qs[j % 16], j < 16 ? low : high) ) + m
+/// which is byte-for-byte ggml's `block_q4_1` / `dequantize_row_q4_1`. The block
+/// is self-describing (d and m live in the data), so no QuantParams are involved.
 ///
-/// This is byte-for-byte ggml's `block_q4_1` / `dequantize_row_q4_1`: an
-/// affine four-bit decode, so q is in [0, 15]. The block is self-describing
-/// (d and m live in the data), so no QuantParams are involved.
-///
-/// `pack_q4` fuses the nibble unpacking with the dequantization and the
-/// f32 → f16 narrowing: each block is read once and the values are written
-/// straight to the output, with no intermediate quantized buffer. This is the
-/// portable scalar reference; the CPU backend's GEMM route uses the AVX2
-/// implementation in src/backend/cpu/x86_64/pack_q4_1.hpp and the NEON one in
-/// src/backend/cpu/aarch64/pack_q4_1.hpp, both of which decode each block once
-/// per row and pack the RHS panels straight from the block stream.
+/// `pack_q4` fuses the nibble unpacking, the dequantization and the f32 → f16
+/// narrowing: each block is read once into a 32-float stack buffer and the
+/// values are written straight to the output, with no intermediate quantized
+/// buffer. This is the portable scalar reference; the CPU backend's GEMM route
+/// uses `pack_q4_1_rhs` in src/backend/cpu/x86_64/pack_q4_1.hpp and the NEON
+/// one in src/backend/cpu/aarch64/pack_q4_1.hpp, which fuse the same decode into
+/// the RHS panel pack so a Q4_1 weight never passes through a dense buffer.
 ///
 /// The count need not be a multiple of 32: a trailing partial block is decoded
 /// only up to `count`, which lets a tensor whose innermost dimension is not
@@ -47,7 +44,6 @@ using backend::cpu::half_from_bits;
 using backend::cpu::half_to_float;
 
 /// One llama.cpp Q4_1 block: `d`, `m` and 16 nibble bytes.
-///
 /// Provided for callers that want to inspect a block; pack_q4() itself reads the
 /// bytes with memcpy so an unaligned source (a slice of a GGUF file, say) is
 /// fine.
@@ -72,8 +68,6 @@ inline void q4_1_unpack_block(const void* block, float* out) noexcept {
     const uint8_t* qs = p + 4;
 
     for (int j = 0; j < 16; ++j) {
-        // Byte j holds value j in its low nibble and value j + 16 in its high
-        // nibble, exactly as llama.cpp's dequantize_row_q4_1 reads it.
         const float lo = static_cast<float>(qs[j] & 0x0F);
         const float hi = static_cast<float>(qs[j] >> 4);
         out[j]      = d * lo + m;
@@ -81,16 +75,9 @@ inline void q4_1_unpack_block(const void* block, float* out) noexcept {
     }
 }
 
-/// Fused unpack + dequantize: decode @p count values from a stream of 20-byte
-/// Q4_1 blocks into a dense f32 or f16 array.
-///
-/// @param blocks  first block; blocks are tightly packed, 20 bytes apart.
-/// @param count   number of logical values to produce (may be 0). The source
-///                must hold ceil(count / 32) blocks.
-/// @param out     destination array of @p count values; T is float or half.
-///
-/// f16 output rounds once per element at the end. The arithmetic is done in
-/// f32, matching llama.cpp's dequantize path.
+/// Fused unpack + dequantize: decode `count` values from tightly packed 20-byte
+/// Q4_1 blocks into a dense f32 or f16 array. Arithmetic runs in f32, matching
+/// llama.cpp's dequantize path, and f16 output rounds once at the store.
 template <class T>
 void pack_q4(const void* blocks, int64_t count, T* out) noexcept {
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,

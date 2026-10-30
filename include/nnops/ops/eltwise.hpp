@@ -1,6 +1,11 @@
 #pragma once
 /// @file eltwise.hpp
 /// @brief Eltwise operator — element-wise binary operations on two tensors.
+///
+/// Both inputs and the output share a shape and a dtype. Quantized (s8/u8) in
+/// and out is a fused path: dequantize both sides, apply the op in f32,
+/// requantize. All three must be quantized — no float/int mixing — and share
+/// one PerTensor or PerToken granularity.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -12,7 +17,6 @@
 
 namespace nnops {
 
-/// Supported element-wise binary operations.
 enum class EltwiseType : uint8_t {
     Add,   ///< C = A + B
     Sub,   ///< C = A - B
@@ -23,23 +27,14 @@ enum class EltwiseType : uint8_t {
     Pow,   ///< C = A ^ B  (pow(A, B))
 };
 
-/// Attributes for the Eltwise operator.
 struct EltwiseAttributes {
     EltwiseType type = EltwiseType::Add;
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// Accumulate into the existing output instead of overwriting (residual);
+    /// rejected on the quantized path.
     bool add_to = false;
 };
 
-/// Eltwise operator (class-based API).
-///
-/// Element-wise binary operation on two tensors of the same shape and data type,
-/// chosen by EltwiseAttributes::type.
-///
-/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: both
-/// inputs are dequantized, the op is applied in f32, and the result is
-/// re-quantized (f32 → int). Both inputs and the output must be quantized. Only
-/// PerTensor / PerToken quantization granularity is supported.
 class Eltwise : public OpBase {
 public:
     static std::unique_ptr<Eltwise> create(const EltwiseAttributes& attrs = {},
@@ -67,7 +62,7 @@ public:
 
     const EltwiseAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in eltwise.cpp (Pimpl pattern)
+    struct Impl;
     ~Eltwise();
 
 private:

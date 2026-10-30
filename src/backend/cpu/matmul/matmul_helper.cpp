@@ -1,3 +1,27 @@
+/// @file matmul_helper.cpp
+/// @brief Arch-neutral pack/MMA dispatch between the tiled drivers (MatMul,
+/// Conv2D, attention) and the per-arch kernels under x86_64/ and aarch64/.
+///
+/// The per-arch pack/MMA fork lives here: the tables and TileTraits<> below are
+/// selected by NNOPS_ARCH_*, so no caller names an arch.
+///
+/// Invariants:
+///  - A decomposes into the arch's MR cascade (MR_F32 / MR_F16 / MR_I8),
+///    largest level first; a leftover runs at the next, smaller level.
+///  - B is uniform: ceil(nc/nr_max) nr_max-wide panels at one 64-byte-aligned
+///    stride. The MMA reads whole lanes, so callers pass the live width and
+///    each kernel's N-tail path drops the lanes past it.
+///  - Panels sit at the caller's `ldd`, never end to end.
+///
+/// Two RHS modes: a per-call pack whose stride comes from the k-block length,
+/// and a MatMulPackedB blob packed at the whole K. Those strides disagree, so
+/// the blob route hands the kernel one panel per call and steps panels itself.
+///
+/// tile_mma_direct's bias seeds the accumulator instead of reading C: `bias` is
+/// one value per output row, `col_bias` one per output column (channel-last
+/// Conv2D, where a row is a pixel). Either one builds the tile, so it belongs on
+/// the first k-block only.
+
 #include "matmul_helper.h"
 
 #include <array>
@@ -16,7 +40,7 @@ using namespace nnops::backend::cpu::aarch64;
 
 namespace nnops::backend::cpu {
 
-// The trailing live width lets one kernel serve a full panel and a partial one.
+// Trailing live width: one kernel serves a full panel and a tail.
 
 template <class T>
 using PackFn = void (*)(T* NNOPS_RESTRICT output, const T* NNOPS_RESTRICT input,
@@ -62,8 +86,6 @@ constexpr std::array<std::array<PackFn<half>, 3>, 2> pack_copy_f16_fn = {{
     {pack_copy_n16_f16, pack_copy_n8_f16, pack_copy_n1_f16},
 #endif
 }};
-
-// MMA rows follow MR_F32 / MR_F16 order; a remainder runs at the level above.
 
 template <class T> struct TileTraits;
 
@@ -115,8 +137,6 @@ inline void for_each_n_panel(int nc, int nr_max, Pack&& pack) {
     if (n < nc) { pack(nc - n); }
 }
 
-// Panels sit at the caller's aligned ldd stride, not end to end.
-
 template <class T>
 void tile_pack_lhs_impl(bool trans, int mc, int kc, T* dst, int ldd,
                         const T* src, int lds, float scale) {
@@ -147,8 +167,6 @@ void tile_pack_lhs(bool trans, int mc, int kc,
 // =========================================================================
 //  Uniform-width RHS panels
 // =========================================================================
-// The MMA reads nr_max B lanes per column, so B is ceil(nc/nr_max) uniform
-// panels at one stride; one nr_max-wide pack kernel pads each tail itself.
 
 template <class T>
 void tile_pack_rhs_impl(bool trans, int nc, int kc, T* dst, int ldd,
@@ -183,11 +201,8 @@ void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
     });
 }
 
-/// Same walk, A read raw through @p lda. `Seed` lets the accumulator start at a
-/// bias instead of zero, which is what removes a whole write+read of the output
-/// tile from Conv2D (the bias seed): 1 is the per-row vector, whose index *is*
-/// the output channel on the planar route; 2 is the per-column one, for the
-/// channel-last route, where the rows are pixels.
+/// Same walk, A read raw through @p lda. `Seed` picks the bias axis: 1 is a
+/// per-row vector indexed from @p m, 2 a per-column one used as given.
 template <class T, bool Zero, int Seed>
 void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                           const T* a, int lda, const T* b,
@@ -213,8 +228,7 @@ template <class T>
 void dispatch_mma_direct(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
                          const T* a, int lda, const T* b, float lo, float hi,
                          const T* bias, const T* col_bias) {
-    // Either bias implies the overwrite path: the tile is built from the bias,
-    // so there is nothing in C to accumulate onto.
+    // Either bias builds the tile, so there is nothing in C to accumulate onto.
     if (col_bias != nullptr) { tile_mma_direct_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, col_bias); }
     else if (bias != nullptr) { tile_mma_direct_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, bias); }
     else if (zero_mode)  { tile_mma_direct_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
@@ -232,11 +246,8 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 }
 
 // ---- Block-packed RHS (q4_1) --------------------------------------------
-// The panel layout matches tile_pack_rhs, so the MMA route knows no block
-// format: it reads the same uniform panels the stream decodes to.
+// The panel layout matches tile_pack_rhs; the MMA route never sees the blocks.
 
-// A Q4_1 block is 32 values; the scalar fallback below indexes them with
-// shifts, and the arch packers assume the same width when slicing rows.
 static_assert(q4_1_block_elems == 32,
               "the block RHS packers assume 32-value blocks");
 
@@ -260,19 +271,16 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 
 /// Portable fallback for arches without a vectorized block pack.
 ///
-/// The panel width must be the active arch's float RHS panel width, because the
-/// workspace stride (ldd_b) and the MMA kernels are sized from it — it is not
-/// the same on every arch (aarch64 f32 uses nr_f32[0] = 12, both x86 widths and
-/// the aarch64 f16 one are 16). The arch packers in x86_64/pack_q4_1.hpp and
-/// aarch64/pack_q4_1.hpp write this same layout, but decode each block once per
-/// row rather than once per element and panel.
+/// The width must be the arch's float RHS panel width — the workspace stride
+/// and the MMA are sized from it — and that is 12 for aarch64 f32, 16 elsewhere.
+/// The arch packers write this same layout, but decode a block once per row.
 template <class T>
 constexpr int block_panel_nr() noexcept {
     if constexpr (std::is_same_v<T, float>) { return NR_MAX_F32; }
     else { return NR_MAX_F16; }
 }
 
-/// Values per block, for the shift-based block indexing below.
+/// Values per block, for the indexing below; must equal q4_1_block_elems.
 constexpr int kBlockElems = 32;
 
 /// One block-packed format's row decoder: unpack(block_ptr, float out[]).
@@ -359,12 +367,8 @@ void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
 // =========================================================================
 //  Prepacked RHS — the same tile, one kernel call per panel
 // =========================================================================
-// The MMA derives its panel stride from the k-block length it is given; a
-// prepacked blob's stride comes from the whole K. So the caller's stride wins
-// and the kernel is handed one panel at a time. A panel is nr_max wide in the
-// blob even when it holds fewer live columns (the packer zero-fills the rest),
-// and the kernel's own tail path reads a whole panel, so a short panel needs no
-// special case.
+// The kernel's panel stride comes from the kc it is given, the blob's from the
+// whole K.
 
 template <class T, bool Zero>
 void tile_mma_pack_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
@@ -521,8 +525,8 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
     const int lds_i = static_cast<int>(lds);
     const int kc = static_cast<int>(K);
 
-    // One panel per task: panels are independent, and each one-pack is the
-    // same kernel the per-call route runs on a k-block.
+    // Panels are independent: one contiguous range per task, each panel packed
+    // by the same kernel the per-call route runs on a k-block.
     const int64_t tasks = std::min<int64_t>(g.np,
         std::max<int64_t>(ctx.cpu.thread_count(), 1));
     ctx.cpu.run(0, tasks, [&](int64_t t) {
@@ -548,8 +552,7 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
 // =========================================================================
 //  int8 (s8×s8) pack + MMA dispatch
 // =========================================================================
-// Same split as the float route. x86's VNNI bias lives entirely in the packed
-// layouts; both arches return the exact s8×s8 product.
+// Same split as the float route; the accumulation is int32.
 
 using PackI8Fn = void (*)(void* NNOPS_RESTRICT output,
                           const void* NNOPS_RESTRICT input,
@@ -604,8 +607,8 @@ void xor0x80_i8(int8_t* p, int nbytes) {
     }
 }
 
-/// int8 A pack. When A needs the hardware shift (see int8_a_pack_bias) every
-/// panel is XOR-biased: s8 → u8 for VNNI, u8 → s8 for SDOT.
+/// int8 A pack. With @p a_biased every panel is XOR-biased (see
+/// int8_a_pack_bias): s8 → u8 on x86, u8 → s8 on aarch64.
 void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased) {
     // transposed source is a plain copy; row-major needs the transposing kernel.
@@ -622,9 +625,9 @@ void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
     });
 }
 
-/// Quantise one panel's rows into a stack copy and run the ordinary int8 pack
-/// on it. The panel layout and the rounding are therefore the same bytes the
-/// materialise-then-pack route produces; only the full M×K intermediate is gone.
+/// Quantise one panel's rows into a stack copy, then run the ordinary int8 pack
+/// on it — the same bytes the materialise-then-pack route produces, without the
+/// full M×K intermediate.
 template <class AT, class QT>
 void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
                             const AT* src, int lds,
@@ -640,8 +643,8 @@ void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
     walk_levels(i, mc, MR_I8, [&](int level, int s) {
         for (int r = 0; r < s; ++r) {
             const float sc = (scale != nullptr) ? scale[i + r] : scale_scalar;
-            // The quant kernel takes a float zero-point array; a null pointer
-            // means "no zero point", exactly as in the materialised route.
+            // The quant kernel takes a float zero-point array; null means no
+            // zero point, as in the materialised route.
             float zf = (zero != nullptr) ? static_cast<float>(zero[i + r])
                                          : static_cast<float>(zero_scalar);
             const float* zp = (zero != nullptr || zero_scalar != 0) ? &zf : nullptr;
@@ -821,8 +824,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
 
-    // A block-packed B (q4_1) is self-describing, so A only has to be a
-    // float type.
+    // A block-packed B (q4_1) is self-describing, so A only has to be a float type.
     const bool block_rhs = is_block_packed_dtype(dt_b) &&
                            (dt_a == DataType::f32 || dt_a == DataType::f16);
     const bool int8_pair = is_int8_matmul(dt_a, dt_b);
@@ -834,7 +836,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     if (int8_pair)                      { geom = &GEOM_I8; }
     else if (dt_a == DataType::f32)     { geom = &GEOM_F32; }
     else if (dt_a == DataType::f16)     { geom = &GEOM_F16; }
-    else                                { return plan; }  // the reference path takes the rest
+    else                                { return plan; }
     num_threads = std::max(num_threads, 1);
 
     const int64_t a_rank = a_desc.rank;
@@ -842,9 +844,8 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     NNOPS_ASSERT(a_rank >= 2 && b_rank >= 2);
 
     // A PackedB leads with N and carries no K (the blob is addressed from K,
-    // not shaped by it), so both come from where they actually live: N from the
-    // descriptor's first dim, K from A — which the product requires to agree
-    // anyway.
+    // not shaped by it), so N comes from the descriptor and K from A — which
+    // the product requires to agree anyway.
     const bool packed_b = is_packed_matmul_b(b_desc.layout);
     if (packed_b && !(dt_a == DataType::f32 || dt_a == DataType::f16)) {
         return plan;  // the packed RHS is a float-panel product only
@@ -882,8 +883,8 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     plan.ldd_b = ldd_b;
 
     // Packed-B scratch. N-split: one slice per n-block. M-split: one per
-    // m-block, or one per worker thread when ids are available (see
-    // MatMulPlan::num_slots). int8 hoists the pack, so one slot serves all.
+    // m-block, or per worker thread when ids are available and blocks outnumber
+    // them (see MatMulPlan::num_slots). int8 hoists B, so one slot serves all.
     const int64_t slice_bytes = static_cast<int64_t>(panel_count(static_cast<int>(N)))
                               * ldd_b * geom->elem;
 
@@ -932,6 +933,5 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 
     return plan;
 }
-
 
 }  // namespace nnops::backend::cpu

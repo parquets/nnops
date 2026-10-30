@@ -1,8 +1,18 @@
-/// Unit tests for the consolidated Norm operator (CPU reference).
+/// @file test_norm.cpp
+/// @brief Norm operator tests (CPU reference) — BatchNorm, LayerNorm, RMSNorm,
+///        GroupNorm and L2Norm through the shared Norm class / NormAttributes,
+///        distinguished by NormType. Class API only.
 ///
-/// Covers BatchNorm, LayerNorm, RMSNorm, GroupNorm, and L2Norm through the
-/// shared Norm class / NormAttributes, distinguished by NormType.
-/// Uses the class API exclusively.
+/// The quantized section (s8/u8 X) is the part that needs context. X carries its
+/// own PerTensor/PerToken params: the kernel dequantizes one row at a time, runs
+/// the float norm row kernel on it, then stores f32/f16 as-is or requantizes
+/// with the output TensorView's params. Only axis == rank-1 is defined, so one
+/// norm row is exactly one quantization row (the unit of a PerToken
+/// scale/zero_point), and the test derives the row width from numel / rows.
+///
+/// No reference kernel takes integer input, so the expected values are built by
+/// hand: dequantize to f32, run reference::norm_ref on that, and requantize by
+/// hand when the output is integer.
 
 #include "nnops/ops/norm.hpp"
 #include "common/test_harness.hpp"
@@ -814,7 +824,7 @@ NNOPS_TEST(norm_l2norm_random) {
     const TensorView ins[] = {input};
     op->compute(y, ins);
 
-    // Each row's L2 norm (sum of squares) should be ≈ 1
+    // A normalized row has sum of squares ≈ 1
     for (int r = 0; r < 4; ++r) {
         float sum_sq = 0.0f;
         for (int c = 0; c < 8; ++c) {
@@ -1293,16 +1303,6 @@ NNOPS_TEST(norm_group_norm_shape_inference) {
 // ============================================================
 // Quantized input (s8/u8) — LayerNorm / RMSNorm / L2Norm
 // ============================================================
-//
-// X is s8/u8 carrying its own PerTensor / PerToken quant params; the kernel
-// dequantizes one row at a time, runs the float norm row kernel on it, and then
-// stores f32/f16 as-is or requantizes with the output TensorView's params.
-// Only axis == rank-1 is defined, so one norm row is exactly one quantization
-// row (the unit of a PerToken scale/zero_point).
-//
-// No reference kernel takes integer input, so the expected values are built the
-// slow way: dequantize by hand to f32, run reference::norm_ref on that, and
-// requantize by hand when the output is integer.
 
 namespace nnops::backend::cpu::reference {
 void norm_ref(const NormAttributes& attrs,
@@ -1314,13 +1314,10 @@ void norm_ref(const NormAttributes& attrs,
 
 namespace {
 
-// Minimal fixed-size thread pool exposing a CpuBackend (test_conv2d pattern).
-// Items in [begin, end) are claimed via an atomic counter; each worker runs
-// body(i) until the range is exhausted.
+// Fixed-size thread pool exposing a CpuBackend; items are claimed via an atomic counter.
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
-        // runs under the same bit-exact comparisons as the kernels.
+        // OpenMP builds run under the same bit-exact comparisons as the kernels.
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
             return;
@@ -1379,8 +1376,7 @@ TensorView make_q(std::span<const int64_t> shape, DataType dt, void* data,
     return TensorView(shape, dt, data, layout, qp);
 }
 
-/// The (scale, zero_point) the kernel uses for row `row`: the per-row buffers
-/// when present, else the per-tensor scalars. A missing zero_point buffer is 0.
+/// Row `row`'s (scale, zero_point); a missing zero_point buffer reads as 0.
 void row_qparam(const QuantParams& qp, int64_t row, float& scale, int32_t& zp) {
     if (qp.scale_data != nullptr) {
         scale = qp.scale_data[row];
@@ -1399,15 +1395,13 @@ float dequant_one(int64_t q, float scale, int32_t zp) {
 int32_t qmin_for(DataType dt) { return dt == DataType::u8 ? 0 : -128; }
 int32_t qmax_for(DataType dt) { return dt == DataType::u8 ? 255 : 127; }
 
-/// Quantize one f32 value the way the arch kernel does: round to nearest, then
-/// clamp to the target dtype's range.
+/// Round to nearest as the arch quant kernel does, then clamp to the target dtype's range.
 int32_t requant_one(float v, float scale, int32_t zp, DataType dt) {
     const int32_t q = static_cast<int32_t>(std::nearbyintf(v / scale)) + zp;
     return std::min(std::max(q, qmin_for(dt)), qmax_for(dt));
 }
 
-/// Element `idx` of an s8/u8 buffer, read as a signed integer (both dtypes are
-/// stored one byte per element).
+/// Element `idx` as a signed integer (both dtypes store one byte per element).
 int64_t raw_at(const uint8_t* bytes, int64_t idx, DataType dt) {
     if (dt == DataType::u8) { return static_cast<int64_t>(bytes[idx]); }
     return static_cast<int64_t>(reinterpret_cast<const int8_t*>(bytes)[idx]);
@@ -1429,12 +1423,7 @@ std::vector<uint8_t> quantize_rows(const float* src, int64_t rows, int64_t n,
     return out;
 }
 
-/// Run the quantized path once and check it against "dequantize by hand ->
-/// reference norm -> requantize by hand".
-///
-/// `attrs` carries the norm type / axis / output_dtype; `x_q` is the s8/u8
-/// input; `extra_inputs` holds [scale] or [scale, bias], f32. `num_rows` is the
-/// norm row count (and the PerToken param count); the row width is derived.
+/// Expect the quantized path to match hand-dequant -> reference norm -> hand-requant.
 void expect_quant_norm(const NormAttributes& attrs,
                        const TensorView& x_q,
                        std::span<const TensorView> extra_inputs,
@@ -1450,7 +1439,6 @@ void expect_quant_norm(const NormAttributes& attrs,
     const int64_t    n = x_q.numel() / num_rows;
     const auto       shape = x_q.shape_span();
 
-    // ---- expected: hand-dequantized f32 through the f32 reference ----
     std::vector<float> x_f32(static_cast<size_t>(num_rows * n));
     for (int64_t r = 0; r < num_rows; ++r) {
         float s; int32_t z;
@@ -1471,7 +1459,6 @@ void expect_quant_norm(const NormAttributes& attrs,
     nnops::backend::cpu::reference::norm_ref(
         attrs, want_view, std::span<const TensorView>(ref_ins), {}, nullptr);
 
-    // ---- the op under test ----
     auto op = Norm::create(attrs, Backend::CPU);
 
     std::vector<TensorDesc> in_descs;
@@ -1497,7 +1484,6 @@ void expect_quant_norm(const NormAttributes& attrs,
     for (const auto& t : extra_inputs) { ins.push_back(t); }
     op->compute(out, std::span<const TensorView>(ins), ctx);
 
-    // ---- compare ----
     if (y_dt == DataType::f32) {
         for (size_t i = 0; i < numel; ++i) {
             NNOPS_EXPECT_NEAR(y_f32[i], want[i], tol);
@@ -1507,8 +1493,7 @@ void expect_quant_norm(const NormAttributes& attrs,
             NNOPS_EXPECT_NEAR(simd::s_load(&y_f16[i]), want[i], tol);
         }
     } else {
-        // Integer output: compare in quantized units, allowing one LSB for
-        // rounding-mode / reassociation differences.
+        // Integer output: one LSB of slack for rounding / reassociation.
         for (int64_t r = 0; r < num_rows; ++r) {
             float s; int32_t z;
             row_qparam(y_qp, r, s, z);
@@ -1521,9 +1506,8 @@ void expect_quant_norm(const NormAttributes& attrs,
     }
 }
 
-/// Sweep every supported combination — {PerTensor, PerToken} input params x
-/// {f32, f16, s8} output dtype — for one norm type. The integer output reuses
-/// the input's granularity, so both output-param paths are exercised.
+/// Sweep {PerTensor, PerToken} input params x {f32, f16, s8} output for one norm
+/// type; integer output reuses the input's granularity, so both param paths hit.
 void sweep_quant_norm(NormType type, bool with_bias, const ComputeContext& ctx = {})
 {
     constexpr int64_t kRows = 4;
@@ -1534,8 +1518,8 @@ void sweep_quant_norm(NormType type, bool with_bias, const ComputeContext& ctx =
     auto [b_data, b_view] = test::make_random_tensor({kDim}, -0.5f, 0.5f, 902);
     (void)_x; (void)s_data; (void)b_data;
 
-    // PerTensor covers the input range exactly; the PerToken scales vary a
-    // little per row (and carry non-zero zero points) so the row mapping is
+    // PerTensor 1/127 maps the [-1, 1] input onto the full s8 range. PerToken
+    // scales vary per row and carry non-zero zero points, so the row mapping is
     // observable.
     const QuantParams x_qp_pt = per_tensor(1.0f / 127.0f, 0);
     const float row_scale[] = {0.0079f, 0.0081f, 0.0077f, 0.0083f};

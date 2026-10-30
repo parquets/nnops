@@ -1,6 +1,11 @@
 #pragma once
 /// @file unary.hpp
 /// @brief Unary operator — element-wise single-tensor math operations.
+///
+/// output[i] = f(input[i]) with f from UnaryType; shape, rank and layout are
+/// preserved. Quantized s8/u8 → s8/u8 runs through a fused
+/// dequantize/apply/requantize path (both sides quantized, PerTensor/PerToken
+/// only); Round/Ceil/Floor are float-meaning ops and reject quantized data.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -12,7 +17,6 @@
 
 namespace nnops {
 
-/// Supported element-wise unary operations.
 enum class UnaryType : uint8_t {
     Exp,    ///< f(x) = exp(x)
     Log,    ///< f(x) = ln(x)
@@ -31,25 +35,13 @@ enum class UnaryType : uint8_t {
     Sign,   ///< f(x) = sign(x)  (-1, 0, or 1)
 };
 
-/// Attributes for the Unary operator.
 struct UnaryAttributes {
     UnaryType type = UnaryType::Exp;
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// If true, add into the existing output buffer instead of overwriting.
     bool add_to = false;
 };
 
-/// Unary operator (class-based API).
-///
-/// Element-wise math operations on a single tensor: output[i] = f(input[i]),
-/// with f chosen by UnaryAttributes::type. Input and output share shape, rank
-/// and layout.
-///
-/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
-/// quantized input is dequantized, the op is applied in f32, and the result is
-/// re-quantized (f32 → int). Both input and output must be quantized. Only
-/// PerTensor / PerToken quantization granularity is supported; Round/Ceil/Floor
-/// are float-meaning ops and reject quantized data types.
 class Unary : public OpBase {
 public:
     static std::unique_ptr<Unary> create(const UnaryAttributes& attrs = {},
@@ -77,7 +69,7 @@ public:
 
     const UnaryAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in unary.cpp (Pimpl pattern)
+    struct Impl;  // defined in unary.cpp
     ~Unary();
 
 private:

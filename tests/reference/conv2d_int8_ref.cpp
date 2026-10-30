@@ -2,17 +2,18 @@
 /// @brief Naive CPU reference for the quantized Conv2D route — s8 weight ×
 ///        u8/s8/f16/f32 activation → f32/f16 or s8/u8 output (planar NCHW).
 ///
-/// The correctness baseline for conv2d_int8.cpp, and the only implementation of
-/// `add_to` (the tiled route would have to fold the pre-existing output into the
-/// accumulator). Naive seven-level loop with per-sample parallelism.
+/// The correctness baseline for the quantized route in conv2d_implicit_gemm.cpp,
+/// and the only implementation of `add_to` on it (the tiled route would have to
+/// fold the pre-existing output into its accumulator, so it refuses the plan).
+/// Loops over (g, oc, oh, ow, ic, kh, kw) with per-sample parallelism.
 ///
 /// Every step after the integer dot product is written to match the tiled
 /// kernel's epilogue expression for expression, so the two agree bit for bit:
-/// for an fp destination dq_epilogue_tile (same dequantize, same bias-then-clip
-/// order, same activation), for an integer destination int8_epilogue_tile
+/// for an fp destination dq_epilogue_row (same dequantize, same bias-then-clip
+/// order, same activation), for an integer destination int8_epilogue_row_quant
 /// (int32 bias, Relu, requant by the output's QuantParams). The activation
-/// quantization uses the same arithmetic as quant_kernel::quantization<T>
-/// (`x · (1/scale) + zero`, round-to-nearest-even, clamp to the storage range).
+/// quantization reproduces quant_kernel::quantization<T>: x·(1/scale) + zero,
+/// round to nearest-even, clamp to the storage range.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -27,7 +28,7 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// float → integer storage, character for character what the quant kernel does.
+/// float → integer storage, the same arithmetic as quant_kernel::quantization.
 template <class QInt>
 inline QInt quantize_value(float x, float inv_scale, float zero) noexcept {
     constexpr int32_t qmin = std::is_same_v<QInt, uint8_t> ? 0 : -128;
@@ -48,8 +49,7 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
 {
     constexpr bool kFpAct = !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
     constexpr bool kU8    = std::is_same_v<TDst, uint8_t>;
-    /// An integer destination: the compensated accumulate is requantized with
-    /// the output's QuantParams instead of dequantized, and the bias is int32.
+    /// Integer destination: requantize by the output's QuantParams, int32 bias.
     constexpr bool kIntOut = std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
 
     const auto& input  = inputs[0];
@@ -84,7 +84,6 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
     const int64_t PH = attrs.padding[0];
     const int64_t PW = attrs.padding[1];
 
-    // ---- quantization parameters -----------------------------------------
     const QuantParams& qa = input.quant_params();
     const QuantParams& qw = weight.quant_params();
 
@@ -99,7 +98,6 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
     [[maybe_unused]] const int32_t* b_i32 =
         (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
     auto*       out_ptr = output.ptr<TOut>();
-    // The requant's output parameters, read only for an integer destination.
     [[maybe_unused]] const QuantParams& qc = output.quant_params();
     [[maybe_unused]] const float out_scale = quant_scale_at(qc, 0);
     [[maybe_unused]] const int32_t zp_out = quant_zp_at(qc, 0);
@@ -181,7 +179,6 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
     ctx.cpu.run(0, N, [&](int64_t n) { compute_sample(n); });
 }
 
-/// Destination dispatch: fp output as stored, integer output requantized.
 template <class TAct, class TDst>
 void conv2d_int8_ref_dst(const Conv2DAttributes& attrs,
                          TensorView& output,
@@ -202,7 +199,7 @@ void conv2d_int8_ref_act(const Conv2DAttributes& attrs,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx)
 {
-    // Same storage selection as the tiled route: fp activations are quantized to
+    // Same storage choice as the tiled route: fp activations go to
     // act_quant_dtype, pre-quantized ones are used as stored.
     const DataType act_dt = inputs[0].data_type();
     const bool u8 = (act_dt == DataType::u8)

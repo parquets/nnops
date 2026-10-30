@@ -1,11 +1,26 @@
 /// Unit tests for the Linear operator.
 ///
-/// Linear is X × W^T + bias, driven by the MatMul kernel. Every case is checked
-/// against `linear_ref` (naive triple loop) on the same operands:
-///   - f32 / f16
-///   - u8×s8 and s8×s8 with per-tensor, per-token and per-channel parameters
-///   - optional bias, epilogue and add_to
-///   - rank-1 and batched (rank-3) inputs
+/// Linear is X × W^T + bias on the MatMul kernel; most cases compare against
+/// `linear_ref` on the same operands: f32/f16, u8×s8 and s8×s8 with per-tensor,
+/// per-token and per-channel parameters, optional bias, epilogue, add_to, and
+/// rank-1 / batched inputs.
+///
+/// add_to rides MatMul's beta only for fp operands with an identity epilogue —
+/// the residual must not pass through the activation. Any other fp-output case
+/// takes a compact output-shaped temporary and adds the residual afterwards: a
+/// non-identity epilogue, or any int8 product (the integer route ignores
+/// alpha/beta and starts C at zero). An integer output (s32 compensated
+/// accumulate, s8/u8 requantized with the output's QuantParams) follows
+/// `output_dtype`, not the operand dtype, and takes an int32 [N] bias.
+///
+/// prepackWeights is the query-then-pack contract: an empty output view is the
+/// query, answering with layout PackedB (rank 2, N leading; empty for a
+/// quantized weight) and a numel the caller sizes the buffer from. The blob is
+/// the GEMM's nr-wide panels over the whole K, so it removes the per-call RHS
+/// pack and nothing else: where the raw weight also takes the tiled GEMM the
+/// two outputs must be bit-identical. Below the small-product thresholds (M ≤ 4
+/// or M·N·K < 1024) the raw weight runs the pack-free kernel, which a
+/// panel-formatted B cannot, so there only the numbers are compared.
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/core/quant_params.hpp"
@@ -49,8 +64,7 @@ TensorDesc make_desc(std::initializer_list<int64_t> dims,
     return d;
 }
 
-/// Run Linear and linear_ref over the same inputs and require agreement.
-/// @p initial optionally seeds the add_to residual in both outputs.
+/// Run Linear and linear_ref over the same inputs; @p initial seeds add_to's residual.
 template <class OutT>
 void check_linear(const LinearAttributes& attrs,
                   const std::vector<TensorView>& ins,
@@ -136,20 +150,15 @@ TensorView make_view(std::span<const int64_t> shape, DataType dt, void* data,
 
 }  // anonymous namespace
 
-// ============================================================
-// Hand-verified tests
-// ============================================================
+// ---- Hand-verified tests ----
 
 NNOPS_TEST(linear_basic) {
-    // input: [2, 3] (M=2, K=3)
-    // weight: [4, 3] (N=4, K=3)
-    // output: [2, 4]
     const int64_t ishape[] = {2, 3};
     const int64_t wshape[] = {4, 3};
 
     float in_data[6] = {1, 2, 3, 4, 5, 6};
     float w_data[12] = {
-        1, 0, 0,   // weight[0] * input[m] => dot({1,2,3}, {1,0,0}) = 1
+        1, 0, 0,   // dot({1,2,3}, {1,0,0}) = 1
         0, 1, 0,   // dot({1,2,3}, {0,1,0}) = 2
         0, 0, 1,   // dot({1,2,3}, {0,0,1}) = 3
         1, 1, 1,   // dot({1,2,3}, {1,1,1}) = 6
@@ -165,7 +174,6 @@ NNOPS_TEST(linear_basic) {
     const TensorDesc desc_arr[] = {di, dw};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Validate output descriptor
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 4);
@@ -215,7 +223,6 @@ NNOPS_TEST(linear_with_bias) {
     const TensorDesc desc_arr[] = {di, dw};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Validate output descriptor
     NNOPS_EXPECT_EQ(descs[0].rank, 2);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
@@ -240,9 +247,7 @@ NNOPS_TEST(linear_with_bias) {
     NNOPS_EXPECT_NEAR(out_buf[2], 4.0f, 1e-6f);
 }
 
-// ============================================================
-// fp32 / fp16 against the reference
-// ============================================================
+// ---- fp32 / fp16 against the reference ----
 
 NNOPS_TEST(linear_f32_random) {
     const int64_t M = 7, K = 37, N = 19;   // odd sizes exercise the tails
@@ -296,8 +301,6 @@ NNOPS_TEST(linear_epilogue_addto) {
     std::vector<float> initial(static_cast<size_t>(M * N));
     rng.fill_float(initial.data(), M * N, -1.0f, 1.0f);
 
-    // A non-identity epilogue with a residual cannot ride MatMul's beta, so
-    // this drives the compact-temporary path.
     check_linear<float>(attrs, {x, w, b}, 1e-5f, initial);
 }
 
@@ -317,9 +320,7 @@ NNOPS_TEST(linear_addto_identity) {
     check_linear<float>(attrs, {x, w, b}, 1e-5f, initial);
 }
 
-// ============================================================
-// Quantized: u8|s8 × s8 → fp
-// ============================================================
+// ---- Quantized: u8|s8 × s8 → fp ----
 
 NNOPS_TEST(linear_u8s8_per_tensor) {
     const int64_t M = 5, K = 32, N = 17;
@@ -346,7 +347,6 @@ NNOPS_TEST(linear_s8s8_asymmetric) {
     auto xv = random_s8(M * K, 24);
     auto wv = random_s8(N * K, 25);
 
-    // Per-token activation parameters, per-channel weight parameters.
     std::vector<float> xs(static_cast<size_t>(M));
     std::vector<int32_t> xzp(static_cast<size_t>(M));
     std::vector<float> ws(static_cast<size_t>(N));
@@ -416,8 +416,7 @@ NNOPS_TEST(linear_int8_addto) {
 }
 
 NNOPS_TEST(linear_quant_output_dtype) {
-    // getOutputTensorDesc must resolve the quantized output to fp, following
-    // output_dtype rather than the u8/s8 operand dtype.
+    // The quantized output follows output_dtype, not the u8/s8 operand dtype.
     const TensorDesc desc_arr[] = {
         make_desc({4, 8}, DataType::u8),
         make_desc({6, 8}, DataType::s8),
@@ -435,7 +434,6 @@ NNOPS_TEST(linear_quant_output_dtype) {
     auto f16_out = f16_op->getOutputTensorDesc(desc_arr);
     NNOPS_EXPECT_EQ(f16_out[0].dtype, DataType::f16);
 
-    // Integer outputs are also resolved from output_dtype.
     for (DataType odt : {DataType::s32, DataType::s8, DataType::u8}) {
         LinearAttributes iattrs;
         iattrs.output_dtype = odt;
@@ -445,9 +443,8 @@ NNOPS_TEST(linear_quant_output_dtype) {
 }
 
 NNOPS_TEST(linear_int8_output_matches_ref) {
-    // Integer outputs: s32 (compensated accumulate), s8 and u8 (requantized),
-    // each with an int32 [N] bias and Relu. Per-token X, per-channel W, and
-    // K spanning several k-blocks — kernel against linear_ref, bit for bit.
+    // s32/s8/u8 against linear_ref bit for bit: int32 [N] bias, Relu, per-token
+    // X, per-channel W, and K spanning several k-blocks.
     for (DataType odt : {DataType::s32, DataType::s8, DataType::u8}) {
         const int64_t M = 5, K = 600, N = 13;
         auto xv = random_s8(M * K, 41);
@@ -509,16 +506,7 @@ NNOPS_TEST(linear_int8_output_matches_ref) {
     }
 }
 
-// ============================================================
-// The prepacked weight — Linear::prepackWeights
-// ============================================================
-//
-// The weight packed once at load time is the same product as the raw one: this
-// route removes the per-call RHS pack and nothing else, so on shapes that the
-// GEMM tiles both ways the two outputs must agree to the bit — same panels,
-// same k-blocks, same order. Below the small product's thresholds the raw
-// weight takes the pack-free kernel instead (a prepacked B is panel-formatted
-// and cannot), so there the two are compared as numbers.
+// ---- The prepacked weight — Linear::prepackWeights ----
 
 namespace {
 
@@ -527,9 +515,8 @@ struct PrepackShape {
     bool bias, relu;
 };
 
-/// Run one shape twice — raw weight, then the same weight through the two-step
-/// contract — and require the two outputs to agree (@p bitwise: the raw weight
-/// takes the tiled GEMM too, so not a single bit may move).
+/// Raw weight vs the same weight through the two-step contract; @p bitwise when
+/// both take the tiled GEMM, so not a single bit may move.
 template <class T>
 void check_prepacked_weight(const PrepackShape& c, uint64_t seed,
                             bool bitwise = true)
@@ -578,7 +565,6 @@ void check_prepacked_weight(const PrepackShape& c, uint64_t seed,
     TensorView og(oshape, od.dtype, got.data());
     TensorView ow(oshape, od.dtype, want.data());
 
-    // The raw weight: the reference for this route.
     NNOPS_EXPECT_EQ(op->compute(og, ins, {}, nullptr), Status::ok);
 
     // ---- two-step contract: query the packed descriptor, allocate, fill
@@ -587,13 +573,12 @@ void check_prepacked_weight(const PrepackShape& c, uint64_t seed,
     TensorView oq[] = {q};
     op->prepackWeights(wq, oq);
     q = oq[0];
-    // A query answer carries no storage (as Conv2D's does): the rank is what
-    // separates it from "this weight has no packed form".
+    // A query answer carries no storage: rank 2 is what separates it from
+    // "this weight has no packed form".
     NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
     NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
                     static_cast<int>(TensorLayout::PackedB));
-    // The descriptor leads with N — the dim shape inference reads — and its
-    // numel is exactly the buffer a caller sizes (net_io's alloc does).
+    // N leads — the dim shape inference reads — and numel is the buffer a caller sizes.
     NNOPS_EXPECT_EQ(q.shape(0), c.N);
     NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
     NNOPS_EXPECT_EQ(q.data_type(), dt);
@@ -624,21 +609,18 @@ void check_prepacked_weight(const PrepackShape& c, uint64_t seed,
 }  // anonymous namespace
 
 NNOPS_TEST(linear_prepacked_weight) {
-    // Shapes chosen for the pack's own seams: a partial n panel, a K that is
-    // not a multiple of the k-block, N below one panel, and a deep K where A
-    // gets packed too.
+    // Shapes for the pack's seams: partial n panel, K not a k-block multiple,
+    // N below one panel, deep K.
     struct Row { PrepackShape s; bool bitwise; };
     const Row cases[] = {
-        // Odd on every side: both tails. Above the small-product threshold and
-        // M > 4, so the raw weight takes the tiled GEMM too.
+        // Both tails; M > 4 and past the small-product threshold, so both arms
+        // take the tiled GEMM.
         {{  7,   37,  19, true,  false}, true},
-        // N below one panel and one row: below the small-product threshold the
-        // raw weight runs the pack-free kernel instead — a prepacked B is
-        // panel-formatted and cannot — so only the numbers are compared.
+        // One row: the raw weight runs the pack-free kernel — numbers only.
         {{  1,    8,   5, false, false}, false},
         {{ 33,  300,  48, true,  true},  true},   // several k-blocks, Relu
         {{ 64,  256,  96, false, false}, true},   // a layer shape, no bias
-        {{  5, 1024,  17, true,  false}, true},   // deep K: pack_a on, narrow N
+        {{  5, 1024,  17, true,  false}, true},   // deep K, narrow N
     };
 
     const size_t ncases = sizeof(cases) / sizeof(cases[0]);
@@ -650,9 +632,8 @@ NNOPS_TEST(linear_prepacked_weight) {
 }
 
 NNOPS_TEST(linear_prepacked_weight_wrong_k) {
-    // The blob carries no K (its descriptor only knows N), so a caller who packs
-    // against one K and computes against another must be refused rather than
-    // read past its panels.
+    // The blob carries no K, so packing against one K and computing another must
+    // be refused rather than read past its panels.
     const int64_t wshape[] = {16, 37};
     auto [wv, weight] = test::make_random_tensor({16, 37}, -1.0f, 1.0f, 41);
 
@@ -681,9 +662,8 @@ NNOPS_TEST(linear_prepacked_weight_wrong_k) {
 }
 
 NNOPS_TEST(linear_prepacked_weight_quantized_has_no_blob) {
-    // A quantized weight has no packed form (its panels would have to carry the
-    // int32 column sums too), so the query answers with nothing — a graph
-    // engine asks unconditionally.
+    // A quantized weight has no packed form (its panels would need the int32
+    // column sums too), so the query answers with nothing.
     const int64_t wshape[] = {8, 16};
     std::vector<int8_t> wv(static_cast<size_t>(8 * 16), 3);
     TensorView weight(wshape, DataType::s8, wv.data());

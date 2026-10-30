@@ -2,22 +2,22 @@
 /// @file linear.hpp
 /// @brief Linear (fully-connected) operator: output = input × weight^T + bias.
 ///
-/// Supported operand combinations:
-///   - f32 × f32, f16 × f16                 → output follows the input dtype
-///   - u8  × s8,  s8 × s8 (quantized)       → output follows `output_dtype`:
-///                                             f32/f16 dequantizes, s32/s8/u8
-///                                             keeps the result integral
+///   f32 × f32, f16 × f16             → output follows the input dtype
+///   u8 × s8, s8 × s8 (quantized)     → output follows `output_dtype`:
+///                                      f32/f16 dequantizes, s32/s8/u8 stays
+///                                      integral
 ///
-/// The quantized path dequantizes (or requantizes) each int32 accumulate with
-/// the QuantParams carried by the two input TensorViews: X's per-tensor /
-/// per-token parameters and W's per-tensor / per-channel parameters. With
-/// inactive parameters the scales are 1 and the zero points 0, i.e. a plain
-/// integer product. An s8/u8 output requantizes with the output's QuantParams,
-/// clamping to the storage range of the destination type.
+/// The quantized path folds the QuantParams carried by the two input
+/// TensorViews into each int32 accumulate — X's per-tensor / per-token, W's
+/// per-tensor / per-channel. Inactive parameters are scale 1 and zero point 0,
+/// i.e. a plain integer product. An s8/u8 output requantizes with the output's
+/// QuantParams, clamped to the destination's storage range.
 ///
-/// The weight is stored [N, K] and the multiplication is X × W^T. The optional
-/// third input is a per-output-channel bias of shape [N]: its dtype follows the
-/// output — the output dtype for f32/f16, int32 for s32/s8/u8.
+/// The weight is [N, K] and the product is X × W^T, i.e. the MatMul kernel with
+/// `transpose_b`; the input is [..., K] and the output [..., N], leading dims
+/// preserved. Bias, epilogue and add_to ride the output write-back. The
+/// optional [N] bias follows the output dtype — int32 on an integer
+/// destination.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -30,37 +30,20 @@
 
 namespace nnops {
 
-/// Attributes for the Linear (fully-connected) operator.
 struct LinearAttributes {
-    /// Post-processing applied during output write-back (default: identity).
     Epilogue epilogue{};
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// Accumulate into the existing output instead of overwriting (residual).
     bool add_to = false;
 
-    /// Output data type for the quantized (u8|s8 × s8) path: f32 / f16 for a
-    /// dequantizing output, s32 / s8 / u8 for an integer one (the last two
-    /// requantize with the output's QuantParams). Anything else selects f32.
+    /// Quantized-path output type: f32/f16 dequantize, s32/s8/u8 stay integral
+    /// (s8/u8 requantize with the output's QuantParams). Anything else selects
+    /// f32. Ignored for fp operands, whose output follows the input dtype.
     ///
     /// An integer output takes its bias as int32; see MatMulAttributes.
-    ///
-    /// Ignored for f32/f16 operands, whose output always follows the input
-    /// dtype (fp in, fp out).
     DataType output_dtype = DataType::f32;
 };
 
-/// Linear / fully-connected operator (class-based API).
-///
-/// Computes: output = epilogue(input × weight^T + bias)
-///   input:  [..., K]     (f32 | f16 | u8 | s8)
-///   weight: [N, K]       (f32 | f16, or s8 for the quantized path)
-///   bias:   [N] (optional, output dtype — int32 when the output is integral)
-///   output: [..., N]     (leading dims preserved; only the last becomes N)
-///
-/// Transposed weight is implicit — the weight is stored as [N, K] and
-/// the multiplication is input × weight^T. Internally this drives the MatMul
-/// kernel with `transpose_b`; bias, the epilogue and add_to are applied on the
-/// output write-back.
 class Linear : public OpBase {
 public:
     static std::unique_ptr<Linear> create(const LinearAttributes& attrs,
@@ -83,19 +66,14 @@ public:
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
 
-    /// Pack the weight once, for compute() to read in place.
-    ///
-    /// Same two-step contract as Conv2D: an empty outputs[0] is the query (the
-    /// descriptor to allocate), a filled one is the pack, and the buffer stays
-    /// the caller's. What it removes is the per-call RHS pack — the weight,
-    /// packed into the GEMM's uniform nr-wide panels over its whole K, which
-    /// the kernel then reads where it lies. That is also why the product's
-    /// alpha has to be 1 (a prepacked B cannot carry a per-call scale).
-    ///
-    /// inputs[0] is the raw weight [N, K] — the same tensor compute() would be
-    /// handed. f32/f16 only; a quantized weight has no packed form (its panels
-    /// would have to carry the int32 column sums too), and the query returns an
-    /// empty view for it.
+    /// Pack the weight once for compute() to read in place — the same two-step
+    /// contract as Conv2D: an empty outputs[0] is the query, a filled one the
+    /// pack, and the buffer stays the caller's. inputs[0] is the raw [N, K]
+    /// weight. The blob is the GEMM's uniform nr-wide panels over the whole K,
+    /// which is what removes the per-call RHS pack — and why alpha must be 1
+    /// (a prepacked B cannot carry a per-call scale). f32/f16 only; a quantized
+    /// weight has no packed form (its panels would need the int32 column sums)
+    /// and the query returns an empty view for it.
     void prepackWeights(std::span<const TensorView> inputs,
                         std::span<TensorView> outputs,
                         const ComputeContext& ctx = {}) override;
@@ -106,7 +84,7 @@ public:
 
     const LinearAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in linear.cpp (Pimpl pattern)
+    struct Impl;
     ~Linear();
 
 private:

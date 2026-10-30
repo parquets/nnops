@@ -1,13 +1,14 @@
 #pragma once
 /// @file simd_reduce.hpp
-/// @brief SIMD kernel functions for the Reduce operator.
+/// @brief SIMD kernels for the Reduce operator.
 ///
-/// Three SIMD dispatch paths:
-///   1. Packed: per-lane SIMD reduction.
-///   2. Contiguous: multi-accumulator unrolling per row.
-///   3. Inner-contiguous: SIMD across axis for L inner elements.
+/// Three dispatch paths:
+///   1. Packed: per-lane SIMD reduction, contiguous (axis == rank-1) or
+///      pitch-strided (axis < rank-1), plus a channel merge to one scalar.
+///   2. Contiguous: multi-accumulator unrolling per row, delegated to row_reduce.
+///   3. Inner-contiguous: SIMD across the inner (non-reduced) axes.
 ///
-/// Only lane=8 SIMD types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
+/// Only lane-8 vector types (v_f32x8 / v_f16x8), matching simd_lane_for<T>.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/ops/reduce.hpp"
@@ -19,8 +20,7 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// Packed SIMD: per-lane reduction over D spatial positions,
-/// contiguous pack-wide strides (axis == rank-1).
+/// Packed SIMD (axis == rank-1): per-lane reduction over D positions `pack` apart.
 template <typename T>
 inline void reduce_process_packed_row(
     const T* x_row, T* y_pos,
@@ -60,11 +60,8 @@ inline void reduce_process_packed_row(
     }
 }
 
-/// Packed column SIMD: per-lane reduction over D pitch-strided rows
-/// (axis < rank-1, pack > 1).  Each row holds `pack` SIMD lanes at a
-/// fixed (outer, inner) position; x_pitch strides to the next row
-/// along the reduce axis.
-/// Output is pack-wide (v_store) — each lane independently reduced.
+/// Packed column SIMD (axis < rank-1, pack > 1): per-lane reduction over D rows
+/// `x_pitch` apart, output pack-wide.
 template <typename T>
 inline void reduce_process_packed_col(
     const T* x_col, T* y_pos,
@@ -105,22 +102,10 @@ inline void reduce_process_packed_col(
     }
 }
 
-/// Packed channel SIMD: reduction over D C8 blocks at a single spatial
-/// position, with a horizontal reduction across SIMD lanes to produce
-/// a single scalar.
-///
-/// Unlike per-lane packed_row (each lane = different channel, independent
-/// reduction), channel reduction merges ALL channels:
-///   1. Per-lane SIMD accumulation over full C8 blocks (0..D-2, or 0..D-1
-///      when valid_lanes == pack).
-///   2. Scalar accumulation for the partial last block (valid_lanes < pack).
-///   3. Horizontal reduction: v_reduce on the SIMD accumulator, then
-///      combine with partial scalar contributions via std::max/std::min/+.
-///   4. s_store a single scalar to y_pos.
-///
-/// valid_lanes: number of valid channels in the last C8 block
-///   (= C % pack, or pack when C % pack == 0).
-/// inv_total: 1.0f / logical_C (used only by Mean).
+/// Packed channel SIMD: reduce D C8 blocks at one spatial position and merge all
+/// channels to one scalar. Full blocks accumulate per-lane, then v_reduce; a
+/// partial last block (valid_lanes < pack) is added lane by lane. @p inv_total is
+/// 1/C and used only by Mean.
 template <typename T>
 inline void reduce_process_packed_channel(
     const T* x_chan, T* y_pos,
@@ -198,8 +183,7 @@ inline void reduce_process_packed_channel(
     }
 }
 
-/// Contiguous tail: multi-accumulator unrolling per row, delegated to the
-/// shared row_reduce primitive (4→2→1 → scalar).
+/// Contiguous: one row's reduction through the shared row_reduce primitive.
 template <typename T>
 inline void reduce_process_contiguous_row(
     const T* x_row, float* out_scalar,
@@ -222,7 +206,7 @@ inline void reduce_process_contiguous_row(
     }
 }
 
-/// Inner-contiguous: SIMD across axis for L inner elements.
+/// Inner-contiguous: SIMD across the inner axis, L inner elements per block.
 template <typename T>
 inline void reduce_process_inner_contiguous_block(
     const T* x_base, T* y_base,

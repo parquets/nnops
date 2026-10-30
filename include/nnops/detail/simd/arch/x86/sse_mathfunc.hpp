@@ -1,12 +1,13 @@
 #pragma once
 /// @file sse_mathfunc.hpp
-/// @brief SSE1+MMX/SSE2 implementation of sin, cos, tan, exp, log, and tanh.
+/// @brief Vector sin/cos/tan/exp/log/tanh on __m128.
 ///
-/// Based on sse_mathfun by Julien Pommier (zlib license):
+/// Cephes polynomial approximations (Cody-Waite range reduction for the trig
+/// functions), after Julien Pommier's sse_mathfun (zlib license):
 ///   http://gruntthepeon.free.fr/ssemath/
 ///
-/// On MSVC, delegates to SVML (_mm_exp_ps, _mm_sin_ps, etc.).
-/// On other compilers, uses the Cephes polynomial approximation algorithms.
+/// Under _MSC_VER these forward to SVML (_mm_exp_ps, _mm_sin_ps, ...); the
+/// other path evaluates the polynomials with FMA3 intrinsics.
 
 #if !defined(NNOPS_ARCH_X86_64)
   #error "sse_mathfunc.hpp requires x86_64 architecture"
@@ -66,7 +67,6 @@ static inline __m128 log_ps(__m128 x)
     __m128 invalid_mask = _mm_cmple_ps(x, _mm_setzero_ps());
     x = _mm_max_ps(x, *(__m128*)_ps_min_norm_pos); /* cut off denormalized stuff */
     emm0 = _mm_srli_epi32(_mm_castps_si128(x), 23);
-    /* keep only the fractional part */
     x = _mm_and_ps(x, *(__m128*)_ps_inv_mant_mask);
     x = _mm_or_ps(x, *(__m128*)_ps_0p5);
     emm0 = _mm_sub_epi32(emm0, *(__m128i*)_pi32_0x7f);
@@ -123,7 +123,6 @@ static inline __m128 exp_ps(__m128 x)
     /* how to perform a floorf with SSE: just below */
     emm0 = _mm_cvttps_epi32(fx);
     tmp = _mm_cvtepi32_ps(emm0);
-    /* if greater, subtract 1 */
     __m128 mask = _mm_cmpgt_ps(tmp, fx);
     mask = _mm_and_ps(mask, one);
     fx = _mm_sub_ps(tmp, mask);

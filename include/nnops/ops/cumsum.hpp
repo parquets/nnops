@@ -1,6 +1,10 @@
 #pragma once
 /// @file cumsum.hpp
-/// @brief CumSum operator — cumulative sum along an axis.
+/// @brief Cumulative sum along one axis.
+///
+/// inclusive: out[i] = sum(in[0..i]); exclusive: out[0] = 0, out[i] =
+/// sum(in[0..i-1]). reverse walks from the last element backward. Input rank
+/// >= 1; output has the input's shape. Planar layouts only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -14,27 +18,11 @@ namespace nnops {
 
 /// Attributes for the CumSum operator.
 struct CumSumAttributes {
-    /// If true, the i-th element excludes input[i] (output[0] = 0).
     bool exclusive = false;
-
-    /// If true, cumulative sum is performed in the reverse direction.
     bool reverse = false;
-
-    /// Axis along which to compute the cumulative sum.
     int64_t axis = 0;
-
 };
 
-/// CumSum operator (class-based API).
-///
-/// Computes the cumulative sum along a given axis.
-///   inclusive:  output[i] = sum(input[0..i])
-///   exclusive:  output[0] = 0, output[i] = sum(input[0..i-1])
-///
-/// With reverse: sum from the last element backward.
-///
-/// Input: [*, D_axis, *]  (rank >= 1)
-/// Output: same shape as input
 class CumSum : public OpBase {
 public:
     static std::unique_ptr<CumSum> create(const CumSumAttributes& attrs = {},

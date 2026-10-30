@@ -1,18 +1,28 @@
 /// @file matmul.cpp
 /// @brief Tiled matrix multiplication kernel — pack + MMA dispatch.
 ///
-/// f32, f16 and int8 share one skeleton (FpRoute / I8Route): B is always packed
-/// into pooled scratch; A is packed too when the route needs it (always int8)
-/// or read directly. Tiling, the split direction and the workspace size come
-/// from get_matmul_plan(): NKM on an N-split, MKN on an M-split.
+/// f32, f16 and int8 share one skeleton (FpRoute / I8Route) and one plan
+/// (get_matmul_plan: NKM on an N-split, MKN on an M-split). B is packed into
+/// pooled scratch per k-block unless the caller supplied a prepacked blob, which
+/// is walked in place at the stride of its own full-K pack. A is packed per M
+/// panel when the plan asks for it — always on int8, and on fp for a transposed
+/// A or K past PACK_A_K_THRESHOLD — and read through lda otherwise.
 ///
-/// f32/f16 below GEMM_FAST_PATH_THRESHOLD MACs, and every product at M <= 4,
-/// use the arch's naive SIMD kernel / direct GEMV instead of the plan; a Q4_1 B
-/// at small M decodes straight into its dot product. Those routes sweep the
-/// product in one pass and share nothing with the skeleton, so they live in
-/// matmul_small.cpp and matmul_qblock_fused.cpp (see matmul_internal.h).
+/// DqRoute is the int8 GEMM with its output pass replaced by a dequantize into
+/// fp; A is either already s8/u8, or fp quantised inside the pack (matmul_dq).
 ///
-/// int8 accumulates raw int32 and recovers the product in one epilogue pass.
+/// int8 accumulates raw int32 and recovers the product in one output pass on the
+/// last k-block's tile, while C is still in cache. That pass needs the two halves
+/// of the zero-point compensation, each fed by its own reduction sweep (r_a over
+/// A, r_b over B); a half that is zero skips its sweep.
+///
+/// An optional fp [N] bias primes each tile with beta·C_old + bias in its first
+/// k-block, instead of a sweep over the finished output.
+///
+/// f32/f16 below GEMM_FAST_PATH_THRESHOLD MACs, or at M <= 4 (bar a transposed A
+/// against a transposed B), and a Q4_1 B at small M, skip the plan and sweep the
+/// product in one pass — matmul_small.cpp and matmul_qblock_fused.cpp (see
+/// matmul_internal.h).
 
 #include "matmul.h"
 #include "matmul_internal.h"      // dims / batch walk shared with the small routes
@@ -38,11 +48,10 @@ namespace {
 //  Dtype routes — the only place a path names its element types
 // =========================================================================
 //
-// Per k-block pack B, per M panel pack A (or read it raw) and call one MMA
-// kernel that sweeps the N side. Everything dtype-specific is named here.
+// Per k-block pack B, per M panel pack A (or read it raw), and one MMA kernel
+// sweeps the N side. Everything dtype-specific is named here.
 
-/// The fp route names no output pass — its epilogue is in place — but the tiled
-/// kernel's parameter type must still exist.
+/// The fp route has no output pass; the tiled kernel still needs a type.
 struct NoEpilogueParams {};
 
 template <class T>
@@ -58,15 +67,13 @@ struct FpRoute {
     static constexpr bool has_direct_a     = true;   // A may be read through lda
     static constexpr bool hoists_b_m_split = false;  // B packs inside each block
 
-    /// No int8-style output pass on the fp route (its epilogue is in-place).
     using EpilogueParams = NoEpilogueParams;
 
     static constexpr const MatmulGeom& geom() {
         return std::is_same_v<T, float> ? GEOM_F32 : GEOM_F16;
     }
 
-    /// B for one batch element: a dense view or a Q4_1 block stream, which
-    /// names its dtype because its storage unit is a block, not an element.
+    /// One batch element's B: a dense view, or a Q4_1 block stream.
     struct B {
         const void* ptr;
         int ldb;
@@ -105,7 +112,8 @@ struct FpRoute {
 
     static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc,
                        int n_start, int nc, Elem* dst, int ldd, bool /*a_biased*/) {
-        // The packer takes the tile origin in block units, not elements.
+        // k and n_start are element indices even for a block-packed B; only
+        // its row stride counts blocks.
         if (b.blocked()) {
             tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
                                b.ptr, b.row_blocks, attrs.alpha);
@@ -119,8 +127,7 @@ struct FpRoute {
         tile_pack_rhs(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, attrs.alpha);
     }
 
-    /// @p ldb > 0 means @p pb is a prepacked blob: panels sit at that stride,
-    /// not at the one the kernel derives from kc (see tile_mma_pack_ldb).
+    /// @p ldb > 0: a prepacked blob's panel stride (see tile_mma_pack_ldb).
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
                          bool zero_mode, int64_t ldb = 0) {
@@ -142,9 +149,6 @@ struct FpRoute {
     static void scale(Acc* c, int ldc, float beta, int mc, int nc) {
         tile_scale(c, ldc, beta, mc, nc);
     }
-    /// C = beta·C_old + bias. Folded into the first k-block's tile pass, so the
-    /// bias costs the same one sweep over C that beta already paid and the
-    /// kernels keep accumulating the bare product.
     static void scale_add_bias(Acc* c, int ldc, float beta, const Elem* bias,
                                int mc, int nc) {
         tile_scale_add_bias(c, ldc, beta, bias, mc, nc);
@@ -155,8 +159,7 @@ struct FpRoute {
     }
 };
 
-/// Bytes of the compact M×N int32 accumulator an int8 output pass reads (the
-/// plan's scratch is followed by exactly this much).
+/// Bytes of the compact M×N int32 accumulator an int8 output pass reads.
 inline size_t accum_bytes(const TensorView& output) noexcept {
     const auto od = output.desc();
     return static_cast<size_t>(od.dims[static_cast<size_t>(od.rank - 2)])
@@ -164,8 +167,7 @@ inline size_t accum_bytes(const TensorView& output) noexcept {
          * sizeof(int32_t);
 }
 
-/// int8 (s8|u8 A × s8 B): no raw A, raw int32 C, epilogue once after all
-/// blocks.
+/// int8 (s8|u8 A × s8 B): A always packed, raw int32 C, one output pass.
 struct I8Route {
     using Elem  = int8_t;
     using AElem = int8_t;
@@ -192,9 +194,7 @@ struct I8Route {
     static int ldd_b(int kc) { return static_cast<int>(geom().ldd_b(kc)); }
     static int ldd_a(int kc) { return static_cast<int>(geom().ldd_a(kc)); }
 
-    /// int8 has no prepacked RHS (a quantized blob would have to carry the
-    /// column sums the panel's correction block holds), so the stride argument
-    /// is always 0 here; see MatMulPackedB.
+    /// int8 has no prepacked RHS (matmul_packed_b_geom admits only f32/f16).
     static constexpr int b_panel_w() { return NR_MAX_I8; }
 
     static std::pair<Clamp, Clamp> clamp(const MatMulAttributes&, bool) {
@@ -207,8 +207,7 @@ struct I8Route {
         tile_pack_lhs_i8(trans, mc, kc, dst, ldd, src, lds, a_biased);
     }
 
-    /// dtype the int8 kernels see on the A side. Only the fused dq route
-    /// differs: it reads fp and quantises to `act_quant_dtype`.
+    /// The A dtype the int8 kernels see; only the fused dq route differs.
     static DataType a_eff_type(const MatMulAttributes& /*attrs*/, const TensorView& a) {
         return a.data_type();
     }
@@ -216,8 +215,8 @@ struct I8Route {
     static void pack_b(const MatMulAttributes& attrs, const B& b, int k, int kc,
                        int n_start, int nc, Elem* dst, int ldd, bool a_biased) {
         const Elem* src = attrs.transpose_b
-            ? b.ptr + n_start * b.ldb + k     // N×K: row n, col k
-            : b.ptr + k * b.ldb + n_start;    // K×N: row k, col n
+            ? b.ptr + n_start * b.ldb + k
+            : b.ptr + k * b.ldb + n_start;
         tile_pack_rhs_i8(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, a_biased);
     }
 
@@ -254,18 +253,12 @@ struct I8Route {
     }
 };
 
-/// Offline-quantized fp activations × s8 weights.
-///
-/// The GEMM is exactly the int8 one: A_q was materialized upstream (same shape,
-/// carrying A's QuantParams) and handed in as inputs[0], so the plan, the pack
-/// bias and the reductions are all already right for it. What changes is the
-/// output pass — the compact int32 accumulator is dequantized into fp.
+/// The int8 GEMM with a dequantizing fp output pass.
 template <class TOut, class AIn = int8_t>
 struct DqRoute : I8Route {
     static constexpr bool is_dq = true;
 
-    /// A arrives as fp and is quantised inside the pack, so no A_q is ever
-    /// materialised (MKN, no compensation; see matmul_dq).
+    /// A arrives as fp and is quantised in the pack, so no A_q is materialised.
     static constexpr bool fused_a = !std::is_same_v<AIn, int8_t>;
 
     using OutElem = TOut;
@@ -277,8 +270,7 @@ struct DqRoute : I8Route {
         else { return a.data_type(); }
     }
 
-    /// Fused: quantise each panel row from fp with its offline parameters
-    /// (already indexed from the batch's first row) and then pack.
+    /// Fused: quantise each panel row from fp with its offline parameters.
     static void pack_a(bool trans, int mc, int kc, int8_t* dst, int ldd,
                        const AElem* src, int lds, bool a_biased,
                        const EpilogueParams* ip, int m) {
@@ -294,8 +286,7 @@ struct DqRoute : I8Route {
         }
     }
 
-    /// Always the compact accumulator: the destination is fp and is written by
-    /// the output pass, never accumulated into.
+    /// Always the compact accumulator: the fp output is written, not accumulated.
     static Acc* c_base(TensorView& /*output*/, int64_t /*c_off*/, void* accum) {
         return static_cast<Acc*>(accum);
     }
@@ -303,7 +294,6 @@ struct DqRoute : I8Route {
     /// The dequant pass is unconditional — it is what produces the output.
     static constexpr bool always_epilogue = true;
 
-    /// Always the compact accumulator, whatever the output dtype.
     static size_t extra_workspace(const TensorView& output) {
         return accum_bytes(output);
     }
@@ -318,7 +308,6 @@ struct DqRoute : I8Route {
 //  Tile-block kernels
 // =========================================================================
 
-/// The row/column range a parallel block owns.
 struct BlockRange { int start; int count; };
 
 inline BlockRange m_range(const MatMulPlan& plan, int64_t blk, int64_t num_blocks,
@@ -342,8 +331,7 @@ inline int64_t block_slot(int64_t num_slots, int64_t num_blocks, int64_t blk,
         : blk;
 }
 
-/// Packed-A slot of a block, or null when A is read raw. A has its own slot
-/// count (`num_slots_a`), not the B one.
+/// Packed-A slot of a block, or null when A is read raw; uses num_slots_a.
 template <class Elem>
 inline Elem* pack_a_slot(const MatMulPlan& plan, int64_t num_blocks, int64_t blk,
                          const ComputeContext& ctx, Elem* base) noexcept {
@@ -352,7 +340,6 @@ inline Elem* pack_a_slot(const MatMulPlan& plan, int64_t num_blocks, int64_t blk
                 * plan.np_a * plan.ldd_a;
 }
 
-/// Accumulate one k-block into an m×n tile of C.
 template <class R>
 void matmul_tile(const MatMulAttributes& attrs,
                  typename R::Acc* c_ptr, int ldc,
@@ -380,8 +367,6 @@ void matmul_tile(const MatMulAttributes& attrs,
     const bool scale_c  = R::is_fp && k == 0 && bias == nullptr &&
                           attrs.beta != 1.0f && attrs.beta != 0.0f;
     const bool epilogue = R::is_fp && last_k && has_inplace_epilogue(attrs);
-    // int8 does its output pass in the same place fp does: on the tile the
-    // last k-block just produced, while it is still in cache.
     const bool int8_ep = !R::is_fp && last_k && (ip != nullptr);
 
     for (int m = m_start; m < m_start + m_count; m += mc) {
@@ -400,9 +385,9 @@ void matmul_tile(const MatMulAttributes& attrs,
                 R::scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
             }
         }
-        // The RHS the MMA reads: the k-block's slice of the packed scratch, or
-        // — for a prepacked blob — that block's slice of the tile's first
-        // panel, from which one kernel call per panel walks the stride.
+        // The RHS the MMA reads: the k-block's slice of the packed scratch, or,
+        // for a prepacked blob, that block's slice of the tile's first panel,
+        // which one kernel call per panel walks at the blob's stride.
         const typename R::Elem* b_tile = packed_b;
         int64_t b_ldb = 0;
         if (prepacked_b != nullptr) {
@@ -470,15 +455,10 @@ void matmul_block(const MatMulAttributes& attrs,
 //  int8 — reduction and epilogue passes around the raw accumulate
 // =========================================================================
 
-/// Raw int8 reductions for the epilogue: r_a[m] = Σ_k A[m,k], r_b[n] = Σ_k B[k,n]
-/// (A[k,m] / the mirror image when transposed). Output slabs are disjoint, so
-/// no atomics; int32 accumulation matches the reference bit for bit. The
-/// kernels are in simd_int8_reduce.hpp — this only owns the slab split.
-///
-/// B is always int8; @p a_u8 selects A's element type — a u8 A must be summed
-/// unsigned, since the compensation is over the true value. A null @p r_a or
-/// @p r_b skips that sweep: each reduction feeds one half of the compensation,
-/// and a half that is folded away or zero needs neither the sum nor the read.
+/// Raw int8 reductions for the output pass: r_a[m] = Σ_k A[m,k], r_b[n] =
+/// Σ_k B[k,n] (the transposes mirror them). Disjoint slabs, so no atomics; the
+/// kernels are in simd_int8_reduce.hpp. @p a_u8 sums A unsigned; a null
+/// @p r_a / @p r_b skips that sweep.
 void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda,
                              const int8_t* b_ptr, int64_t ldb,
                              const MatMulAttributes& attrs,
@@ -519,9 +499,8 @@ void compute_int8_reductions(const int8_t* a_ptr, bool a_u8, int64_t lda,
     if (r_b != nullptr) { reduce(b_ptr, /*u8=*/false, ldb, N, /*rows=*/attrs.transpose_b, r_b); }
 }
 
-/// True when some zero point is non-zero. A per-row / per-column buffer wins
-/// over the scalar; @p n is the tensor extent, used when the caller left
-/// @p num_scales at zero.
+/// True when some zero point is non-zero; @p n is the extent when @p num_scales
+/// is 0.
 inline bool any_zp_nonzero(const int32_t* zp, int32_t scalar, int64_t num_scales,
                            int64_t n) noexcept {
     if (zp == nullptr) { return scalar != 0; }
@@ -532,8 +511,7 @@ inline bool any_zp_nonzero(const int32_t* zp, int32_t scalar, int64_t num_scales
     return false;
 }
 
-/// True when some zero point differs from @p v — i.e. whether a_bias_offset +
-/// zp_a can be non-zero for a row, which is what makes the r_b term live.
+/// True when some zero point differs from @p v, i.e. whether r_b is live.
 inline bool any_zp_differs(const int32_t* zp, int32_t scalar, int64_t num_scales,
                            int64_t n, int32_t v) noexcept {
     if (zp == nullptr) { return scalar != v; }
@@ -544,9 +522,7 @@ inline bool any_zp_differs(const int32_t* zp, int32_t scalar, int64_t num_scales
     return false;
 }
 
-/// Whether the dq compensation is anything other than the identity, i.e.
-/// whether the reduction sweep has to run. True as soon as a row's
-/// a_bias_offset + zp_a or any column's zp_b is non-zero.
+/// Whether the dq compensation is not the identity, i.e. the sweep must run.
 inline bool dq_needs_compensation(const TensorView& a, const TensorView& b,
                                   int32_t a_bias_offset, int64_t M, int64_t N) noexcept {
     const QuantParams& qa = a.quant_params();
@@ -561,8 +537,8 @@ inline bool dq_needs_compensation(const TensorView& a, const TensorView& b,
 // =========================================================================
 //
 // One skeleton for every route: per batch element, split the output on its
-// larger dimension and run the blocks on the pool. The dtype islands are
-// marked inline; B hoisting on an M-split is a route property.
+// larger dimension and run the blocks on the pool; B hoisting on an M-split is
+// a route property.
 
 template <class R>
 Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
@@ -578,29 +554,25 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const auto& b = inputs[1];
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 
-    // Only the fp routes carry a B; a block-packed one (q4_1) says which
-    // format so the shared packer can decode it.
+    // Only the fp route has a block-packed B; the tag names the format the
+    // shared packer decodes.
     const DataType b_block_dt = R::is_fp ? b.data_type() : DataType::f32;
 
-    // Optional per-column bias, fp only: the first k-block of every tile primes
-    // C with beta·C_old + bias, so it rides the tile pass instead of a sweep
-    // over the finished output.
+    // Optional fp bias: primed into C by the first k-block, not swept after.
     const typename R::Elem* bias = nullptr;
     if constexpr (R::is_fp) {
         if (inputs.size() > 2) { bias = inputs[2].ptr<typename R::Elem>(); }
     }
 
     // The fp routes pack into the scratch; a null buffer here means the pool
-    // refused it, and the first pack would fault rather than report. A
-    // prepacked RHS with no packed A has no scratch at all.
+    // refused it, and the first pack would fault rather than report. A prepacked
+    // RHS with no packed A has no scratch at all.
     if constexpr (R::is_fp) {
         if (plan.workspace_size > 0 && workspace == nullptr) {
             return Status::out_of_memory;
         }
     }
 
-    // A caller-supplied RHS: the blob's panels are walked in place, at the
-    // stride its own full-K pack gave them.
     const typename R::Elem* prepacked_b = nullptr;
     int64_t prepacked_ldd = 0;
     if (is_packed_matmul_b(b.layout())) {
@@ -621,8 +593,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
 
     const typename R::AElem* a_base = a.ptr<typename R::AElem>();
     // A's hardware shift (see int8_a_pack_bias): the packers take it, the
-    // epilogue takes what the kernels did not fold back out themselves. The
-    // fused dq route reads fp and quantises, so what matters is the target.
+    // epilogue takes back whatever the kernels did not fold out. The fused dq
+    // route reads fp and quantises, so the target dtype decides.
     bool a_biased = false;
     [[maybe_unused]] int32_t a_bias_offset = 0;
     if constexpr (!R::is_fp) {
@@ -632,9 +604,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     }
 
     // The integer bias: an int32 [N] column vector the output pass adds after
-    // the zero-point compensation and before Relu. It is not scaled by alpha,
-    // which only rides the RHS pack. The dequantizing route has no int32 bias —
-    // its optional bias is the fp output-typed one in inputs[2].
+    // the zero-point compensation and before Relu, not scaled by alpha (which
+    // only rides the RHS pack). The dequantizing route has no int32 bias — its
+    // bias is the fp-typed inputs[2].
     [[maybe_unused]] const int32_t* int_bias = nullptr;
     if constexpr (!R::is_fp && !R::is_dq) {
         if (inputs.size() > 2) { int_bias = inputs[2].ptr<int32_t>(); }
@@ -648,7 +620,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const int64_t ldd_b_full = plan.ldd_b;
     const int np_full = static_cast<int>(plan.np_slice);
 
-    // Workspace: packed-B panels, then packed A, then (s8 only) the accumulator.
+    // Workspace: packed-B panels, then packed A, then the compact accumulator.
     Elem* pack_b_base = static_cast<Elem*>(workspace);
     auto* pack_a_base = reinterpret_cast<Elem*>(
         static_cast<char*>(workspace) + plan.pack_a_offset);
@@ -669,26 +641,22 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const int64_t num_blocks = split_n ? split_block_count(Ni, nc)
                                        : split_block_count(Mi, mc);
 
-    // The reduction sweep and the epilogue exist only to apply quantization:
-    // with no zero points, no activation, no integer destination and no A shift
-    // left to withdraw, both are arithmetic identities (compensate reduces to
-    // `raw`).
-    // They are not free — a full sweep of A and B up front, then a pass over
-    // every element of C — and at shallow K that fixed cost is what keeps the
-    // call off the kernel rate.
-    // Two kinds of gate. `int8_ep` says the output pass runs on the last-k tile;
-    // the sweep flags say which reductions feed it. They differ only on the dq
-    // route, whose output pass is the dequant multiply and therefore always
-    // runs, while a sweep is pure overhead whenever its half of compensate() is
-    // zero or folded away.
+    // The reduction sweep and the output pass exist only to apply quantization.
+    // With no zero point, no activation, no integer destination and no A shift
+    // left to withdraw, the pass would just copy the raw accumulate and the
+    // sweeps are identities — and neither is free: a sweep of A and B up front,
+    // then a pass over every element of C.
     //
-    // The compensation has two independent halves (see DqEpilogueParams), and
-    // each needs its own reduction:
+    // The compensation has two independent halves, each needing its own sweep:
     //   col_term → −(a_bias_offset + zp_a)·r_b[n]   sweeps B
     //   row half → −(r_a − k·zp_a)·zp_b[n]          sweeps A
-    // The row half is a row constant whenever zp_b is per-tensor, so it is
-    // folded into a per-row int32 once (row_fold) instead of applied at every
-    // element; a per-channel zp_b has no such fold and stays in the epilogue.
+    // A per-tensor zp_b makes the row half a row constant, folded into one int32
+    // per row (r_fold); a per-channel zp_b has no such fold.
+    //
+    // int8_ep says the output pass runs on the last-k tile; the sweep flags say
+    // which reductions feed it. They differ on the dq route, whose output pass
+    // is the dequant multiply and always runs, so a sweep is paid only when its
+    // half is live.
     bool int8_ep = false;
     bool col_term = false;       // the column half is non-zero for some row
     bool sweep_a = false;        // Σ_k A[m,k] is needed
@@ -698,10 +666,6 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     if constexpr (!R::is_fp) {
         const QuantParams& qa = a.quant_params();
         const QuantParams& qb = b.quant_params();
-        // The two questions are separate, and the answers are the two gate
-        // conditions: a u8 activation against symmetric weights only needs r_b,
-        // an s8 activation against asymmetric weights only needs r_a, and the
-        // fully symmetric setup needs neither.
         col_term = any_zp_differs(qa.zero_point_data, qa.zero_point, qa.num_scales,
                                   Mi, -a_bias_offset);
         const bool row_half = any_zp_nonzero(qb.zero_point_data, qb.zero_point,
@@ -719,11 +683,10 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 NNOPS_ASSERT(!sweep_a && !sweep_b);
             }
         } else {
-            // The output pass has its own reasons to run even when no sweep
-            // does: it is where an integer destination, the bias and Relu are
-            // applied. An integer destination is not itself a reason to sweep —
-            // a symmetric s8 W8A8 setup requantizes straight from the raw
-            // accumulate.
+            // The output pass has its own reasons to run when no sweep does:
+            // an integer destination, the bias and Relu live there. An integer
+            // destination alone is no reason to sweep — a symmetric s8 W8A8
+            // setup requantizes the raw accumulate.
             int8_ep = sweep_a || sweep_b || out_q || int_bias != nullptr ||
                       attrs.epilogue.type != EpilogueActivateType::None;
         }
@@ -733,9 +696,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     }
 
     // The int8 output pass rides on the last k-block's tile, exactly where fp
-    // runs its epilogue, so C is never swept a second time. Its full-K inputs
-    // (the reductions) are ready before the blocks start; only the s8
-    // destination moves per batch.
+    // runs its epilogue, so C is never swept twice; its full-K inputs are ready
+    // before the blocks start, only the destination moves per batch.
     using EpParams = typename R::EpilogueParams;
     EpParams ip{};
     if constexpr (!R::is_fp) {
@@ -761,8 +723,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 ip.row_off = fold_row ? r_fold.data() : nullptr;
                 ip.act_u8 = R::a_eff_type(attrs, a) == DataType::u8;
                 ip.ep = &attrs.epilogue;
-                // The dequantize pass is this route's accumulator: the bias
-                // enters there, between the product and the clip.
+                // The dequantize pass is this route's accumulator; the bias
+                // enters there, between product and clip.
                 if (inputs.size() > 2) {
                     ip.col_bias = inputs[2].ptr<typename R::OutElem>();
                 }
@@ -774,9 +736,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 ip.compensate = sweep_a && !fold_row;  // row half, per element
                 ip.col_term = col_term;
                 ip.col_bias = int_bias;   // per-column: MatMul's [N] bias
-                // The folded row half is an int32 added before the requant,
-                // which is what the per-row bias slot already is (MatMul's own
-                // bias is per-column, so the slot is free here).
+                // The folded row half is an int32 added before the requant —
+                // exactly the per-row bias slot, free here because MatMul's own
+                // bias is per-column.
                 ip.bias = fold_row ? r_fold.data() : nullptr;
             }
         }
@@ -807,9 +769,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 if constexpr (R::is_dq) {
                     ip.out = output.ptr<typename R::OutElem>() + c_offset;
                     // Per-token arrays carry one entry per global row
-                    // (num_scales == total_rows()); the tile indexes its rows
-                    // within the batch. A_q is compact, so the batch offset is
-                    // a whole number of rows.
+                    // (num_scales == total_rows()); the tile indexes rows
+                    // within the batch, and a compact A_q makes the batch
+                    // offset a whole number of rows.
                     const QuantParams& qa_b = a.quant_params();
                     const int64_t row_base = (a_offset > 0 && lda > 0) ? a_offset / lda : 0;
                     ip.s_a = qa_b.scale_data ? qa_b.scale_data + row_base : nullptr;
@@ -822,9 +784,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 }
                 if (fold_row) {
                     // −zp_b·(r_a[m] − k·zp_a[m]) for this batch's rows, read
-                    // exactly as the epilogue would read them, so folding the
-                    // term out is bit-identical to applying it per element. A
-                    // per-tensor zp_b is the whole reason this fold exists.
+                    // exactly as the epilogue would, so the fold is
+                    // bit-identical to the per-element term; a per-tensor zp_b
+                    // is the whole reason it exists.
                     for (int64_t m = 0; m < Mi; ++m) {
                         const int32_t zp_a_m = int8_zp_at(ip.zp_a, ip.zp_a_scalar, m);
                         r_fold[static_cast<size_t>(m)] =
@@ -886,13 +848,10 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
 //  Offline-quantized activations — quantize A, then ride the int8 GEMM
 // =========================================================================
 
-/// Quantize A into A_q (A's shape, compact) with A's own offline per-tensor /
-/// per-token parameters.
-///
-/// Rows are split across the pool. The quant kernel wants a per-row float
-/// zero-point array, so a per-token int32 array (or PerTensor's single scalar)
-/// is materialized once per call; per-token arrays are indexed by the global
-/// row, which the compact layout preserves.
+/// Quantize A into A_q (same shape, compact) with A's own per-tensor/per-token
+/// parameters. The kernel wants a per-row float zero-point array, so one is
+/// materialized per call from a per-token int32 array or PerTensor's scalar;
+/// rows split across the pool.
 template <class AT>
 void quantize_activation(const TensorView& a, TensorView& aq,
                          const ComputeContext& ctx) {
@@ -949,10 +908,13 @@ void quantize_activation(const TensorView& a, TensorView& aq,
 /// The fp-activation entry point: materialize A_q, then run the int8 GEMM with
 /// the dequantizing output pass.
 ///
-/// A_q is handed to the plan as inputs[0] on purpose: it carries A's shape and
-/// A's QuantParams in the integer storage, so get_matmul_plan, the batch walk,
-/// lda, the reductions and the arch pack bias (derived from A_q's dtype) are
-/// all correct with no plan changes.
+/// A_q goes to the plan as inputs[0] on purpose: with A's shape and QuantParams
+/// in integer storage, the plan, batch walk, lda, reductions and arch pack bias
+/// all come out right unchanged.
+///
+/// Fused A skips A_q entirely: nothing reads it as a whole — no sweep, and each
+/// row is packed once on an M-split — so the pack quantises straight from A. An
+/// N-split re-packs A per n-block and keeps the materialised form.
 template <class T>
 Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
                std::span<const TensorView> inputs, const ComputeContext& ctx)
@@ -963,8 +925,8 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
     NNOPS_ASSERT(attrs.act_quant_dtype == DataType::s8 ||
                  attrs.act_quant_dtype == DataType::u8);
 
-    // A_q's shape and parameters, with no storage: the plan only reads the
-    // description, and the int8 geometry is chosen by the target dtype.
+    // A_q's shape and parameters with no storage: the plan reads only the
+    // description, and the target dtype picks the int8 geometry.
     const TensorView aq_shape(a.shape_span(), attrs.act_quant_dtype, nullptr,
                               TensorLayout::NCHW, a.quant_params());
     auto plan = get_matmul_plan(attrs, aq_shape.desc(), b.desc(),
@@ -972,16 +934,10 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
                                 ctx.cpu.thread_slot_count() > 0);
     NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
 
-    // Fused A: nothing ever reads A_q as a whole — no reduction sweep (the
-    // compensation is the identity here) and, on an M-split, each A row is
-    // packed exactly once — so the pack can quantise straight from A and the
-    // M×K intermediate never exists. An N-split re-packs A once per n-block,
-    // which would quantise the same row `nt` times; it keeps the materialised
-    // form.
     const auto [M, N, K] = matmul_dims(attrs, a, b);
     const int32_t a_bias_offset = int8_epilogue_offset(attrs.act_quant_dtype);
-    // The optional bias rides `inputs` through both branches: the fused route
-    // reads A from it, the materialised one only needs its third element.
+    // The optional bias rides `inputs` through both branches: the fused one
+    // passes the array through, the materialised one substitutes A_q for A.
     if (!plan.split_n && !attrs.transpose_a &&
         !dq_needs_compensation(a, b, a_bias_offset, M, N)) {
         PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
@@ -1016,8 +972,8 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
 namespace {
 
 /// An optional third input (a per-column bias) rides the routes that write fp
-/// output: the fp kernels seed their accumulator with it, the dequantizing int8
-/// route adds it inside its output pass. The raw integer outputs reject it (see
+/// output: the fp kernels seed their accumulator with it, the dequantizing route
+/// adds it in its output pass. Integer outputs take an int32 bias instead (see
 /// matmul_cpu).
 Status matmul_dispatch_impl(const MatMulAttributes& attrs,
                           TensorView& output,
@@ -1036,10 +992,10 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     const auto dt_b = b.data_type();
 
     // A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob:
-    // same dtype as A, f32 or f16, and alpha 1 — alpha rode the per-call RHS
-    // pack, and a load-time blob has no per-call slot for it. Its numel is the
-    // one thing that can be wrong about it (a blob packed against another K),
-    // so it is checked here rather than trusted.
+    // same dtype as A, f32 or f16, and alpha 1 (alpha rode the per-call RHS
+    // pack, and a load-time blob has no slot for it). Its numel is the one thing
+    // that can be wrong — a blob packed against another K — so it is checked
+    // rather than trusted.
     if (is_packed_matmul_b(b.layout())) {
         if (dt_a != dt_b || (dt_a != DataType::f32 && dt_a != DataType::f16)) {
             return Status::unsupported;
@@ -1059,8 +1015,8 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
 #if defined(NNOPS_ARCH_X86_64)
-    // Small-M block quant (Q4_1): decode straight into the reduction,
-    // before the plan and the scratch. Only a transposed A is out of reach.
+    // Small-M block quant (Q4_1): decode straight into the product, before the
+    // plan and the scratch. Only a transposed A is out of reach.
     if (dt_a == DataType::f32 && is_block_packed_dtype(dt_b) &&
         !attrs_n.transpose_a) {
         const auto [M, N, K] = matmul_dims(attrs_n, a, b);
@@ -1081,10 +1037,10 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
     // Offline-quantized activations × s8 weights: quantize A with its own
-    // per-tensor / per-token parameters, run the int8 GEMM, dequantize into A's
-    // dtype. Without active parameters the pair has no defined semantics — a
-    // float A is not a quantized tensor to dequantize — so it is rejected
-    // rather than misreading the int8 weights as floats.
+    // per-tensor/per-token parameters, run the int8 GEMM, dequantize into A's dtype.
+    // Without active parameters the pair has no defined semantics — a float A is
+    // not a quantized tensor to dequantize — so it is rejected rather than
+    // reading the int8 weights as floats.
     if (float_a && dt_b == DataType::s8) {
         const QuantParams& qp = a.quant_params();
         const bool qp_ok = qp.is_active() &&
@@ -1103,8 +1059,8 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count(),
                                 ctx.cpu.thread_slot_count() > 0);
 
-    // int8: tiled for s32 / s8 / u8 / fp outputs. A quantized output adds an
-    // int32 M×N accumulator after the scratch.
+    // int8: tiled for s32 / s8 / u8 / fp outputs; every destination but s32
+    // takes the compact int32 accumulator after the scratch.
     if (is_int8_matmul(dt_a, dt_b)) {
         const DataType odt = output.data_type();
         // An fp output dequantizes the same int32 accumulate instead of
@@ -1114,7 +1070,6 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
         const bool out_ok = (odt == DataType::s32) || (odt == DataType::s8) ||
                             (odt == DataType::u8) || out_fp;
         if (!out_ok) {
-            // int8 x int8 needs a s32/s8/u8/f32/f16 output.
             return Status::unsupported;
         }
         NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
@@ -1137,8 +1092,7 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
     // Past the int8 branch: only f32/f16 have a fused kernel, plus a
-    // block-packed B (q4_1), whose blocks decode to A's type in the RHS
-    // pack.
+    // block-packed B (q4_1), whose blocks decode to A's type in the RHS pack.
     if (!float_a || (dt_b != dt_a && !b_block)) {
         return Status::unsupported;
     }
@@ -1166,13 +1120,12 @@ Status matmul_cpu(const MatMulAttributes& attrs,
         return matmul_dispatch_impl(attrs, output, inputs, ctx, workspace);
     }
 
-    // An optional [N] bias, typed by the output branch. An fp output
-    // (f32/f16) carries an fp bias: every fp-output route consumes it where its
-    // accumulator is seeded — the fp kernels with beta·C_old + bias before the
-    // first k-block, the dequantizing int8 route between the dequantize and the
-    // clip. An integer output (s32/s8/u8) carries an int32 bias instead, added
-    // by the int8 output pass after the compensation and before Relu. Bias is
-    // not scaled by alpha, which only rides the RHS pack.
+    // An optional [N] bias, typed by the output branch. An fp output (f32/f16)
+    // carries an fp bias, consumed where the accumulator is seeded — before the
+    // first k-block on the fp kernels, between dequantize and clip on the
+    // dequantizing one. An integer output (s32/s8/u8) takes an int32 bias, added
+    // by the int8 output pass after the compensation and before Relu. Neither is
+    // scaled by alpha, which only rides the RHS pack.
     const TensorView& bias = inputs[2];
     const DataType odt = output.data_type();
     const bool int_out = odt == DataType::s32 || odt == DataType::s8 ||

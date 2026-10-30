@@ -1,4 +1,20 @@
-/// Unit tests for QuantizeLinear / DequantizeLinear operators.
+/// @file test_quant_linear.cpp
+/// @brief QuantizeLinear / DequantizeLinear tests (CPU backend) — saturation,
+///        zero point, the three granularities, and a quantize/dequantize
+///        roundtrip.
+///
+/// Quantize rounds half-to-even (ONNX default), not half-up. Granularity comes
+/// from the scale shape and `axis` (resolve_quant_granularity): a scalar scale
+/// is PerTensor, axis < 0 (the default) is PerToken with one param per
+/// innermost row — [2, 2, 2] is four rows of two — and axis >= 0 is
+/// PerChannel, one param per index along that axis, intended for weights
+/// (axis=0 over an [OC, IC] matrix). Quantize results saturate to the output
+/// dtype's range: s8 [-128, 127], u8 [0, 255].
+///
+/// The random QuantizeLinear oracle uses std::lround (ties away from zero), so
+/// it agrees with the kernel except on exact ties — the hand-built
+/// quantize_linear_2d_per_channel case pins those. The roundtrip allows
+/// 0.55 * scale: nearest rounding bounds the error by scale/2.
 
 #include "nnops/ops/quant_linear.hpp"
 #include "common/test_harness.hpp"
@@ -210,13 +226,12 @@ NNOPS_TEST(quantize_linear_2d_per_channel) {
 }
 
 NNOPS_TEST(quantize_linear_2d_per_token) {
-    // [M, N] → one scale per row (M entries); each row shares its scale.
     const int64_t shape[] = {2, 3};
     float in_data[] = {0.0f, 1.0f, 2.0f, 10.0f, 20.0f, 30.0f};
     TensorView input(shape, DataType::f32, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.axis = -1;  // per-token (default): one scale per row
+    attrs.axis = -1;
     attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
@@ -243,13 +258,12 @@ NNOPS_TEST(quantize_linear_2d_per_token) {
 }
 
 NNOPS_TEST(quantize_linear_3d_per_token) {
-    // [2, 2, 2] → 4 rows of 2 elements; 4 scales (one per row).
     const int64_t shape[] = {2, 2, 2};
     float in_data[] = {0.0f, 1.0f, 2.0f, 4.0f, 10.0f, 20.0f, 30.0f, 40.0f};
     TensorView input(shape, DataType::f32, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.axis = -1;  // per-token (default): one scale per row
+    attrs.axis = -1;
     attrs.output_dtype = DataType::s8;
     auto op = QuantizeLinear::create(attrs, Backend::CPU);
 
@@ -268,20 +282,18 @@ NNOPS_TEST(quantize_linear_3d_per_token) {
     // Row 0 (scale=1): 0,1
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[0]), 0);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[1]), 1);
-    // Row 1 (scale=2): 2/2=1, 4/2=2
+    // Row 1 (scale=2): 1,2
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[2]), 1);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[3]), 2);
-    // Row 2 (scale=5): 10/5=2, 20/5=4
+    // Row 2 (scale=5): 2,4
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[4]), 2);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[5]), 4);
-    // Row 3 (scale=10): 30/10=3, 40/10=4
+    // Row 3 (scale=10): 3,4
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[6]), 3);
     NNOPS_EXPECT_EQ(static_cast<int>(out_buf[7]), 4);
 }
 
 NNOPS_TEST(quantize_linear_per_channel_axis0_weights) {
-    // Weight-like [OC, IC] quantized per output channel (axis=0): the
-    // PerChannel mode is reserved for weights.
     const int64_t shape[] = {2, 4};
     float in_data[] = {0.0f, 1.0f, 2.0f, 3.0f, 10.0f, 20.0f, 30.0f, 40.0f};
     TensorView input(shape, DataType::f32, in_data);
@@ -455,13 +467,12 @@ NNOPS_TEST(dequantize_linear_2d_per_channel) {
 }
 
 NNOPS_TEST(dequantize_linear_2d_per_token) {
-    // [M, N] → one scale per row (M entries).
     const int64_t shape[] = {2, 3};
     int8_t in_data[] = {1, 2, 3, 4, 5, 6};
     TensorView input(shape, DataType::s8, in_data);
 
     QuantLinearAttributes attrs;
-    attrs.axis = -1;  // per-token (default): one scale per row
+    attrs.axis = -1;
     attrs.output_dtype = DataType::f32;
     auto op = DequantizeLinear::create(attrs, Backend::CPU);
 
@@ -520,17 +531,12 @@ NNOPS_TEST(dequantize_linear_random) {
     }
 }
 
-// ============================================================
-// Roundtrip test
-// ============================================================
-
 NNOPS_TEST(quant_dequant_roundtrip_i8) {
     auto [in_vec, input] = test::make_random_tensor({4, 8}, -5.0f, 5.0f);
 
     float scale_val = 0.1f;
     int8_t zp_val = 0;
 
-    // Quantize
     QuantLinearAttributes q_attrs;
     q_attrs.output_dtype = DataType::s8;
     auto q_op = QuantizeLinear::create(q_attrs, Backend::CPU);
@@ -547,7 +553,6 @@ NNOPS_TEST(quant_dequant_roundtrip_i8) {
     const TensorView q_ins[] = {input, q_scale, q_zp};
     q_op->compute(q_out, q_ins);
 
-    // Dequantize
     QuantLinearAttributes dq_attrs;
     dq_attrs.output_dtype = DataType::f32;
     auto dq_op = DequantizeLinear::create(dq_attrs, Backend::CPU);
@@ -562,10 +567,6 @@ NNOPS_TEST(quant_dequant_roundtrip_i8) {
         NNOPS_EXPECT_TRUE(err <= scale_val * 0.55f);
     }
 }
-
-// ============================================================
-// OpType tests
-// ============================================================
 
 NNOPS_TEST(quant_linear_op_type) {
     auto q_op = QuantizeLinear::create(Backend::CPU);

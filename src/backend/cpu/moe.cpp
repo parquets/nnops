@@ -1,32 +1,28 @@
 /// @file moe.cpp
-/// @brief CPU Mixture-of-Experts kernel — fused router + per-expert FFN.
+/// @brief CPU Mixture-of-Experts — fused router + per-expert FFN.
 ///
-/// Semantics follow onnxruntime's `com.microsoft::MoE` CPU kernel: the router
-/// logits are scored over *all* experts, the top-K are selected (ties toward
-/// the lower expert index), optionally renormalized and scaled, and then each
-/// selected expert's FFN runs and contributes `w * expert_out` to the token's
-/// output.
+/// Semantics follow onnxruntime's `com.microsoft::MoE`: the logits are scored
+/// over *all* experts, top-K are selected (ties toward the lower expert index),
+/// optionally renormalized and scaled, then each selected expert's FFN
+/// contributes `w * expert_out` to the token's output. `attrs.router_gating`
+/// picks the scoring function — softmax by default (what ORT does), or sigmoid
+/// / sqrt-softplus following llama.cpp's `expert_gating_func`; all three are
+/// monotonic in the logits, so the selected experts are the same and only the
+/// mixing weights change.
 ///
-/// The scoring function is `attrs.router_gating` — softmax by default (which is
-/// what ORT does, unconditionally), or sigmoid / sqrt-softplus following
-/// llama.cpp's `expert_gating_func`. It changes only the mixing weights: all
-/// three are monotonic in the logits, so the selected experts are the same.
-///
-/// The work is split in two phases so that neither races:
-///
-///   A. per expert — gather its routed tokens, FC1 -> activation -> FC2, and
-///      write the result to a private per-route slot. Different experts own
-///      disjoint slots, so this parallelizes over experts.
+/// Two phases, so that neither races:
+///   A. per expert — FC1 -> activation -> FC2 over its routed tokens, into that
+///      expert's private per-route slots. The slots are disjoint, so this
+///      parallelizes over experts and never touches the output tensor.
 ///   B. per token — sum the token's K contributions in a fixed order and write
-///      the output row. Each token is owned by exactly one worker.
+///      the output row; each token has exactly one owner.
+/// A direct `out[token] += ...` in phase A would be a lost update: with
+/// top-K > 1 a token belongs to K *different* experts, which run on different
+/// workers.
 ///
-/// Accumulating `out[token] += ...` directly in phase A would be a lost update:
-/// with top-K > 1 a token belongs to K *different* experts, which run on
-/// different workers.
-///
-/// The per-expert GEMMs reuse the library's tiled `matmul_cpu` with a
-/// *default-constructed* ComputeContext, so the inner GEMM stays sequential and
-/// does not nest a second parallel region inside phase A.
+/// The per-expert GEMMs reuse `matmul_cpu` with a *default-constructed*
+/// ComputeContext, so the inner GEMM stays sequential and nests no second
+/// parallel region inside phase A.
 
 #include "nnops/ops/moe.hpp"
 #include "nnops/detail/assert.hpp"
@@ -47,8 +43,7 @@ namespace {
 
 using nnops::backend::cpu::half;
 
-/// Absent optional inputs arrive either as an omitted argument or as an empty
-/// TensorView (data == nullptr) — treat both as "not provided".
+/// Optional inputs may be omitted or passed empty; either means "not provided".
 inline bool has_input(std::span<const TensorView> inputs, size_t i) noexcept
 {
     return i < inputs.size() && !inputs[i].is_empty();
@@ -60,15 +55,10 @@ inline float ldf(const T* p) noexcept { return simd::s_load(p); }
 template <typename T>
 inline void stf(T* p, float v) noexcept { simd::s_store(p, v); }
 
-/// Elementwise router scores, for the gating functions that do not need the
-/// whole row. Softmax normalizes across the row, so it is computed by the caller
-/// directly; these two are pointwise and can be applied a logit at a time.
-///
-/// Sigmoid saturates on its own (exp(-x) overflows to inf at ~-88, giving 0; at
-/// large +x it underflows to 0, giving 1), so it needs no range guard. Softplus
-/// does: ggml guards at 20 and llama.cpp's `ggml_compute_softplus_f32` is the
-/// model here — log1p(exp(x)) loses nothing below the guard and would overflow
-/// above it.
+/// Elementwise router scores for the gatings that do not need the whole row
+/// (softmax is normalized by the caller). Sigmoid saturates on its own;
+/// softplus needs the guard at 20 that ggml uses — beyond it log1p(exp(x))
+/// already equals x in f32, and exp(x) overflows f32 near 88.
 inline float gating_sigmoid(float x) noexcept
 {
     return 1.0f / (1.0f + std::exp(-x));
@@ -79,9 +69,6 @@ inline float gating_sqrt_softplus(float x) noexcept
     return std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
 }
 
-/// SwiGLU gate/value combine, matching moe.hpp's documented formula:
-///   h = gate * sigmoid(alpha * gate) * (value + beta)
-/// with both halves clamped to +/- limit first when limit is finite.
 inline float swiglu_combine(float gate, float value, float alpha, float beta,
                             float limit) noexcept
 {
@@ -93,15 +80,8 @@ inline float swiglu_combine(float gate, float value, float alpha, float beta,
     return gate * sig * (value + beta);
 }
 
-/// Run one `[M,K] x [N,K]^T -> [M,N]` GEMM into @p out, sequentially.
-///
-/// B is `transpose_b`, i.e. stored `[out_features, in_features]` — the layout the
-/// stacked expert weights already use. The output is zeroed first: below
-/// GEMM_FAST_PATH_THRESHOLD the f32 path routes to matmul_ref, which evaluates
-/// `sum + beta * (*dst)` and therefore *reads* C even when beta == 0 — pooled
-/// scratch recycled from another op can hold NaN, and `0 * NaN` would poison the
-/// whole tile. The tiled path avoids this via zero_mode, so the zeroing only
-/// matters for small experts, which is exactly where it is cheap.
+/// Run one `[M,K] x [N,K]^T -> [M,N]` GEMM into @p out, sequentially. B is
+/// `transpose_b` — the stacked expert weights are already `[out, in]`.
 template <typename T>
 void expert_gemm(const T* a, int64_t M, int64_t K,
                  const T* b, int64_t N,
@@ -114,7 +94,6 @@ void expert_gemm(const T* a, int64_t M, int64_t K,
     const int64_t b_shape[] = {N, K};
     const int64_t c_shape[] = {M, N};
 
-    // TensorView takes void*; the GEMM reads B and never writes it.
     TensorView a_view(a_shape, dt, const_cast<T*>(a));
     TensorView b_view(b_shape, dt, const_cast<T*>(b));
     TensorView c_view(c_shape, dt, out);
@@ -123,7 +102,7 @@ void expert_gemm(const T* a, int64_t M, int64_t K,
     mm.transpose_b = true;
 
     const TensorView ins[] = {a_view, b_view};
-    const ComputeContext serial_ctx;  // no hooks -> inner GEMM runs sequentially
+    const ComputeContext serial_ctx;
     matmul_cpu(mm, c_view, ins, serial_ctx, nullptr);
 }
 
@@ -174,9 +153,8 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     NNOPS_ASSERT(fc1_w.shape(0) == E && fc2_w.shape(0) == E);
     NNOPS_ASSERT(fc2_w.shape(1) == H);
     if (is_swiglu) {
-        // Only the Separate layout is implemented: the value half comes from
-        // fc3, so fc1 is the gate alone (fc1_out == I) and fc3 is required.
-        // Interleaved/Block would pack gate+value into fc1 (fc1_out == 2*I).
+        // Only Separate is implemented: fc1 is the gate alone and fc3 holds the
+        // value; the fused layouts pack both into fc1 (fc1_out == 2 * I).
         NNOPS_ASSERT_MSG(attrs.swiglu_layout == SwiGLULayout::Separate,
                          "moe_cpu: only the Separate SwiGLU layout is supported");
         NNOPS_ASSERT(has_fc3_w);
@@ -204,20 +182,16 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
     const int64_t total = k * num_tokens;  // number of (token, expert) routes
 
-    // fc1_out only ever appears in the guards above. Below, FC1 is driven with
-    // fc1_out = I: the gate buffer is laid out as [n_e, I], so a Release build
-    // (where NNOPS_ASSERT compiles away) fed fc1_out != I would silently
-    // mis-stride the activation and FC2 rather than fail. That mismatch is
-    // outside the op's contract — no layout in moe.hpp produces it.
+    // fc1_out is used only by the guards above; FC1 below is driven with
+    // fc1_out = I. A Release build (NNOPS_ASSERT compiled out) fed fc1_out != I
+    // would silently mis-stride the gate buffer and FC2 rather than fail — no
+    // layout in moe.hpp produces that.
     (void)fc1_out;
 
-    // ------------------------------------------------------------------
-    // Routing: score over all experts (`attrs.router_gating`), then top-K,
-    // then optional normalize and scale. Serial on purpose — O(T*E) is
-    // negligible next to the GEMMs, and a fixed order keeps the tie-break and
-    // the weights bit-reproducible. Everything that finalizes route_weight
-    // belongs in here: Phase B reads it from worker threads.
-    // ------------------------------------------------------------------
+    // Routing, serial on purpose: O(T*E) is negligible next to the GEMMs, and
+    // the fixed order keeps the tie-break and the weights bit-reproducible.
+    // Anything that finalizes route_weight must happen here — phase B reads it
+    // from worker threads.
     std::vector<int32_t> route_expert(static_cast<size_t>(total));
     std::vector<float>   route_weight(static_cast<size_t>(total));
     {
@@ -229,8 +203,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
             switch (attrs.router_gating) {
             case MoERouterGating::Softmax: {
-                // Max-subtracted for stability. The scoring is over *all* E
-                // experts, so the softmax normalizes the full row.
+                // Max-subtracted for stability; softmax covers the full row.
                 float max_logit = ldf(logits);
                 for (int64_t e = 1; e < E; ++e) {
                     const float v = ldf(logits + e);
@@ -247,8 +220,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                 }
             } break;
             case MoERouterGating::Sigmoid:
-                // Pointwise, and deliberately *not* max-subtracted: shifting the
-                // logits would change the scores, not just rescale them.
+                // Not max-subtracted: sigmoid is not shift-invariant.
                 for (int64_t e = 0; e < E; ++e) {
                     probs[static_cast<size_t>(e)] = gating_sigmoid(ldf(logits + e));
                 }
@@ -262,8 +234,8 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
             std::fill(used.begin(), used.end(), 0);
             for (int64_t j = 0; j < k; ++j) {
-                // Scan ascending with a strict '>', so an exact tie keeps the
-                // lower expert index.
+                // Ascending scan, strict '>': an exact tie keeps the lower
+                // expert index.
                 int64_t best = -1;
                 for (int64_t e = 0; e < E; ++e) {
                     if (used[static_cast<size_t>(e)]) { continue; }
@@ -291,9 +263,8 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                 }
             }
 
-            // Routed scaling (llama.cpp's w_scale / DeepSeek-V3's 2.5) goes
-            // last, on whatever the routing gathered — so it composes with the
-            // renormalization above rather than fighting it.
+            // Routed scaling (llama.cpp's w_scale, DeepSeek-V3's 2.5) goes
+            // last, so it composes with the renormalization above.
             if (attrs.routed_scaling_factor != 1.0f) {
                 for (int64_t j = 0; j < k; ++j) {
                     route_weight[static_cast<size_t>(t * k + j)] *= attrs.routed_scaling_factor;
@@ -302,11 +273,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         }
     }
 
-    // ------------------------------------------------------------------
-    // Group the routes by expert: counts -> exclusive prefix sum -> slots.
-    // Routes of one expert end up contiguous, and `route_row[s]` maps a slot
-    // back to the token it came from.
-    // ------------------------------------------------------------------
+    // Group the routes by expert: counts -> exclusive prefix sum -> slots, so
+    // one expert's routes are contiguous; route_row[s] maps a slot back to the
+    // token it came from.
     std::vector<int32_t> expert_off(static_cast<size_t>(E) + 1, 0);
     for (int64_t r = 0; r < total; ++r) {
         ++expert_off[static_cast<size_t>(route_expert[static_cast<size_t>(r)]) + 1];
@@ -336,8 +305,6 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     T* gather = gather_owner.as<T>();
     T* eout   = eout_owner.as<T>();
 
-    // Gather the routed token rows into contiguous [total, H] — every slot is
-    // written by exactly one loop iteration, so this parallelizes cleanly.
     const size_t row_bytes = static_cast<size_t>(H) * sizeof(T);
     ctx.cpu.run(0, total, [&](int64_t s) {
         std::memcpy(gather + s * H,
@@ -345,10 +312,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                     row_bytes);
     });
 
-    // ------------------------------------------------------------------
-    // Phase A: one expert per task. Slots are disjoint, so no synchronization
-    // is needed — but note the output tensor is *not* touched here.
-    // ------------------------------------------------------------------
+    // Phase A: one expert per task; each writes only its own slots.
     ctx.cpu.run(0, E, [&](int64_t e) {
         const int64_t begin = expert_off[static_cast<size_t>(e)];
         const int64_t n_e = expert_off[static_cast<size_t>(e) + 1] - begin;
@@ -379,8 +343,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                                              attrs.swiglu_limit));
             }
         } else {
-            // Same activations as the reference (GELU is the tanh approximation
-            // in both). Identity is a no-op, so skip the pass entirely.
+            // GELU is the tanh approximation; Identity skips the pass.
             using namespace nnops::kernel;
             switch (attrs.activation) {
             case MoEActivation::Relu: relu<T>(gate, gate, n_e, I, I, I, false); break;
@@ -398,12 +361,9 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         add_bias_rows<T>(out_slice, n_e, H, fc2b_ptr ? fc2b_ptr + e * H : nullptr);
     });
 
-    // ------------------------------------------------------------------
-    // Phase B: one token per task. Sum its K contributions in a fixed order
-    // (j ascending) and write the row. f32 accumulation: for f16 this is the
-    // only place precision is under our control, since the per-expert GEMMs
-    // accumulate in f16.
-    // ------------------------------------------------------------------
+    // Phase B: one token per task, its K contributions summed in j order. On the
+    // f16 path this f32 accumulator is the only precision under our control —
+    // each expert's GEMM result arrives stored as f16.
     ctx.cpu.run(0, num_tokens, [&](int64_t t) {
         T* out_row = output.ptr<T>() + t * out_row_stride;
         for (int64_t n = 0; n < H; ++n) {
@@ -427,14 +387,13 @@ Status moe_cpu(const MoEAttributes& attrs,
              const ComputeContext& ctx,
              void* workspace)
 {
-    // Sigmoid scores sit in (0, 1) and do not sum to 1 (sqrt-softplus scores are
-    // unbounded, but likewise do not sum to 1), so leaving them unnormalized
-    // scales the routed output down — by about 2/k for sigmoid.
-    // That is well defined and occasionally intended, hence a warning rather
-    // than an assertion — but it is far more often a forgotten
-    // `normalize_routing_weights` (DeepSeek-V3 pairs the two, plus a
-    // `routed_scaling_factor`). It cannot fire when `router_weights` supplies
-    // the mixing weights, since then the gating scores only select.
+    // Sigmoid scores sit in (0, 1) and do not sum to 1 (sqrt-softplus scores
+    // are unbounded and likewise do not sum to 1), so leaving them unnormalized
+    // scales the routed output down. That is well defined and occasionally
+    // intended, hence a warning rather than an assertion — but it is far more
+    // often a forgotten `normalize_routing_weights`. It cannot fire when
+    // `router_weights` supplies the mixing weights, since then the scores only
+    // select.
     NNOPS_WARN_MSG(attrs.router_gating == MoERouterGating::Softmax ||
                        attrs.normalize_routing_weights ||
                        has_input(inputs, 8),

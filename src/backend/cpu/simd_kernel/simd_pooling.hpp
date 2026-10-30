@@ -2,17 +2,27 @@
 /// @file simd_pooling.hpp
 /// @brief SIMD kernels for 2D/3D spatial pooling.
 ///
-/// Two driver families, one per lane choice:
-///   channel   — the lane is a channel, so the loop is over ow. Channel-last
-///               (NHWC/NDHWC) pixels are C elements apart, and a ragged last
-///               block runs short.
-///   planar    — NCHW/NCDHW: the lane is an output column, so padding is filled
-///               per lane instead of skipped, and one row is produced per call.
-/// One driver covers every variant: the row count (h4/h1), the accumulate
-/// (max/avg), and the element type (f32/f16 vs dequantize/requantize) are all
-/// template parameters. Bounds are checked in-kernel, so any stride/padding
-/// combination works. Quantized pooling runs on the channel lane, so it covers
-/// the channel-last layout but not planar.
+/// Two drivers, one per lane choice. The channel driver lanes a channel vector
+/// over output columns (channel-last NHWC/NDHWC); the planar driver (NCHW/
+/// NCDHW) lanes the output column. One channel driver covers every variant:
+/// row count R, IsMax, and Src/Dst (f32/f16, dequantize/requantize) are template
+/// parameters, and bounds are checked in-kernel, so any stride/padding works.
+/// Quantized pooling runs on the channel lane only, not planar.
+///
+/// The channel walk mirrors the depthwise kernel: one row pointer per (kd, kh, r),
+/// biased by the left pad, an interior span whose every tap is in the input row
+/// that takes no bounds or null test, and NV adjacent channel vectors per call —
+/// 2 where the channels allow, since two f32 vectors fill a cache line and a
+/// one-vector sweep pays twice the line traffic for the same arithmetic.
+///
+/// A planar lane cannot skip an out-of-range tap (a padded lane would read the
+/// pitch), so planar_load fills the accumulate's identity and a short last block
+/// stores through a scalar tail. Planar runs one output row per call — the
+/// channel path's R-row blocking shares input rows, which a width-vectorized
+/// kernel does not need. Global pooling scans contiguous memory with four
+/// accumulators and widens f16 to f32 on load so the sum never runs in f16. A
+/// contiguous plane is one flat run, so even a small plane — a 7x7 global pool,
+/// the shape the model runners see — vectorizes instead of falling into the tail.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_access.hpp"
@@ -27,9 +37,7 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-// ============================================================
-// Kernel parameters — set once, od/oh updated per call
-// ============================================================
+// --- Kernel parameters: set once, od/oh updated per call ---
 
 struct PoolingKernelParams {
     int64_t ID, IH, IW;          // input spatial dims
@@ -49,24 +57,7 @@ struct PoolingKernelParams {
     int64_t ow_end = -1;         // one past the last; negative means OW
 };
 
-// ============================================================
-// The driver: R output rows at a time, IsMax picks the accumulate
-// ============================================================
-//
-// The window walk is written the way the depthwise kernel writes it, because
-// the two problems are the same shape: one channel vector per pixel, a tap
-// pattern that repeats over the width, and a border that is a small fraction of
-// the plane. So:
-//
-//   * one row pointer per (kd, kh, r), built once per call and already biased
-//     by the left pad, so a tap's address is `row + (ow*SW + kw*DW)*pix` and
-//     the only product left in the loop is the one the pixel stride forces;
-//   * an interior span of output positions whose every tap is inside the input
-//     row, where the tap loop takes no bounds test and no null test at all;
-//   * NV adjacent channel vectors of the pixel per call. A channel-last plane
-//     takes 2 where the channels allow it, because a 64-byte line holds two
-//     vectors and a one-vector call leaves the other half of every line for a
-//     later sweep — twice the line traffic for the same arithmetic.
+// --- The channel driver: R output rows per call, IsMax picks the accumulate ---
 
 template <int R, int NV, bool IsMax, typename Src, typename Dst>
 inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
@@ -75,8 +66,6 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
     using V = decltype(srcs[0].zero());
     using InPtr = const typename Src::elem*;
     const V vzero = srcs[0].zero();
-    // Same two strides as the depthwise kernel: what "one pixel further" and
-    // "one channel vector further" cost is all that separates the layouts.
     const int64_t pix = p.pix_stride;
     constexpr int64_t kVec = kChannelLanes;
     constexpr int64_t kMaxTapRows = 256;
@@ -110,8 +99,7 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
         }
     }
 
-    // Output positions whose whole window is inside the input row: the leftmost
-    // tap is ow*SW - PW, the rightmost ow*SW + (KW-1)*DW - PW.
+    // Output columns whose whole window is inside the input row.
     const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
     const int64_t last_hi = p.IW - 1 + p.PW - (p.KW - 1) * p.DW;
     const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
@@ -157,8 +145,7 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
                             }
                         }
                     }
-                    // Counted even for max: a window with no valid tap stores
-                    // the identity-free zero, not -inf.
+                    // Counted even for max: an all-pad window stores zero, not -inf.
                     for (int r = 0; r < R; ++r) { cnt[r] += p.KW; }
                     continue;
                 }
@@ -209,17 +196,7 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
     }
 }
 
-// ============================================================
-// Planar (NCHW/NCDHW) driver — the SIMD lane spans output width
-// ============================================================
-//
-// Same window walk as pool_rows, with two differences. The lane is an output
-// column, so a tap outside the input cannot be left out — a padded column
-// would read whatever the pitch holds — and is filled with the accumulate's
-// identity instead (planar_load). And a row's last block carries fewer than L
-// live lanes, so it stores through a scalar tail. One output row per call: the
-// channel path's h4 blocking shares input rows across output rows, which is
-// not where a width-vectorized kernel spends its time.
+// --- Planar (NCHW/NCDHW) driver: the SIMD lane spans output width ---
 
 template <bool IsMax, typename T>
 inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
@@ -228,8 +205,7 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
     constexpr int64_t L = simd_lane_for<T>;
     const T fill = IsMax ? std::numeric_limits<T>::lowest() : static_cast<T>(0);
 
-    // Row-constant half of the tap count: the in-range (kd, kh) positions, each
-    // spanning the full W window.
+    // Row-constant half of the tap count: in-range (kd, kh) positions.
     int64_t row_taps = 0;
     for (int64_t kd = 0; kd < p.KD; ++kd) {
         const int64_t id = p.od * p.SD + kd * p.DD - p.PD;
@@ -240,8 +216,8 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
         }
     }
 
-    // In-range taps of one output column. W padding (the only dim that can trim
-    // a window per column) forces a per-lane count; otherwise it is a constant.
+    // W padding is the only dim that trims a window per column, so it forces a
+    // per-lane count; otherwise the count is a constant.
     const auto taps_of = [&](int64_t col) {
         if (p.PW == 0) { return row_taps * p.KW; }
         const int64_t iw_first = col * p.SW - p.PW;
@@ -253,9 +229,9 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
         return row_taps * n;
     };
 
-    // Max: an all-padding window is 0 (the channel kernel and the reference
-    // say so). Avg: exclude_pad divides by the tap count. With no padding the
-    // tap count is uniform and this is a single scale.
+    // Max: an all-pad window is 0 (the channel kernel zeroes it too).
+    // Avg: exclude_pad divides by the tap count; with no padding the count is
+    // uniform and this is a single scale.
     const bool count_taps = IsMax ? (p.PD != 0 || p.PH != 0 || p.PW != 0)
                                   : p.exclude_pad;
 
@@ -306,17 +282,7 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
     }
 }
 
-// ============================================================
-// Global pooling — the window is the whole extent, so the reduction is a scan
-// of contiguous memory instead of a window walk
-// ============================================================
-//
-// One output element (planar) or one channel vector per plane, and
-// no bounds math at all. The plane is walked row by row (the pitch can exceed
-// the row width) with four accumulators, so the sum is off the add's latency
-// chain, and a scalar tail, since neither a row width nor a plane size is a
-// multiple of 8. f16 widens to f32 on load: a global sum spans thousands of
-// values, far past what an f16 accumulator holds.
+// --- Global pooling: the window is the whole extent, so a contiguous plane is one scan ---
 
 template <bool IsMax>
 inline v_f32x8 global_op(const v_f32x8& a, const v_f32x8& b)
@@ -341,8 +307,8 @@ inline v_f32x8 global_load(const T* p)
     }
 }
 
-/// Widened load of a short channel vector — zero-filled past @p lanes. Only the
-/// live lanes are ever stored, so the fill value never reaches the output.
+/// Widened load of a short channel vector; zero-filled past @p lanes, and only
+/// the live lanes are ever stored.
 template <typename T>
 inline v_f32x8 global_load_lanes(const T* p, int64_t lanes)
 {
@@ -364,8 +330,7 @@ inline float global_fold(const v_f32x8& v, bool is_max)
     return r;
 }
 
-/// Fold @p n contiguous elements into the four accumulators (and the scalar
-/// tail) — the body both layouts share, called once per plane or once per row.
+/// Fold @p n contiguous elements into the four accumulators and the scalar tail.
 template <bool IsMax, typename T>
 inline void global_accumulate(v_f32x8& acc0, v_f32x8& acc1, v_f32x8& acc2,
                               v_f32x8& acc3, float& tail, const T* p, int64_t n)
@@ -385,12 +350,8 @@ inline void global_accumulate(v_f32x8& acc0, v_f32x8& acc1, v_f32x8& acc2,
     }
 }
 
-/// Max/avg of one planar plane — one channel, the whole spatial extent.
-///
-/// A contiguous plane (pitch == width, which is what an allocated tensor has)
-/// is one flat run, so a 7x7 avgpool — the shape the model runners actually
-/// pool — vectorizes instead of falling entirely into the scalar tail. Only a
-/// pitched plane walks row by row.
+/// Max/avg of one planar plane. A contiguous plane (pitch == width, as an
+/// allocated tensor has) is one flat run; only a pitched plane walks row by row.
 template <bool IsMax, typename T>
 inline float global_planar(const T* in, const PoolingKernelParams& p, float scale)
 {
@@ -423,14 +384,9 @@ inline float global_planar(const T* in, const PoolingKernelParams& p, float scal
 template <typename T>
 inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t lanes);
 
-/// Max/avg of one channel vector's plane — the lanes are eight channels of the
-/// same pixel — every C-th vector of the plane on a channel-last tensor, which
-/// is why @c pix_stride is a parameter. A short last block takes masked loads.
-///
-/// NV vectors of a pixel per pass, like the window kernel: one vector per pass
-/// over a channel-last plane spends two passes on every 64-byte line, and the
-/// line is the unit that costs. A short last block still takes masked loads and
-/// only its live lanes are stored.
+/// Max/avg of one channel vector's plane — eight channels of a pixel, every
+/// @c pix_stride-th vector on a channel-last tensor. NV vectors per pass; a
+/// short last block takes masked loads and stores only its live lanes.
 template <bool IsMax, typename T, int NV, int U = 4, bool Full = true>
 inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p,
                                float scale, bool add_to, int64_t lanes)
@@ -448,8 +404,8 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
         const int64_t l = lanes - k * kVec;
         return (l < 0) ? int64_t{0} : (l > kVec ? kVec : l);
     };
-    // Every vector whole is a separate instantiation, so the common case pays
-    // no per-load lane test — that test is what a masked generic costs.
+    // Full vectors are a separate instantiation, so the common case pays no
+    // per-load lane test.
     const auto load = [&](const T* px, int k) {
         if constexpr (Full) {
             return global_load(px);
@@ -490,9 +446,7 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
     }
 }
 
-/// One channel vector's plane — the single-vector form the short last block of
-/// a channel-last task takes (eight channels or fewer, where the two-vector walk
-/// has nothing to pair).
+/// Single-vector form for the short last block of a channel-last task.
 template <bool IsMax, typename T>
 inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float scale,
                               int64_t lanes)
@@ -528,7 +482,7 @@ inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float s
     return IsMax ? v : v_mul(v, v_set1_f32x8(scale));
 }
 
-/// Store a reduced channel vector — narrowing for f16.
+/// Store a reduced channel vector, narrowing for f16.
 template <typename T>
 inline void global_store(T* out, const v_f32x8& v, bool add_to)
 {
@@ -539,9 +493,7 @@ inline void global_store(T* out, const v_f32x8& v, bool add_to)
     }
 }
 
-// ============================================================
-// MaxPool raw-integer fast path (input and output share scale + zero_point)
-// ============================================================
+// --- MaxPool raw-integer fast path (input and output share scale + zero_point) ---
 
 template <int R, typename T>
 inline void maxpool_fast(T* output, const T* input,
@@ -605,17 +557,7 @@ inline void maxpool_fast(T* output, const T* input,
     }
 }
 
-// ============================================================
-// Channel-last (NHWC/NDHWC) wrappers
-// ============================================================
-//
-// The lane stays on the channel axis, so the row driver is the same one the
-// channel driver uses; only the pixel distance changes (C instead of 8) and the
-// last block can be short. Four output rows per call: the rows share their
-// input rows, and a row's taps form a single dependent chain.
-//
-// The row driver already skips the rows past OH, so the driver calls this once
-// per row group and needs no separate h1 tail.
+// --- Channel-last (NHWC/NDHWC) wrappers ---
 
 template <bool IsMax, typename T>
 inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
@@ -684,7 +626,7 @@ inline void pool_last_quant(OutT* output, const InT* input,
     }
 }
 
-/// Store a reduced channel vector — narrowing for f16, @p lanes elements only.
+/// Store a reduced channel vector, narrowing for f16, @p lanes elements only.
 template <typename T>
 inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t lanes)
 {
@@ -699,9 +641,7 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
     }
 }
 
-// ============================================================
-// Planar (NCHW/NCDHW) entry points
-// ============================================================
+// --- Planar (NCHW/NCDHW) entry points ---
 
 template <typename T>
 inline void maxpool_planar(T* output, const T* input, const PoolingKernelParams& p,

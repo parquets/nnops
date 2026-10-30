@@ -1,21 +1,19 @@
 #pragma once
 /// @file vec_f16x8.hpp
-/// @brief Unified 128-bit float16 vector type and operations (8 half floats).
+/// @brief Unified 128-bit float16 vector (8 lanes) and operations.
 ///
-/// At compile time, selects the best available backend:
-///   - AArch64:   native NEON (float16x8_t)
-///   - x86_64 + __F16C__:                               F16C/AVX2 (__m128i + convert→compute→convert)
-///   - everything else:                                 scalar fallback (uint16_t[8])
+/// Backend selected at compile time: AArch64 native NEON (float16x8_t);
+/// x86_64 + __F16C__ F16C/AVX2 stored as __m128i and run as convert → f32
+/// compute → convert; otherwise scalar (uint16_t[8]). The public API takes
+/// uint16_t for v_load_f16x8/v_store (raw binary16 bits) and float at the
+/// scalar boundary.
 ///
-/// The public API uses uint16_t for load/v_store (raw IEEE 754 binary16 bits)
-/// and float for scalar interchange.
-///
-/// Usage:
-///   #include "nnops/detail/simd/vec_f16x8.hpp"
-///   using namespace nnops::simd;
-///   v_f16x8 a = v_load_f16x8(ptr);
-///   v_f32x8 fa = v_cvt_f16_to_f32(a);   // widen to f32x8 for compute
-///   v_f16x8 r = v_cvt_f32_to_f16(fa);   // narrow back to f16
+/// On x86 the f16→f32 widen is defined in this layer, not arch::sse: it returns
+/// this build's own v_f32x8 (arch::avx2's single __m256 on an AVX build, or
+/// arch::sse's lo/hi __m128 pair otherwise). A same-named overload in arch::sse
+/// with this parameter type would make ADL on a v_f16x8 argument see two viable
+/// candidates — an ambiguity, not a shadow. See the matching note in
+/// arch/x86/sse.hpp.
 
 #if defined(NNOPS_ARCH_AARCH64)
   #include "nnops/detail/simd/arch/arm/neon.hpp"
@@ -58,7 +56,6 @@
   using arch::neon::v_transpose_8x8;
   }} // namespace nnops::simd
 #elif defined(NNOPS_ARCH_X86_64) && defined(__F16C__)
-  // x86_64: F16C + AVX2 (__m128i storage, convert→compute→convert via _mm256_cvtph_ps / _mm256_cvtps_ph)
   #include "nnops/detail/simd/arch/x86/sse.hpp"
   #if defined(__AVX__)
     #include "nnops/detail/simd/arch/x86/avx2.hpp"
@@ -70,14 +67,7 @@
   using arch::sse::v_set1_f16x8;
   using arch::sse::v_zero_f16x8;
 
-  // ---- f16 → f32 widen ----------------------------------------------------
-  // Defined here, in the f16 layer, rather than in an arch namespace: the f32
-  // type it returns is whatever *this build's* v_f32x8 is — arch::avx2::v_f32x8
-  // on an AVX build (a single __m256), arch::sse::v_f32x8 otherwise (a lo/hi
-  // __m128 pair). arch::sse must therefore not also define this name with this
-  // parameter type: ADL on a v_f16x8 argument finds that namespace, and two
-  // viable overloads would be an ambiguity, not a shadow. See the matching note
-  // in arch/x86/sse.hpp.
+  // ---- f16 → f32 widen (see the header for why it lives here) ----
   #if defined(__AVX__)
   inline arch::avx2::v_f32x8 v_cvt_f16_to_f32(const v_f16x8& a) {
       return arch::avx2::v_f32x8(_mm256_cvtph_ps(a.val));

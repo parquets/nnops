@@ -1,18 +1,27 @@
 /// @file attention.cpp
 /// @brief Tiled multi-head scaled dot-product attention — fused QK^T + softmax + AV.
 ///
-/// The scale factor is fused into the GEMM1 RHS pack, so scores accumulate
-/// Q·K^T·scale directly. The GEMM kernels accumulate C += A×B, so the scores
-/// buffer is zeroed before GEMM1 and the output head is zeroed before GEMM2
-/// (attention has no beta / add_to; the reference overwrites the output).
+/// Two routes, picked by the per-head scores area:
+///   - standard (Sq*Sk < kFlashMinScores): materialize scores = Q·K^T·scale,
+///     softmax each row in place, then output = attn·V.
+///   - flash (Sq*Sk >= kFlashMinScores): FlashAttention-1 online softmax,
+///     streaming KV in Br×Bc tiles so scores is never materialized. The task
+///     grid is batch × head × query-block, so long-sequence prefill keeps its
+///     parallelism even when batch × head is small.
 ///
-/// When the per-head scores matrix is large (Sq × Sk ≥ kFlashMinScores), the
-/// tiled online-softmax FlashAttention path (attention_flash_impl) is used
-/// instead, streaming KV in Br×Bc tiles so the full scores matrix is never
-/// materialized (MLAS FlashAttention-1 algorithm, adapted to these kernels).
-/// The flash path parallelizes over batch × head × query-block (B × H × NQ),
-/// mirroring MLAS's q_chunk_count task decomposition, so long-sequence prefill
-/// still exposes ample parallelism even when B × H is small.
+/// The scale is fused into the GEMM1 RHS pack. Both GEMMs only accumulate, so
+/// the first k-block of each output tile runs with zero_mode (add_to=false):
+/// nothing is pre-zeroed, and that block skips the C read.
+///
+/// Mask handling differs by route: the standard path folds it into the
+/// mask+softmax kernel (one pass fewer than `scores += mask`), the flash path
+/// adds it into the S tile before the online-softmax update.
+///
+/// Scratch sizing counts uniform nr_max-wide panels, not a width cascade: the
+/// widest n-block in a loop bounds the count (a greedy per-width decomposition
+/// is not monotonic in n and undersized the slot). The packed-B stride takes
+/// min(Kc, k) of the longer GEMM, since a head dim below Kc would otherwise
+/// over-allocate by up to 2x.
 ///
 /// See attention.h for the per-(batch, head) algorithm, the layout contract
 /// and the scratch layout.
@@ -36,21 +45,15 @@ constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 constexpr float kPosInf =  std::numeric_limits<float>::infinity();
 
 // ---- dtype-selected tiling constants -------------------------------------
-// The GEMM scratch (packed panels) and the k-block length are dtype-dependent;
-// these mirror matmul_helper.h's matmul kernel so the plan and the kernels
-// resolve identical tile sizes for either element type.
+// k-block length per dtype, mirroring matmul_helper.h so plan and kernels agree.
 
 template <class T>
 constexpr int64_t kc_for() {
     return std::is_same_v<T, half> ? KC_F16 : KC_F32;
 }
 
-/// Size bound for the packed-B scratch's k-run.
-///
-/// A GEMM with k length @p k reduces in blocks of at most `min(Kc, k)`, and
-/// D (64/128 in practice) is usually *below* Kc, where sizing the panels from
-/// Kc alone over-allocates the slot by up to 2x. The loops still step by Kc;
-/// this is purely the sizing bound — pass the longer of the two GEMMs' k.
+/// Size bound for the packed-B scratch's k-run: min(Kc, k). The loops still
+/// step by Kc; pass the longer of the two GEMMs' k.
 template <class T>
 constexpr int64_t kc_pack_bound(int64_t k) {
     constexpr int64_t kc = std::is_same_v<T, half> ? KC_F16 : KC_F32;
@@ -58,11 +61,6 @@ constexpr int64_t kc_pack_bound(int64_t k) {
 }
 
 /// Panel count a uniform packed-B tile of any n <= n_max emits.
-///
-/// The uniform packer lays down ceil(n / nr_max) full-width panels, so the
-/// widest n-block in a loop is the bound — not a cascade decomposition (the
-/// greedy per-width decomposition is not monotonic in n and was short by a few
-/// panels; size from the uniform count instead).
 template <class T>
 constexpr int panels_for_pack(int64_t n_max) {
     constexpr int nr_max = nr_max_flt<T>();
@@ -130,14 +128,11 @@ void attention_impl(const AttentionAttributes& attrs,
     const T* mask_ptr = has_mask ? inputs[3].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
-    // Row strides in elements (from pitch, accounts for padding).
     const int64_t q_rs = Q.row_stride_elems();
     const int64_t k_rs = K.row_stride_elems();
     const int64_t v_rs = V.row_stride_elems();
     const int64_t o_rs = output.row_stride_elems();
 
-    // Tile sizes come from the plan (attention_cpu resolved them once,
-    // together with the workspace sizing — single source of truth).
     constexpr int nr_max = nr_max_flt<T>();
     constexpr int64_t kc = kc_for<T>();
 
@@ -146,9 +141,7 @@ void attention_impl(const AttentionAttributes& attrs,
     const int mc2 = plan.mc2;
     const int nc2 = plan.nc2;
 
-    // Uniform 64-byte-aligned panel stride at the largest k-block either GEMM
-    // runs, and the panel count any n-block can emit — both sizing upper
-    // bounds, see kc_pack_bound / panels_for_pack.
+    // Scratch bounds: longest k-block and widest n-block either GEMM sees.
     const int ldd_b_full = static_cast<int>(
         mma_pack_align(nr_max * static_cast<int>(
             kc_pack_bound<T>(std::max(D, Sk))) * static_cast<int>(sizeof(T)))
@@ -169,7 +162,6 @@ void attention_impl(const AttentionAttributes& attrs,
         const int64_t b = idx / H;
         const int64_t h = idx % H;
 
-        // Head base pointers (head D columns are contiguous within each row).
         const T* q_head;
         const T* k_head;
         const T* v_head;
@@ -191,7 +183,7 @@ void attention_impl(const AttentionAttributes& attrs,
         T* pack_b = scores + scores_elems;
 
         // ---- GEMM1: scores = Q @ K^T * scale --------------------------
-        // First k-block writes with add_to=false — no pre-zeroing pass.
+        // k0 == 0 runs zero_mode (overwrite) — no pre-zeroing pass.
         for (int64_t k0 = 0; k0 < D; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
             const int ldd_b = static_cast<int>(
@@ -214,9 +206,9 @@ void attention_impl(const AttentionAttributes& attrs,
         }
 
         // ---- mask + softmax over the last dim, per row, in-place ------
-        // The additive mask is fused into the softmax 3-pass (max → exp+sum →
-        // normalize), so scores is never rewritten before normalization — one
-        // fewer full-buffer pass versus an explicit `scores += mask`.
+        // The mask folds into the softmax 3-pass (max → exp+sum → normalize),
+        // so scores is never rewritten before normalization — one full-buffer
+        // pass cheaper than an explicit `scores += mask`.
         for (int64_t i = 0; i < Sq; ++i) {
             if (mask_ptr) {
                 kernel::mask_softmax_process_standard_row<T>(
@@ -228,7 +220,7 @@ void attention_impl(const AttentionAttributes& attrs,
             }
         }
 
-        // ---- GEMM2: output = attn @ V (first block writes, rest accumulate) ----
+        // ---- GEMM2: output = attn @ V ---------------------------------
         for (int64_t k0 = 0; k0 < Sk; k0 += kc) {
             const int actual_kc = static_cast<int>(std::min<int64_t>(kc, Sk - k0));
             const int ldd_b = static_cast<int>(
@@ -236,9 +228,8 @@ void attention_impl(const AttentionAttributes& attrs,
                 / static_cast<int>(sizeof(T)));
             for (int64_t n = 0; n < D; n += nc2) {
                 const int actual_nc = static_cast<int>(std::min<int64_t>(nc2, D - n));
-                // V is the GEMM's B side: pack [actual_kc][actual_nc] of the
-                // head's V into uniform panels once per (k-block, n-block),
-                // then every m-block reuses it.
+                // V is the B side: packed once per (k-block, n-block), then
+                // every m-block reuses it.
                 tile_pack_rhs(false, actual_nc, actual_kc,
                                       pack_b, ldd_b,
                                       v_head + k0 * v_rs + n, static_cast<int>(v_rs),
@@ -259,11 +250,10 @@ void attention_impl(const AttentionAttributes& attrs,
 
 // ---- FlashAttention routing + tiling -------------------------------------
 //
-// The tiled online-softmax (FlashAttention) path is chosen once the per-head
-// scores matrix (Sq × Sk floats) is large enough that the standard path —
-// materializing the full scores plus the fused mask/softmax passes — would
-// thrash cache. Br / Bc follow the MLAS L2 heuristic:
-//   Bc ≈ L2 / (4 · 4 · (qk_head_size + v_head_size)),  Br = min(Bc, 2D).
+// The flash path is chosen once the per-head scores matrix is large enough
+// that materializing it — plus the fused mask/softmax passes — would thrash
+// cache. Br / Bc follow the MLAS L2 heuristic: Bc = L2 / (sizeof(T)·4·2D) and
+// Br = min(Bc, 2D), then both capped to Sk / Sq.
 
 constexpr int64_t kFlashMinScores = 1 << 16;  // Sq*Sk threshold (≈ 256 KiB f32)
 
@@ -287,13 +277,9 @@ inline void resolve_flash_tile_sizes(int64_t Sq, int64_t Sk, int64_t D, int& Br,
     if (Bc < 1) { Bc = 1; }
 }
 
-// Per-task scratch (elements) — one Br-row query block — mirroring the layout
-// inside attention_flash_impl:
-//   [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b:panels*ldd_b_full]
-//
-// The packed-B slot serves GEMM1 (K = D, N <= Bc) and GEMM2 (K <= Bc, N = D),
-// so the stride is bounded by the longer k-block and the panel count by the
-// wider n-block.
+// Per-task scratch for one Br-row query block, matching the layout inside
+// attention_flash_impl: [m:Br][l:Br][s:Br*Bc][o_acc:Br*D][pack_b]. The
+// packed-B slot serves GEMM1 (K = D, N <= Bc) and GEMM2 (K <= Bc, N = D).
 template <class T>
 inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 {
@@ -312,13 +298,9 @@ inline int64_t flash_per_task_elems(int Br, int Bc, int64_t D)
 
 // ---- tiled FlashAttention kernel -----------------------------------------
 //
-// One parallel task = one query block (Br rows) of one (batch, head): it
-// streams the KV rows in Bc-sized blocks, keeping a running max/sum and an
-// output accumulator so the full Sq×Sk scores matrix is never materialized
-// (standard online-softmax / FlashAttention-1 forward pass). Query blocks are
-// folded into the parallel dimension (B × H × NQ) so long sequences still
-// saturate the thread pool even when B × H is small. Reuses the uniform
-// packed-B route (tile_pack_rhs / tile_mma_direct).
+// One task = one query block (Br rows) of one (batch, head): it streams KV in
+// Bc-sized blocks, carrying a running max/sum and an output accumulator, so
+// the Sq×Sk scores matrix never exists. Reuses the packed-B route above.
 
 template <class T>
 void attention_flash_impl(const AttentionAttributes& attrs,
@@ -396,23 +378,22 @@ void attention_flash_impl(const AttentionAttributes& attrs,
         T* o_acc  = s + static_cast<int64_t>(Br) * Bc;
         T* pack_b = o_acc + static_cast<int64_t>(Br) * D;
 
-        // reset the running online-softmax state for this query block. The
-        // scalar simd bridge is used because std::numeric_limits<T> is not
-        // specialized for half (it would silently yield 0, not -inf) and
-        // static_cast<half>(float) is a numeric bits conversion, not a value
-        // conversion, on the x86 half wrapper.
+        // Reset the running online-softmax state through the scalar simd
+        // bridge: std::numeric_limits<T> is not specialized for half (it
+        // silently yields 0, not -inf), and static_cast<half>(float) truncates
+        // to an integer and stores it as bits on the x86 half wrapper.
         for (int i = 0; i < actual_br; ++i) {
             simd::s_store(&m[i], -std::numeric_limits<float>::infinity());
             simd::s_store(&l[i], 0.0f);
         }
-        // o_acc is written by the first KV block with add_to=false — no
-        // pre-zeroing pass. (The exp_diff rescale below may touch it first on
-        // j0 == 0; that garbage is fully overwritten by the first MMA.)
+        // o_acc is written by the first KV block (zero_mode) — no pre-zeroing
+        // pass. The exp_diff rescale may touch it first on j0 == 0; that
+        // garbage is fully overwritten by the first MMA.
         for (int64_t j0 = 0; j0 < Sk; j0 += Bc) {
             const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, Sk - j0));
 
             // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
-            // First k-block writes with add_to=false — no pre-zeroing pass.
+            // k0 == 0 overwrites (zero_mode) — each KV block owns its S tile.
             for (int64_t k0 = 0; k0 < D; k0 += kc) {
                 const int actual_kc = static_cast<int>(std::min<int64_t>(kc, D - k0));
                 const int ldd_b = static_cast<int>(
@@ -427,7 +408,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                                         pack_b, kNegInf, kPosInf, k0 == 0);
             }
 
-            // ---- additive mask (flat [Sq, Sk], shared across heads) ----
+            // ---- additive mask (flat [Sq, Sk]: no batch or head index) ----
             if (mask_ptr) {
                 for (int i = 0; i < actual_br; ++i) {
                     const T* mrow = mask_ptr + (i0 + i) * Sk + j0;
@@ -453,7 +434,6 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                 const float rowsum = kernel::softmax_row_exp_sum<T>(srow, srow, actual_bc, new_m, 1.0f);
                 simd::s_store(&l[i], exp_diff * simd::s_load(&l[i]) + rowsum);
 
-                // rescale the accumulated output by exp_diff (skip work when it is 1.0)
                 if (exp_diff != 1.0f) {
                     T* orow = o_acc + i * D;
                     auto v_ed = simd::v_set1(orow, exp_diff);
@@ -473,8 +453,8 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                 const int ldd_b = static_cast<int>(
                     mma_pack_align(nr_max * actual_kc * static_cast<int>(sizeof(T)))
                     / static_cast<int>(sizeof(T)));
-                // V rows [j0+k0, +actual_kc) x D columns, packed once and
-                // reused across the Br-row query block.
+                // V rows [j0+k0, +actual_kc) x D, packed once for the whole
+                // Br-row block.
                 tile_pack_rhs(false, static_cast<int>(D), actual_kc,
                                       pack_b, ldd_b,
                                       v_head + (j0 + k0) * v_rs, static_cast<int>(v_rs),
@@ -513,9 +493,8 @@ void attention_flash_impl(const AttentionAttributes& attrs,
 
 namespace {
 
-/// Plan resolution for one element type — the dtype-specific tile sizes and
-/// scratch layout, shared by get_attention_plan's per-dtype dispatch below.
-/// (f32 and f16 differ in NR/Kc/element size, exactly as in matmul.)
+/// Per-dtype plan resolution, shared by get_attention_plan's dispatch below.
+/// f32 and f16 differ in NR, Kc and element size, exactly as in matmul.
 template <class T>
 AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
                                  std::span<const TensorDesc> inputs,
@@ -544,9 +523,8 @@ AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
 
     plan.use_flash = should_use_flash_attention(Sq, Sk);
 
-    // FlashAttention path — sized with the same Br/Bc the kernel uses. Scratch
-    // slots are per worker thread when thread ids are reported, else per query
-    // block (tasks are B × H × NQ).
+    // Flash path — sized with the same Br/Bc the kernel uses. Slots are
+    // per worker thread when thread ids are reported, else per query block.
     if (plan.use_flash) {
         int Br, Bc;
         resolve_flash_tile_sizes<T>(Sq, Sk, D, Br, Bc);
@@ -575,9 +553,8 @@ AttentionPlan attention_plan_for(const AttentionAttributes& attrs,
     plan.mc1 = mc1; plan.nc1 = nc1;
     plan.mc2 = mc2; plan.nc2 = nc2;
 
-    // The packed-B slot serves GEMM1 (K = D, N <= nc1) and GEMM2 (K = Sk,
-    // N <= min(nc2, D)) in turn, so the stride is bounded by the longer k-block
-    // and the panel count by the wider n-block.
+    // One packed-B slot for both GEMMs: stride from the longer k-block, panels
+    // from the wider n-block.
     const int ldd_b_full = static_cast<int>(
         mma_pack_align(nr_max * static_cast<int>(
             kc_pack_bound<T>(std::max(D, Sk))) * esz) / esz);
@@ -608,10 +585,8 @@ AttentionPlan get_attention_plan(const AttentionAttributes& attrs,
 
     const DataType dt = inputs[0].dtype;
 
-    // f32 and f16 take the tiled fast path; any other dtype — or a Q/K/V dtype
-    // mismatch — leaves workspace_size == 0 so the kernel routes to the
-    // reference (which is f32-only; the kernel asserts instead of silently
-    // reading f16 as f32).
+    // f32 and f16 take the tiled path; any other dtype, or a Q/K/V mismatch,
+    // returns a zeroed plan.
     const bool types_match = (inputs[1].dtype == dt) && (inputs[2].dtype == dt);
     if (!types_match) { return AttentionPlan{}; }
     if (dt == DataType::f16) {
@@ -642,11 +617,8 @@ Status attention_cpu(const AttentionAttributes& attrs,
                            (inputs.size() <= 3 || inputs[3].data_type() == dt);
 
     if (dtypes_ok) {
-        // Tile sizes + scratch (scores + packed K^T) come from one plan, so the
-        // kernels and the workspace sizing agree by construction. Scratch is
-        // pooled internally (getWorkspaceSize returns 0); allocated once here,
-        // before the parallel dispatch, so no per-task allocation happens inside
-        // the parallel body.
+        // One plan decides tiles and scratch, and the scratch is allocated once
+        // here, outside the parallel dispatch — no per-task allocation.
         const TensorDesc descs[] = {inputs[0].desc(), inputs[1].desc(), inputs[2].desc()};
         const TensorDesc outs[]  = {output.desc()};
         const AttentionPlan plan = get_attention_plan(attrs, descs, outs,
@@ -670,7 +642,6 @@ Status attention_cpu(const AttentionAttributes& attrs,
         return Status::ok;
     }
 
-    // Q, K, V, output and the mask (when present) must share one float dtype.
     return Status::unsupported;
 }
 

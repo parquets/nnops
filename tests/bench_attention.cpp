@@ -5,8 +5,14 @@
 /// reports the resolved plan plus GFLOPS at 1, 2, 4, 8 and hardware threads.
 ///
 /// QK^T (transpose-B GEMM) then softmax then attn @ V (direct GEMM), per
-/// (batch, head) — or the online-softmax FlashAttention path for large Sq*Sk.
-/// The report shows which route fired and the resolved tile sizes.
+/// (batch, head) — or the online-softmax FlashAttention path once Sq*Sk reaches
+/// kFlashMinScores (1<<16). The report shows which route fired and the resolved
+/// tile sizes.
+///
+/// BenchPool carries the two arms of common/cpu_pool.hpp: an OpenMP team when
+/// the build has one (unless NNOPS_BENCH_OMP opts out), else a pool that spawns
+/// per call. Both sit behind the same hooks, so two tables differ only in their
+/// scheduler.
 
 #include "nnops/ops/attention.hpp"
 #include "backend/cpu/attention/attention.h"        // get_attention_plan, AttentionPlan
@@ -30,10 +36,6 @@ using cpu::half;
 
 namespace {
 
-// The bench's CpuBackend: an OpenMP thread team when the build has one (and
-// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
-// behind the same hooks, so a table differs only in its scheduler —
-// see common/cpu_pool.hpp.
 struct BenchPool {
     explicit BenchPool(int nthreads) : nthreads_(nthreads) {
         if (nnops::test::bench_use_openmp()) {
@@ -69,7 +71,6 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
-// Build a random tensor of type T (float -> f32, half -> f16).
 template <typename T>
 auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     if constexpr (std::is_same_v<T, float>) {
@@ -209,7 +210,7 @@ NNOPS_BENCH(attention_f32_flash) {
 }
 
 NNOPS_BENCH(attention_f32_flash_128) {
-    // D=128 -> multi-KV-block flash path.
+    // D=128 doubles head_pairs, halving the L2-derived Bc before the Sk cap.
     bench_attention_case({"attn f32 flash D128 B1 S512 H16 D128", 1, 512, 16, 128});
 }
 
@@ -230,7 +231,7 @@ NNOPS_BENCH(attention_f32_flash_masked) {
 }
 
 // ============================================================
-// f16 (same shapes as the f32 sweep, for a direct comparison)
+// f16 twins of the f32 sweep, minus the D=192 shape
 // ============================================================
 
 NNOPS_BENCH(attention_f16_standard) {

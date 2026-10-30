@@ -1,19 +1,19 @@
 /// @file resize.cpp
 /// @brief SIMD-optimized CPU implementation of 2D/3D spatial resize (NCHWC8/NCDHWC8 only).
 ///
-/// Input/output are always channel-packed (NCHWC8 or NCDHWC8). All C8 blocks
-/// use SIMD — partial C8 blocks are zero-padded by the pack step, so all 8
-/// lanes compute correctly (pad lanes produce 0 results and are never read).
+/// Input/output are always channel-packed: all C8 blocks use SIMD, since the
+/// pack step zero-fills a partial block and its pad lanes produce 0 and are
+/// never read. Work is dispatched over N*C8 blocks.
 ///
-/// Key design decisions:
-///   1. Nearest: compute source coordinate once per output position, then
-///      v_load 8 channels at once from the source NCHWC8 position.
-///   2. Bilinear/Trilinear: compute source coordinates once, load 4/8 corner
-///      vectors (8 channels each), interpolate all 8 lanes in parallel via
-///      v_fmadd (a*b + c).
-///   3. N*C8 parallel dispatch.
-///   4. No h4 blocking — resize doesn't benefit from output-row blocking
-///      (output stride differs from input stride).
+/// Nearest computes the source coordinate once per output position, then
+/// v_loads 8 channels from that position. Bilinear/trilinear compute the
+/// coordinate once, load the 4/8 corner vectors and interpolate all 8 lanes
+/// with v_fmadd. There is no h4 output-row blocking: resize's output stride
+/// differs from the input's, so blocking buys nothing.
+///
+/// Crop: crop_start/crop_end are indexed as {D,H,W} to match output_size, and
+/// crop_end[d] > 0 enables cropping on that axis. The kernel sees the effective
+/// size; crop_off (in elements) skips the crop_start region.
 
 #include "nnops/ops/resize.hpp"
 #include "nnops/detail/assert.hpp"
@@ -39,25 +39,18 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
     const int64_t N   = input.shape(0);
     const int64_t C8  = input.num_channel_blocks();
 
-    // Input spatial dims
     const int64_t raw_ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t raw_IH = input.shape(srank);
     const int64_t raw_IW = input.shape(srank + 1);
 
-    // ---- Crop: compute effective input region ----
-    // When crop_end[d] > 0, use crop region; otherwise use full input.
-    // crop_start / crop_end use {D, H, W} indexing matching output_size.
     const int64_t pack = input.channel_pack_size();  // 8 for NCHWC8
 
     const bool has_crop = attrs.has_crop();
 
-    // Effective source sizes (what the kernel sees as its "input")
     int64_t eff_ID = raw_ID, eff_IH = raw_IH, eff_IW = raw_IW;
-    // Offset added to in_base to skip crop_start region (in elements)
     int64_t crop_off = 0;
 
     if (has_crop) {
-        // Validate crop bounds
         if (srank == 3 && attrs.crop_end[0] > 0) {
             NNOPS_ASSERT(attrs.crop_start[0] >= 0 && attrs.crop_start[0] < raw_ID);
             NNOPS_ASSERT(attrs.crop_end[0] > attrs.crop_start[0] && attrs.crop_end[0] <= raw_ID);
@@ -74,11 +67,10 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
             NNOPS_ASSERT(attrs.crop_start[2] >= 0 && attrs.crop_start[2] < raw_IW);
             NNOPS_ASSERT(attrs.crop_end[2] > attrs.crop_start[2] && attrs.crop_end[2] <= raw_IW);
             eff_IW = attrs.crop_end[2] - attrs.crop_start[2];
-            crop_off += attrs.crop_start[2] * pack;  // W pixels × 8 channels
+            crop_off += attrs.crop_start[2] * pack;
         }
     }
 
-    // Output spatial dims
     const int64_t OD = (srank == 3) ? output.shape(2) : 1;
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
@@ -86,7 +78,7 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
     auto*       out_ptr = output.ptr<T>();
     const auto* in_ptr  = input.ptr<T>();
 
-    // Strides use raw input dims (physical layout doesn't change with crop)
+    // Strides use the raw input dims: the physical layout does not change with crop.
     const int64_t in_row_stride  = input.row_stride_elems();
     const int64_t in_d_stride    = raw_IH * in_row_stride;
     const int64_t in_ch_stride   = input.channel_block_stride_elems();
@@ -98,13 +90,11 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
     const auto coord_mode = attrs.coord_mode;
     const bool add_to     = attrs.add_to;
 
-    // Per-C8-block compute lambda (all C8 blocks use SIMD)
     const auto compute_c8 = [&](int64_t n, int64_t c8) {
         const T* in_base  = in_ptr  + n * C8 * in_ch_stride  + c8 * in_ch_stride + crop_off;
         T*       out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
 
         if (srank == 3) {
-            // 3D
             if (mode == ResizeMode::Nearest) {
                 k::resize_nearest_3d<T>(
                     out_base, in_base,
@@ -121,7 +111,6 @@ void resize_impl_nchwc8(const ResizeAttributes& attrs,
                     coord_mode, add_to);
             }
         } else {
-            // 2D
             if (mode == ResizeMode::Nearest) {
                 k::resize_nearest_2d<T>(
                     out_base, in_base,

@@ -2,18 +2,19 @@
 /// @file pack_dp4a_i8.hpp
 /// @brief AArch64 NEON int8 (dp4a) pack kernels for GEMM LHS/RHS.
 ///
-/// These kernels repack quantised int8 data into the layout consumed by the
-/// int8 dot-product (SDOT/UDOT) micro-kernels. They perform pure data movement
-/// — no dot product happens here. `scale` is accepted for signature parity with
-/// the f32/f16 packs but ignored (quantisation is handled by the caller). Four
-/// int8 elements are packed into each int32 to match the 4-wide dot-product
-/// accumulator.
+/// Repacks quantised int8 into the layout the int8 dot-product (SDOT)
+/// micro-kernels read. Pure data movement — no dot product happens here. Four
+/// int8 k-values land in each int32, matching the 4-wide accumulator. `scale`
+/// is accepted for signature parity with the f32/f16 packs and ignored;
+/// quantisation is the caller's job.
 ///
-/// Two transform families, mirroring pack_f32/pack_f16:
-///   - pack_trans_nN (LHS/A): reads N int8 rows (stride ir_step), transposes
-///     N×K blocks, packs 4 int8 per int32, writes contiguously.
-///   - pack_copy_nN (RHS/B): reads N-column rows, groups each 4-k block into
-///     contiguous 4-int8 runs per column.
+/// Two families, mirroring pack_f32/pack_f16:
+///   - pack_trans_nN (LHS/A): reads N rows (stride ir_step), transposes N x K
+///     and writes contiguous k-major panels (n12 also packs a transposed B).
+///   - pack_copy_nN (RHS/B): rows are contiguous; each 4-k block is written as
+///     a 4-int8 run per column.
+/// The n12 panels take a live width `nr <= 12`: rows/columns past it are
+/// zero-filled and never read, so a short last panel stays inside the tensor.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/aarch64/pack_dp4a_i8.hpp
 
@@ -25,7 +26,7 @@
 namespace nnops::backend::cpu::aarch64 {
 
 // =========================================================================
-//  LHS Transpose pack (int8)  —  4 int8 packed per int32 (K step = 16)
+//  LHS transpose pack (int8)  —  N rows x K, 4 int8 per int32 (k step 16)
 // =========================================================================
 
 inline void pack_trans_n1_dp4a_i8(void* NNOPS_RESTRICT output,
@@ -191,9 +192,6 @@ inline void pack_trans_n8_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 12-wide panel of a transposed B (12 source rows of K), at a live
-/// width `nr <= 12`. The narrow last panel touches only the live rows and
-/// zero-fills the rest, so it never reads a column that is not there.
 inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
                                    const void* NNOPS_RESTRICT input,
                                    int ir_step, int K, float scale,
@@ -328,7 +326,7 @@ inline void pack_trans_n12_dp4a_i8(void* NNOPS_RESTRICT output,
 }
 
 // =========================================================================
-//  RHS Copy pack (int8)  —  contiguous-row copy, 4 int8 grouped per column
+//  RHS copy pack (int8)  —  contiguous rows, 4-int8 runs per column
 // =========================================================================
 
 inline void pack_copy_n1_dp4a_i8(void* NNOPS_RESTRICT output,
@@ -414,9 +412,6 @@ inline void pack_copy_n8_dp4a_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 12-wide panel of a row-major B (K source rows of N), at a live width
-/// `nr <= 12`. Columns past `nr` are zero-filled; the narrow pass reads only
-/// the live ones, so a short last panel never runs past the tensor.
 inline void pack_copy_n12_dp4a_i8(void* NNOPS_RESTRICT output,
                                   const void* NNOPS_RESTRICT input,
                                   int ir_step, int K, float scale,

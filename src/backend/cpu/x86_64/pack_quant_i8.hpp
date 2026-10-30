@@ -1,16 +1,18 @@
 #pragma once
 /// @file pack_quant_i8.hpp
-/// @brief x86_64 AVX2+FMA fused pack + per-row quantize kernels for GEMM LHS/RHS.
+/// @brief x86_64 fused pack + per-row quantize kernels for GEMM LHS/RHS.
 ///
 /// These kernels fuse the f32→i8 quantization step into the GEMM packing step,
 /// eliminating the intermediate quantized-but-unpacked buffer and halving the
-/// memory traffic (one pass instead of quantize + pack).
+/// memory traffic (one pass instead of quantize + pack). The trans kernels and
+/// copy_n16 use 128-bit SSE arithmetic (K step 4); the other copies are scalar.
+/// The register helpers quantize and narrow 4-, 8- and 32-lane groups.
 ///
 /// Two transform families, mirroring pack_f32 / pack_dp4a_i8:
 ///   - pack_quant_trans_nN (LHS/A): reads N f32 rows (stride ir_step), quantizes
 ///     each row independently with its own scale/zero (broadcast across all K),
 ///     narrows to int8, then packs 4 consecutive K values from the SAME row into
-///     each int32 to match the VNNI dp4a interleaved format.
+///     each int32 to match the dp4a interleaved format.
 ///   - pack_quant_copy_nN (RHS/B): reads N-column f32 rows, quantizes with
 ///     K-shared scale/zero (broadcast across all K), groups each 4-k block into
 ///     contiguous 4-i8 runs per column.
@@ -34,40 +36,33 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-// =========================================================================
-//  Per-lane quantization helpers
-// =========================================================================
+// Per-lane quantization helpers
 
-/// Quantize 8 floats (__m256) with per-lane scale/zero to 8 int32 (__m256i).
-/// Used after 8×8 transpose where each lane comes from a different row.
+/// Quantize 8 floats to 8 int32 with per-lane scale/zero.
 inline __m256i quant_8f32_to_i32(__m256 d, __m256 inv_scale, __m256 zero) noexcept
 {
     d = _mm256_add_ps(_mm256_mul_ps(d, inv_scale), zero);
     return _mm256_cvtps_epi32(d);
 }
 
-/// Quantize 4 floats (__m128) with per-lane scale/zero to 4 int32 (__m128i).
+/// Quantize 4 floats to 4 int32 with per-lane scale/zero.
 inline __m128i quant_4f32_to_i32(__m128 d, __m128 inv_scale, __m128 zero) noexcept
 {
     d = _mm_add_ps(_mm_mul_ps(d, inv_scale), zero);
     return _mm_cvtps_epi32(d);
 }
 
-/// Narrow 2×__m256i (8 int32) to 8 int8 (lower 64 bits of __m128i).
-/// The 256-bit packs produce per-lane ordering; a cross-lane permute
-/// restores the natural [0..7] order.
+/// Narrow 8 int32 to 8 int8; a cross-lane dword permute restores [0..7] order.
 inline __m128i narrow_8i32_to_i8(__m256i i0, __m256i i1) noexcept
 {
     const __m256i i16 = _mm256_packs_epi32(i0, i1);
-    // i16 = [i0_lo, i0_hi, i1_lo, i1_hi] per 128-bit lane
-    // Cross-lane permute to restore [i0_lo, i0_hi, i1_lo, i1_hi]
+    // 256-bit packs interleave per 128-bit lane; permute back to natural order.
     const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
     const __m256i ordered = _mm256_permutevar8x32_epi32(i16, perm);
     return _mm256_castsi256_si128(ordered);
 }
 
-/// Narrow 4×__m256i (32 int32) to 32 int8 (__m256i), natural order.
-/// Uses the same cross-lane permute pattern as quant_block32_f32_i8.
+/// Narrow 32 int32 to 32 int8, natural order (same cross-lane dword permute).
 template <bool Q_U8 = false>
 inline __m256i narrow_32i32_to_i8(__m256i i0, __m256i i1, __m256i i2, __m256i i3) noexcept
 {
@@ -83,18 +78,7 @@ inline __m256i narrow_32i32_to_i8(__m256i i0, __m256i i1, __m256i i2, __m256i i3
     return _mm256_permutevar8x32_epi32(packed, perm);
 }
 
-// =========================================================================
-//  LHS pack + quantize  (f32 → i8, per-row scale/zero_point)
-//
-//  Each row is quantized independently with its own scale/zero_point
-//  (broadcast across all K elements).  K step = 4 (SSE __m128) to keep
-//  register pressure low — each row produces 4 int8 = 1 int32 per step.
-//  4 consecutive K values from the SAME row are packed into each int32,
-//  matching the VNNI dp4a interleaved format:
-//    out_i32[0] = [q(r0_k0), q(r0_k1), q(r0_k2), q(r0_k3)]
-//    out_i32[1] = [q(r1_k0), q(r1_k1), q(r1_k2), q(r1_k3)]
-//    ...
-// =========================================================================
+// LHS pack + quantize  (f32 → i8, per-row scale/zero_point)
 
 template <bool Q_U8 = false>
 inline void pack_quant_trans_n1_i8(void* NNOPS_RESTRICT output,
@@ -162,7 +146,6 @@ inline void pack_quant_trans_n4_i8(void* NNOPS_RESTRICT output,
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        // Quantize 4 rows, each producing 4 int32 → 4 int8 = 1 int32
         __m128i qi[4];
         for (int i = 0; i < 4; ++i) {
             __m128 v = _mm_loadu_ps(input + i * ir_step);
@@ -170,7 +153,6 @@ inline void pack_quant_trans_n4_i8(void* NNOPS_RESTRICT output,
             qi[i] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
             qi[i] = _mm_add_epi32(qi[i], _mm_set1_epi32(zp[i]));
         }
-        // Pack 4 rows: 4×4 int32 → 16 int8 → 4 int32
         __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
         __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
         __m128i i8;
@@ -224,7 +206,6 @@ inline void pack_quant_trans_n6_i8(void* NNOPS_RESTRICT output,
             qi[i] = _mm_cvtps_epi32(_mm_mul_ps(v, v_s));
             qi[i] = _mm_add_epi32(qi[i], _mm_set1_epi32(zp[i]));
         }
-        // Rows 0-3: pack to 4 int32
         __m128i i16_01 = _mm_packs_epi32(qi[0], qi[1]);
         __m128i i16_23 = _mm_packs_epi32(qi[2], qi[3]);
         __m128i i8_03;
@@ -234,7 +215,6 @@ inline void pack_quant_trans_n6_i8(void* NNOPS_RESTRICT output,
             i8_03 = _mm_packs_epi16(i16_01, i16_23);
         }
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i32), i8_03);
-        // Rows 4-5: pack to 2 int32
         __m128i i16_45 = _mm_packs_epi32(qi[4], qi[5]);
         __m128i i8_45;
         if constexpr (Q_U8) {
@@ -280,7 +260,6 @@ inline void pack_quant_trans_n8_i8(void* NNOPS_RESTRICT output,
 
     int k = 0;
     for (; k <= K - 4; k += 4) {
-        // Process in 2 groups of 4 rows to keep register pressure low
         for (int g = 0; g < 2; ++g) {
             __m128i qi[4];
             for (int j = 0; j < 4; ++j) {
@@ -428,12 +407,7 @@ inline void pack_quant_trans_n16_i8(void* NNOPS_RESTRICT output,
     }
 }
 
-// =========================================================================
-//  RHS Copy pack + quantize  (f32 → i8, K-shared scale/zero_point)
-//
-//  Scale/zero_point is broadcast across all K elements (single scale/zero_point
-//  for the entire K dimension).  K step = 4 (group 4 consecutive K elements).
-// =========================================================================
+// RHS copy pack + quantize  (f32 → i8, K-shared scale/zero_point)
 
 template <bool Q_U8 = false>
 inline void pack_quant_copy_n1_i8(void* NNOPS_RESTRICT output,
@@ -696,7 +670,6 @@ inline void pack_quant_copy_n16_i8(void* NNOPS_RESTRICT output,
         __m128i r2 = quant_row(2);
         __m128i r3 = quant_row(3);
 
-        // Interleaved store matching dp4a layout
         transpose_4x16_i8(r0, r1, r2, r3);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i8 + 0 * 16), r0);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out_i8 + 1 * 16), r1);

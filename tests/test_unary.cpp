@@ -1,5 +1,23 @@
 /// @file test_unary.cpp
-/// @brief Unit tests for Unary operator (CPU backend).
+/// @brief Unary operator unit tests, CPU backend.
+///
+/// Desk-checked scalar cases for Exp/Log/Sin/Cos/Tanh/Abs/Neg/Sqrt on small
+/// rank-1 tensors, compared against std:: or literal values (Sin/Cos feed 0,
+/// pi/2 and pi). The f32 cases first check getOutputTensorDesc preserves rank,
+/// dims, NCHW layout and dtype; the f16 cases check the output dtype. `add_to`
+/// is the accumulating form: the output buffer arrives pre-filled and the op
+/// adds into it instead of overwriting. Random data sweeps for Abs and Exp and
+/// a rank-2 Sqrt case round out the float side.
+///
+/// The f16 cases run Exp and Abs through the half-precision path with the f32
+/// reference kept on the original input — the one place the two sides differ —
+/// so their tolerance widens to 1e-2.
+///
+/// The quantized cases are the fused dequant → op → requant path: both input and
+/// output views already carry QuantParams over pre-quantized data. PerTensor and
+/// PerToken (here one scale per row of a rank-2 tensor) both appear, the u8 case
+/// is asymmetric with zero_point 128, and Exp shows a transcendental op carried
+/// through the same path.
 
 #include "nnops/ops/unary.hpp"
 #include "common/test_harness.hpp"
@@ -11,10 +29,6 @@
 #include <cmath>
 
 using namespace nnops;
-
-// ============================================================
-// Hand-verified tests
-// ============================================================
 
 NNOPS_TEST(unary_exp) {
     const int64_t shape[] = {3};
@@ -279,10 +293,6 @@ NNOPS_TEST(unary_add_to) {
     NNOPS_EXPECT_NEAR(out_buf[2], 30.0f + std::exp(3.0f), 1e-5f);
 }
 
-// ============================================================
-// Random data tests
-// ============================================================
-
 NNOPS_TEST(unary_random_abs) {
     auto [in_vec, input] = test::make_random_tensor({1000}, -10.0f, 10.0f, 111);
     auto d = input.desc();
@@ -336,10 +346,6 @@ NNOPS_TEST(unary_random_exp) {
     }
 }
 
-// ============================================================
-// 2D tests
-// ============================================================
-
 NNOPS_TEST(unary_2d_sqrt) {
     const int64_t shape[] = {2, 3};
     float in_data[]  = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
@@ -369,10 +375,6 @@ NNOPS_TEST(unary_2d_sqrt) {
         NNOPS_EXPECT_NEAR(out_buf[i], std::sqrt(in_data[i]), 1e-5f);
     }
 }
-
-// ============================================================
-// f16 tests — exercise the SIMD f16 code path
-// ============================================================
 
 NNOPS_TEST(unary_random_exp_f16) {
     auto [f32_vec, _] = test::make_random_tensor({400}, -2.0f, 2.0f, 900);
@@ -434,12 +436,8 @@ NNOPS_TEST(unary_random_abs_f16) {
     }
 }
 
-// ============================================================
-// Quantized input/output tests (fused dequant → unary → quant)
-// ============================================================
-
 NNOPS_TEST(unary_quant_per_tensor_s8_to_s8) {
-    // s8 input → s8 output (fused), per-tensor scale=0.1/zp=0, Abs.
+    // Fused s8 → s8, per-tensor scale 0.1, zero_point 0.
     const int64_t shape[] = {4};
     int8_t in_data[] = {-10, -5, 0, 5};
 
@@ -469,7 +467,7 @@ NNOPS_TEST(unary_quant_per_tensor_s8_to_s8) {
 }
 
 NNOPS_TEST(unary_quant_per_token_s8_to_s8) {
-    // Per-token s8 → s8 (fused), Neg, output uses the same per-token scales.
+    // Per-token: one scale per row; the output reuses the input's scales.
     const int64_t shape[] = {2, 4};
     int8_t in_data[] = {1, -2, 3, -4,  10, -20, 30, -40};
 
@@ -535,7 +533,7 @@ NNOPS_TEST(unary_quant_per_tensor_u8_to_u8) {
 }
 
 NNOPS_TEST(unary_quant_per_tensor_s8_exp) {
-    // Transcendental op (Exp) through the fused path: s8 → s8, scale=1/zp=0.
+    // Exp through the fused path at scale 1 / zero_point 0.
     const int64_t shape[] = {3};
     int8_t in_data[] = {0, 1, 2};
 

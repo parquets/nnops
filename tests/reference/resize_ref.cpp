@@ -1,11 +1,14 @@
 /// @file resize_ref.cpp
-/// @brief Naive CPU reference implementation of 2D/3D spatial resize (NCHW/NCDHW layout).
+/// @brief Naive CPU reference for 2D/3D resize on planar NCHW/NCDHW.
 ///
-/// Supports both f32 and f16 data types. Computation always done in fp32;
-/// dtype-specific load/store handled via s_load/s_store helpers.
+/// One template covers f32 and f16: arithmetic is fp32, and the dtype-specific
+/// load/store goes through s_load/s_store. Nearest reads a single tap; the other
+/// modes interpolate bilinearly (2D) or trilinearly (3D).
 ///
-/// Parallelism is over N*C tasks (sample x channel), allowing better thread utilization
-/// especially for small-batch inference (N=1).
+/// A crop (crop_end[d] > 0 on axis d) only narrows the read window: physical
+/// strides stay on the raw dims, so the window start is folded into one flat
+/// element offset. add_to accumulates into the output. One task per (sample,
+/// channel), so a batch of 1 still fills the pool.
 
 #include "nnops/ops/resize.hpp"
 #include "nnops/detail/assert.hpp"
@@ -33,12 +36,10 @@ inline float compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_si
     }
     switch (mode) {
     case CoordinateTransformMode::HalfPixel: {
-        // src = (dst + 0.5) * scale - 0.5
         float scale = static_cast<float>(src_size) / static_cast<float>(dst_size);
         return (static_cast<float>(dst_idx) + 0.5f) * scale - 0.5f;
     }
     case CoordinateTransformMode::AlignCorners: {
-        // src = dst * (src_size - 1) / (dst_size - 1)
         if (dst_size <= 1) { return 0.0f; }
         return static_cast<float>(dst_idx) *
                static_cast<float>(src_size - 1) /
@@ -46,7 +47,6 @@ inline float compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_si
     }
     case CoordinateTransformMode::Asymmetric:
     default: {
-        // src = dst * scale
         float scale = static_cast<float>(src_size) / static_cast<float>(dst_size);
         return static_cast<float>(dst_idx) * scale;
     }
@@ -68,16 +68,14 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     const int64_t N = input.shape(0);
     const int64_t C = input.shape(1);
 
-    // Input spatial dims (raw — physical memory layout)
     const int64_t raw_ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t raw_IH = input.shape(srank);
     const int64_t raw_IW = input.shape(srank + 1);
 
-    // When crop_end[d] > 0, use crop region; otherwise use full input.
     const bool has_crop = attrs.has_crop();
 
     int64_t eff_ID = raw_ID, eff_IH = raw_IH, eff_IW = raw_IW;
-    int64_t crop_off = 0;  // in elements, planar layout (no pack factor)
+    int64_t crop_off = 0;  // flat element offset into the channel
 
     if (has_crop) {
         if (srank == 3 && attrs.crop_end[0] > 0) {
@@ -96,7 +94,7 @@ void resize_impl_ref(const ResizeAttributes& attrs,
             NNOPS_ASSERT(attrs.crop_start[2] >= 0 && attrs.crop_start[2] < raw_IW);
             NNOPS_ASSERT(attrs.crop_end[2] > attrs.crop_start[2] && attrs.crop_end[2] <= raw_IW);
             eff_IW = attrs.crop_end[2] - attrs.crop_start[2];
-            crop_off += attrs.crop_start[2];  // W has no pack factor in planar
+            crop_off += attrs.crop_start[2];
         }
     }
 
@@ -107,7 +105,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
     const auto* in_ptr  = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
 
-    // Strides use raw input dims (physical layout doesn't change with crop)
     const int64_t in_row_stride  = input.row_stride_elems();
     const int64_t in_d_stride    = raw_IH * in_row_stride;
     const int64_t in_ch_stride   = raw_ID * in_d_stride;
@@ -146,7 +143,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                         }
                     } else {
                         if (srank == 3) {
-                            // Trilinear: 8 neighbors in 3D
                             float src_d = compute_src_coord(od, eff_ID, OD, coord_mode);
                             float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
                             float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
@@ -183,7 +179,6 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                             float r1 = wy0 * r01 + wy * r11;
                             result = wz0 * r0 + wz * r1;
                         } else {
-                            // Bilinear: 4 neighbors in 2D
                             float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
                             float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
 

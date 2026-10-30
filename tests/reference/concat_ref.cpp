@@ -1,9 +1,13 @@
 /// @file concat_ref.cpp
-/// @brief Naive CPU reference implementation of Concat.
+/// @brief Naive CPU reference for Concat; the correctness baseline.
 ///
-/// Correctness baseline. Handles all layouts uniformly (NCHW, NCDHW,
-/// NCHWC8, NCDHWC8), including C-axis concatenation with packed layouts
-/// which requires C8 lane-level merging.
+/// Addressing goes through stride_elems() / row_stride_elems(), with the channel
+/// axis measured in C8 blocks when the layout is packed, so the generic path
+/// covers NCHW, NCDHW, NCHWC8 and NCDHWC8 alike. Channel-axis concat in a packed
+/// layout is not a plain copy — an output lane can come from a different input
+/// than its neighbours — so that case goes to concat_packed_c_axis_ref, which
+/// builds a per-(C8 block, lane) source map and detects the blocks that are
+/// still a 1:1 copy. Rank < 2 is a single row.
 
 #include "nnops/ops/concat.hpp"
 #include "nnops/detail/assert.hpp"
@@ -25,7 +29,6 @@ void concat_packed_c_axis_ref(TensorView& output,
     const int64_t pack = output.channel_pack_size();
     const int64_t srank = rank - 2;  // 2 or 3
 
-    // Cumulative logical channel counts per input
     std::vector<int64_t> ch_start(N + 1, 0);
     for (int64_t i = 0; i < N; ++i) {
         ch_start[static_cast<size_t>(i + 1)] =
@@ -43,8 +46,7 @@ void concat_packed_c_axis_ref(TensorView& output,
     const int64_t o_row_stride = output.row_stride_elems();
     const int64_t o_ch_stride  = output.channel_block_stride_elems();
 
-    // Precompute source mapping for each output (C8 block, lane) pair.
-    // LaneSrc::input_idx == -1 means pad lane (past total_logical_c).
+    // input_idx == -1 marks a pad lane (logical C past the last input).
     struct LaneSrc { int64_t input_idx; int64_t c8_block; int64_t lane; };
     std::vector<std::vector<LaneSrc>> lane_map(
         static_cast<size_t>(oC8),
@@ -57,7 +59,6 @@ void concat_packed_c_axis_ref(TensorView& output,
                 lane_map[static_cast<size_t>(c8)][static_cast<size_t>(lane)] = {-1, -1, -1};
                 continue;
             }
-            // Find which input provides this logical channel
             int64_t in_idx = 0;
             while (in_idx < N - 1 && o_lc >= ch_start[static_cast<size_t>(in_idx + 1)]) {
                 ++in_idx;
@@ -71,8 +72,7 @@ void concat_packed_c_axis_ref(TensorView& output,
         }
     }
 
-    // Determine which output C8 blocks are a 1:1 copy from a single input block
-    // (all lanes from same input, same C8 block, in sequential order).
+    // A block whose lanes all come from one input block, in order, is a 1:1 copy.
     std::vector<int64_t> full_copy_src(static_cast<size_t>(oC8), -1);
     for (int64_t c8 = 0; c8 < oC8; ++c8) {
         const auto& map = lane_map[static_cast<size_t>(c8)];
@@ -198,11 +198,11 @@ void concat_impl_ref(const ConcatAttributes& attrs,
         }
     } else {
         // Outer axis concat: rows/blocks from different inputs
-        const int64_t n_pre = ax;  // number of dimensions before the concat axis
+        const int64_t n_pre = ax;
         const int64_t phys_inner = is_rank1 ? output.numel() : output.stride_elems(ax);
 
         if (n_pre == 0) {
-            // ax == 0: each input contributes entire rank-1..rank-N "blocks"
+            // ax == 0: one phys_inner-sized memcpy per index along the axis.
             for (int64_t n = 0; n < N; ++n) {
                 const auto& in = inputs[static_cast<size_t>(n)];
                 const int64_t in_axis_dim = in.shape(ax);
@@ -217,8 +217,7 @@ void concat_impl_ref(const ConcatAttributes& attrs,
                 }
             }
         } else {
-            // n_pre >= 1: iterate over all outer dimensions with an odometer
-            // Use physical channel block count for packed layouts
+            // n_pre >= 1: odometer over the outer dims; dim 1 counts C8 blocks.
             std::vector<int64_t> pre_sizes(static_cast<size_t>(n_pre));
             std::vector<int64_t> pre_strides(static_cast<size_t>(n_pre));
             for (int64_t d = 0; d < n_pre; ++d) {

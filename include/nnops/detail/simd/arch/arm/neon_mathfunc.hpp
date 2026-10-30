@@ -1,14 +1,18 @@
 #pragma once
 /// @file neon_mathfunc.hpp
-/// @brief ARM NEON implementation of sin, cos, tan, exp, log, and tanh.
+/// @brief Vectorized sin, cos, tan, exp, log and tanh for float32x4_t.
 ///
-/// Based on neon_mathfun by Julien Pommier (zlib license):
-///   http://gruntthepeon.free.fr/ssemath/
+/// Cephes polynomial approximations, vectorized for NEON. Based on
+/// neon_mathfun by Julien Pommier (zlib); tanh_ps from ncnn (BSD 3-Clause).
+/// See http://gruntthepeon.free.fr/ssemath/.
 ///
-/// tanh_ps is derived from ncnn (Tencent, BSD 3-Clause).
+/// The Cephes coefficients keep their own c_* names as #defines and are #undef'd
+/// at the end of the file, so they never leak out of this header.
 ///
-/// All functions use the Cephes polynomial approximation algorithms
-/// adapted for ARM NEON float32x4_t intrinsics.
+/// Accuracy is the polynomial's, not libm's: exp clamps its argument to
+/// +/-88.3762626647949, log clamps at 0 and turns a non-positive argument into
+/// NaN, tanh clamps |x| to 9, and tan_ps divides sin by cos after adding 1e-8
+/// to cosine lanes that are exactly zero.
 
 #if !defined(NNOPS_ARCH_AARCH64)
   #error "neon_mathfunc.hpp requires AArch64 architecture"
@@ -22,9 +26,6 @@ namespace simd {
 namespace arch {
 namespace neon {
 
-// ============================================================
-// Constants (macro-defined for Cephes algorithms)
-// ============================================================
 #define c_inv_mant_mask ~0x7f800000u
 #define c_cephes_SQRTHF 0.707106781186547524
 #define c_cephes_log_p0 7.0376836292E-2
@@ -39,9 +40,6 @@ namespace neon {
 #define c_cephes_log_q1 -2.12194440e-4
 #define c_cephes_log_q2 0.693359375
 
-// ============================================================
-// log_ps — natural logarithm, 4-wide
-// ============================================================
 static inline float32x4_t log_ps(float32x4_t x)
 {
     float32x4_t one = vdupq_n_f32(1);
@@ -82,9 +80,6 @@ static inline float32x4_t log_ps(float32x4_t x)
     return x;
 }
 
-// ============================================================
-// exp_ps — exponential, 4-wide
-// ============================================================
 #define c_exp_hi 88.3762626647949f
 #define c_exp_lo -88.3762626647949f
 #define c_cephes_LOG2EF 1.44269504088896341
@@ -105,9 +100,7 @@ static inline float32x4_t exp_ps(float32x4_t x)
     x = vmaxq_f32(x, vdupq_n_f32(c_exp_lo));
     /* express exp(x) as exp(g + n*log(2)) */
     fx = vmlaq_f32(vdupq_n_f32(0.5f), x, vdupq_n_f32(c_cephes_LOG2EF));
-    /* perform a floorf */
     tmp = vcvtq_f32_s32(vcvtq_s32_f32(fx));
-    /* if greater, subtract 1 */
     uint32x4_t mask = vcgtq_f32(tmp, fx);
     mask = vandq_u32(mask, vreinterpretq_u32_f32(one));
     fx = vsubq_f32(tmp, vreinterpretq_f32_u32(mask));
@@ -134,9 +127,6 @@ static inline float32x4_t exp_ps(float32x4_t x)
     return y;
 }
 
-// ============================================================
-// sincos_ps — simultaneous sin/cos, 4-wide (Cody-Waite range reduction)
-// ============================================================
 #define c_minus_cephes_DP1 -0.78515625
 #define c_minus_cephes_DP2 -2.4187564849853515625e-4
 #define c_minus_cephes_DP3 -3.77489497744594108e-8
@@ -155,9 +145,7 @@ static inline void sincos_ps(float32x4_t x, float32x4_t* ysin, float32x4_t* ycos
     uint32x4_t sign_mask_sin, sign_mask_cos;
     sign_mask_sin = vcltq_f32(x, vdupq_n_f32(0));
     x = vabsq_f32(x);
-    /* scale by 4/Pi */
     y = vmulq_f32(x, vdupq_n_f32(c_cephes_FOPI));
-    /* store the integer part of y in mm0 */
     emm2 = vcvtq_u32_f32(y);
     /* j=(j+1) & (~1) (see the cephes sources) */
     emm2 = vaddq_u32(emm2, vdupq_n_u32(1));
@@ -170,7 +158,6 @@ static inline void sincos_ps(float32x4_t x, float32x4_t* ysin, float32x4_t* ycos
     x = vmlaq_f32(x, y, vdupq_n_f32(c_minus_cephes_DP3));
     sign_mask_sin = veorq_u32(sign_mask_sin, vtstq_u32(emm2, vdupq_n_u32(4)));
     sign_mask_cos = vtstq_u32(vsubq_u32(emm2, vdupq_n_u32(2)), vdupq_n_u32(4));
-    /* Evaluate the two polynoms */
     float32x4_t z = vmulq_f32(x, x);
     float32x4_t y1, y2;
     y1 = vmlaq_f32(vdupq_n_f32(c_coscof_p1), z, vdupq_n_f32(c_coscof_p0));
@@ -183,7 +170,6 @@ static inline void sincos_ps(float32x4_t x, float32x4_t* ysin, float32x4_t* ycos
     y1 = vmlsq_f32(y1, z, vdupq_n_f32(0.5f));
     y2 = vmlaq_f32(x, y2, x);
     y1 = vaddq_f32(y1, vdupq_n_f32(1));
-    /* select the correct result */
     float32x4_t ys = vbslq_f32(poly_mask, y1, y2);
     float32x4_t yc = vbslq_f32(poly_mask, y2, y1);
     *ysin = vbslq_f32(sign_mask_sin, vnegq_f32(ys), ys);
@@ -204,9 +190,6 @@ static inline float32x4_t cos_ps(float32x4_t x)
     return ycos;
 }
 
-// ============================================================
-// tan_ps — tangent, 4-wide (sin/cos with epsilon guard)
-// ============================================================
 static inline float32x4_t tan_ps(float32x4_t x)
 {
     float32x4_t ysin, ycos;
@@ -218,9 +201,6 @@ static inline float32x4_t tan_ps(float32x4_t x)
     return vdivq_f32(ysin, ycos);
 }
 
-// ============================================================
-// tanh_ps — hyperbolic tangent, 4-wide (ncnn-derived rational polynomial)
-// ============================================================
 #define c_tanh_tiny 1e-4f
 #define c_tanh_hi   9.0f
 #define c_tanh_alpha_1  4.89352455891786e-3f
@@ -260,7 +240,6 @@ static inline float32x4_t tanh_ps(float32x4_t x)
     w = vmlaq_f32(vdupq_n_f32(c_tanh_beta_4), w, z);
     w = vmlaq_f32(vdupq_n_f32(c_tanh_beta_2), w, z);
     w = vmlaq_f32(vdupq_n_f32(c_tanh_beta_0), w, z);
-    // divide the numerator by the denominator
     y = vdivq_f32(y, w);
     // reinstate the sign
     y = vreinterpretq_f32_u32(vbslq_u32(
@@ -275,7 +254,6 @@ static inline float32x4_t tanh_ps(float32x4_t x)
     return y;
 }
 
-// Undefine local constants to avoid polluting the namespace
 #undef c_inv_mant_mask
 #undef c_cephes_SQRTHF
 #undef c_cephes_log_p0

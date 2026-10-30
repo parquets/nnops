@@ -10,8 +10,8 @@
 /// each order and move between them with these helpers; the benches use them to
 /// prepare the inputs once, outside the timed region.
 ///
-/// All conversions are plain element copies — tens of microseconds against a
-/// convolution — so a test can convert per case without hiding anything.
+/// All conversions are plain element copies — cheap against a convolution — so
+/// a test can convert per case without hiding anything.
 
 #include <span>
 #include <vector>
@@ -52,9 +52,8 @@ std::vector<T> nhwc_to_nchw(std::span<const T> src,
     return dst;
 }
 
-/// [N][C][S] → [N][S][C] over a flat spatial extent @p S — the 2D and 3D
-/// channel-last layouts alike, whose row strides the callers do not care about
-/// because only the element order matters.
+/// [N][C][S] → [N][S][C] over a flat spatial extent @p S; the 2D and 3D
+/// channel-last layouts alike, since only the element order matters.
 template <class T>
 std::vector<T> to_channel_last(std::span<const T> src,
                                int64_t N, int64_t C, int64_t S)
@@ -86,10 +85,8 @@ std::vector<T> to_channel_first(std::span<const T> src,
     return dst;
 }
 
-/// The depthwise filter [C][(KD)KH KW] → HWCM [(KD)][KH][KW][C] — TensorFlow's
-/// depthwise order with the multiplier dropped. A plain transpose of the
-/// C-by-taps matrix; the multipliers of the shape are the caller's business,
-/// since the kernel reads only the flat tap-major order.
+/// Depthwise [C][(KD)KH KW] → HWCM [(KD)][KH][KW][C]: TensorFlow's depthwise
+/// order with the multiplier dropped, a plain transpose of the C-by-taps matrix.
 template <class T>
 std::vector<T> depthwise_to_hwcm(std::span<const T> src, int64_t C, int64_t taps)
 {

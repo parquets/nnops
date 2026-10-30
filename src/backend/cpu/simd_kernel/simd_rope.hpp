@@ -1,21 +1,19 @@
 #pragma once
 /// @file simd_rope.hpp
-/// @brief SIMD-accelerated RoPE rotation kernels for a single position row.
+/// @brief SIMD RoPE rotation kernels for a single position row.
 ///
-/// Two paths:
-///   - Split-half (!interleaved): full SIMD — 8 elements per iteration.
-///     First-half and second-half pairs are at a fixed offset (head_dim/2),
-///     so a single v_load of each half + cos/sin vectors is sufficient.
-///   - Interleaved (interleaved): scalar fallback for now.
-///     Full SIMD would require a per-pair shuffle not yet in the SIMD
-///     abstraction (v_interleave / v_swap_adjacent).  Scalar via s_load/
-///     s_store is correct and transparently handles f16<->f32 conversion.
+/// Split-half (!interleaved, GPT-NeoX): full SIMD, 8 elements per iteration.
+/// A pair sits at a fixed offset head_dim/2, so one v_load per half plus the
+/// cos/sin vectors covers it. Only f32 takes this path: the tables are float,
+/// and v_mul has no mixed v_f16x8 / v_f32x8 overload. f16 falls back to scalar
+/// through s_load/s_store, which convert f16↔f32 transparently.
 ///
-/// All angles are computed externally (by the CPU backend) and passed as
-/// pre-computed cos_table / sin_table arrays.  Each table has head_dim/2
-/// entries for the current position.  For split-half, indices 0..half-1
-/// correspond to the rotation angle for pair (d, d+half).  For interleaved,
-/// index k corresponds to the pair (2k, 2k+1).
+/// Interleaved (LLaMA): scalar. A SIMD form would need a per-pair shuffle
+/// (v_interleave / v_swap_adjacent) the abstraction does not provide.
+///
+/// Angles are computed by the CPU backend and passed as cos_table / sin_table,
+/// head_dim/2 entries per position: for split-half, index d is the angle of the
+/// pair (d, d+half); for interleaved, index k is the pair (2k, 2k+1).
 
 #include "nnops/detail/simd/simd.hpp"
 
@@ -24,10 +22,6 @@
 namespace nnops::kernel {
 
 using namespace simd;
-
-// ============================================================
-// Split-half SIMD rotation (GPT-NeoX convention)
-// ============================================================
 
 template <typename T>
 inline void rope_process_row_splithalf(
@@ -38,10 +32,8 @@ inline void rope_process_row_splithalf(
 {
     const int64_t half = head_dim / 2;
 
-    // SIMD path only for f32 (cos/sin tables are always float, so mixing
-    // v_f16x8 with v_f32x8 cos/sin vectors is not type-safe).
     if constexpr (std::is_same_v<T, float>) {
-        constexpr int L = simd_lane_for<T>;  // 8
+        constexpr int L = simd_lane_for<T>;
         int64_t d = 0;
         for (; d + L <= half; d += L) {
             auto x0   = v_load(x + d);
@@ -58,7 +50,6 @@ inline void rope_process_row_splithalf(
             v_store(y + d + half, v_add(x1c, x0s));
         }
 
-        // Scalar tail
         for (; d < half; ++d) {
             float x0v = s_load(&x[d]);
             float x1v = s_load(&x[d + half]);
@@ -68,7 +59,6 @@ inline void rope_process_row_splithalf(
             s_store(&y[d + half], x1v * cv + x0v * sv);
         }
     } else {
-        // f16: all-scalar (s_load transparently converts f16→f32→f16)
         for (int64_t d = 0; d < half; ++d) {
             float x0v = s_load(&x[d]);
             float x1v = s_load(&x[d + half]);
@@ -79,10 +69,6 @@ inline void rope_process_row_splithalf(
         }
     }
 }
-
-// ============================================================
-// Interleaved scalar rotation (LLaMA convention)
-// ============================================================
 
 template <typename T>
 inline void rope_process_row_interleaved(
@@ -104,10 +90,6 @@ inline void rope_process_row_interleaved(
         s_store(&y[d + 1], y1);
     }
 }
-
-// ============================================================
-// Unified dispatch
-// ============================================================
 
 template <typename T>
 inline void rope_process_row(

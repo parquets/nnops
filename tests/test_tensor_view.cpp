@@ -1,4 +1,8 @@
-/// Unit tests for TensorView core data structure.
+/// @file test_tensor_view.cpp
+/// @brief TensorView construction and the pitch/stride accessors, plus TensorDesc.
+///
+/// pitch is the row stride in bytes and stride_elems derives from it; in the
+/// packed layouts the innermost stride is the channel pack size, not 1.
 
 #include "nnops/core/tensor_view.hpp"
 #include "common/test_harness.hpp"

@@ -2,43 +2,43 @@
 /// @file mma_i8.hpp
 /// @brief AArch64 NEON int8 (SDOT) mrxncxkc MMA kernels: s8×s8 → int32.
 ///
-/// One call covers the whole N side of one M panel: it computes
-/// C[mr][nc] += A[mr][kc] × B[kc][nc] panel by panel and clamps every int32
-/// result to [clamp_min, clamp_max]. This is the int8 sibling of mma_f32.hpp /
-/// mma_f16.hpp and takes the same runtime panel height `mr` and the same
-/// partial-M convention: rows past `mr` reuse the last live row's index and C
-/// row, so a short panel needs no per-row guards.
+/// One call covers the whole N side of one M panel: C[mr][nc] += A[mr][kc] ×
+/// B[kc][nc] panel by panel, and every int32 result is clamped to
+/// [clamp_min, clamp_max]. The int8 sibling of mma_f32.hpp / mma_f16.hpp, with
+/// the same runtime panel height `mr` and the same partial-M convention: rows
+/// past `mr` reuse the last live row's index in A and C, so a short panel needs
+/// no per-row guards. Those C rows alias the last live row, which is why the
+/// tail store loops over the live rows only.
 ///
-/// A is packed as four-byte k groups, one group per row:
-///   [ceil(kc/4)][MR][4] bytes (32 per group at MR=8), which is exactly what
-///   the pack_trans_nN_dp4a_i8 kernels write -- a 16-byte load holds four rows'
-///   groups, so one vector feeds four vdotq_laneq lanes.
-/// The `mma_packed_b_*` kernels instead read A row-major through `lda` (int8
-/// elements) and broadcast each row's group with vdupq_n_s32, so they need
-/// kc % 4 == 0 -- a row-major row has no zero-filled final group.
+/// Two A presentations share the same packed B:
+///   - packed A (mma_packed_ab_mr{8,4,1}_nr12_*): four-byte k groups, one group
+///     per row, [ceil(kc/4)][MR][4] bytes (32 per group at MR=8) — exactly what
+///     pack_trans_nN_dp4a_i8 writes. A 16-byte load holds four rows' groups, so
+///     one vector feeds four vdotq_laneq lanes.
+///   - row-major A (mma_packed_b_mr{8,4,1}_nr12_*): read through `lda` (int8
+///     elements) and each row's group broadcast with vdupq_n_s32, so they
+///     require kc % 4 == 0 — a row-major row has no zero-filled final group.
 ///
-/// B is always packed, in the layout the dot-product packers already write
-/// (pack_trans_n12_dp4a_i8 / pack_copy_n12_dp4a_i8), and uniform across
-/// panels: ceil(nc/12) panels of 12 columns each, [ceil(kc/4)][12][4] bytes --
-/// 48 bytes per k group. A panel is 12*kbytes bytes and sits in a
-/// mma_pack_align(12*kbytes)-byte slot.
-/// Twelve is the widest panel an 8-row block can keep in 32 vector registers
-/// (24 accumulators + 3 B + A), and it is mma_i8_nr_max on this arch.
+/// B is always in the dot-product packers' layout (pack_trans_n12_dp4a_i8 /
+/// pack_copy_n12_dp4a_i8), uniform across panels: ceil(nc/12) panels of 12
+/// columns each, [ceil(kc/4)][12][4] bytes — 48 bytes per k group — and a
+/// panel of 12*kbytes bytes sits in a mma_pack_align(12*kbytes)-byte slot.
+/// Twelve is the widest panel an 8-row block keeps in 32 vector registers (24
+/// accumulators + 3 B + one A broadcast stay live, 28 in all, nothing spills)
+/// and is mma_i8_nr_max on this arch.
 ///
-/// Only a panel's live columns are stored, so the columns past `nc` never
-/// reach C -- the packer may zero-fill them or alias the last live column
-/// (which is what the transposing packer does when handed a short width).
-/// The same goes for the packed-A panel's row slots past `mr`: the kernels
-/// take their SDOT lanes straight from the panel, so a short panel's dead
-/// slots must repeat the last live row (the pack_trans_* convention that
-/// mma_f32.hpp relies on) — they are not masked off in here.
+/// Only a panel's live columns are stored, so the columns past `nc` never reach
+/// C — the packers zero-fill them. The same goes for the packed-A panel's row
+/// slots past `mr`: the kernels take their SDOT lanes straight from the panel,
+/// so a short panel's dead slots must repeat the last live row (the pack_trans_*
+/// convention that mma_f32.hpp relies on) — they are not masked off in here.
 ///
-/// Arithmetic is signed × signed (vdotq_s32 / vdotq_laneq_s32), which is the
-/// contract x86_64/mma_i8.hpp also presents: both take int8 A and int8 B and
-/// return the exact s8×s8 product, so the MatMul driver is arch-blind. x86
-/// reaches the same answer through u8×s8 plus a bias correction; SDOT has no
-/// unsigned restriction, so there is nothing to correct here and
-/// mma_i8_b_panel_sums below is a no-op.
+/// Arithmetic is signed × signed (vdotq_s32 / vdotq_laneq_s32), the contract
+/// x86_64/mma_i8.hpp also presents: both take int8 A and int8 B and return the
+/// exact s8×s8 product, so the MatMul driver is arch-blind. x86 reaches the
+/// same answer through u8×s8 plus a bias correction; SDOT has no unsigned
+/// restriction, so there is nothing to correct here and mma_i8_b_panel_sums
+/// below is a no-op.
 ///
 /// A uint8 A is shifted into signed range by the A pack (XOR 0x80, i.e. a-128)
 /// rather than by anything in here: SDOT then accumulates Σ(a-128)·b, and the
@@ -49,7 +49,10 @@
 /// `kc` is the number of int8 elements. On the packed route a final partial
 /// group (1..3) is consumed as a whole zero-padded group, matching the packers.
 ///
-/// Tile sizes (AArch64-optimised): M ∈ {8, 4, 1}    N: 12 plus an in-kernel tail.
+/// Tile sizes (AArch64-optimised): M ∈ {8, 4, 1}    N: 12 plus an in-kernel
+/// tail. The dispatch tables at the bottom are indexed by the MR levels
+/// {8,4,1}; because every kernel takes the runtime panel height, a remainder
+/// panel below its own MR runs through the level above it.
 
 #include <array>
 #include <algorithm>
@@ -59,10 +62,7 @@
 
 namespace nnops::backend::cpu::aarch64 {
 
-/// One row's k group as an SDOT operand: the four bytes repeated in every
-/// 4-byte lane, so a plain vdotq_s32 against a 4-column B vector computes the
-/// same 4-k dot for all four columns. Used by the raw-A kernels, whose rows are
-/// not adjacent and so cannot share one 16-byte load.
+/// One row's four k bytes splatted into every 4-byte lane; the raw-A kernels only.
 inline int8x16_t mma_i8_bcast_group(const int8_t* p) noexcept {
     return vreinterpretq_s8_s32(vdupq_n_s32(*reinterpret_cast<const int32_t*>(p)));
 }
@@ -70,22 +70,17 @@ inline int8x16_t mma_i8_bcast_group(const int8_t* p) noexcept {
 /// Packed-B panel width: the kernels' uniform nr.
 inline constexpr int mma_i8_nr_max = 12;
 
-/// Bytes a packed-B panel carries past its nr*kbytes payload. x86 appends the
-/// column sums its u8×s8 emulation needs; SDOT needs none, so the panel is
-/// exactly its data and the panel slot is align(12*kbytes).
+/// Bytes a packed-B panel carries past its nr*kbytes payload; SDOT needs none.
 inline constexpr int mma_i8_b_panel_tail = 0;
 
-/// False: the kernels do not fold an A bias, so a shifted A's correction stays
-/// with the epilogue (which has the full-K sums). See the header comment.
+/// False: a shifted A's correction stays with the epilogue, not the kernel.
 inline constexpr bool mma_i8_folds_a_bias = false;
 
-/// x86 counterpart writes the panel's column sums here (see the x86 header);
-/// SDOT reads B unsigned-bit-exact already, so the packing step has nothing to
-/// add. Same signature in both headers so matmul_helper is arch-blind.
+/// No-op: SDOT needs no column sums. Same signature as x86 so matmul_helper is arch-blind.
 inline void mma_i8_b_panel_sums(int8_t* /*panel*/, int /*kbytes*/, bool /*a_biased*/) noexcept {}
 
 // =========================================================================
-//  mr=8  kernels
+//  packed A + packed B  (mr = 8, 4, 1)
 // =========================================================================
 
 template <bool zero_mode = false>
@@ -95,9 +90,6 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_i8(
     const int8_t* NNOPS_RESTRICT B,
     int32_t clamp_min, int32_t clamp_max) noexcept {
 
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards.
     int32_t* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     int32_t* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     int32_t* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
@@ -127,8 +119,8 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_i8(
         const int8_t* NNOPS_RESTRICT a_ptr = A;
         const int8_t* NNOPS_RESTRICT b_ptr = B;
         for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16);  // rows 0..3
-            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16);  // rows 4..7
+            const int8x16_t v_a0 = vld1q_s8(a_ptr + 0 * 16);
+            const int8x16_t v_a1 = vld1q_s8(a_ptr + 1 * 16);
             a_ptr += 32;
 
             const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
@@ -317,8 +309,7 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_i8(
         };
         int32_t* NNOPS_RESTRICT c_rows[8] = {c0_ptr, c1_ptr, c2_ptr, c3_ptr,
                                              c4_ptr, c5_ptr, c6_ptr, c7_ptr};
-        // Only the live rows are stored; an alias row past `mr` would write a
-        // duplicate of the last live row back over itself.
+        // Only the live rows: an alias row would write the last live row over itself.
         for (int r = 0; r < mr; ++r) {
             int32_t* NNOPS_RESTRICT cp = c_rows[r];
             int rr = rem;
@@ -345,10 +336,6 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_i8(
         }
     }
 }
-
-// =========================================================================
-//  mr=4  kernels
-// =========================================================================
 
 template <bool zero_mode = false>
 inline void mma_packed_ab_mr4_nr12_mrxncxkc_i8(
@@ -378,7 +365,7 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_i8(
         const int8_t* NNOPS_RESTRICT a_ptr = A;
         const int8_t* NNOPS_RESTRICT b_ptr = B;
         for (int k = 0; k < kg; ++k) {
-            const int8x16_t v_a = vld1q_s8(a_ptr);  // rows 0..3
+            const int8x16_t v_a = vld1q_s8(a_ptr);
             a_ptr += 16;
 
             const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
@@ -526,10 +513,6 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_i8(
     }
 }
 
-// =========================================================================
-//  mr=1  kernels
-// =========================================================================
-
 template <bool zero_mode = false>
 inline void mma_packed_ab_mr1_nr12_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
@@ -643,12 +626,8 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_i8(
 }
 
 // =========================================================================
-//  mr=8/4/1  kernels, raw A — only B packed
+//  raw A + packed B  (mr = 8, 4, 1)
 // =========================================================================
-//
-// `lda` is the A row stride in int8 elements. A row's four k bytes are read
-// straight from memory and broadcast, so kc must be a multiple of 4: a
-// row-major row has no zero-filled final group.
 
 template <bool zero_mode = false>
 inline void mma_packed_b_mr8_nr12_mrxncxkc_i8(
@@ -700,8 +679,6 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_i8(
         const int8_t* NNOPS_RESTRICT a7 = A + r7 * lda;
         const int8_t* NNOPS_RESTRICT b_ptr = B;
         for (int k = 0; k < kg; ++k) {
-            // Three B vectors and one A broadcast stay live: 28 registers for
-            // the 24 accumulators, so nothing spills.
             const int8x16_t v_b0 = vld1q_s8(b_ptr + 0 * 16);
             const int8x16_t v_b1 = vld1q_s8(b_ptr + 1 * 16);
             const int8x16_t v_b2 = vld1q_s8(b_ptr + 2 * 16);
@@ -1259,9 +1236,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_i8(
     }
 }
 
-// ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
-// Rows are the MR levels {8,4,1}; every kernel takes the runtime panel height,
-// so a remainder panel below its own MR runs through the level above it.
+// Dispatch tables, consumed by matmul_helper.cpp; rows are the MR levels {8,4,1}.
 template <bool Z>
 inline constexpr auto mma_pack_fns_i8 = std::array{
     &mma_packed_ab_mr8_nr12_mrxncxkc_i8<Z>,

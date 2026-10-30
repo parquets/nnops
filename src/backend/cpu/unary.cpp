@@ -1,18 +1,16 @@
 /// @file unary.cpp
 /// @brief SIMD-optimized CPU implementation of element-wise unary operations.
 ///
-/// Supports both f32 and f16 via a single templated implementation.
-/// Processing is tiled in groups of TILE_M rows and dispatched via
-/// ComputeContext::cpu.run when available.
+/// One templated implementation covers f32 and f16. The pitch-aware row/tile
+/// loop and the ComputeContext::cpu.run dispatch live in common/elementwise.hpp,
+/// so this file is just the op switch and the dtype/quant routing.
 ///
-/// Quantized input/output (s8/u8 → s8/u8) is supported through a fused path: the
-/// input is dequantized (int → f32), the unary op is applied in f32, and the
-/// result is re-quantized (f32 → int). Both input and output must be quantized
-/// (no float↔int mixing). Only PerTensor / PerToken granularity is supported
-/// (activation quantization); the quant/dequant work is delegated to the
-/// raw-intrinsic arch kernels in `x86_64/quant.hpp` / `aarch64/quant.hpp` (NOT
-/// `simd_kernel/simd_quant.hpp`). Float-meaning ops (Round/Ceil/Floor) do not
-/// support quantized data types.
+/// Quantized input/output (s8/u8 → s8/u8) is a fused path: dequantize to f32,
+/// apply the op, requantize. Input and output must both be quantized (no
+/// float↔int mixing) and only PerTensor / PerToken granularity is supported;
+/// the dequant/requant work goes to the raw-intrinsic arch kernels in
+/// `x86_64/quant.hpp` / `aarch64/quant.hpp` (NOT `simd_kernel/simd_quant.hpp`).
+/// Float-meaning ops (Round/Ceil/Floor) reject quantized data types.
 
 #include "nnops/ops/unary.hpp"
 #include "nnops/detail/assert.hpp"
@@ -26,10 +24,7 @@ namespace nnops::backend::cpu {
 
 namespace {
 
-/// Apply a floating-point unary op to an M×N tile, dispatching on the op type.
-/// Shared by the f32/f16 paths (in/out strides may differ) and the quantized
-/// path (in == out, stride == N, add_to == false). Round/Ceil/Floor are only
-/// reachable from the float path.
+/// Dispatch a float unary op over an M×N tile; the quantized path reuses it with in == out and add_to == false.
 template <typename T>
 void apply_unary_flt(UnaryType type, const T* in, T* out,
                      int64_t M, int64_t N, int64_t in_stride, int64_t out_stride,
@@ -103,8 +98,7 @@ Status unary_cpu(const UnaryAttributes& attrs,
     // Quantized path: both input and output must be s8/u8 (no float↔int mixing).
     NNOPS_ASSERT(in_is_int && out_is_int);
 
-    // Round/Ceil/Floor have no quantized meaning; refuse instead of falling
-    // through to unary_quant_impl.
+    // Round/Ceil/Floor have no quantized meaning; refuse rather than fall through.
     if (attrs.type == UnaryType::Round || attrs.type == UnaryType::Ceil ||
         attrs.type == UnaryType::Floor) {
         return Status::unsupported;

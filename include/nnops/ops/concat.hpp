@@ -1,11 +1,10 @@
 #pragma once
 /// @file concat.hpp
-/// @brief Concat operator — concatenate multiple tensors along an axis.
+/// @brief Concatenate N tensors along one axis.
 ///
-/// Supports NCHW, NCDHW, NCHWC8, NCDHWC8 layouts.
-/// All inputs must have the same rank, data type, and layout.
-///
-/// F32 and F16 data types are supported.
+/// N >= 2. All inputs share rank, dtype and layout; every non-axis dimension
+/// must match, and the output axis dimension is their sum. All layouts
+/// (NCHW / NCDHW / NCHWC8 / NCDHWC8); f32 and f16.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -19,18 +18,10 @@ namespace nnops {
 
 /// Attributes for the Concat operator.
 struct ConcatAttributes {
-    /// Axis along which to concatenate (negative values wrap from the end).
+    /// Axis; negative values wrap from the end.
     int64_t axis = -1;
 };
 
-/// Concat operator (class-based API).
-///
-/// Concatenates N input tensors (N >= 2) along the specified axis.
-/// All inputs must share the same rank, dtype, and layout.
-/// All non-axis dimensions must be identical across inputs.
-///
-/// Input:  A [*], B [*], C [*], ...  (same rank/dtype/layout)
-/// Output: O [*]                     (axis dim = sum of all input axis dims)
 class Concat : public OpBase {
 public:
     static std::unique_ptr<Concat> create(const ConcatAttributes& attrs = {},

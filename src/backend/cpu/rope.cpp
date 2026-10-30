@@ -1,14 +1,16 @@
 /// @file rope.cpp
 /// @brief SIMD-optimized CPU implementation of RoPE (Rotary Position Embedding).
 ///
-/// Pre-computes cos/sin tables for all positions (shared across heads and
-/// batch), then applies the rotation row-by-row using SIMD-accelerated
-/// kernels from simd_kernel/simd_rope.hpp.
+/// Builds cos/sin tables once for all positions (shared across heads and
+/// batches), then rotates row by row with the kernels in
+/// simd_kernel/simd_rope.hpp. f32 and f16 via dtype dispatch.
 ///
-/// Supports f32 and f16 via dtype dispatch.
+/// Table layout: table[pos * half + pair_idx], half = head_dim/2. Interleaved:
+/// pair_idx = d/2, the pair is (2p, 2p+1). Split-half: pair_idx = d, the pair
+/// is (d, d+half).
 ///
-/// mRoPE mode: when mrope_section_dims is non-empty, head_dim is partitioned
-/// into sections, each with its own base frequency.
+/// mRoPE: when mrope_section_dims is non-empty, head_dim is partitioned into
+/// sections, each with its own base frequency.
 
 #include "nnops/ops/rope.hpp"
 #include "nnops/detail/assert.hpp"
@@ -31,7 +33,6 @@ struct RoPESection {
     float   base;
 };
 
-/// Build section table.
 std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t head_dim) {
     std::vector<RoPESection> secs;
     if (attrs.mrope_section_dims.empty()) {
@@ -48,10 +49,6 @@ std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t hea
     return secs;
 }
 
-/// Pre-compute cos and sin tables for all positions.
-/// Layout: table[pos * half + pair_idx] where half = head_dim / 2.
-/// For interleaved:    pair_idx = d/2      (pair (2*pair, 2*pair+1))
-/// For split-half:     pair_idx = d        (pair (d, d+half))
 void compute_cos_sin_tables(
     std::vector<float>& cos_table,
     std::vector<float>& sin_table,
@@ -104,26 +101,22 @@ void rope_impl(const RoPEAttributes& attrs,
 
     const int64_t half = head_dim / 2;
 
-    // Flatten leading dims
     int64_t outer_count = 1;
     for (int64_t i = 0; i < rank - 2; ++i) {
         outer_count *= X.shape(i);
     }
 
-    // ---- Build sections and pre-compute cos/sin tables ----
     auto sections = build_sections(attrs, head_dim);
     std::vector<float> cos_table;
     std::vector<float> sin_table;
     compute_cos_sin_tables(cos_table, sin_table, seq_len, head_dim, sections);
 
-    // ---- Data pointers ----
     const T* x_ptr   = X.ptr<T>();
     T*       y_ptr   = output.ptr<T>();
     const int64_t row_stride  = X.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
     const bool    interleaved = attrs.interleaved;
 
-    // ---- Row-by-row rotation ----
     const auto process_outer = [&](int64_t outer) {
         const T* x_outer = x_ptr + outer * seq_len * row_stride;
         T*       y_outer = y_ptr + outer * seq_len * out_row_stride;

@@ -4,30 +4,28 @@
 ///
 /// The packed-B route decodes a Q4_1 block into a dense panel and then reads
 /// that panel back in the MMA. At M=1 the panel is consumed by exactly one
-/// row, so the decode + panel round trip is the whole call. These kernels skip
-/// the panel: each block is decoded into registers and multiplied straight
-/// into the accumulator, so a block is read once (20 B) and never written
-/// back.
+/// row, so the round trip is the whole call. These kernels skip the panel: a
+/// block is decoded into registers and multiplied straight into the
+/// accumulator, read once (20 B) and never written back.
 ///
-/// The kernels are parameterized by a block policy — `Q4Block` — that supplies
-/// the stride, the width and the two decode entry points, so a second block
-/// format costs one policy and no kernel.
+/// A block policy (`Q4Block`) supplies the stride, the width and the two decode
+/// entry points — registers for the k body, a scratch array for the trailing
+/// partial block — so a second block format costs one policy and no kernel.
 ///
 /// Two physical B layouts, each with its natural loop shape:
 ///
-///  * trans ([N][K], the Linear-weight layout): one n row at a time, sweeping
-///    its k blocks linearly. MR accumulator vectors (MR ≤ 8) hold one row each;
-///    a block decode is amortized over all MR rows.
+///  * trans ([N][K], the Linear-weight layout): one n row at a time, its k
+///    blocks swept linearly. MR accumulator vectors (MR ≤ 8) hold one row each,
+///    so a decode is amortized over all MR rows.
 ///  * copy ([K][N]): one 32-wide n block at a time. A block is exactly one
 ///    quant block per k row, and the outer-product form needs four
 ///    accumulators per row, which caps MR at 2.
 ///
-/// Both compute the whole K in one call, so the clamp is applied once, on the
-/// final value. Accumulation reorders the reduction (four partial sums reduced
-/// at the end for trans), which is why callers must keep these on tiles that
-/// are not shared with the packed route.
+/// Both sweep the whole K in one call, so the clamp lands once, on the final
+/// value. The sum order is the kernels' own (four chunk partials reduced at
+/// the end for trans), so a tile must not be shared with the packed route.
 ///
-/// @p MR is the exact number of live rows. A partial M panel instantiates its
+/// @p MR is the exact number of live rows: a partial M panel instantiates its
 /// own width, so no row aliases a duplicate and no per-row guard is needed.
 
 #include <immintrin.h>
@@ -45,21 +43,18 @@ namespace nnops::backend::cpu::x86_64 {
 //  Block policies
 // =========================================================================
 //
-/// Everything the fused kernels need to read one 32-value quant block: the
-/// block width, the dtype it names, and the two decode entry points (vectorized
-/// and scalar, for the paths that write to memory).
+/// One 32-value quant block: its width and byte size, the dtype it names, and
+/// the decode pair.
 
 struct Q4Block {
     static constexpr int block_elems = q4_1_block_elems;
     static constexpr int block_bytes = q4_1_block_bytes;
     static constexpr DataType dtype = DataType::q4_1;
 
-    /// The fused route's measured M ceilings, per layout, at K=N=4096. The dot
-    /// kernel reuses one decode across MR = 8 rows and the outer-product one
-    /// across 2, so the copy limit is half the trans one's: re-decoding B once
-    /// per 2-row panel is amortized over a quarter of the rows. At the ceiling
-    /// the fused route is still ahead — M=8 +34% at 4096² and +89% at 2048² —
-    /// and it loses only from M=16 at 4096² (ratio 0.85) / M=24.
+    /// Per-layout M ceilings at K=N=4096. The dot kernel amortizes one decode
+    /// over MR = 8 rows and the outer product over 2, so copy is capped at half
+    /// the trans ceiling. Measured at 4096²: +34% at M=8 and down to 0.85 by
+    /// M=16; at 2048² the same M=8 point is +89%.
     static constexpr int fused_max_m_trans = 16;
     static constexpr int fused_max_m_copy = 8;
 
@@ -87,8 +82,8 @@ inline float qblock_hsum_ps(__m256 v) noexcept {
     return _mm_cvtss_f32(s);
 }
 
-/// One row of the trans kernel's k body: the four decoded B vectors against
-/// the row's four A vectors, reduced into that row's accumulator.
+/// One trans row's k step: its four A vectors against the four decoded B
+/// vectors.
 #define NNOPS_QBLOCK_DOT_ROW(ACC, ROW)                                    \
     do {                                                                  \
         const float* a = A + static_cast<int64_t>(ROW) * lda + k;         \
@@ -103,13 +98,11 @@ inline float qblock_hsum_ps(__m256 v) noexcept {
 //  trans: B physically [N][K]
 // =========================================================================
 //
-/// Dot-product form. For each of the @p nc columns starting at @p n_start, walk
-/// the column's k blocks once, decoding each block into four vectors and
-/// multiplying it against the same four-vector slice of every live A row.
+/// Dot-product form: one n row at a time, applied to every live A row.
 ///
-/// @param C   C[m0][n_start]; already offset by the caller.
-/// @param A   A[m0][0], row stride @p lda.
-/// @param B   first block of the batch element's [N][K] stream.
+/// @param C C[m0][n_start]; already offset by the caller.
+/// @param A A[m0][0], row stride @p lda.
+/// @param B first block of the batch element's [N][K] stream.
 template <class BQ, int MR, bool ZERO>
 void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                           const float* NNOPS_RESTRICT A, int lda,
@@ -125,12 +118,11 @@ void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const int nblk = kc / BQ::block_elems;
 
     for (int n = 0; n < nc; ++n, src += row_bytes) {
-        // One accumulator chain per row is latency-bound on the
+        // MR <= 2: one chain per row is latency-bound on the
         // mul -> fma -> fma -> fma -> add sequence once the decode stops
-        // covering it, which is the M <= 2 case. There, give each row four
-        // independent chains (one per chunk) and reduce them once per column.
-        // Two rows' worth is all that fits alongside the decoded block; wider
-        // panels keep the single chain, where the decode is amortized anyway.
+        // covering it, so each row gets four independent chunk chains, reduced
+        // once per column. Two rows' worth is all that fits alongside the
+        // decoded block; wider panels keep the single chain.
         __m256 q00 = vzero, q01 = vzero, q02 = vzero, q03 = vzero;
         __m256 q10 = vzero, q11 = vzero, q12 = vzero, q13 = vzero;
         __m256 acc0 = vzero, acc1 = vzero, acc2 = vzero, acc3 = vzero;
@@ -155,8 +147,6 @@ void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                 if constexpr (MR > 1) { NNOPS_QBLOCK_CHAINS(q1, 1); }
 #undef NNOPS_QBLOCK_CHAINS
             } else {
-                // One four-vector slice per row: 4 mul/fma + 1 add, and the
-                // block decode is reused by every row in this panel.
                 NNOPS_QBLOCK_DOT_ROW(acc0, 0);
                 if constexpr (MR > 1) { NNOPS_QBLOCK_DOT_ROW(acc1, 1); }
                 if constexpr (MR > 2) { NNOPS_QBLOCK_DOT_ROW(acc2, 2); }
@@ -223,11 +213,9 @@ void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
 //  copy: B physically [K][N]
 // =========================================================================
 //
-/// Outer-product form. A 32-wide n block spans exactly one quant block per k
-/// row, so each k step decodes one block into four vectors and broadcasts one
-/// A scalar per live row. Four accumulators per row cap MR at 2.
+/// Outer-product form: one 32-wide B block at a time, one A scalar per row.
 ///
-/// @param n_start first column of the tile; must be a multiple of 32 so each
+/// @param n_start first column of the tile; must be a multiple of 32, so each
 ///                decoded block is one panel.
 template <class BQ, int MR, bool ZERO>
 void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
@@ -275,7 +263,6 @@ void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
             }
         }
 
-        // Clamp (and optionally accumulate into) one row's four n-chunks.
         auto emit = [&](int row, __m256 q0, __m256 q1, __m256 q2, __m256 q3) {
             float* cp = C + static_cast<int64_t>(row) * ldc + n;
             if (width == BQ::block_elems) {

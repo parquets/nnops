@@ -1,5 +1,6 @@
 /// @file test_argminmax.cpp
-/// @brief Unit tests for ArgMax / ArgMin operators (CPU backend).
+/// @brief ArgMax / ArgMin (CPU): hand-verified indices, brute-force cross-checks,
+/// and the descriptor / OpType surface.
 
 #include "nnops/ops/argminmax.hpp"
 #include "common/test_harness.hpp"
@@ -72,8 +73,7 @@ NNOPS_TEST(argmax_1d_with_keepdims) {
 }
 
 NNOPS_TEST(argmax_2d_axis1) {
-    // [2, 4], axis=1: argmax per row
-    const int64_t shape[] = {2, 4};
+    const int64_t shape[] = {2, 4};  // 4 columns per row, axis=1
     float data[] = {1.0f, 9.0f, 3.0f, 2.0f,
                     5.0f, 1.0f, 8.0f, 4.0f};
     int64_t out_data[2] = {-1, -1};
@@ -101,8 +101,7 @@ NNOPS_TEST(argmax_2d_axis1) {
 }
 
 NNOPS_TEST(argmax_3d_axis0) {
-    // [3, 2, 2], axis=0: per (row,col) find which "depth" has max
-    const int64_t shape[] = {3, 2, 2};
+    const int64_t shape[] = {3, 2, 2};  // axis=0: per (row,col) depth argmax
     // Depth 0: [1,2; 3,4]  Depth 1: [5,6; 7,8]  Depth 2: [2,1; 4,3]
     float data[] = {1.0f, 2.0f, 3.0f, 4.0f,
                     5.0f, 6.0f, 7.0f, 8.0f,
@@ -214,7 +213,6 @@ NNOPS_TEST(argmax_random_vs_ref) {
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
-    // Verify by brute force
     for (int64_t r = 0; r < 4; ++r) {
         int64_t best_idx = 0;
         float best_val = data[r * 10];
@@ -245,7 +243,6 @@ NNOPS_TEST(argmin_random_vs_ref) {
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
-    // Verify by brute force
     for (int64_t r = 0; r < 3; ++r) {
         int64_t best_idx = 0;
         float best_val = data[r * 8];
@@ -258,10 +255,6 @@ NNOPS_TEST(argmin_random_vs_ref) {
         NNOPS_EXPECT_EQ(out_data[r], best_idx);
     }
 }
-
-// ============================================================
-// Class API
-// ============================================================
 
 NNOPS_TEST(argmax_class_1d) {
     const int64_t shape[] = {4};
@@ -306,10 +299,6 @@ NNOPS_TEST(argmin_class_1d) {
 
     NNOPS_EXPECT_EQ(out_data, 3);  // min 1.0 at idx 3
 }
-
-// ============================================================
-// OpType
-// ============================================================
 
 NNOPS_TEST(argmax_op_type) {
     auto op = ArgMax::create(Backend::CPU);

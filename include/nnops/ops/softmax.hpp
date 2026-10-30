@@ -1,6 +1,12 @@
 #pragma once
 /// @file softmax.hpp
 /// @brief Softmax operator — softmax / log-softmax along an axis.
+///
+/// softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max)); log-softmax subtracts
+/// log(sum) instead. A temperature T divides the max-shifted logits by T
+/// (equivalently softmax(x/T)). Quantized input (s8/u8) is dequantized to f32,
+/// softmax runs in f32, and the output is float — probabilities are never
+/// re-quantized; quantized input is planar and PerTensor/PerToken only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -12,46 +18,19 @@
 
 namespace nnops {
 
-/// Attributes for the Softmax operator.
 struct SoftmaxAttributes {
-    /// Axis along which to compute softmax. Negative values count from the end.
-    /// Default -1 normalizes over the last dimension.
+    /// Axis to normalize over (negative values count from the end; default last).
     int64_t axis = -1;
 
     /// If true, compute log-softmax instead of softmax.
     bool log_softmax = false;
 
-    /// Temperature scaling factor (T > 0).
-    ///
-    /// softmax(x_i, T) = exp(x_i / T) / sum(exp(x_j / T))
-    ///
-    /// T = 1.0  → standard softmax
-    /// T > 1.0  → softer / more uniform distribution
-    /// T < 1.0  → sharper / more peaked distribution
-    ///
-    /// The max-subtraction trick still applies:
-    ///   softmax(x_i, T) = exp((x_i - max) / T) / sum(exp((x_j - max) / T))
-    ///
-    /// Must be > 0. Default 1.0 (standard softmax).
+    /// Temperature T > 0: logits are divided by T (T=1 standard; T>1 flatter,
+    /// T<1 sharper). Must be > 0. Default 1.0.
     float temperature = 1.0f;
 };
 
-/// Softmax operator (class-based API).
-///
-/// Computes softmax along a given axis:
-///   softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))
-///
-/// When log_softmax is true:
-///   log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))
-///
-/// Input: [*, D_axis, *]
-/// Output: same shape as input.
-///
-/// Quantized input (s8/u8) is supported: the integer input is dequantized to
-/// f32, softmax runs in f32, and the output is float (f32 by default, or f16).
-/// Softmax probabilities are never re-quantized to integer. Only PerTensor /
-/// PerToken granularity and planar (NCHW) layouts are supported for quantized
-/// input; packed channel layouts are not defined there.
+/// Softmax over `axis`; input and output share shape.
 class Softmax : public OpBase {
 public:
     static std::unique_ptr<Softmax> create(const SoftmaxAttributes& attrs = {},
@@ -83,7 +62,7 @@ public:
 
     const SoftmaxAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in softmax.cpp (Pimpl pattern)
+    struct Impl;  // defined in softmax.cpp
     ~Softmax();
 
 private:

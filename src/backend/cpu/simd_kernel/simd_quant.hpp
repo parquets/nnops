@@ -1,25 +1,18 @@
 #pragma once
 /// @file simd_quant.hpp
-/// @brief SIMD kernel functions for QuantizeLinear / DequantizeLinear, plus the
-/// shared dequant/requant helpers for quantized conv/pooling kernels.
+/// @brief SIMD QuantizeLinear / DequantizeLinear kernels and the shared
+/// dequant/requant helpers for quantized conv and pooling.
 ///
-/// All arithmetic is in f32 (v_f32x8) or f16 (v_f16x8) depending on the
-/// output type. For f16, the full pipeline runs in f16 vectors when possible.
-/// int8/uint8 → f32 uses v_cvt_s8_to_f32 / v_cvt_u8_to_f32.
-/// int8/uint8 → f16 uses v_cvt_s8_to_f16 / v_cvt_u8_to_f16.
+/// Arithmetic is f32 (v_f32x8) or f16 (v_f16x8) by output type; f16 keeps the
+/// pipeline in f16 vectors where it can. int8/uint8 widen through
+/// v_cvt_s8_to_f32 / v_cvt_u8_to_f32 (or the _to_f16 pair). The helpers are
+/// overloaded on pointer type so callers stay type-agnostic.
 ///
-/// Key interface (overloaded on pointer type so callers stay type-agnostic):
-///   load_i8_to_f32 / load_i8_to_f16     — widen int8/uint8 to SIMD vectors
-///   quant_store_f32 / quant_load_f32    — f32/f16 boundary load/store
-///   dequant_i8_store / dequant_i8_scalar — full load→dequant→store pipeline
-///
-/// The quantized conv/pooling kernels (depthwise conv, pooling) share a second
-/// group of helpers at the bottom of this file: dequantize_tensor (PerTensor),
-/// dequantize_channel (PerChannel weight), and requantize_store
-/// (round-to-nearest-even via the arch `requantize_8`). The `quant_kernel`
-/// alias resolves to the active arch quant primitives.
-///
-/// Reference: include/nnops/detail/simd/simd.hpp — v_load/v_store for half*
+/// The bottom group is shared with the quantized conv/pooling kernels: the
+/// activation is PerTensor (dequantize_tensor broadcasts scale/zero_point), the
+/// depthwise weight is PerChannel (dequantize_channel takes per-lane scale/
+/// zero_point), and requantize_store rounds to nearest even through the arch
+/// `requantize_8`. `quant_kernel` resolves to the active arch's primitives.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
@@ -48,9 +41,7 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 
 constexpr int kQuantLane = 8;  // v_f32x8 / v_f16x8 lane width
 
-// ============================================================
-// QuantizeLinear helpers
-// ============================================================
+// --- QuantizeLinear helpers ---
 
 inline int32_t quant_int_min(DataType dt) { return (dt == DataType::s8) ? -128 : 0; }
 inline int32_t quant_int_max(DataType dt) { return (dt == DataType::s8) ? 127 : 255; }
@@ -66,7 +57,6 @@ inline void quant_write_int8(void* ptr, DataType dt, int64_t off, int32_t val) {
     }
 }
 
-/// Quantize a v_f32x8 vector to int8 and write to output.
 inline void quant_store_int8(v_f32x8 vr, void* y_row, int64_t off,
                               int64_t pack, DataType out_dtype) {
     alignas(32) float ftmp[8];
@@ -77,11 +67,8 @@ inline void quant_store_int8(v_f32x8 vr, void* y_row, int64_t off,
     }
 }
 
-// ============================================================
-// DequantizeLinear: int8/uint8 → floating-point SIMD vectors
-// ============================================================
+// --- DequantizeLinear: int8/uint8 → floating-point SIMD vectors ---
 
-/// Load 8 int8/uint8 values and widen to v_f32x8.
 inline v_f32x8 load_i8_to_f32(const void* p, bool in_is_i8) {
     if (in_is_i8) {
         return v_cvt_s8_to_f32(static_cast<const int8_t*>(p));
@@ -91,7 +78,6 @@ inline v_f32x8 load_i8_to_f32(const void* p, bool in_is_i8) {
     }
 }
 
-/// Load 8 int8/uint8 values and widen to v_f16x8.
 inline v_f16x8 load_i8_to_f16(const void* p, bool in_is_i8) {
     if (in_is_i8) {
         return v_cvt_s8_to_f16(static_cast<const int8_t*>(p));
@@ -101,17 +87,12 @@ inline v_f16x8 load_i8_to_f16(const void* p, bool in_is_i8) {
     }
 }
 
-// ============================================================
-// Store v_f32x8 to output (overloaded on pointer type)
-// ============================================================
+// --- Store v_f32x8 to output (overloaded on pointer type) ---
 
-/// Store v_f32x8 directly to float* — no conversion needed.
 inline void quant_store_f32(float* dest, v_f32x8 vy) {
     v_store(dest, vy);
 }
 
-/// Store v_f32x8 to half*: extract to f32 buffer, convert each lane
-/// to half, then SIMD store as v_f16x8 (v_load + v_store).
 inline void quant_store_f32(half* dest, v_f32x8 vy) {
     alignas(32) float fbuf[8];
     v_store(fbuf, vy);
@@ -119,38 +100,28 @@ inline void quant_store_f32(half* dest, v_f32x8 vy) {
     for (int i = 0; i < 8; ++i) {
         hbuf[i] = ::nnops::backend::cpu::float_to_half(fbuf[i]);
     }
-    v_store(dest, v_load(hbuf));  // SIMD store of 8 half values
+    v_store(dest, v_load(hbuf));
 }
 
-// ============================================================
-// Load f32/f16 → v_f32x8 (overloaded on pointer type)
-// ============================================================
+// --- Load f32/f16 → v_f32x8 (overloaded on pointer type) ---
 
-/// Load float* → v_f32x8 directly — no conversion needed.
 inline v_f32x8 quant_load_f32(const float* p) {
     return v_load(p);
 }
 
-/// Load half* → v_f32x8: SIMD load as v_f16x8, extract each lane,
-/// convert to float, then load back as v_f32x8.
 inline v_f32x8 quant_load_f32(const half* p) {
-    v_f16x8 vh = v_load(p);      // SIMD load of 8 half values
+    v_f16x8 vh = v_load(p);
     half hbuf[8];
     v_store(hbuf, vh);
     float fbuf[8];
     for (int i = 0; i < 8; ++i) {
         fbuf[i] = ::nnops::backend::cpu::half_to_float(hbuf[i]);
     }
-    return v_load(fbuf);          // SIMD load of 8 float values
+    return v_load(fbuf);
 }
 
-// ============================================================
-// Combined dequant+store pipeline: load s8, dequantize, store
-// ============================================================
-// Overloaded on output pointer type so callers (e.g. embed) can
-// be type-agnostic — no SIMD vector types exposed in the caller.
+// --- Combined dequant+store pipeline: load s8, dequantize, store ---
 
-/// Load 8 int8/uint8, dequantize in f32, store to float*.
 inline void dequant_i8_store(const void* src, bool is_i8,
                               float scale, float zp, float* dst) {
     auto vw = load_i8_to_f32(src, is_i8);
@@ -159,7 +130,6 @@ inline void dequant_i8_store(const void* src, bool is_i8,
     v_store(dst, v_mul(v_sub(vw, vz), vs));
 }
 
-/// Load 8 int8/uint8, dequantize in f16, store to half*.
 inline void dequant_i8_store(const void* src, bool is_i8,
                               float scale, float zp, half* dst) {
     auto vw = load_i8_to_f16(src, is_i8);
@@ -168,11 +138,8 @@ inline void dequant_i8_store(const void* src, bool is_i8,
     v_store(dst, v_mul(v_sub(vw, vz), vs));
 }
 
-// ============================================================
-// Scalar dequant+store — for tail elements (< kQuantLane)
-// ============================================================
+// --- Scalar dequant+store, for tail elements (< kQuantLane) ---
 
-/// Scalar dequantize and store to float*.
 inline void dequant_i8_scalar(const void* src, bool is_i8,
                                float scale, float zp, float* dst) {
     float w = is_i8
@@ -181,7 +148,6 @@ inline void dequant_i8_scalar(const void* src, bool is_i8,
     *dst = (w - zp) * scale;
 }
 
-/// Scalar dequantize and store to half*.
 inline void dequant_i8_scalar(const void* src, bool is_i8,
                                float scale, float zp, half* dst) {
     float w = is_i8
@@ -190,18 +156,9 @@ inline void dequant_i8_scalar(const void* src, bool is_i8,
     *dst = ::nnops::backend::cpu::float_to_half((w - zp) * scale);
 }
 
-// ============================================================
-// Shared dequant/requant helpers for quantized conv/pooling kernels
-// ============================================================
-//
-// Depthwise conv and pooling dequantize s8/u8 inputs to float on load,
-// accumulate in float, then requantize on store. These helpers are the shared
-// glue between the two operators' SIMD kernels. The activation is PerTensor
-// (broadcast scale/zero_point); the depthwise weight is PerChannel (per-lane
-// scale/zero_point). Rounding is round-to-nearest-even via the arch
-// `requantize_8`.
+// --- Shared dequant/requant helpers for quantized conv/pooling kernels ---
 
-/// Dequantize 8 activation values (PerTensor: broadcast scale/zero_point).
+/// Dequantize eight activation values (PerTensor: broadcast scale/zero_point).
 template <typename InT>
 inline v_f32x8 dequantize_tensor(const InT* p, float scale, float zero) {
     v_f32x8 v;
@@ -214,7 +171,7 @@ inline v_f32x8 dequantize_tensor(const InT* p, float scale, float zero) {
     return v_mul(v, v_set1_f32x8(scale));
 }
 
-/// Dequantize 8 weight values (PerChannel: per-lane scale/zero_point).
+/// Dequantize eight weight values (PerChannel: per-lane scale/zero_point).
 template <typename InT>
 inline v_f32x8 dequantize_channel(const InT* p, const float* scale8, const float* zero8) {
     v_f32x8 v;
@@ -227,8 +184,8 @@ inline v_f32x8 dequantize_channel(const InT* p, const float* scale8, const float
     return v_mul(v, v_load(scale8));
 }
 
-/// Requantize a float accumulator and store to 8 int8/uint8 output lanes.
-/// `add_to` dequantizes the existing output, adds in float, then requantizes.
+/// Requantize eight lanes; @p add_to dequantizes the existing output, adds in
+/// float, then requantizes.
 template <typename OutT>
 inline void requantize_store(OutT* dst, const v_f32x8& acc,
                              float out_scale, float out_zero, bool add_to) {

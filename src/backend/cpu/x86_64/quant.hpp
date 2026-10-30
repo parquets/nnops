@@ -1,21 +1,31 @@
 #pragma once
 /// @file quant.hpp
-/// @brief x86_64 int8 / uint8 quantization and dequantization kernels (AVX2 + FMA).
+/// @brief x86_64 AVX2 + FMA int8 / uint8 quantization and dequantization kernels.
 ///
-/// Raw-intrinsic per-token (per-row) quantization for GEMM input preparation.
-/// These kernels operate on raw row-major matrices (unlike the portable SIMD
-/// QuantizeLinear/DequantizeLinear operator in `simd_kernel/simd_quant.hpp`,
-/// which is TensorView-based). Each row carries its own `scale` and optional
-/// `zero_point`; `zero == nullptr` means all-zero.
+/// Per-token (per-row) quantization for GEMM input preparation over raw
+/// row-major matrices (the TensorView SIMD path is `simd_kernel/simd_quant.hpp`).
+/// Each row has its own `scale` and optional `zero_point`; `zero == nullptr`
+/// means all-zero.
 ///
-///   - quantization:   f32 → s8/u8,  `dst = clamp(round(src * (1/scale) + zero), min, max)`
-///   - dequantization: s8/u8 → f32,  `dst = (src - zero) * scale`
+///   - quantization:   f32/f16 → s8/u8, `dst = clamp(round(src * (1/scale) + zero), min, max)`
+///   - dequantization: s8/u8 → f32/f16, `dst = (src - zero) * scale`
 ///
-/// Both functions are templated on the integer type `T` (int8_t for s8, uint8_t
-/// for u8); the clamp range is [-128, 127] for s8 and [0, 255] for u8. The `zero`
-/// parameter makes the kernel asymmetric-capable; symmetric quantization is
-/// simply the `zero == nullptr` (all-zero) case. The register-level block helpers
-/// are templated on `Q_U8` and shared by both paths.
+/// `T` is int8_t (clamp [-128, 127]) or uint8_t ([0, 255]). Loops run a 32-wide
+/// AVX2 path, a 16-wide path, then a scalar tail. Quantization clamps through
+/// the saturating packs (the scalar tail through std::min/max); rounding is
+/// round-to-nearest-even (`_mm_cvtps_epi32` / `std::nearbyintf`).
+///
+/// Lane-ordering quirks: the 16-wide block packs with 128-bit `_mm_packs_epi16`
+/// because `_mm256_packs_epi16` packs per 128-bit lane and would interleave the
+/// four 8-element groups; the 32-wide block packs with 256-bit ops and restores
+/// order with a cross-lane dword permute (0,4,1,5,2,6,3,7). Dequantization folds
+/// `i*scale - zero*scale` into one FMA per lane via a per-row `neg_zero_scale`.
+/// The f16 overloads widen with F16C (`_mm256_cvtph_ps`), reuse the f32
+/// arithmetic, and narrow with `_mm256_cvtps_ph`.
+///
+/// `requantize_8` (broadcast scale/zero) backs `requantize_store` in
+/// simd_quant.hpp; `max_8` backs the MaxPooling fast path when scale and
+/// zero_point match.
 ///
 /// Reference: nn_compute/src/cpu/kernel/quant/x86_64/quant_impl.hpp
 
@@ -34,11 +44,7 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-/// Quantize 16 floats (4×__m128) to 16 int8 (1×__m128i), natural order.
-///
-/// 128-bit packs are used on purpose: the 256-bit `_mm256_packs_epi16` operates
-/// per 128-bit lane and would interleave the four 8-element groups; the 128-bit
-/// `_mm_packs_epi16` concatenates in natural order.
+/// Quantize 16 floats (4×__m128) to 16 int8, natural order.
 template <bool Q_U8>
 inline __m128i quant_block16_f32_i8(__m128 d0, __m128 d1, __m128 d2, __m128 d3,
                                     __m128 inv_scale, __m128 zero) noexcept {
@@ -59,11 +65,7 @@ inline __m128i quant_block16_f32_i8(__m128 d0, __m128 d1, __m128 d2, __m128 d3,
     }
 }
 
-/// Quantize 32 floats (4×__m256) to 32 int8 (1×__m256i), natural order.
-///
-/// The 256-bit packs produce `[d0_0..3, d1_0..3, d2_0..3, d3_0..3, d0_4..7,
-/// d1_4..7, d2_4..7, d3_4..7]` (each 128-bit lane packs independently). A
-/// cross-lane dword permute restores the contiguous order.
+/// Quantize 32 floats (4×__m256) to 32 int8, natural order.
 template <bool Q_U8>
 inline __m256i quant_block32_f32_i8(__m256 d0, __m256 d1, __m256 d2, __m256 d3,
                                     __m256 inv_scale, __m256 zero) noexcept {
@@ -87,11 +89,7 @@ inline __m256i quant_block32_f32_i8(__m256 d0, __m256 d1, __m256 d2, __m256 d3,
     return _mm256_permutevar8x32_epi32(packed, perm);
 }
 
-/// Dequantize 16 int8 (1×__m128i) to 16 floats (2×__m256).
-///
-/// Uses FMA: `i_f32 * scale + neg_zero_scale` where `neg_zero_scale = -zero * scale`
-/// is precomputed once per row. This replaces the two-instruction `sub + mul` with
-/// a single fused multiply-add, saving one arithmetic instruction per 8-wide lane.
+/// Dequantize 16 int8 (1×__m128i) to 16 floats (2×__m256) by FMA.
 template <bool Q_U8>
 inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 neg_zero_scale,
                                    __m256& res0, __m256& res1) noexcept {
@@ -113,13 +111,7 @@ inline void dequant_block16_i8_f32(__m128i v, __m256 scale, __m256 neg_zero_scal
     res1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d1_i32), scale, neg_zero_scale);
 }
 
-/// Quantize an M×N f32 matrix to integer `T`, one (scale, zero_point) per row.
-///
-/// `T` is int8_t (s8, clamp [-128, 127]) or uint8_t (u8, clamp [0, 255]).
-/// `scale` has M entries; `zero` has M entries or is nullptr (all-zero). `dst`
-/// is written with row stride `dr_step` elements, `src` read with `sr_step`
-/// elements. SIMD and scalar tails round to nearest-even (`_mm_cvtps_epi32` /
-/// `std::nearbyintf`) and saturate to the type's range.
+/// Quantize an M×N f32 matrix to `T` with one (scale, zero_point) per row.
 template <typename T>
 inline void quantization(int M, int N,
                          T* NNOPS_RESTRICT dst, int dr_step,
@@ -170,13 +162,7 @@ inline void quantization(int M, int N,
     }
 }
 
-/// Quantize an M×N f16 matrix to integer `T`, one (scale, zero_point) per row.
-///
-/// The half input is widened to f32 with F16C (`_mm256_cvtph_ps` for the
-/// 32-wide path, `_mm_cvtph_ps` for the 16-wide tail) and then run through the
-/// same f32→int8 arithmetic as the f32 `quantization<T>` overload. Rounding and
-/// clamping are identical (round-to-nearest-even, saturating to `T`'s range).
-/// `T` is int8_t (s8) or uint8_t (u8).
+/// Quantize an M×N f16 matrix to `T`; widen with F16C, then the f32 path.
 template <typename T>
 inline void quantization(int M, int N,
                          T* NNOPS_RESTRICT dst, int dr_step,
@@ -233,15 +219,7 @@ inline void quantization(int M, int N,
     }
 }
 
-// 8-wide primitives (8 lanes = 8 bytes = one 64-bit group)
-//
-// These operate on eight adjacent channel lanes — the granularity the
-// channel-lane quantized kernels use.
-
-/// Requantize 8 floats to 8 int8/uint8 with a broadcast (per-tensor) scale and
-/// zero_point: `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
-/// Rounding is round-to-nearest-even (`_mm_cvtps_epi32`), matching the per-token
-/// `quantization<T>` path.
+/// Requantize 8 floats to `T` with a broadcast (per-tensor) scale/zero_point.
 template <typename T>
 inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
                          float inv_scale, float zero) noexcept {
@@ -264,9 +242,7 @@ inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
     _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), i8);
 }
 
-/// Per-lane maximum of two 8-wide int8/uint8 vectors (raw integer max, no
-/// dequantization). Used by the MaxPooling fast path, which is valid when input
-/// and output share the same scale and zero_point.
+/// Per-lane integer max of two 8-wide int8/uint8 vectors — no dequantization.
 template <typename T>
 inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
                   const T* NNOPS_RESTRICT b) noexcept {
@@ -279,15 +255,7 @@ inline void max_8(T* NNOPS_RESTRICT dst, const T* NNOPS_RESTRICT a,
     _mm_storel_epi64(reinterpret_cast<__m128i*>(dst), vmax);
 }
 
-/// Dequantize an M×N integer matrix of type `T` to f32, one (scale, zero_point)
-/// per row.
-///
-/// `T` is int8_t (s8) or uint8_t (u8). `scale` and `zero` each have M entries
-/// (or `zero` is nullptr for all-zero).
-///
-/// The inner loop uses a 32-wide path (two 16-wide blocks) to reduce loop
-/// overhead, and a single FMA per 8-wide lane (`neg_zero_scale + i_f32 * scale`)
-/// instead of the two-instruction `sub + mul` sequence.
+/// Dequantize an M×N integer matrix `T` to f32, one (scale, zero_point) per row.
 template <typename T>
 inline void dequantization(int M, int N,
                            float* NNOPS_RESTRICT dst, int dr_step,
@@ -301,8 +269,6 @@ inline void dequantization(int M, int N,
     for (int m = 0; m < M; ++m) {
         const float scale_val = scale[m];
         const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
-        // Precompute neg_zero_scale = -zero * scale so the inner loop can use a
-        // single FMA: fma(i_f32, scale, neg_zero_scale) = i_f32*scale - zero*scale
         const float neg_zero_scale = -zero_val * scale_val;
 
         const __m256 v_scale = _mm256_set1_ps(scale_val);
@@ -336,14 +302,7 @@ inline void dequantization(int M, int N,
     }
 }
 
-/// Dequantize an M×N integer matrix of type `T` to f16, one (scale, zero_point)
-/// per row.
-///
-/// The integer input is widened and dequantized to f32 with the same arithmetic
-/// as the f32 `dequantization<T>`, then narrowed to f16 with F16C
-/// `_mm256_cvtps_ph` (round-to-nearest-even). `T` is int8_t (s8) or uint8_t (u8).
-///
-/// The inner loop uses a 32-wide path and FMA-based dequantization.
+/// Dequantize an M×N integer matrix `T` to f16; narrow with F16C `_mm256_cvtps_ph`.
 template <typename T>
 inline void dequantization(int M, int N,
                            half* NNOPS_RESTRICT dst, int dr_step,

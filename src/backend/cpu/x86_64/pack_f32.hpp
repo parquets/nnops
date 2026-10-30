@@ -2,15 +2,27 @@
 /// @file pack_f32.hpp
 /// @brief x86_64 SSE/AVX float32 pack kernels for GEMM LHS/RHS.
 ///
-/// The AVX path operates on 8-element __m256 vectors, giving a naturally
-/// unrolled inner loop with K step of 8.
+/// Repacks the source into the k-major panels the MMA micro-kernels read,
+/// scaling by `scale` on the way. Two transforms:
+///   - TRANSPOSE: `mr` rows at stride ir_step with k contiguous inside a row,
+///     permuted an 8-k block at a time by the 4/6/8/16-row transposes in
+///     transpose.hpp. Rows past `mr` alias the last live row — the MMA
+///     kernels' convention — so a partial-M panel needs no padding.
+///   - COPY: k rows at stride ir_step, each row's lanes contiguous. A full
+///     width takes the plain loads; a narrow one reads through a lane mask,
+///     which touches only the live columns and zero-fills the rest. That
+///     zero-fill is what lets a runtime-width MMA kernel read all 16 lanes of
+///     every k, and an all-masked lane group never reaches memory, so a short
+///     panel cannot overrun its row.
 ///
-/// Every kernel takes the live source width, defaulting to its own panel
-/// width N: `mr` for the transposing (LHS) kernels, `nr` for the row-major
-/// (RHS) copies. A partial panel needs no separate tail kernel — rows past
-/// `mr` alias the last live row, the same broadcast the MMA kernels apply to
-/// a short A panel, and columns past `nr` are zero-filled so a short B panel
-/// costs the runtime-width MMA kernel nothing.
+/// Every kernel takes the live source width, defaulting to its own panel width
+/// (`mr` for the transposing kernels, `nr` for the copies), so one loop serves
+/// both a full panel and a tail.
+///
+/// mr_f32 = {6, 4, 1} is the A-panel ladder both the pack and the direct route
+/// use, matching the MMA kernels (mma_f32.hpp's mr6/mr4/mr1): at nr 16 the
+/// 6-row tile already holds twelve accumulators plus the two B and two A
+/// vectors — all 16 ymm — so a taller level would spill.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/x86_64/pack_f32.hpp
 
@@ -19,6 +31,10 @@
 #include "transpose.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
+
+// =========================================================================
+//  Transpose pack (f32)  —  source rows at ir_step, k contiguous
+// =========================================================================
 
 inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
@@ -32,8 +48,6 @@ inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 4) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -64,7 +78,6 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
 
         output += 4 * 8;
     }
-    // scalar tail
     for (; k < K; ++k) {
         *output++ = *(p0++) * scale;
         *output++ = *(p1++) * scale;
@@ -76,8 +89,6 @@ inline void pack_trans_n4_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 6) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -131,8 +142,6 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
 inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 8) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -195,14 +204,9 @@ inline void pack_trans_n8_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 16-wide transposing panel. Rows past `mr` alias the last live row,
-/// so a partial-M panel needs no padding and the kernel never reads past the
-/// tile — only the aliased pointer list differs from the full-panel case.
 inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
                                const float* NNOPS_RESTRICT input,
                                int ir_step, int K, float scale, int mr = 16) noexcept {
-    // Rows past `mr` alias the last live row — the same convention the
-    // MMA kernels use — so a partial-M panel needs no padding.
     const int last = (mr > 1) ? mr - 1 : 0;
     const float* NNOPS_RESTRICT p[16];
     for (int i = 0; i < 16; ++i) {
@@ -235,6 +239,10 @@ inline void pack_trans_n16_f32(float* NNOPS_RESTRICT output,
     }
 }
 
+// =========================================================================
+//  Copy pack (f32)  —  source k rows at ir_step, lanes contiguous
+// =========================================================================
+
 inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 1) noexcept {
@@ -244,9 +252,6 @@ inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 4-wide row-major panel. One k loop serves every width: a full panel
-/// takes the plain load, a short one a lane-masked load, which reads only the
-/// live columns and zero-fills the rest on the way in.
 inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 4) noexcept {
@@ -271,8 +276,6 @@ inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 6-wide row-major panel. Lanes 4 and 5 travel as a second, 2-wide
-/// masked load, so the same body covers every width down to zero.
 inline void pack_copy_n6_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 6) noexcept {
@@ -368,10 +371,6 @@ inline void pack_copy_n12_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief 16-wide row-major panel. Columns past `nr` are zero-filled so the
-/// runtime-width MMA kernels can load all 16 lanes of every k; a short panel
-/// reads through a lane mask, which touches only the live columns — the upper
-/// half of a panel narrower than nine is all-masked and never reaches memory.
 inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
                               const float* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int nr = 16) noexcept {
@@ -395,12 +394,11 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
     }
 }
 
-/// @brief f32 LHS micro-panel heights, shared by both routes.
-/// The 6-row direct kernels already match the pack side, and AVX2's 16 ymm
-/// registers leave no room for a taller tile anyway.
-inline constexpr int mr_f32[3] = {6, 4, 1};
+// =========================================================================
+//  Micro-panel size menu (f32)  —  mr = M-panel heights, nr = N-panel widths
+// =========================================================================
 
-/// @brief f32 RHS micro-panel widths.
+inline constexpr int mr_f32[3] = {6, 4, 1};
 inline constexpr int nr_f32[3] = {16, 8, 1};
 
 }  // namespace nnops::backend::cpu::x86_64

@@ -1,11 +1,12 @@
 /// @file pooling_ref.cpp
-/// @brief Naive CPU reference implementation of 2D/3D spatial pooling (NCHW/NCDHW layout).
+/// @brief Naive CPU reference for 2D/3D spatial pooling, planar NCHW/NCDHW.
 ///
-/// Supports both f32 and f16 data types. Computation always done in fp32;
-/// dtype-specific load/store handled via overloaded helpers.
+/// f32 and f16 pool in fp32, loading and storing through the dtype-overloaded
+/// s_load/s_store. s8/u8 dequantize on load, pool in float and requantize on
+/// store, both with the scalar (PerTensor) params only.
 ///
-/// Parallelism is over N*C tasks (sample x channel), allowing better thread utilization
-/// especially for small-batch inference (N=1).
+/// Parallelism is over N*C tasks (sample x channel) rather than over samples,
+/// so small-batch inference (N=1) still fills the thread pool.
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -25,8 +26,7 @@ using nnops::simd::s_store;
 
 namespace {
 
-/// Compute the NCHW offset for a 4D or 5D tensor using pitch.
-/// row_stride is the element stride between rows (>= W for padded data).
+/// Planar (n, c, d, h, w) -> flat offset; row_stride is the padded row pitch.
 inline int64_t nchw_offset(int64_t n, int64_t c,
                            int64_t d, int64_t h, int64_t w,
                            int64_t C, int64_t D, int64_t H,
@@ -34,8 +34,7 @@ inline int64_t nchw_offset(int64_t n, int64_t c,
     return (((n * C + c) * D + d) * H + h) * row_stride + w;
 }
 
-/// Quantize a float value to int8/uint8 with round-to-nearest-even and
-/// saturation, matching the arch `requantize_8` semantics.
+/// Round-to-nearest-even and saturate, matching the arch `requantize_8`.
 template <typename OutT>
 inline OutT quantize_float(float val, float out_scale, float out_zero) {
     constexpr bool Q_U8 = std::is_same_v<OutT, uint8_t>;
@@ -70,9 +69,8 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    // A global window is the full extent, unpadded and undilated: the same
-    // window walk, which keeps this reference independent of the backend's
-    // whole-plane shortcut.
+    // A global window is the full extent, unpadded and undilated, so the same
+    // walk covers it; the backend's whole-plane path is not mirrored here.
     const bool glb = attrs.global;
     const int64_t KD = glb ? ID : ((srank == 3) ? attrs.kernel_shape[0] : 1);
     const int64_t KH = glb ? IH : attrs.kernel_shape[1];
@@ -171,9 +169,6 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
 // ============================================================
 // Quantized reference (s8/u8 input/output)
 // ============================================================
-//
-// Dequantize-on-load (activation PerTensor), pool in float, requantize-on-store
-// with round-to-nearest-even. Mirrors the SIMD backend's float path.
 
 template <typename InT, typename OutT>
 void pooling_impl_ref_quant(const PoolingAttributes& attrs,
@@ -196,7 +191,6 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    // A global window is the full extent (see the fp reference above).
     const bool glb = attrs.global;
     const int64_t KD = glb ? ID : ((srank == 3) ? attrs.kernel_shape[0] : 1);
     const int64_t KH = glb ? IH : attrs.kernel_shape[1];

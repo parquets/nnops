@@ -1,10 +1,24 @@
-/// Unit tests for the offline-quantized-activation GEMM:
-/// fp16/fp32 A (per-tensor or per-token offline params) × s8 B, quantized to
-/// u8/s8 inside the kernel, int8 GEMM, dequantized back to A's dtype.
+/// @file test_matmul_dq.cpp
+/// @brief The fp-activation × s8 MatMul route (offline-quantized activations).
 ///
-/// Every case is compared bit for bit against `matmul_dq_ref`: the GEMM is
-/// integer, and both sides share the dequant expression, so agreement is exact
-/// (f16 outputs are compared by their bit patterns).
+/// A is f32/f16 with per-tensor or per-token offline parameters, quantized into
+/// attrs.act_quant_dtype (s8 or u8) inside the kernel and dequantized back to
+/// A's dtype, which is the output's. The oracle is matmul_dq_ref (declared here,
+/// defined in tests/reference/matmul_dq_ref.cpp): it mirrors the kernel's
+/// arithmetic expression for expression, so the reference comparisons are on
+/// bit patterns, never tolerances.
+///
+/// The cases follow the dispatch. The compensation has two halves — the column
+/// term sweeps B, the row half sweeps A — and a per-tensor zp_b folds the row
+/// half into one int32 per row (r_fold) instead of a per-element pass. With no
+/// zero point on either side both sweeps are skipped and, on an M-split, A_q is
+/// never materialized: the A pack quantizes the fp values itself ("fused A").
+/// An N-split re-packs A per n-block, so it cannot fuse.
+///
+/// Traps: matmul_cpu folds Relu/Relu6 into min_clip/max_clip unconditionally,
+/// overwriting a caller's bound (the reference does not fold) — a Relu case
+/// takes no custom bounds; and the epilogue order is compensate, dequantize,
+/// clip, activate.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/half.hpp"
@@ -37,7 +51,6 @@ void matmul_dq_ref(const MatMulAttributes& attrs,
 
 namespace {
 
-// ---- quant-param builders ----
 QuantParams per_tensor(float scale, int32_t zp) {
     QuantParams qp;
     qp.granularity = QuantGranularity::PerTensor;
@@ -77,11 +90,9 @@ std::span<const int64_t> desc_shape(const TensorDesc& d) {
     return std::span<const int64_t>(d.dims.data(), static_cast<size_t>(d.rank));
 }
 
-// ---- random operands ----
-
 /// fp A (f32 and the f16 view of the same values), s8 B, and the per-row /
-/// per-column parameters both use. Build TensorViews *after* this returns — the
-/// vectors own the storage the views point at.
+/// per-column parameters both use. The vectors own the storage, so build the
+/// TensorViews only after this returns.
 struct Quad {
     std::vector<float>   a;     // M×K
     std::vector<half>    ah;    // M×K
@@ -120,8 +131,6 @@ Quad make_quad(int64_t M, int64_t K, int64_t N, uint64_t seed) {
     return q;
 }
 
-// ---- exact comparison ----
-
 template <class T>
 uint32_t bits_of(T v) {
     if constexpr (std::is_same_v<T, half>) {
@@ -134,7 +143,7 @@ uint32_t bits_of(T v) {
 }
 
 /// Run the op and matmul_dq_ref on the same inputs; the outputs must agree bit
-/// for bit. `odesc` is the descriptor the op itself resolved.
+/// for bit. `odesc` is the descriptor the op resolved.
 template <class T>
 void expect_dq_matches_ref(const MatMulAttributes& attrs, const TensorDesc& odesc,
                            std::span<const TensorView> ins,
@@ -155,7 +164,8 @@ void expect_dq_matches_ref(const MatMulAttributes& attrs, const TensorDesc& odes
     }
 }
 
-/// The quantization the kernel performs, one element at a time.
+/// One element of the kernel's quantize pass; the prequantized cases below need
+/// it to match the kernel exactly.
 template <class QInt>
 QInt quant_one(float x, float scale, int32_t zp) {
     constexpr int32_t qmin = std::is_same_v<QInt, uint8_t> ? 0 : -128;
@@ -202,8 +212,8 @@ NNOPS_TEST(matmul_dq_exact_f32) {
 }
 
 NNOPS_TEST(matmul_dq_per_token_scale) {
-    // s_a = {0.5, 0.25}, zp_a = {2, -1}: the A_q values differ from the
-    // symmetric case but the dezero-pointed values (and thus C) do not.
+    // s_a = {0.5, 0.25}, zp_a = {2, -1}: A_q differs from what a symmetric
+    // scale gives, but dezeroing recovers A exactly, so C = A·B either way.
     const int64_t ashape[] = {2, 3};
     const int64_t bshape[] = {3, 2};
     float   a_data[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
@@ -225,7 +235,7 @@ NNOPS_TEST(matmul_dq_per_token_scale) {
     op->compute(output, ins, {}, nullptr);
 
     // row 0: A_q = [4,6,8] → dezeroed [2,4,6]; row 1: A_q = [15,19,23] →
-    // dezeroed [16,20,24]. Same C as the symmetric case: 22,28 / 49,64.
+    // dezeroed [16,20,24]. C is A·B: 22,28 / 49,64, whatever the parameters.
     NNOPS_EXPECT_TRUE(out_buf[0] == 22.0f);
     NNOPS_EXPECT_TRUE(out_buf[1] == 28.0f);
     NNOPS_EXPECT_TRUE(out_buf[2] == 49.0f);
@@ -251,11 +261,8 @@ NNOPS_TEST(matmul_dq_per_tensor_matches_ref) {
 }
 
 NNOPS_TEST(matmul_dq_symmetric_matches_ref) {
-    // Both subtractions in compensate() vanish — A has no zero points and every
-    // zp_b is zero — so the dispatch skips the reduction sweep and the row pass
-    // takes its no-compensation path. B keeps an all-zero zp *array* so the
-    // "is any zero point non-zero" scan runs over a buffer, not a scalar, and A
-    // keeps its per-token scale array so only the zero side is the identity.
+    // Both compensation halves vanish, so both sweeps are skipped; A keeps its
+    // per-token scale array, so only the zero side is the identity.
     constexpr int64_t M = 21, K = 33, N = 19;
     Quad q = make_quad(M, K, N, 105);
     std::fill(q.b_zp.begin(), q.b_zp.end(), 0);
@@ -271,17 +278,14 @@ NNOPS_TEST(matmul_dq_symmetric_matches_ref) {
     const TensorView ins[] = {a, b};
     expect_dq_matches_ref<float>(attrs, descs[0], ins);
 
-    // With an activation the flag must skip only the two subtractions — the
-    // activation still runs. (No custom clip bounds here: matmul_cpu folds
-    // Relu/Relu6 into min_clip/max_clip and a caller-supplied bound is
-    // overwritten, which the reference does not do.)
+    // An activation does not revive the compensation: the output pass runs for
+    // it, the sweeps stay skipped. (No custom clip bounds; see the header.)
     MatMulAttributes attrs_act{};
     attrs_act.epilogue.type = EpilogueActivateType::Relu;
     expect_dq_matches_ref<float>(attrs_act, descs[0], ins);
 }
 
 NNOPS_TEST(matmul_dq_symmetric_f16_matches_ref) {
-    // The same identity compensation through the f16 output pass.
     constexpr int64_t M = 17, K = 29, N = 15;
     Quad q = make_quad(M, K, N, 116);
     std::fill(q.b_zp.begin(), q.b_zp.end(), 0);
@@ -318,7 +322,7 @@ NNOPS_TEST(matmul_dq_per_token_transpose_b_matches_ref) {
     // [N,K] weights: the per-channel arrays index the output column n.
     constexpr int64_t M = 9, K = 13, N = 11;
     Quad q = make_quad(M, K, N, 103);
-    // Re-lay B as N×K with the same column-major values.
+    // Re-lay B as N×K with the same values.
     std::vector<int8_t> bt(static_cast<size_t>(N * K));
     for (int64_t k = 0; k < K; ++k) {
         for (int64_t n = 0; n < N; ++n) {
@@ -338,9 +342,9 @@ NNOPS_TEST(matmul_dq_per_token_transpose_b_matches_ref) {
 }
 
 NNOPS_TEST(matmul_dq_per_tensor_b_zp_symmetric_a_matches_ref) {
-    // Symmetric A and a per-tensor (not per-channel) non-zero zp_b: the whole
-    // compensation is a row constant, so the dispatch folds it into a per-row
-    // offset and sweeps neither A nor B.
+    // Symmetric A with a per-tensor (not per-channel) non-zero zp_b: everything
+    // folds into one int32 per row, so only the A sweep still runs (to feed the
+    // fold); B is never swept, the column term being zero.
     constexpr int64_t M = 12, K = 20, N = 16;
     Quad q = make_quad(M, K, N, 105);
     TensorView a = make_q(M, K, DataType::f32, q.a.data(), per_tensor(0.03f, 0));
@@ -371,9 +375,8 @@ NNOPS_TEST(matmul_dq_per_tensor_b_zp_asymmetric_a_matches_ref) {
 }
 
 NNOPS_TEST(matmul_dq_symmetric_a_per_channel_b_matches_ref) {
-    // A symmetric, so the column term is identically zero and the B sweep is
-    // skipped; the per-element half has no row fold (zp_b varies per channel)
-    // and is still applied element by element.
+    // Symmetric A: the column term is zero, so B is not swept. zp_b varies per
+    // channel, so the row half cannot fold and stays element by element.
     constexpr int64_t M = 13, K = 21, N = 17;
     Quad q = make_quad(M, K, N, 107);
     TensorView a = make_q(M, K, DataType::f32, q.a.data(), per_tensor(0.03f, 0));
@@ -388,8 +391,7 @@ NNOPS_TEST(matmul_dq_symmetric_a_per_channel_b_matches_ref) {
 }
 
 NNOPS_TEST(matmul_dq_u8_target_matches_ref) {
-    // act_quant_dtype = u8: the pack shifts A into signed range for the
-    // signed-dot kernels, and the shift comes back out of the accumulator.
+    // act_quant_dtype = u8: the 0..255 clamp and the arch's u8 sign handling.
     constexpr int64_t M = 15, K = 19, N = 17;
     Quad q = make_quad(M, K, N, 104);
     TensorView a = make_q(M, K, DataType::f32, q.a.data(), per_token(q.a_s.data(), q.a_zp.data(), M));
@@ -478,16 +480,12 @@ namespace {
 struct DqShape { int64_t M, K, N; };
 
 /// The boundaries the tiling actually has, as (M, K, N):
-///   - M = 1, 2 and 5: the int8 route has no GEMV kernel, so these are the
-///     m-tail micro-kernels running one to five rows;
-///   - M = 6, 7: MR_MAX_I8 and the first row past it;
-///   - N = 15, 16, 17: the padded 16-wide B panel — untouched, exact, and one
-///     past it (copy packer with a masked-load tail);
-///   - N = 240, 241: nc on this class of host, and one past it;
-///   - K = 511, 512, 513: either side of KC_CAP_I8, i.e. the k-block boundary
-///     and the multi-k-block epilogue;
-///   - the rest: mixed primes, powers of two, and the two rectangular corners
-///     (large-M/small-N, small-M/large-N).
+///   - M = 1, 2, 5: no int8 GEMV route, so the m-tail kernels, one to five rows;
+///   - M = 6, 7: MR_MAX_I8 (6 on x86) and the first row past it;
+///   - N = 15, 16, 17: the int8 B panel width (16 on x86) — short, exact, past;
+///   - N = 240, 241: whole NC_ALIGN (48) panels, and one past;
+///   - K = 511, 512, 513: either side of KC_CAP_I8, i.e. the multi-k-block tail;
+///   - the rest: mixed primes, powers of two, and the rectangular corners.
 const DqShape kDqShapes[] = {
     {1, 1, 1},        {1, 16, 16},     {1, 512, 1024},  {2, 3, 2},
     {3, 7, 5},        {5, 16, 15},     {6, 16, 16},     {7, 17, 17},
@@ -498,11 +496,10 @@ const DqShape kDqShapes[] = {
     {64, 1024, 64},   {16, 1200, 17},  {1024, 256, 64},
 };
 
-/// One shape through the same bit-exact comparison. @p act_dt selects the
-/// integer storage; @p scalar_params swaps the per-token / per-channel arrays
-/// for one (scale, zp) per tensor; @p symmetric zeroes every zero point, which
-/// makes the compensation the identity (and, on an M-split, lets the pack
-/// quantize A directly).
+/// One shape through the bit-exact comparison. @p act_dt is the integer
+/// storage; @p scalar_params swaps the per-token / per-channel arrays for one
+/// (scale, zp) per tensor; @p symmetric zeroes every zero point (the identity
+/// compensation, which on an M-split lets the pack quantize A directly).
 template <class T>
 void expect_dq_shape(int64_t M, int64_t K, int64_t N, uint64_t seed,
                      DataType act_dt, bool scalar_params, bool symmetric = false) {
@@ -513,8 +510,8 @@ void expect_dq_shape(int64_t M, int64_t K, int64_t N, uint64_t seed,
     const QuantParams qa = scalar_params
         ? per_tensor(u8 ? 0.008f : 0.02f, symmetric ? 0 : (u8 ? 12 : 3))
         : per_token(q.a_s.data(), symmetric ? nullptr : q.a_zp.data(), M);
-    // B keeps its (all-zero, when symmetric) zp array so the "is any zero point
-    // non-zero" scan still runs over a buffer rather than a scalar.
+    // The per-channel branch keeps B's zp array (all-zero when symmetric), so
+    // any_zp_nonzero scans a buffer, not a scalar.
     const QuantParams qb = scalar_params
         ? per_tensor(0.006f, symmetric ? 0 : -2)
         : per_channel(q.b_s.data(), q.b_zp.data(), N);
@@ -537,7 +534,6 @@ void expect_dq_shape(int64_t M, int64_t K, int64_t N, uint64_t seed,
     expect_dq_matches_ref<T>(attrs, descs[0], ins);
 }
 
-/// Run the whole table, tagging a failure with the shape that produced it.
 template <class T>
 void run_dq_shape_sweep(const char* tag, DataType act_dt, bool scalar_params,
                         bool symmetric = false) {
@@ -557,30 +553,27 @@ void run_dq_shape_sweep(const char* tag, DataType act_dt, bool scalar_params,
 }  // anonymous namespace
 
 NNOPS_TEST(matmul_dq_shape_sweep) {
-    // The shipped configuration — f32 activations, s8 target, per-token A ×
-    // per-channel B — over every tiling boundary.
+    // The default configuration (f32 in, s8 out) over every tiling boundary.
     run_dq_shape_sweep<float>("f32/s8/token", DataType::s8, /*scalar_params=*/false);
 }
 
 NNOPS_TEST(matmul_dq_shape_sweep_u8) {
-    // u8 storage with per-token parameters: the sign handling in the pack and
-    // the epilogue's row vectors are both live.
+    // u8 storage with per-token parameters: the 0..255 clamp and the arch's u8
+    // sign handling are both exercised.
     run_dq_shape_sweep<float>("f32/u8/token", DataType::u8, /*scalar_params=*/false);
 }
 
 NNOPS_TEST(matmul_dq_shape_sweep_f16_u8) {
-    // f16 activations into u8 storage with per-tensor parameters: the quantize
-    // pass widens f16, the arch shifts u8 into signed range, and the dequant
-    // multiply runs in f32 before the f16 narrowing.
+    // f16 in, u8 out: the quantize pass widens f16, the arch's u8 sign handling
+    // applies, and the dequant multiply runs in f32 before the narrowing.
     run_dq_shape_sweep<half>("f16/u8/tensor", DataType::u8, /*scalar_params=*/true);
 }
 
 NNOPS_TEST(matmul_dq_shape_sweep_symmetric) {
-    // No zero point on either side: compensate() is the identity, so the
-    // reduction sweep is skipped — and, on an M-split, nothing ever reads a
-    // materialised A_q, so the A pack quantizes the fp activations itself
-    // (the fused route). The table still covers every tiling boundary, the
-    // multi-k-block epilogue, and the N-split shapes that fall back.
+    // No zero point on either side: the compensation is the identity, so both
+    // sweeps are skipped and, on an M-split, nothing reads a materialized A_q —
+    // the A pack quantizes the fp values itself (fused A). N-split shapes fall
+    // back to A_q, so the table exercises both.
     run_dq_shape_sweep<float>("f32/s8/symmetric", DataType::s8, /*scalar_params=*/false, true);
     run_dq_shape_sweep<float>("f32/s8/tensor/symmetric", DataType::s8, /*scalar_params=*/true, true);
     run_dq_shape_sweep<half>("f16/s8/symmetric", DataType::s8, /*scalar_params=*/true, true);
@@ -589,9 +582,8 @@ NNOPS_TEST(matmul_dq_shape_sweep_symmetric) {
 }
 
 NNOPS_TEST(matmul_dq_saturated_rows) {
-    // Rows whose magnitudes dwarf scale·127 clamp to the storage range; an
-    // all-zero row quantizes to zp_a everywhere (and must still dequantize to
-    // A ≈ 0's contribution, i.e. the compensated dot is exact).
+    // Rows whose magnitudes dwarf scale·127 clamp to the storage range; the
+    // all-zero row quantizes to zp_a everywhere and must still dequantize to 0.
     constexpr int64_t M = 5, K = 33, N = 7;
     Quad q = make_quad(M, K, N, 109);
     for (int64_t k = 0; k < K; ++k) {
@@ -607,7 +599,6 @@ NNOPS_TEST(matmul_dq_saturated_rows) {
     const TensorDesc arr[] = {a.desc(), b.desc()};
     auto descs = op->getOutputTensorDesc(arr);
 
-    // The saturated rows clamp identically in both implementations.
     const TensorView ins[] = {a, b};
     expect_dq_matches_ref<float>(attrs, descs[0], ins);
 }
@@ -694,9 +685,9 @@ NNOPS_TEST(matmul_dq_batched) {
 }
 
 NNOPS_TEST(matmul_dq_batched_symmetric) {
-    // The fused pack path with a batch: every batch indexes the per-token scale
-    // array from its own first row (`row_base = a_offset / lda`), which the
-    // pack reads through the same pointer the epilogue does.
+    // Fused A with a batch: each batch indexes the per-token scale array from
+    // its own first row (`row_base = a_offset / lda`), read by the pack through
+    // the same pointer the epilogue uses.
     constexpr int64_t B = 3, M = 9, K = 550, N = 7;   // K crosses KC_CAP_I8 too
     Quad q = make_quad(B * M, K, N, 118);
     std::fill(q.b_zp.begin(), q.b_zp.end(), 0);   // symmetric: identity compensation
@@ -750,8 +741,8 @@ NNOPS_TEST(matmul_dq_batched_broadcast_a) {
 // ============================================================
 
 NNOPS_TEST(matmul_dq_matches_prequantized_int8) {
-    // The reason the route exists: quantizing A outside and running the int8
-    // route must produce the same numbers as the fused fp-activation route.
+    // The reason the route exists: quantizing A outside must give the same
+    // numbers as the fused fp-activation route.
     constexpr int64_t M = 15, K = 77, N = 13;
     Quad q = make_quad(M, K, N, 114);
 
@@ -804,8 +795,8 @@ NNOPS_TEST(matmul_dq_matches_prequantized_int8) {
 }
 
 NNOPS_TEST(matmul_dq_prequantized_fp_output) {
-    // v1.1: A is already quantized (s8 + params) and the caller asks for an
-    // f32 output. The same dequant epilogue serves both entry points.
+    // A is already quantized (s8 + params) and the caller asks for an f32
+    // output: the same dequant epilogue serves both entry points.
     constexpr int64_t M = 11, K = 19, N = 8;
     Quad q = make_quad(M, K, N, 115);
     std::vector<int8_t> aq(static_cast<size_t>(M * K));
@@ -851,19 +842,16 @@ NNOPS_TEST(matmul_dq_prequantized_fp_output) {
     }
 }
 
-// transpose_a is outside the fast path; it must still be correct via the
-// reference.
 // ============================================================
 // Threaded correctness
 // ============================================================
 
 namespace {
 
-// Minimal fixed-size thread pool exposing a CpuBackend (as in test_matmul.cpp).
+// A fixed-size claim-per-item pool exposing a CpuBackend (as in test_matmul.cpp).
 struct SimplePool {
     explicit SimplePool(int nthreads) : nthreads_(nthreads) {
-        // OpenMP when the build has it (common/cpu_pool.hpp): the adapter then
-        // runs under the same bit-exact comparisons as the kernels.
+        // OpenMP when the build has it (common/cpu_pool.hpp).
         if (nnops::test::bench_use_openmp()) {
             cpu = nnops::openmp_backend(nthreads);
             return;
@@ -920,13 +908,13 @@ void expect_dq_threaded_matches_ref(int64_t M, int64_t K, int64_t N, int nt, uin
 }  // anonymous namespace
 
 NNOPS_TEST(matmul_dq_threaded) {
-    // With a pool the plan shrinks mc (M-split) and nc (N-split); the quantize
-    // pass and the per-token arrays are shared read-only state, so every
-    // decomposition must still match the serial reference exactly.
+    // With a pool the plan shrinks mc (M-split) and nc (N-split); A_q and the
+    // per-token arrays are shared read-only state, so every decomposition must
+    // still match the serial reference exactly.
     for (int nt : {2, 4, 8}) {
         expect_dq_threaded_matches_ref(512, 512, 128, nt, 201);   // M-split
         expect_dq_threaded_matches_ref(128, 512, 512, nt, 202);   // N-split
         expect_dq_threaded_matches_ref(256, 256, 256, nt, 203);   // mc < MC_MAX
-        expect_dq_threaded_matches_ref(1024, 512, 1024, nt, 204); // the measured shape
+        expect_dq_threaded_matches_ref(1024, 512, 1024, nt, 204); // large on both axes
     }
 }

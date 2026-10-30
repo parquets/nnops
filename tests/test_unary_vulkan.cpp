@@ -1,10 +1,20 @@
 /// @file test_unary_vulkan.cpp
-/// @brief Unit tests for Unary operator (Vulkan GPU backend).
+/// @brief Unary operator unit tests, Vulkan backend.
 ///
-/// Each test:
-///   1. Computes the expected result on CPU (reference)
-///   2. Runs the same computation via the Vulkan backend
-///   3. Reads back GPU results and compares against CPU reference
+/// Each case runs the op through run_unary_vulkan (f32) or run_unary_vulkan_f16
+/// and compares against a host reference. For f32 that reference is std:: on the
+/// same values: 1e-5 on Abs/Neg, 1e-3 on Tan, 1e-4 on the others, except the
+/// plain Exp case, which widens to 1e-5 + 2e-4·|expected| because the GPU's
+/// exp() differs in precision from std::exp(). For f16 the reference is
+/// compute_unary_f16_ref, which rounds the input to fp16, evaluates in float
+/// and rounds the result back — so it checks the backend's rounding as well as
+/// the arithmetic — and the tolerance is 1e-3 (1e-5 on Abs/Neg), widening to
+/// 1e-3 + 5e-3·|expected| on Exp, Log and add_to.
+///
+/// The backend reads the VkBuffers set on the ComputeContext and never the
+/// TensorView data pointer, so the views handed to compute() exist only to carry
+/// shape and dtype. The 10000- and 9876-element cases push past the shaders'
+/// 256-wide workgroup, so the dispatch must cover several workgroups.
 
 #ifdef NNOPS_HAS_VULKAN
 
@@ -22,10 +32,6 @@
 
 using namespace nnops;
 
-// ============================================================
-// Helper: run unary on Vulkan backend
-// ============================================================
-
 static std::vector<float> run_unary_vulkan(
     const float* in_data, int64_t numel, UnaryType op_type, bool add_to = false,
     const float* init_out = nullptr)
@@ -34,11 +40,9 @@ static std::vector<float> run_unary_vulkan(
 
     size_t buf_size = numel * sizeof(float);
 
-    // Create device buffers
     auto buf_in = env.create_buffer(buf_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto buf_out = env.create_buffer(buf_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    // Copy input data
     env.copy_to_device(buf_in, in_data, buf_size);
     if (init_out) {
         env.copy_to_device(buf_out, init_out, buf_size);
@@ -47,7 +51,6 @@ static std::vector<float> run_unary_vulkan(
         env.copy_to_device(buf_out, zeros.data(), buf_size);
     }
 
-    // Build Vulkan ComputeContext
     ComputeContext ctx;
     ctx.expected_backend = Backend::Vulkan;
     ctx.vulkan_device = env.device();
@@ -58,17 +61,17 @@ static std::vector<float> run_unary_vulkan(
     ctx.vulkan_buffers = bufs;
     ctx.vulkan_buffers_count = 2;
 
-    // Create operator
     UnaryAttributes attrs;
     attrs.type = op_type;
     attrs.add_to = add_to;
     auto op = Unary::create(attrs, Backend::Vulkan);
 
-    // Record and submit
     VkCommandBuffer cmd = env.begin_cmd();
     ctx.vulkan_cmd_buffer = cmd;
 
     const int64_t shape[] = {numel};
+    // The operator API wants TensorViews; only their shape and dtype are read,
+    // so the data pointers below are dummies.
     TensorView in_view(shape, DataType::f32, const_cast<float*>(in_data));
     TensorView out_view(shape, DataType::f32, nullptr);  // data ptr unused
 
@@ -77,20 +80,14 @@ static std::vector<float> run_unary_vulkan(
 
     env.submit_and_wait();
 
-    // Read back result
     std::vector<float> result(numel);
     env.copy_from_device(buf_out, result.data(), buf_size);
 
-    // Cleanup
     env.destroy_buffer(buf_in);
     env.destroy_buffer(buf_out);
 
     return result;
 }
-
-// ============================================================
-// Tests: Each unary op type
-// ============================================================
 
 NNOPS_TEST(unary_vulkan_exp) {
     const int N = 256;
@@ -102,8 +99,6 @@ NNOPS_TEST(unary_vulkan_exp) {
     auto result = run_unary_vulkan(in, N, UnaryType::Exp);
 
     for (int i = 0; i < N; ++i) {
-        // GPU exp() has slightly different precision than std::exp();
-        // 2e-4 relative tolerance accounts for this.
         float expected = std::exp(in[i]);
         float tol = 1e-5f + 2e-4f * std::abs(expected);
         NNOPS_EXPECT_NEAR(result[i], expected, tol);
@@ -246,7 +241,6 @@ NNOPS_TEST(unary_vulkan_large) {
 }
 
 NNOPS_TEST(unary_vulkan_many_elements) {
-    // Test with >256 elements to verify multi-workgroup dispatch
     const int N = 9876;
     auto [in_vec, in_view] = test::make_random_tensor({N}, -1.0f, 1.0f, 555);
 
@@ -257,15 +251,10 @@ NNOPS_TEST(unary_vulkan_many_elements) {
     }
 }
 
-// ============================================================
-// fp16 (half-precision) tests
-// ============================================================
-
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-/// Helper: convert float array to fp16 uint16_t array
 static std::vector<uint16_t> floats_to_f16(const float* src, int64_t n) {
     std::vector<uint16_t> result(n);
     for (int64_t i = 0; i < n; ++i) {
@@ -274,7 +263,6 @@ static std::vector<uint16_t> floats_to_f16(const float* src, int64_t n) {
     return result;
 }
 
-/// Helper: convert fp16 uint16_t array to float array
 static std::vector<float> f16_to_floats(const uint16_t* src, int64_t n) {
     std::vector<float> result(n);
     for (int64_t i = 0; i < n; ++i) {
@@ -283,7 +271,7 @@ static std::vector<float> f16_to_floats(const uint16_t* src, int64_t n) {
     return result;
 }
 
-/// Helper: run unary on Vulkan backend with f16 data
+/// Buffers and the read-back are fp16; the result comes back as f32.
 static std::vector<float> run_unary_vulkan_f16(
     const float* in_data, int64_t numel, UnaryType op_type, bool add_to = false,
     const float* init_out = nullptr)
@@ -323,7 +311,7 @@ static std::vector<float> run_unary_vulkan_f16(
     ctx.vulkan_cmd_buffer = cmd;
 
     const int64_t shape[] = {numel};
-    uint16_t dummy = 0;
+    uint16_t dummy = 0;   // as in the f32 helper: only shape and dtype are read
     TensorView in_view(shape, DataType::f16, &dummy);
     TensorView out_view(shape, DataType::f16, nullptr);
 
@@ -341,7 +329,8 @@ static std::vector<float> run_unary_vulkan_f16(
     return f16_to_floats(result_f16.data(), numel);
 }
 
-/// Helper: compute fp16 unary reference (round-trip through fp16)
+/// Rounds the input to fp16 and the result back, modelling the backend's
+/// precision loss rather than just the arithmetic.
 static std::vector<float> compute_unary_f16_ref(
     const float* in, int64_t n, UnaryType op_type, bool add_to = false,
     const float* init = nullptr)

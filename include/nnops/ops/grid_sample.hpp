@@ -1,11 +1,10 @@
 #pragma once
 /// @file grid_sample.hpp
-/// @brief GridSample operator — 2D/3D grid-based spatial sampling, packed NCHWC8/NCDHWC8 layout.
+/// @brief GridSample operator — 2D/3D sampling at grid points, packed
+///        NCHWC8/NCDHWC8 layout only.
 ///
-/// Given an input tensor and a flow-field grid, GridSample computes the output by
-/// sampling the input at locations defined by the grid. The grid contains normalized
-/// coordinates in [-1, 1], where -1 maps to the left/top/front border and 1 maps to
-/// the right/bottom/back border.
+/// The grid holds normalized coordinates in [-1, 1]: -1 is the outer
+/// left/top/front border and 1 the right/bottom/back one. f32/f16 only.
 ///
 /// 2D: Input [N, C, IH, IW], Grid [N, OH, OW, 2] → Output [N, C, OH, OW]
 /// 3D: Input [N, C, ID, IH, IW], Grid [N, OD, OH, OW, 3] → Output [N, C, OD, OH, OW]
@@ -22,44 +21,33 @@
 
 namespace nnops {
 
-/// Interpolation mode for grid sampling.
 enum class GridSampleMode : uint8_t {
     Bilinear,   ///< Bilinear (2D) interpolation
     Nearest,    ///< Nearest-neighbor interpolation
 };
 
-/// Padding mode for out-of-bounds grid coordinates.
 enum class GridSamplePaddingMode : uint8_t {
     Zeros,      ///< Fill with zero for out-of-bounds locations
     Border,     ///< Clamp to the nearest border pixel
     Reflection, ///< Reflect coordinates at the boundaries
 };
 
-/// Attributes for the GridSample operator (supports both 2D and 3D).
 struct GridSampleAttributes {
     GridSampleMode mode = GridSampleMode::Bilinear;
     GridSamplePaddingMode padding_mode = GridSamplePaddingMode::Zeros;
 
-    /// If true, -1 and 1 in the grid map to the centers of the corner pixels.
-    /// If false (default), -1 and 1 map to the outer edges of the corner pixels.
+    /// If true, -1 and 1 in the grid map to the centers of the corner pixels;
+    /// if false (default), to their outer edges.
     bool align_corners = false;
 
-    /// If true, add result to existing output buffer instead of overwriting.
+    /// Accumulate into the existing output instead of overwriting (residual).
     bool add_to = false;
 
-    /// Returns the spatial rank (2 or 3) inferred from the input tensor rank.
-    /// For a 4D input (NCHWC8), returns 2. For a 5D input (NCDHWC8), returns 3.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
         return input_rank - 2;  // N, C + spatial dims
     }
 };
 
-/// GridSample operator (class-based API).
-///
-/// Samples values from an input tensor at grid-defined locations.
-///
-/// 2D: Input [N, C, IH, IW], Grid [N, OH, OW, 2] → Output [N, C, OH, OW]
-/// 3D: Input [N, C, ID, IH, IW], Grid [N, OD, OH, OW, 3] → Output [N, C, OD, OH, OW]
 class GridSample : public OpBase {
 public:
     static std::unique_ptr<GridSample> create(const GridSampleAttributes& attrs,
@@ -88,7 +76,7 @@ public:
 
     const GridSampleAttributes& attributes() const noexcept { return attrs_; }
 
-    struct Impl;  // defined in grid_sample.cpp (Pimpl pattern)
+    struct Impl;
     ~GridSample();
 
 private:

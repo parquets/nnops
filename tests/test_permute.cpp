@@ -1,5 +1,12 @@
 /// @file test_permute.cpp
-/// @brief Unit tests for Permute operator (CPU backend).
+/// @brief Unit tests for the CPU Permute operator.
+///
+/// The operator picks one of two routes from `perm`: a general n-D strided copy
+/// (a per-row memcpy when the innermost output dim maps to input stride 1), and
+/// — when the leading dims are unchanged and the last two are exchanged — a
+/// tiled 8x8 SIMD transpose (v_transpose_8x8), batched over the leading dims,
+/// with a scalar fallback on partial tiles. These tests cover both routes, the
+/// shape inference, and the f32/f16 dtypes.
 
 #include "nnops/ops/permute.hpp"
 #include "common/test_harness.hpp"
@@ -45,7 +52,6 @@ NNOPS_TEST(permute_2d_transpose) {
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
-    // Expected: transpose of 3×4 → 4×3
     NNOPS_EXPECT_NEAR(out_buf[0], 1.0f, 1e-5f);   // [0,0] ← in[0,0]
     NNOPS_EXPECT_NEAR(out_buf[1], 5.0f, 1e-5f);   // [0,1] ← in[1,0]
     NNOPS_EXPECT_NEAR(out_buf[2], 9.0f, 1e-5f);   // [0,2] ← in[2,0]
@@ -143,7 +149,6 @@ NNOPS_TEST(permute_4d_nchw_to_nhwc) {
 }
 
 NNOPS_TEST(permute_identity) {
-    // Identity perm [0, 1, 2, 3] — output should equal input
     const int64_t shape[] = {2, 3, 4, 5};
     auto [in_vec, input] = test::make_random_tensor(shape, -1.0f, 1.0f, 222);
 
@@ -210,8 +215,7 @@ NNOPS_TEST(permute_reverse) {
 
 NNOPS_TEST(permute_3d_last_two_swap) {
     // 3D: [B, M, K] → [B, K, M]  (perm = [0, 2, 1])
-    // Batched 2D transpose: each of the B slices is [M, K] → [K, M]
-    // Hits the SIMD tiled v_transpose_8x8 path
+    // Hits the SIMD tiled v_transpose_8x8 path, one [M, K] slice per batch.
     const int64_t B = 3, M = 12, K = 16;
     auto [in_vec, input] = test::make_random_tensor({B, M, K}, -1.0f, 1.0f, 777);
 
@@ -248,8 +252,7 @@ NNOPS_TEST(permute_3d_last_two_swap) {
 
 NNOPS_TEST(permute_4d_last_two_swap) {
     // 4D: [N, C, H, W] → [N, C, W, H]  (perm = [0, 1, 3, 2])
-    // N*C independent 2D transposes of [H, W] → [W, H]
-    // Hits the SIMD tiled v_transpose_8x8 path
+    // N*C independent [H, W] transposes — the SIMD tiled v_transpose_8x8 path.
     const int64_t N = 2, C = 4, H = 16, W = 20;
     auto [in_vec, input] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 888);
 
@@ -290,8 +293,7 @@ NNOPS_TEST(permute_4d_last_two_swap) {
 }
 
 NNOPS_TEST(permute_last_two_swap_f16) {
-    // f16 batched 2D transpose: [B, M, K] → [B, K, M]
-    // Hits the SIMD tiled v_transpose_8x8 path for f16
+    // f16 hits the same SIMD tiled v_transpose_8x8 path.
     const int64_t B = 2, M = 8, K = 10;
     auto [in_vec, _] = test::make_random_tensor({B, M, K}, -1.0f, 1.0f, 999);
 
@@ -334,8 +336,8 @@ NNOPS_TEST(permute_last_two_swap_f16) {
 }
 
 NNOPS_TEST(permute_last_two_swap_partial_tile) {
-    // Edge case: dims that are not multiples of TILE=8 exercise the
-    // partial-tile scalar fallback inside the SIMD path
+    // Dims that are not multiples of TILE=8 exercise the partial-tile scalar
+    // fallback inside the SIMD path.
     const int64_t M = 10, K = 10;  // > 8 but not multiples
     auto [in_vec, input] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 333);
 
@@ -445,10 +447,6 @@ NNOPS_TEST(permute_random_f16) {
     }
 }
 
-// ============================================================
-// Shape inference test
-// ============================================================
-
 NNOPS_TEST(permute_shape_inference) {
     const int64_t in_shape[] = {2, 3, 5, 7};
     float dummy[1] = {};
@@ -472,10 +470,6 @@ NNOPS_TEST(permute_shape_inference) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 }
 
-// ============================================================
-// Class API test
-// ============================================================
-
 NNOPS_TEST(permute_class_api) {
     float in_data[] = {
         1.0f, 2.0f, 3.0f,
@@ -488,7 +482,6 @@ NNOPS_TEST(permute_class_api) {
     const int64_t p8[] = {1, 0};
     attrs.perm = std::span<const int64_t>(p8, 2);
 
-    // Class API
     std::vector<float> out_class(6);
     {
         auto op = Permute::create(attrs, Backend::CPU);
@@ -499,7 +492,7 @@ NNOPS_TEST(permute_class_api) {
         op->compute(output, ins);
     }
 
-    // Class API (second instance)
+    // Second instance: same input, same output.
     std::vector<float> out_func(6);
     {
         auto op = Permute::create(attrs, Backend::CPU);

@@ -1,17 +1,26 @@
-/// Unit tests for Attention operator — class API with CPU reference.
+/// @file test_attention.cpp
+/// @brief Attention operator tests — the class API against the CPU reference.
 ///
-/// All tests use the Attention class interface:
-///   1. auto op = Attention::create(attrs, Backend::CPU);
-///   2. auto d = tv.desc();  // store desc in lvalue
-///   3. const TensorDesc arr[] = {d_q, d_k, d_v};  // C array
-///      auto descs = op->getOutputTensorDesc(arr);
-///   4. Validate descs[0].rank / dims / layout / dtype
-///   5. Create output TensorView via nnops::test::make_planar
-///   6. const TensorView ins[] = {q, k, v}; op->compute(output, ins);
+/// Most tests drive the public shape: Attention::create, then
+/// getOutputTensorDesc over the input descs, then nnops::test::make_planar
+/// for the output and op->compute(out, ins).
+///
+/// reference::attention_ref is f32 only (declared test-locally, as in
+/// test_conv2d.cpp), so f16 is compared against the f32 reference on the same
+/// values with the arch-aware kF16AccumTol. The fast path is compared over
+/// merged [B, S, H*D] and explicit [B, H, S, D] inputs (explicit standard-route
+/// only), on both routes — standard, or flash once Sq*Sk reaches
+/// kFlashMinScores (1 << 16) — with or without a flat [Sq, Sk] additive mask.
+///
+/// The pack-scratch test calls get_attention_plan directly: the scratch is
+/// sized from uniform nr_max-wide panels, while the loops pack a last block
+/// narrower than a full tile. The panel count is monotone in n, so the
+/// tile-sized count covers it, and the cases pin a final block one column short
+/// of a full tile — the widest partial block.
 
 #include "nnops/ops/attention.hpp"
 #include "backend/cpu/attention/attention.h"      // get_attention_plan — to pin the f16 fast path
-#include "backend/cpu/matmul/matmul_helper.h"  // num_panels / NR / Kc — pack-scratch sizing test
+#include "backend/cpu/matmul/matmul_helper.h"  // nr_max_flt / KC_* / mma_pack_align — pack-scratch test
 #include "common/test_harness.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
@@ -34,7 +43,6 @@ namespace cpu = nnops::backend::cpu;
 
 NNOPS_TEST(attention_basic_single_head) {
     // B=1, H=1, Sq=2, Sk=2, D=4
-    // Test scaled dot-product attention without mask
     const int64_t qshape[] = {1, 2, 4};  // [B, S, D]
     const int64_t kshape[] = {1, 2, 4};
     const int64_t vshape[] = {1, 2, 4};
@@ -72,8 +80,6 @@ NNOPS_TEST(attention_basic_single_head) {
     const TensorView ins[] = {q, k, v};
     op->compute(out, ins);
 
-    // QK^T: [[1,0],[0,1]] → scores after softmax ≈ [[0.73, 0.27], [0.27, 0.73]]
-    // attn @ V should be close to V with some mixing
     for (int i = 0; i < 8; ++i) {
         NNOPS_EXPECT_TRUE(!std::isnan(out_buf[i]));
         NNOPS_EXPECT_TRUE(!std::isinf(out_buf[i]));
@@ -94,7 +100,6 @@ NNOPS_TEST(attention_multi_head) {
     std::vector<float> k_buf(8);
     std::vector<float> v_buf(8);
 
-    // Identity-like Q and K (each head gets its own subspace)
     for (int i = 0; i < 8; ++i) { q_buf[i] = (i % 3 == 0) ? 1.0f : 0.0f; }
     for (int i = 0; i < 8; ++i) { k_buf[i] = q_buf[i]; }
     for (int i = 0; i < 8; ++i) { v_buf[i] = static_cast<float>(i + 1); }
@@ -135,11 +140,11 @@ NNOPS_TEST(attention_multi_head) {
 }
 
 // ============================================================
-// Random data (causal)
+// Random data
 // ============================================================
 
 NNOPS_TEST(attention_random) {
-    auto [q_vec, q] = test::make_random_tensor({2, 1, 16});  // B=2, H=1, S=4, D=4 (merged)
+    auto [q_vec, q] = test::make_random_tensor({2, 1, 16});  // B=2, H=1, S=1, D=16 (merged)
     auto [k_vec, k] = test::make_random_tensor({2, 1, 16});
     auto [v_vec, v] = test::make_random_tensor({2, 1, 16});
 
@@ -178,8 +183,6 @@ NNOPS_TEST(attention_random) {
 // Tiled attention fast path (vs reference)
 // ============================================================
 
-// Reference kernel for comparison (test-local declaration, following the
-// test_conv2d.cpp pattern).
 namespace nnops::backend::cpu::reference {
 void attention_ref(const AttentionAttributes& attrs,
                    TensorView& output,
@@ -190,8 +193,7 @@ void attention_ref(const AttentionAttributes& attrs,
 
 namespace {
 
-/// Run the fast path and the reference, and report whether every output element
-/// agrees within (rtol, atol).
+/// Fast path vs reference: does every element agree within (rtol, atol)?
 bool attention_fast_vs_ref(const AttentionAttributes& attrs,
                            const TensorView& q, const TensorView& k, const TensorView& v,
                            const TensorView* mask,
@@ -208,12 +210,12 @@ bool attention_fast_vs_ref(const AttentionAttributes& attrs,
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    // Fast path (scratch pooled internally by the kernel).
+    // Fast path; the caller's workspace is unused — scratch comes from the
+    // kernel's internal pool.
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
     op->compute(fast_out, ins, {}, nullptr);
 
-    // Reference baseline.
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::attention_ref(attrs, ref_out, ins, {}, nullptr);
@@ -240,9 +242,9 @@ bool attention_fast_vs_ref(const AttentionAttributes& attrs,
 }  // anonymous namespace
 
 NNOPS_TEST(attention_tiled_matches_ref) {
-    // Merged [B, S, H*D] self-attention across a spread of batch / heads /
-    // sequence / head-dim sizes, exercising multi-k-block and multi-n-block
-    // tiling paths, with and without a mask.
+    // Merged [B, S, H*D] self-attention over a spread of batch / heads /
+    // sequence / head-dim sizes: multi-k-block and multi-n-block tiling, with
+    // and without a mask.
     struct Case { std::array<int64_t, 3> qshape; std::array<int64_t, 3> kshape;
                   std::array<int64_t, 3> vshape; int64_t heads; float scale; bool mask; };
     const Case cases[] = {
@@ -254,7 +256,7 @@ NNOPS_TEST(attention_tiled_matches_ref) {
         // head_dim just above Kc (128): GEMM1's K loop splits 128 + 64
         {{1, 8, 192},   {1, 8, 192},   {1, 8, 192},   1, 0.0f, false},
         {{1, 8, 256},   {1, 8, 256},   {1, 8, 256},   1, 0.0f, true},
-        // head_dim well past Kc: exercises the multi-k-block GEMM1 / multi-n-block GEMM2
+        // head_dim well past Kc: multi-k-block GEMM1, multi-n-block GEMM2
         {{1, 4, 512},   {1, 4, 512},   {1, 4, 512},   1, 0.0f, false},
     };
 
@@ -283,7 +285,7 @@ NNOPS_TEST(attention_tiled_matches_ref) {
 }
 
 NNOPS_TEST(attention_tiled_explicit_matches_ref) {
-    // Explicit [B, H, S, D] layout (one head per (batch, head) block).
+    // Explicit [B, H, S, D] layout.
     const int64_t qshape[] = {2, 3, 5, 8};
     const int64_t kshape[] = {2, 3, 5, 8};
     const int64_t vshape[] = {2, 3, 5, 8};
@@ -304,9 +306,9 @@ NNOPS_TEST(attention_tiled_explicit_matches_ref) {
 
 namespace {
 
-/// Elements the kernel writes for a packed B block of @p n columns at the
-/// panel stride the plan sizes from — min(Kc, max(D, Sk)), the longest k-run
-/// either GEMM takes. The packer emits ceil(n / nr_max) uniform panels.
+/// Elements a packed-B block of @p n columns occupies at the plan's stride:
+/// min(Kc, max(D, Sk)) k — the longest k-run either GEMM can take — and
+/// ceil(n / nr_max) uniform nr_max-wide panels.
 template <class T>
 int64_t pack_demand_elems(int64_t n, int64_t D, int64_t Sk)
 {
@@ -323,16 +325,10 @@ int64_t pack_demand_elems(int64_t n, int64_t D, int64_t Sk)
 }  // anonymous namespace
 
 NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
-    // Both GEMM loops pack B block by block, and the *last* n-block of a tile
-    // is narrower than a full one — as small as one column. The uniform route
-    // emits ceil(n / nr_max) panels, which is monotonic in n, so a partial
-    // block can never need more than the tile-sized count the scratch is
-    // sized from. Every case below has a final block one column short of a
-    // full tile, the narrowest partial width.
     struct Case { bool f16; int64_t Sq, D, Sk; };
     const Case cases[] = {
         {false,  8, 128, 7679},   // standard path, Sk = 10*nc1 - 1 (nc1 = 768)
-        {false, 33, 128, 2047},   // flash, Sk = 2*Bc - 1
+        {false, 33, 128, 2047},   // flash, Sk = 2^11 - 1
         {false, 65, 256, 1023},   // flash, D = 2*Kc
         {true,  17, 128, 4095},   // flash, f16
     };
@@ -374,9 +370,9 @@ NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
 // ============================================================
 
 NNOPS_TEST(attention_flash_matches_ref) {
-    // Large-sequence cases that route through the tiled FlashAttention path
-    // (Sq × Sk ≥ 65536), exercising single- and multi-KV-block online softmax,
-    // with and without an additive mask.
+    // Large-sequence cases that route through FlashAttention (Sq*Sk >= 65536):
+    // single- and multi-KV-block online softmax, with and without an additive
+    // mask.
     struct Case { std::array<int64_t, 3> qshape; int64_t heads; bool mask; };
     const Case cases[] = {
         {{1, 256, 64},  2, false},   // Sq*Sk = 65536, H*D = 64
@@ -408,17 +404,15 @@ NNOPS_TEST(attention_flash_matches_ref) {
 }
 
 // ============================================================
-// f16 fast path (vs the f32 reference on the same data)
+// f16 fast path
 // ============================================================
 
 namespace {
 
 using nnops::backend::cpu::half;
 
-/// f16 fast path vs the f32 reference computed on the *same* underlying data —
-/// the pattern shared by the other f16 GEMM tests (matmul, conv2d). Returns the
-/// max absolute element-wise deviation so the caller can compare it to a
-/// tolerance and report the margin.
+/// Max |f16 fast path - f32 reference| on the *same* underlying data, for the
+/// caller to compare against kF16AccumTol.
 float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
                                 const TensorView& q32, const TensorView& k32, const TensorView& v32,
                                 const TensorView* m32,
@@ -427,7 +421,6 @@ float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
 {
     auto op = Attention::create(attrs, Backend::CPU);
 
-    // f32 reference baseline.
     std::vector<TensorDesc> rdescs = {q32.desc(), k32.desc(), v32.desc()};
     std::vector<TensorView> rins   = {q32, k32, v32};
     if (m32) { rdescs.push_back(m32->desc()); rins.push_back(*m32); }
@@ -437,7 +430,7 @@ float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
     auto ref_out = test::make_planar(rout_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::attention_ref(attrs, ref_out, rins, {}, nullptr);
 
-    // f16 fast path (scratch pooled internally by the kernel).
+    // f16 fast path; scratch is pooled by the kernel.
     std::vector<TensorDesc> fdescs = {q16.desc(), k16.desc(), v16.desc()};
     std::vector<TensorView> fins   = {q16, k16, v16};
     if (m16) { fdescs.push_back(m16->desc()); fins.push_back(*m16); }
@@ -455,9 +448,8 @@ float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
     return max_dev;
 }
 
-/// Build the f32 + f16 views for one case (merged rank-3 or explicit rank-4,
-/// decided by the shapes), run fast-vs-ref and return the max deviation.
-/// @p mshape empty means "no mask".
+/// Build the f32 and f16 views for one case (rank 3 or 4 by the shapes), run
+/// f16-vs-f32-ref, and return the max deviation. Empty @p mshape means no mask.
 float run_f16_case(const AttentionAttributes& attrs,
                    const std::vector<int64_t>& qshape,
                    const std::vector<int64_t>& kshape,
@@ -495,9 +487,9 @@ float run_f16_case(const AttentionAttributes& attrs,
 }  // anonymous namespace
 
 NNOPS_TEST(attention_f16_routes_to_fast_path) {
-    // f16 must resolve a real plan (workspace_size != 0), i.e. take the tiled
-    // fast path rather than falling through to the f32-only reference — which
-    // would silently interpret the f16 buffers as f32.
+    // f16 must resolve a non-zero plan — its own tiles and scratch — i.e. take
+    // the tiled route; get_attention_plan zeroes the plan for any other dtype
+    // or a Q/K/V dtype mismatch.
     const int64_t qshape[] = {1, 8, 32};
     auto [q16v, q16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 400);
     auto [k16v, k16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 401);
@@ -513,9 +505,8 @@ NNOPS_TEST(attention_f16_routes_to_fast_path) {
 
 NNOPS_TEST(attention_f16_matches_ref) {
     // f16 tiled standard path (Sq*Sk < kFlashMinScores): merged and explicit
-    // layouts, multi-head, an additive mask, and head_dims above Kc — both the
-    // single-k-block GEMM1 (D <= Kc) and the split one (D > Kc).
-    // The f32 reference on the same data is the ground truth.
+    // layouts, multi-head, an additive mask, and head dims on both sides of Kc
+    // — the single-k-block GEMM1 (D <= Kc) and the split one (D > Kc).
     struct Case { std::vector<int64_t> qshape, kshape, vshape, mshape;
                   int64_t heads; float scale; };
     const Case cases[] = {
@@ -552,9 +543,8 @@ NNOPS_TEST(attention_f16_matches_ref) {
 }
 
 NNOPS_TEST(attention_f16_flash_matches_ref) {
-    // Large Sq*Sk routes through the f16 FlashAttention path (online softmax
-    // with f16 running max/sum), single- and multi-KV-block, with and without a
-    // mask.
+    // Large Sq*Sk routes through the f16 flash path (online softmax with f16
+    // running max/sum), single- and multi-KV-block, with and without a mask.
     struct Case { std::vector<int64_t> qshape, mshape; int64_t heads; };
     const Case cases[] = {
         {{1, 256, 64},  {},        2},   // Sq*Sk = 65536, H*D = 64

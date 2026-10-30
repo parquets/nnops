@@ -1,17 +1,17 @@
 /// @file permute.cpp
 /// @brief SIMD-optimized CPU implementation of dimension permute (transpose).
 ///
-/// For planar data, permute is a memory rearrangement where each output
-/// element comes from a permuted position in the input.
+/// Planar data: each output element comes from a permuted input position. Two
+/// routes, picked from `perm`:
+///   1. Last-two-dims swap (perm[i]==i for i<rank-2, and the last two
+///      exchanged): tiled 8x8 SIMD transpose via kernel::tiled_transpose_2d,
+///      batched over all leading dims. Covers 2D transpose and
+///      batched (B,M,K)->(B,K,M).
+///   2. General n-D: scalar strided copy, parallel over the outer index; a row
+///      whose innermost output dim maps to input stride 1 is a memcpy.
 ///
-/// Optimization tiers:
-///   1. Last-2-dims swap (rank>=2, only last 2 dims transposed):
-///      tiled 8×8 SIMD transpose via v_transpose_8x8, batched over
-///      all leading dimensions.
-///      Covers: 2D transpose, batched matrix transpose (B,M,K)→(B,K,M),
-///      NCHW↔NHCW, multi-head dim reordering, etc.
-///   2. Inner dim contiguous (in_step==1): memcpy per output row.
-///   3. General n-D: scalar strided copy, parallel over outer dim.
+/// The batch stride between slices is M*K: planar data makes dims rank-2 and
+/// rank-1 the innermost and contiguous.
 
 #include "nnops/ops/permute.hpp"
 #include "simd_kernel/simd_permute.hpp"
@@ -29,37 +29,28 @@ void permute_last_two_swap_impl(TensorView& output,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
 
-    // Batch = product of all leading dims
     int64_t batch = 1;
     for (int64_t i = 0; i < rank - 2; ++i) {
         batch *= input.shape(i);
     }
 
-    const int64_t M = input.shape(rank - 2);  // rows per slice
-    const int64_t K = input.shape(rank - 1);  // cols per slice
-    const int64_t slice_elems = M * K;        // elements per 2D slice
+    const int64_t M = input.shape(rank - 2);
+    const int64_t K = input.shape(rank - 1);
+    const int64_t slice_elems = M * K;
 
     const T* in_ptr  = input.ptr<T>();
     T*       out_ptr = output.ptr<T>();
 
-    // Leading stride = stride to advance by 1 in the outermost batch dim.
-    // For planar data, this equals slice_elems (since dims rank-2..rank-1
-    // are the innermost).
-    // But we use shape multiplication for correctness: the stride from
-    // batch element b to b+1 is exactly M * K for planar data.
     const int64_t in_batch_stride = slice_elems;
-    const int64_t out_batch_stride = slice_elems;  // same element count
-
-    // Within each slice: input [M, K] row-major → output [K, M] row-major
-    // in_ld = K (row stride in elements), out_ld = M
+    const int64_t out_batch_stride = slice_elems;
 
     auto body = [&](int64_t b) {
         kernel::tiled_transpose_2d<T>(
             in_ptr  + b * in_batch_stride,
             out_ptr + b * out_batch_stride,
             M, K,
-            K,   // in_ld: elements between input rows
-            M);  // out_ld: elements between output rows
+            K,
+            M);
     };
 
     ctx.cpu.run(0, batch, body);
@@ -76,7 +67,6 @@ void permute_impl(const PermuteAttributes& attrs,
     const auto& perm = attrs.perm;
 
     if (rank == 1) {
-        // 1D permute is identity
         std::memcpy(output.ptr<void>(), input.ptr<void>(),
                     static_cast<size_t>(input.numel()) * sizeof(T));
         return;
@@ -85,14 +75,13 @@ void permute_impl(const PermuteAttributes& attrs,
     const int64_t total = output.numel();
     if (total == 0) { return; }
 
-    // Input strides in elements (planar → contiguous innermost)
     int64_t in_strides[TensorDesc::kMaxRank];
     in_strides[rank - 1] = 1;
     for (int64_t i = rank - 2; i >= 0; --i) {
         in_strides[i] = in_strides[i + 1] * input.shape(i + 1);
     }
 
-    // Outer-only strides (for decomposing outer_idx over dims 0..rank-2)
+    // Strides over dims 0..rank-2 only: outer_idx has the inner dim divided out.
     int64_t outer_strides[TensorDesc::kMaxRank];
     if (rank >= 2) {
         outer_strides[rank - 2] = 1;
@@ -107,13 +96,10 @@ void permute_impl(const PermuteAttributes& attrs,
     const int64_t inner_dim = output.shape(rank - 1);
     const int64_t outer_total = total / inner_dim;
 
-    // Input stride delta when innermost output dim increments by 1
     const int64_t last_perm_dim = perm[static_cast<size_t>(rank - 1)];
     const int64_t in_inner_step = in_strides[static_cast<size_t>(last_perm_dim)];
 
     auto body = [&](int64_t outer_idx) {
-        // Decompose outer_idx into multi-index for dims 0..rank-2
-        // Uses outer_strides (which exclude the inner dim factor)
         int64_t tmp = outer_idx;
         int64_t in_base = 0;
         for (int64_t d = 0; d < rank - 1; ++d) {
@@ -125,7 +111,6 @@ void permute_impl(const PermuteAttributes& attrs,
         T* out_row = out_ptr + outer_idx * inner_dim;
 
         if (in_inner_step == 1) {
-            // Contiguous in both input and output: memcpy
             std::memcpy(out_row, in_ptr + in_base,
                         static_cast<size_t>(inner_dim) * sizeof(T));
         } else {
@@ -147,10 +132,6 @@ Status permute_cpu(const PermuteAttributes& attrs,
     const auto dtype = inputs[0].data_type();
     const int64_t rank = inputs[0].rank();
 
-    // Detect "last two dims swap": perm[i]==i for i < rank-2,
-    // perm[rank-2]==rank-1, perm[rank-1]==rank-2.
-    // This covers pure 2D transpose (rank==2) and batched 2D transpose
-    // (rank>2, e.g. [B,M,K]→[B,K,M], NCHW→NHCW).
     bool is_last_two_swap = (rank >= 2);
     if (is_last_two_swap) {
         for (int64_t i = 0; i < rank - 2; ++i) {
@@ -174,7 +155,6 @@ Status permute_cpu(const PermuteAttributes& attrs,
         return Status::ok;
     }
 
-    // General path
     dispatch_f32_f16(dtype, "permute_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
         permute_impl<T>(attrs, output, inputs, ctx);

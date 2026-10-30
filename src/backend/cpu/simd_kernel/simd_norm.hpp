@@ -1,21 +1,20 @@
 #pragma once
 /// @file simd_norm.hpp
-/// @brief SIMD kernel functions for normalization operators.
+/// @brief Row kernels shared by the normalization operators (BatchNorm,
+/// LayerNorm, GroupNorm, RMSNorm, L2Norm).
 ///
-/// Covers BatchNorm, LayerNorm, GroupNorm, RMSNorm, and L2Norm.
+/// Two shapes of work:
+///  - Normalize from statistics: norm_reduce_sum_sq (the shared reduction,
+///    re-exported) and one element-wise pass, either with a broadcast
+///    scale/bias (norm_apply_affine_row, the GroupNorm shape) or with
+///    mean/scale/bias terms gated at compile time by HasMean/HasScale/HasBias
+///    (norm_apply_row, L2/RMS/Layer; scale/bias broadcast or per-element).
+///  - BatchNorm's fused fmadd, one ns*x + nb per block with ns/nb pre-folding
+///    scale/bias/mean/var (the non-spatial kernel folds them itself), written
+///    per storage: packed C8, planar, or per-element block.
 ///
-/// Shared primitives:
-///   - norm_reduce_sum_sq<T>: 4-wide SIMD reduction of sum + sum_sq over contiguous data,
-///     with 4→2→1-wide multi-accumulator unrolling and scalar tail.
-///   - norm_apply_affine_row<T>: SIMD normalize with broadcast scale/bias:
-///     y = (x - mean) * inv_std * scale_val + bias_val
-///   - norm_apply_row<T, HasMean, HasScale, HasBias>: unified SIMD normalize pass
-///     for L2/RMS/Layer norm: y = ((x - mean?) * inv_std) * scale? + bias?
-///
-/// BatchNorm kernels (fused fmadd formula, structurally different):
-///   - batch_norm_process_packed_row<T>
-///   - batch_norm_process_planar_row<T>
-///   - batch_norm_process_nonspatial_block<T>
+/// Every writer goes through v_store_add/s_store_add, so a residual `add_to`
+/// costs no extra pass.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_reduce_primitive.hpp"
@@ -27,19 +26,15 @@ namespace nnops::kernel {
 
 using namespace simd;
 
-/// SIMD sum + sum-of-squares reduction over n contiguous elements — thin
-/// forwarder to the shared reduction primitive in simd_reduce_primitive.hpp.
+/// Re-export of row_reduce_sum_sq (simd_reduce_primitive.hpp).
 template <typename T>
 inline std::pair<float, float> norm_reduce_sum_sq(const T* x, int64_t n)
 {
     return row_reduce_sum_sq<T>(x, n);
 }
 
-/// SIMD normalize: apply `(x - mean) * inv_std * scale_val + bias_val`
-/// to n contiguous elements with broadcast (per-row) scale/bias.
-///
-/// Used by GroupNorm where each row within a channel shares the same
-/// scale/bias value.
+/// (x - mean) * inv_std * scale + bias with broadcast scale/bias — GroupNorm,
+/// where a row within a channel shares one scale/bias pair.
 template <typename T>
 inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
                                    float mean, float inv_std,
@@ -56,7 +51,6 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
 
     for (; i + L <= n; i += L) {
         auto xv = v_load(x + i);
-        // y = (x - mean) * inv_std * scale + bias
         auto rv = v_fmadd(v_mul(v_sub(xv, v_mean), v_inv_std), v_scale, v_bias);
         v_store_add(y + i, rv, add_to);
     }
@@ -67,13 +61,8 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
     }
 }
 
-/// Unified SIMD element-wise normalize pass.
-///
-/// Computes: y[i] = ((x[i] - mean?) * inv_std) * scale? + bias?
-/// Template bools control which operations are compiled in — the compiler
-/// eliminates dead branches for each instantiation via `if constexpr`.
-///
-/// Used as the second pass by L2Norm, RMSNorm, and LayerNorm.
+/// ((x - mean?) * inv_std) * scale? + bias? — the HasMean/HasScale/HasBias
+/// bools compile out the missing terms.
 template <typename T, bool HasMean, bool HasScale, bool HasBias>
 inline void norm_apply_row(const T* x, T* y, int64_t n,
                             float mean_val, float inv_std,
@@ -171,7 +160,7 @@ inline void batch_norm_process_planar_row(
     }
 }
 
-/// Non-spatial mode: per-element SIMD processing.
+/// Non-spatial mode: full per-element scale/bias/mean/var arrays.
 template <typename T>
 inline void batch_norm_process_nonspatial_block(
     const T* x, T* y,

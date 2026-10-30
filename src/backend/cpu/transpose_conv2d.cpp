@@ -6,7 +6,7 @@
 /// accumulated into the appropriate output region. This is the natural transpose
 /// of regular convolution's gather approach.
 ///
-/// Per-(N, C8) parallel dispatch, following the depthwise_conv.cpp pattern.
+/// Per-(N, C8) parallel dispatch; add_to takes a serial save/restore path.
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -68,17 +68,15 @@ void tconv2d_impl_nchwc8(
     const auto* w_ptr   = weight.ptr<T>();
     const auto* b_ptr   = has_bias ? inputs[2].ptr<T>() : nullptr;
 
-    const T* type_tag = nullptr;  // for v_zero / v_set1 overload resolution
+    const T* type_tag = nullptr;  // overload tag for v_zero / apply_epilogue_vec
 
-    // Per-(N, C8) compute lambda
     const auto compute_sample_c8 = [&](int64_t n, int64_t oc8) {
         const int64_t oc_start = oc8 * out_pack;
 
-        // Determine output channel range for this C8 block
         const int64_t oc_end = std::min(oc_start + out_pack, OC);
         const int64_t num_oc = oc_end - oc_start;  // may be < out_pack for last block
 
-        // ---- Zero-initialize output region for this (n, oc8) block ----
+        // ---- zero the output region for this block ----
         {
             T* out_base = out_ptr + n * OC8 * out_ch_stride + oc8 * out_ch_stride;
             for (int64_t oh = 0; oh < OH; ++oh) {
@@ -91,8 +89,7 @@ void tconv2d_impl_nchwc8(
             }
         }
 
-        // ---- Scatter-add ----
-        // For each group, iterate over all input channels and scatter to output
+        // ---- scatter-add ----
         for (int64_t g = 0; g < G; ++g) {
             const int64_t ic_start = g * IC_per_G;
             const int64_t g_oc_start = g * OC_per_G;
@@ -141,11 +138,10 @@ void tconv2d_impl_nchwc8(
             }
         }
 
-        // ---- Bias + Epilogue (SIMD for full C8 blocks, scalar for tail) ----
+        // ---- bias + epilogue (SIMD for full C8 blocks, scalar for the tail) ----
         T* out_base = out_ptr + n * OC8 * out_ch_stride + oc8 * out_ch_stride;
 
         if (num_oc == out_pack) {
-            // Full C8 block — use SIMD
             auto vbias = b_ptr
                 ? v_load(b_ptr + oc8 * out_pack)
                 : v_zero(type_tag);
@@ -161,7 +157,6 @@ void tconv2d_impl_nchwc8(
                 }
             }
         } else {
-            // Partial C8 block — scalar
             for (int64_t loc = 0; loc < num_oc; ++loc) {
                 const int64_t oc = oc_start + loc;
                 const float bval = b_ptr ? s_load(&b_ptr[oc]) : 0.0f;
@@ -179,13 +174,9 @@ void tconv2d_impl_nchwc8(
         }
     };
 
-    // ---- add_to handling ----
-    // Scatter-add is inherently accumulation-based, so we handle add_to by
-    // saving/restoring the output region. For the typical case (add_to=false),
-    // zeroing is sufficient.
-    //
-    // For add_to=true: save existing, zero, scatter, then add bias+epilogue result
-    // to the saved original. This is done per-(n, oc8) to keep temp buffer small.
+    // Scatter-add is accumulation-based, so add_to saves the block, scatters
+    // over a zeroed region, then adds the saved original back; per-(n, oc8)
+    // keeps the temp buffer small.
     if (attrs.add_to) {
         const int64_t out_block_elems = OH * out_row_stride;
         std::vector<T> saved(static_cast<size_t>(out_block_elems));
@@ -219,17 +210,12 @@ void tconv2d_impl_nchwc8(
         return;
     }
 
-    // ---- Normal case (add_to=false): parallel over N * OC8 ----
     const int64_t N_OC8 = N * OC8;
     ctx.cpu.run(0, N_OC8,
             [&](int64_t tid) {
                 compute_sample_c8(tid / OC8, tid % OC8);
             });
 }
-
-// ============================================================
-// Entry point with dtype dispatch
-// ============================================================
 
 Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
                            TensorView& output,

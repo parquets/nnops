@@ -2,8 +2,8 @@
 /// @file random_tensor.hpp
 /// @brief Random data generation utilities for testing.
 ///
-/// Uses XorShift128+ for fast, deterministic pseudo-random number generation.
-/// No external dependencies.
+/// A xorshift128+ generator for fast, deterministic pseudo-random data; no
+/// external dependencies.
 
 #include "nnops/core/tensor_view.hpp"
 
@@ -15,7 +15,6 @@
 
 namespace nnops::test {
 
-/// Fast, deterministic PRNG based on XorShift128+.
 class XorShift128 {
 public:
     explicit XorShift128(uint64_t seed = 42) noexcept {
@@ -23,7 +22,6 @@ public:
         state_[1] = splitmix64(state_[0]);
     }
 
-    /// Generate next uint64_t.
     uint64_t next_u64() noexcept {
         uint64_t s1 = state_[0];
         const uint64_t s0 = state_[1];
@@ -35,13 +33,11 @@ public:
 
     /// Generate float in [min, max).
     float next_float(float min = -1.0f, float max = 1.0f) noexcept {
-        // Generate in [0, 1) then scale
         const uint64_t bits = next_u64();
         const float t = static_cast<float>(bits & 0xFFFFFF) / 16777216.0f;
         return min + t * (max - min);
     }
 
-    /// Fill a buffer with random float values.
     void fill_float(float* data, int64_t numel,
                     float min = -1.0f, float max = 1.0f) noexcept {
         for (int64_t i = 0; i < numel; ++i) {
@@ -60,8 +56,7 @@ private:
     uint64_t state_[2];
 };
 
-/// Create a random float tensor.
-/// Returns a (vector, TensorView) pair. The vector owns the data.
+/// Returns (vector, view); the vector owns the data.
 inline std::pair<std::vector<float>, TensorView>
 make_random_tensor(std::span<const int64_t> shape,
                    float min = -1.0f, float max = 1.0f,
@@ -89,7 +84,6 @@ make_random_tensor(std::initializer_list<int64_t> shape,
                               min, max, seed);
 }
 
-/// Fill a pre-allocated TensorView with random data.
 inline void fill_random_float(TensorView& tensor,
                                float min = -1.0f, float max = 1.0f,
                                uint64_t seed = 12345)

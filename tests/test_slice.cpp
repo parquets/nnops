@@ -1,5 +1,16 @@
 /// @file test_slice.cpp
-/// @brief Unit tests for Slice operator (CPU backend).
+/// @brief Slice operator tests (CPU, planar, f32/f16).
+///
+/// Covers 1-D..4-D, multi-axis, negative axes, step > 1, empty axes (identity),
+/// f16, and descriptor-only shape inference. Slice is a strided sub-tensor
+/// extraction: unlisted axes are kept whole, and a listed axis maps output index
+/// i to input index start + i*step, with output dim ceil((end - start) / step).
+///
+/// There is no slice_ref, so the randomized cases check each output element
+/// against a hand-computed index into the source buffer; the small cases assert
+/// literals. The innermost step is its own code path: the kernel memcpys a row
+/// when it is 1 and takes the scalar strided loop otherwise. f16 values are
+/// converted from an f32 source, hence the looser 0.01 tolerance.
 
 #include "nnops/ops/slice.hpp"
 #include "common/test_harness.hpp"
@@ -14,12 +25,7 @@
 
 using namespace nnops;
 
-// ============================================================
-// Hand-verified tests
-// ============================================================
-
 NNOPS_TEST(slice_1d_basic) {
-    // 1D slice: [0, 1, 2, 3, 4, 5, 6, 7] → [2, 3, 4, 5] (start=2, end=6)
     float in_data[] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f};
     const int64_t in_shape[] = {8};
     TensorView input(in_shape, DataType::f32, in_data);
@@ -52,7 +58,6 @@ NNOPS_TEST(slice_1d_basic) {
 }
 
 NNOPS_TEST(slice_1d_with_step) {
-    // 1D slice with step=2: [0,1,2,3,4,5,6,7] start=0 end=8 step=2 → [0,2,4,6]
     float in_data[] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f};
     const int64_t in_shape[] = {8};
     TensorView input(in_shape, DataType::f32, in_data);
@@ -86,13 +91,6 @@ NNOPS_TEST(slice_1d_with_step) {
 }
 
 NNOPS_TEST(slice_2d_rows) {
-    // 2D slice on dim 0: [4, 3] → [2, 3] (rows 1..2)
-    // Input (row-major):
-    //   [0, 1, 2]
-    //   [3, 4, 5]
-    //   [6, 7, 8]
-    //   [9,10,11]
-    // Output: rows 1,2 (start=1, end=3 on axis 0)
     float in_data[] = {
         0.0f, 1.0f, 2.0f,
         3.0f, 4.0f, 5.0f,
@@ -135,8 +133,6 @@ NNOPS_TEST(slice_2d_rows) {
 }
 
 NNOPS_TEST(slice_2d_cols_strided) {
-    // 2D slice on dim 1 with step=2: [4, 6] → [4, 3] (cols 0,2,4)
-    // This tests the strided inner-dim path.
     const int64_t in_shape[] = {4, 6};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 222);
 
@@ -175,10 +171,6 @@ NNOPS_TEST(slice_2d_cols_strided) {
 }
 
 NNOPS_TEST(slice_3d_multi_axis) {
-    // 3D: [4, 6, 8] → slice on dims 0 and 2
-    // dim 0: start=1, end=3 → 2 elements
-    // dim 2: start=2, end=6 → 4 elements (step=1 → memcpy path)
-    // Output: [2, 6, 4]
     const int64_t in_shape[] = {4, 6, 8};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 333);
 
@@ -218,7 +210,6 @@ NNOPS_TEST(slice_3d_multi_axis) {
 }
 
 NNOPS_TEST(slice_identity) {
-    // Identity slice: output == input
     const int64_t in_shape[] = {3, 4, 5};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 444);
 
@@ -246,8 +237,7 @@ NNOPS_TEST(slice_identity) {
 }
 
 NNOPS_TEST(slice_negative_axes) {
-    // Negative axis: -1 means last dim
-    // 3D [2, 3, 4], slice axis=-1 with start=1, end=3 → [2, 3, 2]
+    // -1 addresses the last axis
     const int64_t in_shape[] = {2, 3, 4};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 555);
 
@@ -284,7 +274,6 @@ NNOPS_TEST(slice_negative_axes) {
 }
 
 NNOPS_TEST(slice_random_f32) {
-    // 4D slice with multiple axes, random verification vs reference algorithm
     const int64_t in_shape[] = {4, 8, 12, 6};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 666);
 
@@ -328,11 +317,9 @@ NNOPS_TEST(slice_random_f32) {
 }
 
 NNOPS_TEST(slice_random_f16) {
-    // f16 random slice
     const int64_t in_shape[] = {3, 8, 4};
     auto [f32_vec, input_f32] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 777);
 
-    // Convert to f16
     const int64_t numel = 3 * 8 * 4;
     std::vector<nnops::backend::cpu::half> in_half(static_cast<size_t>(numel));
     for (int64_t i = 0; i < numel; ++i) {
@@ -378,7 +365,6 @@ NNOPS_TEST(slice_random_f16) {
 }
 
 NNOPS_TEST(slice_innermost_strided) {
-    // Slice on innermost dimension with step > 1 → strided inner path
     const int64_t in_shape[] = {2, 3, 8};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 888);
 
@@ -418,7 +404,6 @@ NNOPS_TEST(slice_innermost_strided) {
 }
 
 NNOPS_TEST(slice_shape_inference) {
-    // Verify shape inference
     SliceAttributes attrs;
     const int64_t starts[] = {1, 0};
     const int64_t ends[]   = {3, 5};
@@ -450,7 +435,6 @@ NNOPS_TEST(slice_shape_inference) {
 }
 
 NNOPS_TEST(slice_class_api) {
-    // Verify two class API instances produce identical results
     const int64_t in_shape[] = {2, 3, 4};
     auto [in_vec, input] = test::make_random_tensor(in_shape, -1.0f, 1.0f, 999);
 
@@ -462,7 +446,6 @@ NNOPS_TEST(slice_class_api) {
     attrs.ends   = std::span<const int64_t>(ends, 2);
     attrs.axes   = std::span<const int64_t>(axes, 2);
 
-    // Class API
     auto op = Slice::create(attrs, Backend::CPU);
     const TensorDesc in_arr[] = {input.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
@@ -472,7 +455,7 @@ NNOPS_TEST(slice_class_api) {
     const TensorView ins[] = {input};
     op->compute(out_view1, ins);
 
-    // Class API (second instance)
+    // A second compute through the same op must reproduce the first exactly.
     std::vector<float> out_func(static_cast<size_t>(numel));
     TensorView out_view2 = test::make_planar(descs[0], out_func.data());
     op->compute(out_view2, ins);

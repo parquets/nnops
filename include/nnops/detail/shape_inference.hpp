@@ -1,17 +1,31 @@
 #pragma once
 /// @file shape_inference.hpp
-/// @brief Shape inference helper functions used by all operator types.
+/// @brief Pure shape-inference helpers used by most operators.
 ///
-/// These are pure functions: given operator attributes and input shapes,
-/// they compute output shapes. No data buffers are accessed.
+/// Given an operator's attributes and input descriptors, these compute output
+/// descriptors; no data buffer is touched. The header depends only on
+/// TensorDesc and detail/small_vector.hpp, never on an op header, so an op's
+/// dispatch unit can call it from getOutputTensorDesc without an include cycle.
 ///
-/// Design: this header depends ONLY on tensor_view.hpp (TensorDesc) and
-/// detail/small_vector.hpp — it does NOT include any op headers. Each op
-/// header includes this file and uses the helpers in its inline override.
+/// An output inherits `layout` and `dtype` from inputs[0] unless its helper
+/// says otherwise. Validation belongs to the caller: the helpers assume the
+/// ranks and axis indices they read exist.
 ///
-/// The auto_pad modes mirror the enum values in Conv2DAttributes::AutoPad,
-/// Conv3DAttributes::AutoPad, and PoolingAttributes::AutoPad (0=NOTSET,
-/// 1=SAME_UPPER, 2=SAME_LOWER, 3=VALID).
+/// Conventions the per-op helpers encode:
+///  - `auto_pad` mirrors Conv2DAttributes::AutoPad, Conv3DAttributes::AutoPad
+///    and PoolingAttributes::AutoPad: 0=NOTSET (explicit symmetric `padding`),
+///    1=SAME_UPPER, 2=SAME_LOWER, 3=VALID.
+///  - Conv2D weights are OIHW [OC, IC/G, KH, KW] (Conv3D adds KD). The
+///    channel-last reading `weight_hwio` instead expects TensorLayout::HWIO,
+///    TensorFlow's [KH, KW, IC/G, OC], so OC is the last axis. TransposeConv
+///    mirrors it: weight [IC, OC/G, KH, KW] and OC = dims[1] * groups.
+///  - DepthwiseConv, Pooling and Resize take their spatial rank from the input
+///    (rank - 2 is 2 or 3) and, for a 2D input, skip the leading D entry of the
+///    per-axis attribute span. GridSample reads the same spatial dims from the
+///    grid instead.
+///  - MatMul's B may be a prepacked RHS (TensorLayout::PackedB): it leads with
+///    N whatever its source order and has no K axis, because the blob is
+///    addressed by geometry derived from the activation's K.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/detail/small_vector.hpp"
@@ -26,25 +40,16 @@ namespace nnops {
 // Utility helpers
 // ============================================================
 
-/// Resolve a potentially negative axis to [0, rank).
 inline int64_t resolve_axis(int64_t axis, int64_t rank) noexcept {
     return axis < 0 ? axis + rank : axis;
 }
 
-/// Integer ceil division: ceil(a / b).
 inline int64_t ceil_div(int64_t a, int64_t b) noexcept {
     return (a + b - 1) / b;
 }
 
-/// Compute a single spatial output dimension for convolution / pooling.
-///
-/// @param input_size   Spatial input size (IH, IW, ID).
-/// @param kernel       Kernel size for this dimension.
-/// @param stride       Stride for this dimension.
-/// @param dilation     Dilation factor for this dimension.
-/// @param padding      Explicit symmetric padding (only used when auto_pad == 0 / NOTSET).
-/// @param auto_pad     0=NOTSET, 1=SAME_UPPER, 2=SAME_LOWER, 3=VALID.
-/// @return             Output spatial size, or 0 if the configuration is invalid.
+/// One spatial output dimension; `padding` applies only to NOTSET, and an
+/// unrecognized `auto_pad` returns 0.
 inline int64_t compute_spatial_output_size(
     int64_t input_size,
     int64_t kernel,
@@ -56,18 +61,18 @@ inline int64_t compute_spatial_output_size(
     const int64_t effective_kernel = dilation * (kernel - 1) + 1;
 
     switch (auto_pad) {
-    case 0: // NOTSET — explicit padding
+    case 0: // NOTSET
         return (input_size + 2 * padding - effective_kernel) / stride + 1;
 
-    case 1: // SAME_UPPER — ceil(input / stride)
+    case 1: // SAME_UPPER
         return ceil_div(input_size, stride);
 
-    case 2: // SAME_LOWER — floor((input - 1) / stride) + 1
+    case 2: // SAME_LOWER
         return (input_size > 0)
             ? (input_size - 1) / stride + 1
             : 1;
 
-    case 3: // VALID — no padding
+    case 3: // VALID
         return (input_size - effective_kernel) / stride + 1;
 
     default:
@@ -75,12 +80,8 @@ inline int64_t compute_spatial_output_size(
     }
 }
 
-/// Resolve auto_pad into explicit leading padding for one spatial dimension.
-///
-/// Kernels index `i = o*stride + k*dilation - pad_before` and treat anything
-/// outside [0, input_size) as zero, so the trailing half never has to be
-/// represented — it only affects the output size. Returns pad_before, or the
-/// explicit padding when auto_pad == 0.
+/// Leading zero-pad for one dimension; the trailing half only affects the
+/// output size, so it is never returned.
 inline int64_t resolve_leading_padding(
     int64_t input_size,
     int64_t kernel,
@@ -104,10 +105,7 @@ inline int64_t resolve_leading_padding(
     }
 }
 
-/// Compute the broadcast output shape for two tensors with numpy semantics.
-///
-/// Aligns shapes from the right; each dimension is the max of the two.
-/// A dimension of 1 broadcasts to the other size.
+/// NumPy broadcast: right-aligned, per-axis max, a 1 broadcasts to the other size.
 inline detail::SmallVector<int64_t, TensorDesc::kMaxRank> compute_broadcast_shape(
     std::span<const int64_t> shape_a,
     std::span<const int64_t> shape_b) noexcept
@@ -130,7 +128,7 @@ inline detail::SmallVector<int64_t, TensorDesc::kMaxRank> compute_broadcast_shap
         } else if (dim_b == 1) {
             result[static_cast<size_t>(rmax - 1 - i)] = dim_a;
         } else {
-            // Incompatible broadcast — default to dim_a (caller should validate)
+            // Incompatible broadcast: keep dim_a; the caller validates.
             result[static_cast<size_t>(rmax - 1 - i)] = dim_a;
         }
     }
@@ -141,13 +139,7 @@ inline detail::SmallVector<int64_t, TensorDesc::kMaxRank> compute_broadcast_shap
 // Per-operator shape inference functions
 // ============================================================
 
-/// Conv2D shape inference.
-/// inputs[0] = input  [N, IC, IH, IW]
-/// inputs[1] = weight [OC, IC/G, KH, KW] — or, for the channel-last weight
-///             (TensorLayout::HWIO, TensorFlow's filter order),
-///             [KH, KW, IC/G, OC]; @p weight_hwio selects the reading.
-/// inputs[2] = bias   [OC] (optional)
-/// Returns: [N, OC, OH, OW]
+/// Returns [N, OC, OH, OW]; `weight_hwio` selects the HWIO reading of the weight.
 inline std::vector<TensorDesc> conv2d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -158,8 +150,8 @@ inline std::vector<TensorDesc> conv2d_output_shape(
     std::span<const TensorDesc> inputs,
     bool weight_hwio = false)
 {
-    const auto& in = inputs[0];  // [N, IC, IH, IW]
-    const auto& wt = inputs[1];  // [OC, IC/G, KH, KW] or [KH, KW, IC/G, OC]
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
 
     TensorDesc out;
     out.rank   = 4;
@@ -167,8 +159,8 @@ inline std::vector<TensorDesc> conv2d_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(4);
-    out.dims[0] = in.dims[0];  // N
-    out.dims[1] = weight_hwio ? wt.dims[3] : wt.dims[0];  // OC
+    out.dims[0] = in.dims[0];
+    out.dims[1] = weight_hwio ? wt.dims[3] : wt.dims[0];
 
     out.dims[2] = compute_spatial_output_size(
         in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
@@ -178,11 +170,7 @@ inline std::vector<TensorDesc> conv2d_output_shape(
     return {out};
 }
 
-/// Conv3D shape inference.
-/// inputs[0] = input  [N, IC, ID, IH, IW]
-/// inputs[1] = weight [OC, IC/G, KD, KH, KW]
-/// inputs[2] = bias   [OC] (optional)
-/// Returns: [N, OC, OD, OH, OW]
+/// Returns [N, OC, OD, OH, OW] from an OIHW weight.
 inline std::vector<TensorDesc> conv3d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -192,8 +180,8 @@ inline std::vector<TensorDesc> conv3d_output_shape(
     int64_t groups,
     std::span<const TensorDesc> inputs)
 {
-    const auto& in = inputs[0];  // [N, IC, ID, IH, IW]
-    const auto& wt = inputs[1];  // [OC, IC/G, KD, KH, KW]
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
 
     TensorDesc out;
     out.rank   = 5;
@@ -201,8 +189,8 @@ inline std::vector<TensorDesc> conv3d_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(5);
-    out.dims[0] = in.dims[0];  // N
-    out.dims[1] = wt.dims[0];  // OC
+    out.dims[0] = in.dims[0];
+    out.dims[1] = wt.dims[0];
 
     out.dims[2] = compute_spatial_output_size(
         in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], auto_pad);
@@ -214,12 +202,7 @@ inline std::vector<TensorDesc> conv3d_output_shape(
     return {out};
 }
 
-/// TransposeConv2D shape inference.
-/// inputs[0] = input  [N, IC, IH, IW]
-/// inputs[1] = weight [IC, OC/G, KH, KW]
-/// inputs[2] = bias   [OC] (optional)
-/// Returns: [N, OC, OH, OW]
-/// Output formula: OH = (IH-1)*SH - 2*PH + DH*(KH-1) + output_padding_H + 1
+/// Returns [N, OC, OH, OW] with OC = weight.dims[1] * groups.
 inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -229,8 +212,8 @@ inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     int64_t groups,
     std::span<const TensorDesc> inputs)
 {
-    const auto& in = inputs[0];  // [N, IC, IH, IW]
-    const auto& wt = inputs[1];  // [IC, OC/G, KH, KW]
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
 
     TensorDesc out;
     out.rank   = 4;
@@ -238,11 +221,9 @@ inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(4);
-    out.dims[0] = in.dims[0];              // N
-    out.dims[1] = wt.dims[1] * groups;     // OC = (OC/G) * groups
+    out.dims[0] = in.dims[0];
+    out.dims[1] = wt.dims[1] * groups;
 
-    // Transpose conv output formula per spatial dimension:
-    //   O = (I - 1) * S - 2*P + D*(K - 1) + output_padding + 1
     auto compute_output = [](int64_t I, int64_t K, int64_t S,
                               int64_t D, int64_t P, int64_t OP) {
         return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
@@ -256,11 +237,7 @@ inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     return {out};
 }
 
-/// DepthwiseConv shape inference (2D / 3D auto-detected from input rank).
-/// inputs[0] = input  [N, C, (D,) H, W]
-/// inputs[1] = weight [C, 1, (KD,) KH, KW]
-/// inputs[2] = bias   [C] (optional)
-/// Returns: [N, C, (OD,) OH, OW]
+/// Returns [N, C, ...spatial]; rank 4 is 2D, rank 5 is 3D.
 inline std::vector<TensorDesc> depthwise_conv_output_shape(
     std::span<const int64_t> kernel_size,
     std::span<const int64_t> stride,
@@ -271,7 +248,7 @@ inline std::vector<TensorDesc> depthwise_conv_output_shape(
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
-    const int64_t srank = rank - 2;  // spatial rank: 2 or 3
+    const int64_t srank = rank - 2;
 
     TensorDesc out;
     out.rank   = rank;
@@ -279,11 +256,9 @@ inline std::vector<TensorDesc> depthwise_conv_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(static_cast<size_t>(rank));
-    out.dims[0] = in.dims[0];  // N
-    out.dims[1] = in.dims[1];  // C (same as input channels)
+    out.dims[0] = in.dims[0];
+    out.dims[1] = in.dims[1];
 
-    // Spatial dimensions start at index 2
-    // kernel_size/stride/dilation/padding are [KD, KH, KW]; for 2D, skip KD
     const int64_t k_offset = (srank == 2) ? 1 : 0;
 
     for (int64_t d = 0; d < srank; ++d) {
@@ -301,20 +276,18 @@ inline std::vector<TensorDesc> depthwise_conv_output_shape(
     return {out};
 }
 
-/// Pooling shape inference (2D / 3D auto-detected from input rank).
-/// inputs[0] = input [N, C, (D,) H, W]
-/// Returns: [N, C, (OD,) OH, OW]
+/// Returns [N, C, ...spatial]; rank 4 is 2D, rank 5 is 3D.
 inline std::vector<TensorDesc> pooling_output_shape(
-    std::span<const int64_t> kernel_shape,  // [KD, KH, KW]
-    std::span<const int64_t> stride,        // [SD, SH, SW]
-    std::span<const int64_t> dilation,      // [DD, DH, DW]
-    std::span<const int64_t> padding,       // [PD, PH, PW]
+    std::span<const int64_t> kernel_shape,
+    std::span<const int64_t> stride,
+    std::span<const int64_t> dilation,
+    std::span<const int64_t> padding,
     int auto_pad,
     std::span<const TensorDesc> inputs)
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
-    const int64_t srank = rank - 2;  // spatial rank: 2 or 3
+    const int64_t srank = rank - 2;
 
     TensorDesc out;
     out.rank   = rank;
@@ -322,11 +295,10 @@ inline std::vector<TensorDesc> pooling_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(static_cast<size_t>(rank));
-    out.dims[0] = in.dims[0];  // N
-    out.dims[1] = in.dims[1];  // C
+    out.dims[0] = in.dims[0];
+    out.dims[1] = in.dims[1];
 
-    // Spatial dimensions start at index 2
-    const int64_t k_offset = (srank == 2) ? 1 : 0;  // shift kernel/stride/pad index for 2D
+    const int64_t k_offset = (srank == 2) ? 1 : 0;
 
     for (int64_t d = 0; d < srank; ++d) {
         const int64_t in_dim   = in.dims[static_cast<size_t>(2 + d)];
@@ -343,16 +315,12 @@ inline std::vector<TensorDesc> pooling_output_shape(
     return {out};
 }
 
-/// Linear shape inference.
-/// inputs[0] = input  [M, K] (or [*, K] — batch dims broadcast)
-/// inputs[1] = weight [N, K]
-/// inputs[2] = bias   [N] (optional)
-/// Returns: [M, N] (with batch dims from input)
+/// [..., K] x [N, K] -> [..., N].
 inline std::vector<TensorDesc> linear_output_shape(
     std::span<const TensorDesc> inputs)
 {
-    const auto& in = inputs[0];   // [..., K]
-    const auto& wt = inputs[1];   // [N, K]
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
 
     TensorDesc out;
     out.layout = in.layout;
@@ -363,13 +331,11 @@ inline std::vector<TensorDesc> linear_output_shape(
     const int64_t N = wt.dims[0];
 
     if (in_rank == 2) {
-        // Simple 2D: [M, K] × [N, K]^T → [M, N]
         out.rank = 2;
         out.dims.resize(2);
-        out.dims[0] = in.dims[0];  // M
+        out.dims[0] = in.dims[0];
         out.dims[1] = N;
     } else {
-        // Higher-dimensional input: batch dims preserved, last dim becomes N
         out.rank = in_rank;
         out.dims.resize(static_cast<size_t>(in_rank));
         for (int64_t i = 0; i < in_rank - 1; ++i) {
@@ -381,10 +347,7 @@ inline std::vector<TensorDesc> linear_output_shape(
     return {out};
 }
 
-/// MatMul shape inference.
-/// A: [..., M, K] (transpose_a: [..., K, M])
-/// B: [..., K, N] (transpose_b: [..., N, K])
-/// Returns: [..., M, N] with broadcast batch dims
+/// [..., M, K] x [..., K, N] -> [..., M, N], batch dims broadcast.
 inline std::vector<TensorDesc> matmul_output_shape(
     bool transpose_a,
     bool transpose_b,
@@ -400,13 +363,9 @@ inline std::vector<TensorDesc> matmul_output_shape(
     const int64_t ra = a.rank;
     const int64_t rb = b.rank;
 
-    // Extract M, K_a from A
     const int64_t K_a = a.dims[static_cast<size_t>(ra - 1)];  // K (or M if transpose_a)
     const int64_t M   = transpose_a ? K_a : a.dims[static_cast<size_t>(ra - 2)];
 
-    // Extract K_b, N from B. A prepacked B (MatMul::prepackWeights) leads with
-    // N whatever its source order, and carries no K — the blob is addressed
-    // from K, not shaped by it (see TensorLayout::PackedB).
     const bool packed_b = is_packed_matmul_b(b.layout);
     const int64_t K_b = packed_b ? K_a
         : transpose_b ? b.dims[static_cast<size_t>(rb - 1)] : b.dims[static_cast<size_t>(rb - 2)];
@@ -415,7 +374,6 @@ inline std::vector<TensorDesc> matmul_output_shape(
 
     (void)K_a; (void)K_b; // Validation done by caller
 
-    // Broadcast batch dimensions
     std::span<const int64_t> batch_a(a.dims.data(), static_cast<size_t>(ra - 2));
     std::span<const int64_t> batch_b(b.dims.data(), static_cast<size_t>(rb - 2));
 
@@ -433,11 +391,7 @@ inline std::vector<TensorDesc> matmul_output_shape(
     return {out};
 }
 
-/// Attention shape inference.
-/// Q: [B, H, Sq, D] or [B, Sq, H*D]
-/// K: [B, H, Sk, D] or [B, Sk, H*D]
-/// V: [B, H, Sk, D] or [B, Sk, H*D]
-/// Returns: same shape as Q
+/// Output matches Q.
 inline std::vector<TensorDesc> attention_output_shape(
     std::span<const TensorDesc> inputs)
 {
@@ -447,14 +401,13 @@ inline std::vector<TensorDesc> attention_output_shape(
     out.rank   = q.rank;
     out.layout = q.layout;
     out.dtype  = q.dtype;
-    out.dims   = q.dims;  // Output shape == Q shape
+    out.dims   = q.dims;
 
     return {out};
 }
 
-/// Element-wise (activation, eltwise, unary, softmax, cumsum, batchnorm,
-/// layernorm, rmsnorm) shape inference — output matches input[0].
-/// These operators all preserve the input shape.
+/// Shape-preserving ops (activation, eltwise, unary, softmax, cumsum, clamp,
+/// rope, norm).
 inline std::vector<TensorDesc> identity_output_shape(
     std::span<const TensorDesc> inputs)
 {
@@ -469,9 +422,7 @@ inline std::vector<TensorDesc> identity_output_shape(
     return {out};
 }
 
-/// LayoutConvert shape inference.
-/// Output has the same logical shape and dtype as input;
-/// only the layout field changes to target_layout.
+/// Same dims and dtype; only `layout` becomes target_layout.
 inline std::vector<TensorDesc> layout_convert_output_shape(
     std::span<const TensorDesc> inputs,
     TensorLayout target_layout)
@@ -487,8 +438,7 @@ inline std::vector<TensorDesc> layout_convert_output_shape(
     return {out};
 }
 
-/// Reduce shape inference.
-/// Axis removed (or kept as size-1 if keepdims).
+/// One axis reduced, dropped or kept as 1.
 inline std::vector<TensorDesc> reduce_output_shape(
     int64_t axis,
     bool keepdims,
@@ -523,17 +473,14 @@ inline std::vector<TensorDesc> reduce_output_shape(
     return {out};
 }
 
-/// Resize shape inference (2D / 3D auto-detected from input rank).
-/// inputs[0] = input [N, C, (D,) H, W]
-/// Returns: [N, C, (OD,) OH, OW]
-/// output_size has 3 elements [OD, OH, OW]; for 2D (rank=4), only [OH, OW] are used.
+/// Spatial dims come from output_size [OD, OH, OW]; a 2D input skips OD.
 inline std::vector<TensorDesc> resize_output_shape(
     std::span<const int64_t> output_size,
     std::span<const TensorDesc> inputs)
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
-    const int64_t srank = rank - 2;  // spatial rank: 2 or 3
+    const int64_t srank = rank - 2;
 
     TensorDesc out;
     out.rank   = rank;
@@ -541,10 +488,9 @@ inline std::vector<TensorDesc> resize_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(static_cast<size_t>(rank));
-    out.dims[0] = in.dims[0];  // N
-    out.dims[1] = in.dims[1];  // C
+    out.dims[0] = in.dims[0];
+    out.dims[1] = in.dims[1];
 
-    // output_size is [OD, OH, OW]; for 2D, skip the first element
     const int64_t os_offset = (srank == 2) ? 1 : 0;
     for (int64_t d = 0; d < srank; ++d) {
         out.dims[static_cast<size_t>(2 + d)] = output_size[static_cast<size_t>(os_offset + d)];
@@ -553,17 +499,14 @@ inline std::vector<TensorDesc> resize_output_shape(
     return {out};
 }
 
-/// GridSample shape inference (2D / 3D auto-detected from input rank).
-/// inputs[0] = input  [N, C, (D,) H, W]
-/// inputs[1] = grid   [N, (OD,) OH, OW, 2|3]
-/// Returns: [N, C, (OD,) OH, OW]
+/// Spatial dims come from grid [N, (OD,) OH, OW, 2|3].
 inline std::vector<TensorDesc> grid_sample_output_shape(
     std::span<const TensorDesc> inputs)
 {
-    const auto& in = inputs[0];    // [N, C, (D,) H, W]
-    const auto& grid = inputs[1];  // [N, (D_out,) H_out, W_out, 2|3]
+    const auto& in = inputs[0];
+    const auto& grid = inputs[1];
     const int64_t irank = in.rank;
-    const int64_t srank = irank - 2;  // spatial rank: 2 or 3
+    const int64_t srank = irank - 2;
 
     TensorDesc out;
     out.rank   = irank;
@@ -571,12 +514,9 @@ inline std::vector<TensorDesc> grid_sample_output_shape(
     out.dtype  = in.dtype;
 
     out.dims.resize(static_cast<size_t>(irank));
-    out.dims[0] = in.dims[0];  // N
-    out.dims[1] = in.dims[1];  // C
+    out.dims[0] = in.dims[0];
+    out.dims[1] = in.dims[1];
 
-    // Grid spatial dims: grid rank = srank + 2 (N + spatial + coordinate)
-    // For 2D: grid = [N, OH, OW, 2], spatial dims at indices 1,2
-    // For 3D: grid = [N, OD, OH, OW, 3], spatial dims at indices 1,2,3
     for (int64_t d = 0; d < srank; ++d) {
         out.dims[static_cast<size_t>(2 + d)] =
             grid.dims[static_cast<size_t>(1 + d)];
@@ -585,9 +525,7 @@ inline std::vector<TensorDesc> grid_sample_output_shape(
     return {out};
 }
 
-/// QuantizeLinear shape inference.
-/// inputs[0] = x (f32/f16), inputs[1] = scale (f32), inputs[2] = zero_point (s8/u8)
-/// Returns: same shape as x, dtype = attrs.output_dtype (s8 or u8)
+/// Shape of x, dtype output_dtype.
 inline std::vector<TensorDesc> quantize_linear_output_shape(
     std::span<const TensorDesc> inputs,
     DataType output_dtype = DataType::s8)
@@ -597,15 +535,13 @@ inline std::vector<TensorDesc> quantize_linear_output_shape(
     TensorDesc out;
     out.rank   = x.rank;
     out.layout = x.layout;
-    out.dtype  = output_dtype;  // s8 or u8, from attributes
+    out.dtype  = output_dtype;
     out.dims   = x.dims;
 
     return {out};
 }
 
-/// DequantizeLinear shape inference.
-/// inputs[0] = x (s8/u8), inputs[1] = scale (f32), inputs[2] = zero_point (s8/u8)
-/// Returns: same shape as x, dtype = f32 (or attr.output_dtype if available)
+/// Shape of x, dtype output_dtype.
 inline std::vector<TensorDesc> dequantize_linear_output_shape(
     std::span<const TensorDesc> inputs,
     DataType output_dtype = DataType::f32)
@@ -615,16 +551,13 @@ inline std::vector<TensorDesc> dequantize_linear_output_shape(
     TensorDesc out;
     out.rank   = x.rank;
     out.layout = x.layout;
-    out.dtype  = output_dtype;  // f32 or f16
+    out.dtype  = output_dtype;
     out.dims   = x.dims;
 
     return {out};
 }
 
-/// Concat shape inference.
-/// Concatenates N tensors along the specified axis.
-/// All inputs must have the same rank, dtype, and layout.
-/// All dimensions except axis must match.
+/// Sums the axis dim across inputs; all inputs share rank, dtype and layout.
 inline std::vector<TensorDesc> concat_output_shape(
     int64_t axis,
     std::span<const TensorDesc> inputs)
@@ -633,7 +566,6 @@ inline std::vector<TensorDesc> concat_output_shape(
     const int64_t rank = in0.rank;
     const int64_t ax = resolve_axis(axis, rank);
 
-    // Sum the axis dimension across all inputs
     int64_t axis_sum = 0;
     for (const auto& in : inputs) {
         axis_sum += in.dims[static_cast<size_t>(ax)];
@@ -652,8 +584,7 @@ inline std::vector<TensorDesc> concat_output_shape(
     return {out};
 }
 
-/// ArgMax / ArgMin shape inference.
-/// Reduces along an axis and outputs int64 indices.
+/// One axis reduced to int64 indices.
 inline std::vector<TensorDesc> argminmax_output_shape(
     int64_t axis,
     bool keepdims,
@@ -688,10 +619,7 @@ inline std::vector<TensorDesc> argminmax_output_shape(
     return {out};
 }
 
-/// TopK shape inference.
-/// Replaces the axis dimension with k. Returns two outputs: values and indices.
-/// values: same dtype as input, axis dim replaced by k.
-/// indices: int64, same shape as values.
+/// Two outputs: values (input dtype) and indices (s64), axis dim = k.
 inline std::vector<TensorDesc> topk_output_shape(
     int64_t axis,
     int64_t k,
@@ -701,7 +629,6 @@ inline std::vector<TensorDesc> topk_output_shape(
     const int64_t rank = in.rank;
     const int64_t ax = resolve_axis(axis, rank);
 
-    // Values output: same dtype, axis dim replaced by k
     TensorDesc values;
     values.rank   = rank;
     values.layout = in.layout;
@@ -712,28 +639,22 @@ inline std::vector<TensorDesc> topk_output_shape(
             (i == ax) ? k : in.dims[static_cast<size_t>(i)];
     }
 
-    // Indices output: int64, same shape as values
     TensorDesc indices = values;
     indices.dtype = DataType::s64;
 
     return {values, indices};
 }
 
-/// Embed shape inference.
-/// inputs[0] = weight  [vocab_size, dim]  (f32, f16, or int8)
-/// inputs[1] = indices [*] int64
-/// When weight is int8, output is f32 (dequantized result).
-/// Returns: [*indices_shape..., dim]
+/// [indices..., weight dims[1:]]; an s8/u8 weight yields f32.
 inline std::vector<TensorDesc> embed_output_shape(
     std::span<const TensorDesc> inputs)
 {
-    const auto& weight  = inputs[0];  // [V, D] or [V, ...]
-    const auto& indices = inputs[1];  // [*] int64
+    const auto& weight  = inputs[0];
+    const auto& indices = inputs[1];
 
     TensorDesc out;
     out.layout = weight.layout;
 
-    // When weight is quantized (int8), output is dequantized float32
     if (weight.dtype == DataType::s8 || weight.dtype == DataType::u8) {
         out.dtype = DataType::f32;
     }
@@ -741,7 +662,7 @@ inline std::vector<TensorDesc> embed_output_shape(
         out.dtype = weight.dtype;
     }
 
-    const int64_t w_extra = weight.rank - 1;  // embedding dim(s)
+    const int64_t w_extra = weight.rank - 1;
     out.rank = indices.rank + w_extra;
     out.dims.resize(static_cast<size_t>(out.rank));
 
@@ -752,15 +673,11 @@ inline std::vector<TensorDesc> embed_output_shape(
     for (int64_t i = 0; i < w_extra; ++i) {
         out.dims[static_cast<size_t>(indices.rank + i)] =
             weight.dims[static_cast<size_t>(1 + i)];
-
     }
     return {out};
 }
 
-/// Permute shape inference.
-/// inputs[0] = input [*]
-/// Returns: permuted shape according to perm order.
-/// perm[i] specifies which input dimension maps to output dimension i.
+/// dims[i] = input.dims[perm[i]].
 inline std::vector<TensorDesc> permute_output_shape(
     std::span<const int64_t> perm,
     std::span<const TensorDesc> inputs)
@@ -782,10 +699,7 @@ inline std::vector<TensorDesc> permute_output_shape(
     return {out};
 }
 
-/// Slice shape inference.
-/// inputs[0] = input [*]
-/// For each axis in @p axes, the output dim is derived from
-/// starts/ends/steps. Axes not listed are kept in full.
+/// Slices the listed axes; an unlisted axis passes through in full.
 inline std::vector<TensorDesc> slice_output_shape(
     std::span<const int64_t> starts,
     std::span<const int64_t> ends,
@@ -796,7 +710,6 @@ inline std::vector<TensorDesc> slice_output_shape(
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
 
-    // Default: copy all dims from input
     TensorDesc out;
     out.layout = in.layout;
     out.dtype  = in.dtype;
@@ -806,7 +719,6 @@ inline std::vector<TensorDesc> slice_output_shape(
         out.dims[static_cast<size_t>(i)] = in.dims[static_cast<size_t>(i)];
     }
 
-    // Apply slicing for each specified axis
     for (size_t a = 0; a < axes.size(); ++a) {
         int64_t ax = axes[a];
         if (ax < 0) {
@@ -817,7 +729,7 @@ inline std::vector<TensorDesc> slice_output_shape(
         int64_t e = ends[a];
         int64_t step = (a < steps.size()) ? steps[a] : int64_t(1);
 
-        // Clamp to valid range (ONNX-style: negative values wrap)
+        // ONNX-style: negative starts/ends wrap before clamping.
         if (s < 0) {
             s += dim;
         }
@@ -834,11 +746,7 @@ inline std::vector<TensorDesc> slice_output_shape(
     return {out};
 }
 
-/// MoE shape inference.
-/// inputs[0] = input [num_tokens, hidden_size] (or any rank whose trailing dim
-///             is the hidden size); the expert weights carry the expert axis.
-/// Returns: same shape, dtype and layout as inputs[0] — MoE is shape-preserving.
-/// Only inputs[0] is read, so this is safe to call with a partial input span.
+/// Shape-preserving; reads only inputs[0], so a partial input span is fine.
 inline std::vector<TensorDesc> moe_output_shape(
     std::span<const TensorDesc> inputs)
 {

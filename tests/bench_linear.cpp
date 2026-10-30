@@ -3,27 +3,24 @@
 ///
 /// Linear is the MatMul GEMM with W stored [N,K], an optional per-column bias
 /// and an fp output for quantized operands; it drives the MatMul kernel instead
-/// of reimplementing it. Every section therefore pairs it against the
-/// MatMul(transpose_b) call it stands for, alternated round by round inside one
-/// process — on this host a run of one operator drifts a few percent against
-/// the next, which is the same order as the gaps being measured (bench_matmul
-/// says the same thing at length).
+/// of reimplementing it. The pairing sections alternate it with the
+/// MatMul(transpose_b) call it stands for, round by round inside one process —
+/// on this host a run of one operator drifts a few percent against the next, the
+/// same order as the gaps being measured (bench_matmul says the same at length).
 ///
 /// Sections:
-///   linear_fp_vs_matmul   f32 Linear against MatMul(tb) at identical operands.
-///                         Without a bias or a residual the two are the same
-///                         call, so the ratio is the cost of the Linear layer
-///                         itself — it should sit at 1.00.
-///   linear_bias_epilogue  what bias, the fused activation and add_to add to
-///                         that, i.e. the deferred output pass Linear pays
-///                         whenever the GEMM cannot own the write-back.
-///   linear_f16            the same pairing in f16.
-///   linear_int8           u8s8 / s8s8 -> f32 / f16, the dequant route, with
-///                         realistic per-token X and per-channel W parameters.
-///   linear_int8_int_out   the same operands with an integral destination
-///                         (s32 / s8 / u8) and its int32 bias, against the f32
-///                         dequantizing row.
-///   linear_threads        block-granularity scaling of the plain f32 call.
+///   linear_fp_vs_matmul      f32 Linear against MatMul(tb), no bias: the ratio
+///                            is the cost of the Linear layer itself, ~1.00.
+///   linear_bias_epilogue     what bias, the fused activation and add_to add —
+///                            the deferred output pass Linear pays when the GEMM
+///                            cannot own the write-back.
+///   linear_prepacked_weight  a weight packed once at load against packed per call.
+///   linear_f16_vs_matmul     the same pairing in f16.
+///   linear_int8              u8s8 / s8s8 -> f32 / f16 dequant, per-token X and
+///                            per-channel W.
+///   linear_int8_int_out      the same operands with an s32 / s8 / u8 destination
+///                            and its int32 bias, against the f32 dequantizing row.
+///   linear_threads           block-granularity scaling of the plain f32 call.
 ///
 /// The decode rows (M=1) are the ones that matter for the operator's real use:
 /// a transformer inference step is one token against a [N,K] weight, and that is
@@ -56,10 +53,7 @@ namespace {
 
 using SteadyClock = std::chrono::high_resolution_clock;
 
-// The bench's CpuBackend: an OpenMP thread team when the build has one (and
-// NNOPS_BENCH_OMP does not opt out), else a pool that spawns per call. Both sit
-// behind the same hooks, so a table differs only in its scheduler —
-// see common/cpu_pool.hpp.
+// OpenMP when the build has it and NNOPS_BENCH_OMP allows, else spawn-per-call.
 struct BenchPool {
     explicit BenchPool(int nthreads) : nthreads_(nthreads) {
         if (nnops::test::bench_use_openmp()) {
@@ -120,10 +114,9 @@ double median(std::vector<double> v) {
     return v.empty() ? 0.0 : v[v.size() / 2];
 }
 
-/// Drop the pooled scratch before a cell so it starts from the same allocator
-/// state as every other cell. Without this, sections later in the process ran
-/// their decode rows up to 3x slower than the same row in isolation — the
-/// pool's free lists are warm with a different mix of sizes by then.
+/// Drop the pooled scratch before a cell so every cell starts from the same
+/// allocator state; without it, later sections ran their decode rows up to 3x
+/// slower than the same row in isolation, their free lists warm with other sizes.
 void fresh_state() {
     nnops::release_scratch_memory();
 }
@@ -139,15 +132,11 @@ std::vector<int> thread_ladder() {
 
 /// Iterate @p fn until @p target_ms of wall clock has elapsed; return GFLOPS.
 ///
-/// A budget rather than a fixed count: a 1x4096x4096 decode row and a 1024^3
-/// row then each stay on the machine for the same time, which is what makes
-/// rows of one table comparable on a host that drifts under load.
-///
-/// The floor of kMinIters matters as much as the budget. One call of a decode
-/// row is tens of milliseconds, so a 100 ms budget alone would time 2-3 calls —
-/// and whatever the first call pays (cold scratch, a fresh mapping, a host
-/// hiccup) is then a third of the measurement, which has been observed to read
-/// as a 3x error on this host. Eight calls bound that to ~12%.
+/// A budget, not a fixed count, keeps a decode row and a 1024^3 row on the
+/// machine equally long, which is what makes rows of one table comparable on a
+/// host that drifts under load. The kMinIters floor matters as much: at 2-3
+/// calls the first one's cold scratch has read as a 3x error on this host;
+/// eight calls bound it to ~12%.
 template <typename F>
 double time_gflops(F&& fn, double flops, double target_ms) {
     constexpr int64_t kMaxIters = 200000;
@@ -173,9 +162,8 @@ double gemm_flops(const Shape& s) {
 
 // ---- fp problems -----------------------------------------------------------
 
-/// One fp problem: A [M,K], W [N,K], an optional bias [N], C [M,N]. Holds both
-/// the Linear op and the MatMul(transpose_b) call it stands for so a section can
-/// alternate them over identical operands.
+/// A [M,K], W [N,K], optional bias [N], C [M,N], plus the Linear op and the
+/// MatMul(transpose_b) call it stands for.
 template <typename T>
 struct FpProblem {
     std::vector<T> a_buf, w_buf, bias_buf, out_buf;
@@ -261,12 +249,10 @@ void bench_fp_vs_matmul(const char* tag, const std::vector<Shape>& shapes,
 
 // ---- quantized problems ----------------------------------------------------
 
-/// One u8|s8 x s8 problem with the parameters an LLM checkpoint carries: X
-/// per-token (scale per row, zero point per row), W per-channel (scale and zero
-/// point per output channel). `out_dt` selects the output pass: f32/f16
-/// dequantize the int32 accumulate, s32 keeps it (a bias-only pass), s8/u8
-/// requantize it with the output's QuantParams. An integer destination takes its
-/// bias as int32, an fp one in the output dtype.
+/// A u8|s8 x s8 problem with an LLM checkpoint's parameters: X per token, W per
+/// channel. `out_dt` selects the output pass: f32/f16 dequantize, s32 keeps the
+/// int32 accumulate, s8/u8 requantize with the output's QuantParams. An integer
+/// destination takes its bias as int32.
 template <typename OutT>
 struct QuantProblem {
     std::vector<int8_t> a_buf, w_buf;   // byte storage; X's dtype decides s8/u8
@@ -385,8 +371,8 @@ struct QuantProblem {
     }
 };
 
-/// One int8 row: Linear against the MatMul call it stands for, at identical
-/// operands and identical output dtype.
+/// One int8 row: Linear against the MatMul call it stands for, same operands
+/// and output dtype.
 template <typename OutT>
 void bench_quant_row(const Shape& s, DataType a_dt, DataType out_dt, int nt,
                      double target_ms, int rounds, bool with_bias = false) {
@@ -442,10 +428,10 @@ NNOPS_BENCH(linear_bias_epilogue) {
         bool bias;
         bool add_to;
     };
-    // Ordered by what the GEMM can own: with no bias and no residual the
-    // epilogue is fused into the output tile (zero extra passes); a bias costs
-    // one pass over C; add_to with an identity epilogue rides MatMul's beta
-    // (still free); the last two need the M×N temporary and a combine pass.
+    // Ordered by what the GEMM can own: no bias and no residual fuse into the
+    // output tile; a bias costs one pass over C; add_to with an identity
+    // epilogue rides MatMul's beta, and add_to with any other epilogue needs an
+    // M×N temporary and a combine pass.
     const Variant variants[] = {
         {"plain",               EpilogueActivateType::None, false, false},
         {"relu (fused)",        EpilogueActivateType::Relu, false, false},
@@ -490,9 +476,8 @@ NNOPS_BENCH(linear_bias_epilogue) {
 // The prepacked weight — what prepackWeights() takes out of the call
 // ============================================================
 //
-// Each call packs W into the GEMM's uniform panels before the first k-block; a
-// weight packed once at load time is read in place instead. The rows are the
-// same Linear against the same numbers, so the ratio is exactly the pack.
+// Each call packs W into the GEMM's uniform panels; a weight packed once at load
+// is read in place instead. Same Linear, same numbers, so the ratio is the pack.
 
 template <typename T>
 void bench_prepack_vs_raw(const char* tag, const std::vector<Shape>& shapes,
@@ -507,8 +492,7 @@ void bench_prepack_vs_raw(const char* tag, const std::vector<Shape>& shapes,
     std::printf("\n");
 
     for (const Shape& s : shapes) {
-        // Two identical problems (same seed): one keeps the raw weight, the
-        // other is handed the blob. Distinct buffers, the same numbers.
+        // Same seed, distinct buffers: one keeps the raw weight, the other gets the blob.
         FpProblem<T> raw(s, LinearAttributes{}, /*with_bias=*/false);
         FpProblem<T> pk(s, LinearAttributes{}, /*with_bias=*/false);
 
@@ -519,7 +503,7 @@ void bench_prepack_vs_raw(const char* tag, const std::vector<Shape>& shapes,
         TensorView q[] = {query};
         op->prepackWeights(win, q);
         // 64-byte aligned like every buffer the pool hands out: a packed panel
-        // that starts 16 bytes into a line splits half its vector loads.
+        // starting 16 bytes into a line splits half its vector loads.
         std::vector<std::byte> hold(
             static_cast<size_t>(q[0].desc().numel()) * sizeof(T) + 64);
         const size_t mis = reinterpret_cast<uintptr_t>(hold.data()) % 64;
@@ -552,12 +536,10 @@ void bench_prepack_vs_raw(const char* tag, const std::vector<Shape>& shapes,
 NNOPS_BENCH(linear_prepacked_weight) {
     // P/R below 1 is not a defect in the blob: at a large M the per-call pack
     // is a pass over B that leaves the panels it just wrote in L2, so the GEMM
-    // that follows reads them from L2 while the blob arm re-reads them from
-    // L3. The loss tracks that working set — 512^2 panels (1 MB) tie, 1024^2
-    // (4 MB) lose 11%, 2048^2 (16 MB) lose 13% — and it needs a large M to
-    // show, because that is the only regime where one pack pass is cheaper
-    // than the GEMM's own B reads. Alignment is not the cause (a 64-byte
-    // aligned blob measures the same as the 16-byte one).
+    // reads them from L2 while the blob arm re-reads them from L3. The loss
+    // tracks that working set — 512^2 (1 MB) ties, 1024^2 (4 MB) loses 11%,
+    // 2048^2 (16 MB) loses 13% — and needs a large M to show. Alignment is not
+    // the cause: a 64-byte aligned blob measures the same as a 16-byte one.
     const std::vector<Shape> shapes{
         {1, 4096, 4096},     // decode: the per-call pack reads a 64 MB weight
         {8, 4096, 4096},     // small speculative batch
@@ -621,12 +603,11 @@ NNOPS_BENCH(linear_int8) {
 // Quantized operands with an integer destination — s32 / s8 / u8
 // ============================================================
 //
-// The output dtype decides which pass ends the call. s32 writes the compensated
-// accumulate with the int32 bias added (the reductions stay off when the zero
-// points are symmetric); s8/u8 requantize with the output's QuantParams, so the
-// reduction sweep has to run and the per-element walk does the round-and-clamp.
-// f32 is kept as the dequantizing baseline. Every row carries a bias, since that
-// is the input the integer routes exist to fuse.
+// The output dtype decides the closing pass: s32 adds the int32 bias to the
+// compensated accumulate (the reductions stay off when the zero points are
+// symmetric); s8/u8 requantize with the output's QuantParams, so the reduction
+// sweep runs and the per-element walk does the round-and-clamp. f32 is the
+// dequantizing baseline; every row carries a bias, the input these routes fuse.
 
 NNOPS_BENCH(linear_int8_int_out) {
     const std::vector<Shape> shapes{
@@ -660,9 +641,9 @@ NNOPS_BENCH(linear_int8_int_out) {
 // ============================================================
 
 NNOPS_BENCH(linear_threads) {
-    // The GEMM parallelises over (batch, n-block) or (batch, m-block); at M=1
-    // the only axis left is N, so the decode rows below scale with the number
-    // of column blocks and stop when the weight stream saturates.
+    // The GEMM splits over (batch, n-block) or (batch, m-block); at M=1 the only
+    // axis left is N, so decode rows scale with the column-block count and stop
+    // when the weight stream saturates.
     const std::vector<Shape> shapes{
         {1, 4096, 4096},
         {8, 4096, 4096},

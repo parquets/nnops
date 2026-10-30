@@ -1,18 +1,16 @@
 /// @file reduce.cpp
 /// @brief SIMD-optimized CPU implementation of the Reduce operator.
 ///
-/// Supports f32 and f16. Supports planar (NCHW/NCDHW) and packed (NCHWC8/NCDHWC8)
-/// layouts.
+/// f32 and f16; planar (NCHW/NCDHW) and channel-packed (NCHWC8/NCDHWC8)
+/// layouts. Pitch-aware via stride_elems() / row_stride_elems().
 ///
-/// Six dispatch paths:
-///   1.  Packed SIMD (axis == rank-1, pack > 1): delegates to kernel::reduce_process_packed_row.
-///   1b. Packed channel SIMD (axis == 1, pack > 1, NCHWC8): delegates to kernel::reduce_process_packed_channel.
-///   1c. Packed column SIMD (pack > 1, general axis): delegates to kernel::reduce_process_packed_col.
-///   2.  Contiguous tail (axis == rank-1, pack == 1): delegates to kernel::reduce_process_contiguous_row.
-///   3.  Inner-contiguous general axis: delegates to kernel::reduce_process_inner_contiguous_block.
-///   4.  General scalar (non-contiguous inner dims or packed layout).
-///
-/// Pitch-aware via stride_elems() / row_stride_elems().
+/// Dispatch, in order:
+///   1.  axis==rank-1, pack>1   -> kernel::reduce_process_packed_row
+///   1b. axis==1,      pack>1   -> kernel::reduce_process_packed_channel
+///   1c. other axis,   pack>1   -> kernel::reduce_process_packed_col
+///   2.  axis==rank-1, pack==1  -> kernel::reduce_process_contiguous_row
+///   3.  inner-contiguous, pack==1 -> kernel::reduce_process_inner_contiguous_block
+///   4.  general                   -> scalar strided walk over (outer x inner)
 
 #include "nnops/ops/reduce.hpp"
 #include "nnops/detail/assert.hpp"
@@ -116,12 +114,11 @@ void reduce_inner_contiguous_simd(const ReduceAttributes& attrs,
 
         int64_t inner = 0;
 
-        // SIMD inner blocks
         kernel::reduce_process_inner_contiguous_block<T>(
             x_base, y_base, 0, num_inner, reduce_size, axis_stride,
             attrs.type, inv_reduce);
 
-        // Scalar tail for inner elements
+        // Scalar tail past the SIMD body.
         for (inner = (num_inner / L) * L; inner < num_inner; ++inner) {
             switch (attrs.type) {
             case ReduceType::Sum:
@@ -244,20 +241,17 @@ void reduce_impl(const ReduceAttributes& attrs,
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
 
-    // Normalize axis
     int64_t axis = attrs.axis;
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
     const int64_t pack = input.channel_pack_size();
 
-    // ---- Path 1: Packed SIMD (axis == rank-1, pack > 1) ----
     if (axis == rank - 1 && pack > 1) {
         reduce_packed_simd<T>(attrs, output, input, axis, ctx);
         return;
     }
 
-    // ---- Path 1b: Packed channel SIMD (axis == 1, pack > 1, NCHWC8) ----
     if (axis == 1 && pack > 1) {
         const int64_t C = input.shape(1);                // logical channel count
         const int64_t C8 = input.num_channel_blocks();   // ceil(C / pack)
@@ -268,7 +262,6 @@ void reduce_impl(const ReduceAttributes& attrs,
         const T* x_ptr = input.ptr<T>();
         T* y_ptr = output.ptr<T>();
 
-        // Count spatial positions: product of all dims except C8 (axis=1)
         int64_t num_spatial = 1;
         for (int64_t d = 0; d < rank; ++d) {
             if (d != 1) {
@@ -280,9 +273,7 @@ void reduce_impl(const ReduceAttributes& attrs,
         const bool keepdims = attrs.keepdims;
 
         const auto process_pos = [&](int64_t s) {
-            // Input offset: decompose flat index → element offset (skip C dim)
             const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/1);
-            // Output offset: same decomposition on output tensor (skip C dim iff keepdims)
             const int64_t out_off = decompose_flat_offset(s, output, 0, rank_out - 1,
                                                           keepdims ? 1 : -1);
             kernel::reduce_process_packed_channel<T>(
@@ -295,7 +286,6 @@ void reduce_impl(const ReduceAttributes& attrs,
         return;
     }
 
-    // ---- Path 1c: Packed column SIMD (pack > 1, general non-channel axis) ----
     if (pack > 1) {
         const int64_t D = input.shape(axis);
         const int64_t axis_stride = input.stride_elems(axis);
@@ -304,7 +294,6 @@ void reduce_impl(const ReduceAttributes& attrs,
         const T* x_ptr = input.ptr<T>();
         T* y_ptr = output.ptr<T>();
 
-        // Count (outer, inner) positions excluding the reduce axis
         int64_t num_positions = 1;
         for (int64_t d = 0; d < rank; ++d) {
             if (d != axis) {
@@ -316,9 +305,7 @@ void reduce_impl(const ReduceAttributes& attrs,
         const bool keepdims = attrs.keepdims;
 
         const auto process_pos = [&](int64_t s) {
-            // Input offset at first row along reduce axis (skip the reduce axis)
             const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/axis);
-            // Output offset (skip the reduce axis iff keepdims)
             const int64_t out_off = decompose_flat_offset(s, output, 0, rank_out - 1,
                                                           keepdims ? axis : -1);
             kernel::reduce_process_packed_col<T>(
@@ -331,13 +318,11 @@ void reduce_impl(const ReduceAttributes& attrs,
         return;
     }
 
-    // ---- Path 2: Contiguous tail (axis == rank-1, pack == 1) ----
     if (axis == rank - 1) {
         reduce_contiguous_simd<T>(attrs, output, input, axis, ctx);
         return;
     }
 
-    // Compute dimensions for general axis
     int64_t num_outer = 1;
     for (int64_t d = 0; d < axis; ++d) { num_outer *= input.shape(d); }
 
@@ -346,7 +331,6 @@ void reduce_impl(const ReduceAttributes& attrs,
     int64_t num_inner = 1;
     for (int64_t d = axis + 1; d < rank; ++d) { num_inner *= input.shape(d); }
 
-    // ---- Path 3: Inner-contiguous SIMD (pack == 1, contiguous inner) ----
     const bool input_inner_contiguous = (pack == 1) &&
         (input.stride_elems(axis) == num_inner);
     const bool output_inner_contiguous = (output.rank() <= 1) ||
@@ -358,7 +342,6 @@ void reduce_impl(const ReduceAttributes& attrs,
         return;
     }
 
-    // ---- Path 4: General scalar ----
     reduce_general_scalar<T>(attrs, output, input, axis,
                               num_outer, reduce_size, num_inner, ctx);
 }

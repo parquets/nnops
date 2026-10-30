@@ -1,21 +1,47 @@
 #pragma once
 /// @file mma_f32.hpp
-/// @brief x86_64 AVX2/FMA float32 MMA (matrix micro-accumulate) kernels.
+/// @brief x86_64 AVX2/FMA float32 mrxncxkc MMA (matrix micro-accumulate)
+///        kernels.
 ///
-/// A and B may both be packed (`mma_packed_ab_*`) or only B packed while A is
-/// read row-major (`mma_packed_b_*`). Tile sizes: M: {6, 4, 2, 1}, N: {16, 8, 1}.
+/// One call covers one M panel through the whole N side of one kc-deep block:
+/// C[mr][nc] += A[mr][kc] x B[kc][nc], each result clamped to
+/// [clamp_min, clamp_max] on the way out. One kernel per MR level: 6, 4, 2, 1.
+/// All take the runtime panel height `mr`; NR is 16 -- two YMM halves.
 ///
-/// Packed B is uniform: ceil(nc / 16) panels, every one a full 16 columns wide
-/// with the columns past `nc` zero-filled, each in a
-/// mma_pack_align(16*kc*sizeof(float))-byte slot (16*kc floats). That lets the
-/// kernel read 16 floats per k at every column, so a tail wider than 8 costs
-/// one k-loop instead of two.
+/// Two operand routes:
+///   - `mma_packed_ab_*` takes a packed A: MR row slots per k, so `a_ptr += MR`
+///     walks k.
+///   - `mma_packed_b_*` reads A row-major through `lda`.
+/// B is always packed: ceil(nc / 16) uniform panels, every one a full 16
+/// columns wide with the columns past `nc` zero-filled, each in a
+/// mma_pack_align(16*kc*sizeof(float))-byte slot (16*kc floats). The uniform
+/// width is what lets the kernel read 16 floats per k at every column, so a
+/// tail wider than 8 costs one k-loop instead of two.
+///
+/// Partial-M: rows past `mr` alias the last live row in both A and C -- they
+/// compute a duplicate and store it back to the same place, so a short panel
+/// needs no per-row guards (the XNNPACK 6x16 broadcast convention). The A
+/// packers duplicate the same way, so the packed layout is MR slots per k
+/// whatever `mr` is.
+///
+/// N tail: a full 16 columns never reaches it, so the remaining 1..15 sit in
+/// one panel. All 16 are read when rem > 8; otherwise only the low 8 lanes
+/// are. Below 8 the ladder is 4 / 2 / 1 on one accumulator -- lane j is
+/// column j, so the high half is simply the next four columns, and the 2-wide
+/// step keeps its untouched lanes for the 1-wide step, the clamp being applied
+/// at each store width.
+///
+/// `zero_mode`: false accumulates into C (read-modify-write), true overwrites.
+/// `seed` (direct route only) sets the accumulator's initial value: 0 zero, 1 a
+/// per-row bias (planar -- a row is an output channel), 2 a per-column bias
+/// (channel-last -- rows are pixels, so the bias lands on the panel's 16 lanes;
+/// two loads per panel where seeding the tile first costs a full write and
+/// read-back of the output).
 
 #include <array>
 #include <immintrin.h>
 #include <algorithm>
 #include "backend/cpu/common/common_utils.hpp"
-
 
 namespace nnops::backend::cpu::x86_64 {
 
@@ -25,10 +51,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max) noexcept {
-
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK 6x16 broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -145,11 +167,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         __m256 v_acc0x01234567 = _mm256_setzero_ps();
         __m256 v_acc0x89abcdef = v_acc0x01234567;
         __m256 v_acc1x01234567 = _mm256_setzero_ps();
@@ -254,9 +271,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
             __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
             __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
@@ -307,8 +321,6 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
                 const __m128 v_rest1 = v_acc1x0123;
                 const __m128 v_rest2 = v_acc2x0123;
@@ -394,10 +406,6 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max) noexcept {
-
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK 6x16 broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -485,11 +493,6 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         __m256 v_acc0x01234567 = _mm256_setzero_ps();
         __m256 v_acc0x89abcdef = v_acc0x01234567;
         __m256 v_acc1x01234567 = _mm256_setzero_ps();
@@ -571,9 +574,6 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
             __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
             __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
@@ -612,8 +612,6 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
                 const __m128 v_rest1 = v_acc1x0123;
                 const __m128 v_rest2 = v_acc2x0123;
@@ -679,10 +677,6 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max) noexcept {
-
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
 
     float* c0_ptr = C;
@@ -741,11 +735,6 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         __m256 v_acc0x01234567 = _mm256_setzero_ps();
         __m256 v_acc0x89abcdef = v_acc0x01234567;
         __m256 v_acc1x01234567 = _mm256_setzero_ps();
@@ -806,9 +795,6 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
             __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
 
@@ -835,8 +821,6 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
                 const __m128 v_rest1 = v_acc1x0123;
 
@@ -929,11 +913,6 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         __m256 v_acc0x01234567 = _mm256_setzero_ps();
         __m256 v_acc0x89abcdef = v_acc0x01234567;
 
@@ -981,9 +960,6 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
 
             const __m128 v_min = _mm_set1_ps(clamp_min);
@@ -1004,8 +980,6 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
 
                 if constexpr (!zero_mode) {
@@ -1042,10 +1016,6 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK 6x16 broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -1063,13 +1033,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
-    // first costs a full write and read-back of the output. `off` is the lane
-    // offset inside the panel. A row past `mr` aliases the last live row in A
-    // and C, so the same alias index keeps the row seed in range.
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
         else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
@@ -1181,11 +1145,6 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
         const float* a2_ptr = A + r2 * lda;
@@ -1298,9 +1257,6 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
             __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
             __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
@@ -1351,8 +1307,6 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
                 const __m128 v_rest1 = v_acc1x0123;
                 const __m128 v_rest2 = v_acc2x0123;
@@ -1439,10 +1393,6 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK 6x16 broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -1456,13 +1406,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
-    // first costs a full write and read-back of the output. `off` is the lane
-    // offset inside the panel. A row past `mr` aliases the last live row in A
-    // and C, so the same alias index keeps the row seed in range.
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
         else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
@@ -1547,11 +1491,6 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
         const float* a2_ptr = A + r2 * lda;
@@ -1637,9 +1576,6 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
             __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
             __m128 v_acc2x0123 = _mm256_castps256_ps128(v_acc2x01234567);
@@ -1678,8 +1614,6 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
                 const __m128 v_rest1 = v_acc1x0123;
                 const __m128 v_rest2 = v_acc2x0123;
@@ -1746,10 +1680,6 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     const float* NNOPS_RESTRICT B,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-
-    // Rows past `mr` alias the last live row in both A and C: they compute a
-    // duplicate of it and store it back to the same place, so a partial-M tile
-    // needs no per-row guards (the XNNPACK broadcast convention).
     const int r1 = (mr > 1) ? 1 : 0;
 
     float* c0_ptr = C;
@@ -1759,13 +1689,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
-    // first costs a full write and read-back of the output. `off` is the lane
-    // offset inside the panel. A row past `mr` aliases the last live row in A
-    // and C, so the same alias index keeps the row seed in range.
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
         else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
@@ -1823,11 +1747,6 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
         __m256 v_acc0x01234567 = init(0, 0);
@@ -1886,9 +1805,6 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
             __m128 v_acc1x0123 = _mm256_castps256_ps128(v_acc1x01234567);
 
@@ -1915,8 +1831,6 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
                 const __m128 v_rest1 = v_acc1x0123;
 
@@ -1974,13 +1888,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 
     int n = 0;
 
-    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
-    // where a row is an output channel; seed 2 is a per-column one, which is the
-    // channel-last route's shape: the rows are pixels and the bias lands on the
-    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
-    // first costs a full write and read-back of the output. `off` is the lane
-    // offset inside the panel. A row past `mr` aliases the last live row in A
-    // and C, so the same alias index keeps the row seed in range.
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
     const auto init = [&](int r, int off) {
         if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
         else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
@@ -2025,11 +1933,6 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        // The tail is one full 16-wide panel in the packed layout -- the
-        // packer zero-fills the columns past `nc`, so both halves can always
-        // be read at the same 16-element stride. At most 8 columns still fit
-        // one 8-lane read; a wider tail reads both halves and reuses the
-        // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
         __m256 v_acc0x01234567 = init(0, 0);
         __m256 v_acc0x89abcdef = init(0, 8);
@@ -2075,9 +1978,6 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
         }
 
         if (rem > 0) {
-            // Lane j holds column j, so the 4/2/1 ladder is just a lo/hi split of
-            // the same accumulator: after the 4-wide step the leftover 1..3 columns
-            // sit at lane 0 of the high half.
             __m128 v_acc0x0123 = _mm256_castps256_ps128(v_acc0x01234567);
 
             const __m128 v_min = _mm_set1_ps(clamp_min);
@@ -2098,8 +1998,6 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
             }
 
             if (rem & 2) {
-                // The clamp below is 4-wide, so keep the untouched leftovers for
-                // the 1-wide step -- lanes 2,3 are what it will store.
                 const __m128 v_rest0 = v_acc0x0123;
 
                 if constexpr (!zero_mode) {
@@ -2131,7 +2029,8 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 // Rows are the MR levels {6,4,1}; every kernel takes the runtime panel height,
-// so a remainder panel below its own MR runs through the level above it.
+// so a remainder panel below its own MR runs through the level above it. The
+// mr2 kernels stay out of these tables; only the tests and bench call them.
 template <bool Z>
 inline constexpr auto mma_pack_fns_f32 = std::array{
     &mma_packed_ab_mr6_nr16_mrxncxkc_f32<Z>,

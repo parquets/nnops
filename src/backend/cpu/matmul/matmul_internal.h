@@ -12,12 +12,12 @@
 ///                                GEMM_FAST_PATH_THRESHOLD MACs, and the direct
 ///                                GEMV at M <= GEMV_M_MAX;
 ///   - matmul_qblock_fused.cpp  — the x86-only fused Q4_1 decode route
-///                                (M <= 16).
+///                                (M <= 16 trans, 8 copy).
 ///
-/// They stay out of the driver because neither packs, blocks, splits or touches
-/// the routes: each sweeps the product in one pass. What they do share with the
-/// driver is here — the product's dims, the epilogue predicates, and the batch
-/// walk that maps a flat batch index to per-operand element offsets.
+/// Neither packs, blocks nor splits: each sweeps the product in one pass and
+/// never touches the routes. What they do share with the driver is here — the
+/// product's dims, the epilogue predicates, and the batch walk that maps a flat
+/// batch index to per-operand element offsets.
 
 #include "matmul_helper.h"                 // MatMulPlan geometry, block sizes
 #include "nnops/core/compute_context.hpp"
@@ -54,8 +54,8 @@ struct MatMulDims { int64_t M, N, K; };
 
 inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
                               const TensorView& a, const TensorView& b) noexcept {
-    // A packed RHS (see matmul_helper.h) leads with N and has no K of its own —
-    // the blob is addressed from K, not shaped by it — so K comes from A.
+    // A packed RHS (see matmul_helper.h) leads with N and carries no K of its
+    // own — the blob is addressed from K, not shaped by it — so K comes from A.
     const int64_t k_a = attrs.transpose_a ? a.shape(a.rank() - 2)
                                           : a.shape(a.rank() - 1);
     if (is_packed_matmul_b(b.layout())) {
@@ -67,16 +67,13 @@ inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
              attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };
 }
 
-/// A block-packed B (q4_1) for a batch element. BatchWalk's offsets and
-/// the row pitch already count in blocks, so only the block size turns a
-/// block offset into bytes.
+/// A block-packed B (q4_1) at a per-batch offset already counted in blocks.
 inline const uint8_t* block_rhs_at(const uint8_t* base, int64_t block_off,
                                    DataType dt) noexcept {
     return base + block_off * static_cast<int64_t>(data_type_stride_unit(dt));
 }
 
-/// Broadcast batch dims (as matmul_ref) and map a flat index to per-operand
-/// element offsets.
+/// Broadcast the batch dims and map a flat index to per-operand element offsets.
 struct BatchWalk {
     const TensorView* a;
     const TensorView* b;

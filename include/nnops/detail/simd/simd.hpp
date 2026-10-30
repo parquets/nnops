@@ -1,58 +1,25 @@
 #pragma once
 /// @file simd.hpp
-/// @brief Main entry point for the nnops SIMD abstraction layer.
+/// @brief Entry point for the nnops SIMD abstraction layer.
 ///
-/// Provides type-safe wrappers around x86 SSE/AVX2 and ARM NEON intrinsics,
-/// inspired by OpenCV's Universal Intrinsics (intrin.hpp) and onnxruntime's MLAS.
+/// Type-safe wrappers around x86 SSE/AVX2 and ARM NEON intrinsics, in the
+/// spirit of OpenCV's Universal Intrinsics and onnxruntime's MLAS. Include
+/// this file to get every vector type plus the generic helpers below.
 ///
-/// ## Architecture
+/// Layout:
+///   vec_f32x4.hpp  128-bit f32 (SSE / NEON / scalar)
+///   vec_f32x8.hpp  256-bit f32 (AVX2 / NEON-emulated / scalar)
+///   vec_f16x8.hpp  128-bit f16 (NEON FP16 / x86 F16C / scalar)
+///   vec_s8x16.hpp  128-bit s8  (SSE / NEON / scalar)
+///   vec_u8x16.hpp  128-bit u8  (SSE / NEON / scalar)
+///   arch/{scalar, x86/sse, x86/avx2, arm/neon}.hpp   backend implementations
+///   cpu_features.hpp  runtime CpuFeatures detection
 ///
-///   simd.hpp  (this file)
-///   ├── cpu_features.hpp   — runtime CPU detection (CpuFeatures singleton)
-///   ├── vec_f32x4.hpp      — 128-bit float32 vector (SSE / NEON / scalar)
-///   ├── vec_f32x8.hpp      — 256-bit float32 vector (AVX2 / emulated / scalar)
-///   ├── vec_f16x8.hpp      — 128-bit float16 vector (NEON FP16 / x86 F16C / scalar)
-///   ├── vec_s8x16.hpp      — 128-bit int8 vector (SSE / NEON / scalar)
-///   ├── vec_u8x16.hpp      — 128-bit uint8 vector (SSE / NEON / scalar)
-///   └── arch/
-///       ├── scalar.hpp     — scalar C++ fallback (f32 + f16 + int8)
-///       ├── x86/
-///       │   ├── sse.hpp    — SSE4.1 backend
-///       │   └── avx2.hpp   — AVX2+FMA backend
-///       └── arm/
-///           └── neon.hpp   — ARM NEON backend (f32 + f16 + int8)
-///
-/// ## Usage
-///
-/// ```cpp
-/// #include "nnops/detail/simd/simd.hpp"
-/// using namespace nnops::simd;
-///
-/// // Compile-time optimal (SSE or NEON depending on target):
-/// void relu_128(const float* in, float* out, int64_t n) {
-///     v_f32x4 zero = v_zero_f32x4();
-///     for (int64_t i = 0; i + 4 <= n; i += 4) {
-///         v_f32x4 v = v_load_f32x4(in + i);
-///         v_store(out + i, v_max(v, zero));
-///     }
-/// }
-///
-/// // Runtime-dispatch for AVX2 (compile with /arch:AVX2):
-/// if (cpu_has_avx2()) {
-///     v_f32x8 zero = v_zero_f32x8();
-///     for (int64_t i = 0; i + 8 <= n; i += 8) {
-///         v_f32x8 v = v_load_f32x8(in + i);
-///         v_store(out + i, v_max(v, zero));
-///     }
-/// }
-/// ```
-///
-/// Reference pattern from OpenCV (modules/core/include/opencv2/core/hal/intrin.hpp):
-///   - v_float32x4, v_float32x8: platform-abstracted vector structs
-///   - v_load, v_store, v_add, v_mul, v_fma: platform-abstracted operations
-/// Reference pattern from onnxruntime (mlas/lib/mlasi.h):
-///   - MLAS_FLOAT32X4, MLAS_INT32X4: cross-platform type aliases
-///   - platform.cpp: runtime dispatch cascade (SSE→AVX→AVX2→AVX512)
+/// The generic helpers are overloaded on the element pointer type so kernel
+/// code stays type-generic: float* → v_f32x8, half* → v_f16x8, int8_t* →
+/// v_s8x16, uint8_t* → v_u8x16. v_store is the backends' overload set plus a
+/// half* overload here that reinterprets to uint16_t*; s_load / s_store are the
+/// scalar fp16↔fp32 counterparts.
 
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/simd/vec_f32x4.hpp"
@@ -73,18 +40,13 @@ inline constexpr int simd_lane_f16x8 = 8;
 inline constexpr int simd_lane_i8x16 = 16;
 inline constexpr int simd_lane_u8x16 = 16;
 
-/// @brief Recommended default SIMD lane count for f32 kernels.
-/// On every hardware SIMD backend this is 8: AVX2 is a native __m256,
-/// NEON emulates it with two float32x4_t.
+/// @brief Default f32 lane count (8): AVX2 native, NEON as two float32x4_t.
 inline constexpr int simd_default_lane_f32 = 8;
 
-/// @brief Recommended default SIMD lane count for f16 kernels.
-/// On x86 F16C+AVX2 this is 8 (cvt→compute→cvt); on ARM NEON native fp16
-/// (float16x8_t) this is 8.
+/// @brief Default f16 lane count (8): x86 F16C cvt→compute→cvt, NEON native float16x8_t.
 inline constexpr int simd_default_lane_f16 = 8;
 
-/// @brief Compile-time SIMD lane count for a given data type T.
-/// Usage: simd_lane_for<T> — yields 8 for both float and half on all backends.
+/// @brief Lane count for element type T (8 for both float and half).
 template <typename T>
 inline constexpr int simd_lane_for = std::is_same_v<T, float>
     ? simd_default_lane_f32
@@ -92,35 +54,13 @@ inline constexpr int simd_lane_for = std::is_same_v<T, float>
 } // namespace simd
 } // namespace nnops
 
-// ============================================================
-// Generic load / store / broadcast / zero helpers
-//
-// Overloaded on pointer type so kernel code is type-generic:
-//   float*   → v_f32x8   (v_load_f32x8 / v_store / v_set1_f32x8 / v_zero_f32x8)
-//   half*    → v_f16x8   (v_load_f16x8 / v_store / v_set1_f16x8 / v_zero_f16x8)
-//   int8_t*  → v_s8x16   (v_load_s8x16 / v_store / v_set1_s8x16 / v_zero_s8x16)
-//   uint8_t* → v_u8x16   (v_load_u8x16 / v_store / v_set1_u8x16 / v_zero_u8x16)
-//
-// v_store is overloaded by each backend for all pointer types;
-// we add a half* overload that reinterpret_cast's to uint16_t* internally.
-// s_load / s_store handle scalar access with fp16↔fp32 conversion.
-//
-// Usage:
-//   using namespace nnops::simd;
-//   auto vacc = v_set1(ptr, init_val);
-//   auto vin  = v_load(ptr);
-//   auto vz   = v_zero(ptr);
-//   float s   = s_load(ptr);
-//   s_store(ptr, s);
-//   v_store(ptr, vacc);
-// ============================================================
+// ---- Generic load / store / broadcast / zero helpers ----
 
 namespace nnops {
 namespace simd {
 
 using ::nnops::backend::cpu::half;
 
-// Generic vector load
 inline v_f32x8 v_load(const float* p) { return v_load_f32x8(p); }
 inline v_f16x8 v_load(const half* p) {
     return v_load_f16x8(reinterpret_cast<const uint16_t*>(p));
@@ -128,13 +68,13 @@ inline v_f16x8 v_load(const half* p) {
 inline v_s8x16 v_load(const int8_t* p) { return v_load_s8x16(p); }
 inline v_u8x16 v_load(const uint8_t* p) { return v_load_u8x16(p); }
 
-// Generic vector broadcast (first arg for overload resolution)
+// Generic broadcast (the first pointer arg only selects the overload)
 inline v_f32x8 v_set1(const float*, float s) { return v_set1_f32x8(s); }
 inline v_f16x8 v_set1(const half*, float s) { return v_set1_f16x8(s); }
 inline v_s8x16 v_set1(const int8_t*, int8_t s) { return v_set1_s8x16(s); }
 inline v_u8x16 v_set1(const uint8_t*, uint8_t s) { return v_set1_u8x16(s); }
 
-// Generic zero vector (first arg for overload resolution)
+// Generic zero (same overload-selection trick)
 inline v_f32x8 v_zero(const float*) { return v_zero_f32x8(); }
 inline v_f16x8 v_zero(const half*) { return v_zero_f16x8(); }
 inline v_s8x16 v_zero(const int8_t*) { return v_zero_s8x16(); }
@@ -157,12 +97,7 @@ inline void s_store(half* p, float v) {
     *p = ::nnops::backend::cpu::float_to_half(v);
 }
 
-// ============================================================
-// Store-with-accumulate helpers — SIMD/scalar equivalents of
-// *ptr += val, combining load+add+store into one call.
-// Eliminates the v_add(v_load(ptr), val) / v_store(ptr, ...) if/else
-// boilerplate at each call site.
-// ============================================================
+// ---- Store-with-accumulate helpers (*ptr += val) ----
 template <typename Ptr, typename Vec>
 inline void v_store_add(Ptr ptr, const Vec& val, bool add_to) {
     if (add_to) {
@@ -180,34 +115,12 @@ inline void s_store_add(Ptr ptr, float val, bool add_to) {
     }
 }
 
-// ============================================================
-// v_pow — composed from existing SIMD primitives:
-//   pow(a, b) = exp(b * log(a))
-// Works for all vector types (v_f32x4, v_f32x8, v_f16x8) and
-// all backends — no arch-specific intrinsics needed.
-// ============================================================
-
 template <typename V>
 inline V v_pow(V a, V b) {
     return v_exp(v_mul(b, v_log(a)));
 }
 
-// ============================================================
-// Deinterleave (stride-2 gather) — generic overloads
-//
-// Three API styles (方案 A / B / C), type-dispatched on pointer type:
-//   float* → v_f32x8 / v_f32x8x2_t
-//   half*  → v_f16x8 / v_f16x8x2_t  (via uint16_t*)
-//
-// v_deinterleave loads 2×N elements and returns {even, odd}.
-// v_load_even / v_load_odd return a single vector with every other element.
-// v_load_stride2_even / v_load_stride2_odd are explicit-named aliases.
-// ============================================================
-
-// Pair types (v_f32x8x2_t, v_f16x8x2_t) are re-exported from the arch
-// namespaces via vec_f32x8.hpp / vec_f16x8.hpp using-declarations.
-
-// ---- 方案 A: v_deinterleave (full pair result) --------------------------
+// ---- Deinterleave (stride-2 gather); v_deinterleave returns {even, odd} ----
 
 inline v_f32x8x2_t v_deinterleave(const float* p) {
     return v_deinterleave_f32x8(p);
@@ -215,8 +128,6 @@ inline v_f32x8x2_t v_deinterleave(const float* p) {
 inline v_f16x8x2_t v_deinterleave(const half* p) {
     return v_deinterleave_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
-
-// ---- 方案 B: v_load_even / v_load_odd -----------------------------------
 
 inline v_f32x8 v_load_even(const float* p) {
     return v_load_even_f32x8(p);
@@ -231,8 +142,6 @@ inline v_f16x8 v_load_odd(const half* p) {
     return v_load_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
 
-// ---- 方案 C: v_load_stride2_even / v_load_stride2_odd -------------------
-
 inline v_f32x8 v_load_stride2_even(const float* p) {
     return v_load_stride2_even_f32x8(p);
 }
@@ -246,9 +155,7 @@ inline v_f16x8 v_load_stride2_odd(const half* p) {
     return v_load_stride2_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
 
-// ============================================================
-// int8 / uint8 → float32 conversion (8 lanes → v_f32x8)
-// ============================================================
+// ---- int8 / uint8 → f32 (8 lanes) ----
 
 #if defined(NNOPS_ARCH_X86_64)
 inline v_f32x8 v_cvt_s8_to_f32(const int8_t* p) {
@@ -306,15 +213,7 @@ inline v_f32x8 v_cvt_u8_to_f32(const uint8_t* p) {
 }
 #endif
 
-// ============================================================
-// f16 → float32 conversion, loading straight from memory
-// (8 lanes → v_f32x8)
-//
-// The pointer counterpart of the f16 layer's v_cvt_f16_to_f32, next to the
-// s8/u8 pair above so a kernel can widen a row without naming any vector type.
-// No arch dispatch here: the widen itself returns each build's own v_f32x8
-// (vec_f16x8.hpp), which is what makes this a load and a call.
-// ============================================================
+// ---- f16 → f32 load; returns this build's own v_f32x8 (vec_f16x8.hpp) ----
 
 inline v_f32x8 v_cvt_f16_to_f32(const half* p) {
     return v_cvt_f16_to_f32(v_load_f16x8(reinterpret_cast<const uint16_t*>(p)));

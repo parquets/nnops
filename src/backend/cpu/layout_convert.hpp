@@ -1,16 +1,14 @@
 #pragma once
 /// @file layout_convert.hpp
-/// @brief Layout conversion utilities — pack/unpack between NCHW and NCHWC8.
+/// @brief Internal NCHW↔NCHWC8 (2D) and NCDHW↔NCDHWC8 (3D) pack/unpack.
 ///
-/// Internal header — not part of the public API. Used by the operator
-/// dispatch layer (src/ops/) and the LayoutDispatch utility.
-///
-/// Unified implementation: 2D (NCHW↔NCHWC8) and 3D (NCDHW↔NCDHWC8)
-/// share a single kernel templated on direction. The only difference
-/// is num_spatial_rows (H for 2D, D*H for 3D).
-///
-/// All functions support f32 and f16, with optional parallel dispatch
-/// via ctx.cpu.run.
+/// Not part of the public API — used by the operator dispatch layer (src/ops/)
+/// and LayoutDispatch. 2D and 3D run the same pack and unpack kernels; only
+/// num_spatial_rows differs (H vs D*H). f32 and f16 go through an 8×8 SIMD
+/// transpose; s8/u8 go through a byte copy. A partial trailing C8 block is
+/// zero-padded on pack for the fp path, and padded with the source zero_point
+/// for s8/u8 so the extra lanes dequantize to nothing; unpack drops it. Every
+/// row is an independent task on ctx.cpu.run.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -22,13 +20,10 @@ namespace nnops {
 // 2D: NCHW <-> NCHWC8
 // ============================================================
 
-/// Pack NCHW → NCHWC8 (2D).
-/// src: dense NCHW [N, C, H, W].
-/// dst: pre-allocated NCHWC8 [N, ceil(C/8), H, W, 8].
+/// Dst must be pre-allocated as NCHWC8 [N, ceil(C/8), H, W, 8].
 void pack_nchw_to_nchwc8(const TensorView& src, TensorView& dst,
                           const ComputeContext& ctx = {});
 
-/// Unpack NCHWC8 → NCHW (2D).
 void unpack_nchwc8_to_nchw(const TensorView& src, TensorView& dst,
                             const ComputeContext& ctx = {});
 
@@ -36,14 +31,14 @@ void unpack_nchwc8_to_nchw(const TensorView& src, TensorView& dst,
 // 3D: NCDHW <-> NCDHWC8
 // ============================================================
 
-/// Pack NCDHW → NCDHWC8 (3D).
+/// Dst must be pre-allocated as NCDHWC8 [N, ceil(C/8), D, H, W, 8].
 void pack_ncdhw_to_ncdhwc8(const TensorView& src, TensorView& dst,
                             const ComputeContext& ctx = {});
 
-/// Unpack NCDHWC8 → NCDHW (3D).
 void unpack_ncdhwc8_to_ncdhw(const TensorView& src, TensorView& dst,
                               const ComputeContext& ctx = {});
 
+/// Bytes for an aligned NCHWC8 buffer of a logical NCHW desc.
 size_t nchwc8_storage_bytes(const TensorDesc& logical_desc,
                              int64_t alignment = 32);
 
