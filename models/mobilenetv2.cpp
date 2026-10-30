@@ -52,12 +52,13 @@ Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
 /// None the same path is conv -> BN only (the projection stages).
 Buf conv_bn(const ModelArtifact& m, const TensorView& x, const std::string& conv,
             const std::string& bn, nnops::EpilogueActivateType act,
-            int64_t kernel, int64_t stride, int64_t pad)
+            int64_t kernel, int64_t stride, int64_t pad,
+            const TensorView* residual = nullptr)
 {
     if (model::fuse_enabled()) {
         return model::conv2d_bn_act(x, m.at(conv + ".weight"),
                                     model::batch_norm_params(m, bn), act,
-                                    kernel, stride, pad);
+                                    kernel, stride, pad, 1, residual);
     }
     Buf y = model::conv2d(x, m.at(conv + ".weight"), kernel, stride, pad);
     y = norm(m, bn, y.view);
@@ -107,11 +108,15 @@ Buf inverted_residual(const ModelArtifact& m, const std::string& prefix,
 
     Buf y = dw_bn_relu6(m, *stage_in, dw, dw_bn, 3, stride, 1);
     // The projection has no activation after it, and that is still a fusion:
-    // the BN merges into the conv, so one pass instead of two.
+    // the BN merges into the conv, so one pass instead of two. The residual has
+    // no activation after it either, which is exactly what add_to wants: the
+    // projection accumulates straight into a buffer pre-filled with the block's
+    // input, and the separate add disappears.
     y = conv_bn(m, y.view, proj_conv, proj_bn,
-                nnops::EpilogueActivateType::None, 1, 1, 0);
+                nnops::EpilogueActivateType::None, 1, 1, 0,
+                residual ? &x : nullptr);
 
-    if (residual) { y = model::add(y.view, x); }
+    if (residual && !model::fuse_enabled()) { y = model::add(y.view, x); }
     return y;
 }
 

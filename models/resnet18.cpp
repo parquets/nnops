@@ -51,12 +51,13 @@ Buf norm(const ModelArtifact& m, const std::string& prefix, const TensorView& x)
 Buf conv_bn(const ModelArtifact& m, const TensorView& x,
             const std::string& conv, const std::string& bn,
             nnops::EpilogueActivateType act,
-            int64_t kernel, int64_t stride, int64_t pad)
+            int64_t kernel, int64_t stride, int64_t pad,
+            const TensorView* residual = nullptr)
 {
     if (model::fuse_enabled()) {
         return model::conv2d_bn_act(x, m.at(conv + ".weight"),
                                     model::batch_norm_params(m, bn), act,
-                                    kernel, stride, pad);
+                                    kernel, stride, pad, 1, residual);
     }
     Buf y = model::conv2d(x, m.at(conv + ".weight"), kernel, stride, pad);
     y = norm(m, bn, y.view);
@@ -74,17 +75,26 @@ Buf basic_block(const ModelArtifact& m, const std::string& prefix,
 {
     Buf y = conv_bn(m, x, prefix + ".conv1", prefix + ".bn1",
                     nnops::EpilogueActivateType::Relu, 3, stride, 1);
-    y = conv_bn(m, y.view, prefix + ".conv2", prefix + ".bn2",
-                nnops::EpilogueActivateType::None, 3, 1, 1);
 
-    // main = main + shortcut, then the block's own relu.
+    // The shortcut is conv+BN with no activation; it folds the same way.
+    Buf skip;
     if (downsample) {
-        // The shortcut is conv+BN with no activation; it folds the same way.
-        Buf skip = conv_bn(m, x, prefix + ".downsample.0", prefix + ".downsample.1",
-                           nnops::EpilogueActivateType::None, 1, stride, 0);
-        y = model::add(y.view, skip.view);
+        skip = conv_bn(m, x, prefix + ".downsample.0", prefix + ".downsample.1",
+                       nnops::EpilogueActivateType::None, 1, stride, 0);
+    }
+    const TensorView& res = downsample ? skip.view : x;
+
+    // main = relu(main + shortcut). `add_to` puts the residual in the output
+    // buffer the conv accumulates into, so the separate add pass goes away —
+    // but its epilogue runs *before* the residual (`output += act(conv)`), and
+    // this block needs the residual first, so the relu stays its own call.
+    if (model::fuse_enabled()) {
+        y = conv_bn(m, y.view, prefix + ".conv2", prefix + ".bn2",
+                    nnops::EpilogueActivateType::None, 3, 1, 1, &res);
     } else {
-        y = model::add(y.view, x);
+        y = conv_bn(m, y.view, prefix + ".conv2", prefix + ".bn2",
+                    nnops::EpilogueActivateType::None, 3, 1, 1);
+        y = model::add(y.view, res);
     }
     return model::relu(y.view);
 }

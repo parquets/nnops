@@ -87,9 +87,40 @@ inline nnops::ComputeContext& context()
     return ctx;
 }
 
-/// Run one operator and hand back its (single) output buffer.
+/// @p dst := @p src for two views of one logical tensor. Row by row, because a
+/// view's pitch is its own; this is the `add_to` contract's fill — the operator
+/// reads the output buffer's existing content as the residual.
+///
+/// Over the backend's rows: the copy it replaces (a separate add) was a parallel
+/// kernel, so a serial fill would hand the threads' share of one pass back —
+/// which at 20 threads is the whole saving. Below @c kSerialBytes a dispatch
+/// costs more than the bytes.
+inline void copy_like(TensorView& dst, const TensorView& src)
+{
+    constexpr int64_t kSerialBytes = 64 * 1024;
+    const int64_t rows  = src.total_rows();
+    const int64_t inner = (rows > 0) ? src.numel() / rows : 0;
+    const int64_t esz   = static_cast<int64_t>(nnops::data_type_size(src.data_type()));
+    uint8_t* d = dst.ptr<uint8_t>();
+    const uint8_t* s = src.ptr<uint8_t>();
+    const int64_t d_step = dst.row_stride_elems() * esz;
+    const int64_t s_step = src.row_stride_elems() * esz;
+    const auto copy_row = [&](int64_t r) {
+        std::memcpy(d + r * d_step, s + r * s_step, static_cast<size_t>(inner * esz));
+    };
+    if (src.numel() * esz < kSerialBytes) {
+        for (int64_t r = 0; r < rows; ++r) { copy_row(r); }
+        return;
+    }
+    context().cpu.run(0, rows, copy_row);
+}
+
+/// Run one operator and hand back its (single) output buffer. @p residual, when
+/// given, is the `add_to` seed: the output buffer starts as its value and the
+/// operator accumulates into it.
 template <class Op>
-Buf run(const char* what, Op& op, std::span<const TensorView> inputs)
+Buf run(const char* what, Op& op, std::span<const TensorView> inputs,
+        const TensorView* residual = nullptr)
 {
     ProfScope prof(what);
     std::vector<TensorDesc> in_desc;
@@ -98,6 +129,7 @@ Buf run(const char* what, Op& op, std::span<const TensorView> inputs)
 
     const auto out_desc = op.getOutputTensorDesc(in_desc);
     Buf out = alloc(out_desc[0]);
+    if (residual != nullptr) { copy_like(out.view, *residual); }   // add_to seed
 
     TensorView outputs[] = {out.view};
     require_ok(op.compute(outputs, inputs, context()), what);
@@ -238,21 +270,27 @@ inline const TensorView& winograd_weight(const TensorView& w,
 inline Buf conv2d_run(const TensorView& x, const TensorView& w,
                       const TensorView* b, const nnops::Conv2DAttributes& attrs,
                       const char* wino_row = "conv2d/wino",
-                      const char* gemm_row = "conv2d/im2col")
+                      const char* gemm_row = "conv2d/im2col",
+                      const TensorView* residual = nullptr)
 {
     // The layout of the activation picks the filter order: torch's OIHW for a
     // planar input, HWIO for a channel-last one. Both read the same numbers —
     // the copy is a load-time transform, cached per weight buffer.
     const TensorView wl =
         nnops::is_channel_last(x.layout()) ? hwio_weight(w) : w;
+    // A residual rides the conv instead of a separate add: the operator reads
+    // the output buffer's own content, so the caller fills it first and what
+    // disappears is one whole read-modify-write pass over the output.
+    nnops::Conv2DAttributes use = attrs;
+    if (residual != nullptr) { use.add_to = true; }
     const bool wino = nnops::winograd_applicable(
-        attrs, x.shape(1) / attrs.groups, x.shape(2), x.shape(3));
+        use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
     // The route is in the row name, so the profile can price the two against
     // each other just by reading the table. A fused caller renames the rows, so
     // a folded conv and a plain one do not share a line.
     ProfScope prof(wino ? wino_row : gemm_row);
-    auto op = nnops::Conv2D::create(attrs, Backend::CPU);
-    const TensorView u = wino ? winograd_weight(wl, attrs) : wl;
+    auto op = nnops::Conv2D::create(use, Backend::CPU);
+    const TensorView u = wino ? winograd_weight(wl, use) : wl;
 
     TensorDesc in_desc[3] = {x.desc(), wl.desc()};
     TensorView in[3] = {x, u};
@@ -262,6 +300,7 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
         in[n++] = *b;
     }
     Buf out = alloc(op->getOutputTensorDesc({in_desc, n})[0]);
+    if (residual != nullptr) { copy_like(out.view, *residual); }
     TensorView outputs[] = {out.view};
     require_ok(op->compute(outputs, {in, n}, context()), "conv2d");
     return out;
@@ -490,7 +529,8 @@ inline Buf conv2d_bn_act(const TensorView& x, const TensorView& w,
                          const BatchNormParams& bn,
                          nnops::EpilogueActivateType act,
                          int64_t kernel, int64_t stride, int64_t pad,
-                         int64_t groups = 1)
+                         int64_t groups = 1,
+                         const TensorView* residual = nullptr)
 {
     nnops::Conv2DAttributes attrs;
     attrs.kernel_size = {kernel, kernel};
@@ -500,7 +540,7 @@ inline Buf conv2d_bn_act(const TensorView& x, const TensorView& w,
     attrs.epilogue.type = act;
     const detail::Folded& f = detail::folded(w, bn);
     return conv2d_run(x, f.weight.view, &f.bias.view, attrs,
-                      "conv2d_fused/wino", "conv2d_fused/im2col");
+                      "conv2d_fused/wino", "conv2d_fused/im2col", residual);
 }
 
 /// Depthwise conv -> BatchNorm -> @p act in one call. The filter is [C, 1, KH,
@@ -508,17 +548,19 @@ inline Buf conv2d_bn_act(const TensorView& x, const TensorView& w,
 inline Buf depthwise_bn_act(const TensorView& x, const TensorView& w,
                             const BatchNormParams& bn,
                             nnops::EpilogueActivateType act,
-                            int64_t kernel, int64_t stride, int64_t pad)
+                            int64_t kernel, int64_t stride, int64_t pad,
+                            const TensorView* residual = nullptr)
 {
     nnops::DepthwiseConvAttributes attrs;
     attrs.kernel_size = {1, kernel, kernel};
     attrs.stride = {1, stride, stride};
     attrs.padding = {0, pad, pad};
     attrs.epilogue.type = act;
+    if (residual != nullptr) { attrs.add_to = true; }
     const detail::Folded& f = detail::folded(w, bn);
     auto op = nnops::DepthwiseConv::create(attrs, Backend::CPU);
     const TensorView in[] = {x, depthwise_weight(x, f.weight.view), f.bias.view};
-    return run("depthwise_fused", *op, in);
+    return run("depthwise_fused", *op, in, residual);
 }
 
 inline Buf add(const TensorView& a, const TensorView& b)
