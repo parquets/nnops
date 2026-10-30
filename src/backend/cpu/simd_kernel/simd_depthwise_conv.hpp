@@ -592,12 +592,257 @@ inline void dwconv_h1_quant(OutT* output, const InT* input, const float* wq,
 /// channel-last plane the second half of every line belongs to the next block,
 /// so a one-vector call leaves it for a later pass — two touches per line where
 /// the packed route has one.
+///
+/// **A 3x3 takes a specialised kernel at both widths** (2026-10-30):
+/// `dwconv_last3x3` below for one vector of channels and `dwconv_last3x3_16`
+/// for two. Both hoist the row table and drop the per-tap pointer arithmetic.
+/// The sixteen-channel one is what the driver asks for: an eight-channel block
+/// touches every 64-byte line twice, and a strided half-line sweep of a plane
+/// costs exactly what a full sweep of it costs (measured — a half-used-line read
+/// runs at the plane's full time), so the narrow route pays twice the memory for
+/// the same FMAs and no kernel-level win buys that back.
+
+/// True when the shape takes the register-hoisted 3x3 kernels below: one depth
+/// plane, a 3x3 filter, no dilation. The vertical stride is not a condition — a
+/// 2x2 stride reads `R·SH + KH - 1` distinct input rows instead of `R + 2` and
+/// is still one row table — but a vertical stride of 3 or more is not common
+/// enough to instantiate.
+inline bool dwconv_last3x3_ok(const DwConvParams& p)
+{
+    return p.KD == 1 && p.KH == 3 && p.KW == 3 && p.DH == 1 && p.DW == 1 &&
+           (p.SH == 1 || p.SH == 2);
+}
+
+/// One 8-channel vector of a 3x3 depthwise filter, R output rows per call, with
+/// the nine tap vectors held in registers for the whole width sweep.
+///
+/// This is what the generic kernel above cannot do. It walks the taps inside
+/// the column loop, so every column reloads all nine weight vectors, and
+/// re-derives the row pointer for each (kh, r) — nine weight loads and
+/// twelve pointer fetches per column on top of the thirty-six input loads. The
+/// taps are loop-invariant in `ow` and belong in registers; the reason they are
+/// not is the register file: nine taps plus four accumulators is thirteen of
+/// the sixteen ymm registers, and the sixteen-channel call wants eight
+/// accumulators, which would be twenty-six — `dwconv_last3x3_16` below is how
+/// that constraint is met, by reloading a tap per column and letting one load
+/// feed four rows and both halves.
+///
+/// So the width-one trade is channels for taps: one vector per call, taps
+/// hoisted. It costs a second walk over every cache line's other half, which is
+/// why the driver never asks for it on a 3x3 — the sixteen-channel kernel below
+/// is that route's answer, and this one is what a plane narrower than sixteen
+/// channels falls back to.
+///
+/// @p SH is the vertical stride, needed because it decides how many distinct
+/// input rows the group reads: output row r with filter row kh is input row
+/// `oh·SH + r·SH + kh - PH`, so the table is `R·SH + 2` entries and a tap's row
+/// is `row[r·SH + kh]` — compile-time indices, no arithmetic in the loop. The
+/// horizontal stride stays a runtime value: it costs one scalar product per
+/// column, which the loop below has slack for.
+template <int R, int SH, typename T>
+inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
+                           const T* bias_vec, const DwConvParams& p,
+                           const Epilogue& epilogue, bool add_to)
+{
+    using V = decltype(v_load(in_img));
+    const int64_t pix = p.pix_stride;
+    const int64_t wtap = p.w_tap_stride;
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+
+    const V vbias = bias_vec ? v_load(bias_vec) : v_zero(in_img);
+    V wt[9];
+    for (int t = 0; t < 9; ++t) { wt[t] = v_load(w_tap0 + t * wtap); }
+
+    // One row pointer per distinct input row of the group, biased by the left
+    // pad so a tap's address is `row + (ow·SW + kw)·pix`.
+    constexpr int64_t kRows = R * SH + 2;
+    const T* row[kRows];
+    bool all_rows = true;
+    for (int64_t i = 0; i < kRows; ++i) {
+        const int64_t ih = p.oh * SH + i - p.PH;
+        const bool ok = ih >= 0 && ih < p.IH;
+        row[i] = ok ? in_img + ih * p.in_row_stride - p.PW * pix : nullptr;
+        all_rows = all_rows && ok;
+    }
+
+    const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
+    const int64_t last_hi = p.IW - 1 + p.PW - 2 * p.DW;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
+    const int64_t off_ok_lo = p.PW;
+    const int64_t off_ok_hi = p.IW + p.PW;
+
+    for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
+        V acc[R];
+        for (int r = 0; r < R; ++r) { acc[r] = vbias; }
+
+        if (all_rows && ow >= ow_lo && ow <= ow_hi) {
+            const int64_t o = ow * p.SW * pix;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t at = o + kw * pix;
+                    for (int r = 0; r < R; ++r) {
+                        acc[r] = v_fmadd(v_load(row[r * SH + kh] + at),
+                                         wt[kh * 3 + kw], acc[r]);
+                    }
+                }
+            }
+        } else {
+            const int64_t ow_off = ow * p.SW;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t off = ow_off + kw;
+                    if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                    const int64_t at = off * pix;
+                    for (int r = 0; r < R; ++r) {
+                        if (row[r * SH + kh] == nullptr) { continue; }
+                        acc[r] = v_fmadd(v_load(row[r * SH + kh] + at),
+                                         wt[kh * 3 + kw], acc[r]);
+                    }
+                }
+            }
+        }
+
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) { continue; }
+            T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue,
+                                                                     out_rows, acc[r]),
+                        add_to);
+        }
+    }
+}
+
+/// The two-vector 3x3: sixteen channels, the same nine taps and the same row
+/// table, eight accumulators for a four-row group, and the weight vectors loaded
+/// per tap inside the column loop — there is no room to hoist them (eight
+/// accumulators plus eighteen tap vectors is twenty-six of sixteen registers),
+/// but one weight load then feeds four rows and both halves, so a tap costs ten
+/// loads for eight FMAs and the loop stays off the two-load-per-cycle floor.
+///
+/// This is the chunk width the memory system wants: a pixel's sixteen f32 are
+/// one 64-byte line, so one sweep of the block loop touches every line once.
+/// The eight-channel kernel above pays two sweeps for the same bytes.
+template <int R, int SH, typename T>
+inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
+                              const T* bias_vec, const DwConvParams& p,
+                              const Epilogue& epilogue, bool add_to)
+{
+    using V = decltype(v_load(in_img));
+    constexpr int64_t kL = kChannelLanes;
+    const int64_t pix = p.pix_stride;
+    const int64_t wtap = p.w_tap_stride;
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+
+    const V vbias[2] = {bias_vec ? v_load(bias_vec) : v_zero(in_img),
+                        bias_vec ? v_load(bias_vec + kL) : v_zero(in_img)};
+
+    constexpr int64_t kRows = R * SH + 2;
+    const T* row[kRows];
+    bool all_rows = true;
+    for (int64_t i = 0; i < kRows; ++i) {
+        const int64_t ih = p.oh * SH + i - p.PH;
+        const bool ok = ih >= 0 && ih < p.IH;
+        row[i] = ok ? in_img + ih * p.in_row_stride - p.PW * pix : nullptr;
+        all_rows = all_rows && ok;
+    }
+
+    const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
+    const int64_t last_hi = p.IW - 1 + p.PW - 2 * p.DW;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
+    const int64_t off_ok_lo = p.PW;
+    const int64_t off_ok_hi = p.IW + p.PW;
+
+    for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
+        V acc[R][2];
+        for (int r = 0; r < R; ++r) { acc[r][0] = vbias[0]; acc[r][1] = vbias[1]; }
+
+        if (all_rows && ow >= ow_lo && ow <= ow_hi) {
+            const int64_t o = ow * p.SW * pix;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t at = o + kw * pix;
+                    const T* wp = w_tap0 + (kh * 3 + kw) * wtap;
+                    const V w0 = v_load(wp);
+                    const V w1 = v_load(wp + kL);
+                    for (int r = 0; r < R; ++r) {
+                        const T* ip = row[r * SH + kh] + at;
+                        acc[r][0] = v_fmadd(v_load(ip), w0, acc[r][0]);
+                        acc[r][1] = v_fmadd(v_load(ip + kL), w1, acc[r][1]);
+                    }
+                }
+            }
+        } else {
+            const int64_t ow_off = ow * p.SW;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t off = ow_off + kw;
+                    if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                    const int64_t at = off * pix;
+                    const T* wp = w_tap0 + (kh * 3 + kw) * wtap;
+                    const V w0 = v_load(wp);
+                    const V w1 = v_load(wp + kL);
+                    for (int r = 0; r < R; ++r) {
+                        if (row[r * SH + kh] == nullptr) { continue; }
+                        const T* ip = row[r * SH + kh] + at;
+                        acc[r][0] = v_fmadd(v_load(ip), w0, acc[r][0]);
+                        acc[r][1] = v_fmadd(v_load(ip + kL), w1, acc[r][1]);
+                    }
+                }
+            }
+        }
+
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) { continue; }
+            T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(
+                                 epilogue, out_rows, acc[r][0]), add_to);
+            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(
+                                      epilogue, out_rows, acc[r][1]), add_to);
+        }
+    }
+}
+
+/// The 8-channel call: pick the kernel for the shape, then the vertical stride.
+template <int R, typename T>
+inline void dwconv_last8(T* out_rows, const T* in_img, const T* w_tap0,
+                         const T* bias_vec, const DwConvParams& p,
+                         const Epilogue& epilogue, bool add_to)
+{
+    if (dwconv_last3x3_ok(p)) {
+        if (p.SH == 1) {
+            dwconv_last3x3<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
+                                 add_to);
+        } else {
+            dwconv_last3x3<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
+                                 add_to);
+        }
+        return;
+    }
+    const FpSrc<T, true> src[1] = {FpSrc<T, true>{in_img, kChannelLanes}};
+    const FpDst<T, true> dst[1] = {FpDst<T, true>{out_rows, p.out_row_stride,
+                                                  add_to, p.pix_stride,
+                                                  kChannelLanes}};
+    const auto vb = bias_vec ? v_load(bias_vec) : v_zero(out_rows);
+    const decltype(vb) vbias[1] = {vb};
+    dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+}
+
 template <int R, typename T>
 inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
                         const T* bias_vec, const DwConvParams& p,
                         const Epilogue& epilogue, bool add_to, int64_t lanes)
 {
     if (lanes > kChannelLanes) {
+        if (lanes == 2 * kChannelLanes && dwconv_last3x3_ok(p)) {
+            if (p.SH == 1) {
+                dwconv_last3x3_16<R, 1>(out_rows, in_img, w_tap0, bias_vec, p,
+                                        epilogue, add_to);
+            } else {
+                dwconv_last3x3_16<R, 2>(out_rows, in_img, w_tap0, bias_vec, p,
+                                        epilogue, add_to);
+            }
+            return;
+        }
         const auto vb0 = bias_vec ? v_load(bias_vec) : v_zero(out_rows);
         const auto vb1 = bias_vec ? v_load(bias_vec + kChannelLanes) : v_zero(out_rows);
         const decltype(vb0) vbias[2] = {vb0, vb1};
@@ -615,10 +860,7 @@ inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
     const auto vb = bias_vec ? load_lanes(bias_vec, lanes) : v_zero(out_rows);
     const decltype(vb) vbias[1] = {vb};
     if (lanes == kChannelLanes) {
-        const FpSrc<T, true> src[1] = {FpSrc<T, true>{in_img, lanes}};
-        const FpDst<T, true> dst[1] = {
-            FpDst<T, true>{out_rows, p.out_row_stride, add_to, p.pix_stride, lanes}};
-        dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+        dwconv_last8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
     } else {
         const FpSrc<T, false> src[1] = {FpSrc<T, false>{in_img, lanes}};
         const FpDst<T, false> dst[1] = {

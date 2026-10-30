@@ -216,10 +216,6 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
 
     const int64_t N = input.shape(0);
     const int64_t C = input.shape(1);
-    // Sixteen channels a chunk, not eight: a pixel's 16 f32 are one 64-byte line,
-    // and a chunk that spans a whole line touches it once instead of leaving the
-    // other half for the next chunk to fetch again.
-    const int64_t nblocks = (C + 15) / 16;
 
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH = input.shape(srank);
@@ -248,6 +244,15 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     p.in_d_stride    = IH * p.in_row_stride;
     p.pix_stride     = C;   // a pixel holds all C channels, and so does a tap
     p.w_tap_stride   = C;   // the raw HWCM filter is [tap][C]
+
+    // Sixteen channels a chunk, always. A pixel's sixteen f32 are one 64-byte
+    // line, so a sweep of the block loop touches every line exactly once; an
+    // eight-channel chunk would touch each line twice for the same bytes, and a
+    // strided sweep costs what a full one costs (measured: half-line reads of a
+    // plane run at the plane's full time). The 3x3 kernel answers that by taking
+    // both halves of the pixel in one call.
+    constexpr int64_t chunk = 16;
+    const int64_t nblocks = (C + chunk - 1) / chunk;
 
     auto* out_ptr = output.ptr<T>();
     const auto* in_ptr = input.ptr<T>();
@@ -328,18 +333,24 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
         const int64_t blk0 = cc * blocks_per;
         const int64_t blk1 = std::min(blk0 + blocks_per, nblocks);
         for (int64_t blk = blk0; blk < blk1; ++blk) {
-            const int64_t c0 = blk * 16;
-            // A chunk of 16 channels is one call; a ragged tail of 9..15 has no
-            // single policy shape, so it runs as an 8-lane call and its remainder.
+            const int64_t c0 = blk * chunk;
+            // One call per block, at the block's own width — full blocks are
+            // `chunk` wide, only the plane's last one is short. That is what the
+            // two-vector 3x3 kernel is for; handing it the whole remaining
+            // channel count instead (`C - c0`) silently sends every full block
+            // down the generic two-vector path, which covers sixteen channels
+            // but re-derives the row pointers and reloads the taps per column.
+            // The exception is 9..15 channels of a sixteen-wide block, which has
+            // no single policy shape (two 8-lane vectors would read past the last
+            // channel), so it runs as an 8-lane call and its remainder.
+            const int64_t rem = std::min(C - c0, chunk);
             int64_t seg_off[2] = {0, 0};
-            int64_t seg_lanes[2] = {C - c0, 0};
+            int64_t seg_lanes[2] = {rem, 0};
             int nseg = 1;
-            if (C - c0 > 16) {
-                seg_lanes[0] = 16;
-            } else if (C - c0 > 8) {
+            if (rem > 8 && rem < chunk) {
                 seg_lanes[0] = 8;
                 seg_off[1] = 8;
-                seg_lanes[1] = C - c0 - 8;
+                seg_lanes[1] = rem - 8;
                 nseg = 2;
             }
             for (int s = 0; s < nseg; ++s) {

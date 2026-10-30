@@ -2140,6 +2140,34 @@ NNOPS_TEST(dwconv_nhwc_vs_ref_f16) {
         false, 5e-3f);
 }
 
+NNOPS_TEST(dwconv_nhwc_vs_ref_f16_wide) {
+    // The two-vector 3x3 kernel is generic over the element type; half is a
+    // different `v_load`/`v_fmadd`, so give it its own wide case.
+    test_nhwc_vs_ref<backend::cpu::half>({1, 32, 10, 10}, {32, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
+        true, 5e-3f);
+}
+
+NNOPS_TEST(dwconv_nhwc_vs_ref_wide_stride2) {
+    // Exactly two channel vectors with the vertical stride on: the two-vector
+    // 3x3 kernel's stride-2 instantiation, whose row table reads R·2+2 input
+    // rows instead of R+2 and therefore exercises a different row index than
+    // the stride-1 cases above.
+    test_nhwc_vs_ref<float>({1, 16, 15, 15}, {16, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}},
+        true, 1e-4f);
+}
+
+NNOPS_TEST(dwconv_nhwc_vs_ref_wide_block) {
+    // C=48: three full sixteen-wide blocks, each handed to the two-vector 3x3
+    // kernel at its own width. Passing the *remaining* channel count instead
+    // covers the same channels through the generic path, so only the harness's
+    // own timing notices — the values here are correct either way.
+    test_nhwc_vs_ref<float>({1, 48, 9, 9}, {48, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}},
+        false, 1e-4f);
+}
+
 NNOPS_TEST(dwconv_ndhwc_vs_ref_3d) {
     test_nhwc_vs_ref<float>({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
         DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}},
