@@ -7,9 +7,11 @@
 /// so the untimed warm-up — the pass that pays the Winograd weight transform
 /// and the first-touch allocation — never lands in the numbers.
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -104,6 +106,33 @@ inline void prof_reset()
     detail::rows(ProfTable::Layer) = detail::ProfRows{};
     detail::rows(ProfTable::Op) = detail::ProfRows{};
     detail::enabled() = true;
+}
+
+/// Repeat the timed pass `NNOPS_MODEL_REPS` times (default 1) and return the
+/// median, in ms. One sample cannot separate a change from host drift — the
+/// single shot swings ±10% between processes — and both onnxruntime and torch
+/// report a median over many iterations, so this is what makes our number
+/// comparable to theirs. The tables are reset per repetition, so `prof_report`
+/// prints the last pass.
+template <class Fn>
+double time_forward(Fn&& fn)
+{
+    int reps = 1;
+    if (const char* s = std::getenv("NNOPS_MODEL_REPS")) {
+        const long v = std::strtol(s, nullptr, 10);
+        if (v > 0) { reps = static_cast<int>(v); }
+    }
+    std::vector<double> samples;
+    samples.reserve(static_cast<size_t>(reps));
+    for (int i = 0; i < reps; ++i) {
+        prof_reset();
+        const auto t0 = Clock::now();
+        fn();
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
 }
 
 /// Print both tables against @p total_ms, the runner's own forward timing.

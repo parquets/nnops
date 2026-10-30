@@ -163,8 +163,14 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     // prepacked, U as B panels; the planar one OIHW or the planar U. Converting
     // is the caller's job, once per model, at load time — a weight reshaped per
     // call would pay that copy on every inference.
-    const bool weight_last = is_channel_last_weight(inputs[1].layout) ||
-                             inputs[1].layout == TensorLayout::PackedWinoWeightLast;
+    //
+    // The im2col route takes a raw filter *or* its prepacked form on either
+    // side (PackedHWIO pairs with a channel-last activation, PackedOIHW with a
+    // planar one), so a graph that prepacks unconditionally still validates.
+    const TensorLayout wl = inputs[1].layout;
+    const bool weight_last = is_channel_last_weight(wl) ||
+                             wl == TensorLayout::PackedWinoWeightLast ||
+                             wl == TensorLayout::PackedHWIO;
     return detail::require(is_channel_last(inputs[0].layout) == weight_last);
 }
 
@@ -190,14 +196,16 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
     }
 
-    // Two cases always run the implicit-GEMM kernel, whatever the algorithm
-    // says, because Winograd cannot express them: a raw channel-last filter (the
-    // kernel then keeps the pixel axis on M and reads HWIO) and an s8 weight (the
-    // quantized driver). A prepacked U is not one of them — each U form now pairs
-    // with its own activation layout.
+    // Three cases always run the implicit-GEMM kernel, whatever the algorithm
+    // says: a raw channel-last filter (the kernel then keeps the pixel axis on M
+    // and reads HWIO), an s8 weight (the quantized driver), and a prepacked
+    // im2col filter (PackedOIHW/PackedHWIO holds that kernel's own panels — U is
+    // the only other prepacked form, and each U form pairs with its own
+    // activation layout).
     const bool wino_u = is_wino_weight(inputs[1].layout());
     if (backend_ == Backend::CPU &&
         (is_quantized_conv2d(inputs[1].data_type()) ||
+         is_packed_conv_weight(inputs[1].layout()) ||
          (is_channel_last(inputs[0].layout()) && !wino_u))) {
         return backend::cpu::conv2d_implicit_gemm_kernel(attrs, output, inputs, ctx,
                                                          workspace);
@@ -220,7 +228,58 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
                             std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
-    (void)ctx;
+    NNOPS_ASSERT(inputs.size() >= 1);
+    NNOPS_ASSERT(outputs.size() >= 1);
+    const auto& weight = inputs[0];
+    NNOPS_ASSERT(weight.rank() == 4);
+    NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOrChannelLast));
+
+    // Two products live behind this one call, and the algorithm picks: the
+    // Winograd U, or the im2col route's packed filter (which both its fp and
+    // int8 drivers read in place, instead of repacking per call or per task).
+    //
+    // Auto keeps producing U exactly where the Winograd transform exists — the
+    // same k3s1 fp geometry its asserts demand — because that is what a caller
+    // asking for Auto is prepared to feed back into compute(); every other
+    // geometry, and every quantized filter, gets the im2col panels.
+    const bool wino_product =
+        attrs_.algorithm == ConvAlgorithm::Winograd ||
+        (attrs_.algorithm == ConvAlgorithm::Auto &&
+         !is_quantized_conv2d(weight.data_type()) &&
+         attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
+         attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
+         attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1);
+
+    if (!wino_product) {
+        // ---- the im2col route's packed filter: PackedOIHW / PackedHWIO ----
+        // The descriptor is resolved from the attributes and the filter's own
+        // dims, so the query needs no activation; the kernel later resolves the
+        // identical geometry from the same function.
+        const TensorDesc d =
+            backend::cpu::conv_packed_weight_desc(attrs_, weight.desc());
+        NNOPS_ASSERT(d.rank > 0 &&
+                     "Conv2D::prepackWeights: this filter has no packed form");
+        std::vector<int64_t> shape(d.dims.begin(), d.dims.begin() + d.rank);
+        const int64_t esz = static_cast<int64_t>(data_type_size(d.dtype));
+
+        if (outputs[0].is_empty()) {
+            // The pitch is the row length in bytes: a packed filter is not
+            // channel-packed, so the default row alignment would not describe it.
+            outputs[0] = TensorView(shape, d.dtype, nullptr,
+                                    d.row_stride_elems * esz, d.layout,
+                                    weight.quant_params());
+            return;
+        }
+
+        NNOPS_ASSERT(outputs[0].layout() == d.layout &&
+                     outputs[0].rank() == d.rank &&
+                     outputs[0].shape(0) == shape[0] &&
+                     outputs[0].shape(1) == shape[1] &&
+                     "Conv2D::prepackWeights: the packed buffer does not match "
+                     "the geometry");
+        backend::cpu::conv_packed_weight_pack(attrs_, weight, outputs[0], ctx);
+        return;
+    }
 
     // compute() receives U and cannot fall back to the raw-weight im2col path,
     // so every unsupported configuration has to fail here, at prepack time.
@@ -231,12 +290,6 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
                  attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
                  attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1 &&
                  "Conv2D::prepackWeights: Winograd requires k3s1");
-
-    NNOPS_ASSERT(inputs.size() >= 1);
-    NNOPS_ASSERT(outputs.size() >= 1);
-    const auto& weight = inputs[0];
-    NNOPS_ASSERT(weight.rank() == 4);
-    NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOrChannelLast));
 
     const DataType dtype = weight.data_type();
     const int64_t elem_size = static_cast<int64_t>(data_type_size(dtype));

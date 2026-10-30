@@ -686,6 +686,189 @@ void run_wino_table(const char* title) {
 }
 
 // ============================================================
+// The prepacked filter: the same call, raw vs packed
+// ============================================================
+//
+// A is the raw HWIO filter — compute() packs it once per call into the shared
+// arena, or per task when it does not fit. B is the same filter through
+// Conv2D::prepackWeights, packed once, outside every timer. Both write the same
+// output buffer, so a row prices one thing: what the per-call pack costs. It is
+// also the arm that must never win — a caller who prepacked has already paid
+// for the filter, and the packed call can only be the cheaper one.
+
+template <class T, bool ChannelLast = true>
+struct AbPacked {
+    explicit AbPacked(const Shape& c) : s(c) {
+        icg = c.IC / c.groups;
+        const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
+        // The two filter orders, each in the layout its activation pairs with:
+        // HWIO for NHWC, OIHW (TensorLayout::NCHW) for NCHW.
+        const int64_t wsh[] = {c.KH, c.KW, icg, c.OC};   // HWIO
+        const int64_t wsh_p[] = {c.OC, icg, c.KH, c.KW}; // OIHW
+        const int64_t bsh[] = {c.OC};
+        constexpr DataType dt = dtype_of<T>();
+        constexpr TensorLayout act_layout = ChannelLast ? TensorLayout::NHWC
+                                                        : TensorLayout::NCHW;
+        constexpr TensorLayout wgt_layout = ChannelLast ? TensorLayout::HWIO
+                                                        : TensorLayout::NCHW;
+
+        const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
+        if constexpr (ChannelLast) {
+            in_buf = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+                                           c.N, c.IC, c.IH, c.IW);
+        } else {
+            in_buf = in32;
+        }
+        w_raw = random_vec<T>(std::span<const int64_t>(ChannelLast ? wsh : wsh_p, 4), 2);
+        bias = random_vec<T>(std::span<const int64_t>(bsh, 1), 3);
+
+        in_v = TensorView(std::span<const int64_t>(ish, 4), dt, in_buf.data(),
+                          act_layout);
+        w_v  = TensorView(std::span<const int64_t>(ChannelLast ? wsh : wsh_p, 4), dt,
+                          w_raw.data(), wgt_layout);
+        b_v  = TensorView(std::span<const int64_t>(bsh, 1), dt, bias.data());
+
+        Conv2DAttributes attrs{};
+        attrs.kernel_size = {c.KH, c.KW};
+        attrs.stride = {c.SH, c.SW};
+        attrs.padding = {c.PH, c.PW};
+        attrs.groups = c.groups;
+        // Auto would build the Winograd U for a k3s1 filter, which is a
+        // different algorithm rather than a different filter order.
+        attrs.algorithm = ConvAlgorithm::ImplicitGemm;
+        op = Conv2D::create(attrs, Backend::CPU);
+
+        const TensorDesc d0[] = {in_v.desc(), w_v.desc(), b_v.desc()};
+        const auto od = op->getOutputTensorDesc(d0);
+        out_desc = od[0];
+        OH = od[0].dims[2];
+        OW = od[0].dims[3];
+        work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
+
+        out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_v = test::make_planar(out_desc, out_buf.data());
+
+        // Query, allocate, pack — once, outside every timer.
+        TensorView q;
+        const TensorView wi[] = {w_v};
+        TensorView wo[] = {q};
+        op->prepackWeights(wi, wo);
+        q = wo[0];
+        blob.assign(static_cast<size_t>(q.storage_bytes() / sizeof(T)), T{});
+        p_v = TensorView(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                         q.layout(), q.quant_params());
+        const TensorView wi2[] = {w_v};
+        TensorView wo2[] = {p_v};
+        op->prepackWeights(wi2, wo2);
+    }
+
+    void run_raw(const ComputeContext& ctx) {
+        const TensorView ins[] = {in_v, w_v, b_v};
+        op->compute(std::span<TensorView>(&out_v, 1), ins, ctx, nullptr);
+    }
+    void run_packed(const ComputeContext& ctx) {
+        const TensorView ins[] = {in_v, p_v, b_v};
+        op->compute(std::span<TensorView>(&out_v, 1), ins, ctx, nullptr);
+    }
+
+    Shape s;
+    int64_t icg = 1, OH = 0, OW = 0;
+    double work = 0.0;
+    std::unique_ptr<Conv2D> op;
+    std::vector<T> in_buf, w_raw, bias, blob, out_buf;
+    TensorView in_v, w_v, b_v, p_v, out_v;
+    TensorDesc out_desc{};
+};
+
+/// The quantized arm: an s8 filter packs into the MMA's A panels and carries
+/// the per-channel sums the epilogue compensates with, so the raw route pays
+/// both a panel pack and a sum walk per call.
+struct AbPackedI8 : AbI8 {
+    explicit AbPackedI8(const Shape& c, bool channel_last = true) : AbI8(c) {
+        Conv2DAttributes attrs{};
+        attrs.kernel_size = {c.KH, c.KW};
+        attrs.stride = {c.SH, c.SW};
+        attrs.padding = {c.PH, c.PW};
+        attrs.groups = c.groups;
+        attrs.algorithm = ConvAlgorithm::ImplicitGemm;
+        p_op = Conv2D::create(attrs, Backend::CPU);
+
+        // The same operator, over whichever activation/filter pair the arm runs.
+        in  = channel_last ? &in_nhwc : &in_nchw;
+        w   = channel_last ? &w_nhwc  : &w_nchw;
+        out = channel_last ? &out_nhwc : &out_nchw;
+
+        TensorView q;
+        const TensorView wi[] = {*w};
+        TensorView wo[] = {q};
+        p_op->prepackWeights(wi, wo);
+        q = wo[0];
+        p_blob.assign(static_cast<size_t>(q.storage_bytes()), int8_t{});
+        p_v = TensorView(q.shape_span(), q.data_type(), p_blob.data(), q.pitch(),
+                         q.layout(), q.quant_params());
+        const TensorView wi2[] = {*w};
+        TensorView wo2[] = {p_v};
+        p_op->prepackWeights(wi2, wo2);
+    }
+
+    void run_raw(const ComputeContext& ctx) {
+        const TensorView ins[] = {*in, *w, b_v};
+        p_op->compute(std::span<TensorView>(out, 1), ins, ctx, nullptr);
+    }
+    void run_packed(const ComputeContext& ctx) {
+        const TensorView ins[] = {*in, p_v, b_v};
+        p_op->compute(std::span<TensorView>(out, 1), ins, ctx, nullptr);
+    }
+
+    std::unique_ptr<Conv2D> p_op;
+    TensorView *in = nullptr, *w = nullptr, *out = nullptr;
+    std::vector<int8_t> p_blob;
+    TensorView p_v;
+};
+
+/// The planar arrangement of the same arm: NCHW activation, OIHW filter.
+struct AbPackedI8Planar : AbPackedI8 {
+    explicit AbPackedI8Planar(const Shape& c) : AbPackedI8(c, /*channel_last=*/false) {}
+};
+
+/// One table: every layer at every thread count, raw filter vs prepacked.
+template <class Layer>
+void run_filter_table(const char* title) {
+    const int iters = 10, rounds = 3;
+    std::printf("\n== %s ==\n", title);
+    for (int nt : bench_threads()) {
+        std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
+        std::printf("    %-34s %8s %8s | %8s %8s | %s | %s\n",
+                    "layer", "raw ms", "GFLOPS", "packed ms", "GFLOPS",
+                    "packed time", "verdict");
+        int wins = 0, losses = 0, ties = 0;
+        double tot_raw = 0.0, tot_packed = 0.0;
+        for (const auto& c : sweep()) {
+            if (c.dw) { continue; }   // a depthwise layer is a different operator
+            Layer l(c);
+            const AbResult r = measure_ab(nt,
+                [&](const ComputeContext& x) { l.run_raw(x); },
+                [&](const ComputeContext& x) { l.run_packed(x); },
+                iters, rounds);
+            const double ratio = r.b_ms / r.a_ms;
+            const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
+            const char* verdict = !real ? "tie (noise)"
+                                : (ratio < 1.0 ? "packed wins" : "RAW WINS");
+            if (!real) { ++ties; } else if (ratio < 1.0) { ++wins; } else { ++losses; }
+            tot_raw += r.a_ms;
+            tot_packed += r.b_ms;
+            std::printf("    %-34s %8.3f %8.1f | %8.3f %8.1f | %8.2fx | %s\n",
+                        c.name, r.a_ms, l.work / r.a_ms / 1e6,
+                        r.b_ms, l.work / r.b_ms / 1e6, ratio, verdict);
+        }
+        std::printf("    %-34s %8.3f %8s | %8.3f %8s | %8.2fx | "
+                    "%d win, %d lose, %d tie\n",
+                    "sum of the layers", tot_raw, "", tot_packed, "",
+                    tot_packed / tot_raw, wins, losses, ties);
+    }
+}
+
+// ============================================================
 // The layer list as a graph: every conv cold
 // ============================================================
 //
@@ -831,4 +1014,34 @@ NNOPS_BENCH(conv2d_nhwc_vs_nchw_int8) {
               // A quantized depthwise arm needs a per-channel weight zero-point
               // and its own output type; bench_depthwise owns that comparison.
               [](const Shape&) -> std::unique_ptr<AbLayer> { return nullptr; });
+}
+
+NNOPS_BENCH(conv2d_filter_prepacked_f32) {
+    run_filter_table<AbPacked<float>>(
+        "f32: the raw HWIO filter vs the same filter through prepackWeights");
+}
+
+NNOPS_BENCH(conv2d_filter_prepacked_f16) {
+    run_filter_table<AbPacked<half>>(
+        "f16: the raw HWIO filter vs the same filter through prepackWeights");
+}
+
+NNOPS_BENCH(conv2d_filter_prepacked_int8) {
+    run_filter_table<AbPackedI8>(
+        "int8: the raw s8 HWIO filter vs the same filter through prepackWeights");
+}
+
+NNOPS_BENCH(conv2d_filter_prepacked_planar_f32) {
+    run_filter_table<AbPacked<float, false>>(
+        "f32 planar: the raw OIHW filter vs the same filter through prepackWeights");
+}
+
+NNOPS_BENCH(conv2d_filter_prepacked_planar_f16) {
+    run_filter_table<AbPacked<half, false>>(
+        "f16 planar: the raw OIHW filter vs the same filter through prepackWeights");
+}
+
+NNOPS_BENCH(conv2d_filter_prepacked_planar_int8) {
+    run_filter_table<AbPackedI8Planar>(
+        "int8 planar: the raw s8 OIHW filter vs the same filter through prepackWeights");
 }

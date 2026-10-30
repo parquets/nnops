@@ -211,12 +211,7 @@ int main(int argc, char** argv)
     forward(artifact, verify, input);
     ModelCheck timed(atol, rtol, /*verbose=*/false);
     timed.set_enabled(false);
-    model::prof_reset();
-    const auto t0 = std::chrono::steady_clock::now();
-    forward(artifact, timed, input);
-    const auto t1 = std::chrono::steady_clock::now();
-    const double ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double ms = model::time_forward([&] { forward(artifact, timed, input); });
     std::printf("forward: %.1f ms\n", ms);
     model::prof_report("resnet18", ms);
     return verify.report("resnet18") == 0 ? 0 : 1;

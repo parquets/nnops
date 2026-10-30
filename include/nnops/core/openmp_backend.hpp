@@ -32,6 +32,7 @@
 #include <cstdint>
 
 #include "nnops/core/parallel_for.hpp"
+#include "nnops/detail/simd/cpu_features.hpp"
 
 namespace nnops {
 
@@ -51,12 +52,11 @@ inline constexpr bool openmp_available() noexcept {
 ///                 caller asking for 4 threads gets 4 even if the process
 ///                 default is larger.
 ///
-/// The split is `schedule(static)`: operators already cut their work into
-/// roughly equal blocks sized from `thread_count()`, so one contiguous chunk
-/// per worker keeps each worker's scratch and its slice of the operands local.
-/// `dynamic` was measured against it on a hybrid 6P+8E part and came out 10-20%
-/// behind on conv (the E-cores finish their single block early either way, and
-/// dynamic also loses the locality), so the balanced split stays.
+/// Up to the machine's fast-core count the split is `schedule(static)`:
+/// operators already cut their work into roughly equal blocks sized from
+/// `thread_count()`, so one contiguous chunk per worker keeps each worker's
+/// scratch and its slice of the operands local. Past that count the provider
+/// over-subscribes the grid and lets workers claim it (`auto_items`).
 ///
 /// Wait policy: this only supplies the hooks — the OpenMP runtime's own knobs
 /// still apply. On MSVC (vcomp) the default is an active spin, which on a hybrid
@@ -65,11 +65,62 @@ inline constexpr bool openmp_available() noexcept {
 /// 4T / 20T were unaffected. That is an embedder-side setting; an application
 /// that calls in continuously may prefer the spin, a benchmark ladder does not.
 ///
+/// How the team is fed: one equal share per worker (the historical behavior), or
+/// an over-subscribed task grid that workers claim as they finish.
+///
+/// The second arm exists for hybrid parts. A `static` split hands every worker
+/// the same share regardless of what that worker can do, so on a 6P+8E such as
+/// the i5-13600KF the region ends when the slowest E-core finishes its share and
+/// the P-cores idle through the tail: conv measured 6.9x over 6 P-cores, 3.2x
+/// at 8 threads (two E-cores holding an eighth of the work at a third of the
+/// speed) and 5.3x at 20 — less than the 6-thread peak. Four items per worker
+/// plus a dynamic claim lets the fast cores take the tail and reaches 9.2x on
+/// the same layer, and the runners are 1.37x faster at 8 threads and 1.16x at
+/// 20. Below the fast-core count the extra tasks only shrink the kernels'
+/// blocks, so the provider stays static there — `auto_items` is where that line
+/// is drawn, and `items_per_thread = 1` turns it off entirely. The item count is
+/// reported through `num_threads()` so operators cut their grid finer without
+/// knowing about the topology — which is also why `thread_slots()` exists:
+/// per-thread scratch must stay at the real worker count while `num_threads()`
+/// reports the inflated grid.
+struct OpenMPSplit {
+    /// Tasks per worker the operators should cut their grid into (>= 1), or 0
+    /// for `auto_items(team)` — 1 unless the team is wider than the machine's
+    /// fast cores, which is the shape that wants a split at all.
+    int items_per_thread = 0;
+    /// Workers claim the next task instead of taking a fixed share. Forced on
+    /// when the item count is left to `auto_items` and it over-subscribes the
+    /// grid: a finer grid only pays when the items are claimed, not sliced.
+    bool dynamic = false;
+};
+
+/// Tasks per worker for a team of @p team: `ceil(team / fast cores)`, and 1
+/// when the team fits on the fast cores or the platform reports no classes.
+///
+/// An equal static share over more workers than fast cores ends on the slowest
+/// worker — on the i5-13600KF (6 P + 8 E) a conv layer runs 6.9x over its
+/// 1-thread time at 6 threads and 3.2x at 8, because two E-cores hold an eighth
+/// of the work at a third of the speed. Four items per worker on 20 threads
+/// takes the same layer to 9.2x. Below the fast-core count there is nothing to
+/// rebalance and the extra tasks only shrink the kernels' blocks.
+inline int auto_items(int team)
+{
+    const int fast = simd::CpuFeatures::get().fast_core_count();
+    if (fast <= 0 || team <= fast) { return 1; }
+    return (team + fast - 1) / fast;
+}
+
 /// Without OpenMP this returns a default (sequential) CpuBackend.
-inline CpuBackend openmp_backend(int nthreads = 0) {
+inline CpuBackend openmp_backend(int nthreads, OpenMPSplit split) {
     CpuBackend b;
 #if defined(_OPENMP)
-    b.parallel_for = [nthreads](int64_t begin, int64_t end, const ParallelForBody& body) {
+    const int team = nthreads > 0 ? nthreads : omp_get_max_threads();
+    const bool items_auto = split.items_per_thread <= 0;
+    const int items = items_auto ? auto_items(team)
+                                  : std::max(split.items_per_thread, 1);
+    const bool dynamic = split.dynamic || (items_auto && items > 1);
+    b.parallel_for = [team, dynamic](int64_t begin, int64_t end,
+                                     const ParallelForBody& body) {
         if (end <= begin) { return; }
         // The team size is pinned, deliberately: it is the *item* count that
         // should follow the pool, never the other way round. Sizing the team
@@ -81,18 +132,32 @@ inline CpuBackend openmp_backend(int nthreads = 0) {
         // narrow one paid for the rebuild. So a caller with few items should
         // give the pool more tasks (the conv plan splits its oc-blocks for
         // exactly this, conv2d_implicit_gemm.cpp) rather than shrink the team.
-        const int nt = nthreads > 0 ? nthreads : omp_get_max_threads();
-#pragma omp parallel for schedule(static) num_threads(nt)
-        for (int64_t i = begin; i < end; ++i) {
-            body(i);
+        if (dynamic) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(team)
+            for (int64_t i = begin; i < end; ++i) {
+                body(i);
+            }
+        } else {
+#pragma omp parallel for schedule(static) num_threads(team)
+            for (int64_t i = begin; i < end; ++i) {
+                body(i);
+            }
         }
     };
-    b.num_threads = [nthreads] { return nthreads > 0 ? nthreads : omp_get_max_threads(); };
+    b.num_threads = [team, items] { return team * items; };
     b.thread_id = [] { return omp_get_thread_num(); };
+    b.thread_slots = [team] { return team; };
 #else
     (void)nthreads;
+    (void)split;
 #endif
     return b;
+}
+
+/// One equal share per worker on a persistent team — the behavior every caller
+/// had before OpenMPSplit existed.
+inline CpuBackend openmp_backend(int nthreads = 0) {
+    return openmp_backend(nthreads, OpenMPSplit{});
 }
 
 }  // namespace nnops

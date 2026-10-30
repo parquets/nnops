@@ -295,7 +295,8 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
                              std::span<const TensorDesc> inputs,
                              std::span<const TensorDesc> outputs,
                              int num_threads,
-                             bool use_thread_slots)
+                             bool use_thread_slots,
+                             int64_t num_slots)
 {
     Conv2DWinogradPlan plan;
     plan.route = Conv2DWinogradRoute::Planar;
@@ -416,7 +417,13 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     // Slots: one per worker when the caller reports worker ids, else one per
     // task (the same convention Conv2D's im2col plan uses — without a worker id
     // there is no way to pick a slot that two concurrent tasks will not share).
-    plan.num_slots = (use_thread_slots && nt < plan.num_tasks) ? nt : plan.num_tasks;
+    // The slot count follows the *workers*, not the reported thread count: an
+    // over-subscribed grid states more tasks than there are workers, and a slot
+    // here is a whole tile block, so following the grid would multiply the
+    // arena for nothing.
+    const int64_t avail = (num_slots > 0) ? num_slots : nt;
+    plan.num_slots = (use_thread_slots && avail < plan.num_tasks) ? avail
+                                                                  : plan.num_tasks;
 
     plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size)
                         * data_type_size(dt);
@@ -655,7 +662,8 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
                              std::span<const TensorDesc> inputs,
                              std::span<const TensorDesc> outputs,
                              int num_threads,
-                             bool use_thread_slots)
+                             bool use_thread_slots,
+                             int64_t num_slots)
 {
     Conv2DWinogradPlan plan;
     plan.route = Conv2DWinogradRoute::ChannelLast;
@@ -752,7 +760,13 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     // Round the slot so every slot base keeps the transform's 32-byte stores
     // aligned for f16 as well.
     plan.slot_size = ((plan.v_size + plan.m_size) + 15) / 16 * 16;
-    plan.num_slots = (use_thread_slots && nt < plan.num_tasks) ? nt : plan.num_tasks;
+    // The slot count follows the *workers*, not the reported thread count: an
+    // over-subscribed grid states more tasks than there are workers, and a slot
+    // here is a whole tile block, so following the grid would multiply the
+    // arena for nothing.
+    const int64_t avail = (num_slots > 0) ? num_slots : nt;
+    plan.num_slots = (use_thread_slots && avail < plan.num_tasks) ? avail
+                                                                  : plan.num_tasks;
     plan.workspace_size = static_cast<size_t>(plan.num_slots * plan.slot_size) *
                           static_cast<size_t>(esz);
     return plan;
@@ -765,16 +779,19 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
                                             std::span<const TensorDesc> inputs,
                                             std::span<const TensorDesc> outputs,
                                             int num_threads,
-                                            bool use_thread_slots)
+                                            bool use_thread_slots,
+                                            int64_t num_slots)
 {
     // The activation's layout picks the route. The two U forms are not
     // interchangeable — each is the other's GEMM with its operands swapped — so
     // a mismatched pair must resolve to a zeroed plan (and the kernel's assert)
     // rather than to a route that would index it wrongly.
     if (!inputs.empty() && is_channel_last(inputs[0].layout)) {
-        return channel_last::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots);
+        return channel_last::make_plan(attrs, inputs, outputs, num_threads,
+                                       use_thread_slots, num_slots);
     }
-    return planar::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots);
+    return planar::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+                             num_slots);
 }
 
 // =========================================================================
@@ -811,7 +828,8 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
     const bool serial = !ctx.cpu.parallel_for;
     const Conv2DWinogradPlan plan =
         get_conv2d_winograd_plan(attrs, descs, outs, ctx.cpu.thread_count(),
-                                 serial || ctx.cpu.thread_slot_count() > 0);
+                                 serial || ctx.cpu.thread_slot_count() > 0,
+                                 ctx.cpu.thread_slot_count());
     NNOPS_ASSERT(plan.workspace_size > 0 &&
                  "conv2d_winograd_kernel: unsupported conv geometry (k3s1 only)");
 

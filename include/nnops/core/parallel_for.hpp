@@ -21,6 +21,13 @@ using ThreadCountFn = std::function<int()>;
 /// Thread-id hook: returns the current worker's id in [0, thread_count()).
 using ThreadIdFn = std::function<int()>;
 
+/// Scratch-slot hook: returns how many distinct ids `thread_id` can report.
+/// Defaults to `thread_count()`, which is only right when the two are the same
+/// number — a backend that hands its workers *more items than workers* (an
+/// over-subscribed task grid) still has `thread_count()` distinct ids, and
+/// scratch indexed by `current_thread_id()` must stay sized to that.
+using ThreadSlotsFn = std::function<int()>;
+
 /// CPU execution backend: the parallelism hooks an operator needs to schedule
 /// work and to size/index per-thread scratch. All members are optional; a null
 /// member means "sequential / unknown". nnops owns no thread pool — callers
@@ -32,6 +39,11 @@ struct CpuBackend {
     ThreadCountFn num_threads = nullptr;
     /// Current worker thread id (0-based).
     ThreadIdFn thread_id = nullptr;
+    /// Distinct worker ids `thread_id` can report. Unset means `num_threads`,
+    /// which holds for every pool that runs one item per worker; a backend that
+    /// over-subscribes its task grid sets this to the real worker count so
+    /// per-thread scratch is not sized by the item count.
+    ThreadSlotsFn thread_slots = nullptr;
 
     /// Run body over [begin, end): parallel when a hook is installed,
     /// sequential otherwise.
@@ -49,12 +61,14 @@ struct CpuBackend {
     /// Current worker thread id (0-based), or 0 when no hook reports it.
     int current_thread_id() const { return thread_id ? thread_id() : 0; }
 
-    /// Number of per-thread scratch slots available: thread_count() when both
-    /// num_threads and thread_id are installed, so operators can size their
-    /// scratch by worker count and index it with current_thread_id(); else 0,
-    /// meaning operators must fall back to per-task scratch indexing.
+    /// Number of per-thread scratch slots available: `thread_slots()` (else
+    /// thread_count()) when both num_threads and thread_id are installed, so
+    /// operators can size their scratch by worker count and index it with
+    /// current_thread_id(); else 0, meaning operators must fall back to
+    /// per-task scratch indexing.
     int thread_slot_count() const {
-        return (num_threads && thread_id) ? thread_count() : 0;
+        if (!(num_threads && thread_id)) { return 0; }
+        return thread_slots ? thread_slots() : thread_count();
     }
 };
 

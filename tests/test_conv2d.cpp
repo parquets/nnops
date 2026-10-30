@@ -1528,6 +1528,88 @@ NNOPS_TEST(conv2d_small_plane_oc_split_plan) {
     }
 }
 
+NNOPS_TEST(conv2d_plan_slots_follow_workers_not_items) {
+    // A backend may hand its operators an over-subscribed task grid: the same
+    // workers, told there are `items` times as many tasks as there are of them,
+    // so a hybrid part's fast cores can claim the tail instead of idling
+    // through it. Per-slot scratch must follow the *worker* count, not that
+    // inflated figure — four times the arena for four times the items would
+    // push the pack/accumulator scratch out of cache for nothing.
+    const int64_t ishape[] = {1, 256, 14, 14};
+    const int64_t wshape[] = {256, 256, 3, 3};
+    float placeholder = 0.0f;
+    TensorView input(ishape, DataType::f32, &placeholder);
+    TensorView weight(wshape, DataType::f32, &placeholder);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.padding     = {1, 1};
+
+    auto op = Conv2D::create(attrs, Backend::CPU);
+    const TensorDesc descs[] = {input.desc(), weight.desc()};
+    const auto out_descs = op->getOutputTensorDesc(descs);
+    const auto get = [&](int nt, int64_t slots) {
+        return nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
+            attrs, descs, out_descs, nt, /*use_thread_slots=*/true, slots);
+    };
+
+    // Same reported thread count, so the same block sizes and the same grid:
+    // only the slot count moved, and only the scratch follows it.
+    const auto one_per_worker = get(20, 0);
+    const auto five_workers   = get(20, 5);
+    NNOPS_EXPECT_EQ(five_workers.oh_chunks, one_per_worker.oh_chunks);
+    NNOPS_EXPECT_EQ(five_workers.oc_chunks, one_per_worker.oc_chunks);
+    NNOPS_EXPECT_EQ(five_workers.num_slots, 5);
+    NNOPS_EXPECT_TRUE(five_workers.workspace_size < one_per_worker.workspace_size);
+
+    // A 4x grid over 20 workers: 80 reported threads, 20 slots — never 80.
+    const auto over = get(80, 20);
+    NNOPS_EXPECT_EQ(over.num_slots,
+                    std::min<int64_t>(20, over.oh_chunks * over.oc_chunks));
+
+    // No slot count given: the historical min(threads, tasks) rule.
+    const auto per_task = get(20, 0);
+    NNOPS_EXPECT_EQ(per_task.num_slots,
+                    std::min<int64_t>(20, per_task.oh_chunks * per_task.oc_chunks));
+}
+
+NNOPS_TEST(conv2d_oversubscribed_grid_matches_serial) {
+    // The over-subscribed grid is a scheduling choice, not a numeric one: a
+    // worker claiming task 57 must produce exactly what the equal split did,
+    // including on the per-slot scratch it reuses across tasks.
+    const int64_t ishape[] = {1, 64, 28, 28};
+    const int64_t wshape[] = {64, 64, 3, 3};
+    auto [in_vec, input]   = test::make_random_tensor(ishape, -1.0f, 1.0f, 911);
+    auto [w_vec, weight]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 912);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.padding     = {1, 1};
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc()};
+    std::vector<TensorView> ins   = {input, weight};
+    auto op = Conv2D::create(attrs, Backend::CPU);
+    const auto out_descs = op->getOutputTensorDesc(descs);
+
+    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
+    TensorView ref = test::make_planar(out_descs[0], ref_buf.data());
+    NNOPS_EXPECT_EQ(op->compute(ref, ins, ComputeContext{}, nullptr), Status::ok);
+
+    for (int nt : {2, 4, 8}) {
+        std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
+        TensorView out = test::make_planar(out_descs[0], out_buf.data());
+        ComputeContext ctx;
+        ctx.cpu = nnops::openmp_backend(nt, nnops::OpenMPSplit{/*items_per_thread=*/4,
+                                                              /*dynamic=*/true});
+        NNOPS_EXPECT_EQ(op->compute(out, ins, ctx, nullptr), Status::ok);
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            NNOPS_EXPECT_NEAR(out_buf[i], ref_buf[i], 1e-5f);
+        }
+    }
+}
+
 NNOPS_TEST(conv2d_small_plane_oc_split_matches_ref) {
     // The filter split is only a partition of the oc loop, so every thread
     // configuration must reproduce the serial result — and the 20-thread plan
@@ -1710,5 +1792,110 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
         }
         std::printf("      wide frame 1x1 (1280x180): max deviation %.6f\n", p_worst);
         NNOPS_EXPECT_NEAR(p_worst, 0.0f, 1e-4f);
+    }
+}
+
+// ============================================================
+// The prepacked filter — Conv2D::prepackWeights on the planar route
+// ============================================================
+//
+// A planar float filter already *is* the GEMM's A operand, so its prepacked
+// form is a densified [OC][IC/G·KH·KW] copy: what the two-step contract buys
+// here is a total one — every supported filter has exactly one prepacked form,
+// so a graph engine can prepack unconditionally and hand the blob to compute()
+// on any route. What it must not change is a single output byte.
+
+NNOPS_TEST(conv2d_prepacked_filter) {
+    struct Case {
+        int64_t N, IC, IH, IW, OC, K, S, PH, G;
+        bool bias;
+    };
+    const Case cases[] = {
+        // the basic gather, with a bias
+        {1,  3, 16, 16,   8, 3, 1, 1, 1, true},
+        // stride 2 on an odd plane
+        {2,  4, 13, 15,   6, 3, 2, 1, 1, false},
+        // 5x5 with groups
+        {1,  8, 20, 20,   8, 5, 1, 2, 2, true},
+        // 7x7 stem
+        {1,  3, 32, 32,  16, 7, 2, 3, 1, false},
+        // 1x1 pointwise: K is the whole channel count in one pass
+        {1, 128, 8, 8,  192, 1, 1, 0, 1, true},
+        // a ResNet stage plane
+        {1, 64, 56, 56,  64, 3, 1, 1, 1, false},
+    };
+
+    for (size_t ci = 0; ci < std::size(cases); ++ci) {
+        const Case& c = cases[ci];
+        const int64_t ICG = c.IC / c.G;
+        const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t wshape[] = {c.OC, ICG, c.K, c.K};
+        const int64_t bshape[] = {c.OC};
+        const uint64_t seed = 900 + static_cast<uint64_t>(ci);
+
+        auto [in_vec, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, seed);
+        auto [w_vec, weight] = test::make_random_tensor(wshape, -1.0f, 1.0f, seed + 1);
+        std::vector<float> b_vec;
+        TensorView bias;
+        if (c.bias) {
+            b_vec.resize(static_cast<size_t>(c.OC));
+            test::XorShift128 rng(seed + 2);
+            rng.fill_float(b_vec.data(), c.OC, -1.0f, 1.0f);
+            bias = TensorView(bshape, DataType::f32, b_vec.data());
+        }
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.K, c.K};
+        attrs.stride      = {c.S, c.S};
+        attrs.padding     = {c.PH, c.PH};
+        attrs.groups      = c.G;
+        // Auto builds the Winograd U for a k3s1 fp filter; the im2col panels
+        // are what this route's prepack produces, so say which one is meant.
+        attrs.algorithm   = ConvAlgorithm::ImplicitGemm;
+
+        auto op = Conv2D::create(attrs, Backend::CPU);
+
+        std::vector<TensorView> ins = {input, weight};
+        if (c.bias) { ins.push_back(bias); }
+        std::vector<TensorDesc> descs;
+        for (const auto& v : ins) { descs.push_back(v.desc()); }
+        const auto od = op->getOutputTensorDesc(descs);
+        const int64_t out_n = od[0].numel();
+
+        // The raw filter's output is the reference.
+        std::vector<float> raw_buf(static_cast<size_t>(out_n));
+        auto raw_out = test::make_planar(od[0], raw_buf.data());
+        NNOPS_EXPECT_EQ(op->compute(raw_out, ins, {}, nullptr), Status::ok);
+
+        // Query the packed descriptor, allocate what it asks for, fill it.
+        TensorView q;
+        const TensorView wq[] = {weight};
+        TensorView oq[] = {q};
+        op->prepackWeights(wq, oq);
+        q = oq[0];
+        NNOPS_EXPECT_TRUE(q.rank() > 0);
+        NNOPS_EXPECT_EQ(q.layout(), TensorLayout::PackedOIHW);
+        NNOPS_EXPECT_EQ(q.shape(0), c.OC);
+        // Dense [OC][IC/G·KH·KW]: the copy is the whole pack, and the buffer
+        // the caller allocates is exactly that matrix.
+        NNOPS_EXPECT_EQ(q.shape(1), ICG * c.K * c.K);
+        // numel() is the buffer size a caller sizes its allocation from.
+        NNOPS_EXPECT_EQ(q.desc().numel(), q.shape(0) * q.shape(1));
+
+        std::vector<float> blob(static_cast<size_t>(q.storage_bytes() / sizeof(float)));
+        TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                          q.layout());
+        const TensorView wf[] = {weight};
+        TensorView of[] = {packed};
+        op->prepackWeights(wf, of);
+
+        std::vector<TensorView> packed_ins = ins;
+        packed_ins[1] = packed;
+        std::vector<float> packed_buf(static_cast<size_t>(out_n));
+        auto packed_out = test::make_planar(od[0], packed_buf.data());
+        NNOPS_EXPECT_EQ(op->compute(packed_out, packed_ins, {}, nullptr), Status::ok);
+
+        NNOPS_EXPECT_TRUE(std::memcmp(raw_buf.data(), packed_buf.data(),
+                                      static_cast<size_t>(out_n) * sizeof(float)) == 0);
     }
 }

@@ -6,6 +6,8 @@
 
 #include "nnops/detail/simd/cpu_features.hpp"
 
+#include <vector>
+
 #if defined(NNOPS_ARCH_X86_64)
 
 #if defined(_MSC_VER)
@@ -162,6 +164,74 @@ size_t read_sysfs_cache_size(const char* path) {
 
 #endif  // NNOPS_ARCH_AARCH64
 
+// ---- Topology: is this a hybrid part, and how many cores run at full speed? ----
+#if defined(_WIN32)
+#include <Windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+namespace {
+
+/// Cores in the fastest efficiency class, or 0 when the platform reports no
+/// classes at all. Windows publishes one entry per physical core with an
+/// `EfficiencyClass` (higher is faster); macOS exposes the performance cluster
+/// as `hw.perflevel0.physicalcpu`. A part that reports a single class — or none
+/// — answers 0: an equal share of the work is already even there, so nothing
+/// downstream should start steering.
+int detect_fast_cores() {
+#if defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) { return 0; }
+    std::vector<char> buf(static_cast<size_t>(len));
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
+            &len)) {
+        return 0;
+    }
+    int best = -1;
+    int best_count = 0;
+    int total = 0;
+    for (DWORD off = 0; off < len;) {
+        const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+            buf.data() + off);
+        if (e->Size == 0) { break; }
+        const int cls = static_cast<int>(e->Processor.EfficiencyClass);
+        ++total;
+        if (cls > best) {
+            best = cls;
+            best_count = 1;
+        } else if (cls == best) {
+            ++best_count;
+        }
+        off += e->Size;
+    }
+    return (best_count > 0 && best_count < total) ? best_count : 0;
+#elif defined(__APPLE__)
+    int32_t perf = 0;
+    size_t len = sizeof(perf);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &len, nullptr, 0) != 0 ||
+        perf <= 0) {
+        return 0;
+    }
+    // A single-perflevel Mac answers perflevel0 with the whole CPU, which is not
+    // a fast class; only a machine with a second level has one.
+    int32_t cores = 0;
+    len = sizeof(cores);
+    if (sysctlbyname("hw.physicalcpu", &cores, &len, nullptr, 0) == 0 &&
+        cores <= perf) {
+        return 0;
+    }
+    return perf;
+#else
+    return 0;
+#endif
+}
+
+} // anonymous namespace
+
 namespace nnops {
 namespace simd {
 
@@ -315,6 +385,8 @@ void CpuFeatures::detect() {
 #endif
 
 #endif  // NNOPS_ARCH_AARCH64
+
+    fast_cores_ = detect_fast_cores();
 }
 
 } // namespace simd

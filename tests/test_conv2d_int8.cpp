@@ -283,6 +283,44 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     return r;
 }
 
+/// The same call with the filter prepacked through the op's two-step contract:
+/// query the descriptor, allocate it, pack into it — the buffer stays the
+/// caller's. On this route the blob is the A panels the MMA reads in place, and
+/// it also carries the per-channel sums the epilogue compensates with.
+Result run_route_prepacked(const Case& c, const ComputeContext& ctx) {
+    Fixture f(c);
+    std::vector<TensorDesc> ins = f.descs();
+    auto op = Conv2D::create(f.attrs, Backend::CPU);
+    auto outs = op->getOutputTensorDesc(ins);
+
+    TensorView q;
+    const TensorView wq[] = {f.ins[1]};
+    TensorView oq[] = {q};
+    op->prepackWeights(wq, oq);
+    q = oq[0];
+    NNOPS_EXPECT_TRUE(q.rank() > 0);
+    NNOPS_EXPECT_EQ(q.layout(), TensorLayout::PackedOIHW);
+    NNOPS_EXPECT_EQ(q.shape(0), c.wshape[0]);
+
+    std::vector<int8_t> blob(q.storage_bytes());
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout(), q.quant_params());
+    const TensorView wf[] = {f.ins[1]};
+    TensorView of[] = {packed};
+    op->prepackWeights(wf, of);
+
+    std::vector<TensorView> pins = f.ins;
+    pins[1] = packed;
+
+    Result r;
+    r.desc = outs[0];
+    r.buf.assign(outs[0].nbytes(), 0);
+    seed_output(r.buf, outs[0].dtype, c.seed + 3);
+    auto out = make_out_view(outs[0], r.buf.data(), f.out_q);
+    NNOPS_EXPECT_EQ(op->compute(out, pins, ctx, nullptr), Status::ok);
+    return r;
+}
+
 /// First differing output element, as a description (empty when bit-identical).
 std::string first_difference(const Result& a, const Result& b) {
     if (a.buf.size() != b.buf.size()) { return "size mismatch"; }
@@ -1343,3 +1381,68 @@ NNOPS_TEST(conv2d_i8_vs_fp_path) {
 }
 
 }  // namespace
+
+// ============================================================
+// The prepacked filter — Conv2D::prepackWeights on the planar int8 route
+// ============================================================
+//
+// Here the prepack is not cosmetic: the A operand is a set of MMA panels, so a
+// raw filter pays a pack per task on every call. The blob also carries the
+// per-channel sums the epilogue compensates with, which is what keeps the
+// packed call cheaper than the raw one rather than merely equal.
+//
+// What it must not do is change the answer: the panels hold the same bytes in
+// the layout the MMA wanted, so both routes have to be bit-identical.
+
+NNOPS_TEST(conv2d_i8_prepacked_filter) {
+    std::vector<Case> cases;
+    auto add = [&](Case c) { cases.push_back(c); };
+
+    // nothing to compensate: the sums are never read
+    { Case c; c.ishape = {1, 4, 8, 8}; c.wshape = {8, 4, 3, 3}; c.kh = c.kw = 3;
+      add(c); }
+    // u8 whose zero point does not cancel the shift (the column term)
+    { Case c; c.ishape = {1, 8, 6, 6}; c.wshape = {4, 8, 3, 3}; c.kh = c.kw = 3;
+      c.act = DataType::u8; c.zp_x = 120; add(c); }
+    // asymmetric weight zero point: the per-pixel sums are live
+    { Case c; c.ishape = {1, 6, 8, 8}; c.wshape = {7, 6, 3, 3}; c.kh = c.kw = 3;
+      c.asym_w = true; add(c); }
+    // both terms, a bias and a nonlinear epilogue
+    { Case c; c.ishape = {1, 5, 7, 7}; c.wshape = {6, 5, 3, 3}; c.kh = c.kw = 3;
+      c.ph = c.pw = 1; c.act = DataType::u8; c.zp_x = 130; c.asym_w = true;
+      c.bias = true; c.ep = EpilogueActivateType::Relu6; add(c); }
+    // groups 4: the per-group panel sets and the sums table both have to move
+    { Case c; c.ishape = {1, 8, 8, 8}; c.wshape = {16, 2, 3, 3}; c.kh = c.kw = 3;
+      c.groups = 4; c.act = DataType::u8; c.zp_x = 120; add(c); }
+    // several oc blocks (160 = 128 + 32) with an ic tail (40 = 2 · 16 + 8)
+    { Case c; c.ishape = {1, 40, 12, 12}; c.wshape = {160, 40, 3, 3};
+      c.kh = c.kw = 3; c.act = DataType::u8; c.zp_x = 128; c.asym_w = true;
+      c.bias = true; add(c); }
+    // 1x1 pointwise: K is the whole channel count in one pass
+    { Case c; c.ishape = {1, 32, 6, 6}; c.wshape = {16, 32, 1, 1}; c.kh = c.kw = 1;
+      add(c); }
+    // an integer destination: the requant path reads the sums too
+    { Case c; c.ishape = {1, 8, 8, 8}; c.wshape = {12, 8, 3, 3}; c.kh = c.kw = 3;
+      c.out = DataType::s8; c.asym_w = true; c.bias = true; add(c); }
+    // a 7x7 at the narrow panel rung
+    { Case c; c.ishape = {1, 4, 14, 14}; c.wshape = {8, 4, 7, 7}; c.kh = c.kw = 7;
+      c.ph = c.pw = 3; c.asym_w = true; add(c); }
+    // a pitched activation: the im2col walk has to skip the row tail either way
+    { Case c; c.ishape = {1, 4, 9, 9}; c.wshape = {8, 4, 3, 3}; c.kh = c.kw = 3;
+      c.in_pitch = 12; c.act = DataType::u8; c.zp_x = 128; add(c); }
+    // an fp activation, quantized into the plane
+    { Case c; c.ishape = {1, 4, 8, 8}; c.wshape = {8, 4, 3, 3}; c.kh = c.kw = 3;
+      c.act = DataType::f32; c.act_q = DataType::u8; c.zp_x = 128; add(c); }
+
+    for (size_t i = 0; i < cases.size(); ++i) {
+        cases[i].seed = 4000 + i;
+        const Result raw = run_route(cases[i], {}, /*reference=*/false);
+        const Result packed = run_route_prepacked(cases[i], {});
+        const std::string diff = first_difference(raw, packed);
+        if (!diff.empty()) {
+            throw std::runtime_error(
+                "conv2d_int8 prepacked filter (case " + std::to_string(i) +
+                ") differs from the raw filter: " + diff);
+        }
+    }
+}

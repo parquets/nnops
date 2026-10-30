@@ -97,6 +97,31 @@ enum class TensorLayout : uint8_t {
                 ///< what the channel-lane kernel loads. The planar filter
                 ///< [C, 1, (KD,) KH, KW] stores a tap's channels C elements
                 ///< apart, so it cannot serve that kernel.
+
+    // ---- Prepacked conv weight (Conv2D::prepackWeights, im2col route) ----
+    //
+    // The two tags name which *route*'s operand a blob holds, because the two
+    // routes swap their GEMM's operands and therefore pack the filter along
+    // different axes:
+    //
+    //   PackedOIHW — from a planar (OIHW) filter, for a planar activation. The
+    //                planar GEMM makes the filter its A operand, so the fp form
+    //                is the filter's own [OC][IC/G·KH·KW] matrix (nothing to
+    //                transpose, which is why the fp prepack is only a densifying
+    //                copy) and the quantized form is the MMA's packed-A panels,
+    //                which the kernel otherwise rebuilds on every task.
+    //   PackedHWIO — from a channel-last (HWIO) filter, for a channel-last
+    //                activation. There the filter is the B operand: the blob is
+    //                one k-major panel of `nr` output channels per k block,
+    //                which the kernel otherwise repacks on every compute().
+    //
+    // Both are opaque to everything outside the im2col kernel: the descriptor's
+    // shape is [OC, ⌈elements / OC⌉] — the output-channel count, so shape
+    // inference still reads the right number, followed by whatever the panel
+    // padding needs — and the panel geometry is resolved from the attributes
+    // plus the filter's own dims, never indexed by hand.
+    PackedOIHW = 15,  ///< planar activation's prepacked filter (see above)
+    PackedHWIO = 16,  ///< channel-last activation's prepacked filter (see above)
 };
 
 
@@ -118,6 +143,8 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::NHWC:     return 1;
     case TensorLayout::NDHWC:    return 1;
     case TensorLayout::HWIO:     return 1;
+    case TensorLayout::PackedOIHW: return 1;
+    case TensorLayout::PackedHWIO: return 1;
     }
     return 1;
 }
@@ -167,6 +194,15 @@ constexpr bool is_wino_weight(TensorLayout layout) noexcept {
            layout == TensorLayout::PackedWinoWeightLast;
 }
 
+/// Returns true for either form of the prepacked im2col conv filter — the
+/// operand Conv2D::prepackWeights builds for the route its source layout pairs
+/// with (PackedOIHW for a planar activation, PackedHWIO for a channel-last
+/// one). Both are opaque blobs; only the kernel that packed them indexes them.
+constexpr bool is_packed_conv_weight(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedOIHW ||
+           layout == TensorLayout::PackedHWIO;
+}
+
 /// Returns the expected spatial rank encoded in the layout name.
 /// NCHW* → 2 (H, W), NCDHW* → 3 (D, H, W).
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
@@ -181,6 +217,8 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::PackedWinoWeightLast:
     case TensorLayout::NHWC:
     case TensorLayout::HWIO:
+    case TensorLayout::PackedOIHW:
+    case TensorLayout::PackedHWIO:
         return 2;
     case TensorLayout::NCDHW:
     case TensorLayout::NCDHWC8:

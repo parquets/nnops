@@ -115,7 +115,12 @@ struct Buf {
 /// A packed layout (NCHWC8) pads every row to the descriptor's pitch, so the
 /// view has to be built with that pitch and the storage with that many words —
 /// the dense constructor would describe a tighter tensor than the kernel writes.
-inline Buf alloc(const nnops::TensorDesc& desc)
+///
+/// @p qp rides the view: a prepacked *quantized* weight (PackedOIHW/PackedHWIO)
+/// is only half the operand — the kernel reads the per-channel scale and zero
+/// point off the tensor it is handed, and the raw filter's would otherwise be
+/// lost in the prepack.
+inline Buf alloc(const nnops::TensorDesc& desc, nnops::QuantParams qp = {})
 {
     Buf buf;
     std::vector<int64_t> shape(desc.dims.begin(),
@@ -127,10 +132,10 @@ inline Buf alloc(const nnops::TensorDesc& desc)
     buf.data = detail::take_block(words);
     if (packed) {
         buf.view = nnops::TensorView(shape, desc.dtype, buf.data.data(),
-                                     desc.row_pitch(), desc.layout);
+                                     desc.row_pitch(), desc.layout, qp);
     } else {
         buf.view = nnops::TensorView(shape, desc.dtype, buf.data.data(),
-                                     desc.layout);
+                                     desc.layout, qp);
     }
     return buf;
 }

@@ -103,6 +103,19 @@ public:
         return l2_shared_cache_size_ ? l2_shared_cache_size_ : l2_cache_size_;
     }
 
+    /// Cores in the fastest performance class — the P-cores of a hybrid part
+    /// (i5-13600KF: 6 of 14 physical, 20 logical) — or 0 when the platform
+    /// reports no distinction between cores.
+    ///
+    /// This is the number of workers that run a task at the same speed, and it
+    /// decides whether a wider team can be handed an equal share: past it the
+    /// extra workers are noticeably slower per task, so a static split ends when
+    /// the slowest of them finishes and the fast cores idle through the tail.
+    /// 0 means "homogeneous, or the platform would not say" — where an equal
+    /// share is already balanced and nothing needs over-subscribing. Detected on
+    /// Windows (EfficiencyClass) and macOS (`hw.perflevel0`); elsewhere 0.
+    int fast_core_count() const { return fast_cores_; }
+
 private:
     CpuFeatures() { detect(); }
     void detect();
@@ -111,6 +124,7 @@ private:
     size_t l1_cache_size_ = 32768;   // 32KB default (typical x86 L1D)
     size_t l2_cache_size_ = 262144;  // 256KB default (Haswell baseline)
     size_t l2_shared_cache_size_ = 0;  // 0 = no separate value known
+    int fast_cores_ = 0;             // 0 = no efficiency classes reported
 };
 
 // ============================================================

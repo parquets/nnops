@@ -72,6 +72,37 @@ inline bool channel_last()
     return on;
 }
 
+/// The split the runners ask the OpenMP provider for: the provider's own auto
+/// policy (equal shares up to the fast-core count, an over-subscribed dynamic
+/// grid past it — see openmp_backend.hpp) unless the environment overrides it.
+/// NNOPS_MODEL_ITEMS sets the tasks per worker (1 restores the plain static
+/// split) and NNOPS_MODEL_SPLIT=dynamic claims items as workers finish.
+inline nnops::OpenMPSplit model_split()
+{
+    static const nnops::OpenMPSplit s = [] {
+        nnops::OpenMPSplit out;
+        bool explicit_items = false;
+        if (const char* v = std::getenv("NNOPS_MODEL_ITEMS")) {
+            const long n = std::strtol(v, nullptr, 10);
+            if (n > 0) {
+                out.items_per_thread = static_cast<int>(n);
+                explicit_items = true;
+            }
+        }
+        if (const char* v = std::getenv("NNOPS_MODEL_SPLIT")) {
+            if (std::strcmp(v, "dynamic") == 0) {
+                out.dynamic = true;
+            } else if (!explicit_items) {
+                // A stated "static" also pins the item count, which is what
+                // keeps the provider's auto policy from over-subscribing.
+                out.items_per_thread = 1;
+            }
+        }
+        return out;
+    }();
+    return s;
+}
+
 /// The ComputeContext every wrapper hands to compute(). A model-level bench
 /// installs a thread pool here rather than plumbing a context through every
 /// wrapper; so does the NNOPS_MODEL_THREADS switch above.
@@ -81,7 +112,8 @@ inline nnops::ComputeContext& context()
     static int installed = -1;
     const int want = model_threads();
     if (want != 0 && want != installed) {
-        ctx.cpu = (want > 1) ? nnops::openmp_backend(want) : nnops::CpuBackend{};
+        ctx.cpu = (want > 1) ? nnops::openmp_backend(want, model_split())
+                             : nnops::CpuBackend{};
         installed = want;
     }
     return ctx;
@@ -264,9 +296,53 @@ inline const TensorView& winograd_weight(const TensorView& w,
     return cache.emplace(w.ptr<float>(), std::move(u)).first->second.view;
 }
 
+/// Whether the runners prepack their filters — always on, except for the A/B
+/// arm that prices it (NNOPS_MODEL_PREPACK=0 hands compute() the raw filter,
+/// which packs per call, into the shared arena or per task).
+inline bool prepack_enabled()
+{
+    static const bool on = [] {
+        const char* s = std::getenv("NNOPS_MODEL_PREPACK");
+        return s == nullptr ||
+               (std::strcmp(s, "0") != 0 && std::strcmp(s, "false") != 0);
+    }();
+    return on;
+}
+
+/// The im2col route's prepacked filter (PackedOIHW / PackedHWIO), made once per
+/// weight buffer by the same two-step prepack as the U above. Both im2col
+/// drivers — fp and int8 — read the blob in place, so what it removes is the
+/// per-call pack: the shared arena copy a fitting weight would otherwise need,
+/// and on a starved plane a pack per task.
+///
+/// The algorithm is pinned to ImplicitGemm so the product is unambiguous: Auto
+/// means "the Winograd U where one exists", and this branch is the one that
+/// asked for panels.
+inline const TensorView& packed_weight(const TensorView& w,
+                                       const nnops::Conv2DAttributes& attrs)
+{
+    static std::map<const void*, Buf> cache;
+    auto it = cache.find(w.ptr<float>());
+    if (it != cache.end()) { return it->second.view; }
+
+    nnops::Conv2DAttributes use = attrs;
+    use.algorithm = nnops::ConvAlgorithm::ImplicitGemm;
+    auto op = nnops::Conv2D::create(use, Backend::CPU);
+    TensorView query;
+    const TensorView in[] = {w};
+    TensorView q[] = {query};
+    op->prepackWeights(in, q);
+    Buf blob = alloc(q[0].desc(), w.quant_params());
+    TensorView pack[] = {blob.view};
+    op->prepackWeights(in, pack);
+
+    return cache.emplace(w.ptr<float>(), std::move(blob)).first->second.view;
+}
+
 /// Run a conv on the weight it should take: Winograd reads the transformed U
-/// when the geometry pays for it, the raw filter otherwise. Shape inference
-/// always reads the raw weight, so it is queried first — only compute() sees U.
+/// when the geometry pays for it, the im2col route its packed filter otherwise.
+/// Shape inference always reads the raw weight, so it is queried first — only
+/// compute() sees the prepacked form.
 inline Buf conv2d_run(const TensorView& x, const TensorView& w,
                       const TensorView* b, const nnops::Conv2DAttributes& attrs,
                       const char* wino_row = "conv2d/wino",
@@ -290,7 +366,8 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // a folded conv and a plain one do not share a line.
     ProfScope prof(wino ? wino_row : gemm_row);
     auto op = nnops::Conv2D::create(use, Backend::CPU);
-    const TensorView u = wino ? winograd_weight(wl, use) : wl;
+    const TensorView u = wino ? winograd_weight(wl, use)
+                              : (prepack_enabled() ? packed_weight(wl, use) : wl);
 
     TensorDesc in_desc[3] = {x.desc(), wl.desc()};
     TensorView in[3] = {x, u};

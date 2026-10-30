@@ -103,7 +103,8 @@ struct Conv2DGemmPlan {
                               ///< at the front of the arena (0 when the
                               ///< activation already arrives quantized)
     int64_t shared_elems = 0; ///< shared packed-B elements at the arena head
-                              ///< (channel-last prepack; 0 → each task packs its
+                              ///< (channel-last prepack; 0 → the filter is read
+                              ///< from the caller's blob, or each task packs its
                               ///< own panels)
     bool pointwise = false;   ///< k1s1p0: the GEMM reads the input tensor itself
                               ///< instead of a gathered tile, so there is no
@@ -131,7 +132,10 @@ struct Conv2DGemmPlan {
     int64_t a_pack_stride = 0;     ///< elements of the packed-A panels at the
                                    ///< front of the A region (0 → fp route)
     int64_t stage_size = 0;        ///< per-slot tap-major weight staging tile
-                                   ///< (0 → a 1x1 filter, which packs in place)
+                                   ///< (0 → nothing packs per task: a 1x1 filter
+                                   ///< packs in place, and a filter packed once —
+                                   ///< shared or prepacked by the caller — never
+                                   ///< restages)
 };
 
 constexpr int64_t gemm_align64(int64_t v) noexcept { return (v + 63) & ~int64_t{63}; }
@@ -155,6 +159,112 @@ inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim,
 {
     return panels_per_oc * gemm_panel_slot(kdim, nr_max, esz, quant);
 }
+
+/// Geometry of the channel-last route's prepacked filter (PackedHWIO): one
+/// panel column per k block, panels of `nr` output channels tiled across the
+/// group's whole oc axis.
+///
+/// It is a function of the attributes and the two channel counts alone — no
+/// activation, no thread count — which is what lets prepackWeights size the
+/// caller's buffer at load time and the kernel address it later without the two
+/// ever agreeing on anything else. Every k block has its own column (the
+/// trailing one packs a shorter k, hence a shorter panel stride), and the
+/// columns are laid out group by group.
+struct ConvPackedWeightLast {
+    int64_t nr = 0;          ///< panel width (output channels per panel)
+    int64_t icn_block = 0;   ///< k block
+    int64_t ocn_block = 0;   ///< oc block (the plan's N tile)
+    int64_t kdim_max = 0;    ///< icn_block × karea
+    int64_t panels_oc = 0;   ///< ⌈oc_per_group / nr⌉ — panels in one k column
+    int64_t slot_full = 0;   ///< elements of one panel at kdim_max
+    int64_t slot_tail = 0;   ///< ... at the trailing k block (0 when none)
+    int64_t nfull_ic = 0;    ///< whole k blocks per group
+    int64_t tail_ic = 0;     ///< input channels in the trailing k block
+    int64_t group_elems = 0; ///< one group's panels
+    int64_t sums_off = 0;    ///< element offset of the int32 table below
+    int64_t total = 0;       ///< all groups' panels, then the sums table
+
+    // A quantized blob carries Σ_k weight[oc, k] per output channel — the
+    // epilogue's R_b, which the raw path re-derives from the filter on every
+    // call. It is a property of the filter alone, so prepacking is where it
+    // belongs, and it is *layout-free*: a plain int32[OC] table after the
+    // panels, computed from the raw filter, never from the packed bytes (whose
+    // panel format differs per arch).
+
+    /// Element offset of k block @p ic_block along group @p g's panel column.
+    int64_t offset(int64_t g, int64_t ic_block) const noexcept
+    {
+        const int64_t col = ic_block >= nfull_ic
+            ? nfull_ic * panels_oc * slot_full +
+                  (ic_block - nfull_ic) * panels_oc * slot_tail
+            : ic_block * panels_oc * slot_full;
+        return g * group_elems + col;
+    }
+
+    /// Elements of one panel at k block @p ic_block — the distance between
+    /// neighbouring panels of that column.
+    int64_t slot(int64_t ic_block) const noexcept
+    {
+        return ic_block >= nfull_ic ? slot_tail : slot_full;
+    }
+};
+
+/// Resolve the channel-last prepacked geometry. It is also the channel-last
+/// plan's own block sizes: the plan reads icn_block/ocn_block from here, so the
+/// panels it sizes and the panels prepackWeights builds cannot disagree.
+ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
+                                             int64_t ic_per_group,
+                                             int64_t oc_per_group,
+                                             DataType weight_dtype);
+
+/// Geometry of the planar route's prepacked filter (PackedOIHW).
+///
+/// Two forms, one tag: a quantized filter packs into the MMA's A panels (the
+/// per-task pack the kernel otherwise repeats), a floating-point one is already
+/// the GEMM's A matrix and only gets a densifying copy (`dense`, and every
+/// field besides `total` is then unused).
+struct ConvPackedWeightPlanar {
+    bool dense = false;      ///< the blob is the filter's own [OC][K] matrix
+    int64_t icn_block = 0;   ///< k block
+    int64_t ocn_block = 0;   ///< oc block
+    int64_t kdim_max = 0;    ///< icn_block × karea
+    int64_t num_oc_blocks = 0;
+    int64_t nfull_ic = 0;
+    int64_t tail_ic = 0;
+    int64_t set_full = 0;    ///< elements of one (k block, oc block) panel set
+    int64_t set_tail = 0;
+    int64_t group_elems = 0;
+    int64_t sums_off = 0;    ///< element offset of the int32 table below
+    int64_t total = 0;       ///< all groups' panel sets, then the sums table
+
+    // A quantized blob carries Σ_k weight[oc, k] per output channel — the
+    // epilogue's R_a — for the same reason the channel-last one carries R_b:
+    // it is a filter property, and a plain int32[OC] table is the only form
+    // both arches can read without knowing a panel format.
+
+    /// Element offset of the panel set for (@p ic_block, @p oc_block) in group
+    /// @p g. Every oc block but the last is `ocn_block` wide, so one formula
+    /// serves both — the trailing block only uses part of its set.
+    int64_t offset(int64_t g, int64_t ic_block, int64_t oc_block) const noexcept;
+};
+
+ConvPackedWeightPlanar conv_packed_weight_planar(const Conv2DAttributes& attrs,
+                                                 int64_t ic_per_group,
+                                                 int64_t oc_per_group,
+                                                 DataType weight_dtype);
+
+/// The descriptor of the blob @p weight prepacks into — the query half of the
+/// two-step prepack, what Conv2D::prepackWeights returns. Rank 0 for a filter
+/// with no prepacked form. Shape [OC, ⌈elems / OC⌉] with an explicit pitch, so
+/// numel() is exactly the buffer the pack writes.
+TensorDesc conv_packed_weight_desc(const Conv2DAttributes& attrs,
+                                   const TensorDesc& weight);
+
+/// Fill @p packed — sized from conv_packed_weight_desc — from the raw filter.
+void conv_packed_weight_pack(const Conv2DAttributes& attrs,
+                             const TensorView& weight,
+                             TensorView& packed,
+                             const ComputeContext& ctx);
 
 /// Scratch geometry — one source of truth for the plan's sizing and both
 /// routes' pointers. All offsets are bytes, and the per-slot ones are into the
@@ -209,11 +319,16 @@ inline Conv2DGemmScratch gemm_scratch_layout(const Conv2DGemmPlan& p,
 ///     add_to supported on the planar route only.
 /// @p num_threads drives the oh-chunk split; @p use_thread_slots sizes the
 /// scratch per worker thread (thread_id-indexed) instead of per task.
+/// @p num_slots is how many distinct ids `current_thread_id()` can report — the
+/// scratch is min(num_slots, tasks) then. Leave it 0 unless the backend hands
+/// out more items than workers: `num_threads` may legitimately exceed the worker
+/// count (an over-subscribed task grid) and the scratch must not follow it.
 Conv2DGemmPlan get_conv2d_implicit_gemm_plan(const Conv2DAttributes& attrs,
                                              std::span<const TensorDesc> inputs,
                                              std::span<const TensorDesc> outputs,
                                              int num_threads,
-                                             bool use_thread_slots = false);
+                                             bool use_thread_slots = false,
+                                             int64_t num_slots = 0);
 
 /// Conv2D through the implicit-GEMM route of the activation's layout: f32 /
 /// f16, or a quantized weight (s8, per-channel QuantParams) × a u8/s8/f16/f32

@@ -223,7 +223,8 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
                                             std::span<const TensorDesc> inputs,
                                             std::span<const TensorDesc> outputs,
                                             int num_threads,
-                                            bool use_thread_slots = false);
+                                            bool use_thread_slots = false,
+                                            int64_t num_slots = 0);
 
 /// Winograd F(2×2, 3×3) Conv2D kernel (f32 / f16, k3s1, NCHW or NHWC).
 ///
