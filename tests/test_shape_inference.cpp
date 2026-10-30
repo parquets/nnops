@@ -286,20 +286,22 @@ NNOPS_TEST(shape_depthwise_conv_2d) {
     validate_output(descs[0], 4, {1, 32, 56, 56}, TensorLayout::NCHW);
 }
 
-NNOPS_TEST(shape_depthwise_conv_2d_nchwc8) {
+NNOPS_TEST(shape_depthwise_conv_2d_nhwc) {
+    // Channel-last: the dims stay the logical [N, C, H, W]; only the layout tag
+    // says the memory order, so the shape math is the planar math.
     auto op = DepthwiseConv::create(Backend::CPU);
     auto& attrs = const_cast<DepthwiseConvAttributes&>(op->attributes());
     attrs.kernel_size = {1, 3, 3};
     attrs.stride  = {1, 1, 1};
     attrs.padding = {1, 1, 1};
 
-    TensorDesc in_desc = td({1, 32, 56, 56}, DataType::f32, TensorLayout::NCHWC8);
-    TensorDesc wt_desc = td({32, 1, 3, 3});
+    TensorDesc in_desc = td({1, 32, 56, 56}, DataType::f32, TensorLayout::NHWC);
+    TensorDesc wt_desc = td({1, 3, 3, 32}, DataType::f32, TensorLayout::HWCM);
     const TensorDesc desc_arr[] = {in_desc, wt_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     // OH = (56+2-3)/1+1 = 56, OW = 56
-    validate_output(descs[0], 4, {1, 32, 56, 56}, TensorLayout::NCHWC8);
+    validate_output(descs[0], 4, {1, 32, 56, 56}, TensorLayout::NHWC);
 }
 
 NNOPS_TEST(shape_depthwise_conv_3d) {
@@ -337,19 +339,19 @@ NNOPS_TEST(shape_pooling_2d) {
     validate_output(descs[0], 4, {1, 64, 56, 56}, TensorLayout::NCHW);
 }
 
-NNOPS_TEST(shape_pooling_2d_nchwc8) {
+NNOPS_TEST(shape_pooling_2d_nhwc) {
     auto op = Pooling::create(Backend::CPU);
     auto& attrs = const_cast<PoolingAttributes&>(op->attributes());
     attrs.kernel_shape = {2, 3, 3};
     attrs.stride   = {1, 2, 2};
     attrs.padding  = {0, 1, 1};
 
-    TensorDesc in_desc = td({1, 32, 56, 56}, DataType::f32, TensorLayout::NCHWC8);
+    TensorDesc in_desc = td({1, 32, 56, 56}, DataType::f32, TensorLayout::NHWC);
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     // OH = (56+2-3)/2+1 = 28
-    validate_output(descs[0], 4, {1, 32, 28, 28}, TensorLayout::NCHWC8);
+    validate_output(descs[0], 4, {1, 32, 28, 28}, TensorLayout::NHWC);
     NNOPS_EXPECT_TRUE(descs[0].storage_bytes() >= descs[0].nbytes());
 }
 
@@ -400,19 +402,19 @@ NNOPS_TEST(shape_pooling_3d) {
     validate_output(descs[0], 5, {1, 16, 7, 55, 55}, TensorLayout::NCHW);
 }
 
-NNOPS_TEST(shape_pooling_3d_ncdhwc8) {
+NNOPS_TEST(shape_pooling_3d_ndhwc) {
     auto op = Pooling::create(Backend::CPU);
     auto& attrs = const_cast<PoolingAttributes&>(op->attributes());
     attrs.kernel_shape = {2, 2, 2};
     attrs.stride   = {2, 2, 2};
     attrs.padding  = {0, 0, 0};
 
-    TensorDesc in_desc = td({1, 8, 8, 56, 56}, DataType::f32, TensorLayout::NCDHWC8);
+    TensorDesc in_desc = td({1, 8, 8, 56, 56}, DataType::f32, TensorLayout::NDHWC);
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     // OD = (8-2)/2+1 = 4, OH = (56-2)/2+1 = 28, OW = 28
-    validate_output(descs[0], 5, {1, 8, 4, 28, 28}, TensorLayout::NCDHWC8);
+    validate_output(descs[0], 5, {1, 8, 4, 28, 28}, TensorLayout::NDHWC);
 }
 
 // ============================================================

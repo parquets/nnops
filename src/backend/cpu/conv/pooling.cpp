@@ -1,27 +1,24 @@
 /// @file pooling.cpp
 /// @brief SIMD-optimized CPU implementation of 2D/3D spatial pooling in the
-///        planar (NCHW/NCDHW), packed (NCHWC8/NCDHWC8) and channel-last
-///        (NHWC/NDHWC) layouts.
+///        planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC) layouts.
 ///
 /// Key design decisions:
-///   1. The layout picks the vector lane. Packed and channel-last: the lane is
-///      the channel, so all blocks use SIMD — pad channels in NCHWC8 input are
-///      zero (max ignores them, avg adds 0), and a channel-last plane's last
-///      block runs short instead. Planar: one channel plane at a time, the
-///      lane runs along output width.
+///   1. The layout picks the vector lane. Channel-last: the lane is the
+///      channel, and a plane's last block runs short. Planar: one channel plane
+///      at a time, the lane runs along output width.
 ///   2. SIMD kernels handle exclude_pad via in-kernel per-position valid_count.
 ///   3. Height-4 blocking (4 output rows per call) on the channel lane; the row
 ///      driver skips rows past OH, so the channel-last route needs no h1 tail.
 ///      A planar row has no h4 form.
 ///   4. In-kernel bounds checking for all kernel positions — no pre-splitting.
 ///   5. All SW values supported — offset math is just integer arithmetic.
-///   6. Task grid: (n, block) per task when packed, (n, block) too when global,
-///      and (n, od, row group) with the channel blocks swept inside the task
-///      when channel-last — see pooling_last_impl.
+///   6. Task grid: (n, block) when global, and (n, od, row group) with the
+///      channel blocks swept inside the task when channel-last — see
+///      pooling_last_impl.
 ///   7. Params passed by const reference (unified across all kernels).
 ///
-/// Quantized pooling runs on the channel lane, so it covers the packed and
-/// channel-last layouts; on planar it stays unsupported.
+/// Quantized pooling runs on the channel lane, so it covers the channel-last
+/// layout; on planar it stays unsupported.
 
 #include "nnops/ops/pooling.hpp"
 #include "nnops/detail/assert.hpp"
@@ -49,11 +46,9 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t rank  = input.rank();
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
-    // Channel blocks: C8 blocks when packed, one per channel when planar. The
-    // block strides below describe both, so only the row kernel differs.
+    // One "block" per channel: a planar tensor has no channel vector.
     const int64_t N      = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
-    const bool packed    = is_channel_packed(input.layout());
 
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH = input.shape(srank);
@@ -99,18 +94,12 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t out_ch_stride = output.channel_block_stride_elems();
     const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
 
-    // Select SIMD kernels (all C8 blocks use SIMD)
+    // Planar rows are vectorized along W, so there is one kernel and no h4 form.
     using PoolingFn = void (*)(T*, const T*, const k::PoolingKernelParams&,
                                 float, bool);
-    const bool is_max = (attrs.type == PoolingType::Max);
-    const PoolingFn pool_h4_fn = is_max ? k::maxpool_h4<T> : k::avgpool_h4<T>;
-    // A planar row is vectorized along W, so it has no h4 form: the h4 slot is
-    // only reached when packed, and the h1 slot carries the layout's kernel.
-    const PoolingFn pool_h1_fn = packed
-        ? (is_max ? k::maxpool_h1<T> : k::avgpool_h1<T>)
-        : (is_max ? k::maxpool_planar<T> : k::avgpool_planar<T>);
+    const PoolingFn pool_fn = (attrs.type == PoolingType::Max)
+        ? k::maxpool_planar<T> : k::avgpool_planar<T>;
 
-    // Per-block compute lambda (all C8 blocks use SIMD — pad channels are zero)
     const auto compute_block = [&](int64_t n, int64_t blk) {
         const T* in_base  = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
         T* out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
@@ -121,20 +110,11 @@ void pooling_impl(const PoolingAttributes& attrs,
         for (int64_t od = 0; od < OD; ++od) {
             T* out_d = out_base + od * pc.out_row_stride * OH;
 
-            int64_t oh = 0;
-            if (packed) {
-                for (; oh + 3 < OH; oh += 4) {
-                    pc.od = od;
-                    pc.oh = oh;
-                    pool_h4_fn(out_d + oh * pc.out_row_stride, in_base, pc, avg_scale,
-                               attrs.add_to);
-                }
-            }
-            for (; oh < OH; ++oh) {
+            for (int64_t oh = 0; oh < OH; ++oh) {
                 pc.od = od;
                 pc.oh = oh;
-                pool_h1_fn(out_d + oh * pc.out_row_stride, in_base,
-                           pc, avg_scale, attrs.add_to);
+                pool_fn(out_d + oh * pc.out_row_stride, in_base,
+                        pc, avg_scale, attrs.add_to);
             }
         }
     };
@@ -147,9 +127,10 @@ void pooling_impl(const PoolingAttributes& attrs,
 // Channel-last (NHWC/NDHWC) pooling — the lane spans channels
 // ============================================================
 //
-// The kernel is the packed one (pool_last): same lane, same window walk, pixels
-// C elements apart instead of one vector. What changes is the grid. On a
-// channel-last plane a cache line holds a run of one pixel's channels, so a
+// The kernel is the channel-lane one (pool_last): the lane is the channel and
+// the window walk is the same at any pixel distance. What the layout decides is
+// the grid. On a channel-last plane a cache line holds a run of one pixel's
+// channels, so a
 // (n, block) task per block would make every line be fetched C/8 times over —
 // the pixel is only whole across the channel blocks. A task therefore owns a
 // group of four output rows *and* every channel block of them: the row group's
@@ -313,12 +294,9 @@ void pooling_global_impl(const PoolingAttributes& attrs,
     const int64_t N      = input.shape(0);
     const int64_t C      = input.shape(1);
     const bool last      = is_channel_last(input.layout());
-    const bool packed    = is_channel_packed(input.layout());
-    // Blocks: C8 (or C, for planar) for the blocked layouts, ceil(C/16) for a
-    // channel-last plane, which has no block axis of its own and reads a whole
-    // 64-byte line of f32 per task.
-    // A channel-last task reads kGlobalCh channels of one pixel per visit: 16
-    // f32 is a whole 64-byte line, so the plane is fetched once rather than
+    // Blocks: one per channel plane for planar, ceil(C/16) for a channel-last
+    // one. A channel-last task reads kGlobalCh channels of one pixel per visit:
+    // 16 f32 is a whole 64-byte line, so the plane is fetched once rather than
     // twice, and a task still has work small enough to split across the pool.
     constexpr int64_t kGlobalCh = 16;
     const int64_t blocks = last ? (C + kGlobalCh - 1) / kGlobalCh
@@ -375,13 +353,8 @@ void pooling_global_impl(const PoolingAttributes& attrs,
         const T* in_base = in_ptr + tid * in_ch_stride;
         T* out_base = out_ptr + tid * out_ch_stride;
 
-        if (packed) {
-            k::global_store(out_base, k::global_channel<IsMax>(in_base, p, scale, 8),
-                            attrs.add_to);
-        } else {
-            s_store_add(out_base, k::global_planar<IsMax>(in_base, p, scale),
-                        attrs.add_to);
-        }
+        s_store_add(out_base, k::global_planar<IsMax>(in_base, p, scale),
+                    attrs.add_to);
     });
 }
 
@@ -435,140 +408,6 @@ inline PoolingAttributes full_extent_window(PoolingAttributes attrs,
 // MaxPooling additionally takes a raw-integer fast path when input and output
 // share the same dtype, scale and zero_point (and !add_to) — then `max` in the
 // integer domain matches `max` in the float domain exactly.
-
-template <typename InT, typename OutT>
-void pooling_impl_quant(const PoolingAttributes& attrs,
-                    TensorView& output,
-                    std::span<const TensorView> inputs,
-                    const ComputeContext& ctx)
-{
-    const auto& input = inputs[0];
-    const int64_t rank  = input.rank();
-    const int64_t srank = PoolingAttributes::spatial_rank(rank);
-
-    const int64_t N  = input.shape(0);
-    const int64_t C8 = input.num_channel_blocks();
-
-    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
-    const int64_t IH = input.shape(srank);
-    const int64_t IW = input.shape(srank + 1);
-
-    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
-    const int64_t OH = output.shape(srank);
-    const int64_t OW = output.shape(srank + 1);
-
-    const int64_t KD = (srank == 3) ? attrs.kernel_shape[0] : 1;
-    const int64_t KH = attrs.kernel_shape[1];
-    const int64_t KW = attrs.kernel_shape[2];
-
-    const int64_t SD = (srank == 3) ? attrs.stride[0] : 1;
-    const int64_t SH = attrs.stride[1];
-    const int64_t SW = attrs.stride[2];
-
-    const int64_t DD_ = (srank == 3) ? attrs.dilation[0] : 1;
-    const int64_t DH  = attrs.dilation[1];
-    const int64_t DW  = attrs.dilation[2];
-
-    const int64_t PD = (srank == 3) ? attrs.padding[0] : 0;
-    const int64_t PH = attrs.padding[1];
-    const int64_t PW = attrs.padding[2];
-
-    const auto& in_qp  = input.quant_params();
-    const auto& out_qp = output.quant_params();
-    const float in_scale  = in_qp.scale;
-    const float in_zero   = static_cast<float>(in_qp.zero_point);
-    const float out_scale = out_qp.scale;
-    const float out_zero  = static_cast<float>(out_qp.zero_point);
-
-    const bool use_fast = (attrs.type == PoolingType::Max)
-                       && std::is_same_v<InT, OutT>
-                       && !attrs.add_to
-                       && (in_qp.scale == out_qp.scale)
-                       && (in_qp.zero_point == out_qp.zero_point);
-
-    auto* out_ptr = output.ptr<OutT>();
-    const auto* in_ptr = input.ptr<InT>();
-
-    k::PoolingKernelParams p{};
-    p.ID = ID; p.IH = IH; p.IW = IW;
-    p.OH = OH; p.OW = OW;
-    p.KD = KD; p.KH = KH; p.KW = KW;
-    p.SD = SD; p.SH = SH; p.SW = SW;
-    p.DD = DD_; p.DH = DH; p.DW = DW;
-    p.PD = PD; p.PH = PH; p.PW = PW;
-    p.out_row_stride = output.row_stride_elems();
-    p.in_d_stride    = IH * input.row_stride_elems();
-    p.in_row_stride  = input.row_stride_elems();
-    p.exclude_pad    = attrs.exclude_pad;
-
-    const int64_t in_ch_stride  = input.channel_block_stride_elems();
-    const int64_t out_ch_stride = output.channel_block_stride_elems();
-    const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
-
-    const auto compute_c8 = [&](int64_t n, int64_t c8) {
-        const InT* in_base  = in_ptr + n * C8 * in_ch_stride + c8 * in_ch_stride;
-        OutT* out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
-
-        // Per-task copy (see above).
-        k::PoolingKernelParams pc = p;
-
-        for (int64_t od = 0; od < OD; ++od) {
-            OutT* out_d = out_base + od * pc.out_row_stride * OH;
-
-            int64_t oh = 0;
-            if (use_fast) {
-                // Only instantiated when InT == OutT (guaranteed by use_fast).
-                if constexpr (std::is_same_v<InT, OutT>) {
-                    for (; oh + 3 < OH; oh += 4) {
-                        pc.od = od;
-                        pc.oh = oh;
-                        k::maxpool_h4_quant_fast<InT>(out_d + oh * pc.out_row_stride,
-                                                   in_base, pc, out_zero);
-                    }
-                    for (; oh < OH; ++oh) {
-                        pc.od = od;
-                        pc.oh = oh;
-                        k::maxpool_h1_quant_fast<InT>(out_d + oh * pc.out_row_stride,
-                                                   in_base, pc, out_zero);
-                    }
-                }
-            } else if (attrs.type == PoolingType::Max) {
-                for (; oh + 3 < OH; oh += 4) {
-                    pc.od = od;
-                    pc.oh = oh;
-                    k::maxpool_h4_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
-                                               in_scale, in_zero, out_scale, out_zero,
-                                               attrs.add_to);
-                }
-                for (; oh < OH; ++oh) {
-                    pc.od = od;
-                    pc.oh = oh;
-                    k::maxpool_h1_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
-                                               in_scale, in_zero, out_scale, out_zero,
-                                               attrs.add_to);
-                }
-            } else {
-                for (; oh + 3 < OH; oh += 4) {
-                    pc.od = od;
-                    pc.oh = oh;
-                    k::avgpool_h4_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
-                                               avg_scale, in_scale, in_zero, out_scale,
-                                               out_zero, attrs.add_to);
-                }
-                for (; oh < OH; ++oh) {
-                    pc.od = od;
-                    pc.oh = oh;
-                    k::avgpool_h1_quant<InT, OutT>(out_d + oh * pc.out_row_stride, in_base, pc,
-                                               avg_scale, in_scale, in_zero, out_scale,
-                                               out_zero, attrs.add_to);
-                }
-            }
-        }
-    };
-
-    ctx.cpu.run(0, N * C8,
-            [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
-}
 
 /// Channel-last quantized pooling — the fp grid (see pooling_last_impl) and the
 /// same dequantize/requantize kernels, with the raw-integer max kept for the
@@ -681,16 +520,15 @@ void pooling_last_impl_quant(const PoolingAttributes& attrs,
     });
 }
 
-/// Layout dispatch shared by the four quantized instantiations.
+/// Layout dispatch shared by the four quantized instantiations. Quantized
+/// pooling is channel-lane only, so there is one route and a type dispatch.
 template <typename InT, typename OutT>
 void pooling_quant(const PoolingAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx)
 {
-    if (!is_channel_last(inputs[0].layout())) {
-        pooling_impl_quant<InT, OutT>(attrs, output, inputs, ctx);
-    } else if (attrs.type == PoolingType::Max) {
+    if (attrs.type == PoolingType::Max) {
         pooling_last_impl_quant<true, InT, OutT>(attrs, output, inputs, ctx);
     } else {
         pooling_last_impl_quant<false, InT, OutT>(attrs, output, inputs, ctx);
@@ -710,9 +548,8 @@ Status pooling_cpu(const PoolingAttributes& attrs,
     const bool quant = (dtype == DataType::s8 || dtype == DataType::u8);
 
     // Quantized pooling lives on the channel lane, so it needs a layout that
-    // has one: packed or channel-last. A planar plane has no channel vector.
-    if (quant && !is_channel_packed(inputs[0].layout()) &&
-        !is_channel_last(inputs[0].layout())) {
+    // has one: channel-last. A planar plane has no channel vector.
+    if (quant && !is_channel_last(inputs[0].layout())) {
         return Status::unsupported;
     }
     // ...and it has no whole-plane form, so a global request takes the window

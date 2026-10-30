@@ -253,17 +253,16 @@ inline void quantization(int M, int N,
 }
 
 // =========================================================================
-//  NCHWC8 8-wide primitives (8 channels = 8 bytes = one 64-bit group)
+//  8-wide primitives (8 lanes = 8 bytes = one 64-bit group)
 //
-// These operate on a single channel-packed lane group (8 int8/uint8 values) —
-// the granularity used by the quantized depthwise-conv / pooling SIMD kernels.
+// These operate on eight adjacent channel lanes — the granularity the
+// channel-lane quantized kernels use.
 // =========================================================================
 
 /// Requantize 8 floats to 8 int8/uint8 with a broadcast (per-tensor) scale and
 /// zero_point: `dst[i] = clamp(round(src[i] * inv_scale + zero), qmin, qmax)`.
 /// Rounding is round-to-nearest-even (`vcvtnq_s32_f32`), matching the per-token
-/// `quantization<T>` path and the x86_64 `requantize_8`. Used for output
-/// requantization of the NCHWC8 quantized depthwise-conv / pooling kernels.
+/// `quantization<T>` path and the x86_64 `requantize_8`.
 template <typename T>
 inline void requantize_8(T* NNOPS_RESTRICT dst, const float* NNOPS_RESTRICT src,
                          float inv_scale, float zero) noexcept {

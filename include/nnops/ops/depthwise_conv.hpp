@@ -1,7 +1,7 @@
 #pragma once
 /// @file depthwise_conv.hpp
 /// @brief DepthwiseConv operator — depthwise separable 2D/3D convolution, on
-///        either a planar (NCHW/NCDHW) or a packed (NCHWC8/NCDHWC8) tensor.
+///        either a planar (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
 ///
 /// Depthwise convolution applies a separate filter to each input channel independently.
 /// There is no cross-channel mixing. This is the first step of a depthwise-separable
@@ -12,8 +12,9 @@
 ///   3D (rank 5): Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW]
 /// Output channels equal input channels. Optional bias: [C].
 ///
-/// A packed input takes the weights prepacked by prepackWeights(); a planar
-/// input takes the raw weight and bias, and supports f32/f16 only.
+/// Both routes read the raw filter: a planar input [C, 1, (KD,) KH, KW] as it
+/// is, a channel-last one the HWCM [KH][KW][C] form. Planar has f32/f16 kernels
+/// only; the channel lane also covers the quantized s8/u8 pairs.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -61,7 +62,8 @@ struct DepthwiseConvAttributes {
 /// DepthwiseConv operator (class-based API).
 ///
 /// Each input channel is convolved with its own independent filter, with no
-/// cross-channel mixing; the input's layout (planar or packed) is the output's.
+/// cross-channel mixing; the input's layout (planar or channel-last) is the
+/// output's.
 ///
 /// 2D: Input [N, C, IH, IW], Weight [C, 1, KH, KW], Output [N, C, OH, OW].
 /// 3D: Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW], Output [N, C, OD, OH, OW].
@@ -88,10 +90,6 @@ public:
                  std::span<const TensorView> inputs,
                  const ComputeContext& ctx = {},
                  void* workspace = nullptr) override;
-
-    void prepackWeights(std::span<const TensorView> inputs,
-                        std::span<TensorView> outputs,
-                        const ComputeContext& ctx = {}) override;
 
     OpType  getOpType()  const override { return OpType::DepthwiseConv; }
     Backend getBackend() const override { return backend_; }

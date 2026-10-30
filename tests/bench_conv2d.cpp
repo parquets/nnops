@@ -218,7 +218,7 @@ void bench_conv2d_case(const Conv2DCase& c) {
 }
 
 // ============================================================
-// DepthwiseConv — dedicated NCHWC8 kernel (vs the im2col group path)
+// DepthwiseConv — the dedicated planar kernel (vs the im2col group path)
 // ============================================================
 
 struct DepthwiseCase {
@@ -240,58 +240,28 @@ void run_depthwise(const DepthwiseCase& c, const std::vector<int>& threads, int 
     attrs.dilation    = {1, 1, 1};
     attrs.padding     = {0, c.PH, c.PW};
 
-    // Pack input NCHW -> NCHWC8 (layout convert, done once outside timing).
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    TensorDesc in_desc = in_nchw.desc();
-    const TensorDesc lc_in_arr[] = {in_desc};
-    auto in_c8_descs = lc_in->getOutputTensorDesc(lc_in_arr);
-    std::vector<float> in_c8_buf(static_cast<size_t>(in_c8_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(in_c8_descs[0], in_c8_buf.data());
-    {
-        const TensorView i[] = {in_nchw};
-        TensorView o[] = {in_c8};
-        lc_in->compute(o, i);
-    }
-
-    // Prepack weight: query -> allocate -> pack (once, outside timing).
+    // The raw filter goes straight to the operator: no pack, no prepack.
     auto dw_op = DepthwiseConv::create(attrs, Backend::CPU);
-    TensorView pw_query;
-    {
-        const TensorView wq[] = {w_nchw};
-        TensorView pq[] = {pw_query};
-        dw_op->prepackWeights(wq, pq);
-        pw_query = pq[0];
-    }
-    std::vector<float> pw_buf(static_cast<size_t>(pw_query.numel()));
-    auto pw_view = test::make_planar(pw_query.desc(), pw_buf.data());
-    {
-        const TensorView wp[] = {w_nchw};
-        TensorView po[] = {pw_view};
-        dw_op->prepackWeights(wp, po);
-    }
 
-    // Output desc (NCHWC8) + geometry.
-    TensorDesc in_c8_desc = in_c8.desc();
-    TensorDesc pw_desc = pw_view.desc();
-    const TensorDesc dw_arr[] = {in_c8_desc, pw_desc};
+    const TensorView dw_in[] = {in_nchw, w_nchw};
+    const TensorDesc dw_arr[] = {in_nchw.desc(), w_nchw.desc()};
     auto out_descs = dw_op->getOutputTensorDesc(dw_arr);
     const int64_t OH = out_descs[0].dims[2];
     const int64_t OW = out_descs[0].dims[3];
     const double flops_per_iter = 2.0 * static_cast<double>(c.N) * c.C * OH * OW * c.KH * c.KW;
 
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], out_buf.data());
+    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = test::make_planar(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
-    std::printf("    in[%lld,%lld,%lld,%lld]  w[%lld,1,%lldx%lld]  -> out[%lld,%lld,%lld,%lld]  NCHWC8\n",
+    std::printf("    in[%lld,%lld,%lld,%lld]  w[%lld,1,%lldx%lld]  -> out[%lld,%lld,%lld,%lld]  NCHW\n",
                 (long long)c.N, (long long)c.C, (long long)c.IH, (long long)c.IW,
                 (long long)c.C, (long long)c.KH, (long long)c.KW,
                 (long long)c.N, (long long)c.C, (long long)OH, (long long)OW);
 
     auto compute = [&](const ComputeContext& ctx) {
-        const TensorView ins[] = {in_c8, pw_view};
-        TensorView outs[] = {out_c8};
-        dw_op->compute(outs, ins, ctx, nullptr);
+        TensorView outs[] = {out};
+        dw_op->compute(outs, dw_in, ctx, nullptr);
     };
     std::vector<double> gflops;
     for (int nt : threads) {
@@ -1229,7 +1199,7 @@ NNOPS_BENCH(conv2d_f32_5x5_dilated2) {
 
 NNOPS_BENCH(conv2d_f32_5x5_grouped) {
     // The im2col grouped path at 5x5 — pairs with dwconv_f32_5x5 below, which is
-    // the dedicated NCHWC8 kernel on the same shape.
+    // the dedicated depthwise kernel on the same shape.
     bench_conv2d_case({"f32 depthwise 5x5 1x128x28x28 -> 128 x 5x5 g128 s1 p2",
                        1, 128, 28, 28, 128, 5, 5, /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2,
                        /*DH=*/1, /*DW=*/1, /*groups=*/128});
@@ -1248,7 +1218,7 @@ NNOPS_BENCH(conv2d_f16_7x7) {
 }
 
 // ============================================================
-// DepthwiseConv — dedicated NCHWC8 kernel
+// DepthwiseConv — the dedicated planar kernel
 // ============================================================
 
 NNOPS_BENCH(dwconv_f32_3x3) {

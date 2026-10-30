@@ -1,10 +1,11 @@
 #pragma once
 /// @file pooling.hpp
 /// @brief Pooling operator — 2D/3D spatial pooling on either a planar
-///        (NCHW/NCDHW) or a packed (NCHWC8/NCDHWC8) tensor.
+///        (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
 ///
 /// The input's layout is the output's: NCHW stays NCHW. Planar input supports
-/// f32/f16; quantized (s8/u8) pooling is packed-only.
+/// f32/f16; quantized (s8/u8) pooling is channel-last only — the quantization
+/// axis is the channel, which a planar plane does not keep together.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -25,10 +26,10 @@ enum class PoolingType : uint8_t {
 
 /// Attributes for the Pooling operator (supports both 2D and 3D).
 ///
-/// For 2D pooling (NCHWC8 input, rank=4): only the last 2 elements of each array
-/// are used (H, W dimensions). The first element (D) is ignored.
+/// For 2D pooling (rank-4 input): only the last 2 elements of each array are
+/// used (H, W dimensions). The first element (D) is ignored.
 ///
-/// For 3D pooling (NCDHWC8 input, rank=5): all 3 elements are used (D, H, W).
+/// For 3D pooling (rank-5 input): all 3 elements are used (D, H, W).
 struct PoolingAttributes {
     PoolingType type = PoolingType::Max;
 

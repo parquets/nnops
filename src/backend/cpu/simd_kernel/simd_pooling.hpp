@@ -3,19 +3,16 @@
 /// @brief SIMD kernels for 2D/3D spatial pooling.
 ///
 /// Two driver families, one per lane choice:
-///   packed    — the lane is a channel inside a C8 block, so the loop is over ow.
-///               Every C8 block (partial ones included) runs the SIMD path,
-///               since NCHWC8 pads channels with zeros (max ignores them, avg
-///               adds 0). Channel-last (NHWC/NDHWC) takes this same row driver:
-///               its lane is also the channel, only pixels are C elements apart
-///               instead of one vector, and its last block can run short.
+///   channel   — the lane is a channel, so the loop is over ow. Channel-last
+///               (NHWC/NDHWC) pixels are C elements apart, and a ragged last
+///               block runs short.
 ///   planar    — NCHW/NCDHW: the lane is an output column, so padding is filled
 ///               per lane instead of skipped, and one row is produced per call.
 /// One driver covers every variant: the row count (h4/h1), the accumulate
 /// (max/avg), and the element type (f32/f16 vs dequantize/requantize) are all
 /// template parameters. Bounds are checked in-kernel, so any stride/padding
 /// combination works. Quantized pooling runs on the channel lane, so it covers
-/// the packed and channel-last layouts but not planar.
+/// the channel-last layout but not planar.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_access.hpp"
@@ -46,9 +43,8 @@ struct PoolingKernelParams {
     int64_t in_d_stride;         // input depth stride (elems)
     int64_t in_row_stride;       // input row stride (elems)
     bool exclude_pad = false;    // AvgPool: divide by valid count instead of K_total
-    int64_t pix_stride = 8;      // elems between adjacent pixels: 8 for a
-                                 // channel-packed block, the channel count for
-                                 // a channel-last plane
+    int64_t pix_stride = 8;      // elems between adjacent pixels: the channel
+                                 // count on a channel-last plane
     int64_t ow0 = 0;             // first output column this call covers
     int64_t ow_end = -1;         // one past the last; negative means OW
 };
@@ -67,11 +63,10 @@ struct PoolingKernelParams {
 //     the only product left in the loop is the one the pixel stride forces;
 //   * an interior span of output positions whose every tap is inside the input
 //     row, where the tap loop takes no bounds test and no null test at all;
-//   * NV adjacent channel vectors of the pixel per call. The packed route is
-//     always 1 (a block is one vector and its planes are dense); a channel-last
-//     plane takes 2, because a 64-byte line holds two vectors and a one-vector
-//     call leaves the other half of every line for a later sweep — twice the
-//     line traffic for the same arithmetic.
+//   * NV adjacent channel vectors of the pixel per call. A channel-last plane
+//     takes 2 where the channels allow it, because a 64-byte line holds two
+//     vectors and a one-vector call leaves the other half of every line for a
+//     later sweep — twice the line traffic for the same arithmetic.
 
 template <int R, int NV, bool IsMax, typename Src, typename Dst>
 inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
@@ -223,8 +218,8 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
 // would read whatever the pitch holds — and is filled with the accumulate's
 // identity instead (planar_load). And a row's last block carries fewer than L
 // live lanes, so it stores through a scalar tail. One output row per call: the
-// packed path's h4 blocking shares input rows across output rows, which is not
-// where a width-vectorized kernel spends its time.
+// channel path's h4 blocking shares input rows across output rows, which is
+// not where a width-vectorized kernel spends its time.
 
 template <bool IsMax, typename T>
 inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
@@ -258,7 +253,7 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
         return row_taps * n;
     };
 
-    // Max: an all-padding window is 0 (the packed kernel and the reference both
+    // Max: an all-padding window is 0 (the channel kernel and the reference
     // say so). Avg: exclude_pad divides by the tap count. With no padding the
     // tap count is uniform and this is a single scale.
     const bool count_taps = IsMax ? (p.PD != 0 || p.PH != 0 || p.PW != 0)
@@ -316,7 +311,7 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
 // of contiguous memory instead of a window walk
 // ============================================================
 //
-// One output element (planar) or one C8 block (packed) per channel plane, and
+// One output element (planar) or one channel vector per plane, and
 // no bounds math at all. The plane is walked row by row (the pitch can exceed
 // the row width) with four accumulators, so the sum is off the add's latency
 // chain, and a scalar tail, since neither a row width nor a plane size is a
@@ -429,9 +424,8 @@ template <typename T>
 inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t lanes);
 
 /// Max/avg of one channel vector's plane — the lanes are eight channels of the
-/// same pixel. A channel-packed block is a plane of its own, contiguous; a
-/// channel-last one is every C-th vector of the plane, which is why @c
-/// pix_stride is a parameter (8 vs C). A short last block takes masked loads.
+/// same pixel — every C-th vector of the plane on a channel-last tensor, which
+/// is why @c pix_stride is a parameter. A short last block takes masked loads.
 ///
 /// NV vectors of a pixel per pass, like the window kernel: one vector per pass
 /// over a channel-last plane spends two passes on every 64-byte line, and the
@@ -496,7 +490,9 @@ inline void global_channel_vec(T* out, const T* in, const PoolingKernelParams& p
     }
 }
 
-/// One channel vector's plane — the single-vector form the packed route uses.
+/// One channel vector's plane — the single-vector form the short last block of
+/// a channel-last task takes (eight channels or fewer, where the two-vector walk
+/// has nothing to pair).
 template <bool IsMax, typename T>
 inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float scale,
                               int64_t lanes)
@@ -532,7 +528,7 @@ inline v_f32x8 global_channel(const T* in, const PoolingKernelParams& p, float s
     return IsMax ? v : v_mul(v, v_set1_f32x8(scale));
 }
 
-/// Store a packed plane's reduced vector — narrowing for f16.
+/// Store a reduced channel vector — narrowing for f16.
 template <typename T>
 inline void global_store(T* out, const v_f32x8& v, bool add_to)
 {
@@ -614,9 +610,9 @@ inline void maxpool_fast(T* output, const T* input,
 // ============================================================
 //
 // The lane stays on the channel axis, so the row driver is the same one the
-// packed route uses; only the pixel distance changes (C instead of 8) and the
-// last block can be short. Four output rows per call, as packed: the rows share
-// their input rows, and a row's taps form a single dependent chain.
+// channel driver uses; only the pixel distance changes (C instead of 8) and the
+// last block can be short. Four output rows per call: the rows share their
+// input rows, and a row's taps form a single dependent chain.
 //
 // The row driver already skips the rows past OH, so the driver calls this once
 // per row group and needs no separate h1 tail.
@@ -704,88 +700,8 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
 }
 
 // ============================================================
-// Public kernels — unchanged signatures, one line each
+// Planar (NCHW/NCDHW) entry points
 // ============================================================
-
-template <typename T>
-inline void maxpool_h4(T* output, const T* input, const PoolingKernelParams& p,
-                       float, bool add_to)
-{
-    const FpSrc<T> src[1] = {FpSrc<T>{input}};
-    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
-    pool_rows<4, 1, true>(p, 0.0f, src, dst);
-}
-
-template <typename T>
-inline void maxpool_h1(T* output, const T* input, const PoolingKernelParams& p,
-                       float, bool add_to)
-{
-    const FpSrc<T> src[1] = {FpSrc<T>{input}};
-    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
-    pool_rows<1, 1, true>(p, 0.0f, src, dst);
-}
-
-template <typename T>
-inline void avgpool_h4(T* output, const T* input, const PoolingKernelParams& p,
-                       float scale, bool add_to)
-{
-    const FpSrc<T> src[1] = {FpSrc<T>{input}};
-    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
-    pool_rows<4, 1, false>(p, scale, src, dst);
-}
-
-template <typename T>
-inline void avgpool_h1(T* output, const T* input, const PoolingKernelParams& p,
-                       float scale, bool add_to)
-{
-    const FpSrc<T> src[1] = {FpSrc<T>{input}};
-    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
-    pool_rows<1, 1, false>(p, scale, src, dst);
-}
-
-template <typename InT, typename OutT>
-inline void maxpool_h4_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
-                             float in_scale, float in_zero,
-                             float out_scale, float out_zero, bool add_to)
-{
-    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
-    const QuantDst<OutT> dst[1] = {
-        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
-    pool_rows<4, 1, true>(p, 0.0f, src, dst);
-}
-
-template <typename InT, typename OutT>
-inline void maxpool_h1_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
-                             float in_scale, float in_zero,
-                             float out_scale, float out_zero, bool add_to)
-{
-    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
-    const QuantDst<OutT> dst[1] = {
-        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
-    pool_rows<1, 1, true>(p, 0.0f, src, dst);
-}
-
-template <typename InT, typename OutT>
-inline void avgpool_h4_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
-                             float scale, float in_scale, float in_zero,
-                             float out_scale, float out_zero, bool add_to)
-{
-    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
-    const QuantDst<OutT> dst[1] = {
-        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
-    pool_rows<4, 1, false>(p, scale, src, dst);
-}
-
-template <typename InT, typename OutT>
-inline void avgpool_h1_quant(OutT* output, const InT* input, const PoolingKernelParams& p,
-                             float scale, float in_scale, float in_zero,
-                             float out_scale, float out_zero, bool add_to)
-{
-    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
-    const QuantDst<OutT> dst[1] = {
-        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
-    pool_rows<1, 1, false>(p, scale, src, dst);
-}
 
 template <typename T>
 inline void maxpool_planar(T* output, const T* input, const PoolingKernelParams& p,
@@ -799,20 +715,6 @@ inline void avgpool_planar(T* output, const T* input, const PoolingKernelParams&
                            float scale, bool add_to)
 {
     pool_planar<false>(output, input, p, scale, add_to);
-}
-
-template <typename T>
-inline void maxpool_h4_quant_fast(T* output, const T* input,
-                                  const PoolingKernelParams& p, float out_zero)
-{
-    maxpool_fast<4>(output, input, p, out_zero);
-}
-
-template <typename T>
-inline void maxpool_h1_quant_fast(T* output, const T* input,
-                                  const PoolingKernelParams& p, float out_zero)
-{
-    maxpool_fast<1>(output, input, p, out_zero);
 }
 
 }  // namespace nnops::kernel

@@ -1,14 +1,14 @@
 #pragma once
 /// @file simd_depthwise_conv.hpp
-/// @brief SIMD kernels for 2D/3D depthwise convolution, packed and planar.
+/// @brief SIMD kernels for 2D/3D depthwise convolution, planar and channel-last.
 ///
-/// Packed (NCHWC8/NCDHWC8) weights are prepacked into dense [C8, (KD,) KH, KW, 8]
-/// form and the lane is a channel; planar (NCHW/NCDHW) input reads the raw
+/// Channel-last (NHWC/NDHWC) input reads the raw HWCM filter [KH][KW][C] and
+/// puts the SIMD lane on the channel; planar (NCHW/NCDHW) input reads the raw
 /// [C, 1, (KD,) KH, KW] filter and vectorizes along output width instead.
 /// Rank is
 /// auto-detected: 2D is KD=OD=ID=1, which degenerates the depth loop.
 /// One driver covers h4/h1 and f32/f16/quant; padding is bounds-checked
-/// in-kernel, and all C8 blocks run SIMD since pad channels are zero.
+/// in-kernel.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
@@ -33,18 +33,17 @@ struct DwConvParams {
     int64_t ow_end = -1;          // one past the last; negative means OW
     int64_t in_d_stride;          // input depth stride (elems)
     int64_t in_row_stride;        // input row stride (elems)
-    int64_t pix_stride = 8;       // elems between adjacent pixels: 8 for a
-                                  // channel-packed block, the channel count for
-                                  // a channel-last plane
-    int64_t w_tap_stride = 8;     // elems between adjacent filter taps: 8 for a
-                                  // packed [C8, KH, KW, 8] block, the channel
-                                  // count for a raw [KH][KW][C] filter (and 8
-                                  // for the dequantized staging block built
-                                  // from one)
+    int64_t pix_stride = 8;       // elems between adjacent pixels: the channel
+                                  // count on a channel-last plane, set by the
+                                  // driver
+    int64_t w_tap_stride = 8;     // elems between adjacent filter taps: the
+                                  // channel count for a raw [KH][KW][C] filter
+                                  // (and 8 for the dequantized staging block
+                                  // built from one — see dwconv_last_quant)
 };
 
-/// R output rows per call. W is the packed-weight element type; Tag only picks
-/// the epilogue's f32/f16 overload. Both are deduced by the wrappers below.
+/// R output rows per call. W is the weight element type; Tag only picks the
+/// epilogue's f32/f16 overload. Both are deduced by the wrappers below.
 ///
 /// The width loop is the innermost one, so everything that depends only on the
 /// tap — the input row it reads, the output position it lands on — is hoisted
@@ -74,15 +73,15 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                         const Dst (&dsts)[NV], const V (&vbias)[NV])
 {
     using InPtr = const typename Src::elem*;
-    // The pixel and the filter tap are both "one vector of channels" apart in
-    // the packed layout, and both "the channel count" apart in a channel-last
-    // plane, so the two strides are all that separate the two routes.
+    // The pixel and the filter tap are both "the channel count" apart on a
+    // channel-last plane, so the two strides in @c DwConvParams are what the
+    // driver sets and the kernel never derives.
     //
-    // NV is how many adjacent channel vectors of one pixel a call covers. The
-    // packed route is always 1 (a block is one vector, and its planes are
-    // dense); a channel-last plane wants 2, because a 64-byte cache line holds
-    // two vectors and a single-vector call leaves the other half of every line
-    // to a later pass — 2x the line traffic for the same arithmetic. Because
+    // NV is how many adjacent channel vectors of one pixel a call covers. A
+    // channel-last plane wants 2 where the channels allow it, because a 64-byte
+    // cache line holds two vectors and a single-vector call leaves the other
+    // half of every line to a later pass — 2x the line traffic for the same
+    // arithmetic. Because
     // the row table is built from vector 0 and the access policies load the
     // address they are handed, vector k's channels are added here.
     const int64_t pix = p.pix_stride;
@@ -506,79 +505,23 @@ inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
     }
 }
 
-template <typename T>
-inline void dwconv_h4(T* output, const T* input, const T* w_base,
-                      const T* bias_vec, const DwConvParams& p,
-                      const Epilogue& epilogue, bool add_to)
-{
-    const auto vb = bias_vec ? v_load(bias_vec) : v_zero(output);
-    const decltype(vb) vbias[1] = {vb};
-    const FpSrc<T> src[1] = {FpSrc<T>{input}};
-    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
-    dwconv_rows<4, 1>(p, w_base, output, epilogue, src, dst, vbias);
-}
-
-template <typename T>
-inline void dwconv_h1(T* output, const T* input, const T* w_base,
-                      const T* bias_vec, const DwConvParams& p,
-                      const Epilogue& epilogue, bool add_to)
-{
-    const auto vb = bias_vec ? v_load(bias_vec) : v_zero(output);
-    const decltype(vb) vbias[1] = {vb};
-    const FpSrc<T> src[1] = {FpSrc<T>{input}};
-    const FpDst<T> dst[1] = {FpDst<T>{output, p.out_row_stride, add_to}};
-    dwconv_rows<1, 1>(p, w_base, output, epilogue, src, dst, vbias);
-}
-
-// Quantized: the weights arrive already dequantized (f32, per-channel, with pad
-// lanes neutralized by scale 0), so the accumulate is the same f32 FMA.
-
-template <typename InT, typename OutT>
-inline void dwconv_h4_quant(OutT* output, const InT* input, const float* wq,
-                            const float* bias_vec, const DwConvParams& p,
-                            const Epilogue& epilogue, bool add_to,
-                            float in_scale, float in_zero,
-                            float out_scale, float out_zero)
-{
-    const v_f32x8 vbias[1] = {bias_vec ? v_load(bias_vec) : v_zero_f32x8()};
-    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
-    const QuantDst<OutT> dst[1] = {
-        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
-    dwconv_rows<4, 1>(p, wq, &out_scale, epilogue, src, dst, vbias);
-}
-
-template <typename InT, typename OutT>
-inline void dwconv_h1_quant(OutT* output, const InT* input, const float* wq,
-                            const float* bias_vec, const DwConvParams& p,
-                            const Epilogue& epilogue, bool add_to,
-                            float in_scale, float in_zero,
-                            float out_scale, float out_zero)
-{
-    const v_f32x8 vbias[1] = {bias_vec ? v_load(bias_vec) : v_zero_f32x8()};
-    const QuantSrc<InT> src[1] = {QuantSrc<InT>{input, in_scale, in_zero}};
-    const QuantDst<OutT> dst[1] = {
-        QuantDst<OutT>{output, p.out_row_stride, out_scale, out_zero, add_to}};
-    dwconv_rows<1, 1>(p, wq, &out_scale, epilogue, src, dst, vbias);
-}
-
 // ============================================================
 // Channel-last (NHWC/NDHWC) entry points
 // ============================================================
 //
-// These are the packed kernel (dwconv_rows) with two runtime strides instead of
-// the C8 constants: a pixel is C elements away, because a pixel holds all of
-// the plane's channels, and a filter tap is C elements away too, because the
-// weight is the raw HWCM filter [tap][C] — TensorFlow's depthwise order with
-// the multiplier dropped. No prepack step is involved: the layout already is
-// the access pattern.
+// These are the channel-lane driver (dwconv_rows) with two runtime strides: a
+// pixel is C elements away, because a pixel holds all of the plane's channels,
+// and a filter tap is C elements away too, because the weight is the raw HWCM
+// filter [tap][C] — TensorFlow's depthwise order with the multiplier dropped.
+// No prepack step is involved: the layout already is the access pattern.
 //
-// The driver also keeps the packed route's shape — four output rows per call
-// for the ILP, one channel block per call — and that is not incidental. A
+// The driver also keeps the channel-lane route's shape — four output rows per
+// call for the ILP, one channel block per call — and that is not incidental. A
 // first cut gave the channel-last route its own kernel with NC pixels in flight
 // down the contiguous axis, one output row per task, one task per (row, block).
-// It measured 1.4-1.9x slower than the packed kernel on every shape, and at
-// C = 8 — where the two layouts are byte-identical, so only the kernel differs
-// — it was still 1.4x slower: the column sweep needs eight live accumulators to
+// It measured 1.4-1.9x slower than the channel-block kernel on every shape, and
+// at C = 8 — where a pixel is exactly one vector, so only the kernel differs —
+// it was still 1.4x slower: the column sweep needs eight live accumulators to
 // cover the same four pixels the row sweep gets from four, and the per-block
 // call rebuilt the row table and re-walked the row for each of the C/8 blocks.
 

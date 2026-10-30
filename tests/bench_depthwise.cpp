@@ -1,23 +1,23 @@
 /// @file bench_depthwise.cpp
-/// @brief Depthwise conv: packed (NCHWC8) against planar (NCHW), interleaved.
+/// @brief Depthwise conv: planar (NCHW) against channel-last (NHWC), interleaved.
 ///
-/// These are two kernels, not two layouts of one kernel, and they are built on
-/// opposite assumptions:
+/// The two routes vectorize on opposite axes:
 ///
-///   packed  the SIMD lane is a channel, so one load feeds 8 channels at the
-///           same output position; four output rows are unrolled (h4) and each
-///           tap broadcasts one weight vector into four independent accumulates.
 ///   planar  the SIMD lane is output width, so one load feeds 8 positions of
 ///           ONE row; there is one accumulate per row and the taps chain
 ///           through it (9 dependent FMAs for a 3x3).
+///   nhwc    the SIMD lane is a channel, so one load feeds 16 channels at the
+///           same output position; four output rows are unrolled and each tap
+///           broadcasts one weight vector into four independent accumulates.
 ///
-/// Shape decides which wins: packed's width wastes lanes on a narrow plane
-/// (7x7 gives 7 useful lanes per row, and 14 per four-row group), while planar's
-/// dependent chain is immune to width but cannot hide FMA latency.
+/// Shape decides which wins: the channel lane wastes lanes when the channel
+/// count is small (a 7x7 plane is not the issue, a 3-channel one is), while
+/// planar's dependent chain is immune to channel count but cannot hide FMA
+/// latency.
 ///
-/// Layout conversion and weight prepack are done once, outside every timed
-/// region: an engine converts a tensor once and reuses it, so billing the bench's
-/// convert per call would price the harness, not the kernel.
+/// The layout conversion is done once, outside every timed region: an engine
+/// converts a tensor once and reuses it, so billing the bench's convert per call
+/// would price the harness, not the kernel.
 ///
 /// Each round times A B A — the second A is the null control (same arm, same
 /// buffers, same binary), so an A2/A1 gap is drift and nothing else. A verdict
@@ -25,7 +25,6 @@
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "backend/cpu/simd_kernel/simd_depthwise_conv.hpp"
-#include "nnops/ops/layout_convert.hpp"
 #include "common/bench_harness.hpp"
 #include "common/channel_last.hpp"
 #include "common/cpu_pool.hpp"
@@ -168,45 +167,6 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         planar_op->compute(outs, planar_in, ctx);
     };
 
-    // ---- packed arm: convert in, prepack the weight, allocate a packed out ----
-    auto to_c8 = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    const TensorDesc in_desc = in_nchw.desc();
-    auto in_c8_desc = to_c8->getOutputTensorDesc({&in_desc, 1})[0];
-    std::vector<float> in_c8_buf(static_cast<size_t>(in_c8_desc.storage_bytes() / sizeof(float)));
-    auto in_c8 = test::make_packed(in_c8_desc, in_c8_buf.data());
-    {
-        const TensorView i[] = {in_nchw};
-        TensorView o[] = {in_c8};
-        to_c8->compute(o, i);
-    }
-
-    auto packed_op = DepthwiseConv::create(attrs, Backend::CPU);
-    TensorView pw_query;
-    {
-        const TensorView wq[] = {w_nchw};
-        TensorView pq[] = {pw_query};
-        packed_op->prepackWeights(wq, pq);
-        pw_query = pq[0];
-    }
-    std::vector<float> pw_buf(static_cast<size_t>(pw_query.numel()));
-    auto pw_view = test::make_planar(pw_query.desc(), pw_buf.data());
-    {
-        const TensorView wp[] = {w_nchw};
-        TensorView po[] = {pw_view};
-        packed_op->prepackWeights(wp, po);
-    }
-
-    const TensorView packed_in[] = {in_c8, pw_view, b_nchw};
-    const TensorDesc packed_in_desc[] = {in_c8.desc(), pw_view.desc(), b_nchw.desc()};
-    auto packed_out_desc = packed_op->getOutputTensorDesc(packed_in_desc)[0];
-    std::vector<float> packed_out_buf(
-        static_cast<size_t>(packed_out_desc.storage_bytes() / sizeof(float)));
-    auto packed_out = test::make_packed(packed_out_desc, packed_out_buf.data());
-    const auto packed_call = [&](const ComputeContext& ctx) {
-        TensorView outs[] = {packed_out};
-        packed_op->compute(outs, packed_in, ctx);
-    };
-
     // ---- nhwc arm: TensorFlow's orders, converted once like a real graph ----
     auto in_cl_vec = test::to_channel_last<float>(
         std::span<const float>(in_vec.data(), in_vec.size()), 1, c.C, c.IH * c.IW);
@@ -228,20 +188,9 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         nhwc_op->compute(outs, nhwc_in, ctx);
     };
 
-    // ---- agreement: every arm must be computing the same function ----
+    // ---- agreement: both arms must be computing the same function -------
     planar_call(ComputeContext{});
-    packed_call(ComputeContext{});
     nhwc_call(ComputeContext{});
-    std::vector<float> packed_as_planar(static_cast<size_t>(planar_out_desc.numel()));
-    auto packed_nchw = test::make_planar(planar_out_desc, packed_as_planar.data());
-    {
-        auto to_nchw = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-        const TensorView i[] = {packed_out};
-        TensorView o[] = {packed_nchw};
-        to_nchw->compute(o, i);
-    }
-    const double d = max_abs_diff(planar_out_buf.data(), packed_as_planar.data(),
-                                  planar_out_desc.numel());
     auto nhwc_as_planar = test::to_channel_first<float>(
         std::span<const float>(nhwc_out_buf.data(), nhwc_out_buf.size()),
         1, c.C, OH * OW);
@@ -251,11 +200,11 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
     std::printf("  %s\n", c.name);
     std::printf("    in[1,%lld,%lld,%lld] w[%lld,1,%lldx%lld] s%lld p%lld -> out[1,%lld,%lld,%lld]"
-                "  |planar - packed| = %.2e  |planar - nhwc| = %.2e\n",
+                "  |planar - nhwc| = %.2e\n",
                 (long long)c.C, (long long)c.IH, (long long)c.IW,
                 (long long)c.C, (long long)c.KH, (long long)c.KW,
                 (long long)c.SH, (long long)c.PH,
-                (long long)c.C, (long long)OH, (long long)OW, d, d_cl);
+                (long long)c.C, (long long)OH, (long long)OW, d_cl);
 
     for (int nt : threads) {
         BenchPool pool(nt);
@@ -264,26 +213,22 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
         planar_call(use_ctx);                // warm-up / first touch
-        packed_call(use_ctx);
         nhwc_call(use_ctx);
 
-        std::vector<double> a1, b, cl, a2;
+        std::vector<double> a1, cl, a2;
         for (int r = 0; r < rounds; ++r) {
             a1.push_back(time_us([&] { planar_call(use_ctx); }, iters));
-            b.push_back(time_us([&] { packed_call(use_ctx); }, iters));
             cl.push_back(time_us([&] { nhwc_call(use_ctx); }, iters));
             a2.push_back(time_us([&] { planar_call(use_ctx); }, iters));
         }
         const double tp = median_of(a1);
-        const double tk = median_of(b);
         const double tc = median_of(cl);
         const double null_gap = (median_of(a2) / tp - 1.0) * 100.0;
 
-        std::printf("    %2dT  planar %8.1f us (%6.1f GFLOPS) | packed %8.1f us (%6.1f GFLOPS)"
-                    " | nhwc %8.1f us (%6.1f GFLOPS) | planar/nhwc %5.2fx"
-                    " packed/nhwc %5.2fx  (null %+4.1f%%)\n",
-                    nt, tp, flops / (tp * 1e3), tk, flops / (tk * 1e3),
-                    tc, flops / (tc * 1e3), tp / tc, tk / tc, null_gap);
+        std::printf("    %2dT  planar %8.1f us (%6.1f GFLOPS) | nhwc %8.1f us (%6.1f GFLOPS)"
+                    " | planar/nhwc %5.2fx  (null %+4.1f%%)\n",
+                    nt, tp, flops / (tp * 1e3),
+                    tc, flops / (tc * 1e3), tp / tc, null_gap);
     }
 }
 
@@ -392,19 +337,19 @@ void run_unroll_case(const DepthwiseCase& c, int iters, int rounds) {
 
 }  // namespace
 
-NNOPS_BENCH(depthwise_planar_vs_packed) {
+NNOPS_BENCH(depthwise_planar_vs_nhwc) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise conv: planar (NCHW, lane=width) against packed (NCHWC8, lane=channel)\n");
+    std::printf("depthwise conv: planar (NCHW, lane=width) against channel-last (NHWC, lane=channel)\n");
     std::printf("  pool=%s  threads=", test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
     }
 
     const DepthwiseCase cases[] = {
-        {"dw 3x3 C=8   @112 s1",    8, 112, 112},   // one block: NHWC == packed
+        {"dw 3x3 C=8   @112 s1",    8, 112, 112},   // half a channel vector
         {"dw 3x3 C=16  @112 s1",   16, 112, 112},
         {"dw 3x3 C=32  @112 s1",   32, 112, 112},
         {"dw 3x3 C=64  @112 s1",   64, 112, 112},

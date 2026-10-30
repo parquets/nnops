@@ -1,5 +1,5 @@
 /// @file pooling.cpp
-/// @brief Pooling operator dispatch — planar, packed or channel-last I/O, direct
+/// @brief Pooling operator dispatch — planar or channel-last I/O, direct
 ///        pass-through (output layout follows the input's).
 
 #include "nnops/ops/pooling.hpp"
@@ -55,7 +55,8 @@ Status Pooling::validate(std::span<const TensorDesc> inputs,
             detail::dtype_in<DataType::f32, DataType::f16,
                              DataType::s8, DataType::u8>(in.dtype));
     }
-    return detail::require(is_layout_supported(in.layout, LayoutSupport::PackedOnly));
+    // Anything else — a channel-packed tensor, say — has no route at all.
+    return Status::unsupported;
 }
 
 Status Pooling::compute(std::span<TensorView> outputs,
