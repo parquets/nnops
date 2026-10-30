@@ -21,7 +21,7 @@ namespace nnops {
 /// `product + bias`.
 ///
 /// Every route takes a bias, and its dtype follows the output: the output's own
-/// fp dtype on an fp destination (fp × fp, Q5_1/Q4_1 weights, the dequantizing
+/// fp dtype on an fp destination (fp × fp, Q4_1 weights, the dequantizing
 /// int8 route), int32 on an integer one (output_dtype s32 / s8 / u8). Integer
 /// destinations add it to the compensated int32 accumulate — before the
 /// activation, and never scaled by alpha, which the integer routes ignore.
@@ -31,7 +31,7 @@ struct MatMulAttributes {
 
     /// Scale factor for the A×B matrix product only — bias and beta×C_old stay
     /// unscaled (see the semantics above). Floating-point routes fold it into
-    /// the RHS pack (f32/f16 × f32/f16, Q5_1/Q4_1 weights), so it costs nothing; the
+    /// the RHS pack (f32/f16 × f32/f16, Q4_1 weights), so it costs nothing; the
     /// small-M kernels apply it to the accumulator before the beta add.
     ///
     /// The integer routes (output_dtype s32 / s8 / u8) ignore alpha: their

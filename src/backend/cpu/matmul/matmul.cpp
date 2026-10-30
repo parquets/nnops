@@ -7,7 +7,7 @@
 /// from get_matmul_plan(): NKM on an N-split, MKN on an M-split.
 ///
 /// f32/f16 below GEMM_FAST_PATH_THRESHOLD MACs, and every product at M <= 4,
-/// use the arch's naive SIMD kernel / direct GEMV instead of the plan; a Q5_1 B
+/// use the arch's naive SIMD kernel / direct GEMV instead of the plan; a Q4_1 B
 /// at small M decodes straight into its dot product. Those routes sweep the
 /// product in one pass and share nothing with the skeleton, so they live in
 /// matmul_small.cpp and matmul_qblock_fused.cpp (see matmul_internal.h).
@@ -65,8 +65,8 @@ struct FpRoute {
         return std::is_same_v<T, float> ? GEOM_F32 : GEOM_F16;
     }
 
-    /// B for one batch element: a dense view or a block-packed stream
-    /// (q5_1/q4_1), which names its dtype because the block size differs.
+    /// B for one batch element: a dense view or a Q4_1 block stream, which
+    /// names its dtype because its storage unit is a block, not an element.
     struct B {
         const void* ptr;
         int ldb;
@@ -107,8 +107,8 @@ struct FpRoute {
                        int n_start, int nc, Elem* dst, int ldd, bool /*a_biased*/) {
         // The packer takes the tile origin in block units, not elements.
         if (b.blocked()) {
-            tile_pack_rhs_block(b.block_dt, attrs.transpose_b, n_start, nc, k, kc,
-                                dst, ldd, b.ptr, b.row_blocks, attrs.alpha);
+            tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
+                               b.ptr, b.row_blocks, attrs.alpha);
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
@@ -578,7 +578,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const auto& b = inputs[1];
     const auto [M, N, K] = matmul_dims(attrs, a, b);
 
-    // Only the fp routes carry a B; a block-packed one (q5_1/q4_1) says which
+    // Only the fp routes carry a B; a block-packed one (q4_1) says which
     // format so the shared packer can decode it.
     const DataType b_block_dt = R::is_fp ? b.data_type() : DataType::f32;
 
@@ -1050,7 +1050,7 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
     // Fold pure-clamp activations into min_clip/max_clip, which kblock_clamp
-    // (and the Q5 route) read directly.
+    // (and the Q4_1 routes) read directly.
     MatMulAttributes attrs_n = attrs;
     switch (attrs_n.epilogue.type) {
     case EpilogueActivateType::Relu:  attrs_n.epilogue.min_clip = 0.0f; break;
@@ -1059,7 +1059,7 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
 #if defined(NNOPS_ARCH_X86_64)
-    // Small-M block quant (Q5_1/Q4_1): decode straight into the reduction,
+    // Small-M block quant (Q4_1): decode straight into the reduction,
     // before the plan and the scratch. Only a transposed A is out of reach.
     if (dt_a == DataType::f32 && is_block_packed_dtype(dt_b) &&
         !attrs_n.transpose_a) {
@@ -1137,7 +1137,7 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
     // Past the int8 branch: only f32/f16 have a fused kernel, plus a
-    // block-packed B (q5_1/q4_1), whose blocks decode to A's type in the RHS
+    // block-packed B (q4_1), whose blocks decode to A's type in the RHS
     // pack.
     if (!float_a || (dt_b != dt_a && !b_block)) {
         return Status::unsupported;

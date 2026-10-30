@@ -68,7 +68,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/moe.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA), plus the two routes
-    # that bypass the plan (small naive / GEMV, fused Q5_1). matmul_helper is the
+    # that bypass the plan (small naive / GEMV, fused Q4_1). matmul_helper is the
     # shared pack/MMA layer that conv2d and attention also drive.
     backend/cpu/matmul/matmul.cpp
     backend/cpu/matmul/matmul_helper.cpp

@@ -13,8 +13,8 @@
 /// f32 and f16 A/output, and a batched B where the batch stride is counted in
 /// blocks rather than elements.
 ///
-/// Q4_1 rides the same two routes as Q5_1: the packed plan (every M) and, on
-/// x86_64 at M ≤ 16 ([N][K]) / M ≤ 4 ([K][N]), the fused small-M kernels that
+/// Q4_1 rides two routes: the packed plan (every M) and, on
+/// x86_64 at M ≤ 16 ([N][K]) / M ≤ 8 ([K][N]), the fused small-M kernels that
 /// decode straight into the reduction. The last two tests sweep the fused
 /// route's edge cases.
 
@@ -432,7 +432,7 @@ NNOPS_TEST(matmul_q4_1_small_m) {
 }
 
 /// The small-M fused route: Q4_1 blocks decoded straight into the reduction
-/// (no packed-B panel, and no 5th-bit mask to spread). [K][N] B runs the
+/// (no packed-B panel). [K][N] B runs the
 /// outer-product kernel (MR ≤ 2), [N][K] B the dot-product one (M ≤ 16, two
 /// 8-row panels); the cases cover row aliasing, K tails, N tiles, beta and the
 /// clamped epilogue.
@@ -440,6 +440,8 @@ NNOPS_TEST(matmul_q4_1_fused_small_m) {
     run_case({1, 37, 70, /*transpose_b=*/false, false, false});
     run_case({2, 37, 70, /*transpose_b=*/false, false, false});
     run_case({2, 64, 33, /*transpose_b=*/false, false, false});   // K tail
+    run_case({5, 37, 70, /*transpose_b=*/false, false, false});   // copy-limit band
+    run_case({8, 37, 70, /*transpose_b=*/false, false, false});   // at the copy limit
     run_case({1, 71, 160, /*transpose_b=*/true, false, false});
     run_case({2, 71, 160, /*transpose_b=*/true, false, false});
     run_case({3, 41, 33, /*transpose_b=*/true, false, false});    // MR=4, partial rows

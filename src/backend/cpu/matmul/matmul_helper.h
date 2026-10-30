@@ -23,7 +23,6 @@
 #ifdef NNOPS_ARCH_X86_64
 #include "backend/cpu/x86_64/pack_f16.hpp"
 #include "backend/cpu/x86_64/pack_f32.hpp"
-#include "backend/cpu/x86_64/pack_q5_1.hpp"
 #include "backend/cpu/x86_64/pack_q4_1.hpp"
 #include "backend/cpu/x86_64/mma_f16.hpp"
 #include "backend/cpu/x86_64/mma_f32.hpp"
@@ -34,7 +33,6 @@
 #elif defined(NNOPS_ARCH_AARCH64)
 #include "backend/cpu/aarch64/pack_f16.hpp"
 #include "backend/cpu/aarch64/pack_f32.hpp"
-#include "backend/cpu/aarch64/pack_q5_1.hpp"
 #include "backend/cpu/aarch64/pack_q4_1.hpp"
 #include "backend/cpu/aarch64/mma_f16.hpp"
 #include "backend/cpu/aarch64/mma_f32.hpp"
@@ -66,17 +64,12 @@ constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
 
 #ifdef NNOPS_ARCH_X86_64
-// The Q5_1 RHS kernel writes the same uniform panels as the float packers, so
+// The Q4_1 RHS kernel writes the same uniform panels as the float packers, so
 // its hard-coded width must track both NR tables (16 for f32 and f16 here).
-static_assert(arch::q5_1_nr_max == NR_MAX_F32 && arch::q5_1_nr_max == NR_MAX_F16,
-              "Q5_1 RHS panel width must match the float RHS panel width");
 static_assert(arch::q4_1_nr_max == NR_MAX_F32 && arch::q4_1_nr_max == NR_MAX_F16,
               "Q4_1 RHS panel width must match the float RHS panel width");
 #elif defined(NNOPS_ARCH_AARCH64)
 // Same contract, but the two AArch64 widths differ (12 for f32, 16 for f16).
-static_assert(arch::q5_1_nr_max<float> == NR_MAX_F32 &&
-              arch::q5_1_nr_max<half> == NR_MAX_F16,
-              "Q5_1 RHS panel width must match the float RHS panel width");
 static_assert(arch::q4_1_nr_max<float> == NR_MAX_F32 &&
               arch::q4_1_nr_max<half> == NR_MAX_F16,
               "Q4_1 RHS panel width must match the float RHS panel width");
@@ -482,40 +475,20 @@ void tile_pack_lhs(bool trans, int mc, int kc, half* dst, int ldd, const half* s
 void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
 
-// ---- Q5_1 (llama.cpp block format) RHS ----------------------------------
+// ---- Q4_1 (llama.cpp block format) RHS ----------------------------------
 //
-// A Q5_1 B is a 24-byte-block stream; the pack fuses unpack + dequantize into
+// A Q4_1 B is a 20-byte-block stream; the pack fuses unpack + dequantize into
 // the uniform panels above, so the MMA side is unchanged. The tile origin is
 // taken in block units (a panel can start mid-block), `src_row_blocks` is the
 // row pitch in blocks, and `scale` (alpha) multiplies every decoded weight.
-void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale);
-void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale);
-
-// ---- Q4_1 (llama.cpp block format) RHS ----------------------------------
-//
-// The same contract as Q5_1 one block format down: a 20-byte block stream,
-// unpacked and dequantized straight into the uniform panels. Both formats name
-// their block units through data_type_stride_unit(), so the caller's tile
-// origin, row pitch and batch offsets are already in blocks.
+// The block unit is named everywhere through data_type_stride_unit(), so the
+// caller's tile origin, row pitch and batch offsets are already in blocks.
 void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         float* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale);
 void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         half* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale);
-
-/// Pack one k-block of a block-packed B (q5_1/q4_1) into uniform RHS panels.
-/// Dispatches on the dtype so the route only has to know "block stream".
-void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc,
-                         int k_start, int kc, float* dst, int ldd,
-                         const void* src, int64_t src_row_blocks, float scale);
-void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc,
-                         int k_start, int kc, half* dst, int ldd,
-                         const void* src, int64_t src_row_blocks, float scale);
 
 // B is always packed here; panels advance by the aligned nr_max*kc stride.
 //
@@ -705,7 +678,7 @@ struct MatMulPlan {
 };
 
 /// Resolve the tile sizes, the split direction and the packed-A/B scratch layout.
-/// Covers f32, f16, s8|u8 A × s8 B, and a f32/f16 A with a Q5_1 B. Returns an
+/// Covers f32, f16, s8|u8 A × s8 B, and a f32/f16 A with a Q4_1 B. Returns an
 /// all-zero plan for any other dtype.
 ///
 /// @p use_thread_slots: when the backend reports worker ids, one scratch slot
@@ -725,7 +698,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
 #ifdef NNOPS_ARCH_X86_64
 /// Diagnostic cap on the fused block-quant small-M route
 /// (matmul_qblock_fused.cpp): negative keeps the built-in per-layout M limits,
-/// 0 disables the route (Q5_1 and Q4_1 alike). Benchmarks use it to A/B the
+/// 0 disables the route. Benchmarks use it to A/B the
 /// fused and packed routes inside one process.
 extern int qblock_fused_max_m_override;
 #endif

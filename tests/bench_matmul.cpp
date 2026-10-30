@@ -12,8 +12,7 @@
 /// can't — e.g. when Nc is so large that an N-split yields only one block).
 
 #include "nnops/ops/matmul.hpp"
-#include "nnops/detail/q5_1.hpp"         // q5_1_block, float_to_half, half_to_bits
-#include "nnops/detail/q4_1.hpp"         // q4_1_block
+#include "nnops/detail/q4_1.hpp"         // q4_1_block, float_to_half, half_to_bits
 #include "backend/cpu/matmul/matmul_helper.h"   // get_matmul_plan, PACK_A_K_THRESHOLD, tile constants
 #include "backend/cpu/simd_kernel/simd_quant.hpp"  // quant_kernel::quantization (the dq quantize pass)
 #include "common/bench_harness.hpp"
@@ -126,46 +125,10 @@ make_tensor_i8(int64_t rows, int64_t cols, uint64_t seed,
     return {std::move(buf), tv};
 }
 
-// Build a compact [rows, cols] Q5_1 (llama.cpp block) tensor: 32 five-bit
-// quants per 24-byte block, with a per-block fp16 scale/offset in the block
+// Build a compact [rows, cols] Q4_1 (llama.cpp block) tensor: 32 four-bit
+// quants per 20-byte block, with a per-block fp16 scale/offset in the block
 // itself. Only the storage matters here, but the quants and d/m are drawn from
 // realistic ranges so no lane is denormal or inf.
-std::pair<std::vector<uint8_t>, TensorView>
-make_tensor_q5(int64_t rows, int64_t cols, uint64_t seed) {
-    const int64_t blocks_per_row = (cols + q5_1_block_elems - 1) / q5_1_block_elems;
-    std::vector<uint8_t> buf(static_cast<size_t>(
-        rows * blocks_per_row * static_cast<int64_t>(q5_1_block_bytes)));
-
-    nnops::test::XorShift128 rng(seed);
-    for (int64_t r = 0; r < rows; ++r) {
-        for (int64_t b = 0; b < blocks_per_row; ++b) {
-            q5_1_block blk{};
-            blk.d = cpu::half_to_bits(cpu::float_to_half(rng.next_float(0.002f, 0.02f)));
-            blk.m = cpu::half_to_bits(cpu::float_to_half(rng.next_float(-0.1f, 0.1f)));
-            uint32_t qh = 0;
-            for (int j = 0; j < 16; ++j) {
-                const uint32_t q0 = static_cast<uint32_t>(rng.next_u64() & 0x1F);
-                const uint32_t q1 = static_cast<uint32_t>(rng.next_u64() & 0x1F);
-                blk.qs[j] = static_cast<uint8_t>(q0 | (q1 << 4));
-                qh |= ((q0 >> 4) & 1u) << j;
-                qh |= ((q1 >> 4) & 1u) << (j + 16);
-            }
-            std::memcpy(blk.qh, &qh, sizeof(qh));
-            std::memcpy(buf.data() + static_cast<size_t>(
-                            (r * blocks_per_row + b)
-                            * static_cast<int64_t>(q5_1_block_bytes)),
-                        &blk, q5_1_block_bytes);
-        }
-    }
-
-    const int64_t shape[] = {rows, cols};
-    TensorView tv(shape, DataType::q5_1, buf.data());
-    return {std::move(buf), tv};
-}
-
-// The Q4_1 twin of make_tensor_q5: the same 32 values per block but 16 nibble
-// bytes and no 5th-bit mask, so 20 bytes instead of 24. Only storage matters
-// here; d/m and the quants are drawn from the same realistic ranges.
 std::pair<std::vector<uint8_t>, TensorView>
 make_tensor_q4(int64_t rows, int64_t cols, uint64_t seed) {
     const int64_t blocks_per_row = (cols + q4_1_block_elems - 1) / q4_1_block_elems;
@@ -394,24 +357,24 @@ void bench_i8_case(const GeMMCase& c) {
     print_report(run_geMM_i8(c, threads, iters));
 }
 
-// ---- Q5_1 right-hand side --------------------------------------------------
+// ---- Q4_1 right-hand side --------------------------------------------------
 //
-// B is a llama.cpp block stream (24 bytes per 32 values) rather than floats.
+// B is a llama.cpp block stream (20 bytes per 32 values) rather than floats.
 // The pack step decodes blocks straight into the GEMM's packed panels, so the
 // kernel never materialises a dense dequantized B; the arithmetic is still f32
 // (or f16 for an f16 A), which is what keeps these GFLOPS comparable with the
-// f32/f16 rows above. The difference under test is that B arrives at 0.75
+// f32/f16 rows above. The difference under test is that B arrives at 0.625
 // bytes/value instead of 4 (f32) or 2 (f16), so the pack/decode cost trades
 // against weight bandwidth — the balance shifts with M.
 template <typename T>
-GeMMReport run_geMM_q5(const GeMMCase& c, const std::vector<int>& threads, int iters) {
+GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int iters) {
     const int64_t a_rows = c.ta ? c.K : c.M;
     const int64_t a_cols = c.ta ? c.M : c.K;
     const int64_t b_rows = c.tb ? c.N : c.K;
     const int64_t b_cols = c.tb ? c.K : c.N;
 
     auto [a_vec, a] = make_tensor<T>(a_rows, a_cols, a_cols + c.pad_a, 1);
-    auto [b_vec, b] = make_tensor_q5(b_rows, b_cols, 2);
+    auto [b_vec, b] = make_tensor_q4(b_rows, b_cols, 2);
 
     MatMulAttributes attrs{};
     attrs.transpose_a = c.ta;
@@ -431,7 +394,7 @@ GeMMReport run_geMM_q5(const GeMMCase& c, const std::vector<int>& threads, int i
 
     GeMMReport rep;
     rep.name = c.name;
-    rep.route = plan.split_n ? "q5-NKM" : "q5-MKN";
+    rep.route = plan.split_n ? "q4-NKM" : "q4-MKN";
     rep.unit = "GFLOPS";
     rep.pack_a = plan.pack_a;
     rep.pack_b = true;
@@ -468,14 +431,14 @@ GeMMReport run_geMM_q5(const GeMMCase& c, const std::vector<int>& threads, int i
 }
 
 template <typename T>
-void bench_q5_case(const GeMMCase& c) {
+void bench_q4_case(const GeMMCase& c) {
     const int iters = 20;
     std::vector<int> threads{1, 2, 4, 8};
     int hw = static_cast<int>(std::thread::hardware_concurrency());
     if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
         threads.push_back(hw);
     }
-    print_report(run_geMM_q5<T>(c, threads, iters));
+    print_report(run_geMM_q4<T>(c, threads, iters));
 }
 
 // ---- controlled A/B between two routes ------------------------------------
@@ -780,9 +743,9 @@ void sweep_i8(const std::vector<SweepShape>& shapes, const std::vector<int>& thr
     }
 }
 
-/// The Q5_1 counterpart to SweepOp: A is dense f32/f16, B is a block stream.
+/// The Q4_1 counterpart to SweepOp: A is dense f32/f16, B is a block stream.
 template <typename T>
-struct SweepOpQ5 {
+struct SweepOpQ4 {
     using OpPtr = decltype(MatMul::create(std::declval<MatMulAttributes>(), Backend::CPU));
 
     OpPtr op;
@@ -794,13 +757,12 @@ struct SweepOpQ5 {
     bool split_n;
     double flops;
 
-    SweepOpQ5(int64_t m, int64_t k, int64_t n, uint64_t seed, int64_t meta_threads,
-              bool tb = false, DataType b_dt = DataType::q5_1)
+    SweepOpQ4(int64_t m, int64_t k, int64_t n, uint64_t seed, int64_t meta_threads,
+              bool tb = false)
         : M(m), K(k), N(n) {
         auto [av, a] = make_tensor<T>(M, K, K, seed);
-        auto [bv, b] = b_dt == DataType::q4_1
-            ? (tb ? make_tensor_q4(N, K, seed + 1) : make_tensor_q4(K, N, seed + 1))
-            : (tb ? make_tensor_q5(N, K, seed + 1) : make_tensor_q5(K, N, seed + 1));
+        auto [bv, b] = tb ? make_tensor_q4(N, K, seed + 1)
+                          : make_tensor_q4(K, N, seed + 1);
         a_buf = std::move(av);
         b_buf = std::move(bv);
         b_bytes = static_cast<int64_t>(b.storage_bytes());
@@ -848,13 +810,13 @@ struct SweepOpQ5 {
 };
 
 template <typename T>
-void sweep_q5(const char* tag, const std::vector<SweepShape>& shapes,
+void sweep_q4(const char* tag, const std::vector<SweepShape>& shapes,
               const std::vector<int>& threads, double target_ms) {
     const int64_t meta_threads = *std::max_element(threads.begin(), threads.end());
-    std::printf("  %s nn sweep (B = q5_1)  budget=%.0f ms/cell\n", tag, target_ms);
+    std::printf("  %s nn sweep (B = q4_1)  budget=%.0f ms/cell\n", tag, target_ms);
     print_sweep_header(threads, "GFLOPS");
     for (const SweepShape& s : shapes) {
-        SweepOpQ5<T> g(s.M, s.K, s.N, 7, meta_threads);
+        SweepOpQ4<T> g(s.M, s.K, s.N, 7, meta_threads);
         std::vector<double> gflops;
         double bw_first = 0.0, bw_last = 0.0;
         for (size_t i = 0; i < threads.size(); ++i) {
@@ -873,20 +835,36 @@ void sweep_q5(const char* tag, const std::vector<SweepShape>& shapes,
     }
 }
 
-/// M ladder at a fixed K×N: the packed B panel is reused once per row, so the
+/// M ladder at a fixed KxN: the packed B panel is reused once per row, so the
 /// decode cost per FLOP falls as 1/M until the MMA (or memory) takes over.
 /// Each M gets a plan resolved at the thread count it is timed with, and the
 /// dense f32 twin is built for the same shape so the ratio shows the knee
 /// rather than the host's absolute speed.
-void m_ladder_q5(int64_t K, int64_t N, const std::vector<int64_t>& ms,
+///
+/// @p packed pins the block format to the packed route (the fused small-M
+/// kernels off), so the small-M cells compare a format against dense f32
+/// rather than two routes. The dense arm has no such switch — it takes the
+/// pack-free GEMV to M = 4 regardless, which is what the operator does for a
+/// dense B.
+void m_ladder_q4(int64_t K, int64_t N, const std::vector<int64_t>& ms,
                  const std::vector<int>& threads, double target_ms,
-                 bool tb = false) {
-    std::printf("  M ladder q5_1 vs dense f32  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
+                 bool tb = false, bool packed = false) {
+    std::printf("  M ladder q4_1 vs dense f32  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
                 static_cast<long long>(K), static_cast<long long>(N),
                 tb ? "[N][K]" : "[K][N]", target_ms);
+    if (packed) {
+        std::printf("    q4_1 pinned to the packed route; the dense arm GEMVs to M = 4,\n"
+                    "    so the small-M cells compare the format, not two routes\n");
+    } else if (tb) {
+        std::printf("    as routed: q4_1 fuses to M = 16 on [N][K]; the dense arm\n"
+                    "    GEMVs to M = 4, so the small-M cells compare routes\n");
+    } else {
+        std::printf("    as routed: q4_1 fuses to M = 8 on [K][N]; the dense arm\n"
+                    "    GEMVs to M = 4, so the small-M cells compare routes\n");
+    }
     std::printf("   %5s |", "M");
     for (int nt : threads) {
-        std::printf("  %2dT:    q5_1      dense f32     ratio |", nt);
+        std::printf("  %2dT:    q4_1      dense f32     ratio |", nt);
     }
     std::printf("\n");
 
@@ -898,11 +876,14 @@ void m_ladder_q5(int64_t K, int64_t N, const std::vector<int64_t>& ms,
     for (int64_t M : ms) {
         std::printf("   %5lld |", static_cast<long long>(M));
         for (int nt : threads) {
-            SweepOpQ5<float> q(M, K, N, 7, nt, tb);
+            SweepOpQ4<float> q(M, K, N, 7, nt, tb);
             SweepOp<float> d(M, K, N, 7, nt, tb);
             BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
+#if defined(NNOPS_ARCH_X86_64)
+            if (packed) { cpu::qblock_fused_max_m_override = 0; }
+#endif
 
             // Alternate the two formats round by round: on this host a run of
             // one format drifts a few percent against the next, which is the
@@ -913,6 +894,9 @@ void m_ladder_q5(int64_t K, int64_t N, const std::vector<int64_t>& ms,
                 vq.push_back(q.time_budget(ctx, target_ms, &gbps));
                 vd.push_back(d.time_budget(ctx, target_ms));
             }
+#if defined(NNOPS_ARCH_X86_64)
+            cpu::qblock_fused_max_m_override = -1;
+#endif
             const double gq = median(vq);
             const double gd = median(vd);
             std::printf(" %10.1f %10.1f %6.3f |", gq, gd, gq / gd);
@@ -921,153 +905,9 @@ void m_ladder_q5(int64_t K, int64_t N, const std::vector<int64_t>& ms,
     }
 }
 
-/// Q4_1 against Q5_1 at the same shape and thread count: both take the packed
-/// route, so the only differences are the weight bytes (20 vs 24 per 32 values)
-/// and the decode work per block (no 5th-bit gather). Alternated round by round
-/// so the ratio is measured under matched thermal conditions.
-void m_ladder_q4_vs_q5(int64_t K, int64_t N, const std::vector<int64_t>& ms,
-                       const std::vector<int>& threads, double target_ms,
-                       bool tb = false) {
-    std::printf("  M ladder q4_1 vs q5_1  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
-                static_cast<long long>(K), static_cast<long long>(N),
-                tb ? "[N][K]" : "[K][N]", target_ms);
-    if (tb) {
-        std::printf("    note: M <= 16 takes the fused route for both formats, so the\n"
-                    "    small-M rows compare the formats on the fused kernels.\n");
-    } else {
-        std::printf("    note: q4_1 fuses to M = 8 on [K][N] and q5_1 only to M = 4, so\n"
-                    "    the M = 8 row compares q4_1-fused against q5_1-packed.\n");
-    }
-    std::printf("   %5s |", "M");
-    for (int nt : threads) {
-        std::printf("  %2dT:    q4_1      q5_1   q4/q5 |", nt);
-    }
-    std::printf("\n");
-
-    auto median = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end());
-        return v[v.size() / 2];
-    };
-
-    for (int64_t M : ms) {
-        std::printf("   %5lld |", static_cast<long long>(M));
-        for (int nt : threads) {
-            SweepOpQ5<float> q4(M, K, N, 7, nt, tb, DataType::q4_1);
-            SweepOpQ5<float> q5(M, K, N, 7, nt, tb, DataType::q5_1);
-            BenchPool pool(nt);
-            ComputeContext ctx;
-            if (nt > 1) { ctx.cpu = pool.cpu; }
-
-            std::vector<double> v4, v5;
-            double bw4 = 0.0, bw5 = 0.0;
-            for (int r = 0; r < 3; ++r) {
-                double g4 = 0.0, g5 = 0.0;
-                v4.push_back(q4.time_budget(ctx, target_ms, &g4));
-                v5.push_back(q5.time_budget(ctx, target_ms, &g5));
-                bw4 = g4;
-                bw5 = g5;
-            }
-            const double g4 = median(v4);
-            const double g5 = median(v5);
-            std::printf(" %10.1f %9.1f %6.3f |", g4, g5, g4 / g5);
-        }
-        std::printf("\n");
-    }
-}
-
-/// Three formats at one shape: q4_1, q5_1 and dense f32, one arm per budgeted
-/// block and the arm order rotated per round, so all three see the same cache
-/// and thermal state (the arm measured second is the one that drifts).
-///
-/// @p packed pins both block formats to the packed route (fused small-M kernels
-/// off), so the small-M cells compare formats rather than routes. The dense arm
-/// has no such switch: it takes the pack-free GEMV to M = 4 regardless, which
-/// is what the operator does for a dense B.
-void m_ladder_formats(int64_t K, int64_t N, const std::vector<int64_t>& ms,
-                      const std::vector<int>& threads, double target_ms,
-                      bool tb = false, bool packed = false) {
-    std::printf("  M ladder q4_1 / q5_1 / f32  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
-                static_cast<long long>(K), static_cast<long long>(N),
-                tb ? "[N][K]" : "[K][N]", target_ms);
-
-    const double kMB = 1.0 / (1024.0 * 1024.0);
-    const int64_t rows  = tb ? N : K;
-    const int64_t cols  = tb ? K : N;
-    const int64_t nblk  = (cols + 31) / 32;
-    std::printf("    weights: q4_1 %6.2f MB | q5_1 %6.2f MB | f32 %7.2f MB\n",
-                static_cast<double>(rows * nblk) * 20.0 * kMB,
-                static_cast<double>(rows * nblk) * 24.0 * kMB,
-                static_cast<double>(rows * cols) * 4.0 * kMB);
-    if (packed) {
-        std::printf("    both block formats pinned to the packed route; the dense arm\n"
-                    "    still GEMVs to M = 4\n");
-    } else {
-        std::printf("    as routed: q5_1 and q4_1 both fuse (M = 16 [N][K], 4 [K][N]) and\n"
-                    "    the dense arm GEMVs to M = 4, so the small-M cells compare\n"
-                    "    routes, not formats\n");
-    }
-
-    std::printf("   %5s |", "M");
-    for (int nt : threads) {
-        std::printf("  %2dT:    q4_1    q5_1      f32   q4/q5  q5/f32 |", nt);
-    }
-    std::printf("\n");
-
-    auto median = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end());
-        return v[v.size() / 2];
-    };
-
-    for (int64_t M : ms) {
-        std::printf("   %5lld |", static_cast<long long>(M));
-        for (int nt : threads) {
-            SweepOpQ5<float> q4(M, K, N, 7, nt, tb, DataType::q4_1);
-            SweepOpQ5<float> q5(M, K, N, 7, nt, tb, DataType::q5_1);
-            SweepOp<float>  f32(M, K, N, 7, nt, tb);
-            BenchPool pool(nt);
-            ComputeContext ctx;
-            if (nt > 1) { ctx.cpu = pool.cpu; }
-
-#if defined(NNOPS_ARCH_X86_64)
-            cpu::qblock_fused_max_m_override = packed ? 0 : -1;
-#endif
-            std::vector<double> v4, v5, vf;
-            for (int r = 0; r < 3; ++r) {
-                // Rotate which arm runs first; the same arm always last is the
-                // one the host penalises.
-                const int order = r % 3;
-                double g4 = 0.0, g5 = 0.0, gf = 0.0;
-                if (order == 0) {
-                    g4 = q4.time_budget(ctx, target_ms, nullptr);
-                    g5 = q5.time_budget(ctx, target_ms, nullptr);
-                    gf = f32.time_budget(ctx, target_ms);
-                } else if (order == 1) {
-                    gf = f32.time_budget(ctx, target_ms);
-                    g5 = q5.time_budget(ctx, target_ms, nullptr);
-                    g4 = q4.time_budget(ctx, target_ms, nullptr);
-                } else {
-                    g5 = q5.time_budget(ctx, target_ms, nullptr);
-                    gf = f32.time_budget(ctx, target_ms);
-                    g4 = q4.time_budget(ctx, target_ms, nullptr);
-                }
-                v4.push_back(g4);
-                v5.push_back(g5);
-                vf.push_back(gf);
-            }
-#if defined(NNOPS_ARCH_X86_64)
-            cpu::qblock_fused_max_m_override = -1;
-#endif
-            const double g4 = median(v4), g5 = median(v5), gf = median(vf);
-            std::printf(" %7.1f %7.1f %7.1f %6.3f %7.3f |", g4, g5, gf,
-                        g4 / g5, g5 / gf);
-        }
-        std::printf("\n");
-    }
-}
-
-/// Same A, two weight formats: dense f16 and Q5_1, alternated round by round so
-/// the ratio is measured under matched thermal conditions (see the A-side A/B
-/// section above). With M small the pair is weight-bandwidth bound and Q5_1
+/// Same A, two weight formats: dense and Q4_1, alternated round by round so the
+/// ratio is measured under matched thermal conditions (see the A-side A/B
+/// section above). With M small the pair is weight-bandwidth bound and Q4_1
 /// should win outright; as M grows the decode overhead is amortised over more
 /// FLOPs and the gap narrows toward the pack cost.
 template <typename T>
@@ -1077,7 +917,7 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
 
     auto [av, a] = make_tensor<T>(M, K, K, 1);
     auto [bfv, bf] = make_tensor<T>(K, N, N, 2);
-    auto [bqv, bq] = make_tensor_q5(K, N, 2);
+    auto [bqv, bq] = make_tensor_q4(K, N, 2);
 
     MatMulAttributes attrs{};
     auto op_f = MatMul::create(attrs, Backend::CPU);
@@ -1120,7 +960,7 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
 
     const char* dense = std::is_same_v<T, float> ? "f32" : "f16";
     std::printf("  %s B-format A/B  %lldx%lldx%lld  1T  rounds=%d iters=%d  "
-                "B: %s %.2f MB, q5_1 %.2f MB\n",
+                "B: %s %.2f MB, q4_1 %.2f MB\n",
                 tag, static_cast<long long>(M), static_cast<long long>(K),
                 static_cast<long long>(N), rounds, iters, dense, b_f_mb, b_q_mb);
 
@@ -1130,8 +970,8 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
         const double gq = time_q();
         vf.push_back(gf);
         vq.push_back(gq);
-        std::printf("    round %d:  f16=%7.1f  q5_1=%7.1f   q5/f16=%.3f\n",
-                    r, gf, gq, gq / gf);
+        std::printf("    round %d:  %s=%7.1f  q4_1=%7.1f   q4/%s=%.3f\n",
+                    r, dense, gf, gq, dense, gq / gf);
     }
 
     auto median = [](std::vector<double> v) {
@@ -1139,7 +979,8 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
         return v[v.size() / 2];
     };
     const double mf = median(vf), mq = median(vq);
-    std::printf("    median:   f16=%7.1f  q5_1=%7.1f   q5/f16=%.3f\n", mf, mq, mq / mf);
+    std::printf("    median:   %s=%7.1f  q4_1=%7.1f   q4/%s=%.3f\n", dense, mf, mq,
+                dense, mq / mf);
 }
 
 // Interleaved A/B of the two activation dtypes at identical memory: one byte
@@ -1712,41 +1553,41 @@ NNOPS_BENCH(matmul_i8_out_decode) {
 }
 
 // ============================================================
-// Q5_1 weights — llama.cpp block stream on the RHS
+// Q4_1 weights — llama.cpp block stream on the RHS
 // ============================================================
 
-NNOPS_BENCH(matmul_q5_f32_nn_large) {
-    bench_q5_case<float>({"q5/f32 nn 1024x512x1024", 1024, 512, 1024});
+NNOPS_BENCH(matmul_q4_f32_nn_large) {
+    bench_q4_case<float>({"q4/f32 nn 1024x512x1024", 1024, 512, 1024});
 }
 
-NNOPS_BENCH(matmul_q5_f32_tb_large) {
+NNOPS_BENCH(matmul_q4_f32_tb_large) {
     // LLM-style: the weight is stored [N][K] and consumed as A @ W^T, which is
     // the layout a quantized checkpoint is loaded in.
-    bench_q5_case<float>({"q5/f32 tb 1024x512x1024", 1024, 512, 1024,
+    bench_q4_case<float>({"q4/f32 tb 1024x512x1024", 1024, 512, 1024,
                           /*ta=*/false, /*tb=*/true});
 }
 
-NNOPS_BENCH(matmul_q5_f16_nn) {
-    bench_q5_case<half>({"q5/f16 nn 1024x512x1024", 1024, 512, 1024,
+NNOPS_BENCH(matmul_q4_f16_nn) {
+    bench_q4_case<half>({"q4/f16 nn 1024x512x1024", 1024, 512, 1024,
                          /*ta=*/false, /*tb=*/false, /*pad_a=*/0, /*pad_b=*/0,
                          /*f16=*/true});
 }
 
-NNOPS_BENCH(matmul_q5_f16_tb) {
-    bench_q5_case<half>({"q5/f16 tb 1024x512x1024", 1024, 512, 1024,
+NNOPS_BENCH(matmul_q4_f16_tb) {
+    bench_q4_case<half>({"q4/f16 tb 1024x512x1024", 1024, 512, 1024,
                          /*ta=*/false, /*tb=*/true, /*pad_a=*/0, /*pad_b=*/0,
                          /*f16=*/true});
 }
 
-NNOPS_BENCH(matmul_q5_decode) {
+NNOPS_BENCH(matmul_q4_decode) {
     // One token. There is almost no A-side work, so this row is the weight
     // stream's bandwidth limit: the block bytes swept per call are printed as
     // "B=... MB" next to the tile sizes.
-    bench_q5_case<float>({"q5/f32 decode 1x4096x4096", 1, 4096, 4096,
+    bench_q4_case<float>({"q4/f32 decode 1x4096x4096", 1, 4096, 4096,
                           /*ta=*/false, /*tb=*/true});
 }
 
-NNOPS_BENCH(matmul_q5_pack_only) {
+NNOPS_BENCH(matmul_q4_pack_only) {
     // Isolate the RHS pack from the MMA at the decode shape: the same tile
     // decomposition matmul_block_fused walks (n-block × k-block, row-major B),
     // but no A pack and no micro-kernel. One sweep is one full-B pass, i.e. the
@@ -1755,8 +1596,7 @@ NNOPS_BENCH(matmul_q5_pack_only) {
     constexpr int64_t K = 4096, N = 4096;
     auto [av, a] = make_tensor<float>(1, K, K, 1);
     auto [fv, f] = make_tensor<float>(K, N, N, 2);   // dense f32 twin
-    auto [bv, b] = make_tensor_q5(K, N, 2);          // 24-byte block stream
-    auto [b4v, b4] = make_tensor_q4(K, N, 2);        // 20-byte block stream
+    auto [bv, b] = make_tensor_q4(K, N, 2);          // 20-byte block stream
 
     MatMulAttributes attrs{};
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1);
@@ -1768,8 +1608,8 @@ NNOPS_BENCH(matmul_q5_pack_only) {
 
     // Both physical layouts; the same square buffers serve as [K][N] (nn) and
     // [N][K] (tb) since K == N.
-    enum Arm { kDense, kQ5, kQ4, kArms };
-    const uint8_t* streams[kArms] = {nullptr, bv.data(), b4v.data()};
+    enum Arm { kDense, kQ4, kArms };
+    const uint8_t* streams[kArms] = {nullptr, bv.data()};
     auto sweep = [&](Arm arm, bool trans, float scale) {
         for (int n0 = 0; n0 < static_cast<int>(N); n0 += nc) {
             const int width = std::min(nc, static_cast<int>(N - n0));
@@ -1777,11 +1617,7 @@ NNOPS_BENCH(matmul_q5_pack_only) {
                 const int actual_kc = std::min(kc, static_cast<int>(K - k));
                 const int ldd = static_cast<int>(
                     cpu::mma_pack_align(nr * actual_kc * sizeof(float)) / sizeof(float));
-                if (arm == kQ5) {
-                    cpu::tile_pack_rhs_q5_1(trans, n0, width, k, actual_kc,
-                                            buf.data(), ldd, streams[arm], row_blocks,
-                                            scale);
-                } else if (arm == kQ4) {
+                if (arm == kQ4) {
                     cpu::tile_pack_rhs_q4_1(trans, n0, width, k, actual_kc,
                                             buf.data(), ldd, streams[arm], row_blocks,
                                             scale);
@@ -1797,9 +1633,9 @@ NNOPS_BENCH(matmul_q5_pack_only) {
     };
 
     // [arm][trans][scale]: scale 1 is the plain pack, scale 2 the alpha path.
-    // Every arm scales as it stores (dense per element, Q5_1/Q4_1 by folding
-    // the factor into the block's d and m), so alpha costs a couple of
-    // multiplies per block, not a second sweep over the panel.
+    // Both arms scale as they store (dense per element, Q4_1 by folding the
+    // factor into the block's d and m), so alpha costs a couple of multiplies
+    // per block, not a second sweep over the panel.
     const int iters = 20;
     double ms[kArms][2][2] = {};
     for (int arm = 0; arm < kArms; ++arm) {
@@ -1823,17 +1659,14 @@ NNOPS_BENCH(matmul_q5_pack_only) {
                 static_cast<long long>(K), static_cast<long long>(N), kc, nc);
     static constexpr const char* kLabels[kArms][2] = {
         {"dense f32 nn [K][N]", "dense f32 tb [N][K]"},
-        {"q5_1      nn [K][N]", "q5_1      tb [N][K]"},
         {"q4_1      nn [K][N]", "q4_1      tb [N][K]"},
     };
     for (int arm = 0; arm < kArms; ++arm) {
         for (int tr = 0; tr < 2; ++tr) {
-            std::printf("    %-22s : %7.3f ms  = %6.2f Gvalues/s   "
-                        "(%.2fx dense, %.2fx q5_1)\n",
+            std::printf("    %-22s : %7.3f ms  = %6.2f Gvalues/s   (%.2fx dense)\n",
                         kLabels[arm][tr], ms[arm][tr][0],
                         values / (ms[arm][tr][0] * 1e6),
-                        ms[arm][tr][0] / ms[kDense][tr][0],
-                        ms[arm][tr][0] / ms[kQ5][tr][0]);
+                        ms[arm][tr][0] / ms[kDense][tr][0]);
             std::printf("    %-22s : %7.3f ms  = %6.2f Gvalues/s   (alpha=2: %.2fx plain)\n",
                         "  same, alpha=2", ms[arm][tr][1],
                         values / (ms[arm][tr][1] * 1e6),
@@ -1842,13 +1675,13 @@ NNOPS_BENCH(matmul_q5_pack_only) {
     }
 }
 
-NNOPS_BENCH(matmul_q5_m_ladder) {
+NNOPS_BENCH(matmul_q4_m_ladder) {
     // Where does the fused decode stop dominating? Small-M rows are weight
     // (decode) bound, large-M rows are FLOP bound; the ratio column crossing
-    // back toward 1 is the knee. Two B sizes: 12 MB (out of cache) and 3 MB.
+    // back toward 1 is the knee. Two B sizes: 10 MB (out of cache) and 2.5 MB.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128, 256};
-    m_ladder_q5(4096, 4096, ms, {1, 4}, 100.0);
-    m_ladder_q5(2048, 2048, ms, {1, 4}, 100.0);
+    m_ladder_q4(4096, 4096, ms, {1, 4}, 100.0);
+    m_ladder_q4(2048, 2048, ms, {1, 4}, 100.0);
 }
 
 NNOPS_BENCH(matmul_qblock_fused_ab) {
@@ -1856,9 +1689,8 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
     // The fused route against the packed route, alternated round by round in
     // one process (the only way this host gives a stable ratio). The fused row
     // forces the fused route for every M so the table shows where it stops
-    // winning; the shipped gate (QBLOCK_FUSED_MAX_M_*) is the crossover
-    // itself, measured per format (q4_1's decode is cheaper, so its crossover
-    // sits no earlier than q5_1's). Override < 0 keeps the built-in limits,
+    // winning; the shipped gate (Q4Block::fused_max_m_trans/copy) is the crossover
+    // itself, measured per layout. Override < 0 keeps the built-in limits,
     // 0 forces the packed route, > 0 overrides the M limit.
     const int64_t K = 4096, N = 4096;
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128};
@@ -1869,49 +1701,46 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
         return v[v.size() / 2];
     };
 
-    for (DataType bdt : {DataType::q5_1, DataType::q4_1}) {
-        for (int tb = 0; tb < 2; ++tb) {
-            std::printf("  fused vs packed %s  K=%lld N=%lld  B=%s\n",
-                        bdt == DataType::q5_1 ? "q5_1" : "q4_1",
-                        static_cast<long long>(K), static_cast<long long>(N),
-                        tb ? "[N][K]" : "[K][N]");
-            std::printf("   %5s |", "M");
+    for (int tb = 0; tb < 2; ++tb) {
+        std::printf("  fused vs packed q4_1  K=%lld N=%lld  B=%s\n",
+                    static_cast<long long>(K), static_cast<long long>(N),
+                    tb ? "[N][K]" : "[K][N]");
+        std::printf("   %5s |", "M");
+        for (int nt : threads) {
+            std::printf("   %2dT:    fused     packed     ratio |", nt);
+        }
+        std::printf("\n");
+
+        for (int64_t M : ms) {
+            std::printf("   %5lld |", static_cast<long long>(M));
             for (int nt : threads) {
-                std::printf("   %2dT:    fused     packed     ratio |", nt);
+                SweepOpQ4<float> q(M, K, N, 7, nt, tb != 0);
+                BenchPool pool(nt);
+                ComputeContext ctx;
+                if (nt > 1) { ctx.cpu = pool.cpu; }
+
+                // Order matters as much as host drift: the route measured
+                // second inherits the other one's cache/bandwidth state and
+                // reads up to 2x slower. Alternate the order per round and
+                // take the median of four samples each.
+                std::vector<double> vf, vp;
+                for (int r = 0; r < 4; ++r) {
+                    const bool fused_first = (r % 2) == 0;
+                    const int first = fused_first ? 128 : 0;
+                    const int second = fused_first ? 0 : 128;
+                    cpu::qblock_fused_max_m_override = first;
+                    const double t1 = q.time_budget(ctx, 40.0, nullptr);
+                    cpu::qblock_fused_max_m_override = second;
+                    const double t2 = q.time_budget(ctx, 40.0, nullptr);
+                    (fused_first ? vf : vp).push_back(t1);
+                    (fused_first ? vp : vf).push_back(t2);
+                }
+                cpu::qblock_fused_max_m_override = -1;
+
+                const double gf = median(vf), gp = median(vp);
+                std::printf(" %9.1f %9.1f %8.3f |", gf, gp, gf / gp);
             }
             std::printf("\n");
-
-            for (int64_t M : ms) {
-                std::printf("   %5lld |", static_cast<long long>(M));
-                for (int nt : threads) {
-                    SweepOpQ5<float> q(M, K, N, 7, nt, tb != 0, bdt);
-                    BenchPool pool(nt);
-                    ComputeContext ctx;
-                    if (nt > 1) { ctx.cpu = pool.cpu; }
-
-                    // Order matters as much as host drift: the route measured
-                    // second inherits the other one's cache/bandwidth state and
-                    // reads up to 2x slower. Alternate the order per round and
-                    // take the median of four samples each.
-                    std::vector<double> vf, vp;
-                    for (int r = 0; r < 4; ++r) {
-                        const bool fused_first = (r % 2) == 0;
-                        const int first = fused_first ? 128 : 0;
-                        const int second = fused_first ? 0 : 128;
-                        cpu::qblock_fused_max_m_override = first;
-                        const double t1 = q.time_budget(ctx, 40.0, nullptr);
-                        cpu::qblock_fused_max_m_override = second;
-                        const double t2 = q.time_budget(ctx, 40.0, nullptr);
-                        (fused_first ? vf : vp).push_back(t1);
-                        (fused_first ? vp : vf).push_back(t2);
-                    }
-                    cpu::qblock_fused_max_m_override = -1;
-
-                    const double gf = median(vf), gp = median(vp);
-                    std::printf(" %9.1f %9.1f %8.3f |", gf, gp, gf / gp);
-                }
-                std::printf("\n");
-            }
         }
     }
 #else
@@ -1919,85 +1748,55 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
 #endif
 }
 
-NNOPS_BENCH(matmul_q5_vs_f32_gemv) {
+NNOPS_BENCH(matmul_q4_vs_f32_gemv) {
     // The decode menu with both arms in their pack-free form. At M <= 4 a dense
-    // f32 B goes through matmul_gemv (B streamed once, never packed) and a q5_1
-    // B through the fused block decode (x86_64; on aarch64 the q5 side falls
+    // f32 B goes through matmul_gemv (B streamed once, never packed) and a q4_1
+    // B through the fused block decode (x86_64; on aarch64 the block side falls
     // back to the packed route, so only the x86 ratio is the fused one). That
-    // pair is the whole trade at batch 1: 5.8x fewer weight bytes against a
+    // pair is the whole trade at batch 1: 6.4x fewer weight bytes against a
     // per-element decode. Above M = 4 the dense side leaves this route for the
-    // packed one, which is matmul_q5_m_ladder's comparison, not this one.
+    // packed one, which is matmul_q4_m_ladder's comparison, not this one.
     const std::vector<int64_t> ms{1, 2, 4};
     const std::vector<int> threads{1, 2, 4, 8};
-    m_ladder_q5(4096, 4096, ms, threads, 60.0);
-    m_ladder_q5(2048, 2048, ms, threads, 60.0);
-    m_ladder_q5(1024, 1024, ms, threads, 60.0);
-    m_ladder_q5(4096, 4096, ms, threads, 60.0, /*tb=*/true);
-    m_ladder_q5(2048, 2048, ms, threads, 60.0, /*tb=*/true);
-    m_ladder_q5(1024, 1024, ms, threads, 60.0, /*tb=*/true);
+    m_ladder_q4(4096, 4096, ms, threads, 60.0);
+    m_ladder_q4(2048, 2048, ms, threads, 60.0);
+    m_ladder_q4(1024, 1024, ms, threads, 60.0);
+    m_ladder_q4(4096, 4096, ms, threads, 60.0, /*tb=*/true);
+    m_ladder_q4(2048, 2048, ms, threads, 60.0, /*tb=*/true);
+    m_ladder_q4(1024, 1024, ms, threads, 60.0, /*tb=*/true);
 }
 
-NNOPS_BENCH(matmul_q4_vs_q5_ladder) {
-    // What the 4-bit format buys over the 5-bit one: both formats ride the same
-    // two routes, so the columns isolate the weight bytes (20 vs 24 per 32
-    // values — 6.4x vs 5.33x below f32) and the cheaper per-block decode. The
-    // ladder starts at M = 8, where on [N][K] both are still fused; the
-    // per-table note spells out where the two routes differ.
-    const std::vector<int64_t> ms{8, 16, 32, 64, 128};
-    const std::vector<int> threads{1, 4, 8};
-    m_ladder_q4_vs_q5(4096, 4096, ms, threads, 60.0);
-    m_ladder_q4_vs_q5(2048, 2048, ms, threads, 60.0);
-    m_ladder_q4_vs_q5(4096, 4096, ms, threads, 60.0, /*tb=*/true);
-    m_ladder_q4_vs_q5(2048, 2048, ms, threads, 60.0, /*tb=*/true);
-}
-
-NNOPS_BENCH(matmul_q4_q5_f32_three_way) {
-    // The three weight formats at one shape, as the operator actually routes
-    // them: at M <= 16 a Q5_1/Q4_1 B may take the fused small-M route (x86_64)
-    // and a dense f32 B streams through the pack-free GEMV to M = 4. So the
-    // small-M cells answer "what do I get", not "what does the format cost";
-    // the matmul_q4_q5_f32_packed bench pins both block formats to compare them.
-    const std::vector<int64_t> ms{1, 2, 4, 8, 16, 64, 256};
-    const std::vector<int> threads{1, 4, 8};
-    m_ladder_formats(4096, 4096, ms, threads, 40.0);
-    m_ladder_formats(2048, 2048, ms, threads, 40.0);
-    m_ladder_formats(1024, 1024, ms, threads, 40.0);
-    m_ladder_formats(4096, 4096, ms, threads, 40.0, /*tb=*/true);
-    m_ladder_formats(2048, 2048, ms, threads, 40.0, /*tb=*/true);
-    m_ladder_formats(1024, 1024, ms, threads, 40.0, /*tb=*/true);
-}
-
-NNOPS_BENCH(matmul_q4_q5_f32_packed) {
-    // Format-only: both block formats pinned to the packed route so the small-M
-    // cells compare the formats themselves on the route they share. The dense
+NNOPS_BENCH(matmul_q4_f32_packed) {
+    // Format-only: the block format pinned to the packed route so the small-M
+    // cells compare Q4_1 against dense f32 rather than two routes. The dense
     // f32 arm is unchanged — no switch exists for its GEMV, which is the route
     // a dense B takes to M = 4 anyway.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16};
     const std::vector<int> threads{1, 8};
-    m_ladder_formats(4096, 4096, ms, threads, 40.0, false, /*packed=*/true);
-    m_ladder_formats(4096, 4096, ms, threads, 40.0, true,  /*packed=*/true);
-    m_ladder_formats(2048, 2048, ms, threads, 40.0, false, /*packed=*/true);
-    m_ladder_formats(2048, 2048, ms, threads, 40.0, true,  /*packed=*/true);
+    m_ladder_q4(4096, 4096, ms, threads, 40.0, false, /*packed=*/true);
+    m_ladder_q4(4096, 4096, ms, threads, 40.0, true,  /*packed=*/true);
+    m_ladder_q4(2048, 2048, ms, threads, 40.0, false, /*packed=*/true);
+    m_ladder_q4(2048, 2048, ms, threads, 40.0, true,  /*packed=*/true);
 }
 
-NNOPS_BENCH(matmul_q5_m_ladder_tb) {
+NNOPS_BENCH(matmul_q4_m_ladder_tb) {
     // Same ladder against a [N][K] weight (the Linear layout), which is the one
     // the fused dot kernel serves.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128, 256};
-    m_ladder_q5(4096, 4096, ms, {1, 4}, 100.0, /*tb=*/true);
-    m_ladder_q5(2048, 2048, ms, {1, 4}, 100.0, /*tb=*/true);
+    m_ladder_q4(4096, 4096, ms, {1, 4}, 100.0, /*tb=*/true);
+    m_ladder_q4(2048, 2048, ms, {1, 4}, 100.0, /*tb=*/true);
 }
 
-// Weight-format A/B under matched conditions: same A, dense f16/f32 B vs Q5_1 B.
-NNOPS_BENCH(matmul_q5_vs_f16_ab) {
+// Weight-format A/B under matched conditions: same A, dense f16/f32 B vs Q4_1 B.
+NNOPS_BENCH(matmul_q4_vs_f16_ab) {
     bench_b_format_ab<half>("f16-act", 512, 512, 256);
 }
 
-NNOPS_BENCH(matmul_q5_vs_f32_ab) {
+NNOPS_BENCH(matmul_q4_vs_f32_ab) {
     bench_b_format_ab<float>("f32-act", 512, 512, 256);
 }
 
-NNOPS_BENCH(matmul_q5_vs_f16_ab_large) {
+NNOPS_BENCH(matmul_q4_vs_f16_ab_large) {
     bench_b_format_ab<half>("f16-act", 1024, 1024, 1024, /*rounds=*/4, /*iters=*/10);
 }
 
@@ -2800,33 +2599,33 @@ NNOPS_BENCH(matmul_i8_size_sweep) {
     }, sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_q5_size_sweep) {
+NNOPS_BENCH(matmul_q4_size_sweep) {
     // Same square ladder as f32 so the two tables can be read side by side:
     // the delta at each size is what the block-stream pack costs (or saves).
-    sweep_q5<float>("f32", {
+    sweep_q4<float>("f32", {
         {64, 64, 64},       {96, 96, 96},       {128, 128, 128},   {192, 192, 192},
         {256, 256, 256},    {384, 384, 384},    {512, 512, 512},   {768, 768, 768},
         {1024, 1024, 1024}, {1536, 1536, 1536}, {2048, 2048, 2048},
     }, sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_q5_decode_sweep) {
+NNOPS_BENCH(matmul_q4_decode_sweep) {
     // Decode-shaped rows: M stays small while K and N grow, so B is the whole
     // working set and the weight-BW line is the real limit. The M ladder at
     // fixed 4096^2 shows where the decode cost stops dominating.
-    sweep_q5<float>("f32 decode", {
+    sweep_q4<float>("f32 decode", {
         {1, 1024, 1024},  {1, 2048, 2048},  {1, 4096, 4096},
         {16, 4096, 4096}, {64, 4096, 4096}, {256, 4096, 4096},
     }, sweep_threads(), 120.0);
 }
 
-NNOPS_BENCH(matmul_q5_decode_rate) {
+NNOPS_BENCH(matmul_q4_decode_rate) {
 #if defined(NNOPS_ARCH_X86_64)
     // Raw block-decode throughput: no A, no panel, no output traffic. This is
     // the floor the fused route can reach — the packed route additionally
     // writes and re-reads every decoded value.
     const int64_t rows = 4096, blocks_per_row = 128;   // 4096 x 4096 values
-    auto [bv, b] = make_tensor_q5(rows, blocks_per_row * 32, 3);
+    auto [bv, b] = make_tensor_q4(rows, blocks_per_row * 32, 3);
     const uint8_t* p = bv.data();
     const int64_t nblk = rows * blocks_per_row;
     const int64_t values = nblk * 32;
@@ -2837,7 +2636,7 @@ NNOPS_BENCH(matmul_q5_decode_rate) {
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (int64_t i = 0; i < nblk; ++i) {
             __m256 v0, v1, v2, v3;
-            cpu::arch::decode_q5_1_block_ps(p + i * 24, v0, v1, v2, v3);
+            cpu::arch::decode_q4_1_block_ps(p + i * 20, v0, v1, v2, v3);
             acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_add_ps(v0, v1),
                                                    _mm256_add_ps(v2, v3)));
         }
@@ -2846,7 +2645,7 @@ NNOPS_BENCH(matmul_q5_decode_rate) {
         if (_mm256_cvtss_f32(acc) == 12345.0f) { std::printf(" "); }
         best = std::min(best, ms);
     }
-    std::printf("  q5_1 decode-only  4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n",
+    std::printf("  q4_1 decode-only  4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n",
                 best, static_cast<double>(values) / (best * 1e6));
 
     // Same stream through the packer's 32-value decode (writes a small stack
@@ -2858,7 +2657,7 @@ NNOPS_BENCH(matmul_q5_decode_rate) {
         __m256 acc = _mm256_setzero_ps();
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (int64_t i = 0; i < nblk; ++i) {
-            cpu::arch::decode_q5_1_block<float>(p + i * 24, vals);
+            cpu::arch::decode_q4_1_block<float>(p + i * 20, vals);
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals));
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals + 8));
             acc = _mm256_add_ps(acc, _mm256_loadu_ps(vals + 16));
@@ -2869,10 +2668,10 @@ NNOPS_BENCH(matmul_q5_decode_rate) {
         if (_mm256_cvtss_f32(acc) == 12345.0f) { std::printf(" "); }
         best = std::min(best, ms);
     }
-    std::printf("  q5_1 decode+stack 4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n",
+    std::printf("  q4_1 decode+stack 4096x4096 blocks: %.3f ms  = %.2f Gvalues/s\n",
                 best, static_cast<double>(values) / (best * 1e6));
 #else
-    std::printf("  q5_1 decode rate: x86_64 only\n");
+    std::printf("  q4_1 decode rate: x86_64 only\n");
 #endif
 }
 

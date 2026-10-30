@@ -5,9 +5,8 @@
 /// Q4_1 is llama.cpp's affine 4-bit block format: 32 values in 20 bytes — an
 /// fp16 delta `d`, an fp16 minimum `m`, and 16 bytes of nibbles (low nibble of
 /// byte j is value j, high nibble is value j + 16). Value j is `d * q + m` with
-/// q in [0, 15]. It is Q5_1's block minus the 5th-bit mask, so the decode here
-/// is the same two nibble vectors without the mask gather, and a Q4_1 block
-/// moves 20 bytes instead of 24 for the same 32 values.
+/// q in [0, 15]: two nibble vectors per block and an affine (d, m) decode, so
+/// a block covers 32 values in 20 bytes.
 ///
 /// The dense `pack_q4` here is the vectorized counterpart of the portable
 /// scalar loop in <nnops/detail/q4_1.hpp>; the block layout and the scalar
@@ -47,8 +46,8 @@ using nnops::backend::cpu::half_to_float;
 /// Decode one block's 32 values into four 8-lane f32 vectors.
 ///
 /// The nibble bytes are widened once into two 16-byte halves (low nibbles and
-/// high nibbles), then each half is widened to 8-lane integers. There is no
-/// 5th-bit gather to interleave, so this is four `cvtepu8_epi32` and four FMAs.
+/// high nibbles), then each half is widened to 8-lane integers: four
+/// `cvtepu8_epi32` and four FMAs.
 ///
 /// @param scale multiplies the whole block: the decode is `q·d + m`, so scaling
 ///              `d` and `m` once per block scales all 32 values — MatMul's alpha

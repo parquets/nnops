@@ -11,7 +11,7 @@
 ///   - matmul_small.cpp         — the naive SIMD kernel below
 ///                                GEMM_FAST_PATH_THRESHOLD MACs, and the direct
 ///                                GEMV at M <= GEMV_M_MAX;
-///   - matmul_qblock_fused.cpp  — the x86-only fused Q5_1/Q4_1 decode route
+///   - matmul_qblock_fused.cpp  — the x86-only fused Q4_1 decode route
 ///                                (M <= 16).
 ///
 /// They stay out of the driver because neither packs, blocks, splits or touches
@@ -19,7 +19,7 @@
 /// driver is here — the product's dims, the epilogue predicates, and the batch
 /// walk that maps a flat batch index to per-operand element offsets.
 
-#include "matmul_helper.h"                 // MatMulPlan geometry, Q5_1 block size
+#include "matmul_helper.h"                 // MatMulPlan geometry, block sizes
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/detail/assert.hpp"
@@ -67,7 +67,7 @@ inline MatMulDims matmul_dims(const MatMulAttributes& attrs,
              attrs.transpose_b ? b.shape(b.rank() - 1) : b.shape(b.rank() - 2) };
 }
 
-/// A block-packed B (q5_1/q4_1) for a batch element. BatchWalk's offsets and
+/// A block-packed B (q4_1) for a batch element. BatchWalk's offsets and
 /// the row pitch already count in blocks, so only the block size turns a
 /// block offset into bytes.
 inline const uint8_t* block_rhs_at(const uint8_t* base, int64_t block_off,
@@ -144,7 +144,7 @@ bool matmul_small_fp(const MatMulAttributes& attrs,
                      const ComputeContext& ctx);
 
 #if defined(NNOPS_ARCH_X86_64)
-/// Whole product through the fused Q5_1/Q4_1 kernels; false if not applicable.
+/// Whole product through the fused Q4_1 kernels; false if not applicable.
 bool matmul_qblock_fused(const MatMulAttributes& attrs,
                          TensorView& output,
                          std::span<const TensorView> inputs,

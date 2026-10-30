@@ -1,16 +1,16 @@
 /// @file matmul_qblock_fused.cpp
 /// @brief Fused block-quant small-M MatMul — decode straight into the product.
 ///
-/// The packed route re-decodes every Q5_1/Q4_1 block into uniform panels,
-/// writes them to scratch and reads them back. At small M there are too few
+/// The packed route re-decodes every Q4_1 block into uniform panels, writes
+/// them to scratch and reads them back. At small M there are too few
 /// output rows to amortise that round trip, so this route skips it: no packed
 /// B, no workspace, no k-blocking — each kernel sweeps K once and decodes B in
 /// registers. x86-only (the arch's mma_qblock_f32_{trans,copy}); everywhere
 /// else the packed route handles the block formats.
 ///
-/// The M limits are per layout and per format, measured; they live on the block
-/// policies in mma_qblock.hpp. The driver asks this file to run the product and
-/// gets false back when the shape is out of range.
+/// The M limits are per layout, measured; they live on the block policy in
+/// mma_qblock.hpp. The driver asks this file to run the product and gets false
+/// back when the shape is out of range.
 
 #include "matmul_internal.h"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"   // tile_scale / epilogue_inplace
@@ -22,16 +22,15 @@ namespace nnops::backend::cpu {
 #if defined(NNOPS_ARCH_X86_64)
 
 /// Benchmark-only cap for the fused block-quant route: negative = the policy's
-/// limits, 0 = disabled, else caps M (so one process can A/B both routes). It
-/// covers Q5_1 and Q4_1 alike, which is what keeps the format ladders
-/// comparing two packed routes unless they ask for the fused one.
+/// limits, 0 = disabled, else caps M (so one process can A/B both routes).
+/// Setting 0 is how a ladder pins itself to the packed route.
 int qblock_fused_max_m_override = -1;
 
 namespace {
 
 /// Two quant blocks per worker task, which is also the copy kernel's minimum
 /// tile.
-constexpr int QBLOCK_FUSED_NTILE = 2 * arch::Q5Block::block_elems;
+constexpr int QBLOCK_FUSED_NTILE = 2 * arch::Q4Block::block_elems;
 
 /// Call the kernel instantiated for @p MR rows, recursing down to the live count.
 template <class BQ, bool ZERO, bool TRANS, int MR>
@@ -181,7 +180,6 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs,
         return false;
     }
     switch (inputs[1].data_type()) {
-    case DataType::q5_1: return qblock_fused_try<arch::Q5Block>(attrs, output, inputs, ctx, M, N, K);
     case DataType::q4_1: return qblock_fused_try<arch::Q4Block>(attrs, output, inputs, ctx, M, N, K);
     default:             return false;
     }

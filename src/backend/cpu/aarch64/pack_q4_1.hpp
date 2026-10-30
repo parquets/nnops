@@ -5,10 +5,9 @@
 /// Q4_1 is llama.cpp's affine 4-bit block format: 32 values in 20 bytes — an
 /// fp16 delta `d`, an fp16 minimum `m`, and 16 bytes of nibbles (low nibble of
 /// byte j is value j, high nibble is value j + 16). Value j is `d * q + m` with
-/// q in [0, 15]. It is Q5_1's block minus the 5th-bit mask, so the decode here
-/// is the same nibble widening without the mask merge, and a Q4_1 block moves
-/// 20 bytes instead of 24 for the same 32 values. The block layout and the
-/// portable scalar reference live in <nnops/detail/q4_1.hpp>.
+/// q in [0, 15]: two nibble vectors per block and an affine (d, m) decode, so
+/// a block covers 32 values in 20 bytes. The block layout and the portable
+/// scalar reference live in <nnops/detail/q4_1.hpp>.
 ///
 /// `pack_q4_1_rhs` is the GEMM-side entry point: it fuses unpack + dequantize
 /// + f16 narrowing into the RHS panel pack, so a Q4_1 weight never passes

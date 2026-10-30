@@ -2,18 +2,16 @@
 /// @file mma_qblock.hpp
 /// @brief Fused block-quant × f32 dot kernels for the small-M MatMul route.
 ///
-/// The packed-B route decodes a Q5_1/Q4_1 block into a dense panel and then
-/// reads that panel back in the MMA. At M=1 the panel is consumed by exactly
-/// one row, so the decode + panel round trip is the whole call. These kernels
-/// skip the panel: each block is decoded into registers and multiplied
-/// straight into the accumulator, so a block is read once (24 B for Q5_1, 20 B
-/// for Q4_1) and never written back.
+/// The packed-B route decodes a Q4_1 block into a dense panel and then reads
+/// that panel back in the MMA. At M=1 the panel is consumed by exactly one
+/// row, so the decode + panel round trip is the whole call. These kernels skip
+/// the panel: each block is decoded into registers and multiplied straight
+/// into the accumulator, so a block is read once (20 B) and never written
+/// back.
 ///
-/// The two formats differ only in the block stream: same 32-value blocks, same
-/// fp16 `d`/`m` affine decode, and Q5_1's extra 5th-bit mask is the only work
-/// Q4_1 does not do. So the kernels are written once and parameterized by a
-/// block policy — `Q5Block` or `Q4Block` — that supplies the stride, the width
-/// and the two decode entry points.
+/// The kernels are parameterized by a block policy — `Q4Block` — that supplies
+/// the stride, the width and the two decode entry points, so a second block
+/// format costs one policy and no kernel.
 ///
 /// Two physical B layouts, each with its natural loop shape:
 ///
@@ -40,7 +38,6 @@
 #include "backend/cpu/common/common_utils.hpp"
 #include "nnops/core/data_type.hpp"
 #include "pack_q4_1.hpp"
-#include "pack_q5_1.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
 
@@ -48,41 +45,21 @@ namespace nnops::backend::cpu::x86_64 {
 //  Block policies
 // =========================================================================
 //
-/// Everything the fused kernels need to read one 32-value quant block. Both
-/// formats encode `d * q + m`; only the quant width differs.
-
-struct Q5Block {
-    static constexpr int block_elems = q5_1_block_elems;
-    static constexpr int block_bytes = q5_1_block_bytes;
-    static constexpr DataType dtype = DataType::q5_1;
-
-    /// Largest M the fused kernels still win, per layout, measured at
-    /// K=N=4096 (the dot kernel reuses one decode across MR = 8 rows, the
-    /// outer-product one across 2, and the packed route decodes B once).
-    static constexpr int fused_max_m_trans = 16;
-    static constexpr int fused_max_m_copy = 4;
-
-    static inline void decode_ps(const uint8_t* p, __m256& v0, __m256& v1,
-                                 __m256& v2, __m256& v3) noexcept {
-        decode_q5_1_block_ps(p, v0, v1, v2, v3);
-    }
-
-    template <class T>
-    static inline void decode(const uint8_t* p, T* out) noexcept {
-        decode_q5_1_block<T>(p, out);
-    }
-};
+/// Everything the fused kernels need to read one 32-value quant block: the
+/// block width, the dtype it names, and the two decode entry points (vectorized
+/// and scalar, for the paths that write to memory).
 
 struct Q4Block {
     static constexpr int block_elems = q4_1_block_elems;
     static constexpr int block_bytes = q4_1_block_bytes;
     static constexpr DataType dtype = DataType::q4_1;
 
-    /// Same measurement as Q5Block's, except the copy limit: a Q4_1 decode does
-    /// less work per block, so re-decoding B once per 2-row panel stays cheaper
-    /// than the packed panel round trip for twice as many rows. At M=8 the
-    /// fused route is still +34% at 4096² and +89% at 2048², and it only loses
-    /// from M=16 at 4096² (ratio 0.85) / M=24.
+    /// The fused route's measured M ceilings, per layout, at K=N=4096. The dot
+    /// kernel reuses one decode across MR = 8 rows and the outer-product one
+    /// across 2, so the copy limit is half the trans one's: re-decoding B once
+    /// per 2-row panel is amortized over a quarter of the rows. At the ceiling
+    /// the fused route is still ahead — M=8 +34% at 4096² and +89% at 2048² —
+    /// and it loses only from M=16 at 4096² (ratio 0.85) / M=24.
     static constexpr int fused_max_m_trans = 16;
     static constexpr int fused_max_m_copy = 8;
 
@@ -97,7 +74,7 @@ struct Q4Block {
     }
 };
 
-static_assert(Q5Block::block_elems == Q4Block::block_elems,
+static_assert(Q4Block::block_elems == 32,
               "the fused kernels assume one 32-value block per k step in the "
               "copy layout");
 

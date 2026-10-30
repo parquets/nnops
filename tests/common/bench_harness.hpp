@@ -57,7 +57,7 @@ struct BenchRegistrar {
 }  // namespace nnops::test
 
 // The name is recorded too, so the runner can take an optional substring
-// filter: `bench_matmul q5` runs only the Q5 cases.
+// filter: `bench_matmul q4` runs only the Q4_1 cases.
 #define NNOPS_BENCH(name) \
     static void _nnops_bench_##name(); \
     static ::nnops::test::BenchRegistrar _nnops_bench_reg_##name(#name, _nnops_bench_##name); \

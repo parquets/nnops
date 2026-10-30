@@ -14,10 +14,9 @@
 ///
 ///   y[j] = d * ( low4(qs[j % 16], j < 16 ? low : high) ) + m
 ///
-/// This is byte-for-byte ggml's `block_q4_1` / `dequantize_row_q4_1`: Q5_1's
-/// affine decode without the 5th bit, so q is in [0, 15] and the block carries
-/// no mask. Like Q5_1 the block is self-describing (d and m live in the data),
-/// so no QuantParams are involved.
+/// This is byte-for-byte ggml's `block_q4_1` / `dequantize_row_q4_1`: an
+/// affine four-bit decode, so q is in [0, 15]. The block is self-describing
+/// (d and m live in the data), so no QuantParams are involved.
 ///
 /// `pack_q4` fuses the nibble unpacking with the dequantization and the
 /// f32 → f16 narrowing: each block is read once and the values are written

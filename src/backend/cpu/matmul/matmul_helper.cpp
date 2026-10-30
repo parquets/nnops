@@ -5,7 +5,6 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/q4_1.hpp"
-#include "nnops/detail/q5_1.hpp"
 #include "nnops/detail/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_quant.hpp"
 
@@ -232,30 +231,16 @@ void tile_pack_rhs(bool trans, int nc, int kc,
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
 
-// ---- Block-packed RHS (q5_1 / q4_1) --------------------------------------
+// ---- Block-packed RHS (q4_1) --------------------------------------------
 // The panel layout matches tile_pack_rhs, so the MMA route knows no block
-// format: it reads the same uniform panels whichever stream they came from.
+// format: it reads the same uniform panels the stream decodes to.
 
-// Both formats are 32-value blocks; the scalar fallback below indexes them with
+// A Q4_1 block is 32 values; the scalar fallback below indexes them with
 // shifts, and the arch packers assume the same width when slicing rows.
-static_assert(q5_1_block_elems == 32 && q4_1_block_elems == 32,
+static_assert(q4_1_block_elems == 32,
               "the block RHS packers assume 32-value blocks");
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
-
-void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    arch::pack_q5_1_rhs<float>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                               src_row_blocks, scale);
-}
-
-void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    arch::pack_q5_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                              src_row_blocks, scale);
-}
 
 void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         float* dst, int ldd, const void* src, int64_t src_row_blocks,
@@ -278,8 +263,8 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 /// The panel width must be the active arch's float RHS panel width, because the
 /// workspace stride (ldd_b) and the MMA kernels are sized from it — it is not
 /// the same on every arch (aarch64 f32 uses nr_f32[0] = 12, both x86 widths and
-/// the aarch64 f16 one are 16). The arch packers in x86_64/pack_q5_1.hpp and
-/// aarch64/pack_q5_1.hpp write this same layout, but decode each block once per
+/// the aarch64 f16 one are 16). The arch packers in x86_64/pack_q4_1.hpp and
+/// aarch64/pack_q4_1.hpp write this same layout, but decode each block once per
 /// row rather than once per element and panel.
 template <class T>
 constexpr int block_panel_nr() noexcept {
@@ -287,7 +272,7 @@ constexpr int block_panel_nr() noexcept {
     else { return NR_MAX_F16; }
 }
 
-/// Values per block of both formats, for the shift-based block indexing below.
+/// Values per block, for the shift-based block indexing below.
 constexpr int kBlockElems = 32;
 
 /// One block-packed format's row decoder: unpack(block_ptr, float out[]).
@@ -325,22 +310,6 @@ void tile_pack_rhs_block_scalar(bool trans, int n_start, int nc, int k_start, in
     }
 }
 
-void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        float* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    tile_pack_rhs_block_scalar<float>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                      src, src_row_blocks, scale,
-                                      q5_1_block_bytes, q5_1_unpack_block);
-}
-
-void tile_pack_rhs_q5_1(bool trans, int n_start, int nc, int k_start, int kc,
-                        half* dst, int ldd, const void* src, int64_t src_row_blocks,
-                        float scale) {
-    tile_pack_rhs_block_scalar<half>(trans, n_start, nc, k_start, kc, dst, ldd,
-                                     src, src_row_blocks, scale,
-                                     q5_1_block_bytes, q5_1_unpack_block);
-}
-
 void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         float* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale) {
@@ -358,30 +327,6 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 }
 
 #endif
-
-void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc, int k_start,
-                         int kc, float* dst, int ldd, const void* src,
-                         int64_t src_row_blocks, float scale) {
-    if (dt == DataType::q4_1) {
-        tile_pack_rhs_q4_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                           src_row_blocks, scale);
-    } else {
-        tile_pack_rhs_q5_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                           src_row_blocks, scale);
-    }
-}
-
-void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc, int k_start,
-                         int kc, half* dst, int ldd, const void* src,
-                         int64_t src_row_blocks, float scale) {
-    if (dt == DataType::q4_1) {
-        tile_pack_rhs_q4_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                           src_row_blocks, scale);
-    } else {
-        tile_pack_rhs_q5_1(trans, n_start, nc, k_start, kc, dst, ldd, src,
-                           src_row_blocks, scale);
-    }
-}
 
 void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc,
                    const float* packed_a, const float* b,
@@ -876,7 +821,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
 
-    // A block-packed B (q5_1/q4_1) is self-describing, so A only has to be a
+    // A block-packed B (q4_1) is self-describing, so A only has to be a
     // float type.
     const bool block_rhs = is_block_packed_dtype(dt_b) &&
                            (dt_a == DataType::f32 || dt_a == DataType::f16);

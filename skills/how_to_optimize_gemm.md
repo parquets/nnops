@@ -4,7 +4,7 @@ A record of the optimization decisions, constraints, and trade-offs that shaped 
 tiled GEMM implementation in [src/backend/cpu/matmul/matmul.cpp](../src/backend/cpu/matmul/matmul.cpp)
 and the shared pack/MMA helpers in [src/backend/cpu/matmul/matmul_helper.h](../src/backend/cpu/matmul/matmul_helper.h).
 The two routes that bypass the plan — the small-GEMM / GEMV paths (rules 3 and 4
-below) and the fused Q5_1/Q4_1 decode — are self-contained and live beside it in
+below) and the fused Q4_1 decode — are self-contained and live beside it in
 [matmul_small.cpp](../src/backend/cpu/matmul/matmul_small.cpp) and
 [matmul_qblock_fused.cpp](../src/backend/cpu/matmul/matmul_qblock_fused.cpp); what they share with
 the driver (dims, batch walk, epilogue predicates) is in
