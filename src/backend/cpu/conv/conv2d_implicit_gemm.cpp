@@ -1349,8 +1349,9 @@ constexpr int64_t kTaskTileCap = int64_t{64} << 10;
 
 /// Seed an output tile [mc][nc] (row stride ld) with the per-column bias,
 /// optionally adding what is already there (the identity-epilogue residual).
-/// Without add_to the accumulator is built by the first MMA block and the bias
-/// rides in the finish pass instead.
+/// This is the add_to route only — a bias with nothing under it is the
+/// accumulator's own initial value now (tile_mma_direct's col_bias), which
+/// costs no tile traffic at all.
 template <class T>
 void tile_seed(T* NNOPS_RESTRICT tile, int ld, int mc, int nc,
                const T* NNOPS_RESTRICT bias, bool add) noexcept
@@ -1362,7 +1363,7 @@ void tile_seed(T* NNOPS_RESTRICT tile, int ld, int mc, int nc,
                 s_store(&row[i], s_load(&row[i]) + s_load(&bias[i]));
             }
         } else {
-            for (int i = 0; i < nc; ++i) { row[i] = bias[i]; }
+            std::memcpy(row, bias, static_cast<size_t>(nc) * sizeof(T));
         }
     }
 }
@@ -1613,6 +1614,17 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     const int nslots = ctx.cpu.thread_slot_count();
     const bool per_thread = nslots > 0 && nslots < total;
 
+    // The bias reaches the accumulator as a per-column seed — the micro-kernel's
+    // lanes are output channels here, its rows pixels — and a kernel loads it a
+    // whole panel at a time, so a group's bias has to be readable `nr_max` past
+    // its last channel. One padded copy of the lot covers every group: lanes
+    // past a group are only ever read, and the store drops them.
+    std::vector<T> bias_pad;
+    if (bias_seed) {
+        bias_pad.assign(static_cast<size_t>(OC + nr_max), T{});
+        std::memcpy(bias_pad.data(), b_ptr, static_cast<size_t>(OC) * sizeof(T));
+    }
+
     const auto run_task = [&](int64_t t) {
         const int64_t ng   = t / chunks_per_ng;
         const int64_t rem  = t % chunks_per_ng;
@@ -1634,6 +1646,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
         const T* const in_g = in_ptr + n * ib_step + g * ic_per_group;
         const T* const w_g  = w_ptr + g * oc_per_group;
         const T* const bias_g = b_ptr ? b_ptr + g * oc_per_group : nullptr;
+        const T* const bias_col = bias_seed ? bias_pad.data() + g * oc_per_group : nullptr;
 
         // Contiguous, disjoint row range of this oh-chunk, and its oc range.
         const int64_t r0 = chunk * OH / oh_chunks;
@@ -1747,21 +1760,20 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                                 tile_zero<T>(tile, static_cast<int>(OC), mc,
                                              static_cast<int>(ocnc));
                             }
-                        } else if (icn == 0 && bias_seed) {
-                            // Bias only: a store per element, against the load
-                            // and store the finish pass would have spent on the
-                            // same tile. The MMA then accumulates onto it.
-                            tile_seed<T>(tile, static_cast<int>(OC), mc,
-                                         static_cast<int>(ocnc), bias_g + ocn,
-                                         /*add=*/false);
                         }
 
+                        // Bias only: the accumulator is *built* from it, one
+                        // panel-lane load per n-block, where seeding the tile
+                        // first cost a whole write and read-back of the output
+                        // — twice the tile's traffic for one addend.
                         tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
                                         tile, static_cast<int>(OC),
                                         a, lda, b_panel, c_lo, c_hi,
                                         /*zero_mode=*/icn == 0 && !attrs.add_to &&
                                                        !bias_seed,
-                                        nullptr);
+                                        nullptr,
+                                        (icn == 0 && bias_seed) ? bias_col + ocn
+                                                                : nullptr);
 
                         if (is_last_icn && need_epi) {
                             epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,

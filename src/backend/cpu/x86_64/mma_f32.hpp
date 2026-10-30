@@ -1035,7 +1035,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -1061,16 +1061,20 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        __m256 v = _mm256_setzero_ps();
-        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
-        return v;
-    };
-
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
+    // first costs a full write and read-back of the output. `off` is the lane
+    // offset inside the panel. A row past `mr` aliases the last live row in A
+    // and C, so the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A + 0 * lda;
@@ -1080,18 +1084,18 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         const float* a4_ptr = A + r4 * lda;
         const float* a5_ptr = A + r5 * lda;
 
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = init_row(r1);
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = init_row(r2);
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = init_row(r3);
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
-        __m256 v_acc4x01234567 = init_row(r4);
-        __m256 v_acc4x89abcdef = v_acc4x01234567;
-        __m256 v_acc5x01234567 = init_row(r5);
-        __m256 v_acc5x89abcdef = v_acc5x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
+        __m256 v_acc4x01234567 = init(r4, 0);
+        __m256 v_acc4x89abcdef = init(r4, 8);
+        __m256 v_acc5x01234567 = init(r5, 0);
+        __m256 v_acc5x89abcdef = init(r5, 8);
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1188,18 +1192,18 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         const float* a3_ptr = A + r3 * lda;
         const float* a4_ptr = A + r4 * lda;
         const float* a5_ptr = A + r5 * lda;
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = init_row(r1);
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = init_row(r2);
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = init_row(r3);
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
-        __m256 v_acc4x01234567 = init_row(r4);
-        __m256 v_acc4x89abcdef = v_acc4x01234567;
-        __m256 v_acc5x01234567 = init_row(r5);
-        __m256 v_acc5x89abcdef = v_acc5x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
+        __m256 v_acc4x01234567 = init(r4, 0);
+        __m256 v_acc4x89abcdef = init(r4, 8);
+        __m256 v_acc5x01234567 = init(r5, 0);
+        __m256 v_acc5x89abcdef = init(r5, 8);
 
         const float* b_ptr = B;
         if (rem > 8) {
@@ -1428,7 +1432,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -1450,16 +1454,20 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        __m256 v = _mm256_setzero_ps();
-        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
-        return v;
-    };
-
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
+    // first costs a full write and read-back of the output. `off` is the lane
+    // offset inside the panel. A row past `mr` aliases the last live row in A
+    // and C, so the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A + 0 * lda;
@@ -1467,14 +1475,14 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         const float* a2_ptr = A + r2 * lda;
         const float* a3_ptr = A + r3 * lda;
 
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = init_row(r1);
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = init_row(r2);
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = init_row(r3);
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1548,14 +1556,14 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         const float* a1_ptr = A + r1 * lda;
         const float* a2_ptr = A + r2 * lda;
         const float* a3_ptr = A + r3 * lda;
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = init_row(r1);
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = init_row(r2);
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = init_row(r3);
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
 
         const float* b_ptr = B;
         if (rem > 8) {
@@ -1731,7 +1739,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -1749,25 +1757,29 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        __m256 v = _mm256_setzero_ps();
-        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
-        return v;
-    };
-
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
+    // first costs a full write and read-back of the output. `off` is the lane
+    // offset inside the panel. A row past `mr` aliases the last live row in A
+    // and C, so the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
 
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = init_row(r1);
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -1818,10 +1830,10 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
         // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
         const float* a1_ptr = A + r1 * lda;
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = init_row(r1);
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
 
         const float* b_ptr = B;
         if (rem > 8) {
@@ -1944,7 +1956,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_b_mr1_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -1960,22 +1972,26 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        __m256 v = _mm256_setzero_ps();
-        if constexpr (with_bias) { v = _mm256_set1_ps(bias[r]); }
-        return v;
-    };
-
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's 16 lanes, so it costs two loads per panel where seeding the tile
+    // first costs a full write and read-back of the output. `off` is the lane
+    // offset inside the panel. A row past `mr` aliases the last live row in A
+    // and C, so the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A;
 
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
 
         const float* b_ptr = B;
         for(int k = 0; k < kc; ++k) {
@@ -2015,8 +2031,8 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
         // one 8-lane read; a wider tail reads both halves and reuses the
         // full-panel body, so it costs one k-loop instead of two.
         const float* a0_ptr = A + 0 * lda;
-        __m256 v_acc0x01234567 = init_row(0);
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
 
         const float* b_ptr = B;
         if (rem > 8) {
@@ -2122,10 +2138,10 @@ inline constexpr auto mma_pack_fns_f32 = std::array{
     &mma_packed_ab_mr4_nr16_mrxncxkc_f32<Z>,
     &mma_packed_ab_mr1_nr16_mrxncxkc_f32<Z>};
 
-template <bool Z, bool B = false>
+template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{
-    &mma_packed_b_mr6_nr16_mrxncxkc_f32<Z, B>,
-    &mma_packed_b_mr4_nr16_mrxncxkc_f32<Z, B>,
-    &mma_packed_b_mr1_nr16_mrxncxkc_f32<Z, B>};
+    &mma_packed_b_mr6_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_b_mr4_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_b_mr1_nr16_mrxncxkc_f32<Z, Seed>};
 
 }

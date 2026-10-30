@@ -525,10 +525,17 @@ void tile_pack_rhs_block(DataType dt, bool trans, int n_start, int nc,
 // partial sum. Conv2D uses it to drop its bias seed, a whole write+read of the
 // output tile that existed only to put the bias where the first k-block could
 // accumulate onto it.
+//
+// `col_bias` is the same idea with the axes swapped: one value per N column,
+// for a route whose M rows are pixels (channel-last Conv2D), where a row seed
+// has nothing to hold. It must be readable in whole nr_max-wide lanes past
+// `nc` — the panel is loaded as a unit and the extra lanes are dropped by the
+// store, so the caller pads its bias to the panel width. Also builds the tile:
+// pass it on the first k-block only, with `zero_mode` true.
 void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr);
+void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
 void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr);
+void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
 
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);

@@ -589,7 +589,113 @@ void run_wino_table(const char* title) {
     }
 }
 
+// ============================================================
+// The layer list as a graph: every conv cold
+// ============================================================
+//
+// The A/B above re-runs one layer until it is L2-resident, which is the right
+// instrument for the kernel and the wrong one for the network: inside a forward
+// pass a layer's input, weights and output arrive cold, and the layers around it
+// evict what it just touched. MobileNetV2's 35 convs are the list below, in the
+// order the model issues them; one pass over it is the graph's conv time.
+//
+// Same layers, same kernels — the difference from the table above is what the
+// neighbours did to the caches. It is where the small-plane expansions and the
+// big-plane head show their real cost, and it is the number a change to the
+// pointwise route has to move.
+
+const std::vector<Shape>& mobile_graph() {
+    static const std::vector<Shape> s = {
+        {"stem   3x3 s2 224   3->32",    1,    3, 224, 224,   32, 3, 3, 2, 2, 1, 1},
+        {"proj   @112      32->16",       1,   32, 112, 112,   16, 1, 1},
+        {"expand @112      16->96",       1,   16, 112, 112,   96, 1, 1},
+        {"proj   @56       96->24",       1,   96,  56,  56,   24, 1, 1},
+        {"expand @56       24->144",      1,   24,  56,  56,  144, 1, 1},
+        {"proj   @56      144->24",       1,  144,  56,  56,   24, 1, 1},
+        {"expand @56       24->144",      1,   24,  56,  56,  144, 1, 1},
+        {"proj   @28      144->32",       1,  144,  28,  28,   32, 1, 1},
+        {"expand @28       32->192",      1,   32,  28,  28,  192, 1, 1},
+        {"proj   @28      192->32",       1,  192,  28,  28,   32, 1, 1},
+        {"expand @28       32->192",      1,   32,  28,  28,  192, 1, 1},
+        {"proj   @28      192->32",       1,  192,  28,  28,   32, 1, 1},
+        {"expand @28       32->192",      1,   32,  28,  28,  192, 1, 1},
+        {"proj   @14      192->64",       1,  192,  14,  14,   64, 1, 1},
+        {"expand @14       64->384",      1,   64,  14,  14,  384, 1, 1},
+        {"proj   @14      384->64",       1,  384,  14,  14,   64, 1, 1},
+        {"expand @14       64->384",      1,   64,  14,  14,  384, 1, 1},
+        {"proj   @14      384->64",       1,  384,  14,  14,   64, 1, 1},
+        {"expand @14       64->384",      1,   64,  14,  14,  384, 1, 1},
+        {"proj   @14      384->64",       1,  384,  14,  14,   64, 1, 1},
+        {"expand @14       64->384",      1,   64,  14,  14,  384, 1, 1},
+        {"proj   @14      384->96",       1,  384,  14,  14,   96, 1, 1},
+        {"expand @14       96->576",      1,   96,  14,  14,  576, 1, 1},
+        {"proj   @14      576->96",       1,  576,  14,  14,   96, 1, 1},
+        {"expand @14       96->576",      1,   96,  14,  14,  576, 1, 1},
+        {"proj   @14      576->96",       1,  576,  14,  14,   96, 1, 1},
+        {"expand @14       96->576",      1,   96,  14,  14,  576, 1, 1},
+        {"proj   @7       576->160",      1,  576,   7,   7,  160, 1, 1},
+        {"expand @7       160->960",      1,  160,   7,   7,  960, 1, 1},
+        {"proj   @7       960->160",      1,  960,   7,   7,  160, 1, 1},
+        {"expand @7       160->960",      1,  160,   7,   7,  960, 1, 1},
+        {"proj   @7       960->160",      1,  960,   7,   7,  160, 1, 1},
+        {"expand @7       160->960",      1,  160,   7,   7,  960, 1, 1},
+        {"proj   @7       960->320",      1,  960,   7,   7,  320, 1, 1},
+        {"head   @7       320->1280",     1,  320,   7,   7, 1280, 1, 1},
+    };
+    return s;
+}
+
 }  // namespace
+
+/// One pass over the conv list in graph order, every call timed on its own so a
+/// row's cost is the cold one. Rows are medians over @c passes, the total is the
+/// median pass.
+NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
+    const int passes = 5;
+    std::printf("\n== f32 channel-last: MobileNetV2's convs as a graph (cold) ==\n");
+    for (int nt : bench_threads()) {
+        std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
+        std::vector<std::unique_ptr<AbFp<float>>> ops;
+        for (const auto& c : mobile_graph()) {
+            ops.push_back(std::make_unique<AbFp<float>>(c));
+        }
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        for (auto& op : ops) { op->run_nhwc(use_ctx); }   // warm-up
+
+        std::vector<std::vector<double>> row(ops.size());
+        std::vector<double> pass_ms;
+        for (int pass = 0; pass < passes; ++pass) {
+            double sum = 0.0;
+            for (size_t i = 0; i < ops.size(); ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                ops[i]->run_nhwc(use_ctx);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                row[i].push_back(ms);
+                sum += ms;
+            }
+            pass_ms.push_back(sum);
+        }
+        for (auto& r : row) { std::sort(r.begin(), r.end()); }
+        std::sort(pass_ms.begin(), pass_ms.end());
+
+        std::printf("    %-24s %8s %8s\n", "layer", "ms", "GFLOPS");
+        double sum = 0.0;
+        for (size_t i = 0; i < ops.size(); ++i) {
+            const double ms = row[i][row[i].size() / 2];
+            sum += ms;
+            std::printf("    %-24s %8.3f %8.1f\n", ops[i]->s.name, ms,
+                        ops[i]->work / ms / 1e6);
+        }
+        std::printf("    %-24s %8.3f\n", "sum of the rows", sum);
+        std::printf("    %-24s %8.3f ms per pass (median of %d)\n",
+                    "the graph", pass_ms[pass_ms.size() / 2], passes);
+    }
+}
 
 NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f32) {
     run_wino_table<float>(

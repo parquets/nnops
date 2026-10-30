@@ -508,9 +508,13 @@ NNOPS_TEST(conv2d_nhwc_fp_epilogues) {
                         static_cast<int>(i) + 100);
     }
 
-    // The clamp folds into the MMA store only when there is neither a bias nor
-    // a residual; that path has to agree with the plain-convolution + clamp
-    // reference too, so cover it without a bias.
+    // The clamp folds into the MMA store. With a bias the accumulator starts at
+    // it (the per-column seed), without one at zero — a different kernel
+    // instantiation, so cover the unbiased one too; and cover the biased f16
+    // route, whose seed arrives as a converted half panel.
+    expect_fp_close(c, DataType::f16, nnops::test::kF16AccumTol,
+                    EpilogueActivateType::Relu6, false, 606);
+
     FpCase no_bias = c;
     no_bias.bias = false;
     expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu, false, 600);

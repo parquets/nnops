@@ -537,7 +537,7 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
 //  mr=8/4/1  kernels, raw A — only B packed
 // =========================================================================
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -566,24 +566,29 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        float32x4_t v = vdupq_n_f32(0.0f);
-        if constexpr (with_bias) { v = vdupq_n_f32(bias[r]); }
-        return v;
-    };
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's lanes, so it costs the panel's loads where seeding the tile first
+    // costs a full write and read-back of the output. `off` is the lane offset
+    // inside the panel. A row past `mr` aliases the last live row in A and C, so
+    // the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
+        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
+        else { return vdupq_n_f32(0.0f); }
+    };
     for (; n < nc - 11; n += 12) {
-        float32x4_t c00 = init_row(0), c01 = c00, c02 = c00;
-        float32x4_t c10 = init_row(r1), c11 = c10, c12 = c10;
-        float32x4_t c20 = init_row(r2), c21 = c20, c22 = c20;
-        float32x4_t c30 = init_row(r3), c31 = c30, c32 = c30;
-        float32x4_t c40 = init_row(r4), c41 = c40, c42 = c40;
-        float32x4_t c50 = init_row(r5), c51 = c50, c52 = c50;
-        float32x4_t c60 = init_row(r6), c61 = c60, c62 = c60;
-        float32x4_t c70 = init_row(r7), c71 = c70, c72 = c70;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
+        float32x4_t c40 = init(r4, 0), c41 = init(r4, 4), c42 = init(r4, 8);
+        float32x4_t c50 = init(r5, 0), c51 = init(r5, 4), c52 = init(r5, 8);
+        float32x4_t c60 = init(r6, 0), c61 = init(r6, 4), c62 = init(r6, 8);
+        float32x4_t c70 = init(r7, 0), c71 = init(r7, 4), c72 = init(r7, 8);
 
         const float* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -701,14 +706,14 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float32x4_t c00 = init_row(0), c01 = c00, c02 = c00;
-        float32x4_t c10 = init_row(r1), c11 = c10, c12 = c10;
-        float32x4_t c20 = init_row(r2), c21 = c20, c22 = c20;
-        float32x4_t c30 = init_row(r3), c31 = c30, c32 = c30;
-        float32x4_t c40 = init_row(r4), c41 = c40, c42 = c40;
-        float32x4_t c50 = init_row(r5), c51 = c50, c52 = c50;
-        float32x4_t c60 = init_row(r6), c61 = c60, c62 = c60;
-        float32x4_t c70 = init_row(r7), c71 = c70, c72 = c70;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
+        float32x4_t c40 = init(r4, 0), c41 = init(r4, 4), c42 = init(r4, 8);
+        float32x4_t c50 = init(r5, 0), c51 = init(r5, 4), c52 = init(r5, 8);
+        float32x4_t c60 = init(r6, 0), c61 = init(r6, 4), c62 = init(r6, 8);
+        float32x4_t c70 = init(r7, 0), c71 = init(r7, 4), c72 = init(r7, 8);
 
         const float* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -818,7 +823,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -839,20 +844,25 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        float32x4_t v = vdupq_n_f32(0.0f);
-        if constexpr (with_bias) { v = vdupq_n_f32(bias[r]); }
-        return v;
-    };
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's lanes, so it costs the panel's loads where seeding the tile first
+    // costs a full write and read-back of the output. `off` is the lane offset
+    // inside the panel. A row past `mr` aliases the last live row in A and C, so
+    // the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
+        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
+        else { return vdupq_n_f32(0.0f); }
+    };
     for (; n < nc - 11; n += 12) {
-        float32x4_t c00 = init_row(0), c01 = c00, c02 = c00;
-        float32x4_t c10 = init_row(r1), c11 = c10, c12 = c10;
-        float32x4_t c20 = init_row(r2), c21 = c20, c22 = c20;
-        float32x4_t c30 = init_row(r3), c31 = c30, c32 = c30;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
 
         const float* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -922,10 +932,10 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float32x4_t c00 = init_row(0), c01 = c00, c02 = c00;
-        float32x4_t c10 = init_row(r1), c11 = c10, c12 = c10;
-        float32x4_t c20 = init_row(r2), c21 = c20, c22 = c20;
-        float32x4_t c30 = init_row(r3), c31 = c30, c32 = c30;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
 
         const float* NNOPS_RESTRICT a0 = A + 0 * lda;
         const float* NNOPS_RESTRICT a1 = A + r1 * lda;
@@ -1005,7 +1015,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false, bool with_bias = false>
+template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
@@ -1022,17 +1032,22 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
-    // Row initial value: the bias when this call folds it (tile_mma_direct's
-    // bias argument), zero otherwise. A row past `mr` aliases the last live
-    // row in A and C, so the same alias index keeps this read in range.
-    const auto init_row = [&](int r) {
-        float32x4_t v = vdupq_n_f32(0.0f);
-        if constexpr (with_bias) { v = vdupq_n_f32(bias[r]); }
-        return v;
-    };
     int n = 0;
+
+    // Accumulator initial value. Seed 1 is a per-row bias — the planar route,
+    // where a row is an output channel; seed 2 is a per-column one, which is the
+    // channel-last route's shape: the rows are pixels and the bias lands on the
+    // panel's lanes, so it costs the panel's loads where seeding the tile first
+    // costs a full write and read-back of the output. `off` is the lane offset
+    // inside the panel. A row past `mr` aliases the last live row in A and C, so
+    // the same alias index keeps the row seed in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
+        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
+        else { return vdupq_n_f32(0.0f); }
+    };
     for (; n < nc - 11; n += 12) {
-        float32x4_t c00 = init_row(0), c01 = c00, c02 = c00;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -1065,7 +1080,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float32x4_t c00 = init_row(0), c01 = c00, c02 = c00;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -1128,10 +1143,10 @@ inline constexpr auto mma_pack_fns_f32 = std::array{
     &mma_packed_ab_mr4_nr12_mrxncxkc_f32<Z>,
     &mma_packed_ab_mr1_nr12_mrxncxkc_f32<Z>};
 
-template <bool Z, bool B = false>
+template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{
-    &mma_packed_b_mr8_nr12_mrxncxkc_f32<Z, B>,
-    &mma_packed_b_mr4_nr12_mrxncxkc_f32<Z, B>,
-    &mma_packed_b_mr1_nr12_mrxncxkc_f32<Z, B>};
+    &mma_packed_b_mr8_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_b_mr4_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_b_mr1_nr12_mrxncxkc_f32<Z, Seed>};
 
 }  // namespace nnops::backend::cpu::aarch64

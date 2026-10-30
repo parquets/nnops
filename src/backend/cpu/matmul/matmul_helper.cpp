@@ -75,7 +75,7 @@ template <> struct TileTraits<float> {
     static constexpr const auto& trans() { return pack_trans_f32_fn; }
     static constexpr const auto& copy()  { return pack_copy_f32_fn; }
     template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f32<Z>; }
-    template <bool Z, bool B> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z, B>; }
+    template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z, S>; }
 };
 
 template <> struct TileTraits<half> {
@@ -85,7 +85,7 @@ template <> struct TileTraits<half> {
     static constexpr const auto& trans() { return pack_trans_f16_fn; }
     static constexpr const auto& copy()  { return pack_copy_f16_fn; }
     template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f16<Z>; }
-    template <bool Z, bool B> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, B>; }
+    template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, S>; }
 };
 
 /// 64-byte-aligned panel stride, in elements.
@@ -184,21 +184,22 @@ void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
     });
 }
 
-/// Same walk, A read raw through @p lda. `Bias` lets the accumulator start at
-/// a per-row value instead of zero, which is what removes a whole write+read of
-/// the output tile from Conv2D (the bias seed): the kernel's row index *is* the
-/// output channel, so the bias row rides in at panel granularity.
-template <class T, bool Zero, bool Bias>
+/// Same walk, A read raw through @p lda. `Seed` lets the accumulator start at a
+/// bias instead of zero, which is what removes a whole write+read of the output
+/// tile from Conv2D (the bias seed): 1 is the per-row vector, whose index *is*
+/// the output channel on the planar route; 2 is the per-column one, for the
+/// channel-last route, where the rows are pixels.
+template <class T, bool Zero, int Seed>
 void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                           const T* a, int lda, const T* b,
                           float clamp_min, float clamp_max, const T* bias) {
     using Tr = TileTraits<T>;
-    const auto& fns = Tr::template mma_direct<Zero, Bias>();
+    const auto& fns = Tr::template mma_direct<Zero, Seed>();
 
     int m = 0;
     walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
         fns[level](s, Nc, Kc, c + m * ldc, ldc, a + m * lda, lda, b, clamp_min, clamp_max,
-                   Bias ? bias + m : nullptr);
+                   Seed == 1 ? bias + m : bias);
     });
 }
 
@@ -212,12 +213,13 @@ void dispatch_mma_pack(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
 template <class T>
 void dispatch_mma_direct(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
                          const T* a, int lda, const T* b, float lo, float hi,
-                         const T* bias) {
-    // A bias implies the overwrite path: the tile is built from the bias, so
-    // there is nothing in C to accumulate onto.
-    if (bias != nullptr) { tile_mma_direct_impl<T, true, true>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, bias); }
-    else if (zero_mode)  { tile_mma_direct_impl<T, true, false>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
-    else                 { tile_mma_direct_impl<T, false, false>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
+                         const T* bias, const T* col_bias) {
+    // Either bias implies the overwrite path: the tile is built from the bias,
+    // so there is nothing in C to accumulate onto.
+    if (col_bias != nullptr) { tile_mma_direct_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, col_bias); }
+    else if (bias != nullptr) { tile_mma_direct_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, bias); }
+    else if (zero_mode)  { tile_mma_direct_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
+    else                 { tile_mma_direct_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, lo, hi, nullptr); }
 }
 
 void tile_pack_rhs(bool trans, int nc, int kc,
@@ -395,14 +397,18 @@ void tile_mma_pack(int Mc, int Nc, int Kc, half* c, int ldc,
 
 void tile_mma_direct(int Mc, int Nc, int Kc, float* c, int ldc,
                      const float* a, int lda, const float* b,
-                     float clamp_min, float clamp_max, bool zero_mode, const float* bias) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max, bias);
+                     float clamp_min, float clamp_max, bool zero_mode, const float* bias,
+                     const float* col_bias) {
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max,
+                        bias, col_bias);
 }
 
 void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
                      const half* a, int lda, const half* b,
-                     float clamp_min, float clamp_max, bool zero_mode, const half* bias) {
-    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max, bias);
+                     float clamp_min, float clamp_max, bool zero_mode, const half* bias,
+                     const half* col_bias) {
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, clamp_min, clamp_max,
+                        bias, col_bias);
 }
 
 // =========================================================================
