@@ -281,35 +281,45 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
 
     for (int r = 0; r < live; ++r) {
         for (int col = 0; col < nc; ++col) {
-            float acc;
-            if constexpr (f16_accum) {
-                T h = from_float<T>(0.f);
-                for (int k = 0; k < kc; ++k) {
-                    h = from_float<T>(
-                        to_float(h) +
-                        to_float(a_at(k, r)) *
-                            to_float(b_raw[static_cast<size_t>(k) * nc + col]));
-                }
-                acc = to_float(h);
-            } else {
-                acc = 0.f;
-                for (int k = 0; k < kc; ++k) {
-                    acc += to_float(a_at(k, r)) *
-                           to_float(b_raw[static_cast<size_t>(k) * nc + col]);
-                }
-            }
+            auto mac = [&](float acc, int k) {
+                return acc + to_float(a_at(k, r)) *
+                                 to_float(b_raw[static_cast<size_t>(k) * nc + col]);
+            };
+            float ref;
             // A bias row replaces both the zero and the C read: the kernel
             // starts its accumulator there, at the accumulator's own precision.
-            float ref;
+            // Seed it too — adding the bias after the fact rounds differently
+            // once cancellation makes the sum small next to the intermediate
+            // magnitudes.
             if (bias_row != nullptr) {
                 const float start = to_float((*bias_row)[static_cast<size_t>(r)]);
-                ref = f16_accum ? to_float(from_float<T>(start + acc)) : start + acc;
+                if constexpr (f16_accum) {
+                    T h = from_float<T>(start);
+                    for (int k = 0; k < kc; ++k) {
+                        h = from_float<T>(mac(to_float(h), k));
+                    }
+                    ref = to_float(h);
+                } else {
+                    ref = start;
+                    for (int k = 0; k < kc; ++k) {
+                        ref = mac(ref, k);
+                    }
+                }
             } else if constexpr (f16_accum) {
+                T h = from_float<T>(0.f);
+                for (int k = 0; k < kc; ++k) {
+                    h = from_float<T>(mac(to_float(h), k));
+                }
                 ref = zero_mode
-                    ? acc
+                    ? to_float(h)
                     : to_float(from_float<T>(
-                          to_float(c0[static_cast<size_t>(r) * ldc + col]) + acc));
+                          to_float(c0[static_cast<size_t>(r) * ldc + col]) +
+                          to_float(h)));
             } else {
+                float acc = 0.f;
+                for (int k = 0; k < kc; ++k) {
+                    acc = mac(acc, k);
+                }
                 ref = zero_mode
                     ? acc
                     : to_float(c0[static_cast<size_t>(r) * ldc + col]) + acc;
