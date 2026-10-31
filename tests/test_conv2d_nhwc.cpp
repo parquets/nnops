@@ -28,6 +28,7 @@
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
 #include "backend/cpu/conv/conv2d_winograd.h"
+#include "backend/cpu/matmul/matmul_helper.h"   // NR_MAX_F32 — the U's panel width
 #include "common/cpu_pool.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -937,11 +938,15 @@ NNOPS_TEST(conv2d_nhwc_wino_plan_and_auto) {
 
     const backend::cpu::WinoChannelLastU ug =
         backend::cpu::wino_channel_last_u(32, 32, 1, DataType::f32);
-    NNOPS_EXPECT_EQ(ug.nr, int64_t{16});
+    // The U is laid out in the arch's MMA panels, so both the panel width and
+    // the panel count it implies follow NR_MAX_F32 (16 on x86, 12 on aarch64).
+    const int64_t nr_max = backend::cpu::NR_MAX_F32;
+    const int64_t jb = (32 + nr_max - 1) / nr_max;
+    NNOPS_EXPECT_EQ(ug.nr, nr_max);
     NNOPS_EXPECT_EQ(ug.kc, int64_t{32});   // one k-block: 32 divides 32
     NNOPS_EXPECT_EQ(ug.nb, int64_t{1});
-    NNOPS_EXPECT_EQ(ug.jb, int64_t{2});
-    NNOPS_EXPECT_EQ(ug.jbg, int64_t{2});
+    NNOPS_EXPECT_EQ(ug.jb, jb);
+    NNOPS_EXPECT_EQ(ug.jbg, jb);
 
     const int64_t u_shape[] = {16, ug.nb, ug.jbg, ug.ldd};
     std::vector<float> u_buf(static_cast<size_t>(ug.total), 0.0f);
