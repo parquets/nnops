@@ -1,20 +1,31 @@
-/// @file depthwise_conv.cu
-/// @brief CUDA implementation of 2D/3D depthwise convolution (NCHW/NCDHW layout).
+/// @file depthwise_conv_cuda.cu
+/// @brief CUDA implementation of 2D/3D depthwise convolution on a planar
+///        (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
 ///
-/// Spatial rank is auto-detected from input tensor rank (4→2D, 5→3D).
+/// Spatial rank comes from the input rank (4 -> 2D, 5 -> 3D).
 ///
-/// Algorithm:
-///   Grid: (N * C) blocks. Each block handles one (sample, channel) pair.
-///   Threads within a block stride over output spatial positions.
-///   Each thread computes the full kernel convolution for one output position.
+/// Planar lanes the output width — the contiguous axis there — with one thread
+/// per output position of one (n, c) plane and a block per plane.
 ///
-/// Epilogue: activation fusion (Relu, Gelu, etc.) applied during output write-back.
+/// Channel-last lands the channel axis in memory instead, so the lane moves to
+/// the channel: a thread owns one 16 B vector of a pixel (four f32 or eight f16)
+/// and every tap is then two 128-bit loads, the activation vector and the
+/// filter vector. The filter is the raw HWCM [KH][KW][C] form, whose taps are
+/// contiguous runs of C — the channel-last kernel reads it as it lies, no
+/// prepack. A channel count that is not a vector multiple is covered by a
+/// second, scalar launch over the remainder; an unaligned pitch or pixel stride
+/// falls back to the scalar script entirely.
+///
+/// Epilogue: activation fusion applied during output write-back, both routes,
+/// both accumulate-before-epilogue and the add_to residual ordering.
 ///
 /// Supports f32 and f16. Workspace: not used.
 
-#include "cuda_common.cuh"
+#include "../cuda_common.cuh"
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
+
+#include <algorithm>
 
 namespace nnops::backend::cuda {
 
@@ -55,7 +66,7 @@ __device__ inline float device_apply_epilogue(
 }
 
 // ============================================================
-// 2D DepthwiseConv CUDA kernel
+// Planar — one thread per output position, a block per (n, c) plane
 // ============================================================
 
 template <typename T>
@@ -119,10 +130,6 @@ __global__ void depthwise_conv_2d_kernel(
         }
     }
 }
-
-// ============================================================
-// 3D DepthwiseConv CUDA kernel
-// ============================================================
 
 template <typename T>
 __global__ void depthwise_conv_3d_kernel(
@@ -196,7 +203,104 @@ __global__ void depthwise_conv_3d_kernel(
 }
 
 // ============================================================
-// Host-side launcher — 2D
+// Channel-last — the lane spans channels
+// ============================================================
+
+/// One channel-last launch's geometry: the window, the strides of both operands,
+/// and the channel span this launch covers. All scalars, passed by value.
+struct DwLastGeom {
+    int64_t c_begin;
+    int64_t chunks;
+    int64_t N;
+    int64_t ID, IH, IW;
+    int64_t OD, OH, OW;
+    int64_t KD, KH, KW;
+    int64_t SD, SH, SW;
+    int64_t DD, DH, DW;
+    int64_t PD, PH, PW;
+    int64_t in_d_stride, in_row_stride, in_pix_stride;
+    int64_t out_d_stride, out_row_stride, out_pix_stride;
+    int64_t w_tap_stride;
+    EpilogueActivateType ep_type;
+    float ep_alpha;
+    float ep_beta;
+    bool has_bias;
+    bool add_to;
+};
+
+template <typename T, int Vec>
+__global__ void depthwise_conv_last_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,     // may be nullptr
+    T* __restrict__ output,
+    DwLastGeom g)
+{
+    const int64_t pix_per_image = g.OD * g.OH * g.OW;
+    const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= g.N * pix_per_image * g.chunks) { return; }
+
+    // Adjacent threads take adjacent channel vectors of the same pixel, which is
+    // what keeps the loads coalesced.
+    const int64_t chunk = t % g.chunks;
+    const int64_t pix   = t / g.chunks;
+    const int64_t c0    = g.c_begin + chunk * Vec;
+
+    const int64_t img = pix / pix_per_image;
+    const int64_t sp  = pix % pix_per_image;
+    const int64_t od = sp / (g.OH * g.OW);
+    const int64_t oh = (sp / g.OW) % g.OH;
+    const int64_t ow = sp % g.OW;
+
+    const T* in_img  = input  + img * g.ID * g.in_d_stride  + c0;
+    T*       out_img = output + img * g.OD * g.out_d_stride + c0;
+
+    float acc[Vec];
+    if (g.has_bias) {
+        load_channels<T, Vec>(bias + c0, acc);
+    } else {
+        #pragma unroll
+        for (int i = 0; i < Vec; ++i) { acc[i] = 0.0f; }
+    }
+
+    for (int64_t kd = 0; kd < g.KD; ++kd) {
+        const int64_t id = od * g.SD + kd * g.DD - g.PD;
+        if (id < 0 || id >= g.ID) continue;
+        for (int64_t kh = 0; kh < g.KH; ++kh) {
+            const int64_t ih = oh * g.SH + kh * g.DH - g.PH;
+            if (ih < 0 || ih >= g.IH) continue;
+            const T* row   = in_img + id * g.in_d_stride + ih * g.in_row_stride;
+            const T* w_row = weight + (kd * g.KH + kh) * g.KW * g.w_tap_stride + c0;
+            for (int64_t kw = 0; kw < g.KW; ++kw) {
+                const int64_t iw = ow * g.SW + kw * g.DW - g.PW;
+                if (iw < 0 || iw >= g.IW) continue;
+                float v[Vec];
+                float wv[Vec];
+                load_channels<T, Vec>(row + iw * g.in_pix_stride, v);
+                load_channels<T, Vec>(w_row + kw * g.w_tap_stride, wv);
+                #pragma unroll
+                for (int i = 0; i < Vec; ++i) { acc[i] = fmaf(wv[i], v[i], acc[i]); }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+        acc[i] = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta, acc[i]);
+    }
+
+    T* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
+    if (g.add_to) {
+        float prev[Vec];
+        load_channels<T, Vec>(out, prev);
+        #pragma unroll
+        for (int i = 0; i < Vec; ++i) { acc[i] += prev[i]; }
+    }
+    store_channels<T, Vec>(out, acc);
+}
+
+// ============================================================
+// Host-side launchers — planar
 // ============================================================
 
 template <typename T>
@@ -253,10 +357,6 @@ void depthwise_conv_cuda_2d_impl(
         attrs.epilogue.type, attrs.epilogue.alpha, attrs.epilogue.beta,
         has_bias, attrs.add_to);
 }
-
-// ============================================================
-// Host-side launcher — 3D
-// ============================================================
 
 template <typename T>
 void depthwise_conv_cuda_3d_impl(
@@ -322,6 +422,99 @@ void depthwise_conv_cuda_3d_impl(
 }
 
 // ============================================================
+// Host-side launcher — channel-last
+// ============================================================
+
+template <typename T, int Vec>
+void depthwise_last_launch(
+    DwLastGeom g,
+    int64_t c_begin,
+    int64_t c_count,
+    const TensorView& input,
+    const TensorView& weight,
+    const TensorView* bias,
+    TensorView& output,
+    cudaStream_t stream)
+{
+    if (c_count <= 0) { return; }
+    g.c_begin  = c_begin;
+    g.chunks   = (c_count + Vec - 1) / Vec;
+    g.has_bias = bias != nullptr;
+
+    const int64_t tasks = g.N * g.OD * g.OH * g.OW * g.chunks;
+    const int64_t blocks = (tasks + kCudaBlockSize - 1) / kCudaBlockSize;
+
+    depthwise_conv_last_kernel<T, Vec><<<static_cast<unsigned int>(blocks), kCudaBlockSize, 0, stream>>>(
+        input.ptr<T>(), weight.ptr<T>(),
+        bias != nullptr ? bias->ptr<T>() : nullptr,
+        output.ptr<T>(), g);
+}
+
+template <typename T>
+void depthwise_conv_last_impl(
+    const DepthwiseConvAttributes& attrs,
+    TensorView& output,
+    std::span<const TensorView> inputs,
+    const ComputeContext& ctx)
+{
+    const auto& input  = inputs[0];
+    const auto& weight = inputs[1];
+    const bool has_bias = inputs.size() > 2;
+    const int64_t rank = input.rank();
+    const bool three_d = rank == 5;
+    const int64_t C = input.shape(1);
+
+    DwLastGeom g{};
+    g.N  = input.shape(0);
+    g.ID = three_d ? input.shape(2) : 1;
+    g.IH = input.shape(rank - 2);
+    g.IW = input.shape(rank - 1);
+    g.OD = three_d ? output.shape(2) : 1;
+    g.OH = output.shape(rank - 2);
+    g.OW = output.shape(rank - 1);
+
+    g.KD = three_d ? attrs.kernel_size[0] : 1;
+    g.KH = attrs.kernel_size[1];
+    g.KW = attrs.kernel_size[2];
+    g.SD = three_d ? attrs.stride[0] : 1;
+    g.SH = attrs.stride[1];
+    g.SW = attrs.stride[2];
+    g.DD = three_d ? attrs.dilation[0] : 1;
+    g.DH = attrs.dilation[1];
+    g.DW = attrs.dilation[2];
+    g.PD = three_d ? attrs.padding[0] : 0;
+    g.PH = attrs.padding[1];
+    g.PW = attrs.padding[2];
+
+    // Channel-last: a pixel is C channels wide, a row IW of them, and the filter
+    // is [tap][C].
+    g.in_pix_stride  = C;
+    g.in_row_stride  = input.row_stride_elems();
+    g.in_d_stride    = g.IH * g.in_row_stride;
+    g.out_pix_stride = C;
+    g.out_row_stride = output.row_stride_elems();
+    g.out_d_stride   = g.OH * g.out_row_stride;
+    g.w_tap_stride   = C;
+
+    g.ep_type  = attrs.epilogue.type;
+    g.ep_alpha = attrs.epilogue.alpha;
+    g.ep_beta  = attrs.epilogue.beta;
+    g.add_to   = attrs.add_to;
+
+    cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+
+    constexpr int kVec = static_cast<int>(16 / sizeof(T));
+    const bool vec_ok = C % kVec == 0
+                        && g.in_pix_stride % kVec == 0 && g.in_row_stride % kVec == 0
+                        && g.out_pix_stride % kVec == 0 && g.out_row_stride % kVec == 0;
+
+    const TensorView* bias = has_bias ? &inputs[2] : nullptr;
+    const int64_t full = vec_ok ? (C / kVec) * kVec : 0;
+    depthwise_last_launch<T, kVec>(g, 0, full, input, weight, bias, output, stream);
+    depthwise_last_launch<T, 1>(g, full, C - full, input, weight, bias, output, stream);
+}
+
+// ============================================================
 // Unified entry point
 // ============================================================
 
@@ -333,27 +526,31 @@ Status depthwise_conv_cuda(
     void* /*workspace*/)
 {
     const auto& input = inputs[0];
-    const int64_t rank = input.rank();
-    const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
+    const int64_t srank = DepthwiseConvAttributes::spatial_rank(input.rank());
+    const bool last = is_channel_last(input.layout());
 
-    const auto dtype = input.data_type();
-    switch (dtype) {
+    switch (input.data_type()) {
     case DataType::f32:
-        if (srank == 3)
+        if (last) {
+            depthwise_conv_last_impl<float>(attrs, output, inputs, ctx);
+        } else if (srank == 3) {
             depthwise_conv_cuda_3d_impl<float>(attrs, output, inputs, ctx);
-        else
+        } else {
             depthwise_conv_cuda_2d_impl<float>(attrs, output, inputs, ctx);
+        }
         return Status::ok;
     case DataType::f16:
-        if (srank == 3)
+        if (last) {
+            depthwise_conv_last_impl<__half>(attrs, output, inputs, ctx);
+        } else if (srank == 3) {
             depthwise_conv_cuda_3d_impl<__half>(attrs, output, inputs, ctx);
-        else
+        } else {
             depthwise_conv_cuda_2d_impl<__half>(attrs, output, inputs, ctx);
+        }
         return Status::ok;
     default:
         return Status::unsupported;
     }
-    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda

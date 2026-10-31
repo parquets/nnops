@@ -15,6 +15,7 @@
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cfloat>
+#include <type_traits>
 
 namespace nnops::backend::cuda {
 
@@ -112,6 +113,47 @@ __device__ inline half8 half8_add(
     r.data[6] = __float2half(__half2float(base.data[6]) + r6);
     r.data[7] = __float2half(__half2float(base.data[7]) + r7);
     return r;
+}
+
+// ============================================================
+// Channel-lane vectors — the loads a channel-last kernel wants
+// ============================================================
+// The channel axis is contiguous there, so a thread owns one 16 B vector of it:
+// `Vec` is 4 for f32 and 8 for f16, or 1 for the scalar script that a channel
+// tail or an unaligned lane takes. Both widen through float, which is what every
+// accumulating kernel works in.
+
+template <typename T, int Vec>
+__device__ inline void load_channels(const T* ptr, float (&v)[Vec]) noexcept
+{
+    if constexpr (Vec == 1) {
+        v[0] = s_load(ptr);
+    } else if constexpr (std::is_same_v<T, float>) {
+        const float4 r = v4_load(ptr);
+        v[0] = r.x;
+        v[1] = r.y;
+        v[2] = r.z;
+        v[3] = r.w;
+    } else {
+        const half8 r = v4_load(ptr);
+        #pragma unroll
+        for (int i = 0; i < Vec; ++i) { v[i] = __half2float(r.data[i]); }
+    }
+}
+
+template <typename T, int Vec>
+__device__ inline void store_channels(T* ptr, const float (&v)[Vec]) noexcept
+{
+    if constexpr (Vec == 1) {
+        s_store(ptr, v[0]);
+    } else if constexpr (std::is_same_v<T, float>) {
+        v4_store(ptr, make_float4(v[0], v[1], v[2], v[3]));
+    } else {
+        half8 r;
+        #pragma unroll
+        for (int i = 0; i < Vec; ++i) { r.data[i] = __float2half(v[i]); }
+        v4_store(ptr, r);
+    }
 }
 
 // ============================================================

@@ -354,6 +354,14 @@ NNOPS_TEST(pooling_planar_f16) {
     attrs.kernel_shape = {1, 3, 3};
     attrs.padding      = {0, 1, 1};
     test_planar_f16({1, 3, 10, 10}, attrs);
+
+    // Max with padding and stride 2, so most windows touch the pad: the lane a
+    // pad contributes must be below every real value. `half` is a raw-bits
+    // struct with no numeric_limits specialization, so lowest() was 0 — every
+    // edge window whose real values were negative came out 0 instead.
+    attrs.type   = PoolingType::Max;
+    attrs.stride = {1, 2, 2};
+    test_planar_f16({2, 3, 10, 9}, attrs);
 }
 
 NNOPS_TEST(pooling_planar_3d_max) {

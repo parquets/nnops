@@ -127,6 +127,93 @@ NNOPS_TEST(dwconv_planar_vs_ref_1x1_kernel_stride2) {
         DepthwiseConvAttributes{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}});
 }
 
+/// The planar route in f16. The f32 reference runs on the same values widened
+/// back from f16, so the only error left is the kernel's own f16 arithmetic.
+static void test_planar_f16_vs_ref(const std::vector<int64_t>& in_shape,
+                                   const std::vector<int64_t>& w_shape,
+                                   const DepthwiseConvAttributes& attrs,
+                                   bool has_bias = false)
+{
+    using half = backend::cpu::half;
+    auto [in_vec, in_f32] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_f32]  = test::make_random_tensor(w_shape);
+    std::vector<float> b_vec;
+    TensorView b_f32;
+    if (has_bias) {
+        auto p = test::make_random_tensor({w_shape[0]});
+        b_vec = std::move(p.first);
+        b_f32 = p.second;
+    }
+
+    // Round in place so the reference and the kernel see the same values.
+    std::vector<half> in_f16(in_vec.size()), w_f16(w_vec.size()), b_f16(b_vec.size());
+    for (size_t i = 0; i < in_f16.size(); ++i) {
+        simd::s_store(&in_f16[i], in_vec[i]);
+        in_vec[i] = simd::s_load(&in_f16[i]);
+    }
+    for (size_t i = 0; i < w_f16.size(); ++i) {
+        simd::s_store(&w_f16[i], w_vec[i]);
+        w_vec[i] = simd::s_load(&w_f16[i]);
+    }
+    for (size_t i = 0; i < b_f16.size(); ++i) {
+        simd::s_store(&b_f16[i], b_vec[i]);
+        b_vec[i] = simd::s_load(&b_f16[i]);
+    }
+
+    TensorView in(std::span<const int64_t>(in_shape), DataType::f16, in_f16.data());
+    TensorView w(std::span<const int64_t>(w_shape), DataType::f16, w_f16.data());
+    const int64_t b_shape[] = {w_shape[0]};
+    TensorView b(std::span<const int64_t>(b_shape, 1), DataType::f16, b_f16.data());
+
+    auto op = DepthwiseConv::create(attrs, Backend::CPU);
+    const TensorDesc in_d[] = {in.desc(), w.desc(), b.desc()};
+    auto out_descs = op->getOutputTensorDesc(
+        std::span<const TensorDesc>(in_d, has_bias ? 3 : 2));
+
+    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()),
+                               attrs.add_to ? 1.0f : 0.0f);
+    auto ref = test::make_planar(out_descs[0], ref_buf.data());
+    {
+        ComputeContext ctx;
+        const TensorView r[] = {in_f32, w_f32, b_f32};
+        backend::cpu::reference::depthwise_conv_ref(
+            attrs, ref, std::span<const TensorView>(r, has_bias ? 3 : 2), ctx, nullptr);
+    }
+
+    std::vector<half> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = test::make_planar(out_descs[0], out_buf.data());
+    for (auto& v : out_buf) { simd::s_store(&v, attrs.add_to ? 1.0f : 0.0f); }
+
+    const TensorView ins[] = {in, w, b};
+    NNOPS_EXPECT_TRUE(
+        is_ok(op->compute(out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
+
+    const auto got = test::f16_to_f32(out_buf);
+    for (size_t i = 0; i < got.size(); ++i) {
+        NNOPS_EXPECT_NEAR(got[i], ref_buf[i], test::kF16AccumTol);
+    }
+}
+
+NNOPS_TEST(dwconv_planar_f16_vs_ref) {
+    // Four channel blocks: the first and last skip the folded width mask (their
+    // masked load would read past the tensor), so only the middle blocks take
+    // it — and in f16 that mask was built as raw bits, i.e. the subnormal
+    // 0x0001 instead of one, which erased every masked tap.
+    test_planar_f16_vs_ref({1, 32, 12, 15}, {32, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true);
+    // One width vector per row: every vector is an edge vector.
+    test_planar_f16_vs_ref({1, 24, 9, 7}, {24, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}});
+    // Stride 2 on the width, and dilation on both axes.
+    test_planar_f16_vs_ref({2, 20, 9, 11}, {20, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}});
+    test_planar_f16_vs_ref({1, 16, 10, 10}, {16, 1, 3, 3},
+        DepthwiseConvAttributes{{1, 3, 3}, {1, 1, 1}, {1, 2, 2}, {0, 0, 0}});
+    // 3D, which walks the depth loop.
+    test_planar_f16_vs_ref({1, 17, 4, 6, 9}, {17, 1, 3, 3, 3},
+        DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
+}
+
 NNOPS_TEST(dwconv_planar_3d_vs_ref) {
     test_planar_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
         DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
