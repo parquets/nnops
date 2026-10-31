@@ -9,7 +9,8 @@
 /// beta times the old C) is tested exactly as the operator defines it.
 ///
 /// Cases cover the shapes the kernel branches on: M/N edges (a 5x3x7 product
-/// inside one 64x64 tile), a K that is not a multiple of the 16-element MMA
+/// inside one 64x64 tile), a grid wide enough to select the 64x128 f32 tile,
+/// a K that is not a multiple of the 16-element MMA
 /// step, both transpose flags (each picks a different copy atom and LDSM
 /// operand), f32 and f16, batched broadcasting, and padded row pitches — the
 /// padded case is where a stray 16 B vector load of a row tail would corrupt
@@ -119,6 +120,25 @@ NNOPS_TEST(cuda_matmul_f32_shapes) {
         c.a_shape = {s[0], 96};
         c.b_shape = {96, s[1]};
         run_case(c, "cuda_matmul_f32_shapes");
+    }
+}
+
+NNOPS_TEST(cuda_matmul_f32_wide_tile) {
+    // Enough CTAs for the launcher to pick the 64x128 f32 tile; one geometry
+    // that divides both tile axes, one where both overhang. Each transpose flag
+    // pairs it with a different shared-memory layout and copy atom.
+    const int64_t shapes[][2] = {{1024, 2048}, {1400, 1200}};
+    for (const auto& s : shapes) {
+        for (int flags = 0; flags < 4; ++flags) {
+            MatmulCase c;
+            c.transpose_a = (flags & 1) != 0;
+            c.transpose_b = (flags & 2) != 0;
+            c.a_shape = c.transpose_a ? std::vector<int64_t>{96, s[0]}
+                                      : std::vector<int64_t>{s[0], 96};
+            c.b_shape = c.transpose_b ? std::vector<int64_t>{s[1], 96}
+                                      : std::vector<int64_t>{96, s[1]};
+            run_case(c, "cuda_matmul_f32_wide_tile");
+        }
     }
 }
 

@@ -151,4 +151,9 @@ if(NNOPS_BUILD_BENCHMARKS)
     foreach(src ${BENCH_SOURCES})
         nnops_add_bench_demo(${src})
     endforeach()
+
+    if(NNOPS_BUILD_CUDA)
+        # Only the matmul bench carries a cuBLAS reference arm.
+        target_link_libraries(bench_cuda_matmul PRIVATE CUDA::cublas)
+    endif()
 endif()
