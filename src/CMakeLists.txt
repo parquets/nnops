@@ -137,17 +137,18 @@ if(NNOPS_BUILD_CUDA)
     set(NNOPS_CUDA_SOURCES
         backend/cuda/softmax.cu
         backend/cuda/activation.cu
-        backend/cuda/pooling.cu
         backend/cuda/cumsum.cu
-        backend/cuda/depthwise_conv.cu
         backend/cuda/eltwise.cu
         backend/cuda/unary.cu
         backend/cuda/reduce.cu
-        # CuTe-based GEMM family: dense MatMul/Linear first, then the two
-        # implicit-GEMM Conv2D routes (planar NCHW and channel-last NHWC).
+        # Convolutions and the pooling that goes with them, one file an
+        # operator family: Conv2D (both memory orders via the CuTe GEMM),
+        # depthwise, and spatial pooling.
         backend/cuda/gemm/matmul_cuda.cu
         backend/cuda/gemm/linear_cuda.cu
         backend/cuda/conv/conv2d_cuda.cu
+        backend/cuda/conv/depthwise_conv_cuda.cu
+        backend/cuda/conv/pooling_cuda.cu
         # Unsupported operators' entry points, so the CUDA library resolves every
         # dispatch site the CPU backend references.
         backend/cuda/not_implemented.cu
