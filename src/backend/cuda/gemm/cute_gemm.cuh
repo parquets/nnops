@@ -427,7 +427,7 @@ void dense_gemm_h_kernel(GemmParams p)
 // ============================================================
 
 template <bool TransA, bool TransB, bool Vectorized, bool Wide>
-__global__ __launch_bounds__(detail::kGemmThreads, 4)
+__global__ __launch_bounds__(detail::kGemmThreads, Wide ? 3 : 4)
 void dense_gemm_f_kernel(GemmParams p)
 {
     using namespace cute;
@@ -476,18 +476,28 @@ void dense_gemm_f_kernel(GemmParams p)
 
     // A k-contiguous panel is bK = 16 floats = 64 B wide, so each row can start
     // in bank 0 or bank 16 only: without help the eight rows a warp reads at one
-    // k land on two banks. Padding the row is one fix (20 floats); the swizzle is
-    // the other, XORing the row index into the 16 B vector index so the eight
-    // rows get the same distinct phases at no shared-memory cost -- and bits 0..1
-    // stay put, so the cp.async vector is still 16 B. A panel wide in the
-    // operand direction (>= 64 floats, two or more full bank cycles per row) is
-    // already conflict free and takes neither.
+    // k land on two banks. Both fixes cost something. Padding the row by one
+    // 16 B vector keeps the row address loop invariant, so every load is an
+    // immediate off a hoisted base, and buys that with 2 KB of shared memory.
+    // The swizzle reproduces the pad's phase spread for free -- XORing the row
+    // index into the 16 B vector index, bits 0..1 untouched so cp.async is still
+    // 16 B -- but the address now depends on (row XOR k-block), and a runtime row
+    // can only spell that as a full index recomputation per load. The wide tile
+    // is down to three blocks a SM for register reasons anyway, so it pays for
+    // the pad; the narrow one keeps its fourth block and swizzles. A panel wide
+    // in the operand direction (>= 64 floats, two bank cycles per row) is already
+    // conflict free and takes neither.
+    constexpr int kPadA = (Wide && !TransA) ? 4 : 0;
     constexpr auto swz = Swizzle<3, 2, 3>{};
     constexpr auto sA_layout = [&] {
         if constexpr (TransA) {
             return make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
                                make_stride(Int<1>{}, Int<bM>{},
                                            Int<bM * bK>{}));
+        } else if constexpr (kPadA != 0) {
+            return make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
+                               make_stride(Int<bK + kPadA>{}, Int<1>{},
+                                           Int<(bK + kPadA) * bM>{}));
         } else {
             return composition(
                 swz, make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
@@ -633,23 +643,23 @@ void dense_gemm_f_kernel(GemmParams p)
         for (int v = 0; v < Tn; ++v) { acc[j][v] = 0.0f; }
     }
 
-    int smem_pipe_read = 0;
-    int smem_pipe_write = kStages - 1;
-
-    CUTE_NO_UNROLL
-    while (k_tile_count > -(kStages - 1)) {
+    // The stage index doubles as a shared-memory address offset, so leaving it a
+    // running variable makes every operand load pay a runtime add. Unrolling the
+    // stage cycle puts it into the layout as a constant and folds those adds into
+    // immediates; ncu counted 195 ALU ops per k-tile per warp (15% of all issued
+    // instructions) before either this or the A pad.
+    auto k_body = [&]<int RD, int WR>() {
         cp_async_wait<kStages - 2>();
         __syncthreads();
 
-        load_a(k_tile_next, smem_pipe_write);
-        load_b(k_tile_next, smem_pipe_write);
+        load_a(k_tile_next, WR);
+        load_b(k_tile_next, WR);
         cp_async_fence();
 
         // Unrolled, or every swizzled A address costs runtime index math. Left
-        // alone ptxas then hoists all four groups' A loads and needs 167
-        // registers for a 104-register loop; the launch bound holds it to the
-        // four-block budget instead.
-        const int rd = smem_pipe_read;
+        // alone ptxas hoists all four groups' A loads and needs 167 registers
+        // for a 104-register loop, which the launch bound then refuses.
+        constexpr int rd = RD;
         CUTE_UNROLL
         for (int kg = 0; kg < bK; kg += 4) {
             float av[Tm][4];
@@ -716,8 +726,21 @@ void dense_gemm_f_kernel(GemmParams p)
 
         --k_tile_count;
         if (k_tile_count > 0) { ++k_tile_next; }
-        smem_pipe_write = smem_pipe_read;
-        smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
+    };
+
+    if constexpr (kStages == 2) {
+        CUTE_NO_UNROLL
+        while (k_tile_count > -1) {
+            k_body.template operator()<0, 1>();
+            if (k_tile_count > -1) { k_body.template operator()<1, 0>(); }
+        }
+    } else {
+        CUTE_NO_UNROLL
+        while (k_tile_count > -2) {
+            k_body.template operator()<0, 2>();
+            if (k_tile_count > -2) { k_body.template operator()<1, 0>(); }
+            if (k_tile_count > -2) { k_body.template operator()<2, 1>(); }
+        }
     }
 
     const int ld_c = int(p.ldc);
@@ -799,7 +822,9 @@ inline void launch_dense_f(const GemmParams& p, cudaStream_t stream)
 {
     using namespace cute;
     constexpr int bM = 64, bN = Wide ? 128 : 64, bK = 16, kStages = Wide ? 2 : 3;
-    constexpr int smem = (bM * bK + bN * bK) * kStages * int(sizeof(float));
+    constexpr int kPadA = (Wide && !TransA) ? 4 : 0;
+    constexpr int smem =
+        (bM * (bK + kPadA) + bN * bK) * kStages * int(sizeof(float));
 
     auto kernel = dense_gemm_f_kernel<TransA, TransB, Vectorized, Wide>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
