@@ -4,7 +4,10 @@
 ///
 /// Two engines under one contract: f16 runs the SM80 16x8x16 tensor-core atom
 /// with f32 accumulators over a 64x64x64 CTA tile, f32 runs a UniversalFMA SIMT
-/// tile, and both stream their k-slices through a three-stage cp.async pipeline.
+/// tile (64x128x16 once the grid is wide enough to refill the machine, else
+/// 64x64x16), and both stream their k-slices through a cp.async pipeline. The
+/// f32 tile swizzles its panel rows rather than padding them, which keeps a
+/// four-block residency in 24 KB instead of 30 KB.
 /// The gmem->smem copy is a 16 B vector load per thread whenever every row pitch
 /// is 16 B aligned and the tile is fully in bounds; the alternative kernel
 /// variant fills shared memory scalar-wise with a bounds check, which is also
@@ -423,18 +426,17 @@ void dense_gemm_h_kernel(GemmParams p)
 // f32 SIMT kernel
 // ============================================================
 
-template <bool TransA, bool TransB, bool Vectorized>
-__global__ __launch_bounds__(detail::kGemmThreads)
+template <bool TransA, bool TransB, bool Vectorized, bool Wide>
+__global__ __launch_bounds__(detail::kGemmThreads, 4)
 void dense_gemm_f_kernel(GemmParams p)
 {
     using namespace cute;
     using Elem = float;
 
     constexpr int bM = 64;
-    constexpr int bN = 64;
+    constexpr int bN = Wide ? 128 : 64;
     constexpr int bK = 16;
-    constexpr int kStages = 3;
-    constexpr int kPad = 4;   // 16 B: a cp.async destination row start must be 16 B aligned
+    constexpr int kStages = Wide ? 2 : 3;
 
     const int M = p.m;
     const int N = p.n;
@@ -467,35 +469,42 @@ void dense_gemm_f_kernel(GemmParams p)
                                make_stride(Int<1>{}, int(p.ldb)));
         }
     }();
-    Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N),
-                            make_stride(int(p.ldc), Int<1>{}));
-
     auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
     auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
     Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{});
-    Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
 
+    // A k-contiguous panel is bK = 16 floats = 64 B wide, so each row can start
+    // in bank 0 or bank 16 only: without help the eight rows a warp reads at one
+    // k land on two banks. Padding the row is one fix (20 floats); the swizzle is
+    // the other, XORing the row index into the 16 B vector index so the eight
+    // rows get the same distinct phases at no shared-memory cost -- and bits 0..1
+    // stay put, so the cp.async vector is still 16 B. A panel wide in the
+    // operand direction (>= 64 floats, two or more full bank cycles per row) is
+    // already conflict free and takes neither.
+    constexpr auto swz = Swizzle<3, 2, 3>{};
     constexpr auto sA_layout = [&] {
         if constexpr (TransA) {
             return make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<1>{}, Int<bM + kPad>{},
-                                           Int<(bM + kPad) * bK>{}));
+                               make_stride(Int<1>{}, Int<bM>{},
+                                           Int<bM * bK>{}));
         } else {
-            return make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<bK + kPad>{}, Int<1>{},
-                                           Int<(bK + kPad) * bM>{}));
+            return composition(
+                swz, make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
+                                 make_stride(Int<bK>{}, Int<1>{},
+                                             Int<bK * bM>{})));
         }
     }();
     constexpr auto sB_layout = [&] {
         if constexpr (TransB) {
-            return make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<bK + kPad>{}, Int<1>{},
-                                           Int<(bK + kPad) * bN>{}));
+            return composition(
+                swz, make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
+                                 make_stride(Int<bK>{}, Int<1>{},
+                                             Int<bK * bN>{})));
         } else {
             return make_layout(make_shape(Int<bN>{}, Int<bK>{}, Int<kStages>{}),
-                               make_stride(Int<1>{}, Int<bN + kPad>{},
-                                           Int<(bN + kPad) * bK>{}));
+                               make_stride(Int<1>{}, Int<bN>{},
+                                           Int<bN * bK>{}));
         }
     }();
 
@@ -508,15 +517,23 @@ void dense_gemm_f_kernel(GemmParams p)
         make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * sizeof(Elem))),
         sB_layout);
 
-    // UniversalFMA is a one-thread atom, so the atom layout *is* the block: it
-    // has to cover all kGemmThreads. A layout with fewer (4 here once) leaves
-    // threadId >= its size aliasing thread 0's slice — the values still come out
-    // right, but 32 warps then race on the same C element, which corrupts any
-    // epilogue that reads the destination (beta, add_to).
-    static_assert(size(Layout<Shape<_8, _16, _1>>{}) == detail::kGemmThreads);
-    TiledMMA mma = make_tiled_mma(UniversalFMA<float, float, float>{},
-                                  Layout<Shape<_8, _16, _1>>{},
-                                  Tile<_64, _64, _1>{});
+    // Thread tile: 8 rows each, and a *contiguous* strip of Tn columns. A CuTe
+    // tiled-MMA hands every thread its N values cyclically (n = t_n + 16*j), and
+    // those four values are 16 floats apart in an n-contiguous panel, so no
+    // shared-memory orientation can serve them as one 16 B load -- each became a
+    // scalar LDS and the loop carried 0.19 shared loads per FFMA where cuBLAS
+    // carries 0.068. Mapping the strip by hand makes both operands 16 B loads:
+    // A along its k-contiguous axis (or along m when the panel is m-contiguous),
+    // B along n (or along k), for 0.094 / 0.063 shared loads per FFMA.
+    constexpr int Tm = 8;
+    constexpr int Tn = bN / 16;
+    constexpr int kThreadsM = bM / Tm;
+    static_assert(kThreadsM * (bN / Tn) == detail::kGemmThreads);
+
+    const int tx = int(threadIdx.x) % kThreadsM;
+    const int ty = int(threadIdx.x) / kThreadsM;
+    auto arow = [&](int j) { return TransA ? tx * Tm + j : tx + kThreadsM * j; };
+    auto brow = [&](int j) { return TransB ? ty + 16 * j : ty * Tn + j; };
 
     auto copy_a = [&] {
         if constexpr (TransA) {
@@ -609,14 +626,12 @@ void dense_gemm_f_kernel(GemmParams p)
         if (k_tile_count > 0) { ++k_tile_next; }
     }
 
-    ThrMMA thr_mma = mma.get_slice(threadIdx.x);
-    Tensor tCgC = thr_mma.partition_C(gC);
-    Tensor tCsA = thr_mma.partition_A(sA);
-    Tensor tCsB = thr_mma.partition_B(sB);
-    Tensor tCrA = thr_mma.make_fragment_A(tCsA(_, _, _, 0));
-    Tensor tCrB = thr_mma.make_fragment_B(tCsB(_, _, _, 0));
-    Tensor tCrC = thr_mma.make_fragment_C(tCgC);
-    clear(tCrC);
+    float acc[Tm][Tn];
+    CUTE_UNROLL
+    for (int j = 0; j < Tm; ++j) {
+        CUTE_UNROLL
+        for (int v = 0; v < Tn; ++v) { acc[j][v] = 0.0f; }
+    }
 
     int smem_pipe_read = 0;
     int smem_pipe_write = kStages - 1;
@@ -630,9 +645,74 @@ void dense_gemm_f_kernel(GemmParams p)
         load_b(k_tile_next, smem_pipe_write);
         cp_async_fence();
 
-        copy(tCsA(_, _, _, smem_pipe_read), tCrA);
-        copy(tCsB(_, _, _, smem_pipe_read), tCrB);
-        gemm(mma, tCrA, tCrB, tCrC);
+        // Unrolled, or every swizzled A address costs runtime index math. Left
+        // alone ptxas then hoists all four groups' A loads and needs 167
+        // registers for a 104-register loop; the launch bound holds it to the
+        // four-block budget instead.
+        const int rd = smem_pipe_read;
+        CUTE_UNROLL
+        for (int kg = 0; kg < bK; kg += 4) {
+            float av[Tm][4];
+            if constexpr (!TransA) {
+                CUTE_UNROLL
+                for (int j = 0; j < Tm; ++j) {
+                    const float4 t =
+                        *reinterpret_cast<const float4*>(&sA(arow(j), kg, rd));
+                    av[j][0] = t.x; av[j][1] = t.y;
+                    av[j][2] = t.z; av[j][3] = t.w;
+                }
+            } else {
+                CUTE_UNROLL
+                for (int kk = 0; kk < 4; ++kk) {
+                    CUTE_UNROLL
+                    for (int u = 0; u < Tm / 4; ++u) {
+                        const float4 t =
+                            *reinterpret_cast<const float4*>(&sA(arow(4 * u), kg + kk, rd));
+                        av[4 * u][kk] = t.x; av[4 * u + 1][kk] = t.y;
+                        av[4 * u + 2][kk] = t.z; av[4 * u + 3][kk] = t.w;
+                    }
+                }
+            }
+
+            if constexpr (!TransB) {
+                CUTE_UNROLL
+                for (int kk = 0; kk < 4; ++kk) {
+                    float bv[Tn];
+                    CUTE_UNROLL
+                    for (int u = 0; u < Tn / 4; ++u) {
+                        const float4 t =
+                            *reinterpret_cast<const float4*>(&sB(brow(4 * u), kg + kk, rd));
+                        bv[4 * u] = t.x; bv[4 * u + 1] = t.y;
+                        bv[4 * u + 2] = t.z; bv[4 * u + 3] = t.w;
+                    }
+                    CUTE_UNROLL
+                    for (int j = 0; j < Tm; ++j) {
+                        CUTE_UNROLL
+                        for (int v = 0; v < Tn; ++v) {
+                            acc[j][v] = fmaf(av[j][kk], bv[v], acc[j][v]);
+                        }
+                    }
+                }
+            } else {
+                // Holding all of B for the group as [Tn][4] is 32 floats at the
+                // wide tile's Tn = 8, on top of av's 32 and the 64 accumulators,
+                // and ptxas spills it. Streaming one n at a time costs the same
+                // eight 16 B loads and keeps four B values live.
+                CUTE_UNROLL
+                for (int v = 0; v < Tn; ++v) {
+                    const float4 t =
+                        *reinterpret_cast<const float4*>(&sB(brow(v), kg, rd));
+                    const float bv[4] = {t.x, t.y, t.z, t.w};
+                    CUTE_UNROLL
+                    for (int kk = 0; kk < 4; ++kk) {
+                        CUTE_UNROLL
+                        for (int j = 0; j < Tm; ++j) {
+                            acc[j][v] = fmaf(av[j][kk], bv[kk], acc[j][v]);
+                        }
+                    }
+                }
+            }
+        }
 
         --k_tile_count;
         if (k_tile_count > 0) { ++k_tile_next; }
@@ -640,33 +720,31 @@ void dense_gemm_f_kernel(GemmParams p)
         smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
     }
 
-    // The coordinate tensor is block-tiled exactly like gC: partition_C only
-    // applies the thread partition, so handing it the whole (M, N) would give
-    // every block the coordinates of block (0, 0).
-    Tensor cC = make_identity_tensor(make_shape(M, N));
-    Tensor tCcC = thr_mma.partition_C(
-        local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{}));
-
+    const int ld_c = int(p.ldc);
     CUTE_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        auto coord = tCcC(i);
-        const int m = int(get<0>(coord));
-        const int n = int(get<1>(coord));
-        if (m >= M || n >= N) { continue; }
+    for (int j = 0; j < Tm; ++j) {
+        const int m = m0 + arow(j);
+        if (m >= M) { continue; }
+        CUTE_UNROLL
+        for (int v = 0; v < Tn; ++v) {
+            const int n = n0 + brow(v);
+            if (n >= N) { continue; }
+            const int idx = m * ld_c + n;
 
-        float v = p.alpha * tCrC(i);
-        if (bias != nullptr) {
-            v += bias[p.bias_row ? m : n];
+            float x = p.alpha * acc[j][v];
+            if (bias != nullptr) {
+                x += bias[p.bias_row ? m : n];
+            }
+            if (p.beta != 0.0f) {
+                x += p.beta * C[idx];
+            }
+            x = fminf(fmaxf(x, p.min_clip), p.max_clip);
+            x = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, x);
+            if (residual != nullptr) {
+                x += residual[m * p.ldr + n];
+            }
+            C[idx] = x;
         }
-        if (p.beta != 0.0f) {
-            v += p.beta * tCgC(i);
-        }
-        v = fminf(fmaxf(v, p.min_clip), p.max_clip);
-        v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
-        if (residual != nullptr) {
-            v += residual[m * p.ldr + n];
-        }
-        tCgC(i) = v;
     }
 }
 
@@ -680,6 +758,21 @@ inline int gemm_batch_count(const GemmParams& p)
 {
     int count = 1;
     for (int d = 0; d < p.batch_rank; ++d) { count *= int(p.batch_size[d]); }
+    return count;
+}
+
+/// Queried once per process; 0 when unavailable, which keeps the narrow tile.
+inline int device_sm_count()
+{
+    static const int count = [] {
+        int dev = 0;
+        int n = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { return 0; }
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+            return 0;
+        }
+        return n;
+    }();
     return count;
 }
 
@@ -701,16 +794,14 @@ inline void launch_dense_h(const GemmParams& p, cudaStream_t stream)
     kernel<<<grid, kGemmThreads, smem, stream>>>(p);
 }
 
-template <bool TransA, bool TransB, bool Vectorized>
+template <bool TransA, bool TransB, bool Vectorized, bool Wide>
 inline void launch_dense_f(const GemmParams& p, cudaStream_t stream)
 {
     using namespace cute;
-    constexpr int bM = 64, bN = 64, bK = 16, kStages = 3;
-    constexpr int kPad = 4;   // 16 B: a cp.async destination row start must be 16 B aligned
-    constexpr int smem =
-        (bM * (bK + kPad) + bN * (bK + kPad)) * kStages * int(sizeof(float));
+    constexpr int bM = 64, bN = Wide ? 128 : 64, bK = 16, kStages = Wide ? 2 : 3;
+    constexpr int smem = (bM * bK + bN * bK) * kStages * int(sizeof(float));
 
-    auto kernel = dense_gemm_f_kernel<TransA, TransB, Vectorized>;
+    auto kernel = dense_gemm_f_kernel<TransA, TransB, Vectorized, Wide>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
@@ -746,13 +837,22 @@ inline bool dense_gemm_launch(const GemmParams& p, int elem_size,
                               cudaStream_t stream)
 {
     if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return false; }
+    // The 128-wide tile halves the A/B panel traffic, but its 30.7 KB of smem
+    // costs a resident block, so it only pays once the grid can refill the
+    // machine several times over.
+    const int sm = detail::device_sm_count();
+    const long long wide_blocks = static_cast<long long>((p.m + 63) / 64) *
+                                  ((p.n + 127) / 128) * detail::gemm_batch_count(p);
+    const bool wide = sm > 0 && wide_blocks >= 4LL * sm;
     detail::dispatch_dense(
         p, trans_a, trans_b, vectorized,
         [&]<bool TA, bool TB, bool V>() {
             if (elem_size == 2) {
                 detail::launch_dense_h<TA, TB, V>(p, stream);
+            } else if (wide) {
+                detail::launch_dense_f<TA, TB, V, true>(p, stream);
             } else {
-                detail::launch_dense_f<TA, TB, V>(p, stream);
+                detail::launch_dense_f<TA, TB, V, false>(p, stream);
             }
         });
     return true;
