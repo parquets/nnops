@@ -233,6 +233,7 @@ void conv2d_planar_impl(const Conv2DAttributes& attrs,
     const int64_t og_step  = oc_per_group * ocn_step;    // between groups (output)
 
     // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
+    // Dims, not pitch: a weight is a load-time constant.
     const int64_t w_ocn_step = ic_per_group * karea;
 
     T* out_ptr = output.ptr<T>();
@@ -536,6 +537,7 @@ void conv2d_planar_int8_impl(const Conv2DAttributes& attrs,
     const int64_t og_step  = oc_per_group * ocn_step;    // between groups (output)
 
     // Weight row stride within a group: [oc_per_group][ic_per_group][karea].
+    // Dims, not pitch: a weight is a load-time constant.
     const int64_t w_ocn_step = ic_per_group * karea;
 
     // ---- quantization parameters -----------------------------------------
@@ -1017,6 +1019,15 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     plan.ocn_block = std::min<int64_t>(kOcnBlock, oc_per_group);
     plan.oh_block  = ((PH + 1 + kAlign - 1) / kAlign) * kAlign;
 
+    // The GEMM's N axis is the block's rows flattened into one roi_area-wide
+    // run, and every store, seed and epilogue pass addresses it contiguously
+    // (ldc is the channel step). A block may therefore only span rows the
+    // destination lays out back to back: a pitched output pins it to one row.
+    // row_stride_elems == 0 is TensorDesc's unknown → compact convention.
+    const bool out_rows_dense =
+        out.row_stride_elems == 0 || out.row_stride_elems == OW;
+    if (!out_rows_dense) { plan.oh_block = 1; }
+
     const int64_t NG = N * G;
     const int64_t nt = std::max<int64_t>(num_threads, 1);
 
@@ -1039,7 +1050,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // feed, covering the whole plane sweeps the weight once instead of once per
     // block (MLAS's ExpandThenGemm takes the same crossover, convolve.cpp:1691).
     // The block lands on OH itself; the kernel derives the row count per block.
-    if (oc_per_group > OH * OW) {
+    if (out_rows_dense && oc_per_group > OH * OW) {
         while (plan.oh_block < OH) {
             const int64_t grown = std::min<int64_t>(plan.oh_block * 2, OH);
             const int64_t grown_blocks = (OH + grown - 1) / grown;
@@ -1057,7 +1068,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // cost -12% at 4T on a 112 plane) and must not grow the busiest chunk's rows.
     // The search steps the block count by the chunk count rather than doubling
     // the row count: it can land on 14 rows on a 112 plane, where 4→8→16 cannot.
-    if (!plan.pointwise) {
+    if (out_rows_dense && !plan.pointwise) {
         constexpr int64_t kScratchCap = int64_t{256} << 10;   // elements per slot
         const int64_t scratch_per_row = plan.icn_block * karea * OW;
         const int64_t cap_rows = (scratch_per_row > 0) ? kScratchCap / scratch_per_row : OH;

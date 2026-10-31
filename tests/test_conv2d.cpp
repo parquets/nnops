@@ -934,6 +934,164 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
     NNOPS_EXPECT_NEAR(worst, 0.0f, nnops::test::kF16AccumTol);
 }
 
+NNOPS_TEST(conv2d_im2col_pitched_output) {
+    // A destination whose rows are 32-byte aligned has a row pitch wider than
+    // OW. The planar GEMM's N axis is an oh-block's rows flattened into one
+    // roi_area run, and the store, the bias seed and the epilogue pass all write
+    // that run contiguously, so a block may not span rows: the plan pins
+    // oh_block to 1 for a pitched destination, and the values must match the
+    // dense run exactly while the pitch tail keeps its sentinel.
+    const int64_t ishape[] = {1, 16, 9, 7};   // OH 9, OW 7
+    const int64_t wshape[] = {20, 8, 3, 3};   // groups 2
+    const int64_t N = 1, OC = 20, OH = 9, OW = 7;
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 2;
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    auto [in_v, input] = test::make_random_tensor(ishape, -1.0f, 1.0f, 501);
+    auto [w_v, weight] = test::make_random_tensor(wshape, -1.0f, 1.0f, 502);
+    const TensorView ins[]    = {input, weight};
+    const TensorDesc descs[]  = {input.desc(), weight.desc()};
+    const auto od = op->getOutputTensorDesc(descs);
+    NNOPS_EXPECT_EQ(od[0].dims[2], OH);
+    NNOPS_EXPECT_EQ(od[0].dims[3], OW);
+    const int64_t rows  = N * OC * OH;
+    const int64_t numel = od[0].numel();
+    const std::span<const int64_t> oshape(od[0].dims.data(),
+                                          static_cast<size_t>(od[0].rank));
+
+    // The dense run is the reference (conv2d_ref honors the pitch, the kernel
+    // was the side that did not).
+    std::vector<float> ref_buf(static_cast<size_t>(numel));
+    auto ref_out = test::make_planar(od[0], ref_buf.data());
+    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
+
+    // The control: at one thread the same geometry on a dense destination keeps
+    // a multi-row block, so the pin is a pitch rule and not a blanket 1.
+    {
+        const TensorDesc dense[] = {od[0]};
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
+            attrs, descs, dense, /*num_threads=*/1, /*use_thread_slots=*/false);
+        NNOPS_EXPECT_TRUE(plan.oh_block > 1);
+    }
+
+    // 7 f32 = 28 B → 8 elements a row at 32 B; 7 f16 = 14 B → 16.
+    {
+        const int64_t stride = 8;
+        std::vector<float> pad_buf(static_cast<size_t>(rows * stride), 1000.0f);
+        TensorView pad_out(oshape, DataType::f32, pad_buf.data(),
+                           stride * static_cast<int64_t>(sizeof(float)));
+        const TensorDesc pdesc[] = {pad_out.desc()};
+
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
+            attrs, descs, pdesc, /*num_threads=*/4, /*use_thread_slots=*/false);
+        NNOPS_EXPECT_EQ(plan.oh_block, 1);
+        NNOPS_EXPECT_EQ(plan.num_oh_blocks, OH);
+
+        op->compute(pad_out, ins, {}, nullptr);
+
+        float worst = 0.0f;
+        int64_t tail_touched = 0;
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < OW; ++c) {
+                worst = std::max(worst, std::abs(pad_buf[static_cast<size_t>(r * stride + c)] -
+                                                 ref_buf[static_cast<size_t>(r * OW + c)]));
+            }
+            for (int64_t c = OW; c < stride; ++c) {
+                tail_touched += (pad_buf[static_cast<size_t>(r * stride + c)] != 1000.0f);
+            }
+        }
+        std::printf("      f32 conv2d (pitched output): max deviation %.3g\n", worst);
+        NNOPS_EXPECT_NEAR(worst, 0.0f, 1e-3f);
+        NNOPS_EXPECT_EQ(tail_touched, 0);
+    }
+
+    {
+        auto in16v = test::f32_to_f16(in_v);
+        auto w16v  = test::f32_to_f16(w_v);
+        TensorView in16(ishape, DataType::f16, in16v.data());
+        TensorView w16(wshape, DataType::f16, w16v.data());
+        const TensorView i16[]   = {in16, w16};
+        const TensorDesc d16[]   = {in16.desc(), w16.desc()};
+        const auto od16 = op->getOutputTensorDesc(d16);
+
+        const int64_t stride = 16;
+        std::vector<half> pad_buf(static_cast<size_t>(rows * stride),
+                                  nnops::backend::cpu::float_to_half(1000.0f));
+        TensorView pad_out(oshape, DataType::f16, pad_buf.data(),
+                           stride * static_cast<int64_t>(sizeof(half)));
+        op->compute(pad_out, i16, {}, nullptr);
+
+        float worst = 0.0f;
+        int64_t tail_touched = 0;
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < OW; ++c) {
+                const float got = nnops::backend::cpu::half_to_float(
+                    pad_buf[static_cast<size_t>(r * stride + c)]);
+                worst = std::max(worst, std::abs(got - ref_buf[static_cast<size_t>(r * OW + c)]));
+            }
+            for (int64_t c = OW; c < stride; ++c) {
+                tail_touched += (nnops::backend::cpu::half_to_float(
+                                     pad_buf[static_cast<size_t>(r * stride + c)]) != 1000.0f);
+            }
+        }
+        std::printf("      f16 conv2d (pitched output): max deviation %.4f\n", worst);
+        NNOPS_EXPECT_NEAR(worst, 0.0f, nnops::test::kF16AccumTol);
+        NNOPS_EXPECT_EQ(tail_touched, 0);
+    }
+
+    // The pointwise route reads its B operand out of the input plane instead of
+    // a gather, but the destination rule is the same, so it pins the block too.
+    {
+        Conv2DAttributes pattrs;
+        pattrs.kernel_size = {1, 1};
+        pattrs.groups      = 2;
+        auto pop = Conv2D::create(pattrs, Backend::CPU);
+
+        const int64_t pw_shape[] = {20, 8, 1, 1};
+        auto [pw_v, pw] = test::make_random_tensor(pw_shape, -1.0f, 1.0f, 503);
+        const TensorView pins[]   = {input, pw};
+        const TensorDesc pdescs[] = {input.desc(), pw.desc()};
+
+        std::vector<float> p_ref(static_cast<size_t>(numel));
+        auto p_ref_out = test::make_planar(od[0], p_ref.data());
+        nnops::backend::cpu::reference::conv2d_ref(pattrs, p_ref_out, pins, {},
+                                                   nullptr);
+
+        const int64_t stride = 8;
+        std::vector<float> pad_buf(static_cast<size_t>(rows * stride), 1000.0f);
+        TensorView pad_out(oshape, DataType::f32, pad_buf.data(),
+                           stride * static_cast<int64_t>(sizeof(float)));
+        const TensorDesc pdesc[] = {pad_out.desc()};
+
+        const auto plan = nnops::backend::cpu::get_conv2d_implicit_gemm_plan(
+            pattrs, pdescs, pdesc, /*num_threads=*/4, /*use_thread_slots=*/false);
+        NNOPS_EXPECT_TRUE(plan.pointwise);
+        NNOPS_EXPECT_EQ(plan.oh_block, 1);
+
+        pop->compute(pad_out, pins, {}, nullptr);
+
+        float worst = 0.0f;
+        int64_t tail_touched = 0;
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < OW; ++c) {
+                worst = std::max(worst, std::abs(pad_buf[static_cast<size_t>(r * stride + c)] -
+                                                 p_ref[static_cast<size_t>(r * OW + c)]));
+            }
+            for (int64_t c = OW; c < stride; ++c) {
+                tail_touched += (pad_buf[static_cast<size_t>(r * stride + c)] != 1000.0f);
+            }
+        }
+        std::printf("      f32 pointwise conv2d (pitched output): max deviation %.3g\n",
+                    worst);
+        NNOPS_EXPECT_NEAR(worst, 0.0f, 1e-3f);
+        NNOPS_EXPECT_EQ(tail_touched, 0);
+    }
+}
+
 // ============================================================
 // Large-kernel planning (5x5 / 7x7 / 9x9)
 // ============================================================

@@ -100,7 +100,9 @@ struct Conv2DGemmPlan {
                               ///< never "unsupported" — that is icn_block == 0
 
     // ---- planar only ------------------------------------------------------
-    int64_t oh_block = 0;          ///< output-row block (the planar GEMM's N tile)
+    int64_t oh_block = 0;          ///< output-row block (the planar GEMM's N tile);
+                                   ///< 1 when the destination's rows are not
+                                   ///< back to back (a padded pitch)
     int64_t num_oh_blocks = 1;     ///< ceil(OH / oh_block)
     int64_t col_size = 0;          ///< per-slot im2col elements — int8 only (fp
                                    ///< fuses the gather with the pack; pointwise

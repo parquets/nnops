@@ -121,6 +121,7 @@ struct Case {
     bool add_to = false;
     EpilogueActivateType ep = EpilogueActivateType::None;
     int64_t in_pitch = 0;             // > IW → pitched input storage
+    int64_t out_pitch = 0;            // > OW → pitched output storage
     uint64_t seed = 1;
 };
 
@@ -268,9 +269,29 @@ void seed_output(std::vector<uint8_t>& buf, DataType dt, uint64_t seed) {
 }
 
 /// make_planar, keeping the quant params an integer destination needs.
-TensorView make_out_view(const TensorDesc& desc, void* data, const QuantParams& qp) {
+/// @p pitch_elems is 0 for a dense run, else the padded row stride.
+TensorView make_out_view(const TensorDesc& desc, void* data, const QuantParams& qp,
+                         int64_t pitch_elems = 0) {
     auto shape = std::span<const int64_t>(desc.dims.data(), static_cast<size_t>(desc.rank));
+    if (pitch_elems > 0) {
+        return TensorView(shape, desc.dtype, data,
+                          pitch_elems * static_cast<int64_t>(data_type_size(desc.dtype)),
+                          desc.layout, qp);
+    }
     return TensorView(shape, desc.dtype, data, desc.layout, qp);
+}
+
+/// Storage and the pitched row stride a case's output needs; the tail keeps the
+/// seed (nothing may write it).
+struct OutPlan { size_t bytes = 0; int64_t pitch = 0; };
+
+OutPlan out_plan(const TensorDesc& od, const Case& c) {
+    const int64_t OW = od.dims[od.rank - 1];
+    OutPlan p;
+    p.pitch = c.out_pitch ? c.out_pitch : OW;
+    p.bytes = static_cast<size_t>(od.numel() / OW * p.pitch) *
+              elem_size(od.dtype);
+    return p;
 }
 
 struct Result {
@@ -286,10 +307,11 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
 
     Result r;
     r.desc = outs[0];
-    r.buf.assign(outs[0].nbytes(), 0);
+    const OutPlan op_layout = out_plan(outs[0], c);
+    r.buf.assign(op_layout.bytes, 0);
     seed_output(r.buf, outs[0].dtype, c.seed + 3);
     // make_planar would drop the QuantParams an integer requant needs.
-    auto out = make_out_view(outs[0], r.buf.data(), f.out_q);
+    auto out = make_out_view(outs[0], r.buf.data(), f.out_q, op_layout.pitch);
 
     if (reference) {
         nnops::backend::cpu::reference::conv2d_int8_ref(f.attrs, out, f.ins, ctx, nullptr);
@@ -327,9 +349,10 @@ Result run_route_prepacked(const Case& c, const ComputeContext& ctx) {
 
     Result r;
     r.desc = outs[0];
-    r.buf.assign(outs[0].nbytes(), 0);
+    const OutPlan op_layout = out_plan(outs[0], c);
+    r.buf.assign(op_layout.bytes, 0);
     seed_output(r.buf, outs[0].dtype, c.seed + 3);
-    auto out = make_out_view(outs[0], r.buf.data(), f.out_q);
+    auto out = make_out_view(outs[0], r.buf.data(), f.out_q, op_layout.pitch);
     NNOPS_EXPECT_EQ(op->compute(out, pins, ctx, nullptr), Status::ok);
     return r;
 }
@@ -1150,6 +1173,75 @@ NNOPS_TEST(conv2d_i8_output_desc) {
         const TensorDesc descs[] = {f.ins[0].desc(), w32.desc()};
         auto op = Conv2D::create(f.attrs, Backend::CPU);
         NNOPS_EXPECT_EQ(op->getOutputTensorDesc(descs)[0].dtype, DataType::f32);
+    }
+}
+
+NNOPS_TEST(conv2d_i8_pitched_output) {
+    // A destination whose rows are 32-byte aligned has a row pitch wider than
+    // OW. The planar GEMM's N axis is an oh-block's rows flattened into one
+    // contiguous run, so the plan pins oh_block to one row for a pitched
+    // destination; the values must stay bit-identical to the reference, which
+    // honors the pitch, and the row tail must keep its seed.
+    Case c = base_case();
+    c.ishape = {1, 8, 9, 7};          // OH 9, OW 7
+    c.wshape = {12, 4, 3, 3};         // groups 2, icg 4 / ocg 6
+    c.kh = c.kw = 3;
+    c.ph = c.pw = 1;
+    c.groups = 2;
+    c.bias = true;
+
+    // The geometry gives the dense plan a multi-row block; the pitch is what
+    // pins it. (The dense assertion is the control: it must not already be 1.)
+    {
+        Fixture f(c);
+        std::vector<TensorDesc> ins = f.descs();
+        auto op = Conv2D::create(f.attrs, Backend::CPU);
+        auto outs = op->getOutputTensorDesc(ins);
+        const int64_t OW = outs[0].dims[outs[0].rank - 1];
+        const int64_t pitch = 32 / static_cast<int64_t>(elem_size(outs[0].dtype));
+        std::vector<uint8_t> pad(static_cast<size_t>(outs[0].numel() / OW * pitch) *
+                                 elem_size(outs[0].dtype));
+        const std::span<const int64_t> oshape(outs[0].dims.data(),
+                                              static_cast<size_t>(outs[0].rank));
+        TensorView pv(oshape, outs[0].dtype, pad.data(),
+                      pitch * static_cast<int64_t>(elem_size(outs[0].dtype)));
+
+        const TensorDesc dense[]   = {outs[0]};
+        const TensorDesc pitched[] = {pv.desc()};
+        const auto pd = backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, dense, 1, false);
+        const auto pp = backend::cpu::get_conv2d_implicit_gemm_plan(f.attrs, ins, pitched, 1, false);
+        NNOPS_EXPECT_TRUE(pd.oh_block > 1);
+        NNOPS_EXPECT_EQ(pp.oh_block, 1);
+        NNOPS_EXPECT_EQ(pp.num_oh_blocks, outs[0].dims[2]);
+    }
+
+    // s8 activation, f32 destination, bias + Relu: 7 f32 rows → 32 B.
+    c.out_pitch = 8;
+    c.ep = EpilogueActivateType::Relu;
+    expect_matches_ref(c);
+
+    // u8 activation requantized to an integer destination: 7 bytes → 32 B.
+    c.act = DataType::u8;
+    c.zp_x = 128;
+    c.out = DataType::s8;
+    c.s_out = 0.05f;
+    c.out_pitch = 32;
+    c.ep = EpilogueActivateType::None;
+    expect_matches_ref(c);
+
+    // f16 destination, and an fp activation materialized into a compact plane.
+    c.act = DataType::f16;
+    c.zp_x = 0;
+    c.out = DataType::f16;
+    c.out_pitch = 16;
+    expect_matches_ref(c);
+
+    // The same contract through the prepacked-filter path.
+    const Result dense = run_route(c, {}, /*reference=*/true);
+    const Result prepacked = run_route_prepacked(c, {});
+    const std::string diff = first_difference(prepacked, dense);
+    if (!diff.empty()) {
+        throw std::runtime_error("conv2d_int8 prepacked, pitched output: " + diff);
     }
 }
 
