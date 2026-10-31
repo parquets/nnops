@@ -238,7 +238,9 @@ inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, u
             for (int64_t l = 0; l < L; ++l) {
                 const int64_t col = (ow_edge[e] + l) * p.SW + kw * p.DW - p.PW;
                 const bool ok = col >= 0 && col < p.IW;
-                mk[l] = ok ? static_cast<T>(1) : static_cast<T>(0);
+                // s_store, not a cast: `half`'s only constructor takes raw bits,
+                // so static_cast<T>(1) is the subnormal 0x0001, not one.
+                s_store(&mk[l], ok ? 1.0f : 0.0f);
                 all = all && ok;
             }
             needed[e * p.KW + kw] = all ? 0 : 1;

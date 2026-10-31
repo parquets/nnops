@@ -198,12 +198,26 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
 
 // --- Planar (NCHW/NCDHW) driver: the SIMD lane spans output width ---
 
+/// The value a padded lane contributes: the max's identity, or zero for the sum.
+/// `half` is a struct with no numeric_limits specialization on x86, so its
+/// lowest() is 0 — which would clamp any window that touches padding at zero.
+template <typename T>
+inline T pooling_fill(bool is_max) noexcept
+{
+    if (!is_max) { return static_cast<T>(0); }
+    if constexpr (std::is_same_v<T, half>) {
+        return ::nnops::backend::cpu::float_to_half(-65504.0f);
+    } else {
+        return std::numeric_limits<T>::lowest();
+    }
+}
+
 template <bool IsMax, typename T>
 inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
                         float avg_scale, bool add_to)
 {
     constexpr int64_t L = simd_lane_for<T>;
-    const T fill = IsMax ? std::numeric_limits<T>::lowest() : static_cast<T>(0);
+    const T fill = pooling_fill<T>(IsMax);
 
     // Row-constant half of the tap count: in-range (kd, kh) positions.
     int64_t row_taps = 0;
