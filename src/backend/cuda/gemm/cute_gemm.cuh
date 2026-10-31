@@ -118,6 +118,10 @@ namespace detail {
 
 constexpr int kGemmThreads = 128;
 
+/// Shared memory a block can ask for on this class of part (GA10x: 128 KB minus
+/// the L1 carveout). A tile's `blocks` target has to fit under it.
+constexpr int kSmemPerSm = 100 * 1024;
+
 inline constexpr auto kGemmAtomK = cute::composition(
     cute::Swizzle<3, 3, 3>{},
     cute::Layout<cute::Shape<cute::_8, cute::Shape<cute::_8, cute::_8>>,
@@ -157,24 +161,114 @@ __device__ inline int64_t gemm_batch_offset(const GemmParams& p,
 // f16 tensor-core kernel
 // ============================================================
 
-template <bool TransA, bool TransB, bool Vectorized>
-__global__ __launch_bounds__(detail::kGemmThreads)
+/// The f16 tile, as one searchable record, for the same reason as the f32 one:
+/// every distinct tile is its own kernel.
+///  - `wm` x `wn` is the warp grid and `mmaM` x `mmaN` the tile one warp's atom
+///    covers; together they fix the MMA, and `threads` follows from the first.
+///  - `bM` x `bN` is the CTA tile, which the MMA tile may divide into several
+///    pieces. Those pieces replicate the accumulator fragment -- `partition_C`
+///    hands a thread one per piece -- so this is what buys a wider tile without
+///    a wider warp.
+///  - `group` sizes the L2 raster, in tiles along m.
+template <int ThreadsV, int BMV, int BNV, int BKV, int StagesV, int WMV, int WNV,
+          int MmaMV, int MmaNV, int GroupV>
+struct GemmTileH
+{
+    static constexpr int threads = ThreadsV;
+    static constexpr int bM = BMV;
+    static constexpr int bN = BNV;
+    static constexpr int bK = BKV;  // a multiple of the swizzle atom's 64-wide k
+    static constexpr int stages = StagesV;
+    static constexpr int wm = WMV;
+    static constexpr int wn = WNV;
+    static constexpr int mmaM = MmaMV;
+    static constexpr int mmaN = MmaNV;
+    static constexpr int group = GroupV;
+    static_assert(wm * wn * 32 == threads, "one warp per warp tile");
+    static_assert(mmaM % 16 == 0 && mmaN % 8 == 0, "the warp tile is an atom multiple");
+    static_assert(bM % (wm * mmaM) == 0 && bN % (wn * mmaN) == 0,
+                  "the MMA tile divides the CTA tile");
+    static_assert(bK % 64 == 0, "the shared-memory atom is 64 halves wide in k");
+};
+
+/// 64x64x64 on four warps: two stages fit three blocks a SM, three stages only
+/// two, and the third block is worth more than the extra stage everywhere but
+/// the largest grids. 32 KB, 48 KB.
+using kF16Narrow = GemmTileH<128, 64, 64, 64, 2, 2, 2, 32, 32, 8>;
+using kF16Wide = GemmTileH<128, 64, 128, 64, 2, 2, 2, 32, 32, 8>;
+
+namespace detail {
+
+/// The gmem->smem copy for one panel: a 16 B vector per thread per pass, so the
+/// thread layout splits the panel eight halves deep along whichever axis is
+/// contiguous, and the passes run over the other axis. A tiling whose thread
+/// count does not divide the panel walks off its end -- into the next stage's
+/// buffer rather than into a fault -- so the shape is checked here instead.
+template <int Threads, int Rows, int Cols, bool ContigCols>
+constexpr auto gemm_copy_half()
+{
+    if constexpr (ContigCols) {
+        constexpr int t_c = Cols / 8;
+        constexpr int t_o = Threads / t_c;
+        static_assert(Cols % 8 == 0, "a 16 B vector does not divide the panel");
+        static_assert(Threads % t_c == 0 && Rows % t_o == 0,
+                      "the copy tiling overshoots the panel");
+        return cute::make_tiled_copy(
+            cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
+                            cute::half_t>{},
+            cute::Layout<cute::Shape<cute::Int<t_o>, cute::Int<t_c>>>{},
+            cute::Layout<cute::Shape<cute::_1, cute::_8>>{});
+    } else {
+        constexpr int t_r = Rows / 8;
+        constexpr int t_c = Threads / t_r;
+        static_assert(Rows % 8 == 0, "a 16 B vector does not divide the panel");
+        static_assert(Threads % t_r == 0 && Cols % t_c == 0,
+                      "the copy tiling overshoots the panel");
+        return cute::make_tiled_copy(
+            cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
+                            cute::half_t>{},
+            cute::Layout<cute::Shape<cute::Int<t_r>, cute::Int<t_c>>>{},
+            cute::Layout<cute::Shape<cute::_8, cute::_1>>{});
+    }
+}
+
+}  // namespace detail
+
+template <class Tile, bool TransA, bool TransB, bool Vectorized>
+__global__ __launch_bounds__(Tile::threads)
 void dense_gemm_h_kernel(GemmParams p)
 {
     using namespace cute;
     using In = cute::half_t;
     using Out = cute::half_t;
 
-    constexpr int bM = 64;
-    constexpr int bN = 64;
-    constexpr int bK = 64;
-    constexpr int kStages = 3;
+    constexpr int bM = Tile::bM;
+    constexpr int bN = Tile::bN;
+    constexpr int bK = Tile::bK;
+    constexpr int kStages = Tile::stages;
 
     const int M = p.m;
     const int N = p.n;
     const int K = p.k;
-    const int m0 = int(blockIdx.x) * bM;
-    const int n0 = int(blockIdx.y) * bN;
+
+    // The operand traffic, not the tensor pipe, is what limits this kernel: ncu
+    // at 4096^3 puts HMMA at 46% and DRAM at 2.3 GB read, which is the whole
+    // runtime. Dispatched in blockIdx order a block column re-reads all of A once
+    // per n tile -- sixty-four times here, L2 being 4 MB against a 33 MB operand.
+    // Walking a square group of tiles instead keeps only the group's k-slice, a
+    // few hundred KB, resident long enough to be shared by ten blocks.
+    const int num_m = (M + bM - 1) / bM;
+    const int num_n = (N + bN - 1) / bN;
+    constexpr int kGroup = Tile::group;
+    const int group_span = kGroup * num_n;
+    const int gid = int(blockIdx.x) / group_span;
+    const int within = int(blockIdx.x) - gid * group_span;
+    const int m_span = (num_m - gid * kGroup) < kGroup ? (num_m - gid * kGroup) : kGroup;
+    const int tile_m = gid * kGroup + within % m_span;
+    const int tile_n = within / m_span;
+
+    const int m0 = tile_m * bM;
+    const int n0 = tile_n * bN;
 
     In const* A = static_cast<In const*>(p.a) + detail::gemm_batch_offset(p, p.a_batch);
     In const* B = static_cast<In const*>(p.b) + detail::gemm_batch_offset(p, p.b_batch);
@@ -205,7 +299,7 @@ void dense_gemm_h_kernel(GemmParams p)
                             make_stride(int(p.ldc), Int<1>{}));
 
     auto cta_tiler = make_shape(Int<bM>{}, Int<bN>{}, Int<bK>{});
-    auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
+    auto cta_coord = make_coord(tile_m, tile_n, _);
     Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{});
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
@@ -224,35 +318,11 @@ void dense_gemm_h_kernel(GemmParams p)
                             sB_layout);
 
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
-                                  Layout<Shape<_2, _2, _1>>{},
-                                  Tile<_32, _32, _16>{});
+                                  Layout<Shape<Int<Tile::wm>, Int<Tile::wn>, _1>>{},
+                                  cute::Tile<Int<Tile::mmaM>, Int<Tile::mmaN>, _16>{});
 
-    auto copy_a = [&] {
-        if constexpr (TransA) {
-            return make_tiled_copy(
-                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, In>{},
-                Layout<Shape<_8, _16>>{},
-                Layout<Shape<_8, _1>>{});
-        } else {
-            return make_tiled_copy(
-                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, In>{},
-                Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-                Layout<Shape<_1, _8>>{});
-        }
-    }();
-    auto copy_b = [&] {
-        if constexpr (TransB) {
-            return make_tiled_copy(
-                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, In>{},
-                Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-                Layout<Shape<_1, _8>>{});
-        } else {
-            return make_tiled_copy(
-                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, In>{},
-                Layout<Shape<_8, _16>>{},
-                Layout<Shape<_8, _1>>{});
-        }
-    }();
+    auto copy_a = detail::gemm_copy_half<Tile::threads, bM, bK, !TransA>();
+    auto copy_b = detail::gemm_copy_half<Tile::threads, bN, bK, TransB>();
 
     ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
     Tensor tAgA = thr_copy_a.partition_S(gA);
@@ -426,17 +496,51 @@ void dense_gemm_h_kernel(GemmParams p)
 // f32 SIMT kernel
 // ============================================================
 
-template <bool TransA, bool TransB, bool Vectorized, bool Wide>
-__global__ __launch_bounds__(detail::kGemmThreads, 4)
+/// Everything the f32 kernel's shape depends on, as one searchable record.
+///
+/// Each field is a knob the benches sweep (`dense_gemm_f32_tile`), and each
+/// distinct value is its own kernel, so a search multiplies instantiations: keep
+/// the list short and only name the configurations that are being measured.
+///  - `threads` and `tm` fix the thread tile: `bM/tm` threads along m, the rest
+///    along n, and Tn falls out as `bN / (threads / (bM/tm))`. Tn is what costs
+///    registers, so `threads` has to grow with the tile or the accumulators do.
+///  - `blocks` is the resident-block target the launch bound has to satisfy; it
+///    has to match what the shared-memory budget actually allows, and it is what
+///    caps the register count (65536/(threads*blocks)).
+///  - `padA` is the A row padding in floats, and only applies to a k-contiguous
+///    A panel; 0 keeps the swizzle.
+template <int ThreadsV, int TmV, int BMV, int BNV, int BKV, int StagesV,
+          int BlocksV, int PadAV>
+struct GemmTileF32
+{
+    static constexpr int threads = ThreadsV;
+    static constexpr int tm = TmV;
+    static constexpr int bM = BMV;
+    static constexpr int bN = BNV;
+    static constexpr int bK = BKV;
+    static constexpr int stages = StagesV;
+    static constexpr int blocks = BlocksV;
+    static constexpr int padA = PadAV;
+};
+
+// 24576 B -> four blocks; 26624 B -> three. See the smem note in the kernel.
+using kF32Narrow = GemmTileF32<128, 8, 64, 64, 16, 3, 4, 0>;
+using kF32Wide = GemmTileF32<128, 8, 64, 128, 16, 2, 3, 4>;
+
+template <class Tile, bool TransA, bool TransB, bool Vectorized>
+__global__ __launch_bounds__(Tile::threads, Tile::blocks)
 void dense_gemm_f_kernel(GemmParams p)
 {
     using namespace cute;
     using Elem = float;
 
-    constexpr int bM = 64;
-    constexpr int bN = Wide ? 128 : 64;
-    constexpr int bK = 16;
-    constexpr int kStages = Wide ? 2 : 3;
+    constexpr int kThreads = Tile::threads;
+    constexpr int bM = Tile::bM;
+    constexpr int bN = Tile::bN;
+    constexpr int bK = Tile::bK;
+    constexpr int kStages = Tile::stages;
+    static_assert(bK % 4 == 0, "every A load is one float4");
+    static_assert(kStages >= 2, "the pipeline waits kStages - 2 deep");
 
     const int M = p.m;
     const int N = p.n;
@@ -476,18 +580,28 @@ void dense_gemm_f_kernel(GemmParams p)
 
     // A k-contiguous panel is bK = 16 floats = 64 B wide, so each row can start
     // in bank 0 or bank 16 only: without help the eight rows a warp reads at one
-    // k land on two banks. Padding the row is one fix (20 floats); the swizzle is
-    // the other, XORing the row index into the 16 B vector index so the eight
-    // rows get the same distinct phases at no shared-memory cost -- and bits 0..1
-    // stay put, so the cp.async vector is still 16 B. A panel wide in the
-    // operand direction (>= 64 floats, two or more full bank cycles per row) is
-    // already conflict free and takes neither.
+    // k land on two banks. Both fixes cost something. Padding the row by one
+    // 16 B vector keeps the row address loop invariant, so every load is an
+    // immediate off a hoisted base, and buys that with 2 KB of shared memory.
+    // The swizzle reproduces the pad's phase spread for free -- XORing the row
+    // index into the 16 B vector index, bits 0..1 untouched so cp.async is still
+    // 16 B -- but the address now depends on (row XOR k-block), and a runtime row
+    // can only spell that as a full index recomputation per load. The wide tile
+    // is down to three blocks a SM for register reasons anyway, so it pays for
+    // the pad; the narrow one keeps its fourth block and swizzles. A panel wide
+    // in the operand direction (>= 64 floats, two bank cycles per row) is already
+    // conflict free and takes neither.
+    constexpr int kPadA = (Tile::padA != 0 && !TransA) ? Tile::padA : 0;
     constexpr auto swz = Swizzle<3, 2, 3>{};
     constexpr auto sA_layout = [&] {
         if constexpr (TransA) {
             return make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
                                make_stride(Int<1>{}, Int<bM>{},
                                            Int<bM * bK>{}));
+        } else if constexpr (kPadA != 0) {
+            return make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
+                               make_stride(Int<bK + kPadA>{}, Int<1>{},
+                                           Int<(bK + kPadA) * bM>{}));
         } else {
             return composition(
                 swz, make_layout(make_shape(Int<bM>{}, Int<bK>{}, Int<kStages>{}),
@@ -525,26 +639,53 @@ void dense_gemm_f_kernel(GemmParams p)
     // carries 0.068. Mapping the strip by hand makes both operands 16 B loads:
     // A along its k-contiguous axis (or along m when the panel is m-contiguous),
     // B along n (or along k), for 0.094 / 0.063 shared loads per FFMA.
-    constexpr int Tm = 8;
-    constexpr int Tn = bN / 16;
+    constexpr int Tm = Tile::tm;
     constexpr int kThreadsM = bM / Tm;
-    static_assert(kThreadsM * (bN / Tn) == detail::kGemmThreads);
+    constexpr int kThreadsN = kThreads / kThreadsM;
+    constexpr int Tn = bN / kThreadsN;
+    static_assert(bM % Tm == 0 && Tm % 4 == 0, "A loads four rows at a time");
+    static_assert(kThreads % kThreadsM == 0, "the block splits over m only");
+    static_assert(bN % kThreadsN == 0 && Tn % 4 == 0, "B loads one float4 per n");
 
     const int tx = int(threadIdx.x) % kThreadsM;
     const int ty = int(threadIdx.x) / kThreadsM;
     auto arow = [&](int j) { return TransA ? tx * Tm + j : tx + kThreadsM * j; };
-    auto brow = [&](int j) { return TransB ? ty + 16 * j : ty * Tn + j; };
+    auto brow = [&](int j) { return TransB ? ty + kThreadsN * j : ty * Tn + j; };
 
+    // Every thread moves one 16 B vector per pass, so the thread layout is "the
+    // block split over both axes": four threads along k when the panel is
+    // k-contiguous, eight when the copy runs along m/n instead. A tiling then
+    // covers `threads / n * 4` rows per pass, and a panel that is not a multiple
+    // of that is overshot -- the copy addresses rows past the panel, which is the
+    // next stage's buffer. A 64-wide B panel on 256 threads is exactly that
+    // (32 threads x 4 = 128 rows for a 64-row panel), and it corrupts memory
+    // rather than failing to launch.
+    constexpr int kCopyRows = (kThreads / 8) * 4;
+    static_assert(TransA || bM % (kThreads / 4) == 0,
+                  "the A copy tiling overshoots the panel");
+    static_assert(!TransA || bM % kCopyRows == 0,
+                  "the A copy tiling overshoots the panel");
+    static_assert(TransB || bN % kCopyRows == 0,
+                  "the B copy tiling overshoots the panel");
+    static_assert(!TransB || bN % (kThreads / 4) == 0,
+                  "the B copy tiling overshoots the panel");
+
+    // The swizzle is a composition of XORs on the linear offset, so it only tiles
+    // a panel whose k-extent is a power of two. The pad takes any multiple of 4.
+    static_assert(TransA || kPadA != 0 || (bK & (bK - 1)) == 0,
+                  "the A swizzle needs a power-of-two bK");
+    static_assert(!TransB || (bK & (bK - 1)) == 0,
+                  "the B swizzle needs a power-of-two bK");
     auto copy_a = [&] {
         if constexpr (TransA) {
             return make_tiled_copy(
                 Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Elem>{},
-                Layout<Shape<_16, _8>>{},
+                Layout<Shape<Int<kThreads / 8>, _8>>{},
                 Layout<Shape<_4, _1>>{});
         } else {
             return make_tiled_copy(
                 Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Elem>{},
-                Layout<Shape<_32, _4>, Stride<_4, _1>>{},
+                Layout<Shape<Int<kThreads / 4>, _4>, Stride<_4, _1>>{},
                 Layout<Shape<_1, _4>>{});
         }
     }();
@@ -552,12 +693,12 @@ void dense_gemm_f_kernel(GemmParams p)
         if constexpr (TransB) {
             return make_tiled_copy(
                 Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Elem>{},
-                Layout<Shape<_32, _4>, Stride<_4, _1>>{},
+                Layout<Shape<Int<kThreads / 4>, _4>, Stride<_4, _1>>{},
                 Layout<Shape<_1, _4>>{});
         } else {
             return make_tiled_copy(
                 Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Elem>{},
-                Layout<Shape<_16, _8>>{},
+                Layout<Shape<Int<kThreads / 8>, _8>>{},
                 Layout<Shape<_4, _1>>{});
         }
     }();
@@ -633,23 +774,23 @@ void dense_gemm_f_kernel(GemmParams p)
         for (int v = 0; v < Tn; ++v) { acc[j][v] = 0.0f; }
     }
 
-    int smem_pipe_read = 0;
-    int smem_pipe_write = kStages - 1;
-
-    CUTE_NO_UNROLL
-    while (k_tile_count > -(kStages - 1)) {
+    // The stage index doubles as a shared-memory address offset, so leaving it a
+    // running variable makes every operand load pay a runtime add. Unrolling the
+    // stage cycle puts it into the layout as a constant and folds those adds into
+    // immediates; ncu counted 195 ALU ops per k-tile per warp (15% of all issued
+    // instructions) before either this or the A pad.
+    auto k_body = [&]<int RD, int WR>() {
         cp_async_wait<kStages - 2>();
         __syncthreads();
 
-        load_a(k_tile_next, smem_pipe_write);
-        load_b(k_tile_next, smem_pipe_write);
+        load_a(k_tile_next, WR);
+        load_b(k_tile_next, WR);
         cp_async_fence();
 
         // Unrolled, or every swizzled A address costs runtime index math. Left
-        // alone ptxas then hoists all four groups' A loads and needs 167
-        // registers for a 104-register loop; the launch bound holds it to the
-        // four-block budget instead.
-        const int rd = smem_pipe_read;
+        // alone ptxas hoists all four groups' A loads and needs 167 registers
+        // for a 104-register loop, which the launch bound then refuses.
+        constexpr int rd = RD;
         CUTE_UNROLL
         for (int kg = 0; kg < bK; kg += 4) {
             float av[Tm][4];
@@ -716,10 +857,30 @@ void dense_gemm_f_kernel(GemmParams p)
 
         --k_tile_count;
         if (k_tile_count > 0) { ++k_tile_next; }
-        smem_pipe_write = smem_pipe_read;
-        smem_pipe_read = (smem_pipe_read == kStages - 1) ? 0 : smem_pipe_read + 1;
+    };
+
+    if constexpr (kStages == 2) {
+        CUTE_NO_UNROLL
+        while (k_tile_count > -1) {
+            k_body.template operator()<0, 1>();
+            if (k_tile_count > -1) { k_body.template operator()<1, 0>(); }
+        }
+    } else {
+        CUTE_NO_UNROLL
+        while (k_tile_count > -2) {
+            k_body.template operator()<0, 2>();
+            if (k_tile_count > -2) { k_body.template operator()<1, 0>(); }
+            if (k_tile_count > -2) { k_body.template operator()<2, 1>(); }
+        }
     }
 
+    // Straight from the accumulators, no staging tile: a thread's Tm rows x Tn
+    // columns are contiguous along n, so an instruction already fills a whole
+    // 128 B segment per row across the block -- and staging the CTA tile over the
+    // dead cp.async panels to coalesce it further was measured at -13% (64x128,
+    // two passes) and -0.4% (64x64, one pass): the epilogue is exposed at the end
+    // of a block's life, so the round trip and the barrier cost more than the
+    // half-filled sectors they remove.
     const int ld_c = int(p.ldc);
     CUTE_UNROLL
     for (int j = 0; j < Tm; ++j) {
@@ -776,38 +937,43 @@ inline int device_sm_count()
     return count;
 }
 
-template <bool TransA, bool TransB, bool Vectorized>
+template <class Tile, bool TransA, bool TransB, bool Vectorized>
 inline void launch_dense_h(const GemmParams& p, cudaStream_t stream)
 {
     using namespace cute;
-    constexpr int bM = 64, bN = 64, bK = 64, kStages = 3;
-    constexpr auto la = gemm_smem_layout<!TransA>(Int<bM>{}, Int<bK>{}, Int<kStages>{});
-    constexpr auto lb = gemm_smem_layout<TransB>(Int<bN>{}, Int<bK>{}, Int<kStages>{});
+    constexpr int bM = Tile::bM, bN = Tile::bN, bK = Tile::bK;
+    constexpr auto la = gemm_smem_layout<!TransA>(Int<bM>{}, Int<bK>{}, Int<Tile::stages>{});
+    constexpr auto lb = gemm_smem_layout<TransB>(Int<bN>{}, Int<bK>{}, Int<Tile::stages>{});
     constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(half_t));
+    static_assert(smem <= kSmemPerSm, "one block has to fit");
 
-    auto kernel = dense_gemm_h_kernel<TransA, TransB, Vectorized>;
+    auto kernel = dense_gemm_h_kernel<Tile, TransA, TransB, Vectorized>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(p.m, bM), ceil_div(p.n, bN), gemm_batch_count(p));
-    kernel<<<grid, kGemmThreads, smem, stream>>>(p);
+    // One flat tile index: the kernel turns it into an L2-grouped (m, n) pair.
+    dim3 grid(ceil_div(p.m, bM) * ceil_div(p.n, bN), 1, gemm_batch_count(p));
+    kernel<<<grid, Tile::threads, smem, stream>>>(p);
 }
 
-template <bool TransA, bool TransB, bool Vectorized, bool Wide>
+template <class Tile, bool TransA, bool TransB, bool Vectorized>
 inline void launch_dense_f(const GemmParams& p, cudaStream_t stream)
 {
     using namespace cute;
-    constexpr int bM = 64, bN = Wide ? 128 : 64, bK = 16, kStages = Wide ? 2 : 3;
-    constexpr int smem = (bM * bK + bN * bK) * kStages * int(sizeof(float));
+    constexpr int bM = Tile::bM, bN = Tile::bN, bK = Tile::bK, kStages = Tile::stages;
+    constexpr int kPadA = (Tile::padA != 0 && !TransA) ? Tile::padA : 0;
+    constexpr int smem =
+        (bM * (bK + kPadA) + bN * bK) * kStages * int(sizeof(float));
+    static_assert(smem * Tile::blocks <= kSmemPerSm, "the block target does not fit");
 
-    auto kernel = dense_gemm_f_kernel<TransA, TransB, Vectorized, Wide>;
+    auto kernel = dense_gemm_f_kernel<Tile, TransA, TransB, Vectorized>;
     static const cudaError_t cfg = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
     dim3 grid(ceil_div(p.m, bM), ceil_div(p.n, bN), gemm_batch_count(p));
-    kernel<<<grid, kGemmThreads, smem, stream>>>(p);
+    kernel<<<grid, Tile::threads, smem, stream>>>(p);
 }
 
 /// Per-(dtype, transpose, vectorized) dispatch table.
@@ -830,6 +996,23 @@ inline void dispatch_dense(const GemmParams& p, bool trans_a, bool trans_b,
 
 }  // namespace detail
 
+/// Launch one f32 GEMM with an explicit tile shape, bypassing the narrow/wide
+/// heuristic. Every distinct tile (and every transpose/vectorized flag) is its
+/// own kernel, so this is the benches' entry point for a tile search rather than
+/// something the operators call.
+template <class Tile, bool TransA, bool TransB, bool Vectorized = true>
+inline void dense_gemm_f32_tile(const GemmParams& p, cudaStream_t stream)
+{
+    detail::launch_dense_f<Tile, TransA, TransB, Vectorized>(p, stream);
+}
+
+/// The f16 twin of `dense_gemm_f32_tile`: one tensor-core tile, spelled out.
+template <class Tile, bool TransA, bool TransB, bool Vectorized = true>
+inline void dense_gemm_f16_tile(const GemmParams& p, cudaStream_t stream)
+{
+    detail::launch_dense_h<Tile, TransA, TransB, Vectorized>(p, stream);
+}
+
 /// Dense C = alpha*A*B + beta*C + bias, epilogue applied, optional residual.
 /// Returns false when the request has no kernel (bad extents).
 inline bool dense_gemm_launch(const GemmParams& p, int elem_size,
@@ -837,22 +1020,31 @@ inline bool dense_gemm_launch(const GemmParams& p, int elem_size,
                               cudaStream_t stream)
 {
     if (p.m <= 0 || p.n <= 0 || p.k <= 0) { return false; }
-    // The 128-wide tile halves the A/B panel traffic, but its 30.7 KB of smem
-    // costs a resident block, so it only pays once the grid can refill the
-    // machine several times over.
+    // The 128-wide tile reads A half as often, which takes a quarter off the
+    // operand traffic, but its 26 KB of smem costs a resident block, so it only
+    // pays once the grid can refill the machine several times over.
     const int sm = detail::device_sm_count();
     const long long wide_blocks = static_cast<long long>((p.m + 63) / 64) *
                                   ((p.n + 127) / 128) * detail::gemm_batch_count(p);
     const bool wide = sm > 0 && wide_blocks >= 4LL * sm;
+    // The same trade in f16, but there the wide tile halves the resident blocks
+    // (two, not three) rather than shaving one off four, so it takes both a deep
+    // grid and a long k loop to pay: -8% at 4096^3 and -3% at 8192^2x4096, but
+    // +8% at 4096^2x1024, where the shorter reduction leaves nothing to save.
+    const bool wide_h = sm > 0 && wide_blocks >= 16LL * sm && p.k >= 4096;
     detail::dispatch_dense(
         p, trans_a, trans_b, vectorized,
         [&]<bool TA, bool TB, bool V>() {
             if (elem_size == 2) {
-                detail::launch_dense_h<TA, TB, V>(p, stream);
+                if (wide_h) {
+                    detail::launch_dense_h<kF16Wide, TA, TB, V>(p, stream);
+                } else {
+                    detail::launch_dense_h<kF16Narrow, TA, TB, V>(p, stream);
+                }
             } else if (wide) {
-                detail::launch_dense_f<TA, TB, V, true>(p, stream);
+                detail::launch_dense_f<kF32Wide, TA, TB, V>(p, stream);
             } else {
-                detail::launch_dense_f<TA, TB, V, false>(p, stream);
+                detail::launch_dense_f<kF32Narrow, TA, TB, V>(p, stream);
             }
         });
     return true;

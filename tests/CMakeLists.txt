@@ -155,5 +155,26 @@ if(NNOPS_BUILD_BENCHMARKS)
     if(NNOPS_BUILD_CUDA)
         # Only the matmul bench carries a cuBLAS reference arm.
         target_link_libraries(bench_cuda_matmul PRIVATE CUDA::cublas)
+
+        # The tile search instantiates kernels from the CuTe header itself, so
+        # that one is CUDA source rather than a demo: nvcc has to see it, and it
+        # needs the CuTe path the library target is given.
+        add_executable(bench_cuda_tiles bench_cuda_tiles.cu common/bench_harness.cpp)
+        target_link_libraries(bench_cuda_tiles PRIVATE nnops_cpu nnops_test_reference
+                                                     CUDA::cudart)
+        # CuTe's path is only resolved inside src/, so it is taken from the
+        # library's own include list rather than repeated here.
+        target_include_directories(bench_cuda_tiles PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
+            $<TARGET_PROPERTY:nnops_cuda,INCLUDE_DIRECTORIES>)
+        # CUDA is enabled from src/, so the language's standard and architecture
+        # settings are directory-scoped there: without them spelled out here the
+        # target compiles for nvcc's default of C++17 and sm_52, and the kernel's
+        # cp.async pipeline does not exist below sm_80.
+        target_compile_options(bench_cuda_tiles PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20
+                                       -arch=sm_${CMAKE_CUDA_ARCHITECTURES}
+                                       --expt-relaxed-constexpr
+                                       --expt-extended-lambda>)
     endif()
 endif()
