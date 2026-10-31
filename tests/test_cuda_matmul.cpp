@@ -12,7 +12,8 @@
 /// inside one 64x64 tile), a grid wide enough to select the 64x128 f32 tile,
 /// a K that is not a multiple of the 16-element MMA
 /// step, both transpose flags (each picks a different copy atom and LDSM
-/// operand), f32 and f16, batched broadcasting, and padded row pitches — the
+/// operand), f32 and f16, a grid deep enough for the wide f16 tile, batched
+/// broadcasting, and padded row pitches — the
 /// padded case is where a stray 16 B vector load of a row tail would corrupt
 /// the result.
 ///
@@ -160,6 +161,26 @@ NNOPS_TEST(cuda_matmul_f16_shapes) {
         c.b_shape = {96, s[1]};
         c.dtype = DataType::f16;
         run_case(c, "cuda_matmul_f16_shapes");
+    }
+}
+
+NNOPS_TEST(cuda_matmul_f16_wide_tile) {
+    // The f16 launcher takes the 64x128 tile only on a deep grid *and* a long k
+    // loop, so this is the smallest pair of geometries that reaches it: one that
+    // divides both tile axes, one where both overhang (the N tail is the wide
+    // tile's own risk — its masked fill and its 128-wide B panel). The oracle is
+    // the CPU route, which is why these two cases cost seconds, not milliseconds.
+    const int64_t shapes[][2] = {{2048, 4096}, {2057, 4103}};
+    bool transpose_b = false;
+    for (const auto& s : shapes) {
+        MatmulCase c;
+        c.dtype = DataType::f16;
+        c.transpose_b = transpose_b;
+        c.a_shape = {s[0], 4096};
+        c.b_shape = c.transpose_b ? std::vector<int64_t>{s[1], 4096}
+                                  : std::vector<int64_t>{4096, s[1]};
+        run_case(c, "cuda_matmul_f16_wide_tile");
+        transpose_b = true;  // the second B layout, on the tail geometry
     }
 }
 
