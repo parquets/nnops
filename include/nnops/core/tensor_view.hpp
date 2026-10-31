@@ -104,7 +104,10 @@ struct TensorDesc {
         }
         const int64_t aligned_row = row_pitch(alignment);
         int64_t rows = dims[0];
-        if (!is_channel_last(layout)) {
+        // dims[1] merges into the row pitch only where it is a channel axis of
+        // its own; at rank 2 it *is* the last dim, which row_pitch already
+        // covers, so counting it here sizes the tensor by another factor of W.
+        if (!is_channel_last(layout) && rank > 2) {
             const int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
             rows *= ((dims[1] + pack - 1) / pack);
         }
