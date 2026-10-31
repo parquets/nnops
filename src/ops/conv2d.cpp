@@ -28,6 +28,8 @@
 
 namespace nnops {
 
+NNOPS_DECLARE_CUDA(Conv2DAttributes, conv2d_cuda)
+
 struct Conv2D::Impl {
     using KernelFn = Status (*)(const Conv2DAttributes&,
                                 TensorView&,
@@ -51,7 +53,10 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
         return backend::cpu::conv2d_implicit_gemm_kernel;
 #ifdef NNOPS_HAS_CUDA
     case Backend::CUDA:
-        return nullptr;
+        // The CUDA route is implicit GEMM only: a Winograd weight handed in
+        // (U) has no CUDA consumer, so it is refused rather than mis-read.
+        return algorithm == ConvAlgorithm::Winograd
+            ? nullptr : backend::cuda::conv2d_cuda;
 #endif
 #ifdef NNOPS_HAS_VULKAN
     case Backend::Vulkan:
@@ -220,6 +225,10 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
                             std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
+    // The CUDA kernels read the raw filter in place (implicit GEMM only), so
+    // this backend has no packed product: the query stays empty, the same
+    // "no packed form" answer MatMul gives a quantized weight.
+    if (backend_ != Backend::CPU) { return; }
     NNOPS_ASSERT(inputs.size() >= 1);
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& weight = inputs[0];

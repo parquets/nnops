@@ -37,8 +37,9 @@ A self-contained, **zero-dependency** C++23 operator library for neural-network 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
-# With CUDA
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNNOPS_BUILD_CUDA=ON
+# With CUDA (the GEMM kernels are built on CuTe, so a CUTLASS checkout is needed)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNNOPS_BUILD_CUDA=ON \
+      -DNNOPS_CUTLASS_DIR=/path/to/cutlass
 
 # With Vulkan (requires the Vulkan SDK's glslc)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNNOPS_BUILD_VULKAN=ON
@@ -49,6 +50,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNNOPS_BUILD_VULKAN=ON
 | `NNOPS_BUILD_TESTS` | `ON` | Build the unit-test demos |
 | `NNOPS_BUILD_BENCHMARKS` | `ON` | Build the micro-benchmark demos |
 | `NNOPS_BUILD_CUDA` | `OFF` | Build the CUDA backend |
+| `NNOPS_CUTLASS_DIR` | auto-detected | CUTLASS checkout providing `include/cute`, required by the CUDA GEMM kernels (`D:/git/cutlass` and `$CUTLASS_DIR` are tried first) |
 | `NNOPS_BUILD_VULKAN` | `OFF` | Build the Vulkan backend |
 
 Install as a CMake package:
@@ -165,7 +167,7 @@ src/backend/cpu/        SIMD kernels, reference kernels, tiled GEMM/Conv/Attenti
   ├── x86_64/           AVX2/FMA/F16C/VNNI micro-kernels (pack, transpose, MMA)
   ├── aarch64/          NEON micro-kernels
   └── simd_kernel/      cross-platform SIMD primitives
-src/backend/cuda/       CUDA kernels (optional)
+src/backend/cuda/       CUDA kernels (optional); gemm/ and conv/ build on CuTe only
 src/backend/vulkan/     Vulkan kernels (optional)
 tests/                  Standalone test demos (one executable per file)
 ```

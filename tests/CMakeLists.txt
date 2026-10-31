@@ -88,6 +88,13 @@ endfunction()
 
 if(NNOPS_BUILD_CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # The CUDA operator tests run the CPU route as their oracle and upload the
+    # same bytes to the device, so they are ordinary demos that also link cudart.
+    list(APPEND TEST_SOURCES
+        test_cuda_matmul.cpp
+        test_cuda_linear.cpp
+        test_cuda_conv2d.cpp
+    )
 endif()
 
 foreach(src ${TEST_SOURCES})
@@ -116,6 +123,9 @@ if(NNOPS_BUILD_BENCHMARKS)
         get_filename_component(name "${src}" NAME_WE)   # strip .cpp → e.g. bench_matmul
         add_executable(${name} "${src}" common/bench_harness.cpp)
         target_link_libraries(${name} PRIVATE nnops_cpu nnops_test_reference)
+        if(NNOPS_BUILD_CUDA)
+            target_link_libraries(${name} PRIVATE CUDA::cudart)
+        endif()
         target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
     endfunction()
 
@@ -129,6 +139,14 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_attention.cpp
         bench_mma_packed.cpp
     )
+
+    if(NNOPS_BUILD_CUDA)
+        list(APPEND BENCH_SOURCES
+            bench_cuda_matmul.cpp
+            bench_cuda_linear.cpp
+            bench_cuda_conv2d.cpp
+        )
+    endif()
 
     foreach(src ${BENCH_SOURCES})
         nnops_add_bench_demo(${src})

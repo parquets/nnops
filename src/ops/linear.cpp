@@ -21,9 +21,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(LinearAttributes, linear_cpu)
+NNOPS_DECLARE_CUDA(LinearAttributes, linear_cuda)
 
 NNOPS_OP_BOILERPLATE(Linear, LinearAttributes,
-        backend::cpu::linear_cpu, nullptr, nullptr)
+        backend::cpu::linear_cpu,
+        NNOPS_IF_CUDA(backend::cuda::linear_cuda), nullptr)
 
 std::vector<TensorDesc> Linear::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
@@ -64,6 +66,8 @@ void Linear::prepackWeights(std::span<const TensorView> inputs,
                             std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
+    // CUDA reads the raw [N, K] weight in place; the query answers empty.
+    if (backend_ != Backend::CPU) { return; }
     NNOPS_ASSERT(inputs.size() >= 1);
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& weight = inputs[0];

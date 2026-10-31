@@ -27,9 +27,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(MatMulAttributes, matmul_cpu)
+NNOPS_DECLARE_CUDA(MatMulAttributes, matmul_cuda)
 
 NNOPS_OP_BOILERPLATE(MatMul, MatMulAttributes,
-        backend::cpu::matmul_cpu, nullptr, nullptr)
+        backend::cpu::matmul_cpu,
+        NNOPS_IF_CUDA(backend::cuda::matmul_cuda), nullptr)
 
 size_t MatMul::getWorkspaceSize(std::span<const TensorDesc> inputs,
                                 std::span<const TensorDesc> outputs) const
@@ -82,6 +84,9 @@ void MatMul::prepackWeights(std::span<const TensorView> inputs,
                             std::span<TensorView> outputs,
                             const ComputeContext& ctx)
 {
+    // CUDA reads B raw (no panel format of its own): an empty query stays
+    // empty, the documented "this weight has no packed form" answer.
+    if (backend_ != Backend::CPU) { return; }
     NNOPS_ASSERT(inputs.size() >= 1);
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& raw = inputs[0];

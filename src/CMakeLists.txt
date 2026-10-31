@@ -107,23 +107,59 @@ if(NNOPS_BUILD_CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+    # The GEMM/Conv kernels are built on CuTe only (cute/ headers); the CUTLASS
+    # host-side GEMM layer is not used. CuTe's own headers still reach into
+    # cutlass/numeric_types.h, so the checkout's include/ root is on the path.
+    set(NNOPS_CUTLASS_DIR "" CACHE PATH
+        "CUTLASS checkout whose include/cute the CUDA GEMM kernels build on")
+    if(NOT NNOPS_CUTLASS_DIR)
+        foreach(_candidate "D:/git/cutlass" "$ENV{CUTLASS_DIR}"
+                           "${CMAKE_SOURCE_DIR}/third_party/cutlass")
+            if(EXISTS "${_candidate}/include/cute/tensor.hpp")
+                set(NNOPS_CUTLASS_DIR "${_candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT EXISTS "${NNOPS_CUTLASS_DIR}/include/cute/tensor.hpp")
+        message(FATAL_ERROR
+            "CuTe headers not found. Set -DNNOPS_CUTLASS_DIR=<cutlass checkout> "
+            "(need <dir>/include/cute/tensor.hpp).")
+    endif()
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80)
+    endif()
+
+    # layer_norm.cu, rms_norm.cu and batch_norm.cu are left out: they were
+    # written against the per-op headers (LayerNormAttributes, ...) that the
+    # Norm merge replaced, so they do not compile, and no dispatch site
+    # references their entry points. Nothing here is lost by excluding them.
     set(NNOPS_CUDA_SOURCES
         backend/cuda/softmax.cu
-        backend/cuda/layer_norm.cu
-        backend/cuda/rms_norm.cu
         backend/cuda/activation.cu
-        backend/cuda/batch_norm.cu
         backend/cuda/pooling.cu
         backend/cuda/cumsum.cu
         backend/cuda/depthwise_conv.cu
         backend/cuda/eltwise.cu
         backend/cuda/unary.cu
         backend/cuda/reduce.cu
+        # CuTe-based GEMM family: dense MatMul/Linear first, then the two
+        # implicit-GEMM Conv2D routes (planar NCHW and channel-last NHWC).
+        backend/cuda/gemm/matmul_cuda.cu
+        backend/cuda/gemm/linear_cuda.cu
+        backend/cuda/conv/conv2d_cuda.cu
+        # Unsupported operators' entry points, so the CUDA library resolves every
+        # dispatch site the CPU backend references.
+        backend/cuda/not_implemented.cu
     )
 
     add_library(nnops_cuda STATIC ${NNOPS_CUDA_SOURCES})
     target_link_libraries(nnops_cuda PUBLIC nnops)
-    target_include_directories(nnops_cuda PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_include_directories(nnops_cuda PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${NNOPS_CUTLASS_DIR}/include)
+    target_compile_options(nnops_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --expt-extended-lambda>)
     target_compile_definitions(nnops_cpu PUBLIC NNOPS_HAS_CUDA)
     target_link_libraries(nnops_cpu PUBLIC nnops_cuda)
 endif()
