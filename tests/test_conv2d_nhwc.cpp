@@ -702,7 +702,7 @@ NNOPS_TEST(conv2d_nhwc_fp_prepacked_filter) {
     const FpCase f16_cases[] = {
         {{1, 8, 16, 16},   8, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
         {{1, 8, 20, 20},  16, 5, 5, 1, 1, 2, 2, 1, 1, 2, false},
-        {{1, 3, 32, 32},  16, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},
+        {{1, 3, 32, 32},   8, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},
         {{1, 128, 8, 8},  32, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
     };
     for (size_t i = 0; i < std::size(f16_cases); ++i) {
@@ -740,16 +740,41 @@ NNOPS_TEST(conv2d_nhwc_wino_matches_ref) {
         {{{1, 16, 20, 20},   8, 3, 3, 1, 1, 1, 1, 1, 1, 2, true},   76},
         // A single channel per group (IC/G 1) and a filter over the whole plane.
         {{{1, 2, 10, 10},    4, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},  77},
-        // IC 512 over the 256 k-block cap: two K passes.
-        {{{1, 512, 8, 8},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   78},
+        // IC 512 over the 256 k-block cap: two K passes. (Its order is F(4,3),
+        // so the tolerance that case needs is set in the block below.)
         // pad 0 (OH = IH − 2) and pad 2.
         {{{1, 32, 18, 18},  16, 3, 3, 1, 1, 0, 0, 1, 1, 1, false},  79},
         {{{1, 32, 12, 12},  16, 3, 3, 1, 1, 2, 2, 1, 1, 1, true},   80},
+        // 64 channels per group is where prepack switches to F(4,3), so this one
+        // runs 4x4 tiles off a 6x6 window and still holds the F(2,3) tolerance.
+        {{{1, 64, 16, 16},  64, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},  85},
     };
     for (size_t i = 0; i < std::size(f32_cases); ++i) {
         expect_fp_close(f32_cases[i].c, DataType::f32, 2e-4f,
                         EpilogueActivateType::None, false, f32_cases[i].seed,
                         static_cast<int>(i), ConvAlgorithm::Winograd);
+    }
+
+    // F(4,3)'s own tolerance. Bᵀ scales a window by up to 5 and Aᵀ the products
+    // by up to 8, so the same f32 reduction carries roughly 1.5-2 bits more
+    // error than F(2,3)'s — 3.5e-4 against 2e-4 measured on the 512-channel
+    // case. That is the order's price, not a defect, and it is where the extra
+    // multiplies are saved.
+    const Case f43_cases[] = {
+        // An extent odd on both axes, and a last tile column 3 outputs wide.
+        {{{1, 64, 15, 17},  96, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   86},
+        // groups 2 (IC/G 64, OC/G 32) and pad 0.
+        {{{1, 128, 16, 16}, 64, 3, 3, 1, 1, 0, 0, 1, 1, 2, false},  87},
+        // Over the 256 k-block cap: two K passes, and a plane barely one tile
+        // row of tiles tall (9x9 is 3x3 tiles, the window running past the edge).
+        {{{1, 512, 9, 9},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   89},
+        // The case that set the tolerance above: 512 channels and 3x3 tiles.
+        {{{1, 512, 8, 8},   64, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},   88},
+    };
+    for (size_t i = 0; i < std::size(f43_cases); ++i) {
+        expect_fp_close(f43_cases[i].c, DataType::f32, 1e-3f,
+                        EpilogueActivateType::None, false, f43_cases[i].seed,
+                        static_cast<int>(i) + 200, ConvAlgorithm::Winograd);
     }
 
     // f16 narrows only the accumulator, so the shared f16 tolerance applies.
@@ -866,6 +891,9 @@ NNOPS_TEST(conv2d_nhwc_wino_prepack_matches_planar) {
     attrs.padding = {1, 1};
     attrs.groups = G;
     attrs.algorithm = ConvAlgorithm::Winograd;
+    // Pin the order: the two routes pick differently by default (channel-last
+    // takes F(4,3) at any plane), and this test compares the blobs' packing.
+    attrs.winograd_order = 2;
     auto op = Conv2D::create(attrs, Backend::CPU);
 
     TensorView w_pl(wsh, DataType::f32, w32v.data()),
@@ -903,6 +931,11 @@ NNOPS_TEST(conv2d_nhwc_wino_prepack_matches_planar) {
     NNOPS_EXPECT_EQ(static_cast<int64_t>(u_cl.layout()),
                     static_cast<int64_t>(TensorLayout::PackedWinoWeightLast));
 
+    // Both blobs here were built with the order pinned to F(2,3), so the panels
+    // hold the same 16 planes as the planar U they compare to, plane for plane —
+    // and without a plane to weigh, the policy takes the safe order too.
+    NNOPS_EXPECT_TRUE(backend::cpu::wino_pick_order(DataType::f32, ICG, OCG) ==
+                      backend::cpu::WinoOrder::F23);
     const auto ug = backend::cpu::wino_channel_last_u(ICG, OCG, G, DataType::f32);
     const float* pl = u_pl_buf.data();   // [p][oc][ic], row stride ICG
     const float* cl = u_cl_buf.data();
@@ -966,6 +999,41 @@ NNOPS_TEST(conv2d_nhwc_wino_plan_and_auto) {
     NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
     NNOPS_EXPECT_EQ(plan.icn_block, ug.kc);
     NNOPS_EXPECT_EQ(plan.num_tiles, int64_t{7 * 7});
+    NNOPS_EXPECT_TRUE(plan.order == backend::cpu::WinoOrder::F23);
+
+    // The order is the U's leading dimension: 36 positions resolves to F(4,3)
+    // and a 4x4 tile grid over the same 14x14 output. The panels are otherwise
+    // the same shape (32 channels, 32 oc), so only the position count differs.
+    {
+        const backend::cpu::WinoChannelLastU ug43 =
+            backend::cpu::wino_channel_last_u(32, 32, 1, DataType::f32,
+                                              backend::cpu::WinoOrder::F43);
+        NNOPS_EXPECT_EQ(ug43.pos, int64_t{36});
+        const int64_t s43[] = {36, ug43.nb, ug43.jbg, ug43.ldd};
+        std::vector<float> b43(static_cast<size_t>(ug43.total), 0.0f);
+        TensorView u43(std::span<const int64_t>(s43, 4), DataType::f32, b43.data(),
+                       ug43.ldd * static_cast<int64_t>(sizeof(float)),
+                       TensorLayout::PackedWinoWeightLast);
+        const TensorDesc ins43[] = {input.desc(), u43.desc()};
+        const auto p43 =
+            backend::cpu::get_conv2d_winograd_plan(attrs, ins43, outs, 1, false);
+        NNOPS_EXPECT_TRUE(p43.workspace_size > 0);
+        NNOPS_EXPECT_TRUE(p43.order == backend::cpu::WinoOrder::F43);
+        NNOPS_EXPECT_EQ(p43.num_tiles, int64_t{4 * 4});   // ceil(14/4) squared
+        NNOPS_EXPECT_EQ(p43.num_tile_rows, int64_t{4});
+        NNOPS_EXPECT_EQ(p43.u.pos, int64_t{36});
+
+        // A leading dimension that is neither order's position count describes
+        // no U this route can index.
+        const int64_t s_bad[] = {20, ug43.nb, ug43.jbg, ug43.ldd};
+        TensorView u_bad(std::span<const int64_t>(s_bad, 4), DataType::f32, b43.data(),
+                         ug43.ldd * static_cast<int64_t>(sizeof(float)),
+                         TensorLayout::PackedWinoWeightLast);
+        const TensorDesc ins_bad[] = {input.desc(), u_bad.desc()};
+        NNOPS_EXPECT_EQ(backend::cpu::get_conv2d_winograd_plan(attrs, ins_bad, outs, 1,
+                                                              false).workspace_size,
+                        0u);
+    }
 
     // A planar U with a channel-last activation has no route.
     const int64_t pu_shape[] = {16, 32, 32};

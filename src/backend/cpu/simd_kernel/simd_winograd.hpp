@@ -241,10 +241,10 @@ inline void winograd_input_nhwc(const T* in_plane, int64_t in_row, int64_t ic_st
     }
 }
 
-/// Transform one tile's 16 M planes into its 2×2 outputs, one channel vector at a time; a nullptr destination skips that pixel (past OW/OH on an odd extent).
+/// Transform one tile's 16 M planes into its 2×2 outputs, one channel vector at a time; a nullptr destination skips that pixel (past OW/OH on an odd extent). @p p is the tile's destination grid, row-major.
 template <class T>
 inline void winograd_output_nhwc(const T* m, int64_t m_plane,
-                                 T* p00, T* p01, T* p10, T* p11,
+                                 T* const p[2][2],
                                  const Epilogue& ep, const T* bias, bool add_to,
                                  int lanes) noexcept {
     // Aᵀ M per column, then (Aᵀ M) A.
@@ -270,15 +270,13 @@ inline void winograd_output_nhwc(const T* m, int64_t m_plane,
         wino_store_lanes(dst, v, lanes);
     };
     for (int r = 0; r < 2; ++r) {
-        if ((r == 0 ? p00 : p10) == nullptr && (r == 0 ? p01 : p11) == nullptr) {
-            continue;
-        }
+        if (p[r][0] == nullptr && p[r][1] == nullptr) { continue; }
         const v_f32x8 t0 = v_load(&t[r][0][0]);
         const v_f32x8 t1 = v_load(&t[r][1][0]);
         const v_f32x8 t2 = v_load(&t[r][2][0]);
         const v_f32x8 t3 = v_load(&t[r][3][0]);
-        emit((r == 0) ? p00 : p10, v_add(v_add(t0, t1), t2));
-        emit((r == 0) ? p01 : p11, v_sub(v_sub(t1, t2), t3));
+        emit(p[r][0], v_add(v_add(t0, t1), t2));
+        emit(p[r][1], v_sub(v_sub(t1, t2), t3));
     }
 }
 

@@ -1,11 +1,12 @@
 /// @file test_conv2d_winograd.cpp
-/// @brief Unit tests for the Winograd F(2×2, 3×3) Conv2D path (k3s1).
+/// @brief Unit tests for the Winograd Conv2D path (k3s1), F(2×2,3×3) and
+///        F(4×4,3×3).
 ///
-/// The three transforms are checked against naive scalar references written
-/// longhand from the F(2,3) definition; then the prepack contract (query
-/// metadata, explicit pitch) and the plan's admission and filter-row split;
-/// then end-to-end Winograd vs conv2d_ref on the *raw* weight, f32 and f16,
-/// plus winograd_applicable's policy and a serial-vs-pooled run.
+/// The transforms are checked against naive scalar references written longhand
+/// from each order's definition; then the prepack contract (query metadata,
+/// explicit pitch) and the plan's admission and filter-row split; then
+/// end-to-end Winograd vs conv2d_ref on the *raw* weight, f32 and f16, plus
+/// winograd_applicable's policy and a serial-vs-pooled run.
 ///
 /// Winograd and direct convolution are algebraically equal but not bit-identical
 /// (the transform reorders the sums and, at f16, adds a rounding step), so every
@@ -15,6 +16,7 @@
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
+#include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -104,6 +106,75 @@ static void naive_gggt(const float g[3][3], float u[4][4]) {
         for (int j = 0; j < 4; ++j) {
             float s = 0.0f;
             for (int k = 0; k < 3; ++k) { s += t[i][k] * G[j][k]; }  // ·Gᵀ
+            u[i][j] = s;
+        }
+    }
+}
+
+// ---- the F(4,3) matrices, restated the same way ---------------------------
+
+static void naive_btdb43(const float d[6][6], float v[6][6]) {
+    static const float Bt[6][6] = {
+        {4, 0, -5, 0, 1, 0}, {0, -4, -4, 1, 1, 0}, {0, 4, -4, -1, 1, 0},
+        {0, -2, -1, 2, 1, 0}, {0, 2, -1, -2, 1, 0}, {0, 4, 0, -5, 0, 1}};
+    float e[6][6];
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j < 6; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 6; ++k) { s += d[i][k] * Bt[j][k]; }  // d·B
+            e[i][j] = s;
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j < 6; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 6; ++k) { s += Bt[i][k] * e[k][j]; }
+            v[i][j] = s;
+        }
+    }
+}
+
+static void naive_atma43(const float m[6][6], float y[4][4]) {
+    static const float At[4][6] = {
+        {1, 1, 1, 1, 1, 0}, {0, 1, -1, 2, -2, 0},
+        {0, 1, 1, 4, 4, 0}, {0, 1, -1, 8, -8, 1}};
+    float t[4][6];
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 6; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 6; ++k) { s += At[i][k] * m[k][j]; }
+            t[i][j] = s;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 6; ++k) { s += t[i][k] * At[j][k]; }
+            y[i][j] = s;
+        }
+    }
+}
+
+static void naive_gggt43(const float g[3][3], float u[6][6]) {
+    static const float G[6][3] = {
+        {1.0f / 4.0f, 0.0f, 0.0f},
+        {-1.0f / 6.0f, -1.0f / 6.0f, -1.0f / 6.0f},
+        {-1.0f / 6.0f, 1.0f / 6.0f, -1.0f / 6.0f},
+        {1.0f / 24.0f, 1.0f / 12.0f, 1.0f / 6.0f},
+        {1.0f / 24.0f, -1.0f / 12.0f, 1.0f / 6.0f},
+        {0.0f, 0.0f, 1.0f}};
+    float t[6][3];
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k) { s += G[i][k] * g[k][j]; }
+            t[i][j] = s;
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j < 6; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k) { s += t[i][k] * G[j][k]; }
             u[i][j] = s;
         }
     }
@@ -243,6 +314,108 @@ NNOPS_TEST(wino_output_transform_applies_bias_and_masks) {
 }
 
 // ============================================================
+// F(4,3) transforms (channel-last route only)
+// ============================================================
+
+NNOPS_TEST(wino43_weight_transform_matches_naive) {
+    // p = i·6 + j, scattered into 36 planes the way prepack stores U.
+    const int plane = 3;
+    const int ld_u = 6 * plane;
+    const int ld_c = plane;
+    test::XorShift128 rng(0x43);
+    for (int trial = 0; trial < 20; ++trial) {
+        float g[3][3];
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) { g[i][j] = rng.next_float(-2.0f, 2.0f); }
+        }
+        std::vector<float> u(36 * plane, -99.0f);
+        nnops::kernel::winograd43_weight_transform(&g[0][0], 3, u.data(), ld_u, ld_c);
+
+        float want[6][6];
+        naive_gggt43(g, want);
+        for (int i = 0; i < 6; ++i) {
+            for (int j = 0; j < 6; ++j) {
+                NNOPS_EXPECT_NEAR(u[(i * 6 + j) * plane], want[i][j], 1e-6f);
+            }
+        }
+    }
+}
+
+NNOPS_TEST(wino43_input_transform_matches_naive) {
+    // A 12x12 NHWC plane holds four 4x4 tiles in a row and three tile rows; the
+    // window of the corner tile reads four rows and columns of zeros.
+    constexpr int IH = 12, IW = 12, IC = 8;
+    constexpr int64_t kVPlane = 8;  // one tile per position
+    std::vector<float> plane(static_cast<size_t>(IH * IW * IC));
+    test::XorShift128 rng(0x4343);
+    for (auto& x : plane) { x = rng.next_float(-3.0f, 3.0f); }
+
+    std::vector<float> v(36 * kVPlane, -99.0f);
+    const int th = 2, tw = 2;  // tile [8..11] x [8..11]: its window ends at 13
+    nnops::kernel::winograd43_input_nhwc<float>(
+        plane.data(), IW * IC, IC, 4 * th, 4 * tw, IH, IW,
+        v.data(), kVPlane, IC);
+
+    for (int k = 0; k < IC; ++k) {
+        float d[6][6];
+        for (int r = 0; r < 6; ++r) {
+            for (int c = 0; c < 6; ++c) {
+                const int h = 4 * th + r, w = 4 * tw + c;
+                d[r][c] = (h < IH && w < IW)
+                        ? plane[static_cast<size_t>((h * IW + w) * IC + k)] : 0.0f;
+            }
+        }
+        float want[6][6];
+        naive_btdb43(d, want);
+        for (int i = 0; i < 6; ++i) {
+            for (int j = 0; j < 6; ++j) {
+                NNOPS_EXPECT_NEAR(v[(i * 6 + j) * kVPlane + k], want[i][j], 1e-3f);
+            }
+        }
+    }
+}
+
+NNOPS_TEST(wino43_output_transform_matches_naive) {
+    // m is [pos][oc] for one tile; the write-back adds the bias and applies the
+    // epilogue on the four real outputs, and a null destination writes nothing.
+    constexpr int kOcn = 8;
+    std::vector<float> m(36 * kOcn);
+    test::XorShift128 rng(0x434343);
+    for (auto& x : m) { x = rng.next_float(-2.0f, 2.0f); }
+    std::vector<float> bias(kOcn);
+    for (auto& b : bias) { b = rng.next_float(-1.0f, 1.0f); }
+
+    std::vector<float> out(16 * kOcn, -7.0f);
+    float* p[4][4];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) { p[r][c] = out.data() + (r * 4 + c) * kOcn; }
+    }
+    p[3][2] = nullptr;  // past the output extent: must stay untouched
+    const Epilogue ep{};
+    nnops::kernel::winograd43_output_nhwc<float>(m.data(), kOcn, p, ep, bias.data(),
+                                                 false, kOcn);
+
+    for (int k = 0; k < kOcn; ++k) {
+        float mm[6][6];
+        for (int i = 0; i < 6; ++i) {
+            for (int j = 0; j < 6; ++j) { mm[i][j] = m[(i * 6 + j) * kOcn + k]; }
+        }
+        float want[4][4];
+        naive_atma43(mm, want);
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                const float got = out[static_cast<size_t>((r * 4 + c) * kOcn + k)];
+                if (p[r][c] == nullptr) {
+                    NNOPS_EXPECT_EQ(got, -7.0f);
+                } else {
+                    NNOPS_EXPECT_NEAR(got, want[r][c] + bias[k], 1e-3f);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
 // Prepack contract
 // ============================================================
 
@@ -276,6 +449,46 @@ NNOPS_TEST(wino_prepack_query) {
     // Explicit pitch — the packed weight is *not* channel-packed, so the
     // default 32 B row alignment would not be IC/G × elem_size.
     NNOPS_EXPECT_EQ(packed.pitch(), 3 * static_cast<int64_t>(sizeof(float)));
+}
+
+NNOPS_TEST(wino_prepack_order_bakes_the_opt_in) {
+    // The planar route never picks F(4,3) by itself (wino_pick_order: it is a
+    // single-thread win and a threaded loss, and no caller-visible quantity
+    // separates the two), so the plane hint changes nothing here and the wider
+    // transform is only reachable through winograd_order. What the query does
+    // prove is that the order is baked into U at prepack and read back off the
+    // blob — 36 positions for the pinned order, 16 otherwise.
+    const int64_t wshape[] = {64, 64, 3, 3};
+    std::vector<float> w_buf(64 * 64 * 9, 0.25f);
+    TensorView weight(wshape, DataType::f32, w_buf.data());
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    attrs.algorithm = ConvAlgorithm::Winograd;
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    const auto query = [&](int64_t h, int64_t w, bool hint) {
+        std::vector<float> x_buf(static_cast<size_t>(64 * h * w), 0.0f);
+        const int64_t xshape[] = {1, 64, h, w};
+        TensorView x(xshape, DataType::f32, x_buf.data());
+        TensorView empty;
+        const TensorView in[] = {weight, x};
+        TensorView out[] = {empty};
+        const std::span<const TensorView> ins =
+            hint ? std::span<const TensorView>(in, 2)
+                 : std::span<const TensorView>(in, 1);
+        op->prepackWeights(ins, out);
+        return out[0].shape(0);
+    };
+
+    NNOPS_EXPECT_EQ(query(56, 56, true), int64_t{16});
+    NNOPS_EXPECT_EQ(query(56, 56, false), int64_t{16});
+
+    attrs.winograd_order = 4;
+    op = Conv2D::create(attrs, Backend::CPU);
+    NNOPS_EXPECT_EQ(query(14, 14, true), int64_t{36});
 }
 
 NNOPS_TEST(wino_plan_gates_on_geometry) {
@@ -348,14 +561,17 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
         return nnops::backend::cpu::get_conv2d_winograd_plan(attrs, ins, outs, nt, true);
     };
 
-    // TH 7 · one tile block = 7 plane tasks. Rounding, not ceiling: 16 threads
-    // want 2 chunks (14 tasks, one wave), and 3 would run a straggler.
+    // TH 7 in tile rows of 8 columns, and a task takes two tile rows: 16 tiles
+    // exactly fills an f32 MMA panel, where one row leaves half of it empty. So
+    // the plane is 4 tasks, not 7. Rounding, not ceiling, on the chunk count: 16
+    // threads want 4 chunks (16 tasks, one wave), and 5 would run a straggler.
     struct Row { int nt; int64_t chunks; };
-    for (const Row& r : {Row{1, 1}, Row{4, 1}, Row{8, 1}, Row{12, 2},
-                         Row{14, 2}, Row{16, 2}, Row{20, 3}, Row{28, 4}}) {
+    for (const Row& r : {Row{1, 1}, Row{4, 1}, Row{8, 2}, Row{12, 3},
+                         Row{14, 4}, Row{16, 4}, Row{20, 5}, Row{28, 7}}) {
         const auto p = plan(r.nt);
+        NNOPS_EXPECT_EQ(p.tile_rows, int64_t{2});
         NNOPS_EXPECT_EQ(p.oc_chunks, r.chunks);
-        NNOPS_EXPECT_EQ(p.num_tasks, 7 * r.chunks);
+        NNOPS_EXPECT_EQ(p.num_tasks, 4 * r.chunks);
         NNOPS_EXPECT_EQ(p.num_slots, std::min<int64_t>(r.nt, p.num_tasks));
         // Every task keeps at least two M-panels (6 rows each on x86_64 f32).
         NNOPS_EXPECT_TRUE(256 / p.oc_chunks >= 2 * 6);
@@ -377,11 +593,12 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
     const TensorDesc outs56[] = {out_v.desc()};
     const auto wide = nnops::backend::cpu::get_conv2d_winograd_plan(
         attrs, ins56, outs56, 20, true);
+    NNOPS_EXPECT_EQ(wide.tile_rows, int64_t{1});
     NNOPS_EXPECT_EQ(wide.oc_chunks, int64_t{1});
     NNOPS_EXPECT_EQ(wide.num_tasks, int64_t{56});
 
     // And the floor stops it: 16 filter rows cannot be cut into two 12-row
-    // tasks, so the starved 7-task grid stays as it is.
+    // tasks, so the starved 4-task grid stays as it is.
     std::vector<float> in16(16 * 14 * 14, 0.0f);
     std::vector<float> out16(16 * 14 * 14, 0.0f);
     std::vector<float> u16(16 * 16 * 16, 0.0f);
@@ -398,7 +615,7 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
     const auto narrow = nnops::backend::cpu::get_conv2d_winograd_plan(
         attrs, ins16, outs16, 20, true);
     NNOPS_EXPECT_EQ(narrow.oc_chunks, int64_t{1});
-    NNOPS_EXPECT_EQ(narrow.num_tasks, int64_t{7});
+    NNOPS_EXPECT_EQ(narrow.num_tasks, int64_t{4});
 }
 
 // ============================================================
@@ -598,6 +815,17 @@ NNOPS_TEST(wino_matches_ref_wide) {
     attrs.stride = {1, 1};
     attrs.padding = {1, 1};
     wino_vs_ref_f32({1, 16, 14, 18}, {20, 16, 3, 3}, attrs, /*has_bias=*/true);
+}
+
+NNOPS_TEST(wino_matches_ref_wide_two_blocks) {
+    // 14x58 output: 29 tile columns pad to 32, so a single-row task owns one
+    // 16-wide block of two and must transform nc tiles, not TW_pad — reading a
+    // whole padded row out of a halo strip that only holds its own block.
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    wino_vs_ref_f32({1, 16, 14, 58}, {20, 16, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(wino_matches_ref_groups) {
@@ -823,4 +1051,131 @@ NNOPS_TEST(wino_f16_matches_ref) {
                             std::abs(got[static_cast<size_t>(i)] - ref2[static_cast<size_t>(i)]));
     }
     NNOPS_EXPECT_TRUE(max_diff < test::kF16AccumTol);
+}
+
+// ---- F(4,3) on the planar route ------------------------------------------
+
+NNOPS_TEST(wino43_planar_matches_ref) {
+    // The order follows the filter's channel count, so 64 channels is what asks
+    // for F(4,3) — 36 positions per tile, 4x4 outputs. The tolerance is the
+    // channel-last route's, for the same reason: Bᵀ scales a window by 5 and
+    // Aᵀ by 8, so an f32 round is wider than F(2,3)'s even in f32.
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+    // Odd extents: the last tile row and column are short on both axes.
+    wino_vs_ref_f32({1, 64, 15, 17}, {64, 64, 3, 3}, attrs, /*has_bias=*/true,
+                    0.0f, nullptr, 1e-4f, 1e-3f);
+
+    Conv2DAttributes pad0 = attrs;
+    pad0.padding = {0, 0};
+    wino_vs_ref_f32({2, 64, 16, 16}, {128, 64, 3, 3}, pad0, /*has_bias=*/false,
+                    0.0f, nullptr, 1e-4f, 1e-3f);
+
+    // Two k passes: 512 channels against the planar k-block, tiles past one
+    // 8-wide group on both axes.
+    wino_vs_ref_f32({1, 512, 9, 9}, {512, 512, 3, 3}, attrs, /*has_bias=*/false,
+                    0.0f, nullptr, 1e-4f, 1e-3f);
+}
+
+NNOPS_TEST(wino43_planar_reads_the_order_off_the_u) {
+    // Both end-to-end routes take the transform order from the U's leading
+    // dimension — 16 positions is F(2,3), 36 is F(4,3) — and tile the output
+    // accordingly. Anything else is not a U this plan can index.
+    const int64_t ishape[] = {1, 64, 16, 16};
+    const int64_t oshape[] = {1, 64, 16, 16};
+    std::vector<float> in_buf(64 * 16 * 16, 0.0f);
+    std::vector<float> out_buf(64 * 16 * 16, 0.0f);
+    TensorView input(ishape, DataType::f32, in_buf.data());
+    TensorView output(oshape, DataType::f32, out_buf.data());
+    const TensorDesc outs[] = {output.desc()};
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride = {1, 1};
+    attrs.padding = {1, 1};
+
+    const int64_t pitch = 64 * static_cast<int64_t>(sizeof(float));
+    for (const int64_t pos : {int64_t{16}, int64_t{36}}) {
+        const int64_t ushape[] = {pos, 64, 64};
+        std::vector<float> u_buf(static_cast<size_t>(pos * 64 * 64), 0.0f);
+        TensorView u(ushape, DataType::f32, u_buf.data(), pitch,
+                     TensorLayout::PackedWinoWeight);
+        const TensorDesc ins[] = {input.desc(), u.desc()};
+
+        const auto plan = nnops::backend::cpu::get_conv2d_winograd_plan(
+            attrs, ins, outs, 1, false);
+        const auto order = (pos == 36) ? nnops::backend::cpu::WinoOrder::F43
+                                       : nnops::backend::cpu::WinoOrder::F23;
+        NNOPS_EXPECT_EQ(plan.order, order);
+        NNOPS_EXPECT_EQ(plan.num_tile_rows, pos == 36 ? 4 : 8);   // ceil(16 / tile)
+        NNOPS_EXPECT_EQ(plan.num_tile_cols, pos == 36 ? 4 : 8);
+        NNOPS_EXPECT_TRUE(plan.workspace_size > 0);
+    }
+
+    // A leading dimension that is neither: no route can index it.
+    const int64_t bad_shape[] = {20, 64, 64};
+    std::vector<float> bad_buf(20 * 64 * 64, 0.0f);
+    TensorView bad(bad_shape, DataType::f32, bad_buf.data(), pitch,
+                   TensorLayout::PackedWinoWeight);
+    const TensorDesc bad_ins[] = {input.desc(), bad.desc()};
+    NNOPS_EXPECT_EQ(nnops::backend::cpu::get_conv2d_winograd_plan(
+                        attrs, bad_ins, outs, 1, false).workspace_size, 0u);
+}
+
+NNOPS_TEST(wino_pick_order_fences) {
+    using nnops::backend::cpu::WinoOrder;
+    using nnops::backend::cpu::wino_pick_order;
+    constexpr bool cl = true;    // channel-last
+    constexpr bool pl = false;   // planar
+    // f16 keeps F(2,3) at every width and plane, on both routes.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, cl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, pl) ==
+                      WinoOrder::F23);
+    // Planar takes F(4,3) only where its own tile grid fills a pool: 112x112 is
+    // 56 tasks, a 56x56 plane 14 and a 28x28 plane 4, and the oc-chunk axis
+    // that would split those rebuilds the halo strip per chunk.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, pl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, pl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 111, 200, pl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 112, 112, pl) ==
+                      WinoOrder::F43);
+    // ... and under the same channel floor and U fence as the channel-last one:
+    // 32 channels per group never pays for the 4.5x transform, and a 512x512
+    // filter is 37.7 MB of U.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 32, 32, 224, 224, pl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 224, 224, pl) ==
+                      WinoOrder::F23);
+    // Channel-last: F(4,3) from a 28x28 plane up ...
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, cl) ==
+                      WinoOrder::F43);
+    // ... but not below it: a 27-row plane is the same handful of tiles as 14.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 27, 56, cl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 14, 14, cl) ==
+                      WinoOrder::F23);
+    // An unknown plane takes the safe order.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 0, 0, cl) ==
+                      WinoOrder::F23);
+    // The U fence: 36 positions x IC x OC x 4 B under 16 MB. 512x512 is 37.7 MB
+    // and loses on both routes; 256x256 is 9.4 MB and wins.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 56, 56, cl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 512, 28, 28, cl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 28, 28, cl) ==
+                      WinoOrder::F43);
+    // 18.9 MB is over the line, 9.4 MB is under it.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 256, 28, 28, cl) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 128, 28, 28, cl) ==
+                      WinoOrder::F43);
 }

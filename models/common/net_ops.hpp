@@ -277,22 +277,40 @@ inline const TensorView& hwcm_weight(const TensorView& w)
 /// HWIO the channel-last panels, so a channel-last caller passes the HWIO view
 /// (a distinct buffer, hence a distinct cache entry).
 inline const TensorView& winograd_weight(const TensorView& w,
+                                         const TensorView& x,
                                          const nnops::Conv2DAttributes& attrs)
 {
-    static std::map<const void*, detail::WeightCopy> cache;
-    if (const TensorView* hit = detail::find_copy(cache, w)) { return *hit; }
+    // Keyed by the weight *and* the plane: the transform order is baked into U,
+    // and the plane is what picks it, so one filter run at two resolutions is
+    // two blobs.
+    const int64_t plane = x.shape(1) * 100000 + x.shape(2);
+    static std::map<std::pair<const void*, int64_t>, detail::WeightCopy> cache;
+    const auto key = std::make_pair(static_cast<const void*>(w.ptr<float>()), plane);
+    const auto hit = cache.find(key);
+    if (hit != cache.end() &&
+        static_cast<int64_t>(hit->second.shape.size()) == w.rank()) {
+        bool same = true;
+        for (int64_t d = 0; same && d < w.rank(); ++d) {
+            same = hit->second.shape[static_cast<size_t>(d)] == w.shape(d);
+        }
+        if (same) { return hit->second.buf.view; }
+    }
 
-    // Two-step prepack: query the U descriptor, allocate it, fill it.
+    // Two-step prepack: query the U descriptor, allocate it, fill it. The
+    // activation rides along so the order can weigh the plane it will run on.
     auto op = nnops::Conv2D::create(attrs, Backend::CPU);
     TensorView query;
-    const TensorView in[] = {w};
+    const TensorView in[] = {w, x};
     TensorView q[] = {query};
     op->prepackWeights(in, q);
     Buf u = alloc(q[0].desc());
     TensorView pack[] = {u.view};
     op->prepackWeights(in, pack);
 
-    return detail::store_copy(cache, w, std::move(u));
+    detail::WeightCopy& slot = cache[key];
+    slot.shape.assign(w.shape(), w.shape() + w.rank());
+    slot.buf = std::move(u);
+    return slot.buf.view;
 }
 
 /// Whether the runners prepack their filters — always on, except for the A/B
@@ -306,6 +324,19 @@ inline bool prepack_enabled()
                (std::strcmp(s, "0") != 0 && std::strcmp(s, "false") != 0);
     }();
     return on;
+}
+
+/// A pinned Winograd transform order (2 = F(2,3), 4 = F(4,3)), or 0 for the
+/// policy's own choice — the A/B arm that prices the two on a whole model.
+inline int64_t winograd_order_override()
+{
+    static const int64_t order = []() -> int64_t {
+        const char* s = std::getenv("NNOPS_MODEL_WINO_ORDER");
+        if (s == nullptr) { return 0; }
+        const long v = std::strtol(s, nullptr, 10);
+        return (v == 2 || v == 4) ? v : 0;
+    }();
+    return order;
 }
 
 /// The im2col route's prepacked filter (PackedOIHW / PackedHWIO), made once per
@@ -359,12 +390,15 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     if (residual != nullptr) { use.add_to = true; }
     const bool wino = nnops::winograd_applicable(
         use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
+    if (wino && winograd_order_override() != 0) {
+        use.winograd_order = winograd_order_override();
+    }
     // The route is in the row name, so the profile can price the two against
     // each other just by reading the table. A fused caller renames the rows, so
     // a folded conv and a plain one do not share a line.
     ProfScope prof(wino ? wino_row : gemm_row);
     auto op = nnops::Conv2D::create(use, Backend::CPU);
-    const TensorView u = wino ? winograd_weight(wl, use)
+    const TensorView u = wino ? winograd_weight(wl, x, use)
                               : (prepack_enabled() ? packed_weight(wl, use) : wl);
 
     TensorDesc in_desc[3] = {x.desc(), wl.desc()};

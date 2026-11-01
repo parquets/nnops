@@ -15,13 +15,14 @@
 /// (the raw accumulate, added before the activation, never scaled) on s8/u8.
 ///
 /// Algorithms: ImplicitGemm is the general tiled im2col + GEMM path and handles
-/// any geometry. Winograd is the F(2x2, 3x3) fast path, valid only for k3s1
-/// (dilation 1) and only when compute() is handed the transform-domain U from
-/// prepackWeights, not the raw filter. Auto follows the weight it is handed
-/// (U → Winograd, raw filter → im2col), so a caller that predates the enum needs
-/// no attribute; the prepack stays the caller's decision because it allocates U.
-/// Shape inference is unaffected: getOutputTensorDesc reads the raw filter, so
-/// the caller passes the raw weight there and U only to compute().
+/// any geometry. Winograd is the F(2x2, 3x3) or F(4x4, 3x3) fast path, valid
+/// only for k3s1 (dilation 1) and only when compute() is handed the
+/// transform-domain U from prepackWeights, not the raw filter. Auto follows the
+/// weight it is handed (U → Winograd, raw filter → im2col), so a caller that
+/// predates the enum needs no attribute; the prepack stays the caller's decision
+/// because it allocates U. Shape inference is unaffected: getOutputTensorDesc
+/// reads the raw filter, so the caller passes the raw weight there and U only to
+/// compute().
 ///
 /// winograd_applicable() is what a caller checks before prepacking. It requires
 /// algorithm != ImplicitGemm (the off switch), k3s1, at least 32 input channels
@@ -111,6 +112,16 @@ struct Conv2DAttributes {
     DataType act_quant_dtype = DataType::s8;
 
     ConvAlgorithm algorithm = ConvAlgorithm::Auto;
+
+    /// Winograd transform order as the output tile side: 2 pins F(2,3), 4 pins
+    /// F(4,3), 0 (the default) lets wino_pick_order() choose — for the
+    /// channel-last route that is F(4,3) from a 28x28 plane up and, on the
+    /// planar route, from 112x112 — both subject to the U still fitting the
+    /// last-level cache (see wino_pick_order). Pin 4 to take it anywhere. Any
+    /// other value is refused at prepack. It only selects which U
+    /// prepackWeights() builds; compute() reads the order back off the blob, so
+    /// the two cannot disagree.
+    int64_t winograd_order = 0;
 };
 
 /// Policy a caller checks before prepackWeights(); see the file header.

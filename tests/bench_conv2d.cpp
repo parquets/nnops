@@ -90,6 +90,8 @@
 #include "nnops/ops/layout_convert.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
 #include "backend/cpu/conv/conv2d_winograd.h" // get_conv2d_winograd_plan
+#include "backend/cpu/simd_kernel/simd_winograd.hpp"   // the weight transforms
+#include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -455,8 +457,12 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
         const int max_nt = threads.empty() ? 1 : *std::max_element(threads.begin(),
                                                                   threads.end());
         const auto wp = cpu::get_conv2d_winograd_plan(base, wd, wo_arr, max_nt, true);
-        std::printf("    wino: tiles=%lldx%lld(pad %lld) icn=%lld ocn=%lld tile_blk=%lld"
+        std::printf("    wino: %s (%lld pos, %lldx%lld window) tiles=%lldx%lld(pad %lld)"
+                    " icn=%lld ocn=%lld tile_blk=%lld"
                     " occ=%lld tasks=%lld x %lld slots, slot=%lld el, ws=%zuB\n",
+                    wp.order == cpu::WinoOrder::F43 ? "F(4,3)" : "F(2,3)",
+                    (long long)cpu::wino_pos(wp.order), (long long)cpu::wino_alpha(wp.order),
+                    (long long)cpu::wino_alpha(wp.order),
                     (long long)wp.num_tile_rows, (long long)wp.num_tile_cols,
                     (long long)wp.num_tile_cols_pad, (long long)wp.icn_block,
                     (long long)wp.ocn_block, (long long)wp.tile_block,
@@ -511,6 +517,138 @@ void bench_wino_case(const WinoCase& c) {
     const std::vector<int> threads = conv_bench_threads();
     if (c.f16) { run_wino_ab<half>(c, threads, iters, rounds); }
     else       { run_wino_ab<float>(c, threads, iters, rounds); }
+}
+
+// ============================================================
+// Winograd F(2,3) vs F(4,3) on one shape
+// ============================================================
+//
+// Prepack picks an order from the filter's channel count, so this bench builds
+// both U's by hand and runs the *same* op over each: everything but the U is
+// identical, which is what makes the ratio mean something. The rate columns are
+// each row's own transform-domain product count — 16 positions over 2x2 tiles,
+// 36 over 4x4 — so they are not comparable across the two arms either; the wall
+// time is.
+
+/// Build the planar U for an explicit transform order: [pos][OC][IC/G], pitched
+/// at ICG, plane step wino_alpha (p = i·α + j).
+template <typename T>
+TensorView build_planar_u(const TensorView& weight, int64_t OC, int64_t ICG,
+                          cpu::WinoOrder order, std::vector<T>& buf) {
+    const int64_t plane = OC * ICG;
+    const int64_t pos   = cpu::wino_pos(order);
+    const int64_t ld_u  = cpu::wino_alpha(order) * plane;
+    buf.assign(static_cast<size_t>(pos * plane), T{});
+    const T* g = weight.ptr<T>();
+    for (int64_t oc = 0; oc < OC; ++oc) {
+        for (int64_t ic = 0; ic < ICG; ++ic) {
+            T* dst = buf.data() + oc * ICG + ic;
+            if (order == cpu::WinoOrder::F23) {
+                nnops::kernel::winograd_weight_transform<T>(
+                    g + (oc * ICG + ic) * 9, 3, dst, static_cast<int>(ld_u),
+                    static_cast<int>(plane));
+            } else {
+                nnops::kernel::winograd43_weight_transform<T>(
+                    g + (oc * ICG + ic) * 9, 3, dst, static_cast<int>(ld_u),
+                    static_cast<int>(plane));
+            }
+        }
+    }
+    const int64_t ushape[] = {pos, OC, ICG};
+    return TensorView(ushape, weight.data_type(), buf.data(),
+                      ICG * static_cast<int64_t>(sizeof(T)),
+                      TensorLayout::PackedWinoWeight);
+}
+
+struct WinoOrderCase {
+    const char* name;
+    int64_t N, IC, IH, IW, OC;
+    int64_t PH = 1, PW = 1;
+};
+
+template <typename T>
+void run_wino_order_ab(const WinoOrderCase& c, const std::vector<int>& threads,
+                       int iters, int rounds) {
+    const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
+    const int64_t wshape[] = {c.OC, c.IC, 3, 3};
+
+    auto [in_vec, input] = make_random<T>(ishape, 21);
+    auto [w_vec, weight] = make_random<T>(wshape, 22);
+
+    Conv2DAttributes attrs{};
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.padding     = {c.PH, c.PW};
+    attrs.algorithm   = ConvAlgorithm::Winograd;
+    auto op = Conv2D::create(attrs, Backend::CPU);
+
+    const TensorDesc d0[] = {input.desc(), weight.desc()};
+    const auto od = op->getOutputTensorDesc(d0);
+    const int64_t OH = od[0].dims[2], OW = od[0].dims[3];
+    std::vector<T> out_buf(static_cast<size_t>(od[0].numel()), T{});
+    auto output = test::make_planar(od[0], out_buf.data());
+
+    std::vector<T> u23_buf, u43_buf;
+    const TensorView u23 = build_planar_u<T>(weight, c.OC, c.IC, cpu::WinoOrder::F23, u23_buf);
+    const TensorView u43 = build_planar_u<T>(weight, c.OC, c.IC, cpu::WinoOrder::F43, u43_buf);
+
+    const auto gflops_of = [&](cpu::WinoOrder o) -> double {
+        const int64_t tile = cpu::wino_tile(o);
+        const double ntiles = static_cast<double>(((OH + tile - 1) / tile) *
+                                                  ((OW + tile - 1) / tile));
+        return 2.0 * static_cast<double>(c.N) * c.OC * ntiles * c.IC *
+               static_cast<double>(cpu::wino_pos(o));
+    };
+
+    std::printf("  %s\n", c.name);
+    std::printf("    in[%lld,%lld,%lld,%lld]  w[%lld,%lld,3x3]  -> out[%lld,%lld,%lld,%lld]  %s\n",
+                (long long)c.N, (long long)c.IC, (long long)c.IH, (long long)c.IW,
+                (long long)c.OC, (long long)c.IC, (long long)c.N, (long long)c.OC,
+                (long long)OH, (long long)OW, sizeof(T) == 2 ? "f16" : "f32");
+
+    for (int nt : threads) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        const std::vector<TensorView> ins23 = {input, u23};
+        const std::vector<TensorView> ins43 = {input, u43};
+        auto run23 = [&]() { op->compute(output, ins23, use_ctx, nullptr); };
+        auto run43 = [&]() { op->compute(output, ins43, use_ctx, nullptr); };
+
+        run23(); run43(); run23(); run43();   // warm-up / page faults
+
+        std::vector<double> a_ms, b_ms, null_pct;
+        for (int r = 0; r < rounds; ++r) {
+            const double a1 = time_ms(run23, iters);
+            const double b1 = time_ms(run43, iters);
+            const double a2 = time_ms(run23, iters);   // null control
+            const double b2 = time_ms(run43, iters);
+            const double a = std::min(a1, a2), b = std::min(b1, b2);
+            a_ms.push_back(a);
+            b_ms.push_back(b);
+            null_pct.push_back(std::abs(a2 - a1) / std::min(a1, a2) * 100.0);
+        }
+        const double a = median_of(a_ms), b = median_of(b_ms);
+        const double nf = median_of(null_pct);
+        // Time ratio F(4,3)/F(2,3), the same convention as the im2col columns
+        // above and as bench_conv2d_nhwc's order table: below 1 is a win.
+        const double ratio = b / a;
+        const bool real = std::abs(a - b) / a * 100.0 > nf;
+
+        std::printf("    %2dT  F(2,3) %7.3f ms (%7.1f GFLOPS) | F(4,3) %7.3f ms (%7.1f GFLOPS)"
+                    " | F43/F23 %.2fx%s | null %.1f%%\n",
+                    nt, a, gflops_of(cpu::WinoOrder::F23) / a / 1e6,
+                    b, gflops_of(cpu::WinoOrder::F43) / b / 1e6,
+                    ratio, real ? "" : " (within noise)", nf);
+    }
+}
+
+void bench_wino_order_case(const WinoOrderCase& c) {
+    const int iters = 20, rounds = 5;
+    const std::vector<int> threads = conv_bench_threads();
+    run_wino_order_ab<float>(c, threads, iters, rounds);
 }
 
 // ============================================================
@@ -1221,6 +1359,52 @@ NNOPS_BENCH(conv2d_wino_f16_64ch) {
 NNOPS_BENCH(conv2d_wino_f16_256ch) {
     bench_wino_case({"f16 wino 1x256x28x28 -> 256 x 3x3 s1 p1", 1, 256, 28, 28, 256,
                      /*PH=*/1, /*PW=*/1, /*bias=*/false, /*f16=*/true});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_224x224_64) {
+    bench_wino_order_case({"wino order 1x64x224x224 -> 64", 1, 64, 224, 224, 64});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_112x112_64) {
+    bench_wino_order_case({"wino order 1x64x112x112 -> 64", 1, 64, 112, 112, 64});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_56x56_256) {
+    bench_wino_order_case({"wino order 1x256x56x56 -> 256", 1, 256, 56, 56, 256});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_28x28_512) {
+    bench_wino_order_case({"wino order 1x512x28x28 -> 512", 1, 512, 28, 28, 512});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_14x14_256) {
+    bench_wino_order_case({"wino order 1x256x14x14 -> 256", 1, 256, 14, 14, 256});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_28x28_64) {
+    bench_wino_order_case({"wino order 1x64x28x28 -> 64", 1, 64, 28, 28, 64});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_28x28_256) {
+    bench_wino_order_case({"wino order 1x256x28x28 -> 256", 1, 256, 28, 28, 256});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_56x56_512) {
+    bench_wino_order_case({"wino order 1x512x56x56 -> 512", 1, 512, 56, 56, 512});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_14x14_64) {
+    bench_wino_order_case({"wino order 1x64x14x14 -> 64", 1, 64, 14, 14, 64});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_14x14_512) {
+    bench_wino_order_case({"wino order 1x512x14x14 -> 512", 1, 512, 14, 14, 512});
+}
+
+NNOPS_BENCH(conv2d_wino_f32_order_ab_7x7_512) {
+    // The starved end: four 4x4 tiles against sixteen 2x2 ones, so the U's extra
+    // 2.25x is re-read with almost no tile count to amortize it.
+    bench_wino_order_case({"wino order 1x512x7x7 -> 512", 1, 512, 7, 7, 512});
 }
 
 NNOPS_BENCH(conv2d_f32_kernel_sweep) {

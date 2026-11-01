@@ -1,32 +1,40 @@
 #pragma once
 /// @file conv2d_winograd.h
-/// @brief Winograd F(2×2, 3×3) Conv2D — the k3s1 fast path, both layouts (f32/f16).
+/// @brief Winograd Conv2D — the k3s1 fast path, both layouts, two tile sizes.
 ///
-/// F(2,3) replaces the 3×3 convolution with 16 batched GEMMs in the transform
-/// domain: for each transform position p ∈ [0,16),
+/// Winograd replaces the 3×3 convolution with `pos` batched GEMMs in the
+/// transform domain: for each transform position p,
 ///
 ///     M_p[oc][t] = Σ_ic U_p[oc][ic] · V_p[ic][t]        t = tile index
 ///
-/// where U is the prepacked weight (G g Gᵀ, one 4×4 kernel per position) and V
-/// the transformed input (Bᵀ d B, one 4×4 window per 2×2 output tile). Every one
-/// of those GEMMs runs through tile_mma_direct — raw A, packed B — the same
-/// route MatMul uses.
+/// where U is the prepacked weight (G g Gᵀ) and V the transformed input
+/// (Bᵀ d B). Every one of those GEMMs runs through tile_mma_direct — raw A,
+/// packed B — the same route MatMul uses.
 ///
-/// The algebra is the same for both layouts and only the tuple swaps, exactly as
-/// Conv2D's implicit-GEMM routes swap it:
+/// Two orders, told apart by the U's leading dimension because they are not
+/// interchangeable (WinoOrder):
+///   * F(2×2, 3×3) — 16 positions, a 4×4 window per 2×2 output tile. 2.25x the
+///     multiplies of a direct 3×3, and the default on both routes.
+///   * F(4×4, 3×3) — 36 positions, a 6×6 window per 4×4 output tile. 4x the
+///     multiplies of a direct 3×3 (1.78x better than F(2,3)) but ~4.5x the
+///     transform work per tile and 2.25x the U to stream. wino_pick_order()
+///     decides; see there.
+///
+/// The algebra is the same for both layouts and both orders, and only the tuple
+/// swaps, exactly as Conv2D's implicit-GEMM routes swap it:
 ///   * planar (NCHW) — M = oc, N = tiles (the tile count padded to a multiple of
-///     8), K = ic; A = U [16][OC][IC/G] (PackedWinoWeight) as it lies, B = V
+///     8), K = ic; A = U [pos][OC][IC/G] (PackedWinoWeight) as it lies, B = V
 ///     [ic][tiles] packed per call.
 ///   * channel-last (NHWC) — M = tiles, N = oc block, K = ic; A = V [tiles][ic],
 ///     the tile-major, channel-contiguous layout the gather-free transform gives
 ///     for free, and B = the U panels prepacked once at load
-///     ([16][nb][G·jb][ldd], PackedWinoWeightLast). The output transform then
+///     ([pos][nb][G·jb][ldd], PackedWinoWeightLast). The output transform then
 ///     reads whole channel vectors instead of striding down a column.
 ///
 /// Structure: ONE dispatch over (batch, group, tile row, tile block, oc-chunk) —
 /// the channel-last grid flattens the tile rows into tile blocks. Each task
 /// transforms its tiles into V (the planar route from a halo strip it builds),
-/// runs the 16 GEMMs for its slice of the filter, and writes those tiles back.
+/// runs the pos GEMMs for its slice of the filter, and writes those tiles back.
 /// Tile rows, blocks and oc ranges are disjoint, so no task reads another's
 /// scratch and the phases need no barrier between them.
 ///
@@ -57,21 +65,21 @@
 ///     Aᵀ(·)A would distort a folded bias. M starts at zero (zero_mode on the
 ///     first k-block), then bias[oc] is added per output element during
 ///     write-back.
-///   * the epilogue runs after the output transform, on the real 2×2 outputs,
+///   * the epilogue runs after the output transform, on the real tile outputs,
 ///     and every accumulating GEMM clamps at ±inf with zero_mode=false.
 ///   * add_to needs no orig scratch: every output element is written exactly
 ///     once, so the residual reads the pre-existing output in place.
 ///
 /// This kernel must never fall back to the reference conv2d: U is not an OIHW
-/// filter (planar's is rank-3 with dims[0] == 16), so the reference would read it
-/// as a weight of 16 output channels and silently compute garbage. A dtype
-/// mismatch is a hard assert.
+/// filter (planar's is rank-3 with dims[0] == 16 or 36), so the reference would
+/// read it as a weight of that many output channels and silently compute
+/// garbage. A dtype mismatch is a hard assert.
 ///
 /// Winograd is NOT always faster, and this kernel makes no attempt to hide that:
 /// the transforms cost a fixed amount per tile per channel, so with few channels
-/// the 2.25x multiply saving never pays for them. Measured on this tree
+/// the multiply saving never pays for them. Measured on this tree
 /// (bench_conv2d, interleaved A/B against im2col with a null control, median
-/// over rounds): planar f32 is ahead from 32 channels up — ~1.2x at 32,
+/// over rounds): planar F(2,3) f32 is ahead from 32 channels up — ~1.2x at 32,
 /// ~1.3-1.45x at 64 and ~1.55-1.6x at 256 — and a wash at 8; f16 reaches
 /// ~1.35x at 64 and ~1.6-1.7x at 256. So whether a conv is worth transforming
 /// is the caller's decision, taken once when it prepacks —
@@ -107,6 +115,21 @@ enum class Conv2DWinogradRoute : uint8_t {
     ChannelLast,  ///< activation stored NHWC, U as B panels [16][nb][G·jb][ldd]
 };
 
+/// Which transform order the U was built with — F(2×2,3×3) or F(4×4,3×3). The
+/// two are not interchangeable, so the U's leading dimension has to say which:
+/// 16 positions or 36. Prepack picks one; compute reads it back off the blob.
+enum class WinoOrder : uint8_t {
+    F23,  ///< 16 positions, a 4×4 window per 2×2 output tile
+    F43,  ///< 36 positions, a 6×6 window per 4×4 output tile
+};
+
+constexpr int64_t wino_pos(WinoOrder o) noexcept { return o == WinoOrder::F43 ? 36 : 16; }
+/// Output pixels per side of one tile: 4 on F(4,3), 2 on F(2,3).
+constexpr int64_t wino_tile(WinoOrder o) noexcept { return o == WinoOrder::F43 ? 4 : 2; }
+/// Input window per side: one tile plus the two kernel taps. This — not
+/// wino_tile — is the plane step of a planar U, since p = i·α + j.
+constexpr int64_t wino_alpha(WinoOrder o) noexcept { return wino_tile(o) + 2; }
+
 /// Geometry of the channel-last U (TensorLayout::PackedWinoWeightLast).
 ///
 /// Resolved by the same function at prepack time and inside the kernel, so the
@@ -115,6 +138,8 @@ enum class Conv2DWinogradRoute : uint8_t {
 /// output channels run zero-padded to whole panels, so a partial panel's dead
 /// columns are computed and dropped.
 struct WinoChannelLastU {
+    WinoOrder order = WinoOrder::F23;  ///< which transform produced these panels
+    int64_t pos = 0;    ///< transform positions = wino_pos(order)
     int64_t nr = 0;     ///< panel width: the arch's nr_max for the dtype
     int64_t kc = 0;     ///< k-block length: the largest divisor of IC/G that is
                         ///< <= 128 (f16) or 256 (f32)
@@ -123,23 +148,47 @@ struct WinoChannelLastU {
     int64_t jbg = 0;    ///< oc panels over all groups = groups · jb
     int64_t ldd = 0;    ///< elements per panel (kc·nr, padded to the pack align)
     int64_t plane = 0;  ///< elements per transform position = nb · jbg · ldd
-    int64_t total = 0;  ///< 16 · plane — the whole U
+    int64_t total = 0;  ///< pos · plane — the whole U
 };
 
-/// Resolve the channel-last U geometry for a dtype (see WinoChannelLastU).
+/// Resolve the channel-last U geometry for a dtype and transform order (see
+/// WinoChannelLastU).
 WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group,
-                                     int64_t groups, DataType dt) noexcept;
+                                     int64_t groups, DataType dt,
+                                     WinoOrder order = WinoOrder::F23) noexcept;
+
+/// Which order a prepack should build, for both routes. The trade is F(4,3)'s
+/// 1.78x fewer multiplies per output against ~4.5x the transform work per tile,
+/// which the channel count amortizes; on the planar route the transform's fixed
+/// cost is a halo strip and parallel-fill cost the plane then has to amortize in
+/// turn, while the channel-last route reads its windows in place.
+///
+/// The channel-last route therefore takes F(4,3) from a 28x28 plane up, and the
+/// planar route from 112x112 — the plane each route's task grid can fill on its
+/// own, since the oc-chunk axis that splits a small grid for the pool rebuilds
+/// the planar halo strip per chunk. Both are subject to the same fence: a U that
+/// still fits the last-level cache.
+///
+/// Pass the output extent when the caller knows it — a filter alone picks the
+/// safe order. The policy is what `ConvAlgorithm::Winograd` means for a filter:
+/// compute never re-decides it, it reads the order back off the U.
+WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group,
+                          int64_t out_h = 0, int64_t out_w = 0,
+                          bool channel_last = false) noexcept;
 
 /// Single source of truth for the Winograd block sizes, the parallel
 /// decomposition and the scratch layout; the fields a route does not use stay
 /// zero.
 struct Conv2DWinogradPlan {
     Conv2DWinogradRoute route = Conv2DWinogradRoute::Planar;
+    WinoOrder order = WinoOrder::F23;   ///< transform order (channel-last only)
 
     // ---- transform-domain geometry ----
-    int64_t num_tile_rows = 0;      ///< TH  = ceil(OH / 2)
-    int64_t num_tile_cols = 0;      ///< TW  = ceil(OW / 2)
+    int64_t num_tile_rows = 0;      ///< TH  = ceil(OH / tile)
+    int64_t num_tile_cols = 0;      ///< TW  = ceil(OW / tile)
     int64_t num_tile_cols_pad = 0;  ///< planar: TW_pad = ceil(TW / 8) · 8
+    int64_t tile_rows = 0;          ///< planar: tile rows per task, so a task's
+                                    ///< N side can fill an nr_max-wide panel
                                     ///< channel-last: the flat tile count TH · TW
     int64_t num_tiles = 0;          ///< planar: TH · TW_pad — the GEMM's N
 
@@ -148,8 +197,9 @@ struct Conv2DWinogradPlan {
                              ///< channel-last: the U's k-block (kc)
     int64_t ocn_block = 0;   ///< planar: output-channel (GEMM M) block
                              ///< channel-last: oc block (GEMM N), a multiple of nr
-    int64_t tile_block = 0;  ///< tiles per task: 8 or 16 within one tile row
-                             ///< (planar), up to 24 flattened (channel-last)
+    int64_t tile_block = 0;  ///< tiles per task: 8 or 16 within one tile row,
+                             ///< or a whole multi-row block (planar); up to 24
+                             ///< flattened (channel-last)
 
     int64_t num_tile_blocks = 1;   ///< ceil(tiles / tile_block)
     int64_t oc_chunks = 1;         ///< parallel filter-row chunks per plane; 1
@@ -166,11 +216,12 @@ struct Conv2DWinogradPlan {
     // ---- scratch (elements, not bytes), all per slot ----
     int64_t num_slots = 0;    ///< worker threads, else tasks
     int64_t halo_ld = 0;      ///< planar: padded columns = 2·tile_block + 2
-    int64_t halo_rows = 0;    ///< planar: padded rows = 4 (the window)
+    int64_t halo_rows = 0;    ///< planar: padded rows — the window (alpha)
+                              ///< plus ktile per extra tile row the task spans
     int64_t halo_size = 0;    ///< planar: ic_per_group · halo_rows · halo_ld
     int64_t v_p_stride = 0;   ///< elements between transform positions
-    int64_t v_size = 0;       ///< 16 · v_p_stride
-    int64_t m_size = 0;       ///< 16 · tile_block · ocn_block
+    int64_t v_size = 0;       ///< pos · v_p_stride
+    int64_t m_size = 0;       ///< pos · tile_block · ocn_block
     int64_t b_size = 0;       ///< planar: uniform packed-B elements
     int64_t slot_size = 0;    ///< halo + V + M + B; channel-last rounds to 16
     size_t workspace_size = 0;

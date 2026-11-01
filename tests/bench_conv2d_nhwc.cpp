@@ -563,7 +563,9 @@ const std::vector<Shape>& wino_sweep() {
 
 template <class T>
 struct AbWino {
-    explicit AbWino(const Shape& c) : s(c) {
+    /// @param order pins the transform order (2 = F(2,3), 4 = F(4,3)); 0 lets
+    /// prepack pick it from the channel count and the plane.
+    explicit AbWino(const Shape& c, int64_t order = 0) : s(c) {
         const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
         const int64_t wsh[] = {c.KH, c.KW, c.IC, c.OC};   // HWIO
         constexpr DataType dt = dtype_of<T>();
@@ -589,6 +591,7 @@ struct AbWino {
         im_attrs.algorithm = ConvAlgorithm::ImplicitGemm;
         wn_attrs = attrs;
         wn_attrs.algorithm = ConvAlgorithm::Winograd;
+        wn_attrs.winograd_order = order;
         im_op = Conv2D::create(im_attrs, Backend::CPU);
         wn_op = Conv2D::create(wn_attrs, Backend::CPU);
 
@@ -597,27 +600,34 @@ struct AbWino {
         out_desc = od[0];
         OH = od[0].dims[2];
         OW = od[0].dims[3];
-        const int64_t ntiles = ((OH + 1) / 2) * ((OW + 1) / 2);
         work_im = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * c.IC * 9.0;
-        work_wn = 2.0 * static_cast<double>(c.N) * c.OC * ntiles * c.IC * 16.0;
 
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
         out_v = test::make_planar(out_desc, out_buf.data());
 
         // Prepack U (query -> allocate -> pack), once and outside every timer.
+        // The activation rides along so an unpinned order can weigh the plane.
         {
             TensorView q;
-            TensorView wi[] = {w_v};
+            TensorView wi[] = {w_v, in_v};
             TensorView wo[] = {q};
             wn_op->prepackWeights(wi, wo);
             q = wo[0];
             u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(T)), T{});
             u_v = TensorView(q.shape_span(), q.data_type(), u_buf.data(), q.pitch(),
                              q.layout());
-            TensorView wi2[] = {w_v};
             TensorView wo2[] = {u_v};
-            wn_op->prepackWeights(wi2, wo2);
+            wn_op->prepackWeights(wi, wo2);
         }
+        // The transform order is prepack's choice, and it is what the row's
+        // FLOP count has to reflect: 16 positions over 2x2 tiles or 36 over
+        // 4x4. Read it back off the U rather than guessing alongside it.
+        const int64_t pos  = u_v.shape(0);
+        const int64_t tile = (pos == 36) ? 4 : 2;
+        ord = (pos == 36) ? "F(4,3)" : "F(2,3)";
+        const int64_t ntiles = ((OH + tile - 1) / tile) * ((OW + tile - 1) / tile);
+        work_wn = 2.0 * static_cast<double>(c.N) * c.OC * ntiles * c.IC *
+                  static_cast<double>(pos);
     }
 
     void run_im(const ComputeContext& ctx) {
@@ -630,6 +640,7 @@ struct AbWino {
     }
 
     Shape s;
+    const char* ord = "F(2,3)";   // the transform order prepack chose
     int64_t OH = 0, OW = 0;
     double work_im = 0.0, work_wn = 0.0;
     Conv2DAttributes im_attrs, wn_attrs;
@@ -645,8 +656,8 @@ void run_wino_table(const char* title) {
     std::printf("\n== %s ==\n", title);
     for (int nt : bench_threads()) {
         std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
-        std::printf("    %-32s %8s %8s | %8s %8s | %s | %s\n",
-                    "layer", "im gemm ms", "GFLOPS", "wino ms", "GFLOPS",
+        std::printf("    %-32s %7s %8s %8s | %8s %8s | %s | %s\n",
+                    "layer", "order", "im gemm ms", "GFLOPS", "wino ms", "GFLOPS",
                     "wino time", "verdict");
         int wins = 0, losses = 0, ties = 0;
         double tot_im = 0.0, tot_wn = 0.0;
@@ -663,14 +674,54 @@ void run_wino_table(const char* title) {
             if (!real) { ++ties; } else if (ratio < 1.0) { ++wins; } else { ++losses; }
             tot_im += r.a_ms;
             tot_wn += r.b_ms;
-            std::printf("    %-32s %8.3f %8.1f | %8.3f %8.1f | %8.2fx | %s\n",
-                        c.name, r.a_ms, op->work_im / r.a_ms / 1e6,
+            std::printf("    %-32s %7s %8.3f %8.1f | %8.3f %8.1f | %8.2fx | %s\n",
+                        c.name, op->ord, r.a_ms, op->work_im / r.a_ms / 1e6,
                         r.b_ms, op->work_wn / r.b_ms / 1e6, ratio, verdict);
         }
-        std::printf("    %-32s %8.3f %8s | %8.3f %8s | %8.2fx | "
+        std::printf("    %-32s %7s %8.3f %8s | %8.3f %8s | %8.2fx | "
                     "%d win, %d lose, %d tie\n",
-                    "sum of the layers", tot_im, "", tot_wn, "",
+                    "sum of the layers", "", tot_im, "", tot_wn, "",
                     tot_wn / tot_im, wins, losses, ties);
+    }
+}
+
+// ============================================================
+// The transform order: F(2,3) against F(4,3), channel-last
+// ============================================================
+//
+// Both arms run the same channel-last Winograd kernel on the same activation and
+// differ only in U — 16 positions over 2x2 tiles against 36 over 4x4 — so a row
+// prices the order, and the totals say whether the 1.78x fewer multiplies reach
+// the wall clock on this route.
+
+template <class T>
+void run_wino_order_ab(const char* title) {
+    const int iters = 10, rounds = 3;
+    std::printf("\n== %s ==\n", title);
+    for (int nt : bench_threads()) {
+        std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
+        std::printf("    %-32s | %8s %8s | %8s %8s | %s | %s\n",
+                    "layer", "F(2,3) ms", "GFLOPS", "F(4,3) ms", "GFLOPS",
+                    "F43/F23", "null");
+        double tot23 = 0.0, tot43 = 0.0;
+        for (const auto& c : wino_sweep()) {
+            auto op23 = std::make_unique<AbWino<T>>(c, 2);
+            auto op43 = std::make_unique<AbWino<T>>(c, 4);
+            const AbResult r = measure_ab(nt,
+                [&](const ComputeContext& x) { op23->run_wn(x); },
+                [&](const ComputeContext& x) { op43->run_wn(x); },
+                iters, rounds);
+            tot23 += r.a_ms;
+            tot43 += r.b_ms;
+            const bool real =
+                std::abs(r.b_ms - r.a_ms) / r.a_ms * 100.0 > r.null_pct;
+            std::printf("    %-32s | %8.3f %8.1f | %8.3f %8.1f | %5.2fx%s | %.1f%%\n",
+                        c.name, r.a_ms, op23->work_wn / r.a_ms / 1e6,
+                        r.b_ms, op43->work_wn / r.b_ms / 1e6, r.b_ms / r.a_ms,
+                        real ? "" : " (noise)", r.null_pct);
+        }
+        std::printf("    %-32s | %8.3f %8s | %8.3f %8s | %5.2fx |\n",
+                    "sum of the layers", tot23, "", tot43, "", tot43 / tot23);
     }
 }
 
@@ -943,6 +994,14 @@ NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
         std::printf("    %-24s %8.3f ms per pass (median of %d)\n",
                     "the graph", pass_ms[pass_ms.size() / 2], passes);
     }
+}
+
+NNOPS_BENCH(conv2d_nhwc_wino_order_ab_f32) {
+    run_wino_order_ab<float>("f32: channel-last Winograd, F(2,3) vs F(4,3)");
+}
+
+NNOPS_BENCH(conv2d_nhwc_wino_order_ab_f16) {
+    run_wino_order_ab<half>("f16: channel-last Winograd, F(2,3) vs F(4,3)");
 }
 
 NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f32) {
