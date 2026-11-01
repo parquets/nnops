@@ -20,12 +20,12 @@
 ///    split of one accumulator and the partial C stores are 8/4/2-byte stores
 ///    of converted lanes; the 2-wide clamp keeps lanes 2,3 for the 1-wide step.
 ///
-/// Bias seed (`mma_packed_b_*`): 1 is per-row (planar, a row is an output
+/// Bias seed (both routes): 1 is per-row (planar, a row is an output
 /// channel), 2 is per-column (channel-last, rows are pixels, so the bias lands
 /// on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
 /// buffer must be padded to the panel width. Seeding is two loads per row per
 /// panel against a full output write and read-back if the tile were primed
-/// first. The mr1 kernels ignore `mr`, `lda` and `ldc`.
+/// first. The mr1 kernels ignore `mr` and `ldc` (the packed-B ones `lda` too).
 
 #include <array>
 #include <immintrin.h>
@@ -39,12 +39,13 @@ using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr6_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
     const half* NNOPS_RESTRICT A,
     const half* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const half* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
@@ -62,19 +63,29 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f16(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(half_to_float(bias[r])); }
+        else if constexpr (seed == 2) {
+            return _mm256_cvtph_ps(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
+        } else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc2x01234567 = v_acc0x01234567;
-        __m256 v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc3x01234567 = v_acc0x01234567;
-        __m256 v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc4x01234567 = v_acc0x01234567;
-        __m256 v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc5x01234567 = v_acc0x01234567;
-        __m256 v_acc5x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
+        __m256 v_acc4x01234567 = init(r4, 0);
+        __m256 v_acc4x89abcdef = init(r4, 8);
+        __m256 v_acc5x01234567 = init(r5, 0);
+        __m256 v_acc5x89abcdef = init(r5, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -188,18 +199,18 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f16(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = _mm256_setzero_ps();
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = _mm256_setzero_ps();
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
-        __m256 v_acc4x01234567 = _mm256_setzero_ps();
-        __m256 v_acc4x89abcdef = v_acc4x01234567;
-        __m256 v_acc5x01234567 = _mm256_setzero_ps();
-        __m256 v_acc5x89abcdef = v_acc5x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
+        __m256 v_acc4x01234567 = init(r4, 0);
+        __m256 v_acc4x89abcdef = init(r4, 8);
+        __m256 v_acc5x01234567 = init(r5, 0);
+        __m256 v_acc5x89abcdef = init(r5, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -493,12 +504,13 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f16(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr4_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
     const half* NNOPS_RESTRICT A,
     const half* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const half* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
@@ -512,15 +524,25 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f16(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(half_to_float(bias[r])); }
+        else if constexpr (seed == 2) {
+            return _mm256_cvtph_ps(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
+        } else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc2x01234567 = v_acc0x01234567;
-        __m256 v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc3x01234567 = v_acc0x01234567;
-        __m256 v_acc3x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -605,14 +627,14 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f16(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = _mm256_setzero_ps();
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = _mm256_setzero_ps();
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -833,12 +855,13 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f16(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr2_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
     const half* NNOPS_RESTRICT A,
     const half* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const half* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
 
@@ -848,11 +871,21 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f16(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(half_to_float(bias[r])); }
+        else if constexpr (seed == 2) {
+            return _mm256_cvtph_ps(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
+        } else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -908,10 +941,10 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f16(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -1059,12 +1092,13 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f16(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr1_nr16_mrxncxkc_f16(
     int mr, int nc, int kc, half* NNOPS_RESTRICT C, int ldc,
     const half* NNOPS_RESTRICT A,
     const half* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const half* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     (void)mr;
     (void)ldc;
@@ -1074,9 +1108,18 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f16(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(half)) / sizeof(half));
 
     int n = 0;
+
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(half_to_float(bias[r])); }
+        else if constexpr (seed == 2) {
+            return _mm256_cvtph_ps(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bias + n + off)));
+        } else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -1118,8 +1161,8 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f16(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
 
         const half* a_ptr = A;
         const half* b_ptr = B;
@@ -2483,11 +2526,11 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f16(
 }
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
-template <bool Z>
+template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f16 = std::array{
-    &mma_packed_ab_mr6_nr16_mrxncxkc_f16<Z>,
-    &mma_packed_ab_mr4_nr16_mrxncxkc_f16<Z>,
-    &mma_packed_ab_mr1_nr16_mrxncxkc_f16<Z>};
+    &mma_packed_ab_mr6_nr16_mrxncxkc_f16<Z, Seed>,
+    &mma_packed_ab_mr4_nr16_mrxncxkc_f16<Z, Seed>,
+    &mma_packed_ab_mr1_nr16_mrxncxkc_f16<Z, Seed>};
 
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f16 = std::array{

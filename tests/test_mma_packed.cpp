@@ -12,6 +12,10 @@
 /// Each case checks: live rows/columns against a scalar reference (clamp, the
 /// beta == 1 add, and for f16 the round-trip through fp16 storage); columns
 /// >= nc and rows >= mr untouched; and the C and B sentinel tails.
+///
+/// The accumulator seed is the fourth variant: 1 is a per-row bias (both
+/// routes), 2 a per-column one (the packed-A route), whose reference starts the
+/// accumulation at `bias[col]` just as the kernel's panel loads do.
 
 #include "common/test_harness.hpp"
 #include "nnops/detail/simd.hpp"
@@ -92,7 +96,8 @@ template <typename T> constexpr int panel_width() noexcept {
 }
 
 template <typename T>
-using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float);
+using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float,
+                          const T*);
 template <typename T>
 using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
                           float, float, const T*);
@@ -102,49 +107,77 @@ using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
 enum class Kind { Ab, B };
 
 template <typename T>
-auto ab_fn(int level, bool zero_mode) {
+auto ab_fn(int level, bool zero_mode, int seed) {
 #if defined(NNOPS_ARCH_X86_64)
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return zero_mode ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true>
-                                 : mma_packed_ab_mr6_nr16_mrxncxkc_f32<false>;
-        case 4: return zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true>
-                                 : mma_packed_ab_mr4_nr16_mrxncxkc_f32<false>;
-        case 2: return zero_mode ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true>
-                                 : mma_packed_ab_mr2_nr16_mrxncxkc_f32<false>;
-        default: return zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true>
-                                  : mma_packed_ab_mr1_nr16_mrxncxkc_f32<false>;
+        case 6: return seed == 1 ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr6_nr16_mrxncxkc_f32<false>;
+        case 4: return seed == 1 ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr4_nr16_mrxncxkc_f32<false>;
+        case 2: return seed == 1 ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr2_nr16_mrxncxkc_f32<false>;
+        default: return seed == 1 ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr1_nr16_mrxncxkc_f32<false>;
         }
     } else {
         switch (level) {
-        case 6: return zero_mode ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_ab_mr6_nr16_mrxncxkc_f16<false>;
-        case 4: return zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
-        case 2: return zero_mode ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_ab_mr2_nr16_mrxncxkc_f16<false>;
-        default: return zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true>
-                                  : mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
+        case 6: return seed == 1 ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr6_nr16_mrxncxkc_f16<false>;
+        case 4: return seed == 1 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
+        case 2: return seed == 1 ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr2_nr16_mrxncxkc_f16<false>;
+        default: return seed == 1 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return zero_mode ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true>
-                                 : mma_packed_ab_mr8_nr12_mrxncxkc_f32<false>;
-        case 4: return zero_mode ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true>
-                                 : mma_packed_ab_mr4_nr12_mrxncxkc_f32<false>;
-        default: return zero_mode ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true>
-                                  : mma_packed_ab_mr1_nr12_mrxncxkc_f32<false>;
+        case 8: return seed == 1 ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr8_nr12_mrxncxkc_f32<false>;
+        case 4: return seed == 1 ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr4_nr12_mrxncxkc_f32<false>;
+        default: return seed == 1 ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true>
+                        : mma_packed_ab_mr1_nr12_mrxncxkc_f32<false>;
         }
     } else {
         switch (level) {
-        case 8: return zero_mode ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_ab_mr8_nr16_mrxncxkc_f16<false>;
-        case 4: return zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true>
-                                 : mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
-        default: return zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true>
-                                  : mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
+        case 8: return seed == 1 ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr8_nr16_mrxncxkc_f16<false>;
+        case 4: return seed == 1 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
+        default: return seed == 1 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true>
+                        : mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
         }
     }
 #endif
@@ -246,7 +279,8 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
             const std::vector<T>& b, const std::vector<T>& b_raw,
             const std::vector<T>& a, int nc, int kc, int ldc, int mr, int MR,
             int ldb, int nslots, float clamp_min, float clamp_max,
-            bool zero_mode, const std::vector<T>* bias_row, Kind kind,
+            bool zero_mode, const std::vector<T>* bias_row,
+            const std::vector<T>* bias_col, Kind kind,
             AAt a_at, const char* what) {
     const float tol = tolerance<T>();
     const int live = std::min(mr, MR);
@@ -291,8 +325,10 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
             // Seed it too — adding the bias after the fact rounds differently
             // once cancellation makes the sum small next to the intermediate
             // magnitudes.
-            if (bias_row != nullptr) {
-                const float start = to_float((*bias_row)[static_cast<size_t>(r)]);
+            if (bias_row != nullptr || bias_col != nullptr) {
+                const float start = bias_row != nullptr
+                    ? to_float((*bias_row)[static_cast<size_t>(r)])
+                    : to_float((*bias_col)[static_cast<size_t>(col)]);
                 if constexpr (f16_accum) {
                     T h = from_float<T>(start);
                     for (int k = 0; k < kc; ++k) {
@@ -356,10 +392,11 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
     (void)kind;
 }
 
-/// One packed-AB case: A is [kc][MR], B is packed.
+/// One packed-AB case: A is [kc][MR], B is packed. `seed` 1 seeds a per-row
+/// bias, 2 a per-column one; both are the overwrite path.
 template <typename T>
-void check_ab(AbKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
-              int ldc, float clamp_min, float clamp_max) {
+void check_ab(AbKernel<T> fn, int level, bool zero_mode, int seed, int mr, int nc,
+              int kc, int ldc, float clamp_min, float clamp_max) {
     const int panel = panel_width<T>();
     const int ldb = static_cast<int>(mma_pack_align(panel * kc * sizeof(T)) / sizeof(T));
     const int nslots = panel_slots(nc, panel);
@@ -389,10 +426,19 @@ void check_ab(AbKernel<T> fn, int level, bool zero_mode, int mr, int nc, int kc,
     }
     const std::vector<T> c0 = c;
 
-    fn(mr, nc, kc, c.data(), ldc, a.data(), b.data(), clamp_min, clamp_max);
+    std::vector<T> bias_row(seed == 1 ? level : 0);
+    for (auto& v : bias_row) { v = from_float<T>(rnd()); }
+    // Seed 2 reads whole panel lanes, so the column bias is padded to the panel
+    // width, as the kernel's contract asks.
+    std::vector<T> bias_col(static_cast<size_t>(seed == 2 ? nslots : 0) * panel);
+    for (auto& v : bias_col) { v = from_float<T>(rnd()); }
+
+    fn(mr, nc, kc, c.data(), ldc, a.data(), b.data(), clamp_min, clamp_max,
+       seed == 1 ? bias_row.data() : seed == 2 ? bias_col.data() : nullptr);
 
     verify<T>(c, c0, b, b_raw, a, nc, kc, ldc, mr, level, ldb, nslots,
-              clamp_min, clamp_max, zero_mode, nullptr, Kind::Ab,
+              clamp_min, clamp_max, zero_mode, seed == 1 ? &bias_row : nullptr,
+              seed == 2 ? &bias_col : nullptr, Kind::Ab,
               [&](int k, int r) { return a[static_cast<size_t>(k) * level + r]; },
               "packed_ab");
 }
@@ -435,7 +481,7 @@ void check_b(BKernel<T> fn, int level, bool zero_mode, bool with_bias, int mr,
 
     verify<T>(c, c0, b, b_raw, a, nc, kc, ldc, mr, level, ldb, nslots,
               clamp_min, clamp_max, zero_mode, with_bias ? &bias_row : nullptr,
-              Kind::B,
+              nullptr, Kind::B,
               [&](int k, int r) { return a[static_cast<size_t>(r) * lda + k]; },
               "packed_b");
 }
@@ -451,15 +497,17 @@ void run_suite(Kind kind) {
                     for (int li = 0; li < MR_COUNT; ++li) {
                         const int level = MR_LEVELS[li];
                         for (int mr = 1; mr <= level; ++mr) {
-                            for (int zi = 0; zi < 3; ++zi) {
-                                // zi 0/1: the zero_mode pair; zi 2: the bias row
-                                // (overwrite path only).
-                                const bool z = zi != 0;
+                            for (int zi = 0; zi < (kind == Kind::Ab ? 4 : 3); ++zi) {
+                                // zi 0/1: the zero_mode pair. zi 2: the bias seed,
+                                // per row on both routes and per column on the
+                                // packed-A one (overwrite path only).
+                                const bool z = zi == 1;
                                 const bool b = zi == 2;
-                                if (kind == Kind::Ab && b) { continue; }
+                                const int seed = (kind == Kind::Ab && zi > 2) ? zi - 1 : 0;
                                 if (kind == Kind::Ab) {
-                                    check_ab<T>(ab_fn<T>(level, z), level, z, mr, nc,
-                                                kc, ldc, clamps[cl][0], clamps[cl][1]);
+                                    check_ab<T>(ab_fn<T>(level, z, seed), level, z, seed,
+                                                mr, nc, kc, ldc, clamps[cl][0],
+                                                clamps[cl][1]);
                                 } else {
                                     check_b<T>(b_fn<T>(level, z, b), level, z, b, mr, nc,
                                                kc, kc + 3, ldc,

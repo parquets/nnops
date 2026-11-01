@@ -19,7 +19,7 @@
 /// packers fill on the A side and the C row pointers repeat -- so a partial-M
 /// tile needs no per-row guards; only the tail's store loop stops at `mr`.
 ///
-/// Bias seed (`mma_packed_b_*`): 1 is per-row (`bias[r]`) -- the planar route,
+/// Bias seed (both routes): 1 is per-row (`bias[r]`) -- the planar route,
 /// where a row is an output channel; 2 is per-column (`bias + n + off`) -- the
 /// channel-last shape, where rows are pixels and the bias lands on the panel's
 /// lanes. Seeding each row's three panel vectors costs a few loads, where
@@ -36,12 +36,13 @@ namespace nnops::backend::cpu::aarch64 {
 
 // ---- A and B both packed ----
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     float* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     float* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
@@ -52,20 +53,36 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
     float* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
     float* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
 
+    const int r1 = (mr > 1) ? 1 : 0;
+    const int r2 = (mr > 2) ? 2 : r1;
+    const int r3 = (mr > 3) ? 3 : r2;
+    const int r4 = (mr > 4) ? 4 : r3;
+    const int r5 = (mr > 5) ? 5 : r4;
+    const int r6 = (mr > 6) ? 6 : r5;
+    const int r7 = (mr > 7) ? 7 : r6;
+
     const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
+        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
+        else { return vdupq_n_f32(0.0f); }
+    };
+
     for (; n < nc - 11; n += 12) {
-        float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
-        float32x4_t c10 = vdupq_n_f32(0.0f), c11 = c10, c12 = c10;
-        float32x4_t c20 = vdupq_n_f32(0.0f), c21 = c20, c22 = c20;
-        float32x4_t c30 = vdupq_n_f32(0.0f), c31 = c30, c32 = c30;
-        float32x4_t c40 = vdupq_n_f32(0.0f), c41 = c40, c42 = c40;
-        float32x4_t c50 = vdupq_n_f32(0.0f), c51 = c50, c52 = c50;
-        float32x4_t c60 = vdupq_n_f32(0.0f), c61 = c60, c62 = c60;
-        float32x4_t c70 = vdupq_n_f32(0.0f), c71 = c70, c72 = c70;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
+        float32x4_t c40 = init(r4, 0), c41 = init(r4, 4), c42 = init(r4, 8);
+        float32x4_t c50 = init(r5, 0), c51 = init(r5, 4), c52 = init(r5, 8);
+        float32x4_t c60 = init(r6, 0), c61 = init(r6, 4), c62 = init(r6, 8);
+        float32x4_t c70 = init(r7, 0), c71 = init(r7, 4), c72 = init(r7, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -171,14 +188,14 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
-        float32x4_t c10 = vdupq_n_f32(0.0f), c11 = c10, c12 = c10;
-        float32x4_t c20 = vdupq_n_f32(0.0f), c21 = c20, c22 = c20;
-        float32x4_t c30 = vdupq_n_f32(0.0f), c31 = c30, c32 = c30;
-        float32x4_t c40 = vdupq_n_f32(0.0f), c41 = c40, c42 = c40;
-        float32x4_t c50 = vdupq_n_f32(0.0f), c51 = c50, c52 = c50;
-        float32x4_t c60 = vdupq_n_f32(0.0f), c61 = c60, c62 = c60;
-        float32x4_t c70 = vdupq_n_f32(0.0f), c71 = c70, c72 = c70;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
+        float32x4_t c40 = init(r4, 0), c41 = init(r4, 4), c42 = init(r4, 8);
+        float32x4_t c50 = init(r5, 0), c51 = init(r5, 4), c52 = init(r5, 8);
+        float32x4_t c60 = init(r6, 0), c61 = init(r6, 4), c62 = init(r6, 8);
+        float32x4_t c70 = init(r7, 0), c71 = init(r7, 4), c72 = init(r7, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -271,28 +288,41 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     float* NNOPS_RESTRICT c0_ptr = C + 0 * ldc;
     float* NNOPS_RESTRICT c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
     float* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
     float* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
+    const int r1 = (mr > 1) ? 1 : 0;
+    const int r2 = (mr > 2) ? 2 : r1;
+    const int r3 = (mr > 3) ? 3 : r2;
+
     const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
+        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
+        else { return vdupq_n_f32(0.0f); }
+    };
+
     for (; n < nc - 11; n += 12) {
-        float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
-        float32x4_t c10 = vdupq_n_f32(0.0f), c11 = c10, c12 = c10;
-        float32x4_t c20 = vdupq_n_f32(0.0f), c21 = c20, c22 = c20;
-        float32x4_t c30 = vdupq_n_f32(0.0f), c31 = c30, c32 = c30;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -357,10 +387,10 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
-        float32x4_t c10 = vdupq_n_f32(0.0f), c11 = c10, c12 = c10;
-        float32x4_t c20 = vdupq_n_f32(0.0f), c21 = c20, c22 = c20;
-        float32x4_t c30 = vdupq_n_f32(0.0f), c31 = c30, c32 = c30;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c10 = init(r1, 0), c11 = init(r1, 4), c12 = init(r1, 8);
+        float32x4_t c20 = init(r2, 0), c21 = init(r2, 4), c22 = init(r2, 8);
+        float32x4_t c30 = init(r3, 0), c31 = init(r3, 4), c32 = init(r3, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -433,12 +463,13 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     float* NNOPS_RESTRICT c0_ptr = C;
 
@@ -447,8 +478,15 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
     int n = 0;
+
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return vdupq_n_f32(bias[r]); }
+        else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
+        else { return vdupq_n_f32(0.0f); }
+    };
+
     for (; n < nc - 11; n += 12) {
-        float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -481,7 +519,7 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
 
     const int rem = nc - n;
     if (rem > 0) {
-        float32x4_t c00 = vdupq_n_f32(0.0f), c01 = c00, c02 = c00;
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
 
         const float* NNOPS_RESTRICT a_ptr = A;
         const float* NNOPS_RESTRICT b_ptr = B;
@@ -1114,11 +1152,11 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
 }
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
-template <bool Z>
+template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f32 = std::array{
-    &mma_packed_ab_mr8_nr12_mrxncxkc_f32<Z>,
-    &mma_packed_ab_mr4_nr12_mrxncxkc_f32<Z>,
-    &mma_packed_ab_mr1_nr12_mrxncxkc_f32<Z>};
+    &mma_packed_ab_mr8_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_ab_mr4_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_ab_mr1_nr12_mrxncxkc_f32<Z, Seed>};
 
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{

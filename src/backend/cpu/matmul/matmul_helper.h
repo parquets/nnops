@@ -486,9 +486,9 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 // Either implies the overwrite path (`zero_mode` is ignored). `col_bias` is read
 // in whole nr_max-wide lanes past `nc` — the panel loads as a unit and the store
 // drops the extra lanes — so the caller pads it to the panel width.
-void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
 void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
-void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode);
+void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
 void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
 
 // ---- Prepacked RHS: the same panels, at a caller-chosen stride ----------
@@ -499,11 +499,12 @@ void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, in
 // variants take the stride instead: k block `k` of panel `p` starts at
 // `b + p·ldb` and holds kc columns, exactly the sub-panel a k-block needs.
 // Everything else — the A cascade, the clamp, the store — is the same kernel;
-// the price is one prologue and call per nr_max columns.
-void tile_mma_pack_ldb(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_pack_ldb(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct_ldb(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
-void tile_mma_direct_ldb(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode);
+// the price is one prologue and call per nr_max columns. `col_bias` follows the
+// same rule as above, one panel's worth at a time.
+void tile_mma_pack_ldb(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* col_bias = nullptr);
+void tile_mma_pack_ldb(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* col_bias = nullptr);
+void tile_mma_direct_ldb(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* col_bias = nullptr);
+void tile_mma_direct_ldb(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* col_bias = nullptr);
 
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);

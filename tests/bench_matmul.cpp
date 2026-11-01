@@ -2581,13 +2581,12 @@ NNOPS_BENCH(matmul_q4_decode_rate) {
 
 // ---- bias A/B --------------------------------------------------------------
 //
-// A biased call costs the kernels nothing: matmul_cpu strips the activation (and
-// the Relu/Relu6 fold) from the attrs it dispatches with, runs the bare product,
-// then sweeps C once with epilogue_inplace(bias, activation). The price is one
-// extra read-modify-write pass over M×N plus a third input span — invisible next
-// to a large GEMM, worth measuring only at decode shapes. The four variants
-// alternate round by round in one process, so bias/plain is not a thermal
-// artifact.
+// The bias is the accumulator's initial value on the tiled route (first k-block,
+// no pass of its own) and a priming pass over C on the small-M ones. What is
+// left is a third input span and, when beta folds an old C, one read-modify-write
+// pass over M×N — invisible next to a large GEMM, worth measuring at decode
+// shapes. The four variants alternate round by round in one process, so
+// bias/plain is not a thermal artifact.
 
 template <typename T>
 struct BiasAB {
@@ -2808,6 +2807,11 @@ NNOPS_BENCH(matmul_bias_ab) {
     bench_bias_ab<float>("f32", 128, 4096, 4096, false, 6, 4);
     bench_bias_ab<float>("f32", 1024, 1024, 1024, false, 6, 8);
     bench_bias_ab<float>("f32", 128, 4096, 4096, true, 6, 4);
+    // One k-block, so the priming pass is the largest share of C's traffic it
+    // ever is: three tile passes for a bias, against one without. The call is
+    // short, so the iteration count, not the round count, carries the sample.
+    bench_bias_ab<float>("f32", 512, 128, 4096, false, 8, 40);
     bench_bias_ab<half>("f16", 1, 4096, 4096, false, 6, 30);
     bench_bias_ab<half>("f16", 128, 4096, 4096, false, 6, 4);
+    bench_bias_ab<half>("f16", 512, 128, 4096, false, 8, 40);
 }

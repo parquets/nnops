@@ -32,7 +32,7 @@
 /// at each store width.
 ///
 /// `zero_mode`: false accumulates into C (read-modify-write), true overwrites.
-/// `seed` (direct route only) sets the accumulator's initial value: 0 zero, 1 a
+/// `seed` sets the accumulator's initial value on both routes: 0 zero, 1 a
 /// per-row bias (planar -- a row is an output channel), 2 a per-column bias
 /// (channel-last -- rows are pixels, so the bias lands on the panel's 16 lanes;
 /// two loads per panel where seeding the tile first costs a full write and
@@ -45,12 +45,13 @@
 
 namespace nnops::backend::cpu::x86_64 {
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -67,19 +68,27 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc2x01234567 = v_acc0x01234567;
-        __m256 v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc3x01234567 = v_acc0x01234567;
-        __m256 v_acc3x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc4x01234567 = v_acc0x01234567;
-        __m256 v_acc4x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc5x01234567 = v_acc0x01234567;
-        __m256 v_acc5x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
+        __m256 v_acc4x01234567 = init(r4, 0);
+        __m256 v_acc4x89abcdef = init(r4, 8);
+        __m256 v_acc5x01234567 = init(r5, 0);
+        __m256 v_acc5x89abcdef = init(r5, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -167,18 +176,18 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = _mm256_setzero_ps();
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = _mm256_setzero_ps();
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
-        __m256 v_acc4x01234567 = _mm256_setzero_ps();
-        __m256 v_acc4x89abcdef = v_acc4x01234567;
-        __m256 v_acc5x01234567 = _mm256_setzero_ps();
-        __m256 v_acc5x89abcdef = v_acc5x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
+        __m256 v_acc4x01234567 = init(r4, 0);
+        __m256 v_acc4x89abcdef = init(r4, 8);
+        __m256 v_acc5x01234567 = init(r5, 0);
+        __m256 v_acc5x89abcdef = init(r5, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -400,12 +409,13 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     const int r1 = (mr > 1) ? 1 : 0;
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
@@ -418,15 +428,23 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc2x01234567 = v_acc0x01234567;
-        __m256 v_acc2x89abcdef = v_acc0x89abcdef;
-        __m256 v_acc3x01234567 = v_acc0x01234567;
-        __m256 v_acc3x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -493,14 +511,14 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
-        __m256 v_acc2x01234567 = _mm256_setzero_ps();
-        __m256 v_acc2x89abcdef = v_acc2x01234567;
-        __m256 v_acc3x01234567 = _mm256_setzero_ps();
-        __m256 v_acc3x89abcdef = v_acc3x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
+        __m256 v_acc2x01234567 = init(r2, 0);
+        __m256 v_acc2x89abcdef = init(r2, 8);
+        __m256 v_acc3x01234567 = init(r3, 0);
+        __m256 v_acc3x89abcdef = init(r3, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -671,12 +689,13 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     const int r1 = (mr > 1) ? 1 : 0;
 
     float* c0_ptr = C;
@@ -685,11 +704,19 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
+
+    // A row past `mr` aliases the last live row, so `bias[r]` stays in range.
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
-        __m256 v_acc1x01234567 = v_acc0x01234567;
-        __m256 v_acc1x89abcdef = v_acc0x89abcdef;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -735,10 +762,10 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
-        __m256 v_acc1x01234567 = _mm256_setzero_ps();
-        __m256 v_acc1x89abcdef = v_acc1x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc1x01234567 = init(r1, 0);
+        __m256 v_acc1x89abcdef = init(r1, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -860,12 +887,13 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     }
 }
 
-template <bool zero_mode = false>
+template <bool zero_mode = false, int seed = 0>
 void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max) noexcept {
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
     (void)mr;   // one row, so the row count never varies
     (void)ldc;  // one row, so the C row stride never applies
@@ -875,9 +903,16 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
     int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
+
+    const auto init = [&](int r, int off) {
+        if constexpr (seed == 1) { return _mm256_set1_ps(bias[r]); }
+        else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
+        else { return _mm256_setzero_ps(); }
+    };
+
     for(; n < nc - 15; n += 16) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = _mm256_setzero_ps();
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -913,8 +948,8 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
     int rem = nc - n;
 
     if (rem > 0) {
-        __m256 v_acc0x01234567 = _mm256_setzero_ps();
-        __m256 v_acc0x89abcdef = v_acc0x01234567;
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
 
         const float* a_ptr = A;
         const float* b_ptr = B;
@@ -2031,11 +2066,11 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 // Rows are the MR levels {6,4,1}; every kernel takes the runtime panel height,
 // so a remainder panel below its own MR runs through the level above it. The
 // mr2 kernels stay out of these tables; only the tests and bench call them.
-template <bool Z>
+template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f32 = std::array{
-    &mma_packed_ab_mr6_nr16_mrxncxkc_f32<Z>,
-    &mma_packed_ab_mr4_nr16_mrxncxkc_f32<Z>,
-    &mma_packed_ab_mr1_nr16_mrxncxkc_f32<Z>};
+    &mma_packed_ab_mr6_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_ab_mr4_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_packed_ab_mr1_nr16_mrxncxkc_f32<Z, Seed>};
 
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{

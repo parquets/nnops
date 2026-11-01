@@ -105,7 +105,8 @@ void fill_random(T* p, size_t n, uint64_t seed) {
 
 /// Kernel signatures, per dtype (mr first, as in XNNPACK).
 template <typename T>
-using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float);
+using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float,
+                          const T*);
 template <typename T>
 using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
                           float, float, const T*);
@@ -222,7 +223,7 @@ void bench_ab(const char* dtype, int kc) {
                 dtype, MR, NR, kc, REPS);
     for (int mr = 1; mr <= MR; ++mr) {
         const double g = time_kernel<T>(
-            [&](T* c) { fn(mr, NR, kc, c, NR, A.data(), B.data(), -1e30f, 1e30f); },
+            [&](T* c) { fn(mr, NR, kc, c, NR, A.data(), B.data(), -1e30f, 1e30f, nullptr); },
             mr, MR, NR, NR, kc, REPS);
         std::printf("      mr=%d/%d  %8.1f GFLOPS\n", mr, MR, g);
     }
@@ -303,7 +304,7 @@ void bench_nc_ab(const char* dtype) {
         const int reps = reps_for(MR, nc, NC_KC);
         const double g = time_kernel<T>(
             [&](T* c) {
-                fn(MR, nc, NC_KC, c, NC_LDC, A.data(), B.data(), -1e30f, 1e30f);
+                fn(MR, nc, NC_KC, c, NC_LDC, A.data(), B.data(), -1e30f, 1e30f, nullptr);
             },
             MR, MR, nc, NC_LDC, NC_KC, reps);
         rows.push_back({nc, g});
@@ -395,7 +396,7 @@ void bench_large_nc_ab(const char* dtype) {
         fill_random<T>(B.data(), B.size(), 0xDEAD ^ static_cast<uint64_t>(nc));
         return time_kernel<T>(
             [&](T* c) {
-                fn(MR, nc, NC_KC, c, nc, A.data(), B.data(), -1e30f, 1e30f);
+                fn(MR, nc, NC_KC, c, nc, A.data(), B.data(), -1e30f, 1e30f, nullptr);
             },
             MR, MR, nc, nc, NC_KC, reps);
     });

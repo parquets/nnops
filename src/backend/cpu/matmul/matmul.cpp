@@ -16,8 +16,9 @@
 /// of the zero-point compensation, each fed by its own reduction sweep (r_a over
 /// A, r_b over B); a half that is zero skips its sweep.
 ///
-/// An optional fp [N] bias primes each tile with beta·C_old + bias in its first
-/// k-block, instead of a sweep over the finished output.
+/// An optional fp [N] bias reaches the output in the first k-block either way:
+/// with no old C to fold it is the accumulator's initial value (no pass at all),
+/// and with a beta·C_old term the tile is primed with both before the MMA.
 ///
 /// f32/f16 below GEMM_FAST_PATH_THRESHOLD MACs, or at M <= 4 (bar a transposed A
 /// against a transposed B), and a Q4_1 B at small M, skip the plan and sweep the
@@ -128,18 +129,26 @@ struct FpRoute {
     }
 
     /// @p ldb > 0: a prepacked blob's panel stride (see tile_mma_pack_ldb).
+    /// @p col_bias, when set, becomes the accumulator's initial value instead of
+    /// C being read: the first k-block builds the tile from it.
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool zero_mode, int64_t ldb = 0) {
-        if (ldb > 0) { tile_mma_pack_ldb(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode); }
-        else         { tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, lo, hi, zero_mode); }
+                         bool zero_mode, int64_t ldb = 0,
+                         const Elem* col_bias = nullptr) {
+        if (ldb > 0) { tile_mma_pack_ldb(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi,
+                                         zero_mode, col_bias); }
+        else         { tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, lo, hi, zero_mode,
+                                     nullptr, col_bias); }
     }
 
     static void mma_direct(int mc, int nc, int kc, Acc* c, int ldc,
                            const Elem* a, int lda, const Elem* pb,
-                           Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = 0) {
-        if (ldb > 0) { tile_mma_direct_ldb(mc, nc, kc, c, ldc, a, lda, pb, ldb, lo, hi, zero_mode); }
-        else         { tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, lo, hi, zero_mode); }
+                           Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = 0,
+                           const Elem* col_bias = nullptr) {
+        if (ldb > 0) { tile_mma_direct_ldb(mc, nc, kc, c, ldc, a, lda, pb, ldb, lo, hi,
+                                          zero_mode, col_bias); }
+        else         { tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, lo, hi, zero_mode,
+                                       nullptr, col_bias); }
     }
 
     /// C row of a batch element plus the two fp-only in-place passes.
@@ -222,7 +231,8 @@ struct I8Route {
 
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool /*zero_mode*/, int64_t ldb = 0) {
+                         bool /*zero_mode*/, int64_t ldb = 0,
+                         const Elem* /*col_bias*/ = nullptr) {
         NNOPS_ASSERT(ldb == 0 && "int8 has no prepacked RHS");
         (void)ldb;
         tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, lo, hi);
@@ -350,7 +360,7 @@ void matmul_tile(const MatMulAttributes& attrs,
                  bool pack_a, const typename R::Elem* packed_b,
                  typename R::Elem* pack_a_slice, bool a_biased,
                  const typename R::EpilogueParams* ip,
-                 const typename R::Elem* bias,
+                 const typename R::Elem* bias, const typename R::Elem* col_bias,
                  const typename R::Elem* prepacked_b = nullptr,
                  int64_t prepacked_ldd = 0)
 {
@@ -360,7 +370,11 @@ void matmul_tile(const MatMulAttributes& attrs,
     // The first k-block primes C with beta·C_old + bias; every k-block then
     // only accumulates the product. A bias forces accumulate mode — the
     // overwriting kernel would drop it — even when beta is 0.
-    const bool prime_c = R::is_fp && k == 0 && bias != nullptr;
+    //
+    // When there is no old C to fold (beta 0) the bias becomes the accumulator's
+    // initial value and the priming pass disappears.
+    const bool seed_bias = R::is_fp && k == 0 && col_bias != nullptr;
+    const bool prime_c = R::is_fp && k == 0 && bias != nullptr && !seed_bias;
     const bool zero_mode = (k == 0 && attrs.beta == 0.0f && bias == nullptr);
     const auto [cmin, cmax] = R::clamp(attrs, last_k);
     // fp-only; compile out of the int8 instantiation.
@@ -401,10 +415,12 @@ void matmul_tile(const MatMulAttributes& attrs,
             R::pack_a(attrs.transpose_a, actual_mc, actual_kc,
                       pack_a_slice, ldd_a, a_src, lda, a_biased, ip, m);
             R::mma_pack(actual_mc, n_count, actual_kc,
-                        c_tile, ldc, pack_a_slice, b_tile, cmin, cmax, zero_mode, b_ldb);
+                        c_tile, ldc, pack_a_slice, b_tile, cmin, cmax, zero_mode,
+                        b_ldb, seed_bias ? col_bias + n_start : nullptr);
         } else if constexpr (R::has_direct_a) {
             R::mma_direct(actual_mc, n_count, actual_kc,
-                          c_tile, ldc, a_src, lda, b_tile, cmin, cmax, zero_mode, b_ldb);
+                          c_tile, ldc, a_src, lda, b_tile, cmin, cmax, zero_mode,
+                          b_ldb, seed_bias ? col_bias + n_start : nullptr);
         }
         if constexpr (R::is_fp) {
             if (epilogue) { R::epilogue(attrs, c_tile, ldc, actual_mc, n_count); }
@@ -431,7 +447,7 @@ void matmul_block(const MatMulAttributes& attrs,
                   typename R::Elem* pack_a_slice,
                   bool pack_a, bool a_biased,
                   const typename R::EpilogueParams* ip,
-                  const typename R::Elem* bias,
+                  const typename R::Elem* bias, const typename R::Elem* col_bias,
                   const typename R::Elem* prepacked_b = nullptr,
                   int64_t prepacked_ldd = 0)
 {
@@ -447,7 +463,7 @@ void matmul_block(const MatMulAttributes& attrs,
         matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
                        k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice,
-                       a_biased, ip, bias, prepacked_b, prepacked_ldd);
+                       a_biased, ip, bias, col_bias, prepacked_b, prepacked_ldd);
     }
 }
 
@@ -559,9 +575,17 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     const DataType b_block_dt = R::is_fp ? b.data_type() : DataType::f32;
 
     // Optional fp bias: primed into C by the first k-block, not swept after.
+    // With no old C to fold it can seed the accumulator instead, which drops
+    // that pass — but the kernel reads a whole panel of lanes, so only a bias
+    // whose last panel is full can be read in place.
     const typename R::Elem* bias = nullptr;
+    const typename R::Elem* col_bias = nullptr;
     if constexpr (R::is_fp) {
-        if (inputs.size() > 2) { bias = inputs[2].ptr<typename R::Elem>(); }
+        if (inputs.size() > 2) {
+            bias = inputs[2].ptr<typename R::Elem>();
+            const int64_t pw = nr_max_flt<typename R::Elem>();
+            if (attrs.beta == 0.0f && N % pw == 0) { col_bias = bias; }
+        }
     }
 
     // The fp routes pack into the scratch; a null buffer here means the pool
@@ -807,7 +831,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null, bias, prepacked_b, prepacked_ldd);
+                                ip_or_null, bias, col_bias, prepacked_b,
+                                prepacked_ldd);
             });
         } else if constexpr (R::hoists_b_m_split) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
@@ -823,7 +848,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                    mr.start, mr.count, mc, 0, Ni,
                                    k, actual_kc, last_k, plan.pack_a, pack_b_base,
                                    pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                   a_biased, ip_or_null, bias,
+                                   a_biased, ip_or_null, bias, col_bias,
                                    prepacked_b, prepacked_ldd);
                 });
             }
@@ -837,7 +862,8 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null, bias, prepacked_b, prepacked_ldd);
+                                ip_or_null, bias, col_bias, prepacked_b,
+                                prepacked_ldd);
             });
         }
     }

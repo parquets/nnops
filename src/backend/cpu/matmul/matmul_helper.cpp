@@ -95,7 +95,7 @@ template <> struct TileTraits<float> {
     static constexpr const int* nr() { return NR_F32; }
     static constexpr const auto& trans() { return pack_trans_f32_fn; }
     static constexpr const auto& copy()  { return pack_copy_f32_fn; }
-    template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f32<Z>; }
+    template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f32<Z, S>; }
     template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z, S>; }
 };
 
@@ -105,7 +105,7 @@ template <> struct TileTraits<half> {
     static constexpr const int* nr() { return NR_F16; }
     static constexpr const auto& trans() { return pack_trans_f16_fn; }
     static constexpr const auto& copy()  { return pack_copy_f16_fn; }
-    template <bool Z> static constexpr const auto& mma_pack()   { return mma_pack_fns_f16<Z>; }
+    template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f16<Z, S>; }
     template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, S>; }
 };
 
@@ -185,18 +185,20 @@ void tile_pack_rhs_impl(bool trans, int nc, int kc, T* dst, int ldd,
     });
 }
 
-/// One M panel; the kernel walks the N side itself.
-template <class T, bool Zero>
+/// One M panel; the kernel walks the N side itself. `Seed` picks the bias axis:
+/// 1 is a per-row vector indexed from @p m, 2 a per-column one used as given.
+template <class T, bool Zero, int Seed>
 void tile_mma_pack_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                         const T* packed_a, const T* b,
-                        float clamp_min, float clamp_max) {
+                        float clamp_min, float clamp_max, const T* bias) {
     using Tr = TileTraits<T>;
-    const auto& fns = Tr::template mma_pack<Zero>();
+    const auto& fns = Tr::template mma_pack<Zero, Seed>();
     const int ldd_a = panel_stride<T>(Tr::mr()[0], Kc);
 
     int m = 0;
     walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
-        fns[level](s, Nc, Kc, c + m * ldc, ldc, packed_a, b, clamp_min, clamp_max);
+        fns[level](s, Nc, Kc, c + m * ldc, ldc, packed_a, b, clamp_min, clamp_max,
+                   Seed == 1 ? bias + m : bias);
         packed_a += ldd_a;
     });
 }
@@ -219,9 +221,13 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
 
 template <class T>
 void dispatch_mma_pack(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
-                       const T* a, const T* b, float lo, float hi) {
-    if (zero_mode) { tile_mma_pack_impl<T, true>(Mc, Nc, Kc, c, ldc, a, b, lo, hi); }
-    else           { tile_mma_pack_impl<T, false>(Mc, Nc, Kc, c, ldc, a, b, lo, hi); }
+                       const T* a, const T* b, float lo, float hi,
+                       const T* bias, const T* col_bias) {
+    // Either bias builds the tile, so there is nothing in C to accumulate onto.
+    if (col_bias != nullptr) { tile_mma_pack_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, b, lo, hi, col_bias); }
+    else if (bias != nullptr) { tile_mma_pack_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, b, lo, hi, bias); }
+    else if (zero_mode)  { tile_mma_pack_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, b, lo, hi, nullptr); }
+    else                 { tile_mma_pack_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, b, lo, hi, nullptr); }
 }
 
 template <class T>
@@ -338,14 +344,18 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 
 void tile_mma_pack(int Mc, int Nc, int Kc, float* c, int ldc,
                    const float* packed_a, const float* b,
-                   float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, clamp_min, clamp_max);
+                   float clamp_min, float clamp_max, bool zero_mode,
+                   const float* bias, const float* col_bias) {
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, clamp_min, clamp_max,
+                      bias, col_bias);
 }
 
 void tile_mma_pack(int Mc, int Nc, int Kc, half* c, int ldc,
                    const half* packed_a, const half* b,
-                   float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, clamp_min, clamp_max);
+                   float clamp_min, float clamp_max, bool zero_mode,
+                   const half* bias, const half* col_bias) {
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, clamp_min, clamp_max,
+                      bias, col_bias);
 }
 
 void tile_mma_direct(int Mc, int Nc, int Kc, float* c, int ldc,
@@ -370,12 +380,12 @@ void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
 // The kernel's panel stride comes from the kc it is given, the blob's from the
 // whole K.
 
-template <class T, bool Zero>
+template <class T, bool Zero, int Seed>
 void tile_mma_pack_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                             const T* packed_a, const T* b, int64_t ldb,
-                            float clamp_min, float clamp_max) {
+                            float clamp_min, float clamp_max, const T* col_bias) {
     using Tr = TileTraits<T>;
-    const auto& fns = Tr::template mma_pack<Zero>();
+    const auto& fns = Tr::template mma_pack<Zero, Seed>();
     constexpr int nr = Tr::nr()[0];
     const int ldd_a = panel_stride<T>(Tr::mr()[0], Kc);
 
@@ -384,18 +394,19 @@ void tile_mma_pack_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
         for (int n = 0; n < Nc; n += nr) {
             const int w = std::min<int>(nr, Nc - n);
             fns[level](s, w, Kc, c + m * ldc + n, ldc, packed_a,
-                       b + (static_cast<int64_t>(n) / nr) * ldb, clamp_min, clamp_max);
+                       b + (static_cast<int64_t>(n) / nr) * ldb, clamp_min, clamp_max,
+                       col_bias == nullptr ? nullptr : col_bias + n);
         }
         packed_a += ldd_a;
     });
 }
 
-template <class T, bool Zero>
+template <class T, bool Zero, int Seed>
 void tile_mma_direct_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
                               const T* a, int lda, const T* b, int64_t ldb,
-                              float clamp_min, float clamp_max) {
+                              float clamp_min, float clamp_max, const T* col_bias) {
     using Tr = TileTraits<T>;
-    const auto& fns = Tr::template mma_direct<Zero, 0>();
+    const auto& fns = Tr::template mma_direct<Zero, Seed>();
     constexpr int nr = Tr::nr()[0];
 
     int m = 0;
@@ -404,48 +415,55 @@ void tile_mma_direct_ldb_impl(int Mc, int Nc, int Kc, T* c, int ldc,
             const int w = std::min<int>(nr, Nc - n);
             fns[level](s, w, Kc, c + m * ldc + n, ldc, a + m * lda, lda,
                        b + (static_cast<int64_t>(n) / nr) * ldb, clamp_min, clamp_max,
-                       nullptr);
+                       col_bias == nullptr ? nullptr : col_bias + n);
         }
     });
 }
 
 template <class T>
 void dispatch_mma_pack_ldb(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
-                           const T* a, const T* b, int64_t ldb, float lo, float hi) {
-    if (zero_mode) { tile_mma_pack_ldb_impl<T, true>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi); }
-    else           { tile_mma_pack_ldb_impl<T, false>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi); }
+                           const T* a, const T* b, int64_t ldb, float lo, float hi,
+                           const T* col_bias) {
+    if (col_bias != nullptr) { tile_mma_pack_ldb_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, col_bias); }
+    else if (zero_mode)      { tile_mma_pack_ldb_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr); }
+    else                     { tile_mma_pack_ldb_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, b, ldb, lo, hi, nullptr); }
 }
 
 template <class T>
 void dispatch_mma_direct_ldb(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
                              const T* a, int lda, const T* b, int64_t ldb,
-                             float lo, float hi) {
-    if (zero_mode) { tile_mma_direct_ldb_impl<T, true>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi); }
-    else           { tile_mma_direct_ldb_impl<T, false>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi); }
+                             float lo, float hi, const T* col_bias) {
+    if (col_bias != nullptr) { tile_mma_direct_ldb_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi, col_bias); }
+    else if (zero_mode)      { tile_mma_direct_ldb_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi, nullptr); }
+    else                     { tile_mma_direct_ldb_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, lo, hi, nullptr); }
 }
 
 void tile_mma_pack_ldb(int Mc, int Nc, int Kc, float* c, int ldc,
                        const float* a, const float* b, int64_t ldb,
-                       float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_pack_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, b, ldb, clamp_min, clamp_max);
+                       float clamp_min, float clamp_max, bool zero_mode,
+                       const float* col_bias) {
+    dispatch_mma_pack_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, b, ldb, clamp_min, clamp_max, col_bias);
 }
 
 void tile_mma_pack_ldb(int Mc, int Nc, int Kc, half* c, int ldc,
                        const half* a, const half* b, int64_t ldb,
-                       float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_pack_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, b, ldb, clamp_min, clamp_max);
+                       float clamp_min, float clamp_max, bool zero_mode,
+                       const half* col_bias) {
+    dispatch_mma_pack_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, b, ldb, clamp_min, clamp_max, col_bias);
 }
 
 void tile_mma_direct_ldb(int Mc, int Nc, int Kc, float* c, int ldc,
                          const float* a, int lda, const float* b, int64_t ldb,
-                         float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max);
+                         float clamp_min, float clamp_max, bool zero_mode,
+                         const float* col_bias) {
+    dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max, col_bias);
 }
 
 void tile_mma_direct_ldb(int Mc, int Nc, int Kc, half* c, int ldc,
                          const half* a, int lda, const half* b, int64_t ldb,
-                         float clamp_min, float clamp_max, bool zero_mode) {
-    dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max);
+                         float clamp_min, float clamp_max, bool zero_mode,
+                         const half* col_bias) {
+    dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max, col_bias);
 }
 
 // ---- the blob ---------------------------------------------------------
