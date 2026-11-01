@@ -361,6 +361,10 @@ inline const TensorView& packed_weight(const TensorView& w,
     const TensorView in[] = {w};
     TensorView q[] = {query};
     op->prepackWeights(in, q);
+    // The query answers with nothing (rank 0) when the filter has no packed
+    // form: a 3x3 over at most four channels is convoluted in place by the
+    // direct route, so the raw filter is what compute() wants.
+    if (q[0].rank() < 2) { return w; }
     Buf blob = alloc(q[0].desc(), w.quant_params());
     TensorView pack[] = {blob.view};
     op->prepackWeights(in, pack);

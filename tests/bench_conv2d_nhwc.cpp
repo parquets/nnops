@@ -187,7 +187,10 @@ const std::vector<Shape>& sweep() {
         {"conv 3x3 s2 14x14 512->512",      1,  512,  14,  14,  512, 3, 3, 2, 2, 1, 1},
         {"conv 3x3 s1  7x7  512->512",      1,  512,   7,   7,  512, 3, 3, 1, 1, 1, 1},
         // ---- wide kernels ---------------------------------------------------
+        // Both model stems: the tiny filter, 7x7 for ResNet and 3x3 for
+        // MobileNet, where the gather the direct route skips is largest.
         {"stem 7x7 s2 224x224 3->64",       1,    3, 224, 224,   64, 7, 7, 2, 2, 3, 3},
+        {"stem 3x3 s2 224x224 3->32",       1,    3, 224, 224,   32, 3, 3, 2, 2, 1, 1},
         {"conv 5x5 s1 28x28  32->32",       1,   32,  28,  28,   32, 5, 5, 1, 1, 2, 2},
         {"conv 5x5 s2 56x56  16->32",       1,   16,  56,  56,   32, 5, 5, 2, 2, 2, 2},
         // ---- grouped / batched ----------------------------------------------

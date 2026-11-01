@@ -467,6 +467,20 @@ NNOPS_TEST(conv2d_nhwc_fp_matches_ref) {
         // 2x2 stride 2 with groups.
         {{{1, 4, 20, 20},   8, 2, 2, 2, 2, 1, 1, 1, 1, 2, false},  16},
 
+        // ---- the tiny filter: a square K <= 7 over <= 4 channels --------
+        // The MobileNetV2 stem, which also has no packed form to prepack.
+        {{{1, 3, 32, 32},   32, 3, 3, 2, 2, 1, 1, 1, 1, 1, true},  60},
+        // IC 1 with an odd plane: the last block is short and every tap is
+        // bounds-checked.
+        {{{1, 1, 17, 19},   16, 3, 3, 1, 1, 1, 1, 1, 1, 1, false}, 61},
+        // IC 4, no padding, dilation on one axis only, 3 vectors of channels.
+        {{{1, 4, 11, 13},   48, 3, 3, 1, 1, 0, 0, 2, 1, 1, true},  62},
+        // The ResNet stem: a 7x7 at stride 2, where the gather it skips is 49
+        // elements a pixel.
+        {{{1, 3, 32, 32},   64, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},  63},
+        // A 5x5 with padding on one axis only, and a short last pixel block.
+        {{{1, 2, 15, 18},   16, 5, 5, 1, 1, 2, 1, 1, 1, 1, false}, 64},
+
         // ---- 1x1 pointwise (A read from the input row) ---------------------
         // IC 128 = the whole group in one K pass, direct-A read.
         {{{1, 128, 8, 8},   192, 1, 1, 1, 1, 0, 0, 1, 1, 1, true}, 17},
@@ -512,6 +526,12 @@ NNOPS_TEST(conv2d_nhwc_f16_matches_ref) {
         {{{1, 512, 5, 5},  64, 1, 1, 1, 1, 0, 0, 1, 1, 1, false}, 37},
         // a partial pixel tile.
         {{{1, 32, 4, 5},   12, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},  38},
+        // ---- the tiny filter: a square K <= 7 over <= 4 channels --------
+        {{{1, 3, 32, 32},  32, 3, 3, 2, 2, 1, 1, 1, 1, 1, true},  39},  // MobileNetV2 stem
+        {{{1, 1, 17, 19},  16, 3, 3, 1, 1, 1, 1, 1, 1, 1, false}, 40},  // IC 1, odd plane
+        {{{1, 4, 11, 13},  48, 3, 3, 1, 1, 0, 0, 2, 1, 1, true},  41},  // IC 4, no pad, dilation
+        {{{1, 3, 32, 32},  64, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},  42},  // the ResNet stem
+        {{{1, 2, 15, 18},  16, 5, 5, 1, 1, 2, 1, 1, 1, 1, false}, 43},  // 5x5, pad one axis
     };
 
     for (size_t i = 0; i < std::size(cases); ++i) {
@@ -672,7 +692,9 @@ NNOPS_TEST(conv2d_nhwc_fp_prepacked_filter) {
         {{{1, 16, 14, 14}, 256, 3, 3, 2, 2, 1, 1, 1, 1, 1, false}, 705},
         // a 5x5 and a 7x7 stem at narrow IC: the whole group per k block
         {{{1, 8, 18, 18},  16, 5, 5, 1, 1, 2, 2, 1, 1, 1, true},  706},
-        {{{1, 3, 32, 32},  16, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},  707},
+        // (OC 8 rather than 16: a 7x7 over three channels at a whole vector pair
+        // is the direct route's shape, so its filter has no packed form.)
+        {{{1, 3, 32, 32},   8, 7, 7, 2, 2, 3, 3, 1, 1, 1, true},  707},
         // 9x9 at IC 4: 4 · 81 > 256, so icn_block drops to 1 — one channel per
         // k block, four panel sets
         {{{1, 4, 24, 24},   8, 9, 9, 1, 1, 4, 4, 1, 1, 1, false}, 708},

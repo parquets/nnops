@@ -83,6 +83,7 @@
 #include "backend/cpu/simd_kernel/simd_im2col.hpp"          // tiled im2col gathers
 #include "backend/cpu/simd_kernel/simd_int8_reduce.hpp"     // int8_row_sum / int8_col_sum_slab
 #include "backend/cpu/simd_kernel/simd_quant.hpp"           // quant_kernel::quantization
+#include "backend/cpu/simd_kernel/simd_stem_conv.hpp"       // the tiny filter's direct 3x3
 #include "backend/cpu/common/memory_pool.hpp"               // internal scratch-memory pool
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
@@ -1219,6 +1220,8 @@ namespace {
 using nnops::simd::s_load;
 using nnops::simd::s_store;
 
+namespace k = nnops::kernel;  // pure SIMD kernels: the stem's direct 3x3
+
 // ---- block-size heuristics ------------------------------------------------
 
 /// Input-channel block: kdim = ic_block × karea lands in ~144–256, and the
@@ -1340,6 +1343,29 @@ void pack_block(T* dst, int64_t panel_slot, T* stage,
     }
 }
 
+// ---- the tiny filter ------------------------------------------------------
+//
+// The kernels live in simd_kernel/simd_stem_conv.hpp; this is the task grid over
+// them, one task per output row: a row is ~27 multiply-adds per output element,
+// wide enough that the pool's per-task cost is noise.
+
+template <class T, int IC, int K>
+void stem_conv_plane(T* NNOPS_RESTRICT out, const T* NNOPS_RESTRICT in,
+                     const T* NNOPS_RESTRICT w, const T* NNOPS_RESTRICT bias,
+                     int64_t N, int64_t IH, int64_t IW, int64_t OW, int64_t OC,
+                     int64_t in_rs, int64_t out_rs, int64_t ib_step,
+                     int64_t ob_step, int64_t OH,
+                     int SH, int SW, int PH, int PW, int DH, int DW,
+                     bool clamp, float lo, float hi, const ComputeContext& ctx)
+{
+    ctx.cpu.run(0, N * OH, [&](int64_t t) {
+        const int64_t n = t / OH;
+        k::stem_conv_row<T, IC, K>(out + n * ob_step, in + n * ib_step, w, bias,
+                                   IH, IW, OW, OC, in_rs, out_rs, t - n * OH,
+                                   SH, SW, PH, PW, DH, DW, clamp, lo, hi);
+    });
+}
+
 // ---- main kernel ----------------------------------------------------------
 
 template <class T>
@@ -1447,6 +1473,50 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     const bool seed_bias = attrs.add_to && has_bias;
     const bool bias_seed = has_bias && !attrs.add_to;
     const bool need_epi  = epi_pass;
+
+    // ---- the tiny filter ---------------------------------------------------
+    // At most four input channels under a square 3x3/5x5/7x7: no gather, no
+    // panel, no plan — the tap is read where it lies. prepackWeights declines
+    // this shape too, so the filter arrives raw.
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+        if (G == 1 && !prepacked && ic_per_group <= 4 && oc_per_group % 16 == 0 &&
+            KH == KW && KH >= 3 && KH <= 7 && (KH & 1) &&
+            !attrs.add_to && !epi_pass) {
+            const bool clamp = clamp_lo != -kInf || clamp_hi != kInf;
+            const float lo = clamp ? clamp_lo : -kInf;
+            const float hi = clamp ? clamp_hi : kInf;
+            const auto run = [&](auto kk) {
+                constexpr int K = decltype(kk)::value;
+                switch (ic_per_group) {
+                case 1: stem_conv_plane<T, 1, K>(out_ptr, in_ptr, w_ptr, b_ptr,
+                                                 N, IH, IW, OW, OC, in_row_stride,
+                                                 out_row_stride, ib_step, ob_step, OH,
+                                                 SH, SW, PH, PW, DH, DW, clamp, lo, hi,
+                                                 ctx); return;
+                case 2: stem_conv_plane<T, 2, K>(out_ptr, in_ptr, w_ptr, b_ptr,
+                                                 N, IH, IW, OW, OC, in_row_stride,
+                                                 out_row_stride, ib_step, ob_step, OH,
+                                                 SH, SW, PH, PW, DH, DW, clamp, lo, hi,
+                                                 ctx); return;
+                case 3: stem_conv_plane<T, 3, K>(out_ptr, in_ptr, w_ptr, b_ptr,
+                                                 N, IH, IW, OW, OC, in_row_stride,
+                                                 out_row_stride, ib_step, ob_step, OH,
+                                                 SH, SW, PH, PW, DH, DW, clamp, lo, hi,
+                                                 ctx); return;
+                default: stem_conv_plane<T, 4, K>(out_ptr, in_ptr, w_ptr, b_ptr,
+                                                  N, IH, IW, OW, OC, in_row_stride,
+                                                  out_row_stride, ib_step, ob_step, OH,
+                                                  SH, SW, PH, PW, DH, DW, clamp, lo, hi,
+                                                  ctx); return;
+                }
+            };
+            switch (KH) {
+            case 3: run(std::integral_constant<int, 3>{}); return;
+            case 5: run(std::integral_constant<int, 5>{}); return;
+            default: run(std::integral_constant<int, 7>{}); return;
+            }
+        }
+    }
 
     // ---- block geometry ----------------------------------------------------
     // Same function prepackWeights built the blob with; it must never disagree.

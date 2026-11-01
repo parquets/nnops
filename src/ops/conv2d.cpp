@@ -260,6 +260,23 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
          attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1);
 
     if (!wino_product) {
+        // A square 3x3/5x5/7x7 over at most four channels has no packed form on
+        // the channel-last side: the direct route convolves the raw filter in
+        // place, and one call per inference leaves nothing to amortize. The
+        // conditions mirror that route's, so a shape it will not take still
+        // packs (a declined pack is a per-call pack at compute time).
+        const int64_t ks = attrs_.kernel_size[0];
+        const bool epi_pass =
+            attrs_.epilogue.type != EpilogueActivateType::None &&
+            !(!attrs_.add_to && (attrs_.epilogue.type == EpilogueActivateType::Relu ||
+                                 attrs_.epilogue.type == EpilogueActivateType::Relu6));
+        if (is_channel_last_weight(weight.layout()) && attrs_.groups == 1 &&
+            (weight.data_type() == DataType::f32 ||
+             weight.data_type() == DataType::f16) && weight.shape(2) <= 4 &&
+            weight.shape(3) % 16 == 0 && ks == attrs_.kernel_size[1] &&
+            ks >= 3 && ks <= 7 && (ks & 1) && !attrs_.add_to && !epi_pass) {
+            return;
+        }
         // The descriptor comes from the attributes and the filter's own dims, so
         // the query needs no activation.
         const TensorDesc d =
