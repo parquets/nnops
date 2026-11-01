@@ -746,6 +746,44 @@ inline std::vector<TensorDesc> slice_output_shape(
     return {out};
 }
 
+/// Recurrent family (RNN / GRU / LSTM): Y [T, D, B, H], Y_h [D, B, H] and, when
+/// @p with_cell is set, Y_c of the same shape as Y_h. `hidden_size` 0 infers H
+/// from R's last axis. A one-directional layer keeps D = 1.
+inline std::vector<TensorDesc> recurrent_output_shape(
+    int64_t hidden_size,
+    int64_t num_directions,
+    bool with_cell,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& x = inputs[0];
+    const auto& r = inputs[2];
+
+    const int64_t H = (hidden_size > 0) ? hidden_size : r.dims[static_cast<size_t>(r.rank - 1)];
+
+    TensorDesc y;
+    y.rank   = 4;
+    y.layout = x.layout;
+    y.dtype  = x.dtype;
+    y.dims.resize(4);
+    y.dims[0] = x.dims[0];
+    y.dims[1] = num_directions;
+    y.dims[2] = x.dims[1];
+    y.dims[3] = H;
+
+    TensorDesc yh;
+    yh.rank   = 3;
+    yh.layout = x.layout;
+    yh.dtype  = x.dtype;
+    yh.dims.resize(3);
+    yh.dims[0] = num_directions;
+    yh.dims[1] = x.dims[1];
+    yh.dims[2] = H;
+
+    std::vector<TensorDesc> out{y, yh};
+    if (with_cell) { out.push_back(yh); }
+    return out;
+}
+
 /// Shape-preserving; reads only inputs[0], so a partial input span is fine.
 inline std::vector<TensorDesc> moe_output_shape(
     std::span<const TensorDesc> inputs)

@@ -48,6 +48,9 @@ enum class OpType : uint8_t {
     LinearAttention = 33,
     Norm            = 34,
     MoE             = 35,
+    Rnn             = 36,
+    Gru             = 37,
+    Lstm            = 38,
 };
 
 }  // namespace nnops

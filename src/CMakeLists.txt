@@ -35,6 +35,9 @@ set(NNOPS_CPU_SOURCES
     ops/flatten.cpp
     ops/transpose_conv2d.cpp
     ops/moe.cpp
+    ops/rnn.cpp
+    ops/gru.cpp
+    ops/lstm.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -94,6 +97,11 @@ set(NNOPS_CPU_SOURCES
     # lives alongside it)
     backend/cpu/attention/attention.cpp
     backend/cpu/attention/linear_attention.cpp
+
+    # The recurrent family: one driver for RNN, GRU and LSTM — the chunked input
+    # projection, the per-step recurrent GEMM and the epilogue that fuses the
+    # gate arithmetic, the sequence mask and the Y store.
+    backend/cpu/rnn/recurrent.cpp
 
     backend/cpu/cumsum.cpp
 )

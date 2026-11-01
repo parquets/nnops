@@ -48,6 +48,7 @@ set(TEST_SOURCES
     test_cpu_features.cpp
     test_memory_pool.cpp
     test_mma_packed.cpp
+    test_rnn.cpp
 )
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.
@@ -66,6 +67,7 @@ add_library(nnops_test_reference STATIC
     reference/moe_ref.cpp
     reference/norm_ref.cpp
     reference/pooling_ref.cpp
+    reference/recurrent_ref.cpp
     reference/resize_ref.cpp
     reference/transpose_conv2d_ref.cpp
 )
@@ -140,6 +142,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_pooling.cpp
         bench_attention.cpp
         bench_mma_packed.cpp
+        bench_rnn.cpp
     )
 
     if(NNOPS_BUILD_CUDA)

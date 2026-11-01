@@ -93,6 +93,16 @@ enum class TensorLayout : uint8_t {
     // (it is per call), so a prepacked B requires alpha == 1. Shape is
     // [N, ⌈elements / N⌉], N first so shape inference reads the output's last dim.
     PackedB = 17,
+
+    // ---- Prepacked recurrent weights (Rnn / Gru / Lstm ::prepackWeights) ----
+    //
+    // Everything the step loop would otherwise rebuild on every call, for every
+    // direction: W and R interleaved into the gate-block order and packed into
+    // the MMA's nr-wide B panels, plus the per-phase bias vectors (Rbh kept
+    // apart under linear_before_reset). Opaque and self-describing — the blob
+    // leads with its own header, so a compute() handed one reads it in place
+    // instead of running the interleave and the two pack passes.
+    PackedRecurrent = 18,
 };
 
 
@@ -117,6 +127,7 @@ constexpr int64_t layout_channel_pack(TensorLayout layout) noexcept {
     case TensorLayout::PackedOIHW: return 1;
     case TensorLayout::PackedHWIO: return 1;
     case TensorLayout::PackedB:  return 1;
+    case TensorLayout::PackedRecurrent: return 1;
     }
     return 1;
 }
@@ -168,6 +179,11 @@ constexpr bool is_packed_matmul_b(TensorLayout layout) noexcept {
     return layout == TensorLayout::PackedB;
 }
 
+/// True for the recurrent family's prepacked weights; opaque, self-describing.
+constexpr bool is_packed_recurrent(TensorLayout layout) noexcept {
+    return layout == TensorLayout::PackedRecurrent;
+}
+
 /// Spatial rank encoded in the layout: NCHW* → 2, NCDHW* → 3.
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     switch (layout) {
@@ -184,6 +200,7 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     case TensorLayout::PackedOIHW:
     case TensorLayout::PackedHWIO:
     case TensorLayout::PackedB:
+    case TensorLayout::PackedRecurrent:
         return 2;
     case TensorLayout::NCDHW:
     case TensorLayout::NCDHWC8:
