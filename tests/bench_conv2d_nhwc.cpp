@@ -173,6 +173,10 @@ const std::vector<Shape>& sweep() {
         {"pointwise 1x1 56x56  64->64",     1,   64,  56,  56,   64, 1, 1},
         {"expand    1x1 56x56  24->144",    1,   24,  56,  56,  144, 1, 1},
         {"project   1x1 56x56 144->24",     1,  144,  56,  56,   24, 1, 1},
+        // The N sweep at fixed M and K: the project layer's twin with 3 and 9
+        // full nr=16 panels, so the panel tail is the only thing that changes.
+        {"pointwise 1x1 56x56 144->48",     1,  144,  56,  56,   48, 1, 1},
+        {"pointwise 1x1 56x56 144->144",    1,  144,  56,  56,  144, 1, 1},
         {"pointwise 1x1 28x28 128->128",    1,  128,  28,  28,  128, 1, 1},
         {"project   1x1 14x14 576->96",     1,  576,  14,  14,   96, 1, 1},
         {"classifier 1x1  7x7 1280->1280",  1, 1280,   7,   7, 1280, 1, 1},

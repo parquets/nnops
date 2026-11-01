@@ -1045,10 +1045,10 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr6_nr16_mrxncxkc_f32(
+void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     const int r1 = (mr > 1) ? 1 : 0;
@@ -1064,7 +1064,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     float* c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
     float* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -1100,7 +1100,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += 16;
+            b_ptr += ldb;
 
             __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1174,7 +1174,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
         c4_ptr += 16;
         c5_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1204,7 +1204,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += 16;
+                b_ptr += ldb;
 
                 __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1229,7 +1229,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += 16;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += ldb;
                 v_acc0x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a0_ptr), v_b0, v_acc0x01234567);
                 v_acc1x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a1_ptr), v_b0, v_acc1x01234567);
                 v_acc2x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a2_ptr), v_b0, v_acc2x01234567);
@@ -1422,10 +1422,21 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr4_nr16_mrxncxkc_f32(
+void mma_packed_b_mr6_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+    mma_packed_b_mr6_nr16_mrxncxkc_f32_bld<zero_mode, seed>(
+        mr, nc, kc, C, ldc, A, lda, B, 16, clamp_min, clamp_max, bias);
+}
+
+template <bool zero_mode = false, int seed = 0>
+void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
+    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+    const float* NNOPS_RESTRICT A, int lda,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     const int r1 = (mr > 1) ? 1 : 0;
@@ -1437,7 +1448,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
     float* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
     float* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -1467,7 +1478,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += 16;
+            b_ptr += ldb;
 
             __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1520,7 +1531,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
         c2_ptr += 16;
         c3_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1544,7 +1555,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += 16;
+                b_ptr += ldb;
 
                 __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1562,7 +1573,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += 16;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += ldb;
                 v_acc0x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a0_ptr), v_b0, v_acc0x01234567);
                 v_acc1x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a1_ptr), v_b0, v_acc1x01234567);
                 v_acc2x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a2_ptr), v_b0, v_acc2x01234567);
@@ -1706,6 +1717,17 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32(
             }
         }
     }
+}
+
+template <bool zero_mode = false, int seed = 0>
+void mma_packed_b_mr4_nr16_mrxncxkc_f32(
+    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+    const float* NNOPS_RESTRICT A, int lda,
+    const float* NNOPS_RESTRICT B,
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+    mma_packed_b_mr4_nr16_mrxncxkc_f32_bld<zero_mode, seed>(
+        mr, nc, kc, C, ldc, A, lda, B, 16, clamp_min, clamp_max, bias);
 }
 
 template <bool zero_mode = false, int seed = 0>
@@ -1906,10 +1928,10 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr1_nr16_mrxncxkc_f32(
+void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
@@ -1919,7 +1941,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 
     float* c0_ptr = C;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -1940,7 +1962,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += 16;
+            b_ptr += ldb;
 
             const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
@@ -1962,7 +1984,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
 
         c0_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1977,7 +1999,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += 16;
+                b_ptr += ldb;
 
                 const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
@@ -1985,7 +2007,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += 16;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += ldb;
                 v_acc0x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a0_ptr), v_b0, v_acc0x01234567);
                 a0_ptr += 1;
             }
@@ -2062,6 +2084,17 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32(
     }
 }
 
+template <bool zero_mode = false, int seed = 0>
+void mma_packed_b_mr1_nr16_mrxncxkc_f32(
+    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+    const float* NNOPS_RESTRICT A, int lda,
+    const float* NNOPS_RESTRICT B,
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+    mma_packed_b_mr1_nr16_mrxncxkc_f32_bld<zero_mode, seed>(
+        mr, nc, kc, C, ldc, A, lda, B, 16, clamp_min, clamp_max, bias);
+}
+
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 // Rows are the MR levels {6,4,1}; every kernel takes the runtime panel height,
 // so a remainder panel below its own MR runs through the level above it. The
@@ -2077,5 +2110,11 @@ inline constexpr auto mma_direct_fns_f32 = std::array{
     &mma_packed_b_mr6_nr16_mrxncxkc_f32<Z, Seed>,
     &mma_packed_b_mr4_nr16_mrxncxkc_f32<Z, Seed>,
     &mma_packed_b_mr1_nr16_mrxncxkc_f32<Z, Seed>};
+
+template <bool Z, int Seed = 0>
+inline constexpr auto mma_direct_bld_fns_f32 = std::array{
+    &mma_packed_b_mr6_nr16_mrxncxkc_f32_bld<Z, Seed>,
+    &mma_packed_b_mr4_nr16_mrxncxkc_f32_bld<Z, Seed>,
+    &mma_packed_b_mr1_nr16_mrxncxkc_f32_bld<Z, Seed>};
 
 }

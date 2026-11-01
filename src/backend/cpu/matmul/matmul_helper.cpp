@@ -97,6 +97,7 @@ template <> struct TileTraits<float> {
     static constexpr const auto& copy()  { return pack_copy_f32_fn; }
     template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f32<Z, S>; }
     template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f32<Z, S>; }
+    template <bool Z, int S> static constexpr const auto& mma_direct_bld() { return mma_direct_bld_fns_f32<Z, S>; }
 };
 
 template <> struct TileTraits<half> {
@@ -107,6 +108,7 @@ template <> struct TileTraits<half> {
     static constexpr const auto& copy()  { return pack_copy_f16_fn; }
     template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f16<Z, S>; }
     template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, S>; }
+    template <bool Z, int S> static constexpr const auto& mma_direct_bld() { return mma_direct_bld_fns_f16<Z, S>; }
 };
 
 /// 64-byte-aligned panel stride, in elements.
@@ -464,6 +466,73 @@ void tile_mma_direct_ldb(int Mc, int Nc, int Kc, half* c, int ldc,
                          float clamp_min, float clamp_max, bool zero_mode,
                          const half* col_bias) {
     dispatch_mma_direct_ldb(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb, clamp_min, clamp_max, col_bias);
+}
+
+// =========================================================================
+//  Strided RHS — one panel per kernel call, straight from the source
+// =========================================================================
+// The kernel reads a panel as kc rows of nr_max lanes stepping `ldb` apart, so
+// the caller's matrix needs no panels at all. The kernel's own panel step
+// (`B += ldb`) never runs, because each call covers at most one panel.
+
+template <class T, bool Zero, int Seed>
+void tile_mma_direct_strided_impl(int Mc, int Nc, int Kc, T* c, int ldc,
+                                  const T* a, int lda, const T* b, int ldb,
+                                  T* stage, float clamp_min, float clamp_max,
+                                  const T* bias) {
+    using Tr = TileTraits<T>;
+    const auto& fns = Tr::template mma_direct_bld<Zero, Seed>();
+    constexpr int nr = Tr::nr()[0];
+
+    // The kernel reads each seed from its own lane 0, so a per-column one has to
+    // step with the panel here, exactly as tile_mma_direct_ldb offsets it.
+    const auto seed_at = [&](int m, int n) {
+        return (Seed == 1) ? bias + m : (Seed == 2 ? bias + n : nullptr);
+    };
+
+    int m = 0;
+    walk_levels(m, Mc, Tr::mr(), [&](int level, int s) {
+        int n = 0;
+        for (; n + nr <= Nc; n += nr) {
+            fns[level](s, nr, Kc, c + m * ldc + n, ldc, a + m * lda, lda,
+                       b + n, ldb, clamp_min, clamp_max, seed_at(m, n));
+        }
+        if (n < Nc) {
+            // The lanes past the live width are outside the source, so the tail
+            // is packed (zero-filled, one panel) into the caller's stage.
+            const int w = Nc - n;
+            tile_pack_rhs(false, w, Kc, stage, nr * Kc, b + n, ldb, 1.0f);
+            fns[level](s, w, Kc, c + m * ldc + n, ldc, a + m * lda, lda,
+                       stage, nr, clamp_min, clamp_max, seed_at(m, n));
+        }
+    });
+}
+
+template <class T>
+void dispatch_mma_direct_strided(bool zero_mode, int Mc, int Nc, int Kc, T* c, int ldc,
+                                 const T* a, int lda, const T* b, int ldb, T* stage,
+                                 float lo, float hi, const T* bias, const T* col_bias) {
+    // Either bias builds the tile, so there is nothing in C to accumulate onto.
+    if (col_bias != nullptr)  { tile_mma_direct_strided_impl<T, true, 2>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, col_bias); }
+    else if (bias != nullptr) { tile_mma_direct_strided_impl<T, true, 1>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, bias); }
+    else if (zero_mode)       { tile_mma_direct_strided_impl<T, true, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr); }
+    else                      { tile_mma_direct_strided_impl<T, false, 0>(Mc, Nc, Kc, c, ldc, a, lda, b, ldb, stage, lo, hi, nullptr); }
+}
+
+void tile_mma_direct_strided(int Mc, int Nc, int Kc, float* c, int ldc,
+                             const float* a, int lda, const float* b, int ldb,
+                             float* stage, float clamp_min, float clamp_max,
+                             bool zero_mode, const float* bias, const float* col_bias) {
+    dispatch_mma_direct_strided(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
+                                stage, clamp_min, clamp_max, bias, col_bias);
+}
+
+void tile_mma_direct_strided(int Mc, int Nc, int Kc, half* c, int ldc,
+                             const half* a, int lda, const half* b, int ldb,
+                             half* stage, float clamp_min, float clamp_max,
+                             bool zero_mode, const half* bias, const half* col_bias) {
+    dispatch_mma_direct_strided(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
+                                stage, clamp_min, clamp_max, bias, col_bias);
 }
 
 // ---- the blob ---------------------------------------------------------

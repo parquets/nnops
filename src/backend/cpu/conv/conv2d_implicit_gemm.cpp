@@ -357,7 +357,10 @@ void conv2d_planar_impl(const Conv2DAttributes& attrs,
                     // the input instead. pad == 0 and stride == 1 keep the ROI
                     // inside the input, so there is no border case. The ROI is
                     // one roi_area-wide run per channel, so k strides by the
-                    // channel stride, not the ROI width.
+                    // channel stride, not the ROI width. The pack stays: B is
+                    // read panel-major and a packed panel's k rows are contiguous,
+                    // where the plane's are a plane-row apart (measured 11% worse
+                    // at 1T on a 28x28 plane to read it in place).
                     const T* b_src = input_local + oh * in_row_stride;
                     tile_pack_rhs(false, static_cast<int>(roi_area), kdim,
                                   pack_b, ldd_b, b_src, static_cast<int>(icn_step), 1.0f);
@@ -1558,12 +1561,19 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                 const int kdim = static_cast<int>(icnc * karea);
 
                 const T* b_panel;
+                int b_ld = 0;
                 if (panels) {
                     // The k block's panel column, then this task's own panels
                     // along it: no pack, however many chunks the oc axis took.
                     const int64_t ib = icn / icn_block;
                     b_panel = panels + pg.offset(g, ib) +
                               (ocn / nr_max) * pg.slot(ib);
+                } else if (karea == 1) {
+                    // A 1x1 filter is [ic][oc] with oc contiguous — a panel's k
+                    // rows already, `w_ic_stride` apart — so read it in place and
+                    // let the stage take the partial last panel only.
+                    b_panel = w_g + ocn + icn * w_ic_stride;
+                    b_ld = static_cast<int>(w_ic_stride);
                 } else {
                     pack_block<T>(pack_buf, gemm_panel_slot(kdim, nr_max, esz, false),
                                   stage, w_g + ocn + icn * w_ic_stride,
@@ -1628,14 +1638,26 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                         // Bias only: build the accumulator from it (one panel-lane
                         // load per n-block) rather than seed the tile, which
                         // would double the tile's traffic for one addend.
-                        tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
-                                        tile, static_cast<int>(OC),
-                                        a, lda, b_panel, c_lo, c_hi,
-                                        /*zero_mode=*/icn == 0 && !attrs.add_to &&
-                                                       !bias_seed,
-                                        nullptr,
-                                        (icn == 0 && bias_seed) ? bias_col + ocn
-                                                                : nullptr);
+                        if (b_ld != 0) {
+                            tile_mma_direct_strided(mc, static_cast<int>(ocnc), kdim,
+                                                    tile, static_cast<int>(OC),
+                                                    a, lda, b_panel, b_ld, stage,
+                                                    c_lo, c_hi,
+                                                    /*zero_mode=*/icn == 0 && !attrs.add_to &&
+                                                                   !bias_seed,
+                                                    nullptr,
+                                                    (icn == 0 && bias_seed) ? bias_col + ocn
+                                                                            : nullptr);
+                        } else {
+                            tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
+                                            tile, static_cast<int>(OC),
+                                            a, lda, b_panel, c_lo, c_hi,
+                                            /*zero_mode=*/icn == 0 && !attrs.add_to &&
+                                                           !bias_seed,
+                                            nullptr,
+                                            (icn == 0 && bias_seed) ? bias_col + ocn
+                                                                    : nullptr);
+                        }
 
                         if (is_last_icn && need_epi) {
                             epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,
@@ -2383,10 +2405,11 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
                        ? 0
                        : plan.m_block * (quant ? ((kdim_max + 3) & ~int64_t{3})
                                                : kdim_max + kABSlack));
-    // In HWIO a panel's k row is one OC-length run, nothing transposed. Only a
-    // multi-tap filter needs the staging tile, and only when a task does pack —
-    // which neither a prepacked filter nor a shared per-call one does.
-    plan.stage_size = (karea > 1 && plan.pack_size > 0) ? nr_max * kdim_max : 0;
+    // In HWIO a panel's k row is one OC-length run, nothing transposed. A 1x1
+    // filter is read in place and needs only the tail's panel; a multi-tap one
+    // restages a whole panel. Either way, only when a task does pack — which
+    // neither a prepacked filter nor a shared per-call one does.
+    plan.stage_size = plan.pack_size > 0 ? nr_max * kdim_max : 0;
     const int64_t pass_tiles = plan.ph_block * OW;
     plan.orig_size = keep_orig ? pass_tiles * plan.ocn_block : 0;
     // The int32 accumulator is a per-slot tile set shaped like the residual.

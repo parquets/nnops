@@ -506,6 +506,29 @@ void tile_mma_pack_ldb(int mc, int nc, int kc, half* c, int ldc, const half* pac
 void tile_mma_direct_ldb(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* col_bias = nullptr);
 void tile_mma_direct_ldb(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* col_bias = nullptr);
 
+// ---- Strided RHS: no panels exist at all --------------------------------
+//
+// B is the caller's own matrix: the N axis is contiguous and K rows sit `ldb`
+// apart (B's leading dimension, not the panel stride the `_ldb` variants above
+// take), so panel p is read in place at `b + p·nr_max` and nothing is
+// materialized. That is what a 1x1 Conv2D can give — the NCHW activation is
+// already [ic][pixel] with the pixel axis contiguous, and an HWIO filter is
+// already [ic][oc] — so the pack pass disappears rather than getting cheaper.
+//
+// A panel is read whole, so a partial last panel would run past its live
+// columns; that one is packed into @p stage (nr_max · kc elements, caller
+// owned) and read back through the packed path. Only the tail costs a copy.
+void tile_mma_direct_strided(int mc, int nc, int kc, float* c, int ldc,
+                             const float* a, int lda, const float* b, int ldb,
+                             float* stage, float clamp_min, float clamp_max,
+                             bool zero_mode, const float* bias = nullptr,
+                             const float* col_bias = nullptr);
+void tile_mma_direct_strided(int mc, int nc, int kc, half* c, int ldc,
+                             const half* a, int lda, const half* b, int ldb,
+                             half* stage, float clamp_min, float clamp_max,
+                             bool zero_mode, const half* bias = nullptr,
+                             const half* col_bias = nullptr);
+
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
 void tile_scale(half* c, int ldc, float scale, int M, int N);

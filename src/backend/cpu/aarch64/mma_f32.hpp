@@ -576,10 +576,10 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
 // ---- only B packed, A read row-major ----
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
+inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
@@ -600,7 +600,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
     float* NNOPS_RESTRICT c6_ptr = (mr > 6) ? C + 6 * ldc : c5_ptr;
     float* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
 
-    const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -634,7 +634,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
             const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
             const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
             const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-            b_ptr += 12;
+            b_ptr += ldb;
 
             const float v0 = *a0++;
             const float v1 = *a1++;
@@ -732,7 +732,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
         c6_ptr += 12;
         c7_ptr += 12;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     const int rem = nc - n;
@@ -760,7 +760,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
                 const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-                b_ptr += 12;
+                b_ptr += ldb;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -799,7 +799,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
         } else {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr);
-                b_ptr += 12;
+                b_ptr += ldb;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -855,10 +855,21 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
+inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+    mma_packed_b_mr8_nr12_mrxncxkc_f32_bld<zero_mode, seed>(
+        mr, nc, kc, C, ldc, A, lda, B, 12, clamp_min, clamp_max, bias);
+}
+
+template <bool zero_mode = false, int seed = 0>
+inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
+    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+    const float* NNOPS_RESTRICT A, int lda,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
 
@@ -871,7 +882,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
     float* NNOPS_RESTRICT c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
     float* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
-    const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -897,7 +908,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
             const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
             const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
             const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-            b_ptr += 12;
+            b_ptr += ldb;
 
             const float v0 = *a0++;
             const float v1 = *a1++;
@@ -951,7 +962,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
         c2_ptr += 12;
         c3_ptr += 12;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     const int rem = nc - n;
@@ -971,7 +982,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
                 const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-                b_ptr += 12;
+                b_ptr += ldb;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -994,7 +1005,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
         } else {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr);
-                b_ptr += 12;
+                b_ptr += ldb;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -1040,10 +1051,21 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
+inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B,
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+    mma_packed_b_mr4_nr12_mrxncxkc_f32_bld<zero_mode, seed>(
+        mr, nc, kc, C, ldc, A, lda, B, 12, clamp_min, clamp_max, bias);
+}
+
+template <bool zero_mode = false, int seed = 0>
+inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
+    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+    const float* NNOPS_RESTRICT A, int lda,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     (void)mr;
@@ -1052,7 +1074,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
 
     float* NNOPS_RESTRICT c0_ptr = C;
 
-    const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -1072,7 +1094,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
             const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
             const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
             const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-            b_ptr += 12;
+            b_ptr += ldb;
 
             const float a = *a_ptr++;
 
@@ -1092,7 +1114,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
         vst1q_f32(c0_ptr + 2 * 4, vminq_f32(vmaxq_f32(c02, vmin), vmax));
 
         c0_ptr += 12;
-        B += ldb;
+        B += ldb_panel;
     }
 
     const int rem = nc - n;
@@ -1106,7 +1128,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
                 const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-                b_ptr += 12;
+                b_ptr += ldb;
 
                 const float a = *a_ptr++;
 
@@ -1117,7 +1139,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
         } else {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr);
-                b_ptr += 12;
+                b_ptr += ldb;
 
                 const float a = *a_ptr++;
 
@@ -1151,6 +1173,17 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
     }
 }
 
+template <bool zero_mode = false, int seed = 0>
+inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
+    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
+    const float* NNOPS_RESTRICT A, int lda,
+    const float* NNOPS_RESTRICT B,
+    float clamp_min, float clamp_max,
+    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
+    mma_packed_b_mr1_nr12_mrxncxkc_f32_bld<zero_mode, seed>(
+        mr, nc, kc, C, ldc, A, lda, B, 12, clamp_min, clamp_max, bias);
+}
+
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f32 = std::array{
@@ -1163,5 +1196,11 @@ inline constexpr auto mma_direct_fns_f32 = std::array{
     &mma_packed_b_mr8_nr12_mrxncxkc_f32<Z, Seed>,
     &mma_packed_b_mr4_nr12_mrxncxkc_f32<Z, Seed>,
     &mma_packed_b_mr1_nr12_mrxncxkc_f32<Z, Seed>};
+
+template <bool Z, int Seed = 0>
+inline constexpr auto mma_direct_bld_fns_f32 = std::array{
+    &mma_packed_b_mr8_nr12_mrxncxkc_f32_bld<Z, Seed>,
+    &mma_packed_b_mr4_nr12_mrxncxkc_f32_bld<Z, Seed>,
+    &mma_packed_b_mr1_nr12_mrxncxkc_f32_bld<Z, Seed>};
 
 }  // namespace nnops::backend::cpu::aarch64
