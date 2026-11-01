@@ -1,7 +1,7 @@
 #pragma once
 /// @file index.hpp
 /// @brief Flat-index → strided-offset decomposition shared by the axis-wise
-///        operators (Norm, Softmax, Reduce).
+///        operators (Norm, Reduce).
 ///
 /// Several operators independently re-implement the same "odometer": turn a
 /// row-major flat index into a multi-dimensional element offset using

@@ -8,10 +8,17 @@
 ///   3. Normalize — softmax: stored exp * inv_sum or recompute;
 ///      log_softmax: (x - max) - log(sum).
 ///
-/// Three paths (mirrors CPU backend):
-///   - Fast path (axis == rank-1): contiguous tail, one block per group.
-///   - General path: reference-style outer/D/inner decomposition with strided
-///     access, correct for packed layouts (NCHWC8/NCDHWC8).
+/// Two paths, chosen by where the normalization axis sits in memory (mirrors
+/// the CPU backend), over planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC)
+/// layouts:
+///   - The axis is the innermost axis of the storage (planar's last dim,
+///     channel-last's C): every group is D contiguous elements, one block per
+///     group (softmax_kernel).
+///   - Every other axis: reference-style outer/D/inner decomposition with
+///     strided access (softmax_general_kernel).
+///
+/// Channel-packed layouts are refused by the operator, so no location is
+/// `pack`-scaled: stride_elems() is the physical stride.
 ///
 /// Supports f32 and f16. Workspace: not used.
 
@@ -128,7 +135,8 @@ __global__ void softmax_kernel(
 // Each block normalizes D elements at stride axis_stride.
 // Launched with outer_size * inner_total blocks for full
 // parallelism across independent normalization groups.
-// Correct for packed layouts (NCHWC8/NCDHWC8).
+// outer_offsets/inner_offsets are the layout's own element offsets, walked once
+// on the host from stride_elems().
 // ============================================================
 
 template <typename T>
@@ -139,6 +147,7 @@ __global__ void softmax_general_kernel(
     int64_t D,
     int64_t axis_stride,
     int64_t inner_total,
+    const int64_t* __restrict__ outer_offsets,
     const int64_t* __restrict__ inner_offsets,
     bool log_softmax)
 {
@@ -151,7 +160,7 @@ __global__ void softmax_general_kernel(
 
     if (outer >= outer_size) return;
 
-    const int64_t base = outer * D * axis_stride;
+    const int64_t base = outer_offsets[outer];
     const int64_t inner_off = inner_offsets[inner_idx];
 
     // ---- Pass 1: find max ----
@@ -230,24 +239,41 @@ void softmax_cuda_impl(
     if (axis < 0) axis += rank;
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
+    if (X.numel() == 0 || X.shape(axis) == 0) return;  // nothing to launch
+
     const auto* x_ptr = X.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
 
     // ============================================================
-    // Fast path: contiguous tail (axis == rank-1)
+    // Fast path: the axis is the innermost axis of the storage, so every group
+    // is D contiguous elements and the groups are `group_stride` apart.
     // ============================================================
 
-    const int64_t pack = X.channel_pack_size();
+    const bool channel_last = is_channel_last(X.layout()) && rank > 1;
+    int64_t group_stride = 0;
+    bool contiguous_axis = false;
+    if (rank == 1) {
+        contiguous_axis = true;
+        group_stride = 1;
+    } else if (channel_last) {
+        if (axis == 1) {
+            contiguous_axis = true;
+            group_stride = X.shape(1);
+        } else if (axis == rank - 1 && X.shape(1) == 1) {
+            contiguous_axis = true;
+            group_stride = X.shape(rank - 1);
+        }
+    } else if (axis == rank - 1) {
+        contiguous_axis = true;
+        group_stride = X.row_stride_elems();
+    }
 
-    if (axis == rank - 1 && pack == 1) {
-        int64_t num_rows = 1;
-        for (int64_t i = 0; i < axis; ++i)
-            num_rows *= X.shape(i);
+    const int64_t norm_size = X.shape(axis);
 
-        const int64_t norm_size = X.shape(axis);
-        const int64_t group_stride = (axis > 0) ? X.stride_elems(axis - 1) : norm_size;
+    if (contiguous_axis && norm_size > 0) {
+        const int64_t num_rows = X.numel() / norm_size;
 
         const int block_size = std::min(static_cast<int>(norm_size), kCudaBlockSize);
         const int shared_bytes = block_size * sizeof(float);
@@ -268,44 +294,57 @@ void softmax_cuda_impl(
         for (int64_t i = 0; i < axis; ++i)
             outer_size *= X.shape(i);
 
-        const int64_t D = X.shape(axis);
-        // stride_elems() returns logical strides; for packed layouts
-        // the physical stride = logical stride * pack.
-        const int64_t axis_stride = X.stride_elems(axis) * pack;
+        const int64_t D = norm_size;
+        // No channel packing, so stride_elems() is the physical stride.
+        const int64_t axis_stride = X.stride_elems(axis);
 
         int64_t inner_total = 1;
         for (int64_t i = axis + 1; i < rank; ++i)
             inner_total *= X.shape(i);
 
-        // Precompute inner offsets on host (physical strides)
-        std::vector<int64_t> inner_offsets(static_cast<size_t>(inner_total));
+        // Precompute both position tables on host: one entry per outer position
+        // (the axis index left at 0) and one per inner position.
+        std::vector<int64_t> offsets(static_cast<size_t>(outer_size + inner_total));
+        int64_t* outer_offsets = offsets.data();
+        int64_t* inner_offsets = offsets.data() + outer_size;
+
+        for (int64_t o = 0; o < outer_size; ++o) {
+            int64_t off = 0, rem = o;
+            for (int64_t d = axis - 1; d >= 0; --d) {
+                int64_t dim = X.shape(d);
+                off += (rem % dim) * X.stride_elems(d);
+                rem /= dim;
+            }
+            outer_offsets[o] = off;
+        }
         for (int64_t s = 0; s < inner_total; ++s) {
             int64_t off = 0, rem = s;
             for (int64_t d = rank - 1; d > axis; --d) {
                 int64_t dim = X.shape(d);
-                off += (rem % dim) * X.stride_elems(d) * pack;
+                off += (rem % dim) * X.stride_elems(d);
                 rem /= dim;
             }
             inner_offsets[static_cast<size_t>(s)] = off;
         }
 
         int64_t* d_offsets = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_offsets, inner_total * sizeof(int64_t)));
-        CUDA_CHECK(cudaMemcpyAsync(d_offsets, inner_offsets.data(),
-                                     inner_total * sizeof(int64_t),
+        CUDA_CHECK(cudaMalloc(&d_offsets, offsets.size() * sizeof(int64_t)));
+        CUDA_CHECK(cudaMemcpyAsync(d_offsets, offsets.data(),
+                                     offsets.size() * sizeof(int64_t),
                                      cudaMemcpyHostToDevice, stream));
-
-        const int block_size = std::min(static_cast<int>(D), kCudaBlockSize);
-        const int shared_bytes = block_size * sizeof(float);
 
         // Launch outer_size * inner_total blocks (one per normalization group).
         // Use gridDim.y to carry inner_total so the kernel can decompose blockIdx.x.
+        const int block_size = std::min(static_cast<int>(D), kCudaBlockSize);
+        const int shared_bytes = block_size * sizeof(float);
+
         const int total_blocks = static_cast<int>(outer_size * inner_total);
         dim3 grid(total_blocks);
 
         softmax_general_kernel<<<grid, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr,
-            outer_size, D, axis_stride, inner_total, d_offsets,
+            outer_size, D, axis_stride, inner_total,
+            d_offsets, d_offsets + outer_size,
             log_softmax);
 
         CUDA_CHECK(cudaFree(d_offsets));

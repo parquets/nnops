@@ -7,6 +7,9 @@
 /// (equivalently softmax(x/T)). Quantized input (s8/u8) is dequantized to f32,
 /// softmax runs in f32, and the output is float — probabilities are never
 /// re-quantized; quantized input is planar and PerTensor/PerToken only.
+///
+/// Two layout families: planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC).
+/// Channel-packed layouts (NCHWC8/16/32, NCDHWC*) are not supported.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -59,6 +62,11 @@ public:
 
     OpType  getOpType()  const override { return OpType::Softmax; }
     Backend getBackend() const override { return backend_; }
+
+    /// Both regular activation families; channel-packed layouts are refused.
+    LayoutSupport getLayoutSupport() const noexcept override {
+        return LayoutSupport::PlanarOrChannelLast;
+    }
 
     const SoftmaxAttributes& attributes() const noexcept { return attrs_; }
 

@@ -42,6 +42,13 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_rank(inputs[0].rank, 1));
     if (!(attrs_.temperature > 0.0f)) { return Status::invalid_argument; }
 
+    // The axis walk reads the tensor through stride_elems(), which describes the
+    // two regular activation layouts; channel-packed (NCHWC8/16/32, NCDHWC*)
+    // and the opaque weight tags have no axis semantics here.
+    if (!is_planar_spatial(inputs[0].layout) && !is_channel_last(inputs[0].layout)) {
+        return Status::unsupported;
+    }
+
     if (is_quantized_dtype(inputs[0].dtype)) {
         // A quantized input is dequantized first, so the output must be float.
         if (!detail::dtype_in<DataType::f32, DataType::f16>(outputs[0].dtype)) {

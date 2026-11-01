@@ -1,17 +1,18 @@
 /// @file softmax.cpp
 /// @brief SIMD-optimized CPU implementation of softmax / log-softmax.
 ///
-/// One templated implementation covers f32 and f16, planar (NCHW/NCDHW) and
-/// packed (NCHWC8/NCDHWC8) layouts. Five dispatch paths, tried in this order:
-///   - axis == rank-1, pack > 1: per-lane SIMD within each physical row
-///     (kernel::softmax_per_lane).
-///   - axis == 1, pack > 1 (NCHWC8): per-lane across channel blocks
-///     (kernel::softmax_process_packed_channel).
-///   - pack > 1, any other axis: per-lane SIMD strided along the axis
-///     (kernel::softmax_per_lane).
-///   - axis == rank-1, pack == 1: contiguous-tail SIMD
-///     (kernel::softmax_process_standard_row).
-///   - otherwise: scalar outer/D/inner decomposition with strided access.
+/// One templated implementation covers f32 and f16 over the two activation
+/// layout families — planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC); the
+/// operator refuses channel-packed layouts (Softmax::validate). Two dispatch
+/// paths, chosen by where the normalization axis sits in memory:
+///   - The axis is the innermost axis of the storage — planar's last dim, or
+///     channel-last's C. Every group is then `D` contiguous elements and the
+///     groups are a constant stride apart, so each one is one
+///     kernel::softmax_process_standard_row call (horizontal reduction).
+///   - Every other axis: each group is `D` elements strided by the axis' element
+///     stride, so kernel::softmax_per_lane runs L groups at a time. Lanes are
+///     the channels of a channel-last tensor, or the dims below a planar axis
+///     when the pitch keeps them contiguous; otherwise one group per lane.
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems(). Patterned on
 /// onnxruntime's MlasComputeSoftmax / MlasReduceMaximumF32Kernel /
@@ -23,7 +24,6 @@
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
 #include "common/memory_pool.hpp"
-#include "common/index.hpp"
 #include "common/dtype_dispatch.hpp"
 #include "simd_kernel/simd_softmax.hpp"
 
@@ -52,81 +52,166 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 
 namespace {
 
+/// True when the axis is the innermost axis of the storage: planar's last dim
+/// and channel-last's C are one contiguous run, and the runs are a constant
+/// stride apart, so the contiguous-row kernel can take the whole axis.
+bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
+{
+    const int64_t rank = x.rank();
+    if (rank == 1) {
+        unit_stride = 1;
+        return true;
+    }
+    if (is_channel_last(x.layout())) {
+        if (axis == 1) {
+            unit_stride = x.shape(1);
+            return true;
+        }
+        // C == 1 leaves the spatial axis as the innermost one as well.
+        if (axis == rank - 1 && x.shape(1) == 1) {
+            unit_stride = x.shape(rank - 1);
+            return true;
+        }
+        return false;
+    }
+    if (axis == rank - 1) {
+        unit_stride = x.row_stride_elems();
+        return true;
+    }
+    return false;
+}
+
+/// One normalization group, scalar: D elements `stride` apart.
+template <typename T>
+void softmax_group_scalar(const T* x, T* y, int64_t D, int64_t stride,
+                          bool log_softmax, float inv_T)
+{
+    float max_val = -std::numeric_limits<float>::infinity();
+    for (int64_t k = 0; k < D; ++k) {
+        const float v = s_load(&x[k * stride]);
+        if (v > max_val) { max_val = v; }
+    }
+
+    float sum_exp = 0.0f;
+    for (int64_t k = 0; k < D; ++k) {
+        sum_exp += std::exp((s_load(&x[k * stride]) - max_val) * inv_T);
+    }
+
+    if (log_softmax) {
+        const float log_sum = std::log(sum_exp);
+        for (int64_t k = 0; k < D; ++k) {
+            const float v = (s_load(&x[k * stride]) - max_val) * inv_T - log_sum;
+            s_store(&y[k * stride], v);
+        }
+    } else {
+        const float inv_sum = 1.0f / sum_exp;
+        for (int64_t k = 0; k < D; ++k) {
+            const float v = std::exp((s_load(&x[k * stride]) - max_val) * inv_T) * inv_sum;
+            s_store(&y[k * stride], v);
+        }
+    }
+}
+
+/// The dims whose flat index selects a group's position — everything but the
+/// softmax axis, and (channel-last) the channel axis, which supplies the lanes.
+struct PositionWalk {
+    int64_t count = 1;
+    int64_t n = 0;
+    int64_t shape[TensorView::kMaxRank] = {};
+    int64_t stride[TensorView::kMaxRank] = {};
+
+    void add(const TensorView& x, int64_t dim) {
+        shape[n] = x.shape(dim);
+        stride[n] = x.stride_elems(dim);
+        count *= shape[n];
+        ++n;
+    }
+
+    int64_t offset_of(int64_t flat) const {
+        int64_t off = 0;
+        for (int64_t i = n - 1; i >= 0; --i) {
+            off += (flat % shape[i]) * stride[i];
+            flat /= shape[i];
+        }
+        return off;
+    }
+};
+
 // ============================================================
-// General-axis softmax — SIMD strided + scalar fallback
+// General-axis softmax — per-lane SIMD along the axis
 // ============================================================
-//
-// Dense (pitch == last_dim * elem_size): inner positions are contiguous, so
-// each lane does an independent softmax over the D strided axis elements and a
-// scalar tail mops up the rest. Pitch padding breaks that contiguity, so it
-// falls back to the scalar decomposition with precomputed inner offsets.
 
 template <typename T>
-void softmax_general(
-    const T* x_ptr, T* y_ptr,
-    const TensorView& X,
-    int64_t axis, int64_t outer_size, int64_t D, int64_t inner_total,
-    bool log_softmax, float inv_T,
-    const ComputeContext& ctx)
+void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
+                          int64_t axis, bool log_softmax, float inv_T,
+                          const ComputeContext& ctx)
 {
-    constexpr int L = simd_lane_for<T>;
+    constexpr int64_t L = simd_lane_for<T>;
     const int64_t rank = X.rank();
-    const int64_t pack = X.channel_pack_size();  // always 1 here (packed paths handled earlier)
-    const int64_t axis_stride = X.stride_elems(axis) * pack;
+    const int64_t D = X.shape(axis);
+    const int64_t axis_stride = X.stride_elems(axis);
 
-    // inner positions stay in one row for axis >= rank-2, else only if pitch has no padding
-    const int64_t elem_size = static_cast<int64_t>(data_type_size(X.data_type()));
-    const bool dense = (axis >= rank - 2) ||
-                       (X.pitch() == X.shape(rank - 1) * elem_size);
+    // Lanes: the channels of a channel-last tensor are one vector, and so are
+    // the dims below a planar axis when the pitch leaves them contiguous.
+    const bool channel_last = is_channel_last(X.layout()) && rank > 1;
+    const bool lanes_are_channels = channel_last && axis != 1;
+    int64_t nlanes = 1;
+    if (lanes_are_channels) {
+        nlanes = X.shape(1);
+    } else if (axis + 1 < rank && X.stride_elems(rank - 1) == 1 &&
+               (axis == rank - 2 ||
+                X.pitch() == static_cast<int64_t>(
+                    data_type_row_bytes(X.data_type(), X.shape(rank - 1))))) {
+        for (int64_t d = axis + 1; d < rank; ++d) { nlanes *= X.shape(d); }
+    }
 
-    const auto process_row = [&](int64_t outer) {
-        int64_t base = outer * D * axis_stride;
+    PositionWalk pos;
+    for (int64_t d = 0; d < rank; ++d) {
+        if (d == axis) { continue; }
+        if (nlanes > 1) {
+            if (lanes_are_channels ? (d == 1) : (d > axis)) { continue; }
+        }
+        pos.add(X, d);
+    }
 
-        const auto scalar_softmax = [&](int64_t inner_off) {
-            float max_val = -std::numeric_limits<float>::infinity();
-            for (int64_t k = 0; k < D; ++k) {
-                float v = s_load(&x_ptr[base + inner_off + k * axis_stride]);
-                if (v > max_val) { max_val = v; }
-            }
-            float sum_exp = 0.0f;
-            for (int64_t k = 0; k < D; ++k) {
-                sum_exp += std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T);
-            }
-            if (log_softmax) {
-                float log_sum = std::log(sum_exp);
-                for (int64_t k = 0; k < D; ++k) {
-                    float val = (s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T - log_sum;
-                    s_store(&y_ptr[base + inner_off + k * axis_stride], val);
-                }
-            } else {
-                float inv_sum = 1.0f / sum_exp;
-                for (int64_t k = 0; k < D; ++k) {
-                    float val = std::exp((s_load(&x_ptr[base + inner_off + k * axis_stride]) - max_val) * inv_T) * inv_sum;
-                    s_store(&y_ptr[base + inner_off + k * axis_stride], val);
-                }
-            }
-        };
+    const int64_t lane_blocks = (nlanes + L - 1) / L;
 
-        if (dense) {
-            int64_t s = 0;
-            for (; s + L <= inner_total; s += L) {
-                kernel::softmax_per_lane<T>(
-                    x_ptr + base + s, y_ptr + base + s,
+    ctx.cpu.run(0, pos.count * lane_blocks, [&](int64_t task) {
+        const int64_t base = pos.offset_of(task / lane_blocks);
+        const int64_t lane0 = (task % lane_blocks) * L;
+
+        if (lane0 + L <= nlanes) {
+            kernel::softmax_per_lane<T>(
+                x_ptr + base + lane0, y_ptr + base + lane0,
+                D, axis_stride, log_softmax, inv_T);
+        } else {
+            for (int64_t lane = lane0; lane < nlanes; ++lane) {
+                softmax_group_scalar<T>(
+                    x_ptr + base + lane, y_ptr + base + lane,
                     D, axis_stride, log_softmax, inv_T);
             }
-            for (; s < inner_total; ++s) {
-                scalar_softmax(s);
-            }
-        } else {
-            const auto inner_offsets = build_offsets(X, axis + 1, rank - 1, inner_total);
-
-            for (int64_t s = 0; s < inner_total; ++s) {
-                scalar_softmax(inner_offsets[static_cast<size_t>(s)]);
-            }
         }
-    };
+    });
+}
 
-    ctx.cpu.run(0, outer_size, process_row);
+// ============================================================
+// Innermost-axis softmax — one contiguous run per group
+// ============================================================
+
+template <typename T>
+void softmax_contiguous_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
+                             int64_t axis, int64_t unit_stride,
+                             bool log_softmax, float inv_T,
+                             const ComputeContext& ctx)
+{
+    const int64_t D = X.shape(axis);
+    const int64_t units = (D > 0) ? X.numel() / D : 0;
+
+    ctx.cpu.run(0, units, [&](int64_t u) {
+        kernel::softmax_process_standard_row<T>(
+            x_ptr + u * unit_stride, y_ptr + u * unit_stride,
+            D, log_softmax, inv_T);
+    });
 }
 
 }  // anonymous namespace
@@ -156,123 +241,21 @@ void softmax_impl(const SoftmaxAttributes& attrs,
     const auto* x_ptr = X.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
-    const int64_t pack = X.channel_pack_size();
-
-    // Path 1 — Packed SIMD: axis == rank-1, pack > 1
-    if (axis == rank - 1 && pack > 1) {
-        const int64_t D = X.shape(axis);
-        const int64_t num_rows = X.total_rows();
-        const int64_t x_rs = X.row_stride_elems();
-        const int64_t y_rs = output.row_stride_elems();
-
-        const auto process_row = [&](int64_t r) {
-            kernel::softmax_per_lane<T>(
-                x_ptr + r * x_rs, y_ptr + r * y_rs, D, pack, log_softmax, inv_T);
-        };
-
-        ctx.cpu.run(0, num_rows, process_row);
-
+    int64_t unit_stride = 0;
+    if (axis_is_innermost(X, axis, unit_stride)) {
+        softmax_contiguous_axis<T>(x_ptr, y_ptr, X, axis, unit_stride,
+                                   log_softmax, inv_T, ctx);
         return;
     }
 
-    // Path 1b — Packed channel SIMD: axis == 1, pack > 1 (NCHWC8)
-    if (axis == 1 && pack > 1) {
-        const int64_t C = X.shape(1);
-        const int64_t C8 = X.num_channel_blocks();        // ceil(C / pack)
-        const int64_t chan_stride = X.stride_elems(1);
-        const int64_t valid_lanes = (C % pack == 0) ? pack : (C % pack);
-
-        int64_t num_spatial = 1;
-        for (int64_t d = 0; d < rank; ++d) {
-            if (d != 1) {
-                num_spatial *= X.shape(d);
-            }
-        }
-
-        const auto process_pos = [&](int64_t s) {
-            const int64_t off = decompose_flat_offset(s, X, 0, rank - 1, /*skip_dim=*/1);
-            kernel::softmax_process_packed_channel<T>(
-                x_ptr + off, y_ptr + off,
-                chan_stride,
-                C8, pack, valid_lanes, log_softmax, inv_T);
-        };
-
-        ctx.cpu.run(0, num_spatial, process_pos);
-
-        return;
-    }
-
-    // Path 1c — Packed column SIMD (pack > 1, non-channel axis): covers NCHWC8 H,
-    // NCDHWC8 D/H, and axis=0 for all.
-    if (pack > 1) {
-        const int64_t D = X.shape(axis);
-        const int64_t axis_stride = X.stride_elems(axis);
-
-        int64_t num_positions = 1;
-        for (int64_t d = 0; d < rank; ++d) {
-            if (d != axis) {
-                num_positions *= X.shape(d);
-            }
-        }
-
-        const auto process_pos = [&](int64_t s) {
-            const int64_t off = decompose_flat_offset(s, X, 0, rank - 1, /*skip_dim=*/axis);
-            kernel::softmax_per_lane<T>(
-                x_ptr + off, y_ptr + off,
-                D, axis_stride, log_softmax, inv_T);
-        };
-
-        ctx.cpu.run(0, num_positions, process_pos);
-
-        return;
-    }
-
-    // Path 2 — Standard SIMD fast path: axis == rank-1, pack == 1
-    if (axis == rank - 1) {
-        int64_t num_rows = 1;
-        for (int64_t i = 0; i < axis; ++i) {
-            num_rows *= X.shape(i);
-        }
-
-        const int64_t D = X.shape(axis);
-        const int64_t group_stride = (axis > 0) ? X.stride_elems(axis - 1) : D;
-
-        const auto process_row = [&](int64_t row) {
-            kernel::softmax_process_standard_row<T>(
-                x_ptr + row * group_stride, y_ptr + row * group_stride, D, log_softmax, inv_T);
-        };
-
-        ctx.cpu.run(0, num_rows, process_row);
-
-        return;
-    }
-
-    // Path 3 — General axis: scalar, reference-style decomposition
-    {
-        int64_t outer_size = 1;
-        for (int64_t i = 0; i < axis; ++i) {
-            outer_size *= X.shape(i);
-        }
-
-        const int64_t D = X.shape(axis);
-
-        int64_t inner_total = 1;
-        for (int64_t i = axis + 1; i < rank; ++i) {
-            inner_total *= X.shape(i);
-        }
-
-        softmax_general<T>(
-            x_ptr, y_ptr, X,
-            axis, outer_size, D, inner_total,
-            log_softmax, inv_T, ctx);
-    }
+    softmax_strided_axis<T>(x_ptr, y_ptr, X, axis, log_softmax, inv_T, ctx);
 }
 
 // ---- Quantized input (s8/u8) → float output (f32/f16) ----
 //
 // Dequantize to contiguous f32 scratch (arch quant.hpp per-row kernels), run f32
 // softmax on it, then write back f32 or f16 (probabilities are never
-// re-quantized). PerTensor / PerToken only, planar (pack == 1) layouts only.
+// re-quantized). PerTensor / PerToken only, planar layouts only.
 
 Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
                                 TensorView& output,
@@ -291,7 +274,7 @@ Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(out_dtype == DataType::f32 || out_dtype == DataType::f16);
 
     // Quantized softmax is only defined over planar layouts (Softmax::validate).
-    NNOPS_ASSERT(X.channel_pack_size() == 1);
+    NNOPS_ASSERT(is_planar_spatial(X.layout()));
     if (workspace == nullptr) { return Status::out_of_memory; }
 
     const QuantParams& qp = X.quant_params();

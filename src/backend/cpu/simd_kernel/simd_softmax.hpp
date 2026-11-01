@@ -3,11 +3,9 @@
 /// @brief SIMD softmax / log-softmax kernels.
 ///
 /// softmax_per_lane is the unified 3-pass kernel — max, then exp((x-max)/T) plus
-/// its sum, then normalize — over D elements strided by `stride`. Every per-lane
-/// variant (packed row, packed column, strided axis) is this kernel and differs
-/// only in the stride. softmax_process_packed_channel adds a scalar per-lane
-/// correction over a partial last C8 block, whose padded zeros must not perturb
-/// the max, sum or normalization.
+/// its sum, then normalize — over D elements strided by `stride`, one
+/// normalization group per lane. Every strided-axis case is this kernel and
+/// differs only in the stride.
 ///
 /// softmax_process_standard_row is structurally different: horizontal
 /// v_reduce_max / v_reduce_sum over one contiguous row. HasMask fuses an
@@ -68,99 +66,6 @@ inline void softmax_per_lane(
         }
     }
 }
-
-template <typename T>
-inline void softmax_process_packed_channel(
-    const T* x_chan, T* y_chan,
-    int64_t stride,
-    int64_t D, int64_t pack, int64_t valid_lanes,
-    bool log_softmax,
-    float inv_T = 1.0f
-) {
-    int64_t full_blocks = (valid_lanes == pack || D == 0) ? D : D - 1;
-    auto v_inv_T = v_set1(x_chan, inv_T);
-
-    auto lane_val = [](auto vec, int64_t l) -> float {
-        T buf[16];
-        v_store(buf, vec);
-        return s_load(&buf[l]);
-    };
-
-    auto v_max_vec = v_set1(x_chan, -std::numeric_limits<float>::infinity());
-    for (int64_t c = 0; c < full_blocks; ++c) {
-        v_max_vec = v_max(v_max_vec, v_load(x_chan + c * stride));
-    }
-
-    if (valid_lanes < pack) {
-        T tmp[16];
-        v_store(tmp, v_max_vec);
-        const T* last = x_chan + (D - 1) * stride;
-        for (int64_t l = 0; l < valid_lanes; ++l) {
-            float v = s_load(&last[l]);
-            if (v > s_load(&tmp[l])) { s_store(&tmp[l], v); }
-        }
-        v_max_vec = v_load(tmp);
-    }
-
-    auto v_sum_vec = v_zero(x_chan);
-    auto v_neg_max = v_neg(v_max_vec);
-
-    for (int64_t c = 0; c < full_blocks; ++c) {
-        auto v = v_add(v_load(x_chan + c * stride), v_neg_max);
-        if (inv_T != 1.0f) { v = v_mul(v, v_inv_T); }
-        v = v_exp(v);
-        if (!log_softmax) { v_store(y_chan + c * stride, v); }
-        v_sum_vec = v_add(v_sum_vec, v);
-    }
-
-    if (valid_lanes < pack) {
-        T tmp[16];
-        v_store(tmp, v_sum_vec);
-        const T* last_x = x_chan + (D - 1) * stride;
-        T*       last_y = y_chan + (D - 1) * stride;
-
-        for (int64_t l = 0; l < valid_lanes; ++l) {
-            float xv = s_load(&last_x[l]);
-            float nm = lane_val(v_neg_max, l);
-            float ev = std::exp((xv + nm) * inv_T);
-            if (!log_softmax) { s_store(&last_y[l], ev); }
-            s_store(&tmp[l], s_load(&tmp[l]) + ev);
-        }
-        v_sum_vec = v_load(tmp);
-    }
-
-    if (log_softmax) {
-        auto v_bias = v_sub(v_neg(v_mul(v_max_vec, v_inv_T)), v_log(v_sum_vec));
-        for (int64_t c = 0; c < full_blocks; ++c) {
-            v_store(y_chan + c * stride,
-                    v_add(v_mul(v_load(x_chan + c * stride), v_inv_T), v_bias));
-        }
-        if (valid_lanes < pack) {
-            const T* last_x = x_chan + (D - 1) * stride;
-            T*       last_y = y_chan + (D - 1) * stride;
-            for (int64_t l = 0; l < valid_lanes; ++l) {
-                float xv = s_load(&last_x[l]);
-                float b  = lane_val(v_bias, l);
-                s_store(&last_y[l], xv * inv_T + b);
-            }
-        }
-    } else {
-        auto v_inv = v_div(v_set1(x_chan, 1.0f), v_sum_vec);
-        for (int64_t c = 0; c < full_blocks; ++c) {
-            v_store(y_chan + c * stride,
-                    v_mul(v_load(y_chan + c * stride), v_inv));
-        }
-        if (valid_lanes < pack) {
-            T* last_y = y_chan + (D - 1) * stride;
-            for (int64_t l = 0; l < valid_lanes; ++l) {
-                float ev = s_load(&last_y[l]);
-                float inv = lane_val(v_inv, l);
-                s_store(&last_y[l], ev * inv);
-            }
-        }
-    }
-}
-
 
 template <typename T, bool HasMask>
 inline auto softmax_xm(const T* x, const T* mask, int64_t i) {
