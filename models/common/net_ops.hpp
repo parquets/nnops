@@ -279,9 +279,8 @@ inline const TensorView& hwcm_weight(const TensorView& w)
 inline const TensorView& winograd_weight(const TensorView& w,
                                          const nnops::Conv2DAttributes& attrs)
 {
-    static std::map<const void*, Buf> cache;
-    auto it = cache.find(w.ptr<float>());
-    if (it != cache.end()) { return it->second.view; }
+    static std::map<const void*, detail::WeightCopy> cache;
+    if (const TensorView* hit = detail::find_copy(cache, w)) { return *hit; }
 
     // Two-step prepack: query the U descriptor, allocate it, fill it.
     auto op = nnops::Conv2D::create(attrs, Backend::CPU);
@@ -293,7 +292,7 @@ inline const TensorView& winograd_weight(const TensorView& w,
     TensorView pack[] = {u.view};
     op->prepackWeights(in, pack);
 
-    return cache.emplace(w.ptr<float>(), std::move(u)).first->second.view;
+    return detail::store_copy(cache, w, std::move(u));
 }
 
 /// Whether the runners prepack their filters — always on, except for the A/B
@@ -321,9 +320,8 @@ inline bool prepack_enabled()
 inline const TensorView& packed_weight(const TensorView& w,
                                        const nnops::Conv2DAttributes& attrs)
 {
-    static std::map<const void*, Buf> cache;
-    auto it = cache.find(w.ptr<float>());
-    if (it != cache.end()) { return it->second.view; }
+    static std::map<const void*, detail::WeightCopy> cache;
+    if (const TensorView* hit = detail::find_copy(cache, w)) { return *hit; }
 
     nnops::Conv2DAttributes use = attrs;
     use.algorithm = nnops::ConvAlgorithm::ImplicitGemm;
@@ -336,7 +334,7 @@ inline const TensorView& packed_weight(const TensorView& w,
     TensorView pack[] = {blob.view};
     op->prepackWeights(in, pack);
 
-    return cache.emplace(w.ptr<float>(), std::move(blob)).first->second.view;
+    return detail::store_copy(cache, w, std::move(blob));
 }
 
 /// Run a conv on the weight it should take: Winograd reads the transformed U
@@ -693,9 +691,8 @@ inline Buf global_avg_pool(const TensorView& x)
 /// what compute() takes anyway.
 inline const TensorView& packed_linear_weight(const TensorView& w)
 {
-    static std::map<const void*, Buf> cache;
-    auto it = cache.find(w.ptr<float>());
-    if (it != cache.end()) { return it->second.view; }
+    static std::map<const void*, detail::WeightCopy> cache;
+    if (const TensorView* hit = detail::find_copy(cache, w)) { return *hit; }
 
     auto op = nnops::Linear::create(nnops::LinearAttributes{}, Backend::CPU);
     TensorView query;
@@ -709,7 +706,7 @@ inline const TensorView& packed_linear_weight(const TensorView& w)
     TensorView pack[] = {blob.view};
     op->prepackWeights(in, pack);
 
-    return cache.emplace(w.ptr<float>(), std::move(blob)).first->second.view;
+    return detail::store_copy(cache, w, std::move(blob));
 }
 
 inline Buf linear(const TensorView& x, const TensorView& w, const TensorView& b)
