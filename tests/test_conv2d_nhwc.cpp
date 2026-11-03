@@ -1082,6 +1082,10 @@ NNOPS_TEST(conv2d_nhwc_threaded_matches_serial) {
         {{{1, 256, 14, 14}, 256, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},  67},
         {{{1, 192, 14, 14},  64, 1, 1, 1, 1, 0, 0, 1, 1, 1, false}, 68},
         {{{1, 512, 7, 7},   512, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},   69},
+        // ResNet-18's layer4.0 conv1: one plane-level task, so the filter axis
+        // splits, and a split that starts mid-oc-block must still cover the
+        // rest of that block.
+        {{{1, 256, 14, 14}, 512, 3, 3, 2, 2, 1, 1, 1, 1, 1, true},   70},
     };
 
     int case_i = 0;
@@ -1142,10 +1146,19 @@ NNOPS_TEST(conv2d_nhwc_threaded_matches_serial) {
         auto threaded_out = make_out(threaded_buf);
         op->compute(serial_out, ins, {}, nullptr);
 
-        for (int nthreads : {2, 4, 8, 20}) {
+        for (int nthreads : {2, 3, 4, 5, 6, 8, 20}) {
             SimplePool pool(nthreads);
             ComputeContext ctx;
+            // One task per worker: openmp_backend over-subscribes the grid past
+            // the fast-core count, which thins the filter-axis split — the one
+            // this loop exists to cover. Pin it to the worker count.
             ctx.cpu = pool.cpu;
+            ctx.cpu.num_threads = [nthreads] { return nthreads; };
+            ctx.cpu.thread_slots = [nthreads] { return nthreads; };
+            // Poison the destination first: an oc chunk the task grid never
+            // writes would otherwise keep the previous run's correct values,
+            // and the comparison could not tell.
+            std::fill(threaded_buf.begin(), threaded_buf.end(), -12345.0f);
             op->compute(threaded_out, ins, ctx, nullptr);
             if (std::memcmp(serial_buf.data(), threaded_buf.data(),
                             static_cast<size_t>(out_n) * sizeof(float)) != 0) {
@@ -1757,28 +1770,42 @@ NNOPS_TEST(conv2d_nhwc_i8_int_out) {
 }
 
 NNOPS_TEST(conv2d_nhwc_i8_threaded_matches_serial) {
-    QCase c;
-    c.ishape = {1, 16, 20, 20};
-    c.wshape = {160, 16, 3, 3};
-    c.kh = c.kw = 3;
-    c.ph = c.pw = 1;
-    c.act = DataType::u8;
-    c.zp_x = 128;
-    c.asym_w = true;
-    c.bias = true;
-    c.seed = 4000;
+    // Two shapes: a narrow-oc 20x20 plane, and a wide-output one on a plane too
+    // small to fill the pool — 64 channels into 512, where the filter axis has
+    // to split and a chunk starts mid-oc-block.
+    QCase small;
+    small.ishape = {1, 16, 20, 20};
+    small.wshape = {160, 16, 3, 3};
+    small.kh = small.kw = 3;
+    small.sh = small.sw = 1;
+    small.ph = small.pw = 1;
+    small.act = DataType::u8;
+    small.zp_x = 128;
+    small.asym_w = true;
+    small.bias = true;
+    small.seed = 4000;
 
-    const std::string serial = run_q_case(c, {}, /*exact=*/true);
-    if (!serial.empty()) { throw std::runtime_error("serial: " + serial); }
+    QCase starved = small;
+    starved.ishape = {1, 64, 14, 14};
+    starved.wshape = {512, 64, 3, 3};
+    starved.seed = 4001;
 
-    for (int nthreads : {2, 4}) {
-        SimplePool pool(nthreads);
-        ComputeContext ctx;
-        ctx.cpu = pool.cpu;
-        const std::string threaded = run_q_case(c, ctx, /*exact=*/true);
-        if (!threaded.empty()) {
-            throw std::runtime_error(threaded + " (" + std::to_string(nthreads) +
-                                     " threads)");
+    const QCase cases[] = {small, starved};
+    for (const QCase& c : cases) {
+        const std::string serial = run_q_case(c, {}, /*exact=*/true);
+        if (!serial.empty()) { throw std::runtime_error("serial: " + serial); }
+
+        for (int nthreads : {2, 3, 5, 6, 20}) {
+            SimplePool pool(nthreads);
+            ComputeContext ctx;
+            ctx.cpu = pool.cpu;
+            ctx.cpu.num_threads = [nthreads] { return nthreads; };
+            ctx.cpu.thread_slots = [nthreads] { return nthreads; };
+            const std::string threaded = run_q_case(c, ctx, /*exact=*/true);
+            if (!threaded.empty()) {
+                throw std::runtime_error(threaded + " (" + std::to_string(nthreads) +
+                                         " threads)");
+            }
         }
     }
 }

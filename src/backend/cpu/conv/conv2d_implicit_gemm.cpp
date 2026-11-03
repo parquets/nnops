@@ -1603,12 +1603,18 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
         const bool flat = out_row_stride == OW * OC &&
                           (!plan.pointwise || in_row_stride == IW * IC);
 
-        for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
-            // A task may start mid-block (oc_chunks splits on panels), but the
-            // blob holds one oc block at a time: end the tile where the block
-            // does, so its panels keep the stride the kernel derives from kdim.
-            const int64_t oc_end = panels
-                ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
+        // A task may start mid-block (oc_chunks splits on panels), but the blob
+        // holds one oc block at a time: end the tile where the block does, so its
+        // panels keep the stride the kernel derives from kdim. The step is
+        // therefore the tile's own end — a whole block from a short tile would
+        // skip the rest of that block.
+        const auto block_end = [&](int64_t ocn) {
+            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block)
+                          : oc_hi;
+        };
+        for (int64_t ocn = oc_lo; ocn < oc_hi;
+             ocn = panels ? block_end(ocn) : ocn + ocn_block) {
+            const int64_t oc_end = block_end(ocn);
             const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
             // The residual region covers one pass's rows (one oc block live).
             T* const orig = keep_orig ? orig_buf : nullptr;
@@ -2073,11 +2079,15 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
         const bool flat = out_row_stride == OW * OC &&
                           (!plan.pointwise || in_row_stride == IW * IC);
 
-        for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
-            // Same block-end clamp as the fp route: the blob holds one oc block
-            // at a time and the kernel walks its panels at `slot` apart.
-            const int64_t oc_end = panels
-                ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
+        // Same block-end clamp and step as the fp route: the blob holds one oc
+        // block at a time and the kernel walks its panels at `slot` apart.
+        const auto block_end = [&](int64_t ocn) {
+            return panels ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block)
+                          : oc_hi;
+        };
+        for (int64_t ocn = oc_lo; ocn < oc_hi;
+             ocn = panels ? block_end(ocn) : ocn + ocn_block) {
+            const int64_t oc_end = block_end(ocn);
             const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
 
             for (int64_t pr = r0; pr < r1; pr += ph_block) {
