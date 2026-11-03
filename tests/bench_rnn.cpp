@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
@@ -35,6 +36,8 @@
 #include <vector>
 
 using namespace nnops;
+using nnops::simd::s_load;
+using nnops::simd::s_store;
 namespace cpu = nnops::backend::cpu;
 using cpu::half;
 
@@ -91,7 +94,33 @@ struct RecurrentCase {
     RnnDirection dir = RnnDirection::Forward;
     bool f16 = false;
     bool lbr = false;  ///< GRU linear_before_reset: one pass per step instead of two
+    /// s8 W and R with one symmetric scale per gate row; X stays floating, so
+    /// the kernel quantizes every activation row (the W8A8 route).
+    bool q8 = false;
 };
+
+/// W or R as a real quantization would leave it: each row rounded to s8 against
+/// its own max, so the quantized route sees the same weights the fp route does
+/// (up to the rounding) and the two timings are comparable.
+template <typename T>
+void quantize_rows(const std::vector<T>& src, int64_t rows, int64_t cols,
+                   std::vector<int8_t>& q, std::vector<float>& sc) {
+    q.resize(src.size());
+    sc.assign(static_cast<size_t>(rows), 1.0f);
+    for (int64_t r = 0; r < rows; ++r) {
+        const T* row = src.data() + r * cols;
+        float mx = 0.0f;
+        for (int64_t k = 0; k < cols; ++k) {
+            mx = std::max(mx, std::fabs(s_load(row + k)));
+        }
+        const float s = mx > 0.0f ? mx / 127.0f : 1.0f;
+        sc[static_cast<size_t>(r)] = s;
+        for (int64_t k = 0; k < cols; ++k) {
+            const float v = std::min(std::max(s_load(row + k) / s, -127.0f), 127.0f);
+            q[static_cast<size_t>(r * cols + k)] = static_cast<int8_t>(std::lround(v));
+        }
+    }
+}
 
 template <typename T>
 void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int iters) {
@@ -113,7 +142,29 @@ void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int 
     auto [c_vec, c0] = make_random<T>(hshape, 16);
 
     const bool lstm = c.mode == RecurrentMode::Lstm;
-    std::vector<TensorView> ins = {x, w, r, b, TensorView{}, h0};
+
+    // The quantized route's storage and views. Declared before `ins` so the
+    // views' scale pointers outlive every compute call.
+    std::vector<int8_t> wq, rq;
+    std::vector<float> wsc, rsc;
+    QuantParams qw, qr;
+    TensorView w_view = w;
+    TensorView r_view = r;
+    if (c.q8) {
+        quantize_rows(w_vec, D * G * c.H, c.I, wq, wsc);
+        quantize_rows(r_vec, D * G * c.H, c.H, rq, rsc);
+        qw.granularity = QuantGranularity::PerToken;
+        qw.scale_data = wsc.data();
+        qw.num_scales = D * G * c.H;
+        qr = qw;
+        qr.scale_data = rsc.data();
+        w_view = TensorView(std::span<const int64_t>(wshape, 3), DataType::s8,
+                            wq.data(), TensorLayout::NCHW, qw);
+        r_view = TensorView(std::span<const int64_t>(rshape, 3), DataType::s8,
+                            rq.data(), TensorLayout::NCHW, qr);
+    }
+
+    std::vector<TensorView> ins = {x, w_view, r_view, b, TensorView{}, h0};
     if (lstm) { ins.push_back(c0); }
 
     std::vector<T> y_buf(static_cast<size_t>(c.T * D * c.B * c.H));
@@ -153,9 +204,10 @@ void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int 
                                   static_cast<double>(c.I + c.H);
 
     std::printf("  %s\n", c.name);
-    std::printf("    T=%lld B=%lld I=%lld H=%lld  G=%lld D=%lld  %s\n",
+    std::printf("    T=%lld B=%lld I=%lld H=%lld  G=%lld D=%lld  %s%s\n",
                 (long long)c.T, (long long)c.B, (long long)c.I, (long long)c.H,
-                (long long)G, (long long)D, c.f16 ? "f16" : "f32");
+                (long long)G, (long long)D, c.f16 ? "f16" : "f32",
+                c.q8 ? " W8A8" : "");
 
     auto compute = [&](const ComputeContext& ctx) { op->compute(outs, ins, ctx, nullptr); };
 
@@ -488,4 +540,162 @@ NNOPS_BENCH(rnn_prepack_ab) {
     ab_rnn_prepack<float>(RecurrentMode::Lstm, 32, 1, 128, 128, threads, 20, 9);
     ab_rnn_prepack<float>(RecurrentMode::Lstm, 32, 8, 128, 128, threads, 20, 9);
     ab_rnn_prepack<half>(RecurrentMode::Lstm, 32, 1, 256, 256, threads, 20, 9);
+}
+
+// ============================================================
+// W8A8 — s8 weights, activations quantized inside the kernel
+// ============================================================
+
+NNOPS_BENCH(q8_lstm_decode) {
+    // One timestep, one row: the decode step, where both products are short and
+    // the int8 route's per-call setup is the whole question.
+    bench_case({"lstm T1 B1 I256 H256 W8A8", RecurrentMode::Lstm, 1, 1, 256, 256,
+                RnnDirection::Forward, /*f16=*/false, /*lbr=*/false, /*q8=*/true});
+}
+
+NNOPS_BENCH(q8_lstm_batched) {
+    // Batched and long enough that the tile has full m: the case where the
+    // narrower int8 panels can actually pay.
+    bench_case({"lstm T32 B8 I128 H128 W8A8", RecurrentMode::Lstm, 32, 8, 128, 128,
+                RnnDirection::Forward, false, false, /*q8=*/true});
+}
+
+NNOPS_BENCH(q8_lstm_wide) {
+    // H past the 256-value int8 k cap: the recurrent product splits in k.
+    bench_case({"lstm T16 B2 I256 H520 W8A8", RecurrentMode::Lstm, 16, 2, 256, 520,
+                RnnDirection::Forward, false, false, /*q8=*/true});
+}
+
+NNOPS_BENCH(q8_gru_batched) {
+    // Two phases per step, each with its own packed R panels.
+    bench_case({"gru T32 B8 I128 H128 W8A8", RecurrentMode::Gru, 32, 8, 128, 128,
+                RnnDirection::Forward, false, /*lbr=*/true, /*q8=*/true});
+}
+
+NNOPS_BENCH(q8_lstm_f16_compute) {
+    // s8 weights, f16 gate arithmetic and state: the mixed reading.
+    bench_case({"lstm f16 T32 B8 I128 H128 W8A8", RecurrentMode::Lstm, 32, 8, 128, 128,
+                RnnDirection::Forward, /*f16=*/true, false, /*q8=*/true});
+}
+
+/// The fp arm against the W8A8 arm, interleaved in one process on the same
+/// weights. The only difference is the two products' arithmetic, so the ratio is
+/// what quantizing the layer buys end to end — including the per-step
+/// quantize-and-dequantize passes the int8 route adds.
+template <typename T>
+void ab_rnn_q8(RecurrentMode mode, int64_t steps, int64_t B, int64_t I, int64_t H,
+               const std::vector<int>& threads, int iters, int reps) {
+    const int64_t G = recurrent_gates(mode);
+    constexpr int64_t D = 1;
+    const int64_t xshape[] = {steps, B, I};
+    const int64_t wshape[] = {D, G * H, I};
+    const int64_t rshape[] = {D, G * H, H};
+    const int64_t bshape[] = {D, 2 * G * H};
+    const int64_t hshape[] = {D, B, H};
+    const int64_t yshape[] = {steps, D, B, H};
+
+    auto [x_vec, x] = make_random<T>(xshape, 11);
+    auto [w_vec, w] = make_random<T>(wshape, 12);
+    auto [r_vec, r] = make_random<T>(rshape, 13);
+    auto [b_vec, b] = make_random<T>(bshape, 14);
+    auto [h_vec, h0] = make_random<T>(hshape, 15);
+    auto [c_vec, c0] = make_random<T>(hshape, 16);
+
+    std::vector<int8_t> wq, rq;
+    std::vector<float> wsc, rsc;
+    quantize_rows(w_vec, D * G * H, I, wq, wsc);
+    quantize_rows(r_vec, D * G * H, H, rq, rsc);
+    QuantParams qw, qr;
+    qw.granularity = QuantGranularity::PerToken;
+    qw.scale_data = wsc.data();
+    qw.num_scales = D * G * H;
+    qr = qw;
+    qr.scale_data = rsc.data();
+    const TensorView w8w(std::span<const int64_t>(wshape, 3), DataType::s8, wq.data(),
+                         TensorLayout::NCHW, qw);
+    const TensorView r8w(std::span<const int64_t>(rshape, 3), DataType::s8, rq.data(),
+                         TensorLayout::NCHW, qr);
+
+    std::vector<T> y_buf(static_cast<size_t>(steps * D * B * H));
+    std::vector<T> yh_buf(static_cast<size_t>(D * B * H));
+    std::vector<T> yc_buf(static_cast<size_t>(D * B * H));
+    const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    std::vector<TensorView> outs = {
+        TensorView(std::span<const int64_t>(yshape, 4), dt, y_buf.data()),
+        TensorView(std::span<const int64_t>(hshape, 3), dt, yh_buf.data()),
+    };
+    std::vector<TensorView> ins_fp = {x, w, r, b, TensorView{}, h0};
+    std::vector<TensorView> ins_q8 = {x, w8w, r8w, b, TensorView{}, h0};
+    if (mode == RecurrentMode::Lstm) {
+        ins_fp.push_back(c0);
+        ins_q8.push_back(c0);
+        outs.push_back(TensorView(std::span<const int64_t>(hshape, 3), dt, yc_buf.data()));
+    }
+
+    std::unique_ptr<OpBase> op;
+    if (mode == RecurrentMode::Lstm) {
+        LstmAttributes a;
+        a.hidden_size = H;
+        op = Lstm::create(a, Backend::CPU);
+    } else if (mode == RecurrentMode::Gru) {
+        GruAttributes a;
+        a.hidden_size = H;
+        op = Gru::create(a, Backend::CPU);
+    } else {
+        RnnAttributes a;
+        a.hidden_size = H;
+        op = Rnn::create(a, Backend::CPU);
+    }
+
+    const char* name = mode == RecurrentMode::Lstm ? "lstm"
+                     : mode == RecurrentMode::Gru  ? "gru" : "rnn";
+    std::printf("  %s fp vs W8A8  T=%lld B=%lld I=%lld H=%lld\n", name,
+                (long long)steps, (long long)B, (long long)I, (long long)H);
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    auto time_it = [&](std::span<const TensorView> in, const ComputeContext& ctx) {
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) { op->compute(outs, in, ctx, nullptr); }
+        auto end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(end - start).count() /
+               static_cast<double>(iters);
+    };
+
+    std::printf("    ");
+    for (size_t i = 0; i < threads.size(); ++i) {
+        BenchPool pool(threads[i]);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (threads[i] > 1) ? ctx : ComputeContext{};
+        time_it(ins_fp, use_ctx);
+        time_it(ins_q8, use_ctx);
+
+        std::vector<double> tf, tq;
+        for (int rep = 0; rep < reps; ++rep) {
+            if (rep & 1) {
+                tq.push_back(time_it(ins_q8, use_ctx));
+                tf.push_back(time_it(ins_fp, use_ctx));
+            } else {
+                tf.push_back(time_it(ins_fp, use_ctx));
+                tq.push_back(time_it(ins_q8, use_ctx));
+            }
+        }
+        const double f = median(tf), q = median(tq);
+        std::printf(" %2dT fp %7.1f vs q8 %7.1f us/call (%.2fx)%s", threads[i],
+                    f * 1e3, q * 1e3, f / q, (i + 1 < threads.size()) ? " |" : "\n");
+    }
+}
+
+NNOPS_BENCH(rnn_q8_ab) {
+    const std::vector<int> threads{1, 4};
+    ab_rnn_q8<float>(RecurrentMode::Lstm, 1, 1, 256, 256, threads, 50, 9);
+    ab_rnn_q8<float>(RecurrentMode::Lstm, 8, 1, 256, 256, threads, 20, 9);
+    ab_rnn_q8<float>(RecurrentMode::Lstm, 32, 8, 128, 128, threads, 20, 9);
+    ab_rnn_q8<float>(RecurrentMode::Lstm, 16, 2, 256, 520, threads, 20, 9);
+    ab_rnn_q8<float>(RecurrentMode::Gru, 32, 1, 128, 128, threads, 20, 9);
+    ab_rnn_q8<float>(RecurrentMode::Rnn, 32, 8, 128, 128, threads, 20, 9);
+    ab_rnn_q8<half>(RecurrentMode::Lstm, 32, 8, 128, 128, threads, 20, 9);
 }

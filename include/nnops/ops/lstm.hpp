@@ -17,6 +17,12 @@
 /// tile, so one pass over a tile produces C and H without a second sweep; see
 /// rnn.hpp for the chunked input projection and the tile epilogue.
 ///
+/// An s8 W and R select the quantized route (W8A8): both products of every gate
+/// are int8 MMAs against per-row dynamically quantized activations, dequantized
+/// into the compute dtype before the cell update, which is unchanged. The
+/// contract — symmetric only, the s8 activation option, the prepacked blob — is
+/// rnn.hpp's.
+///
 /// Inputs (ONNX order, an absent optional is an empty view):
 ///   0 X [T,B,I]  1 W [D,4H,I]  2 R [D,4H,H]  3 B [D,8H]
 ///   4 sequence_lens [B] int32  5 initial_h [D,B,H]  6 initial_c [D,B,H]

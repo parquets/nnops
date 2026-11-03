@@ -19,6 +19,22 @@
 /// `direction = Bidirectional` runs the second direction over the timesteps in
 /// reverse; Y still holds time t at index t.
 ///
+/// Quantized weights (W8A8). An s8 W makes the layer quantized: R must be s8
+/// too, and the gate arithmetic, the state and every output stay in the compute
+/// dtype — X's floating type, f32 when X is itself s8. Both products then run on
+/// the int8 MMA, with the activations dynamically quantized per row and the
+/// weights symmetric s8 with one scale per gate row, dequantized before the
+/// epilogue:
+///
+///   gates = C_w · s_x · s_w + C_r · s_h · s_r + bias
+///
+/// so activations, clip and the state update are untouched. X may arrive as s8
+/// with its own symmetric per-row (or per-tensor) scale; a floating X is
+/// quantized inside the kernel. Symmetric only — zero_point must be 0 and a
+/// per-channel scale is refused, both with `unsupported`, since the kernel
+/// carries none of the zero-point correction terms. Prepacking an s8 W and R
+/// produces an s8 blob whose biases are stored f32 (see rnn.hpp's kernel notes).
+///
 /// Inputs (ONNX order, an absent optional is an empty view):
 ///   0 X [T,B,I]  1 W [D,H,I]  2 R [D,H,H]  3 B [D,2H]
 ///   4 sequence_lens [B] int32  5 initial_h [D,B,H]

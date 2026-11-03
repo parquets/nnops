@@ -97,6 +97,17 @@ struct Geo {
     /// every output comparison covers it: a write past a row shows up.
     int64_t pad = 0;
     uint64_t seed = 11;
+    /// W and R are s8 with one symmetric scale per gate row — the W8A8 route.
+    /// The reference sees them dequantized, so it agrees to the activation
+    /// quantisation's own error rather than to the packing.
+    bool q8 = false;
+    /// A multiplier on the quantized weights' row scales. At a wide hidden size
+    /// the random weights drive every tanh into its flat region, where the
+    /// quantisation noise of a 520-term product is amplified; a smaller scale
+    /// keeps the case linear so the tolerance stays meaningful.
+    float q8_wscale = 1.0f;
+    /// X arrives as s8 with a per-row scale table instead of floating point.
+    bool x_s8 = false;
 };
 
 /// Owns every operand of one run and the views over them.
@@ -106,6 +117,13 @@ struct Fixture {
     std::vector<int32_t> seq;
     std::vector<T> y, yh, yc;
     std::vector<TensorView> ins, outs;
+    // The quantized route's storage: s8 bytes and their per-row scales, with
+    // `w`/`r`/`xd` holding the dequantized values the reference reads.
+    std::vector<int8_t> wq, rq, xq;
+    std::vector<float> wscale, rscale, xscale;
+    std::vector<T> xd;
+    TensorView x_ref_view;
+    std::vector<TensorView> ins_ref;
 
     void build(RecurrentMode mode, const Geo& g) {
         const DataType dt = dt_of<T>();
@@ -187,6 +205,103 @@ struct Fixture {
                                ? TensorView(std::span<const int64_t>(s_h, 3), dt, yc.data())
                                : TensorView{});
         }
+
+        // The reference reads the floating views taken before W/R/X turn into s8;
+        // quantize_* rewrites the fp vectors they point at with the dequantized
+        // values, so the comparison is against the quantization's own error.
+        ins_ref = ins;
+        if (g.q8) { quantize_weights(mode, g); }
+        if (g.x_s8) { quantize_x(g); }
+        if (g.x_s8) { ins_ref[0] = x_ref_view; }
+    }
+
+    /// W and R become s8 with one positive scale per gate row; the fp vectors the
+    /// fixture already owns are rewritten as the dequantized values, which is what
+    /// the reference solves with.
+    void quantize_weights(RecurrentMode mode, const Geo& g) {
+        const int64_t G = recurrent_gates(mode);
+        const int64_t D = rnn_num_directions(g.dir);
+        XorShift128 rng(g.seed * 3 + 1);
+        wq.resize(w.size());
+        rq.resize(r.size());
+        wscale.assign(static_cast<size_t>(D * G * g.H), 0.0f);
+        rscale.assign(static_cast<size_t>(D * G * g.H), 0.0f);
+
+        const auto fill = [&](std::vector<int8_t>& q, std::vector<float>& sc,
+                              std::vector<T>& deq, int64_t cols) {
+            for (int64_t row = 0; row < D * G * g.H; ++row) {
+                // Scales that differ per row: a table packed out of order does not
+                // cancel out.
+                const float s = (0.002f + 0.006f * rng.next_float(0.0f, 1.0f)) *
+                                g.q8_wscale;
+                sc[static_cast<size_t>(row)] = s;
+                for (int64_t k = 0; k < cols; ++k) {
+                    const auto v = static_cast<int8_t>(
+                        static_cast<int>(rng.next_u64() % 255) - 127);
+                    q[static_cast<size_t>(row * cols + k)] = v;
+                    s_store(&deq[static_cast<size_t>(row * cols + k)],
+                            static_cast<float>(v) * s);
+                }
+            }
+        };
+        fill(wq, wscale, w, g.I);
+        fill(rq, rscale, r, g.H);
+
+        const int64_t rows = D * G * g.H;
+        QuantParams qpw;
+        qpw.granularity = QuantGranularity::PerToken;
+        qpw.scale_data = wscale.data();
+        qpw.num_scales = rows;
+        QuantParams qpr;
+        qpr.granularity = QuantGranularity::PerToken;
+        qpr.scale_data = rscale.data();
+        qpr.num_scales = rows;
+
+        int64_t s_w[3] = {D, G * g.H, g.I};
+        int64_t s_r[3] = {D, G * g.H, g.H};
+        // The pack reads the fp bias as the compute dtype, so `b` stays as built.
+        ins[1] = TensorView(std::span<const int64_t>(s_w, 3), DataType::s8,
+                            wq.data(), TensorLayout::NCHW, qpw);
+        ins[2] = TensorView(std::span<const int64_t>(s_r, 3), DataType::s8,
+                            rq.data(), TensorLayout::NCHW, qpr);
+    }
+
+    /// X as s8 with one scale per [t, b] row; `xd` holds the dequantized values,
+    /// which the reference reads instead.
+    void quantize_x(const Geo& g) {
+        const int64_t xw = g.I + g.pad;
+        const int64_t rows = g.T * g.B;
+        xq.resize(static_cast<size_t>(rows * xw));
+        xd.resize(static_cast<size_t>(rows * xw));
+        xscale.assign(static_cast<size_t>(rows), 0.0f);
+        XorShift128 rng(g.seed * 7 + 3);
+        for (int64_t row = 0; row < rows; ++row) {
+            const float s = 0.002f + 0.004f * rng.next_float(0.0f, 1.0f);
+            xscale[static_cast<size_t>(row)] = s;
+            for (int64_t k = 0; k < xw; ++k) {
+                const auto v = static_cast<int8_t>(
+                    static_cast<int>(rng.next_u64() % 255) - 127);
+                xq[static_cast<size_t>(row * xw + k)] = v;
+                s_store(&xd[static_cast<size_t>(row * xw + k)],
+                        static_cast<float>(v) * s);
+            }
+        }
+        QuantParams qp;
+        qp.granularity = QuantGranularity::PerToken;
+        qp.scale_data = xscale.data();
+        qp.num_scales = rows;
+        int64_t s_x[3] = {g.T, g.B, g.I};
+        const int64_t esz = static_cast<int64_t>(sizeof(T));
+        ins[0] = g.pad > 0
+                     ? TensorView(std::span<const int64_t>(s_x, 3), DataType::s8,
+                                  xq.data(), xw, TensorLayout::NCHW, qp)
+                     : TensorView(std::span<const int64_t>(s_x, 3), DataType::s8,
+                                  xq.data(), TensorLayout::NCHW, qp);
+        x_ref_view = g.pad > 0
+                         ? TensorView(std::span<const int64_t>(s_x, 3), dt_of<T>(),
+                                      xd.data(), xw * esz)
+                         : TensorView(std::span<const int64_t>(s_x, 3), dt_of<T>(),
+                                      xd.data());
     }
 
     /// Zero the outputs, run the scalar reference, and return the operator's own
@@ -202,13 +317,13 @@ struct Fixture {
 
         switch (mode) {
         case RecurrentMode::Rnn:
-            ref::rnn_ref(ra, outs, ins);
+            ref::rnn_ref(ra, outs, ins_ref);
             break;
         case RecurrentMode::Gru:
-            ref::gru_ref(ga, outs, ins);
+            ref::gru_ref(ga, outs, ins_ref);
             break;
         case RecurrentMode::Lstm:
-            ref::lstm_ref(la, outs, ins);
+            ref::lstm_ref(la, outs, ins_ref);
             break;
         }
     }
@@ -292,11 +407,15 @@ void check_prepacked(RecurrentMode mode, const Geo& g, const AttrT& a) {
     NNOPS_EXPECT_EQ(query.rank(), 1);
     NNOPS_EXPECT_TRUE(query.numel() > 0);
     NNOPS_EXPECT_TRUE(query.layout() == TensorLayout::PackedRecurrent);
-    NNOPS_EXPECT_TRUE(query.data_type() == dt_of<T>());
+    // A quantized blob is its own element size — s8, one byte per panel — so the
+    // buffer is sized from what the query answered, not from the compute type.
+    NNOPS_EXPECT_TRUE(query.data_type() == f.ins[1].data_type());
 
-    std::vector<T> blob(static_cast<size_t>(query.numel()), T{});
+    const size_t blob_bytes =
+        static_cast<size_t>(query.numel()) * data_type_size(query.data_type());
+    std::vector<uint8_t> blob(blob_bytes, uint8_t{});
     const int64_t bs[1] = {query.numel()};
-    TensorView packed(std::span<const int64_t>(bs, 1), dt_of<T>(), blob.data(),
+    TensorView packed(std::span<const int64_t>(bs, 1), query.data_type(), blob.data(),
                       TensorLayout::PackedRecurrent);
     op->prepackWeights(f.ins, std::span<TensorView>(&packed, 1), {});
 
@@ -507,6 +626,224 @@ NNOPS_TEST(gru_f16_matches_reference) {
         g.T = 3; g.B = 2; g.I = 5; g.H = 9; g.h0 = true;
         check_gru<half>(g, a, test::kF16AccumTol);
     }
+}
+
+// =========================================================================
+//  W8A8 — s8 weights, per-row scale, dynamically quantized activations
+// =========================================================================
+
+/// The weights are exactly what the reference solves with (the fixture's s8 rows
+/// dequantize to the fp values it is handed), so what is left is the activation's
+/// own per-row quantisation: half an int8 step of that row's max, run through the
+/// gate functions. A weight scale attached to the wrong column would be orders of
+/// magnitude larger.
+constexpr float kQ8Tol = 2e-2f;
+
+NNOPS_TEST(q8_rnn_matches_reference) {
+    for (int64_t H : {5, 8, 16}) {
+        RnnAttributes a;
+        a.hidden_size = H;
+        Geo g;
+        g.T = 4; g.B = 3; g.I = 7; g.H = H; g.h0 = true; g.q8 = true;
+        check_rnn<float>(g, a, kQ8Tol);
+    }
+}
+
+NNOPS_TEST(q8_lstm_matches_reference) {
+    LstmAttributes a;
+    a.hidden_size = 9;
+    a.direction = RnnDirection::Bidirectional;
+    Geo g;
+    g.T = 4; g.B = 2; g.I = 5; g.H = 9; g.dir = RnnDirection::Bidirectional;
+    g.seq = true; g.h0 = true; g.c0 = true; g.q8 = true;
+    check_lstm<float>(g, a, kQ8Tol);
+}
+
+NNOPS_TEST(q8_gru_matches_reference) {
+    for (bool lbr : {false, true}) {
+        GruAttributes a;
+        a.hidden_size = 7;
+        a.linear_before_reset = lbr;
+        a.clip = 1.5f;
+        Geo g;
+        g.T = 3; g.B = 3; g.I = 5; g.H = 7; g.h0 = true; g.q8 = true;
+        check_gru<float>(g, a, kQ8Tol);
+    }
+}
+
+NNOPS_TEST(q8_hidden_past_k_block_cap) {
+    // H > 512 splits the recurrent product into two k blocks, so R's panels in
+    // the second slab are addressed at a different offset from the first's — and
+    // a wrong offset is an O(1) error, not a noise-level one. The weights are
+    // scaled down because at this width the unscaled random ones saturate every
+    // tanh, where the 520-term product's quantisation noise is amplified.
+    RnnAttributes a;
+    a.hidden_size = 520;
+    Geo g;
+    g.T = 3; g.B = 2; g.I = 6; g.H = 520; g.h0 = true; g.q8 = true;
+    g.q8_wscale = 0.1f;
+    check_rnn<float>(g, a, kQ8Tol);
+}
+
+NNOPS_TEST(q8_s8_activation_and_f16_compute) {
+    // X arrives quantized with its own per-row table: the projection packs the
+    // bytes as stored instead of quantizing them. And an f16 X makes the gate
+    // math f16, while the weights stay s8.
+    {
+        LstmAttributes a;
+        a.hidden_size = 8;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 6; g.H = 8; g.h0 = true; g.c0 = true;
+        g.q8 = true; g.x_s8 = true;
+        check_lstm<float>(g, a, kQ8Tol);
+    }
+    {
+        RnnAttributes a;
+        a.hidden_size = 10;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 5; g.H = 10; g.h0 = true; g.q8 = true;
+        check_rnn<half>(g, a, test::kF16AccumTol + kQ8Tol);
+    }
+    {
+        // Pitched X and Y on the quantized route: the panel pack and the Y store
+        // both honour the row stride.
+        RnnAttributes a;
+        a.hidden_size = 6;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 4; g.H = 6; g.h0 = true; g.q8 = true; g.pad = 3;
+        check_rnn<float>(g, a, kQ8Tol);
+    }
+}
+
+NNOPS_TEST(q8_prepacked_matches_raw) {
+    // The blob's panels and scales go through the same writer compute() uses, so
+    // the prepacked run is bit-identical — a tolerance here would hide a region
+    // read at the wrong offset.
+    {
+        LstmAttributes a;
+        a.hidden_size = 9;
+        Geo g;
+        g.T = 4; g.B = 2; g.I = 5; g.H = 9; g.h0 = true; g.c0 = true; g.q8 = true;
+        check_prepacked<float, Lstm>(RecurrentMode::Lstm, g, a);
+    }
+    for (bool lbr : {false, true}) {
+        GruAttributes a;
+        a.hidden_size = 7;
+        a.linear_before_reset = lbr;
+        Geo g;
+        g.T = 3; g.B = 3; g.I = 5; g.H = 7; g.h0 = true; g.q8 = true;
+        check_prepacked<float, Gru>(RecurrentMode::Gru, g, a);
+    }
+    {
+        // A quantized blob for the f16 compute route: the bias rides the blob as
+        // f32 and the driver converts it.
+        RnnAttributes a;
+        a.hidden_size = 11;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 6; g.H = 11; g.h0 = true; g.q8 = true;
+        check_prepacked<half, Rnn>(RecurrentMode::Rnn, g, a);
+    }
+}
+
+NNOPS_TEST(q8_rejects_asymmetric_quantisation) {
+    // Symmetric only: a non-zero zero point needs correction terms the kernel
+    // does not carry, so it is refused rather than silently dropped. The
+    // descriptor cannot carry quant params, so this is compute()'s verdict.
+    LstmAttributes a;
+    a.hidden_size = 5;
+    Geo g;
+    g.T = 2; g.B = 2; g.I = 4; g.H = 5; g.q8 = true;
+    Fixture<float> f;
+    f.build(RecurrentMode::Lstm, g);
+    auto op = Lstm::create(a, Backend::CPU);
+
+    // The baseline runs.
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(f.outs, f.ins, ComputeContext{}, nullptr)));
+
+    const int64_t D = 1, G = 4;
+    int64_t s_w[3] = {D, G * g.H, g.I};
+    {
+        QuantParams qp;
+        qp.granularity = QuantGranularity::PerToken;
+        qp.scale_data = f.wscale.data();
+        qp.num_scales = D * G * g.H;
+        qp.zero_point = 1;  // asymmetric
+        TensorView wv(std::span<const int64_t>(s_w, 3), DataType::s8, f.wq.data(),
+                      TensorLayout::NCHW, qp);
+        std::vector<TensorView> ins = f.ins;
+        ins[1] = wv;
+        NNOPS_EXPECT_EQ(op->compute(f.outs, ins, ComputeContext{}, nullptr),
+                        Status::unsupported);
+    }
+    {
+        // A scale table shorter than one row per gate row is not a per-row table.
+        QuantParams qp;
+        qp.granularity = QuantGranularity::PerToken;
+        qp.scale_data = f.wscale.data();
+        qp.num_scales = 3;
+        TensorView wv(std::span<const int64_t>(s_w, 3), DataType::s8, f.wq.data(),
+                      TensorLayout::NCHW, qp);
+        std::vector<TensorView> ins = f.ins;
+        ins[1] = wv;
+        NNOPS_EXPECT_EQ(op->compute(f.outs, ins, ComputeContext{}, nullptr),
+                        Status::unsupported);
+    }
+    {
+        // A blob bakes the scales in and hides the weight from compute()'s
+        // checks, so the packer applies the same rule: an asymmetric W gets no
+        // packed form (a rank-0 answer), rather than a blob with wrong scales.
+        QuantParams qp;
+        qp.granularity = QuantGranularity::PerToken;
+        qp.scale_data = f.wscale.data();
+        qp.num_scales = D * G * g.H;
+        qp.zero_point = -3;
+        TensorView wv(std::span<const int64_t>(s_w, 3), DataType::s8, f.wq.data(),
+                      TensorLayout::NCHW, qp);
+        std::vector<TensorView> ins = f.ins;
+        ins[1] = wv;
+        TensorView q{};
+        op->prepackWeights(ins, std::span<TensorView>(&q, 1), {});
+        NNOPS_EXPECT_EQ(q.rank(), 0);
+    }
+}
+
+NNOPS_TEST(q8_validation_is_dtype_only) {
+    // validate() reads descriptors, which carry no quant params: it can only say
+    // that an s8 weight pairs with an s8 R, and that the bias, the states and the
+    // outputs are the activation's floating type.
+    std::vector<TensorDesc> in(3);
+    in[0].rank = 3; in[0].dims = {4, 2, 3}; in[0].dtype = DataType::f32;
+    in[1].rank = 3; in[1].dims = {1, 4 * 5, 3}; in[1].dtype = DataType::s8;
+    in[2].rank = 3; in[2].dims = {1, 4 * 5, 5}; in[2].dtype = DataType::s8;
+    std::vector<TensorDesc> out(3);
+    out[0].rank = 4; out[0].dims = {4, 1, 2, 5}; out[0].dtype = DataType::f32;
+    out[1].rank = 3; out[1].dims = {1, 2, 5}; out[1].dtype = DataType::f32;
+    out[2].rank = 3; out[2].dims = {1, 2, 5}; out[2].dtype = DataType::f32;
+
+    LstmAttributes a;
+    a.hidden_size = 5;
+    auto op = Lstm::create(a);
+    NNOPS_EXPECT_TRUE(is_ok(op->validate(in, out)));
+
+    // An f16 activation with s8 weights is the f16 compute route.
+    auto in_f16 = in;
+    in_f16[0].dtype = DataType::f16;
+    auto out_f16 = out;
+    for (auto& o : out_f16) { o.dtype = DataType::f16; }
+    NNOPS_EXPECT_TRUE(is_ok(op->validate(in_f16, out_f16)));
+
+    // An s8 R is required beside an s8 W.
+    auto bad = in;
+    bad[2].dtype = DataType::f32;
+    NNOPS_EXPECT_EQ(op->validate(bad, out), Status::invalid_argument);
+
+    // The bias and states are the compute dtype, not the weight's.
+    auto bad_bias = in;
+    bad_bias.resize(4);
+    bad_bias[3].rank = 2;
+    bad_bias[3].dims = {1, 2 * 4 * 5};
+    bad_bias[3].dtype = DataType::s8;
+    NNOPS_EXPECT_EQ(op->validate(bad_bias, out), Status::invalid_argument);
 }
 
 // =========================================================================
@@ -948,3 +1285,4 @@ NNOPS_TEST(unsupported_backend_and_dtype) {
 }
 
 }  // namespace
+

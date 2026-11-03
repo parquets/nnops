@@ -18,6 +18,12 @@
 /// ride the same interleaved gate layout and the same tile epilogue as RNN and
 /// LSTM; see rnn.hpp for the chunked input projection.
 ///
+/// An s8 W and R select the quantized route (W8A8): each phase's products are
+/// int8 MMAs against per-row dynamically quantized activations, dequantized into
+/// the compute dtype before the gate functions, so z, r and h~ are unchanged.
+/// The contract — symmetric only, the s8 activation option, the prepacked blob —
+/// is rnn.hpp's.
+///
 /// Inputs (ONNX order, an absent optional is an empty view):
 ///   0 X [T,B,I]  1 W [D,3H,I]  2 R [D,3H,H]  3 B [D,6H]
 ///   4 sequence_lens [B] int32  5 initial_h [D,B,H]

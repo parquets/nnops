@@ -160,6 +160,15 @@ struct RecPlan {
     int64_t chunk = 0;             ///< timesteps per input-projection chunk
     /// X·W^T as one matrix for the whole gate row, so the projection is one GEMM.
     MatMulPackedB wgeo;
+
+    // ---- quantized route only ----
+    bool q8 = false;
+    int64_t proj_mc = 0;  ///< the input projection's m-tile
+    int64_t proj_nc = 0;  ///< the input projection's n-tile
+    int64_t slots = 1;    ///< per-worker scratch slots (see CpuBackend)
+    int64_t a_bytes = 0;  ///< packed-A panels per slot, the largest tile's
+    int64_t c_elems = 0;  ///< int32 accumulator per slot, the largest tile's
+    int64_t s_elems = 0;  ///< A row scales per slot, the largest tile's rows
 };
 
 int64_t gcd64(int64_t a, int64_t b) noexcept {
@@ -195,7 +204,8 @@ TensorView packed_view(int64_t n, int64_t total, T* data) noexcept {
 struct RecurrentPackedHeader {
     uint32_t magic;
     uint32_t version;
-    int64_t elem_size;
+    int64_t elem_size;   ///< 1 for quantized panels, else the fp element size
+    int64_t q8;          ///< W and R are s8: int8 panels and f32 scales
     int64_t input;
     int64_t hidden;
     int64_t directions;
@@ -208,7 +218,7 @@ struct RecurrentPackedHeader {
 };
 
 inline constexpr uint32_t kRecurrentPackedMagic = 0x5043524e;  // 'NRCP'
-inline constexpr uint32_t kRecurrentPackedVersion = 1;
+inline constexpr uint32_t kRecurrentPackedVersion = 2;
 /// Both the header and every region start on this, which is also the packing
 /// alignment the panels need.
 inline constexpr int64_t kPackedAlign = 64;
@@ -221,12 +231,44 @@ inline int64_t packed_header_bytes() noexcept {
     return align_up64(static_cast<int64_t>(sizeof(RecurrentPackedHeader)));
 }
 
+/// The quantized route's k-block. The int8 MMA takes no RHS stride, so a panel
+/// set is addressed at int8_panel_stride(kc) for the k block it was packed for;
+/// fixing the block size makes the boundaries — and so the packed blob — a
+/// function of K alone, independent of the batch, the sequence and the team.
+constexpr int64_t kQ8Kc = KC_CAP_I8;
+
+/// The input projection's column tile. int8 has no prepacked B, so the panels
+/// are addressed per k-block slab; a 512-wide column tile keeps one task's int32
+/// accumulator small (and is a whole number of nr-wide panels, which is what
+/// lets the kernel address a column block as a panel index).
+constexpr int64_t kQ8ProjNc = 512;
+
+inline int64_t q8_panels(int64_t cols) noexcept {
+    return (cols + NR_MAX_I8 - 1) / NR_MAX_I8;
+}
+
+/// One k-block's slab: every column panel at this block's panel stride.
+inline int64_t q8_slab_bytes(int64_t cols, int64_t kc) noexcept {
+    return q8_panels(cols) * int8_panel_stride(kc);
+}
+
+/// Every k-block's slab, summed, for a K-wide operand.
+inline int64_t q8_packed_bytes(int64_t k, int64_t cols) noexcept {
+    int64_t bytes = 0;
+    for (int64_t at = 0; at < k; at += kQ8Kc) {
+        bytes += q8_slab_bytes(cols, std::min<int64_t>(kQ8Kc, k - at));
+    }
+    return bytes;
+}
+
 /// Where each region of one direction starts, in bytes from the direction's base.
 struct PackedWeightOffsets {
     int64_t w = 0;
     int64_t r[2] = {0, 0};
     int64_t bias[2] = {0, 0};
     int64_t rh = 0;
+    int64_t sw = 0;          ///< quantized only: interleaved per-column scales
+    int64_t sr[2] = {0, 0};  ///< quantized only, one per phase
     int64_t dir_bytes = 0;
 };
 
@@ -236,6 +278,33 @@ PackedWeightOffsets packed_weight_offsets(const RecurrentPackedHeader& h) noexce
 {
     PackedWeightOffsets o;
     int64_t off = 0;
+    // Byte region, 64-aligned. `h.elem_size` scales the floating regions below;
+    // the quantized ones are stated in bytes and take() is only alignment there.
+    const auto take_bytes = [&](int64_t bytes) {
+        const int64_t at = off;
+        off = align_up64(off + bytes);
+        return at;
+    };
+    if (h.q8 != 0) {
+        // Panels are per k-block slabs; a blob packed once is readable by any
+        // plan, because the k blocks are a function of K alone.
+        o.w = take_bytes(q8_packed_bytes(h.input, h.total_cols));
+        for (int64_t ph = 0; ph < h.nphases; ++ph) {
+            o.r[ph] = take_bytes(q8_packed_bytes(h.hidden, h.phase_cols[ph]));
+        }
+        o.sw = take_bytes(4 * h.total_cols);
+        for (int64_t ph = 0; ph < h.nphases; ++ph) {
+            o.sr[ph] = take_bytes(4 * h.phase_cols[ph]);
+        }
+        // The bias stays f32 here whatever the compute dtype: prepackWeights
+        // does not know whether the caller will run f32 or f16.
+        for (int64_t ph = 0; ph < h.nphases; ++ph) {
+            o.bias[ph] = take_bytes(4 * h.phase_cols[ph]);
+        }
+        if (h.lbr != 0) { o.rh = take_bytes(4 * h.total_cols); }
+        o.dir_bytes = off;
+        return o;
+    }
     const auto take = [&](int64_t elems) {
         const int64_t at = off;
         off = align_up64(off + elems * h.elem_size);
@@ -261,7 +330,8 @@ RecurrentPackedHeader packed_header(const RecurrentParams& p) noexcept
     RecurrentPackedHeader h{};
     h.magic = kRecurrentPackedMagic;
     h.version = kRecurrentPackedVersion;
-    h.elem_size = static_cast<int64_t>(data_type_size(p.dtype));
+    h.q8 = p.weight_dtype == DataType::s8 ? 1 : 0;
+    h.elem_size = h.q8 != 0 ? 1 : static_cast<int64_t>(data_type_size(p.dtype));
     h.input = p.input;
     h.hidden = p.hidden;
     h.directions = p.directions;
@@ -354,6 +424,26 @@ void interleave_gates(const T* src, int64_t lds, int64_t hidden, int64_t k,
     }
 }
 
+/// The same interleave for a quantized operand's per-row scales, so column j of
+/// a packed panel is scaled by the scale of the gate row it came from. Null
+/// means a per-tensor scalar; the pad lanes take 1, which is inert because the
+/// weight bytes beside them are zero.
+inline void interleave_scales(const float* src, float scalar, int64_t hidden,
+                              int64_t gates, int64_t gate_off, float* dst)
+{
+    const int64_t q = 8 * gates;
+    for (int64_t hb = 0; hb * 8 < hidden; ++hb) {
+        for (int64_t g = 0; g < gates; ++g) {
+            for (int64_t j = 0; j < 8; ++j) {
+                const int64_t h = hb * 8 + j;
+                dst[hb * q + g * 8 + j] =
+                    (h < hidden && src != nullptr) ? src[(gate_off + g) * hidden + h]
+                                                   : scalar;
+            }
+        }
+    }
+}
+
 /// The gate row's bias in the interleaved order: Wb + Rb, with `rb_mask` saying
 /// which gates take Rb (bit g). The GRU h gate drops it under
 /// linear_before_reset, where Rbh belongs after the recurrent product. Either
@@ -381,6 +471,173 @@ void build_bias(const T* wb, const T* rb, int64_t hidden, int64_t gates,
     }
 }
 
+// ---- the quantized weights -------------------------------------------------
+
+/// The direction's slice of a per-row scale table, or null for a per-tensor
+/// one. `rows` is one direction's row count; a table wider than that is per
+/// row, anything narrower is shared by every direction.
+inline const float* q8_scale_rows(const QuantParams& q, int64_t d,
+                                  int64_t rows) noexcept
+{
+    if (q.scale_data == nullptr) { return nullptr; }
+    return (q.num_scales > rows) ? q.scale_data + d * rows : q.scale_data;
+}
+
+/// Where a direction's quantized pieces live. The same writer serves the
+/// per-call scratch and the blob, so the two layouts cannot drift.
+struct Q8Regions {
+    int8_t* w = nullptr;
+    int8_t* r[2] = {nullptr, nullptr};
+    float* sw = nullptr;
+    float* sr[2] = {nullptr, nullptr};
+    float* bias[2] = {nullptr, nullptr};
+    float* rh = nullptr;
+};
+
+/// Pack one k-block slab set: `nc` columns of a [nc, K] byte matrix, one
+/// int8_panel_stride slab per k block.
+inline void q8_pack_slabs(int8_t* dst, const int8_t* src, int64_t lds,
+                          int64_t k, int64_t cols, bool a_biased)
+{
+    int64_t off = 0;
+    for (int64_t at = 0; at < k; at += kQ8Kc) {
+        const int64_t kc = std::min<int64_t>(kQ8Kc, k - at);
+        tile_pack_rhs_i8(/*trans=*/true, static_cast<int>(cols),
+                         static_cast<int>(kc), dst + off,
+                         static_cast<int>(int8_panel_stride(kc)),
+                         src + at, static_cast<int>(lds), a_biased);
+        off += q8_slab_bytes(cols, kc);
+    }
+}
+
+/// Interleave, pack and scale one direction's s8 weights. `raw` stages the
+/// interleaved byte matrix (total_cols × max(I, H)) and `bias_f32` holds one
+/// direction's fp bias in f32 (2·G·H entries) — the blob stores f32 so a pack
+/// does not have to know the compute dtype.
+inline void prepare_q8_direction(const RecurrentParams& p,
+                                 const RecurrentPackedHeader& h, int64_t d,
+                                 const TensorView& w, const TensorView& r,
+                                 const TensorView* bias, int8_t* raw,
+                                 float* bias_f32, const Q8Regions& dst)
+{
+    const int64_t G = h.gates;
+    const int64_t H = h.hidden;
+    const int64_t I = h.input;
+    const bool lbr = h.lbr != 0;
+    const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
+
+    const QuantParams& qw = w.quant_params();
+    const QuantParams& qr = r.quant_params();
+    const float* sw_rows = q8_scale_rows(qw, d, G * H);
+    const float* sr_rows = q8_scale_rows(qr, d, G * H);
+
+    int64_t col = 0;
+    for (int64_t ph = 0; ph < h.nphases; ++ph) {
+        const PhaseKind kind = phase_kind(p.mode, lbr, ph);
+        const int64_t gates = phase_gates(kind);
+        const int64_t gate_off = phase_gate_offset(p.mode, lbr, ph);
+        interleave_gates<int8_t>(w.ptr<int8_t>(static_cast<size_t>(d * G * H)),
+                                 w.row_stride_elems(), H, I, gates, gate_off,
+                                 raw + col * I);
+        interleave_scales(sw_rows, qw.scale, H, gates, gate_off, dst.sw + col);
+        col += h.phase_cols[ph];
+    }
+    q8_pack_slabs(dst.w, raw, I, I, h.total_cols, a_biased);
+
+    for (int64_t ph = 0; ph < h.nphases; ++ph) {
+        const PhaseKind kind = phase_kind(p.mode, lbr, ph);
+        const int64_t gates = phase_gates(kind);
+        const int64_t gate_off = phase_gate_offset(p.mode, lbr, ph);
+        interleave_gates<int8_t>(r.ptr<int8_t>(static_cast<size_t>(d * G * H)),
+                                 r.row_stride_elems(), H, H, gates, gate_off, raw);
+        interleave_scales(sr_rows, qr.scale, H, gates, gate_off, dst.sr[ph]);
+        q8_pack_slabs(dst.r[ph], raw, H, H, h.phase_cols[ph], a_biased);
+    }
+
+    // The bias is the caller's fp type; the regions are f32.
+    const DataType bdt = bias ? bias->data_type() : DataType::f32;
+    for (int64_t gi = 0; gi < 2 * G * H; ++gi) {
+        float v = 0.0f;
+        if (bias != nullptr) {
+            v = (bdt == DataType::f16)
+                    ? s_load(bias->ptr<half>(static_cast<size_t>(d)) + gi)
+                    : bias->ptr<float>(static_cast<size_t>(d))[gi];
+        }
+        bias_f32[gi] = v;
+    }
+    const float* wb = bias ? bias_f32 : nullptr;
+    const float* rb = bias ? bias_f32 + G * H : nullptr;
+
+    for (int64_t ph = 0; ph < h.nphases; ++ph) {
+        const PhaseKind kind = phase_kind(p.mode, lbr, ph);
+        const int64_t gates = phase_gates(kind);
+        const int64_t gate_off = phase_gate_offset(p.mode, lbr, ph);
+        // Rbh belongs after the recurrent product under linear_before_reset, so
+        // the h gate's bias vector takes Wb alone here.
+        const int64_t h_gate = (kind == PhaseKind::GruZr) ? -1
+                             : (kind == PhaseKind::GruAll) ? 2 : 0;
+        const int64_t all_gates = (int64_t{1} << gates) - 1;
+        const int64_t h_bit = (h_gate < 0) ? 0 : (int64_t{1} << h_gate);
+        build_bias<float>(wb, rb, H, gates, lbr ? (all_gates & ~h_bit) : all_gates,
+                          gate_off, dst.bias[ph]);
+        if (lbr) {
+            build_bias<float>(static_cast<const float*>(nullptr), rb, H, gates,
+                              h_bit, gate_off, dst.rh);
+        }
+    }
+}
+
+/// A quantized activation's per-row scales: a caller table when the tensor
+/// carries one per row, else its per-tensor scalar.
+struct RowScales {
+    const float* rows = nullptr;
+    float scalar = 1.0f;
+};
+
+inline RowScales row_scales_of(const QuantParams& q, int64_t rows) noexcept
+{
+    RowScales r;
+    if (q.scale_data != nullptr && q.num_scales >= rows && rows > 0) {
+        r.rows = q.scale_data;
+    } else {
+        r.scalar = q.scale;
+    }
+    return r;
+}
+
+/// The per-row dynamic scale of a floating operand: |max| / 127, or 1 for a row
+/// that is all zero (its quantized values are zero, so the scale is only a
+/// divisor and never observed).
+template <typename T>
+void quant_row_scales(const T* a, int64_t lds, int64_t rows, int64_t k, float* s)
+{
+    constexpr float kInv127 = 1.0f / 127.0f;
+    for (int64_t m = 0; m < rows; ++m) {
+        const T* row = a + m * lds;
+        v_f32x8 vmax = v_zero_f32x8();
+        int64_t j = 0;
+        for (; j + 8 <= k; j += 8) { vmax = v_max(vmax, v_abs(vload8(row + j))); }
+        alignas(32) float tmp[8];
+        vstore8(tmp, vmax);
+        float mx = 0.0f;
+        for (int c = 0; c < 8; ++c) { mx = std::max(mx, tmp[c]); }
+        for (; j < k; ++j) { mx = std::max(mx, std::fabs(s_load(row + j))); }
+        s[m] = mx > 0.0f ? mx * kInv127 : 1.0f;
+    }
+}
+
+/// The per-worker scratch the int8 tiles need: the packed-A panels, the int32
+/// accumulator and the A row scales, one slot each.
+struct Q8Scratch {
+    int8_t* a = nullptr;
+    int32_t* c = nullptr;
+    float* s = nullptr;
+    int64_t slots = 1;
+    int64_t a_bytes = 0;
+    int64_t c_elems = 0;
+    int64_t s_elems = 0;
+};
+
 // =========================================================================
 //  One phase of one timestep
 // =========================================================================
@@ -404,6 +661,11 @@ struct StepCtx {
     int64_t r_nr = 0;
     const T* bias = nullptr;      ///< the gate row's interleaved bias
     const T* rh_bias = nullptr;   ///< GRU h gate, linear_before_reset only
+
+    // ---- quantized route only ----
+    const int8_t* q_r = nullptr;  ///< R's int8 slabs, per k block
+    const float* sr = nullptr;    ///< R's interleaved per-column scales
+    Q8Scratch qs;                 ///< the int8 scratch, one slot per worker
 
     T* h_prev = nullptr;
     T* h_next = nullptr;
@@ -668,6 +930,98 @@ void project_chunk(const T* x, int64_t x_ld, T* c, int64_t ldc, const T* packed_
     }
 }
 
+/// The input projection on the int8 MMA. A is the chunk's X rows — floating and
+/// dynamically quantized per row, or s8 with the tensor's own per-row table — and
+/// B is W's per-k-block slabs; the dequant writes the fp chunk buffer.
+template <typename T>
+void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
+                      const int8_t* packed_w, const float* sw, int64_t cols,
+                      int64_t input, int64_t rows, int64_t mc, int64_t nc,
+                      const RowScales& xs, const Q8Scratch& qs,
+                      const ComputeContext& ctx)
+{
+    const int64_t n_blocks = (cols + nc - 1) / nc;
+    const int64_t m_blocks = (rows + mc - 1) / mc;
+    const int64_t tasks = m_blocks * n_blocks;
+    const bool x_s8 = x.data_type() == DataType::s8;
+    const int64_t x_ld = x.row_stride_elems();
+    const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
+
+    auto body = [&](int64_t task) {
+        const int64_t slot = (qs.slots < tasks)
+                                 ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+                                 : task;
+        int8_t* pa = qs.a + slot * qs.a_bytes;
+        int32_t* pc = qs.c + slot * qs.c_elems;
+        float* psa = qs.s + slot * qs.s_elems;
+
+        const int64_t m0 = (task / n_blocks) * mc;
+        const int64_t n0 = (task % n_blocks) * nc;
+        const int64_t mcnt = std::min<int64_t>(mc, rows - m0);
+        const int64_t ncnt = std::min<int64_t>(nc, cols - n0);
+        if (mcnt <= 0 || ncnt <= 0) { return; }
+
+        if (x_s8) {
+            const float* xt = xs.rows ? xs.rows + x_row0 + m0 : nullptr;
+            for (int64_t r = 0; r < mcnt; ++r) {
+                psa[r] = xt ? xt[r] : xs.scalar;
+            }
+        } else {
+            quant_row_scales(x.ptr<T>(static_cast<size_t>(x_row0 + m0)), x_ld,
+                             mcnt, input, psa);
+        }
+        const int8_t* xa8 = x_s8
+            ? x.ptr<int8_t>(static_cast<size_t>(x_row0 + m0)) : nullptr;
+        const T* xa = x_s8 ? nullptr
+                           : x.ptr<T>(static_cast<size_t>(x_row0 + m0));
+
+        int64_t slab = 0;
+        for (int64_t at = 0, kb = 0; at < input; at += kQ8Kc, ++kb) {
+            const int64_t kc = std::min<int64_t>(kQ8Kc, input - at);
+            if (x_s8) {
+                tile_pack_lhs_i8(/*trans=*/false, static_cast<int>(mcnt),
+                                 static_cast<int>(kc), pa,
+                                 static_cast<int>(geom_ldd_i8_a(kc)), xa8 + at,
+                                 static_cast<int>(x_ld), a_biased);
+            } else {
+                tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc),
+                                       pa, static_cast<int>(geom_ldd_i8_a(kc)),
+                                       xa + at, static_cast<int>(x_ld), psa, nullptr,
+                                       1.0f, 0, /*u8=*/false, a_biased);
+            }
+            const int8_t* pb = packed_w + slab +
+                               (n0 / NR_MAX_I8) * int8_panel_stride(kc);
+            if (kb == 0) {
+                tile_mma_pack_i8_zero(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                      static_cast<int>(kc), pc, static_cast<int>(nc),
+                                      pa, pb, INT32_MIN, INT32_MAX);
+            } else {
+                tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                 static_cast<int>(kc), pc, static_cast<int>(nc),
+                                 pa, pb, INT32_MIN, INT32_MAX);
+            }
+            slab += q8_slab_bytes(cols, kc);
+        }
+
+        T* dst = c + m0 * ldc + n0;
+        const float* swp = sw + n0;
+        for (int64_t m = 0; m < mcnt; ++m) {
+            const int32_t* crow = pc + m * nc;
+            T* drow = dst + m * ldc;
+            const float sa = psa[m];
+            for (int64_t n = 0; n < ncnt; ++n) {
+                s_store(drow + n, static_cast<float>(crow[n]) * sa * swp[n]);
+            }
+        }
+    };
+
+    if (tasks <= 1) {
+        body(0);
+    } else {
+        ctx.cpu.run(0, tasks, body);
+    }
+}
+
 void run_phase(const StepCtx<float>& s, PhaseKind kind, const ComputeContext& ctx) {
     switch (kind) {
     case PhaseKind::Rnn:    run_phase<float, PhaseKind::Rnn>(s, ctx); break;
@@ -685,6 +1039,98 @@ void run_phase(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& ctx
     case PhaseKind::GruAll: run_phase<half, PhaseKind::GruAll>(s, ctx); break;
     case PhaseKind::GruZr:  run_phase<half, PhaseKind::GruZr>(s, ctx); break;
     case PhaseKind::GruH:   run_phase<half, PhaseKind::GruH>(s, ctx); break;
+    }
+}
+
+// ---- the quantized twin ----------------------------------------------------
+
+/// The recurrent product on the int8 MMA. A — the hidden state, in `dtype` — is
+/// quantized per row from its own max, B is the packed s8 R panels, and the
+/// int32 accumulator is dequantized into the fp destination the epilogue reads.
+/// The scale is one per row over the whole K, so the dequant is one pass however
+/// many k blocks the product took.
+template <typename T, PhaseKind Kind>
+void run_phase_q8(const StepCtx<T>& s, const ComputeContext& ctx)
+{
+    const int64_t tasks = s.m_blocks * s.n_blocks;
+    const bool fresh = (s.rec != nullptr);
+    const bool a_biased = int8_a_pack_bias(DataType::s8) != 0;
+
+    auto body = [&](int64_t task) {
+        const int64_t slot = (s.qs.slots < tasks)
+                                 ? static_cast<int64_t>(ctx.cpu.current_thread_id())
+                                 : task;
+        int8_t* pa = s.qs.a + slot * s.qs.a_bytes;
+        int32_t* pc = s.qs.c + slot * s.qs.c_elems;
+        float* psa = s.qs.s + slot * s.qs.s_elems;
+
+        const int64_t mblk = task / s.n_blocks;
+        const int64_t nblk = task % s.n_blocks;
+        const int64_t m0 = mblk * s.mc;
+        const int64_t mcnt = std::min<int64_t>(s.mc, s.batch - m0);
+        const int64_t n0 = nblk * s.nc;
+        const int64_t ncnt = std::min<int64_t>(s.nc, s.cols - n0);
+        if (mcnt <= 0 || ncnt <= 0) { return; }
+
+        const T* a = s.a + m0 * s.hp;
+        quant_row_scales(a, s.hp, mcnt, s.hidden, psa);
+
+        int64_t slab = 0;
+        for (int64_t k = 0, kb = 0; k < s.hidden; k += s.kc, ++kb) {
+            const int64_t kc = std::min<int64_t>(s.kc, s.hidden - k);
+            tile_pack_quant_lhs_i8(static_cast<int>(mcnt), static_cast<int>(kc),
+                                   pa, static_cast<int>(geom_ldd_i8_a(kc)), a + k,
+                                   static_cast<int>(s.hp), psa, nullptr, 1.0f, 0,
+                                   /*u8=*/false, a_biased);
+            const int8_t* pb = s.q_r + slab +
+                               (n0 / NR_MAX_I8) * int8_panel_stride(kc);
+            if (kb == 0) {
+                tile_mma_pack_i8_zero(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                      static_cast<int>(kc), pc, static_cast<int>(s.nc),
+                                      pa, pb, INT32_MIN, INT32_MAX);
+            } else {
+                tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                                 static_cast<int>(kc), pc, static_cast<int>(s.nc),
+                                 pa, pb, INT32_MIN, INT32_MAX);
+            }
+            slab += q8_slab_bytes(s.cols, kc);
+        }
+
+        T* dst = (fresh ? s.rec : s.in_proj) + m0 * s.ldc + n0;
+        const float* sr = s.sr + n0;
+        for (int64_t m = 0; m < mcnt; ++m) {
+            const int32_t* crow = pc + m * s.nc;
+            T* drow = dst + m * s.ldc;
+            const float sa = psa[m];
+            for (int64_t n = 0; n < ncnt; ++n) {
+                const float v = static_cast<float>(crow[n]) * sa * sr[n];
+                s_store(drow + n, fresh ? v : s_load(drow + n) + v);
+            }
+        }
+
+        // The tile is offset to n0 but the bias vectors are not, and the epilogue
+        // indexes both by the same block-local column.
+        StepCtx<T> tile = s;
+        tile.bias = s.bias ? s.bias + n0 : nullptr;
+        tile.rh_bias = s.rh_bias ? s.rh_bias + n0 : nullptr;
+        epilogue_tile<T, Kind>(tile, m0, mcnt, n0, ncnt);
+    };
+
+    if (tasks <= 1) {
+        body(0);
+    } else {
+        ctx.cpu.run(0, tasks, body);
+    }
+}
+
+template <typename T>
+void run_phase_q8(const StepCtx<T>& s, PhaseKind kind, const ComputeContext& ctx) {
+    switch (kind) {
+    case PhaseKind::Rnn:    run_phase_q8<T, PhaseKind::Rnn>(s, ctx); break;
+    case PhaseKind::Lstm:   run_phase_q8<T, PhaseKind::Lstm>(s, ctx); break;
+    case PhaseKind::GruAll: run_phase_q8<T, PhaseKind::GruAll>(s, ctx); break;
+    case PhaseKind::GruZr:  run_phase_q8<T, PhaseKind::GruZr>(s, ctx); break;
+    case PhaseKind::GruH:   run_phase_q8<T, PhaseKind::GruH>(s, ctx); break;
     }
 }
 
@@ -707,6 +1153,17 @@ public:
         cur_ += static_cast<size_t>(count) * sizeof(T);
         NNOPS_ASSERT(cur_ <= end_ && "recurrent scratch exhausted");
         return reinterpret_cast<T*>(p);
+    }
+
+    /// For the quantized route's byte-sized regions — the s8 panels are one
+    /// byte per element, and their stride is a byte count.
+    char* take_bytes(int64_t bytes) {
+        cur_ = reinterpret_cast<char*>(
+            align_up<64>(reinterpret_cast<uintptr_t>(cur_)));
+        char* const p = cur_;
+        cur_ += static_cast<size_t>(std::max<int64_t>(bytes, 0));
+        NNOPS_ASSERT(cur_ <= end_ && "recurrent scratch exhausted");
+        return p;
     }
 
 private:
@@ -753,12 +1210,16 @@ void store_state(TensorView& dst, int64_t d, int64_t batch, int64_t hidden,
     }
 }
 
-Status build_plan(const RecurrentParams& p, int64_t threads, RecPlan& plan)
+Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& plan)
 {
+    const int64_t threads = std::max<int64_t>(ctx.cpu.thread_count(), 1);
     const int64_t esz = static_cast<int64_t>(data_type_size(p.dtype));
     const int64_t H = p.hidden;
-    const int64_t nr = (esz == 4) ? NR_MAX_F32 : NR_MAX_F16;
-    const int64_t kc_cap = (esz == 4) ? KC_CAP_F32 : KC_CAP_F16;
+    plan.q8 = p.weight_dtype == DataType::s8;
+    const int64_t nr = plan.q8 ? NR_MAX_I8
+                               : ((esz == 4) ? NR_MAX_F32 : NR_MAX_F16);
+    const int64_t kc_cap = plan.q8 ? kQ8Kc
+                                   : ((esz == 4) ? KC_CAP_F32 : KC_CAP_F16);
 
     const bool lbr = p.mode == RecurrentMode::Gru && p.linear_before_reset;
     plan.nphases = num_phases(p.mode, lbr);
@@ -772,15 +1233,19 @@ Status build_plan(const RecurrentParams& p, int64_t threads, RecPlan& plan)
         g.q = 8 * g.gates;
         g.cols = ((H + 7) / 8) * g.q;
         g.n_align = lcm64(g.q, nr);
-        g.rgeo = matmul_packed_b_geom(g.cols, H, p.dtype);
-        if (!g.rgeo.ok()) { return Status::invalid_argument; }
+        if (!plan.q8) {
+            g.rgeo = matmul_packed_b_geom(g.cols, H, p.dtype);
+            if (!g.rgeo.ok()) { return Status::invalid_argument; }
+        }
         plan.col_base[ph] = plan.total_cols;
         plan.total_cols += g.cols;
         solve_tiles(p.batch, g.cols, std::min(H, kc_cap), g.n_align, threads, g);
     }
 
-    plan.wgeo = matmul_packed_b_geom(plan.total_cols, p.input, p.dtype);
-    if (!plan.wgeo.ok()) { return Status::invalid_argument; }
+    if (!plan.q8) {
+        plan.wgeo = matmul_packed_b_geom(plan.total_cols, p.input, p.dtype);
+        if (!plan.wgeo.ok()) { return Status::invalid_argument; }
+    }
 
     plan.kc = std::max<int64_t>(1, std::min<int64_t>(H, kc_cap));
 
@@ -789,6 +1254,49 @@ Status build_plan(const RecurrentParams& p, int64_t threads, RecPlan& plan)
     plan.chunk = std::max<int64_t>(
         1, budget / (std::max<int64_t>(p.batch, 1) * plan.total_cols * esz));
     plan.chunk = std::min(plan.chunk, std::max<int64_t>(p.seq, 1));
+
+    if (plan.q8) {
+        // The projection's m-tile, by the same rule project_chunk uses: start
+        // wide, then narrow until the grid is deep enough for the team.
+        const int64_t rows = plan.chunk * std::max<int64_t>(p.batch, 1);
+        const int64_t threads_n = std::max<int64_t>(threads, 1);
+        int64_t mc = 64;
+        for (;;) {
+            const int64_t mb = (rows + mc - 1) / mc;
+            if (mb >= threads_n || mc <= 8) { break; }
+            mc -= 8;
+        }
+        plan.proj_mc = std::min<int64_t>(mc, std::max<int64_t>(rows, 1));
+        // A column tile keeps one task's int32 accumulator bounded; the panels
+        // are addressed per k-block slab, so any nr multiple is addressable.
+        plan.proj_nc = std::min<int64_t>(plan.total_cols, kQ8ProjNc);
+
+        // Scratch slots, by the library's rule: thread ids bound the slots when
+        // the grid hands one worker several items, otherwise every task owns
+        // its slice. Sized for the largest tile any phase and the projection
+        // can produce, since the phases run one after another.
+        const int64_t proj_n_blocks = (plan.total_cols + plan.proj_nc - 1) / plan.proj_nc;
+        int64_t tasks_max = (rows + plan.proj_mc - 1) / plan.proj_mc * proj_n_blocks;
+        for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+            tasks_max = std::max<int64_t>(
+                tasks_max, plan.phase[ph].m_blocks * plan.phase[ph].n_blocks);
+        }
+        const int64_t workers = std::max<int64_t>(ctx.cpu.worker_count(), 1);
+        plan.slots = (ctx.cpu.thread_slot_count() > 0 && workers < tasks_max)
+                         ? workers : std::max<int64_t>(tasks_max, 1);
+        plan.a_bytes = num_panels_max(static_cast<int>(plan.proj_mc), MR_I8, 3) *
+                       geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, std::max<int64_t>(p.input, 1)));
+        plan.a_bytes = std::max<int64_t>(
+            plan.a_bytes, num_panels_max(static_cast<int>(p.batch), MR_I8, 3) *
+                          geom_ldd_i8_a(std::min<int64_t>(kQ8Kc, H)));
+        plan.c_elems = plan.proj_mc * plan.proj_nc;
+        plan.s_elems = plan.proj_mc;
+        for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+            const PhaseGeom& g = plan.phase[ph];
+            plan.c_elems = std::max<int64_t>(plan.c_elems, g.mc * g.nc);
+            plan.s_elems = std::max<int64_t>(plan.s_elems, g.mc);
+        }
+    }
     return Status::ok;
 }
 
@@ -810,10 +1318,13 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
     if (B <= 0 || I <= 0 || H <= 0 || D <= 0) { return Status::ok; }
 
     RecPlan plan;
-    NNOPS_TRY(build_plan(p, ctx.cpu.thread_count(), plan));
+    NNOPS_TRY(build_plan(p, ctx, plan));
     const int64_t hp = plan.hp;
     const int64_t ldc = plan.total_cols;
     const DataType dt = p.dtype;
+    const bool q8 = plan.q8;
+    // The header a per-call q8 pack writes, for the geometry the blob uses too.
+    const RecurrentPackedHeader q8_hdr = packed_header(p);
 
     // A prepacked W is every weight this driver would build — W and R panels and
     // the bias vectors — so the packing scratch disappears with it.
@@ -824,7 +1335,9 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
         const char* blob = reinterpret_cast<const char*>(w_in.ptr<T>());
         const auto* h = reinterpret_cast<const RecurrentPackedHeader*>(blob);
         if (h->magic != kRecurrentPackedMagic || h->version != kRecurrentPackedVersion ||
-            h->elem_size != esz || h->input != I || h->hidden != H ||
+            h->elem_size != (q8 ? int64_t{1} : esz) ||
+            h->q8 != (q8 ? int64_t{1} : int64_t{0}) ||
+            h->input != I || h->hidden != H ||
             h->directions != D || h->gates != G ||
             h->lbr != static_cast<int64_t>(lbr ? 1 : 0) ||
             w_in.numel() < recurrent_packed_numel(p)) {
@@ -834,16 +1347,39 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
     }
 
     // ---- scratch: one pooled block, carved per direction ------------------
-    int64_t elems = 0;
+    int64_t elems = 0;   // in T
+    int64_t qbytes = 0;  // the s8 panels are one byte per element
     if (!prepacked) {
-        elems += plan.total_cols * std::max(I, H);  // the interleave staging area
-        elems += packed_b_numel(plan.total_cols, plan.wgeo.total);
-        for (int64_t ph = 0; ph < plan.nphases; ++ph) {
-            const PhaseGeom& g = plan.phase[ph];
-            elems += packed_b_numel(g.cols, g.rgeo.total);
-            elems += g.cols;                        // bias
+        if (q8) {
+            qbytes += plan.total_cols * std::max(I, H);  // interleave staging
+            qbytes += q8_packed_bytes(I, plan.total_cols);
+            for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                qbytes += q8_packed_bytes(H, plan.phase[ph].cols);
+            }
+            qbytes += 4 * plan.total_cols;                       // W's scales
+            qbytes += 8 * G * H;                                 // bias staging, f32
+            for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                qbytes += 4 * plan.phase[ph].cols;               // R's scales
+                qbytes += 4 * plan.phase[ph].cols;               // bias, f32
+            }
+            if (lbr) { qbytes += 4 * plan.total_cols; }          // Rbh, f32
+        } else {
+            elems += plan.total_cols * std::max(I, H);  // the interleave staging area
+            elems += packed_b_numel(plan.total_cols, plan.wgeo.total);
+            for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                const PhaseGeom& g = plan.phase[ph];
+                elems += packed_b_numel(g.cols, g.rgeo.total);
+                elems += g.cols;                        // bias
+            }
+            if (lbr) { elems += plan.phase[0].cols; }   // Rbh, kept apart
         }
-        if (lbr) { elems += plan.phase[0].cols; }   // Rbh, kept apart
+    }
+    if (q8) {
+        // The blob stores the bias as f32 whatever the compute dtype, so a q8
+        // direction converts it once.
+        for (int64_t ph = 0; ph < plan.nphases; ++ph) { elems += plan.phase[ph].cols; }
+        if (lbr) { elems += plan.total_cols; }
+        qbytes += plan.slots * (plan.a_bytes + plan.c_elems * 4 + plan.s_elems * 4);
     }
     elems += plan.chunk * B * ldc;              // the input projection
     if (lbr) { elems += B * ldc; }              // h~'s second accumulation
@@ -851,7 +1387,8 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
     if (is_lstm) { elems += 2 * B * hp; }       // c_prev, c_next
     if (is_gru && !lbr) { elems += 2 * B * hp; }  // z, r⊙H
 
-    const size_t bytes = static_cast<size_t>(elems) * sizeof(T) + 4096;
+    const size_t bytes = static_cast<size_t>(elems) * sizeof(T) +
+                         static_cast<size_t>(qbytes) + 4096;
     PoolPtr owner(bytes);
     if (!owner) { return Status::out_of_memory; }
 
@@ -874,6 +1411,12 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
 
     const int64_t y_stride = y.is_empty() ? 0 : y.row_stride_elems();
     const int64_t x_rows = x.row_stride_elems();
+    // An s8 activation carries its own per-row table; a floating one is
+    // quantized inside the projection from each row's max.
+    RowScales x_scales;
+    if (q8 && x.data_type() == DataType::s8) {
+        x_scales = row_scales_of(x.quant_params(), Tn * B);
+    }
 
     for (int64_t d = 0; d < D; ++d) {
         Arena arena(owner.get(), bytes);
@@ -891,7 +1434,86 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
         const T* bias_p[2] = {nullptr, nullptr};
         const T* rh_bias = nullptr;
 
-        if (prepacked) {
+        // ---- the quantized route's own scratch -----------------------------
+        Q8Scratch qs;
+        const int8_t* q_w = nullptr;
+        const int8_t* q_r[2] = {nullptr, nullptr};
+        const float* q_sw = nullptr;
+        const float* q_sr[2] = {nullptr, nullptr};
+        const float* q_bias[2] = {nullptr, nullptr};
+        const float* q_rh = nullptr;
+        if (q8) {
+            qs.slots = plan.slots;
+            qs.a_bytes = plan.a_bytes;
+            qs.c_elems = plan.c_elems;
+            qs.s_elems = plan.s_elems;
+            qs.a = reinterpret_cast<int8_t*>(arena.take_bytes(plan.slots * plan.a_bytes));
+            qs.c = reinterpret_cast<int32_t*>(
+                arena.take_bytes(plan.slots * plan.c_elems * 4));
+            qs.s = reinterpret_cast<float*>(
+                arena.take_bytes(plan.slots * plan.s_elems * 4));
+
+            if (prepacked) {
+                const PackedWeightOffsets o = packed_weight_offsets(*ph_hdr);
+                const char* base =
+                    reinterpret_cast<const char*>(ph_hdr) + packed_header_bytes() +
+                    d * ph_hdr->dir_bytes;
+                q_w = reinterpret_cast<const int8_t*>(base + o.w);
+                q_sw = reinterpret_cast<const float*>(base + o.sw);
+                for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                    q_r[ph] = reinterpret_cast<const int8_t*>(base + o.r[ph]);
+                    q_sr[ph] = reinterpret_cast<const float*>(base + o.sr[ph]);
+                    q_bias[ph] = reinterpret_cast<const float*>(base + o.bias[ph]);
+                }
+                q_rh = ph_hdr->lbr != 0 ? reinterpret_cast<const float*>(base + o.rh)
+                                        : nullptr;
+            } else {
+                int8_t* raw8 = reinterpret_cast<int8_t*>(
+                    arena.take_bytes(plan.total_cols * std::max(I, H)));
+                Q8Regions reg;
+                reg.w = reinterpret_cast<int8_t*>(
+                    arena.take_bytes(q8_packed_bytes(I, plan.total_cols)));
+                reg.sw = reinterpret_cast<float*>(
+                    arena.take_bytes(4 * plan.total_cols));
+                for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                    reg.r[ph] = reinterpret_cast<int8_t*>(
+                        arena.take_bytes(q8_packed_bytes(H, plan.phase[ph].cols)));
+                    reg.sr[ph] = reinterpret_cast<float*>(
+                        arena.take_bytes(4 * plan.phase[ph].cols));
+                    reg.bias[ph] = reinterpret_cast<float*>(
+                        arena.take_bytes(4 * plan.phase[ph].cols));
+                }
+                if (lbr) {
+                    reg.rh = reinterpret_cast<float*>(arena.take_bytes(4 * plan.total_cols));
+                }
+                float* bias_f32 = reinterpret_cast<float*>(
+                    arena.take_bytes(8 * G * H));
+                prepare_q8_direction(p, q8_hdr, d, w_in, r, bias, raw8, bias_f32,
+                                     reg);
+                q_w = reg.w;
+                q_sw = reg.sw;
+                for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                    q_r[ph] = reg.r[ph];
+                    q_sr[ph] = reg.sr[ph];
+                    q_bias[ph] = reg.bias[ph];
+                }
+                q_rh = reg.rh;
+            }
+
+            // The blob keeps the bias as f32 (a pack cannot know the compute
+            // dtype); the epilogue reads it in T.
+            for (int64_t ph = 0; ph < plan.nphases; ++ph) {
+                const int64_t cols = plan.phase[ph].cols;
+                T* bp = arena.take<T>(cols);
+                for (int64_t i = 0; i < cols; ++i) { s_store(bp + i, q_bias[ph][i]); }
+                bias_p[ph] = bp;
+            }
+            if (lbr) {
+                T* rp = arena.take<T>(plan.total_cols);
+                for (int64_t i = 0; i < plan.total_cols; ++i) { s_store(rp + i, q_rh[i]); }
+                rh_bias = rp;
+            }
+        } else if (prepacked) {
             const PackedWeightOffsets o = packed_weight_offsets(*ph_hdr);
             const char* base =
                 reinterpret_cast<const char*>(ph_hdr) + packed_header_bytes() +
@@ -984,11 +1606,17 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
             // One GEMM over the whole gate width: both phases of a chunk read
             // the same X rows, and neither's input projection waits on the
             // other's recurrence.
-            project_chunk<T>(x.ptr<T>(static_cast<size_t>(t0 * B)), x_rows,
-                             in_proj, ldc, packed_w,
-                             plan.wgeo.ldd, plan.wgeo.nr,
-                             nrows * B, plan.total_cols, I, plan.kc,
-                             plan.total_cols, ctx);
+            if (q8) {
+                project_chunk_q8<T>(x, t0 * B, in_proj, ldc, q_w, q_sw,
+                                    plan.total_cols, I, nrows * B, plan.proj_mc,
+                                    plan.proj_nc, x_scales, qs, ctx);
+            } else {
+                project_chunk<T>(x.ptr<T>(static_cast<size_t>(t0 * B)), x_rows,
+                                 in_proj, ldc, packed_w,
+                                 plan.wgeo.ldd, plan.wgeo.nr,
+                                 nrows * B, plan.total_cols, I, plan.kc,
+                                 plan.total_cols, ctx);
+            }
 
             const int64_t t_step = fwd ? 1 : -1;
             const int64_t t_first = fwd ? t0 : t0 + nrows - 1;
@@ -1018,6 +1646,9 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
                     s.packed_r = packed_r[ph];
                     s.r_ldd = g.rgeo.ldd;
                     s.r_nr = g.rgeo.nr;
+                    s.q_r = q_r[ph];
+                    s.sr = q_sr[ph];
+                    s.qs = qs;
                     s.bias = bias_p[ph];
                     s.rh_bias = (lbr && g.kind == PhaseKind::GruAll) ? rh_bias : nullptr;
                     s.h_prev = h_a;
@@ -1041,7 +1672,11 @@ Status recurrent_impl(const RecurrentParams& p, std::span<TensorView> outputs,
                     s.alpha_h = p.alpha_h;
                     s.input_forget = p.input_forget;
                     s.linear_before_reset = lbr;
-                    run_phase(s, g.kind, ctx);
+                    if (q8) {
+                        run_phase_q8(s, g.kind, ctx);
+                    } else {
+                        run_phase(s, g.kind, ctx);
+                    }
                 }
 
                 std::swap(h_a, h_b);
@@ -1155,6 +1790,52 @@ Status pack_weights_impl(const RecurrentParams& p, const TensorView& w,
     return Status::ok;
 }
 
+/// The quantized blob: the fp pack's directions, but W and R go in as int8
+/// panels with their per-column scales, and the bias stays f32 — the blob is
+/// shared by the f32 and f16 compute routes, and the driver converts it.
+Status pack_weights_q8(const RecurrentParams& p, const TensorView& w,
+                       const TensorView& r, const TensorView* bias,
+                       TensorView& dst, const ComputeContext& ctx)
+{
+    const int64_t need = recurrent_packed_numel(p);
+    if (dst.is_empty() || dst.data_type() != DataType::s8 || dst.numel() < need) {
+        return Status::invalid_argument;
+    }
+    if (w.data_type() != DataType::s8 || r.data_type() != DataType::s8) {
+        return Status::invalid_argument;
+    }
+    const RecurrentPackedHeader h = packed_header(p);
+    const int64_t G = h.gates;
+
+    // The interleave staging area, then one direction's bias row in f32.
+    const int64_t raw_bytes = align_up64(h.total_cols * std::max(h.input, h.hidden));
+    PoolPtr owner(static_cast<size_t>(raw_bytes) +
+                  static_cast<size_t>(2 * G * h.hidden) * sizeof(float) + 4096);
+    if (!owner) { return Status::out_of_memory; }
+    int8_t* raw = static_cast<int8_t*>(owner.get());
+    float* bias_f32 =
+        reinterpret_cast<float*>(static_cast<char*>(owner.get()) + raw_bytes);
+
+    char* blob = reinterpret_cast<char*>(dst.ptr<int8_t>());
+    std::memcpy(blob, &h, sizeof(h));
+
+    for (int64_t d = 0; d < h.directions; ++d) {
+        char* base = blob + packed_header_bytes() + d * h.dir_bytes;
+        const PackedWeightOffsets o = packed_weight_offsets(h);
+        Q8Regions reg;
+        reg.w = reinterpret_cast<int8_t*>(base + o.w);
+        reg.sw = reinterpret_cast<float*>(base + o.sw);
+        for (int64_t ph = 0; ph < h.nphases; ++ph) {
+            reg.r[ph] = reinterpret_cast<int8_t*>(base + o.r[ph]);
+            reg.sr[ph] = reinterpret_cast<float*>(base + o.sr[ph]);
+            reg.bias[ph] = reinterpret_cast<float*>(base + o.bias[ph]);
+        }
+        reg.rh = h.lbr != 0 ? reinterpret_cast<float*>(base + o.rh) : nullptr;
+        prepare_q8_direction(p, h, d, w, r, bias, raw, bias_f32, reg);
+    }
+    return Status::ok;
+}
+
 }  // anonymous namespace
 
 int64_t recurrent_packed_numel(const RecurrentParams& p)
@@ -1173,6 +1854,9 @@ Status recurrent_pack_weights(const RecurrentParams& p, const TensorView& w,
     }
     if (p.input <= 0 || p.hidden <= 0 || p.directions <= 0) {
         return Status::invalid_argument;
+    }
+    if (p.weight_dtype == DataType::s8) {
+        return pack_weights_q8(p, w, r, bias, dst, ctx);
     }
     return p.dtype == DataType::f32
                ? pack_weights_impl<float>(p, w, r, bias, dst, ctx)
