@@ -10,7 +10,7 @@
 /// for that pattern.
 
 #include "nnops/core/tensor_view.hpp"
-#include "common/memory_pool.hpp"
+#include "memory_pool.hpp"
 
 #include <cstdint>
 
