@@ -1604,7 +1604,12 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                           (!plan.pointwise || in_row_stride == IW * IC);
 
         for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
-            const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
+            // A task may start mid-block (oc_chunks splits on panels), but the
+            // blob holds one oc block at a time: end the tile where the block
+            // does, so its panels keep the stride the kernel derives from kdim.
+            const int64_t oc_end = panels
+                ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
+            const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
             // The residual region covers one pass's rows (one oc block live).
             T* const orig = keep_orig ? orig_buf : nullptr;
 
@@ -1633,11 +1638,9 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                 const T* b_panel;
                 int b_ld = 0;
                 if (panels) {
-                    // The k block's panel column, then this task's own panels
-                    // along it: no pack, however many chunks the oc axis took.
-                    const int64_t ib = icn / icn_block;
-                    b_panel = panels + pg.offset(g, ib) +
-                              (ocn / nr_max) * pg.slot(ib);
+                    // The blob's own walk: this oc block's k block, in place —
+                    // no pack, however many chunks the oc axis took.
+                    b_panel = panels + pg.offset(g, icn / icn_block, ocn);
                 } else if (karea == 1) {
                     // A 1x1 filter is [ic][oc] with oc contiguous — a panel's k
                     // rows already, `w_ic_stride` apart — so read it in place and
@@ -2071,7 +2074,11 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
                           (!plan.pointwise || in_row_stride == IW * IC);
 
         for (int64_t ocn = oc_lo; ocn < oc_hi; ocn += ocn_block) {
-            const int64_t ocnc = std::min(ocn_block, oc_hi - ocn);
+            // Same block-end clamp as the fp route: the blob holds one oc block
+            // at a time and the kernel walks its panels at `slot` apart.
+            const int64_t oc_end = panels
+                ? std::min(oc_hi, (ocn / ocn_block + 1) * ocn_block) : oc_hi;
+            const int64_t ocnc = std::min(ocn_block, oc_end - ocn);
 
             for (int64_t pr = r0; pr < r1; pr += ph_block) {
             const int64_t pr1 = std::min(r1, pr + ph_block);
@@ -2098,9 +2105,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
 
                 const int8_t* b_panel;
                 if (panels) {
-                    const int64_t ib = icn / icn_block;
-                    b_panel = panels + pg.offset(g, ib) +
-                              (ocn / nr_max) * pg.slot(ib);
+                    b_panel = panels + pg.offset(g, icn / icn_block, ocn);
                 } else {
                     pack_block_i8(pack_buf, gemm_panel_slot(kdim, nr_max, 1, true), stage,
                                   w_g + ocn + icn * w_ic_stride,
@@ -2671,8 +2676,11 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
     g.tail_ic     = ic_per_group - g.nfull_ic * g.icn_block;
     g.slot_tail   = g.tail_ic
         ? gemm_panel_slot(g.tail_ic * karea, g.nr, esz, quant) : 0;
-    g.group_elems = g.panels_oc
-                  * (g.nfull_ic * g.slot_full + (g.tail_ic ? g.slot_tail : 0));
+    g.col_elems   = g.nfull_ic * g.slot_full + (g.tail_ic ? g.slot_tail : 0);
+    // ⌈⌉, not ÷: a lone oc block is the group's own width, which need not be a
+    // multiple of nr (24 channels is two panels, one of them half live).
+    g.block_panels = (g.ocn_block + g.nr - 1) / g.nr;
+    g.group_elems = g.panels_oc * g.col_elems;
     g.total = attrs.groups * g.group_elems;
     if (quant) {
         // The R_b table trails the panels: int32 per output channel, the only
@@ -2810,12 +2818,12 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
     }
 }
 
-/// Pack the channel-last panels (PackedHWIO): one panel per (group, k block,
-/// panel), `nr` output channels wide.
+/// Pack the channel-last panels (PackedHWIO): one panel per (group, oc block,
+/// k block, panel), `nr` output channels wide.
 ///
 /// A panel is what pack_block builds for an oc run one panel wide. The task
-/// split is (group, k block) — a whole panel column each, so every task writes a
-/// contiguous region.
+/// split is (group, oc block, k block) — the layout's own unit, so every task
+/// writes a contiguous region without the panels of two oc blocks interleaving.
 template <class T>
 void pack_weight_last(const TensorView& weight, TensorView& packed,
                       const ConvPackedWeightLast& g, int64_t ic_per_group,
@@ -2824,31 +2832,35 @@ void pack_weight_last(const TensorView& weight, TensorView& packed,
 {
     const int64_t karea = g.kdim_max / g.icn_block;
     const int64_t num_ic_blocks = g.nfull_ic + (g.tail_ic ? 1 : 0);
+    const int64_t num_oc_blocks = (oc_per_group + g.ocn_block - 1) / g.ocn_block;
+    const int64_t per_group = num_oc_blocks * num_ic_blocks;
 
     const T* const w = weight.ptr<T>();
     T* const blob = packed.ptr<T>();
     const int64_t stage_len = g.nr * g.kdim_max;   // elements
 
-    with_stage(ctx, groups * num_ic_blocks, stage_len * static_cast<int64_t>(sizeof(T)),
+    with_stage(ctx, groups * per_group, stage_len * static_cast<int64_t>(sizeof(T)),
                [&](int64_t s, char* stage_raw) {
         T* const stage = reinterpret_cast<T*>(stage_raw);
-        const int64_t gg = s / num_ic_blocks;
-        const int64_t ib = s % num_ic_blocks;
+        const int64_t gg  = s / per_group;
+        const int64_t rem = s % per_group;
+        const int64_t ob  = rem / num_ic_blocks;
+        const int64_t ib  = rem % num_ic_blocks;
 
         const int64_t icn  = ib * g.icn_block;
         const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
         const int64_t kdim = icnc * karea;
         const int64_t slot = gemm_panel_slot(kdim, g.nr, sizeof(T), false);
-        T* const col = blob + g.offset(gg, ib);
+        const int64_t oc0  = ob * g.ocn_block;
+        const int64_t oc1  = std::min(oc0 + g.ocn_block, oc_per_group);
 
         // HWIO: one input channel's tap is one OC-length run; the group's output
         // channels start at gg·oc_per_group.
         const int64_t w_ic  = weight.shape(3);          // between input channels
         const int64_t w_tap = ic_per_group * w_ic;      // between filter taps
-        for (int64_t p = 0; p < g.panels_oc; ++p) {
-            const int64_t ocn  = p * g.nr;
+        for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
             const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
-            channel_last::pack_block<T>(col + p * slot, slot, stage,
+            channel_last::pack_block<T>(blob + g.offset(gg, ib, ocn), slot, stage,
                           w + gg * oc_per_group + ocn + icn * w_ic,
                           w_ic, w_tap, ocnc, icnc, static_cast<int>(karea),
                           g.nr, static_cast<int>(kdim));
@@ -2864,29 +2876,33 @@ void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
 {
     const int64_t karea = g.kdim_max / g.icn_block;
     const int64_t num_ic_blocks = g.nfull_ic + (g.tail_ic ? 1 : 0);
+    const int64_t num_oc_blocks = (oc_per_group + g.ocn_block - 1) / g.ocn_block;
+    const int64_t per_group = num_oc_blocks * num_ic_blocks;
     const bool a_biased = arch::mma_i8_folds_a_bias;
 
     const int8_t* const w = weight.ptr<int8_t>();
     int8_t* const blob = packed.ptr<int8_t>();
     const int64_t stage_len = g.nr * g.kdim_max;   // bytes
 
-    with_stage(ctx, groups * num_ic_blocks, stage_len, [&](int64_t s, char* stage_raw) {
+    with_stage(ctx, groups * per_group, stage_len, [&](int64_t s, char* stage_raw) {
         int8_t* const stage = reinterpret_cast<int8_t*>(stage_raw);
-        const int64_t gg = s / num_ic_blocks;
-        const int64_t ib = s % num_ic_blocks;
+        const int64_t gg  = s / per_group;
+        const int64_t rem = s % per_group;
+        const int64_t ob  = rem / num_ic_blocks;
+        const int64_t ib  = rem % num_ic_blocks;
 
         const int64_t icn  = ib * g.icn_block;
         const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
         const int64_t kdim = icnc * karea;
         const int64_t slot = gemm_panel_slot(kdim, g.nr, 1, true);
-        int8_t* const col = blob + g.offset(gg, ib);
+        const int64_t oc0  = ob * g.ocn_block;
+        const int64_t oc1  = std::min(oc0 + g.ocn_block, oc_per_group);
 
         const int64_t w_ic  = weight.shape(3);
         const int64_t w_tap = ic_per_group * w_ic;
-        for (int64_t p = 0; p < g.panels_oc; ++p) {
-            const int64_t ocn  = p * g.nr;
+        for (int64_t ocn = oc0; ocn < oc1; ocn += g.nr) {
             const int64_t ocnc = std::min(g.nr, oc_per_group - ocn);
-            channel_last::pack_block_i8(col + p * slot, slot, stage,
+            channel_last::pack_block_i8(blob + g.offset(gg, ib, ocn), slot, stage,
                           w + gg * oc_per_group + ocn + icn * w_ic,
                           w_ic, w_tap, ocnc, icnc, static_cast<int>(karea),
                           g.nr, static_cast<int>(kdim), a_biased);

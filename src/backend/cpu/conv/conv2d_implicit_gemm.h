@@ -145,20 +145,25 @@ inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim,
     return panels_per_oc * gemm_panel_slot(kdim, nr_max, esz, quant);
 }
 
-/// Geometry of the channel-last prepacked filter (PackedHWIO): one panel column
-/// per k block, panels of `nr` output channels tiled across the group's oc axis.
-/// The trailing k block packs a shorter k, hence a shorter panel stride, and the
-/// columns are laid out group by group.
+/// Geometry of the channel-last prepacked filter (PackedHWIO): the blob is
+/// [group][oc block][k block][panel][k][nr], panels of `nr` output channels.
+/// The two outer axes are the reader's own loop nest — the driver walks oc block
+/// → pixel pass → k block → panel ([conv2d_implicit_gemm.cpp], the channel-last
+/// task) — so one oc block's whole filter is one contiguous run taken in order,
+/// and a cold filter streams once instead of in `panels_oc`-strided slices.
+/// The trailing k block packs a shorter k, hence a shorter panel stride.
 struct ConvPackedWeightLast {
     int64_t nr = 0;          ///< panel width (output channels per panel)
     int64_t icn_block = 0;   ///< k block
     int64_t ocn_block = 0;   ///< oc block (the plan's N tile)
     int64_t kdim_max = 0;    ///< icn_block × karea
-    int64_t panels_oc = 0;   ///< ⌈oc_per_group / nr⌉ — panels in one k column
+    int64_t panels_oc = 0;   ///< ⌈oc_per_group / nr⌉ — panels in the group
     int64_t slot_full = 0;   ///< elements of one panel at kdim_max
     int64_t slot_tail = 0;   ///< ... at the trailing k block (0 when none)
     int64_t nfull_ic = 0;    ///< whole k blocks per group
     int64_t tail_ic = 0;     ///< input channels in the trailing k block
+    int64_t col_elems = 0;   ///< one panel's whole k column
+    int64_t block_panels = 0;///< ⌈ocn_block / nr⌉ — panels in an oc block
     int64_t group_elems = 0; ///< one group's panels
     int64_t sums_off = 0;    ///< element offset of the sums table
     int64_t total = 0;       ///< all groups' panels, then the sums table
@@ -170,14 +175,19 @@ struct ConvPackedWeightLast {
     // the raw filter, never from the packed bytes (whose format differs per
     // arch).
 
-    /// Element offset of k block @p ic_block in group @p g's panel column.
-    int64_t offset(int64_t g, int64_t ic_block) const noexcept
+    /// Element offset of the panel holding output channel @p oc (panel-aligned)
+    /// at k block @p ic_block, in group @p g. Panels of one oc block at one k
+    /// block are `slot` apart, and the next k block starts `block_panels·slot`
+    /// later — so a whole oc block is read straight through.
+    int64_t offset(int64_t g, int64_t ic_block, int64_t oc) const noexcept
     {
-        const int64_t col = ic_block >= nfull_ic
-            ? nfull_ic * panels_oc * slot_full +
-                  (ic_block - nfull_ic) * panels_oc * slot_tail
-            : ic_block * panels_oc * slot_full;
-        return g * group_elems + col;
+        const int64_t koff = ic_block >= nfull_ic
+            ? nfull_ic * slot_full + (ic_block - nfull_ic) * slot_tail
+            : ic_block * slot_full;
+        const int64_t blk  = oc / ocn_block;
+        const int64_t pin  = (oc - blk * ocn_block) / nr;
+        return g * group_elems + blk * block_panels * col_elems +
+               block_panels * koff + pin * slot(ic_block);
     }
 
     /// Elements of one panel at k block @p ic_block (neighbouring panels in that
