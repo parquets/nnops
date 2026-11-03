@@ -688,8 +688,8 @@ struct MatMulPlan {
 /// num_slots_a has its own predicate: int8 hoists its B pack on the M-split
 /// (num_slots == 1) but still packs A per block, so the dispatch must index A
 /// by `num_slots_a`. One thread always gets one A slot — sizing per block would
-/// push a large M-split past the memory pool's 16 MiB ceiling into a per-call
-/// OS allocation.
+/// push a large M-split past the memory pool's ceiling into a per-call OS
+/// allocation.
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,

@@ -17,6 +17,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "simd_kernel/simd_rope.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/memory_pool.hpp"
 
 #include <cmath>
 #include <vector>
@@ -50,16 +51,16 @@ std::vector<RoPESection> build_sections(const RoPEAttributes& attrs, int64_t hea
 }
 
 void compute_cos_sin_tables(
-    std::vector<float>& cos_table,
-    std::vector<float>& sin_table,
+    PoolArray<float>& cos_table,
+    PoolArray<float>& sin_table,
     int64_t seq_len,
     int64_t head_dim,
     const std::vector<RoPESection>& sections)
 {
     const int64_t half = head_dim / 2;
     const size_t  total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
-    cos_table.resize(total);
-    sin_table.resize(total);
+    cos_table.reset(total);
+    sin_table.reset(total);
 
     for (int64_t pos = 0; pos < seq_len; ++pos) {
         const float pos_f = static_cast<float>(pos);
@@ -107,8 +108,8 @@ void rope_impl(const RoPEAttributes& attrs,
     }
 
     auto sections = build_sections(attrs, head_dim);
-    std::vector<float> cos_table;
-    std::vector<float> sin_table;
+    PoolArray<float> cos_table;
+    PoolArray<float> sin_table;
     compute_cos_sin_tables(cos_table, sin_table, seq_len, head_dim, sections);
 
     const T* x_ptr   = X.ptr<T>();

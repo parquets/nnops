@@ -170,11 +170,11 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
     const int64_t rank = input.rank();
     const int64_t rank_out = output.rank();
 
-    const std::vector<int64_t> inner_offsets =
+    const PoolArray<int64_t> inner_offsets =
         build_offsets(input, axis + 1, rank - 1, num_inner);
 
     const int64_t y_inner_start = attrs.keepdims ? axis + 1 : axis;
-    const std::vector<int64_t> y_inner_offsets =
+    const PoolArray<int64_t> y_inner_offsets =
         build_offsets(output, y_inner_start, rank_out - 1, num_inner);
 
     const int64_t x_outer_stride = (axis > 0) ? input.stride_elems(axis - 1) : 0;

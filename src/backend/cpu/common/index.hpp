@@ -10,9 +10,9 @@
 /// for that pattern.
 
 #include "nnops/core/tensor_view.hpp"
+#include "common/memory_pool.hpp"
 
 #include <cstdint>
-#include <vector>
 
 namespace nnops::backend::cpu {
 
@@ -38,11 +38,11 @@ inline int64_t decompose_flat_offset(int64_t flat, const TensorView& t,
 
 /// Offset table for `count` consecutive flat indices over [dim_lo, dim_hi]
 /// (see decompose_flat_offset); the general non-contiguous paths build it once.
-inline std::vector<int64_t> build_offsets(const TensorView& t,
-                                          int64_t dim_lo, int64_t dim_hi,
-                                          int64_t count)
+inline PoolArray<int64_t> build_offsets(const TensorView& t,
+                                        int64_t dim_lo, int64_t dim_hi,
+                                        int64_t count)
 {
-    std::vector<int64_t> offs(static_cast<size_t>(count));
+    PoolArray<int64_t> offs(static_cast<size_t>(count));
     for (int64_t flat = 0; flat < count; ++flat) {
         offs[static_cast<size_t>(flat)] =
             decompose_flat_offset(flat, t, dim_lo, dim_hi);

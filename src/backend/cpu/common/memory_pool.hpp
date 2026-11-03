@@ -8,13 +8,13 @@
 /// recycled across operators and invocations, avoiding malloc/free churn.
 ///
 /// Design:
-///   - Size-class free lists (powers of two, 64 B .. 16 MiB): allocate() rounds
+///   - Size-class free lists (powers of two, 64 B .. 32 MiB): allocate() rounds
 ///     up to the next class; deallocate() returns the block to its class.
 ///   - Every block is 64-byte aligned (matches mma_pack_align).
 ///   - Each thread keeps a cache of one recycled block per size class, so the
 ///     "allocate one scratch buffer, free it on return" pattern hits a lock-free
 ///     fast path. Every thread cache is registered so release_all() can drain it.
-///   - Requests above 16 MiB bypass the pool (direct aligned alloc/free).
+///   - Requests above 32 MiB bypass the pool (direct aligned alloc/free).
 ///   - The central lists are bounded by a retention budget: past it, the largest
 ///     freed blocks go back to the OS so the idle footprint stays bounded.
 ///
@@ -23,8 +23,10 @@
 /// nnops::release_scratch_memory() (see include/nnops/core/backend.hpp), which
 /// force-releases all pooled memory.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace nnops::backend::cpu {
 
@@ -37,7 +39,7 @@ public:
     MemoryPool& operator=(const MemoryPool&) = delete;
 
     /// Allocate @p size bytes, 64-byte aligned: this thread's cache first, then
-    /// the shared pool, then the OS. Requests above 16 MiB are direct and not
+    /// the shared pool, then the OS. Requests above 32 MiB are direct and not
     /// recycled.
     void* allocate(size_t size);
 
@@ -98,6 +100,71 @@ public:
 
 private:
     void* ptr_ = nullptr;
+};
+
+/// Typed, uninitialized scratch array over PoolPtr — the operator-side
+/// replacement for std::vector so every per-call request goes through the pool
+/// and returns to it on scope exit. Unlike a vector it does not value-initialize
+/// its elements; call zero()/assign() when the consumer relies on that.
+template <class T>
+class PoolArray {
+public:
+    PoolArray() noexcept = default;
+    explicit PoolArray(size_t n) { reset(n); }
+
+    PoolArray(const PoolArray&) = delete;
+    PoolArray& operator=(const PoolArray&) = delete;
+    PoolArray(PoolArray&& o) noexcept
+        : owner_(std::move(o.owner_)), ptr_(o.ptr_), n_(o.n_) {
+        o.ptr_ = nullptr;
+        o.n_ = 0;
+    }
+    PoolArray& operator=(PoolArray&& o) noexcept {
+        if (this != &o) {
+            owner_ = std::move(o.owner_);
+            ptr_ = o.ptr_;
+            n_ = o.n_;
+            o.ptr_ = nullptr;
+            o.n_ = 0;
+        }
+        return *this;
+    }
+
+    T* data() noexcept { return ptr_; }
+    const T* data() const noexcept { return ptr_; }
+    size_t size() const noexcept { return n_; }
+    bool empty() const noexcept { return n_ == 0; }
+    T* begin() noexcept { return ptr_; }
+    T* end() noexcept { return ptr_ + n_; }
+    const T* begin() const noexcept { return ptr_; }
+    const T* end() const noexcept { return ptr_ + n_; }
+    T& operator[](size_t i) noexcept { return ptr_[i]; }
+    const T& operator[](size_t i) const noexcept { return ptr_[i]; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    /// Size the array, keeping the block when the size is unchanged.
+    bool reset(size_t n) {
+        if (n == n_ && (n == 0 || ptr_ != nullptr)) { return true; }
+        owner_.reset();
+        ptr_ = nullptr;
+        n_ = 0;
+        if (n == 0) { return true; }
+        owner_ = PoolPtr(n * sizeof(T));
+        if (!owner_) { return false; }
+        ptr_ = owner_.as<T>();
+        n_ = n;
+        return true;
+    }
+
+    /// Size the array and fill every element with @p v.
+    void assign(size_t n, T v) { if (reset(n)) { std::fill_n(ptr_, n, v); } }
+    /// Size the array and zero every element.
+    void zero(size_t n) { assign(n, T{}); }
+
+private:
+    PoolPtr owner_;
+    T*      ptr_ = nullptr;
+    size_t  n_ = 0;
 };
 
 }  // namespace nnops::backend::cpu

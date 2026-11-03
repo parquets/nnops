@@ -618,11 +618,13 @@ Status attention_cpu(const AttentionAttributes& attrs,
 
     if (dtypes_ok) {
         // One plan decides tiles and scratch, and the scratch is allocated once
-        // here, outside the parallel dispatch — no per-task allocation.
+        // here, outside the parallel dispatch — no per-task allocation. Slots
+        // are indexed by worker id, so the count is the workers, not the grid:
+        // an over-subscribed provider would otherwise allocate 4x the scratch.
         const TensorDesc descs[] = {inputs[0].desc(), inputs[1].desc(), inputs[2].desc()};
         const TensorDesc outs[]  = {output.desc()};
         const AttentionPlan plan = get_attention_plan(attrs, descs, outs,
-                                                      ctx.cpu.thread_count(),
+                                                      ctx.cpu.worker_count(),
                                                       ctx.cpu.thread_slot_count() > 0);
         PoolPtr scratch(plan.workspace_size);
 

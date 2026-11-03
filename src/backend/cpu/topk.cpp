@@ -11,6 +11,7 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/memory_pool.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -70,7 +71,7 @@ void topk_impl(const TopKAttributes& attrs,
     // when there are enough positions.
     auto process_outer = [&](int64_t outer) {
         // Per-thread heap to avoid allocation in hot loop
-        std::vector<Pair> heap(static_cast<size_t>(k));
+        PoolArray<Pair> heap(static_cast<size_t>(k));
 
         for (int64_t inner = 0; inner < inner_size; ++inner) {
             int64_t i_base = outer * axis_stride * axis_dim + inner;

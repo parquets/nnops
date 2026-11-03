@@ -792,25 +792,24 @@ nnops::backend::cpu::MatMulPlan i8_plan(int64_t M, int64_t K, int64_t N, int nt)
 NNOPS_TEST(matmul_int8_plan_shrinks_tiles_with_threads) {
     namespace cpu = nnops::backend::cpu;
 
-    // mc is bounded by MC_MAX (768) and the shape, then balanced on the M-split:
-    // the block count is rounded up to a multiple of the pool and the tile is
-    // that even share, rounded up to MC_ALIGN (24). It is the plan's thread
-    // awareness that makes the block count grow with the pool.
+    // mc is bounded by MC_MAX (768) and the shape, then balanced on the M-split
+    // against 2 * pool blocks: the tile is the aligned even share of that count,
+    // never below 2 * MC_ALIGN. It is the plan's thread awareness that makes the
+    // block count grow with the pool.
     const auto p1  = i8_plan(256, 256, 256, 1);
     const auto p10 = i8_plan(256, 256, 256, 10);
     NNOPS_EXPECT_TRUE(!p10.split_n);                     // M >= N → split on M
-    NNOPS_EXPECT_EQ(p1.mc, int64_t{240});                // nt = 1: the M cap, snapped to 24
+    NNOPS_EXPECT_EQ(p1.mc, int64_t{144});                // 2 blocks of 128 → 24-grid
     NNOPS_EXPECT_EQ(cpu::split_block_count(256, p1.mc), int64_t{2});
-    NNOPS_EXPECT_EQ(p10.mc, int64_t{48});                // ceil24(256 / 10) → 6 blocks
+    NNOPS_EXPECT_EQ(p10.mc, int64_t{48});                // the 2 * 24 floor
     NNOPS_EXPECT_EQ(cpu::split_block_count(256, p10.mc), int64_t{6});
 
-    // At one thread mc is the 768 ceiling, so the pool is what moves the block
-    // count.
+    // At one thread the block target alone splits M in two; the pool widens it.
     const auto b1  = i8_plan(1024, 512, 1024, 1);
     const auto b10 = i8_plan(1024, 512, 1024, 10);
-    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b1.mc), int64_t{2});   // mc = 768
-    NNOPS_EXPECT_EQ(b10.mc, int64_t{120});               // ceil24(1024 / 10)
-    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b10.mc), int64_t{9});
+    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b1.mc), int64_t{2});   // mc = 512
+    NNOPS_EXPECT_EQ(b10.mc, int64_t{72});                // ceil24(1024 / 20)
+    NNOPS_EXPECT_EQ(cpu::split_block_count(1024, b10.mc), int64_t{15});
 
     // int8 has no direct-A route, so A is packed however narrow its row stride.
     NNOPS_EXPECT_TRUE(b10.pack_a);

@@ -686,7 +686,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     bool sweep_a = false;        // Σ_k A[m,k] is needed
     bool sweep_b = false;        // Σ_k B[k,n] is needed
     bool fold_row = false;       // the row half is folded into r_fold
-    std::vector<int32_t> r_a, r_b, r_fold;
+    PoolArray<int32_t> r_a, r_b, r_fold;
     if constexpr (!R::is_fp) {
         const QuantParams& qa = a.quant_params();
         const QuantParams& qb = b.quant_params();
@@ -714,9 +714,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             int8_ep = sweep_a || sweep_b || out_q || int_bias != nullptr ||
                       attrs.epilogue.type != EpilogueActivateType::None;
         }
-        if (sweep_a) { r_a.resize(static_cast<size_t>(Mi)); }
-        if (sweep_b) { r_b.resize(static_cast<size_t>(Ni)); }
-        if (fold_row) { r_fold.resize(static_cast<size_t>(Mi)); }
+        if (sweep_a) { r_a.reset(static_cast<size_t>(Mi)); }
+        if (sweep_b) { r_b.reset(static_cast<size_t>(Ni)); }
+        if (fold_row) { r_fold.reset(static_cast<size_t>(Mi)); }
     }
 
     // The int8 output pass rides on the last k-block's tile, exactly where fp
@@ -887,7 +887,7 @@ void quantize_activation(const TensorView& a, TensorView& aq,
     const int64_t K = a.shape(a.rank() - 1);
     if (rows <= 0 || K <= 0) { return; }
 
-    std::vector<float> scale_buf, zero_buf;
+    PoolArray<float> scale_buf, zero_buf;
     const float* scale_arr = qp.scale_data;
     if (scale_arr == nullptr) {
         scale_buf.assign(static_cast<size_t>(rows), qp.scale);
@@ -895,7 +895,7 @@ void quantize_activation(const TensorView& a, TensorView& aq,
     }
     const float* zero_arr = nullptr;
     if (qp.zero_point_data != nullptr) {
-        zero_buf.resize(static_cast<size_t>(rows));
+        zero_buf.reset(static_cast<size_t>(rows));
         for (int64_t i = 0; i < rows; ++i) {
             zero_buf[static_cast<size_t>(i)] =
                 static_cast<float>(qp.zero_point_data[i]);

@@ -192,11 +192,11 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     // the fixed order keeps the tie-break and the weights bit-reproducible.
     // Anything that finalizes route_weight must happen here — phase B reads it
     // from worker threads.
-    std::vector<int32_t> route_expert(static_cast<size_t>(total));
-    std::vector<float>   route_weight(static_cast<size_t>(total));
+    PoolArray<int32_t> route_expert(static_cast<size_t>(total));
+    PoolArray<float>   route_weight(static_cast<size_t>(total));
     {
-        std::vector<float> probs(static_cast<size_t>(E));
-        std::vector<char>  used(static_cast<size_t>(E));
+        PoolArray<float> probs(static_cast<size_t>(E));
+        PoolArray<char>  used(static_cast<size_t>(E));
 
         for (int64_t t = 0; t < num_tokens; ++t) {
             const T* logits = rout_ptr + t * rout_row_stride;
@@ -276,7 +276,8 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     // Group the routes by expert: counts -> exclusive prefix sum -> slots, so
     // one expert's routes are contiguous; route_row[s] maps a slot back to the
     // token it came from.
-    std::vector<int32_t> expert_off(static_cast<size_t>(E) + 1, 0);
+    PoolArray<int32_t> expert_off;
+    expert_off.zero(static_cast<size_t>(E) + 1);
     for (int64_t r = 0; r < total; ++r) {
         ++expert_off[static_cast<size_t>(route_expert[static_cast<size_t>(r)]) + 1];
     }
@@ -284,10 +285,12 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         expert_off[static_cast<size_t>(e) + 1] += expert_off[static_cast<size_t>(e)];
     }
 
-    std::vector<int32_t> slot(static_cast<size_t>(total));
-    std::vector<int32_t> route_row(static_cast<size_t>(total));
+    PoolArray<int32_t> slot(static_cast<size_t>(total));
+    PoolArray<int32_t> route_row(static_cast<size_t>(total));
     {
-        std::vector<int32_t> cursor(expert_off.begin(), expert_off.end() - 1);
+        PoolArray<int32_t> cursor;
+        cursor.reset(static_cast<size_t>(E));
+        std::memcpy(cursor.data(), expert_off.data(), static_cast<size_t>(E) * sizeof(int32_t));
         for (int64_t t = 0; t < num_tokens; ++t) {
             for (int64_t j = 0; j < k; ++j) {
                 const int64_t idx = t * k + j;

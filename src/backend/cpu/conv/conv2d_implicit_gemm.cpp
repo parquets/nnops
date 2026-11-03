@@ -611,9 +611,9 @@ void conv2d_planar_int8_impl(const Conv2DAttributes& attrs,
     NNOPS_ASSERT(!prepacked ||
                  (pg.icn_block == icn_block && pg.ocn_block == ocn_block));
 
-    std::vector<int32_t> r_a;
+    PoolArray<int32_t> r_a;
     if (need_comp) {
-        r_a.resize(static_cast<size_t>(OC));
+        r_a.reset(static_cast<size_t>(OC));
         if (prepacked) {
             // The blob carries the sums, so no per-call walk of MMA-layout panels.
             std::memcpy(r_a.data(), w_ptr + pg.sums_off,
@@ -630,10 +630,10 @@ void conv2d_planar_int8_impl(const Conv2DAttributes& attrs,
     // per element: −zp_b·(r_a − k·zp_a) per output channel. The integer
     // destination folds it into the bias, the fp one into an int32 row offset;
     // either way the epilogue then only handles the column term.
-    std::vector<int32_t> row_fold;
-    std::vector<int32_t> bias_fold;
+    PoolArray<int32_t> row_fold;
+    PoolArray<int32_t> bias_fold;
     if (!need_col_sum && zp_eff != 0) {
-        row_fold.resize(static_cast<size_t>(OC));
+        row_fold.reset(static_cast<size_t>(OC));
         for (int64_t oc = 0; oc < OC; ++oc) {
             const int32_t coef_zp =
                 r_a[static_cast<size_t>(oc)] -
@@ -641,7 +641,7 @@ void conv2d_planar_int8_impl(const Conv2DAttributes& attrs,
             row_fold[static_cast<size_t>(oc)] = -zp_eff * coef_zp;
         }
         if constexpr (kIntOut) {
-            bias_fold.resize(static_cast<size_t>(OC));
+            bias_fold.reset(static_cast<size_t>(OC));
             for (int64_t oc = 0; oc < OC; ++oc) {
                 bias_fold[static_cast<size_t>(oc)] =
                     row_fold[static_cast<size_t>(oc)] + (b_i32 ? b_i32[oc] : 0);
@@ -652,7 +652,7 @@ void conv2d_planar_int8_impl(const Conv2DAttributes& attrs,
     // R_b[column] = Σ_k (stored byte) over one output column's whole K,
     // accumulated across ic-blocks; per slot and per oh-block.
     const int64_t r_b_len = plan.oh_block * OW;
-    std::vector<int32_t> r_b_buf(
+    PoolArray<int32_t> r_b_buf(
         need_col_sum ? static_cast<size_t>(plan.num_slots * r_b_len) : 0);
 
     // ---- scratch slices ---------------------------------------------------
@@ -1558,7 +1558,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     // The micro-kernel loads a bias panel at a time, so a group's bias must be
     // readable `nr_max` past its last channel. One padded copy covers every
     // group: lanes past a group are only read, and the store drops them.
-    std::vector<T> bias_pad;
+    PoolArray<T> bias_pad;
     if (bias_seed) {
         bias_pad.assign(static_cast<size_t>(OC + nr_max), T{});
         std::memcpy(bias_pad.data(), b_ptr, static_cast<size_t>(OC) * sizeof(T));
@@ -2018,7 +2018,7 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     //
     // In HWIO one output channel's K values are a *strided* column, so the sum
     // accumulates over the k rows — elementwise across OC, the contiguous axis.
-    std::vector<int32_t> r_b_all;
+    PoolArray<int32_t> r_b_all;
     if (col_term) {
         r_b_all.assign(static_cast<size_t>(OC), 0);
         if (panels) {
@@ -2814,8 +2814,8 @@ void with_stage(const ComputeContext& ctx, int64_t n, int64_t stage_len, Body bo
 {
     const int nslots = std::max(ctx.cpu.thread_slot_count(), 1);
     const bool par = nslots > 1 && n > 1;
-    // One vector of chars keeps this helper type-agnostic.
-    std::vector<char> stages(static_cast<size_t>(nslots * stage_len));
+    // One char array keeps this helper type-agnostic.
+    PoolArray<char> stages(static_cast<size_t>(nslots * stage_len));
     auto run = [&](int64_t s) {
         char* const stage = stages.data() +
             (par ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : 0) * stage_len;
@@ -3029,7 +3029,8 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
         }
         if (is_quantized_conv2d(dtype)) {
             // The sums land on an unaligned byte offset: accumulate whole, copy in.
-            std::vector<int32_t> sums(static_cast<size_t>(OC), 0);
+            PoolArray<int32_t> sums;
+            sums.zero(static_cast<size_t>(OC));
             write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, true, weight,
                               sums.data(), ctx);
             std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
@@ -3048,7 +3049,8 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
                     static_cast<size_t>(g.total) * static_cast<size_t>(esz));
     } else {
         pack_weight_planar_i8(weight, packed, g, ICG, OCG, G, ctx);
-        std::vector<int32_t> sums(static_cast<size_t>(OC), 0);
+        PoolArray<int32_t> sums;
+        sums.zero(static_cast<size_t>(OC));
         write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, false, weight,
                           sums.data(), ctx);
         std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),

@@ -22,6 +22,7 @@
 #include "nnops/detail/simd/cpu_features.hpp"
 #include "nnops/detail/half.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/memory_pool.hpp"
 
 #if defined(NNOPS_ARCH_X86_64)
 #include "x86_64/quant.hpp"
@@ -117,8 +118,8 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
     }
 
     NNOPS_ASSERT(scale.numel() == M);
-    std::vector<float> s_f32(static_cast<size_t>(M));
-    std::vector<float> z_f32(static_cast<size_t>(M));
+    PoolArray<float> s_f32(static_cast<size_t>(M));
+    PoolArray<float> z_f32(static_cast<size_t>(M));
     for (int64_t k = 0; k < M; ++k) {
         s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[k];
         int32_t z = (zp.data_type() == DataType::s8)
@@ -127,10 +128,10 @@ void quantize_linear_impl(const QuantLinearAttributes& attrs,
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
-    std::vector<float> f32_buf;
+    PoolArray<float> f32_buf;
     const float* src_ptr;
     if constexpr (std::is_same_v<T, half>) {
-        f32_buf.resize(static_cast<size_t>(numel));
+        f32_buf.reset(static_cast<size_t>(numel));
         convert_half_to_float(f32_buf.data(), X.ptr<half>(), static_cast<int>(numel));
         src_ptr = f32_buf.data();
     } else {
@@ -218,8 +219,8 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
     }
 
     NNOPS_ASSERT(scale.numel() == M);
-    std::vector<float> s_f32(static_cast<size_t>(M));
-    std::vector<float> z_f32(static_cast<size_t>(M));
+    PoolArray<float> s_f32(static_cast<size_t>(M));
+    PoolArray<float> z_f32(static_cast<size_t>(M));
     for (int64_t k = 0; k < M; ++k) {
         s_f32[static_cast<size_t>(k)] = scale.ptr<float>()[k];
         int32_t z = (zp.data_type() == DataType::s8)
@@ -228,10 +229,10 @@ void dequantize_linear_impl(const QuantLinearAttributes& attrs,
         z_f32[static_cast<size_t>(k)] = static_cast<float>(z);
     }
 
-    std::vector<float> f32_buf;
+    PoolArray<float> f32_buf;
     float* dst_f32;
     if constexpr (std::is_same_v<T, half>) {
-        f32_buf.resize(static_cast<size_t>(numel));
+        f32_buf.reset(static_cast<size_t>(numel));
         dst_f32 = f32_buf.data();
     } else {
         dst_f32 = output.ptr<float>();

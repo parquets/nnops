@@ -13,6 +13,7 @@
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_epilogue.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/memory_pool.hpp"
 
 namespace nnops::backend::cpu {
 
@@ -179,7 +180,7 @@ void tconv2d_impl_nchwc8(
     // keeps the temp buffer small.
     if (attrs.add_to) {
         const int64_t out_block_elems = OH * out_row_stride;
-        std::vector<T> saved(static_cast<size_t>(out_block_elems));
+        PoolArray<T> saved(static_cast<size_t>(out_block_elems));
 
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t oc8 = 0; oc8 < OC8; ++oc8) {

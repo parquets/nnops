@@ -2554,13 +2554,13 @@ NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
     // 3k+3 panels, 24k only 3k), so num_panels_max exceeds num_panels(plan.mc)
     // by construction. Both shapes reach the pack via transpose_a with K ==
     // plan.kc, so the pack uses the full-kc stride the region is sized at.
-    //   - M = 575, 4 workers: mc = 144 (575/4 rounded up to the 24-grid),
-    //     blocks 144,144,144,143.
-    //   - M = 287, 2 workers: mc = 144, blocks 144,143.
+    //   - M = 575, 4 workers: mc = 72 (the 2x-workers block target),
+    //     blocks 72 x7 + 71.
+    //   - M = 287, 2 workers: mc = 72, blocks 72,72,72,71.
     struct Case { int64_t M; int nthreads; int64_t want_mc; };
     const Case cases[] = {
-        {575, 4, 144},
-        {287, 2, 144},
+        {575, 4, 72},
+        {287, 2, 72},
     };
 
     for (const Case& c : cases) {

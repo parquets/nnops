@@ -15,7 +15,7 @@ using nnops::backend::cpu::MemoryPool;
 namespace {
 
 constexpr size_t kAlign = 64;
-constexpr size_t kOversize = 20u * 1024u * 1024u;  // > 16 MiB cap
+constexpr size_t kOversize = 40u * 1024u * 1024u;  // > 32 MiB cap
 
 inline bool aligned(void* p) {
     return (reinterpret_cast<uintptr_t>(p) % kAlign) == 0;
@@ -65,6 +65,19 @@ NNOPS_TEST(memory_pool_reuses_freed_blocks) {
 
     pool.deallocate(p2);
     pool.deallocate(q2);
+    NNOPS_EXPECT_EQ(pool.live_bytes(), size_t{0});
+}
+
+NNOPS_TEST(memory_pool_cap_is_32_mib) {
+    auto& pool = MemoryPool::instance();
+    pool.release_all();
+
+    // 20 MiB used to cross the old 16 MiB cap and bypass the pool; the cap is
+    // now 32 MiB, so it must come back to a free list like any other block.
+    void* p = pool.allocate(20u * 1024u * 1024u);
+    const size_t before = pool.pooled_blocks();
+    pool.deallocate(p);
+    NNOPS_EXPECT_EQ(pool.pooled_blocks(), before + 1);
     NNOPS_EXPECT_EQ(pool.live_bytes(), size_t{0});
 }
 

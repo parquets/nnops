@@ -16,6 +16,7 @@
 #include "nnops/ops/concat.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
+#include "common/memory_pool.hpp"
 
 #include <cstring>
 #include <vector>
@@ -53,15 +54,14 @@ void concat_packed_c_axis(TensorView& output,
     const int64_t o_ch_stride  = output.channel_block_stride_elems();
 
     struct LaneSrc { int64_t input_idx; int64_t c8_block; int64_t lane; };
-    std::vector<std::vector<LaneSrc>> lane_map(
-        static_cast<size_t>(oC8),
-        std::vector<LaneSrc>(static_cast<size_t>(pack)));
+    PoolArray<LaneSrc> lane_map(static_cast<size_t>(oC8 * pack));
 
     for (int64_t c8 = 0; c8 < oC8; ++c8) {
         for (int64_t lane = 0; lane < pack; ++lane) {
+            LaneSrc& entry = lane_map[static_cast<size_t>(c8 * pack + lane)];
             int64_t o_lc = c8 * pack + lane;
             if (o_lc >= total_logical_c) {
-                lane_map[static_cast<size_t>(c8)][static_cast<size_t>(lane)] = {-1, -1, -1};
+                entry = {-1, -1, -1};
                 continue;
             }
             int64_t in_idx = 0;
@@ -69,15 +69,14 @@ void concat_packed_c_axis(TensorView& output,
                 ++in_idx;
             }
             int64_t in_lc = o_lc - ch_start[static_cast<size_t>(in_idx)];
-            lane_map[static_cast<size_t>(c8)][static_cast<size_t>(lane)] = {
-                in_idx, in_lc / pack, in_lc % pack
-            };
+            entry = {in_idx, in_lc / pack, in_lc % pack};
         }
     }
 
-    std::vector<int64_t> full_copy_src(static_cast<size_t>(oC8), -1);
+    PoolArray<int64_t> full_copy_src;
+    full_copy_src.assign(static_cast<size_t>(oC8), -1);
     for (int64_t c8 = 0; c8 < oC8; ++c8) {
-        const auto& map = lane_map[static_cast<size_t>(c8)];
+        const LaneSrc* map = lane_map.data() + c8 * pack;
         int64_t src_idx = map[0].input_idx;
         int64_t src_c8  = map[0].c8_block;
         if (src_idx < 0) {
@@ -120,7 +119,7 @@ void concat_packed_c_axis(TensorView& output,
                                 + w  * pack;
                             v_store(o_vec, v_load(i_vec));
                         } else {
-                            const auto& map = lane_map[static_cast<size_t>(c8)];
+                            const LaneSrc* map = lane_map.data() + c8 * pack;
                             for (int64_t l = 0; l < pack; ++l) {
                                 const auto& src = map[static_cast<size_t>(l)];
                                 if (src.input_idx < 0) {

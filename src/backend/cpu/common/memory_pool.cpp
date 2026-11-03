@@ -19,8 +19,8 @@ namespace {
 
 constexpr size_t kAlignment = 64;                  // matches mma_pack_align
 constexpr size_t kMinClass  = 64;                  // smallest pooled size
-constexpr size_t kMaxClass  = 16u * 1024u * 1024u; // 16 MiB cap
-constexpr int    kNumClasses = 19;                 // 64 B .. 16 MiB (powers of two)
+constexpr size_t kMaxClass  = 32u * 1024u * 1024u; // 32 MiB cap
+constexpr int    kNumClasses = 20;                 // 64 B .. 32 MiB (powers of two)
 
 // Retention budget: bytes allowed in the central free lists; past it the largest
 // blocks go back to the OS, trading reuse for a bounded idle footprint.
@@ -28,7 +28,7 @@ constexpr size_t kMaxPooledBytes = 64u * 1024u * 1024u;
 
 // Per-thread cap: further freed blocks go to the central pool. One max-class
 // block bounds worst-case retention across many threads.
-constexpr size_t kMaxTlsBytes = 16u * 1024u * 1024u;
+constexpr size_t kMaxTlsBytes = kMaxClass;
 
 constexpr uint32_t kMagic = 0x4E4E4F50u;           // "NNOP" — block sanity tag
 

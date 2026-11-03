@@ -62,7 +62,7 @@ namespace {
 // ============================================================
 
 /// Flattened inner index -> stride offset (non-trailing axis).
-inline std::vector<int64_t> compute_inner_offsets(
+inline PoolArray<int64_t> compute_inner_offsets(
     const TensorView& X, int64_t axis, int64_t norm_size)
 {
     return build_offsets(X, axis, X.rank() - 1, norm_size);
@@ -121,8 +121,8 @@ void batch_norm_impl(const NormAttributes& attrs,
     auto* y_ptr = output.ptr<T>();
 
     if (attrs.spatial) {
-        std::vector<float> ns_f(static_cast<size_t>(C));
-        std::vector<float> nb_f(static_cast<size_t>(C));
+        PoolArray<float> ns_f(static_cast<size_t>(C));
+        PoolArray<float> nb_f(static_cast<size_t>(C));
         for (int64_t c = 0; c < C; ++c) {
             float inv_std = 1.0f / std::sqrt(s_load(&v_ptr[c]) + epsilon);
             ns_f[static_cast<size_t>(c)] = inv_std * s_load(&s_ptr[c]);
@@ -133,8 +133,10 @@ void batch_norm_impl(const NormAttributes& attrs,
 
         if (pack > 1) {
             const int64_t c8_blocks = X.num_channel_blocks();
-            std::vector<T> ns_packed(static_cast<size_t>(c8_blocks * pack), T(0));
-            std::vector<T> nb_packed(static_cast<size_t>(c8_blocks * pack), T(0));
+            PoolArray<T> ns_packed;
+            PoolArray<T> nb_packed;
+            ns_packed.zero(static_cast<size_t>(c8_blocks * pack));
+            nb_packed.zero(static_cast<size_t>(c8_blocks * pack));
             for (int64_t c = 0; c < C; ++c) {
                 s_store(&ns_packed[static_cast<size_t>(c)], ns_f[static_cast<size_t>(c)]);
                 s_store(&nb_packed[static_cast<size_t>(c)], nb_f[static_cast<size_t>(c)]);
