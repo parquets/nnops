@@ -510,7 +510,8 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
 // =========================================================================
 
 WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group,
-                          int64_t out_h, int64_t out_w, bool channel_last) noexcept
+                          int64_t out_h, int64_t out_w, bool channel_last,
+                          int num_threads) noexcept
 {
     // f16 stays on F(2,3) on both routes: Bᵀ scales a window by up to 5 and Aᵀ
     // the products by 8, so the V and M rounds cost three bits on top of an f16
@@ -547,16 +548,16 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     // Planar pays a halo strip per task instead — ICG · window rows · window
     // columns, six wide and twelve deep for a task of two tile rows against
     // F(2,3)'s two and six — and 4x4 tiles quarter the tile grid the strip is
-    // rebuilt for. A 224x224 plane still has 224 tasks and a 112x112 plane 56,
-    // so the strip is amortized and the order wins at both ends of the thread
-    // range (0.91x of F(2,3) at 1 thread and 0.82x at 20 on 224x224 64ch, 0.93x
-    // and 1.02x on 112x112). A 56x56 plane is 14 tasks: the oc-chunk axis has
-    // to make up the difference by rebuilding that strip per chunk, and 4.5x
-    // the transform then costs more than the wider tile saves — 0.75x at 1
-    // thread but 2.25x at 20, 5.2x at 28x28 and 9.0x at 14x14 and below. So the
-    // plane gate is where the grid is big enough on its own.
+    // rebuilt for. On a small team the tile axes fill the pool by themselves, so
+    // the strip is amortized all the way down to 28x28: measured 0.71-0.81x of
+    // F(2,3) at 1 thread on 256ch and 0.73-0.75x at 4, 0.71-0.80x on 56x56.
+    // Past four workers the grid is short — 14 tasks on a 56x56 plane, 7 on a
+    // 28x28 — and the oc-chunk axis that makes up the difference rebuilds that
+    // strip per chunk: 28x28 drifts to 1.04x at six threads and 5.1x at 20, so
+    // the floor climbs with the team rather than sitting at the widest case.
     if (ic_per_group < 64) { return WinoOrder::F23; }
-    if (out_h < 112 || out_w < 112) { return WinoOrder::F23; }
+    const int64_t floor = num_threads <= 4 ? 28 : num_threads <= 8 ? 56 : 112;
+    if (out_h < floor || out_w < floor) { return WinoOrder::F23; }
     return WinoOrder::F43;
 }
 

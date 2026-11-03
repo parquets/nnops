@@ -23,11 +23,13 @@
 #include "model_io.hpp"
 #include "model_prof.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -304,12 +306,15 @@ inline const TensorView& winograd_weight(const TensorView& w,
                                          const TensorView& x,
                                          const nnops::Conv2DAttributes& attrs)
 {
-    // Keyed by the weight *and* the plane: the transform order is baked into U,
-    // and the plane is what picks it, so one filter run at two resolutions is
-    // two blobs.
+    // Keyed by the weight, the plane and the team: the transform order is baked
+    // into U, and the plane and the worker count are both what pick it, so one
+    // filter run at two resolutions or two team sizes is two blobs.
     const int64_t plane = x.shape(1) * 100000 + x.shape(2);
-    static std::map<std::pair<const void*, int64_t>, detail::WeightCopy> cache;
-    const auto key = std::make_pair(static_cast<const void*>(w.ptr<float>()), plane);
+    const nnops::ComputeContext& ctx = context();
+    const int team = std::max(ctx.cpu.thread_slot_count(), 1);
+    static std::map<std::tuple<const void*, int64_t, int>, detail::WeightCopy> cache;
+    const auto key =
+        std::make_tuple(static_cast<const void*>(w.ptr<float>()), plane, team);
     const auto hit = cache.find(key);
     if (hit != cache.end() &&
         static_cast<int64_t>(hit->second.shape.size()) == w.rank()) {
@@ -326,10 +331,10 @@ inline const TensorView& winograd_weight(const TensorView& w,
     TensorView query;
     const TensorView in[] = {w, x};
     TensorView q[] = {query};
-    op->prepackWeights(in, q);
+    op->prepackWeights(in, q, ctx);
     Buf u = alloc(q[0].desc());
     TensorView pack[] = {u.view};
-    op->prepackWeights(in, pack);
+    op->prepackWeights(in, pack, ctx);
 
     detail::WeightCopy& slot = cache[key];
     slot.shape.assign(w.shape(), w.shape() + w.rank());
@@ -384,14 +389,14 @@ inline const TensorView& packed_weight(const TensorView& w,
     TensorView query;
     const TensorView in[] = {w};
     TensorView q[] = {query};
-    op->prepackWeights(in, q);
+    op->prepackWeights(in, q, context());
     // The query answers with nothing (rank 0) when the filter has no packed
     // form: a 3x3 over at most four channels is convoluted in place by the
     // direct route, so the raw filter is what compute() wants.
     if (q[0].rank() < 2) { return w; }
     Buf blob = alloc(q[0].desc(), w.quant_params());
     TensorView pack[] = {blob.view};
-    op->prepackWeights(in, pack);
+    op->prepackWeights(in, pack, context());
 
     return detail::store_copy(cache, w, std::move(blob));
 }
@@ -787,13 +792,13 @@ inline const TensorView& packed_linear_weight(const TensorView& w)
     TensorView query;
     const TensorView in[] = {w};
     TensorView q[] = {query};
-    op->prepackWeights(in, q);
+    op->prepackWeights(in, q, context());
     // The query answers with nothing (rank 0) when there is no packed form.
     if (q[0].rank() < 2) { return w; }
 
     Buf blob = alloc(q[0].desc(), w.quant_params());
     TensorView pack[] = {blob.view};
-    op->prepackWeights(in, pack);
+    op->prepackWeights(in, pack, context());
 
     return detail::store_copy(cache, w, std::move(blob));
 }

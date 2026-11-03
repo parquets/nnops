@@ -452,12 +452,10 @@ NNOPS_TEST(wino_prepack_query) {
 }
 
 NNOPS_TEST(wino_prepack_order_bakes_the_opt_in) {
-    // The planar route never picks F(4,3) by itself (wino_pick_order: it is a
-    // single-thread win and a threaded loss, and no caller-visible quantity
-    // separates the two), so the plane hint changes nothing here and the wider
-    // transform is only reachable through winograd_order. What the query does
-    // prove is that the order is baked into U at prepack and read back off the
-    // blob — 36 positions for the pinned order, 16 otherwise.
+    // The order is baked into U at prepack and read back off the blob — 36
+    // positions for F(4,3), 16 otherwise. The plane hint is what the policy
+    // weighs, so a 56x56 plane at one worker takes F(4,3) on its own while a
+    // 14x14 one stays below the floor; winograd_order still overrides both.
     const int64_t wshape[] = {64, 64, 3, 3};
     std::vector<float> w_buf(64 * 64 * 9, 0.25f);
     TensorView weight(wshape, DataType::f32, w_buf.data());
@@ -483,12 +481,18 @@ NNOPS_TEST(wino_prepack_order_bakes_the_opt_in) {
         return out[0].shape(0);
     };
 
-    NNOPS_EXPECT_EQ(query(56, 56, true), int64_t{16});
+    NNOPS_EXPECT_EQ(query(56, 56, true), int64_t{36});
+    NNOPS_EXPECT_EQ(query(14, 14, true), int64_t{16});
+    // No plane hint: the policy cannot weigh the plane and takes the safe order.
     NNOPS_EXPECT_EQ(query(56, 56, false), int64_t{16});
 
     attrs.winograd_order = 4;
     op = Conv2D::create(attrs, Backend::CPU);
     NNOPS_EXPECT_EQ(query(14, 14, true), int64_t{36});
+
+    attrs.winograd_order = 2;
+    op = Conv2D::create(attrs, Backend::CPU);
+    NNOPS_EXPECT_EQ(query(56, 56, true), int64_t{16});
 }
 
 NNOPS_TEST(wino_plan_gates_on_geometry) {
@@ -1134,16 +1138,35 @@ NNOPS_TEST(wino_pick_order_fences) {
                       WinoOrder::F23);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, pl) ==
                       WinoOrder::F23);
-    // Planar takes F(4,3) only where its own tile grid fills a pool: 112x112 is
-    // 56 tasks, a 56x56 plane 14 and a 28x28 plane 4, and the oc-chunk axis
-    // that would split those rebuilds the halo strip per chunk.
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, pl) ==
+    // Planar's plane floor moves with the team, because what it amortizes is a
+    // halo strip per *task*: on a small team the tile axes fill the pool on
+    // their own (28x28 is 0.71-0.81x of F(2,3)), past four workers the grid is
+    // short and the oc-chunk split rebuilds that strip per chunk (1.04x at six
+    // on 28x28), and past eight even 112x112 is a wash.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, pl, 1) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, pl, 4) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, pl, 5) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, pl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, pl, 6) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 28, 28, pl, 6) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 111, 200, pl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 56, 56, pl, 9) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 112, 112, pl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 111, 200, pl, 9) ==
+                      WinoOrder::F23);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 112, 112, pl, 9) ==
+                      WinoOrder::F43);
+    // Below 28x28 the grid is a handful of tiles on any team.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 14, 14, pl, 1) ==
+                      WinoOrder::F23);
+    // The channel-last route reads its windows in place, so its floor does not
+    // move with the team.
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl, 20) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl, 1) ==
                       WinoOrder::F43);
     // ... and under the same channel floor and U fence as the channel-last one:
     // 32 channels per group never pays for the 4.5x transform, and a 512x512

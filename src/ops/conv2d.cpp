@@ -26,6 +26,7 @@
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
 #include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace nnops {
@@ -71,62 +72,74 @@ auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
 
 /// Pack [OC, IC/G, 3, 3] into U[pos][OC][IC/G] = G g Gᵀ; p = i·tile + j, with
 /// ld_u and ld_c the block's row and column strides.
+///
+/// One output channel is one task: its IC/G transforms write a column of every
+/// position plane, and no two channels touch the same element, so the split is
+/// free of scratch and of ordering. A 512x512 filter is 262k transforms at load
+/// time — the one pack in this file big enough to be worth the dispatch.
 template <class T>
 void wino_pack_weight(const TensorView& weight, TensorView& u_out,
                       int64_t OC, int64_t ICG, int64_t ld_u, int64_t ld_c,
-                      backend::cpu::WinoOrder order)
+                      backend::cpu::WinoOrder order, const ComputeContext& ctx)
 {
     const T* g = weight.ptr<T>();
     T* u = u_out.ptr<T>();
-    for (int64_t oc = 0; oc < OC; ++oc) {
+    const bool f23 = order == backend::cpu::WinoOrder::F23;
+    ctx.cpu.run(0, OC, [&](int64_t oc) {
         for (int64_t ic = 0; ic < ICG; ++ic) {
-            if (order == backend::cpu::WinoOrder::F23) {
+            T* const dst = u + oc * ICG + ic;
+            const T* const src = g + (oc * ICG + ic) * 9;
+            if (f23) {
                 nnops::kernel::winograd_weight_transform(
-                    g + (oc * ICG + ic) * 9, 3, u + oc * ICG + ic,
-                    static_cast<int>(ld_u), static_cast<int>(ld_c));
+                    src, 3, dst, static_cast<int>(ld_u), static_cast<int>(ld_c));
             } else {
                 nnops::kernel::winograd43_weight_transform(
-                    g + (oc * ICG + ic) * 9, 3, u + oc * ICG + ic,
-                    static_cast<int>(ld_u), static_cast<int>(ld_c));
+                    src, 3, dst, static_cast<int>(ld_u), static_cast<int>(ld_c));
             }
         }
-    }
+    });
 }
 
 /// Pack HWIO ([KH][KW][IC/G][OC], OC contiguous) into the channel-last B panels:
 /// the same G g Gᵀ, one 3×3 gather per (ic, oc), written [pos][kb][g·jb + j][ldd]
-/// k-major. The oc padding must arrive zeroed. Scalar because it runs once.
+/// k-major. The oc padding must arrive zeroed. Scalar per element because the
+/// gather is a stride-tap walk, but one output channel is still one task: it
+/// owns the (k, col) lane of every position, so the split needs no scratch.
 template <class T>
 void wino_pack_weight_hwio(const TensorView& weight, TensorView& u_out,
                            const backend::cpu::WinoChannelLastU& ug,
-                           int64_t ICG, int64_t OCG, int64_t G)
+                           int64_t ICG, int64_t OCG, int64_t G,
+                           const ComputeContext& ctx)
 {
     const T* g = weight.ptr<T>();
     T* u = u_out.ptr<T>();
     // Strides come from the dims, not the pitch: a weight is a load-time constant.
     const int64_t OC  = OCG * G;
     const int64_t tap = ICG * OC;   // one filter position ([kh][kw]) of all groups
-    for (int64_t gg = 0; gg < G; ++gg) {
-        for (int64_t n = 0; n < OCG; ++n) {
-            const int64_t j   = gg * ug.jb + n / ug.nr;
-            const int64_t col = n - (n / ug.nr) * ug.nr;
-            for (int64_t ic = 0; ic < ICG; ++ic) {
-                const int64_t kb = ic / ug.kc;
-                const int64_t k  = ic - kb * ug.kc;
-                const T* src = g + ic * OC + gg * OCG + n;
-                T gt[9];
-                for (int t = 0; t < 9; ++t) { gt[t] = src[t * tap]; }
-                T uu[36];
-                if (ug.order == backend::cpu::WinoOrder::F23) {
-                    nnops::kernel::winograd_weight_transform(gt, 3, uu, 4, 1);
-                } else {
-                    nnops::kernel::winograd43_weight_transform(gt, 3, uu, 6, 1);
-                }
-                T* dst = u + (kb * ug.jbg + j) * ug.ldd + k * ug.nr + col;
-                for (int64_t p = 0; p < ug.pos; ++p) { dst[p * ug.plane] = uu[p]; }
+    const bool f23 = ug.order == backend::cpu::WinoOrder::F23;
+    // The group and the in-group channel flatten to one index, so the task axis
+    // is the filter's whole output-channel extent.
+    ctx.cpu.run(0, OC, [&](int64_t o) {
+        const int64_t gg  = o / OCG;
+        const int64_t n   = o % OCG;
+        const int64_t j   = gg * ug.jb + n / ug.nr;
+        const int64_t col = n - (n / ug.nr) * ug.nr;
+        for (int64_t ic = 0; ic < ICG; ++ic) {
+            const int64_t kb = ic / ug.kc;
+            const int64_t k  = ic - kb * ug.kc;
+            const T* src = g + ic * OC + o;
+            T gt[9];
+            for (int t = 0; t < 9; ++t) { gt[t] = src[t * tap]; }
+            T uu[36];
+            if (f23) {
+                nnops::kernel::winograd_weight_transform(gt, 3, uu, 4, 1);
+            } else {
+                nnops::kernel::winograd43_weight_transform(gt, 3, uu, 6, 1);
             }
+            T* dst = u + (kb * ug.jbg + j) * ug.ldd + k * ug.nr + col;
+            for (int64_t p = 0; p < ug.pos; ++p) { dst[p * ug.plane] = uu[p]; }
         }
-    }
+    });
 }
 }  // anonymous namespace
 
@@ -331,11 +344,15 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     NNOPS_ASSERT((attrs_.winograd_order == 0 || attrs_.winograd_order == 2 ||
                   attrs_.winograd_order == 4) &&
                  "Conv2D::prepackWeights: winograd_order is 0, 2 or 4");
+    // The worker count, not the item grid: an over-subscribed pool hands a
+    // worker several items, and what the transform's cost per task amortizes
+    // against is the cores it runs on.
+    const int team = std::max(ctx.cpu.thread_slot_count(), 1);
     const auto pick_order = [&](int64_t icg, int64_t ocg, bool channel_last) {
         return attrs_.winograd_order == 2 ? backend::cpu::WinoOrder::F23
              : attrs_.winograd_order == 4 ? backend::cpu::WinoOrder::F43
              : backend::cpu::wino_pick_order(dtype, icg, ocg, plane_h, plane_w,
-                                             channel_last);
+                                             channel_last, team);
     };
 
     // Both U forms hold the same G g Gᵀ — only the packing differs, because the
@@ -371,10 +388,11 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
         std::memset(outputs[0].ptr<char>(), 0,
                     static_cast<size_t>(ug.total) * static_cast<size_t>(elem_size));
         if (dtype == DataType::f32) {
-            wino_pack_weight_hwio<float>(weight, outputs[0], ug, ICG, OCG, G);
+            wino_pack_weight_hwio<float>(weight, outputs[0], ug, ICG, OCG, G, ctx);
         } else {
             NNOPS_ASSERT(dtype == DataType::f16);
-            wino_pack_weight_hwio<backend::cpu::half>(weight, outputs[0], ug, ICG, OCG, G);
+            wino_pack_weight_hwio<backend::cpu::half>(weight, outputs[0], ug, ICG,
+                                                      OCG, G, ctx);
         }
         return;
     }
@@ -405,11 +423,11 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     const int64_t ld_u  = backend::cpu::wino_alpha(order) * plane;  // row (i) step
 
     if (dtype == DataType::f32) {
-        wino_pack_weight<float>(weight, outputs[0], OC, ICG, ld_u, ld_c, order);
+        wino_pack_weight<float>(weight, outputs[0], OC, ICG, ld_u, ld_c, order, ctx);
     } else {
         NNOPS_ASSERT(dtype == DataType::f16);
         wino_pack_weight<backend::cpu::half>(weight, outputs[0], OC, ICG, ld_u, ld_c,
-                                             order);
+                                             order, ctx);
     }
 }
 

@@ -115,12 +115,13 @@ struct Conv2DAttributes {
 
     /// Winograd transform order as the output tile side: 2 pins F(2,3), 4 pins
     /// F(4,3), 0 (the default) lets wino_pick_order() choose — for the
-    /// channel-last route that is F(4,3) from a 28x28 plane up and, on the
-    /// planar route, from 112x112 — both subject to the U still fitting the
-    /// last-level cache (see wino_pick_order). Pin 4 to take it anywhere. Any
-    /// other value is refused at prepack. It only selects which U
-    /// prepackWeights() builds; compute() reads the order back off the blob, so
-    /// the two cannot disagree.
+    /// channel-last route that is F(4,3) from a 28x28 plane up at any team
+    /// size, and on the planar route from a floor that climbs with the worker
+    /// count this call reports through ctx (28x28 up to four workers, 56x56 to
+    /// eight, 112x112 past that) — both subject to the U still fitting the
+    /// last-level cache. Pin 4 to take it anywhere. Any other value is refused
+    /// at prepack. It only selects which U prepackWeights() builds; compute()
+    /// reads the order back off the blob, so the two cannot disagree.
     int64_t winograd_order = 0;
 };
 
@@ -167,6 +168,11 @@ public:
     /// channel-last [16, nb, G·jb, ldd]/PackedWinoWeightLast (pitch ldd × elem_size)
     /// — and a preallocated one receives U. Requires algorithm == Winograd and
     /// k3s1, asserted: a later compute() gets U and cannot fall back to im2col.
+    ///
+    /// @p ctx is not optional in effect: its worker count is what the order
+    /// policy weighs (see winograd_order), and both U packers split the filter's
+    /// output channels across that team. Pass the same context compute() will
+    /// run with, or the order is chosen for a pool the call never sees.
     void prepackWeights(std::span<const TensorView> inputs,
                         std::span<TensorView> outputs,
                         const ComputeContext& ctx = {}) override;

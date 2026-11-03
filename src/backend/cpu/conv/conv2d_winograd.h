@@ -163,18 +163,27 @@ WinoChannelLastU wino_channel_last_u(int64_t ic_per_group, int64_t oc_per_group,
 /// cost is a halo strip and parallel-fill cost the plane then has to amortize in
 /// turn, while the channel-last route reads its windows in place.
 ///
-/// The channel-last route therefore takes F(4,3) from a 28x28 plane up, and the
-/// planar route from 112x112 — the plane each route's task grid can fill on its
-/// own, since the oc-chunk axis that splits a small grid for the pool rebuilds
-/// the planar halo strip per chunk. Both are subject to the same fence: a U that
-/// still fits the last-level cache.
+/// The channel-last route reads its windows in place, so the plane alone
+/// decides: F(4,3) from 28x28 up, at any team size. The planar route's floor
+/// moves with the team, because the cost it is amortizing is per task and the
+/// task grid is what the pool splits: on a small team the tile axes fill the
+/// pool by themselves and a 28x28 plane pays (0.71-0.81x of F(2,3) at 1-4
+/// threads), but past four workers the grid is short and the oc-chunk axis has
+/// to split it, rebuilding the halo strip per chunk — 28x28 turns into 1.04x at
+/// six threads and the floor climbs to 56x56, then to 112x112 past eight where
+/// even a 112x112 plane is a wash. Both routes are subject to the same fence: a
+/// U that still fits the last-level cache.
+///
+/// @p num_threads is the *worker* count (CpuBackend::thread_slot_count, not the
+/// item grid) — the grid an over-subscribed pool hands out says nothing about
+/// how many cores the transforms run on.
 ///
 /// Pass the output extent when the caller knows it — a filter alone picks the
 /// safe order. The policy is what `ConvAlgorithm::Winograd` means for a filter:
 /// compute never re-decides it, it reads the order back off the U.
 WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group,
                           int64_t out_h = 0, int64_t out_w = 0,
-                          bool channel_last = false) noexcept;
+                          bool channel_last = false, int num_threads = 1) noexcept;
 
 /// Single source of truth for the Winograd block sizes, the parallel
 /// decomposition and the scratch layout; the fields a route does not use stay
