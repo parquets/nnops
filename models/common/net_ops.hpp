@@ -42,13 +42,29 @@ using nnops::TensorView;
 /// variable is unset — which leaves the context alone, so the default stays the
 /// sequential backend (what the runners check against PyTorch) and a bench that
 /// installed its own pool keeps it.
+///
+/// Capped at the fast-core count on a hybrid CPU. An E-core runs AVX2 as two
+/// 128-bit halves, so a team sized to every logical CPU leaves the P-cores
+/// waiting at each barrier for a worker that is half as fast: MobileNetV2 at
+/// 224 on 6 P-cores + 8 E-cores runs 1.7 ms at 5-6 workers, 1.9 at 8 and 2.1 at
+/// 20, and the wait costs 79% of all CPU time. The cap is a model-harness
+/// policy, not the backend's — one deep GEMM does want them (bench_matmul's
+/// N-split reaches 7.2x at 20 workers against 3.7x at 4). NNOPS_MODEL_E_CORES=1
+/// turns it off.
 inline int model_threads()
 {
     static const int n = [] {
         const char* s = std::getenv("NNOPS_MODEL_THREADS");
         if (s == nullptr) { return 0; }
         const long v = std::strtol(s, nullptr, 10);
-        return (v > 0) ? static_cast<int>(v) : 0;
+        if (v <= 0) { return 0; }
+        int want = static_cast<int>(v);
+        const int fast = nnops::simd::CpuFeatures::get().fast_core_count();
+        const char* use_all = std::getenv("NNOPS_MODEL_E_CORES");
+        if (fast > 0 && want > fast && (use_all == nullptr || use_all[0] == '0')) {
+            want = fast;
+        }
+        return want;
     }();
     return n;
 }
@@ -137,6 +153,14 @@ inline void copy_like(TensorView& dst, const TensorView& src)
     const uint8_t* s = src.ptr<uint8_t>();
     const int64_t d_step = dst.row_stride_elems() * esz;
     const int64_t s_step = src.row_stride_elems() * esz;
+    // Tight on both sides: the rows are adjacent in both, so it is one run. The
+    // row loop exists for a pitch, and a channel-last residual never has one —
+    // without this a 56x56x24 residual is 3136 memcpys of 96 bytes, and the
+    // call overhead is most of the copy.
+    if (d_step == inner * esz && s_step == inner * esz) {
+        std::memcpy(d, s, static_cast<size_t>(inner * rows * esz));
+        return;
+    }
     const auto copy_row = [&](int64_t r) {
         std::memcpy(d + r * d_step, s + r * s_step, static_cast<size_t>(inner * esz));
     };
@@ -372,6 +396,17 @@ inline const TensorView& packed_weight(const TensorView& w,
     return detail::store_copy(cache, w, std::move(blob));
 }
 
+/// NNOPS_MODEL_PROF=shape: one profile row per layer shape, so a per-layer
+/// table lines up with another framework's per-node profile.
+inline bool prof_per_shape()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("NNOPS_MODEL_PROF");
+        return v != nullptr && std::strcmp(v, "shape") == 0;
+    }();
+    return on;
+}
+
 /// Run a conv on the weight it should take: Winograd reads the transformed U
 /// when the geometry pays for it, the im2col route its packed filter otherwise.
 /// Shape inference always reads the raw weight, so it is queried first — only
@@ -400,7 +435,23 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // The route is in the row name, so the profile can price the two against
     // each other just by reading the table. A fused caller renames the rows, so
     // a folded conv and a plain one do not share a line.
-    ProfScope prof(wino ? wino_row : gemm_row);
+    std::string shape_row;
+    if (prof_per_shape()) {
+        // The converted filter is HWIO, the raw one OIHW.
+        const bool hwio = wl.layout() == nnops::TensorLayout::HWIO;
+        char text[96];
+        std::snprintf(text, sizeof text, "conv k%llds%lld @%lld %lld->%lld g%lld%s",
+                      static_cast<long long>(hwio ? wl.shape(0) : wl.shape(2)),
+                      static_cast<long long>(use.stride[0]),
+                      static_cast<long long>(x.shape(2)),
+                      static_cast<long long>(x.shape(1) / use.groups),
+                      static_cast<long long>(hwio ? wl.shape(3) : wl.shape(0)),
+                      static_cast<long long>(use.groups),
+                      residual != nullptr ? "+add" : "");
+        shape_row = text;
+    }
+    ProfScope prof(prof_per_shape() ? shape_row.c_str()
+                                    : (wino ? wino_row : gemm_row));
     auto op = nnops::Conv2D::create(use, Backend::CPU);
     const TensorView u = wino ? winograd_weight(wl, x, use)
                               : (prepack_enabled() ? packed_weight(wl, use) : wl);

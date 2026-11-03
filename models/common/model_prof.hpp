@@ -61,6 +61,15 @@ inline bool& enabled()
     return on;
 }
 
+/// Passes the tables have accumulated. One pass of a 6 ms network is a noisy
+/// enough sample that two identical blocks report 0.15 and 0.40 ms, so the
+/// tables are summed over every repetition and divided back out on report.
+inline long& passes()
+{
+    static long n = 0;
+    return n;
+}
+
 }  // namespace detail
 
 /// Adds this scope's wall clock to @p name when it goes out of scope. The
@@ -106,14 +115,15 @@ inline void prof_reset()
     detail::rows(ProfTable::Layer) = detail::ProfRows{};
     detail::rows(ProfTable::Op) = detail::ProfRows{};
     detail::enabled() = true;
+    detail::passes() = 0;
 }
 
 /// Repeat the timed pass `NNOPS_MODEL_REPS` times (default 1) and return the
 /// median, in ms. One sample cannot separate a change from host drift — the
 /// single shot swings ±10% between processes — and both onnxruntime and torch
 /// report a median over many iterations, so this is what makes our number
-/// comparable to theirs. The tables are reset per repetition, so `prof_report`
-/// prints the last pass.
+/// comparable to theirs. The tables are cleared once and then summed over every
+/// repetition, so `prof_report` prints the mean pass rather than the last one.
 template <class Fn>
 double time_forward(Fn&& fn)
 {
@@ -125,7 +135,8 @@ double time_forward(Fn&& fn)
     std::vector<double> samples;
     samples.reserve(static_cast<size_t>(reps));
     for (int i = 0; i < reps; ++i) {
-        prof_reset();
+        if (i == 0) { prof_reset(); }
+        ++detail::passes();
         const auto t0 = Clock::now();
         fn();
         samples.push_back(
@@ -142,6 +153,9 @@ inline void prof_report(const char* title, double total_ms)
 {
     detail::enabled() = false;
 
+    const double passes =
+        static_cast<double>(detail::passes() > 0 ? detail::passes() : 1);
+
     auto share = [total_ms](double ms) {
         return total_ms > 0.0 ? 100.0 * ms / total_ms : 0.0;
     };
@@ -153,9 +167,10 @@ inline void prof_report(const char* title, double total_ms)
                     t == ProfTable::Layer ? "per layer" : "per op");
         double sum = 0.0;
         for (const auto& r : set.rows) {
-            std::printf("  %-18s %8.2f ms %6.1f%%  x%ld\n", r.name.c_str(), r.ms,
-                        share(r.ms), r.calls);
-            sum += r.ms;
+            const double ms = r.ms / passes;
+            std::printf("  %-18s %8.2f ms %6.1f%%  x%ld\n", r.name.c_str(), ms, share(ms),
+                        r.calls / static_cast<long>(passes));
+            sum += ms;
         }
         if (t == ProfTable::Layer) {
             std::printf("  %-18s %8.2f ms %6.1f%%\n", "(other)",
