@@ -2926,7 +2926,7 @@ void pack_weight_last_i8(const TensorView& weight, TensorView& packed,
 void pack_weight_planar_i8(const TensorView& weight, TensorView& packed,
                            const ConvPackedWeightPlanar& g,
                            int64_t ic_per_group, int64_t oc_per_group,
-                           int64_t groups)
+                           int64_t groups, const ComputeContext& ctx)
 {
     const int64_t karea = g.kdim_max / g.icn_block;
     const bool a_biased = arch::mma_i8_folds_a_bias;
@@ -2937,23 +2937,27 @@ void pack_weight_planar_i8(const TensorView& weight, TensorView& packed,
     const int8_t* const w = weight.ptr<int8_t>();
     int8_t* const blob = packed.ptr<int8_t>();
 
-    for (int64_t gg = 0; gg < groups; ++gg) {
-        for (int64_t ib = 0; ib < num_ic_blocks; ++ib) {
-            const int64_t icn  = ib * g.icn_block;
-            const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
-            const int64_t kdim = icnc * karea;
-            for (int64_t ob = 0; ob < oc_blocks; ++ob) {
-                const int64_t ocn  = ob * g.ocn_block;
-                const int64_t ocnc = std::min(g.ocn_block, oc_per_group - ocn);
-                int8_t* const dst = blob + g.offset(gg, ib, ob);
-                tile_pack_lhs_i8(false, static_cast<int>(ocnc), static_cast<int>(kdim),
-                                 dst, static_cast<int>(geom_ldd_i8_a(kdim)),
-                                 w + gg * oc_per_group * w_ocn_step +
-                                     icn * karea + ocn * w_ocn_step,
-                                 static_cast<int>(w_ocn_step), a_biased);
-            }
-        }
-    }
+    // One (group, k block, oc block) is one A panel set and one contiguous run
+    // of the blob, so the split needs no scratch and no lock.
+    const int64_t per_group = num_ic_blocks * oc_blocks;
+    ctx.cpu.run(0, groups * per_group, [&](int64_t t) {
+        const int64_t gg  = t / per_group;
+        const int64_t rem = t % per_group;
+        const int64_t ib  = rem / oc_blocks;
+        const int64_t ob  = rem % oc_blocks;
+
+        const int64_t icn  = ib * g.icn_block;
+        const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
+        const int64_t kdim = icnc * karea;
+        const int64_t ocn  = ob * g.ocn_block;
+        const int64_t ocnc = std::min(g.ocn_block, oc_per_group - ocn);
+        int8_t* const dst = blob + g.offset(gg, ib, ob);
+        tile_pack_lhs_i8(false, static_cast<int>(ocnc), static_cast<int>(kdim),
+                         dst, static_cast<int>(geom_ldd_i8_a(kdim)),
+                         w + gg * oc_per_group * w_ocn_step +
+                             icn * karea + ocn * w_ocn_step,
+                         static_cast<int>(w_ocn_step), a_biased);
+    });
 }
 
 /// Σ_k weight[oc, k] per output channel over a group's whole K — the table the
@@ -2961,26 +2965,30 @@ void pack_weight_planar_i8(const TensorView& weight, TensorView& packed,
 /// the *raw* filter, in whichever order its layout makes contiguous.
 void write_weight_sums(const int8_t* w, int64_t OC, int64_t ic_per_group,
                        int64_t karea, bool hwio, const TensorView& weight,
-                       int32_t* out)
+                       int32_t* out, const ComputeContext& ctx)
 {
     if (hwio) {
         // [KH][KW][IC/G][OC]: the walk covers the group's input channels and
         // *all* groups' output channels at once — the OC axis spans groups.
         const int64_t w_ic  = weight.shape(3);
         const int64_t w_tap = ic_per_group * w_ic;
-        for (int64_t t = 0; t < karea; ++t) {
-            for (int64_t i = 0; i < ic_per_group; ++i) {
-                const int8_t* const row = w + t * w_tap + i * w_ic;
-                for (int64_t oc = 0; oc < OC; ++oc) { out[oc] += row[oc]; }
+        // One output channel is one task: a channel's taps are strided, but the
+        // writes are disjoint and this is the pack's smallest cost.
+        ctx.cpu.run(0, OC, [&](int64_t oc) {
+            int32_t acc = 0;
+            for (int64_t t = 0; t < karea; ++t) {
+                const int8_t* const row = w + t * w_tap + oc;
+                for (int64_t i = 0; i < ic_per_group; ++i) { acc += row[i * w_ic]; }
             }
-        }
+            out[oc] = acc;
+        });
         return;
     }
     // [OC][IC/G·KH·KW]: one output channel's whole K is one contiguous run.
     const int64_t k_full = ic_per_group * karea;
-    for (int64_t oc = 0; oc < OC; ++oc) {
+    ctx.cpu.run(0, OC, [&](int64_t oc) {
         out[oc] = nnops::kernel::int8_row_sum<int8_t>(w + oc * k_full, k_full);
-    }
+    });
 }
 
 }  // anonymous namespace
@@ -3023,7 +3031,7 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
             // The sums land on an unaligned byte offset: accumulate whole, copy in.
             std::vector<int32_t> sums(static_cast<size_t>(OC), 0);
             write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, true, weight,
-                              sums.data());
+                              sums.data(), ctx);
             std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
                         static_cast<size_t>(OC) * sizeof(int32_t));
         }
@@ -3039,10 +3047,10 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
         std::memcpy(packed.ptr<char>(), weight.ptr<char>(),
                     static_cast<size_t>(g.total) * static_cast<size_t>(esz));
     } else {
-        pack_weight_planar_i8(weight, packed, g, ICG, OCG, G);
+        pack_weight_planar_i8(weight, packed, g, ICG, OCG, G, ctx);
         std::vector<int32_t> sums(static_cast<size_t>(OC), 0);
         write_weight_sums(weight.ptr<int8_t>(), OC, ICG, karea, false, weight,
-                          sums.data());
+                          sums.data(), ctx);
         std::memcpy(packed.ptr<char>() + g.sums_off, sums.data(),
                     static_cast<size_t>(OC) * sizeof(int32_t));
     }
