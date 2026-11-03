@@ -302,17 +302,22 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
                 const T* in_blk = in_img + co;
                 const T* w_blk  = w_ptr + co;
                 const T* b_blk  = b_ptr ? b_ptr + co : nullptr;
+                // The short last group runs as one call at its own height
+                // rather than one call per row: on a 7-row plane the tail is 3
+                // of the 7 rows, and at R = 1 a row is a quarter of the ILP and
+                // shares no input row with its neighbour.
                 if (rows_here == 4) {
                     k::dwconv_last<4>(out_rows + co, in_blk, w_blk, b_blk, pc,
                                       attrs.epilogue, attrs.add_to, seg_lanes[s]);
-                    continue;
-                }
-                for (int64_t r = 0; r < rows_here; ++r) {
-                    k::DwConvParams pr = pc;
-                    pr.oh = pc.oh + r;
-                    k::dwconv_last<1>(out_rows + r * p.out_row_stride + co, in_blk,
-                                      w_blk, b_blk, pr, attrs.epilogue,
-                                      attrs.add_to, seg_lanes[s]);
+                } else if (rows_here == 3) {
+                    k::dwconv_last<3>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
+                } else if (rows_here == 2) {
+                    k::dwconv_last<2>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
+                } else {
+                    k::dwconv_last<1>(out_rows + co, in_blk, w_blk, b_blk, pc,
+                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
                 }
             }
         }
@@ -447,19 +452,23 @@ Status dwconv_last_impl_quant(const DepthwiseConvAttributes& attrs, TensorView& 
             const float* ws = w_qp.scale_data + c0;
             const int32_t* wz = w_qp.zero_point_data ? w_qp.zero_point_data + c0
                                                      : nullptr;
+            // One call at the short group's own height, as in the f32 driver.
             if (rows_here == 4) {
                 k::dwconv_last_quant<4, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
                     attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
-                continue;
-            }
-            for (int64_t r = 0; r < rows_here; ++r) {
-                k::DwConvParams pr = pc;
-                pr.oh = pc.oh + r;
+            } else if (rows_here == 3) {
+                k::dwconv_last_quant<3, InT, OutT>(
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
+                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
+            } else if (rows_here == 2) {
+                k::dwconv_last_quant<2, InT, OutT>(
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
+                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
+            } else {
                 k::dwconv_last_quant<1, InT, OutT>(
-                    out_rows + r * p.out_row_stride + c0, in_blk, w_blk, ws, wz, b_blk,
-                    pr, attrs.epilogue, attrs.add_to, lanes, in_scale, in_zero,
-                    out_scale, out_zero);
+                    out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
+                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
             }
         }
     });

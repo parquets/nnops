@@ -555,6 +555,99 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
     }
 }
 
+/// The two-vector 3x3 with the two rows a group can reach past the plane — the
+/// top one and the bottom one — known at compile time. A group whose window
+/// leaves the plane falls back to the checked path for *every* column, and at
+/// both ends of every plane that is exactly one row: skipping its tap at
+/// compile time is what puts those groups back on the unchecked loop.
+template <int R, int SH, bool TOP_OK, bool BOT_OK, typename T>
+inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
+                                     const T* w_tap0, const T* bias_vec,
+                                     const DwConvParams& p,
+                                     const Epilogue& epilogue, bool add_to)
+{
+    using V = decltype(v_load(in_img));
+    constexpr int64_t kL = kChannelLanes;
+    constexpr int64_t kRows = (R - 1) * SH + 3;
+    const int64_t pix = p.pix_stride;
+    const int64_t wtap = p.w_tap_stride;
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+
+    const V vbias[2] = {bias_vec ? v_load(bias_vec) : v_zero(in_img),
+                        bias_vec ? v_load(bias_vec + kL) : v_zero(in_img)};
+
+    // A masked-out row never reaches the FMA, so it holds a pointer that is
+    // valid to form — the plane's own first pixel — and is never dereferenced.
+    const T* row[kRows];
+    for (int64_t i = 0; i < kRows; ++i) {
+        const int64_t ih = p.oh * SH + i - p.PH;
+        row[i] = (!TOP_OK && i == 0) ? in_img
+                                     : in_img + ih * p.in_row_stride - p.PW * pix;
+    }
+
+    const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
+    const int64_t last_hi = p.IW - 1 + p.PW - 2 * p.DW;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
+    const int64_t off_ok_lo = p.PW;
+    const int64_t off_ok_hi = p.IW + p.PW;
+
+    for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
+        V acc[R][2];
+        for (int r = 0; r < R; ++r) { acc[r][0] = vbias[0]; acc[r][1] = vbias[1]; }
+
+        if (ow >= ow_lo && ow <= ow_hi) {
+            const int64_t o = ow * p.SW * pix;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t at = o + kw * pix;
+                    const T* wp = w_tap0 + (kh * 3 + kw) * wtap;
+                    const V w0 = v_load(wp);
+                    const V w1 = v_load(wp + kL);
+                    for (int r = 0; r < R; ++r) {
+                        if ((!TOP_OK && r == 0 && kh == 0) ||
+                            (!BOT_OK && r == R - 1 && kh == 2)) {
+                            continue;
+                        }
+                        const T* ip = row[r * SH + kh] + at;
+                        acc[r][0] = v_fmadd(v_load(ip), w0, acc[r][0]);
+                        acc[r][1] = v_fmadd(v_load(ip + kL), w1, acc[r][1]);
+                    }
+                }
+            }
+        } else {
+            const int64_t ow_off = ow * p.SW;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t off = ow_off + kw;
+                    if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                    const int64_t at = off * pix;
+                    const T* wp = w_tap0 + (kh * 3 + kw) * wtap;
+                    const V w0 = v_load(wp);
+                    const V w1 = v_load(wp + kL);
+                    for (int r = 0; r < R; ++r) {
+                        if ((!TOP_OK && r == 0 && kh == 0) ||
+                            (!BOT_OK && r == R - 1 && kh == 2)) {
+                            continue;
+                        }
+                        const T* ip = row[r * SH + kh] + at;
+                        acc[r][0] = v_fmadd(v_load(ip), w0, acc[r][0]);
+                        acc[r][1] = v_fmadd(v_load(ip + kL), w1, acc[r][1]);
+                    }
+                }
+            }
+        }
+
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) { continue; }
+            T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(
+                                 epilogue, out_rows, acc[r][0]), add_to);
+            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(
+                                      epilogue, out_rows, acc[r][1]), add_to);
+        }
+    }
+}
+
 /// The two-vector 3x3: sixteen channels, the same row table and eight
 /// accumulators, with the tap vectors loaded per column inside the width loop —
 /// eighteen of them plus eight accumulators is twenty-six registers — but one
@@ -565,6 +658,32 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
                               const T* bias_vec, const DwConvParams& p,
                               const Epilogue& epilogue, bool add_to)
 {
+    // A group misses at most its top row when `oh*SH - PH` is -1 and at most its
+    // bottom row when the last one is exactly `IH`; a wider reach keeps the
+    // checked table below.
+    const int64_t ih0 = p.oh * SH - p.PH;
+    const int64_t ih_max = ih0 + (R - 1) * SH + 2;
+    if (ih0 >= -1 && ih_max <= p.IH) {
+        const bool top_ok = ih0 >= 0;
+        const bool bot_ok = ih_max < p.IH;
+        if (top_ok) {
+            if (bot_ok) {
+                dwconv_last3x3_16_masked<R, SH, true, true>(
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+            } else {
+                dwconv_last3x3_16_masked<R, SH, true, false>(
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+            }
+        } else if (bot_ok) {
+            dwconv_last3x3_16_masked<R, SH, false, true>(
+                out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+        } else {
+            dwconv_last3x3_16_masked<R, SH, false, false>(
+                out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+        }
+        return;
+    }
+
     using V = decltype(v_load(in_img));
     constexpr int64_t kL = kChannelLanes;
     const int64_t pix = p.pix_stride;
