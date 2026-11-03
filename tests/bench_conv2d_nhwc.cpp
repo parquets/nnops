@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <random>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -1079,4 +1080,80 @@ NNOPS_BENCH(conv2d_filter_prepacked_planar_f16) {
 NNOPS_BENCH(conv2d_filter_prepacked_planar_int8) {
     run_filter_table<AbPackedI8Planar>(
         "int8 planar: the raw s8 OIHW filter vs the same filter through prepackWeights");
+}
+
+// ============================================================
+// One call, warm vs after a cache scrub
+// ============================================================
+
+// The head 1x1 is 0.27 ms in the loop above and 0.37 ms in MobileNetV2's graph.
+// This runs the *same* call with and without a scrub in between, which is the
+// only thing the graph does differently: it streams the network's other layers
+// through the cache between two uses of this filter. The sweep is the point --
+// a scrub that only reaches L2 proves nothing, and the answer to "is the
+// in-graph loss a cache effect?" is the scrub size at which the curve moves.
+NNOPS_BENCH(conv2d_head_cache_probe) {
+    const Shape c{"head 1x1 7x7 320->1280", 1, 320, 7, 7, 1280, 1, 1};
+    AbPacked<float> l(c);
+    const ComputeContext ctx;
+    const int iters = 24, rounds = 5;
+
+    // A scrub of size S leaves the filter wherever it fits: below the 2 MB L2
+    // nothing spills, between L2 and the 24 MB L3 it survives there, past L3 it
+    // comes from DRAM. The curve says which level the graph loses.
+    std::vector<char> scrub(std::size_t{32} << 20, char{1});
+    const std::size_t mb = std::size_t{1} << 20;
+
+    // Random line order, reads only. A sequential sweep is not enough on this
+    // CPU: its streaming policy keeps a long linear read in a slice of the
+    // cache, so a 64 MB sweep leaves a 5 MB filter resident and the probe
+    // reports bandwidth the machine does not have. Writing instead would leave
+    // tens of MB of dirty lines writing back through the timed call, which
+    // steals the very bandwidth being measured.
+    std::vector<std::size_t> lines(scrub.size() / 64);
+    for (std::size_t i = 0; i < lines.size(); ++i) { lines[i] = i * 64; }
+    {
+        std::mt19937 g(12345);
+        std::shuffle(lines.begin(), lines.end(), g);
+    }
+    static volatile double scrub_sink = 0.0;
+    const auto scrub_to = [&](std::size_t bytes) {
+        const std::size_t n = std::min(lines.size(), bytes / 64);
+        const char* p = scrub.data();
+        double acc = 0.0;
+        for (std::size_t i = 0; i < n; ++i) { acc += p[lines[i]]; }
+        scrub_sink = acc;
+    };
+
+    const auto one = [&] {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        l.run_packed(ctx);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+    const auto sweep = [&](std::size_t bytes) {
+        std::vector<double> v;
+        for (int r = 0; r < rounds; ++r) {
+            double best = 1e9;
+            for (int i = 0; i < iters; ++i) {
+                if (bytes != 0) { scrub_to(bytes); }
+                best = std::min(best, one());
+            }
+            v.push_back(best);
+        }
+        return median_of(v);
+    };
+
+    l.run_packed(ctx);
+    l.run_packed(ctx);
+    std::printf("\n== head 1x1 7x7 320->1280: warm vs a cache scrub, 1 thread ==\n");
+    std::printf("    %-10s %8s %9s\n", "scrub", "ms", "GFLOPS");
+    for (const std::size_t s : {std::size_t{0}, mb, 2 * mb, 4 * mb, 8 * mb,
+                                 16 * mb, 32 * mb}) {
+        const double ms = sweep(s);
+        char label[32];
+        if (s == 0) { std::snprintf(label, sizeof label, "none"); }
+        else { std::snprintf(label, sizeof label, "%zu MB", s / mb); }
+        std::printf("    %-10s %8.3f %9.1f\n", label, ms, l.work / ms / 1e6);
+    }
 }
