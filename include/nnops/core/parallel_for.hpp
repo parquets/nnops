@@ -52,6 +52,15 @@ struct CpuBackend {
     /// Grid size, or 1 with no hook.
     int thread_count() const { return num_threads ? num_threads() : 1; }
 
+    /// Concurrent workers: thread_slots() when installed, else the grid. This is
+    /// the count that bounds scratch, cache residency and tile sizes — an
+    /// over-subscribed grid hands one worker several items and says nothing
+    /// about how many blocks can be live at once.
+    int worker_count() const {
+        const int slots = thread_slot_count();
+        return slots > 0 ? slots : thread_count();
+    }
+
     /// Current worker id, or 0 with no hook.
     int current_thread_id() const { return thread_id ? thread_id() : 0; }
 

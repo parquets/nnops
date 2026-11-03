@@ -956,7 +956,7 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
     const TensorView aq_shape(a.shape_span(), attrs.act_quant_dtype, nullptr,
                               TensorLayout::NCHW, a.quant_params());
     auto plan = get_matmul_plan(attrs, aq_shape.desc(), b.desc(),
-                                ctx.cpu.thread_count(),
+                                ctx.cpu.worker_count(),
                                 ctx.cpu.thread_slot_count() > 0);
     NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
 
@@ -1082,7 +1082,7 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     }
 
     // Worker ids → one scratch slot per thread instead of per m-block.
-    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.thread_count(),
+    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.worker_count(),
                                 ctx.cpu.thread_slot_count() > 0);
 
     // int8: tiled for s32 / s8 / u8 / fp outputs; every destination but s32

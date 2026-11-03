@@ -302,6 +302,14 @@ inline int64_t balance_tile(int64_t dim, int64_t cap, int64_t align,
     const int64_t nb = ((nb_min + nt - 1) / nt) * nt;
     int64_t tile = (((dim + nb - 1) / nb) + align - 1) / align * align;
     tile = std::min<int64_t>(tile, cap_a);
+    // ... but a grid wider than the work can fill must not shrink the tile below
+    // its efficiency floor: past that point more blocks buy no parallelism, they
+    // just make every block pay its own pack and seam. Measured on
+    // 1024x512x1024 at 20 workers: mc 48 runs 0.64 TFLOP/s, mc 24 runs 0.33, and
+    // the extra 21 blocks are the whole difference. The floor yields to the cap
+    // on a machine with so many workers that the residency budget cannot carry
+    // two alignment units at all.
+    tile = std::max<int64_t>(tile, std::min<int64_t>(2 * align, cap_a));
     return std::min<int64_t>(std::max<int64_t>(tile, 1), dim);
 }
 
@@ -336,13 +344,18 @@ inline void choose_tile_impl(int64_t M, int64_t N, int64_t K,
     int64_t nc_t = std::max<int64_t>(
         snap_down(std::min(s - mc_t, static_cast<int64_t>(NC_MAX)), NC_ALIGN), NC_ALIGN);
 
-    // The split dimension is balanced; the other spans whole.
+    // The split dimension is balanced; the other spans whole. The target is
+    // ~2 blocks per worker — one to keep every worker busy, the second to cover
+    // the tail when someone finishes early, which on a hybrid part an E-core
+    // worker always does. This is the *block* count; the residency budget C
+    // above stays on the worker count, because only that many blocks are live.
+    const int64_t block_nt = 2 * nt;
     int64_t mc_raw, nc_raw;
     if (split_n) {
         mc_raw = snap_down(std::min(mc_t, std::max<int64_t>(M, 1)), MC_ALIGN);
-        nc_raw = balance_tile(std::max<int64_t>(N, 1), nc_t, NC_ALIGN, nt);
+        nc_raw = balance_tile(std::max<int64_t>(N, 1), nc_t, NC_ALIGN, block_nt);
     } else {
-        mc_raw = balance_tile(std::max<int64_t>(M, 1), mc_t, MC_ALIGN, nt);
+        mc_raw = balance_tile(std::max<int64_t>(M, 1), mc_t, MC_ALIGN, block_nt);
         nc_raw = std::min(nc_t, std::max<int64_t>(N, 1));
     }
     mc = std::max<int64_t>(mc_raw, 1);
