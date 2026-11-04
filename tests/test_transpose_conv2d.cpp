@@ -19,7 +19,9 @@
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
+#include "common/channel_last.hpp"
 
+#include <span>
 #include <vector>
 #include <cmath>
 #include <cstring>
@@ -880,4 +882,273 @@ NNOPS_TEST(tconv2d_roundtrip_f32_multi_channel) {
     attrs.groups       = 1;
 
     test_channel_last_vs_ref({1, 16, 8, 8}, {16, 32, 3, 3}, attrs);
+}
+
+// ============================================================
+// Planar (NCHW) col-GEMM route
+// ============================================================
+
+/// One planar case against the scalar golden. The shapes here reach the parts
+/// of the route the hand-verified cases are too small for: an output row wider
+/// than one tile, a col large enough to be chunked, and a group count that makes
+/// OC/G narrower than a vector.
+static void test_planar_vs_ref(const std::vector<int64_t>& in_shape,
+                               const std::vector<int64_t>& w_shape,
+                               const TransposeConv2DAttributes& attrs,
+                               bool has_bias = false)
+{
+    const int64_t OC = w_shape[1] * attrs.groups;
+
+    auto [in_vec, in_nchw] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_nchw]  = test::make_random_tensor(w_shape);
+    std::vector<float> b_vec;
+    TensorView b_nchw;
+    if (has_bias) {
+        auto p = test::make_random_tensor({OC});
+        b_vec = std::move(p.first);
+        b_nchw = p.second;
+    }
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> out_descs;
+    if (has_bias) {
+        const TensorDesc d[] = {in_nchw.desc(), w_nchw.desc(), b_nchw.desc()};
+        out_descs = op->getOutputTensorDesc(d);
+    } else {
+        const TensorDesc d[] = {in_nchw.desc(), w_nchw.desc()};
+        out_descs = op->getOutputTensorDesc(d);
+    }
+
+    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = test::make_planar(out_descs[0], out_buf.data());
+    {
+        TensorView outs[] = {out};
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ins[] = {in_nchw, w_nchw, b_nchw};
+            op->compute(outs, ins, ctx);
+        } else {
+            const TensorView ins[] = {in_nchw, w_nchw};
+            op->compute(outs, ins, ctx);
+        }
+    }
+
+    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out_ref = test::make_planar(out_descs[0], ref_buf.data());
+    {
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ins[] = {in_nchw, w_nchw, b_nchw};
+            backend::cpu::reference::transpose_conv2d_nchw_ref(
+                attrs, out_ref, ins, ctx, nullptr);
+        } else {
+            const TensorView ins[] = {in_nchw, w_nchw};
+            backend::cpu::reference::transpose_conv2d_nchw_ref(
+                attrs, out_ref, ins, ctx, nullptr);
+        }
+    }
+
+    NNOPS_EXPECT_TRUE(test::allclose(out, out_ref, 1e-4f, 1e-4f));
+}
+
+NNOPS_TEST(tconv2d_planar_stride2) {
+    // OW = 19, so an output row spans several four-pixel tiles, and OC = 32
+    // gives the GEMM enough columns to block.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+
+    test_planar_vs_ref({2, 64, 10, 10}, {64, 32, 3, 3}, attrs, /*has_bias=*/true);
+}
+
+NNOPS_TEST(tconv2d_planar_col_chunked) {
+    // 5x5 over 64x64 with 256 output channels is ~100K col elements per oc row,
+    // past the 8 MiB budget, so the M rows are split and the scatter has to fold
+    // several GEMM calls back together.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {5, 5};
+    attrs.stride      = {1, 1};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {2, 2};
+    attrs.groups      = 1;
+
+    test_planar_vs_ref({1, 16, 64, 64}, {16, 256, 5, 5}, attrs);
+}
+
+NNOPS_TEST(tconv2d_planar_narrow_oc) {
+    // OC/G = 4: the tile's two-vector block never applies and the oc tail runs
+    // the scalar path, so this is the shape that would silently drop a group.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 4;
+
+    test_planar_vs_ref({1, 32, 12, 12}, {32, 4, 3, 3}, attrs, /*has_bias=*/true);
+}
+
+NNOPS_TEST(tconv2d_planar_add_to) {
+    // add_to keeps whatever the destination already held, and the merge pass is
+    // the only writer — this is the case that would clobber it.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+    attrs.add_to      = true;
+
+    auto [in_vec, in_nchw]   = test::make_random_tensor({1, 16, 8, 8});
+    auto [w_vec,  w_nchw]    = test::make_random_tensor({16, 32, 3, 3});
+    auto [res_vec, res_view] = test::make_random_tensor({1, 32, 15, 15});
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in_nchw.desc(), w_nchw.desc()};
+    const auto out_descs = op->getOutputTensorDesc(d);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[2], 15);
+    NNOPS_EXPECT_EQ(out_descs[0].dims[3], 15);
+
+    std::vector<float> out_buf(res_vec);
+    auto out = test::make_planar(out_descs[0], out_buf.data());
+    {
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_nchw, w_nchw};
+        ComputeContext ctx;
+        op->compute(outs, ins, ctx);
+    }
+
+    std::vector<float> ref_buf(res_vec);
+    auto out_ref = test::make_planar(out_descs[0], ref_buf.data());
+    {
+        const TensorView ins[] = {in_nchw, w_nchw};
+        ComputeContext ctx;
+        backend::cpu::reference::transpose_conv2d_nchw_ref(
+            attrs, out_ref, ins, ctx, nullptr);
+    }
+
+    NNOPS_EXPECT_TRUE(test::allclose(out, out_ref, 1e-4f, 1e-4f));
+}
+
+// ============================================================
+// f16, both layouts
+// ============================================================
+
+/// f16 against an f32 golden computed from the same values *after* their f16
+/// rounding, so the comparison prices the kernel's summation order rather than
+/// the operand quantisation.
+static void test_f16_vs_ref(const std::vector<int64_t>& in_shape,
+                            const std::vector<int64_t>& w_shape,
+                            const TransposeConv2DAttributes& attrs,
+                            bool channel_last)
+{
+    using half = nnops::backend::cpu::half;
+
+    const int64_t N  = in_shape[0];
+    const int64_t IC = in_shape[1];
+    const int64_t IH = in_shape[2];
+    const int64_t IW = in_shape[3];
+    const int64_t OC = w_shape[1] * attrs.groups;
+
+    auto [in_vec, in_f32_view] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_f32_view]  = test::make_random_tensor(w_shape);
+
+    const auto in16 = test::f32_to_f16(in_vec);
+    const auto w16  = test::f32_to_f16(w_vec);
+    auto in_r = test::f16_to_f32(in16);
+    auto w_r  = test::f16_to_f32(w16);
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in_f32_view.desc(), w_f32_view.desc()};
+    const auto out_descs = op->getOutputTensorDesc(d);
+    const int64_t OH = out_descs[0].dims[2];
+    const int64_t OW = out_descs[0].dims[3];
+    const auto numel = static_cast<size_t>(out_descs[0].numel());
+
+    TensorView in_ref(in_shape, DataType::f32, in_r.data(), TensorLayout::NCHW);
+    TensorView w_ref(w_shape, DataType::f32, w_r.data(), TensorLayout::NCHW);
+    std::vector<float> ref_buf(numel);
+    auto out_ref = test::make_planar(out_descs[0], ref_buf.data());
+    {
+        const TensorView ins[] = {in_ref, w_ref};
+        ComputeContext ctx;
+        backend::cpu::reference::transpose_conv2d_nchw_ref(
+            attrs, out_ref, ins, ctx, nullptr);
+    }
+
+    TensorView w16_view(w_shape, DataType::f16,
+                        const_cast<half*>(w16.data()), TensorLayout::NCHW);
+    std::vector<half> out16(numel);
+    std::vector<float> got;
+
+    if (channel_last) {
+        auto in_cl = test::nchw_to_nhwc<half>(
+            std::span<const half>(in16.data(), in16.size()), N, IC, IH, IW);
+        TensorView in16_view(in_shape, DataType::f16, in_cl.data(),
+                             TensorLayout::NHWC);
+        TensorView out16_view(out_descs[0].dims, DataType::f16, out16.data(),
+                              TensorLayout::NHWC);
+        TensorView outs[] = {out16_view};
+        const TensorView ins[] = {in16_view, w16_view};
+        ComputeContext ctx;
+        op->compute(outs, ins, ctx);
+
+        got = test::f16_to_f32(test::nhwc_to_nchw<half>(
+            std::span<const half>(out16.data(), out16.size()), N, OC, OH, OW));
+    } else {
+        TensorView in16_view(in_shape, DataType::f16,
+                             const_cast<half*>(in16.data()), TensorLayout::NCHW);
+        TensorView out16_view(out_descs[0].dims, DataType::f16, out16.data(),
+                              TensorLayout::NCHW);
+        TensorView outs[] = {out16_view};
+        const TensorView ins[] = {in16_view, w16_view};
+        ComputeContext ctx;
+        op->compute(outs, ins, ctx);
+
+        got = test::f16_to_f32(out16);
+    }
+
+    TensorView got_view(out_descs[0].dims, DataType::f32, got.data(),
+                        TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, test::kF16AccumTol,
+                                     test::kF16AccumTol));
+}
+
+NNOPS_TEST(tconv2d_f16_planar) {
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+
+    test_f16_vs_ref({1, 32, 12, 12}, {32, 64, 3, 3}, attrs, /*channel_last=*/false);
+}
+
+NNOPS_TEST(tconv2d_f16_nhwc) {
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+
+    test_f16_vs_ref({1, 32, 12, 12}, {32, 64, 3, 3}, attrs, /*channel_last=*/true);
+}
+
+NNOPS_TEST(tconv2d_nhwc_wide_oc) {
+    // Wide enough that the channel-last tile repeats its oc block several times
+    // over one row of pixels.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+
+    test_channel_last_vs_ref({1, 64, 16, 16}, {64, 128, 3, 3}, attrs);
 }

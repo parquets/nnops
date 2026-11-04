@@ -144,6 +144,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_linear.cpp
         bench_conv2d.cpp
         bench_conv2d_nhwc.cpp
+        bench_transpose_conv2d.cpp
         bench_depthwise.cpp
         bench_pooling.cpp
         bench_attention.cpp

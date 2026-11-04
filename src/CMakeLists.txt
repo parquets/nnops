@@ -74,7 +74,6 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/topk.cpp
     backend/cpu/rope.cpp
     backend/cpu/flatten.cpp
-    backend/cpu/transpose_conv2d.cpp
     backend/cpu/moe.cpp
     backend/cpu/pad.cpp
     backend/cpu/gather.cpp
@@ -104,6 +103,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/conv2d_implicit_gemm.cpp
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/depthwise_conv.cpp
+    backend/cpu/conv/transpose_conv2d.cpp
     backend/cpu/conv/pooling.cpp
     backend/cpu/conv/conv3d.cpp
 
