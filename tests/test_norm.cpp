@@ -15,6 +15,7 @@
 /// hand when the output is integer.
 
 #include "nnops/ops/norm.hpp"
+#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -232,43 +233,19 @@ NNOPS_TEST(norm_batchnorm_random_f16) {
     }
 }
 
-NNOPS_TEST(norm_batchnorm_nchwc8_spatial) {
+NNOPS_TEST(norm_batchnorm_nhwc_spatial) {
     const int64_t N = 2, C = 8, H = 3, W = 4;
 
-    auto [f32_buf, _] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 300);
+    auto [in_vec, in_planar] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 300);
 
-    const int64_t num_c8 = (C + 7) / 8;
-    const int64_t row_stride = W * 8;
-    size_t total = static_cast<size_t>(N * num_c8 * H * row_stride);
-    std::vector<float> in_data(total, 0.0f);
-
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t c = 0; c < C; ++c) {
-            int64_t c8 = c / 8;
-            int64_t lane = c % 8;
-            for (int64_t h = 0; h < H; ++h) {
-                for (int64_t w = 0; w < W; ++w) {
-                    int64_t planar_idx = n * (C * H * W) + c * (H * W) + h * W + w;
-                    int64_t packed_off = n * (num_c8 * H * row_stride)
-                                         + c8 * (H * row_stride)
-                                         + h * row_stride + w * 8 + lane;
-                    in_data[static_cast<size_t>(packed_off)] = f32_buf[static_cast<size_t>(planar_idx)];
-                }
-            }
-        }
+    std::vector<float> scale(C), bias(C), mean(C), var(C);
+    for (int64_t c = 0; c < C; ++c) {
+        const auto i = static_cast<size_t>(c);
+        scale[i] = 0.5f + 0.1f * static_cast<float>(c);
+        bias[i]  = 0.05f * static_cast<float>(c);
+        mean[i]  = 0.1f * static_cast<float>(c) - 0.3f;
+        var[i]   = 1.0f + 0.2f * static_cast<float>(c);
     }
-
-    TensorDesc desc;
-    desc.rank = 4;
-    desc.dims = {N, C, H, W};
-    desc.dtype = DataType::f32;
-    desc.layout = TensorLayout::NCHWC8;
-    TensorView x = test::make_packed(desc, in_data.data());
-
-    std::vector<float> scale(C, 1.0f);
-    std::vector<float> bias(C, 0.0f);
-    std::vector<float> mean(C, 0.0f);
-    std::vector<float> var(C, 1.0f);
 
     const int64_t shape_c[] = {C};
     TensorView s(shape_c, DataType::f32, scale.data());
@@ -281,7 +258,8 @@ NNOPS_TEST(norm_batchnorm_nchwc8_spatial) {
     attrs.spatial = true;
     auto op = Norm::create(attrs, Backend::CPU);
 
-    auto dx = x.desc();
+    // Golden: the same norm on the planar input.
+    auto dx = in_planar.desc();
     auto ds = s.desc();
     auto db = b.desc();
     auto dm = m.desc();
@@ -289,33 +267,39 @@ NNOPS_TEST(norm_batchnorm_nchwc8_spatial) {
     const TensorDesc desc_arr[] = {dx, ds, db, dm, dv};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHWC8);
+    std::vector<float> ref_buf(static_cast<size_t>(descs[0].numel()));
+    auto ref_out = test::make_planar(descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {in_planar, s, b, m, v};
+    TensorView ref_outs[] = {ref_out};
+    op->compute(ref_outs, ref_ins);
 
-    std::vector<float> out_buf(total, 0.0f);
-    auto out = test::make_packed(descs[0], out_buf.data());
+    // Channel-last: convert in, normalize, convert back.
+    auto to_cl = LayoutConvert::create(TensorLayout::NHWC);
+    const TensorDesc cl_in_desc[] = {in_planar.desc()};
+    auto cl_desc = to_cl->getOutputTensorDesc(cl_in_desc)[0];
 
-    const TensorView ins[] = {x, s, b, m, v};
-    TensorView outs[] = {out};
-    op->compute(outs, ins);
+    std::vector<float> cl_buf(static_cast<size_t>(cl_desc.storage_bytes() / sizeof(float)));
+    auto x_cl = test::make_packed(cl_desc, cl_buf.data());
+    const TensorView lc_ins[] = {in_planar};
+    to_cl->compute(x_cl, lc_ins);
 
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t c = 0; c < C; ++c) {
-            int64_t c8 = c / 8;
-            int64_t lane = c % 8;
-            for (int64_t h = 0; h < H; ++h) {
-                for (int64_t w = 0; w < W; ++w) {
-                    int64_t planar_idx = n * (C * H * W) + c * (H * W) + h * W + w;
-                    int64_t packed_off = n * (num_c8 * H * row_stride)
-                                         + c8 * (H * row_stride)
-                                         + h * row_stride + w * 8 + lane;
-                    float expected = f32_buf[static_cast<size_t>(planar_idx)];
-                    float result = out_buf[static_cast<size_t>(packed_off)];
-                    NNOPS_EXPECT_TRUE(std::isfinite(result));
-                    NNOPS_EXPECT_NEAR(result, expected, 1e-3f);
-                }
-            }
-        }
-    }
+    const TensorDesc cl_norm_desc[] = {x_cl.desc(), ds, db, dm, dv};
+    auto cl_out_desc = op->getOutputTensorDesc(cl_norm_desc);
+    NNOPS_EXPECT_EQ(cl_out_desc[0].layout, TensorLayout::NHWC);
+
+    std::vector<float> cl_out_buf(static_cast<size_t>(cl_out_desc[0].storage_bytes() / sizeof(float)));
+    auto out_cl = test::make_packed(cl_out_desc[0], cl_out_buf.data());
+    const TensorView cl_ins[] = {x_cl, s, b, m, v};
+    TensorView cl_outs[] = {out_cl};
+    op->compute(cl_outs, cl_ins);
+
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW);
+    std::vector<float> back_buf(static_cast<size_t>(in_planar.numel()));
+    TensorView back(in_planar.shape_span(), DataType::f32, back_buf.data());
+    const TensorView back_ins[] = {out_cl};
+    to_planar->compute(back, back_ins);
+
+    NNOPS_EXPECT_TRUE(test::allclose(back, ref_out, 1e-4f, 1e-4f));
 }
 
 // ============================================================

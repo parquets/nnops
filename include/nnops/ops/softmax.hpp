@@ -9,7 +9,6 @@
 /// re-quantized; quantized input is planar and PerTensor/PerToken only.
 ///
 /// Two layout families: planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC).
-/// Channel-packed layouts (NCHWC8/16/32, NCDHWC*) are not supported.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

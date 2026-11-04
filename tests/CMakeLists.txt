@@ -49,6 +49,12 @@ set(TEST_SOURCES
     test_memory_pool.cpp
     test_mma_packed.cpp
     test_rnn.cpp
+    test_pad.cpp
+    test_gather.cpp
+    test_scatter.cpp
+    test_split.cpp
+    test_tile.cpp
+    test_where.cpp
 )
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.

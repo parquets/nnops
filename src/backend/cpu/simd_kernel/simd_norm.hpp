@@ -111,22 +111,6 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
     }
 }
 
-/// Packed layout: per-row SIMD fmadd with per-C8-block scale/bias.
-template <typename T>
-inline void batch_norm_process_packed_row(
-    const T* x_row, T* y_row,
-    const T* ns_packed, const T* nb_packed,
-    int64_t c8, int64_t pack,
-    int64_t last_dim, bool add_to)
-{
-    constexpr int L = simd_lane_for<T>;
-    const auto ns8 = v_load(&ns_packed[c8 * pack]);
-    const auto nb8 = v_load(&nb_packed[c8 * pack]);
-    for (int64_t i = 0; i < last_dim; i += L) {
-        v_store_add(y_row + i, v_fmadd(ns8, v_load(x_row + i), nb8), add_to);
-    }
-}
-
 /// Planar layout: 4-wide unrolled SIMD fmadd per row.
 template <typename T>
 inline void batch_norm_process_planar_row(

@@ -1,13 +1,14 @@
 #pragma once
 /// @file simd_resize.hpp
-/// @brief SIMD kernels for 2D/3D spatial resize (NCHWC8 / NCDHWC8 only).
+/// @brief CPU kernels for 2D/3D spatial resize, planar and channel-last.
 ///
-/// Input and output are always channel-packed (NCHWC8 or NCDHWC8); partial C8
-/// blocks are zero-padded by the pack step, so every block loads with SIMD.
+/// Planar walks one channel plane and evaluates scalar output pixels; the
+/// channel-last kernels put the SIMD lane on C, so a pixel's whole channel
+/// vector interpolates with v_fmadd and only the C tail runs scalar.
 ///
-/// Nearest computes the source coordinate once per output position and loads
-/// its 8 channels. Bilinear/trilinear compute the corner coordinates once and
-/// interpolate all 8 lanes in parallel with v_fmadd.
+/// The coordinate tables (source indices and the weight of the upper/right
+/// neighbour) are built once per call by the driver; nearest encodes itself as
+/// i1 == i0, w == 0.
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/ops/resize.hpp"
@@ -51,173 +52,261 @@ inline float resize_compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t
     }
 }
 
+// ============================================================
+// Planar (NCHW/NCDHW): scalar over W inside one channel plane
+// ============================================================
+
 template <typename T>
-void resize_nearest_2d(
-    T* output, const T* input,
-    int64_t IH, int64_t IW, int64_t OH, int64_t OW,
+void resize_planar_2d(
+    T* out, const T* in,
+    int64_t OH, int64_t OW,
+    const int64_t* y0, const int64_t* y1, const float* wy,
+    const int64_t* x0, const int64_t* x1, const float* wx,
     int64_t in_row_stride, int64_t out_row_stride,
-    CoordinateTransformMode coord_mode, bool add_to)
+    bool linear, bool add_to)
 {
     for (int64_t oh = 0; oh < OH; ++oh) {
-        float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
-        int64_t ih = resize_clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
-        const T* in_row = input + ih * in_row_stride;
+        const T* r0 = in + y0[oh] * in_row_stride;
+        const T* r1 = in + y1[oh] * in_row_stride;
+        T* orow = out + oh * out_row_stride;
 
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
-            int64_t iw = resize_clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
-
-            auto val = v_load(&in_row[iw * 8]);
-            v_store_add(output + ow * 8, val, add_to);
+        if (!linear) {
+            for (int64_t ow = 0; ow < OW; ++ow) {
+                s_store_add(&orow[ow], s_load(&r0[x0[ow]]), add_to);
+            }
+            continue;
         }
-        output += out_row_stride;
+
+        const float w_y  = wy[oh];
+        const float w_y0 = 1.0f - w_y;
+        for (int64_t ow = 0; ow < OW; ++ow) {
+            const float w_x  = wx[ow];
+            const float w_x0 = 1.0f - w_x;
+            const float v00 = s_load(&r0[x0[ow]]);
+            const float v10 = s_load(&r0[x1[ow]]);
+            const float v01 = s_load(&r1[x0[ow]]);
+            const float v11 = s_load(&r1[x1[ow]]);
+            const float top = w_x0 * v00 + w_x * v10;
+            const float bot = w_x0 * v01 + w_x * v11;
+            s_store_add(&orow[ow], w_y0 * top + w_y * bot, add_to);
+        }
     }
 }
 
 template <typename T>
-void resize_bilinear_2d(
-    T* output, const T* input,
-    int64_t IH, int64_t IW, int64_t OH, int64_t OW,
-    int64_t in_row_stride, int64_t out_row_stride,
-    CoordinateTransformMode coord_mode, bool add_to)
-{
-    const T* type_tag = output;
-
-    for (int64_t oh = 0; oh < OH; ++oh) {
-        float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
-        int64_t y0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
-        int64_t y1 = resize_clamp_idx(y0 + 1, IH);
-        float wy = src_h - std::floor(src_h);
-        float wy0 = 1.0f - wy;
-        auto v_wy  = v_set1(type_tag, wy);
-        auto v_wy0 = v_set1(type_tag, wy0);
-
-        const T* in_row0 = input + y0 * in_row_stride;
-        const T* in_row1 = input + y1 * in_row_stride;
-
-        for (int64_t ow = 0; ow < OW; ++ow) {
-            float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
-            int64_t x0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
-            int64_t x1 = resize_clamp_idx(x0 + 1, IW);
-            float wx = src_w - std::floor(src_w);
-            float wx0 = 1.0f - wx;
-            auto v_wx  = v_set1(type_tag, wx);
-            auto v_wx0 = v_set1(type_tag, wx0);
-
-            auto v00 = v_load(&in_row0[x0 * 8]);
-            auto v10 = v_load(&in_row0[x1 * 8]);
-            auto v01 = v_load(&in_row1[x0 * 8]);
-            auto v11 = v_load(&in_row1[x1 * 8]);
-
-            auto top0 = v_fmadd(v_wx0, v00, v_mul(v_wx, v10));
-            auto top1 = v_fmadd(v_wx0, v01, v_mul(v_wx, v11));
-            auto result = v_fmadd(v_wy0, top0, v_mul(v_wy, top1));
-
-            v_store_add(output + ow * 8, result, add_to);
-        }
-        output += out_row_stride;
-    }
-}
-
-template <typename T>
-void resize_nearest_3d(
-    T* output, const T* input,
-    int64_t ID, int64_t IH, int64_t IW,
+void resize_planar_3d(
+    T* out, const T* in,
     int64_t OD, int64_t OH, int64_t OW,
+    const int64_t* z0, const int64_t* z1, const float* wz,
+    const int64_t* y0, const int64_t* y1, const float* wy,
+    const int64_t* x0, const int64_t* x1, const float* wx,
     int64_t in_d_stride, int64_t in_row_stride,
     int64_t out_d_stride, int64_t out_row_stride,
-    CoordinateTransformMode coord_mode, bool add_to)
+    bool linear, bool add_to)
 {
     for (int64_t od = 0; od < OD; ++od) {
-        float src_d = resize_compute_src_coord(od, ID, OD, coord_mode);
-        int64_t id = resize_clamp_idx(static_cast<int64_t>(std::round(src_d)), ID);
-        const T* in_d = input + id * in_d_stride;
-        T* out_d = output + od * out_d_stride;
+        const T* d0 = in + z0[od] * in_d_stride;
+        const T* d1 = in + z1[od] * in_d_stride;
+        T* odst = out + od * out_d_stride;
 
         for (int64_t oh = 0; oh < OH; ++oh) {
-            float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
-            int64_t ih = resize_clamp_idx(static_cast<int64_t>(std::round(src_h)), IH);
-            const T* in_row = in_d + ih * in_row_stride;
+            const T* r00 = d0 + y0[oh] * in_row_stride;
+            const T* r01 = d0 + y1[oh] * in_row_stride;
+            const T* r10 = d1 + y0[oh] * in_row_stride;
+            const T* r11 = d1 + y1[oh] * in_row_stride;
+            T* orow = odst + oh * out_row_stride;
+
+            if (!linear) {
+                for (int64_t ow = 0; ow < OW; ++ow) {
+                    s_store_add(&orow[ow], s_load(&r00[x0[ow]]), add_to);
+                }
+                continue;
+            }
+
+            const float w_z  = wz[od];
+            const float w_z0 = 1.0f - w_z;
+            const float w_y  = wy[oh];
+            const float w_y0 = 1.0f - w_y;
 
             for (int64_t ow = 0; ow < OW; ++ow) {
-                float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
-                int64_t iw = resize_clamp_idx(static_cast<int64_t>(std::round(src_w)), IW);
+                const float w_x  = wx[ow];
+                const float w_x0 = 1.0f - w_x;
 
-                auto val = v_load(&in_row[iw * 8]);
-                v_store_add(out_d + oh * out_row_stride + ow * 8, val, add_to);
+                const float v000 = s_load(&r00[x0[ow]]);
+                const float v100 = s_load(&r00[x1[ow]]);
+                const float v010 = s_load(&r01[x0[ow]]);
+                const float v110 = s_load(&r01[x1[ow]]);
+                const float v001 = s_load(&r10[x0[ow]]);
+                const float v101 = s_load(&r10[x1[ow]]);
+                const float v011 = s_load(&r11[x0[ow]]);
+                const float v111 = s_load(&r11[x1[ow]]);
+
+                const float z0_top = w_x0 * v000 + w_x * v100;
+                const float z0_bot = w_x0 * v010 + w_x * v110;
+                const float z0_val = w_y0 * z0_top + w_y * z0_bot;
+
+                const float z1_top = w_x0 * v001 + w_x * v101;
+                const float z1_bot = w_x0 * v011 + w_x * v111;
+                const float z1_val = w_y0 * z1_top + w_y * z1_bot;
+
+                s_store_add(&orow[ow], w_z0 * z0_val + w_z * z1_val, add_to);
             }
         }
     }
 }
 
+// ============================================================
+// Channel-last (NHWC/NDHWC): the SIMD lane spans C
+// ============================================================
+
+/// Interpolate one output pixel: `dst[c] = w_y0*(w_x0*a0[c] + w_x*a1[c]) +
+/// w_y*(w_x0*b0[c] + w_x*b1[c])`. With linear == false this is a whole-pixel
+/// copy from a0.
 template <typename T>
-void resize_trilinear_3d(
-    T* output, const T* input,
-    int64_t ID, int64_t IH, int64_t IW,
-    int64_t OD, int64_t OH, int64_t OW,
+inline void resize_pixel_2d(T* dst, const T* a0, const T* a1,
+                            const T* b0, const T* b1, int64_t C,
+                            float w_x, float w_y, bool linear, bool add_to)
+{
+    constexpr int L = simd_lane_for<T>;
+    if (!linear) {
+        int64_t c = 0;
+        for (; c + L <= C; c += L) {
+            v_store_add(dst + c, v_load(a0 + c), add_to);
+        }
+        for (; c < C; ++c) {
+            s_store_add(&dst[c], s_load(&a0[c]), add_to);
+        }
+        return;
+    }
+
+    const auto vw_x  = v_set1(dst, w_x);
+    const auto vw_x0 = v_set1(dst, 1.0f - w_x);
+    const auto vw_y  = v_set1(dst, w_y);
+    const auto vw_y0 = v_set1(dst, 1.0f - w_y);
+
+    int64_t c = 0;
+    for (; c + L <= C; c += L) {
+        const auto top = v_fmadd(vw_x0, v_load(a0 + c), v_mul(vw_x, v_load(a1 + c)));
+        const auto bot = v_fmadd(vw_x0, v_load(b0 + c), v_mul(vw_x, v_load(b1 + c)));
+        v_store_add(dst + c, v_fmadd(vw_y0, top, v_mul(vw_y, bot)), add_to);
+    }
+    const float w_x0 = 1.0f - w_x;
+    const float w_y0 = 1.0f - w_y;
+    for (; c < C; ++c) {
+        const float top = w_x0 * s_load(&a0[c]) + w_x * s_load(&a1[c]);
+        const float bot = w_x0 * s_load(&b0[c]) + w_x * s_load(&b1[c]);
+        s_store_add(&dst[c], w_y0 * top + w_y * bot, add_to);
+    }
+}
+
+template <typename T>
+void resize_last_2d(
+    T* out, const T* in, int64_t C, int64_t OH, int64_t OW,
+    const int64_t* y0, const int64_t* y1, const float* wy,
+    const int64_t* x0, const int64_t* x1, const float* wx,
+    int64_t in_row_stride, int64_t out_row_stride,
+    bool linear, bool add_to)
+{
+    for (int64_t oh = 0; oh < OH; ++oh) {
+        const T* r0 = in + y0[oh] * in_row_stride;
+        const T* r1 = in + y1[oh] * in_row_stride;
+        T* orow = out + oh * out_row_stride;
+
+        for (int64_t ow = 0; ow < OW; ++ow) {
+            const T* a0 = r0 + x0[ow] * C;
+            const T* a1 = r0 + x1[ow] * C;
+            const T* b0 = r1 + x0[ow] * C;
+            const T* b1 = r1 + x1[ow] * C;
+            resize_pixel_2d<T>(orow + ow * C, a0, a1, b0, b1, C,
+                               wx[ow], wy[oh], linear, add_to);
+        }
+    }
+}
+
+template <typename T>
+void resize_last_3d(
+    T* out, const T* in, int64_t C, int64_t OD, int64_t OH, int64_t OW,
+    const int64_t* z0, const int64_t* z1, const float* wz,
+    const int64_t* y0, const int64_t* y1, const float* wy,
+    const int64_t* x0, const int64_t* x1, const float* wx,
     int64_t in_d_stride, int64_t in_row_stride,
     int64_t out_d_stride, int64_t out_row_stride,
-    CoordinateTransformMode coord_mode, bool add_to)
+    bool linear, bool add_to)
 {
-    const T* type_tag = output;
+    constexpr int L = simd_lane_for<T>;
 
     for (int64_t od = 0; od < OD; ++od) {
-        float src_d = resize_compute_src_coord(od, ID, OD, coord_mode);
-        int64_t z0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_d)), ID);
-        int64_t z1 = resize_clamp_idx(z0 + 1, ID);
-        float wz   = src_d - std::floor(src_d);
-        float wz0  = 1.0f - wz;
-        auto v_wz  = v_set1(type_tag, wz);
-        auto v_wz0 = v_set1(type_tag, wz0);
-
-        const T* in_d0 = input + z0 * in_d_stride;
-        const T* in_d1 = input + z1 * in_d_stride;
-        T* out_d = output + od * out_d_stride;
+        const T* d0 = in + z0[od] * in_d_stride;
+        const T* d1 = in + z1[od] * in_d_stride;
+        T* odst = out + od * out_d_stride;
 
         for (int64_t oh = 0; oh < OH; ++oh) {
-            float src_h = resize_compute_src_coord(oh, IH, OH, coord_mode);
-            int64_t y0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_h)), IH);
-            int64_t y1 = resize_clamp_idx(y0 + 1, IH);
-            float wy   = src_h - std::floor(src_h);
-            float wy0  = 1.0f - wy;
-            auto v_wy  = v_set1(type_tag, wy);
-            auto v_wy0 = v_set1(type_tag, wy0);
+            const T* plane00 = d0 + y0[oh] * in_row_stride;
+            const T* plane01 = d0 + y1[oh] * in_row_stride;
+            const T* plane10 = d1 + y0[oh] * in_row_stride;
+            const T* plane11 = d1 + y1[oh] * in_row_stride;
+            T* orow = odst + oh * out_row_stride;
 
-            const T* in_d0_r0 = in_d0 + y0 * in_row_stride;
-            const T* in_d0_r1 = in_d0 + y1 * in_row_stride;
-            const T* in_d1_r0 = in_d1 + y0 * in_row_stride;
-            const T* in_d1_r1 = in_d1 + y1 * in_row_stride;
+            const float w_z  = wz[od];
+            const float w_z0 = 1.0f - w_z;
+            const float w_y  = wy[oh];
+            const float w_y0 = 1.0f - w_y;
 
             for (int64_t ow = 0; ow < OW; ++ow) {
-                float src_w = resize_compute_src_coord(ow, IW, OW, coord_mode);
-                int64_t x0 = resize_clamp_idx(static_cast<int64_t>(std::floor(src_w)), IW);
-                int64_t x1 = resize_clamp_idx(x0 + 1, IW);
-                float wx   = src_w - std::floor(src_w);
-                float wx0  = 1.0f - wx;
-                auto v_wx  = v_set1(type_tag, wx);
-                auto v_wx0 = v_set1(type_tag, wx0);
+                const float w_x  = wx[ow];
+                const float w_x0 = 1.0f - w_x;
+                T* dst = orow + ow * C;
 
-                auto v000 = v_load(&in_d0_r0[x0 * 8]);
-                auto v100 = v_load(&in_d0_r0[x1 * 8]);
-                auto v010 = v_load(&in_d0_r1[x0 * 8]);
-                auto v110 = v_load(&in_d0_r1[x1 * 8]);
-                auto v001 = v_load(&in_d1_r0[x0 * 8]);
-                auto v101 = v_load(&in_d1_r0[x1 * 8]);
-                auto v011 = v_load(&in_d1_r1[x0 * 8]);
-                auto v111 = v_load(&in_d1_r1[x1 * 8]);
+                const T* a000 = plane00 + x0[ow] * C;
+                const T* a100 = plane00 + x1[ow] * C;
+                const T* a010 = plane01 + x0[ow] * C;
+                const T* a110 = plane01 + x1[ow] * C;
+                const T* a001 = plane10 + x0[ow] * C;
+                const T* a101 = plane10 + x1[ow] * C;
+                const T* a011 = plane11 + x0[ow] * C;
+                const T* a111 = plane11 + x1[ow] * C;
 
-                // 2D interpolation in each z-plane, then interp across z
-                auto r00 = v_fmadd(v_wx0, v000, v_mul(v_wx, v100));  // z0
-                auto r10 = v_fmadd(v_wx0, v010, v_mul(v_wx, v110));
-                auto z0_term = v_fmadd(v_wy0, r00, v_mul(v_wy, r10));
+                if (!linear) {
+                    resize_pixel_2d<T>(dst, a000, a000, a000, a000, C,
+                                       0.0f, 0.0f, false, add_to);
+                    continue;
+                }
 
-                auto r01 = v_fmadd(v_wx0, v001, v_mul(v_wx, v101));  // z1
-                auto r11 = v_fmadd(v_wx0, v011, v_mul(v_wx, v111));
-                auto z1_term = v_fmadd(v_wy0, r01, v_mul(v_wy, r11));
+                const auto vw_x  = v_set1(dst, w_x);
+                const auto vw_x0 = v_set1(dst, 1.0f - w_x);
+                const auto vw_y  = v_set1(dst, w_y);
+                const auto vw_y0 = v_set1(dst, 1.0f - w_y);
+                const auto vw_z  = v_set1(dst, w_z);
+                const auto vw_z0 = v_set1(dst, w_z0);
 
-                auto result = v_fmadd(v_wz0, z0_term, v_mul(v_wz, z1_term));
+                int64_t c = 0;
+                for (; c + L <= C; c += L) {
+                    const auto z0_top = v_fmadd(vw_x0, v_load(a000 + c),
+                                                v_mul(vw_x, v_load(a100 + c)));
+                    const auto z0_bot = v_fmadd(vw_x0, v_load(a010 + c),
+                                                v_mul(vw_x, v_load(a110 + c)));
+                    const auto z0_val = v_fmadd(vw_y0, z0_top, v_mul(vw_y, z0_bot));
 
-                v_store_add(out_d + oh * out_row_stride + ow * 8, result, add_to);
+                    const auto z1_top = v_fmadd(vw_x0, v_load(a001 + c),
+                                                v_mul(vw_x, v_load(a101 + c)));
+                    const auto z1_bot = v_fmadd(vw_x0, v_load(a011 + c),
+                                                v_mul(vw_x, v_load(a111 + c)));
+                    const auto z1_val = v_fmadd(vw_y0, z1_top, v_mul(vw_y, z1_bot));
+
+                    v_store_add(dst + c, v_fmadd(vw_z0, z0_val, v_mul(vw_z, z1_val)),
+                                add_to);
+                }
+                for (; c < C; ++c) {
+                    const float z0_top = w_x0 * s_load(&a000[c]) + w_x * s_load(&a100[c]);
+                    const float z0_bot = w_x0 * s_load(&a010[c]) + w_x * s_load(&a110[c]);
+                    const float z0_val = w_y0 * z0_top + w_y * z0_bot;
+
+                    const float z1_top = w_x0 * s_load(&a001[c]) + w_x * s_load(&a101[c]);
+                    const float z1_bot = w_x0 * s_load(&a011[c]) + w_x * s_load(&a111[c]);
+                    const float z1_val = w_y0 * z1_top + w_y * z1_bot;
+
+                    s_store_add(&dst[c], w_z0 * z0_val + w_z * z1_val, add_to);
+                }
             }
         }
     }

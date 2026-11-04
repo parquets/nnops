@@ -4,10 +4,11 @@
 ///
 /// f32 and f16 share one templated implementation per type, over the SIMD row
 /// kernels in simd_kernel/simd_norm.hpp. LayerNorm / RMSNorm / L2Norm run the
-/// vectorized row path at axis == rank-1 (is_contiguous_tail) and fall back to
-/// a scalar loop over precomputed inner offsets on any other axis. BatchNorm
-/// with channel_pack_size() > 1 walks rows and picks the pack block from the
-/// row index; GroupNorm reduces one (sample, group) at a time.
+/// vectorized row path when the normalized axes are the physically contiguous
+/// tail (planar axis == rank-1) and otherwise walk precomputed offsets, so a
+/// logical axis means the same thing in planar and channel-last layouts.
+/// BatchNorm walks rows and applies the per-channel factors pixel by pixel in
+/// channel-last; GroupNorm reduces one (sample, group) at a time.
 ///
 /// s8/u8 input is supported for LayerNorm / RMSNorm / L2Norm over the trailing
 /// axis: each integer row is dequantized to f32 by the arch quant.hpp per-row
@@ -68,6 +69,12 @@ inline PoolArray<int64_t> compute_inner_offsets(
     return build_offsets(X, axis, X.rank() - 1, norm_size);
 }
 
+/// Base offset of row `row` in the outer dims [0, axis-1].
+inline int64_t outer_base(const TensorView& t, int64_t row, int64_t axis)
+{
+    return decompose_flat_offset(row, t, 0, axis - 1);
+}
+
 /// Normalized axis dimensions for row-wise norm dispatch.
 struct NormDims {
     int64_t axis;               ///< Normalized axis (0 <= axis < rank)
@@ -87,7 +94,10 @@ inline NormDims compute_norm_dims(const TensorView& X, int64_t raw_axis) {
     int64_t norm_size = 1;
     for (int64_t i = axis; i < rank; ++i) { norm_size *= X.shape(i); }
 
-    return {axis, num_rows, norm_size, axis == rank - 1};
+    // Only planar's trailing axis is one physically contiguous run.
+    const bool contiguous_tail = (axis == rank - 1) &&
+                                 !is_channel_last(X.layout());
+    return {axis, num_rows, norm_size, contiguous_tail};
 }
 
 // ============================================================
@@ -129,75 +139,65 @@ void batch_norm_impl(const NormAttributes& attrs,
             nb_f[static_cast<size_t>(c)] = s_load(&b_ptr[c]) - s_load(&m_ptr[c]) * ns_f[static_cast<size_t>(c)];
         }
 
-        const int64_t pack = X.channel_pack_size();
-
-        if (pack > 1) {
-            const int64_t c8_blocks = X.num_channel_blocks();
-            PoolArray<T> ns_packed;
-            PoolArray<T> nb_packed;
-            ns_packed.zero(static_cast<size_t>(c8_blocks * pack));
-            nb_packed.zero(static_cast<size_t>(c8_blocks * pack));
-            for (int64_t c = 0; c < C; ++c) {
-                s_store(&ns_packed[static_cast<size_t>(c)], ns_f[static_cast<size_t>(c)]);
-                s_store(&nb_packed[static_cast<size_t>(c)], nb_f[static_cast<size_t>(c)]);
-            }
-
-            const int64_t num_rows = X.total_rows();
-            const int64_t last_dim = X.shape(rank - 1) * pack;
+        if (is_channel_last(X.layout())) {
+            // One row is a spatial line of W pixels × C channels; each pixel
+            // takes the same C factors. Rank 2 has C as its only row.
+            const int64_t pixels  = (rank >= 3) ? X.shape(rank - 1) : 1;
+            const int64_t num_rows = (rank >= 3) ? X.total_rows() : N;
             const int64_t x_rs = X.row_stride_elems();
             const int64_t y_rs = output.row_stride_elems();
 
-            int64_t rows_per_c8 = 1;
-            for (int64_t d = 2; d < rank - 1; ++d) {
-                rows_per_c8 *= X.shape(d);
-            }
-
             const auto process_row = [&](int64_t r) {
-                const int64_t c8 = (r / rows_per_c8) % c8_blocks;
-                kernel::batch_norm_process_packed_row<T>(
-                    x_ptr + r * x_rs, y_ptr + r * y_rs,
-                    ns_packed.data(), nb_packed.data(),
-                    c8, pack, last_dim, attrs.add_to);
-            };
-
-            ctx.cpu.run(0, num_rows, process_row);
-
-        } else {
-            int64_t sample_size = 1;
-            if (rank >= 2) {
-                for (int64_t i = 2; i < rank; ++i) {
-                    sample_size *= X.shape(i);
-                }
-            }
-
-            const int64_t x_n_stride = X.stride_elems(0);
-            const int64_t x_c_stride = (rank >= 2) ? X.stride_elems(1) : 1;
-            const int64_t y_n_stride = output.stride_elems(0);
-            const int64_t y_c_stride = (rank >= 2) ? output.stride_elems(1) : 1;
-
-            const int64_t last_dim = (rank >= 3) ? X.shape(rank - 1) : 1;
-            const int64_t num_rows = (rank >= 3) ? sample_size / last_dim : 1;
-            const int64_t x_row_stride = X.row_stride_elems();
-            const int64_t y_row_stride = output.row_stride_elems();
-
-            const auto compute_sample = [&](int64_t n) {
-                for (int64_t c = 0; c < C; ++c) {
-                    const float ns = ns_f[static_cast<size_t>(c)];
-                    const float nb = nb_f[static_cast<size_t>(c)];
-                    const int64_t x_ch_base = n * x_n_stride + c * x_c_stride;
-                    const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
-
-                    for (int64_t hh = 0; hh < num_rows; ++hh) {
-                        kernel::batch_norm_process_planar_row<T>(
-                            x_ptr + x_ch_base + hh * x_row_stride,
-                            y_ptr + y_ch_base + hh * y_row_stride,
-                            last_dim, ns, nb, attrs.add_to);
+                const T* xr = x_ptr + r * x_rs;
+                T* yr = y_ptr + r * y_rs;
+                for (int64_t p = 0; p < pixels; ++p) {
+                    for (int64_t c = 0; c < C; ++c) {
+                        const int64_t idx = p * C + c;
+                        const float v = s_load(&xr[idx]) * ns_f[static_cast<size_t>(c)] +
+                                        nb_f[static_cast<size_t>(c)];
+                        s_store_add(&yr[idx], v, attrs.add_to);
                     }
                 }
             };
 
-            ctx.cpu.run(0, N, compute_sample);
+            ctx.cpu.run(0, num_rows, process_row);
+            return;
         }
+
+        int64_t sample_size = 1;
+        if (rank >= 2) {
+            for (int64_t i = 2; i < rank; ++i) {
+                sample_size *= X.shape(i);
+            }
+        }
+
+        const int64_t x_n_stride = X.stride_elems(0);
+        const int64_t x_c_stride = (rank >= 2) ? X.stride_elems(1) : 1;
+        const int64_t y_n_stride = output.stride_elems(0);
+        const int64_t y_c_stride = (rank >= 2) ? output.stride_elems(1) : 1;
+
+        const int64_t last_dim = (rank >= 3) ? X.shape(rank - 1) : 1;
+        const int64_t num_rows = (rank >= 3) ? sample_size / last_dim : 1;
+        const int64_t x_row_stride = X.row_stride_elems();
+        const int64_t y_row_stride = output.row_stride_elems();
+
+        const auto compute_sample = [&](int64_t n) {
+            for (int64_t c = 0; c < C; ++c) {
+                const float ns = ns_f[static_cast<size_t>(c)];
+                const float nb = nb_f[static_cast<size_t>(c)];
+                const int64_t x_ch_base = n * x_n_stride + c * x_c_stride;
+                const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
+
+                for (int64_t hh = 0; hh < num_rows; ++hh) {
+                    kernel::batch_norm_process_planar_row<T>(
+                        x_ptr + x_ch_base + hh * x_row_stride,
+                        y_ptr + y_ch_base + hh * y_row_stride,
+                        last_dim, ns, nb, attrs.add_to);
+                }
+            }
+        };
+
+        ctx.cpu.run(0, N, compute_sample);
 
     } else {
         const int64_t total = X.numel();
@@ -216,22 +216,23 @@ void layer_norm_general_scalar(
     const T* x_ptr, const T* s_ptr, const T* b_ptr,
     T* y_ptr,
     int64_t num_rows, int64_t norm_size,
-    int64_t axis, const TensorView& X, const TensorView& scale,
+    int64_t axis, const TensorView& X, const TensorView& Y,
+    const TensorView& scale,
     float epsilon, bool add_to, bool has_bias,
     const ComputeContext& ctx)
 {
     const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
-    const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
+    const auto y_inner_offsets = compute_inner_offsets(Y, axis, norm_size);
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
-        const int64_t row_base = row * outer_stride;
+        const int64_t x_base = outer_base(X, row, axis);
+        const int64_t y_base = outer_base(Y, row, axis);
 
         float mean_val = 0.0f;
         float M2 = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
-            float x = s_load(&x_ptr[off]);
+            float x = s_load(&x_ptr[x_base + inner_offsets[static_cast<size_t>(i)]]);
             float delta = x - mean_val;
             mean_val += delta / static_cast<float>(i + 1);
             float delta2 = x - mean_val;
@@ -241,12 +242,13 @@ void layer_norm_general_scalar(
         const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
 
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
+            const int64_t x_off = x_base + inner_offsets[static_cast<size_t>(i)];
+            const int64_t y_off = y_base + y_inner_offsets[static_cast<size_t>(i)];
             int64_t s_idx = scale_is_scalar ? 0 : i;
             float s = s_load(&s_ptr[s_idx]);
             float b = (has_bias && b_ptr) ? s_load(&b_ptr[s_idx]) : 0.0f;
-            float val = (s_load(&x_ptr[off]) - mean_val) * inv_std * s + b;
-            s_store_add(&y_ptr[off], val, add_to);
+            float val = (s_load(&x_ptr[x_off]) - mean_val) * inv_std * s + b;
+            s_store_add(&y_ptr[y_off], val, add_to);
         }
     };
 
@@ -276,17 +278,19 @@ void layer_norm_impl(const NormAttributes& attrs,
     if (!dims.is_contiguous_tail) {
         layer_norm_general_scalar<T>(
             x_ptr, s_ptr, b_ptr, y_ptr,
-            dims.num_rows, dims.norm_size, dims.axis, X, scale,
+            dims.num_rows, dims.norm_size, dims.axis, X, output, scale,
             epsilon, add_to, has_bias, ctx);
         return;
     }
 
     const int64_t x_row_stride = X.row_stride_elems();
+    const int64_t y_row_stride = output.row_stride_elems();
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
-        const int64_t row_off = row * x_row_stride;
-        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, dims.norm_size);
+        const int64_t x_off = row * x_row_stride;
+        const int64_t y_off = row * y_row_stride;
+        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
 
         const float inv_n = 1.0f / static_cast<float>(dims.norm_size);
         const float mean_val = sum * inv_n;
@@ -296,11 +300,11 @@ void layer_norm_impl(const NormAttributes& attrs,
 
         if (has_bias && b_ptr) {
             kernel::norm_apply_row<T, true, true, true>(
-                x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+                x_ptr + x_off, y_ptr + y_off, dims.norm_size,
                 mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to);
         } else {
             kernel::norm_apply_row<T, true, true, false>(
-                x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+                x_ptr + x_off, y_ptr + y_off, dims.norm_size,
                 mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to);
         }
     };
@@ -317,21 +321,22 @@ void rms_norm_general_scalar(
     const T* x_ptr, const T* s_ptr,
     T* y_ptr,
     int64_t num_rows, int64_t norm_size,
-    int64_t axis, const TensorView& X, const TensorView& scale,
+    int64_t axis, const TensorView& X, const TensorView& Y,
+    const TensorView& scale,
     float epsilon, bool add_to,
     const ComputeContext& ctx)
 {
     const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
-    const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
+    const auto y_inner_offsets = compute_inner_offsets(Y, axis, norm_size);
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
-        const int64_t row_base = row * outer_stride;
+        const int64_t x_base = outer_base(X, row, axis);
+        const int64_t y_base = outer_base(Y, row, axis);
 
         float sum_sq = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
-            float x = s_load(&x_ptr[off]);
+            float x = s_load(&x_ptr[x_base + inner_offsets[static_cast<size_t>(i)]]);
             sum_sq += x * x;
         }
 
@@ -339,11 +344,12 @@ void rms_norm_general_scalar(
         const float inv_rms = 1.0f / rms;
 
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
+            const int64_t x_off = x_base + inner_offsets[static_cast<size_t>(i)];
+            const int64_t y_off = y_base + y_inner_offsets[static_cast<size_t>(i)];
             int64_t s_idx = scale_is_scalar ? 0 : i;
             float s = s_load(&s_ptr[s_idx]);
-            float val = s_load(&x_ptr[off]) * inv_rms * s;
-            s_store_add(&y_ptr[off], val, add_to);
+            float val = s_load(&x_ptr[x_off]) * inv_rms * s;
+            s_store_add(&y_ptr[y_off], val, add_to);
         }
     };
 
@@ -371,21 +377,23 @@ void rms_norm_impl(const NormAttributes& attrs,
     if (!dims.is_contiguous_tail) {
         rms_norm_general_scalar<T>(
             x_ptr, s_ptr, y_ptr,
-            dims.num_rows, dims.norm_size, dims.axis, X, scale,
+            dims.num_rows, dims.norm_size, dims.axis, X, output, scale,
             epsilon, add_to, ctx);
         return;
     }
 
     const int64_t x_row_stride = X.row_stride_elems();
+    const int64_t y_row_stride = output.row_stride_elems();
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
-        const int64_t row_off = row * x_row_stride;
-        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, dims.norm_size);
+        const int64_t x_off = row * x_row_stride;
+        const int64_t y_off = row * y_row_stride;
+        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
         (void)sum;
         const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(dims.norm_size) + epsilon);
         kernel::norm_apply_row<T, false, true, false>(
-            x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+            x_ptr + x_off, y_ptr + y_off, dims.norm_size,
             0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
     };
 
@@ -400,20 +408,20 @@ template <typename T>
 void l2_norm_general_scalar(
     const T* x_ptr, T* y_ptr,
     int64_t num_rows, int64_t norm_size,
-    int64_t axis, const TensorView& X,
+    int64_t axis, const TensorView& X, const TensorView& Y,
     float epsilon, bool add_to,
     const ComputeContext& ctx)
 {
     const auto inner_offsets = compute_inner_offsets(X, axis, norm_size);
-    const int64_t outer_stride = (axis > 0) ? X.stride_elems(axis - 1) : 0;
+    const auto y_inner_offsets = compute_inner_offsets(Y, axis, norm_size);
 
     const auto process_row = [&](int64_t row) {
-        const int64_t row_base = row * outer_stride;
+        const int64_t x_base = outer_base(X, row, axis);
+        const int64_t y_base = outer_base(Y, row, axis);
 
         float sum_sq = 0.0f;
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
-            float x = s_load(&x_ptr[off]);
+            float x = s_load(&x_ptr[x_base + inner_offsets[static_cast<size_t>(i)]]);
             sum_sq += x * x;
         }
 
@@ -421,9 +429,10 @@ void l2_norm_general_scalar(
         const float inv_norm = 1.0f / norm_val;
 
         for (int64_t i = 0; i < norm_size; ++i) {
-            int64_t off = row_base + inner_offsets[static_cast<size_t>(i)];
-            float val = s_load(&x_ptr[off]) * inv_norm;
-            s_store_add(&y_ptr[off], val, add_to);
+            const int64_t x_off = x_base + inner_offsets[static_cast<size_t>(i)];
+            const int64_t y_off = y_base + y_inner_offsets[static_cast<size_t>(i)];
+            float val = s_load(&x_ptr[x_off]) * inv_norm;
+            s_store_add(&y_ptr[y_off], val, add_to);
         }
     };
 
@@ -449,20 +458,22 @@ void l2_norm_impl(const NormAttributes& attrs,
     if (!dims.is_contiguous_tail) {
         l2_norm_general_scalar<T>(
             x_ptr, y_ptr,
-            dims.num_rows, dims.norm_size, dims.axis, X,
+            dims.num_rows, dims.norm_size, dims.axis, X, output,
             epsilon, add_to, ctx);
         return;
     }
 
     const int64_t x_row_stride = X.row_stride_elems();
+    const int64_t y_row_stride = output.row_stride_elems();
 
     const auto process_row = [&](int64_t row) {
-        const int64_t row_off = row * x_row_stride;
-        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + row_off, dims.norm_size);
+        const int64_t x_off = row * x_row_stride;
+        const int64_t y_off = row * y_row_stride;
+        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
         (void)sum;
         const float inv_norm = 1.0f / std::sqrt(sum_sq + epsilon);
         kernel::norm_apply_row<T, false, false, false>(
-            x_ptr + row_off, y_ptr + row_off, dims.norm_size,
+            x_ptr + x_off, y_ptr + y_off, dims.norm_size,
             0.0f, inv_norm, nullptr, nullptr, false, add_to);
     };
 
@@ -511,6 +522,53 @@ void group_norm_impl(const NormAttributes& attrs,
     const auto* s_ptr  = scale.ptr<T>();
     const auto* b_ptr  = (has_bias && !inputs[2].is_empty()) ? inputs[2].ptr<T>() : nullptr;
     auto* y_ptr = output.ptr<T>();
+    const bool add_to = attrs.add_to;
+
+    if (is_channel_last(X.layout())) {
+        // Channels are contiguous inside each pixel, so a group is
+        // channels_per_group consecutive elements at every spatial offset.
+        const auto x_sp = build_offsets(X, 2, rank - 1, spatial_size);
+        const auto y_sp = build_offsets(output, 2, rank - 1, spatial_size);
+        const int64_t x_n = X.stride_elems(0);
+        const int64_t y_n = output.stride_elems(0);
+
+        const auto process_group = [&](int64_t ng) {
+            const int64_t n = ng / G;
+            const int64_t g = ng % G;
+            const int64_t c_start = g * channels_per_group;
+
+            float sum = 0.0f;
+            float sum_sq = 0.0f;
+            for (int64_t p = 0; p < spatial_size; ++p) {
+                const int64_t base = x_n * n + x_sp[static_cast<size_t>(p)] + c_start;
+                for (int64_t k = 0; k < channels_per_group; ++k) {
+                    const float v = s_load(&x_ptr[base + k]);
+                    sum += v;
+                    sum_sq += v * v;
+                }
+            }
+
+            const float mean_val = sum * inv_norm;
+            float var_val = sum_sq * inv_norm - mean_val * mean_val;
+            if (var_val < 0.0f) { var_val = 0.0f; }
+            const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
+
+            for (int64_t p = 0; p < spatial_size; ++p) {
+                const int64_t xo = x_n * n + x_sp[static_cast<size_t>(p)] + c_start;
+                const int64_t yo = y_n * n + y_sp[static_cast<size_t>(p)] + c_start;
+                for (int64_t k = 0; k < channels_per_group; ++k) {
+                    const int64_t c_global = c_start + k;
+                    const float s = s_load(&s_ptr[c_global]);
+                    const float b = (has_bias && b_ptr) ? s_load(&b_ptr[c_global]) : 0.0f;
+                    const float val = (s_load(&x_ptr[xo + k]) - mean_val) * inv_std * s + b;
+                    s_store_add(&y_ptr[yo + k], val, add_to);
+                }
+            }
+        };
+
+        ctx.cpu.run(0, N * G, process_group);
+        return;
+    }
 
     const int64_t stride_N = X.stride_elems(0);
     const int64_t stride_C = X.stride_elems(1);
@@ -518,7 +576,6 @@ void group_norm_impl(const NormAttributes& attrs,
 
     const int64_t total_groups = N * G;
     const int64_t total_rows_per_group = channels_per_group * rows_per_channel;
-    const bool add_to = attrs.add_to;
 
     const auto process_group = [&](int64_t ng) {
         const int64_t n = ng / G;
@@ -731,7 +788,6 @@ Status norm_quant_impl(const NormAttributes& attrs,
     // Quant params live on the view, so descriptor-only validate() cannot see
     // them; check them here, before anything is dereferenced.
     if (!X.is_quantized()) { return Status::invalid_argument; }
-    if (X.channel_pack_size() != 1) { return Status::unsupported; }
 
     const auto& x_qp = X.quant_params();
     if (x_qp.granularity != QuantGranularity::PerTensor &&

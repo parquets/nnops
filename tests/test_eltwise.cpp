@@ -22,6 +22,7 @@
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 
 #include <vector>
 #include <cmath>
@@ -725,4 +726,187 @@ NNOPS_TEST(eltwise_quant_per_tensor_add_u8) {
     NNOPS_EXPECT_EQ(out_buf[0], 128);
     NNOPS_EXPECT_EQ(out_buf[1], 131);
     NNOPS_EXPECT_EQ(out_buf[2], 134);
+}
+
+// ============================================================
+// NumPy broadcasting — the inputs' shapes are right-aligned and a size-1 axis
+// (or a missing axis) repeats. The planar and channel-last paths share the
+// odometer, so the layout only changes the strides.
+// ============================================================
+
+NNOPS_TEST(eltwise_broadcast_scalar) {
+    auto [a_vec, a] = test::make_random_tensor({2, 3, 4}, -2.0f, 2.0f);
+    const int64_t b_shape[] = {1};
+    float b_data[] = {2.5f};
+    TensorView b(b_shape, DataType::f32, b_data);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Mul;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc descs_in[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(descs_in);
+    NNOPS_EXPECT_TRUE(descs[0].rank == 3 && descs[0].dims[0] == 2 &&
+                      descs[0].dims[1] == 3 && descs[0].dims[2] == 4);
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (size_t i = 0; i < a_vec.size(); ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[i], a_vec[i] * 2.5f, 1e-5f);
+    }
+}
+
+NNOPS_TEST(eltwise_broadcast_row) {
+    // [3,4] + [1,4]: the second operand repeats down the rows.
+    auto [a_vec, a] = test::make_random_tensor({3, 4}, -2.0f, 2.0f);
+    auto [b_vec, b] = test::make_random_tensor({1, 4}, -2.0f, 2.0f);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Add;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc descs_in[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(descs_in);
+    NNOPS_EXPECT_TRUE(descs[0].rank == 2 && descs[0].dims[0] == 3);
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (int64_t r = 0; r < 3; ++r) {
+        for (int64_t c = 0; c < 4; ++c) {
+            NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(r * 4 + c)],
+                              a_vec[static_cast<size_t>(r * 4 + c)] + b_vec[static_cast<size_t>(c)],
+                              1e-5f);
+        }
+    }
+}
+
+NNOPS_TEST(eltwise_broadcast_column) {
+    // [3,4] - [3,1]: the second operand repeats across the columns.
+    auto [a_vec, a] = test::make_random_tensor({3, 4}, -2.0f, 2.0f);
+    auto [b_vec, b] = test::make_random_tensor({3, 1}, -2.0f, 2.0f);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Sub;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc descs_in[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(descs_in);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (int64_t r = 0; r < 3; ++r) {
+        for (int64_t c = 0; c < 4; ++c) {
+            NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(r * 4 + c)],
+                              a_vec[static_cast<size_t>(r * 4 + c)] - b_vec[static_cast<size_t>(r)],
+                              1e-5f);
+        }
+    }
+}
+
+NNOPS_TEST(eltwise_broadcast_rank_mismatch) {
+    // [4] / [2,3,4]: the rank-1 operand is right-aligned to the last axis.
+    auto [a_vec, a] = test::make_random_tensor({4}, 0.5f, 2.0f);
+    auto [b_vec, b] = test::make_random_tensor({2, 3, 4}, 0.5f, 2.0f);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Div;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc descs_in[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(descs_in);
+    NNOPS_EXPECT_TRUE(descs[0].rank == 3 && descs[0].dims[2] == 4);
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (size_t i = 0; i < b_vec.size(); ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[i], a_vec[i % 4] / b_vec[i], 1e-5f);
+    }
+}
+
+NNOPS_TEST(eltwise_broadcast_add_to) {
+    auto [a_vec, a] = test::make_random_tensor({2, 5}, -2.0f, 2.0f);
+    auto [b_vec, b] = test::make_random_tensor({5}, -2.0f, 2.0f);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Mul;
+    attrs.add_to = true;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc descs_in[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(descs_in);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 1.0f);
+    auto out = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {a, b};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (size_t i = 0; i < a_vec.size(); ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[i], 1.0f + a_vec[i] * b_vec[i % 5], 1e-5f);
+    }
+}
+
+NNOPS_TEST(eltwise_broadcast_nhwc_per_channel) {
+    // [N,C,H,W] logical in NHWC storage, times a [1,C,1,1] per-channel scale.
+    constexpr int64_t N = 2, C = 3, H = 5, W = 4;
+    auto [a_vec, a_planar] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f);
+    auto [s_vec, s] = test::make_random_tensor({1, C, 1, 1}, -2.0f, 2.0f);
+
+    auto a_cl = test::to_channel_last<float>(a_vec, N, C, H * W);
+    const int64_t a_shape[] = {N, C, H, W};
+    TensorView a(a_shape, DataType::f32, a_cl.data(), TensorLayout::NHWC);
+
+    // A [1,C,1,1] tensor is the same bytes in either layout.
+    const int64_t s_shape[] = {1, C, 1, 1};
+    TensorView scale(s_shape, DataType::f32, s_vec.data(), TensorLayout::NHWC);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Mul;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc descs_in[] = {a.desc(), scale.desc()};
+    auto descs = op->getOutputTensorDesc(descs_in);
+    NNOPS_EXPECT_TRUE(descs[0].layout == TensorLayout::NHWC);
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    TensorView out(a_shape, DataType::f32, out_buf.data(), TensorLayout::NHWC);
+
+    const TensorView ins[] = {a, scale};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    const auto got = test::to_channel_first<float>(out_buf, N, C, H * W);
+    for (int64_t i = 0; i < N * C * H * W; ++i) {
+        const int64_t c = (i / (H * W)) % C;
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)],
+                          a_vec[static_cast<size_t>(i)] * s_vec[static_cast<size_t>(c)],
+                          1e-5f);
+    }
+}
+
+NNOPS_TEST(eltwise_broadcast_rejects_incompatible) {
+    TensorDesc a; a.rank = 1; a.dtype = DataType::f32; a.dims.push_back(3);
+    TensorDesc b; b.rank = 1; b.dtype = DataType::f32; b.dims.push_back(4);
+    TensorDesc o; o.rank = 1; o.dtype = DataType::f32; o.dims.push_back(3);
+
+    EltwiseAttributes attrs;
+    attrs.type = EltwiseType::Add;
+    auto op = Eltwise::create(attrs, Backend::CPU);
+
+    const TensorDesc ins[] = {a, b};
+    const TensorDesc outs[] = {o};
+    NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
 }

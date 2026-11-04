@@ -1,12 +1,10 @@
 #pragma once
 /// @file layout_convert.hpp
-/// @brief LayoutConvert operator — pack/unpack between planar and C8-blocked.
+/// @brief LayoutConvert operator — planar ↔ channel-last.
 ///
-/// NCHW ↔ NCHWC8 (2D) and NCDHW ↔ NCDHWC8 (3D). The logical shape is
-/// preserved; only the physical layout changes. On pack the trailing C8 block
-/// is zero-padded when C is not a multiple of 8; unpack drops the pad lanes.
-/// f32, f16, s8 and u8 — on the s8/u8 path the pad lanes take the activation
-/// zero point, so a padded lane dequantizes to zero contribution.
+/// NCHW ↔ NHWC (2D) and NCDHW ↔ NDHWC (3D). The logical shape is preserved;
+/// only the physical layout changes, so the output descriptor is the input's
+/// dimensions with the target layout. f32, f16, s8 and u8.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

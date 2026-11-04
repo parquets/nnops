@@ -21,19 +21,19 @@ namespace {
 
         if (src_layout == dst_layout) { return Status::invalid_argument; }
 
-        // 2D: NCHW ↔ NCHWC8
-        if (src_layout == TensorLayout::NCHW && dst_layout == TensorLayout::NCHWC8) {
-            pack_nchw_to_nchwc8(input, output, ctx);
-        } else if (src_layout == TensorLayout::NCHWC8 && dst_layout == TensorLayout::NCHW) {
-            unpack_nchwc8_to_nchw(input, output, ctx);
-        }
-        // 3D: NCDHW ↔ NCDHWC8
-        else if (src_layout == TensorLayout::NCDHW && dst_layout == TensorLayout::NCDHWC8) {
-            pack_ncdhw_to_ncdhwc8(input, output, ctx);
-        } else if (src_layout == TensorLayout::NCDHWC8 && dst_layout == TensorLayout::NCDHW) {
-            unpack_ncdhwc8_to_ncdhw(input, output, ctx);
-        }
-        else {
+        const bool planar_to_cl =
+            (src_layout == TensorLayout::NCHW && dst_layout == TensorLayout::NHWC) ||
+            (src_layout == TensorLayout::NCDHW && dst_layout == TensorLayout::NDHWC);
+        const bool cl_to_planar =
+            (src_layout == TensorLayout::NHWC && dst_layout == TensorLayout::NCHW) ||
+            (src_layout == TensorLayout::NDHWC && dst_layout == TensorLayout::NCDHW);
+
+        if (planar_to_cl) {
+            convert_planar_to_channel_last(input, output, ctx);
+        } else if (cl_to_planar) {
+            convert_channel_last_to_planar(input, output, ctx);
+        } else {
+            // A weight-prepack tag or a mismatched rank-3 layout.
             return Status::unsupported;
         }
         return Status::ok;

@@ -3,8 +3,9 @@
 /// @brief Concatenate N tensors along one axis.
 ///
 /// N >= 2. All inputs share rank, dtype and layout; every non-axis dimension
-/// must match, and the output axis dimension is their sum. All layouts
-/// (NCHW / NCDHW / NCHWC8 / NCDHWC8); f32 and f16.
+/// must match, and the output axis dimension is their sum. Layout-agnostic:
+/// planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC) are both walked by logical
+/// axis; f32 and f16.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

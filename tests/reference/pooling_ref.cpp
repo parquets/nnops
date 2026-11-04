@@ -93,6 +93,56 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
     const int64_t K_total = KD * KH * KW;
 
     const auto compute_channel = [&](int64_t n, int64_t c) {
+        // Adaptive: the window bounds move with the output index, so the fixed
+        // kernel/stride walk below does not apply.
+        if (attrs.adaptive()) {
+            const auto ob = [](int64_t o, int64_t in, int64_t out) {
+                return (o * in) / out;
+            };
+            const auto oe = [](int64_t o, int64_t in, int64_t out) {
+                return ((o + 1) * in + out - 1) / out;
+            };
+            for (int64_t od = 0; od < OD; ++od) {
+            const int64_t d0 = ob(od, ID, OD), d1 = oe(od, ID, OD);
+            for (int64_t oh = 0; oh < OH; ++oh) {
+            const int64_t h0 = ob(oh, IH, OH), h1 = oe(oh, IH, OH);
+            for (int64_t ow = 0; ow < OW; ++ow) {
+            const int64_t w0 = ob(ow, IW, OW), w1 = oe(ow, IW, OW);
+                float result;
+                if (attrs.type == PoolingType::Max) {
+                    float max_val = -std::numeric_limits<float>::infinity();
+                    for (int64_t id = d0; id < d1; ++id) {
+                    for (int64_t ih = h0; ih < h1; ++ih) {
+                    for (int64_t iw = w0; iw < w1; ++iw) {
+                        const int64_t in_idx = nchw_offset(
+                            n, c, id, ih, iw, C, ID, IH, in_row_stride);
+                        max_val = std::max(max_val, s_load(&in_ptr[in_idx]));
+                    }}}
+                    result = max_val;
+                } else {
+                    float sum = 0.0f;
+                    for (int64_t id = d0; id < d1; ++id) {
+                    for (int64_t ih = h0; ih < h1; ++ih) {
+                    for (int64_t iw = w0; iw < w1; ++iw) {
+                        const int64_t in_idx = nchw_offset(
+                            n, c, id, ih, iw, C, ID, IH, in_row_stride);
+                        sum += s_load(&in_ptr[in_idx]);
+                    }}}
+                    result = sum / static_cast<float>((d1 - d0) * (h1 - h0) *
+                                                      (w1 - w0));
+                }
+                const int64_t out_idx = nchw_offset(
+                    n, c, od, oh, ow, C, OD, OH, out_row_stride);
+                if (attrs.add_to) {
+                    s_store(&out_ptr[out_idx],
+                            s_load(&out_ptr[out_idx]) + result);
+                } else {
+                    s_store(&out_ptr[out_idx], result);
+                }
+            }}}
+            return;
+        }
+
         for (int64_t od = 0; od < OD; ++od) {
         for (int64_t oh = 0; oh < OH; ++oh) {
         for (int64_t ow = 0; ow < OW; ++ow) {

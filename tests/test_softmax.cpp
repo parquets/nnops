@@ -404,7 +404,7 @@ NNOPS_TEST(softmax_planar_pitched_rows) {
     }
 }
 
-NNOPS_TEST(softmax_rejects_channel_packed) {
+NNOPS_TEST(softmax_rejects_weight_tags) {
     auto op = Softmax::create(Backend::CPU);
 
     const int64_t shape[] = {4, 128, 32};
@@ -412,7 +412,7 @@ NNOPS_TEST(softmax_rejects_channel_packed) {
     in_desc.dims = std::span<const int64_t>(shape, 3);
     in_desc.rank = 3;
     in_desc.dtype = DataType::f32;
-    in_desc.layout = TensorLayout::NCHWC8;
+    in_desc.layout = TensorLayout::PackedOIHW;
     const TensorDesc out_desc = in_desc;
 
     const TensorDesc ins[] = {in_desc};

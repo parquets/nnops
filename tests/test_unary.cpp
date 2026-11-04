@@ -558,3 +558,99 @@ NNOPS_TEST(unary_quant_per_tensor_s8_exp) {
     NNOPS_EXPECT_EQ(out_buf[2], 7);
 }
 
+
+// ============================================================
+// Graph-support set — exp2/log2/log10, the inverse trig and hyperbolic
+// functions, and erfc. Each case pins the vector body and the scalar tail.
+// ============================================================
+
+template <class F>
+static void check_unary_f32(UnaryType type, const std::vector<float>& xs,
+                            F&& ref, float tol = 1e-5f)
+{
+    std::vector<float> in_data = xs;
+    const int64_t shape[] = {static_cast<int64_t>(xs.size())};
+    TensorView input(shape, DataType::f32, in_data.data());
+
+    UnaryAttributes attrs;
+    attrs.type = type;
+    auto op = Unary::create(attrs, Backend::CPU);
+
+    const TensorDesc in_arr[] = {input.desc()};
+    auto descs = op->getOutputTensorDesc(in_arr);
+    NNOPS_EXPECT_EQ(descs[0].numel(), static_cast<int64_t>(xs.size()));
+
+    std::vector<float> out_buf(xs.size());
+    auto output = test::make_planar(descs[0], out_buf.data());
+
+    const TensorView ins[] = {input};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(output, ins)));
+
+    for (size_t i = 0; i < xs.size(); ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[i], ref(xs[i]), tol);
+    }
+}
+
+NNOPS_TEST(unary_exp2) {
+    check_unary_f32(UnaryType::Exp2, {-2.0f, -0.5f, 0.0f, 1.0f, 3.5f, 10.0f},
+                    [](float x) { return std::exp2(x); });
+}
+
+NNOPS_TEST(unary_log2) {
+    check_unary_f32(UnaryType::Log2, {0.25f, 0.5f, 1.0f, 2.0f, 8.0f, 1024.0f},
+                    [](float x) { return std::log2(x); });
+}
+
+NNOPS_TEST(unary_log10) {
+    check_unary_f32(UnaryType::Log10, {0.001f, 0.1f, 1.0f, 10.0f, 1000.0f},
+                    [](float x) { return std::log10(x); });
+}
+
+NNOPS_TEST(unary_asin_acos_atan) {
+    check_unary_f32(UnaryType::Asin, {-0.9f, -0.3f, 0.0f, 0.5f, 1.0f},
+                    [](float x) { return std::asin(x); });
+    check_unary_f32(UnaryType::Acos, {-0.9f, -0.3f, 0.0f, 0.5f, 1.0f},
+                    [](float x) { return std::acos(x); });
+    check_unary_f32(UnaryType::Atan, {-3.0f, -1.0f, 0.0f, 1.0f, 3.0f},
+                    [](float x) { return std::atan(x); });
+}
+
+NNOPS_TEST(unary_sinh_cosh) {
+    check_unary_f32(UnaryType::Sinh, {-2.0f, -0.5f, 0.0f, 0.5f, 2.0f},
+                    [](float x) { return std::sinh(x); });
+    check_unary_f32(UnaryType::Cosh, {-2.0f, -0.5f, 0.0f, 0.5f, 2.0f},
+                    [](float x) { return std::cosh(x); });
+}
+
+NNOPS_TEST(unary_asinh_acosh_atanh) {
+    check_unary_f32(UnaryType::Asinh, {-3.0f, -1.0f, 0.0f, 1.0f, 3.0f},
+                    [](float x) { return std::asinh(x); });
+    check_unary_f32(UnaryType::Acosh, {1.0f, 1.5f, 2.0f, 10.0f},
+                    [](float x) { return std::acosh(x); });
+    check_unary_f32(UnaryType::Atanh, {-0.9f, -0.5f, 0.0f, 0.5f, 0.9f},
+                    [](float x) { return std::atanh(x); });
+}
+
+NNOPS_TEST(unary_erfc) {
+    check_unary_f32(UnaryType::Erfc, {-2.0f, -0.5f, 0.0f, 0.5f, 2.0f},
+                    [](float x) { return std::erfc(x); });
+}
+
+NNOPS_TEST(unary_new_types_random_sweep) {
+    // A width that is not a multiple of the lane count, so the scalar tail runs
+    // after the vector body.
+    std::vector<float> pos(257);
+    for (size_t i = 0; i < pos.size(); ++i) {
+        pos[i] = 0.05f + 3.0f * static_cast<float>(i) / 256.0f;
+    }
+    check_unary_f32(UnaryType::Log2,  pos, [](float x) { return std::log2(x); }, 1e-4f);
+    check_unary_f32(UnaryType::Log10, pos, [](float x) { return std::log10(x); }, 1e-4f);
+    check_unary_f32(UnaryType::Exp2,  pos, [](float x) { return std::exp2(x); }, 1e-4f);
+
+    std::vector<float> unit(257);
+    for (size_t i = 0; i < unit.size(); ++i) {
+        unit[i] = -0.99f + 1.98f * static_cast<float>(i) / 256.0f;
+    }
+    check_unary_f32(UnaryType::Atanh, unit, [](float x) { return std::atanh(x); }, 1e-4f);
+    check_unary_f32(UnaryType::Erfc,  unit, [](float x) { return std::erfc(x); }, 1e-4f);
+}

@@ -1,16 +1,17 @@
 /// @file reduce.cpp
 /// @brief SIMD-optimized CPU implementation of the Reduce operator.
 ///
-/// f32 and f16; planar (NCHW/NCDHW) and channel-packed (NCHWC8/NCDHWC8)
-/// layouts. Pitch-aware via stride_elems() / row_stride_elems().
+/// f32 and f16; planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC) layouts.
+/// The reduction is driven by the logical axis; stride_elems() turns it into
+/// physical offsets, so the same axis means the same thing in either layout.
 ///
-/// Dispatch, in order:
-///   1.  axis==rank-1, pack>1   -> kernel::reduce_process_packed_row
-///   1b. axis==1,      pack>1   -> kernel::reduce_process_packed_channel
-///   1c. other axis,   pack>1   -> kernel::reduce_process_packed_col
-///   2.  axis==rank-1, pack==1  -> kernel::reduce_process_contiguous_row
-///   3.  inner-contiguous, pack==1 -> kernel::reduce_process_inner_contiguous_block
-///   4.  general                   -> scalar strided walk over (outer x inner)
+/// Planar dispatch, in order:
+///   1. axis==rank-1            -> kernel::reduce_process_contiguous_row
+///   2. inner-contiguous        -> kernel::reduce_process_inner_contiguous_block
+///   3. general                 -> scalar strided walk over (outer x inner)
+///
+/// Channel-last: axis==1 (C) is the contiguous case and runs one row reduction
+/// per spatial position; every other axis walks the strided reduce axis.
 
 #include "nnops/ops/reduce.hpp"
 #include "nnops/detail/assert.hpp"
@@ -30,30 +31,82 @@ using namespace nnops::simd;
 namespace {
 
 template <typename T>
-void reduce_packed_simd(const ReduceAttributes& attrs,
+void reduce_channel_last(const ReduceAttributes& attrs,
                          TensorView& output,
                          const TensorView& input,
                          int64_t axis,
                          const ComputeContext& ctx)
 {
     const int64_t rank = input.rank();
-    NNOPS_ASSERT(axis == rank - 1);
-
-    const int64_t pack = input.channel_pack_size();
+    const int64_t rank_out = output.rank();
     const int64_t D = input.shape(axis);
-    const int64_t num_rows = input.total_rows();
-    const int64_t x_rs = input.row_stride_elems();
+    const int64_t axis_stride = input.stride_elems(axis);
+    const bool keepdims = attrs.keepdims;
+
+    int64_t num_positions = 1;
+    for (int64_t d = 0; d < rank; ++d) {
+        if (d != axis) { num_positions *= input.shape(d); }
+    }
 
     const T* x_ptr = input.ptr<T>();
     T* y_ptr = output.ptr<T>();
     const float inv_D = 1.0f / static_cast<float>(D);
 
-    const auto process_row = [&](int64_t r) {
-        kernel::reduce_process_packed_row<T>(
-            x_ptr + r * x_rs, y_ptr + r * pack, D, pack, attrs.type, inv_D);
-    };
+    // axis==1 is C: contiguous in every channel-last tensor.
+    if (axis == 1) {
+        const auto process_pos = [&](int64_t s) {
+            const int64_t in_off =
+                decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/1);
+            const int64_t out_off = decompose_flat_offset(
+                s, output, 0, rank_out - 1, keepdims ? 1 : -1);
+            float result = 0.0f;
+            kernel::reduce_process_contiguous_row<T>(
+                x_ptr + in_off, &result, D, attrs.type);
+            s_store(&y_ptr[out_off], result);
+        };
+        ctx.cpu.run(0, num_positions, process_pos);
+        return;
+    }
 
-    ctx.cpu.run(0, num_rows, process_row);
+    const auto process_pos = [&](int64_t s) {
+        const int64_t in_off =
+            decompose_flat_offset(s, input, 0, rank - 1, axis);
+        const int64_t out_off = decompose_flat_offset(
+            s, output, 0, rank_out - 1, keepdims ? axis : -1);
+
+        switch (attrs.type) {
+        case ReduceType::Sum:
+        case ReduceType::Mean: {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < D; ++k) {
+                sum += s_load(&x_ptr[in_off + k * axis_stride]);
+            }
+            const float result =
+                (attrs.type == ReduceType::Mean) ? sum * inv_D : sum;
+            s_store(&y_ptr[out_off], result);
+            break;
+        }
+        case ReduceType::Max: {
+            float best = -std::numeric_limits<float>::infinity();
+            for (int64_t k = 0; k < D; ++k) {
+                const float xv = s_load(&x_ptr[in_off + k * axis_stride]);
+                if (xv > best) { best = xv; }
+            }
+            s_store(&y_ptr[out_off], best);
+            break;
+        }
+        case ReduceType::Min: {
+            float best = std::numeric_limits<float>::infinity();
+            for (int64_t k = 0; k < D; ++k) {
+                const float xv = s_load(&x_ptr[in_off + k * axis_stride]);
+                if (xv < best) { best = xv; }
+            }
+            s_store(&y_ptr[out_off], best);
+            break;
+        }
+        }
+    };
+    ctx.cpu.run(0, num_positions, process_pos);
 }
 
 template <typename T>
@@ -245,76 +298,8 @@ void reduce_impl(const ReduceAttributes& attrs,
     if (axis < 0) { axis += rank; }
     NNOPS_ASSERT(axis >= 0 && axis < rank);
 
-    const int64_t pack = input.channel_pack_size();
-
-    if (axis == rank - 1 && pack > 1) {
-        reduce_packed_simd<T>(attrs, output, input, axis, ctx);
-        return;
-    }
-
-    if (axis == 1 && pack > 1) {
-        const int64_t C = input.shape(1);                // logical channel count
-        const int64_t C8 = input.num_channel_blocks();   // ceil(C / pack)
-        const int64_t chan_stride = input.stride_elems(1);
-        const int64_t valid_lanes = (C % pack == 0) ? pack : (C % pack);
-        const float inv_total = 1.0f / static_cast<float>(C);
-
-        const T* x_ptr = input.ptr<T>();
-        T* y_ptr = output.ptr<T>();
-
-        int64_t num_spatial = 1;
-        for (int64_t d = 0; d < rank; ++d) {
-            if (d != 1) {
-                num_spatial *= input.shape(d);
-            }
-        }
-
-        const int64_t rank_out = output.rank();
-        const bool keepdims = attrs.keepdims;
-
-        const auto process_pos = [&](int64_t s) {
-            const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/1);
-            const int64_t out_off = decompose_flat_offset(s, output, 0, rank_out - 1,
-                                                          keepdims ? 1 : -1);
-            kernel::reduce_process_packed_channel<T>(
-                x_ptr + in_off, y_ptr + out_off,
-                chan_stride, C8, pack, valid_lanes, attrs.type, inv_total);
-        };
-
-        ctx.cpu.run(0, num_spatial, process_pos);
-
-        return;
-    }
-
-    if (pack > 1) {
-        const int64_t D = input.shape(axis);
-        const int64_t axis_stride = input.stride_elems(axis);
-        const float inv_D = 1.0f / static_cast<float>(D);
-
-        const T* x_ptr = input.ptr<T>();
-        T* y_ptr = output.ptr<T>();
-
-        int64_t num_positions = 1;
-        for (int64_t d = 0; d < rank; ++d) {
-            if (d != axis) {
-                num_positions *= input.shape(d);
-            }
-        }
-
-        const int64_t rank_out = output.rank();
-        const bool keepdims = attrs.keepdims;
-
-        const auto process_pos = [&](int64_t s) {
-            const int64_t in_off = decompose_flat_offset(s, input, 0, rank - 1, /*skip_dim=*/axis);
-            const int64_t out_off = decompose_flat_offset(s, output, 0, rank_out - 1,
-                                                          keepdims ? axis : -1);
-            kernel::reduce_process_packed_col<T>(
-                x_ptr + in_off, y_ptr + out_off,
-                axis_stride, D, pack, attrs.type, inv_D);
-        };
-
-        ctx.cpu.run(0, num_positions, process_pos);
-
+    if (is_channel_last(input.layout())) {
+        reduce_channel_last<T>(attrs, output, input, axis, ctx);
         return;
     }
 
@@ -331,8 +316,7 @@ void reduce_impl(const ReduceAttributes& attrs,
     int64_t num_inner = 1;
     for (int64_t d = axis + 1; d < rank; ++d) { num_inner *= input.shape(d); }
 
-    const bool input_inner_contiguous = (pack == 1) &&
-        (input.stride_elems(axis) == num_inner);
+    const bool input_inner_contiguous = (input.stride_elems(axis) == num_inner);
     const bool output_inner_contiguous = (output.rank() <= 1) ||
         (output.row_stride_elems() == output.shape(output.rank() - 1));
 

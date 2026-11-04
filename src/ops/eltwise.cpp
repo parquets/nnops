@@ -18,13 +18,27 @@ NNOPS_OP_BOILERPLATE(Eltwise, EltwiseAttributes,
 std::vector<TensorDesc> Eltwise::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return {identity_output_shape(inputs)};
+    return broadcast_binary_output_shape(inputs);
 }
 
 Status Eltwise::validate(std::span<const TensorDesc> inputs,
                          std::span<const TensorDesc> outputs) const
 {
-    return detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1);
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 2, 1));
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+
+    if (a.dtype != b.dtype || outputs[0].dtype != a.dtype) {
+        return Status::invalid_argument;
+    }
+    // A packed or prepacked tag describes a filter, never an activation.
+    if (!(is_planar_spatial(a.layout) || is_channel_last(a.layout)) ||
+        !(is_planar_spatial(b.layout) || is_channel_last(b.layout))) {
+        return Status::invalid_argument;
+    }
+    return detail::require(broadcast_compatible(
+        std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
+        std::span<const int64_t>(b.dims.data(), static_cast<size_t>(b.rank))));
 }
 
 Status Eltwise::compute(std::span<TensorView> outputs,

@@ -55,7 +55,7 @@ inline void run_parallel(const ComputeContext& ctx, int64_t count,
 
 /// Row-major view of a pitch-aware tensor, with input/output row strides.
 struct RowGeometry {
-    int64_t last_dim;   ///< elements per row (already includes channel packing)
+    int64_t last_dim;   ///< elements per row (channel-last includes all C)
     int64_t num_rows;   ///< number of logical rows
     int64_t in_stride;  ///< input row stride (elements)
     int64_t out_stride; ///< output row stride (elements)
@@ -69,7 +69,7 @@ inline RowGeometry rowwise_geometry(const TensorView& input, const TensorView& o
     if (rank >= 1) {
         last_dim = (rank >= 3 && is_channel_last(input.layout()))
                        ? input.shape(1) * input.shape(rank - 1)
-                       : input.shape(rank - 1) * input.channel_pack_size();
+                       : input.shape(rank - 1);
     }
     const int64_t num_rows = (rank >= 2) ? input.total_rows() : total / last_dim;
     return { last_dim, num_rows, input.row_stride_elems(), output.row_stride_elems() };

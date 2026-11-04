@@ -1,10 +1,11 @@
 #pragma once
 /// @file grid_sample.hpp
-/// @brief GridSample operator — 2D/3D sampling at grid points, packed
-///        NCHWC8/NCDHWC8 layout only.
+/// @brief GridSample operator — 2D/3D sampling at grid points.
 ///
-/// The grid holds normalized coordinates in [-1, 1]: -1 is the outer
-/// left/top/front border and 1 the right/bottom/back one. f32/f16 only.
+/// The image tensor is NCHW/NCDHW or NHWC/NDHWC; the output carries its layout.
+/// The grid is a dense f32 tensor of normalized coordinates in [-1, 1]: -1 is
+/// the outer left/top/front border and 1 the right/bottom/back one. f32/f16
+/// images only.
 ///
 /// 2D: Input [N, C, IH, IW], Grid [N, OH, OW, 2] → Output [N, C, OH, OW]
 /// 3D: Input [N, C, ID, IH, IW], Grid [N, OD, OH, OW, 3] → Output [N, C, OD, OH, OW]
@@ -72,7 +73,9 @@ public:
 
     OpType  getOpType()  const override { return OpType::GridSample; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override {
+        return LayoutSupport::PlanarOrChannelLast;
+    }
 
     const GridSampleAttributes& attributes() const noexcept { return attrs_; }
 

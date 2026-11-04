@@ -16,8 +16,8 @@
 ///
 /// TensorDesc::row_pitch() aligns rows to 32 bytes by default; a TensorView
 /// built with an explicit pitch accepts any value >= the minimum.
-///   NCHW uint8,   W=70: pitch = 96  (70 rounded up to a multiple of 32)
-///   NCHWC8 uint8, W=7:  pitch = 64  (7*8 = 56 rounded up to a multiple of 32)
+///   NCHW uint8,  W=70:  pitch = 96  (70 rounded up to a multiple of 32)
+///   NHWC uint8, W*C=56: pitch = 64  (56 rounded up to a multiple of 32)
 
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_layout.hpp"
@@ -45,21 +45,14 @@ struct TensorDesc {
     /// consumers must treat as compact.
     int64_t row_stride_elems = 0;
 
-    /// Storage element count: C rounded up to whole channel blocks.
+    /// Logical element count (product of dims).
     int64_t numel() const noexcept {
         if (rank == 0) {
             return 1; // scalar = 1 element
         }
         int64_t n = 1;
         for (int64_t i = 0; i < rank; ++i) {
-            int64_t d = dims[static_cast<size_t>(i)];
-            if (i == 1) {
-                int64_t pack = layout_channel_pack(layout);
-                if (pack > 1) {
-                    d = ((d + pack - 1) / pack) * pack;
-                }
-            }
-            n *= d;
+            n *= dims[static_cast<size_t>(i)];
         }
         return n;
     }
@@ -84,16 +77,11 @@ struct TensorDesc {
         if (rank < 2) {
             return static_cast<int64_t>(data_type_stride_unit(dtype));
         }
-        int64_t row_bytes;
-        if (is_channel_last(layout)) {
-            const int64_t W = dims[static_cast<size_t>(rank - 1)];
-            const int64_t C = dims[1];
-            row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W * C));
-        } else {
-            const int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
-            const int64_t W = dims[static_cast<size_t>(rank - 1)];
-            row_bytes = static_cast<int64_t>(data_type_row_bytes(dtype, W)) * pack;
-        }
+        const int64_t row_elems = is_channel_last(layout)
+            ? dims[1] * dims[static_cast<size_t>(rank - 1)]
+            : dims[static_cast<size_t>(rank - 1)];
+        const int64_t row_bytes =
+            static_cast<int64_t>(data_type_row_bytes(dtype, row_elems));
         return ((row_bytes + alignment - 1) / alignment) * alignment;
     }
 
@@ -108,8 +96,7 @@ struct TensorDesc {
         // its own; at rank 2 it *is* the last dim, which row_pitch already
         // covers, so counting it here sizes the tensor by another factor of W.
         if (!is_channel_last(layout) && rank > 2) {
-            const int64_t pack = std::max<int64_t>(1, layout_channel_pack(layout));
-            rows *= ((dims[1] + pack - 1) / pack);
+            rows *= dims[1];
         }
         for (int64_t d = 2; d < rank - 1; ++d) {
             rows *= dims[static_cast<size_t>(d)];
@@ -157,13 +144,12 @@ public:
         NNOPS_ASSERT(shape.size() <= kMaxRank);
         rank_ = static_cast<int64_t>(shape.size());
         shape_ = shape;
-        const int64_t pack = layout_channel_pack(layout);
         if (rank_ >= 2) {
             const int64_t row_elems = is_channel_last(layout)
                 ? shape_[1] * shape_[static_cast<size_t>(rank_ - 1)]
                 : shape_[static_cast<size_t>(rank_ - 1)];
             const int64_t min_pitch =
-                static_cast<int64_t>(data_type_row_bytes(dtype, row_elems)) * pack;
+                static_cast<int64_t>(data_type_row_bytes(dtype, row_elems));
             NNOPS_ASSERT(pitch_ >= min_pitch);
         }
     }
@@ -256,35 +242,33 @@ public:
     // ---- Derived stride helpers (element counts, not bytes) ----
 
     /// Element stride for one step in `dim` (element counts, not bytes).
-    /// The innermost dim steps a whole channel lane (channel_pack_size()); the
-    /// second-innermost comes from pitch, so it may exceed shape[rank-1].
+    /// The innermost dim steps one element; the second-innermost comes from
+    /// pitch, so it may exceed shape[rank-1].
     int64_t stride_elems(int64_t dim) const noexcept {
         NNOPS_ASSERT(dim >= 0 && dim < rank_);
         // Channel-last stores [N][spatial…][C]: C (dim 1) is the innermost
-        // axis, a spatial step moves a whole C block.
+        // axis, a spatial step moves a whole C block. A step in H is one row
+        // pitch, so a pitched view's outer strides account for the padding.
         if (is_channel_last(layout_)) {
             if (dim == 1) { return 1; }
-            int64_t s = shape_[1];
-            for (int64_t i = dim + 1; i < rank_; ++i) {
+            if (dim == rank_ - 1) { return shape_[1]; }
+            int64_t s = row_stride_elems();
+            for (int64_t i = rank_ - 2; i > dim; --i) {
+                // C is already inside the row; multiplying by it again would
+                // size a batch step by another factor of C.
                 if (i != 1) { s *= shape_[static_cast<size_t>(i)]; }
             }
             return s;
         }
         if (dim == rank_ - 1) {
-            return channel_pack_size();
+            return 1;
         }
         const int64_t unit = static_cast<int64_t>(data_type_stride_unit(dtype_));
         if (unit <= 0) { return 0; }  // no element/block storage unit (s4/u4)
         int64_t s = pitch_ / unit;
         if (dim == rank_ - 2) { return s; }
-        // Outer dims: shape[i+1] * stride(i+1), except that a channel-packed
-        // C contributes its block count, not its logical size.
         for (int64_t i = rank_ - 3; i >= dim; --i) {
-            int64_t inner_size = shape_[static_cast<size_t>(i + 1)];
-            if (i + 1 == 1 && channel_pack_size() > 1) {
-                inner_size = num_channel_blocks();
-            }
-            s = inner_size * s;
+            s = shape_[static_cast<size_t>(i + 1)] * s;
         }
         return s;
     }
@@ -298,25 +282,14 @@ public:
 
     // ---- Layout-aware accessors ----
 
-    /// 1 for planar, 8/16/32 for NCHWC8/16/32.
-    int64_t channel_pack_size() const noexcept {
-        return layout_channel_pack(layout_);
-    }
-
-    /// ceil(C / pack); planar returns C (each channel is its own block), and
-    /// channel-last or rank < 2 returns 1.
+    /// Channels per contiguously-stored block: planar keeps each channel as
+    /// its own block (C), channel-last packs all of C into every pixel (1
+    /// channel block per spatial position).
     int64_t num_channel_blocks() const noexcept {
         if (rank_ < 2) {
             return 1;
         }
-        if (is_channel_last(layout_)) {
-            return 1;
-        }
-        int64_t pack = channel_pack_size();
-        if (pack <= 1) {
-            return shape_[1];
-        }
-        return (shape_[1] + pack - 1) / pack;
+        return is_channel_last(layout_) ? 1 : shape_[1];
     }
 
     /// Element stride between channel blocks: row_stride_elems() × inner

@@ -33,6 +33,20 @@ enum class UnaryType : uint8_t {
     Floor,  ///< f(x) = floor(x)
     Recip,  ///< f(x) = 1/x
     Sign,   ///< f(x) = sign(x)  (-1, 0, or 1)
+
+    // ---- graph-support set ----
+    Exp2,   ///< f(x) = 2^x
+    Log2,   ///< f(x) = log2(x)
+    Log10,  ///< f(x) = log10(x)
+    Asin,   ///< f(x) = asin(x)
+    Acos,   ///< f(x) = acos(x)
+    Atan,   ///< f(x) = atan(x)
+    Sinh,   ///< f(x) = sinh(x)
+    Cosh,   ///< f(x) = cosh(x)
+    Asinh,  ///< f(x) = asinh(x)
+    Acosh,  ///< f(x) = acosh(x)
+    Atanh,  ///< f(x) = atanh(x)
+    Erfc,   ///< f(x) = erfc(x) = 1 - erf(x)
 };
 
 struct UnaryAttributes {

@@ -837,3 +837,177 @@ NNOPS_TEST(pooling_q_nhwc_global) {
     mx.type = PoolingType::Max;
     pooling_q_nhwc_test<int8_t, int8_t>({2, 11, 9, 13}, mx, qp, qp);
 }
+
+// ============================================================
+// Adaptive pooling — the window of output index o spans
+// [floor(o·I/O), ceil((o+1)·I/O)) on each axis, so a size whose I % O != 0 has
+// no fixed kernel/stride form. The planar reference walks the same bounds.
+// ============================================================
+
+NNOPS_TEST(pooling_adaptive_deterministic) {
+    // 1x1x3x3 → 1x1x2x2: H windows are [0,2) and [1,3); W windows the same.
+    const int64_t shape[] = {1, 1, 3, 3};
+    float data[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    TensorView in(shape, DataType::f32, data, TensorLayout::NCHW);
+
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {0, 2, 2};
+
+    auto op = Pooling::create(attrs);
+    const TensorDesc in_desc[] = {in.desc()};
+    auto out_descs = op->getOutputTensorDesc(in_desc);
+    NNOPS_EXPECT_TRUE(out_descs[0].rank == 4 && out_descs[0].dims[2] == 2 &&
+                      out_descs[0].dims[3] == 2);
+
+    const int64_t oshape[] = {1, 1, 2, 2};
+    float out_buf[4] = {};
+    TensorView out(oshape, DataType::f32, out_buf, TensorLayout::NCHW);
+    const TensorView ins[] = {in};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    // (1,2,4,5)/4, (2,3,5,6)/4, (4,5,7,8)/4, (5,6,8,9)/4
+    const float expected[4] = {3.0f, 4.0f, 6.0f, 7.0f};
+    for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_NEAR(out_buf[i], expected[i], 1e-6f); }
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    auto mx_op = Pooling::create(mx);
+    NNOPS_EXPECT_TRUE(is_ok(mx_op->compute(out, ins)));
+    const float expected_max[4] = {5.0f, 6.0f, 8.0f, 9.0f};
+    for (int i = 0; i < 4; ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[i], expected_max[i], 1e-6f);
+    }
+}
+
+NNOPS_TEST(pooling_adaptive_ones_is_global) {
+    // An all-ones output is the global window; the op routes it to the plane
+    // scan, so the values must match a global request exactly.
+    PoolingAttributes ad;
+    ad.type = PoolingType::Average;
+    ad.output_size = {0, 1, 1};
+
+    PoolingAttributes gl = ad;
+    gl.global = true;
+    gl.output_size = {0, 0, 0};
+
+    for (PoolingAttributes a : {ad, gl}) {
+        auto [in_vec, in] = test::make_random_tensor({2, 3, 7, 9});
+        auto op = Pooling::create(a);
+        const TensorDesc in_desc[] = {in.desc()};
+        auto out_descs = op->getOutputTensorDesc(in_desc);
+        NNOPS_EXPECT_TRUE(out_descs[0].dims[2] == 1 && out_descs[0].dims[3] == 1);
+
+        std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+        auto out = test::make_planar(out_descs[0], out_buf.data());
+        const TensorView ins[] = {in};
+        NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+        // Same plane, same mean.
+        float sum = 0.0f;
+        const float* p = in.ptr<float>();
+        for (int64_t i = 0; i < 7 * 9; ++i) { sum += p[i]; }
+        NNOPS_EXPECT_NEAR(out_buf[0], sum / 63.0f, 1e-4f);
+    }
+}
+
+NNOPS_TEST(pooling_adaptive_planar_shapes) {
+    // Odd input sizes and outputs that do not divide them: 7→3, 9→4, 13→5.
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {0, 3, 4};
+    test_planar_f32({1, 4, 7, 9}, attrs);
+    test_planar_f32({2, 5, 13, 5}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f32({1, 4, 7, 9}, mx);
+    test_planar_f32({2, 3, 11, 6}, mx);
+
+    // A larger output than half the input, so most windows overlap.
+    PoolingAttributes wide;
+    wide.type = PoolingType::Average;
+    wide.output_size = {0, 7, 11};
+    test_planar_f32({1, 3, 8, 12}, wide);
+}
+
+NNOPS_TEST(pooling_adaptive_planar_3d) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {2, 3, 4};
+    test_planar_f32({1, 2, 5, 7, 9}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f32({1, 2, 5, 7, 9}, mx);
+}
+
+NNOPS_TEST(pooling_adaptive_planar_f16) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {0, 3, 4};
+    test_planar_f16({1, 3, 10, 10}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f16({1, 3, 10, 10}, mx);
+}
+
+NNOPS_TEST(pooling_adaptive_add_to) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {0, 3, 5};
+    attrs.add_to = true;
+    test_planar_f32({1, 3, 9, 11}, attrs);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_planar_f32({1, 3, 9, 11}, mx);
+}
+
+NNOPS_TEST(pooling_adaptive_nhwc) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {0, 3, 4};
+    test_nhwc_vs_ref<float>({2, 5, 9, 11}, attrs, 1e-4f);
+
+    PoolingAttributes mx = attrs;
+    mx.type = PoolingType::Max;
+    test_nhwc_vs_ref<float>({2, 11, 7, 13}, mx, 1e-4f);
+}
+
+NNOPS_TEST(pooling_adaptive_nhwc_3d) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Max;
+    attrs.output_size = {2, 2, 3};
+    test_nhwc_vs_ref<float>({1, 4, 5, 6, 7}, attrs, 1e-4f);
+}
+
+NNOPS_TEST(pooling_adaptive_nhwc_f16) {
+    PoolingAttributes attrs;
+    attrs.type = PoolingType::Average;
+    attrs.output_size = {0, 3, 3};
+    test_nhwc_vs_ref<backend::cpu::half>({1, 8, 8, 8}, attrs, 5e-3f);
+}
+
+NNOPS_TEST(pooling_adaptive_rejects_quantized) {
+    TensorDesc in;
+    in.rank   = 4;
+    in.layout = TensorLayout::NHWC;
+    in.dtype  = DataType::s8;
+    for (int64_t d : {1, 4, 8, 8}) { in.dims.push_back(d); }
+
+    TensorDesc out;
+    out.rank   = 4;
+    out.layout = TensorLayout::NHWC;
+    out.dtype  = DataType::s8;
+    for (int64_t d : {1, 4, 3, 3}) { out.dims.push_back(d); }
+
+    PoolingAttributes attrs;
+    attrs.output_size = {0, 3, 3};
+
+    auto op = Pooling::create(attrs);
+    const TensorDesc ins[] = {in};
+    const TensorDesc outs[] = {out};
+    NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::unsupported);
+}

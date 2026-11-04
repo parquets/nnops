@@ -60,6 +60,16 @@ struct PoolingAttributes {
     /// `type` still selects max vs mean.
     bool global = false;
 
+    /// Adaptive pooling: the output's spatial size, [OD, OH, OW] with a 2D
+    /// input reading the last two slots. All zero means the fixed window fields
+    /// decide. The window of output index o spans input
+    /// [floor(o·I/O), ceil((o+1)·I/O)) — PyTorch's AdaptiveAvgPool, which also
+    /// covers the I % O != 0 sizes a fixed kernel/stride cannot express. The
+    /// kernel, stride, padding and dilation fields are not consulted.
+    std::array<int64_t, 3> output_size = {0, 0, 0};
+
+    bool adaptive() const noexcept { return output_size[2] > 0; }
+
     /// 2 for a rank-4 input, 3 for rank-5.
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
         return input_rank - 2;  // N, C + spatial dims

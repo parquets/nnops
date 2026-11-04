@@ -18,6 +18,8 @@
 #include "common/elementwise.hpp"
 #include "common/dtype_dispatch.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace nnops::backend::cpu {
@@ -42,6 +44,86 @@ void apply_eltwise_flt(EltwiseType type, const T* a, const T* b, T* out,
     }
 }
 
+/// True when the two inputs describe exactly the same tensor, which is the
+/// case the tiled SIMD route handles.
+inline bool same_shape(const TensorView& a, const TensorView& b)
+{
+    if (a.rank() != b.rank()) { return false; }
+    for (int64_t d = 0; d < a.rank(); ++d) {
+        if (a.shape(d) != b.shape(d)) { return false; }
+    }
+    return true;
+}
+
+/// Generic NumPy-broadcast loop: one odometer over the output's logical index
+/// space, three running element offsets (a, b, out). Amortized one increment
+/// per element, and no division inside the loop; the strides carry the layout,
+/// so planar and channel-last need no separate code.
+template <typename T, typename F>
+void broadcast_loop(const TensorView& a, const TensorView& b, TensorView& out,
+                    const ComputeContext& ctx, F&& op, bool add_to)
+{
+    const int64_t rank  = out.rank();
+    const int64_t numel = out.numel();
+    if (numel == 0) { return; }
+
+    int64_t dims[8];
+    int64_t as[8], bs[8], os[8];
+    for (int64_t d = 0; d < rank; ++d) {
+        dims[d] = out.shape(d);
+        os[d]   = out.stride_elems(d);
+
+        const int64_t ia = d - (rank - a.rank());
+        as[d] = (ia < 0 || a.shape(ia) == 1) ? 0 : a.stride_elems(ia);
+        const int64_t ib = d - (rank - b.rank());
+        bs[d] = (ib < 0 || b.shape(ib) == 1) ? 0 : b.stride_elems(ib);
+    }
+
+    using simd::s_load;
+    using simd::s_store_add;
+    const T* ap = a.ptr<T>();
+    const T* bp = b.ptr<T>();
+    T*       op_ptr = out.ptr<T>();
+
+    constexpr int64_t kChunk = 1 << 16;
+    const int64_t chunks = (numel + kChunk - 1) / kChunk;
+
+    ctx.cpu.run(0, chunks, [&](int64_t ci) {
+        const int64_t begin = ci * kChunk;
+        const int64_t end   = std::min(begin + kChunk, numel);
+
+        int64_t idx[8] = {};
+        int64_t rem = begin;
+        for (int64_t d = rank - 1; d >= 0; --d) {
+            idx[d] = (dims[d] > 0) ? rem % dims[d] : 0;
+            rem    = (dims[d] > 0) ? rem / dims[d] : 0;
+        }
+        int64_t ao = 0, bo = 0, oo = 0;
+        for (int64_t d = 0; d < rank; ++d) {
+            ao += idx[d] * as[d];
+            bo += idx[d] * bs[d];
+            oo += idx[d] * os[d];
+        }
+
+        for (int64_t n = begin; n < end; ++n) {
+            const float v = op(s_load(&ap[ao]), s_load(&bp[bo]));
+            s_store_add(&op_ptr[oo], v, add_to);
+
+            for (int64_t d = rank - 1; d >= 0; --d) {
+                ++idx[d];
+                ao += as[d];
+                bo += bs[d];
+                oo += os[d];
+                if (idx[d] < dims[d]) { break; }
+                idx[d] = 0;
+                ao -= as[d] * dims[d];
+                bo -= bs[d] * dims[d];
+                oo -= os[d] * dims[d];
+            }
+        }
+    });
+}
+
 }  // anonymous namespace
 
 template <typename T>
@@ -50,12 +132,33 @@ void eltwise_impl(const EltwiseAttributes& attrs,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx)
 {
-    tiled_float_transform2<T>(inputs[0], inputs[1], output, ctx,
-        [&](const T* a, const T* b, T* out, int64_t m, int64_t n,
-            int64_t a_stride, int64_t b_stride, int64_t out_stride) {
-            apply_eltwise_flt<T>(attrs.type, a, b, out, m, n, a_stride, b_stride,
-                                 out_stride, attrs.add_to);
-        });
+    if (same_shape(inputs[0], inputs[1])) {
+        tiled_float_transform2<T>(inputs[0], inputs[1], output, ctx,
+            [&](const T* a, const T* b, T* out, int64_t m, int64_t n,
+                int64_t a_stride, int64_t b_stride, int64_t out_stride) {
+                apply_eltwise_flt<T>(attrs.type, a, b, out, m, n, a_stride, b_stride,
+                                     out_stride, attrs.add_to);
+            });
+        return;
+    }
+
+    const bool add_to = attrs.add_to;
+    switch (attrs.type) {
+    case EltwiseType::Add: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return x + y; }, add_to); break;
+    case EltwiseType::Sub: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return x - y; }, add_to); break;
+    case EltwiseType::Mul: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return x * y; }, add_to); break;
+    case EltwiseType::Div: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return x / y; }, add_to); break;
+    case EltwiseType::Min: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return std::min(x, y); }, add_to); break;
+    case EltwiseType::Max: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return std::max(x, y); }, add_to); break;
+    case EltwiseType::Pow: broadcast_loop<T>(inputs[0], inputs[1], output, ctx,
+                                [](float x, float y) { return std::pow(x, y); }, add_to); break;
+    }
 }
 
 Status eltwise_quant_impl(const EltwiseAttributes& attrs,
@@ -93,6 +196,10 @@ Status eltwise_cpu(const EltwiseAttributes& attrs,
 
     // Quantized path: both inputs and the output must be s8/u8 (no float↔int mixing).
     NNOPS_ASSERT(in_is_int && out_is_int);
+
+    // The fused tile path dequantizes one element per side; a broadcast would
+    // need the index arithmetic re-derived per scale row, so it stays float.
+    if (!same_shape(inputs[0], inputs[1])) { return Status::unsupported; }
 
     return eltwise_quant_impl(attrs, output, inputs, ctx);
 }

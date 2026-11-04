@@ -112,9 +112,12 @@ struct Buf {
 /// Allocate a buffer described by @p desc and a view over it. A recycled block
 /// when one of this exact size is on the free list; a zeroed one otherwise.
 ///
-/// A packed layout (NCHWC8) pads every row to the descriptor's pitch, so the
-/// view has to be built with that pitch and the storage with that many words —
-/// the dense constructor would describe a tighter tensor than the kernel writes.
+/// The buffer is dense: rows abut, so the view takes the descriptor's dense
+/// shape and the storage is exactly what nbytes() asks for (a channel-last row
+/// is a whole spatial line — W pixels × C channels — and abuts the next one the
+/// same way). A desc naming a *padded* row pitch is not what the operators that
+/// hand one back produce, and a pitched activation would make the checkpoint
+/// comparison — which expects row-packed planes — fail on the pitch alone.
 ///
 /// @p qp rides the view: a prepacked *quantized* weight (PackedOIHW/PackedHWIO)
 /// is only half the operand — the kernel reads the per-channel scale and zero
@@ -125,18 +128,10 @@ inline Buf alloc(const nnops::TensorDesc& desc, nnops::QuantParams qp = {})
     Buf buf;
     std::vector<int64_t> shape(desc.dims.begin(),
                                desc.dims.begin() + desc.rank);
-    const bool packed = nnops::layout_channel_pack(desc.layout) > 1;
-    const size_t words = packed
-        ? (desc.storage_bytes() + sizeof(float) - 1) / sizeof(float)
-        : static_cast<size_t>(desc.numel());
+    const size_t words = (desc.nbytes() + sizeof(float) - 1) / sizeof(float);
     buf.data = detail::take_block(words);
-    if (packed) {
-        buf.view = nnops::TensorView(shape, desc.dtype, buf.data.data(),
-                                     desc.row_pitch(), desc.layout, qp);
-    } else {
-        buf.view = nnops::TensorView(shape, desc.dtype, buf.data.data(),
-                                     desc.layout, qp);
-    }
+    buf.view = nnops::TensorView(shape, desc.dtype, buf.data.data(),
+                                 desc.layout, qp);
     return buf;
 }
 

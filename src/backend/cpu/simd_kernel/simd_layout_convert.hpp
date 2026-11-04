@@ -1,10 +1,14 @@
 #pragma once
 /// @file simd_layout_convert.hpp
-/// @brief SIMD kernel functions for NCHW ↔ NCHWC8 layout conversion.
+/// @brief CPU kernels for planar ↔ channel-last conversion.
 ///
-/// Uses an 8×8 SIMD transpose to vectorize both loads AND stores —
-/// 8 vector loads + transpose + 8 vector stores processes 8 W-positions
-/// at once (64 elements per iteration). Works for both f32 and f16.
+/// A spatial row is W pixels × C channels; planar stores it as C channel rows
+/// of W, channel-last as W pixels of C. Converting one 8-channel block against
+/// 8 pixels is an 8×8 transpose, so f32/f16 move 64 elements per iteration with
+/// 8 vector loads, one transpose, and 8 vector stores. Strided stores are fine:
+/// a transposed vector lands on one pixel's 8 channels (stride 1) at a C-pixel
+/// pitch, or on one channel row's 8 W positions. s8/u8 use scalar moves because
+/// their `v_load` is 16 lanes.
 
 #include "nnops/detail/simd/simd.hpp"
 
@@ -15,139 +19,103 @@ namespace nnops::kernel {
 using namespace simd;
 
 template <typename T>
-inline void layout_pack_one_w(const T* in_row, T* out_row,
-                               int64_t w, int64_t c_base, int64_t ch_stride,
-                               int64_t valid_lanes) {
-    T tmp[8] = {};
-    for (int64_t lane = 0; lane < valid_lanes; ++lane) {
-        tmp[lane] = in_row[(c_base + lane) * ch_stride + w];
-    }
-    v_store(&out_row[w * 8], v_load(tmp));
-}
+inline constexpr bool layout_convert_simd8 =
+    std::is_same_v<T, float> || std::is_same_v<T, half>;
 
+/// Copy one 8-channel block of a planar row into channel-last rows:
+/// `out[w*C + c_base + lane] = in[(c_base + lane)*ch_stride + w]`.
 template <typename T>
-inline void layout_unpack_one_w(const T* in_row, T* out_row,
-                                 int64_t w, int64_t c_base, int64_t ch_stride,
-                                 int64_t valid_lanes) {
-    T tmp[8] = {};
-    v_store(tmp, v_load(&in_row[w * 8]));
-    for (int64_t lane = 0; lane < valid_lanes; ++lane) {
-        out_row[(c_base + lane) * ch_stride + w] = tmp[lane];
-    }
-}
-
-template <typename T>
-inline void layout_pack_row(
-    const T* in_row, T* out_row,
-    int64_t W, int64_t c_base, int64_t ch_stride,
-    int64_t valid_lanes, int64_t C)
+inline void layout_planar_to_cl_block(const T* in_row, T* out_row,
+                                      int64_t W, int64_t C, int64_t ch_stride,
+                                      int64_t c_base, int64_t valid_lanes)
 {
-    auto vzero = v_set1(in_row, 0);
-    int64_t w = 0;
-    for (; w + 8 <= W; w += 8) {
-        auto c0 = c_base + 0 < C ? v_load(&in_row[(c_base + 0) * ch_stride + w]) : vzero;
-        auto c1 = c_base + 1 < C ? v_load(&in_row[(c_base + 1) * ch_stride + w]) : vzero;
-        auto c2 = c_base + 2 < C ? v_load(&in_row[(c_base + 2) * ch_stride + w]) : vzero;
-        auto c3 = c_base + 3 < C ? v_load(&in_row[(c_base + 3) * ch_stride + w]) : vzero;
-        auto c4 = c_base + 4 < C ? v_load(&in_row[(c_base + 4) * ch_stride + w]) : vzero;
-        auto c5 = c_base + 5 < C ? v_load(&in_row[(c_base + 5) * ch_stride + w]) : vzero;
-        auto c6 = c_base + 6 < C ? v_load(&in_row[(c_base + 6) * ch_stride + w]) : vzero;
-        auto c7 = c_base + 7 < C ? v_load(&in_row[(c_base + 7) * ch_stride + w]) : vzero;
+    if constexpr (layout_convert_simd8<T>) {
+        if (valid_lanes == 8) {
+            int64_t w = 0;
+            for (; w + 8 <= W; w += 8) {
+                auto c0 = v_load(&in_row[(c_base + 0) * ch_stride + w]);
+                auto c1 = v_load(&in_row[(c_base + 1) * ch_stride + w]);
+                auto c2 = v_load(&in_row[(c_base + 2) * ch_stride + w]);
+                auto c3 = v_load(&in_row[(c_base + 3) * ch_stride + w]);
+                auto c4 = v_load(&in_row[(c_base + 4) * ch_stride + w]);
+                auto c5 = v_load(&in_row[(c_base + 5) * ch_stride + w]);
+                auto c6 = v_load(&in_row[(c_base + 6) * ch_stride + w]);
+                auto c7 = v_load(&in_row[(c_base + 7) * ch_stride + w]);
 
-        v_transpose_8x8(c0, c1, c2, c3, c4, c5, c6, c7);
+                v_transpose_8x8(c0, c1, c2, c3, c4, c5, c6, c7);
 
-        v_store(&out_row[(w + 0) * 8], c0);
-        v_store(&out_row[(w + 1) * 8], c1);
-        v_store(&out_row[(w + 2) * 8], c2);
-        v_store(&out_row[(w + 3) * 8], c3);
-        v_store(&out_row[(w + 4) * 8], c4);
-        v_store(&out_row[(w + 5) * 8], c5);
-        v_store(&out_row[(w + 6) * 8], c6);
-        v_store(&out_row[(w + 7) * 8], c7);
-    }
-    for (; w < W; ++w) {
-        layout_pack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
-    }
-}
-
-template <typename T>
-inline void layout_unpack_row(
-    const T* in_row, T* out_row,
-    int64_t W, int64_t c_base, int64_t ch_stride,
-    int64_t valid_lanes, int64_t C)
-{
-    int64_t w = 0;
-    for (; w + 8 <= W; w += 8) {
-        auto r0 = v_load(&in_row[(w + 0) * 8]);
-        auto r1 = v_load(&in_row[(w + 1) * 8]);
-        auto r2 = v_load(&in_row[(w + 2) * 8]);
-        auto r3 = v_load(&in_row[(w + 3) * 8]);
-        auto r4 = v_load(&in_row[(w + 4) * 8]);
-        auto r5 = v_load(&in_row[(w + 5) * 8]);
-        auto r6 = v_load(&in_row[(w + 6) * 8]);
-        auto r7 = v_load(&in_row[(w + 7) * 8]);
-
-        v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
-
-        if (c_base + 0 < C) {
-            v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
-        }
-        if (c_base + 1 < C) {
-            v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
-        }
-        if (c_base + 2 < C) {
-            v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
-        }
-        if (c_base + 3 < C) {
-            v_store(&out_row[(c_base + 3) * ch_stride + w], r3);
-        }
-        if (c_base + 4 < C) {
-            v_store(&out_row[(c_base + 4) * ch_stride + w], r4);
-        }
-        if (c_base + 5 < C) {
-            v_store(&out_row[(c_base + 5) * ch_stride + w], r5);
-        }
-        if (c_base + 6 < C) {
-            v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
-        }
-        if (c_base + 7 < C) {
-            v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
+                v_store(&out_row[(w + 0) * C + c_base], c0);
+                v_store(&out_row[(w + 1) * C + c_base], c1);
+                v_store(&out_row[(w + 2) * C + c_base], c2);
+                v_store(&out_row[(w + 3) * C + c_base], c3);
+                v_store(&out_row[(w + 4) * C + c_base], c4);
+                v_store(&out_row[(w + 5) * C + c_base], c5);
+                v_store(&out_row[(w + 6) * C + c_base], c6);
+                v_store(&out_row[(w + 7) * C + c_base], c7);
+            }
+            for (; w < W; ++w) {
+                for (int64_t lane = 0; lane < 8; ++lane) {
+                    out_row[w * C + c_base + lane] =
+                        in_row[(c_base + lane) * ch_stride + w];
+                }
+            }
+            return;
         }
     }
-    for (; w < W; ++w) {
-        layout_unpack_one_w<T>(in_row, out_row, w, c_base, ch_stride, valid_lanes);
-    }
-}
 
-// The 8×8 transpose above operates on 8-lane floating vectors (f32/f16) and is
-// not valid for int8/uint8 (whose `v_load` returns 16 lanes). These byte paths
-// copy 8 channel bytes per W position directly. Pack fills pad lanes (c >= C)
-// with `pad_val` — the activation's zero_point — so that padded channels in a
-// quantized NCHWC8 tensor dequantize to zero contribution.
-
-template <typename T>
-inline void layout_pack_row_byte(
-    const T* in_row, T* out_row,
-    int64_t W, int64_t c_base, int64_t ch_stride,
-    int64_t /*valid_lanes*/, int64_t C, T pad_val)
-{
-    for (int64_t w = 0; w < W; ++w) {
-        for (int64_t lane = 0; lane < 8; ++lane) {
-            const int64_t c = c_base + lane;
-            out_row[w * 8 + lane] = (c < C) ? in_row[c * ch_stride + w] : pad_val;
-        }
-    }
-}
-
-template <typename T>
-inline void layout_unpack_row_byte(
-    const T* in_row, T* out_row,
-    int64_t W, int64_t c_base, int64_t ch_stride,
-    int64_t valid_lanes, int64_t /*C*/)
-{
     for (int64_t w = 0; w < W; ++w) {
         for (int64_t lane = 0; lane < valid_lanes; ++lane) {
-            out_row[(c_base + lane) * ch_stride + w] = in_row[w * 8 + lane];
+            out_row[w * C + c_base + lane] =
+                in_row[(c_base + lane) * ch_stride + w];
+        }
+    }
+}
+
+/// The reverse: gather one 8-channel block of a channel-last row back into
+/// planar channel rows.
+template <typename T>
+inline void layout_cl_to_planar_block(const T* in_row, T* out_row,
+                                      int64_t W, int64_t C, int64_t ch_stride,
+                                      int64_t c_base, int64_t valid_lanes)
+{
+    if constexpr (layout_convert_simd8<T>) {
+        if (valid_lanes == 8) {
+            int64_t w = 0;
+            for (; w + 8 <= W; w += 8) {
+                auto r0 = v_load(&in_row[(w + 0) * C + c_base]);
+                auto r1 = v_load(&in_row[(w + 1) * C + c_base]);
+                auto r2 = v_load(&in_row[(w + 2) * C + c_base]);
+                auto r3 = v_load(&in_row[(w + 3) * C + c_base]);
+                auto r4 = v_load(&in_row[(w + 4) * C + c_base]);
+                auto r5 = v_load(&in_row[(w + 5) * C + c_base]);
+                auto r6 = v_load(&in_row[(w + 6) * C + c_base]);
+                auto r7 = v_load(&in_row[(w + 7) * C + c_base]);
+
+                v_transpose_8x8(r0, r1, r2, r3, r4, r5, r6, r7);
+
+                v_store(&out_row[(c_base + 0) * ch_stride + w], r0);
+                v_store(&out_row[(c_base + 1) * ch_stride + w], r1);
+                v_store(&out_row[(c_base + 2) * ch_stride + w], r2);
+                v_store(&out_row[(c_base + 3) * ch_stride + w], r3);
+                v_store(&out_row[(c_base + 4) * ch_stride + w], r4);
+                v_store(&out_row[(c_base + 5) * ch_stride + w], r5);
+                v_store(&out_row[(c_base + 6) * ch_stride + w], r6);
+                v_store(&out_row[(c_base + 7) * ch_stride + w], r7);
+            }
+            for (; w < W; ++w) {
+                for (int64_t lane = 0; lane < 8; ++lane) {
+                    out_row[(c_base + lane) * ch_stride + w] =
+                        in_row[w * C + c_base + lane];
+                }
+            }
+            return;
+        }
+    }
+
+    for (int64_t w = 0; w < W; ++w) {
+        for (int64_t lane = 0; lane < valid_lanes; ++lane) {
+            out_row[(c_base + lane) * ch_stride + w] =
+                in_row[w * C + c_base + lane];
         }
     }
 }

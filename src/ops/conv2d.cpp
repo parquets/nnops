@@ -190,8 +190,7 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     NNOPS_TRY(detail::require(
         is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOrChannelLast)));
-    NNOPS_TRY(detail::require(
-        is_layout_supported(inputs[1].layout, LayoutSupport::PlanarOrChannelLast)));
+    NNOPS_TRY(detail::require(is_conv_filter_layout(inputs[1].layout)));
     // A raw filter or its prepacked form works on either side (PackedHWIO with a
     // channel-last activation, PackedOIHW with a planar one), so a graph that
     // prepacks unconditionally still validates.
@@ -259,7 +258,7 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     NNOPS_ASSERT(outputs.size() >= 1);
     const auto& weight = inputs[0];
     NNOPS_ASSERT(weight.rank() == 4);
-    NNOPS_ASSERT(is_layout_supported(weight.layout(), LayoutSupport::PlanarOrChannelLast));
+    NNOPS_ASSERT(is_conv_filter_layout(weight.layout()));
 
     // Two products live behind this one call. Auto keeps producing U exactly
     // where the transform exists — the k3s1 fp geometry its asserts demand —

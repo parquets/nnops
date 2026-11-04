@@ -277,18 +277,18 @@ static QuantParams make_per_channel(const std::vector<float>& scales,
 }
 
 // ============================================================
-// Layout contract — the planar path reads the raw filter, so a prepacked
-// weight is rejected at descriptor level rather than misread.
+// Layout contract — the planar path reads the raw planar filter, so a
+// channel-last weight is rejected at descriptor level rather than misread.
 // ============================================================
 
-NNOPS_TEST(dwconv_planar_rejects_packed_weight) {
+NNOPS_TEST(dwconv_planar_rejects_channel_last_weight) {
     TensorDesc in;
     in.rank = 4;
     for (int64_t d : {1, 4, 8, 8}) { in.dims.push_back(d); }
 
     TensorDesc w;
     w.rank   = 4;
-    w.layout = TensorLayout::PackedWeight;
+    w.layout = TensorLayout::NHWC;
     for (int64_t d : {1, 3, 3, 8}) { w.dims.push_back(d); }
 
     TensorDesc out;

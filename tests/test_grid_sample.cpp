@@ -1,12 +1,12 @@
 /// @file test_grid_sample.cpp
-/// @brief GridSample tests — the operator accepts packed NCHWC8 / NCDHWC8 only.
+/// @brief GridSample tests — planar and channel-last activations.
 ///
-/// Every case runs the class API end-to-end:
-///   NCHW -> LayoutConvert(pack) -> GridSample -> LayoutConvert(unpack) -> NCHW
-/// and checks the unpacked result against known values where the sample
-/// position is predictable, else only finiteness. The grid stays planar NCHW.
+/// Every case runs the class API end-to-end on a channel-last input:
+///   NCHW -> LayoutConvert -> GridSample -> LayoutConvert -> NCHW
+/// and checks the planar result against known values where the sample position
+/// is predictable, else only finiteness. The grid stays planar NCHW.
 /// Covers bilinear/nearest, zeros/border/reflection padding, align_corners,
-/// add_to (residual onto a pre-filled output), batch, 3D, and partial C8.
+/// add_to (residual onto a pre-filled output), batch, 3D, and an odd C.
 
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -40,46 +40,46 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
     TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
-        NNOPS_EXPECT_EQ(pack_descs[0].dtype, DataType::f32);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
+        NNOPS_EXPECT_EQ(cl_descs[0].dtype, DataType::f32);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
-        NNOPS_EXPECT_EQ(unpack_descs[0].dtype, DataType::f32);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        NNOPS_EXPECT_EQ(planar_descs[0].dtype, DataType::f32);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[0], 1.0f, 1e-5f);
         NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[1], 2.0f, 1e-5f);
@@ -107,28 +107,28 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.align_corners = true;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
         NNOPS_EXPECT_EQ(gs_descs[0].dims[0], 1);
         NNOPS_EXPECT_EQ(gs_descs[0].dims[1], 1);
@@ -136,21 +136,21 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
         NNOPS_EXPECT_EQ(gs_descs[0].dims[3], 4);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[0],  1.0f, 1e-5f);
         NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[3],  2.0f, 1e-5f);
@@ -174,43 +174,43 @@ NNOPS_TEST(grid_sample_2d_bilinear_random) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (size_t i = 0; i < 72; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
@@ -236,45 +236,45 @@ NNOPS_TEST(grid_sample_2d_nearest_basic) {
     TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.mode = GridSampleMode::Nearest;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (int i = 0; i < 4; ++i) {
             NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[i], 4.0f, 1e-5f);
@@ -292,45 +292,45 @@ NNOPS_TEST(grid_sample_2d_nearest_random) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.mode = GridSampleMode::Nearest;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (size_t i = 0; i < 75; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
@@ -356,43 +356,43 @@ NNOPS_TEST(grid_sample_2d_zeros_padding) {
     TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (int i = 0; i < 4; ++i) {
             NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[i], 0.0f, 1e-5f);
@@ -413,46 +413,46 @@ NNOPS_TEST(grid_sample_2d_border_padding) {
     TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.padding_mode = GridSamplePaddingMode::Border;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (int i = 0; i < 4; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
@@ -476,45 +476,45 @@ NNOPS_TEST(grid_sample_2d_reflection_padding) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.padding_mode = GridSamplePaddingMode::Reflection;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (size_t i = 0; i < 16; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
@@ -554,46 +554,46 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCDHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NDHWC);
     {
         auto d = in_ncdhw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCDHWC8);
-        NNOPS_EXPECT_EQ(pack_descs[0].dtype, DataType::f32);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 5);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NDHWC);
+        NNOPS_EXPECT_EQ(cl_descs[0].dtype, DataType::f32);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_ncdhw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_ncdhw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCDHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NDHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCDHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCDHW);
-        NNOPS_EXPECT_EQ(unpack_descs[0].dtype, DataType::f32);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCDHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 5);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCDHW);
+        NNOPS_EXPECT_EQ(planar_descs[0].dtype, DataType::f32);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_ncdhw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_ncdhw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_ncdhw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_ncdhw, planar_ins);
 
         for (size_t i = 0; i < 8; ++i) {
             NNOPS_EXPECT_NEAR(res_ncdhw.ptr<float>()[i], static_cast<float>(i + 1), 1e-4f);
@@ -611,45 +611,45 @@ NNOPS_TEST(grid_sample_3d_nearest_basic) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCDHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NDHWC);
     {
         auto d = in_ncdhw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCDHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 5);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NDHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_ncdhw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_ncdhw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.mode = GridSampleMode::Nearest;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCDHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NDHWC);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCDHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCDHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCDHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 5);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCDHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_ncdhw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_ncdhw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_ncdhw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_ncdhw, planar_ins);
 
         for (size_t i = 0; i < 27; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_ncdhw.ptr<float>()[i]));
@@ -677,56 +677,56 @@ NNOPS_TEST(grid_sample_add_to) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.add_to = true;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
 
-        int64_t rows = out_c8.total_rows();
-        int64_t row_elems = out_c8.row_stride_elems();
+        int64_t rows = out_cl.total_rows();
+        int64_t row_elems = out_cl.row_stride_elems();
         for (int64_t r = 0; r < rows; ++r) {
-            float* row = out_c8.ptr<float>(r);
+            float* row = out_cl.ptr<float>(r);
             for (int64_t e = 0; e < row_elems; ++e) {
                 row[e] = 0.5f;
             }
         }
 
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (size_t i = 0; i < 16; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
@@ -749,46 +749,46 @@ NNOPS_TEST(grid_sample_multisample) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
         NNOPS_EXPECT_EQ(gs_descs[0].dims[0], 2);
         NNOPS_EXPECT_EQ(gs_descs[0].dims[1], 1);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (size_t i = 0; i < 18; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
@@ -820,46 +820,46 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
         attrs.align_corners = true;
         auto gs_op = GridSample::create(attrs);
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (int i = 0; i < 9; ++i) {
             NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[i], in_data[i], 1e-5f);
@@ -871,7 +871,7 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
 // Partial C8 tests (zero-padded, all C8 blocks use SIMD)
 // ============================================================
 
-NNOPS_TEST(grid_sample_partial_c8) {
+NNOPS_TEST(grid_sample_partial_channels) {
     auto [in_vec, in_nchw] = test::make_random_tensor({1, 3, 4, 4});
     const int64_t gshape[] = {1, 4, 4, 2};
 
@@ -886,44 +886,44 @@ NNOPS_TEST(grid_sample_partial_c8) {
     }
     TensorView grid(gshape, DataType::f32, grid_buf.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8);
+    auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
         auto d = in_nchw.desc();
-        const TensorDesc pack_in_arr[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in_arr);
-        NNOPS_EXPECT_EQ(pack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(pack_descs[0].layout, TensorLayout::NCHWC8);
+        const TensorDesc cl_in_arr[] = {d};
+        auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
+        NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(cl_descs[0].layout, TensorLayout::NHWC);
 
-        std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-        auto in_c8 = test::make_packed(pack_descs[0], packed_buf.data());
-        const TensorView pack_ins[] = {in_nchw};
-        pack_op->compute(in_c8, pack_ins);
+        std::vector<char> cl_buf(cl_descs[0].storage_bytes());
+        auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
+        const TensorView cl_conv_ins[] = {in_nchw};
+        to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
-        auto d_in = in_c8.desc();
+        auto d_in = in_cl.desc();
         auto d_grid = grid.desc();
         const TensorDesc gs_in_arr[] = {d_in, d_grid};
         auto gs_descs = gs_op->getOutputTensorDesc(gs_in_arr);
         NNOPS_EXPECT_EQ(gs_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NCHWC8);
+        NNOPS_EXPECT_EQ(gs_descs[0].layout, TensorLayout::NHWC);
         NNOPS_EXPECT_EQ(gs_descs[0].dtype, DataType::f32);
 
         std::vector<char> gs_buf(gs_descs[0].storage_bytes());
-        auto out_c8 = test::make_packed(gs_descs[0], gs_buf.data());
-        const TensorView gs_ins[] = {in_c8, grid};
-        gs_op->compute(out_c8, gs_ins);
+        auto out_cl = test::make_packed(gs_descs[0], gs_buf.data());
+        const TensorView gs_ins[] = {in_cl, grid};
+        gs_op->compute(out_cl, gs_ins);
 
-        auto unpack_op = LayoutConvert::create(TensorLayout::NCHW);
-        auto d_out = out_c8.desc();
-        const TensorDesc unpack_in_arr[] = {d_out};
-        auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in_arr);
-        NNOPS_EXPECT_EQ(unpack_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(unpack_descs[0].layout, TensorLayout::NCHW);
+        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto d_out = out_cl.desc();
+        const TensorDesc planar_in_arr[] = {d_out};
+        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
+        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> unpack_buf(unpack_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(unpack_descs[0], unpack_buf.data());
-        const TensorView unpack_ins[] = {out_c8};
-        unpack_op->compute(res_nchw, unpack_ins);
+        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
+        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
+        const TensorView planar_ins[] = {out_cl};
+        to_planar_op->compute(res_nchw, planar_ins);
 
         for (size_t i = 0; i < 48; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));

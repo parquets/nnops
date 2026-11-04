@@ -4,8 +4,8 @@
 /// Row-by-row SIMD copy from any input layout to dense planar output.
 /// Uses the generic SIMD API (v_load/v_store) to handle both f32 and f16.
 ///
-/// The key optimization: detect when the input is already dense planar
-/// (pack == 1, row_stride == oW) → single memcpy of the entire buffer.
+/// The key optimization: detect when the input is already dense in the
+/// output's row order (row_stride == oW) → single memcpy of the entire buffer.
 
 #include "nnops/ops/flatten.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -24,7 +24,6 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
 {
     const auto& input = inputs[0];
     const int64_t rank  = input.rank();
-    const int64_t pack  = input.channel_pack_size();
     constexpr int L = simd_lane_for<T>;
 
     // Output is always dense planar
@@ -35,7 +34,7 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
     const auto* i_ptr = input.ptr<T>();
     const int64_t i_w_stride = input.stride_elems(rank - 1);
 
-    if (pack == 1 && input.row_stride_elems() == oW) {
+    if (input.row_stride_elems() == oW) {
         size_t total_bytes = static_cast<size_t>(output.numel()) * sizeof(T);
         std::memcpy(o_ptr, i_ptr, total_bytes);
         return;
@@ -56,24 +55,17 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
             int64_t dim = input.shape(d);
             int64_t idx = rem % dim;
             rem /= dim;
-
-            if (d == 1 && pack > 1) {
-                int64_t c8_block = idx / pack;
-                int64_t lane     = idx % pack;
-                i_off += c8_block * input.channel_block_stride_elems() + lane;
-            } else {
-                i_off += idx * input.stride_elems(d);
-            }
+            i_off += idx * input.stride_elems(d);
         }
 
         int64_t w = 0;
-        if (i_w_stride == 1 && pack == 1) {
+        if (i_w_stride == 1) {
             // Planar input: contiguous row → SIMD vector copy
             for (; w + L <= oW; w += L) {
                 v_store(o_row + w, v_load(i_ptr + i_off + w));
             }
         } else {
-            // Packed input: strided element access
+            // Channel-last input: strided element access
             for (; w + L <= oW; w += L) {
                 T tmp[16];  // max simd lane width
                 for (int k = 0; k < L; ++k) {

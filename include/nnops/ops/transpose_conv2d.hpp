@@ -2,10 +2,9 @@
 /// @file transpose_conv2d.hpp
 /// @brief TransposeConv2D — transposed 2D convolution (deconvolution).
 ///
-/// The backward of a regular convolution: each input pixel is scaled by the
-/// kernel and scattered/accumulated over a region of the output (one-to-many).
-/// NCHWC8 packed input/output; weight is planar [IC, OC/G, KH, KW]; bias [OC]
-/// optional. Reference: ncnn Deconvolution (scatter-add approach).
+/// The backward of a regular convolution. The image tensor is NCHW or NHWC
+/// (the output carries its layout); the weight is planar [IC, OC/G, KH, KW] in
+/// both cases; bias [OC] optional. Reference: ncnn Deconvolution.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -73,7 +72,9 @@ public:
 
     OpType  getOpType()  const override { return OpType::TransposeConv2D; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override {
+        return LayoutSupport::PlanarOrChannelLast;
+    }
 
     const TransposeConv2DAttributes& attributes() const noexcept { return attrs_; }
 

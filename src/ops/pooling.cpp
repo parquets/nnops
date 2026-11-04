@@ -23,8 +23,9 @@ NNOPS_OP_BOILERPLATE(Pooling, PoolingAttributes,
 std::vector<TensorDesc> Pooling::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    if (attrs_.global) {
+    if (attrs_.global || attrs_.adaptive()) {
         const auto& in = inputs[0];
+        const int64_t srank = PoolingAttributes::spatial_rank(in.rank);
         TensorDesc out;
         out.rank   = in.rank;
         out.layout = in.layout;
@@ -32,7 +33,12 @@ std::vector<TensorDesc> Pooling::getOutputTensorDesc(
         out.dims.resize(static_cast<size_t>(in.rank));
         out.dims[0] = in.dims[0];
         out.dims[1] = in.dims[1];
-        for (int64_t d = 2; d < in.rank; ++d) { out.dims[static_cast<size_t>(d)] = 1; }
+        for (int64_t d = 2; d < in.rank; ++d) {
+            // A 2D input reads output_size's H/W slots; 3D reads all three.
+            const size_t ai = static_cast<size_t>(3 - srank + (d - 2));
+            out.dims[static_cast<size_t>(d)] =
+                attrs_.global ? 1 : attrs_.output_size[ai];
+        }
         return {out};
     }
     return {pooling_output_shape(
@@ -45,10 +51,28 @@ Status Pooling::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
     const auto& in = inputs[0];
+
+    if (attrs_.adaptive()) {
+        // Every spatial axis needs an output size; a 2D input reads [1] and [2].
+        const int64_t srank = PoolingAttributes::spatial_rank(in.rank);
+        const size_t first = static_cast<size_t>(3 - srank);
+        for (int64_t d = 0; d < srank; ++d) {
+            if (attrs_.output_size[first + static_cast<size_t>(d)] <= 0) {
+                return Status::invalid_argument;
+            }
+        }
+    }
+
     if (is_planar_spatial(in.layout)) {
         return detail::require(
             detail::dtype_in<DataType::f32, DataType::f16>(in.dtype),
             Status::unsupported);
+    }
+    // Adaptive pooling walks the window per output position; the quantized
+    // channel-lane kernel has no such form, so it stays float.
+    if (attrs_.adaptive() &&
+        detail::dtype_in<DataType::s8, DataType::u8>(in.dtype)) {
+        return Status::unsupported;
     }
     if (is_channel_last(in.layout)) {
         return detail::require(
@@ -70,6 +94,20 @@ Status Pooling::compute(std::span<TensorView> outputs,
     auto& input = inputs[0];
 
     PoolingAttributes attrs = attrs_;
+    if (attrs.adaptive()) {
+        // An all-ones output is the global case; the plane scan is the faster
+        // form and needs no window walk. Adaptive ignores the window fields.
+        const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
+        const size_t first = static_cast<size_t>(3 - srank);
+        bool all_ones = true;
+        for (int64_t d = 0; d < srank; ++d) {
+            if (attrs.output_size[first + static_cast<size_t>(d)] != 1) {
+                all_ones = false;
+            }
+        }
+        if (all_ones) { attrs.global = true; }
+        attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET;
+    }
     if (attrs.global) {
         attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET;
     } else if (attrs.auto_pad != PoolingAttributes::AutoPad::NOTSET) {

@@ -45,6 +45,18 @@ void apply_unary_flt(UnaryType type, const T* in, T* out,
     case UnaryType::Floor: kernel::floor<T>(in, out, M, N, in_stride, out_stride, add_to); break;
     case UnaryType::Recip: kernel::recip<T>(in, out, M, N, in_stride, out_stride, add_to); break;
     case UnaryType::Sign:  kernel::sign<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Exp2:  kernel::exp2<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Log2:  kernel::log2<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Log10: kernel::log10<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Asin:  kernel::asin<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Acos:  kernel::acos<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Atan:  kernel::atan<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Sinh:  kernel::sinh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Cosh:  kernel::cosh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Asinh: kernel::asinh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Acosh: kernel::acosh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Atanh: kernel::atanh<T>(in, out, M, N, in_stride, out_stride, add_to); break;
+    case UnaryType::Erfc:  kernel::erfc<T>(in, out, M, N, in_stride, out_stride, add_to); break;
     }
 }
 

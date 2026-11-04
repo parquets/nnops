@@ -15,6 +15,11 @@
 ///   silu        x / (1 + exp(-x))
 ///   hard_swish  x * relu6(x + 3) * (beta / 6)
 ///   elu         max(x, 0) + alpha * (exp(min(x, 0)) - 1)
+///   hard_sigmoid clamp(alpha*x + beta, 0, 1)
+///   softplus    max(x, 0) + log(1 + exp(-|x|))
+///   selu        scale * (max(x, 0) + alpha * (exp(min(x, 0)) - 1))
+///   mish        x * tanh(softplus(x))
+///   quick_gelu  x * sigmoid(alpha*x)
 ///
 /// LeakyRelu and Elu use min/max decomposition, not compare+blend, so the same
 /// code works across v_f32x8, v_f16x8 and every backend (AVX2, SSE, NEON,
@@ -69,6 +74,40 @@ template <typename V>
 inline V v_elu(V x, V vzero, V valpha, V v1) {
     auto neg_part = v_mul(valpha, v_sub(v_exp(v_min(x, vzero)), v1));
     return v_add(v_max(x, vzero), neg_part);
+}
+
+/// clamp(alpha·x + beta, 0, 1).
+template <typename V>
+inline V v_hard_sigmoid(V x, V vzero, V vone, V valpha, V vbeta) {
+    return v_min(v_max(v_add(v_mul(valpha, x), vbeta), vzero), vone);
+}
+
+/// max(x, 0) + log(1 + exp(-|x|)) — the shifted form, so exp never overflows.
+template <typename V>
+inline V v_softplus(V x, V vzero, V vone) {
+    auto tail = v_log(v_add(vone, v_exp(v_neg(v_abs(x)))));
+    return v_add(v_max(x, vzero), tail);
+}
+
+/// scale · (max(x, 0) + alpha · (exp(min(x, 0)) - 1)).
+template <typename V>
+inline V v_selu(V x, V vzero, V valpha, V vscale, V v1) {
+    auto pos = v_max(x, vzero);
+    auto neg = v_mul(valpha, v_sub(v_exp(v_min(x, vzero)), v1));
+    return v_mul(vscale, v_add(pos, neg));
+}
+
+/// x · tanh(softplus(x)).
+template <typename V>
+inline V v_mish(V x, V vzero, V vone) {
+    return v_mul(x, v_tanh(v_softplus(x, vzero, vone)));
+}
+
+/// x · sigmoid(alpha·x).
+template <typename V>
+inline V v_quick_gelu(V x, V vone, V valpha) {
+    auto ax = v_mul(valpha, x);
+    return v_div(v_mul(x, vone), v_add(vone, v_exp(v_neg(ax))));
 }
 
 }  // namespace nnops::kernel

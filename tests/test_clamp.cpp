@@ -1,10 +1,10 @@
 /// @file test_clamp.cpp
 /// @brief Clamp operator tests (CPU backend) — hand-checked bounds, a missing
-///        min or max, add_to, f32/f16, and a packed NCHWC8 input.
+///        min or max, add_to, f32/f16, and a channel-last (NHWC) input.
 ///
-/// Clamp is elementwise, so a re-layout cannot change a value: the packed case
-/// runs the op on NCHWC8 data and compares every element against a scalar clamp
-/// of the packed input. The class API test only checks that two independently
+/// Clamp is elementwise, so a re-layout cannot change a value: the channel-last
+/// case converts in, clamps, converts back and compares against a scalar clamp
+/// of the logical input. The class API test only checks that two independently
 /// created instances of the same attributes agree.
 
 #include "nnops/ops/clamp.hpp"
@@ -187,44 +187,43 @@ NNOPS_TEST(clamp_add_to) {
 }
 
 // ============================================================
-// Packed layout (NCHWC8)
+// Channel-last (NHWC) input
 // ============================================================
 
-NNOPS_TEST(clamp_packed_layout) {
+NNOPS_TEST(clamp_channel_last_layout) {
     const int64_t N = 1, C = 16, H = 4, W = 4;
     auto [in_vec, input_planar] = test::make_random_tensor({N, C, H, W}, -10.0f, 10.0f, 444);
 
-    auto lc = LayoutConvert::create(LayoutConvertAttributes{TensorLayout::NCHWC8}, Backend::CPU);
+    auto to_cl = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in[] = {input_planar.desc()};
-    auto lc_descs = lc->getOutputTensorDesc(lc_in);
+    auto cl_desc = to_cl->getOutputTensorDesc(lc_in)[0];
 
-    int64_t packed_elems = 1;
-    for (int i = 0; i < lc_descs[0].rank; ++i) {
-        packed_elems *= lc_descs[0].dims[i];
-    }
-    std::vector<float> packed_in_buf(static_cast<size_t>(packed_elems), 0.0f);
-    auto input_packed = test::make_packed(lc_descs[0], packed_in_buf.data());
+    std::vector<float> cl_in_buf(cl_desc.storage_bytes() / sizeof(float), 0.0f);
+    auto input_cl = test::make_packed(cl_desc, cl_in_buf.data());
     const TensorView lc_inputs[] = {input_planar};
-    lc->compute(input_packed, lc_inputs);
+    to_cl->compute(input_cl, lc_inputs);
 
-    std::vector<float> packed_out_buf(static_cast<size_t>(packed_elems), 0.0f);
-    auto output_packed = test::make_packed(lc_descs[0], packed_out_buf.data());
+    std::vector<float> cl_out_buf(cl_desc.storage_bytes() / sizeof(float), 0.0f);
+    auto output_cl = test::make_packed(cl_desc, cl_out_buf.data());
 
     ClampAttributes attrs;
     attrs.min_val = -2.0f;
     attrs.max_val = 3.0f;
     auto op = Clamp::create(attrs, Backend::CPU);
 
-    const TensorView ins[] = {input_packed};
-    op->compute(output_packed, ins);
+    const TensorView ins[] = {input_cl};
+    op->compute(output_cl, ins);
 
-    const float* out_ptr = output_packed.ptr<float>();
-    const float* in_ptr = input_packed.ptr<float>();
-    for (size_t i = 0; i < static_cast<size_t>(packed_elems); ++i) {
-        float inv = in_ptr[i];
-        float outv = out_ptr[i];
-        float expected = std::max(-2.0f, std::min(3.0f, inv));
-        NNOPS_EXPECT_NEAR(outv, expected, 1e-5f);
+    // Back to planar so the comparison is against logical order.
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    std::vector<float> out_planar(static_cast<size_t>(input_planar.numel()), 0.0f);
+    TensorView output_planar(input_planar.shape_span(), DataType::f32, out_planar.data());
+    const TensorView back[] = {output_cl};
+    to_planar->compute(output_planar, back);
+
+    for (size_t i = 0; i < in_vec.size(); ++i) {
+        float expected = std::max(-2.0f, std::min(3.0f, in_vec[i]));
+        NNOPS_EXPECT_NEAR(out_planar[i], expected, 1e-5f);
     }
 }
 

@@ -801,10 +801,11 @@ void eltwise_cuda_impl(
             A.ptr<T>(), B.ptr<T>(), output.ptr<T>(),
             total, attrs.type, attrs.add_to);
     } else {
-        // Row-by-row processing, respecting pitch.
-        // For packed layouts, last_dim = W * pack covers all C8 lanes,
-        // and num_rows = total_rows() accounts for channel block rounding.
-        const int64_t last_dim = A.shape(rank - 1) * A.channel_pack_size();
+        // Row-by-row processing, respecting pitch. A channel-last row is one
+        // spatial line — W pixels × C channels.
+        const int64_t last_dim = (rank >= 3 && is_channel_last(A.layout()))
+            ? A.shape(1) * A.shape(rank - 1)
+            : A.shape(rank - 1);
         const int64_t num_rows = A.total_rows();
         const int64_t a_row_stride = A.row_stride_elems();
         const int64_t b_row_stride = B.row_stride_elems();

@@ -1,20 +1,13 @@
 /// @file grid_sample.cpp
-/// @brief SIMD-optimized CPU implementation of 2D/3D grid sampling (NCHWC8/NCDHWC8 only).
+/// @brief CPU implementation of 2D/3D grid sampling, planar and channel-last.
 ///
-/// Input (image to sample) is always NCHWC8 (or NCDHWC8 for 3D). Grid is always
-/// plain NCHW/NCDHW float32 (spatial coords, not channel data). All C8 blocks
-/// use SIMD — grid coordinates are per-output-position (same for all 8 channels),
-/// so validity is all-or-nothing per C8 block.
-///
-/// Key design decisions:
-///   1. Nearest: compute pixel coordinate once per output position, v_load 8
-///      channels from source NCHWC8 position, v_store.
-///   2. Bilinear/Trilinear: compute pixel coords once, v_load 4/8 corner vectors
-///      (8 channels each), interpolate all 8 lanes with v_fmadd (a*b + c).
-///   3. Zeros padding: all-or-nothing per C8 block (grid coords are per-position).
-///   4. Border/Reflection padding: always valid after padding → SIMD always works.
-///   5. N*C8 parallel dispatch.
-///   6. Grid access is scalar (grid is NCHW, not channel-packed).
+/// The image tensor is NCHW/NCDHW or NHWC/NDHWC; the grid is always dense f32
+/// ([N, (OD,) OH, OW, 2|3]), because its last axis is a coordinate pair/triple,
+/// not a channel. Planar dispatches one task per (n, c) and samples one channel
+/// plane per task; channel-last dispatches one task per n and keeps the SIMD
+/// lane on C, so a pixel interpolates all its channels at once. The grid
+/// coordinate is per output position, so zeros padding is all-or-nothing across
+/// the channel vector.
 
 #include "nnops/ops/grid_sample.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -23,32 +16,31 @@
 
 namespace nnops::backend::cpu {
 
-using namespace nnops::simd;
 namespace k = nnops::kernel;
 
 template <typename T>
-void grid_sample_impl_nchwc8(const GridSampleAttributes& attrs,
-                              TensorView& output,
-                              std::span<const TensorView> inputs,
-                              const ComputeContext& ctx)
+void grid_sample_impl(const GridSampleAttributes& attrs,
+                      TensorView& output,
+                      std::span<const TensorView> inputs,
+                      const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const auto& grid  = inputs[1];
     const int64_t irank = input.rank();
     const int64_t srank = GridSampleAttributes::spatial_rank(irank);
 
-    const int64_t N  = input.shape(0);
-    const int64_t C8 = input.num_channel_blocks();
+    const int64_t N = input.shape(0);
+    const int64_t C = input.shape(1);
 
-    // Input spatial dims
     const int64_t ID = (srank == 3) ? input.shape(2) : 1;
     const int64_t IH = input.shape(srank);
     const int64_t IW = input.shape(srank + 1);
 
-    // Output spatial dims (from grid)
     const int64_t OD = (srank == 3) ? output.shape(2) : 1;
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
+
+    if (N == 0 || C == 0 || OD == 0 || OH == 0 || OW == 0) { return; }
 
     auto*       out_ptr  = output.ptr<T>();
     const auto* in_ptr   = input.ptr<T>();
@@ -56,82 +48,118 @@ void grid_sample_impl_nchwc8(const GridSampleAttributes& attrs,
 
     const int64_t in_row_stride  = input.row_stride_elems();
     const int64_t in_d_stride    = IH * in_row_stride;
-    const int64_t in_ch_stride   = input.channel_block_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
     const int64_t out_d_stride   = OH * out_row_stride;
-    const int64_t out_ch_stride  = output.channel_block_stride_elems();
 
-    // Grid strides (grid is plain NCHW/NCDHW float32, not channel-packed)
-    const int64_t coord_dim = srank;
+    const int64_t coord_dim       = srank;
     const int64_t grid_row_stride = OW * coord_dim;
-    const int64_t grid_d_elems    = OH * grid_row_stride;
+    const int64_t grid_n_stride   = grid.stride_elems(0);
 
     const auto mode         = attrs.mode;
     const auto padding_mode = attrs.padding_mode;
     const bool align        = attrs.align_corners;
     const bool add_to       = attrs.add_to;
+    const bool nearest      = (mode == GridSampleMode::Nearest);
 
-    // Per-C8-block compute lambda (all C8 blocks use SIMD)
-    const auto compute_c8 = [&](int64_t n, int64_t c8) {
-        const T* in_base  = in_ptr  + n * C8 * in_ch_stride  + c8 * in_ch_stride;
-        T*       out_base = out_ptr + n * C8 * out_ch_stride + c8 * out_ch_stride;
+    if (is_channel_last(input.layout())) {
+        const int64_t in_n_stride  = input.stride_elems(0);
+        const int64_t out_n_stride = output.stride_elems(0);
 
-        // Grid for this sample (NCHW, not channel-packed)
-        const float* grid_n = (srank == 3)
-            ? grid_ptr + n * OD * grid_d_elems
-            : grid_ptr + n * OH * grid_row_stride;
+        const auto process = [&](int64_t n) {
+            const T* in_base  = in_ptr  + n * in_n_stride;
+            T*       out_base = out_ptr + n * out_n_stride;
+            const float* grid_n = grid_ptr + n * grid_n_stride;
+
+            if (srank == 3) {
+                if (nearest) {
+                    k::gridsample_nearest_last_3d<T>(
+                        out_base, in_base, grid_n, C,
+                        ID, IH, IW, OD, OH, OW,
+                        in_d_stride, in_row_stride, out_d_stride, out_row_stride,
+                        grid_row_stride, align, padding_mode, add_to);
+                } else {
+                    k::gridsample_last_3d<T>(
+                        out_base, in_base, grid_n, C,
+                        ID, IH, IW, OD, OH, OW,
+                        in_d_stride, in_row_stride, out_d_stride, out_row_stride,
+                        grid_row_stride, align, padding_mode, add_to);
+                }
+            } else {
+                if (nearest) {
+                    k::gridsample_nearest_last_2d<T>(
+                        out_base, in_base, grid_n, C,
+                        IH, IW, OH, OW,
+                        in_row_stride, out_row_stride,
+                        grid_row_stride, align, padding_mode, add_to);
+                } else {
+                    k::gridsample_last_2d<T>(
+                        out_base, in_base, grid_n, C,
+                        IH, IW, OH, OW,
+                        in_row_stride, out_row_stride,
+                        grid_row_stride, align, padding_mode, add_to);
+                }
+            }
+        };
+
+        ctx.cpu.run(0, N, process);
+        return;
+    }
+
+    const int64_t in_c_stride  = input.stride_elems(1);
+    const int64_t out_c_stride = output.stride_elems(1);
+    const int64_t in_n_stride  = input.stride_elems(0);
+    const int64_t out_n_stride = output.stride_elems(0);
+
+    const auto process = [&](int64_t task) {
+        const int64_t n = task / C;
+        const int64_t c = task % C;
+        const T* in_base  = in_ptr  + n * in_n_stride  + c * in_c_stride;
+        T*       out_base = out_ptr + n * out_n_stride + c * out_c_stride;
+        const float* grid_n = grid_ptr + n * grid_n_stride;
 
         if (srank == 3) {
-            if (mode == GridSampleMode::Nearest) {
-                k::gridsample_nearest_3d<T>(
+            if (nearest) {
+                k::gridsample_nearest_planar_3d<T>(
                     out_base, in_base, grid_n,
                     ID, IH, IW, OD, OH, OW,
-                    in_d_stride, in_row_stride,
-                    out_d_stride, out_row_stride,
-                    grid_row_stride, grid_d_elems,
-                    align, padding_mode, add_to);
+                    in_d_stride, in_row_stride, out_d_stride, out_row_stride,
+                    grid_row_stride, align, padding_mode, add_to);
             } else {
-                k::gridsample_trilinear_3d<T>(
+                k::gridsample_planar_3d<T>(
                     out_base, in_base, grid_n,
                     ID, IH, IW, OD, OH, OW,
-                    in_d_stride, in_row_stride,
-                    out_d_stride, out_row_stride,
-                    grid_row_stride, grid_d_elems,
-                    align, padding_mode, add_to);
+                    in_d_stride, in_row_stride, out_d_stride, out_row_stride,
+                    grid_row_stride, align, padding_mode, add_to);
             }
         } else {
-            if (mode == GridSampleMode::Nearest) {
-                k::gridsample_nearest_2d<T>(
+            if (nearest) {
+                k::gridsample_nearest_planar_2d<T>(
                     out_base, in_base, grid_n,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,
-                    grid_row_stride,
-                    align, padding_mode, add_to);
+                    grid_row_stride, align, padding_mode, add_to);
             } else {
-                k::gridsample_bilinear_2d<T>(
+                k::gridsample_planar_2d<T>(
                     out_base, in_base, grid_n,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,
-                    grid_row_stride,
-                    align, padding_mode, add_to);
+                    grid_row_stride, align, padding_mode, add_to);
             }
         }
     };
 
-    const int64_t N_C8 = N * C8;
-    ctx.cpu.run(0, N_C8,
-            [&](int64_t tid) { compute_c8(tid / C8, tid % C8); });
+    ctx.cpu.run(0, N * C, process);
 }
 
 Status grid_sample_cpu(const GridSampleAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     void* /*workspace*/)
+                       TensorView& output,
+                       std::span<const TensorView> inputs,
+                       const ComputeContext& ctx,
+                       void* /*workspace*/)
 {
     dispatch_f32_f16(inputs[0].data_type(), "grid_sample_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
-        grid_sample_impl_nchwc8<T>(attrs, output, inputs, ctx);
+        grid_sample_impl<T>(attrs, output, inputs, ctx);
     });
     return Status::ok;
 }

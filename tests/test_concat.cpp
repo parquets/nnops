@@ -1,8 +1,9 @@
 /// @file test_concat.cpp
-/// @brief Unit tests for Concat (CPU), planar NCHW/NCDHW and packed NCHWC8/NCDHWC8.
+/// @brief Unit tests for Concat (CPU), planar NCHW/NCDHW and channel-last NHWC/NDHWC.
 ///
-/// The packed cases are a pack → concat → unpack roundtrip compared against
-/// concat_ref on the planar inputs; the C-axis ones exercise the C8 lane merge.
+/// The channel-last cases are a convert → concat → convert-back roundtrip
+/// compared against concat_ref on the planar inputs; the C-axis ones exercise
+/// the interleaved-channel axis merge.
 
 #include "nnops/ops/concat.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -27,10 +28,10 @@ namespace nnops::backend::cpu::reference {
 
 namespace {
 
-/// Pack → concat → unpack, compared against the planar reference concat.
-void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
-                         int64_t axis,
-                         DataType dtype = DataType::f32)
+/// Convert → concat → convert-back, compared against the planar reference concat.
+void test_channel_last_concat(const std::vector<std::vector<int64_t>>& in_shapes,
+                               int64_t axis,
+                               DataType dtype = DataType::f32)
 {
     const int64_t N = static_cast<int64_t>(in_shapes.size());
     NNOPS_ASSERT(N >= 2);
@@ -38,7 +39,7 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
     const int64_t rank = static_cast<int64_t>(in_shapes[0].size());
     const int64_t srank = rank - 2;
     const TensorLayout planar_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
-    const TensorLayout packed_layout = (srank == 3) ? TensorLayout::NCDHWC8 : TensorLayout::NCHWC8;
+    const TensorLayout cl_layout = (srank == 3) ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     std::vector<std::vector<float>> in_bufs(N);
     std::vector<TensorView> in_planars(N);
@@ -73,56 +74,56 @@ void test_packed_concat(const std::vector<std::vector<int64_t>>& in_shapes,
         backend::cpu::reference::concat_ref(attrs, out_ref, ref_ins, ctx, nullptr);
     }
 
-    // Packed path: pack each input, concat, unpack.
-    std::vector<std::vector<char>> packed_bufs(N);
-    std::vector<TensorView> in_packeds(N);
+    // Channel-last path: convert each input, concat, convert back.
+    std::vector<std::vector<char>> cl_bufs(N);
+    std::vector<TensorView> in_cls(N);
     for (int64_t i = 0; i < N; ++i) {
-        auto pack_op = LayoutConvert::create(packed_layout, Backend::CPU);
+        auto to_cl = LayoutConvert::create(cl_layout, Backend::CPU);
         auto d = in_planars[static_cast<size_t>(i)].desc();
-        const TensorDesc pack_in[] = {d};
-        auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
+        const TensorDesc cl_in[] = {d};
+        auto cl_descs = to_cl->getOutputTensorDesc(cl_in);
 
-        packed_bufs[static_cast<size_t>(i)].resize(
-            static_cast<size_t>(pack_descs[0].storage_bytes()));
-        in_packeds[static_cast<size_t>(i)] =
-            test::make_packed(pack_descs[0], packed_bufs[static_cast<size_t>(i)].data());
-        const TensorView pack_ins[] = {in_planars[static_cast<size_t>(i)]};
-        pack_op->compute(in_packeds[static_cast<size_t>(i)], pack_ins);
+        cl_bufs[static_cast<size_t>(i)].resize(
+            static_cast<size_t>(cl_descs[0].storage_bytes()));
+        in_cls[static_cast<size_t>(i)] =
+            test::make_packed(cl_descs[0], cl_bufs[static_cast<size_t>(i)].data());
+        const TensorView cl_ins[] = {in_planars[static_cast<size_t>(i)]};
+        to_cl->compute(in_cls[static_cast<size_t>(i)], cl_ins);
     }
 
     auto concat_op = Concat::create(attrs, Backend::CPU);
-    std::vector<TensorDesc> packed_descs(N);
+    std::vector<TensorDesc> cl_descs_in(N);
     for (int64_t i = 0; i < N; ++i) {
-        packed_descs[static_cast<size_t>(i)] = in_packeds[static_cast<size_t>(i)].desc();
+        cl_descs_in[static_cast<size_t>(i)] = in_cls[static_cast<size_t>(i)].desc();
     }
-    auto concat_descs = concat_op->getOutputTensorDesc(packed_descs);
+    auto concat_descs = concat_op->getOutputTensorDesc(cl_descs_in);
 
     NNOPS_EXPECT_EQ(concat_descs[0].rank, rank);
-    NNOPS_EXPECT_EQ(concat_descs[0].layout, packed_layout);
+    NNOPS_EXPECT_EQ(concat_descs[0].layout, cl_layout);
     NNOPS_EXPECT_EQ(concat_descs[0].dtype, dtype);
 
     std::vector<char> concat_buf(static_cast<size_t>(concat_descs[0].storage_bytes()));
-    auto out_packed = test::make_packed(concat_descs[0], concat_buf.data());
+    auto out_cl = test::make_packed(concat_descs[0], concat_buf.data());
 
     std::vector<TensorView> concat_ins(N);
     for (int64_t i = 0; i < N; ++i) {
-        concat_ins[static_cast<size_t>(i)] = in_packeds[static_cast<size_t>(i)];
+        concat_ins[static_cast<size_t>(i)] = in_cls[static_cast<size_t>(i)];
     }
-    concat_op->compute(out_packed, concat_ins);
+    concat_op->compute(out_cl, concat_ins);
 
-    auto unpack_op = LayoutConvert::create(planar_layout, Backend::CPU);
-    auto od = out_packed.desc();
-    const TensorDesc unpack_in[] = {od};
-    auto unpack_descs = unpack_op->getOutputTensorDesc(unpack_in);
+    auto to_planar = LayoutConvert::create(planar_layout, Backend::CPU);
+    auto od = out_cl.desc();
+    const TensorDesc back_in[] = {od};
+    auto back_descs = to_planar->getOutputTensorDesc(back_in);
 
-    NNOPS_EXPECT_EQ(unpack_descs[0].rank, rank);
-    NNOPS_EXPECT_EQ(unpack_descs[0].layout, planar_layout);
-    NNOPS_EXPECT_EQ(unpack_descs[0].dtype, dtype);
+    NNOPS_EXPECT_EQ(back_descs[0].rank, rank);
+    NNOPS_EXPECT_EQ(back_descs[0].layout, planar_layout);
+    NNOPS_EXPECT_EQ(back_descs[0].dtype, dtype);
 
-    std::vector<char> unpack_buf(static_cast<size_t>(unpack_descs[0].storage_bytes()));
-    auto res_planar = test::make_planar(unpack_descs[0], unpack_buf.data());
-    const TensorView unpack_ins[] = {out_packed};
-    unpack_op->compute(res_planar, unpack_ins);
+    std::vector<char> back_buf(static_cast<size_t>(back_descs[0].storage_bytes()));
+    auto res_planar = test::make_planar(back_descs[0], back_buf.data());
+    const TensorView back_ins[] = {out_cl};
+    to_planar->compute(res_planar, back_ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(res_planar, out_ref, 1e-5f, 1e-5f));
 }
@@ -465,89 +466,89 @@ NNOPS_TEST(concat_op_type) {
 }
 
 // ============================================================
-// Packed layout tests (NCHWC8 / NCDHWC8)
+// Channel-last layout tests (NHWC / NDHWC)
 // ============================================================
 
-NNOPS_TEST(concat_nchwc8_axis0) {
-    // Concat on N axis with NCHWC8: [2, 3, 4, 4] + [1, 3, 4, 4] → [3, 3, 4, 4]
-    test_packed_concat({{2, 3, 4, 4}, {1, 3, 4, 4}}, 0);
+NNOPS_TEST(concat_nhwc_axis0) {
+    // Concat on N axis with NHWC: [2, 3, 4, 4] + [1, 3, 4, 4] -> [3, 3, 4, 4]
+    test_channel_last_concat({{2, 3, 4, 4}, {1, 3, 4, 4}}, 0);
 }
 
-NNOPS_TEST(concat_nchwc8_axis1_c3_c5) {
-    // Concat on C axis: 3ch + 5ch → 8ch (exactly 1 C8 block)
-    test_packed_concat({{1, 3, 4, 4}, {1, 5, 4, 4}}, 1);
+NNOPS_TEST(concat_nhwc_axis1_c3_c5) {
+    // Concat on C axis: 3ch + 5ch → 8ch (single channel block)
+    test_channel_last_concat({{1, 3, 4, 4}, {1, 5, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_nchwc8_axis1_c7_c5) {
-    // C axis: 7ch + 5ch → 12ch (1 full + 1 partial C8 block)
-    test_packed_concat({{1, 7, 4, 4}, {1, 5, 4, 4}}, 1);
+NNOPS_TEST(concat_nhwc_axis1_c7_c5) {
+    // C axis: 7ch + 5ch → 12ch 
+    test_channel_last_concat({{1, 7, 4, 4}, {1, 5, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_nchwc8_axis1_c10_c6) {
-    // C axis: 10ch + 6ch → 16ch (exactly 2 C8 blocks)
-    test_packed_concat({{1, 10, 4, 4}, {1, 6, 4, 4}}, 1);
+NNOPS_TEST(concat_nhwc_axis1_c10_c6) {
+    // C axis: 10ch + 6ch → 16ch 
+    test_channel_last_concat({{1, 10, 4, 4}, {1, 6, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_nchwc8_axis1_c2_c3_c3) {
+NNOPS_TEST(concat_nhwc_axis1_c2_c3_c3) {
     // Three inputs on C axis: 2ch + 3ch + 3ch → 8ch
-    test_packed_concat({{1, 2, 4, 4}, {1, 3, 4, 4}, {1, 3, 4, 4}}, 1);
+    test_channel_last_concat({{1, 2, 4, 4}, {1, 3, 4, 4}, {1, 3, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_nchwc8_axis1_c1_c1) {
-    // Small C: 1 + 1 → 2 (partial C8 block)
-    test_packed_concat({{1, 1, 8, 8}, {1, 1, 8, 8}}, 1);
+NNOPS_TEST(concat_nhwc_axis1_c1_c1) {
+    // Small C: 1 + 1 → 2 
+    test_channel_last_concat({{1, 1, 8, 8}, {1, 1, 8, 8}}, 1);
 }
 
-NNOPS_TEST(concat_nchwc8_axis1_multibatch) {
+NNOPS_TEST(concat_nhwc_axis1_multibatch) {
     // Multi-batch C-axis concat: N=2
-    test_packed_concat({{2, 5, 4, 4}, {2, 3, 4, 4}}, 1);
+    test_channel_last_concat({{2, 5, 4, 4}, {2, 3, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_nchwc8_axis2_H) {
-    // Concat on H axis with NCHWC8: [1, 3, 4, 4] + [1, 3, 6, 4] → [1, 3, 10, 4]
-    test_packed_concat({{1, 3, 4, 4}, {1, 3, 6, 4}}, 2);
+NNOPS_TEST(concat_nhwc_axis2_H) {
+    // Concat on H axis with NHWC: [1, 3, 4, 4] + [1, 3, 6, 4] -> [1, 3, 10, 4]
+    test_channel_last_concat({{1, 3, 4, 4}, {1, 3, 6, 4}}, 2);
 }
 
-NNOPS_TEST(concat_nchwc8_axis3_W) {
-    // Concat on W axis with NCHWC8: [1, 3, 4, 6] + [1, 3, 4, 4] → [1, 3, 4, 10]
-    test_packed_concat({{1, 3, 4, 6}, {1, 3, 4, 4}}, 3);
+NNOPS_TEST(concat_nhwc_axis3_W) {
+    // Concat on W axis with NHWC: [1, 3, 4, 6] + [1, 3, 4, 4] -> [1, 3, 4, 10]
+    test_channel_last_concat({{1, 3, 4, 6}, {1, 3, 4, 4}}, 3);
 }
 
-NNOPS_TEST(concat_nchwc8_axis2_H_multi_c8) {
-    // H-axis concat with multiple C8 blocks (C=10 → 2 C8 blocks)
-    test_packed_concat({{1, 10, 4, 4}, {1, 10, 6, 4}}, 2);
+NNOPS_TEST(concat_nhwc_axis2_H_multi_c8) {
+    // H-axis concat with multiple channel planes (C=10)
+    test_channel_last_concat({{1, 10, 4, 4}, {1, 10, 6, 4}}, 2);
 }
 
-NNOPS_TEST(concat_nchwc8_axis0_multi_c8) {
-    // N-axis concat with multiple C8 blocks
-    test_packed_concat({{2, 10, 4, 4}, {1, 10, 4, 4}}, 0);
+NNOPS_TEST(concat_nhwc_axis0_multi_c8) {
+    // N-axis concat with multiple channel planes
+    test_channel_last_concat({{2, 10, 4, 4}, {1, 10, 4, 4}}, 0);
 }
 
 // ============================================================
-// 3D packed layout tests (NCDHWC8)
+// 3D channel-last layout tests (NDHWC)
 // ============================================================
 
-NNOPS_TEST(concat_ncdhwc8_axis1_C) {
+NNOPS_TEST(concat_ndhwc_axis1_C) {
     // C-axis concat: [1, 3, 4, 4, 4] + [1, 5, 4, 4, 4] → [1, 8, 4, 4, 4]
-    test_packed_concat({{1, 3, 4, 4, 4}, {1, 5, 4, 4, 4}}, 1);
+    test_channel_last_concat({{1, 3, 4, 4, 4}, {1, 5, 4, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_ncdhwc8_axis1_C_multi) {
-    // C-axis concat with multiple C8 blocks (10ch + 8ch → 18ch)
-    test_packed_concat({{1, 10, 2, 4, 4}, {1, 8, 2, 4, 4}}, 1);
+NNOPS_TEST(concat_ndhwc_axis1_C_multi) {
+    // C-axis concat with multiple channel planes (10ch + 8ch → 18ch)
+    test_channel_last_concat({{1, 10, 2, 4, 4}, {1, 8, 2, 4, 4}}, 1);
 }
 
-NNOPS_TEST(concat_ncdhwc8_axis2_D) {
+NNOPS_TEST(concat_ndhwc_axis2_D) {
     // D-axis concat: [1, 3, 2, 4, 4] + [1, 3, 3, 4, 4] → [1, 3, 5, 4, 4]
-    test_packed_concat({{1, 3, 2, 4, 4}, {1, 3, 3, 4, 4}}, 2);
+    test_channel_last_concat({{1, 3, 2, 4, 4}, {1, 3, 3, 4, 4}}, 2);
 }
 
-NNOPS_TEST(concat_ncdhwc8_axis3_H) {
+NNOPS_TEST(concat_ndhwc_axis3_H) {
     // H-axis concat
-    test_packed_concat({{1, 3, 2, 4, 4}, {1, 3, 2, 6, 4}}, 3);
+    test_channel_last_concat({{1, 3, 2, 4, 4}, {1, 3, 2, 6, 4}}, 3);
 }
 
-NNOPS_TEST(concat_ncdhwc8_axis4_W) {
+NNOPS_TEST(concat_ndhwc_axis4_W) {
     // W-axis concat
-    test_packed_concat({{1, 3, 2, 4, 6}, {1, 3, 2, 4, 4}}, 4);
+    test_channel_last_concat({{1, 3, 2, 4, 6}, {1, 3, 2, 4, 4}}, 4);
 }

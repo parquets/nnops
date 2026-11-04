@@ -47,15 +47,14 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
             detail::dtype_in<DataType::f32, DataType::f16,
                              DataType::s8, DataType::u8>(in.dtype));
     }
-    // Planar reads the raw filter one channel plane at a time, f32/f16 only.
-    // Nothing produces PackedWeight any more, so it is rejected here rather than
-    // misread as a raw filter.
+    // Planar reads the raw [C, 1, KH, KW] filter one channel plane at a time,
+    // f32/f16 only.
     if (!is_planar_spatial(in.layout)) {
         return Status::unsupported;
     }
     return detail::require(
         detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
-            inputs[1].layout != TensorLayout::PackedWeight,
+            is_planar_spatial(inputs[1].layout),
         Status::unsupported);
 }
 

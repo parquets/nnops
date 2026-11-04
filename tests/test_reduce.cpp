@@ -1,29 +1,30 @@
 /// @file test_reduce.cpp
 /// @brief Tests for the Reduce operator (Sum, Min, Max, Mean).
 ///
-/// Planar 1D/2D/3D, keepdims, negative axes, NCHWC8 and f16. The 1D/2D
+/// Planar 1D/2D/3D, keepdims, negative axes, channel-last and f16. The 1D/2D
 /// expected values are hand-computed next to the asserts; the random-data
 /// tests build a scalar reference over the same buffer. A negative axis wraps
 /// from the end, so the negative-axis test runs axis=2 and axis=-1 on one
 /// input and compares the two outputs.
 ///
-/// NCHWC8 is where the context is needed. The desc is rank 4 [N, C, H, W] with
-/// C the LOGICAL channel count, while storage is [n][c8][h][w][lane]: a row is
-/// W positions of 8 lanes, row_stride = W * 8 elements (the 32B row pitch
-/// never pads: W*8 f32 is already 32B), and c8 runs over ceil(C / 8) blocks.
-/// Reducing the last axis runs per lane, i.e. per channel, and the output just
-/// loses that extent: rank 3 [N, C, H] here, or rank 4 with the extent left at
-/// 1 under keepdims. Buffers come from desc.storage_bytes(), which is what
-/// accounts for the padded channel blocks.
+/// The channel-last section converts a planar input to NHWC/NDHWC, reduces, and
+/// compares the result against the planar reduce in logical order. The layout
+/// only changes where the values live: the axis means the same thing either
+/// way. A rank-dropping reduce on a channel-last input produces a planar
+/// output -- dropping an axis shifts whichever axis C sat on, so the tag cannot
+/// describe the shorter rank any more -- while keepdims keeps the rank and the
+/// channel-last tag.
 ///
 /// f16 goes through the SIMD f16 path and is compared against the f32
 /// reference at 5e-2 rather than round-tripped.
 
 #include "nnops/ops/reduce.hpp"
+#include "nnops/ops/layout_convert.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 
+#include <cmath>
 #include <random>
 
 using namespace nnops;
@@ -583,363 +584,172 @@ NNOPS_TEST(reduce_3d_first_axis) {
 }
 
 // ============================================================
-// Packed layout tests (NCHWC8)
+// Channel-last layout tests (NHWC / NDHWC)
 // ============================================================
 
-/// Rank-4 [N, C, H, W] view; the buffer is sized for padded channel blocks.
-static std::pair<std::vector<float>, TensorView>
-make_nchwc8_4d(int64_t N, int64_t C, int64_t H, int64_t W)
-{
-    TensorDesc desc;
-    desc.rank = 4;
-    desc.dims = {N, C, H, W};
-    desc.dtype = DataType::f32;
-    desc.layout = TensorLayout::NCHWC8;
+namespace {
 
-    size_t nbytes = desc.storage_bytes();
-    std::vector<float> buf(nbytes / sizeof(float));
-    TensorView tv = test::make_packed(desc, buf.data());
-    return {std::move(buf), tv};
+/// Convert a planar view into `target` and return the view; `buf` outlives it.
+TensorView to_layout(const TensorView& planar, TensorLayout target,
+                     std::vector<char>& buf)
+{
+    auto op = LayoutConvert::create(target);
+    const TensorDesc in[] = {planar.desc()};
+    auto d = op->getOutputTensorDesc(in)[0];
+    buf.resize(d.storage_bytes());
+    TensorView out = test::make_packed(d, buf.data());
+    const TensorView ins[] = {planar};
+    op->compute(out, ins);
+    return out;
 }
 
-static std::pair<std::vector<float>, TensorView>
-make_nchwc8_out(const TensorDesc& desc)
+/// Compare two same-dimension views in logical order (any layout).
+bool same_logical_f32(const TensorView& a, const TensorView& b)
 {
-    size_t nbytes = desc.storage_bytes();
-    std::vector<float> buf(nbytes / sizeof(float));
-    TensorView tv = test::make_packed(desc, buf.data());
-    return {std::move(buf), tv};
-}
-
-static void fill_nchwc8(float* data,
-                         int64_t N, int64_t C, int64_t H, int64_t W,
-                         float base_val, float step)
-{
-    int64_t num_c8 = (C + 7) / 8;
-    int64_t row_stride = W * 8;
-    int64_t c8_stride = H * row_stride;
-    int64_t n_stride = num_c8 * c8_stride;
-    float val = base_val;
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t c8 = 0; c8 < num_c8; ++c8) {
-            for (int64_t h = 0; h < H; ++h) {
-                for (int64_t w = 0; w < W; ++w) {
-                    for (int64_t l = 0; l < 8; ++l) {
-                        int64_t off = n * n_stride + c8 * c8_stride
-                                      + h * row_stride + w * 8 + l;
-                        data[off] = val;
-                        val += step;
-                    }
-                }
+    if (a.rank() != b.rank()) {
+        return false;
+    }
+    for (int64_t d = 0; d < a.rank(); ++d) {
+        if (a.shape(d) != b.shape(d)) {
+            return false;
+        }
+    }
+    int64_t idx[8] = {};
+    const int64_t rank = a.rank();
+    const int64_t total = a.numel();
+    for (int64_t flat = 0; flat < total; ++flat) {
+        int64_t off_a = 0;
+        int64_t off_b = 0;
+        for (int64_t d = 0; d < rank; ++d) {
+            off_a += idx[d] * a.stride_elems(d);
+            off_b += idx[d] * b.stride_elems(d);
+        }
+        const float x = a.ptr<float>()[off_a];
+        const float y = b.ptr<float>()[off_b];
+        // Mean's reciprocal multiply can differ by an ulp from a divide.
+        if (std::fabs(x - y) > 1e-5f + 1e-5f * std::fabs(y)) {
+            return false;
+        }
+        for (int64_t d = rank - 1; d >= 0; --d) {
+            if (++idx[d] < a.shape(d)) {
+                break;
             }
+            idx[d] = 0;
         }
     }
+    return true;
 }
 
-static float read_nchwc8(const float* data,
-                          int64_t N, int64_t C, int64_t H, int64_t W,
-                          int64_t n, int64_t c, int64_t h, int64_t w)
+/// Run the reduce on a planar input and on its channel-last twin; the results
+/// must agree element for element in logical order.
+void check_reduce_layout(const std::vector<int64_t>& shape,
+                         ReduceType type, int64_t axis, bool keepdims)
 {
-    int64_t num_c8 = (C + 7) / 8;
-    int64_t c8 = c / 8;
-    int64_t lane = c % 8;
-    int64_t row_stride = W * 8;
-    int64_t c8_stride = H * row_stride;
-    int64_t n_stride = num_c8 * c8_stride;
-    int64_t off = n * n_stride + c8 * c8_stride + h * row_stride + w * 8 + lane;
-    return data[off];
-}
-
-NNOPS_TEST(reduce_nchwc8_axis_w_sum) {
-    const int64_t N = 1, C = 8, H = 1, W = 4;
-
-    auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-    fill_nchwc8(in_data.data(), N, C, H, W, 1.0f, 1.0f);
-
-    auto d_in = input.desc();
+    const uint64_t seed = static_cast<uint64_t>(
+        100 + axis * 7 + (keepdims ? 1 : 0) + static_cast<int>(type) * 31);
+    auto [in_vec, in_planar] = test::make_random_tensor(shape, -2.0f, 2.0f, seed);
 
     ReduceAttributes attrs;
-    attrs.type = ReduceType::Sum;
-    attrs.axis = -1;  // W dimension (rank-1)
+    attrs.type = type;
+    attrs.axis = axis;
+    attrs.keepdims = keepdims;
     auto op = Reduce::create(attrs, Backend::CPU);
 
-    const TensorDesc in_arr[] = {d_in};
-    auto descs = op->getOutputTensorDesc(in_arr);
+    const TensorDesc planar_in[] = {in_planar.desc()};
+    auto ref_desc = op->getOutputTensorDesc(planar_in);
+    std::vector<float> ref_buf(static_cast<size_t>(ref_desc[0].numel()));
+    auto ref_out = test::make_planar(ref_desc[0], ref_buf.data());
+    const TensorView ref_ins[] = {in_planar};
+    op->compute(ref_out, ref_ins);
 
-    NNOPS_EXPECT_EQ(descs[0].rank, 3);
-    NNOPS_EXPECT_EQ(descs[0].dims[0], 1);
-    NNOPS_EXPECT_EQ(descs[0].dims[1], 8);
-    NNOPS_EXPECT_EQ(descs[0].dims[2], 1);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHWC8);
+    std::vector<char> cl_buf;
+    const TensorLayout cl_layout =
+        (shape.size() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
+    auto in_cl = to_layout(in_planar, cl_layout, cl_buf);
 
-    auto [out_buf, output] = make_nchwc8_out(descs[0]);
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins);
-
-    // Lane l sums (1+l)+(9+l)+(17+l)+(25+l) = 4*l + 52 into the 8 lanes at offset 0.
-    for (int lane = 0; lane < 8; ++lane) {
-        float expected = 4.0f * static_cast<float>(lane) + 52.0f;
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(lane)], expected, 1e-4f);
+    const TensorDesc cl_in[] = {in_cl.desc()};
+    auto cl_desc = op->getOutputTensorDesc(cl_in);
+    NNOPS_EXPECT_EQ(cl_desc[0].rank, ref_desc[0].rank);
+    for (int64_t d = 0; d < cl_desc[0].rank; ++d) {
+        NNOPS_EXPECT_EQ(cl_desc[0].dims[static_cast<size_t>(d)],
+                        ref_desc[0].dims[static_cast<size_t>(d)]);
     }
+    // A rank-preserving output stays channel-last; a rank-dropping one is planar.
+    const TensorLayout planar_layout =
+        (shape.size() == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : planar_layout);
 
-    // Cross-check through read_nchwc8.
-    for (int lane = 0; lane < 8; ++lane) {
-        float sum = 0.0f;
-        for (int w = 0; w < 4; ++w) {
-            sum += read_nchwc8(in_data.data(), N, C, H, W, 0, lane, 0, w);
-        }
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(lane)], sum, 1e-4f);
-    }
+    std::vector<float> out_buf(
+        static_cast<size_t>(cl_desc[0].storage_bytes() / sizeof(float)));
+    auto out_cl = test::make_packed(cl_desc[0], out_buf.data());
+    const TensorView cl_ins[] = {in_cl};
+    op->compute(out_cl, cl_ins);
+
+    NNOPS_EXPECT_TRUE(same_logical_f32(out_cl, ref_out));
 }
 
-NNOPS_TEST(reduce_nchwc8_axis_w_max) {
-    const int64_t N = 1, C = 8, H = 1, W = 3;
+}  // anonymous namespace
 
-    auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-    int64_t num_c8 = (C + 7) / 8;
-    int64_t row_stride = W * 8;
-    int64_t c8_stride = H * row_stride;
-    int64_t n_stride = num_c8 * c8_stride;
-    for (int lane = 0; lane < 8; ++lane) {
-        for (int w = 0; w < W; ++w) {
-            int64_t off = 0 * n_stride + 0 * c8_stride + 0 * row_stride + w * 8 + lane;
-            // Lane l: values 10*l+w+1, so max is 10*l+W at w=W-1
-            in_data[off] = 10.0f * static_cast<float>(lane) + static_cast<float>(w) + 1.0f;
-        }
-    }
-
-    auto d_in = input.desc();
-
-    ReduceAttributes attrs;
-    attrs.type = ReduceType::Max;
-    attrs.axis = -1;
-    auto op = Reduce::create(attrs, Backend::CPU);
-
-    const TensorDesc in_arr[] = {d_in};
-    auto descs = op->getOutputTensorDesc(in_arr);
-
-    auto [out_buf, output] = make_nchwc8_out(descs[0]);
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins);
-
-    for (int lane = 0; lane < 8; ++lane) {
-        float expected = 10.0f * static_cast<float>(lane) + 3.0f; // max at w=2
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(lane)], expected, 1e-4f);
-    }
-}
-
-NNOPS_TEST(reduce_nchwc8_axis_w_mean) {
-    const int64_t N = 1, C = 8, H = 1, W = 4;
-
-    auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-    fill_nchwc8(in_data.data(), N, C, H, W, 1.0f, 1.0f);
-
-    auto d_in = input.desc();
-
-    ReduceAttributes attrs;
-    attrs.type = ReduceType::Mean;
-    attrs.axis = -1;
-    auto op = Reduce::create(attrs, Backend::CPU);
-
-    const TensorDesc in_arr[] = {d_in};
-    auto descs = op->getOutputTensorDesc(in_arr);
-
-    auto [out_buf, output] = make_nchwc8_out(descs[0]);
-
-    const TensorView ins[] = {input};
-    op->compute(output, ins);
-
-    // Per-lane means: ((1+l) + (9+l) + (17+l) + (25+l)) / 4 = (4*l + 52) / 4 = l + 13
-    for (int lane = 0; lane < 8; ++lane) {
-        float expected = static_cast<float>(lane) + 13.0f;
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(lane)], expected, 1e-4f);
-    }
-}
-
-NNOPS_TEST(reduce_nchwc8_axis_w_min) {
-    const int64_t N = 1, C = 8, H = 1, W = 3;
-
-    auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-    int64_t num_c8 = (C + 7) / 8;
-    int64_t row_stride = W * 8;
-    int64_t c8_stride = H * row_stride;
-    int64_t n_stride = num_c8 * c8_stride;
-    for (int lane = 0; lane < 8; ++lane) {
-        for (int w = 0; w < W; ++w) {
-            int64_t off = 0 * n_stride + 0 * c8_stride + 0 * row_stride + w * 8 + lane;
-            in_data[off] = 20.0f - static_cast<float>(w) * static_cast<float>(lane + 1);
-        }
-    }
-
-    ReduceAttributes attrs;
-    attrs.type = ReduceType::Min;
-    attrs.axis = -1;
-    auto op = Reduce::create(attrs, Backend::CPU);
-
-    const TensorDesc in_arr2[] = {input.desc()};
-    auto descs2 = op->getOutputTensorDesc(in_arr2);
-    auto [out_buf, output] = make_nchwc8_out(descs2[0]);
-    const TensorView ins[] = {input};
-    op->compute(output, ins);
-
-    for (int lane = 0; lane < 8; ++lane) {
-        // Min is at w=2: 20 - 2*(lane+1) = 18 - 2*lane
-        float expected = 20.0f - 2.0f * static_cast<float>(lane + 1);
-        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(lane)], expected, 1e-4f);
-    }
-}
-
-NNOPS_TEST(reduce_nchwc8_random) {
-    // [2, 16, 3, 5] — two full C8 blocks.
-    const int64_t N = 2, C = 16, H = 3, W = 5;
-    const int64_t num_c8 = (C + 7) / 8;
-    const int64_t row_stride = W * 8;
-
-    auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
-    for (auto& v : in_data) {
-        v = dist(rng);
-    }
-
-    int64_t n_stride = num_c8 * H * row_stride;
-    int64_t c8_stride = H * row_stride;
-
-    struct TestCase { ReduceType type; };
-    TestCase cases[] = {
-        {ReduceType::Sum},
-        {ReduceType::Max},
-        {ReduceType::Min},
-        {ReduceType::Mean},
+NNOPS_TEST(reduce_nhwc_axis_c_sum) {
+    // Hand-checked: C is contiguous in NHWC, so this is the SIMD row path.
+    const int64_t N = 1, C = 4, H = 1, W = 3;
+    float in_planar_data[] = {
+        1.0f, 2.0f, 3.0f,        // c=0
+        10.0f, 20.0f, 30.0f,     // c=1
+        100.0f, 200.0f, 300.0f,  // c=2
+        -1.0f, -2.0f, -3.0f,     // c=3
     };
+    const int64_t shape[] = {N, C, H, W};
+    TensorView in_planar(shape, DataType::f32, in_planar_data);
 
-    for (const auto& tc : cases) {
-        ReduceAttributes attrs;
-        attrs.type = tc.type;
-        attrs.axis = -1;
-        auto op = Reduce::create(attrs, Backend::CPU);
-
-        auto d_in2 = input.desc();
-        const TensorDesc in_arr2[] = {d_in2};
-        auto descs2 = op->getOutputTensorDesc(in_arr2);
-        auto [out_buf, output] = make_nchwc8_out(descs2[0]);
-        const TensorView ins[] = {input};
-        op->compute(output, ins);
-
-        // Output is rank 3 [N, C, H]; C=16 fills whole blocks, so position pos
-        // owns the 8 lanes at pos*8 with no pitch slack.
-        int64_t out_positions = static_cast<int64_t>(N) * num_c8 * H;
-        for (int64_t pos = 0; pos < out_positions; ++pos) {
-            int64_t n = pos / (num_c8 * H);
-            int64_t c8 = (pos / H) % num_c8;
-            int64_t h = pos % H;
-            for (int lane = 0; lane < 8; ++lane) {
-                float result;
-                switch (tc.type) {
-                case ReduceType::Sum: {
-                    float sum = 0.0f;
-                    for (int64_t w = 0; w < W; ++w) {
-                        int64_t off = n * n_stride + c8 * c8_stride
-                                      + h * row_stride + w * 8 + lane;
-                        sum += in_data[off];
-                    }
-                    result = sum;
-                    break;
-                }
-                case ReduceType::Max: {
-                    float best = -std::numeric_limits<float>::infinity();
-                    for (int64_t w = 0; w < W; ++w) {
-                        int64_t off = n * n_stride + c8 * c8_stride
-                                      + h * row_stride + w * 8 + lane;
-                        if (in_data[off] > best) {
-                            best = in_data[off];
-                        }
-                    }
-                    result = best;
-                    break;
-                }
-                case ReduceType::Min: {
-                    float best = std::numeric_limits<float>::infinity();
-                    for (int64_t w = 0; w < W; ++w) {
-                        int64_t off = n * n_stride + c8 * c8_stride
-                                      + h * row_stride + w * 8 + lane;
-                        if (in_data[off] < best) {
-                            best = in_data[off];
-                        }
-                    }
-                    result = best;
-                    break;
-                }
-                case ReduceType::Mean: {
-                    float sum = 0.0f;
-                    for (int64_t w = 0; w < W; ++w) {
-                        int64_t off = n * n_stride + c8 * c8_stride
-                                      + h * row_stride + w * 8 + lane;
-                        sum += in_data[off];
-                    }
-                    result = sum / static_cast<float>(W);
-                    break;
-                }
-                }
-                int64_t out_off = pos * 8 + lane;
-                NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(out_off)], result, 1e-4f);
-            }
-        }
-    }
-}
-
-NNOPS_TEST(reduce_nchwc8_keepdims) {
-    const int64_t N = 1, C = 8, H = 2, W = 3;
-
-    auto [in_data, input] = make_nchwc8_4d(N, C, H, W);
-    fill_nchwc8(in_data.data(), N, C, H, W, 0.0f, 1.0f);
-
-    auto d_in = input.desc();
+    std::vector<char> cl_buf;
+    auto in_cl = to_layout(in_planar, TensorLayout::NHWC, cl_buf);
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
-    attrs.axis = -1;
-    attrs.keepdims = true;
+    attrs.axis = 1;
     auto op = Reduce::create(attrs, Backend::CPU);
 
-    const TensorDesc in_arr[] = {d_in};
-    auto descs = op->getOutputTensorDesc(in_arr);
+    const TensorDesc in_desc[] = {in_cl.desc()};
+    auto descs = op->getOutputTensorDesc(in_desc);
+    NNOPS_EXPECT_EQ(descs[0].rank, 3);
+    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    NNOPS_EXPECT_EQ(descs[0].rank, 4);
-    NNOPS_EXPECT_EQ(descs[0].dims[3], 1);
-    NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHWC8);
-
-    auto [out_buf, output] = make_nchwc8_out(descs[0]);
-
-    const TensorView ins[] = {input};
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = test::make_planar(descs[0], out_buf.data());
+    const TensorView ins[] = {in_cl};
     op->compute(output, ins);
 
-    int64_t num_c8 = (C + 7) / 8;
-    int64_t in_row_stride = W * 8;
-    int64_t in_c8_stride = H * in_row_stride;
-    int64_t in_n_stride = num_c8 * in_c8_stride;
-    int64_t out_row_stride = 1 * 8;
-    int64_t out_c8_stride = H * out_row_stride;
-    int64_t out_n_stride = num_c8 * out_c8_stride;
+    NNOPS_EXPECT_NEAR(out_buf[0], 1.0f + 10.0f + 100.0f - 1.0f, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[1], 2.0f + 20.0f + 200.0f - 2.0f, 1e-4f);
+    NNOPS_EXPECT_NEAR(out_buf[2], 3.0f + 30.0f + 300.0f - 3.0f, 1e-4f);
+}
 
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t c8 = 0; c8 < num_c8; ++c8) {
-            for (int64_t h = 0; h < H; ++h) {
-                for (int lane = 0; lane < 8; ++lane) {
-                    float sum = 0.0f;
-                    for (int64_t w = 0; w < W; ++w) {
-                        int64_t off = n * in_n_stride + c8 * in_c8_stride
-                                      + h * in_row_stride + w * 8 + lane;
-                        sum += in_data[off];
-                    }
-                    int64_t out_off = n * out_n_stride + c8 * out_c8_stride
-                                      + h * out_row_stride + lane;
-                    NNOPS_EXPECT_NEAR(out_buf[out_off], sum, 1e-4f);
-                }
-            }
+NNOPS_TEST(reduce_nhwc_axis_c_keepdims) {
+    check_reduce_layout({2, 5, 3, 4}, ReduceType::Sum, 1, true);
+    check_reduce_layout({2, 5, 3, 4}, ReduceType::Mean, 1, true);
+}
+
+NNOPS_TEST(reduce_nhwc_all_axes) {
+    const std::vector<int64_t> shape = {2, 4, 3, 5};
+    const ReduceType types[] = {ReduceType::Sum, ReduceType::Max,
+                                ReduceType::Min, ReduceType::Mean};
+    for (const auto type : types) {
+        for (int64_t axis = 0; axis < 4; ++axis) {
+            check_reduce_layout(shape, type, axis, false);
+            check_reduce_layout(shape, type, axis, true);
+        }
+        check_reduce_layout(shape, type, -1, false);
+    }
+}
+
+NNOPS_TEST(reduce_ndhwc_all_axes) {
+    const std::vector<int64_t> shape = {2, 3, 2, 3, 4};
+    const ReduceType types[] = {ReduceType::Sum, ReduceType::Max, ReduceType::Mean};
+    for (const auto type : types) {
+        for (int64_t axis = 0; axis < 5; ++axis) {
+            check_reduce_layout(shape, type, axis, false);
+            check_reduce_layout(shape, type, axis, true);
         }
     }
 }

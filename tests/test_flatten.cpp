@@ -2,13 +2,13 @@
 /// @brief Flatten tests — every accepted layout unpacks to dense contiguous
 /// planar data of the input's logical rank and dtype.
 ///
-/// Coverage: an already-dense NCHW input (the memcpy identity path), NCHWC8 with a
-/// partial block, a full C8 block, a single channel and several batches, NCDHWC8
-/// for the 3D case, and SIMD output against the reference flatten.
+/// Coverage: an already-dense NCHW input (the memcpy identity path), NHWC with
+/// a partial / full / single channel plane and several batches, NDHWC for the
+/// 3D case, and SIMD output against the reference flatten.
 ///
-/// Every packed input is produced by running LayoutConvert into a make_packed
-/// buffer at the default 32-byte alignment; at these row widths (128 to 256 bytes)
-/// that alignment adds nothing, so no case exercises pitch padding.
+/// Every channel-last input is produced by running LayoutConvert into a
+/// make_packed buffer at the default 32-byte alignment, so a pitched row is
+/// exercised whenever the row width is not already a multiple of 32 bytes.
 
 #include "nnops/ops/flatten.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -28,6 +28,25 @@ namespace nnops::backend::cpu::reference {
                      const ComputeContext& ctx,
                      void* workspace);
 }
+
+namespace {
+
+/// Convert a planar view into `target` (NHWC / NDHWC) and return the view; the
+/// caller keeps `buf` alive.
+TensorView to_channel_last(const TensorView& planar, TensorLayout target,
+                           std::vector<char>& buf)
+{
+    auto op = LayoutConvert::create(target, Backend::CPU);
+    const TensorDesc in[] = {planar.desc()};
+    TensorDesc d = op->getOutputTensorDesc(in)[0];
+    buf.resize(d.storage_bytes());
+    TensorView cl = test::make_packed(d, buf.data());
+    const TensorView ins[] = {planar};
+    op->compute(cl, ins);
+    return cl;
+}
+
+}  // anonymous namespace
 
 NNOPS_TEST(flatten_planar_identity) {
     const int64_t shape[] = {1, 3, 4, 4};
@@ -55,23 +74,15 @@ NNOPS_TEST(flatten_planar_identity) {
     NNOPS_EXPECT_TRUE(test::allclose(output, input, 1e-7f, 1e-7f));
 }
 
-NNOPS_TEST(flatten_nchwc8_to_nchw) {
-    const std::vector<int64_t> shape = {2, 5, 4, 4};  // 5ch → partial C8
+NNOPS_TEST(flatten_nhwc_to_nchw) {
+    const std::vector<int64_t> shape = {2, 5, 4, 4};  // odd C
 
     auto [in_vec, in_planar] = test::make_random_tensor(shape, -1.0f, 1.0f, 123);
-
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    auto d = in_planar.desc();
-    const TensorDesc pack_in[] = {d};
-    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
-
-    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-    auto in_packed = test::make_packed(pack_descs[0], packed_buf.data());
-    const TensorView pack_ins[] = {in_planar};
-    pack_op->compute(in_packed, pack_ins);
+    std::vector<char> cl_buf;
+    TensorView in_cl = to_channel_last(in_planar, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
-    auto pd = in_packed.desc();
+    auto pd = in_cl.desc();
     const TensorDesc flat_in[] = {pd};
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
@@ -81,82 +92,64 @@ NNOPS_TEST(flatten_nchwc8_to_nchw) {
 
     std::vector<float> flat_buf(flat_descs[0].numel());
     TensorView out_planar = test::make_planar(flat_descs[0], flat_buf.data());
-    const TensorView flat_ins[] = {in_packed};
+    const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_planar, flat_ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_planar, in_planar, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_nchwc8_full_c8) {
-    const std::vector<int64_t> shape = {1, 8, 6, 6};  // full C8 block
+NNOPS_TEST(flatten_nhwc_full_c) {
+    const std::vector<int64_t> shape = {1, 8, 6, 6};
     auto [in_vec, in_planar] = test::make_random_tensor(shape, -1.0f, 1.0f, 456);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    auto d = in_planar.desc();
-    const TensorDesc pack_in[] = {d};
-    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
-    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-    auto in_packed = test::make_packed(pack_descs[0], packed_buf.data());
-    const TensorView pack_ins[] = {in_planar};
-    pack_op->compute(in_packed, pack_ins);
+    std::vector<char> cl_buf;
+    TensorView in_cl = to_channel_last(in_planar, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
-    auto pd = in_packed.desc();
+    auto pd = in_cl.desc();
     const TensorDesc flat_in[] = {pd};
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
     std::vector<float> flat_buf(flat_descs[0].numel());
     TensorView out_planar = test::make_planar(flat_descs[0], flat_buf.data());
-    const TensorView flat_ins[] = {in_packed};
+    const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_planar, flat_ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_planar, in_planar, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_nchwc8_single_channel) {
-    const std::vector<int64_t> shape = {1, 1, 8, 8};  // C = 1, one packed block
+NNOPS_TEST(flatten_nhwc_single_channel) {
+    const std::vector<int64_t> shape = {1, 1, 8, 8};
     auto [in_vec, in_planar] = test::make_random_tensor(shape, -1.0f, 1.0f, 789);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    auto d = in_planar.desc();
-    const TensorDesc pack_in[] = {d};
-    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
-    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-    auto in_packed = test::make_packed(pack_descs[0], packed_buf.data());
-    const TensorView pack_ins[] = {in_planar};
-    pack_op->compute(in_packed, pack_ins);
+    std::vector<char> cl_buf;
+    TensorView in_cl = to_channel_last(in_planar, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
-    auto pd = in_packed.desc();
+    auto pd = in_cl.desc();
     const TensorDesc flat_in[] = {pd};
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
     std::vector<float> flat_buf(flat_descs[0].numel());
     TensorView out_planar = test::make_planar(flat_descs[0], flat_buf.data());
-    const TensorView flat_ins[] = {in_packed};
+    const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_planar, flat_ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_planar, in_planar, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_ncdhwc8_to_ncdhw) {
+NNOPS_TEST(flatten_ndhwc_to_ncdhw) {
     const std::vector<int64_t> shape = {1, 5, 3, 4, 4};
-    auto [in_vec, in_planar] = test::make_random_tensor(shape, -1.0f, 1.0f, 111);
+    auto [in_vec, _] = test::make_random_tensor(shape, -1.0f, 1.0f, 111);
 
-    TensorView in_planar_tv(std::span<const int64_t>(shape), DataType::f32,
-                             in_vec.data(), TensorLayout::NCDHW);
+    TensorView in_planar(std::span<const int64_t>(shape), DataType::f32,
+                         in_vec.data(), TensorLayout::NCDHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCDHWC8, Backend::CPU);
-    auto d = in_planar_tv.desc();
-    const TensorDesc pack_in[] = {d};
-    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
-    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-    auto in_packed = test::make_packed(pack_descs[0], packed_buf.data());
-    const TensorView pack_ins[] = {in_planar_tv};
-    pack_op->compute(in_packed, pack_ins);
+    std::vector<char> cl_buf;
+    TensorView in_cl = to_channel_last(in_planar, TensorLayout::NDHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
-    auto pd = in_packed.desc();
+    auto pd = in_cl.desc();
     const TensorDesc flat_in[] = {pd};
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
@@ -165,62 +158,50 @@ NNOPS_TEST(flatten_ncdhwc8_to_ncdhw) {
 
     std::vector<float> flat_buf(flat_descs[0].numel());
     TensorView out_planar = test::make_planar(flat_descs[0], flat_buf.data());
-    const TensorView flat_ins[] = {in_packed};
+    const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_planar, flat_ins);
 
-    NNOPS_EXPECT_TRUE(test::allclose(out_planar, in_planar_tv, 1e-5f, 1e-5f));
+    NNOPS_EXPECT_TRUE(test::allclose(out_planar, in_planar, 1e-5f, 1e-5f));
 }
 
-NNOPS_TEST(flatten_nchwc8_multibatch) {
+NNOPS_TEST(flatten_nhwc_multibatch) {
     const std::vector<int64_t> shape = {3, 7, 4, 4};
     auto [in_vec, in_planar] = test::make_random_tensor(shape, -1.0f, 1.0f, 222);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    auto d = in_planar.desc();
-    const TensorDesc pack_in[] = {d};
-    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
-    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-    auto in_packed = test::make_packed(pack_descs[0], packed_buf.data());
-    const TensorView pack_ins[] = {in_planar};
-    pack_op->compute(in_packed, pack_ins);
+    std::vector<char> cl_buf;
+    TensorView in_cl = to_channel_last(in_planar, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
-    auto pd = in_packed.desc();
+    auto pd = in_cl.desc();
     const TensorDesc flat_in[] = {pd};
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
     std::vector<float> flat_buf(flat_descs[0].numel());
     TensorView out_planar = test::make_planar(flat_descs[0], flat_buf.data());
-    const TensorView flat_ins[] = {in_packed};
+    const TensorView flat_ins[] = {in_cl};
     flatten_op->compute(out_planar, flat_ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(out_planar, in_planar, 1e-5f, 1e-5f));
 }
 
 NNOPS_TEST(flatten_simd_vs_ref) {
-    const std::vector<int64_t> shape = {2, 11, 6, 8};  // 11ch → partial C8
+    const std::vector<int64_t> shape = {2, 11, 6, 8};
 
     auto [in_vec, in_planar] = test::make_random_tensor(shape, -1.0f, 1.0f, 333);
     TensorView in_planar_tv(std::span<const int64_t>(shape), DataType::f32,
-                             in_vec.data(), TensorLayout::NCHW);
+                            in_vec.data(), TensorLayout::NCHW);
 
-    auto pack_op = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
-    auto d = in_planar_tv.desc();
-    const TensorDesc pack_in[] = {d};
-    auto pack_descs = pack_op->getOutputTensorDesc(pack_in);
-    std::vector<char> packed_buf(pack_descs[0].storage_bytes());
-    auto in_packed = test::make_packed(pack_descs[0], packed_buf.data());
-    const TensorView pack_ins[] = {in_planar_tv};
-    pack_op->compute(in_packed, pack_ins);
+    std::vector<char> cl_buf;
+    TensorView in_cl = to_channel_last(in_planar_tv, TensorLayout::NHWC, cl_buf);
 
     auto flatten_op = Flatten::create(Backend::CPU);
-    auto pd = in_packed.desc();
+    auto pd = in_cl.desc();
     const TensorDesc flat_in[] = {pd};
     auto flat_descs = flatten_op->getOutputTensorDesc(flat_in);
 
     std::vector<float> simd_buf(flat_descs[0].numel());
     TensorView simd_out = test::make_planar(flat_descs[0], simd_buf.data());
-    const TensorView simd_ins[] = {in_packed};
+    const TensorView simd_ins[] = {in_cl};
     flatten_op->compute(simd_out, simd_ins);
 
     std::vector<float> ref_buf(flat_descs[0].numel());

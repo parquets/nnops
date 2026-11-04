@@ -2,10 +2,10 @@
 /// @file flatten.hpp
 /// @brief Flatten operator — any layout to dense contiguous planar data.
 ///
-/// The counterpart of `np.ascontiguousarray()` / `.contiguous()`: channel
-/// packing is unrolled and pitch padding removed, so the output carries the
-/// input's logical shape and dtype. Inputs may be NCHW, NCHWC8, NCDHW or
-/// NCDHWC8, padded or not; f32 and f16 only.
+/// The counterpart of `np.ascontiguousarray()` / `.contiguous()`: the logical
+/// element order is preserved and pitch padding removed, so the output is a
+/// dense planar (NCHW/NCDHW) tensor with the input's shape and dtype. Inputs
+/// may be NCHW, NCDHW, NHWC or NDHWC, padded or not; f32 and f16 only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

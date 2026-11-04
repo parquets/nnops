@@ -6,7 +6,7 @@
 /// appropriate output region.
 ///
 /// This kernel operates on NCHW planar tensors. It serves as the golden
-/// reference for verifying the NCHWC8 SIMD implementation.
+/// reference for verifying the channel-last SIMD implementation.
 ///
 /// Weight layout: planar NCHW [IC, OC/G, KH, KW].
 /// Input:  NCHW [N, IC, IH, IW]

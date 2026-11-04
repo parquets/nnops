@@ -422,6 +422,54 @@ inline std::vector<TensorDesc> identity_output_shape(
     return {out};
 }
 
+/// Element-wise binary output: the NumPy broadcast of the two input shapes.
+///
+/// The layout tag follows the first input when the rank survives — the channel
+/// slot is then still dim 1 in the result — and falls back to the planar tag of
+/// the output rank otherwise (a rank change moves C, so a channel-last tag
+/// would no longer describe where it sits).
+inline std::vector<TensorDesc> broadcast_binary_output_shape(
+    std::span<const TensorDesc> inputs)
+{
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+
+    const auto dims = compute_broadcast_shape(
+        std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
+        std::span<const int64_t>(b.dims.data(), static_cast<size_t>(b.rank)));
+
+    TensorDesc out;
+    out.rank   = static_cast<int64_t>(dims.size());
+    out.dtype  = a.dtype;
+    out.dims   = dims;
+    if (a.rank == out.rank) {
+        out.layout = a.layout;
+    } else if (is_channel_last(a.layout) && a.rank == out.rank - 1) {
+        // The extra leading axis belongs to B; prepending it to a channel-last
+        // number is the same as prepending it to a planar one.
+        out.layout = (out.rank == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    } else {
+        out.layout = (out.rank == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    }
+    return {out};
+}
+
+/// True when @p a and @p b agree under NumPy broadcasting — right-aligned, each
+/// axis equal or 1.
+inline bool broadcast_compatible(std::span<const int64_t> a,
+                                 std::span<const int64_t> b) noexcept
+{
+    const int64_t ra = static_cast<int64_t>(a.size());
+    const int64_t rb = static_cast<int64_t>(b.size());
+    const int64_t rmax = std::max(ra, rb);
+    for (int64_t i = 0; i < rmax; ++i) {
+        const int64_t da = (i < ra) ? a[static_cast<size_t>(ra - 1 - i)] : 1;
+        const int64_t db = (i < rb) ? b[static_cast<size_t>(rb - 1 - i)] : 1;
+        if (da != db && da != 1 && db != 1) { return false; }
+    }
+    return true;
+}
+
 /// Same dims and dtype; only `layout` becomes target_layout.
 inline std::vector<TensorDesc> layout_convert_output_shape(
     std::span<const TensorDesc> inputs,
@@ -451,6 +499,14 @@ inline std::vector<TensorDesc> reduce_output_shape(
     TensorDesc out;
     out.layout = in.layout;
     out.dtype  = in.dtype;
+
+    // A channel-last tag describes where C sits among the *input's* axes; a
+    // rank-dropping reduce shifts them, so the result is tagged planar — the
+    // layout of a dense tensor whose logical order the kernel already writes.
+    if (!keepdims && is_channel_last(in.layout)) {
+        out.layout = (in.layout == TensorLayout::NDHWC)
+            ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    }
 
     if (keepdims) {
         out.rank = rank;

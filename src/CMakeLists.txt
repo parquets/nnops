@@ -38,6 +38,13 @@ set(NNOPS_CPU_SOURCES
     ops/rnn.cpp
     ops/gru.cpp
     ops/lstm.cpp
+    ops/pad.cpp
+    ops/gather.cpp
+    ops/scatter.cpp
+    ops/split.cpp
+    ops/tile.cpp
+    ops/where.cpp
+    ops/compare.cpp
 
     # CPU feature detection (runtime CPUID / NEON probing)
     detail/cpu_features.cpp
@@ -45,7 +52,7 @@ set(NNOPS_CPU_SOURCES
     # Operator scratch-memory pool (shared, thread-safe singleton)
     backend/cpu/common/memory_pool.cpp
 
-    # Layout conversion utilities (pack/unpack between NCHW and NCHWC8)
+    # Layout conversion utilities (planar <-> channel-last)
     backend/cpu/layout_convert.cpp
 
     # CPU optimized kernels (SIMD-accelerated)
@@ -69,6 +76,13 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/flatten.cpp
     backend/cpu/transpose_conv2d.cpp
     backend/cpu/moe.cpp
+    backend/cpu/pad.cpp
+    backend/cpu/gather.cpp
+    backend/cpu/scatter.cpp
+    backend/cpu/split.cpp
+    backend/cpu/tile.cpp
+    backend/cpu/where.cpp
+    backend/cpu/compare.cpp
 
     # CPU tiled matmul kernel (NKM loop with pack + MMA), plus the two routes
     # that bypass the plan (small naive / GEMV, fused Q4_1). matmul_helper is the

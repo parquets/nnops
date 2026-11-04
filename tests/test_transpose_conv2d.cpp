@@ -1,17 +1,17 @@
 /// @file test_transpose_conv2d.cpp
-/// @brief TransposeConv2D correctness tests — NCHWC8 only.
+/// @brief TransposeConv2D correctness tests — planar and channel-last.
 ///
-/// TransposeConv2D is packed-only, so every case round-trips: NCHW input ->
-/// LayoutConvert NCHWC8 -> compute -> LayoutConvert back to NCHW, then compare.
-/// Weight stays planar NCHW [IC, OC/G, KH, KW] (no prepacking), so one weight
-/// tensor feeds both the packed op and the scalar golden.
+/// Every case round-trips the channel-last path: NCHW input -> LayoutConvert
+/// NHWC -> compute -> LayoutConvert back to NCHW, then compare. Weight stays
+/// planar NCHW [IC, OC/G, KH, KW] (no prepacking), so one weight tensor feeds
+/// both the channel-last op and the scalar golden.
 ///
 /// Two kinds of case: hand-computed small shapes that pin exact output values
 /// and output geometry, and random roundtrips against
 /// reference::transpose_conv2d_nchw_ref (tests/reference).
 ///
-/// Input:  NCHWC8 [N, ceil(IC/8), IH, IW, 8]
-/// Output: NCHWC8 [N, ceil(OC/8), OH, OW, 8]
+/// Channel-last input:  logical [N, IC, IH, IW] stored [N, IH, IW, IC]
+/// Channel-last output: logical [N, OC, OH, OW] stored [N, OH, OW, OC]
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -36,8 +36,9 @@ namespace nnops::backend::cpu::reference {
                                     void* workspace);
 }
 
-/// Roundtrip: pack input → TransposeConv2D::compute → unpack → compare with NCHW ref golden.
-static void test_nchwc8_vs_ref(
+/// Roundtrip: convert input to NHWC -> TransposeConv2D::compute -> convert back
+/// -> compare with the NCHW scalar golden.
+static void test_channel_last_vs_ref(
     const std::vector<int64_t>& in_shape,
     const std::vector<int64_t>& w_shape,
     const TransposeConv2DAttributes& attrs,
@@ -86,17 +87,17 @@ static void test_nchwc8_vs_ref(
         }
     }
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     TensorDesc in_planar_desc = in_nchw.desc();
     const TensorDesc lc_in_desc_arr[] = {in_planar_desc};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -104,45 +105,45 @@ static void test_nchwc8_vs_ref(
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    TensorDesc in_c8_desc = in_c8.desc();
+    TensorDesc in_cl_desc = in_cl.desc();
     std::vector<TensorDesc> out_descs;
     if (has_bias) {
-        const TensorDesc tc_desc_arr[] = {in_c8_desc, w_desc_ref, b_nchw.desc()};
+        const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc_ref, b_nchw.desc()};
         out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
     } else {
-        const TensorDesc tc_desc_arr[] = {in_c8_desc, w_desc_ref};
+        const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc_ref};
         out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
     }
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
 
     {
         ComputeContext ctx;
         if (has_bias) {
-            const TensorView ins[] = {in_c8, w_nchw, b_nchw};
-            TensorView outs[] = {out_c8};
+            const TensorView ins[] = {in_cl, w_nchw, b_nchw};
+            TensorView outs[] = {out_cl};
             tconv_op->compute(outs, ins, ctx);
         } else {
-            const TensorView ins[] = {in_c8, w_nchw};
-            TensorView outs[] = {out_c8};
+            const TensorView ins[] = {in_cl, w_nchw};
+            TensorView outs[] = {out_cl};
             tconv_op->compute(outs, ins, ctx);
         }
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    TensorDesc out_c8_desc = out_c8.desc();
-    const TensorDesc lc_out_desc_arr[] = {out_c8_desc};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    TensorDesc out_cl_desc = out_cl.desc();
+    const TensorDesc planar_out_desc_arr[] = {out_cl_desc};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     NNOPS_EXPECT_TRUE(test::allclose(result, out_ref, 1e-4f, 1e-4f));
@@ -164,17 +165,17 @@ NNOPS_TEST(tconv2d_basic_1x1_kernel) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     TensorDesc in_desc = in_nchw.desc();
     const TensorDesc lc_in_desc_arr[] = {in_desc};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -186,9 +187,9 @@ NNOPS_TEST(tconv2d_basic_1x1_kernel) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    TensorDesc in_c8_desc = in_c8.desc();
+    TensorDesc in_cl_desc = in_cl.desc();
     TensorDesc w_desc = w_nchw.desc();
-    const TensorDesc tc_desc_arr[] = {in_c8_desc, w_desc};
+    const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     // [1, 1, 2, 2]
@@ -197,28 +198,28 @@ NNOPS_TEST(tconv2d_basic_1x1_kernel) {
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 2);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 2);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
 
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    TensorDesc out_c8_desc = out_c8.desc();
-    const TensorDesc lc_out_desc_arr[] = {out_c8_desc};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    TensorDesc out_cl_desc = out_cl.desc();
+    const TensorDesc planar_out_desc_arr[] = {out_cl_desc};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     for (int i = 0; i < 4; ++i) {
@@ -238,17 +239,17 @@ NNOPS_TEST(tconv2d_basic_2x2_kernel) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     TensorDesc in_desc = in_nchw.desc();
     const TensorDesc lc_in_desc_arr[] = {in_desc};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -260,36 +261,36 @@ NNOPS_TEST(tconv2d_basic_2x2_kernel) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    TensorDesc in_c8_desc = in_c8.desc();
+    TensorDesc in_cl_desc = in_cl.desc();
     TensorDesc w_desc = w_nchw.desc();
-    const TensorDesc tc_desc_arr[] = {in_c8_desc, w_desc};
+    const TensorDesc tc_desc_arr[] = {in_cl_desc, w_desc};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     // [1, 1, 3, 3]
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 3);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 3);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    TensorDesc out_c8_desc = out_c8.desc();
-    const TensorDesc lc_out_desc_arr[] = {out_c8_desc};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    TensorDesc out_cl_desc = out_cl.desc();
+    const TensorDesc planar_out_desc_arr[] = {out_cl_desc};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     // [[1, 2, 0], [3, 4, 0], [0, 0, 0]]
@@ -316,16 +317,16 @@ NNOPS_TEST(tconv2d_stride_2) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -337,32 +338,32 @@ NNOPS_TEST(tconv2d_stride_2) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 4);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 4);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
@@ -393,16 +394,16 @@ NNOPS_TEST(tconv2d_with_padding) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -414,32 +415,32 @@ NNOPS_TEST(tconv2d_with_padding) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 1);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 1);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     // input[0][0] maps to (oh, ow) = (-1, -1) and is clipped; only input[1][1]
@@ -474,16 +475,16 @@ NNOPS_TEST(tconv2d_with_bias) {
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
     TensorView b_nchw(bshape, DataType::f32, b_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -495,32 +496,32 @@ NNOPS_TEST(tconv2d_with_bias) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc(), b_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc(), b_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 2);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 2);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw, b_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw, b_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     for (int i = 0; i < 4; ++i) {
@@ -542,16 +543,16 @@ NNOPS_TEST(tconv2d_epilogue_relu) {
     const int64_t bshape[] = {1};
     TensorView b_nchw(bshape, DataType::f32, b_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -564,29 +565,29 @@ NNOPS_TEST(tconv2d_epilogue_relu) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc(), b_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc(), b_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw, b_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw, b_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     NNOPS_EXPECT_NEAR(result_buf[0], 0.0f, 1e-4f);
@@ -604,16 +605,16 @@ NNOPS_TEST(tconv2d_groups) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -626,31 +627,31 @@ NNOPS_TEST(tconv2d_groups) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     NNOPS_EXPECT_EQ(out_descs[0].dims[1], 2);  // OC = 2
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     NNOPS_EXPECT_NEAR(result_buf[0], 20.0f, 1e-4f);
@@ -669,16 +670,16 @@ NNOPS_TEST(tconv2d_output_padding) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -691,7 +692,7 @@ NNOPS_TEST(tconv2d_output_padding) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 4);
@@ -709,26 +710,26 @@ NNOPS_TEST(tconv2d_output_padding) {
             attrs, out_ref, ref_arr, ctx, nullptr);
     }
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     NNOPS_EXPECT_TRUE(test::allclose(result, out_ref, 1e-4f, 1e-4f));
@@ -746,16 +747,16 @@ NNOPS_TEST(tconv2d_dilation) {
     TensorView in_nchw(ishape, DataType::f32, in_buf.data(), TensorLayout::NCHW);
     TensorView w_nchw(wshape, DataType::f32, w_buf.data(), TensorLayout::NCHW);
 
-    auto lc_in = LayoutConvert::create(TensorLayout::NCHWC8, Backend::CPU);
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
     const TensorDesc lc_in_desc_arr[] = {in_nchw.desc()};
     auto lc_in_descs = lc_in->getOutputTensorDesc(lc_in_desc_arr);
 
-    std::vector<float> packed_in_buf(
+    std::vector<float> cl_in_buf(
         static_cast<size_t>(lc_in_descs[0].storage_bytes()));
-    auto in_c8 = test::make_packed(lc_in_descs[0], packed_in_buf.data());
+    auto in_cl = test::make_packed(lc_in_descs[0], cl_in_buf.data());
     {
         const TensorView lc_ins[] = {in_nchw};
-        TensorView lc_outs[] = {in_c8};
+        TensorView lc_outs[] = {in_cl};
         lc_in->compute(lc_outs, lc_ins);
     }
 
@@ -767,32 +768,32 @@ NNOPS_TEST(tconv2d_dilation) {
 
     auto tconv_op = TransposeConv2D::create(attrs, Backend::CPU);
 
-    const TensorDesc tc_desc_arr[] = {in_c8.desc(), w_nchw.desc()};
+    const TensorDesc tc_desc_arr[] = {in_cl.desc(), w_nchw.desc()};
     auto out_descs = tconv_op->getOutputTensorDesc(tc_desc_arr);
 
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 5);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 5);
 
-    std::vector<float> packed_out_buf(
+    std::vector<float> cl_out_buf(
         static_cast<size_t>(out_descs[0].storage_bytes()));
-    auto out_c8 = test::make_packed(out_descs[0], packed_out_buf.data());
+    auto out_cl = test::make_packed(out_descs[0], cl_out_buf.data());
     {
-        const TensorView ins[] = {in_c8, w_nchw};
-        TensorView outs[] = {out_c8};
+        const TensorView ins[] = {in_cl, w_nchw};
+        TensorView outs[] = {out_cl};
         tconv_op->compute(outs, ins);
     }
 
-    auto lc_out = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    const TensorDesc lc_out_desc_arr[] = {out_c8.desc()};
-    auto lc_out_descs = lc_out->getOutputTensorDesc(lc_out_desc_arr);
+    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    const TensorDesc planar_out_desc_arr[] = {out_cl.desc()};
+    auto planar_out_descs = to_planar->getOutputTensorDesc(planar_out_desc_arr);
 
     std::vector<float> result_buf(
-        static_cast<size_t>(lc_out_descs[0].numel()));
-    auto result = test::make_planar(lc_out_descs[0], result_buf.data());
+        static_cast<size_t>(planar_out_descs[0].numel()));
+    auto result = test::make_planar(planar_out_descs[0], result_buf.data());
     {
-        const TensorView lc_ins[] = {out_c8};
+        const TensorView lc_ins[] = {out_cl};
         TensorView lc_outs[] = {result};
-        lc_out->compute(lc_outs, lc_ins);
+        to_planar->compute(lc_outs, lc_ins);
     }
 
     auto tconv_op_ref = TransposeConv2D::create(attrs, Backend::CPU);
@@ -811,7 +812,7 @@ NNOPS_TEST(tconv2d_dilation) {
 }
 
 // ============================================================
-// NCHWC8 roundtrip tests (random data, compare with NCHW ref golden)
+// NHWC roundtrip tests (random data, compare with NCHW ref golden)
 // ============================================================
 
 NNOPS_TEST(tconv2d_roundtrip_f32) {
@@ -822,7 +823,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32) {
     attrs.padding      = {1, 1};
     attrs.groups       = 1;
 
-    test_nchwc8_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs);
+    test_channel_last_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_bias) {
@@ -833,7 +834,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_bias) {
     attrs.padding      = {1, 1};
     attrs.groups       = 1;
 
-    test_nchwc8_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs, /*has_bias=*/true);
+    test_channel_last_vs_ref({1, 4, 8, 8}, {4, 8, 3, 3}, attrs, /*has_bias=*/true);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_groups) {
@@ -844,7 +845,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_groups) {
     attrs.padding      = {0, 0};
     attrs.groups       = 2;
 
-    test_nchwc8_vs_ref({1, 4, 4, 4}, {4, 4, 3, 3}, attrs);
+    test_channel_last_vs_ref({1, 4, 4, 4}, {4, 4, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_nopad) {
@@ -855,7 +856,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_nopad) {
     attrs.padding      = {0, 0};
     attrs.groups       = 1;
 
-    test_nchwc8_vs_ref({1, 4, 4, 4}, {4, 6, 2, 2}, attrs);
+    test_channel_last_vs_ref({1, 4, 4, 4}, {4, 6, 2, 2}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_dilation) {
@@ -866,7 +867,7 @@ NNOPS_TEST(tconv2d_roundtrip_f32_dilation) {
     attrs.padding      = {0, 0};
     attrs.groups       = 1;
 
-    test_nchwc8_vs_ref({1, 4, 8, 8}, {4, 4, 3, 3}, attrs);
+    test_channel_last_vs_ref({1, 4, 8, 8}, {4, 4, 3, 3}, attrs);
 }
 
 NNOPS_TEST(tconv2d_roundtrip_f32_multi_channel) {
@@ -878,5 +879,5 @@ NNOPS_TEST(tconv2d_roundtrip_f32_multi_channel) {
     attrs.padding      = {1, 1};
     attrs.groups       = 1;
 
-    test_nchwc8_vs_ref({1, 16, 8, 8}, {16, 32, 3, 3}, attrs);
+    test_channel_last_vs_ref({1, 16, 8, 8}, {16, 32, 3, 3}, attrs);
 }

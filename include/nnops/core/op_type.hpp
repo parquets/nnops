@@ -51,6 +51,18 @@ enum class OpType : uint8_t {
     Rnn             = 36,
     Gru             = 37,
     Lstm            = 38,
+    Pad             = 39,
+    Gather          = 40,
+    GatherElements  = 41,
+    GatherND        = 42,
+    ScatterElements = 43,
+    ScatterND       = 44,
+    Split           = 45,
+    Tile            = 46,
+    Expand          = 47,
+    Where           = 48,
+    Compare         = 49,
+    Logical         = 50,
 };
 
 }  // namespace nnops

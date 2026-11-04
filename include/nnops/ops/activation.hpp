@@ -6,6 +6,10 @@
 /// Quantized s8/u8 → s8/u8 is a fused dequantize → f32 activation → requantize
 /// path; both operands must be quantized, and only PerTensor / PerToken
 /// granularity is supported.
+///
+/// Every type but PRelu takes one input. PRelu takes the activation first and
+/// the slope second: a [C] vector (channel is logical dim 1, in either layout)
+/// or a [1] scalar shared by every channel. PRelu is float-only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -23,17 +27,34 @@ enum class ActivationType : uint8_t {
     LeakyRelu,  ///< x > 0 ? x : alpha * x
     Sigmoid,
     Tanh,
-    Gelu,       ///< tanh approximation
+    Gelu,       ///< tanh approximation: 0.5x(1 + tanh(c(x + 0.044715x³)))
     Silu,       ///< x * sigmoid(x) (Swish)
     HardSwish,  ///< x * relu6(x + 3) * beta / 6
     Elu,        ///< x > 0 ? x : alpha * (exp(x) - 1)
+
+    // ---- graph-support set ----
+    PRelu,       ///< x > 0 ? x : alpha[channel] * x — takes a second input,
+                 ///< the slope vector [C] (or [1] for one shared slope)
+    HardSigmoid, ///< clamp(alpha * x + beta, 0, 1)
+    Softplus,    ///< max(x, 0) + log1p(exp(-|x|)); `beta` scales the input:
+                 ///< the result is log1p(exp(beta·x)) / beta
+    Selu,        ///< beta (scale) * (x > 0 ? x : alpha * (exp(x) - 1));
+                 ///< the published defaults are alpha 1.6732632, beta 1.0507010
+    Mish,        ///< x * tanh(softplus(x))
+    GeluExact,   ///< 0.5x(1 + erf(x/√2)) — the exact form, slower than Gelu
+    QuickGelu,   ///< x * sigmoid(alpha * x); PyTorch's default alpha is 1.702
 };
 
 /// Attributes for the Activation operator.
 struct ActivationAttributes {
     ActivationType type = ActivationType::Relu;
-    float alpha = 0.0f;  ///< Slope for LeakyRelu, alpha for Elu
-    float beta  = 1.0f;  ///< Parameter for HardSwish
+    /// alpha and beta default to the neutral (0 / 1) values LeakyRelu and Elu
+    /// expect. A type with a published non-neutral default — HardSigmoid's
+    /// (0.2, 0.5), Selu's (1.6732632, 1.0507010), QuickGelu's 1.702 — gets it
+    /// from the caller; nothing here can tell "unset" from an explicit 0.
+    float alpha = 0.0f;  ///< Slope for LeakyRelu / Elu, the slope of the linear term
+                         ///< in HardSigmoid, QuickGelu and Selu
+    float beta  = 1.0f;  ///< HardSwish scale, HardSigmoid offset, Softplus input scale, Selu scale
 
     /// If true, add result to existing output buffer instead of overwriting.
     bool add_to = false;

@@ -51,6 +51,31 @@ __device__ inline float activation_elu(float x, float alpha, float) {
     return (x > 0.0f) ? x : alpha * (expf(x) - 1.0f);
 }
 
+__device__ inline float activation_hard_sigmoid(float x, float alpha, float beta) {
+    return fminf(fmaxf(alpha * x + beta, 0.0f), 1.0f);
+}
+
+__device__ inline float activation_softplus(float x, float, float beta) {
+    const float z = beta * x;
+    return (fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)))) / beta;
+}
+
+__device__ inline float activation_selu(float x, float alpha, float scale) {
+    return scale * ((x > 0.0f) ? x : alpha * (expf(x) - 1.0f));
+}
+
+__device__ inline float activation_mish(float x, float, float) {
+    return x * tanhf(fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))));
+}
+
+__device__ inline float activation_gelu_exact(float x, float, float) {
+    return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
+}
+
+__device__ inline float activation_quick_gelu(float x, float alpha, float) {
+    return x / (1.0f + expf(-alpha * x));
+}
+
 // ============================================================
 // Function pointer type for activation
 // ============================================================
@@ -67,6 +92,13 @@ __device__ ActivationFn get_activation_fn(ActivationType type) {
     case ActivationType::Silu:       return activation_silu;
     case ActivationType::HardSwish:  return activation_hard_swish;
     case ActivationType::Elu:        return activation_elu;
+    case ActivationType::HardSigmoid: return activation_hard_sigmoid;
+    case ActivationType::Softplus:   return activation_softplus;
+    case ActivationType::Selu:       return activation_selu;
+    case ActivationType::Mish:       return activation_mish;
+    case ActivationType::GeluExact:  return activation_gelu_exact;
+    case ActivationType::QuickGelu:  return activation_quick_gelu;
+    case ActivationType::PRelu:      return activation_relu;  // rejected on entry
     }
     return activation_relu;
 }
@@ -166,10 +198,11 @@ void activation_cuda_impl(
             input.ptr<T>(), output.ptr<T>(), total,
             attrs.type, attrs.alpha, attrs.beta, attrs.add_to);
     } else {
-        // Row-by-row processing, respecting pitch.
-        // For packed layouts, last_dim = W * pack covers all C8 lanes,
-        // and num_rows = total_rows() accounts for channel block rounding.
-        const int64_t last_dim = input.shape(rank - 1) * input.channel_pack_size();
+        // Row-by-row processing, respecting pitch. A channel-last row is one
+        // spatial line — W pixels × C channels.
+        const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout()))
+            ? input.shape(1) * input.shape(rank - 1)
+            : input.shape(rank - 1);
         const int64_t num_rows = input.total_rows();
         const int64_t in_row_stride  = input.row_stride_elems();
         const int64_t out_row_stride = output.row_stride_elems();
@@ -194,6 +227,9 @@ Status activation_cuda(
     const ComputeContext& ctx,
     void* /*workspace*/)
 {
+    // PRelu reads a per-channel slope tensor, which the scalar device-function
+    // table has no room for.
+    if (attrs.type == ActivationType::PRelu) { return Status::unsupported; }
     const auto dtype = inputs[0].data_type();
     switch (dtype) {
     case DataType::f32:

@@ -223,4 +223,152 @@ inline void sign(
         [](float v) { return (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f); });
 }
 
+// ============================================================
+// Base-2 / base-10 and hyperbolic route through the existing vector exp/log;
+// the inverse trigonometry and the inverse hyperbolics have no vector form in
+// the abstraction, so they run through the scalar tail.
+// ============================================================
+
+template <typename T>
+inline void exp2(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    auto vln2 = v_set1(in, 0.6931471805599453f);
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vln2](auto x) { return v_exp(v_mul(x, vln2)); },
+        [](float v) { return std::exp2(v); });
+}
+
+template <typename T>
+inline void log2(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    auto vinvln2 = v_set1(in, 1.4426950408889634f);
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vinvln2](auto x) { return v_mul(v_log(x), vinvln2); },
+        [](float v) { return std::log2(v); });
+}
+
+template <typename T>
+inline void log10(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    auto vinvln10 = v_set1(in, 0.4342944819032518f);
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vinvln10](auto x) { return v_mul(v_log(x), vinvln10); },
+        [](float v) { return std::log10(v); });
+}
+
+template <typename T>
+inline void sinh(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    auto vhalf = v_set1(in, 0.5f);
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vhalf](auto x) { return v_mul(v_sub(v_exp(x), v_exp(v_neg(x))), vhalf); },
+        [](float v) { return std::sinh(v); });
+}
+
+template <typename T>
+inline void cosh(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    auto vhalf = v_set1(in, 0.5f);
+    tiled_unary_simd(in, out, m, n, in_pitch, out_pitch, add_to,
+        [vhalf](auto x) { return v_mul(v_add(v_exp(x), v_exp(v_neg(x))), vhalf); },
+        [](float v) { return std::cosh(v); });
+}
+
+template <typename T>
+inline void asin(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::asin(v); });
+}
+
+template <typename T>
+inline void acos(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::acos(v); });
+}
+
+template <typename T>
+inline void atan(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::atan(v); });
+}
+
+template <typename T>
+inline void asinh(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::asinh(v); });
+}
+
+template <typename T>
+inline void acosh(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::acosh(v); });
+}
+
+template <typename T>
+inline void atanh(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::atanh(v); });
+}
+
+template <typename T>
+inline void erfc(
+    const T* in, T* out,
+    int64_t m, int64_t n,
+    int64_t in_pitch, int64_t out_pitch,
+    bool add_to = false)
+{
+    tiled_unary_scalar(in, out, m, n, in_pitch, out_pitch, add_to,
+        [](float v) { return std::erfc(v); });
+}
+
 }  // namespace nnops::kernel

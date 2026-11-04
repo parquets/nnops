@@ -32,6 +32,18 @@ __device__ inline float unary_ceil(float x)  { return ceilf(x); }
 __device__ inline float unary_floor(float x) { return floorf(x); }
 __device__ inline float unary_recip(float x) { return 1.0f / x; }
 __device__ inline float unary_sign(float x)  { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
+__device__ inline float unary_exp2(float x)  { return exp2f(x); }
+__device__ inline float unary_log2(float x)  { return log2f(x); }
+__device__ inline float unary_log10(float x) { return log10f(x); }
+__device__ inline float unary_asin(float x)  { return asinf(x); }
+__device__ inline float unary_acos(float x)  { return acosf(x); }
+__device__ inline float unary_atan(float x)  { return atanf(x); }
+__device__ inline float unary_sinh(float x)  { return sinhf(x); }
+__device__ inline float unary_cosh(float x)  { return coshf(x); }
+__device__ inline float unary_asinh(float x) { return asinhf(x); }
+__device__ inline float unary_acosh(float x) { return acoshf(x); }
+__device__ inline float unary_atanh(float x) { return atanhf(x); }
+__device__ inline float unary_erfc(float x)  { return erfcf(x); }
 
 // ============================================================
 // Function pointer type for unary
@@ -50,6 +62,24 @@ __device__ UnaryFn get_unary_fn(UnaryType type) {
     case UnaryType::Abs:  return unary_abs;
     case UnaryType::Neg:  return unary_neg;
     case UnaryType::Sqrt: return unary_sqrt;
+    case UnaryType::Erf:   return unary_erf;
+    case UnaryType::Round: return unary_round;
+    case UnaryType::Ceil:  return unary_ceil;
+    case UnaryType::Floor: return unary_floor;
+    case UnaryType::Recip: return unary_recip;
+    case UnaryType::Sign:  return unary_sign;
+    case UnaryType::Exp2:  return unary_exp2;
+    case UnaryType::Log2:  return unary_log2;
+    case UnaryType::Log10: return unary_log10;
+    case UnaryType::Asin:  return unary_asin;
+    case UnaryType::Acos:  return unary_acos;
+    case UnaryType::Atan:  return unary_atan;
+    case UnaryType::Sinh:  return unary_sinh;
+    case UnaryType::Cosh:  return unary_cosh;
+    case UnaryType::Asinh: return unary_asinh;
+    case UnaryType::Acosh: return unary_acosh;
+    case UnaryType::Atanh: return unary_atanh;
+    case UnaryType::Erfc:  return unary_erfc;
     }
     return unary_exp;
 }
@@ -223,10 +253,11 @@ void unary_cuda_impl(
             input.ptr<T>(), output.ptr<T>(), total,
             attrs.type, attrs.add_to);
     } else {
-        // Row-by-row processing, respecting pitch.
-        // For packed layouts, last_dim = W * pack covers all C8 lanes,
-        // and num_rows = total_rows() accounts for channel block rounding.
-        const int64_t last_dim = input.shape(rank - 1) * input.channel_pack_size();
+        // Row-by-row processing, respecting pitch. A channel-last row is one
+        // spatial line — W pixels × C channels.
+        const int64_t last_dim = (rank >= 3 && is_channel_last(input.layout()))
+            ? input.shape(1) * input.shape(rank - 1)
+            : input.shape(rank - 1);
         const int64_t num_rows = input.total_rows();
         const int64_t in_row_stride  = input.row_stride_elems();
         const int64_t out_row_stride = output.row_stride_elems();

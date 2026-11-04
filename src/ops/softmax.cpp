@@ -43,8 +43,8 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
     if (!(attrs_.temperature > 0.0f)) { return Status::invalid_argument; }
 
     // The axis walk reads the tensor through stride_elems(), which describes the
-    // two regular activation layouts; channel-packed (NCHWC8/16/32, NCDHWC*)
-    // and the opaque weight tags have no axis semantics here.
+    // two regular image layouts; the opaque weight tags have no axis semantics
+    // here.
     if (!is_planar_spatial(inputs[0].layout) && !is_channel_last(inputs[0].layout)) {
         return Status::unsupported;
     }

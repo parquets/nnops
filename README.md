@@ -11,7 +11,7 @@ A self-contained, **zero-dependency** C++23 operator library for neural-network 
 - **SIMD kernels** for the hot path: AVX2 + FMA + F16C + AVX-VNNI on x86_64, NEON (with native fp16) on aarch64, with a scalar fallback and naive *reference* kernels kept as a correctness baseline.
 - **Fusion-friendly** — an `Epilogue` (activation / quantization) fused into Conv/MatMul/Linear write-back, and an `add_to` flag that turns every elementwise-ish op into a residual accumulate.
 - **Explicit memory model** — a non-owning `TensorView` with a pitch (row-stride) layout, so padded/aligned buffers are first-class.
-- **~30 operators** covering convolution, GEMM, attention, normalization, element-wise math, reductions, and tensor layout ops.
+- **~40 operators** covering convolution, GEMM, attention, normalization, element-wise math, reductions, indexing/scatter, and tensor layout ops.
 
 ## Backends and data types
 
@@ -104,7 +104,9 @@ Two patterns worth knowing:
 | Matrix / linear | `MatMul` (f32 / f16 / s8×s8), `Linear`, `QuantLinear` |
 | Attention | `Attention`, `LinearAttention` |
 | Normalization | `LayerNorm`, `RMSNorm`, `BatchNorm`, `Softmax` (softmax & log-softmax) |
-| Element-wise | `Eltwise` (add/sub/mul/div), `Unary` (exp/log/sin/cos/tan/tanh/abs/neg/sqrt), `Activation` (relu/leaky_relu/sigmoid/tanh/gelu/silu/hard_swish/elu), `Clamp` |
+| Element-wise | `Eltwise` (add/sub/mul/div, NumPy broadcast), `Unary` (exp/log family, trig, hyperbolic, erfc, …), `Activation` (relu/leaky_relu/sigmoid/tanh/gelu variants/silu/hard_swish/hard_sigmoid/elu/selu/softplus/mish/prelu/quick_gelu), `Clamp` |
+| Selection / predicate | `Where`, `Compare` (equal/greater/less/…), `Logical` (and/or/xor/not) |
+| Indexing | `Gather`, `GatherElements`, `GatherND`, `ScatterElements`, `ScatterND`, `Pad`, `Split`, `Tile`, `Expand` |
 | Reduction | `Reduce` (sum/mean/max/min), `ArgMinMax`, `TopK`, `CumSum` |
 | Shape / layout | `Concat`, `Slice`, `Permute`, `Flatten`, `Embed`, `Resize`, `GridSample`, `LayoutConvert` |
 | Positional | `RoPE` (rotary position embeddings) |
@@ -174,7 +176,7 @@ tests/                  Standalone test demos (one executable per file)
 
 Key design choices:
 
-- `TensorView` is a **non-owning view** — shape stored inline (zero heap for rank ≤ 8), with a byte `pitch` between rows (OpenCV `cv::Mat::step` style). Packed layouts (`NCHWC8`, …) and padded rows are supported.
+- `TensorView` is a **non-owning view** — shape stored inline (zero heap for rank ≤ 8), with a byte `pitch` between rows (OpenCV `cv::Mat::step` style). Planar (`NCHW`/`NCDHW`) and channel-last (`NHWC`/`NDHWC`) layouts and padded rows are supported.
 - Backend kernels keep a `TensorView&` and are dispatched through `switch (backend_)`.
 - The CPU SIMD abstraction (`v_load` / `v_store` / `v_fmadd` / `v_reduce_sum` …) lets a single templated kernel target f32 and f16 across SSE/AVX2/NEON/scalar.
 

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace nnops::backend::cpu {
@@ -334,6 +335,192 @@ void pooling_global_impl(const PoolingAttributes& attrs,
     });
 }
 
+// ============================================================
+// Adaptive pooling — the window of output index o spans
+// [floor(o·I/O), ceil((o+1)·I/O)) on each axis
+// ============================================================
+//
+// PyTorch's adaptive form. The bounds depend on the output index, so the window
+// is not a fixed kernel/stride and the driver walks it per output position.
+// Consecutive windows overlap when I % O != 0, which is why a fixed stride
+// cannot express it. An all-ones output is the global case; the op driver routes
+// it to the native plane scan, so the walk here only sees O > 1.
+
+inline int64_t adaptive_begin(int64_t o, int64_t in, int64_t out) noexcept
+{
+    return (o * in) / out;
+}
+
+inline int64_t adaptive_end(int64_t o, int64_t in, int64_t out) noexcept
+{
+    return ((o + 1) * in + out - 1) / out;
+}
+
+/// Planar adaptive: the lane stays on output width (a window edge is not a
+/// vector-friendly axis), so a window is a scalar-seeded reduction per output
+/// element. The task grid is (n, channel plane).
+template <bool IsMax, typename T>
+void pooling_adaptive_planar_impl(const PoolingAttributes& attrs,
+                                  TensorView& output,
+                                  std::span<const TensorView> inputs,
+                                  const ComputeContext& ctx)
+{
+    const auto& input = inputs[0];
+    const int64_t rank  = input.rank();
+    const int64_t srank = PoolingAttributes::spatial_rank(rank);
+
+    const int64_t N      = input.shape(0);
+    const int64_t blocks = input.num_channel_blocks();
+    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
+    const int64_t IH = input.shape(srank);
+    const int64_t IW = input.shape(srank + 1);
+    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
+    const int64_t OH = output.shape(srank);
+    const int64_t OW = output.shape(srank + 1);
+
+    const int64_t in_c  = input.channel_block_stride_elems();
+    const int64_t out_c = output.channel_block_stride_elems();
+    const int64_t in_d  = (srank == 3) ? input.stride_elems(2) : 0;
+    const int64_t out_d = (srank == 3) ? output.stride_elems(2) : 0;
+    const int64_t in_h  = input.stride_elems(srank);
+    const int64_t out_h = output.stride_elems(srank);
+    const int64_t in_w  = input.stride_elems(srank + 1);
+    const int64_t out_w = output.stride_elems(srank + 1);
+
+    const auto* in_ptr = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
+    const float low = -std::numeric_limits<float>::infinity();
+
+    ctx.cpu.run(0, N * blocks, [&](int64_t tid) {
+        const int64_t n   = tid / blocks;
+        const int64_t blk = tid % blocks;
+        const T* in_plane  = in_ptr + n * blocks * in_c + blk * in_c;
+        T* out_plane = out_ptr + n * blocks * out_c + blk * out_c;
+
+        for (int64_t od = 0; od < OD; ++od) {
+            const int64_t d0 = adaptive_begin(od, ID, OD);
+            const int64_t d1 = adaptive_end(od, ID, OD);
+            for (int64_t oh = 0; oh < OH; ++oh) {
+                const int64_t h0 = adaptive_begin(oh, IH, OH);
+                const int64_t h1 = adaptive_end(oh, IH, OH);
+                for (int64_t ow = 0; ow < OW; ++ow) {
+                    const int64_t w0 = adaptive_begin(ow, IW, OW);
+                    const int64_t w1 = adaptive_end(ow, IW, OW);
+                    const T* base = in_plane + d0 * in_d + h0 * in_h + w0 * in_w;
+
+                    float acc = IsMax ? low : 0.0f;
+                    for (int64_t d = d0; d < d1; ++d) {
+                        for (int64_t h = h0; h < h1; ++h) {
+                            const T* row = base + (d - d0) * in_d + (h - h0) * in_h;
+                            for (int64_t w = w0; w < w1; ++w) {
+                                const float v = s_load(row + (w - w0) * in_w);
+                                acc = IsMax ? std::max(acc, v) : acc + v;
+                            }
+                        }
+                    }
+                    if (!IsMax) {
+                        acc /= static_cast<float>((d1 - d0) * (h1 - h0) * (w1 - w0));
+                    }
+                    s_store_add(out_plane + od * out_d + oh * out_h + ow * out_w,
+                                acc, attrs.add_to);
+                }
+            }
+        }
+    });
+}
+
+/// Channel-last adaptive: the lane is the channel, so the window walk is a
+/// vector min/add over whole pixels and only the channel tail runs scalar.
+template <bool IsMax, typename T>
+void pooling_adaptive_last_impl(const PoolingAttributes& attrs,
+                                TensorView& output,
+                                std::span<const TensorView> inputs,
+                                const ComputeContext& ctx)
+{
+    const auto& input = inputs[0];
+    const int64_t rank  = input.rank();
+    const int64_t srank = PoolingAttributes::spatial_rank(rank);
+
+    const int64_t N  = input.shape(0);
+    const int64_t C  = input.shape(1);
+    const int64_t ID = (srank == 3) ? input.shape(2) : 1;
+    const int64_t IH = input.shape(srank);
+    const int64_t IW = input.shape(srank + 1);
+    const int64_t OD = (srank == 3) ? output.shape(2) : 1;
+    const int64_t OH = output.shape(srank);
+    const int64_t OW = output.shape(srank + 1);
+
+    const int64_t in_n  = input.stride_elems(0);
+    const int64_t out_n = output.stride_elems(0);
+    const int64_t in_d  = (srank == 3) ? input.stride_elems(2) : 0;
+    const int64_t out_d = (srank == 3) ? output.stride_elems(2) : 0;
+    const int64_t in_h  = input.stride_elems(srank);
+    const int64_t out_h = output.stride_elems(srank);
+    // A pixel step is the channel count in this layout.
+    const int64_t in_pix  = input.stride_elems(rank - 1);
+    const int64_t out_pix = output.stride_elems(rank - 1);
+
+    const auto* in_ptr = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
+    const float low = -std::numeric_limits<float>::infinity();
+    constexpr int64_t L = simd_lane_for<T>;
+
+    // One task per output row: every output column re-walks a window of the
+    // same rows, and the row's channels are the vector.
+    ctx.cpu.run(0, N * OD * OH, [&](int64_t tid) {
+        const int64_t n  = tid / (OD * OH);
+        const int64_t od = (tid / OH) % OD;
+        const int64_t oh = tid % OH;
+
+        const int64_t d0 = adaptive_begin(od, ID, OD);
+        const int64_t d1 = adaptive_end(od, ID, OD);
+        const int64_t h0 = adaptive_begin(oh, IH, OH);
+        const int64_t h1 = adaptive_end(oh, IH, OH);
+        const T* in_base = in_ptr + n * in_n + d0 * in_d + h0 * in_h;
+        T* out_row = out_ptr + n * out_n + od * out_d + oh * out_h;
+        const float inv_count = 1.0f / static_cast<float>(
+            (d1 - d0) * (h1 - h0));
+
+        for (int64_t ow = 0; ow < OW; ++ow) {
+            const int64_t w0 = adaptive_begin(ow, IW, OW);
+            const int64_t w1 = adaptive_end(ow, IW, OW);
+            const T* win = in_base + w0 * in_pix;
+            const float inv = inv_count / static_cast<float>(w1 - w0);
+            T* dst = out_row + ow * out_pix;
+
+            int64_t c = 0;
+            for (; c + L <= C; c += L) {
+                auto acc = IsMax ? v_set1(in_ptr, low) : v_zero(in_ptr);
+                for (int64_t d = d0; d < d1; ++d) {
+                    for (int64_t h = h0; h < h1; ++h) {
+                        const T* row = win + (d - d0) * in_d + (h - h0) * in_h;
+                        for (int64_t w = w0; w < w1; ++w) {
+                            const auto v = v_load(row + (w - w0) * in_pix + c);
+                            acc = IsMax ? v_max(acc, v) : v_add(acc, v);
+                        }
+                    }
+                }
+                if (!IsMax) { acc = v_mul(acc, v_set1(in_ptr, inv)); }
+                v_store_add(dst + c, acc, attrs.add_to);
+            }
+            for (; c < C; ++c) {
+                float acc = IsMax ? low : 0.0f;
+                for (int64_t d = d0; d < d1; ++d) {
+                    for (int64_t h = h0; h < h1; ++h) {
+                        const T* row = win + (d - d0) * in_d + (h - h0) * in_h;
+                        for (int64_t w = w0; w < w1; ++w) {
+                            const float v = s_load(row + (w - w0) * in_pix + c);
+                            acc = IsMax ? std::max(acc, v) : acc + v;
+                        }
+                    }
+                }
+                if (!IsMax) { acc *= inv; }
+                s_store_add(dst + c, acc, attrs.add_to);
+            }
+        }
+    });
+}
+
 /// The fp driver: a native plane scan when global, the window walk otherwise.
 template <typename T>
 void pooling_fp(const PoolingAttributes& attrs,
@@ -342,6 +529,14 @@ void pooling_fp(const PoolingAttributes& attrs,
                 const ComputeContext& ctx)
 {
     const bool last = is_channel_last(inputs[0].layout());
+    if (attrs.adaptive()) {
+        if (attrs.type == PoolingType::Max) {
+            return last ? pooling_adaptive_last_impl<true, T>(attrs, output, inputs, ctx)
+                        : pooling_adaptive_planar_impl<true, T>(attrs, output, inputs, ctx);
+        }
+        return last ? pooling_adaptive_last_impl<false, T>(attrs, output, inputs, ctx)
+                    : pooling_adaptive_planar_impl<false, T>(attrs, output, inputs, ctx);
+    }
     if (!attrs.global) {
         if (!last) {
             pooling_impl<T>(attrs, output, inputs, ctx);
@@ -518,8 +713,9 @@ Status pooling_cpu(const PoolingAttributes& attrs,
     const auto odtype = output.data_type();
     const bool quant = (dtype == DataType::s8 || dtype == DataType::u8);
 
-    // Quantized pooling needs a channel lane: channel-last only.
-    if (quant && !is_channel_last(inputs[0].layout())) {
+    // Quantized pooling needs a channel lane: channel-last only, and the
+    // quantized kernels have no per-output adaptive window.
+    if (quant && (!is_channel_last(inputs[0].layout()) || attrs.adaptive())) {
         return Status::unsupported;
     }
     // ...and with no whole-plane form, a global request is walked as the full

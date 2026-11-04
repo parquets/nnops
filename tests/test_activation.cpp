@@ -7,6 +7,7 @@
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
+#include "common/channel_last.hpp"
 
 #include <vector>
 #include <cmath>
@@ -337,4 +338,205 @@ NNOPS_TEST(activation_quant_per_tensor_relu_u8) {
     NNOPS_EXPECT_EQ(out_buf[1], 128);
     NNOPS_EXPECT_EQ(out_buf[2], 128);
     NNOPS_EXPECT_EQ(out_buf[3], 129);
+}
+
+// ============================================================
+// Graph-support set — the closed form is recomputed here in double-free fp32
+// arithmetic, so a wrong branch (or a mixed-up alpha/beta) shows up directly.
+// ============================================================
+
+template <class F>
+static void check_activation_f32(const std::vector<int64_t>& shape,
+                                 const ActivationAttributes& attrs, F&& ref,
+                                 float tol = 1e-4f)
+{
+    auto [in_vec, input] = test::make_random_tensor(shape, -3.0f, 3.0f);
+    auto op = Activation::create(attrs, Backend::CPU);
+
+    const TensorDesc in_desc[] = {input.desc()};
+    auto out_descs = op->getOutputTensorDesc(in_desc);
+
+    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = nnops::test::make_planar(out_descs[0], buf.data());
+
+    const TensorView ins[] = {input};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (int64_t i = 0; i < input.numel(); ++i) {
+        NNOPS_EXPECT_NEAR(buf[static_cast<size_t>(i)],
+                          ref(in_vec[static_cast<size_t>(i)]), tol);
+    }
+}
+
+NNOPS_TEST(activation_hard_sigmoid) {
+    ActivationAttributes attrs;
+    attrs.type  = ActivationType::HardSigmoid;
+    attrs.alpha = 0.2f;
+    attrs.beta  = 0.5f;
+    check_activation_f32({257}, attrs, [](float x) {
+        return std::min(std::max(0.2f * x + 0.5f, 0.0f), 1.0f);
+    });
+}
+
+NNOPS_TEST(activation_softplus) {
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::Softplus;
+    attrs.beta = 2.0f;
+    check_activation_f32({257}, attrs, [](float x) {
+        const float z = 2.0f * x;
+        return (std::max(z, 0.0f) + std::log1p(std::exp(-std::fabs(z)))) / 2.0f;
+    });
+}
+
+NNOPS_TEST(activation_selu) {
+    const float alpha = 1.6732632f;
+    const float scale = 1.0507010f;
+    ActivationAttributes attrs;
+    attrs.type  = ActivationType::Selu;
+    attrs.alpha = alpha;
+    attrs.beta  = scale;
+    check_activation_f32({257}, attrs, [=](float x) {
+        return scale * (x > 0.0f ? x : alpha * (std::exp(x) - 1.0f));
+    });
+}
+
+NNOPS_TEST(activation_mish) {
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::Mish;
+    check_activation_f32({257}, attrs, [](float x) {
+        return x * std::tanh(std::max(x, 0.0f) +
+                             std::log1p(std::exp(-std::fabs(x))));
+    });
+}
+
+NNOPS_TEST(activation_gelu_exact) {
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::GeluExact;
+    check_activation_f32({257}, attrs, [](float x) {
+        return 0.5f * x * (1.0f + std::erf(x * 0.70710678118654752f));
+    });
+}
+
+NNOPS_TEST(activation_quick_gelu) {
+    ActivationAttributes attrs;
+    attrs.type  = ActivationType::QuickGelu;
+    attrs.alpha = 1.702f;
+    check_activation_f32({257}, attrs, [](float x) {
+        return x / (1.0f + std::exp(-1.702f * x));
+    });
+}
+
+// ============================================================
+// PRelu — the slope is a second input, one per logical channel (dim 1)
+// ============================================================
+
+NNOPS_TEST(activation_prelu_planar) {
+    const int64_t H = 5, W = 7;
+    auto [in_vec, input] = test::make_random_tensor({1, 3, H, W}, -4.0f, 4.0f);
+    float slope_data[] = {2.0f, 0.5f, -1.0f};
+    const int64_t sshape[] = {3};
+    TensorView slope(sshape, DataType::f32, slope_data);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::PRelu;
+    auto op = Activation::create(attrs);
+
+    const TensorDesc in_descs[] = {input.desc(), slope.desc()};
+    auto out_descs = op->getOutputTensorDesc(in_descs);
+    NNOPS_EXPECT_TRUE(out_descs[0].rank == 4 && out_descs[0].dims[1] == 3);
+
+    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = nnops::test::make_planar(out_descs[0], buf.data());
+
+    const TensorView ins[] = {input, slope};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (int64_t i = 0; i < input.numel(); ++i) {
+        const int64_t c = (i / (H * W)) % 3;
+        const float x = in_vec[static_cast<size_t>(i)];
+        const float expected = x > 0.0f ? x : slope_data[c] * x;
+        NNOPS_EXPECT_NEAR(buf[static_cast<size_t>(i)], expected, 1e-6f);
+    }
+}
+
+NNOPS_TEST(activation_prelu_nhwc) {
+    constexpr int64_t N = 2, C = 5, H = 4, W = 6;
+    auto [in_vec, in_planar] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
+    float slope_data[C];
+    for (int64_t c = 0; c < C; ++c) { slope_data[c] = 0.1f * (c + 1); }
+
+    auto cl = test::to_channel_last<float>(in_vec, N, C, H * W);
+    // Logical shape stays [N, C, H, W]; the NHWC tag changes only the storage.
+    const int64_t in_shape[] = {N, C, H, W};
+    TensorView input(in_shape, DataType::f32, cl.data(), TensorLayout::NHWC);
+
+    const int64_t sshape[] = {C};
+    TensorView slope(sshape, DataType::f32, slope_data);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::PRelu;
+    auto op = Activation::create(attrs);
+
+    const TensorDesc in_descs[] = {input.desc(), slope.desc()};
+    auto out_descs = op->getOutputTensorDesc(in_descs);
+    NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
+
+    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
+    TensorView out(std::span<const int64_t>(in_shape, 4), DataType::f32,
+                   buf.data(), TensorLayout::NHWC);
+
+    const TensorView ins[] = {input, slope};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    const auto got = test::to_channel_first<float>(buf, N, C, H * W);
+    for (int64_t i = 0; i < N * C * H * W; ++i) {
+        const int64_t c = (i / (H * W)) % C;
+        const float x = in_vec[static_cast<size_t>(i)];
+        const float expected = x > 0.0f ? x : slope_data[c] * x;
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)], expected, 1e-6f);
+    }
+}
+
+NNOPS_TEST(activation_prelu_single_slope) {
+    auto [in_vec, input] = test::make_random_tensor({1, 4, 3, 3}, -4.0f, 4.0f);
+    float slope_data[] = {0.25f};
+    const int64_t sshape[] = {1};
+    TensorView slope(sshape, DataType::f32, slope_data);
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::PRelu;
+    auto op = Activation::create(attrs);
+
+    const TensorDesc in_descs[] = {input.desc(), slope.desc()};
+    auto out_descs = op->getOutputTensorDesc(in_descs);
+    std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = nnops::test::make_planar(out_descs[0], buf.data());
+
+    const TensorView ins[] = {input, slope};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    for (int64_t i = 0; i < input.numel(); ++i) {
+        const float x = in_vec[static_cast<size_t>(i)];
+        NNOPS_EXPECT_NEAR(buf[static_cast<size_t>(i)],
+                          x > 0.0f ? x : 0.25f * x, 1e-6f);
+    }
+}
+
+NNOPS_TEST(activation_prelu_rejects_bad_slope) {
+    TensorDesc x;
+    x.rank = 4; x.layout = TensorLayout::NCHW; x.dtype = DataType::f32;
+    for (int64_t d : {1, 3, 4, 4}) { x.dims.push_back(d); }
+
+    TensorDesc slope;
+    slope.rank = 1; slope.layout = TensorLayout::NCHW; slope.dtype = DataType::f32;
+    slope.dims.push_back(2);  // neither 3 nor 1
+
+    ActivationAttributes attrs;
+    attrs.type = ActivationType::PRelu;
+    auto op = Activation::create(attrs);
+
+    TensorDesc out = x;
+    const TensorDesc ins[] = {x, slope};
+    const TensorDesc outs[] = {out};
+    NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
 }

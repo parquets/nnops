@@ -1,9 +1,10 @@
 #pragma once
 /// @file resize.hpp
-/// @brief Resize operator — 2D/3D spatial interpolation, packed NCHWC8/NCDHWC8.
+/// @brief Resize operator — 2D/3D spatial interpolation, planar and channel-last.
 ///
 /// Per-axis arrays are [D, H, W]; a rank-4 (2D) input reads only H/W (index 0
-/// is ignored), a rank-5 input all three.
+/// is ignored), a rank-5 input all three. NCHW/NCDHW and NHWC/NDHWC are both
+/// supported; the output carries the input's layout.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -79,7 +80,9 @@ public:
 
     OpType  getOpType()  const override { return OpType::Resize; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PackedOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override {
+        return LayoutSupport::PlanarOrChannelLast;
+    }
 
     const ResizeAttributes& attributes() const noexcept { return attrs_; }
 

@@ -205,7 +205,7 @@ NNOPS_TEST(status_validate_descriptors_only) {
     {
         auto op = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
         const TensorDesc same[] = {desc_of({2, 3}, DataType::f32, TensorLayout::NCHW)};
-        const TensorDesc other[] = {desc_of({2, 3}, DataType::f32, TensorLayout::NCHWC8)};
+        const TensorDesc other[] = {desc_of({2, 3}, DataType::f32, TensorLayout::NHWC)};
         NNOPS_EXPECT_TRUE(op->validate(same, same) == Status::invalid_argument);
         NNOPS_EXPECT_TRUE(op->validate(other, same) == Status::ok);
     }
