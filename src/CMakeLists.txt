@@ -11,7 +11,7 @@ set(NNOPS_CPU_SOURCES
     ops/pooling.cpp
     ops/linear.cpp
     ops/matmul.cpp
-    ops/attention.cpp
+    ops/multi_head_attention.cpp
     ops/softmax.cpp
     ops/cumsum.cpp
     ops/norm.cpp
@@ -27,6 +27,8 @@ set(NNOPS_CPU_SOURCES
     ops/grid_sample.cpp
     ops/layout_convert.cpp
     ops/linear_attention.cpp
+    ops/group_query_attention.cpp
+    ops/multi_latent_attention.cpp
     ops/quant_linear.cpp
     ops/concat.cpp
     ops/argminmax.cpp
@@ -107,8 +109,9 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/pooling.cpp
     backend/cpu/conv/conv3d.cpp
 
-    # CPU tiled attention kernels (fused QK^T + softmax + AV; linear attention
-    # lives alongside it)
+    # CPU tiled attention kernels (fused QK^T + softmax + AV) — one core shared
+    # by MultiHeadAttention, GroupQueryAttention and MultiLatentAttention;
+    # linear attention lives alongside it.
     backend/cpu/attention/attention.cpp
     backend/cpu/attention/linear_attention.cpp
 

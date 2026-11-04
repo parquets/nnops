@@ -1,21 +1,27 @@
 /// @file bench_attention.cpp
-/// @brief Attention micro-benchmark — plan (standard vs flash) + thread scaling.
+/// @brief Attention-family micro-benchmark — route (standard vs flash) and
+///        thread scaling for MultiHeadAttention, GroupQueryAttention and
+///        MultiLatentAttention.
 ///
-/// Mirrors bench_matmul.cpp: every case runs the plan-driven fused fast path and
-/// reports the resolved plan plus GFLOPS at 1, 2, 4, 8 and hardware threads.
+/// Every case runs the plan-driven fused fast path and reports GFLOPS at 1, 2,
+/// 4, 8 and hardware threads. QK^T (transpose-B GEMM) then softmax then
+/// attn @ V (direct GEMM), per (batch, query head) — or the online-softmax
+/// FlashAttention path once Sq*Sk reaches kFlashMinScores (1<<16).
 ///
-/// QK^T (transpose-B GEMM) then softmax then attn @ V (direct GEMM), per
-/// (batch, head) — or the online-softmax FlashAttention path once Sq*Sk reaches
-/// kFlashMinScores (1<<16). The report shows which route fired and the resolved
-/// tile sizes.
+/// FLOPs count head work, not distinct kv heads: under GQA every query head
+/// still runs its own QK and AV, even though they read a shared K/V slice.
+/// MLA counts both widths, qk and value, since the query-key product is over
+/// kv_lora_rank + qk_rope_head_dim while the value product is over v_head_dim.
 ///
 /// BenchPool carries the two arms of common/cpu_pool.hpp: an OpenMP team when
 /// the build has one (unless NNOPS_BENCH_OMP opts out), else a pool that spawns
 /// per call. Both sit behind the same hooks, so two tables differ only in their
 /// scheduler.
 
-#include "nnops/ops/attention.hpp"
-#include "backend/cpu/attention/attention.h"        // get_attention_plan, AttentionPlan
+#include "nnops/ops/group_query_attention.hpp"
+#include "nnops/ops/multi_head_attention.hpp"
+#include "nnops/ops/multi_latent_attention.hpp"
+#include "backend/cpu/attention/attention.h"        // get_attention_plan, AttentionConfig
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"
@@ -80,73 +86,20 @@ auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     }
 }
 
-struct AttentionCase {
-    const char* name;
-    int64_t B, S, H, D;     // merged [B, S, H*D], self-attention (Sq = S)
-    int64_t Sk = 0;         // key seq len; 0 -> S
-    bool mask = false;
-    bool f16 = false;
-};
-
-template <typename T>
-void run_attention(const AttentionCase& c, const std::vector<int>& threads, int iters) {
-    const int64_t Sq = c.S;
-    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
-    const int64_t H  = c.H;
-    const int64_t D  = c.D;
-
-    const int64_t qshape[] = {c.B, Sq, H * D};
-    const int64_t kshape[] = {c.B, Sk, H * D};
-    const int64_t vshape[] = {c.B, Sk, H * D};
-
-    auto [q_vec, q] = make_random<T>(qshape, 11);
-    auto [k_vec, k] = make_random<T>(kshape, 12);
-    auto [v_vec, v] = make_random<T>(vshape, 13);
-
-    std::vector<T> m_vec;
-    TensorView mask_view;
-    if (c.mask) {
-        const int64_t mshape[] = {Sq, Sk};
-        auto [mv, m] = make_random<T>(mshape, 14);
-        m_vec = std::move(mv);
-        mask_view = m;
+std::vector<int> thread_list() {
+    std::vector<int> threads{1, 2, 4, 8};
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
+        threads.push_back(hw);
     }
+    return threads;
+}
 
-    AttentionAttributes attrs{};
-    attrs.num_heads = H;
-    attrs.scale = 0.0f;   // auto 1/sqrt(D)
-
-    auto op = Attention::create(attrs, Backend::CPU);
-
-    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
-    std::vector<TensorView> ins   = {q, k, v};
-    if (c.mask) { descs.push_back(mask_view.desc()); ins.push_back(mask_view); }
-    auto out_descs = op->getOutputTensorDesc(descs);
-
-    const cpu::AttentionPlan plan = cpu::get_attention_plan(attrs, descs, out_descs,
-                                                            threads.back(),
-                                                            /*use_thread_slots=*/true);
-
-    // 2 matmuls per head: QK^T (Sq*Sk*D) + attn@V (Sq*D*Sk) = 2*Sq*Sk*D MACs.
-    const double flops_per_iter = 4.0 * static_cast<double>(c.B) * H * Sq * Sk * D;
-
-    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto output = test::make_planar(out_descs[0], out_buf.data());
-
-    std::printf("  %s\n", c.name);
-    std::printf("    B=%lld H=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s\n",
-                (long long)c.B, (long long)H, (long long)Sq, (long long)Sk,
-                (long long)D, (long long)(Sq * Sk),
-                c.f16 ? "f16" : "f32", c.mask ? "  mask" : "");
-    if (plan.use_flash) {
-        std::printf("    route=flash Br=%d Bc=%d  ws=%zuB\n",
-                    plan.Br, plan.Bc, plan.workspace_size);
-    } else {
-        std::printf("    route=standard GEMM1(mc=%d nc=%d) GEMM2(mc=%d nc=%d)  ws=%zuB\n",
-                    plan.mc1, plan.nc1, plan.mc2, plan.nc2, plan.workspace_size);
-    }
-
-    auto compute = [&](const ComputeContext& ctx) { op->compute(output, ins, ctx, nullptr); };
+/// Time `body(ctx)` over the thread list; returns GFLOPS at each width.
+template <typename Body>
+std::vector<double> measure(const std::vector<int>& threads, int iters,
+                            double flops_per_iter, Body&& body)
+{
     std::vector<double> gflops;
     for (int nt : threads) {
         BenchPool pool(nt);
@@ -154,15 +107,18 @@ void run_attention(const AttentionCase& c, const std::vector<int>& threads, int 
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-        for (int i = 0; i < 2; ++i) { compute(use_ctx); }   // warm-up / page faults
+        for (int i = 0; i < 2; ++i) { body(use_ctx); }   // warm-up / page faults
 
         auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iters; ++i) { compute(use_ctx); }
+        for (int i = 0; i < iters; ++i) { body(use_ctx); }
         auto end = std::chrono::high_resolution_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(end - start).count();
         gflops.push_back(flops_per_iter * static_cast<double>(iters) / (ms * 1e6));
     }
+    return gflops;
+}
 
+void print_row(const std::vector<int>& threads, const std::vector<double>& gflops) {
     const double g1 = gflops.empty() ? 0.0 : gflops[0];
     std::printf("    ");
     for (size_t i = 0; i < threads.size(); ++i) {
@@ -173,61 +129,282 @@ void run_attention(const AttentionCase& c, const std::vector<int>& threads, int 
     std::printf("\n");
 }
 
-void bench_attention_case(const AttentionCase& c) {
-    const int iters = 20;
-    std::vector<int> threads{1, 2, 4, 8};
-    int hw = static_cast<int>(std::thread::hardware_concurrency());
-    if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
-        threads.push_back(hw);
+// ---- MultiHeadAttention ---------------------------------------------------
+
+struct MhaCase {
+    const char* name;
+    int64_t B, S, H, D;     // merged [B, S, H*D], self-attention (Sq = S)
+    int64_t Sk = 0;         // key seq len; 0 -> S
+    bool mask = false;
+    bool f16 = false;
+    bool causal = false;
+};
+
+template <typename T>
+void run_mha(const MhaCase& c, const std::vector<int>& threads, int iters) {
+    const int64_t Sq = c.S;
+    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t H  = c.H;
+    const int64_t D  = c.D;
+
+    const int64_t qshape[] = {c.B, Sq, H * D};
+    const int64_t kshape[] = {c.B, Sk, H * D};
+
+    auto [q_vec, q] = make_random<T>(qshape, 11);
+    auto [k_vec, k] = make_random<T>(kshape, 12);
+    auto [v_vec, v] = make_random<T>(kshape, 13);
+
+    std::vector<T> m_vec;
+    TensorView mask_view;
+    if (c.mask) {
+        const int64_t mshape[] = {Sq, Sk};
+        auto [mv, m] = make_random<T>(mshape, 14);
+        m_vec = std::move(mv);
+        mask_view = m;
     }
-    if (c.f16) { run_attention<half>(c, threads, iters); }
-    else       { run_attention<float>(c, threads, iters); }
+
+    MultiHeadAttentionAttributes attrs{};
+    attrs.num_heads = H;
+    attrs.scale = 0.0f;   // auto 1/sqrt(D)
+    attrs.causal = c.causal;
+
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
+    std::vector<TensorView> ins   = {q, k, v};
+    if (c.mask) { descs.push_back(mask_view.desc()); ins.push_back(mask_view); }
+    auto out_descs = op->getOutputTensorDesc(descs);
+
+    const cpu::AttentionPlan plan = cpu::get_attention_plan({H}, descs, out_descs,
+                                                            threads.back(),
+                                                            /*use_thread_slots=*/true);
+
+    // 2 matmuls per head: QK^T (Sq*Sk*D) + attn@V (Sq*D*Sk) = 2*Sq*Sk*D MACs.
+    const double flops = 4.0 * static_cast<double>(c.B) * H * Sq * Sk * D;
+
+    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto output = test::make_planar(out_descs[0], out_buf.data());
+
+    std::printf("  %s\n", c.name);
+    std::printf("    B=%lld H=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s%s\n",
+                (long long)c.B, (long long)H, (long long)Sq, (long long)Sk, (long long)D,
+                (long long)(Sq * Sk), c.f16 ? "f16" : "f32",
+                c.mask ? "  mask" : "", c.causal ? "  causal" : "");
+    if (plan.use_flash) {
+        std::printf("    route=flash Br=%d Bc=%d  ws=%zuB\n",
+                    plan.Br, plan.Bc, plan.workspace_size);
+    } else {
+        std::printf("    route=standard GEMM1(mc=%d nc=%d) GEMM2(mc=%d nc=%d)  ws=%zuB\n",
+                    plan.mc1, plan.nc1, plan.mc2, plan.nc2, plan.workspace_size);
+    }
+
+    const auto gflops = measure(threads, iters, flops, [&](const ComputeContext& ctx) {
+        op->compute(output, ins, ctx, nullptr);
+    });
+    print_row(threads, gflops);
+}
+
+void bench_mha(const MhaCase& c) {
+    const int iters = 20;
+    const auto threads = thread_list();
+    if (c.f16) { run_mha<half>(c, threads, iters); }
+    else       { run_mha<float>(c, threads, iters); }
+}
+
+// ---- GroupQueryAttention --------------------------------------------------
+
+struct GqaCase {
+    const char* name;
+    int64_t B, S, H, Hkv, D;
+    int64_t Sk = 0;         // 0 -> S
+    bool causal = true;
+    bool f16 = false;
+};
+
+template <typename T>
+void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
+    const int64_t Sq = c.S;
+    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
+
+    const int64_t qshape[]  = {c.B, Sq, c.H * c.D};
+    const int64_t kvshape[] = {c.B, Sk, c.Hkv * c.D};
+
+    auto [q_vec, q]   = make_random<T>(qshape, 21);
+    auto [k_vec, k]   = make_random<T>(kvshape, 22);
+    auto [v_vec, v]   = make_random<T>(kvshape, 23);
+
+    GroupQueryAttentionAttributes attrs{};
+    attrs.num_heads    = c.H;
+    attrs.kv_num_heads = c.Hkv;
+    attrs.causal       = c.causal;
+
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
+    std::vector<TensorView> ins   = {q, k, v};
+    auto out_descs = op->getOutputTensorDesc(descs);
+
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = c.H;
+    cfg.num_kv_heads = c.Hkv;
+    cfg.causal = c.causal;
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs,
+                                                            threads.back(), true);
+
+    // Every query head runs its own QK and AV, whether or not it shares a kv
+    // head, so the count is over H — not H_kv.
+    const double flops = 4.0 * static_cast<double>(c.B) * c.H * Sq * Sk * c.D;
+
+    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto output = test::make_planar(out_descs[0], out_buf.data());
+
+    std::printf("  %s\n", c.name);
+    std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s\n",
+                (long long)c.B, (long long)c.H, (long long)c.Hkv, (long long)Sq,
+                (long long)Sk, (long long)c.D, (long long)(Sq * Sk),
+                c.f16 ? "f16" : "f32", c.causal ? "  causal" : "");
+    std::printf("    route=%s  ws=%zuB\n", plan.use_flash ? "flash" : "standard",
+                plan.workspace_size);
+
+    const auto gflops = measure(threads, iters, flops, [&](const ComputeContext& ctx) {
+        op->compute(output, ins, ctx, nullptr);
+    });
+    print_row(threads, gflops);
+}
+
+void bench_gqa(const GqaCase& c) {
+    const int iters = 20;
+    const auto threads = thread_list();
+    if (c.f16) { run_gqa<half>(c, threads, iters); }
+    else       { run_gqa<float>(c, threads, iters); }
+}
+
+// ---- MultiLatentAttention -------------------------------------------------
+
+struct MlaCase {
+    const char* name;
+    int64_t B, S, H, Hkv, rank, rope, vdim;
+    int64_t Sk = 0;         // 0 -> S
+    bool causal = true;
+    bool f16 = false;
+};
+
+template <typename T>
+void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
+    const int64_t Sq = c.S;
+    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t dkv = c.rank + c.rope;
+
+    const int64_t q_width  = c.H * dkv;
+    const int64_t kv_width = c.Hkv * dkv;
+
+    const int64_t q_dims[]  = {c.B, Sq, q_width};
+    const int64_t kv_dims[] = {c.B, Sk, kv_width};
+
+    auto [q_vec, q]   = make_random<T>(q_dims, 31);
+    auto [kv_vec, kv] = make_random<T>(kv_dims, 32);
+
+    MultiLatentAttentionAttributes attrs{};
+    attrs.num_heads        = c.H;
+    attrs.kv_num_heads     = c.Hkv;
+    attrs.kv_lora_rank     = c.rank;
+    attrs.qk_rope_head_dim = c.rope;
+    attrs.v_head_dim       = c.vdim;
+    attrs.causal           = c.causal;
+
+    auto op = MultiLatentAttention::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> descs = {q.desc(), kv.desc()};
+    std::vector<TensorView> ins   = {q, kv};
+    auto out_descs = op->getOutputTensorDesc(descs);
+
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = c.H;
+    cfg.num_kv_heads = c.Hkv;
+    cfg.v_head_dim = c.vdim > 0 ? c.vdim : c.rank;
+    cfg.v_is_k = true;
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs,
+                                                            threads.back(), true);
+
+    // QK over the latent width, AV over the value width.
+    const double flops = 2.0 * static_cast<double>(c.B) * c.H * Sq * Sk *
+                         static_cast<double>(dkv + (c.vdim > 0 ? c.vdim : c.rank));
+
+    std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto output = test::make_planar(out_descs[0], out_buf.data());
+
+    std::printf("  %s\n", c.name);
+    std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld Dkv=%lld v=%lld  %s%s\n",
+                (long long)c.B, (long long)c.H, (long long)c.Hkv, (long long)Sq,
+                (long long)Sk, (long long)dkv,
+                (long long)(c.vdim > 0 ? c.vdim : c.rank),
+                c.f16 ? "f16" : "f32", c.causal ? "  causal" : "");
+    std::printf("    route=%s  ws=%zuB\n", plan.use_flash ? "flash" : "standard",
+                plan.workspace_size);
+
+    const auto gflops = measure(threads, iters, flops, [&](const ComputeContext& ctx) {
+        op->compute(output, ins, ctx, nullptr);
+    });
+    print_row(threads, gflops);
+}
+
+void bench_mla(const MlaCase& c) {
+    const int iters = 20;
+    const auto threads = thread_list();
+    if (c.f16) { run_mla<half>(c, threads, iters); }
+    else       { run_mla<float>(c, threads, iters); }
 }
 
 }  // anonymous namespace
 
 // ============================================================
-// Standard vs flash routing sweep
+// MultiHeadAttention — standard vs flash routing sweep
 // ============================================================
 
 NNOPS_BENCH(attention_f32_standard) {
     // Small Sq*Sk — tiled GEMM + softmax path.
-    bench_attention_case({"attn f32 standard B2 S128 H8 D64", 2, 128, 8, 64});
+    bench_mha({"attn f32 standard B2 S128 H8 D64", 2, 128, 8, 64});
 }
 
 NNOPS_BENCH(attention_f32_standard_wide) {
-    bench_attention_case({"attn f32 standard-wide B1 S128 H8 D128", 1, 128, 8, 128});
+    bench_mha({"attn f32 standard-wide B1 S128 H8 D128", 1, 128, 8, 128});
 }
 
 NNOPS_BENCH(attention_f32_standard_d256) {
     // D=256 -> GEMM1's K loop runs twice at Kc=128.
-    bench_attention_case({"attn f32 standard D256 B2 S128 H8 D256", 2, 128, 8, 256});
+    bench_mha({"attn f32 standard D256 B2 S128 H8 D256", 2, 128, 8, 256});
 }
 
 NNOPS_BENCH(attention_f32_flash) {
     // Sq*Sk = 262144 -> online-softmax FlashAttention path.
-    bench_attention_case({"attn f32 flash B1 S512 H8 D64", 1, 512, 8, 64});
+    bench_mha({"attn f32 flash B1 S512 H8 D64", 1, 512, 8, 64});
 }
 
 NNOPS_BENCH(attention_f32_flash_128) {
     // D=128 doubles head_pairs, halving the L2-derived Bc before the Sk cap.
-    bench_attention_case({"attn f32 flash D128 B1 S512 H16 D128", 1, 512, 16, 128});
+    bench_mha({"attn f32 flash D128 B1 S512 H16 D128", 1, 512, 16, 128});
 }
 
 NNOPS_BENCH(attention_f32_flash_d256) {
     // D=256 in the flash path -> GEMM1's K loop runs twice at Kc=128.
-    bench_attention_case({"attn f32 flash D256 B1 S1024 H8 D256", 1, 1024, 8, 256});
+    bench_mha({"attn f32 flash D256 B1 S1024 H8 D256", 1, 1024, 8, 256});
 }
 
 NNOPS_BENCH(attention_f32_flash_d192) {
     // D=192 -> GEMM1's K loop splits 128 + 64 at Kc=128.
-    bench_attention_case({"attn f32 flash D192 B1 S1024 H8 D192", 1, 1024, 8, 192});
+    bench_mha({"attn f32 flash D192 B1 S1024 H8 D192", 1, 1024, 8, 192});
 }
 
 NNOPS_BENCH(attention_f32_flash_masked) {
     // Flash + additive mask.
-    bench_attention_case({"attn f32 flash masked B2 S256 H8 D64", 2, 256, 8, 64,
-                          /*Sk=*/0, /*mask=*/true});
+    bench_mha({"attn f32 flash masked B2 S256 H8 D64", 2, 256, 8, 64,
+               /*Sk=*/0, /*mask=*/true});
+}
+
+NNOPS_BENCH(attention_f32_standard_causal) {
+    // Causal prefill on the standard route.
+    bench_mha({"attn f32 causal B2 S128 H8 D64", 2, 128, 8, 64,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/false, /*causal=*/true});
 }
 
 // ============================================================
@@ -235,36 +412,82 @@ NNOPS_BENCH(attention_f32_flash_masked) {
 // ============================================================
 
 NNOPS_BENCH(attention_f16_standard) {
-    bench_attention_case({"attn f16 standard B2 S128 H8 D64", 2, 128, 8, 64,
-                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+    bench_mha({"attn f16 standard B2 S128 H8 D64", 2, 128, 8, 64,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
 NNOPS_BENCH(attention_f16_standard_wide) {
-    bench_attention_case({"attn f16 standard-wide B1 S128 H8 D128", 1, 128, 8, 128,
-                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+    bench_mha({"attn f16 standard-wide B1 S128 H8 D128", 1, 128, 8, 128,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
 NNOPS_BENCH(attention_f16_standard_d256) {
-    bench_attention_case({"attn f16 standard D256 B2 S128 H8 D256", 2, 128, 8, 256,
-                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+    bench_mha({"attn f16 standard D256 B2 S128 H8 D256", 2, 128, 8, 256,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
 NNOPS_BENCH(attention_f16_flash) {
-    bench_attention_case({"attn f16 flash B1 S512 H8 D64", 1, 512, 8, 64,
-                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+    bench_mha({"attn f16 flash B1 S512 H8 D64", 1, 512, 8, 64,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
 NNOPS_BENCH(attention_f16_flash_128) {
-    bench_attention_case({"attn f16 flash D128 B1 S512 H16 D128", 1, 512, 16, 128,
-                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+    bench_mha({"attn f16 flash D128 B1 S512 H16 D128", 1, 512, 16, 128,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
 NNOPS_BENCH(attention_f16_flash_d256) {
-    bench_attention_case({"attn f16 flash D256 B1 S1024 H8 D256", 1, 1024, 8, 256,
-                          /*Sk=*/0, /*mask=*/false, /*f16=*/true});
+    bench_mha({"attn f16 flash D256 B1 S1024 H8 D256", 1, 1024, 8, 256,
+               /*Sk=*/0, /*mask=*/false, /*f16=*/true});
 }
 
 NNOPS_BENCH(attention_f16_flash_masked) {
-    bench_attention_case({"attn f16 flash masked B2 S256 H8 D64", 2, 256, 8, 64,
-                          /*Sk=*/0, /*mask=*/true, /*f16=*/true});
+    bench_mha({"attn f16 flash masked B2 S256 H8 D64", 2, 256, 8, 64,
+               /*Sk=*/0, /*mask=*/true, /*f16=*/true});
+}
+
+// ============================================================
+// GroupQueryAttention — prefill and decode shapes
+// ============================================================
+
+NNOPS_BENCH(gqa_f32_prefill) {
+    // 4:1 grouping, 512-token prefill: the flash path.
+    bench_gqa({"gqa f32 prefill B1 S512 H32 Hkv8 D128", 1, 512, 32, 8, 128});
+}
+
+NNOPS_BENCH(gqa_f32_decode) {
+    // One new token against a 2048-token key run: the standard path, and the
+    // shape where a kv head's reuse actually shows up.
+    bench_gqa({"gqa f32 decode B1 S1 H32 Hkv8 D128", 1, 1, 32, 8, 128, /*Sk=*/2048});
+}
+
+NNOPS_BENCH(gqa_f32_mqa) {
+    // MQA: one kv head for all 32 query heads.
+    bench_gqa({"gqa f32 mqa B1 S512 H16 Hkv1 D64", 1, 512, 16, 1, 64});
+}
+
+NNOPS_BENCH(gqa_f16_prefill) {
+    bench_gqa({"gqa f16 prefill B1 S512 H32 Hkv8 D128", 1, 512, 32, 8, 128,
+               /*Sk=*/0, /*causal=*/true, /*f16=*/true});
+}
+
+// ============================================================
+// MultiLatentAttention — DeepSeek-shaped latent, prefill and decode
+// ============================================================
+
+NNOPS_BENCH(mla_f32_prefill) {
+    // kv_lora_rank 512 + rope 64, 128 query heads over one latent head.
+    bench_mla({"mla f32 prefill B1 S128 H32 Hkv1 rank512 rope64 v512",
+               1, 128, 32, 1, 512, 64, 512});
+}
+
+NNOPS_BENCH(mla_f32_decode) {
+    // Single-token decode against a 2048-token latent run.
+    bench_mla({"mla f32 decode B1 S1 H64 Hkv1 rank512 rope64 v512",
+               1, 1, 64, 1, 512, 64, 512, /*Sk=*/2048});
+}
+
+NNOPS_BENCH(mla_f16_prefill) {
+    bench_mla({"mla f16 prefill B1 S128 H32 Hkv1 rank512 rope64 v512",
+               1, 128, 32, 1, 512, 64, 512, /*Sk=*/0, /*causal=*/true, /*f16=*/true});
 }

@@ -102,7 +102,7 @@ Two patterns worth knowing:
 |---|---|
 | Convolution | `Conv2D`, `Conv3D`, `DepthwiseConv2D`, `TransposeConv2D` |
 | Matrix / linear | `MatMul` (f32 / f16 / s8×s8), `Linear`, `QuantLinear` |
-| Attention | `Attention`, `LinearAttention` |
+| Attention | `MultiHeadAttention`, `GroupQueryAttention`, `MultiLatentAttention`, `LinearAttention` |
 | Normalization | `LayerNorm`, `RMSNorm`, `BatchNorm`, `Softmax` (softmax & log-softmax) |
 | Element-wise | `Eltwise` (add/sub/mul/div, NumPy broadcast), `Unary` (exp/log family, trig, hyperbolic, erfc, …), `Activation` (relu/leaky_relu/sigmoid/tanh/gelu variants/silu/hard_swish/hard_sigmoid/elu/selu/softplus/mish/prelu/quick_gelu), `Clamp` |
 | Selection / predicate | `Where`, `Compare` (equal/greater/less/…), `Logical` (and/or/xor/not) |

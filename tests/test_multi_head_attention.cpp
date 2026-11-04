@@ -1,7 +1,7 @@
 /// @file test_attention.cpp
-/// @brief Attention operator tests — the class API against the CPU reference.
+/// @brief MultiHeadAttention operator tests — the class API against the CPU reference.
 ///
-/// Most tests drive the public shape: Attention::create, then
+/// Most tests drive the public shape: MultiHeadAttention::create, then
 /// getOutputTensorDesc over the input descs, then nnops::test::make_planar
 /// for the output and op->compute(out, ins).
 ///
@@ -18,7 +18,7 @@
 /// tile-sized count covers it, and the cases pin a final block one column short
 /// of a full tile — the widest partial block.
 
-#include "nnops/ops/attention.hpp"
+#include "nnops/ops/multi_head_attention.hpp"
 #include "backend/cpu/attention/attention.h"      // get_attention_plan — to pin the f16 fast path
 #include "backend/cpu/matmul/matmul_helper.h"  // nr_max_flt / KC_* / mma_pack_align — pack-scratch test
 #include "common/test_harness.hpp"
@@ -55,10 +55,10 @@ NNOPS_TEST(attention_basic_single_head) {
     TensorView k(kshape, DataType::f32, k_data);
     TensorView v(vshape, DataType::f32, v_data);
 
-    AttentionAttributes attrs;
+    MultiHeadAttentionAttributes attrs;
     attrs.num_heads = 1;
 
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
 
     auto d_q = q.desc();
     auto d_k = k.desc();
@@ -108,10 +108,10 @@ NNOPS_TEST(attention_multi_head) {
     TensorView k(kshape, DataType::f32, k_buf.data());
     TensorView v(vshape, DataType::f32, v_buf.data());
 
-    AttentionAttributes attrs;
+    MultiHeadAttentionAttributes attrs;
     attrs.num_heads = 2;
 
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
 
     auto d_q = q.desc();
     auto d_k = k.desc();
@@ -148,10 +148,10 @@ NNOPS_TEST(attention_random) {
     auto [k_vec, k] = test::make_random_tensor({2, 1, 16});
     auto [v_vec, v] = test::make_random_tensor({2, 1, 16});
 
-    AttentionAttributes attrs;
+    MultiHeadAttentionAttributes attrs;
     attrs.num_heads = 1;
 
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
 
     auto d_q = q.desc();
     auto d_k = k.desc();
@@ -184,7 +184,7 @@ NNOPS_TEST(attention_random) {
 // ============================================================
 
 namespace nnops::backend::cpu::reference {
-void attention_ref(const AttentionAttributes& attrs,
+void multi_head_attention_ref(const MultiHeadAttentionAttributes& attrs,
                    TensorView& output,
                    std::span<const TensorView> inputs,
                    const ComputeContext& ctx,
@@ -194,7 +194,7 @@ void attention_ref(const AttentionAttributes& attrs,
 namespace {
 
 /// Fast path vs reference: does every element agree within (rtol, atol)?
-bool attention_fast_vs_ref(const AttentionAttributes& attrs,
+bool attention_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
                            const TensorView& q, const TensorView& k, const TensorView& v,
                            const TensorView* mask,
                            float rtol, float atol)
@@ -206,7 +206,7 @@ bool attention_fast_vs_ref(const AttentionAttributes& attrs,
         ins.push_back(*mask);
     }
 
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
@@ -218,7 +218,7 @@ bool attention_fast_vs_ref(const AttentionAttributes& attrs,
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
-    nnops::backend::cpu::reference::attention_ref(attrs, ref_out, ins, {}, nullptr);
+    nnops::backend::cpu::reference::multi_head_attention_ref(attrs, ref_out, ins, {}, nullptr);
 
     int64_t worst_i = -1;
     float worst_over = 0.0f;
@@ -275,7 +275,7 @@ NNOPS_TEST(attention_tiled_matches_ref) {
             mask  = m;
         }
 
-        AttentionAttributes attrs;
+        MultiHeadAttentionAttributes attrs;
         attrs.num_heads = c.heads;
         attrs.scale     = c.scale;
 
@@ -294,7 +294,7 @@ NNOPS_TEST(attention_tiled_explicit_matches_ref) {
     auto [k_vec, k] = test::make_random_tensor(kshape, -1.0f, 1.0f, 211);
     auto [v_vec, v] = test::make_random_tensor(vshape, -1.0f, 1.0f, 212);
 
-    AttentionAttributes attrs;
+    MultiHeadAttentionAttributes attrs;
     attrs.num_heads = 3;
 
     NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f));
@@ -340,11 +340,12 @@ NNOPS_TEST(attention_pack_scratch_covers_partial_block) {
         q.dims = {1, c.Sq, c.D};
         k.dims = v.dims = {1, c.Sk, c.D};
 
-        AttentionAttributes attrs;
-        attrs.num_heads = 1;
+        // The plan takes the head geometry, not the operator's attributes.
+        cpu::AttentionConfig cfg;
+        cfg.num_heads = 1;
 
         const TensorDesc descs[] = {q, k, v};
-        const cpu::AttentionPlan plan = cpu::get_attention_plan(attrs, descs, {}, 1, false);
+        const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, {}, 1, false);
         const int64_t esz = c.f16 ? 2 : 4;
 
         // One scratch slot here (B = H = 1), and pack_b is its last region, so
@@ -395,7 +396,7 @@ NNOPS_TEST(attention_flash_matches_ref) {
             mask  = m;
         }
 
-        AttentionAttributes attrs;
+        MultiHeadAttentionAttributes attrs;
         attrs.num_heads = c.heads;
 
         const TensorView* mp = c.mask ? &mask : nullptr;
@@ -413,13 +414,13 @@ using nnops::backend::cpu::half;
 
 /// Max |f16 fast path - f32 reference| on the *same* underlying data, for the
 /// caller to compare against kF16AccumTol.
-float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
+float attention_f16_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
                                 const TensorView& q32, const TensorView& k32, const TensorView& v32,
                                 const TensorView* m32,
                                 const TensorView& q16, const TensorView& k16, const TensorView& v16,
                                 const TensorView* m16)
 {
-    auto op = Attention::create(attrs, Backend::CPU);
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
 
     std::vector<TensorDesc> rdescs = {q32.desc(), k32.desc(), v32.desc()};
     std::vector<TensorView> rins   = {q32, k32, v32};
@@ -428,7 +429,7 @@ float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
     const int64_t out_numel = rout_descs[0].numel();
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_planar(rout_descs[0], ref_buf.data());
-    nnops::backend::cpu::reference::attention_ref(attrs, ref_out, rins, {}, nullptr);
+    nnops::backend::cpu::reference::multi_head_attention_ref(attrs, ref_out, rins, {}, nullptr);
 
     // f16 fast path; scratch is pooled by the kernel.
     std::vector<TensorDesc> fdescs = {q16.desc(), k16.desc(), v16.desc()};
@@ -450,7 +451,7 @@ float attention_f16_fast_vs_ref(const AttentionAttributes& attrs,
 
 /// Build the f32 and f16 views for one case (rank 3 or 4 by the shapes), run
 /// f16-vs-f32-ref, and return the max deviation. Empty @p mshape means no mask.
-float run_f16_case(const AttentionAttributes& attrs,
+float run_f16_case(const MultiHeadAttentionAttributes& attrs,
                    const std::vector<int64_t>& qshape,
                    const std::vector<int64_t>& kshape,
                    const std::vector<int64_t>& vshape,
@@ -495,11 +496,11 @@ NNOPS_TEST(attention_f16_routes_to_fast_path) {
     auto [k16v, k16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 401);
     auto [v16v, v16] = test::make_random_f16_tensor(qshape, -1.0f, 1.0f, 402);
 
-    AttentionAttributes attrs;
-    attrs.num_heads = 2;
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = 2;
 
     const TensorDesc descs[] = {q16.desc(), k16.desc(), v16.desc()};
-    const auto plan = nnops::backend::cpu::get_attention_plan(attrs, descs, {}, 1, false);
+    const auto plan = nnops::backend::cpu::get_attention_plan(cfg, descs, {}, 1, false);
     NNOPS_EXPECT_TRUE(plan.workspace_size != 0);
 }
 
@@ -529,7 +530,7 @@ NNOPS_TEST(attention_f16_matches_ref) {
     const float tol = nnops::test::kF16AccumTol;
     float worst = 0.0f;
     for (const auto& c : cases) {
-        AttentionAttributes attrs;
+        MultiHeadAttentionAttributes attrs;
         attrs.num_heads = c.heads;
         attrs.scale     = c.scale;
         const float dev = run_f16_case(attrs, c.qshape, c.kshape, c.vshape, c.mshape, 500);
@@ -556,7 +557,7 @@ NNOPS_TEST(attention_f16_flash_matches_ref) {
     const float tol = nnops::test::kF16AccumTol;
     float worst = 0.0f;
     for (const auto& c : cases) {
-        AttentionAttributes attrs;
+        MultiHeadAttentionAttributes attrs;
         attrs.num_heads = c.heads;
         worst = std::max(worst, run_f16_case(attrs, c.qshape, c.qshape, c.qshape, c.mshape, 600));
     }

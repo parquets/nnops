@@ -12,7 +12,9 @@
 #include "nnops/ops/pooling.hpp"
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
-#include "nnops/ops/attention.hpp"
+#include "nnops/ops/multi_head_attention.hpp"
+#include "nnops/ops/group_query_attention.hpp"
+#include "nnops/ops/multi_latent_attention.hpp"
 #include "nnops/ops/activation.hpp"
 #include "nnops/ops/softmax.hpp"
 #include "nnops/ops/cumsum.hpp"
@@ -531,11 +533,11 @@ NNOPS_TEST(shape_matmul_layout_propagation) {
 }
 
 // ============================================================
-// 7. Attention
+// 7. Attention family
 // ============================================================
 
 NNOPS_TEST(shape_attention_merged_heads) {
-    auto op = Attention::create(Backend::CPU);
+    auto op = MultiHeadAttention::create(Backend::CPU);
 
     TensorDesc q_desc = td({1, 128, 768});  // [B, S, H*D]
     TensorDesc k_desc = td({1, 128, 768});
@@ -547,7 +549,7 @@ NNOPS_TEST(shape_attention_merged_heads) {
 }
 
 NNOPS_TEST(shape_attention_per_head) {
-    auto op = Attention::create(Backend::CPU);
+    auto op = MultiHeadAttention::create(Backend::CPU);
 
     TensorDesc q_desc = td({1, 12, 128, 64});  // [B, H, S, D]
     TensorDesc k_desc = td({1, 12, 128, 64});
@@ -559,7 +561,7 @@ NNOPS_TEST(shape_attention_per_head) {
 }
 
 NNOPS_TEST(shape_attention_layout_propagation) {
-    auto op = Attention::create(Backend::CPU);
+    auto op = MultiHeadAttention::create(Backend::CPU);
 
     TensorDesc q_desc = td({2, 64, 512}, DataType::f16, TensorLayout::NHWC);  // [B, S, H*D]
     TensorDesc k_desc = td({2, 64, 512}, DataType::f16);

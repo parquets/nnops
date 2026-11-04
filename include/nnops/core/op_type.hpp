@@ -17,7 +17,7 @@ enum class OpType : uint8_t {
     Pooling     = 2,
     Linear      = 3,
     MatMul      = 4,
-    Attention   = 5,
+    MultiHeadAttention = 5,
     Softmax     = 6,
     CumSum      = 7,
     BatchNorm   = 8,
@@ -63,6 +63,8 @@ enum class OpType : uint8_t {
     Where           = 48,
     Compare         = 49,
     Logical         = 50,
+    GroupQueryAttention = 51,
+    MultiLatentAttention = 52,
 };
 
 }  // namespace nnops

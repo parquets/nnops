@@ -14,7 +14,9 @@ set(TEST_SOURCES
     test_pooling.cpp
     test_linear.cpp
     test_pack_mma.cpp
-    test_attention.cpp
+    test_multi_head_attention.cpp
+    test_group_query_attention.cpp
+    test_multi_latent_attention.cpp
     test_clamp.cpp
     test_softmax.cpp
     test_cumsum.cpp
@@ -59,7 +61,9 @@ set(TEST_SOURCES
 
 # Reference kernels that only the tests need, as ground truth for the fast paths.
 add_library(nnops_test_reference STATIC
-    reference/attention_ref.cpp
+    reference/multi_head_attention_ref.cpp
+    reference/group_query_attention_ref.cpp
+    reference/multi_latent_attention_ref.cpp
     reference/concat_ref.cpp
     reference/conv2d_int8_ref.cpp
     reference/conv2d_ref.cpp
