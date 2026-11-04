@@ -89,8 +89,9 @@ enum class TensorLayout : uint8_t {
     // [K][nr] k-major with the tail zero-filled, panels `ldd` elements apart.
     // Packing at full K makes `ldd` depend on K, not the call's k-block, so the
     // plan's kc stays free (it depends on M, N and the worker count); the MMA
-    // walks one panel at a time (tile_mma_pack_ldb). alpha cannot ride the pack
-    // (it is per call), so a prepacked B requires alpha == 1. Shape is
+    // walks one panel at a time (tile_mma_pack at the blob's stride). alpha
+    // cannot ride the pack (it is per call), so a prepacked B requires
+    // alpha == 1. Shape is
     // [N, ⌈elements / N⌉], N first so shape inference reads the output's last dim.
     PackedB = 17,
 

@@ -14,11 +14,11 @@
 /// panel's column sums are the only seed.
 ///
 /// Two A routes, as in the float files; B is always packed, always VNNI order.
-///   - `mma_packed_ab_*` takes a packed A: four consecutive k per int32, with
+///   - `mma_pack_*` takes a packed A: four consecutive k per int32, with
 ///     the kernel's MR row slots interleaved inside each k group --
 ///     [ceil(kc/4)][MR] int32s, in a mma_pack_align(MR*kbytes)-byte slot; only
 ///     the first `mr` slots of a short panel are read.
-///   - `mma_packed_b_*` reads A row-major through `lda` (in int8 elements): the
+///   - `mma_direct_*` reads A row-major through `lda` (in int8 elements): the
 ///     four consecutive k of one row are already the dword dpbusd wants, so the
 ///     broadcast is one unaligned 4-byte load (no penalty on x86) rather than a
 ///     packed panel -- but a row-major row has no zero-filled final group, so
@@ -29,6 +29,15 @@
 ///     64*ceil(kc/4) bytes, itself a multiple of the 64-byte mma_pack_align
 ///     slot, so the sums block starts at panel + 64*ceil(kc/4) and the panel's
 ///     slot is mma_pack_align(64*ceil(kc/4) + 64) (see mma_i8_b_panel_tail).
+///
+/// `ldb` (0 = the natural slot above), the B-side argument that follows the
+/// operand it strides, overrides the panel-to-panel step in bytes: a prepacked B
+/// need not be one uniform pitch, because its panels can be cut into k-block
+/// segments -- [block 0 data][block 0 sums][block 1 data][block 1 sums]... --
+/// whose total is the caller's, not the kernel's. What stays fixed is the sums'
+/// position *within* a call: each panel's sums are read at that panel's own
+/// start + 16*ceil(kc/4), so the segment's sums land where a per-call pack would
+/// have put them.
 ///
 /// Panels past `nc` in the last one are zero-filled by the packer, so the tail
 /// can always read all 16 columns at the uniform stride and discard the dead
@@ -91,6 +100,14 @@ inline constexpr int mma_i8_nr_max = 16;
 /// Bytes a packed-B panel carries past its payload: one int32 of column sums per column.
 inline constexpr int mma_i8_b_panel_tail = mma_i8_nr_max * 4;
 
+/// A packed-B panel's byte pitch: the caller's `ldb` when it gave one (a
+/// prepacked blob's own), else the uniform slot `k` int8 k-values take.
+inline constexpr int mma_i8_panel_stride(int ldb, int k) noexcept {
+    return (ldb > 0)
+        ? ldb
+        : static_cast<int>(mma_pack_align(16 * k + mma_i8_b_panel_tail));
+}
+
 /// The kernels fold the A bias per panel, so matmul_helper's epilogue corrects none of it.
 inline constexpr bool mma_i8_folds_a_bias = true;
 
@@ -118,10 +135,10 @@ inline __m256i mma_i8_bias_fix(const int8_t* panel, int kbytes, int off) noexcep
 }
 
 template <bool zero_mode = false>
-void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
+void mma_pack_mr6_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
     const int8_t* NNOPS_RESTRICT A,
-    const int8_t* NNOPS_RESTRICT B,
+    const int8_t* NNOPS_RESTRICT B, int ldb,
     int32_t clamp_min, int32_t clamp_max) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
@@ -139,7 +156,7 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
 
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kbytes + mma_i8_b_panel_tail));
+    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
 
     int n = 0;
     for(; n < nc - 15; n += 16) {
@@ -248,7 +265,7 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
         c4_ptr += 16;
         c5_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -505,10 +522,10 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
+void mma_pack_mr4_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
     const int8_t* NNOPS_RESTRICT A,
-    const int8_t* NNOPS_RESTRICT B,
+    const int8_t* NNOPS_RESTRICT B, int ldb,
     int32_t clamp_min, int32_t clamp_max) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
@@ -522,7 +539,7 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
 
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kbytes + mma_i8_b_panel_tail));
+    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
 
     int n = 0;
     for(; n < nc - 15; n += 16) {
@@ -602,7 +619,7 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
         c2_ptr += 16;
         c3_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -796,10 +813,10 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
+void mma_pack_mr1_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
     const int8_t* NNOPS_RESTRICT A,
-    const int8_t* NNOPS_RESTRICT B,
+    const int8_t* NNOPS_RESTRICT B, int ldb,
     int32_t clamp_min, int32_t clamp_max) noexcept {
     (void)mr;
 
@@ -807,7 +824,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
 
     const int kbytes = (kc + 3) & ~3;
     const int kg = kbytes >> 2;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kbytes + mma_i8_b_panel_tail));
+    const int ldb_panel = mma_i8_panel_stride(ldb, kbytes);
 
     int n = 0;
     for(; n < nc - 15; n += 16) {
@@ -844,7 +861,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
 
         c0_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -951,10 +968,10 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-void mma_packed_b_mr6_nr16_mrxncxkc_i8(
+void mma_direct_mr6_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
     const int8_t* NNOPS_RESTRICT A, int lda,
-    const int8_t* NNOPS_RESTRICT B,
+    const int8_t* NNOPS_RESTRICT B, int ldb,
     int32_t clamp_min, int32_t clamp_max) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
@@ -971,7 +988,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_i8(
     int32_t* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
 
     const int kg = kc >> 2;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kc + mma_i8_b_panel_tail));
+    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
 
     int n = 0;
     for(; n < nc - 15; n += 16) {
@@ -1091,7 +1108,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_i8(
         c4_ptr += 16;
         c5_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1360,10 +1377,10 @@ void mma_packed_b_mr6_nr16_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-void mma_packed_b_mr4_nr16_mrxncxkc_i8(
+void mma_direct_mr4_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
     const int8_t* NNOPS_RESTRICT A, int lda,
-    const int8_t* NNOPS_RESTRICT B,
+    const int8_t* NNOPS_RESTRICT B, int ldb,
     int32_t clamp_min, int32_t clamp_max) noexcept {
 
     const int r1 = (mr > 1) ? 1 : 0;
@@ -1376,7 +1393,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_i8(
     int32_t* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
     const int kg = kc >> 2;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kc + mma_i8_b_panel_tail));
+    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
 
     int n = 0;
     for(; n < nc - 15; n += 16) {
@@ -1463,7 +1480,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_i8(
         c2_ptr += 16;
         c3_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1667,17 +1684,17 @@ void mma_packed_b_mr4_nr16_mrxncxkc_i8(
 }
 
 template <bool zero_mode = false>
-void mma_packed_b_mr1_nr16_mrxncxkc_i8(
+void mma_direct_mr1_nr16_mrxncxkc_i8(
     int mr, int nc, int kc, int32_t* NNOPS_RESTRICT C, int ldc,
     const int8_t* NNOPS_RESTRICT A, int lda,
-    const int8_t* NNOPS_RESTRICT B,
+    const int8_t* NNOPS_RESTRICT B, int ldb,
     int32_t clamp_min, int32_t clamp_max) noexcept {
     (void)mr;
 
     int32_t* c0_ptr = C;
 
     const int kg = kc >> 2;
-    const int ldb = static_cast<int>(mma_pack_align(16 * kc + mma_i8_b_panel_tail));
+    const int ldb_panel = mma_i8_panel_stride(ldb, kc);
 
     int n = 0;
     for(; n < nc - 15; n += 16) {
@@ -1715,7 +1732,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_i8(
 
         c0_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1825,15 +1842,15 @@ void mma_packed_b_mr1_nr16_mrxncxkc_i8(
 /// MR levels {6,4,1} (MR_I8); a remainder panel runs through the level above it.
 template <bool Z>
 inline constexpr auto mma_pack_fns_i8 = std::array{
-    &mma_packed_ab_mr6_nr16_mrxncxkc_i8<Z>,
-    &mma_packed_ab_mr4_nr16_mrxncxkc_i8<Z>,
-    &mma_packed_ab_mr1_nr16_mrxncxkc_i8<Z>};
+    &mma_pack_mr6_nr16_mrxncxkc_i8<Z>,
+    &mma_pack_mr4_nr16_mrxncxkc_i8<Z>,
+    &mma_pack_mr1_nr16_mrxncxkc_i8<Z>};
 
 /// Row-major A (`lda` in int8 elements, kc % 4 == 0), same MR levels.
 template <bool Z>
 inline constexpr auto mma_direct_fns_i8 = std::array{
-    &mma_packed_b_mr6_nr16_mrxncxkc_i8<Z>,
-    &mma_packed_b_mr4_nr16_mrxncxkc_i8<Z>,
-    &mma_packed_b_mr1_nr16_mrxncxkc_i8<Z>};
+    &mma_direct_mr6_nr16_mrxncxkc_i8<Z>,
+    &mma_direct_mr4_nr16_mrxncxkc_i8<Z>,
+    &mma_direct_mr1_nr16_mrxncxkc_i8<Z>};
 
 }  // namespace nnops::backend::cpu::x86_64

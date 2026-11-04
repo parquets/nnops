@@ -854,11 +854,11 @@ void run_phase(const StepCtx<T>& s, const ComputeContext& ctx)
 
         for (int64_t k = 0; k < s.hidden; k += s.kc) {
             const int64_t kc = std::min<int64_t>(s.kc, s.hidden - k);
-            tile_mma_direct_ldb(static_cast<int>(mcnt), static_cast<int>(ncnt),
+            tile_mma_direct(static_cast<int>(mcnt), static_cast<int>(ncnt),
                                 static_cast<int>(kc),
                                 c_tile, static_cast<int>(s.ldc),
                                 a + k, static_cast<int>(s.hp),
-                                b_panel + k * s.r_nr, s.r_ldd,
+                                b_panel + k * s.r_nr, -s.r_ldd, /*stage=*/nullptr,
                                 -INFINITY, INFINITY, k == 0 && fresh);
         }
 
@@ -913,11 +913,11 @@ void project_chunk(const T* x, int64_t x_ld, T* c, int64_t ldc, const T* packed_
 
         for (int64_t k = 0; k < input; k += kc) {
             const int64_t kcnt = std::min<int64_t>(kc, input - k);
-            tile_mma_direct_ldb(static_cast<int>(mcnt), static_cast<int>(ncnt),
+            tile_mma_direct(static_cast<int>(mcnt), static_cast<int>(ncnt),
                                 static_cast<int>(kcnt),
                                 c_tile, static_cast<int>(ldc),
                                 a + k, static_cast<int>(x_ld),
-                                b_panel + k * w_nr, w_ldd,
+                                b_panel + k * w_nr, -w_ldd, /*stage=*/nullptr,
                                 -INFINITY, INFINITY, k == 0);
         }
     };
@@ -991,15 +991,10 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
             }
             const int8_t* pb = packed_w + slab +
                                (n0 / NR_MAX_I8) * int8_panel_stride(kc);
-            if (kb == 0) {
-                tile_mma_pack_i8_zero(static_cast<int>(mcnt), static_cast<int>(ncnt),
-                                      static_cast<int>(kc), pc, static_cast<int>(nc),
-                                      pa, pb, INT32_MIN, INT32_MAX);
-            } else {
-                tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
-                                 static_cast<int>(kc), pc, static_cast<int>(nc),
-                                 pa, pb, INT32_MIN, INT32_MAX);
-            }
+            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                             static_cast<int>(kc), pc, static_cast<int>(nc),
+                             pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
+                             /*zero_mode=*/kb == 0);
             slab += q8_slab_bytes(cols, kc);
         }
 
@@ -1084,15 +1079,10 @@ void run_phase_q8(const StepCtx<T>& s, const ComputeContext& ctx)
                                    /*u8=*/false, a_biased);
             const int8_t* pb = s.q_r + slab +
                                (n0 / NR_MAX_I8) * int8_panel_stride(kc);
-            if (kb == 0) {
-                tile_mma_pack_i8_zero(static_cast<int>(mcnt), static_cast<int>(ncnt),
-                                      static_cast<int>(kc), pc, static_cast<int>(s.nc),
-                                      pa, pb, INT32_MIN, INT32_MAX);
-            } else {
-                tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
-                                 static_cast<int>(kc), pc, static_cast<int>(s.nc),
-                                 pa, pb, INT32_MIN, INT32_MAX);
-            }
+            tile_mma_pack_i8(static_cast<int>(mcnt), static_cast<int>(ncnt),
+                             static_cast<int>(kc), pc, static_cast<int>(s.nc),
+                             pa, pb, /*ldb=*/0, INT32_MIN, INT32_MAX,
+                             /*zero_mode=*/kb == 0);
             slab += q8_slab_bytes(s.cols, kc);
         }
 

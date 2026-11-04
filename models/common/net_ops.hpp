@@ -781,8 +781,9 @@ inline Buf global_avg_pool(const TensorView& x)
 /// above. What it removes is the per-call RHS pack: every forward would
 /// otherwise repack the whole [N, K] weight into the GEMM's uniform panels.
 ///
-/// A weight with no packed form (a quantized one) comes back raw, which is
-/// what compute() takes anyway.
+/// A weight with no packed form (u8, or anything but f32/f16/s8) comes back
+/// raw, which is what compute() takes anyway. An s8 weight packs here too, but
+/// only an s8 activation may hand the result to compute().
 inline const TensorView& packed_linear_weight(const TensorView& w)
 {
     static std::map<const void*, detail::WeightCopy> cache;

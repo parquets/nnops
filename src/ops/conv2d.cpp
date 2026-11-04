@@ -253,7 +253,7 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
 {
     // The CUDA kernels read the raw filter in place (implicit GEMM only), so
     // this backend has no packed product: the query stays empty, the same
-    // "no packed form" answer MatMul gives a quantized weight.
+    // "no packed form" answer MatMul gives a dtype it cannot pack.
     if (backend_ != Backend::CPU) { return; }
     NNOPS_ASSERT(inputs.size() >= 1);
     NNOPS_ASSERT(outputs.size() >= 1);

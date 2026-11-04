@@ -7,8 +7,10 @@
 /// panel the largest-first M decomposition emits instead of needing a kernel
 /// per height.
 ///
-/// A and B may both be packed (`mma_packed_ab_*`) or only B packed while A is
-/// read row-major (`mma_packed_b_*`); `zero_mode` drops the C read-add. Packed
+/// A and B may both be packed (`mma_pack_*`) or only B packed while A is
+/// read row-major (`mma_direct_*`), whose `ldb` is B's k-row step: negative
+/// selects the packed layout (rows 12 apart), any other value is a caller's
+/// matrix read in place. `zero_mode` drops the C read-add. Packed
 /// B is uniform: ceil(nc / 12) panels, every one a full 12 columns wide, each
 /// in a mma_pack_align(12*kc*sizeof(float))-byte slot (12*kc floats). The
 /// columns past `nc` are padding the tail's store discards, so the tail always
@@ -37,7 +39,7 @@ namespace nnops::backend::cpu::aarch64 {
 // ---- A and B both packed ----
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
+inline void mma_pack_mr8_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -61,7 +63,7 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
     const int r6 = (mr > 6) ? 6 : r5;
     const int r7 = (mr > 7) ? 7 : r6;
 
-    const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -183,7 +185,7 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
         c6_ptr += 12;
         c7_ptr += 12;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     const int rem = nc - n;
@@ -289,7 +291,7 @@ inline void mma_packed_ab_mr8_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
+inline void mma_pack_mr4_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -305,7 +307,7 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
     const int r2 = (mr > 2) ? 2 : r1;
     const int r3 = (mr > 3) ? 3 : r2;
 
-    const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -382,7 +384,7 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
         c2_ptr += 12;
         c3_ptr += 12;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     const int rem = nc - n;
@@ -464,7 +466,7 @@ inline void mma_packed_ab_mr4_nr12_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
+inline void mma_pack_mr1_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -473,7 +475,7 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
 
     float* NNOPS_RESTRICT c0_ptr = C;
 
-    const int ldb = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -514,7 +516,7 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
         vst1q_f32(c0_ptr + 2 * 4, vminq_f32(vmaxq_f32(c02, vmin), vmax));
 
         c0_ptr += 12;
-        B += ldb;
+        B += ldb_panel;
     }
 
     const int rem = nc - n;
@@ -576,7 +578,7 @@ inline void mma_packed_ab_mr1_nr12_mrxncxkc_f32(
 // ---- only B packed, A read row-major ----
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
+inline void mma_direct_mr8_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B, int ldb,
@@ -601,6 +603,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
     float* NNOPS_RESTRICT c7_ptr = (mr > 7) ? C + 7 * ldc : c6_ptr;
 
     const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 12 : ldb;
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -634,7 +637,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
             const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
             const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
             const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-            b_ptr += ldb;
+            b_ptr += row_step;
 
             const float v0 = *a0++;
             const float v1 = *a1++;
@@ -760,7 +763,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
                 const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -799,7 +802,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
         } else {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -855,18 +858,7 @@ inline void mma_packed_b_mr8_nr12_mrxncxkc_f32_bld(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr8_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    mma_packed_b_mr8_nr12_mrxncxkc_f32_bld<zero_mode, seed>(
-        mr, nc, kc, C, ldc, A, lda, B, 12, clamp_min, clamp_max, bias);
-}
-
-template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
+inline void mma_direct_mr4_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B, int ldb,
@@ -883,6 +875,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
     float* NNOPS_RESTRICT c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
     const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 12 : ldb;
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -908,7 +901,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
             const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
             const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
             const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-            b_ptr += ldb;
+            b_ptr += row_step;
 
             const float v0 = *a0++;
             const float v1 = *a1++;
@@ -982,7 +975,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
                 const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -1005,7 +998,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
         } else {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const float v0 = *a0++;
                 const float v1 = *a1++;
@@ -1051,18 +1044,7 @@ inline void mma_packed_b_mr4_nr12_mrxncxkc_f32_bld(
 }
 
 template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr4_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    mma_packed_b_mr4_nr12_mrxncxkc_f32_bld<zero_mode, seed>(
-        mr, nc, kc, C, ldc, A, lda, B, 12, clamp_min, clamp_max, bias);
-}
-
-template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
+inline void mma_direct_mr1_nr12_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B, int ldb,
@@ -1075,6 +1057,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
     float* NNOPS_RESTRICT c0_ptr = C;
 
     const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 12 : ldb;
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -1094,7 +1077,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
             const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
             const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
             const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-            b_ptr += ldb;
+            b_ptr += row_step;
 
             const float a = *a_ptr++;
 
@@ -1128,7 +1111,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
                 const float32x4_t b0 = vld1q_f32(b_ptr + 0 * 4);
                 const float32x4_t b1 = vld1q_f32(b_ptr + 1 * 4);
                 const float32x4_t b2 = vld1q_f32(b_ptr + 2 * 4);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const float a = *a_ptr++;
 
@@ -1139,7 +1122,7 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
         } else {
             for (int k = 0; k < kc; ++k) {
                 const float32x4_t b0 = vld1q_f32(b_ptr);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const float a = *a_ptr++;
 
@@ -1173,34 +1156,17 @@ inline void mma_packed_b_mr1_nr12_mrxncxkc_f32_bld(
     }
 }
 
-template <bool zero_mode = false, int seed = 0>
-inline void mma_packed_b_mr1_nr12_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    mma_packed_b_mr1_nr12_mrxncxkc_f32_bld<zero_mode, seed>(
-        mr, nc, kc, C, ldc, A, lda, B, 12, clamp_min, clamp_max, bias);
-}
-
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f32 = std::array{
-    &mma_packed_ab_mr8_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_ab_mr4_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_ab_mr1_nr12_mrxncxkc_f32<Z, Seed>};
+    &mma_pack_mr8_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_pack_mr4_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_pack_mr1_nr12_mrxncxkc_f32<Z, Seed>};
 
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{
-    &mma_packed_b_mr8_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_b_mr4_nr12_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_b_mr1_nr12_mrxncxkc_f32<Z, Seed>};
-
-template <bool Z, int Seed = 0>
-inline constexpr auto mma_direct_bld_fns_f32 = std::array{
-    &mma_packed_b_mr8_nr12_mrxncxkc_f32_bld<Z, Seed>,
-    &mma_packed_b_mr4_nr12_mrxncxkc_f32_bld<Z, Seed>,
-    &mma_packed_b_mr1_nr12_mrxncxkc_f32_bld<Z, Seed>};
+    &mma_direct_mr8_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_direct_mr4_nr12_mrxncxkc_f32<Z, Seed>,
+    &mma_direct_mr1_nr12_mrxncxkc_f32<Z, Seed>};
 
 }  // namespace nnops::backend::cpu::aarch64

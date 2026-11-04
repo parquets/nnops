@@ -9,14 +9,16 @@
 /// All take the runtime panel height `mr`; NR is 16 -- two YMM halves.
 ///
 /// Two operand routes:
-///   - `mma_packed_ab_*` takes a packed A: MR row slots per k, so `a_ptr += MR`
+///   - `mma_pack_*` takes a packed A: MR row slots per k, so `a_ptr += MR`
 ///     walks k.
-///   - `mma_packed_b_*` reads A row-major through `lda`.
-/// B is always packed: ceil(nc / 16) uniform panels, every one a full 16
-/// columns wide with the columns past `nc` zero-filled, each in a
+///   - `mma_direct_*` reads A row-major through `lda`.
+/// B is always a panel sequence: ceil(nc / 16) uniform panels, every one a full
+/// 16 columns wide with the columns past `nc` zero-filled, each in a
 /// mma_pack_align(16*kc*sizeof(float))-byte slot (16*kc floats). The uniform
 /// width is what lets the kernel read 16 floats per k at every column, so a
-/// tail wider than 8 costs one k-loop instead of two.
+/// tail wider than 8 costs one k-loop instead of two. `ldb` is B's k-row step:
+/// negative selects that packed layout (rows 16 apart), any other value is a
+/// raw caller matrix read in place.
 ///
 /// Partial-M: rows past `mr` alias the last live row in both A and C -- they
 /// compute a duplicate and store it back to the same place, so a short panel
@@ -46,7 +48,7 @@
 namespace nnops::backend::cpu::x86_64 {
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
+void mma_pack_mr6_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -65,7 +67,7 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
     float* c4_ptr = (mr > 4) ? C + 4 * ldc : c3_ptr;
     float* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -170,7 +172,7 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
         c4_ptr += 16;
         c5_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -410,7 +412,7 @@ void mma_packed_ab_mr6_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
+void mma_pack_mr4_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -425,7 +427,7 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
     float* c2_ptr = (mr > 2) ? C + 2 * ldc : c1_ptr;
     float* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -505,7 +507,7 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
         c2_ptr += 16;
         c3_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -690,7 +692,7 @@ void mma_packed_ab_mr4_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
+void mma_pack_mr2_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -701,7 +703,7 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
     float* c0_ptr = C;
     float* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -756,7 +758,7 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
         c0_ptr += 16;
         c1_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -888,7 +890,7 @@ void mma_packed_ab_mr2_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
+void mma_pack_mr1_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A,
     const float* NNOPS_RESTRICT B,
@@ -900,7 +902,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
 
     float* c0_ptr = C;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
 
     int n = 0;
 
@@ -942,7 +944,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
 
         c0_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1045,7 +1047,7 @@ void mma_packed_ab_mr1_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
+void mma_direct_mr6_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B, int ldb,
@@ -1065,6 +1067,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
     float* c5_ptr = (mr > 5) ? C + 5 * ldc : c4_ptr;
 
     int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 16 : ldb;
 
     int n = 0;
 
@@ -1100,7 +1103,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += ldb;
+            b_ptr += row_step;
 
             __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1204,7 +1207,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1229,7 +1232,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += ldb;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += row_step;
                 v_acc0x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a0_ptr), v_b0, v_acc0x01234567);
                 v_acc1x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a1_ptr), v_b0, v_acc1x01234567);
                 v_acc2x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a2_ptr), v_b0, v_acc2x01234567);
@@ -1422,18 +1425,7 @@ void mma_packed_b_mr6_nr16_mrxncxkc_f32_bld(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr6_nr16_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    mma_packed_b_mr6_nr16_mrxncxkc_f32_bld<zero_mode, seed>(
-        mr, nc, kc, C, ldc, A, lda, B, 16, clamp_min, clamp_max, bias);
-}
-
-template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
+void mma_direct_mr4_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B, int ldb,
@@ -1449,6 +1441,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
     float* c3_ptr = (mr > 3) ? C + 3 * ldc : c2_ptr;
 
     int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 16 : ldb;
 
     int n = 0;
 
@@ -1478,7 +1471,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += ldb;
+            b_ptr += row_step;
 
             __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1555,7 +1548,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1573,7 +1566,7 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += ldb;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += row_step;
                 v_acc0x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a0_ptr), v_b0, v_acc0x01234567);
                 v_acc1x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a1_ptr), v_b0, v_acc1x01234567);
                 v_acc2x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a2_ptr), v_b0, v_acc2x01234567);
@@ -1720,21 +1713,10 @@ void mma_packed_b_mr4_nr16_mrxncxkc_f32_bld(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr4_nr16_mrxncxkc_f32(
+void mma_direct_mr2_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    mma_packed_b_mr4_nr16_mrxncxkc_f32_bld<zero_mode, seed>(
-        mr, nc, kc, C, ldc, A, lda, B, 16, clamp_min, clamp_max, bias);
-}
-
-template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr2_nr16_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
+    const float* NNOPS_RESTRICT B, int ldb,
     float clamp_min, float clamp_max,
     const float* NNOPS_RESTRICT bias = nullptr) noexcept {
     const int r1 = (mr > 1) ? 1 : 0;
@@ -1742,7 +1724,8 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
     float* c0_ptr = C;
     float* c1_ptr = (mr > 1) ? C + 1 * ldc : c0_ptr;
 
-    int ldb = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 16 : ldb;
 
     int n = 0;
 
@@ -1766,7 +1749,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += 16;
+            b_ptr += row_step;
 
             const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             const __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1798,7 +1781,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
         c0_ptr += 16;
         c1_ptr += 16;
 
-        B += ldb;
+        B += ldb_panel;
     }
 
     int rem = nc - n;
@@ -1816,7 +1799,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += 16;
+                b_ptr += row_step;
 
                 const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 const __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
@@ -1827,7 +1810,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += 16;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += row_step;
                 const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 const __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
                 v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
@@ -1928,7 +1911,7 @@ void mma_packed_b_mr2_nr16_mrxncxkc_f32(
 }
 
 template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
+void mma_direct_mr1_nr16_mrxncxkc_f32(
     int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
     const float* NNOPS_RESTRICT A, int lda,
     const float* NNOPS_RESTRICT B, int ldb,
@@ -1942,6 +1925,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
     float* c0_ptr = C;
 
     int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    const int row_step = (ldb < 0) ? 16 : ldb;
 
     int n = 0;
 
@@ -1962,7 +1946,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-            b_ptr += ldb;
+            b_ptr += row_step;
 
             const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
             v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
@@ -1999,7 +1983,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
             for(int k = 0; k < kc; ++k) {
                 const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
                 const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
-                b_ptr += ldb;
+                b_ptr += row_step;
 
                 const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
                 v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
@@ -2007,7 +1991,7 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
             }
         } else {
             for (int k = 0; k < kc; ++k) {
-                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += ldb;
+                const __m256 v_b0 = _mm256_loadu_ps(b_ptr); b_ptr += row_step;
                 v_acc0x01234567 = _mm256_fmadd_ps(_mm256_broadcast_ss(a0_ptr), v_b0, v_acc0x01234567);
                 a0_ptr += 1;
             }
@@ -2084,37 +2068,20 @@ void mma_packed_b_mr1_nr16_mrxncxkc_f32_bld(
     }
 }
 
-template <bool zero_mode = false, int seed = 0>
-void mma_packed_b_mr1_nr16_mrxncxkc_f32(
-    int mr, int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-    const float* NNOPS_RESTRICT A, int lda,
-    const float* NNOPS_RESTRICT B,
-    float clamp_min, float clamp_max,
-    const float* NNOPS_RESTRICT bias = nullptr) noexcept {
-    mma_packed_b_mr1_nr16_mrxncxkc_f32_bld<zero_mode, seed>(
-        mr, nc, kc, C, ldc, A, lda, B, 16, clamp_min, clamp_max, bias);
-}
-
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
 // Rows are the MR levels {6,4,1}; every kernel takes the runtime panel height,
 // so a remainder panel below its own MR runs through the level above it. The
 // mr2 kernels stay out of these tables; only the tests and bench call them.
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f32 = std::array{
-    &mma_packed_ab_mr6_nr16_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_ab_mr4_nr16_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_ab_mr1_nr16_mrxncxkc_f32<Z, Seed>};
+    &mma_pack_mr6_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_pack_mr4_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_pack_mr1_nr16_mrxncxkc_f32<Z, Seed>};
 
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{
-    &mma_packed_b_mr6_nr16_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_b_mr4_nr16_mrxncxkc_f32<Z, Seed>,
-    &mma_packed_b_mr1_nr16_mrxncxkc_f32<Z, Seed>};
-
-template <bool Z, int Seed = 0>
-inline constexpr auto mma_direct_bld_fns_f32 = std::array{
-    &mma_packed_b_mr6_nr16_mrxncxkc_f32_bld<Z, Seed>,
-    &mma_packed_b_mr4_nr16_mrxncxkc_f32_bld<Z, Seed>,
-    &mma_packed_b_mr1_nr16_mrxncxkc_f32_bld<Z, Seed>};
+    &mma_direct_mr6_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_direct_mr4_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_direct_mr1_nr16_mrxncxkc_f32<Z, Seed>};
 
 }

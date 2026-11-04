@@ -99,7 +99,7 @@ template <typename T>
 using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float,
                           const T*);
 template <typename T>
-using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*,
+using BKernel  = void (*)(int, int, int, T*, int, const T*, int, const T*, int,
                           float, float, const T*);
 
 // ---- level tables ---------------------------------------------------------
@@ -111,73 +111,73 @@ auto ab_fn(int level, bool zero_mode, int seed) {
 #if defined(NNOPS_ARCH_X86_64)
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return seed == 1 ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr6_nr16_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr6_nr16_mrxncxkc_f32<false>;
-        case 4: return seed == 1 ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr4_nr16_mrxncxkc_f32<false>;
-        case 2: return seed == 1 ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr2_nr16_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr2_nr16_mrxncxkc_f32<false>;
-        default: return seed == 1 ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr1_nr16_mrxncxkc_f32<false>;
+        case 6: return seed == 1 ? mma_pack_mr6_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr6_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr6_nr16_mrxncxkc_f32<true>
+                        : mma_pack_mr6_nr16_mrxncxkc_f32<false>;
+        case 4: return seed == 1 ? mma_pack_mr4_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr4_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr4_nr16_mrxncxkc_f32<true>
+                        : mma_pack_mr4_nr16_mrxncxkc_f32<false>;
+        case 2: return seed == 1 ? mma_pack_mr2_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr2_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr2_nr16_mrxncxkc_f32<true>
+                        : mma_pack_mr2_nr16_mrxncxkc_f32<false>;
+        default: return seed == 1 ? mma_pack_mr1_nr16_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr1_nr16_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr1_nr16_mrxncxkc_f32<true>
+                        : mma_pack_mr1_nr16_mrxncxkc_f32<false>;
         }
     } else {
         switch (level) {
-        case 6: return seed == 1 ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr6_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr6_nr16_mrxncxkc_f16<false>;
-        case 4: return seed == 1 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
-        case 2: return seed == 1 ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr2_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr2_nr16_mrxncxkc_f16<false>;
-        default: return seed == 1 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
+        case 6: return seed == 1 ? mma_pack_mr6_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr6_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr6_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr6_nr16_mrxncxkc_f16<false>;
+        case 4: return seed == 1 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr4_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr4_nr16_mrxncxkc_f16<false>;
+        case 2: return seed == 1 ? mma_pack_mr2_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr2_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr2_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr2_nr16_mrxncxkc_f16<false>;
+        default: return seed == 1 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr1_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr1_nr16_mrxncxkc_f16<false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return seed == 1 ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr8_nr12_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr8_nr12_mrxncxkc_f32<false>;
-        case 4: return seed == 1 ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr4_nr12_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr4_nr12_mrxncxkc_f32<false>;
-        default: return seed == 1 ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true, 2>
-                        : zero_mode ? mma_packed_ab_mr1_nr12_mrxncxkc_f32<true>
-                        : mma_packed_ab_mr1_nr12_mrxncxkc_f32<false>;
+        case 8: return seed == 1 ? mma_pack_mr8_nr12_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr8_nr12_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr8_nr12_mrxncxkc_f32<true>
+                        : mma_pack_mr8_nr12_mrxncxkc_f32<false>;
+        case 4: return seed == 1 ? mma_pack_mr4_nr12_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr4_nr12_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr4_nr12_mrxncxkc_f32<true>
+                        : mma_pack_mr4_nr12_mrxncxkc_f32<false>;
+        default: return seed == 1 ? mma_pack_mr1_nr12_mrxncxkc_f32<true, 1>
+                        : seed == 2 ? mma_pack_mr1_nr12_mrxncxkc_f32<true, 2>
+                        : zero_mode ? mma_pack_mr1_nr12_mrxncxkc_f32<true>
+                        : mma_pack_mr1_nr12_mrxncxkc_f32<false>;
         }
     } else {
         switch (level) {
-        case 8: return seed == 1 ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr8_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr8_nr16_mrxncxkc_f16<false>;
-        case 4: return seed == 1 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr4_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr4_nr16_mrxncxkc_f16<false>;
-        default: return seed == 1 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 1>
-                        : seed == 2 ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true, 2>
-                        : zero_mode ? mma_packed_ab_mr1_nr16_mrxncxkc_f16<true>
-                        : mma_packed_ab_mr1_nr16_mrxncxkc_f16<false>;
+        case 8: return seed == 1 ? mma_pack_mr8_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr8_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr8_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr8_nr16_mrxncxkc_f16<false>;
+        case 4: return seed == 1 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr4_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr4_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr4_nr16_mrxncxkc_f16<false>;
+        default: return seed == 1 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 1>
+                        : seed == 2 ? mma_pack_mr1_nr16_mrxncxkc_f16<true, 2>
+                        : zero_mode ? mma_pack_mr1_nr16_mrxncxkc_f16<true>
+                        : mma_pack_mr1_nr16_mrxncxkc_f16<false>;
         }
     }
 #endif
@@ -188,59 +188,59 @@ auto b_fn(int level, bool zero_mode, bool with_bias) {
 #if defined(NNOPS_ARCH_X86_64)
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 6: return with_bias ? mma_packed_b_mr6_nr16_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_packed_b_mr6_nr16_mrxncxkc_f32<true, false>
-                                 : mma_packed_b_mr6_nr16_mrxncxkc_f32<false, false>;
-        case 4: return with_bias ? mma_packed_b_mr4_nr16_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f32<true, false>
-                                 : mma_packed_b_mr4_nr16_mrxncxkc_f32<false, false>;
-        case 2: return with_bias ? mma_packed_b_mr2_nr16_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_packed_b_mr2_nr16_mrxncxkc_f32<true, false>
-                                 : mma_packed_b_mr2_nr16_mrxncxkc_f32<false, false>;
-        default: return with_bias ? mma_packed_b_mr1_nr16_mrxncxkc_f32<true, true>
-                                  : zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f32<true, false>
-                                  : mma_packed_b_mr1_nr16_mrxncxkc_f32<false, false>;
+        case 6: return with_bias ? mma_direct_mr6_nr16_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_direct_mr6_nr16_mrxncxkc_f32<true, false>
+                                 : mma_direct_mr6_nr16_mrxncxkc_f32<false, false>;
+        case 4: return with_bias ? mma_direct_mr4_nr16_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_direct_mr4_nr16_mrxncxkc_f32<true, false>
+                                 : mma_direct_mr4_nr16_mrxncxkc_f32<false, false>;
+        case 2: return with_bias ? mma_direct_mr2_nr16_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_direct_mr2_nr16_mrxncxkc_f32<true, false>
+                                 : mma_direct_mr2_nr16_mrxncxkc_f32<false, false>;
+        default: return with_bias ? mma_direct_mr1_nr16_mrxncxkc_f32<true, true>
+                                  : zero_mode ? mma_direct_mr1_nr16_mrxncxkc_f32<true, false>
+                                  : mma_direct_mr1_nr16_mrxncxkc_f32<false, false>;
         }
     } else {
         switch (level) {
-        case 6: return with_bias ? mma_packed_b_mr6_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_packed_b_mr6_nr16_mrxncxkc_f16<true, false>
-                                 : mma_packed_b_mr6_nr16_mrxncxkc_f16<false, false>;
-        case 4: return with_bias ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, false>
-                                 : mma_packed_b_mr4_nr16_mrxncxkc_f16<false, false>;
-        case 2: return with_bias ? mma_packed_b_mr2_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_packed_b_mr2_nr16_mrxncxkc_f16<true, false>
-                                 : mma_packed_b_mr2_nr16_mrxncxkc_f16<false, false>;
-        default: return with_bias ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, true>
-                                  : zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, false>
-                                  : mma_packed_b_mr1_nr16_mrxncxkc_f16<false, false>;
+        case 6: return with_bias ? mma_direct_mr6_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_direct_mr6_nr16_mrxncxkc_f16<true, false>
+                                 : mma_direct_mr6_nr16_mrxncxkc_f16<false, false>;
+        case 4: return with_bias ? mma_direct_mr4_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_direct_mr4_nr16_mrxncxkc_f16<true, false>
+                                 : mma_direct_mr4_nr16_mrxncxkc_f16<false, false>;
+        case 2: return with_bias ? mma_direct_mr2_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_direct_mr2_nr16_mrxncxkc_f16<true, false>
+                                 : mma_direct_mr2_nr16_mrxncxkc_f16<false, false>;
+        default: return with_bias ? mma_direct_mr1_nr16_mrxncxkc_f16<true, true>
+                                  : zero_mode ? mma_direct_mr1_nr16_mrxncxkc_f16<true, false>
+                                  : mma_direct_mr1_nr16_mrxncxkc_f16<false, false>;
         }
     }
 #else
     if constexpr (std::is_same_v<T, float>) {
         switch (level) {
-        case 8: return with_bias ? mma_packed_b_mr8_nr12_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_packed_b_mr8_nr12_mrxncxkc_f32<true, false>
-                                 : mma_packed_b_mr8_nr12_mrxncxkc_f32<false, false>;
-        case 4: return with_bias ? mma_packed_b_mr4_nr12_mrxncxkc_f32<true, true>
-                                 : zero_mode ? mma_packed_b_mr4_nr12_mrxncxkc_f32<true, false>
-                                 : mma_packed_b_mr4_nr12_mrxncxkc_f32<false, false>;
-        default: return with_bias ? mma_packed_b_mr1_nr12_mrxncxkc_f32<true, true>
-                                  : zero_mode ? mma_packed_b_mr1_nr12_mrxncxkc_f32<true, false>
-                                  : mma_packed_b_mr1_nr12_mrxncxkc_f32<false, false>;
+        case 8: return with_bias ? mma_direct_mr8_nr12_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_direct_mr8_nr12_mrxncxkc_f32<true, false>
+                                 : mma_direct_mr8_nr12_mrxncxkc_f32<false, false>;
+        case 4: return with_bias ? mma_direct_mr4_nr12_mrxncxkc_f32<true, true>
+                                 : zero_mode ? mma_direct_mr4_nr12_mrxncxkc_f32<true, false>
+                                 : mma_direct_mr4_nr12_mrxncxkc_f32<false, false>;
+        default: return with_bias ? mma_direct_mr1_nr12_mrxncxkc_f32<true, true>
+                                  : zero_mode ? mma_direct_mr1_nr12_mrxncxkc_f32<true, false>
+                                  : mma_direct_mr1_nr12_mrxncxkc_f32<false, false>;
         }
     } else {
         switch (level) {
-        case 8: return with_bias ? mma_packed_b_mr8_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_packed_b_mr8_nr16_mrxncxkc_f16<true, false>
-                                 : mma_packed_b_mr8_nr16_mrxncxkc_f16<false, false>;
-        case 4: return with_bias ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, true>
-                                 : zero_mode ? mma_packed_b_mr4_nr16_mrxncxkc_f16<true, false>
-                                 : mma_packed_b_mr4_nr16_mrxncxkc_f16<false, false>;
-        default: return with_bias ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, true>
-                                  : zero_mode ? mma_packed_b_mr1_nr16_mrxncxkc_f16<true, false>
-                                  : mma_packed_b_mr1_nr16_mrxncxkc_f16<false, false>;
+        case 8: return with_bias ? mma_direct_mr8_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_direct_mr8_nr16_mrxncxkc_f16<true, false>
+                                 : mma_direct_mr8_nr16_mrxncxkc_f16<false, false>;
+        case 4: return with_bias ? mma_direct_mr4_nr16_mrxncxkc_f16<true, true>
+                                 : zero_mode ? mma_direct_mr4_nr16_mrxncxkc_f16<true, false>
+                                 : mma_direct_mr4_nr16_mrxncxkc_f16<false, false>;
+        default: return with_bias ? mma_direct_mr1_nr16_mrxncxkc_f16<true, true>
+                                  : zero_mode ? mma_direct_mr1_nr16_mrxncxkc_f16<true, false>
+                                  : mma_direct_mr1_nr16_mrxncxkc_f16<false, false>;
         }
     }
 #endif
@@ -476,7 +476,7 @@ void check_b(BKernel<T> fn, int level, bool zero_mode, bool with_bias, int mr,
     std::vector<T> bias_row(with_bias ? level : 0);
     for (auto& v : bias_row) { v = from_float<T>(rnd()); }
 
-    fn(mr, nc, kc, c.data(), ldc, a.data(), lda, b.data(), clamp_min, clamp_max,
+    fn(mr, nc, kc, c.data(), ldc, a.data(), lda, b.data(), /*ldb=*/-1, clamp_min, clamp_max,
        with_bias ? bias_row.data() : nullptr);
 
     verify<T>(c, c0, b, b_raw, a, nc, kc, ldc, mr, level, ldb, nslots,
@@ -524,9 +524,9 @@ void run_suite(Kind kind) {
 
 }  // namespace
 
-NNOPS_TEST(mma_packed_ab_f32) { run_suite<float>(Kind::Ab); }
-NNOPS_TEST(mma_packed_b_f32)  { run_suite<float>(Kind::B); }
-NNOPS_TEST(mma_packed_ab_f16) { run_suite<half>(Kind::Ab); }
-NNOPS_TEST(mma_packed_b_f16)  { run_suite<half>(Kind::B); }
+NNOPS_TEST(mma_pack_f32) { run_suite<float>(Kind::Ab); }
+NNOPS_TEST(mma_direct_f32)  { run_suite<float>(Kind::B); }
+NNOPS_TEST(mma_pack_f16) { run_suite<half>(Kind::Ab); }
+NNOPS_TEST(mma_direct_f16)  { run_suite<half>(Kind::B); }
 
 #endif  // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64

@@ -15,6 +15,8 @@
 ///                            the deferred output pass Linear pays when the GEMM
 ///                            cannot own the write-back.
 ///   linear_prepacked_weight  a weight packed once at load against packed per call.
+///   linear_prepacked_weight_int8  the same in s8, where the blob is cut into k
+///                            segments and only an s8 activation can read it.
 ///   linear_f16_vs_matmul     the same pairing in f16.
 ///   linear_int8              u8s8 / s8s8 -> f32 / f16 dequant, per-token X and
 ///                            per-channel W.
@@ -531,6 +533,86 @@ void bench_prepack_vs_raw(const char* tag, const std::vector<Shape>& shapes,
         }
         std::printf("\n");
     }
+}
+
+/// The int8 arm of the same pairing: s8 X, s8 W, fp output. The blob is the
+/// same panels cut into k segments, so a deep K re-reads the weight by segment
+/// — and the plan pins kc to one segment, which the raw arm does not have to.
+template <typename OutT>
+void bench_prepack_i8_vs_raw(const std::vector<Shape>& shapes,
+                             const std::vector<int>& threads, double target_ms,
+                             int rounds) {
+    std::printf("  s8s8 Linear -> %s, weight packed once vs packed per call  "
+                "budget=%.0f ms/cell  rounds=%d\n",
+                dtype_of<OutT>() == DataType::f32 ? "f32" : "f16",
+                target_ms, rounds);
+    std::printf("   %5s %5s %5s |", "M", "K", "N");
+    for (int nt : threads) {
+        std::printf("  %2dT:  packed     raw    P/R |", nt);
+    }
+    std::printf("\n");
+
+    for (const Shape& s : shapes) {
+        QuantProblem<OutT> raw(s, DataType::s8, dtype_of<OutT>(), 1);
+        QuantProblem<OutT> pk(s, DataType::s8, dtype_of<OutT>(), 1);
+
+        LinearAttributes la;
+        la.output_dtype = dtype_of<OutT>();
+        auto op = Linear::create(la, Backend::CPU);
+        TensorView query;
+        const TensorView win[] = {raw.ins[1]};
+        TensorView q[] = {query};
+        op->prepackWeights(win, q);
+        std::vector<std::byte> hold(
+            static_cast<size_t>(q[0].desc().numel()) + 64);
+        const size_t mis = reinterpret_cast<uintptr_t>(hold.data()) % 64;
+        int8_t* blob = reinterpret_cast<int8_t*>(hold.data() + ((64 - mis) % 64));
+        // The blob carries W's quantization: the dequant pass reads the scales
+        // off the view it is handed.
+        TensorView packed(q[0].shape_span(), DataType::s8, blob, q[0].pitch(),
+                          q[0].layout(), raw.ins[1].quant_params());
+        TensorView pack[] = {packed};
+        op->prepackWeights(win, pack);
+        pk.ins[1] = packed;
+
+        std::printf("   %5lld %5lld %5lld |", static_cast<long long>(s.M),
+                    static_cast<long long>(s.K), static_cast<long long>(s.N));
+        for (int nt : threads) {
+            BenchPool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+
+            std::vector<double> vp, vr;
+            for (int r = 0; r < rounds; ++r) {
+                vp.push_back(pk.run(*pk.linear, ctx, target_ms));
+                vr.push_back(raw.run(*raw.linear, ctx, target_ms));
+            }
+            const double gp = median(vp), gr = median(vr);
+            std::printf(" %9.1f %9.1f %5.3f |", gp, gr, gr > 0.0 ? gp / gr : 0.0);
+        }
+        std::printf("\n");
+    }
+}
+
+NNOPS_BENCH(linear_prepacked_weight_int8) {
+    // Integer accumulation is exact, so the two arms compute the same numbers;
+    // what differs is the pack (paid per call on the raw arm, once here) and
+    // kc, which the blob pins to a 512-long segment. Decode shows the pack in
+    // full — the int8 route has no small-M kernel that could read B raw, so at
+    // M=1 it is the whole gap (3.5x here), where the fp bench's raw arm's
+    // small-M path skips its pack and the two arms tie.
+    const std::vector<Shape> shapes{
+        {1, 4096, 4096},     // decode: 8 segments against a 16 MB weight
+        {8, 4096, 4096},
+        {128, 4096, 4096},   // prefill: the pack amortizes over the rows
+        {1, 1280, 1000},     // MobileNetV2's logits
+        {512, 512, 512},     // one segment, 1 MB — the panels fit L2
+        {1024, 1024, 1024},
+    };
+    bench_prepack_i8_vs_raw<float>(shapes, {1, 4}, /*target_ms=*/100.0,
+                                   /*rounds=*/3);
+    bench_prepack_i8_vs_raw<half>(shapes, {1, 4}, /*target_ms=*/100.0,
+                                  /*rounds=*/3);
 }
 
 NNOPS_BENCH(linear_prepacked_weight) {

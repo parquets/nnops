@@ -3017,6 +3017,145 @@ NNOPS_TEST(matmul_prepacked_b) {
     run(half{});
 }
 
+NNOPS_TEST(matmul_prepacked_b_int8) {
+    // The int8 blob is the same panels cut into k segments; the plan pins kc to
+    // one segment, and integer accumulation is exact, so raw and packed agree
+    // bit for bit. Both operand layouts and both output kinds are covered, and
+    // the asymmetric rows are the ones whose output pass still needs Σ_k B —
+    // which a packed B can only give back out of its panels.
+    struct Case {
+        int64_t M, K, N;
+        bool tb;
+        DataType odt;
+        bool asym;
+    };
+    const Case cases[] = {
+        { 5,   37, 19, false, DataType::s32, false},  // tails on both axes
+        { 5,   37, 19, true,  DataType::s32, false},  // the same B stored [N, K]
+        { 6, 1031, 21, true,  DataType::f32, false},  // 512 + 512 + 7
+        { 6,  520, 33, false, DataType::f32, true },  // 512 + 8, both zero points live
+        { 9,  256, 17, true,  DataType::s32, true },
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const Case& c = cases[ci];
+        const int64_t ashape[] = {c.M, c.K};
+        const int64_t bshape[] = {c.tb ? c.N : c.K, c.tb ? c.K : c.N};
+
+        std::vector<int8_t> av(static_cast<size_t>(c.M * c.K));
+        std::vector<int8_t> bv(static_cast<size_t>(c.K * c.N));
+        nnops::test::XorShift128 rng(980 + 10 * static_cast<uint64_t>(ci));
+        for (auto& e : av) {
+            e = static_cast<int8_t>(static_cast<int32_t>(rng.next_u64() % 255) - 127);
+        }
+        for (auto& e : bv) {
+            e = static_cast<int8_t>(static_cast<int32_t>(rng.next_u64() % 255) - 127);
+        }
+
+        std::vector<float> a_s(static_cast<size_t>(c.M), 0.01f);
+        std::vector<int32_t> a_zp(static_cast<size_t>(c.M), 0);
+        std::vector<float> b_s(static_cast<size_t>(c.N), 0.004f);
+        std::vector<int32_t> b_zp(static_cast<size_t>(c.N), 0);
+        QuantParams qa = bias_per_tensor(0.01f, 0);
+        QuantParams qb = bias_per_tensor(0.004f, 0);
+        if (c.asym) {
+            for (int64_t i = 0; i < c.M; ++i) {
+                a_s[static_cast<size_t>(i)] = 0.01f + 0.002f * static_cast<float>(i % 9);
+                a_zp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 7) - 3;
+            }
+            for (int64_t i = 0; i < c.N; ++i) {
+                b_s[static_cast<size_t>(i)] = 0.004f + 0.001f * static_cast<float>(i % 5);
+                b_zp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 5) - 2;
+            }
+            qa.granularity = QuantGranularity::PerToken;
+            qa.scale_data = a_s.data();
+            qa.zero_point_data = a_zp.data();
+            qa.num_scales = c.M;
+            qb.granularity = QuantGranularity::PerChannel;
+            qb.scale_data = b_s.data();
+            qb.zero_point_data = b_zp.data();
+            qb.num_scales = c.N;
+        }
+
+        TensorView a = quant_view(ashape, 2, DataType::s8, av.data(), qa);
+        TensorView b = quant_view(bshape, 2, DataType::s8, bv.data(), qb);
+
+        MatMulAttributes attrs;
+        attrs.transpose_b = c.tb;
+        attrs.output_dtype = c.odt;
+        auto op = MatMul::create(attrs, Backend::CPU);
+
+        const TensorDesc descs[] = {a.desc(), b.desc()};
+        const auto od = op->getOutputTensorDesc(descs)[0];
+        const auto oshape = std::span<const int64_t>(od.dims.data(),
+                                                     static_cast<size_t>(od.rank));
+        std::vector<std::byte> raw_buf(static_cast<size_t>(od.numel()) *
+                                       data_type_size(od.dtype));
+        std::vector<std::byte> pk_buf(raw_buf.size());
+        TensorView raw(oshape, od.dtype, raw_buf.data());
+        TensorView pk(oshape, od.dtype, pk_buf.data());
+
+        const TensorView ins[] = {a, b};
+        NNOPS_EXPECT_EQ(op->compute(raw, ins, {}, nullptr), Status::ok);
+
+        TensorView q;
+        const TensorView bq[] = {b};
+        TensorView oq[] = {q};
+        op->prepackWeights(bq, oq);
+        q = oq[0];
+        NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
+        NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
+                        static_cast<int>(TensorLayout::PackedB));
+        NNOPS_EXPECT_EQ(q.shape(0), c.N);
+        NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
+
+        std::vector<int8_t> blob(static_cast<size_t>(q.desc().numel()));
+        TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                          q.layout(), b.quant_params());
+        const TensorView bp[] = {b};
+        TensorView opk[] = {packed};
+        op->prepackWeights(bp, opk);
+
+        const TensorView pins[] = {a, packed};
+        NNOPS_EXPECT_EQ(op->compute(pk, pins, {}, nullptr), Status::ok);
+        NNOPS_EXPECT_TRUE(std::memcmp(raw_buf.data(), pk_buf.data(),
+                                      raw_buf.size()) == 0);
+    }
+}
+
+NNOPS_TEST(matmul_prepacked_b_int8_rejects_u8_activation) {
+    // The blob's panels are written with the s8 activation shift folded in, so
+    // only an s8 A may read them — a u8 A is refused, not silently mis-read.
+    const int64_t ashape[] = {4, 32};
+    const int64_t bshape[] = {32, 16};
+    std::vector<uint8_t> av(static_cast<size_t>(4 * 32), 7);
+    std::vector<int8_t> bv(static_cast<size_t>(32 * 16), 5);
+    TensorView a = quant_view(ashape, 2, DataType::u8, av.data(),
+                              bias_per_tensor(0.01f, 128));
+    TensorView b = quant_view(bshape, 2, DataType::s8, bv.data(),
+                              bias_per_tensor(0.004f, 0));
+
+    auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
+    TensorView q;
+    const TensorView bq[] = {b};
+    TensorView oq[] = {q};
+    op->prepackWeights(bq, oq);
+    q = oq[0];
+    NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
+
+    std::vector<int8_t> blob(static_cast<size_t>(q.desc().numel()));
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout(), b.quant_params());
+    TensorView opk[] = {packed};
+    op->prepackWeights(bq, opk);
+
+    const int64_t oshape[] = {4, 16};
+    std::vector<int32_t> obuf(static_cast<size_t>(4 * 16));
+    TensorView out(oshape, DataType::s32, obuf.data());
+    const TensorView ins[] = {a, packed};
+    NNOPS_EXPECT_EQ(op->compute(out, ins, {}, nullptr), Status::unsupported);
+}
+
 NNOPS_TEST(matmul_prepacked_b_contract_errors) {
     const int64_t bshape[] = {37, 19};
     auto [bv, b] = test::make_random_tensor({37, 19}, -1.0f, 1.0f, 61);

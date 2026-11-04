@@ -4,9 +4,10 @@
 /// f32, f16 and int8 share one skeleton (FpRoute / I8Route) and one plan
 /// (get_matmul_plan: NKM on an N-split, MKN on an M-split). B is packed into
 /// pooled scratch per k-block unless the caller supplied a prepacked blob, which
-/// is walked in place at the stride of its own full-K pack. A is packed per M
-/// panel when the plan asks for it — always on int8, and on fp for a transposed
-/// A or K past PACK_A_K_THRESHOLD — and read through lda otherwise.
+/// is walked in place: one whole-K panel per call on fp, and on int8 one panel of
+/// the k segment the block falls in (see PackedBView). A is packed per M panel
+/// when the plan asks for it — always on int8, and on fp for a transposed A or K
+/// past PACK_A_K_THRESHOLD — and read through lda otherwise.
 ///
 /// DqRoute is the int8 GEMM with its output pass replaced by a dequantize into
 /// fp; A is either already s8/u8, or fp quantised inside the pack (matmul_dq).
@@ -55,6 +56,20 @@ namespace {
 /// The fp route has no output pass; the tiled kernel still needs a type.
 struct NoEpilogueParams {};
 
+/// The caller's prepacked RHS (MatMul/Linear ::prepackWeights) as one object.
+/// A float blob is a single whole-K panel sequence; an int8 blob is the same
+/// sequence repeated per k segment, because its per-panel correction block is
+/// read at the call's kc. Routes turn a (k-block, panel) pair into a pointer and
+/// a kernel pitch — the two routes disagree on both.
+struct PackedBView {
+    const void* base = nullptr;
+    int64_t ldd = 0;   // panel pitch: elements for fp, bytes for int8
+    int64_t np = 0;    // panels per segment (int8 only)
+    int64_t seg = 0;   // k segment length (int8 only; 0 = the whole K)
+
+    bool ok() const noexcept { return base != nullptr; }
+};
+
 template <class T>
 struct FpRoute {
     using Elem  = T;
@@ -101,6 +116,19 @@ struct FpRoute {
     /// Width of one RHS panel — the unit a prepacked B is walked in.
     static constexpr int b_panel_w() { return nr_max_flt<T>(); }
 
+    /// B pitch for the panels this call packed. A prepacked blob walks one
+    /// whole-K panel per call, negated so the tile reads it as a blob.
+    static constexpr int64_t ldb_packed = -1;
+
+    /// The blob's panel for (k block, panel) and the pitch to walk it: the
+    /// k-block's slice of a k-major panel, panels `ldd` apart.
+    static std::pair<const T*, int64_t> prepacked_addr(const PackedBView& pb,
+                                                       int64_t panel0, int k) {
+        return {static_cast<const T*>(pb.base) + panel0 * pb.ldd
+                    + static_cast<int64_t>(k) * b_panel_w(),
+                -pb.ldd};
+    }
+
     static std::pair<Clamp, Clamp> clamp(const MatMulAttributes& attrs, bool last_k) {
         return kblock_clamp(attrs, last_k);
     }
@@ -128,27 +156,25 @@ struct FpRoute {
         tile_pack_rhs(attrs.transpose_b, nc, kc, dst, ldd, src, b.ldb, attrs.alpha);
     }
 
-    /// @p ldb > 0: a prepacked blob's panel stride (see tile_mma_pack_ldb).
-    /// @p col_bias, when set, becomes the accumulator's initial value instead of
-    /// C being read: the first k-block builds the tile from it.
+    /// @p ldb -1: the panels this call packed; below that, a prepacked blob's
+    /// panel stride negated (only `tile_mma_direct` also takes B in place, which
+    /// no MatMul route does). @p col_bias, when set, becomes the accumulator's
+    /// initial value instead of C being read: the first k-block builds the tile
+    /// from it.
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool zero_mode, int64_t ldb = 0,
+                         bool zero_mode, int64_t ldb = -1,
                          const Elem* col_bias = nullptr) {
-        if (ldb > 0) { tile_mma_pack_ldb(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi,
-                                         zero_mode, col_bias); }
-        else         { tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, lo, hi, zero_mode,
-                                     nullptr, col_bias); }
+        tile_mma_pack(mc, nc, kc, c, ldc, pa, pb, ldb, lo, hi, zero_mode,
+                      nullptr, col_bias);
     }
 
     static void mma_direct(int mc, int nc, int kc, Acc* c, int ldc,
                            const Elem* a, int lda, const Elem* pb,
-                           Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = 0,
+                           Clamp lo, Clamp hi, bool zero_mode, int64_t ldb = -1,
                            const Elem* col_bias = nullptr) {
-        if (ldb > 0) { tile_mma_direct_ldb(mc, nc, kc, c, ldc, a, lda, pb, ldb, lo, hi,
-                                          zero_mode, col_bias); }
-        else         { tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, lo, hi, zero_mode,
-                                       nullptr, col_bias); }
+        tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, ldb, nullptr, lo, hi,
+                        zero_mode, nullptr, col_bias);
     }
 
     /// C row of a batch element plus the two fp-only in-place passes.
@@ -203,8 +229,21 @@ struct I8Route {
     static int ldd_b(int kc) { return static_cast<int>(geom().ldd_b(kc)); }
     static int ldd_a(int kc) { return static_cast<int>(geom().ldd_a(kc)); }
 
-    /// int8 has no prepacked RHS (matmul_packed_b_geom admits only f32/f16).
+    /// One RHS panel — the unit a prepacked B is walked in.
     static constexpr int b_panel_w() { return NR_MAX_I8; }
+
+    /// B pitch the pack wrote; 0 is the kernel's own slot, the per-call form.
+    static constexpr int64_t ldb_packed = 0;
+
+    /// The blob's panel for (k block, panel) and the pitch to walk it: segment
+    /// `k / seg` owns a contiguous run of np panels, because the correction
+    /// block a kernel reads at kc = seg lives inside each panel.
+    static std::pair<const int8_t*, int64_t> prepacked_addr(const PackedBView& pb,
+                                                            int64_t panel0, int k) {
+        const int64_t seg = k / pb.seg;
+        return {static_cast<const int8_t*>(pb.base) + (seg * pb.np + panel0) * pb.ldd,
+                pb.ldd};
+    }
 
     static std::pair<Clamp, Clamp> clamp(const MatMulAttributes&, bool) {
         return {INT32_MIN, INT32_MAX};
@@ -231,11 +270,10 @@ struct I8Route {
 
     static void mma_pack(int mc, int nc, int kc, Acc* c, int ldc,
                          const Elem* pa, const Elem* pb, Clamp lo, Clamp hi,
-                         bool /*zero_mode*/, int64_t ldb = 0,
+                         bool zero_mode, int64_t ldb = 0,
                          const Elem* /*col_bias*/ = nullptr) {
-        NNOPS_ASSERT(ldb == 0 && "int8 has no prepacked RHS");
-        (void)ldb;
-        tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, lo, hi);
+        tile_mma_pack_i8(mc, nc, kc, c, ldc, pa, pb, static_cast<int>(ldb), lo, hi,
+                         zero_mode);
     }
 
     /// The s32 output, or the M×N temporary an s8/u8 output requantizes from.
@@ -361,8 +399,7 @@ void matmul_tile(const MatMulAttributes& attrs,
                  typename R::Elem* pack_a_slice, bool a_biased,
                  const typename R::EpilogueParams* ip,
                  const typename R::Elem* bias, const typename R::Elem* col_bias,
-                 const typename R::Elem* prepacked_b = nullptr,
-                 int64_t prepacked_ldd = 0)
+                 const PackedBView& prepacked)
 {
     using Acc = typename R::Acc;
 
@@ -399,16 +436,15 @@ void matmul_tile(const MatMulAttributes& attrs,
                 R::scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
             }
         }
-        // The RHS the MMA reads: the k-block's slice of the packed scratch, or,
-        // for a prepacked blob, that block's slice of the tile's first panel,
-        // which one kernel call per panel walks at the blob's stride.
+        // The RHS the MMA reads: the k-block's slice of the packed scratch, or
+        // the blob's own panel for this block, which one kernel call per panel
+        // walks at the pitch the route names (see PackedBView).
         const typename R::Elem* b_tile = packed_b;
-        int64_t b_ldb = 0;
-        if (prepacked_b != nullptr) {
-            const int64_t panel0 = n_start / R::b_panel_w();
-            b_tile = prepacked_b + panel0 * prepacked_ldd
-                   + static_cast<int64_t>(k) * R::b_panel_w();
-            b_ldb = prepacked_ldd;
+        int64_t b_ldb = R::ldb_packed;
+        if (prepacked.ok()) {
+            const auto at = R::prepacked_addr(prepacked, n_start / R::b_panel_w(), k);
+            b_tile = at.first;
+            b_ldb = at.second;
         }
 
         if (pack_a) {
@@ -448,14 +484,13 @@ void matmul_block(const MatMulAttributes& attrs,
                   bool pack_a, bool a_biased,
                   const typename R::EpilogueParams* ip,
                   const typename R::Elem* bias, const typename R::Elem* col_bias,
-                  const typename R::Elem* prepacked_b = nullptr,
-                  int64_t prepacked_ldd = 0)
+                  const PackedBView& prepacked)
 {
     for (int k = 0; k < K; k += kc) {
         const int actual_kc = std::min(kc, K - k);
         const bool last_k = (k + kc >= K);
         // A prepacked RHS is already packed for every k-block: no pack here.
-        if (prepacked_b == nullptr) {
+        if (!prepacked.ok()) {
             const int ldd_b = R::ldd_b(actual_kc);
             R::pack_b(attrs, b_src, k, actual_kc, n_start, n_count,
                       pack_b_slice, ldd_b, a_biased);
@@ -463,7 +498,7 @@ void matmul_block(const MatMulAttributes& attrs,
         matmul_tile<R>(attrs, c_ptr, ldc, a_ptr, lda,
                        m_start, m_count, mc, n_start, n_count,
                        k, actual_kc, last_k, pack_a, pack_b_slice, pack_a_slice,
-                       a_biased, ip, bias, col_bias, prepacked_b, prepacked_ldd);
+                       a_biased, ip, bias, col_bias, prepacked);
     }
 }
 
@@ -597,11 +632,10 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
         }
     }
 
-    const typename R::Elem* prepacked_b = nullptr;
-    int64_t prepacked_ldd = 0;
+    PackedBView prepacked;
     if (is_packed_matmul_b(b.layout())) {
-        prepacked_b = b.ptr<typename R::Elem>();
-        prepacked_ldd = matmul_packed_b_geom(N, K, b.data_type()).ldd;
+        const MatMulPackedB bg = matmul_packed_b_geom(N, K, b.data_type());
+        prepacked = {b.ptr<void>(), bg.ldd, bg.np, bg.seg};
     }
 
     const int lda = static_cast<int>(a.row_stride_elems());
@@ -769,6 +803,15 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
     }
     const EpParams* ip_or_null = int8_ep ? &ip : nullptr;
 
+    // A prepacked B has no raw matrix left to sweep, so its column sums are read
+    // out of the panels themselves — once, since B does not vary per batch.
+    const bool sweep_b_raw = sweep_b && !prepacked.ok();
+    if constexpr (!R::is_fp) {
+        if (sweep_b && prepacked.ok()) {
+            matmul_packed_b_i8_col_sums(b, Ki, r_b.data(), ctx);
+        }
+    }
+
     for (int64_t bi = 0; bi < batch.total; ++bi) {
         int64_t a_offset, b_offset, c_offset;
         batch.offsets(bi, output, a_offset, b_offset, c_offset);
@@ -782,11 +825,11 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             // no pass: its first k-block runs the zero_mode kernel.
             R::zero_c(c_p, ldc, Mi, Ni);
             if constexpr (!R::fused_a) {
-                if (sweep_a || sweep_b) {
+                if (sweep_a || sweep_b_raw) {
                     compute_int8_reductions(a_p, R::a_eff_type(attrs, a) == DataType::u8,
                                             lda, b_src.ptr, ldb, attrs, M, N, K,
                                             sweep_a ? r_a.data() : nullptr,
-                                            sweep_b ? r_b.data() : nullptr, ctx);
+                                            sweep_b_raw ? r_b.data() : nullptr, ctx);
                 }
             }
             if (int8_ep) {
@@ -831,8 +874,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null, bias, col_bias, prepacked_b,
-                                prepacked_ldd);
+                                ip_or_null, bias, col_bias, prepacked);
             });
         } else if constexpr (R::hoists_b_m_split) {
             // MKN, hoisted: pack the full-N B once per k-block, then split the
@@ -840,16 +882,17 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             for (int k = 0; k < Ki; k += kc) {
                 const int actual_kc = std::min(kc, Ki - k);
                 const bool last_k = (k + kc >= Ki);
-                R::pack_b(attrs, b_src, k, actual_kc, 0, Ni,
-                          pack_b_base, R::ldd_b(actual_kc), a_biased);
+                if (!prepacked.ok()) {
+                    R::pack_b(attrs, b_src, k, actual_kc, 0, Ni,
+                              pack_b_base, R::ldd_b(actual_kc), a_biased);
+                }
                 ctx.cpu.run(0, num_blocks, [&](int64_t blk) {
                     const auto mr = m_range(plan, blk, num_blocks, Mi);
                     matmul_tile<R>(attrs, c_p, ldc, a_p, lda,
                                    mr.start, mr.count, mc, 0, Ni,
                                    k, actual_kc, last_k, plan.pack_a, pack_b_base,
                                    pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
-                                   a_biased, ip_or_null, bias, col_bias,
-                                   prepacked_b, prepacked_ldd);
+                                   a_biased, ip_or_null, bias, col_bias, prepacked);
                 });
             }
         } else {
@@ -862,8 +905,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                                 pack_b_base + slot * np_full * ldd_b_full,
                                 pack_a_slot(plan, num_blocks, blk, ctx, pack_a_base),
                                 plan.pack_a, a_biased,
-                                ip_or_null, bias, col_bias, prepacked_b,
-                                prepacked_ldd);
+                                ip_or_null, bias, col_bias, prepacked);
             });
         }
     }
@@ -1017,16 +1059,21 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     const auto dt_a = a.data_type();
     const auto dt_b = b.data_type();
 
-    // A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob:
-    // same dtype as A, f32 or f16, and alpha 1 (alpha rode the per-call RHS
-    // pack, and a load-time blob has no slot for it). Its numel is the one thing
-    // that can be wrong — a blob packed against another K — so it is checked
-    // rather than trusted.
+    // A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob —
+    // same dtype as A, f32 or f16, alpha 1 (alpha rode the per-call RHS pack,
+    // and a load-time blob has no slot for it) — or an int8 one. The int8 blob
+    // is s8-only and alpha-free: its panel correction block is the +128 A shift,
+    // which neither a u8 activation nor a fused fp one would reproduce. Its numel
+    // is the one thing that can be wrong — a blob packed against another K — so
+    // it is checked rather than trusted.
     if (is_packed_matmul_b(b.layout())) {
-        if (dt_a != dt_b || (dt_a != DataType::f32 && dt_a != DataType::f16)) {
-            return Status::unsupported;
+        const bool int8_blob = (dt_a == DataType::s8 && dt_b == DataType::s8);
+        if (!int8_blob) {
+            if (dt_a != dt_b || (dt_a != DataType::f32 && dt_a != DataType::f16)) {
+                return Status::unsupported;
+            }
+            if (attrs.alpha != 1.0f) { return Status::unsupported; }
         }
-        if (attrs.alpha != 1.0f) { return Status::unsupported; }
         const MatMulDims d = matmul_dims(attrs, a, b);
         if (!matmul_packed_b_matches(b.desc(), d.K)) { return Status::invalid_argument; }
     }

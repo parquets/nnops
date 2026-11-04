@@ -199,7 +199,7 @@ void attention_impl(const AttentionAttributes& attrs,
                     tile_mma_direct(actual_mc, actual_nc, actual_kc,
                                             scores + m * Sk + n, static_cast<int>(Sk),
                                             q_head + m * q_rs + k0, static_cast<int>(q_rs),
-                                            pack_b,
+                                            pack_b, /*ldb=*/-1, /*stage=*/nullptr,
                                             kNegInf, kPosInf, k0 == 0);
                 }
             }
@@ -239,7 +239,7 @@ void attention_impl(const AttentionAttributes& attrs,
                     tile_mma_direct(actual_mc, actual_nc, actual_kc,
                                             o_head + m * o_rs + n, static_cast<int>(o_rs),
                                             scores + m * Sk + k0, static_cast<int>(Sk),
-                                            pack_b, kNegInf, kPosInf, k0 == 0);
+                                            pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf, k0 == 0);
                 }
             }
         }
@@ -405,7 +405,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                 tile_mma_direct(actual_br, actual_bc, actual_kc,
                                         s, actual_bc,
                                         q_head + i0 * q_rs + k0, static_cast<int>(q_rs),
-                                        pack_b, kNegInf, kPosInf, k0 == 0);
+                                        pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf, k0 == 0);
             }
 
             // ---- additive mask (flat [Sq, Sk]: no batch or head index) ----
@@ -462,7 +462,7 @@ void attention_flash_impl(const AttentionAttributes& attrs,
                 tile_mma_direct(actual_br, static_cast<int>(D), actual_kc,
                                         o_acc, static_cast<int>(D),
                                         s + k0, actual_bc,
-                                        pack_b, kNegInf, kPosInf, j0 == 0 && k0 == 0);
+                                        pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf, j0 == 0 && k0 == 0);
             }
         }
 

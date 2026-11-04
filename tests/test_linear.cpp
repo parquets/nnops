@@ -14,13 +14,16 @@
 /// `output_dtype`, not the operand dtype, and takes an int32 [N] bias.
 ///
 /// prepackWeights is the query-then-pack contract: an empty output view is the
-/// query, answering with layout PackedB (rank 2, N leading; empty for a
-/// quantized weight) and a numel the caller sizes the buffer from. The blob is
-/// the GEMM's nr-wide panels over the whole K, so it removes the per-call RHS
-/// pack and nothing else: where the raw weight also takes the tiled GEMM the
-/// two outputs must be bit-identical. Below the small-product thresholds (M ≤ 4
-/// or M·N·K < 1024) the raw weight runs the pack-free kernel, which a
-/// panel-formatted B cannot, so there only the numbers are compared.
+/// query, answering with layout PackedB (rank 2, N leading; empty for a dtype
+/// with no packed form, a u8 weight among them) and a numel the caller sizes the
+/// buffer from. The float blob is the GEMM's nr-wide panels over the whole K, so
+/// it removes the per-call RHS pack and nothing else: where the raw weight also
+/// takes the tiled GEMM the two outputs must be bit-identical. Below the
+/// small-product thresholds (M ≤ 4 or M·N·K < 1024) the raw weight runs the
+/// pack-free kernel, which a panel-formatted B cannot, so there only the numbers
+/// are compared. The int8 blob is the same panels cut into k segments, read by
+/// an s8 activation only; its raw arm always takes the tiled GEMM, so those two
+/// outputs are bit-identical at every size.
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/core/quant_params.hpp"
@@ -661,12 +664,108 @@ NNOPS_TEST(linear_prepacked_weight_wrong_k) {
                     Status::invalid_argument);
 }
 
+namespace {
+
+/// s8 weight, packed once vs packed per call, same operands. Both arms take the
+/// tiled int8 GEMM — the blob only changes the k-block split, and integer
+/// accumulation is exact — so the outputs are bit-identical. @p asym drives a
+/// non-zero activation zero point, the case whose output pass still needs Σ_k B
+/// and therefore reads the packed panels.
+void check_prepacked_s8(int64_t M, int64_t K, int64_t N, bool asym,
+                        DataType odt, uint64_t seed)
+{
+    auto xv = random_s8(M * K, seed);
+    auto wv = random_s8(N * K, seed + 1);
+
+    std::vector<float> xs(static_cast<size_t>(M), 0.01f);
+    std::vector<int32_t> xzp(static_cast<size_t>(M), 0);
+    std::vector<float> ws(static_cast<size_t>(N), 0.005f);
+    std::vector<int32_t> wzp(static_cast<size_t>(N), 0);
+    QuantParams xq = per_tensor(0.01f, 0);
+    QuantParams wq = per_tensor(0.005f, 0);
+    if (asym) {
+        for (int64_t i = 0; i < M; ++i) {
+            xs[static_cast<size_t>(i)] = 0.01f + 0.001f * static_cast<float>(i);
+            xzp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 7) - 3;
+        }
+        for (int64_t i = 0; i < N; ++i) {
+            ws[static_cast<size_t>(i)] = 0.005f + 0.001f * static_cast<float>(i);
+            wzp[static_cast<size_t>(i)] = static_cast<int32_t>(i % 5) - 2;
+        }
+        xq = quant_arrays(QuantGranularity::PerToken, xs.data(), xzp.data(), M);
+        wq = quant_arrays(QuantGranularity::PerChannel, ws.data(), wzp.data(), N);
+    }
+
+    const int64_t xshape[] = {M, K};
+    const int64_t wshape[] = {N, K};
+    TensorView x = make_view(xshape, DataType::s8, xv.data(), xq);
+    TensorView weight = make_view(wshape, DataType::s8, wv.data(), wq);
+
+    LinearAttributes attrs;
+    attrs.output_dtype = odt;
+    auto op = Linear::create(attrs, Backend::CPU);
+
+    const TensorDesc descs[] = {x.desc(), weight.desc()};
+    const TensorDesc od = op->getOutputTensorDesc(descs)[0];
+    const auto oshape = std::span<const int64_t>(od.dims.data(),
+                                                 static_cast<size_t>(od.rank));
+    std::vector<std::byte> raw_buf(static_cast<size_t>(od.numel()) *
+                                   data_type_size(od.dtype));
+    std::vector<std::byte> pk_buf(raw_buf.size());
+    TensorView raw(oshape, od.dtype, raw_buf.data());
+    TensorView pk(oshape, od.dtype, pk_buf.data());
+
+    const TensorView ins[] = {x, weight};
+    NNOPS_EXPECT_EQ(op->compute(raw, ins, {}, nullptr), Status::ok);
+
+    // Query, allocate, fill. The blob carries the weight's quantization — the
+    // output pass reads the per-channel scales off the view it is handed.
+    TensorView q;
+    TensorView oq[] = {q};
+    const TensorView wq_in[] = {weight};
+    op->prepackWeights(wq_in, oq);
+    q = oq[0];
+    NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
+    NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
+                    static_cast<int>(TensorLayout::PackedB));
+    NNOPS_EXPECT_EQ(q.shape(0), N);
+    NNOPS_EXPECT_TRUE(q.desc().numel() >= N * K);
+
+    std::vector<int8_t> blob(static_cast<size_t>(q.desc().numel()));
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout(), weight.quant_params());
+    const TensorView wp[] = {weight};
+    TensorView opk[] = {packed};
+    op->prepackWeights(wp, opk);
+
+    const TensorView pins[] = {x, packed};
+    NNOPS_EXPECT_EQ(op->compute(pk, pins, {}, nullptr), Status::ok);
+    NNOPS_EXPECT_TRUE(std::memcmp(raw_buf.data(), pk_buf.data(),
+                                  raw_buf.size()) == 0);
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(linear_prepacked_weight_int8) {
+    // 33: one short segment. 1031: three k segments (512, 512, 7) — a final
+    // segment shorter than a dot group. 512/1024: whole segments. The asym rows
+    // are the ones whose output pass needs the B column sums.
+    check_prepacked_s8(  7,   33, 19, false, DataType::f32, 900);
+    check_prepacked_s8(  6, 1031, 21, false, DataType::f32, 910);
+    check_prepacked_s8(  6,   40, 13, true,  DataType::f32, 920);
+    check_prepacked_s8(  9, 1024, 17, true,  DataType::f32, 930);
+    check_prepacked_s8(  5,  512, 40, false, DataType::s32, 940);
+    // One row and two: the narrow-M kernels read the blob too.
+    check_prepacked_s8(  1, 4096, 37, false, DataType::f32, 950);
+    check_prepacked_s8(  2,  777, 21, true,  DataType::f32, 960);
+}
+
 NNOPS_TEST(linear_prepacked_weight_quantized_has_no_blob) {
-    // A quantized weight has no packed form (its panels would need the int32
-    // column sums too), so the query answers with nothing.
+    // Only s8 has a packed form: an s8 blob's panel correction block is the s8
+    // activation shift, so a u8 weight (and every other dtype) answers rank 0.
     const int64_t wshape[] = {8, 16};
-    std::vector<int8_t> wv(static_cast<size_t>(8 * 16), 3);
-    TensorView weight(wshape, DataType::s8, wv.data());
+    std::vector<uint8_t> wv(static_cast<size_t>(8 * 16), 3);
+    TensorView weight(wshape, DataType::u8, wv.data());
 
     auto op = Linear::create(Backend::CPU);
     TensorView q;

@@ -8,11 +8,14 @@
 ///
 /// prepackWeights is a caller-driven two-step: an empty output buffer is the
 /// query (the call writes back the descriptor that sizes the blob, and rank 0 --
-/// not f32/f16, or an empty extent -- is an answer rather than a failure), then
-/// the same call fills the caller's buffer. The blob holds the whole K, which is what makes it
-/// independent of the per-call plan -- and why alpha, which otherwise rides the
-/// RHS pack, must be 1. A packed B carries N but no K: validate() takes K from
-/// A, and the backend's numel check catches a blob packed against another K.
+/// not f32/f16/s8, or an empty extent -- is an answer rather than a failure),
+/// then the same call fills the caller's buffer. A float blob holds the whole K,
+/// which is what makes it independent of the per-call plan -- and why alpha,
+/// which otherwise rides the RHS pack, must be 1. The int8 blob is cut into
+/// segments (its panel correction block is read at the call's kc), so the plan
+/// pins kc to one segment instead, and only an s8 activation can read it. A
+/// packed B carries N but no K: validate() takes K from A, and the backend's
+/// numel check catches a blob packed against another K.
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/assert.hpp"
@@ -105,10 +108,10 @@ void MatMul::prepackWeights(std::span<const TensorView> inputs,
     }
 
     NNOPS_ASSERT(d.rank > 0 &&
-                 "MatMul::prepackWeights: this B has no packed form (f32/f16 only)");
-    NNOPS_ASSERT(attrs_.alpha == 1.0f &&
+                 "MatMul::prepackWeights: this B has no packed form (f32/f16/s8 only)");
+    NNOPS_ASSERT((raw.data_type() == DataType::s8 || attrs_.alpha == 1.0f) &&
                  "MatMul::prepackWeights: a prepacked B cannot carry alpha "
-                 "(it rode the per-call RHS pack)");
+                 "(it rode the per-call RHS pack; integer matmul ignores it)");
     NNOPS_ASSERT(outputs[0].layout() == d.layout &&
                  outputs[0].rank() == d.rank &&
                  outputs[0].shape(0) == shape[0] &&

@@ -69,11 +69,12 @@ public:
     /// Pack the weight once for compute() to read in place — the same two-step
     /// contract as Conv2D: an empty outputs[0] is the query, a filled one the
     /// pack, and the buffer stays the caller's. inputs[0] is the raw [N, K]
-    /// weight. The blob is the GEMM's uniform nr-wide panels over the whole K,
-    /// which is what removes the per-call RHS pack — and why alpha must be 1
-    /// (a prepacked B cannot carry a per-call scale). f32/f16 only; a quantized
-    /// weight has no packed form (its panels would need the int32 column sums)
-    /// and the query returns an empty view for it.
+    /// weight. For f32/f16 the blob is the GEMM's uniform nr-wide panels over
+    /// the whole K, which is what removes the per-call RHS pack — and why alpha
+    /// must be 1 (a prepacked B cannot carry a per-call scale). An s8 weight is
+    /// packed into the same panels cut into ⌈K/512⌉ k segments, read by an s8
+    /// activation only (alpha is ignored there). Any other dtype — u8 among
+    /// them — has no packed form and the query returns an empty view.
     void prepackWeights(std::span<const TensorView> inputs,
                         std::span<TensorView> outputs,
                         const ComputeContext& ctx = {}) override;

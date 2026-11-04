@@ -392,7 +392,7 @@ void conv2d_planar_impl(const Conv2DAttributes& attrs,
                                             kdim,
                                             tile, static_cast<int>(ocn_step),
                                             a, static_cast<int>(w_ocn_step),
-                                            pack_b,
+                                            pack_b, /*ldb=*/-1, /*stage=*/nullptr,
                                             clamp_here ? clamp_lo : -kInf,
                                             clamp_here ? clamp_hi : kInf,
                                             /*zero_mode=*/icn == 0 && !seed_needed,
@@ -786,15 +786,12 @@ void conv2d_planar_int8_impl(const Conv2DAttributes& attrs,
                         a_panel = pack_a;
                     }
 
-                    // tile_mma_pack_i8 accumulates, so the first ic-block zeroes
-                    // the tile instead of seeding it.
-                    if (icn == 0) {
-                        std::fill(acc, acc + ocnc * roi_area, 0);
-                    }
-
+                    // The first ic-block stores instead of accumulating, so the
+                    // tile needs no zero fill.
                     tile_mma_pack_i8(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                      kdim, acc, static_cast<int>(roi_area),
-                                     a_panel, pack_b, INT32_MIN, INT32_MAX);
+                                     a_panel, pack_b, /*ldb=*/0, INT32_MIN, INT32_MAX,
+                                     /*zero_mode=*/icn == 0);
                 }
 
                 // The oc-block is complete: rewrite in place while it is hot,
@@ -1717,26 +1714,17 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                         // Bias only: build the accumulator from it (one panel-lane
                         // load per n-block) rather than seed the tile, which
                         // would double the tile's traffic for one addend.
-                        if (b_ld != 0) {
-                            tile_mma_direct_strided(mc, static_cast<int>(ocnc), kdim,
-                                                    tile, static_cast<int>(OC),
-                                                    a, lda, b_panel, b_ld, stage,
-                                                    c_lo, c_hi,
-                                                    /*zero_mode=*/icn == 0 && !attrs.add_to &&
-                                                                   !bias_seed,
-                                                    nullptr,
-                                                    (icn == 0 && bias_seed) ? bias_col + ocn
-                                                                            : nullptr);
-                        } else {
-                            tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
-                                            tile, static_cast<int>(OC),
-                                            a, lda, b_panel, c_lo, c_hi,
-                                            /*zero_mode=*/icn == 0 && !attrs.add_to &&
-                                                           !bias_seed,
-                                            nullptr,
-                                            (icn == 0 && bias_seed) ? bias_col + ocn
-                                                                    : nullptr);
-                        }
+                        // A 1x1 filter reads in place; everything else arrives as
+                        // panels, the blob's or this call's.
+                        tile_mma_direct(mc, static_cast<int>(ocnc), kdim,
+                                        tile, static_cast<int>(OC),
+                                        a, lda, b_panel,
+                                        b_ld != 0 ? b_ld : -1, stage, c_lo, c_hi,
+                                        /*zero_mode=*/icn == 0 && !attrs.add_to &&
+                                                       !bias_seed,
+                                        nullptr,
+                                        (icn == 0 && bias_seed) ? bias_col + ocn
+                                                                : nullptr);
 
                         if (is_last_icn && need_epi) {
                             epilogue_inplace<T>(mc, static_cast<int>(ocnc), tile,
@@ -2167,15 +2155,10 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
                         const int64_t ldd_a = geom_ldd_i8_a(kdim4);
                         tile_pack_lhs_i8(false, mc, kdim4, a_pack,
                                          static_cast<int>(ldd_a), a, lda, a_biased);
-                        if (icn == 0) {
-                            tile_mma_pack_i8_zero(mc, static_cast<int>(ocnc), kdim4,
-                                                  acc_tile, static_cast<int>(ocn_block),
-                                                  a_pack, b_panel, INT32_MIN, INT32_MAX);
-                        } else {
-                            tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4,
-                                             acc_tile, static_cast<int>(ocn_block),
-                                             a_pack, b_panel, INT32_MIN, INT32_MAX);
-                        }
+                        tile_mma_pack_i8(mc, static_cast<int>(ocnc), kdim4,
+                                         acc_tile, static_cast<int>(ocn_block),
+                                         a_pack, b_panel, /*ldb=*/0, INT32_MIN, INT32_MAX,
+                                         /*zero_mode=*/icn == 0);
 
                         if (!is_last_icn) { continue; }
 

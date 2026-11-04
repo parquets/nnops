@@ -490,7 +490,23 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         half* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale);
 
-// B is always packed here; panels advance by the aligned nr_max*kc stride.
+// Two axes. `pack` / `direct` describe A: `pack` takes an already-packed A
+// panel, `direct` reads A row-major in place through `lda`. `ldb` describes B:
+//   -1    the panels this call packed -- uniform nr_max-wide slots at the
+//         k-block's natural pitch, so one call covers the whole N side and the
+//         kernel walks them;
+//   <-1   a caller-prepacked PackedB blob, one panel per call, the panels -ldb
+//         apart (ldd = align(nr_max·K·esz), a function of K, where the k-block's
+//         own slot is a function of kc -- hence the explicit stride);
+//   >0    the caller's own matrix, K rows `ldb` apart with the N axis
+//         contiguous, so panel p is read in place at b + p·nr_max and nothing
+//         is materialized. That is what a 1x1 Conv2D can give — the activation
+//         is already [ic][pixel] and an HWIO filter already [ic][oc] — so the
+//         pack pass disappears rather than getting cheaper. A panel is read
+//         whole, so the partial last panel would run past its live columns;
+//         that one is packed into @p stage (nr_max · kc elements, caller
+//         owned) and read back through the packed path, so only the tail costs
+//         a copy. `direct` only: a packed A always pairs with panels.
 //
 // `bias` (one value per M row) or `col_bias` (one per N column, for the
 // channel-last Conv2D whose rows are pixels and a row seed has nothing to hold)
@@ -499,48 +515,10 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 // Either implies the overwrite path (`zero_mode` is ignored). `col_bias` is read
 // in whole nr_max-wide lanes past `nc` — the panel loads as a unit and the store
 // drops the extra lanes — so the caller pads it to the panel width.
-void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
-void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* packed_b, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
-void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
-void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* packed_b, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
-
-// ---- Prepacked RHS: the same panels, at a caller-chosen stride ----------
-//
-// A PackedB blob holds the panels above for the whole K, so its stride is
-// ldd = align(nr_max·K·esz) — a function of K — while the MMA would derive its
-// own from the k-block, whose length follows M and the worker count. These
-// variants take the stride instead: k block `k` of panel `p` starts at
-// `b + p·ldb` and holds kc columns, exactly the sub-panel a k-block needs.
-// Everything else — the A cascade, the clamp, the store — is the same kernel;
-// the price is one prologue and call per nr_max columns. `col_bias` follows the
-// same rule as above, one panel's worth at a time.
-void tile_mma_pack_ldb(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* col_bias = nullptr);
-void tile_mma_pack_ldb(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* col_bias = nullptr);
-void tile_mma_direct_ldb(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* col_bias = nullptr);
-void tile_mma_direct_ldb(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* col_bias = nullptr);
-
-// ---- Strided RHS: no panels exist at all --------------------------------
-//
-// B is the caller's own matrix: the N axis is contiguous and K rows sit `ldb`
-// apart (B's leading dimension, not the panel stride the `_ldb` variants above
-// take), so panel p is read in place at `b + p·nr_max` and nothing is
-// materialized. That is what a 1x1 Conv2D can give — the NCHW activation is
-// already [ic][pixel] with the pixel axis contiguous, and an HWIO filter is
-// already [ic][oc] — so the pack pass disappears rather than getting cheaper.
-//
-// A panel is read whole, so a partial last panel would run past its live
-// columns; that one is packed into @p stage (nr_max · kc elements, caller
-// owned) and read back through the packed path. Only the tail costs a copy.
-void tile_mma_direct_strided(int mc, int nc, int kc, float* c, int ldc,
-                             const float* a, int lda, const float* b, int ldb,
-                             float* stage, float clamp_min, float clamp_max,
-                             bool zero_mode, const float* bias = nullptr,
-                             const float* col_bias = nullptr);
-void tile_mma_direct_strided(int mc, int nc, int kc, half* c, int ldc,
-                             const half* a, int lda, const half* b, int ldb,
-                             half* stage, float clamp_min, float clamp_max,
-                             bool zero_mode, const half* bias = nullptr,
-                             const half* col_bias = nullptr);
+void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packed_a, const float* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
+void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float* stage, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
+void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
+void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, half* stage, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
 
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
@@ -590,30 +568,27 @@ void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased,
                       bool src_shift = false);
 
-// Accumulate C[mc][nc] += A_packed[mc][K] × B_packed[K][nc] (int32), one kernel
-// call per M panel covering the whole N side.
+// The int8 family, same two axes as the fp one above: `pack` is an already
+// packed A panel, `direct` reads A row-major through `lda`. B is always a packed
+// panel sequence here — there is no raw variant, the kernels' B layout is the
+// packers' — and `ldb` is its panel pitch in bytes: 0 for the layout
+// tile_pack_rhs_i8 writes, a prepacked blob's own otherwise. `zero_mode` is the
+// C-read axis as on the fp side: true stores A×B into C without reading it, so a
+// tile's first K block needs no zero fill. On x86 the accumulators still start
+// at the panel's -128·Σb correction, so the stored result equals what the
+// accumulate form gives from a zeroed tile.
 void tile_mma_pack_i8(int mc, int nc, int kc,
                       int32_t* c, int ldc,
-                      const int8_t* packed_a, const int8_t* packed_b,
-                      int32_t clamp_min, int32_t clamp_max);
+                      const int8_t* packed_a, const int8_t* packed_b, int ldb,
+                      int32_t clamp_min, int32_t clamp_max, bool zero_mode);
 
-// The same call for a tile's *first* K block: the accumulators are stored
-// rather than loaded and added, so the caller does not zero the tile first. On
-// x86 they still start at the panel's -128·Σb correction, so the stored result
-// equals what the accumulate form gives from a zeroed tile.
-void tile_mma_pack_i8_zero(int mc, int nc, int kc,
-                           int32_t* c, int ldc,
-                           const int8_t* packed_a, const int8_t* packed_b,
-                           int32_t clamp_min, int32_t clamp_max);
-
-// Accumulate C[mc][nc] += A[mc][Kc] × B_packed[Kc][nc] (int32) with A read
-// row-major from memory (`lda` in int8 elements; kc must be a multiple of 4, the
-// panel's group size). The int8 mirror of tile_mma_direct: Conv2D's
-// channel-last route gathers its activations into A, so there is no panel.
+// A row-major through `lda` (int8 elements; kc must be a multiple of 4, the
+// panel's group size). Conv2D's channel-last route gathers its activations into
+// A, so there is no panel to pack.
 void tile_mma_direct_i8(int mc, int nc, int kc,
                         int32_t* c, int ldc,
-                        const int8_t* a, int lda, const int8_t* packed_b,
-                        int32_t clamp_min, int32_t clamp_max);
+                        const int8_t* a, int lda, const int8_t* packed_b, int ldb,
+                        int32_t clamp_min, int32_t clamp_max, bool zero_mode);
 
 // XOR every byte of a packed-A panel with 0x80 (s8 → u8 for VNNI).
 void xor0x80_i8(int8_t* p, int nbytes);
@@ -627,21 +602,31 @@ void xor0x80_i8(int8_t* p, int nbytes);
 //
 // The layout is the per-call one, one level up: ceil(N/nr_max) panels of
 // nr_max columns, each [K][nr_max] k-major with the columns past N zero-filled,
-// `ldd` elements apart. Packing at full K is what makes the blob independent of
-// the plan (kc follows M and the worker count), and why alpha, a per-call scale
-// that otherwise rides the RHS pack, must be 1 here.
+// `ldd` elements apart. Packing at full K is what makes the float blobs
+// independent of the plan (kc follows M and the worker count), and why alpha, a
+// per-call scale that otherwise rides the RHS pack, must be 1 here.
+//
+// An int8 blob is the one exception, and the correction block is why: on x86 a
+// panel carries 16 int32 of -128·Σ_k B[k,n] right after its data, and the kernel
+// reads them at the call's own kc. So the blob is cut into k segments of at most
+// KC_CAP_I8, each its own sequence of np panels at int8_panel_stride(segment),
+// and the plan pins kc to one segment. `seg` is that length; the float blobs
+// leave it 0, their panels already span the whole K. Last segment sits at a
+// whole panel slot too: a caller never has to read its shorter pitch.
 
 struct MatMulPackedB {
     int64_t nr = 0;     ///< panel width (the arch's uniform RHS width)
-    int64_t ldd = 0;    ///< panel stride, elements, at the whole K
+    int64_t ldd = 0;    ///< panel stride: elements (fp), bytes (int8)
     int64_t np = 0;     ///< ceil(N / nr)
-    int64_t total = 0;  ///< np × ldd — the blob, in elements
+    int64_t seg = 0;    ///< k segment length (int8); 0 = the whole K
+    int64_t total = 0;  ///< the blob's numel: np × ldd, × ⌈K/seg⌉ for int8
 
     bool ok() const noexcept { return total > 0; }
 };
 
 /// The blob's geometry for a product N wide and K deep. `ok()` is false for a
-/// dtype with no float RHS route, and for a non-positive extent.
+/// dtype with no packed RHS route (anything but f32, f16 and s8), and for a
+/// non-positive extent.
 MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept;
 
 /// The descriptor the blob is allocated from — the query half of the two-step
@@ -659,6 +644,13 @@ bool matmul_packed_b_matches(const TensorDesc& packed, int64_t K) noexcept;
 /// Fill @p packed, sized from matmul_packed_b_desc, from the raw B.
 void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
                           bool transpose_b, const ComputeContext& ctx);
+
+/// Σ_k B[k,n] per column, read out of an int8 blob's panels: the int8 output
+/// pass needs it when the activation zero point is not symmetric, and a packed
+/// B has no raw matrix left to sweep. @p r_b holds N entries; zero padding
+/// (the tail columns and a short final k group) contributes nothing.
+void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
+                                 int32_t* r_b, const ComputeContext& ctx);
 
 struct MatMulPlan {
     int64_t mc, nc, kc;       // tile sizes
