@@ -1152,3 +1152,134 @@ NNOPS_TEST(tconv2d_nhwc_wide_oc) {
 
     test_channel_last_vs_ref({1, 64, 16, 16}, {64, 128, 3, 3}, attrs);
 }
+
+// ============================================================
+// Channel-last col routes (depthwise, in-place filter, chunked col)
+// ============================================================
+
+NNOPS_TEST(tconv2d_nhwc_depthwise) {
+    // g == IC == OC, so every group holds one channel and the route vectorises
+    // across groups. The group offset has to be exactly g on both operands or
+    // the channels silently swap.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 16;
+
+    test_channel_last_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, /*has_bias=*/true);
+}
+
+NNOPS_TEST(tconv2d_nhwc_depthwise_stride1) {
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 12;
+    attrs.epilogue    = {EpilogueActivateType::LeakyRelu};
+    attrs.epilogue.alpha = 0.05f;
+
+    test_channel_last_vs_ref({1, 12, 10, 10}, {12, 1, 3, 3}, attrs);
+}
+
+NNOPS_TEST(tconv2d_nhwc_direct_weight) {
+    // Fewer pixels than the filter has input channels: the col is transposed
+    // per pixel instead of the weight, so B is the planar filter read in place.
+    // OC/G = 12 leaves the vector loop a tail as well.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {4, 4};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 2;
+    attrs.epilogue    = {EpilogueActivateType::Relu6};
+
+    test_channel_last_vs_ref({1, 32, 3, 3}, {32, 12, 4, 4}, attrs, /*has_bias=*/true);
+}
+
+NNOPS_TEST(tconv2d_nhwc_col_chunked) {
+    // The 8 MiB col budget from the other side: the col is [pixels][tap·oc]
+    // here, so it splits on oc and each chunk runs its own GEMM and scatter.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {5, 5};
+    attrs.stride      = {1, 1};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {2, 2};
+    attrs.groups      = 1;
+
+    test_channel_last_vs_ref({1, 16, 64, 64}, {16, 256, 5, 5}, attrs);
+}
+
+NNOPS_TEST(tconv2d_nhwc_batched_groups) {
+    // Every batch item runs its own GEMM against the one packed filter, so the
+    // group and batch offsets both have to survive.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 2;
+
+    test_channel_last_vs_ref({3, 16, 10, 10}, {16, 8, 3, 3}, attrs, /*has_bias=*/true);
+}
+
+NNOPS_TEST(tconv2d_nhwc_add_to) {
+    // add_to through the col route: only the merge writes, so the destination's
+    // own values are still there to add into.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {4, 4};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+    attrs.add_to      = true;
+    attrs.epilogue    = {EpilogueActivateType::Relu};
+
+    auto [in_vec, in_nchw] = test::make_random_tensor({1, 16, 8, 8});
+    auto [w_vec,  w_nchw]  = test::make_random_tensor({16, 32, 4, 4});
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in_nchw.desc(), w_nchw.desc()};
+    const auto out_descs = op->getOutputTensorDesc(d);
+    const int64_t ON = out_descs[0].dims[0];
+    const int64_t OC = out_descs[0].dims[1];
+    const int64_t OH = out_descs[0].dims[2];
+    const int64_t OW = out_descs[0].dims[3];
+
+    auto [res_vec, res_view] = test::make_random_tensor(
+        std::span<const int64_t>(out_descs[0].dims.begin(), out_descs[0].dims.size()),
+        -1.0f, 1.0f, 11);
+    (void)res_view;
+
+    std::vector<float> ref_buf(res_vec);
+    auto out_ref = test::make_planar(out_descs[0], ref_buf.data());
+    {
+        const TensorView ins[] = {in_nchw, w_nchw};
+        ComputeContext ctx;
+        backend::cpu::reference::transpose_conv2d_nchw_ref(
+            attrs, out_ref, ins, ctx, nullptr);
+    }
+
+    auto in_cl = test::nchw_to_nhwc<float>(
+        std::span<const float>(in_vec.data(), in_vec.size()), ON, 16, 8, 8);
+    auto out_cl = test::nchw_to_nhwc<float>(
+        std::span<const float>(res_vec.data(), res_vec.size()), ON, OC, OH, OW);
+
+    const std::vector<int64_t> ishape = {ON, 16, 8, 8};
+    const std::vector<int64_t> oshape = {ON, OC, OH, OW};
+    TensorView in_view(ishape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
+    TensorView out_view(oshape, DataType::f32, out_cl.data(), TensorLayout::NHWC);
+    {
+        TensorView outs[] = {out_view};
+        const TensorView ins[] = {in_view, w_nchw};
+        ComputeContext ctx;
+        op->compute(outs, ins, ctx);
+    }
+
+    auto got = test::nhwc_to_nchw<float>(
+        std::span<const float>(out_cl.data(), out_cl.size()), ON, OC, OH, OW);
+    TensorView got_view(oshape, DataType::f32, got.data(), TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
+}
