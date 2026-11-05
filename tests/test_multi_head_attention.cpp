@@ -300,6 +300,47 @@ NNOPS_TEST(attention_tiled_explicit_matches_ref) {
     NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f));
 }
 
+NNOPS_TEST(attention_decode_sq1_matches_ref) {
+    // Cross-attention from a single query row against a longer key run: the
+    // GEMV decode route. The key counts cover the dot_row4 batch and its
+    // remainder, a head dim past Kc, and the masked case, which stays on the
+    // standard route.
+    struct DCase { std::vector<int64_t> qshape, kshape; int64_t heads; float scale; bool mask; };
+    const DCase cases[] = {
+        {{1, 1, 8},     {1, 12, 8},    1, 0.0f, false},
+        {{2, 1, 64},    {2, 11, 64},   4, 0.0f, false},
+        {{1, 1, 192},   {1, 9, 192},   1, 0.3f, false},
+        {{1, 1, 32},    {1, 9, 32},    2, 0.0f, true},
+    };
+
+    for (const auto& c : cases) {
+        auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 230);
+        auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 231);
+
+        std::vector<float> m_vec;
+        TensorView mask;
+        if (c.mask) {
+            auto [mv, m] = test::make_random_tensor({c.qshape[1], c.kshape[1]}, -2.0f, 2.0f, 232);
+            m_vec = std::move(mv);
+            mask  = m;
+        }
+
+        MultiHeadAttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+        attrs.scale     = c.scale;
+
+        cpu::AttentionConfig cfg;
+        cfg.num_heads = c.heads;
+        std::vector<TensorDesc> ddescs = {q.desc(), k.desc(), k.desc()};
+        if (c.mask) { ddescs.push_back(mask.desc()); }
+        const auto plan = cpu::get_attention_plan(cfg, ddescs, {});
+        NNOPS_EXPECT_EQ(plan.use_decode, !c.mask);
+
+        NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, k, c.mask ? &mask : nullptr,
+                                                1e-3f, 1e-4f));
+    }
+}
+
 // ============================================================
 // Pack-scratch sizing
 // ============================================================
@@ -525,6 +566,9 @@ NNOPS_TEST(attention_f16_matches_ref) {
         {{1, 4, 512},  {1, 4, 512},  {1, 4, 512},  {},        1, 0.0f},
         // explicit [B, H, S, D] layout, H=3, per-head D=8.
         {{2, 3, 5, 8}, {2, 3, 5, 8}, {2, 3, 5, 8}, {},        3, 0.0f},
+        // Sq == 1 against a longer key run: the f16 GEMV decode route, with a
+        // key count that leaves a dot_row4 remainder.
+        {{1, 1, 64},   {1, 11, 64},  {1, 11, 64},  {},        4, 0.0f},
     };
 
     const float tol = nnops::test::kF16AccumTol;

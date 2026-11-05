@@ -263,7 +263,8 @@ void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
                 (long long)c.B, (long long)c.H, (long long)c.Hkv, (long long)Sq,
                 (long long)Sk, (long long)c.D, (long long)(Sq * Sk),
                 c.f16 ? "f16" : "f32", c.causal ? "  causal" : "");
-    std::printf("    route=%s  ws=%zuB\n", plan.use_flash ? "flash" : "standard",
+    std::printf("    route=%s  ws=%zuB\n",
+                plan.use_decode ? "decode" : (plan.use_flash ? "flash" : "standard"),
                 plan.workspace_size);
 
     const auto gflops = measure(threads, iters, flops, [&](const ComputeContext& ctx) {
@@ -339,7 +340,8 @@ void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
                 (long long)Sk, (long long)dkv,
                 (long long)(c.vdim > 0 ? c.vdim : c.rank),
                 c.f16 ? "f16" : "f32", c.causal ? "  causal" : "");
-    std::printf("    route=%s  ws=%zuB\n", plan.use_flash ? "flash" : "standard",
+    std::printf("    route=%s  ws=%zuB\n",
+                plan.use_decode ? "decode" : (plan.use_flash ? "flash" : "standard"),
                 plan.workspace_size);
 
     const auto gflops = measure(threads, iters, flops, [&](const ComputeContext& ctx) {
@@ -455,8 +457,14 @@ NNOPS_BENCH(gqa_f32_prefill) {
     bench_gqa({"gqa f32 prefill B1 S512 H32 Hkv8 D128", 1, 512, 32, 8, 128});
 }
 
+NNOPS_BENCH(gqa_f32_prefill_long) {
+    // 2048-token causal prefill: the flash path's triangle skip and its tile
+    // sizes decide the result here.
+    bench_gqa({"gqa f32 prefill B1 S2048 H32 Hkv8 D128", 1, 2048, 32, 8, 128});
+}
+
 NNOPS_BENCH(gqa_f32_decode) {
-    // One new token against a 2048-token key run: the standard path, and the
+    // One new token against a 2048-token key run: the GEMV decode route, and
     // shape where a kv head's reuse actually shows up.
     bench_gqa({"gqa f32 decode B1 S1 H32 Hkv8 D128", 1, 1, 32, 8, 128, /*Sk=*/2048});
 }
@@ -479,6 +487,13 @@ NNOPS_BENCH(mla_f32_prefill) {
     // kv_lora_rank 512 + rope 64, 128 query heads over one latent head.
     bench_mla({"mla f32 prefill B1 S128 H32 Hkv1 rank512 rope64 v512",
                1, 128, 32, 1, 512, 64, 512});
+}
+
+NNOPS_BENCH(mla_f32_prefill_long) {
+    // 1024-token causal prefill over the latent: eight 64-row query blocks, so
+    // the triangle skip and the latent width both show in the rate.
+    bench_mla({"mla f32 prefill B1 S1024 H32 Hkv1 rank512 rope64 v512",
+               1, 1024, 32, 1, 512, 64, 512});
 }
 
 NNOPS_BENCH(mla_f32_decode) {

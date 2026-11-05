@@ -57,7 +57,7 @@ struct Case {
 };
 
 /// fast path vs reference on f32; returns false on the first mismatch.
-bool gqa_fast_vs_ref(const Case& c, bool& used_flash)
+bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out = nullptr)
 {
     auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 100);
     auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 101);
@@ -90,8 +90,10 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash)
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    used_flash = cpu::get_attention_plan({c.heads, c.kv_heads},
-                                         descs, out_descs).use_flash;
+    const cpu::AttentionPlan plan = cpu::get_attention_plan({c.heads, c.kv_heads},
+                                                             descs, out_descs);
+    used_flash = plan.use_flash;
+    if (plan_out) { *plan_out = plan; }
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
@@ -218,6 +220,48 @@ NNOPS_TEST(gqa_flash_matches_ref) {
         const bool ok = gqa_fast_vs_ref(c, flash);
         NNOPS_EXPECT_TRUE(flash);
         NNOPS_EXPECT_TRUE(ok);
+    }
+}
+
+// ============================================================
+// Single-token decode: the GEMV route (Sq == 1, no mask)
+// ============================================================
+
+NNOPS_TEST(gqa_decode_sq1_matches_ref) {
+    // One query row against the whole key run: the decode route streams K and
+    // V once, with no packing and no M == 1 tiles. The key runs pick the four
+    // shapes the dot_row4 batch has to handle — a multiple of 4, a remainder,
+    // a multi-k-block head dim, and a single key — plus the explicit layout.
+    const Case cases[] = {
+        {{1, 1, 8 * 8},    {1, 12, 1 * 8},   8, 1, 0.0f, true},   // MQA, Sk % 4 == 0
+        {{1, 1, 8 * 16},   {1, 11, 4 * 16},  8, 4, 0.0f, true},   // ratio 2, Sk % 4 == 3
+        {{1, 1, 2 * 192},  {1, 7, 1 * 192},  2, 1, 0.0f, false},  // D = 192, two k-blocks
+        {{2, 4, 1, 8},     {2, 2, 5, 8},     4, 2, 0.0f, true},   // explicit layout
+        {{1, 1, 4 * 8},    {1, 1, 4 * 8},    4, 4, 0.0f, true},   // single key, Hkv == H
+        {{1, 1, 4 * 16},   {1, 13, 2 * 16},  4, 2, 0.5f, true},   // non-default scale
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash, &plan));
+        NNOPS_EXPECT_TRUE(plan.use_decode);
+    }
+}
+
+NNOPS_TEST(gqa_decode_sq1_masked_matches_ref) {
+    // An additive mask keeps the call on the standard route, so the two routes
+    // have to agree on the same Sq == 1 shape.
+    const Case cases[] = {
+        {{1, 1, 8 * 8}, {1, 9, 2 * 8}, 8, 2, 0.0f, false, true},
+        {{1, 1, 4 * 8}, {1, 9, 1 * 8}, 4, 1, 0.0f, true,  true},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash, &plan));
+        NNOPS_EXPECT_TRUE(!plan.use_decode);
     }
 }
 

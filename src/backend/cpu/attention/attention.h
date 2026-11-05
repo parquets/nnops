@@ -10,13 +10,17 @@
 /// the value is the leading slice of the key row (MLA's latent). Each operator
 /// builds a config and calls attention_cpu; nothing below knows which one did.
 ///
-/// Two routes, picked by the per-head scores area:
+/// Three routes, picked by the shape:
+///   - decode (Sq == 1, no mask): both products are matrix-vector, so K and V
+///     are streamed once each with no packing and no M == 1 MMA tiles.
 ///   - standard (Sq*Sk < kFlashMinScores): materialize scores = Q·K^T·scale,
 ///     softmax each row in place, then output = attn·V.
 ///   - flash (Sq*Sk >= kFlashMinScores): FlashAttention-1 online softmax,
 ///     streaming KV in Br×Bc tiles so scores is never materialized. The task
 ///     grid is batch × query head × query-block, so long-sequence prefill keeps
-///     its parallelism even when batch × head is small.
+///     its parallelism even when batch × head is small. A causal query block
+///     stops its KV stream at the block's causal limit, so prefill never walks
+///     the masked upper triangle.
 ///
 /// Query head h reads kv head h / (H / H_kv), so one K/V slice serves a whole
 /// group under grouped-query attention, and H_kv == H is ordinary MHA.
@@ -74,9 +78,11 @@ struct AttentionConfig {
 /// the scratch sizing.
 struct AttentionPlan {
     bool   use_flash = false;   ///< route through the FlashAttention path
+    bool   use_decode = false;  ///< Sq == 1: route through the GEMV decode path
     int    mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
     int    mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × Dv) tiles
     int    Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
+    int64_t decode_elems = 0;   ///< decode-path f32 scratch elements per slot
     int64_t num_slots = 0;      ///< scratch slots (worker threads, else tasks)
     size_t workspace_size = 0;  ///< pooled scratch bytes (0 → no tiled route)
 };

@@ -72,7 +72,7 @@ MultiLatentAttentionAttributes attrs_of(const Case& c)
     return a;
 }
 
-bool mla_fast_vs_ref(const Case& c, bool& used_flash)
+bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out = nullptr)
 {
     auto [q_vec, q]   = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 100);
     auto [kv_vec, kv] = test::make_random_tensor(c.kvshape, -1.0f, 1.0f, 101);
@@ -104,7 +104,9 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash)
     cfg.num_kv_heads = c.kv_heads;
     cfg.v_head_dim = c.vdim > 0 ? c.vdim : c.rank;
     cfg.v_is_k = true;
-    used_flash = cpu::get_attention_plan(cfg, descs, out_descs).use_flash;
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs);
+    used_flash = plan.use_flash;
+    if (plan_out) { *plan_out = plan; }
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
@@ -234,6 +236,45 @@ NNOPS_TEST(mla_flash_matches_ref) {
         const bool ok = mla_fast_vs_ref(c, flash);
         NNOPS_EXPECT_TRUE(flash);
         NNOPS_EXPECT_TRUE(ok);
+    }
+}
+
+// ============================================================
+// Single-token decode: the GEMV route (Sq == 1, no mask)
+// ============================================================
+
+NNOPS_TEST(mla_decode_sq1_matches_ref) {
+    // One latent row read twice — as keys over kv_lora_rank + rope, as values
+    // over the leading v_head_dim — with no packing and no M == 1 tiles.
+    const Case cases[] = {
+        {{1, 1, 8 * 24},  {1, 12, 1 * 24}, 8, 1, 16, 8, 32, 0,  0.0f, true},
+        {{1, 1, 4 * 24},  {1, 11, 1 * 24}, 4, 1, 16, 8, 32, 8,  0.0f, true},   // narrow value
+        {{2, 2, 1, 24},   {2, 1, 7, 24},   2, 1, 16, 8, 32, 0,  0.0f, false},  // explicit layout
+        {{1, 1, 2 * 40},  {1, 9, 1 * 40},  2, 1, 32, 8, 64, 0,  0.25f, true},  // non-default scale
+        {{1, 1, 4 * 24},  {1, 1, 1 * 24},  4, 1, 16, 8, 32, 0,  0.0f, true},   // single key
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(mla_fast_vs_ref(c, flash, &plan));
+        NNOPS_EXPECT_TRUE(plan.use_decode);
+    }
+}
+
+NNOPS_TEST(mla_decode_sq1_masked_matches_ref) {
+    // A mask keeps the call on the standard route; both routes must agree on
+    // the same Sq == 1 shape.
+    const Case cases[] = {
+        {{1, 1, 8 * 24}, {1, 9, 1 * 24}, 8, 1, 16, 8, 32, 8, 0.0f, false, true},
+        {{1, 1, 4 * 24}, {1, 9, 1 * 24}, 4, 1, 16, 8, 32, 0, 0.0f, true,  true},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(mla_fast_vs_ref(c, flash, &plan));
+        NNOPS_EXPECT_TRUE(!plan.use_decode);
     }
 }
 

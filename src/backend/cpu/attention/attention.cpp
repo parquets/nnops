@@ -92,6 +92,42 @@ inline int64_t merged_v_head_stride(const AttentionConfig& cfg, int64_t Dqk, int
     return cfg.v_is_k ? Dqk : Dv;
 }
 
+/// The optional mask is present only when its view carries data; callers may
+/// pass an empty view to mean "absent".
+inline bool has_mask_input(const AttentionConfig& cfg, std::span<const TensorView> inputs)
+{
+    const size_t required = cfg.v_is_k ? 2u : 3u;
+    return inputs.size() > required && !inputs[required].is_empty();
+}
+
+// ---- scratch slots -------------------------------------------------------
+//
+// A slot holds one task's scratch. How many are needed depends on the backend:
+// one per worker when thread ids are reported (a worker reuses its slot), one
+// for a sequential run (only one task is live), and otherwise one per task.
+// The kernel's slot index and the plan's slot count are the same decision, so
+// both go through these — sizing per task on a sequential run over-allocates
+// the scratch by the task count, which at 20+ tasks and a large Br×Bc tile
+// pushes it past the pool's cap and turns every call into a fresh malloc.
+
+inline bool scratch_per_worker(const CpuBackend& cpu, int64_t tasks)
+{
+    const int slots = cpu.thread_slot_count();
+    return slots > 0 && slots < tasks;
+}
+
+inline int64_t scratch_slot_count(const CpuBackend& cpu, int64_t tasks)
+{
+    if (scratch_per_worker(cpu, tasks)) { return cpu.thread_slot_count(); }
+    return cpu.worker_count() <= 1 ? 1 : tasks;
+}
+
+inline int64_t scratch_slot_of(const CpuBackend& cpu, int64_t tasks, int64_t idx)
+{
+    if (scratch_per_worker(cpu, tasks)) { return cpu.current_thread_id(); }
+    return cpu.worker_count() <= 1 ? 0 : idx;
+}
+
 // ---- causal row limit ----------------------------------------------------
 
 /// Exclusive end of query row @p i's valid key range under the config:
@@ -124,7 +160,7 @@ void attention_impl(const AttentionConfig& cfg,
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
-    const bool has_mask = inputs.size() > (cfg.v_is_k ? 2u : 3u);
+    const bool has_mask = has_mask_input(cfg, inputs);
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
@@ -169,8 +205,6 @@ void attention_impl(const AttentionConfig& cfg,
 
     const int64_t NG = B * H;
     T* ws_base = static_cast<T*>(workspace);
-    const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < NG;
 
     const auto run = [&](int64_t idx) {
         const int64_t b = idx / H;
@@ -193,7 +227,7 @@ void attention_impl(const AttentionConfig& cfg,
             o_head = out_ptr + (b * H + h) * Sq * o_rs;
         }
 
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : idx;
+        const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
         T* scores = ws_base + slot * per_head;
         T* pack_b = scores + scores_elems;
 
@@ -280,20 +314,41 @@ void attention_impl(const AttentionConfig& cfg,
 
 constexpr int64_t kFlashMinScores = 1 << 16;  // Sq*Sk threshold (≈ 256 KiB f32)
 
+// Tile caps measured on the i5-13600KF, 1T..20T:
+//  - Bc tops out at 256. The L2 formula asks for 512 at D=128 f32, but the
+//    S tile (Br·Bc), the accumulator and the packed K no longer share the L2
+//    with the K/V stream, and 20T lands 12% below the 256-wide tile.
+//  - Causal runs want small tiles, because the work a query block wastes above
+//    the diagonal is Br/Sq of the total — but only while the key run is
+//    comparable to the query run: the fraction is (Sq-Br)/(2·Sk), so a chunk
+//    against a long cache gains nothing and keeps the wide tiles. At least
+//    four query blocks are needed for the saved triangle to pay for the tiling
+//    overhead (a 128-row MLA block lost 5% at Br 64, its 1024-row prefill
+//    gained 7%).
+constexpr int kFlashBcMax = 256;
+constexpr int kCausalBrMax = 64;
+constexpr int kCausalBcMax = 128;
+
 inline bool should_use_flash_attention(int64_t Sq, int64_t Sk)
 {
     return Sq * Sk >= kFlashMinScores;
 }
 
 inline void resolve_flash_tile_sizes(size_t elem_size, int64_t Sq, int64_t Sk,
-                                     int64_t Dqk, int64_t Dv, int& Br, int& Bc)
+                                     int64_t Dqk, int64_t Dv, bool causal,
+                                     int& Br, int& Bc)
 {
     const size_t l2 = simd::CpuFeatures::get().l2_cache_size();
     const size_t l2_eff = l2 > 0 ? l2 : (1024u * 1024u);  // 1 MiB fallback
     const int64_t head_pairs = Dqk + Dv;  // qk_head_size + v_head_size
-    Bc = static_cast<int>(l2_eff / (elem_size * 4 * static_cast<size_t>(head_pairs)));
+    Bc = static_cast<int>(std::min<int64_t>(l2_eff / (elem_size * 4 * static_cast<size_t>(head_pairs)),
+                                            kFlashBcMax));
     if (Bc < 1) { Bc = 1; }
     Br = static_cast<int>(std::min<int64_t>(Bc, head_pairs));
+    if (causal && Sq >= 4 * kCausalBrMax && Sk <= 2 * Sq) {
+        Br = std::min(Br, kCausalBrMax);
+        Bc = std::min(Bc, kCausalBcMax);
+    }
     Bc = static_cast<int>(std::min<int64_t>(Bc, Sk));
     Br = static_cast<int>(std::min<int64_t>(Br, Sq));
     if (Br < 1) { Br = 1; }
@@ -336,7 +391,7 @@ void attention_flash_impl(const AttentionConfig& cfg,
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
-    const bool has_mask = inputs.size() > (cfg.v_is_k ? 2u : 3u);
+    const bool has_mask = has_mask_input(cfg, inputs);
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
@@ -370,8 +425,6 @@ void attention_flash_impl(const AttentionConfig& cfg,
     const int64_t NQ = (Sq + Br - 1) / Br;  // number of Br-row query blocks
     const int64_t NG = B * H * NQ;
     T* ws_base = static_cast<T*>(workspace);
-    const int nslots = ctx.cpu.thread_slot_count();
-    const bool per_thread = nslots > 0 && nslots < NG;
 
     const auto run = [&](int64_t idx) {
         const int64_t qi = idx % NQ;
@@ -397,7 +450,7 @@ void attention_flash_impl(const AttentionConfig& cfg,
             o_head = out_ptr + (b * H + h) * Sq * o_rs;
         }
 
-        const int64_t slot = per_thread ? static_cast<int64_t>(ctx.cpu.current_thread_id()) : idx;
+        const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
         T* m      = ws_base + slot * per_task;
         T* l      = m + Br;
         T* s      = l + Br;
@@ -412,11 +465,23 @@ void attention_flash_impl(const AttentionConfig& cfg,
             simd::s_store(&m[i], -std::numeric_limits<float>::infinity());
             simd::s_store(&l[i], 0.0f);
         }
+        // Causal early exit: the causal limit grows with the query row, so the
+        // last row of the block bounds every row in it. A KV block starting at
+        // or past that bound is fully masked for all of them and contributes
+        // nothing — for a causal prefill that is the whole upper triangle, and
+        // skipping it halves the QK and AV work.
+        const int64_t kv_end = cfg.causal
+            ? causal_limit(cfg, i0 + actual_br - 1, Sq, Sk)
+            : Sk;
+
         // o_acc is written by the first KV block (zero_mode) — no pre-zeroing
         // pass. The exp_diff rescale may touch it first on j0 == 0; that
         // garbage is fully overwritten by the first MMA.
-        for (int64_t j0 = 0; j0 < Sk; j0 += Bc) {
-            const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, Sk - j0));
+        for (int64_t j0 = 0; j0 < kv_end; j0 += Bc) {
+            // The diagonal block is the last one and is rarely a full Bc wide:
+            // clamping it bounds the tile to the block's causal rectangle
+            // instead of a full-width strip that is mostly masked.
+            const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, kv_end - j0));
 
             // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
             // k0 == 0 overwrites (zero_mode) — each KV block owns its S tile.
@@ -529,6 +594,213 @@ void attention_flash_impl(const AttentionConfig& cfg,
     ctx.cpu.run(0, NG, run);
 }
 
+// ---- single-row decode kernel (Sq == 1) ----------------------------------
+//
+// With one query row both products collapse to GEMV, so K and V are streamed
+// once each: no B packing, no M == 1 MMA tiles, and no materialized score
+// matrix beyond the row itself. Scores and the output accumulator are f32
+// whatever the element type — f16 converts once per loaded vector instead of
+// accumulating in f16, which also keeps the deviation inside kF16AccumTol.
+//
+// One task per (batch, head). A task reads Sk·Dqk elements of K and Sk·Dv of
+// V, the same traffic the packed route spends on packing alone before its
+// MMA sees a byte.
+
+inline simd::v_f32x8 vload_f32x8(const float* p) { return simd::v_load(p); }
+inline simd::v_f32x8 vload_f32x8(const half* p)  { return simd::v_cvt_f16_to_f32(p); }
+
+inline void vstore_f32x8(float* p, const simd::v_f32x8& v) { simd::v_store(p, v); }
+inline void vstore_f32x8(half* p, const simd::v_f32x8& v)  { simd::v_store(p, simd::v_cvt_f32_to_f16(v)); }
+
+/// Dot product of two n-wide rows, f32 accumulation.
+template <class T>
+inline float dot_row(const T* a, const T* b, int64_t n)
+{
+    constexpr int L = simd::simd_lane_for<T>;
+    auto acc = simd::v_zero_f32x8();
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        acc = simd::v_fmadd(vload_f32x8(a + i), vload_f32x8(b + i), acc);
+    }
+    float s = simd::v_reduce_sum(acc);
+    for (; i < n; ++i) { s += simd::s_load(&a[i]) * simd::s_load(&b[i]); }
+    return s;
+}
+
+/// Four n-wide dot products against one query row, written to @p out. A
+/// horizontal reduce costs about as much as the 16 vector FMAs of a 128-wide
+/// row, so four keys per reduce is what keeps the GEMV off the latency floor.
+template <class T>
+inline void dot_row4(const T* q, const T* k0, const T* k1, const T* k2, const T* k3,
+                     int64_t n, float* out)
+{
+    constexpr int L = simd::simd_lane_for<T>;
+    auto a0 = simd::v_zero_f32x8();
+    auto a1 = a0, a2 = a0, a3 = a0;
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        auto qv = vload_f32x8(q + i);
+        a0 = simd::v_fmadd(qv, vload_f32x8(k0 + i), a0);
+        a1 = simd::v_fmadd(qv, vload_f32x8(k1 + i), a1);
+        a2 = simd::v_fmadd(qv, vload_f32x8(k2 + i), a2);
+        a3 = simd::v_fmadd(qv, vload_f32x8(k3 + i), a3);
+    }
+    float s0 = simd::v_reduce_sum(a0);
+    float s1 = simd::v_reduce_sum(a1);
+    float s2 = simd::v_reduce_sum(a2);
+    float s3 = simd::v_reduce_sum(a3);
+    for (; i < n; ++i) {
+        const float qs = simd::s_load(&q[i]);
+        s0 += qs * simd::s_load(&k0[i]);
+        s1 += qs * simd::s_load(&k1[i]);
+        s2 += qs * simd::s_load(&k2[i]);
+        s3 += qs * simd::s_load(&k3[i]);
+    }
+    out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+}
+
+template <class T>
+void attention_decode_impl(const AttentionConfig& cfg,
+                           TensorView& output,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx,
+                           const AttentionPlan& plan,
+                           void* workspace)
+{
+    const auto& Q = inputs[0];
+    const auto& K = inputs[1];
+    const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
+
+    const HeadShape hs = resolve_head_shape(cfg, inputs);
+    const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
+    const int64_t Sq = hs.Sq, Sk = hs.Sk, Dqk = hs.Dqk, Dv = hs.Dv;
+    const bool merged = hs.merged;
+    NNOPS_ASSERT(Sq == 1);
+
+    const float scale = (cfg.scale == 0.0f)
+        ? (1.0f / std::sqrt(static_cast<float>(Dqk)))
+        : cfg.scale;
+
+    const T* q_ptr = Q.ptr<T>();
+    const T* k_ptr = K.ptr<T>();
+    const T* v_ptr = V.ptr<T>();
+    T* out_ptr = output.ptr<T>();
+
+    const int64_t q_rs = Q.row_stride_elems();
+    const int64_t k_rs = K.row_stride_elems();
+    const int64_t v_rs = V.row_stride_elems();
+    const int64_t o_rs = output.row_stride_elems();
+    const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
+
+    const int64_t per_slot = plan.decode_elems;   // f32: [scores:Sk][o_acc:Dv]
+    const int64_t NG = B * H;
+    float* ws = static_cast<float*>(workspace);
+
+    // The decode shape is bottom-right aligned, so its causal limit is Sk: the
+    // row attends to every cached key. Precompute it once for both the mask
+    // pass and the accumulation bound.
+    const int64_t n_valid = causal_limit(cfg, 0, Sq, Sk);
+
+    const auto run = [&](int64_t idx) {
+        const int64_t b = idx / H;
+        const int64_t h = idx % H;
+        const int64_t hkv = h / (H / Hkv);
+
+        const T* q_row;
+        const T* k_head;
+        const T* v_head;
+        T* o_row;
+        if (merged) {
+            q_row  = q_ptr + b * q_rs + h * Dqk;
+            k_head = k_ptr + b * Sk * k_rs + hkv * Dqk;
+            v_head = v_ptr + b * hs.Sv * v_rs + hkv * v_head_stride;
+            o_row  = out_ptr + b * o_rs + h * Dv;
+        } else {
+            q_row  = q_ptr + (b * H + h) * q_rs;
+            k_head = k_ptr + (b * Hkv + hkv) * Sk * k_rs;
+            v_head = v_ptr + (b * Hkv + hkv) * hs.Sv * v_rs;
+            o_row  = out_ptr + (b * H + h) * o_rs;
+        }
+
+        const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
+        float* scores = ws + slot * per_slot;
+        float* o_acc  = scores + Sk;
+
+        // ---- scores = q · K^T ----------------------------------------
+        // The scale rides through the softmax temperature instead of touching
+        // the row, so this pass stays a pure dot product.
+        int64_t t = 0;
+        for (; t + 4 <= Sk; t += 4) {
+            const T* kk = k_head + t * k_rs;
+            dot_row4(q_row, kk, kk + k_rs, kk + 2 * k_rs, kk + 3 * k_rs, Dqk, scores + t);
+        }
+        for (; t < Sk; ++t) {
+            scores[t] = dot_row(q_row, k_head + t * k_rs, Dqk);
+        }
+
+        // ---- softmax over the valid prefix (already normalized) ------
+        if (n_valid <= 0) {
+            for (int64_t d = 0; d < Dv; ++d) { simd::s_store(&o_row[d], 0.0f); }
+            return;
+        }
+        kernel::softmax_process_standard_row<float>(scores, scores, n_valid,
+                                                    /*log_softmax=*/false, scale);
+
+        // ---- o = P · V, f32 accumulator ------------------------------
+        // Four value rows per accumulator pass: the o_acc round-trip drops 4x
+        // and the four FMAs into one lane vector still leave Dv/8 independent
+        // chains. A row that softmaxed to zero contributes a zero, so the
+        // branch-free path costs nothing and drops a per-row test.
+        for (int64_t d = 0; d < Dv; ++d) { o_acc[d] = 0.0f; }
+        constexpr int64_t lanes = simd::simd_default_lane_f32;
+        t = 0;
+        for (; t + 4 <= n_valid; t += 4) {
+            const T* r0 = v_head + t * v_rs;
+            const T* r1 = r0 + v_rs;
+            const T* r2 = r1 + v_rs;
+            const T* r3 = r2 + v_rs;
+            const float p0 = scores[t + 0], p1 = scores[t + 1];
+            const float p2 = scores[t + 2], p3 = scores[t + 3];
+            const auto vp0 = simd::v_set1_f32x8(p0), vp1 = simd::v_set1_f32x8(p1);
+            const auto vp2 = simd::v_set1_f32x8(p2), vp3 = simd::v_set1_f32x8(p3);
+            int64_t d = 0;
+            for (; d + lanes <= Dv; d += lanes) {
+                auto acc = simd::v_load(o_acc + d);
+                acc = simd::v_fmadd(vp0, vload_f32x8(r0 + d), acc);
+                acc = simd::v_fmadd(vp1, vload_f32x8(r1 + d), acc);
+                acc = simd::v_fmadd(vp2, vload_f32x8(r2 + d), acc);
+                acc = simd::v_fmadd(vp3, vload_f32x8(r3 + d), acc);
+                simd::v_store(o_acc + d, acc);
+            }
+            for (; d < Dv; ++d) {
+                o_acc[d] += p0 * simd::s_load(&r0[d]) + p1 * simd::s_load(&r1[d])
+                          + p2 * simd::s_load(&r2[d]) + p3 * simd::s_load(&r3[d]);
+            }
+        }
+        for (; t < n_valid; ++t) {
+            const float p = scores[t];
+            const T* vrow = v_head + t * v_rs;
+            auto vp = simd::v_set1_f32x8(p);
+            int64_t d = 0;
+            for (; d + lanes <= Dv; d += lanes) {
+                auto acc = simd::v_load(o_acc + d);
+                acc = simd::v_fmadd(vp, vload_f32x8(vrow + d), acc);
+                simd::v_store(o_acc + d, acc);
+            }
+            for (; d < Dv; ++d) { o_acc[d] += p * simd::s_load(&vrow[d]); }
+        }
+
+        // ---- store ---------------------------------------------------
+        int64_t d = 0;
+        for (; d + simd::simd_default_lane_f32 <= Dv; d += simd::simd_default_lane_f32) {
+            vstore_f32x8(o_row + d, simd::v_load(o_acc + d));
+        }
+        for (; d < Dv; ++d) { simd::s_store(&o_row[d], o_acc[d]); }
+    };
+
+    ctx.cpu.run(0, NG, run);
+}
+
 }  // anonymous namespace
 
 // =========================================================================
@@ -536,6 +808,14 @@ void attention_flash_impl(const AttentionConfig& cfg,
 // =========================================================================
 
 namespace {
+
+/// Slots a plan must size, matching scratch_slot_count's choice at run time.
+inline int64_t plan_slot_count(int num_threads, bool use_thread_slots, int64_t tasks)
+{
+    const int64_t nt = std::max<int64_t>(num_threads, 1);
+    if (use_thread_slots && nt < tasks) { return nt; }
+    return nt <= 1 ? 1 : tasks;
+}
 
 /// Per-dtype plan resolution, shared by get_attention_plan's dispatch below.
 /// f32 and f16 differ in NR, Kc and element size, exactly as in matmul.
@@ -566,19 +846,32 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
     }
     const int64_t Dv = cfg.v_is_k ? cfg.v_head_dim : Dqk;
 
+    // Decode — one query row and no mask: both products are GEMV, so the
+    // packing-dominated tiled routes are pure overhead. An optional mask
+    // arrives as a rank-0 descriptor and keeps the standard route.
+    const size_t required = cfg.v_is_k ? 2u : 3u;
+    const bool has_mask = inputs.size() > required && inputs[required].rank != 0;
+    plan.use_decode = (Sq == 1) && !has_mask;
+    if (plan.use_decode) {
+        plan.decode_elems = Sk + Dv;   // f32: scores row then output accumulator
+        plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H);
+        plan.workspace_size = static_cast<size_t>(plan.num_slots)
+                            * static_cast<size_t>(plan.decode_elems) * sizeof(float);
+        return plan;
+    }
+
     plan.use_flash = should_use_flash_attention(Sq, Sk);
 
     // Flash path — sized with the same Br/Bc the kernel uses. Slots are
     // per worker thread when thread ids are reported, else per query block.
     if (plan.use_flash) {
         int Br, Bc;
-        resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, Br, Bc);
+        resolve_flash_tile_sizes(sizeof(T), Sq, Sk, Dqk, Dv, cfg.causal, Br, Bc);
         plan.Br = Br;
         plan.Bc = Bc;
         const int64_t per_task = flash_per_task_elems<T>(Br, Bc, Dqk, Dv);
         const int64_t NQ = (Sq + Br - 1) / Br;
-        const int64_t nt  = std::max<int64_t>(num_threads, 1);
-        plan.num_slots = (use_thread_slots && nt < B * H * NQ) ? nt : B * H * NQ;
+        plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H * NQ);
         plan.workspace_size = static_cast<size_t>(plan.num_slots)
                             * static_cast<size_t>(per_task) * sizeof(T);
         return plan;
@@ -610,8 +903,7 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
     const int64_t pack_elems   = static_cast<int64_t>(np_full) * ldd_b_full;
     const int64_t per_head     = scores_elems + pack_elems;
 
-    const int64_t nt = std::max<int64_t>(num_threads, 1);
-    plan.num_slots = (use_thread_slots && nt < B * H) ? nt : B * H;
+    plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H);
     plan.workspace_size = static_cast<size_t>(plan.num_slots)
                         * static_cast<size_t>(per_head) * sizeof(T);
     return plan;
@@ -680,13 +972,17 @@ Status attention_cpu(const AttentionConfig& cfg,
     PoolPtr scratch(plan.workspace_size);
 
     if (dt == DataType::f16) {
-        if (plan.use_flash) {
+        if (plan.use_decode) {
+            attention_decode_impl<half>(cfg, output, inputs, ctx, plan, scratch.as<float>());
+        } else if (plan.use_flash) {
             attention_flash_impl<half>(cfg, output, inputs, ctx, plan, scratch.as<half>());
         } else {
             attention_impl<half>(cfg, output, inputs, ctx, plan, scratch.as<half>());
         }
     } else {
-        if (plan.use_flash) {
+        if (plan.use_decode) {
+            attention_decode_impl<float>(cfg, output, inputs, ctx, plan, scratch.as<float>());
+        } else if (plan.use_flash) {
             attention_flash_impl<float>(cfg, output, inputs, ctx, plan, scratch.as<float>());
         } else {
             attention_impl<float>(cfg, output, inputs, ctx, plan, scratch.as<float>());
