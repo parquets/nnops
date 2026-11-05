@@ -33,8 +33,8 @@ NNOPS_TEST(split_explicit_lengths) {
 
     std::vector<float> b0(static_cast<size_t>(descs[0].numel()));
     std::vector<float> b1(static_cast<size_t>(descs[1].numel()));
-    TensorView outs[] = {test::make_planar(descs[0], b0.data()),
-                         test::make_planar(descs[1], b1.data())};
+    TensorView outs[] = {test::make_channel_first(descs[0], b0.data()),
+                         test::make_channel_first(descs[1], b1.data())};
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(std::span<TensorView>(outs), ins) == Status::ok);
 
@@ -63,7 +63,7 @@ NNOPS_TEST(split_even_and_negative_axis) {
     TensorView outs[3];
     for (int j = 0; j < 3; ++j) {
         b[j].assign(static_cast<size_t>(descs[j].numel()), -1.0f);
-        outs[j] = test::make_planar(descs[j], b[j].data());
+        outs[j] = test::make_channel_first(descs[j], b[j].data());
     }
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(std::span<TensorView>(outs, 3), ins) == Status::ok);
@@ -95,8 +95,8 @@ NNOPS_TEST(split_f16_exact) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     half b0[2], b1[2];
-    TensorView outs[] = {test::make_planar(descs[0], b0),
-                         test::make_planar(descs[1], b1)};
+    TensorView outs[] = {test::make_channel_first(descs[0], b0),
+                         test::make_channel_first(descs[1], b1)};
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(std::span<TensorView>(outs), ins) == Status::ok);
 

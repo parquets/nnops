@@ -5,7 +5,7 @@
 ///   2. auto d = input.desc(); const TensorDesc arr[] = {d};
 ///      auto descs = op->getOutputTensorDesc(arr);
 ///   3. Validate descs[0].rank / dims / layout / dtype
-///   4. Create output via test::make_planar
+///   4. Create output via test::make_channel_first
 ///   5. const TensorView ins[] = {input}; op->compute(out, ins);
 
 #include "nnops/ops/cumsum.hpp"
@@ -34,7 +34,7 @@ NNOPS_TEST(cumsum_1d_inclusive) {
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_data);
+    auto out = test::make_channel_first(descs[0], out_data);
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -66,7 +66,7 @@ NNOPS_TEST(cumsum_1d_exclusive) {
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_data);
+    auto out = test::make_channel_first(descs[0], out_data);
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -97,7 +97,7 @@ NNOPS_TEST(cumsum_1d_reverse) {
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_data);
+    auto out = test::make_channel_first(descs[0], out_data);
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -129,7 +129,7 @@ NNOPS_TEST(cumsum_2d_axis_1) {
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_data);
+    auto out = test::make_channel_first(descs[0], out_data);
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -160,7 +160,7 @@ NNOPS_TEST(cumsum_random) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);

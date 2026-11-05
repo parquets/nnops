@@ -3,7 +3,7 @@
 ///        the two prepacked weight products.
 ///
 /// validate() makes the filter order pair with the activation: a channel-last
-/// activation takes HWIO, PackedHWIO or PackedWinoWeightLast, a planar one any
+/// activation takes HWIO, PackedHWIO or PackedWinoWeightLast, a channel-first one any
 /// other tag (a raw filter, PackedOIHW, or PackedWinoWeight). compute() forces
 /// the implicit-GEMM kernel for three cases whatever the algorithm says — a
 /// quantized (s8) filter, a prepacked im2col filter, and a raw channel-last
@@ -11,10 +11,10 @@
 /// has no U to multiply in the transform domain.
 ///
 /// prepackWeights() produces one of two things: the Winograd U — [pos][OC][IC/G]
-/// for a planar activation, [pos][nb][G·jb][ldd] B panels for a channel-last one,
-/// pos being 16 (F(2,3)) or 36 (F(4,3)) — when asked for Winograd (under Auto,
-/// only for a non-quantized k3s1 filter),
-/// and the im2col route's PackedOIHW/PackedHWIO otherwise. Both are built once at
+/// for a channel-first activation, [pos][nb][G·jb][ldd] B panels for a
+/// channel-last one, pos being 16 (F(2,3)) or 36 (F(4,3)) — when asked for
+/// Winograd (under Auto, only for a non-quantized k3s1 filter), and the im2col
+/// route's PackedOIHW/PackedHWIO otherwise. Both are built once at
 /// load time so compute() reads them in place instead of repacking per call.
 
 #include "nnops/ops/conv2d.hpp"
@@ -189,10 +189,10 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     NNOPS_TRY(detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOrChannelLast)));
+        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast)));
     NNOPS_TRY(detail::require(is_conv_filter_layout(inputs[1].layout)));
     // A raw filter or its prepacked form works on either side (PackedHWIO with a
-    // channel-last activation, PackedOIHW with a planar one), so a graph that
+    // Channel-last activation, PackedOIHW with a channel-first one), so a graph that
     // prepacks unconditionally still validates.
     const TensorLayout wl = inputs[1].layout;
     const bool weight_last = is_channel_last_weight(wl) ||
@@ -400,8 +400,8 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     const int64_t OC  = weight.shape(0);
     const int64_t ICG = weight.shape(1);
 
-    // The transform order is the planar U's leading dimension, exactly as on the
-    // channel-last route; compute() reads it back off the blob.
+    // The transform order is the channel-first U's leading dimension, exactly as
+    // on the channel-last route; compute() reads it back off the blob.
     const backend::cpu::WinoOrder order = pick_order(ICG, OC / attrs_.groups, false);
 
     if (outputs[0].is_empty()) {

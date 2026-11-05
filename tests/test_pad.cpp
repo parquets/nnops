@@ -33,7 +33,7 @@ NNOPS_TEST(pad_constant_1d) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 5);
 
     float out[5] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -60,7 +60,7 @@ NNOPS_TEST(pad_constant_2d_value) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 2);
 
     float out[8] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -83,7 +83,7 @@ NNOPS_TEST(pad_edge) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 5);
 
     float out[5] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -106,7 +106,7 @@ NNOPS_TEST(pad_reflect) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 7);
 
     float out[7] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -130,7 +130,7 @@ NNOPS_TEST(pad_wrap) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 6);
 
     float out[6] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -152,7 +152,7 @@ NNOPS_TEST(pad_negative_crop) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
 
     float out[4] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -177,7 +177,7 @@ NNOPS_TEST(pad_f16_bits_and_int64) {
     const TensorDesc h_arr[] = {hin.desc()};
     auto h_descs = op->getOutputTensorDesc(h_arr);
     half h_out[4];
-    TensorView h_ov = test::make_planar(h_descs[0], h_out);
+    TensorView h_ov = test::make_channel_first(h_descs[0], h_out);
     const TensorView h_ins[] = {hin};
     NNOPS_EXPECT_TRUE(op->compute(h_ov, h_ins) == Status::ok);
 
@@ -197,7 +197,7 @@ NNOPS_TEST(pad_f16_bits_and_int64) {
     const TensorDesc i_arr[] = {iin.desc()};
     auto i_descs = iop->getOutputTensorDesc(i_arr);
     int64_t i_out[4] = {};
-    TensorView i_ov = test::make_planar(i_descs[0], i_out);
+    TensorView i_ov = test::make_channel_first(i_descs[0], i_out);
     const TensorView i_ins[] = {iin};
     NNOPS_EXPECT_TRUE(iop->compute(i_ov, i_ins) == Status::ok);
 

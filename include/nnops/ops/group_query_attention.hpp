@@ -8,7 +8,7 @@
 ///
 ///   scores = Q·Kᵀ·scale (+ mask);  output = softmax(scores, -1)·V
 ///
-/// Inputs, planar only:
+/// Inputs, channel-first only:
 ///   [0] Q [B, Sq, H·D]    or [B, H,   Sq, D]
 ///   [1] K [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
 ///   [2] V [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
@@ -91,7 +91,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::GroupQueryAttention; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const GroupQueryAttentionAttributes& attributes() const noexcept { return attrs_; }
 

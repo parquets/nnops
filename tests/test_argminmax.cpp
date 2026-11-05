@@ -37,7 +37,7 @@ NNOPS_TEST(argmax_1d_basic) {
     NNOPS_EXPECT_EQ(descs[0].rank, 0);  // scalar
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s64);
 
-    auto output = test::make_planar(descs[0], &out_data);
+    auto output = test::make_channel_first(descs[0], &out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -65,7 +65,7 @@ NNOPS_TEST(argmax_1d_with_keepdims) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s64);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -92,7 +92,7 @@ NNOPS_TEST(argmax_2d_axis1) {
     NNOPS_EXPECT_EQ(descs[0].rank, 1);
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -123,7 +123,7 @@ NNOPS_TEST(argmax_3d_axis0) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 2);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -160,7 +160,7 @@ NNOPS_TEST(argmin_1d_basic) {
     NNOPS_EXPECT_EQ(descs[0].rank, 0);  // scalar
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::s64);
 
-    auto output = test::make_planar(descs[0], &out_data);
+    auto output = test::make_channel_first(descs[0], &out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -184,7 +184,7 @@ NNOPS_TEST(argmin_2d_axis1) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -209,7 +209,7 @@ NNOPS_TEST(argmax_random_vs_ref) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<int64_t> out_data(4, -1);
-    auto output = test::make_planar(descs[0], out_data.data());
+    auto output = test::make_channel_first(descs[0], out_data.data());
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -239,7 +239,7 @@ NNOPS_TEST(argmin_random_vs_ref) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<int64_t> out_data(3, -1);
-    auto output = test::make_planar(descs[0], out_data.data());
+    auto output = test::make_channel_first(descs[0], out_data.data());
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -271,7 +271,7 @@ NNOPS_TEST(argmax_class_1d) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto output = test::make_planar(descs[0], &out_data);
+    auto output = test::make_channel_first(descs[0], &out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 
@@ -293,7 +293,7 @@ NNOPS_TEST(argmin_class_1d) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto output = test::make_planar(descs[0], &out_data);
+    auto output = test::make_channel_first(descs[0], &out_data);
     const TensorView ins[] = {in};
     op->compute(output, ins);
 

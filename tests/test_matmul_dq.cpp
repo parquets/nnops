@@ -151,8 +151,8 @@ void expect_dq_matches_ref(const MatMulAttributes& attrs, const TensorDesc& odes
 {
     std::vector<T> got(static_cast<size_t>(odesc.numel()));
     std::vector<T> want(got.size());
-    TensorView output  = test::make_planar(odesc, got.data());
-    TensorView ref_out = test::make_planar(odesc, want.data());
+    TensorView output  = test::make_channel_first(odesc, got.data());
+    TensorView ref_out = test::make_channel_first(odesc, want.data());
 
     auto op = MatMul::create(attrs, Backend::CPU);
     op->compute(output, ins, ctx, nullptr);
@@ -199,7 +199,7 @@ NNOPS_TEST(matmul_dq_exact_f32) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);   // output follows A
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
@@ -230,7 +230,7 @@ NNOPS_TEST(matmul_dq_per_token_scale) {
     auto descs = op->getOutputTensorDesc(arr);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
@@ -766,7 +766,7 @@ NNOPS_TEST(matmul_dq_matches_prequantized_int8) {
     const TensorDesc arr[] = {a_fp.desc(), b.desc()};
     auto descs = dq_op->getOutputTensorDesc(arr);
     std::vector<float> fused(static_cast<size_t>(descs[0].numel()));
-    TensorView fused_out = test::make_planar(descs[0], fused.data());
+    TensorView fused_out = test::make_channel_first(descs[0], fused.data());
     const TensorView ins_fp[] = {a_fp, b};
     dq_op->compute(fused_out, ins_fp, {}, nullptr);
 
@@ -780,7 +780,7 @@ NNOPS_TEST(matmul_dq_matches_prequantized_int8) {
     auto i8_descs = i8_op->getOutputTensorDesc(i8_arr);
     NNOPS_EXPECT_EQ(i8_descs[0].dtype, DataType::s32);
     std::vector<int32_t> acc(static_cast<size_t>(i8_descs[0].numel()));
-    TensorView acc_out = test::make_planar(i8_descs[0], acc.data());
+    TensorView acc_out = test::make_channel_first(i8_descs[0], acc.data());
     const TensorView ins_q[] = {a_q, b};
     i8_op->compute(acc_out, ins_q, {}, nullptr);
 
@@ -819,7 +819,7 @@ NNOPS_TEST(matmul_dq_prequantized_fp_output) {
     auto descs = op->getOutputTensorDesc(arr);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     std::vector<float> got(static_cast<size_t>(descs[0].numel()));
-    TensorView output = test::make_planar(descs[0], got.data());
+    TensorView output = test::make_channel_first(descs[0], got.data());
     const TensorView ins[] = {a_s8, b};
     op->compute(output, ins, {}, nullptr);
 
@@ -830,7 +830,7 @@ NNOPS_TEST(matmul_dq_prequantized_fp_output) {
     const TensorDesc i8_arr[] = {a_s8.desc(), b.desc()};
     auto i8_descs = i8_op->getOutputTensorDesc(i8_arr);
     std::vector<int32_t> acc(static_cast<size_t>(i8_descs[0].numel()));
-    TensorView acc_out = test::make_planar(i8_descs[0], acc.data());
+    TensorView acc_out = test::make_channel_first(i8_descs[0], acc.data());
     i8_op->compute(acc_out, ins, {}, nullptr);
 
     for (int64_t m = 0; m < M; ++m) {

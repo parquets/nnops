@@ -32,7 +32,7 @@ NNOPS_TEST(scatter_elements_axis0) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     float out[6] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -61,7 +61,7 @@ NNOPS_TEST(scatter_elements_add_and_mul) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     float out_add[4] = {};
-    TensorView ov = test::make_planar(descs[0], out_add);
+    TensorView ov = test::make_channel_first(descs[0], out_add);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -76,7 +76,7 @@ NNOPS_TEST(scatter_elements_add_and_mul) {
     auto op_mul = ScatterElements::create(attrs);
 
     float out_mul[4] = {};
-    TensorView ov2 = test::make_planar(descs[0], out_mul);
+    TensorView ov2 = test::make_channel_first(descs[0], out_mul);
     const TensorView ins2[] = {d2, indices, updates};
     NNOPS_EXPECT_TRUE(op_mul->compute(ov2, ins2) == Status::ok);
 
@@ -103,7 +103,7 @@ NNOPS_TEST(scatter_elements_negative_index) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     float out[6] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -135,7 +135,7 @@ NNOPS_TEST(scatter_elements_f16_bits) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     half out[3];
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -162,7 +162,7 @@ NNOPS_TEST(scatter_nd_element) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     float out[4] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -191,7 +191,7 @@ NNOPS_TEST(scatter_nd_slice_add) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     float out[8] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -216,7 +216,7 @@ NNOPS_TEST(scatter_rejects_out_of_range) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     float out[3] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {d, indices, updates};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::invalid_argument);
 
@@ -226,7 +226,7 @@ NNOPS_TEST(scatter_rejects_out_of_range) {
     TensorView indices_nd(i_nd_shape, DataType::s64, idx_nd);
     const TensorDesc in_nd[] = {d.desc(), indices_nd.desc(), updates.desc()};
     auto nd_descs = op_nd->getOutputTensorDesc(in_nd);
-    TensorView ov_nd = test::make_planar(nd_descs[0], out);
+    TensorView ov_nd = test::make_channel_first(nd_descs[0], out);
     const TensorView ins_nd[] = {d, indices_nd, updates};
     NNOPS_EXPECT_TRUE(op_nd->compute(ov_nd, ins_nd) == Status::invalid_argument);
 }

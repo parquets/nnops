@@ -6,7 +6,7 @@
 ///
 /// Indices are s64 or s32 and may be negative, wrapping from the end of the
 /// gathered axis. Data may be f32/f16/s8/u8/s32/s64 — a gather moves elements
-/// without touching them. Planar order.
+/// without touching them. Channel-first order.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -45,7 +45,7 @@ public:
     OpType  getOpType()  const override { return OpType::Gather; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;
@@ -85,7 +85,7 @@ public:
     OpType  getOpType()  const override { return OpType::GatherElements; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;
@@ -125,7 +125,7 @@ public:
     OpType  getOpType()  const override { return OpType::GatherND; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;

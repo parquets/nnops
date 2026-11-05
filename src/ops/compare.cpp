@@ -19,9 +19,9 @@ NNOPS_OP_BOILERPLATE(Logical, LogicalAttributes,
 namespace {
 
 template <size_t N>
-bool all_planar(const TensorDesc* d) {
+bool all_channel_first(const TensorDesc* d) {
     for (size_t i = 0; i < N; ++i) {
-        if (!is_layout_supported(d[i].layout, LayoutSupport::PlanarOnly)) {
+        if (!is_layout_supported(d[i].layout, LayoutSupport::ChannelFirstOnly)) {
             return false;
         }
     }
@@ -60,7 +60,7 @@ Status Compare::validate(std::span<const TensorDesc> inputs,
         return Status::unsupported;
     }
     if (outputs[0].dtype != DataType::u8) { return Status::invalid_argument; }
-    if (!all_planar<2>(inputs.data())) { return Status::unsupported; }
+    if (!all_channel_first<2>(inputs.data())) { return Status::unsupported; }
 
     return detail::require(broadcast_compatible(
         std::span<const int64_t>(a.dims.data(), static_cast<size_t>(a.rank)),
@@ -112,7 +112,7 @@ Status Logical::validate(std::span<const TensorDesc> inputs,
     }
     if (outputs[0].dtype != DataType::u8) { return Status::invalid_argument; }
     for (size_t i = 0; i < n_in; ++i) {
-        if (!is_layout_supported(inputs[i].layout, LayoutSupport::PlanarOnly)) {
+        if (!is_layout_supported(inputs[i].layout, LayoutSupport::ChannelFirstOnly)) {
             return Status::unsupported;
         }
     }

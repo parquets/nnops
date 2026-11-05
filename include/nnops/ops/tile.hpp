@@ -5,7 +5,7 @@
 /// Tile repeats each axis `repeats[d]` times, so out.dims = in.dims * repeats.
 /// Expand broadcasts the input to a target shape under NumPy rules: the target
 /// is right-aligned, a size-1 (or missing) input axis repeats, and every other
-/// axis must match the target exactly. Both are element copies. Planar.
+/// axis must match the target exactly. Both are element copies. Channel-first.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -44,7 +44,7 @@ public:
     OpType  getOpType()  const override { return OpType::Tile; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;
@@ -83,7 +83,7 @@ public:
     OpType  getOpType()  const override { return OpType::Expand; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;

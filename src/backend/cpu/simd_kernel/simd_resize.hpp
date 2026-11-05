@@ -1,8 +1,8 @@
 #pragma once
 /// @file simd_resize.hpp
-/// @brief CPU kernels for 2D/3D spatial resize, planar and channel-last.
+/// @brief CPU kernels for 2D/3D spatial resize, channel-first and channel-last.
 ///
-/// Planar walks one channel plane and evaluates scalar output pixels; the
+/// Channel-first walks one channel plane and evaluates scalar output pixels; the
 /// channel-last kernels put the SIMD lane on C, so a pixel's whole channel
 /// vector interpolates with v_fmadd and only the C tail runs scalar.
 ///
@@ -53,11 +53,11 @@ inline float resize_compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t
 }
 
 // ============================================================
-// Planar (NCHW/NCDHW): scalar over W inside one channel plane
+// Channel-first: scalar over W inside one channel plane
 // ============================================================
 
 template <typename T>
-void resize_planar_2d(
+void resize_channel_first_2d(
     T* out, const T* in,
     int64_t OH, int64_t OW,
     const int64_t* y0, const int64_t* y1, const float* wy,
@@ -94,7 +94,7 @@ void resize_planar_2d(
 }
 
 template <typename T>
-void resize_planar_3d(
+void resize_channel_first_3d(
     T* out, const T* in,
     int64_t OD, int64_t OH, int64_t OW,
     const int64_t* z0, const int64_t* z1, const float* wz,
@@ -156,7 +156,7 @@ void resize_planar_3d(
 }
 
 // ============================================================
-// Channel-last (NHWC/NDHWC): the SIMD lane spans C
+// Channel-last: the SIMD lane spans C
 // ============================================================
 
 /// Interpolate one output pixel: `dst[c] = w_y0*(w_x0*a0[c] + w_x*a1[c]) +

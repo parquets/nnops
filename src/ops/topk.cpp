@@ -88,7 +88,7 @@ Status TopK::validate(std::span<const TensorDesc> inputs,
     }
 
     return detail::require(
-        is_layout_supported(in.layout, LayoutSupport::PlanarOnly));
+        is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly));
 }
 
 Status TopK::compute(std::span<TensorView> outputs,

@@ -106,7 +106,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::MatMul; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const MatMulAttributes& attributes() const noexcept { return attrs_; }
 

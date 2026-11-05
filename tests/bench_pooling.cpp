@@ -1,6 +1,6 @@
 /// @file bench_pooling.cpp
 /// @brief Global pooling micro-benchmark: the whole-plane scan against the two
-///        routes it replaced, plus an NCHW-vs-NHWC layout comparison.
+///        routes it replaced, plus a channel-first-vs-channel-last layout comparison.
 ///
 /// Three arms over the same input, interleaved inside one process so the
 /// numbers share an instrument:
@@ -16,9 +16,9 @@
 /// backbone plane to show what the scan does when it is not dwarfed by dispatch.
 ///
 /// The layouts bench holds shape and kernel fixed and varies only the memory
-/// order: NCHW keeps a plane contiguous along W, NHWC along C. It times the
-/// same two modes in each layout — the global mean and a 3x3 stride-2 max — and
-/// a null re-run of NCHW reports instrument drift.
+/// order: channel-first keeps a plane contiguous along W, channel-last along C.
+/// It times the same two modes in each layout — the global mean and a 3x3
+/// stride-2 max — and a null re-run of channel-first reports instrument drift.
 ///
 /// `NNOPS_BENCH_THREADS=1` (or "1,4") pins the ladder, as in the other benches.
 
@@ -138,7 +138,7 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
               int iters)
 {
     const int64_t shape[] = {c.N, c.C, c.H, c.W};
-    auto [in_vec, in_nchw] = make_random<T>(shape, 1);
+    auto [in_vec, in_channel_first] = make_random<T>(shape, 1);
 
     auto make_arm = [&](bool global) {
         PoolingAttributes attrs;
@@ -150,7 +150,7 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
             attrs.padding = {0, 0, 0};
         }
         auto op = Pooling::create(attrs, Backend::CPU);
-        TensorDesc d = in_nchw.desc();
+        TensorDesc d = in_channel_first.desc();
         const TensorDesc ins[] = {d};
         auto descs = op->getOutputTensorDesc(ins);
         return std::pair{std::move(op), std::move(descs)};
@@ -158,23 +158,23 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
 
     auto [global_op, global_desc] = make_arm(/*global=*/true);
     auto [window_op, window_desc] = make_arm(/*global=*/false);
-    const TensorView& x = in_nchw;
+    const TensorView& x = in_channel_first;
 
     std::vector<T> g_buf(static_cast<size_t>(global_desc[0].numel()));
     std::vector<T> w_buf(static_cast<size_t>(window_desc[0].numel()));
-    auto g_out = test::make_planar(global_desc[0], g_buf.data());
-    auto w_out = test::make_planar(window_desc[0], w_buf.data());
+    auto g_out = test::make_channel_first(global_desc[0], g_buf.data());
+    auto w_out = test::make_channel_first(window_desc[0], w_buf.data());
 
     // Axes are rank-relative: the input is [N,C,H,W], so W is 3 and H is 2.
     auto reduce_w = Reduce::create(ReduceAttributes{ReduceType::Mean, 3, true}, Backend::CPU);
     auto reduce_h = Reduce::create(ReduceAttributes{ReduceType::Mean, 2, true}, Backend::CPU);
-    TensorDesc rd = in_nchw.desc();
+    TensorDesc rd = in_channel_first.desc();
     const TensorDesc r_in[] = {rd};
     auto mid_desc = reduce_w->getOutputTensorDesc(r_in);
     std::vector<T> mid_buf(static_cast<size_t>(mid_desc[0].numel()));
-    auto mid = test::make_planar(mid_desc[0], mid_buf.data());
+    auto mid = test::make_channel_first(mid_desc[0], mid_buf.data());
     std::vector<T> r_buf(static_cast<size_t>(c.N * c.C));
-    auto r_out = test::make_planar(global_desc[0], r_buf.data());
+    auto r_out = test::make_channel_first(global_desc[0], r_buf.data());
 
     std::printf("  %-34s [%lld,%lld,%lld,%lld] %s\n", c.name, (long long)c.N,
                 (long long)c.C, (long long)c.H, (long long)c.W,
@@ -191,7 +191,7 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
 
         const TensorView g_ins[] = {x};
         const TensorView w_ins[] = {x};
-        const TensorView r_ins[] = {in_nchw};
+        const TensorView r_ins[] = {in_channel_first};
         const TensorView mid_ins[] = {mid};
         TensorView g_outs[] = {g_out};
         TensorView w_outs[] = {w_out};
@@ -212,7 +212,7 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
 
         // Every arm has to agree with a host-side mean, not just with each
         // other: a compute that writes nothing would otherwise time as a win.
-        // The output is planar, one pixel per channel.
+        // The output is channel-first, one pixel per channel.
         if (nt == threads.front()) {
             const double tol = c.f16 ? 2e-3 : 1e-4;  // f16 lanes round over the walk
             auto worst = [&](const std::vector<T>& a, const T* want, size_t n) {
@@ -231,7 +231,7 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
                 return d;
             };
 
-            // Ground truth: the mean of each channel plane of the planar input.
+            // Ground truth: the mean of each channel plane of the channel-first input.
             std::vector<T> want(static_cast<size_t>(c.N * c.C));
             const int64_t plane = c.H * c.W;
             for (int64_t ch = 0; ch < c.N * c.C; ++ch) {
@@ -268,7 +268,7 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
 }
 
 // ============================================================
-// Layouts: NHWC against NCHW
+// Layouts: channel-last against channel-first
 // ============================================================
 
 struct LayoutCase {
@@ -283,15 +283,15 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
 {
     constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
     const int64_t shape[] = {1, c.C, c.H, c.W};
-    auto [in_vec, in_nchw] = make_random<T>(shape, 11);
+    auto [in_vec, in_channel_first] = make_random<T>(shape, 11);
 
-    // NHWC: all C channels dense per pixel.
+    // Channel-last: all C channels dense per pixel.
     auto cl_vec = test::to_channel_last<T>(
         std::span<const T>(in_vec.data(), in_vec.size()), 1, c.C, c.H * c.W);
     TensorView in_cl(shape, dt, cl_vec.data(), TensorLayout::NHWC);
 
-    const TensorView* ins[2] = {&in_nchw, &in_cl};
-    const char* const names[2] = {"NCHW", "NHWC"};
+    const TensorView* ins[2] = {&in_channel_first, &in_cl};
+    const char* const names[2] = {"ChannelFirst", "ChannelLast"};
 
     struct Arm {
         TensorView in;
@@ -310,7 +310,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
             auto od = arms[i].op->getOutputTensorDesc(ad);
             const int64_t storage = od[0].storage_bytes() / static_cast<int64_t>(sizeof(T));
             arms[i].buf.assign(static_cast<size_t>(std::max(od[0].numel(), storage)), T{});
-            arms[i].out = test::make_planar(od[0], arms[i].buf.data());
+            arms[i].out = test::make_channel_first(od[0], arms[i].buf.data());
         }
         return arms;
     };
@@ -330,7 +330,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
     auto max_arms = make_mode(max_attrs);
     const char* const mode_names[2] = {"avg (global)", "max 3x3 s2"};
 
-    // Ground truth: the plane's mean and max on the host from the planar input;
+    // Ground truth: the plane's mean and max on the host from the channel-first input;
     // every arm of every mode has to land on these.
     const int64_t plane = c.H * c.W;
     std::vector<T> want_avg(static_cast<size_t>(c.C));
@@ -344,7 +344,7 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
                       static_cast<float>(sum / static_cast<double>(plane)));
     }
 
-    // The window reference: the planar max over a 3x3 stride-2 padded window.
+    // The window reference: the channel-first max over a 3x3 stride-2 padded window.
     const int64_t OH = (c.H + 2 - 3) / 2 + 1;
     const int64_t OW = (c.W + 2 - 3) / 2 + 1;
     std::vector<T> want_max(static_cast<size_t>(c.C * OH * OW));
@@ -431,8 +431,8 @@ void run_layout_case(const LayoutCase& c, const std::vector<int>& threads,
             const double tc = median(cl);
             const double null_gap = (median(a2) / tp - 1.0) * 100.0;
 
-            std::printf("    %-12s %2dT  NCHW %8.2f us | NHWC %8.2f us"
-                        " | planar/nhwc %5.2fx  (null %+4.1f%%)\n",
+            std::printf("    %-12s %2dT  channel-first %8.2f us | channel-last %8.2f us"
+                        " | channel-first/channel_last %5.2fx  (null %+4.1f%%)\n",
                         mode_names[m], nt, tp, tc, tp / tc, null_gap);
         }
     }
@@ -473,7 +473,7 @@ NNOPS_BENCH(pooling_layouts) {
     const int rounds = 5;
     const int iters = 50;
 
-    std::printf("pooling layouts: NCHW against NHWC over one shape and kernel\n");
+    std::printf("pooling layouts: channel-first against channel-last over one shape and kernel\n");
     std::printf("  pool=%s threads=", nnops::test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");

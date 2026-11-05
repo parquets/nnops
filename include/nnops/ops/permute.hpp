@@ -3,7 +3,7 @@
 /// @brief Permute operator — dimension reordering (transpose).
 ///
 /// Equivalent to `np.transpose()` / `torch.permute()`, with
-/// output.shape[i] = input.shape[perm[i]]. Planar layout only; packed layouts
+/// output.shape[i] = input.shape[perm[i]]. Channel-first layout only; packed layouts
 /// must go through LayoutConvert first.
 
 #include "nnops/core/op_base.hpp"
@@ -48,7 +48,7 @@ public:
     Backend getBackend() const override { return backend_; }
 
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     const PermuteAttributes& attributes() const noexcept { return attrs_; }

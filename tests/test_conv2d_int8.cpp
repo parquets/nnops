@@ -268,7 +268,7 @@ void seed_output(std::vector<uint8_t>& buf, DataType dt, uint64_t seed) {
     }
 }
 
-/// make_planar, keeping the quant params an integer destination needs.
+/// make_channel_first, keeping the quant params an integer destination needs.
 /// @p pitch_elems is 0 for a dense run, else the padded row stride.
 TensorView make_out_view(const TensorDesc& desc, void* data, const QuantParams& qp,
                          int64_t pitch_elems = 0) {
@@ -310,7 +310,7 @@ Result run_route(const Case& c, const ComputeContext& ctx, bool reference) {
     const OutPlan op_layout = out_plan(outs[0], c);
     r.buf.assign(op_layout.bytes, 0);
     seed_output(r.buf, outs[0].dtype, c.seed + 3);
-    // make_planar would drop the QuantParams an integer requant needs.
+    // make_channel_first would drop the QuantParams an integer requant needs.
     auto out = make_out_view(outs[0], r.buf.data(), f.out_q, op_layout.pitch);
 
     if (reference) {
@@ -440,7 +440,7 @@ NNOPS_TEST(conv2d_i8_hand_exact) {
     NNOPS_EXPECT_EQ(outs[0].dims[3], 2);
 
     std::vector<float> out_buf(4, 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
 
@@ -1178,7 +1178,7 @@ NNOPS_TEST(conv2d_i8_output_desc) {
 
 NNOPS_TEST(conv2d_i8_pitched_output) {
     // A destination whose rows are 32-byte aligned has a row pitch wider than
-    // OW. The planar GEMM's N axis is an oh-block's rows flattened into one
+    // OW. The channel-first GEMM's N axis is an oh-block's rows flattened into one
     // contiguous run, so the plan pins oh_block to one row for a pitched
     // destination; the values must stay bit-identical to the reference, which
     // honors the pitch, and the row tail must keep its seed.
@@ -1437,7 +1437,7 @@ NNOPS_TEST(conv2d_i8_vs_fp_path) {
     const TensorDesc qdescs[] = {in_q.desc(), w_q.desc()};
     auto qouts = op_q->getOutputTensorDesc(qdescs);
     std::vector<float> qbuf(static_cast<size_t>(qouts[0].numel()), 0.0f);
-    auto qout = test::make_planar(qouts[0], qbuf.data());
+    auto qout = test::make_channel_first(qouts[0], qbuf.data());
     const TensorView qins[] = {in_q, w_q};
     op_q->compute(qout, qins);
 
@@ -1445,7 +1445,7 @@ NNOPS_TEST(conv2d_i8_vs_fp_path) {
     TensorView in_f(ishape, DataType::f32, adq.data());
     TensorView w_f(wshape, DataType::f32, wdq.data());
     std::vector<float> fbuf(static_cast<size_t>(qouts[0].numel()), 0.0f);
-    auto fout = test::make_planar(qouts[0], fbuf.data());
+    auto fout = test::make_channel_first(qouts[0], fbuf.data());
     const TensorView fins[] = {in_f, w_f};
     auto op_f = Conv2D::create(attrs, Backend::CPU);
     op_f->compute(fout, fins);
@@ -1466,7 +1466,7 @@ NNOPS_TEST(conv2d_i8_vs_fp_path) {
 }  // namespace
 
 // ============================================================
-// The prepacked filter — Conv2D::prepackWeights on the planar int8 route
+// The prepacked filter — Conv2D::prepackWeights on the channel-first int8 route
 // ============================================================
 
 NNOPS_TEST(conv2d_i8_prepacked_filter) {

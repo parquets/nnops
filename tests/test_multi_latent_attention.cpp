@@ -142,11 +142,11 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     }
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
     op->compute(fast_out, ins, {}, nullptr);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::multi_latent_attention_ref(attrs, ref_out, ins, {}, nullptr);
 
     for (int64_t i = 0; i < out_numel; ++i) {
@@ -365,7 +365,7 @@ NNOPS_TEST(mla_f16_matches_ref) {
         const int64_t n = out_desc.numel();
 
         std::vector<float> ref_buf(static_cast<size_t>(n));
-        auto ref_out = test::make_planar(out_desc, ref_buf.data());
+        auto ref_out = test::make_channel_first(out_desc, ref_buf.data());
         nnops::backend::cpu::reference::multi_latent_attention_ref(attrs, ref_out, ins32, {}, nullptr);
 
         auto q16v  = test::f32_to_f16(q32v);
@@ -378,7 +378,7 @@ NNOPS_TEST(mla_f16_matches_ref) {
         const TensorDesc fdescs[] = {q16.desc(), kv16.desc()};
         const auto fout_desc = op->getOutputTensorDesc(fdescs)[0];
         std::vector<cpu::half> got_buf(static_cast<size_t>(n));
-        auto got = test::make_planar(fout_desc, got_buf.data());
+        auto got = test::make_channel_first(fout_desc, got_buf.data());
         const TensorView ins16[] = {q16, kv16};
         NNOPS_EXPECT_TRUE(op->compute(got, ins16) == Status::ok);
 

@@ -116,7 +116,7 @@ public:
     Backend getBackend() const override { return backend_; }
 
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     const RoPEAttributes& attributes() const noexcept { return attrs_; }

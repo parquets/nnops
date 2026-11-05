@@ -58,7 +58,7 @@ inline bool same_shape(const TensorView& a, const TensorView& b)
 /// Generic NumPy-broadcast loop: one odometer over the output's logical index
 /// space, three running element offsets (a, b, out). Amortized one increment
 /// per element, and no division inside the loop; the strides carry the layout,
-/// so planar and channel-last need no separate code.
+/// so channel-first and channel-last need no separate code.
 template <typename T, typename F>
 void broadcast_loop(const TensorView& a, const TensorView& b, TensorView& out,
                     const ComputeContext& ctx, F&& op, bool add_to)

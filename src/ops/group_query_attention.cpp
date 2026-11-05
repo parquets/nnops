@@ -1,7 +1,7 @@
 /// @file group_query_attention.cpp
 /// @brief GroupQueryAttention operator dispatch.
 ///
-/// Q, K, V [, mask] in f32 or f16, planar, merged [B, S, H*D] or explicit
+/// Q, K, V [, mask] in f32 or f16, channel-first, merged [B, S, H*D] or explicit
 /// [B, H, S, D]. K and V carry kv_num_heads heads, so their rows are
 /// H_kv*D wide; query head h reads kv head h / (H / H_kv). Everything below
 /// the attribute copy is the shared CPU attention core.
@@ -45,7 +45,7 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
 {
     // Q, K, V [, mask [, past K, past V]]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 6, 1));
-    if (!is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly)) {
+    if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
 

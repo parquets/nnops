@@ -11,7 +11,7 @@
 /// 2D [V, D] weight (axis 0 is the vocab entry, so it is the same thing);
 /// PerTensor is rejected.
 ///
-/// Planar only — pack/unpack with LayoutConvert first.
+/// Channel-first only — pack/unpack with LayoutConvert first.
 ///
 ///   inputs[0] weight   [V, D]       f32 | f16 | s8 | u8
 ///   inputs[1] indices  [...]        s64 | s32
@@ -61,7 +61,7 @@ public:
     Backend getBackend() const override { return backend_; }
 
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     const EmbedAttributes& attributes() const noexcept { return attrs_; }

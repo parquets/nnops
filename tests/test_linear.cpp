@@ -188,7 +188,7 @@ NNOPS_TEST(linear_basic) {
         out_numel *= descs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -237,7 +237,7 @@ NNOPS_TEST(linear_with_bias) {
         out_numel *= descs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight, bias};
     op->compute(out, ins);

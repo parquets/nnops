@@ -6,9 +6,9 @@
 /// log(sum) instead. A temperature T divides the max-shifted logits by T
 /// (equivalently softmax(x/T)). Quantized input (s8/u8) is dequantized to f32,
 /// softmax runs in f32, and the output is float — probabilities are never
-/// re-quantized; quantized input is planar and PerTensor/PerToken only.
+/// re-quantized; quantized input is channel-first and PerTensor/PerToken only.
 ///
-/// Two layout families: planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC).
+/// Two layout families: channel-first and channel-last.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -64,7 +64,7 @@ public:
 
     /// Both regular activation families; channel-packed layouts are refused.
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOrChannelLast;
+        return LayoutSupport::ChannelFirstOrChannelLast;
     }
 
     const SoftmaxAttributes& attributes() const noexcept { return attrs_; }

@@ -1,10 +1,10 @@
 /// @file test_softmax.cpp
 /// @brief Softmax operator tests (CPU, class API): softmax and log-softmax
-///        along an axis, temperature, f16, both regular layouts (planar NCHW and
-///        channel-last NHWC) and quantized input.
+///        along an axis, temperature, f16, both regular layouts (channel-first and
+///        channel-last) and quantized input.
 ///
 /// The layout tests run every axis of a 4-D tensor against a reference that
-/// walks the same physical indexing (planar [N][C][H][W], channel-last
+/// walks the same physical indexing (channel-first [N][C][H][W], channel-last
 /// [N][H][W][C]) in its own code, so an axis handled through the wrong stride
 /// cannot pass. Padded row pitch and channel-packed rejection are covered too.
 ///
@@ -43,7 +43,7 @@ NNOPS_TEST(softmax_last_axis) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -79,7 +79,7 @@ NNOPS_TEST(softmax_2d_axis_1) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -116,7 +116,7 @@ NNOPS_TEST(softmax_log_softmax) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -147,7 +147,7 @@ NNOPS_TEST(softmax_random) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -163,7 +163,7 @@ NNOPS_TEST(softmax_random) {
 }
 
 // ============================================================
-// Layout coverage — planar NCHW and channel-last NHWC
+// Layout coverage — channel-first and channel-last
 // ============================================================
 //
 // Both families keep the logical dims [N][C][H][W]; only the physical order
@@ -246,7 +246,7 @@ static void check_all_axes(std::vector<float>& in, const int64_t dims[4],
     }
 }
 
-NNOPS_TEST(softmax_planar_all_axes) {
+NNOPS_TEST(softmax_channel_first_all_axes) {
     const int64_t dims[4] = {2, 3, 4, 5};
     const int64_t C = dims[1], H = dims[2], W = dims[3];
 
@@ -259,7 +259,7 @@ NNOPS_TEST(softmax_planar_all_axes) {
                    });
 }
 
-NNOPS_TEST(softmax_nhwc_all_axes) {
+NNOPS_TEST(softmax_channel_last_all_axes) {
     // The strided path lanes across channels, so C = 5 is a partial vector and
     // C = 12 is a full one plus a half; the channel axis itself is a channel-last
     // row, whose own tail is the last group's.
@@ -277,7 +277,7 @@ NNOPS_TEST(softmax_nhwc_all_axes) {
     }
 }
 
-NNOPS_TEST(softmax_nhwc_2d_channel) {
+NNOPS_TEST(softmax_channel_last_2d_channel) {
     // Rank-2 channel-last is still [N][C]: axis 1 is one contiguous pixel.
     const int64_t N = 3, C = 5;
     const int64_t shape[] = {N, C};
@@ -308,7 +308,7 @@ NNOPS_TEST(softmax_nhwc_2d_channel) {
     }
 }
 
-NNOPS_TEST(softmax_nhwc_channel_axis_f16) {
+NNOPS_TEST(softmax_channel_last_channel_axis_f16) {
     const int64_t N = 1, C = 10, H = 2, W = 2;
     const int64_t shape[] = {N, C, H, W};
 
@@ -351,7 +351,7 @@ NNOPS_TEST(softmax_nhwc_channel_axis_f16) {
     }
 }
 
-NNOPS_TEST(softmax_planar_pitched_rows) {
+NNOPS_TEST(softmax_channel_first_pitched_rows) {
     // A pitch one 32-byte step past the dense row. The last-axis path addresses
     // whole rows; the strided path may only lane across dims that stay inside
     // one row. The padding doubles as an overrun detector.
@@ -442,7 +442,7 @@ NNOPS_TEST(softmax_temperature_basic) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -475,7 +475,7 @@ NNOPS_TEST(softmax_temperature_sharper) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -510,7 +510,7 @@ NNOPS_TEST(softmax_temperature_equals_one) {
     auto descs = op_default->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_default(2);
-    TensorView output_default = nnops::test::make_planar(descs[0], out_default.data());
+    TensorView output_default = nnops::test::make_channel_first(descs[0], out_default.data());
     const TensorView ins[] = {input};
     op_default->compute(output_default, ins);
 
@@ -519,7 +519,7 @@ NNOPS_TEST(softmax_temperature_equals_one) {
     auto op_t1 = Softmax::create(attrs_t1, Backend::CPU);
 
     std::vector<float> out_t1(2);
-    TensorView output_t1 = nnops::test::make_planar(descs[0], out_t1.data());
+    TensorView output_t1 = nnops::test::make_channel_first(descs[0], out_t1.data());
     op_t1->compute(output_t1, ins);
 
     NNOPS_EXPECT_NEAR(out_t1[0], out_default[0], 1e-6f);
@@ -542,7 +542,7 @@ NNOPS_TEST(softmax_temperature_log) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(3);
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -574,7 +574,7 @@ NNOPS_TEST(softmax_temperature_random_2d) {
         auto descs = op->getOutputTensorDesc(in_arr);
 
         std::vector<float> out_buf(descs[0].numel());
-        TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+        TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
         const TensorView ins[] = {input};
         op->compute(output, ins);
@@ -590,7 +590,7 @@ NNOPS_TEST(softmax_temperature_random_2d) {
     }
 }
 
-NNOPS_TEST(softmax_nchw_axis_first) {
+NNOPS_TEST(softmax_channel_first_axis_first) {
     const int64_t shape[] = {3, 4, 2, 2};
     const int64_t N = 3, C = 4, H = 2, W = 2;
     const int64_t total = N * C * H * W;  // 48
@@ -644,7 +644,7 @@ NNOPS_TEST(softmax_random_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins);
@@ -682,7 +682,7 @@ NNOPS_TEST(softmax_quant_s8_per_tensor) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins, {}, nullptr);
@@ -711,7 +711,7 @@ NNOPS_TEST(softmax_quant_u8_per_tensor) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins, {}, nullptr);
@@ -743,7 +743,7 @@ NNOPS_TEST(softmax_quant_s8_per_token) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(descs[0].numel());
-    TensorView output = nnops::test::make_planar(descs[0], out_buf.data());
+    TensorView output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(output, ins, {}, nullptr);

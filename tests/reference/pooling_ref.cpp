@@ -1,5 +1,5 @@
 /// @file pooling_ref.cpp
-/// @brief Naive CPU reference for 2D/3D spatial pooling, planar NCHW/NCDHW.
+/// @brief Naive CPU reference for 2D/3D spatial pooling, channel-first.
 ///
 /// f32 and f16 pool in fp32, loading and storing through the dtype-overloaded
 /// s_load/s_store. s8/u8 dequantize on load, pool in float and requantize on
@@ -26,8 +26,8 @@ using nnops::simd::s_store;
 
 namespace {
 
-/// Planar (n, c, d, h, w) -> flat offset; row_stride is the padded row pitch.
-inline int64_t nchw_offset(int64_t n, int64_t c,
+/// Channel-first (n, c, d, h, w) -> flat offset; row_stride is the padded row pitch.
+inline int64_t channel_first_offset(int64_t n, int64_t c,
                            int64_t d, int64_t h, int64_t w,
                            int64_t C, int64_t D, int64_t H,
                            int64_t row_stride) {
@@ -114,7 +114,7 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                     for (int64_t id = d0; id < d1; ++id) {
                     for (int64_t ih = h0; ih < h1; ++ih) {
                     for (int64_t iw = w0; iw < w1; ++iw) {
-                        const int64_t in_idx = nchw_offset(
+                        const int64_t in_idx = channel_first_offset(
                             n, c, id, ih, iw, C, ID, IH, in_row_stride);
                         max_val = std::max(max_val, s_load(&in_ptr[in_idx]));
                     }}}
@@ -124,14 +124,14 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                     for (int64_t id = d0; id < d1; ++id) {
                     for (int64_t ih = h0; ih < h1; ++ih) {
                     for (int64_t iw = w0; iw < w1; ++iw) {
-                        const int64_t in_idx = nchw_offset(
+                        const int64_t in_idx = channel_first_offset(
                             n, c, id, ih, iw, C, ID, IH, in_row_stride);
                         sum += s_load(&in_ptr[in_idx]);
                     }}}
                     result = sum / static_cast<float>((d1 - d0) * (h1 - h0) *
                                                       (w1 - w0));
                 }
-                const int64_t out_idx = nchw_offset(
+                const int64_t out_idx = channel_first_offset(
                     n, c, od, oh, ow, C, OD, OH, out_row_stride);
                 if (attrs.add_to) {
                     s_store(&out_ptr[out_idx],
@@ -162,7 +162,7 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                     const int64_t iw = ow * SW + kw - PW;
                     if (iw < 0 || iw >= IW) { continue; }
                     const int64_t in_idx =
-                        nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
+                        channel_first_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                     max_val = std::max(max_val, s_load(&in_ptr[in_idx]));
                     any = true;
                 }}}
@@ -184,7 +184,7 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                         continue;
                     }
                     const int64_t in_idx =
-                        nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
+                        channel_first_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                     sum += s_load(&in_ptr[in_idx]);
                 }}}
                 if (attrs.exclude_pad) {
@@ -198,7 +198,7 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
             }
 
             const int64_t out_idx =
-                nchw_offset(n, c, od, oh, ow, C, OD, OH, out_row_stride);
+                channel_first_offset(n, c, od, oh, ow, C, OD, OH, out_row_stride);
             if (attrs.add_to) {
                 s_store(&out_ptr[out_idx], s_load(&out_ptr[out_idx]) + result);
             } else {
@@ -289,7 +289,7 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
                     const int64_t iw = ow * SW + kw - PW;
                     if (iw < 0 || iw >= IW) { continue; }
                     const int64_t in_idx =
-                        nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
+                        channel_first_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                     const float x =
                         (static_cast<float>(in_ptr[in_idx]) - in_zero) * in_scale;
                     max_val = std::max(max_val, x);
@@ -313,7 +313,7 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
                         continue;
                     }
                     const int64_t in_idx =
-                        nchw_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
+                        channel_first_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
                     sum += (static_cast<float>(in_ptr[in_idx]) - in_zero) * in_scale;
                 }}}
                 if (attrs.exclude_pad) {
@@ -327,7 +327,7 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
             }
 
             const int64_t out_idx =
-                nchw_offset(n, c, od, oh, ow, C, OD, OH, out_row_stride);
+                channel_first_offset(n, c, od, oh, ow, C, OD, OH, out_row_stride);
             if (attrs.add_to) {
                 const float existing =
                     (static_cast<float>(out_ptr[out_idx]) - out_zero) * out_scale;

@@ -50,7 +50,7 @@ NNOPS_TEST(embed_basic) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(6);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -80,7 +80,7 @@ NNOPS_TEST(embed_out_of_bounds) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(4);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -110,7 +110,7 @@ NNOPS_TEST(embed_random_f32) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], D);
 
     std::vector<float> out_buf(static_cast<size_t>(N * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -150,7 +150,7 @@ NNOPS_TEST(embed_random_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(N * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -182,7 +182,7 @@ NNOPS_TEST(embed_batch_indices) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], D);
 
     std::vector<float> out_buf(static_cast<size_t>(B * S * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -216,7 +216,7 @@ NNOPS_TEST(embed_zero_dim) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 1);
 
     float out_buf[2] = {};
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -262,7 +262,7 @@ NNOPS_TEST(embed_class_api) {
         auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
         const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
         auto descs = op->getOutputTensorDesc(in_arr);
-        TensorView output = test::make_planar(descs[0], out_class.data());
+        TensorView output = test::make_channel_first(descs[0], out_class.data());
         const TensorView ins[] = {weight, indices};
         op->compute(output, ins);
     }
@@ -272,7 +272,7 @@ NNOPS_TEST(embed_class_api) {
         auto op = Embed::create(EmbedAttributes{}, Backend::CPU);
         const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
         auto descs = op->getOutputTensorDesc(in_arr);
-        TensorView output = test::make_planar(descs[0], out_func.data());
+        TensorView output = test::make_channel_first(descs[0], out_func.data());
         const TensorView ins[] = {weight, indices};
         op->compute(output, ins);
     }
@@ -306,7 +306,7 @@ NNOPS_TEST(embed_int8_per_token_f32) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(3 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -350,7 +350,7 @@ NNOPS_TEST(embed_int8_with_zero_point) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(2 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -388,7 +388,7 @@ NNOPS_TEST(embed_int8_per_channel_f32) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(3 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -434,7 +434,7 @@ NNOPS_TEST(embed_uint8_per_channel_zp) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(2 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -475,7 +475,7 @@ NNOPS_TEST(embed_int8_output_f16) {
 
     using nnops::backend::cpu::half;
     std::vector<half> out_buf(static_cast<size_t>(2 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins, {}, nullptr);
@@ -513,7 +513,7 @@ NNOPS_TEST(embed_int8_out_of_bounds) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(2 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -546,7 +546,7 @@ NNOPS_TEST(embed_int8_uint8_weight) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(2 * D));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {weight, indices};
     op->compute(output, ins);
 
@@ -579,12 +579,12 @@ NNOPS_TEST(embed_int8_class_api) {
     const TensorDesc in_arr[] = {weight.desc(), indices.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
     std::vector<float> out_class(static_cast<size_t>(descs[0].numel()));
-    TensorView out1 = test::make_planar(descs[0], out_class.data());
+    TensorView out1 = test::make_channel_first(descs[0], out_class.data());
     const TensorView ins1[] = {weight, indices};
     op->compute(out1, ins1);
 
     std::vector<float> out_func(static_cast<size_t>(descs[0].numel()));
-    TensorView out2 = test::make_planar(descs[0], out_func.data());
+    TensorView out2 = test::make_channel_first(descs[0], out_func.data());
     op->compute(out2, ins1);
 
     for (size_t i = 0; i < out_class.size(); ++i) {

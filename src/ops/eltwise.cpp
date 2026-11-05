@@ -32,8 +32,8 @@ Status Eltwise::validate(std::span<const TensorDesc> inputs,
         return Status::invalid_argument;
     }
     // A packed or prepacked tag describes a filter, never an activation.
-    if (!(is_planar_spatial(a.layout) || is_channel_last(a.layout)) ||
-        !(is_planar_spatial(b.layout) || is_channel_last(b.layout))) {
+    if (!(is_channel_first_spatial(a.layout) || is_channel_last(a.layout)) ||
+        !(is_channel_first_spatial(b.layout) || is_channel_last(b.layout))) {
         return Status::invalid_argument;
     }
     return detail::require(broadcast_compatible(

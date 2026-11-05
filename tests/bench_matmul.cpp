@@ -249,7 +249,7 @@ GeMMReport run_geMM(const GeMMCase& c, const std::vector<int>& threads, int iter
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
 
     GeMMReport rep;
@@ -346,7 +346,7 @@ GeMMReport run_geMM_i8(const GeMMCase& c, const std::vector<int>& threads, int i
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, meta_threads);
 
     std::vector<int32_t> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
 
     GeMMReport rep;
@@ -423,7 +423,7 @@ GeMMReport run_geMM_q4(const GeMMCase& c, const std::vector<int>& threads, int i
     const cpu::MatMulPlan plan = cpu::get_matmul_plan(attrs, a_desc, b_desc, 1);
 
     std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
 
     GeMMReport rep;
@@ -511,7 +511,7 @@ struct RouteAB {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
         out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
-        out = test::make_planar(descs[0], out_buf.data());
+        out = test::make_channel_first(descs[0], out_buf.data());
 
         ins[0] = a;
         ins[1] = b;
@@ -628,7 +628,7 @@ struct SweepOp {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
         out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
-        out = test::make_planar(descs[0], out_buf.data());
+        out = test::make_channel_first(descs[0], out_buf.data());
         ins[0] = a;
         ins[1] = b;
 
@@ -706,7 +706,7 @@ struct SweepOpI8 {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
         out_buf.assign(static_cast<size_t>(descs[0].numel()), 0);
-        out = test::make_planar(descs[0], out_buf.data());
+        out = test::make_channel_first(descs[0], out_buf.data());
         ins[0] = a;
         ins[1] = b;
 
@@ -784,7 +784,7 @@ struct SweepOpQ4 {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
         out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
-        out = test::make_planar(descs[0], out_buf.data());
+        out = test::make_channel_first(descs[0], out_buf.data());
         ins[0] = a;
         ins[1] = b;
 
@@ -932,8 +932,8 @@ void bench_b_format_ab(const char* tag, int64_t M, int64_t K, int64_t N,
     auto descs_q = op_q->getOutputTensorDesc(arr_q);
     std::vector<T> out_f(static_cast<size_t>(descs_f[0].numel()));
     std::vector<T> out_q(static_cast<size_t>(descs_q[0].numel()));
-    auto vout_f = test::make_planar(descs_f[0], out_f.data());
-    auto vout_q = test::make_planar(descs_q[0], out_q.data());
+    auto vout_f = test::make_channel_first(descs_f[0], out_f.data());
+    auto vout_q = test::make_channel_first(descs_q[0], out_q.data());
 
     const TensorView ins_f[] = {a, bf};
     const TensorView ins_q[] = {a, bq};
@@ -1012,8 +1012,8 @@ void bench_i8_u8_ab(const char* tag, int64_t M, int64_t K, int64_t N,
     auto descs_u8 = op_u8->getOutputTensorDesc(arr_u8);
     std::vector<int32_t> out_s8(static_cast<size_t>(descs_s8[0].numel()));
     std::vector<int32_t> out_u8(static_cast<size_t>(descs_u8[0].numel()));
-    auto vout_s8 = test::make_planar(descs_s8[0], out_s8.data());
-    auto vout_u8 = test::make_planar(descs_u8[0], out_u8.data());
+    auto vout_s8 = test::make_channel_first(descs_s8[0], out_s8.data());
+    auto vout_u8 = test::make_channel_first(descs_u8[0], out_u8.data());
 
     const TensorView ins_s8[] = {a_s8, b};
     const TensorView ins_u8[] = {a_u8, b};
@@ -1113,7 +1113,7 @@ void bench_i8_out_ab(const char* tag, int64_t M, int64_t K, int64_t N,
     std::vector<uint8_t> out_u8(static_cast<size_t>(od_u8.numel()));
     const int64_t oshape[] = {M, N};
     const std::span<const int64_t> ospan(oshape, 2);
-    auto vout_s32 = test::make_planar(od_s32, out_s32.data());
+    auto vout_s32 = test::make_channel_first(od_s32, out_s32.data());
     auto vout_s8 = TensorView(ospan, DataType::s8, out_s8.data(),
                               TensorLayout::NCHW, oq_s8);
     auto vout_u8 = TensorView(ospan, DataType::u8, out_u8.data(),
@@ -1345,7 +1345,7 @@ NNOPS_BENCH(matmul_small_naive_ab) {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
         std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-        auto output = test::make_planar(descs[0], out_buf.data());
+        auto output = test::make_channel_first(descs[0], out_buf.data());
         const TensorView ins[] = {a, b};
 
         const auto ns_per_call = [&](auto&& fn) {
@@ -1428,7 +1428,7 @@ void bench_gemv_dtype(const char* tag) {
         const TensorDesc descs_in[] = {a.desc(), b.desc()};
         auto descs = op_direct->getOutputTensorDesc(descs_in);
         std::vector<T> out_buf(static_cast<size_t>(descs[0].numel()));
-        auto output = test::make_planar(descs[0], out_buf.data());
+        auto output = test::make_channel_first(descs[0], out_buf.data());
         const TensorView ins_direct[] = {a, b};
         const TensorView ins_tb[] = {a, bt2};
         const TensorView ins_packed[] = {at, bt};
@@ -2642,7 +2642,7 @@ struct BiasAB {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = variants[0].op->getOutputTensorDesc(arr);
         out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
-        out = test::make_planar(descs[0], out_buf.data());
+        out = test::make_channel_first(descs[0], out_buf.data());
     }
 
     double time(Variant& v, int iters) {
@@ -2739,7 +2739,7 @@ struct AlphaAB {
         const TensorDesc arr[] = {ins[0].desc(), ins[1].desc()};
         auto descs = variants[0].op->getOutputTensorDesc(arr);
         out_buf.assign(static_cast<size_t>(descs[0].numel()), T{});
-        out = test::make_planar(descs[0], out_buf.data());
+        out = test::make_channel_first(descs[0], out_buf.data());
     }
 
     double time(Variant& v, int iters) {

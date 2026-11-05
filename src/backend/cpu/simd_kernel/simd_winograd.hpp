@@ -23,7 +23,7 @@
 /// B and A carry only 0/±1, so those transforms are adds/subs (no multiply, no
 /// FMA); G's 1/2s are applied once per (oc, ic) at prepack.
 ///
-/// The planar 8-tile batch is one vector wide: 8 horizontally adjacent tiles
+/// The channel-first 8-tile batch is one vector wide: 8 horizontally adjacent tiles
 /// from two stride-2 loads (offsets 0 and 2), matching NEON vld2q and compiling
 /// to the portable v_load_even / v_load_odd primitives on both arches. Two
 /// caller obligations follow:
@@ -37,10 +37,10 @@
 /// because every element is written exactly once the residual add can read the
 /// pre-existing output in place — no scratch buffer, no second pass.
 ///
-/// Channel-last (NHWC) puts the *channel* axis in the vector lanes instead of
+/// Channel-last puts the *channel* axis in the vector lanes instead of
 /// the tile axis: a window is sixteen channel-vector loads and an output tile
 /// four stores, with no deinterleave and no neighbour coupling, so its tile grid
-/// can flatten. The planar halo is a padded-grid strip that must be zero
+/// can flatten. The channel-first halo is a padded-grid strip that must be zero
 /// outside the image; V's transform position p lives at
 /// v_base + p·v_plane_stride, tile tw0+t at +t.
 
@@ -176,7 +176,7 @@ inline void winograd_output_tile8(const T* m_base, int m_plane_stride,
 }
 
 // =========================================================================
-//  Channel-last (NHWC) transforms
+//  Channel-last transforms
 // =========================================================================
 
 /// A zero vector in the transform domain (f32 whatever the storage type).
@@ -207,7 +207,7 @@ inline void wino_store_lanes(T* p, const v_f32x8& v, int lanes) noexcept {
 
 /// Transform one 4×4 input window into V = Bᵀ d B, one channel vector at a time.
 template <class T>
-inline void winograd_input_nhwc(const T* in_plane, int64_t in_row, int64_t ic_stride,
+inline void winograd_input_channel_last(const T* in_plane, int64_t in_row, int64_t ic_stride,
                                 int ih0, int iw0, int IH, int IW,
                                 T* v, int64_t v_plane, int lanes) noexcept {
     // E = d B in an f32 stack buffer (16 live vectors would spill on 16-ymm x86);
@@ -243,7 +243,7 @@ inline void winograd_input_nhwc(const T* in_plane, int64_t in_row, int64_t ic_st
 
 /// Transform one tile's 16 M planes into its 2×2 outputs, one channel vector at a time; a nullptr destination skips that pixel (past OW/OH on an odd extent). @p p is the tile's destination grid, row-major.
 template <class T>
-inline void winograd_output_nhwc(const T* m, int64_t m_plane,
+inline void winograd_output_channel_last(const T* m, int64_t m_plane,
                                  T* const p[2][2],
                                  const Epilogue& ep, const T* bias, bool add_to,
                                  int lanes) noexcept {

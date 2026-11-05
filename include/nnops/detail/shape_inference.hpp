@@ -16,7 +16,7 @@
 ///    and PoolingAttributes::AutoPad: 0=NOTSET (explicit symmetric `padding`),
 ///    1=SAME_UPPER, 2=SAME_LOWER, 3=VALID.
 ///  - Conv2D weights are OIHW [OC, IC/G, KH, KW] (Conv3D adds KD). The
-///    channel-last reading `weight_hwio` instead expects TensorLayout::HWIO,
+///    Channel-last reading `weight_hwio` instead expects TensorLayout::HWIO,
 ///    TensorFlow's [KH, KW, IC/G, OC], so OC is the last axis. TransposeConv
 ///    mirrors it: weight [IC, OC/G, KH, KW] and OC = dims[1] * groups.
 ///  - DepthwiseConv, Pooling and Resize take their spatial rank from the input
@@ -425,9 +425,9 @@ inline std::vector<TensorDesc> identity_output_shape(
 /// Element-wise binary output: the NumPy broadcast of the two input shapes.
 ///
 /// The layout tag follows the first input when the rank survives — the channel
-/// slot is then still dim 1 in the result — and falls back to the planar tag of
-/// the output rank otherwise (a rank change moves C, so a channel-last tag
-/// would no longer describe where it sits).
+/// slot is then still dim 1 in the result — and falls back to the channel-first
+/// tag of the output rank otherwise (a rank change moves C, so a channel-last
+/// tag would no longer describe where it sits).
 inline std::vector<TensorDesc> broadcast_binary_output_shape(
     std::span<const TensorDesc> inputs)
 {
@@ -446,7 +446,7 @@ inline std::vector<TensorDesc> broadcast_binary_output_shape(
         out.layout = a.layout;
     } else if (is_channel_last(a.layout) && a.rank == out.rank - 1) {
         // The extra leading axis belongs to B; prepending it to a channel-last
-        // number is the same as prepending it to a planar one.
+        // number is the same as prepending it to a channel-first one.
         out.layout = (out.rank == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
     } else {
         out.layout = (out.rank == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
@@ -501,7 +501,7 @@ inline std::vector<TensorDesc> reduce_output_shape(
     out.dtype  = in.dtype;
 
     // A channel-last tag describes where C sits among the *input's* axes; a
-    // rank-dropping reduce shifts them, so the result is tagged planar — the
+    // rank-dropping reduce shifts them, so the result is tagged channel-first — the
     // layout of a dense tensor whose logical order the kernel already writes.
     if (!keepdims && is_channel_last(in.layout)) {
         out.layout = (in.layout == TensorLayout::NDHWC)

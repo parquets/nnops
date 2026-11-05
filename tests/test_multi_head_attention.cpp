@@ -2,7 +2,7 @@
 /// @brief MultiHeadAttention operator tests — the class API against the CPU reference.
 ///
 /// Most tests drive the public shape: MultiHeadAttention::create, then
-/// getOutputTensorDesc over the input descs, then nnops::test::make_planar
+/// getOutputTensorDesc over the input descs, then nnops::test::make_channel_first
 /// for the output and op->compute(out, ins).
 ///
 /// reference::attention_ref is f32 only (declared test-locally, as in
@@ -77,7 +77,7 @@ NNOPS_TEST(attention_basic_single_head) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], out_buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {q, k, v};
     op->compute(out, ins);
@@ -130,7 +130,7 @@ NNOPS_TEST(attention_multi_head) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], out_buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {q, k, v};
     op->compute(out, ins);
@@ -170,7 +170,7 @@ NNOPS_TEST(attention_random) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], out_buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {q, k, v};
     op->compute(out, ins);
@@ -227,11 +227,11 @@ bool attention_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
     // Fast path; the caller's workspace is unused — scratch comes from the
     // kernel's internal pool.
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
     op->compute(fast_out, ins, {}, nullptr);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::multi_head_attention_ref(attrs, ref_out, ins, {}, nullptr);
 
     int64_t worst_i = -1;
@@ -537,7 +537,7 @@ float attention_f16_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
     auto rout_descs = op->getOutputTensorDesc(rdescs);
     const int64_t out_numel = rout_descs[0].numel();
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(rout_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(rout_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::multi_head_attention_ref(attrs, ref_out, rins, {}, nullptr);
 
     // f16 fast path; scratch is pooled by the kernel.
@@ -546,7 +546,7 @@ float attention_f16_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
     if (m16) { fdescs.push_back(m16->desc()); fins.push_back(*m16); }
     auto fout_descs = op->getOutputTensorDesc(fdescs);
     std::vector<half> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(fout_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(fout_descs[0], fast_buf.data());
     op->compute(fast_out, fins, {}, nullptr);
 
     const auto fast_f32 = test::f16_to_f32(fast_buf);

@@ -1,8 +1,8 @@
 #pragma once
 /// @file simd_layout_convert.hpp
-/// @brief CPU kernels for planar ↔ channel-last conversion.
+/// @brief CPU kernels for channel-first ↔ channel-last conversion.
 ///
-/// A spatial row is W pixels × C channels; planar stores it as C channel rows
+/// A spatial row is W pixels × C channels; channel-first stores it as C channel rows
 /// of W, channel-last as W pixels of C. Converting one 8-channel block against
 /// 8 pixels is an 8×8 transpose, so f32/f16 move 64 elements per iteration with
 /// 8 vector loads, one transpose, and 8 vector stores. Strided stores are fine:
@@ -22,10 +22,10 @@ template <typename T>
 inline constexpr bool layout_convert_simd8 =
     std::is_same_v<T, float> || std::is_same_v<T, half>;
 
-/// Copy one 8-channel block of a planar row into channel-last rows:
+/// Copy one 8-channel block of a channel-first row into channel-last rows:
 /// `out[w*C + c_base + lane] = in[(c_base + lane)*ch_stride + w]`.
 template <typename T>
-inline void layout_planar_to_cl_block(const T* in_row, T* out_row,
+inline void layout_channel_first_to_cl_block(const T* in_row, T* out_row,
                                       int64_t W, int64_t C, int64_t ch_stride,
                                       int64_t c_base, int64_t valid_lanes)
 {
@@ -72,9 +72,9 @@ inline void layout_planar_to_cl_block(const T* in_row, T* out_row,
 }
 
 /// The reverse: gather one 8-channel block of a channel-last row back into
-/// planar channel rows.
+/// Channel-first channel rows.
 template <typename T>
-inline void layout_cl_to_planar_block(const T* in_row, T* out_row,
+inline void layout_cl_to_channel_first_block(const T* in_row, T* out_row,
                                       int64_t W, int64_t C, int64_t ch_stride,
                                       int64_t c_base, int64_t valid_lanes)
 {

@@ -200,7 +200,7 @@ NNOPS_TEST(rope_simple_interleaved) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
@@ -243,7 +243,7 @@ NNOPS_TEST(rope_simple_splithalf) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
@@ -279,7 +279,7 @@ NNOPS_TEST(rope_random_interleaved) {
     auto descs = op->getOutputTensorDesc(da);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
@@ -310,7 +310,7 @@ NNOPS_TEST(rope_random_splithalf) {
     auto descs = op->getOutputTensorDesc(da);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
@@ -345,7 +345,7 @@ NNOPS_TEST(rope_3d_batch) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(8));
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
@@ -380,7 +380,7 @@ NNOPS_TEST(rope_4d_multihead) {
     NNOPS_EXPECT_EQ(descs[0].dims[3], int64_t(8));
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
@@ -415,7 +415,7 @@ NNOPS_TEST(rope_different_bases) {
     auto d = op1->getOutputTensorDesc(da);
 
     std::vector<float> out1(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y1 = test::make_planar(d[0], out1.data());
+    auto y1 = test::make_channel_first(d[0], out1.data());
     const TensorView x_arr[] = {x};
     op1->compute(y1, x_arr);
 
@@ -425,7 +425,7 @@ NNOPS_TEST(rope_different_bases) {
     auto op2 = RoPE::create(attrs2, Backend::CPU);
 
     std::vector<float> out2(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y2 = test::make_planar(d[0], out2.data());
+    auto y2 = test::make_channel_first(d[0], out2.data());
     op2->compute(y2, x_arr);
 
     float diff = 0.0f;
@@ -458,7 +458,7 @@ NNOPS_TEST(mrope_two_sections_same_base) {
     const TensorDesc da[] = {dx};
     auto d = op->getOutputTensorDesc(da);
     std::vector<float> out_buf(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y = test::make_planar(d[0], out_buf.data());
+    auto y = test::make_channel_first(d[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
@@ -468,7 +468,7 @@ NNOPS_TEST(mrope_two_sections_same_base) {
     auto op_std = RoPE::create(attrs_std, Backend::CPU);
 
     std::vector<float> out_std(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y_std = test::make_planar(d[0], out_std.data());
+    auto y_std = test::make_channel_first(d[0], out_std.data());
     const TensorView ins2[] = {x};
     op_std->compute(y_std, ins2);
 
@@ -495,7 +495,7 @@ NNOPS_TEST(mrope_different_bases) {
     const TensorDesc da[] = {dx};
     auto d = op->getOutputTensorDesc(da);
     std::vector<float> out_buf(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y = test::make_planar(d[0], out_buf.data());
+    auto y = test::make_channel_first(d[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
@@ -525,7 +525,7 @@ static void check_rope_scaled(const RoPEAttributes& attrs,
     auto descs = op->getOutputTensorDesc(da);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
@@ -564,7 +564,7 @@ NNOPS_TEST(rope_position_offset_row_shift) {
     const TensorDesc run_da[] = {d_run};
     auto run_desc = run_op->getOutputTensorDesc(run_da);
     std::vector<float> run_out(static_cast<size_t>(run_desc[0].numel()), 0.0f);
-    auto run_y = test::make_planar(run_desc[0], run_out.data());
+    auto run_y = test::make_channel_first(run_desc[0], run_out.data());
     const TensorView run_ins[] = {run_view};
     run_op->compute(run_y, run_ins);
 
@@ -580,7 +580,7 @@ NNOPS_TEST(rope_position_offset_row_shift) {
     const TensorDesc row_da[] = {d_row};
     auto row_desc = row_op->getOutputTensorDesc(row_da);
     std::vector<float> row_out(static_cast<size_t>(row_desc[0].numel()), 0.0f);
-    auto row_y = test::make_planar(row_desc[0], row_out.data());
+    auto row_y = test::make_channel_first(row_desc[0], row_out.data());
     const TensorView row_ins[] = {row_view};
     row_op->compute(row_y, row_ins);
 
@@ -762,7 +762,7 @@ NNOPS_TEST(rope_zero_input) {
     const TensorDesc da[] = {dx};
     auto d = op->getOutputTensorDesc(da);
     std::vector<float> out_buf(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y = test::make_planar(d[0], out_buf.data());
+    auto y = test::make_channel_first(d[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
@@ -784,7 +784,7 @@ NNOPS_TEST(rope_single_position) {
     const TensorDesc da[] = {dx};
     auto d = op->getOutputTensorDesc(da);
     std::vector<float> out_buf(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y = test::make_planar(d[0], out_buf.data());
+    auto y = test::make_channel_first(d[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 
@@ -806,7 +806,7 @@ NNOPS_TEST(rope_large_head_dim) {
     const TensorDesc da[] = {dx};
     auto d = op->getOutputTensorDesc(da);
     std::vector<float> out_buf(static_cast<size_t>(d[0].numel()), 0.0f);
-    auto y = test::make_planar(d[0], out_buf.data());
+    auto y = test::make_channel_first(d[0], out_buf.data());
     const TensorView ins[] = {in_view};
     op->compute(y, ins);
 
@@ -871,7 +871,7 @@ NNOPS_TEST(rope_random_interleaved_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {x};
     op->compute(y, ins);
 

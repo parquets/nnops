@@ -52,9 +52,9 @@ Status Where::validate(std::span<const TensorDesc> inputs,
                           DataType::u8, DataType::s32, DataType::s64>(x.dtype)) {
         return Status::unsupported;
     }
-    if (!is_layout_supported(cond.layout, LayoutSupport::PlanarOnly) ||
-        !is_layout_supported(x.layout, LayoutSupport::PlanarOnly) ||
-        !is_layout_supported(y.layout, LayoutSupport::PlanarOnly)) {
+    if (!is_layout_supported(cond.layout, LayoutSupport::ChannelFirstOnly) ||
+        !is_layout_supported(x.layout, LayoutSupport::ChannelFirstOnly) ||
+        !is_layout_supported(y.layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
 

@@ -1,10 +1,10 @@
 /// @file test_grid_sample.cpp
-/// @brief GridSample tests — planar and channel-last activations.
+/// @brief GridSample tests — channel-first and channel-last activations.
 ///
 /// Every case runs the class API end-to-end on a channel-last input:
-///   NCHW -> LayoutConvert -> GridSample -> LayoutConvert -> NCHW
-/// and checks the planar result against known values where the sample position
-/// is predictable, else only finiteness. The grid stays planar NCHW.
+///   Channel-first -> LayoutConvert -> GridSample -> LayoutConvert -> channel-first
+/// and checks the channel-first result against known values where the sample position
+/// is predictable, else only finiteness. The grid stays channel-first.
 /// Covers bilinear/nearest, zeros/border/reflection padding, align_corners,
 /// add_to (residual onto a pre-filled output), batch, 3D, and an odd C.
 
@@ -37,12 +37,12 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
          0.5f,  0.5f,
     };
 
-    TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
+    TensorView in_channel_first(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -51,7 +51,7 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
@@ -68,23 +68,23 @@ NNOPS_TEST(grid_sample_2d_bilinear_identity) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
-        NNOPS_EXPECT_EQ(planar_descs[0].dtype, DataType::f32);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].dtype, DataType::f32);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[0], 1.0f, 1e-5f);
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[1], 2.0f, 1e-5f);
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[2], 3.0f, 1e-5f);
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[3], 4.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[0], 1.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[1], 2.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[2], 3.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[3], 4.0f, 1e-5f);
     }
 }
 
@@ -94,7 +94,7 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
 
     float in_data[4] = {1, 2, 3, 4};
 
-    TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
+    TensorView in_channel_first(ishape, DataType::f32, in_data, TensorLayout::NCHW);
 
     std::vector<float> grid_buf(1 * 4 * 4 * 2);
     for (int64_t oh = 0; oh < 4; ++oh) {
@@ -109,7 +109,7 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -117,7 +117,7 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -140,32 +140,32 @@ NNOPS_TEST(grid_sample_2d_bilinear_align_corners) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[0],  1.0f, 1e-5f);
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[3],  2.0f, 1e-5f);
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[12], 3.0f, 1e-5f);
-        NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[15], 4.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[0],  1.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[3],  2.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[12], 3.0f, 1e-5f);
+        NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[15], 4.0f, 1e-5f);
 
         for (int64_t i = 0; i < 16; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
 
 NNOPS_TEST(grid_sample_2d_bilinear_random) {
-    auto [in_vec, in_nchw] = test::make_random_tensor({1, 2, 8, 8});
+    auto [in_vec, in_channel_first] = test::make_random_tensor({1, 2, 8, 8});
     const int64_t gshape[] = {1, 6, 6, 2};
 
     std::vector<float> grid_buf(1 * 6 * 6 * 2);
@@ -176,7 +176,7 @@ NNOPS_TEST(grid_sample_2d_bilinear_random) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -184,7 +184,7 @@ NNOPS_TEST(grid_sample_2d_bilinear_random) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
@@ -200,21 +200,21 @@ NNOPS_TEST(grid_sample_2d_bilinear_random) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (size_t i = 0; i < 72; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
@@ -233,12 +233,12 @@ NNOPS_TEST(grid_sample_2d_nearest_basic) {
         0.5f, 0.5f, 0.5f, 0.5f,
     };
 
-    TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
+    TensorView in_channel_first(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -246,7 +246,7 @@ NNOPS_TEST(grid_sample_2d_nearest_basic) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -264,26 +264,26 @@ NNOPS_TEST(grid_sample_2d_nearest_basic) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (int i = 0; i < 4; ++i) {
-            NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[i], 4.0f, 1e-5f);
+            NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[i], 4.0f, 1e-5f);
         }
     }
 }
 
 NNOPS_TEST(grid_sample_2d_nearest_random) {
-    auto [in_vec, in_nchw] = test::make_random_tensor({1, 3, 10, 10});
+    auto [in_vec, in_channel_first] = test::make_random_tensor({1, 3, 10, 10});
     const int64_t gshape[] = {1, 5, 5, 2};
 
     std::vector<float> grid_buf(1 * 5 * 5 * 2);
@@ -294,7 +294,7 @@ NNOPS_TEST(grid_sample_2d_nearest_random) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -302,7 +302,7 @@ NNOPS_TEST(grid_sample_2d_nearest_random) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -320,21 +320,21 @@ NNOPS_TEST(grid_sample_2d_nearest_random) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (size_t i = 0; i < 75; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
@@ -353,12 +353,12 @@ NNOPS_TEST(grid_sample_2d_zeros_padding) {
         10.0f, 10.0f, 10.0f, 10.0f,
     };
 
-    TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
+    TensorView in_channel_first(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -366,7 +366,7 @@ NNOPS_TEST(grid_sample_2d_zeros_padding) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
@@ -382,20 +382,20 @@ NNOPS_TEST(grid_sample_2d_zeros_padding) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (int i = 0; i < 4; ++i) {
-            NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[i], 0.0f, 1e-5f);
+            NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[i], 0.0f, 1e-5f);
         }
     }
 }
@@ -410,12 +410,12 @@ NNOPS_TEST(grid_sample_2d_border_padding) {
          0.0f, -10.0f, 0.0f, -10.0f,
     };
 
-    TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
+    TensorView in_channel_first(ishape, DataType::f32, in_data, TensorLayout::NCHW);
     TensorView grid(gshape, DataType::f32, grid_data, TensorLayout::NCHW);
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -423,7 +423,7 @@ NNOPS_TEST(grid_sample_2d_border_padding) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -442,27 +442,27 @@ NNOPS_TEST(grid_sample_2d_border_padding) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (int i = 0; i < 4; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
 
 NNOPS_TEST(grid_sample_2d_reflection_padding) {
-    auto [in_vec, in_nchw] = test::make_random_tensor({1, 1, 4, 4});
+    auto [in_vec, in_channel_first] = test::make_random_tensor({1, 1, 4, 4});
     const int64_t gshape[] = {1, 4, 4, 2};
 
     std::vector<float> grid_buf(1 * 4 * 4 * 2);
@@ -478,7 +478,7 @@ NNOPS_TEST(grid_sample_2d_reflection_padding) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -486,7 +486,7 @@ NNOPS_TEST(grid_sample_2d_reflection_padding) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -504,21 +504,21 @@ NNOPS_TEST(grid_sample_2d_reflection_padding) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (size_t i = 0; i < 16; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
@@ -582,18 +582,18 @@ NNOPS_TEST(grid_sample_3d_bilinear_basic) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCDHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCDHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCDHW);
-        NNOPS_EXPECT_EQ(planar_descs[0].dtype, DataType::f32);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 5);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCDHW);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].dtype, DataType::f32);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_ncdhw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_ncdhw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_ncdhw = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_ncdhw, channel_first_ins);
 
         for (size_t i = 0; i < 8; ++i) {
             NNOPS_EXPECT_NEAR(res_ncdhw.ptr<float>()[i], static_cast<float>(i + 1), 1e-4f);
@@ -639,17 +639,17 @@ NNOPS_TEST(grid_sample_3d_nearest_basic) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCDHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCDHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 5);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCDHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 5);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCDHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_ncdhw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_ncdhw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_ncdhw = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_ncdhw, channel_first_ins);
 
         for (size_t i = 0; i < 27; ++i) {
             NNOPS_EXPECT_TRUE(!std::isnan(res_ncdhw.ptr<float>()[i]));
@@ -663,7 +663,7 @@ NNOPS_TEST(grid_sample_3d_nearest_basic) {
 // ============================================================
 
 NNOPS_TEST(grid_sample_add_to) {
-    auto [in_vec, in_nchw] = test::make_random_tensor({1, 1, 4, 4});
+    auto [in_vec, in_channel_first] = test::make_random_tensor({1, 1, 4, 4});
     const int64_t gshape[] = {1, 4, 4, 2};
 
     std::vector<float> grid_buf(1 * 4 * 4 * 2);
@@ -679,7 +679,7 @@ NNOPS_TEST(grid_sample_add_to) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -687,7 +687,7 @@ NNOPS_TEST(grid_sample_add_to) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -716,21 +716,21 @@ NNOPS_TEST(grid_sample_add_to) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (size_t i = 0; i < 16; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
@@ -740,7 +740,7 @@ NNOPS_TEST(grid_sample_add_to) {
 // ============================================================
 
 NNOPS_TEST(grid_sample_multisample) {
-    auto [in_vec, in_nchw] = test::make_random_tensor({2, 1, 4, 4});
+    auto [in_vec, in_channel_first] = test::make_random_tensor({2, 1, 4, 4});
     const int64_t gshape[] = {2, 3, 3, 2};
 
     std::vector<float> grid_buf(2 * 3 * 3 * 2);
@@ -751,7 +751,7 @@ NNOPS_TEST(grid_sample_multisample) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -759,7 +759,7 @@ NNOPS_TEST(grid_sample_multisample) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
@@ -778,21 +778,21 @@ NNOPS_TEST(grid_sample_multisample) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (size_t i = 0; i < 18; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }
@@ -807,7 +807,7 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
 
     float in_data[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 
-    TensorView in_nchw(ishape, DataType::f32, in_data, TensorLayout::NCHW);
+    TensorView in_channel_first(ishape, DataType::f32, in_data, TensorLayout::NCHW);
 
     std::vector<float> grid_buf(1 * 3 * 3 * 2);
     for (int64_t oh = 0; oh < 3; ++oh) {
@@ -822,7 +822,7 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -830,7 +830,7 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         GridSampleAttributes attrs;
@@ -849,20 +849,20 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (int i = 0; i < 9; ++i) {
-            NNOPS_EXPECT_NEAR(res_nchw.ptr<float>()[i], in_data[i], 1e-5f);
+            NNOPS_EXPECT_NEAR(res_channel_first.ptr<float>()[i], in_data[i], 1e-5f);
         }
     }
 }
@@ -872,7 +872,7 @@ NNOPS_TEST(grid_sample_2d_align_corners_corners_exact) {
 // ============================================================
 
 NNOPS_TEST(grid_sample_partial_channels) {
-    auto [in_vec, in_nchw] = test::make_random_tensor({1, 3, 4, 4});
+    auto [in_vec, in_channel_first] = test::make_random_tensor({1, 3, 4, 4});
     const int64_t gshape[] = {1, 4, 4, 2};
 
     std::vector<float> grid_buf(1 * 4 * 4 * 2);
@@ -888,7 +888,7 @@ NNOPS_TEST(grid_sample_partial_channels) {
 
     auto to_cl_op = LayoutConvert::create(TensorLayout::NHWC);
     {
-        auto d = in_nchw.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_arr[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_arr);
         NNOPS_EXPECT_EQ(cl_descs[0].rank, 4);
@@ -896,7 +896,7 @@ NNOPS_TEST(grid_sample_partial_channels) {
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_conv_ins[] = {in_nchw};
+        const TensorView cl_conv_ins[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_conv_ins);
 
         auto gs_op = GridSample::create({});
@@ -913,21 +913,21 @@ NNOPS_TEST(grid_sample_partial_channels) {
         const TensorView gs_ins[] = {in_cl, grid};
         gs_op->compute(out_cl, gs_ins);
 
-        auto to_planar_op = LayoutConvert::create(TensorLayout::NCHW);
+        auto to_channel_first_op = LayoutConvert::create(TensorLayout::NCHW);
         auto d_out = out_cl.desc();
-        const TensorDesc planar_in_arr[] = {d_out};
-        auto planar_descs = to_planar_op->getOutputTensorDesc(planar_in_arr);
-        NNOPS_EXPECT_EQ(planar_descs[0].rank, 4);
-        NNOPS_EXPECT_EQ(planar_descs[0].layout, TensorLayout::NCHW);
+        const TensorDesc channel_first_in_arr[] = {d_out};
+        auto channel_first_descs = to_channel_first_op->getOutputTensorDesc(channel_first_in_arr);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].rank, 4);
+        NNOPS_EXPECT_EQ(channel_first_descs[0].layout, TensorLayout::NCHW);
 
-        std::vector<char> planar_buf(planar_descs[0].storage_bytes());
-        auto res_nchw = test::make_planar(planar_descs[0], planar_buf.data());
-        const TensorView planar_ins[] = {out_cl};
-        to_planar_op->compute(res_nchw, planar_ins);
+        std::vector<char> channel_first_buf(channel_first_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(channel_first_descs[0], channel_first_buf.data());
+        const TensorView channel_first_ins[] = {out_cl};
+        to_channel_first_op->compute(res_channel_first, channel_first_ins);
 
         for (size_t i = 0; i < 48; ++i) {
-            NNOPS_EXPECT_TRUE(!std::isnan(res_nchw.ptr<float>()[i]));
-            NNOPS_EXPECT_TRUE(!std::isinf(res_nchw.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isnan(res_channel_first.ptr<float>()[i]));
+            NNOPS_EXPECT_TRUE(!std::isinf(res_channel_first.ptr<float>()[i]));
         }
     }
 }

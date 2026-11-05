@@ -70,7 +70,7 @@ NNOPS_TEST(norm_batchnorm_simple_1d) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_data);
+    auto out = test::make_channel_first(descs[0], out_data);
 
     const TensorView ins[] = {x, s, b, m, v};
     TensorView outs[] = {out};
@@ -119,7 +119,7 @@ NNOPS_TEST(norm_batchnorm_2d_with_scale_bias) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_data);
+    auto out = test::make_channel_first(descs[0], out_data);
 
     const TensorView ins[] = {x, s, b, m, v};
     TensorView outs[] = {out};
@@ -174,7 +174,7 @@ NNOPS_TEST(norm_batchnorm_random) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x, s, b, m, v};
     TensorView outs[] = {out};
@@ -220,7 +220,7 @@ NNOPS_TEST(norm_batchnorm_random_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x, s, b, m, v};
     TensorView outs[] = {out};
@@ -233,10 +233,10 @@ NNOPS_TEST(norm_batchnorm_random_f16) {
     }
 }
 
-NNOPS_TEST(norm_batchnorm_nhwc_spatial) {
+NNOPS_TEST(norm_batchnorm_channel_last_spatial) {
     const int64_t N = 2, C = 8, H = 3, W = 4;
 
-    auto [in_vec, in_planar] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 300);
+    auto [in_vec, in_channel_first] = test::make_random_tensor({N, C, H, W}, -1.0f, 1.0f, 300);
 
     std::vector<float> scale(C), bias(C), mean(C), var(C);
     for (int64_t c = 0; c < C; ++c) {
@@ -258,8 +258,8 @@ NNOPS_TEST(norm_batchnorm_nhwc_spatial) {
     attrs.spatial = true;
     auto op = Norm::create(attrs, Backend::CPU);
 
-    // Golden: the same norm on the planar input.
-    auto dx = in_planar.desc();
+    // Golden: the same norm on the channel-first input.
+    auto dx = in_channel_first.desc();
     auto ds = s.desc();
     auto db = b.desc();
     auto dm = m.desc();
@@ -268,19 +268,19 @@ NNOPS_TEST(norm_batchnorm_nhwc_spatial) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> ref_buf(static_cast<size_t>(descs[0].numel()));
-    auto ref_out = test::make_planar(descs[0], ref_buf.data());
-    const TensorView ref_ins[] = {in_planar, s, b, m, v};
+    auto ref_out = test::make_channel_first(descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {in_channel_first, s, b, m, v};
     TensorView ref_outs[] = {ref_out};
     op->compute(ref_outs, ref_ins);
 
     // Channel-last: convert in, normalize, convert back.
     auto to_cl = LayoutConvert::create(TensorLayout::NHWC);
-    const TensorDesc cl_in_desc[] = {in_planar.desc()};
+    const TensorDesc cl_in_desc[] = {in_channel_first.desc()};
     auto cl_desc = to_cl->getOutputTensorDesc(cl_in_desc)[0];
 
     std::vector<float> cl_buf(static_cast<size_t>(cl_desc.storage_bytes() / sizeof(float)));
     auto x_cl = test::make_packed(cl_desc, cl_buf.data());
-    const TensorView lc_ins[] = {in_planar};
+    const TensorView lc_ins[] = {in_channel_first};
     to_cl->compute(x_cl, lc_ins);
 
     const TensorDesc cl_norm_desc[] = {x_cl.desc(), ds, db, dm, dv};
@@ -293,11 +293,11 @@ NNOPS_TEST(norm_batchnorm_nhwc_spatial) {
     TensorView cl_outs[] = {out_cl};
     op->compute(cl_outs, cl_ins);
 
-    auto to_planar = LayoutConvert::create(TensorLayout::NCHW);
-    std::vector<float> back_buf(static_cast<size_t>(in_planar.numel()));
-    TensorView back(in_planar.shape_span(), DataType::f32, back_buf.data());
+    auto to_channel_first = LayoutConvert::create(TensorLayout::NCHW);
+    std::vector<float> back_buf(static_cast<size_t>(in_channel_first.numel()));
+    TensorView back(in_channel_first.shape_span(), DataType::f32, back_buf.data());
     const TensorView back_ins[] = {out_cl};
-    to_planar->compute(back, back_ins);
+    to_channel_first->compute(back, back_ins);
 
     NNOPS_EXPECT_TRUE(test::allclose(back, ref_out, 1e-4f, 1e-4f));
 }
@@ -331,7 +331,7 @@ NNOPS_TEST(norm_layernorm_simple_last_axis) {
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
@@ -374,7 +374,7 @@ NNOPS_TEST(norm_layernorm_with_bias) {
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s, b};
     op->compute(out, ins);
@@ -416,7 +416,7 @@ NNOPS_TEST(norm_layernorm_2d_axis_1) {
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
@@ -455,7 +455,7 @@ NNOPS_TEST(norm_layernorm_random) {
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, s};
     op->compute(out, ins);
@@ -504,7 +504,7 @@ NNOPS_TEST(norm_layernorm_random_f16) {
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s, b};
     op->compute(out, ins);
@@ -546,7 +546,7 @@ NNOPS_TEST(norm_rmsnorm_simple_last_axis) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(y, ins);
@@ -585,7 +585,7 @@ NNOPS_TEST(norm_rmsnorm_with_scale) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(y, ins);
@@ -623,7 +623,7 @@ NNOPS_TEST(norm_rmsnorm_2d_axis_1) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(y, ins);
@@ -660,7 +660,7 @@ NNOPS_TEST(norm_rmsnorm_random) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input, s};
     op->compute(y, ins);
@@ -699,7 +699,7 @@ NNOPS_TEST(norm_rmsnorm_random_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(y, ins);
@@ -742,7 +742,7 @@ NNOPS_TEST(norm_l2norm_simple_last_axis) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x};
     op->compute(y, ins);
@@ -774,7 +774,7 @@ NNOPS_TEST(norm_l2norm_2d_axis_1) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x};
     op->compute(y, ins);
@@ -803,7 +803,7 @@ NNOPS_TEST(norm_l2norm_random) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(8));
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(y, ins);
@@ -835,7 +835,7 @@ NNOPS_TEST(norm_l2norm_add_to) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 10.0f);
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x};
     op->compute(y, ins);
@@ -863,7 +863,7 @@ NNOPS_TEST(norm_l2norm_random_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto y = test::make_planar(descs[0], out_buf.data());
+    auto y = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {x};
     op->compute(y, ins);
@@ -910,7 +910,7 @@ NNOPS_TEST(norm_group_norm_2_groups) {
     NNOPS_EXPECT_EQ(outs[0].dims[3], int64_t{2});
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
@@ -956,7 +956,7 @@ NNOPS_TEST(norm_group_norm_with_scale_bias) {
     auto outs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s, b};
     op->compute(out, ins);
@@ -995,7 +995,7 @@ NNOPS_TEST(norm_group_norm_equals_instancenorm_when_g_equals_c) {
     auto outs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
 
@@ -1037,7 +1037,7 @@ NNOPS_TEST(norm_group_norm_add_to) {
     auto outs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()), 10.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
@@ -1074,7 +1074,7 @@ NNOPS_TEST(norm_group_norm_random_f32) {
         const TensorDesc desc_simd[] = {dx, ds, db};
         auto outs_simd = op_simd->getOutputTensorDesc(desc_simd);
         std::vector<float> out_simd_buf(static_cast<size_t>(outs_simd[0].numel()));
-        auto out_simd = test::make_planar(outs_simd[0], out_simd_buf.data());
+        auto out_simd = test::make_channel_first(outs_simd[0], out_simd_buf.data());
         const TensorView ins_simd[] = {x, s, b};
         op_simd->compute(out_simd, ins_simd);
 
@@ -1129,7 +1129,7 @@ NNOPS_TEST(norm_group_norm_random_f16) {
     auto outs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<half> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
@@ -1171,7 +1171,7 @@ NNOPS_TEST(norm_group_norm_rank3_ncw) {
     NNOPS_EXPECT_EQ(outs[0].dims[2], int64_t{4});
 
     std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
     const TensorView ins[] = {x, s};
     op->compute(out, ins);
 
@@ -1203,8 +1203,8 @@ NNOPS_TEST(norm_group_norm_class_api) {
     auto out_desc = TensorDesc{dx.dims, dx.rank, dx.dtype, dx.layout};
     std::vector<float> out_buf1(static_cast<size_t>(out_desc.numel()));
     std::vector<float> out_buf2(static_cast<size_t>(out_desc.numel()));
-    auto out1 = test::make_planar(out_desc, out_buf1.data());
-    auto out2 = test::make_planar(out_desc, out_buf2.data());
+    auto out1 = test::make_channel_first(out_desc, out_buf1.data());
+    auto out2 = test::make_channel_first(out_desc, out_buf2.data());
 
     NormAttributes attrs;
     attrs.type = NormType::GroupNorm;
@@ -1237,8 +1237,8 @@ NNOPS_TEST(norm_group_norm_class_api_with_bias) {
     auto out_desc = TensorDesc{dx.dims, dx.rank, dx.dtype, dx.layout};
     std::vector<float> out_buf1(static_cast<size_t>(out_desc.numel()));
     std::vector<float> out_buf2(static_cast<size_t>(out_desc.numel()));
-    auto out1 = test::make_planar(out_desc, out_buf1.data());
-    auto out2 = test::make_planar(out_desc, out_buf2.data());
+    auto out1 = test::make_channel_first(out_desc, out_buf1.data());
+    auto out2 = test::make_channel_first(out_desc, out_buf2.data());
 
     NormAttributes attrs;
     attrs.type = NormType::GroupNorm;
@@ -1354,7 +1354,7 @@ QuantParams per_token(const float* scale, const int32_t* zp, int64_t n) {
     return qp;
 }
 
-/// Planar s8/u8 view over `data` carrying explicit quant params.
+/// Channel-first s8/u8 view over `data` carrying explicit quant params.
 TensorView make_q(std::span<const int64_t> shape, DataType dt, void* data,
                   const QuantParams& qp, TensorLayout layout = TensorLayout::NCHW) {
     return TensorView(shape, dt, data, layout, qp);

@@ -45,7 +45,7 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
     // The axis walk reads the tensor through stride_elems(), which describes the
     // two regular image layouts; the opaque weight tags have no axis semantics
     // here.
-    if (!is_planar_spatial(inputs[0].layout) && !is_channel_last(inputs[0].layout)) {
+    if (!is_channel_first_spatial(inputs[0].layout) && !is_channel_last(inputs[0].layout)) {
         return Status::unsupported;
     }
 
@@ -54,9 +54,9 @@ Status Softmax::validate(std::span<const TensorDesc> inputs,
         if (!detail::dtype_in<DataType::f32, DataType::f16>(outputs[0].dtype)) {
             return Status::invalid_argument;
         }
-        // And the dequantizing walk is only defined over planar layouts.
+        // And the dequantizing walk is only defined over channel-first layouts.
         return detail::require(
-            is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly),
+            is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly),
             Status::unsupported);
     }
     return Status::ok;

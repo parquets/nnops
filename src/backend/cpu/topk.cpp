@@ -4,7 +4,7 @@
 /// Supports both f32 and f16 via templated implementation.
 /// Uses scalar selection (top-k is inherently sequential along the axis).
 ///
-/// Supports planar layouts (NCHW, NCDHW). Not for packed layouts.
+/// Supports the channel-first layouts, 2D and 3D. Not for packed layouts.
 
 #include "nnops/ops/topk.hpp"
 #include "nnops/detail/assert.hpp"

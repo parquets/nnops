@@ -4,7 +4,7 @@
 ///
 /// inclusive: out[i] = sum(in[0..i]); exclusive: out[0] = 0, out[i] =
 /// sum(in[0..i-1]). reverse walks from the last element backward. Input rank
-/// >= 1; output has the input's shape. Planar layouts only.
+/// >= 1; output has the input's shape. Channel-first layouts only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -47,7 +47,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::CumSum; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const CumSumAttributes& attributes() const noexcept { return attrs_; }
 

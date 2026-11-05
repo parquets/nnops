@@ -12,13 +12,13 @@
 ///   head 1x1 (1280) -> BN -> ReLU6 -> global avg pool -> fc 1280->1000
 ///
 /// The depthwise stage is DepthwiseConv on the exported weight as it is
-/// ([C, 1, 3, 3]): planar input takes the raw filter, no prepack.
+/// ([C, 1, 3, 3]): channel-first input takes the raw filter, no prepack.
 ///
-/// NNOPS_MODEL_LAYOUT=nhwc runs the same graph with every activation
+/// NNOPS_MODEL_LAYOUT=channel_last runs the same graph with every activation
 /// channel-last (see net_ops.hpp): the 1x1s and the stem read HWIO filters, the
 /// depthwise stages HWCM [KH, KW, C], the global pool its channel-last route,
-/// and each checkpoint is reordered back to NCHW before it is compared. Only
-/// the BN fold is mandatory there — the Norm operator is planar — which the
+/// and each checkpoint is reordered back to channel-first before it is compared. Only
+/// the BN fold is mandatory there — the Norm operator is channel-first — which the
 /// fused path does anyway.
 ///
 /// Usage:  model_mobilenetv2 [artifact-dir] [--atol X] [--rtol Y]
@@ -204,10 +204,10 @@ int main(int argc, char** argv)
 
     const bool channel_last = model::channel_last();
     if (channel_last && !model::fuse_enabled()) {
-        // The Norm operator reads planar tensors, so a channel-last graph has
+        // The Norm operator reads channel-first tensors, so a channel-last graph has
         // to fold the BN into the conv — which is what fusion already does.
         std::fprintf(stderr,
-                     "mobilenetv2: NNOPS_MODEL_LAYOUT=nhwc needs the BN fold "
+                     "mobilenetv2: NNOPS_MODEL_LAYOUT=channel_last needs the BN fold "
                      "(unset NNOPS_MODEL_FUSE)\n");
         return 2;
     }
@@ -221,7 +221,7 @@ int main(int argc, char** argv)
     std::printf("mobilenetv2: %zu tensors from %s (conv+bn+relu6 %s, %s)\n",
                 artifact.count(), dir.c_str(),
                 model::fuse_enabled() ? "folded" : "unfused",
-                channel_last ? "nhwc" : "nchw");
+                channel_last ? "channel_last" : "channel_first");
     // The untimed pass is the model-load step: it prepacks any Winograd weights
     // (and first-touches every buffer) and it is the pass that checks every
     // checkpoint, so the number below is the steady state with no comparison in

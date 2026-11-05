@@ -13,7 +13,7 @@
 /// live bytes on store, and it is a separate instantiation, so the common path
 /// pays nothing: C % 8 == 0 never reaches it.
 ///
-/// @c planar_load is the other lane layout — output width instead of channels:
+/// @c channel_first_load is the other lane layout — output width instead of channels:
 /// lane l reads input column iw0 + l*sw, and a lane outside the row takes @p fill,
 /// which must be the accumulate's identity so a padded tap contributes nothing.
 /// Unit and doubled stride take a plain or deinterleaving load; any other stride
@@ -88,7 +88,7 @@ struct QuantSrc {
 
 /// One input row, lane l at input column iw0 + l*sw.
 template <typename T>
-inline auto planar_load(const T* row, int64_t iw0, int64_t sw, int64_t iw, T fill)
+inline auto channel_first_load(const T* row, int64_t iw0, int64_t sw, int64_t iw, T fill)
 {
     constexpr int64_t L = simd_lane_for<T>;
     if (iw0 >= 0) {

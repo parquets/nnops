@@ -1,7 +1,7 @@
 /// @file permute.cpp
 /// @brief SIMD-optimized CPU implementation of dimension permute (transpose).
 ///
-/// Planar data: each output element comes from a permuted input position. Two
+/// Channel-first data: each output element comes from a permuted input position. Two
 /// routes, picked from `perm`:
 ///   1. Last-two-dims swap (perm[i]==i for i<rank-2, and the last two
 ///      exchanged): tiled 8x8 SIMD transpose via kernel::tiled_transpose_2d,
@@ -10,7 +10,7 @@
 ///   2. General n-D: scalar strided copy, parallel over the outer index; a row
 ///      whose innermost output dim maps to input stride 1 is a memcpy.
 ///
-/// The batch stride between slices is M*K: planar data makes dims rank-2 and
+/// The batch stride between slices is M*K: channel-first data makes dims rank-2 and
 /// rank-1 the innermost and contiguous.
 
 #include "nnops/ops/permute.hpp"

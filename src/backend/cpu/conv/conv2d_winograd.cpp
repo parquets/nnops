@@ -1,7 +1,8 @@
 /// @file conv2d_winograd.cpp
-/// @brief Winograd F(2×2, 3×3) Conv2D kernel (k3s1, f32/f16, NCHW or NHWC).
+/// @brief Winograd F(2×2, 3×3) Conv2D kernel (k3s1, f32/f16, channel-first or
+/// channel-last).
 ///
-/// Both routes live here as `planar` and `channel_last`, in the same spirit as
+/// Both routes live here as `channel_first` and `channel_last`, in the same spirit as
 /// Conv2D's implicit-GEMM file: one plan per route, one dispatch, and the same
 /// numeric order and scratch conventions on each.
 ///
@@ -29,10 +30,10 @@ constexpr int kWinoAlpha = 4; // the 4×4 transform domain (F(2,3): 2×2 output)
 constexpr int kWinoPos = kWinoAlpha * kWinoAlpha;  // 16 batched GEMMs
 
 // =========================================================================
-//  Planar route (NCHW)
+//  Channel-first route (channel-first)
 // =========================================================================
 
-namespace planar {
+namespace channel_first {
 namespace {
 
 using namespace nnops::simd;
@@ -326,7 +327,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
 
 }  // anonymous namespace
 
-/// Resolve the planar route: U is [pos][OC][IC/G] and the activation is NCHW.
+/// Resolve the channel-first route: U is [pos][OC][IC/G] and the activation
+/// is channel-first.
 Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
                              std::span<const TensorDesc> inputs,
                              std::span<const TensorDesc> outputs,
@@ -335,7 +337,7 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
                              int64_t num_slots)
 {
     Conv2DWinogradPlan plan;
-    plan.route = Conv2DWinogradRoute::Planar;
+    plan.route = Conv2DWinogradRoute::ChannelFirst;
     if (inputs.size() < 2 || outputs.empty()) { return plan; }
 
     const auto& in  = inputs[0];
@@ -503,10 +505,10 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     return plan;
 }
 
-}  // namespace planar
+}  // namespace channel_first
 
 // =========================================================================
-//  Channel-last route (NHWC)
+//  Channel-last route (channel-last)
 // =========================================================================
 
 WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_group,
@@ -516,7 +518,7 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     // f16 stays on F(2,3) on both routes: Bᵀ scales a window by up to 5 and Aᵀ
     // the products by 8, so the V and M rounds cost three bits on top of an f16
     // for an f16 GEMM accumulate. Measured 0.63-0.73x of F(2,3) on the
-    // channel-last route (0.56-0.87x at 1 thread), but at 0.125 of full scale on
+    // Channel-last route (0.56-0.87x at 1 thread), but at 0.125 of full scale on
     // a 32-channel case where the f16 contract holds 0.05 — the speed is there
     // and the accuracy is not.
     // A caller who wants it anyway pins winograd_order = 4.
@@ -545,7 +547,7 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
         return (out_h >= 28 && out_w >= 28) ? WinoOrder::F43 : WinoOrder::F23;
     }
 
-    // Planar pays a halo strip per task instead — ICG · window rows · window
+    // Channel-first pays a halo strip per task instead — ICG · window rows · window
     // columns, six wide and twelve deep for a task of two tile rows against
     // F(2,3)'s two and six — and 4x4 tiles quarter the tile grid the strip is
     // rebuilt for. On a small team the tile axes fill the pool by themselves, so
@@ -615,7 +617,7 @@ constexpr int64_t kTileBlockMin(WinoOrder o) noexcept {
     return o == WinoOrder::F43 ? 6 : 8;
 }
 /// Output channels per GEMM (the N side), snapped down to whole panels — the
-/// same trade as the planar M block: each extra oc block is another pass over
+/// same trade as the channel-first M block: each extra oc block is another pass over
 /// the task's tiles (accumulator traffic plus one more B read).
 constexpr int64_t kOcnBlock = 64;
 
@@ -624,7 +626,7 @@ constexpr int64_t kOcnBlock = 64;
 /// count, the tile size and the two transforms' shapes — everything else about
 /// the task is order-independent.
 template <class T, WinoOrder O>
-void conv2d_winograd_nhwc_impl(const Conv2DAttributes& attrs,
+void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
                                TensorView& output,
                                std::span<const TensorView> inputs,
                                const ComputeContext& ctx,
@@ -637,7 +639,7 @@ void conv2d_winograd_nhwc_impl(const Conv2DAttributes& attrs,
     const auto& u_tensor = inputs[1];  // prepacked transform-domain weight
     const bool has_bias = inputs.size() > 2;
 
-    // Logical [N, C, H, W]; NHWC stores [N][H][W][C], so a "row" is one spatial
+    // Logical [N, C, H, W]; channel-last stores [N][H][W][C], so a "row" is one spatial
     // line and a pixel's channels are contiguous.
     const int64_t IH = input.shape(2);
     const int64_t IW = input.shape(3);
@@ -693,7 +695,7 @@ void conv2d_winograd_nhwc_impl(const Conv2DAttributes& attrs,
     // into V once, run the pos GEMMs for its oc blocks into M, write them back.
     const auto run_task = [&](int64_t t) {
         int64_t idx = t;
-        // The oc chunk varies fastest, as in the planar route: the chunks of one
+        // The oc chunk varies fastest, as in the channel-first route: the chunks of one
         // plane are adjacent in task order and re-read the same input lines, so
         // whichever arrives second finds them in L2.
         const int64_t chunk = idx % oc_chunks; idx /= oc_chunks;
@@ -728,12 +730,12 @@ void conv2d_winograd_nhwc_impl(const Conv2DAttributes& attrs,
                 // channel and the activation's channel lane.
                 T* v_tile = v_all + tl * v_lda + ic;
                 if constexpr (O == WinoOrder::F23) {
-                    k::winograd_input_nhwc<T>(task_in + ic, in_row, IC,
+                    k::winograd_input_channel_last<T>(task_in + ic, in_row, IC,
                                               static_cast<int>(ih0), static_cast<int>(iw0),
                                               static_cast<int>(IH), static_cast<int>(IW),
                                               v_tile, v_p_stride, lanes);
                 } else {
-                    k::winograd43_input_nhwc<T>(task_in + ic, in_row, IC,
+                    k::winograd43_input_channel_last<T>(task_in + ic, in_row, IC,
                                                 static_cast<int>(ih0), static_cast<int>(iw0),
                                                 static_cast<int>(IH), static_cast<int>(IW),
                                                 v_tile, v_p_stride, lanes);
@@ -792,11 +794,11 @@ void conv2d_winograd_nhwc_impl(const Conv2DAttributes& attrs,
                                              : nullptr;
                     const T* m_tile = m_all + tl * m_oc_stride + oc;
                     if constexpr (O == WinoOrder::F23) {
-                        k::winograd_output_nhwc<T>(m_tile, m_p_stride, dst,
+                        k::winograd_output_channel_last<T>(m_tile, m_p_stride, dst,
                                                    attrs.epilogue, bias_oc,
                                                    attrs.add_to, lanes);
                     } else {
-                        k::winograd43_output_nhwc<T>(m_tile, m_p_stride, dst,
+                        k::winograd43_output_channel_last<T>(m_tile, m_p_stride, dst,
                                                      attrs.epilogue, bias_oc,
                                                      attrs.add_to, lanes);
                     }
@@ -808,7 +810,7 @@ void conv2d_winograd_nhwc_impl(const Conv2DAttributes& attrs,
     ctx.cpu.run(0, plan.num_tasks, run_task);
 }
 
-/// Resolve the channel-last route: the activation is NHWC and U is prepacked as
+/// Resolve the channel-last route: the activation is channel-last and U is prepacked as
 /// B panels (PackedWinoWeightLast).
 Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
                              std::span<const TensorDesc> inputs,
@@ -904,7 +906,7 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     // V: one [tile][ic] plane per position, tiles contiguous inside a position
     // (that is the GEMM's A, so lda is a tile row). The row is padded to the
     // vector width so a tail block can be written whole, and the +8 per position
-    // keeps the 16 planes off one L1 set — the planar route's measurement holds.
+    // keeps the 16 planes off one L1 set — the channel-first route's measurement holds.
     plan.v_lda      = ((ic_per_group + 7) / 8) * 8;
     plan.v_p_stride = plan.tile_block * plan.v_lda + 8;
     plan.v_size     = ug.pos * plan.v_p_stride;
@@ -946,7 +948,7 @@ Conv2DWinogradPlan get_conv2d_winograd_plan(const Conv2DAttributes& attrs,
         return channel_last::make_plan(attrs, inputs, outputs, num_threads,
                                        use_thread_slots, num_slots);
     }
-    return planar::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
+    return channel_first::make_plan(attrs, inputs, outputs, num_threads, use_thread_slots,
                              num_slots);
 }
 
@@ -961,7 +963,7 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                             void* /*workspace*/)
 {
     // Never fall back to the reference conv2d here: U is not an OIHW filter —
-    // planar's is rank-3 with dims[0] == 16, which the reference reads as an OC
+    // Channel-first's is rank-3 with dims[0] == 16, which the reference reads as an OC
     // of 16.
     NNOPS_ASSERT(inputs.size() >= 2);
     const DataType dt = inputs[0].data_type();
@@ -990,37 +992,37 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                  "conv2d_winograd_kernel: unsupported conv geometry (k3s1 only)");
 
     PoolPtr scratch(plan.workspace_size);
-    const bool nhwc = plan.route == Conv2DWinogradRoute::ChannelLast;
+    const bool channel_last = plan.route == Conv2DWinogradRoute::ChannelLast;
     const bool f43  = plan.order == WinoOrder::F43;
     if (dt == DataType::f32) {
-        if (nhwc) {
+        if (channel_last) {
             if (f43) {
-                channel_last::conv2d_winograd_nhwc_impl<float, WinoOrder::F43>(
+                channel_last::conv2d_winograd_channel_last_impl<float, WinoOrder::F43>(
                     attrs, output, inputs, ctx, plan, scratch.as<float>());
             } else {
-                channel_last::conv2d_winograd_nhwc_impl<float, WinoOrder::F23>(
+                channel_last::conv2d_winograd_channel_last_impl<float, WinoOrder::F23>(
                     attrs, output, inputs, ctx, plan, scratch.as<float>());
             }
         } else if (f43) {
-            planar::conv2d_winograd_impl<float, WinoOrder::F43>(
+            channel_first::conv2d_winograd_impl<float, WinoOrder::F43>(
                 attrs, output, inputs, ctx, plan, scratch.as<float>());
         } else {
-            planar::conv2d_winograd_impl<float, WinoOrder::F23>(
+            channel_first::conv2d_winograd_impl<float, WinoOrder::F23>(
                 attrs, output, inputs, ctx, plan, scratch.as<float>());
         }
-    } else if (nhwc) {
+    } else if (channel_last) {
         if (f43) {
-            channel_last::conv2d_winograd_nhwc_impl<half, WinoOrder::F43>(
+            channel_last::conv2d_winograd_channel_last_impl<half, WinoOrder::F43>(
                 attrs, output, inputs, ctx, plan, scratch.as<half>());
         } else {
-            channel_last::conv2d_winograd_nhwc_impl<half, WinoOrder::F23>(
+            channel_last::conv2d_winograd_channel_last_impl<half, WinoOrder::F23>(
                 attrs, output, inputs, ctx, plan, scratch.as<half>());
         }
     } else if (f43) {
-        planar::conv2d_winograd_impl<half, WinoOrder::F43>(
+        channel_first::conv2d_winograd_impl<half, WinoOrder::F43>(
             attrs, output, inputs, ctx, plan, scratch.as<half>());
     } else {
-        planar::conv2d_winograd_impl<half, WinoOrder::F23>(
+        channel_first::conv2d_winograd_impl<half, WinoOrder::F23>(
             attrs, output, inputs, ctx, plan, scratch.as<half>());
     }
     return Status::ok;

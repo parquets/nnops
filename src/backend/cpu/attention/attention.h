@@ -55,7 +55,7 @@
 /// min(Kc, k) of the longer GEMM, since a head dim below Kc would otherwise
 /// over-allocate by up to 2x.
 ///
-/// Q/K/V/O head slices are M×K / N×K / K×N / M×N submatrices of the planar
+/// Q/K/V/O head slices are M×K / N×K / K×N / M×N submatrices of the channel-first
 /// tensors, for both merged [B, S, H*D] and explicit [B, H, S, D] layouts (a
 /// head's D columns are contiguous within each row). The mask is flat
 /// [Sq, Sk_total] over the whole run; its index carries no batch or head.

@@ -48,7 +48,7 @@ static TensorDesc td(std::initializer_list<int64_t> dims,
 }
 
 /// storage_bytes() counts 32B-aligned row pitch, so it is >= nbytes() for both
-/// planar and packed layouts; the two are equal when the dense row already
+/// Channel-first and packed layouts; the two are equal when the dense row already
 /// meets the pitch.
 static void check_storage_consistent(const TensorDesc& d) {
     size_t sb = d.storage_bytes();
@@ -282,9 +282,9 @@ NNOPS_TEST(shape_depthwise_conv_2d) {
     validate_output(descs[0], 4, {1, 32, 56, 56}, TensorLayout::NCHW);
 }
 
-NNOPS_TEST(shape_depthwise_conv_2d_nhwc) {
+NNOPS_TEST(shape_depthwise_conv_2d_channel_last) {
     // Channel-last: dims stay logical [N, C, H, W]; the layout tag alone sets
-    // memory order, so the shape math is the planar math.
+    // memory order, so the shape math is the channel-first math.
     auto op = DepthwiseConv::create(Backend::CPU);
     auto& attrs = const_cast<DepthwiseConvAttributes&>(op->attributes());
     attrs.kernel_size = {1, 3, 3};
@@ -335,7 +335,7 @@ NNOPS_TEST(shape_pooling_2d) {
     validate_output(descs[0], 4, {1, 64, 56, 56}, TensorLayout::NCHW);
 }
 
-NNOPS_TEST(shape_pooling_2d_nhwc) {
+NNOPS_TEST(shape_pooling_2d_channel_last) {
     auto op = Pooling::create(Backend::CPU);
     auto& attrs = const_cast<PoolingAttributes&>(op->attributes());
     attrs.kernel_shape = {2, 3, 3};
@@ -880,7 +880,7 @@ NNOPS_TEST(shape_reduce_channel_last) {
     const TensorDesc desc_arr[] = {in_desc};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    // Dropping an axis shifts the channel axis, so the result is planar.
+    // Dropping an axis shifts the channel axis, so the result is channel-first.
     NNOPS_EXPECT_EQ(static_cast<int>(descs[0].layout), static_cast<int>(TensorLayout::NCHW));
     validate_dims(descs[0], 3, {32, 28, 28});
 
@@ -937,7 +937,7 @@ NNOPS_TEST(shape_workspace_consistent) {
     NNOPS_EXPECT_TRUE(ws >= size_t(0));
 }
 
-NNOPS_TEST(shape_storage_bytes_planar_equality) {
+NNOPS_TEST(shape_storage_bytes_channel_first_equality) {
     auto op = Activation::create(Backend::CPU);
 
     // {1,8,8,8} f32: row 8*4 = 32B is already pitch-aligned, so
@@ -963,7 +963,7 @@ NNOPS_TEST(shape_storage_bytes_packed_exceeds_nbytes) {
 }
 
 // ============================================================
-// NHWC / NDHWC layout propagation
+// Channel-last layout propagation
 // ============================================================
 
 NNOPS_TEST(shape_nchwc16_layout_propagation) {

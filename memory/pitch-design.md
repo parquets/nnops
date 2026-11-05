@@ -22,7 +22,7 @@ TensorView uses a pitch-based memory model (like OpenCV `cv::Mat::step[0]`) inst
 - Elements within a row are always contiguous (byte stride = `elem_size`).
 - Higher dimensions (C, N, D, ...) are densely packed — stride = inner_dim_size × inner_stride.
 
-For NCHW float32: `pitch >= W * 4`. For contiguous data: `pitch == W * 4`.
+For channel-first float32: `pitch >= W * 4`. For contiguous data: `pitch == W * 4`.
 For NCHWC8 uint8: `pitch >= W * 8`. With 32-byte alignment: `pitch = align_up(W*8, 32)`.
 
 ## API

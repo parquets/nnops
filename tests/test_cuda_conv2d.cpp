@@ -1,5 +1,5 @@
 /// @file test_cuda_conv2d.cpp
-/// @brief CUDA Conv2D, planar and channel-last, against the CPU backend.
+/// @brief CUDA Conv2D, channel-first and channel-last, against the CPU backend.
 ///
 /// Each case builds one activation/filter pair, runs the operator on both
 /// backends over the same bytes, and compares. The CPU route is the oracle
@@ -12,7 +12,7 @@
 /// a depthwise-shaped group count, plane sizes that leave a partial pixel tile
 /// (a 7x7 output is 49 pixels against a 64-pixel tile), and input channels that
 /// do not fill a k tile. Both memory orders run the same cases, and one test
-/// converts a planar result into the channel-last order and demands the two
+/// converts a channel-first result into the channel-last order and demands the two
 /// routes agree, which catches an address error that both backends would have
 /// to share.
 ///
@@ -53,7 +53,7 @@ struct ConvCase {
     bool channel_last = false;
     bool use_bias = false;
     bool add_to = false;
-    // Planar only: a 32 B row pitch on the activation, and one on the output.
+    // Channel-first only: a 32 B row pitch on the activation, and one on the output.
     // A pitched output pins the CPU planner's oh-block to one row (its GEMM
     // flattens a block into one contiguous run), so both backends have to
     // reproduce the same values in the same padded rows.
@@ -149,77 +149,77 @@ Outputs run_case(const ConvCase& c, const char* what)
 
 }  // namespace
 
-NNOPS_TEST(cuda_conv2d_planar_geometry) {
+NNOPS_TEST(cuda_conv2d_channel_first_geometry) {
     {
         ConvCase c;   // 3x3 s1 p1 over 14x14
         c.ic = 8; c.oc = 16;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
     {
         ConvCase c;   // stride 2
         c.ic = 8; c.oc = 16; c.sh = c.sw = 2; c.ph = c.pw = 0;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
     {
         ConvCase c;   // dilation 2 on a 5x5 filter
         c.ic = 8; c.oc = 16; c.kh = c.kw = 5; c.dh = c.dw = 2; c.ph = c.pw = 4;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
     {
         ConvCase c;   // 1x1 pointwise
         c.ic = 8; c.oc = 16; c.kh = c.kw = 1; c.ph = c.pw = 0;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
     {
         ConvCase c;   // non-square filter and stride
         c.ic = 6; c.oc = 12; c.kh = 3; c.kw = 2; c.sh = 1; c.sw = 2;
         c.ph = 1; c.pw = 0;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
     {
         ConvCase c;   // 7x7 plane: 49 pixels against a 64-pixel tile
         c.ic = 16; c.oc = 32; c.ih = c.iw = 7; c.ph = c.pw = 1;
         c.pad_output = true;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
     {
         ConvCase c;   // multi-batch
         c.n = 3; c.ic = 5; c.oc = 9; c.ih = 9; c.iw = 11;
-        run_case(c, "cuda_conv2d_planar_geometry");
+        run_case(c, "cuda_conv2d_channel_first_geometry");
     }
 }
 
-NNOPS_TEST(cuda_conv2d_planar_groups) {
+NNOPS_TEST(cuda_conv2d_channel_first_groups) {
     {
         ConvCase c;   // two groups
         c.ic = 8; c.oc = 16; c.groups = 2;
-        run_case(c, "cuda_conv2d_planar_groups");
+        run_case(c, "cuda_conv2d_channel_first_groups");
     }
     {
         ConvCase c;   // depthwise-shaped: one group per channel
         c.ic = 8; c.oc = 8; c.groups = 8;
-        run_case(c, "cuda_conv2d_planar_groups");
+        run_case(c, "cuda_conv2d_channel_first_groups");
     }
     {
         ConvCase c;   // four groups, non-square stride
         c.ic = 12; c.oc = 16; c.groups = 4; c.sh = c.sw = 2; c.ph = c.pw = 0;
-        run_case(c, "cuda_conv2d_planar_groups");
+        run_case(c, "cuda_conv2d_channel_first_groups");
     }
 }
 
-NNOPS_TEST(cuda_conv2d_planar_f16) {
+NNOPS_TEST(cuda_conv2d_channel_first_f16) {
     ConvCase c;
     c.ic = 8; c.oc = 16; c.dtype = DataType::f16; c.use_bias = true;
-    run_case(c, "cuda_conv2d_planar_f16");
+    run_case(c, "cuda_conv2d_channel_first_f16");
 
     ConvCase d;
     d.ic = 16; d.oc = 24; d.dtype = DataType::f16; d.padded = true;
     d.ih = d.iw = 7; d.groups = 2;
     d.pad_output = true;   // 7 f16 = 14 B a row: both planes get a 32 B pitch
-    run_case(d, "cuda_conv2d_planar_f16");
+    run_case(d, "cuda_conv2d_channel_first_f16");
 }
 
-NNOPS_TEST(cuda_conv2d_planar_epilogue) {
+NNOPS_TEST(cuda_conv2d_channel_first_epilogue) {
     // Relu with add_to: the residual lands after the activation.
     Epilogue relu;
     relu.type = EpilogueActivateType::Relu;
@@ -227,7 +227,7 @@ NNOPS_TEST(cuda_conv2d_planar_epilogue) {
     ConvCase c;
     c.ic = 8; c.oc = 16; c.use_bias = true; c.epilogue = relu;
     c.add_to = true;
-    run_case(c, "cuda_conv2d_planar_epilogue");
+    run_case(c, "cuda_conv2d_channel_first_epilogue");
 
     // Relu6 is the other activation Conv folds into the store clamp.
     Epilogue relu6;
@@ -235,7 +235,7 @@ NNOPS_TEST(cuda_conv2d_planar_epilogue) {
 
     ConvCase d;
     d.ic = 8; d.oc = 16; d.use_bias = true; d.epilogue = relu6;
-    run_case(d, "cuda_conv2d_planar_epilogue");
+    run_case(d, "cuda_conv2d_channel_first_epilogue");
 
     // An activation that is not a pure clamp runs through the epilogue itself.
     Epilogue gelu;
@@ -243,7 +243,7 @@ NNOPS_TEST(cuda_conv2d_planar_epilogue) {
 
     ConvCase e;
     e.ic = 8; e.oc = 16; e.use_bias = true; e.epilogue = gelu;
-    run_case(e, "cuda_conv2d_planar_epilogue");
+    run_case(e, "cuda_conv2d_channel_first_epilogue");
 
     // epilogue.min_clip/max_clip are MatMul's: Conv2D folds only Relu/Relu6 and
     // ignores the fields (see core/epilogue.hpp), on both backends.
@@ -253,7 +253,7 @@ NNOPS_TEST(cuda_conv2d_planar_epilogue) {
 
     ConvCase f;
     f.ic = 8; f.oc = 16; f.use_bias = true; f.epilogue = clip;
-    run_case(f, "cuda_conv2d_planar_epilogue");
+    run_case(f, "cuda_conv2d_channel_first_epilogue");
 }
 
 NNOPS_TEST(cuda_conv2d_channel_last_geometry) {
@@ -310,7 +310,7 @@ NNOPS_TEST(cuda_conv2d_channel_last_f16_add_to) {
 
 NNOPS_TEST(cuda_conv2d_layouts_agree) {
     // One convolution computed in both orders must give the same numbers: run
-    // the planar route, convert its output to the channel-last order, and hold
+    // the channel-first route, convert its output to the channel-last order, and hold
     // it against the channel-last route on the transposed filter.
     const int64_t n = 2, ic = 8, ih = 12, iw = 10, oc = 16, kh = 3, kw = 3;
     const int64_t oh = ih, ow = iw;
@@ -321,60 +321,60 @@ NNOPS_TEST(cuda_conv2d_layouts_agree) {
     (void)act_view;
     (void)wgt_view;
 
-    std::vector<float> act_nhwc = nchw_to_nhwc<float>(act_flat, n, ic, ih, iw);
+    std::vector<float> act_channel_last = channel_first_to_channel_last<float>(act_flat, n, ic, ih, iw);
     std::vector<float> wgt_hwio = oihw_to_hwio<float>(wgt_flat, oc, icg, kh, kw);
 
     Conv2DAttributes attrs;
     attrs.kernel_size = {kh, kw};
     attrs.padding = {1, 1};
 
-    const int64_t as_nchw[] = {n, ic, ih, iw};
+    const int64_t as_channel_first[] = {n, ic, ih, iw};
     const int64_t ws_oihw[] = {oc, icg, kh, kw};
-    const int64_t as_nhwc[] = {n, ic, ih, iw};
+    const int64_t as_channel_last[] = {n, ic, ih, iw};
     const int64_t ws_hwio[] = {kh, kw, icg, oc};
     const int64_t os[] = {n, oc, oh, ow};
 
     // The operator reads the views' pointers on the device, so every operand
     // (and the two destinations) has to live in device memory.
-    CudaBuffer d_act_planar(act_flat.size() * sizeof(float));
-    CudaBuffer d_wgt_planar(wgt_flat.size() * sizeof(float));
-    CudaBuffer d_act_last(act_nhwc.size() * sizeof(float));
+    CudaBuffer d_act_channel_first(act_flat.size() * sizeof(float));
+    CudaBuffer d_wgt_channel_first(wgt_flat.size() * sizeof(float));
+    CudaBuffer d_act_last(act_channel_last.size() * sizeof(float));
     CudaBuffer d_wgt_last(wgt_hwio.size() * sizeof(float));
     const size_t out_bytes = static_cast<size_t>(n * oc * oh * ow) * sizeof(float);
-    CudaBuffer d_out_planar(out_bytes);
+    CudaBuffer d_out_channel_first(out_bytes);
     CudaBuffer d_out_last(out_bytes);
-    d_act_planar.upload(act_flat.data(), act_flat.size() * sizeof(float));
-    d_wgt_planar.upload(wgt_flat.data(), wgt_flat.size() * sizeof(float));
-    d_act_last.upload(act_nhwc.data(), act_nhwc.size() * sizeof(float));
+    d_act_channel_first.upload(act_flat.data(), act_flat.size() * sizeof(float));
+    d_wgt_channel_first.upload(wgt_flat.data(), wgt_flat.size() * sizeof(float));
+    d_act_last.upload(act_channel_last.data(), act_channel_last.size() * sizeof(float));
     d_wgt_last.upload(wgt_hwio.data(), wgt_hwio.size() * sizeof(float));
-    d_out_planar.zero();
+    d_out_channel_first.zero();
     d_out_last.zero();
 
-    TensorView a_planar(as_nchw, DataType::f32, d_act_planar.data());
-    TensorView w_planar(ws_oihw, DataType::f32, d_wgt_planar.data());
-    TensorView a_last(as_nhwc, DataType::f32, d_act_last.data(), TensorLayout::NHWC);
+    TensorView a_channel_first(as_channel_first, DataType::f32, d_act_channel_first.data());
+    TensorView w_channel_first(ws_oihw, DataType::f32, d_wgt_channel_first.data());
+    TensorView a_last(as_channel_last, DataType::f32, d_act_last.data(), TensorLayout::NHWC);
     TensorView w_last(ws_hwio, DataType::f32, d_wgt_last.data(), TensorLayout::HWIO);
-    TensorView o_planar(os, DataType::f32, d_out_planar.data());
+    TensorView o_channel_first(os, DataType::f32, d_out_channel_first.data());
     TensorView o_last(os, DataType::f32, d_out_last.data(), TensorLayout::NHWC);
 
-    std::vector<float> out_planar(static_cast<size_t>(n * oc * oh * ow), 0.0f);
-    std::vector<float> out_last(out_planar.size(), 0.0f);
+    std::vector<float> out_channel_first(static_cast<size_t>(n * oc * oh * ow), 0.0f);
+    std::vector<float> out_last(out_channel_first.size(), 0.0f);
 
     auto op = Conv2D::create(attrs, Backend::CUDA);
     {
-        const TensorView ins[] = {a_planar, w_planar};
-        cuda_run(*op, o_planar, ins);
+        const TensorView ins[] = {a_channel_first, w_channel_first};
+        cuda_run(*op, o_channel_first, ins);
     }
     {
         const TensorView ins[] = {a_last, w_last};
         cuda_run(*op, o_last, ins);
     }
-    d_out_planar.download(out_planar.data(), out_bytes);
+    d_out_channel_first.download(out_channel_first.data(), out_bytes);
     d_out_last.download(out_last.data(), out_bytes);
 
-    std::vector<float> planar_as_last =
-        nchw_to_nhwc<float>(out_planar, n, oc, oh, ow);
-    expect_close(planar_as_last, out_last, 1e-3f, 1e-4f, "cuda_conv2d_layouts_agree");
+    std::vector<float> channel_first_as_last =
+        channel_first_to_channel_last<float>(out_channel_first, n, oc, oh, ow);
+    expect_close(channel_first_as_last, out_last, 1e-3f, 1e-4f, "cuda_conv2d_layouts_agree");
 }
 
 NNOPS_TEST(cuda_conv2d_pitched_output) {

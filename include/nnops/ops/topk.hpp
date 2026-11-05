@@ -2,7 +2,7 @@
 /// @file topk.hpp
 /// @brief TopK operator — top-k (or bottom-k) values and indices along an axis.
 ///
-/// Planar (NCHW/NCDHW) layouts, f32/f16 input. Two outputs: Values (same dtype,
+/// Channel-first layouts, f32/f16 input. Two outputs: Values (same dtype,
 /// axis dim replaced by k) and Indices (int64, same shape as Values).
 
 #include "nnops/core/op_base.hpp"
@@ -58,7 +58,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::TopK; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const TopKAttributes& attributes() const noexcept { return attrs_; }
 

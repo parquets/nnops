@@ -4,7 +4,7 @@
 /// Desk-checked scalar cases for Exp/Log/Sin/Cos/Tanh/Abs/Neg/Sqrt on small
 /// rank-1 tensors, compared against std:: or literal values (Sin/Cos feed 0,
 /// pi/2 and pi). The f32 cases first check getOutputTensorDesc preserves rank,
-/// dims, NCHW layout and dtype; the f16 cases check the output dtype. `add_to`
+/// dims, channel-first layout and dtype; the f16 cases check the output dtype. `add_to`
 /// is the accumulating form: the output buffer arrives pre-filled and the op
 /// adds into it instead of overwriting. Random data sweeps for Abs and Exp and
 /// a rank-2 Sqrt case round out the float side.
@@ -50,7 +50,7 @@ NNOPS_TEST(unary_exp) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -79,7 +79,7 @@ NNOPS_TEST(unary_log) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -108,7 +108,7 @@ NNOPS_TEST(unary_sin) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -137,7 +137,7 @@ NNOPS_TEST(unary_cos) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -166,7 +166,7 @@ NNOPS_TEST(unary_tanh) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -195,7 +195,7 @@ NNOPS_TEST(unary_abs) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -225,7 +225,7 @@ NNOPS_TEST(unary_neg) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -254,7 +254,7 @@ NNOPS_TEST(unary_sqrt) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -284,7 +284,7 @@ NNOPS_TEST(unary_add_to) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -310,7 +310,7 @@ NNOPS_TEST(unary_random_abs) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(1000);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -337,7 +337,7 @@ NNOPS_TEST(unary_random_exp) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(500);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -367,7 +367,7 @@ NNOPS_TEST(unary_2d_sqrt) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -395,7 +395,7 @@ NNOPS_TEST(unary_random_exp_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(400);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -425,7 +425,7 @@ NNOPS_TEST(unary_random_abs_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(400);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -581,7 +581,7 @@ static void check_unary_f32(UnaryType type, const std::vector<float>& xs,
     NNOPS_EXPECT_EQ(descs[0].numel(), static_cast<int64_t>(xs.size()));
 
     std::vector<float> out_buf(xs.size());
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(output, ins)));

@@ -36,7 +36,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Files:** `include/nnops/ops/conv3d.hpp`, `src/ops/conv3d.cpp`, `src/backend/cpu/reference/conv3d_ref.cpp`
 - **Attributes:** `Conv3DAttributes` — kernel_size[3], stride[3], dilation[3], padding[3], groups, auto_pad, epilogue
 - **Input:** `[N, IC, ID, IH, IW]`, weight `[OC, IC/G, KD, KH, KW]`, optional bias `[OC]`
-- **Output:** `[N, OC, OD, OH, OW]` (NCDHW layout)
+- **Output:** `[N, OC, OD, OH, OW]` (channel-first 3D layout)
 - **CPU Reference:** 9-level nested loop, per-sample parallel via `parallel_for`; output write: `apply_epilogue(attrs.epilogue, sum, oc_global)`
 - **Added:** 2026-07-21
 - **Note:** Same Impl/Pimpl pattern as Conv2D. Follows the 2D→3D upgrade pattern established by [[#Pooling]].
@@ -46,7 +46,7 @@ Reference project patterns from onnxruntime (OpKernel + attributes struct), Comp
 - **Files:** `include/nnops/ops/depthwise_conv2d.hpp`, `src/ops/depthwise_conv2d.cpp`, `src/backend/cpu/depthwise_conv2d.cpp`, `src/backend/cpu/reference/depthwise_conv2d_ref.cpp`, `src/backend/cuda/depthwise_conv2d.cu`
 - **Attributes:** `DepthwiseConv2DAttributes` — kernel_size[2], stride[2], dilation[2], padding[2], epilogue, add_to
 - **Input:** `[N, C, IH, IW]`, weight `[C, 1, KH, KW]`, optional bias `[C]`
-- **Output:** `[N, C, OH, OW]` (NCHW layout)
+- **Output:** `[N, C, OH, OW]` (channel-first layout)
 - **Formula:** Per-channel convolution — each input channel is convolved with its own independent KH×KW filter. No cross-channel mixing.
 - **CPU SIMD Kernel** (`src/backend/cpu/depthwise_conv2d.cpp`): Height-4 blocking (process 4 output rows simultaneously to reuse kernel weights), width SIMD via `simd_lane_for<T>` (8 lanes), region splitting (pad regions → scalar, interior → SIMD), kernel weight pre-load into registers, N×C parallel via `ctx.cpu.run`. Falls back to reference when SIMD unavailable.
 - **Data types:** f32 and f16 (templated `depthwise_conv2d_impl<T>`, dtype dispatch at entry)

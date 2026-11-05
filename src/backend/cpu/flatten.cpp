@@ -1,7 +1,7 @@
 /// @file flatten.cpp
 /// @brief SIMD-optimized CPU implementation of Flatten.
 ///
-/// Row-by-row SIMD copy from any input layout to dense planar output.
+/// Row-by-row SIMD copy from any input layout to dense channel-first output.
 /// Uses the generic SIMD API (v_load/v_store) to handle both f32 and f16.
 ///
 /// The key optimization: detect when the input is already dense in the
@@ -26,7 +26,7 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
     const int64_t rank  = input.rank();
     constexpr int L = simd_lane_for<T>;
 
-    // Output is always dense planar
+    // Output is always dense channel-first
     const int64_t oW = output.shape(rank - 1);
     const int64_t o_row_stride = oW;
 
@@ -60,7 +60,7 @@ void flatten_impl(const FlattenAttributes& /*attrs*/,
 
         int64_t w = 0;
         if (i_w_stride == 1) {
-            // Planar input: contiguous row → SIMD vector copy
+            // Channel-first input: contiguous row → SIMD vector copy
             for (; w + L <= oW; w += L) {
                 v_store(o_row + w, v_load(i_ptr + i_off + w));
             }

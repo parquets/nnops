@@ -1,14 +1,15 @@
 /// @file transpose_conv2d.cpp
-/// @brief CPU implementation of 2D transposed convolution, planar and
+/// @brief CPU implementation of 2D transposed convolution, channel-first and
 ///        channel-last.
 ///
 /// Gather formulation (output-driven), the exact inverse of regular conv's
 /// indexing: output (oh, ow) reads input (ih, iw) where
 /// oh + PH - kh·DH == ih·SH (and likewise for w), so every output pixel is
 /// accumulated independently and add_to needs no save/restore pass. Weights are
-/// planar [IC, OC/G, KH, KW] either way; the image tensor is NCHW or NHWC.
+/// Channel-first [IC, OC/G, KH, KW] either way; the image tensor is channel-first or
+/// channel-last.
 ///
-/// Planar runs the onnxruntime structure: for each (n, group) the group's
+/// Channel-first runs the onnxruntime structure: for each (n, group) the group's
 /// filter slice is a [OC/G·KH·KW] × [IC/G] matrix and the whole input plane is
 /// [IC/G] × [IH·IW], so one GEMM produces the col matrix — every (oc, kh, kw)
 /// row over every input pixel, the channel reduction already done. A scatter
@@ -34,7 +35,7 @@
 /// That reuse only survives while the filter does: a large filter is re-read
 /// from DRAM on every tile, and a stride-1 filter has many taps per output
 /// pixel, so both go through the col matrix instead — the same one GEMM per
-/// (n, group) as the planar route, with the image as [npix][IC/G] and the
+/// (n, group) as the channel-first route, with the image as [npix][IC/G] and the
 /// filter repacked to [IC/G][KH·KW·OC/G], followed by a stride-residue scatter
 /// that adds whole oc vectors. Depthwise (one channel per group) has its own
 /// route: group g's input channel *is* output channel g, so the vector axis is
@@ -75,7 +76,7 @@ struct Geom {
 /// Largest col one GEMM call may materialise; past it the M rows are split.
 constexpr int64_t kColCapBytes = 8 << 20;
 
-/// Tallest per-row tap list the planar scatter keeps on the stack.
+/// Tallest per-row tap list the channel-first scatter keeps on the stack.
 constexpr int64_t kMaxRowTaps = 16;
 
 /// row[0, n) += src[0, n), element-wise.
@@ -114,10 +115,10 @@ void row_fill(T* dst, int64_t n, float v)
     for (; i < n; ++i) { s_store(dst + i, v); }
 }
 
-/// Planar through a col matrix — the onnxruntime route. Returns false when the
+/// Channel-first through a col matrix — the onnxruntime route. Returns false when the
 /// operands cannot be read as flat matrices, leaving the caller its scalar path.
 template <typename T>
-bool tconv2d_planar_gemm(const Geom& gm,
+bool tconv2d_channel_first_gemm(const Geom& gm,
                          TensorView& output,
                          std::span<const TensorView> inputs,
                          const ComputeContext& ctx)
@@ -409,7 +410,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
     // Two col orientations. Ordered [tap][oc] the GEMM needs the filter
     // permuted to [IC/G][KH·KW·OC/G], but the col feeds the scatter as it is.
     // Ordered [oc][tap] the raw filter slice *is* B — oc runs faster than tap
-    // in the planar weight already — and the col pays a transpose instead, per
+    // in the channel-first weight already — and the col pays a transpose instead, per
     // batch item. One of the two is walked twice either way, so walk the
     // smaller: the filter once, or the col per batch item.
     const bool direct_w = npix * gm.N < icg;
@@ -445,7 +446,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
 
             if (!direct_w) {
                 // B: the group's filter slice as [IC/G] × [KH·KW·nc], a blocked
-                // transpose of the planar [IC/G][OC/G][KH·KW] rows.
+                // transpose of the channel-first [IC/G][OC/G][KH·KW] rows.
                 for (int64_t ic = 0; ic < icg; ++ic) {
                     const T* src = w_ptr + ((g * icg + ic) * ocg + oc0) * karea;
                     T* dst = aux.data() + ic * karea * nc;
@@ -465,7 +466,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
             }
 
             // B is the filter slice as [IC/G] × [KH·KW·nc]: permuted, or the
-            // planar rows read in place with oc still the faster axis.
+            // Channel-first rows read in place with oc still the faster axis.
             const int64_t bshape[] = {icg, m};
             TensorView bm(std::span<const int64_t>(bshape, 2), vdt,
                           direct_w
@@ -478,7 +479,7 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
                 const T* in_n = in_ptr + n * in_n_stride;
                 T* out_n = out_ptr + n * out_n_stride;
 
-                // A: the NHWC image as [IH·IW] × [IC/G] pixels — one pixel
+                // A: the channel-last image as [IH·IW] × [IC/G] pixels — one pixel
                 // stride of IC, so the group offset is g·IC/G elements in.
                 const int64_t ashape[] = {npix, icg};
                 TensorView am(std::span<const int64_t>(ashape, 2), vdt,
@@ -630,7 +631,7 @@ void tconv2d_impl(const Geom& gm,
     const T* type_tag = nullptr;
 
     if (!is_channel_last(input.layout())) {
-        if (tconv2d_planar_gemm<T>(gm, output, inputs, ctx)) { return; }
+        if (tconv2d_channel_first_gemm<T>(gm, output, inputs, ctx)) { return; }
 
         const int64_t in_c_stride  = input.stride_elems(1);
         const int64_t out_c_stride = output.stride_elems(1);

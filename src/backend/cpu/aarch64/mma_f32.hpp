@@ -21,9 +21,9 @@
 /// packers fill on the A side and the C row pointers repeat -- so a partial-M
 /// tile needs no per-row guards; only the tail's store loop stops at `mr`.
 ///
-/// Bias seed (both routes): 1 is per-row (`bias[r]`) -- the planar route,
+/// Bias seed (both routes): 1 is per-row (`bias[r]`) -- the channel-first route,
 /// where a row is an output channel; 2 is per-column (`bias + n + off`) -- the
-/// channel-last shape, where rows are pixels and the bias lands on the panel's
+/// Channel-last shape, where rows are pixels and the bias lands on the panel's
 /// lanes. Seeding each row's three panel vectors costs a few loads, where
 /// priming the tile first would cost a full output write and read-back. Seed 2
 /// loads a whole 12-lane panel even on a short tail, since `n` is its start.

@@ -5,10 +5,10 @@
 /// f32 and f16 share one templated implementation per type, over the SIMD row
 /// kernels in simd_kernel/simd_norm.hpp. LayerNorm / RMSNorm / L2Norm run the
 /// vectorized row path when the normalized axes are the physically contiguous
-/// tail (planar axis == rank-1) and otherwise walk precomputed offsets, so a
-/// logical axis means the same thing in planar and channel-last layouts.
+/// tail (channel-first axis == rank-1) and otherwise walk precomputed offsets, so a
+/// logical axis means the same thing in channel-first and channel-last layouts.
 /// BatchNorm walks rows and applies the per-channel factors pixel by pixel in
-/// channel-last; GroupNorm reduces one (sample, group) at a time.
+/// Channel-last; GroupNorm reduces one (sample, group) at a time.
 ///
 /// s8/u8 input is supported for LayerNorm / RMSNorm / L2Norm over the trailing
 /// axis: each integer row is dequantized to f32 by the arch quant.hpp per-row
@@ -94,7 +94,7 @@ inline NormDims compute_norm_dims(const TensorView& X, int64_t raw_axis) {
     int64_t norm_size = 1;
     for (int64_t i = axis; i < rank; ++i) { norm_size *= X.shape(i); }
 
-    // Only planar's trailing axis is one physically contiguous run.
+    // Only channel-first's trailing axis is one physically contiguous run.
     const bool contiguous_tail = (axis == rank - 1) &&
                                  !is_channel_last(X.layout());
     return {axis, num_rows, norm_size, contiguous_tail};
@@ -189,7 +189,7 @@ void batch_norm_impl(const NormAttributes& attrs,
                 const int64_t y_ch_base = n * y_n_stride + c * y_c_stride;
 
                 for (int64_t hh = 0; hh < num_rows; ++hh) {
-                    kernel::batch_norm_process_planar_row<T>(
+                    kernel::batch_norm_process_channel_first_row<T>(
                         x_ptr + x_ch_base + hh * x_row_stride,
                         y_ptr + y_ch_base + hh * y_row_stride,
                         last_dim, ns, nb, attrs.add_to);

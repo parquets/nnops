@@ -1,10 +1,10 @@
 #pragma once
 /// @file simd_depthwise_conv.hpp
-/// @brief SIMD kernels for 2D/3D depthwise convolution, planar and channel-last.
+/// @brief SIMD kernels for 2D/3D depthwise convolution, channel-first and channel-last.
 ///
 /// Two drivers, split by the axis the lane takes.
 ///
-/// Channel-last (NHWC/NDHWC) reads the raw HWCM filter [KD][KH][KW][C] — TF's
+/// Channel-last reads the raw HWCM filter [KD][KH][KW][C] — TF's
 /// depthwise order with the multiplier dropped — and puts the lane on the channel.
 /// The pixel stride and the tap stride are both the channel count, set by the
 /// driver; no prepack is involved, because the layout already is the access
@@ -13,10 +13,10 @@
 /// other half of every line to a later pass — 2x the line traffic for the same
 /// arithmetic.
 ///
-/// Planar (NCHW/NCDHW) reads the raw [C, 1, (KD,) KH, KW] filter — one scalar per
+/// Channel-first reads the raw [C, 1, (KD,) KH, KW] filter — one scalar per
 /// tap, broadcast into the accumulate — and puts the lane on the output width.
 ///
-/// Both run R = 4 output rows per call, R = 1 for a tail. Planar needs it for ILP
+/// Both run R = 4 output rows per call, R = 1 for a tail. Channel-first needs it for ILP
 /// alone: one row's taps are a chain of KD*KH*KW dependent FMAs with nothing to
 /// interleave, and four rows are four independent chains. A KD of 1 — the 2D
 /// case — degenerates the depth loop, and padding is bounds-checked in-kernel.
@@ -37,7 +37,7 @@
 /// 1.4-1.9x slower at every shape, 1.4x even at C = 8 where only the kernel
 /// differs.
 ///
-/// The planar row table is gated on a row spanning at least two width vectors —
+/// The channel-first row table is gated on a row spanning at least two width vectors —
 /// at one it costs more to fill than the arithmetic it saves (1T GFLOPS, 3x3: two
 /// vectors 14.0 vs 14.3, four 18.5 vs 13.1, a 112-wide plane 28.3 vs 13.8). Its
 /// edge vectors take a lane mask instead, folded into the tap's broadcast weight;
@@ -205,11 +205,11 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
 }
 
 // ============================================================
-// Planar (NCHW/NCDHW) driver — the SIMD lane spans output width
+// Channel-first driver — the SIMD lane spans output width
 // ============================================================
 
 /// Lane masks for the plane's two edge width vectors.
-struct DwPlanarEdges {
+struct DwChannelFirstEdges {
     const void* masks = nullptr;      ///< [2][KW][L] elements of T
     const uint8_t* needed = nullptr;  ///< [2][KW]
     int64_t kw = 0;
@@ -219,10 +219,10 @@ struct DwPlanarEdges {
 /// Fill `masks` ([2*MaxKw*L] elements of T) and `needed` ([2*MaxKw]) from `p`.
 /// `masks == nullptr` is the general path; the buffers stay the caller's.
 template <int64_t MaxKw, typename T>
-inline DwPlanarEdges dwconv_planar_edge_masks(const DwConvParams& p, T* masks, uint8_t* needed)
+inline DwChannelFirstEdges dwconv_channel_first_edge_masks(const DwConvParams& p, T* masks, uint8_t* needed)
 {
     constexpr int64_t L = simd_lane_for<T>;
-    DwPlanarEdges edges;
+    DwChannelFirstEdges edges;
     if ((p.SW != 1 && p.SW != 2) || p.KW > MaxKw) {
         return edges;
     }
@@ -275,9 +275,9 @@ inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
 /// stride when the caller knows it (1 or 2) and 0 when it does not, so the choice
 /// stays out of the tap loop.
 template <int R, int SW, typename T>
-inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
+inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bias,
                                const DwConvParams& p, const Epilogue& epilogue,
-                               bool add_to, const DwPlanarEdges& edges)
+                               bool add_to, const DwChannelFirstEdges& edges)
 {
     constexpr int64_t L = simd_lane_for<T>;
     const T zero = static_cast<T>(0);
@@ -324,7 +324,7 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
     }
 
     // A stride-2 vector reads 2L inputs to produce L outputs, so the interior
-    // guard widens with it — the same bound planar_load uses.
+    // guard widens with it — the same bound channel_first_load uses.
     const int64_t span  = (sw == 2) ? 2 * L : L;
     const int64_t need  = (p.KW - 1) * p.DW + span;    // past the first column
     const int64_t ow_lo = (p.PW + sw - 1) / sw;        // first ow with iw >= 0
@@ -396,7 +396,7 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
                     const auto vk = v_set1(out, s_load(&w_row[kw]));
                     for (int r = 0; r < R; ++r) {
                         if (row[r] == nullptr) { continue; }
-                        acc[r] = v_fmadd(planar_load(row[r], iw0, p.SW, p.IW, zero),
+                        acc[r] = v_fmadd(channel_first_load(row[r], iw0, p.SW, p.IW, zero),
                                          vk, acc[r]);
                     }
                 }
@@ -433,32 +433,32 @@ inline void dwconv_planar_rows(T* out, const T* in, const T* w, float bias,
 // ============================================================
 
 template <typename T>
-inline void dwconv_planar_h4(T* out, const T* in, const T* w, float bias,
+inline void dwconv_channel_first_h4(T* out, const T* in, const T* w, float bias,
                              const DwConvParams& p, const Epilogue& epilogue,
-                             bool add_to, const DwPlanarEdges& edges)
+                             bool add_to, const DwChannelFirstEdges& edges)
 {
     switch (p.SW) {
-        case 1:  dwconv_planar_rows<4, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        case 2:  dwconv_planar_rows<4, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        default: dwconv_planar_rows<4, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 1:  dwconv_channel_first_rows<4, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 2:  dwconv_channel_first_rows<4, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        default: dwconv_channel_first_rows<4, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
     }
 }
 
 /// One row — the tail of an h4 loop, and the whole kernel for a single-row call.
 template <typename T>
-inline void dwconv_planar(T* out, const T* in, const T* w, float bias,
+inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias,
                           const DwConvParams& p, const Epilogue& epilogue,
-                          bool add_to, const DwPlanarEdges& edges)
+                          bool add_to, const DwChannelFirstEdges& edges)
 {
     switch (p.SW) {
-        case 1:  dwconv_planar_rows<1, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        case 2:  dwconv_planar_rows<1, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        default: dwconv_planar_rows<1, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 1:  dwconv_channel_first_rows<1, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 2:  dwconv_channel_first_rows<1, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        default: dwconv_channel_first_rows<1, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
     }
 }
 
 // ============================================================
-// Channel-last (NHWC/NDHWC) entry points
+// Channel-last entry points
 // ============================================================
 //
 // out_rows and in_img are the bases advanced by the channel block, w_tap0 the

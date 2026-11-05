@@ -1,9 +1,9 @@
 /// @file bench_cuda_conv2d.cpp
-/// @brief CUDA Conv2D throughput, planar NCHW and channel-last NHWC.
+/// @brief CUDA Conv2D throughput, channel-first and channel-last.
 ///
 /// Both memory orders run the same implicit-GEMM kernel: M is the output
 /// pixels, N is the output channels per group, K is IC/G·KH·KW, and the only
-/// difference is where each operand comes from — a gathered planar activation
+/// difference is where each operand comes from — a gathered channel-first activation
 /// against a coalesced channel-last row, and an OIHW filter read k-major
 /// against an HWIO filter read n-major. So the two tables answer which layout
 /// the gather is cheaper in for a given layer, and the third section puts them
@@ -122,7 +122,7 @@ double measure(const ConvBenchCase& c)
 double run_conv(const ConvBenchCase& c, const char* label)
 {
     const double ms = measure(c);
-    print_cuda_row(label, conv_geometry(c, c.channel_last ? "nhwc" : "nchw"), ms,
+    print_cuda_row(label, conv_geometry(c, c.channel_last ? "channel_last" : "channel_first"), ms,
                    cuda_gflops(ms, c.flops()));
     return cuda_gflops(ms, c.flops());
 }
@@ -189,45 +189,45 @@ void run_table(DataType dt, bool channel_last, const char* label)
 
 }  // namespace
 
-NNOPS_BENCH(cuda_conv2d_planar) {
-    print_cuda_header("CUDA Conv2D planar NCHW (f32)");
+NNOPS_BENCH(cuda_conv2d_channel_first) {
+    print_cuda_header("CUDA Conv2D channel-first (f32)");
     run_table(DataType::f32, false, "f32");
 }
 
 NNOPS_BENCH(cuda_conv2d_channel_last) {
-    print_cuda_header("CUDA Conv2D channel-last NHWC (f32)");
+    print_cuda_header("CUDA Conv2D channel-last (f32)");
     run_table(DataType::f32, true, "f32");
 }
 
 NNOPS_BENCH(cuda_conv2d_f16) {
     print_cuda_header("CUDA Conv2D f16 (tensor core)");
-    run_table(DataType::f16, false, "f16 nchw");
-    run_table(DataType::f16, true, "f16 nhwc");
+    run_table(DataType::f16, false, "f16 channel_first");
+    run_table(DataType::f16, true, "f16 channel_last");
 }
 
 NNOPS_BENCH(cuda_conv2d_layouts) {
     print_cuda_header("CUDA Conv2D layout A/B, same geometry (f32)");
-    // The planar arm is measured once before and once after each channel-last
+    // The channel-first arm is measured once before and once after each channel-last
     // arm, so the repeat is the drift floor the ratio has to clear.
     for (ConvBenchCase c : cnn_layers()) {
         ConvBenchCase last = c;
         last.channel_last = true;
 
-        const double planar = measure(c);
+        const double channel_first = measure(c);
         const double last_ms = measure(last);
-        const double planar_again = measure(c);
-        const double floor = planar_again / planar;
+        const double channel_first_again = measure(c);
+        const double floor = channel_first_again / channel_first;
 
         // The shared geometry string, minus the layout prefix.
         const std::string geo = conv_geometry(c, "");
-        std::printf("  %-36s nchw %8.4f ms   nhwc %8.4f ms   nhwc/nchw %.2f   "
-                    "drift %.3f\n", geo.c_str() + 1, planar, last_ms,
-                    last_ms / planar, floor);
+        std::printf("  %-36s channel_first %8.4f ms   channel_last %8.4f ms   channel_last/channel_first %.2f   "
+                    "drift %.3f\n", geo.c_str() + 1, channel_first, last_ms,
+                    last_ms / channel_first, floor);
     }
 }
 
 NNOPS_BENCH(cuda_conv2d_shapes) {
-    print_cuda_header("CUDA Conv2D stride, dilation and small planes (f32 nhwc)");
+    print_cuda_header("CUDA Conv2D stride, dilation and small planes (f32 channel_last)");
     // The shapes the implicit GEMM is most likely to mis-tile: planes whose
     // pixel count is not a multiple of the 64-pixel tile (49 and 196 pixels), a
     // stride-2 border, and a dilated 3x3 whose taps leave the plane.
@@ -236,19 +236,19 @@ NNOPS_BENCH(cuda_conv2d_shapes) {
         c.ic = c.oc = 64;
         c.ih = c.iw = side;
         c.channel_last = true;
-        run_conv(c, "nhwc s1");
+        run_conv(c, "channel_last s1");
     }
     {
         ConvBenchCase c;
         c.ic = c.oc = 128; c.ih = c.iw = 56; c.sh = c.sw = 2; c.ph = c.pw = 0;
         c.channel_last = true;
-        run_conv(c, "nhwc s2");
+        run_conv(c, "channel_last s2");
     }
     {
         ConvBenchCase c;
         c.ic = c.oc = 64; c.ih = c.iw = 28; c.dh = c.dw = 2; c.ph = c.pw = 2;
         c.channel_last = true;
-        run_conv(c, "nhwc d2");
+        run_conv(c, "channel_last d2");
     }
 }
 

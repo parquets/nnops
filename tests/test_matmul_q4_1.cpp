@@ -247,13 +247,13 @@ void run_case(const Case& c) {
             for (int64_t i = 0; i < M * N; ++i) {
                 out_f16[static_cast<size_t>(i)] = float_to_half(ramp_value(i));
             }
-            return nnops::test::make_planar(descs[0], out_f16.data());
+            return nnops::test::make_channel_first(descs[0], out_f16.data());
         }
         out_f32.resize(static_cast<size_t>(M * N));
         for (int64_t i = 0; i < M * N; ++i) {
             out_f32[static_cast<size_t>(i)] = ramp_value(i);
         }
-        return nnops::test::make_planar(descs[0], out_f32.data());
+        return nnops::test::make_channel_first(descs[0], out_f32.data());
     }();
 
     // Optional [N] bias in the output dtype, exactly representable in f16.
@@ -355,7 +355,7 @@ NNOPS_TEST(matmul_q4_1_batched) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], N);
 
     std::vector<float> out(static_cast<size_t>(B * M * N));
-    auto output = nnops::test::make_planar(descs[0], out.data());
+    auto output = nnops::test::make_channel_first(descs[0], out.data());
 
     const TensorView ins[] = {a, bv};
     op->compute(output, ins);

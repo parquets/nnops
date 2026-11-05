@@ -52,7 +52,7 @@ NNOPS_TEST(eltwise_add_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -85,7 +85,7 @@ NNOPS_TEST(eltwise_sub_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -117,7 +117,7 @@ NNOPS_TEST(eltwise_mul_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -150,7 +150,7 @@ NNOPS_TEST(eltwise_div_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -183,7 +183,7 @@ NNOPS_TEST(eltwise_add_to) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -211,7 +211,7 @@ NNOPS_TEST(eltwise_random_add) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(1000);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -239,7 +239,7 @@ NNOPS_TEST(eltwise_random_mul) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(500);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -272,7 +272,7 @@ NNOPS_TEST(eltwise_2d_add) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -304,7 +304,7 @@ NNOPS_TEST(eltwise_min_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -337,7 +337,7 @@ NNOPS_TEST(eltwise_max_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -366,7 +366,7 @@ NNOPS_TEST(eltwise_min_add_to) {
     const TensorDesc desc_arr[] = {d_a, d_b};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -389,7 +389,7 @@ NNOPS_TEST(eltwise_random_min) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(1000);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -413,7 +413,7 @@ NNOPS_TEST(eltwise_random_max) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(1000);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -446,7 +446,7 @@ NNOPS_TEST(eltwise_pow_1d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -475,7 +475,7 @@ NNOPS_TEST(eltwise_pow_add_to) {
     const TensorDesc desc_arr[] = {d_a, d_b};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto output = test::make_planar(descs[0], out_data);
+    auto output = test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -498,7 +498,7 @@ NNOPS_TEST(eltwise_random_pow) {
     auto descs = op->getOutputTensorDesc(desc_arr);
 
     std::vector<float> out_buf(1000);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -533,7 +533,7 @@ NNOPS_TEST(eltwise_min_max_2d) {
         NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
         NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
 
-        auto output = test::make_planar(descs[0], min_out);
+        auto output = test::make_channel_first(descs[0], min_out);
         const TensorView ins[] = {a, b};
         op->compute(output, ins);
     }
@@ -556,7 +556,7 @@ NNOPS_TEST(eltwise_min_max_2d) {
         const TensorDesc desc_arr[] = {d_a, d_b};
         auto descs = op->getOutputTensorDesc(desc_arr);
 
-        auto output = test::make_planar(descs[0], max_out);
+        auto output = test::make_channel_first(descs[0], max_out);
         const TensorView ins[] = {a, b};
         op->compute(output, ins);
     }
@@ -592,7 +592,7 @@ NNOPS_TEST(eltwise_random_add_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(500);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -627,7 +627,7 @@ NNOPS_TEST(eltwise_random_mul_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(300);
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
 
@@ -730,7 +730,7 @@ NNOPS_TEST(eltwise_quant_per_tensor_add_u8) {
 
 // ============================================================
 // NumPy broadcasting — the inputs' shapes are right-aligned and a size-1 axis
-// (or a missing axis) repeats. The planar and channel-last paths share the
+// (or a missing axis) repeats. The channel-first and channel-last paths share the
 // odometer, so the layout only changes the strides.
 // ============================================================
 
@@ -750,7 +750,7 @@ NNOPS_TEST(eltwise_broadcast_scalar) {
                       descs[0].dims[1] == 3 && descs[0].dims[2] == 4);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -774,7 +774,7 @@ NNOPS_TEST(eltwise_broadcast_row) {
     NNOPS_EXPECT_TRUE(descs[0].rank == 2 && descs[0].dims[0] == 3);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -800,7 +800,7 @@ NNOPS_TEST(eltwise_broadcast_column) {
     const TensorDesc descs_in[] = {a.desc(), b.desc()};
     auto descs = op->getOutputTensorDesc(descs_in);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -828,7 +828,7 @@ NNOPS_TEST(eltwise_broadcast_rank_mismatch) {
     NNOPS_EXPECT_TRUE(descs[0].rank == 3 && descs[0].dims[2] == 4);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -850,7 +850,7 @@ NNOPS_TEST(eltwise_broadcast_add_to) {
     const TensorDesc descs_in[] = {a.desc(), b.desc()};
     auto descs = op->getOutputTensorDesc(descs_in);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 1.0f);
-    auto out = test::make_planar(descs[0], out_buf.data());
+    auto out = test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -860,10 +860,10 @@ NNOPS_TEST(eltwise_broadcast_add_to) {
     }
 }
 
-NNOPS_TEST(eltwise_broadcast_nhwc_per_channel) {
-    // [N,C,H,W] logical in NHWC storage, times a [1,C,1,1] per-channel scale.
+NNOPS_TEST(eltwise_broadcast_channel_last_per_channel) {
+    // [N,C,H,W] logical in channel-last storage, times a [1,C,1,1] per-channel scale.
     constexpr int64_t N = 2, C = 3, H = 5, W = 4;
-    auto [a_vec, a_planar] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f);
+    auto [a_vec, a_channel_first] = test::make_random_tensor({N, C, H, W}, -2.0f, 2.0f);
     auto [s_vec, s] = test::make_random_tensor({1, C, 1, 1}, -2.0f, 2.0f);
 
     auto a_cl = test::to_channel_last<float>(a_vec, N, C, H * W);

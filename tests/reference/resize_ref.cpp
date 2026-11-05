@@ -1,5 +1,5 @@
 /// @file resize_ref.cpp
-/// @brief Naive CPU reference for 2D/3D resize on planar NCHW/NCDHW.
+/// @brief Naive CPU reference for 2D/3D resize on channel-first.
 ///
 /// One template covers f32 and f16: arithmetic is fp32, and the dtype-specific
 /// load/store goes through s_load/s_store. Nearest reads a single tap; the other

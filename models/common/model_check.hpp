@@ -127,10 +127,10 @@ public:
             rows_.push_back(row);
             return;
         }
-        if (!dense_planar(actual) || !dense_planar(expected)) {
+        if (!dense_channel_first(actual) || !dense_channel_first(expected)) {
             row.shape_ok = false;
             if (verbose_) {
-                std::printf("  %-24s LAYOUT: expected dense planar, got packed "
+                std::printf("  %-24s LAYOUT: expected dense channel-first, got packed "
                             "or pitch-padded\n", name.c_str());
             }
             rows_.push_back(row);
@@ -203,7 +203,7 @@ private:
         return true;
     }
 
-    static bool dense_planar(const nnops::TensorView& v)
+    static bool dense_channel_first(const nnops::TensorView& v)
     {
         if (v.rank() < 2) { return true; }
         const int64_t elem = static_cast<int64_t>(

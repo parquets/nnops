@@ -4,7 +4,7 @@
 ///
 /// Every type reads and writes f32 whatever the input dtype: the tests
 /// dequantize to f32, run this, and requantize. Addressing goes through
-/// stride_elems(), so planar and channel-last inputs are both covered by the
+/// stride_elems(), so channel-first and channel-last inputs are both covered by the
 /// same code; only the logical axis matters.
 
 #include "nnops/ops/norm.hpp"

@@ -1,8 +1,8 @@
 #pragma once
 /// @file conv2d.hpp
-/// @brief 2D convolution — planar NCHW or channel-last NHWC.
+/// @brief 2D convolution — channel-first or channel-last.
 ///
-/// Planar: input [N, IC, IH, IW], weight [OC, IC/G, KH, KW] (OIHW), output
+/// Channel-first: input [N, IC, IH, IW], weight [OC, IC/G, KH, KW] (OIHW), output
 /// [N, OC, OH, OW], bias [OC]. Channel-last: the same activation with the weight
 /// as HWIO [KH, KW, IC/G, OC] — there the tensor's *shape* is the filter itself;
 /// the two must pair (see validate()). Both routes support groups and dilation.
@@ -29,7 +29,7 @@
 /// per group, and at least 14x14 input. The transforms cost a fixed amount per
 /// tile per channel, so the 2.25x multiply saving needs wide K to pay for them
 /// (a wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256). Below 14x14 the
-/// planar kernel's 8-lane tile packing inflates the GEMM's N more than the
+/// Channel-first kernel's 8-lane tile packing inflates the GEMM's N more than the
 /// saving is worth: a 7x7 output packs its 4 real tile columns to 8 and runs
 /// 0.65x im2col, while 14x14 packs 7 to 8 (14% waste) and keeps a 1.15x lead.
 /// The channel-last route has none of those costs — no deinterleaving load, no
@@ -115,8 +115,8 @@ struct Conv2DAttributes {
 
     /// Winograd transform order as the output tile side: 2 pins F(2,3), 4 pins
     /// F(4,3), 0 (the default) lets wino_pick_order() choose — for the
-    /// channel-last route that is F(4,3) from a 28x28 plane up at any team
-    /// size, and on the planar route from a floor that climbs with the worker
+    /// channel-last route that is F(4,3) from a 28x28 plane up at any team size,
+    /// and on the channel-first route from a floor that climbs with the worker
     /// count this call reports through ctx (28x28 up to four workers, 56x56 to
     /// eight, 112x112 past that) — both subject to the U still fitting the
     /// last-level cache. Pin 4 to take it anywhere. Any other value is refused
@@ -164,8 +164,9 @@ public:
                  void* workspace = nullptr) override;
 
     /// Winograd U = G·g·Gᵀ, two-step: an empty outputs[0] queries the packed
-    /// descriptor — planar [16, OC, IC/G]/PackedWinoWeight (pitch IC/G × elem_size),
-    /// channel-last [16, nb, G·jb, ldd]/PackedWinoWeightLast (pitch ldd × elem_size)
+    /// descriptor — channel-first [16, OC, IC/G]/PackedWinoWeight (pitch IC/G ×
+    /// elem_size), channel-last [16, nb, G·jb, ldd]/PackedWinoWeightLast (pitch
+    /// ldd × elem_size)
     /// — and a preallocated one receives U. Requires algorithm == Winograd and
     /// k3s1, asserted: a later compute() gets U and cannot fall back to im2col.
     ///
@@ -181,7 +182,7 @@ public:
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override
     {
-        return LayoutSupport::PlanarOrChannelLast;
+        return LayoutSupport::ChannelFirstOrChannelLast;
     }
 
     const Conv2DAttributes& attributes() const noexcept { return attrs_; }

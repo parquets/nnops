@@ -1,8 +1,8 @@
 /// @file depthwise_conv.cpp
-/// @brief SIMD CPU depthwise 2D/3D convolution, planar (NCHW/NCDHW) and
-///        channel-last (NHWC/NDHWC).
+/// @brief SIMD CPU depthwise 2D/3D convolution, channel-first and
+///        channel-last.
 ///
-/// Planar keeps the raw [C, 1, (KD,) KH, KW] filter, takes one channel plane at
+/// Channel-first keeps the raw [C, 1, (KD,) KH, KW] filter, takes one channel plane at
 /// a time, and puts the SIMD lane on output width. Channel-last keeps the raw
 /// HWCM filter [KH][KW][C] (TF depthwise order, multiplier dropped) and puts the
 /// lane on channels; all channel blocks of a row group are swept inside one
@@ -31,7 +31,7 @@ using namespace nnops::simd;
 namespace k = nnops::kernel;
 
 // ============================================================
-// Planar depthwise conv (NCHW/NCDHW) — the lane spans output width
+// Channel-first depthwise conv (channel-first) — the lane spans output width
 // ============================================================
 
 template <typename T>
@@ -48,7 +48,7 @@ void dwconv_impl(
     const int64_t rank  = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
 
-    // One "block" per channel: a planar tensor has no channel vector.
+    // One "block" per channel: a channel-first tensor has no channel vector.
     const int64_t N      = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
 
@@ -98,7 +98,7 @@ void dwconv_impl(
     p.in_d_stride    = in_d_stride;
     p.in_row_stride  = in_row_stride;
 
-    // Planar edge masks: only the first and last width vector of a row read past
+    // Channel-first edge masks: only the first and last width vector of a row read past
     // it, and a mask zeroes the lanes outside the row so a tap stays a load and
     // an FMA instead of a per-lane scalar loop. The mask depends only on
     // (edge, tap), never on the row, so it is built once for the whole call.
@@ -106,8 +106,8 @@ void dwconv_impl(
     constexpr int64_t kMaskMaxKw = 16;
     uint8_t edge_needed[2 * kMaskMaxKw] = {};
     alignas(32) T edge_masks[2 * kMaskMaxKw * kMaskLanes] = {};
-    const k::DwPlanarEdges edges =
-        k::dwconv_planar_edge_masks<kMaskMaxKw, T>(p, edge_masks, edge_needed);
+    const k::DwChannelFirstEdges edges =
+        k::dwconv_channel_first_edge_masks<kMaskMaxKw, T>(p, edge_masks, edge_needed);
 
     const auto compute_block = [&](int64_t n, int64_t blk) {
         const T* in_base  = in_ptr  + n * blocks * in_ch_stride  + blk * in_ch_stride;
@@ -122,7 +122,7 @@ void dwconv_impl(
         // The masked load reaches into the neighbouring row, harmlessly, since
         // those lanes are masked to zero — except at the tensor's first and
         // last row blocks, which keep the bounds-checked path.
-        k::DwPlanarEdges blk_edges = edges;
+        k::DwChannelFirstEdges blk_edges = edges;
         if ((n == 0 && blk == 0) || (n == N - 1 && blk == blocks - 1)) {
             blk_edges.masks = nullptr;
         }
@@ -136,14 +136,14 @@ void dwconv_impl(
             for (; oh + 3 < OH; oh += 4) {
                 pc.od = od;
                 pc.oh = oh;
-                k::dwconv_planar_h4(out_d + oh * pc.out_row_stride, in_base,
+                k::dwconv_channel_first_h4(out_d + oh * pc.out_row_stride, in_base,
                                     w_base, bias, pc, attrs.epilogue, attrs.add_to,
                                     blk_edges);
             }
             for (; oh < OH; ++oh) {
                 pc.od = od;
                 pc.oh = oh;
-                k::dwconv_planar(out_d + oh * pc.out_row_stride, in_base, w_base,
+                k::dwconv_channel_first(out_d + oh * pc.out_row_stride, in_base, w_base,
                                  bias, pc, attrs.epilogue, attrs.add_to, blk_edges);
             }
         }
@@ -154,7 +154,7 @@ void dwconv_impl(
 }
 
 // ============================================================
-// Channel-last (NHWC/NDHWC) depthwise — the lane spans channels
+// Channel-last depthwise — the lane spans channels
 // ============================================================
 
 template <typename T>
@@ -489,7 +489,7 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
     const auto odtype = output.data_type();
 
     // Quantized depthwise conv lives on the channel lane: its dequantize-on-load
-    // kernels read a channel vector, which a planar plane does not have.
+    // kernels read a channel vector, which a channel-first plane does not have.
     if (!is_channel_last(inputs[0].layout()) &&
         (dtype == DataType::s8 || dtype == DataType::u8)) {
         return Status::unsupported;
@@ -532,7 +532,7 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
         dwconv_impl<half>(attrs, output, inputs, ctx);
         return Status::ok;
     default:
-        return Status::unsupported;   // planar has no quantized route
+        return Status::unsupported;   // Channel-first has no quantized route
     }
 }
 

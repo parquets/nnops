@@ -1,8 +1,8 @@
 /// @file conv2d_cuda.cu
 /// @brief CUDA Conv2D — one implicit-GEMM kernel for both memory orders.
 ///
-/// The convolution is posed the same way for NCHW and NHWC: M is the output
-/// pixel axis, N the output channels of one group, K the reduction over
+/// The convolution is posed the same way for channel-first and channel-last: M is
+/// the output pixel axis, N the output channels of one group, K the reduction over
 /// IC/G × KH × KW. The activation is the gathered operand and therefore lives
 /// on A, whose shared-memory tile is filled tap by tap with a bounds check that
 /// zeroes the padding ring; the filter is B, read straight out of global memory.
@@ -13,10 +13,10 @@
 /// tap-major inside an output channel for OIHW (k = ic·karea + tap), channel-
 /// major for HWIO (k = tap·ICG + ic).
 ///
-/// Shape indices follow the library's convention: they are the logical NCHW
+/// Shape indices follow the library's convention: they are the logical channel-first
 /// ones even for a channel-last tensor, and the layout tag only changes the
 /// element strides. The epilogue therefore writes through the operator's own
-/// address arithmetic rather than a strided C tensor, because a planar row is
+/// address arithmetic rather than a strided C tensor, because a channel-first row is
 /// padded to a 32 B pitch and the pixel axis is only uniform inside one row.
 /// add_to reads the old output at that same address before overwriting it, so
 /// the residual lands after the activation as it does on the CPU.
@@ -113,7 +113,7 @@ __device__ inline Elem conv_weight(const ConvParams& p, const void* base,
 
 /// Fill one shared-memory A tile with the gathered activation. Threads spread
 /// over the k axis in the channel-last order (consecutive threads read
-/// consecutive channels) and over the pixel axis in the planar one (consecutive
+/// consecutive channels) and over the pixel axis in the channel-first one (consecutive
 /// threads read consecutive columns of a row).
 template <class Elem, bool ChannelsLast, class SmemA>
 __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
@@ -157,7 +157,7 @@ __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
     }
 }
 
-/// Output element (pixel, channel) of the order the op was asked for: planar
+/// Output element (pixel, channel) of the order the op was asked for: channel-first
 /// gives the channel axis a whole plane, channel-last the innermost slot.
 template <class Elem>
 __device__ inline Elem* conv_out_addr(const ConvParams& p, int64_t base,

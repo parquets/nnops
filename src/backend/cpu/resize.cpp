@@ -1,15 +1,15 @@
 /// @file resize.cpp
-/// @brief CPU implementation of 2D/3D spatial resize, planar and channel-last.
+/// @brief CPU implementation of 2D/3D spatial resize, channel-first and channel-last.
 ///
 /// The coordinate tables are built once per call: for each output coordinate,
-/// the source index (or the two neighbours and their weight). Planar walks one
+/// the source index (or the two neighbours and their weight). Channel-first walks one
 /// channel plane per task and evaluates scalar pixels; channel-last dispatches
 /// per sample and lets the kernel interpolate a pixel's whole C vector with SIMD.
 ///
 /// Crop: crop_start/crop_end are indexed as {D,H,W} to match output_size, and
 /// crop_end[d] > 0 enables cropping on that axis. The kernel sees the effective
 /// size; the crop start becomes one element offset through stride_elems(), so
-/// planar and channel-last need no separate arithmetic.
+/// Channel-first and channel-last need no separate arithmetic.
 
 #include "nnops/ops/resize.hpp"
 #include "nnops/detail/assert.hpp"
@@ -168,7 +168,7 @@ void resize_impl(const ResizeAttributes& attrs,
         T*       out_base = out_ptr + n * out_n_stride + c * out_c_stride;
 
         if (srank == 3) {
-            k::resize_planar_3d<T>(
+            k::resize_channel_first_3d<T>(
                 out_base, in_base, OD, OH, OW,
                 cz.i0.data(), cz.i1.data(), cz.w.data(),
                 cy.i0.data(), cy.i1.data(), cy.w.data(),
@@ -176,7 +176,7 @@ void resize_impl(const ResizeAttributes& attrs,
                 in_d_stride, in_row_stride, out_d_stride, out_row_stride,
                 linear, add_to);
         } else {
-            k::resize_planar_2d<T>(
+            k::resize_channel_first_2d<T>(
                 out_base, in_base, OH, OW,
                 cy.i0.data(), cy.i1.data(), cy.w.data(),
                 cx.i0.data(), cx.i1.data(), cx.w.data(),

@@ -5,7 +5,7 @@
 ///   1. auto op = MatMul::create(attrs, Backend::CPU);
 ///   2. const TensorDesc arr[] = {a_desc, b_desc}; auto descs = op->getOutputTensorDesc(arr);
 ///   3. Validate descs[0].rank/dims/layout/dtype
-///   4. Create output via nnops::test::make_planar(descs[0], buf.data())
+///   4. Create output via nnops::test::make_channel_first(descs[0], buf.data())
 ///   5. const TensorView ins[] = {a, b}; op->compute(out, ins);
 /// The plan-only tests skip 1-5 and call get_matmul_plan directly;
 /// matmul_naive_kernel_layouts calls arch::matmul_naive the same way.
@@ -107,7 +107,7 @@ NNOPS_TEST(matmul_basic_2d) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(4));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -151,7 +151,7 @@ NNOPS_TEST(matmul_transpose_a) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -196,7 +196,7 @@ NNOPS_TEST(matmul_transpose_b) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -242,7 +242,7 @@ NNOPS_TEST(matmul_transpose_both) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -289,7 +289,7 @@ NNOPS_TEST(matmul_batch_3d) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(8));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -348,7 +348,7 @@ NNOPS_TEST(matmul_broadcast_a_2d_x_3d) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(18));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -416,7 +416,7 @@ NNOPS_TEST(matmul_broadcast_b_3d_x_2d) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(12));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -493,7 +493,7 @@ NNOPS_TEST(matmul_broadcast_multi_dim) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(2 * 4 * 3 * 2));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -572,7 +572,7 @@ NNOPS_TEST(matmul_beta_add_to_output) {
     for (auto& v : out_buf) {
         v = 10.0f;
     }
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -614,7 +614,7 @@ NNOPS_TEST(matmul_beta_zero_overwrite) {
     for (auto& v : out_buf) {
         v = 999.0f;
     }
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -656,7 +656,7 @@ NNOPS_TEST(matmul_epilogue_relu) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -700,7 +700,7 @@ NNOPS_TEST(matmul_epilogue_relu_with_beta) {
     for (auto& v : out_buf) {
         v = 10.0f;
     }
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -753,8 +753,8 @@ void expect_matches_ref(const MatMulAttributes& attrs,
         std::copy(initial.begin(), initial.end(), want.begin());
     }
 
-    TensorView og = nnops::test::make_planar(od, got.data());
-    TensorView ow = nnops::test::make_planar(od, want.data());
+    TensorView og = nnops::test::make_channel_first(od, got.data());
+    TensorView ow = nnops::test::make_channel_first(od, want.data());
 
     op->compute(og, ins);
     nnops::backend::cpu::reference::matmul_ref(attrs, ow, ins, {}, nullptr);
@@ -793,7 +793,7 @@ NNOPS_TEST(matmul_bias_basic_2d) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -826,7 +826,7 @@ NNOPS_TEST(matmul_bias_precedes_activation) {
     const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -859,7 +859,7 @@ NNOPS_TEST(matmul_bias_with_beta) {
     const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 10.0f);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -963,7 +963,7 @@ NNOPS_TEST(matmul_bias_f16) {
 
     std::vector<nnops::backend::cpu::half> out_buf(
         static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -974,7 +974,7 @@ NNOPS_TEST(matmul_bias_f16) {
     const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc(), z32v.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_arr);
     std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(ref_descs[0], ref_buf.data());
     const TensorView ref_ins[] = {a32v, b32v, z32v};
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -1012,7 +1012,7 @@ NNOPS_TEST(matmul_bias_int8_dequant) {
     NNOPS_EXPECT_EQ(descs[0].rank, int64_t(2));
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -1076,8 +1076,8 @@ NNOPS_TEST(matmul_bias_fp_activation_dq) {
 
     std::vector<float> got(static_cast<size_t>(descs[0].numel()));
     std::vector<float> want(got.size());
-    auto og = nnops::test::make_planar(descs[0], got.data());
-    auto ow = nnops::test::make_planar(descs[0], want.data());
+    auto og = nnops::test::make_channel_first(descs[0], got.data());
+    auto ow = nnops::test::make_channel_first(descs[0], want.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(og, ins);
@@ -1112,7 +1112,7 @@ NNOPS_TEST(matmul_bias_clip_bounds) {
     const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -1144,7 +1144,7 @@ NNOPS_TEST(matmul_bias_relu6) {
     const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -1178,7 +1178,7 @@ NNOPS_TEST(matmul_bias_transpose_a) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], int64_t(2));
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(2));
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -1217,7 +1217,7 @@ NNOPS_TEST(matmul_bias_int8_dequant_clip) {
     const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> got(static_cast<size_t>(descs[0].numel()));
-    auto og = nnops::test::make_planar(descs[0], got.data());
+    auto og = nnops::test::make_channel_first(descs[0], got.data());
 
     // matmul_dq_ref only backs the fp-A route, so these hand-computed values are the spec.
     const TensorView ins[] = {a, b, bias};
@@ -1278,7 +1278,7 @@ NNOPS_TEST(matmul_alpha_fp_routes) {
         NNOPS_EXPECT_EQ(descs[0].dims[1], c.N);
 
         std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-        auto output = nnops::test::make_planar(descs[0], out_buf.data());
+        auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
         // beta ∉ {0}: give the accumulate real prior data.
         for (size_t i = 0; i < out_buf.size(); ++i) {
             out_buf[i] = 0.25f * static_cast<float>(i % 7) - 0.5f;
@@ -1288,7 +1288,7 @@ NNOPS_TEST(matmul_alpha_fp_routes) {
         op->compute(output, ins);
 
         std::vector<float> ref_buf(out_buf.size());
-        auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+        auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
         for (size_t i = 0; i < ref_buf.size(); ++i) {
             ref_buf[i] = 0.25f * static_cast<float>(i % 7) - 0.5f;
         }
@@ -1324,7 +1324,7 @@ NNOPS_TEST(matmul_alpha_scales_product_only) {
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
     std::copy(std::begin(c_init), std::end(c_init), out_buf.begin());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -1360,7 +1360,7 @@ NNOPS_TEST(matmul_alpha_before_activation) {
     const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b, bias};
     op->compute(output, ins);
@@ -1393,7 +1393,7 @@ NNOPS_TEST(matmul_alpha_f16) {
 
     std::vector<nnops::backend::cpu::half> out_buf(
         static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1403,7 +1403,7 @@ NNOPS_TEST(matmul_alpha_f16) {
     const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_arr);
     std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
-    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(ref_descs[0], ref_buf.data());
     const TensorView ref_ins[] = {a32v, b32v};
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -1431,7 +1431,7 @@ NNOPS_TEST(matmul_alpha_ignored_on_integer_route) {
         const TensorDesc arr[] = {a.desc(), b.desc()};
         auto descs = op->getOutputTensorDesc(arr);
         out.assign(static_cast<size_t>(descs[0].numel()), 0.0f);
-        auto output = nnops::test::make_planar(descs[0], out.data());
+        auto output = nnops::test::make_channel_first(descs[0], out.data());
         const TensorView ins[] = {a, b};
         op->compute(output, ins);
     };
@@ -1475,7 +1475,7 @@ NNOPS_TEST(matmul_1x1_dot) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1513,7 +1513,7 @@ NNOPS_TEST(matmul_square) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1552,7 +1552,7 @@ NNOPS_TEST(matmul_random) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(8 * 32));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1585,7 +1585,7 @@ NNOPS_TEST(matmul_random_batch) {
     int64_t nelem = descs[0].numel();
     NNOPS_EXPECT_EQ(nelem, int64_t(4 * 8 * 32));
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1617,7 +1617,7 @@ NNOPS_TEST(matmul_random_transpose_a) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1649,7 +1649,7 @@ NNOPS_TEST(matmul_random_transpose_b) {
 
     int64_t nelem = descs[0].numel();
     std::vector<float> out_buf(nelem);
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins);
@@ -1683,13 +1683,13 @@ NNOPS_TEST(matmul_packed_transpose_both_workspace) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(29));
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-4f, 1e-5f));
@@ -1713,13 +1713,13 @@ NNOPS_TEST(matmul_packed_multiple_kblocks) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(9));
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
@@ -1742,11 +1742,11 @@ NNOPS_TEST(matmul_packed_beta_relu_workspace) {
     auto descs = op->getOutputTensorDesc(arr);
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     // Seed C with old values so beta scaling is observable.
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     for (size_t i = 0; i < out_buf.size(); ++i) {
         out_buf[i] = static_cast<float>(i) * 0.25f;
         ref_buf[i] = out_buf[i];
@@ -1778,13 +1778,13 @@ NNOPS_TEST(matmul_packed_batched_workspace) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], int64_t(16));
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-4f, 1e-5f));
@@ -1813,7 +1813,7 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
@@ -1825,7 +1825,7 @@ NNOPS_TEST(matmul_packed_f16_workspace) {
     const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_arr);
     std::vector<float> ref_buf(ref_descs[0].numel());
-    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(ref_descs[0], ref_buf.data());
     const TensorView ref_ins[] = {a32, b32};
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -1861,7 +1861,7 @@ NNOPS_TEST(matmul_f16_deep_k_accumulation) {
     const auto plan = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1);
 
     std::vector<cpu::half> out_buf(descs[0].numel());
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
@@ -1872,7 +1872,7 @@ NNOPS_TEST(matmul_f16_deep_k_accumulation) {
     const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_arr);
     std::vector<float> ref_buf(ref_descs[0].numel());
-    auto ref_out = test::make_planar(ref_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(ref_descs[0], ref_buf.data());
     const TensorView ref_ins[] = {a32, b32};
     cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -1916,7 +1916,7 @@ NNOPS_TEST(matmul_f16_transpose_b_packed) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], int64_t(25));
 
     std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
@@ -1928,7 +1928,7 @@ NNOPS_TEST(matmul_f16_transpose_b_packed) {
     const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_arr);
     std::vector<float> ref_buf(ref_descs[0].numel());
-    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(ref_descs[0], ref_buf.data());
     const TensorView ref_ins[] = {a32, b32};
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -2018,12 +2018,12 @@ NNOPS_TEST(matmul_padded_b_stride_pack_b_workspace) {
     auto descs = op->getOutputTensorDesc(arr);
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
@@ -2058,7 +2058,7 @@ NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
@@ -2070,7 +2070,7 @@ NNOPS_TEST(matmul_padded_b_stride_f16_workspace) {
     const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
     auto ref_descs = op->getOutputTensorDesc(ref_arr);
     std::vector<float> ref_buf(ref_descs[0].numel());
-    auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(ref_descs[0], ref_buf.data());
     const TensorView ref_ins[] = {a32, b32};
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -2099,12 +2099,12 @@ NNOPS_TEST(matmul_padded_a_stride_correctness) {
     auto descs = op->getOutputTensorDesc(arr);
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
@@ -2142,12 +2142,12 @@ NNOPS_TEST(matmul_f32_nn_direct_tile_remainders) {
                 auto descs = op->getOutputTensorDesc(arr);
 
                 std::vector<float> out_buf(descs[0].numel());
-                auto output = nnops::test::make_planar(descs[0], out_buf.data());
+                auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
                 const TensorView ins[] = {a, b};
                 op->compute(output, ins, {}, nullptr);
 
                 std::vector<float> ref_buf(descs[0].numel());
-                auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+                auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
                 nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
                 if (!test::allclose(output, ref_out, 1e-4f, 1e-5f)) {
@@ -2201,7 +2201,7 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
                 NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
                 std::vector<nnops::backend::cpu::half> out_buf(descs[0].numel());
-                auto output = nnops::test::make_planar(descs[0], out_buf.data());
+                auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
 
                 const TensorView ins[] = {a, b};
                 op->compute(output, ins, {}, nullptr);
@@ -2213,7 +2213,7 @@ NNOPS_TEST(matmul_f16_nn_direct_tile_remainders) {
                 const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
                 auto ref_descs = op->getOutputTensorDesc(ref_arr);
                 std::vector<float> ref_buf(ref_descs[0].numel());
-                auto ref_out = nnops::test::make_planar(ref_descs[0], ref_buf.data());
+                auto ref_out = nnops::test::make_channel_first(ref_descs[0], ref_buf.data());
                 const TensorView ref_ins[] = {a32, b32};
                 nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
 
@@ -2252,12 +2252,12 @@ NNOPS_TEST(matmul_mkn_transpose_a_multik) {
     auto descs = op->getOutputTensorDesc(arr);
 
     std::vector<float> out_buf(descs[0].numel(), 1.0f);  // prefill for beta
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, {}, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel(), 1.0f);
-    auto ref_out = nnops::test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = nnops::test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
@@ -2333,14 +2333,14 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
             const TensorView ins[] = {in.a, in.b};
 
             std::vector<float> serial_buf(descs[0].numel());
-            auto serial_out = test::make_planar(descs[0], serial_buf.data());
+            auto serial_out = test::make_channel_first(descs[0], serial_buf.data());
             op->compute(serial_out, ins, {}, nullptr);
 
             SimplePool pool(nthreads);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
             std::vector<float> threaded_buf(descs[0].numel());
-            auto threaded_out = test::make_planar(descs[0], threaded_buf.data());
+            auto threaded_out = test::make_channel_first(descs[0], threaded_buf.data());
             op->compute(threaded_out, ins, ctx, nullptr);
 
             for (int64_t i = 0; i < descs[0].numel(); ++i) {
@@ -2353,7 +2353,7 @@ NNOPS_TEST(matmul_threaded_matches_serial) {
             }
 
             std::vector<float> ref_buf(descs[0].numel());
-            auto ref_out = test::make_planar(descs[0], ref_buf.data());
+            auto ref_out = test::make_channel_first(descs[0], ref_buf.data());
             nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
             NNOPS_EXPECT_TRUE(test::allclose(serial_out, ref_out, 1e-3f, 1e-4f));
         }
@@ -2593,8 +2593,8 @@ NNOPS_TEST(matmul_packed_a_bad_remainder_threaded) {
 
         const TensorView ins[] = {in.a, in.b};
         std::vector<float> got(descs[0].numel()), want(descs[0].numel());
-        auto out = test::make_planar(descs[0], got.data());
-        auto ref_out = test::make_planar(descs[0], want.data());
+        auto out = test::make_channel_first(descs[0], got.data());
+        auto ref_out = test::make_channel_first(descs[0], want.data());
 
         SimplePool pool(c.nthreads);
         ComputeContext ctx;
@@ -2649,14 +2649,14 @@ NNOPS_TEST(matmul_threaded_multi_block_slots) {
         }
 
         std::vector<float> serial_buf(descs[0].numel());
-        auto serial_out = test::make_planar(descs[0], serial_buf.data());
+        auto serial_out = test::make_channel_first(descs[0], serial_buf.data());
         op->compute(serial_out, ins, {}, nullptr);
 
         SimplePool pool(c.nthreads);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         std::vector<float> threaded_buf(descs[0].numel());
-        auto threaded_out = test::make_planar(descs[0], threaded_buf.data());
+        auto threaded_out = test::make_channel_first(descs[0], threaded_buf.data());
         op->compute(threaded_out, ins, ctx, nullptr);
 
         for (int64_t i = 0; i < descs[0].numel(); ++i) {
@@ -2689,12 +2689,12 @@ NNOPS_TEST(matmul_threaded_batched) {
     ctx.cpu = pool.cpu;
 
     std::vector<float> out_buf(descs[0].numel());
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {a, b};
     op->compute(output, ins, ctx, nullptr);
 
     std::vector<float> ref_buf(descs[0].numel());
-    auto ref_out = test::make_planar(descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(descs[0], ref_buf.data());
     nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ins, {}, nullptr);
 
     NNOPS_EXPECT_TRUE(test::allclose(output, ref_out, 1e-3f, 1e-4f));
@@ -2884,7 +2884,7 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
                 got_buf[i] = cast(static_cast<float>(i % 17) * 0.25f);
                 want_buf[i] = to_f(got_buf[i]);
             }
-            auto got = nnops::test::make_planar(descs[0], got_buf.data());
+            auto got = nnops::test::make_channel_first(descs[0], got_buf.data());
 
             const TensorView ins[] = {a, b};
             op->compute(got, ins, {}, nullptr);
@@ -2892,7 +2892,7 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
             const TensorView ref_ins[] = {a32, b32};
             const TensorDesc ref_arr[] = {a32.desc(), b32.desc()};
             auto ref_descs = op->getOutputTensorDesc(ref_arr);
-            auto want = nnops::test::make_planar(ref_descs[0], want_buf.data());
+            auto want = nnops::test::make_channel_first(ref_descs[0], want_buf.data());
             cpu::reference::matmul_ref(attrs, want, ref_ins, {}, nullptr);
 
             for (size_t i = 0; i < got_buf.size(); ++i) {
@@ -2958,8 +2958,8 @@ NNOPS_TEST(matmul_prepacked_b) {
 
             std::vector<T> raw(static_cast<size_t>(od[0].numel()));
             std::vector<T> pk(static_cast<size_t>(od[0].numel()));
-            auto ro = nnops::test::make_planar(od[0], raw.data());
-            auto po = nnops::test::make_planar(od[0], pk.data());
+            auto ro = nnops::test::make_channel_first(od[0], raw.data());
+            auto po = nnops::test::make_channel_first(od[0], pk.data());
 
             const TensorView ins[] = {a, b};
             NNOPS_EXPECT_EQ(op->compute(ro, ins, {}, nullptr), Status::ok);

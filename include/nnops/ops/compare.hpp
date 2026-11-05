@@ -7,7 +7,7 @@
 /// (f32/f16/s32/s64); a NaN compares equal to nothing and greater/less to
 /// nothing, so a NaN input yields 0 for every relation. Logical takes one
 /// operand (Not) or two, treats a nonzero byte as true, and accepts s8/u8/s32/
-/// s64. Planar.
+/// s64. Channel-first.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -52,7 +52,7 @@ public:
     OpType  getOpType()  const override { return OpType::Compare; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;
@@ -97,7 +97,7 @@ public:
     OpType  getOpType()  const override { return OpType::Logical; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;

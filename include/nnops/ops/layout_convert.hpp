@@ -1,10 +1,10 @@
 #pragma once
 /// @file layout_convert.hpp
-/// @brief LayoutConvert operator — planar ↔ channel-last.
+/// @brief LayoutConvert operator — channel-first ↔ channel-last.
 ///
-/// NCHW ↔ NHWC (2D) and NCDHW ↔ NDHWC (3D). The logical shape is preserved;
-/// only the physical layout changes, so the output descriptor is the input's
-/// dimensions with the target layout. f32, f16, s8 and u8.
+/// Channel-first ↔ channel-last, in 2D and in 3D. The logical shape is
+/// preserved; only the physical layout changes, so the output descriptor is
+/// the input's dimensions with the target layout. f32, f16, s8 and u8.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

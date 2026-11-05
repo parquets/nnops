@@ -1,16 +1,16 @@
 /// @file transpose_conv2d_ref.cpp
-/// @brief NCHW planar scalar reference — used as correctness baseline for tests.
+/// @brief channel-first scalar reference — used as correctness baseline for tests.
 ///
 /// Implements the scatter-add (input-driven) approach from ncnn Deconvolution:
 /// each input pixel, scaled by kernel weights, is accumulated into the
 /// appropriate output region.
 ///
-/// This kernel operates on NCHW planar tensors. It serves as the golden
+/// This kernel operates on channel-first tensors. It serves as the golden
 /// reference for verifying the channel-last SIMD implementation.
 ///
-/// Weight layout: planar NCHW [IC, OC/G, KH, KW].
-/// Input:  NCHW [N, IC, IH, IW]
-/// Output: NCHW [N, OC, OH, OW]
+/// Weight layout: channel-first [IC, OC/G, KH, KW].
+/// Input:  channel-first [N, IC, IH, IW]
+/// Output: channel-first [N, OC, OH, OW]
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/core/parallel_for.hpp"
@@ -22,7 +22,7 @@
 
 namespace nnops::backend::cpu::reference {
 
-void transpose_conv2d_nchw_ref(const TransposeConv2DAttributes& attrs,
+void transpose_conv2d_channel_first_ref(const TransposeConv2DAttributes& attrs,
                                 TensorView& output,
                                 std::span<const TensorView> inputs,
                                 const ComputeContext& ctx,

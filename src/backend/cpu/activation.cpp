@@ -55,7 +55,7 @@ void apply_activation_flt(ActivationType type, const T* in, T* out,
 
 }  // anonymous namespace
 
-/// PRelu: one slope per logical channel (dim 1). Planar strides a whole plane
+/// PRelu: one slope per logical channel (dim 1). Channel-first strides a whole plane
 /// per slope, so a row is one constant-slope LeakyRelu; channel-last packs C
 /// inside every pixel, so the slope vector loads alongside the pixel vector.
 template <typename T>
@@ -81,9 +81,9 @@ void prelu_impl(const ActivationAttributes& attrs,
     if (rows_total == 0) { return; }
     const int64_t rows_per_c = (C > 0) ? rows_total / C : 0;
 
-    // Rank-2 keeps C on the innermost axis in either layout; rank ≥ 3 planar
+    // Rank-2 keeps C on the innermost axis in either layout; rank ≥ 3 channel-first
     // gives each channel a contiguous run of rows.
-    const bool per_row_slope = is_planar_spatial(x.layout()) && x.rank() >= 3;
+    const bool per_row_slope = is_channel_first_spatial(x.layout()) && x.rank() >= 3;
 
     constexpr int64_t kTileRows = 32;
     const int64_t num_tiles = (rows_total + kTileRows - 1) / kTileRows;

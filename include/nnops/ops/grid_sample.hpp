@@ -2,7 +2,7 @@
 /// @file grid_sample.hpp
 /// @brief GridSample operator — 2D/3D sampling at grid points.
 ///
-/// The image tensor is NCHW/NCDHW or NHWC/NDHWC; the output carries its layout.
+/// The image tensor is channel-first or channel-last; the output carries its layout.
 /// The grid is a dense f32 tensor of normalized coordinates in [-1, 1]: -1 is
 /// the outer left/top/front border and 1 the right/bottom/back one. f32/f16
 /// images only.
@@ -74,7 +74,7 @@ public:
     OpType  getOpType()  const override { return OpType::GridSample; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOrChannelLast;
+        return LayoutSupport::ChannelFirstOrChannelLast;
     }
 
     const GridSampleAttributes& attributes() const noexcept { return attrs_; }

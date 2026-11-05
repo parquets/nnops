@@ -101,7 +101,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Gru; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const GruAttributes& attributes() const noexcept { return attrs_; }
 

@@ -112,7 +112,7 @@ inline bool recurrent_activation_ok(RnnActivation a) noexcept {
 }
 
 /// Descriptor-only twin of recurrent_run's checks: every rule the ONNX schema
-/// states about the shapes, plus the ones this library adds (planar layout,
+/// states about the shapes, plus the ones this library adds (channel-first layout,
 /// peepholes unsupported). An absent optional is a rank-0 descriptor.
 inline Status recurrent_check(const RecurrentSpec& s,
                               std::span<const TensorDesc> inputs,
@@ -153,7 +153,7 @@ inline Status recurrent_check(const RecurrentSpec& s,
                   : (w.dtype != x.dtype || r.dtype != x.dtype)) {
         return Status::invalid_argument;
     }
-    if (!is_layout_supported(x.layout, LayoutSupport::PlanarOnly)) {
+    if (!is_layout_supported(x.layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::invalid_argument;
     }
     if (!w_packed && (w.dims[0] != D || w.dims[1] != G * H || w.dims[2] != I)) {

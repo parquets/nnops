@@ -1,6 +1,6 @@
 /// @file conv2d_int8_ref.cpp
 /// @brief Naive CPU reference for the quantized Conv2D route — s8 weight ×
-///        u8/s8/f16/f32 activation → f32/f16 or s8/u8 output (planar NCHW).
+///        u8/s8/f16/f32 activation → f32/f16 or s8/u8 output (channel-first).
 ///
 /// The correctness baseline for the quantized route in conv2d_implicit_gemm.cpp,
 /// and the only implementation of `add_to` on it (the tiled route would have to

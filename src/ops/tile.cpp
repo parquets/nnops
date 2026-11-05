@@ -27,7 +27,7 @@ Status check_repeat_dtype(const TensorDesc& in)
         return Status::unsupported;
     }
     return detail::require(
-        is_layout_supported(in.layout, LayoutSupport::PlanarOnly));
+        is_layout_supported(in.layout, LayoutSupport::ChannelFirstOnly));
 }
 
 }  // anonymous namespace

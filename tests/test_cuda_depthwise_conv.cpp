@@ -4,13 +4,13 @@
 /// Every case builds one random host operand set, runs the operator twice —
 /// once with Backend::CPU and once with Backend::CUDA over device copies — and
 /// compares the outputs. The CPU route is the oracle and both routes read the
-/// identical views, so a planar case exercises the width lane and a channel-last
+/// identical views, so a channel-first case exercises the width lane and a channel-last
 /// case the channel lane without any layout conversion in the comparison.
 ///
 /// Cases cover the shapes the kernel branches on: the vector lane's exact fit
 /// (C = 4 f32 / 8 f16), a short and a long scalar tail (C = 5 and 17), padded
 /// and strided windows, dilation, the bias seed, the epilogue, add_to's ordering,
-/// the 3D forms, and f16 throughout. Planar tensors carry a padded pitch, as a
+/// the 3D forms, and f16 throughout. Channel-first tensors carry a padded pitch, as a
 /// graph hands them; channel-last ones stay dense because their strides never
 /// consult the pitch.
 ///
@@ -71,7 +71,7 @@ void run_case(const DwCase& c, const char* what)
     HostTensor in = make_host_random(c.in_shape, c.dtype, padded, 17, -1.0f, 1.0f,
                                      in_layout);
 
-    // Planar reads the raw [C, 1, (KD,) KH, KW]; channel-last the HWCM
+    // Channel-first reads the raw [C, 1, (KD,) KH, KW]; channel-last the HWCM
     // [(KD,) KH, KW, C], whose every tap is a contiguous run of C.
     std::vector<int64_t> w_shape;
     TensorLayout w_layout = in_layout;
@@ -138,10 +138,10 @@ void run_case(const DwCase& c, const char* what)
 }  // namespace
 
 // ============================================================
-// Planar
+// Channel-first
 // ============================================================
 
-NNOPS_TEST(cuda_dwconv_planar_stride_padding) {
+NNOPS_TEST(cuda_dwconv_channel_first_stride_padding) {
     for (const auto& k : {std::array<int64_t, 3>{1, 3, 3},
                           std::array<int64_t, 3>{1, 1, 1}}) {
         DwCase c;
@@ -149,16 +149,16 @@ NNOPS_TEST(cuda_dwconv_planar_stride_padding) {
         c.kernel = k;
         c.stride = {1, 2, 2};
         c.padding = {0, 1, 1};
-        run_case(c, "cuda_dwconv_planar_stride_padding");
+        run_case(c, "cuda_dwconv_channel_first_stride_padding");
     }
 }
 
-NNOPS_TEST(cuda_dwconv_planar_dilation_epilogue) {
+NNOPS_TEST(cuda_dwconv_channel_first_dilation_epilogue) {
     DwCase c;
     c.in_shape = {1, 5, 10, 9};
     c.dilation = {1, 2, 2};
     c.epilogue.type = EpilogueActivateType::Relu;
-    run_case(c, "cuda_dwconv_planar_dilation_epilogue");
+    run_case(c, "cuda_dwconv_channel_first_dilation_epilogue");
 
     c.in_shape = {1, 3, 7, 6};
     c.dilation = {1, 1, 1};
@@ -166,30 +166,30 @@ NNOPS_TEST(cuda_dwconv_planar_dilation_epilogue) {
     c.epilogue.type = EpilogueActivateType::Relu6;
     c.bias = true;
     c.add_to = true;
-    run_case(c, "cuda_dwconv_planar_dilation_epilogue");
+    run_case(c, "cuda_dwconv_channel_first_dilation_epilogue");
 }
 
-NNOPS_TEST(cuda_dwconv_planar_3d) {
+NNOPS_TEST(cuda_dwconv_channel_first_3d) {
     DwCase c;
     c.in_shape = {1, 4, 4, 6, 9};
     c.kernel = {3, 3, 3};
     c.padding = {1, 1, 1};
     c.bias = true;
-    run_case(c, "cuda_dwconv_planar_3d");
+    run_case(c, "cuda_dwconv_channel_first_3d");
     c.in_shape = {1, 2, 3, 5, 5};
     c.kernel = {2, 2, 2};
     c.padding = {0, 0, 0};
     c.add_to = true;
-    run_case(c, "cuda_dwconv_planar_3d");
+    run_case(c, "cuda_dwconv_channel_first_3d");
 }
 
-NNOPS_TEST(cuda_dwconv_planar_f16) {
+NNOPS_TEST(cuda_dwconv_channel_first_f16) {
     DwCase c;
     c.in_shape = {1, 8, 9, 11};
     c.dtype = DataType::f16;
     c.padding = {0, 1, 1};
     c.bias = true;
-    run_case(c, "cuda_dwconv_planar_f16");
+    run_case(c, "cuda_dwconv_channel_first_f16");
 }
 
 // ============================================================

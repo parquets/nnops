@@ -8,7 +8,7 @@
 /// Three granularities — PerTensor, PerToken, PerChannel — picked from the
 /// scale shape and `axis` (ONNX conventions); see resolve_quant_granularity.
 /// Layout-agnostic: the kernels treat the tensor as a flat row-major numel()
-/// array, so packed and planar are not distinguished. Floats f32/f16;
+/// array, so packed and channel-first are not distinguished. Floats f32/f16;
 /// integers s8/u8.
 
 #include "nnops/core/op_base.hpp"

@@ -1,7 +1,7 @@
 /// @file slice.cpp
 /// @brief SIMD-optimized CPU implementation of Slice.
 ///
-/// For planar data, slice is a strided sub-tensor extraction.
+/// For channel-first data, slice is a strided sub-tensor extraction.
 ///
 /// Optimization tiers:
 ///   1. Inner-dim contiguous (innermost output dim maps to step-1 input):
@@ -51,7 +51,7 @@ void slice_impl(const SliceAttributes& attrs,
             (a < attrs.steps.size()) ? attrs.steps[a] : int64_t(1);
     }
 
-    // Input strides in elements (planar → contiguous innermost)
+    // Input strides in elements (channel-first → contiguous innermost)
     int64_t in_strides[TensorDesc::kMaxRank];
     in_strides[rank - 1] = 1;
     for (int64_t i = rank - 2; i >= 0; --i) {

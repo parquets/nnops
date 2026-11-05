@@ -342,7 +342,7 @@ NNOPS_TEST(wino43_weight_transform_matches_naive) {
 }
 
 NNOPS_TEST(wino43_input_transform_matches_naive) {
-    // A 12x12 NHWC plane holds four 4x4 tiles in a row and three tile rows; the
+    // A 12x12 channel-last plane holds four 4x4 tiles in a row and three tile rows; the
     // window of the corner tile reads four rows and columns of zeros.
     constexpr int IH = 12, IW = 12, IC = 8;
     constexpr int64_t kVPlane = 8;  // one tile per position
@@ -352,7 +352,7 @@ NNOPS_TEST(wino43_input_transform_matches_naive) {
 
     std::vector<float> v(36 * kVPlane, -99.0f);
     const int th = 2, tw = 2;  // tile [8..11] x [8..11]: its window ends at 13
-    nnops::kernel::winograd43_input_nhwc<float>(
+    nnops::kernel::winograd43_input_channel_last<float>(
         plane.data(), IW * IC, IC, 4 * th, 4 * tw, IH, IW,
         v.data(), kVPlane, IC);
 
@@ -392,7 +392,7 @@ NNOPS_TEST(wino43_output_transform_matches_naive) {
     }
     p[3][2] = nullptr;  // past the output extent: must stay untouched
     const Epilogue ep{};
-    nnops::kernel::winograd43_output_nhwc<float>(m.data(), kOcn, p, ep, bias.data(),
+    nnops::kernel::winograd43_output_channel_last<float>(m.data(), kOcn, p, ep, bias.data(),
                                                  false, kOcn);
 
     for (int k = 0; k < kOcn; ++k) {
@@ -707,7 +707,7 @@ void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
     const int64_t on = desc_numel(outs[0]);
 
     std::vector<float> out_wino(static_cast<size_t>(on), fill_out);
-    auto out_view = test::make_planar(outs[0], out_wino.data());
+    auto out_view = test::make_channel_first(outs[0], out_wino.data());
 
     // Two-step prepack: query the shape with an empty view, then fill it.
     std::vector<float> u_buf;
@@ -733,7 +733,7 @@ void wino_vs_ref_f32(std::initializer_list<int64_t> in_shape,
 
     // Reference: conv2d_ref on the raw weight.
     std::vector<float> out_ref(static_cast<size_t>(on), fill_out);
-    auto ref_view = test::make_planar(outs[0], out_ref.data());
+    auto ref_view = test::make_channel_first(outs[0], out_ref.data());
     std::vector<TensorView> rins = {in_view, w_view};
     if (has_bias) { rins.push_back(bias_view); }
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_view, rins,
@@ -970,14 +970,14 @@ NNOPS_TEST(wino_threads_bit_identical_batch_groups) {
     const std::vector<TensorView> ins = {in_view, u_view, b_view};
 
     std::vector<float> out_serial(static_cast<size_t>(on), 0.0f);
-    auto serial_view = test::make_planar(outs[0], out_serial.data());
+    auto serial_view = test::make_channel_first(outs[0], out_serial.data());
     op->compute(serial_view, ins, ComputeContext{});
 
     SimplePool pool(4);
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
     std::vector<float> out_pool(static_cast<size_t>(on), 0.0f);
-    auto pool_view = test::make_planar(outs[0], out_pool.data());
+    auto pool_view = test::make_channel_first(outs[0], out_pool.data());
     op->compute(pool_view, ins, ctx);
 
     // 2 batches · 2 groups · 7 tile rows = 28 tasks over 4 workers, so the pool
@@ -1013,7 +1013,7 @@ NNOPS_TEST(wino_f16_matches_ref) {
     const int64_t on = desc_numel(outs[0]);
 
     std::vector<half> out_wino(static_cast<size_t>(on), half(0.0f));
-    auto out_view = test::make_planar(outs[0], out_wino.data());
+    auto out_view = test::make_channel_first(outs[0], out_wino.data());
 
     std::vector<half> u_buf;
     TensorView u_view;
@@ -1043,7 +1043,7 @@ NNOPS_TEST(wino_f16_matches_ref) {
     TensorView in_ref(ishape, DataType::f32, in_f32.data());
     TensorView w_ref(wshape, DataType::f32, w_f32.data());
     std::vector<float> ref2(on, 0.0f);
-    auto ref2_view = test::make_planar(outs[0], ref2.data());
+    auto ref2_view = test::make_channel_first(outs[0], ref2.data());
     const TensorView rins[] = {in_ref, w_ref};
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref2_view, rins,
                                                ComputeContext{}, nullptr);
@@ -1057,12 +1057,12 @@ NNOPS_TEST(wino_f16_matches_ref) {
     NNOPS_EXPECT_TRUE(max_diff < test::kF16AccumTol);
 }
 
-// ---- F(4,3) on the planar route ------------------------------------------
+// ---- F(4,3) on the channel-first route ------------------------------------------
 
-NNOPS_TEST(wino43_planar_matches_ref) {
+NNOPS_TEST(wino43_channel_first_matches_ref) {
     // The order follows the filter's channel count, so 64 channels is what asks
     // for F(4,3) — 36 positions per tile, 4x4 outputs. The tolerance is the
-    // channel-last route's, for the same reason: Bᵀ scales a window by 5 and
+    // Channel-last route's, for the same reason: Bᵀ scales a window by 5 and
     // Aᵀ by 8, so an f32 round is wider than F(2,3)'s even in f32.
     Conv2DAttributes attrs;
     attrs.kernel_size = {3, 3};
@@ -1077,13 +1077,13 @@ NNOPS_TEST(wino43_planar_matches_ref) {
     wino_vs_ref_f32({2, 64, 16, 16}, {128, 64, 3, 3}, pad0, /*has_bias=*/false,
                     0.0f, nullptr, 1e-4f, 1e-3f);
 
-    // Two k passes: 512 channels against the planar k-block, tiles past one
+    // Two k passes: 512 channels against the channel-first k-block, tiles past one
     // 8-wide group on both axes.
     wino_vs_ref_f32({1, 512, 9, 9}, {512, 512, 3, 3}, attrs, /*has_bias=*/false,
                     0.0f, nullptr, 1e-4f, 1e-3f);
 }
 
-NNOPS_TEST(wino43_planar_reads_the_order_off_the_u) {
+NNOPS_TEST(wino43_channel_first_reads_the_order_off_the_u) {
     // Both end-to-end routes take the transform order from the U's leading
     // dimension — 16 positions is F(2,3), 36 is F(4,3) — and tile the output
     // accordingly. Anything else is not a U this plan can index.
@@ -1131,14 +1131,14 @@ NNOPS_TEST(wino43_planar_reads_the_order_off_the_u) {
 NNOPS_TEST(wino_pick_order_fences) {
     using nnops::backend::cpu::WinoOrder;
     using nnops::backend::cpu::wino_pick_order;
-    constexpr bool cl = true;    // channel-last
-    constexpr bool pl = false;   // planar
+    constexpr bool cl = true;    // Channel-last
+    constexpr bool pl = false;   // Channel-first
     // f16 keeps F(2,3) at every width and plane, on both routes.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, cl) ==
                       WinoOrder::F23);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f16, 512, 512, 56, 56, pl) ==
                       WinoOrder::F23);
-    // Planar's plane floor moves with the team, because what it amortizes is a
+    // Channel-first's plane floor moves with the team, because what it amortizes is a
     // halo strip per *task*: on a small team the tile axes fill the pool on
     // their own (28x28 is 0.71-0.81x of F(2,3)), past four workers the grid is
     // short and the oc-chunk split rebuilds that strip per chunk (1.04x at six

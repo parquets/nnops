@@ -4,7 +4,7 @@
 ///
 /// Equivalent to numpy/torch `x[start:end:step, ...]` on the listed axes;
 /// unlisted axes are kept in full. For each listed axis the output dim is
-/// ceil((end - start) / step) after clamping to the input extent. Planar only.
+/// ceil((end - start) / step) after clamping to the input extent. Channel-first only.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -58,7 +58,7 @@ public:
     Backend getBackend() const override { return backend_; }
 
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     const SliceAttributes& attributes() const noexcept { return attrs_; }

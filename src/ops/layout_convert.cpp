@@ -21,17 +21,17 @@ namespace {
 
         if (src_layout == dst_layout) { return Status::invalid_argument; }
 
-        const bool planar_to_cl =
+        const bool channel_first_to_cl =
             (src_layout == TensorLayout::NCHW && dst_layout == TensorLayout::NHWC) ||
             (src_layout == TensorLayout::NCDHW && dst_layout == TensorLayout::NDHWC);
-        const bool cl_to_planar =
+        const bool cl_to_channel_first =
             (src_layout == TensorLayout::NHWC && dst_layout == TensorLayout::NCHW) ||
             (src_layout == TensorLayout::NDHWC && dst_layout == TensorLayout::NCDHW);
 
-        if (planar_to_cl) {
-            convert_planar_to_channel_last(input, output, ctx);
-        } else if (cl_to_planar) {
-            convert_channel_last_to_planar(input, output, ctx);
+        if (channel_first_to_cl) {
+            convert_channel_first_to_channel_last(input, output, ctx);
+        } else if (cl_to_channel_first) {
+            convert_channel_last_to_channel_first(input, output, ctx);
         } else {
             // A weight-prepack tag or a mismatched rank-3 layout.
             return Status::unsupported;

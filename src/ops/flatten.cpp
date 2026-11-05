@@ -15,7 +15,7 @@ NNOPS_OP_BOILERPLATE(Flatten, FlattenAttributes,
 std::vector<TensorDesc> Flatten::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    // Same logical shape, always dense planar layout.
+    // Same logical shape, always dense channel-first layout.
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
     const int64_t srank = rank - 2;

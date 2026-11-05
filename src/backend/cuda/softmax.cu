@@ -9,9 +9,9 @@
 ///      log_softmax: (x - max) - log(sum).
 ///
 /// Two paths, chosen by where the normalization axis sits in memory (mirrors
-/// the CPU backend), over planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC)
+/// the CPU backend), over channel-first and channel-last
 /// layouts:
-///   - The axis is the innermost axis of the storage (planar's last dim,
+///   - The axis is the innermost axis of the storage (channel-first's last dim,
 ///     channel-last's C): every group is D contiguous elements, one block per
 ///     group (softmax_kernel).
 ///   - Every other axis: reference-style outer/D/inner decomposition with

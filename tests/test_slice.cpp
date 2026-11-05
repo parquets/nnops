@@ -1,5 +1,5 @@
 /// @file test_slice.cpp
-/// @brief Slice operator tests (CPU, planar, f32/f16).
+/// @brief Slice operator tests (CPU, channel-first, f32/f16).
 ///
 /// Covers 1-D..4-D, multi-axis, negative axes, step > 1, empty axes (identity),
 /// f16, and descriptor-only shape inference. Slice is a strided sub-tensor
@@ -47,7 +47,7 @@ NNOPS_TEST(slice_1d_basic) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
 
     std::vector<float> out_buf(4);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -80,7 +80,7 @@ NNOPS_TEST(slice_1d_with_step) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
 
     std::vector<float> out_buf(4);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -118,7 +118,7 @@ NNOPS_TEST(slice_2d_rows) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
 
     std::vector<float> out_buf(6);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -156,7 +156,7 @@ NNOPS_TEST(slice_2d_cols_strided) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
 
     std::vector<float> out_buf(12);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -193,7 +193,7 @@ NNOPS_TEST(slice_3d_multi_axis) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 4);
 
     std::vector<float> out_buf(48);  // 2 * 6 * 4
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -227,7 +227,7 @@ NNOPS_TEST(slice_identity) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 5);
 
     std::vector<float> out_buf(60);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -257,7 +257,7 @@ NNOPS_TEST(slice_negative_axes) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 2);
 
     std::vector<float> out_buf(12);  // 2 * 3 * 2
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -297,7 +297,7 @@ NNOPS_TEST(slice_random_f32) {
 
     int64_t numel = 2 * 6 * 3 * 6;
     std::vector<float> out_buf(static_cast<size_t>(numel));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -348,7 +348,7 @@ NNOPS_TEST(slice_random_f16) {
 
     int64_t out_numel = 2 * 8 * 4;
     std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(out_numel));
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -387,7 +387,7 @@ NNOPS_TEST(slice_innermost_strided) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 2);
 
     std::vector<float> out_buf(12);  // 2 * 3 * 2
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -451,13 +451,13 @@ NNOPS_TEST(slice_class_api) {
     auto descs = op->getOutputTensorDesc(in_arr);
     int64_t numel = 2 * 3 * 2;
     std::vector<float> out_class(static_cast<size_t>(numel));
-    TensorView out_view1 = test::make_planar(descs[0], out_class.data());
+    TensorView out_view1 = test::make_channel_first(descs[0], out_class.data());
     const TensorView ins[] = {input};
     op->compute(out_view1, ins);
 
     // A second compute through the same op must reproduce the first exactly.
     std::vector<float> out_func(static_cast<size_t>(numel));
-    TensorView out_view2 = test::make_planar(descs[0], out_func.data());
+    TensorView out_view2 = test::make_channel_first(descs[0], out_func.data());
     op->compute(out_view2, ins);
 
     for (size_t i = 0; i < static_cast<size_t>(numel); ++i) {

@@ -7,7 +7,7 @@
 /// quantization rounds half-to-even (ONNX default).
 ///
 /// Every tensor is treated as a flat row-major `numel()` array; packed and
-/// planar layouts are not distinguished. Granularity maps onto the kernel's
+/// Channel-first layouts are not distinguished. Granularity maps onto the kernel's
 /// per-row M x N shape:
 ///   PerTensor  -> M=1,           N=numel
 ///   PerToken   -> M=numel/last,  N=last (one scale per row)

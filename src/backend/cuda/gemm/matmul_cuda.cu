@@ -3,7 +3,7 @@
 ///        operator front end.
 ///
 /// The op resolves the logical (M, N, K) out of the two transpose flags and
-/// hands the kernel the physical row strides, so a planar tensor's pitch simply
+/// hands the kernel the physical row strides, so a channel-first tensor's pitch simply
 /// becomes the row stride of whichever physical axis is the row. Batch dims
 /// broadcast numpy-style from the right and travel as (size, stride) pairs with
 /// stride 0 for a broadcast axis; blockIdx.z walks the flattened product.

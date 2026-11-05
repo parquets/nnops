@@ -5,7 +5,7 @@
 /// `split` gives the slice lengths; when empty, `num_outputs` equal slices are
 /// taken and the axis must divide evenly. The slices cover the axis in order, so
 /// their lengths sum to it. Each output is a plain copy of a contiguous axis
-/// region. Planar.
+/// region. Channel-first.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -58,7 +58,7 @@ public:
     OpType  getOpType()  const override { return OpType::Split; }
     Backend getBackend() const override { return backend_; }
     LayoutSupport getLayoutSupport() const noexcept override {
-        return LayoutSupport::PlanarOnly;
+        return LayoutSupport::ChannelFirstOnly;
     }
 
     struct Impl;

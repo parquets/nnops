@@ -5,13 +5,13 @@
 /// Conv2D over an im2col matrix is a GEMM either way; the layout decides the
 /// operand roles:
 ///
-///   planar (NCHW):
+///   Channel-first:
 ///     M = oc_per_group, N = pixels of the oh-block, K = ic_per_group × karea
 ///     A = the weight (direct-A on fp, packed into A panels on int8)
 ///     B = the activations, gathered into uniform packed panels (on fp the
 ///         gather and the pack are one fused pass)
 ///
-///   channel-last (NHWC):
+///   Channel-last:
 ///     M = pixels, N = oc block, K = karea × ic block, tap-major
 ///     A = the activation tile (the input row itself for a 1x1)
 ///     B = the weight, packed from TensorFlow's HWIO filter
@@ -19,7 +19,7 @@
 /// The swap is what makes channel-last fast: a pixel's channels are contiguous,
 /// so a tap is one copy in both the input and the A row, and the weight's
 /// contiguous axis is the output channel, so a B panel's k row is one OC-length
-/// run with no transposing pack. A planar OIHW weight's k slice is instead a
+/// run with no transposing pack. A channel-first OIHW weight's k slice is instead a
 /// karea-strided scatter, so the pixel axis is what has to be gathered.
 ///
 /// Shared here:
@@ -28,7 +28,7 @@
 ///     two plans are one struct with a route tag;
 ///   * one scratch layout (Conv2DGemmScratch / gemm_scratch_layout): every
 ///     region 64-byte aligned, all offsets computed in that one function;
-///   * the prepacked-filter geometry (ConvPackedWeightLast / _Planar) — a
+///   * the prepacked-filter geometry (ConvPackedWeightLast / _ChannelFirst) — a
 ///     function of the attributes and the channel counts alone, no activation
 ///     and no thread count. The plan adopts its block sizes, so the panels
 ///     prepackWeights builds and the panels the kernel addresses are one
@@ -43,7 +43,7 @@
 /// Scratch arena, one shape for both routes (offsets are bytes, sizes are in
 /// esz-sized elements unless noted):
 ///   [quant plane][shared packed B][slot 0 | slot 1 | …][int32 acc][packed A]
-/// A slot is [col | A][add_to residual][weight staging][packed B]: the planar
+/// A slot is [col | A][add_to residual][weight staging][packed B]: the channel-first
 /// int8 col matrix, the channel-last A region (packed-A panels, then the
 /// row-major gather), the add_to original tile, the channel-last staging tile,
 /// then the per-slot B panels. Before the slots sit the quantized activation
@@ -65,19 +65,19 @@ namespace nnops::backend::cpu {
 
 /// Which route a plan was resolved for — the tag the kernel dispatches on.
 enum class Conv2DGemmRoute : uint8_t {
-    Planar,       ///< activation stored NCHW, weight OIHW [OC][IC/G][KH][KW]
-    ChannelLast,  ///< activation stored NHWC, weight HWIO [KH][KW][IC/G][OC]
+    ChannelFirst,  ///< activation channel-first, weight OIHW [OC][IC/G][KH][KW]
+    ChannelLast,   ///< activation channel-last, weight HWIO [KH][KW][IC/G][OC]
 };
 
 /// Both routes' block sizes, parallel decomposition and scratch geometry;
 /// unused fields stay zero.
 struct Conv2DGemmPlan {
-    Conv2DGemmRoute route = Conv2DGemmRoute::Planar;
+    Conv2DGemmRoute route = Conv2DGemmRoute::ChannelFirst;
 
     // ---- both routes ------------------------------------------------------
     int64_t icn_block = 0;    ///< input-channel block (kdim = icn_block × karea on
                               ///< both routes)
-    int64_t ocn_block = 0;    ///< output-channel block: the planar GEMM's M tile,
+    int64_t ocn_block = 0;    ///< output-channel block: the channel-first GEMM's M tile,
                               ///< the channel-last GEMM's N tile
     int64_t oh_chunks = 1;    ///< parallel row chunks per (batch, group)
     int64_t oc_chunks = 1;    ///< filter chunks per (batch, group); the grid is
@@ -95,12 +95,12 @@ struct Conv2DGemmPlan {
                               ///< own panels)
     bool pointwise = false;   ///< k1s1p0: the GEMM reads the input tensor itself,
                               ///< so no gather and icn_block spans all of
-                              ///< ic_per_group (planar: only for a dense plane)
+                              ///< ic_per_group (channel-first: only for a dense plane)
     size_t workspace_size = 0;///< pooled scratch bytes; 0 is "nothing to pool",
                               ///< never "unsupported" — that is icn_block == 0
 
-    // ---- planar only ------------------------------------------------------
-    int64_t oh_block = 0;          ///< output-row block (the planar GEMM's N tile);
+    // ---- channel-first only ------------------------------------------------------
+    int64_t oh_block = 0;          ///< output-row block (the channel-first GEMM's N tile);
                                    ///< 1 when the destination's rows are not
                                    ///< back to back (a padded pitch)
     int64_t num_oh_blocks = 1;     ///< ceil(OH / oh_block)
@@ -137,7 +137,7 @@ inline int64_t gemm_panel_slot(int64_t kc, int64_t nr_max, int64_t esz,
 }
 
 /// Packed-B panel-set elements: @p panels_per_oc panels at k-length @p kdim —
-/// the planar route's whole oh-block, or the channel-last route's one
+/// the channel-first route's whole oh-block, or the channel-last route's one
 /// (ic block, oc block) at the whole filter's kdim.
 inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim,
                               int64_t nr_max, int64_t esz, bool quant) noexcept
@@ -206,11 +206,11 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
                                              int64_t oc_per_group,
                                              DataType weight_dtype);
 
-/// Geometry of the planar prepacked filter (PackedOIHW). Two forms, one tag: an
+/// Geometry of the channel-first prepacked filter (PackedOIHW). Two forms, one tag: an
 /// int8 filter packs into the MMA's A panels (the per-task pack the kernel
 /// otherwise repeats); a float one is already the GEMM's A matrix and only gets
 /// a densifying copy (`dense`, and every field besides `total` is then unused).
-struct ConvPackedWeightPlanar {
+struct ConvPackedWeightChannelFirst {
     bool dense = false;      ///< the blob is the filter's own [OC][K] matrix
     int64_t icn_block = 0;   ///< k block
     int64_t ocn_block = 0;   ///< oc block
@@ -234,7 +234,7 @@ struct ConvPackedWeightPlanar {
     int64_t offset(int64_t g, int64_t ic_block, int64_t oc_block) const noexcept;
 };
 
-ConvPackedWeightPlanar conv_packed_weight_planar(const Conv2DAttributes& attrs,
+ConvPackedWeightChannelFirst conv_packed_weight_channel_first(const Conv2DAttributes& attrs,
                                                  int64_t ic_per_group,
                                                  int64_t oc_per_group,
                                                  DataType weight_dtype);
@@ -258,14 +258,14 @@ struct Conv2DGemmScratch {
     int64_t quant_off = 0;   ///< the shared quantized-activation plane (at 0)
     int64_t panel_off = 0;   ///< absolute: the shared packed-B region
     int64_t head = 0;        ///< absolute: the per-slot region
-    int64_t off_col = 0;     ///< per-slot im2col col matrix (planar quantized)
+    int64_t off_col = 0;     ///< per-slot im2col col matrix (channel-first quantized)
     int64_t off_a = 0;       ///< per-slot A: the packed-A panels, then the gather
     int64_t off_orig = 0;    ///< per-slot add_to residual region
     int64_t off_stage = 0;   ///< per-slot weight staging tile
     int64_t off_pack = 0;    ///< per-slot packed-B region (when not shared)
     int64_t slot_stride = 0; ///< bytes per slot
     int64_t off_acc = 0;     ///< int32 accumulator region (absolute, after slots)
-    int64_t off_pack_a = 0;  ///< packed-weight region (absolute, planar quantized)
+    int64_t off_pack_a = 0;  ///< packed-weight region (absolute, channel-first quantized)
     int64_t total = 0;       ///< total arena bytes
 };
 
@@ -290,9 +290,9 @@ inline Conv2DGemmScratch gemm_scratch_layout(const Conv2DGemmPlan& p,
 }
 
 /// Resolve the plan (block sizes, parallel decomposition, workspace bytes) from
-/// the descriptors. The route follows the activation's layout: NCHW → planar,
-/// NHWC → channel-last (which additionally needs the HWIO filter or its
-/// prepacked blob). A zeroed plan — `icn_block == 0`, not workspace_size — is
+/// the descriptors. The route follows the activation's layout: channel-first →
+/// channel-first, channel-last → channel-last (which additionally needs the HWIO
+/// filter or its prepacked blob). A zeroed plan — `icn_block == 0`, not workspace_size — is
 /// the unsupported-dtype answer, which the kernel turns into
 /// Status::unsupported. Supported on both routes: f32/f16 on every tensor, or
 /// the int8 route — an s8 weight, a u8/s8/f16/f32 activation, an f32/f16/s8/u8

@@ -2,7 +2,7 @@
 /// @file simd_permute.hpp
 /// @brief Tiled 2D transpose via v_transpose_8x8 — the core of the Permute
 /// operator's last-two-dims swap (2D transpose, batched (B,M,K)->(B,K,M),
-/// NCHW<->NHCW).
+/// channel-first ↔ channel-last).
 ///
 /// Full 8×8 tiles transpose in registers with the unpack/permute intrinsics;
 /// partial right/bottom edge tiles fall back to a scalar element copy. The

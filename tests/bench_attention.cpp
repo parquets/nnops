@@ -183,7 +183,7 @@ void run_mha(const MhaCase& c, const std::vector<int>& threads, int iters) {
     const double flops = 4.0 * static_cast<double>(c.B) * H * Sq * Sk * D;
 
     std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto output = test::make_planar(out_descs[0], out_buf.data());
+    auto output = test::make_channel_first(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
     std::printf("    B=%lld H=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s%s\n",
@@ -280,7 +280,7 @@ void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
     const double flops = 4.0 * static_cast<double>(c.B) * c.H * Sq * Sk * c.D;
 
     std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto output = test::make_planar(out_descs[0], out_buf.data());
+    auto output = test::make_channel_first(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
     std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s%s\n",
@@ -377,7 +377,7 @@ void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
                          static_cast<double>(dkv + (c.vdim > 0 ? c.vdim : c.rank));
 
     std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto output = test::make_planar(out_descs[0], out_buf.data());
+    auto output = test::make_channel_first(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
     std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld Dkv=%lld v=%lld  %s%s%s\n",

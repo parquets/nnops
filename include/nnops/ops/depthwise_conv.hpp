@@ -1,7 +1,7 @@
 #pragma once
 /// @file depthwise_conv.hpp
-/// @brief DepthwiseConv operator — per-channel 2D/3D convolution, on a planar
-///        (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
+/// @brief DepthwiseConv operator — per-channel 2D/3D convolution, on a channel-first
+///        (channel-first) or a channel-last tensor.
 ///
 /// One filter per input channel and no cross-channel mixing — the first half of
 /// a depthwise-separable convolution. The output has the input's channel count
@@ -11,8 +11,8 @@
 /// (Input [N, C, IH, IW], Weight [C, 1, KH, KW]), rank 5 is 3D
 /// (Input [N, C, ID, IH, IW], Weight [C, 1, KD, KH, KW]).
 ///
-/// Both routes read the raw filter: a planar input the [C, 1, (KD,) KH, KW]
-/// form as it is, a channel-last one the HWCM [KH][KW][C] form. The planar
+/// Both routes read the raw filter: a channel-first input the [C, 1, (KD,) KH, KW]
+/// form as it is, a channel-last one the HWCM [KH][KW][C] form. The channel-first
 /// route has f32/f16 kernels only; the channel lane also covers the quantized
 /// s8/u8 pairs (PerTensor activation, PerChannel weight).
 

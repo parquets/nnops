@@ -3,18 +3,18 @@
 /// @brief SIMD im2col gathers — the gathered operand of a conv-as-GEMM.
 ///
 /// Two families:
-///  - planar (NCHW Conv2D, NCDHW Conv3D): one row per (ic, tap), the row
+///  - channel-first Conv2D / Conv3D: one row per (ic, tap), the row
 ///    spanning the current output block (the roi). tiled_im2col_2d writes a
 ///    row-major col matrix [ic*karea][roi_area]; tiled_im2col_2d_packed writes
 ///    the same values straight into the uniform NR-wide B panels the MMA
 ///    consumes (column n of k row at dst[(n/NR)*ldd + k*NR + n%NR]), dropping
 ///    the materialize-then-pack round trip. Out-of-input positions store `pad`.
-///  - channel-last (NHWC Conv2D): one row per output pixel, k tap-major
+///  - channel-last (channel-last Conv2D): one row per output pixel, k tap-major
 ///    (k = tap*icnc + ic). A tap is a contiguous channel run, so a row is
 ///    karea straight copies — the same access the 1x1 route reads for free —
 ///    and that order is the weight's own (HWIO), so the ordinary panel packer
 ///    reads B. Adjacent taps of one filter row merge into a single KW*icnc span
-///    when DW == 1 and ic_stride == icnc. tiled_im2col_nhwc_i8 is the same
+///    when DW == 1 and ic_stride == icnc. tiled_im2col_channel_last_i8 is the same
 ///    gather into s8 for the quantized route: bytes in, XORed by `xr`, the zero
 ///    point as `pad`, and the k tail zeroed to kdim4 for the direct-A MMA.
 ///
@@ -278,7 +278,7 @@ inline void im2col_2d_walk(
 
 }  // namespace detail
 
-/// NCHW Conv2D gather into the row-major col matrix
+/// Channel-first Conv2D gather into the row-major col matrix
 /// col_data[ic*karea + kh*kernel_w + kw][roi_h*roi_w].
 template <class T>
 inline void tiled_im2col_2d(
@@ -339,7 +339,7 @@ inline void tiled_im2col_2d_packed(
     }
 }
 
-/// NCDHW Conv3D gather into
+/// Channel-first 3D Conv3D gather into
 /// col_data[ic*karea3d + (kd*kernel_h + kh)*kernel_w + kw][roi_d*roi_h*roi_w];
 /// out-of-input positions are zero. Unlike the 2D kernel, which fills only the
 /// padded faces, this one zeroes each row and copies the valid interior —
@@ -410,14 +410,14 @@ inline void tiled_im2col_3d(
     }
 }
 
-// ---- channel-last (NHWC) gathers ------------------------------------------
+// ---- channel-last gathers ------------------------------------------
 
 /// Gather one pixel tile of one ic block into A: row m is the patch of output
 /// pixel (oh, ow0 + m). @p p0 is that pixel's flat index (oh × OW + ow0);
 /// @p flat walks the tile past a row end into the next, legal only because the
 /// rows are dense.
 template <class T>
-inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
+inline void tiled_im2col_channel_last(T* NNOPS_RESTRICT a, int lda,
                               const T* NNOPS_RESTRICT in,
                               int64_t in_row_stride, int64_t ic_stride, T pad,
                               int64_t p0, int OW, bool flat, int mc,
@@ -519,7 +519,7 @@ inline void tiled_im2col_nhwc(T* NNOPS_RESTRICT a, int lda,
 /// @p kdim4 is zeroed so the direct-A kernel, which reads whole 4-byte groups,
 /// sees a zero product there (the B panel is zero-padded over the same range).
 /// @p p0 / @p flat mean what they do in the fp gather.
-inline void tiled_im2col_nhwc_i8(int8_t* NNOPS_RESTRICT a, int lda,
+inline void tiled_im2col_channel_last_i8(int8_t* NNOPS_RESTRICT a, int lda,
                                  const uint8_t* NNOPS_RESTRICT in,
                                  int64_t in_row_stride, int64_t ic_stride,
                                  uint8_t xr, uint8_t pad,

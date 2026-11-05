@@ -49,8 +49,8 @@ NNOPS_TEST(topk_1d_max_basic) {
     NNOPS_EXPECT_EQ(descs[1].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[1].dtype, DataType::s64);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -83,8 +83,8 @@ NNOPS_TEST(topk_1d_min_basic) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -117,8 +117,8 @@ NNOPS_TEST(topk_1d_unsorted) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -173,8 +173,8 @@ NNOPS_TEST(topk_2d_last_axis) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 2);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -218,8 +218,8 @@ NNOPS_TEST(topk_2d_axis0) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);  // k=2
     NNOPS_EXPECT_EQ(descs[0].dims[1], 2);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -261,8 +261,8 @@ NNOPS_TEST(topk_k1_matches_argmax) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 2);
     NNOPS_EXPECT_EQ(descs[0].dims[1], 1);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -275,8 +275,8 @@ NNOPS_TEST(topk_k1_matches_argmax) {
     NNOPS_EXPECT_EQ(idx_buf[1], 2);
 }
 
-NNOPS_TEST(topk_4d_nchw) {
-    // NCHW [1, 2, 1, 4], k=2, axis=-1 (W axis)
+NNOPS_TEST(topk_4d_channel_first) {
+    // Channel-first [1, 2, 1, 4], k=2, axis=-1 (W axis)
     const int64_t shape[] = {1, 2, 1, 4};
     float data[] = {1.0f, 9.0f, 3.0f, 7.0f,   // C=0
                     4.0f, 2.0f, 8.0f, 6.0f};  // C=1
@@ -302,8 +302,8 @@ NNOPS_TEST(topk_4d_nchw) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 1);
     NNOPS_EXPECT_EQ(descs[0].dims[3], 2);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -322,7 +322,7 @@ NNOPS_TEST(topk_4d_nchw) {
 }
 
 NNOPS_TEST(topk_5d_ncdhw) {
-    // NCDHW [1, 1, 2, 1, 3], k=2, axis=-1 (W axis)
+    // Channel-first 3D [1, 1, 2, 1, 3], k=2, axis=-1 (W axis)
     const int64_t shape[] = {1, 1, 2, 1, 3};
     float data[] = {10.0f, 2.0f, 6.0f,   // D=0
                     5.0f, 8.0f, 1.0f};  // D=1
@@ -345,8 +345,8 @@ NNOPS_TEST(topk_5d_ncdhw) {
     NNOPS_EXPECT_EQ(descs[0].rank, 5);
     NNOPS_EXPECT_EQ(descs[0].dims[4], 2);  // W dim replaced by k
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -384,8 +384,8 @@ NNOPS_TEST(topk_random_vs_ref) {
 
     std::vector<float> val_buf(25);
     std::vector<int64_t> idx_buf(25);
-    auto val_out = test::make_planar(descs[0], val_buf.data());
-    auto idx_out = test::make_planar(descs[1], idx_buf.data());
+    auto val_out = test::make_channel_first(descs[0], val_buf.data());
+    auto idx_out = test::make_channel_first(descs[1], idx_buf.data());
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -424,8 +424,8 @@ NNOPS_TEST(topk_random_min_vs_ref) {
 
     std::vector<float> val_buf(12);
     std::vector<int64_t> idx_buf(12);
-    auto val_out = test::make_planar(descs[0], val_buf.data());
-    auto idx_out = test::make_planar(descs[1], idx_buf.data());
+    auto val_out = test::make_channel_first(descs[0], val_buf.data());
+    auto idx_out = test::make_channel_first(descs[1], idx_buf.data());
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -471,8 +471,8 @@ NNOPS_TEST(topk_k_equals_axis_dim) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -489,8 +489,8 @@ NNOPS_TEST(topk_k_equals_axis_dim) {
 }
 
 NNOPS_TEST(topk_negative_axis) {
-    // Negative axis: -3 means C axis in NCHW (0=N, 1=C, 2=H, 3=W)
-    const int64_t shape[] = {1, 3, 1, 2};  // NCHW
+    // Negative axis: -3 means C axis in channel-first (0=N, 1=C, 2=H, 3=W)
+    const int64_t shape[] = {1, 3, 1, 2};  // Channel-first
     float data[] = {5.0f, 1.0f,   // C=0
                     2.0f, 4.0f,   // C=1
                     3.0f, 6.0f};  // C=2
@@ -512,8 +512,8 @@ NNOPS_TEST(topk_negative_axis) {
 
     NNOPS_EXPECT_EQ(descs[0].dims[1], 2);  // C dim replaced by k
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView outs[] = {val_out, idx_out};
     const TensorView ins[] = {in};
     op->compute(outs, ins);
@@ -554,8 +554,8 @@ NNOPS_TEST(topk_class_api) {
     const TensorDesc desc_arr[] = {d_in};
     auto descs = op->getOutputTensorDesc(desc_arr);
 
-    auto val_out = test::make_planar(descs[0], val_buf);
-    auto idx_out = test::make_planar(descs[1], idx_buf);
+    auto val_out = test::make_channel_first(descs[0], val_buf);
+    auto idx_out = test::make_channel_first(descs[1], idx_buf);
     TensorView out_arr[] = {val_out, idx_out};
 
     const TensorView ins[] = {in};

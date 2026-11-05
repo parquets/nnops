@@ -1,5 +1,5 @@
 /// @file layout_convert.cpp
-/// @brief CPU implementation of planar ↔ channel-last conversion.
+/// @brief CPU implementation of channel-first ↔ channel-last conversion.
 ///
 /// Both directions walk one spatial row at a time (W pixels, C channels) and
 /// hand 8-channel blocks to the transpose kernel. 2D and 3D share the loop:
@@ -22,7 +22,7 @@ namespace k = nnops::kernel;
 namespace {
 
 template <typename T>
-void planar_to_cl_impl(const TensorView& src, TensorView& dst,
+void channel_first_to_cl_impl(const TensorView& src, TensorView& dst,
                        const ComputeContext& ctx)
 {
     const int64_t rank = src.rank();
@@ -53,7 +53,7 @@ void planar_to_cl_impl(const TensorView& src, TensorView& dst,
 
         for (int64_t c_base = 0; c_base < C; c_base += 8) {
             const int64_t valid = std::min<int64_t>(8, C - c_base);
-            k::layout_planar_to_cl_block<T>(in_row, out_row, W, C, in_ch_stride,
+            k::layout_channel_first_to_cl_block<T>(in_row, out_row, W, C, in_ch_stride,
                                             c_base, valid);
         }
     };
@@ -62,7 +62,7 @@ void planar_to_cl_impl(const TensorView& src, TensorView& dst,
 }
 
 template <typename T>
-void cl_to_planar_impl(const TensorView& src, TensorView& dst,
+void cl_to_channel_first_impl(const TensorView& src, TensorView& dst,
                        const ComputeContext& ctx)
 {
     const int64_t rank = src.rank();
@@ -93,7 +93,7 @@ void cl_to_planar_impl(const TensorView& src, TensorView& dst,
 
         for (int64_t c_base = 0; c_base < C; c_base += 8) {
             const int64_t valid = std::min<int64_t>(8, C - c_base);
-            k::layout_cl_to_planar_block<T>(in_row, out_row, W, C, out_ch_stride,
+            k::layout_cl_to_channel_first_block<T>(in_row, out_row, W, C, out_ch_stride,
                                             c_base, valid);
         }
     };
@@ -103,27 +103,27 @@ void cl_to_planar_impl(const TensorView& src, TensorView& dst,
 
 }  // anonymous namespace
 
-void convert_planar_to_channel_last(const TensorView& src, TensorView& dst,
+void convert_channel_first_to_channel_last(const TensorView& src, TensorView& dst,
                                     const ComputeContext& ctx) {
     NNOPS_ASSERT(src.data_type() == dst.data_type());
     switch (src.data_type()) {
-    case DataType::f32: planar_to_cl_impl<float>(src, dst, ctx); return;
-    case DataType::f16: planar_to_cl_impl<half>(src, dst, ctx);  return;
-    case DataType::s8:  planar_to_cl_impl<int8_t>(src, dst, ctx); return;
-    case DataType::u8:  planar_to_cl_impl<uint8_t>(src, dst, ctx); return;
-    default: NNOPS_ASSERT(!"convert_planar_to_channel_last: unsupported data type");
+    case DataType::f32: channel_first_to_cl_impl<float>(src, dst, ctx); return;
+    case DataType::f16: channel_first_to_cl_impl<half>(src, dst, ctx);  return;
+    case DataType::s8:  channel_first_to_cl_impl<int8_t>(src, dst, ctx); return;
+    case DataType::u8:  channel_first_to_cl_impl<uint8_t>(src, dst, ctx); return;
+    default: NNOPS_ASSERT(!"convert_channel_first_to_channel_last: unsupported data type");
     }
 }
 
-void convert_channel_last_to_planar(const TensorView& src, TensorView& dst,
+void convert_channel_last_to_channel_first(const TensorView& src, TensorView& dst,
                                     const ComputeContext& ctx) {
     NNOPS_ASSERT(src.data_type() == dst.data_type());
     switch (src.data_type()) {
-    case DataType::f32: cl_to_planar_impl<float>(src, dst, ctx); return;
-    case DataType::f16: cl_to_planar_impl<half>(src, dst, ctx);  return;
-    case DataType::s8:  cl_to_planar_impl<int8_t>(src, dst, ctx); return;
-    case DataType::u8:  cl_to_planar_impl<uint8_t>(src, dst, ctx); return;
-    default: NNOPS_ASSERT(!"convert_channel_last_to_planar: unsupported data type");
+    case DataType::f32: cl_to_channel_first_impl<float>(src, dst, ctx); return;
+    case DataType::f16: cl_to_channel_first_impl<half>(src, dst, ctx);  return;
+    case DataType::s8:  cl_to_channel_first_impl<int8_t>(src, dst, ctx); return;
+    case DataType::u8:  cl_to_channel_first_impl<uint8_t>(src, dst, ctx); return;
+    default: NNOPS_ASSERT(!"convert_channel_last_to_channel_first: unsupported data type");
     }
 }
 

@@ -7,7 +7,7 @@
 /// Q/K/V arrive as [B, S, H·D] (reshaped internally to [B, H, S, D]) or already
 /// as [B, H, S, D]; inputs[0..2] = Q, K, V and inputs[3] = optional additive
 /// mask, flat [Sq, Sk] and shared by every batch and head. scale = 0 means
-/// 1/sqrt(head_dim). Planar layouts only.
+/// 1/sqrt(head_dim). Channel-first layouts only.
 ///
 /// Chunked input: inputs[4] and inputs[5] are an optional past K and past V —
 /// the same layout as K/V, with Sk_past rows instead of Sk_new. The key run
@@ -81,7 +81,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::MultiHeadAttention; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const MultiHeadAttentionAttributes& attributes() const noexcept { return attrs_; }
 

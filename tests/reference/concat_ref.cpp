@@ -3,9 +3,9 @@
 ///
 /// One element at a time: the output's logical flat index is decomposed to an
 /// index vector, the axis entry selects the source input, and both physical
-/// offsets come from stride_elems(). That covers NCHW, NCDHW, NHWC and NDHWC
-/// without a layout-specific branch — a channel-last row interleaves C, so a
-/// contiguous-copy formulation would be wrong there.
+/// offsets come from stride_elems(). That covers channel-first and channel-last
+/// alike, 2D and 3D, without a layout-specific branch — a channel-last row
+/// interleaves C, so a contiguous-copy formulation would be wrong there.
 
 #include "nnops/ops/concat.hpp"
 #include "nnops/detail/assert.hpp"

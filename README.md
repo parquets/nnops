@@ -176,7 +176,7 @@ tests/                  Standalone test demos (one executable per file)
 
 Key design choices:
 
-- `TensorView` is a **non-owning view** — shape stored inline (zero heap for rank ≤ 8), with a byte `pitch` between rows (OpenCV `cv::Mat::step` style). Planar (`NCHW`/`NCDHW`) and channel-last (`NHWC`/`NDHWC`) layouts and padded rows are supported.
+- `TensorView` is a **non-owning view** — shape stored inline (zero heap for rank ≤ 8), with a byte `pitch` between rows (OpenCV `cv::Mat::step` style). `NCHW`/`NCDHW` (channel-first) and `NHWC`/`NDHWC` (channel-last) layouts and padded rows are supported.
 - Backend kernels keep a `TensorView&` and are dispatched through `switch (backend_)`.
 - The CPU SIMD abstraction (`v_load` / `v_store` / `v_fmadd` / `v_reduce_sum` …) lets a single templated kernel target f32 and f16 across SSE/AVX2/NEON/scalar.
 

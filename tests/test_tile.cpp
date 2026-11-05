@@ -29,7 +29,7 @@ NNOPS_TEST(tile_1d) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 6);
 
     float out[6] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -52,7 +52,7 @@ NNOPS_TEST(tile_2d) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 4);
 
     float out[16] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -78,7 +78,7 @@ NNOPS_TEST(tile_int64_exact) {
     auto descs = op->getOutputTensorDesc(in_arr);
 
     int64_t out[4] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -103,7 +103,7 @@ NNOPS_TEST(expand_row_broadcast) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
 
     float out[6] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -128,7 +128,7 @@ NNOPS_TEST(expand_rank_increase) {
     NNOPS_EXPECT_EQ(descs[0].dims[2], 3);
 
     float out[12] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -152,7 +152,7 @@ NNOPS_TEST(expand_minus_one_keeps_axis) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
 
     float out[12] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {in};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 

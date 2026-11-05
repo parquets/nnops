@@ -36,7 +36,7 @@ tests/
 
 + 项目的 namespace 为 nnops
 + 算子内部使用模板元编程和现代 C++ 特性（如 concepts、constexpr、ranges 等）来实现高性能和类型安全。
-+ 支持多种数据类型（如 float、half、int8_t 等）和不同的张量布局（NCHW/NCDHW 平面布局与 NHWC/NDHWC 通道末尾布局）。
++ 支持多种数据类型（如 float、half、int8_t 等）和不同的张量布局（channel-first 布局与 channel-last 通道末尾布局）。
 + 支持多种硬件后端，包括 CPU、CUDA 和 Vulkan，并提供统一的接口来调用不同后端的实现，并且 CPU 支持 x86_64/aarch64。
 + 提供丰富的算子集合，包括 Conv、Activation、Pool、Linear、MatMul 等常用操作。
 + 算子包含类和函数式两种调用方式。

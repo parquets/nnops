@@ -48,7 +48,7 @@
 /// - Per-slot scratch follows the *worker* count, not the reported task count,
 ///   even when a backend over-subscribes the grid.
 ///
-/// The prepacked filter: a planar float filter already is the GEMM's A operand,
+/// The prepacked filter: a channel-first float filter already is the GEMM's A operand,
 /// so PackedOIHW is a densified [OC][IC/G·KH·KW] copy. Prepacking is total —
 /// every supported filter has a packed form, so a graph engine can prepack
 /// unconditionally and hand the blob back to compute() — but the form follows
@@ -121,7 +121,7 @@ NNOPS_TEST(conv2d_basic_no_pad) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -160,7 +160,7 @@ NNOPS_TEST(conv2d_with_bias) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight, bias};
     op->compute(out, ins);
@@ -196,7 +196,7 @@ NNOPS_TEST(conv2d_stride_2) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -232,7 +232,7 @@ NNOPS_TEST(conv2d_padding_1) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -270,7 +270,7 @@ NNOPS_TEST(conv2d_grouped) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -300,7 +300,7 @@ NNOPS_TEST(conv2d_random_small) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel));
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -313,7 +313,7 @@ NNOPS_TEST(conv2d_random_small) {
 }
 
 NNOPS_TEST(conv2d_class_api) {
-    // The getOutputTensorDesc + make_planar pipeline, on the same 4.5 case.
+    // The getOutputTensorDesc + make_channel_first pipeline, on the same 4.5 case.
     const int64_t ishape[] = {1, 1, 4, 4};
     const int64_t wshape[] = {1, 1, 3, 3};
 
@@ -338,7 +338,7 @@ NNOPS_TEST(conv2d_class_api) {
         out_numel *= outs[0].dims[i];
     }
     std::vector<float> out_buf(static_cast<size_t>(out_numel), 0.0f);
-    auto out = test::make_planar(outs[0], out_buf.data());
+    auto out = test::make_channel_first(outs[0], out_buf.data());
 
     const TensorView ins[] = {input, weight};
     op->compute(out, ins);
@@ -420,11 +420,11 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
     const int64_t out_numel = out_descs[0].numel();
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
     op->compute(fast_out, ins, {}, nullptr);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
 
     for (int64_t i = 0; i < out_numel; ++i) {
@@ -464,7 +464,7 @@ float conv2d_f16_case(const Conv2DAttributes& attrs,
     auto od32 = op->getOutputTensorDesc(d32);
     const int64_t n = od32[0].numel();
     std::vector<float> ref_buf(static_cast<size_t>(n));
-    auto ref_out = test::make_planar(od32[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(od32[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
 
     auto in16v = test::f32_to_f16(in32v);
@@ -485,7 +485,7 @@ float conv2d_f16_case(const Conv2DAttributes& attrs,
     }
     auto od16 = op->getOutputTensorDesc(d16);
     std::vector<half> out16(static_cast<size_t>(n));
-    auto fast_out = test::make_planar(od16[0], out16.data());
+    auto fast_out = test::make_channel_first(od16[0], out16.data());
     op->compute(fast_out, i16, {}, nullptr);
 
     auto fast32 = test::f16_to_f32(out16);
@@ -644,14 +644,14 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
 
             // Serial (default context, no parallelism hook → oh_chunks == 1).
             std::vector<float> serial_buf(static_cast<size_t>(out_numel));
-            auto serial_out = test::make_planar(out_descs[0], serial_buf.data());
+            auto serial_out = test::make_channel_first(out_descs[0], serial_buf.data());
             op->compute(serial_out, ins, {}, nullptr);
 
             SimplePool pool(nthreads);
             ComputeContext ctx;
             ctx.cpu = pool.cpu;
             std::vector<float> threaded_buf(static_cast<size_t>(out_numel));
-            auto threaded_out = test::make_planar(out_descs[0], threaded_buf.data());
+            auto threaded_out = test::make_channel_first(out_descs[0], threaded_buf.data());
             op->compute(threaded_out, ins, ctx, nullptr);
 
             for (int64_t i = 0; i < out_numel; ++i) {
@@ -663,7 +663,7 @@ NNOPS_TEST(conv2d_im2col_threaded_matches_serial) {
             }
 
             std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-            auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+            auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
             nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
             NNOPS_EXPECT_TRUE(test::allclose(serial_out, ref_out, 1e-3f, 1e-4f));
         }
@@ -701,9 +701,9 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
     auto [res_vec, _] = test::make_random_tensor(out_shape, -0.5f, 0.5f, 94);
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
     for (int64_t i = 0; i < out_numel; ++i) {
         fast_buf[i] = res_vec[i];
         ref_buf[i]  = res_vec[i];
@@ -754,9 +754,9 @@ NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
         // Same pre-seeded residual for both paths.
         auto [res_vec, _] = test::make_random_tensor(oshape, -0.5f, 0.5f, 104);
         std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-        auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+        auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
         std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-        auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+        auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
         for (int64_t i = 0; i < out_numel; ++i) {
             fast_buf[i] = res_vec[i];
             ref_buf[i]  = res_vec[i];
@@ -794,13 +794,13 @@ NNOPS_TEST(conv2d_im2col_epilogue_relu6) {
     const int64_t out_numel = out_descs[0].numel();
 
     std::vector<float> plain_buf(static_cast<size_t>(out_numel));
-    auto plain_out = test::make_planar(out_descs[0], plain_buf.data());
+    auto plain_out = test::make_channel_first(out_descs[0], plain_buf.data());
     auto plain_op = Conv2D::create(attrs, Backend::CPU);
     plain_op->compute(plain_out, ins, {}, nullptr);
 
     attrs.epilogue.type = EpilogueActivateType::Relu6;
     std::vector<float> relu6_buf(static_cast<size_t>(out_numel));
-    auto relu6_out = test::make_planar(out_descs[0], relu6_buf.data());
+    auto relu6_out = test::make_channel_first(out_descs[0], relu6_buf.data());
     auto relu6_op = Conv2D::create(attrs, Backend::CPU);
     relu6_op->compute(relu6_out, ins, {}, nullptr);
 
@@ -898,7 +898,7 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
     auto od = op->getOutputTensorDesc(d32);
     const int64_t n = od[0].numel();
     std::vector<float> ref_buf(static_cast<size_t>(n));
-    auto ref_out = test::make_planar(od[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(od[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
 
     // Padded f16 input: rows of Wpad elements, only the first W logical.
@@ -921,7 +921,7 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
     const std::vector<TensorView> i16 = {in16, w16};
     auto od16 = op->getOutputTensorDesc(d16);
     std::vector<half> out16(static_cast<size_t>(n));
-    auto fast_out = test::make_planar(od16[0], out16.data());
+    auto fast_out = test::make_channel_first(od16[0], out16.data());
     op->compute(fast_out, i16, {}, nullptr);
 
     auto fast32 = test::f16_to_f32(out16);
@@ -936,7 +936,7 @@ NNOPS_TEST(conv2d_im2col_f16_pitched_input) {
 
 NNOPS_TEST(conv2d_im2col_pitched_output) {
     // A destination whose rows are 32-byte aligned has a row pitch wider than
-    // OW. The planar GEMM's N axis is an oh-block's rows flattened into one
+    // OW. The channel-first GEMM's N axis is an oh-block's rows flattened into one
     // roi_area run, and the store, the bias seed and the epilogue pass all write
     // that run contiguously, so a block may not span rows: the plan pins
     // oh_block to 1 for a pitched destination, and the values must match the
@@ -966,7 +966,7 @@ NNOPS_TEST(conv2d_im2col_pitched_output) {
     // The dense run is the reference (conv2d_ref honors the pitch, the kernel
     // was the side that did not).
     std::vector<float> ref_buf(static_cast<size_t>(numel));
-    auto ref_out = test::make_planar(od[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(od[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
 
     // The control: at one thread the same geometry on a dense destination keeps
@@ -1057,7 +1057,7 @@ NNOPS_TEST(conv2d_im2col_pitched_output) {
         const TensorDesc pdescs[] = {input.desc(), pw.desc()};
 
         std::vector<float> p_ref(static_cast<size_t>(numel));
-        auto p_ref_out = test::make_planar(od[0], p_ref.data());
+        auto p_ref_out = test::make_channel_first(od[0], p_ref.data());
         nnops::backend::cpu::reference::conv2d_ref(pattrs, p_ref_out, pins, {},
                                                    nullptr);
 
@@ -1382,7 +1382,7 @@ NNOPS_TEST(conv2d_pointwise_routing) {
     auto od = op->getOutputTensorDesc(d32);
     const int64_t n = od[0].numel();
     std::vector<float> ref_buf(static_cast<size_t>(n));
-    auto ref_out = test::make_planar(od[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(od[0], ref_buf.data());
     nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, i32, {}, nullptr);
 
     std::vector<float> padded(static_cast<size_t>(C * H * Wpad), 0.0f);
@@ -1408,7 +1408,7 @@ NNOPS_TEST(conv2d_pointwise_routing) {
 
     const std::vector<TensorView> pins = {pitched, w32};
     std::vector<float> out_buf(static_cast<size_t>(n));
-    auto out = test::make_planar(od[0], out_buf.data());
+    auto out = test::make_channel_first(od[0], out_buf.data());
     op->compute(out, pins, {}, nullptr);
     NNOPS_EXPECT_TRUE(test::allclose(out, ref_out, 1e-3f, 1e-4f));
 }
@@ -1442,9 +1442,9 @@ NNOPS_TEST(conv2d_pointwise_epilogue_add_to) {
     auto [res_vec, _] = test::make_random_tensor(out_shape, -0.5f, 0.5f, 514);
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
     for (int64_t i = 0; i < out_numel; ++i) {
         fast_buf[static_cast<size_t>(i)] = res_vec[static_cast<size_t>(i)];
         ref_buf[static_cast<size_t>(i)]  = res_vec[static_cast<size_t>(i)];
@@ -1714,12 +1714,12 @@ NNOPS_TEST(conv2d_oversubscribed_grid_matches_serial) {
     const auto out_descs = op->getOutputTensorDesc(descs);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
-    TensorView ref = test::make_planar(out_descs[0], ref_buf.data());
+    TensorView ref = test::make_channel_first(out_descs[0], ref_buf.data());
     NNOPS_EXPECT_EQ(op->compute(ref, ins, ComputeContext{}, nullptr), Status::ok);
 
     for (int nt : {2, 4, 8}) {
         std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
-        TensorView out = test::make_planar(out_descs[0], out_buf.data());
+        TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
         ComputeContext ctx;
         ctx.cpu = nnops::openmp_backend(nt, nnops::OpenMPSplit{/*items_per_thread=*/4,
                                                               /*dynamic=*/true});
@@ -1753,14 +1753,14 @@ NNOPS_TEST(conv2d_small_plane_oc_split_matches_ref) {
     NNOPS_EXPECT_TRUE(plan.oc_chunks > 1);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
-    TensorView ref = test::make_planar(out_descs[0], ref_buf.data());
+    TensorView ref = test::make_channel_first(out_descs[0], ref_buf.data());
     {
         NNOPS_EXPECT_EQ(op->compute(ref, ins, ComputeContext{}, nullptr), Status::ok);
     }
 
     for (int nt : {2, 4, 20}) {
         std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
-        TensorView out = test::make_planar(out_descs[0], out_buf.data());
+        TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
         SimplePool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
@@ -1809,14 +1809,14 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
     NNOPS_EXPECT_EQ(plan.num_oh_blocks, int64_t{103});
 
     std::vector<float> serial_buf(static_cast<size_t>(out_numel));
-    auto serial_out = test::make_planar(out_descs[0], serial_buf.data());
+    auto serial_out = test::make_channel_first(out_descs[0], serial_buf.data());
     op->compute(serial_out, ins, {}, nullptr);
 
     SimplePool pool(4);
     ComputeContext ctx;
     ctx.cpu = pool.cpu;
     std::vector<float> threaded_buf(static_cast<size_t>(out_numel));
-    auto threaded_out = test::make_planar(out_descs[0], threaded_buf.data());
+    auto threaded_out = test::make_channel_first(out_descs[0], threaded_buf.data());
     op->compute(threaded_out, ins, ctx, nullptr);
     int64_t mismatches = 0;
     for (int64_t i = 0; i < out_numel; ++i) {
@@ -1876,11 +1876,11 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
         const int64_t pn = pouts[0].numel();
         const int64_t POW = pouts[0].dims[3];
         std::vector<float> p_buf(static_cast<size_t>(pn));
-        auto p_out = test::make_planar(pouts[0], p_buf.data());
+        auto p_out = test::make_channel_first(pouts[0], p_buf.data());
         pop->compute(p_out, pins, {}, nullptr);
 
         std::vector<float> p_threaded(static_cast<size_t>(pn));
-        auto p_tout = test::make_planar(pouts[0], p_threaded.data());
+        auto p_tout = test::make_channel_first(pouts[0], p_threaded.data());
         pop->compute(p_tout, pins, ctx, nullptr);
         NNOPS_EXPECT_TRUE(p_buf == p_threaded);
 
@@ -1915,7 +1915,7 @@ NNOPS_TEST(conv2d_wide_frame_matches_ref) {
 }
 
 // ============================================================
-// The prepacked filter — Conv2D::prepackWeights on the planar route
+// The prepacked filter — Conv2D::prepackWeights on the channel-first route
 // ============================================================
 
 NNOPS_TEST(conv2d_prepacked_filter) {
@@ -1976,7 +1976,7 @@ NNOPS_TEST(conv2d_prepacked_filter) {
         const int64_t out_n = od[0].numel();
 
         std::vector<float> raw_buf(static_cast<size_t>(out_n));
-        auto raw_out = test::make_planar(od[0], raw_buf.data());
+        auto raw_out = test::make_channel_first(od[0], raw_buf.data());
         NNOPS_EXPECT_EQ(op->compute(raw_out, ins, {}, nullptr), Status::ok);
 
         // Query the packed descriptor, allocate what it asks for, fill it.
@@ -2003,7 +2003,7 @@ NNOPS_TEST(conv2d_prepacked_filter) {
         std::vector<TensorView> packed_ins = ins;
         packed_ins[1] = packed;
         std::vector<float> packed_buf(static_cast<size_t>(out_n));
-        auto packed_out = test::make_planar(od[0], packed_buf.data());
+        auto packed_out = test::make_channel_first(od[0], packed_buf.data());
         NNOPS_EXPECT_EQ(op->compute(packed_out, packed_ins, {}, nullptr), Status::ok);
 
         NNOPS_EXPECT_TRUE(std::memcmp(raw_buf.data(), packed_buf.data(),

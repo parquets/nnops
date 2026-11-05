@@ -1,9 +1,11 @@
 /// @file test_resize.cpp
-/// @brief Tests for the Resize (interpolation) operator — planar and channel-last.
+/// @brief Tests for the Resize (interpolation) operator — channel-first and
+/// channel-last.
 ///
 /// All tests use the class API path:
-///   NCHW in -> LayoutConvert -> NHWC -> Resize::compute -> LayoutConvert -> NCHW -> compare
-/// The parity check between the two paths also runs the planar Resize directly.
+/// Channel-first in -> LayoutConvert -> channel-last -> Resize::compute ->
+/// LayoutConvert -> channel-first -> compare. The parity check between the two
+/// paths also runs the channel-first Resize directly.
 
 #include "nnops/ops/resize.hpp"
 #include "nnops/ops/layout_convert.hpp"
@@ -18,7 +20,7 @@
 
 using namespace nnops;
 
-// NCHW scalar reference — the ground truth.
+// Channel-first scalar reference — the ground truth.
 namespace nnops::backend::cpu::reference {
     void resize_ref(const ResizeAttributes& attrs,
                     TensorView& output,
@@ -30,19 +32,19 @@ namespace nnops::backend::cpu::reference {
 namespace {
 
 /// 2D+3D roundtrip: convert -> resize channel-last -> convert back -> compare
-/// with the planar reference.
-void test_channel_last_vs_planar(const std::vector<int64_t>& in_shape,
+/// with the channel-first reference.
+void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
                           const ResizeAttributes& attrs)
 {
     const int64_t rank = static_cast<int64_t>(in_shape.size());
     const int64_t srank = rank - 2;  // 2 or 3
 
-    const TensorLayout planar_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    const TensorLayout channel_first_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
     const TensorLayout cl_layout = (srank == 3) ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     auto [in_vec, in_default] = test::make_random_tensor(in_shape);
-    TensorView in_planar(in_default.shape_span(), DataType::f32,
-                         in_default.ptr<float>(), planar_layout);
+    TensorView in_channel_first(in_default.shape_span(), DataType::f32,
+                         in_default.ptr<float>(), channel_first_layout);
 
     std::vector<int64_t> oshape_ref = in_shape;
     if (srank == 3) {
@@ -59,7 +61,7 @@ void test_channel_last_vs_planar(const std::vector<int64_t>& in_shape,
         ref_elems *= static_cast<size_t>(d);
     }
     std::vector<float> ref_out(ref_elems);
-    TensorView out_ref(oshape_ref, DataType::f32, ref_out.data(), planar_layout);
+    TensorView out_ref(oshape_ref, DataType::f32, ref_out.data(), channel_first_layout);
 
     const float prefill_val = 0.5f;
     if (attrs.add_to) {
@@ -70,13 +72,13 @@ void test_channel_last_vs_planar(const std::vector<int64_t>& in_shape,
 
     {
         ComputeContext ctx;
-        const TensorView ref_ins[] = {in_planar};
+        const TensorView ref_ins[] = {in_channel_first};
         backend::cpu::reference::resize_ref(attrs, out_ref, ref_ins, ctx, nullptr);
     }
 
     {
         auto to_cl_op = LayoutConvert::create(cl_layout, Backend::CPU);
-        auto d = in_planar.desc();
+        auto d = in_channel_first.desc();
         const TensorDesc cl_in_desc[] = {d};
         auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_desc);
 
@@ -88,7 +90,7 @@ void test_channel_last_vs_planar(const std::vector<int64_t>& in_shape,
 
         std::vector<char> cl_buf(cl_descs[0].storage_bytes());
         auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-        const TensorView cl_in_descs[] = {in_planar};
+        const TensorView cl_in_descs[] = {in_channel_first};
         to_cl_op->compute(in_cl, cl_in_descs);
 
         auto resize_op = Resize::create(attrs, Backend::CPU);
@@ -120,13 +122,13 @@ void test_channel_last_vs_planar(const std::vector<int64_t>& in_shape,
         const TensorView resize_ins[] = {in_cl};
         resize_op->compute(out_cl, resize_ins);
 
-        auto unto_cl_op = LayoutConvert::create(planar_layout, Backend::CPU);
+        auto unto_cl_op = LayoutConvert::create(channel_first_layout, Backend::CPU);
         auto od = out_cl.desc();
         const TensorDesc uncl_in_desc[] = {od};
         auto uncl_descs = unto_cl_op->getOutputTensorDesc(uncl_in_desc);
 
         NNOPS_EXPECT_EQ(uncl_descs[0].rank, rank);
-        NNOPS_EXPECT_EQ(uncl_descs[0].layout, planar_layout);
+        NNOPS_EXPECT_EQ(uncl_descs[0].layout, channel_first_layout);
         NNOPS_EXPECT_EQ(uncl_descs[0].dtype, DataType::f32);
         NNOPS_EXPECT_EQ(uncl_descs[0].dims[0], in_shape[0]);
         NNOPS_EXPECT_EQ(uncl_descs[0].dims[1], in_shape[1]);
@@ -139,18 +141,18 @@ void test_channel_last_vs_planar(const std::vector<int64_t>& in_shape,
             NNOPS_EXPECT_EQ(uncl_descs[0].dims[3], attrs.output_size[2]);
         }
 
-        std::vector<char> planar_buf(uncl_descs[0].storage_bytes());
-        auto res_planar = test::make_planar(uncl_descs[0], planar_buf.data());
+        std::vector<char> channel_first_buf(uncl_descs[0].storage_bytes());
+        auto res_channel_first = test::make_channel_first(uncl_descs[0], channel_first_buf.data());
         const TensorView uncl_in_descs[] = {out_cl};
-        unto_cl_op->compute(res_planar, uncl_in_descs);
+        unto_cl_op->compute(res_channel_first, uncl_in_descs);
 
         float rtol = (attrs.mode == ResizeMode::Linear) ? 1e-3f : 1e-4f;
         float atol = (attrs.mode == ResizeMode::Linear) ? 1e-3f : 1e-4f;
-        NNOPS_EXPECT_TRUE(test::allclose(res_planar, out_ref, rtol, atol));
+        NNOPS_EXPECT_TRUE(test::allclose(res_channel_first, out_ref, rtol, atol));
     }
 }
 
-/// convert -> resize channel-last -> convert back, then hand the planar result
+/// convert -> resize channel-last -> convert back, then hand the channel-first result
 /// to the caller's validator.
 template <typename ValidateFn>
 void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
@@ -161,15 +163,15 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
 {
     const int64_t rank = static_cast<int64_t>(in_shape.size());
     const int64_t srank = rank - 2;
-    const TensorLayout planar_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
+    const TensorLayout channel_first_layout = (srank == 3) ? TensorLayout::NCDHW : TensorLayout::NCHW;
     const TensorLayout cl_layout = (srank == 3) ? TensorLayout::NDHWC : TensorLayout::NHWC;
 
     // TensorView takes a mutable buffer; copy the const input.
     std::vector<float> in_buf = in_data;
-    TensorView in_planar(std::span<const int64_t>(in_shape), DataType::f32, in_buf.data(), planar_layout);
+    TensorView in_channel_first(std::span<const int64_t>(in_shape), DataType::f32, in_buf.data(), channel_first_layout);
 
     auto to_cl_op = LayoutConvert::create(cl_layout, Backend::CPU);
-    auto d = in_planar.desc();
+    auto d = in_channel_first.desc();
     const TensorDesc cl_in_desc[] = {d};
     auto cl_descs = to_cl_op->getOutputTensorDesc(cl_in_desc);
 
@@ -179,7 +181,7 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
 
     std::vector<char> cl_buf(cl_descs[0].storage_bytes());
     auto in_cl = test::make_packed(cl_descs[0], cl_buf.data());
-    const TensorView cl_in_descs[] = {in_planar};
+    const TensorView cl_in_descs[] = {in_channel_first};
     to_cl_op->compute(in_cl, cl_in_descs);
 
     auto resize_op = Resize::create(attrs, Backend::CPU);
@@ -196,21 +198,21 @@ void run_resize_roundtrip(const std::vector<int64_t>& in_shape,
     const TensorView resize_ins[] = {in_cl};
     resize_op->compute(out_cl, resize_ins);
 
-    auto unto_cl_op = LayoutConvert::create(planar_layout, Backend::CPU);
+    auto unto_cl_op = LayoutConvert::create(channel_first_layout, Backend::CPU);
     auto od = out_cl.desc();
     const TensorDesc uncl_in_desc[] = {od};
     auto uncl_descs = unto_cl_op->getOutputTensorDesc(uncl_in_desc);
 
     NNOPS_EXPECT_EQ(uncl_descs[0].rank, rank);
-    NNOPS_EXPECT_EQ(uncl_descs[0].layout, planar_layout);
+    NNOPS_EXPECT_EQ(uncl_descs[0].layout, channel_first_layout);
     NNOPS_EXPECT_EQ(uncl_descs[0].dtype, DataType::f32);
 
-    std::vector<char> planar_buf(uncl_descs[0].storage_bytes());
-    auto res_planar = test::make_planar(uncl_descs[0], planar_buf.data());
+    std::vector<char> channel_first_buf(uncl_descs[0].storage_bytes());
+    auto res_channel_first = test::make_channel_first(uncl_descs[0], channel_first_buf.data());
     const TensorView uncl_in_descs[] = {out_cl};
-    unto_cl_op->compute(res_planar, uncl_in_descs);
+    unto_cl_op->compute(res_channel_first, uncl_in_descs);
 
-    validate_fn(res_planar);
+    validate_fn(res_channel_first);
 }
 
 }  // anonymous namespace
@@ -271,7 +273,7 @@ NNOPS_TEST(resize_2d_nearest_identity) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 8, 8};
-    test_channel_last_vs_planar({1, 3, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
 }
 
 // ============================================================
@@ -306,7 +308,7 @@ NNOPS_TEST(resize_2d_linear_identity) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 4, 4};
-    test_channel_last_vs_planar({1, 1, 4, 4}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_2d_linear_upsample_no_nan) {
@@ -314,7 +316,7 @@ NNOPS_TEST(resize_2d_linear_upsample_no_nan) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 20, 20};
-    test_channel_last_vs_planar({1, 2, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 2, 8, 8}, attrs);
 }
 
 // ============================================================
@@ -326,7 +328,7 @@ NNOPS_TEST(resize_3d_nearest_basic) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 4, 4};
-    test_channel_last_vs_planar({1, 1, 2, 2, 2}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 2, 2, 2}, attrs);
 }
 
 NNOPS_TEST(resize_3d_nearest_identity) {
@@ -334,7 +336,7 @@ NNOPS_TEST(resize_3d_nearest_identity) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 4, 4};
-    test_channel_last_vs_planar({1, 2, 4, 4, 4}, attrs);
+    test_channel_last_vs_channel_first({1, 2, 4, 4, 4}, attrs);
 }
 
 // ============================================================
@@ -346,7 +348,7 @@ NNOPS_TEST(resize_3d_linear_basic) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {8, 12, 12};
-    test_channel_last_vs_planar({1, 1, 4, 6, 6}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 4, 6, 6}, attrs);
 }
 
 NNOPS_TEST(resize_3d_linear_identity) {
@@ -354,7 +356,7 @@ NNOPS_TEST(resize_3d_linear_identity) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 4, 4};
-    test_channel_last_vs_planar({1, 2, 4, 4, 4}, attrs);
+    test_channel_last_vs_channel_first({1, 2, 4, 4, 4}, attrs);
 }
 
 // ============================================================
@@ -366,7 +368,7 @@ NNOPS_TEST(resize_2d_multichannel) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_planar({2, 3, 32, 32}, attrs);
+    test_channel_last_vs_channel_first({2, 3, 32, 32}, attrs);
 }
 
 NNOPS_TEST(resize_3d_multichannel) {
@@ -374,7 +376,7 @@ NNOPS_TEST(resize_3d_multichannel) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {4, 8, 8};
-    test_channel_last_vs_planar({1, 3, 8, 16, 16}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 16, 16}, attrs);
 }
 
 NNOPS_TEST(resize_add_to) {
@@ -383,7 +385,7 @@ NNOPS_TEST(resize_add_to) {
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 8, 8};
     attrs.add_to = true;
-    test_channel_last_vs_planar({1, 1, 4, 4}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_2d_linear_half_pixel) {
@@ -391,7 +393,7 @@ NNOPS_TEST(resize_2d_linear_half_pixel) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_planar({1, 1, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 8, 8}, attrs);
 }
 
 // ============================================================
@@ -403,7 +405,7 @@ NNOPS_TEST(resize_partial_channels_nearest) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_planar({1, 5, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 5, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_partial_channels_linear) {
@@ -411,7 +413,7 @@ NNOPS_TEST(resize_partial_channels_linear) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 16, 16};
-    test_channel_last_vs_planar({1, 3, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_single_channel) {
@@ -419,7 +421,7 @@ NNOPS_TEST(resize_single_channel) {
     attrs.mode = ResizeMode::Linear;
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 12, 12};
-    test_channel_last_vs_planar({1, 1, 4, 4}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 4, 4}, attrs);
 }
 
 NNOPS_TEST(resize_multi_channel_nearest) {
@@ -427,7 +429,7 @@ NNOPS_TEST(resize_multi_channel_nearest) {
     attrs.mode = ResizeMode::Nearest;
     attrs.coord_mode = CoordinateTransformMode::Asymmetric;
     attrs.output_size = {0, 8, 8};
-    test_channel_last_vs_planar({2, 17, 16, 16}, attrs);
+    test_channel_last_vs_channel_first({2, 17, 16, 16}, attrs);
 }
 
 // ============================================================
@@ -441,7 +443,7 @@ NNOPS_TEST(resize_2d_crop_nearest_upsample) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 2, 2};
     attrs.crop_end   = {0, 6, 6};
-    test_channel_last_vs_planar({1, 3, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_nearest_downsample) {
@@ -451,7 +453,7 @@ NNOPS_TEST(resize_2d_crop_nearest_downsample) {
     attrs.output_size = {0, 4, 4};
     attrs.crop_start = {0, 4, 4};
     attrs.crop_end   = {0, 12, 12};
-    test_channel_last_vs_planar({1, 3, 16, 16}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 16, 16}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
@@ -461,7 +463,7 @@ NNOPS_TEST(resize_2d_crop_bilinear_upsample) {
     attrs.output_size = {0, 12, 12};
     attrs.crop_start = {0, 3, 3};
     attrs.crop_end   = {0, 7, 7};
-    test_channel_last_vs_planar({1, 3, 10, 10}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 10, 10}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_bilinear_align_corners) {
@@ -471,7 +473,7 @@ NNOPS_TEST(resize_2d_crop_bilinear_align_corners) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 1, 1};
     attrs.crop_end   = {0, 5, 5};
-    test_channel_last_vs_planar({1, 1, 6, 6}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 6, 6}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_full_image) {
@@ -482,7 +484,7 @@ NNOPS_TEST(resize_2d_crop_full_image) {
     attrs.output_size = {0, 16, 16};
     attrs.crop_start = {0, 0, 0};
     attrs.crop_end   = {0, 8, 8};
-    test_channel_last_vs_planar({1, 3, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_single_pixel_output) {
@@ -492,7 +494,7 @@ NNOPS_TEST(resize_2d_crop_single_pixel_output) {
     attrs.output_size = {0, 1, 1};
     attrs.crop_start = {0, 3, 5};
     attrs.crop_end   = {0, 5, 7};
-    test_channel_last_vs_planar({1, 3, 8, 12}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 12}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
@@ -502,7 +504,7 @@ NNOPS_TEST(resize_2d_crop_asymmetric_edge) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 0, 0};
     attrs.crop_end   = {0, 6, 6};
-    test_channel_last_vs_planar({1, 3, 10, 10}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 10, 10}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
@@ -512,7 +514,7 @@ NNOPS_TEST(resize_2d_crop_bottom_right_corner) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 6, 6};
     attrs.crop_end   = {0, 12, 12};
-    test_channel_last_vs_planar({1, 3, 12, 12}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_multichannel) {
@@ -522,7 +524,7 @@ NNOPS_TEST(resize_2d_crop_multichannel) {
     attrs.output_size = {0, 8, 8};
     attrs.crop_start = {0, 4, 4};
     attrs.crop_end   = {0, 12, 12};
-    test_channel_last_vs_planar({2, 7, 16, 16}, attrs);
+    test_channel_last_vs_channel_first({2, 7, 16, 16}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_partial_channels) {
@@ -533,7 +535,7 @@ NNOPS_TEST(resize_2d_crop_partial_channels) {
     attrs.output_size = {0, 16, 16};
     attrs.crop_start = {0, 2, 2};
     attrs.crop_end   = {0, 10, 10};
-    test_channel_last_vs_planar({1, 3, 12, 12}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_2d_crop_add_to) {
@@ -544,7 +546,7 @@ NNOPS_TEST(resize_2d_crop_add_to) {
     attrs.add_to = true;
     attrs.crop_start = {0, 3, 3};
     attrs.crop_end   = {0, 9, 9};
-    test_channel_last_vs_planar({1, 3, 12, 12}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 12, 12}, attrs);
 }
 
 // ============================================================
@@ -558,7 +560,7 @@ NNOPS_TEST(resize_3d_crop_nearest) {
     attrs.output_size = {4, 4, 4};
     attrs.crop_start = {1, 2, 2};
     attrs.crop_end   = {3, 6, 6};
-    test_channel_last_vs_planar({1, 3, 4, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 4, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_trilinear) {
@@ -568,7 +570,7 @@ NNOPS_TEST(resize_3d_crop_trilinear) {
     attrs.output_size = {4, 6, 6};
     attrs.crop_start = {2, 2, 2};
     attrs.crop_end   = {6, 10, 10};
-    test_channel_last_vs_planar({1, 3, 8, 12, 12}, attrs);
+    test_channel_last_vs_channel_first({1, 3, 8, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_full_volume) {
@@ -579,7 +581,7 @@ NNOPS_TEST(resize_3d_crop_full_volume) {
     attrs.output_size = {4, 8, 8};
     attrs.crop_start = {0, 0, 0};
     attrs.crop_end   = {4, 8, 8};
-    test_channel_last_vs_planar({1, 1, 4, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 1, 4, 8, 8}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_partial_channels) {
@@ -589,7 +591,7 @@ NNOPS_TEST(resize_3d_crop_partial_channels) {
     attrs.output_size = {4, 8, 8};
     attrs.crop_start = {1, 2, 2};
     attrs.crop_end   = {5, 10, 10};
-    test_channel_last_vs_planar({1, 5, 6, 12, 12}, attrs);
+    test_channel_last_vs_channel_first({1, 5, 6, 12, 12}, attrs);
 }
 
 NNOPS_TEST(resize_3d_crop_align_corners) {
@@ -599,7 +601,7 @@ NNOPS_TEST(resize_3d_crop_align_corners) {
     attrs.output_size = {4, 6, 6};
     attrs.crop_start = {1, 1, 1};
     attrs.crop_end   = {5, 7, 7};
-    test_channel_last_vs_planar({1, 2, 6, 8, 8}, attrs);
+    test_channel_last_vs_channel_first({1, 2, 6, 8, 8}, attrs);
 }
 
 // ============================================================

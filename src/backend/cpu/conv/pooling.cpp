@@ -1,8 +1,7 @@
 /// @file pooling.cpp
-/// @brief SIMD CPU 2D/3D pooling, planar (NCHW/NCDHW) and channel-last
-///        (NHWC/NDHWC).
+/// @brief SIMD CPU 2D/3D pooling, channel-first and channel-last.
 ///
-/// The layout picks the lane: planar walks one channel plane at a time with the
+/// The layout picks the lane: channel-first walks one channel plane at a time with the
 /// lane on output width, channel-last puts the lane on channels and a plane's
 /// last block runs short. The fp channel-last route pools four output rows per
 /// call (the row driver skips rows past OH, so there is no h1 tail) and sweeps
@@ -15,7 +14,7 @@
 /// divide, and any SW is just integer arithmetic.
 ///
 /// Quantized pooling lives on the channel lane, so it covers only channel-last;
-/// planar is unsupported. It has no whole-plane form either, so a global
+/// Channel-first is unsupported. It has no whole-plane form either, so a global
 /// request is turned into the full-extent window walk.
 
 #include "nnops/ops/pooling.hpp"
@@ -45,7 +44,7 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t rank  = input.rank();
     const int64_t srank = PoolingAttributes::spatial_rank(rank);
 
-    // One "block" per channel: a planar tensor has no channel vector.
+    // One "block" per channel: a channel-first tensor has no channel vector.
     const int64_t N      = input.shape(0);
     const int64_t blocks = input.num_channel_blocks();
 
@@ -92,11 +91,11 @@ void pooling_impl(const PoolingAttributes& attrs,
     const int64_t out_ch_stride = output.channel_block_stride_elems();
     const float avg_scale = 1.0f / static_cast<float>(KD * KH * KW);
 
-    // Planar rows are vectorized along W, so there is one kernel and no h4 form.
+    // Channel-first rows are vectorized along W, so there is one kernel and no h4 form.
     using PoolingFn = void (*)(T*, const T*, const k::PoolingKernelParams&,
                                 float, bool);
     const PoolingFn pool_fn = (attrs.type == PoolingType::Max)
-        ? k::maxpool_planar<T> : k::avgpool_planar<T>;
+        ? k::maxpool_channel_first<T> : k::avgpool_channel_first<T>;
 
     const auto compute_block = [&](int64_t n, int64_t blk) {
         const T* in_base  = in_ptr + n * blocks * in_ch_stride + blk * in_ch_stride;
@@ -122,7 +121,7 @@ void pooling_impl(const PoolingAttributes& attrs,
 }
 
 // ============================================================
-// Channel-last (NHWC/NDHWC) pooling — the lane spans channels
+// Channel-last pooling — the lane spans channels
 // ============================================================
 
 template <bool IsMax, typename T>
@@ -274,8 +273,8 @@ void pooling_global_impl(const PoolingAttributes& attrs,
     const int64_t N      = input.shape(0);
     const int64_t C      = input.shape(1);
     const bool last      = is_channel_last(input.layout());
-    // Blocks: one per channel plane for planar, ceil(C/16) for channel-last. A
-    // channel-last task reads sixteen channels — one 64-byte line of f32 — per
+    // Blocks: one per channel plane for channel-first, ceil(C/16) for channel-last.
+    // A channel-last task reads sixteen channels — one 64-byte line of f32 — per
     // pixel, so the plane is fetched once and still splits across the pool.
     constexpr int64_t kGlobalCh = 16;
     const int64_t blocks = last ? (C + kGlobalCh - 1) / kGlobalCh
@@ -330,7 +329,7 @@ void pooling_global_impl(const PoolingAttributes& attrs,
         const T* in_base = in_ptr + tid * in_ch_stride;
         T* out_base = out_ptr + tid * out_ch_stride;
 
-        s_store_add(out_base, k::global_planar<IsMax>(in_base, p, scale),
+        s_store_add(out_base, k::global_channel_first<IsMax>(in_base, p, scale),
                     attrs.add_to);
     });
 }
@@ -356,11 +355,11 @@ inline int64_t adaptive_end(int64_t o, int64_t in, int64_t out) noexcept
     return ((o + 1) * in + out - 1) / out;
 }
 
-/// Planar adaptive: the lane stays on output width (a window edge is not a
+/// Channel-first adaptive: the lane stays on output width (a window edge is not a
 /// vector-friendly axis), so a window is a scalar-seeded reduction per output
 /// element. The task grid is (n, channel plane).
 template <bool IsMax, typename T>
-void pooling_adaptive_planar_impl(const PoolingAttributes& attrs,
+void pooling_adaptive_channel_first_impl(const PoolingAttributes& attrs,
                                   TensorView& output,
                                   std::span<const TensorView> inputs,
                                   const ComputeContext& ctx)
@@ -532,10 +531,10 @@ void pooling_fp(const PoolingAttributes& attrs,
     if (attrs.adaptive()) {
         if (attrs.type == PoolingType::Max) {
             return last ? pooling_adaptive_last_impl<true, T>(attrs, output, inputs, ctx)
-                        : pooling_adaptive_planar_impl<true, T>(attrs, output, inputs, ctx);
+                        : pooling_adaptive_channel_first_impl<true, T>(attrs, output, inputs, ctx);
         }
         return last ? pooling_adaptive_last_impl<false, T>(attrs, output, inputs, ctx)
-                    : pooling_adaptive_planar_impl<false, T>(attrs, output, inputs, ctx);
+                    : pooling_adaptive_channel_first_impl<false, T>(attrs, output, inputs, ctx);
     }
     if (!attrs.global) {
         if (!last) {

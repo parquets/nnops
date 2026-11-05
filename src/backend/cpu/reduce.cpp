@@ -1,11 +1,11 @@
 /// @file reduce.cpp
 /// @brief SIMD-optimized CPU implementation of the Reduce operator.
 ///
-/// f32 and f16; planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC) layouts.
+/// f32 and f16; channel-first and channel-last layouts.
 /// The reduction is driven by the logical axis; stride_elems() turns it into
 /// physical offsets, so the same axis means the same thing in either layout.
 ///
-/// Planar dispatch, in order:
+/// Channel-first dispatch, in order:
 ///   1. axis==rank-1            -> kernel::reduce_process_contiguous_row
 ///   2. inner-contiguous        -> kernel::reduce_process_inner_contiguous_block
 ///   3. general                 -> scalar strided walk over (outer x inner)

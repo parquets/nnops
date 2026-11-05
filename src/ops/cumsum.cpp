@@ -25,7 +25,7 @@ Status CumSum::validate(std::span<const TensorDesc> inputs,
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 1, 1, 1));
     return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly));
 }
 
 Status CumSum::compute(std::span<TensorView> outputs,

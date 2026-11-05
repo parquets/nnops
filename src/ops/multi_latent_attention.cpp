@@ -1,7 +1,7 @@
 /// @file multi_latent_attention.cpp
 /// @brief MultiLatentAttention operator dispatch.
 ///
-/// Q and the packed latent KV [, mask], f32 or f16, planar, merged [B, S, H*D]
+/// Q and the packed latent KV [, mask], f32 or f16, channel-first, merged [B, S, H*D]
 /// or explicit [B, H, S, D]. D = kv_lora_rank + qk_rope_head_dim on both
 /// inputs; the value is the leading v_head_dim channels of each latent row, so
 /// there is no third input. Everything below the attribute copy is the shared
@@ -66,7 +66,7 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
 {
     // Q, KV [, mask [, past KV]]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 4, 1));
-    if (!is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly)) {
+    if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
 

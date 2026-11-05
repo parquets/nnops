@@ -3,11 +3,11 @@
 /// @brief SIMD kernels for 2D/3D spatial pooling.
 ///
 /// Two drivers, one per lane choice. The channel driver lanes a channel vector
-/// over output columns (channel-last NHWC/NDHWC); the planar driver (NCHW/
-/// NCDHW) lanes the output column. One channel driver covers every variant:
+/// over output columns (channel-last); the channel-first driver, 2D and 3D,
+/// lanes the output column. One channel driver covers every variant:
 /// row count R, IsMax, and Src/Dst (f32/f16, dequantize/requantize) are template
 /// parameters, and bounds are checked in-kernel, so any stride/padding works.
-/// Quantized pooling runs on the channel lane only, not planar.
+/// Quantized pooling runs on the channel lane only, not channel-first.
 ///
 /// The channel walk mirrors the depthwise kernel: one row pointer per (kd, kh, r),
 /// biased by the left pad, an interior span whose every tap is in the input row
@@ -15,9 +15,9 @@
 /// 2 where the channels allow, since two f32 vectors fill a cache line and a
 /// one-vector sweep pays twice the line traffic for the same arithmetic.
 ///
-/// A planar lane cannot skip an out-of-range tap (a padded lane would read the
-/// pitch), so planar_load fills the accumulate's identity and a short last block
-/// stores through a scalar tail. Planar runs one output row per call — the
+/// A channel-first lane cannot skip an out-of-range tap (a padded lane would read the
+/// pitch), so channel_first_load fills the accumulate's identity and a short last block
+/// stores through a scalar tail. Channel-first runs one output row per call — the
 /// channel path's R-row blocking shares input rows, which a width-vectorized
 /// kernel does not need. Global pooling scans contiguous memory with four
 /// accumulators and widens f16 to f32 on load so the sum never runs in f16. A
@@ -196,7 +196,7 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
     }
 }
 
-// --- Planar (NCHW/NCDHW) driver: the SIMD lane spans output width ---
+// --- channel-first driver: the SIMD lane spans output width ---
 
 /// The value a padded lane contributes: the max's identity, or zero for the sum.
 /// `half` is a struct with no numeric_limits specialization on x86, so its
@@ -213,7 +213,7 @@ inline T pooling_fill(bool is_max) noexcept
 }
 
 template <bool IsMax, typename T>
-inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
+inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p,
                         float avg_scale, bool add_to)
 {
     constexpr int64_t L = simd_lane_for<T>;
@@ -264,7 +264,7 @@ inline void pool_planar(T* out, const T* in, const PoolingKernelParams& p,
 
                 for (int64_t kw = 0; kw < p.KW; ++kw) {
                     const int64_t iw0 = ow * p.SW + kw * p.DW - p.PW;
-                    const auto v = planar_load(row, iw0, p.SW, p.IW, fill);
+                    const auto v = channel_first_load(row, iw0, p.SW, p.IW, fill);
                     acc = IsMax ? v_max(acc, v) : v_add(acc, v);
                 }
             }
@@ -364,10 +364,10 @@ inline void global_accumulate(v_f32x8& acc0, v_f32x8& acc1, v_f32x8& acc2,
     }
 }
 
-/// Max/avg of one planar plane. A contiguous plane (pitch == width, as an
+/// Max/avg of one channel-first plane. A contiguous plane (pitch == width, as an
 /// allocated tensor has) is one flat run; only a pitched plane walks row by row.
 template <bool IsMax, typename T>
-inline float global_planar(const T* in, const PoolingKernelParams& p, float scale)
+inline float global_channel_first(const T* in, const PoolingKernelParams& p, float scale)
 {
     const v_f32x8 init = IsMax ? v_set1_f32x8(-std::numeric_limits<float>::infinity())
                                : v_zero_f32x8();
@@ -571,7 +571,7 @@ inline void maxpool_fast(T* output, const T* input,
     }
 }
 
-// --- Channel-last (NHWC/NDHWC) wrappers ---
+// --- Channel-last wrappers ---
 
 template <bool IsMax, typename T>
 inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
@@ -655,20 +655,20 @@ inline void global_store_lanes(T* out, const v_f32x8& v, bool add_to, int64_t la
     }
 }
 
-// --- Planar (NCHW/NCDHW) entry points ---
+// --- channel-first entry points ---
 
 template <typename T>
-inline void maxpool_planar(T* output, const T* input, const PoolingKernelParams& p,
+inline void maxpool_channel_first(T* output, const T* input, const PoolingKernelParams& p,
                            float, bool add_to)
 {
-    pool_planar<true>(output, input, p, 0.0f, add_to);
+    pool_channel_first<true>(output, input, p, 0.0f, add_to);
 }
 
 template <typename T>
-inline void avgpool_planar(T* output, const T* input, const PoolingKernelParams& p,
+inline void avgpool_channel_first(T* output, const T* input, const PoolingKernelParams& p,
                            float scale, bool add_to)
 {
-    pool_planar<false>(output, input, p, scale, add_to);
+    pool_channel_first<false>(output, input, p, scale, add_to);
 }
 
 }  // namespace nnops::kernel

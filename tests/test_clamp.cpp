@@ -1,6 +1,6 @@
 /// @file test_clamp.cpp
 /// @brief Clamp operator tests (CPU backend) — hand-checked bounds, a missing
-///        min or max, add_to, f32/f16, and a channel-last (NHWC) input.
+///        min or max, add_to, f32/f16, and a channel-last input.
 ///
 /// Clamp is elementwise, so a re-layout cannot change a value: the channel-last
 /// case converts in, clamps, converts back and compares against a scalar clamp
@@ -45,7 +45,7 @@ NNOPS_TEST(clamp_basic) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
 
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -67,7 +67,7 @@ NNOPS_TEST(clamp_no_min) {
 
     const TensorDesc in_arr[] = {input.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -90,7 +90,7 @@ NNOPS_TEST(clamp_no_max) {
 
     const TensorDesc in_arr[] = {input.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -118,7 +118,7 @@ NNOPS_TEST(clamp_random_f32) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 1000);
 
     std::vector<float> out_buf(1000);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -150,7 +150,7 @@ NNOPS_TEST(clamp_random_f16) {
 
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
     std::vector<nnops::backend::cpu::half> out_buf(500);
-    TensorView output = test::make_planar(descs[0], out_buf.data());
+    TensorView output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -176,7 +176,7 @@ NNOPS_TEST(clamp_add_to) {
 
     const TensorDesc in_arr[] = {input.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
-    TensorView output = test::make_planar(descs[0], out_buf);
+    TensorView output = test::make_channel_first(descs[0], out_buf);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -187,20 +187,20 @@ NNOPS_TEST(clamp_add_to) {
 }
 
 // ============================================================
-// Channel-last (NHWC) input
+// Channel-last input
 // ============================================================
 
 NNOPS_TEST(clamp_channel_last_layout) {
     const int64_t N = 1, C = 16, H = 4, W = 4;
-    auto [in_vec, input_planar] = test::make_random_tensor({N, C, H, W}, -10.0f, 10.0f, 444);
+    auto [in_vec, input_channel_first] = test::make_random_tensor({N, C, H, W}, -10.0f, 10.0f, 444);
 
     auto to_cl = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
-    const TensorDesc lc_in[] = {input_planar.desc()};
+    const TensorDesc lc_in[] = {input_channel_first.desc()};
     auto cl_desc = to_cl->getOutputTensorDesc(lc_in)[0];
 
     std::vector<float> cl_in_buf(cl_desc.storage_bytes() / sizeof(float), 0.0f);
     auto input_cl = test::make_packed(cl_desc, cl_in_buf.data());
-    const TensorView lc_inputs[] = {input_planar};
+    const TensorView lc_inputs[] = {input_channel_first};
     to_cl->compute(input_cl, lc_inputs);
 
     std::vector<float> cl_out_buf(cl_desc.storage_bytes() / sizeof(float), 0.0f);
@@ -214,16 +214,16 @@ NNOPS_TEST(clamp_channel_last_layout) {
     const TensorView ins[] = {input_cl};
     op->compute(output_cl, ins);
 
-    // Back to planar so the comparison is against logical order.
-    auto to_planar = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
-    std::vector<float> out_planar(static_cast<size_t>(input_planar.numel()), 0.0f);
-    TensorView output_planar(input_planar.shape_span(), DataType::f32, out_planar.data());
+    // Back to channel-first so the comparison is against logical order.
+    auto to_channel_first = LayoutConvert::create(TensorLayout::NCHW, Backend::CPU);
+    std::vector<float> out_channel_first(static_cast<size_t>(input_channel_first.numel()), 0.0f);
+    TensorView output_channel_first(input_channel_first.shape_span(), DataType::f32, out_channel_first.data());
     const TensorView back[] = {output_cl};
-    to_planar->compute(output_planar, back);
+    to_channel_first->compute(output_channel_first, back);
 
     for (size_t i = 0; i < in_vec.size(); ++i) {
         float expected = std::max(-2.0f, std::min(3.0f, in_vec[i]));
-        NNOPS_EXPECT_NEAR(out_planar[i], expected, 1e-5f);
+        NNOPS_EXPECT_NEAR(out_channel_first[i], expected, 1e-5f);
     }
 }
 
@@ -244,7 +244,7 @@ NNOPS_TEST(clamp_class_api) {
         auto op = Clamp::create(attrs, Backend::CPU);
         const TensorDesc in_arr[] = {d};
         auto descs = op->getOutputTensorDesc(in_arr);
-        TensorView output = test::make_planar(descs[0], out_buf_class);
+        TensorView output = test::make_channel_first(descs[0], out_buf_class);
         const TensorView ins[] = {input};
         op->compute(output, ins);
     }
@@ -253,7 +253,7 @@ NNOPS_TEST(clamp_class_api) {
         auto op = Clamp::create(attrs, Backend::CPU);
         const TensorDesc in_arr[] = {d};
         auto descs = op->getOutputTensorDesc(in_arr);
-        TensorView output = test::make_planar(descs[0], out_buf_func);
+        TensorView output = test::make_channel_first(descs[0], out_buf_func);
         const TensorView ins[] = {input};
         op->compute(output, ins);
     }

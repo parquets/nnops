@@ -107,7 +107,7 @@ public:
 
     OpType  getOpType()  const override { return OpType::Rnn; }
     Backend getBackend() const override { return backend_; }
-    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::PlanarOnly; }
+    LayoutSupport getLayoutSupport() const noexcept override { return LayoutSupport::ChannelFirstOnly; }
 
     const RnnAttributes& attributes() const noexcept { return attrs_; }
 

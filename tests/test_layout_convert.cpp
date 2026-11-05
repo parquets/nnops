@@ -1,11 +1,11 @@
 /// @file test_layout_convert.cpp
-/// @brief LayoutConvert tests — NCHW <-> NHWC (2D) and NCDHW <-> NDHWC (3D).
+/// @brief LayoutConvert tests — channel-first <-> channel-last, in 2D and in 3D.
 ///
 /// The round-trip cases drive the operator in both directions and check the
 /// result bit-exact against the input in logical order: f32, f16, a single
 /// channel, an odd C, and 3D. One case pins the physical placement of a value
 /// in a channel-last row. The rest cover the shape/layout inference done by
-/// getOutputTensorDesc(), the NHWC row pitch in TensorDesc::storage_bytes(),
+/// getOutputTensorDesc(), the channel-last row pitch in TensorDesc::storage_bytes(),
 /// the rejections, and the op's OpType/Backend.
 
 #include "nnops/ops/layout_convert.hpp"
@@ -114,16 +114,17 @@ inline TensorDesc make_desc_5d(int64_t N, int64_t C, int64_t D, int64_t H, int64
     return desc;
 }
 
-/// Convert planar -> channel-last -> planar and compare against the input.
+/// Convert channel-first -> channel-last -> channel-first and compare against the
+/// input.
 template <typename T>
 void roundtrip(const TensorDesc& input_desc) {
     std::vector<T> input_data(static_cast<size_t>(input_desc.numel()));
-    auto input = nnops::test::make_planar(input_desc, input_data.data());
+    auto input = nnops::test::make_channel_first(input_desc, input_data.data());
     fill_sequential<T>(input);
 
     const TensorLayout cl_layout = (input_desc.rank == 5)
         ? TensorLayout::NDHWC : TensorLayout::NHWC;
-    const TensorLayout planar_layout = (input_desc.rank == 5)
+    const TensorLayout channel_first_layout = (input_desc.rank == 5)
         ? TensorLayout::NCDHW : TensorLayout::NCHW;
 
     auto to_cl = LayoutConvert::create(cl_layout);
@@ -137,16 +138,16 @@ void roundtrip(const TensorDesc& input_desc) {
     const TensorView cl_ins[] = { input };
     NNOPS_EXPECT_TRUE(to_cl->compute(cl, cl_ins) == Status::ok);
 
-    auto to_planar = LayoutConvert::create(planar_layout);
+    auto to_channel_first = LayoutConvert::create(channel_first_layout);
     const TensorDesc back_in_descs[] = { cl_descs[0] };
-    auto back_descs = to_planar->getOutputTensorDesc(back_in_descs);
+    auto back_descs = to_channel_first->getOutputTensorDesc(back_in_descs);
     NNOPS_EXPECT_EQ(back_descs.size(), 1u);
-    NNOPS_EXPECT_EQ(back_descs[0].layout, planar_layout);
+    NNOPS_EXPECT_EQ(back_descs[0].layout, channel_first_layout);
 
     std::vector<T> back_data(static_cast<size_t>(back_descs[0].numel()));
-    auto back = nnops::test::make_planar(back_descs[0], back_data.data());
+    auto back = nnops::test::make_channel_first(back_descs[0], back_data.data());
     const TensorView back_ins[] = { cl };
-    NNOPS_EXPECT_TRUE(to_planar->compute(back, back_ins) == Status::ok);
+    NNOPS_EXPECT_TRUE(to_channel_first->compute(back, back_ins) == Status::ok);
 
     NNOPS_EXPECT_TRUE(same_logical<T>(input, back));
 }
@@ -189,11 +190,11 @@ NNOPS_TEST(layout_convert_roundtrip_3d_odd_c_f32) {
 // Physical placement inside a channel-last row
 // ============================================================
 
-NNOPS_TEST(layout_convert_nhwc_element_placement) {
+NNOPS_TEST(layout_convert_channel_last_element_placement) {
     auto input_desc = make_desc_4d(1, 3, 2, 2, DataType::f32, TensorLayout::NCHW);
 
     std::vector<float> input_data(static_cast<size_t>(input_desc.numel()));
-    auto input = nnops::test::make_planar(input_desc, input_data.data());
+    auto input = nnops::test::make_channel_first(input_desc, input_data.data());
     fill_sequential<float>(input);  // 1..12 in logical order
 
     auto to_cl = LayoutConvert::create(TensorLayout::NHWC);
@@ -260,7 +261,7 @@ NNOPS_TEST(layout_convert_rejects_cross_rank) {
 
 NNOPS_TEST(storage_bytes_channel_last) {
     // N=1, C=3, H=2, W=5 f32 channel-last: a row is 3 * 5 * 4 = 60 bytes,
-    // aligned to 64; 2 rows -> 128. Planar would be 1 * 3 * 2 * 32 = 192.
+    // aligned to 64; 2 rows -> 128. Channel-first would be 1 * 3 * 2 * 32 = 192.
     auto desc = make_desc_4d(1, 3, 2, 5, DataType::f32, TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(desc.row_pitch(32), 64);
     NNOPS_EXPECT_EQ(desc.storage_bytes(32), 128u);
@@ -303,7 +304,7 @@ NNOPS_TEST(get_output_tensor_desc_to_channel_last_2d) {
     NNOPS_EXPECT_EQ(outputs[0].dims[3], 4);
 }
 
-NNOPS_TEST(get_output_tensor_desc_to_planar_2d) {
+NNOPS_TEST(get_output_tensor_desc_to_channel_first_2d) {
     auto input_desc = make_desc_4d(1, 24, 5, 6, DataType::f16, TensorLayout::NHWC);
 
     auto op = LayoutConvert::create(TensorLayout::NCHW);

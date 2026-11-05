@@ -1,8 +1,8 @@
 /// @file pooling_cuda.cu
 /// @brief CUDA implementation of 2D/3D spatial pooling — Max and Average — on a
-///        planar (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
+///        Channel-first or a channel-last tensor.
 ///
-/// Planar keeps the lane on output width, because that is the contiguous axis
+/// Channel-first keeps the lane on output width, because that is the contiguous axis
 /// there: one thread per output position of one (n, c) plane, a block per plane.
 /// Channel-last puts the lane on the channel instead, for the same reason — a
 /// thread owns one 16 B vector of a pixel (four f32 or eight f16) and the window
@@ -11,8 +11,8 @@
 /// by masking inside the vector kernel, and an unaligned pitch or pixel stride
 /// falls back to the scalar script entirely.
 ///
-/// Global pooling is a separate pair: a planar plane reduces across a block, a
-/// channel-last image reduces across pixels with one thread per channel vector,
+/// Global pooling is a separate pair: a channel-first plane reduces across a block,
+/// a channel-last image reduces across pixels with one thread per channel vector,
 /// which keeps the loads coalesced because adjacent threads hold adjacent
 /// channels of the same pixel.
 ///
@@ -27,11 +27,11 @@
 namespace nnops::backend::cuda {
 
 // ============================================================
-// Planar — one thread per output position, a block per (n, c) plane
+// Channel-first — one thread per output position, a block per (n, c) plane
 // ============================================================
 
 template <typename T>
-__global__ void pooling_planar_kernel(
+__global__ void pooling_channel_first_kernel(
     const T* __restrict__ input,
     T* __restrict__ output,
     // Spatial dimensions
@@ -245,11 +245,11 @@ __global__ void pooling_last_kernel(
 // Global pooling — every output spatial axis is one
 // ============================================================
 
-/// A planar plane is walked per row rather than as one run: a padded pitch puts
+/// A channel-first plane is walked per row rather than as one run: a padded pitch puts
 /// dead bytes between rows, and reading through them would fold them into the
 /// reduction.
 template <typename T>
-__global__ void pooling_global_planar_kernel(
+__global__ void pooling_global_channel_first_kernel(
     const T* __restrict__ input,
     T* __restrict__ output,
     int64_t rows,           // ID * IH
@@ -286,7 +286,7 @@ __global__ void pooling_global_planar_kernel(
     }
 }
 
-/// Per row for the same reason as the planar twin: a padded pitch leaves dead
+/// Per row for the same reason as the channel-first twin: a padded pitch leaves dead
 /// bytes after the last pixel of a row.
 template <typename T, int Vec>
 __global__ void pooling_global_last_kernel(
@@ -350,7 +350,7 @@ __global__ void pooling_global_last_kernel(
 // Host-side launchers
 // ============================================================
 
-/// The dimensions both routes spell out, planar and channel-last alike.
+/// The dimensions both routes spell out, channel-first and channel-last alike.
 struct PoolingDims {
     int64_t N, C;
     int64_t ID, IH, IW;
@@ -391,7 +391,7 @@ inline PoolingDims pooling_dims(const PoolingAttributes& attrs,
 }
 
 template <typename T>
-void pooling_planar_impl(
+void pooling_channel_first_impl(
     const PoolingAttributes& attrs,
     TensorView& output,
     std::span<const TensorView> inputs,
@@ -415,7 +415,7 @@ void pooling_planar_impl(
     const int64_t NC = d.N * d.C;
     const dim3 grid(1, static_cast<unsigned int>(NC), 1);
 
-    pooling_planar_kernel<<<grid, block_size, 0, stream>>>(
+    pooling_channel_first_kernel<<<grid, block_size, 0, stream>>>(
         input.ptr<T>(), output.ptr<T>(),
         d.N, d.C,
         d.ID, d.IH, d.IW,
@@ -545,7 +545,7 @@ void pooling_global_impl(
         const int64_t in_ch_stride  = d.ID * d.IH * in_row_stride;
         const int64_t out_ch_stride = output.row_stride_elems();
         const int64_t NC = d.N * d.C;
-        pooling_global_planar_kernel<T><<<static_cast<unsigned int>(NC), kCudaBlockSize, 0, stream>>>(
+        pooling_global_channel_first_kernel<T><<<static_cast<unsigned int>(NC), kCudaBlockSize, 0, stream>>>(
             input.ptr<T>(), output.ptr<T>(), d.ID * d.IH, d.IW, in_row_stride,
             in_ch_stride, out_ch_stride, attrs.type, attrs.add_to);
         return;
@@ -587,7 +587,7 @@ void pooling_dispatch(const PoolingAttributes& attrs,
     } else if (is_channel_last(inputs[0].layout())) {
         pooling_last_impl<T>(attrs, output, inputs, ctx);
     } else {
-        pooling_planar_impl<T>(attrs, output, inputs, ctx);
+        pooling_channel_first_impl<T>(attrs, output, inputs, ctx);
     }
 }
 

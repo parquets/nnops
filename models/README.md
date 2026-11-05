@@ -86,7 +86,7 @@ anything structural.
 
 ## Layout notes
 
-The runners stay in NCHW, which is what PyTorch records, so nothing is
+The runners stay in channel-first, which is what PyTorch records, so nothing is
 converted on the way in:
 
 - **Global average pooling** is the pooling operator's `global` mode
@@ -94,7 +94,7 @@ converted on the way in:
   window is the whole plane and every spatial axis of the output is 1, so the
   kernel scans each channel plane instead of walking a window.
 
-Pooling and depthwise convolution take NCHW directly, so `max_pool()` and
+Pooling and depthwise convolution take channel-first directly, so `max_pool()` and
 `depthwise_conv()` in `common/net_ops.hpp` hand them the tensor (and, for the
 depthwise stage, the exported `[C, 1, 3, 3]` weight) with no repacking.
 

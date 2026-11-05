@@ -143,11 +143,11 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     }
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
-    auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
     op->compute(fast_out, ins, {}, nullptr);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
-    auto ref_out = test::make_planar(out_descs[0], ref_buf.data());
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
     nnops::backend::cpu::reference::group_query_attention_ref(attrs, ref_out, ins, {}, nullptr);
 
     for (int64_t i = 0; i < out_numel; ++i) {
@@ -381,8 +381,8 @@ NNOPS_TEST(gqa_degenerate_equals_mha) {
 
     std::vector<float> a_buf(static_cast<size_t>(mha_desc.numel()));
     std::vector<float> b_buf(static_cast<size_t>(gqa_desc.numel()));
-    auto a = test::make_planar(mha_desc, a_buf.data());
-    auto b = test::make_planar(gqa_desc, b_buf.data());
+    auto a = test::make_channel_first(mha_desc, a_buf.data());
+    auto b = test::make_channel_first(gqa_desc, b_buf.data());
 
     mha->compute(a, ins);
     gqa->compute(b, ins);
@@ -421,7 +421,7 @@ NNOPS_TEST(gqa_f16_matches_ref) {
         const int64_t n = out_desc.numel();
 
         std::vector<float> ref_buf(static_cast<size_t>(n));
-        auto ref_out = test::make_planar(out_desc, ref_buf.data());
+        auto ref_out = test::make_channel_first(out_desc, ref_buf.data());
         nnops::backend::cpu::reference::group_query_attention_ref(attrs, ref_out, ins32, {}, nullptr);
 
         auto q16v = test::f32_to_f16(q32v);
@@ -436,7 +436,7 @@ NNOPS_TEST(gqa_f16_matches_ref) {
         const TensorDesc fdescs[] = {q16.desc(), k16.desc(), v16.desc()};
         const auto fout_desc = op->getOutputTensorDesc(fdescs)[0];
         std::vector<cpu::half> got_buf(static_cast<size_t>(n));
-        auto got = test::make_planar(fout_desc, got_buf.data());
+        auto got = test::make_channel_first(fout_desc, got_buf.data());
         const TensorView ins16[] = {q16, k16, v16};
         NNOPS_EXPECT_TRUE(op->compute(got, ins16) == Status::ok);
 

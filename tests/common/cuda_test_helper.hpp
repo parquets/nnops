@@ -11,7 +11,7 @@
 ///
 /// The oracle is the CPU backend running the same attributes on the same input
 /// values — the contract is identical, so a difference is a CUDA bug. Rows are
-/// built with make_packed (a 32 B pitch) for planar tensors so the padded-stride
+/// built with make_packed (a 32 B pitch) for channel-first tensors so the padded-stride
 /// path is the one under test; channel-last tensors must be dense, because their
 /// strides never consult the pitch.
 ///

@@ -1,7 +1,7 @@
 /// @file multi_head_attention.cpp
 /// @brief MultiHeadAttention operator dispatch.
 ///
-/// Q, K, V [, mask] in f32 or f16, planar, merged [B, S, H*D] or explicit
+/// Q, K, V [, mask] in f32 or f16, channel-first, merged [B, S, H*D] or explicit
 /// [B, H, S, D]. The optional mask is positional and may still arrive as an
 /// empty view (absent, not malformed). Everything below the attribute copy is
 /// the shared CPU attention core.
@@ -39,7 +39,7 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
 {
     // Q, K, V [, mask [, past K, past V]]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 6, 1));
-    if (!is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly)) {
+    if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
 

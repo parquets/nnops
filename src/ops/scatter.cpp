@@ -34,9 +34,9 @@ Status check_scatter_layouts(const TensorDesc& data, const TensorDesc& indices,
                              const TensorDesc& updates)
 {
     return detail::require(
-        is_layout_supported(data.layout, LayoutSupport::PlanarOnly) &&
-        is_layout_supported(indices.layout, LayoutSupport::PlanarOnly) &&
-        is_layout_supported(updates.layout, LayoutSupport::PlanarOnly));
+        is_layout_supported(data.layout, LayoutSupport::ChannelFirstOnly) &&
+        is_layout_supported(indices.layout, LayoutSupport::ChannelFirstOnly) &&
+        is_layout_supported(updates.layout, LayoutSupport::ChannelFirstOnly));
 }
 
 }  // anonymous namespace

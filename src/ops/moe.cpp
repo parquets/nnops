@@ -35,7 +35,7 @@ Status MoE::validate(std::span<const TensorDesc> inputs,
     // bounds and the required head are checked here.
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 5, 9, 1));
     return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly));
+        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly));
 }
 
 Status MoE::compute(std::span<TensorView> outputs,

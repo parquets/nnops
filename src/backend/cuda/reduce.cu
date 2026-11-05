@@ -196,7 +196,7 @@ void reduce_cuda_impl(
     const int grid = std::min(static_cast<int>(outer_dim_count), 65535);
 
     if (axis == rank - 1 && !is_channel_last(input.layout())) {
-        // Contiguous tail fast path: planar only — channel-last has C innermost.
+        // Contiguous tail fast path: channel-first only — channel-last has C innermost.
         const int64_t row_stride = (axis > 0) ? input.stride_elems(axis - 1) : input.numel();
         reduce_fast_kernel<T><<<grid, block_size, shared_bytes, stream>>>(
             x_ptr, y_ptr, norm_size, row_stride, reduce_type);

@@ -2,12 +2,12 @@
 /// @file tensor_layout.hpp
 /// @brief TensorLayout enum for describing data arrangement in memory.
 ///
-/// Two activation families:
-///   NCHW / NCDHW  — planar 2D / 3D
+/// Two activation families, named by where the channel axis sits:
+///   NCHW / NCDHW  — channel-first 2D / 3D
 ///   NHWC / NDHWC  — channel-last 2D / 3D
 ///
 /// Channel-last keeps the logical [N, C, ...] dims in the descriptor exactly as
-/// planar does; only the physical order changes, so the "row" of the pitch model
+/// channel-first does; only the physical order changes, so the "row" of the pitch model
 /// is one spatial line — (n, h) over all W pixels and all C channels — and the
 /// channel axis is contiguous. A [W][C] row is one contiguous block, with
 /// pitch = align_up(W * C * elem_size, 32) (see TensorDesc::row_pitch()); a
@@ -22,19 +22,20 @@ namespace nnops {
 
 /// Memory layout of tensor data.
 enum class TensorLayout : uint8_t {
-    // ---- 2D planar ----
+    // ---- channel-first, 2D ----
     NCHW      = 0,  ///< [N, C, H, W]
 
-    // ---- 3D planar ----
+    // ---- channel-first, 3D ----
     NCDHW     = 1,  ///< [N, C, D, H, W]
 
-    // ---- Channel-last (NHWC family) ----
+    // ---- channel-last, 2D / 3D ----
     NHWC      = 2,  ///< logical [N, C, H, W], stored [N, H, W, C]
     NDHWC     = 3,  ///< logical [N, C, D, H, W], stored [N, D, H, W, C]
 
     // ---- Winograd-transformed weight ----
-    PackedWinoWeight = 4,  ///< [16, OC, IC/G] — F(2,3) Winograd U for a planar
-                           ///< activation, one transform-domain kernel per p ∈ [0,16).
+    PackedWinoWeight = 4,  ///< [16, OC, IC/G] — F(2,3) Winograd U for a
+                           ///< channel-first activation, one transform-domain
+                           ///< kernel per p ∈ [0,16).
 
     // ---- Channel-last conv weight ----
     HWIO      = 5,  ///< [KH][KW][IC/G][OC] — TF filter order for channel-last
@@ -55,8 +56,9 @@ enum class TensorLayout : uint8_t {
     //
     // The tags name which route's operand a blob holds; the two routes swap their
     // GEMM's operands, so they pack along different axes:
-    //   PackedOIHW — planar (OIHW) filter, planar activation: the filter is the A
-    //                operand (fp: [OC][IC/G·KH·KW] copy, quant: packed-A panels).
+    //   PackedOIHW — channel-first (OIHW) filter, channel-first activation: the
+    //                filter is the A operand (fp: [OC][IC/G·KH·KW] copy, quant:
+    //                packed-A panels).
     //   PackedHWIO — channel-last (HWIO) filter, channel-last activation: the
     //                filter is the B operand (one k-major panel of nr OC per k block).
     //
@@ -64,7 +66,7 @@ enum class TensorLayout : uint8_t {
     // [OC, ⌈elements / OC⌉] so shape inference still reads the output-channel
     // count; panel geometry is resolved from the attributes and the filter's
     // dims, never indexed by hand.
-    PackedOIHW = 8,   ///< planar activation's prepacked filter (see above)
+    PackedOIHW = 8,   ///< channel-first activation's prepacked filter (see above)
     PackedHWIO = 9,   ///< channel-last activation's prepacked filter (see above)
 
     // ---- Prepacked matmul RHS (MatMul / Linear ::prepackWeights) ----
@@ -91,13 +93,13 @@ enum class TensorLayout : uint8_t {
     PackedRecurrent = 11,
 };
 
-/// True for NHWC, NDHWC — channel is the innermost, contiguous axis.
+/// True for the channel-last layouts, NHWC and NDHWC.
 constexpr bool is_channel_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::NHWC || layout == TensorLayout::NDHWC;
 }
 
-/// True for NCHW, NCDHW — planar activations.
-constexpr bool is_planar_spatial(TensorLayout layout) noexcept {
+/// True for the channel-first layouts, NCHW and NCDHW.
+constexpr bool is_channel_first_spatial(TensorLayout layout) noexcept {
     return layout == TensorLayout::NCHW || layout == TensorLayout::NCDHW;
 }
 
@@ -111,7 +113,8 @@ constexpr bool is_depthwise_weight_last(TensorLayout layout) noexcept {
     return layout == TensorLayout::HWCM;
 }
 
-/// True for either Winograd weight form; the two pair with NCHW and NHWC.
+/// True for either Winograd weight form; the two pair with the
+/// channel-first and channel-last activations.
 constexpr bool is_wino_weight(TensorLayout layout) noexcept {
     return layout == TensorLayout::PackedWinoWeight ||
            layout == TensorLayout::PackedWinoWeightLast;
@@ -133,15 +136,15 @@ constexpr bool is_packed_recurrent(TensorLayout layout) noexcept {
     return layout == TensorLayout::PackedRecurrent;
 }
 
-/// True for any layout a conv-family filter may carry: a raw planar or
-/// channel-last filter, or one of the prepacked blobs.
+/// True for any layout a conv-family filter may carry: a raw channel-first
+/// or channel-last filter, or one of the prepacked blobs.
 constexpr bool is_conv_filter_layout(TensorLayout layout) noexcept {
-    return is_planar_spatial(layout) || is_channel_last(layout) ||
+    return is_channel_first_spatial(layout) || is_channel_last(layout) ||
            is_channel_last_weight(layout) || is_packed_conv_weight(layout) ||
            is_wino_weight(layout);
 }
 
-/// Spatial rank encoded in the layout: NCHW/NHWC → 2, NCDHW/NDHWC → 3.
+/// Spatial rank encoded in the layout: the 2D names → 2, the 3D ones → 3.
 constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
     switch (layout) {
     case TensorLayout::NCDHW:
@@ -158,25 +161,25 @@ constexpr int64_t layout_spatial_rank(TensorLayout layout) noexcept {
 
 /// Categories of layout support for an operator.
 ///
-///   PlanarOnly — planar activations (plus every weight tag)
-///   Any        — planar or channel-last, pitch-aware
-///   PlanarOrChannelLast — both activation families (same as Any today; kept
-///                          so an op can declare its spatial fast path)
+///   ChannelFirstOnly           — channel-first activations (plus weight tags)
+///   Any                        — either family, pitch-aware
+///   ChannelFirstOrChannelLast  — both activation families (same as Any today;
+///                              kept so an op can declare its spatial fast path)
 enum class LayoutSupport : uint8_t {
-    PlanarOnly,          ///< NCHW/NCDHW; channel-last and weight tags rejected
-    Any,                 ///< every layout (pitch-aware processing)
-    PlanarOrChannelLast, ///< NCHW/NCDHW/NHWC/NDHWC
+    ChannelFirstOnly,           ///< NCHW/NCDHW only; channel-last and weights rejected
+    Any,                        ///< every layout (pitch-aware processing)
+    ChannelFirstOrChannelLast,  ///< NCHW/NCDHW/NHWC/NDHWC
 };
 
 /// True when @p layout satisfies the @p support constraint.
 inline bool is_layout_supported(TensorLayout layout, LayoutSupport support) noexcept {
     switch (support) {
-    case LayoutSupport::PlanarOnly:
-        return is_planar_spatial(layout);
+    case LayoutSupport::ChannelFirstOnly:
+        return is_channel_first_spatial(layout);
     case LayoutSupport::Any:
         return true;
-    case LayoutSupport::PlanarOrChannelLast:
-        return is_planar_spatial(layout) || is_channel_last(layout);
+    case LayoutSupport::ChannelFirstOrChannelLast:
+        return is_channel_first_spatial(layout) || is_channel_last(layout);
     }
     return false;
 }

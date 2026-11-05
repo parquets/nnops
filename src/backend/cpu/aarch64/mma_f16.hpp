@@ -21,7 +21,7 @@
 /// the A side and the C row pointers repeat here — so a partial-M tile needs no
 /// per-row guards.
 ///
-/// Bias seed (both routes): 1 is per-row (planar, a row is an output
+/// Bias seed (both routes): 1 is per-row (channel-first, a row is an output
 /// channel), 2 is per-column (channel-last, rows are pixels, so the bias lands
 /// on the panel's 16 lanes). Seed 2 reads all 16 lanes, so the caller's bias
 /// buffer must be padded to the panel width. Seeding costs two loads per row per

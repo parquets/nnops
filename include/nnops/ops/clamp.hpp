@@ -3,7 +3,7 @@
 /// @brief Element-wise clamp to [min, max].
 ///
 /// output[i] = max(min_val, min(max_val, input[i])). Any shape, rank or layout
-/// (Planar and Packed), processed a row at a time by row stride; output matches
+/// (channel-first and Packed), processed a row at a time by row stride; output matches
 /// input.
 
 #include "nnops/core/op_base.hpp"

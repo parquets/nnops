@@ -210,7 +210,7 @@ void run_conv2d(const Conv2DCase& c, const std::vector<int>& threads, int iters)
                                                       /*use_thread_slots=*/true);
 
     std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto output = test::make_planar(out_descs[0], out_buf.data());
+    auto output = test::make_channel_first(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
     std::printf("    in[%lld,%lld,%lld,%lld]  w[%lld,%lld,%lldx%lld]  -> out[%lld,%lld,%lld,%lld]  %s\n",
@@ -281,7 +281,7 @@ void bench_conv2d_case(const Conv2DCase& c) {
 }
 
 // ============================================================
-// DepthwiseConv — the dedicated planar kernel (vs the im2col group path)
+// DepthwiseConv — the dedicated channel-first kernel (vs the im2col group path)
 // ============================================================
 
 struct DepthwiseCase {
@@ -294,8 +294,8 @@ void run_depthwise(const DepthwiseCase& c, const std::vector<int>& threads, int 
     const int64_t ishape[] = {c.N, c.C, c.IH, c.IW};
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
 
-    auto [in_vec, in_nchw] = test::make_random_tensor(ishape, -1.0f, 1.0f, 21);
-    auto [w_vec, w_nchw]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 22);
+    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 21);
+    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 22);
 
     DepthwiseConvAttributes attrs{};
     attrs.kernel_size = {1, c.KH, c.KW};
@@ -305,18 +305,18 @@ void run_depthwise(const DepthwiseCase& c, const std::vector<int>& threads, int 
 
     auto dw_op = DepthwiseConv::create(attrs, Backend::CPU);
 
-    const TensorView dw_in[] = {in_nchw, w_nchw};
-    const TensorDesc dw_arr[] = {in_nchw.desc(), w_nchw.desc()};
+    const TensorView dw_in[] = {in_channel_first, w_channel_first};
+    const TensorDesc dw_arr[] = {in_channel_first.desc(), w_channel_first.desc()};
     auto out_descs = dw_op->getOutputTensorDesc(dw_arr);
     const int64_t OH = out_descs[0].dims[2];
     const int64_t OW = out_descs[0].dims[3];
     const double flops_per_iter = 2.0 * static_cast<double>(c.N) * c.C * OH * OW * c.KH * c.KW;
 
     std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = test::make_planar(out_descs[0], out_buf.data());
+    auto out = test::make_channel_first(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
-    std::printf("    in[%lld,%lld,%lld,%lld]  w[%lld,1,%lldx%lld]  -> out[%lld,%lld,%lld,%lld]  NCHW\n",
+    std::printf("    in[%lld,%lld,%lld,%lld]  w[%lld,1,%lldx%lld]  -> out[%lld,%lld,%lld,%lld]  channel-first\n",
                 (long long)c.N, (long long)c.C, (long long)c.IH, (long long)c.IW,
                 (long long)c.C, (long long)c.KH, (long long)c.KW,
                 (long long)c.N, (long long)c.C, (long long)OH, (long long)OW);
@@ -444,7 +444,7 @@ void run_wino_ab(const WinoCase& c, const std::vector<int>& threads,
     }
 
     std::vector<T> out_buf(static_cast<size_t>(out_descs[0].numel()));
-    auto output = test::make_planar(out_descs[0], out_buf.data());
+    auto output = test::make_channel_first(out_descs[0], out_buf.data());
 
     std::vector<TensorView> im_ins = {input, weight};
     std::vector<TensorView> wn_ins = {input, u_view};
@@ -530,10 +530,10 @@ void bench_wino_case(const WinoCase& c) {
 // 36 over 4x4 — so they are not comparable across the two arms either; the wall
 // time is.
 
-/// Build the planar U for an explicit transform order: [pos][OC][IC/G], pitched
+/// Build the channel-first U for an explicit transform order: [pos][OC][IC/G], pitched
 /// at ICG, plane step wino_alpha (p = i·α + j).
 template <typename T>
-TensorView build_planar_u(const TensorView& weight, int64_t OC, int64_t ICG,
+TensorView build_channel_first_u(const TensorView& weight, int64_t OC, int64_t ICG,
                           cpu::WinoOrder order, std::vector<T>& buf) {
     const int64_t plane = OC * ICG;
     const int64_t pos   = cpu::wino_pos(order);
@@ -586,11 +586,11 @@ void run_wino_order_ab(const WinoOrderCase& c, const std::vector<int>& threads,
     const auto od = op->getOutputTensorDesc(d0);
     const int64_t OH = od[0].dims[2], OW = od[0].dims[3];
     std::vector<T> out_buf(static_cast<size_t>(od[0].numel()), T{});
-    auto output = test::make_planar(od[0], out_buf.data());
+    auto output = test::make_channel_first(od[0], out_buf.data());
 
     std::vector<T> u23_buf, u43_buf;
-    const TensorView u23 = build_planar_u<T>(weight, c.OC, c.IC, cpu::WinoOrder::F23, u23_buf);
-    const TensorView u43 = build_planar_u<T>(weight, c.OC, c.IC, cpu::WinoOrder::F43, u43_buf);
+    const TensorView u23 = build_channel_first_u<T>(weight, c.OC, c.IC, cpu::WinoOrder::F23, u23_buf);
+    const TensorView u43 = build_channel_first_u<T>(weight, c.OC, c.IC, cpu::WinoOrder::F43, u43_buf);
 
     const auto gflops_of = [&](cpu::WinoOrder o) -> double {
         const int64_t tile = cpu::wino_tile(o);
@@ -633,7 +633,7 @@ void run_wino_order_ab(const WinoOrderCase& c, const std::vector<int>& threads,
         const double a = median_of(a_ms), b = median_of(b_ms);
         const double nf = median_of(null_pct);
         // Time ratio F(4,3)/F(2,3), the same convention as the im2col columns
-        // above and as bench_conv2d_nhwc's order table: below 1 is a win.
+        // above and as bench_conv2d_channel_last's order table: below 1 is a win.
         const double ratio = b / a;
         const bool real = std::abs(a - b) / a * 100.0 > nf;
 
@@ -795,7 +795,7 @@ struct I8Op {
         OH = outs[0].dims[2];
         OW = outs[0].dims[3];
         out_buf.assign(outs[0].nbytes(), 0);
-        // make_planar would drop the QuantParams the integer destination needs.
+        // make_channel_first would drop the QuantParams the integer destination needs.
         const std::span<const int64_t> oshape(outs[0].dims.data(), 4);
         out = TensorView(oshape, outs[0].dtype, out_buf.data(),
                          outs[0].layout, out_q);
@@ -859,7 +859,7 @@ struct Fp32Op {
         OH = outs[0].dims[2];
         OW = outs[0].dims[3];
         out_buf.assign(outs[0].nbytes(), 0);
-        out = test::make_planar(outs[0], out_buf.data());
+        out = test::make_channel_first(outs[0], out_buf.data());
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW *
                static_cast<double>(icg) * c.KH * c.KW;
     }
@@ -1107,7 +1107,7 @@ struct ConvSweepOp {
         const TensorDesc descs[] = {in.desc(), w.desc()};
         auto out_descs = op->getOutputTensorDesc(descs);
         out_buf.assign(static_cast<size_t>(out_descs[0].numel()), T{});
-        out = test::make_planar(out_descs[0], out_buf.data());
+        out = test::make_channel_first(out_descs[0], out_buf.data());
         ins = {in, w};
 
         const cpu::Conv2DGemmPlan plan = cpu::get_conv2d_implicit_gemm_plan(

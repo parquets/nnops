@@ -1,17 +1,17 @@
 /// @file bench_depthwise.cpp
-/// @brief Depthwise conv: planar (NCHW) against channel-last (NHWC), interleaved.
+/// @brief Depthwise conv: channel-first against channel-last, interleaved.
 ///
 /// The two routes vectorize on opposite axes:
 ///
-///   planar  the lane is output width, so one load feeds 8 positions of ONE row
+///   Channel-first  the lane is output width, so one load feeds 8 positions of ONE row
 ///           and a 3x3 is a chain of 9 dependent FMAs.
-///   nhwc    the lane is a channel, so one load feeds 16 channels at one output
+///   channel_last    the lane is a channel, so one load feeds 16 channels at one output
 ///           position; four output rows are unrolled and each tap broadcasts one
 ///           weight vector into four independent accumulates.
 ///
 /// Shape decides which wins: the channel lane wastes lanes when the channel
 /// count is small (a 7x7 plane is not the issue, a 3-channel one is), while
-/// planar's dependent chain is immune to channel count but cannot hide FMA
+/// Channel-first's dependent chain is immune to channel count but cannot hide FMA
 /// latency.
 ///
 /// The layout conversion is done once, outside every timed region: an engine
@@ -139,9 +139,9 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
     const int64_t bshape[] = {c.C};
 
-    auto [in_vec, in_nchw] = test::make_random_tensor(ishape, -1.0f, 1.0f, 31);
-    auto [w_vec, w_nchw]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 32);
-    auto [b_vec, b_nchw]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 33);
+    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 31);
+    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 32);
+    auto [b_vec, b_channel_first]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 33);
 
     DepthwiseConvAttributes attrs{};
     attrs.kernel_size = {1, c.KH, c.KW};
@@ -150,54 +150,54 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
     attrs.padding     = {0, c.PH, c.PW};
     if (c.relu6) { attrs.epilogue.type = nnops::EpilogueActivateType::Relu6; }
 
-    // ---- planar arm: the tensors as they come out of a PyTorch model ----
-    auto planar_op = DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView planar_in[] = {in_nchw, w_nchw, b_nchw};
-    const TensorDesc planar_in_desc[] = {in_nchw.desc(), w_nchw.desc(), b_nchw.desc()};
-    auto planar_out_desc = planar_op->getOutputTensorDesc(planar_in_desc)[0];
-    const int64_t OH = planar_out_desc.dims[2];
-    const int64_t OW = planar_out_desc.dims[3];
-    std::vector<float> planar_out_buf(static_cast<size_t>(planar_out_desc.numel()));
-    auto planar_out = test::make_planar(planar_out_desc, planar_out_buf.data());
-    const auto planar_call = [&](const ComputeContext& ctx) {
-        TensorView outs[] = {planar_out};
-        planar_op->compute(outs, planar_in, ctx);
+    // ---- channel-first arm: the tensors as they come out of a PyTorch model ----
+    auto channel_first_op = DepthwiseConv::create(attrs, Backend::CPU);
+    const TensorView channel_first_in[] = {in_channel_first, w_channel_first, b_channel_first};
+    const TensorDesc channel_first_in_desc[] = {in_channel_first.desc(), w_channel_first.desc(), b_channel_first.desc()};
+    auto channel_first_out_desc = channel_first_op->getOutputTensorDesc(channel_first_in_desc)[0];
+    const int64_t OH = channel_first_out_desc.dims[2];
+    const int64_t OW = channel_first_out_desc.dims[3];
+    std::vector<float> channel_first_out_buf(static_cast<size_t>(channel_first_out_desc.numel()));
+    auto channel_first_out = test::make_channel_first(channel_first_out_desc, channel_first_out_buf.data());
+    const auto channel_first_call = [&](const ComputeContext& ctx) {
+        TensorView outs[] = {channel_first_out};
+        channel_first_op->compute(outs, channel_first_in, ctx);
     };
 
-    // ---- nhwc arm: TensorFlow's orders, converted once like a real graph ----
+    // ---- channel_last arm: TensorFlow's orders, converted once like a real graph ----
     auto in_cl_vec = test::to_channel_last<float>(
         std::span<const float>(in_vec.data(), in_vec.size()), 1, c.C, c.IH * c.IW);
     auto w_cl_vec = test::depthwise_to_hwcm<float>(
         std::span<const float>(w_vec.data(), w_vec.size()), c.C, c.KH * c.KW);
-    TensorView nhwc_in_v(ishape, DataType::f32, in_cl_vec.data(), TensorLayout::NHWC);
+    TensorView channel_last_in_v(ishape, DataType::f32, in_cl_vec.data(), TensorLayout::NHWC);
     const int64_t w_cl_shape[] = {1, c.KH, c.KW, c.C};
-    TensorView nhwc_w_v(std::span<const int64_t>(w_cl_shape, 4), DataType::f32,
+    TensorView channel_last_w_v(std::span<const int64_t>(w_cl_shape, 4), DataType::f32,
                         w_cl_vec.data(), TensorLayout::HWCM);
 
-    auto nhwc_op = DepthwiseConv::create(attrs, Backend::CPU);
-    const TensorView nhwc_in[] = {nhwc_in_v, nhwc_w_v, b_nchw};
-    const TensorDesc nhwc_in_desc[] = {nhwc_in_v.desc(), nhwc_w_v.desc(), b_nchw.desc()};
-    auto nhwc_out_desc = nhwc_op->getOutputTensorDesc(nhwc_in_desc)[0];
-    std::vector<float> nhwc_out_buf(static_cast<size_t>(nhwc_out_desc.numel()));
-    auto nhwc_out = test::make_planar(nhwc_out_desc, nhwc_out_buf.data());
-    const auto nhwc_call = [&](const ComputeContext& ctx) {
-        TensorView outs[] = {nhwc_out};
-        nhwc_op->compute(outs, nhwc_in, ctx);
+    auto channel_last_op = DepthwiseConv::create(attrs, Backend::CPU);
+    const TensorView channel_last_in[] = {channel_last_in_v, channel_last_w_v, b_channel_first};
+    const TensorDesc channel_last_in_desc[] = {channel_last_in_v.desc(), channel_last_w_v.desc(), b_channel_first.desc()};
+    auto channel_last_out_desc = channel_last_op->getOutputTensorDesc(channel_last_in_desc)[0];
+    std::vector<float> channel_last_out_buf(static_cast<size_t>(channel_last_out_desc.numel()));
+    auto channel_last_out = test::make_channel_first(channel_last_out_desc, channel_last_out_buf.data());
+    const auto channel_last_call = [&](const ComputeContext& ctx) {
+        TensorView outs[] = {channel_last_out};
+        channel_last_op->compute(outs, channel_last_in, ctx);
     };
 
     // ---- agreement: both arms must be computing the same function -------
-    planar_call(ComputeContext{});
-    nhwc_call(ComputeContext{});
-    auto nhwc_as_planar = test::to_channel_first<float>(
-        std::span<const float>(nhwc_out_buf.data(), nhwc_out_buf.size()),
+    channel_first_call(ComputeContext{});
+    channel_last_call(ComputeContext{});
+    auto channel_last_as_channel_first = test::to_channel_first<float>(
+        std::span<const float>(channel_last_out_buf.data(), channel_last_out_buf.size()),
         1, c.C, OH * OW);
-    const double d_cl = max_abs_diff(planar_out_buf.data(), nhwc_as_planar.data(),
-                                     planar_out_desc.numel());
+    const double d_cl = max_abs_diff(channel_first_out_buf.data(), channel_last_as_channel_first.data(),
+                                     channel_first_out_desc.numel());
 
     const double flops = 2.0 * static_cast<double>(c.C) * OH * OW * c.KH * c.KW;
     std::printf("  %s\n", c.name);
     std::printf("    in[1,%lld,%lld,%lld] w[%lld,1,%lldx%lld] s%lld p%lld -> out[1,%lld,%lld,%lld]"
-                "  |planar - nhwc| = %.2e\n",
+                "  |channel-first - channel_last| = %.2e\n",
                 (long long)c.C, (long long)c.IH, (long long)c.IW,
                 (long long)c.C, (long long)c.KH, (long long)c.KW,
                 (long long)c.SH, (long long)c.PH,
@@ -209,21 +209,21 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-        planar_call(use_ctx);                // warm-up / first touch
-        nhwc_call(use_ctx);
+        channel_first_call(use_ctx);                // warm-up / first touch
+        channel_last_call(use_ctx);
 
         std::vector<double> a1, cl, a2;
         for (int r = 0; r < rounds; ++r) {
-            a1.push_back(time_us([&] { planar_call(use_ctx); }, iters));
-            cl.push_back(time_us([&] { nhwc_call(use_ctx); }, iters));
-            a2.push_back(time_us([&] { planar_call(use_ctx); }, iters));
+            a1.push_back(time_us([&] { channel_first_call(use_ctx); }, iters));
+            cl.push_back(time_us([&] { channel_last_call(use_ctx); }, iters));
+            a2.push_back(time_us([&] { channel_first_call(use_ctx); }, iters));
         }
         const double tp = median_of(a1);
         const double tc = median_of(cl);
         const double null_gap = (median_of(a2) / tp - 1.0) * 100.0;
 
-        std::printf("    %2dT  planar %8.1f us (%6.1f GFLOPS) | nhwc %8.1f us (%6.1f GFLOPS)"
-                    " | planar/nhwc %5.2fx  (null %+4.1f%%)\n",
+        std::printf("    %2dT  channel-first %8.1f us (%6.1f GFLOPS) | channel_last %8.1f us (%6.1f GFLOPS)"
+                    " | channel-first/channel_last %5.2fx  (null %+4.1f%%)\n",
                     nt, tp, flops / (tp * 1e3),
                     tc, flops / (tc * 1e3), tp / tc, null_gap);
     }
@@ -231,15 +231,15 @@ void run_case(const DepthwiseCase& c, const std::vector<int>& threads, int iters
 
 
 // ============================================================
-// The unroll itself: planar h1 against planar h4
+// The unroll itself: channel-first h1 against channel-first h4
 // ============================================================
 //
 // Same buffers, one variable: R. Single-threaded on purpose — the question is
 // instruction-level parallelism, and a pool would only add scheduling noise.
 
-/// One channel of the driver's planar loop. The tensor's first and last channel
+/// One channel of the driver's channel-first loop. The tensor's first and last channel
 /// keep the bounds-checked edge path, as the driver's block test does.
-void planar_kernel(const float* in, float* out, const float* w, const float* b,
+void channel_first_kernel(const float* in, float* out, const float* w, const float* b,
                    const DepthwiseCase& c, int64_t OH, int64_t OW, bool h4) {
     const Epilogue ep{};
     constexpr int64_t kMaskMaxKw = 16;
@@ -259,8 +259,8 @@ void planar_kernel(const float* in, float* out, const float* w, const float* b,
 
         uint8_t needed[2 * kMaskMaxKw] = {};
         alignas(32) float masks[2 * kMaskMaxKw * 8] = {};
-        k::DwPlanarEdges edges =
-            k::dwconv_planar_edge_masks<kMaskMaxKw, float>(p, masks, needed);
+        k::DwChannelFirstEdges edges =
+            k::dwconv_channel_first_edge_masks<kMaskMaxKw, float>(p, masks, needed);
         if (ch == 0 || ch == c.C - 1) { edges.masks = nullptr; }
 
         const float* in_c  = in  + ch * c.IH * c.IW;
@@ -271,12 +271,12 @@ void planar_kernel(const float* in, float* out, const float* w, const float* b,
         if (h4) {
             for (; oh + 3 < OH; oh += 4) {
                 p.oh = oh;
-                k::dwconv_planar_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
+                k::dwconv_channel_first_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
             }
         }
         for (; oh < OH; ++oh) {
             p.oh = oh;
-            k::dwconv_planar(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
+            k::dwconv_channel_first(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
         }
     }
 }
@@ -286,9 +286,9 @@ void run_unroll_case(const DepthwiseCase& c, int iters, int rounds) {
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
     const int64_t bshape[] = {c.C};
 
-    auto [in_vec, in_nchw] = test::make_random_tensor(ishape, -1.0f, 1.0f, 41);
-    auto [w_vec, w_nchw]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 42);
-    auto [b_vec, b_nchw]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 43);
+    auto [in_vec, in_channel_first] = test::make_random_tensor(ishape, -1.0f, 1.0f, 41);
+    auto [w_vec, w_channel_first]   = test::make_random_tensor(wshape, -1.0f, 1.0f, 42);
+    auto [b_vec, b_channel_first]   = test::make_random_tensor(bshape, -0.5f, 0.5f, 43);
 
     const int64_t OH = (c.IH + 2 * c.PH - c.KH) / c.SH + 1;
     const int64_t OW = (c.IW + 2 * c.PW - c.KW) / c.SW + 1;
@@ -296,12 +296,12 @@ void run_unroll_case(const DepthwiseCase& c, int iters, int rounds) {
     std::vector<float> out1(static_cast<size_t>(c.C * OH * OW));
     std::vector<float> out4(out1.size());
 
-    const float* in = in_nchw.ptr<float>();
-    const float* w  = w_nchw.ptr<float>();
-    const float* b  = b_nchw.ptr<float>();
+    const float* in = in_channel_first.ptr<float>();
+    const float* w  = w_channel_first.ptr<float>();
+    const float* b  = b_channel_first.ptr<float>();
 
-    const auto h1 = [&] { planar_kernel(in, out1.data(), w, b, c, OH, OW, false); };
-    const auto h4 = [&] { planar_kernel(in, out4.data(), w, b, c, OH, OW, true); };
+    const auto h1 = [&] { channel_first_kernel(in, out1.data(), w, b, c, OH, OW, false); };
+    const auto h4 = [&] { channel_first_kernel(in, out4.data(), w, b, c, OH, OW, true); };
 
     h1();
     h4();
@@ -328,12 +328,12 @@ void run_unroll_case(const DepthwiseCase& c, int iters, int rounds) {
 
 }  // namespace
 
-NNOPS_BENCH(depthwise_planar_vs_nhwc) {
+NNOPS_BENCH(depthwise_channel_first_vs_channel_last) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise conv: planar (NCHW, lane=width) against channel-last (NHWC, lane=channel)\n");
+    std::printf("depthwise conv: channel-first (lane=width) against channel-last (lane=channel)\n");
     std::printf("  pool=%s  threads=", test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
@@ -362,11 +362,11 @@ NNOPS_BENCH(depthwise_planar_vs_nhwc) {
     }
 }
 
-NNOPS_BENCH(depthwise_planar_unroll) {
+NNOPS_BENCH(depthwise_channel_first_unroll) {
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise planar: one output row per call (h1) against four (h4)\n");
+    std::printf("depthwise channel-first: one output row per call (h1) against four (h4)\n");
 
     const DepthwiseCase cases[] = {
         {"dw 3x3 C=32  @112 s1",   32, 112, 112},
@@ -396,12 +396,12 @@ NNOPS_BENCH(depthwise_planar_unroll) {
 // The sum is what the model's `depthwise_fused` row should read if the kernel
 // rate holds at these shapes; the difference is per-call cost.
 
-NNOPS_BENCH(depthwise_planar_mobilenet) {
+NNOPS_BENCH(depthwise_channel_first_mobilenet) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise planar: MobileNetV2's seventeen stages, 3x3 p1\n");
+    std::printf("depthwise channel-first: MobileNetV2's seventeen stages, 3x3 p1\n");
     std::printf("  pool=%s  threads=", test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
@@ -440,12 +440,12 @@ NNOPS_BENCH(depthwise_planar_mobilenet) {
 // last vector is full (8 and 16). The (7,8) and (15,16) pairs therefore read the
 // scalar store tail with the edge masking held constant.
 
-NNOPS_BENCH(depthwise_planar_narrow) {
+NNOPS_BENCH(depthwise_channel_first_narrow) {
     const std::vector<int> threads = bench_threads();
     const int iters = 20;
     const int rounds = 5;
 
-    std::printf("depthwise planar: narrow widths, masked edges\n");
+    std::printf("depthwise channel-first: narrow widths, masked edges\n");
     std::printf("  pool=%s  threads=", test::bench_pool_name());
     for (size_t i = 0; i < threads.size(); ++i) {
         std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");

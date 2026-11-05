@@ -35,7 +35,7 @@ NNOPS_TEST(where_basic) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 4);
 
     float out[4] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {cv, xv, yv};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -61,7 +61,7 @@ NNOPS_TEST(where_broadcast_condition) {
     NNOPS_EXPECT_EQ(descs[0].dims[1], 3);
 
     float out[6] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {cv, xv, yv};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -90,7 +90,7 @@ NNOPS_TEST(where_f16_exact) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     half out[2];
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {cv, xv, yv};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -132,7 +132,7 @@ void run_compare(CompareType type, const float* a, const float* b, size_t n,
     auto op = Compare::create(attrs);
     const TensorDesc in_arr[] = {av.desc(), bv.desc()};
     auto descs = op->getOutputTensorDesc(in_arr);
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {av, bv};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 }
@@ -187,7 +187,7 @@ NNOPS_TEST(compare_broadcast_and_f16) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
 
     uint8_t out[3] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {hv, tv};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -229,7 +229,7 @@ NNOPS_TEST(logical_gates) {
         auto descs = op->getOutputTensorDesc(in_arr);
         NNOPS_EXPECT_EQ(descs[0].dtype, DataType::u8);
         uint8_t out[4] = {};
-        TensorView ov = test::make_planar(descs[0], out);
+        TensorView ov = test::make_channel_first(descs[0], out);
         const TensorView ins[] = {av, bv};
         NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
         for (int i = 0; i < 4; ++i) { NNOPS_EXPECT_EQ(out[i], want[i]); }
@@ -256,7 +256,7 @@ NNOPS_TEST(logical_not_int32) {
     NNOPS_EXPECT_EQ(descs[0].dims[0], 3);
 
     uint8_t out[3] = {};
-    TensorView ov = test::make_planar(descs[0], out);
+    TensorView ov = test::make_channel_first(descs[0], out);
     const TensorView ins[] = {av};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::ok);
 
@@ -277,7 +277,7 @@ NNOPS_TEST(logical_rejects_float) {
     const TensorDesc out_desc[] = {av.desc()};
     NNOPS_EXPECT_TRUE(op->validate(in_arr, out_desc) == Status::unsupported);
 
-    TensorView ov = test::make_planar(av.desc(), out);
+    TensorView ov = test::make_channel_first(av.desc(), out);
     const TensorView ins[] = {av};
     NNOPS_EXPECT_TRUE(op->compute(ov, ins) == Status::unsupported);
 }

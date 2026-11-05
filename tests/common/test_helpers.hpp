@@ -20,8 +20,8 @@
 namespace nnops {
 namespace test {
 
-/// Create a planar TensorView from a TensorDesc.
-inline TensorView make_planar(const TensorDesc& desc, void* data) {
+/// Create a channel-first TensorView from a TensorDesc.
+inline TensorView make_channel_first(const TensorDesc& desc, void* data) {
     auto shape = std::span<const int64_t>(desc.dims.data(), static_cast<size_t>(desc.rank));
     return TensorView(shape, desc.dtype, data, desc.layout);
 }

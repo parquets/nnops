@@ -1,19 +1,19 @@
 /// @file test_reduce.cpp
 /// @brief Tests for the Reduce operator (Sum, Min, Max, Mean).
 ///
-/// Planar 1D/2D/3D, keepdims, negative axes, channel-last and f16. The 1D/2D
+/// Channel-first 1D/2D/3D, keepdims, negative axes, channel-last and f16. The 1D/2D
 /// expected values are hand-computed next to the asserts; the random-data
 /// tests build a scalar reference over the same buffer. A negative axis wraps
 /// from the end, so the negative-axis test runs axis=2 and axis=-1 on one
 /// input and compares the two outputs.
 ///
-/// The channel-last section converts a planar input to NHWC/NDHWC, reduces, and
-/// compares the result against the planar reduce in logical order. The layout
+/// The channel-last section converts a channel-first input to channel-last, reduces, and
+/// compares the result against the channel-first reduce in logical order. The layout
 /// only changes where the values live: the axis means the same thing either
-/// way. A rank-dropping reduce on a channel-last input produces a planar
+/// way. A rank-dropping reduce on a channel-last input produces a channel-first
 /// output -- dropping an axis shifts whichever axis C sat on, so the tag cannot
 /// describe the shorter rank any more -- while keepdims keeps the rank and the
-/// channel-last tag.
+/// Channel-last tag.
 ///
 /// f16 goes through the SIMD f16 path and is compared against the f32
 /// reference at 5e-2 rather than round-tripped.
@@ -53,7 +53,7 @@ NNOPS_TEST(reduce_1d_sum) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -80,7 +80,7 @@ NNOPS_TEST(reduce_1d_max) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -107,7 +107,7 @@ NNOPS_TEST(reduce_1d_min) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -134,7 +134,7 @@ NNOPS_TEST(reduce_1d_mean) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -163,7 +163,7 @@ NNOPS_TEST(reduce_1d_keepdims) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -198,7 +198,7 @@ NNOPS_TEST(reduce_2d_axis0_sum) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -231,7 +231,7 @@ NNOPS_TEST(reduce_2d_axis1_max) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -261,7 +261,7 @@ NNOPS_TEST(reduce_2d_axis1_min) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -291,7 +291,7 @@ NNOPS_TEST(reduce_2d_axis0_mean) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -325,7 +325,7 @@ NNOPS_TEST(reduce_2d_keepdims) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
-    auto output = nnops::test::make_planar(descs[0], out_data);
+    auto output = nnops::test::make_channel_first(descs[0], out_data);
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -360,7 +360,7 @@ NNOPS_TEST(reduce_negative_axis) {
     NNOPS_EXPECT_EQ(descs1[0].dims[1], 4);
 
     std::vector<float> out1(static_cast<size_t>(descs1[0].numel()));
-    auto output1 = nnops::test::make_planar(descs1[0], out1.data());
+    auto output1 = nnops::test::make_channel_first(descs1[0], out1.data());
     const TensorView ins1[] = {input};
     op1->compute(output1, ins1);
 
@@ -376,7 +376,7 @@ NNOPS_TEST(reduce_negative_axis) {
     NNOPS_EXPECT_EQ(descs2[0].dims[1], 4);
 
     std::vector<float> out2(static_cast<size_t>(descs2[0].numel()));
-    auto output2 = nnops::test::make_planar(descs2[0], out2.data());
+    auto output2 = nnops::test::make_channel_first(descs2[0], out2.data());
     const TensorView ins2[] = {input};
     op2->compute(output2, ins2);
 
@@ -407,7 +407,7 @@ NNOPS_TEST(reduce_random_sum) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -436,7 +436,7 @@ NNOPS_TEST(reduce_random_max) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -467,7 +467,7 @@ NNOPS_TEST(reduce_random_min) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -498,7 +498,7 @@ NNOPS_TEST(reduce_random_mean) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -533,7 +533,7 @@ NNOPS_TEST(reduce_3d_middle_axis) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -568,7 +568,7 @@ NNOPS_TEST(reduce_3d_first_axis) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = nnops::test::make_planar(descs[0], out_buf.data());
+    auto output = nnops::test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {input};
     op->compute(output, ins);
 
@@ -584,21 +584,21 @@ NNOPS_TEST(reduce_3d_first_axis) {
 }
 
 // ============================================================
-// Channel-last layout tests (NHWC / NDHWC)
+// Channel-last layout tests
 // ============================================================
 
 namespace {
 
-/// Convert a planar view into `target` and return the view; `buf` outlives it.
-TensorView to_layout(const TensorView& planar, TensorLayout target,
+/// Convert a channel-first view into `target` and return the view; `buf` outlives it.
+TensorView to_layout(const TensorView& channel_first, TensorLayout target,
                      std::vector<char>& buf)
 {
     auto op = LayoutConvert::create(target);
-    const TensorDesc in[] = {planar.desc()};
+    const TensorDesc in[] = {channel_first.desc()};
     auto d = op->getOutputTensorDesc(in)[0];
     buf.resize(d.storage_bytes());
     TensorView out = test::make_packed(d, buf.data());
-    const TensorView ins[] = {planar};
+    const TensorView ins[] = {channel_first};
     op->compute(out, ins);
     return out;
 }
@@ -640,14 +640,14 @@ bool same_logical_f32(const TensorView& a, const TensorView& b)
     return true;
 }
 
-/// Run the reduce on a planar input and on its channel-last twin; the results
+/// Run the reduce on a channel-first input and on its channel-last twin; the results
 /// must agree element for element in logical order.
 void check_reduce_layout(const std::vector<int64_t>& shape,
                          ReduceType type, int64_t axis, bool keepdims)
 {
     const uint64_t seed = static_cast<uint64_t>(
         100 + axis * 7 + (keepdims ? 1 : 0) + static_cast<int>(type) * 31);
-    auto [in_vec, in_planar] = test::make_random_tensor(shape, -2.0f, 2.0f, seed);
+    auto [in_vec, in_channel_first] = test::make_random_tensor(shape, -2.0f, 2.0f, seed);
 
     ReduceAttributes attrs;
     attrs.type = type;
@@ -655,17 +655,17 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
     attrs.keepdims = keepdims;
     auto op = Reduce::create(attrs, Backend::CPU);
 
-    const TensorDesc planar_in[] = {in_planar.desc()};
-    auto ref_desc = op->getOutputTensorDesc(planar_in);
+    const TensorDesc channel_first_in[] = {in_channel_first.desc()};
+    auto ref_desc = op->getOutputTensorDesc(channel_first_in);
     std::vector<float> ref_buf(static_cast<size_t>(ref_desc[0].numel()));
-    auto ref_out = test::make_planar(ref_desc[0], ref_buf.data());
-    const TensorView ref_ins[] = {in_planar};
+    auto ref_out = test::make_channel_first(ref_desc[0], ref_buf.data());
+    const TensorView ref_ins[] = {in_channel_first};
     op->compute(ref_out, ref_ins);
 
     std::vector<char> cl_buf;
     const TensorLayout cl_layout =
         (shape.size() == 5) ? TensorLayout::NDHWC : TensorLayout::NHWC;
-    auto in_cl = to_layout(in_planar, cl_layout, cl_buf);
+    auto in_cl = to_layout(in_channel_first, cl_layout, cl_buf);
 
     const TensorDesc cl_in[] = {in_cl.desc()};
     auto cl_desc = op->getOutputTensorDesc(cl_in);
@@ -674,10 +674,10 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
         NNOPS_EXPECT_EQ(cl_desc[0].dims[static_cast<size_t>(d)],
                         ref_desc[0].dims[static_cast<size_t>(d)]);
     }
-    // A rank-preserving output stays channel-last; a rank-dropping one is planar.
-    const TensorLayout planar_layout =
+    // A rank-preserving output stays channel-last; a rank-dropping one is channel-first.
+    const TensorLayout channel_first_layout =
         (shape.size() == 5) ? TensorLayout::NCDHW : TensorLayout::NCHW;
-    NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : planar_layout);
+    NNOPS_EXPECT_EQ(cl_desc[0].layout, keepdims ? cl_layout : channel_first_layout);
 
     std::vector<float> out_buf(
         static_cast<size_t>(cl_desc[0].storage_bytes() / sizeof(float)));
@@ -690,20 +690,20 @@ void check_reduce_layout(const std::vector<int64_t>& shape,
 
 }  // anonymous namespace
 
-NNOPS_TEST(reduce_nhwc_axis_c_sum) {
-    // Hand-checked: C is contiguous in NHWC, so this is the SIMD row path.
+NNOPS_TEST(reduce_channel_last_axis_c_sum) {
+    // Hand-checked: C is contiguous in channel-last, so this is the SIMD row path.
     const int64_t N = 1, C = 4, H = 1, W = 3;
-    float in_planar_data[] = {
+    float in_channel_first_data[] = {
         1.0f, 2.0f, 3.0f,        // c=0
         10.0f, 20.0f, 30.0f,     // c=1
         100.0f, 200.0f, 300.0f,  // c=2
         -1.0f, -2.0f, -3.0f,     // c=3
     };
     const int64_t shape[] = {N, C, H, W};
-    TensorView in_planar(shape, DataType::f32, in_planar_data);
+    TensorView in_channel_first(shape, DataType::f32, in_channel_first_data);
 
     std::vector<char> cl_buf;
-    auto in_cl = to_layout(in_planar, TensorLayout::NHWC, cl_buf);
+    auto in_cl = to_layout(in_channel_first, TensorLayout::NHWC, cl_buf);
 
     ReduceAttributes attrs;
     attrs.type = ReduceType::Sum;
@@ -716,7 +716,7 @@ NNOPS_TEST(reduce_nhwc_axis_c_sum) {
     NNOPS_EXPECT_EQ(descs[0].layout, TensorLayout::NCHW);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto output = test::make_planar(descs[0], out_buf.data());
+    auto output = test::make_channel_first(descs[0], out_buf.data());
     const TensorView ins[] = {in_cl};
     op->compute(output, ins);
 
@@ -725,12 +725,12 @@ NNOPS_TEST(reduce_nhwc_axis_c_sum) {
     NNOPS_EXPECT_NEAR(out_buf[2], 3.0f + 30.0f + 300.0f - 3.0f, 1e-4f);
 }
 
-NNOPS_TEST(reduce_nhwc_axis_c_keepdims) {
+NNOPS_TEST(reduce_channel_last_axis_c_keepdims) {
     check_reduce_layout({2, 5, 3, 4}, ReduceType::Sum, 1, true);
     check_reduce_layout({2, 5, 3, 4}, ReduceType::Mean, 1, true);
 }
 
-NNOPS_TEST(reduce_nhwc_all_axes) {
+NNOPS_TEST(reduce_channel_last_all_axes) {
     const std::vector<int64_t> shape = {2, 4, 3, 5};
     const ReduceType types[] = {ReduceType::Sum, ReduceType::Max,
                                 ReduceType::Min, ReduceType::Mean};
@@ -784,7 +784,7 @@ NNOPS_TEST(reduce_random_f16) {
         NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
         std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
-        auto output = test::make_planar(descs[0], out_buf.data());
+        auto output = test::make_channel_first(descs[0], out_buf.data());
         const TensorView ins[] = {input};
         op->compute(output, ins);
 

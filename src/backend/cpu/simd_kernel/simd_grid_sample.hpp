@@ -1,9 +1,9 @@
 #pragma once
 /// @file simd_grid_sample.hpp
-/// @brief CPU kernels for 2D/3D grid sampling, planar and channel-last.
+/// @brief CPU kernels for 2D/3D grid sampling, channel-first and channel-last.
 ///
-/// The grid itself is always dense f32 NCHW/NCDHW ([N, (OD,) OH, OW, 2|3]).
-/// Planar samples one channel plane at a time, scalar; channel-last computes
+/// The grid itself is always dense f32 channel-first ([N, (OD,) OH, OW, 2|3]).
+/// Channel-first samples one channel plane at a time, scalar; channel-last computes
 /// the source position once per output pixel and runs the interpolation across
 /// the whole C vector with SIMD. Zeros padding is all-or-nothing per pixel, so
 /// the channel vector is either interpolated or zeroed.
@@ -113,11 +113,11 @@ inline void gridsample_zero_pixel(T* dst, int64_t C, bool add_to) {
 }
 
 // ============================================================
-// Planar (NCHW/NCDHW): scalar within one channel plane
+// Channel-first: scalar within one channel plane
 // ============================================================
 
 template <typename T>
-void gridsample_planar_2d(
+void gridsample_channel_first_2d(
     T* output, const T* input, const float* grid_n,
     int64_t IH, int64_t IW, int64_t OH, int64_t OW,
     int64_t in_row_stride, int64_t out_row_stride,
@@ -167,7 +167,7 @@ void gridsample_planar_2d(
 }
 
 template <typename T>
-void gridsample_nearest_planar_2d(
+void gridsample_nearest_channel_first_2d(
     T* output, const T* input, const float* grid_n,
     int64_t IH, int64_t IW, int64_t OH, int64_t OW,
     int64_t in_row_stride, int64_t out_row_stride,
@@ -205,7 +205,7 @@ void gridsample_nearest_planar_2d(
 }
 
 template <typename T>
-void gridsample_planar_3d(
+void gridsample_channel_first_3d(
     T* output, const T* input, const float* grid_n,
     int64_t ID, int64_t IH, int64_t IW,
     int64_t OD, int64_t OH, int64_t OW,
@@ -270,7 +270,7 @@ void gridsample_planar_3d(
 }
 
 template <typename T>
-void gridsample_nearest_planar_3d(
+void gridsample_nearest_channel_first_3d(
     T* output, const T* input, const float* grid_n,
     int64_t ID, int64_t IH, int64_t IW,
     int64_t OD, int64_t OH, int64_t OW,
@@ -320,7 +320,7 @@ void gridsample_nearest_planar_3d(
 }
 
 // ============================================================
-// Channel-last (NHWC/NDHWC): the SIMD lane spans C
+// Channel-last: the SIMD lane spans C
 // ============================================================
 
 template <typename T>

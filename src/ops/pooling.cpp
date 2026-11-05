@@ -1,10 +1,10 @@
 /// @file pooling.cpp
-/// @brief Pooling operator dispatch — planar or channel-last I/O, direct
+/// @brief Pooling operator dispatch — channel-first or channel-last I/O, direct
 ///        pass-through (output layout follows the input's).
 ///
 /// Attribute semantics live in pooling.hpp. What this file adds is auto_pad:
 /// SAME_UPPER / SAME_LOWER / VALID are resolved here into explicit leading
-/// padding, because the kernels only see a resolved pad. Planar input is
+/// padding, because the kernels only see a resolved pad. Channel-first input is
 /// f32/f16; quantized pooling is channel-last only (the lane is the channel).
 
 #include "nnops/ops/pooling.hpp"
@@ -63,7 +63,7 @@ Status Pooling::validate(std::span<const TensorDesc> inputs,
         }
     }
 
-    if (is_planar_spatial(in.layout)) {
+    if (is_channel_first_spatial(in.layout)) {
         return detail::require(
             detail::dtype_in<DataType::f32, DataType::f16>(in.dtype),
             Status::unsupported);

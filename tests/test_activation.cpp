@@ -35,7 +35,7 @@ NNOPS_TEST(activation_relu) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -67,7 +67,7 @@ NNOPS_TEST(activation_leaky_relu) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -98,7 +98,7 @@ NNOPS_TEST(activation_sigmoid) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -128,7 +128,7 @@ NNOPS_TEST(activation_tanh) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -158,7 +158,7 @@ NNOPS_TEST(activation_gelu) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -187,7 +187,7 @@ NNOPS_TEST(activation_silu) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -213,7 +213,7 @@ NNOPS_TEST(activation_random_relu) {
     NNOPS_EXPECT_TRUE(descs[0].dtype == DataType::f32);
 
     std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()));
-    auto out = nnops::test::make_planar(descs[0], out_buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -246,7 +246,7 @@ NNOPS_TEST(activation_random_relu_f16) {
     NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
 
     std::vector<nnops::backend::cpu::half> out_buf(500);
-    auto out = nnops::test::make_planar(descs[0], out_buf.data());
+    auto out = nnops::test::make_channel_first(descs[0], out_buf.data());
 
     const TensorView ins[] = {input};
     op->compute(out, ins);
@@ -357,7 +357,7 @@ static void check_activation_f32(const std::vector<int64_t>& shape,
     auto out_descs = op->getOutputTensorDesc(in_desc);
 
     std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = nnops::test::make_planar(out_descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(out_descs[0], buf.data());
 
     const TensorView ins[] = {input};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -430,7 +430,7 @@ NNOPS_TEST(activation_quick_gelu) {
 // PRelu — the slope is a second input, one per logical channel (dim 1)
 // ============================================================
 
-NNOPS_TEST(activation_prelu_planar) {
+NNOPS_TEST(activation_prelu_channel_first) {
     const int64_t H = 5, W = 7;
     auto [in_vec, input] = test::make_random_tensor({1, 3, H, W}, -4.0f, 4.0f);
     float slope_data[] = {2.0f, 0.5f, -1.0f};
@@ -446,7 +446,7 @@ NNOPS_TEST(activation_prelu_planar) {
     NNOPS_EXPECT_TRUE(out_descs[0].rank == 4 && out_descs[0].dims[1] == 3);
 
     std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = nnops::test::make_planar(out_descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(out_descs[0], buf.data());
 
     const TensorView ins[] = {input, slope};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
@@ -459,14 +459,14 @@ NNOPS_TEST(activation_prelu_planar) {
     }
 }
 
-NNOPS_TEST(activation_prelu_nhwc) {
+NNOPS_TEST(activation_prelu_channel_last) {
     constexpr int64_t N = 2, C = 5, H = 4, W = 6;
-    auto [in_vec, in_planar] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
+    auto [in_vec, in_channel_first] = test::make_random_tensor({N, C, H, W}, -4.0f, 4.0f);
     float slope_data[C];
     for (int64_t c = 0; c < C; ++c) { slope_data[c] = 0.1f * (c + 1); }
 
     auto cl = test::to_channel_last<float>(in_vec, N, C, H * W);
-    // Logical shape stays [N, C, H, W]; the NHWC tag changes only the storage.
+    // Logical shape stays [N, C, H, W]; the channel-last tag changes only the storage.
     const int64_t in_shape[] = {N, C, H, W};
     TensorView input(in_shape, DataType::f32, cl.data(), TensorLayout::NHWC);
 
@@ -510,7 +510,7 @@ NNOPS_TEST(activation_prelu_single_slope) {
     const TensorDesc in_descs[] = {input.desc(), slope.desc()};
     auto out_descs = op->getOutputTensorDesc(in_descs);
     std::vector<float> buf(static_cast<size_t>(out_descs[0].numel()));
-    auto out = nnops::test::make_planar(out_descs[0], buf.data());
+    auto out = nnops::test::make_channel_first(out_descs[0], buf.data());
 
     const TensorView ins[] = {input, slope};
     NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));

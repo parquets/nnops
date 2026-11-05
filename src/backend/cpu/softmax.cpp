@@ -2,16 +2,16 @@
 /// @brief SIMD-optimized CPU implementation of softmax / log-softmax.
 ///
 /// One templated implementation covers f32 and f16 over the two activation
-/// layout families — planar (NCHW/NCDHW) and channel-last (NHWC/NDHWC); the
+/// layout families — channel-first and channel-last; the
 /// operator refuses channel-packed layouts (Softmax::validate). Two dispatch
 /// paths, chosen by where the normalization axis sits in memory:
-///   - The axis is the innermost axis of the storage — planar's last dim, or
+///   - The axis is the innermost axis of the storage — channel-first's last dim, or
 ///     channel-last's C. Every group is then `D` contiguous elements and the
 ///     groups are a constant stride apart, so each one is one
 ///     kernel::softmax_process_standard_row call (horizontal reduction).
 ///   - Every other axis: each group is `D` elements strided by the axis' element
 ///     stride, so kernel::softmax_per_lane runs L groups at a time. Lanes are
-///     the channels of a channel-last tensor, or the dims below a planar axis
+///     the channels of a channel-last tensor, or the dims below a channel-first axis
 ///     when the pitch keeps them contiguous; otherwise one group per lane.
 ///
 /// Pitch-aware via stride_elems() / row_stride_elems(). Patterned on
@@ -52,7 +52,7 @@ namespace quant_kernel = nnops::backend::cpu::aarch64;
 
 namespace {
 
-/// True when the axis is the innermost axis of the storage: planar's last dim
+/// True when the axis is the innermost axis of the storage: channel-first's last dim
 /// and channel-last's C are one contiguous run, and the runs are a constant
 /// stride apart, so the contiguous-row kernel can take the whole axis.
 bool axis_is_innermost(const TensorView& x, int64_t axis, int64_t& unit_stride)
@@ -152,7 +152,7 @@ void softmax_strided_axis(const T* x_ptr, T* y_ptr, const TensorView& X,
     const int64_t axis_stride = X.stride_elems(axis);
 
     // Lanes: the channels of a channel-last tensor are one vector, and so are
-    // the dims below a planar axis when the pitch leaves them contiguous.
+    // the dims below a channel-first axis when the pitch leaves them contiguous.
     const bool channel_last = is_channel_last(X.layout()) && rank > 1;
     const bool lanes_are_channels = channel_last && axis != 1;
     int64_t nlanes = 1;
@@ -255,7 +255,7 @@ void softmax_impl(const SoftmaxAttributes& attrs,
 //
 // Dequantize to contiguous f32 scratch (arch quant.hpp per-row kernels), run f32
 // softmax on it, then write back f32 or f16 (probabilities are never
-// re-quantized). PerTensor / PerToken only, planar layouts only.
+// re-quantized). PerTensor / PerToken only, channel-first layouts only.
 
 Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
                                 TensorView& output,
@@ -273,8 +273,8 @@ Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(is_quantized_dtype(in_dtype));
     NNOPS_ASSERT(out_dtype == DataType::f32 || out_dtype == DataType::f16);
 
-    // Quantized softmax is only defined over planar layouts (Softmax::validate).
-    NNOPS_ASSERT(is_planar_spatial(X.layout()));
+    // Quantized softmax is only defined over channel-first layouts (Softmax::validate).
+    NNOPS_ASSERT(is_channel_first_spatial(X.layout()));
     if (workspace == nullptr) { return Status::out_of_memory; }
 
     const QuantParams& qp = X.quant_params();

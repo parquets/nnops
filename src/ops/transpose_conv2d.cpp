@@ -27,7 +27,7 @@ Status TransposeConv2D::validate(std::span<const TensorDesc> inputs,
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOrChannelLast));
+        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast));
 }
 
 Status TransposeConv2D::compute(std::span<TensorView> outputs,

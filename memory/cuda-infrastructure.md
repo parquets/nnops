@@ -144,7 +144,7 @@ Activation and Unary kernels use `row_stride_elems()` for pitch-aware memory acc
 | 5 | BatchNorm | [batch_norm.cu](src/backend/cuda/batch_norm.cu) | 211 | Inference-only, spatial/non-spatial modes, fused params |
 | 6 | Pooling | [pooling.cu](src/backend/cuda/pooling.cu) | 257 | Unified 2D/3D, switch-based dispatch, 4 pool types |
 | 7 | CumSum | [cumsum.cu](src/backend/cuda/cumsum.cu) | 161 | Sequential per-thread scan, upper/lower dimension decomposition |
-| 8 | DepthwiseConv2D | [depthwise_conv2d.cu](src/backend/cuda/depthwise_conv2d.cu) | 225 | Per-channel NCHW, epilogue fusion (8 activation types), stride/dilation/padding |
+| 8 | DepthwiseConv2D | [depthwise_conv2d.cu](src/backend/cuda/depthwise_conv2d.cu) | 225 | Per-channel channel-first, epilogue fusion (8 activation types), stride/dilation/padding |
 | 9 | Eltwise | [eltwise.cu](src/backend/cuda/eltwise.cu) | 134 | Flat grid-stride, switch-based, 4 ops (Add/Sub/Mul/Div) |
 | 10 | Unary | [unary.cu](src/backend/cuda/unary.cu) | 183 | Device fn pointer dispatch, flat/row kernels, 9 ops |
 

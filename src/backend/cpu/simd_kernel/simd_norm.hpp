@@ -11,7 +11,7 @@
 ///    (norm_apply_row, L2/RMS/Layer; scale/bias broadcast or per-element).
 ///  - BatchNorm's fused fmadd, one ns*x + nb per block with ns/nb pre-folding
 ///    scale/bias/mean/var (the non-spatial kernel folds them itself), written
-///    per storage: packed C8, planar, or per-element block.
+///    per storage: packed C8, channel-first, or per-element block.
 ///
 /// Every writer goes through v_store_add/s_store_add, so a residual `add_to`
 /// costs no extra pass.
@@ -111,9 +111,9 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
     }
 }
 
-/// Planar layout: 4-wide unrolled SIMD fmadd per row.
+/// Channel-first layout: 4-wide unrolled SIMD fmadd per row.
 template <typename T>
-inline void batch_norm_process_planar_row(
+inline void batch_norm_process_channel_first_row(
     const T* x_row, T* y_row,
     int64_t last_dim,
     float ns, float nb, bool add_to)

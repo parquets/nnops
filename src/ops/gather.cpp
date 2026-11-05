@@ -34,8 +34,8 @@ Status check_gather_dtypes(const TensorDesc& data, const TensorDesc& indices)
 Status check_gather_layouts(const TensorDesc& data, const TensorDesc& indices)
 {
     return detail::require(
-        is_layout_supported(data.layout, LayoutSupport::PlanarOnly) &&
-        is_layout_supported(indices.layout, LayoutSupport::PlanarOnly));
+        is_layout_supported(data.layout, LayoutSupport::ChannelFirstOnly) &&
+        is_layout_supported(indices.layout, LayoutSupport::ChannelFirstOnly));
 }
 
 }  // anonymous namespace

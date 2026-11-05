@@ -98,7 +98,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/matmul/linear.cpp
 
     # CPU convolution kernels: the implicit-GEMM route (both layouts — planar
-    # NCHW and channel-last NHWC, fp and quantized, one file since they share a
+    # Channel-first and channel-last, fp and quantized, one file since they share a
     # plan, a scratch layout and a driver), the Winograd F(2x2,3x3) route, the
     # depthwise kernel and pooling (which sweeps the same windows the two above
     # do, and shares their channel-lane / width-lane split).

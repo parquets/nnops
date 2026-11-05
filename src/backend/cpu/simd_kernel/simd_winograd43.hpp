@@ -28,10 +28,10 @@
 ///
 /// Both layouts are here, as in simd_winograd.hpp. Channel-last puts the
 /// *channel* axis in the vector lanes — a window is 36 channel-vector loads and
-/// an output tile 16 stores, no deinterleave at all. Planar puts the *tile* axis
+/// an output tile 16 stores, no deinterleave at all. Channel-first puts the *tile* axis
 /// there, eight tiles to a vector, which costs a stride-4 gather that the
 /// portable SIMD layer does not have and works around by deinterleaving twice
-/// (see the planar section below).
+/// (see the channel-first section below).
 
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/core/epilogue.hpp"
@@ -103,12 +103,12 @@ inline void wino43_bt(v_f32x8 d[6]) noexcept {
 }
 
 // =========================================================================
-//  Channel-last (NHWC) transforms — the channel axis is the vector lane
+//  Channel-last transforms — the channel axis is the vector lane
 // =========================================================================
 
 /// Transform one 6×6 input window into V = Bᵀ d B, one channel vector at a time.
 template <class T>
-inline void winograd43_input_nhwc(const T* in_plane, int64_t in_row, int64_t ic_stride,
+inline void winograd43_input_channel_last(const T* in_plane, int64_t in_row, int64_t ic_stride,
                                   int ih0, int iw0, int IH, int IW,
                                   T* v, int64_t v_plane, int lanes) noexcept {
     // E = d B in an f32 stack buffer: 36 live vectors would spill every register
@@ -157,7 +157,7 @@ inline void wino43_at(v_f32x8 m[6]) noexcept {
 /// Transform one tile's 36 M planes into its 4×4 outputs, one channel vector at
 /// a time; a nullptr destination skips that pixel (past OW/OH on a short extent).
 template <class T>
-inline void winograd43_output_nhwc(const T* m, int64_t m_plane,
+inline void winograd43_output_channel_last(const T* m, int64_t m_plane,
                                    T* const p[4][4],
                                    const Epilogue& ep, const T* bias, bool add_to,
                                    int lanes) noexcept {
@@ -187,7 +187,7 @@ inline void winograd43_output_nhwc(const T* m, int64_t m_plane,
 }
 
 // =========================================================================
-//  Planar (NCHW) transforms — the tile axis is the vector lane
+//  Channel-first transforms — the tile axis is the vector lane
 // =========================================================================
 //
 // Eight horizontally adjacent tiles sit four columns apart, and the portable

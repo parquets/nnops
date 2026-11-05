@@ -1,10 +1,10 @@
 /// @file depthwise_conv_cuda.cu
-/// @brief CUDA implementation of 2D/3D depthwise convolution on a planar
-///        (NCHW/NCDHW) or a channel-last (NHWC/NDHWC) tensor.
+/// @brief CUDA implementation of 2D/3D depthwise convolution on a channel-first
+///        (channel-first) or a channel-last tensor.
 ///
 /// Spatial rank comes from the input rank (4 -> 2D, 5 -> 3D).
 ///
-/// Planar lanes the output width — the contiguous axis there — with one thread
+/// Channel-first lanes the output width — the contiguous axis there — with one thread
 /// per output position of one (n, c) plane and a block per plane.
 ///
 /// Channel-last lands the channel axis in memory instead, so the lane moves to
@@ -66,7 +66,7 @@ __device__ inline float device_apply_epilogue(
 }
 
 // ============================================================
-// Planar — one thread per output position, a block per (n, c) plane
+// Channel-first — one thread per output position, a block per (n, c) plane
 // ============================================================
 
 template <typename T>
@@ -300,7 +300,7 @@ __global__ void depthwise_conv_last_kernel(
 }
 
 // ============================================================
-// Host-side launchers — planar
+// Host-side launchers — channel-first
 // ============================================================
 
 template <typename T>

@@ -11,13 +11,13 @@
 ///  - block-packed dtypes (q4_1) have no per-element size — data_type_size()
 ///    is 0 and strides step in 20-byte blocks — so every row/stride computation
 ///    goes through data_type_row_bytes() / data_type_stride_unit();
-///  - channel-last (NHWC/NDHWC) keeps C inside the row, so a row is one
+///  - channel-last keeps C inside the row, so a row is one
 ///    spatial line: W pixels × C channels.
 ///
 /// TensorDesc::row_pitch() aligns rows to 32 bytes by default; a TensorView
 /// built with an explicit pitch accepts any value >= the minimum.
-///   NCHW uint8,  W=70:  pitch = 96  (70 rounded up to a multiple of 32)
-///   NHWC uint8, W*C=56: pitch = 64  (56 rounded up to a multiple of 32)
+///   Channel-first uint8,  W=70:  pitch = 96  (70 rounded up to a multiple of 32)
+///   Channel-last uint8, W*C=56: pitch = 64  (56 rounded up to a multiple of 32)
 
 #include "nnops/core/data_type.hpp"
 #include "nnops/core/tensor_layout.hpp"
@@ -282,7 +282,7 @@ public:
 
     // ---- Layout-aware accessors ----
 
-    /// Channels per contiguously-stored block: planar keeps each channel as
+    /// Channels per contiguously-stored block: channel-first keeps each channel as
     /// its own block (C), channel-last packs all of C into every pixel (1
     /// channel block per spatial position).
     int64_t num_channel_blocks() const noexcept {

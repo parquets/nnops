@@ -1,12 +1,12 @@
 #pragma once
 /// @file channel_last.hpp
-/// @brief NCHW ↔ NHWC and OIHW ↔ HWIO bridges for the channel-last Conv2D
-///        tests and benchmarks.
+/// @brief Channel-first ↔ channel-last and OIHW ↔ HWIO bridges for the
+///        channel-last Conv2D tests and benchmarks.
 ///
 /// The channel-last routes take their activations stored [N][H][W][C] and their
 /// weights stored [KH][KW][IC/G][OC] — TensorFlow's filter order, referred to
 /// here as HWIO (TensorLayout::HWIO) — while every reference implementation in
-/// this directory reads the planar orders. The tests therefore keep one copy in
+/// this directory reads the channel-first orders. The tests therefore keep one copy in
 /// each order and move between them with these helpers; the benches use them to
 /// prepare the inputs once, outside the timed region.
 ///
@@ -18,9 +18,9 @@
 
 namespace nnops::test {
 
-/// NCHW [N][C][H][W] → NHWC [N][H][W][C].
+/// Channel-first [N][C][H][W] → channel-last [N][H][W][C].
 template <class T>
-std::vector<T> nchw_to_nhwc(std::span<const T> src,
+std::vector<T> channel_first_to_channel_last(std::span<const T> src,
                             int64_t N, int64_t C, int64_t H, int64_t W)
 {
     std::vector<T> dst(src.size());
@@ -35,9 +35,9 @@ std::vector<T> nchw_to_nhwc(std::span<const T> src,
     return dst;
 }
 
-/// NHWC [N][H][W][C] → NCHW [N][C][H][W].
+/// Channel-last [N][H][W][C] → channel-first [N][C][H][W].
 template <class T>
-std::vector<T> nhwc_to_nchw(std::span<const T> src,
+std::vector<T> channel_last_to_channel_first(std::span<const T> src,
                             int64_t N, int64_t C, int64_t H, int64_t W)
 {
     std::vector<T> dst(src.size());
@@ -53,7 +53,7 @@ std::vector<T> nhwc_to_nchw(std::span<const T> src,
 }
 
 /// [N][C][S] → [N][S][C] over a flat spatial extent @p S; the 2D and 3D
-/// channel-last layouts alike, since only the element order matters.
+/// Channel-last layouts alike, since only the element order matters.
 template <class T>
 std::vector<T> to_channel_last(std::span<const T> src,
                                int64_t N, int64_t C, int64_t S)

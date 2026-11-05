@@ -1,9 +1,9 @@
 /// @file grid_sample.cpp
-/// @brief CPU implementation of 2D/3D grid sampling, planar and channel-last.
+/// @brief CPU implementation of 2D/3D grid sampling, channel-first and channel-last.
 ///
-/// The image tensor is NCHW/NCDHW or NHWC/NDHWC; the grid is always dense f32
+/// The image tensor is channel-first or channel-last; the grid is always dense f32
 /// ([N, (OD,) OH, OW, 2|3]), because its last axis is a coordinate pair/triple,
-/// not a channel. Planar dispatches one task per (n, c) and samples one channel
+/// not a channel. Channel-first dispatches one task per (n, c) and samples one channel
 /// plane per task; channel-last dispatches one task per n and keeps the SIMD
 /// lane on C, so a pixel interpolates all its channels at once. The grid
 /// coordinate is per output position, so zeros padding is all-or-nothing across
@@ -119,13 +119,13 @@ void grid_sample_impl(const GridSampleAttributes& attrs,
 
         if (srank == 3) {
             if (nearest) {
-                k::gridsample_nearest_planar_3d<T>(
+                k::gridsample_nearest_channel_first_3d<T>(
                     out_base, in_base, grid_n,
                     ID, IH, IW, OD, OH, OW,
                     in_d_stride, in_row_stride, out_d_stride, out_row_stride,
                     grid_row_stride, align, padding_mode, add_to);
             } else {
-                k::gridsample_planar_3d<T>(
+                k::gridsample_channel_first_3d<T>(
                     out_base, in_base, grid_n,
                     ID, IH, IW, OD, OH, OW,
                     in_d_stride, in_row_stride, out_d_stride, out_row_stride,
@@ -133,13 +133,13 @@ void grid_sample_impl(const GridSampleAttributes& attrs,
             }
         } else {
             if (nearest) {
-                k::gridsample_nearest_planar_2d<T>(
+                k::gridsample_nearest_channel_first_2d<T>(
                     out_base, in_base, grid_n,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,
                     grid_row_stride, align, padding_mode, add_to);
             } else {
-                k::gridsample_planar_2d<T>(
+                k::gridsample_channel_first_2d<T>(
                     out_base, in_base, grid_n,
                     IH, IW, OH, OW,
                     in_row_stride, out_row_stride,

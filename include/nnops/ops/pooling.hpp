@@ -1,11 +1,11 @@
 #pragma once
 /// @file pooling.hpp
-/// @brief Pooling operator — 2D/3D spatial pooling, planar (NCHW/NCDHW) or
-///        channel-last (NHWC/NDHWC).
+/// @brief Pooling operator — 2D/3D spatial pooling, channel-first or
+///        channel-last.
 ///
-/// The output's layout follows the input's. Planar input supports f32/f16;
+/// The output's layout follows the input's. Channel-first input supports f32/f16;
 /// quantized (s8/u8) pooling is channel-last only — its kernel lanes the
-/// channel, where a planar plane lanes output width. Per-axis arrays
+/// channel, where a channel-first plane lanes output width. Per-axis arrays
 /// are [D, H, W]; a rank-4 (2D) input reads only the H/W entries, a rank-5
 /// (3D) input all three.
 

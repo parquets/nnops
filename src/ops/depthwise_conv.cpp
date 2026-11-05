@@ -1,11 +1,11 @@
 /// @file depthwise_conv.cpp
 /// @brief DepthwiseConv operator dispatch — descriptor checks and backend binding.
 ///
-/// Both routes read the raw filter: planar (NCHW/NCDHW) the [C, 1, (KD,) KH, KW]
-/// form with a [C] bias, channel-last (NHWC/NDHWC) the HWCM [KH][KW][C] form, whose
+/// Both routes read the raw filter: channel-first the [C, 1, (KD,) KH, KW]
+/// form with a [C] bias, channel-last the HWCM [KH][KW][C] form, whose
 /// every tap is a contiguous run of C channels — the pattern the channel-lane
 /// kernel already reads a vector at a time, so no prepack is involved either way.
-/// The channel lane also covers the quantized s8/u8 pairs; the planar route is
+/// The channel lane also covers the quantized s8/u8 pairs; the channel-first route is
 /// f32/f16 only. Spatial rank follows the input rank (4→2D, 5→3D).
 
 #include "nnops/ops/depthwise_conv.hpp"
@@ -38,7 +38,7 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     const auto& in = inputs[0];
     if (is_channel_last(in.layout)) {
-        // The channel lane loads a tap's channels as one vector, which the planar
+        // The channel lane loads a tap's channels as one vector, which the channel-first
         // [C, 1, KH, KW] cannot give it (a tap's channels are C elements apart).
         if (inputs[1].layout != TensorLayout::HWCM) {
             return Status::unsupported;
@@ -47,14 +47,14 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
             detail::dtype_in<DataType::f32, DataType::f16,
                              DataType::s8, DataType::u8>(in.dtype));
     }
-    // Planar reads the raw [C, 1, KH, KW] filter one channel plane at a time,
+    // Channel-first reads the raw [C, 1, KH, KW] filter one channel plane at a time,
     // f32/f16 only.
-    if (!is_planar_spatial(in.layout)) {
+    if (!is_channel_first_spatial(in.layout)) {
         return Status::unsupported;
     }
     return detail::require(
         detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
-            is_planar_spatial(inputs[1].layout),
+            is_channel_first_spatial(inputs[1].layout),
         Status::unsupported);
 }
 

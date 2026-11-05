@@ -1,12 +1,12 @@
-/// @file bench_conv2d_nhwc.cpp
-/// @brief Channel-last vs planar Conv2D on the same layer — an interleaved A/B.
+/// @file bench_conv2d_channel_last.cpp
+/// @brief Channel-last vs channel-first Conv2D on the same layer — an interleaved A/B.
 ///
-/// One row per layer. `nchw` is the planar route (NCHW activations, OIHW weight,
-/// im2col + GEMM) and `nhwc` is the channel-last one (NHWC activations, HWIO
-/// weight, pixel tiles straight out of the row). Both run on identical values,
-/// converted once outside the timed region, so what a row shows is the data
-/// layout and everything it decides: the gather's access pattern, whether a 1x1
-/// needs an im2col buffer at all, and how a pixel tile fills the GEMM.
+/// One row per layer. `channel_first` is the channel-first route (OIHW weight,
+/// im2col + GEMM) and `channel_last` the channel-last one (HWIO weight, pixel
+/// tiles straight out of the row). Both run on identical values, converted once
+/// outside the timed region, so what a row shows is the data layout and
+/// everything it decides: the gather's access pattern, whether a 1x1 needs an
+/// im2col buffer at all, and how a pixel tile fills the GEMM.
 ///
 /// measure_ab is the interleaved A/B the rest of the benches use: within a round
 /// the two arms alternate, the second run of A is the null control, and a
@@ -214,8 +214,8 @@ constexpr DataType dtype_of() {
 /// One table row: the same layer through each layout's entry point.
 struct AbLayer {
     virtual ~AbLayer() = default;
-    virtual void run_nchw(const ComputeContext&) = 0;
-    virtual void run_nhwc(const ComputeContext&) = 0;
+    virtual void run_channel_first(const ComputeContext&) = 0;
+    virtual void run_channel_last(const ComputeContext&) = 0;
     double work = 0.0;   ///< 2 * MACs, for the GFLOPS column
 };
 
@@ -243,20 +243,20 @@ struct AbFp : AbLayer {
         const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
         const auto w32  = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
         bias     = random_vec<T>(std::span<const int64_t>(bsh, 1), 3);
-        in_planar = in32;
-        w_planar  = w32;
-        in_cl     = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+        in_channel_first_buf = in32;
+        w_channel_first_buf  = w32;
+        in_cl     = test::channel_first_to_channel_last<T>(std::span<const T>(in32.data(), in32.size()),
                                           c.N, c.IC, c.IH, c.IW);
         w_cl      = test::oihw_to_hwio<T>(std::span<const T>(w32.data(), w32.size()),
                                           c.OC, icg, c.KH, c.KW);
 
-        in_nchw = TensorView(std::span<const int64_t>(ish, 4), dt, in_planar.data(),
+        in_channel_first = TensorView(std::span<const int64_t>(ish, 4), dt, in_channel_first_buf.data(),
                              TensorLayout::NCHW);
-        w_nchw  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_planar.data(),
+        w_channel_first  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_channel_first_buf.data(),
                              TensorLayout::NCHW);
-        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
+        in_channel_last = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
                              TensorLayout::NHWC);
-        w_nhwc  = TensorView(std::span<const int64_t>(wsh_cl, 4), dt, w_cl.data(),
+        w_channel_last  = TensorView(std::span<const int64_t>(wsh_cl, 4), dt, w_cl.data(),
                              TensorLayout::HWIO);
         b_v     = TensorView(std::span<const int64_t>(bsh, 1), dt, bias.data());
 
@@ -267,36 +267,36 @@ struct AbFp : AbLayer {
         attrs.groups = c.groups;
         op = Conv2D::create(attrs, Backend::CPU);
 
-        const TensorDesc d0[] = {in_nchw.desc(), w_nchw.desc()};
+        const TensorDesc d0[] = {in_channel_first.desc(), w_channel_first.desc()};
         const auto od = op->getOutputTensorDesc(d0);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
-        out_nchw_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_nchw = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
-                              out_nchw_buf.data(), TensorLayout::NCHW);
-        out_nhwc = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
-                              out_nhwc_buf.data(), TensorLayout::NHWC);
+        out_channel_first_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_channel_last_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_channel_first = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_channel_first_buf.data(), TensorLayout::NCHW);
+        out_channel_last = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_channel_last_buf.data(), TensorLayout::NHWC);
     }
 
-    void run_nchw(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_nchw, w_nchw, b_v};
-        op->compute(std::span<TensorView>(&out_nchw, 1), ins, ctx, nullptr);
+    void run_channel_first(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_channel_first, w_channel_first, b_v};
+        op->compute(std::span<TensorView>(&out_channel_first, 1), ins, ctx, nullptr);
     }
-    void run_nhwc(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
-        op->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
+    void run_channel_last(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_channel_last, w_channel_last, b_v};
+        op->compute(std::span<TensorView>(&out_channel_last, 1), ins, ctx, nullptr);
     }
 
     Shape s;
     int64_t icg = 1, OH = 0, OW = 0;
     std::unique_ptr<Conv2D> op;
-    std::vector<T> in_planar, w_planar, in_cl, w_cl, bias;
-    std::vector<T> out_nchw_buf, out_nhwc_buf;
-    TensorView in_nchw, w_nchw, in_nhwc, w_nhwc, b_v;
-    TensorView out_nchw, out_nhwc;
+    std::vector<T> in_channel_first_buf, w_channel_first_buf, in_cl, w_cl, bias;
+    std::vector<T> out_channel_first_buf, out_channel_last_buf;
+    TensorView in_channel_first, w_channel_first, in_channel_last, w_channel_last, b_v;
+    TensorView out_channel_first, out_channel_last;
 };
 
 // ============================================================
@@ -316,20 +316,20 @@ struct AbDw : AbLayer {
         const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
         const auto w32  = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
         bias = random_vec<T>(std::span<const int64_t>(bsh, 1), 3);
-        in_planar = in32;
-        in_cl     = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+        in_channel_first_buf = in32;
+        in_cl     = test::channel_first_to_channel_last<T>(std::span<const T>(in32.data(), in32.size()),
                                           c.N, C, c.IH, c.IW);
-        w_planar  = w32;
+        w_channel_first_buf  = w32;
         w_hwcm    = test::depthwise_to_hwcm<T>(std::span<const T>(w32.data(), w32.size()),
                                                C, c.KH * c.KW);
 
-        in_nchw = TensorView(std::span<const int64_t>(ish, 4), dt, in_planar.data(),
+        in_channel_first = TensorView(std::span<const int64_t>(ish, 4), dt, in_channel_first_buf.data(),
                              TensorLayout::NCHW);
-        w_nchw  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_planar.data(),
+        w_channel_first  = TensorView(std::span<const int64_t>(wsh, 4), dt, w_channel_first_buf.data(),
                              TensorLayout::NCHW);
-        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
+        in_channel_last = TensorView(std::span<const int64_t>(ish, 4), dt, in_cl.data(),
                              TensorLayout::NHWC);
-        w_nhwc  = TensorView(std::span<const int64_t>(wsh_cl, 4), dt, w_hwcm.data(),
+        w_channel_last  = TensorView(std::span<const int64_t>(wsh_cl, 4), dt, w_hwcm.data(),
                              TensorLayout::HWCM);
         b_v     = TensorView(std::span<const int64_t>(bsh, 1), dt, bias.data());
 
@@ -338,39 +338,39 @@ struct AbDw : AbLayer {
         attrs.stride      = {1, c.SH, c.SW};
         attrs.dilation    = {1, 1, 1};
         attrs.padding     = {0, c.PH, c.PW};
-        op_nchw = DepthwiseConv::create(attrs, Backend::CPU);
-        op_nhwc = DepthwiseConv::create(attrs, Backend::CPU);
+        op_channel_first = DepthwiseConv::create(attrs, Backend::CPU);
+        op_channel_last = DepthwiseConv::create(attrs, Backend::CPU);
 
-        const TensorDesc d0[] = {in_nchw.desc(), w_nchw.desc(), b_v.desc()};
-        const auto od = op_nchw->getOutputTensorDesc(d0);
+        const TensorDesc d0[] = {in_channel_first.desc(), w_channel_first.desc(), b_v.desc()};
+        const auto od = op_channel_first->getOutputTensorDesc(d0);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
         work = 2.0 * static_cast<double>(c.N) * C * OH * OW * c.KH * c.KW;
 
-        out_nchw_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_nchw = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
-                              out_nchw_buf.data(), TensorLayout::NCHW);
-        out_nhwc = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
-                              out_nhwc_buf.data(), TensorLayout::NHWC);
+        out_channel_first_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_channel_last_buf.assign(static_cast<size_t>(od[0].numel()), T{});
+        out_channel_first = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_channel_first_buf.data(), TensorLayout::NCHW);
+        out_channel_last = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), dt,
+                              out_channel_last_buf.data(), TensorLayout::NHWC);
     }
 
-    void run_nchw(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_nchw, w_nchw, b_v};
-        op_nchw->compute(std::span<TensorView>(&out_nchw, 1), ins, ctx, nullptr);
+    void run_channel_first(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_channel_first, w_channel_first, b_v};
+        op_channel_first->compute(std::span<TensorView>(&out_channel_first, 1), ins, ctx, nullptr);
     }
-    void run_nhwc(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
-        op_nhwc->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
+    void run_channel_last(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_channel_last, w_channel_last, b_v};
+        op_channel_last->compute(std::span<TensorView>(&out_channel_last, 1), ins, ctx, nullptr);
     }
 
     Shape s;
     int64_t OH = 0, OW = 0;
-    std::unique_ptr<DepthwiseConv> op_nchw, op_nhwc;
-    std::vector<T> in_planar, w_planar, in_cl, w_hwcm, bias;
-    std::vector<T> out_nchw_buf, out_nhwc_buf;
-    TensorView in_nchw, w_nchw, in_nhwc, w_nhwc, b_v;
-    TensorView out_nchw, out_nhwc;
+    std::unique_ptr<DepthwiseConv> op_channel_first, op_channel_last;
+    std::vector<T> in_channel_first_buf, w_channel_first_buf, in_cl, w_hwcm, bias;
+    std::vector<T> out_channel_first_buf, out_channel_last_buf;
+    TensorView in_channel_first, w_channel_first, in_channel_last, w_channel_last, b_v;
+    TensorView out_channel_first, out_channel_last;
 };
 
 // ============================================================
@@ -388,15 +388,15 @@ struct AbI8 : AbLayer {
         const int32_t zp_x = 128;
 
         const int64_t act_n = c.N * c.IC * c.IH * c.IW;
-        act_planar.resize(static_cast<size_t>(act_n));
+        act_channel_first.resize(static_cast<size_t>(act_n));
         {
             test::XorShift128 rng(11);
-            for (auto& v : act_planar) {
+            for (auto& v : act_channel_first) {
                 v = static_cast<uint8_t>(quant_u8(rng.next_float(-1.0f, 1.0f), s_x, zp_x));
             }
         }
-        act_cl = test::nchw_to_nhwc<uint8_t>(
-            std::span<const uint8_t>(act_planar.data(), act_planar.size()),
+        act_cl = test::channel_first_to_channel_last<uint8_t>(
+            std::span<const uint8_t>(act_channel_first.data(), act_channel_first.size()),
             c.N, c.IC, c.IH, c.IW);
 
         w_oihw.resize(static_cast<size_t>(c.OC * icg * c.KH * c.KW));
@@ -437,28 +437,28 @@ struct AbI8 : AbLayer {
         qw.zero_point_data = w_zp.data();
         qw.num_scales = c.OC;
 
-        in_nchw = TensorView(std::span<const int64_t>(ish, 4), DataType::u8,
-                             act_planar.data(), TensorLayout::NCHW, qa);
-        w_nchw  = TensorView(std::span<const int64_t>(wsh, 4), DataType::s8,
+        in_channel_first = TensorView(std::span<const int64_t>(ish, 4), DataType::u8,
+                             act_channel_first.data(), TensorLayout::NCHW, qa);
+        w_channel_first  = TensorView(std::span<const int64_t>(wsh, 4), DataType::s8,
                              w_oihw.data(), TensorLayout::NCHW, qw);
-        in_nhwc = TensorView(std::span<const int64_t>(ish, 4), DataType::u8,
+        in_channel_last = TensorView(std::span<const int64_t>(ish, 4), DataType::u8,
                              act_cl.data(), TensorLayout::NHWC, qa);
-        w_nhwc  = TensorView(std::span<const int64_t>(wsh_cl, 4), DataType::s8,
+        w_channel_last  = TensorView(std::span<const int64_t>(wsh_cl, 4), DataType::s8,
                              w_hwio.data(), TensorLayout::HWIO, qw);
         b_v     = TensorView(std::span<const int64_t>(bsh, 1), DataType::f32, bias.data());
 
-        const TensorDesc d0[] = {in_nchw.desc(), w_nchw.desc(), b_v.desc()};
+        const TensorDesc d0[] = {in_channel_first.desc(), w_channel_first.desc(), b_v.desc()};
         const auto od = op->getOutputTensorDesc(d0);
         OH = od[0].dims[2];
         OW = od[0].dims[3];
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
-        out_nchw_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
-        out_nhwc_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
-        out_nchw = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), DataType::f32,
-                              out_nchw_buf.data(), TensorLayout::NCHW);
-        out_nhwc = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), DataType::f32,
-                              out_nhwc_buf.data(), TensorLayout::NHWC);
+        out_channel_first_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
+        out_channel_last_buf.assign(static_cast<size_t>(od[0].numel()), 0.0f);
+        out_channel_first = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), DataType::f32,
+                              out_channel_first_buf.data(), TensorLayout::NCHW);
+        out_channel_last = TensorView(std::span<const int64_t>(od[0].dims.data(), 4), DataType::f32,
+                              out_channel_last_buf.data(), TensorLayout::NHWC);
     }
 
     static int32_t quant_u8(float x, float inv, int32_t zp) {
@@ -471,32 +471,32 @@ struct AbI8 : AbLayer {
         return std::min(std::max(q, -128), 127);
     }
 
-    void run_nchw(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_nchw, w_nchw, b_v};
-        op->compute(std::span<TensorView>(&out_nchw, 1), ins, ctx, nullptr);
+    void run_channel_first(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_channel_first, w_channel_first, b_v};
+        op->compute(std::span<TensorView>(&out_channel_first, 1), ins, ctx, nullptr);
     }
-    void run_nhwc(const ComputeContext& ctx) override {
-        const TensorView ins[] = {in_nhwc, w_nhwc, b_v};
-        op->compute(std::span<TensorView>(&out_nhwc, 1), ins, ctx, nullptr);
+    void run_channel_last(const ComputeContext& ctx) override {
+        const TensorView ins[] = {in_channel_last, w_channel_last, b_v};
+        op->compute(std::span<TensorView>(&out_channel_last, 1), ins, ctx, nullptr);
     }
 
     Shape s;
     int64_t icg = 1, OH = 0, OW = 0;
     std::unique_ptr<Conv2D> op;
-    std::vector<uint8_t> act_planar, act_cl;
+    std::vector<uint8_t> act_channel_first, act_cl;
     std::vector<int8_t> w_oihw, w_hwio;
     std::vector<float> w_s, bias;
     std::vector<int32_t> w_zp;
-    std::vector<float> out_nchw_buf, out_nhwc_buf;
-    TensorView in_nchw, w_nchw, in_nhwc, w_nhwc, b_v;
-    TensorView out_nchw, out_nhwc;
+    std::vector<float> out_channel_first_buf, out_channel_last_buf;
+    TensorView in_channel_first, w_channel_first, in_channel_last, w_channel_last, b_v;
+    TensorView out_channel_first, out_channel_last;
 };
 
 // ============================================================
 // The tables
 // ============================================================
 
-/// Every layer at every thread count, planar vs channel-last. @p make_dw builds
+/// Every layer at every thread count, channel-first vs channel-last. @p make_dw builds
 /// the depthwise rows; nullptr means this table has no arm for them.
 template <class MakeOp, class MakeDw>
 void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
@@ -505,23 +505,23 @@ void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
     for (int nt : bench_threads()) {
         std::printf("  %d thread%s\n", nt, nt == 1 ? "" : "s");
         std::printf("    %-34s %8s %8s | %8s %8s | %s | %s\n",
-                    "layer", "nchw ms", "GFLOPS", "nhwc ms", "GFLOPS",
-                    "nhwc time", "verdict");
+                    "layer", "channel_first ms", "GFLOPS", "channel_last ms", "GFLOPS",
+                    "channel_last time", "verdict");
         int wins = 0, losses = 0, ties = 0;
-        double tot_planar = 0.0, tot_cl = 0.0;
+        double tot_channel_first = 0.0, tot_cl = 0.0;
         for (const auto& c : sweep()) {
             std::unique_ptr<AbLayer> op = c.dw ? make_dw(c) : make_op(c);
             if (!op) { continue; }   // this table has no arm for the row
             const AbResult r = measure_ab(nt,
-                [&](const ComputeContext& x) { op->run_nchw(x); },
-                [&](const ComputeContext& x) { op->run_nhwc(x); },
+                [&](const ComputeContext& x) { op->run_channel_first(x); },
+                [&](const ComputeContext& x) { op->run_channel_last(x); },
                 iters, rounds);
-            const double ratio = r.b_ms / r.a_ms;   // channel-last / planar time
+            const double ratio = r.b_ms / r.a_ms;   // Channel-last / channel-first time
             const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
             const char* verdict = !real ? "tie (noise)"
-                                : (ratio < 1.0 ? "nhwc wins" : "nchw wins");
+                                : (ratio < 1.0 ? "channel_last wins" : "channel_first wins");
             if (!real) { ++ties; } else if (ratio < 1.0) { ++wins; } else { ++losses; }
-            tot_planar += r.a_ms;
+            tot_channel_first += r.a_ms;
             tot_cl += r.b_ms;
             std::printf("    %-34s %8.3f %8.1f | %8.3f %8.1f | %8.2fx | %s\n",
                         c.name, r.a_ms, op->work / r.a_ms / 1e6,
@@ -529,8 +529,8 @@ void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
         }
         std::printf("    %-34s %8.3f %8s | %8.3f %8s | %8.2fx | "
                     "%d win, %d lose, %d tie\n",
-                    "sum of the layers", tot_planar, "", tot_cl, "",
-                    tot_cl / tot_planar, wins, losses, ties);
+                    "sum of the layers", tot_channel_first, "", tot_cl, "",
+                    tot_cl / tot_channel_first, wins, losses, ties);
     }
 }
 
@@ -539,7 +539,7 @@ void run_table(const char* title, MakeOp make_op, MakeDw make_dw) {
 // ============================================================
 //
 // A = implicit GEMM on the raw HWIO filter, B = Winograd with U prepacked; both
-// write the same NHWC output, so the row is purely the algorithm.
+// write the same channel-last output, so the row is purely the algorithm.
 
 /// k3s1 shapes from 224 down to 7x7 — how far the Winograd policy should reach.
 const std::vector<Shape>& wino_sweep() {
@@ -581,7 +581,7 @@ struct AbWino {
         // Same values on both routes, converted once outside every timer.
         const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
         const auto w32  = random_vec<T>(std::span<const int64_t>(wsh, 4), 2);
-        in_cl = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+        in_cl = test::channel_first_to_channel_last<T>(std::span<const T>(in32.data(), in32.size()),
                                       c.N, c.IC, c.IH, c.IW);
         w_hwio = w32;   // already [KH][KW][IC][OC]
 
@@ -611,7 +611,7 @@ struct AbWino {
         work_im = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * c.IC * 9.0;
 
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_v = test::make_planar(out_desc, out_buf.data());
+        out_v = test::make_channel_first(out_desc, out_buf.data());
 
         // Prepack U (query -> allocate -> pack), once and outside every timer.
         // The activation rides along so an unpinned order can weigh the plane.
@@ -757,7 +757,7 @@ struct AbPacked {
 
         const auto in32 = random_vec<T>(std::span<const int64_t>(ish, 4), 1);
         if constexpr (ChannelLast) {
-            in_buf = test::nchw_to_nhwc<T>(std::span<const T>(in32.data(), in32.size()),
+            in_buf = test::channel_first_to_channel_last<T>(std::span<const T>(in32.data(), in32.size()),
                                            c.N, c.IC, c.IH, c.IW);
         } else {
             in_buf = in32;
@@ -789,7 +789,7 @@ struct AbPacked {
         work = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW * icg * c.KH * c.KW;
 
         out_buf.assign(static_cast<size_t>(od[0].numel()), T{});
-        out_v = test::make_planar(out_desc, out_buf.data());
+        out_v = test::make_channel_first(out_desc, out_buf.data());
 
         // Query, allocate, pack — once, outside every timer.
         TensorView q;
@@ -835,9 +835,9 @@ struct AbPackedI8 : AbI8 {
         attrs.algorithm = ConvAlgorithm::ImplicitGemm;
         p_op = Conv2D::create(attrs, Backend::CPU);
 
-        in  = channel_last ? &in_nhwc : &in_nchw;
-        w   = channel_last ? &w_nhwc  : &w_nchw;
-        out = channel_last ? &out_nhwc : &out_nchw;
+        in  = channel_last ? &in_channel_last : &in_channel_first;
+        w   = channel_last ? &w_channel_last  : &w_channel_first;
+        out = channel_last ? &out_channel_last : &out_channel_first;
 
         TensorView q;
         const TensorView wi[] = {*w};
@@ -867,9 +867,9 @@ struct AbPackedI8 : AbI8 {
     TensorView p_v;
 };
 
-/// The planar arrangement of the same arm: NCHW activation, OIHW filter.
-struct AbPackedI8Planar : AbPackedI8 {
-    explicit AbPackedI8Planar(const Shape& c) : AbPackedI8(c, /*channel_last=*/false) {}
+/// The channel-first arrangement of the same arm: OIHW filter.
+struct AbPackedI8ChannelFirst : AbPackedI8 {
+    explicit AbPackedI8ChannelFirst(const Shape& c) : AbPackedI8(c, /*channel_last=*/false) {}
 };
 
 /// One table: every layer at every thread count, raw filter vs prepacked.
@@ -957,7 +957,7 @@ const std::vector<Shape>& mobile_graph() {
 }  // namespace
 
 /// MobileNetV2's convs in graph order; rows and the total are medians over @c passes.
-NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
+NNOPS_BENCH(conv2d_channel_last_mobile_graph) {
     const int passes = 5;
     std::printf("\n== f32 channel-last: MobileNetV2's convs as a graph (cold) ==\n");
     for (int nt : bench_threads()) {
@@ -971,7 +971,7 @@ NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
 
-        for (auto& op : ops) { op->run_nhwc(use_ctx); }   // warm-up
+        for (auto& op : ops) { op->run_channel_last(use_ctx); }   // warm-up
 
         std::vector<std::vector<double>> row(ops.size());
         std::vector<double> pass_ms;
@@ -979,7 +979,7 @@ NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
             double sum = 0.0;
             for (size_t i = 0; i < ops.size(); ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
-                ops[i]->run_nhwc(use_ctx);
+                ops[i]->run_channel_last(use_ctx);
                 const double ms = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - t0).count();
                 row[i].push_back(ms);
@@ -1004,26 +1004,26 @@ NNOPS_BENCH(conv2d_nhwc_mobile_graph) {
     }
 }
 
-NNOPS_BENCH(conv2d_nhwc_wino_order_ab_f32) {
+NNOPS_BENCH(conv2d_channel_last_wino_order_ab_f32) {
     run_wino_order_ab<float>("f32: channel-last Winograd, F(2,3) vs F(4,3)");
 }
 
-NNOPS_BENCH(conv2d_nhwc_wino_order_ab_f16) {
+NNOPS_BENCH(conv2d_channel_last_wino_order_ab_f16) {
     run_wino_order_ab<half>("f16: channel-last Winograd, F(2,3) vs F(4,3)");
 }
 
-NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f32) {
+NNOPS_BENCH(conv2d_channel_last_wino_vs_implicit_f32) {
     run_wino_table<float>(
         "f32: channel-last implicit GEMM (HWIO) vs channel-last Winograd (U panels)");
 }
 
-NNOPS_BENCH(conv2d_nhwc_wino_vs_implicit_f16) {
+NNOPS_BENCH(conv2d_channel_last_wino_vs_implicit_f16) {
     run_wino_table<half>(
         "f16: channel-last implicit GEMM (HWIO) vs channel-last Winograd (U panels)");
 }
 
-NNOPS_BENCH(conv2d_nhwc_vs_nchw_f32) {
-    run_table("f32: planar (NCHW+OIHW) vs channel-last (NHWC+HWIO)",
+NNOPS_BENCH(conv2d_channel_last_vs_channel_first_f32) {
+    run_table("f32: channel-first (OIHW) vs channel-last (HWIO)",
               [](const Shape& c) -> std::unique_ptr<AbLayer> {
                   return std::make_unique<AbFp<float>>(c);
               },
@@ -1032,8 +1032,8 @@ NNOPS_BENCH(conv2d_nhwc_vs_nchw_f32) {
               });
 }
 
-NNOPS_BENCH(conv2d_nhwc_vs_nchw_f16) {
-    run_table("f16: planar (NCHW+OIHW) vs channel-last (NHWC+HWIO)",
+NNOPS_BENCH(conv2d_channel_last_vs_channel_first_f16) {
+    run_table("f16: channel-first (OIHW) vs channel-last (HWIO)",
               [](const Shape& c) -> std::unique_ptr<AbLayer> {
                   return std::make_unique<AbFp<half>>(c);
               },
@@ -1042,8 +1042,8 @@ NNOPS_BENCH(conv2d_nhwc_vs_nchw_f16) {
               });
 }
 
-NNOPS_BENCH(conv2d_nhwc_vs_nchw_int8) {
-    run_table("int8: s8 weight x u8 activation -> f32, planar vs channel-last",
+NNOPS_BENCH(conv2d_channel_last_vs_channel_first_int8) {
+    run_table("int8: s8 weight x u8 activation -> f32, channel-first vs channel-last",
               [](const Shape& c) -> std::unique_ptr<AbLayer> {
                   return std::make_unique<AbI8>(c);
               },
@@ -1067,19 +1067,19 @@ NNOPS_BENCH(conv2d_filter_prepacked_int8) {
         "int8: the raw s8 HWIO filter vs the same filter through prepackWeights");
 }
 
-NNOPS_BENCH(conv2d_filter_prepacked_planar_f32) {
+NNOPS_BENCH(conv2d_filter_prepacked_channel_first_f32) {
     run_filter_table<AbPacked<float, false>>(
-        "f32 planar: the raw OIHW filter vs the same filter through prepackWeights");
+        "f32 channel-first: the raw OIHW filter vs the same filter through prepackWeights");
 }
 
-NNOPS_BENCH(conv2d_filter_prepacked_planar_f16) {
+NNOPS_BENCH(conv2d_filter_prepacked_channel_first_f16) {
     run_filter_table<AbPacked<half, false>>(
-        "f16 planar: the raw OIHW filter vs the same filter through prepackWeights");
+        "f16 channel-first: the raw OIHW filter vs the same filter through prepackWeights");
 }
 
-NNOPS_BENCH(conv2d_filter_prepacked_planar_int8) {
-    run_filter_table<AbPackedI8Planar>(
-        "int8 planar: the raw s8 OIHW filter vs the same filter through prepackWeights");
+NNOPS_BENCH(conv2d_filter_prepacked_channel_first_int8) {
+    run_filter_table<AbPackedI8ChannelFirst>(
+        "int8 channel-first: the raw s8 OIHW filter vs the same filter through prepackWeights");
 }
 
 // ============================================================

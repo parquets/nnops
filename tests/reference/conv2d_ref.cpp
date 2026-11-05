@@ -1,5 +1,5 @@
 /// @file conv2d_ref.cpp
-/// @brief Naive CPU reference implementation of 2D convolution (NCHW layout).
+/// @brief Naive CPU reference implementation of 2D convolution (channel-first layout).
 ///
 /// This is the correctness baseline. Uses a straightforward 7-level nested loop
 /// with per-sample parallelism via the external parallel_for hook.
