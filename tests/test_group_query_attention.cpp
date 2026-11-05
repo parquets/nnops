@@ -9,7 +9,9 @@
 /// merged [B, S, H*D] and explicit [B, H, S, D] layouts, with and without the
 /// causal mask, with an additive mask, with a shorter query run than the key
 /// run (the KV-cache decode shape), and on both routes: standard, and flash
-/// once Sq*Sk reaches kFlashMinScores (1 << 16).
+/// once Sq*Sk reaches kFlashMinScores (1 << 16). The step cases feed the key
+/// run as [past | new] and check both the decode and the forced-flash route,
+/// including a segment boundary that is not aligned to the KV tile.
 
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/multi_head_attention.hpp"
@@ -54,7 +56,18 @@ struct Case {
     float scale = 0.0f;
     bool causal = true;
     bool mask = false;
+    int64_t past = 0;              // rows in the past K/V segment
+    int64_t position_offset = -1;  // absolute position of query row 0
+    int route = -1;                // 0 standard, 1 flash, 2 decode; -1 unchecked
 };
+
+/// @p past_shape with the sequence dim replaced by @p past.
+std::vector<int64_t> with_seq(const std::vector<int64_t>& shape, int64_t seq)
+{
+    auto s = shape;
+    s[shape.size() == 3 ? 1 : 2] = seq;
+    return s;
+}
 
 /// fast path vs reference on f32; returns false on the first mismatch.
 bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out = nullptr)
@@ -63,12 +76,24 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 101);
     auto [v_vec, v] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 102);
 
+    std::vector<float> pk_vec, pv_vec;
+    TensorView past_k, past_v;
+    if (c.past > 0) {
+        const auto ps = with_seq(c.kshape, c.past);
+        auto [a, ka] = test::make_random_tensor(ps, -1.0f, 1.0f, 104);
+        pk_vec = std::move(a);
+        past_k = ka;
+        auto [b, vb] = test::make_random_tensor(ps, -1.0f, 1.0f, 105);
+        pv_vec = std::move(b);
+        past_v = vb;
+    }
+
+    const int64_t sk_all = (c.kshape.size() == 3 ? c.kshape[1] : c.kshape[2]) + c.past;
     std::vector<float> m_vec;
     TensorView mask;
     if (c.mask) {
         const int64_t sq = c.qshape.size() == 3 ? c.qshape[1] : c.qshape[2];
-        const int64_t sk = c.kshape.size() == 3 ? c.kshape[1] : c.kshape[2];
-        auto [mv, m] = test::make_random_tensor({sq, sk}, -2.0f, 2.0f, 103);
+        auto [mv, m] = test::make_random_tensor({sq, sk_all}, -2.0f, 2.0f, 103);
         m_vec = std::move(mv);
         mask  = m;
     }
@@ -78,6 +103,7 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     attrs.kv_num_heads = c.kv_heads;
     attrs.scale        = c.scale;
     attrs.causal       = c.causal;
+    attrs.position_offset = c.position_offset;
 
     auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
@@ -86,14 +112,35 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     if (c.mask) {
         descs.push_back(mask.desc());
         ins.push_back(mask);
+    } else if (c.past > 0) {
+        // The optional slots are positional: an empty view marks the absent mask.
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+    }
+    if (c.past > 0) {
+        descs.push_back(past_k.desc());
+        ins.push_back(past_k);
+        descs.push_back(past_v.desc());
+        ins.push_back(past_v);
     }
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
-    const cpu::AttentionPlan plan = cpu::get_attention_plan({c.heads, c.kv_heads},
-                                                             descs, out_descs);
+    cpu::AttentionConfig pcfg;
+    pcfg.num_heads = c.heads;
+    pcfg.num_kv_heads = c.kv_heads;
+    pcfg.causal = c.causal;
+    pcfg.position_offset = c.position_offset;
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(pcfg, descs, out_descs);
     used_flash = plan.use_flash;
     if (plan_out) { *plan_out = plan; }
+    if (c.route >= 0) {
+        const int got = plan.use_decode ? 2 : (plan.use_flash ? 1 : 0);
+        if (got != c.route) {
+            std::printf("        route mismatch: want %d, got %d\n", c.route, got);
+            return false;
+        }
+    }
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
@@ -262,6 +309,45 @@ NNOPS_TEST(gqa_decode_sq1_masked_matches_ref) {
         cpu::AttentionPlan plan;
         NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash, &plan));
         NNOPS_EXPECT_TRUE(!plan.use_decode);
+    }
+}
+
+// ============================================================
+// Chunked input: a past segment and an explicit position offset
+// ============================================================
+
+NNOPS_TEST(gqa_step_matches_ref) {
+    // The run the operator reads is [past | new]; the kernels stream the two
+    // segments in place, so the reference — which indexes the same run by
+    // logical position — is the ground truth for both the segment plumbing and
+    // the per-row causal limit.
+    const Case cases[] = {
+        // Single new token after a 37-row past: the GEMV decode route.
+        {{1, 1, 8 * 8},   {1, 1, 1 * 8},   8, 1, 0.0f, true,  false, 37,  37, 2},
+        // Masked step: off the decode route, mask spanning [Sq, past + new].
+        {{1, 1, 4 * 16},  {1, 1, 2 * 16},  4, 2, 0.0f, true,  true,  11,  11, 1},
+        // Chunked prefill, D = 128: a 64-wide KV tile does not line up with the
+        // 100-row segment boundary.
+        {{1, 8, 4 * 128}, {1, 8, 2 * 128}, 4, 2, 0.0f, true,  false, 100, 100, 1},
+        // Past shorter than one KV tile.
+        {{1, 5, 4 * 8},   {1, 5, 2 * 8},   4, 2, 0.0f, true,  false, 3,   3,   1},
+        // Explicit [B, H_kv, S, D] layout, past + new.
+        {{2, 4, 3, 8},    {2, 2, 4, 8},    4, 2, 0.0f, true,  false, 6,   6,   1},
+        // Non-tail chunk of a full run: no past tensor, only the offset — the
+        // rows see the 8..15 key prefix, not the bottom-right one.
+        {{1, 8, 4 * 16},  {1, 40, 2 * 16}, 4, 2, 0.0f, true,  false, 0,   7,   0},
+        // Same chunk on the flash route, and with a mask.
+        {{1, 256, 2 * 64}, {1, 512, 1 * 64}, 2, 1, 0.0f, true, false, 0,  128, 1},
+        {{1, 8, 4 * 16},  {1, 40, 2 * 16}, 4, 2, 0.0f, true,  true,  0,   7,   0},
+        // Decode whose row sits inside the run, not at its end: the score pass
+        // stops at the causal limit instead of walking every key.
+        {{1, 1, 8 * 8},   {1, 1, 1 * 8},   8, 1, 0.0f, true,  false, 37,  20, 2},
+        {{1, 1, 4 * 16},  {1, 40, 2 * 16}, 4, 2, 0.0f, true,  false, 0,   17, 2},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
     }
 }
 

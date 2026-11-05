@@ -26,7 +26,7 @@ void multi_latent_attention_ref(const MultiLatentAttentionAttributes& attrs,
                                                attrs.qk_rope_head_dim));
     detail::attention_ref_generic(attrs.num_heads, attrs.kv_num_heads, vd,
                                   scale, attrs.causal, /*v_is_k=*/true,
-                                  output, inputs, ctx);
+                                  attrs.position_offset, output, inputs, ctx);
 }
 
 }  // namespace nnops::backend::cpu::reference

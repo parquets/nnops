@@ -29,8 +29,19 @@
 /// scale, 1/sqrt(qk_nope_head_dim + qk_rope_head_dim), so the default here uses
 /// those two attributes. DeepSeek-V2 is 1/sqrt(128 + 64).
 ///
-/// `causal` (default true) is bottom-right aligned: row i sees j <= i + (Sk - Sq),
-/// so a single-token decode against a cache pass the whole cached run as KV.
+/// `causal` (default true) uses j <= q0 + i for query row i, q0 being
+/// position_offset or, by default, Sk - Sq (bottom-right): a single-token
+/// decode against a cache passes the whole cached run as KV.
+///
+/// Chunked input: inputs[3] is an optional past KV — the same layout, with
+/// Sk_past latent rows. The operator reads [past | new] by streaming each
+/// segment in place, so latents gathered out of a paged cache need no per-step
+/// concatenation, and the mask stays [Sq, Sk_past + Sk_new]. The past is
+/// read-only. Optional slots are positional, so a step call without a mask
+/// passes an empty view in inputs[2].
+///
+/// `position_offset` is the absolute position of query row 0; set it when the
+/// chunk is not the tail of the run.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -66,8 +77,13 @@ struct MultiLatentAttentionAttributes {
     /// Attention scale; 0 means 1/sqrt(qk_nope_head_dim + qk_rope_head_dim).
     float scale = 0.0f;
 
-    /// Causal mask, bottom-right aligned: j <= i + (Sk - Sq).
+    /// Causal mask: j <= q0 + i, with q0 = position_offset or Sk - Sq.
     bool causal = true;
+
+    /// Absolute position of query row 0; negative means bottom-right. Only
+    /// consulted when causal. With a past segment, the chunked-prefill value is
+    /// the past length.
+    int64_t position_offset = -1;
 };
 
 class MultiLatentAttention : public OpBase {

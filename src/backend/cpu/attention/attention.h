@@ -25,10 +25,19 @@
 /// Query head h reads kv head h / (H / H_kv), so one K/V slice serves a whole
 /// group under grouped-query attention, and H_kv == H is ordinary MHA.
 ///
-/// Causal masking is bottom-right aligned: query row i sees key positions
-/// j <= i + (Sk - Sq). That is the KV-cache decode convention — the Sq query
-/// rows are the last Sq positions of the key run — and it degenerates to
-/// j <= i when Sq == Sk.
+/// Causal masking: query row i sees key positions j <= q0 + i, where q0 is the
+/// absolute position of row 0. Without an explicit offset q0 = Sk - Sq, the
+/// bottom-right alignment — the Sq query rows are the last Sq positions of the
+/// key run — which is the KV-cache decode convention and degenerates to
+/// j <= i when Sq == Sk. An explicit q0 (cfg.position_offset) decodes a chunk
+/// that is not the tail of the run.
+///
+/// Chunked input: the key run may arrive as two segments, an optional past
+/// tensor followed by the step's new K/V. The kernels address the run by
+/// logical index and stream each segment in place, so nothing is concatenated
+/// or copied. The past is read-only; writing the cache stays the caller's job.
+/// The standard route packs B from one base pointer and so is not split-aware
+/// — a split run always routes through flash (or decode).
 ///
 /// Scale is fused into the GEMM1 RHS pack. Both GEMMs only accumulate, so the
 /// first k-block of each output tile runs with zero_mode (add_to=false):
@@ -48,8 +57,13 @@
 ///
 /// Q/K/V/O head slices are M×K / N×K / K×N / M×N submatrices of the planar
 /// tensors, for both merged [B, S, H*D] and explicit [B, H, S, D] layouts (a
-/// head's D columns are contiguous within each row). The mask is flat [Sq, Sk];
-/// its index carries no batch or head.
+/// head's D columns are contiguous within each row). The mask is flat
+/// [Sq, Sk_total] over the whole run; its index carries no batch or head.
+///
+/// Input slots are positional and an omitted optional input is an empty view:
+/// Q, K, V, [mask], [past K], [past V] — or Q, KV, [mask], [past KV] when
+/// v_is_k. The past tensors carry the same layout as their new counterpart,
+/// with Sk_past rows instead of Sk_new; the run is [past | new].
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
@@ -66,8 +80,11 @@ struct AttentionConfig {
     int64_t num_kv_heads = 0;  ///< key/value heads; 0 means num_heads
     int64_t v_head_dim = 0;    ///< value width; only read when v_is_k
     float   scale = 0.0f;      ///< 0 means 1/sqrt(query-key width)
-    bool    causal = false;    ///< bottom-right aligned causal mask
+    bool    causal = false;    ///< causal mask over the run
     bool    v_is_k = false;    ///< value = leading v_head_dim of the key row
+    /// Absolute position of query row 0; negative (the default) means
+    /// bottom-right, q0 = Sk - Sq. Only consulted when causal.
+    int64_t position_offset = -1;
 
     int64_t kv_heads() const noexcept {
         return num_kv_heads > 0 ? num_kv_heads : num_heads;
@@ -97,9 +114,10 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg,
                                  int num_threads = 1,
                                  bool use_thread_slots = false);
 
-/// Tiled attention kernel (f32 / f16), routed standard or flash by the plan.
-/// Inputs are Q, K, V [, mask] — or Q, KV [, mask] when cfg.v_is_k, in which
-/// case the value is read from the key tensor's leading columns. Scratch comes
+/// Tiled attention kernel (f32 / f16), routed standard, flash or decode by the
+/// plan. Inputs are Q, K, V [, mask [, past K, past V]] — or Q, KV [, mask
+/// [, past KV]] when cfg.v_is_k, in which case the value is read from the key
+/// tensor's leading columns. Scratch comes
 /// from the internal pool, sized by get_attention_plan; @p workspace is unused.
 /// Returns Status::unsupported unless every input, the output and the optional
 /// mask share one f32 or f16 dtype.

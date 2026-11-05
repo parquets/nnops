@@ -16,10 +16,23 @@
 /// The output follows Q's shape. scale = 0 means 1/sqrt(D).
 ///
 /// `causal` (default true, as in onnxruntime's GroupQueryAttention) masks query
-/// row i to key positions j <= i + (Sk - Sq): the bottom-right alignment makes
-/// a shorter query run the KV-cache decode case, where the Sq new tokens are
-/// the last Sq positions of the cached key run. No past/present cache is taken
-/// or written — the caller owns the cache and passes the whole key run.
+/// row i to key positions j <= q0 + i, with q0 = position_offset or, by
+/// default, Sk - Sq: the bottom-right alignment makes a shorter query run the
+/// KV-cache decode case, where the Sq new tokens are the last Sq positions of
+/// the cached key run.
+///
+/// Chunked input: inputs[4] and inputs[5] are an optional past K and past V —
+/// the same layout as K/V, with Sk_past rows. The operator reads the run
+/// [past | new] by streaming each segment in place, so the caller never
+/// concatenates the cache for a step, and passes position_offset = Sk_past for
+/// a chunked prefill. The mask stays [Sq, Sk_past + Sk_new]. The past is
+/// read-only: no present/cache output is written, growing the cache stays the
+/// caller's job. Optional slots are positional, so a step call without a mask
+/// passes an empty view in inputs[3].
+///
+/// `position_offset` is what makes a non-tail chunk decodable: it is the
+/// absolute position of query row 0, and each row sees j <= position_offset + i
+/// regardless of where the chunk sits in the run.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -41,8 +54,13 @@ struct GroupQueryAttentionAttributes {
     /// Attention scale; 0 means 1/sqrt(head_dim).
     float scale = 0.0f;
 
-    /// Causal mask, bottom-right aligned: j <= i + (Sk - Sq).
+    /// Causal mask: j <= q0 + i, with q0 = position_offset or Sk - Sq.
     bool causal = true;
+
+    /// Absolute position of query row 0; negative means bottom-right. Only
+    /// consulted when causal. With a past segment, the chunked-prefill value is
+    /// the past length.
+    int64_t position_offset = -1;
 };
 
 class GroupQueryAttention : public OpBase {

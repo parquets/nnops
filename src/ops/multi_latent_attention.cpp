@@ -64,8 +64,8 @@ size_t MultiLatentAttention::getWorkspaceSize(std::span<const TensorDesc> inputs
 Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
                                       std::span<const TensorDesc> outputs) const
 {
-    // Q, KV [, mask]
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    // Q, KV [, mask [, past KV]]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 4, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly)) {
         return Status::unsupported;
     }
@@ -77,8 +77,10 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
     if (inputs[1].dtype != dt || outputs[0].dtype != dt) {
         return Status::invalid_argument;
     }
-    if (inputs.size() > 2 && inputs[2].rank != 0 && inputs[2].dtype != dt) {
-        return Status::invalid_argument;
+    for (size_t i = 2; i < inputs.size(); ++i) {
+        if (inputs[i].rank != 0 && inputs[i].dtype != dt) {
+            return Status::invalid_argument;
+        }
     }
 
     const auto& q = inputs[0];
@@ -129,11 +131,33 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
         }
     }
 
+    // Optional trailing segment: [3] past KV — the same layout as KV, with
+    // Sk_past latent rows.
+    const int64_t seq_dim = (q.rank == 3) ? 1 : 2;
+    int64_t sk_past = 0;
+    if (inputs.size() > 3 && inputs[3].rank != 0) {
+        const auto& p = inputs[3];
+        if (p.rank != kv.rank) { return Status::invalid_argument; }
+        for (int64_t i = 0; i < p.rank; ++i) {
+            if (i != seq_dim && p.dims[i] != kv.dims[i]) {
+                return Status::invalid_argument;
+            }
+        }
+        sk_past = p.dims[seq_dim];
+        if (sk_past <= 0) { return Status::invalid_argument; }
+    }
+
+    const int64_t sk_all = sk + sk_past;
     if (inputs.size() > 2 && inputs[2].rank != 0) {
         const auto& m = inputs[2];
-        if (m.rank != 2 || m.dims[0] != sq || m.dims[1] != sk) {
+        if (m.rank != 2 || m.dims[0] != sq || m.dims[1] != sk_all) {
             return Status::invalid_argument;
         }
+    }
+    // Every query row must sit inside the run it attends to.
+    if (attrs_.causal && attrs_.position_offset >= 0 &&
+        attrs_.position_offset + sq > sk_all) {
+        return Status::invalid_argument;
     }
     return Status::ok;
 }
@@ -143,7 +167,7 @@ Status MultiLatentAttention::compute(std::span<TensorView> outputs,
                                      const ComputeContext& ctx,
                                      void* workspace)
 {
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 4, 1));
     for (size_t i = 0; i < 2; ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }

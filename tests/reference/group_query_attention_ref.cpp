@@ -17,7 +17,7 @@ void group_query_attention_ref(const GroupQueryAttentionAttributes& attrs,
 {
     detail::attention_ref_generic(attrs.num_heads, attrs.kv_num_heads, 0,
                                   attrs.scale, attrs.causal, /*v_is_k=*/false,
-                                  output, inputs, ctx);
+                                  attrs.position_offset, output, inputs, ctx);
 }
 
 }  // namespace nnops::backend::cpu::reference

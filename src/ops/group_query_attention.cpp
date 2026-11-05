@@ -43,8 +43,8 @@ size_t GroupQueryAttention::getWorkspaceSize(std::span<const TensorDesc> inputs,
 Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
                                      std::span<const TensorDesc> outputs) const
 {
-    // Q, K, V [, mask]
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 4, 1));
+    // Q, K, V [, mask [, past K, past V]]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 6, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::PlanarOnly)) {
         return Status::unsupported;
     }
@@ -57,8 +57,10 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
         if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
     if (outputs[0].dtype != dt) { return Status::invalid_argument; }
-    if (inputs.size() > 3 && inputs[3].rank != 0 && inputs[3].dtype != dt) {
-        return Status::invalid_argument;
+    for (size_t i = 3; i < inputs.size(); ++i) {
+        if (inputs[i].rank != 0 && inputs[i].dtype != dt) {
+            return Status::invalid_argument;
+        }
     }
 
     const auto& q = inputs[0];
@@ -99,11 +101,42 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
     }
     if (sq <= 0 || sk <= 0) { return Status::invalid_argument; }
 
-    if (inputs.size() > 3 && inputs[3].rank != 0) {
-        const auto& m = inputs[3];
-        if (m.rank != 2 || m.dims[0] != sq || m.dims[1] != sk) {
+    // Optional trailing segments: [4] past K, [5] past V, same layout as their
+    // new counterpart with Sk_past rows. Both or neither.
+    const int64_t seq_dim = (q.rank == 3) ? 1 : 2;
+    const bool has_past_k = inputs.size() > 4 && inputs[4].rank != 0;
+    const bool has_past_v = inputs.size() > 5 && inputs[5].rank != 0;
+    if (has_past_k != has_past_v) { return Status::invalid_argument; }
+    int64_t sk_past = 0;
+    if (has_past_k) {
+        const auto& pk = inputs[4];
+        const auto& pv = inputs[5];
+        if (pk.rank != k.rank || pv.rank != v.rank) {
             return Status::invalid_argument;
         }
+        for (int64_t i = 0; i < pk.rank; ++i) {
+            if (i == seq_dim) { continue; }
+            if (pk.dims[i] != k.dims[i] || pv.dims[i] != v.dims[i]) {
+                return Status::invalid_argument;
+            }
+        }
+        sk_past = pk.dims[seq_dim];
+        if (sk_past <= 0 || pv.dims[seq_dim] != sk_past) {
+            return Status::invalid_argument;
+        }
+    }
+
+    const int64_t sk_all = sk + sk_past;
+    if (inputs.size() > 3 && inputs[3].rank != 0) {
+        const auto& m = inputs[3];
+        if (m.rank != 2 || m.dims[0] != sq || m.dims[1] != sk_all) {
+            return Status::invalid_argument;
+        }
+    }
+    // Every query row must sit inside the run it attends to.
+    if (attrs_.causal && attrs_.position_offset >= 0 &&
+        attrs_.position_offset + sq > sk_all) {
+        return Status::invalid_argument;
     }
     return Status::ok;
 }
@@ -113,7 +146,7 @@ Status GroupQueryAttention::compute(std::span<TensorView> outputs,
                                     const ComputeContext& ctx,
                                     void* workspace)
 {
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 4, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 6, 1));
     for (size_t i = 0; i < 3; ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }

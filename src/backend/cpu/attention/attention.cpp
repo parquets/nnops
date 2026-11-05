@@ -54,8 +54,20 @@ constexpr int panels_for_pack(int64_t n_max) {
 
 struct HeadShape {
     int64_t B, H, Hkv, Sq, Sk, Sv, Dqk, Dv;
+    int64_t Sk_past = 0;  ///< rows in the past segment; Sk counts the whole run
     bool merged;
 };
+
+/// The optional mask and past slots. Both are positional: a call that passes a
+/// past but no mask still fills the mask slot with an empty view.
+inline size_t mask_slot(const AttentionConfig& cfg) { return cfg.v_is_k ? 2u : 3u; }
+inline size_t past_slot(const AttentionConfig& cfg) { return cfg.v_is_k ? 3u : 4u; }
+
+inline bool has_past_view(const AttentionConfig& cfg, std::span<const TensorView> inputs)
+{
+    const size_t p = past_slot(cfg);
+    return inputs.size() > p && !inputs[p].is_empty();
+}
 
 inline HeadShape resolve_head_shape(const AttentionConfig& cfg,
                                     std::span<const TensorView> inputs)
@@ -82,6 +94,9 @@ inline HeadShape resolve_head_shape(const AttentionConfig& cfg,
     }
     // The value head is Dqk wide unless MLA's latent says otherwise.
     s.Dv = cfg.v_is_k ? cfg.v_head_dim : s.Dqk;
+    if (has_past_view(cfg, inputs)) {
+        s.Sk_past = inputs[past_slot(cfg)].shape(s.merged ? 1 : 2);
+    }
     return s;
 }
 
@@ -96,8 +111,8 @@ inline int64_t merged_v_head_stride(const AttentionConfig& cfg, int64_t Dqk, int
 /// pass an empty view to mean "absent".
 inline bool has_mask_input(const AttentionConfig& cfg, std::span<const TensorView> inputs)
 {
-    const size_t required = cfg.v_is_k ? 2u : 3u;
-    return inputs.size() > required && !inputs[required].is_empty();
+    const size_t m = mask_slot(cfg);
+    return inputs.size() > m && !inputs[m].is_empty();
 }
 
 // ---- scratch slots -------------------------------------------------------
@@ -130,13 +145,15 @@ inline int64_t scratch_slot_of(const CpuBackend& cpu, int64_t tasks, int64_t idx
 
 // ---- causal row limit ----------------------------------------------------
 
-/// Exclusive end of query row @p i's valid key range under the config:
-/// Sk when not causal, else the bottom-right-aligned prefix end.
+/// Exclusive end of query row @p i's valid key range under the config: Sk when
+/// not causal, else q0 + i + 1 with q0 the row-0 position — cfg.position_offset
+/// when given, bottom-right (Sk - Sq) otherwise. @p Sk is the whole run.
 inline int64_t causal_limit(const AttentionConfig& cfg, int64_t i,
                             int64_t Sq, int64_t Sk)
 {
     if (!cfg.causal) { return Sk; }
-    const int64_t lim = i + (Sk - Sq) + 1;
+    const int64_t q0 = cfg.position_offset >= 0 ? cfg.position_offset : (Sk - Sq);
+    const int64_t lim = q0 + i + 1;
     if (lim < 0) { return 0; }
     return lim > Sk ? Sk : lim;
 }
@@ -163,6 +180,7 @@ void attention_impl(const AttentionConfig& cfg,
     const bool has_mask = has_mask_input(cfg, inputs);
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
+    NNOPS_ASSERT(hs.Sk_past == 0);   // the plan sends a split run to flash
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
     const int64_t Sq = hs.Sq, Sk = hs.Sk, Dqk = hs.Dqk, Dv = hs.Dv;
     const bool merged = hs.merged;
@@ -174,7 +192,7 @@ void attention_impl(const AttentionConfig& cfg,
     const T* q_ptr = Q.ptr<T>();
     const T* k_ptr = K.ptr<T>();
     const T* v_ptr = V.ptr<T>();
-    const T* mask_ptr = has_mask ? inputs[cfg.v_is_k ? 2 : 3].ptr<T>() : nullptr;
+    const T* mask_ptr = has_mask ? inputs[mask_slot(cfg)].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
     const int64_t q_rs = Q.row_stride_elems();
@@ -392,10 +410,15 @@ void attention_flash_impl(const AttentionConfig& cfg,
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
     const bool has_mask = has_mask_input(cfg, inputs);
+    const bool split = has_past_view(cfg, inputs);
+    const auto& Kp = split ? inputs[past_slot(cfg)] : K;
+    const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
-    const int64_t Sq = hs.Sq, Sk = hs.Sk, Dqk = hs.Dqk, Dv = hs.Dv;
+    const int64_t Sq = hs.Sq, Dqk = hs.Dqk, Dv = hs.Dv;
+    const int64_t Sk_new = hs.Sk, Sk_past = hs.Sk_past;
+    const int64_t Sk = Sk_new + Sk_past;   // the whole [past | new] run
     const bool merged = hs.merged;
 
     const float scale = (cfg.scale == 0.0f)
@@ -405,12 +428,16 @@ void attention_flash_impl(const AttentionConfig& cfg,
     const T* q_ptr = Q.ptr<T>();
     const T* k_ptr = K.ptr<T>();
     const T* v_ptr = V.ptr<T>();
-    const T* mask_ptr = has_mask ? inputs[cfg.v_is_k ? 2 : 3].ptr<T>() : nullptr;
+    const T* kp_ptr = split ? Kp.ptr<T>() : nullptr;
+    const T* vp_ptr = split ? Vp.ptr<T>() : nullptr;
+    const T* mask_ptr = has_mask ? inputs[mask_slot(cfg)].ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
     const int64_t q_rs = Q.row_stride_elems();
     const int64_t k_rs = K.row_stride_elems();
     const int64_t v_rs = V.row_stride_elems();
+    const int64_t kp_rs = split ? Kp.row_stride_elems() : k_rs;
+    const int64_t vp_rs = split ? Vp.row_stride_elems() : v_rs;
     const int64_t o_rs = output.row_stride_elems();
     const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
 
@@ -440,14 +467,33 @@ void attention_flash_impl(const AttentionConfig& cfg,
         T* o_head;
         if (merged) {
             q_head = q_ptr + b * Sq * q_rs + h * Dqk;
-            k_head = k_ptr + b * Sk * k_rs + hkv * Dqk;
+            k_head = k_ptr + b * Sk_new * k_rs + hkv * Dqk;
             v_head = v_ptr + b * hs.Sv * v_rs + hkv * v_head_stride;
             o_head = out_ptr + b * Sq * o_rs + h * Dv;
         } else {
             q_head = q_ptr + (b * H + h) * Sq * q_rs;
-            k_head = k_ptr + (b * Hkv + hkv) * Sk * k_rs;
+            k_head = k_ptr + (b * Hkv + hkv) * Sk_new * k_rs;
             v_head = v_ptr + (b * Hkv + hkv) * hs.Sv * v_rs;
             o_head = out_ptr + (b * H + h) * Sq * o_rs;
+        }
+        // The run is two contiguous segments, past first; without a past the
+        // first is empty. Each is streamed in place, so the caller never has to
+        // concatenate.
+        const T* k_base[2] = {k_head, k_head};
+        const T* v_base[2] = {v_head, v_head};
+        int64_t k_str[2] = {k_rs, k_rs};
+        int64_t v_str[2] = {v_rs, v_rs};
+        int64_t seg_lo[2] = {0, 0};
+        int64_t seg_hi[2] = {0, Sk};
+        if (split) {
+            k_base[0] = merged ? kp_ptr + b * Sk_past * kp_rs + hkv * Dqk
+                               : kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
+            v_base[0] = merged ? vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride
+                               : vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
+            k_str[0] = kp_rs;
+            v_str[0] = vp_rs;
+            seg_lo[1] = Sk_past;
+            seg_hi[0] = Sk_past;
         }
 
         const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
@@ -475,13 +521,23 @@ void attention_flash_impl(const AttentionConfig& cfg,
             : Sk;
 
         // o_acc is written by the first KV block (zero_mode) — no pre-zeroing
-        // pass. The exp_diff rescale may touch it first on j0 == 0; that
-        // garbage is fully overwritten by the first MMA.
-        for (int64_t j0 = 0; j0 < kv_end; j0 += Bc) {
+        // pass. The exp_diff rescale may touch it first on the first block;
+        // that garbage is fully overwritten by the first MMA.
+        bool first_tile = true;
+        int64_t j0 = 0;
+        while (j0 < kv_end) {
+            const int seg = (j0 < seg_lo[1]) ? 0 : 1;
+            const int64_t seg_end = std::min(seg_hi[seg], kv_end);
             // The diagonal block is the last one and is rarely a full Bc wide:
             // clamping it bounds the tile to the block's causal rectangle
-            // instead of a full-width strip that is mostly masked.
-            const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, kv_end - j0));
+            // instead of a full-width strip that is mostly masked. A segment
+            // boundary also ends a tile, so one tile never spans both.
+            const int actual_bc = static_cast<int>(std::min<int64_t>(Bc, seg_end - j0));
+            const int64_t koff = j0 - seg_lo[seg];
+            const T* kb = k_base[seg];
+            const T* vb = v_base[seg];
+            const int64_t k_step = k_str[seg];
+            const int64_t v_step = v_str[seg];
 
             // ---- S = Q[i0:i0+Br] @ K[j0:j0+Bc]^T * scale ----------
             // k0 == 0 overwrites (zero_mode) — each KV block owns its S tile.
@@ -492,7 +548,7 @@ void attention_flash_impl(const AttentionConfig& cfg,
                     / static_cast<int>(sizeof(T)));
                 tile_pack_rhs(true, actual_bc, actual_kc,
                                       pack_b, ldd_b,
-                                      k_head + j0 * k_rs + k0, static_cast<int>(k_rs), scale);
+                                      kb + koff * k_step + k0, static_cast<int>(k_step), scale);
                 tile_mma_direct(actual_br, actual_bc, actual_kc,
                                         s, actual_bc,
                                         q_head + i0 * q_rs + k0, static_cast<int>(q_rs),
@@ -564,13 +620,15 @@ void attention_flash_impl(const AttentionConfig& cfg,
                 // Br-row block.
                 tile_pack_rhs(false, static_cast<int>(Dv), actual_kc,
                                       pack_b, ldd_b,
-                                      v_head + (j0 + k0) * v_rs, static_cast<int>(v_rs),
+                                      vb + (koff + k0) * v_step, static_cast<int>(v_step),
                                       1.0f);
                 tile_mma_direct(actual_br, static_cast<int>(Dv), actual_kc,
                                         o_acc, static_cast<int>(Dv),
                                         s + k0, actual_bc,
-                                        pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf, j0 == 0 && k0 == 0);
+                                        pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf, first_tile && k0 == 0);
             }
+            first_tile = false;
+            j0 += actual_bc;
         }
 
         // ---- final normalize: output = o_acc / l -------------------
@@ -670,10 +728,15 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
+    const bool split = has_past_view(cfg, inputs);
+    const auto& Kp = split ? inputs[past_slot(cfg)] : K;
+    const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
-    const int64_t Sq = hs.Sq, Sk = hs.Sk, Dqk = hs.Dqk, Dv = hs.Dv;
+    const int64_t Sq = hs.Sq, Dqk = hs.Dqk, Dv = hs.Dv;
+    const int64_t Sk_new = hs.Sk, Sk_past = hs.Sk_past;
+    const int64_t Sk = Sk_new + Sk_past;   // the whole [past | new] run
     const bool merged = hs.merged;
     NNOPS_ASSERT(Sq == 1);
 
@@ -684,11 +747,15 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const T* q_ptr = Q.ptr<T>();
     const T* k_ptr = K.ptr<T>();
     const T* v_ptr = V.ptr<T>();
+    const T* kp_ptr = split ? Kp.ptr<T>() : nullptr;
+    const T* vp_ptr = split ? Vp.ptr<T>() : nullptr;
     T* out_ptr = output.ptr<T>();
 
     const int64_t q_rs = Q.row_stride_elems();
     const int64_t k_rs = K.row_stride_elems();
     const int64_t v_rs = V.row_stride_elems();
+    const int64_t kp_rs = split ? Kp.row_stride_elems() : k_rs;
+    const int64_t vp_rs = split ? Vp.row_stride_elems() : v_rs;
     const int64_t o_rs = output.row_stride_elems();
     const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
 
@@ -696,9 +763,8 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const int64_t NG = B * H;
     float* ws = static_cast<float*>(workspace);
 
-    // The decode shape is bottom-right aligned, so its causal limit is Sk: the
-    // row attends to every cached key. Precompute it once for both the mask
-    // pass and the accumulation bound.
+    // Bottom-right alignment makes the limit Sk — the row attends to every
+    // cached key; an explicit position_offset can cut it shorter.
     const int64_t n_valid = causal_limit(cfg, 0, Sq, Sk);
 
     const auto run = [&](int64_t idx) {
@@ -712,14 +778,32 @@ void attention_decode_impl(const AttentionConfig& cfg,
         T* o_row;
         if (merged) {
             q_row  = q_ptr + b * q_rs + h * Dqk;
-            k_head = k_ptr + b * Sk * k_rs + hkv * Dqk;
+            k_head = k_ptr + b * Sk_new * k_rs + hkv * Dqk;
             v_head = v_ptr + b * hs.Sv * v_rs + hkv * v_head_stride;
             o_row  = out_ptr + b * o_rs + h * Dv;
         } else {
             q_row  = q_ptr + (b * H + h) * q_rs;
-            k_head = k_ptr + (b * Hkv + hkv) * Sk * k_rs;
+            k_head = k_ptr + (b * Hkv + hkv) * Sk_new * k_rs;
             v_head = v_ptr + (b * Hkv + hkv) * hs.Sv * v_rs;
             o_row  = out_ptr + (b * H + h) * o_rs;
+        }
+
+        // [past | new], the past segment empty when no past is passed.
+        const T* k_base[2] = {k_head, k_head};
+        const T* v_base[2] = {v_head, v_head};
+        int64_t k_str[2] = {k_rs, k_rs};
+        int64_t v_str[2] = {v_rs, v_rs};
+        int64_t seg_lo[2] = {0, 0};
+        int64_t seg_hi[2] = {0, Sk};
+        if (split) {
+            k_base[0] = merged ? kp_ptr + b * Sk_past * kp_rs + hkv * Dqk
+                               : kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
+            v_base[0] = merged ? vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride
+                               : vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
+            k_str[0] = kp_rs;
+            v_str[0] = vp_rs;
+            seg_lo[1] = Sk_past;
+            seg_hi[0] = Sk_past;
         }
 
         const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
@@ -728,14 +812,20 @@ void attention_decode_impl(const AttentionConfig& cfg,
 
         // ---- scores = q · K^T ----------------------------------------
         // The scale rides through the softmax temperature instead of touching
-        // the row, so this pass stays a pure dot product.
-        int64_t t = 0;
-        for (; t + 4 <= Sk; t += 4) {
-            const T* kk = k_head + t * k_rs;
-            dot_row4(q_row, kk, kk + k_rs, kk + 2 * k_rs, kk + 3 * k_rs, Dqk, scores + t);
-        }
-        for (; t < Sk; ++t) {
-            scores[t] = dot_row(q_row, k_head + t * k_rs, Dqk);
+        // the row, so this pass stays a pure dot product. Nothing past the
+        // row's causal limit is scored.
+        for (int s = 0; s < 2; ++s) {
+            const int64_t hi = std::min(seg_hi[s], n_valid);
+            const T* kb = k_base[s];
+            const int64_t rs = k_str[s];
+            int64_t t = seg_lo[s];
+            for (; t + 4 <= hi; t += 4) {
+                const T* kk = kb + (t - seg_lo[s]) * rs;
+                dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs, Dqk, scores + t);
+            }
+            for (; t < hi; ++t) {
+                scores[t] = dot_row(q_row, kb + (t - seg_lo[s]) * rs, Dqk);
+            }
         }
 
         // ---- softmax over the valid prefix (already normalized) ------
@@ -753,41 +843,46 @@ void attention_decode_impl(const AttentionConfig& cfg,
         // branch-free path costs nothing and drops a per-row test.
         for (int64_t d = 0; d < Dv; ++d) { o_acc[d] = 0.0f; }
         constexpr int64_t lanes = simd::simd_default_lane_f32;
-        t = 0;
-        for (; t + 4 <= n_valid; t += 4) {
-            const T* r0 = v_head + t * v_rs;
-            const T* r1 = r0 + v_rs;
-            const T* r2 = r1 + v_rs;
-            const T* r3 = r2 + v_rs;
-            const float p0 = scores[t + 0], p1 = scores[t + 1];
-            const float p2 = scores[t + 2], p3 = scores[t + 3];
-            const auto vp0 = simd::v_set1_f32x8(p0), vp1 = simd::v_set1_f32x8(p1);
-            const auto vp2 = simd::v_set1_f32x8(p2), vp3 = simd::v_set1_f32x8(p3);
-            int64_t d = 0;
-            for (; d + lanes <= Dv; d += lanes) {
-                auto acc = simd::v_load(o_acc + d);
-                acc = simd::v_fmadd(vp0, vload_f32x8(r0 + d), acc);
-                acc = simd::v_fmadd(vp1, vload_f32x8(r1 + d), acc);
-                acc = simd::v_fmadd(vp2, vload_f32x8(r2 + d), acc);
-                acc = simd::v_fmadd(vp3, vload_f32x8(r3 + d), acc);
-                simd::v_store(o_acc + d, acc);
+        for (int s = 0; s < 2; ++s) {
+            const int64_t hi = std::min(seg_hi[s], n_valid);
+            const T* vb = v_base[s];
+            const int64_t rs = v_str[s];
+            int64_t t = seg_lo[s];
+            for (; t + 4 <= hi; t += 4) {
+                const T* r0 = vb + (t - seg_lo[s]) * rs;
+                const T* r1 = r0 + rs;
+                const T* r2 = r1 + rs;
+                const T* r3 = r2 + rs;
+                const float p0 = scores[t + 0], p1 = scores[t + 1];
+                const float p2 = scores[t + 2], p3 = scores[t + 3];
+                const auto vp0 = simd::v_set1_f32x8(p0), vp1 = simd::v_set1_f32x8(p1);
+                const auto vp2 = simd::v_set1_f32x8(p2), vp3 = simd::v_set1_f32x8(p3);
+                int64_t d = 0;
+                for (; d + lanes <= Dv; d += lanes) {
+                    auto acc = simd::v_load(o_acc + d);
+                    acc = simd::v_fmadd(vp0, vload_f32x8(r0 + d), acc);
+                    acc = simd::v_fmadd(vp1, vload_f32x8(r1 + d), acc);
+                    acc = simd::v_fmadd(vp2, vload_f32x8(r2 + d), acc);
+                    acc = simd::v_fmadd(vp3, vload_f32x8(r3 + d), acc);
+                    simd::v_store(o_acc + d, acc);
+                }
+                for (; d < Dv; ++d) {
+                    o_acc[d] += p0 * simd::s_load(&r0[d]) + p1 * simd::s_load(&r1[d])
+                              + p2 * simd::s_load(&r2[d]) + p3 * simd::s_load(&r3[d]);
+                }
             }
-            for (; d < Dv; ++d) {
-                o_acc[d] += p0 * simd::s_load(&r0[d]) + p1 * simd::s_load(&r1[d])
-                          + p2 * simd::s_load(&r2[d]) + p3 * simd::s_load(&r3[d]);
+            for (; t < hi; ++t) {
+                const float p = scores[t];
+                const T* vrow = vb + (t - seg_lo[s]) * rs;
+                auto vp = simd::v_set1_f32x8(p);
+                int64_t d = 0;
+                for (; d + lanes <= Dv; d += lanes) {
+                    auto acc = simd::v_load(o_acc + d);
+                    acc = simd::v_fmadd(vp, vload_f32x8(vrow + d), acc);
+                    simd::v_store(o_acc + d, acc);
+                }
+                for (; d < Dv; ++d) { o_acc[d] += p * simd::s_load(&vrow[d]); }
             }
-        }
-        for (; t < n_valid; ++t) {
-            const float p = scores[t];
-            const T* vrow = v_head + t * v_rs;
-            auto vp = simd::v_set1_f32x8(p);
-            int64_t d = 0;
-            for (; d + lanes <= Dv; d += lanes) {
-                auto acc = simd::v_load(o_acc + d);
-                acc = simd::v_fmadd(vp, vload_f32x8(vrow + d), acc);
-                simd::v_store(o_acc + d, acc);
-            }
-            for (; d < Dv; ++d) { o_acc[d] += p * simd::s_load(&vrow[d]); }
         }
 
         // ---- store ---------------------------------------------------
@@ -832,25 +927,33 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
 
     const int64_t H = cfg.num_heads;
     const bool merged = (q.rank == 3);
-    int64_t B, Sq, Sk, Dqk;
+    int64_t B, Sq, Sk_new, Dqk;
     if (merged) {
         B  = q.dims[0];
         Sq = q.dims[1];
-        Sk = k.dims[1];
+        Sk_new = k.dims[1];
         Dqk = q.dims[2] / H;
     } else {
         B  = q.dims[0];
         Sq = q.dims[2];
-        Sk = k.dims[2];
+        Sk_new = k.dims[2];
         Dqk = q.dims[3];
     }
     const int64_t Dv = cfg.v_is_k ? cfg.v_head_dim : Dqk;
 
+    // A past segment makes the run [past | new]; every route is sized by the
+    // whole run, and the standard route — which packs B from one base pointer
+    // — is skipped in favour of flash.
+    const size_t pslot = past_slot(cfg);
+    const bool split = inputs.size() > pslot && inputs[pslot].rank != 0;
+    const int64_t Sk_past = split ? inputs[pslot].dims[merged ? 1 : 2] : 0;
+    const int64_t Sk = Sk_new + Sk_past;
+
     // Decode — one query row and no mask: both products are GEMV, so the
     // packing-dominated tiled routes are pure overhead. An optional mask
     // arrives as a rank-0 descriptor and keeps the standard route.
-    const size_t required = cfg.v_is_k ? 2u : 3u;
-    const bool has_mask = inputs.size() > required && inputs[required].rank != 0;
+    const size_t mslot = mask_slot(cfg);
+    const bool has_mask = inputs.size() > mslot && inputs[mslot].rank != 0;
     plan.use_decode = (Sq == 1) && !has_mask;
     if (plan.use_decode) {
         plan.decode_elems = Sk + Dv;   // f32: scores row then output accumulator
@@ -860,7 +963,7 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
         return plan;
     }
 
-    plan.use_flash = should_use_flash_attention(Sq, Sk);
+    plan.use_flash = split || should_use_flash_attention(Sq, Sk);
 
     // Flash path — sized with the same Br/Bc the kernel uses. Slots are
     // per worker thread when thread ids are reported, else per query block.
@@ -1005,6 +1108,7 @@ Status multi_head_attention_cpu(const MultiHeadAttentionAttributes& attrs,
     cfg.num_heads = attrs.num_heads;
     cfg.scale = attrs.scale;
     cfg.causal = attrs.causal;
+    cfg.position_offset = attrs.position_offset;
     return attention_cpu(cfg, output, inputs, ctx, workspace);
 }
 
@@ -1019,6 +1123,7 @@ Status group_query_attention_cpu(const GroupQueryAttentionAttributes& attrs,
     cfg.num_kv_heads = attrs.kv_num_heads;
     cfg.scale = attrs.scale;
     cfg.causal = attrs.causal;
+    cfg.position_offset = attrs.position_offset;
     return attention_cpu(cfg, output, inputs, ctx, workspace);
 }
 
@@ -1036,6 +1141,7 @@ Status multi_latent_attention_cpu(const MultiLatentAttentionAttributes& attrs,
         ? attrs.scale
         : 1.0f / std::sqrt(static_cast<float>(attrs.qk_nope_head_dim + attrs.qk_rope_head_dim));
     cfg.causal = attrs.causal;
+    cfg.position_offset = attrs.position_offset;
     cfg.v_is_k = true;
     return attention_cpu(cfg, output, inputs, ctx, workspace);
 }

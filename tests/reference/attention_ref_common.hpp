@@ -11,6 +11,10 @@
 /// [Sq, Sk] mask, softmaxed per row over its causal prefix, then multiplied by
 /// V into the output. A row whose causal prefix is empty is all zeros.
 ///
+/// The optional past segment is read as the first Sk_past rows of the key run,
+/// so [past | new] behaves as one tensor. @p q0 is the absolute position of
+/// query row 0; negative means bottom-right (Sk - Sq).
+///
 /// This is deliberately the slowest possible spelling — no blocking, no
 /// packing — so it can serve as ground truth for the tiled kernels.
 
@@ -29,6 +33,7 @@ namespace nnops::backend::cpu::reference::detail {
 inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
                                   int64_t v_head_dim,
                                   float scale, bool causal, bool v_is_k,
+                                  int64_t position_offset,
                                   TensorView& output,
                                   std::span<const TensorView> inputs,
                                   const ComputeContext& ctx)
@@ -36,25 +41,32 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
     const auto& Q = inputs[0];
     const auto& K = inputs[1];
     const auto& V = v_is_k ? inputs[1] : inputs[2];
-    const bool has_mask = inputs.size() > (v_is_k ? 2u : 3u);
+    const size_t mask_slot = v_is_k ? 2u : 3u;
+    const size_t past_slot = v_is_k ? 3u : 4u;
+    const bool has_mask = inputs.size() > mask_slot && inputs[mask_slot].rank() != 0;
+    const bool has_past = inputs.size() > past_slot && inputs[past_slot].rank() != 0;
+    const auto& Kp = has_past ? inputs[past_slot] : K;
+    const auto& Vp = has_past ? inputs[v_is_k ? past_slot : past_slot + 1] : V;
 
     const bool merged = (Q.rank() == 3);
     const int64_t B   = Q.shape(0);
     const int64_t H   = num_heads;
     const int64_t Hkv = num_kv_heads > 0 ? num_kv_heads : num_heads;
 
-    int64_t Sq, Sk, Sv, Dqk;
+    int64_t Sq, Sk_new, Sv, Dqk;
     if (merged) {
         Sq  = Q.shape(1);
-        Sk  = K.shape(1);
+        Sk_new = K.shape(1);
         Sv  = V.shape(1);
         Dqk = Q.shape(2) / H;
     } else {
         Sq  = Q.shape(2);
-        Sk  = K.shape(2);
+        Sk_new = K.shape(2);
         Sv  = V.shape(2);
         Dqk = Q.shape(3);
     }
+    const int64_t Sk_past = has_past ? (merged ? Kp.shape(1) : Kp.shape(2)) : 0;
+    const int64_t Sk = Sk_new + Sk_past;
     const int64_t Dv = v_is_k ? v_head_dim : Dqk;
 
     const float s = (scale == 0.0f)
@@ -64,12 +76,16 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
     const auto* q_ptr = Q.ptr<float>();
     const auto* k_ptr = K.ptr<float>();
     const auto* v_ptr = V.ptr<float>();
-    const auto* mask_ptr = has_mask ? inputs[v_is_k ? 2 : 3].ptr<float>() : nullptr;
+    const auto* kp_ptr = has_past ? Kp.ptr<float>() : nullptr;
+    const auto* vp_ptr = has_past ? Vp.ptr<float>() : nullptr;
+    const auto* mask_ptr = has_mask ? inputs[mask_slot].ptr<float>() : nullptr;
     auto* out_ptr = output.ptr<float>();
 
     const int64_t q_rs = Q.row_stride_elems();
     const int64_t k_rs = K.row_stride_elems();
     const int64_t v_rs = V.row_stride_elems();
+    const int64_t kp_rs = has_past ? Kp.row_stride_elems() : k_rs;
+    const int64_t vp_rs = has_past ? Vp.row_stride_elems() : v_rs;
     const int64_t o_rs = output.row_stride_elems();
     // A latent key row is Dqk wide per head; the value is its prefix.
     const int64_t v_head_stride = v_is_k ? Dqk : Dv;
@@ -85,23 +101,44 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
         float* o_head;
         if (merged) {
             q_head = q_ptr + b * Sq * q_rs + h * Dqk;
-            k_head = k_ptr + b * Sk * k_rs + hkv * Dqk;
+            k_head = k_ptr + b * Sk_new * k_rs + hkv * Dqk;
             v_head = v_ptr + b * Sv * v_rs + hkv * v_head_stride;
             o_head = out_ptr + b * Sq * o_rs + h * Dv;
         } else {
             q_head = q_ptr + (b * H + h) * Sq * q_rs;
-            k_head = k_ptr + (b * Hkv + hkv) * Sk * k_rs;
+            k_head = k_ptr + (b * Hkv + hkv) * Sk_new * k_rs;
             v_head = v_ptr + (b * Hkv + hkv) * Sv * v_rs;
             o_head = out_ptr + (b * H + h) * Sq * o_rs;
         }
+
+        const float* kp_head = nullptr;
+        const float* vp_head = nullptr;
+        if (has_past) {
+            if (merged) {
+                kp_head = kp_ptr + b * Sk_past * kp_rs + hkv * Dqk;
+                vp_head = vp_ptr + b * Sk_past * vp_rs + hkv * v_head_stride;
+            } else {
+                kp_head = kp_ptr + (b * Hkv + hkv) * Sk_past * kp_rs;
+                vp_head = vp_ptr + (b * Hkv + hkv) * Sk_past * vp_rs;
+            }
+        }
+        const auto k_row = [&](int64_t j) {
+            return (j < Sk_past) ? kp_head + j * kp_rs
+                                 : k_head + (j - Sk_past) * k_rs;
+        };
+        const auto v_row = [&](int64_t j) {
+            return (j < Sk_past) ? vp_head + j * vp_rs
+                                 : v_head + (j - Sk_past) * v_rs;
+        };
 
         std::vector<float> scores(static_cast<size_t>(Sq * Sk), 0.0f);
 
         for (int64_t i = 0; i < Sq; ++i) {
             for (int64_t j = 0; j < Sk; ++j) {
+                const float* krow = k_row(j);
                 float dot = 0.0f;
                 for (int64_t d = 0; d < Dqk; ++d) {
-                    dot += q_head[i * q_rs + d] * k_head[j * k_rs + d];
+                    dot += q_head[i * q_rs + d] * krow[d];
                 }
                 scores[static_cast<size_t>(i * Sk + j)] = dot * s;
             }
@@ -115,11 +152,12 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
             }
         }
 
-        // Causal prefix, bottom-right aligned; the tail is never read.
+        // Causal prefix from the row's absolute position; the tail is never read.
         for (int64_t i = 0; i < Sq; ++i) {
             int64_t n = Sk;
             if (causal) {
-                n = i + (Sk - Sq) + 1;
+                const int64_t q0 = position_offset >= 0 ? position_offset : (Sk - Sq);
+                n = q0 + i + 1;
                 n = std::max<int64_t>(0, std::min<int64_t>(n, Sk));
             }
             float* row = scores.data() + i * Sk;
@@ -148,7 +186,7 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
                 for (int64_t j = 0; j < Sk; ++j) {
                     const float attn = scores[static_cast<size_t>(i * Sk + j)];
                     if (std::isinf(attn) || std::isnan(attn)) { continue; }
-                    sum += attn * v_head[j * v_rs + d];
+                    sum += attn * v_row(j)[d];
                 }
                 o_head[i * o_rs + d] = sum;
             }

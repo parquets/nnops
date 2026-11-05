@@ -9,6 +9,8 @@
 /// merged [B, S, H*Dkv] and explicit [B, H, S, Dkv] layouts, the causal mask on
 /// and off, an additive mask, a decode-shaped shorter query run, and both
 /// routes — standard, and flash once Sq*Sk reaches kFlashMinScores (1 << 16).
+/// The step cases put latent rows in a past segment and set position_offset,
+/// which also exercises the flash route's two-segment KV stream.
 
 #include "nnops/ops/multi_latent_attention.hpp"
 #include "backend/cpu/attention/attention.h"
@@ -56,6 +58,9 @@ struct Case {
     float scale = 0.0f;
     bool causal = true;
     bool mask = false;
+    int64_t past = 0;              // latent rows in the past segment
+    int64_t position_offset = -1;  // absolute position of query row 0
+    int route = -1;                // 0 standard, 1 flash, 2 decode; -1 unchecked
 };
 
 MultiLatentAttentionAttributes attrs_of(const Case& c)
@@ -69,6 +74,7 @@ MultiLatentAttentionAttributes attrs_of(const Case& c)
     a.v_head_dim        = c.vdim;
     a.scale             = c.scale;
     a.causal            = c.causal;
+    a.position_offset   = c.position_offset;
     return a;
 }
 
@@ -77,12 +83,22 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     auto [q_vec, q]   = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 100);
     auto [kv_vec, kv] = test::make_random_tensor(c.kvshape, -1.0f, 1.0f, 101);
 
+    std::vector<float> pkv_vec;
+    TensorView past_kv;
+    if (c.past > 0) {
+        auto ps = c.kvshape;
+        ps[c.kvshape.size() == 3 ? 1 : 2] = c.past;
+        auto [pv, p] = test::make_random_tensor(ps, -1.0f, 1.0f, 103);
+        pkv_vec = std::move(pv);
+        past_kv = p;
+    }
+
+    const int64_t sk_all = (c.kvshape.size() == 3 ? c.kvshape[1] : c.kvshape[2]) + c.past;
     std::vector<float> m_vec;
     TensorView mask;
     if (c.mask) {
         const int64_t sq = c.qshape.size() == 3 ? c.qshape[1] : c.qshape[2];
-        const int64_t sk = c.kvshape.size() == 3 ? c.kvshape[1] : c.kvshape[2];
-        auto [mv, m] = test::make_random_tensor({sq, sk}, -2.0f, 2.0f, 102);
+        auto [mv, m] = test::make_random_tensor({sq, sk_all}, -2.0f, 2.0f, 102);
         m_vec = std::move(mv);
         mask  = m;
     }
@@ -95,6 +111,14 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     if (c.mask) {
         descs.push_back(mask.desc());
         ins.push_back(mask);
+    } else if (c.past > 0) {
+        // The optional slots are positional: an empty view marks the absent mask.
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+    }
+    if (c.past > 0) {
+        descs.push_back(past_kv.desc());
+        ins.push_back(past_kv);
     }
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
@@ -104,9 +128,18 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     cfg.num_kv_heads = c.kv_heads;
     cfg.v_head_dim = c.vdim > 0 ? c.vdim : c.rank;
     cfg.v_is_k = true;
+    cfg.causal = c.causal;
+    cfg.position_offset = c.position_offset;
     const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs);
     used_flash = plan.use_flash;
     if (plan_out) { *plan_out = plan; }
+    if (c.route >= 0) {
+        const int got = plan.use_decode ? 2 : (plan.use_flash ? 1 : 0);
+        if (got != c.route) {
+            std::printf("        route mismatch: want %d, got %d\n", c.route, got);
+            return false;
+        }
+    }
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_planar(out_descs[0], fast_buf.data());
@@ -275,6 +308,35 @@ NNOPS_TEST(mla_decode_sq1_masked_matches_ref) {
         cpu::AttentionPlan plan;
         NNOPS_EXPECT_TRUE(mla_fast_vs_ref(c, flash, &plan));
         NNOPS_EXPECT_TRUE(!plan.use_decode);
+    }
+}
+
+// ============================================================
+// Chunked input: a past segment and an explicit position offset
+// ============================================================
+
+NNOPS_TEST(mla_step_matches_ref) {
+    // The latent run is [past | new] — exactly the rows a paged cache gathers
+    // into its two buffers — and position_offset places the chunk in the run.
+    const Case cases[] = {
+        // Single new latent row after a 25-row past: the GEMV decode route.
+        {{1, 1, 8 * 24}, {1, 1, 1 * 24},  8, 1, 16, 8, 32, 0,  0.0f, true, false, 25, 25, 2},
+        // Chunked prefill over four new rows.
+        {{1, 4, 4 * 24}, {1, 4, 1 * 24},  4, 1, 16, 8, 32, 0,  0.0f, true, false, 37, 37, 1},
+        // Explicit [B, H, S, D] / [B, H_kv, S, D].
+        {{1, 2, 3, 24},  {1, 1, 3, 24},   2, 1, 16, 8, 32, 0,  0.0f, true, false, 5,  5,  1},
+        // Narrow value width with a past.
+        {{1, 3, 4 * 24}, {1, 3, 1 * 24},  4, 1, 16, 8, 32, 8,  0.0f, true, false, 9,  9,  1},
+        // Non-tail chunk of a full run, and the same with a mask.
+        {{1, 4, 4 * 24}, {1, 40, 1 * 24}, 4, 1, 16, 8, 32, 0,  0.0f, true, false, 0,  7,  0},
+        {{1, 4, 4 * 24}, {1, 40, 1 * 24}, 4, 1, 16, 8, 32, 0,  0.0f, true, true,  0,  7,  0},
+        // Masked step after a past: the mask spans the whole run.
+        {{1, 1, 4 * 24}, {1, 1, 1 * 24},  4, 1, 16, 8, 32, 0,  0.0f, true, true,  13, 13, 1},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(mla_fast_vs_ref(c, flash));
     }
 }
 

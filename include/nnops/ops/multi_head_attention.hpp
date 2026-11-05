@@ -9,6 +9,18 @@
 /// mask, flat [Sq, Sk] and shared by every batch and head. scale = 0 means
 /// 1/sqrt(head_dim). Planar layouts only.
 ///
+/// Chunked input: inputs[4] and inputs[5] are an optional past K and past V —
+/// the same layout as K/V, with Sk_past rows instead of Sk_new. The key run
+/// the operator reads is then [past | new], streamed segment by segment, so
+/// nothing is concatenated or copied. The mask stays [Sq, Sk_past + Sk_new].
+/// The past is read-only: growing and writing the cache stays the caller's job.
+/// Optional slots are positional, so a step call without a mask passes an empty
+/// view in inputs[3].
+///
+/// `position_offset` is the absolute position of query row 0 and fixes each
+/// row's causal range, j <= position_offset + i. Unset (-1) means bottom-right,
+/// Sk - Sq; set it for a chunk that is not the tail of the run.
+///
 /// Grouped-query attention — several query heads per key/value head — is
 /// GroupQueryAttention, and the absorbed DeepSeek-style latent form is
 /// MultiLatentAttention; this operator is the H == Hkv case and does not
@@ -31,10 +43,14 @@ struct MultiHeadAttentionAttributes {
     /// Attention scale; 0 means 1/sqrt(head_dim).
     float scale = 0.0f;
 
-    /// Causal masking: query row i attends to key positions j <= i + (Sk - Sq).
-    /// The bottom-right alignment makes the Sq < Sk case the KV-cache decode
-    /// convention — the new queries are the last Sq positions of the key run.
+    /// Causal masking: query row i attends to key positions j <= q0 + i, where
+    /// q0 is position_offset or, by default, Sk - Sq (bottom-right).
     bool causal = false;
+
+    /// Absolute position of query row 0; negative means bottom-right. Only
+    /// consulted when causal. With a past segment the run is [past | new] and
+    /// the chunked-prefill value is the past length.
+    int64_t position_offset = -1;
 };
 
 class MultiHeadAttention : public OpBase {

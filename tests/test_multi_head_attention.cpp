@@ -11,6 +11,8 @@
 /// merged [B, S, H*D] and explicit [B, H, S, D] inputs (explicit standard-route
 /// only), on both routes — standard, or flash once Sq*Sk reaches
 /// kFlashMinScores (1 << 16) — with or without a flat [Sq, Sk] additive mask.
+/// The step cases add a past K/V segment and an explicit position_offset, so
+/// the run spans two allocations and the chunk need not be the tail.
 ///
 /// The pack-scratch test calls get_attention_plan directly: the scratch is
 /// sized from uniform nr_max-wide panels, while the loops pack a last block
@@ -197,13 +199,25 @@ namespace {
 bool attention_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
                            const TensorView& q, const TensorView& k, const TensorView& v,
                            const TensorView* mask,
-                           float rtol, float atol)
+                           float rtol, float atol,
+                           const TensorView* past_k = nullptr,
+                           const TensorView* past_v = nullptr)
 {
     std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
     std::vector<TensorView> ins   = {q, k, v};
     if (mask) {
         descs.push_back(mask->desc());
         ins.push_back(*mask);
+    } else if (past_k) {
+        // The optional slots are positional: an empty view marks the absent mask.
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+    }
+    if (past_k) {
+        descs.push_back(past_k->desc());
+        ins.push_back(*past_k);
+        descs.push_back(past_v->desc());
+        ins.push_back(*past_v);
     }
 
     auto op = MultiHeadAttention::create(attrs, Backend::CPU);
@@ -338,6 +352,60 @@ NNOPS_TEST(attention_decode_sq1_matches_ref) {
 
         NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, k, c.mask ? &mask : nullptr,
                                                 1e-3f, 1e-4f));
+    }
+}
+
+// ============================================================
+// Chunked input: a past segment and an explicit position offset
+// ============================================================
+
+NNOPS_TEST(attention_step_matches_ref) {
+    // The key run is [past | new] and the row's causal range comes from
+    // position_offset, so a chunk that is not the tail of the run stays exact.
+    struct Case {
+        std::vector<int64_t> qshape, kshape;
+        int64_t heads;
+        int64_t past;
+        int64_t offset;
+        bool causal;
+    };
+    const Case cases[] = {
+        // Merged, chunked prefill: four new queries after a twelve-row past.
+        {{1, 4, 4 * 16}, {1, 4, 4 * 16}, 4, 12, 12, true},
+        // Explicit [B, H, S, D].
+        {{1, 4, 5, 8},   {1, 4, 5, 8},   4, 7,  7,  true},
+        // Non-tail chunk of a full run: no past tensor, only the offset.
+        {{1, 8, 2 * 8},  {1, 40, 2 * 8}, 2, 0,  7,  true},
+        // Non-causal: the offset is not consulted, the past still is.
+        {{1, 6, 4 * 8},  {1, 6, 4 * 8},  4, 9, -1,  false},
+    };
+
+    for (const auto& c : cases) {
+        auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 240);
+        auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 241);
+        auto [v_vec, v] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 242);
+
+        std::vector<float> pk_vec, pv_vec;
+        TensorView past_k, past_v;
+        if (c.past > 0) {
+            auto ps = c.kshape;
+            ps[c.kshape.size() == 3 ? 1 : 2] = c.past;
+            auto [a, ka] = test::make_random_tensor(ps, -1.0f, 1.0f, 243);
+            pk_vec = std::move(a);
+            past_k = ka;
+            auto [b, vb] = test::make_random_tensor(ps, -1.0f, 1.0f, 244);
+            pv_vec = std::move(b);
+            past_v = vb;
+        }
+
+        MultiHeadAttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+        attrs.causal = c.causal;
+        attrs.position_offset = c.offset;
+
+        NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f,
+                                                c.past > 0 ? &past_k : nullptr,
+                                                c.past > 0 ? &past_v : nullptr));
     }
 }
 

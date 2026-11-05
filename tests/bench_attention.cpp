@@ -219,35 +219,59 @@ struct GqaCase {
     int64_t Sk = 0;         // 0 -> S
     bool causal = true;
     bool f16 = false;
+    int64_t past = 0;       // rows in the past segment, keyed before the new ones
 };
 
 template <typename T>
 void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
     const int64_t Sq = c.S;
-    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t Sk_new = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t Sk_past = c.past;   // chunked/step input: the run is [past | new]
+    const int64_t Sk = Sk_new + Sk_past;
 
     const int64_t qshape[]  = {c.B, Sq, c.H * c.D};
-    const int64_t kvshape[] = {c.B, Sk, c.Hkv * c.D};
+    const int64_t kvshape[] = {c.B, Sk_new, c.Hkv * c.D};
+    const int64_t pshape[]  = {c.B, Sk_past, c.Hkv * c.D};
 
     auto [q_vec, q]   = make_random<T>(qshape, 21);
     auto [k_vec, k]   = make_random<T>(kvshape, 22);
     auto [v_vec, v]   = make_random<T>(kvshape, 23);
+    std::vector<T> pk_vec, pv_vec;
+    TensorView past_k, past_v;
+    if (Sk_past > 0) {
+        auto [a, ka] = make_random<T>(pshape, 24);
+        pk_vec = std::move(a);
+        past_k = ka;
+        auto [b, vb] = make_random<T>(pshape, 25);
+        pv_vec = std::move(b);
+        past_v = vb;
+    }
 
     GroupQueryAttentionAttributes attrs{};
     attrs.num_heads    = c.H;
     attrs.kv_num_heads = c.Hkv;
     attrs.causal       = c.causal;
+    attrs.position_offset = Sk_past > 0 ? Sk_past : -1;
 
     auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
     std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
     std::vector<TensorView> ins   = {q, k, v};
+    if (Sk_past > 0) {
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+        descs.push_back(past_k.desc());
+        ins.push_back(past_k);
+        descs.push_back(past_v.desc());
+        ins.push_back(past_v);
+    }
     auto out_descs = op->getOutputTensorDesc(descs);
 
     cpu::AttentionConfig cfg;
     cfg.num_heads = c.H;
     cfg.num_kv_heads = c.Hkv;
     cfg.causal = c.causal;
+    cfg.position_offset = attrs.position_offset;
     const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs,
                                                             threads.back(), true);
 
@@ -259,10 +283,11 @@ void run_gqa(const GqaCase& c, const std::vector<int>& threads, int iters) {
     auto output = test::make_planar(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
-    std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s\n",
+    std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld D=%lld  (Sq*Sk=%lld)  %s%s%s\n",
                 (long long)c.B, (long long)c.H, (long long)c.Hkv, (long long)Sq,
                 (long long)Sk, (long long)c.D, (long long)(Sq * Sk),
-                c.f16 ? "f16" : "f32", c.causal ? "  causal" : "");
+                c.f16 ? "f16" : "f32", c.causal ? "  causal" : "",
+                Sk_past > 0 ? "  step" : "");
     std::printf("    route=%s  ws=%zuB\n",
                 plan.use_decode ? "decode" : (plan.use_flash ? "flash" : "standard"),
                 plan.workspace_size);
@@ -288,22 +313,33 @@ struct MlaCase {
     int64_t Sk = 0;         // 0 -> S
     bool causal = true;
     bool f16 = false;
+    int64_t past = 0;       // latent rows in the past segment
 };
 
 template <typename T>
 void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
     const int64_t Sq = c.S;
-    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t Sk_new = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t Sk_past = c.past;   // chunked/step input: the run is [past | new]
+    const int64_t Sk = Sk_new + Sk_past;
     const int64_t dkv = c.rank + c.rope;
 
     const int64_t q_width  = c.H * dkv;
     const int64_t kv_width = c.Hkv * dkv;
 
     const int64_t q_dims[]  = {c.B, Sq, q_width};
-    const int64_t kv_dims[] = {c.B, Sk, kv_width};
+    const int64_t kv_dims[] = {c.B, Sk_new, kv_width};
+    const int64_t p_dims[]  = {c.B, Sk_past, kv_width};
 
     auto [q_vec, q]   = make_random<T>(q_dims, 31);
     auto [kv_vec, kv] = make_random<T>(kv_dims, 32);
+    std::vector<T> pkv_vec;
+    TensorView past_kv;
+    if (Sk_past > 0) {
+        auto [a, pa] = make_random<T>(p_dims, 33);
+        pkv_vec = std::move(a);
+        past_kv = pa;
+    }
 
     MultiLatentAttentionAttributes attrs{};
     attrs.num_heads        = c.H;
@@ -312,11 +348,18 @@ void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
     attrs.qk_rope_head_dim = c.rope;
     attrs.v_head_dim       = c.vdim;
     attrs.causal           = c.causal;
+    attrs.position_offset  = Sk_past > 0 ? Sk_past : -1;
 
     auto op = MultiLatentAttention::create(attrs, Backend::CPU);
 
     std::vector<TensorDesc> descs = {q.desc(), kv.desc()};
     std::vector<TensorView> ins   = {q, kv};
+    if (Sk_past > 0) {
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+        descs.push_back(past_kv.desc());
+        ins.push_back(past_kv);
+    }
     auto out_descs = op->getOutputTensorDesc(descs);
 
     cpu::AttentionConfig cfg;
@@ -324,6 +367,8 @@ void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
     cfg.num_kv_heads = c.Hkv;
     cfg.v_head_dim = c.vdim > 0 ? c.vdim : c.rank;
     cfg.v_is_k = true;
+    cfg.causal = c.causal;
+    cfg.position_offset = attrs.position_offset;
     const cpu::AttentionPlan plan = cpu::get_attention_plan(cfg, descs, out_descs,
                                                             threads.back(), true);
 
@@ -335,11 +380,12 @@ void run_mla(const MlaCase& c, const std::vector<int>& threads, int iters) {
     auto output = test::make_planar(out_descs[0], out_buf.data());
 
     std::printf("  %s\n", c.name);
-    std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld Dkv=%lld v=%lld  %s%s\n",
+    std::printf("    B=%lld H=%lld Hkv=%lld Sq=%lld Sk=%lld Dkv=%lld v=%lld  %s%s%s\n",
                 (long long)c.B, (long long)c.H, (long long)c.Hkv, (long long)Sq,
                 (long long)Sk, (long long)dkv,
                 (long long)(c.vdim > 0 ? c.vdim : c.rank),
-                c.f16 ? "f16" : "f32", c.causal ? "  causal" : "");
+                c.f16 ? "f16" : "f32", c.causal ? "  causal" : "",
+                Sk_past > 0 ? "  step" : "");
     std::printf("    route=%s  ws=%zuB\n",
                 plan.use_decode ? "decode" : (plan.use_flash ? "flash" : "standard"),
                 plan.workspace_size);
@@ -469,6 +515,20 @@ NNOPS_BENCH(gqa_f32_decode) {
     bench_gqa({"gqa f32 decode B1 S1 H32 Hkv8 D128", 1, 1, 32, 8, 128, /*Sk=*/2048});
 }
 
+NNOPS_BENCH(gqa_f32_step_decode) {
+    // The same decode shape, but the key run arrives as [past | new] — the
+    // cache buffer plus the token just written — so the split's cost shows
+    // against the single-run bench above.
+    bench_gqa({"gqa f32 step decode B1 S1 H32 Hkv8 D128 past2048", 1, 1, 32, 8, 128,
+               /*Sk=*/0, /*causal=*/true, /*f16=*/false, /*past=*/2048});
+}
+
+NNOPS_BENCH(gqa_f32_step_prefill) {
+    // Chunked prefill: a 256-token chunk over 1024 cached keys.
+    bench_gqa({"gqa f32 step prefill B1 S256 H32 Hkv8 D128 past1024", 1, 256, 32, 8, 128,
+               /*Sk=*/0, /*causal=*/true, /*f16=*/false, /*past=*/1024});
+}
+
 NNOPS_BENCH(gqa_f32_mqa) {
     // MQA: one kv head for all 32 query heads.
     bench_gqa({"gqa f32 mqa B1 S512 H16 Hkv1 D64", 1, 512, 16, 1, 64});
@@ -500,6 +560,13 @@ NNOPS_BENCH(mla_f32_decode) {
     // Single-token decode against a 2048-token latent run.
     bench_mla({"mla f32 decode B1 S1 H64 Hkv1 rank512 rope64 v512",
                1, 1, 64, 1, 512, 64, 512, /*Sk=*/2048});
+}
+
+NNOPS_BENCH(mla_f32_step_decode) {
+    // Decode whose latent run is [past | new]: the paged-cache step form.
+    bench_mla({"mla f32 step decode B1 S1 H64 Hkv1 rank512 rope64 v512 past2048",
+               1, 1, 64, 1, 512, 64, 512, /*Sk=*/0, /*causal=*/true, /*f16=*/false,
+               /*past=*/2048});
 }
 
 NNOPS_BENCH(mla_f16_prefill) {
