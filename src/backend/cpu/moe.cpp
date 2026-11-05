@@ -11,18 +11,22 @@
 /// mixing weights change.
 ///
 /// Two phases, so that neither races:
-///   A. per expert — FC1 -> activation -> FC2 over its routed tokens, into that
-///      expert's private per-route slots. The slots are disjoint, so this
-///      parallelizes over experts and never touches the output tensor.
+///   A. per (expert, output-channel block) — FC1 -> activation -> FC2 over an
+///      expert's routed tokens, into that expert's private per-route slots. The
+///      slots are disjoint, so this never touches the output tensor, and the N
+///      split is what keeps the pool busy when there are fewer experts than
+///      workers. It runs as two dispatches: FC1 writes the gate with its bias
+///      and activation folded into the GEMM's output pass, then FC2 reads the
+///      whole gate row and so needs a barrier.
 ///   B. per token — sum the token's K contributions in a fixed order and write
 ///      the output row; each token has exactly one owner.
 /// A direct `out[token] += ...` in phase A would be a lost update: with
 /// top-K > 1 a token belongs to K *different* experts, which run on different
 /// workers.
 ///
-/// The per-expert GEMMs reuse `matmul_cpu` with a *default-constructed*
-/// ComputeContext, so the inner GEMM stays sequential and nests no second
-/// parallel region inside phase A.
+/// The inner GEMMs use a *default-constructed* ComputeContext: phase A is
+/// already spread over the pool, and a nested region would either
+/// oversubscribe the machine or serialize inside the outer team.
 
 #include "nnops/ops/moe.hpp"
 #include "nnops/detail/assert.hpp"
@@ -31,7 +35,6 @@
 
 #include "backend/cpu/matmul/matmul.h"
 #include "common/memory_pool.hpp"
-#include "simd_kernel/simd_activation.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -69,6 +72,21 @@ inline float gating_sqrt_softplus(float x) noexcept
     return std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
 }
 
+/// The expert activation as a MatMul epilogue. GELU is the same tanh
+/// approximation on both sides; SwiGLU has no epilogue form because it needs
+/// the value half too, and the combine runs as its own pass.
+inline EpilogueActivateType epilogue_of(MoEActivation act) noexcept
+{
+    switch (act) {
+    case MoEActivation::Relu: return EpilogueActivateType::Relu;
+    case MoEActivation::Gelu: return EpilogueActivateType::Gelu;
+    case MoEActivation::Silu: return EpilogueActivateType::Silu;
+    case MoEActivation::Identity:
+    case MoEActivation::SwiGLU: break;
+    }
+    return EpilogueActivateType::None;
+}
+
 inline float swiglu_combine(float gate, float value, float alpha, float beta,
                             float limit) noexcept
 {
@@ -80,14 +98,19 @@ inline float swiglu_combine(float gate, float value, float alpha, float beta,
     return gate * sig * (value + beta);
 }
 
-/// Run one `[M,K] x [N,K]^T -> [M,N]` GEMM into @p out, sequentially. B is
-/// `transpose_b` — the stacked expert weights are already `[out, in]`.
+/// Run one `[M,K] x [N,K]^T -> [M,N]` GEMM into @p out, whose rows are @p ld
+/// apart. B is `transpose_b` — the stacked expert weights are already
+/// `[out, in]`, so an output-channel slice is a contiguous run of rows, and
+/// @p bias / @p ep are that same slice's bias and activation. Both ride the
+/// kernel's own output pass — the last k-block's tile, still in cache — so the
+/// gate is written once, already final, instead of being swept twice more.
 template <typename T>
 void expert_gemm(const T* a, int64_t M, int64_t K,
                  const T* b, int64_t N,
-                 T* out, DataType dt)
+                 const T* bias, const Epilogue& ep,
+                 T* out, int64_t ld,
+                 DataType dt, const ComputeContext& ctx)
 {
-    std::memset(out, 0, static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(T));
     if (M == 0 || N == 0 || K == 0) { return; }
 
     const int64_t a_shape[] = {M, K};
@@ -96,27 +119,20 @@ void expert_gemm(const T* a, int64_t M, int64_t K,
 
     TensorView a_view(a_shape, dt, const_cast<T*>(a));
     TensorView b_view(b_shape, dt, const_cast<T*>(b));
-    TensorView c_view(c_shape, dt, out);
+    // beta = 0: the GEMM overwrites its slice, so no clear pass is needed.
+    TensorView c_view(c_shape, dt, out, ld * static_cast<int64_t>(sizeof(T)));
 
     MatMulAttributes mm{};
     mm.transpose_b = true;
+    mm.epilogue = ep;
 
-    const TensorView ins[] = {a_view, b_view};
-    const ComputeContext serial_ctx;
-    matmul_cpu(mm, c_view, ins, serial_ctx, nullptr);
-}
-
-/// Add a per-expert bias vector to every row of an [M,N] block, in f32.
-template <typename T>
-void add_bias_rows(T* block, int64_t M, int64_t N, const T* bias) noexcept
-{
-    if (bias == nullptr) { return; }
-    for (int64_t r = 0; r < M; ++r) {
-        T* row = block + r * N;
-        for (int64_t n = 0; n < N; ++n) {
-            stf(row + n, ldf(row + n) + ldf(bias + n));
-        }
+    TensorView ins[3] = {a_view, b_view, TensorView{}};
+    if (bias != nullptr) {
+        const int64_t bias_shape[] = {N};
+        ins[2] = TensorView(bias_shape, dt, const_cast<T*>(bias));
     }
+    matmul_cpu(mm, c_view, std::span<const TensorView>(ins, bias != nullptr ? 3 : 2),
+               ctx, nullptr);
 }
 
 template <typename T>
@@ -308,6 +324,19 @@ void moe_cpu_impl(const MoEAttributes& attrs,
     T* gather = gather_owner.as<T>();
     T* eout   = eout_owner.as<T>();
 
+    // FC1 output for every route. The two GEMM stages are separated by a
+    // barrier — a second-stage task reads a whole gate row, which several
+    // first-stage tasks may have written — so this spans all routes instead of
+    // living inside one expert's task.
+    PoolPtr gate_owner(static_cast<size_t>(total) * static_cast<size_t>(I) * sizeof(T));
+    T* gates = gate_owner.as<T>();
+    PoolPtr value_owner;
+    T* values = nullptr;
+    if (is_swiglu) {
+        value_owner = PoolPtr(static_cast<size_t>(total) * static_cast<size_t>(I) * sizeof(T));
+        values = value_owner.as<T>();
+    }
+
     const size_t row_bytes = static_cast<size_t>(H) * sizeof(T);
     ctx.cpu.run(0, total, [&](int64_t s) {
         std::memcpy(gather + s * H,
@@ -315,53 +344,112 @@ void moe_cpu_impl(const MoEAttributes& attrs,
                     row_bytes);
     });
 
-    // Phase A: one expert per task; each writes only its own slots.
-    ctx.cpu.run(0, E, [&](int64_t e) {
+    // Phase A: one task per (expert, output-channel block), over both GEMM
+    // stages. Splitting the N side is the only split that does not re-read an
+    // expert's weights: an output-channel slice of B is a contiguous run of
+    // rows and each task packs only its own, while splitting M would pack the
+    // whole weight once per chunk.
+    //
+    // The block count targets sixteen tasks per worker across all experts —
+    // enough to absorb both an uneven route histogram and the static task
+    // order. With fewer experts than workers, expert-parallel alone leaves the
+    // pool half idle; with more, it already saturates it and the blocks only
+    // add granularity. Two floors keep the slice a GEMM rather than a
+    // reduction in disguise: never below 128 channels, and the span is rounded
+    // to the 16-wide pack width so every slice but the last is a whole panel.
+    const int64_t workers = std::max<int64_t>(1, ctx.cpu.worker_count());
+    constexpr int64_t kTasksPerWorker = 16;
+    constexpr int64_t kMinSlice = 128;
+    constexpr int64_t kSliceAlign = 16;
+
+    const auto blocks_for = [&](int64_t N) {
+        int64_t b = (kTasksPerWorker * workers + E - 1) / E;
+        const int64_t widest = (N + kMinSlice - 1) / kMinSlice;
+        if (b > widest) { b = widest; }
+        return std::max<int64_t>(b, 1);
+    };
+    // Slice width: the block count's share of N, rounded up to a whole panel.
+    const auto span_of = [](int64_t N, int64_t b) {
+        const int64_t share = (N + b - 1) / b;
+        return (share + kSliceAlign - 1) / kSliceAlign * kSliceAlign;
+    };
+    const int64_t ib = blocks_for(I);
+    const int64_t hb = blocks_for(H);
+
+    // The inner GEMM stays serial: this stage is already spread over the pool,
+    // and a nested parallel region would either oversubscribe or serialize
+    // inside the outer team.
+    const ComputeContext serial_ctx;
+
+    // FC1's bias and activation fold into the GEMM's output pass; the SwiGLU
+    // halves take neither, since the combine pass reads the gate raw.
+    Epilogue act_ep{};
+    act_ep.type = is_swiglu ? EpilogueActivateType::None
+                            : epilogue_of(attrs.activation);
+
+    // Stage 1: FC1 (and FC3 for SwiGLU) on one output-channel slice, then — for
+    // SwiGLU only — the gate×value combine, confined to that slice.
+    ctx.cpu.run(0, E * ib, [&](int64_t task) {
+        const int64_t e = task / ib;
         const int64_t begin = expert_off[static_cast<size_t>(e)];
         const int64_t n_e = expert_off[static_cast<size_t>(e) + 1] - begin;
         if (n_e == 0) { return; }
 
+        const int64_t span = span_of(I, ib);
+        const int64_t n0 = (task % ib) * span;
+        if (n0 >= I) { return; }
+        const int64_t n1 = std::min(I, n0 + span);
+        const int64_t w = n1 - n0;
+
         const T* a = gather + begin * H;
-        T* out_slice = eout + begin * H;
+        T* gate_row = gates + begin * I;
+        T* gate = gate_row + n0;
 
-        PoolPtr gate_owner(static_cast<size_t>(n_e) * static_cast<size_t>(I) * sizeof(T));
-        T* gate = gate_owner.as<T>();
-
-        // FC1: [n_e, H] x [I, H]^T -> [n_e, I] (the gate half).
-        expert_gemm<T>(a, n_e, H, fc1_ptr + e * I * H, I, gate, dt);
-        add_bias_rows<T>(gate, n_e, I, fc1b_ptr ? fc1b_ptr + e * I : nullptr);
+        // FC1: [n_e, H] x [w, H]^T -> [n_e, w] (the gate half).
+        expert_gemm<T>(a, n_e, H, fc1_ptr + (e * I + n0) * H, w,
+                       fc1b_ptr ? fc1b_ptr + e * I + n0 : nullptr, act_ep,
+                       gate, I, dt, serial_ctx);
 
         if (is_swiglu) {
-            PoolPtr value_owner(static_cast<size_t>(n_e) * static_cast<size_t>(I) * sizeof(T));
-            T* value = value_owner.as<T>();
+            T* value_row = values + begin * I;
+            T* value = value_row + n0;
 
             // FC3: the value half, same shape.
-            expert_gemm<T>(a, n_e, H, fc3_ptr + e * I * H, I, value, dt);
-            add_bias_rows<T>(value, n_e, I, fc3b_ptr ? fc3b_ptr + e * I : nullptr);
+            expert_gemm<T>(a, n_e, H, fc3_ptr + (e * I + n0) * H, w,
+                           fc3b_ptr ? fc3b_ptr + e * I + n0 : nullptr, Epilogue{},
+                           value, I, dt, serial_ctx);
 
-            const int64_t n_elems = n_e * I;
-            for (int64_t i = 0; i < n_elems; ++i) {
-                stf(gate + i, swiglu_combine(ldf(gate + i), ldf(value + i),
-                                             attrs.activation_alpha, attrs.activation_beta,
-                                             attrs.swiglu_limit));
-            }
-        } else {
-            // GELU is the tanh approximation; Identity skips the pass.
-            using namespace nnops::kernel;
-            switch (attrs.activation) {
-            case MoEActivation::Relu: relu<T>(gate, gate, n_e, I, I, I, false); break;
-            case MoEActivation::Gelu: gelu<T>(gate, gate, n_e, I, I, I, false); break;
-            case MoEActivation::Silu: silu<T>(gate, gate, n_e, I, I, I, false); break;
-            case MoEActivation::Identity: break;
-            default:
-                NNOPS_ASSERT(!"moe_cpu: unsupported activation");
-                break;
+            for (int64_t r = 0; r < n_e; ++r) {
+                T* g = gate_row + r * I + n0;
+                const T* v = value_row + r * I + n0;
+                for (int64_t c = 0; c < w; ++c) {
+                    stf(g + c, swiglu_combine(ldf(g + c), ldf(v + c),
+                                              attrs.activation_alpha, attrs.activation_beta,
+                                              attrs.swiglu_limit));
+                }
             }
         }
+    });
 
-        // FC2: [n_e, I] x [H, I]^T -> [n_e, H], straight into the expert's slots.
-        expert_gemm<T>(gate, n_e, I, fc2_ptr + e * H * I, H, out_slice, dt);
-        add_bias_rows<T>(out_slice, n_e, H, fc2b_ptr ? fc2b_ptr + e * H : nullptr);
+    // Stage 2: FC2 over an output-channel slice of H, straight into the
+    // expert's routes.
+    ctx.cpu.run(0, E * hb, [&](int64_t task) {
+        const int64_t e = task / hb;
+        const int64_t begin = expert_off[static_cast<size_t>(e)];
+        const int64_t n_e = expert_off[static_cast<size_t>(e) + 1] - begin;
+        if (n_e == 0) { return; }
+
+        const int64_t span = span_of(H, hb);
+        const int64_t n0 = (task % hb) * span;
+        if (n0 >= H) { return; }
+        const int64_t n1 = std::min(H, n0 + span);
+        const int64_t w = n1 - n0;
+
+        T* out_slice = eout + begin * H;
+        // [n_e, I] x [w, I]^T -> [n_e, w].
+        expert_gemm<T>(gates + begin * I, n_e, I, fc2_ptr + (e * H + n0) * I, w,
+                       fc2b_ptr ? fc2b_ptr + e * H + n0 : nullptr, Epilogue{},
+                       out_slice + n0, H, dt, serial_ctx);
     });
 
     // Phase B: one token per task, its K contributions summed in j order. On the

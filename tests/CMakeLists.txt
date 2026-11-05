@@ -154,6 +154,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_attention.cpp
         bench_mma_packed.cpp
         bench_rnn.cpp
+        bench_moe.cpp
     )
 
     if(NNOPS_BUILD_CUDA)
