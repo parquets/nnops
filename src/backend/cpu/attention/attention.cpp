@@ -314,7 +314,7 @@ void attention_impl(const AttentionConfig& cfg,
 
 constexpr int64_t kFlashMinScores = 1 << 16;  // Sq*Sk threshold (≈ 256 KiB f32)
 
-// Tile caps measured on the i5-13600KF, 1T..20T:
+// Tile caps measured across 1T..20T:
 //  - Bc tops out at 256. The L2 formula asks for 512 at D=128 f32, but the
 //    S tile (Br·Bc), the accumulator and the packed K no longer share the L2
 //    with the K/V stream, and 20T lands 12% below the 256-wide tile.

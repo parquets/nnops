@@ -7,9 +7,9 @@
 /// and OpenCV's simd_intrinsics.hpp.
 ///
 /// The cache sizes feed the kc/mc bounds, so they must describe the caches the
-/// compute runs in. On Apple Silicon the OS reports the E-core L1D and L2
-/// (64 KiB / 4 MiB on an M4) against the P-cores' 128 KiB / 16 MiB: l1_cache_size()
-/// keeps the smaller E figure because a worker can land on either cluster, while
+/// compute runs in. On Apple platforms the OS's system-wide query reports the
+/// E-core L1D and L2 rather than the P-cores': l1_cache_size() keeps the smaller
+/// E figure because a worker can land on either cluster, while
 /// l2_shared_cache_size() surfaces the P-cluster figure that mc/nc tile against.
 /// fast_core_count() is the P-core count (Windows EfficiencyClass, macOS
 /// hw.perflevel0): the workers that run a task at the same speed. Past it the
@@ -74,15 +74,15 @@ public:
     uint32_t raw() const { return features_; }
 
     /// L1 data cache in bytes — the data cache, since this sizes the kc bound.
-    /// On Apple Silicon this is the E-core figure (see the file header).
+    /// On Apple platforms this is the E-core figure (see the file header).
     /// Defaults to 32768 when no detection path is available.
     size_t l1_cache_size() const { return l1_cache_size_; }
 
     /// Per-core L2 in bytes; defaults to 262144 (256 KiB) when undetectable.
     size_t l2_cache_size() const { return l2_cache_size_; }
 
-    /// L2 in bytes shared by the cores the compute lands on — on Apple Silicon
-    /// the P-cluster's figure, not the E-cluster's. Falls back to
+    /// L2 in bytes shared by the cores the compute lands on — on Apple
+    /// platforms the P-cluster's figure, not the E-cluster's. Falls back to
     /// l2_cache_size() where the two cannot differ.
     size_t l2_shared_cache_size() const {
         return l2_shared_cache_size_ ? l2_shared_cache_size_ : l2_cache_size_;

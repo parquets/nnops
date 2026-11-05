@@ -277,7 +277,7 @@ void CpuFeatures::detect() {
     }
 #endif
 
-    // Apple's L1D is read in the sysctl block below.
+    // The macOS L1D is read in its own sysctl block below.
 #if defined(__linux__)
     {
         // sysfs only: there is no getauxval(AT_L1D_CACHESIZE), and HWCAP does

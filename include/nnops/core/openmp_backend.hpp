@@ -16,16 +16,16 @@
 ///
 /// Up to the fast-core count the split is schedule(static), one contiguous chunk
 /// per worker; past it the grid is over-subscribed and claimed. An equal share
-/// over more threads than fast cores ends on the slowest worker: on the
-/// i5-13600KF (6P+8E) a conv layer runs 3.2x at 8 threads (the E-cores hold a
-/// slow eighth) and 5.3x at 20, versus 9.2x with four items per worker. Below the
-/// fast-core count extra tasks only shrink the kernels' blocks, so auto_items()
-/// keeps it static there. The item count is reported through num_threads() so
+/// over more threads than fast cores ends on the slowest worker: on a 6P+8E
+/// hybrid a conv layer runs 3.2x at 8 threads (the E-cores hold a slow eighth)
+/// and 5.3x at 20, versus 9.2x with four items per worker. Below the fast-core
+/// count extra tasks only shrink the kernels' blocks, so auto_items() keeps it
+/// static there. The item count is reported through num_threads() so
 /// operators cut a finer grid; thread_slots() stays the real worker count so
 /// scratch is not sized by it.
 ///
 /// Wait policy is the embedder's: vcomp's default spin measured ~2x slower at 8T
-/// than OMP_WAIT_POLICY=PASSIVE on the i5-13600KF (1T / 4T / 20T unaffected).
+/// than OMP_WAIT_POLICY=PASSIVE on a hybrid host (1T / 4T / 20T unaffected).
 
 #if defined(_OPENMP)
 #include <omp.h>
