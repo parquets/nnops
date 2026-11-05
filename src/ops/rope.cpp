@@ -6,6 +6,8 @@
 #include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
 
+#include <cmath>
+
 namespace nnops {
 
 NNOPS_DECLARE_CPU(RoPEAttributes, rope_cpu)
@@ -35,6 +37,24 @@ Status RoPE::validate(std::span<const TensorDesc> inputs,
         if (total != head_dim) { return Status::invalid_argument; }
         if (!attrs_.mrope_section_bases.empty() &&
             attrs_.mrope_section_bases.size() != attrs_.mrope_section_dims.size()) {
+            return Status::invalid_argument;
+        }
+    }
+
+    if (attrs_.position_offset < 0) { return Status::invalid_argument; }
+    if (attrs_.attention_factor < 0.0f) { return Status::invalid_argument; }
+    if (attrs_.scaling_type != RoPEScalingType::None) {
+        if (!std::isfinite(attrs_.scaling_factor) || attrs_.scaling_factor <= 0.0f) {
+            return Status::invalid_argument;
+        }
+        // Every type but Linear pivots on the pretraining context length.
+        if (attrs_.scaling_type != RoPEScalingType::Linear &&
+            attrs_.original_max_position <= 0) {
+            return Status::invalid_argument;
+        }
+        if (attrs_.scaling_type == RoPEScalingType::Llama3 &&
+            (attrs_.llama3_low_freq_factor <= 0.0f ||
+             attrs_.llama3_high_freq_factor <= attrs_.llama3_low_freq_factor)) {
             return Status::invalid_argument;
         }
     }

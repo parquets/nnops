@@ -1,6 +1,7 @@
 #pragma once
 /// @file rope.hpp
-/// @brief RoPE (Rotary Position Embedding) with mRoPE (multi-modal) support.
+/// @brief RoPE (Rotary Position Embedding) with mRoPE, position offset and
+///        long-context scaling.
 ///
 /// Rotates pairs of the last dim, head_dim (even), by position-dependent
 /// angles: theta_i = pos / base^(2*i/head_dim), then
@@ -8,6 +9,26 @@
 ///   x'[i1] = x[i1]*cos(theta_i) + x[i0]*sin(theta_i)
 /// mRoPE splits head_dim into sections, each with its own base. Input and
 /// output are [..., S, D].
+///
+/// Row s sits at absolute position position_offset + s, so a decode step can
+/// rotate its new token where it really belongs instead of at 0.
+///
+/// Long-context scaling follows the HuggingFace `rope_scaling` conventions and
+/// rewrites the same angle:
+///   Linear   every inverse frequency is divided by scaling_factor.
+///   Dynamic  NTK: the base grows once the run's end position passes
+///            original_max_position; scaling_factor is the context multiplier
+///            the model was trained for.
+///   YaRN     NTK-by-parts: high-frequency pairs keep the original angle,
+///            low-frequency pairs are interpolated, the ramp between
+///            yarn_beta_fast and yarn_beta_slow deciding where, and cos/sin
+///            carry a magnitude of 1 + 0.1*ln(scaling_factor) (or the explicit
+///            attention_factor).
+///   Llama3   wavelength bands: pairs whose wavelength stays under
+///            original_max_position / high_freq_factor keep the original
+///            angle, pairs beyond / low_freq_factor are scaled by the factor,
+///            and the band between the two is interpolated smoothly.
+/// With mRoPE sections each section scales independently.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -19,6 +40,14 @@
 #include <vector>
 
 namespace nnops {
+
+enum class RoPEScalingType : uint8_t {
+    None = 0,     ///< theta = pos / base^(2*i/head_dim)
+    Linear = 1,   ///< inverse frequencies divided by the factor
+    Dynamic = 2,  ///< NTK: base grows past original_max_position
+    YaRN = 3,     ///< NTK-by-parts interpolation + attention magnitude
+    Llama3 = 4,   ///< wavelength bands (Llama 3.1)
+};
 
 struct RoPEAttributes {
     /// Rotary base frequency (default 10000.0, standard for most LLMs).
@@ -34,6 +63,31 @@ struct RoPEAttributes {
     /// mRoPE: per-section base frequencies, same size as mrope_section_dims.
     /// Empty means every section uses `base`.
     std::vector<float> mrope_section_bases;
+
+    /// Absolute position of row 0; rows are consecutive.
+    int64_t position_offset = 0;
+
+    /// Long-context scaling; see the file header.
+    RoPEScalingType scaling_type = RoPEScalingType::None;
+
+    /// Context-extension factor (HF rope_scaling["factor"]); > 0, 1 = no-op.
+    float scaling_factor = 1.0f;
+
+    /// Pretraining context length, the pivot for Dynamic and YaRN; must be
+    /// positive for those two.
+    int64_t original_max_position = 0;
+
+    /// YaRN ramp bounds in rotations (the paper's 32 and 1).
+    float yarn_beta_fast = 32.0f;
+    float yarn_beta_slow = 1.0f;
+
+    /// YaRN cos/sin magnitude; 0 derives it as 1 + 0.1*ln(scaling_factor).
+    float attention_factor = 0.0f;
+
+    /// Llama3 band bounds as divisors of original_max_position; the paper's
+    /// 1 and 4. high_freq_factor must exceed low_freq_factor.
+    float llama3_low_freq_factor = 1.0f;
+    float llama3_high_freq_factor = 4.0f;
 };
 
 class RoPE : public OpBase {
