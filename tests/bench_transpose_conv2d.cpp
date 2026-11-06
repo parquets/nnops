@@ -22,10 +22,18 @@
 /// kernel per input pixel. Counting output-taps instead would inflate a stride-2
 /// layer by 4x and hide the whole point of the col GEMM.
 ///
-/// Two tables, one per value type, each with the thread ladder folded in:
-/// every shape is also printed as a scan of its own geometry, so a regression
-/// can be read against OW, the tap count and the col size rather than against a
-/// single rate.
+/// Three tables for the floating-point route, one per value type, each with the
+/// thread ladder folded in: every shape is also printed as a scan of its own
+/// geometry, so a regression can be read against OW, the tap count and the col
+/// size rather than against a single rate.
+///
+/// Three more tables price the quantized route on the same layer list and the
+/// same two arms: s8 weight with per-channel scales against a per-tensor s8 or
+/// u8 activation, to a dequantized f32 destination and to the s8 / u8 requant
+/// chains. No bias, so the rows price the accumulation and the store, not the
+/// epilogue add. The work count is the same MAC count, so the rates are GOP/s;
+/// compare them within a row and against the fp arms only as an order of
+/// magnitude.
 
 #include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -40,6 +48,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <memory>
 #include <span>
@@ -323,7 +332,210 @@ void run_table(const char* tag) {
                 sum_channel_first / sum_channel_last);
 }
 
+// ============================================================
+// Quantized route — s8 weight (per channel) against a u8/s8 activation
+// ============================================================
+
+size_t elem_bytes(DataType dt) { return static_cast<size_t>(data_type_size(dt)); }
+
+QuantParams q_per_tensor(float scale, int32_t zp) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerTensor;
+    qp.scale = scale;
+    qp.zero_point = zp;
+    return qp;
+}
+
+QuantParams q_per_channel(const float* scale, const int32_t* zp, int64_t n) {
+    QuantParams qp;
+    qp.granularity = QuantGranularity::PerChannel;
+    qp.scale_data = scale;
+    qp.zero_point_data = zp;
+    qp.num_scales = n;
+    return qp;
+}
+
+/// Dense [N][C][H][W] → dense [N][H][W][C], byte-wise so any storage width works.
+std::vector<uint8_t> permute_to_channel_last(const Shape& s, const std::vector<uint8_t>& src,
+                                             size_t esz) {
+    std::vector<uint8_t> dst(src.size());
+    for (int64_t n = 0; n < s.N; ++n) {
+        for (int64_t c = 0; c < s.IC; ++c) {
+            for (int64_t h = 0; h < s.IH; ++h) {
+                const uint8_t* p = src.data() +
+                    (((n * s.IC + c) * s.IH + h) * s.IW) * static_cast<int64_t>(esz);
+                for (int64_t w = 0; w < s.IW; ++w) {
+                    std::memcpy(dst.data() +
+                                    ((((n * s.IH + h) * s.IW + w) * s.IC + c) *
+                                     static_cast<int64_t>(esz)),
+                                p + w * static_cast<int64_t>(esz), esz);
+                }
+            }
+        }
+    }
+    return dst;
+}
+
+/// The same layer list in its quantized form. The weight keeps the channel-first
+/// [IC, OC/G, KH, KW] form in both layouts, as the op contract says.
+struct Int8Layer {
+    Int8Layer(const Shape& sh, DataType a_dt, DataType o_dt)
+        : s(sh), act_dt(a_dt), out_dt(o_dt) {
+        const bool int_out = (out_dt == DataType::s8 || out_dt == DataType::u8);
+        const int32_t zp_x   = (act_dt == DataType::u8) ? 128 : 0;
+        const int32_t zp_out = (out_dt == DataType::u8) ? 128 : 0;
+        const size_t  esz_in = elem_bytes(act_dt);
+        const int64_t OC = s.OC;
+
+        // ---- activation: [-1, 1] quantized at 1/128, the scale the tests use ----
+        const int64_t in_numel = s.N * s.IC * s.IH * s.IW;
+        in_cf_buf.assign(static_cast<size_t>(in_numel) * esz_in, 0);
+        {
+            test::XorShift128 rng(1);
+            const int32_t qmin = (act_dt == DataType::u8) ? 0 : -128;
+            const int32_t qmax = (act_dt == DataType::u8) ? 255 : 127;
+            for (int64_t i = 0; i < in_numel; ++i) {
+                const float x = rng.next_float(-1.0f, 1.0f);
+                int32_t q = static_cast<int32_t>(
+                    std::nearbyintf(std::fmaf(x, 128.0f, static_cast<float>(zp_x))));
+                q = std::min(std::max(q, qmin), qmax);
+                in_cf_buf[static_cast<size_t>(i)] = static_cast<uint8_t>(q);
+            }
+        }
+        in_cl_buf = permute_to_channel_last(s, in_cf_buf, esz_in);
+
+        // ---- weight + per-channel scales ----
+        const int64_t wnumel = s.IC * (s.OC / s.groups) * s.KH * s.KW;
+        w_buf.resize(static_cast<size_t>(wnumel));
+        w_s.resize(static_cast<size_t>(OC));
+        w_zp.assign(static_cast<size_t>(OC), 0);
+        {
+            test::XorShift128 rng(2);
+            for (int64_t i = 0; i < wnumel; ++i) {
+                const int32_t q = static_cast<int32_t>(rng.next_u64() % 255u) - 127;
+                w_buf[static_cast<size_t>(i)] = static_cast<int8_t>(q);
+            }
+            for (int64_t oc = 0; oc < OC; ++oc) {
+                w_s[static_cast<size_t>(oc)] = 0.01f * static_cast<float>(1 + oc % 5);
+            }
+        }
+
+        qa = q_per_tensor(1.0f / 128.0f, zp_x);
+        qw = q_per_channel(w_s.data(), w_zp.data(), OC);
+        if (int_out) { qo = q_per_tensor(1.0f / 128.0f, zp_out); }
+
+        attrs.kernel_size = {s.KH, s.KW};
+        attrs.stride      = {s.SH, s.SW};
+        attrs.dilation    = {s.DH, s.DW};
+        attrs.padding     = {s.PH, s.PW};
+        attrs.groups      = s.groups;
+        attrs.output_dtype = out_dt;
+        attrs.act_quant_dtype = act_dt;
+
+        op = TransposeConv2D::create(attrs, Backend::CPU);
+
+        const int64_t ish[] = {s.N, s.IC, s.IH, s.IW};
+        const int64_t wsh[] = {s.IC, s.OC / s.groups, s.KH, s.KW};
+        in_cf = TensorView(std::span<const int64_t>(ish, 4), act_dt, in_cf_buf.data(),
+                           TensorLayout::NCHW, qa);
+        in_cl = TensorView(std::span<const int64_t>(ish, 4), act_dt, in_cl_buf.data(),
+                           TensorLayout::NHWC, qa);
+        w = TensorView(std::span<const int64_t>(wsh, 4), DataType::s8, w_buf.data(),
+                       TensorLayout::NCHW, qw);
+
+        const TensorDesc dn[] = {in_cf.desc(), w.desc()};
+        const auto od_cf = op->getOutputTensorDesc(dn);
+        const TensorDesc dn_cl[] = {in_cl.desc(), w.desc()};
+        const auto od_cl = op->getOutputTensorDesc(dn_cl);
+
+        out_cf_buf.assign(static_cast<size_t>(od_cf[0].numel()) * elem_bytes(out_dt), 0);
+        out_cl_buf.assign(static_cast<size_t>(od_cl[0].numel()) * elem_bytes(out_dt), 0);
+        out_cf = TensorView(od_cf[0].dims, out_dt, out_cf_buf.data(), TensorLayout::NCHW, qo);
+        out_cl = TensorView(od_cl[0].dims, out_dt, out_cl_buf.data(), TensorLayout::NHWC, qo);
+        OH = od_cf[0].dims[2];
+        OW = od_cf[0].dims[3];
+
+        ins_cf = {in_cf, w};
+        ins_cl = {in_cl, w};
+        // Same contributions count as the fp arms, so the rates line up.
+        work = 2.0 * static_cast<double>(s.N) * s.OC * s.IH * s.IW *
+               static_cast<double>(s.IC / s.groups) * s.KH * s.KW;
+    }
+
+    Status run_channel_first(const ComputeContext& ctx) {
+        return op->compute(out_cf, ins_cf, ctx, nullptr);
+    }
+    Status run_channel_last(const ComputeContext& ctx) {
+        return op->compute(out_cl, ins_cl, ctx, nullptr);
+    }
+
+    Shape s;
+    DataType act_dt, out_dt;
+    TransposeConv2DAttributes attrs{};
+    std::unique_ptr<TransposeConv2D> op;
+    std::vector<uint8_t> in_cf_buf, in_cl_buf, out_cf_buf, out_cl_buf;
+    std::vector<int8_t>  w_buf;
+    std::vector<float>   w_s;
+    std::vector<int32_t> w_zp;
+    QuantParams qa, qw, qo;
+    TensorView in_cf, in_cl, w, out_cf, out_cl;
+    std::vector<TensorView> ins_cf, ins_cl;
+    int64_t OH = 0, OW = 0;
+    double work = 0.0;
+};
+
+void run_int8_table(DataType act_dt, DataType out_dt, const char* tag) {
+    const std::vector<int> threads = bench_threads();
+    const int iters = 20, rounds = 5;
+
+    std::printf("  %s — same columns as the fp tables, rates in int8 GOP/s\n", tag);
+    std::printf("    %-45s %6s %6s %6s | %8s %8s | %7s %7s | %6s %s\n",
+                "case", "OH", "OW", "taps", "channel_first ms", "channel_last ms",
+                "channel_first GOP", "channel_last GOP", "r", "null");
+
+    double sum_channel_first = 0.0, sum_channel_last = 0.0, sum_work = 0.0;
+    for (const Shape& c : sweep()) {
+        Int8Layer l(c, act_dt, out_dt);
+        const Status probe = l.run_channel_first(ComputeContext{});
+        if (probe != Status::ok) {
+            std::printf("    %-45s int8: n/a (compute returned %d)\n", c.name,
+                        static_cast<int>(probe));
+            continue;
+        }
+        const double taps = static_cast<double>(c.KH * c.KW) /
+                            static_cast<double>(c.SH * c.SW);
+        for (int nt : threads) {
+            const AbResult r = measure_ab(nt,
+                [&](const ComputeContext& x) { l.run_channel_first(x); },
+                [&](const ComputeContext& x) { l.run_channel_last(x); },
+                iters, rounds);
+            const bool real = std::abs(r.a_ms - r.b_ms) / r.a_ms * 100.0 > r.null_pct;
+            std::printf("    %-45s %6lld %6lld %6.1f | %8.3f %8.3f | %7.1f %7.1f | %6.2f %4.1f%%%s\n",
+                        (nt == threads.front()) ? c.name : "",
+                        (long long)l.OH, (long long)l.OW, taps,
+                        r.a_ms, r.b_ms,
+                        l.work / r.a_ms / 1e6, l.work / r.b_ms / 1e6,
+                        r.a_ms / r.b_ms, r.null_pct,
+                        real ? "" : " (noise)");
+            if (nt == threads.front()) {
+                sum_channel_first += r.a_ms;
+                sum_channel_last += r.b_ms;
+                sum_work += l.work;
+            }
+        }
+    }
+    std::printf("    %-45s %6s %6s %6s | %8.3f %8.3f | %7.1f %7.1f | %6.2f\n",
+                "sum of the layers (1T)", "", "", "",
+                sum_channel_first, sum_channel_last,
+                sum_work / sum_channel_first / 1e6, sum_work / sum_channel_last / 1e6,
+                sum_channel_first / sum_channel_last);
+}
+
 }  // anonymous namespace
 
 NNOPS_BENCH(tconv2d_f32) { run_table<float>("f32"); }
 NNOPS_BENCH(tconv2d_f16) { run_table<half>("f16"); }
+
+NNOPS_BENCH(tconv2d_int8_f32_out) { run_int8_table(DataType::s8, DataType::f32, "int8 s8 act -> f32 out"); }
+NNOPS_BENCH(tconv2d_int8_s8_out)  { run_int8_table(DataType::s8, DataType::s8,  "int8 s8 act -> s8 out"); }
+NNOPS_BENCH(tconv2d_int8_u8_out)  { run_int8_table(DataType::u8, DataType::u8,  "int8 u8 act -> u8 out"); }

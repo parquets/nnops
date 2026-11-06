@@ -16,9 +16,21 @@ NNOPS_OP_BOILERPLATE(TransposeConv2D, TransposeConv2DAttributes,
 std::vector<TensorDesc> TransposeConv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return transpose_conv2d_output_shape(
+    std::vector<TensorDesc> outs = transpose_conv2d_output_shape(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
         attrs_.output_padding, attrs_.groups, inputs);
+
+    // The quantized route writes s8/u8 when output_dtype says so, else the fp
+    // activation's dtype (output_dtype for a pre-quantized one); an unsupported
+    // request passes through for the kernel to refuse.
+    if (inputs.size() > 1 && is_quantized_transpose_conv2d(inputs[1].dtype)) {
+        const DataType act = inputs[0].dtype;
+        const bool fp_act = (act == DataType::f32 || act == DataType::f16);
+        const DataType odt = attrs_.output_dtype;
+        const bool int_out = odt == DataType::s8 || odt == DataType::u8;
+        outs[0].dtype = (int_out || !fp_act) ? odt : act;
+    }
+    return outs;
 }
 
 Status TransposeConv2D::validate(std::span<const TensorDesc> inputs,

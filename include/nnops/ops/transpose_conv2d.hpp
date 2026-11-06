@@ -6,6 +6,14 @@
 /// channel-last
 /// (the output carries its layout); the weight is channel-first [IC, OC/G, KH, KW] in
 /// both cases; bias [OC] optional. Reference: ncnn Deconvolution.
+///
+/// Data types: f32/f16 on every input and output (the floating-point route), or
+/// the quantized route — an s8 weight with per-channel QuantParams against a
+/// u8/s8/f16/f32 activation with per-tensor QuantParams, producing fp or s8/u8
+/// output (see output_dtype and is_quantized_transpose_conv2d()). The bias dtype
+/// follows the output: [OC] in the output's fp dtype on an fp destination, [OC]
+/// int32 (the raw accumulate, added before the activation, never scaled) on
+/// s8/u8. add_to is refused on the quantized route.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -18,6 +26,12 @@
 #include <span>
 
 namespace nnops {
+
+/// True when the weight dtype selects the quantized route; the CPU backend
+/// dispatches on this predicate.
+inline constexpr bool is_quantized_transpose_conv2d(DataType weight_dtype) noexcept {
+    return weight_dtype == DataType::s8;
+}
 
 /// Attributes describing a 2D transposed convolution.
 struct TransposeConv2DAttributes {
@@ -46,6 +60,28 @@ struct TransposeConv2DAttributes {
 
     /// If true, add into the existing output buffer instead of overwriting.
     bool add_to = false;
+
+    // ---- quantized route (is_quantized_transpose_conv2d(weight): s8 weights) --
+    // Mirror Conv2D's two attributes: same names, same meaning; ignored on the
+    // floating-point route.
+
+    /// Quantized-route output dtype.
+    ///   f32 (default) / f16: dequantize the int32 accumulate. With an fp
+    ///                        activation the output follows the activation's
+    ///                        dtype and this value is ignored; with a
+    ///                        pre-quantized (u8/s8) activation it is honoured.
+    ///   s8 / u8:             requantize with the output's QuantParams (scale
+    ///                        s_w·s_x/out_scale, round half away from zero,
+    ///                        clamped to the storage range; the product is f32).
+    ///                        Honoured for every activation dtype; the bias is
+    ///                        then int32 rather than the output dtype.
+    /// Any other value is refused by the kernel.
+    DataType output_dtype = DataType::f32;
+
+    /// Integer storage an fp activation is quantized to inside the kernel: s8
+    /// (default) or u8, selecting the clamp range and zero-point convention.
+    /// Only read when the activation is f32/f16.
+    DataType act_quant_dtype = DataType::s8;
 };
 
 class TransposeConv2D : public OpBase {

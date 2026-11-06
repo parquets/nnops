@@ -46,6 +46,7 @@ set(TEST_SOURCES
     test_flatten.cpp
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
+    test_transpose_conv2d_int8.cpp
     test_moe.cpp
     test_cpu_backend.cpp
     test_status.cpp
@@ -84,6 +85,7 @@ add_library(nnops_test_reference STATIC
     reference/recurrent_ref.cpp
     reference/resize_ref.cpp
     reference/transpose_conv2d_ref.cpp
+    reference/transpose_conv2d_int8_ref.cpp
 )
 target_link_libraries(nnops_test_reference PRIVATE nnops_cpu)
 target_include_directories(nnops_test_reference PRIVATE

@@ -50,11 +50,13 @@
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
+#include "backend/cpu/simd_kernel/simd_quant.hpp"   // quant_kernel::quantization
 #include "backend/cpu/matmul/matmul.h"
 #include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <type_traits>
 
 namespace nnops::backend::cpu {
@@ -581,6 +583,688 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
     return true;
 }
 
+// =========================================================================
+//  Quantized route — s8 weight (per-channel), u8/s8/f32/f16 activation
+// =========================================================================
+//
+// The two col-matrix routes above, with the int32 accumulate as the col: the
+// quantized GEMM (MatMulInteger) reduces the input channels and withdraws both
+// zero points, so the scatter adds raw int32 and the merge does what the fp
+// merge did — bias, clip, epilogue — under a dequantize or a requantize. The
+// geometry does not change, which is why each scatter below is the fp scatter
+// element for element.
+//
+// The activation is normalised to one s8 plane per call so the GEMM sees a
+// single zero-point convention: an fp activation is quantized into it (its
+// act_quant_dtype picks the clamp range), and a u8 activation is shifted to s8
+// with its zero point moved by -128 — the same value, one convention. A
+// pre-quantized s8 activation whose rows are dense is read in place.
+//
+// The weight keeps its per-channel parameters. The GEMM's reduction axis is the
+// input channel, so an output channel owns karea consecutive rows (channel-
+// first) or columns (channel-last) and its (scale, zero point) has to be
+// replicated across them — the one thing the operand views need that the raw
+// tensors do not have. Replication is cheap and per chunk: the taps of one
+// channel always sit together.
+
+namespace k = nnops::kernel;
+
+/// row[0, n) += src[0, n) over the int32 col (simd has no int32 vector).
+void row_add_i32(int32_t* dst, const int32_t* src, int64_t n)
+{
+    for (int64_t i = 0; i < n; ++i) { dst[i] += src[i]; }
+}
+
+/// One (scale, zero point) for the whole tensor.
+inline QuantParams qp_per_tensor(float scale, int32_t zero)
+{
+    QuantParams q;
+    q.scale = scale;
+    q.zero_point = zero;
+    return q;
+}
+
+/// One (scale, zero point) per row (channel-first) or column (channel-last).
+inline QuantParams qp_per_channel(const float* scale, const int32_t* zero, int64_t n)
+{
+    QuantParams q;
+    q.granularity = QuantGranularity::PerChannel;
+    q.scale_data = scale;
+    q.zero_point_data = zero;
+    q.num_scales = n;
+    return q;
+}
+
+/// The activation the int8 GEMM reads: an s8 plane (or the input itself when it
+/// is already s8 and dense) and the single (scale, zero point) it carries.
+struct ActPlane {
+    const int8_t* ptr = nullptr;
+    int64_t n_stride = 0;   ///< elements per batch item
+    float scale = 1.0f;
+    int32_t zero = 0;
+};
+
+/// Quantize/shift the activation into a dense s8 plane in the layout the route
+/// reads: channel-first is channel-major [N][IC][IH·IW], channel-last is
+/// pixel-major [N][IH·IW][IC]. @p zero is the plane's zero point (-128 from the
+/// stored one when the storage was unsigned).
+template <class TAct>
+void build_activation_plane(const TensorView& in, int8_t* dst, float scale,
+                            int32_t zero, bool channel_last, int64_t IC,
+                            int64_t IH, int64_t IW, const ComputeContext& ctx)
+{
+    const int64_t N  = in.shape(0);
+    const int64_t rs = in.row_stride_elems();
+    const int64_t ns = in.stride_elems(0);
+    const int64_t cs = channel_last ? 0 : in.stride_elems(1);
+    const int64_t row_len = channel_last ? IW * IC : IW;
+    const int64_t rows_n  = channel_last ? IH : IC * IH;
+    const int64_t total   = N * rows_n;
+    const TAct* src = in.ptr<TAct>();
+    const float s = scale;
+    const float z = static_cast<float>(zero);
+
+    const auto run_rows = [&](int64_t beg, int64_t end) {
+        for (int64_t r = beg; r < end; ++r) {
+            const int64_t nb = r / rows_n;
+            const int64_t i  = r - nb * rows_n;
+            const int64_t h  = channel_last ? i : i % IH;
+            const int64_t c  = channel_last ? 0 : i / IH;
+            const TAct* sp = src + nb * ns + c * cs + h * rs;
+            int8_t* dp = dst + (nb * rows_n + i) * row_len;
+            if constexpr (std::is_same_v<TAct, int8_t>) {
+                std::memcpy(dp, sp, static_cast<size_t>(row_len));
+            } else if constexpr (std::is_same_v<TAct, uint8_t>) {
+                for (int64_t k = 0; k < row_len; ++k) {
+                    dp[k] = static_cast<int8_t>(static_cast<uint8_t>(sp[k]) ^ 0x80u);
+                }
+            } else {
+                k::quant_kernel::quantization<int8_t>(
+                    static_cast<int>(1), static_cast<int>(row_len), dp, 1, sp, 1,
+                    &s, &z);
+            }
+        }
+    };
+
+    // Below this a dispatch costs more than the pass (see quantize_plane).
+    constexpr int64_t kInlineMax = int64_t{1} << 19;
+    const int64_t nt = std::max<int64_t>(ctx.cpu.thread_count(), 1);
+    if (nt == 1 || total <= kInlineMax) {
+        run_rows(0, total);
+        return;
+    }
+    const int64_t slab = (total + nt - 1) / nt;
+    const int64_t nslab = (total + slab - 1) / slab;
+    ctx.cpu.run(0, nslab, [&](int64_t i) {
+        run_rows(i * slab, std::min(i * slab + slab, total));
+    });
+}
+
+/// Channel-first quantized route: one int8 GEMM per (n, group, oc chunk) gives
+/// every (oc, tap) row over every input pixel, and the fp route's scatter adds
+/// those int32 rows into a scratch row before the merge requantizes.
+template <typename TOut>
+bool tconv2d_int8_channel_first(const Geom& gm, TensorView& output,
+                                std::span<const TensorView> inputs,
+                                const ActPlane& act, const ComputeContext& ctx)
+{
+    const auto& weight = inputs[1];
+    const bool has_bias = inputs.size() > 2;
+    constexpr bool kIntOut =
+        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+
+    if (weight.row_stride_elems() != gm.KW) { return false; }
+    if (gm.KH > kMaxRowTaps) { return false; }
+
+    const int64_t karea = gm.KH * gm.KW;
+    const int64_t npix  = gm.IH * gm.IW;
+    const int64_t icg   = gm.IC_per_G;
+    const int64_t ocg   = gm.OC_per_G;
+    if (npix <= 0 || icg <= 0 || ocg <= 0) { return false; }
+
+    const int64_t out_n_stride   = output.stride_elems(0);
+    const int64_t out_c_stride   = output.stride_elems(1);
+    const int64_t out_row_stride = output.row_stride_elems();
+
+    const int64_t mic     = (gm.OW + gm.SW - 1) / gm.SW;
+    const int64_t row_len = gm.SW * mic;
+    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
+
+    const int64_t elems_per_oc = karea * npix;
+    const int64_t cap = kColCapBytes / static_cast<int64_t>(sizeof(int32_t));
+    const int64_t chunk = std::max<int64_t>(
+        1, std::min(ocg, cap / std::max<int64_t>(elems_per_oc, 1)));
+
+    PoolArray<int32_t> col(static_cast<size_t>(chunk * elems_per_oc));
+    PoolArray<int32_t> rows(static_cast<size_t>(slots * row_len));
+    PoolArray<float> w_scale(static_cast<size_t>(chunk * karea));
+    PoolArray<int32_t> w_zp(static_cast<size_t>(chunk * karea));
+    if (!col || !rows || !w_scale || !w_zp) { return false; }
+
+    const auto* w_ptr = weight.ptr<int8_t>();
+    const QuantParams& qw = weight.quant_params();
+    const auto* b_i32 = (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
+    const TOut* b_fp = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    const float s_x = act.scale;
+    const QuantParams act_qp = qp_per_tensor(s_x, act.zero);
+
+    const QuantParams& qo = output.quant_params();
+    const float out_scale = kIntOut ? quant_scale_at(qo, 0) : 0.0f;
+    const int32_t zp_out = kIntOut ? quant_zp_at(qo, 0) : 0;
+    const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
+
+    auto* out_ptr = output.ptr<TOut>();
+
+    MatMulAttributes mm{};
+    mm.transpose_a = true;
+
+    for (int64_t n = 0; n < gm.N; ++n) {
+        const int8_t* in_n = act.ptr + n * act.n_stride;
+        TOut* out_n = out_ptr + n * out_n_stride;
+
+        for (int64_t g = 0; g < gm.G; ++g) {
+            const int8_t* w_g = w_ptr + g * icg * (ocg * karea);
+
+            // B: the group's whole input plane, [IC/G] × [IH·IW].
+            const int64_t bshape[] = {icg, npix};
+            TensorView bm(std::span<const int64_t>(bshape, 2), DataType::s8,
+                          const_cast<int8_t*>(in_n + g * icg * npix),
+                          static_cast<int64_t>(npix), TensorLayout::NCHW, act_qp);
+
+            for (int64_t oc0 = 0; oc0 < ocg; oc0 += chunk) {
+                const int64_t cc = std::min(chunk, ocg - oc0);
+                const int64_t m  = cc * karea;
+
+                // A channel's karea taps are consecutive GEMM rows, so its
+                // (scale, zero point) fills karea entries.
+                for (int64_t o = 0; o < cc; ++o) {
+                    const int64_t oc = g * ocg + oc0 + o;
+                    const float s = quant_scale_at(qw, oc);
+                    const int32_t z = quant_zp_at(qw, oc);
+                    for (int64_t t = 0; t < karea; ++t) {
+                        w_scale.data()[o * karea + t] = s;
+                        w_zp.data()[o * karea + t] = z;
+                    }
+                }
+
+                const int64_t ashape[] = {icg, m};
+                TensorView am(std::span<const int64_t>(ashape, 2), DataType::s8,
+                              const_cast<int8_t*>(w_g + oc0 * karea),
+                              static_cast<int64_t>(ocg * karea), TensorLayout::NCHW,
+                              qp_per_channel(w_scale.data(), w_zp.data(), m));
+                const int64_t cshape[] = {m, npix};
+                TensorView cm(std::span<const int64_t>(cshape, 2), DataType::s32,
+                              col.data(),
+                              static_cast<int64_t>(npix * sizeof(int32_t)),
+                              TensorLayout::NCHW);
+
+                const TensorView mins[] = {am, bm};
+                matmul_cpu(mm, cm, mins, ctx, nullptr);
+
+                ctx.cpu.run(0, cc * gm.OH, [&](int64_t task) {
+                    const int64_t oc_l = task / gm.OH;
+                    const int64_t oh   = task % gm.OH;
+                    int32_t* row = rows.data() +
+                        static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
+                    std::fill_n(row, row_len, int32_t{0});
+
+                    // Which kernel rows land on this output row.
+                    int64_t kh_of[kMaxRowTaps];
+                    int64_t ih_of[kMaxRowTaps];
+                    int64_t taps = 0;
+                    for (int64_t kh = 0; kh < gm.KH; ++kh) {
+                        const int64_t nh = oh + gm.PH - kh * gm.DH;
+                        if (nh < 0 || nh % gm.SH != 0) { continue; }
+                        const int64_t ih = nh / gm.SH;
+                        if (ih >= gm.IH) { continue; }
+                        kh_of[taps] = kh;
+                        ih_of[taps] = ih;
+                        ++taps;
+                    }
+
+                    for (int64_t ti = 0; ti < taps; ++ti) {
+                        const int32_t* base = col.data() +
+                            (oc_l * karea + kh_of[ti] * gm.KW) * npix +
+                            ih_of[ti] * gm.IW;
+                        for (int64_t kw = 0; kw < gm.KW; ++kw) {
+                            const int64_t d = gm.PW - kw * gm.DW;
+                            for (int64_t r = 0; r < gm.SW; ++r) {
+                                if (r >= gm.OW) { break; }
+                                const int64_t nd = r + d;
+                                if (nd % gm.SW != 0) { continue; }
+                                const int64_t shift = nd / gm.SW;
+                                const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
+                                const int64_t tlo = std::max<int64_t>(0, -shift);
+                                const int64_t thi = std::min<int64_t>(nr, gm.IW - shift);
+                                if (thi <= tlo) { continue; }
+                                row_add_i32(row + r * mic + tlo,
+                                            base + kw * npix + shift + tlo,
+                                            thi - tlo);
+                            }
+                        }
+                    }
+
+                    const int64_t oc = g * ocg + oc0 + oc_l;
+                    const float s_w = quant_scale_at(qw, oc);
+                    const float req = kIntOut
+                        ? matmul_int8_requant_scale(s_w, s_x, out_scale) : 0.0f;
+                    TOut* orow = out_n + oc * out_c_stride + oh * out_row_stride;
+                    for (int64_t r = 0; r < gm.SW; ++r) {
+                        if (r >= gm.OW) { break; }
+                        const int64_t nr = (gm.OW - r + gm.SW - 1) / gm.SW;
+                        const int32_t* rp = row + r * mic;
+                        for (int64_t t = 0; t < nr; ++t) {
+                            const int64_t ow = r + t * gm.SW;
+                            if constexpr (kIntOut) {
+                                int32_t v = rp[t];
+                                if (b_i32) { v += b_i32[oc]; }
+                                if (relu) { v = std::max(v, int32_t{0}); }
+                                orow[ow] = matmul_int8_requant<TOut>(v, req, zp_out);
+                            } else {
+                                float f = static_cast<float>(rp[t]) * (s_w * s_x);
+                                if (b_fp) { f += s_load(&b_fp[oc]); }
+                                f = std::min(std::max(f, gm.epilogue.min_clip),
+                                             gm.epilogue.max_clip);
+                                f = nnops::apply_epilogue(gm.epilogue, f, oc);
+                                s_store(&orow[ow], f);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    return true;
+}
+
+/// Channel-last quantized route: one int8 GEMM per (group, oc chunk, batch)
+/// gives [pixel] × [tap·oc], and the fp route's stride-residue scatter adds the
+/// int32 columns before the merge. The filter is always permuted here, unlike
+/// the fp route's in-place orientation: its columns carry the per-channel
+/// parameters, which the raw [oc][tap] order does not line up with.
+template <typename TOut>
+bool tconv2d_int8_channel_last(const Geom& gm, TensorView& output,
+                               std::span<const TensorView> inputs,
+                               const ActPlane& act, const ComputeContext& ctx)
+{
+    const auto& weight = inputs[1];
+    const bool has_bias = inputs.size() > 2;
+    constexpr bool kIntOut =
+        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+
+    if (weight.row_stride_elems() != gm.KW) { return false; }
+
+    const int64_t karea = gm.KH * gm.KW;
+    const int64_t npix  = gm.IH * gm.IW;
+    const int64_t icg   = gm.IC_per_G;
+    const int64_t ocg   = gm.OC_per_G;
+    if (npix <= 0 || karea <= 0 || icg <= 0) { return false; }
+
+    const int64_t out_n_stride   = output.stride_elems(0);
+    const int64_t out_row_stride = output.row_stride_elems();
+    const int64_t slots          = std::max(1, ctx.cpu.worker_count());
+
+    // The col and the per-worker row scratch both scale with the oc chunk.
+    const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(int32_t));
+    int64_t cc = ocg;
+    cc = std::min(cc, std::max<int64_t>(1, elem_cap / (npix * karea)));
+    cc = std::min(cc, std::max<int64_t>(1, elem_cap / (slots * gm.OW)));
+
+    PoolArray<int32_t> col(static_cast<size_t>(npix * karea * cc));
+    PoolArray<int8_t> aux(static_cast<size_t>(icg * karea * cc));
+    PoolArray<int32_t> rows(static_cast<size_t>(slots * gm.OW * cc));
+    PoolArray<float> b_scale(static_cast<size_t>(karea * cc));
+    PoolArray<int32_t> b_zp(static_cast<size_t>(karea * cc));
+    if (!col || !aux || !rows || !b_scale || !b_zp) { return false; }
+
+    const auto* w_ptr = weight.ptr<int8_t>();
+    const QuantParams& qw = weight.quant_params();
+    const auto* b_i32 = (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
+    const TOut* b_fp = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    const float s_x = act.scale;
+    const QuantParams act_qp = qp_per_tensor(s_x, act.zero);
+
+    const QuantParams& qo = output.quant_params();
+    const float out_scale = kIntOut ? quant_scale_at(qo, 0) : 0.0f;
+    const int32_t zp_out = kIntOut ? quant_zp_at(qo, 0) : 0;
+    const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
+
+    auto* out_ptr = output.ptr<TOut>();
+
+    MatMulAttributes mm{};
+
+    for (int64_t g = 0; g < gm.G; ++g) {
+        for (int64_t oc0 = 0; oc0 < ocg; oc0 += cc) {
+            const int64_t nc = std::min(cc, ocg - oc0);
+            if (nc <= 0) { continue; }
+            const int64_t m = nc * karea;
+
+            // Per-column (tap, oc) parameters: B's columns are the
+            // (kh, kw, oc) triples of one output channel.
+            for (int64_t o = 0; o < nc; ++o) {
+                const int64_t oc = g * ocg + oc0 + o;
+                const float s = quant_scale_at(qw, oc);
+                const int32_t z = quant_zp_at(qw, oc);
+                for (int64_t t = 0; t < karea; ++t) {
+                    b_scale.data()[t * nc + o] = s;
+                    b_zp.data()[t * nc + o] = z;
+                }
+            }
+
+            // B: the group's filter slice as [IC/G] × [KH·KW·nc], a blocked
+            // transpose of the channel-first [IC/G][OC/G][KH·KW] rows.
+            for (int64_t ic = 0; ic < icg; ++ic) {
+                const int8_t* src = w_ptr + ((g * icg + ic) * ocg + oc0) * karea;
+                int8_t* dst = aux.data() + ic * m;
+                constexpr int64_t kB = 8;
+                for (int64_t o0 = 0; o0 < nc; o0 += kB) {
+                    const int64_t o1 = std::min(o0 + kB, nc);
+                    for (int64_t t0 = 0; t0 < karea; t0 += kB) {
+                        const int64_t t1 = std::min(t0 + kB, karea);
+                        for (int64_t o = o0; o < o1; ++o) {
+                            int8_t* d = dst + t0 * nc + o;
+                            const int8_t* s = src + o * karea + t0;
+                            for (int64_t t = 0; t < t1 - t0; ++t) { d[t * nc] = s[t]; }
+                        }
+                    }
+                }
+            }
+
+            const int64_t bshape[] = {icg, m};
+            TensorView bm(std::span<const int64_t>(bshape, 2), DataType::s8,
+                          aux.data(), static_cast<int64_t>(m), TensorLayout::NCHW,
+                          qp_per_channel(b_scale.data(), b_zp.data(), m));
+
+            for (int64_t n = 0; n < gm.N; ++n) {
+                const int8_t* in_n = act.ptr + n * act.n_stride;
+                TOut* out_n = out_ptr + n * out_n_stride;
+
+                // A: the channel-last image as [IH·IW] × [IC/G] pixels — one
+                // pixel stride of IC, so the group offset is g·IC/G elements in.
+                const int64_t ashape[] = {npix, icg};
+                TensorView am(std::span<const int64_t>(ashape, 2), DataType::s8,
+                              const_cast<int8_t*>(in_n + g * icg),
+                              static_cast<int64_t>(gm.IC), TensorLayout::NCHW,
+                              act_qp);
+                const int64_t cshape[] = {npix, m};
+                TensorView cm(std::span<const int64_t>(cshape, 2), DataType::s32,
+                              col.data(),
+                              static_cast<int64_t>(m * sizeof(int32_t)),
+                              TensorLayout::NCHW);
+
+                const TensorView mins[] = {am, bm};
+                matmul_cpu(mm, cm, mins, ctx, nullptr);
+
+                ctx.cpu.run(0, gm.OH, [&](int64_t oh) {
+                    int32_t* row = rows.data() +
+                        static_cast<int64_t>(ctx.cpu.current_thread_id()) *
+                            (gm.OW * nc);
+                    std::fill_n(row, gm.OW * nc, int32_t{0});
+
+                    for (int64_t kh = 0; kh < gm.KH; ++kh) {
+                        const int64_t num_h = oh + gm.PH - kh * gm.DH;
+                        if (num_h < 0 || num_h % gm.SH != 0) { continue; }
+                        const int64_t ih = num_h / gm.SH;
+                        if (ih >= gm.IH) { continue; }
+                        const int32_t* ihrow = col.data() + ih * gm.IW * m;
+
+                        for (int64_t kw = 0; kw < gm.KW; ++kw) {
+                            const int32_t* colw = ihrow + (kh * gm.KW + kw) * nc;
+                            for (int64_t r = 0; r < gm.SW && r < gm.OW; ++r) {
+                                const int64_t num_w = r + gm.PW - kw * gm.DW;
+                                if (num_w % gm.SW != 0) { continue; }
+                                const int64_t sh  = num_w / gm.SW;
+                                const int64_t mic = (gm.OW - r + gm.SW - 1) / gm.SW;
+                                const int64_t tlo = std::max<int64_t>(0, -sh);
+                                const int64_t thi = std::min<int64_t>(mic, gm.IW - sh);
+                                for (int64_t t = tlo; t < thi; ++t) {
+                                    row_add_i32(row + (r + t * gm.SW) * nc,
+                                                colw + (t + sh) * m, nc);
+                                }
+                            }
+                        }
+                    }
+
+                    TOut* orow = out_n + oh * out_row_stride + g * ocg + oc0;
+                    for (int64_t ow = 0; ow < gm.OW; ++ow) {
+                        const int32_t* rp = row + ow * nc;
+                        TOut* dp = orow + ow * gm.OC;
+                        for (int64_t c = 0; c < nc; ++c) {
+                            const int64_t oc = g * ocg + oc0 + c;
+                            const float s_w = quant_scale_at(qw, oc);
+                            if constexpr (kIntOut) {
+                                int32_t v = rp[c];
+                                if (b_i32) { v += b_i32[oc]; }
+                                if (relu) { v = std::max(v, int32_t{0}); }
+                                dp[c] = matmul_int8_requant<TOut>(
+                                    v, matmul_int8_requant_scale(s_w, s_x, out_scale),
+                                    zp_out);
+                            } else {
+                                float f = static_cast<float>(rp[c]) * (s_w * s_x);
+                                if (b_fp) { f += s_load(&b_fp[oc]); }
+                                f = std::min(std::max(f, gm.epilogue.min_clip),
+                                             gm.epilogue.max_clip);
+                                f = nnops::apply_epilogue(gm.epilogue, f, oc);
+                                s_store(&dp[c], f);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    return true;
+}
+
+/// Scalar quantized gather — the total route. Each term is
+/// (w - zp_w)·(x - zp_x) in int32, the reference's own arithmetic; used when the
+/// operands cannot be read as flat matrices or the kernel is too tall for the
+/// per-row tap list.
+template <typename TOut>
+void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
+                         std::span<const TensorView> inputs, const ActPlane& act,
+                         bool channel_last, const ComputeContext& ctx)
+{
+    const auto& weight = inputs[1];
+    const bool has_bias = inputs.size() > 2;
+    constexpr bool kIntOut =
+        std::is_same_v<TOut, int8_t> || std::is_same_v<TOut, uint8_t>;
+
+    const int64_t npix = gm.IH * gm.IW;
+    const auto* w_ptr = weight.ptr<int8_t>();
+    const QuantParams& qw = weight.quant_params();
+    const auto* b_i32 = (has_bias && kIntOut) ? inputs[2].ptr<int32_t>() : nullptr;
+    const TOut* b_fp = (has_bias && !kIntOut) ? inputs[2].ptr<TOut>() : nullptr;
+    const float s_x = act.scale;
+    const QuantParams& qo = output.quant_params();
+    const float out_scale = kIntOut ? quant_scale_at(qo, 0) : 0.0f;
+    const int32_t zp_out = kIntOut ? quant_zp_at(qo, 0) : 0;
+    const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
+
+    const int64_t in_c_stride  = channel_last ? 1 : npix;
+    const int64_t in_row_stride = channel_last ? gm.IC : gm.IW;
+    const int64_t out_c_stride = output.stride_elems(1);
+    const int64_t out_row_stride = output.row_stride_elems();
+    const int64_t out_n_stride = output.stride_elems(0);
+    auto* out_ptr = output.ptr<TOut>();
+
+    const auto process = [&](int64_t task) {
+        const int64_t n  = task / gm.OC;
+        const int64_t oc = task % gm.OC;
+        const int64_t g = oc / gm.OC_per_G;
+        const int64_t oc_l = oc % gm.OC_per_G;
+        const float s_w = quant_scale_at(qw, oc);
+        const int32_t zp_w = quant_zp_at(qw, oc);
+        const int8_t* in_n = act.ptr + n * act.n_stride;
+        TOut* out_plane = out_ptr + n * out_n_stride + oc * out_c_stride;
+
+        for (int64_t oh = 0; oh < gm.OH; ++oh) {
+            TOut* orow = out_plane + oh * out_row_stride;
+            for (int64_t ow = 0; ow < gm.OW; ++ow) {
+                int32_t acc = 0;
+                for (int64_t kh = 0; kh < gm.KH; ++kh) {
+                    const int64_t num_h = oh + gm.PH - kh * gm.DH;
+                    if (num_h < 0 || num_h % gm.SH != 0) { continue; }
+                    const int64_t ih = num_h / gm.SH;
+                    if (ih >= gm.IH) { continue; }
+                    for (int64_t kw = 0; kw < gm.KW; ++kw) {
+                        const int64_t num_w = ow + gm.PW - kw * gm.DW;
+                        if (num_w < 0 || num_w % gm.SW != 0) { continue; }
+                        const int64_t iw = num_w / gm.SW;
+                        if (iw >= gm.IW) { continue; }
+                        const int8_t* xp = in_n +
+                            (channel_last ? (ih * gm.IW + iw) * gm.IC + g * gm.IC_per_G
+                                          : (g * gm.IC_per_G) * npix + ih * in_row_stride + iw);
+                        for (int64_t ic_l = 0; ic_l < gm.IC_per_G; ++ic_l) {
+                            const int64_t ic = g * gm.IC_per_G + ic_l;
+                            const int32_t xv = static_cast<int32_t>(xp[ic_l * in_c_stride]);
+                            const int64_t wi =
+                                ((ic * gm.OC_per_G + oc_l) * gm.KH + kh) * gm.KW + kw;
+                            acc += (static_cast<int32_t>(w_ptr[wi]) - zp_w) * (xv - act.zero);
+                        }
+                    }
+                }
+
+                if constexpr (kIntOut) {
+                    int32_t v = acc;
+                    if (b_i32) { v += b_i32[oc]; }
+                    if (relu) { v = std::max(v, int32_t{0}); }
+                    orow[ow] = matmul_int8_requant<TOut>(
+                        v, matmul_int8_requant_scale(s_w, s_x, out_scale), zp_out);
+                } else {
+                    float f = static_cast<float>(acc) * (s_w * s_x);
+                    if (b_fp) { f += s_load(&b_fp[oc]); }
+                    f = std::min(std::max(f, gm.epilogue.min_clip),
+                                 gm.epilogue.max_clip);
+                    f = nnops::apply_epilogue(gm.epilogue, f, oc);
+                    s_store(&orow[ow], f);
+                }
+            }
+        }
+    };
+
+    ctx.cpu.run(0, gm.N * gm.OC, process);
+}
+
+template <typename TOut>
+void tconv2d_int8_layout(const Geom& gm, TensorView& output,
+                         std::span<const TensorView> inputs, const ActPlane& act,
+                         const ComputeContext& ctx)
+{
+    if (is_channel_last(inputs[0].layout())) {
+        if (tconv2d_int8_channel_last<TOut>(gm, output, inputs, act, ctx)) { return; }
+    } else if (tconv2d_int8_channel_first<TOut>(gm, output, inputs, act, ctx)) {
+        return;
+    }
+    tconv2d_int8_scalar<TOut>(gm, output, inputs, act,
+                              is_channel_last(inputs[0].layout()), ctx);
+}
+
+/// One activation storage type of the quantized route: build the plane, then
+/// dispatch the output dtype.
+template <class TAct>
+Status tconv2d_int8_act(const TransposeConv2DAttributes& attrs, const Geom& gm,
+                        TensorView& output, std::span<const TensorView> inputs,
+                        const ComputeContext& ctx)
+{
+    constexpr bool kFpAct =
+        !std::is_same_v<TAct, int8_t> && !std::is_same_v<TAct, uint8_t>;
+    const auto& input = inputs[0];
+    const DataType adt = input.data_type();
+    const bool target_u8 = kFpAct ? (attrs.act_quant_dtype == DataType::u8)
+                                  : (adt == DataType::u8);
+    const QuantParams& qa = input.quant_params();
+    const float s_x    = quant_scale_at(qa, 0);
+    const int32_t zp_x = quant_zp_at(qa, 0);
+
+    const bool channel_last = is_channel_last(input.layout());
+    const int64_t npix = gm.IH * gm.IW;
+    const bool dense = channel_last
+        ? (input.row_stride_elems() == gm.IW * gm.IC)
+        : (input.row_stride_elems() == gm.IW);
+    // A pre-quantized s8 activation with dense rows needs no plane at all.
+    const bool in_place = !kFpAct && adt == DataType::s8 && dense;
+
+    ActPlane act;
+    act.scale = s_x;
+    act.zero = zp_x - (target_u8 ? 128 : 0);
+    // An empty plane (IH or IW 0) leaves the pointer on the input: no pixel of
+    // it is ever read, but the batch walk still forms in_n.
+    act.ptr = reinterpret_cast<const int8_t*>(input.ptr<TAct>());
+
+    PoolArray<int8_t> plane;
+    if (in_place) {
+        act.ptr = input.ptr<int8_t>();
+        act.n_stride = input.stride_elems(0);
+    } else if (npix > 0) {
+        const int64_t total = gm.N * gm.IC * npix;
+        plane.reset(static_cast<size_t>(total));
+        if (!plane) { return Status::out_of_memory; }
+        build_activation_plane<TAct>(input, plane.data(), s_x, act.zero,
+                                     channel_last, gm.IC, gm.IH, gm.IW, ctx);
+        act.ptr = plane.data();
+        act.n_stride = gm.IC * npix;
+    }
+
+    switch (output.data_type()) {
+    case DataType::f32:
+        tconv2d_int8_layout<float>(gm, output, inputs, act, ctx);
+        break;
+    case DataType::f16:
+        tconv2d_int8_layout<half>(gm, output, inputs, act, ctx);
+        break;
+    case DataType::s8:
+        tconv2d_int8_layout<int8_t>(gm, output, inputs, act, ctx);
+        break;
+    default:
+        tconv2d_int8_layout<uint8_t>(gm, output, inputs, act, ctx);
+        break;
+    }
+    return Status::ok;
+}
+
+/// dtype gate of the quantized route, then the activation dispatch.
+Status transpose_conv2d_int8_cpu(const TransposeConv2DAttributes& attrs,
+                                 const Geom& gm, TensorView& output,
+                                 std::span<const TensorView> inputs,
+                                 const ComputeContext& ctx)
+{
+    const DataType adt = inputs[0].data_type();
+    const DataType odt = output.data_type();
+    const bool fp_act = adt == DataType::f32 || adt == DataType::f16;
+    const bool int_out = odt == DataType::s8 || odt == DataType::u8;
+
+    if (!fp_act && adt != DataType::s8 && adt != DataType::u8) {
+        return Status::unsupported;
+    }
+    if (!int_out && odt != DataType::f32 && odt != DataType::f16) {
+        return Status::unsupported;
+    }
+    // An fp activation keeps its own dtype on an fp destination; a pre-quantized
+    // one is dequantized to whatever output_dtype asked for.
+    if (!int_out && fp_act && odt != adt) { return Status::unsupported; }
+    if (inputs.size() > 2) {
+        const DataType bdt = inputs[2].data_type();
+        if (bdt != (int_out ? DataType::s32 : odt)) { return Status::unsupported; }
+    }
+    // add_to would have to keep the pre-existing destination out of the
+    // scatter; the integer accumulate has no fold for it.
+    if (attrs.add_to) { return Status::unsupported; }
+
+    if (gm.N == 0 || gm.OC == 0 || gm.OH == 0 || gm.OW == 0) { return Status::ok; }
+
+    switch (adt) {
+    case DataType::f32:
+        return tconv2d_int8_act<float>(attrs, gm, output, inputs, ctx);
+    case DataType::f16:
+        return tconv2d_int8_act<half>(attrs, gm, output, inputs, ctx);
+    case DataType::u8:
+        return tconv2d_int8_act<uint8_t>(attrs, gm, output, inputs, ctx);
+    default:
+        return tconv2d_int8_act<int8_t>(attrs, gm, output, inputs, ctx);
+    }
+}
+
 template <typename T>
 void tconv2d_impl(const Geom& gm,
                   TensorView& output,
@@ -952,6 +1636,10 @@ Status transpose_conv2d_cpu(const TransposeConv2DAttributes& attrs,
     gm.PW = attrs.padding[1];
     gm.epilogue = attrs.epilogue;
     gm.add_to = attrs.add_to;
+
+    if (is_quantized_transpose_conv2d(weight.data_type())) {
+        return transpose_conv2d_int8_cpu(attrs, gm, output, inputs, ctx);
+    }
 
     dispatch_f32_f16(input.data_type(), "transpose_conv2d_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
