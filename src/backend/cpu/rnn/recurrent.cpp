@@ -238,10 +238,11 @@ inline int64_t packed_header_bytes() noexcept {
 constexpr int64_t kQ8Kc = KC_CAP_I8;
 
 /// The input projection's column tile. int8 has no prepacked B, so the panels
-/// are addressed per k-block slab; a 512-wide column tile keeps one task's int32
-/// accumulator small (and is a whole number of nr-wide panels, which is what
-/// lets the kernel address a column block as a panel index).
-constexpr int64_t kQ8ProjNc = 512;
+/// are addressed per k-block slab; a ~512-wide column tile keeps one task's
+/// int32 accumulator small (and is a whole number of nr-wide panels, which is
+/// what lets the kernel address a column block as a panel index — so it is
+/// rounded down to one: 512 is 32 panels at nr 16, but not at nr 12).
+constexpr int64_t kQ8ProjNc = (512 / NR_MAX_I8) * NR_MAX_I8;
 
 inline int64_t q8_panels(int64_t cols) noexcept {
     return (cols + NR_MAX_I8 - 1) / NR_MAX_I8;
