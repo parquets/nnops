@@ -66,6 +66,8 @@ enum class OpType : uint8_t {
     GroupQueryAttention = 51,
     MultiLatentAttention = 52,
     DepthwiseTransposeConv2D = 53,
+    Conv1D          = 54,
+    Pool1D          = 56,
 };
 
 }  // namespace nnops

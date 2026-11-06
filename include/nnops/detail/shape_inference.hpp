@@ -170,6 +170,63 @@ inline std::vector<TensorDesc> conv2d_output_shape(
     return {out};
 }
 
+/// Returns [N, OC, OL] — the 1D twin of conv2d_output_shape, on a rank-3
+/// activation [N, IC, IL]; `weight_hwio` selects the HWIO [K, IC/G, OC] reading.
+inline std::vector<TensorDesc> conv1d_output_shape(
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t dilation,
+    int64_t padding,
+    int auto_pad,
+    int64_t groups,
+    std::span<const TensorDesc> inputs,
+    bool weight_hwio = false)
+{
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
+
+    TensorDesc out;
+    out.rank   = 3;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(3);
+    out.dims[0] = in.dims[0];
+    out.dims[1] = weight_hwio ? wt.dims[2] : wt.dims[0];
+
+    out.dims[2] = compute_spatial_output_size(
+        in.dims[2], kernel_size, stride, dilation, padding, auto_pad);
+
+    (void)groups;  // OC comes from the filter; the caller validates the split
+    return {out};
+}
+
+/// Returns [N, C, OL] — one spatial axis, so the per-axis spans of
+/// pooling_output_shape collapse to scalars.
+inline std::vector<TensorDesc> pool1d_output_shape(
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t dilation,
+    int64_t padding,
+    int auto_pad,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+
+    TensorDesc out;
+    out.rank   = 3;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(3);
+    out.dims[0] = in.dims[0];
+    out.dims[1] = in.dims[1];
+    out.dims[2] = compute_spatial_output_size(
+        in.dims[2], kernel_size, stride, dilation, padding, auto_pad);
+
+    return {out};
+}
+
 /// Returns [N, OC, OD, OH, OW] from an OIHW weight.
 inline std::vector<TensorDesc> conv3d_output_shape(
     std::span<const int64_t> kernel_size,

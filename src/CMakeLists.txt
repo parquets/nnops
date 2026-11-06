@@ -37,6 +37,8 @@ set(NNOPS_CPU_SOURCES
     ops/rope.cpp
     ops/flatten.cpp
     ops/transpose_conv2d.cpp
+    ops/conv1d.cpp
+    ops/pool1d.cpp
     ops/moe.cpp
     ops/rnn.cpp
     ops/gru.cpp
@@ -110,6 +112,10 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/transpose_conv2d.cpp
     backend/cpu/conv/pooling.cpp
     backend/cpu/conv/conv3d.cpp
+
+    # Conv1D is the 2D GEMM kernel on a rank-4 lift (conv1d_common.h), so this
+    # file only translates attributes; Pool1D lives with pooling.cpp.
+    backend/cpu/conv/conv1d.cpp
 
     # CPU tiled attention kernels (fused QK^T + softmax + AV) — one core shared
     # by MultiHeadAttention, GroupQueryAttention and MultiLatentAttention;

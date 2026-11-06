@@ -16,9 +16,17 @@
 /// Quantized pooling lives on the channel lane, so it covers only channel-last;
 /// Channel-first is unsupported. It has no whole-plane form either, so a global
 /// request is turned into the full-extent window walk.
+///
+/// An adaptive output of one on every spatial axis is the whole plane, and is
+/// resolved to the global scan here rather than in an op driver, so Pool1D gets
+/// it by the same call. Pool1D (pool1d_cpu, at the bottom) is the width-only
+/// lift of this kernel and owns no code beyond that translate.
 
 #include "nnops/ops/pooling.hpp"
+#include "nnops/ops/pool1d.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/shape_inference.hpp"
+#include "conv1d_common.h"
 #include "nnops/core/parallel_for.hpp"
 #include "backend/cpu/simd_kernel/simd_pooling.hpp"
 
@@ -528,6 +536,16 @@ void pooling_fp(const PoolingAttributes& attrs,
                 const ComputeContext& ctx)
 {
     const bool last = is_channel_last(inputs[0].layout());
+    // global wins over adaptive: an all-ones adaptive output is resolved to
+    // global above, and the plane scan is the whole window in one pass.
+    if (attrs.global) {
+        if (attrs.type == PoolingType::Max) {
+            pooling_global_impl<true, T>(attrs, output, inputs, ctx);
+        } else {
+            pooling_global_impl<false, T>(attrs, output, inputs, ctx);
+        }
+        return;
+    }
     if (attrs.adaptive()) {
         if (attrs.type == PoolingType::Max) {
             return last ? pooling_adaptive_last_impl<true, T>(attrs, output, inputs, ctx)
@@ -536,18 +554,12 @@ void pooling_fp(const PoolingAttributes& attrs,
         return last ? pooling_adaptive_last_impl<false, T>(attrs, output, inputs, ctx)
                     : pooling_adaptive_channel_first_impl<false, T>(attrs, output, inputs, ctx);
     }
-    if (!attrs.global) {
-        if (!last) {
-            pooling_impl<T>(attrs, output, inputs, ctx);
-        } else if (attrs.type == PoolingType::Max) {
-            pooling_last_impl<true, T>(attrs, output, inputs, ctx);
-        } else {
-            pooling_last_impl<false, T>(attrs, output, inputs, ctx);
-        }
+    if (!last) {
+        pooling_impl<T>(attrs, output, inputs, ctx);
     } else if (attrs.type == PoolingType::Max) {
-        pooling_global_impl<true, T>(attrs, output, inputs, ctx);
+        pooling_last_impl<true, T>(attrs, output, inputs, ctx);
     } else {
-        pooling_global_impl<false, T>(attrs, output, inputs, ctx);
+        pooling_last_impl<false, T>(attrs, output, inputs, ctx);
     }
 }
 
@@ -712,22 +724,36 @@ Status pooling_cpu(const PoolingAttributes& attrs,
     const auto odtype = output.data_type();
     const bool quant = (dtype == DataType::s8 || dtype == DataType::u8);
 
+    // An adaptive output of one on every spatial axis is the whole plane: the
+    // walk would visit the same window through a much slower loop. Resolved
+    // here rather than in the op so every caller gets it.
+    PoolingAttributes a = attrs;
+    if (a.adaptive()) {
+        const int64_t srank = PoolingAttributes::spatial_rank(inputs[0].rank());
+        const size_t first = static_cast<size_t>(3 - srank);
+        bool all_ones = true;
+        for (int64_t d = 0; d < srank; ++d) {
+            if (a.output_size[first + static_cast<size_t>(d)] != 1) { all_ones = false; }
+        }
+        if (all_ones) { a.global = true; }
+    }
+
     // Quantized pooling needs a channel lane: channel-last only, and the
     // quantized kernels have no per-output adaptive window.
-    if (quant && (!is_channel_last(inputs[0].layout()) || attrs.adaptive())) {
+    if (quant && (!is_channel_last(inputs[0].layout()) || a.adaptive())) {
         return Status::unsupported;
     }
     // ...and with no whole-plane form, a global request is walked as the full
     // extent window.
     const PoolingAttributes qattrs =
-        (quant && attrs.global) ? full_extent_window(attrs, inputs[0]) : attrs;
+        (quant && a.global) ? full_extent_window(a, inputs[0]) : a;
 
     switch (dtype) {
     case DataType::f32:
-        pooling_fp<float>(attrs, output, inputs, ctx);
+        pooling_fp<float>(a, output, inputs, ctx);
         return Status::ok;
     case DataType::f16:
-        pooling_fp<half>(attrs, output, inputs, ctx);
+        pooling_fp<half>(a, output, inputs, ctx);
         return Status::ok;
     case DataType::s8:
         if (odtype == DataType::s8) {
@@ -751,6 +777,47 @@ Status pooling_cpu(const PoolingAttributes& attrs,
         NNOPS_ASSERT(!"pooling_cpu: unsupported data type");
     }
     return Status::ok;
+}
+
+/// Pool1D: a rank-3 signal does not fit a kernel that takes its spatial rank
+/// from the activation, so [N, C, L] lifts to [N, C, 1, L] with a {1, K} window
+/// and the translate is a slot shift (the 2D activation reads the H/W entries of
+/// the per-axis spans, [1] and [2], and skips [0]). auto_pad is resolved here
+/// because the kernel only sees an explicit pad; quantized pooling stays
+/// channel-last and has no adaptive form, both inherited from the 2D kernel.
+Status pool1d_cpu(const Pool1DAttributes& attrs,
+                  TensorView& output,
+                  std::span<const TensorView> inputs,
+                  const ComputeContext& ctx,
+                  void* workspace)
+{
+    const auto& input = inputs[0];
+
+    PoolingAttributes a{};
+    a.type        = (attrs.type == Pool1DType::Max) ? PoolingType::Max
+                                                    : PoolingType::Average;
+    a.kernel_shape = {1, 1, attrs.kernel_shape};
+    a.stride       = {1, 1, attrs.stride};
+    a.padding      = {0, 0, attrs.padding};
+    a.dilation     = {1, 1, attrs.dilation};
+    a.exclude_pad  = attrs.exclude_pad;
+    a.add_to       = attrs.add_to;
+    a.global       = attrs.global;
+    // A 2D activation reads output_size's H and W slots; H stays 1.
+    a.output_size  = {0, 1, attrs.output_size};
+
+    if (!a.global && !a.adaptive() &&
+        attrs.auto_pad != Pool1DAttributes::AutoPad::NOTSET) {
+        a.padding[2] = resolve_leading_padding(
+            input.shape(2), attrs.kernel_shape, attrs.stride, attrs.dilation,
+            attrs.padding, static_cast<int>(attrs.auto_pad));
+    }
+    a.auto_pad = PoolingAttributes::AutoPad::NOTSET;
+
+    TensorView out4 = lift_wide(output);
+    TensorView in4  = lift_wide(input);
+    const TensorView ins[1] = {in4};
+    return pooling_cpu(a, out4, std::span<const TensorView>(ins, 1), ctx, workspace);
 }
 
 }  // namespace nnops::backend::cpu

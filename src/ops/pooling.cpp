@@ -94,20 +94,9 @@ Status Pooling::compute(std::span<TensorView> outputs,
     auto& input = inputs[0];
 
     PoolingAttributes attrs = attrs_;
-    if (attrs.adaptive()) {
-        // An all-ones output is the global case; the plane scan is the faster
-        // form and needs no window walk. Adaptive ignores the window fields.
-        const int64_t srank = PoolingAttributes::spatial_rank(input.rank());
-        const size_t first = static_cast<size_t>(3 - srank);
-        bool all_ones = true;
-        for (int64_t d = 0; d < srank; ++d) {
-            if (attrs.output_size[first + static_cast<size_t>(d)] != 1) {
-                all_ones = false;
-            }
-        }
-        if (all_ones) { attrs.global = true; }
-        attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET;
-    }
+    // Adaptive ignores the window fields; the all-ones output becomes the
+    // global scan in the backend, where the 1D op reaches it too.
+    if (attrs.adaptive()) { attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET; }
     if (attrs.global) {
         attrs.auto_pad = PoolingAttributes::AutoPad::NOTSET;
     } else if (attrs.auto_pad != PoolingAttributes::AutoPad::NOTSET) {

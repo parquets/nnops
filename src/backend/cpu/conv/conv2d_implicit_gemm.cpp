@@ -90,6 +90,7 @@
 #include "nnops/detail/assert.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -2586,6 +2587,69 @@ struct ChannelLastRoute {
     }
 };
 
+/// [N, C, H, W] cut to `len` columns from `col0`, pitch and layout kept:
+/// channel-first shifts one element per column, channel-last a whole vector.
+TensorView wide_window(const TensorView& v, int64_t col0, int64_t len)
+{
+    const int64_t unit = static_cast<int64_t>(data_type_stride_unit(v.data_type()));
+    const int64_t off = col0 * (is_channel_last(v.layout()) ? v.shape(1) : 1) * unit;
+    const int64_t s[4] = {v.shape(0), v.shape(1), v.shape(2), len};
+    auto* base = const_cast<char*>(static_cast<const char*>(
+        static_cast<const void*>(v.ptr<uint8_t>())));
+    return TensorView(std::span<const int64_t>(s, 4), v.data_type(), base + off,
+                      v.pitch(), v.layout(), v.quant_params());
+}
+
+/// A one-row output has no oh axis to split, so the plan is left with the filter
+/// — and a filter chunk still needs every activation: it duplicates the im2col
+/// gather once per chunk where a column chunk divides it. MLAS picks between M
+/// and N for the same reason (the larger one), and for a one-row image N = the
+/// row is normally the larger. Returns the column-chunk count, 1 for whole.
+int64_t wide_split_chunks(const Conv2DAttributes& attrs,
+                          std::span<const TensorView> inputs,
+                          const TensorView& output, const Conv2DGemmPlan& plan,
+                          const ComputeContext& ctx)
+{
+    const TensorView& input  = inputs[0];
+    const TensorView& weight = inputs[1];
+    const int64_t OW = output.shape(3);
+    const int64_t IW = input.shape(3);
+    const int64_t workers = std::max<int64_t>(ctx.cpu.worker_count(), 1);
+    if (output.shape(2) != 1 || workers <= 1 || inputs.size() > 4) { return 1; }
+
+    // A chunk pays the filter's halo again, so eight effective kernels of output
+    // amortize it. The quantized route also repacks the whole filter into the
+    // MMA's A panels per task — compute, not traffic, invisible to the bound
+    // below — so its chunks stay longer.
+    const int64_t k_eff = attrs.dilation[1] * (attrs.kernel_size[1] - 1) + 1;
+    const int64_t min_len = std::max<int64_t>(
+        8 * k_eff, is_quantized_conv2d(weight.data_type()) ? 128 : 1);
+    if (OW < 2 * min_len || (OW - 1) * attrs.stride[1] - attrs.padding[1] >= IW) {
+        return 1;
+    }
+
+    // 1 + 8·io/filter: past that the chunks bury the compute in filter streams.
+    const int64_t filter_bytes =
+        weight.numel() * static_cast<int64_t>(data_type_size(weight.data_type()));
+    const int64_t io_bytes =
+        input.numel() * static_cast<int64_t>(data_type_size(input.data_type())) +
+        output.numel() * static_cast<int64_t>(data_type_size(output.data_type()));
+    const int64_t by_traffic = 1 + (8 * io_bytes) / std::max<int64_t>(filter_bytes, 1);
+
+    // Batch, group and oh divide the gather; only oc_chunks buys width by
+    // duplicating it.
+    const int64_t plane_items = input.shape(0) * attrs.groups * plan.oh_chunks;
+    const int64_t tasks = plane_items * plan.oc_chunks;
+    const int64_t chunks =
+        std::clamp<int64_t>(std::min(workers, OW / min_len), 1, by_traffic);
+
+    // Take the column axis only when it is at least as wide as the plan's own
+    // grid, and only where that grid is thin: once batch and group fill the
+    // pool the split adds no parallelism, only the halo and the filter re-read
+    // (a batch-8 layer at 4T read 0.79x with it).
+    return (chunks < std::min(workers, tasks) || plane_items >= workers) ? 1 : chunks;
+}
+
 /// The shared prologue: descriptors from the views, one plan, one pooled arena,
 /// then the route's driver. A zeroed plan (icn_block 0) is the "unsupported
 /// dtype combination" answer, refused before anything is allocated.
@@ -2603,6 +2667,37 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
         attrs, descs, outs, ctx.cpu.thread_count(), ctx.cpu.thread_slot_count() > 0,
         ctx.cpu.thread_slot_count());
     if (plan.icn_block <= 0) { return Status::unsupported; }
+
+    // The column split: each chunk is one serial call on its own output window,
+    // so no nested region is opened, and the chunks write disjoint columns —
+    // bit-exact whatever the count.
+    const int64_t col_chunks = wide_split_chunks(attrs, inputs, output, plan, ctx);
+    if (col_chunks > 1) {
+        const int64_t OW = output.shape(3);
+        const int64_t IW = inputs[0].shape(3);
+        const int64_t S = attrs.stride[1];
+        const int64_t P = attrs.padding[1];
+        std::atomic<int> fail{0};
+        ctx.cpu.run(0, col_chunks, [&](int64_t c) {
+            const int64_t o0 = c * OW / col_chunks;
+            const int64_t o1 = (c + 1) * OW / col_chunks;
+            const int64_t origin = std::max<int64_t>(0, o0 * S - P);
+            Conv2DAttributes ac = attrs;
+            ac.padding[1] = std::max<int64_t>(0, P - o0 * S);
+            TensorView ops[4];
+            std::copy(inputs.begin(), inputs.end(), ops);
+            ops[0] = wide_window(inputs[0], origin, IW - origin);
+            TensorView out_c = wide_window(output, o0, o1 - o0);
+            const Status st = conv2d_implicit_gemm_kernel(
+                ac, out_c, std::span<const TensorView>(ops, inputs.size()),
+                ComputeContext{}, nullptr);
+            if (!is_ok(st)) {
+                fail.store(static_cast<int>(st), std::memory_order_relaxed);
+            }
+        });
+        const auto r = static_cast<Status>(fail.load());
+        return is_ok(r) ? Status::ok : r;
+    }
 
     // A pointwise call with no add_to needs no scratch, but the pool rejects a
     // zero-byte request: ask for the smallest arena instead.

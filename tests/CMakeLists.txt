@@ -47,6 +47,8 @@ set(TEST_SOURCES
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
     test_transpose_conv2d_int8.cpp
+    test_conv1d.cpp
+    test_pool1d.cpp
     test_moe.cpp
     test_cpu_backend.cpp
     test_status.cpp
@@ -158,6 +160,8 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_depthwise.cpp
         bench_depthwise_transpose_conv.cpp
         bench_pooling.cpp
+        bench_pool1d.cpp
+        bench_conv1d.cpp
         bench_attention.cpp
         bench_mma_packed.cpp
         bench_rnn.cpp
