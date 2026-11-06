@@ -259,6 +259,10 @@ NNOPS_TEST(conv2d_grouped) {
     attrs.stride  = {1, 1};
     attrs.padding = {0, 0};
     attrs.groups  = 2;
+    // One input and one output channel per group is the depthwise geometry, which
+    // compute() hands to the depthwise kernels (they have their own cases, see
+    // test_depthwise_conv.cpp). Pin the grouped GEMM's own path here.
+    attrs.algorithm = ConvAlgorithm::ImplicitGemm;
 
     auto op = Conv2D::create(attrs, Backend::CPU);
 
@@ -435,6 +439,23 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
         }
     }
     return true;
+}
+
+NNOPS_TEST(conv2d_grouped_outputs_per_group) {
+    // group == IC, but two output channels per group: [OC, IC/G, KH, KW] is
+    // [4, 1, 2, 2]. The depthwise condition also wants OC == C, so this stays on
+    // the grouped GEMM — the shape that looks depthwise in the channel split
+    // alone.
+    auto [in_vec, input] = test::make_random_tensor({1, 2, 5, 5});
+    auto [w_vec, weight] = test::make_random_tensor({4, 1, 2, 2});
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {2, 2};
+    attrs.stride  = {1, 1};
+    attrs.padding = {0, 0};
+    attrs.groups  = 2;
+
+    NNOPS_EXPECT_TRUE(conv2d_fast_vs_ref(attrs, input, weight, nullptr, 1e-5f, 1e-5f));
 }
 
 /// f16 fast path vs the f32 reference on the same values; max abs deviation.

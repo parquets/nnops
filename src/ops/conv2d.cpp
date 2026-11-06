@@ -10,6 +10,14 @@
 /// filter — and under Auto picks Winograd only when handed U, since a raw filter
 /// has no U to multiply in the transform domain.
 ///
+/// One grouped geometry is not a GEMM at all: a group of one input and one
+/// output channel is a depthwise convolution, and compute() hands it to the
+/// depthwise kernels on either layout. The filter is already in the order they
+/// read — [OC=1·G, 1, KH, KW] channel-first, [KH, KW, 1, OC=G] channel-last,
+/// both of which index as tap·C + c — so nothing is converted. A prepacked
+/// filter, or ConvAlgorithm::ImplicitGemm, keeps the grouped GEMM; prepackWeights
+/// answers the same geometry with no packed form, so the two cannot disagree.
+///
 /// prepackWeights() produces one of two things: the Winograd U — [pos][OC][IC/G]
 /// for a channel-first activation, [pos][nb][G·jb][ldd] B panels for a
 /// channel-last one, pos being 16 (F(2,3)) or 36 (F(4,3)) — when asked for
@@ -18,6 +26,7 @@
 /// load time so compute() reads them in place instead of repacking per call.
 
 #include "nnops/ops/conv2d.hpp"
+#include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
 #include "dispatch.hpp"
 #include "nnops/detail/shape_inference.hpp"
@@ -32,6 +41,7 @@
 namespace nnops {
 
 NNOPS_DECLARE_CUDA(Conv2DAttributes, conv2d_cuda)
+NNOPS_DECLARE_CPU(DepthwiseConvAttributes, depthwise_conv_cpu)
 
 struct Conv2D::Impl {
     using KernelFn = Status (*)(const Conv2DAttributes&,
@@ -45,6 +55,28 @@ Conv2D::~Conv2D() = default;
 
 
 namespace {
+
+/// A group that is one input channel wide and one output channel wide makes the
+/// whole convolution depthwise: groups == OC and IC/G == 1. The filter is then
+/// [OC, 1, KH, KW] channel-first or [KH, KW, 1, OC] channel-last, and both lay
+/// out as tap·C + c — the order the depthwise kernels read, unwrapped. A packed
+/// blob is excluded on purpose: it is a caller asking for the im2col route.
+bool is_depthwise_geometry(const Conv2DAttributes& attrs, const TensorView& weight)
+{
+    if (attrs.groups <= 1) { return false; }
+    const TensorLayout layout = weight.layout();
+    if (!is_channel_first_spatial(layout) && !is_channel_last_weight(layout)) {
+        return false;
+    }
+    const bool hwio = is_channel_last_weight(layout);
+    return weight.shape(hwio ? 2 : 1) == 1 && weight.shape(hwio ? 3 : 0) == attrs.groups;
+}
+
+bool is_fp(DataType dtype) noexcept
+{
+    return dtype == DataType::f32 || dtype == DataType::f16;
+}
+
 auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
     -> Conv2D::Impl::KernelFn
 {
@@ -223,6 +255,24 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         attrs.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
     }
 
+    // A depthwise geometry reads the filter Conv2D was handed, so it costs no
+    // conversion in either layout. The grouped GEMM degenerates there — one
+    // channel per group is a single-row product, re-dispatched per group — and
+    // loses by roughly 3.8x on the MobileNetV2 shapes.
+    if (backend_ == Backend::CPU &&
+        attrs.algorithm != ConvAlgorithm::ImplicitGemm &&
+        inputs.size() >= 2 && is_fp(inputs[0].data_type()) &&
+        is_fp(inputs[1].data_type()) && is_depthwise_geometry(attrs, inputs[1])) {
+        DepthwiseConvAttributes dw;
+        dw.kernel_size = {1, attrs.kernel_size[0], attrs.kernel_size[1]};
+        dw.stride      = {1, attrs.stride[0], attrs.stride[1]};
+        dw.dilation    = {1, attrs.dilation[0], attrs.dilation[1]};
+        dw.padding     = {0, attrs.padding[0], attrs.padding[1]};
+        dw.epilogue    = attrs.epilogue;
+        dw.add_to      = attrs.add_to;
+        return backend::cpu::depthwise_conv_cpu(dw, output, inputs, ctx, workspace);
+    }
+
     // A raw channel-last filter keeps the pixel axis on M; U is the only other
     // prepacked form, each pairing with its own activation layout.
     const bool wino_u = is_wino_weight(inputs[1].layout());
@@ -259,6 +309,14 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     const auto& weight = inputs[0];
     NNOPS_ASSERT(weight.rank() == 4);
     NNOPS_ASSERT(is_conv_filter_layout(weight.layout()));
+
+    // A depthwise geometry runs on the raw filter, so there is nothing to pack.
+    // Answering with a PackedOIHW would hand compute() a blob that steers it
+    // back to the grouped GEMM — the caller would pay for a pack it cannot use.
+    if (attrs_.algorithm != ConvAlgorithm::ImplicitGemm && is_fp(weight.data_type()) &&
+        is_depthwise_geometry(attrs_, weight)) {
+        return;
+    }
 
     // Two products live behind this one call. Auto keeps producing U exactly
     // where the transform exists — the k3s1 fp geometry its asserts demand —
