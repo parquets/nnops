@@ -26,6 +26,7 @@
 #include "nnops/ops/conv3d.hpp"
 #include "nnops/ops/cumsum.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
+#include "nnops/ops/depthwise_transpose_conv.hpp"
 #include "nnops/ops/eltwise.hpp"
 #include "nnops/ops/embed.hpp"
 #include "nnops/ops/flatten.hpp"

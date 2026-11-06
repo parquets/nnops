@@ -1,0 +1,79 @@
+/// @file depthwise_transpose_conv.cpp
+/// @brief DepthwiseTransposeConv2D operator dispatch — descriptor checks and
+///        backend binding.
+///
+/// One filter per channel, read raw: a channel-first activation takes the
+/// [C, 1, KH, KW] filter, a channel-last one the HWCM [KH][KW][C] form whose
+/// every tap is a contiguous run of C channels. There is no prepack either way
+/// — the storage order already is the access pattern the kernel wants.
+
+#include "nnops/ops/depthwise_transpose_conv.hpp"
+#include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
+#include "nnops/detail/shape_inference.hpp"
+#include "nnops/detail/validate.hpp"
+
+#include <cstdint>
+
+namespace nnops {
+
+NNOPS_DECLARE_CPU(DepthwiseTransposeConv2DAttributes, depthwise_transpose_conv_cpu)
+
+NNOPS_OP_BOILERPLATE(DepthwiseTransposeConv2D, DepthwiseTransposeConv2DAttributes,
+        backend::cpu::depthwise_transpose_conv_cpu, nullptr, nullptr)
+
+std::vector<TensorDesc> DepthwiseTransposeConv2D::getOutputTensorDesc(
+    std::span<const TensorDesc> inputs) const
+{
+    return depthwise_transpose_conv_output_shape(
+        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+        attrs_.output_padding, inputs);
+}
+
+Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
+                                          std::span<const TensorDesc> outputs) const
+{
+    // input, weight [, bias]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    const auto& in = inputs[0];
+    const auto& weight = inputs[1];
+
+    NNOPS_TRY(detail::require(in.rank == 4));
+    NNOPS_TRY(detail::require(
+        detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
+        weight.dtype == in.dtype,
+        Status::unsupported));
+    if (inputs.size() > 2 && inputs[2].dtype != in.dtype) {
+        return Status::unsupported;
+    }
+
+    if (is_channel_last(in.layout)) {
+        // The channel lane loads a tap's channels as one vector, which the
+        // channel-first [C, 1, KH, KW] cannot give it (a tap's channels are C
+        // elements apart).
+        NNOPS_TRY(detail::require(
+            weight.layout == TensorLayout::HWCM && weight.rank == 3,
+            Status::unsupported));
+        return detail::require(weight.dims[2] == in.dims[1]);
+    }
+    if (is_channel_first_spatial(in.layout)) {
+        NNOPS_TRY(detail::require(
+            is_channel_first_spatial(weight.layout) && weight.rank == 4,
+            Status::unsupported));
+        return detail::require(weight.dims[0] == in.dims[1]);
+    }
+    return Status::unsupported;
+}
+
+Status DepthwiseTransposeConv2D::compute(std::span<TensorView> outputs,
+                                         std::span<const TensorView> inputs,
+                                         const ComputeContext& ctx,
+                                         void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
+}
+
+}  // namespace nnops

@@ -237,6 +237,40 @@ inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     return {out};
 }
 
+/// Returns [N, C, OH, OW], C inherited from the input: a depthwise transposed
+/// conv keeps the input's channel count (OC == IC == weight.dims[0]).
+inline std::vector<TensorDesc> depthwise_transpose_conv_output_shape(
+    std::span<const int64_t> kernel_size,
+    std::span<const int64_t> stride,
+    std::span<const int64_t> dilation,
+    std::span<const int64_t> padding,
+    std::span<const int64_t> output_padding,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+
+    TensorDesc out;
+    out.rank   = 4;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(4);
+    out.dims[0] = in.dims[0];
+    out.dims[1] = in.dims[1];
+
+    auto compute_output = [](int64_t I, int64_t K, int64_t S,
+                              int64_t D, int64_t P, int64_t OP) {
+        return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
+    };
+
+    out.dims[2] = compute_output(
+        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
+    out.dims[3] = compute_output(
+        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
+
+    return {out};
+}
+
 /// Returns [N, C, ...spatial]; rank 4 is 2D, rank 5 is 3D.
 inline std::vector<TensorDesc> depthwise_conv_output_shape(
     std::span<const int64_t> kernel_size,

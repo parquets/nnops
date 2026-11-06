@@ -23,6 +23,8 @@ set(TEST_SOURCES
     test_norm.cpp
     test_simd.cpp
     test_depthwise_conv.cpp
+    test_depthwise_transpose_conv.cpp
+    test_depthwise_transpose_conv_int8.cpp
     test_eltwise.cpp
     test_embed.cpp
     test_permute.cpp
@@ -68,6 +70,8 @@ add_library(nnops_test_reference STATIC
     reference/conv2d_int8_ref.cpp
     reference/conv2d_ref.cpp
     reference/depthwise_conv_ref.cpp
+    reference/depthwise_transpose_conv_ref.cpp
+    reference/depthwise_transpose_conv_int8_ref.cpp
     reference/flatten_ref.cpp
     reference/linear_attention_ref.cpp
     reference/linear_ref.cpp
@@ -150,6 +154,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_conv2d_channel_last.cpp
         bench_transpose_conv2d.cpp
         bench_depthwise.cpp
+        bench_depthwise_transpose_conv.cpp
         bench_pooling.cpp
         bench_attention.cpp
         bench_mma_packed.cpp

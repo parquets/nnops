@@ -17,6 +17,7 @@ set(NNOPS_CPU_SOURCES
     ops/norm.cpp
     ops/conv3d.cpp
     ops/depthwise_conv.cpp
+    ops/depthwise_transpose_conv.cpp
     ops/eltwise.cpp
     ops/embed.cpp
     ops/permute.cpp
@@ -105,6 +106,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/conv2d_implicit_gemm.cpp
     backend/cpu/conv/conv2d_winograd.cpp
     backend/cpu/conv/depthwise_conv.cpp
+    backend/cpu/conv/depthwise_transpose_conv.cpp
     backend/cpu/conv/transpose_conv2d.cpp
     backend/cpu/conv/pooling.cpp
     backend/cpu/conv/conv3d.cpp
