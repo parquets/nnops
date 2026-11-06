@@ -36,6 +36,7 @@ struct ReduceAdd {
     static V combine(V a, V b) { return v_add(a, b); }
     template <typename V>
     static float horizontal(V v) { return v_reduce_sum(v); }
+    static float scalar_identity() { return 0.0f; }
     static float combine_scalar(float a, float b) { return a + b; }
 };
 
@@ -48,6 +49,9 @@ struct ReduceMax {
     static V combine(V a, V b) { return v_max(a, b); }
     template <typename V>
     static float horizontal(V v) { return v_reduce_max(v); }
+    static float scalar_identity() {
+        return -std::numeric_limits<float>::infinity();
+    }
     static float combine_scalar(float a, float b) { return a > b ? a : b; }
 };
 
@@ -60,6 +64,9 @@ struct ReduceMin {
     static V combine(V a, V b) { return v_min(a, b); }
     template <typename V>
     static float horizontal(V v) { return v_reduce_min(v); }
+    static float scalar_identity() {
+        return std::numeric_limits<float>::infinity();
+    }
     static float combine_scalar(float a, float b) { return a < b ? a : b; }
 };
 

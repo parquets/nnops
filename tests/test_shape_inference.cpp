@@ -815,7 +815,7 @@ NNOPS_TEST(shape_reduce_sum_axis0) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Sum;
-    attrs.axis = 0;
+    attrs.axes = {0};
 
     TensorDesc in_desc = td({3, 4, 5});
     const TensorDesc desc_arr[] = {in_desc};
@@ -832,7 +832,7 @@ NNOPS_TEST(shape_reduce_keepdims) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Sum;
-    attrs.axis = 1;
+    attrs.axes = {1};
     attrs.keepdims = true;
 
     TensorDesc in_desc = td({3, 4, 5});
@@ -846,7 +846,7 @@ NNOPS_TEST(shape_reduce_negative_axis) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Sum;
-    attrs.axis = -1;
+    attrs.axes = {-1};
 
     TensorDesc in_desc = td({3, 4, 5});
     const TensorDesc desc_arr[] = {in_desc};
@@ -859,7 +859,7 @@ NNOPS_TEST(shape_reduce_mean_keepdims) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Mean;
-    attrs.axis = 2;
+    attrs.axes = {2};
     attrs.keepdims = true;
 
     TensorDesc in_desc = td({2, 8, 16, 32});
@@ -873,7 +873,7 @@ NNOPS_TEST(shape_reduce_channel_last) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Max;
-    attrs.axis = 0;
+    attrs.axes = {0};
     attrs.keepdims = false;
 
     TensorDesc in_desc = td({4, 32, 28, 28}, DataType::f32, TensorLayout::NHWC);
@@ -1027,7 +1027,7 @@ NNOPS_TEST(shape_reduce_last_axis) {
     auto op = Reduce::create(Backend::CPU);
     auto& attrs = const_cast<ReduceAttributes&>(op->attributes());
     attrs.type = ReduceType::Sum;
-    attrs.axis = -1;
+    attrs.axes = {-1};
 
     TensorDesc in_desc = td({64});
     const TensorDesc desc_arr[] = {in_desc};

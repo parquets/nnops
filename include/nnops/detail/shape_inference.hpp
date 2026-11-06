@@ -520,15 +520,29 @@ inline std::vector<TensorDesc> layout_convert_output_shape(
     return {out};
 }
 
-/// One axis reduced, dropped or kept as 1.
+/// Axes reduced, dropped or kept as 1. Empty `axes` means all axes, unless
+/// `noop_with_empty_axes` copies the input through. Out-of-range axes are
+/// ignored here; Reduce::validate rejects them.
 inline std::vector<TensorDesc> reduce_output_shape(
-    int64_t axis,
+    std::span<const int64_t> axes,
     bool keepdims,
+    bool noop_with_empty_axes,
     std::span<const TensorDesc> inputs)
 {
     const auto& in = inputs[0];
     const int64_t rank = in.rank;
-    const int64_t ax = resolve_axis(axis, rank);
+
+    if (axes.empty() && noop_with_empty_axes) { return {in}; }
+
+    bool reduced[TensorDesc::kMaxRank] = {};
+    if (axes.empty()) {
+        for (int64_t i = 0; i < rank; ++i) { reduced[i] = true; }
+    } else {
+        for (const int64_t a : axes) {
+            const int64_t ax = resolve_axis(a, rank);
+            if (ax >= 0 && ax < rank) { reduced[ax] = true; }
+        }
+    }
 
     TensorDesc out;
     out.layout = in.layout;
@@ -546,15 +560,19 @@ inline std::vector<TensorDesc> reduce_output_shape(
         out.rank = rank;
         out.dims.resize(static_cast<size_t>(rank));
         for (int64_t i = 0; i < rank; ++i) {
-            out.dims[static_cast<size_t>(i)] = (i == ax)
+            out.dims[static_cast<size_t>(i)] = reduced[i]
                 ? int64_t(1)
                 : in.dims[static_cast<size_t>(i)];
         }
     } else {
-        out.rank = rank - 1;
-        out.dims.resize(static_cast<size_t>(rank - 1));
+        int64_t out_rank = 0;
+        for (int64_t i = 0; i < rank; ++i) {
+            if (!reduced[i]) { ++out_rank; }
+        }
+        out.rank = out_rank;
+        out.dims.resize(static_cast<size_t>(out_rank));
         for (int64_t i = 0, o = 0; i < rank; ++i) {
-            if (i != ax) {
+            if (!reduced[i]) {
                 out.dims[static_cast<size_t>(o++)] = in.dims[static_cast<size_t>(i)];
             }
         }

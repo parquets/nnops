@@ -166,8 +166,8 @@ void run_case(const GlobalCase& c, const std::vector<int>& threads, int rounds,
     auto w_out = test::make_channel_first(window_desc[0], w_buf.data());
 
     // Axes are rank-relative: the input is [N,C,H,W], so W is 3 and H is 2.
-    auto reduce_w = Reduce::create(ReduceAttributes{ReduceType::Mean, 3, true}, Backend::CPU);
-    auto reduce_h = Reduce::create(ReduceAttributes{ReduceType::Mean, 2, true}, Backend::CPU);
+    auto reduce_w = Reduce::create(ReduceAttributes{ReduceType::Mean, {3}, true}, Backend::CPU);
+    auto reduce_h = Reduce::create(ReduceAttributes{ReduceType::Mean, {2}, true}, Backend::CPU);
     TensorDesc rd = in_channel_first.desc();
     const TensorDesc r_in[] = {rd};
     auto mid_desc = reduce_w->getOutputTensorDesc(r_in);

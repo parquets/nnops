@@ -1,26 +1,40 @@
 /// @file reduce.cpp
 /// @brief SIMD-optimized CPU implementation of the Reduce operator.
 ///
-/// f32 and f16; channel-first and channel-last layouts.
-/// The reduction is driven by the logical axis; stride_elems() turns it into
+/// f32 and f16; channel-first and channel-last layouts; one axis or many.
+/// The reduction is driven by the logical axes; stride_elems() turns them into
 /// physical offsets, so the same axis means the same thing in either layout.
 ///
-/// Channel-first dispatch, in order:
+/// A multi-axis set is split into maximal runs of adjacent axes that are dense
+/// in memory (stride(d) == shape(d+1) * stride(d+1)); each run becomes one
+/// (dim = product, stride = stride_elems(last axis)) pair, and a flat index k
+/// over the run maps to base + k * stride.
+///
+/// Single-axis dispatch (unchanged), in order:
 ///   1. axis==rank-1            -> kernel::reduce_process_contiguous_row
 ///   2. inner-contiguous        -> kernel::reduce_process_inner_contiguous_block
 ///   3. general                 -> scalar strided walk over (outer x inner)
-///
 /// Channel-last: axis==1 (C) is the contiguous case and runs one row reduction
 /// per spatial position; every other axis walks the strided reduce axis.
+///
+/// Multi-axis dispatch:
+///   1. one dense run + no kept dims trailing the run -> row kernel per outer
+///      block
+///   2. one dense run + a contiguous kept tail       -> inner block kernel per
+///      (outer, lane chunk)
+///   3. otherwise                                    -> an odometer over the
+///      runs, vectorized across the last kept axis when it steps by one
 
 #include "nnops/ops/reduce.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "simd_kernel/simd_reduce.hpp"
+#include "simd_kernel/simd_reduce_primitive.hpp"
 #include "common/index.hpp"
 #include "common/dtype_dispatch.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <vector>
 
@@ -29,6 +43,39 @@ namespace nnops::backend::cpu {
 using namespace nnops::simd;
 
 namespace {
+
+constexpr int64_t kLaneChunk = 256;
+
+/// One reduced run: `dim` elements spaced `stride` apart.
+struct ReduceRun {
+    int64_t dim;
+    int64_t stride;
+};
+
+/// Collapse the sorted axes into maximal dense runs.
+int64_t build_reduced_runs(const TensorView& input,
+                           const int64_t* axes,
+                           int64_t n_axes,
+                           ReduceRun* runs)
+{
+    int64_t n = 0;
+    int64_t dim = input.shape(axes[0]);
+    int64_t run_stride = input.stride_elems(axes[0]);
+    for (int64_t i = 1; i < n_axes; ++i) {
+        const int64_t d = axes[i];
+        if (d == axes[i - 1] + 1 &&
+            run_stride == input.shape(d) * input.stride_elems(d)) {
+            dim *= input.shape(d);
+            run_stride = input.stride_elems(d);
+            continue;
+        }
+        runs[n++] = {dim, run_stride};
+        dim = input.shape(d);
+        run_stride = input.stride_elems(d);
+    }
+    runs[n++] = {dim, run_stride};
+    return n;
+}
 
 template <typename T>
 void reduce_channel_last(const ReduceAttributes& attrs,
@@ -283,20 +330,241 @@ void reduce_general_scalar(const ReduceAttributes& attrs,
     ctx.cpu.run(0, num_outer, process_outer);
 }
 
-}  // anonymous namespace
+/// One dense reduced run with no kept tail: one row reduction per outer block.
+template <typename T>
+void reduce_multi_fast_row(const ReduceAttributes& attrs,
+                           TensorView& output,
+                           const TensorView& input,
+                           int64_t num_outer,
+                           int64_t outer_stride,
+                           int64_t reduce_size,
+                           const ComputeContext& ctx)
+{
+    const int64_t rank_out = output.rank();
+    const T* x_ptr = input.ptr<T>();
+    T* y_ptr = output.ptr<T>();
+
+    ctx.cpu.run(0, num_outer, [&](int64_t outer) {
+        const int64_t out_off =
+            decompose_flat_offset(outer, output, 0, rank_out - 1);
+        float result = 0.0f;
+        kernel::reduce_process_contiguous_row<T>(
+            x_ptr + outer * outer_stride, &result, reduce_size, attrs.type);
+        s_store(&y_ptr[out_off], result);
+    });
+}
+
+/// One dense reduced run followed by a contiguous kept tail: the reduce stride
+/// equals the lane count, so the inner block kernel works lane by lane.
+template <typename T>
+void reduce_multi_fast_lanes(const ReduceAttributes& attrs,
+                             TensorView& output,
+                             const TensorView& input,
+                             int64_t num_outer,
+                             int64_t outer_stride,
+                             int64_t reduce_size,
+                             int64_t num_inner,
+                             const ComputeContext& ctx)
+{
+    const T* x_ptr = input.ptr<T>();
+    T* y_ptr = output.ptr<T>();
+    constexpr int L = simd_lane_for<T>;
+    const float inv_reduce = 1.0f / static_cast<float>(reduce_size);
+    const int64_t n_chunks = (num_inner + kLaneChunk - 1) / kLaneChunk;
+
+    ctx.cpu.run(0, num_outer * n_chunks, [&](int64_t task) {
+        const int64_t outer = task / n_chunks;
+        const int64_t chunk = task % n_chunks;
+        const int64_t lane0 = chunk * kLaneChunk;
+        const int64_t lane1 = std::min(lane0 + kLaneChunk, num_inner);
+
+        const T* x_base = x_ptr + outer * outer_stride;
+        T* y_base = y_ptr + outer * num_inner;
+
+        kernel::reduce_process_inner_contiguous_block<T>(
+            x_base, y_base, lane0, lane1, reduce_size, num_inner,
+            attrs.type, inv_reduce);
+
+        const int64_t vec_end = lane0 + ((lane1 - lane0) / L) * L;
+        for (int64_t inner = vec_end; inner < lane1; ++inner) {
+            switch (attrs.type) {
+            case ReduceType::Sum:
+            case ReduceType::Mean: {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < reduce_size; ++k) {
+                    sum += s_load(&x_base[k * num_inner + inner]);
+                }
+                float result = (attrs.type == ReduceType::Mean)
+                    ? sum * inv_reduce : sum;
+                s_store(&y_base[inner], result);
+                break;
+            }
+            case ReduceType::Max: {
+                float best = -std::numeric_limits<float>::infinity();
+                for (int64_t k = 0; k < reduce_size; ++k) {
+                    float xv = s_load(&x_base[k * num_inner + inner]);
+                    if (xv > best) { best = xv; }
+                }
+                s_store(&y_base[inner], best);
+                break;
+            }
+            case ReduceType::Min: {
+                float best = std::numeric_limits<float>::infinity();
+                for (int64_t k = 0; k < reduce_size; ++k) {
+                    float xv = s_load(&x_base[k * num_inner + inner]);
+                    if (xv < best) { best = xv; }
+                }
+                s_store(&y_base[inner], best);
+                break;
+            }
+            }
+        }
+    });
+}
+
+/// General multi-axis path: an odometer over the runs, vectorized across the
+/// last kept axis when its stride is one on both sides.
+template <typename T, typename Op>
+void reduce_multi_general(const ReduceAttributes& attrs,
+                          TensorView& output,
+                          const TensorView& input,
+                          const ReduceRun* runs,
+                          int64_t n_runs,
+                          const bool* kept,
+                          float inv_count,
+                          const ComputeContext& ctx)
+{
+    const int64_t rank = input.rank();
+    const bool keepdims = attrs.keepdims;
+
+    int64_t out_pos[TensorView::kMaxRank] = {};
+    int64_t n_kept = 0;
+    for (int64_t d = 0, p = 0; d < rank; ++d) {
+        if (kept[d]) {
+            out_pos[d] = keepdims ? d : p;
+            ++p;
+            ++n_kept;
+        }
+    }
+
+    int64_t lane_axis = -1;
+    if (n_kept > 0) {
+        int64_t last_kept = -1;
+        for (int64_t d = rank - 1; d >= 0; --d) {
+            if (kept[d]) { last_kept = d; break; }
+        }
+        if (input.stride_elems(last_kept) == 1 &&
+            output.stride_elems(out_pos[last_kept]) == 1) {
+            lane_axis = last_kept;
+        }
+    }
+    const int64_t lanes = (lane_axis >= 0) ? input.shape(lane_axis) : 1;
+
+    int64_t unit_axes[TensorView::kMaxRank] = {};
+    int64_t n_unit_axes = 0;
+    int64_t units = 1;
+    for (int64_t d = 0; d < rank; ++d) {
+        if (kept[d] && d != lane_axis) {
+            unit_axes[n_unit_axes++] = d;
+            units *= input.shape(d);
+        }
+    }
+
+    const T* x_ptr = input.ptr<T>();
+    T* y_ptr = output.ptr<T>();
+    constexpr int L = simd_lane_for<T>;
+    const bool is_mean = attrs.type == ReduceType::Mean;
+    const int64_t n_chunks = (lanes + kLaneChunk - 1) / kLaneChunk;
+
+    ctx.cpu.run(0, units * n_chunks, [&](int64_t task) {
+        const int64_t unit = task / n_chunks;
+        const int64_t chunk = task % n_chunks;
+        const int64_t lane0 = chunk * kLaneChunk;
+        const int64_t lane1 = std::min(lane0 + kLaneChunk, lanes);
+
+        int64_t in_base = 0;
+        int64_t out_off = 0;
+        int64_t rem = unit;
+        for (int64_t i = n_unit_axes - 1; i >= 0; --i) {
+            const int64_t ax = unit_axes[i];
+            const int64_t idx = rem % input.shape(ax);
+            rem /= input.shape(ax);
+            in_base += idx * input.stride_elems(ax);
+            out_off += idx * output.stride_elems(out_pos[ax]);
+        }
+
+        int64_t idx[TensorView::kMaxRank] = {};
+        auto step = [&](int64_t& delta) -> bool {
+            for (int64_t g = n_runs - 1; g >= 0; --g) {
+                delta += runs[g].stride;
+                if (++idx[g] < runs[g].dim) { return true; }
+                idx[g] = 0;
+                delta -= runs[g].dim * runs[g].stride;
+            }
+            return false;
+        };
+
+        int64_t lane = lane0;
+        for (; lane + L <= lane1; lane += L) {
+            auto acc = Op::vec_identity(x_ptr);
+            int64_t delta = 0;
+            do {
+                acc = Op::combine(acc, v_load(x_ptr + in_base + delta + lane));
+            } while (step(delta));
+            if (is_mean) { acc = v_mul(acc, v_set1(x_ptr, inv_count)); }
+            v_store(y_ptr + out_off + lane, acc);
+        }
+        for (; lane < lane1; ++lane) {
+            float acc = Op::scalar_identity();
+            int64_t delta = 0;
+            do {
+                acc = Op::combine_scalar(
+                    acc, s_load(&x_ptr[in_base + delta + lane]));
+            } while (step(delta));
+            if (is_mean) { acc *= inv_count; }
+            s_store(&y_ptr[out_off + lane], acc);
+        }
+    });
+}
 
 template <typename T>
-void reduce_impl(const ReduceAttributes& attrs,
-                 TensorView& output,
-                 std::span<const TensorView> inputs,
+void reduce_copy(TensorView& output,
+                 const TensorView& input,
                  const ComputeContext& ctx)
 {
-    const auto& input = inputs[0];
     const int64_t rank = input.rank();
+    const int64_t n = input.numel();
+    if (rank < 2) {
+        std::copy_n(input.ptr<T>(), static_cast<size_t>(n), output.ptr<T>());
+        return;
+    }
 
-    int64_t axis = attrs.axis;
-    if (axis < 0) { axis += rank; }
-    NNOPS_ASSERT(axis >= 0 && axis < rank);
+    // total_rows()/numel() gives the logical elements in one physical row for
+    // every layout: W planar, C*W channel-last, the packed block width packed.
+    const int64_t rows = input.total_rows();
+    if (rows <= 0) { return; }
+    const int64_t cols = n / rows;
+    const int64_t in_row = input.row_stride_elems();
+    const int64_t out_row = output.row_stride_elems();
+    const T* x_ptr = input.ptr<T>();
+    T* y_ptr = output.ptr<T>();
+
+    ctx.cpu.run(0, rows, [&](int64_t row) {
+        std::copy_n(x_ptr + row * in_row, static_cast<size_t>(cols),
+                    y_ptr + row * out_row);
+    });
+}
+
+/// The single-axis dispatch, unchanged: channel-last, last axis, inner
+/// contiguous, general.
+template <typename T>
+void reduce_single_axis(const ReduceAttributes& attrs,
+                        TensorView& output,
+                        const TensorView& input,
+                        int64_t axis,
+                        const ComputeContext& ctx)
+{
+    const int64_t rank = input.rank();
 
     if (is_channel_last(input.layout())) {
         reduce_channel_last<T>(attrs, output, input, axis, ctx);
@@ -328,6 +596,108 @@ void reduce_impl(const ReduceAttributes& attrs,
 
     reduce_general_scalar<T>(attrs, output, input, axis,
                               num_outer, reduce_size, num_inner, ctx);
+}
+
+}  // anonymous namespace
+
+template <typename T>
+void reduce_impl(const ReduceAttributes& attrs,
+                 TensorView& output,
+                 std::span<const TensorView> inputs,
+                 const ComputeContext& ctx)
+{
+    const auto& input = inputs[0];
+    const int64_t rank = input.rank();
+
+    int64_t axes[TensorView::kMaxRank] = {};
+    int64_t n_axes = 0;
+    if (attrs.axes.empty()) {
+        if (attrs.noop_with_empty_axes) {
+            reduce_copy<T>(output, input, ctx);
+            return;
+        }
+        for (int64_t d = 0; d < rank; ++d) { axes[n_axes++] = d; }
+    } else {
+        for (const int64_t a : attrs.axes) {
+            const int64_t ax = a < 0 ? a + rank : a;
+            NNOPS_ASSERT(ax >= 0 && ax < rank);
+            axes[n_axes++] = ax;
+        }
+        std::sort(axes, axes + n_axes);
+    }
+
+    if (n_axes == 1) {
+        reduce_single_axis<T>(attrs, output, input, axes[0], ctx);
+        return;
+    }
+
+    bool kept[TensorView::kMaxRank] = {};
+    for (int64_t d = 0; d < rank; ++d) { kept[d] = true; }
+    for (int64_t i = 0; i < n_axes; ++i) { kept[axes[i]] = false; }
+
+    int64_t count = 1;
+    for (int64_t i = 0; i < n_axes; ++i) { count *= input.shape(axes[i]); }
+    const float inv_count = 1.0f / static_cast<float>(count);
+
+    ReduceRun runs[TensorView::kMaxRank];
+    const int64_t n_runs = build_reduced_runs(input, axes, n_axes, runs);
+
+    if (n_runs == 1) {
+        const int64_t first = axes[0];
+        const int64_t last = axes[n_axes - 1];
+
+        int64_t num_outer = 1;
+        for (int64_t d = 0; d < first; ++d) { num_outer *= input.shape(d); }
+
+        int64_t num_inner = 1;
+        for (int64_t d = last + 1; d < rank; ++d) {
+            num_inner *= input.shape(d);
+        }
+
+        bool outer_dense = true;
+        for (int64_t d = 0; d + 1 < first; ++d) {
+            if (input.stride_elems(d) !=
+                input.shape(d + 1) * input.stride_elems(d + 1)) {
+                outer_dense = false;
+                break;
+            }
+        }
+        const int64_t outer_stride =
+            (first > 0) ? input.stride_elems(first - 1) : 0;
+
+        if (outer_dense && num_inner == 1 && runs[0].stride == 1) {
+            reduce_multi_fast_row<T>(attrs, output, input, num_outer,
+                                     outer_stride, runs[0].dim, ctx);
+            return;
+        }
+
+        const bool output_dense = output.rank() < 2 ||
+            output.row_stride_elems() == output.shape(output.rank() - 1);
+        if (outer_dense && num_inner > 1 &&
+            runs[0].stride == num_inner &&
+            input.stride_elems(rank - 1) == 1 && output_dense) {
+            reduce_multi_fast_lanes<T>(attrs, output, input, num_outer,
+                                       outer_stride, runs[0].dim, num_inner,
+                                       ctx);
+            return;
+        }
+    }
+
+    switch (attrs.type) {
+    case ReduceType::Sum:
+    case ReduceType::Mean:
+        reduce_multi_general<T, kernel::ReduceAdd>(
+            attrs, output, input, runs, n_runs, kept, inv_count, ctx);
+        break;
+    case ReduceType::Max:
+        reduce_multi_general<T, kernel::ReduceMax>(
+            attrs, output, input, runs, n_runs, kept, inv_count, ctx);
+        break;
+    case ReduceType::Min:
+        reduce_multi_general<T, kernel::ReduceMin>(
+            attrs, output, input, runs, n_runs, kept, inv_count, ctx);
+        break;
+    }
 }
 
 Status reduce_cpu(const ReduceAttributes& attrs,

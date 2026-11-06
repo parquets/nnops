@@ -169,11 +169,10 @@ void reduce_cuda_impl(
     const ReduceAttributes& attrs,
     TensorView& output,
     const TensorView& input,
+    int64_t axis,
     const ComputeContext& ctx)
 {
     const int64_t rank = input.rank();
-    int64_t axis = attrs.axis;
-    if (axis < 0) axis += rank;
 
     const int64_t outer_dim_count = [&]() {
         int64_t n = 1;
@@ -243,18 +242,22 @@ Status reduce_cuda(const ReduceAttributes& attrs,
 {
     const auto& input = inputs[0];
 
-    // CUDA supports single-axis reduction only
+    // Single-axis only for now; multi-axis and the empty-means-all default
+    // fall back to the caller.
+    if (attrs.axes.size() != 1) { return Status::unsupported; }
+    int64_t axis = attrs.axes[0];
+    if (axis < 0) { axis += input.rank(); }
+
     switch (input.data_type()) {
     case DataType::f32:
-        reduce_cuda_impl<float>(attrs, output, input, ctx);
+        reduce_cuda_impl<float>(attrs, output, input, axis, ctx);
         return Status::ok;
     case DataType::f16:
-        reduce_cuda_impl<__half>(attrs, output, input, ctx);
+        reduce_cuda_impl<__half>(attrs, output, input, axis, ctx);
         return Status::ok;
     default:
         return Status::unsupported;
     }
-    return Status::ok;
 }
 
 }  // namespace nnops::backend::cuda
