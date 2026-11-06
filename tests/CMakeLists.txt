@@ -121,6 +121,25 @@ foreach(src ${TEST_SOURCES})
     nnops_add_test_demo(${src})
 endforeach()
 
+# ---- Framework (ONNX -> graph -> execution) ----
+#
+# The unit test drives models written byte by byte against hand-rolled
+# arithmetic. The model test is the other end of the same chain: a torchvision
+# network built from the exported artifact (models/data/, see models/README.md)
+# and compared layer by layer with the activations PyTorch recorded. Both reach
+# outside tests/, so they get the repo root as well.
+nnops_add_test_demo(framework/test_framework_onnx.cpp)
+
+add_executable(test_framework_model framework/test_framework_model.cpp)
+target_link_libraries(test_framework_model PRIVATE nnops_cpu)
+target_include_directories(test_framework_model PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_framework_model PRIVATE
+    NNOPS_MODEL_DATA_DIR="${CMAKE_SOURCE_DIR}/models/data")
+add_test(NAME test_framework_model COMMAND test_framework_model)
+# No exported artifact means no network to run: skip it, do not fail.
+set_tests_properties(test_framework_model PROPERTIES SKIP_RETURN_CODE 77)
+
 # ---- Vulkan tests (only when Vulkan backend is enabled) ----
 if(NNOPS_BUILD_VULKAN)
     find_package(Vulkan REQUIRED)
@@ -175,6 +194,15 @@ if(NNOPS_BUILD_BENCHMARKS)
     foreach(src ${BENCH_SOURCES})
         nnops_add_bench_demo(${src})
     endforeach()
+
+    # The framework's model-level bench: the ONNX pipeline on the torchvision
+    # networks, from the file bytes down to a steady-state call.
+    add_executable(bench_framework_model framework/bench_framework_model.cpp)
+    target_link_libraries(bench_framework_model PRIVATE nnops_cpu)
+    target_include_directories(bench_framework_model PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(bench_framework_model PRIVATE
+        NNOPS_MODEL_DATA_DIR="${CMAKE_SOURCE_DIR}/models/data")
 
     if(NNOPS_BUILD_CUDA)
         # Only the matmul bench carries a cuBLAS reference arm.

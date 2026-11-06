@@ -16,6 +16,7 @@
 /// apply them as a clamp, and MatMul/Conv fold Relu/Relu6 into their clamp.
 
 #include <cstdint>
+#include <limits>
 
 namespace nnops {
 

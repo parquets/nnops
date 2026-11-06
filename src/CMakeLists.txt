@@ -123,6 +123,19 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/rnn/recurrent.cpp
 
     backend/cpu/cumsum.cpp
+
+    # ONNX → graph → execution framework. One file per stage: the protobuf
+    # wire decoder (no protobuf runtime), the ONNX importer, the load-time
+    # passes, lowering to operators, the executor, and the owning buffers.
+    framework/onnx_proto.cpp
+    framework/import.cpp
+    framework/graph.cpp
+    framework/tensor.cpp
+    framework/optimizer.cpp
+    framework/lowering.cpp
+    framework/execute.cpp
+    framework/model.cpp
+    framework/session.cpp
 )
 
 target_sources(nnops_cpu PRIVATE ${NNOPS_CPU_SOURCES})
