@@ -304,9 +304,10 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
         throw std::runtime_error(msg);
     };
 
-    // aarch64 fp16 kernels accumulate in f16 (all else in f32). Match that in
-    // the reference: mixed-sign products can cancel to near zero, where an f32
-    // reference would disagree by more than the relative tolerance allows.
+    // aarch64 fp16 kernels accumulate in f16 (all else in f32), by a vfmaq
+    // chain. Match that in the reference: mixed-sign products can cancel to near
+    // zero, where an f32 reference would disagree by more than the relative
+    // tolerance allows.
 #if defined(NNOPS_ARCH_AARCH64)
     constexpr bool f16_accum = std::is_same_v<T, half>;
 #else
@@ -318,6 +319,19 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
             auto mac = [&](float acc, int k) {
                 return acc + to_float(a_at(k, r)) *
                                  to_float(b_raw[static_cast<size_t>(k) * nc + col]);
+            };
+            // The kernel's step, not float arithmetic rounded to f16: an f16
+            // FMA rounds once from the exact product and accumulator, where
+            // rounding an f32 add rounds twice (an f16 product is exact in f32,
+            // so only the accumulator add can round, and it rounds to f32 before
+            // f16). One intermediate step landing an ulp of the *intermediate*
+            // magnitude away is 64 ulps of a cancelled final sum: at nc=23 kc=16
+            // the two step models disagree by 0.031 on a 0.486 result.
+            auto fma16 = [&](T h, int k) -> T {
+                const double p = static_cast<double>(to_float(a_at(k, r))) *
+                                 static_cast<double>(
+                                     to_float(b_raw[static_cast<size_t>(k) * nc + col]));
+                return static_cast<T>(p + static_cast<double>(to_float(h)));
             };
             float ref;
             // A bias row replaces both the zero and the C read: the kernel
@@ -332,7 +346,7 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
                 if constexpr (f16_accum) {
                     T h = from_float<T>(start);
                     for (int k = 0; k < kc; ++k) {
-                        h = from_float<T>(mac(to_float(h), k));
+                        h = fma16(h, k);
                     }
                     ref = to_float(h);
                 } else {
@@ -344,7 +358,7 @@ void verify(const std::vector<T>& c, const std::vector<T>& c0,
             } else if constexpr (f16_accum) {
                 T h = from_float<T>(0.f);
                 for (int k = 0; k < kc; ++k) {
-                    h = from_float<T>(mac(to_float(h), k));
+                    h = fma16(h, k);
                 }
                 ref = zero_mode
                     ? to_float(h)

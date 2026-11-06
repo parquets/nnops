@@ -15,6 +15,7 @@
 
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_winograd.h"
+#include "backend/cpu/matmul/matmul_helper.h"   // NR_MAX_F32/MR_MAX_F32 — the plan's panels
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
 #include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 #include "common/test_harness.hpp"
@@ -565,20 +566,29 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
         return nnops::backend::cpu::get_conv2d_winograd_plan(attrs, ins, outs, nt, true);
     };
 
-    // TH 7 in tile rows of 8 columns, and a task takes two tile rows: 16 tiles
-    // exactly fills an f32 MMA panel, where one row leaves half of it empty. So
-    // the plane is 4 tasks, not 7. Rounding, not ceiling, on the chunk count: 16
-    // threads want 4 chunks (16 tasks, one wave), and 5 would run a straggler.
-    struct Row { int nt; int64_t chunks; };
-    for (const Row& r : {Row{1, 1}, Row{4, 1}, Row{8, 2}, Row{12, 3},
-                         Row{14, 4}, Row{16, 4}, Row{20, 5}, Row{28, 7}}) {
-        const auto p = plan(r.nt);
-        NNOPS_EXPECT_EQ(p.tile_rows, int64_t{2});
-        NNOPS_EXPECT_EQ(p.oc_chunks, r.chunks);
-        NNOPS_EXPECT_EQ(p.num_tasks, 4 * r.chunks);
-        NNOPS_EXPECT_EQ(p.num_slots, std::min<int64_t>(r.nt, p.num_tasks));
-        // Every task keeps at least two M-panels (6 rows each on x86_64 f32).
-        NNOPS_EXPECT_TRUE(256 / p.oc_chunks >= 2 * 6);
+    // TH 7 in tile rows of 8 columns. A task spans two tile rows when 14 tiles
+    // fill the f32 MMA panel better than 7 do — true at nr 16 (14 of 16 versus
+    // 7 of 16), not at nr 12, where both land on 58% and the plan keeps the one
+    // row and its smaller halo/V/M footprint. So the plane is 4 tasks on x86_64
+    // and 7 on aarch64. Rounding, not ceiling, on the chunk count: 16 threads
+    // want 4 chunks (16 tasks, one wave), and 5 would run a straggler.
+    const int64_t nr_max = nnops::backend::cpu::NR_MAX_F32;
+    const int64_t mr_max = nnops::backend::cpu::MR_MAX_F32;
+    const int64_t rows = (2 * 7 <= nr_max) ? 2 : 1;
+    const int64_t plane_tasks = (7 + rows - 1) / rows;
+    const auto chunks_for = [&](int64_t nt) {
+        const int64_t want = (nt + plane_tasks / 2) / plane_tasks;
+        return std::clamp<int64_t>(want, 1, 256 / (2 * mr_max));
+    };
+    for (const int nt : {1, 4, 8, 12, 14, 16, 20, 28}) {
+        const auto p = plan(nt);
+        const int64_t chunks = chunks_for(nt);
+        NNOPS_EXPECT_EQ(p.tile_rows, rows);
+        NNOPS_EXPECT_EQ(p.oc_chunks, chunks);
+        NNOPS_EXPECT_EQ(p.num_tasks, plane_tasks * chunks);
+        NNOPS_EXPECT_EQ(p.num_slots, std::min<int64_t>(nt, p.num_tasks));
+        // Every task keeps at least two M-panels.
+        NNOPS_EXPECT_TRUE(256 / p.oc_chunks >= 2 * mr_max);
     }
 
     // A plane that already fills the pool keeps the single dispatch: 56 tasks.
@@ -601,8 +611,8 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
     NNOPS_EXPECT_EQ(wide.oc_chunks, int64_t{1});
     NNOPS_EXPECT_EQ(wide.num_tasks, int64_t{56});
 
-    // And the floor stops it: 16 filter rows cannot be cut into two 12-row
-    // tasks, so the starved 4-task grid stays as it is.
+    // And the floor stops it: 16 filter rows cannot be cut into two blocks of
+    // two M-panels, so the starved tile-only grid stays as it is.
     std::vector<float> in16(16 * 14 * 14, 0.0f);
     std::vector<float> out16(16 * 14 * 14, 0.0f);
     std::vector<float> u16(16 * 16 * 16, 0.0f);
@@ -619,7 +629,7 @@ NNOPS_TEST(wino_plan_splits_the_filter_rows) {
     const auto narrow = nnops::backend::cpu::get_conv2d_winograd_plan(
         attrs, ins16, outs16, 20, true);
     NNOPS_EXPECT_EQ(narrow.oc_chunks, int64_t{1});
-    NNOPS_EXPECT_EQ(narrow.num_tasks, int64_t{4});
+    NNOPS_EXPECT_EQ(narrow.num_tasks, plane_tasks);
 }
 
 // ============================================================
