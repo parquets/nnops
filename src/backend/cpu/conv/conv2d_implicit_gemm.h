@@ -157,7 +157,7 @@ struct ConvPackedWeightLast {
     int64_t icn_block = 0;   ///< k block
     int64_t ocn_block = 0;   ///< oc block (the plan's N tile)
     int64_t kdim_max = 0;    ///< icn_block × karea
-    int64_t panels_oc = 0;   ///< ⌈oc_per_group / nr⌉ — panels in the group
+    int64_t panels_oc = 0;   ///< oc blocks × block_panels — the group's panels
     int64_t slot_full = 0;   ///< elements of one panel at kdim_max
     int64_t slot_tail = 0;   ///< ... at the trailing k block (0 when none)
     int64_t nfull_ic = 0;    ///< whole k blocks per group

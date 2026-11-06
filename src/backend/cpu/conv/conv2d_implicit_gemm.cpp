@@ -2664,7 +2664,6 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
         oc_per_group, ((per_block + g.nr - 1) / g.nr) * g.nr);
 
     g.kdim_max    = g.icn_block * karea;
-    g.panels_oc   = (oc_per_group + g.nr - 1) / g.nr;
     g.slot_full   = gemm_panel_slot(g.kdim_max, g.nr, esz, quant);
     g.nfull_ic    = ic_per_group / g.icn_block;
     g.tail_ic     = ic_per_group - g.nfull_ic * g.icn_block;
@@ -2674,6 +2673,14 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
     // ⌈⌉, not ÷: a lone oc block is the group's own width, which need not be a
     // multiple of nr (24 channels is two panels, one of them half live).
     g.block_panels = (g.ocn_block + g.nr - 1) / g.nr;
+    // Count the group's panels the way the blob addresses them — one whole
+    // block_panels column per oc block — not as ⌈oc_per_group/nr⌉. The two
+    // differ whenever ocn_block's rounding up to nr leaves the last block
+    // part-full: 512 channels on aarch64 are 2 blocks of 264, i.e. 44 panels,
+    // where ⌈512/12⌉ = 43. Sizing by the blocks is what keeps the last block's
+    // shorter panel column inside the buffer.
+    const int64_t num_oc_blocks = (oc_per_group + g.ocn_block - 1) / g.ocn_block;
+    g.panels_oc   = num_oc_blocks * g.block_panels;
     g.group_elems = g.panels_oc * g.col_elems;
     g.total = attrs.groups * g.group_elems;
     if (quant) {
