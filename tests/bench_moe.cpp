@@ -14,6 +14,7 @@
 /// fc1 + fc2, plus fc3 for SwiGLU.
 
 #include "nnops/ops/moe.hpp"
+#include "nnops/ops/matmul.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/bench_harness.hpp"
@@ -264,7 +265,129 @@ void run_table(const char* tag) {
     }
 }
 
+// ============================================================
+// The per-call weight pack — the one pass MoE pays that a graph does not
+// ============================================================
+//
+// Each expert's slice is a `transpose_b` GEMM, so the kernel transposes it into
+// uniform panels on every call: read the raw weight, write the panels, read the
+// panels. MoE has no load step of its own, so all three passes are per call —
+// and unlike a dense Linear the weight bank (E × fc1 + E × fc2) is far past any
+// cache, so the pack is not amortized over K or over a resident bank.
+//
+// This measures the two arms at the per-expert M a prefill row actually hands
+// the GEMM (k·T/E routes, uneven load ignored — it is the same M on both arms):
+// a slice packed inside the call against the same slice through prepackWeights,
+// packed once outside every timer the way a graph engine does at load. Same
+// MatMul, same numbers, so the ratio is the pack.
+struct GemmCase {
+    const char* name;
+    int64_t M, N, K;   // one expert: [M,H] x [N,K]^T, M = k*T/E
+};
+
+template <class T>
+void bench_pack_ab(const char* tag, const std::vector<int>& threads, int rounds) {
+    static const GemmCase cases[] = {
+        {"mixtral fc1  64x4096x2048",  64, 4096, 2048},
+        {"mixtral fc1  64x 128x2048",  64,  128, 2048},
+        {"mixtral fc1  64x 256x2048",  64,  256, 2048},
+        {"mixtral fc1  64x 512x2048",  64,  512, 2048},
+        {"mixtral fc1  64x1024x2048",  64, 1024, 2048},
+        {"mixtral fc2  64x2048x4096",  64, 2048, 4096},
+        {"deepseek fc1 32x512x2048",   32,  512, 2048},
+        {"deepseek fc2 32x2048x512",   32, 2048,  512},
+        {"small    fc1 16x512x512",    16,  512,  512},
+        {"decode   fc1  1x4096x2048",   1, 4096, 2048},
+    };
+
+    std::printf("  %s expert GEMM, weight packed once vs packed per call\n", tag);
+    std::printf("    %-26s", "case");
+    for (int nt : threads) { std::printf("  %2dT:   packed      raw    P/R", nt); }
+    std::printf("\n");
+
+    for (const GemmCase& c : cases) {
+        constexpr DataType dt = dtype_of<T>();
+        const int64_t a_shape[] = {c.M, c.K};
+        const int64_t b_shape[] = {c.N, c.K};
+        const int64_t o_shape[] = {c.M, c.N};
+
+        std::vector<T> a_v(static_cast<size_t>(c.M * c.K));
+        std::vector<T> b_v(static_cast<size_t>(c.N * c.K));
+        std::vector<T> o_v(static_cast<size_t>(c.M * c.N));
+        fill_random(a_v, 11);
+        fill_random(b_v, 12);
+
+        TensorView a(a_shape, dt, a_v.data());
+        TensorView b(b_shape, dt, b_v.data());
+        TensorView o(o_shape, dt, o_v.data());
+
+        MatMulAttributes mm{};
+        mm.transpose_b = true;
+        auto op = MatMul::create(mm, Backend::CPU);
+
+        // Pack once, outside every timer. 64-byte aligned like a pool buffer: a
+        // panel starting 16 bytes into a line splits half its vector loads.
+        TensorView query;
+        const TensorView win[] = {b};
+        TensorView q[] = {query};
+        op->prepackWeights(win, q);
+        std::vector<std::byte> hold(
+            static_cast<size_t>(q[0].desc().numel()) * sizeof(T) + 64);
+        const size_t mis = reinterpret_cast<uintptr_t>(hold.data()) % 64;
+        T* blob = reinterpret_cast<T*>(hold.data() + ((64 - mis) % 64));
+        TensorView packed(q[0].shape_span(), dt, blob, q[0].pitch(), q[0].layout());
+        TensorView pack[] = {packed};
+        op->prepackWeights(win, pack);
+
+        const TensorView ins_raw[] = {a, b};
+        const TensorView ins_pk[] = {a, packed};
+        const double flops = 2.0 * static_cast<double>(c.M) * static_cast<double>(c.N) *
+                             static_cast<double>(c.K);
+
+        std::printf("    %-26s", c.name);
+        for (int nt : threads) {
+            BenchPool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+
+            const int iters = (c.M <= 1 || nt == 1) ? 8 : 3;
+            auto arm = [&](const TensorView* ins) {
+                const std::span<const TensorView> in(ins, 2);
+                return time_ms([&] { op->compute(o, in, ctx, nullptr); }, iters);
+            };
+            std::fill(o_v.begin(), o_v.end(), T{});
+            arm(ins_raw);
+            arm(ins_pk);
+
+            std::vector<double> vp, vr;
+            for (int r = 0; r < rounds; ++r) {
+                // Alternate which arm goes first: the second arm inherits the
+                // first's cache and bandwidth state.
+                if (r % 2 == 0) {
+                    vr.push_back(arm(ins_raw));
+                    vp.push_back(arm(ins_pk));
+                } else {
+                    vp.push_back(arm(ins_pk));
+                    vr.push_back(arm(ins_raw));
+                }
+            }
+            const double tp = median_of(vp), tr = median_of(vr);
+            std::printf(" %9.1f %9.1f %6.3f",
+                        flops / tp / 1e6, flops / tr / 1e6, tr > 0.0 ? tp / tr : 0.0);
+        }
+        std::printf("\n");
+    }
+}
+
 }  // anonymous namespace
 
 NNOPS_BENCH(moe_f32) { run_table<float>("f32"); }
 NNOPS_BENCH(moe_f16) { run_table<half>("f16"); }
+
+NNOPS_BENCH(moe_prepack_ab_f32) {
+    bench_pack_ab<float>("f32", bench_threads(), 3);
+}
+
+NNOPS_BENCH(moe_prepack_ab_f16) {
+    bench_pack_ab<half>("f16", bench_threads(), 3);
+}
