@@ -469,6 +469,29 @@ NNOPS_TEST(matmul_q4_1_fused_small_m) {
               EpilogueActivateType::Relu6, /*bias=*/true});
 }
 
+/// The same route with f16 activations — the w4a16 decode case. Each M limit is
+/// visited exactly: at it the fused kernel runs, one row past it the packed
+/// plan takes the call, and both must land on the same decoded product.
+NNOPS_TEST(matmul_q4_1_fused_small_m_f16) {
+    run_case({1, 71, 160, /*transpose_b=*/true, true, false});
+    run_case({3, 41, 33, /*transpose_b=*/true, true, false});    // MR=4, K tail
+    run_case({16, 71, 95, /*transpose_b=*/true, true, false});   // two 8-row panels
+    run_case({32, 71, 95, /*transpose_b=*/true, true, false});   // at the trans limit
+    run_case({33, 71, 95, /*transpose_b=*/true, true, false});   // past it
+    run_case({1, 37, 70, /*transpose_b=*/false, true, false});
+    run_case({5, 37, 70, /*transpose_b=*/false, true, false});   // copy-limit band
+    run_case({8, 37, 70, /*transpose_b=*/false, true, false});   // at the copy limit
+    run_case({9, 37, 70, /*transpose_b=*/false, true, false});   // past it
+    run_case({16, 37, 33, /*transpose_b=*/true, true, false, 0.5f, 2.0f});
+    run_case({2, 37, 70, /*transpose_b=*/false, true, false, 0.0f, -0.5f});
+    run_case({2, 37, 70, /*transpose_b=*/false, true, false, 0.0f, 1.0f,
+              EpilogueActivateType::Relu6});
+    run_case({8, 71, 160, /*transpose_b=*/true, true, false, 0.0f, 2.0f,
+              EpilogueActivateType::None, /*bias=*/true});
+    run_case({16, 37, 33, /*transpose_b=*/true, true, false, 0.5f, 1.5f,
+              EpilogueActivateType::Relu, /*bias=*/true});
+}
+
 NNOPS_TEST(matmul_q4_1_f16) {
     run_case({5, 37, 70, /*transpose_b=*/false, /*f16=*/true, /*transpose_a=*/false});
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false});

@@ -1090,8 +1090,8 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
 #if defined(NNOPS_ARCH_X86_64)
     // Small-M block quant (Q4_1): decode straight into the product, before the
     // plan and the scratch. Only a transposed A is out of reach.
-    if (dt_a == DataType::f32 && is_block_packed_dtype(dt_b) &&
-        !attrs_n.transpose_a) {
+    if ((dt_a == DataType::f32 || dt_a == DataType::f16) &&
+        is_block_packed_dtype(dt_b) && !attrs_n.transpose_a) {
         const auto [M, N, K] = matmul_dims(attrs_n, a, b);
         if (matmul_qblock_fused(attrs_n, output, inputs, ctx,
                             static_cast<int>(M), static_cast<int>(N),

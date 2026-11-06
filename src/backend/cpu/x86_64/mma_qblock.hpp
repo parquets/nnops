@@ -1,6 +1,6 @@
 #pragma once
 /// @file mma_qblock.hpp
-/// @brief Fused block-quant × f32 dot kernels for the small-M MatMul route.
+/// @brief Fused block-quant dot kernels for the small-M MatMul route.
 ///
 /// The packed-B route decodes a Q4_1 block into a dense panel and then reads
 /// that panel back in the MMA. At M=1 the panel is consumed by exactly one
@@ -27,6 +27,9 @@
 ///
 /// @p MR is the exact number of live rows: a partial M panel instantiates its
 /// own width, so no row aliases a duplicate and no per-row guard is needed.
+/// @p AC is the activation/output element type — f32 reads through, f16 converts
+/// on the load and rounds once at the store, so a w4a16 call decodes a block
+/// into f32 registers instead of packing an f16 panel first.
 
 #include <immintrin.h>
 
@@ -53,9 +56,12 @@ struct Q4Block {
 
     /// Per-layout M ceilings at K=N=4096. The dot kernel amortizes one decode
     /// over MR = 8 rows and the outer product over 2, so copy is capped at half
-    /// the trans ceiling. Measured at 4096²: +34% at M=8 and down to 0.85 by
-    /// M=16; at 2048² the same M=8 point is +89%.
+    /// the trans ceiling — past M=8 the extra pass over B stops paying.
+    /// With a float activation the trans route is 2.29x at M=16 and par by M=32;
+    /// an f16 activation converts on the load but its packed twin is slower, so
+    /// the register decode still reads 1.31x at M=32 and only reaches par by 128.
     static constexpr int fused_max_m_trans = 16;
+    static constexpr int fused_max_m_trans_f16 = 32;
     static constexpr int fused_max_m_copy = 8;
 
     static inline void decode_ps(const uint8_t* p, __m256& v0, __m256& v1,
@@ -82,15 +88,40 @@ inline float qblock_hsum_ps(__m256 v) noexcept {
     return _mm_cvtss_f32(s);
 }
 
+// =========================================================================
+//  Activation access — f32 reads through, f16 converts on the fly
+// =========================================================================
+//
+/// The product accumulates in f32 registers either way; only the operand load
+/// and the final store differ, so an f16 activation costs eight converts per
+/// vector instead of a dense f32 copy of A.
+
+inline __m256 qblock_load8(const float* p) noexcept { return _mm256_loadu_ps(p); }
+inline __m256 qblock_load8(const half* p) noexcept {
+    return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+}
+
+inline void qblock_store8(float* p, __m256 v) noexcept { _mm256_storeu_ps(p, v); }
+inline void qblock_store8(half* p, __m256 v) noexcept {
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(p),
+                     _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
+}
+
+inline float qblock_load1(const float* p) noexcept { return *p; }
+inline float qblock_load1(const half* p) noexcept { return half_to_float(*p); }
+
+inline void qblock_store1(float* p, float v) noexcept { *p = v; }
+inline void qblock_store1(half* p, float v) noexcept { *p = float_to_half(v); }
+
 /// One trans row's k step: its four A vectors against the four decoded B
 /// vectors.
 #define NNOPS_QBLOCK_DOT_ROW(ACC, ROW)                                    \
     do {                                                                  \
-        const float* a = A + static_cast<int64_t>(ROW) * lda + k;         \
-        __m256 t = _mm256_mul_ps(b0, _mm256_loadu_ps(a));                 \
-        t = _mm256_fmadd_ps(b1, _mm256_loadu_ps(a + 8), t);               \
-        t = _mm256_fmadd_ps(b2, _mm256_loadu_ps(a + 16), t);              \
-        t = _mm256_fmadd_ps(b3, _mm256_loadu_ps(a + 24), t);              \
+        const AC* a = A + static_cast<int64_t>(ROW) * lda + k;            \
+        __m256 t = _mm256_mul_ps(b0, qblock_load8(a));                    \
+        t = _mm256_fmadd_ps(b1, qblock_load8(a + 8), t);                  \
+        t = _mm256_fmadd_ps(b2, qblock_load8(a + 16), t);                 \
+        t = _mm256_fmadd_ps(b3, qblock_load8(a + 24), t);                 \
         ACC = _mm256_add_ps(ACC, t);                                      \
     } while (0)
 
@@ -103,12 +134,12 @@ inline float qblock_hsum_ps(__m256 v) noexcept {
 /// @param C C[m0][n_start]; already offset by the caller.
 /// @param A A[m0][0], row stride @p lda.
 /// @param B first block of the batch element's [N][K] stream.
-template <class BQ, int MR, bool ZERO>
-void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-                          const float* NNOPS_RESTRICT A, int lda,
-                          const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
-                          int n_start, float alpha, float clamp_min,
-                          float clamp_max) noexcept {
+template <class BQ, class AC, int MR, bool ZERO>
+void mma_qblock_trans(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
+                      const AC* NNOPS_RESTRICT A, int lda,
+                      const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
+                      int n_start, float alpha, float clamp_min,
+                      float clamp_max) noexcept {
     static_assert(MR >= 1 && MR <= 8, "trans qblock kernel: MR in [1, 8]");
 
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(BQ::block_bytes);
@@ -137,11 +168,11 @@ void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
             if constexpr (MR <= 2) {
 #define NNOPS_QBLOCK_CHAINS(Q, ROW)                                           \
                 do {                                                          \
-                    const float* a = A + static_cast<int64_t>(ROW) * lda + k; \
-                    Q##0 = _mm256_fmadd_ps(b0, _mm256_loadu_ps(a), Q##0);     \
-                    Q##1 = _mm256_fmadd_ps(b1, _mm256_loadu_ps(a + 8), Q##1); \
-                    Q##2 = _mm256_fmadd_ps(b2, _mm256_loadu_ps(a + 16), Q##2);\
-                    Q##3 = _mm256_fmadd_ps(b3, _mm256_loadu_ps(a + 24), Q##3);\
+                    const AC* a = A + static_cast<int64_t>(ROW) * lda + k;    \
+                    Q##0 = _mm256_fmadd_ps(b0, qblock_load8(a), Q##0);        \
+                    Q##1 = _mm256_fmadd_ps(b1, qblock_load8(a + 8), Q##1);    \
+                    Q##2 = _mm256_fmadd_ps(b2, qblock_load8(a + 16), Q##2);   \
+                    Q##3 = _mm256_fmadd_ps(b3, qblock_load8(a + 24), Q##3);   \
                 } while (0)
                 NNOPS_QBLOCK_CHAINS(q0, 0);
                 if constexpr (MR > 1) { NNOPS_QBLOCK_CHAINS(q1, 1); }
@@ -176,24 +207,24 @@ void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
             for (int i = 0; i < rem; ++i) {
                 const int kk = k + i;
                 const float bv = vals[i];
-                t0 += bv * A[kk];
-                if constexpr (MR > 1) { t1 += bv * A[static_cast<int64_t>(lda) + kk]; }
-                if constexpr (MR > 2) { t2 += bv * A[2 * static_cast<int64_t>(lda) + kk]; }
-                if constexpr (MR > 3) { t3 += bv * A[3 * static_cast<int64_t>(lda) + kk]; }
-                if constexpr (MR > 4) { t4 += bv * A[4 * static_cast<int64_t>(lda) + kk]; }
-                if constexpr (MR > 5) { t5 += bv * A[5 * static_cast<int64_t>(lda) + kk]; }
-                if constexpr (MR > 6) { t6 += bv * A[6 * static_cast<int64_t>(lda) + kk]; }
-                if constexpr (MR > 7) { t7 += bv * A[7 * static_cast<int64_t>(lda) + kk]; }
+                t0 += bv * qblock_load1(A + kk);
+                if constexpr (MR > 1) { t1 += bv * qblock_load1(A + static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 2) { t2 += bv * qblock_load1(A + 2 * static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 3) { t3 += bv * qblock_load1(A + 3 * static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 4) { t4 += bv * qblock_load1(A + 4 * static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 5) { t5 += bv * qblock_load1(A + 5 * static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 6) { t6 += bv * qblock_load1(A + 6 * static_cast<int64_t>(lda) + kk); }
+                if constexpr (MR > 7) { t7 += bv * qblock_load1(A + 7 * static_cast<int64_t>(lda) + kk); }
             }
         }
 
-        float* c = C + n;
+        AC* c = C + n;
         auto finish = [&](int row, __m256 acc, float tail) {
-            float* cp = c + static_cast<int64_t>(row) * ldc;
+            AC* cp = c + static_cast<int64_t>(row) * ldc;
             float v = qblock_hsum_ps(acc) + tail;
             if (alpha != 1.0f) { v *= alpha; }
-            if constexpr (!ZERO) { v += *cp; }
-            *cp = std::min(std::max(v, clamp_min), clamp_max);
+            if constexpr (!ZERO) { v += qblock_load1(cp); }
+            qblock_store1(cp, std::min(std::max(v, clamp_min), clamp_max));
         };
 
         finish(0, acc0, t0);
@@ -217,12 +248,12 @@ void mma_qblock_f32_trans(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
 ///
 /// @param n_start first column of the tile; must be a multiple of 32, so each
 ///                decoded block is one panel.
-template <class BQ, int MR, bool ZERO>
-void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
-                         const float* NNOPS_RESTRICT A, int lda,
-                         const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
-                         int n_start, float alpha, float clamp_min,
-                         float clamp_max) noexcept {
+template <class BQ, class AC, int MR, bool ZERO>
+void mma_qblock_copy(int nc, int kc, AC* NNOPS_RESTRICT C, int ldc,
+                     const AC* NNOPS_RESTRICT A, int lda,
+                     const uint8_t* NNOPS_RESTRICT B, int64_t row_blocks,
+                     int n_start, float alpha, float clamp_min,
+                     float clamp_max) noexcept {
     static_assert(MR == 1 || MR == 2, "copy qblock kernel: MR in {1, 2}");
 
     const int64_t row_bytes = row_blocks * static_cast<int64_t>(BQ::block_bytes);
@@ -247,15 +278,15 @@ void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
             __m256 b0, b1, b2, b3;
             BQ::decode_ps(src, b0, b1, b2, b3);
 
-            const __m256 va = _mm256_broadcast_ss(A + k);
+            const __m256 va = _mm256_set1_ps(qblock_load1(A + k));
             r0a = _mm256_fmadd_ps(va, b0, r0a);
             r0b = _mm256_fmadd_ps(va, b1, r0b);
             r0c = _mm256_fmadd_ps(va, b2, r0c);
             r0d = _mm256_fmadd_ps(va, b3, r0d);
 
             if constexpr (MR > 1) {
-                const __m256 vb =
-                    _mm256_broadcast_ss(A + static_cast<int64_t>(lda) + k);
+                const __m256 vb = _mm256_set1_ps(
+                    qblock_load1(A + static_cast<int64_t>(lda) + k));
                 r1a = _mm256_fmadd_ps(vb, b0, r1a);
                 r1b = _mm256_fmadd_ps(vb, b1, r1b);
                 r1c = _mm256_fmadd_ps(vb, b2, r1c);
@@ -264,7 +295,7 @@ void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
         }
 
         auto emit = [&](int row, __m256 q0, __m256 q1, __m256 q2, __m256 q3) {
-            float* cp = C + static_cast<int64_t>(row) * ldc + n;
+            AC* cp = C + static_cast<int64_t>(row) * ldc + n;
             if (width == BQ::block_elems) {
                 if (scaled) {
                     q0 = _mm256_mul_ps(q0, valpha);
@@ -273,15 +304,15 @@ void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                     q3 = _mm256_mul_ps(q3, valpha);
                 }
                 if constexpr (!ZERO) {
-                    q0 = _mm256_add_ps(q0, _mm256_loadu_ps(cp + 0));
-                    q1 = _mm256_add_ps(q1, _mm256_loadu_ps(cp + 8));
-                    q2 = _mm256_add_ps(q2, _mm256_loadu_ps(cp + 16));
-                    q3 = _mm256_add_ps(q3, _mm256_loadu_ps(cp + 24));
+                    q0 = _mm256_add_ps(q0, qblock_load8(cp + 0));
+                    q1 = _mm256_add_ps(q1, qblock_load8(cp + 8));
+                    q2 = _mm256_add_ps(q2, qblock_load8(cp + 16));
+                    q3 = _mm256_add_ps(q3, qblock_load8(cp + 24));
                 }
-                _mm256_storeu_ps(cp + 0, _mm256_min_ps(_mm256_max_ps(q0, vlo), vhi));
-                _mm256_storeu_ps(cp + 8, _mm256_min_ps(_mm256_max_ps(q1, vlo), vhi));
-                _mm256_storeu_ps(cp + 16, _mm256_min_ps(_mm256_max_ps(q2, vlo), vhi));
-                _mm256_storeu_ps(cp + 24, _mm256_min_ps(_mm256_max_ps(q3, vlo), vhi));
+                qblock_store8(cp + 0, _mm256_min_ps(_mm256_max_ps(q0, vlo), vhi));
+                qblock_store8(cp + 8, _mm256_min_ps(_mm256_max_ps(q1, vlo), vhi));
+                qblock_store8(cp + 16, _mm256_min_ps(_mm256_max_ps(q2, vlo), vhi));
+                qblock_store8(cp + 24, _mm256_min_ps(_mm256_max_ps(q3, vlo), vhi));
             } else {
                 float tmp[BQ::block_elems];
                 _mm256_storeu_ps(tmp + 0, q0);
@@ -291,8 +322,8 @@ void mma_qblock_f32_copy(int nc, int kc, float* NNOPS_RESTRICT C, int ldc,
                 for (int i = 0; i < width; ++i) {
                     float v = tmp[i];
                     if (scaled) { v *= alpha; }
-                    if constexpr (!ZERO) { v += cp[i]; }
-                    cp[i] = std::min(std::max(v, clamp_min), clamp_max);
+                    if constexpr (!ZERO) { v += qblock_load1(cp + i); }
+                    qblock_store1(cp + i, std::min(std::max(v, clamp_min), clamp_max));
                 }
             }
         };

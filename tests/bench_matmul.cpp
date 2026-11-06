@@ -847,31 +847,38 @@ void sweep_q4(const char* tag, const std::vector<SweepShape>& shapes,
 
 /// M ladder at a fixed KxN: the packed B panel is reused once per output row, so
 /// the decode cost per FLOP falls as 1/M until the MMA (or memory) takes over.
-/// The dense f32 twin is built at the same thread count so the ratio shows the
-/// knee, not the host's absolute speed.
+/// The dense twin at the same activation type is built at the same thread count
+/// so the ratio shows the knee, not the host's absolute speed.
 ///
 /// @p packed pins the block format to the packed route (the fused small-M kernels
 /// off), so the small-M cells compare formats, not routes; the dense arm has no
 /// such switch and GEMVs to M = 4 regardless.
-void m_ladder_q4(int64_t K, int64_t N, const std::vector<int64_t>& ms,
+template <typename Act>
+void m_ladder_q4(const char* tag, int64_t K, int64_t N, const std::vector<int64_t>& ms,
                  const std::vector<int>& threads, double target_ms,
                  bool tb = false, bool packed = false) {
-    std::printf("  M ladder q4_1 vs dense f32  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
-                static_cast<long long>(K), static_cast<long long>(N),
+    std::printf("  M ladder q4_1 vs dense %s  K=%lld N=%lld  B=%s  budget=%.0f ms/cell\n",
+                tag, static_cast<long long>(K), static_cast<long long>(N),
                 tb ? "[N][K]" : "[K][N]", target_ms);
     if (packed) {
         std::printf("    q4_1 pinned to the packed route; the dense arm GEMVs to M = 4,\n"
                     "    so the small-M cells compare the format, not two routes\n");
-    } else if (tb) {
-        std::printf("    as routed: q4_1 fuses to M = 16 on [N][K]; the dense arm\n"
-                    "    GEMVs to M = 4, so the small-M cells compare routes\n");
     } else {
-        std::printf("    as routed: q4_1 fuses to M = 8 on [K][N]; the dense arm\n"
-                    "    GEMVs to M = 4, so the small-M cells compare routes\n");
+#if defined(NNOPS_ARCH_X86_64)
+        constexpr int kTransM = std::is_same_v<Act, half>
+            ? cpu::arch::Q4Block::fused_max_m_trans_f16
+            : cpu::arch::Q4Block::fused_max_m_trans;
+        std::printf("    as routed: q4_1 fuses to M = %d on %s; the dense arm GEMVs to\n"
+                    "    M = 4, so the small-M cells compare routes\n",
+                    tb ? kTransM : int{cpu::arch::Q4Block::fused_max_m_copy},
+                    tb ? "[N][K]" : "[K][N]");
+#else
+        std::printf("    block formats take the packed route on this arch\n");
+#endif
     }
     std::printf("   %5s |", "M");
     for (int nt : threads) {
-        std::printf("  %2dT:    q4_1      dense f32     ratio |", nt);
+        std::printf("  %2dT:    q4_1      dense %-6s  ratio |", nt, tag);
     }
     std::printf("\n");
 
@@ -883,8 +890,8 @@ void m_ladder_q4(int64_t K, int64_t N, const std::vector<int64_t>& ms,
     for (int64_t M : ms) {
         std::printf("   %5lld |", static_cast<long long>(M));
         for (int nt : threads) {
-            SweepOpQ4<float> q(M, K, N, 7, nt, tb);
-            SweepOp<float> d(M, K, N, 7, nt, tb);
+            SweepOpQ4<Act> q(M, K, N, 7, nt, tb);
+            SweepOp<Act> d(M, K, N, 7, nt, tb);
             BenchPool pool(nt);
             ComputeContext ctx;
             if (nt > 1) { ctx.cpu = pool.cpu; }
@@ -1665,16 +1672,17 @@ NNOPS_BENCH(matmul_q4_m_ladder) {
     // (decode) bound, large-M rows are FLOP bound; the ratio column crossing
     // back toward 1 is the knee. Two B sizes: 10 MB (out of cache) and 2.5 MB.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128, 256};
-    m_ladder_q4(4096, 4096, ms, {1, 4}, 100.0);
-    m_ladder_q4(2048, 2048, ms, {1, 4}, 100.0);
+    m_ladder_q4<float>("f32", 4096, 4096, ms, {1, 4}, 100.0);
+    m_ladder_q4<float>("f32", 2048, 2048, ms, {1, 4}, 100.0);
 }
 
-NNOPS_BENCH(matmul_qblock_fused_ab) {
+/// Fused vs packed, alternated in one process. The fused arm forces the fused
+/// route for every M, so the table shows where it stops winning; the shipped
+/// gate is Q4Block::fused_max_m_trans/copy. Override < 0 keeps the built-in
+/// limits, 0 forces packed, > 0 overrides the M limit.
+template <typename Act>
+void qblock_fused_ab(const char* tag) {
 #if defined(NNOPS_ARCH_X86_64)
-    // Fused vs packed, alternated in one process. The fused arm forces the fused
-    // route for every M, so the table shows where it stops winning; the shipped
-    // gate is Q4Block::fused_max_m_trans/copy. Override < 0 keeps the built-in
-    // limits, 0 forces packed, > 0 overrides the M limit.
     const int64_t K = 4096, N = 4096;
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128};
     const std::vector<int> threads{1, 4};
@@ -1685,7 +1693,7 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
     };
 
     for (int tb = 0; tb < 2; ++tb) {
-        std::printf("  fused vs packed q4_1  K=%lld N=%lld  B=%s\n",
+        std::printf("  fused vs packed q4_1 %s  K=%lld N=%lld  B=%s\n", tag,
                     static_cast<long long>(K), static_cast<long long>(N),
                     tb ? "[N][K]" : "[K][N]");
         std::printf("   %5s |", "M");
@@ -1697,7 +1705,7 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
         for (int64_t M : ms) {
             std::printf("   %5lld |", static_cast<long long>(M));
             for (int nt : threads) {
-                SweepOpQ4<float> q(M, K, N, 7, nt, tb != 0);
+                SweepOpQ4<Act> q(M, K, N, 7, nt, tb != 0);
                 BenchPool pool(nt);
                 ComputeContext ctx;
                 if (nt > 1) { ctx.cpu = pool.cpu; }
@@ -1725,8 +1733,17 @@ NNOPS_BENCH(matmul_qblock_fused_ab) {
         }
     }
 #else
+    (void)tag;
     std::printf("  fused block-quant route: x86_64 only\n");
 #endif
+}
+
+NNOPS_BENCH(matmul_qblock_fused_ab) {
+    qblock_fused_ab<float>("f32");
+}
+
+NNOPS_BENCH(matmul_qblock_fused_ab_f16) {
+    qblock_fused_ab<half>("f16");
 }
 
 NNOPS_BENCH(matmul_q4_vs_f32_gemv) {
@@ -1738,12 +1755,12 @@ NNOPS_BENCH(matmul_q4_vs_f32_gemv) {
     // matmul_q4_m_ladder's comparison, not this one.
     const std::vector<int64_t> ms{1, 2, 4};
     const std::vector<int> threads{1, 2, 4, 8};
-    m_ladder_q4(4096, 4096, ms, threads, 60.0);
-    m_ladder_q4(2048, 2048, ms, threads, 60.0);
-    m_ladder_q4(1024, 1024, ms, threads, 60.0);
-    m_ladder_q4(4096, 4096, ms, threads, 60.0, /*tb=*/true);
-    m_ladder_q4(2048, 2048, ms, threads, 60.0, /*tb=*/true);
-    m_ladder_q4(1024, 1024, ms, threads, 60.0, /*tb=*/true);
+    m_ladder_q4<float>("f32", 4096, 4096, ms, threads, 60.0);
+    m_ladder_q4<float>("f32", 2048, 2048, ms, threads, 60.0);
+    m_ladder_q4<float>("f32", 1024, 1024, ms, threads, 60.0);
+    m_ladder_q4<float>("f32", 4096, 4096, ms, threads, 60.0, /*tb=*/true);
+    m_ladder_q4<float>("f32", 2048, 2048, ms, threads, 60.0, /*tb=*/true);
+    m_ladder_q4<float>("f32", 1024, 1024, ms, threads, 60.0, /*tb=*/true);
 }
 
 NNOPS_BENCH(matmul_q4_f32_packed) {
@@ -1752,18 +1769,27 @@ NNOPS_BENCH(matmul_q4_f32_packed) {
     // arm has no switch — its GEMV is the route a dense B takes to M = 4 anyway.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16};
     const std::vector<int> threads{1, 8};
-    m_ladder_q4(4096, 4096, ms, threads, 40.0, false, /*packed=*/true);
-    m_ladder_q4(4096, 4096, ms, threads, 40.0, true,  /*packed=*/true);
-    m_ladder_q4(2048, 2048, ms, threads, 40.0, false, /*packed=*/true);
-    m_ladder_q4(2048, 2048, ms, threads, 40.0, true,  /*packed=*/true);
+    m_ladder_q4<float>("f32", 4096, 4096, ms, threads, 40.0, false, /*packed=*/true);
+    m_ladder_q4<float>("f32", 4096, 4096, ms, threads, 40.0, true,  /*packed=*/true);
+    m_ladder_q4<float>("f32", 2048, 2048, ms, threads, 40.0, false, /*packed=*/true);
+    m_ladder_q4<float>("f32", 2048, 2048, ms, threads, 40.0, true,  /*packed=*/true);
 }
 
 NNOPS_BENCH(matmul_q4_m_ladder_tb) {
     // Same ladder against a [N][K] weight (the Linear layout): the fused dot
     // kernel's shape.
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128, 256};
-    m_ladder_q4(4096, 4096, ms, {1, 4}, 100.0, /*tb=*/true);
-    m_ladder_q4(2048, 2048, ms, {1, 4}, 100.0, /*tb=*/true);
+    m_ladder_q4<float>("f32", 4096, 4096, ms, {1, 4}, 100.0, /*tb=*/true);
+    m_ladder_q4<float>("f32", 2048, 2048, ms, {1, 4}, 100.0, /*tb=*/true);
+}
+
+// The deployment pair: Q4_1 weights with an f16 activation. The fused small-M
+// route was written against f32 A, so this arm always packs a panel first —
+// the same ladder on f32 A (above) is what the route would give.
+NNOPS_BENCH(matmul_q4_m_ladder_f16) {
+    const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128, 256};
+    m_ladder_q4<half>("f16", 4096, 4096, ms, {1, 4}, 100.0, /*tb=*/true);
+    m_ladder_q4<half>("f16", 2048, 2048, ms, {1, 4}, 100.0, /*tb=*/true);
 }
 
 // Weight-format A/B under matched conditions: same A, dense f16/f32 B vs Q4_1 B.
