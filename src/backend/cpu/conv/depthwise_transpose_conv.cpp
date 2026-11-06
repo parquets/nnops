@@ -1263,6 +1263,47 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
         return Status::unsupported;
     }
 
+    // The per-tap form is what a channel-last lane reads; a filter in the
+    // channel-first [C, 1, KH, KW] order — what a grouped TransposeConv2D hands
+    // over — has its channels a plane apart, so it is repacked once here rather
+    // than read strided through every tap.
+    PoolArray<std::byte> w_per_tap;
+    TensorView w_hwcm;
+    std::array<TensorView, 3> operands;
+    if (last && weight.rank() == 4 && is_channel_first_spatial(weight.layout())) {
+        if (weight.shape(0) != gm.C || weight.shape(1) != 1) {
+            return Status::unsupported;   // not one filter per channel
+        }
+        const int64_t taps = gm.KH * gm.KW;
+        const size_t es = data_type_size(weight.data_type());
+        w_per_tap.reset(static_cast<size_t>(taps * gm.C) * es);
+        if (!w_per_tap) { return Status::unsupported; }
+
+        const auto* src = weight.ptr<std::byte>();
+        auto* dst = w_per_tap.data();
+        const int64_t s_c  = weight.stride_elems(0);
+        const int64_t s_kh = weight.stride_elems(2);
+        const int64_t s_kw = weight.stride_elems(3);
+        for (int64_t c = 0; c < gm.C; ++c) {
+            for (int64_t kh = 0; kh < gm.KH; ++kh) {
+                for (int64_t kw = 0; kw < gm.KW; ++kw) {
+                    const size_t from =
+                        static_cast<size_t>((c * s_c + kh * s_kh + kw * s_kw)) * es;
+                    const size_t to =
+                        static_cast<size_t>(((kh * gm.KW + kw) * gm.C + c)) * es;
+                    std::memcpy(dst + to, src + from, es);
+                }
+            }
+        }
+        const int64_t shape[] = {gm.KH, gm.KW, gm.C};
+        w_hwcm = TensorView(shape, weight.data_type(), dst, TensorLayout::HWCM);
+
+        operands[0] = inputs[0];
+        operands[1] = w_hwcm;
+        if (inputs.size() > 2) { operands[2] = inputs[2]; }
+        inputs = std::span<const TensorView>(operands.data(), inputs.size());
+    }
+
     if (is_quantized_depthwise_transpose_conv2d(weight.data_type())) {
         return depthwise_transpose_conv_int8_cpu(attrs, gm, output, inputs, ctx);
     }

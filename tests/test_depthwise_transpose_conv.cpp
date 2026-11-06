@@ -20,6 +20,7 @@
 /// every output element is accumulated by exactly one task in a fixed tap
 /// order, so the thread count may not change the result.
 
+#include "nnops/ops/transpose_conv2d.hpp"
 #include "nnops/ops/depthwise_transpose_conv.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
@@ -644,14 +645,17 @@ NNOPS_TEST(dwtconv_refusals) {
         NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::unsupported);
     }
 
-    // A channel-last activation needs the HWCM filter.
+    // A channel-last activation takes the transpose-conv [C, 1, KH, KW] filter
+    // as well as HWCM, but one filter per channel is the geometry here: a
+    // multiplier is refused.
     {
         std::vector<float> in_cl(in_vec.size());
         TensorView in_last(std::span<const int64_t>(in.shape(),
                                                     static_cast<size_t>(in.rank())),
                            DataType::f32, in_cl.data(), TensorLayout::NHWC);
-        const TensorView ins[] = {in_last, w};
-        NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::unsupported);
+        auto [wm_vec, wm] = test::make_random_tensor({4, 2, 3, 3});
+        const TensorView ins[] = {in_last, wm};
+        NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::invalid_argument);
     }
 
     // Channel counts must agree.
@@ -672,4 +676,131 @@ NNOPS_TEST(dwtconv_refusals) {
         const TensorView ins[] = {in_s8, w};
         NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::unsupported);
     }
+}
+
+// ============================================================
+// TransposeConv2D's depthwise geometry — group == in_channels runs on these
+// kernels
+// ============================================================
+
+/// A TransposeConv2D whose group count equals its input channels is the
+/// depthwise geometry, and compute() hands it to these kernels instead of the
+/// per-group col GEMM. Its filter is [IC, OC/G, KH, KW] = [C, 1, KH, KW], which
+/// a channel-first activation reads in place and a channel-last one has
+/// repacked. Compare against depthwise_transpose_conv_ref on the same values.
+static void transpose_conv2d_depthwise_vs_ref(
+    const std::vector<int64_t>& in_shape,
+    const DepthwiseTransposeConv2DAttributes& dw,
+    bool has_bias,
+    bool channel_last)
+{
+    const int64_t N  = in_shape[0];
+    const int64_t C  = in_shape[1];
+    const int64_t H  = in_shape[2];
+    const int64_t W  = in_shape[3];
+    const int64_t S  = H * W;
+    const int64_t KH = dw.kernel_size[0];
+    const int64_t KW = dw.kernel_size[1];
+
+    auto [in_vec, in_cf] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_cf]  = test::make_random_tensor({C, 1, KH, KW});
+    std::vector<float> b_vec;
+    TensorView b_cf;
+    if (has_bias) {
+        auto p = test::make_random_tensor({C});
+        b_vec = std::move(p.first);
+        b_cf  = p.second;
+    }
+
+    // ---- The reference: the depthwise operator's own shape rule and kernel ---
+    auto dw_op = DepthwiseTransposeConv2D::create(dw, Backend::CPU);
+    const TensorDesc ref_in[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
+    auto ref_descs = dw_op->getOutputTensorDesc(
+        std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
+    const int64_t out_n = ref_descs[0].numel();
+    const int64_t out_S = out_n / (N * C);
+
+    std::vector<float> ref_buf(static_cast<size_t>(out_n), dw.add_to ? 1.0f : 0.0f);
+    auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
+    {
+        ComputeContext ctx;
+        const TensorView r[] = {in_cf, w_cf, b_cf};
+        backend::cpu::reference::depthwise_transpose_conv_ref(
+            dw, ref, std::span<const TensorView>(r, has_bias ? 3 : 2), ctx, nullptr);
+    }
+
+    // ---- TransposeConv2D at the same geometry --------------------------------
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size    = dw.kernel_size;
+    attrs.stride         = dw.stride;
+    attrs.dilation       = dw.dilation;
+    attrs.padding        = dw.padding;
+    attrs.output_padding = dw.output_padding;
+    attrs.groups         = C;
+    attrs.epilogue       = dw.epilogue;
+    attrs.add_to         = dw.add_to;
+
+    auto conv = TransposeConv2D::create(attrs, Backend::CPU);
+
+    std::vector<float> out_buf(static_cast<size_t>(out_n), dw.add_to ? 1.0f : 0.0f);
+    if (channel_last) {
+        auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
+        const int64_t in_cl_shape[] = {N, C, H, W};
+        TensorView in_v(in_cl_shape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
+
+        const TensorDesc cl_in[] = {in_v.desc(), w_cf.desc(), b_cf.desc()};
+        auto out_descs = conv->getOutputTensorDesc(
+            std::span<const TensorDesc>(cl_in, has_bias ? 3 : 2));
+        NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
+        NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
+
+        auto out = test::make_channel_first(out_descs[0], out_buf.data());
+        const TensorView ins[] = {in_v, w_cf, b_cf};
+        NNOPS_EXPECT_TRUE(is_ok(conv->compute(
+            out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
+        out_buf = test::to_channel_first<float>(out_buf, N, C, out_S);
+    } else {
+        const TensorDesc cf_in[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
+        auto out_descs = conv->getOutputTensorDesc(
+            std::span<const TensorDesc>(cf_in, has_bias ? 3 : 2));
+        NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
+
+        auto out = test::make_channel_first(out_descs[0], out_buf.data());
+        const TensorView ins[] = {in_cf, w_cf, b_cf};
+        NNOPS_EXPECT_TRUE(is_ok(conv->compute(
+            out, std::span<const TensorView>(ins, has_bias ? 3 : 2))));
+    }
+
+    for (int64_t i = 0; i < out_n; ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[static_cast<size_t>(i)],
+                          ref_buf[static_cast<size_t>(i)], 1e-4f);
+    }
+}
+
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_first) {
+    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
+    dw.epilogue.type = EpilogueActivateType::Relu;
+    transpose_conv2d_depthwise_vs_ref({1, 6, 8, 9}, dw, true, false);
+}
+
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_stride2_output_padding) {
+    // Stride 2 with output_padding: the geometry the operator reads back from
+    // the output size, not from the input's.
+    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {1, 1}};
+    dw.add_to = true;
+    transpose_conv2d_depthwise_vs_ref({2, 5, 7, 6}, dw, false, false);
+}
+
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last) {
+    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
+    dw.epilogue.type = EpilogueActivateType::Relu;
+    transpose_conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true, true);
+}
+
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_add_to) {
+    // C=17 leaves a one-lane tail past two full vectors; stride 2 makes the
+    // output plane a different size from the input's.
+    DepthwiseTransposeConv2DAttributes dw{{2, 2}, {2, 2}, {1, 1}, {0, 0}, {0, 0}};
+    dw.add_to = true;
+    transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false, true);
 }

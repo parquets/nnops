@@ -13,7 +13,9 @@
 ///   channel-last    [KH][KW][C] (TensorLayout::HWCM) — TensorFlow's depthwise
 ///                   order with the multiplier dropped, so every tap is a run
 ///                   of C contiguous channels and the channel lane reads it as
-///                   one vector.
+///                   one vector. The channel-first [C, 1, KH, KW] form is
+///                   accepted here too, for the grouped TransposeConv2D that
+///                   hands its filter over unconverted; the entry repacks it.
 ///
 /// Bias [C] is optional. The output is [N, C, OH, OW] with
 /// OH = (IH - 1)·SH - 2·PH + DH·(KH - 1) + OP_h + 1, and likewise for W.

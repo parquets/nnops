@@ -5,7 +5,10 @@
 /// One filter per channel, read raw: a channel-first activation takes the
 /// [C, 1, KH, KW] filter, a channel-last one the HWCM [KH][KW][C] form whose
 /// every tap is a contiguous run of C channels. There is no prepack either way
-/// — the storage order already is the access pattern the kernel wants.
+/// — the storage order already is the access pattern the kernel wants. A
+/// channel-last activation also takes the [C, 1, KH, KW] filter, because that
+/// is what a grouped TransposeConv2D hands over when its group count meets its
+/// channel count; the entry repacks it to the per-tap order.
 
 #include "nnops/ops/depthwise_transpose_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -79,13 +82,21 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
     }
 
     if (is_channel_last(in.layout)) {
-        // The channel lane loads a tap's channels as one vector, which the
-        // channel-first [C, 1, KH, KW] cannot give it (a tap's channels are C
-        // elements apart).
+        // The channel lane loads a tap's channels as one vector. The per-tap
+        // [KH][KW][C] filter gives it that directly; the transpose-conv
+        // [C, 1, KH, KW] the routed grouped call carries has the channel axis
+        // outermost, and the entry repacks it — the fp kernels only, since the
+        // int8 route reads the per-channel scales off that filter in place.
+        if (weight.layout == TensorLayout::HWCM && weight.rank == 3) {
+            return detail::require(weight.dims[2] == in.dims[1]);
+        }
         NNOPS_TRY(detail::require(
-            weight.layout == TensorLayout::HWCM && weight.rank == 3,
+            !is_quantized_depthwise_transpose_conv2d(weight.dtype),
             Status::unsupported));
-        return detail::require(weight.dims[2] == in.dims[1]);
+        NNOPS_TRY(detail::require(
+            is_channel_first_spatial(weight.layout) && weight.rank == 4,
+            Status::unsupported));
+        return detail::require(weight.dims[1] == 1 && weight.dims[0] == in.dims[1]);
     }
     if (is_channel_first_spatial(in.layout)) {
         NNOPS_TRY(detail::require(
