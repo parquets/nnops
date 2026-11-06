@@ -269,8 +269,7 @@ void run_case(const DwtCase& c, const std::vector<int>& threads, int iters, int 
     }
 }
 
-/// The quantized arm, in place ahead of the kernel: it prints `n/a` until the
-/// route answers. Both layouts are attempted, channel-first first.
+/// The quantized arm, both layouts: the same s8 operands, permuted.
 void run_quantized_arm(const DwtCase& c, const std::vector<int>& threads, int iters) {
     const int64_t ishape[] = {1, c.C, c.IH, c.IW};
     const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
@@ -302,27 +301,55 @@ void run_quantized_arm(const DwtCase& c, const std::vector<int>& threads, int it
     std::vector<float> out_buf(static_cast<size_t>(out_desc.numel()));
     auto out = test::make_channel_first(out_desc, out_buf.data());
 
-    const Status st = op->compute(out, ins, ComputeContext{});
-    const double flops = 2.0 * static_cast<double>(c.C) * out_desc.dims[2] *
-                         out_desc.dims[3] * c.KH * c.KW;
-    if (st != Status::ok) {
-        std::printf("    int8: n/a (compute returned %d)\n", static_cast<int>(st));
+    auto act_cl_vec = test::to_channel_last<int8_t>(
+        std::span<const int8_t>(act.data(), act.size()), 1, c.C, c.IH * c.IW);
+    auto w_hwcm_vec = test::depthwise_to_hwcm<int8_t>(
+        std::span<const int8_t>(w.data(), w.size()), c.C, c.KH * c.KW);
+    TensorView in_cl(std::span<const int64_t>(ishape, 4), DataType::s8,
+                     act_cl_vec.data(), TensorLayout::NHWC, qa);
+    const int64_t w_hwcm_shape[] = {c.KH, c.KW, c.C};
+    TensorView w_hwcm(std::span<const int64_t>(w_hwcm_shape, 3), DataType::s8,
+                      w_hwcm_vec.data(), TensorLayout::HWCM, qw);
+    const TensorView cl_ins[] = {in_cl, w_hwcm};
+    const TensorDesc cl_descs[] = {in_cl.desc(), w_hwcm.desc()};
+    const auto cl_desc_out = op->getOutputTensorDesc(cl_descs)[0];
+    std::vector<float> cl_buf(static_cast<size_t>(cl_desc_out.numel()));
+    auto cl_out = test::make_channel_first(cl_desc_out, cl_buf.data());
+
+    const Status st_cf = op->compute(out, ins, ComputeContext{});
+    const Status st_cl = op->compute(cl_out, cl_ins, ComputeContext{});
+    if (st_cf != Status::ok || st_cl != Status::ok) {
+        std::printf("    int8: n/a (compute returned %d / %d)\n",
+                    static_cast<int>(st_cf), static_cast<int>(st_cl));
         (void)threads;
         (void)iters;
-        (void)flops;
         return;
     }
+
+    // A permuted input and filter must land on the same numbers.
+    const auto cl_as_cf = test::to_channel_first<float>(
+        std::span<const float>(cl_buf.data(), cl_buf.size()), 1, c.C,
+        out_desc.dims[2] * out_desc.dims[3]);
+    const double gap = max_abs_diff(out_buf.data(), cl_as_cf.data(), out_desc.numel());
+
+    const double flops = 2.0 * static_cast<double>(c.C) * out_desc.dims[2] *
+                         out_desc.dims[3] * c.KH * c.KW;
+    std::printf("    |int8 cf - int8 cl| = %.2e\n", gap);
+
     for (int nt : threads) {
         BenchPool pool(nt);
         ComputeContext ctx;
         ctx.cpu = pool.cpu;
         const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
-        std::vector<double> t;
+        std::vector<double> t_cf, t_cl;
         for (int r = 0; r < 3; ++r) {
-            t.push_back(time_us([&] { op->compute(out, ins, use_ctx); }, iters));
+            t_cf.push_back(time_us([&] { op->compute(out, ins, use_ctx); }, iters));
+            t_cl.push_back(time_us([&] { op->compute(cl_out, cl_ins, use_ctx); }, iters));
         }
-        const double us = median_of(t);
-        std::printf("    int8 %2dT  %8.1f us (%6.1f GFLOP/s)\n", nt, us, flops / (us * 1e3));
+        const double cf_us = median_of(t_cf);
+        const double cl_us = median_of(t_cl);
+        std::printf("    int8 %2dT  cf %8.1f us (%6.1f GFLOP/s) | cl %8.1f us (%6.1f)\n",
+                    nt, cf_us, flops / (cf_us * 1e3), cl_us, flops / (cl_us * 1e3));
     }
 }
 
@@ -367,7 +394,7 @@ NNOPS_BENCH(depthwise_transpose_conv_routes) {
 }
 
 // ============================================================
-// The quantized route's arms — n/a until the kernel answers them
+// The quantized route's arms
 // ============================================================
 
 NNOPS_BENCH(depthwise_transpose_conv_int8) {

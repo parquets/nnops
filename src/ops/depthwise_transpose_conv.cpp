@@ -25,9 +25,22 @@ NNOPS_OP_BOILERPLATE(DepthwiseTransposeConv2D, DepthwiseTransposeConv2DAttribute
 std::vector<TensorDesc> DepthwiseTransposeConv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
 {
-    return depthwise_transpose_conv_output_shape(
+    std::vector<TensorDesc> outs = depthwise_transpose_conv_output_shape(
         attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
         attrs_.output_padding, inputs);
+
+    // The quantized route writes s8/u8 when output_dtype says so, else the fp
+    // activation's dtype (output_dtype for a pre-quantized one); an unsupported
+    // request passes through for the kernel to refuse.
+    if (inputs.size() > 1 &&
+        is_quantized_depthwise_transpose_conv2d(inputs[1].dtype)) {
+        const DataType act = inputs[0].dtype;
+        const bool fp_act = (act == DataType::f32 || act == DataType::f16);
+        const DataType odt = attrs_.output_dtype;
+        const bool int_out = odt == DataType::s8 || odt == DataType::u8;
+        outs[0].dtype = (int_out || !fp_act) ? odt : act;
+    }
+    return outs;
 }
 
 Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
@@ -39,12 +52,30 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
     const auto& weight = inputs[1];
 
     NNOPS_TRY(detail::require(in.rank == 4));
-    NNOPS_TRY(detail::require(
-        detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
-        weight.dtype == in.dtype,
-        Status::unsupported));
-    if (inputs.size() > 2 && inputs[2].dtype != in.dtype) {
-        return Status::unsupported;
+
+    if (is_quantized_depthwise_transpose_conv2d(weight.dtype)) {
+        // s8 weights select the quantized route: the activation arrives fp and
+        // is quantized inside, or already quantized; the bias is int32 on an
+        // integer destination and the output dtype otherwise.
+        NNOPS_TRY(detail::require(
+            detail::dtype_in<DataType::f32, DataType::f16, DataType::s8,
+                             DataType::u8>(in.dtype),
+            Status::unsupported));
+        if (inputs.size() > 2) {
+            const DataType odt = outputs[0].dtype;
+            const bool int_out = odt == DataType::s8 || odt == DataType::u8;
+            NNOPS_TRY(detail::require(
+                inputs[2].dtype == (int_out ? DataType::s32 : odt),
+                Status::unsupported));
+        }
+    } else {
+        NNOPS_TRY(detail::require(
+            detail::dtype_in<DataType::f32, DataType::f16>(in.dtype) &&
+            weight.dtype == in.dtype,
+            Status::unsupported));
+        if (inputs.size() > 2 && inputs[2].dtype != in.dtype) {
+            return Status::unsupported;
+        }
     }
 
     if (is_channel_last(in.layout)) {

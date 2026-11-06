@@ -798,8 +798,9 @@ NNOPS_TEST(dwt_i8_output_desc) {
     auto outs = op->getOutputTensorDesc(descs);
     NNOPS_EXPECT_EQ(outs[0].dtype, DataType::f32);
     NNOPS_EXPECT_EQ(outs[0].dims[1], 8);
-    NNOPS_EXPECT_EQ(outs[0].dims[2], 11);
-    NNOPS_EXPECT_EQ(outs[0].dims[3], 11);
+    // (6-1)*2 - 2 + 1*(3-1) + 1 + 1 = 12
+    NNOPS_EXPECT_EQ(outs[0].dims[2], 12);
+    NNOPS_EXPECT_EQ(outs[0].dims[3], 12);
 
     attrs.output_dtype = DataType::u8;
     op = DepthwiseTransposeConv2D::create(attrs, Backend::CPU);

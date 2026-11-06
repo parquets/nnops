@@ -661,17 +661,15 @@ NNOPS_TEST(dwtconv_refusals) {
         NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::invalid_argument);
     }
 
-    // Only f32/f16: an s8 pair is refused.
+    // Only f32/f16 here: an s8 weight selects the quantized route (whose own
+    // suite covers it), and an s8 activation against an fp weight is a mixed
+    // pair no route takes.
     {
         std::vector<int8_t> in_i8(in_vec.size(), 1);
-        std::vector<int8_t> w_i8(w_vec.size(), 1);
         TensorView in_s8(std::span<const int64_t>(in.shape(),
                                                   static_cast<size_t>(in.rank())),
                          DataType::s8, in_i8.data());
-        TensorView w_s8(std::span<const int64_t>(w.shape(),
-                                                 static_cast<size_t>(w.rank())),
-                        DataType::s8, w_i8.data());
-        const TensorView ins[] = {in_s8, w_s8};
+        const TensorView ins[] = {in_s8, w};
         NNOPS_EXPECT_TRUE(op->compute(out, ins) == Status::unsupported);
     }
 }

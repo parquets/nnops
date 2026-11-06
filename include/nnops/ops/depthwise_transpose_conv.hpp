@@ -43,6 +43,13 @@
 
 namespace nnops {
 
+/// True when the weight dtype selects the quantized route; the CPU backend
+/// dispatches on this predicate.
+inline constexpr bool is_quantized_depthwise_transpose_conv2d(
+    DataType weight_dtype) noexcept {
+    return weight_dtype == DataType::s8;
+}
+
 /// Attributes describing a depthwise transposed 2D convolution.
 struct DepthwiseTransposeConv2DAttributes {
     /// Kernel size [KH, KW].
