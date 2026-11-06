@@ -1,6 +1,6 @@
 #pragma once
 /// @file q4_1.hpp
-/// @brief llama.cpp Q4_1 block decoder — fused unpack + dequantize.
+/// @brief llama.cpp Q4_1 block codec — quantize, and fused unpack + dequantize.
 ///
 /// A Q4_1 tensor is a stream of 20-byte blocks covering 32 values each:
 ///
@@ -14,6 +14,8 @@
 ///
 /// which is byte-for-byte ggml's `block_q4_1` / `dequantize_row_q4_1`. The block
 /// is self-describing (d and m live in the data), so no QuantParams are involved.
+/// `quantize_q4` is the encoder — llama.cpp's `quantize_row_q4_1_ref`, bit for
+/// bit — so a weight quantized here and one quantized by ggml are the same bytes.
 ///
 /// `pack_q4` fuses the nibble unpacking, the dequantization and the f32 → f16
 /// narrowing: each block is read once into a 32-float stack buffer and the
@@ -41,6 +43,7 @@ namespace nnops {
 using backend::cpu::float_to_half;
 using backend::cpu::half;
 using backend::cpu::half_from_bits;
+using backend::cpu::half_to_bits;
 using backend::cpu::half_to_float;
 
 /// One llama.cpp Q4_1 block: `d`, `m` and 16 nibble bytes.
@@ -72,6 +75,76 @@ inline void q4_1_unpack_block(const void* block, float* out) noexcept {
         const float hi = static_cast<float>(qs[j] >> 4);
         out[j]      = d * lo + m;
         out[j + 16] = d * hi + m;
+    }
+}
+
+/// Quantize `count` f32 or f16 values into Q4_1 blocks — llama.cpp's
+/// `quantize_row_q4_1_ref`, bit for bit: the block's own min and max set
+/// d = (max - min) / 15 and m = min, and every value rounds half up into
+/// 0..15 with the low nibble of byte j holding value j and the high nibble
+/// value j + 16. A block whose values are all equal gets d = 0, so it decodes
+/// back to m exactly.
+///
+/// `count` need not be a multiple of 32, mirroring pack_q4(): a trailing
+/// partial block takes its d and m from the values that exist and leaves the
+/// missing nibbles zero, which the decoder never reads.
+template <class T>
+void quantize_q4(const T* src, int64_t count, void* blocks) noexcept {
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
+                  "quantize_q4: T must be float or half");
+    if (count <= 0) {
+        return;
+    }
+
+    const auto load = [](const T* p) {
+        if constexpr (std::is_same_v<T, float>) {
+            return *p;
+        } else {
+            return half_to_float(*p);
+        }
+    };
+
+    constexpr int kQMax = 15;
+    uint8_t* dst = static_cast<uint8_t*>(blocks);
+    const int64_t nblocks = (count + q4_1_block_elems - 1) / q4_1_block_elems;
+
+    for (int64_t b = 0; b < nblocks; ++b) {
+        const int64_t base = b * q4_1_block_elems;
+        const int n = static_cast<int>(
+            std::min<int64_t>(q4_1_block_elems, count - base));
+        const T* x = src + base;
+
+        float vmin = load(x);
+        float vmax = vmin;
+        for (int j = 1; j < n; ++j) {
+            const float v = load(x + j);
+            vmin = v < vmin ? v : vmin;
+            vmax = v > vmax ? v : vmax;
+        }
+
+        const float d = (vmax - vmin) / static_cast<float>(kQMax);
+        const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+
+        uint8_t* blk = dst + b * static_cast<int64_t>(q4_1_block_bytes);
+        const uint16_t d_bits = half_to_bits(float_to_half(d));
+        const uint16_t m_bits = half_to_bits(float_to_half(vmin));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        std::memcpy(blk + 2, &m_bits, sizeof(m_bits));
+
+        uint8_t qs[16] = {};
+        for (int j = 0; j < n; ++j) {
+            // Truncating the +0.5 gives llama.cpp's round-half-up; the clamp
+            // only guards a value that slid past max through rounding.
+            const float qf = (load(x + j) - vmin) * id + 0.5f;
+            const uint8_t q = static_cast<uint8_t>(
+                qf < static_cast<float>(kQMax) ? static_cast<int>(qf) : kQMax);
+            if (j < 16) {
+                qs[j] = q;
+            } else {
+                qs[j - 16] |= static_cast<uint8_t>(q << 4);
+            }
+        }
+        std::memcpy(blk + 4, qs, sizeof(qs));
     }
 }
 

@@ -10,6 +10,8 @@
 #include "nnops/detail/simd/cpu_features.hpp"  // NNOPS_ARCH_X86_64 / _AARCH64
 #include "common/test_harness.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -43,6 +45,39 @@ BuiltBlock make_block(const int q[32], float d, float m) {
         b.blk.qs[j] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
     }
     return b;
+}
+
+/// llama.cpp's quantize_row_q4_1_ref, transliterated, for whole blocks only.
+std::vector<uint8_t> reference_quantize(const float* x, int64_t k) {
+    const int nb = static_cast<int>(k / q4_1_block_elems);
+    std::vector<uint8_t> out(static_cast<size_t>(nb) * q4_1_block_bytes);
+
+    for (int i = 0; i < nb; ++i) {
+        float vmin = 1e30f;
+        float vmax = -1e30f;
+        for (int j = 0; j < q4_1_block_elems; ++j) {
+            const float v = x[i * q4_1_block_elems + j];
+            if (v < vmin) { vmin = v; }
+            if (v > vmax) { vmax = v; }
+        }
+        const float d = (vmax - vmin) / 15.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+
+        uint8_t* blk = out.data() + static_cast<size_t>(i) * q4_1_block_bytes;
+        const uint16_t d16 = backend::cpu::half_to_bits(float_to_half(d));
+        const uint16_t m16 = backend::cpu::half_to_bits(float_to_half(vmin));
+        std::memcpy(blk + 0, &d16, sizeof(d16));
+        std::memcpy(blk + 2, &m16, sizeof(m16));
+
+        for (int j = 0; j < q4_1_block_elems / 2; ++j) {
+            const float x0 = (x[i * q4_1_block_elems + j] - vmin) * id;
+            const float x1 = (x[i * q4_1_block_elems + q4_1_block_elems / 2 + j] - vmin) * id;
+            const int q0 = std::min(15, static_cast<int>(x0 + 0.5f));
+            const int q1 = std::min(15, static_cast<int>(x1 + 0.5f));
+            blk[4 + j] = static_cast<uint8_t>(q0 | (q1 << 4));
+        }
+    }
+    return out;
 }
 
 /// llama.cpp's dequantize_row_q4_1, transliterated as an independent check of the nibble order.
@@ -235,6 +270,153 @@ NNOPS_TEST(q4_1_pack_unaligned_source) {
     for (size_t i = 0; i < expected.size(); ++i) {
         NNOPS_EXPECT_EQ(out[i], expected[i]);
     }
+}
+
+// ============================================================
+// quantize_q4 — llama.cpp's quantize_row_q4_1_ref
+// ============================================================
+
+/// Values in [-1, 1) at full f32 spread, so d lands mid-range and no block is
+/// degenerate unless a case says so.
+std::vector<float> random_values(int64_t count, uint32_t seed) {
+    std::vector<float> v(static_cast<size_t>(count));
+    uint32_t s = seed;
+    for (auto& x : v) {
+        s = s * 1664525u + 1013904223u;
+        x = static_cast<float>(s >> 8) / 8388608.0f - 1.0f;
+    }
+    return v;
+}
+
+NNOPS_TEST(q4_1_quantize_matches_llama_reference) {
+    for (int64_t count : {32, 64, 96, 320, 4096}) {
+        const std::vector<float> x = random_values(count, 12345u + count);
+        std::vector<uint8_t> got(static_cast<size_t>(count / q4_1_block_elems)
+                                 * q4_1_block_bytes);
+        quantize_q4(x.data(), count, got.data());
+        const std::vector<uint8_t> want = reference_quantize(x.data(), count);
+        NNOPS_EXPECT_EQ(got.size(), want.size());
+        NNOPS_EXPECT_EQ(std::memcmp(got.data(), want.data(), want.size()), 0);
+    }
+}
+
+NNOPS_TEST(q4_1_quantize_roundtrip) {
+    const int64_t count = 32 * 17;
+    const std::vector<float> x = random_values(count, 99u);
+    std::vector<uint8_t> blocks(static_cast<size_t>(count / 32) * q4_1_block_bytes);
+    quantize_q4(x.data(), count, blocks.data());
+
+    std::vector<float> back(static_cast<size_t>(count));
+    pack_q4(blocks.data(), count, back.data());
+
+    // Every value lands within half a quant step, with the stored d (already
+    // rounded to f16) as the step and a sliver for the d/m f16 rounding.
+    for (int64_t b = 0; b < count / 32; ++b) {
+        q4_1_block blk;
+        std::memcpy(&blk, blocks.data() + static_cast<size_t>(b) * q4_1_block_bytes,
+                    sizeof(blk));
+        const float d = half_to_float(half_from_bits(blk.d));
+        for (int j = 0; j < 32; ++j) {
+            const int64_t i = b * 32 + j;
+            const float err = std::fabs(back[static_cast<size_t>(i)] - x[static_cast<size_t>(i)]);
+            NNOPS_EXPECT_TRUE(err <= 0.5f * d + 1e-3f);
+        }
+    }
+}
+
+NNOPS_TEST(q4_1_quantize_constant_block) {
+    // All values equal: d collapses to 0, m carries the value, every quant is 0,
+    // and the round-trip is exact up to m's f16 rounding.
+    std::vector<float> x(64, 0.375f);  // exact in f16
+    std::vector<uint8_t> blocks(2 * q4_1_block_bytes);
+    quantize_q4(x.data(), static_cast<int64_t>(x.size()), blocks.data());
+
+    for (int b = 0; b < 2; ++b) {
+        q4_1_block blk;
+        std::memcpy(&blk, blocks.data() + static_cast<size_t>(b) * q4_1_block_bytes,
+                    sizeof(blk));
+        NNOPS_EXPECT_EQ(half_to_float(half_from_bits(blk.d)), 0.0f);
+        NNOPS_EXPECT_EQ(half_to_float(half_from_bits(blk.m)), 0.375f);
+        for (int j = 0; j < 16; ++j) {
+            NNOPS_EXPECT_EQ(static_cast<int>(blk.qs[j]), 0);
+        }
+    }
+
+    std::vector<float> back(64);
+    pack_q4(blocks.data(), 64, back.data());
+    for (float v : back) {
+        NNOPS_EXPECT_EQ(v, 0.375f);
+    }
+}
+
+NNOPS_TEST(q4_1_quantize_partial_tail) {
+    const int64_t count = 37;  // one whole block + 5 values
+    const std::vector<float> x = random_values(count, 7u);
+    std::vector<uint8_t> blocks(2 * q4_1_block_bytes, 0xAA);
+    quantize_q4(x.data(), count, blocks.data());
+
+    // The tail's d and m come from its own five values, not the first block's.
+    q4_1_block blk;
+    std::memcpy(&blk, blocks.data() + q4_1_block_bytes, sizeof(blk));
+    float lo = x[32], hi = x[32];
+    for (int j = 1; j < 5; ++j) {
+        const float v = x[static_cast<size_t>(32 + j)];
+        lo = v < lo ? v : lo;
+        hi = v > hi ? v : hi;
+    }
+    NNOPS_EXPECT_EQ(half_to_float(half_from_bits(blk.m)),
+                    half_to_float(float_to_half(lo)));
+    const float d = half_to_float(half_from_bits(blk.d));
+    NNOPS_EXPECT_TRUE(std::fabs(d - half_to_float(float_to_half((hi - lo) / 15.0f))) <= 1e-6f);
+    // Values 5..15 and every high nibble are unwritten, so the decoder reads
+    // them as 0 and never looks at them.
+    for (int j = 5; j < 16; ++j) {
+        NNOPS_EXPECT_EQ(static_cast<int>(blk.qs[j]), 0);
+    }
+
+    std::vector<float> back(static_cast<size_t>(count));
+    pack_q4(blocks.data(), count, back.data());
+
+    q4_1_block first;
+    std::memcpy(&first, blocks.data(), sizeof(first));
+    const float d0 = half_to_float(half_from_bits(first.d));
+    for (int64_t i = 0; i < count; ++i) {
+        const float step = (i < 32) ? d0 : d;
+        const float err = std::fabs(back[static_cast<size_t>(i)] - x[static_cast<size_t>(i)]);
+        NNOPS_EXPECT_TRUE(err <= 0.5f * step + 1e-3f);
+    }
+}
+
+NNOPS_TEST(q4_1_quantize_f16_source) {
+    // A f16 source quantizes to the same bytes as the f32 tensor it upconverts
+    // to: the encoder does all its arithmetic in f32.
+    const int64_t count = 128;
+    const std::vector<float> x = random_values(count, 31u);
+    std::vector<half> xh(static_cast<size_t>(count));
+    std::vector<float> xf(static_cast<size_t>(count));
+    for (int64_t i = 0; i < count; ++i) {
+        xh[static_cast<size_t>(i)] = float_to_half(x[static_cast<size_t>(i)]);
+        xf[static_cast<size_t>(i)] = half_to_float(xh[static_cast<size_t>(i)]);
+    }
+
+    std::vector<uint8_t> from_f32(static_cast<size_t>(count / 32) * q4_1_block_bytes);
+    std::vector<uint8_t> from_f16(from_f32.size());
+    quantize_q4(xf.data(), count, from_f32.data());
+    quantize_q4(xh.data(), count, from_f16.data());
+    NNOPS_EXPECT_EQ(std::memcmp(from_f32.data(), from_f16.data(), from_f32.size()), 0);
+}
+
+NNOPS_TEST(q4_1_quantize_unaligned_dest) {
+    const int64_t count = 96;
+    const std::vector<float> x = random_values(count, 5u);
+    std::vector<uint8_t> aligned(3 * q4_1_block_bytes);
+    std::vector<uint8_t> shifted(aligned.size() + 1, 0x5A);
+
+    quantize_q4(x.data(), count, aligned.data());
+    quantize_q4(x.data(), count, shifted.data() + 1);
+
+    NNOPS_EXPECT_EQ(std::memcmp(shifted.data() + 1, aligned.data(), aligned.size()), 0);
+    NNOPS_EXPECT_EQ(static_cast<int>(shifted[0]), 0x5A);  // the pad byte is untouched
 }
 
 NNOPS_TEST(q4_1_unpack_block_helper) {
