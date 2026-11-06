@@ -11,11 +11,48 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <type_traits>
+#include <utility>
 
 namespace nnops {
 
+/// A non-owning callable view: the object pointer and one invoker, no
+/// allocation and no per-callable class. The callable must outlive the view.
+///
+/// This is the body type rather than std::function for a measured reason: every
+/// `ctx.cpu.run(..., [&]{})` call site used to instantiate std::function's
+/// _Func_impl_no_alloc machinery — a ctor, a copy, a move, a destructor, a
+/// call operator and a target-type accessor, each with a mangled name that
+/// embeds the lambda's, which in turn embeds the enclosing function's. That one
+/// family was 38% of the archive's symbol-name bytes. The view needs the single
+/// invoker below, so a call site costs one symbol instead of eight.
+template <typename Sig>
+class FunctionRef;
+
+template <typename R, typename... A>
+class FunctionRef<R(A...)> {
+public:
+    template <typename F,
+              typename = std::enable_if_t<
+                  !std::is_same_v<std::remove_cvref_t<F>, FunctionRef>>>
+    FunctionRef(F&& f) noexcept
+        : obj_(const_cast<void*>(static_cast<const void*>(std::addressof(f)))),
+          fn_([](void* o, A... a) -> R {
+              return (*static_cast<std::remove_reference_t<F>*>(o))(
+                  static_cast<A&&>(a)...);
+          })
+    {}
+
+    R operator()(A... a) const { return fn_(obj_, static_cast<A&&>(a)...); }
+
+private:
+    void* obj_;
+    R (*fn_)(void*, A...);
+};
+
 /// Body function: body(index).
-using ParallelForBody = std::function<void(int64_t)>;
+using ParallelForBody = FunctionRef<void(int64_t)>;
 
 /// pf(begin, end, body) — process [begin, end); empty means sequential.
 using ParallelForFn = std::function<void(int64_t, int64_t, const ParallelForBody&)>;
