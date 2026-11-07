@@ -1,6 +1,6 @@
 /// @file moe_ref.cpp
 /// @brief Naive scalar CPU reference for the MoE layer, and the correctness
-/// oracle for `backend/cpu/moe.cpp` — it deliberately shares no code with it.
+/// oracle for `backend/cpu/matmul/moe.cpp` — it deliberately shares no code with it.
 ///
 /// Per token: score the router logits over *all* experts with
 /// `attrs.router_gating` (softmax by default), take the top-K (ties toward the

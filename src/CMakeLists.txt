@@ -79,7 +79,6 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/topk.cpp
     backend/cpu/rope.cpp
     backend/cpu/flatten.cpp
-    backend/cpu/moe.cpp
     backend/cpu/pad.cpp
     backend/cpu/gather.cpp
     backend/cpu/scatter.cpp
@@ -97,8 +96,11 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/matmul/matmul_qblock_fused.cpp
 
     # Linear is the MatMul GEMM with a transposed weight, a per-column bias and
-    # an fp output for quantized operands; it drives matmul.cpp above.
+    # an fp output for quantized operands; it drives matmul.cpp above. MoE is
+    # the routed FFN on top of the same GEMM — per-expert MatMul calls, one
+    # output-channel block per task — so it lives with them.
     backend/cpu/matmul/linear.cpp
+    backend/cpu/matmul/moe.cpp
 
     # CPU convolution kernels: the implicit-GEMM route (both layouts — planar
     # Channel-first and channel-last, fp and quantized, one file since they share a

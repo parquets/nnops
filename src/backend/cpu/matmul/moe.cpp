@@ -35,6 +35,9 @@
 /// The inner GEMMs use a *default-constructed* ComputeContext: phase A is
 /// already spread over the pool, and a nested region would either
 /// oversubscribe the machine or serialize inside the outer team.
+///
+/// The operator is a routed FFN over per-expert MatMul calls and nothing else,
+/// so it lives with the matmul family rather than beside the other op kernels.
 
 #include "nnops/ops/moe.hpp"
 #include "nnops/detail/assert.hpp"
@@ -42,9 +45,9 @@
 #include "nnops/detail/simd/simd.hpp"
 
 #include "backend/cpu/matmul/matmul.h"
-#include "simd_kernel/activation_kernels.hpp"
-#include "simd_kernel/tiled_map.hpp"
-#include "common/memory_pool.hpp"
+#include "backend/cpu/simd_kernel/activation_kernels.hpp"
+#include "backend/cpu/simd_kernel/tiled_map.hpp"
+#include "backend/cpu/common/memory_pool.hpp"
 
 #include <algorithm>
 #include <cmath>
