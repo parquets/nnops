@@ -656,13 +656,26 @@ void attention_flash_impl(const AttentionConfig& cfg,
 //
 // With one query row both products collapse to GEMV, so K and V are streamed
 // once each: no B packing, no M == 1 MMA tiles, and no materialized score
-// matrix beyond the row itself. Scores and the output accumulator are f32
+// matrix beyond one block of keys. Scores and the output accumulator are f32
 // whatever the element type — f16 converts once per loaded vector instead of
 // accumulating in f16, which also keeps the deviation inside kF16AccumTol.
 //
-// One task per (batch, head). A task reads Sk·Dqk elements of K and Sk·Dv of
-// V, the same traffic the packed route spends on packing alone before its
-// MMA sees a byte.
+// One task serves up to kDecodeHeadBatch query heads of the same KV head. The
+// key loop stays outermost, so the run is read from memory once for the whole
+// group instead of once per query head; the per-head dots against a key row
+// hit L1. That is the GQA/MQA traffic win — with H/H_kv = 4 each K/V byte was
+// otherwise fetched four times.
+//
+// The run is walked in kDecodeChunk-key blocks with the online-softmax update
+// of the flash route, so the score scratch does not grow with the cache. When
+// the batched grid no longer covers the workers, KV splitting cuts the run
+// into independent slices; each task leaves its unnormalized output, max and
+// sum, and a merge pass combines them — the flash-decoding schedule.
+
+constexpr int64_t kDecodeChunk = 1024;   ///< keys per decode softmax block
+constexpr int     kDecodeHeadBatch = 8;  ///< query heads one decode task serves
+constexpr int     kDecodeMaxSplits = 16; ///< KV slices per decode unit, at most
+constexpr int64_t kDecodeMinSlice = 256; ///< shortest slice worth its merge pass
 
 inline simd::v_f32x8 vload_f32x8(const float* p) { return simd::v_load(p); }
 inline simd::v_f32x8 vload_f32x8(const half* p)  { return simd::v_cvt_f16_to_f32(p); }
@@ -759,33 +772,57 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const int64_t o_rs = output.row_stride_elems();
     const int64_t v_head_stride = merged_v_head_stride(cfg, Dqk, Dv);
 
-    const int64_t per_slot = plan.decode_elems;   // f32: [scores:Sk][o_acc:Dv]
-    const int64_t NG = B * H;
+    const int64_t G = H / Hkv;
+    const int64_t hb = plan.decode_heads;
+    const int64_t splits = plan.decode_splits;
+    const int64_t nb = (G + hb - 1) / hb;   // head blocks per KV head
+    const int64_t units = B * Hkv * nb;
+    const int64_t NG = units * splits;
+
+    const int64_t per_slot = plan.decode_elems;   // f32: [scores][o_acc][max][sum]
     float* ws = static_cast<float*>(workspace);
+    float* partials = ws + plan.num_slots * per_slot;
 
     // Bottom-right alignment makes the limit Sk — the row attends to every
     // cached key; an explicit position_offset can cut it shorter.
     const int64_t n_valid = causal_limit(cfg, 0, Sq, Sk);
 
-    const auto run = [&](int64_t idx) {
-        const int64_t b = idx / H;
-        const int64_t h = idx % H;
-        const int64_t hkv = h / (H / Hkv);
+    constexpr int64_t lanes = simd::simd_default_lane_f32;
 
-        const T* q_row;
+    const auto run = [&](int64_t idx) {
+        // Grid (batch, kv head, head block) × KV slice. A slice is a
+        // contiguous span of the run, empty when there are more slices than
+        // keys; its head block holds up to hb query heads of one KV head.
+        const int64_t si   = idx % splits;
+        const int64_t unit = idx / splits;
+        const int64_t c    = unit % nb;
+        const int64_t hkv  = (unit / nb) % Hkv;
+        const int64_t b    = (unit / nb) / Hkv;
+        const int64_t h0   = hkv * G + c * hb;
+        const int64_t nh   = std::min(hb, G - c * hb);
+
+        const int64_t lo = (n_valid * si) / splits;
+        const int64_t hi = (n_valid * (si + 1)) / splits;
+
         const T* k_head;
         const T* v_head;
-        T* o_row;
+        const T* q_base;
+        T* o_base;
+        int64_t q_step, o_step;
         if (merged) {
-            q_row  = q_ptr + b * q_rs + h * Dqk;
+            q_base = q_ptr + b * q_rs + h0 * Dqk;
+            q_step = Dqk;
             k_head = k_ptr + b * Sk_new * k_rs + hkv * Dqk;
             v_head = v_ptr + b * hs.Sv * v_rs + hkv * v_head_stride;
-            o_row  = out_ptr + b * o_rs + h * Dv;
+            o_base = out_ptr + b * o_rs + h0 * Dv;
+            o_step = Dv;
         } else {
-            q_row  = q_ptr + (b * H + h) * q_rs;
+            q_base = q_ptr + (b * H + h0) * q_rs;
+            q_step = q_rs;
             k_head = k_ptr + (b * Hkv + hkv) * Sk_new * k_rs;
             v_head = v_ptr + (b * Hkv + hkv) * hs.Sv * v_rs;
-            o_row  = out_ptr + (b * H + h) * o_rs;
+            o_base = out_ptr + (b * H + h0) * o_rs;
+            o_step = o_rs;
         }
 
         // [past | new], the past segment empty when no past is passed.
@@ -807,93 +844,221 @@ void attention_decode_impl(const AttentionConfig& cfg,
         }
 
         const int64_t slot = scratch_slot_of(ctx.cpu, NG, idx);
-        float* scores = ws + slot * per_slot;
-        float* o_acc  = scores + Sk;
+        float* scores = ws + slot * per_slot;        // [nh][kDecodeChunk]
+        float* o_acc  = scores + hb * kDecodeChunk;  // [nh][Dv]
+        float* mrow   = o_acc + hb * Dv;             // [nh]
+        float* lrow   = mrow + hb;                   // [nh]
 
-        // ---- scores = q · K^T ----------------------------------------
-        // The scale rides through the softmax temperature instead of touching
-        // the row, so this pass stays a pure dot product. Nothing past the
-        // row's causal limit is scored.
-        for (int s = 0; s < 2; ++s) {
-            const int64_t hi = std::min(seg_hi[s], n_valid);
-            const T* kb = k_base[s];
-            const int64_t rs = k_str[s];
-            int64_t t = seg_lo[s];
-            for (; t + 4 <= hi; t += 4) {
-                const T* kk = kb + (t - seg_lo[s]) * rs;
-                dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs, Dqk, scores + t);
-            }
-            for (; t < hi; ++t) {
-                scores[t] = dot_row(q_row, kb + (t - seg_lo[s]) * rs, Dqk);
-            }
+        for (int64_t j = 0; j < nh; ++j) {
+            mrow[j] = kNegInf;
+            lrow[j] = 0.0f;
+            float* oa = o_acc + j * Dv;
+            for (int64_t d = 0; d < Dv; ++d) { oa[d] = 0.0f; }
         }
 
-        // ---- softmax over the valid prefix (already normalized) ------
-        if (n_valid <= 0) {
-            for (int64_t d = 0; d < Dv; ++d) { simd::s_store(&o_row[d], 0.0f); }
-            return;
-        }
-        kernel::softmax_process_standard_row<float>(scores, scores, n_valid,
-                                                    /*log_softmax=*/false, scale);
+        // Walk the slice in kDecodeChunk-key blocks, keeping the running max,
+        // sum and unnormalized output per head: the score scratch is a fixed
+        // block, not the whole run, so it stays flat as the cache grows.
+        for (int64_t t0 = lo; t0 < hi; t0 += kDecodeChunk) {
+            const int64_t t1 = std::min(hi, t0 + kDecodeChunk);
+            const int64_t nc = t1 - t0;
 
-        // ---- o = P · V, f32 accumulator ------------------------------
-        // Four value rows per accumulator pass: the o_acc round-trip drops 4x
-        // and the four FMAs into one lane vector still leave Dv/8 independent
-        // chains. A row that softmaxed to zero contributes a zero, so the
-        // branch-free path costs nothing and drops a per-row test.
-        for (int64_t d = 0; d < Dv; ++d) { o_acc[d] = 0.0f; }
-        constexpr int64_t lanes = simd::simd_default_lane_f32;
-        for (int s = 0; s < 2; ++s) {
-            const int64_t hi = std::min(seg_hi[s], n_valid);
-            const T* vb = v_base[s];
-            const int64_t rs = v_str[s];
-            int64_t t = seg_lo[s];
-            for (; t + 4 <= hi; t += 4) {
-                const T* r0 = vb + (t - seg_lo[s]) * rs;
-                const T* r1 = r0 + rs;
-                const T* r2 = r1 + rs;
-                const T* r3 = r2 + rs;
-                const float p0 = scores[t + 0], p1 = scores[t + 1];
-                const float p2 = scores[t + 2], p3 = scores[t + 3];
-                const auto vp0 = simd::v_set1_f32x8(p0), vp1 = simd::v_set1_f32x8(p1);
-                const auto vp2 = simd::v_set1_f32x8(p2), vp3 = simd::v_set1_f32x8(p3);
-                int64_t d = 0;
-                for (; d + lanes <= Dv; d += lanes) {
-                    auto acc = simd::v_load(o_acc + d);
-                    acc = simd::v_fmadd(vp0, vload_f32x8(r0 + d), acc);
-                    acc = simd::v_fmadd(vp1, vload_f32x8(r1 + d), acc);
-                    acc = simd::v_fmadd(vp2, vload_f32x8(r2 + d), acc);
-                    acc = simd::v_fmadd(vp3, vload_f32x8(r3 + d), acc);
-                    simd::v_store(o_acc + d, acc);
-                }
-                for (; d < Dv; ++d) {
-                    o_acc[d] += p0 * simd::s_load(&r0[d]) + p1 * simd::s_load(&r1[d])
-                              + p2 * simd::s_load(&r2[d]) + p3 * simd::s_load(&r3[d]);
+            // ---- scores = q · K^T ------------------------------------
+            // The key block is streamed once and every head of the group dots
+            // against it: what was one full pass over the run per query head
+            // is now one per group. The scale rides through the softmax
+            // exponential, so this stays a pure dot product.
+            for (int64_t j = 0; j < nh; ++j) {
+                const T* q_row = q_base + j * q_step;
+                float* sj = scores + j * kDecodeChunk;
+                for (int s = 0; s < 2; ++s) {
+                    const int64_t a  = std::max(t0, seg_lo[s]);
+                    const int64_t b1 = std::min(t1, seg_hi[s]);
+                    const T* kb = k_base[s];
+                    const int64_t rs = k_str[s];
+                    int64_t t = a;
+                    for (; t + 4 <= b1; t += 4) {
+                        const T* kk = kb + (t - seg_lo[s]) * rs;
+                        dot_row4(q_row, kk, kk + rs, kk + 2 * rs, kk + 3 * rs,
+                                 Dqk, sj + (t - t0));
+                    }
+                    for (; t < b1; ++t) {
+                        sj[t - t0] = dot_row(q_row, kb + (t - seg_lo[s]) * rs, Dqk);
+                    }
                 }
             }
-            for (; t < hi; ++t) {
-                const float p = scores[t];
-                const T* vrow = vb + (t - seg_lo[s]) * rs;
-                auto vp = simd::v_set1_f32x8(p);
-                int64_t d = 0;
-                for (; d + lanes <= Dv; d += lanes) {
-                    auto acc = simd::v_load(o_acc + d);
-                    acc = simd::v_fmadd(vp, vload_f32x8(vrow + d), acc);
-                    simd::v_store(o_acc + d, acc);
+
+            // ---- online-softmax update --------------------------------
+            for (int64_t j = 0; j < nh; ++j) {
+                float* sj = scores + j * kDecodeChunk;
+                const float rowmax = kernel::softmax_row_max<float>(sj, nc);
+                if (rowmax == kNegInf) { continue; }
+                const float old_m = mrow[j];
+                const float new_m = std::max(old_m, rowmax);
+                // A first block starts from zero, so the rescale is skipped
+                // rather than evaluated as -inf·0.
+                const float exp_diff = (old_m == kNegInf) ? 0.0f : std::exp(old_m - new_m);
+                mrow[j] = new_m;
+                lrow[j] = exp_diff * lrow[j]
+                        + kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, scale);
+                if (exp_diff != 1.0f) {
+                    float* oa = o_acc + j * Dv;
+                    auto v_ed = simd::v_set1(oa, exp_diff);
+                    int64_t d = 0;
+                    for (; d + lanes <= Dv; d += lanes) {
+                        simd::v_store(oa + d, simd::v_mul(simd::v_load(oa + d), v_ed));
+                    }
+                    for (; d < Dv; ++d) { oa[d] *= exp_diff; }
                 }
-                for (; d < Dv; ++d) { o_acc[d] += p * simd::s_load(&vrow[d]); }
+            }
+
+            // ---- o += P · V ------------------------------------------
+            // The probabilities are the unnormalized block exponentials; the
+            // running sum normalizes once at the end. Four value rows per
+            // accumulator pass, as in the unbatched kernel.
+            for (int s = 0; s < 2; ++s) {
+                const int64_t a  = std::max(t0, seg_lo[s]);
+                const int64_t b1 = std::min(t1, seg_hi[s]);
+                const T* vb = v_base[s];
+                const int64_t rs = v_str[s];
+                int64_t t = a;
+                for (; t + 4 <= b1; t += 4) {
+                    const T* r0 = vb + (t - seg_lo[s]) * rs;
+                    const T* r1 = r0 + rs;
+                    const T* r2 = r1 + rs;
+                    const T* r3 = r2 + rs;
+                    const int64_t tt = t - t0;
+                    for (int64_t j = 0; j < nh; ++j) {
+                        const float* sj = scores + j * kDecodeChunk;
+                        const auto vp0 = simd::v_set1_f32x8(sj[tt + 0]);
+                        const auto vp1 = simd::v_set1_f32x8(sj[tt + 1]);
+                        const auto vp2 = simd::v_set1_f32x8(sj[tt + 2]);
+                        const auto vp3 = simd::v_set1_f32x8(sj[tt + 3]);
+                        float* oa = o_acc + j * Dv;
+                        int64_t d = 0;
+                        for (; d + lanes <= Dv; d += lanes) {
+                            auto acc = simd::v_load(oa + d);
+                            acc = simd::v_fmadd(vp0, vload_f32x8(r0 + d), acc);
+                            acc = simd::v_fmadd(vp1, vload_f32x8(r1 + d), acc);
+                            acc = simd::v_fmadd(vp2, vload_f32x8(r2 + d), acc);
+                            acc = simd::v_fmadd(vp3, vload_f32x8(r3 + d), acc);
+                            simd::v_store(oa + d, acc);
+                        }
+                        for (; d < Dv; ++d) {
+                            oa[d] += sj[tt + 0] * simd::s_load(&r0[d])
+                                   + sj[tt + 1] * simd::s_load(&r1[d])
+                                   + sj[tt + 2] * simd::s_load(&r2[d])
+                                   + sj[tt + 3] * simd::s_load(&r3[d]);
+                        }
+                    }
+                }
+                for (; t < b1; ++t) {
+                    const T* vrow = vb + (t - seg_lo[s]) * rs;
+                    const int64_t tt = t - t0;
+                    for (int64_t j = 0; j < nh; ++j) {
+                        const float p = scores[j * kDecodeChunk + tt];
+                        auto vp = simd::v_set1_f32x8(p);
+                        float* oa = o_acc + j * Dv;
+                        int64_t d = 0;
+                        for (; d + lanes <= Dv; d += lanes) {
+                            simd::v_store(oa + d,
+                                simd::v_fmadd(vp, vload_f32x8(vrow + d), simd::v_load(oa + d)));
+                        }
+                        for (; d < Dv; ++d) { oa[d] += p * simd::s_load(&vrow[d]); }
+                    }
+                }
             }
         }
 
         // ---- store ---------------------------------------------------
-        int64_t d = 0;
-        for (; d + simd::simd_default_lane_f32 <= Dv; d += simd::simd_default_lane_f32) {
-            vstore_f32x8(o_row + d, simd::v_load(o_acc + d));
+        if (splits == 1) {
+            for (int64_t j = 0; j < nh; ++j) {
+                const float l_j = lrow[j];
+                // A row every key was masked out of leaves l == 0: zeros.
+                const float inv_l = (l_j > 0.0f) ? (1.0f / l_j) : 0.0f;
+                const float* oa = o_acc + j * Dv;
+                T* o_row = o_base + j * o_step;
+                auto v_inv = simd::v_set1(oa, inv_l);
+                int64_t d = 0;
+                for (; d + lanes <= Dv; d += lanes) {
+                    vstore_f32x8(o_row + d, simd::v_mul(simd::v_load(oa + d), v_inv));
+                }
+                for (; d < Dv; ++d) { simd::s_store(&o_row[d], oa[d] * inv_l); }
+            }
+        } else {
+            // Unnormalized output, max and sum; the merge pass combines them.
+            for (int64_t j = 0; j < nh; ++j) {
+                float* pj = partials + idx * hb * (Dv + 2) + j * (Dv + 2);
+                const float* oa = o_acc + j * Dv;
+                for (int64_t d = 0; d < Dv; ++d) { pj[d] = oa[d]; }
+                pj[Dv] = mrow[j];
+                pj[Dv + 1] = lrow[j];
+            }
         }
-        for (; d < Dv; ++d) { simd::s_store(&o_row[d], o_acc[d]); }
     };
 
     ctx.cpu.run(0, NG, run);
+
+    if (splits == 1) { return; }
+
+    // ---- merge the KV slices -----------------------------------------------
+    // Each slice left o = Σ e·v, m = its maximum raw score and l = Σ e at that
+    // max. Under the global maximum M a slice is weighted by exp((m - M)·scale),
+    // so the online-softmax identity holds across slices exactly as it does
+    // across blocks within one.
+    const int64_t nmerge = B * H;
+    const auto merge = [&](int64_t idx) {
+        const int64_t b   = idx / H;
+        const int64_t h   = idx % H;
+        const int64_t hkv = h / G;
+        const int64_t g   = h - hkv * G;
+        const int64_t c   = g / hb;
+        const int64_t j   = g - c * hb;
+        const int64_t u   = (b * Hkv + hkv) * nb + c;
+        const int64_t pstep = hb * (Dv + 2);
+        const float* pj = partials + (u * splits) * pstep + j * (Dv + 2);
+
+        T* o_row = merged ? out_ptr + b * o_rs + h * Dv
+                          : out_ptr + (b * H + h) * o_rs;
+
+        float M = kNegInf;
+        for (int64_t s = 0; s < splits; ++s) {
+            M = std::max(M, pj[s * pstep + Dv]);
+        }
+        if (M == kNegInf) {
+            for (int64_t d = 0; d < Dv; ++d) { simd::s_store(&o_row[d], 0.0f); }
+            return;
+        }
+
+        // The merge dispatch runs after the slice dispatch, so no slot is
+        // live; reuse one as the f32 accumulator.
+        const int64_t slot = scratch_slot_of(ctx.cpu, nmerge, idx);
+        float* acc = ws + slot * per_slot + hb * kDecodeChunk;
+        for (int64_t d = 0; d < Dv; ++d) { acc[d] = 0.0f; }
+        float denom = 0.0f;
+        for (int64_t s = 0; s < splits; ++s) {
+            const float* p = pj + s * pstep;
+            const float ms = p[Dv];
+            if (ms == kNegInf) { continue; }
+            const float w = std::exp((ms - M) * scale);
+            denom += w * p[Dv + 1];
+            auto vw = simd::v_set1(p, w);
+            int64_t d = 0;
+            for (; d + lanes <= Dv; d += lanes) {
+                simd::v_store(acc + d,
+                    simd::v_fmadd(vw, simd::v_load(p + d), simd::v_load(acc + d)));
+            }
+            for (; d < Dv; ++d) { acc[d] += w * p[d]; }
+        }
+        const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+        auto v_inv = simd::v_set1(acc, inv);
+        int64_t d = 0;
+        for (; d + lanes <= Dv; d += lanes) {
+            vstore_f32x8(o_row + d, simd::v_mul(simd::v_load(acc + d), v_inv));
+        }
+        for (; d < Dv; ++d) { simd::s_store(&o_row[d], acc[d] * inv); }
+    };
+    ctx.cpu.run(0, nmerge, merge);
 }
 
 }  // anonymous namespace
@@ -956,10 +1121,49 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
     const bool has_mask = inputs.size() > mslot && inputs[mslot].rank != 0;
     plan.use_decode = (Sq == 1) && !has_mask;
     if (plan.use_decode) {
-        plan.decode_elems = Sk + Dv;   // f32: scores row then output accumulator
-        plan.num_slots = plan_slot_count(num_threads, use_thread_slots, B * H);
-        plan.workspace_size = static_cast<size_t>(plan.num_slots)
-                            * static_cast<size_t>(plan.decode_elems) * sizeof(float);
+        // Head batching: a GQA/MQA group's query heads share one KV head, so
+        // one task streams the run for the whole group. The batch is capped:
+        // past eight heads the score tile and the live accumulators push the
+        // GEMV out of registers for a read that is already amortized.
+        const int64_t Hkv = cfg.kv_heads();
+        NNOPS_ASSERT(H % Hkv == 0);
+        const int64_t G = H / Hkv;
+        const int64_t hb = std::min<int64_t>(G, kDecodeHeadBatch);
+        const int64_t nb = (G + hb - 1) / hb;
+        const int64_t units = B * Hkv * nb;
+
+        // KV splitting: batching shrinks the task grid by up to eight, so when
+        // it no longer covers the workers the run is cut into slices and the
+        // partial softmax states merged. A slice below kDecodeMinSlice does
+        // not amortize its own max/merge pass.
+        int64_t splits = 1;
+        const int64_t nt = std::max<int64_t>(num_threads, 1);
+        if (nt > 1 && units < nt) {
+            splits = std::min<int64_t>(kDecodeMaxSplits, (nt + units - 1) / units);
+            while (splits > 1 && (Sk + splits - 1) / splits < kDecodeMinSlice) {
+                --splits;
+            }
+        }
+
+        plan.decode_heads = static_cast<int>(hb);
+        plan.decode_splits = static_cast<int>(splits);
+        // f32 per slot: [scores: hb][chunk][o_acc: hb][Dv][max: hb][sum: hb].
+        // The score block is a fixed chunk, not the whole run, so the scratch
+        // stays flat as the cache grows.
+        plan.decode_elems = hb * kDecodeChunk + hb * Dv + 2 * hb;
+        const int64_t tasks = units * splits;
+        // Both dispatches draw slots from the same pool: the slice kernel and
+        // the (batch, query head) merge pass after it.
+        plan.num_slots = plan_slot_count(num_threads, use_thread_slots,
+                                         std::max(tasks, B * H));
+        size_t bytes = static_cast<size_t>(plan.num_slots)
+                     * static_cast<size_t>(plan.decode_elems) * sizeof(float);
+        if (splits > 1) {
+            // One partial per (task, batched head): output, max, sum.
+            bytes += static_cast<size_t>(tasks) * static_cast<size_t>(hb)
+                   * static_cast<size_t>(Dv + 2) * sizeof(float);
+        }
+        plan.workspace_size = bytes;
         return plan;
     }
 

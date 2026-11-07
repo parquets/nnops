@@ -12,7 +12,11 @@
 ///
 /// Three routes, picked by the shape:
 ///   - decode (Sq == 1, no mask): both products are matrix-vector, so K and V
-///     are streamed once each with no packing and no M == 1 MMA tiles.
+///     are streamed once each with no packing and no M == 1 MMA tiles. One
+///     task serves up to eight query heads of the same KV head (GQA/MQA), so
+///     the run is read once for the whole group, and the run is split into
+///     independent slices when the batched grid would leave workers idle;
+///     a slice's partial output, max and sum are merged afterwards.
 ///   - standard (Sq*Sk < kFlashMinScores): materialize scores = Q·K^T·scale,
 ///     softmax each row in place, then output = attn·V.
 ///   - flash (Sq*Sk >= kFlashMinScores): FlashAttention-1 online softmax,
@@ -99,6 +103,14 @@ struct AttentionPlan {
     int    mc1 = 0, nc1 = 0;    ///< standard-path GEMM1 (Sq × Sk) tiles
     int    mc2 = 0, nc2 = 0;    ///< standard-path GEMM2 (Sq × Dv) tiles
     int    Br = 0, Bc = 0;      ///< flash-path query/KV block tiles
+    /// Decode head batching: query heads one task serves. Under GQA/MQA the
+    /// group's heads share a KV head, so one pass over K/V feeds all of them
+    /// instead of each head re-reading the run.
+    int    decode_heads = 1;
+    /// Decode KV splitting: slices of the run handled by independent tasks,
+    /// merged with the online-softmax weights. > 1 only when the head-batched
+    /// task count would leave workers idle.
+    int    decode_splits = 1;
     int64_t decode_elems = 0;   ///< decode-path f32 scratch elements per slot
     int64_t num_slots = 0;      ///< scratch slots (worker threads, else tasks)
     size_t workspace_size = 0;  ///< pooled scratch bytes (0 → no tiled route)

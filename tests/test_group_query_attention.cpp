@@ -11,21 +11,26 @@
 /// run (the KV-cache decode shape), and on both routes: standard, and flash
 /// once Sq*Sk reaches kFlashMinScores (1 << 16). The step cases feed the key
 /// run as [past | new] and check both the decode and the forced-flash route,
-/// including a segment boundary that is not aligned to the KV tile.
+/// including a segment boundary that is not aligned to the KV tile. The
+/// threaded cases drive the decode route over a long run, so the plan splits it
+/// into KV slices and the partial softmax states are merged.
 
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/multi_head_attention.hpp"
 #include "backend/cpu/attention/attention.h"   // AttentionConfig / get_attention_plan
 #include "common/test_harness.hpp"
+#include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/test_helpers.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace nnops;
@@ -69,8 +74,46 @@ std::vector<int64_t> with_seq(const std::vector<int64_t>& shape, int64_t seq)
     return s;
 }
 
+/// Fixed-size pool over a CpuBackend (test_conv2d.cpp pattern); items are
+/// claimed atomically. Installed only for the cases that need a worker grid.
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
 /// fast path vs reference on f32; returns false on the first mismatch.
-bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out = nullptr)
+bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_out = nullptr,
+                     const CpuBackend* pool = nullptr)
 {
     auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 100);
     auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 101);
@@ -131,7 +174,10 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     pcfg.num_kv_heads = c.kv_heads;
     pcfg.causal = c.causal;
     pcfg.position_offset = c.position_offset;
-    const cpu::AttentionPlan plan = cpu::get_attention_plan(pcfg, descs, out_descs);
+    const cpu::AttentionPlan plan = cpu::get_attention_plan(
+        pcfg, descs, out_descs,
+        pool != nullptr ? pool->worker_count() : 1,
+        pool != nullptr && pool->thread_slot_count() > 0);
     used_flash = plan.use_flash;
     if (plan_out) { *plan_out = plan; }
     if (c.route >= 0) {
@@ -144,7 +190,9 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
 
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
-    op->compute(fast_out, ins, {}, nullptr);
+    ComputeContext fast_ctx;
+    if (pool != nullptr) { fast_ctx.cpu = *pool; }
+    op->compute(fast_out, ins, fast_ctx, nullptr);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
@@ -312,6 +360,33 @@ NNOPS_TEST(gqa_decode_sq1_masked_matches_ref) {
     }
 }
 
+NNOPS_TEST(gqa_decode_kv_split_matches_ref) {
+    // A long decode run hands the head-batched plan fewer tasks than workers,
+    // so it cuts the run into KV slices: each slice keeps its own online
+    // softmax and a second dispatch merges the partial output/max/sum. The
+    // reference over the whole run is the ground truth for that merge.
+    SimplePool pool(8);
+
+    const Case cases[] = {
+        // H = 8 over 2 kv heads → 2 units; 2048 keys → 4 slices of 512.
+        {{1, 1, 8 * 64},   {1, 2048, 2 * 64}, 8, 2, 0.0f, true, false, 0, -1, 2},
+        // G = 16 caps the head batch at 8: two head blocks per kv head, and
+        // 1500 keys → 4 slices of 375.
+        {{1, 1, 16 * 32},  {1, 1500, 1 * 32}, 16, 1, 0.0f, true, false, 0, -1, 2},
+        // [past | new] with the slice edges inside the 1000-row past; 1001
+        // keys land on 3 slices of 334, so the edges are not tile-aligned.
+        {{1, 1, 8 * 32},   {1, 1, 2 * 32},    8, 2, 0.0f, true, false, 1000, -1, 2},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash, &plan, &pool.cpu));
+        NNOPS_EXPECT_TRUE(plan.use_decode);
+        NNOPS_EXPECT_TRUE(plan.decode_splits > 1);
+    }
+}
+
 // ============================================================
 // Chunked input: a past segment and an explicit position offset
 // ============================================================
@@ -450,5 +525,59 @@ NNOPS_TEST(gqa_f16_matches_ref) {
             throw std::runtime_error("gqa f16 deviation " + std::to_string(worst) +
                                      " > tol " + std::to_string(tol));
         }
+    }
+}
+
+NNOPS_TEST(gqa_f16_decode_split_matches_ref) {
+    // f16 down the sliced decode route: the f32 partials and the merge are
+    // element-type independent, only the loads, the stores and the running
+    // state move to half.
+    SimplePool pool(8);
+    const Case c = {{1, 1, 8 * 32}, {1, 1200, 2 * 32}, 8, 2, 0.0f, true};
+
+    auto [q32v, q32] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 400);
+    auto [k32v, k32] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 401);
+    auto [v32v, v32] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 402);
+
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = c.heads;
+    attrs.kv_num_heads = c.kv_heads;
+    attrs.causal = c.causal;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    const TensorDesc descs32[] = {q32.desc(), k32.desc(), v32.desc()};
+    const TensorView ins32[] = {q32, k32, v32};
+    auto out_desc = op->getOutputTensorDesc(descs32)[0];
+    const int64_t n = out_desc.numel();
+
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_channel_first(out_desc, ref_buf.data());
+    nnops::backend::cpu::reference::group_query_attention_ref(attrs, ref_out, ins32, {}, nullptr);
+
+    auto q16v = test::f32_to_f16(q32v);
+    auto k16v = test::f32_to_f16(k32v);
+    auto v16v = test::f32_to_f16(v32v);
+    TensorView q16(std::span<const int64_t>(c.qshape), DataType::f16, q16v.data());
+    TensorView k16(std::span<const int64_t>(c.kshape), DataType::f16, k16v.data());
+    TensorView v16(std::span<const int64_t>(c.kshape), DataType::f16, v16v.data());
+
+    const TensorDesc fdescs[] = {q16.desc(), k16.desc(), v16.desc()};
+    const auto fout_desc = op->getOutputTensorDesc(fdescs)[0];
+    std::vector<cpu::half> got_buf(static_cast<size_t>(n));
+    auto got = test::make_channel_first(fout_desc, got_buf.data());
+    const TensorView ins16[] = {q16, k16, v16};
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+    NNOPS_EXPECT_TRUE(op->compute(got, ins16, ctx) == Status::ok);
+
+    const auto got_f32 = test::f16_to_f32(got_buf);
+    float worst = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        worst = std::max(worst, std::abs(got_f32[static_cast<size_t>(i)] -
+                                         ref_buf[static_cast<size_t>(i)]));
+    }
+    if (worst > test::kF16AccumTol) {
+        throw std::runtime_error("gqa f16 decode deviation " + std::to_string(worst) +
+                                 " > tol " + std::to_string(test::kF16AccumTol));
     }
 }
