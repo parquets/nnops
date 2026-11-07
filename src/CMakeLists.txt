@@ -118,9 +118,14 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/conv1d.cpp
 
     # CPU tiled attention kernels (fused QK^T + softmax + AV) — one core shared
-    # by MultiHeadAttention, GroupQueryAttention and MultiLatentAttention;
-    # linear attention lives alongside it.
+    # by MultiHeadAttention, GroupQueryAttention and MultiLatentAttention, split
+    # one file per route (standard / flash / decode), with the plan that picks
+    # between them in attention_plan.cpp; linear attention lives alongside it.
     backend/cpu/attention/attention.cpp
+    backend/cpu/attention/attention_plan.cpp
+    backend/cpu/attention/attention_standard.cpp
+    backend/cpu/attention/attention_flash.cpp
+    backend/cpu/attention/attention_decode.cpp
     backend/cpu/attention/linear_attention.cpp
 
     # The recurrent family: one driver for RNN, GRU and LSTM — the chunked input

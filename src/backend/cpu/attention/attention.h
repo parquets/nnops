@@ -68,6 +68,11 @@
 /// Q, K, V, [mask], [past K], [past V] — or Q, KV, [mask], [past KV] when
 /// v_is_k. The past tensors carry the same layout as their new counterpart,
 /// with Sk_past rows instead of Sk_new; the run is [past | new].
+///
+/// Implementation is one file per route (attention_standard.cpp,
+/// attention_flash.cpp, attention_decode.cpp) over the shared machinery in
+/// attention_internal.h; attention_plan.cpp owns the tile and scratch sizing,
+/// and attention.cpp holds the public entry and the operator mappings.
 
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
