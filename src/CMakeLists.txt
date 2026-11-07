@@ -130,10 +130,14 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/attention/attention_decode.cpp
     backend/cpu/attention/linear_attention.cpp
 
-    # The recurrent family: one driver for RNN, GRU and LSTM — the chunked input
-    # projection, the per-step recurrent GEMM and the epilogue that fuses the
-    # gate arithmetic, the sequence mask and the Y store.
+    # The recurrent family: one driver for RNN, GRU and LSTM — split into the
+    # plan (tile grid, chunk, q8 scratch), the packed-weight blob, the fp step
+    # kernels and their int8 twin; recurrent.cpp walks the timeline.
     backend/cpu/rnn/recurrent.cpp
+    backend/cpu/rnn/recurrent_plan.cpp
+    backend/cpu/rnn/recurrent_pack.cpp
+    backend/cpu/rnn/recurrent_step.cpp
+    backend/cpu/rnn/recurrent_q8.cpp
 
     backend/cpu/cumsum.cpp
 )
