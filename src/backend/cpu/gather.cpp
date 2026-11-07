@@ -13,6 +13,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/shape_inference.hpp"
 #include "common/strided_walk.hpp"
+#include "common/dtype_dispatch.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
 #include <cstdint>
@@ -22,20 +23,6 @@
 namespace nnops::backend::cpu {
 
 namespace {
-
-template <class F>
-void for_each_data_type(DataType t, F&& f)
-{
-    switch (t) {
-    case DataType::f32: f(std::type_identity<float>{}); break;
-    case DataType::f16: f(std::type_identity<half>{}); break;
-    case DataType::s8:  f(std::type_identity<int8_t>{}); break;
-    case DataType::u8:  f(std::type_identity<uint8_t>{}); break;
-    case DataType::s32: f(std::type_identity<int32_t>{}); break;
-    case DataType::s64: f(std::type_identity<int64_t>{}); break;
-    default: break;
-    }
-}
 
 template <typename I>
 bool index_in_range(const TensorView& indices, int64_t limit)
