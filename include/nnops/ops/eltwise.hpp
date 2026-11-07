@@ -2,10 +2,12 @@
 /// @file eltwise.hpp
 /// @brief Eltwise operator — element-wise binary operations on two tensors.
 ///
-/// Both inputs and the output share a shape and a dtype. Quantized (s8/u8) in
-/// and out is a fused path: dequantize both sides, apply the op in f32,
-/// requantize. All three must be quantized — no float/int mixing — and share
-/// one PerTensor or PerToken granularity.
+/// Both inputs broadcast against each other under the NumPy rules and share a
+/// dtype with the output. Equal shapes take the tiled SIMD route, a broadcast
+/// an index-driven general loop. Quantized (s8/u8) in and out is a fused path:
+/// dequantize both sides, apply the op in f32, requantize. All three must be
+/// quantized — no float/int mixing — share one PerTensor or PerToken
+/// granularity, and have the same shape: the fused tile path has no broadcast.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
