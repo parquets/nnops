@@ -219,6 +219,22 @@ inline v_f32x8 v_cvt_f16_to_f32(const half* p) {
     return v_cvt_f16_to_f32(v_load_f16x8(reinterpret_cast<const uint16_t*>(p)));
 }
 
+/// Load @p T elements as f32 lanes and store f32 lanes back as @p T. For
+/// float this is a plain v_load / v_store; for half it widens at load and
+/// narrows once at store, so a kernel whose constants or tables are f32 — or
+/// that must not round between operations — can be written once.
+template <typename T>
+inline v_f32x8 v_load_f32(const T* p) {
+    if constexpr (std::is_same_v<T, half>) { return v_cvt_f16_to_f32(p); }
+    else { return v_load(p); }
+}
+
+template <typename T>
+inline void v_store_f32(T* p, const v_f32x8& v) {
+    if constexpr (std::is_same_v<T, half>) { v_store(p, v_cvt_f32_to_f16(v)); }
+    else { v_store(p, v); }
+}
+
 // int8/uint8 → f16: direct per-element conversion (8 lanes)
 inline v_f16x8 v_cvt_s8_to_f16(const int8_t* p) {
     half buf[8];
