@@ -17,7 +17,6 @@
 #include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/matmul/matmul_helper.h"   // NR_MAX_F32/MR_MAX_F32 — the plan's panels
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
-#include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 #include "common/test_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"

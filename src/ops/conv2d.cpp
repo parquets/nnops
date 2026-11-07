@@ -33,7 +33,6 @@
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"
 #include "backend/cpu/conv/conv2d_winograd.h"
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"
-#include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 
 #include <algorithm>
 #include <cstring>

@@ -91,7 +91,6 @@
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
 #include "backend/cpu/conv/conv2d_winograd.h" // get_conv2d_winograd_plan
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"   // the weight transforms
-#include "backend/cpu/simd_kernel/simd_winograd43.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/test_helpers.hpp"

@@ -11,8 +11,7 @@
 
 #include "conv2d_winograd.h"
 #include "backend/cpu/matmul/matmul_helper.h"                  // tile_mma_direct / tile_pack_rhs
-#include "backend/cpu/simd_kernel/simd_winograd.hpp"    // BᵀdB / AᵀMA / GgGᵀ transforms
-#include "backend/cpu/simd_kernel/simd_winograd43.hpp"  // the F(4,3) transforms
+#include "backend/cpu/simd_kernel/simd_winograd.hpp"    // the F(2,3) and F(4,3) transforms
 #include "backend/cpu/common/memory_pool.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "nnops/detail/half.hpp"
