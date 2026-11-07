@@ -159,7 +159,7 @@ inline void winograd_output_tile8(const T* m_base, int m_plane_stride,
                                   T* out0, T* out1,
                                   int ow0, int ow_end, bool row1_ok,
                                   const Epilogue& ep, float bias_oc,
-                                  bool add_to) noexcept {
+                                  bool add_to, bool pre_act = false) noexcept {
     // Aᵀ M per column c: the four M rows sit 4·m_plane_stride apart.
     v_f32x8 t[2][4];
     for (int c = 0; c < 4; ++c) {
@@ -186,14 +186,18 @@ inline void winograd_output_tile8(const T* m_base, int m_plane_stride,
         for (int lane = 0; lane < 8; ++lane) {
             const int ow = ow0 + 2 * lane;
             if (ow >= ow_end) { break; }
+            // pre_act is the ResNet order: the residual joins the sum before
+            // the activation. The read is the same either way.
             float v = b0[lane] + bias_oc;
+            if (add_to && pre_act) { v += s_load(row + ow); }
             v = apply_epilogue(ep, v);
-            if (add_to) { v += s_load(row + ow); }
+            if (add_to && !pre_act) { v += s_load(row + ow); }
             s_store(row + ow, v);
             if (ow + 1 < ow_end) {
                 float v1 = b1[lane] + bias_oc;
+                if (add_to && pre_act) { v1 += s_load(row + ow + 1); }
                 v1 = apply_epilogue(ep, v1);
-                if (add_to) { v1 += s_load(row + ow + 1); }
+                if (add_to && !pre_act) { v1 += s_load(row + ow + 1); }
                 s_store(row + ow + 1, v1);
             }
         }
@@ -271,7 +275,7 @@ template <class T>
 inline void winograd_output_channel_last(const T* m, int64_t m_plane,
                                  T* const p[2][2],
                                  const Epilogue& ep, const T* bias, bool add_to,
-                                 int lanes) noexcept {
+                                 int lanes, bool pre_act = false) noexcept {
     // Aᵀ M per column, then (Aᵀ M) A.
     alignas(32) float t[2][4][8];
     for (int c = 0; c < 4; ++c) {
@@ -288,10 +292,11 @@ inline void winograd_output_channel_last(const T* m, int64_t m_plane,
     const auto emit = [&](T* dst, const v_f32x8& y) {
         if (dst == nullptr) { return; }
         v_f32x8 v = v_add(y, vb);
+        if (add_to && pre_act) { v = v_add(v, wino_load_lanes<T>(dst, lanes)); }
         // apply_epilogue_vec is backend/cpu's (this header is a kernel's): same
         // file, same table, so the two forms cannot disagree.
         v = backend::cpu::apply_epilogue_vec<float>(ep, &tag, v);
-        if (add_to) { v = v_add(v, wino_load_lanes<T>(dst, lanes)); }
+        if (add_to && !pre_act) { v = v_add(v, wino_load_lanes<T>(dst, lanes)); }
         wino_store_lanes(dst, v, lanes);
     };
     for (int r = 0; r < 2; ++r) {
@@ -425,7 +430,7 @@ template <class T>
 inline void winograd43_output_channel_last(const T* m, int64_t m_plane,
                                    T* const p[4][4],
                                    const Epilogue& ep, const T* bias, bool add_to,
-                                   int lanes) noexcept {
+                                   int lanes, bool pre_act = false) noexcept {
     // Aᵀ M per column, then (Aᵀ M) A.
     alignas(32) float t[4][6][8];
     for (int c = 0; c < 6; ++c) {
@@ -439,8 +444,9 @@ inline void winograd43_output_channel_last(const T* m, int64_t m_plane,
     const auto emit = [&](T* dst, const v_f32x8& y) {
         if (dst == nullptr) { return; }
         v_f32x8 v = v_add(y, vb);
+        if (add_to && pre_act) { v = v_add(v, wino_load_lanes<T>(dst, lanes)); }
         v = backend::cpu::apply_epilogue_vec<float>(ep, &tag, v);
-        if (add_to) { v = v_add(v, wino_load_lanes<T>(dst, lanes)); }
+        if (add_to && !pre_act) { v = v_add(v, wino_load_lanes<T>(dst, lanes)); }
         wino_store_lanes(dst, v, lanes);
     };
     for (int r = 0; r < 4; ++r) {
@@ -508,7 +514,7 @@ inline void winograd43_output_tile8(const T* m_base, int m_plane_stride,
                                     T* const out[4],
                                     int ow0, int ow_end, int rows_ok,
                                     const Epilogue& ep, float bias_oc,
-                                    bool add_to) noexcept {
+                                    bool add_to, bool pre_act = false) noexcept {
     alignas(32) float t[4][6][8];
     for (int c = 0; c < 6; ++c) {
         const T* mp = m_base + c * m_plane_stride
@@ -531,8 +537,9 @@ inline void winograd43_output_tile8(const T* m_base, int m_plane_stride,
                 const int ow = ow0 + 4 * lane + c;
                 if (ow >= ow_end) { break; }
                 float val = b[lane] + bias_oc;
+                if (add_to && pre_act) { val += s_load(out[r] + ow); }
                 val = apply_epilogue(ep, val);
-                if (add_to) { val += s_load(out[r] + ow); }
+                if (add_to && !pre_act) { val += s_load(out[r] + ow); }
                 s_store(out[r] + ow, val);
             }
         }

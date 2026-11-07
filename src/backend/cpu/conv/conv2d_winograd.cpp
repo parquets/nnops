@@ -303,7 +303,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                                 m_all_, static_cast<int>(ocn_block * tile_block),
                                 static_cast<int>(tile_block), static_cast<int>(oc),
                                 t0, row0, row1, ow0, static_cast<int>(OW), row1_ok,
-                                attrs.epilogue, bias_oc, attrs.add_to);
+                                attrs.epilogue, bias_oc, attrs.add_to,
+                                attrs.residual_pre_activation);
                         } else {
                             T* rows[4];
                             for (int rr = 0; rr < 4; ++rr) {
@@ -313,7 +314,8 @@ void conv2d_winograd_impl(const Conv2DAttributes& attrs,
                                 m_all_, static_cast<int>(ocn_block * tile_block),
                                 static_cast<int>(tile_block), static_cast<int>(oc),
                                 t0, rows, ow0, static_cast<int>(OW), rows_ok,
-                                attrs.epilogue, bias_oc, attrs.add_to);
+                                attrs.epilogue, bias_oc, attrs.add_to,
+                                attrs.residual_pre_activation);
                         }
                     }
                 }
@@ -795,11 +797,13 @@ void conv2d_winograd_channel_last_impl(const Conv2DAttributes& attrs,
                     if constexpr (O == WinoOrder::F23) {
                         k::winograd_output_channel_last<T>(m_tile, m_p_stride, dst,
                                                    attrs.epilogue, bias_oc,
-                                                   attrs.add_to, lanes);
+                                                   attrs.add_to, lanes,
+                                                   attrs.residual_pre_activation);
                     } else {
                         k::winograd43_output_channel_last<T>(m_tile, m_p_stride, dst,
                                                      attrs.epilogue, bias_oc,
-                                                     attrs.add_to, lanes);
+                                                     attrs.add_to, lanes,
+                                                     attrs.residual_pre_activation);
                     }
                 }
             }

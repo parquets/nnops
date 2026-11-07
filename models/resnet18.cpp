@@ -87,15 +87,13 @@ Buf basic_block(const ModelArtifact& m, const std::string& prefix,
     const TensorView& res = downsample ? skip.view : x;
 
     // main = relu(main + shortcut). `add_to` puts the residual in the output
-    // buffer the conv accumulates into, and the relu stays a separate call by
-    // default: these convs are 3x3 s1, so they take Winograd, whose kernels
-    // apply the residual after the activation. `residual_pre_activation` folds
-    // the relu into the conv but is implemented on the implicit-GEMM route
-    // only, so setting NNOPS_MODEL_PREACT=1 validates that form end to end at
-    // the cost of the Winograd route.
+    // buffer the conv accumulates into; `residual_pre_activation` makes the
+    // conv add it *before* its epilogue, so the relu rides the conv's epilogue
+    // (Winograd included) and its separate pass disappears. NNOPS_MODEL_PREACT=0
+    // restores the split form for an A/B.
     static const bool preact = [] {
         const char* s = std::getenv("NNOPS_MODEL_PREACT");
-        return s != nullptr && std::strcmp(s, "0") != 0;
+        return !(s != nullptr && std::strcmp(s, "0") == 0);
     }();
     if (model::fuse_enabled()) {
         if (preact) {

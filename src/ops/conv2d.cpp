@@ -236,9 +236,6 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
     // the residual on the wrong side of the activation.
     if (attrs_.add_to && attrs_.residual_pre_activation) {
         if (is_quantized_conv2d(inputs[1].dtype)) { return Status::unsupported; }
-        if (attrs_.algorithm == ConvAlgorithm::Winograd) { return Status::unsupported; }
-        // A Winograd-packed filter selects that kernel by layout alone.
-        if (is_wino_weight(wl)) { return Status::unsupported; }
         if (backend_ == Backend::CUDA) { return Status::unsupported; }
     }
     return Status::ok;

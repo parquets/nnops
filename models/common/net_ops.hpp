@@ -432,9 +432,7 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // disappears is one whole read-modify-write pass over the output.
     nnops::Conv2DAttributes use = attrs;
     if (residual != nullptr) { use.add_to = true; }
-    // The Winograd kernels apply the residual after the activation; a
-    // pre-activation residual falls back to the implicit-GEMM route.
-    const bool wino = !use.residual_pre_activation && nnops::winograd_applicable(
+    const bool wino = nnops::winograd_applicable(
         use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
     if (wino && winograd_order_override() != 0) {
         use.winograd_order = winograd_order_override();

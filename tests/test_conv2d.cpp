@@ -795,13 +795,6 @@ NNOPS_TEST(conv2d_im2col_residual_pre_activation) {
     }
     NNOPS_EXPECT_TRUE(negative > 0);   // the relu must actually bite
 
-    // Winograd has no pre-activation form; it must refuse rather than ignore.
-    Conv2DAttributes wino = pre;
-    wino.algorithm = ConvAlgorithm::Winograd;
-    auto wop = Conv2D::create(wino, Backend::CPU);
-    std::vector<float> wbuf(static_cast<size_t>(out_numel));
-    auto wout = test::make_channel_first(out_descs[0], wbuf.data());
-    NNOPS_EXPECT_TRUE(wop->compute(wout, ins, {}, nullptr) == Status::unsupported);
 }
 
 NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
