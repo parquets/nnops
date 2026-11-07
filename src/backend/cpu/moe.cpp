@@ -104,9 +104,12 @@ inline float swiglu_combine(float gate, float value, float alpha, float beta,
 /// @p bias / @p ep are that same slice's bias and activation. Both ride the
 /// kernel's own output pass — the last k-block's tile, still in cache — so the
 /// gate is written once, already final, instead of being swept twice more.
+///
+/// @p b is raw weight storage of @p bdt, which may be block-packed: the caller
+/// offsets it by whole rows either way, and MatMul is what knows the format.
 template <typename T>
 void expert_gemm(const T* a, int64_t M, int64_t K,
-                 const T* b, int64_t N,
+                 const void* b, int64_t N, DataType bdt,
                  const T* bias, const Epilogue& ep,
                  T* out, int64_t ld,
                  DataType dt, const ComputeContext& ctx)
@@ -118,7 +121,7 @@ void expert_gemm(const T* a, int64_t M, int64_t K,
     const int64_t c_shape[] = {M, N};
 
     TensorView a_view(a_shape, dt, const_cast<T*>(a));
-    TensorView b_view(b_shape, dt, const_cast<T*>(b));
+    TensorView b_view(b_shape, bdt, const_cast<void*>(b));
     // beta = 0: the GEMM overwrites its slice, so no clear pass is needed.
     TensorView c_view(c_shape, dt, out, ld * static_cast<int64_t>(sizeof(T)));
 
@@ -181,13 +184,23 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         NNOPS_ASSERT(fc1_out == I);
     }
 
+    // The weights may be block-packed, so they are addressed as bytes: one row
+    // is H (or I) values, which is `pitch()` bytes — 20 per 32 values for Q4_1.
+    const DataType fc1_dt = fc1_w.data_type();
+    const DataType fc2_dt = fc2_w.data_type();
+    const DataType fc3_dt = has_fc3_w ? inputs[6].data_type() : fc1_dt;
+    const auto* fc1_base = static_cast<const uint8_t*>(fc1_w.ptr<void>());
+    const auto* fc2_base = static_cast<const uint8_t*>(fc2_w.ptr<void>());
+    const auto* fc3_base = has_fc3_w ? static_cast<const uint8_t*>(inputs[6].ptr<void>())
+                                     : nullptr;
+    const int64_t fc1_row_bytes = fc1_w.pitch();
+    const int64_t fc2_row_bytes = fc2_w.pitch();
+    const int64_t fc3_row_bytes = has_fc3_w ? inputs[6].pitch() : 0;
+
     const T* in_ptr      = input.ptr<T>();
     const T* rout_ptr    = router_probs.ptr<T>();
-    const T* fc1_ptr     = fc1_w.ptr<T>();
-    const T* fc2_ptr     = fc2_w.ptr<T>();
     const T* fc1b_ptr    = has_fc1_bias ? inputs[3].ptr<T>() : nullptr;
     const T* fc2b_ptr    = has_fc2_bias ? inputs[5].ptr<T>() : nullptr;
-    const T* fc3_ptr     = has_fc3_w ? inputs[6].ptr<T>() : nullptr;
     const T* fc3b_ptr    = has_fc3_bias ? inputs[7].ptr<T>() : nullptr;
     const T* rw_ptr      = has_rweights ? inputs[8].ptr<T>() : nullptr;
 
@@ -406,7 +419,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
         T* gate = gate_row + n0;
 
         // FC1: [n_e, H] x [w, H]^T -> [n_e, w] (the gate half).
-        expert_gemm<T>(a, n_e, H, fc1_ptr + (e * I + n0) * H, w,
+        expert_gemm<T>(a, n_e, H, fc1_base + (e * I + n0) * fc1_row_bytes, w, fc1_dt,
                        fc1b_ptr ? fc1b_ptr + e * I + n0 : nullptr, act_ep,
                        gate, I, dt, serial_ctx);
 
@@ -415,7 +428,7 @@ void moe_cpu_impl(const MoEAttributes& attrs,
             T* value = value_row + n0;
 
             // FC3: the value half, same shape.
-            expert_gemm<T>(a, n_e, H, fc3_ptr + (e * I + n0) * H, w,
+            expert_gemm<T>(a, n_e, H, fc3_base + (e * I + n0) * fc3_row_bytes, w, fc3_dt,
                            fc3b_ptr ? fc3b_ptr + e * I + n0 : nullptr, Epilogue{},
                            value, I, dt, serial_ctx);
 
@@ -447,8 +460,8 @@ void moe_cpu_impl(const MoEAttributes& attrs,
 
         T* out_slice = eout + begin * H;
         // [n_e, I] x [w, I]^T -> [n_e, w].
-        expert_gemm<T>(gates + begin * I, n_e, I, fc2_ptr + (e * H + n0) * I, w,
-                       fc2b_ptr ? fc2b_ptr + e * H + n0 : nullptr, Epilogue{},
+        expert_gemm<T>(gates + begin * I, n_e, I, fc2_base + (e * H + n0) * fc2_row_bytes,
+                       w, fc2_dt, fc2b_ptr ? fc2b_ptr + e * H + n0 : nullptr, Epilogue{},
                        out_slice + n0, H, dt, serial_ctx);
     });
 

@@ -55,8 +55,13 @@ Status MoE::compute(std::span<TensorView> outputs,
     if (!detail::dtype_in<DataType::f32, DataType::f16>(dt0)) {
         return Status::unsupported;
     }
+    // The three expert weights (fc1, fc2, fc3) may be block-packed — Q4_1 is
+    // what MatMul already takes as a right-hand side — while the activations,
+    // the biases and the router stay in the activation dtype.
     for (size_t i = 0; i < inputs.size(); ++i) {
-        if (!inputs[i].is_empty() && inputs[i].data_type() != dt0) {
+        if (inputs[i].is_empty() || inputs[i].data_type() == dt0) { continue; }
+        const bool weight = (i == 2 || i == 4 || i == 6);
+        if (!weight || !is_block_packed_dtype(inputs[i].data_type())) {
             return Status::invalid_argument;
         }
     }

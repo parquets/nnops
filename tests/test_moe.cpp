@@ -16,6 +16,7 @@
 #include "nnops/ops/moe.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/q4_1.hpp"
 
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -116,11 +117,41 @@ struct Buf {
     /// f16 kernel saw.
     void round_trip_f16() { f32 = nnops::test::f16_to_f32(f16); }
 
-    TensorView view(DataType dt) {
+    TensorView view(DataType dt) const {
         if (dt == DataType::f16) {
-            return TensorView(shape, dt, f16.data(), TensorLayout::NCHW);
+            return TensorView(shape, dt, const_cast<half*>(f16.data()), TensorLayout::NCHW);
         }
-        return TensorView(shape, dt, f32.data(), TensorLayout::NCHW);
+        return TensorView(shape, dt, const_cast<float*>(f32.data()), TensorLayout::NCHW);
+    }
+};
+
+/// One expert weight in Q4_1 blocks, plus the values those blocks decode to.
+/// The kernel gets `bytes`; the reference gets `decoded`, so the only thing
+/// under test is the storage format, not the quantizer.
+struct Q4Weight {
+    std::vector<uint8_t> bytes;
+    Buf decoded;
+
+    void from(const Buf& dense) {
+        const int64_t rows = dense.shape[0] * dense.shape[1];
+        const int64_t cols = dense.shape[2];
+        const int64_t row_bytes =
+            static_cast<int64_t>(data_type_row_bytes(DataType::q4_1, cols));
+
+        bytes.assign(static_cast<size_t>(rows * row_bytes), 0);
+        decoded.shape = dense.shape;
+        decoded.f32.assign(static_cast<size_t>(rows * cols), 0.0f);
+
+        for (int64_t r = 0; r < rows; ++r) {
+            uint8_t* blk = bytes.data() + r * row_bytes;
+            quantize_q4(dense.f32.data() + r * cols, cols, blk);
+            pack_q4(blk, cols, decoded.f32.data() + r * cols);
+        }
+    }
+
+    TensorView view() const {
+        return TensorView(decoded.shape, DataType::q4_1,
+                          const_cast<uint8_t*>(bytes.data()), TensorLayout::NCHW);
     }
 };
 
@@ -133,6 +164,11 @@ struct MoEProblem {
     Buf input, router, fc1w, fc1b, fc2w, fc2b, fc3w, fc3b, rw;
     bool has_fc1b = true, has_fc2b = true;
     bool has_fc3w = false, has_fc3b = false, has_rw = false;
+
+    /// When set, the expert weights are Q4_1 blocks and only the reference run
+    /// sees the dense values they decode to.
+    bool q4_weights = false;
+    Q4Weight q4_fc1w, q4_fc2w, q4_fc3w;
 
     /// Build with random data; fc3 and its bias are passed only when requested
     /// (SwiGLU is the only path that reads them).
@@ -181,18 +217,36 @@ struct MoEProblem {
         return bufs;
     }
 
+    /// Quantize the expert weights to Q4_1; the decoded values stay available
+    /// for the reference run.
+    void quantize_weights() {
+        q4_fc1w.from(fc1w);
+        q4_fc2w.from(fc2w);
+        if (has_fc3w) { q4_fc3w.from(fc3w); }
+        q4_weights = true;
+    }
+
     /// All nine inputs; absent optionals are empty views, so the op's
-    /// `is_empty()` handling is exercised rather than truncated away.
-    std::vector<TensorView> inputs(DataType dt) {
+    /// `is_empty()` handling is exercised rather than truncated away. With
+    /// @p quantized the weights are handed over as their Q4_1 blocks.
+    std::vector<TensorView> inputs(DataType dt, bool quantized = false) {
+        // Quantized: the blocks. Otherwise, if the problem is a quantized one,
+        // the decoded values — the reference must see exactly what the kernel
+        // decodes, and it always runs in f32.
+        const auto weight_view = [&](const Buf& dense, const Q4Weight& q) {
+            if (!q4_weights) { return dense.view(dt); }
+            return quantized ? q.view() : q.decoded.view(DataType::f32);
+        };
+
         std::vector<TensorView> ins;
         ins.reserve(9);
         ins.push_back(input.view(dt));
         ins.push_back(router.view(dt));
-        ins.push_back(fc1w.view(dt));
+        ins.push_back(weight_view(fc1w, q4_fc1w));
         ins.push_back(has_fc1b ? fc1b.view(dt) : TensorView{});
-        ins.push_back(fc2w.view(dt));
+        ins.push_back(weight_view(fc2w, q4_fc2w));
         ins.push_back(has_fc2b ? fc2b.view(dt) : TensorView{});
-        ins.push_back(has_fc3w ? fc3w.view(dt) : TensorView{});
+        ins.push_back(has_fc3w ? weight_view(fc3w, q4_fc3w) : TensorView{});
         ins.push_back(has_fc3b ? fc3b.view(dt) : TensorView{});
         ins.push_back(has_rw   ? rw.view(dt)   : TensorView{});
         return ins;
@@ -210,7 +264,7 @@ std::vector<float> run_moe(MoEProblem& p, const MoEAttributes& attrs,
                            const ComputeContext& ctx, DataType dt, bool use_ref)
 {
     auto op = MoE::create(attrs, Backend::CPU);
-    auto ins = p.inputs(dt);
+    auto ins = p.inputs(dt, p.q4_weights && !use_ref);
     const auto oshape = p.out_shape();
     const size_t n_out = static_cast<size_t>(p.T * p.H);
 
@@ -874,6 +928,56 @@ NNOPS_TEST(moe_f16)
     auto want = run_ref(p, attrs);
 
     expect_close(got, want, 0.0f, nnops::test::kF16AccumTol, "moe f16");
+}
+
+// Q4_1 expert weights: the kernel slices the block stream by row and MatMul
+// decodes inside its GEMM, while the reference sees the values those blocks
+// decode to. H and I are both off the 32-value block, so every weight row ends
+// in a partial block.
+NNOPS_TEST(moe_q4_1_weights)
+{
+    MoEProblem p;
+    p.T = 6; p.H = 40; p.E = 3; p.I = 70;
+    p.build(/*seed=*/801);
+    p.quantize_weights();
+
+    MoEAttributes attrs;
+    attrs.k = 2;
+    attrs.activation = MoEActivation::Silu;
+
+    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe q4_1");
+}
+
+// Same, through SwiGLU: fc3 is the third block-packed weight, and the gate
+// value combine stays in the activation dtype.
+NNOPS_TEST(moe_q4_1_swiglu)
+{
+    MoEProblem p;
+    p.T = 8; p.H = 64; p.E = 2; p.I = 96;
+    p.build(/*seed=*/802, /*with_fc3=*/true);
+    p.quantize_weights();
+
+    MoEAttributes attrs;
+    attrs.k = 2;
+    attrs.activation = MoEActivation::SwiGLU;
+
+    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe q4_1 swiglu");
+}
+
+// Enough routes per expert that the GEMM leaves the fused small-M decode and
+// packs Q4_1 panels instead: 128 routes over 2 experts is ~64 rows per expert.
+NNOPS_TEST(moe_q4_1_packed_route)
+{
+    MoEProblem p;
+    p.T = 64; p.H = 128; p.E = 2; p.I = 256;
+    p.build(/*seed=*/803);
+    p.quantize_weights();
+
+    MoEAttributes attrs;
+    attrs.k = 2;
+    attrs.activation = MoEActivation::Relu;
+
+    expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, "moe q4_1 packed");
 }
 
 }  // anonymous namespace
