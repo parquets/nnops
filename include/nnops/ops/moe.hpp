@@ -23,8 +23,10 @@
 ///
 /// Implemented today (CPU): f32/f16, all three router_gating functions,
 /// routed_scaling_factor, the Relu/Gelu/Silu/Identity activations, and SwiGLU
-/// with the `Separate` layout. The Interleaved/Block SwiGLU layouts and
-/// use_sparse_mixer exist in the interface but are rejected by an assertion.
+/// in all three layouts — `Separate` (two matrices), and the fused
+/// `Interleaved`/`Block` ones, where fc1 holds both halves and one GEMM covers
+/// them. use_sparse_mixer exists in the interface but is rejected by an
+/// assertion.
 ///
 /// Inputs (an optional one is omitted by passing an empty TensorView):
 ///   [0] input                  [num_tokens, hidden_size]     f32/f16

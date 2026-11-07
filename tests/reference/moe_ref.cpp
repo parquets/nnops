@@ -7,8 +7,10 @@
 /// lower expert index), optionally renormalize and scale the selected weights,
 /// then run the selected experts' FFNs and accumulate `w * expert_out` in f32.
 ///
-/// Scope matches the kernel: f32/f16, Relu/Gelu/Silu/Identity, and SwiGLU with
-/// the Separate (fc3) layout. Everything else is rejected.
+/// Scope matches the kernel: f32/f16, Relu/Gelu/Silu/Identity, and SwiGLU in
+/// all three layouts (Separate reads a second fc3 matrix; Interleaved and Block
+/// both read the gate/value pairs out of the 2*inter_size-wide fc1). Everything
+/// else is rejected.
 ///
 /// Sqrt-softplus guards at 20: above it `log1p(exp(x))` already equals x in
 /// f32, and `exp(x)` overflows near 88.
@@ -107,10 +109,15 @@ void moe_ref_impl(const MoEAttributes& attrs,
     const int64_t I = fc2_w.shape(2);
 
     const bool is_swiglu = (attrs.activation == MoEActivation::SwiGLU);
+    const bool swi_separate = is_swiglu && attrs.swiglu_layout == SwiGLULayout::Separate;
     if (is_swiglu) {
-        NNOPS_ASSERT_MSG(attrs.swiglu_layout == SwiGLULayout::Separate,
-                         "moe_ref: only the Separate SwiGLU layout is supported");
-        NNOPS_ASSERT(has_fc3_w);
+        if (swi_separate) {
+            NNOPS_ASSERT(has_fc3_w);
+        } else {
+            // Fused: gate and value packed into fc1, twice as wide, no fc3.
+            NNOPS_ASSERT(!has_fc3_w);
+            NNOPS_ASSERT(fc1_w.shape(1) == 2 * I);
+        }
     }
     NNOPS_ASSERT(!attrs.use_sparse_mixer);
     NNOPS_ASSERT(attrs.k >= 1 && attrs.k <= E);
@@ -223,8 +230,9 @@ void moe_ref_impl(const MoEAttributes& attrs,
                     s += load_at(x, h) * load_at(row, h);
                 }
                 gate[static_cast<size_t>(i)] = s;
-
-                if (is_swiglu) {
+            }
+            if (swi_separate) {
+                for (int64_t i = 0; i < I; ++i) {
                     float v = b3 ? load_at(b3, i) : 0.0f;
                     const T* row3 = w3 + i * H;
                     for (int64_t h = 0; h < H; ++h) {
@@ -234,11 +242,25 @@ void moe_ref_impl(const MoEAttributes& attrs,
                 }
             }
 
-            if (is_swiglu) {
+            if (swi_separate) {
                 // Separate layout: fc1_out == I, so gate and value align.
                 for (int64_t i = 0; i < I; ++i) {
                     gate[static_cast<size_t>(i)] = swiglu_combine(
                         gate[static_cast<size_t>(i)], value[static_cast<size_t>(i)],
+                        attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
+                }
+            } else if (is_swiglu) {
+                // Fused: pair i reads its two rows of the 2I-wide fc1 output —
+                // adjacent for Interleaved, the two halves for Block — and
+                // leaves the combined value in the pair's compact slot. The
+                // write is always behind every not-yet-read row.
+                const bool interleaved =
+                    attrs.swiglu_layout == SwiGLULayout::Interleaved;
+                for (int64_t i = 0; i < I; ++i) {
+                    const int64_t gi = interleaved ? 2 * i : i;
+                    const int64_t vi = interleaved ? 2 * i + 1 : I + i;
+                    gate[static_cast<size_t>(i)] = swiglu_combine(
+                        gate[static_cast<size_t>(gi)], gate[static_cast<size_t>(vi)],
                         attrs.activation_alpha, attrs.activation_beta, attrs.swiglu_limit);
                 }
             } else {

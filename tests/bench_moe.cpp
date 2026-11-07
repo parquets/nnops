@@ -127,7 +127,10 @@ void fill_random(std::vector<T>& v, uint64_t seed, float lo = -1.0f, float hi = 
     }
 }
 
-/// One decode-layer MoE. `swiglu` adds the third projection (Separate layout).
+/// One decode-layer MoE. `swiglu` turns on the SwiGLU expert, whose `layout`
+/// picks Separate (three I-wide GEMMs) or a fused Interleaved/Block fc1 (one
+/// 2I-wide GEMM); `skew` adds a fixed bias to the first two experts' logits, so
+/// nearly every token routes to them.
 struct Shape {
     const char* name;
     int64_t T, H, I, E, k;
@@ -136,6 +139,8 @@ struct Shape {
     bool normalize = false;
     float scale = 1.0f;
     bool swiglu = false;
+    bool skew = false;
+    SwiGLULayout layout = SwiGLULayout::Separate;
 };
 
 const std::vector<Shape>& sweep() {
@@ -146,8 +151,20 @@ const std::vector<Shape>& sweep() {
          MoEActivation::Silu, MoERouterGating::Sigmoid, true, 2.5f},
         {"swiglu 8x   k2  T=128",         128, 1024, 2048, 8, 2,
          MoEActivation::SwiGLU, MoERouterGating::Softmax, false, 1.0f, true},
+        {"swiglu intlv 8x k2 T=128",      128, 1024, 2048, 8, 2,
+         MoEActivation::SwiGLU, MoERouterGating::Softmax, false, 1.0f, true,
+         /*skew=*/false, SwiGLULayout::Interleaved},
+        {"swiglu block 8x k2 T=128",      128, 1024, 2048, 8, 2,
+         MoEActivation::SwiGLU, MoERouterGating::Softmax, false, 1.0f, true,
+         /*skew=*/false, SwiGLULayout::Block},
         {"small 16x   k4  T=64",           64,  512,  512, 16, 4,
          MoEActivation::Gelu, MoERouterGating::Softmax, false, 1.0f, false},
+        {"skewed 8x   k2  T=256",         256, 2048, 4096, 8, 2,
+         MoEActivation::Silu, MoERouterGating::Softmax, false, 1.0f,
+         /*swiglu=*/false, /*skew=*/true},
+        {"skewed 4x   k2  T=256 I=256",   256, 2048,  256, 4, 2,
+         MoEActivation::Silu, MoERouterGating::Softmax, false, 1.0f,
+         /*swiglu=*/false, /*skew=*/true},
     };
     return s;
 }
@@ -156,10 +173,14 @@ template <class T>
 struct Layer {
     explicit Layer(const Shape& c) : s(c) {
         constexpr DataType dt = dtype_of<T>();
+        // The fused SwiGLU layouts pack gate and value into fc1 (width 2I) and
+        // carry no fc3; Separate keeps two I-wide matrices.
+        const bool separate = c.layout == SwiGLULayout::Separate;
+        const int64_t fc1_width = (c.swiglu && !separate) ? 2 * c.I : c.I;
         const int64_t tok[] = {c.T, c.H};
         const int64_t gate[] = {c.T, c.E};
-        const int64_t f1[] = {c.E, c.I, c.H};
-        const int64_t b1[] = {c.E, c.I};
+        const int64_t f1[] = {c.E, fc1_width, c.H};
+        const int64_t b1[] = {c.E, fc1_width};
         const int64_t f2[] = {c.E, c.H, c.I};
         const int64_t b2[] = {c.E, c.H};
         const int64_t f3[] = {c.E, c.I, c.H};
@@ -174,11 +195,21 @@ struct Layer {
         };
         alloc(input, tok, 2, 1);
         alloc(router, gate, 2, 2);
+        if (c.skew) {
+            // Two experts dominate the top-K, the shape a trained router can
+            // reach; the other E-2 expert rows stay near empty.
+            for (int64_t t = 0; t < c.T; ++t) {
+                for (int64_t e = 0; e < 2; ++e) {
+                    T* p = &router[static_cast<size_t>(t * c.E + e)];
+                    nnops::simd::s_store(p, nnops::simd::s_load(p) + 4.0f - 2.0f * static_cast<float>(e));
+                }
+            }
+        }
         alloc(fc1w, f1, 3, 3);
         alloc(fc1b, b1, 2, 4);
         alloc(fc2w, f2, 3, 5);
         alloc(fc2b, b2, 2, 6);
-        if (c.swiglu) {
+        if (c.swiglu && separate) {
             alloc(fc3w, f3, 3, 7);
             alloc(fc3b, b3, 2, 8);
         }
@@ -190,7 +221,7 @@ struct Layer {
         fc1b_v     = TensorView(std::span<const int64_t>(b1, 2), dt, fc1b.data());
         fc2w_v     = TensorView(std::span<const int64_t>(f2, 3), dt, fc2w.data());
         fc2b_v     = TensorView(std::span<const int64_t>(b2, 2), dt, fc2b.data());
-        if (c.swiglu) {
+        if (c.swiglu && separate) {
             fc3w_v = TensorView(std::span<const int64_t>(f3, 3), dt, fc3w.data());
             fc3b_v = TensorView(std::span<const int64_t>(b3, 2), dt, fc3b.data());
         }
@@ -201,7 +232,7 @@ struct Layer {
         attrs.router_gating = c.gating;
         attrs.normalize_routing_weights = c.normalize;
         attrs.routed_scaling_factor = c.scale;
-        attrs.swiglu_layout = SwiGLULayout::Separate;
+        attrs.swiglu_layout = c.layout;
         op = MoE::create(attrs, Backend::CPU);
 
         ins = {in_v, router_v, fc1w_v, fc1b_v, fc2w_v, fc2b_v,

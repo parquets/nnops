@@ -197,6 +197,19 @@ struct MoEProblem {
         has_fc3b = with_fc3;
     }
 
+    /// Fuse gate and value into one 2I-wide fc1 row — the Interleaved/Block
+    /// SwiGLU layouts — and drop fc3, as a model with packed weights supplies
+    /// it. The row order itself is the layout, so random weights are valid for
+    /// either.
+    void fuse_swiglu(uint64_t seed) {
+        fc1w.shape = {E, 2 * I, H};
+        fc1b.shape = {E, 2 * I};
+        fc1w.fill(seed + 3);
+        fc1b.fill(seed + 4);
+        has_fc3w = false;
+        has_fc3b = false;
+    }
+
     void to_f16_all() {
         for (Buf* b : all()) { b->to_f16(); }
         dtype = DataType::f16;
@@ -501,6 +514,46 @@ NNOPS_TEST(moe_f32_topk_threaded_uneven)
     }
 }
 
+// Skewed routing with a long token tail: the dominant expert collects about
+// three times its fair share of rows, so the row split cuts it into chunks and
+// the blocks share it instead of each walking the whole tail. The reference is
+// oblivious to the grid, so this pins the chunk boundaries and the per-chunk
+// gather / FC2 offsets.
+NNOPS_TEST(moe_skewed_routing_threaded)
+{
+    MoEProblem p;
+    p.T = 512; p.H = 64; p.E = 4; p.I = 96;
+    p.build(/*seed=*/62);
+
+    // ~70% of the tokens to expert 0, ~20% to expert 1, the rest spread.
+    for (int64_t t = 0; t < p.T; ++t) {
+        const int64_t band = t % 10;
+        for (int64_t e = 0; e < p.E; ++e) {
+            int64_t winner;
+            if (band < 7) { winner = 0; }
+            else if (band < 9) { winner = 1; }
+            else { winner = 2 + (t / 10) % 2; }
+            p.router.f32[static_cast<size_t>(t * p.E + e)] =
+                (e == winner) ? 6.0f : -6.0f;
+        }
+    }
+
+    MoEAttributes attrs;
+    attrs.k = 1;
+    attrs.activation = MoEActivation::Gelu;
+
+    SimpleMoEPool pool(8);
+    ComputeContext ctx;
+    ctx.cpu = pool.cpu;
+
+    auto want = run_ref(p, attrs);
+    for (int rep = 0; rep < 3; ++rep) {
+        auto got = run_kernel(p, attrs, ctx);
+        expect_close(got, want, 1e-4f, 1e-4f,
+                     "moe_skewed_routing_threaded rep " + std::to_string(rep));
+    }
+}
+
 // Renormalization on and off must both track the reference.
 NNOPS_TEST(moe_normalize_routing_weights)
 {
@@ -761,6 +814,83 @@ NNOPS_TEST(moe_swiglu_separate)
     MoEAttributes tight = attrs;
     tight.swiglu_limit = 0.1f;
     NNOPS_EXPECT_TRUE(max_abs_diff(run_kernel(p, attrs), run_kernel(p, tight)) > 1e-3f);
+}
+
+// The fused SwiGLU layouts pack gate and value into fc1 (fc1_out == 2 * I):
+// Interleaved pairs them adjacently (GPT-OSS), Block concatenates the halves
+// (Llama/Gemma). One GEMM covers both halves, so what is under test is that the
+// combine picks the right rows and that FC2 sees the compact I-wide result.
+NNOPS_TEST(moe_swiglu_fused_layouts)
+{
+    const SwiGLULayout layouts[] = {SwiGLULayout::Interleaved, SwiGLULayout::Block};
+    const char* names[] = {"moe swiglu interleaved", "moe swiglu block"};
+
+    for (int i = 0; i < 2; ++i) {
+        MoEProblem p;
+        p.T = 12; p.H = 16; p.E = 4; p.I = 24;
+        p.build(/*seed=*/211);
+        p.fuse_swiglu(/*seed=*/211);
+
+        MoEAttributes attrs;
+        attrs.k = 2;
+        attrs.activation = MoEActivation::SwiGLU;
+        attrs.swiglu_layout = layouts[i];
+        attrs.normalize_routing_weights = true;
+
+        const std::string name = names[i];
+        expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, name);
+
+        // GPT-OSS parameters enter the clamp and the value offset.
+        attrs.activation_alpha = 1.702f;
+        attrs.activation_beta  = 1.0f;
+        attrs.swiglu_limit     = 7.0f;
+        expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, name + " gpt-oss params");
+    }
+}
+
+// Same layouts through f16 and Q4_1 weights: the fused row is what both the
+// combine and the block-packed FC2 input address.
+NNOPS_TEST(moe_swiglu_fused_f16_q4_1)
+{
+    const SwiGLULayout layouts[] = {SwiGLULayout::Interleaved, SwiGLULayout::Block};
+    const char* names[] = {"moe swiglu interleaved", "moe swiglu block"};
+
+    for (int i = 0; i < 2; ++i) {
+        const std::string name = names[i];
+
+        {
+            MoEProblem p;
+            p.T = 8; p.H = 32; p.E = 4; p.I = 32;
+            p.build(/*seed=*/213);
+            p.fuse_swiglu(/*seed=*/213);
+
+            MoEAttributes attrs;
+            attrs.k = 2;
+            attrs.activation = MoEActivation::SwiGLU;
+            attrs.swiglu_layout = layouts[i];
+
+            p.to_f16_all();
+            auto got = run_kernel(p, attrs);
+            p.round_trip_f16_all();
+            auto want = run_ref(p, attrs);
+            expect_close(got, want, 0.0f, nnops::test::kF16AccumTol, name + " f16");
+        }
+
+        {
+            MoEProblem p;
+            p.T = 6; p.H = 40; p.E = 3; p.I = 70;
+            p.build(/*seed=*/214);
+            p.fuse_swiglu(/*seed=*/214);
+            p.quantize_weights();
+
+            MoEAttributes attrs;
+            attrs.k = 2;
+            attrs.activation = MoEActivation::SwiGLU;
+            attrs.swiglu_layout = layouts[i];
+
+            expect_matches_ref(p, attrs, {}, 1e-4f, 1e-5f, name + " q4_1");
+        }
+    }
 }
 
 // Every token routed to one expert, leaving the others with n_e == 0. The
