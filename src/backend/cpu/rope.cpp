@@ -5,12 +5,16 @@
 /// batches), then rotates row by row with the kernels in
 /// simd_kernel/simd_rope.hpp. f32 and f16 via dtype dispatch.
 ///
-/// Table layout: table[pos * half + pair_idx], half = head_dim/2. Interleaved:
+/// Table layout: table[pos * half + pair_idx], half = rotary_dim/2. Interleaved:
 /// pair_idx = d/2, the pair is (2p, 2p+1). Split-half: pair_idx = d, the pair
-/// is (d, d+half).
+/// is (d, d+half). Lanes past rotary_dim are copied through unrotated.
 ///
-/// mRoPE: when mrope_section_dims is non-empty, head_dim is partitioned into
+/// mRoPE: when mrope_section_dims is non-empty, rotary_dim is partitioned into
 /// sections, each with its own base frequency.
+///
+/// Fused pre-norm: an optional scale/bias pair (inputs [1]/[2]) RMS-normalizes
+/// each whole head before the rotation, writing into the output so the rotate
+/// pass runs in place on it.
 ///
 /// Position offset: row s is at absolute position position_offset + s.
 ///
@@ -24,6 +28,7 @@
 #include "nnops/ops/rope.hpp"
 #include "nnops/detail/assert.hpp"
 #include "nnops/core/parallel_for.hpp"
+#include "simd_kernel/simd_norm.hpp"
 #include "simd_kernel/simd_rope.hpp"
 #include "common/dtype_dispatch.hpp"
 #include "common/memory_pool.hpp"
@@ -135,11 +140,11 @@ void compute_cos_sin_tables(
     PoolArray<float>& cos_table,
     PoolArray<float>& sin_table,
     int64_t seq_len,
-    int64_t head_dim,
+    int64_t rotary_dim,
     const std::vector<RoPESection>& sections,
     const RoPEAttributes& attrs)
 {
-    const int64_t half = head_dim / 2;
+    const int64_t half = rotary_dim / 2;
     const size_t  total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
     cos_table.reset(total);
     sin_table.reset(total);
@@ -221,23 +226,30 @@ void rope_impl(const RoPEAttributes& attrs,
     const int64_t head_dim = X.shape(rank - 1);
     NNOPS_ASSERT(head_dim % 2 == 0);
 
-    const int64_t half = head_dim / 2;
+    const int64_t rotary_dim = attrs.rotary_dim > 0 ? attrs.rotary_dim : head_dim;
+    NNOPS_ASSERT(rotary_dim >= 2 && rotary_dim % 2 == 0 && rotary_dim <= head_dim);
+
+    const int64_t half = rotary_dim / 2;
 
     int64_t outer_count = 1;
     for (int64_t i = 0; i < rank - 2; ++i) {
         outer_count *= X.shape(i);
     }
 
-    auto sections = build_sections(attrs, head_dim);
+    auto sections = build_sections(attrs, rotary_dim);
     PoolArray<float> cos_table;
     PoolArray<float> sin_table;
-    compute_cos_sin_tables(cos_table, sin_table, seq_len, head_dim, sections, attrs);
+    compute_cos_sin_tables(cos_table, sin_table, seq_len, rotary_dim, sections, attrs);
 
     const T* x_ptr   = X.ptr<T>();
     T*       y_ptr   = output.ptr<T>();
     const int64_t row_stride  = X.row_stride_elems();
     const int64_t out_row_stride = output.row_stride_elems();
     const bool    interleaved = attrs.interleaved;
+
+    const T* gamma = inputs.size() > 1 ? inputs[1].ptr<T>() : nullptr;
+    const T* beta  = inputs.size() > 2 ? inputs[2].ptr<T>() : nullptr;
+    const float norm_eps = attrs.norm_epsilon;
 
     const auto process_outer = [&](int64_t outer) {
         const T* x_outer = x_ptr + outer * seq_len * row_stride;
@@ -249,9 +261,30 @@ void rope_impl(const RoPEAttributes& attrs,
             const float* cos_row = cos_table.data() + pos * half;
             const float* sin_row = sin_table.data() + pos * half;
 
-            kernel::rope_process_row<T>(
-                y_row, x_row, head_dim, cos_row, sin_row,
-                interleaved);
+            if (gamma) {
+                // Normalize the whole head into the output, then rotate the
+                // prefix in place — one fewer tensor pass than norm+rope.
+                auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_row, head_dim);
+                (void)sum;
+                const float inv_rms = 1.0f / std::sqrt(
+                    sum_sq / static_cast<float>(head_dim) + norm_eps);
+                if (beta) {
+                    kernel::norm_apply_row<T, false, true, true>(
+                        x_row, y_row, head_dim, 0.0f, inv_rms,
+                        gamma, beta, false, false);
+                } else {
+                    kernel::norm_apply_row<T, false, true, false>(
+                        x_row, y_row, head_dim, 0.0f, inv_rms,
+                        gamma, nullptr, false, false);
+                }
+                kernel::rope_process_row<T>(
+                    y_row, y_row, head_dim, rotary_dim, cos_row, sin_row,
+                    interleaved);
+            } else {
+                kernel::rope_process_row<T>(
+                    y_row, x_row, head_dim, rotary_dim, cos_row, sin_row,
+                    interleaved);
+            }
         }
     };
 

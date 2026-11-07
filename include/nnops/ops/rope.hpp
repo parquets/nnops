@@ -4,11 +4,21 @@
 ///        long-context scaling.
 ///
 /// Rotates pairs of the last dim, head_dim (even), by position-dependent
-/// angles: theta_i = pos / base^(2*i/head_dim), then
+/// angles: theta_i = pos / base^(2*i/rotary_dim), then
 ///   x'[i0] = x[i0]*cos(theta_i) - x[i1]*sin(theta_i)
 ///   x'[i1] = x[i1]*cos(theta_i) + x[i0]*sin(theta_i)
-/// mRoPE splits head_dim into sections, each with its own base. Input and
+/// mRoPE splits rotary_dim into sections, each with its own base. Input and
 /// output are [..., S, D].
+///
+/// Partial rotary: only the first rotary_dim lanes of each head rotate; the
+/// rest are copied through. The frequency exponents keep rotary_dim in the
+/// denominator, as in HuggingFace's `inv_freq` built over `rotary_dim`.
+///
+/// Optional fused Q/K normalization: when input [1] is present the row is
+/// RMS-normalized over the whole head_dim before the rotation, with a per-lane
+/// scale [1] and optional bias [2] — the q_norm / k_norm step Qwen-family
+/// models run between the projection and RoPE. Fusing it here removes a full
+/// tensor pass and the intermediate write.
 ///
 /// Row s sits at absolute position position_offset + s, so a decode step can
 /// rotate its new token where it really belongs instead of at 0.
@@ -54,10 +64,14 @@ struct RoPEAttributes {
     float base = 10000.0f;
 
     /// true: adjacent pairs (0,1), (2,3), ... (LLaMA); false: split-half pairs
-    /// (0, D/2), (1, D/2+1), ... (GPT-NeoX).
+    /// (0, R/2), (1, R/2+1), ... (GPT-NeoX), R = rotary_dim.
     bool interleaved = true;
 
-    /// mRoPE: per-section dim counts; the sum must equal head_dim.
+    /// Lanes of each head that rotate; 0 means the whole head_dim. Must be
+    /// even and no larger than head_dim; the lanes past it are copied through.
+    int64_t rotary_dim = 0;
+
+    /// mRoPE: per-section dim counts; the sum must equal rotary_dim.
     std::vector<int64_t> mrope_section_dims;
 
     /// mRoPE: per-section base frequencies, same size as mrope_section_dims.
@@ -88,6 +102,9 @@ struct RoPEAttributes {
     /// 1 and 4. high_freq_factor must exceed low_freq_factor.
     float llama3_low_freq_factor = 1.0f;
     float llama3_high_freq_factor = 4.0f;
+
+    /// Epsilon of the fused RMSNorm (only read when input [1] is present).
+    float norm_epsilon = 1e-5f;
 };
 
 class RoPE : public OpBase {

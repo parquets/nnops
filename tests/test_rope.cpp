@@ -146,23 +146,47 @@ static void compute_rope_ref_scaled(const float* x, float* y,
                                     int64_t seq_len, int64_t head_dim,
                                     float base, bool interleaved,
                                     int64_t position_offset,
-                                    const RefScaling& s) {
-    const int64_t half = head_dim / 2;
+                                    const RefScaling& s,
+                                    int64_t rotary_dim = -1,
+                                    const float* gamma = nullptr,
+                                    const float* beta = nullptr,
+                                    float eps = 1e-5f) {
+    if (rotary_dim < 0) { rotary_dim = head_dim; }
+    const int64_t half = rotary_dim / 2;
     const int64_t run_end = position_offset + seq_len;
     const float magnitude = ref_attention_magnitude(s);
+    std::vector<float> row_buf(static_cast<size_t>(head_dim));
 
     for (int64_t row = 0; row < seq_len; ++row) {
         const int64_t pos = position_offset + row;
+        const float* src = x + row * head_dim;
+        float* dst = y + row * head_dim;
+
+        if (gamma) {
+            float sum_sq = 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d) { sum_sq += src[d] * src[d]; }
+            const float inv = 1.0f / std::sqrt(
+                sum_sq / static_cast<float>(head_dim) + eps);
+            for (int64_t d = 0; d < head_dim; ++d) {
+                row_buf[static_cast<size_t>(d)] =
+                    src[d] * inv * gamma[d] + (beta ? beta[d] : 0.0f);
+            }
+            src = row_buf.data();
+        }
+
+        // Lanes past rotary_dim pass through untouched.
+        for (int64_t d = rotary_dim; d < head_dim; ++d) { dst[d] = src[d]; }
+
         const auto rotate = [&](int64_t pair, int64_t i0, int64_t i1) {
-            const float theta = rope_theta_scaled(pos, pair, head_dim, base,
+            const float theta = rope_theta_scaled(pos, pair, rotary_dim, base,
                                                   run_end, s);
             const float cv = std::cos(theta) * magnitude;
             const float sv = std::sin(theta) * magnitude;
 
-            const float x0 = x[row * head_dim + i0];
-            const float x1 = x[row * head_dim + i1];
-            y[row * head_dim + i0] = x0 * cv - x1 * sv;
-            y[row * head_dim + i1] = x1 * cv + x0 * sv;
+            const float x0 = src[i0];
+            const float x1 = src[i1];
+            dst[i0] = x0 * cv - x1 * sv;
+            dst[i1] = x1 * cv + x0 * sv;
         };
         for (int64_t d = 0; d < half; ++d) {
             if (interleaved) {
@@ -511,12 +535,15 @@ NNOPS_TEST(mrope_different_bases) {
 // ============================================================
 
 /// Rotate a random tensor and compare every element with the scalar reference.
+/// `norm_scale` / `norm_bias` (head_dim wide) exercise the fused pre-norm.
 static void check_rope_scaled(const RoPEAttributes& attrs,
                               std::initializer_list<int64_t> shape,
                               int64_t position_offset,
                               const RefScaling& scaling,
                               float tol = 1e-4f,
-                              uint64_t seed = 200) {
+                              uint64_t seed = 200,
+                              const std::vector<float>* norm_scale = nullptr,
+                              const std::vector<float>* norm_bias = nullptr) {
     auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, seed);
     auto op = RoPE::create(attrs, Backend::CPU);
 
@@ -524,22 +551,43 @@ static void check_rope_scaled(const RoPEAttributes& attrs,
     const TensorDesc da[] = {d_x};
     auto descs = op->getOutputTensorDesc(da);
 
-    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
-    auto y = test::make_channel_first(descs[0], out_buf.data());
-    const TensorView ins[] = {in_view};
-    op->compute(y, ins);
-
     const int64_t seq_len = d_x.dims[static_cast<size_t>(d_x.rank) - 2];
     const int64_t head_dim = d_x.dims[static_cast<size_t>(d_x.rank) - 1];
+
+    // Copies, because a TensorView holds a mutable pointer into the buffer.
+    std::vector<float> scale_copy;
+    std::vector<float> bias_copy;
+    std::vector<TensorView> ins;
+    ins.push_back(in_view);
+    if (norm_scale) {
+        scale_copy = *norm_scale;
+        const int64_t g_shape[] = {head_dim};
+        ins.emplace_back(g_shape, DataType::f32, scale_copy.data());
+    }
+    if (norm_bias) {
+        bias_copy = *norm_bias;
+        const int64_t b_shape[] = {head_dim};
+        ins.emplace_back(b_shape, DataType::f32, bias_copy.data());
+    }
+
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(descs[0], out_buf.data());
+    op->compute(y, ins);
+
     const int64_t stride = seq_len * head_dim;
     const int64_t outer = static_cast<int64_t>(in_vec.size()) / stride;
+    const int64_t rotary_dim = attrs.rotary_dim > 0 ? attrs.rotary_dim : head_dim;
 
     std::vector<float> ref(out_buf.size(), 0.0f);
     for (int64_t o = 0; o < outer; ++o) {
         compute_rope_ref_scaled(in_vec.data() + o * stride,
                                 ref.data() + o * stride,
                                 seq_len, head_dim, attrs.base,
-                                attrs.interleaved, position_offset, scaling);
+                                attrs.interleaved, position_offset, scaling,
+                                rotary_dim,
+                                norm_scale ? scale_copy.data() : nullptr,
+                                norm_bias ? bias_copy.data() : nullptr,
+                                attrs.norm_epsilon);
     }
     for (size_t i = 0; i < out_buf.size(); ++i) {
         NNOPS_EXPECT_NEAR(out_buf[i], ref[i], tol);
@@ -703,6 +751,188 @@ NNOPS_TEST(rope_mrope_with_offset) {
     attrs.mrope_section_dims = {16};
 
     check_rope_scaled(attrs, {3, 16}, 77, RefScaling{});
+}
+
+// ============================================================
+// Partial rotary and the fused Q/K norm
+// ============================================================
+
+NNOPS_TEST(rope_partial_rotary_splithalf) {
+    // half = rotary_dim/2, so the pairs live inside [0, 16); lanes 16..31 copy.
+    RoPEAttributes attrs;
+    attrs.interleaved = false;
+    attrs.rotary_dim = 16;
+
+    check_rope_scaled(attrs, {4, 3, 32}, 0, RefScaling{});
+}
+
+NNOPS_TEST(rope_partial_rotary_interleaved) {
+    RoPEAttributes attrs;
+    attrs.interleaved = true;
+    attrs.rotary_dim = 16;
+
+    check_rope_scaled(attrs, {8, 32}, 0, RefScaling{});
+}
+
+NNOPS_TEST(rope_partial_rotary_with_yarn_offset) {
+    // The chunked-decode shape, rotating only a prefix of each head.
+    RoPEAttributes attrs;
+    attrs.rotary_dim = 32;
+    attrs.position_offset = 512;
+    attrs.scaling_type = RoPEScalingType::YaRN;
+    attrs.scaling_factor = 8.0f;
+    attrs.original_max_position = 1024;
+
+    RefScaling ref;
+    ref.type = RoPEScalingType::YaRN;
+    ref.factor = 8.0f;
+    ref.orig = 1024;
+
+    check_rope_scaled(attrs, {2, 2, 64}, 512, ref);
+}
+
+NNOPS_TEST(rope_mrope_section_covers_rotary_dim_only) {
+    // The section sum must equal rotary_dim, not head_dim — the tail is not
+    // part of any section.
+    RoPEAttributes attrs;
+    attrs.rotary_dim = 16;
+    attrs.mrope_section_dims = {16};
+
+    check_rope_scaled(attrs, {3, 32}, 0, RefScaling{});
+}
+
+NNOPS_TEST(rope_fused_qk_norm) {
+    RoPEAttributes attrs;
+    attrs.interleaved = false;
+    attrs.rotary_dim = 16;
+    attrs.norm_epsilon = 1e-6f;
+
+    const int64_t head_dim = 32;
+    std::vector<float> gamma(static_cast<size_t>(head_dim));
+    std::vector<float> beta(static_cast<size_t>(head_dim));
+    for (int64_t d = 0; d < head_dim; ++d) {
+        gamma[static_cast<size_t>(d)] = 0.5f + 0.05f * static_cast<float>(d % 7);
+        beta[static_cast<size_t>(d)]  = -0.1f + 0.01f * static_cast<float>(d % 5);
+    }
+
+    check_rope_scaled(attrs, {4, head_dim}, 0, RefScaling{},
+                      1e-4f, 401, &gamma, &beta);
+}
+
+NNOPS_TEST(rope_fused_qk_norm_no_bias) {
+    RoPEAttributes attrs;
+    attrs.interleaved = true;
+
+    const int64_t head_dim = 16;
+    std::vector<float> gamma(static_cast<size_t>(head_dim));
+    for (int64_t d = 0; d < head_dim; ++d) {
+        gamma[static_cast<size_t>(d)] = 0.5f + 0.05f * static_cast<float>(d % 7);
+    }
+
+    check_rope_scaled(attrs, {6, head_dim}, 0, RefScaling{},
+                      1e-4f, 402, &gamma, nullptr);
+}
+
+NNOPS_TEST(rope_fused_qk_norm_f16) {
+    const int64_t seq_len = 4;
+    const int64_t head_dim = 32;
+    const int64_t shape[] = {seq_len, head_dim};
+    const int64_t vec_shape[] = {head_dim};
+    const int N = static_cast<int>(seq_len * head_dim);
+
+    auto [f32_vec, _] = test::make_random_tensor(shape, -2.0f, 2.0f, 403);
+    auto [gamma_vec, __] = test::make_random_tensor(vec_shape, 0.5f, 1.5f, 404);
+    auto [beta_vec, ___] = test::make_random_tensor(vec_shape, -0.5f, 0.5f, 405);
+
+    auto x16 = test::f32_to_f16(f32_vec);
+    auto g16 = test::f32_to_f16(gamma_vec);
+    auto b16 = test::f32_to_f16(beta_vec);
+
+    TensorView x(shape, DataType::f16, x16.data());
+    TensorView g(vec_shape, DataType::f16, g16.data());
+    TensorView b(vec_shape, DataType::f16, b16.data());
+
+    RoPEAttributes attrs;
+    attrs.interleaved = false;
+    attrs.rotary_dim = 16;
+    attrs.norm_epsilon = 1e-6f;
+    auto op = RoPE::create(attrs, Backend::CPU);
+
+    auto d_x = x.desc();
+    const TensorDesc da[] = {d_x};
+    auto descs = op->getOutputTensorDesc(da);
+
+    std::vector<nnops::backend::cpu::half> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto y = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {x, g, b};
+    op->compute(y, ins);
+
+    std::vector<float> ref(static_cast<size_t>(N), 0.0f);
+    compute_rope_ref_scaled(f32_vec.data(), ref.data(), seq_len, head_dim,
+                            10000.0f, false, 0, RefScaling{},
+                            attrs.rotary_dim, gamma_vec.data(), beta_vec.data(),
+                            attrs.norm_epsilon);
+
+    for (int i = 0; i < N; ++i) {
+        const float result = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+        NNOPS_EXPECT_TRUE(std::isfinite(result));
+        NNOPS_EXPECT_NEAR(result, ref[static_cast<size_t>(i)], 5e-2f);
+    }
+}
+
+NNOPS_TEST(rope_partial_rotary_validation) {
+    const int64_t shape[] = {2, 16};
+    float x_data[32] = {};
+    TensorView x(shape, DataType::f32, x_data);
+    auto d_x = x.desc();
+    const TensorDesc ins[] = {d_x};
+    const TensorDesc outs[] = {d_x};
+
+    RoPEAttributes odd_dim;
+    odd_dim.rotary_dim = 7;
+    NNOPS_EXPECT_TRUE(RoPE::create(odd_dim, Backend::CPU)->validate(ins, outs)
+                      == Status::invalid_argument);
+
+    RoPEAttributes too_wide;
+    too_wide.rotary_dim = 18;
+    NNOPS_EXPECT_TRUE(RoPE::create(too_wide, Backend::CPU)->validate(ins, outs)
+                      == Status::invalid_argument);
+
+    // mRoPE sections partition rotary_dim, so a sum equal to head_dim is wrong
+    // once a tail is left unrotated.
+    RoPEAttributes sections_overflow;
+    sections_overflow.rotary_dim = 8;
+    sections_overflow.mrope_section_dims = {16};
+    NNOPS_EXPECT_TRUE(RoPE::create(sections_overflow, Backend::CPU)
+                          ->validate(ins, outs) == Status::invalid_argument);
+
+    RoPEAttributes sections_ok;
+    sections_ok.rotary_dim = 8;
+    sections_ok.mrope_section_dims = {4, 4};
+    NNOPS_EXPECT_TRUE(RoPE::create(sections_ok, Backend::CPU)->validate(ins, outs)
+                      == Status::ok);
+
+    RoPEAttributes bad_eps;
+    bad_eps.norm_epsilon = 0.0f;
+    NNOPS_EXPECT_TRUE(RoPE::create(bad_eps, Backend::CPU)->validate(ins, outs)
+                      == Status::invalid_argument);
+
+    // The fused norm vectors are head_dim wide and share X's dtype.
+    const int64_t short_shape[] = {8};
+    float g_data[8] = {};
+    TensorView g_short(short_shape, DataType::f32, g_data);
+    auto d_g = g_short.desc();
+    const TensorDesc bad_ins[] = {d_x, d_g};
+    NNOPS_EXPECT_TRUE(RoPE::create(RoPEAttributes{}, Backend::CPU)
+                          ->validate(bad_ins, outs) == Status::invalid_argument);
+
+    const int64_t full_shape[] = {16};
+    float g_full[16] = {};
+    TensorView g_full_view(full_shape, DataType::f32, g_full);
+    auto d_gf = g_full_view.desc();
+    const TensorDesc good_ins[] = {d_x, d_gf};
+    NNOPS_EXPECT_TRUE(RoPE::create(RoPEAttributes{}, Backend::CPU)
+                          ->validate(good_ins, outs) == Status::ok);
 }
 
 NNOPS_TEST(rope_scaling_validation) {
