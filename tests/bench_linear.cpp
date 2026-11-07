@@ -17,6 +17,8 @@
 ///   linear_prepacked_weight  a weight packed once at load against packed per call.
 ///   linear_prepacked_weight_int8  the same in s8, where the blob is cut into k
 ///                            segments and only an s8 activation can read it.
+///   linear_q4_1              a q4_1 weight read as raw blocks against the same
+///                            values decoded once into a dense fp blob.
 ///   linear_f16_vs_matmul     the same pairing in f16.
 ///   linear_int8              u8s8 / s8s8 -> f32 / f16 dequant, per-token X and
 ///                            per-channel W.
@@ -33,6 +35,7 @@
 #include "nnops/ops/matmul.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/q4_1.hpp"
 #include "common/bench_harness.hpp"
 #include "common/cpu_pool.hpp"
 #include "common/random_tensor.hpp"
@@ -635,6 +638,113 @@ NNOPS_BENCH(linear_prepacked_weight) {
                                 /*rounds=*/3);
     bench_prepack_vs_raw<half>("f16", shapes, {1, 4}, /*target_ms=*/100.0,
                                /*rounds=*/3);
+}
+
+// ============================================================
+// q4_1 weight — the raw block stream against a decoded dense blob
+// ============================================================
+//
+// The only blob a q4 prepackWeights could hand back is the weight decoded to
+// the activation's dtype and packed into the usual panels: 16x the bytes in
+// f32, 8x in f16, and the activation has to be named at pack time, which
+// prepackWeights (it sees only the weight) cannot do. This measures that trade
+// without new prepack code — the raw arm hands Linear the 20-byte blocks, the
+// dense arm decodes them once through the existing fp prepack. Below the fused
+// kernel's M ceiling the raw arm packs nothing at all, so the blob can only
+// lose there; above it the question is whether the per-call decode outweighs
+// reading a 16x larger stream.
+
+template <typename T>
+void bench_q4_vs_dense(const char* tag, const std::vector<Shape>& shapes,
+                       const std::vector<int>& threads, double target_ms,
+                       int rounds) {
+    std::printf("  %s Linear q4_1 weight: raw vs decoded+dense-packed  "
+                "budget=%.0f ms/cell  rounds=%d\n", tag, target_ms, rounds);
+    std::printf("   %5s %5s %5s |", "M", "K", "N");
+    for (int nt : threads) {
+        std::printf("  %2dT:     raw   dense   R/D |", nt);
+    }
+    std::printf("\n");
+
+    for (const Shape& s : shapes) {
+        FpProblem<T> raw(s, LinearAttributes{}, /*with_bias=*/false);
+        FpProblem<T> den(s, LinearAttributes{}, /*with_bias=*/false);
+
+        // Quantize the raw arm's own weight, then decode those blocks into the
+        // dense arm's buffer: both arms multiply the same values.
+        const int64_t row_bytes =
+            static_cast<int64_t>(data_type_row_bytes(DataType::q4_1, s.K));
+        std::vector<uint8_t> blocks(static_cast<size_t>(s.N * row_bytes), 0);
+        for (int64_t n = 0; n < s.N; ++n) {
+            quantize_q4<T>(raw.w_buf.data() + n * s.K, s.K,
+                           blocks.data() + n * row_bytes);
+            pack_q4<T>(blocks.data() + n * row_bytes, s.K,
+                       den.w_buf.data() + n * s.K);
+        }
+        const int64_t wshape[] = {s.N, s.K};
+        raw.ins[1] = TensorView(wshape, DataType::q4_1, blocks.data());
+
+        // What a q4 -> dense prepack would produce, built by the existing fp path.
+        auto op = Linear::create(LinearAttributes{}, Backend::CPU);
+        TensorView query;
+        const TensorView win[] = {den.ins[1]};
+        TensorView q[] = {query};
+        op->prepackWeights(win, q);
+        std::vector<std::byte> hold(
+            static_cast<size_t>(q[0].desc().numel()) * sizeof(T) + 64);
+        const size_t mis = reinterpret_cast<uintptr_t>(hold.data()) % 64;
+        T* blob = reinterpret_cast<T*>(hold.data() + ((64 - mis) % 64));
+        TensorView packed(q[0].shape_span(), dtype_of<T>(), blob,
+                          q[0].pitch(), q[0].layout());
+        TensorView pack[] = {packed};
+        op->prepackWeights(win, pack);
+        den.ins[1] = packed;
+        std::vector<T>().swap(den.w_buf);   // dead once the blob is built
+
+        std::printf("   %5lld %5lld %5lld |", static_cast<long long>(s.M),
+                    static_cast<long long>(s.K), static_cast<long long>(s.N));
+        for (int nt : threads) {
+            BenchPool pool(nt);
+            ComputeContext ctx;
+            if (nt > 1) { ctx.cpu = pool.cpu; }
+
+            std::vector<double> vq, vd;
+            for (int r = 0; r < rounds; ++r) {
+                vq.push_back(raw.run(*raw.linear, ctx, target_ms));
+                vd.push_back(den.run(*den.linear, ctx, target_ms));
+            }
+            const double gq = median(vq), gd = median(vd);
+            std::printf(" %9.1f %9.1f %5.3f |", gq, gd, gd > 0.0 ? gq / gd : 0.0);
+        }
+        std::printf("\n");
+    }
+}
+
+NNOPS_BENCH(linear_q4_1) {
+    // The M ladder straddles both fused ceilings (16 f32 / 32 f16 trans, 8
+    // copy): below them the raw arm is a decode straight into the accumulator,
+    // above them it packs panels per call and the blob gets its chance.
+    //
+    // Measured: the blob never repays its 8-16x size where the operator is
+    // used. At M=1/8 on 4096^2 the raw arm is 1.5-3.3x faster — it packs
+    // nothing. At M=64/128 the arms tie within ~10-15%, and the blob's wins are
+    // confined to cells whose decoded weight is L3-resident (1280x1000 f32 at
+    // M=1, 512^3 at 4T: +20-30%) — where it is a bandwidth read of a decoded
+    // weight rather than a win over the decode. 1024^3 f32 even favors raw by
+    // 13% at 1T: 1 MB of blocks against 4 MB of panels.
+    const std::vector<Shape> shapes{
+        {1, 4096, 4096},     // decode: the fused kernel's home, no pack at all
+        {8, 4096, 4096},
+        {64, 4096, 4096},    // past both trans ceilings: packed per call
+        {128, 4096, 4096},   // prefill
+        {1, 1280, 1000},     // MobileNetV2's logits
+        {512, 512, 512},
+        {1024, 1024, 1024},  // square, FLOP bound
+    };
+    bench_q4_vs_dense<float>("f32", shapes, {1, 4}, /*target_ms=*/100.0,
+                             /*rounds=*/3);
+    bench_q4_vs_dense<half>("f16", shapes, {1, 4}, /*target_ms=*/100.0,
+                            /*rounds=*/3);
 }
 
 // ============================================================
