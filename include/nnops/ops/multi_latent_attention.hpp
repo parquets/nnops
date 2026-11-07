@@ -42,6 +42,13 @@
 ///
 /// `position_offset` is the absolute position of query row 0; set it when the
 /// chunk is not the tail of the run.
+///
+/// inputs[4] is an optional int32 [B] `seqlens_k`: each batch's valid key-run
+/// length, so the run is the prefix [0, seqlens_k[b]) — right padding is
+/// truncated and batches may sit at different positions. Causal masking then
+/// takes the per-batch bottom-right q0 = seqlens_k[b] - Sq unless
+/// position_offset (a scalar for every batch) is given. Absent, every batch
+/// runs to the full Sk.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

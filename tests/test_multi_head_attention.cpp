@@ -201,14 +201,15 @@ bool attention_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
                            const TensorView* mask,
                            float rtol, float atol,
                            const TensorView* past_k = nullptr,
-                           const TensorView* past_v = nullptr)
+                           const TensorView* past_v = nullptr,
+                           const TensorView* seqlens = nullptr)
 {
     std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
     std::vector<TensorView> ins   = {q, k, v};
     if (mask) {
         descs.push_back(mask->desc());
         ins.push_back(*mask);
-    } else if (past_k) {
+    } else if (past_k || seqlens) {
         // The optional slots are positional: an empty view marks the absent mask.
         descs.push_back(TensorDesc{});
         ins.push_back(TensorView{});
@@ -218,6 +219,16 @@ bool attention_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
         ins.push_back(*past_k);
         descs.push_back(past_v->desc());
         ins.push_back(*past_v);
+    } else if (seqlens) {
+        // seqlens sits after the past pair, so its slots must exist too.
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+    }
+    if (seqlens) {
+        descs.push_back(seqlens->desc());
+        ins.push_back(*seqlens);
     }
 
     auto op = MultiHeadAttention::create(attrs, Backend::CPU);
@@ -228,7 +239,7 @@ bool attention_fast_vs_ref(const MultiHeadAttentionAttributes& attrs,
     // kernel's internal pool.
     std::vector<float> fast_buf(static_cast<size_t>(out_numel));
     auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
-    op->compute(fast_out, ins, {}, nullptr);
+    NNOPS_EXPECT_TRUE(op->compute(fast_out, ins, {}, nullptr) == Status::ok);
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
@@ -406,6 +417,65 @@ NNOPS_TEST(attention_step_matches_ref) {
         NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f,
                                                 c.past > 0 ? &past_k : nullptr,
                                                 c.past > 0 ? &past_v : nullptr));
+    }
+}
+
+NNOPS_TEST(attention_seqlens_matches_ref) {
+    // Per-batch run lengths: every batch reads its prefix and its own
+    // bottom-right causal diagonal; absent the vector, the whole run is used.
+    struct Case {
+        std::vector<int64_t> qshape, kshape;
+        int64_t heads;
+        int64_t past;
+        int64_t offset;
+        bool causal;
+        std::vector<int32_t> seqlens;
+    };
+    const Case cases[] = {
+        // Causal, two batches at different positions.
+        {{2, 5, 4 * 8},  {2, 9, 4 * 8},  4, 0, -1, true,  {9, 5}},
+        // Non-causal: the prefix alone bounds the range.
+        {{2, 4, 2 * 16}, {2, 7, 2 * 16}, 2, 0, -1, false, {7, 2}},
+        // A past segment: seqlens counts the whole run.
+        {{2, 4, 4 * 8},  {2, 6, 4 * 8},  4, 5, -1, true,  {11, 7}},
+        // Explicit [B, H, S, D], one batch with an empty run (zeros) and a
+        // query run longer than the key run.
+        {{2, 4, 3, 8},   {2, 4, 2, 8},   4, 0, -1, true,  {4, 0}},
+        // Decode: one query row, per-batch limits inside the GEMV route.
+        {{2, 1, 4 * 8},  {2, 10, 4 * 8}, 4, 0, -1, true,  {10, 6}},
+    };
+
+    for (const auto& c : cases) {
+        auto [q_vec, q] = test::make_random_tensor(c.qshape, -1.0f, 1.0f, 250);
+        auto [k_vec, k] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 251);
+        auto [v_vec, v] = test::make_random_tensor(c.kshape, -1.0f, 1.0f, 252);
+
+        std::vector<float> pk_vec, pv_vec;
+        TensorView past_k, past_v;
+        if (c.past > 0) {
+            auto ps = c.kshape;
+            ps[c.kshape.size() == 3 ? 1 : 2] = c.past;
+            auto [a, ka] = test::make_random_tensor(ps, -1.0f, 1.0f, 253);
+            pk_vec = std::move(a);
+            past_k = ka;
+            auto [b, vb] = test::make_random_tensor(ps, -1.0f, 1.0f, 254);
+            pv_vec = std::move(b);
+            past_v = vb;
+        }
+
+        std::vector<int32_t> sl_vec(c.seqlens);
+        const std::vector<int64_t> sl_shape{static_cast<int64_t>(sl_vec.size())};
+        TensorView sl_view(sl_shape, DataType::s32, sl_vec.data());
+
+        MultiHeadAttentionAttributes attrs;
+        attrs.num_heads = c.heads;
+        attrs.causal = c.causal;
+        attrs.position_offset = c.offset;
+
+        NNOPS_EXPECT_TRUE(attention_fast_vs_ref(attrs, q, k, v, nullptr, 1e-3f, 1e-4f,
+                                                c.past > 0 ? &past_k : nullptr,
+                                                c.past > 0 ? &past_v : nullptr,
+                                                &sl_view));
     }
 }
 

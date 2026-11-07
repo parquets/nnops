@@ -8,12 +8,15 @@
 /// channels of the key row (MLA's latent) rather than a third tensor.
 ///
 /// Per head: the Q·K dot over the key width, scaled, plus the optional
-/// [Sq, Sk] mask, softmaxed per row over its causal prefix, then multiplied by
-/// V into the output. A row whose causal prefix is empty is all zeros.
+/// [Sq, Sk] mask, softmaxed per row over its valid prefix, then multiplied by
+/// V into the output. A row whose valid prefix is empty is all zeros.
 ///
 /// The optional past segment is read as the first Sk_past rows of the key run,
 /// so [past | new] behaves as one tensor. @p q0 is the absolute position of
-/// query row 0; negative means bottom-right (Sk - Sq).
+/// query row 0; negative means bottom-right (run - Sq). The run is the whole
+/// [past | new] range unless an int32 [B] seqlens_k vector is supplied, in
+/// which case batch b reads the prefix [0, seqlens_k[b]) and the causal and
+/// non-causal bounds both clamp to it.
 ///
 /// This is deliberately the slowest possible spelling — no blocking, no
 /// packing — so it can serve as ground truth for the tiled kernels.
@@ -24,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <span>
 #include <vector>
@@ -43,8 +47,11 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
     const auto& V = v_is_k ? inputs[1] : inputs[2];
     const size_t mask_slot = v_is_k ? 2u : 3u;
     const size_t past_slot = v_is_k ? 3u : 4u;
+    const size_t seqlens_slot = v_is_k ? 4u : 6u;
     const bool has_mask = inputs.size() > mask_slot && inputs[mask_slot].rank() != 0;
     const bool has_past = inputs.size() > past_slot && inputs[past_slot].rank() != 0;
+    const bool has_seqlens = inputs.size() > seqlens_slot &&
+                             inputs[seqlens_slot].rank() != 0;
     const auto& Kp = has_past ? inputs[past_slot] : K;
     const auto& Vp = has_past ? inputs[v_is_k ? past_slot : past_slot + 1] : V;
 
@@ -79,6 +86,7 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
     const auto* kp_ptr = has_past ? Kp.ptr<float>() : nullptr;
     const auto* vp_ptr = has_past ? Vp.ptr<float>() : nullptr;
     const auto* mask_ptr = has_mask ? inputs[mask_slot].ptr<float>() : nullptr;
+    const auto* seqlens = has_seqlens ? inputs[seqlens_slot].ptr<int32_t>() : nullptr;
     auto* out_ptr = output.ptr<float>();
 
     const int64_t q_rs = Q.row_stride_elems();
@@ -152,13 +160,18 @@ inline void attention_ref_generic(int64_t num_heads, int64_t num_kv_heads,
             }
         }
 
-        // Causal prefix from the row's absolute position; the tail is never read.
+        // The batch's valid key-run prefix; absent seqlens it is the whole run.
+        const int64_t run = seqlens
+            ? std::max<int64_t>(0, std::min<int64_t>(seqlens[b], Sk))
+            : Sk;
+
+        // Valid prefix from the row's absolute position; the tail is never read.
         for (int64_t i = 0; i < Sq; ++i) {
-            int64_t n = Sk;
+            int64_t n = run;
             if (causal) {
-                const int64_t q0 = position_offset >= 0 ? position_offset : (Sk - Sq);
+                const int64_t q0 = position_offset >= 0 ? position_offset : (run - Sq);
                 n = q0 + i + 1;
-                n = std::max<int64_t>(0, std::min<int64_t>(n, Sk));
+                n = std::max<int64_t>(0, std::min<int64_t>(n, run));
             }
             float* row = scores.data() + i * Sk;
 

@@ -34,14 +34,25 @@ Status attention_cpu(const AttentionConfig& cfg,
     if (inputs.size() < required) { return Status::invalid_argument; }
 
     const DataType dt = inputs[0].data_type();
+    const size_t seqlens = seqlens_slot(cfg);
 
     bool dtypes_ok = (dt == DataType::f32 || dt == DataType::f16) &&
                      output.data_type() == dt;
     for (size_t i = 1; i < inputs.size() && dtypes_ok; ++i) {
-        if (inputs[i].is_empty()) { continue; }   // absent optional mask
+        if (i == seqlens || inputs[i].is_empty()) { continue; }  // optional slots
         dtypes_ok = inputs[i].data_type() == dt;
     }
     if (!dtypes_ok) { return Status::unsupported; }
+
+    // The optional per-batch run lengths are int32 [B]; the kernels index them
+    // by batch, so a short tensor must not reach them.
+    if (has_seqlens_input(cfg, inputs)) {
+        const auto& s = inputs[seqlens];
+        if (s.data_type() != DataType::s32 || s.rank() != 1 ||
+            s.shape(0) != inputs[0].shape(0)) {
+            return Status::invalid_argument;
+        }
+    }
 
     // One plan decides tiles and scratch, and the scratch is allocated once
     // here, outside the parallel dispatch — no per-task allocation. Slots are

@@ -44,6 +44,8 @@ void attention_flash_impl(const AttentionConfig& cfg,
     const bool split = has_past_view(cfg, inputs);
     const auto& Kp = split ? inputs[past_slot(cfg)] : K;
     const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
+    const int32_t* seqlens = has_seqlens_input(cfg, inputs)
+        ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
@@ -91,6 +93,8 @@ void attention_flash_impl(const AttentionConfig& cfg,
         const int64_t hkv = h / (H / Hkv);
         const int64_t i0 = qi * Br;
         const int actual_br = static_cast<int>(std::min<int64_t>(Br, Sq - i0));
+        // The batch's valid key run: its prefix of the [past | new] rows.
+        const int64_t run_len = run_length(seqlens, b, Sk);
 
         const T* q_head;
         const T* k_head;
@@ -148,8 +152,8 @@ void attention_flash_impl(const AttentionConfig& cfg,
         // nothing — for a causal prefill that is the whole upper triangle, and
         // skipping it halves the QK and AV work.
         const int64_t kv_end = cfg.causal
-            ? causal_limit(cfg, i0 + actual_br - 1, Sq, Sk)
-            : Sk;
+            ? causal_limit(cfg, i0 + actual_br - 1, Sq, run_len)
+            : run_len;
 
         // o_acc is written by the first KV block (zero_mode) — no pre-zeroing
         // pass. The exp_diff rescale may touch it first on the first block;
@@ -191,7 +195,7 @@ void attention_flash_impl(const AttentionConfig& cfg,
             // row's valid prefix, then fill the out-of-range tail with -inf.
             if (mask_ptr || cfg.causal) {
                 for (int i = 0; i < actual_br; ++i) {
-                    const int64_t lim = causal_limit(cfg, i0 + i, Sq, Sk);
+                    const int64_t lim = causal_limit(cfg, i0 + i, Sq, run_len);
                     int64_t n = lim - j0;
                     if (n < 0) { n = 0; }
                     if (n > actual_bc) { n = actual_bc; }

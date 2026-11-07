@@ -21,6 +21,13 @@
 /// row's causal range, j <= position_offset + i. Unset (-1) means bottom-right,
 /// Sk - Sq; set it for a chunk that is not the tail of the run.
 ///
+/// inputs[6] is an optional int32 [B] `seqlens_k`: each batch's valid key-run
+/// length, so the run is the prefix [0, seqlens_k[b]) — right padding is
+/// truncated and batches may sit at different positions. Causal masking then
+/// takes the per-batch bottom-right q0 = seqlens_k[b] - Sq unless
+/// position_offset (a scalar for every batch) is given. Absent, every batch
+/// runs to the full Sk.
+///
 /// Grouped-query attention — several query heads per key/value head — is
 /// GroupQueryAttention, and the absorbed DeepSeek-style latent form is
 /// MultiLatentAttention; this operator is the H == Hkv case and does not

@@ -30,11 +30,14 @@
 /// group under grouped-query attention, and H_kv == H is ordinary MHA.
 ///
 /// Causal masking: query row i sees key positions j <= q0 + i, where q0 is the
-/// absolute position of row 0. Without an explicit offset q0 = Sk - Sq, the
+/// absolute position of row 0. Without an explicit offset q0 = run - Sq, the
 /// bottom-right alignment — the Sq query rows are the last Sq positions of the
 /// key run — which is the KV-cache decode convention and degenerates to
-/// j <= i when Sq == Sk. An explicit q0 (cfg.position_offset) decodes a chunk
-/// that is not the tail of the run.
+/// j <= i when Sq == run. An explicit q0 (cfg.position_offset) decodes a chunk
+/// that is not the tail of the run. The run is the whole [past | new] tensor
+/// unless a per-batch seqlens_k vector shortens it (see below), in which case
+/// both the causal diagonal and the non-causal range are clamped to the batch's
+/// prefix.
 ///
 /// Chunked input: the key run may arrive as two segments, an optional past
 /// tensor followed by the step's new K/V. The kernels address the run by
@@ -65,9 +68,11 @@
 /// [Sq, Sk_total] over the whole run; its index carries no batch or head.
 ///
 /// Input slots are positional and an omitted optional input is an empty view:
-/// Q, K, V, [mask], [past K], [past V] — or Q, KV, [mask], [past KV] when
-/// v_is_k. The past tensors carry the same layout as their new counterpart,
-/// with Sk_past rows instead of Sk_new; the run is [past | new].
+/// Q, K, V, [mask], [past K], [past V], [seqlens_k] — or Q, KV, [mask],
+/// [past KV], [seqlens_k] when v_is_k. The past tensors carry the same layout
+/// as their new counterpart, with Sk_past rows instead of Sk_new; the run is
+/// [past | new]. seqlens_k is an int32 [B] vector of per-batch valid key-run
+/// lengths (the run's prefix), read by every route through run_length.
 ///
 /// Implementation is one file per route (attention_standard.cpp,
 /// attention_flash.cpp, attention_decode.cpp) over the shared machinery in
@@ -92,7 +97,7 @@ struct AttentionConfig {
     bool    causal = false;    ///< causal mask over the run
     bool    v_is_k = false;    ///< value = leading v_head_dim of the key row
     /// Absolute position of query row 0; negative (the default) means
-    /// bottom-right, q0 = Sk - Sq. Only consulted when causal.
+    /// bottom-right, q0 = run - Sq. Only consulted when causal.
     int64_t position_offset = -1;
 
     int64_t kv_heads() const noexcept {

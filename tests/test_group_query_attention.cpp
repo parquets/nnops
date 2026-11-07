@@ -64,6 +64,7 @@ struct Case {
     int64_t past = 0;              // rows in the past K/V segment
     int64_t position_offset = -1;  // absolute position of query row 0
     int route = -1;                // 0 standard, 1 flash, 2 decode; -1 unchecked
+    std::vector<int32_t> seqlens;  // per-batch key-run lengths; empty = absent
 };
 
 /// @p past_shape with the sequence dim replaced by @p past.
@@ -150,12 +151,22 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
 
     auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
+    // Per-batch run lengths, positional slot 6: an int32 [B] vector.
+    std::vector<int32_t> sl_vec(c.seqlens);
+    std::vector<int64_t> sl_shape;
+    TensorView sl_view;
+    if (!sl_vec.empty()) {
+        sl_shape.push_back(static_cast<int64_t>(sl_vec.size()));
+        sl_view = TensorView(sl_shape, DataType::s32, sl_vec.data());
+    }
+
+    const bool has_seqlens = !sl_vec.empty();
     std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
     std::vector<TensorView> ins   = {q, k, v};
     if (c.mask) {
         descs.push_back(mask.desc());
         ins.push_back(mask);
-    } else if (c.past > 0) {
+    } else if (c.past > 0 || has_seqlens) {
         // The optional slots are positional: an empty view marks the absent mask.
         descs.push_back(TensorDesc{});
         ins.push_back(TensorView{});
@@ -165,6 +176,16 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
         ins.push_back(past_k);
         descs.push_back(past_v.desc());
         ins.push_back(past_v);
+    } else if (has_seqlens) {
+        // seqlens sits after the past pair, so its slots must exist too.
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+    }
+    if (has_seqlens) {
+        descs.push_back(sl_view.desc());
+        ins.push_back(sl_view);
     }
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
@@ -423,6 +444,124 @@ NNOPS_TEST(gqa_step_matches_ref) {
     for (const auto& c : cases) {
         bool flash = false;
         NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
+    }
+}
+
+// ============================================================
+// Per-batch key-run lengths (seqlens_k)
+// ============================================================
+
+NNOPS_TEST(gqa_seqlens_matches_ref) {
+    // Each batch reads the prefix [0, seqlens_k[b]): a shorter entry drops the
+    // right padding and moves that batch's bottom-right causal diagonal, so
+    // batches at different positions share one call.
+    const Case cases[] = {
+        // Standard route, causal, two batches at different positions.
+        {{2, 6, 4 * 8}, {2, 9, 1 * 8}, 4, 1, 0.0f, true,  false, 0, -1, 0, {9, 5}},
+        // Non-causal: the valid range is the run prefix and nothing else.
+        {{2, 5, 4 * 8}, {2, 9, 2 * 8}, 4, 2, 0.0f, false, false, 0, -1, 0, {9, 3}},
+        // A batch with an empty run: every key masked, its rows are zeros.
+        {{2, 4, 4 * 8}, {2, 7, 2 * 8}, 4, 2, 0.0f, true,  false, 0, -1, 0, {7, 0}},
+        // Explicit [B, H, S, D] layout.
+        {{2, 4, 3, 8},  {2, 2, 5, 8},  4, 2, 0.0f, true,  false, 0, -1, 0, {5, 2}},
+        // With a past: seqlens counts the whole [past | new] run (a split run
+        // routes through flash).
+        {{2, 5, 4 * 8}, {2, 5, 2 * 8}, 4, 2, 0.0f, true,  false, 3, -1, 1, {8, 4}},
+        // Mask + seqlens: the mask stays one flat [Sq, Sk] for all batches.
+        {{2, 5, 4 * 8}, {2, 9, 1 * 8}, 4, 1, 0.0f, true,  true,  0, -1, 0, {9, 6}},
+        // Decode: Sq == 1, a per-batch limit inside one GEMV run.
+        {{2, 1, 8 * 8}, {2, 12, 1 * 8}, 8, 1, 0.0f, true, false, 0, -1, 2, {12, 5}},
+        // Decode with the run inside a past and one batch empty.
+        {{2, 1, 4 * 8}, {2, 1, 1 * 8},  4, 1, 0.0f, true, false, 20, -1, 2, {21, 0}},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
+        (void)flash;
+    }
+}
+
+NNOPS_TEST(gqa_seqlens_flash_matches_ref) {
+    // The flash route bounds its KV stream by the batch's run: the causal tile
+    // skip and the row limit both use it.
+    const Case cases[] = {
+        {{2, 256, 4 * 64}, {2, 256, 2 * 64}, 4, 2, 0.0f, true,  false, 0, -1, 1, {256, 200}},
+        // Non-causal flash: the run prefix is the whole valid range.
+        {{1, 256, 2 * 128}, {1, 256, 1 * 128}, 2, 1, 0.0f, false, false, 0, -1, 1, {180}},
+        // Split [past | new] run, one batch short of its tensor.
+        {{2, 512, 4 * 64}, {2, 64, 2 * 64}, 4, 2, 0.0f, true, false, 100, -1, 1, {164, 120}},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        const bool ok = gqa_fast_vs_ref(c, flash);
+        NNOPS_EXPECT_TRUE(flash);
+        NNOPS_EXPECT_TRUE(ok);
+    }
+}
+
+NNOPS_TEST(gqa_seqlens_decode_split_matches_ref) {
+    // Variable-length decode down the sliced route: each batch computes its own
+    // limit inside the task, and the merge sees per-slice states that may be
+    // empty on one side.
+    SimplePool pool(8);
+    const Case cases[] = {
+        {{2, 1, 8 * 32}, {2, 1, 2 * 32}, 8, 2, 0.0f, true, false, 1000, -1, 2, {1001, 700}},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash, &plan, &pool.cpu));
+        NNOPS_EXPECT_TRUE(plan.use_decode);
+        NNOPS_EXPECT_TRUE(plan.decode_splits > 1);
+    }
+}
+
+NNOPS_TEST(gqa_seqlens_validation) {
+    // Q, K, V + mask + past K/V + seqlens_k: the vector must be int32, rank 1
+    // and one entry per batch.
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = 4;
+    attrs.kv_num_heads = 2;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    const TensorDesc q = td({2, 5, 4 * 8});
+    const TensorDesc k = td({2, 9, 2 * 8});
+    const TensorDesc v = td({2, 9, 2 * 8});
+    const TensorDesc out = td({2, 5, 4 * 8});
+    TensorDesc sl;
+    sl.rank = 1;
+    sl.dims = {2};
+    sl.dtype = DataType::s32;
+
+    {
+        const TensorDesc ins[] = {q, k, v, TensorDesc{}, TensorDesc{}, TensorDesc{}, sl};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+    }
+    {
+        TensorDesc wrong_dtype = sl;
+        wrong_dtype.dtype = DataType::f32;
+        const TensorDesc ins[] = {q, k, v, TensorDesc{}, TensorDesc{}, TensorDesc{}, wrong_dtype};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        TensorDesc wrong_rank = sl;
+        wrong_rank.rank = 2;
+        wrong_rank.dims = {2, 1};
+        const TensorDesc ins[] = {q, k, v, TensorDesc{}, TensorDesc{}, TensorDesc{}, wrong_rank};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        TensorDesc wrong_len = sl;
+        wrong_len.dims = {3};
+        const TensorDesc ins[] = {q, k, v, TensorDesc{}, TensorDesc{}, TensorDesc{}, wrong_len};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
     }
 }
 

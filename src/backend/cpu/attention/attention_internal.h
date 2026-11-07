@@ -125,6 +125,31 @@ inline bool has_mask_input(const AttentionConfig& cfg, std::span<const TensorVie
     return inputs.size() > m && !inputs[m].is_empty();
 }
 
+// ---- per-batch key-run length (seqlens_k) --------------------------------
+
+/// The optional per-batch run length, the last positional slot: Q, K, V,
+/// [mask], [past K], [past V], [seqlens_k] — or Q, KV, [mask], [past KV],
+/// [seqlens_k] when v_is_k. An int32 [B] tensor whose entry is the number of
+/// valid keys in the whole [past | new] run for that batch; the valid keys are
+/// that prefix, so right padding is truncated and each batch may sit at its own
+/// position. Absent, every batch runs to the tensor's Sk.
+inline size_t seqlens_slot(const AttentionConfig& cfg) { return cfg.v_is_k ? 4u : 6u; }
+
+inline bool has_seqlens_input(const AttentionConfig& cfg, std::span<const TensorView> inputs)
+{
+    const size_t s = seqlens_slot(cfg);
+    return inputs.size() > s && !inputs[s].is_empty();
+}
+
+/// Batch @p b's valid key-run length, clamped to the tensor's run.
+inline int64_t run_length(const int32_t* seqlens, int64_t b, int64_t Sk)
+{
+    if (seqlens == nullptr) { return Sk; }
+    const int64_t v = seqlens[b];
+    if (v <= 0) { return 0; }
+    return v < Sk ? v : Sk;
+}
+
 // ---- scratch slots -------------------------------------------------------
 //
 // A slot holds one task's scratch. How many are needed depends on the backend:
@@ -147,19 +172,21 @@ inline int64_t scratch_slot_of(const CpuBackend& cpu, int64_t tasks, int64_t idx
     return cpu.worker_count() <= 1 ? 0 : idx;
 }
 
-// ---- causal row limit ----------------------------------------------------
+// ---- row limit -----------------------------------------------------------
 
-/// Exclusive end of query row @p i's valid key range under the config: Sk when
-/// not causal, else q0 + i + 1 with q0 the row-0 position — cfg.position_offset
-/// when given, bottom-right (Sk - Sq) otherwise. @p Sk is the whole run.
+/// Exclusive end of query row @p i's valid key range: the batch's whole run
+/// when not causal, else q0 + i + 1 with q0 the row-0 position —
+/// cfg.position_offset when given, bottom-right (run - Sq) otherwise. @p run is
+/// the batch's valid key-run length (run_length), so a shorter run truncates
+/// both the padding and the causal diagonal.
 inline int64_t causal_limit(const AttentionConfig& cfg, int64_t i,
-                            int64_t Sq, int64_t Sk)
+                            int64_t Sq, int64_t run)
 {
-    if (!cfg.causal) { return Sk; }
-    const int64_t q0 = cfg.position_offset >= 0 ? cfg.position_offset : (Sk - Sq);
+    if (!cfg.causal) { return run; }
+    const int64_t q0 = cfg.position_offset >= 0 ? cfg.position_offset : (run - Sq);
     const int64_t lim = q0 + i + 1;
     if (lim < 0) { return 0; }
-    return lim > Sk ? Sk : lim;
+    return lim > run ? run : lim;
 }
 
 template <class T>

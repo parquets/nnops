@@ -61,6 +61,7 @@ struct Case {
     int64_t past = 0;              // latent rows in the past segment
     int64_t position_offset = -1;  // absolute position of query row 0
     int route = -1;                // 0 standard, 1 flash, 2 decode; -1 unchecked
+    std::vector<int32_t> seqlens;  // per-batch key-run lengths; empty = absent
 };
 
 MultiLatentAttentionAttributes attrs_of(const Case& c)
@@ -106,12 +107,21 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     const auto attrs = attrs_of(c);
     auto op = MultiLatentAttention::create(attrs, Backend::CPU);
 
+    std::vector<int32_t> sl_vec(c.seqlens);
+    std::vector<int64_t> sl_shape;
+    TensorView sl_view;
+    if (!sl_vec.empty()) {
+        sl_shape.push_back(static_cast<int64_t>(sl_vec.size()));
+        sl_view = TensorView(sl_shape, DataType::s32, sl_vec.data());
+    }
+
+    const bool has_seqlens = !sl_vec.empty();
     std::vector<TensorDesc> descs = {q.desc(), kv.desc()};
     std::vector<TensorView> ins   = {q, kv};
     if (c.mask) {
         descs.push_back(mask.desc());
         ins.push_back(mask);
-    } else if (c.past > 0) {
+    } else if (c.past > 0 || has_seqlens) {
         // The optional slots are positional: an empty view marks the absent mask.
         descs.push_back(TensorDesc{});
         ins.push_back(TensorView{});
@@ -119,6 +129,14 @@ bool mla_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     if (c.past > 0) {
         descs.push_back(past_kv.desc());
         ins.push_back(past_kv);
+    } else if (has_seqlens) {
+        // seqlens sits after the past KV slot, so that slot must exist too.
+        descs.push_back(TensorDesc{});
+        ins.push_back(TensorView{});
+    }
+    if (has_seqlens) {
+        descs.push_back(sl_view.desc());
+        ins.push_back(sl_view);
     }
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
@@ -332,6 +350,31 @@ NNOPS_TEST(mla_step_matches_ref) {
         {{1, 4, 4 * 24}, {1, 40, 1 * 24}, 4, 1, 16, 8, 32, 0,  0.0f, true, true,  0,  7,  0},
         // Masked step after a past: the mask spans the whole run.
         {{1, 1, 4 * 24}, {1, 1, 1 * 24},  4, 1, 16, 8, 32, 0,  0.0f, true, true,  13, 13, 1},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(mla_fast_vs_ref(c, flash));
+    }
+}
+
+NNOPS_TEST(mla_seqlens_matches_ref) {
+    // Per-batch latent-run lengths: each batch reads its prefix and its own
+    // bottom-right causal diagonal, with the value width unchanged.
+    const Case cases[] = {
+        // Causal, two batches at different positions.
+        {{2, 5, 4 * 24}, {2, 9, 1 * 24}, 4, 1, 16, 8, 32, 0,
+         0.0f, true,  false, 0, -1, 0, {9, 4}},
+        // Non-causal: the prefix alone bounds the valid range.
+        {{2, 4, 2 * 24}, {2, 7, 2 * 24}, 2, 2, 16, 8, 32, 0,
+         0.0f, false, false, 0, -1, 0, {7, 2}},
+        // Past + seqlens (a split run routes through flash), a narrow value
+        // width, and one empty batch (zeros).
+        {{2, 3, 4 * 24}, {2, 5, 1 * 24}, 4, 1, 16, 8, 32, 8,
+         0.0f, true,  false, 6, -1, 1, {11, 0}},
+        // Decode: a per-batch limit inside the GEMV route.
+        {{2, 1, 4 * 24}, {2, 12, 1 * 24}, 4, 1, 16, 8, 32, 0,
+         0.0f, true,  false, 0, -1, 2, {12, 5}},
     };
 
     for (const auto& c : cases) {

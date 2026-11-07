@@ -85,6 +85,8 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const bool split = has_past_view(cfg, inputs);
     const auto& Kp = split ? inputs[past_slot(cfg)] : K;
     const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
+    const int32_t* seqlens = has_seqlens_input(cfg, inputs)
+        ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     const int64_t B = hs.B, H = hs.H, Hkv = hs.Hkv;
@@ -124,10 +126,6 @@ void attention_decode_impl(const AttentionConfig& cfg,
     float* ws = static_cast<float*>(workspace);
     float* partials = ws + plan.num_slots * per_slot;
 
-    // Bottom-right alignment makes the limit Sk — the row attends to every
-    // cached key; an explicit position_offset can cut it shorter.
-    const int64_t n_valid = causal_limit(cfg, 0, Sq, Sk);
-
     constexpr int64_t lanes = simd::simd_default_lane_f32;
 
     const auto run = [&](int64_t idx) {
@@ -142,6 +140,10 @@ void attention_decode_impl(const AttentionConfig& cfg,
         const int64_t h0   = hkv * G + c * hb;
         const int64_t nh   = std::min(hb, G - c * hb);
 
+        // The batch's valid key run and this row's limit over it: bottom-right
+        // alignment reads every valid key, a shorter run or an explicit
+        // position_offset cuts it shorter.
+        const int64_t n_valid = causal_limit(cfg, 0, Sq, run_length(seqlens, b, Sk));
         const int64_t lo = (n_valid * si) / splits;
         const int64_t hi = (n_valid * (si + 1)) / splits;
 

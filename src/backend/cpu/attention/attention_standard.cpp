@@ -34,6 +34,8 @@ void attention_standard_impl(const AttentionConfig& cfg,
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
     const bool has_mask = has_mask_input(cfg, inputs);
+    const int32_t* seqlens = has_seqlens_input(cfg, inputs)
+        ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
 
     const HeadShape hs = resolve_head_shape(cfg, inputs);
     NNOPS_ASSERT(hs.Sk_past == 0);   // the plan sends a split run to flash
@@ -105,6 +107,9 @@ void attention_standard_impl(const AttentionConfig& cfg,
         T* scores = ws_base + slot * per_head;
         T* pack_b = scores + scores_elems;
 
+        // The batch's valid key run: its prefix of the [past | new] rows.
+        const int64_t run = run_length(seqlens, b, Sk);
+
         // ---- GEMM1: scores = Q @ K^T * scale --------------------------
         // k0 == 0 runs zero_mode (overwrite) — no pre-zeroing pass.
         for (int64_t k0 = 0; k0 < Dqk; k0 += kc) {
@@ -136,7 +141,7 @@ void attention_standard_impl(const AttentionConfig& cfg,
         // nothing from it.
         for (int64_t i = 0; i < Sq; ++i) {
             T* row = scores + i * Sk;
-            const int64_t n = causal_limit(cfg, i, Sq, Sk);
+            const int64_t n = causal_limit(cfg, i, Sq, run);
             if (n == 0) {
                 row_fill(row, Sk, 0.0f);
                 continue;

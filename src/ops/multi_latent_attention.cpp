@@ -64,8 +64,8 @@ size_t MultiLatentAttention::getWorkspaceSize(std::span<const TensorDesc> inputs
 Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
                                       std::span<const TensorDesc> outputs) const
 {
-    // Q, KV [, mask [, past KV]]
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 4, 1));
+    // Q, KV [, mask [, past KV [, seqlens_k]]]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 5, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
@@ -77,16 +77,22 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
     if (inputs[1].dtype != dt || outputs[0].dtype != dt) {
         return Status::invalid_argument;
     }
+    // Slot 4 is the int32 [B] run-length vector, not an activation.
+    constexpr size_t kSeqlensSlot = 4;
     for (size_t i = 2; i < inputs.size(); ++i) {
-        if (inputs[i].rank != 0 && inputs[i].dtype != dt) {
-            return Status::invalid_argument;
-        }
+        if (i == kSeqlensSlot || inputs[i].rank == 0) { continue; }
+        if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
-
     const auto& q = inputs[0];
     const auto& kv = inputs[1];
     if (q.rank != 3 && q.rank != 4) { return Status::invalid_argument; }
     if (kv.rank != q.rank) { return Status::invalid_argument; }
+    if (inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0) {
+        const auto& s = inputs[kSeqlensSlot];
+        if (s.dtype != DataType::s32 || s.rank != 1 || s.dims[0] != q.dims[0]) {
+            return Status::invalid_argument;
+        }
+    }
 
     const int64_t h = attrs_.num_heads;
     const int64_t hkv = kv_heads_of(attrs_);
@@ -132,7 +138,8 @@ Status MultiLatentAttention::validate(std::span<const TensorDesc> inputs,
     }
 
     // Optional trailing segment: [3] past KV — the same layout as KV, with
-    // Sk_past latent rows.
+    // Sk_past latent rows. [4] is the int32 [B] per-batch run length
+    // (seqlens_k), checked above.
     const int64_t seq_dim = (q.rank == 3) ? 1 : 2;
     int64_t sk_past = 0;
     if (inputs.size() > 3 && inputs[3].rank != 0) {
@@ -167,7 +174,7 @@ Status MultiLatentAttention::compute(std::span<TensorView> outputs,
                                      const ComputeContext& ctx,
                                      void* workspace)
 {
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 4, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 5, 1));
     for (size_t i = 0; i < 2; ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }

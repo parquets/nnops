@@ -13,6 +13,8 @@
 ///   [1] K [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
 ///   [2] V [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
 ///   [3] optional additive mask, flat [Sq, Sk], shared by every batch and head.
+///   [4] optional past K, [5] optional past V — same layout as K/V, past rows.
+///   [6] optional per-batch key-run length, int32 [B] (see below).
 /// The output follows Q's shape. scale = 0 means 1/sqrt(D).
 ///
 /// `causal` (default true, as in onnxruntime's GroupQueryAttention) masks query
@@ -33,6 +35,14 @@
 /// `position_offset` is what makes a non-tail chunk decodable: it is the
 /// absolute position of query row 0, and each row sees j <= position_offset + i
 /// regardless of where the chunk sits in the run.
+///
+/// `seqlens_k` (inputs[6], ORT's name) is the per-batch counterpart: an int32
+/// [B] vector whose entry is the number of valid keys in batch b's whole run —
+/// the run's prefix [0, seqlens_k[b]), so right padding is truncated and every
+/// batch may sit at its own position. Causal masking then takes the per-batch
+/// bottom-right q0 = seqlens_k[b] - Sq unless position_offset is given (a
+/// scalar, so it applies to every batch). Absent, each batch runs to the full
+/// Sk. The mask, if any, remains a single flat [Sq, Sk] shared by all batches.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"

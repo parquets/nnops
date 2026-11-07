@@ -43,8 +43,8 @@ size_t GroupQueryAttention::getWorkspaceSize(std::span<const TensorDesc> inputs,
 Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
                                      std::span<const TensorDesc> outputs) const
 {
-    // Q, K, V [, mask [, past K, past V]]
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 6, 1));
+    // Q, K, V [, mask [, past K, past V [, seqlens_k]]]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 7, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
@@ -57,17 +57,23 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
         if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
     if (outputs[0].dtype != dt) { return Status::invalid_argument; }
+    // Slot 6 is the int32 [B] run-length vector, not an activation.
+    constexpr size_t kSeqlensSlot = 6;
     for (size_t i = 3; i < inputs.size(); ++i) {
-        if (inputs[i].rank != 0 && inputs[i].dtype != dt) {
-            return Status::invalid_argument;
-        }
+        if (i == kSeqlensSlot || inputs[i].rank == 0) { continue; }
+        if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
-
     const auto& q = inputs[0];
     const auto& k = inputs[1];
     const auto& v = inputs[2];
     if (q.rank != 3 && q.rank != 4) { return Status::invalid_argument; }
     if (k.rank != q.rank || v.rank != q.rank) { return Status::invalid_argument; }
+    if (inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0) {
+        const auto& s = inputs[kSeqlensSlot];
+        if (s.dtype != DataType::s32 || s.rank != 1 || s.dims[0] != q.dims[0]) {
+            return Status::invalid_argument;
+        }
+    }
 
     const int64_t h = attrs_.num_heads;
     const int64_t hkv = kv_heads_of(attrs_);
@@ -102,7 +108,8 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
     if (sq <= 0 || sk <= 0) { return Status::invalid_argument; }
 
     // Optional trailing segments: [4] past K, [5] past V, same layout as their
-    // new counterpart with Sk_past rows. Both or neither.
+    // new counterpart with Sk_past rows. Both or neither. [6] is the int32 [B]
+    // per-batch run length (seqlens_k), checked above.
     const int64_t seq_dim = (q.rank == 3) ? 1 : 2;
     const bool has_past_k = inputs.size() > 4 && inputs[4].rank != 0;
     const bool has_past_v = inputs.size() > 5 && inputs[5].rank != 0;
@@ -146,7 +153,7 @@ Status GroupQueryAttention::compute(std::span<TensorView> outputs,
                                     const ComputeContext& ctx,
                                     void* workspace)
 {
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 6, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 7, 1));
     for (size_t i = 0; i < 3; ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }
