@@ -184,6 +184,40 @@ NNOPS_TEST(cuda_matmul_f16_wide_tile) {
     }
 }
 
+NNOPS_TEST(cuda_matmul_splitk) {
+    // Grids one or two tiles deep against a long reduction: the launcher cuts k
+    // and reduces the planes, so these are the shapes that reach that pass.
+    // The M and N tails matter here as much as anywhere — each split writes only
+    // its in-bounds tile — and both dtypes take the cut.
+    const int64_t shapes[][2] = {{1, 512}, {16, 256}, {33, 17}, {65, 130}};
+    for (const auto& s : shapes) {
+        for (DataType dt : {DataType::f32, DataType::f16}) {
+            MatmulCase c;
+            c.dtype = dt;
+            c.a_shape = {s[0], 2048};
+            c.b_shape = {2048, s[1]};
+            run_case(c, "cuda_matmul_splitk");
+        }
+    }
+
+    // The epilogue runs in the reduce pass on the summed planes, with beta
+    // reading the destination there rather than in the split blocks.
+    MatmulCase c;
+    c.a_shape = {8, 4096};
+    c.b_shape = {4096, 128};
+    c.beta = 0.5f;
+    c.use_bias = true;
+    c.epilogue.type = EpilogueActivateType::Relu;
+    run_case(c, "cuda_matmul_splitk_epilogue");
+
+    // The batch axis multiplies the grid while the split axis rides on it:
+    // blockIdx.z carries batch·splits + split, so this pins that arithmetic.
+    MatmulCase b;
+    b.a_shape = {2, 8, 2048};
+    b.b_shape = {2, 2048, 128};
+    run_case(b, "cuda_matmul_splitk_batched");
+}
+
 NNOPS_TEST(cuda_matmul_transposes) {
     // A is [M,K] or the transposed [K,M]; B is [K,N] or the transposed [N,K].
     for (int flags = 0; flags < 4; ++flags) {

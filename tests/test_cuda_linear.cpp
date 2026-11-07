@@ -150,6 +150,30 @@ NNOPS_TEST(cuda_linear_add_to) {
     run_case(d, "cuda_linear_add_to");
 }
 
+NNOPS_TEST(cuda_linear_splitk_residual) {
+    // A small M against a long K is what the split-K launcher cuts, and add_to
+    // is the term the reduce pass has to apply itself: the residual is added
+    // after the activation, once, on the summed planes.
+    Epilogue ep;
+    ep.type = EpilogueActivateType::Gelu;
+
+    LinearCase c;
+    c.x_shape = {8, 4096};
+    c.n = 256;
+    c.use_bias = true;
+    c.add_to = true;
+    c.epilogue = ep;
+    run_case(c, "cuda_linear_splitk_residual");
+
+    LinearCase f;
+    f.x_shape = {1, 2048};
+    f.n = 128;
+    f.dtype = DataType::f16;
+    f.add_to = true;
+    f.epilogue = ep;
+    run_case(f, "cuda_linear_splitk_residual");
+}
+
 NNOPS_TEST(cuda_linear_dense_strides) {
     LinearCase c;
     c.x_shape = {37, 65};

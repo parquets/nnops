@@ -24,6 +24,20 @@
 /// Batching is numpy-style broadcast over up to four leading dimensions, each
 /// carried as a (size, stride) pair and with stride 0 meaning broadcast;
 /// blockIdx.z walks the flattened batch and the offsets are resolved in-kernel.
+///
+/// Split-K. A grid shallower than the tile wants — the decode-shaped products,
+/// where M fits one tile and N is a few dozen — leaves most of the machine idle,
+/// because there is no third axis left to cut. The launcher then cuts the
+/// reduction instead: blockIdx.z carries batch·k_splits + split, each block owns
+/// a proportional range of the k tiles, and it writes its f32 accumulator tile
+/// to a scratch plane instead of running the epilogue. A second kernel sums the
+/// planes and applies the epilogue once, so alpha, bias, beta·C, the clamp, the
+/// activation and the residual keep their single-pass order. Only the narrow
+/// tiles split — the wide-tile gates already require a grid that fills the
+/// machine — and the scratch is stream-ordered from a private, retained memory
+/// pool (the default pool releases on every free, which measured at 1.45 ms a
+/// pair on WDDM). NNOPS_CUDA_SPLITK forces or disables it for a bench; unset
+/// means the heuristic.
 
 #pragma once
 
@@ -31,7 +45,9 @@
 #include <nnops/core/epilogue.hpp>
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 namespace nnops::backend::cuda {
@@ -59,6 +75,15 @@ struct GemmParams {
     float max_clip = std::numeric_limits<float>::infinity();
 
     bool bias_row = false;
+
+    // ---- split-K ----------------------------------------------------------
+    // `k_splits` cuts the reduction into that many ranges, one per blockIdx.z
+    // slice (z = batch · k_splits + split); each block writes its f32
+    // accumulator tile to `partial` instead of running the epilogue, and a
+    // second kernel sums the planes and applies the epilogue once. 1 means the
+    // plain single-pass kernel and `partial` unused.
+    int k_splits = 1;
+    float* partial = nullptr;  ///< [batch][split][m][n], row-major
 
     int batch_rank = 0;
     int64_t batch_size[4] = {1, 1, 1, 1};
@@ -142,10 +167,24 @@ constexpr auto gemm_smem_layout(BM bm, BK bk, P p)
     }
 }
 
-__device__ inline int64_t gemm_batch_offset(const GemmParams& p,
-                                            const int64_t* strides)
+/// The batch index a block owns. Without split-K it is blockIdx.z; with it,
+/// blockIdx.z carries batch · k_splits + split, split varying fastest so the
+/// slices of one matrix land on different waves of the scheduler.
+__device__ inline int gemm_block_batch(const GemmParams& p)
 {
-    int64_t idx = blockIdx.z;
+    const int z = int(blockIdx.z);
+    return p.k_splits > 1 ? z / p.k_splits : z;
+}
+
+__device__ inline int gemm_block_split(const GemmParams& p)
+{
+    return p.k_splits > 1 ? int(blockIdx.z) % p.k_splits : 0;
+}
+
+__device__ inline int64_t gemm_batch_offset(const GemmParams& p,
+                                            const int64_t* strides,
+                                            int64_t idx)
+{
     int64_t off = 0;
     for (int d = 0; d < p.batch_rank; ++d) {
         const int64_t i = idx % p.batch_size[d];
@@ -153,6 +192,23 @@ __device__ inline int64_t gemm_batch_offset(const GemmParams& p,
         off += i * strides[d];
     }
     return off;
+}
+
+/// The k-tile range a split owns, as [begin, begin + count). The bounds are
+/// proportional cuts of the tile count, so with `k_splits <= k_tiles` every
+/// split is non-empty and the ranges differ by at most one tile.
+__device__ inline void gemm_split_range(const GemmParams& p, int bK, int split,
+                                        int& kt_begin, int& kt_count)
+{
+    const int k_tiles = (p.k + bK - 1) / bK;
+    if (p.k_splits <= 1) {
+        kt_begin = 0;
+        kt_count = k_tiles;
+        return;
+    }
+    const int64_t tiles = k_tiles;
+    kt_begin = int(tiles * split / p.k_splits);
+    kt_count = int(tiles * (split + 1) / p.k_splits) - kt_begin;
 }
 
 }  // namespace detail
@@ -270,12 +326,18 @@ void dense_gemm_h_kernel(GemmParams p)
     const int m0 = tile_m * bM;
     const int n0 = tile_n * bN;
 
-    In const* A = static_cast<In const*>(p.a) + detail::gemm_batch_offset(p, p.a_batch);
-    In const* B = static_cast<In const*>(p.b) + detail::gemm_batch_offset(p, p.b_batch);
+    const int batch = detail::gemm_block_batch(p);
+    const int split = detail::gemm_block_split(p);
+
+    In const* A = static_cast<In const*>(p.a) +
+                  detail::gemm_batch_offset(p, p.a_batch, batch);
+    In const* B = static_cast<In const*>(p.b) +
+                  detail::gemm_batch_offset(p, p.b_batch, batch);
     In const* bias = static_cast<In const*>(p.bias);
-    Out* C = static_cast<Out*>(p.c) + detail::gemm_batch_offset(p, p.c_batch);
+    Out* C = static_cast<Out*>(p.c) +
+             detail::gemm_batch_offset(p, p.c_batch, batch);
     Out const* residual = static_cast<Out const*>(p.residual) +
-                          detail::gemm_batch_offset(p, p.r_batch);
+                          detail::gemm_batch_offset(p, p.r_batch, batch);
 
     Tensor mA = [&] {
         if constexpr (TransA) {
@@ -376,8 +438,9 @@ void dense_gemm_h_kernel(GemmParams p)
         fill_b(kt, stage);
     };
 
-    int k_tile_count = (K + bK - 1) / bK;
+    int k_tile_count = 0;
     int k_tile_next = 0;
+    detail::gemm_split_range(p, bK, split, k_tile_next, k_tile_count);
 
     CUTE_UNROLL
     for (int pipe = 0; pipe < kStages - 1; ++pipe) {
@@ -469,12 +532,24 @@ void dense_gemm_h_kernel(GemmParams p)
     Tensor tCcC = thr_mma.partition_C(
         local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{}));
 
+    // A split's block stops at its accumulator: the sum, the bias and the
+    // activation all belong to the reduce kernel, which sees every plane.
+    float* part = nullptr;
+    if (p.k_splits > 1) {
+        const int64_t plane = static_cast<int64_t>(M) * N;
+        part = p.partial + (static_cast<int64_t>(batch) * p.k_splits + split) * plane;
+    }
+
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC); ++i) {
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
         if (m >= M || n >= N) { continue; }
+        if (part != nullptr) {
+            part[static_cast<int64_t>(m) * N + n] = float(tCrC(i));
+            continue;
+        }
 
         float v = p.alpha * float(tCrC(i));
         if (bias != nullptr) {
@@ -548,12 +623,18 @@ void dense_gemm_f_kernel(GemmParams p)
     const int m0 = int(blockIdx.x) * bM;
     const int n0 = int(blockIdx.y) * bN;
 
-    Elem const* A = static_cast<Elem const*>(p.a) + detail::gemm_batch_offset(p, p.a_batch);
-    Elem const* B = static_cast<Elem const*>(p.b) + detail::gemm_batch_offset(p, p.b_batch);
+    const int batch = detail::gemm_block_batch(p);
+    const int split = detail::gemm_block_split(p);
+
+    Elem const* A = static_cast<Elem const*>(p.a) +
+                    detail::gemm_batch_offset(p, p.a_batch, batch);
+    Elem const* B = static_cast<Elem const*>(p.b) +
+                    detail::gemm_batch_offset(p, p.b_batch, batch);
     Elem const* bias = static_cast<Elem const*>(p.bias);
-    Elem* C = static_cast<Elem*>(p.c) + detail::gemm_batch_offset(p, p.c_batch);
+    Elem* C = static_cast<Elem*>(p.c) +
+              detail::gemm_batch_offset(p, p.c_batch, batch);
     Elem const* residual = static_cast<Elem const*>(p.residual) +
-                           detail::gemm_batch_offset(p, p.r_batch);
+                           detail::gemm_batch_offset(p, p.r_batch, batch);
 
     Tensor mA = [&] {
         if constexpr (TransA) {
@@ -755,8 +836,9 @@ void dense_gemm_f_kernel(GemmParams p)
         fill_b(kt, stage);
     };
 
-    int k_tile_count = (K + bK - 1) / bK;
+    int k_tile_count = 0;
     int k_tile_next = 0;
+    detail::gemm_split_range(p, bK, split, k_tile_next, k_tile_count);
 
     CUTE_UNROLL
     for (int pipe = 0; pipe < kStages - 1; ++pipe) {
@@ -881,6 +963,14 @@ void dense_gemm_f_kernel(GemmParams p)
     // two passes) and -0.4% (64x64, one pass): the epilogue is exposed at the end
     // of a block's life, so the round trip and the barrier cost more than the
     // half-filled sectors they remove.
+    // A split's block stops at its accumulator: the sum, the bias and the
+    // activation all belong to the reduce kernel, which sees every plane.
+    float* part = nullptr;
+    if (p.k_splits > 1) {
+        const int64_t plane = static_cast<int64_t>(M) * N;
+        part = p.partial + (static_cast<int64_t>(batch) * p.k_splits + split) * plane;
+    }
+
     const int ld_c = int(p.ldc);
     CUTE_UNROLL
     for (int j = 0; j < Tm; ++j) {
@@ -891,6 +981,10 @@ void dense_gemm_f_kernel(GemmParams p)
             const int n = n0 + brow(v);
             if (n >= N) { continue; }
             const int idx = m * ld_c + n;
+            if (part != nullptr) {
+                part[static_cast<int64_t>(m) * N + n] = acc[j][v];
+                continue;
+            }
 
             float x = p.alpha * acc[j][v];
             if (bias != nullptr) {
@@ -907,6 +1001,52 @@ void dense_gemm_f_kernel(GemmParams p)
             C[idx] = x;
         }
     }
+}
+
+// ============================================================
+// split-K reduction
+// ============================================================
+
+/// Sum the k-split planes and run the epilogue once, exactly as the single-pass
+/// kernels would have. One thread per output element, planes summed in a fixed
+/// order, so a given split count is deterministic. The block tile is not
+/// involved: this pass is over the whole [M, N] plane.
+template <class Elem>
+__global__ void dense_gemm_splitk_reduce_kernel(GemmParams p)
+{
+    const int64_t plane = static_cast<int64_t>(p.m) * p.n;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= plane) { return; }
+
+    const int m = int(idx / p.n);
+    const int n = int(idx - static_cast<int64_t>(m) * p.n);
+    const int batch = int(blockIdx.y);
+
+    const float* src = p.partial +
+                       static_cast<int64_t>(batch) * p.k_splits * plane + idx;
+    float sum = 0.0f;
+    for (int s = 0; s < p.k_splits; ++s) {
+        sum += src[static_cast<int64_t>(s) * plane];
+    }
+
+    Elem* C = static_cast<Elem*>(p.c) +
+              detail::gemm_batch_offset(p, p.c_batch, batch);
+    const int64_t off = static_cast<int64_t>(m) * p.ldc + n;
+
+    float v = p.alpha * sum;
+    if (p.bias != nullptr) {
+        const Elem* bias = static_cast<const Elem*>(p.bias);
+        v += gemm_to_float(bias[p.bias_row ? m : n]);
+    }
+    if (p.beta != 0.0f) { v += p.beta * gemm_to_float(C[off]); }
+    v = fminf(fmaxf(v, p.min_clip), p.max_clip);
+    v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
+    if (p.residual != nullptr) {
+        const Elem* residual = static_cast<const Elem*>(p.residual) +
+                               detail::gemm_batch_offset(p, p.r_batch, batch);
+        v += gemm_to_float(residual[static_cast<int64_t>(m) * p.ldr + n]);
+    }
+    C[off] = Elem(v);
 }
 
 // ============================================================
@@ -953,7 +1093,8 @@ inline void launch_dense_h(const GemmParams& p, cudaStream_t stream)
     (void)cfg;
 
     // One flat tile index: the kernel turns it into an L2-grouped (m, n) pair.
-    dim3 grid(ceil_div(p.m, bM) * ceil_div(p.n, bN), 1, gemm_batch_count(p));
+    dim3 grid(ceil_div(p.m, bM) * ceil_div(p.n, bN), 1,
+              gemm_batch_count(p) * p.k_splits);
     kernel<<<grid, Tile::threads, smem, stream>>>(p);
 }
 
@@ -972,8 +1113,200 @@ inline void launch_dense_f(const GemmParams& p, cudaStream_t stream)
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(p.m, bM), ceil_div(p.n, bN), gemm_batch_count(p));
+    dim3 grid(ceil_div(p.m, bM), ceil_div(p.n, bN),
+              gemm_batch_count(p) * p.k_splits);
     kernel<<<grid, Tile::threads, smem, stream>>>(p);
+}
+
+// ---- split-K --------------------------------------------------------------
+
+/// Bench knob: NNOPS_CUDA_SPLITK=0 disables split-K, N > 1 forces N splits
+/// (clamped like the auto choice); unset keeps the heuristic.
+inline int splitk_env()
+{
+    static const int v = [] {
+        const char* s = std::getenv("NNOPS_CUDA_SPLITK");
+        return s != nullptr ? std::atoi(s) : -1;
+    }();
+    return v;
+}
+
+/// A split needs enough k tiles for the pipeline prologue to disappear into
+/// work, and every split writes one f32 plane of partial stores.
+constexpr int kSplitKMinTiles = 4;
+constexpr int kSplitKMaxSplits = 64;
+constexpr int64_t kSplitKMaxBytes = int64_t{64} << 20;
+
+/// How many k ranges the product should be cut into. `capacity` is the resident
+/// block count the tile is built for (`blocks` per SM, three for the 32 KB f16
+/// tile) and `elem_size` the operand width.
+///
+/// The split count is the largest that still fits the machine in one wave:
+/// rounding up instead (ceil) was measured at -25% on 512³ and -57% on the f16
+/// twin, because the extra blocks become a second, nearly empty wave and each
+/// split is also priced in prologue k tiles plus one plane of partial stores.
+///
+/// One wave is necessary but not sufficient. Splitting multiplies the output
+/// stream — every split writes an f32 plane and the reduce reads it back — so
+/// against a short K the planes outweigh the product itself: 512³ still pays
+/// +19% at two splits even though 64 blocks fill only 42% of a wave. So the cut
+/// is taken only when one of two measured conditions holds:
+///  - the grid is starved, under an eighth of a wave (128³ and 256³, which gain
+///    +15% and +19% despite plane traffic larger than the operands), or
+///  - the planes are cheap against the operands, under a quarter of them
+///    (16x4096x4096: 1 MB of planes against 67 MB of operands, +11%).
+inline int pick_split_k(const GemmParams& p, int bM, int bN, int bK,
+                        int capacity, int elem_size)
+{
+    const int forced = splitk_env();
+    if (forced == 0) { return 1; }
+    const int k_tiles = (p.k + bK - 1) / bK;
+    if (forced > 1) {
+        return std::max(1, std::min({forced, k_tiles, kSplitKMaxSplits}));
+    }
+    if (capacity <= 0) { return 1; }
+
+    const int64_t batch = gemm_batch_count(p);
+    const int64_t tiles =
+        int64_t((p.m + bM - 1) / bM) * ((p.n + bN - 1) / bN) * batch;
+
+    int64_t splits = std::min<int64_t>(kSplitKMaxSplits, capacity / tiles);
+    splits = std::min<int64_t>(splits, k_tiles / kSplitKMinTiles);
+    if (splits < 2) { return 1; }
+
+    const int64_t plane = int64_t(p.m) * p.n * batch;
+    const int64_t partial_bytes = int64_t{8} * splits * plane;  // f32 write + read
+    const int64_t operand_bytes = int64_t(elem_size) * p.k * (int64_t(p.m) + p.n) * batch;
+    const bool starved = tiles * 8 <= capacity;
+    const bool cheap = partial_bytes * 4 <= operand_bytes;
+    return (starved || cheap) ? int(splits) : 1;
+}
+
+/// The reduce pass's scratch. cudaMallocAsync keeps the whole call stream
+/// ordered; the blocking cudaMalloc is the fallback when the async allocator is
+/// unavailable, and the flag says which one owns the pointer.
+struct GemmWorkspace {
+    void* ptr = nullptr;
+    bool async = false;
+};
+
+/// A private memory pool for the scratch, created once per process. The default
+/// pool's release threshold is 0, so on WDDM every free hands the pages back to
+/// the OS and the next alloc costs milliseconds — the pool measured at 1.45 ms
+/// per alloc/free pair with kernels interleaved, against 2 µs here. Keeping
+/// up to 128 MiB resident bounds the pool without touching the process-wide
+/// default pool.
+inline cudaMemPool_t gemm_workspace_pool()
+{
+    static const cudaMemPool_t pool = [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { return cudaMemPool_t{}; }
+        cudaMemPoolProps props{};
+        props.allocType = cudaMemAllocationTypePinned;
+        props.handleTypes = cudaMemHandleTypeNone;
+        props.location.type = cudaMemLocationTypeDevice;
+        props.location.id = dev;
+        cudaMemPool_t p = nullptr;
+        if (cudaMemPoolCreate(&p, &props) != cudaSuccess) {
+            cudaGetLastError();
+            return cudaMemPool_t{};
+        }
+        unsigned long long keep = 128ull << 20;
+        cudaMemPoolSetAttribute(p, cudaMemPoolAttrReleaseThreshold, &keep);
+        return p;
+    }();
+    return pool;
+}
+
+inline GemmWorkspace gemm_workspace_alloc(int64_t bytes, cudaStream_t stream)
+{
+    GemmWorkspace ws;
+    if (bytes <= 0) { return ws; }
+#if CUDART_VERSION >= 11070
+    const cudaMemPool_t pool = gemm_workspace_pool();
+    if (pool != nullptr &&
+        cudaMallocFromPoolAsync(&ws.ptr, static_cast<size_t>(bytes), pool,
+                                stream) == cudaSuccess) {
+        ws.async = true;
+        return ws;
+    }
+    cudaGetLastError();
+#endif
+    if (cudaMalloc(&ws.ptr, static_cast<size_t>(bytes)) != cudaSuccess) {
+        ws.ptr = nullptr;
+        cudaGetLastError();
+    }
+    return ws;
+}
+
+inline void gemm_workspace_free(GemmWorkspace ws, cudaStream_t stream)
+{
+    if (ws.ptr == nullptr) { return; }
+#if CUDART_VERSION >= 11020
+    if (ws.async && cudaFreeAsync(ws.ptr, stream) == cudaSuccess) { return; }
+    cudaGetLastError();
+#endif
+    cudaFree(ws.ptr);
+}
+
+template <class Elem>
+inline void launch_splitk_reduce(const GemmParams& p, cudaStream_t stream)
+{
+    constexpr int kThreads = 256;
+    const int64_t plane = static_cast<int64_t>(p.m) * p.n;
+    dim3 grid(static_cast<unsigned>((plane + kThreads - 1) / kThreads),
+              static_cast<unsigned>(gemm_batch_count(p)), 1);
+    dense_gemm_splitk_reduce_kernel<Elem><<<grid, kThreads, 0, stream>>>(p);
+}
+
+/// Launch a tile, cutting the reduction into k ranges when the grid is shallower
+/// than the tile wants, and reducing the planes afterwards. Falls back to the
+/// single-pass launch whenever a split cannot help or its scratch cannot be
+/// carved.
+template <bool Half, class Tile, bool TransA, bool TransB, bool Vectorized>
+inline void launch_dense_split(const GemmParams& p, cudaStream_t stream)
+{
+    auto launch_one = [&](const GemmParams& q) {
+        if constexpr (Half) {
+            launch_dense_h<Tile, TransA, TransB, Vectorized>(q, stream);
+        } else {
+            launch_dense_f<Tile, TransA, TransB, Vectorized>(q, stream);
+        }
+    };
+
+    constexpr int blocks_per_sm = [] {
+        if constexpr (Half) { return 3; }  // the 32 KB f16 tile
+        else { return Tile::blocks; }
+    }();
+    const int elem_size = Half ? 2 : 4;
+    int splits = pick_split_k(p, Tile::bM, Tile::bN, Tile::bK,
+                              device_sm_count() * blocks_per_sm, elem_size);
+    if (splits <= 1) { launch_one(p); return; }
+
+    const int64_t batch = gemm_batch_count(p);
+    const int64_t plane = static_cast<int64_t>(p.m) * p.n;
+    // gridDim.z is 16-bit, and the partial planes are f32 whatever the operands.
+    while (splits > 1 && batch * splits > 65535) { splits /= 2; }
+    int64_t bytes = int64_t(splits) * batch * plane * int64_t(sizeof(float));
+    while (splits > 1 && bytes > kSplitKMaxBytes) {
+        splits /= 2;
+        bytes = int64_t(splits) * batch * plane * int64_t(sizeof(float));
+    }
+    if (splits <= 1) { launch_one(p); return; }
+
+    const GemmWorkspace ws = gemm_workspace_alloc(bytes, stream);
+    if (ws.ptr == nullptr) { launch_one(p); return; }
+
+    GemmParams q = p;
+    q.k_splits = splits;
+    q.partial = static_cast<float*>(ws.ptr);
+    launch_one(q);
+    if constexpr (Half) {
+        launch_splitk_reduce<cute::half_t>(q, stream);
+    } else {
+        launch_splitk_reduce<float>(q, stream);
+    }
+    gemm_workspace_free(ws, stream);
 }
 
 /// Per-(dtype, transpose, vectorized) dispatch table.
@@ -1039,12 +1372,14 @@ inline bool dense_gemm_launch(const GemmParams& p, int elem_size,
                 if (wide_h) {
                     detail::launch_dense_h<kF16Wide, TA, TB, V>(p, stream);
                 } else {
-                    detail::launch_dense_h<kF16Narrow, TA, TB, V>(p, stream);
+                    // The wide gate needs 16·SM blocks, so a narrow tile always
+                    // has room for split-K to fill the machine.
+                    detail::launch_dense_split<true, kF16Narrow, TA, TB, V>(p, stream);
                 }
             } else if (wide) {
                 detail::launch_dense_f<kF32Wide, TA, TB, V>(p, stream);
             } else {
-                detail::launch_dense_f<kF32Narrow, TA, TB, V>(p, stream);
+                detail::launch_dense_split<false, kF32Narrow, TA, TB, V>(p, stream);
             }
         });
     return true;
