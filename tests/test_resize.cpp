@@ -146,9 +146,8 @@ void test_channel_last_vs_channel_first(const std::vector<int64_t>& in_shape,
         const TensorView uncl_in_descs[] = {out_cl};
         unto_cl_op->compute(res_channel_first, uncl_in_descs);
 
-        float rtol = (attrs.mode == ResizeMode::Linear) ? 1e-3f : 1e-4f;
-        float atol = (attrs.mode == ResizeMode::Linear) ? 1e-3f : 1e-4f;
-        NNOPS_EXPECT_TRUE(test::allclose(res_channel_first, out_ref, rtol, atol));
+        const float tol = (attrs.mode == ResizeMode::Nearest) ? 1e-4f : 1e-3f;
+        NNOPS_EXPECT_TRUE(test::allclose(res_channel_first, out_ref, tol, tol));
     }
 }
 
@@ -317,6 +316,165 @@ NNOPS_TEST(resize_2d_linear_upsample_no_nan) {
     attrs.coord_mode = CoordinateTransformMode::HalfPixel;
     attrs.output_size = {0, 20, 20};
     test_channel_last_vs_channel_first({1, 2, 8, 8}, attrs);
+}
+
+// ============================================================
+// 2D Cubic (bicubic) tests
+// ============================================================
+
+NNOPS_TEST(resize_2d_cubic_identity) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 8, 8};
+    test_channel_last_vs_channel_first({1, 3, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_upsample) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 20, 20};
+    test_channel_last_vs_channel_first({1, 2, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_downsample) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 5, 7};
+    test_channel_last_vs_channel_first({1, 3, 11, 13}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_align_corners) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::AlignCorners;
+    attrs.output_size = {0, 12, 12};
+    test_channel_last_vs_channel_first({1, 2, 6, 6}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_partial_channels) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 16, 16};
+    test_channel_last_vs_channel_first({1, 5, 8, 8}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_add_to) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 8, 8};
+    attrs.add_to = true;
+    test_channel_last_vs_channel_first({1, 3, 4, 4}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_coeff_half) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 20, 20};
+    attrs.cubic_coeff_a = -0.5f;  // PIL's BICUBIC
+    test_channel_last_vs_channel_first({1, 3, 10, 10}, attrs);
+}
+
+NNOPS_TEST(resize_2d_cubic_constant_preserved) {
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 6, 6};
+    run_resize_roundtrip({1, 1, 3, 3}, {1, 1, 6, 6},
+                         std::vector<float>(9, 7.0f), attrs,
+                         [](const TensorView& result) {
+        const float* r = result.ptr<float>();
+        for (int64_t i = 0; i < result.numel(); ++i) {
+            NNOPS_EXPECT_NEAR(r[i], 7.0f, 1e-5f);
+        }
+    });
+}
+
+NNOPS_TEST(resize_2d_cubic_ramp_hand_verified) {
+    // 4x4, every row the horizontal ramp {0,1,2,3}, upsampled half-pixel to
+    // 8x8: src = o/2 - 0.25. The a = -0.75 kernel is not first-order
+    // reproducing (only a = -0.5 is), so the values below come from the Keys
+    // weights; the edges also fold their outside taps into the border pixel.
+    const std::vector<float> in_data = {
+        0, 1, 2, 3,
+        0, 1, 2, 3,
+        0, 1, 2, 3,
+        0, 1, 2, 3,
+    };
+
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 8, 8};
+
+    run_resize_roundtrip({1, 1, 4, 4}, {1, 1, 8, 8}, in_data, attrs,
+                         [](const TensorView& result) {
+        const float* r = result.ptr<float>();
+        // Interior, src 1.25: w = {-0.10546875, 0.87890625, 0.26171875,
+        // -0.03515625} over p = {0,1,2,3}; src 1.75 mirrors it.
+        NNOPS_EXPECT_NEAR(r[3], 1.296875f, 1e-5f);
+        NNOPS_EXPECT_NEAR(r[4], 1.703125f, 1e-5f);
+        // Left edge (src -0.25): (w0+w1+w2)*p0 + w3*p1.
+        NNOPS_EXPECT_NEAR(r[0], -0.10546875f, 1e-5f);
+        // Right edge (src 3.25): w0*p2 + (w1+w2+w3)*p3.
+        NNOPS_EXPECT_NEAR(r[7], 3.10546875f, 1e-5f);
+    });
+}
+
+NNOPS_TEST(resize_2d_cubic_ramp_interior_2d) {
+    // v[r][c] = 3r + 2c + 5, and a = -0.5 (Catmull-Rom) reproduces a linear
+    // ramp, so output coords whose four taps all land inside are exact.
+    std::vector<float> in_data(36);
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) {
+            in_data[static_cast<size_t>(r * 6 + c)] = 3.0f * r + 2.0f * c + 5.0f;
+        }
+    }
+
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.coord_mode = CoordinateTransformMode::HalfPixel;
+    attrs.output_size = {0, 12, 12};
+    attrs.cubic_coeff_a = -0.5f;
+
+    run_resize_roundtrip({1, 1, 6, 6}, {1, 1, 12, 12}, in_data, attrs,
+                         [](const TensorView& result) {
+        const float* r = result.ptr<float>();
+        const auto value = [](int oh, int ow) {
+            const float sh = 0.5f * oh - 0.25f;
+            const float sw = 0.5f * ow - 0.25f;
+            return 3.0f * sh + 2.0f * sw + 5.0f;
+        };
+        for (int oh = 3; oh <= 8; ++oh) {
+            for (int ow = 3; ow <= 8; ++ow) {
+                NNOPS_EXPECT_NEAR(r[oh * 12 + ow], value(oh, ow), 1e-4f);
+            }
+        }
+    });
+}
+
+NNOPS_TEST(resize_3d_cubic_unsupported) {
+    std::vector<float> in(8, 1.0f);
+    const int64_t ishape[] = {1, 1, 2, 2, 2};
+    TensorView x(ishape, DataType::f32, in.data(), TensorLayout::NCDHW);
+
+    ResizeAttributes attrs;
+    attrs.mode = ResizeMode::Cubic;
+    attrs.output_size = {4, 4, 4};
+    auto op = Resize::create(attrs, Backend::CPU);
+
+    auto d = x.desc();
+    const TensorDesc da[] = {d};
+    auto descs = op->getOutputTensorDesc(da);
+    std::vector<float> out(static_cast<size_t>(descs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(descs[0], out.data());
+    const TensorView ins[] = {x};
+    NNOPS_EXPECT_EQ(op->compute(y, ins), Status::unsupported);
 }
 
 // ============================================================

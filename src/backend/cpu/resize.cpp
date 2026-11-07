@@ -5,6 +5,8 @@
 /// the source index (or the two neighbours and their weight). Channel-first walks one
 /// channel plane per task and evaluates scalar pixels; channel-last dispatches
 /// per sample and lets the kernel interpolate a pixel's whole C vector with SIMD.
+/// Cubic swaps the two-tap table for four taps per axis (ResizeCubicTap) and is
+/// 2D only.
 ///
 /// Crop: crop_start/crop_end are indexed as {D,H,W} to match output_size, and
 /// crop_end[d] > 0 enables cropping on that axis. The kernel sees the effective
@@ -52,6 +54,21 @@ struct CoordTable {
                 i1[static_cast<size_t>(o)] = k::resize_clamp_idx(lo + 1, in_size);
                 w[static_cast<size_t>(o)]  = src - floored;
             }
+        }
+    }
+};
+
+struct CubicTable {
+    std::vector<k::ResizeCubicTap> taps;
+
+    void build(int64_t in_size, int64_t out_size,
+               CoordinateTransformMode coord_mode, float a)
+    {
+        taps.resize(static_cast<size_t>(out_size));
+        for (int64_t o = 0; o < out_size; ++o) {
+            taps[static_cast<size_t>(o)] = k::resize_make_cubic_tap(
+                k::resize_compute_src_coord(o, in_size, out_size, coord_mode),
+                in_size, a);
         }
     }
 };
@@ -107,14 +124,21 @@ void resize_impl(const ResizeAttributes& attrs,
     const int64_t OH = output.shape(srank);
     const int64_t OW = output.shape(srank + 1);
 
-    const bool linear = (attrs.mode != ResizeMode::Nearest);
+    const bool cubic  = (attrs.mode == ResizeMode::Cubic);
+    const bool linear = (attrs.mode == ResizeMode::Linear);
     const bool add_to = attrs.add_to;
 
     CoordTable cx, cy, cz;
-    cx.build(eff_IW, OW, attrs.coord_mode, linear);
-    cy.build(eff_IH, OH, attrs.coord_mode, linear);
-    if (srank == 3) {
-        cz.build(eff_ID, OD, attrs.coord_mode, linear);
+    CubicTable kx, ky;
+    if (cubic) {
+        kx.build(eff_IW, OW, attrs.coord_mode, attrs.cubic_coeff_a);
+        ky.build(eff_IH, OH, attrs.coord_mode, attrs.cubic_coeff_a);
+    } else {
+        cx.build(eff_IW, OW, attrs.coord_mode, linear);
+        cy.build(eff_IH, OH, attrs.coord_mode, linear);
+        if (srank == 3) {
+            cz.build(eff_ID, OD, attrs.coord_mode, linear);
+        }
     }
 
     if (OW == 0 || OH == 0 || OD == 0 || N == 0 || C == 0) { return; }
@@ -135,7 +159,12 @@ void resize_impl(const ResizeAttributes& attrs,
             const T* in_base  = in_ptr + n * in_n_stride + crop_off;
             T*       out_base = out_ptr + n * out_n_stride;
 
-            if (srank == 3) {
+            if (cubic) {
+                k::resize_last_2d_cubic<T>(
+                    out_base, in_base, C, OH, OW,
+                    ky.taps.data(), kx.taps.data(),
+                    in_row_stride, out_row_stride, add_to);
+            } else if (srank == 3) {
                 k::resize_last_3d<T>(
                     out_base, in_base, C, OD, OH, OW,
                     cz.i0.data(), cz.i1.data(), cz.w.data(),
@@ -167,7 +196,12 @@ void resize_impl(const ResizeAttributes& attrs,
         const T* in_base  = in_ptr  + n * in_n_stride  + c * in_c_stride  + crop_off;
         T*       out_base = out_ptr + n * out_n_stride + c * out_c_stride;
 
-        if (srank == 3) {
+        if (cubic) {
+            k::resize_channel_first_2d_cubic<T>(
+                out_base, in_base, OH, OW,
+                ky.taps.data(), kx.taps.data(),
+                in_row_stride, out_row_stride, add_to);
+        } else if (srank == 3) {
             k::resize_channel_first_3d<T>(
                 out_base, in_base, OD, OH, OW,
                 cz.i0.data(), cz.i1.data(), cz.w.data(),
@@ -193,6 +227,11 @@ Status resize_cpu(const ResizeAttributes& attrs,
                 const ComputeContext& ctx,
                 void* /*workspace*/)
 {
+    // Cubic is the 2D bicubic; PyTorch and ONNX Runtime stop there too.
+    if (attrs.mode == ResizeMode::Cubic &&
+        ResizeAttributes::spatial_rank(inputs[0].rank()) != 2) {
+        return Status::unsupported;
+    }
     dispatch_f32_f16(inputs[0].data_type(), "resize_cpu", [&](auto tag) {
         using T = typename decltype(tag)::type;
         resize_impl<T>(attrs, output, inputs, ctx);

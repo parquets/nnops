@@ -2,8 +2,9 @@
 /// @brief Naive CPU reference for 2D/3D resize on channel-first.
 ///
 /// One template covers f32 and f16: arithmetic is fp32, and the dtype-specific
-/// load/store goes through s_load/s_store. Nearest reads a single tap; the other
-/// modes interpolate bilinearly (2D) or trilinearly (3D).
+/// load/store goes through s_load/s_store. Nearest reads a single tap; linear
+/// interpolates bilinearly (2D) or trilinearly (3D); cubic is the 2D bicubic
+/// with four clamped taps per axis.
 ///
 /// A crop (crop_end[d] > 0 on axis d) only narrows the read window: physical
 /// strides stay on the raw dims, so the window start is folded into one flat
@@ -27,6 +28,32 @@ namespace {
 
 inline int64_t clamp_idx(int64_t idx, int64_t src_size) {
     return std::max<int64_t>(0, std::min(idx, src_size - 1));
+}
+
+/// Keys cubic kernel; the four taps are base-1 .. base+2 and each index clamps
+/// to the image edge.
+inline float cubic_weight(float x, float a) {
+    const float ax = std::fabs(x);
+    if (ax <= 1.0f) {
+        return ((a + 2.0f) * ax - (a + 3.0f)) * ax * ax + 1.0f;
+    }
+    if (ax < 2.0f) {
+        return ((a * ax - 5.0f * a) * ax + 8.0f * a) * ax - 4.0f * a;
+    }
+    return 0.0f;
+}
+
+inline void cubic_taps(float src, int64_t src_size, float a,
+                       int64_t idx[4], float w[4]) {
+    const int64_t base = static_cast<int64_t>(std::floor(src));
+    const float   frac = src - static_cast<float>(base);
+    for (int j = 0; j < 4; ++j) {
+        idx[j] = clamp_idx(base + j - 1, src_size);
+    }
+    w[0] = cubic_weight(frac + 1.0f, a);
+    w[1] = cubic_weight(frac, a);
+    w[2] = cubic_weight(1.0f - frac, a);
+    w[3] = cubic_weight(2.0f - frac, a);
 }
 
 inline float compute_src_coord(int64_t dst_idx, int64_t src_size, int64_t dst_size,
@@ -141,6 +168,24 @@ void resize_impl_ref(const ResizeAttributes& attrs,
                             int64_t iw = clamp_idx(static_cast<int64_t>(std::round(src_w)), eff_IW);
                             result = s_load(&in_ch[ih * in_row_stride + iw]);
                         }
+                    } else if (mode == ResizeMode::Cubic) {
+                        NNOPS_ASSERT(srank == 2);
+                        const float src_h = compute_src_coord(oh, eff_IH, OH, coord_mode);
+                        const float src_w = compute_src_coord(ow, eff_IW, OW, coord_mode);
+
+                        int64_t yi[4], xi[4];
+                        float   yw[4], xw[4];
+                        cubic_taps(src_h, eff_IH, attrs.cubic_coeff_a, yi, yw);
+                        cubic_taps(src_w, eff_IW, attrs.cubic_coeff_a, xi, xw);
+
+                        float sum = 0.0f;
+                        for (int j = 0; j < 4; ++j) {
+                            for (int k = 0; k < 4; ++k) {
+                                sum += yw[j] * xw[k] *
+                                       s_load(&in_ch[yi[j] * in_row_stride + xi[k]]);
+                            }
+                        }
+                        result = sum;
                     } else {
                         if (srank == 3) {
                             float src_d = compute_src_coord(od, eff_ID, OD, coord_mode);

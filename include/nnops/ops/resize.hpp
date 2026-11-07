@@ -6,6 +6,11 @@
 /// Per-axis arrays are [D, H, W]; a rank-4 (2D) input reads only H/W (index 0
 /// is ignored), a rank-5 input all three. Channel-first and channel-last are both
 /// supported; the output carries the input's layout.
+///
+/// Nearest and linear are 2D/3D; cubic is the 2D bicubic only (a rank-5 input
+/// reports unsupported), the same split PyTorch and ONNX Runtime draw. Taps
+/// outside the image clamp to the edge, so their weight folds into the border
+/// pixel.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -21,6 +26,7 @@ namespace nnops {
 enum class ResizeMode : uint8_t {
     Nearest,  ///< Nearest-neighbor
     Linear,   ///< Bilinear (2D) / trilinear (3D)
+    Cubic,    ///< Bicubic (2D), Keys kernel
 };
 
 /// Coordinate transformation mode for mapping output coords to source coords.
@@ -39,6 +45,10 @@ struct ResizeAttributes {
 
     /// If true, add into the existing output buffer instead of overwriting.
     bool add_to = false;
+
+    /// Cubic kernel parameter (ONNX cubic_coeff_a). -0.75 is what ONNX and
+    /// PyTorch bicubic use; PIL's BICUBIC is -0.5. Only read for Cubic.
+    float cubic_coeff_a = -0.75f;
 
     /// Crop region in input pixel coords: start inclusive, end exclusive;
     /// crop_end[d] == 0 leaves that dimension uncropped. 2D uses H/W only.
