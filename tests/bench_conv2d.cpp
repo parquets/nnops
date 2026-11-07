@@ -88,6 +88,8 @@
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/ops/layout_convert.hpp"
+#include "nnops/ops/activation.hpp"
+#include "nnops/ops/eltwise.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
 #include "backend/cpu/conv/conv2d_winograd.h" // get_conv2d_winograd_plan
 #include "backend/cpu/simd_kernel/simd_winograd.hpp"   // the weight transforms
@@ -1823,5 +1825,75 @@ NNOPS_BENCH(conv2d_i8_fpact_vs_fp_sweep) {
         std::printf("    %-31s %7.3f %8s | %8.3f %8s | %9.2fx | %7.3f %8s | %8.2fx |\n",
                     "sum of the layers", tot_a, "", tot_b, "", tot_b / tot_a,
                     tot_u, "", tot_b / tot_u);
+    }
+}
+NNOPS_BENCH(conv2d_f32_residual_pre_activation) {
+    // `relu(conv + shortcut)` as one call against the graph chain it replaces:
+    // Conv(identity) → Add(residual) → Relu. Each arm computes the same product,
+    // so the ratio is the two elementwise passes plus one dispatch that the
+    // pre-activation residual absorbs.
+    struct Case { const char* name; int64_t N, IC, IH, IW, OC; };
+    const Case cases[] = {
+        {"f32 relu(conv+res) 1x64x56x56 -> 64 3x3",   1,  64, 56, 56,  64},
+        {"f32 relu(conv+res) 1x128x28x28 -> 128 3x3",  1, 128, 28, 28, 128},
+        {"f32 relu(conv+res) 1x256x14x14 -> 256 3x3",  1, 256, 14, 14, 256},
+    };
+    constexpr int kIters = 8;
+    constexpr int kRounds = 3;
+    const std::vector<int> threads = conv_bench_threads();
+
+    for (const Case& c : cases) {
+        const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
+        const int64_t wshape[] = {c.OC, c.IC, 3, 3};
+        const int64_t oshape[] = {c.N, c.OC, c.IH, c.IW};
+
+        auto [in_vec, input]   = make_random<float>(ishape, 21);
+        auto [w_vec, weight]   = make_random<float>(wshape, 22);
+        auto [res_vec, resid]  = make_random<float>(oshape, 23);
+        std::vector<float> out_buf(static_cast<size_t>(c.N * c.OC * c.IH * c.IW));
+        std::vector<float> tmp_buf(out_buf.size());
+
+        TensorView out(std::span<const int64_t>(oshape, 4), DataType::f32, out_buf.data());
+        TensorView tmp(std::span<const int64_t>(oshape, 4), DataType::f32, tmp_buf.data());
+
+        Conv2DAttributes fused_a;
+        fused_a.kernel_size = {3, 3};
+        fused_a.padding = {1, 1};
+        fused_a.epilogue.type = EpilogueActivateType::Relu;
+        fused_a.add_to = true;
+        fused_a.residual_pre_activation = true;
+        auto op_fused = Conv2D::create(fused_a, Backend::CPU);
+
+        Conv2DAttributes plain_a;
+        plain_a.kernel_size = {3, 3};
+        plain_a.padding = {1, 1};
+        auto op_plain = Conv2D::create(plain_a, Backend::CPU);
+        EltwiseAttributes ea;
+        ea.type = EltwiseType::Add;
+        auto op_add = Eltwise::create(ea, Backend::CPU);
+        ActivationAttributes aa;
+        aa.type = ActivationType::Relu;
+        auto op_relu = Activation::create(aa, Backend::CPU);
+
+        const TensorView conv_ins[] = {input, weight};
+        const double flops = 2.0 * static_cast<double>(c.N) * c.OC * c.IH * c.IW *
+                             static_cast<double>(c.IC) * 9.0;
+
+        // The residual lives in the destination: seeding once is enough, and
+        // the steady state is one call. Re-copying it per iteration would time
+        // a copy the graph planner aliases away.
+        for (size_t i = 0; i < out_buf.size(); ++i) { out_buf[i] = res_vec[i]; }
+        auto fused = [&](const ComputeContext& ctx) {
+            op_fused->compute(out, conv_ins, ctx, nullptr);
+        };
+        auto chain = [&](const ComputeContext& ctx) {
+            op_plain->compute(tmp, conv_ins, ctx, nullptr);
+            const TensorView add_ins[] = {tmp, resid};
+            op_add->compute(out, add_ins, ctx, nullptr);
+            const TensorView relu_ins[] = {out};
+            op_relu->compute(out, relu_ins, ctx, nullptr);
+        };
+        run_ab_pair(c.name, "fused", flops, "GFLOPS", fused,
+                    "chain", flops, "GFLOPS", chain, threads, kIters, kRounds);
     }
 }

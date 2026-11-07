@@ -8,7 +8,8 @@
 ///
 /// Inputs by type: BatchNorm X,scale,bias,mean,var (5); LayerNorm X,scale[,bias]
 /// (2-3); RMSNorm X,scale (2); GroupNorm X,scale[,bias] (2-3); L2Norm X (1).
-/// The output Y has X's shape.
+/// With `add_residual`, one trailing input R is pre-added to X (see the
+/// attribute). The output Y has X's shape.
 ///
 /// Quantized input (CPU): an s8/u8 X with PerTensor or PerToken params, for
 /// LayerNorm / RMSNorm / L2Norm with axis == rank-1 only — one normalization
@@ -62,6 +63,17 @@ struct NormAttributes {
     /// Accumulate into the existing output instead of overwriting; rejected on
     /// the quantized-input path.
     bool add_to = false;
+
+    /// Pre-add a residual before normalizing: `y = norm(X + R)`, the transformer
+    /// block's `norm(x + sublayer(x))` in one pass. R is the trailing input, in
+    /// X's slot order:
+    ///   LayerNorm  [X, scale, bias?, residual]  (4 inputs; bias may be empty)
+    ///   RMSNorm    [X, scale, residual]         (3)
+    ///   L2Norm     [X, residual]                (1)
+    /// R must match X's dims and dtype, and the normalized axis must be the
+    /// rank-1 contiguous tail; BatchNorm/GroupNorm and quantized X are rejected.
+    /// `add_to` still applies to the output, after the normalization.
+    bool add_residual = false;
 };
 
 class Norm : public OpBase {

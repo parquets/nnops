@@ -45,7 +45,7 @@ inline std::pair<float, float> kblock_clamp(const MatMulAttributes& attrs, bool 
 
 /// Non-clamp epilogues (Relu is folded into the MMA clamp) run in place.
 inline bool has_inplace_epilogue(const MatMulAttributes& attrs) noexcept {
-    return attrs.epilogue.type != EpilogueActivateType::None &&
+    return epilogue_is_active(attrs.epilogue) &&
            attrs.epilogue.type != EpilogueActivateType::Relu;
 }
 

@@ -874,6 +874,139 @@ NNOPS_TEST(norm_l2norm_random_f16) {
     }
 }
 
+NNOPS_TEST(norm_residual_pre_add) {
+    // `y = norm(x + r)` — the transformer block's residual + norm in one pass.
+    // The expectation is written out by hand from x + r, so a pass that
+    // normalized x alone (or added the residual after) cannot match it.
+    const int64_t shape[]  = {2, 4};
+    const int64_t sshape[] = {4};
+
+    const float x_data[] = { 1.0f, -2.0f,  3.0f,   0.5f,
+                             0.0f,  1.0f, -1.0f,   2.0f};
+    const float r_data[] = { 0.5f,  0.5f, -1.0f,   1.5f,
+                             1.0f, -1.0f,  0.0f,   0.5f};
+    const float s_data[] = { 1.0f,  2.0f,  0.5f,   1.0f};
+    const float b_data[] = { 0.1f, -0.2f,  0.3f,   0.0f};
+    constexpr float kEps = 1e-5f;
+
+    TensorView x(shape, DataType::f32, const_cast<float*>(x_data));
+    TensorView r(shape, DataType::f32, const_cast<float*>(r_data));
+    TensorView s(sshape, DataType::f32, const_cast<float*>(s_data));
+    TensorView b(sshape, DataType::f32, const_cast<float*>(b_data));
+    TensorView no_bias;
+
+    // ---- LayerNorm(x + r), with bias ----
+    {
+        NormAttributes attrs;
+        attrs.type = NormType::LayerNorm;
+        attrs.add_residual = true;
+        auto op = Norm::create(attrs, Backend::CPU);
+
+        const TensorDesc desc_arr[] = {x.desc(), s.desc(), b.desc(), r.desc()};
+        auto descs = op->getOutputTensorDesc(desc_arr);
+        std::vector<float> got(static_cast<size_t>(descs[0].numel()), 0.0f);
+        auto y = test::make_channel_first(descs[0], got.data());
+
+        const TensorView ins[] = {x, s, b, r};
+        NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+        for (int row = 0; row < 2; ++row) {
+            float sum = x_data[4 * row + 0] + r_data[4 * row + 0] +
+                        x_data[4 * row + 1] + r_data[4 * row + 1] +
+                        x_data[4 * row + 2] + r_data[4 * row + 2] +
+                        x_data[4 * row + 3] + r_data[4 * row + 3];
+            const float mean = sum / 4.0f;
+            float var = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float d = (x_data[4 * row + i] + r_data[4 * row + i]) - mean;
+                var += d * d;
+            }
+            var /= 4.0f;
+            const float inv = 1.0f / std::sqrt(var + kEps);
+            for (int i = 0; i < 4; ++i) {
+                const float v = (x_data[4 * row + i] + r_data[4 * row + i] - mean) * inv;
+                const float want = v * s_data[i] + b_data[i];
+                NNOPS_EXPECT_NEAR(got[static_cast<size_t>(4 * row + i)], want, 1e-4f);
+            }
+        }
+    }
+
+    // ---- RMSNorm(x + r): third input, no bias slot ----
+    {
+        NormAttributes attrs;
+        attrs.type = NormType::RMSNorm;
+        attrs.add_residual = true;
+        auto op = Norm::create(attrs, Backend::CPU);
+
+        const TensorDesc desc_arr[] = {x.desc(), s.desc(), r.desc()};
+        auto descs = op->getOutputTensorDesc(desc_arr);
+        std::vector<float> got(static_cast<size_t>(descs[0].numel()), 0.0f);
+        auto y = test::make_channel_first(descs[0], got.data());
+
+        const TensorView ins[] = {x, s, r};
+        NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+        for (int row = 0; row < 2; ++row) {
+            float sum_sq = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float v = x_data[4 * row + i] + r_data[4 * row + i];
+                sum_sq += v * v;
+            }
+            const float inv = 1.0f / std::sqrt(sum_sq / 4.0f + kEps);
+            for (int i = 0; i < 4; ++i) {
+                const float v = x_data[4 * row + i] + r_data[4 * row + i];
+                NNOPS_EXPECT_NEAR(got[static_cast<size_t>(4 * row + i)], v * inv * s_data[i],
+                                  1e-4f);
+            }
+        }
+    }
+
+    // ---- L2Norm(x + r): second input ----
+    {
+        NormAttributes attrs;
+        attrs.type = NormType::L2Norm;
+        attrs.add_residual = true;
+        auto op = Norm::create(attrs, Backend::CPU);
+
+        const TensorDesc desc_arr[] = {x.desc(), r.desc()};
+        auto descs = op->getOutputTensorDesc(desc_arr);
+        std::vector<float> got(static_cast<size_t>(descs[0].numel()), 0.0f);
+        auto y = test::make_channel_first(descs[0], got.data());
+
+        const TensorView ins[] = {x, r};
+        NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+        for (int row = 0; row < 2; ++row) {
+            float sum_sq = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float v = x_data[4 * row + i] + r_data[4 * row + i];
+                sum_sq += v * v;
+            }
+            const float inv = 1.0f / std::sqrt(sum_sq + kEps);
+            for (int i = 0; i < 4; ++i) {
+                const float v = x_data[4 * row + i] + r_data[4 * row + i];
+                NNOPS_EXPECT_NEAR(got[static_cast<size_t>(4 * row + i)], v * inv, 1e-4f);
+            }
+        }
+    }
+
+    // The fused form is the contiguous tail only.
+    {
+        NormAttributes attrs;
+        attrs.type = NormType::LayerNorm;
+        attrs.axis = 0;
+        attrs.add_residual = true;
+        auto op = Norm::create(attrs, Backend::CPU);
+
+        const TensorDesc desc_arr[] = {x.desc(), s.desc(), b.desc(), r.desc()};
+        auto descs = op->getOutputTensorDesc(desc_arr);
+        std::vector<float> got(static_cast<size_t>(descs[0].numel()), 0.0f);
+        auto y = test::make_channel_first(descs[0], got.data());
+        const TensorView ins[] = {x, s, b, r};
+        NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::unsupported);
+    }
+}
+
 // ============================================================
 // GroupNorm
 // ============================================================

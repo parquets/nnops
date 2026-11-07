@@ -109,6 +109,17 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
                 const int64_t oc_global = g * OC_per_G + oc;
                 const float   s_w  = quant_scale_at(qw, oc_global);
                 const int32_t zp_w = quant_zp_at(qw, oc_global);
+                // A Requantize epilogue carries one output scale per channel.
+                const float   oc_out_scale =
+                    (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                     attrs.epilogue.quant_param_count > 0)
+                        ? epilogue_quant_scale(attrs.epilogue, oc_global)
+                        : out_scale;
+                const int32_t oc_zp_out =
+                    (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                     attrs.epilogue.quant_param_count > 0)
+                        ? epilogue_quant_zero(attrs.epilogue, oc_global)
+                        : zp_out;
 
                 for (int64_t oh = 0; oh < OH; ++oh) {
                     for (int64_t ow = 0; ow < OW; ++ow) {
@@ -153,8 +164,8 @@ void conv2d_int8_ref_impl(const Conv2DAttributes& attrs,
                             if (attrs.epilogue.type == EpilogueActivateType::Relu) {
                                 v = std::max(v, 0);
                             }
-                            const float req = matmul_int8_requant_scale(s_w, s_x, out_scale);
-                            out_ptr[out_idx] = matmul_int8_requant<TOut>(v, req, zp_out);
+                            const float req = matmul_int8_requant_scale(s_w, s_x, oc_out_scale);
+                            out_ptr[out_idx] = matmul_int8_requant<TOut>(v, req, oc_zp_out);
                         } else {
                             // ---- same tail as dq_epilogue_row -----------------
                             float f = static_cast<float>(acc) * (s_w * s_x);

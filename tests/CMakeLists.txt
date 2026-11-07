@@ -167,6 +167,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_rnn.cpp
         bench_moe.cpp
         bench_rope.cpp
+        bench_norm.cpp
     )
 
     if(NNOPS_BUILD_CUDA)

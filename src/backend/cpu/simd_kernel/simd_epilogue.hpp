@@ -53,6 +53,11 @@
 namespace nnops {
 
 inline float apply_epilogue(const Epilogue& ep, float x) {
+    // The clip bounds are part of the contract for every operator that applies
+    // an epilogue: the result is activate(clamp(x, min_clip, max_clip)). They
+    // used to be MatMul's alone, which left Conv2D unable to take a general
+    // Clip and made one Epilogue struct mean two things.
+    x = std::min(std::max(x, ep.min_clip), ep.max_clip);
     switch (ep.type) {
     case EpilogueActivateType::None:
         return x;
@@ -82,10 +87,21 @@ inline float apply_epilogue(const Epilogue& ep, float x) {
     return x;
 }
 
-inline float apply_epilogue(const Epilogue& ep, float x, int64_t /*channel*/) {
-    // Every live type is per-element; the channel index is for the reserved
-    // per-channel quant fields (Epilogue::quant_scales / quant_zero_points).
-    return apply_epilogue(ep, x);
+inline float apply_epilogue(const Epilogue& ep, float x, int64_t channel) {
+    // activate(clamp(x)) first, then the quantization stage — the row index is
+    // only read by that stage.
+    x = apply_epilogue(ep, x);
+    switch (ep.quant) {
+    case EpilogueQuantType::None:
+        return x;
+    case EpilogueQuantType::Requantize:
+        return std::round(x / epilogue_quant_scale(ep, channel)) +
+               static_cast<float>(epilogue_quant_zero(ep, channel));
+    case EpilogueQuantType::Dequantize:
+        return (x - static_cast<float>(epilogue_quant_zero(ep, channel))) *
+               epilogue_quant_scale(ep, channel);
+    }
+    return x;
 }
 
 }  // namespace nnops
@@ -398,6 +414,13 @@ template <typename T>
 inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
                                       const T* type_tag,
                                       vec_for<T> vx) {
+    // Clamp first, then activate — the scalar overload's contract. Only paid
+    // when a bound is set.
+    if (ep.min_clip > -std::numeric_limits<float>::infinity() ||
+        ep.max_clip <  std::numeric_limits<float>::infinity()) {
+        vx = v_min(v_max(vx, v_set1(type_tag, ep.min_clip)),
+                   v_set1(type_tag, ep.max_clip));
+    }
     switch (ep.type) {
     case EpilogueActivateType::None:
         return vx;
@@ -495,6 +518,11 @@ struct Int8EpilogueParams {
     int32_t zp_a_scalar, zp_b_scalar;
     double out_scale;
     int32_t zp_out;
+    /// Per output row (m0 + r) overrides of out_scale/zp_out — the epilogue's
+    /// Requantize stage, or a per-row table on the destination. nullptr keeps
+    /// the scalar pair.
+    const float* row_out_scales = nullptr;
+    const int32_t* row_out_zps = nullptr;
     int32_t a_bias_offset;
     int32_t k;
     bool relu;
@@ -536,8 +564,8 @@ inline void int8_epilogue_tile(const Int8EpilogueParams& p, int32_t* c, int ldc,
                 ? static_cast<double>(int8_scale_at(p.s_a, p.s_a_scalar, m)) : 0.0,
             p.s_b,
             p.s_b_scalar,
-            p.out_scale,
-            p.zp_out,
+            p.row_out_scales ? p.row_out_scales[m] : p.out_scale,
+            p.row_out_zps ? p.row_out_zps[m] : p.zp_out,
             p.k,
             p.relu,
             p.bias ? p.bias[m] : 0,

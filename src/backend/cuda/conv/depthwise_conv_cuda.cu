@@ -34,8 +34,11 @@ namespace nnops::backend::cuda {
 // ============================================================
 
 __device__ inline float device_apply_epilogue(
-    EpilogueActivateType ep_type, float alpha, float beta, float x)
+    EpilogueActivateType ep_type, float alpha, float beta,
+    float min_clip, float max_clip, float x)
 {
+    // activate(clamp(x)) — the same contract as the CPU's apply_epilogue.
+    x = fminf(fmaxf(x, min_clip), max_clip);
     switch (ep_type) {
     case EpilogueActivateType::None:
         return x;
@@ -90,6 +93,8 @@ __global__ void depthwise_conv_2d_kernel(
     EpilogueActivateType ep_type,
     float ep_alpha,
     float ep_beta,
+    float ep_min,
+    float ep_max,
     bool has_bias,
     bool add_to)
 {
@@ -120,7 +125,8 @@ __global__ void depthwise_conv_2d_kernel(
             }
         }
 
-        float val = device_apply_epilogue(ep_type, ep_alpha, ep_beta, sum);
+        float val = device_apply_epilogue(ep_type, ep_alpha, ep_beta,
+                                          ep_min, ep_max, sum);
 
         const int64_t out_idx = oh * out_row_stride + ow;
         if (add_to) {
@@ -154,6 +160,8 @@ __global__ void depthwise_conv_3d_kernel(
     EpilogueActivateType ep_type,
     float ep_alpha,
     float ep_beta,
+    float ep_min,
+    float ep_max,
     bool has_bias,
     bool add_to)
 {
@@ -191,7 +199,8 @@ __global__ void depthwise_conv_3d_kernel(
             }
         }
 
-        float val = device_apply_epilogue(ep_type, ep_alpha, ep_beta, sum);
+        float val = device_apply_epilogue(ep_type, ep_alpha, ep_beta,
+                                          ep_min, ep_max, sum);
 
         const int64_t out_idx = od * out_d_stride + oh * out_row_stride + ow;
         if (add_to) {
@@ -224,6 +233,8 @@ struct DwLastGeom {
     EpilogueActivateType ep_type;
     float ep_alpha;
     float ep_beta;
+    float ep_min;
+    float ep_max;
     bool has_bias;
     bool add_to;
 };
@@ -286,7 +297,8 @@ __global__ void depthwise_conv_last_kernel(
 
     #pragma unroll
     for (int i = 0; i < Vec; ++i) {
-        acc[i] = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta, acc[i]);
+        acc[i] = device_apply_epilogue(g.ep_type, g.ep_alpha, g.ep_beta,
+                                      g.ep_min, g.ep_max, acc[i]);
     }
 
     T* out = out_img + od * g.out_d_stride + oh * g.out_row_stride + ow * g.out_pix_stride;
@@ -355,6 +367,7 @@ void depthwise_conv_cuda_2d_impl(
         out_ch_stride, out_row_stride,
         w_ch_stride,
         attrs.epilogue.type, attrs.epilogue.alpha, attrs.epilogue.beta,
+        attrs.epilogue.min_clip, attrs.epilogue.max_clip,
         has_bias, attrs.add_to);
 }
 
@@ -418,6 +431,7 @@ void depthwise_conv_cuda_3d_impl(
         out_ch_stride, out_row_stride, out_d_stride,
         w_ch_stride,
         attrs.epilogue.type, attrs.epilogue.alpha, attrs.epilogue.beta,
+        attrs.epilogue.min_clip, attrs.epilogue.max_clip,
         has_bias, attrs.add_to);
 }
 
@@ -499,6 +513,8 @@ void depthwise_conv_last_impl(
     g.ep_type  = attrs.epilogue.type;
     g.ep_alpha = attrs.epilogue.alpha;
     g.ep_beta  = attrs.epilogue.beta;
+    g.ep_min   = attrs.epilogue.min_clip;
+    g.ep_max   = attrs.epilogue.max_clip;
     g.add_to   = attrs.add_to;
 
     cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);

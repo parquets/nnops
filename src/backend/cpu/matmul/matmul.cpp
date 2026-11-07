@@ -746,7 +746,7 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
             // destination alone is no reason to sweep — a symmetric s8 W8A8
             // setup requantizes the raw accumulate.
             int8_ep = sweep_a || sweep_b || out_q || int_bias != nullptr ||
-                      attrs.epilogue.type != EpilogueActivateType::None;
+                      epilogue_is_active(attrs.epilogue);
         }
         if (sweep_a) { r_a.reset(static_cast<size_t>(Mi)); }
         if (sweep_b) { r_b.reset(static_cast<size_t>(Ni)); }
@@ -790,6 +790,15 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 const QuantParams& qc = output.quant_params();
                 ip.out_scale = quant_scale_at(qc, 0);  // requant only
                 ip.zp_out = quant_zp_at(qc, 0);
+                // The epilogue's Requantize stage carries a per-row table; it
+                // overrides the destination's per-tensor parameters.
+                if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                    attrs.epilogue.quant_param_count > 0) {
+                    ip.row_out_scales = attrs.epilogue.quant_scales;
+                    ip.row_out_zps = attrs.epilogue.quant_zero_points;
+                    ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
+                    ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
+                }
                 ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
                 ip.compensate = sweep_a && !fold_row;  // row half, per element
                 ip.col_term = col_term;

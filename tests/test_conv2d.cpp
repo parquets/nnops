@@ -738,6 +738,72 @@ NNOPS_TEST(conv2d_im2col_epilogue_add_to) {
     }
 }
 
+NNOPS_TEST(conv2d_im2col_residual_pre_activation) {
+    // ResNet's `relu(conv + shortcut)`: the residual joins the accumulator
+    // *before* the activation. Expected value is written from a plain product,
+    // so an implementation that applies the residual after the relu (the
+    // default add_to order) cannot match it.
+    const int64_t ishape[] = {1, 3, 12, 12};
+    const int64_t wshape[] = {6, 3, 3, 3};
+    const int64_t bshape[] = {6};
+
+    auto [in_vec, input]  = test::make_random_tensor(ishape, -1.0f, 1.0f, 111);
+    auto [w_vec, weight]  = test::make_random_tensor(wshape, -1.0f, 1.0f, 112);
+    auto [b_vec, bias]    = test::make_random_tensor(bshape, -0.5f, 0.5f, 113);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride  = {1, 1};
+    attrs.padding = {1, 1};
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc(), bias.desc()};
+    std::vector<TensorView> ins   = {input, weight, bias};
+
+    auto out_descs = Conv2D::create(attrs, Backend::CPU)->getOutputTensorDesc(descs);
+    const int64_t out_numel = out_descs[0].numel();
+
+    std::vector<float> plain_buf(static_cast<size_t>(out_numel));
+    auto plain_out = test::make_channel_first(out_descs[0], plain_buf.data());
+    Conv2D::create(attrs, Backend::CPU)->compute(plain_out, ins, {}, nullptr);
+
+    std::vector<int64_t> out_shape(out_descs[0].dims.data(),
+                                   out_descs[0].dims.data() + out_descs[0].rank);
+    auto [res_vec, _] = test::make_random_tensor(out_shape, -1.0f, 1.0f, 114);
+
+    Conv2DAttributes pre = attrs;
+    pre.epilogue.type = EpilogueActivateType::Relu;
+    pre.add_to = true;
+    pre.residual_pre_activation = true;
+
+    std::vector<float> fast_buf(static_cast<size_t>(out_numel));
+    auto fast_out = test::make_channel_first(out_descs[0], fast_buf.data());
+    std::vector<float> ref_buf(static_cast<size_t>(out_numel));
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
+    for (int64_t i = 0; i < out_numel; ++i) {
+        fast_buf[i] = res_vec[i];
+        ref_buf[i]  = res_vec[i];
+    }
+    Conv2D::create(pre, Backend::CPU)->compute(fast_out, ins, {}, nullptr);
+    nnops::backend::cpu::reference::conv2d_ref(pre, ref_out, ins, {}, nullptr);
+
+    int64_t negative = 0;
+    for (int64_t i = 0; i < out_numel; ++i) {
+        const float want = std::max(plain_buf[i] + res_vec[i], 0.0f);
+        NNOPS_EXPECT_NEAR(fast_buf[i], want, 1e-4f);
+        NNOPS_EXPECT_NEAR(fast_buf[i], ref_buf[i], 1e-4f);
+        negative += (plain_buf[i] + res_vec[i] < 0.0f);
+    }
+    NNOPS_EXPECT_TRUE(negative > 0);   // the relu must actually bite
+
+    // Winograd has no pre-activation form; it must refuse rather than ignore.
+    Conv2DAttributes wino = pre;
+    wino.algorithm = ConvAlgorithm::Winograd;
+    auto wop = Conv2D::create(wino, Backend::CPU);
+    std::vector<float> wbuf(static_cast<size_t>(out_numel));
+    auto wout = test::make_channel_first(out_descs[0], wbuf.data());
+    NNOPS_EXPECT_TRUE(wop->compute(wout, ins, {}, nullptr) == Status::unsupported);
+}
+
 NNOPS_TEST(conv2d_im2col_identity_epilogue_add_to) {
     // add_to with no activation: the residual is folded into the tile at icn == 0
     // and no epilogue runs. The no-bias form also takes the zero_mode seeding
@@ -833,6 +899,58 @@ NNOPS_TEST(conv2d_im2col_epilogue_relu6) {
         above_hi += (plain_buf[i] > 6.0f);
     }
     // Both clamp bounds must actually bite, otherwise the case is vacuous.
+    NNOPS_EXPECT_TRUE(below_lo > 0 && above_hi > 0);
+}
+
+NNOPS_TEST(conv2d_im2col_epilogue_clip) {
+    // The general Clip form, not just Relu6: the epilogue contract is
+    // activate(clamp(x, min_clip, max_clip)) and it holds for every operator.
+    // Conv2D used to derive the clamp from the activation type and ignore these
+    // fields, so the expectation is written out by hand from the plain product.
+    const int64_t ishape[] = {1, 3, 12, 12};
+    const int64_t wshape[] = {6, 3, 3, 3};
+    const int64_t bshape[] = {6};
+
+    auto [in_vec, input]  = test::make_random_tensor(ishape, -1.0f, 1.0f, 105);
+    auto [w_vec, weight]  = test::make_random_tensor(wshape, -2.0f, 2.0f, 106);
+    auto [b_vec, bias]    = test::make_random_tensor(bshape, -1.0f, 1.0f, 107);
+
+    Conv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride  = {1, 1};
+    attrs.padding = {1, 1};
+
+    std::vector<TensorDesc> descs = {input.desc(), weight.desc(), bias.desc()};
+    std::vector<TensorView> ins   = {input, weight, bias};
+
+    auto out_descs = Conv2D::create(attrs, Backend::CPU)->getOutputTensorDesc(descs);
+    const int64_t out_numel = out_descs[0].numel();
+
+    std::vector<float> plain_buf(static_cast<size_t>(out_numel));
+    auto plain_out = test::make_channel_first(out_descs[0], plain_buf.data());
+    auto plain_op = Conv2D::create(attrs, Backend::CPU);
+    plain_op->compute(plain_out, ins, {}, nullptr);
+
+    constexpr float kLo = -0.5f, kHi = 0.25f;
+    attrs.epilogue.type = EpilogueActivateType::Gelu;
+    attrs.epilogue.min_clip = kLo;
+    attrs.epilogue.max_clip = kHi;
+    std::vector<float> clip_buf(static_cast<size_t>(out_numel));
+    auto clip_out = test::make_channel_first(out_descs[0], clip_buf.data());
+    auto clip_op = Conv2D::create(attrs, Backend::CPU);
+    clip_op->compute(clip_out, ins, {}, nullptr);
+
+    constexpr float c = 0.7978845608028654f;
+    const auto gelu = [](float x) {
+        return 0.5f * x * (1.0f + std::tanh(c * (x + 0.044715f * x * x * x)));
+    };
+    int64_t below_lo = 0, above_hi = 0;
+    for (int64_t i = 0; i < out_numel; ++i) {
+        const float clamped = std::min(std::max(plain_buf[i], kLo), kHi);
+        NNOPS_EXPECT_NEAR(clip_buf[i], gelu(clamped), 1e-4f);
+        below_lo += (plain_buf[i] < kLo);
+        above_hi += (plain_buf[i] > kHi);
+    }
     NNOPS_EXPECT_TRUE(below_lo > 0 && above_hi > 0);
 }
 

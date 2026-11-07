@@ -20,6 +20,7 @@
 #include "simd_reduce_primitive.hpp"
 
 #include <cmath>
+#include <type_traits>
 #include <utility>
 
 namespace nnops::kernel {
@@ -31,6 +32,49 @@ template <typename T>
 inline std::pair<float, float> norm_reduce_sum_sq(const T* x, int64_t n)
 {
     return row_reduce_sum_sq<T>(x, n);
+}
+
+/// The same reduction over a pre-added row: Σ(x+r) and Σ(x+r)². The residual
+/// is added here rather than in a separate pass, so a fused `norm(x + r)` reads
+/// both operands twice and writes one output instead of writing and re-reading
+/// a sum tensor.
+template <typename T>
+inline std::pair<float, float> norm_reduce_sum_sq_add(const T* x, const T* r, int64_t n)
+{
+    constexpr int L = simd_lane_for<T>;
+    int64_t i = 0;
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    if constexpr (std::is_same_v<T, half>) {
+        // f16 storage, f32 accumulation: on x86 every f16 vector op is a
+        // convert round trip, so the pair is widened once here.
+        v_f32x8 v_sum = v_set1_f32x8(0.0f);
+        v_f32x8 v_sq = v_set1_f32x8(0.0f);
+        for (; i + L <= n; i += L) {
+            const v_f32x8 v = v_add(v_cvt_f16_to_f32(v_load(x + i)),
+                                    v_cvt_f16_to_f32(v_load(r + i)));
+            v_sum = v_add(v_sum, v);
+            v_sq = v_fmadd(v, v, v_sq);
+        }
+        sum = v_reduce_sum(v_sum);
+        sum_sq = v_reduce_sum(v_sq);
+    } else {
+        v_f32x8 v_sum = v_set1_f32x8(0.0f);
+        v_f32x8 v_sq = v_set1_f32x8(0.0f);
+        for (; i + L <= n; i += L) {
+            const v_f32x8 v = v_add(v_load(x + i), v_load(r + i));
+            v_sum = v_add(v_sum, v);
+            v_sq = v_fmadd(v, v, v_sq);
+        }
+        sum = v_reduce_sum(v_sum);
+        sum_sq = v_reduce_sum(v_sq);
+    }
+    for (; i < n; ++i) {
+        const float v = s_load(&x[i]) + s_load(&r[i]);
+        sum += v;
+        sum_sq += v * v;
+    }
+    return {sum, sum_sq};
 }
 
 /// (x - mean) * inv_std * scale + bias with broadcast scale/bias — GroupNorm,
@@ -57,6 +101,54 @@ inline void norm_apply_affine_row(const T* x, T* y, int64_t n,
     for (; i < n; ++i) {
         float xv = s_load(&x[i]);
         float rv = (xv - mean) * inv_std * scale_val + bias_val;
+        s_store_add(&y[i], rv, add_to);
+    }
+}
+
+/// norm_apply_row over the pre-added row (x + r) — the write side of the fused
+/// `norm(x + r)`.
+template <typename T, bool HasMean, bool HasScale, bool HasBias>
+inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
+                               float mean_val, float inv_std,
+                               const T* scale, const T* bias,
+                               bool scale_is_scalar, bool add_to)
+{
+    constexpr int L = simd_lane_for<T>;
+    int64_t i = 0;
+
+    const auto v_mean    = v_set1(x, mean_val);
+    const auto v_inv_std = v_set1(x, inv_std);
+
+    for (; i + L <= n; i += L) {
+        auto rv = v_add(v_load(x + i), v_load(r + i));
+        if constexpr (HasMean) {
+            rv = v_sub(rv, v_mean);
+        }
+        rv = v_mul(rv, v_inv_std);
+        if constexpr (HasScale) {
+            auto vs = v_load(scale + (scale_is_scalar ? 0 : i));
+            rv = v_mul(rv, vs);
+        }
+        if constexpr (HasBias) {
+            auto vb = v_load(bias + (scale_is_scalar ? 0 : i));
+            rv = v_add(rv, vb);
+        }
+        v_store_add(y + i, rv, add_to);
+    }
+    for (; i < n; ++i) {
+        float rv = s_load(&x[i]) + s_load(&r[i]);
+        if constexpr (HasMean) {
+            rv -= mean_val;
+        }
+        rv *= inv_std;
+        if constexpr (HasScale) {
+            int64_t s_idx = scale_is_scalar ? 0 : i;
+            rv *= s_load(&scale[s_idx]);
+        }
+        if constexpr (HasBias) {
+            int64_t b_idx = scale_is_scalar ? 0 : i;
+            rv += s_load(&bias[b_idx]);
+        }
         s_store_add(&y[i], rv, add_to);
     }
 }

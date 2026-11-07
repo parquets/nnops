@@ -272,10 +272,16 @@ void layer_norm_impl(const NormAttributes& attrs,
     const auto* b_ptr  = (has_bias && !inputs[2].is_empty()) ? inputs[2].ptr<T>() : nullptr;
     auto* y_ptr = output.ptr<T>();
 
+    // The pre-add residual is the trailing slot, after the optional bias.
+    const bool has_res = attrs.add_residual && inputs.size() >= 4 &&
+                         !inputs[3].is_empty();
+    const auto* r_ptr  = has_res ? inputs[3].ptr<T>() : nullptr;
+
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
 
     if (!dims.is_contiguous_tail) {
+        NNOPS_ASSERT(!has_res && "norm residual needs the contiguous tail");
         layer_norm_general_scalar<T>(
             x_ptr, s_ptr, b_ptr, y_ptr,
             dims.num_rows, dims.norm_size, dims.axis, X, output, scale,
@@ -285,12 +291,17 @@ void layer_norm_impl(const NormAttributes& attrs,
 
     const int64_t x_row_stride = X.row_stride_elems();
     const int64_t y_row_stride = output.row_stride_elems();
+    const int64_t r_row_stride = has_res ? inputs[3].row_stride_elems() : 0;
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
+        const int64_t r_off = row * r_row_stride;
         const int64_t y_off = row * y_row_stride;
-        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
+        const auto [sum, sum_sq] =
+            has_res ? kernel::norm_reduce_sum_sq_add<T>(x_ptr + x_off, r_ptr + r_off,
+                                                        dims.norm_size)
+                    : kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
 
         const float inv_n = 1.0f / static_cast<float>(dims.norm_size);
         const float mean_val = sum * inv_n;
@@ -298,7 +309,17 @@ void layer_norm_impl(const NormAttributes& attrs,
         if (var_val < 0.0f) { var_val = 0.0f; }
         const float inv_std = 1.0f / std::sqrt(var_val + epsilon);
 
-        if (has_bias && b_ptr) {
+        if (has_res) {
+            if (b_ptr) {
+                kernel::norm_apply_row_add<T, true, true, true>(
+                    x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
+                    mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to);
+            } else {
+                kernel::norm_apply_row_add<T, true, true, false>(
+                    x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
+                    mean_val, inv_std, s_ptr, nullptr, scale_is_scalar, add_to);
+            }
+        } else if (b_ptr) {
             kernel::norm_apply_row<T, true, true, true>(
                 x_ptr + x_off, y_ptr + y_off, dims.norm_size,
                 mean_val, inv_std, s_ptr, b_ptr, scale_is_scalar, add_to);
@@ -371,10 +392,16 @@ void rms_norm_impl(const NormAttributes& attrs,
     const auto* s_ptr = scale.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
+    // RMSNorm has no bias, so the residual is the third input.
+    const bool has_res = attrs.add_residual && inputs.size() >= 3 &&
+                         !inputs[2].is_empty();
+    const auto* r_ptr  = has_res ? inputs[2].ptr<T>() : nullptr;
+
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
 
     if (!dims.is_contiguous_tail) {
+        NNOPS_ASSERT(!has_res && "norm residual needs the contiguous tail");
         rms_norm_general_scalar<T>(
             x_ptr, s_ptr, y_ptr,
             dims.num_rows, dims.norm_size, dims.axis, X, output, scale,
@@ -384,17 +411,28 @@ void rms_norm_impl(const NormAttributes& attrs,
 
     const int64_t x_row_stride = X.row_stride_elems();
     const int64_t y_row_stride = output.row_stride_elems();
+    const int64_t r_row_stride = has_res ? inputs[2].row_stride_elems() : 0;
     const bool scale_is_scalar = (scale.numel() == 1);
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
+        const int64_t r_off = row * r_row_stride;
         const int64_t y_off = row * y_row_stride;
-        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
+        const auto [sum, sum_sq] =
+            has_res ? kernel::norm_reduce_sum_sq_add<T>(x_ptr + x_off, r_ptr + r_off,
+                                                        dims.norm_size)
+                    : kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
         (void)sum;
         const float inv_rms = 1.0f / std::sqrt(sum_sq / static_cast<float>(dims.norm_size) + epsilon);
-        kernel::norm_apply_row<T, false, true, false>(
-            x_ptr + x_off, y_ptr + y_off, dims.norm_size,
-            0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
+        if (has_res) {
+            kernel::norm_apply_row_add<T, false, true, false>(
+                x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
+                0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
+        } else {
+            kernel::norm_apply_row<T, false, true, false>(
+                x_ptr + x_off, y_ptr + y_off, dims.norm_size,
+                0.0f, inv_rms, s_ptr, nullptr, scale_is_scalar, add_to);
+        }
     };
 
     ctx.cpu.run(0, dims.num_rows, process_row);
@@ -452,10 +490,16 @@ void l2_norm_impl(const NormAttributes& attrs,
     const auto* x_ptr = X.ptr<T>();
     auto* y_ptr = output.ptr<T>();
 
+    // L2Norm has no scale, so the residual is the second input.
+    const bool has_res = attrs.add_residual && inputs.size() >= 2 &&
+                         !inputs[1].is_empty();
+    const auto* r_ptr  = has_res ? inputs[1].ptr<T>() : nullptr;
+
     const bool add_to = attrs.add_to;
     const auto dims = compute_norm_dims(X, attrs.axis);
 
     if (!dims.is_contiguous_tail) {
+        NNOPS_ASSERT(!has_res && "norm residual needs the contiguous tail");
         l2_norm_general_scalar<T>(
             x_ptr, y_ptr,
             dims.num_rows, dims.norm_size, dims.axis, X, output,
@@ -465,16 +509,27 @@ void l2_norm_impl(const NormAttributes& attrs,
 
     const int64_t x_row_stride = X.row_stride_elems();
     const int64_t y_row_stride = output.row_stride_elems();
+    const int64_t r_row_stride = has_res ? inputs[1].row_stride_elems() : 0;
 
     const auto process_row = [&](int64_t row) {
         const int64_t x_off = row * x_row_stride;
+        const int64_t r_off = row * r_row_stride;
         const int64_t y_off = row * y_row_stride;
-        auto [sum, sum_sq] = kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
+        const auto [sum, sum_sq] =
+            has_res ? kernel::norm_reduce_sum_sq_add<T>(x_ptr + x_off, r_ptr + r_off,
+                                                        dims.norm_size)
+                    : kernel::norm_reduce_sum_sq<T>(x_ptr + x_off, dims.norm_size);
         (void)sum;
         const float inv_norm = 1.0f / std::sqrt(sum_sq + epsilon);
-        kernel::norm_apply_row<T, false, false, false>(
-            x_ptr + x_off, y_ptr + y_off, dims.norm_size,
-            0.0f, inv_norm, nullptr, nullptr, false, add_to);
+        if (has_res) {
+            kernel::norm_apply_row_add<T, false, false, false>(
+                x_ptr + x_off, r_ptr + r_off, y_ptr + y_off, dims.norm_size,
+                0.0f, inv_norm, nullptr, nullptr, false, add_to);
+        } else {
+            kernel::norm_apply_row<T, false, false, false>(
+                x_ptr + x_off, y_ptr + y_off, dims.norm_size,
+                0.0f, inv_norm, nullptr, nullptr, false, add_to);
+        }
     };
 
     ctx.cpu.run(0, dims.num_rows, process_row);

@@ -28,7 +28,12 @@
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/matmul/matmul.h"
 #include "backend/cpu/common/memory_pool.hpp"
+#include "backend/cpu/simd_kernel/simd_epilogue.hpp"
+#include "backend/cpu/simd_kernel/tiled_map.hpp"
+#include "nnops/detail/validate.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <type_traits>
@@ -55,6 +60,71 @@ DataType linear_output_dtype(const LinearAttributes& attrs, DataType x_dt) noexc
 /// Raw data pointer of a view, for building a promoted (rank-1 → rank-2) view.
 void* view_data(const TensorView& t) noexcept {
     return const_cast<void*>(static_cast<const void*>(t.ptr<uint8_t>()));
+}
+
+/// The gated form: one MatMul over the [2N, K] weight into a pooled [rows, 2N]
+/// tile, then the SwiGLU combine into the caller's [rows, N] output. Both
+/// halves must exist before the combine, so the gate cannot ride MatMul's
+/// epilogue — but the whole path is one GEMM plus one output pass, where a
+/// graph would otherwise run the GEMM, a split, a Silu and a multiply.
+template <typename T>
+Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs, int64_t rows,
+                         int64_t n2, const ComputeContext& ctx, void* workspace)
+{
+    const int64_t n = n2 / 2;
+    PoolPtr tmp(static_cast<size_t>(rows) * static_cast<size_t>(n2) * sizeof(T));
+    if (!tmp) { return Status::out_of_memory; }
+    int64_t tshape[2] = {rows, n2};
+    TensorView mt(std::span<const int64_t>(tshape, 2),
+                  std::is_same_v<T, float> ? DataType::f32 : DataType::f16,
+                  tmp.get(), n2 * static_cast<int64_t>(sizeof(T)));
+
+    MatMulAttributes ma;
+    ma.transpose_b = true;
+    ma.epilogue = Epilogue{};   // the combine applies Linear's
+    NNOPS_TRY(matmul_cpu(ma, mt, inputs, ctx, workspace));
+
+    const float alpha = attrs.gate_alpha;
+    const float beta = attrs.gate_beta;
+    const float limit = attrs.gate_limit;
+    const bool clamp = std::isfinite(limit);
+    const Epilogue ep = attrs.epilogue;
+    const bool add_to = attrs.add_to;
+    const T* tag = output.ptr<T>();
+
+    // gate · sigmoid(alpha·gate) · (value + beta), both halves clamped to
+    // ±limit when finite — the MoE operator's combine, applied to one GEMM's
+    // two column halves.
+    auto vec = [=](auto g, auto v) {
+        if (clamp) {
+            const auto vlim = simd::v_set1(tag, limit);
+            const auto vnlim = simd::v_neg(vlim);
+            g = simd::v_max(simd::v_min(g, vlim), vnlim);
+            v = simd::v_max(simd::v_min(v, vlim), vnlim);
+        }
+        const auto one = simd::v_set1(tag, 1.0f);
+        const auto sig = simd::v_div(
+            one, simd::v_add(one, simd::v_exp(
+                                      simd::v_neg(simd::v_mul(g, simd::v_set1(tag, alpha))))));
+        const auto r = simd::v_mul(simd::v_mul(g, sig),
+                                   simd::v_add(v, simd::v_set1(tag, beta)));
+        return apply_epilogue_vec(ep, tag, r);
+    };
+    auto scalar = [=](float g, float v) {
+        if (clamp) {
+            g = std::max(std::min(g, limit), -limit);
+            v = std::max(std::min(v, limit), -limit);
+        }
+        const float sig = 1.0f / (1.0f + std::exp(-alpha * g));
+        return apply_epilogue(ep, g * sig * (v + beta));
+    };
+
+    T* base = mt.ptr<T>();
+    kernel::tiled_map_simd<T, 2>({base, base + n}, {n2, n2},
+                                 output.ptr<T>(), output.row_stride_elems(),
+                                 rows, n, add_to, vec, scalar);
+    return Status::ok;
 }
 
 /// out += src over every row; MatMul already put bias and activation through `src`.
@@ -117,7 +187,8 @@ Status linear_cpu(const LinearAttributes& attrs,
     }
 
     const int64_t K = x.shape(x.rank() - 1);
-    const int64_t N = w.shape(0);
+    // In the gated form the weight is [2N, K] and the output's last dim is N.
+    const int64_t N = attrs.gated ? w.shape(0) / 2 : w.shape(0);
 
     // A rank-1 X (and its [N] output) is one row over the same buffers.
     std::optional<TensorView> x_row, out_row;
@@ -139,6 +210,14 @@ Status linear_cpu(const LinearAttributes& attrs,
     const std::span<const TensorView> min(
         minputs, has_bias ? size_t{3} : size_t{2});
 
+    if (attrs.gated) {
+        return x_dt == DataType::f32
+                   ? linear_gated_impl<float>(attrs, ov, min, ov.total_rows(),
+                                              w.shape(0), ctx, workspace)
+                   : linear_gated_impl<half>(attrs, ov, min, ov.total_rows(),
+                                             w.shape(0), ctx, workspace);
+    }
+
     MatMulAttributes ma;
     ma.transpose_b = true;
     ma.output_dtype = out_dt;   // read only on the int8 route
@@ -146,7 +225,7 @@ Status linear_cpu(const LinearAttributes& attrs,
 
     // add_to can ride beta only for fp operands with an identity epilogue: the
     // residual must not pass through the activation, and int8 zeroes C.
-    const bool ep_identity = attrs.epilogue.type == EpilogueActivateType::None;
+    const bool ep_identity = !epilogue_is_active(attrs.epilogue);
     const bool beta_residual = attrs.add_to && !quant && ep_identity;
     if (beta_residual) { ma.beta = 1.0f; }
 

@@ -661,15 +661,11 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
     p.epilogue = attrs.epilogue.type;
     p.ep_alpha = attrs.epilogue.alpha;
     p.ep_beta = attrs.epilogue.beta;
+    // The epilogue contract is activate(clamp(x, min_clip, max_clip)) on every
+    // backend; the descriptor's bounds go through as-is.
+    p.min_clip = attrs.epilogue.min_clip;
+    p.max_clip = attrs.epilogue.max_clip;
     p.add_to = attrs.add_to;
-
-    // Conv folds Relu/Relu6 into the store clamp and ignores epilogue's own
-    // min_clip/max_clip (they are MatMul's); the CPU conv does the same.
-    switch (attrs.epilogue.type) {
-    case EpilogueActivateType::Relu:  p.min_clip = 0.0f; break;
-    case EpilogueActivateType::Relu6: p.min_clip = 0.0f; p.max_clip = 6.0f; break;
-    default: break;
-    }
 
     // The filter's own strides. `w_k_dense` says the k axis (IC/G·KH·KW) is
     // contiguous, which is what lets the kernel pose the filter as a plain

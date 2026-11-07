@@ -120,6 +120,10 @@ struct Case {
     bool asym_w = false;              // per-channel weight zero point != 0
     bool add_to = false;
     EpilogueActivateType ep = EpilogueActivateType::None;
+    // When non-empty, the output requant parameters ride the epilogue's
+    // Requantize stage (one per channel) instead of the destination tensor.
+    std::vector<float> out_s;
+    std::vector<int32_t> out_zp;
     int64_t in_pitch = 0;             // > IW → pitched input storage
     int64_t out_pitch = 0;            // > OW → pitched output storage
     uint64_t seed = 1;
@@ -221,6 +225,12 @@ struct Fixture {
         attrs.groups = c.groups;
         attrs.add_to = c.add_to;
         attrs.epilogue.type = c.ep;
+        if (int_out && !c.out_s.empty()) {
+            attrs.epilogue.quant = EpilogueQuantType::Requantize;
+            attrs.epilogue.quant_scales = c.out_s.data();
+            attrs.epilogue.quant_zero_points = c.out_zp.empty() ? nullptr : c.out_zp.data();
+            attrs.epilogue.quant_param_count = static_cast<int64_t>(c.out_s.size());
+        }
         attrs.output_dtype = c.out;
         attrs.act_quant_dtype = c.act_q;
 
@@ -1521,4 +1531,32 @@ NNOPS_TEST(conv2d_i8_prepacked_filter) {
                 ") differs from the raw filter: " + diff);
         }
     }
+}
+
+NNOPS_TEST(conv2d_i8_int_out_epilogue_requant) {
+    // Per-channel output parameters carried by the epilogue instead of the
+    // destination tensor: the int8 output pass reads one scale/zero point per
+    // output channel, which is the QDQ graph's QuantizeLinear folded in.
+    Case c;
+    c.ishape = {1, 8, 6, 6};
+    c.wshape = {8, 8, 1, 1};
+    c.kh = c.kw = 1;
+    c.ph = c.pw = 0;
+    c.act = DataType::u8;
+    c.zp_x = 128;
+    c.out = DataType::u8;
+    c.bias = true;
+    c.out_s  = {0.02f, 0.04f, 0.01f, 0.08f, 0.03f, 0.05f, 0.015f, 0.06f};
+    c.out_zp = {0, 8, 16, 32, 64, 100, 120, 128};
+    expect_matches_ref(c);
+
+    // The same geometry with the table flattened to its first entry: the two
+    // results must differ, or the per-channel path is not being read at all.
+    Case flat = c;
+    flat.out_s.assign(c.out_s.size(), c.out_s[0]);
+    flat.out_zp.assign(c.out_zp.size(), c.out_zp[0]);
+    expect_matches_ref(flat);
+    const Result pc = run_route(c, {}, false);
+    const Result un = run_route(flat, {}, false);
+    NNOPS_EXPECT_TRUE(!first_difference(pc, un).empty());
 }

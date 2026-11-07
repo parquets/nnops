@@ -83,8 +83,11 @@ void conv2d_ref(const Conv2DAttributes& attrs,
                         }
                         const int64_t out_idx =
                             ((n * OC + oc_global) * OH + oh) * out_row_stride + ow;
+                        const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
+                        if (pre_act) { sum += out_ptr[out_idx]; }
                         float val = apply_epilogue(attrs.epilogue, sum, oc_global);
-                        out_ptr[out_idx] = attrs.add_to ? out_ptr[out_idx] + val : val;
+                        out_ptr[out_idx] =
+                            (attrs.add_to && !pre_act) ? out_ptr[out_idx] + val : val;
                     }
                 }
             }

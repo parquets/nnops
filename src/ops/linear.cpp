@@ -32,6 +32,12 @@ std::vector<TensorDesc> Linear::getOutputTensorDesc(
 {
     auto out = linear_output_shape(inputs);
 
+    // The gated form's weight is [2N, K]: the output is the combined [..., N].
+    if (attrs_.gated && !out.empty() && out[0].rank >= 1 && inputs.size() >= 2 &&
+        inputs[1].rank == 2) {
+        out[0].dims[static_cast<size_t>(out[0].rank - 1)] = inputs[1].dims[0] / 2;
+    }
+
     if (is_int8_matmul(inputs[0].dtype, inputs[1].dtype)) {
         const DataType odt = attrs_.output_dtype;
         const bool known = odt == DataType::f16 || odt == DataType::f32 ||
@@ -47,8 +53,30 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
                         std::span<const TensorDesc> outputs) const
 {
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
-    return detail::require(
-        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly));
+    NNOPS_TRY(detail::require(
+        is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)));
+    if (!attrs_.gated) { return Status::ok; }
+
+    const TensorDesc& x = inputs[0];
+    const TensorDesc& w = inputs[1];
+    if ((x.dtype != DataType::f32 && x.dtype != DataType::f16) || w.dtype != x.dtype) {
+        return Status::unsupported;
+    }
+    if (w.rank != 2 || w.dims[0] <= 0 || (w.dims[0] % 2) != 0) {
+        return Status::invalid_argument;
+    }
+    const int64_t n = w.dims[0] / 2;
+    if (inputs.size() > 2) {
+        const TensorDesc& b = inputs[2];
+        if (b.dtype != x.dtype || b.numel() != w.dims[0]) {
+            return Status::invalid_argument;
+        }
+    }
+    if (outputs.size() == 1 && outputs[0].rank >= 1 &&
+        outputs[0].dims[static_cast<size_t>(outputs[0].rank - 1)] != n) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
 }
 
 Status Linear::compute(std::span<TensorView> outputs,

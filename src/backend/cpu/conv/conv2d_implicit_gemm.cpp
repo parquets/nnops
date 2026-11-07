@@ -259,7 +259,13 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
     const int nslots = ctx.cpu.thread_slot_count();
     const bool per_thread = nslots > 0 && nslots < total;
 
-    const bool epilogue_active = attrs.epilogue.type != EpilogueActivateType::None;
+    const bool epilogue_active = epilogue_is_active(attrs.epilogue);
+
+    // The residual joins the accumulator before the epilogue instead of after
+    // it: `epilogue(conv + residual)` rather than `epilogue(conv) + residual`.
+    // The tile already holds the caller's output, so the pre-activation form is
+    // the cheaper of the two — one seed, no saved copy, no post-add.
+    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
 
     // A pure clamp needs no epilogue pass: the MMA store's min/max bounds carry
     // it. add_to is the exception — it adds the residual *after* the
@@ -374,15 +380,17 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
 
                     if (icn == 0 && seed_needed) {
                         // add_to keeps the original output: epilogue(bias + Σ)
-                        // then += orig.
-                        if (attrs.add_to && epilogue_pass) {
+                        // then += orig. The pre-activation form keeps the
+                        // original in the tile and adds the bias onto it, so
+                        // the epilogue sees conv + residual at once.
+                        if (attrs.add_to && epilogue_pass && !pre_act) {
                             tile_save<T>(orig, tile, static_cast<int>(ocn_step),
                                          static_cast<int>(ocnc), static_cast<int>(roi_area));
                         }
                         tile_set_bias<T>(tile, static_cast<int>(ocn_step),
                                          static_cast<int>(ocnc), static_cast<int>(roi_area),
                                          bias_ptr ? bias_ptr + ocn : nullptr,
-                                         attrs.add_to && !epilogue_active);
+                                         attrs.add_to && (!epilogue_active || pre_act));
                     }
 
                     const T* a = weight_ptr + icn * karea + ocn * w_ocn_step;
@@ -404,7 +412,8 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
                         epilogue_inplace<T>(static_cast<int>(ocnc), static_cast<int>(roi_area),
                                             tile, static_cast<int>(ocn_step),
                                             static_cast<const T*>(nullptr), attrs.epilogue,
-                                            orig, attrs.add_to && epilogue_active);
+                                            pre_act ? nullptr : orig,
+                                            attrs.add_to && epilogue_active && !pre_act);
                     }
                 }
             }
@@ -820,6 +829,14 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
                     ip.col_term   = need_col_sum;
                     ip.out_scale = quant_scale_at(qc, 0);
                     ip.zp_out    = quant_zp_at(qc, 0);
+                    // Requantize epilogue: one output scale per channel.
+                    if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                        attrs.epilogue.quant_param_count > 0) {
+                        ip.row_out_scales = attrs.epilogue.quant_scales;
+                        ip.row_out_zps = attrs.epilogue.quant_zero_points;
+                        ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
+                        ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
+                    }
                     ip.relu = attrs.epilogue.type == EpilogueActivateType::Relu;
                     ip.bias = !bias_fold.empty()
                             ? bias_fold.data() + g * oc_per_group + ocn
@@ -2227,6 +2244,13 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
                             ip.col_term   = col_term;
                             ip.out_scale  = quant_scale_at(qc, 0);
                             ip.zp_out     = quant_zp_at(qc, 0);
+                            if (attrs.epilogue.quant == EpilogueQuantType::Requantize &&
+                                attrs.epilogue.quant_param_count > 0) {
+                                ip.row_out_scales = attrs.epilogue.quant_scales;
+                                ip.row_out_zps = attrs.epilogue.quant_zero_points;
+                                ip.out_scale = epilogue_quant_scale(attrs.epilogue, 0);
+                                ip.zp_out = epilogue_quant_zero(attrs.epilogue, 0);
+                            }
                             ip.bias     = nullptr;          // the bias is per column
                             ip.col_bias = ibias_g ? ibias_g + ocn : nullptr;
                             if constexpr (std::is_same_v<TOut, uint8_t>) {

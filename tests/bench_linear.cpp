@@ -33,6 +33,8 @@
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
+#include "nnops/ops/activation.hpp"
+#include "nnops/ops/eltwise.hpp"
 #include "nnops/core/quant_params.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/q4_1.hpp"
@@ -861,5 +863,97 @@ NNOPS_BENCH(linear_threads) {
             std::printf(" %7.1f", p.run(*p.linear, ctx, kBudgetMs));
         }
         std::printf("\n");
+    }
+}
+
+NNOPS_BENCH(linear_gated_swiglu) {
+    // The gated form against the graph chain it replaces:
+    //   Linear[2N] → Silu(gate half) → Mul(gate, value)
+    // One call and one output pass against three calls and two extra passes
+    // over the activation tensor. Both arms compute the same products, so the
+    // ratio isolates the elementwise work the combine absorbs.
+    struct Case { int64_t M, K, N; };
+    const Case cases[] = {
+        {   1, 4096, 4096},   // decode step of a 4096-wide FFN
+        {  16, 4096, 4096},   // short chunk
+        { 512, 4096, 4096},   // prefill chunk
+    };
+    constexpr double kBudgetMs = 100.0;
+    constexpr int kRounds = 3;
+
+    std::printf("  f32 gated (SwiGLU) against Linear[2N]+Silu+Mul  "
+                "budget=%.0f ms/cell\n", kBudgetMs);
+    std::printf("   %5s %5s %5s |   gated    chain    ratio   (GFLOPS)\n",
+                "M", "K", "N");
+
+    for (const Case& c : cases) {
+        const Shape s{c.M, c.K, c.N};
+        const int64_t n2 = 2 * c.N;
+        constexpr DataType dt = DataType::f32;
+
+        std::vector<float> a_buf(random_fp<float>(s.M * s.K, 1));
+        std::vector<float> w_buf(random_fp<float>(n2 * s.K, 2));
+        std::vector<float> b_buf(random_fp<float>(n2, 3));
+        std::vector<float> tmp_buf(static_cast<size_t>(s.M * n2), 0.0f);
+        std::vector<float> out_buf(static_cast<size_t>(s.M * c.N), 0.0f);
+
+        const int64_t as[] = {s.M, s.K};
+        const int64_t ws[] = {n2, s.K};
+        const int64_t bs[] = {n2};
+        const int64_t ts[] = {s.M, n2};
+        const int64_t os[] = {s.M, c.N};
+        const int64_t gs[] = {s.M, c.N};
+        const int64_t esz = static_cast<int64_t>(sizeof(float));
+
+        TensorView a(std::span<const int64_t>(as, 2), dt, a_buf.data());
+        TensorView w(std::span<const int64_t>(ws, 2), dt, w_buf.data());
+        TensorView b(std::span<const int64_t>(bs, 1), dt, b_buf.data());
+        TensorView tmp(std::span<const int64_t>(ts, 2), dt, tmp_buf.data());
+        TensorView out(std::span<const int64_t>(os, 2), dt, out_buf.data());
+        // The chain's two halves are pitched views of the [M, 2N] temporary.
+        TensorView gate(std::span<const int64_t>(gs, 2), dt, tmp_buf.data(),
+                        n2 * esz);
+        TensorView value(std::span<const int64_t>(gs, 2), dt, tmp_buf.data() + c.N,
+                         n2 * esz);
+
+        const std::vector<TensorView> ins = {a, w, b};
+
+        LinearAttributes la;
+        la.gated = true;
+        auto op_gated = Linear::create(la, Backend::CPU);
+        auto op_plain = Linear::create(LinearAttributes{}, Backend::CPU);
+        ActivationAttributes aa;
+        aa.type = ActivationType::Silu;
+        auto op_silu = Activation::create(aa, Backend::CPU);
+        EltwiseAttributes ea;
+        ea.type = EltwiseType::Mul;
+        auto op_mul = Eltwise::create(ea, Backend::CPU);
+
+        const double flops = 2.0 * static_cast<double>(s.M) * static_cast<double>(n2)
+                           * static_cast<double>(s.K);
+
+        std::vector<double> vg, vc;
+        for (int r = 0; r < kRounds; ++r) {
+            fresh_state();
+            vg.push_back(time_gflops(
+                [&] {
+                    op_gated->compute(out, ins, ComputeContext{}, nullptr);
+                },
+                flops, kBudgetMs));
+            fresh_state();
+            vc.push_back(time_gflops(
+                [&] {
+                    op_plain->compute(tmp, ins, ComputeContext{}, nullptr);
+                    const TensorView gate_in[] = {gate};
+                    op_silu->compute(gate, gate_in, ComputeContext{}, nullptr);
+                    const TensorView mul_ins[] = {gate, value};
+                    op_mul->compute(out, mul_ins, ComputeContext{}, nullptr);
+                },
+                flops, kBudgetMs));
+        }
+        const double gg = median(vg), gc = median(vc);
+        std::printf("   %5lld %5lld %5lld | %7.1f  %7.1f   %5.3f\n",
+                    static_cast<long long>(s.M), static_cast<long long>(s.K),
+                    static_cast<long long>(c.N), gg, gc, gc > 0.0 ? gg / gc : 0.0);
     }
 }

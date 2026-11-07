@@ -263,6 +263,91 @@ NNOPS_TEST(linear_f32_random) {
     check_linear<float>(LinearAttributes{}, {x, w});
 }
 
+NNOPS_TEST(linear_gated_swiglu) {
+    // The gated form: weight [2N, K], bias [2N], output [..., N]. Compared
+    // against the reference, which combines the two halves itself — so the
+    // shape rule (N, not 2N), the bias split, the gate formula and the epilogue
+    // ordering all have to agree.
+    const int64_t M = 7, K = 37, N = 19;
+    const int64_t n2 = 2 * N;
+    auto [xv, x] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 11);
+    auto [wv, w] = test::make_random_tensor({n2, K}, -1.0f, 1.0f, 12);
+    auto [bv, b] = test::make_random_tensor({n2}, -0.5f, 0.5f, 13);
+
+    LinearAttributes plain;
+    plain.gated = true;
+    check_linear<float>(plain, {x, w, b});
+    check_linear<float>(plain, {x, w});
+
+    // GPT-OSS's SwiGLU: gate scaled 1.702, value offset 1.0, both clamped at 7.
+    LinearAttributes oss;
+    oss.gated = true;
+    oss.gate_alpha = 1.702f;
+    oss.gate_beta = 1.0f;
+    oss.gate_limit = 7.0f;
+    check_linear<float>(oss, {x, w, b});
+
+    // The epilogue and add_to belong to the combine, not to the two halves.
+    Epilogue relu;
+    relu.type = EpilogueActivateType::Relu;
+    LinearAttributes fused;
+    fused.gated = true;
+    fused.epilogue = relu;
+    fused.add_to = true;
+    const std::vector<float> seed(static_cast<size_t>(M * N), 0.25f);
+    check_linear<float>(fused, {x, w, b}, 1e-5f, seed);
+
+    // Rank-1 X and the f16 storage.
+    auto [xv1, x1] = test::make_random_tensor({K}, -1.0f, 1.0f, 14);
+    check_linear<float>(plain, {x1, w, b});
+    {
+        auto x16 = test::f32_to_f16(xv);
+        auto w16 = test::f32_to_f16(wv);
+        auto b16 = test::f32_to_f16(bv);
+        const int64_t xs[] = {M, K};
+        const int64_t ws[] = {n2, K};
+        const int64_t bs[] = {n2};
+        TensorView xf(xs, DataType::f16, x16.data());
+        TensorView wf(ws, DataType::f16, w16.data());
+        TensorView bf(bs, DataType::f16, b16.data());
+        check_linear<half>(plain, {xf, wf, bf}, 2e-2f);
+    }
+}
+
+NNOPS_TEST(linear_gated_shape_and_reject) {
+    const int64_t ishape[] = {2, 8};
+    const int64_t wshape[] = {11, 8};   // odd row count
+    float xd[16] = {};
+    float wd[88] = {};
+    TensorView x(ishape, DataType::f32, xd);
+    TensorView w(wshape, DataType::f32, wd);
+
+    LinearAttributes attrs;
+    attrs.gated = true;
+    auto op = Linear::create(attrs, Backend::CPU);
+    const TensorDesc desc_arr[] = {x.desc(), w.desc()};
+    const auto outs = op->getOutputTensorDesc(desc_arr);
+    NNOPS_EXPECT_EQ(outs[0].dims[1], int64_t(5));   // 11 / 2
+
+    std::vector<float> out_buf(static_cast<size_t>(outs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(outs[0], out_buf.data());
+    const TensorView ins[] = {x, w};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::invalid_argument);
+
+    // int8 has no gated route.
+    LinearAttributes q = attrs;
+    std::vector<int8_t> xi(16), wi(88);
+    TensorView xq(ishape, DataType::s8, xi.data());
+    TensorView wq(wshape, DataType::s8, wi.data());
+    auto qop = Linear::create(q, Backend::CPU);
+    const TensorDesc qd[] = {xq.desc(), wq.desc()};
+    const auto qouts = qop->getOutputTensorDesc(qd);
+    std::vector<float> qbuf(static_cast<size_t>(qouts[0].numel()), 0.0f);
+    auto qy = test::make_channel_first(qouts[0], qbuf.data());
+    const TensorView qins[] = {xq, wq};
+    NNOPS_EXPECT_TRUE(qop->compute(qy, qins) == Status::unsupported);
+}
+
 NNOPS_TEST(linear_batched) {
     const int64_t B = 3, M = 4, K = 16, N = 8;
     auto [xv, x] = test::make_random_tensor({B, M, K}, -1.0f, 1.0f, 4);

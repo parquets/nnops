@@ -27,6 +27,7 @@
 #include "simd_kernel/simd_epilogue.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <type_traits>
 #include <vector>
@@ -70,11 +71,14 @@ void linear_ref_impl(const LinearAttributes& attrs,
     const bool has_bias = inputs.size() > 2;
 
     const int64_t K = x.shape(x.rank() - 1);
-    const int64_t N = w.shape(0);
+    // The gated form's weight is [2N, K]; rows [0, N) are the gate, [N, 2N) the
+    // value, and the output has N columns.
+    const int64_t N = attrs.gated ? w.shape(0) / 2 : w.shape(0);
     const int64_t rows = (x.rank() >= 2) ? x.total_rows() : 1;
 
     constexpr bool quant   = std::is_integral_v<XT>;
     constexpr bool int_out = std::is_integral_v<CT>;
+    NNOPS_ASSERT(!attrs.gated || !quant);
     NNOPS_ASSERT(!has_bias || inputs[2].data_type() ==
                                  (int_out ? DataType::s32 : output.data_type()));
     NNOPS_ASSERT(int_out || output.data_type() == DataType::f32 ||
@@ -148,6 +152,27 @@ void linear_ref_impl(const LinearAttributes& attrs,
                 }
                 f = static_cast<float>(acc) *
                     (scale_at(qx, row) * scale_at(qw, n));
+            } else if (attrs.gated) {
+                // gate · sigmoid(alpha·gate) · (value + beta), both halves
+                // clamped to ±limit when finite — the MoE combine's formula.
+                const WT* vr = w.ptr<WT>(static_cast<size_t>(n + N));
+                float gate = 0.0f, value = 0.0f;
+                for (int64_t k = 0; k < K; ++k) {
+                    const float xv = as_float(xr[k]);
+                    gate += xv * as_float(wr[k]);
+                    value += xv * as_float(vr[k]);
+                }
+                if (bias != nullptr) {
+                    gate += as_float(bias[n]);
+                    value += as_float(bias[n + N]);
+                }
+                const float limit = attrs.gate_limit;
+                if (std::isfinite(limit)) {
+                    gate = std::max(std::min(gate, limit), -limit);
+                    value = std::max(std::min(value, limit), -limit);
+                }
+                const float sig = 1.0f / (1.0f + std::exp(-attrs.gate_alpha * gate));
+                f = gate * sig * (value + attrs.gate_beta);
             } else {
                 float sum = 0.0f;
                 for (int64_t k = 0; k < K; ++k) {
@@ -156,7 +181,8 @@ void linear_ref_impl(const LinearAttributes& attrs,
                 f = sum;
             }
 
-            if (bias != nullptr) { f += as_float(bias[n]); }
+            // A gated row already folded both halves' bias.
+            if (bias != nullptr && !attrs.gated) { f += as_float(bias[n]); }
             f = apply_epilogue(attrs.epilogue, f);
             if (attrs.add_to) { f += as_float(orow[n]); }
             store_as(orow[n], f);

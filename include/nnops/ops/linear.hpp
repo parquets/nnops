@@ -20,7 +20,8 @@
 /// `transpose_b`; the input is [..., K] and the output [..., N], leading dims
 /// preserved. Bias, epilogue and add_to ride the output write-back. The
 /// optional [N] bias follows the output dtype — int32 on an integer
-/// destination.
+/// destination. With `gated`, the weight carries the gate and value halves
+/// ([2N, K]) and the output is the SwiGLU combine of the two.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -28,6 +29,7 @@
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/epilogue.hpp"
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 
@@ -45,6 +47,22 @@ struct LinearAttributes {
     ///
     /// An integer output takes its bias as int32; see MatMulAttributes.
     DataType output_dtype = DataType::f32;
+
+    // ---- gated (SwiGLU) form ---------------------------------------------
+    // The weight is [2N, K] and the bias [2N]: rows [0, N) are the gate, rows
+    // [N, 2N) the value, and the output is [..., N]:
+    //
+    //   y = epilogue( gate · sigmoid(alpha·gate) · (value + beta) )
+    //
+    // with both halves clamped to ±limit when limit is finite. alpha 1, beta 0,
+    // limit +inf is standard SwiGLU; GPT-OSS uses 1.702 / 1.0 / 7.0. This is
+    // the same combine the MoE operator applies inside an expert, so a dense
+    // FFN's gate/up pair costs one GEMM and one output pass instead of a GEMM,
+    // a split and two elementwise passes. fp operands only.
+    bool gated = false;
+    float gate_alpha = 1.0f;
+    float gate_beta = 0.0f;
+    float gate_limit = std::numeric_limits<float>::infinity();
 };
 
 class Linear : public OpBase {

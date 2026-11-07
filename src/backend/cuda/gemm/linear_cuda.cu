@@ -21,6 +21,8 @@ Status linear_cuda(const LinearAttributes& attrs, TensorView& output,
     const TensorView& w = inputs[1];
     const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
 
+    // The SwiGLU combine has no CUDA route yet; the op is CPU-only in that form.
+    if (attrs.gated) { return Status::unsupported; }
     const DataType dt = x.data_type();
     if ((dt != DataType::f32 && dt != DataType::f16) || w.data_type() != dt) {
         return Status::unsupported;
