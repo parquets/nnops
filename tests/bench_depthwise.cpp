@@ -271,12 +271,12 @@ void channel_first_kernel(const float* in, float* out, const float* w, const flo
         if (h4) {
             for (; oh + 3 < OH; oh += 4) {
                 p.oh = oh;
-                k::dwconv_channel_first_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
+                k::dwconv_channel_first_h4(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, false, edges);
             }
         }
         for (; oh < OH; ++oh) {
             p.oh = oh;
-            k::dwconv_channel_first(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, edges);
+            k::dwconv_channel_first(out_c + oh * OW, in_c, w_c, b[ch], p, ep, false, false, edges);
         }
     }
 }
