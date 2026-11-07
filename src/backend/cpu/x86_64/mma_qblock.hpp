@@ -64,6 +64,11 @@ struct Q4Block {
     static constexpr int fused_max_m_trans_f16 = 32;
     static constexpr int fused_max_m_copy = 8;
 
+    /// Rows per kernel call: eight for the dot kernel, two for the outer
+    /// product.
+    static constexpr int panel_trans = 8;
+    static constexpr int panel_copy = 2;
+
     static inline void decode_ps(const uint8_t* p, __m256& v0, __m256& v1,
                                  __m256& v2, __m256& v3) noexcept {
         decode_q4_1_block_ps(p, v0, v1, v2, v3);

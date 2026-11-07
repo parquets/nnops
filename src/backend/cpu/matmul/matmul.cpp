@@ -1087,7 +1087,7 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     default: break;
     }
 
-#if defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
     // Small-M block quant (Q4_1): decode straight into the product, before the
     // plan and the scratch. Only a transposed A is out of reach.
     if ((dt_a == DataType::f32 || dt_a == DataType::f16) &&

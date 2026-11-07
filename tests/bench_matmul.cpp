@@ -1682,7 +1682,7 @@ NNOPS_BENCH(matmul_q4_m_ladder) {
 /// limits, 0 forces packed, > 0 overrides the M limit.
 template <typename Act>
 void qblock_fused_ab(const char* tag) {
-#if defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
     const int64_t K = 4096, N = 4096;
     const std::vector<int64_t> ms{1, 2, 4, 8, 16, 32, 64, 128};
     const std::vector<int> threads{1, 4};
@@ -1734,7 +1734,7 @@ void qblock_fused_ab(const char* tag) {
     }
 #else
     (void)tag;
-    std::printf("  fused block-quant route: x86_64 only\n");
+    std::printf("  fused block-quant route: x86_64 / aarch64 only\n");
 #endif
 }
 

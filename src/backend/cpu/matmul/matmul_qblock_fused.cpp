@@ -5,12 +5,13 @@
 /// them to scratch and reads them back. At small M there are too few
 /// output rows to amortise that round trip, so this route skips it: no packed
 /// B, no workspace, no k-blocking — each kernel sweeps K once and decodes B in
-/// registers. x86-only (the arch's mma_qblock_f32_{trans,copy}); everywhere
-/// else the packed route handles the block formats.
+/// registers. The kernels are per-arch (mma_qblock.hpp: AVX2+FMA on x86_64,
+/// NEON on aarch64); everywhere else the packed route handles the block
+/// formats.
 ///
 /// The walk: one flat task list over (batch, n tile), a tile being two
-/// 32-value blocks; inside a tile the rows go out one panel at a time — 8 for
-/// the dot kernel, 2 for the outer product.
+/// 32-value blocks; inside a tile the rows go out one panel at a time, the
+/// width the arch's policy names (fused_max_m_* / panel_* in its Q4Block).
 ///
 /// Admission is the block policy's measured per-layout M limit
 /// (arch::Q4Block::fused_max_m_trans / _trans_f16 / _copy in mma_qblock.hpp);
@@ -30,7 +31,7 @@
 
 namespace nnops::backend::cpu {
 
-#if defined(NNOPS_ARCH_X86_64)
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 
 int qblock_fused_max_m_override = -1;
 
@@ -62,7 +63,7 @@ inline void qblock_fused_dispatch(int M, int nc, int K, AC* C, int ldc,
                                   const AC* A, int lda, const uint8_t* B,
                                   int64_t row_blocks, int n_start, float alpha,
                                   float cmin, float cmax) {
-    constexpr int kPanel = TRANS ? 8 : 2;
+    constexpr int kPanel = TRANS ? BQ::panel_trans : BQ::panel_copy;
     for (int m = 0; m < M; m += kPanel) {
         qblock_fused_rows<BQ, AC, ZERO, TRANS, kPanel>(
             std::min(kPanel, M - m), nc, K, C + static_cast<int64_t>(m) * ldc,
@@ -190,6 +191,6 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs,
     }
 }
 
-#endif  // NNOPS_ARCH_X86_64
+#endif  // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64
 
 }  // namespace nnops::backend::cpu

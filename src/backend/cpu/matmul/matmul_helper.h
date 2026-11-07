@@ -47,6 +47,7 @@
 #include "backend/cpu/aarch64/pack_q4_1.hpp"
 #include "backend/cpu/aarch64/mma_f16.hpp"
 #include "backend/cpu/aarch64/mma_f32.hpp"
+#include "backend/cpu/aarch64/mma_qblock.hpp"
 #include "backend/cpu/aarch64/pack_dp4a_i8.hpp"
 #include "backend/cpu/aarch64/mma_i8.hpp"
 #include "backend/cpu/aarch64/matmul_naive.hpp"
@@ -688,7 +689,7 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           int num_threads = 1,
                           bool use_thread_slots = false);
 
-#ifdef NNOPS_ARCH_X86_64
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
 /// Diagnostic cap on the fused block-quant small-M route
 /// (matmul_qblock_fused.cpp): negative keeps the per-layout M limits, 0 disables
 /// the route, > 0 caps M. Benchmarks use it to A/B the fused and packed routes
