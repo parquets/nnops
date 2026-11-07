@@ -3,6 +3,9 @@
 /// @brief Linear (fully-connected) operator: output = input × weight^T + bias.
 ///
 ///   f32 × f32, f16 × f16             → output follows the input dtype
+///   f32 : q4_1, f16 : q4_1           → the same, with a block-packed weight
+///                                      (32 values per 20-byte block, decoded
+///                                      inside the RHS pack or the fused kernel)
 ///   u8 × s8, s8 × s8 (quantized)     → output follows `output_dtype`:
 ///                                      f32/f16 dequantizes, s32/s8/u8 stays
 ///                                      integral
@@ -73,8 +76,11 @@ public:
     /// the whole K, which is what removes the per-call RHS pack — and why alpha
     /// must be 1 (a prepacked B cannot carry a per-call scale). An s8 weight is
     /// packed into the same panels cut into ⌈K/512⌉ k segments, read by an s8
-    /// activation only (alpha is ignored there). Any other dtype — u8 among
-    /// them — has no packed form and the query returns an empty view.
+    /// activation only (alpha is ignored there). Any other dtype — u8 and the
+    /// block-packed q4_1 among them — has no packed form and the query returns
+    /// an empty view: a q4_1 weight is already its own compact form, and the
+    /// only blob that would remove its per-call decode is a dense one, which
+    /// would have to name the activation type it is decoded for.
     void prepackWeights(std::span<const TensorView> inputs,
                         std::span<TensorView> outputs,
                         const ComputeContext& ctx = {}) override;

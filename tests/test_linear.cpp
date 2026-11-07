@@ -27,6 +27,7 @@
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/core/quant_params.hpp"
+#include "nnops/detail/q4_1.hpp"
 #include "nnops/detail/half.hpp"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
@@ -770,6 +771,220 @@ NNOPS_TEST(linear_prepacked_weight_quantized_has_no_blob) {
     auto op = Linear::create(Backend::CPU);
     TensorView q;
     const TensorView wq[] = {weight};
+    TensorView oq[] = {q};
+    op->prepackWeights(wq, oq);
+    NNOPS_EXPECT_TRUE(oq[0].is_empty());
+    NNOPS_EXPECT_EQ(oq[0].rank(), int64_t(0));
+}
+
+// ---- Q4_1 weights ----------------------------------------------------------
+
+namespace {
+
+/// One [rows, cols] Q4_1 matrix (whole-block row padding) plus its decoded
+/// values; d and m are f16-exact, so the decoded values are exact in f32.
+struct Q4Weight {
+    std::vector<uint8_t> bytes;
+    std::vector<float>   decoded;
+    int64_t rows = 0, cols = 0, blocks = 0;
+};
+
+Q4Weight make_q4_weight(int64_t rows, int64_t cols, uint32_t seed) {
+    Q4Weight w;
+    w.rows = rows;
+    w.cols = cols;
+    w.blocks = (cols + q4_1_block_elems - 1) / q4_1_block_elems;
+    w.bytes.assign(static_cast<size_t>(rows * w.blocks
+                                       * static_cast<int64_t>(q4_1_block_bytes)), 0);
+    w.decoded.assign(static_cast<size_t>(rows * cols), 0.0f);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t b = 0; b < w.blocks; ++b) {
+            uint8_t* blk = w.bytes.data() + static_cast<size_t>(
+                (r * w.blocks + b) * static_cast<int64_t>(q4_1_block_bytes));
+            const float d = 0.125f * static_cast<float>(1 + (seed + r + b) % 8);
+            const float m = -0.25f * static_cast<float>((seed + 2 * r + b) % 4);
+            const uint16_t d_bits = backend::cpu::half_to_bits(float_to_half(d));
+            const uint16_t m_bits = backend::cpu::half_to_bits(float_to_half(m));
+            std::memcpy(blk + 0, &d_bits, 2);
+            std::memcpy(blk + 2, &m_bits, 2);
+            for (int j = 0; j < 16; ++j) {
+                const int q0 = static_cast<int>((seed + r * 13 + b * 7 + j * 5) & 0x0F);
+                const int q1 = static_cast<int>((seed + r * 7 + b * 11 + j * 3) & 0x0F);
+                blk[4 + j] = static_cast<uint8_t>(q0 | (q1 << 4));
+            }
+            const int64_t base = r * cols + b * q4_1_block_elems;
+            const int n = static_cast<int>(std::min<int64_t>(
+                q4_1_block_elems, cols - b * q4_1_block_elems));
+            for (int j = 0; j < n; ++j) {
+                const int q = (j < 16) ? (blk[4 + j] & 0x0F) : (blk[4 + j - 16] >> 4);
+                w.decoded[static_cast<size_t>(base + j)] =
+                    half_to_float(float_to_half(d)) * static_cast<float>(q) +
+                    half_to_float(float_to_half(m));
+            }
+        }
+    }
+    return w;
+}
+
+template <class T>
+T from_f32(float f) {
+    if constexpr (std::is_same_v<T, half>) { return float_to_half(f); }
+    else { return f; }
+}
+
+/// Linear with a q4_1 weight against C = A × Wᵀ from the decoded values, then
+/// the bias and the activation.
+template <class T>
+void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
+                     EpilogueActivateType act, float tol, uint32_t seed)
+{
+    Q4Weight w = make_q4_weight(N, K, seed);
+
+    std::vector<T> a_buf(static_cast<size_t>(M * K));
+    nnops::test::XorShift128 rng(seed + 1);
+    for (auto& v : a_buf) {
+        v = from_f32<T>(rng.next_float(-1.0f, 1.0f));
+    }
+    std::vector<T> b_buf(static_cast<size_t>(N));
+    for (auto& v : b_buf) {
+        v = from_f32<T>(rng.next_float(-0.5f, 0.5f));
+    }
+
+    const int64_t ashape[] = {M, K};
+    const int64_t wshape[] = {N, K};
+    const int64_t bshape[] = {N};
+    TensorView a(ashape, std::is_same_v<T, half> ? DataType::f16 : DataType::f32,
+                 a_buf.data());
+    TensorView wv(wshape, DataType::q4_1, w.bytes.data());
+    TensorView bv(bshape, std::is_same_v<T, half> ? DataType::f16 : DataType::f32,
+                  b_buf.data());
+
+    LinearAttributes attrs;
+    attrs.epilogue.type = act;
+    auto op = Linear::create(attrs, Backend::CPU);
+
+    std::vector<TensorDesc> descs = {a.desc(), wv.desc()};
+    if (with_bias) { descs.push_back(bv.desc()); }
+    const TensorDesc od = op->getOutputTensorDesc(descs)[0];
+    NNOPS_EXPECT_EQ(od.dtype, a.data_type());
+    NNOPS_EXPECT_EQ(od.dims[0], M);
+    NNOPS_EXPECT_EQ(od.dims[1], N);
+
+    std::vector<T> out(static_cast<size_t>(M * N), T{});
+    TensorView ov(std::span<const int64_t>(od.dims.data(),
+                                           static_cast<size_t>(od.rank)),
+                  od.dtype, out.data());
+    const std::vector<TensorView> ins = with_bias
+        ? std::vector<TensorView>{a, wv, bv} : std::vector<TensorView>{a, wv};
+    NNOPS_EXPECT_EQ(op->compute(ov, ins), Status::ok);
+
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += to_f(a_buf[static_cast<size_t>(m * K + k)]) *
+                       w.decoded[static_cast<size_t>(n * K + k)];
+            }
+            if (with_bias) { acc += to_f(b_buf[static_cast<size_t>(n)]); }
+            if (act == EpilogueActivateType::Relu6) {
+                acc = std::min(std::max(acc, 0.0f), 6.0f);
+            } else if (act == EpilogueActivateType::Relu) {
+                acc = std::max(acc, 0.0f);
+            }
+            const size_t i = static_cast<size_t>(m * N + n);
+            NNOPS_EXPECT_NEAR(to_f(out[i]), acc, tol * std::max(1.0f, std::abs(acc)));
+        }
+    }
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(linear_q4_1_weight) {
+    const float tol = 2e-4f;
+    // M = 1 is the decode shape and the fused kernel's home; 17 is past the f32
+    // dot kernel's M limit (16), so it sweeps the packed plan instead. K = 70 and
+    // N = 37 are off the 32-value block and the 16-wide panel.
+    check_linear_q4<float>(1, 70, 37, false, EpilogueActivateType::None, tol, 31);
+    check_linear_q4<float>(1, 70, 37, true, EpilogueActivateType::None, tol, 32);
+    check_linear_q4<float>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 33);
+    check_linear_q4<float>(5, 33, 18, true, EpilogueActivateType::Relu6, tol, 34);
+    check_linear_q4<float>(64, 96, 44, false, EpilogueActivateType::None, tol, 35);
+}
+
+NNOPS_TEST(linear_q4_1_weight_f16) {
+    // f16 activations are the w4a16 decode case: the weight decodes into f32
+    // registers and the output round-trips through f16 once.
+    const float tol = test::kF16AccumTol;
+    check_linear_q4<half>(1, 71, 33, false, EpilogueActivateType::None, tol, 41);
+    check_linear_q4<half>(32, 71, 33, true, EpilogueActivateType::None, tol, 42);
+    check_linear_q4<half>(33, 71, 33, true, EpilogueActivateType::Relu6, tol, 43);
+    check_linear_q4<half>(8, 37, 70, true, EpilogueActivateType::None, tol, 44);
+}
+
+NNOPS_TEST(linear_q4_1_rank1_and_batch) {
+    // A rank-1 X rides the same buffers as one row; a batched X takes MatMul's
+    // per-batch offset over the same weight.
+    const int64_t K = 40, N = 9;
+    Q4Weight w = make_q4_weight(N, K, 51);
+    const int64_t wshape[] = {N, K};
+    TensorView wv(wshape, DataType::q4_1, w.bytes.data());
+
+    std::vector<float> x(static_cast<size_t>(K));
+    nnops::test::XorShift128 rng(52);
+    rng.fill_float(x.data(), K, -1.0f, 1.0f);
+
+    const int64_t xshape[] = {K};
+    const int64_t oshape[] = {N};
+    TensorView xv(xshape, DataType::f32, x.data());
+    std::vector<float> out(static_cast<size_t>(N), 0.0f);
+    TensorView ov(oshape, DataType::f32, out.data());
+
+    auto op = Linear::create(Backend::CPU);
+    const TensorView in_a[] = {xv, wv};
+    NNOPS_EXPECT_EQ(op->compute(ov, in_a), Status::ok);
+    for (int64_t n = 0; n < N; ++n) {
+        float acc = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+            acc += x[static_cast<size_t>(k)] * w.decoded[static_cast<size_t>(n * K + k)];
+        }
+        NNOPS_EXPECT_NEAR(out[static_cast<size_t>(n)], acc, 2e-4f * std::max(1.0f, std::abs(acc)));
+    }
+
+    const int64_t B = 3;
+    std::vector<float> xb(static_cast<size_t>(B * K));
+    for (auto& v : xb) { v = rng.next_float(-1.0f, 1.0f); }
+    const int64_t xbshape[] = {B, K};
+    const int64_t obshape[] = {B, N};
+    TensorView xbv(xbshape, DataType::f32, xb.data());
+    std::vector<float> outb(static_cast<size_t>(B * N), 0.0f);
+    TensorView obv(obshape, DataType::f32, outb.data());
+
+    const TensorView in_b[] = {xbv, wv};
+    NNOPS_EXPECT_EQ(op->compute(obv, in_b), Status::ok);
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += xb[static_cast<size_t>(b * K + k)] *
+                       w.decoded[static_cast<size_t>(n * K + k)];
+            }
+            NNOPS_EXPECT_NEAR(outb[static_cast<size_t>(b * N + n)], acc,
+                              2e-4f * std::max(1.0f, std::abs(acc)));
+        }
+    }
+}
+
+NNOPS_TEST(linear_q4_1_has_no_packed_blob) {
+    // A q4_1 weight is already its own compact form; the query answers rank 0,
+    // so a caller's prepack path falls back to the raw weight.
+    Q4Weight w = make_q4_weight(8, 64, 61);
+    const int64_t wshape[] = {8, 64};
+    TensorView wv(wshape, DataType::q4_1, w.bytes.data());
+
+    auto op = Linear::create(Backend::CPU);
+    TensorView q;
+    const TensorView wq[] = {wv};
     TensorView oq[] = {q};
     op->prepackWeights(wq, oq);
     NNOPS_EXPECT_TRUE(oq[0].is_empty());

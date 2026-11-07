@@ -5,6 +5,10 @@
 /// drives the MatMul kernel instead of duplicating the GEMM:
 ///
 ///   - f32/f16 X and W: MatMul's fp route; the output keeps X's dtype.
+///   - f32/f16 X × q4_1 W: MatMul's block-quant routes — the fused small-M
+///     kernels decode into the accumulator, the packed plan decodes into its
+///     panels — so the weight stays 20 bytes per 32 values. The output keeps
+///     X's dtype.
 ///   - u8|s8 X × s8 W:  MatMul's int8 route, with the output dtype taken from
 ///     `attrs.output_dtype` — f32/f16 dequantizes every int32 accumulate with
 ///     X's and W's QuantParams, s32/s8/u8 keeps it integral (requantizing the
@@ -96,8 +100,12 @@ Status linear_cpu(const LinearAttributes& attrs,
     NNOPS_ASSERT(output.data_type() == out_dt);
 
     const bool quant = is_int8_matmul(x_dt, w_dt);
-    NNOPS_ASSERT(quant || (x_dt == w_dt &&
-                           (x_dt == DataType::f32 || x_dt == DataType::f16)));
+    // A block-packed weight (q4_1) is self-describing and decodes to X's type
+    // inside MatMul, so it pairs with a float activation only.
+    const bool block_rhs = is_block_packed_dtype(w_dt) &&
+                           (x_dt == DataType::f32 || x_dt == DataType::f16);
+    NNOPS_ASSERT(quant || block_rhs ||
+                 (x_dt == w_dt && (x_dt == DataType::f32 || x_dt == DataType::f16)));
     // Integer output -> int32 bias (MatMul's rule).
     const bool int_out = out_dt == DataType::s32 || out_dt == DataType::s8 ||
                          out_dt == DataType::u8;
