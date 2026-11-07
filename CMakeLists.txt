@@ -32,6 +32,14 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(AMD64)|(amd64)|(i686)")
     add_compile_options(-mavx2 -mfma -mf16c -mavxvnni)
 endif()
 
+# Release archives carry no debug info. The NDK toolchain puts -g into
+# CMAKE_CXX_FLAGS for every configuration, and on arm64-v8a that is 90% of a
+# Release libnnops_cpu.a (27 MB of .debug_* plus 21 MB of their relocations at
+# 54 MB) — -g0 here, after the toolchain's flags, brings it to 5 MB.
+if(NOT MSVC)
+    add_compile_options($<$<CONFIG:Release>:-g0>)
+endif()
+
 # ---- Export compile commands (for IDE support) ----
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
