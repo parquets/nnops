@@ -26,9 +26,10 @@
 /// requantized s8/u8 destination (see output_dtype).
 ///
 /// The gather form is used, so every output pixel is accumulated once and
-/// add_to needs no save/restore pass: output (oh, ow) reads input (ih, iw)
-/// where oh + PH - kh·DH == ih·SH, which pins each tap to one residue of the
-/// output coordinate. The CPU driver hoists those residue facts out of the
+/// add_to needs no save/restore pass — nor does the pre-activation order, which
+/// folds the destination into the accumulate before the epilogue: output
+/// (oh, ow) reads input (ih, iw) where oh + PH - kh·DH == ih·SH, which pins
+/// each tap to one residue of the output coordinate. The CPU driver hoists those residue facts out of the
 /// pixel loop — the (kh, ih) row pairs for one output row, the (kw, shift)
 /// column pairs for one residue class — and then runs a boundary-free vector
 /// loop over the class steps, with the edges left to the scalar tap loop.
@@ -76,6 +77,14 @@ struct DepthwiseTransposeConv2DAttributes {
 
     /// Accumulate into the existing output instead of overwriting (residual).
     bool add_to = false;
+
+    /// Order of the add_to term relative to the epilogue:
+    ///   false: y = epilogue(conv) + residual
+    ///   true:  y = epilogue(conv + residual)
+    /// Only meaningful with add_to. The fp CPU routes — both layouts — and the
+    /// reference implement it; the quantized route refuses add_to, so it has no
+    /// pre-activation form either.
+    bool residual_pre_activation = false;
 
     // ---- quantized route (s8 weight, u8/s8/f16/f32 activation) --------------
     // Mirror Conv2D's two attributes: same names, same meaning; ignored on the

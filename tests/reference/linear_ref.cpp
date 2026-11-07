@@ -183,8 +183,11 @@ void linear_ref_impl(const LinearAttributes& attrs,
 
             // A gated row already folded both halves' bias.
             if (bias != nullptr && !attrs.gated) { f += as_float(bias[n]); }
+            // The pre-activation order is the ResNet block's: the residual joins
+            // the sum the epilogue clamps and activates.
+            if (attrs.add_to && attrs.residual_pre_activation) { f += as_float(orow[n]); }
             f = apply_epilogue(attrs.epilogue, f);
-            if (attrs.add_to) { f += as_float(orow[n]); }
+            if (attrs.add_to && !attrs.residual_pre_activation) { f += as_float(orow[n]); }
             store_as(orow[n], f);
         }
     });

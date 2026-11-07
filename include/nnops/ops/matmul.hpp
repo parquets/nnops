@@ -7,6 +7,8 @@
 /// activation and is never scaled by alpha. Its dtype follows the output — the
 /// output's fp dtype on an fp destination, int32 on an integer one, where it is
 /// added to the compensated int32 accumulate before the activation.
+/// `residual_pre_activation` folds old C into the same sum on every route,
+/// including the integer ones that ignore beta.
 ///
 /// Routes: f32/f16 × f32/f16 (including Q4_1 block weights), s8|u8 × s8 with
 /// output_dtype s32/s8/u8 (integral) or f32/f16 (dequantized), and an fp
@@ -38,6 +40,15 @@ struct MatMulAttributes {
 
     /// Scale for old C; beta = 0 (default) overwrites C, beta = 1 accumulates.
     float beta = 0.0f;
+
+    /// Add the old C to the product before the epilogue — epilogue(A×B + bias +
+    /// C_old), the ResNet pre-activation order — so the clamp and the activation
+    /// see the residual. The destination is read before it is written, so it
+    /// must hold the residual on entry. The routes run the beta = 1 order on
+    /// every CPU route, the integer ones included (they ignore beta natively);
+    /// when this is set, `beta` is not used. Only an fp output is supported (a
+    /// requantized residual would need its own add).
+    bool residual_pre_activation = false;
 
     /// Integer-path output type: s32 (default) is the raw int32 accumulate
     /// (MatMulInteger semantics); s8/u8 requantize it with the output's

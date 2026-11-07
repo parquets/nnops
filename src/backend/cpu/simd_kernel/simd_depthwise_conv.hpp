@@ -85,10 +85,13 @@ struct DwConvParams {
 };
 
 /// R output rows per call; W is the weight type and Tag picks the epilogue overload.
+///
+/// @p add_to adds the destination after the epilogue, @p pre_act folds it into
+/// the accumulator before it; the driver sets at most one of the two.
 template <int R, int NV, typename W, typename Tag, typename Src, typename Dst, typename V>
 inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                         const Epilogue& epilogue, const Src (&srcs)[NV],
-                        const Dst (&dsts)[NV], const V (&vbias)[NV])
+                        const Dst (&dsts)[NV], const V (&vbias)[NV], bool pre_act)
 {
     using InPtr = const typename Src::elem*;
     const int64_t pix = p.pix_stride;
@@ -196,9 +199,10 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                 continue;
             }
             for (int k = 0; k < NV; ++k) {
+                V a = acc[r][k];
+                if (pre_act) { a = v_add(a, dsts[k].load(r, ow)); }
                 dsts[k].store(r, ow,
-                              nnops::backend::cpu::apply_epilogue_vec(epilogue, tag,
-                                                                      acc[r][k]));
+                              nnops::backend::cpu::apply_epilogue_vec(epilogue, tag, a));
             }
         }
     }
@@ -277,7 +281,8 @@ inline void dwconv_copy_prefix(T* dst, const T* src, int64_t n)
 template <int R, int SW, typename T>
 inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bias,
                                const DwConvParams& p, const Epilogue& epilogue,
-                               bool add_to, const DwChannelFirstEdges& edges)
+                               bool add_to, bool pre_act,
+                               const DwChannelFirstEdges& edges)
 {
     constexpr int64_t L = simd_lane_for<T>;
     const T zero = static_cast<T>(0);
@@ -406,8 +411,18 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
         const int64_t lanes = (p.OW - ow < L) ? p.OW - ow : L;
         for (int r = 0; r < R; ++r) {
             if (p.oh + r >= p.OH) { continue; }
-            const auto v = nnops::backend::cpu::apply_epilogue_vec(epilogue, out, acc[r]);
             T* dst = out + r * p.out_row_stride + ow;
+            auto a = acc[r];
+            if (pre_act) {
+                if (lanes == L) {
+                    a = v_add(a, v_load(dst));
+                } else {
+                    alignas(32) T cur[L] = {};
+                    dwconv_copy_prefix<T>(cur, dst, lanes);
+                    a = v_add(a, v_load(cur));
+                }
+            }
+            const auto v = nnops::backend::cpu::apply_epilogue_vec(epilogue, out, a);
             if (lanes == L) {
                 v_store_add(dst, v, add_to);
             } else {
@@ -435,12 +450,12 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
 template <typename T>
 inline void dwconv_channel_first_h4(T* out, const T* in, const T* w, float bias,
                              const DwConvParams& p, const Epilogue& epilogue,
-                             bool add_to, const DwChannelFirstEdges& edges)
+                             bool add_to, bool pre_act, const DwChannelFirstEdges& edges)
 {
     switch (p.SW) {
-        case 1:  dwconv_channel_first_rows<4, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        case 2:  dwconv_channel_first_rows<4, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        default: dwconv_channel_first_rows<4, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 1:  dwconv_channel_first_rows<4, 1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
+        case 2:  dwconv_channel_first_rows<4, 2>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
+        default: dwconv_channel_first_rows<4, 0>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
     }
 }
 
@@ -448,12 +463,12 @@ inline void dwconv_channel_first_h4(T* out, const T* in, const T* w, float bias,
 template <typename T>
 inline void dwconv_channel_first(T* out, const T* in, const T* w, float bias,
                           const DwConvParams& p, const Epilogue& epilogue,
-                          bool add_to, const DwChannelFirstEdges& edges)
+                          bool add_to, bool pre_act, const DwChannelFirstEdges& edges)
 {
     switch (p.SW) {
-        case 1:  dwconv_channel_first_rows<1, 1>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        case 2:  dwconv_channel_first_rows<1, 2>(out, in, w, bias, p, epilogue, add_to, edges); break;
-        default: dwconv_channel_first_rows<1, 0>(out, in, w, bias, p, epilogue, add_to, edges); break;
+        case 1:  dwconv_channel_first_rows<1, 1>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
+        case 2:  dwconv_channel_first_rows<1, 2>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
+        default: dwconv_channel_first_rows<1, 0>(out, in, w, bias, p, epilogue, add_to, pre_act, edges); break;
     }
 }
 
@@ -485,7 +500,7 @@ inline bool dwconv_last3x3_ok(const DwConvParams& p)
 template <int R, int SH, typename T>
 inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
                            const T* bias_vec, const DwConvParams& p,
-                           const Epilogue& epilogue, bool add_to)
+                           const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     using V = decltype(v_load(in_img));
     const int64_t pix = p.pix_stride;
@@ -548,8 +563,10 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
         for (int r = 0; r < R; ++r) {
             if (p.oh + r >= p.OH) { continue; }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            V a = acc[r];
+            if (pre_act) { a = v_add(a, v_load(dst)); }
             v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue,
-                                                                     out_rows, acc[r]),
+                                                                     out_rows, a),
                         add_to);
         }
     }
@@ -564,7 +581,8 @@ template <int R, int SH, bool TOP_OK, bool BOT_OK, typename T>
 inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
                                      const T* w_tap0, const T* bias_vec,
                                      const DwConvParams& p,
-                                     const Epilogue& epilogue, bool add_to)
+                                     const Epilogue& epilogue, bool add_to,
+                                     bool pre_act)
 {
     using V = decltype(v_load(in_img));
     constexpr int64_t kL = kChannelLanes;
@@ -640,10 +658,16 @@ inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
         for (int r = 0; r < R; ++r) {
             if (p.oh + r >= p.OH) { continue; }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            V a0 = acc[r][0];
+            V a1 = acc[r][1];
+            if (pre_act) {
+                a0 = v_add(a0, v_load(dst));
+                a1 = v_add(a1, v_load(dst + kL));
+            }
             v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(
-                                 epilogue, out_rows, acc[r][0]), add_to);
+                                 epilogue, out_rows, a0), add_to);
             v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(
-                                      epilogue, out_rows, acc[r][1]), add_to);
+                                      epilogue, out_rows, a1), add_to);
         }
     }
 }
@@ -656,7 +680,7 @@ inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
 template <int R, int SH, typename T>
 inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
                               const T* bias_vec, const DwConvParams& p,
-                              const Epilogue& epilogue, bool add_to)
+                              const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     // A group misses at most its top row when `oh*SH - PH` is -1 and at most its
     // bottom row when the last one is exactly `IH`; a wider reach keeps the
@@ -669,17 +693,17 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
         if (top_ok) {
             if (bot_ok) {
                 dwconv_last3x3_16_masked<R, SH, true, true>(
-                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
             } else {
                 dwconv_last3x3_16_masked<R, SH, true, false>(
-                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
             }
         } else if (bot_ok) {
             dwconv_last3x3_16_masked<R, SH, false, true>(
-                out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+                out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
         } else {
             dwconv_last3x3_16_masked<R, SH, false, false>(
-                out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+                out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
         }
         return;
     }
@@ -751,10 +775,16 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
         for (int r = 0; r < R; ++r) {
             if (p.oh + r >= p.OH) { continue; }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            V a0 = acc[r][0];
+            V a1 = acc[r][1];
+            if (pre_act) {
+                a0 = v_add(a0, v_load(dst));
+                a1 = v_add(a1, v_load(dst + kL));
+            }
             v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(
-                                 epilogue, out_rows, acc[r][0]), add_to);
+                                 epilogue, out_rows, a0), add_to);
             v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(
-                                      epilogue, out_rows, acc[r][1]), add_to);
+                                      epilogue, out_rows, a1), add_to);
         }
     }
 }
@@ -763,15 +793,15 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
 template <int R, typename T>
 inline void dwconv_last8(T* out_rows, const T* in_img, const T* w_tap0,
                          const T* bias_vec, const DwConvParams& p,
-                         const Epilogue& epilogue, bool add_to)
+                         const Epilogue& epilogue, bool add_to, bool pre_act)
 {
     if (dwconv_last3x3_ok(p)) {
         if (p.SH == 1) {
             dwconv_last3x3<R, 1>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
-                                 add_to);
+                                 add_to, pre_act);
         } else {
             dwconv_last3x3<R, 2>(out_rows, in_img, w_tap0, bias_vec, p, epilogue,
-                                 add_to);
+                                 add_to, pre_act);
         }
         return;
     }
@@ -781,22 +811,23 @@ inline void dwconv_last8(T* out_rows, const T* in_img, const T* w_tap0,
                                                   kChannelLanes}};
     const auto vb = bias_vec ? v_load(bias_vec) : v_zero(out_rows);
     const decltype(vb) vbias[1] = {vb};
-    dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+    dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias, pre_act);
 }
 
 template <int R, typename T>
 inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
                         const T* bias_vec, const DwConvParams& p,
-                        const Epilogue& epilogue, bool add_to, int64_t lanes)
+                        const Epilogue& epilogue, bool add_to, bool pre_act,
+                        int64_t lanes)
 {
     if (lanes > kChannelLanes) {
         if (lanes == 2 * kChannelLanes && dwconv_last3x3_ok(p)) {
             if (p.SH == 1) {
                 dwconv_last3x3_16<R, 1>(out_rows, in_img, w_tap0, bias_vec, p,
-                                        epilogue, add_to);
+                                        epilogue, add_to, pre_act);
             } else {
                 dwconv_last3x3_16<R, 2>(out_rows, in_img, w_tap0, bias_vec, p,
-                                        epilogue, add_to);
+                                        epilogue, add_to, pre_act);
             }
             return;
         }
@@ -811,18 +842,19 @@ inline void dwconv_last(T* out_rows, const T* in_img, const T* w_tap0,
                            kChannelLanes},
             FpDst<T, true>{out_rows + kChannelLanes, p.out_row_stride, add_to,
                            p.pix_stride, kChannelLanes}};
-        dwconv_rows<R, 2>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+        dwconv_rows<R, 2>(p, w_tap0, out_rows, epilogue, src, dst, vbias, pre_act);
         return;
     }
     const auto vb = bias_vec ? load_lanes(bias_vec, lanes) : v_zero(out_rows);
     const decltype(vb) vbias[1] = {vb};
     if (lanes == kChannelLanes) {
-        dwconv_last8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to);
+        dwconv_last8<R>(out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                        pre_act);
     } else {
         const FpSrc<T, false> src[1] = {FpSrc<T, false>{in_img, lanes}};
         const FpDst<T, false> dst[1] = {
             FpDst<T, false>{out_rows, p.out_row_stride, add_to, p.pix_stride, lanes}};
-        dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias);
+        dwconv_rows<R, 1>(p, w_tap0, out_rows, epilogue, src, dst, vbias, pre_act);
     }
 }
 
@@ -834,8 +866,8 @@ template <int R, typename InT, typename OutT>
 inline void dwconv_last_quant(OutT* out_rows, const InT* in_img, const InT* w_tap0,
                               const float* w_scale, const int32_t* w_zero,
                               const float* bias_vec, const DwConvParams& p,
-                              const Epilogue& epilogue, bool add_to, int64_t lanes,
-                              float in_scale, float in_zero,
+                              const Epilogue& epilogue, bool add_to, bool pre_act,
+                              int64_t lanes, float in_scale, float in_zero,
                               float out_scale, float out_zero)
 {
     const int64_t taps = p.KD * p.KH * p.KW;
@@ -871,14 +903,14 @@ inline void dwconv_last_quant(OutT* out_rows, const InT* in_img, const InT* w_ta
         const QuantDst<OutT, true> dst[1] = {
             QuantDst<OutT, true>{out_rows, p.out_row_stride, out_scale, out_zero,
                                  add_to, p.pix_stride, lanes}};
-        dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias);
+        dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias, pre_act);
     } else {
         const QuantSrc<InT, false> src[1] = {QuantSrc<InT, false>{in_img, in_scale,
                                                                   in_zero, lanes}};
         const QuantDst<OutT, false> dst[1] = {
             QuantDst<OutT, false>{out_rows, p.out_row_stride, out_scale, out_zero,
                                   add_to, p.pix_stride, lanes}};
-        dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias);
+        dwconv_rows<R, 1>(pq, wq, &out_scale, epilogue, src, dst, vbias, pre_act);
     }
 }
 

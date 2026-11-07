@@ -42,7 +42,9 @@ void prime_bias_pass(const MatMulAttributes& attrs, TensorView& output,
     const auto prime = [&](int64_t bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
-        tile_scale_add_bias(c_base + c_off, ldc, attrs.beta, bias, M, N);
+        tile_scale_add_bias(c_base + c_off, ldc,
+                            attrs.residual_pre_activation ? 1.0f : attrs.beta,
+                            bias, M, N);
     };
     if (batch.total > 1) {
         ctx.cpu.run(0, batch.total, prime);
@@ -118,7 +120,9 @@ void matmul_gemv(const MatMulAttributes& attrs, TensorView& output,
     if (bias != nullptr) {
         prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
     }
-    const float beta = (bias != nullptr) ? 1.0f : attrs.beta;
+    // With a bias primed, or a residual in C, the kernel must accumulate.
+    const float beta = (bias != nullptr || attrs.residual_pre_activation)
+                           ? 1.0f : attrs.beta;
     const auto block = [&](int64_t bi, int nb) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);
@@ -174,7 +178,9 @@ void matmul_naive_small(const MatMulAttributes& attrs, TensorView& output,
     if (bias != nullptr) {
         prime_bias_pass<T>(attrs, output, batch, c_base, ldc, Mi, Ni, bias, ctx);
     }
-    const float beta = (bias != nullptr) ? 1.0f : attrs.beta;
+    // With a bias primed, or a residual in C, the kernel must accumulate.
+    const float beta = (bias != nullptr || attrs.residual_pre_activation)
+                           ? 1.0f : attrs.beta;
     const auto gemm = [&](int64_t bi) {
         int64_t a_off, b_off, c_off;
         batch.offsets(bi, output, a_off, b_off, c_off);

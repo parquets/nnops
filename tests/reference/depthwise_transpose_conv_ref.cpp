@@ -95,8 +95,13 @@ void dwtconv_ref_impl(const DepthwiseTransposeConv2DAttributes& attrs,
                     }
                 }
                 acc += bias;
+                if (attrs.add_to && attrs.residual_pre_activation) {
+                    acc += s_load(&orow[ow]);
+                }
                 acc = nnops::apply_epilogue(attrs.epilogue, acc);
-                if (attrs.add_to) { acc += s_load(&orow[ow]); }
+                if (attrs.add_to && !attrs.residual_pre_activation) {
+                    acc += s_load(&orow[ow]);
+                }
                 s_store(&orow[ow], acc);
             }
         }

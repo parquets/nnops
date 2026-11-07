@@ -78,9 +78,15 @@ static void test_channel_first_vs_ref(const std::vector<int64_t>& in_shape,
     if (has_bias) { descs.push_back(b.desc()); }
     auto out_descs = op->getOutputTensorDesc(descs);
 
-    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()),
-                               attrs.add_to ? 1.0f : 0.0f);
-    std::vector<float> ref_buf(out_buf.size(), attrs.add_to ? 1.0f : 0.0f);
+    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
+    if (attrs.add_to) {
+        // Mixed signs: a positive shortcut survives a ReLU either way, only a
+        // negative one tells the pre- and post-activation orders apart.
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            out_buf[i] = static_cast<float>(i % 5) * 0.5f - 1.0f;
+        }
+    }
+    std::vector<float> ref_buf(out_buf);
     auto out = test::make_channel_first(out_descs[0], out_buf.data());
     auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
 
@@ -141,8 +147,12 @@ static void test_channel_first_f16_vs_ref(const std::vector<int64_t>& in_shape,
     auto out_descs = op->getOutputTensorDesc(
         std::span<const TensorDesc>(in_d, has_bias ? 3 : 2));
 
-    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()),
-                               attrs.add_to ? 1.0f : 0.0f);
+    std::vector<float> ref_buf(static_cast<size_t>(out_descs[0].numel()), 0.0f);
+    if (attrs.add_to) {
+        for (size_t i = 0; i < ref_buf.size(); ++i) {
+            ref_buf[i] = static_cast<float>(i % 5) * 0.5f - 1.0f;
+        }
+    }
     auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
     {
         ComputeContext ctx;
@@ -153,7 +163,10 @@ static void test_channel_first_f16_vs_ref(const std::vector<int64_t>& in_shape,
 
     std::vector<half> out_buf(static_cast<size_t>(out_descs[0].numel()));
     auto out = test::make_channel_first(out_descs[0], out_buf.data());
-    for (auto& v : out_buf) { simd::s_store(&v, attrs.add_to ? 1.0f : 0.0f); }
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        simd::s_store(&out_buf[i],
+                      attrs.add_to ? static_cast<float>(i % 5) * 0.5f - 1.0f : 0.0f);
+    }
 
     const TensorView ins[] = {in, w, b};
     NNOPS_EXPECT_TRUE(
@@ -224,8 +237,15 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     const int64_t outS  = dwt_spatial_elems(ref_descs[0].dims);
     const int64_t out_n = N * C * outS;
 
-    std::vector<float> ref_buf(static_cast<size_t>(out_n),
-                               attrs.add_to ? 1.0f : 0.0f);
+    // The residual, snapshotted before the reference overwrites its copy.
+    std::vector<float> res_cf(static_cast<size_t>(out_n), 0.0f);
+    if (attrs.add_to) {
+        for (int64_t i = 0; i < out_n; ++i) {
+            res_cf[static_cast<size_t>(i)] =
+                static_cast<float>(i % 5) * 0.5f - 1.0f;
+        }
+    }
+    std::vector<float> ref_buf(res_cf);
     auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
     {
         ComputeContext ctx;
@@ -265,8 +285,14 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     NNOPS_EXPECT_TRUE(out_descs[0].layout == TensorLayout::NHWC);
     NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
 
-    std::vector<T> out_buf(static_cast<size_t>(out_n),
-                           to_T(attrs.add_to ? 1.0f : 0.0f));
+    // The same residual, permuted into the channel-last order the kernel writes.
+    std::vector<T> out_buf(static_cast<size_t>(out_n), to_T(0.0f));
+    if (attrs.add_to) {
+        const auto res_cl = test::to_channel_last<float>(res_cf, N, C, outS);
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            out_buf[i] = to_T(res_cl[i]);
+        }
+    }
     TensorView out_v(std::span<const int64_t>(out_descs[0].dims.data(),
                                               static_cast<size_t>(out_descs[0].rank)),
                      dt, out_buf.data(), TensorLayout::NHWC);
@@ -384,6 +410,17 @@ NNOPS_TEST(dwtconv_channel_first_vs_ref_add_to) {
     test_channel_first_vs_ref({1, 3, 8, 8}, {3, 1, 3, 3}, attrs);
 }
 
+NNOPS_TEST(dwtconv_channel_first_vs_ref_pre_act) {
+    // ReLU plus a mixed-sign residual: the post-activation order would clamp the
+    // convolution before the shortcut arrives, the pre-activation one after.
+    // Stride 2 puts the residual read on the strided staging path.
+    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    test_channel_first_vs_ref({1, 6, 9, 11}, {6, 1, 3, 3}, attrs);
+}
+
 NNOPS_TEST(dwtconv_channel_first_vs_ref_relu_epilogue) {
     DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
     attrs.epilogue.type = EpilogueActivateType::Relu;
@@ -395,6 +432,14 @@ NNOPS_TEST(dwtconv_channel_first_vs_ref_1x1_stride2) {
     // edge step, so the scalar tap loop carries the whole row.
     test_channel_first_vs_ref({1, 8, 9, 9}, {8, 1, 1, 1},
         DepthwiseTransposeConv2DAttributes{{1, 1}, {2, 2}, {1, 1}, {0, 0}, {0, 0}});
+}
+
+NNOPS_TEST(dwtconv_channel_first_f16_pre_act) {
+    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    test_channel_first_f16_vs_ref({1, 8, 9, 11}, {8, 1, 3, 3}, attrs, true);
 }
 
 NNOPS_TEST(dwtconv_channel_first_f16_vs_ref) {
@@ -442,6 +487,25 @@ NNOPS_TEST(dwtconv_channel_last_vs_ref_add_to_relu) {
     attrs.add_to = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
     test_channel_last_vs_ref<float>({1, 6, 6, 11}, {6, 1, 3, 3}, attrs, false, 1e-4f);
+}
+
+NNOPS_TEST(dwtconv_channel_last_vs_ref_pre_act) {
+    // Seventeen channels end on a one-lane tail past the vector chunks, so the
+    // residual load runs through the same partial-block staging as the store.
+    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    test_channel_last_vs_ref<float>({1, 17, 7, 9}, {17, 1, 3, 3}, attrs, true, 1e-4f);
+}
+
+NNOPS_TEST(dwtconv_channel_last_vs_ref_f16_pre_act) {
+    DepthwiseTransposeConv2DAttributes attrs{{3, 3}, {2, 2}, {1, 1}, {1, 1}, {0, 0}};
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    test_channel_last_vs_ref<half>({1, 24, 9, 9}, {24, 1, 3, 3}, attrs, false,
+                                   test::kF16AccumTol);
 }
 
 NNOPS_TEST(dwtconv_channel_last_vs_ref_output_padding) {
@@ -720,7 +784,13 @@ static void transpose_conv2d_depthwise_vs_ref(
     const int64_t out_n = ref_descs[0].numel();
     const int64_t out_S = out_n / (N * C);
 
-    std::vector<float> ref_buf(static_cast<size_t>(out_n), dw.add_to ? 1.0f : 0.0f);
+    std::vector<float> res_cf(static_cast<size_t>(out_n), 0.0f);
+    if (dw.add_to) {
+        for (int64_t i = 0; i < out_n; ++i) {
+            res_cf[static_cast<size_t>(i)] = static_cast<float>(i % 5) * 0.5f - 1.0f;
+        }
+    }
+    std::vector<float> ref_buf(res_cf);
     auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
     {
         ComputeContext ctx;
@@ -739,10 +809,16 @@ static void transpose_conv2d_depthwise_vs_ref(
     attrs.groups         = C;
     attrs.epilogue       = dw.epilogue;
     attrs.add_to         = dw.add_to;
+    attrs.residual_pre_activation = dw.residual_pre_activation;
 
     auto conv = TransposeConv2D::create(attrs, Backend::CPU);
 
-    std::vector<float> out_buf(static_cast<size_t>(out_n), dw.add_to ? 1.0f : 0.0f);
+    // A residual is a logical [N,C,OH,OW] value, so the channel-last buffer
+    // takes it permuted rather than in the channel-first order it was built in.
+    std::vector<float> out_buf(res_cf);
+    if (channel_last && dw.add_to) {
+        out_buf = test::to_channel_last<float>(res_cf, N, C, out_S);
+    }
     if (channel_last) {
         auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
         const int64_t in_cl_shape[] = {N, C, H, W};
@@ -802,5 +878,21 @@ NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_add_to) {
     // output plane a different size from the input's.
     DepthwiseTransposeConv2DAttributes dw{{2, 2}, {2, 2}, {1, 1}, {0, 0}, {0, 0}};
     dw.add_to = true;
+    transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false, true);
+}
+
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_pre_act) {
+    DepthwiseTransposeConv2DAttributes dw{{3, 3}, {1, 1}, {1, 1}, {1, 1}, {0, 0}};
+    dw.epilogue.type = EpilogueActivateType::Relu;
+    dw.add_to = true;
+    dw.residual_pre_activation = true;
+    transpose_conv2d_depthwise_vs_ref({1, 6, 8, 9}, dw, true, false);
+}
+
+NNOPS_TEST(tconv2d_group_eq_channels_depthwise_channel_last_pre_act) {
+    DepthwiseTransposeConv2DAttributes dw{{2, 2}, {2, 2}, {1, 1}, {0, 0}, {0, 0}};
+    dw.epilogue.type = EpilogueActivateType::Relu;
+    dw.add_to = true;
+    dw.residual_pre_activation = true;
     transpose_conv2d_depthwise_vs_ref({1, 17, 7, 6}, dw, false, true);
 }

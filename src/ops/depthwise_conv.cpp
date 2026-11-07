@@ -37,6 +37,11 @@ Status DepthwiseConv::validate(std::span<const TensorDesc> inputs,
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     const auto& in = inputs[0];
+    // The CPU kernels fold the residual into the accumulate before the epilogue;
+    // the CUDA kernel adds it after, so refusing beats applying it on the wrong side.
+    if (attrs_.add_to && attrs_.residual_pre_activation && backend_ != Backend::CPU) {
+        return Status::unsupported;
+    }
     if (is_channel_last(in.layout)) {
         // The channel lane loads a tap's channels as one vector, which the channel-first
         // [C, 1, KH, KW] cannot give it (a tap's channels are C elements apart).

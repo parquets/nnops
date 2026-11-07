@@ -13,7 +13,8 @@
 /// output (see output_dtype and is_quantized_transpose_conv2d()). The bias dtype
 /// follows the output: [OC] in the output's fp dtype on an fp destination, [OC]
 /// int32 (the raw accumulate, added before the activation, never scaled) on
-/// s8/u8. add_to is refused on the quantized route.
+/// s8/u8. add_to is refused on the quantized route, and with it the
+/// pre-activation order (residual_pre_activation).
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -60,6 +61,14 @@ struct TransposeConv2DAttributes {
 
     /// If true, add into the existing output buffer instead of overwriting.
     bool add_to = false;
+
+    /// Order of the add_to term relative to the epilogue:
+    ///   false: y = epilogue(conv) + residual
+    ///   true:  y = epilogue(conv + residual)
+    /// Only meaningful with add_to. The fp CPU routes — every layout and every
+    /// sub-route — and the reference implement it; the quantized route refuses
+    /// add_to altogether, so it has no pre-activation form either.
+    bool residual_pre_activation = false;
 
     // ---- quantized route (is_quantized_transpose_conv2d(weight): s8 weights) --
     // Mirror Conv2D's two attributes: same names, same meaning; ignored on the

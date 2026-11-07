@@ -109,6 +109,11 @@ void dwconv_impl(
     const k::DwChannelFirstEdges edges =
         k::dwconv_channel_first_edge_masks<kMaskMaxKw, T>(p, edge_masks, edge_needed);
 
+    // At most one of the two: the pre-activation order folds the destination
+    // into the accumulator, so nothing is left for the post-epilogue add.
+    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
+    const bool add_to  = attrs.add_to && !pre_act;
+
     const auto compute_block = [&](int64_t n, int64_t blk) {
         const T* in_base  = in_ptr  + n * blocks * in_ch_stride  + blk * in_ch_stride;
         T*       out_base = out_ptr + n * blocks * out_ch_stride + blk * out_ch_stride;
@@ -137,14 +142,14 @@ void dwconv_impl(
                 pc.od = od;
                 pc.oh = oh;
                 k::dwconv_channel_first_h4(out_d + oh * pc.out_row_stride, in_base,
-                                    w_base, bias, pc, attrs.epilogue, attrs.add_to,
+                                    w_base, bias, pc, attrs.epilogue, add_to, pre_act,
                                     blk_edges);
             }
             for (; oh < OH; ++oh) {
                 pc.od = od;
                 pc.oh = oh;
                 k::dwconv_channel_first(out_d + oh * pc.out_row_stride, in_base, w_base,
-                                 bias, pc, attrs.epilogue, attrs.add_to, blk_edges);
+                                 bias, pc, attrs.epilogue, add_to, pre_act, blk_edges);
             }
         }
     };
@@ -164,6 +169,10 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
     const auto& input  = inputs[0];
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
+    // At most one of the two: the pre-activation order folds the destination
+    // into the accumulator, so nothing is left for the post-epilogue add.
+    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
+    const bool add_to  = attrs.add_to && !pre_act;
 
     const int64_t rank  = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
@@ -308,16 +317,16 @@ void dwconv_last_impl(const DepthwiseConvAttributes& attrs, TensorView& output,
                 // shares no input row with its neighbour.
                 if (rows_here == 4) {
                     k::dwconv_last<4>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
+                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else if (rows_here == 3) {
                     k::dwconv_last<3>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
+                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else if (rows_here == 2) {
                     k::dwconv_last<2>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
+                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 } else {
                     k::dwconv_last<1>(out_rows + co, in_blk, w_blk, b_blk, pc,
-                                      attrs.epilogue, attrs.add_to, seg_lanes[s]);
+                                      attrs.epilogue, add_to, pre_act, seg_lanes[s]);
                 }
             }
         }
@@ -341,6 +350,10 @@ Status dwconv_last_impl_quant(const DepthwiseConvAttributes& attrs, TensorView& 
     const auto& weight = inputs[1];
     const bool has_bias = inputs.size() > 2;
     NNOPS_ASSERT(!has_bias || inputs[2].data_type() == DataType::f32);
+    // At most one of the two: the pre-activation order folds the destination
+    // into the accumulator, so nothing is left for the post-epilogue add.
+    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
+    const bool add_to  = attrs.add_to && !pre_act;
 
     const int64_t rank  = input.rank();
     const int64_t srank = DepthwiseConvAttributes::spatial_rank(rank);
@@ -456,19 +469,19 @@ Status dwconv_last_impl_quant(const DepthwiseConvAttributes& attrs, TensorView& 
             if (rows_here == 4) {
                 k::dwconv_last_quant<4, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
+                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else if (rows_here == 3) {
                 k::dwconv_last_quant<3, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
+                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else if (rows_here == 2) {
                 k::dwconv_last_quant<2, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
+                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             } else {
                 k::dwconv_last_quant<1, InT, OutT>(
                     out_rows + c0, in_blk, w_blk, ws, wz, b_blk, pc, attrs.epilogue,
-                    attrs.add_to, lanes, in_scale, in_zero, out_scale, out_zero);
+                    add_to, pre_act, lanes, in_scale, in_zero, out_scale, out_zero);
             }
         }
     });

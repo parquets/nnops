@@ -65,6 +65,10 @@ Status MatMul::validate(std::span<const TensorDesc> inputs,
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::invalid_argument;
     }
+    // The pre-activation residual is a CPU-route fold (see MatMulAttributes).
+    if (attrs_.residual_pre_activation && backend_ != Backend::CPU) {
+        return Status::unsupported;
+    }
 
     const auto& a = inputs[0];
     const auto& b = inputs[1];

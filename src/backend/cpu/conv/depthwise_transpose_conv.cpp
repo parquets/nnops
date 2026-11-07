@@ -57,6 +57,7 @@ struct DwtConvGeom {
     int64_t PH, PW;                // padding
     Epilogue epilogue;
     bool add_to;
+    bool pre_act;   ///< fold add_to's old value in before the epilogue
 };
 
 /// The tap lists hold at most ceil(K) entries; a taller kernel takes the scalar
@@ -195,8 +196,9 @@ void dwtconv_scalar_first(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
                 acc += bias;
+                if (gm.pre_act) { acc += s_load(&orow[ow]); }
                 acc = nnops::apply_epilogue(gm.epilogue, acc);
-                if (gm.add_to) { acc += s_load(&orow[ow]); }
+                if (gm.add_to && !gm.pre_act) { acc += s_load(&orow[ow]); }
                 s_store(&orow[ow], acc);
             }
         }
@@ -251,8 +253,9 @@ void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
                 if (has_bias) { acc += s_load(&b_ptr[c]); }
+                if (gm.pre_act) { acc += s_load(&dst[c]); }
                 acc = nnops::apply_epilogue(gm.epilogue, acc);
-                if (gm.add_to) { acc += s_load(&dst[c]); }
+                if (gm.add_to && !gm.pre_act) { acc += s_load(&dst[c]); }
                 s_store(&dst[c], acc);
             }
         }
@@ -347,9 +350,10 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                         }
                     }
                     acc += bias;
-                    acc = nnops::apply_epilogue(gm.epilogue, acc);
                     T* dst = orow + r + t * gm.SW;
-                    if (gm.add_to) { acc += s_load(dst); }
+                    if (gm.pre_act) { acc += s_load(dst); }
+                    acc = nnops::apply_epilogue(gm.epilogue, acc);
+                    if (gm.add_to && !gm.pre_act) { acc += s_load(dst); }
                     s_store(dst, acc);
                 };
 
@@ -370,15 +374,30 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                         }
                     }
                     if (has_bias) { acc = v_add(acc, v_set1(tag, bias)); }
+                    // The residual joins before the epilogue; the same staging
+                    // that gathers a strided destination may serve both orders.
+                    const bool strided = (gm.SW != 1);
+                    if (gm.pre_act) {
+                        if (strided) {
+                            for (int64_t j = 0; j < L; ++j) {
+                                s_store(&lanes[j], s_load(&orow[r + (t + j) * gm.SW]));
+                            }
+                            acc = v_add(acc, v_load(lanes));
+                        } else {
+                            acc = v_add(acc, v_load(orow + t));
+                        }
+                    }
                     acc = apply_epilogue_vec<T>(gm.epilogue, tag, acc);
 
-                    if (gm.SW == 1) {
-                        if (gm.add_to) { acc = v_add(acc, v_load(orow + t)); }
+                    if (!strided) {
+                        if (gm.add_to && !gm.pre_act) {
+                            acc = v_add(acc, v_load(orow + t));
+                        }
                         v_store(orow + t, acc);
                     } else {
                         // A residue step lands SW pixels apart: stage the lanes and
                         // store one by one, reading the destination the same way.
-                        if (gm.add_to) {
+                        if (gm.add_to && !gm.pre_act) {
                             for (int64_t j = 0; j < L; ++j) {
                                 s_store(&lanes[j], s_load(&orow[r + (t + j) * gm.SW]));
                             }
@@ -482,9 +501,10 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
                 if (has_bias) { acc += s_load(&b_ptr[c]); }
-                acc = nnops::apply_epilogue(gm.epilogue, acc);
                 T* dst = orow + (r + t * gm.SW) * C + c;
-                if (gm.add_to) { acc += s_load(dst); }
+                if (gm.pre_act) { acc += s_load(dst); }
+                acc = nnops::apply_epilogue(gm.epilogue, acc);
+                if (gm.add_to && !gm.pre_act) { acc += s_load(dst); }
                 s_store(dst, acc);
             };
 
@@ -507,9 +527,12 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                             }
                         }
                         if (has_bias) { acc = v_add(acc, v_load(b_ptr + c)); }
-                        acc = apply_epilogue_vec<T>(gm.epilogue, tag, acc);
                         T* dst = orow + (r + t * gm.SW) * C + c;
-                        if (gm.add_to) { acc = v_add(acc, v_load(dst)); }
+                        if (gm.pre_act) { acc = v_add(acc, v_load(dst)); }
+                        acc = apply_epilogue_vec<T>(gm.epilogue, tag, acc);
+                        if (gm.add_to && !gm.pre_act) {
+                            acc = v_add(acc, v_load(dst));
+                        }
                         v_store(dst, acc);
                     }
                     for (; c < cend; ++c) { scalar_one(t, c); }
@@ -547,15 +570,21 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                             a2 = v_add(a2, bv);
                             a3 = v_add(a3, bv);
                         }
-                        a0 = apply_epilogue_vec<T>(gm.epilogue, tag, a0);
-                        a1 = apply_epilogue_vec<T>(gm.epilogue, tag, a1);
-                        a2 = apply_epilogue_vec<T>(gm.epilogue, tag, a2);
-                        a3 = apply_epilogue_vec<T>(gm.epilogue, tag, a3);
                         T* d0 = orow + (r + t * gm.SW) * C + c;
                         T* d1 = d0 + gm.SW * C;
                         T* d2 = d1 + gm.SW * C;
                         T* d3 = d2 + gm.SW * C;
-                        if (gm.add_to) {
+                        if (gm.pre_act) {
+                            a0 = v_add(a0, v_load(d0));
+                            a1 = v_add(a1, v_load(d1));
+                            a2 = v_add(a2, v_load(d2));
+                            a3 = v_add(a3, v_load(d3));
+                        }
+                        a0 = apply_epilogue_vec<T>(gm.epilogue, tag, a0);
+                        a1 = apply_epilogue_vec<T>(gm.epilogue, tag, a1);
+                        a2 = apply_epilogue_vec<T>(gm.epilogue, tag, a2);
+                        a3 = apply_epilogue_vec<T>(gm.epilogue, tag, a3);
+                        if (gm.add_to && !gm.pre_act) {
                             a0 = v_add(a0, v_load(d0));
                             a1 = v_add(a1, v_load(d1));
                             a2 = v_add(a2, v_load(d2));
@@ -1257,6 +1286,7 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
     gm.PW = attrs.padding[1];
     gm.epilogue = attrs.epilogue;
     gm.add_to = attrs.add_to;
+    gm.pre_act = attrs.add_to && attrs.residual_pre_activation;
 
     const bool last = is_channel_last(input.layout());
     if (!last && !is_channel_first_spatial(input.layout())) {

@@ -410,13 +410,24 @@ void matmul_tile(const MatMulAttributes& attrs,
     //
     // When there is no old C to fold (beta 0) the bias becomes the accumulator's
     // initial value and the priming pass disappears.
-    const bool seed_bias = R::is_fp && k == 0 && col_bias != nullptr;
+    //
+    // The pre-activation residual is the beta = 1 order — C keeps its own
+    // contents, the first block accumulates onto them, and the last block
+    // clamps and activates the finished sum — so it substitutes the scale and
+    // leaves MatMul's beta untouched. A bias is then added onto C instead of
+    // seeding the accumulator, which would drop the residual. The int8 routes
+    // keep beta out of it: their accumulator is not C, and the dequant pass
+    // adds C_old itself.
+    const float beta = (R::is_fp && attrs.residual_pre_activation) ? 1.0f
+                                                                   : attrs.beta;
+    const bool seed_bias = R::is_fp && k == 0 && col_bias != nullptr &&
+                           beta == 0.0f;
     const bool prime_c = R::is_fp && k == 0 && bias != nullptr && !seed_bias;
-    const bool zero_mode = (k == 0 && attrs.beta == 0.0f && bias == nullptr);
+    const bool zero_mode = (k == 0 && beta == 0.0f && bias == nullptr);
     const auto [cmin, cmax] = R::clamp(attrs, last_k);
     // fp-only; compile out of the int8 instantiation.
     const bool scale_c  = R::is_fp && k == 0 && bias == nullptr &&
-                          attrs.beta != 1.0f && attrs.beta != 0.0f;
+                          beta != 1.0f && beta != 0.0f;
     const bool epilogue = R::is_fp && last_k && has_inplace_epilogue(attrs);
     const bool int8_ep = !R::is_fp && last_k && (ip != nullptr);
 
@@ -430,10 +441,10 @@ void matmul_tile(const MatMulAttributes& attrs,
 
         if constexpr (R::is_fp) {
             if (prime_c) {
-                R::scale_add_bias(c_tile, ldc, attrs.beta, bias + n_start,
+                R::scale_add_bias(c_tile, ldc, beta, bias + n_start,
                                   actual_mc, n_count);
             } else if (scale_c) {
-                R::scale(c_tile, ldc, attrs.beta, actual_mc, n_count);
+                R::scale(c_tile, ldc, beta, actual_mc, n_count);
             }
         }
         // The RHS the MMA reads: the k-block's slice of the packed scratch, or
@@ -781,6 +792,9 @@ Status matmul_dispatch_tiled(const MatMulAttributes& attrs,
                 ip.row_off = fold_row ? r_fold.data() : nullptr;
                 ip.act_u8 = R::a_eff_type(attrs, a) == DataType::u8;
                 ip.ep = &attrs.epilogue;
+                // The int8 accumulator is its own buffer, so the destination
+                // still holds the residual when the pass writes it.
+                ip.residual = attrs.residual_pre_activation;
                 // The dequantize pass is this route's accumulator; the bias
                 // enters there, between product and clip.
                 if (inputs.size() > 2) {
@@ -1152,6 +1166,11 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
         const bool out_ok = (odt == DataType::s32) || (odt == DataType::s8) ||
                             (odt == DataType::u8) || out_fp;
         if (!out_ok) {
+            return Status::unsupported;
+        }
+        // The residual folds into the fp output pass; an integral destination
+        // has no fp sum to add it to.
+        if (attrs_n.residual_pre_activation && !out_fp) {
             return Status::unsupported;
         }
         NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);

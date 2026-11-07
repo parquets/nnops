@@ -117,8 +117,11 @@ void transpose_conv2d_channel_first_ref(const TransposeConv2DAttributes& attrs,
                     const int64_t out_idx =
                         (oc * OH + oh) * out_row_stride + ow;
                     float val = out_ptr[n_offset + out_idx] + bias_val;
+                    if (attrs.add_to && attrs.residual_pre_activation) {
+                        val += saved[out_idx];
+                    }
                     val = apply_epilogue(attrs.epilogue, val, oc);
-                    if (attrs.add_to) {
+                    if (attrs.add_to && !attrs.residual_pre_activation) {
                         out_ptr[n_offset + out_idx] = saved[out_idx] + val;
                     } else {
                         out_ptr[n_offset + out_idx] = val;

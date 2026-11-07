@@ -107,8 +107,11 @@ inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
     const auto [cmin, cmax] = kblock_clamp(attrs, /*last_k=*/true);
     const bool epilogue = has_inplace_epilogue(attrs);
     const AC* bias = inputs.size() > 2 ? inputs[2].ptr<AC>() : nullptr;
+    // The pre-activation residual is the beta = 1 order: C keeps its contents
+    // and every tile accumulates onto them, with the bias added on top.
+    const float beta = attrs.residual_pre_activation ? 1.0f : attrs.beta;
     const bool prime_c = (bias != nullptr);
-    const bool scale_c = !prime_c && attrs.beta != 0.0f && attrs.beta != 1.0f;
+    const bool scale_c = !prime_c && beta != 0.0f && beta != 1.0f;
 
     const BatchWalk batch(a, b);
     const int nt = QBLOCK_FUSED_NTILE;
@@ -127,13 +130,13 @@ inline void qblock_fused_all(const MatMulAttributes& attrs, TensorView& output,
         AC* c_p = c_base + c_off + n_start;
 
         if (prime_c) {
-            tile_scale_add_bias(c_p, ldc, attrs.beta, bias + n_start, M, nc);
+            tile_scale_add_bias(c_p, ldc, beta, bias + n_start, M, nc);
         } else if (scale_c) {
-            tile_scale(c_p, ldc, attrs.beta, M, nc);
+            tile_scale(c_p, ldc, beta, M, nc);
         }
 
         // The clamp belongs on the finished sum, not on the partial.
-        if (attrs.beta == 0.0f && !prime_c) {
+        if (beta == 0.0f && !prime_c) {
             qblock_fused_run<BQ, AC, true>(trans, M, nc, K, c_p, ldc, a_p, lda, b_p,
                                            row_blocks, n_start, attrs.alpha, cmin,
                                            cmax);

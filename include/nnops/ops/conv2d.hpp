@@ -94,8 +94,9 @@ struct Conv2DAttributes {
     ///   true:  y = epilogue(conv + residual)
     /// The pre-activation form is the ResNet block's `relu(conv + shortcut)`,
     /// which otherwise needs a separate add and activation. Only meaningful with
-    /// add_to; the fp implicit-GEMM route and the reference implement it (the
-    /// Winograd, quantized and CUDA routes refuse it rather than ignore it).
+    /// add_to; the fp routes — implicit-GEMM in both layouts, the depthwise
+    /// reroute and Winograd — and the reference implement it (the quantized and
+    /// CUDA routes refuse it rather than ignore it).
     bool residual_pre_activation = false;
 
     // ---- quantized route (is_quantized_conv2d(weight): s8 weights) ----------

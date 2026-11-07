@@ -57,6 +57,11 @@ Status DepthwiseTransposeConv2D::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::require(in.rank == 4));
 
     if (is_quantized_depthwise_transpose_conv2d(weight.dtype)) {
+        // The fp kernels fold the residual in before the epilogue; the integer
+        // accumulate has no fold for it (add_to is refused below the same way).
+        if (attrs_.add_to && attrs_.residual_pre_activation) {
+            return Status::unsupported;
+        }
         // s8 weights select the quantized route: the activation arrives fp and
         // is quantized inside, or already quantized; the bias is int32 on an
         // integer destination and the output dtype otherwise.

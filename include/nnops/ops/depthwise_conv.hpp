@@ -15,6 +15,10 @@
 /// form as it is, a channel-last one the HWCM [KH][KW][C] form. The channel-first
 /// route has f32/f16 kernels only; the channel lane also covers the quantized
 /// s8/u8 pairs (PerTensor activation, PerChannel weight).
+///
+/// The bias, the epilogue and the add_to residual all run in the output's domain,
+/// and `residual_pre_activation` folds the destination's old contents into the
+/// sum before the clamp and the activation on every route.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -43,6 +47,16 @@ struct DepthwiseConvAttributes {
 
     /// Accumulate into the existing output instead of overwriting (residual).
     bool add_to = false;
+
+    /// Order of the add_to term relative to the epilogue:
+    ///   false: y = epilogue(conv) + residual
+    ///   true:  y = epilogue(conv + residual)
+    /// The pre-activation form is the ResNet block's `relu(dwconv + shortcut)`,
+    /// which otherwise needs a separate add and activation. Only meaningful with
+    /// add_to. Every CPU route implements it — both layouts, f32/f16 and the
+    /// quantized s8/u8 pair — and the CUDA kernel refuses it rather than adding
+    /// the residual on the wrong side.
+    bool residual_pre_activation = false;
 
     static constexpr int64_t spatial_rank(int64_t input_rank) noexcept {
         return input_rank - 2;  // 4→2, 5→3

@@ -192,7 +192,8 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
                      EpilogueActivateType ep = EpilogueActivateType::None,
                      bool add_to = false, uint64_t seed = 900,
                      ConvAlgorithm alg = ConvAlgorithm::Auto,
-                     bool packed_filter = false)
+                     bool packed_filter = false,
+                     bool pre_act = false)
 {
     const int64_t N = c.ishape[0], IC = c.ishape[1];
     const int64_t IH = c.ishape[2], IW = c.ishape[3];
@@ -221,6 +222,7 @@ FpResult run_fp_case(const FpCase& c, DataType dt,
     attrs.groups      = c.groups;
     attrs.epilogue.type = ep;
     attrs.add_to      = add_to;
+    attrs.residual_pre_activation = pre_act;
     attrs.algorithm   = alg;
 
     auto op = Conv2D::create(attrs, Backend::CPU);
@@ -333,9 +335,10 @@ void expect_fp_close(const FpCase& c, DataType dt, float tol,
                      EpilogueActivateType ep = EpilogueActivateType::None,
                      bool add_to = false, uint64_t seed = 900, int idx = -1,
                      ConvAlgorithm alg = ConvAlgorithm::Auto,
-                     bool packed_filter = false)
+                     bool packed_filter = false, bool pre_act = false)
 {
-    const FpResult r = run_fp_case(c, dt, ep, add_to, seed, alg, packed_filter);
+    const FpResult r = run_fp_case(c, dt, ep, add_to, seed, alg, packed_filter,
+                                   pre_act);
     if (r.worst > tol) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
@@ -580,6 +583,29 @@ NNOPS_TEST(conv2d_channel_last_fp_epilogues) {
     expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu6, true, 604);
     expect_fp_close(no_bias, DataType::f16, nnops::test::kF16AccumTol,
                     EpilogueActivateType::Relu, true, 605);
+
+    // The pre-activation order: the shortcut joins the sum the clamp and the
+    // activation see, so the accumulator is seeded with it (with the bias) and
+    // the epilogue runs as a pass. The residuals carry both signs, so the two
+    // orders give different answers.
+    expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu,
+                    true, 610, -1, ConvAlgorithm::Auto, false, true);
+    expect_fp_close(no_bias, DataType::f32, 2e-4f, EpilogueActivateType::Relu6,
+                    true, 611, -1, ConvAlgorithm::Auto, false, true);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::Relu,
+                    true, 612, -1, ConvAlgorithm::Auto, false, true);
+    expect_fp_close(c, DataType::f32, 2e-4f, EpilogueActivateType::None,
+                    true, 613, -1, ConvAlgorithm::Auto, false, true);
+    expect_fp_close(c, DataType::f16, nnops::test::kF16AccumTol,
+                    EpilogueActivateType::Relu, true, 614, -1,
+                    ConvAlgorithm::Auto, false, true);
+    // A 1x1 pointwise filter and a grouped one.
+    expect_fp_close({{1, 64, 7, 7}, 32, 1, 1, 1, 1, 0, 0, 1, 1, 1, true},
+                    DataType::f32, 2e-4f, EpilogueActivateType::Relu, true, 615,
+                    -1, ConvAlgorithm::Auto, false, true);
+    expect_fp_close({{1, 8, 12, 12}, 16, 3, 3, 1, 1, 1, 1, 1, 1, 2, false},
+                    DataType::f32, 2e-4f, EpilogueActivateType::Relu, true, 616,
+                    -1, ConvAlgorithm::Auto, false, true);
 }
 
 // ============================================================

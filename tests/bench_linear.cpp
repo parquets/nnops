@@ -434,18 +434,21 @@ NNOPS_BENCH(linear_bias_epilogue) {
         EpilogueActivateType ep;
         bool bias;
         bool add_to;
+        bool pre_act = false;
     };
     // Ordered by what the GEMM can own: no bias and no residual fuse into the
-    // output tile; a bias costs one pass over C; add_to with an identity
-    // epilogue rides MatMul's beta, and add_to with any other epilogue needs an
-    // M×N temporary and a combine pass.
+    // output tile; a bias costs one pass over C; add_to folds when the residual
+    // goes on the pre-activation side or the epilogue is identity, and
+    // otherwise needs an M×N temporary and a combine pass. The last row is the
+    // same activation with the residual folded instead of staged.
     const Variant variants[] = {
-        {"plain",               EpilogueActivateType::None, false, false},
-        {"relu (fused)",        EpilogueActivateType::Relu, false, false},
-        {"bias",                EpilogueActivateType::None, true,  false},
-        {"bias + relu",         EpilogueActivateType::Relu, true,  false},
-        {"add_to (beta)",       EpilogueActivateType::None, false, true},
-        {"add_to + relu (tmp)", EpilogueActivateType::Relu, false, true},
+        {"plain",                 EpilogueActivateType::None, false, false},
+        {"relu (fused)",          EpilogueActivateType::Relu, false, false},
+        {"bias",                  EpilogueActivateType::None, true,  false},
+        {"bias + relu",           EpilogueActivateType::Relu, true,  false},
+        {"add_to",                EpilogueActivateType::None, false, true},
+        {"add_to + relu (tmp)",   EpilogueActivateType::Relu, false, true},
+        {"add_to + relu (pre-act)", EpilogueActivateType::Relu, false, true, true},
     };
     const std::vector<Shape> shapes{{1, 4096, 4096}, {128, 4096, 4096}};
     constexpr int kRounds = 3;
@@ -453,7 +456,7 @@ NNOPS_BENCH(linear_bias_epilogue) {
 
     std::printf("  f32 Linear write-back variants  1T  budget=%.0f ms/cell  rounds=%d\n",
                 kBudgetMs, kRounds);
-    std::printf("   %5s %5s %5s | %-18s %9s %6s |\n", "M", "K", "N",
+    std::printf("   %5s %5s %5s | %-22s %9s %6s |\n", "M", "K", "N",
                 "variant", "GFLOPS", "vs");
 
     for (const Shape& s : shapes) {
@@ -462,6 +465,7 @@ NNOPS_BENCH(linear_bias_epilogue) {
             LinearAttributes la;
             la.epilogue.type = v.ep;
             la.add_to = v.add_to;
+            la.residual_pre_activation = v.pre_act;
             FpProblem<float> p(s, la, v.bias);
 
             std::vector<double> g;
@@ -470,7 +474,7 @@ NNOPS_BENCH(linear_bias_epilogue) {
             }
             const double gf = median(g);
             if (base == 0.0) { base = gf; }
-            std::printf("   %5lld %5lld %5lld | %-18s %9.1f %6.3f |\n",
+            std::printf("   %5lld %5lld %5lld | %-22s %9.1f %6.3f |\n",
                         static_cast<long long>(s.M), static_cast<long long>(s.K),
                         static_cast<long long>(s.N), v.name, gf,
                         base > 0.0 ? gf / base : 0.0);

@@ -126,6 +126,13 @@ struct FpDst {
             }
         }
     }
+
+    /// The destination's current contents, for the pre-activation residual.
+    auto load(int64_t r, int64_t ow) const {
+        const T* p = out + r * row_stride + ow * pix;
+        if constexpr (Full) { return v_load(p); }
+        else { return load_lanes(p, lanes); }
+    }
 };
 
 template <typename OutT, bool Full = true>
@@ -151,6 +158,19 @@ struct QuantDst {
             }
             requantize_store(tmp, v, scale, zero_pt, add_to);
             std::memcpy(p, tmp, static_cast<size_t>(lanes) * sizeof(OutT));
+        }
+    }
+
+    /// The destination's current contents in the accumulate's (f32) domain, for
+    /// the pre-activation residual.
+    v_f32x8 load(int64_t r, int64_t ow) const {
+        const OutT* p = out + r * row_stride + ow * pix;
+        if constexpr (Full) {
+            return dequantize_tensor(p, scale, zero_pt);
+        } else {
+            OutT tmp[kChannelLanes] = {};
+            std::memcpy(tmp, p, static_cast<size_t>(lanes) * sizeof(OutT));
+            return dequantize_tensor(tmp, scale, zero_pt);
         }
     }
 };

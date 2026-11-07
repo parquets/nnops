@@ -65,6 +65,12 @@ Status TransposeConv2D::validate(std::span<const TensorDesc> inputs,
 {
     // input, weight [, bias]
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    // The fp routes fold the residual in before the epilogue; the quantized
+    // route refuses add_to outright, so it has no pre-activation order either.
+    if (attrs_.add_to && attrs_.residual_pre_activation && inputs.size() > 1 &&
+        is_quantized_transpose_conv2d(inputs[1].dtype)) {
+        return Status::unsupported;
+    }
     return detail::require(
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOrChannelLast));
 }
@@ -95,6 +101,7 @@ Status TransposeConv2D::compute(std::span<TensorView> outputs,
         dw.output_padding  = attrs_.output_padding;
         dw.epilogue        = attrs_.epilogue;
         dw.add_to          = attrs_.add_to;
+        dw.residual_pre_activation = attrs_.residual_pre_activation;
         dw.output_dtype    = attrs_.output_dtype;
         dw.act_quant_dtype = attrs_.act_quant_dtype;
         return backend::cpu::depthwise_transpose_conv_cpu(dw, outputs[0], inputs, ctx,

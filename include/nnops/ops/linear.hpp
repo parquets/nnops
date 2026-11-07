@@ -18,10 +18,12 @@
 ///
 /// The weight is [N, K] and the product is X × W^T, i.e. the MatMul kernel with
 /// `transpose_b`; the input is [..., K] and the output [..., N], leading dims
-/// preserved. Bias, epilogue and add_to ride the output write-back. The
-/// optional [N] bias follows the output dtype — int32 on an integer
-/// destination. With `gated`, the weight carries the gate and value halves
-/// ([2N, K]) and the output is the SwiGLU combine of the two.
+/// preserved. Bias, epilogue and add_to ride the output write-back; the
+/// residual is added after the epilogue unless `residual_pre_activation` folds
+/// it into the sum the epilogue sees. The optional [N] bias follows the output
+/// dtype — int32 on an integer destination. With `gated`, the weight carries
+/// the gate and value halves ([2N, K]) and the output is the SwiGLU combine of
+/// the two.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -40,6 +42,17 @@ struct LinearAttributes {
 
     /// Accumulate into the existing output instead of overwriting (residual).
     bool add_to = false;
+
+    /// Order of the add_to term relative to the epilogue:
+    ///   false: y = epilogue(x·wᵀ + bias) + residual
+    ///   true:  y = epilogue(x·wᵀ + bias + residual)
+    /// The pre-activation form is the ResNet block's order: the residual joins
+    /// the sum MatMul's clamp and activation see, so it folds into the GEMM call
+    /// even with an active epilogue, on every CPU route — fp, q4_1 and int8. An
+    /// identity epilogue folds either way. Only meaningful with add_to; the
+    /// gated combine and the CUDA kernel refuse it rather than apply the
+    /// residual on the wrong side.
+    bool residual_pre_activation = false;
 
     /// Quantized-path output type: f32/f16 dequantize, s32/s8/u8 stay integral
     /// (s8/u8 requantize with the output's QuantParams). Anything else selects

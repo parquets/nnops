@@ -5,13 +5,15 @@
 /// per-token and per-channel parameters, optional bias, epilogue, add_to, and
 /// rank-1 / batched inputs.
 ///
-/// add_to rides MatMul's beta only for fp operands with an identity epilogue —
-/// the residual must not pass through the activation. Any other fp-output case
-/// takes a compact output-shaped temporary and adds the residual afterwards: a
-/// non-identity epilogue, or any int8 product (the integer route ignores
-/// alpha/beta and starts C at zero). An integer output (s32 compensated
-/// accumulate, s8/u8 requantized with the output's QuantParams) follows
-/// `output_dtype`, not the operand dtype, and takes an int32 [N] bias.
+/// add_to folds into the GEMM whenever the residual goes on the pre-activation
+/// side — `residual_pre_activation`, where it joins the sum the clamp and the
+/// activation see — or when the epilogue is identity, where both orders agree.
+/// Every CPU route implements that, int8 and q4_1 included: the fp and q4_1
+/// routes accumulate onto C, the int8 dequant pass adds C_old before its clip.
+/// Any other case takes a compact output-shaped temporary and adds the residual
+/// afterwards. An integer output (s32 compensated accumulate, s8/u8 requantized
+/// with the output's QuantParams) follows `output_dtype`, not the operand dtype,
+/// and takes an int32 [N] bias.
 ///
 /// prepackWeights is the query-then-pack contract: an empty output view is the
 /// query, answering with layout PackedB (rank 2, N leading; empty for a dtype
@@ -400,13 +402,68 @@ NNOPS_TEST(linear_addto_identity) {
     auto [bv, b] = test::make_random_tensor({N}, -0.5f, 0.5f, 19);
 
     LinearAttributes attrs;
-    attrs.add_to = true;   // identity epilogue → MatMul's beta residual
+    attrs.add_to = true;   // identity epilogue: either order folds
 
     nnops::test::XorShift128 rng(20);
     std::vector<float> initial(static_cast<size_t>(M * N));
     rng.fill_float(initial.data(), M * N, -1.0f, 1.0f);
 
     check_linear<float>(attrs, {x, w, b}, 1e-5f, initial);
+}
+
+NNOPS_TEST(linear_residual_pre_activation) {
+    // The ResNet order — relu(x·wᵀ + bias + residual) — with an active
+    // epilogue. The residual folds into the GEMM, so there is no output-shaped
+    // temporary: the product, bias and residual are clamped and activated
+    // together. The two orders differ wherever the sum crosses zero.
+    const int64_t M = 6, K = 20, N = 9;
+    auto [xv, x] = test::make_random_tensor({M, K}, -1.0f, 1.0f, 21);
+    auto [wv, w] = test::make_random_tensor({N, K}, -1.0f, 1.0f, 22);
+    auto [bv, b] = test::make_random_tensor({N}, -0.5f, 0.5f, 23);
+
+    LinearAttributes attrs;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+
+    nnops::test::XorShift128 rng(24);
+    std::vector<float> initial(static_cast<size_t>(M * N));
+    rng.fill_float(initial.data(), M * N, -1.0f, 1.0f);
+
+    check_linear<float>(attrs, {x, w, b}, 1e-5f, initial);
+    // No bias: the first k-block accumulates straight onto the residual.
+    check_linear<float>(attrs, {x, w}, 1e-5f, initial);
+
+    attrs.epilogue.type = EpilogueActivateType::None;
+    check_linear<float>(attrs, {x, w, b}, 1e-5f, initial);
+}
+
+NNOPS_TEST(linear_int8_residual_pre_activation) {
+    // The int8 routes fold the residual too: the dequant pass reads the
+    // destination's old contents and adds them before its clip, which is the
+    // same pre-activation order the fp routes get from accumulating onto C.
+    const int64_t M = 5, K = 32, N = 17;
+    auto xv = random_s8(M * K, 31);
+    auto wv = random_s8(N * K, 32);
+
+    const int64_t xshape[] = {M, K};
+    const int64_t wshape[] = {N, K};
+    auto x = make_view(xshape, DataType::s8, xv.data(), per_tensor(0.02f, 3));
+    auto w = make_view(wshape, DataType::s8, wv.data(), per_tensor(0.01f, -2));
+
+    nnops::test::XorShift128 rng(33);
+    std::vector<float> initial(static_cast<size_t>(M * N));
+    rng.fill_float(initial.data(), M * N, -1.0f, 1.0f);
+
+    LinearAttributes attrs;
+    attrs.output_dtype = DataType::f32;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    check_linear<float>(attrs, {x, w}, 1e-4f, initial);
+
+    attrs.epilogue.type = EpilogueActivateType::None;
+    check_linear<float>(attrs, {x, w}, 1e-4f, initial);
 }
 
 // ---- Quantized: u8|s8 × s8 → fp ----
@@ -919,10 +976,11 @@ T from_f32(float f) {
 }
 
 /// Linear with a q4_1 weight against C = A × Wᵀ from the decoded values, then
-/// the bias and the activation.
+/// the bias, the pre-activation residual and the activation.
 template <class T>
 void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
-                     EpilogueActivateType act, float tol, uint32_t seed)
+                     EpilogueActivateType act, float tol, uint32_t seed,
+                     bool pre_act = false)
 {
     Q4Weight w = make_q4_weight(N, K, seed);
 
@@ -947,6 +1005,8 @@ void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
 
     LinearAttributes attrs;
     attrs.epilogue.type = act;
+    attrs.add_to = pre_act;
+    attrs.residual_pre_activation = pre_act;
     auto op = Linear::create(attrs, Backend::CPU);
 
     std::vector<TensorDesc> descs = {a.desc(), wv.desc()};
@@ -957,6 +1017,11 @@ void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
     NNOPS_EXPECT_EQ(od.dims[1], N);
 
     std::vector<T> out(static_cast<size_t>(M * N), T{});
+    if (pre_act) {
+        nnops::test::XorShift128 irng(seed + 2);
+        for (auto& v : out) { v = from_f32<T>(irng.next_float(-1.0f, 1.0f)); }
+    }
+    const std::vector<T> resid = out;   // compute() overwrites the residual
     TensorView ov(std::span<const int64_t>(od.dims.data(),
                                            static_cast<size_t>(od.rank)),
                   od.dtype, out.data());
@@ -972,6 +1037,9 @@ void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
                        w.decoded[static_cast<size_t>(n * K + k)];
             }
             if (with_bias) { acc += to_f(b_buf[static_cast<size_t>(n)]); }
+            if (pre_act) {
+                acc += to_f(resid[static_cast<size_t>(m * N + n)]);
+            }
             if (act == EpilogueActivateType::Relu6) {
                 acc = std::min(std::max(acc, 0.0f), 6.0f);
             } else if (act == EpilogueActivateType::Relu) {
@@ -995,6 +1063,10 @@ NNOPS_TEST(linear_q4_1_weight) {
     check_linear_q4<float>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 33);
     check_linear_q4<float>(5, 33, 18, true, EpilogueActivateType::Relu6, tol, 34);
     check_linear_q4<float>(64, 96, 44, false, EpilogueActivateType::None, tol, 35);
+    // The pre-activation residual rides beta through both block routes too:
+    // M=1 is the fused kernel, 17 the packed plan.
+    check_linear_q4<float>(1, 70, 37, true, EpilogueActivateType::Relu, tol, 36, true);
+    check_linear_q4<float>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 37, true);
 }
 
 NNOPS_TEST(linear_q4_1_weight_f16) {

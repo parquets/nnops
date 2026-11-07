@@ -231,9 +231,10 @@ Status Conv2D::validate(std::span<const TensorDesc> inputs,
                              wl == TensorLayout::PackedHWIO;
     NNOPS_TRY(detail::require(is_channel_last(inputs[0].layout) == weight_last));
 
-    // A pre-activation residual is implemented by the fp implicit-GEMM route
-    // and the reference only. Refusing the other routes beats silently applying
-    // the residual on the wrong side of the activation.
+    // A pre-activation residual is implemented by every fp CPU route (both
+    // layouts, the depthwise reroute and Winograd) and the reference. Refusing
+    // the other routes beats silently applying the residual on the wrong side
+    // of the activation.
     if (attrs_.add_to && attrs_.residual_pre_activation) {
         if (is_quantized_conv2d(inputs[1].dtype)) { return Status::unsupported; }
         if (backend_ == Backend::CUDA) { return Status::unsupported; }
@@ -278,6 +279,7 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         dw.padding     = {0, attrs.padding[0], attrs.padding[1]};
         dw.epilogue    = attrs.epilogue;
         dw.add_to      = attrs.add_to;
+        dw.residual_pre_activation = attrs.residual_pre_activation;
         return backend::cpu::depthwise_conv_cpu(dw, output, inputs, ctx, workspace);
     }
 

@@ -992,6 +992,93 @@ NNOPS_TEST(tconv2d_channel_first_narrow_oc) {
     test_channel_first_vs_ref({1, 32, 12, 12}, {32, 4, 3, 3}, attrs, /*has_bias=*/true);
 }
 
+/// Channel-last roundtrip against the channel-first golden with a mixed-sign
+/// residual in the destination, so that the pre- and post-activation orders of
+/// add_to cannot agree by accident.
+static void test_channel_last_residual_vs_ref(
+    const std::vector<int64_t>& in_shape,
+    const std::vector<int64_t>& w_shape,
+    const TransposeConv2DAttributes& attrs,
+    bool has_bias = false)
+{
+    const int64_t N  = in_shape[0];
+    const int64_t IC = in_shape[1];
+    const int64_t IH = in_shape[2];
+    const int64_t IW = in_shape[3];
+    const int64_t OC = w_shape[1] * attrs.groups;
+
+    auto [in_vec, in_cf] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_cf]  = test::make_random_tensor(w_shape);
+    (void)w_vec;
+
+    std::vector<float> b_vec;
+    TensorView b_cf;
+    if (has_bias) {
+        auto p = test::make_random_tensor({OC});
+        b_vec = std::move(p.first);
+        b_cf  = p.second;
+    }
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    std::vector<TensorDesc> out_descs;
+    if (has_bias) {
+        const TensorDesc d[] = {in_cf.desc(), w_cf.desc(), b_cf.desc()};
+        out_descs = op->getOutputTensorDesc(d);
+    } else {
+        const TensorDesc d[] = {in_cf.desc(), w_cf.desc()};
+        out_descs = op->getOutputTensorDesc(d);
+    }
+    const int64_t on  = out_descs[0].dims[0];
+    const int64_t och = out_descs[0].dims[1];
+    const int64_t oh  = out_descs[0].dims[2];
+    const int64_t ow  = out_descs[0].dims[3];
+
+    auto [res_vec, res_view] = test::make_random_tensor(
+        {on, och, oh, ow}, -1.0f, 1.0f, 11);
+    (void)res_view;
+
+    std::vector<float> ref_buf(res_vec);
+    auto out_ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    {
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ins[] = {in_cf, w_cf, b_cf};
+            backend::cpu::reference::transpose_conv2d_channel_first_ref(
+                attrs, out_ref, ins, ctx, nullptr);
+        } else {
+            const TensorView ins[] = {in_cf, w_cf};
+            backend::cpu::reference::transpose_conv2d_channel_first_ref(
+                attrs, out_ref, ins, ctx, nullptr);
+        }
+    }
+
+    auto in_cl = test::channel_first_to_channel_last<float>(
+        std::span<const float>(in_vec.data(), in_vec.size()), on, IC, IH, IW);
+    auto out_cl = test::channel_first_to_channel_last<float>(
+        std::span<const float>(res_vec.data(), res_vec.size()), on, och, oh, ow);
+
+    const std::vector<int64_t> ishape = {on, IC, IH, IW};
+    const std::vector<int64_t> oshape = {on, och, oh, ow};
+    TensorView in_view(ishape, DataType::f32, in_cl.data(), TensorLayout::NHWC);
+    TensorView out_view(oshape, DataType::f32, out_cl.data(), TensorLayout::NHWC);
+    {
+        TensorView outs[] = {out_view};
+        ComputeContext ctx;
+        if (has_bias) {
+            const TensorView ins[] = {in_view, w_cf, b_cf};
+            op->compute(outs, ins, ctx);
+        } else {
+            const TensorView ins[] = {in_view, w_cf};
+            op->compute(outs, ins, ctx);
+        }
+    }
+
+    auto got = test::channel_last_to_channel_first<float>(
+        std::span<const float>(out_cl.data(), out_cl.size()), on, och, oh, ow);
+    TensorView got_view(oshape, DataType::f32, got.data(), TensorLayout::NCHW);
+    NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
+}
+
 NNOPS_TEST(tconv2d_channel_first_add_to) {
     // add_to keeps whatever the destination already held, and the merge pass is
     // the only writer — this is the case that would clobber it.
@@ -1012,6 +1099,48 @@ NNOPS_TEST(tconv2d_channel_first_add_to) {
     const auto out_descs = op->getOutputTensorDesc(d);
     NNOPS_EXPECT_EQ(out_descs[0].dims[2], 15);
     NNOPS_EXPECT_EQ(out_descs[0].dims[3], 15);
+
+    std::vector<float> out_buf(res_vec);
+    auto out = test::make_channel_first(out_descs[0], out_buf.data());
+    {
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_channel_first, w_channel_first};
+        ComputeContext ctx;
+        op->compute(outs, ins, ctx);
+    }
+
+    std::vector<float> ref_buf(res_vec);
+    auto out_ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    {
+        const TensorView ins[] = {in_channel_first, w_channel_first};
+        ComputeContext ctx;
+        backend::cpu::reference::transpose_conv2d_channel_first_ref(
+            attrs, out_ref, ins, ctx, nullptr);
+    }
+
+    NNOPS_EXPECT_TRUE(test::allclose(out, out_ref, 1e-4f, 1e-4f));
+}
+
+NNOPS_TEST(tconv2d_channel_first_pre_act) {
+    // ReLU plus a mixed-sign residual: the post-activation order clamps the
+    // convolution before the shortcut arrives, the pre-activation order after.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to      = true;
+    attrs.residual_pre_activation = true;
+
+    auto [in_vec, in_channel_first]   = test::make_random_tensor({1, 16, 8, 8});
+    auto [w_vec,  w_channel_first]    = test::make_random_tensor({16, 32, 3, 3});
+    auto [res_vec, res_view] = test::make_random_tensor({1, 32, 15, 15}, -1.0f, 1.0f, 11);
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in_channel_first.desc(), w_channel_first.desc()};
+    const auto out_descs = op->getOutputTensorDesc(d);
 
     std::vector<float> out_buf(res_vec);
     auto out = test::make_channel_first(out_descs[0], out_buf.data());
@@ -1282,4 +1411,72 @@ NNOPS_TEST(tconv2d_channel_last_add_to) {
         std::span<const float>(out_cl.data(), out_cl.size()), ON, OC, OH, OW);
     TensorView got_view(oshape, DataType::f32, got.data(), TensorLayout::NCHW);
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, 1e-4f, 1e-4f));
+}
+
+// ============================================================
+// residual_pre_activation — channel-last routes
+// ============================================================
+
+NNOPS_TEST(tconv2d_channel_last_pre_act) {
+    // 4x4 stride 2 is past the pixel kernel's tap budget, so this is the col
+    // route: the merge is the only writer and folds the destination in first.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {4, 4};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to      = true;
+    attrs.residual_pre_activation = true;
+
+    test_channel_last_residual_vs_ref({1, 16, 8, 8}, {16, 32, 4, 4}, attrs);
+}
+
+NNOPS_TEST(tconv2d_channel_last_pre_act_bias_groups) {
+    // Two groups and a bias, with an odd output width so the oc tail and the
+    // row edges both carry the residual.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {1, 1};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 2;
+    attrs.epilogue.type = EpilogueActivateType::Relu6;
+    attrs.add_to      = true;
+    attrs.residual_pre_activation = true;
+
+    test_channel_last_residual_vs_ref({2, 8, 9, 10}, {8, 8, 3, 3}, attrs, true);
+}
+
+NNOPS_TEST(tconv2d_channel_last_pixel_pre_act) {
+    // 2x2 stride 2 keeps the filter under the pixel kernel's threshold, so this
+    // runs the four-pixel tile and the per-pixel edge path with the residual.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {2, 2};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {0, 0};
+    attrs.groups      = 1;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    attrs.add_to      = true;
+    attrs.residual_pre_activation = true;
+
+    test_channel_last_residual_vs_ref({1, 16, 10, 11}, {16, 32, 2, 2}, attrs, true);
+}
+
+NNOPS_TEST(tconv2d_channel_last_depthwise_pre_act) {
+    // g == IC == OC, so this takes the channel-last depthwise merge.
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 16;
+    attrs.epilogue.type = EpilogueActivateType::LeakyRelu;
+    attrs.epilogue.alpha = 0.05f;
+    attrs.add_to      = true;
+    attrs.residual_pre_activation = true;
+
+    test_channel_last_residual_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, true);
 }

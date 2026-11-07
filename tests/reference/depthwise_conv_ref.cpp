@@ -10,7 +10,8 @@
 /// store with round-to-nearest-even, mirroring the SIMD backend's
 /// float-accumulate strategy so the two agree exactly. add_to stays in the
 /// output's own domain: fp adds, the quantized path dequantizes the existing
-/// value, adds and requantizes.
+/// value, adds and requantizes. `residual_pre_activation` folds the same old
+/// value into the sum before the epilogue instead of after it.
 
 #include "nnops/ops/depthwise_conv.hpp"
 #include "nnops/detail/assert.hpp"
@@ -111,8 +112,11 @@ void dwconv_impl_2d_ref(const DepthwiseConvAttributes& attrs,
 
                 const int64_t out_idx =
                     ((n * C + c) * OH + oh) * out_row_stride + ow;
+                if (attrs.add_to && attrs.residual_pre_activation) {
+                    sum += s_load(&out_ptr[out_idx]);
+                }
                 float val = apply_epilogue(attrs.epilogue, sum, c);
-                if (attrs.add_to) {
+                if (attrs.add_to && !attrs.residual_pre_activation) {
                     s_store(&out_ptr[out_idx], s_load(&out_ptr[out_idx]) + val);
                 } else {
                     s_store(&out_ptr[out_idx], val);
@@ -221,8 +225,11 @@ void dwconv_impl_3d_ref(const DepthwiseConvAttributes& attrs,
                     const int64_t out_idx =
                         ((n * C + c) * OD + od) * out_d_stride
                         + oh * out_row_stride + ow;
+                    if (attrs.add_to && attrs.residual_pre_activation) {
+                        sum += s_load(&out_ptr[out_idx]);
+                    }
                     float val = apply_epilogue(attrs.epilogue, sum, c);
-                    if (attrs.add_to) {
+                    if (attrs.add_to && !attrs.residual_pre_activation) {
                         s_store(&out_ptr[out_idx], s_load(&out_ptr[out_idx]) + val);
                     } else {
                         s_store(&out_ptr[out_idx], val);
@@ -324,8 +331,11 @@ void dwconv_impl_2d_ref_quant(const DepthwiseConvAttributes& attrs,
 
                 const int64_t out_idx =
                     ((n * C + c) * OH + oh) * out_row_stride + ow;
+                if (attrs.add_to && attrs.residual_pre_activation) {
+                    sum += (static_cast<float>(out_ptr[out_idx]) - out_zero) * out_scale;
+                }
                 float val = apply_epilogue(attrs.epilogue, sum, c);
-                if (attrs.add_to) {
+                if (attrs.add_to && !attrs.residual_pre_activation) {
                     const float existing =
                         (static_cast<float>(out_ptr[out_idx]) - out_zero) * out_scale;
                     val += existing;
@@ -448,8 +458,11 @@ void dwconv_impl_3d_ref_quant(const DepthwiseConvAttributes& attrs,
                     const int64_t out_idx =
                         ((n * C + c) * OD + od) * out_d_stride
                         + oh * out_row_stride + ow;
+                    if (attrs.add_to && attrs.residual_pre_activation) {
+                        sum += (static_cast<float>(out_ptr[out_idx]) - out_zero) * out_scale;
+                    }
                     float val = apply_epilogue(attrs.epilogue, sum, c);
-                    if (attrs.add_to) {
+                    if (attrs.add_to && !attrs.residual_pre_activation) {
                         const float existing =
                             (static_cast<float>(out_ptr[out_idx]) - out_zero) * out_scale;
                         val += existing;

@@ -64,8 +64,11 @@ static void test_channel_first_vs_ref(const std::vector<int64_t>& in_shape,
     std::vector<float> ref_buf(out_buf.size());
     auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
     if (attrs.add_to) {
-        std::fill(out_buf.begin(), out_buf.end(), 1.0f);
-        std::fill(ref_buf.begin(), ref_buf.end(), 1.0f);
+        // Mixed signs: a positive shortcut survives a ReLU either way, only a
+        // negative one tells the pre- and post-activation orders apart.
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            out_buf[i] = ref_buf[i] = static_cast<float>(i % 5) * 0.5f - 1.0f;
+        }
     }
 
     {
@@ -121,6 +124,28 @@ NNOPS_TEST(dwconv_channel_first_vs_ref_relu_epilogue) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.epilogue.type = EpilogueActivateType::Relu;
     test_channel_first_vs_ref({1, 5, 6, 11}, {5, 1, 3, 3}, attrs);
+}
+
+NNOPS_TEST(dwconv_channel_first_vs_ref_pre_act) {
+    // The shortcut joins the sum the activation sees. The helper's residual
+    // alternates sign, so a post-epilogue add would leave the negative half
+    // unclamped and fail here.
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_channel_first_vs_ref({1, 5, 6, 11}, {5, 1, 3, 3}, attrs);
+}
+
+NNOPS_TEST(dwconv_channel_first_vs_ref_pre_act_clamp) {
+    // The clamp-only epilogue on a 13-wide plane: the last width vector is
+    // short, so the residual is read through the masked block copy too.
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.min_clip = -0.5f;
+    attrs.epilogue.max_clip = 0.5f;
+    test_channel_first_vs_ref({1, 7, 9, 13}, {7, 1, 3, 3}, attrs, true);
 }
 
 NNOPS_TEST(dwconv_channel_first_vs_ref_1x1_kernel_stride2) {
@@ -218,6 +243,14 @@ NNOPS_TEST(dwconv_channel_first_f16_vs_ref) {
 NNOPS_TEST(dwconv_channel_first_3d_vs_ref) {
     test_channel_first_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3},
         DepthwiseConvAttributes{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}}, true);
+}
+
+NNOPS_TEST(dwconv_channel_first_3d_vs_ref_pre_act) {
+    DepthwiseConvAttributes attrs{{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_channel_first_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3}, attrs, true);
 }
 
 // The one hand-computed case: everything else compares against
@@ -373,8 +406,13 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     const int64_t outS  = dw_spatial_elems(ref_descs[0].dims);
     const int64_t out_n = N * C * outS;
 
-    std::vector<float> ref_buf(static_cast<size_t>(out_n),
-                               attrs.add_to ? 1.0f : 0.0f);
+    const auto residual_at = [](int64_t i) {
+        return static_cast<float>(i % 5) * 0.5f - 1.0f;
+    };
+    std::vector<float> ref_buf(static_cast<size_t>(out_n));
+    for (int64_t i = 0; attrs.add_to && i < out_n; ++i) {
+        ref_buf[static_cast<size_t>(i)] = residual_at(i);
+    }
     auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
     {
         ComputeContext ctx;
@@ -416,8 +454,15 @@ static void test_channel_last_vs_ref(const std::vector<int64_t>& in_shape,
     NNOPS_EXPECT_TRUE(out_descs[0].layout == cl);
     NNOPS_EXPECT_EQ(out_descs[0].numel(), out_n);
 
-    std::vector<T> out_buf(static_cast<size_t>(out_n),
-                           to_T(attrs.add_to ? 1.0f : 0.0f));
+    // The destination is pixel-major, so the shortcut has to be permuted the
+    // same way the activation is.
+    std::vector<T> res_cf(static_cast<size_t>(out_n));
+    for (int64_t i = 0; attrs.add_to && i < out_n; ++i) {
+        res_cf[static_cast<size_t>(i)] = to_T(residual_at(i));
+    }
+    std::vector<T> out_buf(attrs.add_to
+                               ? test::to_channel_last<T>(res_cf, N, C, outS)
+                               : std::vector<T>(static_cast<size_t>(out_n)));
     TensorView out_v(std::span<const int64_t>(out_descs[0].dims.data(),
                                               static_cast<size_t>(out_descs[0].rank)),
                      dt, out_buf.data(), cl);
@@ -475,6 +520,43 @@ NNOPS_TEST(dwconv_channel_last_vs_ref_relu) {
     DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
     attrs.epilogue.type = EpilogueActivateType::Relu;
     test_channel_last_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
+}
+
+NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act) {
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_channel_last_vs_ref<float>({1, 5, 6, 11}, {5, 1, 3, 3}, attrs, false, 1e-4f);
+}
+
+NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act_wide) {
+    // C=17: the two-vector 3x3 kernel followed by the one-lane tail, both
+    // reading their own destination before the epilogue.
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_channel_last_vs_ref<float>({1, 17, 7, 7}, {17, 1, 3, 3}, attrs, true, 1e-4f);
+}
+
+NNOPS_TEST(dwconv_channel_last_vs_ref_pre_act_generic) {
+    // A 1x1 filter keeps the 1x1 shape off the 3x3 kernels and on the generic
+    // row kernel.
+    DepthwiseConvAttributes attrs{{1, 1, 1}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_channel_last_vs_ref<float>({1, 8, 9, 9}, {8, 1, 1, 1}, attrs, false, 1e-4f);
+}
+
+NNOPS_TEST(dwconv_channel_last_vs_ref_f16_pre_act) {
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    test_channel_last_vs_ref<backend::cpu::half>({1, 8, 10, 10}, {8, 1, 3, 3},
+        attrs, false, 5e-3f);
 }
 
 NNOPS_TEST(dwconv_channel_last_vs_ref_1x1_stride2) {
@@ -595,6 +677,15 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
     const int64_t outS = dw_spatial_elems(ref_descs[0].dims);
     std::vector<OutT> ref_buf(static_cast<size_t>(N * C * outS));
+    // A signed shortcut in the output's domain, so the pre- and post-epilogue
+    // orders give different answers under a clamp or a ReLU.
+    const auto residual_at = [&](int64_t i) {
+        const int32_t z = out_qp.zero_point;
+        return static_cast<OutT>(z + static_cast<int32_t>(i % 5) - 2);
+    };
+    for (int64_t i = 0; attrs.add_to && i < N * C * outS; ++i) {
+        ref_buf[static_cast<size_t>(i)] = residual_at(i);
+    }
     TensorView ref_out(std::span<const int64_t>(ref_descs[0].dims), out_dt,
                        ref_buf.data(), TensorLayout::NCHW, out_qp);
     {
@@ -630,7 +721,13 @@ static void dwconv_q_channel_last_test(const std::vector<int64_t>& in_shape,
         std::span<const TensorDesc>(cl_in, has_bias ? 3 : 2));
     NNOPS_EXPECT_TRUE(out_descs[0].layout == cl);
 
-    std::vector<OutT> out_buf(static_cast<size_t>(N * C * outS));
+    std::vector<OutT> res_cf(static_cast<size_t>(N * C * outS));
+    for (int64_t i = 0; attrs.add_to && i < N * C * outS; ++i) {
+        res_cf[static_cast<size_t>(i)] = residual_at(i);
+    }
+    std::vector<OutT> out_buf(attrs.add_to
+                                  ? test::to_channel_last<OutT>(res_cf, N, C, outS)
+                                  : std::vector<OutT>(static_cast<size_t>(N * C * outS)));
     TensorView out_v(std::span<const int64_t>(out_descs[0].dims.data(),
                                               static_cast<size_t>(out_descs[0].rank)),
                      out_dt, out_buf.data(), cl, out_qp);
@@ -663,6 +760,35 @@ NNOPS_TEST(dwconv_q_channel_last_u8_to_u8_partial_bias) {
     std::vector<int32_t> wzps(5, 0);
     dwconv_q_channel_last_test<uint8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 3, 3}, attrs,
         make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
+        make_per_tensor(1.0f, 128), true);
+}
+
+NNOPS_TEST(dwconv_q_channel_last_s8_pre_act) {
+    // The quantized route dequantizes the destination into the sum, so the
+    // clamp sees the residual on the correct side of the output quantizer.
+    DepthwiseConvAttributes attrs{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.type = EpilogueActivateType::Relu;
+    std::vector<float> wscales(8, 1.0f);
+    std::vector<int32_t> wzps(8, 0);
+    dwconv_q_channel_last_test<int8_t, int8_t>({1, 8, 8, 8}, {8, 1, 3, 3}, attrs,
+        make_per_tensor(1.0f, 0), make_per_channel(wscales, wzps),
+        make_per_tensor(1.0f, 0), true);
+}
+
+NNOPS_TEST(dwconv_q_channel_last_u8_pre_act_clamp) {
+    // u8 with a non-zero zero point and a clamp: the residual arrives as a
+    // quantized value and must be dequantized around that zero point.
+    DepthwiseConvAttributes attrs{{1, 2, 2}, {1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    attrs.add_to = true;
+    attrs.residual_pre_activation = true;
+    attrs.epilogue.min_clip = -0.25f;
+    attrs.epilogue.max_clip = 0.75f;
+    std::vector<float> wscales(5, 1.0f);
+    std::vector<int32_t> wzps(5, 0);
+    dwconv_q_channel_last_test<uint8_t, uint8_t>({1, 5, 6, 6}, {5, 1, 2, 2}, attrs,
+        make_per_tensor(1.0f, 128), make_per_channel(wscales, wzps),
         make_per_tensor(1.0f, 128), true);
 }
 
@@ -716,7 +842,13 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
         std::span<const TensorDesc>(ref_in, has_bias ? 3 : 2));
     const int64_t out_n = ref_descs[0].numel();
 
-    std::vector<float> ref_buf(static_cast<size_t>(out_n), dw.add_to ? 1.0f : 0.0f);
+    const auto residual_at = [](int64_t i) {
+        return static_cast<float>(i % 5) * 0.5f - 1.0f;
+    };
+    std::vector<float> ref_buf(static_cast<size_t>(out_n));
+    for (int64_t i = 0; dw.add_to && i < out_n; ++i) {
+        ref_buf[static_cast<size_t>(i)] = residual_at(i);
+    }
     auto ref = test::make_channel_first(ref_descs[0], ref_buf.data());
     {
         ComputeContext ctx;
@@ -734,11 +866,18 @@ static void conv2d_depthwise_vs_ref(const std::vector<int64_t>& in_shape,
     attrs.groups      = C;
     attrs.epilogue    = dw.epilogue;
     attrs.add_to      = dw.add_to;
+    attrs.residual_pre_activation = dw.residual_pre_activation;
 
     auto conv = Conv2D::create(attrs, Backend::CPU);
 
-    std::vector<float> out_buf(static_cast<size_t>(out_n), dw.add_to ? 1.0f : 0.0f);
+    std::vector<float> out_buf(static_cast<size_t>(out_n));
+    for (int64_t i = 0; dw.add_to && i < out_n; ++i) {
+        out_buf[static_cast<size_t>(i)] = residual_at(i);
+    }
     if (channel_last) {
+        if (dw.add_to) {
+            out_buf = test::to_channel_last<float>(out_buf, N, C, out_n / (N * C));
+        }
         auto in_cl = test::to_channel_last<float>(in_vec, N, C, S);
         auto w_cl  = test::depthwise_to_hwcm<float>(w_vec, C, taps);
 
@@ -800,6 +939,24 @@ NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last) {
     conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true, true);
 }
 
+
+NNOPS_TEST(conv2d_group_eq_channels_depthwise_pre_act) {
+    // The reroute forwards the flag: a Conv2D with group == in_channels must
+    // not silently apply its shortcut after the activation.
+    DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    dw.add_to = true;
+    dw.residual_pre_activation = true;
+    dw.epilogue.type = EpilogueActivateType::Relu;
+    conv2d_depthwise_vs_ref({1, 6, 9, 9}, dw, true, false);
+}
+
+NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_pre_act) {
+    DepthwiseConvAttributes dw{{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}};
+    dw.add_to = true;
+    dw.residual_pre_activation = true;
+    dw.epilogue.type = EpilogueActivateType::Relu;
+    conv2d_depthwise_vs_ref({1, 8, 8, 9}, dw, true, true);
+}
 NNOPS_TEST(conv2d_group_eq_channels_depthwise_channel_last_add_to) {
     // C=17 leaves a one-lane tail past two full vectors, and the filter is
     // smaller than its padding-free plane, so the output is not the input's size.

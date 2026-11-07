@@ -592,7 +592,11 @@ inline void int8_epilogue_tile(const Int8EpilogueParams& p, int32_t* c, int ldc,
 // =========================================================================
 // Per column n of one output row:
 //   acc = raw[n] − coef_rb·R_b[n] − coef_zp·zp_b[n] + row_off
-//   out = ep(clamp(float(acc)·(s_a·s_b[n]) + bias, min_clip, max_clip))
+//   out = ep(clamp(float(acc)·(s_a·s_b[n]) + bias + col_bias + C_old,
+//                  min_clip, max_clip))
+//
+// C_old is the destination's own value, read before the store: the
+// pre-activation residual, which joins the sum the clip and the activation see.
 
 /// The row-constant half of the fp output pass.
 template <class TOut>
@@ -617,6 +621,7 @@ struct DqEpilogueRow {
     const TOut* col_bias;   ///< per-column bias, indexed by absolute column, or null
     int32_t k;
     const Epilogue* ep;     ///< clip bounds + activation
+    bool residual;          ///< add the destination's old value before the clip
 };
 
 template <class TOut>
@@ -665,6 +670,14 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
                     reinterpret_cast<const __m128i*>(p.col_bias + n))));
             } else {
                 f = _mm256_add_ps(f, _mm256_loadu_ps(p.col_bias + n));
+            }
+        }
+        if (p.residual) {
+            if constexpr (std::is_same_v<TOut, half>) {
+                f = _mm256_add_ps(f, _mm256_cvtph_ps(_mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(out + n))));
+            } else {
+                f = _mm256_add_ps(f, _mm256_loadu_ps(out + n));
             }
         }
         f = _mm256_min_ps(_mm256_max_ps(f, vmin), vmax);
@@ -719,6 +732,14 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
                 f = vaddq_f32(f, vld1q_f32(p.col_bias + n));
             }
         }
+        if (p.residual) {
+            if constexpr (std::is_same_v<TOut, half>) {
+                f = vaddq_f32(f, vcvt_f32_f16(vld1_f16(
+                    reinterpret_cast<const __fp16*>(out + n))));
+            } else {
+                f = vaddq_f32(f, vld1q_f32(out + n));
+            }
+        }
         f = vminq_f32(vmaxq_f32(f, vmin), vmax);
 
         if (plain) {
@@ -746,6 +767,7 @@ inline void dq_epilogue_row(const int32_t* c, TOut* out, int64_t n0, int64_t n1,
         float f = static_cast<float>(acc) * scale;
         if (p.bias != 0.0f) { f += p.bias; }
         if (p.col_bias != nullptr) { f += s_load(&p.col_bias[n]); }
+        if (p.residual) { f += s_load(&out[n]); }
         f = std::min(std::max(f, ep.min_clip), ep.max_clip);
         f = nnops::apply_epilogue(ep, f);
         s_store(&out[n], f);
@@ -781,6 +803,10 @@ struct DqEpilogueParams {
     /// Per-column bias over the full [N] output width, added in the same place:
     /// MatMul's [N] bias, or Conv2D's channel-last one. nullptr → none.
     const TOut* col_bias;
+    /// Add the destination's old value to the dequantized sum before the clip —
+    /// the pre-activation residual. The int8 routes accumulate into a buffer of
+    /// their own, so the destination still holds C_old when this pass runs.
+    bool residual = false;
     TOut* out;               ///< fp destination
     int ldc_out;
 };
@@ -812,6 +838,7 @@ inline void dq_epilogue_tile(const DqEpilogueParams<TOut>& p, const int32_t* c, 
             p.col_bias,
             p.k,
             p.ep,
+            p.residual,
         };
         dq_epilogue_row(c + r * ldc, p.out + m * p.ldc_out, n0, n0 + nc, row);
     }

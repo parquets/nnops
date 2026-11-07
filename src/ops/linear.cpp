@@ -55,6 +55,16 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
     NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
     NNOPS_TRY(detail::require(
         is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)));
+
+    // The CPU routes implement the pre-activation residual — int8 included —
+    // but the gated combine and the CUDA kernel apply the residual after their
+    // own activation. Refusing beats applying it on the wrong side.
+    if (attrs_.add_to && attrs_.residual_pre_activation) {
+        if (attrs_.gated || backend_ != Backend::CPU) {
+            return Status::unsupported;
+        }
+    }
+
     if (!attrs_.gated) { return Status::ok; }
 
     const TensorDesc& x = inputs[0];

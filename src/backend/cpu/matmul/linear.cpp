@@ -17,10 +17,13 @@
 /// Bias and the activation are MatMul's: it adds the bias between the product
 /// and the epilogue (an fp bias on an fp output, an int32 bias on an integer
 /// one). Linear forwards its third input and sets the epilogue; what is left
-/// here is add_to, which rides MatMul's beta when the operands are fp and the
-/// epilogue is identity — the residual must not pass through the activation —
-/// and otherwise goes through a compact M×N temporary. add_to on an integer
-/// output is not implemented (the residual would need its own requantized add).
+/// here is add_to. The pre-activation order folds into the GEMM call even with
+/// an active epilogue — `residual_pre_activation` has every route, int8
+/// included, add the destination's old contents to the sum before the clamp
+/// and the activation — and an identity epilogue folds either way, since the
+/// two orders then agree. The post-activation order with an active epilogue
+/// goes through a compact M×N temporary instead. add_to on an integer output is
+/// not implemented (the residual would need its own requantized add).
 
 #include "nnops/ops/linear.hpp"
 #include "nnops/ops/matmul.hpp"
@@ -127,7 +130,9 @@ Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
     return Status::ok;
 }
 
-/// out += src over every row; MatMul already put bias and activation through `src`.
+/// out += src over every row; MatMul already put bias and activation through
+/// `src`. That is the epilogue helper's post-activation add with an identity
+/// epilogue, so the arithmetic is the shared vector kernel's.
 template <class T>
 void residual_add(TensorView& out, const TensorView& src, const ComputeContext& ctx)
 {
@@ -136,15 +141,11 @@ void residual_add(TensorView& out, const TensorView& src, const ComputeContext& 
     if (cols <= 0 || rows <= 0) { return; }
 
     ctx.cpu.run(0, rows, [&](int64_t r) {
-        T* d = out.ptr<T>(static_cast<size_t>(r));
-        const T* s = src.ptr<T>(static_cast<size_t>(r));
-        for (int64_t n = 0; n < cols; ++n) {
-            if constexpr (std::is_same_v<T, half>) {
-                d[n] = float_to_half(half_to_float(d[n]) + half_to_float(s[n]));
-            } else {
-                d[n] += s[n];
-            }
-        }
+        epilogue_inplace<T>(1, static_cast<int>(cols),
+                            out.ptr<T>(static_cast<size_t>(r)),
+                            static_cast<int>(out.row_stride_elems()),
+                            static_cast<const T*>(nullptr), Epilogue{},
+                            src.ptr<T>(static_cast<size_t>(r)), true);
     });
 }
 
@@ -223,13 +224,16 @@ Status linear_cpu(const LinearAttributes& attrs,
     ma.output_dtype = out_dt;   // read only on the int8 route
     ma.epilogue = attrs.epilogue;
 
-    // add_to can ride beta only for fp operands with an identity epilogue: the
-    // residual must not pass through the activation, and int8 zeroes C.
-    const bool ep_identity = !epilogue_is_active(attrs.epilogue);
-    const bool beta_residual = attrs.add_to && !quant && ep_identity;
-    if (beta_residual) { ma.beta = 1.0f; }
+    // The pre-activation residual folds into the GEMM: every route — fp, q4_1
+    // and int8 — adds the destination's old contents to the product before the
+    // clamp and the activation. An identity epilogue folds either way, since
+    // the two orders then agree.
+    const bool fold = attrs.add_to &&
+                      (attrs.residual_pre_activation ||
+                       !epilogue_is_active(attrs.epilogue));
+    ma.residual_pre_activation = fold;
 
-    if (attrs.add_to && !beta_residual) {
+    if (attrs.add_to && !fold) {
         // MatMul writes a compact temporary; the residual is added after its epilogue.
         const int64_t out_rows = ov.total_rows();
         PoolPtr tmp(static_cast<size_t>(out_rows) * static_cast<size_t>(N)

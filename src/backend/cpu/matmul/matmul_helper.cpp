@@ -829,21 +829,28 @@ void tile_scale(half* c, int ldc, float scale, int M, int N) {
     tile_scale_impl(c, ldc, scale, M, N);
 }
 
+/// C = scale·C + bias. A zero scale replaces the tile, so it stores the bias
+/// rather than trusting 0·C: the old C is arbitrary (a pooled output buffer),
+/// and 0·±inf or 0·NaN is NaN, which would then ride the whole k sweep.
 template <typename T>
 void tile_scale_add_bias_impl(T* c, int ldc, float scale, const T* bias,
                               int M, int N) {
     using namespace nnops::simd;
     constexpr int L = simd_lane_for<T>;
+    const bool replace = (scale == 0.0f);
     for (int m = 0; m < M; ++m) {
         T* row = c + m * ldc;
         auto v_scale = v_set1(row, scale);
         int i = 0;
         for (; i + L <= N; i += L) {
-            auto v = v_add(v_mul(v_load(row + i), v_scale), v_load(bias + i));
+            auto v = replace
+                ? v_load(bias + i)
+                : v_add(v_mul(v_load(row + i), v_scale), v_load(bias + i));
             v_store(row + i, v);
         }
         for (; i < N; ++i) {
-            s_store(&row[i], s_load(&row[i]) * scale + s_load(&bias[i]));
+            s_store(&row[i], replace ? s_load(&bias[i])
+                                     : s_load(&row[i]) * scale + s_load(&bias[i]));
         }
     }
 }

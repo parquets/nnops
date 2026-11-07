@@ -1460,10 +1460,14 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     // A pure clamp folds into the MMA store, as on the channel-first route. The bias is
     // per *column* here (rows are pixels), so it seeds the tile instead of the
     // micro-kernel's per-row seed — leaving the clamp nothing else to do.
+    // A pre-activation residual joins the sum before the clamp, so the clamp
+    // cannot ride the MMA store and the epilogue stays a separate pass.
+    const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
+
     float clamp_lo = -kInf;
     float clamp_hi = kInf;
     bool epi_folded = false;
-    if (!attrs.add_to) {
+    if (!attrs.add_to || pre_act) {
         switch (attrs.epilogue.type) {
         case EpilogueActivateType::Relu:
             clamp_lo = 0.0f; epi_folded = true;
@@ -1479,9 +1483,10 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
     const bool epi_pass   = epi_active && !epi_folded;
 
     // add_to folds the pre-existing output into the accumulator seed when the
-    // epilogue is the identity; with an activation the residual must be added
-    // *after* it, so the original tile is preserved instead.
-    const bool keep_orig = attrs.add_to && epi_pass;
+    // epilogue is the identity, and the pre-activation order always does; the
+    // post-activation order with an activation preserves the original tile and
+    // adds it after the epilogue instead.
+    const bool keep_orig = attrs.add_to && epi_pass && !pre_act;
 
     // The bias is per column, so it always seeds the tile; add_to's seed also
     // carries the residual. A seeded tile must never be zeroed by the MMA.
