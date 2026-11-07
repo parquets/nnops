@@ -52,12 +52,14 @@ Buf conv_bn(const ModelArtifact& m, const TensorView& x,
             const std::string& conv, const std::string& bn,
             nnops::EpilogueActivateType act,
             int64_t kernel, int64_t stride, int64_t pad,
-            const TensorView* residual = nullptr)
+            const TensorView* residual = nullptr,
+            bool residual_pre_act = false)
 {
     if (model::fuse_enabled()) {
         return model::conv2d_bn_act(x, m.at(conv + ".weight"),
                                     model::batch_norm_params(m, bn), act,
-                                    kernel, stride, pad, 1, residual);
+                                    kernel, stride, pad, 1, residual,
+                                    residual_pre_act);
     }
     Buf y = model::conv2d(x, m.at(conv + ".weight"), kernel, stride, pad);
     y = norm(m, bn, y.view);
@@ -85,10 +87,22 @@ Buf basic_block(const ModelArtifact& m, const std::string& prefix,
     const TensorView& res = downsample ? skip.view : x;
 
     // main = relu(main + shortcut). `add_to` puts the residual in the output
-    // buffer the conv accumulates into, so the separate add pass goes away —
-    // but its epilogue runs *before* the residual (`output += act(conv)`), and
-    // this block needs the residual first, so the relu stays its own call.
+    // buffer the conv accumulates into, and the relu stays a separate call by
+    // default: these convs are 3x3 s1, so they take Winograd, whose kernels
+    // apply the residual after the activation. `residual_pre_activation` folds
+    // the relu into the conv but is implemented on the implicit-GEMM route
+    // only, so setting NNOPS_MODEL_PREACT=1 validates that form end to end at
+    // the cost of the Winograd route.
+    static const bool preact = [] {
+        const char* s = std::getenv("NNOPS_MODEL_PREACT");
+        return s != nullptr && std::strcmp(s, "0") != 0;
+    }();
     if (model::fuse_enabled()) {
+        if (preact) {
+            return conv_bn(m, y.view, prefix + ".conv2", prefix + ".bn2",
+                           nnops::EpilogueActivateType::Relu, 3, 1, 1, &res,
+                           /*residual_pre_act=*/true);
+        }
         y = conv_bn(m, y.view, prefix + ".conv2", prefix + ".bn2",
                     nnops::EpilogueActivateType::None, 3, 1, 1, &res);
     } else {

@@ -432,7 +432,9 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     // disappears is one whole read-modify-write pass over the output.
     nnops::Conv2DAttributes use = attrs;
     if (residual != nullptr) { use.add_to = true; }
-    const bool wino = nnops::winograd_applicable(
+    // The Winograd kernels apply the residual after the activation; a
+    // pre-activation residual falls back to the implicit-GEMM route.
+    const bool wino = !use.residual_pre_activation && nnops::winograd_applicable(
         use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
     if (wino && winograd_order_override() != 0) {
         use.winograd_order = winograd_order_override();
@@ -699,7 +701,8 @@ inline Buf conv2d_bn_act(const TensorView& x, const TensorView& w,
                          nnops::EpilogueActivateType act,
                          int64_t kernel, int64_t stride, int64_t pad,
                          int64_t groups = 1,
-                         const TensorView* residual = nullptr)
+                         const TensorView* residual = nullptr,
+                         bool residual_pre_act = false)
 {
     nnops::Conv2DAttributes attrs;
     attrs.kernel_size = {kernel, kernel};
@@ -707,6 +710,10 @@ inline Buf conv2d_bn_act(const TensorView& x, const TensorView& w,
     attrs.padding = {pad, pad};
     attrs.groups = groups;
     attrs.epilogue.type = act;
+    // ResNet's `relu(conv + shortcut)`: the residual joins the accumulator
+    // before the activation, so the relu is the conv's epilogue rather than a
+    // separate pass over the output.
+    attrs.residual_pre_activation = residual_pre_act;
     const detail::Folded& f = detail::folded(w, bn);
     return conv2d_run(x, f.weight.view, &f.bias.view, attrs,
                       "conv2d_fused/wino", "conv2d_fused/im2col", residual);
