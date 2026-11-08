@@ -202,6 +202,34 @@ const std::vector<Shape>& sweep() {
     return s;
 }
 
+/// MobileNetV2's own layer shapes, one row per distinct geometry, so a
+/// per-layer reference (oneDNN's benchdnn, say) can be lined up row by row.
+const std::vector<Shape>& mobilenetv2_shapes() {
+    static const std::vector<Shape> s = {
+        {"mnv2 stem k3s2 224 3->32",   1,    3, 224, 224,   32, 3, 3, 2, 2, 1, 1},
+        {"mnv2 pw @112 32->16",        1,   32, 112, 112,   16, 1, 1},
+        {"mnv2 pw @112 16->96",        1,   16, 112, 112,   96, 1, 1},
+        {"mnv2 pw @56  96->24",        1,   96,  56,  56,   24, 1, 1},
+        {"mnv2 pw @56  24->144",       1,   24,  56,  56,  144, 1, 1},
+        {"mnv2 pw @56  144->24",       1,  144,  56,  56,   24, 1, 1},
+        {"mnv2 pw @28  144->32",       1,  144,  28,  28,   32, 1, 1},
+        {"mnv2 pw @28  32->192",       1,   32,  28,  28,  192, 1, 1},
+        {"mnv2 pw @28  192->32",       1,  192,  28,  28,   32, 1, 1},
+        {"mnv2 pw @14  192->64",       1,  192,  14,  14,   64, 1, 1},
+        {"mnv2 pw @14  64->384",       1,   64,  14,  14,  384, 1, 1},
+        {"mnv2 pw @14  384->64",       1,  384,  14,  14,   64, 1, 1},
+        {"mnv2 pw @14  384->96",       1,  384,  14,  14,   96, 1, 1},
+        {"mnv2 pw @14  96->576",       1,   96,  14,  14,  576, 1, 1},
+        {"mnv2 pw @14  576->96",       1,  576,  14,  14,   96, 1, 1},
+        {"mnv2 pw @7   576->160",      1,  576,   7,   7,  160, 1, 1},
+        {"mnv2 pw @7   160->960",      1,  160,   7,   7,  960, 1, 1},
+        {"mnv2 pw @7   960->160",      1,  960,   7,   7,  160, 1, 1},
+        {"mnv2 pw @7   960->320",      1,  960,   7,   7,  320, 1, 1},
+        {"mnv2 pw @7   320->1280",     1,  320,   7,   7, 1280, 1, 1},
+    };
+    return s;
+}
+
 // ============================================================
 // Floating-point A/B: one layer in both layouts
 // ============================================================
@@ -874,7 +902,8 @@ struct AbPackedI8ChannelFirst : AbPackedI8 {
 
 /// One table: every layer at every thread count, raw filter vs prepacked.
 template <class Layer>
-void run_filter_table(const char* title) {
+void run_filter_table(const char* title,
+                      const std::vector<Shape>& shapes = sweep()) {
     const int iters = 10, rounds = 3;
     std::printf("\n== %s ==\n", title);
     for (int nt : bench_threads()) {
@@ -884,7 +913,7 @@ void run_filter_table(const char* title) {
                     "packed time", "verdict");
         int wins = 0, losses = 0, ties = 0;
         double tot_raw = 0.0, tot_packed = 0.0;
-        for (const auto& c : sweep()) {
+        for (const auto& c : shapes) {
             if (c.dw) { continue; }   // a depthwise layer is a different operator
             Layer l(c);
             const AbResult r = measure_ab(nt,
@@ -1055,6 +1084,18 @@ NNOPS_BENCH(conv2d_channel_last_vs_channel_first_int8) {
 NNOPS_BENCH(conv2d_filter_prepacked_f32) {
     run_filter_table<AbPacked<float>>(
         "f32: the raw HWIO filter vs the same filter through prepackWeights");
+}
+
+NNOPS_BENCH(conv2d_mobilenetv2_shapes_f32) {
+    run_filter_table<AbPacked<float>>(
+        "f32: MobileNetV2's layer shapes, the raw HWIO filter vs prepacked",
+        mobilenetv2_shapes());
+}
+
+NNOPS_BENCH(conv2d_mobilenetv2_shapes_f16) {
+    run_filter_table<AbPacked<half>>(
+        "f16: MobileNetV2's layer shapes, the raw HWIO filter vs prepacked",
+        mobilenetv2_shapes());
 }
 
 NNOPS_BENCH(conv2d_filter_prepacked_f16) {

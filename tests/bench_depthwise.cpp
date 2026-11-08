@@ -362,6 +362,35 @@ NNOPS_BENCH(depthwise_channel_first_vs_channel_last) {
     }
 }
 
+NNOPS_BENCH(depthwise_mobilenetv2_shapes) {
+    const std::vector<int> threads = bench_threads();
+    const int iters = 20;
+    const int rounds = 5;
+
+    std::printf("depthwise 3x3: MobileNetV2's own layer shapes\n");
+    std::printf("  pool=%s  threads=", test::bench_pool_name());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        std::printf("%d%s", threads[i], i + 1 < threads.size() ? "," : "\n");
+    }
+
+    const DepthwiseCase cases[] = {
+        {"mnv2 dw @112 C=32  s1",  32, 112, 112},
+        {"mnv2 dw @112 C=96  s2",  96, 112, 112, 3, 3, 2, 2},
+        {"mnv2 dw @56  C=144 s1", 144,  56,  56},
+        {"mnv2 dw @56  C=144 s2", 144,  56,  56, 3, 3, 2, 2},
+        {"mnv2 dw @28  C=192 s1", 192,  28,  28},
+        {"mnv2 dw @28  C=192 s2", 192,  28,  28, 3, 3, 2, 2},
+        {"mnv2 dw @14  C=384 s1", 384,  14,  14},
+        {"mnv2 dw @14  C=576 s2", 576,  14,  14, 3, 3, 2, 2},
+        {"mnv2 dw @7   C=576 s1", 576,   7,   7},
+        {"mnv2 dw @7   C=960 s1", 960,   7,   7},
+    };
+
+    for (const auto& c : cases) {
+        run_case(c, threads, iters, rounds);
+    }
+}
+
 NNOPS_BENCH(depthwise_channel_first_unroll) {
     const int iters = 20;
     const int rounds = 5;
