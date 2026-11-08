@@ -1100,27 +1100,30 @@ void mma_direct_mr6_nr16_mrxncxkc_f32(
         __m256 v_acc5x89abcdef = init(r5, 8);
 
         const float* b_ptr = B;
+        // A is indexed by the k counter rather than walked: six bumped pointers cost
+        // six lea per k against a budget of twenty-four uops per twelve FMAs, and the
+        // width is what the front end runs out of. One index register, no bumps.
         for(int k = 0; k < kc; ++k) {
             const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
             const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
             b_ptr += row_step;
 
-            __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
-            __m256 v_a1 = _mm256_broadcast_ss(a1_ptr); a1_ptr += 1;
+            __m256 v_a0 = _mm256_broadcast_ss(a0_ptr + k);
+            __m256 v_a1 = _mm256_broadcast_ss(a1_ptr + k);
             v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
             v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
             v_acc1x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc1x01234567);
             v_acc1x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc1x89abcdef);
 
-            v_a0 = _mm256_broadcast_ss(a2_ptr); a2_ptr += 1;
-            v_a1 = _mm256_broadcast_ss(a3_ptr); a3_ptr += 1;
+            v_a0 = _mm256_broadcast_ss(a2_ptr + k);
+            v_a1 = _mm256_broadcast_ss(a3_ptr + k);
             v_acc2x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc2x01234567);
             v_acc2x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc2x89abcdef);
             v_acc3x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc3x01234567);
             v_acc3x89abcdef = _mm256_fmadd_ps(v_a1, v_b1, v_acc3x89abcdef);
 
-            v_a0 = _mm256_broadcast_ss(a4_ptr); a4_ptr += 1;
-            v_a1 = _mm256_broadcast_ss(a5_ptr); a5_ptr += 1;
+            v_a0 = _mm256_broadcast_ss(a4_ptr + k);
+            v_a1 = _mm256_broadcast_ss(a5_ptr + k);
             v_acc4x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc4x01234567);
             v_acc4x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc4x89abcdef);
             v_acc5x01234567 = _mm256_fmadd_ps(v_a1, v_b0, v_acc5x01234567);
