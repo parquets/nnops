@@ -510,6 +510,11 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
     const V vbias = bias_vec ? v_load(bias_vec) : v_zero(in_img);
     V wt[9];
     for (int t = 0; t < 9; ++t) { wt[t] = v_load(w_tap0 + t * wtap); }
+    // An inactive epilogue writes the accumulator out as it stands; the runtime
+    // switch in apply_epilogue_vec would otherwise cost a load and an indirect
+    // branch per store.
+    const bool simple = !add_to && !pre_act &&
+                        !nnops::epilogue_is_active(epilogue);
 
     // One row pointer per distinct input row of the group, biased by the left
     // pad so a tap's address is `row + (ow*SW + kw)*pix`.
@@ -563,6 +568,7 @@ inline void dwconv_last3x3(T* out_rows, const T* in_img, const T* w_tap0,
         for (int r = 0; r < R; ++r) {
             if (p.oh + r >= p.OH) { continue; }
             T* dst = out_rows + r * p.out_row_stride + ow * pix;
+            if (simple) { v_store(dst, acc[r]); continue; }
             V a = acc[r];
             if (pre_act) { a = v_add(a, v_load(dst)); }
             v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(epilogue,
@@ -672,6 +678,202 @@ inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
     }
 }
 
+// A tap of the unrolled four-row body: two weight vectors, then eight FMAs whose
+// source addresses are literals. The two rows a group can reach past the plane are
+// compile-time guards, so a masked tap costs no branch. Token-pasted row names keep
+// the eight accumulators in registers; an indexed array is what the rolled kernel
+// spills.
+//
+// `wsrc` points at the packed copy of the taps (see the kernel), so a tap's two weight
+// vectors sit at a literal displacement and cost no address arithmetic. `wsrc` is
+// volatile on purpose: it keeps the eighteen loads inside the width loop, because
+// hoisted they are eighteen live vectors on top of the eight accumulators and the
+// allocator answers that by spilling the accumulators. A read-write barrier or a store
+// into `wpack` blocks the hoist just as well, and both were measured worse: with the
+// taps free to become FMA memory operands, the body re-loads every input per output row
+// — seventy-two loads a column against thirty-six — which costs more than the eighteen
+// pointer reloads it saves.
+//
+// `OFF` is the running byte-free column offset for this tap's `kw`.
+#define NNOPS_DW16X4_TAP(KH, KW, OFF)                                          \
+    {                                                                          \
+        const V w0 = v_load(wsrc + ((KH) * 3 + (KW)) * 2 * kL);                 \
+        const V w1 = v_load(wsrc + ((KH) * 3 + (KW)) * 2 * kL + kL);            \
+        if (TOP_OK || (KH) != 0) {                                             \
+            a00 = v_fmadd(v_load(row[(KH)] + (OFF)), w0, a00);                  \
+            a01 = v_fmadd(v_load(row[(KH)] + (OFF) + kL), w1, a01);             \
+        }                                                                      \
+        a10 = v_fmadd(v_load(row[SH + (KH)] + (OFF)), w0, a10);                 \
+        a11 = v_fmadd(v_load(row[SH + (KH)] + (OFF) + kL), w1, a11);            \
+        a20 = v_fmadd(v_load(row[2 * SH + (KH)] + (OFF)), w0, a20);             \
+        a21 = v_fmadd(v_load(row[2 * SH + (KH)] + (OFF) + kL), w1, a21);        \
+        if (BOT_OK || (KH) != 2) {                                             \
+            a30 = v_fmadd(v_load(row[3 * SH + (KH)] + (OFF)), w0, a30);         \
+            a31 = v_fmadd(v_load(row[3 * SH + (KH)] + (OFF) + kL), w1, a31);    \
+        }                                                                      \
+    }
+
+// `rows_left` is p.OH - p.oh, hoisted: read from the params, the four store predicates
+// cost four loads, four adds and four compares per column.
+#define NNOPS_DW16X4_STORE_AT(R, DST)                                          \
+    if ((R) < rows_left) {                                                     \
+        T* dst = (DST);                                                         \
+        if constexpr (SIMPLE) {                                                 \
+            v_store(dst, a##R##0);                                              \
+            v_store(dst + kL, a##R##1);                                         \
+        } else {                                                                \
+            V x0 = a##R##0;                                                     \
+            V x1 = a##R##1;                                                     \
+            if (pre_act) {                                                      \
+                x0 = v_add(x0, v_load(dst));                                    \
+                x1 = v_add(x1, v_load(dst + kL));                               \
+            }                                                                   \
+            v_store_add(dst, nnops::backend::cpu::apply_epilogue_vec(           \
+                                    epilogue, out_rows, x0), add_to);           \
+            v_store_add(dst + kL, nnops::backend::cpu::apply_epilogue_vec(      \
+                                      epilogue, out_rows, x1), add_to);         \
+        }                                                                       \
+    }
+
+#define NNOPS_DW16X4_STORE(R)                                                  \
+    NNOPS_DW16X4_STORE_AT(R, out_rows + (R) * p.out_row_stride + ow * pix)
+
+/// The two-vector 3x3 at four rows, straight-line: the nine taps of a column are
+/// a compile-time sequence with literal source offsets, so the body carries no tap
+/// counter, no row-table index and no accumulator array. The rolled variant below
+/// rebuilds four row pointers per filter row and drives both loops off a counter.
+///
+/// `SIMPLE` is a template argument rather than a runtime flag because the epilogue
+/// still has to be *absent* from the instantiation: the four activation arms of a
+/// live epilogue need enough registers of their own that the allocator spills the
+/// eight accumulators to stack. A store-only body leaves eleven live vectors and the
+/// interior loop compiles clean.
+template <int SH, bool TOP_OK, bool BOT_OK, bool SIMPLE, typename T>
+inline void dwconv_last3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
+                                const T* bias_vec, const DwConvParams& p,
+                                const Epilogue& epilogue, bool add_to, bool pre_act)
+{
+    if constexpr (SIMPLE) {
+        (void)epilogue; (void)add_to; (void)pre_act;
+    }
+    using V = decltype(v_load(in_img));
+    constexpr int64_t kL = kChannelLanes;
+    constexpr int64_t kRows = 3 * SH + 3;
+    const int64_t pix  = p.pix_stride;
+    const int64_t wtap = p.w_tap_stride;
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+
+    const V vb0 = bias_vec ? v_load(bias_vec) : v_zero(in_img);
+    const V vb1 = bias_vec ? v_load(bias_vec + kL) : v_zero(in_img);
+
+    const T* row[kRows];
+    for (int64_t i = 0; i < kRows; ++i) {
+        const int64_t ih = p.oh * SH + i - p.PH;
+        row[i] = in_img + ih * p.in_row_stride - p.PW * pix;
+    }
+    // A masked-out row never reaches an FMA, so it can hold any valid pointer.
+    if (!TOP_OK) { row[0] = in_img; }
+
+    // The nine taps copied into tap order. Addressing them through `wtap` costs an
+    // imul per load, and the width loop has no general register to spare; copied, every
+    // weight access is a literal displacement. One copy per four-row block, so the
+    // amortised cost is a fraction of a load per column.
+    alignas(32) T wpack[18 * kL];
+    for (int64_t k = 0; k < 9; ++k) {
+        v_store(wpack + k * 2 * kL, v_load(w_tap0 + k * wtap));
+        v_store(wpack + k * 2 * kL + kL, v_load(w_tap0 + k * wtap + kL));
+    }
+    const T* const volatile wsrc = wpack;
+
+    const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
+    const int64_t last_hi = p.IW - 1 + p.PW - 2 * p.DW;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / p.SW : -1;
+    const int64_t off_ok_lo = p.PW;
+    const int64_t off_ok_hi = p.IW + p.PW;
+    const int64_t rows_left = p.OH - p.oh;
+
+    // A column whose 3x3 window straddles the padded edge takes the rolled masked
+    // pass. It rebuilds its own row table: the rolled loops index by a variable `kh`,
+    // and one variable index is enough to put the table in memory, after which the
+    // interior loop reloads `row[k]` from the stack on the load ports — measured at 89
+    // stack accesses per column against 90 real loads. Constant indices let the
+    // allocator keep the interior table in registers.
+    const auto masked_col = [&](int64_t ow) {
+        const T* mrow[kRows];
+        for (int64_t i = 0; i < kRows; ++i) {
+            const int64_t ih = p.oh * SH + i - p.PH;
+            mrow[i] = in_img + ih * p.in_row_stride - p.PW * pix;
+        }
+        if (!TOP_OK) { mrow[0] = in_img; }
+        V a00 = vb0, a01 = vb1, a10 = vb0, a11 = vb1;
+        V a20 = vb0, a21 = vb1, a30 = vb0, a31 = vb1;
+        const int64_t ow_off = ow * p.SW;
+        for (int64_t kh = 0; kh < 3; ++kh) {
+            for (int64_t kw = 0; kw < 3; ++kw) {
+                const int64_t off = ow_off + kw;
+                if (off < off_ok_lo || off >= off_ok_hi) { continue; }
+                const int64_t at = off * pix;
+                const V w0 = v_load(w_tap0 + (kh * 3 + kw) * wtap);
+                const V w1 = v_load(w_tap0 + (kh * 3 + kw) * wtap + kL);
+                if (TOP_OK || kh != 0) {
+                    a00 = v_fmadd(v_load(mrow[kh] + at), w0, a00);
+                    a01 = v_fmadd(v_load(mrow[kh] + at + kL), w1, a01);
+                }
+                a10 = v_fmadd(v_load(mrow[SH + kh] + at), w0, a10);
+                a11 = v_fmadd(v_load(mrow[SH + kh] + at + kL), w1, a11);
+                a20 = v_fmadd(v_load(mrow[2 * SH + kh] + at), w0, a20);
+                a21 = v_fmadd(v_load(mrow[2 * SH + kh] + at + kL), w1, a21);
+                if (BOT_OK || kh != 2) {
+                    a30 = v_fmadd(v_load(mrow[3 * SH + kh] + at), w0, a30);
+                    a31 = v_fmadd(v_load(mrow[3 * SH + kh] + at + kL), w1, a31);
+                }
+            }
+        }
+        NNOPS_DW16X4_STORE(0) NNOPS_DW16X4_STORE(1) NNOPS_DW16X4_STORE(2)
+        NNOPS_DW16X4_STORE(3)
+    };
+
+    const int64_t iw_lo = (ow_lo > p.ow0) ? ow_lo : p.ow0;
+    const int64_t iw_hi = (ow_hi + 1 < ow_end) ? ow_hi + 1 : ow_end;
+    const int64_t iw_tail = (iw_hi > iw_lo) ? iw_hi : iw_lo;
+
+    for (int64_t ow = p.ow0; ow < iw_lo; ++ow) { masked_col(ow); }
+
+    // Three walking source offsets, one per `kw`, and a walking destination offset: the
+    // column index disappears from the loop, leaving literal displacements in the tap
+    // addresses and no imul or lea per tap.
+    const int64_t swpix = p.SW * pix;
+    const int64_t stride = p.out_row_stride;
+    int64_t o0 = iw_lo * swpix;
+    int64_t o1 = o0 + pix;
+    int64_t o2 = o1 + pix;
+    int64_t dpos = iw_lo * pix;
+    for (int64_t ow = iw_lo; ow < iw_hi;
+         ++ow, o0 += swpix, o1 += swpix, o2 += swpix, dpos += pix) {
+        T* dst0 = out_rows + dpos;
+        V a00 = vb0, a01 = vb1, a10 = vb0, a11 = vb1;
+        V a20 = vb0, a21 = vb1, a30 = vb0, a31 = vb1;
+        NNOPS_DW16X4_TAP(0, 0, o0)
+        NNOPS_DW16X4_TAP(0, 1, o1)
+        NNOPS_DW16X4_TAP(0, 2, o2)
+        NNOPS_DW16X4_TAP(1, 0, o0)
+        NNOPS_DW16X4_TAP(1, 1, o1)
+        NNOPS_DW16X4_TAP(1, 2, o2)
+        NNOPS_DW16X4_TAP(2, 0, o0)
+        NNOPS_DW16X4_TAP(2, 1, o1)
+        NNOPS_DW16X4_TAP(2, 2, o2)
+        NNOPS_DW16X4_STORE_AT(0, dst0)
+        NNOPS_DW16X4_STORE_AT(1, dst0 + stride)
+        NNOPS_DW16X4_STORE_AT(2, dst0 + 2 * stride)
+        NNOPS_DW16X4_STORE_AT(3, dst0 + 3 * stride)
+    }
+
+    for (int64_t ow = iw_tail; ow < ow_end; ++ow) { masked_col(ow); }
+}
+
+#undef NNOPS_DW16X4_TAP
+#undef NNOPS_DW16X4_STORE
+
 /// The two-vector 3x3: sixteen channels, the same row table and eight
 /// accumulators, with the tap vectors loaded per column inside the width loop —
 /// eighteen of them plus eight accumulators is twenty-six registers — but one
@@ -690,6 +892,50 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
     if (ih0 >= -1 && ih_max <= p.IH) {
         const bool top_ok = ih0 >= 0;
         const bool bot_ok = ih_max < p.IH;
+        if (R == 4) {
+            const bool simple = !add_to && !pre_act &&
+                                !nnops::epilogue_is_active(epilogue);
+            if (simple) {
+                if (top_ok) {
+                    if (bot_ok) {
+                        dwconv_last3x3_16x4<SH, true, true, true>(
+                            out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                            pre_act);
+                    } else {
+                        dwconv_last3x3_16x4<SH, true, false, true>(
+                            out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                            pre_act);
+                    }
+                } else if (bot_ok) {
+                    dwconv_last3x3_16x4<SH, false, true, true>(
+                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                        pre_act);
+                } else {
+                    dwconv_last3x3_16x4<SH, false, false, true>(
+                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                        pre_act);
+                }
+                return;
+            }
+            if (top_ok) {
+                if (bot_ok) {
+                    dwconv_last3x3_16x4<SH, true, true, false>(
+                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                        pre_act);
+                } else {
+                    dwconv_last3x3_16x4<SH, true, false, false>(
+                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
+                        pre_act);
+                }
+            } else if (bot_ok) {
+                dwconv_last3x3_16x4<SH, false, true, false>(
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
+            } else {
+                dwconv_last3x3_16x4<SH, false, false, false>(
+                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
+            }
+            return;
+        }
         if (top_ok) {
             if (bot_ok) {
                 dwconv_last3x3_16_masked<R, SH, true, true>(
