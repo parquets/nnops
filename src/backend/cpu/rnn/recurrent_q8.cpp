@@ -32,17 +32,34 @@ inline const float* q8_scale_rows(const QuantParams& q, int64_t d,
 /// a packed panel is scaled by the scale of the gate row it came from. Null
 /// means a per-tensor scalar; the pad lanes take 1, which is inert because the
 /// weight bytes beside them are zero.
+///
+/// One hidden block is one vector either way — eight contiguous scales of one
+/// gate row in, eight contiguous columns out — so the gates are a straight-line
+/// loop over full-width moves and only the last block, when H is not a multiple
+/// of eight, fills lanes scalar-wise.
 inline void interleave_scales(const float* src, float scalar, int64_t hidden,
                               int64_t gates, int64_t gate_off, float* dst)
 {
     const int64_t q = 8 * gates;
+    const v_f32x8 fill = v_set1(dst, scalar);
     for (int64_t hb = 0; hb * 8 < hidden; ++hb) {
-        for (int64_t g = 0; g < gates; ++g) {
-            for (int64_t j = 0; j < 8; ++j) {
-                const int64_t h = hb * 8 + j;
-                dst[hb * q + g * 8 + j] =
-                    (h < hidden && src != nullptr) ? src[(gate_off + g) * hidden + h]
-                                                   : scalar;
+        const int64_t h = hb * 8;
+        float* const out = dst + hb * q;
+        if (src == nullptr) {
+            for (int64_t g = 0; g < gates; ++g) { v_store(out + g * 8, fill); }
+        } else if (h + 8 <= hidden) {
+            const float* const row = src + gate_off * hidden + h;
+            for (int64_t g = 0; g < gates; ++g) {
+                v_store(out + g * 8, v_load(row + g * hidden));
+            }
+        } else {
+            const int64_t live = hidden - h;
+            for (int64_t g = 0; g < gates; ++g) {
+                float tail[8];
+                std::memcpy(tail, src + (gate_off + g) * hidden + h,
+                            static_cast<size_t>(live) * sizeof(float));
+                for (int64_t j = live; j < 8; ++j) { tail[j] = scalar; }
+                v_store(out + g * 8, v_load(tail));
             }
         }
     }
