@@ -9,6 +9,11 @@
 /// when the plan asks for it — always on int8, and on fp for a transposed A or K
 /// past PACK_A_K_THRESHOLD — and read through lda otherwise.
 ///
+/// The entry point forks once, on the compute dtype: matmul_dispatch_fp for the
+/// float routes and matmul_dispatch_quant for the quantized ones (s8 weights,
+/// activations integer or fp-quantized). matmul_dispatch_impl itself only
+/// validates and classifies.
+///
 /// DqRoute is the int8 GEMM with its output pass replaced by a dequantize into
 /// fp; A is either already s8/u8, or fp quantised inside the pack (matmul_dq).
 ///
@@ -176,6 +181,9 @@ struct FpRoute {
         tile_mma_direct(mc, nc, kc, c, ldc, a, lda, pb, ldb, nullptr, lo, hi,
                         zero_mode, nullptr, col_bias);
     }
+
+    /// The output is C itself: nothing is appended to the plan's scratch.
+    static constexpr size_t extra_workspace(const TensorView&) { return 0; }
 
     /// C row of a batch element plus the two fp-only in-place passes.
     static Acc* c_base(TensorView& output, int64_t c_off, void* /*accum*/) {
@@ -1062,15 +1070,195 @@ Status matmul_dq(const MatMulAttributes& attrs, TensorView& output,
 
 namespace {
 
+// =========================================================================
+//  Route selection — the only place an operand pair names a route
+// =========================================================================
+//
+// Each helper below instantiates the tiled skeleton once, so the entry point is
+// a table of operand pairs and output dtypes rather than a sequence of tests.
+
+/// The plan's scratch plus whatever the route appends to it, then the shared
+/// skeleton: batch walk, block grid, per-route scratch slots.
+template <class R>
+Status run_route(const MatMulAttributes& attrs, TensorView& output,
+                 std::span<const TensorView> inputs, const ComputeContext& ctx,
+                 const MatMulPlan& plan)
+{
+    PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
+                    + R::extra_workspace(output));
+    return matmul_dispatch_tiled<R>(attrs, output, inputs, ctx, plan,
+                                    scratch.get());
+}
+
+/// The plan for one call: worker ids turn scratch slots per m-block into slots
+/// per thread.
+inline MatMulPlan make_plan(const MatMulAttributes& attrs, const TensorView& a,
+                            const TensorView& b, const ComputeContext& ctx)
+{
+    return get_matmul_plan(attrs, a.desc(), b.desc(), ctx.cpu.worker_count(),
+                           ctx.cpu.thread_slot_count() > 0);
+}
+
+/// Offline-quantized activations × s8 weights: quantize A with its own
+/// per-tensor/per-token parameters, run the int8 GEMM, dequantize into A's
+/// dtype. Without active parameters the pair has no defined semantics — a float
+/// A is not a quantized tensor to dequantize — so it is rejected rather than
+/// reading the int8 weights as floats.
+Status matmul_dq_from_fp(const MatMulAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx)
+{
+    const auto& a = inputs[0];
+    const QuantParams& qp = a.quant_params();
+    const bool quantized = qp.is_active() &&
+                           (qp.granularity == QuantGranularity::PerTensor ||
+                            qp.granularity == QuantGranularity::PerToken);
+    if (!quantized) { return Status::invalid_argument; }
+    if (attrs.transpose_a) { return Status::unsupported; }
+    NNOPS_ASSERT(output.data_type() == a.data_type());
+    return a.data_type() == DataType::f32
+        ? matmul_dq<float>(attrs, output, inputs, ctx)
+        : matmul_dq<half>(attrs, output, inputs, ctx);
+}
+
+/// s8/u8 activations × s8 weights. The destination alone picks the variant: raw
+/// int32 through the requantizing pass (every destination but s32 takes the
+/// compact accumulator after the scratch), or the same accumulate dequantized
+/// into fp — DqRoute's A is already s8, so only the output type differs.
+Status matmul_int8_tiled(const MatMulAttributes& attrs, TensorView& output,
+                         std::span<const TensorView> inputs,
+                         const ComputeContext& ctx, const MatMulPlan& plan)
+{
+    const DataType odt = output.data_type();
+    const bool out_fp = odt == DataType::f32 || odt == DataType::f16;
+    // The residual folds into the fp output pass; an integral destination has no
+    // fp sum to add it to.
+    if (attrs.residual_pre_activation && !out_fp) { return Status::unsupported; }
+    NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
+    switch (odt) {
+    case DataType::f32: return run_route<DqRoute<float>>(attrs, output, inputs, ctx, plan);
+    case DataType::f16: return run_route<DqRoute<half>>(attrs, output, inputs, ctx, plan);
+    case DataType::s32:
+    case DataType::s8:
+    case DataType::u8:  return run_route<I8Route>(attrs, output, inputs, ctx, plan);
+    default:            return Status::unsupported;
+    }
+}
+
+/// A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob —
+/// same dtype as A, f32 or f16, alpha 1 (alpha rode the per-call RHS pack, and
+/// a load-time blob has no slot for it) — or an int8 one. The int8 blob is
+/// s8-only and alpha-free: its panel correction block is the +128 A shift, which
+/// neither a u8 activation nor a fused fp one would reproduce. Its numel is the
+/// one thing that can be wrong — a blob packed against another K — so it is
+/// checked rather than trusted.
+Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a,
+                      const TensorView& b)
+{
+    const DataType dt_a = a.data_type();
+    const bool int8_blob = dt_a == DataType::s8 && b.data_type() == DataType::s8;
+    if (!int8_blob) {
+        const bool float_blob = dt_a == b.data_type() &&
+                                (dt_a == DataType::f32 || dt_a == DataType::f16);
+        if (!float_blob) { return Status::unsupported; }
+        if (attrs.alpha != 1.0f) { return Status::unsupported; }
+    }
+    if (!matmul_packed_b_matches(b.desc(), matmul_dims(attrs, a, b).K)) {
+        return Status::invalid_argument;
+    }
+    return Status::ok;
+}
+
+/// True for the quantized operand pairs: s8 weights against an activation that
+/// is either integer already (s8/u8) or fp and carrying the quantization to
+/// apply. Every other pair runs the fp kernels, or has no kernel at all.
+inline bool is_quantized_pair(DataType dt_a, DataType dt_b) noexcept
+{
+    if (dt_b != DataType::s8) { return false; }
+    switch (dt_a) {
+    case DataType::f32:
+    case DataType::f16:
+    case DataType::s8:
+    case DataType::u8:  return true;
+    default:            return false;
+    }
+}
+
+/// The quantized family: s8 weights, and an activation that is either already
+/// integer (the integer GEMM's operand pair) or fp carrying QuantParams, which
+/// the A pack applies on the fly — so both ends of the chain may be fp while the
+/// arithmetic is int8.
+Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
+                             std::span<const TensorView> inputs,
+                             const ComputeContext& ctx)
+{
+    const auto& a = inputs[0];
+    const DataType dt_a = a.data_type();
+    // fp activations: quantize (in the pack, or into A_q), then dequantize out.
+    if (dt_a == DataType::f32 || dt_a == DataType::f16) {
+        return matmul_dq_from_fp(attrs, output, inputs, ctx);
+    }
+    // Integer activations: the destination dtype picks the output pass.
+    const auto plan = make_plan(attrs, a, inputs[1], ctx);
+    return matmul_int8_tiled(attrs, output, inputs, ctx, plan);
+}
+
+/// The float family: a dense f32/f16 product, with B the same type or a Q4_1
+/// block stream that decodes to it in the RHS pack. Two routes here never build
+/// a plan — the fused Q4_1 decode and the small-product sweep.
+Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
+                          std::span<const TensorView> inputs,
+                          const ComputeContext& ctx)
+{
+    const auto& a = inputs[0];
+    const auto& b = inputs[1];
+    const DataType dt_a = a.data_type();
+    const DataType dt_b = b.data_type();
+    const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
+    const bool block_b = is_block_packed_dtype(dt_b);
+    const bool same_type = dt_b == dt_a;
+
+#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
+    // Small-M block quant (Q4_1): decode straight into the product, before the
+    // plan and the scratch. Only a transposed A is out of reach.
+    if (float_a && block_b && !attrs.transpose_a) {
+        const auto [M, N, K] = matmul_dims(attrs, a, b);
+        if (matmul_qblock_fused(attrs, output, inputs, ctx, static_cast<int>(M),
+                                static_cast<int>(N), static_cast<int>(K))) {
+            return Status::ok;
+        }
+    }
+#endif
+
+    // A dense f32/f16 product that is small enough (or narrow enough) skips the
+    // plan: no pack, no tiles, no scratch. The thresholds live with the kernels,
+    // and the route rejects every operand pair that is not a same-type fp one.
+    if (matmul_small_fp(attrs, output, inputs, ctx)) { return Status::ok; }
+
+    // Past those, only f32/f16 have a fused kernel, plus a block-packed B, whose
+    // blocks decode to A's type in the RHS pack.
+    if (!float_a || (!same_type && !block_b)) { return Status::unsupported; }
+
+    const auto plan = make_plan(attrs, a, b, ctx);
+    return dt_a == DataType::f32
+        ? run_route<FpRoute<float>>(attrs, output, inputs, ctx, plan)
+        : run_route<FpRoute<half>>(attrs, output, inputs, ctx, plan);
+}
+
 /// An optional third input (a per-column bias) rides the routes that write fp
 /// output: the fp kernels seed their accumulator with it, the dequantizing route
 /// adds it in its output pass. Integer outputs take an int32 bias instead (see
 /// matmul_cpu).
+///
+/// This function only classifies the call — validate a prepacked B, normalize
+/// the attributes, pick a family. Each family owns its operands, its plan-free
+/// routes and its own rejections: matmul_dispatch_quant and
+/// matmul_dispatch_fp above.
 Status matmul_dispatch_impl(const MatMulAttributes& attrs,
-                          TensorView& output,
-                          std::span<const TensorView> inputs,
-                          const ComputeContext& ctx,
-                          void* /*workspace*/)
+                            TensorView& output,
+                            std::span<const TensorView> inputs,
+                            const ComputeContext& ctx,
+                            void* /*workspace*/)
 {
     const auto& a = inputs[0];
     const auto& b = inputs[1];
@@ -1079,30 +1267,14 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     NNOPS_ASSERT(b.rank() >= 2);
     NNOPS_ASSERT(inputs.size() >= 2 && inputs.size() <= 3);
 
-    const auto dt_a = a.data_type();
-    const auto dt_b = b.data_type();
-
-    // A prepacked RHS (MatMul/Linear ::prepackWeights) is a float-panel blob —
-    // same dtype as A, f32 or f16, alpha 1 (alpha rode the per-call RHS pack,
-    // and a load-time blob has no slot for it) — or an int8 one. The int8 blob
-    // is s8-only and alpha-free: its panel correction block is the +128 A shift,
-    // which neither a u8 activation nor a fused fp one would reproduce. Its numel
-    // is the one thing that can be wrong — a blob packed against another K — so
-    // it is checked rather than trusted.
     if (is_packed_matmul_b(b.layout())) {
-        const bool int8_blob = (dt_a == DataType::s8 && dt_b == DataType::s8);
-        if (!int8_blob) {
-            if (dt_a != dt_b || (dt_a != DataType::f32 && dt_a != DataType::f16)) {
-                return Status::unsupported;
-            }
-            if (attrs.alpha != 1.0f) { return Status::unsupported; }
-        }
-        const MatMulDims d = matmul_dims(attrs, a, b);
-        if (!matmul_packed_b_matches(b.desc(), d.K)) { return Status::invalid_argument; }
+        const Status st = check_packed_b(attrs, a, b);
+        if (!is_ok(st)) { return st; }
     }
 
     // Fold pure-clamp activations into min_clip/max_clip, which kblock_clamp
-    // (and the Q4_1 routes) read directly.
+    // (and the Q4_1 routes) read directly. A normalization of the attributes
+    // that every route shares, so it happens before the family is picked.
     MatMulAttributes attrs_n = attrs;
     switch (attrs_n.epilogue.type) {
     case EpilogueActivateType::Relu:  attrs_n.epilogue.min_clip = 0.0f; break;
@@ -1110,102 +1282,12 @@ Status matmul_dispatch_impl(const MatMulAttributes& attrs,
     default: break;
     }
 
-#if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
-    // Small-M block quant (Q4_1): decode straight into the product, before the
-    // plan and the scratch. Only a transposed A is out of reach.
-    if ((dt_a == DataType::f32 || dt_a == DataType::f16) &&
-        is_block_packed_dtype(dt_b) && !attrs_n.transpose_a) {
-        const auto [M, N, K] = matmul_dims(attrs_n, a, b);
-        if (matmul_qblock_fused(attrs_n, output, inputs, ctx,
-                            static_cast<int>(M), static_cast<int>(N),
-                            static_cast<int>(K))) {
-            return Status::ok;
-        }
-    }
-#endif
-
-    // A dense f32/f16 product that is small enough (or narrow enough) skips the
-    // plan: no pack, no tiles, no scratch. The thresholds live with the kernels.
-    const bool b_block = is_block_packed_dtype(dt_b);
-    const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
-    if (matmul_small_fp(attrs_n, output, inputs, ctx)) {
-        return Status::ok;
-    }
-
-    // Offline-quantized activations × s8 weights: quantize A with its own
-    // per-tensor/per-token parameters, run the int8 GEMM, dequantize into A's dtype.
-    // Without active parameters the pair has no defined semantics — a float A is
-    // not a quantized tensor to dequantize — so it is rejected rather than
-    // reading the int8 weights as floats.
-    if (float_a && dt_b == DataType::s8) {
-        const QuantParams& qp = a.quant_params();
-        const bool qp_ok = qp.is_active() &&
-                           (qp.granularity == QuantGranularity::PerTensor ||
-                            qp.granularity == QuantGranularity::PerToken);
-        if (!qp_ok) { return Status::invalid_argument; }
-        if (attrs_n.transpose_a) { return Status::unsupported; }
-        NNOPS_ASSERT(output.data_type() == dt_a);
-        if (dt_a == DataType::f32) {
-            return matmul_dq<float>(attrs_n, output, inputs, ctx);
-        }
-        return matmul_dq<half>(attrs_n, output, inputs, ctx);
-    }
-
-    // Worker ids → one scratch slot per thread instead of per m-block.
-    auto plan = get_matmul_plan(attrs_n, a.desc(), b.desc(), ctx.cpu.worker_count(),
-                                ctx.cpu.thread_slot_count() > 0);
-
-    // int8: tiled for s32 / s8 / u8 / fp outputs; every destination but s32
-    // takes the compact int32 accumulator after the scratch.
-    if (is_int8_matmul(dt_a, dt_b)) {
-        const DataType odt = output.data_type();
-        // An fp output dequantizes the same int32 accumulate instead of
-        // returning or requantizing it — the "already-quantized A" entry point
-        // mirrors the fp-activation one, sharing the epilogue kernel.
-        const bool out_fp = (odt == DataType::f32 || odt == DataType::f16);
-        const bool out_ok = (odt == DataType::s32) || (odt == DataType::s8) ||
-                            (odt == DataType::u8) || out_fp;
-        if (!out_ok) {
-            return Status::unsupported;
-        }
-        // The residual folds into the fp output pass; an integral destination
-        // has no fp sum to add it to.
-        if (attrs_n.residual_pre_activation && !out_fp) {
-            return Status::unsupported;
-        }
-        NNOPS_ASSERT(plan.mc > 0 && plan.nc > 0 && plan.kc > 0);
-        if (out_fp && odt == DataType::f32) {
-            PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                            + DqRoute<float>::extra_workspace(output));
-            return matmul_dispatch_tiled<DqRoute<float>>(
-                attrs_n, output, inputs, ctx, plan, scratch.get());
-        }
-        if (out_fp) {
-            PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                            + DqRoute<half>::extra_workspace(output));
-            return matmul_dispatch_tiled<DqRoute<half>>(
-                attrs_n, output, inputs, ctx, plan, scratch.get());
-        }
-        PoolPtr scratch(static_cast<size_t>(plan.workspace_size)
-                        + I8Route::extra_workspace(output));
-        return matmul_dispatch_tiled<I8Route>(attrs_n, output, inputs, ctx, plan,
-                                              scratch.get());
-    }
-
-    // Past the int8 branch: only f32/f16 have a fused kernel, plus a
-    // block-packed B (q4_1), whose blocks decode to A's type in the RHS pack.
-    if (!float_a || (dt_b != dt_a && !b_block)) {
-        return Status::unsupported;
-    }
-
-    PoolPtr scratch(plan.workspace_size);
-
-    if (dt_a == DataType::f32) {
-        return matmul_dispatch_tiled<FpRoute<float>>(attrs_n, output, inputs, ctx,
-                                                     plan, scratch.get());
-    }
-    return matmul_dispatch_tiled<FpRoute<half>>(attrs_n, output, inputs, ctx, plan,
-                                                scratch.get());
+    // The only fork left: quantized compute or float compute. s8 weights are the
+    // whole of the first family — the activation may be integer or fp, so the
+    // dtype pair alone does not say where the arithmetic happens.
+    return is_quantized_pair(a.data_type(), b.data_type())
+        ? matmul_dispatch_quant(attrs_n, output, inputs, ctx)
+        : matmul_dispatch_fp(attrs_n, output, inputs, ctx);
 }
 
 }  // anonymous namespace
