@@ -14,12 +14,16 @@
 /// tile is A and the packed HWIO weight is B, either prepacked once per call
 /// (shared arena region) or per task.
 ///
-/// The route comes from the activation's layout in conv2d_implicit_gemm_kernel,
-/// which owns the plan/pool/dispatch prologue and hands each route its plan.
-/// Each route opens its own anonymous namespace, so helpers (tile_save,
-/// pack_block, …) carry no route prefix. The decomposition is the same on both:
-/// (batch, group) × oh-chunks × oc-chunks. Output tiles are disjoint, so every
-/// route is bit-identical to serial execution.
+/// Two axes, resolved once each, in one place: the activation's layout picks the
+/// route (conv2d_implicit_gemm_kernel), the weight's dtype picks the family (fp
+/// or quantized, in conv2d_gemm_run). Everything else — the plan prologue, the
+/// pooled arena, the column split, the (activation, output) dtype ladders — is
+/// written once and takes the route as a template parameter, so the two routes
+/// contribute only their kernels. Each route opens its own anonymous namespace,
+/// so helpers (tile_save, pack_block, …) carry no route prefix. The
+/// decomposition is the same on both: (batch, group) × oh-chunks × oc-chunks.
+/// Output tiles are disjoint, so every route is bit-identical to serial
+/// execution.
 ///
 /// What not to "fix" later:
 ///
@@ -883,52 +887,6 @@ void conv2d_channel_first_int8_impl(const Conv2DAttributes& attrs,
     });
 }
 
-/// Resolve the integer storage behind an fp activation (`act_quant_dtype`) and
-/// run the implementation.
-template <class TAct, class TOut>
-void conv2d_channel_first_int8_act(const Conv2DAttributes& attrs,
-                            TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
-                            const Conv2DGemmPlan& plan,
-                             void* workspace)
-{
-    constexpr bool kPreQuant =
-        std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
-    if constexpr (kPreQuant) {
-        conv2d_channel_first_int8_impl<TAct, TAct, TOut>(attrs, output, inputs, ctx, plan, workspace);
-    } else if (attrs.act_quant_dtype == DataType::u8) {
-        conv2d_channel_first_int8_impl<TAct, uint8_t, TOut>(attrs, output, inputs, ctx, plan, workspace);
-    } else {
-        conv2d_channel_first_int8_impl<TAct, int8_t, TOut>(attrs, output, inputs, ctx, plan, workspace);
-    }
-}
-
-/// Second-level dispatch: the output dtype.
-template <class TAct>
-void conv2d_channel_first_int8_out(const Conv2DAttributes& attrs,
-                     TensorView& output,
-                     std::span<const TensorView> inputs,
-                     const ComputeContext& ctx,
-                     const Conv2DGemmPlan& plan,
-                            void* workspace)
-{
-    switch (output.data_type()) {
-    case DataType::f16:
-        conv2d_channel_first_int8_act<TAct, half>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    case DataType::s8:
-        conv2d_channel_first_int8_act<TAct, int8_t>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    case DataType::u8:
-        conv2d_channel_first_int8_act<TAct, uint8_t>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    default:
-        conv2d_channel_first_int8_act<TAct, float>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    }
-}
-
 // =========================================================================
 //  Plan — single source of truth for block sizes, parallelism + workspace
 // =========================================================================
@@ -1181,45 +1139,6 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     }
     plan.workspace_size = static_cast<size_t>(gemm_scratch_layout(plan, esz).total);
     return plan;
-}
-
-
-// ---- dispatch -------------------------------------------------------------
-
-/// Resolve the activation's own type; the plan already validated the combination.
-Status conv2d_channel_first_int8_run(const Conv2DAttributes& attrs, TensorView& output,
-                       std::span<const TensorView> inputs,
-                       const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                                void* workspace)
-{
-    switch (inputs[0].data_type()) {
-    case DataType::f32: conv2d_channel_first_int8_out<float>(attrs, output, inputs, ctx, plan, workspace); break;
-    case DataType::f16: conv2d_channel_first_int8_out<half>(attrs, output, inputs, ctx, plan, workspace); break;
-    case DataType::u8:  conv2d_channel_first_int8_out<uint8_t>(attrs, output, inputs, ctx, plan, workspace); break;
-    case DataType::s8:  conv2d_channel_first_int8_out<int8_t>(attrs, output, inputs, ctx, plan, workspace); break;
-    default: return Status::unsupported;
-    }
-    return Status::ok;
-}
-
-/// An s8 weight selects the quantized driver; otherwise the two fp element types.
-Status run(const Conv2DAttributes& attrs, TensorView& output,
-           std::span<const TensorView> inputs, const ComputeContext& ctx,
-           const Conv2DGemmPlan& plan, void* workspace)
-{
-    if (is_quantized_conv2d(inputs[1].data_type())) {
-        return conv2d_channel_first_int8_run(attrs, output, inputs, ctx, plan, workspace);
-    }
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        conv2d_channel_first_impl<float>(attrs, output, inputs, ctx, plan, workspace);
-        return Status::ok;
-    case DataType::f16:
-        conv2d_channel_first_impl<half>(attrs, output, inputs, ctx, plan, workspace);
-        return Status::ok;
-    default:
-        return Status::unsupported;
-    }
 }
 
 }  // anonymous namespace
@@ -2306,29 +2225,6 @@ void conv2d_channel_last_int8_impl(const Conv2DAttributes& attrs,
     ctx.cpu.run(0, total, run_task);
 }
 
-// ---- dispatch -------------------------------------------------------------
-
-template <class TAct>
-void conv2d_channel_last_int8_out(const Conv2DAttributes& attrs, TensorView& output,
-                                  std::span<const TensorView> inputs, const ComputeContext& ctx,
-                                  const Conv2DGemmPlan& plan, void* workspace)
-{
-    switch (output.data_type()) {
-    case DataType::f16:
-        conv2d_channel_last_int8_impl<TAct, half>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    case DataType::s8:
-        conv2d_channel_last_int8_impl<TAct, int8_t>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    case DataType::u8:
-        conv2d_channel_last_int8_impl<TAct, uint8_t>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    default:
-        conv2d_channel_last_int8_impl<TAct, float>(attrs, output, inputs, ctx, plan, workspace);
-        break;
-    }
-}
-
 // =========================================================================
 //  Plan
 // =========================================================================
@@ -2529,44 +2425,6 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
 }
 
 
-// ---- dispatch -------------------------------------------------------------
-
-/// The quantized route's dtype dispatch; the plan already refused the rest.
-Status conv2d_channel_last_int8_run(const Conv2DAttributes& attrs, TensorView& output,
-                            std::span<const TensorView> inputs,
-                            const ComputeContext& ctx,
-                            const Conv2DGemmPlan& plan, void* workspace)
-{
-    switch (inputs[0].data_type()) {
-    case DataType::f32: conv2d_channel_last_int8_out<float>(attrs, output, inputs, ctx, plan, workspace); break;
-    case DataType::f16: conv2d_channel_last_int8_out<half>(attrs, output, inputs, ctx, plan, workspace); break;
-    case DataType::u8:  conv2d_channel_last_int8_out<uint8_t>(attrs, output, inputs, ctx, plan, workspace); break;
-    case DataType::s8:  conv2d_channel_last_int8_out<int8_t>(attrs, output, inputs, ctx, plan, workspace); break;
-    default: return Status::unsupported;
-    }
-    return Status::ok;
-}
-
-/// The channel-last driver: quantized weights first, then the two fp element types.
-Status run(const Conv2DAttributes& attrs, TensorView& output,
-           std::span<const TensorView> inputs, const ComputeContext& ctx,
-           const Conv2DGemmPlan& plan, void* workspace)
-{
-    if (is_quantized_conv2d(inputs[1].data_type())) {
-        return conv2d_channel_last_int8_run(attrs, output, inputs, ctx, plan, workspace);
-    }
-    switch (inputs[0].data_type()) {
-    case DataType::f32:
-        conv2d_channel_last_impl<float>(attrs, output, inputs, ctx, plan, workspace);
-        return Status::ok;
-    case DataType::f16:
-        conv2d_channel_last_impl<half>(attrs, output, inputs, ctx, plan, workspace);
-        return Status::ok;
-    default:
-        return Status::unsupported;
-    }
-}
-
 }  // anonymous namespace
 }  // namespace channel_last
 
@@ -2576,8 +2434,9 @@ Status run(const Conv2DAttributes& attrs, TensorView& output,
 
 namespace {
 
-/// A route is (make_plan, run); both are template parameters to conv2d_gemm_run
-/// so the plan/pool/dispatch prologue is written once.
+/// A route is (make_plan, fp_impl, quant_impl): the plan, then the two per-dtype
+/// leaves the shared ladders below call. Everything route-independent — the
+/// pool, the plan prologue, the column split, the dtype switches — lives outside.
 struct ChannelFirstRoute {
     static Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
                                     std::span<const TensorDesc> inputs,
@@ -2588,12 +2447,37 @@ struct ChannelFirstRoute {
         return channel_first::make_plan(attrs, inputs, outputs, num_threads,
                                  use_thread_slots, num_slots);
     }
-    static Status run(const Conv2DAttributes& attrs, TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                      void* workspace)
+
+    template <class T>
+    static void fp_impl(const Conv2DAttributes& attrs, TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                        void* workspace)
     {
-        return channel_first::run(attrs, output, inputs, ctx, plan, workspace);
+        channel_first::conv2d_channel_first_impl<T>(attrs, output, inputs, ctx, plan,
+                                                    workspace);
+    }
+
+    /// An fp activation is stored as `act_quant_dtype`; a pre-quantized one is
+    /// already its own storage.
+    template <class TAct, class TOut>
+    static void quant_impl(const Conv2DAttributes& attrs, TensorView& output,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                           void* workspace)
+    {
+        constexpr bool kPreQuant =
+            std::is_same_v<TAct, int8_t> || std::is_same_v<TAct, uint8_t>;
+        if constexpr (kPreQuant) {
+            channel_first::conv2d_channel_first_int8_impl<TAct, TAct, TOut>(
+                attrs, output, inputs, ctx, plan, workspace);
+        } else if (attrs.act_quant_dtype == DataType::u8) {
+            channel_first::conv2d_channel_first_int8_impl<TAct, uint8_t, TOut>(
+                attrs, output, inputs, ctx, plan, workspace);
+        } else {
+            channel_first::conv2d_channel_first_int8_impl<TAct, int8_t, TOut>(
+                attrs, output, inputs, ctx, plan, workspace);
+        }
     }
 };
 
@@ -2607,14 +2491,99 @@ struct ChannelLastRoute {
         return channel_last::make_plan(attrs, inputs, outputs, num_threads,
                                        use_thread_slots, num_slots);
     }
-    static Status run(const Conv2DAttributes& attrs, TensorView& output,
-                      std::span<const TensorView> inputs,
-                      const ComputeContext& ctx, const Conv2DGemmPlan& plan,
-                      void* workspace)
+
+    template <class T>
+    static void fp_impl(const Conv2DAttributes& attrs, TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                        void* workspace)
     {
-        return channel_last::run(attrs, output, inputs, ctx, plan, workspace);
+        channel_last::conv2d_channel_last_impl<T>(attrs, output, inputs, ctx, plan,
+                                                  workspace);
+    }
+
+    /// The storage choice is a runtime flag inside this route's kernel, not a
+    /// template parameter: its packer reads both signs on one path.
+    template <class TAct, class TOut>
+    static void quant_impl(const Conv2DAttributes& attrs, TensorView& output,
+                           std::span<const TensorView> inputs,
+                           const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                           void* workspace)
+    {
+        channel_last::conv2d_channel_last_int8_impl<TAct, TOut>(attrs, output, inputs,
+                                                               ctx, plan, workspace);
     }
 };
+
+// ---- dtype ladders --------------------------------------------------------
+//
+// Route-independent, so each is written once and takes its route as a parameter:
+// the fp ladder switches on the activation's element type, the quantized one on
+// (activation, output). The weight chose the family in conv2d_gemm_run, and the
+// plan refused every combination these would miss — a refusal here means the
+// plan and the ladders disagree, not that the caller asked for something odd.
+
+template <class TRoute, class TAct>
+Status conv2d_quant_out(const Conv2DAttributes& attrs, TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                        void* workspace)
+{
+    switch (output.data_type()) {
+    case DataType::f32:
+        TRoute::template quant_impl<TAct, float>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+    case DataType::f16:
+        TRoute::template quant_impl<TAct, half>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+    case DataType::s8:
+        TRoute::template quant_impl<TAct, int8_t>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+    case DataType::u8:
+        TRoute::template quant_impl<TAct, uint8_t>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+    default:
+        return Status::unsupported;
+    }
+}
+
+template <class TRoute>
+Status conv2d_quant_run(const Conv2DAttributes& attrs, TensorView& output,
+                        std::span<const TensorView> inputs,
+                        const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                        void* workspace)
+{
+    switch (inputs[0].data_type()) {
+    case DataType::f32:
+        return conv2d_quant_out<TRoute, float>(attrs, output, inputs, ctx, plan, workspace);
+    case DataType::f16:
+        return conv2d_quant_out<TRoute, half>(attrs, output, inputs, ctx, plan, workspace);
+    case DataType::u8:
+        return conv2d_quant_out<TRoute, uint8_t>(attrs, output, inputs, ctx, plan, workspace);
+    case DataType::s8:
+        return conv2d_quant_out<TRoute, int8_t>(attrs, output, inputs, ctx, plan, workspace);
+    default:
+        return Status::unsupported;
+    }
+}
+
+template <class TRoute>
+Status conv2d_fp_run(const Conv2DAttributes& attrs, TensorView& output,
+                     std::span<const TensorView> inputs,
+                     const ComputeContext& ctx, const Conv2DGemmPlan& plan,
+                     void* workspace)
+{
+    switch (inputs[0].data_type()) {
+    case DataType::f32:
+        TRoute::template fp_impl<float>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+    case DataType::f16:
+        TRoute::template fp_impl<half>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+    default:
+        return Status::unsupported;
+    }
+}
 
 /// [N, C, H, W] cut to `len` columns from `col0`, pitch and layout kept:
 /// channel-first shifts one element per column, channel-last a whole vector.
@@ -2733,7 +2702,11 @@ Status conv2d_gemm_run(const Conv2DAttributes& attrs, TensorView& output,
     PoolPtr scratch(plan.workspace_size ? plan.workspace_size : 1);
     if (!scratch) { return Status::out_of_memory; }
 
-    return TRoute::run(attrs, output, inputs, ctx, plan, scratch.get());
+    // The weight's dtype is the family, whatever the activation is: an s8 filter
+    // selects the quantized kernels, and a pre-quantized activation does not.
+    return is_quantized_conv2d(inputs[1].data_type())
+        ? conv2d_quant_run<TRoute>(attrs, output, inputs, ctx, plan, scratch.get())
+        : conv2d_fp_run<TRoute>(attrs, output, inputs, ctx, plan, scratch.get());
 }
 
 }  // anonymous namespace
