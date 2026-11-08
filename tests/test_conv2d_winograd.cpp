@@ -775,6 +775,14 @@ NNOPS_TEST(wino_applicable_thresholds) {
     NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 13, 14));  // too short
     NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 14, 13));  // too narrow
 
+    // The plane floor is the layout's: channel-first packs 4 tile columns to 8
+    // and loses below 14, channel-last flattens its tiles and keeps winning.
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 7, 7));
+    NNOPS_EXPECT_TRUE(winograd_applicable(a, 64, 7, 7, true));
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 6, 7, true));
+    NNOPS_EXPECT_FALSE(winograd_applicable(a, 64, 7, 6, true));
+    NNOPS_EXPECT_TRUE(winograd_applicable(a, 512, 14, 14, true));
+
     Conv2DAttributes k1 = a;
     k1.kernel_size = {1, 1};
     NNOPS_EXPECT_FALSE(winograd_applicable(k1, 64, 28, 28));
@@ -1171,12 +1179,20 @@ NNOPS_TEST(wino_pick_order_fences) {
     // Below 28x28 the grid is a handful of tiles on any team.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 14, 14, pl, 1) ==
                       WinoOrder::F23);
-    // The channel-last route reads its windows in place, so its floor does not
-    // move with the team.
+    // The channel-last floor moves with the team too, but only by one step: a
+    // 14x14 plane is one whole-plane block on a small pool (1.47x of F(2,3) at
+    // 1 thread on 256->256), and past four workers that block stops filling the
+    // pool (0.60x at 20).
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl, 20) ==
                       WinoOrder::F43);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 28, 28, cl, 1) ==
                       WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, cl, 1) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, cl, 4) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 14, 14, cl, 20) ==
+                      WinoOrder::F23);
     // ... and under the same channel floor and U fence as the channel-last one:
     // 32 channels per group never pays for the 4.5x transform, and a 512x512
     // filter is 37.7 MB of U.
@@ -1189,10 +1205,14 @@ NNOPS_TEST(wino_pick_order_fences) {
                       WinoOrder::F43);
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 256, 256, 56, 56, cl) ==
                       WinoOrder::F43);
-    // ... but not below it: a 27-row plane is the same handful of tiles as 14.
+    // ... and down to 14, where a single whole-plane block still pays. Under
+    // that floor it does not: 7x7 is a 4-tile grid and F(4,3) measured 1.6x
+    // F(2,3) there.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 27, 56, cl) ==
+                      WinoOrder::F43);
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 13, 56, cl) ==
                       WinoOrder::F23);
-    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 512, 64, 14, 14, cl) ==
+    NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 7, 7, cl) ==
                       WinoOrder::F23);
     // An unknown plane takes the safe order.
     NNOPS_EXPECT_TRUE(wino_pick_order(DataType::f32, 64, 64, 0, 0, cl) ==

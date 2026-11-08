@@ -99,7 +99,8 @@ Pooling and depthwise convolution take channel-first directly, so `max_pool()` a
 depthwise stage, the exported `[C, 1, 3, 3]` weight) with no repacking.
 
 Convolutions take the Winograd route where `winograd_applicable` says it pays —
-3×3, stride 1, at least 32 input channels and a 14×14 input — with the weight
+3×3, stride 1, at least 32 input channels and a 14×14 input, or 7×7 for the
+channel-last layout — with the weight
 transformed (`common/net_ops.hpp`'s `winograd_weight`) and cached on first use;
 everything else stays on im2col. Both runners do one untimed pass first, so the
 weight transform and the first-touch allocation costs are paid before the clock

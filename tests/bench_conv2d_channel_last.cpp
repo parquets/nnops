@@ -599,9 +599,13 @@ const std::vector<Shape>& wino_sweep() {
 
 template <class T>
 struct AbWino {
+    /// @param nt the pool this row will be timed on. It has to reach prepack:
+    /// the order policy weighs the plane against the worker count, and a
+    /// prepack that assumed one worker would bake a different U than the call
+    /// it is being measured against.
     /// @param order pins the transform order (2 = F(2,3), 4 = F(4,3)); 0 lets
     /// prepack pick it from the channel count and the plane.
-    explicit AbWino(const Shape& c, int64_t order = 0) : s(c) {
+    explicit AbWino(const Shape& c, int nt, int64_t order = 0) : s(c) {
         const int64_t ish[] = {c.N, c.IC, c.IH, c.IW};
         const int64_t wsh[] = {c.KH, c.KW, c.IC, c.OC};   // HWIO
         constexpr DataType dt = dtype_of<T>();
@@ -644,16 +648,22 @@ struct AbWino {
         // Prepack U (query -> allocate -> pack), once and outside every timer.
         // The activation rides along so an unpinned order can weigh the plane.
         {
+            // A worker count without a grid hook: prepack still runs serially,
+            // but thread_slot_count() reports the team the row will run on.
+            ComputeContext ctx;
+            const int team = nt;
+            ctx.cpu.num_threads = [team]() { return team; };
+            ctx.cpu.thread_id = []() { return 0; };
             TensorView q;
             TensorView wi[] = {w_v, in_v};
             TensorView wo[] = {q};
-            wn_op->prepackWeights(wi, wo);
+            wn_op->prepackWeights(wi, wo, ctx);
             q = wo[0];
             u_buf.assign(static_cast<size_t>(q.storage_bytes() / sizeof(T)), T{});
             u_v = TensorView(q.shape_span(), q.data_type(), u_buf.data(), q.pitch(),
                              q.layout());
             TensorView wo2[] = {u_v};
-            wn_op->prepackWeights(wi, wo2);
+            wn_op->prepackWeights(wi, wo2, ctx);
         }
         // The transform order is prepack's choice, and it is what the row's
         // FLOP count has to reflect: 16 positions over 2x2 tiles or 36 over
@@ -698,7 +708,7 @@ void run_wino_table(const char* title) {
         int wins = 0, losses = 0, ties = 0;
         double tot_im = 0.0, tot_wn = 0.0;
         for (const auto& c : wino_sweep()) {
-            auto op = std::make_unique<AbWino<T>>(c);
+            auto op = std::make_unique<AbWino<T>>(c, nt);
             const AbResult r = measure_ab(nt,
                 [&](const ComputeContext& x) { op->run_im(x); },
                 [&](const ComputeContext& x) { op->run_wn(x); },
@@ -741,8 +751,8 @@ void run_wino_order_ab(const char* title) {
                     "F43/F23", "null");
         double tot23 = 0.0, tot43 = 0.0;
         for (const auto& c : wino_sweep()) {
-            auto op23 = std::make_unique<AbWino<T>>(c, 2);
-            auto op43 = std::make_unique<AbWino<T>>(c, 4);
+            auto op23 = std::make_unique<AbWino<T>>(c, nt, 2);
+            auto op43 = std::make_unique<AbWino<T>>(c, nt, 4);
             const AbResult r = measure_ab(nt,
                 [&](const ComputeContext& x) { op23->run_wn(x); },
                 [&](const ComputeContext& x) { op43->run_wn(x); },

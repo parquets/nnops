@@ -107,6 +107,7 @@ const char* route_of(const FusionCase& c)
     if (c.depthwise) { return "depthwise"; }
     const auto attrs = conv_attrs(c);
     const int64_t ic = c.in[1];
+    // This bench runs the channel-first layout, which is the predicate's default.
     return nnops::winograd_applicable(attrs, ic, c.in[2], c.in[3]) ? "wino" : "im2col";
 }
 

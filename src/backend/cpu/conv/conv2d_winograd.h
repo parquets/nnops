@@ -38,6 +38,14 @@
 /// Tile rows, blocks and oc ranges are disjoint, so no task reads another's
 /// scratch and the phases need no barrier between them.
 ///
+/// The channel-last tile block is the one axis a task pays U for twice: every
+/// block streams the whole weight blob, while an oc chunk reads a disjoint
+/// slice of it for the same bytes. So the block count is taken as the fewest
+/// that fill the pool and keep the arena inside one pooled allocation — at 1
+/// thread that is the whole plane whenever it fits (1.10x on a 36 MB U, flat
+/// where the U is already L3-resident), bounded by an L2-sized working set
+/// because V and M spilling past it costs more than the passes it saves.
+///
 /// A barrier is not available anyway: CpuBackend has no such thing — `run` is
 /// just a forwarder to parallel_for, and a ParallelForFn gives no guarantee that
 /// every worker visits the body, nor in what order (a pool that partitions
@@ -84,8 +92,9 @@
 /// ~1.35x at 64 and ~1.6-1.7x at 256. So whether a conv is worth transforming
 /// is the caller's decision, taken once when it prepacks —
 /// winograd_applicable() is that policy (the caller allows it, k3s1, at least
-/// 32 input channels per group, at least a 14x14 input) — and
-/// ConvAlgorithm::Auto then only follows the weight it is given.
+/// 32 input channels per group, and a 14x14 plane here against 7x7 on the
+/// channel-last route) — and ConvAlgorithm::Auto then only follows the weight
+/// it is given.
 ///
 /// Channel-last is the wider win, because the two costs the channel-first thresholds
 /// are about — a deinterleaving load and 8-lane tile packing — do not exist

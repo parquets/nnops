@@ -433,7 +433,8 @@ inline Buf conv2d_run(const TensorView& x, const TensorView& w,
     nnops::Conv2DAttributes use = attrs;
     if (residual != nullptr) { use.add_to = true; }
     const bool wino = nnops::winograd_applicable(
-        use, x.shape(1) / use.groups, x.shape(2), x.shape(3));
+        use, x.shape(1) / use.groups, x.shape(2), x.shape(3),
+        nnops::is_channel_last(x.layout()));
     if (wino && winograd_order_override() != 0) {
         use.winograd_order = winograd_order_override();
     }

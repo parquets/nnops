@@ -26,18 +26,17 @@
 ///
 /// winograd_applicable() is what a caller checks before prepacking. It requires
 /// algorithm != ImplicitGemm (the off switch), k3s1, at least 32 input channels
-/// per group, and at least 14x14 input. The transforms cost a fixed amount per
-/// tile per channel, so the 2.25x multiply saving needs wide K to pay for them
-/// (a wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256). Below 14x14 the
-/// Channel-first kernel's 8-lane tile packing inflates the GEMM's N more than the
-/// saving is worth: a 7x7 output packs its 4 real tile columns to 8 and runs
-/// 0.65x im2col, while 14x14 packs 7 to 8 (14% waste) and keeps a 1.15x lead.
-/// The channel-last route has none of those costs — no deinterleaving load, no
-/// strided column store, no 8-lane packing (its tiles are flattened, so a 7x7
-/// plane's 16 tiles are exactly 16) — and beats the channel-last implicit GEMM
-/// at every IC >= 32 shape from 7x7 to 224x224. The shared floor stays 14x14:
-/// one signature can only be as permissive as the route that constrains it, and
-/// this costs the channel-last route nothing.
+/// per group, and a plane floor that depends on the layout. The transforms cost
+/// a fixed amount per tile per channel, so the 2.25x multiply saving needs wide
+/// K to pay for them (a wash at 8 channels, ~1.2x at 32, 1.5-1.6x at 128-256).
+/// Channel-first keeps 14x14: its 8-lane tile packing inflates the GEMM's N more
+/// than the saving is worth below that — a 7x7 output packs its 4 real tile
+/// columns to 8 and runs 0.65x im2col, while 14x14 packs 7 to 8 (14% waste) and
+/// keeps a 1.15x lead. Channel-last has none of those costs — no deinterleaving
+/// load, no strided column store, no 8-lane packing (its tiles are flattened, so
+/// a 7x7 plane's 16 tiles are exactly 16) — and beats the channel-last implicit
+/// GEMM at every IC >= 32 shape down to 7x7: 0.50-0.59x of its time at 1 thread,
+/// and 2.2 ms of ResNet-18's 21.3 ms (7x7, 512->512) once the floor lets it in.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
@@ -135,15 +134,19 @@ struct Conv2DAttributes {
     int64_t winograd_order = 0;
 };
 
-/// Policy a caller checks before prepackWeights(); see the file header.
+/// Policy a caller checks before prepackWeights(); see the file header. @p
+/// channel_last is the activation's layout, because the two routes have
+/// different plane floors.
 inline bool winograd_applicable(const Conv2DAttributes& attrs,
-                                int64_t ic_per_group, int64_t ih, int64_t iw)
+                                int64_t ic_per_group, int64_t ih, int64_t iw,
+                                bool channel_last = false)
 {
+    const int64_t floor = channel_last ? 7 : 14;
     return attrs.algorithm != ConvAlgorithm::ImplicitGemm &&
            attrs.kernel_size[0] == 3 && attrs.kernel_size[1] == 3 &&
            attrs.stride[0] == 1 && attrs.stride[1] == 1 &&
            attrs.dilation[0] == 1 && attrs.dilation[1] == 1 &&
-           ic_per_group >= 32 && ih >= 14 && iw >= 14;
+           ic_per_group >= 32 && ih >= floor && iw >= floor;
 }
 
 class Conv2D : public OpBase {

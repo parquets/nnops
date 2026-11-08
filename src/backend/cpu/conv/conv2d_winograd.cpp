@@ -541,11 +541,13 @@ WinoOrder wino_pick_order(DataType dt, int64_t ic_per_group, int64_t oc_per_grou
     // dearer transform is the only cost the order adds: 0.61-0.92x of F(2,3) at
     // 1 thread over every plane from 28x28 up, 0.60-0.86x at 20 threads except
     // the two narrowest filters (32 and 64 channels on a 28x28 plane, 1.27x and
-    // 1.28x, against 21 and 55 us of work). Below 28x28 the tile grid is a
-    // handful of tasks — 16 tiles for a 14x14 plane — and the order loses both
-    // ways (0.90-0.93x at 1 thread, 1.36-1.81x at 20).
+    // 1.28x, against 21 and 55 us of work). A 14x14 plane is 16 F(4,3) tiles
+    // and one whole-plane block: 1.23x F(2,3) at 1 thread (0.655 vs 0.804 ms on
+    // 256->256). Past four workers that block no longer fills the pool and the
+    // per-task transform shows, so the floor climbs with the team.
     if (channel_last) {
-        return (out_h >= 28 && out_w >= 28) ? WinoOrder::F43 : WinoOrder::F23;
+        const int64_t floor = num_threads <= 4 ? 14 : 28;
+        return (out_h >= floor && out_w >= floor) ? WinoOrder::F43 : WinoOrder::F23;
     }
 
     // Channel-first pays a halo strip per task instead — ICG · window rows · window
@@ -600,20 +602,8 @@ namespace {
 
 using namespace nnops::simd;
 
-/// Tiles per task. A slot holds the task's whole V and M — pos·T·(IC/G + ocn)
-/// elements, 150-500 KiB (f32) over the 32-256 channel shapes Winograd is used
-/// on — so this is the knob that decides whether they stay in L2. 24 is a
-/// multiple of mr_max on both arches (6 on x86, 8 on aarch64), so a full task
-/// leaves no partial A panel.
-///
-/// F(4,3) holds 2.25x the V per tile and produces 4x the outputs, so the same
-/// scratch budget is about half as many tiles. Task count, not scratch, is what
-/// sets it: 12 tiles is 192 outputs, still a whole tile row of a 14x14 plane.
-constexpr int64_t kTileBlock(WinoOrder o) noexcept {
-    return o == WinoOrder::F43 ? 12 : 24;
-}
-/// Growth stops here: below it a task re-reads its whole U slice (pos·kc·oc)
-/// for too few tiles of MACs, and the per-task transform cost shows.
+/// Blocks stop shrinking here: below it a task re-reads its whole U slice
+/// (pos·kc·oc) for too few tiles of MACs, and the per-task transform cost shows.
 constexpr int64_t kTileBlockMin(WinoOrder o) noexcept {
     return o == WinoOrder::F43 ? 6 : 8;
 }
@@ -887,17 +877,53 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
         kOcnBlock, ((oc_per_group + nr - 1) / nr) * nr);
     plan.ocn_block = std::max<int64_t>(nr, (ocn_raw / nr) * nr);
 
+    // V: one [tile][ic] plane per position, tiles contiguous inside a position
+    // (that is the GEMM's A, so lda is a tile row). The row is padded to the
+    // vector width so a tail block can be written whole, and the +8 per position
+    // keeps the 16 planes off one L1 set — the channel-first route's measurement holds.
+    plan.v_lda      = ((ic_per_group + 7) / 8) * 8;
+    // M: [tile][oc] per position, a whole panel per row so the MMA's widest row
+    // read stays inside it.
+    plan.m_oc_stride = plan.ocn_block;
+
     // Tile blocks first — flattening repeats no work — then the oc axis, which
     // repeats the input transform (its input lines stay hot) but nothing of U.
+    // A tile block is a pass over the whole U (pos·IC·OC), and no other block
+    // re-uses it; an oc chunk reads a disjoint slice of the same bytes. So the
+    // block axis is the only one that costs weight traffic, and blocks exist
+    // for the pool and the arena, not for the GEMM: take the fewest that fill
+    // it. Measured at 1 thread on channel-last f32, whole-plane against the old
+    // ~12-tile block: 28x28 512->512 1.10x, 28x28 256 1.15x, 56x56 256 flat.
     const int64_t NB = (in.dims[0] > 0) ? in.dims[0] : 1;
     const int64_t nt = std::max<int64_t>(num_threads, 1);
-    const int64_t tb_target = kTileBlock(order);
-    int64_t ntb = (tiles + tb_target - 1) / tb_target;
-    while (NB * G * ntb < nt && tiles / (ntb + 1) >= kTileBlockMin(order)) { ++ntb; }
+    const int64_t oc_blocks = (oc_per_group + plan.ocn_block - 1) / plan.ocn_block;
+    const int64_t waves = NB * G * oc_blocks;
+    int64_t ntb = std::max<int64_t>(1, (nt + waves - 1) / waves);
+
+    // V and M per task are the route's working set. Past L2 (2 MiB) the GEMM's
+    // A stream and the output transform's M reads fall to L3 and a wider block
+    // loses more than the U passes it saves — 224x224 64ch measured 1.07x of
+    // the 12-tile block. A U that no longer fits L2 is worth streaming less
+    // often, so the cap follows it; past 12 MiB the arena stops being one
+    // pooled allocation, which is dearer than any pass count.
+    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
+    const int64_t slots = std::max<int64_t>(1, (num_slots > 0) ? num_slots : nt);
+    constexpr int64_t kArena = 24 << 20;
+    const int64_t workset =
+        std::max<int64_t>(2 << 20, std::min<int64_t>(ug.total * esz, 12 << 20));
+    const int64_t slot_cap =
+        std::min<int64_t>(workset / esz, kArena / (esz * slots));
+    const int64_t per_tile = std::max<int64_t>(
+        1, ug.pos * (plan.v_lda + plan.m_oc_stride));
+    const int64_t tile_cap = std::max<int64_t>(1, slot_cap / per_tile);
+    ntb = std::max<int64_t>(ntb, (tiles + tile_cap - 1) / tile_cap);
+    // ... but never past the point where a task's U read stops paying.
+    ntb = std::min<int64_t>(
+        ntb, std::max<int64_t>(1, tiles / kTileBlockMin(order)));
+
     plan.tile_block = (tiles + ntb - 1) / ntb;
     plan.num_tile_blocks = (tiles + plan.tile_block - 1) / plan.tile_block;
 
-    const int64_t oc_blocks = (oc_per_group + plan.ocn_block - 1) / plan.ocn_block;
     const int64_t plane_tasks = NB * G * plan.num_tile_blocks;
     plan.oc_chunks = 1;
     if (plane_tasks < nt && oc_blocks > 1) {
@@ -906,19 +932,10 @@ Conv2DWinogradPlan make_plan(const Conv2DAttributes& attrs,
     }
     plan.num_tasks = plane_tasks * plan.oc_chunks;
 
-    // V: one [tile][ic] plane per position, tiles contiguous inside a position
-    // (that is the GEMM's A, so lda is a tile row). The row is padded to the
-    // vector width so a tail block can be written whole, and the +8 per position
-    // keeps the 16 planes off one L1 set — the channel-first route's measurement holds.
-    plan.v_lda      = ((ic_per_group + 7) / 8) * 8;
     plan.v_p_stride = plan.tile_block * plan.v_lda + 8;
     plan.v_size     = ug.pos * plan.v_p_stride;
-    // M: [tile][oc] per position, a whole panel per row so the MMA's widest row
-    // read stays inside it.
-    plan.m_oc_stride = plan.ocn_block;
-    plan.m_size      = ug.pos * plan.tile_block * plan.m_oc_stride;
+    plan.m_size     = ug.pos * plan.tile_block * plan.m_oc_stride;
 
-    const int64_t esz = static_cast<int64_t>(data_type_size(dt));
     plan.halo_size = 0;   // no halo strip on this route
     plan.b_size    = 0;   // and no packed-B block: U is read in place
     // Round the slot to 16 elements so every slot base keeps the transform's
