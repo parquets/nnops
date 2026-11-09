@@ -87,6 +87,34 @@ auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     }
 }
 
+/// The weights as a decode loop would hold them: prepackWeights() once, before
+/// the clock, and only the blob handed to compute(). The pack is a per-call cost
+/// otherwise, and at T=1 it is most of the call — every row here is the steady
+/// state, which is the only number a caller can act on.
+struct PackedBlob {
+    std::vector<std::byte> buf;
+    TensorView view;
+};
+
+inline PackedBlob prepack(OpBase& op, std::span<const TensorView> ins) {
+    PackedBlob b;
+    TensorView query{};
+    op.prepackWeights(ins, std::span<TensorView>(&query, 1), {});
+    // The answer carries no storage, so rank — not is_empty() — separates a
+    // blob from "no packed form".
+    if (query.rank() == 0) { return b; }
+    b.buf.assign(static_cast<size_t>(query.numel()) *
+                     static_cast<size_t>(data_type_size(query.data_type())) + 64,
+                 std::byte{0});
+    const int64_t shape[1] = {query.numel()};
+    b.view = TensorView(std::span<const int64_t>(shape, 1), query.data_type(),
+                        b.buf.data(), TensorLayout::PackedRecurrent);
+    TensorView fill[1] = {b.view};
+    op.prepackWeights(ins, fill, {});
+    b.view = fill[0];
+    return b;
+}
+
 struct RecurrentCase {
     const char* name;
     RecurrentMode mode = RecurrentMode::Lstm;
@@ -197,6 +225,8 @@ void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int 
         a.direction = c.dir;
         op = Rnn::create(a, Backend::CPU);
     }
+    const PackedBlob blob = prepack(*op, ins);
+    ins[1] = blob.view;
 
     // Every gate column of every batch row of every timestep, input and
     // recurrent halves: 2 flops per MAC.
@@ -649,6 +679,12 @@ void ab_rnn_q8(RecurrentMode mode, int64_t steps, int64_t B, int64_t I, int64_t 
 
     const char* name = mode == RecurrentMode::Lstm ? "lstm"
                      : mode == RecurrentMode::Gru  ? "gru" : "rnn";
+    // Both arms prepacked, so the ratio is the two routes' arithmetic and not
+    // the two routes' packers — a per-call pack is 4-8x a one-step call.
+    const PackedBlob blob_fp = prepack(*op, ins_fp);
+    ins_fp[1] = blob_fp.view;
+    const PackedBlob blob_q8 = prepack(*op, ins_q8);
+    ins_q8[1] = blob_q8.view;
     std::printf("  %s fp vs W8A8  T=%lld B=%lld I=%lld H=%lld\n", name,
                 (long long)steps, (long long)B, (long long)I, (long long)H);
 

@@ -14,6 +14,8 @@
 
 #include "backend/cpu/rnn/recurrent_internal.h"
 
+#include "backend/cpu/simd_kernel/simd_int8_lane.hpp"
+
 namespace nnops::backend::cpu {
 
 namespace {
@@ -230,9 +232,15 @@ void run_phase_q8_kernel(const StepCtx<T>& s, const ComputeContext& ctx)
         for (int64_t m = 0; m < mcnt; ++m) {
             const int32_t* crow = pc + m * s.nc;
             T* drow = dst + m * s.ldc;
-            const float sa = psa[m];
-            for (int64_t n = 0; n < ncnt; ++n) {
-                const float v = static_cast<float>(crow[n]) * sa * sr[n];
+            const v_f32x8 vsa = v_set1_f32x8(psa[m]);
+            int64_t n = 0;
+            for (; n + 8 <= ncnt; n += 8) {
+                const v_f32x8 v = v_mul(v_mul(kernel::v_cvt_i32_to_f32(crow + n), vsa),
+                                        v_load(sr + n));
+                vstore8(drow + n, fresh ? v : v_add(vload8(drow + n), v));
+            }
+            for (; n < ncnt; ++n) {
+                const float v = static_cast<float>(crow[n]) * psa[m] * sr[n];
                 s_store(drow + n, fresh ? v : s_load(drow + n) + v);
             }
         }
@@ -347,9 +355,14 @@ void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
         for (int64_t m = 0; m < mcnt; ++m) {
             const int32_t* crow = pc + m * nc;
             T* drow = dst + m * ldc;
-            const float sa = psa[m];
-            for (int64_t n = 0; n < ncnt; ++n) {
-                s_store(drow + n, static_cast<float>(crow[n]) * sa * swp[n]);
+            const v_f32x8 vsa = v_set1_f32x8(psa[m]);
+            int64_t n = 0;
+            for (; n + 8 <= ncnt; n += 8) {
+                vstore8(drow + n, v_mul(v_mul(kernel::v_cvt_i32_to_f32(crow + n), vsa),
+                                        v_load(swp + n)));
+            }
+            for (; n < ncnt; ++n) {
+                s_store(drow + n, static_cast<float>(crow[n]) * psa[m] * swp[n]);
             }
         }
     };
