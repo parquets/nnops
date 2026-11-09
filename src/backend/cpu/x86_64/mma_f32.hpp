@@ -1927,8 +1927,11 @@ void mma_direct_mr1_nr16_mrxncxkc_f32(
 
     float* c0_ptr = C;
 
-    int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
+    const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float)) / sizeof(float));
     const int row_step = (ldb < 0) ? 16 : ldb;
+    // Below -1 a negative ldb is how far apart the caller's packed panels sit;
+    // without one the panels are this call's own and the aligned slot is right.
+    const int panel_step = (ldb < -1) ? -ldb : ldb_panel;
 
     int n = 0;
 
@@ -1938,6 +1941,58 @@ void mma_direct_mr1_nr16_mrxncxkc_f32(
         else if constexpr (seed == 2) { return _mm256_loadu_ps(bias + n + off); }
         else { return _mm256_setzero_ps(); }
     };
+
+    // Two packed panels per pass: at one row the loop is nothing but weight
+    // stream, and a broadcast per k already takes a third of its load slots, so
+    // one A scalar over 32 columns is the whole margin over the read ceiling.
+    for (; ldb < 0 && n <= nc - 32; n += 32) {
+        const float* a0_ptr = A;
+
+        __m256 v_acc0x01234567 = init(0, 0);
+        __m256 v_acc0x89abcdef = init(0, 8);
+        __m256 v_acc0x01234567_hi = init(0, 16);
+        __m256 v_acc0x89abcdef_hi = init(0, 24);
+
+        const float* b_ptr = B;
+        const float* b1_ptr = B + panel_step;
+        for(int k = 0; k < kc; ++k) {
+            const __m256 v_b0 = _mm256_loadu_ps(b_ptr + 0 * 8);
+            const __m256 v_b1 = _mm256_loadu_ps(b_ptr + 1 * 8);
+            const __m256 v_b2 = _mm256_loadu_ps(b1_ptr + 0 * 8);
+            const __m256 v_b3 = _mm256_loadu_ps(b1_ptr + 1 * 8);
+            b_ptr += row_step;
+            b1_ptr += row_step;
+
+            const __m256 v_a0 = _mm256_broadcast_ss(a0_ptr); a0_ptr += 1;
+            v_acc0x01234567 = _mm256_fmadd_ps(v_a0, v_b0, v_acc0x01234567);
+            v_acc0x89abcdef = _mm256_fmadd_ps(v_a0, v_b1, v_acc0x89abcdef);
+            v_acc0x01234567_hi = _mm256_fmadd_ps(v_a0, v_b2, v_acc0x01234567_hi);
+            v_acc0x89abcdef_hi = _mm256_fmadd_ps(v_a0, v_b3, v_acc0x89abcdef_hi);
+        }
+
+        if constexpr (!zero_mode) {
+            v_acc0x01234567 = _mm256_add_ps(v_acc0x01234567, _mm256_loadu_ps(c0_ptr + 0));
+            v_acc0x89abcdef = _mm256_add_ps(v_acc0x89abcdef, _mm256_loadu_ps(c0_ptr + 8));
+            v_acc0x01234567_hi = _mm256_add_ps(v_acc0x01234567_hi, _mm256_loadu_ps(c0_ptr + 16));
+            v_acc0x89abcdef_hi = _mm256_add_ps(v_acc0x89abcdef_hi, _mm256_loadu_ps(c0_ptr + 24));
+        }
+        const __m256 v_min = _mm256_set1_ps(clamp_min);
+        const __m256 v_max = _mm256_set1_ps(clamp_max);
+
+        v_acc0x01234567 = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567, v_max), v_min);
+        v_acc0x89abcdef = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef, v_max), v_min);
+        v_acc0x01234567_hi = _mm256_max_ps(_mm256_min_ps(v_acc0x01234567_hi, v_max), v_min);
+        v_acc0x89abcdef_hi = _mm256_max_ps(_mm256_min_ps(v_acc0x89abcdef_hi, v_max), v_min);
+
+        _mm256_storeu_ps(c0_ptr + 0, v_acc0x01234567);
+        _mm256_storeu_ps(c0_ptr + 8, v_acc0x89abcdef);
+        _mm256_storeu_ps(c0_ptr + 16, v_acc0x01234567_hi);
+        _mm256_storeu_ps(c0_ptr + 24, v_acc0x89abcdef_hi);
+
+        c0_ptr += 32;
+
+        B += 2 * panel_step;
+    }
 
     for(; n < nc - 15; n += 16) {
         const float* a0_ptr = A;
@@ -1971,7 +2026,7 @@ void mma_direct_mr1_nr16_mrxncxkc_f32(
 
         c0_ptr += 16;
 
-        B += ldb_panel;
+        B += panel_step;
     }
 
     int rem = nc - n;
@@ -2072,19 +2127,20 @@ void mma_direct_mr1_nr16_mrxncxkc_f32(
 }
 
 // ---- dispatch tables, consumed by matmul_helper.cpp ---------------------
-// Rows are the MR levels {6,4,1}; every kernel takes the runtime panel height,
-// so a remainder panel below its own MR runs through the level above it. The
-// mr2 kernels stay out of these tables; only the tests and bench call them.
+// Rows are the MR levels {6,4,2,1}; every kernel takes the runtime panel height,
+// so a remainder panel below its own MR runs through the level above it.
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_pack_fns_f32 = std::array{
     &mma_pack_mr6_nr16_mrxncxkc_f32<Z, Seed>,
     &mma_pack_mr4_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_pack_mr2_nr16_mrxncxkc_f32<Z, Seed>,
     &mma_pack_mr1_nr16_mrxncxkc_f32<Z, Seed>};
 
 template <bool Z, int Seed = 0>
 inline constexpr auto mma_direct_fns_f32 = std::array{
     &mma_direct_mr6_nr16_mrxncxkc_f32<Z, Seed>,
     &mma_direct_mr4_nr16_mrxncxkc_f32<Z, Seed>,
+    &mma_direct_mr2_nr16_mrxncxkc_f32<Z, Seed>,
     &mma_direct_mr1_nr16_mrxncxkc_f32<Z, Seed>};
 
 }

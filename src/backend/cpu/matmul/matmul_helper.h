@@ -63,10 +63,15 @@ namespace arch = x86_64;
 namespace arch = aarch64;
 #endif
 
-constexpr int MR_F32[3] = {arch::mr_f32[0], arch::mr_f32[1], arch::mr_f32[2]};
+constexpr int MR_F32[4] = {arch::mr_f32[0], arch::mr_f32[1], arch::mr_f32[2], arch::mr_f32[3]};
 constexpr int NR_F32[3] = {arch::nr_f32[0], arch::nr_f32[1], arch::nr_f32[2]};
-constexpr int MR_F16[3] = {arch::mr_f16[0], arch::mr_f16[1], arch::mr_f16[2]};
+constexpr int MR_F16[4] = {arch::mr_f16[0], arch::mr_f16[1], arch::mr_f16[2], arch::mr_f16[3]};
 constexpr int NR_F16[3] = {arch::nr_f16[0], arch::nr_f16[1], arch::nr_f16[2]};
+
+/// Rungs in an MR ladder, terminators included. Every pack and MMA table is
+/// this wide; the float ladder spends one rung on the 2-row panel and the int8
+/// one on a zero terminator.
+constexpr int MR_LEVELS = 4;
 
 constexpr int MR_MAX_F32 = arch::mr_f32[0];
 constexpr int NR_MAX_F32 = arch::nr_f32[0];
@@ -87,9 +92,9 @@ static_assert(arch::q4_1_nr_max<float> == NR_MAX_F32 &&
 
 // int8 panels: A keeps the arch's MR cascade; B and the MMA are uniform.
 #ifdef NNOPS_ARCH_X86_64
-constexpr int MR_I8[3] = {6, 4, 1};
+constexpr int MR_I8[4] = {6, 4, 1, 0};
 #elif defined(NNOPS_ARCH_AARCH64)
-constexpr int MR_I8[3] = {8, 4, 1};
+constexpr int MR_I8[4] = {8, 4, 1, 0};
 #endif
 
 constexpr int MR_MAX_I8 = MR_I8[0];
@@ -443,10 +448,12 @@ inline bool gemm_is_small(int64_t M, int64_t N, int64_t K) noexcept {
 }
 
 /// Panels the largest-first decomposition emits for `n` (quotient chain, O(levels)).
-constexpr int num_panels(int n, const int* nr, int levels = 3) noexcept {
+/// A zero entry terminates a short ladder (aarch64's float rungs stop at 1).
+constexpr int num_panels(int n, const int* nr, int levels = 4) noexcept {
     int count = 0;
     int rem   = n;
     for (int s = 0; s < levels; ++s) {
+        if (nr[s] <= 0) { break; }
         count += rem / nr[s];
         rem   %= nr[s];
     }
@@ -457,8 +464,8 @@ constexpr int num_panels(int n, const int* nr, int levels = 3) noexcept {
 /// monotonic: with {8,4,1}, 143 rows need 21 panels but 144 need 18. So the
 /// packed-A buffer must size by this maximum, not num_panels(n, mr). Closed
 /// form (one step down from the quotient, recursing) instead of an O(n) scan.
-constexpr int num_panels_max(int n, const int* nr, int levels = 3) noexcept {
-    if (n <= 0 || levels <= 0) { return 0; }
+constexpr int num_panels_max(int n, const int* nr, int levels = 4) noexcept {
+    if (n <= 0 || levels <= 0 || nr[0] <= 0) { return 0; }
     const int step = nr[0];
     const int q    = n / step;
     if (q == 0) { return num_panels_max(n, nr + 1, levels - 1); }

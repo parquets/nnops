@@ -8,7 +8,11 @@
 /// Invariants:
 ///  - A decomposes into the arch's MR cascade (MR_F32 / MR_F16 / MR_I8), and
 ///    the split minimises the number of panels, not the largest first: every
-///    panel re-streams all of B, so 8 rows is 4+4 rather than 6+1+1.
+///    panel re-streams all of B, so 8 rows is 4+4 rather than 6+1+1. A short
+///    tail rides a wider kernel rather than a narrow one (3 rows through the
+///    4-wide kernel), since the float kernels alias rows past the live count —
+///    one redundant row is cheaper than a second B pass. The int8 packers take
+///    no live width, so their ladder keeps exact panels.
 ///  - B is uniform: ceil(nc/nr_max) nr_max-wide panels at one 64-byte-aligned
 ///    stride. The MMA reads whole lanes, so callers pass the live width and
 ///    each kernel's N-tail path drops the lanes past it.
@@ -16,7 +20,9 @@
 ///
 /// Two RHS modes: a per-call pack whose stride comes from the k-block length,
 /// and a MatMulPackedB blob packed outside the call. Those strides disagree, so
-/// the blob route hands the kernel one panel per call and steps panels itself.
+/// the blob route hands the kernel one panel per call and steps panels itself —
+/// except on the 1-row rung, where one call takes two panels and reads the
+/// caller's stride (a negative ldb below -1) instead of its own.
 /// The int8 blob adds a second axis — its panels come in k segments, because the
 /// per-panel correction block is read at the call's kc (see matmul_packed_b_geom).
 ///
@@ -50,43 +56,43 @@ using PackFn = void (*)(T* NNOPS_RESTRICT output, const T* NNOPS_RESTRICT input,
                         int ir_step, int K, float scale, int w);
 
 // Pack tables (largest-first): row 0 = LHS (MR), row 1 = RHS (NR).
-constexpr std::array<std::array<PackFn<float>, 3>, 2> pack_trans_f32_fn = {{
+constexpr std::array<std::array<PackFn<float>, MR_LEVELS>, 2> pack_trans_f32_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {pack_trans_n6_f32, pack_trans_n4_f32, pack_trans_n1_f32},
-    {pack_trans_n16_f32, pack_trans_n8_f32, pack_trans_n1_f32},
+    {pack_trans_n6_f32, pack_trans_n4_f32, pack_trans_n2_f32, pack_trans_n1_f32},
+    {pack_trans_n16_f32, pack_trans_n8_f32, nullptr, pack_trans_n1_f32},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {pack_trans_n8_f32, pack_trans_n4_f32, pack_trans_n1_f32},
-    {pack_trans_n12_f32, pack_trans_n4_f32, pack_trans_n1_f32},
+    {pack_trans_n8_f32, pack_trans_n4_f32, pack_trans_n1_f32, nullptr},
+    {pack_trans_n12_f32, pack_trans_n4_f32, nullptr, pack_trans_n1_f32},
 #endif
 }};
 
-constexpr std::array<std::array<PackFn<float>, 3>, 2> pack_copy_f32_fn = {{
+constexpr std::array<std::array<PackFn<float>, MR_LEVELS>, 2> pack_copy_f32_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {pack_copy_n6_f32, pack_copy_n4_f32, pack_copy_n1_f32},
-    {pack_copy_n16_f32, pack_copy_n8_f32, pack_copy_n1_f32},
+    {pack_copy_n6_f32, pack_copy_n4_f32, pack_copy_n2_f32, pack_copy_n1_f32},
+    {pack_copy_n16_f32, pack_copy_n8_f32, nullptr, pack_copy_n1_f32},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {pack_copy_n8_f32, pack_copy_n4_f32, pack_copy_n1_f32},
-    {pack_copy_n12_f32, pack_copy_n4_f32, pack_copy_n1_f32},
+    {pack_copy_n8_f32, pack_copy_n4_f32, pack_copy_n1_f32, nullptr},
+    {pack_copy_n12_f32, pack_copy_n4_f32, nullptr, pack_copy_n1_f32},
 #endif
 }};
 
-constexpr std::array<std::array<PackFn<half>, 3>, 2> pack_trans_f16_fn = {{
+constexpr std::array<std::array<PackFn<half>, MR_LEVELS>, 2> pack_trans_f16_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {pack_trans_n6_f16, pack_trans_n4_f16, pack_trans_n1_f16},
-    {pack_trans_n16_f16, pack_trans_n8_f16, pack_trans_n1_f16},
+    {pack_trans_n6_f16, pack_trans_n4_f16, pack_trans_n2_f16, pack_trans_n1_f16},
+    {pack_trans_n16_f16, pack_trans_n8_f16, nullptr, pack_trans_n1_f16},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {pack_trans_n8_f16, pack_trans_n4_f16, pack_trans_n1_f16},
-    {pack_trans_n16_f16, pack_trans_n8_f16, pack_trans_n1_f16},
+    {pack_trans_n8_f16, pack_trans_n4_f16, pack_trans_n1_f16, nullptr},
+    {pack_trans_n16_f16, pack_trans_n8_f16, nullptr, pack_trans_n1_f16},
 #endif
 }};
 
-constexpr std::array<std::array<PackFn<half>, 3>, 2> pack_copy_f16_fn = {{
+constexpr std::array<std::array<PackFn<half>, MR_LEVELS>, 2> pack_copy_f16_fn = {{
 #ifdef NNOPS_ARCH_X86_64
-    {pack_copy_n6_f16, pack_copy_n4_f16, pack_copy_n1_f16},
-    {pack_copy_n16_f16, pack_copy_n8_f16, pack_copy_n1_f16},
+    {pack_copy_n6_f16, pack_copy_n4_f16, pack_copy_n2_f16, pack_copy_n1_f16},
+    {pack_copy_n16_f16, pack_copy_n8_f16, nullptr, pack_copy_n1_f16},
 #elif defined(NNOPS_ARCH_AARCH64)
-    {pack_copy_n8_f16, pack_copy_n4_f16, pack_copy_n1_f16},
-    {pack_copy_n16_f16, pack_copy_n8_f16, pack_copy_n1_f16},
+    {pack_copy_n8_f16, pack_copy_n4_f16, pack_copy_n1_f16, nullptr},
+    {pack_copy_n16_f16, pack_copy_n8_f16, nullptr, pack_copy_n1_f16},
 #endif
 }};
 
@@ -120,21 +126,85 @@ constexpr int panel_stride(int rows, int kc) {
         / static_cast<int>(sizeof(T)));
 }
 
-template <int Level, class Emit>
-inline void panel_level(int& i, int count, const int* sizes, Emit&& emit) {
-    const int s = sizes[Level];
-    for (; i + s <= count; i += s) { emit(Level, s); }
+/// One M panel: @p level selects the packer and MMA width, @p rows is how many
+/// real rows it carries. A panel narrower than its kernel is legal because the
+/// kernels alias every row past the live count onto the last live row, in A and
+/// in C: the surplus rows redo a lane of arithmetic and store it back to the
+/// same place. No padding, no bounds, no change in the result.
+struct MrPanel { int level; int rows; };
+
+/// The rows below the level-0 stride, largest level first, then the last two
+/// panels folded into the next wider kernel for as long as they both fit in it.
+/// The fold is the point: 4+1 becomes one 6-row panel, 1+1+1 one 4-row panel —
+/// one B pass instead of three, for two rows of duplicate arithmetic.
+///
+/// Caller passes fewer than 3 * levels[0] rows, so the tail is at most
+/// 3 * levels[0] / levels[1] + 2 panels; MrPanel[10] covers every shipped table.
+inline int tail_panels(int count, const int* levels, MrPanel* out) {
+    int n = 0;
+    for (int lv = 1; lv < MR_LEVELS && levels[lv] > 0; ++lv) {
+        for (const int w = levels[lv]; count >= w; count -= w) { out[n++] = {lv, w}; }
+    }
+    while (n >= 2) {
+        MrPanel& a = out[n - 2];
+        const int merged = a.rows + out[n - 1].rows;
+        if (a.level == 0 || merged > levels[a.level - 1]) { break; }
+        a.rows = merged;
+        --a.level;
+        --n;
+    }
+    return n;
 }
 
-/// How many of the largest-level panels a walk should emit for @p count rows.
+/// The M split, by three costs in order: the panel count (each panel re-streams
+/// the whole B side, an order of magnitude above any row cost), the rows of
+/// duplicate arithmetic the rounding rule pays for, and the widest kernel (a
+/// wider panel does more work per row). Ties go to the greedy split.
 ///
-/// The greedy cascade is not the cheapest split, because every panel re-streams
-/// the whole B side: the count of panels, not their width, is what an M split
-/// costs. 8 rows is 4+4, not 6+1+1; 14 is 6+4+4, not 6+6+1+1; 15 is 6+4+4+1. So
-/// the level-0 count is the one to search, and only a couple of steps below the
-/// greedy one — giving up a level-0 panel frees at most six rows, which the
-/// second level covers in at most two panels.
-inline int best_level0_count(int count, const int* levels) {
+/// Only the level-0 count is searched, and only a couple of steps below greedy:
+/// giving up a level-0 panel frees under one stride, which one tail panel now
+/// covers outright. Yields 1, 2, 4/3, 4, 6/5, 6, 6+1, 4+4 for 1..8 rows.
+template <class Emit>
+inline void walk_levels(int& i, int count, const int* levels, Emit&& emit) {
+    const int l0 = levels[0];
+    const int greedy = count / l0;
+    int best_q0 = greedy, best_n = count + 1, best_waste = 0, best_wide = 0;
+    MrPanel best_tail[10];
+    int best_tail_n = 0;
+
+    for (int q0 = greedy; q0 >= 0 && q0 >= greedy - 2; --q0) {
+        MrPanel tail[10];
+        const int tn = tail_panels(count - q0 * l0, levels, tail);
+        int waste = 0, wide = l0;
+        for (int t = 0; t < tn; ++t) {
+            waste += levels[tail[t].level] - tail[t].rows;
+            wide = std::max(wide, levels[tail[t].level]);
+        }
+        const int n = q0 + tn;
+        if (n < best_n || (n == best_n && waste < best_waste) ||
+            (n == best_n && waste == best_waste && wide <= best_wide)) {
+            best_q0 = q0;
+            best_n = n;
+            best_waste = waste;
+            best_wide = wide;
+            best_tail_n = tn;
+            for (int t = 0; t < tn; ++t) { best_tail[t] = tail[t]; }
+        }
+    }
+
+    for (int n = 0; n < best_q0; ++n) { emit(0, l0); i += l0; }
+    for (int t = 0; t < best_tail_n; ++t) {
+        emit(best_tail[t].level, best_tail[t].rows);
+        i += best_tail[t].rows;
+    }
+}
+
+/// The same count search for a ladder whose packers take no live width: an int8
+/// LHS panel is its rung's full row count, so a panel can never be narrower than
+/// the kernel that packed it and the tail stays exact. The count search still
+/// applies (8 rows is 4+4, not 6+1+1); only the rounding does not.
+template <class Emit>
+inline void walk_levels_exact(int& i, int count, const int* levels, Emit&& emit) {
     const int l0 = levels[0], l1 = levels[1];
     const int greedy = count / l0;
     int best = count + 1, best_q0 = greedy;
@@ -143,15 +213,10 @@ inline int best_level0_count(int count, const int* levels) {
         const int n = q0 + rest / l1 + rest % l1;
         if (n < best) { best = n; best_q0 = q0; }
     }
-    return best_q0;
-}
-
-template <class Emit>
-inline void walk_levels(int& i, int count, const int* levels, Emit&& emit) {
-    const int q0 = best_level0_count(count, levels);
-    for (int n = 0; n < q0; ++n) { emit(0, levels[0]); i += levels[0]; }
-    panel_level<1>(i, count, levels, emit);
-    panel_level<2>(i, count, levels, emit);
+    for (int n = 0; n < best_q0; ++n) { emit(0, l0); i += l0; }
+    for (int lv = 1; lv < MR_LEVELS && levels[lv] > 0; ++lv) {
+        for (int w = levels[lv]; i + w <= count; i += w) { emit(lv, w); }
+    }
 }
 
 template <class Pack>
@@ -167,7 +232,7 @@ void tile_pack_lhs_impl(bool trans, int mc, int kc, T* dst, int ldd,
     using Tr = TileTraits<T>;
     using Fn = typename Tr::Pack;
     // transposed source is a plain copy; row-major needs the transposing kernel.
-    const std::array<Fn, 3>& fns = trans ? Tr::copy()[0] : Tr::trans()[0];
+    const std::array<Fn, MR_LEVELS>& fns = trans ? Tr::copy()[0] : Tr::trans()[0];
     const int pack_lds = trans ? 1 : lds;
 
     int i = 0;
@@ -257,6 +322,8 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
     using Tr = TileTraits<T>;
     const auto& fns = Tr::template mma_direct<Zero, Seed>();
     constexpr int nr = Tr::nr()[0];
+    // Every float 1-row kernel takes two packed panels per call.
+    constexpr int wide_nr = 2 * nr;
 
     const auto seed_at = [&](int m, int n) {
         return (Seed == 1) ? bias + m : (Seed == 2 ? col_bias + n : nullptr);
@@ -269,10 +336,15 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
             fns[level](s, Nc, Kc, c + m * ldc, ldc, a_m, lda, b, /*ldb=*/-1,
                        clamp_min, clamp_max, seed_at(m, 0));
         } else if (ldb < 0) {
-            for (int n = 0; n < Nc; n += nr) {
-                const int w = std::min<int>(nr, Nc - n);
+            // A 1-row panel is a pure weight stream, so its kernel takes two
+            // packed panels there and its one A scalar feeds two panel widths;
+            // the packing is uniform, so any other rung stays one panel.
+            const int step = (Tr::mr()[level] == 1) ? wide_nr : nr;
+            const int64_t b_ld = (step > nr) ? ldb : -1;
+            for (int n = 0; n < Nc; n += step) {
+                const int w = std::min<int>(step, Nc - n);
                 fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda,
-                           b + (static_cast<int64_t>(n) / nr) * -ldb, /*ldb=*/-1,
+                           b + (static_cast<int64_t>(n) / nr) * -ldb, b_ld,
                            clamp_min, clamp_max, seed_at(m, n));
             }
         } else {
@@ -697,7 +769,7 @@ void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
     const int kbytes   = (kc + 3) & ~3;  // pack writes ceil(kc/4)*4 bytes per row
 
     int i = 0;
-    walk_levels(i, mc, MR_I8, [&](int level, int s) {
+    walk_levels_exact(i, mc, MR_I8, [&](int level, int s) {
         fns[level](dst, src, lds, kc, 0.0f);
         if (a_biased) { xor0x80_i8(dst, s * kbytes); }
         dst += ldd;
@@ -720,7 +792,7 @@ void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
     QT tmp[MR_MAX_I8 * (static_cast<int>(KC_CAP_I8) + 3)];
 
     int i = 0;
-    walk_levels(i, mc, MR_I8, [&](int level, int s) {
+    walk_levels_exact(i, mc, MR_I8, [&](int level, int s) {
         for (int r = 0; r < s; ++r) {
             const float sc = (scale != nullptr) ? scale[i + r] : scale_scalar;
             // The quant kernel takes a float zero-point array; null means no
@@ -802,7 +874,7 @@ void tile_mma_pack_i8(int mc, int nc, int kc,
     const auto& fns = zero_mode ? mma_pack_fns_i8<true> : mma_pack_fns_i8<false>;
 
     int m = 0;
-    walk_levels(m, mc, MR_I8, [&](int level, int s) {
+    walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
         fns[level](s, nc, kc, c + m * ldc, ldc, packed_a, packed_b, ldb,
                    clamp_min, clamp_max);
         packed_a += ldd_a;
@@ -818,7 +890,7 @@ void tile_mma_direct_i8(int mc, int nc, int kc,
 
     // Same MR cascade as the packed route; only the A operand moves.
     int m = 0;
-    walk_levels(m, mc, MR_I8, [&](int level, int s) {
+    walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
         fns[level](s, nc, kc, c + m * ldc, ldc, a + m * lda, lda, packed_b, ldb,
                    clamp_min, clamp_max);
     });

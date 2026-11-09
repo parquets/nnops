@@ -2416,14 +2416,16 @@ NNOPS_TEST(matmul_panel_counts_match_their_stepwise_definitions) {
         int count = 0;
         int i = 0;
         for (int s = 0; s < levels; ++s) {
+            if (nr[s] <= 0) { break; }
             for (; i + nr[s] <= n; i += nr[s]) { ++count; }
         }
         return count;
     };
 
     struct List { const int* nr; int levels; };
-    for (const List& l : {List{cpu::MR_F32, 3}, List{cpu::MR_F16, 3}, List{cpu::NR_F32, 3},
-                          List{cpu::NR_F16, 3}, List{cpu::MR_I8, 3}}) {
+    for (const List& l : {List{cpu::MR_F32, cpu::MR_LEVELS}, List{cpu::MR_F16, cpu::MR_LEVELS},
+                          List{cpu::NR_F32, 3}, List{cpu::NR_F16, 3},
+                          List{cpu::MR_I8, cpu::MR_LEVELS}}) {
         for (int n = 1; n <= 8192; ++n) {
             NNOPS_EXPECT_EQ(cpu::num_panels(n, l.nr, l.levels), stepwise(n, l.nr, l.levels));
             int worst = 0;
@@ -2921,6 +2923,8 @@ NNOPS_TEST(matmul_prepacked_b) {
         {1,  5,   37,  19, false, true},   // tails on both axes
         {1,  5,   37,  19, true,  true},   // the same product, B stored [N, K]
         {1,  1,    8,   5, true,  false},  // 40 MACs: the raw B takes the naive small kernel
+        {1,  1,   64,  64, false, true},   // M=1 over several panels: the 1-row kernel pairs them
+        {1,  1,   96,  40, true,  false},  // the same, with a k off the pack width and a tail panel
         {3, 16,  300,  48, false, true},   // batched A, several k-blocks
         {2, 64,  256,  96, true,  true},   // a layer shape, B broadcast
         {1,  4, 1024,  17, false, false},  // deep K, M = 4: the raw B is a GEMV

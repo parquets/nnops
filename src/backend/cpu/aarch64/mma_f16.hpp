@@ -953,6 +953,9 @@ inline void mma_direct_mr1_nr16_mrxncxkc_f16(
 
     const int ldb_panel = static_cast<int>(mma_pack_align(16 * kc * sizeof(float16_t)) / sizeof(float16_t));
     const int row_step = (ldb < 0) ? 16 : ldb;
+    // Below -1 a negative ldb is how far apart the caller's packed panels sit;
+    // without one the panels are this call's own and the aligned slot is right.
+    const int panel_step = (ldb < -1) ? -ldb : ldb_panel;
     const float16_t cmin = static_cast<float16_t>(clamp_min);
     const float16_t cmax = static_cast<float16_t>(clamp_max);
     const float16x8_t vmin = vdupq_n_f16(cmin);
@@ -965,6 +968,48 @@ inline void mma_direct_mr1_nr16_mrxncxkc_f16(
         else if constexpr (seed == 2) { return vld1q_f16(bias + n + off); }
         else { return vdupq_n_f16(0.0f16); }
     };
+    // Two packed panels per pass: at one row the loop is nothing but weight
+    // stream, and its scalar A load costs a whole load slot of its own, so one
+    // scalar over 32 columns is the margin.
+    for (; ldb < 0 && n <= nc - 32; n += 32) {
+        float16x8_t c00 = init(0, 0), c01 = init(0, 8);
+        float16x8_t c02 = init(0, 16), c03 = init(0, 24);
+
+        const float16_t* NNOPS_RESTRICT a_ptr = A;
+        const float16_t* NNOPS_RESTRICT b0_ptr = B;
+        const float16_t* NNOPS_RESTRICT b1_ptr = B + panel_step;
+        for (int k = 0; k < kc; ++k) {
+            const float16x8_t d0 = vld1q_f16(b0_ptr + 0 * 8);
+            const float16x8_t d1 = vld1q_f16(b0_ptr + 1 * 8);
+            const float16x8_t d2 = vld1q_f16(b1_ptr + 0 * 8);
+            const float16x8_t d3 = vld1q_f16(b1_ptr + 1 * 8);
+            b0_ptr += row_step;
+            b1_ptr += row_step;
+
+            const float16_t a = *a_ptr++;
+
+            c00 = vfmaq_n_f16(c00, d0, a);
+            c01 = vfmaq_n_f16(c01, d1, a);
+            c02 = vfmaq_n_f16(c02, d2, a);
+            c03 = vfmaq_n_f16(c03, d3, a);
+        }
+
+        if constexpr (!zero_mode) {
+            c00 = vaddq_f16(c00, vld1q_f16(c0_ptr + 0 * 8));
+            c01 = vaddq_f16(c01, vld1q_f16(c0_ptr + 1 * 8));
+            c02 = vaddq_f16(c02, vld1q_f16(c0_ptr + 2 * 8));
+            c03 = vaddq_f16(c03, vld1q_f16(c0_ptr + 3 * 8));
+        }
+
+        vst1q_f16(c0_ptr + 0 * 8, vminq_f16(vmaxq_f16(c00, vmin), vmax));
+        vst1q_f16(c0_ptr + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
+        vst1q_f16(c0_ptr + 2 * 8, vminq_f16(vmaxq_f16(c02, vmin), vmax));
+        vst1q_f16(c0_ptr + 3 * 8, vminq_f16(vmaxq_f16(c03, vmin), vmax));
+
+        c0_ptr += 32;
+        B += 2 * panel_step;
+    }
+
     for (; n < nc - 15; n += 16) {
         float16x8_t c00 = init(0, 0), c01 = init(0, 8);
 
@@ -990,7 +1035,7 @@ inline void mma_direct_mr1_nr16_mrxncxkc_f16(
         vst1q_f16(c0_ptr + 1 * 8, vminq_f16(vmaxq_f16(c01, vmin), vmax));
 
         c0_ptr += 16;
-        B += ldb_panel;
+        B += panel_step;
     }
 
     const int rem = nc - n;

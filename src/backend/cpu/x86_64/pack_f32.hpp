@@ -19,10 +19,12 @@
 /// (`mr` for the transposing kernels, `nr` for the copies), so one loop serves
 /// both a full panel and a tail.
 ///
-/// mr_f32 = {6, 4, 1} is the A-panel ladder both the pack and the direct route
-/// use, matching the MMA kernels (mma_f32.hpp's mr6/mr4/mr1): at nr 16 the
-/// 6-row tile already holds twelve accumulators plus the two B and two A
-/// vectors — all 16 ymm — so a taller level would spill.
+/// mr_f32 = {6, 4, 2, 1} is the A-panel ladder both the pack and the direct
+/// route use, matching the MMA kernels (mma_f32.hpp's mr6/mr4/mr2/mr1): at
+/// nr 16 the 6-row tile already holds twelve accumulators plus the two B and
+/// two A vectors — all 16 ymm — so a taller level would spill. The 2-row rung
+/// is what a batch of two rides; without it the walk split it into two 1-row
+/// panels, each of which re-streams the whole B side.
 ///
 /// Reference: nn_compute/src/cpu/kernel/pack/x86_64/pack_f32.hpp
 
@@ -42,6 +44,30 @@ inline void pack_trans_n1_f32(float* NNOPS_RESTRICT output,
     for (int k = 0; k < K; ++k) {
         *output++ = input[0] * scale;
         input += 1;  // consecutive k within the M×K source row
+    }
+}
+
+inline void pack_trans_n2_f32(float* NNOPS_RESTRICT output,
+                              const float* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 2) noexcept {
+    const int r1 = (mr > 1) ? 1 : 0;
+    const float* NNOPS_RESTRICT p0 = input;
+    const float* NNOPS_RESTRICT p1 = input + r1 * ir_step;
+
+    const __m128 v_scale = _mm_set1_ps(scale);
+    int k = 0;
+    for (; k <= K - 4; k += 4) {
+        const __m128 a = _mm_loadu_ps(p0);
+        const __m128 b = _mm_loadu_ps(p1);
+        p0 += 4; p1 += 4;
+        _mm_storeu_ps(output + 0, _mm_mul_ps(_mm_unpacklo_ps(a, b), v_scale));
+        _mm_storeu_ps(output + 4, _mm_mul_ps(_mm_unpackhi_ps(a, b), v_scale));
+        output += 8;
+    }
+    for (; k < K; ++k) {
+        output[0] = *p0++ * scale;
+        output[1] = *p1++ * scale;
+        output += 2;
     }
 }
 
@@ -252,6 +278,20 @@ inline void pack_copy_n1_f32(float* NNOPS_RESTRICT output,
     }
 }
 
+inline void pack_copy_n2_f32(float* NNOPS_RESTRICT output,
+                             const float* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 2) noexcept {
+    const __m128 v_scale = _mm_set1_ps(scale);
+    for (int k = 0; k < K; ++k) {
+        __m128 v = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(input)));
+        if (nr < 2) { v = _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 0, 0, 0)); }
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(output),
+                         _mm_castps_si128(_mm_mul_ps(v, v_scale)));
+        output += 2;
+        input  += ir_step;
+    }
+}
+
 inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
                              const float* NNOPS_RESTRICT input,
                              int ir_step, int K, float scale, int nr = 4) noexcept {
@@ -398,7 +438,7 @@ inline void pack_copy_n16_f32(float* NNOPS_RESTRICT output,
 //  Micro-panel size menu (f32)  —  mr = M-panel heights, nr = N-panel widths
 // =========================================================================
 
-inline constexpr int mr_f32[3] = {6, 4, 1};
+inline constexpr int mr_f32[4] = {6, 4, 2, 1};
 inline constexpr int nr_f32[3] = {16, 8, 1};
 
 }  // namespace nnops::backend::cpu::x86_64

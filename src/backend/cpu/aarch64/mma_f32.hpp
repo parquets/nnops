@@ -1058,6 +1058,9 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(
 
     const int ldb_panel = static_cast<int>(mma_pack_align(12 * kc * sizeof(float)) / sizeof(float));
     const int row_step = (ldb < 0) ? 12 : ldb;
+    // Below -1 a negative ldb is how far apart the caller's packed panels sit;
+    // without one the panels are this call's own and the aligned slot is right.
+    const int panel_step = (ldb < -1) ? -ldb : ldb_panel;
     const float32x4_t vmin = vdupq_n_f32(clamp_min);
     const float32x4_t vmax = vdupq_n_f32(clamp_max);
 
@@ -1068,6 +1071,56 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(
         else if constexpr (seed == 2) { return vld1q_f32(bias + n + off); }
         else { return vdupq_n_f32(0.0f); }
     };
+    // Two packed panels per pass: at one row the loop is nothing but weight
+    // stream, and its scalar A load costs a whole load slot of its own, so one
+    // scalar over 24 columns is the margin.
+    for (; ldb < 0 && n <= nc - 24; n += 24) {
+        float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
+        float32x4_t c03 = init(0, 12), c04 = init(0, 16), c05 = init(0, 20);
+
+        const float* NNOPS_RESTRICT a_ptr = A;
+        const float* NNOPS_RESTRICT b0_ptr = B;
+        const float* NNOPS_RESTRICT b1_ptr = B + panel_step;
+        for (int k = 0; k < kc; ++k) {
+            const float32x4_t d0 = vld1q_f32(b0_ptr + 0 * 4);
+            const float32x4_t d1 = vld1q_f32(b0_ptr + 1 * 4);
+            const float32x4_t d2 = vld1q_f32(b0_ptr + 2 * 4);
+            const float32x4_t d3 = vld1q_f32(b1_ptr + 0 * 4);
+            const float32x4_t d4 = vld1q_f32(b1_ptr + 1 * 4);
+            const float32x4_t d5 = vld1q_f32(b1_ptr + 2 * 4);
+            b0_ptr += row_step;
+            b1_ptr += row_step;
+
+            const float a = *a_ptr++;
+
+            c00 = vfmaq_n_f32(c00, d0, a);
+            c01 = vfmaq_n_f32(c01, d1, a);
+            c02 = vfmaq_n_f32(c02, d2, a);
+            c03 = vfmaq_n_f32(c03, d3, a);
+            c04 = vfmaq_n_f32(c04, d4, a);
+            c05 = vfmaq_n_f32(c05, d5, a);
+        }
+
+        if constexpr (!zero_mode) {
+            c00 = vaddq_f32(c00, vld1q_f32(c0_ptr + 0 * 4));
+            c01 = vaddq_f32(c01, vld1q_f32(c0_ptr + 1 * 4));
+            c02 = vaddq_f32(c02, vld1q_f32(c0_ptr + 2 * 4));
+            c03 = vaddq_f32(c03, vld1q_f32(c0_ptr + 3 * 4));
+            c04 = vaddq_f32(c04, vld1q_f32(c0_ptr + 4 * 4));
+            c05 = vaddq_f32(c05, vld1q_f32(c0_ptr + 5 * 4));
+        }
+
+        vst1q_f32(c0_ptr + 0 * 4, vminq_f32(vmaxq_f32(c00, vmin), vmax));
+        vst1q_f32(c0_ptr + 1 * 4, vminq_f32(vmaxq_f32(c01, vmin), vmax));
+        vst1q_f32(c0_ptr + 2 * 4, vminq_f32(vmaxq_f32(c02, vmin), vmax));
+        vst1q_f32(c0_ptr + 3 * 4, vminq_f32(vmaxq_f32(c03, vmin), vmax));
+        vst1q_f32(c0_ptr + 4 * 4, vminq_f32(vmaxq_f32(c04, vmin), vmax));
+        vst1q_f32(c0_ptr + 5 * 4, vminq_f32(vmaxq_f32(c05, vmin), vmax));
+
+        c0_ptr += 24;
+        B += 2 * panel_step;
+    }
+
     for (; n < nc - 11; n += 12) {
         float32x4_t c00 = init(0, 0), c01 = init(0, 4), c02 = init(0, 8);
 
@@ -1097,7 +1150,7 @@ inline void mma_direct_mr1_nr12_mrxncxkc_f32(
         vst1q_f32(c0_ptr + 2 * 4, vminq_f32(vmaxq_f32(c02, vmin), vmax));
 
         c0_ptr += 12;
-        B += ldb_panel;
+        B += panel_step;
     }
 
     const int rem = nc - n;

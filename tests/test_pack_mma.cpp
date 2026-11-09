@@ -8,13 +8,15 @@
 /// zero-fill the columns past it. The 16-wide tests check only the lanes the
 /// MMA reads — 8 for a tail of 8 or fewer, all 16 above.
 ///
-/// tile_pack_lhs walks the MR cascade (mr_f32/mr_f16 {6,4,1} on x86, {8,4,1}
-/// on aarch64), advancing ldd per panel; tile_pack_rhs cuts N into uniform
+/// tile_pack_lhs walks the MR cascade (mr_f32/mr_f16 {6,4,2,1} on x86, {8,4,1}
+/// on aarch64), advancing ldd per panel and letting a short tail ride a wider
+/// kernel than the rows it carries; tile_pack_rhs cuts N into uniform
 /// nr_max-wide panels the same way. Both write the [k][panel] layout the MMA
 /// consumes; the tests round ldd up to the 64-byte slot mma_pack_align uses.
 /// The MMA kernels are tested in test_mma_packed.cpp.
 
 #include <algorithm>
+#include <utility>
 
 #include "common/test_harness.hpp"
 #include "nnops/detail/half.hpp"
@@ -279,6 +281,38 @@ NNOPS_TEST(pack_f16_copy_n8) {
     }
 }
 
+// The 2-row rung, both source orientations: the trans packer interleaves the
+// pair, the copy takes the pair whole, and a live width of 1 replicates row 0
+// into lane 1 — the alias the MMA applies to a 1-row panel.
+#if defined(NNOPS_ARCH_X86_64)
+NNOPS_TEST(pack_f16_n2_panels) {
+    constexpr int K = 13, M = 2;
+
+    std::vector<f16_t> rows(M * K);   // [M][K], the transposing source
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) { rows[m * K + k] = f_to_f16(1.0f + float(m * 100 + k)); }
+    }
+    std::vector<f16_t> cols(K * M);   // [K][M], the transposed source
+    for (int k = 0; k < K; ++k) {
+        for (int m = 0; m < M; ++m) { cols[k * M + m] = rows[m * K + k]; }
+    }
+
+    for (int live : {2, 1}) {
+        const float lane1 = (live > 1) ? 101.0f : 1.0f;
+        std::vector<f16_t> trans_out(M * K, f_to_f16(-7.0f));
+        pack_trans_n2_f16(trans_out.data(), rows.data(), K, K, 1.0f, live);
+        std::vector<f16_t> copy_out(M * K, f_to_f16(-7.0f));
+        pack_copy_n2_f16(copy_out.data(), cols.data(), M, K, 1.0f, live);
+        for (int k = 0; k < K; ++k) {
+            NNOPS_EXPECT_NEAR(f16_to_f(trans_out[k * 2 + 0]), 1.0f + float(k), 0.5f);
+            NNOPS_EXPECT_NEAR(f16_to_f(trans_out[k * 2 + 1]), lane1 + float(k), 0.5f);
+            NNOPS_EXPECT_NEAR(f16_to_f(copy_out[k * 2 + 0]), 1.0f + float(k), 0.5f);
+            NNOPS_EXPECT_NEAR(f16_to_f(copy_out[k * 2 + 1]), lane1 + float(k), 0.5f);
+        }
+    }
+}
+#endif  // NNOPS_ARCH_X86_64
+
 #if defined(NNOPS_ARCH_X86_64)
 // Same partial-panel contract as Section 2b, in f16.
 NNOPS_TEST(pack_f16_n16_pad) {
@@ -405,9 +439,64 @@ NNOPS_TEST(dequant_s8_to_f16_sym) { check_dequant_f16<int8_t>(2, 33, false); }
 
 namespace cpu = nnops::backend::cpu;
 
+/// The panels tile_pack_lhs must emit for @p M rows, as (kernel width, live
+/// rows). The greedy level-0 stride, then the tail folded up: largest rung
+/// first, then the two narrowest panels merged into the next wider kernel for
+/// as long as both fit inside it. A panel can therefore be narrower than the
+/// kernel that packed it — 4+1 is one 6-row panel, 2+1 one 4-row panel.
+///
+/// Mirrors tail_panels/walk_levels in matmul_helper.cpp on purpose: the split
+/// is part of the contract, so changing it has to fail here.
+static std::vector<std::pair<int, int>> lhs_panels(int M) {
+    const int* mr = cpu::MR_F32;
+    int nlv = 0;
+    while (nlv < cpu::MR_LEVELS && mr[nlv] > 0) { ++nlv; }
+
+    const int l0 = mr[0];
+    const int greedy = M / l0;
+    int best_q0 = greedy, best_n = M + 1, best_waste = 0, best_wide = 0;
+    std::vector<std::pair<int, int>> best_tail;
+
+    for (int q0 = greedy; q0 >= 0 && q0 >= greedy - 2; --q0) {
+        std::vector<std::pair<int, int>> tail;
+        for (int lv = 1, left = M - q0 * l0; lv < nlv; ++lv) {
+            for (int w = mr[lv]; left >= w; left -= w) { tail.push_back({w, w}); }
+        }
+        while (tail.size() >= 2) {
+            const int dead = tail.back().second;
+            std::pair<int, int>& a = tail[tail.size() - 2];
+            int rung = 0;
+            for (int lv = 1; lv < nlv; ++lv) {
+                if (mr[lv] == a.first) { rung = mr[lv - 1]; break; }
+            }
+            if (rung == 0 || a.second + dead > rung) { break; }
+            a.first = rung;
+            a.second += dead;
+            tail.pop_back();
+        }
+        int waste = 0, wide = l0;
+        for (const auto& t : tail) {
+            waste += t.first - t.second;
+            wide = std::max(wide, t.first);
+        }
+        const int n = q0 + static_cast<int>(tail.size());
+        if (n < best_n || (n == best_n && (waste < best_waste ||
+            (waste == best_waste && wide <= best_wide)))) {
+            best_q0 = q0;
+            best_n = n;
+            best_waste = waste;
+            best_wide = wide;
+            best_tail = tail;
+        }
+    }
+
+    std::vector<std::pair<int, int>> out(static_cast<size_t>(best_q0), {l0, l0});
+    out.insert(out.end(), best_tail.begin(), best_tail.end());
+    return out;
+}
+
 /// src is the physical matrix: [M,K] row-major when !trans, [K,M] when trans.
-static void check_tile_pack_lhs(bool trans) {
-    constexpr int M = 11;   // x86: 6+4+1, one panel at each mr level
+static void check_tile_pack_lhs(bool trans, int M) {
     constexpr int K = 13;   // SIMD blocks + scalar k tail
 
     const int lds = trans ? M : K;   // physical row stride of the source
@@ -422,25 +511,26 @@ static void check_tile_pack_lhs(bool trans) {
 
     const int mr0 = cpu::MR_F32[0];
     const int ldd = (mr0 * K * 4 + 63) / 64 * 16;  // 64-byte-aligned stride
+    const auto panels = lhs_panels(M);
     // Panels sit at the aligned stride, so size by panel count, not M*K.
-    std::vector<float> dst(static_cast<size_t>(cpu::num_panels(M, cpu::MR_F32)) * ldd, -1.0f);
+    std::vector<float> dst(panels.size() * ldd, -1.0f);
 
     cpu::tile_pack_lhs(trans, M, K, dst.data(), ldd, src.data(), lds, 1.0f);
 
-    const int* mr = cpu::MR_F32;
     int m_off = 0;
     int p = 0;
-    for (int si = 0; si < 3; ++si) {
-        for (; m_off + mr[si] <= M; m_off += mr[si], ++p) {
-            const float* panel = dst.data() + p * ldd;
-            for (int k = 0; k < K; ++k) {
-                for (int m = 0; m < mr[si]; ++m) {
-                    const float expect = 1.0f + float((m_off + m) * 100 + k);
-                    NNOPS_EXPECT_NEAR(panel[k * mr[si] + m], expect, 1e-5f);
-                }
+    for (const auto& pan : panels) {
+        const float* panel = dst.data() + static_cast<size_t>(p) * ldd;
+        for (int k = 0; k < K; ++k) {
+            for (int m = 0; m < pan.second; ++m) {
+                const float expect = 1.0f + float((m_off + m) * 100 + k);
+                NNOPS_EXPECT_NEAR(panel[k * pan.first + m], expect, 1e-5f);
             }
         }
+        m_off += pan.second;
+        ++p;
     }
+    NNOPS_EXPECT_EQ(m_off, M);
 }
 
 /// src is the physical matrix: [K,N] row-major when !trans, [N,K] when trans.
@@ -483,7 +573,7 @@ static void check_tile_pack_rhs(bool trans) {
     }
 }
 
-NNOPS_TEST(tile_pack_lhs_trans)          { check_tile_pack_lhs(true); }
-NNOPS_TEST(tile_pack_lhs_copy)           { check_tile_pack_lhs(false); }
+NNOPS_TEST(tile_pack_lhs_trans)          { for (int M = 1; M <= 21; ++M) { check_tile_pack_lhs(true, M); } }
+NNOPS_TEST(tile_pack_lhs_copy)           { for (int M = 1; M <= 21; ++M) { check_tile_pack_lhs(false, M); } }
 NNOPS_TEST(tile_pack_rhs_trans)          { check_tile_pack_rhs(true); }
 NNOPS_TEST(tile_pack_rhs_copy)           { check_tile_pack_rhs(false); }

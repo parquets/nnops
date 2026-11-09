@@ -43,6 +43,34 @@ inline void pack_trans_n1_f16(half* NNOPS_RESTRICT output,
     }
 }
 
+inline void pack_trans_n2_f16(half* NNOPS_RESTRICT output,
+                              const half* NNOPS_RESTRICT input,
+                              int ir_step, int K, float scale, int mr = 2) noexcept {
+    const int r1 = (mr > 1) ? 1 : 0;
+    const half* NNOPS_RESTRICT p0 = input;
+    const half* NNOPS_RESTRICT p1 = input + r1 * ir_step;
+
+    const __m128 v_scale = _mm_set1_ps(scale);
+    int k = 0;
+    for (; k <= K - 4; k += 4) {
+        const __m128 a = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p0)));
+        const __m128 b = _mm_cvtph_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p1)));
+        p0 += 4; p1 += 4;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 0),
+                         _mm_cvtps_ph(_mm_mul_ps(_mm_unpacklo_ps(a, b), v_scale),
+                                      _MM_FROUND_TO_NEAREST_INT));
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 4),
+                         _mm_cvtps_ph(_mm_mul_ps(_mm_unpackhi_ps(a, b), v_scale),
+                                      _MM_FROUND_TO_NEAREST_INT));
+        output += 8;
+    }
+    for (; k < K; ++k) {
+        output[0] = float_to_half(half_to_float(*p0++) * scale);
+        output[1] = float_to_half(half_to_float(*p1++) * scale);
+        output += 2;
+    }
+}
+
 inline void pack_trans_n4_f16(half* NNOPS_RESTRICT output,
                               const half* NNOPS_RESTRICT input,
                               int ir_step, int K, float scale, int mr = 4) noexcept {
@@ -243,6 +271,19 @@ inline void pack_copy_n1_f16(half* NNOPS_RESTRICT output,
     for (int k = 0; k < K; ++k) {
         *output++ = (nr > 0) ? float_to_half(half_to_float(input[0]) * scale) : half{};
         input += ir_step;
+    }
+}
+
+inline void pack_copy_n2_f16(half* NNOPS_RESTRICT output,
+                             const half* NNOPS_RESTRICT input,
+                             int ir_step, int K, float scale, int nr = 2) noexcept {
+    for (int k = 0; k < K; ++k) {
+        const half a = float_to_half(half_to_float(input[0]) * scale);
+        const half b = (nr > 1) ? float_to_half(half_to_float(input[1]) * scale) : a;
+        output[0] = a;
+        output[1] = b;
+        output += 2;
+        input  += ir_step;
     }
 }
 
@@ -455,7 +496,7 @@ inline void pack_copy_n24_f16(half* NNOPS_RESTRICT output,
 }
 
 /// @brief f16 LHS micro-panel heights.
-inline constexpr int mr_f16[3] = {6, 4, 1};
+inline constexpr int mr_f16[4] = {6, 4, 2, 1};
 
 /// @brief f16 RHS micro-panel widths.
 inline constexpr int nr_f16[3] = {16, 8, 1};

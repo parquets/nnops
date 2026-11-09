@@ -318,7 +318,7 @@ inline void pack_copy_n16_f16(float16_t* NNOPS_RESTRICT output,
 //  Micro-panel size menu (f16)  —  mr = LHS rows, nr = RHS columns.
 // =========================================================================
 
-inline constexpr int mr_f16[3] = {8, 4, 1};
+inline constexpr int mr_f16[4] = {8, 4, 1, 0};
 
 inline constexpr int nr_f16[3] = {16, 8, 1};
 

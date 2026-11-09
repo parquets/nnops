@@ -372,7 +372,7 @@ inline void pack_trans_n6_f32(float* NNOPS_RESTRICT output,
 //  rows, nr = RHS columns.
 // =========================================================================
 
-inline constexpr int mr_f32[3] = {8, 4, 1};
+inline constexpr int mr_f32[4] = {8, 4, 1, 0};
 
 inline constexpr int nr_f32[3] = {12, 4, 1};
 
