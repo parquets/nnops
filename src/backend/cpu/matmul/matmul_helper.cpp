@@ -6,8 +6,9 @@
 /// selected by NNOPS_ARCH_*, so no caller names an arch.
 ///
 /// Invariants:
-///  - A decomposes into the arch's MR cascade (MR_F32 / MR_F16 / MR_I8),
-///    largest level first; a leftover runs at the next, smaller level.
+///  - A decomposes into the arch's MR cascade (MR_F32 / MR_F16 / MR_I8), and
+///    the split minimises the number of panels, not the largest first: every
+///    panel re-streams all of B, so 8 rows is 4+4 rather than 6+1+1.
 ///  - B is uniform: ceil(nc/nr_max) nr_max-wide panels at one 64-byte-aligned
 ///    stride. The MMA reads whole lanes, so callers pass the live width and
 ///    each kernel's N-tail path drops the lanes past it.
@@ -125,9 +126,30 @@ inline void panel_level(int& i, int count, const int* sizes, Emit&& emit) {
     for (; i + s <= count; i += s) { emit(Level, s); }
 }
 
+/// How many of the largest-level panels a walk should emit for @p count rows.
+///
+/// The greedy cascade is not the cheapest split, because every panel re-streams
+/// the whole B side: the count of panels, not their width, is what an M split
+/// costs. 8 rows is 4+4, not 6+1+1; 14 is 6+4+4, not 6+6+1+1; 15 is 6+4+4+1. So
+/// the level-0 count is the one to search, and only a couple of steps below the
+/// greedy one — giving up a level-0 panel frees at most six rows, which the
+/// second level covers in at most two panels.
+inline int best_level0_count(int count, const int* levels) {
+    const int l0 = levels[0], l1 = levels[1];
+    const int greedy = count / l0;
+    int best = count + 1, best_q0 = greedy;
+    for (int q0 = greedy; q0 >= 0 && q0 >= greedy - 2; --q0) {
+        const int rest = count - q0 * l0;
+        const int n = q0 + rest / l1 + rest % l1;
+        if (n < best) { best = n; best_q0 = q0; }
+    }
+    return best_q0;
+}
+
 template <class Emit>
 inline void walk_levels(int& i, int count, const int* levels, Emit&& emit) {
-    panel_level<0>(i, count, levels, emit);
+    const int q0 = best_level0_count(count, levels);
+    for (int n = 0; n < q0; ++n) { emit(0, levels[0]); i += levels[0]; }
     panel_level<1>(i, count, levels, emit);
     panel_level<2>(i, count, levels, emit);
 }
