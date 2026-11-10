@@ -22,6 +22,8 @@
 ///  - pitched X and Y, since both are read and written by row stride;
 ///  - a one-row batch, which takes the matrix-vector route for the recurrent
 ///    product (a sub-panel width, a k split, and several column blocks);
+///  - a single step (T = 1), where Y and Y_h collapse onto each other and the
+///    sequence machinery has nothing to iterate over;
 ///  - a threaded run, compared against the sequential one.
 
 #include "nnops/nnops.hpp"
@@ -625,6 +627,53 @@ NNOPS_TEST(gru_f16_matches_reference) {
         Geo g;
         g.T = 3; g.B = 2; g.I = 5; g.H = 9; g.h0 = true;
         check_gru<half>(g, a, test::kF16AccumTol);
+    }
+}
+
+NNOPS_TEST(single_step_geometries) {
+    // T = 1 is the decoder's per-token call: one step, no loop, so whatever the
+    // driver does before and after the loop is all there is. B = 1 and I = 1
+    // drop the batch and the input axis; h0/c0 make the only step read the
+    // carried state rather than the initial one.
+    {
+        RnnAttributes a;
+        a.hidden_size = 6;
+        Geo g;
+        g.T = 1; g.B = 1; g.I = 1; g.H = 6; g.h0 = true;
+        check_rnn<float>(g, a, kF32Tol);
+    }
+    {
+        // No bias, no initial state: the defaults the driver must fill in.
+        RnnAttributes a;
+        a.hidden_size = 8;
+        Geo g;
+        g.T = 1; g.B = 5; g.I = 3; g.H = 8; g.bias = false;
+        check_rnn<float>(g, a, kF32Tol);
+    }
+    {
+        LstmAttributes a;
+        a.hidden_size = 5;
+        Geo g;
+        g.T = 1; g.B = 1; g.I = 2; g.H = 5; g.h0 = true; g.c0 = true;
+        check_lstm<float>(g, a, kF32Tol);
+    }
+    {
+        // Bidirectional at T = 1: both directions see the same single step.
+        LstmAttributes a;
+        a.hidden_size = 16;
+        a.direction = RnnDirection::Bidirectional;
+        Geo g;
+        g.T = 1; g.B = 3; g.I = 4; g.H = 16;
+        g.dir = RnnDirection::Bidirectional; g.h0 = true; g.c0 = true;
+        check_lstm<float>(g, a, kF32Tol);
+    }
+    {
+        GruAttributes a;
+        a.hidden_size = 7;
+        a.linear_before_reset = true;
+        Geo g;
+        g.T = 1; g.B = 2; g.I = 3; g.H = 7; g.h0 = true;
+        check_gru<float>(g, a, kF32Tol);
     }
 }
 

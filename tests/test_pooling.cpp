@@ -6,6 +6,12 @@
 ///
 /// Channel-last: the channel-first reference holds the truth; the channel-last run is
 /// converted back to channel-first for the comparison.
+///
+/// Window walks: the kernels, the reference and the tests share one convention —
+/// taps are spaced by the dilation and only the leading pad exists explicitly, the
+/// trailing half of a SAME pad being implicit. The auto_pad cases therefore hand the
+/// operator auto_pad and the reference the leading pad it must resolve to, worked out
+/// by hand; a wrong resolution shifts every window and no other test sees it.
 
 #include "nnops/ops/pooling.hpp"
 
@@ -364,6 +370,167 @@ NNOPS_TEST(pooling_channel_first_f16) {
     test_channel_first_f16({2, 3, 10, 9}, attrs);
 }
 
+// ============================================================
+// Dilation — the window stretches, the tap count does not
+// ============================================================
+
+NNOPS_TEST(pooling_channel_first_2d_dilation) {
+    // 3x3 at dilation 2 spans five rows and columns: 7x9 leaves OH 3, OW 5, so
+    // no window is clipped and the tap spacing is the only difference from a
+    // plain k3 walk. A dilated tap is not an extra tap, so an average still
+    // divides by nine.
+    for (auto type : {PoolingType::Max, PoolingType::Average}) {
+        PoolingAttributes attrs;
+        attrs.type         = type;
+        attrs.kernel_shape = {1, 3, 3};
+        attrs.dilation     = {1, 2, 2};
+        test_channel_first_f32({2, 3, 7, 9}, attrs);
+    }
+}
+
+NNOPS_TEST(pooling_channel_first_2d_dilation_per_axis) {
+    // Dilation on H only, with padding on both axes, so side windows leave the
+    // plane and exclude_pad has a dilated walk to count over.
+    PoolingAttributes attrs;
+    attrs.type         = PoolingType::Average;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.dilation     = {1, 2, 1};
+    attrs.padding      = {0, 1, 1};
+    test_channel_first_f32({1, 4, 9, 10}, attrs);
+
+    attrs.exclude_pad = true;
+    test_channel_first_f32({1, 4, 9, 10}, attrs);
+
+    attrs.type = PoolingType::Max;
+    attrs.exclude_pad = false;
+    test_channel_first_f32({1, 4, 9, 10}, attrs);
+}
+
+NNOPS_TEST(pooling_channel_first_3d_dilation) {
+    // Depth strides by two, the other two axes not: 5 deep with a 2-tap window
+    // leaves OD 3.
+    for (auto type : {PoolingType::Max, PoolingType::Average}) {
+        PoolingAttributes attrs;
+        attrs.type         = type;
+        attrs.kernel_shape = {2, 2, 2};
+        attrs.dilation     = {2, 2, 1};
+        attrs.padding      = {0, 1, 1};
+        test_channel_first_f32({1, 3, 5, 6, 7}, attrs);
+    }
+}
+
+NNOPS_TEST(pooling_channel_first_f16_dilation) {
+    PoolingAttributes attrs;
+    attrs.type         = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.dilation     = {1, 2, 2};
+    attrs.padding      = {0, 2, 2};
+    test_channel_first_f16({1, 3, 8, 8}, attrs);
+}
+
+// ============================================================
+// auto_pad — resolved to explicit leading padding before the kernel
+// ============================================================
+
+NNOPS_TEST(pooling_2d_auto_pad_resolution) {
+    // Each row carries the leading padding the resolver must produce, worked
+    // out by hand. The operator sees auto_pad and resolves it; the reference
+    // sees that explicit pad. A wrong resolution moves every window and shows
+    // up as a mismatch, and SAME_LOWER on an even plane leads by one where
+    // SAME_UPPER leads by zero.
+    struct Case {
+        std::vector<int64_t> shape;
+        PoolingType type;
+        int64_t kh, kw, sh, sw, dh, dw;
+        PoolingAttributes::AutoPad ap;
+        int64_t ph, pw;
+        bool exclude_pad;
+    };
+    const Case cases[] = {
+        // SAME_UPPER, odd plane at stride 2: total pad 2, so one row and one
+        // column lead.
+        {{1, 3, 13, 15}, PoolingType::Max, 3, 3, 2, 2, 1, 1,
+         PoolingAttributes::AutoPad::SAME_UPPER, 1, 1, false},
+        // SAME_UPPER, even plane: total pad 1 on H, 2 on W — the odd element
+        // goes after, so H leads by none.
+        {{1, 3, 8, 9}, PoolingType::Average, 3, 3, 2, 2, 1, 1,
+         PoolingAttributes::AutoPad::SAME_UPPER, 0, 1, false},
+        // The same plane under SAME_LOWER: the odd H element goes before.
+        {{1, 3, 8, 9}, PoolingType::Average, 3, 3, 2, 2, 1, 1,
+         PoolingAttributes::AutoPad::SAME_LOWER, 1, 1, true},
+        // VALID: no padding whatever the stride.
+        {{2, 2, 13, 13}, PoolingType::Max, 3, 3, 2, 2, 1, 1,
+         PoolingAttributes::AutoPad::VALID, 0, 0, false},
+        // A dilated SAME window: the extent is dilation·(k-1)+1, so the total
+        // pad is 4 on H and 3 on W.
+        {{1, 4, 11, 12}, PoolingType::Average, 3, 3, 2, 2, 2, 2,
+         PoolingAttributes::AutoPad::SAME_UPPER, 2, 1, false},
+    };
+
+    for (const Case& c : cases) {
+        auto [in_vec, in] = test::make_random_tensor(c.shape);
+
+        PoolingAttributes auto_a;
+        auto_a.type         = c.type;
+        auto_a.kernel_shape = {1, c.kh, c.kw};
+        auto_a.stride       = {1, c.sh, c.sw};
+        auto_a.dilation     = {1, c.dh, c.dw};
+        auto_a.auto_pad     = c.ap;
+        auto_a.exclude_pad  = c.exclude_pad;
+
+        auto op = Pooling::create(auto_a);
+        const TensorDesc ds[] = {in.desc()};
+        auto out_descs = op->getOutputTensorDesc(ds);
+        std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+        auto out = test::make_channel_first(out_descs[0], out_buf.data());
+        const TensorView ins[] = {in};
+        NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+        PoolingAttributes resolved = auto_a;
+        resolved.auto_pad  = PoolingAttributes::AutoPad::NOTSET;
+        resolved.padding   = {0, c.ph, c.pw};
+        std::vector<float> ref_buf(out_buf.size());
+        auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
+        {
+            ComputeContext ctx;
+            backend::cpu::reference::pooling_ref(resolved, ref, ins, ctx, nullptr);
+        }
+        NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-4f, 1e-4f));
+    }
+}
+
+NNOPS_TEST(pooling_3d_auto_pad_resolution) {
+    // One row per axis: 5 deep, 7 high, 8 wide at kernel 3 stride 2 gives total
+    // pads of 2, 2 and 1, so D and H lead by one and W by none.
+    auto [in_vec, in] = test::make_random_tensor({1, 2, 5, 7, 8});
+
+    PoolingAttributes auto_a;
+    auto_a.type         = PoolingType::Average;
+    auto_a.kernel_shape = {3, 3, 3};
+    auto_a.stride       = {2, 2, 2};
+    auto_a.auto_pad     = PoolingAttributes::AutoPad::SAME_UPPER;
+    auto_a.exclude_pad  = true;
+
+    auto op = Pooling::create(auto_a);
+    const TensorDesc ds[] = {in.desc()};
+    auto out_descs = op->getOutputTensorDesc(ds);
+    std::vector<float> out_buf(static_cast<size_t>(out_descs[0].numel()));
+    auto out = test::make_channel_first(out_descs[0], out_buf.data());
+    const TensorView ins[] = {in};
+    NNOPS_EXPECT_TRUE(is_ok(op->compute(out, ins)));
+
+    PoolingAttributes resolved = auto_a;
+    resolved.auto_pad = PoolingAttributes::AutoPad::NOTSET;
+    resolved.padding  = {1, 1, 0};
+    std::vector<float> ref_buf(out_buf.size());
+    auto ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    {
+        ComputeContext ctx;
+        backend::cpu::reference::pooling_ref(resolved, ref, ins, ctx, nullptr);
+    }
+    NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-4f, 1e-4f));
+}
+
 NNOPS_TEST(pooling_channel_first_3d_max) {
     PoolingAttributes attrs;
     attrs.type = PoolingType::Max;
@@ -683,6 +850,35 @@ NNOPS_TEST(pooling_channel_last_3d_avg_padding) {
     attrs.stride       = {1, 1, 1};
     attrs.padding      = {1, 1, 1};
     test_channel_last_vs_ref<float>({1, 5, 4, 5, 6}, attrs, 1e-4f);
+}
+
+NNOPS_TEST(pooling_channel_last_2d_dilation) {
+    // C = 5 ends on a short block, and the dilated window keeps the row-group
+    // walk's bounds checks busy on the clipped side windows.
+    PoolingAttributes attrs;
+    attrs.type         = PoolingType::Max;
+    attrs.kernel_shape = {1, 3, 3};
+    attrs.dilation     = {1, 2, 2};
+    test_channel_last_vs_ref<float>({1, 5, 7, 9}, attrs, 1e-4f);
+
+    attrs.type        = PoolingType::Average;
+    attrs.exclude_pad = true;
+    attrs.padding     = {0, 1, 1};
+    test_channel_last_vs_ref<float>({2, 8, 9, 11}, attrs, 1e-4f);
+
+    attrs.exclude_pad = false;
+    attrs.padding     = {0, 0, 0};
+    attrs.kernel_shape = {1, 2, 2};
+    attrs.dilation     = {1, 2, 2};
+    test_channel_last_vs_ref<backend::cpu::half>({1, 16, 8, 8}, attrs, 5e-3f);
+}
+
+NNOPS_TEST(pooling_channel_last_3d_dilation) {
+    PoolingAttributes attrs;
+    attrs.type         = PoolingType::Average;
+    attrs.kernel_shape = {2, 2, 2};
+    attrs.dilation     = {2, 2, 1};
+    test_channel_last_vs_ref<float>({1, 6, 5, 6, 7}, attrs, 1e-4f);
 }
 
 // ---- Quantized, channel-last -------------------------------------------

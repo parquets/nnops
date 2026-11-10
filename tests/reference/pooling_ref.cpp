@@ -5,6 +5,10 @@
 /// s_load/s_store. s8/u8 dequantize on load, pool in float and requantize on
 /// store, both with the scalar (PerTensor) params only.
 ///
+/// The window walk mirrors the kernel: taps are spaced by the dilation, padding
+/// is leading-only, and K_total stays the kernel volume (a dilated tap reads a
+/// gap, it does not add taps).
+///
 /// Parallelism is over N*C tasks (sample x channel) rather than over samples,
 /// so small-batch inference (N=1) still fills the thread pool.
 
@@ -84,6 +88,12 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
     const int64_t PH = glb ? 0 : attrs.padding[1];
     const int64_t PW = glb ? 0 : attrs.padding[2];
 
+    // Dilation stretches the window without changing its tap count, so K_total
+    // stays the kernel volume.
+    const int64_t DIL_D = glb ? 1 : ((srank == 3) ? attrs.dilation[0] : 1);
+    const int64_t DIL_H = glb ? 1 : attrs.dilation[1];
+    const int64_t DIL_W = glb ? 1 : attrs.dilation[2];
+
     const auto* in_ptr  = input.ptr<T>();
     auto* out_ptr = output.ptr<T>();
 
@@ -153,13 +163,13 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                 float max_val = -std::numeric_limits<float>::infinity();
                 bool any = false;
                 for (int64_t kd = 0; kd < KD; ++kd) {
-                const int64_t id = od * SD + kd - PD;
+                const int64_t id = od * SD + kd * DIL_D - PD;
                 if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t ih = oh * SH + kh - PH;
+                const int64_t ih = oh * SH + kh * DIL_H - PH;
                 if (ih < 0 || ih >= IH) { continue; }
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t iw = ow * SW + kw - PW;
+                    const int64_t iw = ow * SW + kw * DIL_W - PW;
                     if (iw < 0 || iw >= IW) { continue; }
                     const int64_t in_idx =
                         channel_first_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
@@ -173,11 +183,11 @@ void pooling_impl_ref(const PoolingAttributes& attrs,
                 float sum = 0.0f;
                 int64_t pad_count = 0;
                 for (int64_t kd = 0; kd < KD; ++kd) {
-                const int64_t id = od * SD + kd - PD;
+                const int64_t id = od * SD + kd * DIL_D - PD;
                 for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t ih = oh * SH + kh - PH;
+                const int64_t ih = oh * SH + kh * DIL_H - PH;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t iw = ow * SW + kw - PW;
+                    const int64_t iw = ow * SW + kw * DIL_W - PW;
                     if (id < 0 || id >= ID || ih < 0 || ih >= IH ||
                         iw < 0 || iw >= IW) {
                         ++pad_count;
@@ -254,6 +264,10 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
     const int64_t PH = glb ? 0 : attrs.padding[1];
     const int64_t PW = glb ? 0 : attrs.padding[2];
 
+    const int64_t DIL_D = glb ? 1 : ((srank == 3) ? attrs.dilation[0] : 1);
+    const int64_t DIL_H = glb ? 1 : attrs.dilation[1];
+    const int64_t DIL_W = glb ? 1 : attrs.dilation[2];
+
     const auto& in_qp  = input.quant_params();
     const auto& out_qp = output.quant_params();
     const float in_scale  = in_qp.scale;
@@ -280,13 +294,13 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
                 float max_val = -std::numeric_limits<float>::infinity();
                 bool any = false;
                 for (int64_t kd = 0; kd < KD; ++kd) {
-                const int64_t id = od * SD + kd - PD;
+                const int64_t id = od * SD + kd * DIL_D - PD;
                 if (id < 0 || id >= ID) { continue; }
                 for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t ih = oh * SH + kh - PH;
+                const int64_t ih = oh * SH + kh * DIL_H - PH;
                 if (ih < 0 || ih >= IH) { continue; }
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t iw = ow * SW + kw - PW;
+                    const int64_t iw = ow * SW + kw * DIL_W - PW;
                     if (iw < 0 || iw >= IW) { continue; }
                     const int64_t in_idx =
                         channel_first_offset(n, c, id, ih, iw, C, ID, IH, in_row_stride);
@@ -302,11 +316,11 @@ void pooling_impl_ref_quant(const PoolingAttributes& attrs,
                 float sum = 0.0f;
                 int64_t pad_count = 0;
                 for (int64_t kd = 0; kd < KD; ++kd) {
-                const int64_t id = od * SD + kd - PD;
+                const int64_t id = od * SD + kd * DIL_D - PD;
                 for (int64_t kh = 0; kh < KH; ++kh) {
-                const int64_t ih = oh * SH + kh - PH;
+                const int64_t ih = oh * SH + kh * DIL_H - PH;
                 for (int64_t kw = 0; kw < KW; ++kw) {
-                    const int64_t iw = ow * SW + kw - PW;
+                    const int64_t iw = ow * SW + kw * DIL_W - PW;
                     if (id < 0 || id >= ID || ih < 0 || ih >= IH ||
                         iw < 0 || iw >= IW) {
                         ++pad_count;

@@ -55,6 +55,15 @@
 /// attrs.algorithm: a k3s1 fp filter under Auto gets the Winograd U, so the
 /// prepack test pins ImplicitGemm. The output must stay byte-identical to the
 /// raw-filter run.
+///
+/// auto_pad: the operator resolves it to leading-only padding before the plan,
+/// so the resolution tests hand the operator auto_pad and the reference the pad
+/// it must have produced, each worked out by hand — the same plane under
+/// SAME_UPPER and SAME_LOWER differs by one leading row, and a dilated SAME
+/// window widens the total pad. The edge-plane table then pushes single rows,
+/// single columns, IC or OC of 1, strides past the kernel and grouped batches
+/// through the same gather, where each leaves a different remainder for the
+/// pack.
 
 #include "nnops/ops/conv2d.hpp"
 #include "backend/cpu/conv/conv2d_implicit_gemm.h"   // get_conv2d_implicit_gemm_plan, Conv2DGemmPlan
@@ -2140,5 +2149,160 @@ NNOPS_TEST(conv2d_prepacked_filter) {
 
         NNOPS_EXPECT_TRUE(std::memcmp(raw_buf.data(), packed_buf.data(),
                                       static_cast<size_t>(out_n) * sizeof(float)) == 0);
+    }
+}
+
+// ============================================================
+// auto_pad — resolved to explicit leading padding before the plan
+// ============================================================
+
+NNOPS_TEST(conv2d_auto_pad_resolution) {
+    // Each row carries the leading padding the resolver must produce, worked out
+    // by hand. The operator sees auto_pad and resolves it; the reference sees
+    // that explicit pad, and reads OH/OW off the output tensor the auto_pad
+    // shape inference chose. A wrong resolution shifts every window.
+    struct Case {
+        std::vector<int64_t> ishape, wshape;
+        int64_t kh, kw, sh, sw, dh, dw, groups;
+        int64_t ph, pw;                          // what the resolver must yield
+        Conv2DAttributes::AutoPad ap;
+        bool bias;
+    };
+    const Case cases[] = {
+        // k3 s1: total pad 2 on a 16-wide plane, so one row and column lead.
+        {{1, 3, 16, 16}, {8, 3, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1,
+         Conv2DAttributes::AutoPad::SAME_UPPER, true},
+        // k3 s2 on an odd plane: total pad 2 on both axes.
+        {{2, 4, 13, 15}, {6, 4, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1,
+         Conv2DAttributes::AutoPad::SAME_UPPER, false},
+        // k3 s2 on an even height: total pad 1 on H goes after, so H leads by
+        // none while W still leads by one.
+        {{1, 2, 8, 9}, {4, 2, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 0, 1,
+         Conv2DAttributes::AutoPad::SAME_UPPER, false},
+        // The same plane under SAME_LOWER: the odd H pad goes before.
+        {{1, 2, 8, 9}, {4, 2, 3, 3}, 3, 3, 2, 2, 1, 1, 1, 1, 1,
+         Conv2DAttributes::AutoPad::SAME_LOWER, false},
+        // VALID: no padding whatever the stride.
+        {{1, 3, 12, 12}, {4, 3, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 0, 0,
+         Conv2DAttributes::AutoPad::VALID, false},
+        // A dilated SAME window: the extent is dilation*(k-1)+1 = 5, so the
+        // total pad is 4 and two positions lead.
+        {{1, 3, 15, 15}, {8, 3, 3, 3}, 3, 3, 1, 1, 2, 2, 1, 2, 2,
+         Conv2DAttributes::AutoPad::SAME_UPPER, false},
+        // A non-square kernel: H takes kernel 5 by stride 2 (total pad 4) and W
+        // kernel 3 by stride 2 (total pad 2).
+        {{1, 4, 13, 11}, {8, 4, 5, 3}, 5, 3, 2, 2, 1, 1, 1, 2, 1,
+         Conv2DAttributes::AutoPad::SAME_UPPER, true},
+        // Groups 2 with a batch dim, so the resolved pad rides the grouped plan.
+        {{1, 8, 9, 11}, {16, 4, 3, 3}, 3, 3, 2, 2, 1, 1, 2, 1, 1,
+         Conv2DAttributes::AutoPad::SAME_UPPER, true},
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const Case& c = cases[ci];
+        const uint64_t seed = 3100 + static_cast<uint64_t>(ci);
+
+        auto [in_vec, input] = test::make_random_tensor(c.ishape, -1.0f, 1.0f, seed);
+        auto [w_vec, weight] = test::make_random_tensor(c.wshape, -1.0f, 1.0f, seed + 1);
+        std::vector<float> b_vec;
+        TensorView bias;
+        if (c.bias) {
+            b_vec.resize(static_cast<size_t>(c.wshape[0]));
+            test::XorShift128 rng(seed + 2);
+            rng.fill_float(b_vec.data(), c.wshape[0], -1.0f, 1.0f);
+            const int64_t bs[] = {c.wshape[0]};
+            bias = TensorView(bs, DataType::f32, b_vec.data());
+        }
+
+        Conv2DAttributes auto_a;
+        auto_a.kernel_size = {c.kh, c.kw};
+        auto_a.stride      = {c.sh, c.sw};
+        auto_a.dilation    = {c.dh, c.dw};
+        auto_a.groups      = c.groups;
+        auto_a.auto_pad    = c.ap;
+
+        auto op = Conv2D::create(auto_a, Backend::CPU);
+        std::vector<TensorView> ins = {input, weight};
+        if (c.bias) { ins.push_back(bias); }
+        std::vector<TensorDesc> descs;
+        for (const auto& v : ins) { descs.push_back(v.desc()); }
+        const auto od = op->getOutputTensorDesc(descs);
+
+        std::vector<float> out_buf(static_cast<size_t>(od[0].numel()));
+        auto out = test::make_channel_first(od[0], out_buf.data());
+        NNOPS_EXPECT_EQ(op->compute(out, ins, {}, nullptr), Status::ok);
+
+        Conv2DAttributes resolved = auto_a;
+        resolved.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
+        resolved.padding  = {c.ph, c.pw};
+        std::vector<float> ref_buf(out_buf.size());
+        auto ref = test::make_channel_first(od[0], ref_buf.data());
+        nnops::backend::cpu::reference::conv2d_ref(resolved, ref, ins, {}, nullptr);
+
+        NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-3f, 1e-4f));
+    }
+}
+
+// ============================================================
+// Edge planes — the shapes a real graph rarely feeds
+// ============================================================
+
+NNOPS_TEST(conv2d_edge_plane_shapes) {
+    // One row or one column of input, one output row, one channel on either
+    // side, a stride past the kernel, and filter tails off the plan's block
+    // sizes — each leaves the gather and the pack with a different remainder.
+    struct Case {
+        std::array<int64_t, 4> ishape, wshape;
+        int64_t kh, kw, sh, sw, ph, pw, dh, dw, groups;
+        bool bias;
+    };
+    const Case cases[] = {
+        // A single input row: every window but the middle is half padding.
+        {{1, 4, 1, 9},   {8, 4, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},
+        // A single input column.
+        {{1, 4, 9, 1},   {8, 4, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        // One output row on a wide plane.
+        {{1, 8, 3, 9},   {16, 8, 3, 3}, 3, 3, 1, 1, 0, 0, 1, 1, 1, true},
+        // IC 1: the group is a single channel, K is 9.
+        {{2, 1, 9, 11},  {4, 1, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, false},
+        // OC 1: a single filter row.
+        {{1, 6, 10, 10}, {1, 6, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        // Stride past the kernel: the windows do not overlap on either axis.
+        {{1, 3, 17, 19}, {5, 3, 3, 3}, 3, 3, 3, 3, 1, 1, 1, 1, 1, false},
+        // A rank-1 panel in one direction only.
+        {{1, 4, 12, 14}, {6, 4, 1, 7}, 1, 7, 1, 1, 0, 3, 1, 1, 1, false},
+        {{1, 4, 12, 14}, {6, 4, 7, 1}, 7, 1, 1, 1, 3, 0, 1, 1, 1, false},
+        // OC past the 128-wide filter block with a 17-row tail.
+        {{1, 8, 12, 12}, {145, 8, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 1, true},
+        // 9x9 at IC 4: the icn_block-1 rung, four ic-block iterations.
+        {{2, 4, 20, 20}, {8, 4, 9, 9}, 9, 9, 1, 1, 4, 4, 1, 1, 1, false},
+        // Groups 3 over a batch of 2: IC 3 a group, OC 6 a group.
+        {{2, 9, 10, 13}, {18, 3, 3, 3}, 3, 3, 1, 1, 1, 1, 1, 1, 3, true},
+    };
+
+    for (const Case& c : cases) {
+        auto [in_vec, input] = test::make_random_tensor(
+            std::span<const int64_t>(c.ishape.data(), 4), -1.0f, 1.0f, 4200);
+        auto [w_vec, weight] = test::make_random_tensor(
+            std::span<const int64_t>(c.wshape.data(), 4), -1.0f, 1.0f, 4201);
+        std::vector<float> b_vec;
+        TensorView bias;
+        if (c.bias) {
+            b_vec.resize(static_cast<size_t>(c.wshape[0]));
+            test::XorShift128 rng(4202);
+            rng.fill_float(b_vec.data(), c.wshape[0], -1.0f, 1.0f);
+            const int64_t bs[] = {c.wshape[0]};
+            bias = TensorView(bs, DataType::f32, b_vec.data());
+        }
+
+        Conv2DAttributes attrs;
+        attrs.kernel_size = {c.kh, c.kw};
+        attrs.stride      = {c.sh, c.sw};
+        attrs.dilation    = {c.dh, c.dw};
+        attrs.padding     = {c.ph, c.pw};
+        attrs.groups      = c.groups;
+
+        const TensorView* bp = c.bias ? &bias : nullptr;
+        NNOPS_EXPECT_TRUE(conv2d_fast_vs_ref(attrs, input, weight, bp, 1e-3f, 1e-4f));
     }
 }

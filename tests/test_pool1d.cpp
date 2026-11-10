@@ -64,9 +64,9 @@ PoolingAttributes to_2d(const Pool1DAttributes& a) {
     return c;
 }
 
-/// The 1D pooling semantics written out once, over channel-first data. The 2D
-/// reference's windowed walk does not apply dilation (`id = od·SD + kd - PD`),
-/// so a dilated case needs an oracle that does — this one.
+/// The 1D pooling semantics written out once, over channel-first data. It
+/// carries its own window walk rather than reusing the 2D reference: the rows
+/// are handed to it flat, and a 1D window has no H axis to fold into.
 void ref1d(const Pool1DAttributes& a, const std::vector<float>& in, int64_t N,
            int64_t C, int64_t L, int64_t OL, std::vector<float>& out)
 {

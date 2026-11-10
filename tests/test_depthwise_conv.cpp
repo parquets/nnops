@@ -12,6 +12,12 @@
 /// call covers 8 channels, or 16 (two vectors) where the 3x3 kernel can take
 /// both halves — which the C values below pick out: sub-vector, partial, full
 /// and multi-block.
+///
+/// The channel-first shape sweep picks the geometries that strand an edge mask:
+/// a plane one row or one column wide, C of 1 and past a vector, a filter larger
+/// than a vector, stride 2 with dilation 2 (the two compose, so the tap at the
+/// far edge is read and the one past it is not), and 3D volumes with a kernel
+/// shorter than the rank on one axis.
 
 #include "nnops/ops/conv2d.hpp"
 #include "nnops/ops/depthwise_conv.hpp"
@@ -251,6 +257,58 @@ NNOPS_TEST(dwconv_channel_first_3d_vs_ref_pre_act) {
     attrs.residual_pre_activation = true;
     attrs.epilogue.type = EpilogueActivateType::Relu;
     test_channel_first_vs_ref({1, 4, 4, 6, 9}, {4, 1, 3, 3, 3}, attrs, true);
+}
+
+NNOPS_TEST(dwconv_channel_first_shape_sweep) {
+    // Window and plane shapes the 3x3 cases above never reach: 5x5 and 7x7
+    // windows, an even 2x2, a rank-1 window on either axis, a one-row and a
+    // one-column plane, a single channel, an odd C, and the 3D forms at stride 2.
+    struct Case {
+        std::vector<int64_t> ishape, wshape;
+        DepthwiseConvAttributes attrs;
+        bool bias;
+    };
+    const Case cases[] = {
+        // 5x5 "same" over an odd plane: the width tail is 5 of 8 lanes.
+        {{1, 5, 11, 13}, {5, 1, 5, 5},
+         {{1, 5, 5}, {1, 1, 1}, {1, 1, 1}, {0, 2, 2}}, true},
+        // An even window at stride 2 with no padding.
+        {{1, 3, 8, 10}, {3, 1, 2, 2},
+         {{1, 2, 2}, {1, 2, 2}, {1, 1, 1}, {0, 0, 0}}, false},
+        // 7x7 "same" — the ResNet stem window.
+        {{1, 2, 11, 11}, {2, 1, 7, 7},
+         {{1, 7, 7}, {1, 1, 1}, {1, 1, 1}, {0, 3, 3}}, false},
+        // Rank-1 windows, one per axis.
+        {{1, 4, 9, 15}, {4, 1, 1, 7},
+         {{1, 1, 7}, {1, 1, 1}, {1, 1, 1}, {0, 0, 3}}, false},
+        {{1, 4, 15, 9}, {4, 1, 7, 1},
+         {{1, 7, 1}, {1, 1, 1}, {1, 1, 1}, {0, 3, 0}}, true},
+        // A single column and a single row of input: every window clipped.
+        {{1, 4, 7, 1}, {4, 1, 3, 3},
+         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true},
+        {{1, 4, 1, 7}, {4, 1, 3, 3},
+         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, false},
+        // One channel, and an odd C whose plane loop ends on a short tail.
+        {{1, 1, 9, 9},  {1, 1, 3, 3},
+         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, false},
+        {{1, 17, 8, 9}, {17, 1, 3, 3},
+         {{1, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true},
+        // Stride 2 with dilation 2: the gather skips a tap and a row.
+        {{1, 4, 15, 17}, {4, 1, 3, 3},
+         {{1, 3, 3}, {1, 2, 2}, {1, 2, 2}, {0, 2, 2}}, false},
+        // 3D: an even cube at stride 2, a 3x3x3 with H/W padding, and a
+        // 1x3x5 whose depth window is a single plane.
+        {{1, 3, 6, 8, 10}, {3, 1, 2, 2, 2},
+         {{2, 2, 2}, {2, 2, 2}, {1, 1, 1}, {0, 0, 0}}, false},
+        {{1, 2, 5, 9, 11}, {2, 1, 3, 3, 3},
+         {{3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {0, 1, 1}}, true},
+        {{2, 4, 5, 7, 9},  {4, 1, 1, 3, 5},
+         {{1, 3, 5}, {1, 1, 1}, {1, 1, 1}, {0, 1, 2}}, false},
+    };
+
+    for (const Case& c : cases) {
+        test_channel_first_vs_ref(c.ishape, c.wshape, c.attrs, c.bias);
+    }
 }
 
 // The one hand-computed case: everything else compares against

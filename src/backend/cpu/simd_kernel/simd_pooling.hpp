@@ -231,9 +231,14 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
     }
 
     // W padding is the only dim that trims a window per column, so it forces a
-    // per-lane count; otherwise the count is a constant.
+    // per-lane count; otherwise the count is a constant — unless a window runs
+    // off the right edge, which PW cannot see: a SAME-style pad is leading-only
+    // and its trailing half is implicit, so PW == 0 with the last window past
+    // IW would divide by taps that were never read.
+    const bool cols_inside = p.PW == 0 &&
+        (p.OW - 1) * p.SW + (p.KW - 1) * p.DW < p.IW;
     const auto taps_of = [&](int64_t col) {
-        if (p.PW == 0) { return row_taps * p.KW; }
+        if (cols_inside) { return row_taps * p.KW; }
         const int64_t iw_first = col * p.SW - p.PW;
         int64_t n = 0;
         for (int64_t kw = 0; kw < p.KW; ++kw) {
