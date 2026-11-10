@@ -68,6 +68,24 @@
 
 using namespace nnops;
 
+namespace {
+
+// Most tables below run the same case for f32 and f16; these convert at the
+// edges so the body stays type-generic.
+template <typename T>
+T cast_to(float v) {
+    if constexpr (std::is_same_v<T, float>) { return v; }
+    else { return backend::cpu::float_to_half(v); }
+}
+
+template <typename T>
+float cast_from(T v) {
+    if constexpr (std::is_same_v<T, float>) { return v; }
+    else { return backend::cpu::half_to_float(v); }
+}
+
+}  // namespace
+
 namespace nnops::backend::cpu::reference {
 void matmul_ref(const MatMulAttributes& attrs,
                 TensorView& output,
@@ -2726,15 +2744,6 @@ NNOPS_TEST(matmul_naive_kernel_layouts) {
         using T = decltype(dtype_tag);
         constexpr float tol = std::is_same_v<T, float> ? 1e-5f : kF16AccumTol;
 
-        const auto cast = [](float v) -> T {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::float_to_half(v); }
-        };
-        const auto to_f = [](T v) -> float {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::half_to_float(v); }
-        };
-
         for (const auto& s : shapes) {
             const int64_t M = s[0], N = s[1], K = s[2];
             for (int ta = 0; ta < 2; ++ta) {
@@ -2753,15 +2762,15 @@ NNOPS_TEST(matmul_naive_kernel_layouts) {
                         std::vector<T> cbuf(static_cast<size_t>(M * ldc));
                         for (int64_t r = 0; r < a_rows; ++r) {
                             for (int64_t c = 0; c < a_cols; ++c) {
-                                abuf[static_cast<size_t>(r * apitch + c)] = cast(rng.next_float());
+                                abuf[static_cast<size_t>(r * apitch + c)] = cast_to<T>(rng.next_float());
                             }
                         }
                         for (int64_t r = 0; r < b_rows; ++r) {
                             for (int64_t c = 0; c < b_cols; ++c) {
-                                bbuf[static_cast<size_t>(r * bpitch + c)] = cast(rng.next_float());
+                                bbuf[static_cast<size_t>(r * bpitch + c)] = cast_to<T>(rng.next_float());
                             }
                         }
-                        for (auto& v : cbuf) { v = cast(1.0f); }
+                        for (auto& v : cbuf) { v = cast_to<T>(1.0f); }
 
                         cpu::arch::matmul_naive(static_cast<int>(M), static_cast<int>(N),
                                                 static_cast<int>(K),
@@ -2773,14 +2782,14 @@ NNOPS_TEST(matmul_naive_kernel_layouts) {
                             for (int64_t n = 0; n < N; ++n) {
                                 float want = 0.0f;
                                 for (int64_t k = 0; k < K; ++k) {
-                                    const float av = to_f(abuf[static_cast<size_t>(
+                                    const float av = cast_from<T>(abuf[static_cast<size_t>(
                                         ta ? k * apitch + m : m * apitch + k)]);
-                                    const float bv = to_f(bbuf[static_cast<size_t>(
+                                    const float bv = cast_from<T>(bbuf[static_cast<size_t>(
                                         tb ? n * bpitch + k : k * bpitch + n)]);
                                     want += av * bv;
                                 }
                                 if (beta != 0.0f) { want += beta * 1.0f; }
-                                NNOPS_EXPECT_NEAR(to_f(cbuf[static_cast<size_t>(m * ldc + n)]),
+                                NNOPS_EXPECT_NEAR(cast_from<T>(cbuf[static_cast<size_t>(m * ldc + n)]),
                                                   want, tol);
                             }
                         }
@@ -2832,15 +2841,6 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
         constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32
                                                          : DataType::f16;
 
-        const auto cast = [](float v) -> T {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::float_to_half(v); }
-        };
-        const auto to_f = [](T v) -> float {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::half_to_float(v); }
-        };
-
         for (const Case& c : cases) {
             const int64_t a_rows = c.ta ? c.K : c.M;
             const int64_t a_cols = c.ta ? c.M : c.K;
@@ -2856,8 +2856,8 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
             for (auto& v : bf32) { v = rng.next_float(-1.0f, 1.0f); }
             std::vector<T> abuf(af32.size());
             std::vector<T> bbuf(bf32.size());
-            for (size_t i = 0; i < af32.size(); ++i) { abuf[i] = cast(af32[i]); }
-            for (size_t i = 0; i < bf32.size(); ++i) { bbuf[i] = cast(bf32[i]); }
+            for (size_t i = 0; i < af32.size(); ++i) { abuf[i] = cast_to<T>(af32[i]); }
+            for (size_t i = 0; i < bf32.size(); ++i) { bbuf[i] = cast_to<T>(bf32[i]); }
 
             TensorView a, b, a32, b32;
             if (c.batch) {
@@ -2889,8 +2889,8 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
             std::vector<float> want_buf(static_cast<size_t>(descs[0].numel()));
             // Seed C so a beta would be observable.
             for (size_t i = 0; i < got_buf.size(); ++i) {
-                got_buf[i] = cast(static_cast<float>(i % 17) * 0.25f);
-                want_buf[i] = to_f(got_buf[i]);
+                got_buf[i] = cast_to<T>(static_cast<float>(i % 17) * 0.25f);
+                want_buf[i] = cast_from<T>(got_buf[i]);
             }
             auto got = nnops::test::make_channel_first(descs[0], got_buf.data());
 
@@ -2904,7 +2904,7 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
             cpu::reference::matmul_ref(attrs, want, ref_ins, {}, nullptr);
 
             for (size_t i = 0; i < got_buf.size(); ++i) {
-                NNOPS_EXPECT_NEAR(to_f(got_buf[i]), want_buf[i], tol);
+                NNOPS_EXPECT_NEAR(cast_from<T>(got_buf[i]), want_buf[i], tol);
             }
         }
     };
@@ -2916,6 +2916,36 @@ NNOPS_TEST(matmul_gemv_route_layouts) {
 // ============================================================
 // The prepacked B — MatMul::prepackWeights
 // ============================================================
+
+namespace {
+
+// The two-step in one place: query with an empty view (the answer carries no
+// storage), allocate what that answer says the blob is, then hand the storage
+// back to be filled. The caller owns the buffer; the quant params ride on B,
+// since a packed B has to dequantize exactly as the raw one did.
+template <typename T>
+TensorView prepack_b(MatMul& op, TensorView b, std::vector<T>& blob) {
+    TensorView q;
+    const TensorView bq[] = {b};
+    TensorView oq[] = {q};
+    op.prepackWeights(bq, oq);
+    q = oq[0];
+    // Rank 2 separates a blob from "no packed form", which carries no storage.
+    NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
+    NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
+                    static_cast<int>(TensorLayout::PackedB));
+    NNOPS_EXPECT_TRUE(q.desc().numel() >= b.numel());
+
+    blob.assign(static_cast<size_t>(q.desc().numel()), T{});
+    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
+                      q.layout(), b.quant_params());
+    const TensorView bp[] = {b};
+    TensorView opk[] = {packed};
+    op.prepackWeights(bp, opk);
+    return packed;
+}
+
+}  // namespace
 
 NNOPS_TEST(matmul_prepacked_b) {
     namespace cpu = nnops::backend::cpu;
@@ -2940,10 +2970,6 @@ NNOPS_TEST(matmul_prepacked_b) {
         using T = decltype(dtype_tag);
         const DataType dt = std::is_same_v<T, float> ? DataType::f32
                                                     : DataType::f16;
-        const auto cast = [](float v) -> T {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::float_to_half(v); }
-        };
 
         for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
             const Case& c = cases[ci];
@@ -2953,8 +2979,8 @@ NNOPS_TEST(matmul_prepacked_b) {
             std::vector<T> av(static_cast<size_t>(c.B * c.M * c.K));
             std::vector<T> bv(static_cast<size_t>(c.K * c.N));
             nnops::test::XorShift128 rng(500 + 10 * static_cast<uint64_t>(ci));
-            for (auto& e : av) { e = cast(rng.next_float()); }
-            for (auto& e : bv) { e = cast(rng.next_float()); }
+            for (auto& e : av) { e = cast_to<T>(rng.next_float()); }
+            for (auto& e : bv) { e = cast_to<T>(rng.next_float()); }
 
             TensorView a(ashape, dt, av.data());
             TensorView b(bshape, dt, bv.data());
@@ -2975,25 +3001,10 @@ NNOPS_TEST(matmul_prepacked_b) {
             NNOPS_EXPECT_EQ(op->compute(ro, ins, {}, nullptr), Status::ok);
 
             // ---- two-step contract: query, allocate, fill
-            TensorView q;
-            const TensorView bq[] = {b};
-            TensorView oq[] = {q};
-            op->prepackWeights(bq, oq);
-            q = oq[0];
-            // A query answer carries no storage; rank separates it from "no packed form".
-            NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
-            NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
-                            static_cast<int>(TensorLayout::PackedB));
             // Leading N: what shape inference reads and the panel count is built from.
-            NNOPS_EXPECT_EQ(q.shape(0), c.N);
-            NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
-
-            std::vector<T> blob(static_cast<size_t>(q.desc().numel()));
-            TensorView packed(q.shape_span(), q.data_type(), blob.data(),
-                              q.pitch(), q.layout());
-            const TensorView bp[] = {b};
-            TensorView opk[] = {packed};
-            op->prepackWeights(bp, opk);
+            std::vector<T> blob;
+            TensorView packed = prepack_b(*op, b, blob);
+            NNOPS_EXPECT_EQ(packed.shape(0), c.N);
 
             const TensorDesc pdescs[] = {a.desc(), packed.desc()};
             const auto pod = op->getOutputTensorDesc(pdescs);
@@ -3012,13 +3023,9 @@ NNOPS_TEST(matmul_prepacked_b) {
                 continue;
             }
             const float tol = std::is_same_v<T, float> ? 1e-5f : kF16AccumTol;
-            const auto to_f = [](T v) -> float {
-                if constexpr (std::is_same_v<T, float>) { return v; }
-                else { return cpu::half_to_float(v); }
-            };
             for (size_t i = 0; i < raw.size(); ++i) {
-                const float e = to_f(raw[i]);
-                NNOPS_EXPECT_NEAR(to_f(pk[i]), e, tol * std::max(1.0f, std::abs(e)));
+                const float e = cast_from<T>(raw[i]);
+                NNOPS_EXPECT_NEAR(cast_from<T>(pk[i]), e, tol * std::max(1.0f, std::abs(e)));
             }
         }
     };
@@ -3033,8 +3040,6 @@ NNOPS_TEST(matmul_prepacked_b_n_tails) {
     // loop plus a single panel, 32 two pairs and 33 a pair plus a tail. K = 37
     // leaves a tail inside every panel too. M = 5 falls off the rung and must
     // still see one panel per call.
-    namespace cpu = nnops::backend::cpu;
-
     const int64_t Ns[] = {1, 15, 16, 17, 31, 32, 33, 40, 47, 48, 64, 65};
     const int64_t Ms[] = {1, 4, 5};
     const int64_t K = 37;
@@ -3043,14 +3048,6 @@ NNOPS_TEST(matmul_prepacked_b_n_tails) {
         using T = decltype(dtype_tag);
         const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
         const float tol = std::is_same_v<T, float> ? 1e-4f : kF16AccumTol;
-        const auto cast = [](float v) -> T {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::float_to_half(v); }
-        };
-        const auto to_f = [](T v) -> float {
-            if constexpr (std::is_same_v<T, float>) { return v; }
-            else { return cpu::half_to_float(v); }
-        };
 
         for (int64_t M : Ms) {
             for (int64_t N : Ns) {
@@ -3064,8 +3061,8 @@ NNOPS_TEST(matmul_prepacked_b_n_tails) {
                 rng.fill_float(bv.data(), K * N, -1.0f, 1.0f);
 
                 std::vector<T> avT(av.size()), bvT(bv.size());
-                for (size_t i = 0; i < av.size(); ++i) { avT[i] = cast(av[i]); }
-                for (size_t i = 0; i < bv.size(); ++i) { bvT[i] = cast(bv[i]); }
+                for (size_t i = 0; i < av.size(); ++i) { avT[i] = cast_to<T>(av[i]); }
+                for (size_t i = 0; i < bv.size(); ++i) { bvT[i] = cast_to<T>(bv[i]); }
 
                 TensorView a(ashape, dt, avT.data());
                 TensorView b(bshape, dt, bvT.data());
@@ -3086,19 +3083,8 @@ NNOPS_TEST(matmul_prepacked_b_n_tails) {
                 nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins,
                                                            {}, nullptr);
 
-                TensorView q;
-                const TensorView bq[] = {b};
-                TensorView oq[] = {q};
-                op->prepackWeights(bq, oq);
-                q = oq[0];
-                NNOPS_EXPECT_EQ(q.layout(), TensorLayout::PackedB);
-
-                std::vector<T> blob(static_cast<size_t>(q.desc().numel()));
-                TensorView packed(q.shape_span(), q.data_type(), blob.data(),
-                                  q.pitch(), q.layout());
-                const TensorView bp[] = {b};
-                TensorView opk[] = {packed};
-                op->prepackWeights(bp, opk);
+                std::vector<T> blob;
+                TensorView packed = prepack_b(*op, b, blob);
 
                 std::vector<T> out_buf(static_cast<size_t>(out_n));
                 auto out = nnops::test::make_channel_first(od[0], out_buf.data());
@@ -3107,7 +3093,7 @@ NNOPS_TEST(matmul_prepacked_b_n_tails) {
 
                 for (int64_t i = 0; i < out_n; ++i) {
                     const float e = ref[static_cast<size_t>(i)];
-                    NNOPS_EXPECT_NEAR(to_f(out_buf[static_cast<size_t>(i)]), e,
+                    NNOPS_EXPECT_NEAR(cast_from<T>(out_buf[static_cast<size_t>(i)]), e,
                                       tol * std::max(1.0f, std::abs(e)));
                 }
             }
@@ -3199,23 +3185,9 @@ NNOPS_TEST(matmul_prepacked_b_int8) {
         const TensorView ins[] = {a, b};
         NNOPS_EXPECT_EQ(op->compute(raw, ins, {}, nullptr), Status::ok);
 
-        TensorView q;
-        const TensorView bq[] = {b};
-        TensorView oq[] = {q};
-        op->prepackWeights(bq, oq);
-        q = oq[0];
-        NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
-        NNOPS_EXPECT_EQ(static_cast<int>(q.layout()),
-                        static_cast<int>(TensorLayout::PackedB));
-        NNOPS_EXPECT_EQ(q.shape(0), c.N);
-        NNOPS_EXPECT_TRUE(q.desc().numel() >= c.N * c.K);
-
-        std::vector<int8_t> blob(static_cast<size_t>(q.desc().numel()));
-        TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
-                          q.layout(), b.quant_params());
-        const TensorView bp[] = {b};
-        TensorView opk[] = {packed};
-        op->prepackWeights(bp, opk);
+        std::vector<int8_t> blob;
+        TensorView packed = prepack_b(*op, b, blob);
+        NNOPS_EXPECT_EQ(packed.shape(0), c.N);
 
         const TensorView pins[] = {a, packed};
         NNOPS_EXPECT_EQ(op->compute(pk, pins, {}, nullptr), Status::ok);
@@ -3237,18 +3209,8 @@ NNOPS_TEST(matmul_prepacked_b_int8_rejects_u8_activation) {
                               bias_per_tensor(0.004f, 0));
 
     auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
-    TensorView q;
-    const TensorView bq[] = {b};
-    TensorView oq[] = {q};
-    op->prepackWeights(bq, oq);
-    q = oq[0];
-    NNOPS_EXPECT_EQ(q.rank(), int64_t(2));
-
-    std::vector<int8_t> blob(static_cast<size_t>(q.desc().numel()));
-    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
-                      q.layout(), b.quant_params());
-    TensorView opk[] = {packed};
-    op->prepackWeights(bq, opk);
+    std::vector<int8_t> blob;
+    TensorView packed = prepack_b(*op, b, blob);
 
     const int64_t oshape[] = {4, 16};
     std::vector<int32_t> obuf(static_cast<size_t>(4 * 16));
@@ -3262,18 +3224,8 @@ NNOPS_TEST(matmul_prepacked_b_contract_errors) {
     auto [bv, b] = test::make_random_tensor({37, 19}, -1.0f, 1.0f, 61);
 
     auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
-    TensorView q;
-    const TensorView bq[] = {b};
-    TensorView oq[] = {q};
-    op->prepackWeights(bq, oq);
-    q = oq[0];
-
-    std::vector<float> blob(static_cast<size_t>(q.desc().numel()));
-    TensorView packed(q.shape_span(), q.data_type(), blob.data(), q.pitch(),
-                      q.layout());
-    const TensorView bp[] = {b};
-    TensorView opk[] = {packed};
-    op->prepackWeights(bp, opk);
+    std::vector<float> blob;
+    TensorView packed = prepack_b(*op, b, blob);
 
     // The blob carries no K (only N), so a mismatched-K compute is refused
     // rather than reading past the panels.

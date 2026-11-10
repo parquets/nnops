@@ -416,10 +416,13 @@ struct SimplePool {
 namespace {
 
 /// Fast path vs reference: true iff every output agrees within (rtol, atol).
+/// @p ref_attrs overrides the attributes the reference sees, for the cases where
+/// the operator transforms them first (auto_pad resolves to explicit padding).
 bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
                         const TensorView& input, const TensorView& weight,
                         const TensorView* bias,
-                        float rtol, float atol)
+                        float rtol, float atol,
+                        const Conv2DAttributes* ref_attrs = nullptr)
 {
     std::vector<TensorDesc> descs = {input.desc(), weight.desc()};
     std::vector<TensorView> ins   = {input, weight};
@@ -438,7 +441,8 @@ bool conv2d_fast_vs_ref(const Conv2DAttributes& attrs,
 
     std::vector<float> ref_buf(static_cast<size_t>(out_numel));
     auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
-    nnops::backend::cpu::reference::conv2d_ref(attrs, ref_out, ins, {}, nullptr);
+    nnops::backend::cpu::reference::conv2d_ref(ref_attrs ? *ref_attrs : attrs,
+                                               ref_out, ins, {}, nullptr);
 
     for (int64_t i = 0; i < out_numel; ++i) {
         const float diff = std::abs(fast_buf[i] - ref_buf[i]);
@@ -2221,25 +2225,13 @@ NNOPS_TEST(conv2d_auto_pad_resolution) {
         auto_a.groups      = c.groups;
         auto_a.auto_pad    = c.ap;
 
-        auto op = Conv2D::create(auto_a, Backend::CPU);
-        std::vector<TensorView> ins = {input, weight};
-        if (c.bias) { ins.push_back(bias); }
-        std::vector<TensorDesc> descs;
-        for (const auto& v : ins) { descs.push_back(v.desc()); }
-        const auto od = op->getOutputTensorDesc(descs);
-
-        std::vector<float> out_buf(static_cast<size_t>(od[0].numel()));
-        auto out = test::make_channel_first(od[0], out_buf.data());
-        NNOPS_EXPECT_EQ(op->compute(out, ins, {}, nullptr), Status::ok);
-
         Conv2DAttributes resolved = auto_a;
         resolved.auto_pad = Conv2DAttributes::AutoPad::NOTSET;
         resolved.padding  = {c.ph, c.pw};
-        std::vector<float> ref_buf(out_buf.size());
-        auto ref = test::make_channel_first(od[0], ref_buf.data());
-        nnops::backend::cpu::reference::conv2d_ref(resolved, ref, ins, {}, nullptr);
 
-        NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-3f, 1e-4f));
+        const TensorView* bp = c.bias ? &bias : nullptr;
+        NNOPS_EXPECT_TRUE(
+            conv2d_fast_vs_ref(auto_a, input, weight, bp, 1e-3f, 1e-4f, &resolved));
     }
 }
 
