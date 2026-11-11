@@ -1,20 +1,21 @@
 #pragma once
-/// @file tconv_row.h
+/// @file simd_tconv_row.hpp
 /// @brief The row primitives both transposed-conv kernels accumulate with — one
 ///        contiguous run added, added as int32, FMA'd or filled, a vector at a
-///        time — and the merge that turns an accumulated channel-last row into
-///        output.
+///        time.
 ///
-/// Every route — channel-first, channel-last, depthwise, 2-D or 3-D — reduces to
-/// "add this tap's run into that row", so these are the leaves of all of them.
+/// Every route of the operator — channel-first, channel-last, depthwise, 2-D or
+/// 3-D, fp or int8 — reduces to "add this tap's run into that row", so these are
+/// the leaves of all of them. The walks that produce the runs are
+/// simd_col2im.hpp; the merge that ends a channel-last row is route glue and
+/// lives in conv/tconv_cl.h.
 
 #include "nnops/detail/simd/simd.hpp"
-#include "backend/cpu/simd_kernel/simd_epilogue.hpp"
-#include "backend/cpu/simd_kernel/simd_permute.hpp"
+#include "simd_permute.hpp"
 
 #include <cstdint>
 
-namespace nnops::backend::cpu {
+namespace nnops::kernel {
 
 using namespace nnops::simd;
 
@@ -96,43 +97,7 @@ void row_fill(T* dst, int64_t n, float v)
 template <typename T>
 void permute_taps(const T* src, T* dst, int64_t rows, int64_t taps)
 {
-    nnops::kernel::tiled_transpose_2d(src, dst, rows, taps, taps, rows);
+    tiled_transpose_2d(src, dst, rows, taps, taps, rows);
 }
 
-/// Merge one channel-last scratch row into the output: bias, then the
-/// pre-activation residual, the epilogue and add_to, over `nc` of the row's
-/// channels starting at @p oc_base. The caller has this row to itself, which is
-/// what keeps add_to's original value — this is the only read and the only write.
-///
-/// `gm` is duck-typed on OW, OC, epilogue, pre_act and add_to, so the 2-D and
-/// 3-D geometries both fit without either kernel learning the other's type.
-template <typename T, typename G>
-void merge_oc_row(T* orow, const T* row, const T* bias, int64_t oc_base,
-                  const G& gm, int64_t nc)
-{
-    const T* type_tag = nullptr;
-    constexpr int L = simd_lane_for<T>;
-    for (int64_t ow = 0; ow < gm.OW; ++ow) {
-        const T* rp = row + ow * nc;
-        T* dp = orow + ow * gm.OC;
-        int64_t c = 0;
-        for (; c + L <= nc; c += L) {
-            vec_for<T> acc = v_load(rp + c);
-            if (bias) { acc = v_add(acc, v_load(bias + oc_base + c)); }
-            if (gm.pre_act) { acc = v_add(acc, v_load(dp + c)); }
-            acc = apply_epilogue_vec<T>(gm.epilogue, type_tag, acc);
-            if (gm.add_to && !gm.pre_act) { acc = v_add(acc, v_load(dp + c)); }
-            v_store(dp + c, acc);
-        }
-        for (; c < nc; ++c) {
-            float v = s_load(rp + c);
-            if (bias) { v += s_load(bias + oc_base + c); }
-            if (gm.pre_act) { v += s_load(dp + c); }
-            v = nnops::apply_epilogue(gm.epilogue, v, oc_base + c);
-            if (gm.add_to && !gm.pre_act) { v += s_load(dp + c); }
-            s_store(dp + c, v);
-        }
-    }
-}
-
-}  // namespace nnops::backend::cpu
+}  // namespace nnops::kernel

@@ -49,8 +49,8 @@
 /// is correct for every shape.
 
 #include "nnops/ops/transpose_conv2d.hpp"
-#include "backend/cpu/conv/tconv_row.h"
-#include "backend/cpu/conv/transpose_conv2d_col2im.h"
+#include "backend/cpu/conv/tconv_cl.h"
+#include "backend/cpu/simd_kernel/simd_col2im.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
@@ -66,6 +66,7 @@
 namespace nnops::backend::cpu {
 
 using namespace nnops::simd;
+using namespace nnops::kernel;
 
 namespace {
 
@@ -85,9 +86,6 @@ struct Geom {
         return make_col_geom(IH, IW, OW, KH, KW, SH, SW, DH, DW, PH, PW);
     }
 };
-
-/// Largest col one GEMM call may materialise; past it the M rows are split.
-constexpr int64_t kColCapBytes = 8 << 20;
 
 /// Channel-first through a col matrix — the onnxruntime route. Returns false when the
 /// operands cannot be read as flat matrices, leaving the caller its scalar path.
@@ -211,9 +209,9 @@ bool tconv2d_channel_first_gemm(const Geom& gm,
 
 /// Depthwise channel-last. One channel per group means group g's input channel
 /// is output channel g, so the vector axis is the channel itself: an output
-/// pixel accumulates the whole C-wide tap vector at once. The filter is
-/// repacked to [KH·KW][C] so a tap is one contiguous vector. Returns false for
-/// anything that is not depthwise, or when the row scratch would not fit.
+/// pixel accumulates the whole C-wide tap vector at once, and the "col" the
+/// scatter reads is the input plane. The skeleton — the repack to [KH·KW][C],
+/// the row scratch, the merge — is tconv_cl.h's; only the walk is 2-D.
 template <typename T>
 bool tconv2d_channel_last_depthwise(const Geom& gm,
                                     TensorView& output,
@@ -224,141 +222,21 @@ bool tconv2d_channel_last_depthwise(const Geom& gm,
 
     const auto& input  = inputs[0];
     const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
 
     if (weight.row_stride_elems() != gm.KW) { return false; }
     if (input.row_stride_elems() != gm.IW * gm.IC) { return false; }
 
-    const int64_t karea   = gm.KH * gm.KW;
-    const int64_t C       = gm.IC;
-    const int64_t slots   = std::max(1, ctx.cpu.worker_count());
-    const int64_t row_len = gm.OW * C;
-
-    const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
-    if (slots * row_len > elem_cap) { return false; }
-
-    PoolArray<T> wd(static_cast<size_t>(karea * C));
-    PoolArray<T> rows(static_cast<size_t>(slots * row_len));
-    if (!wd || !rows) { return false; }
-
-    const auto* w_ptr = weight.ptr<T>();
-    permute_taps(w_ptr, wd.data(), C, karea);
-
-    const auto* in_ptr = input.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
-    auto* out_ptr = output.ptr<T>();
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_row_stride = output.row_stride_elems();
-    const Tconv2dColGeom cg      = gm.col_geom();
-
-    ctx.cpu.run(0, gm.N * gm.OH, [&](int64_t task) {
-        const int64_t n  = task / gm.OH;
-        const int64_t oh = task % gm.OH;
-        T* row = rows.data() +
-                 static_cast<int64_t>(ctx.cpu.current_thread_id()) * row_len;
-        const T* in_n = in_ptr + n * in_n_stride;
-
-        row_fill(row, row_len, 0.0f);
-
-        // The "col" is the input plane itself: one channel per group means the
-        // tap indexes the repacked filter, not a source stride.
-        tconv2d_col2im_pixel_major<T>(
-            cg, in_n, gm.IC, C, 0, row, oh,
-            [&](T* dst, const T* src, int64_t len, int64_t tap) {
-                row_fma(dst, src, wd.data() + tap * C, len);
-            });
-
-        T* orow = out_ptr + n * out_n_stride + oh * out_row_stride;
-        merge_oc_row(orow, row, b_ptr, 0, gm, C);
-    });
-    return true;
-}
-
-/// One channel-last col GEMM call, resolved to flat operands: the chunk walk
-/// below varies only the group and the oc chunk.
-template <typename T>
-struct ClCall {
-    const Geom& gm;
-    Tconv2dColGeom cg;
-    const T *in, *w, *b;
-    T *out, *col, *aux, *rows;
-    DataType vdt;
-    int64_t icg, ocg, npix, karea;
-    int64_t in_n_stride, out_n_stride, out_row_stride;
-    bool direct_w;
-};
-
-/// One oc chunk: B for the chunk — the filter as [IC/G] × [KH·KW·nc], permuted,
-/// or the channel-first rows read in place with oc still the faster axis — then
-/// per batch item the GEMM, the direct-weight col transpose, and the scatter and
-/// merge of each output row.
-template <typename T>
-void tconv2d_cl_chunk(const ClCall<T>& c, const ComputeContext& ctx,
-                      int64_t g, int64_t oc0, int64_t nc)
-{
-    const int64_t m = nc * c.karea;
-
-    if (!c.direct_w) {
-        // A blocked transpose of the channel-first [IC/G][OC/G][KH·KW] rows.
-        for (int64_t ic = 0; ic < c.icg; ++ic) {
-            const T* src = c.w + ((g * c.icg + ic) * c.ocg + oc0) * c.karea;
-            permute_taps(src, c.aux + ic * c.karea * nc, nc, c.karea);
-        }
-    }
-
-    const int64_t bshape[] = {c.icg, m};
-    TensorView bm(std::span<const int64_t>(bshape, 2), c.vdt,
-                  c.direct_w
-                      ? const_cast<T*>(c.w + (g * c.icg * c.ocg + oc0) * c.karea)
-                      : c.aux,
-                  (c.direct_w ? c.ocg * c.karea : m) * sizeof(T),
-                  TensorLayout::NCHW);
-
-    for (int64_t n = 0; n < c.gm.N; ++n) {
-        const T* in_n = c.in + n * c.in_n_stride;
-        T* out_n = c.out + n * c.out_n_stride;
-
-        // A: the channel-last image as [IH·IW] × [IC/G] pixels — one pixel
-        // stride of IC, so the group offset is g·IC/G elements in.
-        const int64_t ashape[] = {c.npix, c.icg};
-        TensorView am(std::span<const int64_t>(ashape, 2), c.vdt,
-                      const_cast<T*>(in_n + g * c.icg),
-                      static_cast<int64_t>(c.gm.IC * sizeof(T)),
-                      TensorLayout::NCHW);
-        const int64_t cshape[] = {c.npix, m};
-        TensorView cm(std::span<const int64_t>(cshape, 2), c.vdt, c.col,
-                      static_cast<int64_t>(m * sizeof(T)), TensorLayout::NCHW);
-
-        const TensorView mins[] = {am, bm};
-        const MatMulAttributes mm{};
-        matmul_cpu(mm, cm, mins, ctx, nullptr);
-
-        const T* cbase = c.col;
-        if (c.direct_w) {
-            // Per pixel, [oc][tap] → [tap][oc], so the scatter sees the same
-            // col either way.
-            for (int64_t p = 0; p < c.npix; ++p) {
-                permute_taps(c.col + p * m, c.aux + p * m, nc, c.karea);
-            }
-            cbase = c.aux;
-        }
-
-        ctx.cpu.run(0, c.gm.OH, [&](int64_t oh) {
-            T* row = c.rows + static_cast<int64_t>(ctx.cpu.current_thread_id()) *
-                                   (c.gm.OW * nc);
-            row_fill(row, c.gm.OW * nc, 0.0f);
-
+    const Tconv2dColGeom cg = gm.col_geom();
+    return tconv_cl_depthwise<T>(
+        gm, output, inputs, ctx, gm.OH, gm.KH * gm.KW, gm.IC,
+        [cg](const T* src, T* row, int64_t oh, const T* wd, int64_t m, int64_t nc) {
+            // The tap indexes the repacked filter, not a source stride.
             tconv2d_col2im_pixel_major<T>(
-                c.cg, cbase, m, nc, nc, row, oh,
-                [](T* dst, const T* src, int64_t len, int64_t) {
-                    row_add(dst, src, len);
+                cg, src, m, nc, 0, row, oh,
+                [wd, nc](T* dst, const T* s, int64_t len, int64_t tap) {
+                    row_fma(dst, s, wd + tap * nc, len);
                 });
-
-            T* orow = out_n + oh * c.out_row_stride + g * c.ocg + oc0;
-            merge_oc_row(orow, row, c.b, g * c.ocg + oc0, c.gm, nc);
         });
-    }
 }
 
 /// Channel-last through a col matrix — onnxruntime's channels-last structure,
@@ -367,6 +245,7 @@ void tconv2d_cl_chunk(const ClCall<T>& c, const ComputeContext& ctx,
 /// once per group instead of once per pixel tile, and a stride-residue scatter
 /// then adds whole oc vectors out of the col. That pass over the filter is the
 /// entire point on a layer where the pixel kernel's re-read goes to DRAM.
+/// The chunk skeleton is tconv_cl.h's; only the walk is 2-D.
 /// Returns false when the operands cannot be read as flat matrices.
 template <typename T>
 bool tconv2d_channel_last_gemm(const Geom& gm,
@@ -376,22 +255,12 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
 {
     const auto& input  = inputs[0];
     const auto& weight = inputs[1];
-    const bool has_bias = inputs.size() > 2;
 
     if (weight.row_stride_elems() != gm.KW) { return false; }
     if (input.row_stride_elems() != gm.IW * gm.IC) { return false; }
 
-    const int64_t karea = gm.KH * gm.KW;
-    const int64_t npix  = gm.IH * gm.IW;
-    const int64_t icg   = gm.IC_per_G;
-    const int64_t ocg   = gm.OC_per_G;
-    if (npix <= 0 || karea <= 0 || icg <= 0) { return false; }
-
-    const int64_t in_n_stride    = input.stride_elems(0);
-    const int64_t out_n_stride   = output.stride_elems(0);
-    const int64_t out_row_stride = output.row_stride_elems();
-    const int64_t slots          = std::max(1, ctx.cpu.worker_count());
-    const Tconv2dColGeom cg      = gm.col_geom();
+    const int64_t npix = gm.IH * gm.IW;
+    if (npix <= 0 || gm.KH * gm.KW <= 0 || gm.IC_per_G <= 0) { return false; }
 
     // Two col orientations. Ordered [tap][oc] the GEMM needs the filter
     // permuted to [IC/G][KH·KW·OC/G], but the col feeds the scatter as it is.
@@ -399,39 +268,18 @@ bool tconv2d_channel_last_gemm(const Geom& gm,
     // in the channel-first weight already — and the col pays a transpose instead, per
     // batch item. One of the two is walked twice either way, so walk the
     // smaller: the filter once, or the col per batch item.
-    const bool direct_w = npix * gm.N < icg;
+    const bool direct_w = npix * gm.N < gm.IC_per_G;
 
-    // The col and the per-worker row scratch both scale with the oc chunk.
-    const int64_t elem_cap = kColCapBytes / static_cast<int64_t>(sizeof(T));
-    const int64_t cap = direct_w ? elem_cap / 2 : elem_cap;
-    int64_t cc = ocg;
-    cc = std::min(cc, std::max<int64_t>(1, cap / (npix * karea)));
-    cc = std::min(cc, std::max<int64_t>(1, cap / (slots * gm.OW)));
-
-    PoolArray<T> col(static_cast<size_t>(npix * karea * cc));
-    PoolArray<T> aux(static_cast<size_t>((direct_w ? npix : icg) * karea * cc));
-    PoolArray<T> rows(static_cast<size_t>(slots * gm.OW * cc));
-    if (!col || !aux || !rows) { return false; }
-
-    const auto* in_ptr = input.ptr<T>();
-    const auto* w_ptr  = weight.ptr<T>();
-    const auto* b_ptr  = has_bias ? inputs[2].ptr<T>() : nullptr;
-    auto* out_ptr = output.ptr<T>();
-    const DataType vdt = input.data_type();
-
-    const ClCall<T> call{gm,         cg,       in_ptr,   w_ptr,
-                         b_ptr,      out_ptr,  col.data(), aux.data(),
-                         rows.data(), vdt,     icg,      ocg,
-                         npix,       karea,    in_n_stride, out_n_stride,
-                         out_row_stride, direct_w};
-
-    for (int64_t g = 0; g < gm.G; ++g) {
-        for (int64_t oc0 = 0; oc0 < ocg; oc0 += cc) {
-            const int64_t nc = std::min(cc, ocg - oc0);
-            if (nc > 0) { tconv2d_cl_chunk(call, ctx, g, oc0, nc); }
-        }
-    }
-    return true;
+    const Tconv2dColGeom cg = gm.col_geom();
+    return tconv_cl_route<T>(
+        gm, output, inputs, ctx, npix, gm.OH, gm.KH * gm.KW, direct_w,
+        [cg](const T* col, T* row, int64_t oh, int64_t m, int64_t nc) {
+            tconv2d_col2im_pixel_major<T>(
+                cg, col, m, nc, nc, row, oh,
+                [](T* dst, const T* src, int64_t len, int64_t) {
+                    row_add(dst, src, len);
+                });
+        });
 }
 
 // =========================================================================
