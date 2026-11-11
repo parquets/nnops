@@ -46,6 +46,7 @@ inline auto load_lanes(const T* p, int64_t lanes)
 template <typename T, bool Full = true>
 struct FpSrc {
     using elem = T;
+    static constexpr bool full = Full;  ///< a whole channel vector, so no lane masks
     const T* in;    // also picks the v_set1/v_zero overload
     int64_t lanes = kChannelLanes;
 
@@ -67,6 +68,7 @@ struct FpSrc {
 template <typename InT, bool Full = true>
 struct QuantSrc {
     using elem = InT;
+    static constexpr bool full = Full;  ///< a whole channel vector, so no lane masks
     const InT* in;
     float scale, zero_pt;
     int64_t lanes = kChannelLanes;

@@ -229,9 +229,13 @@ inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
 
             output += 4 * 4;
         } else {
+            // A lane past the live row count repeats the last live row, not
+            // zero: the packed-A MMA loads all four lanes and stores rung-wide,
+            // its surplus C rows aliasing the last live one, so a zero lane
+            // would overwrite that row's sum (see walk_levels' short panels).
             for (int j = 0; j < 4; ++j) {
                 for (int i = 0; i < 4; ++i) {
-                    output[i] = (i < nr) ? input[j * ir_step + i] * scale : 0.0f;
+                    output[i] = input[j * ir_step + (i < nr ? i : nr - 1)] * scale;
                 }
                 output += 4;
             }
@@ -240,7 +244,7 @@ inline void pack_copy_n4_f32(float* NNOPS_RESTRICT output,
     }
     for (; k < K; ++k) {
         for (int i = 0; i < 4; ++i) {
-            *output++ = (i < nr) ? input[i] * scale : 0.0f;
+            *output++ = input[i < nr ? i : nr - 1] * scale;
         }
         input += ir_step;
     }
@@ -286,9 +290,10 @@ inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
 
             output += 4 * 8;
         } else {
+            // Surplus lanes repeat the last live row (see pack_copy_n4_f32).
             for (int j = 0; j < 4; ++j) {
                 for (int i = 0; i < 8; ++i) {
-                    output[i] = (i < nr) ? input[j * ir_step + i] * scale : 0.0f;
+                    output[i] = input[j * ir_step + (i < nr ? i : nr - 1)] * scale;
                 }
                 output += 8;
             }
@@ -297,7 +302,7 @@ inline void pack_copy_n8_f32(float* NNOPS_RESTRICT output,
     }
     for (; k < K; ++k) {
         for (int i = 0; i < 8; ++i) {
-            *output++ = (i < nr) ? input[i] * scale : 0.0f;
+            *output++ = input[i < nr ? i : nr - 1] * scale;
         }
         input += ir_step;
     }

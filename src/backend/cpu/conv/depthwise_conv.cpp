@@ -109,6 +109,19 @@ void dwconv_impl(
     const k::DwChannelFirstEdges edges =
         k::dwconv_channel_first_edge_masks<kMaskMaxKw, T>(p, edge_masks, edge_needed);
 
+    // The masked load is a whole vector even in a row's edge vector, so its
+    // surplus lanes are the neighbouring rows' elements — and past the last
+    // row, the next plane's; the first vector's left lane likewise reaches into
+    // the previous plane. In bounds only while the tensor has the elements to
+    // back it: `mask_hi` bounds the deepest element a masked load can touch,
+    // relative to the block base, and `mask_lo` how far before it the load can
+    // start. A block the tensor cannot back keeps the checked path.
+    const int64_t mask_span = (SW == 2) ? 2 * kMaskLanes : kMaskLanes;
+    const int64_t mask_last_ow = ((OW + kMaskLanes - 1) / kMaskLanes - 1) * kMaskLanes;
+    const int64_t mask_hi = (ID - 1) * in_d_stride + (IH - 1) * in_row_stride +
+                            mask_last_ow * SW + (KW - 1) * DW - PW + mask_span;
+    const int64_t mask_lo = PW;
+
     // At most one of the two: the pre-activation order folds the destination
     // into the accumulator, so nothing is left for the post-epilogue add.
     const bool pre_act = attrs.add_to && attrs.residual_pre_activation;
@@ -126,9 +139,12 @@ void dwconv_impl(
 
         // The masked load reaches into the neighbouring row, harmlessly, since
         // those lanes are masked to zero — except at the tensor's first and
-        // last row blocks, which keep the bounds-checked path.
+        // last row blocks, and where the block's remaining planes cannot back
+        // the read, which keep the bounds-checked path.
         k::DwChannelFirstEdges blk_edges = edges;
-        if ((n == 0 && blk == 0) || (n == N - 1 && blk == blocks - 1)) {
+        if ((n == 0 && blk == 0) || (n == N - 1 && blk == blocks - 1) ||
+            mask_hi > (blocks - blk) * in_ch_stride ||
+            mask_lo > (n * blocks + blk) * in_ch_stride) {
             blk_edges.masks = nullptr;
         }
 

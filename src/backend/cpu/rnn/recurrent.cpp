@@ -196,7 +196,7 @@ Status prepare_run(const RecurrentParams& p, std::span<TensorView> outputs,
     run.seq_len = (inputs.size() > 4 && !inputs[4].is_empty())
                       ? inputs[4].ptr<int32_t>() : nullptr;
 
-    run.y_base = run.y.is_empty() ? nullptr : run.y.ptr<T>();
+    run.y_base = run.y.is_empty() ? nullptr : run.y.template ptr<T>();
     run.y_stride = run.y.is_empty() ? 0 : run.y.row_stride_elems();
     run.x_rows = run.x->row_stride_elems();
     // An s8 activation carries its own per-row table; a floating one is
@@ -209,7 +209,7 @@ Status prepare_run(const RecurrentParams& p, std::span<TensorView> outputs,
     // the bias vectors — so the packing scratch disappears with it.
     if (is_packed_recurrent(run.w->layout())) {
         const int64_t esz = static_cast<int64_t>(sizeof(T));
-        const char* blob = reinterpret_cast<const char*>(run.w->ptr<T>());
+        const char* blob = reinterpret_cast<const char*>(run.w->template ptr<T>());
         const auto* h = reinterpret_cast<const RecurrentPackedHeader*>(blob);
         if (h->magic != kRecurrentPackedMagic || h->version != kRecurrentPackedVersion ||
             h->elem_size != (run.q8 ? int64_t{1} : esz) ||
@@ -399,7 +399,7 @@ void pack_fp_weights(const Run<T>& run, int64_t d, Arena& arena,
     // W: every phase's gate rows into one matrix, then one pack.
     for (int64_t ph = 0; ph < plan.nphases; ++ph) {
         const PhaseGeom& g = plan.phase[ph];
-        interleave_gates(run.w->ptr<T>(static_cast<size_t>(d * run.G * run.H)),
+        interleave_gates(run.w->template ptr<T>(static_cast<size_t>(d * run.G * run.H)),
                          run.w->row_stride_elems(), run.H, run.I, g.gates,
                          phase_gate_offset(run.p.mode, run.lbr, ph),
                          raw + plan.col_base[ph] * run.I);
@@ -416,14 +416,14 @@ void pack_fp_weights(const Run<T>& run, int64_t d, Arena& arena,
 
     // The bias is [D, 2·G·H], so direction d is row d — `ptr` counts rows, and
     // each row is already the whole of one direction.
-    const T* wb = run.bias ? run.bias->ptr<T>(static_cast<size_t>(d)) : nullptr;
+    const T* wb = run.bias ? run.bias->template ptr<T>(static_cast<size_t>(d)) : nullptr;
     const T* rb = wb ? wb + run.G * run.H : nullptr;
 
     for (int64_t ph = 0; ph < plan.nphases; ++ph) {
         const PhaseGeom& g = plan.phase[ph];
         const int64_t gate_off = phase_gate_offset(run.p.mode, run.lbr, ph);
 
-        interleave_gates(run.r->ptr<T>(static_cast<size_t>(d * run.G * run.H)),
+        interleave_gates(run.r->template ptr<T>(static_cast<size_t>(d * run.G * run.H)),
                          run.r->row_stride_elems(), run.H, run.H, g.gates, gate_off, raw);
         {
             int64_t sh[2] = {g.cols, run.H};
@@ -619,7 +619,7 @@ void run_direction(const Run<T>& run, int64_t d, void* base, size_t bytes,
                                 nrows * run.B, run.plan.proj_mc, run.plan.proj_nc,
                                 run.x_scales, qs, ctx);
         } else {
-            project_chunk<T>(run.x->ptr<T>(static_cast<size_t>(t0 * run.B)),
+            project_chunk<T>(run.x->template ptr<T>(static_cast<size_t>(t0 * run.B)),
                              run.x_rows, ds.in_proj, run.ldc, dw.w,
                              run.plan.wgeo.ldd, run.plan.wgeo.nr, nrows * run.B,
                              run.plan.total_cols, run.I, run.plan.kc,

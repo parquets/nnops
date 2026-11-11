@@ -2959,7 +2959,11 @@ NNOPS_TEST(matmul_prepacked_b) {
         {1,  5,   37,  19, false, true},   // tails on both axes
         {1,  5,   37,  19, true,  true},   // the same product, B stored [N, K]
         {1,  1,    8,   5, true,  false},  // 40 MACs: the raw B takes the naive small kernel
-        {1,  1,   64,  64, false, true},   // M=1 over several panels: the 1-row kernel pairs them
+        // 17 rows leave a 1-row tail panel on both ABIs (17 = 8+8+1, 6+6+4+1),
+        // where the 1-row kernel pairs two packed panels. M must exceed
+        // GEMV_M_MAX so the raw B takes the tiled GEMM too: at M <= 4 the raw B
+        // is a GEMV, and f16 only agrees approximately with the tiled route.
+        {1, 17,   64,  64, false, true},
         {1,  1,   96,  40, true,  false},  // the same, with a k off the pack width and a tail panel
         {3, 16,  300,  48, false, true},   // batched A, several k-blocks
         {2, 64,  256,  96, true,  true},   // a layer shape, B broadcast

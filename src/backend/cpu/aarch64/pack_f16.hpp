@@ -230,10 +230,12 @@ inline void pack_copy_n4_f16(float16_t* NNOPS_RESTRICT output,
 
             output += 4 * 4;
         } else {
+            // Surplus lanes repeat the last live row, not zero: the packed-A
+            // MMA loads all four lanes and stores rung-wide, its surplus C rows
+            // aliasing the last live one (see walk_levels' short panels).
             for (int j = 0; j < 4; ++j) {
                 for (int i = 0; i < 4; ++i) {
-                    output[i] = (i < nr) ? input[j * ir_step + i] * s
-                                         : static_cast<float16_t>(0.0f);
+                    output[i] = input[j * ir_step + (i < nr ? i : nr - 1)] * s;
                 }
                 output += 4;
             }
@@ -242,7 +244,7 @@ inline void pack_copy_n4_f16(float16_t* NNOPS_RESTRICT output,
     }
     for (; k < K; ++k) {
         for (int i = 0; i < 4; ++i) {
-            *output++ = (i < nr) ? input[i] * s : static_cast<float16_t>(0.0f);
+            *output++ = input[i < nr ? i : nr - 1] * s;
         }
         input += ir_step;
     }
@@ -269,8 +271,9 @@ inline void pack_copy_n8_f16(float16_t* NNOPS_RESTRICT output,
         if (nr >= 8) {
             vst1q_f16(output, vmulq_n_f16(vld1q_f16(input), s));
         } else {
+            // Surplus lanes repeat the last live row (see pack_copy_n4_f16).
             for (int i = 0; i < 8; ++i) {
-                output[i] = (i < nr) ? input[i] * s : static_cast<float16_t>(0.0f);
+                output[i] = input[i < nr ? i : nr - 1] * s;
             }
         }
         output += 8;

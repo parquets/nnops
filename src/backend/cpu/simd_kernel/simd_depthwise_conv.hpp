@@ -43,7 +43,8 @@
 /// edge vectors take a lane mask instead, folded into the tap's broadcast weight;
 /// those lanes are real tensor neighbours, not zeros, so a non-finite value there
 /// would reach the FMA as 0 * NaN, and the driver nulls the mask for the tensor's
-/// first and last channel block.
+/// first and last channel block and for any block whose neighbouring planes
+/// cannot back a whole-vector read.
 ///
 /// The channel-last 3x3 kernels hold the nine taps in registers —
 /// `dwconv_last3x3` for one channel vector, `dwconv_last3x3_16` for two, which
@@ -98,6 +99,15 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
     const int64_t wtap = p.w_tap_stride;
     constexpr int64_t kVec = kChannelLanes;
     constexpr int64_t kMaxTapRows = 256;  // (kd, kh, r): 8x8 with R = 4 fits
+
+    // A short channel block's filter is short too: the last tap of the raw HWCM
+    // weight ends at C, so a whole-vector read there would run past the filter.
+    // The activation's live lanes are zero past `lanes`, so the lanes the weight
+    // read must not touch contribute nothing.
+    const auto load_w = [&](const W* wp) -> V {
+        if constexpr (Src::full) { return v_load(wp); }
+        else { return load_lanes(wp, srcs[0].lanes); }
+    };
 
     // The row table is built from vector 0's base, so vector k adds k*kVec to it.
     const int64_t nrow = p.KD * p.KH;
@@ -164,7 +174,7 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                     for (int64_t kw = 0; kw < p.KW; ++kw) {
                         const int64_t at = (ow_off + kw * p.DW) * pix;
                         for (int k = 0; k < NV; ++k) {
-                            const V vk = v_load(w_row + kw * wtap + k * kVec);
+                            const V vk = load_w(w_row + kw * wtap + k * kVec);
                             for (int r = 0; r < R; ++r) {
                                 acc[r][k] = v_fmadd(srcs[k].load_ptr(row[r] + at + k * kVec), vk,
                                                     acc[r][k]);
@@ -181,7 +191,7 @@ inline void dwconv_rows(const DwConvParams& p, const W* w, const Tag* tag,
                     }
                     const int64_t at = off * pix;
                     for (int k = 0; k < NV; ++k) {
-                        const V vk = v_load(w_row + kw * wtap + k * kVec);
+                        const V vk = load_w(w_row + kw * wtap + k * kVec);
                         for (int r = 0; r < R; ++r) {
                             if (row[r] == nullptr) {
                                 continue;
