@@ -10,6 +10,7 @@ set(TEST_SOURCES
     test_conv2d_winograd.cpp
     test_conv2d_int8.cpp
     test_conv2d_channel_last.cpp
+    test_conv3d.cpp
     test_activation.cpp
     test_pooling.cpp
     test_linear.cpp
@@ -73,6 +74,7 @@ add_library(nnops_test_reference STATIC
     reference/concat_ref.cpp
     reference/conv2d_int8_ref.cpp
     reference/conv2d_ref.cpp
+    reference/conv3d_ref.cpp
     reference/depthwise_conv_ref.cpp
     reference/depthwise_transpose_conv_ref.cpp
     reference/depthwise_transpose_conv_int8_ref.cpp
@@ -158,6 +160,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_linear.cpp
         bench_conv2d.cpp
         bench_conv2d_channel_last.cpp
+        bench_conv3d.cpp
         bench_transpose_conv2d.cpp
         bench_transpose_conv3d.cpp
         bench_depthwise.cpp
