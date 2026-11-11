@@ -37,6 +37,7 @@ set(NNOPS_CPU_SOURCES
     ops/rope.cpp
     ops/flatten.cpp
     ops/transpose_conv2d.cpp
+    ops/transpose_conv3d.cpp
     ops/conv1d.cpp
     ops/pool1d.cpp
     ops/moe.cpp
@@ -112,6 +113,7 @@ set(NNOPS_CPU_SOURCES
     backend/cpu/conv/depthwise_conv.cpp
     backend/cpu/conv/depthwise_transpose_conv.cpp
     backend/cpu/conv/transpose_conv2d.cpp
+    backend/cpu/conv/transpose_conv3d.cpp
     backend/cpu/conv/pooling.cpp
     backend/cpu/conv/conv3d.cpp
 

@@ -294,6 +294,44 @@ inline std::vector<TensorDesc> transpose_conv2d_output_shape(
     return {out};
 }
 
+/// Returns [N, OC, OD, OH, OW] with OC = weight.dims[1] * groups, the 3-D form
+/// of the above: the same trailing-edge term, one per spatial axis.
+inline std::vector<TensorDesc> transpose_conv3d_output_shape(
+    std::span<const int64_t> kernel_size,
+    std::span<const int64_t> stride,
+    std::span<const int64_t> dilation,
+    std::span<const int64_t> padding,
+    std::span<const int64_t> output_padding,
+    int64_t groups,
+    std::span<const TensorDesc> inputs)
+{
+    const auto& in = inputs[0];
+    const auto& wt = inputs[1];
+
+    TensorDesc out;
+    out.rank   = 5;
+    out.layout = in.layout;
+    out.dtype  = in.dtype;
+
+    out.dims.resize(5);
+    out.dims[0] = in.dims[0];
+    out.dims[1] = wt.dims[1] * groups;
+
+    auto compute_output = [](int64_t I, int64_t K, int64_t S,
+                              int64_t D, int64_t P, int64_t OP) {
+        return (I - 1) * S - 2 * P + D * (K - 1) + OP + 1;
+    };
+
+    out.dims[2] = compute_output(
+        in.dims[2], kernel_size[0], stride[0], dilation[0], padding[0], output_padding[0]);
+    out.dims[3] = compute_output(
+        in.dims[3], kernel_size[1], stride[1], dilation[1], padding[1], output_padding[1]);
+    out.dims[4] = compute_output(
+        in.dims[4], kernel_size[2], stride[2], dilation[2], padding[2], output_padding[2]);
+
+    return {out};
+}
+
 /// Returns [N, C, OH, OW], C inherited from the input: a depthwise transposed
 /// conv keeps the input's channel count (OC == IC == weight.dims[0]).
 inline std::vector<TensorDesc> depthwise_transpose_conv_output_shape(

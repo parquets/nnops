@@ -1,0 +1,47 @@
+/// @file transpose_conv3d.cpp
+/// @brief TransposeConv3D operator dispatch — connects class API to backend
+///        implementations.
+
+#include "nnops/ops/transpose_conv3d.hpp"
+#include "nnops/detail/assert.hpp"
+#include "dispatch.hpp"
+#include "nnops/detail/shape_inference.hpp"
+
+namespace nnops {
+
+NNOPS_DECLARE_CPU(TransposeConv3DAttributes, transpose_conv3d_cpu)
+
+NNOPS_OP_BOILERPLATE(TransposeConv3D, TransposeConv3DAttributes,
+        backend::cpu::transpose_conv3d_cpu, nullptr, nullptr)
+
+std::vector<TensorDesc> TransposeConv3D::getOutputTensorDesc(
+    std::span<const TensorDesc> inputs) const
+{
+    return transpose_conv3d_output_shape(
+        attrs_.kernel_size, attrs_.stride, attrs_.dilation, attrs_.padding,
+        attrs_.output_padding, attrs_.groups, inputs);
+}
+
+Status TransposeConv3D::validate(std::span<const TensorDesc> inputs,
+                                 std::span<const TensorDesc> outputs) const
+{
+    // input, weight [, bias]
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 2, 3, 1));
+    return detail::require(
+        is_layout_supported(inputs[0].layout,
+                            LayoutSupport::ChannelFirstOrChannelLast));
+}
+
+Status TransposeConv3D::compute(std::span<TensorView> outputs,
+                                std::span<const TensorView> inputs,
+                                const ComputeContext& ctx,
+                                void* workspace)
+{
+    NNOPS_TRY(detail::check_views(outputs, inputs, 2, 3, 1));
+    NNOPS_TRY(validate_views(outputs, inputs));
+
+    if (!impl_->kernel_fn) { return Status::unsupported; }
+    return impl_->kernel_fn(attrs_, outputs[0], inputs, ctx, workspace);
+}
+
+}  // namespace nnops

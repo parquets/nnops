@@ -47,6 +47,7 @@ set(TEST_SOURCES
     test_linear_attention.cpp
     test_transpose_conv2d.cpp
     test_transpose_conv2d_int8.cpp
+    test_transpose_conv3d.cpp
     test_conv1d.cpp
     test_pool1d.cpp
     test_moe.cpp
@@ -88,6 +89,7 @@ add_library(nnops_test_reference STATIC
     reference/resize_ref.cpp
     reference/transpose_conv2d_ref.cpp
     reference/transpose_conv2d_int8_ref.cpp
+    reference/transpose_conv3d_ref.cpp
 )
 target_link_libraries(nnops_test_reference PRIVATE nnops_cpu)
 target_include_directories(nnops_test_reference PRIVATE
@@ -157,6 +159,7 @@ if(NNOPS_BUILD_BENCHMARKS)
         bench_conv2d.cpp
         bench_conv2d_channel_last.cpp
         bench_transpose_conv2d.cpp
+        bench_transpose_conv3d.cpp
         bench_depthwise.cpp
         bench_depthwise_transpose_conv.cpp
         bench_pooling.cpp
