@@ -308,6 +308,20 @@ NNOPS_TEST(cuda_conv2d_channel_last_f16_add_to) {
     run_case(c, "cuda_conv2d_channel_last_f16_add_to");
 }
 
+NNOPS_TEST(cuda_conv2d_wide_channels) {
+    // More than 64 output channels and more than 64 pixels: this is the shape
+    // that exercises the second piece of a CTA tile wider than the 64-wide MMA
+    // tile, which every smaller case here masks out completely.
+    ConvCase c;
+    c.ic = 64; c.oc = 128; c.ih = c.iw = 14; c.dtype = DataType::f16;
+    run_case(c, "cuda_conv2d_wide_channels");
+
+    ConvCase d = c;
+    d.channel_last = true;
+    d.use_bias = true;
+    run_case(d, "cuda_conv2d_wide_channels");
+}
+
 NNOPS_TEST(cuda_conv2d_layouts_agree) {
     // One convolution computed in both orders must give the same numbers: run
     // the channel-first route, convert its output to the channel-last order, and hold

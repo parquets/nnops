@@ -21,6 +21,15 @@
 /// add_to reads the old output at that same address before overwriting it, so
 /// the residual lands after the activation as it does on the CPU.
 ///
+/// The grid is one block per 64-pixel by 64-channel tile per batch·group slice,
+/// which starves the machine once the plane shrinks: 14x14x256 is 16 blocks
+/// against 114 resident slots (three blocks a SM at 30 KB of f32 tile or 32 KB
+/// of f16). Those calls cut the reduction instead — blockIdx.z then carries
+/// (batch·group)·splits + split, each block owns a proportional k range and
+/// writes an f32 accumulator plane, and a second kernel sums the planes and runs
+/// the epilogue once. That is what takes 14x14x256 k3 from 0.21 to 0.066 ms and
+/// the 7x7x512 tail from 0.059 to 0.023 ms.
+///
 /// f32 and f16; a Winograd weight never reaches this kernel (the dispatch
 /// refuses it), a prepacked filter is opaque to it, and quantized weights
 /// return unsupported.
@@ -60,33 +69,18 @@ struct ConvParams {
     bool add_to = false;
     bool channels_last = false;
     bool weight_vec = false;
+    bool fill_vec = false;
+
+    // ---- split-K ----
+    // Same form as the dense GEMM's: blockIdx.z carries (batch·group)·splits +
+    // split, each block owns a proportional range of the k tiles and writes its
+    // f32 accumulator tile to `partial` instead of running the epilogue, and a
+    // second kernel sums the planes and epilogues once.
+    int k_splits = 1;
+    float* partial = nullptr;   ///< [(batch·group)][split][M][OC/G], row-major
 };
 
 constexpr int kConvThreads = detail::kGemmThreads;
-
-/// Element (pixel, k) of the gathered activation, zero outside the input.
-template <class Elem, bool ChannelsLast>
-__device__ inline Elem conv_gather(const ConvParams& p, int64_t base, int k,
-                                   int oh, int ow)
-{
-    const int karea = p.kh * p.kw;
-    int ic, tap;
-    if constexpr (ChannelsLast) {
-        tap = k / p.icg;
-        ic = k - tap * p.icg;
-    } else {
-        ic = k / karea;
-        tap = k - ic * karea;
-    }
-    const int kh = tap / p.kw;
-    const int kw = tap - kh * p.kw;
-    const int ih = oh * p.sh - p.ph + kh * p.dh;
-    const int iw = ow * p.sw - p.pw + kw * p.dw;
-    if (ih < 0 || ih >= p.ih || iw < 0 || iw >= p.iw) { return Elem(0); }
-    return static_cast<const Elem*>(p.input)[base + int64_t(ic) * p.in_c +
-                                             int64_t(ih) * p.in_h +
-                                             int64_t(iw) * p.in_w];
-}
 
 /// Element (n, k) of one group's filter, walked through its own strides so a
 /// padded or sliced filter tensor is read correctly.
@@ -111,48 +105,206 @@ __device__ inline Elem conv_weight(const ConvParams& p, const void* base,
                                           int64_t(kw) * p.w_kw];
 }
 
+/// The rows of an A tile one thread feeds on the channel-last vector walk, and
+/// the two pixel coordinates each of them starts from. The thread-to-(row,
+/// k-group) mapping is fixed for the whole kernel, so the division that turns a
+/// pixel into (oh, ow) is paid once instead of once per k tile, and `oh0`/`ow0`
+/// already carry the stride and the negative padding: a tap is then one add.
+struct ConvRows {
+    static constexpr int kMax = 4;
+    int count = 0;
+    int row[kMax] = {};
+    int off[kMax] = {};   // (oh·sh − ph)·in_h + (ow·sw − pw)·in_w
+    int oh0[kMax] = {};
+    int ow0[kMax] = {};
+    int ok[kMax] = {};
+};
+
+template <class Elem, int Threads, int bM, int bK>
+__device__ inline ConvRows conv_rows(const ConvParams& p, int pixel0)
+{
+    constexpr int kGroup = 16 / int(sizeof(Elem));   // one 16 B vector of k
+    constexpr int groups = bK / kGroup;
+    constexpr int step = Threads / groups;
+    static_assert(bM % step == 0 && bM / step <= ConvRows::kMax,
+                  "the row walk has to fit ConvRows");
+    const int M = p.oh * p.ow;
+    const int row0 = int(threadIdx.x) / groups;
+
+    ConvRows r;
+    r.count = bM / step;
+    CUTE_UNROLL
+    for (int i = 0; i < ConvRows::kMax; ++i) {
+        if (i >= r.count) { break; }
+        const int row = row0 + i * step;
+        const int pixel = pixel0 + row;
+        const int oh = pixel / p.ow;
+        const int ow = pixel - oh * p.ow;
+        r.row[i] = row;
+        r.oh0[i] = oh * p.sh - p.ph;
+        r.ow0[i] = ow * p.sw - p.pw;
+        r.off[i] = r.oh0[i] * int(p.in_h) + r.ow0[i] * int(p.in_w);
+        r.ok[i] = pixel < M;
+    }
+    return r;
+}
+
+/// The (batch, group, split) triple one blockIdx.z stands for. Split varies
+/// fastest, exactly as in the dense GEMM, so the k ranges of one product land on
+/// different waves of the scheduler.
+struct ConvBlock {
+    int zb = 0;
+    int g = 0;
+    int split = 0;
+};
+
+__device__ inline ConvBlock conv_block(const ConvParams& p)
+{
+    const int zg = int(blockIdx.z);
+    const int bg = p.k_splits > 1 ? zg / p.k_splits : zg;
+    ConvBlock b;
+    b.split = p.k_splits > 1 ? zg - bg * p.k_splits : 0;
+    b.zb = bg / p.groups;
+    b.g = bg - b.zb * p.groups;
+    return b;
+}
+
+/// The k-tile range a split owns, as [begin, begin + count). Proportional cuts
+/// of the tile count, so with `splits <= k_tiles` no split is empty.
+__device__ inline void conv_split_range(int K, int bK, int splits, int split,
+                                        int& kt_begin, int& kt_count)
+{
+    const int k_tiles = (K + bK - 1) / bK;
+    if (splits <= 1) {
+        kt_begin = 0;
+        kt_count = k_tiles;
+        return;
+    }
+    kt_begin = int(int64_t(k_tiles) * split / splits);
+    kt_count = int(int64_t(k_tiles) * (split + 1) / splits) - kt_begin;
+}
+
+/// Channel-last fill, one 16 B vector per (row, k-group): k is the innermost
+/// axis there, so a group of `kGroup` consecutive k is a run of whole channels
+/// inside a single tap -- contiguous in the activation and contiguous in the
+/// shared tile, so both the load and the store are one 16 B move. This is the
+/// im2col pack the reference kernels do; element-at-a-time it cost 40-70% of the
+/// kernel, since a 2-byte scalar load per element halves the traffic a request
+/// can carry.
+template <class Elem, int bK, class SmemA>
+__device__ inline void conv_fill_a_vec(const ConvParams& p, SmemA sA, int stage,
+                                       const Elem* in, const ConvRows& rows,
+                                       int k0)
+{
+    constexpr int kGroup = 16 / int(sizeof(Elem));   // one 16 B vector of k
+    using Vec = std::conditional_t<sizeof(Elem) == 2, uint4, float4>;
+
+    const int K = p.icg * p.kh * p.kw;
+    const int kg = int(threadIdx.x) % (bK / kGroup);
+    const int k = k0 + kg * kGroup;
+    const int tap = k / p.icg;
+    const int ic = k - tap * p.icg;
+    const int kh = tap / p.kw;
+    const int kw = tap - kh * p.kw;
+    const int inc = int(p.in_c), inh = int(p.in_h), inw = int(p.in_w);
+    const int koff = ic * inc + (kh * p.dh) * inh + (kw * p.dw) * inw;
+    const int dh = kh * p.dh, dw = kw * p.dw;
+    const bool k_ok = k < K;
+    const Vec zero = {};
+
+    CUTE_UNROLL
+    for (int i = 0; i < ConvRows::kMax; ++i) {
+        if (i >= rows.count) { break; }
+        Vec v = zero;
+        if (k_ok && rows.ok[i]) {
+            const int ih = rows.oh0[i] + dh;
+            const int iw = rows.ow0[i] + dw;
+            if (unsigned(ih) < unsigned(p.ih) && unsigned(iw) < unsigned(p.iw)) {
+                v = *reinterpret_cast<const Vec*>(in + koff + rows.off[i]);
+            }
+        }
+        *reinterpret_cast<Vec*>(&sA(rows.row[i], kg * kGroup, stage)) = v;
+    }
+}
+
 /// Fill one shared-memory A tile with the gathered activation. Threads spread
 /// over the k axis in the channel-last order (consecutive threads read
 /// consecutive channels) and over the pixel axis in the channel-first one (consecutive
 /// threads read consecutive columns of a row).
-template <class Elem, bool ChannelsLast, class SmemA>
+///
+/// Both walks decode their starting index once and then step it, and every
+/// address is a 32-bit offset from the block's already-shifted input pointer.
+/// That matters more than it sounds: a division by a runtime value is a
+/// ~20-instruction sequence on this ISA, and the element-at-a-time form spent two
+/// of them on every element of the tile — 45-79% of the kernel's time sat in
+/// this fill. `ic`/`tap` step tap-fastest inside a channel for the channel-first
+/// order and channel-fastest inside a tap for the other, matching each order's
+/// k-flattening.
+template <class Elem, bool ChannelsLast, int Threads, int bM, int bK, class SmemA>
 __device__ inline void conv_fill_a(const ConvParams& p, SmemA sA, int stage,
-                                   int64_t base, int pixel0, int k0)
+                                   const Elem* in, int pixel0, int k0)
 {
-    constexpr int bM = 64;
-    constexpr int bK = (sizeof(Elem) == 2) ? 64 : 16;
     const int M = p.oh * p.ow;
     const int K = p.icg * p.kh * p.kw;
+    const int karea = p.kh * p.kw;
     const int tid = int(threadIdx.x);
+    // Narrow, so the address arithmetic below stays 32-bit IMAD.
+    const int inc = int(p.in_c), inh = int(p.in_h), inw = int(p.in_w);
 
     if constexpr (ChannelsLast) {
-        constexpr int per = kConvThreads / bK;   // pixels per round
+        static_assert(Threads % bK == 0, "a thread has to own one k column");
+        constexpr int per = Threads / bK;   // pixels per round
         const int col = tid % bK;
         const int k = k0 + col;
+        const int tap = k / p.icg;
+        int ic = k - tap * p.icg;
+        int kh = tap / p.kw;
+        int kw = tap - kh * p.kw;
+        int pixel = pixel0 + tid / bK;
+        int oh = pixel / p.ow;
+        int ow = pixel - oh * p.ow;
         for (int row = tid / bK; row < bM; row += per) {
-            const int pixel = pixel0 + row;
+            const int ih = oh * p.sh - p.ph + kh * p.dh;
+            const int iw = ow * p.sw - p.pw + kw * p.dw;
             Elem val = Elem(0);
-            if (pixel < M && k < K) {
-                const int oh = pixel / p.ow;
-                const int ow = pixel - oh * p.ow;
-                val = conv_gather<Elem, ChannelsLast>(p, base, k, oh, ow);
+            if (pixel < M && k < K && unsigned(ih) < unsigned(p.ih) &&
+                unsigned(iw) < unsigned(p.iw)) {
+                val = in[ic * inc + ih * inh + iw * inw];
             }
             sA(row, col, stage) = val;
+            pixel += per;
+            ow += per;
+            while (ow >= p.ow) { ow -= p.ow; ++oh; }
         }
     } else {
-        constexpr int per = kConvThreads / bM;   // k columns per thread
+        static_assert(Threads % bM == 0 && bK % (Threads / bM) == 0,
+                      "the k column walk has to divide the tile");
+        constexpr int per = Threads / bM;   // k columns per thread
         const int row = tid % bM;
         const int pixel = pixel0 + row;
+        const bool m_ok = pixel < M;
         const int oh = pixel / p.ow;
         const int ow = pixel - oh * p.ow;
         const int col0 = (tid / bM) * (bK / per);
+        int k = k0 + col0;
+        int ic = k / karea;
+        int tap = k - ic * karea;
+        int kh = tap / p.kw;
+        int kw = tap - kh * p.kw;
         for (int j = 0; j < bK / per; ++j) {
-            const int k = k0 + col0 + j;
+            const int ih = oh * p.sh - p.ph + kh * p.dh;
+            const int iw = ow * p.sw - p.pw + kw * p.dw;
             Elem val = Elem(0);
-            if (pixel < M && k < K) {
-                val = conv_gather<Elem, ChannelsLast>(p, base, k, oh, ow);
+            if (m_ok && k < K && unsigned(ih) < unsigned(p.ih) &&
+                unsigned(iw) < unsigned(p.iw)) {
+                val = in[ic * inc + ih * inh + iw * inw];
             }
             sA(row, col0 + j, stage) = val;
+            ++k;
+            if (++kw == p.kw) {
+                kw = 0;
+                if (++kh == p.kh) { kh = 0; ++ic; }
+            }
         }
     }
 }
@@ -184,17 +336,47 @@ __device__ inline void conv_store(const ConvParams& p, int64_t base, int pixel,
 // f16 tensor-core kernel
 // ============================================================
 
+/// The f16 conv tile: 64 pixels by 64 channels, 64 halves of k, two stages.
+///
+/// Every axis was swept on the CNN layer set (2026-11-11), and the tile is 32 KB
+/// because that is what fits three blocks a SM where three stages fit two: the
+/// deeper pipeline only wins on the one 56x56 plane whose grid already hides the
+/// gather, and loses by up to 1.7x on the stem and the 1x1s, where the extra
+/// resident block is the whole margin (sum over the layer set 1.58 -> 1.20 ms).
+///
+/// A wider n tile is the tempting lever — every block re-gathers its own n slice
+/// of the activation, so bN halves the total A traffic — and it loses anyway:
+/// 1.1-6.9x on every layer whose OC/G does not cover the tile, because the
+/// filter then falls back to its scalar gather, and no better than noise on the
+/// ones where it does, because the wider tile halves the block count of planes
+/// that were already too short to fill the machine. Wider m tiles and deeper k
+/// panels lose the same way, on resident blocks.
+struct ConvTileH
+{
+    static constexpr int bM = 64;
+    static constexpr int bN = 64;
+    static constexpr int bK = 64;   // the swizzle atom is 64 halves wide in k
+    static constexpr int stages = 2;
+    // 2x2 warps of a 32x32 atom. Wider warp grids break the LDSM copy atoms,
+    // which are built off the per-warp tile.
+    static constexpr int wm = 2;
+    static constexpr int wn = 2;
+    static constexpr int mmaM = 32;
+    static constexpr int mmaN = 32;
+    static constexpr int threads = 32 * wm * wn;
+};
+
 template <bool ChannelsLast>
-__global__ __launch_bounds__(kConvThreads)
+__global__ __launch_bounds__(ConvTileH::threads)
 void conv_gemm_h_kernel(ConvParams p)
 {
     using namespace cute;
     using Elem = cute::half_t;
 
-    constexpr int bM = 64;
-    constexpr int bN = 64;
-    constexpr int bK = 64;
-    constexpr int kStages = 3;
+    constexpr int bM = ConvTileH::bM;
+    constexpr int bN = ConvTileH::bN;
+    constexpr int bK = ConvTileH::bK;
+    constexpr int kStages = ConvTileH::stages;
 
     const int M = p.oh * p.ow;
     const int N = p.ocg;
@@ -202,14 +384,19 @@ void conv_gemm_h_kernel(ConvParams p)
     const int m0 = int(blockIdx.x) * bM;
     const int n0 = int(blockIdx.y) * bN;
 
-    const int zb = int(blockIdx.z) / p.groups;
-    const int g = int(blockIdx.z) - zb * p.groups;
+    const ConvBlock blk = conv_block(p);
+    const int zb = blk.zb;
+    const int g = blk.g;
 
     const int64_t in_base = int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
     const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c;
 
     Elem const* W = static_cast<Elem const*>(p.weight) +
                     int64_t(g) * p.ocg * p.w_n;
+    // Shifted once so the fill's own arithmetic stays 32-bit (the launch gate
+    // keeps every offset it forms inside int).
+    Elem const* in = static_cast<Elem const*>(p.input) + in_base;
+    const ConvRows rows = conv_rows<Elem, ConvTileH::threads, bM, bK>(p, m0);
 
     Tensor mB = [&] {
         if constexpr (ChannelsLast) {
@@ -237,23 +424,12 @@ void conv_gemm_h_kernel(ConvParams p)
         make_smem_ptr(reinterpret_cast<Elem*>(gemm_smem + kSmemA * int(sizeof(Elem)))),
         sB_layout);
 
-    TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
-                                  Layout<Shape<_2, _2, _1>>{},
-                                  Tile<_32, _32, _16>{});
+    TiledMMA mma = make_tiled_mma(
+        SM80_16x8x16_F32F16F16F32_TN{},
+        Layout<Shape<Int<ConvTileH::wm>, Int<ConvTileH::wn>, _1>>{},
+        cute::Tile<Int<ConvTileH::mmaM>, Int<ConvTileH::mmaN>, _16>{});
 
-    TiledCopy copy_b = [&] {
-        if constexpr (ChannelsLast) {
-            return make_tiled_copy(
-                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Elem>{},
-                Layout<Shape<_8, _16>>{},
-                Layout<Shape<_8, _1>>{});
-        } else {
-            return make_tiled_copy(
-                Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Elem>{},
-                Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-                Layout<Shape<_1, _8>>{});
-        }
-    }();
+    TiledCopy copy_b = detail::gemm_copy_half<ConvTileH::threads, bN, bK, !ChannelsLast>();
 
     ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
     Tensor tBgB = thr_copy_b.partition_S(gB);
@@ -262,7 +438,14 @@ void conv_gemm_h_kernel(ConvParams p)
     const bool n_full = (n0 + bN <= N);
 
     auto load_a = [&](int kt, int stage) {
-        conv_fill_a<Elem, ChannelsLast>(p, sA, stage, in_base, m0, kt * bK);
+        if constexpr (ChannelsLast) {
+            if (p.fill_vec) {
+                conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
+                return;
+            }
+        }
+        conv_fill_a<Elem, ChannelsLast, ConvTileH::threads, bM, bK>(
+            p, sA, stage, in, m0, kt * bK);
     };
     auto load_b = [&](int kt, int stage) {
         if (p.weight_vec && n_full && (kt + 1) * bK <= K) {
@@ -281,8 +464,9 @@ void conv_gemm_h_kernel(ConvParams p)
         }
     };
 
-    int k_tile_count = (K + bK - 1) / bK;
+    int k_tile_count = 0;
     int k_tile_next = 0;
+    conv_split_range(K, bK, p.k_splits, blk.split, k_tile_next, k_tile_count);
 
     CUTE_UNROLL
     for (int pipe = 0; pipe < kStages - 1; ++pipe) {
@@ -365,12 +549,24 @@ void conv_gemm_h_kernel(ConvParams p)
     Elem const* bias = p.bias != nullptr
         ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
 
+    // A split's block stops at its accumulator: the sum, the bias and the
+    // activation all belong to the reduce kernel, which sees every plane.
+    float* part = nullptr;
+    if (p.k_splits > 1) {
+        // blockIdx.z already is zg·splits + split, which is the plane index.
+        part = p.partial + int64_t(blockIdx.z) * int64_t(M) * N;
+    }
+
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC); ++i) {
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
         if (m >= M || n >= N) { continue; }
+        if (part != nullptr) {
+            part[int64_t(m) * N + n] = float(tCrC(i));
+            continue;
+        }
 
         float v = float(tCrC(i));
         if (bias != nullptr) { v += gemm_to_float(bias[n]); }
@@ -403,14 +599,19 @@ void conv_gemm_f_kernel(ConvParams p)
     const int m0 = int(blockIdx.x) * bM;
     const int n0 = int(blockIdx.y) * bN;
 
-    const int zb = int(blockIdx.z) / p.groups;
-    const int g = int(blockIdx.z) - zb * p.groups;
+    const ConvBlock blk = conv_block(p);
+    const int zb = blk.zb;
+    const int g = blk.g;
 
     const int64_t in_base = int64_t(zb) * p.in_batch + int64_t(g) * p.icg * p.in_c;
     const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c;
 
     Elem const* W = static_cast<Elem const*>(p.weight) +
                     int64_t(g) * p.ocg * p.w_n;
+    // Shifted once so the fill's own arithmetic stays 32-bit (the launch gate
+    // keeps every offset it forms inside int).
+    Elem const* in = static_cast<Elem const*>(p.input) + in_base;
+    const ConvRows rows = conv_rows<Elem, kConvThreads, bM, bK>(p, m0);
 
     Tensor mB = [&] {
         if constexpr (ChannelsLast) {
@@ -476,7 +677,14 @@ void conv_gemm_f_kernel(ConvParams p)
     const bool n_full = (n0 + bN <= N);
 
     auto load_a = [&](int kt, int stage) {
-        conv_fill_a<Elem, ChannelsLast>(p, sA, stage, in_base, m0, kt * bK);
+        if constexpr (ChannelsLast) {
+            if (p.fill_vec) {
+                conv_fill_a_vec<Elem, bK>(p, sA, stage, in, rows, kt * bK);
+                return;
+            }
+        }
+        conv_fill_a<Elem, ChannelsLast, kConvThreads, bM, bK>(
+            p, sA, stage, in, m0, kt * bK);
     };
     auto load_b = [&](int kt, int stage) {
         if (p.weight_vec && n_full && (kt + 1) * bK <= K) {
@@ -495,8 +703,9 @@ void conv_gemm_f_kernel(ConvParams p)
         }
     };
 
-    int k_tile_count = (K + bK - 1) / bK;
+    int k_tile_count = 0;
     int k_tile_next = 0;
+    conv_split_range(K, bK, p.k_splits, blk.split, k_tile_next, k_tile_count);
 
     CUTE_UNROLL
     for (int pipe = 0; pipe < kStages - 1; ++pipe) {
@@ -543,12 +752,24 @@ void conv_gemm_f_kernel(ConvParams p)
     Elem const* bias = p.bias != nullptr
         ? static_cast<Elem const*>(p.bias) + int64_t(g) * p.ocg : nullptr;
 
+    // A split's block stops at its accumulator: the sum, the bias and the
+    // activation all belong to the reduce kernel, which sees every plane.
+    float* part = nullptr;
+    if (p.k_splits > 1) {
+        // blockIdx.z already is zg·splits + split, which is the plane index.
+        part = p.partial + int64_t(blockIdx.z) * int64_t(M) * N;
+    }
+
     CUTE_UNROLL
     for (int i = 0; i < size(tCrC); ++i) {
         auto coord = tCcC(i);
         const int m = int(get<0>(coord));
         const int n = int(get<1>(coord));
         if (m >= M || n >= N) { continue; }
+        if (part != nullptr) {
+            part[int64_t(m) * N + n] = tCrC(i);
+            continue;
+        }
 
         float v = tCrC(i);
         if (bias != nullptr) { v += bias[n]; }
@@ -559,18 +780,156 @@ void conv_gemm_f_kernel(ConvParams p)
 }
 
 // ============================================================
+// split-K reduction
+// ============================================================
+
+/// Sum the k-split planes of one conv and run the epilogue once, exactly as the
+/// single-pass kernel would have. One thread per (pixel, channel), planes in
+/// split order so a split count is deterministic. The output goes through the
+/// operator's own addressing, since a channel-first row is pitch-padded.
+template <class Elem>
+__global__ void conv_splitk_reduce_kernel(ConvParams p)
+{
+    const int M = p.oh * p.ow;
+    const int N = p.ocg;
+    const int64_t plane = int64_t(M) * N;
+    const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= plane) { return; }
+
+    const int pixel = int(idx / N);
+    const int n = int(idx - int64_t(pixel) * N);
+    const int zg = int(blockIdx.y);
+
+    const float* src = p.partial + int64_t(zg) * p.k_splits * plane + idx;
+    float sum = 0.0f;
+    for (int s = 0; s < p.k_splits; ++s) { sum += src[int64_t(s) * plane]; }
+
+    const int zb = zg / p.groups;
+    const int g = zg - zb * p.groups;
+    const int64_t out_base = int64_t(zb) * p.out_batch + int64_t(g) * p.ocg * p.out_c;
+
+    float v = sum;
+    if (p.bias != nullptr) {
+        v += gemm_to_float(static_cast<const Elem*>(p.bias)[int64_t(g) * p.ocg + n]);
+    }
+    v = fminf(fmaxf(v, p.min_clip), p.max_clip);
+    v = gemm_apply_epilogue(p.epilogue, p.ep_alpha, p.ep_beta, v);
+    conv_store<Elem>(p, out_base, pixel, n, v);
+}
+
+// ============================================================
 // Launch
 // ============================================================
 
+/// How many k ranges the block grid should be cut into.
+///
+/// The dense GEMM's rule prices the cut against a streamed A and declines the
+/// ones whose f32 planes outweigh the operands; a conv block instead gathers its
+/// A tile tap by tap, and the shapes that lose here are the ones that repeat
+/// that gather. Measured on this part, the cut pays exactly when
+///  - the grid is under `1/wave_div` of a wave, and
+///  - each split keeps four k tiles, so the two-deep pipeline prologue is at
+///    most a quarter of the split's work (f32 56x56x64 k1 -- 4 k tiles, 2 splits
+///    measured 1.7x slower; 9 k tiles at 2 splits, 1.3x faster),
+/// and then the count is the largest that still fits one wave, `capacity/tiles`
+/// (rounding up instead was measured at -25% on the dense twins). 14x14x256 k3
+/// f16 goes 0.075 -> 0.028 ms at four splits, 28x28x128 k5 f32 0.34 -> 0.14 ms.
+///
+/// Half a wave is too eager at two splits for f16: the 56x56x64 3x3 plane has
+/// 49 blocks against 114 resident and a shallow cut already costs it 13%
+/// channel-last, because two blocks per k range repeat the gather while the
+/// plane was wide enough to hide it. A quarter-wave gate leaves every deeper
+/// case untouched (7x7x512 has 8 blocks, 14x14x256 16) and only declines that
+/// one.
+///
+/// `wave_div` is dtype-scaled because that margin is a time, not a shape: the
+/// cut costs a fixed two launches and a stream-ordered workspace round trip, so
+/// a plane only pays for it when one undivided wave lasts longer than that. The
+/// same 49-block f16 plane takes 0.031 ms and loses 13% at two splits, while the
+/// f32 twin takes 0.086 ms and gains 20% (0.087 -> 0.070 channel-last), and the
+/// gate is the only thing that tells them apart. The f16 kernel therefore needs
+/// the quarter-wave gate and f32 the half.
+///
+/// The smallest cut is left in place at the very shallow end. f16 7x7x512 is
+/// 12.8M MACs against a fixed cut cost of about 20 us, and channel-last lands at
+/// 0.0184 ms in five runs out of six and 0.0417 ms in the sixth -- the arm where
+/// the cut does not cover itself. It still stays: the same layer channel-first
+/// takes 0.0440 ms cut against 0.0705 ms whole, every run, and a MAC floor high
+/// enough to decline them both (which is what a first attempt did) costs that
+/// 1.6x to buy back nothing but the sixth run.
+inline int conv_pick_splits(int m, int n, int K, int64_t zg, int bM, int bN, int bK,
+                            int capacity, int wave_div)
+{
+    const int forced = detail::splitk_env();
+    const int k_tiles = (K + bK - 1) / bK;
+    if (forced == 0) { return 1; }
+    if (forced > 1) {
+        return std::max(1, std::min({forced, k_tiles, detail::kSplitKMaxSplits}));
+    }
+    if (capacity <= 0) { return 1; }
+
+    const int64_t tiles = int64_t((m + bM - 1) / bM) * ((n + bN - 1) / bN) * zg;
+    if (tiles * wave_div > capacity) { return 1; }
+
+    int64_t splits = std::min<int64_t>(detail::kSplitKMaxSplits, capacity / tiles);
+    splits = std::min<int64_t>(splits, k_tiles / 4);
+    return splits >= 2 ? int(splits) : 1;
+}
+
+/// Cut the reduction into k ranges when the grid is shallower than the resident
+/// block count wants, and carve the scratch the split blocks write into. A null
+/// workspace means single-pass: either the rule declined or the carve failed
+/// (`k_splits` stays 1).
+inline detail::GemmWorkspace conv_split_workspace(ConvParams& p, int bM, int bN,
+                                                  int bK, int smem_bytes,
+                                                  int wave_div, cudaStream_t stream)
+{
+    const int64_t zg = int64_t(p.batch) * p.groups;
+    const int blocks = std::max(1, int(detail::kSmemPerSm / smem_bytes));
+    const int64_t plane = int64_t(p.oh) * p.ow * p.ocg;
+    int splits = conv_pick_splits(p.oh * p.ow, p.ocg, p.icg * p.kh * p.kw, zg,
+                                  bM, bN, bK, detail::device_sm_count() * blocks,
+                                  wave_div);
+
+    // gridDim.z is 16-bit, and every split costs one f32 plane of stores.
+    const int64_t bytes_per_split = zg * plane * int64_t(sizeof(float));
+    while (splits > 1 && (zg * splits > 65535 ||
+                          bytes_per_split * splits > detail::kSplitKMaxBytes)) {
+        splits /= 2;
+    }
+    if (splits <= 1) { return {}; }
+
+    const detail::GemmWorkspace ws =
+        detail::gemm_workspace_alloc(bytes_per_split * splits, stream);
+    if (ws.ptr == nullptr) { return {}; }
+    p.k_splits = splits;
+    p.partial = static_cast<float*>(ws.ptr);
+    return ws;
+}
+
+/// Sum the split planes and hand the scratch back. Shared by every tile and
+/// both element types.
+template <class Elem>
+inline void conv_reduce(ConvParams& p, detail::GemmWorkspace ws,
+                        cudaStream_t stream)
+{
+    constexpr int kReduceThreads = 256;
+    const int64_t plane = int64_t(p.oh) * p.ow * p.ocg;
+    dim3 rgrid(unsigned((plane + kReduceThreads - 1) / kReduceThreads),
+               unsigned(p.batch * p.groups), 1);
+    conv_splitk_reduce_kernel<Elem><<<rgrid, kReduceThreads, 0, stream>>>(p);
+    detail::gemm_workspace_free(ws, stream);
+}
+
 template <bool ChannelsLast>
-void launch_conv_h(const ConvParams& p, cudaStream_t stream)
+void launch_conv_h(ConvParams& p, cudaStream_t stream)
 {
     using namespace cute;
-    constexpr int bM = 64, bN = 64, bK = 64, kStages = 3;
+    constexpr int bM = ConvTileH::bM, bN = ConvTileH::bN, bK = ConvTileH::bK;
     constexpr auto la = detail::gemm_smem_layout<true>(
-        Int<bM>{}, Int<bK>{}, Int<kStages>{});
+        Int<bM>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr auto lb = detail::gemm_smem_layout<!ChannelsLast>(
-        Int<bN>{}, Int<bK>{}, Int<kStages>{});
+        Int<bN>{}, Int<bK>{}, Int<ConvTileH::stages>{});
     constexpr int smem = int(cosize(la) + cosize(lb)) * int(sizeof(half_t));
 
     auto kernel = conv_gemm_h_kernel<ChannelsLast>;
@@ -578,12 +937,18 @@ void launch_conv_h(const ConvParams& p, cudaStream_t stream)
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(p.oh * p.ow, bM), ceil_div(p.ocg, bN), p.batch * p.groups);
-    kernel<<<grid, kConvThreads, smem, stream>>>(p);
+    // Quarter wave: the f16 block is 2.3x shorter than the f32 one, so its
+    // shallow cuts need a deeper grid to cover the same fixed cost.
+    const detail::GemmWorkspace ws = conv_split_workspace(
+        p, bM, bN, bK, smem, 4, stream);
+    dim3 grid(ceil_div(p.oh * p.ow, bM), ceil_div(p.ocg, bN),
+              p.batch * p.groups * p.k_splits);
+    kernel<<<grid, ConvTileH::threads, smem, stream>>>(p);
+    if (p.k_splits > 1) { conv_reduce<half_t>(p, ws, stream); }
 }
 
 template <bool ChannelsLast>
-void launch_conv_f(const ConvParams& p, cudaStream_t stream)
+void launch_conv_f(ConvParams& p, cudaStream_t stream)
 {
     using namespace cute;   // ceil_div
     constexpr int bM = 64, bN = 64, bK = 16, kStages = 3, kPad = 4;
@@ -595,8 +960,12 @@ void launch_conv_f(const ConvParams& p, cudaStream_t stream)
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     (void)cfg;
 
-    dim3 grid(ceil_div(p.oh * p.ow, bM), ceil_div(p.ocg, bN), p.batch * p.groups);
+    const detail::GemmWorkspace ws =
+        conv_split_workspace(p, bM, bN, bK, smem, 2, stream);
+    dim3 grid(ceil_div(p.oh * p.ow, bM), ceil_div(p.ocg, bN),
+              p.batch * p.groups * p.k_splits);
     kernel<<<grid, kConvThreads, smem, stream>>>(p);
+    if (p.k_splits > 1) { conv_reduce<float>(p, ws, stream); }
 }
 
 }  // namespace
@@ -697,7 +1066,20 @@ Status conv2d_cuda(const Conv2DAttributes& attrs, TensorView& output,
                    (reinterpret_cast<uintptr_t>(p.weight) % 16 == 0) &&
                    (row % 16 == 0);
 
-    if (p.oh * p.ow > 65535 || p.batch * p.groups > 65535 || p.ocg <= 0) {
+    // The channel-last 16 B A-fill needs four (or eight) whole channels of one
+    // tap on a dense channel axis: in_c == 1 puts consecutive channels next to
+    // each other, IC/G a multiple of the vector makes a k-group never straddle
+    // a tap, and the channel stride is what has to be 16 B aligned.
+    const int kGroup = esz == 2 ? 8 : 4;
+    p.fill_vec = last && p.in_c == 1 && p.icg % kGroup == 0 &&
+                 (p.in_w * esz) % 16 == 0 &&
+                 (reinterpret_cast<uintptr_t>(p.input) % 16 == 0);
+
+    // The fill addresses the activation with 32-bit offsets from its block's
+    // slice; a tensor past the halfway point of the int range is refused rather
+    // than silently wrapping.
+    if (p.oh * p.ow > 65535 || p.batch * p.groups > 65535 || p.ocg <= 0 ||
+        act.numel() > (int64_t(1) << 30)) {
         return Status::unsupported;
     }
 
