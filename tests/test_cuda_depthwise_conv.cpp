@@ -192,6 +192,22 @@ NNOPS_TEST(cuda_dwconv_channel_first_f16) {
     run_case(c, "cuda_dwconv_channel_first_f16");
 }
 
+NNOPS_TEST(cuda_dwconv_channel_first_window) {
+    // Unit stride, a square kernel and a row wide enough to hold two column
+    // runs: the only channel-first shape that takes the column-walking kernel.
+    // The other cases here land on the grid kernel (stride or dilation) or
+    // stay under its width gate.
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        DwCase c;
+        c.in_shape = {2, 4, 12, 15};
+        c.padding = {0, 1, 1};
+        c.bias = true;
+        c.add_to = true;
+        c.dtype = dt;
+        run_case(c, "cuda_dwconv_channel_first_window");
+    }
+}
+
 // ============================================================
 // Channel-last
 // ============================================================

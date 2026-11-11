@@ -252,4 +252,32 @@ NNOPS_BENCH(cuda_conv2d_shapes) {
     }
 }
 
+NNOPS_BENCH(cuda_depthwise_layers) {
+    print_cuda_header("CUDA depthwise (groups = IC, rerouted out of the GEMM)");
+    // The depthwise stack a MobileNetV2 block walks, plus the 5x5 and the two
+    // channel-first rows the depthwise kernel still owns on its own.
+    struct Dw { int64_t side, c, k, s; };
+    const Dw layers[] = {
+        {112, 32, 3, 1}, {112, 64, 3, 2}, {56, 64, 3, 1}, {56, 128, 3, 2},
+        {28, 128, 3, 1}, {28, 256, 3, 2}, {14, 256, 3, 1}, {14, 512, 3, 2},
+        {7, 512, 3, 1}, {56, 64, 5, 1},
+    };
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        for (const Dw& l : layers) {
+            for (bool last : {true, false}) {
+                ConvBenchCase c;
+                c.ic = c.oc = l.c;
+                c.ih = c.iw = l.side;
+                c.kh = c.kw = l.k;
+                c.sh = c.sw = l.s;
+                c.ph = c.pw = l.k / 2;
+                c.groups = l.c;
+                c.dtype = dt;
+                c.channel_last = last;
+                run_conv(c, dt == DataType::f32 ? "f32" : "f16");
+            }
+        }
+    }
+}
+
 #endif  // NNOPS_HAS_CUDA
