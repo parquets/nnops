@@ -41,6 +41,7 @@ namespace nnops {
 
 NNOPS_DECLARE_CUDA(Conv2DAttributes, conv2d_cuda)
 NNOPS_DECLARE_CPU(DepthwiseConvAttributes, depthwise_conv_cpu)
+NNOPS_DECLARE_CUDA(DepthwiseConvAttributes, depthwise_conv_cuda)
 
 struct Conv2D::Impl {
     using KernelFn = Status (*)(const Conv2DAttributes&,
@@ -267,8 +268,9 @@ Status Conv2D::compute(std::span<TensorView> outputs,
     // A depthwise geometry reads the filter Conv2D was handed, so it costs no
     // conversion in either layout. The grouped GEMM degenerates there — one
     // channel per group is a single-row product, re-dispatched per group — and
-    // loses by roughly 3.8x on the MobileNetV2 shapes.
-    if (backend_ == Backend::CPU &&
+    // loses by roughly 3.8x on the MobileNetV2 shapes on the CPU, an order of
+    // magnitude more on the GPU, where every group also pays its own block.
+    if ((backend_ == Backend::CPU || backend_ == Backend::CUDA) &&
         attrs.algorithm != ConvAlgorithm::ImplicitGemm &&
         inputs.size() >= 2 && is_fp(inputs[0].data_type()) &&
         is_fp(inputs[1].data_type()) && is_depthwise_geometry(attrs, inputs[1])) {
@@ -280,7 +282,14 @@ Status Conv2D::compute(std::span<TensorView> outputs,
         dw.epilogue    = attrs.epilogue;
         dw.add_to      = attrs.add_to;
         dw.residual_pre_activation = attrs.residual_pre_activation;
-        return backend::cpu::depthwise_conv_cpu(dw, output, inputs, ctx, workspace);
+        if (backend_ == Backend::CPU) {
+            return backend::cpu::depthwise_conv_cpu(dw, output, inputs, ctx, workspace);
+        }
+#if defined(NNOPS_HAS_CUDA)
+        return backend::cuda::depthwise_conv_cuda(dw, output, inputs, ctx, workspace);
+#else
+        return Status::unsupported;
+#endif
     }
 
     // A raw channel-last filter keeps the pixel axis on M; U is the only other
