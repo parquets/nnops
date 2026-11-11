@@ -193,11 +193,9 @@ bool tconv2d_channel_first_gemm(const Geom& gm,
                         const T* rp = row + r * cg.mic;
                         for (int64_t t = 0; t < nr; ++t) {
                             const int64_t ow = r + t * gm.SW;
-                            float a = s_load(&rp[t]);
-                            if (gm.pre_act) { a += s_load(&orow[ow]); }
-                            float v = nnops::apply_epilogue(gm.epilogue, a, oc);
-                            if (gm.add_to && !gm.pre_act) { v += s_load(&orow[ow]); }
-                            s_store(&orow[ow], v);
+                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]),
+                                                    gm.epilogue, oc, gm.add_to,
+                                                    gm.pre_act);
                         }
                     }
                 });
@@ -823,10 +821,8 @@ bool tconv2d_int8_channel_first_depthwise(const Geom& gm, TensorView& output,
                 } else {
                     float f = rp[t] * (s_w * s_x);
                     if (b_fp) { f += s_load(&b_fp[oc]); }
-                    f = std::min(std::max(f, gm.epilogue.min_clip),
-                                 gm.epilogue.max_clip);
-                    f = nnops::apply_epilogue(gm.epilogue, f, oc);
-                    s_store(&orow[ow], f);
+                    apply_epilogue_store<TOut>(&orow[ow], f, gm.epilogue, oc,
+                                               /*add_to=*/false, /*pre_act=*/false);
                 }
             }
         }
@@ -967,10 +963,9 @@ bool tconv2d_int8_channel_first(const Geom& gm, TensorView& output,
                             } else {
                                 float f = static_cast<float>(rp[t]) * (s_w * s_x);
                                 if (b_fp) { f += s_load(&b_fp[oc]); }
-                                f = std::min(std::max(f, gm.epilogue.min_clip),
-                                             gm.epilogue.max_clip);
-                                f = nnops::apply_epilogue(gm.epilogue, f, oc);
-                                s_store(&orow[ow], f);
+                                apply_epilogue_store<TOut>(&orow[ow], f, gm.epilogue, oc,
+                                                           /*add_to=*/false,
+                                                           /*pre_act=*/false);
                             }
                         }
                     }
@@ -1228,10 +1223,8 @@ void tconv2d_int8_scalar(const Geom& gm, TensorView& output,
                 } else {
                     float f = static_cast<float>(acc) * (s_w * s_x);
                     if (b_fp) { f += s_load(&b_fp[oc]); }
-                    f = std::min(std::max(f, gm.epilogue.min_clip),
-                                 gm.epilogue.max_clip);
-                    f = nnops::apply_epilogue(gm.epilogue, f, oc);
-                    s_store(&orow[ow], f);
+                    apply_epilogue_store<TOut>(&orow[ow], f, gm.epilogue, oc,
+                                               /*add_to=*/false, /*pre_act=*/false);
                 }
             }
         }
@@ -1411,7 +1404,6 @@ void tconv2d_impl(const Geom& gm,
     const int64_t out_n_stride   = output.stride_elems(0);
 
     const auto epilogue = gm.epilogue;
-    const bool add_to = gm.add_to && !gm.pre_act;
     const T* type_tag = nullptr;
 
     if (!is_channel_last(input.layout())) {
@@ -1459,10 +1451,8 @@ void tconv2d_impl(const Geom& gm,
                     }
 
                     if (b_ptr) { acc += s_load(&b_ptr[oc]); }
-                    if (gm.pre_act) { acc += s_load(&orow[ow]); }
-                    acc = nnops::apply_epilogue(epilogue, acc, oc);
-                    if (add_to) { acc += s_load(&orow[ow]); }
-                    s_store(&orow[ow], acc);
+                    apply_epilogue_store<T>(&orow[ow], acc, epilogue, oc,
+                                            gm.add_to, gm.pre_act);
                 }
             }
         };
@@ -1605,9 +1595,9 @@ void tconv2d_impl(const Geom& gm,
                         }
 
                         acc = v_add(acc, bg ? v_load(bg + c0) : v_zero(type_tag));
-                        if (gm.pre_act) { acc = v_add(acc, v_load(dst + c0)); }
-                        acc = apply_epilogue_vec<T>(epilogue, type_tag, acc);
-                        if (add_to) { acc = v_add(acc, v_load(dst + c0)); }
+                        acc = apply_epilogue_vec_dst<T>(epilogue, type_tag, acc,
+                                                        dst + c0, gm.add_to,
+                                                        gm.pre_act);
                         v_store(dst + c0, acc);
                     }
 
@@ -1629,11 +1619,9 @@ void tconv2d_impl(const Geom& gm,
                         }
 
                         if (bg) { acc += s_load(&bg[c0]); }
-                        if (gm.pre_act) { acc += s_load(&dst[c0]); }
-                        acc = nnops::apply_epilogue(epilogue, acc,
-                                                    g * OC_span + c0);
-                        if (add_to) { acc += s_load(&dst[c0]); }
-                        s_store(&dst[c0], acc);
+                        apply_epilogue_store<T>(&dst[c0], acc, epilogue,
+                                                g * OC_span + c0, gm.add_to,
+                                                gm.pre_act);
                     }
                 };
 
@@ -1676,20 +1664,14 @@ void tconv2d_impl(const Geom& gm,
                             T* dst = d0 + j * SW * OC;
                             vec_for<T> s0 = v_add(a0[j], b0);
                             vec_for<T> s1 = v_add(a1[j], b1);
-                            if (gm.pre_act) {
-                                s0 = v_add(s0, v_load(dst + c0));
-                                s1 = v_add(s1, v_load(dst + c0 + L));
-                            }
-                            vec_for<T> v0 = apply_epilogue_vec<T>(
-                                epilogue, type_tag, s0);
-                            vec_for<T> v1 = apply_epilogue_vec<T>(
-                                epilogue, type_tag, s1);
-                            if (add_to) {
-                                v0 = v_add(v0, v_load(dst + c0));
-                                v1 = v_add(v1, v_load(dst + c0 + L));
-                            }
-                            v_store(dst + c0, v0);
-                            v_store(dst + c0 + L, v1);
+                            s0 = apply_epilogue_vec_dst<T>(epilogue, type_tag, s0,
+                                                           dst + c0, gm.add_to,
+                                                           gm.pre_act);
+                            s1 = apply_epilogue_vec_dst<T>(epilogue, type_tag, s1,
+                                                           dst + c0 + L,
+                                                           gm.add_to, gm.pre_act);
+                            v_store(dst + c0, s0);
+                            v_store(dst + c0 + L, s1);
                         }
                     }
                     if (c0 < OC_span) {

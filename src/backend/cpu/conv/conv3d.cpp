@@ -74,31 +74,15 @@ constexpr int64_t kTileCapBytes = 4 << 20;
 
 /// Write one block's GEMM result into the output row: bias, epilogue, add_to.
 /// @p src and @p dst may alias — the residual then comes from the same tile,
-/// which is why a destination that needs add_to is staged instead.
+/// which is why a destination that needs add_to is staged instead. The run is
+/// over pixels inside one output channel, so the quant stage indexes @p oc
+/// throughout.
 template <typename T>
-void write_tile(T* dst, const T* src, int64_t len, float bias_val, int64_t oc,
-                const Geom& gm, bool has_bias)
+void write_tile(T* dst, const T* src, int64_t len, const T* bias, int64_t oc,
+                const Geom& gm)
 {
-    const T* tag = nullptr;
-    constexpr int L = simd_lane_for<T>;
-    int64_t p = 0;
-    if (gm.epilogue.quant == EpilogueQuantType::None) {
-        const auto bv = v_set1(tag, bias_val);
-        for (; p + L <= len; p += L) {
-            auto acc = v_load(src + p);
-            if (has_bias) { acc = v_add(acc, bv); }
-            acc = apply_epilogue_vec<T>(gm.epilogue, tag, acc);
-            if (gm.add_to) { acc = v_add(acc, v_load(dst + p)); }
-            v_store(dst + p, acc);
-        }
-    }
-    for (; p < len; ++p) {
-        float v = s_load(src + p);
-        if (has_bias) { v += bias_val; }
-        v = nnops::apply_epilogue(gm.epilogue, v, oc);
-        if (gm.add_to) { v += s_load(dst + p); }
-        s_store(dst + p, v);
-    }
+    apply_epilogue_row<T>(dst, src, len, bias, /*bias_step=*/0, gm.epilogue, oc,
+                          /*quant_step=*/0, gm.add_to, /*pre_act=*/false);
 }
 
 /// im2col → GEMM. Returns false when the operands cannot be read as flat
@@ -255,18 +239,18 @@ bool conv3d_im2col_gemm(const Geom& gm,
                         const int64_t crow = in_place ? out_c_stride : nblk;
                         ctx.cpu.run(0, ncc, [&](int64_t oc_l) {
                             const int64_t oc = g * gm.OC_per_G + oc0 + oc_l;
-                            const float bv = b_ptr ? s_load(&b_ptr[oc]) : 0.0f;
+                            const T* bias = b_ptr ? b_ptr + oc : nullptr;
                             const T* src = ctile + oc_l * crow;
                             T* dst = out_g + (oc0 + oc_l) * out_c_stride + p0;
                             if (dense_out) {
-                                write_tile(dst, src, nblk, bv, oc, gm, has_bias);
+                                write_tile(dst, src, nblk, bias, oc, gm);
                             } else {
                                 for (int64_t od = 0; od < nd; ++od) {
                                     for (int64_t oh = 0; oh < nh; ++oh) {
                                         const int64_t off = (od * nh + oh) * gm.OW;
                                         write_tile(dst + (od0 + od) * gm.OH * out_row_stride +
                                                        (oh0 + oh) * out_row_stride,
-                                                   src + off, gm.OW, bv, oc, gm, has_bias);
+                                                   src + off, gm.OW, bias, oc, gm);
                                     }
                                 }
                             }
@@ -347,9 +331,8 @@ void conv3d_gather(const Geom& gm,
                                     }
                                 }
                             }
-                            float val = nnops::apply_epilogue(gm.epilogue, sum + bv, oc);
-                            if (gm.add_to) { val += s_load(&orow[ow]); }
-                            s_store(&orow[ow], val);
+                            apply_epilogue_store<T>(&orow[ow], sum + bv, gm.epilogue,
+                                                    oc, gm.add_to, /*pre_act=*/false);
                         }
                     }
                 }

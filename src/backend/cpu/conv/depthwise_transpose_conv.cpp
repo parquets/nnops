@@ -196,10 +196,8 @@ void dwtconv_scalar_first(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
                 acc += bias;
-                if (gm.pre_act) { acc += s_load(&orow[ow]); }
-                acc = nnops::apply_epilogue(gm.epilogue, acc);
-                if (gm.add_to && !gm.pre_act) { acc += s_load(&orow[ow]); }
-                s_store(&orow[ow], acc);
+                apply_epilogue_store<T>(&orow[ow], acc, gm.epilogue, c, gm.add_to,
+                                        gm.pre_act);
             }
         }
     });
@@ -253,10 +251,8 @@ void dwtconv_scalar_last(const DwtConvGeom& gm, TensorView& output,
                     }
                 }
                 if (has_bias) { acc += s_load(&b_ptr[c]); }
-                if (gm.pre_act) { acc += s_load(&dst[c]); }
-                acc = nnops::apply_epilogue(gm.epilogue, acc);
-                if (gm.add_to && !gm.pre_act) { acc += s_load(&dst[c]); }
-                s_store(&dst[c], acc);
+                apply_epilogue_store<T>(&dst[c], acc, gm.epilogue, c, gm.add_to,
+                                        gm.pre_act);
             }
         }
     });
@@ -351,10 +347,8 @@ void dwtconv_channel_first(const DwtConvGeom& gm, TensorView& output,
                     }
                     acc += bias;
                     T* dst = orow + r + t * gm.SW;
-                    if (gm.pre_act) { acc += s_load(dst); }
-                    acc = nnops::apply_epilogue(gm.epilogue, acc);
-                    if (gm.add_to && !gm.pre_act) { acc += s_load(dst); }
-                    s_store(dst, acc);
+                    apply_epilogue_store<T>(dst, acc, gm.epilogue, c, gm.add_to,
+                                            gm.pre_act);
                 };
 
                 const int64_t ilo = std::min(std::max(t_lo, ts), te);
@@ -502,10 +496,8 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                 }
                 if (has_bias) { acc += s_load(&b_ptr[c]); }
                 T* dst = orow + (r + t * gm.SW) * C + c;
-                if (gm.pre_act) { acc += s_load(dst); }
-                acc = nnops::apply_epilogue(gm.epilogue, acc);
-                if (gm.add_to && !gm.pre_act) { acc += s_load(dst); }
-                s_store(dst, acc);
+                apply_epilogue_store<T>(dst, acc, gm.epilogue, c, gm.add_to,
+                                        gm.pre_act);
             };
 
             const auto pixel = [&](int64_t t) {
@@ -528,11 +520,8 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                         }
                         if (has_bias) { acc = v_add(acc, v_load(b_ptr + c)); }
                         T* dst = orow + (r + t * gm.SW) * C + c;
-                        if (gm.pre_act) { acc = v_add(acc, v_load(dst)); }
-                        acc = apply_epilogue_vec<T>(gm.epilogue, tag, acc);
-                        if (gm.add_to && !gm.pre_act) {
-                            acc = v_add(acc, v_load(dst));
-                        }
+                        acc = apply_epilogue_vec_dst<T>(gm.epilogue, tag, acc, dst,
+                                                        gm.add_to, gm.pre_act);
                         v_store(dst, acc);
                     }
                     for (; c < cend; ++c) { scalar_one(t, c); }
@@ -574,22 +563,14 @@ void dwtconv_channel_last(const DwtConvGeom& gm, TensorView& output,
                         T* d1 = d0 + gm.SW * C;
                         T* d2 = d1 + gm.SW * C;
                         T* d3 = d2 + gm.SW * C;
-                        if (gm.pre_act) {
-                            a0 = v_add(a0, v_load(d0));
-                            a1 = v_add(a1, v_load(d1));
-                            a2 = v_add(a2, v_load(d2));
-                            a3 = v_add(a3, v_load(d3));
-                        }
-                        a0 = apply_epilogue_vec<T>(gm.epilogue, tag, a0);
-                        a1 = apply_epilogue_vec<T>(gm.epilogue, tag, a1);
-                        a2 = apply_epilogue_vec<T>(gm.epilogue, tag, a2);
-                        a3 = apply_epilogue_vec<T>(gm.epilogue, tag, a3);
-                        if (gm.add_to && !gm.pre_act) {
-                            a0 = v_add(a0, v_load(d0));
-                            a1 = v_add(a1, v_load(d1));
-                            a2 = v_add(a2, v_load(d2));
-                            a3 = v_add(a3, v_load(d3));
-                        }
+                        a0 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a0, d0,
+                                                       gm.add_to, gm.pre_act);
+                        a1 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a1, d1,
+                                                       gm.add_to, gm.pre_act);
+                        a2 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a2, d2,
+                                                       gm.add_to, gm.pre_act);
+                        a3 = apply_epilogue_vec_dst<T>(gm.epilogue, tag, a3, d3,
+                                                       gm.add_to, gm.pre_act);
                         v_store(d0, a0);
                         v_store(d1, a1);
                         v_store(d2, a2);
@@ -794,8 +775,6 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
     const int32_t zp_x = pl.zero;
     const int64_t in_row = pl.row_stride;
     const int64_t in_ch = pl.ch_stride;
-    const float min_clip = gm.epilogue.min_clip;
-    const float max_clip = gm.epilogue.max_clip;
     const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
 
     const DwtRowGrid grid = dwt_row_grid(gm, ctx.cpu.thread_count());
@@ -840,9 +819,8 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
             } else {
                 float f = static_cast<float>(acc) * swsx;
                 if (has_bias) { f += bias_f; }
-                f = std::min(std::max(f, min_clip), max_clip);
-                f = nnops::apply_epilogue(gm.epilogue, f, c);
-                s_store(dst, f);
+                apply_epilogue_store<TOut>(dst, f, gm.epilogue, c,
+                                           /*add_to=*/false, /*pre_act=*/false);
             }
         };
 
@@ -864,8 +842,6 @@ Status dwtconv_i8_first(const DwtConvGeom& gm, TensorView& output,
                     v_f32x8 f = v_cvt_i32_to_f32(lanes + j);
                     f = v_mul(f, v_set1_f32x8(swsx));
                     if (has_bias) { f = v_add(f, v_set1_f32x8(bias_f)); }
-                    f = v_max(f, v_set1_f32x8(min_clip));
-                    f = v_min(f, v_set1_f32x8(max_clip));
                     f = apply_epilogue_vec<float>(gm.epilogue,
                                                   static_cast<const float*>(nullptr), f);
                     if constexpr (std::is_same_v<TOut, half>) {
@@ -988,8 +964,6 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
     const float s_x = pl.scale;
     const int32_t zp_x = pl.zero;
     const int64_t in_row = pl.row_stride;
-    const float min_clip = gm.epilogue.min_clip;
-    const float max_clip = gm.epilogue.max_clip;
     const bool relu = gm.epilogue.type == EpilogueActivateType::Relu;
 
     PoolArray<float> req_arr;
@@ -1064,9 +1038,8 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                 } else {
                     float f = static_cast<float>(acc) * (quant_scale_at(qw, c) * s_x);
                     if (has_bias) { f += s_load(&b_out[c]); }
-                    f = std::min(std::max(f, min_clip), max_clip);
-                    f = nnops::apply_epilogue(gm.epilogue, f, c);
-                    s_store(dst, f);
+                    apply_epilogue_store<TOut>(dst, f, gm.epilogue, c,
+                                               /*add_to=*/false, /*pre_act=*/false);
                 }
             };
 
@@ -1119,8 +1092,6 @@ Status dwtconv_i8_last(const DwtConvGeom& gm, TensorView& output,
                                     f = v_add(f, v_load(b_out + cb + j));
                                 }
                             }
-                            f = v_max(f, v_set1_f32x8(min_clip));
-                            f = v_min(f, v_set1_f32x8(max_clip));
                             f = apply_epilogue_vec<float>(
                                 gm.epilogue, static_cast<const float*>(nullptr), f);
                             if constexpr (std::is_same_v<TOut, half>) {

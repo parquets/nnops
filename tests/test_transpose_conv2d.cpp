@@ -20,8 +20,11 @@
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
 #include "common/channel_last.hpp"
+#include "common/cpu_pool.hpp"
 
+#include <atomic>
 #include <span>
+#include <thread>
 #include <vector>
 #include <cmath>
 #include <cstring>
@@ -1479,4 +1482,146 @@ NNOPS_TEST(tconv2d_channel_last_depthwise_pre_act) {
     attrs.residual_pre_activation = true;
 
     test_channel_last_residual_vs_ref({1, 16, 9, 9}, {16, 1, 3, 3}, attrs, true);
+}
+
+// ============================================================
+// Thread identity
+// ============================================================
+
+/// Fixed-size pool over a CpuBackend (the test_conv2d.cpp pattern).
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
+NNOPS_TEST(tconv2d_threaded_matches_serial) {
+    // Neither route reorders an element of an output row: the channel-first col
+    // GEMM splits over (batch, group, oc chunk) and each task owns one output
+    // row's scatter and merge, the channel-last kernels split the image. So a
+    // thread count may only change a GEMM's accumulation order. The channel-first
+    // arm carries add_to in the pre-activation order, i.e. the residual read and
+    // the scratch merge that the write-back helpers own.
+    const std::vector<int64_t> in_shape = {2, 32, 12, 12};
+    const std::vector<int64_t> w_shape  = {32, 16, 3, 3};
+
+    auto [in_vec, in_cf] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_cf]  = test::make_random_tensor(w_shape);
+
+    TransposeConv2DAttributes attrs;
+    attrs.kernel_size = {3, 3};
+    attrs.stride      = {2, 2};
+    attrs.dilation    = {1, 1};
+    attrs.padding     = {1, 1};
+    attrs.groups      = 1;
+    attrs.epilogue    = {EpilogueActivateType::Relu6};
+    attrs.add_to      = true;
+    attrs.residual_pre_activation = true;
+
+    auto op = TransposeConv2D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in_cf.desc(), w_cf.desc()};
+    const auto out_descs = op->getOutputTensorDesc(d);
+    const auto numel = static_cast<size_t>(out_descs[0].numel());
+    const auto seed = test::make_random_tensor(
+                          std::span<const int64_t>(out_descs[0].dims.data(),
+                                                   static_cast<size_t>(out_descs[0].rank)))
+                          .first;
+
+    std::vector<float> ref_buf = seed;
+    {
+        TensorView ref = test::make_channel_first(out_descs[0], ref_buf.data());
+        TensorView outs[] = {ref};
+        const TensorView ins[] = {in_cf, w_cf};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}), Status::ok);
+    }
+
+    for (int nt : {2, 4, 20}) {
+        std::vector<float> out_buf = seed;
+        TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_cf, w_cf};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
+        for (size_t i = 0; i < numel; ++i) {
+            NNOPS_EXPECT_NEAR(out_buf[i], ref_buf[i], 1e-5f);
+        }
+    }
+
+    // Channel-last arm: same values through the NHWC route, no residual, since
+    // the packed destination has no channel-first seed to share.
+    TransposeConv2DAttributes cl_attrs = attrs;
+    cl_attrs.add_to = false;
+    cl_attrs.residual_pre_activation = false;
+    auto cl_op = TransposeConv2D::create(cl_attrs, Backend::CPU);
+
+    auto lc_in = LayoutConvert::create(TensorLayout::NHWC, Backend::CPU);
+    const TensorDesc cf_desc = in_cf.desc();
+    const TensorDesc lc_d[] = {cf_desc};
+    const auto lc_descs = lc_in->getOutputTensorDesc(lc_d);
+    std::vector<float> cl_in_buf(static_cast<size_t>(lc_descs[0].storage_bytes()));
+    TensorView in_cl = test::make_packed(lc_descs[0], cl_in_buf.data());
+    {
+        const TensorView lc_ins[] = {in_cf};
+        TensorView lc_outs[] = {in_cl};
+        lc_in->compute(lc_outs, lc_ins);
+    }
+
+    const TensorDesc cl_in_desc = in_cl.desc();
+    const TensorDesc w_desc = w_cf.desc();
+    const TensorDesc cl_d[] = {cl_in_desc, w_desc};
+    const auto cl_out_descs = cl_op->getOutputTensorDesc(cl_d);
+    const auto cl_bytes = static_cast<size_t>(cl_out_descs[0].storage_bytes());
+
+    std::vector<float> cl_ref_buf(cl_bytes);
+    {
+        TensorView out = test::make_packed(cl_out_descs[0], cl_ref_buf.data());
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_cl, w_cf};
+        NNOPS_EXPECT_EQ(cl_op->compute(outs, ins, ComputeContext{}), Status::ok);
+    }
+
+    for (int nt : {2, 4, 20}) {
+        std::vector<float> out_buf(cl_bytes);
+        TensorView out = test::make_packed(cl_out_descs[0], out_buf.data());
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_cl, w_cf};
+        NNOPS_EXPECT_EQ(cl_op->compute(outs, ins, ctx), Status::ok);
+        for (size_t i = 0; i < cl_ref_buf.size(); ++i) {
+            NNOPS_EXPECT_NEAR(out_buf[i], cl_ref_buf[i], 1e-5f);
+        }
+    }
 }

@@ -1,6 +1,7 @@
 #pragma once
 /// @file simd_epilogue.hpp
-/// @brief Epilogue kernels — scalar and vector apply_epilogue, epilogue_inplace,
+/// @brief Epilogue kernels — scalar and vector apply_epilogue, the fp write-back
+///        sequence (apply_epilogue_store / _vec_dst / _row), epilogue_inplace,
 ///        and the int8 / fp tile output passes of MatMul and Conv2D. The scalar
 ///        overloads declared in nnops/core/epilogue.hpp are defined here.
 ///
@@ -458,6 +459,91 @@ inline vec_for<T> apply_epilogue_vec(const Epilogue& ep,
             v_set1(type_tag, 1.0f));
     }
     return vx;
+}
+
+// =========================================================================
+//  The fp write-back sequence — bias, residual order, activation
+// =========================================================================
+//
+// Every fp route ends the same way: add the bias, fold the destination's old
+// value in (the residual) on whichever side of the activation the operator's
+// order asks for, apply the epilogue, store. Only where the operands live
+// differs — a memory run, a live register vector, one element of a strided
+// walk — so the sequence lives here once per operand kind rather than once per
+// route, and the residual order is decided in one place. pre_act implies
+// add_to: the residual is the same value either way.
+//
+// The quant stage is a per-channel table read element by element, which is what
+// drops a run to the scalar path; the vector forms apply the clip and the
+// activation only. A route whose epilogue has no quant stage — every fp one
+// today — pays nothing for the distinction.
+
+/// One element: epilogue(clamp) with the destination's old value folded in
+/// before (@p pre_act) or after the activation, then stored.
+template <class T>
+inline void apply_epilogue_store(T* dst, float x, const Epilogue& ep,
+                                 int64_t quant_idx, bool add_to, bool pre_act) {
+    if (add_to && pre_act) { x += s_load(dst); }
+    x = nnops::apply_epilogue(ep, x, quant_idx);
+    if (add_to && !pre_act) { x += s_load(dst); }
+    s_store(dst, x);
+}
+
+/// The same sequence for an accumulator that is already a vector: the caller has
+/// added the bias, the residual comes from the destination.
+template <class T>
+inline vec_for<T> apply_epilogue_vec_dst(const Epilogue& ep, const T* type_tag,
+                                         vec_for<T> v, const T* dst,
+                                         bool add_to, bool pre_act) {
+    if (add_to && pre_act) { v = v_add(v, v_load(dst)); }
+    v = apply_epilogue_vec(ep, type_tag, v);
+    if (add_to && !pre_act) { v = v_add(v, v_load(dst)); }
+    return v;
+}
+
+/// A contiguous run of an output row, `src` to `dst`:
+///
+///     dst[i] = epilogue(src[i] + bias[·] + [residual]) [+ residual]
+///
+/// @p bias is one value for the whole run when @p bias_step is 0, one per
+/// element when it is 1, and absent when the pointer is null. The quant stage is
+/// indexed by output channel — @p quant_idx + i·@p quant_step — which is 1 for a
+/// run over channels and 0 for a run over pixels inside one channel. `src` and
+/// `dst` may alias; the residual, always the destination's own old value, is
+/// read before the store.
+template <class T>
+inline void apply_epilogue_row(T* dst, const T* src, int64_t n,
+                               const T* bias, int64_t bias_step,
+                               const Epilogue& ep, int64_t quant_idx,
+                               int64_t quant_step, bool add_to, bool pre_act) {
+    constexpr int L = simd_lane_for<T>;
+    const T* type_tag = nullptr;
+    const bool pre  = add_to && pre_act;
+    const bool post = add_to && !pre_act;
+    int64_t i = 0;
+
+    if (ep.quant == EpilogueQuantType::None && bias_step <= 1) {
+        const auto vb = v_set1(type_tag, bias ? s_load(bias) : 0.0f);
+        for (; i + L <= n; i += L) {
+            vec_for<T> v = v_load(src + i);
+            if (bias != nullptr) {
+                v = v_add(v, bias_step == 0 ? vb : v_load(bias + i));
+            }
+            if (pre) { v = v_add(v, v_load(dst + i)); }
+            v = apply_epilogue_vec(ep, type_tag, v);
+            if (post) { v = v_add(v, v_load(dst + i)); }
+            v_store(dst + i, v);
+        }
+    }
+
+    for (; i < n; ++i) {
+        float x = s_load(src + i);
+        if (bias != nullptr) { x += s_load(bias + i * bias_step); }
+        if (pre) { x += s_load(dst + i); }
+        x = nnops::apply_epilogue(ep, x, quant_idx + i * quant_step);
+        if (post) { x += s_load(dst + i); }
+        s_store(dst + i, x);
+    }
 }
 
 /// data = epilogue(data + bias) + add_src, in place over an M×N row-major tile.

@@ -178,11 +178,9 @@ bool tconv3d_gemm(const Geom3& gm,
                         const T* rp = row + r * cg.w.mic;
                         for (int64_t t = 0; t < nr; ++t) {
                             const int64_t ow = r + t * gm.SW;
-                            float a = s_load(&rp[t]);
-                            if (gm.pre_act) { a += s_load(&orow[ow]); }
-                            float v = nnops::apply_epilogue(gm.epilogue, a, oc);
-                            if (gm.add_to && !gm.pre_act) { v += s_load(&orow[ow]); }
-                            s_store(&orow[ow], v);
+                            apply_epilogue_store<T>(&orow[ow], s_load(&rp[t]),
+                                                    gm.epilogue, oc, gm.add_to,
+                                                    gm.pre_act);
                         }
                     }
                 });
@@ -369,10 +367,8 @@ void tconv3d_gather(const Geom3& gm,
                     }
 
                     if (b_ptr) { acc += s_load(&b_ptr[oc]); }
-                    if (gm.pre_act) { acc += s_load(op); }
-                    acc = nnops::apply_epilogue(gm.epilogue, acc, oc);
-                    if (gm.add_to && !gm.pre_act) { acc += s_load(op); }
-                    s_store(op, acc);
+                    apply_epilogue_store<T>(op, acc, gm.epilogue, oc, gm.add_to,
+                                            gm.pre_act);
                 }
             }
         }

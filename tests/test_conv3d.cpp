@@ -17,9 +17,12 @@
 #include "common/test_helpers.hpp"
 #include "common/random_tensor.hpp"
 #include "common/compare.hpp"
+#include "common/cpu_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <span>
+#include <thread>
 #include <vector>
 #include <cstdint>
 
@@ -396,4 +399,92 @@ NNOPS_TEST(conv3d_f16) {
                         TensorLayout::NCDHW);
     NNOPS_EXPECT_TRUE(test::allclose(got_view, out_ref, test::kF16AccumTol,
                                      test::kF16AccumTol));
+}
+
+// ============================================================
+// Thread identity
+// ============================================================
+
+/// Fixed-size pool over a CpuBackend (the test_conv2d.cpp pattern).
+struct SimplePool {
+    explicit SimplePool(int nthreads) : nthreads_(nthreads) {
+        if (nnops::test::bench_use_openmp()) {
+            cpu = nnops::openmp_backend(nthreads);
+            return;
+        }
+        cpu.parallel_for = [this](int64_t begin, int64_t end, const ParallelForBody& body) {
+            this->parallel_for(begin, end, body);
+        };
+        cpu.num_threads = [this]() { return nthreads_; };
+        cpu.thread_id = []() { return current_thread_id_; };
+    }
+
+    void parallel_for(int64_t begin, int64_t end, const ParallelForBody& body) {
+        std::atomic<int64_t> next{begin};
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(nthreads_));
+        for (int t = 0; t < nthreads_; ++t) {
+            workers.emplace_back([&, t]() {
+                current_thread_id_ = t;
+                for (;;) {
+                    int64_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= end) { break; }
+                    body(i);
+                }
+            });
+        }
+        for (auto& w : workers) { w.join(); }
+    }
+
+    int nthreads_;
+    CpuBackend cpu;
+    inline static thread_local int current_thread_id_ = 0;
+};
+
+NNOPS_TEST(conv3d_threaded_matches_serial) {
+    // The grid splits over batches, oc chunks and output rows, and every task
+    // writes rows of its own, so a thread count may only change accumulation
+    // order. The residual puts the staged write pass under the comparison.
+    const std::vector<int64_t> in_shape = {2, 16, 4, 8, 8};
+    const std::vector<int64_t> w_shape  = {32, 16, 3, 3, 3};
+
+    auto [in_vec, in_view] = test::make_random_tensor(in_shape);
+    auto [w_vec,  w_view]  = test::make_random_tensor(w_shape);
+
+    Conv3DAttributes attrs;
+    attrs.kernel_size = {3, 3, 3};
+    attrs.padding     = {1, 1, 1};
+    attrs.add_to      = true;
+
+    auto op = Conv3D::create(attrs, Backend::CPU);
+    const TensorDesc d[] = {in_view.desc(), w_view.desc()};
+    const auto out_descs = op->getOutputTensorDesc(d);
+    const auto numel = static_cast<size_t>(out_descs[0].numel());
+    const int64_t OW = out_descs[0].dims[4];
+    const auto seed = test::make_random_tensor(
+                          std::span<const int64_t>(out_descs[0].dims.data(),
+                                                   static_cast<size_t>(out_descs[0].rank)))
+                          .first;
+
+    std::vector<float> ref_buf = seed;
+    TensorView ref = test::make_channel_first(out_descs[0], ref_buf.data());
+    init_rows(ref, seed, OW);
+    {
+        TensorView outs[] = {ref};
+        const TensorView ins[] = {in_view, w_view};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ComputeContext{}), Status::ok);
+    }
+
+    for (int nt : {2, 4, 20}) {
+        std::vector<float> out_buf = seed;
+        TensorView out = test::make_channel_first(out_descs[0], out_buf.data());
+        init_rows(out, seed, OW);
+        SimplePool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        TensorView outs[] = {out};
+        const TensorView ins[] = {in_view, w_view};
+        NNOPS_EXPECT_EQ(op->compute(outs, ins, ctx), Status::ok);
+        NNOPS_EXPECT_TRUE(test::allclose(out, ref, 1e-5f, 1e-5f));
+    }
 }

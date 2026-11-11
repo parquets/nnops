@@ -188,17 +188,11 @@ inline void winograd_output_tile8(const T* m_base, int m_plane_stride,
             if (ow >= ow_end) { break; }
             // pre_act is the ResNet order: the residual joins the sum before
             // the activation. The read is the same either way.
-            float v = b0[lane] + bias_oc;
-            if (add_to && pre_act) { v += s_load(row + ow); }
-            v = apply_epilogue(ep, v);
-            if (add_to && !pre_act) { v += s_load(row + ow); }
-            s_store(row + ow, v);
+            backend::cpu::apply_epilogue_store<T>(row + ow, b0[lane] + bias_oc, ep,
+                                                  oc, add_to, pre_act);
             if (ow + 1 < ow_end) {
-                float v1 = b1[lane] + bias_oc;
-                if (add_to && pre_act) { v1 += s_load(row + ow + 1); }
-                v1 = apply_epilogue(ep, v1);
-                if (add_to && !pre_act) { v1 += s_load(row + ow + 1); }
-                s_store(row + ow + 1, v1);
+                backend::cpu::apply_epilogue_store<T>(
+                    row + ow + 1, b1[lane] + bias_oc, ep, oc, add_to, pre_act);
             }
         }
     }
@@ -536,11 +530,8 @@ inline void winograd43_output_tile8(const T* m_base, int m_plane_stride,
             for (int lane = 0; lane < 8; ++lane) {
                 const int ow = ow0 + 4 * lane + c;
                 if (ow >= ow_end) { break; }
-                float val = b[lane] + bias_oc;
-                if (add_to && pre_act) { val += s_load(out[r] + ow); }
-                val = apply_epilogue(ep, val);
-                if (add_to && !pre_act) { val += s_load(out[r] + ow); }
-                s_store(out[r] + ow, val);
+                backend::cpu::apply_epilogue_store<T>(
+                    out[r] + ow, b[lane] + bias_oc, ep, oc, add_to, pre_act);
             }
         }
     }

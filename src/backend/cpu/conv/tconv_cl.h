@@ -50,28 +50,11 @@ template <typename T, typename G>
 void merge_oc_row(T* orow, const T* row, const T* bias, int64_t oc_base,
                   const G& gm, int64_t nc)
 {
-    const T* type_tag = nullptr;
-    constexpr int L = simd_lane_for<T>;
+    const T* bp = bias ? bias + oc_base : nullptr;
     for (int64_t ow = 0; ow < gm.OW; ++ow) {
-        const T* rp = row + ow * nc;
-        T* dp = orow + ow * gm.OC;
-        int64_t c = 0;
-        for (; c + L <= nc; c += L) {
-            vec_for<T> acc = v_load(rp + c);
-            if (bias) { acc = v_add(acc, v_load(bias + oc_base + c)); }
-            if (gm.pre_act) { acc = v_add(acc, v_load(dp + c)); }
-            acc = apply_epilogue_vec<T>(gm.epilogue, type_tag, acc);
-            if (gm.add_to && !gm.pre_act) { acc = v_add(acc, v_load(dp + c)); }
-            v_store(dp + c, acc);
-        }
-        for (; c < nc; ++c) {
-            float v = s_load(rp + c);
-            if (bias) { v += s_load(bias + oc_base + c); }
-            if (gm.pre_act) { v += s_load(dp + c); }
-            v = nnops::apply_epilogue(gm.epilogue, v, oc_base + c);
-            if (gm.add_to && !gm.pre_act) { v += s_load(dp + c); }
-            s_store(dp + c, v);
-        }
+        apply_epilogue_row<T>(orow + ow * gm.OC, row + ow * nc, nc, bp,
+                              /*bias_step=*/1, gm.epilogue, oc_base,
+                              /*quant_step=*/1, gm.add_to, gm.pre_act);
     }
 }
 
