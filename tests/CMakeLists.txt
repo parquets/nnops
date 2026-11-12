@@ -181,6 +181,7 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_matmul.cpp
             bench_cuda_linear.cpp
             bench_cuda_conv2d.cpp
+            bench_cuda_pooling.cpp
         )
     endif()
 

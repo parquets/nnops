@@ -154,6 +154,41 @@ NNOPS_TEST(cuda_pooling_channel_first_add_to) {
     run_case(c, "cuda_pooling_channel_first_add_to");
 }
 
+NNOPS_TEST(cuda_pooling_channel_first_window) {
+    // A row wide enough for four column runs: the only channel-first shapes
+    // that take the column-walking kernel. 21 wide at stride 2 leaves 11
+    // outputs, so the last thread covers three of its four columns.
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        PoolCase c;
+        c.shape = {1, 3, 15, 21};
+        c.dtype = dt;
+        c.attrs = window(PoolingType::Max, 3, 2, 1);
+        run_case(c, "cuda_pooling_channel_first_window");
+        c.attrs = window(PoolingType::Average, 3, 2, 1);
+        c.attrs.exclude_pad = true;
+        run_case(c, "cuda_pooling_channel_first_window");
+        c.attrs = window(PoolingType::Max, 2, 1, 0);
+        run_case(c, "cuda_pooling_channel_first_window");
+    }
+    // The same kernel walks the depth loop, so a 3D window takes it too.
+    PoolCase d;
+    d.shape = {1, 3, 4, 6, 12};
+    d.layout = TensorLayout::NCDHW;
+    d.attrs = window(PoolingType::Average, 3, 1, 1);
+    d.attrs.exclude_pad = true;
+    run_case(d, "cuda_pooling_channel_first_window");
+}
+
+NNOPS_TEST(cuda_pooling_first_flat_fallback) {
+    // N·C·OD past blockIdx.z's range: this geometry keeps the flat script,
+    // which is the route every channel-first shape took before the axes did.
+    PoolCase c;
+    c.shape = {1, 512, 130, 2, 2};
+    c.layout = TensorLayout::NCDHW;
+    c.attrs = window(PoolingType::Average, 1, 1, 0);
+    run_case(c, "cuda_pooling_first_flat_fallback");
+}
+
 NNOPS_TEST(cuda_pooling_channel_first_3d) {
     PoolCase c;
     c.shape = {1, 3, 4, 6, 8};
@@ -223,6 +258,40 @@ NNOPS_TEST(cuda_pooling_channel_last_f16) {
     run_case(c, "cuda_pooling_channel_last_f16");
     c.attrs = window(PoolingType::Average, 3, 1, 1);
     run_case(c, "cuda_pooling_channel_last_f16");
+}
+
+NNOPS_TEST(cuda_pooling_channel_last_rows) {
+    // Unit stride and a square kernel: the channel-last kernel that walks two
+    // output rows per thread. The max window pads, so its last row is short;
+    // the exclude_pad average divides by a count that changes at the border.
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        PoolCase c;
+        c.shape = {1, 16, 10, 10};
+        c.dtype = dt;
+        c.layout = TensorLayout::NHWC;
+        c.attrs = window(PoolingType::Max, 3, 1, 1);
+        run_case(c, "cuda_pooling_channel_last_rows");
+        c.attrs = window(PoolingType::Average, 2, 1, 1);
+        c.attrs.exclude_pad = true;
+        run_case(c, "cuda_pooling_channel_last_rows");
+    }
+    // A 3D unit-stride window takes the same walk with a depth loop.
+    PoolCase d;
+    d.shape = {1, 8, 3, 6, 6};
+    d.layout = TensorLayout::NDHWC;
+    d.attrs = window(PoolingType::Average, 3, 1, 1);
+    d.attrs.exclude_pad = true;
+    run_case(d, "cuda_pooling_channel_last_rows");
+}
+
+NNOPS_TEST(cuda_pooling_last_flat_fallback) {
+    // (image, depth, row) past blockIdx.z's range, on a window that is neither
+    // square nor of the walkable sizes: the channel-last flat script.
+    PoolCase c;
+    c.shape = {1, 8, 300, 250, 2};
+    c.layout = TensorLayout::NDHWC;
+    c.attrs = window(PoolingType::Max, 1, 1, 0);
+    run_case(c, "cuda_pooling_last_flat_fallback");
 }
 
 NNOPS_TEST(cuda_pooling_channel_last_3d) {
