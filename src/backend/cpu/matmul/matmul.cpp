@@ -85,13 +85,19 @@ struct FpRoute {
     static constexpr bool is_fp            = true;
     static constexpr bool is_dq            = false;
     static constexpr bool fused_a          = false;
-    static constexpr bool has_direct_a     = true;   // A may be read through lda
+    // A may be read through lda — except for bf16, whose GEOM packs it always.
+    static constexpr bool has_direct_a =
+        !std::is_same_v<T, bfloat16>;
     static constexpr bool hoists_b_m_split = false;  // B packs inside each block
 
     using EpilogueParams = NoEpilogueParams;
 
     static constexpr const MatmulGeom& geom() {
-        return std::is_same_v<T, float> ? GEOM_F32 : GEOM_F16;
+        if constexpr (std::is_same_v<T, float>) { return GEOM_F32; }
+#ifdef NNOPS_ARCH_AARCH64
+        else if constexpr (std::is_same_v<T, bfloat16>) { return GEOM_BF16; }
+#endif
+        else { return GEOM_F16; }
     }
 
     /// One batch element's B: a dense view, or a Q4_1 block stream.
@@ -149,8 +155,12 @@ struct FpRoute {
         // k and n_start are element indices even for a block-packed B; only
         // its row stride counts blocks.
         if (b.blocked()) {
-            tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
-                               b.ptr, b.row_blocks, attrs.alpha);
+            // bf16 has no block stream (matmul_dispatch_fp rejects that pair),
+            // but the route still has to compile for it.
+            if constexpr (!std::is_same_v<T, bfloat16>) {
+                tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
+                                   b.ptr, b.row_blocks, attrs.alpha);
+            }
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
@@ -1159,7 +1169,8 @@ Status check_packed_b(const MatMulAttributes& attrs, const TensorView& a,
     const bool int8_blob = dt_a == DataType::s8 && b.data_type() == DataType::s8;
     if (!int8_blob) {
         const bool float_blob = dt_a == b.data_type() &&
-                                (dt_a == DataType::f32 || dt_a == DataType::f16);
+                                (dt_a == DataType::f32 || dt_a == DataType::f16 ||
+                                 (nnops::detail::bf16_enabled && dt_a == DataType::bf16));
         if (!float_blob) { return Status::unsupported; }
         if (attrs.alpha != 1.0f) { return Status::unsupported; }
     }
@@ -1214,9 +1225,12 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     const auto& b = inputs[1];
     const DataType dt_a = a.data_type();
     const DataType dt_b = b.data_type();
-    const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16;
+    const bool float_a = dt_a == DataType::f32 || dt_a == DataType::f16 ||
+                         (nnops::detail::bf16_enabled && dt_a == DataType::bf16);
     const bool block_b = is_block_packed_dtype(dt_b);
     const bool same_type = dt_b == dt_a;
+    // A bf16 B has one packed form and no block stream: no Q4_1 cross-pair.
+    if (dt_a == DataType::bf16 && !same_type) { return Status::unsupported; }
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
     // Small-M block quant (Q4_1): decode straight into the product, before the
@@ -1240,9 +1254,15 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
     if (!float_a || (!same_type && !block_b)) { return Status::unsupported; }
 
     const auto plan = make_plan(attrs, a, b, ctx);
-    return dt_a == DataType::f32
-        ? run_route<FpRoute<float>>(attrs, output, inputs, ctx, plan)
-        : run_route<FpRoute<half>>(attrs, output, inputs, ctx, plan);
+    if (dt_a == DataType::f32) {
+        return run_route<FpRoute<float>>(attrs, output, inputs, ctx, plan);
+    }
+#ifdef NNOPS_ARCH_AARCH64
+    if (dt_a == DataType::bf16) {
+        return run_route<FpRoute<bfloat16>>(attrs, output, inputs, ctx, plan);
+    }
+#endif
+    return run_route<FpRoute<half>>(attrs, output, inputs, ctx, plan);
 }
 
 /// An optional third input (a per-column bias) rides the routes that write fp
@@ -1317,7 +1337,8 @@ Status matmul_cpu(const MatMulAttributes& attrs,
         NNOPS_ASSERT_MSG(bias.data_type() == DataType::s32,
                          "MatMul: an integer output (s32/s8/u8) takes an int32 bias");
     } else {
-        NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16,
+        NNOPS_ASSERT_MSG(odt == DataType::f32 || odt == DataType::f16 ||
+                             odt == DataType::bf16,
                          "MatMul: the bias needs an fp or integer output");
         NNOPS_ASSERT(bias.data_type() == odt);
     }

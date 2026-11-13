@@ -10,14 +10,18 @@
 #include "nnops/ops/cumsum.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/simd/simd.hpp"
+#include "common/dtype_dispatch.hpp"
 
 namespace nnops::backend::cpu {
 
-Status cumsum_cpu(const CumSumAttributes& attrs,
-                TensorView& output,
-                std::span<const TensorView> inputs,
-                const ComputeContext& ctx,
-                void* /*workspace*/)
+/// The running sum lives in f32 whatever T is, so a bf16 or f16 run does not
+/// accumulate the rounding of every step into the next.
+template <typename T>
+Status cumsum_impl(const CumSumAttributes& attrs,
+                   TensorView& output,
+                   std::span<const TensorView> inputs,
+                   const ComputeContext& ctx)
 {
     const auto& input = inputs[0];
     const int64_t rank = input.rank();
@@ -39,8 +43,8 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
         lower_dim_size *= input.shape(i);
     }
 
-    const auto* in_ptr  = input.ptr<float>();
-    auto* out_ptr = output.ptr<float>();
+    const auto* in_ptr  = input.ptr<T>();
+    auto* out_ptr = output.ptr<T>();
 
     // Pitch-aware: the axis step can exceed lower_dim_size.
     const int64_t axis_stride = input.stride_elems(axis);
@@ -55,8 +59,8 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
                         float val = running;
-                        out_ptr[idx] = val;
-                        running += in_ptr[idx];
+                        simd::s_store(out_ptr + idx, val);
+                        running += simd::s_load(in_ptr + idx);
                     }
                 }
             } else {
@@ -64,8 +68,8 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
                 for (int64_t k = 0; k < dim; ++k) {
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
-                        running += in_ptr[idx];
-                        out_ptr[idx] = running;
+                        running += simd::s_load(in_ptr + idx);
+                        simd::s_store(out_ptr + idx, running);
                     }
                 }
             }
@@ -82,8 +86,8 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
                         float val = running;
-                        out_ptr[idx] = val;
-                        running += in_ptr[idx];
+                        simd::s_store(out_ptr + idx, val);
+                        running += simd::s_load(in_ptr + idx);
                     }
                 }
             } else {
@@ -91,8 +95,8 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
                 for (int64_t k = dim - 1; k >= 0; --k) {
                     for (int64_t s = 0; s < lower_dim_size; ++s) {
                         int64_t idx = slice_start + k * axis_stride + s;
-                        running += in_ptr[idx];
-                        out_ptr[idx] = running;
+                        running += simd::s_load(in_ptr + idx);
+                        simd::s_store(out_ptr + idx, running);
                     }
                 }
             }
@@ -100,6 +104,19 @@ Status cumsum_cpu(const CumSumAttributes& attrs,
 
         ctx.cpu.run(0, upper_dim_count, process_slice);
     }
+    return Status::ok;
+}
+
+Status cumsum_cpu(const CumSumAttributes& attrs,
+                  TensorView& output,
+                  std::span<const TensorView> inputs,
+                  const ComputeContext& ctx,
+                  void* /*workspace*/)
+{
+    dispatch_f32_f16(inputs[0].data_type(), "cumsum_cpu", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        cumsum_impl<T>(attrs, output, inputs, ctx);
+    });
     return Status::ok;
 }
 

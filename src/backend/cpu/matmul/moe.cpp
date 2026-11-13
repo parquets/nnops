@@ -656,6 +656,9 @@ Status moe_cpu(const MoEAttributes& attrs,
     switch (inputs[0].data_type()) {
     case DataType::f32: moe_cpu_impl<float>(attrs, output, inputs, ctx); return Status::ok;
     case DataType::f16: moe_cpu_impl<half>(attrs, output, inputs, ctx);  return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: moe_cpu_impl<bfloat16>(attrs, output, inputs, ctx); return Status::ok;
+#endif
     default: break;
     }
     return Status::unsupported;

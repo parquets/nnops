@@ -267,6 +267,14 @@ void CpuFeatures::detect() {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_FP16);
     }
     #endif
+    // FEAT_BF16: HWCAP2 bit 14 (defined by the kernel as HWCAP2_BF16; spelled
+    // numerically so old headers still compile).
+    #ifndef HWCAP2_BF16
+    #define HWCAP2_BF16 (1L << 14)
+    #endif
+    if (hwcap2 & HWCAP2_BF16) {
+        features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
+    }
 
 #elif defined(_WIN32)
     // NEON (ASIMD) is always available. 43 is
@@ -274,6 +282,22 @@ void CpuFeatures::detect() {
     // against SDKs that predate the enumerator.
     if (IsProcessorFeaturePresent(43)) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_DOT);
+    }
+    // 47 is PF_ARM_BF16_INSTRUCTIONS_AVAILABLE, likewise spelled numerically.
+    if (IsProcessorFeaturePresent(47)) {
+        features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
+    }
+#endif
+
+    // macOS publishes the optional features as their own sysctl nodes.
+#if defined(__APPLE__)
+    {
+        int32_t has_bf16 = 0;
+        size_t len = sizeof(has_bf16);
+        if (sysctlbyname("hw.optional.arm.FEAT_BF16", &has_bf16, &len,
+                         nullptr, 0) == 0 && has_bf16 != 0) {
+            features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
+        }
     }
 #endif
 

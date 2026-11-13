@@ -755,6 +755,11 @@ Status pooling_cpu(const PoolingAttributes& attrs,
     case DataType::f16:
         pooling_fp<half>(a, output, inputs, ctx);
         return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16:
+        pooling_fp<bfloat16>(a, output, inputs, ctx);
+        return Status::ok;
+#endif
     case DataType::s8:
         if (odtype == DataType::s8) {
             pooling_quant<int8_t, int8_t>(qattrs, output, inputs, ctx);

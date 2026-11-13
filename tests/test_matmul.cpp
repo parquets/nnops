@@ -100,6 +100,7 @@ void matmul_dq_ref(const MatMulAttributes& attrs,
 }
 
 using nnops::test::kF16AccumTol;
+using nnops::test::kBF16AccumTol;
 
 NNOPS_TEST(matmul_basic_2d) {
     // A: [2, 3], B: [3, 2]  →  C: [2, 2]
@@ -3251,3 +3252,257 @@ NNOPS_TEST(matmul_prepacked_b_contract_errors) {
     const TensorView sins[] = {a2, packed};
     NNOPS_EXPECT_EQ(sop->compute(out, sins, {}, nullptr), Status::unsupported);
 }
+
+// ============================================================
+// bf16 — aarch64 only; x86 refuses the dtype
+// ============================================================
+//
+// bf16 rides the f16 tests' contract: compared against the f32 reference on
+// the same values, within the arch-aware kBF16AccumTol. The kernels are
+// BFMMLA's (FEAT_BF16) with a widening f32 fallback for pre-v8.6 cores; on a
+// core with the instruction, the fallback is reachable only through the
+// bf16_force_wide test hook, so the tests below run both paths.
+
+#if defined(NNOPS_ARCH_AARCH64)
+
+namespace {
+
+/// Run one bf16 matmul case and compare every element to the f32 reference.
+/// `force_wide` drives the fallback kernel; `tol` is absolute.
+void run_bf16_case(const MatMulAttributes& attrs,
+                   std::initializer_list<int64_t> a_shape,
+                   std::initializer_list<int64_t> b_shape,
+                   uint64_t seed, float tol, bool force_wide) {
+    namespace cpu = nnops::backend::cpu;
+    const std::vector<int64_t> as(a_shape), bs(b_shape);
+    auto [a32, _]  = test::make_random_tensor(as, -1.0f, 1.0f, seed);
+    auto [b32, __] = test::make_random_tensor(bs, -1.0f, 1.0f, seed + 1);
+    auto a_bf = test::f32_to_bf16(a32);
+    auto b_bf = test::f32_to_bf16(b32);
+
+    TensorView a(std::span<const int64_t>(as), DataType::bf16, a_bf.data());
+    TensorView b(std::span<const int64_t>(bs), DataType::bf16, b_bf.data());
+
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::bf16);
+
+    std::vector<cpu::bfloat16> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = test::make_channel_first(descs[0], out_buf.data());
+
+    cpu::aarch64::bf16_force_wide = force_wide;
+    const TensorView ins[] = {a, b};
+    const auto st = op->compute(output, ins, {}, nullptr);
+    cpu::aarch64::bf16_force_wide = false;
+    NNOPS_EXPECT_EQ(st, Status::ok);
+
+    TensorView a32v(std::span<const int64_t>(as), DataType::f32, a32.data());
+    TensorView b32v(std::span<const int64_t>(bs), DataType::f32, b32.data());
+    const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
+    auto ref_out = test::make_channel_first(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32v, b32v};
+    cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[i]), ref_buf[i], tol);
+    }
+}
+
+}  // namespace
+
+NNOPS_TEST(matmul_bf16_basic) {
+    // Both paths on the same shape: one kc block (K = 40), a partial N panel
+    // (N = 9) and rows past mr (M = 12 = 8 + 4).
+    for (const bool wide : {false, true}) {
+        MatMulAttributes attrs{};
+        run_bf16_case(attrs, {12, 40}, {40, 9}, 950, kBF16AccumTol, wide);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_transpose_b_packed) {
+    // transpose_b through the B pack, N = 25 = 16 + 9 panels and K = 13 = 8 + 9
+    // leaving a tail inside every panel's last k-group.
+    for (const bool wide : {false, true}) {
+        MatMulAttributes attrs{};
+        attrs.transpose_b = true;
+        run_bf16_case(attrs, {7, 13}, {25, 13}, 901, kBF16AccumTol, wide);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_transpose_a) {
+    // transpose_a packs A out of the caller's [K, M] view into dense rows.
+    for (const bool wide : {false, true}) {
+        MatMulAttributes attrs{};
+        attrs.transpose_a = true;
+        run_bf16_case(attrs, {7, 33}, {7, 11}, 911, kBF16AccumTol, wide);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_tiled_and_odd_k) {
+    // A tiled shape (K over two kc blocks, M and N over several panels) and an
+    // odd K whose tail k-group is partial (37 = 9*4 + 1), both paths.
+    for (const bool wide : {false, true}) {
+        MatMulAttributes attrs{};
+        run_bf16_case(attrs, {33, 100}, {100, 33}, 921, kBF16AccumTol, wide);
+        run_bf16_case(attrs, {5, 37}, {37, 17}, 931, kBF16AccumTol, wide);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_prepacked_b) {
+    // The blob is the BFMMLA panel layout, so a prepacked B must agree
+    // bit-for-bit with a raw B that takes the same tiled GEMM.
+    constexpr int64_t M = 5, K = 37, N = 25;   // odd k-group tail + 16+9 panels
+    auto [a32, _]  = test::make_random_tensor({M, K}, -1.0f, 1.0f, 941);
+    auto [b32, __] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 942);
+    auto a_bf = test::f32_to_bf16(a32);
+    auto b_bf = test::f32_to_bf16(b32);
+
+    const int64_t a_shape[] = {M, K};
+    const int64_t b_shape[] = {K, N};
+    TensorView a(a_shape, DataType::bf16, a_bf.data());
+    TensorView b(b_shape, DataType::bf16, b_bf.data());
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    std::vector<nnops::backend::cpu::bfloat16> blob;
+    TensorView packed = prepack_b(*op, b, blob);
+
+    const TensorDesc arr[] = {a.desc(), packed.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::bf16);
+
+    std::vector<nnops::backend::cpu::bfloat16> raw_buf(static_cast<size_t>(M * N));
+    std::vector<nnops::backend::cpu::bfloat16> pk_buf(static_cast<size_t>(M * N));
+    auto raw_out = test::make_channel_first(descs[0], raw_buf.data());
+    auto pk_out = test::make_channel_first(descs[0], pk_buf.data());
+
+    const TensorView raw_ins[] = {a, b};
+    op->compute(raw_out, raw_ins, {}, nullptr);
+    const TensorView pk_ins[] = {a, packed};
+    NNOPS_EXPECT_EQ(op->compute(pk_out, pk_ins, {}, nullptr), Status::ok);
+
+    for (size_t i = 0; i < raw_buf.size(); ++i) {
+        NNOPS_EXPECT_EQ(pk_buf[i].bits, raw_buf[i].bits);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_bias) {
+    // bf16 operands and bias against the f32 reference (the bias seeds the
+    // accumulator column-wise, before the clamp and the activation).
+    auto [a32, _]  = test::make_random_tensor({12, 40}, -1.0f, 1.0f, 950);
+    auto [b32, __] = test::make_random_tensor({40, 9}, -1.0f, 1.0f, 951);
+    auto [z32, ___] = test::make_random_tensor({9}, -0.5f, 0.5f, 952);
+    auto a_bf = test::f32_to_bf16(a32);
+    auto b_bf = test::f32_to_bf16(b32);
+    auto bias_bf = test::f32_to_bf16(z32);
+
+    const int64_t a_shape[] = {12, 40};
+    const int64_t b_shape[] = {40, 9};
+    const int64_t bias_shape[] = {9};
+    TensorView a(a_shape, DataType::bf16, a_bf.data());
+    TensorView b(b_shape, DataType::bf16, b_bf.data());
+    TensorView bias(bias_shape, DataType::bf16, bias_bf.data());
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc(), bias.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::bf16);
+
+    std::vector<nnops::backend::cpu::bfloat16> out_buf(
+        static_cast<size_t>(descs[0].numel()));
+    auto output = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b, bias};
+    NNOPS_EXPECT_EQ(op->compute(output, ins, {}, nullptr), Status::ok);
+
+    TensorView a32v(a_shape, DataType::f32, a32.data());
+    TensorView b32v(b_shape, DataType::f32, b32.data());
+    TensorView z32v(bias_shape, DataType::f32, z32.data());
+    const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc(), z32v.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
+    auto ref_out = test::make_channel_first(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32v, b32v, z32v};
+    nnops::backend::cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[i]), ref_buf[i], kBF16AccumTol);
+    }
+}
+
+NNOPS_TEST(matmul_bf16_deep_k_accumulation) {
+    namespace cpu = nnops::backend::cpu;
+
+    // Same contract as the f16 deep-K test: the kc-blocked loop carries partial
+    // sums through C, which is bf16, so error grows with K. Pin kc and the
+    // worst case relative to max |ref|.
+    const int64_t M = 64, K = 4096, N = 64;
+    auto [a32, _]  = test::make_random_tensor({M, K}, -1.0f, 1.0f, 4242);
+    auto [b32, __] = test::make_random_tensor({K, N}, -1.0f, 1.0f, 4243);
+    auto a_bf = test::f32_to_bf16(a32);
+    auto b_bf = test::f32_to_bf16(b32);
+
+    const int64_t a_shape[] = {M, K};
+    const int64_t b_shape[] = {K, N};
+    TensorView a(a_shape, DataType::bf16, a_bf.data());
+    TensorView b(b_shape, DataType::bf16, b_bf.data());
+
+    MatMulAttributes attrs{};
+    auto op = MatMul::create(attrs, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    const auto plan = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1);
+
+    std::vector<cpu::bfloat16> out_buf(static_cast<size_t>(descs[0].numel()));
+    auto output = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    op->compute(output, ins, {}, nullptr);
+
+    TensorView a32v(a_shape, DataType::f32, a32.data());
+    TensorView b32v(b_shape, DataType::f32, b32.data());
+    const TensorDesc ref_arr[] = {a32v.desc(), b32v.desc()};
+    auto ref_descs = op->getOutputTensorDesc(ref_arr);
+    std::vector<float> ref_buf(static_cast<size_t>(ref_descs[0].numel()));
+    auto ref_out = test::make_channel_first(ref_descs[0], ref_buf.data());
+    const TensorView ref_ins[] = {a32v, b32v};
+    cpu::reference::matmul_ref(attrs, ref_out, ref_ins, {}, nullptr);
+
+    float worst = 0.0f, maxref = 0.0f;
+    for (int64_t i = 0; i < descs[0].numel(); ++i) {
+        const float v = simd::s_load(&out_buf[static_cast<size_t>(i)]);
+        const float r = ref_buf[static_cast<size_t>(i)];
+        worst = std::max(worst, std::fabs(v - r));
+        maxref = std::max(maxref, std::fabs(r));
+    }
+    NNOPS_EXPECT_EQ(plan.kc, cpu::KC_CAP_BF16);
+    NNOPS_EXPECT_TRUE(worst <= 0.02f * maxref);
+}
+
+#else  // x86_64 and anything else: bf16 is not a route here
+
+NNOPS_TEST(matmul_bf16_unsupported) {
+    // The bf16 kernels live in the aarch64 backend only; elsewhere the dtype is
+    // refused rather than silently widened into an f32 route.
+    auto [a32, _]  = test::make_random_tensor({4, 8}, -1.0f, 1.0f, 951);
+    auto [b32, __] = test::make_random_tensor({8, 5}, -1.0f, 1.0f, 952);
+    auto a_bf = test::f32_to_bf16(a32);
+    auto b_bf = test::f32_to_bf16(b32);
+    const int64_t a_shape[] = {4, 8};
+    const int64_t b_shape[] = {8, 5};
+    TensorView a(a_shape, DataType::bf16, a_bf.data());
+    TensorView b(b_shape, DataType::bf16, b_bf.data());
+
+    auto op = MatMul::create(MatMulAttributes{}, Backend::CPU);
+    const TensorDesc arr[] = {a.desc(), b.desc()};
+    auto descs = op->getOutputTensorDesc(arr);
+    std::vector<nnops::backend::cpu::bfloat16> out_buf(
+        static_cast<size_t>(descs[0].numel()));
+    auto output = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {a, b};
+    NNOPS_EXPECT_EQ(op->compute(output, ins, {}, nullptr), Status::unsupported);
+}
+
+#endif

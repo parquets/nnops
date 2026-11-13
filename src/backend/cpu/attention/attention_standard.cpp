@@ -194,9 +194,14 @@ void attention_standard_cpu(const AttentionConfig& cfg,
                             void* scratch)
 {
     NNOPS_ASSERT(inputs[0].data_type() == DataType::f16 ||
-                 inputs[0].data_type() == DataType::f32);
+                 inputs[0].data_type() == DataType::f32 ||
+                 inputs[0].data_type() == DataType::bf16);
     if (inputs[0].data_type() == DataType::f16) {
         attention_standard_impl<half>(cfg, output, inputs, ctx, plan, scratch);
+#ifdef NNOPS_ARCH_AARCH64
+    } else if (inputs[0].data_type() == DataType::bf16) {
+        attention_standard_impl<bfloat16>(cfg, output, inputs, ctx, plan, scratch);
+#endif
     } else {
         attention_standard_impl<float>(cfg, output, inputs, ctx, plan, scratch);
     }

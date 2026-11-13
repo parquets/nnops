@@ -96,6 +96,20 @@ constexpr std::array<std::array<PackFn<half>, MR_LEVELS>, 2> pack_copy_f16_fn = 
 #endif
 }};
 
+#ifdef NNOPS_ARCH_AARCH64
+// bf16 has one ladder and one B layout; the A side is dense rows, so the
+// transposing and copying packers differ only in where the k axis comes from.
+constexpr std::array<std::array<PackFn<bfloat16>, MR_LEVELS>, 2> pack_trans_bf16_fn = {{
+    {pack_trans_n8_bf16, pack_trans_n4_bf16, pack_trans_n1_bf16, nullptr},
+    {pack_trans_n16_bf16, nullptr, nullptr, nullptr},
+}};
+
+constexpr std::array<std::array<PackFn<bfloat16>, MR_LEVELS>, 2> pack_copy_bf16_fn = {{
+    {pack_copy_n8_bf16, pack_copy_n4_bf16, pack_copy_n1_bf16, nullptr},
+    {pack_copy_n16_bf16, nullptr, nullptr, nullptr},
+}};
+#endif
+
 template <class T> struct TileTraits;
 
 template <> struct TileTraits<float> {
@@ -117,6 +131,18 @@ template <> struct TileTraits<half> {
     template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_f16<Z, S>; }
     template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_f16<Z, S>; }
 };
+
+#ifdef NNOPS_ARCH_AARCH64
+template <> struct TileTraits<bfloat16> {
+    using Pack = PackFn<bfloat16>;
+    static constexpr const int* mr() { return MR_BF16; }
+    static constexpr const int* nr() { return NR_BF16; }
+    static constexpr const auto& trans() { return pack_trans_bf16_fn; }
+    static constexpr const auto& copy()  { return pack_copy_bf16_fn; }
+    template <bool Z, int S = 0> static constexpr const auto& mma_pack() { return mma_pack_fns_bf16<Z, S>; }
+    template <bool Z, int S> static constexpr const auto& mma_direct() { return mma_direct_fns_bf16<Z, S>; }
+};
+#endif
 
 /// 64-byte-aligned panel stride, in elements.
 template <class T>
@@ -253,6 +279,13 @@ void tile_pack_lhs(bool trans, int mc, int kc,
     tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+void tile_pack_lhs(bool trans, int mc, int kc,
+                   bfloat16* dst, int ldd, const bfloat16* src, int lds, float scale) {
+    tile_pack_lhs_impl(trans, mc, kc, dst, ldd, src, lds, scale);
+}
+#endif
+
 // =========================================================================
 //  Uniform-width RHS panels
 // =========================================================================
@@ -356,9 +389,19 @@ void tile_mma_direct_impl(int Mc, int Nc, int Kc, T* c, int ldc,
             }
             if (n < Nc) {
                 const int w = Nc - n;
-                tile_pack_rhs(false, w, Kc, stage, nr * Kc, b + n, ld, 1.0f);
-                fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, stage, nr,
-                           clamp_min, clamp_max, seed_at(m, n));
+                // bf16's in-place read is the caller's own matrix at a row
+                // pitch, not the f16-style [k][nr] panel, so its kernel takes
+                // the partial column block directly: packing it into `stage`
+                // and handing it back at `ldb == nr` would misread the layout
+                // (and bf16's panel is ⌈kc/4⌉ groups, wider than nr·kc).
+                if constexpr (std::is_same_v<T, bfloat16>) {
+                    fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, b + n, ld,
+                               clamp_min, clamp_max, seed_at(m, n));
+                } else {
+                    tile_pack_rhs(false, w, Kc, stage, nr * Kc, b + n, ld, 1.0f);
+                    fns[level](s, w, Kc, c + m * ldc + n, ldc, a_m, lda, stage, nr,
+                               clamp_min, clamp_max, seed_at(m, n));
+                }
             }
         }
     });
@@ -395,6 +438,13 @@ void tile_pack_rhs(bool trans, int nc, int kc,
                    half* dst, int ldd, const half* src, int lds, float scale) {
     tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
 }
+
+#ifdef NNOPS_ARCH_AARCH64
+void tile_pack_rhs(bool trans, int nc, int kc,
+                   bfloat16* dst, int ldd, const bfloat16* src, int lds, float scale) {
+    tile_pack_rhs_impl(trans, nc, kc, dst, ldd, src, lds, scale);
+}
+#endif
 
 // ---- Block-packed RHS (q4_1) --------------------------------------------
 // The panel layout matches tile_pack_rhs; the MMA route never sees the blocks.
@@ -519,6 +569,24 @@ void tile_mma_direct(int Mc, int Nc, int Kc, half* c, int ldc,
                         stage, clamp_min, clamp_max, bias, col_bias);
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+void tile_mma_pack(int Mc, int Nc, int Kc, bfloat16* c, int ldc,
+                   const bfloat16* packed_a, const bfloat16* b, int64_t ldb,
+                   float clamp_min, float clamp_max, bool zero_mode,
+                   const bfloat16* bias, const bfloat16* col_bias) {
+    dispatch_mma_pack(zero_mode, Mc, Nc, Kc, c, ldc, packed_a, b, ldb,
+                      clamp_min, clamp_max, bias, col_bias);
+}
+
+void tile_mma_direct(int Mc, int Nc, int Kc, bfloat16* c, int ldc,
+                     const bfloat16* a, int lda, const bfloat16* b, int64_t ldb,
+                     bfloat16* stage, float clamp_min, float clamp_max,
+                     bool zero_mode, const bfloat16* bias, const bfloat16* col_bias) {
+    dispatch_mma_direct(zero_mode, Mc, Nc, Kc, c, ldc, a, lda, b, ldb,
+                        stage, clamp_min, clamp_max, bias, col_bias);
+}
+#endif
+
 // ---- the blob ---------------------------------------------------------
 
 MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcept {
@@ -538,6 +606,18 @@ MatMulPackedB matmul_packed_b_geom(int64_t N, int64_t K, DataType dtype) noexcep
         g.total = ((K + g.seg - 1) / g.seg) * g.np * g.ldd;
         return g;
     }
+
+#ifdef NNOPS_ARCH_AARCH64
+    if (dtype == DataType::bf16) {
+        // Panels are BFMMLA's operand layout, so the slot is the pack's own
+        // stride: ⌈K/4⌉ k-groups of 64 elements, independent of K's parity.
+        g.nr = NR_MAX_BF16;
+        g.ldd = geom_ldd_bf16_b(K);
+        g.np = (N + g.nr - 1) / g.nr;
+        g.total = g.np * g.ldd;
+        return g;
+    }
+#endif
 
     if (dtype != DataType::f32 && dtype != DataType::f16) { return g; }
 
@@ -657,11 +737,18 @@ void matmul_packed_b_pack(const TensorView& raw, TensorView& packed,
                 const float* src = raw.ptr<float>() + src_off;
                 float* dst = packed.ptr<float>() + p * g.ldd;
                 tile_pack_rhs(trans, w, kc, dst, ldd, src, lds_i, 1.0f);
-            } else {
+            } else if (dt == DataType::f16) {
                 const half* src = raw.ptr<half>() + src_off;
                 half* dst = packed.ptr<half>() + p * g.ldd;
                 tile_pack_rhs(trans, w, kc, dst, ldd, src, lds_i, 1.0f);
             }
+#ifdef NNOPS_ARCH_AARCH64
+            else {
+                const bfloat16* src = raw.ptr<bfloat16>() + src_off;
+                bfloat16* dst = packed.ptr<bfloat16>() + p * g.ldd;
+                tile_pack_rhs(trans, w, kc, dst, ldd, src, lds_i, 1.0f);
+            }
+#endif
         }
     });
 }
@@ -923,6 +1010,12 @@ void tile_scale(half* c, int ldc, float scale, int M, int N) {
     tile_scale_impl(c, ldc, scale, M, N);
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+void tile_scale(bfloat16* c, int ldc, float scale, int M, int N) {
+    tile_scale_impl(c, ldc, scale, M, N);
+}
+#endif
+
 /// C = scale·C + bias. A zero scale replaces the tile, so it stores the bias
 /// rather than trusting 0·C: the old C is arbitrary (a pooled output buffer),
 /// and 0·±inf or 0·NaN is NaN, which would then ride the whole k sweep.
@@ -959,6 +1052,13 @@ void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias,
     tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+void tile_scale_add_bias(bfloat16* c, int ldc, float scale, const bfloat16* bias,
+                         int M, int N) {
+    tile_scale_add_bias_impl(c, ldc, scale, bias, M, N);
+}
+#endif
+
 MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
                           const TensorDesc& a_desc,
                           const TensorDesc& b_desc,
@@ -981,6 +1081,9 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     if (int8_pair)                      { geom = &GEOM_I8; }
     else if (dt_a == DataType::f32)     { geom = &GEOM_F32; }
     else if (dt_a == DataType::f16)     { geom = &GEOM_F16; }
+#ifdef NNOPS_ARCH_AARCH64
+    else if (dt_a == DataType::bf16)    { geom = &GEOM_BF16; }
+#endif
     else                                { return plan; }
     num_threads = std::max(num_threads, 1);
 
@@ -997,7 +1100,8 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     // u8 activation would not undo.
     const bool packed_i8 = packed_b && dt_a == DataType::s8 && dt_b == DataType::s8;
     if (packed_b && !packed_i8 &&
-        !(dt_a == DataType::f32 || dt_a == DataType::f16)) {
+        !(dt_a == DataType::f32 || dt_a == DataType::f16 ||
+          (nnops::detail::bf16_enabled && dt_a == DataType::bf16))) {
         return plan;
     }
 

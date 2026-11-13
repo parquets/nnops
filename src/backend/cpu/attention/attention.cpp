@@ -13,6 +13,7 @@
 /// MultiLatentAttention all run the kernels above.
 
 #include "attention_internal.h"
+#include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp"           // internal scratch-memory pool
 #include "nnops/ops/group_query_attention.hpp"
 #include "nnops/ops/multi_head_attention.hpp"
@@ -36,8 +37,7 @@ Status attention_cpu(const AttentionConfig& cfg,
     const DataType dt = inputs[0].data_type();
     const size_t seqlens = seqlens_slot(cfg);
 
-    bool dtypes_ok = (dt == DataType::f32 || dt == DataType::f16) &&
-                     output.data_type() == dt;
+    bool dtypes_ok = is_float_dtype(dt) && output.data_type() == dt;
     for (size_t i = 1; i < inputs.size() && dtypes_ok; ++i) {
         if (i == seqlens || inputs[i].is_empty()) { continue; }  // optional slots
         dtypes_ok = inputs[i].data_type() == dt;

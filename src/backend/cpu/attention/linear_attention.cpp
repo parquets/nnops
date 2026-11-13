@@ -41,15 +41,23 @@ namespace nnops::backend::cpu {
 namespace {
 
 using nnops::backend::cpu::half;
+using nnops::backend::cpu::bfloat16;
 using namespace nnops::simd;
 
-/// Widen L consecutive T elements to an f32 vector (f16 widens, f32 is a load).
+/// Widen L consecutive T elements to an f32 vector (f16 and bf16 widen, f32 is
+/// a load — simd.hpp's own widening overloads cover the bf16 case).
 inline v_f32x8 vload_f32(const float* p) { return v_load(p); }
 inline v_f32x8 vload_f32(const half* p) { return v_cvt_f16_to_f32(p); }
+#ifdef NNOPS_ARCH_AARCH64
+inline v_f32x8 vload_f32(const bfloat16* p) { return v_load(p); }
+#endif
 
 /// Narrow an f32 vector back to T and store it.
 inline void vstore_f32(float* p, const v_f32x8& v) { v_store(p, v); }
 inline void vstore_f32(half* p, const v_f32x8& v)  { v_store(p, v_cvt_f32_to_f16(v)); }
+#ifdef NNOPS_ARCH_AARCH64
+inline void vstore_f32(bfloat16* p, const v_f32x8& v) { v_store(p, v); }
+#endif
 
 template <typename T>
 void linear_attention_impl(const LinearAttentionAttributes& attrs,
@@ -302,6 +310,9 @@ Status linear_attention_cpu(const LinearAttentionAttributes& attrs,
     switch (inputs[0].data_type()) {
     case DataType::f32: linear_attention_impl<float>(attrs, outputs, inputs, ctx); return Status::ok;
     case DataType::f16: linear_attention_impl<half>(attrs, outputs, inputs, ctx);  return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: linear_attention_impl<bfloat16>(attrs, outputs, inputs, ctx); return Status::ok;
+#endif
     default: break;
     }
     return Status::unsupported;

@@ -24,7 +24,8 @@ namespace {
 
 bool is_fp(DataType dtype) noexcept
 {
-    return dtype == DataType::f32 || dtype == DataType::f16;
+    return dtype == DataType::f32 || dtype == DataType::f16 ||
+           dtype == DataType::bf16;
 }
 
 /// One input and one output channel per group, with the filter in the

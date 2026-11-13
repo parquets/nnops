@@ -186,6 +186,11 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg,
     if (dt == DataType::f16) {
         return attention_plan_for<half>(cfg, inputs, num_threads, use_thread_slots);
     }
+#ifdef NNOPS_ARCH_AARCH64
+    if (dt == DataType::bf16) {
+        return attention_plan_for<bfloat16>(cfg, inputs, num_threads, use_thread_slots);
+    }
+#endif
     if (dt == DataType::f32) {
         return attention_plan_for<float>(cfg, inputs, num_threads, use_thread_slots);
     }

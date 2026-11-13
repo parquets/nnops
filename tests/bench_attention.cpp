@@ -30,8 +30,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -39,6 +44,7 @@
 using namespace nnops;
 namespace cpu = nnops::backend::cpu;
 using cpu::half;
+using bfloat16 = nnops::backend::cpu::bfloat16;
 
 namespace {
 
@@ -77,17 +83,32 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
+/// float -> f32, half -> f16, bfloat16 -> bf16.
 template <typename T>
 auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     if constexpr (std::is_same_v<T, float>) {
         return test::make_random_tensor(shape, -1.0f, 1.0f, seed);
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return test::make_random_bf16_tensor(shape, -1.0f, 1.0f, seed);
     } else {
         return test::make_random_f16_tensor(shape, -1.0f, 1.0f, seed);
     }
 }
 
+/// The attention bench thread ladder; NNOPS_BENCH_THREADS="1,4" pins it.
 std::vector<int> thread_list() {
-    std::vector<int> threads{1, 2, 4, 8};
+    std::vector<int> threads;
+    if (const char* env = std::getenv("NNOPS_BENCH_THREADS")) {
+        for (const char* p = env; *p;) {
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end != p && v > 0) { threads.push_back(static_cast<int>(v)); }
+            p = (end != p) ? end : p + 1;
+            if (*p == ',') { ++p; }
+        }
+        if (!threads.empty()) { return threads; }
+    }
+    threads = {1, 2, 4, 8};
     const int hw = static_cast<int>(std::thread::hardware_concurrency());
     if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
         threads.push_back(hw);
@@ -403,6 +424,298 @@ void bench_mla(const MlaCase& c) {
     else       { run_mla<float>(c, threads, iters); }
 }
 
+// ============================================================
+// f16 vs bf16 — interleaved A/B on the same case
+// ============================================================
+//
+// The two arms differ only in the tensor dtype; the op, the attributes and the
+// budgets are the same object shape. They are timed A B A B inside one process
+// and the second A is a null control, so a ratio is read against the A2/A1
+// drift instead of against a table that was printed minutes earlier. bf16 needs
+// no route of its own: it rides the same plan, and on aarch64 the two GEMMs go
+// through the BFMMLA kernels rather than a widening fallback.
+
+template <typename Fn>
+double time_ms(Fn&& fn, int iters) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i) { fn(); }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+           std::max(iters, 1);
+}
+
+double median_of(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+/// One built case: the call, plus a one-line description of what it runs.
+struct DtypeArm {
+    std::function<void(const ComputeContext&)> run;
+    std::string note;
+};
+
+/// Move a fresh random buffer into @p buf and return a view that points at it.
+/// The view is built *after* the move, so it tracks the vector's heap block.
+template <typename T>
+TensorView adopt(std::shared_ptr<std::vector<T>> buf, std::span<const int64_t> shape,
+                 uint64_t seed) {
+    auto [v, view] = make_random<T>(shape, seed);
+    *buf = std::move(v);
+    return TensorView(shape, view.data_type(), buf->data(), view.layout());
+}
+
+std::string route_note(const cpu::AttentionPlan& plan) {
+    char buf[160];
+    if (plan.use_decode) {
+        std::snprintf(buf, sizeof buf, "route=decode");
+    } else if (plan.use_flash) {
+        std::snprintf(buf, sizeof buf, "route=flash Br=%d Bc=%d ws=%zuB",
+                      plan.Br, plan.Bc, plan.workspace_size);
+    } else {
+        std::snprintf(buf, sizeof buf, "route=standard GEMM1(mc=%d nc=%d) GEMM2(mc=%d nc=%d) ws=%zuB",
+                      plan.mc1, plan.nc1, plan.mc2, plan.nc2, plan.workspace_size);
+    }
+    return buf;
+}
+
+template <typename T>
+DtypeArm make_mha_arm(const MhaCase& c, double& flops) {
+    const int64_t Sq = c.S;
+    const int64_t Sk = (c.Sk == 0) ? c.S : c.Sk;
+
+    auto q_buf   = std::make_shared<std::vector<T>>();
+    auto k_buf   = std::make_shared<std::vector<T>>();
+    auto v_buf   = std::make_shared<std::vector<T>>();
+    auto m_buf   = std::make_shared<std::vector<T>>();
+    auto out_buf = std::make_shared<std::vector<T>>();
+
+    const int64_t qshape[] = {c.B, Sq, c.H * c.D};
+    const int64_t kshape[] = {c.B, Sk, c.H * c.D};
+
+    std::vector<TensorView> ins;
+    ins.push_back(adopt(q_buf, qshape, 11));
+    ins.push_back(adopt(k_buf, kshape, 12));
+    ins.push_back(adopt(v_buf, kshape, 13));
+    if (c.mask) {
+        const int64_t mshape[] = {Sq, Sk};
+        ins.push_back(adopt(m_buf, mshape, 14));
+    }
+
+    MultiHeadAttentionAttributes attrs{};
+    attrs.num_heads = c.H;
+    attrs.scale = 0.0f;   // auto 1/sqrt(D)
+    attrs.causal = c.causal;
+    auto op = std::shared_ptr<MultiHeadAttention>(
+        MultiHeadAttention::create(attrs, Backend::CPU));
+
+    std::vector<TensorDesc> descs;
+    descs.reserve(ins.size());
+    for (const auto& v : ins) { descs.push_back(v.desc()); }
+    const auto out_descs = op->getOutputTensorDesc(descs);
+
+    out_buf->assign(static_cast<size_t>(out_descs[0].numel()), T{});
+    TensorView output = test::make_channel_first(out_descs[0], out_buf->data());
+
+    flops = 4.0 * static_cast<double>(c.B) * c.H * Sq * Sk * c.D;
+
+    DtypeArm arm;
+    arm.note = route_note(cpu::get_attention_plan({c.H}, descs, out_descs,
+                                                  thread_list().back(),
+                                                  /*use_thread_slots=*/true));
+    arm.run = [op, ins = std::move(ins), output, q_buf, k_buf, v_buf, m_buf, out_buf]
+              (const ComputeContext& ctx) mutable {
+        op->compute(output, ins, ctx, nullptr);
+    };
+    return arm;
+}
+
+template <typename T>
+DtypeArm make_gqa_arm(const GqaCase& c, double& flops) {
+    const int64_t Sq = c.S;
+    const int64_t Sk_new = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t Sk_past = c.past;
+    const int64_t Sk = Sk_new + Sk_past;
+
+    auto q_buf  = std::make_shared<std::vector<T>>();
+    auto k_buf  = std::make_shared<std::vector<T>>();
+    auto v_buf  = std::make_shared<std::vector<T>>();
+    auto pk_buf = std::make_shared<std::vector<T>>();
+    auto pv_buf = std::make_shared<std::vector<T>>();
+    auto out_buf = std::make_shared<std::vector<T>>();
+
+    const int64_t qshape[]  = {c.B, Sq, c.H * c.D};
+    const int64_t kvshape[] = {c.B, Sk_new, c.Hkv * c.D};
+    const int64_t pshape[]  = {c.B, Sk_past, c.Hkv * c.D};
+
+    std::vector<TensorView> ins;
+    ins.push_back(adopt(q_buf, qshape, 21));
+    ins.push_back(adopt(k_buf, kvshape, 22));
+    ins.push_back(adopt(v_buf, kvshape, 23));
+    if (Sk_past > 0) {
+        ins.push_back(TensorView{});
+        ins.push_back(adopt(pk_buf, pshape, 24));
+        ins.push_back(adopt(pv_buf, pshape, 25));
+    }
+
+    GroupQueryAttentionAttributes attrs{};
+    attrs.num_heads    = c.H;
+    attrs.kv_num_heads = c.Hkv;
+    attrs.causal       = c.causal;
+    attrs.position_offset = Sk_past > 0 ? Sk_past : -1;
+    auto op = std::shared_ptr<GroupQueryAttention>(
+        GroupQueryAttention::create(attrs, Backend::CPU));
+
+    std::vector<TensorDesc> descs;
+    descs.reserve(ins.size());
+    for (const auto& v : ins) { descs.push_back(v.desc()); }
+    const auto out_descs = op->getOutputTensorDesc(descs);
+
+    out_buf->assign(static_cast<size_t>(out_descs[0].numel()), T{});
+    TensorView output = test::make_channel_first(out_descs[0], out_buf->data());
+
+    flops = 4.0 * static_cast<double>(c.B) * c.H * Sq * Sk * c.D;
+
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = c.H;
+    cfg.num_kv_heads = c.Hkv;
+    cfg.causal = c.causal;
+    cfg.position_offset = attrs.position_offset;
+
+    DtypeArm arm;
+    arm.note = route_note(cpu::get_attention_plan(cfg, descs, out_descs,
+                                                  thread_list().back(), true));
+    arm.run = [op, ins = std::move(ins), output, q_buf, k_buf, v_buf, pk_buf, pv_buf,
+               out_buf](const ComputeContext& ctx) mutable {
+        op->compute(output, ins, ctx, nullptr);
+    };
+    return arm;
+}
+
+template <typename T>
+DtypeArm make_mla_arm(const MlaCase& c, double& flops) {
+    const int64_t Sq = c.S;
+    const int64_t Sk_new = (c.Sk == 0) ? c.S : c.Sk;
+    const int64_t Sk_past = c.past;
+    const int64_t Sk = Sk_new + Sk_past;
+    const int64_t dkv = c.rank + c.rope;
+
+    auto q_buf   = std::make_shared<std::vector<T>>();
+    auto kv_buf  = std::make_shared<std::vector<T>>();
+    auto pkv_buf = std::make_shared<std::vector<T>>();
+    auto out_buf = std::make_shared<std::vector<T>>();
+
+    const int64_t q_dim[]  = {c.B, Sq, c.H * dkv};
+    const int64_t kv_dim[] = {c.B, Sk_new, c.Hkv * dkv};
+    const int64_t p_dim[]  = {c.B, Sk_past, c.Hkv * dkv};
+
+    std::vector<TensorView> ins;
+    ins.push_back(adopt(q_buf, q_dim, 31));
+    ins.push_back(adopt(kv_buf, kv_dim, 32));
+    if (Sk_past > 0) {
+        ins.push_back(TensorView{});
+        ins.push_back(adopt(pkv_buf, p_dim, 33));
+    }
+
+    MultiLatentAttentionAttributes attrs{};
+    attrs.num_heads        = c.H;
+    attrs.kv_num_heads     = c.Hkv;
+    attrs.kv_lora_rank     = c.rank;
+    attrs.qk_rope_head_dim = c.rope;
+    attrs.v_head_dim       = c.vdim;
+    attrs.causal           = c.causal;
+    attrs.position_offset  = Sk_past > 0 ? Sk_past : -1;
+    auto op = std::shared_ptr<MultiLatentAttention>(
+        MultiLatentAttention::create(attrs, Backend::CPU));
+
+    std::vector<TensorDesc> descs;
+    descs.reserve(ins.size());
+    for (const auto& v : ins) { descs.push_back(v.desc()); }
+    const auto out_descs = op->getOutputTensorDesc(descs);
+
+    out_buf->assign(static_cast<size_t>(out_descs[0].numel()), T{});
+    TensorView output = test::make_channel_first(out_descs[0], out_buf->data());
+
+    flops = 2.0 * static_cast<double>(c.B) * c.H * Sq * Sk *
+            static_cast<double>(dkv + (c.vdim > 0 ? c.vdim : c.rank));
+
+    cpu::AttentionConfig cfg;
+    cfg.num_heads = c.H;
+    cfg.num_kv_heads = c.Hkv;
+    cfg.v_head_dim = c.vdim > 0 ? c.vdim : c.rank;
+    cfg.v_is_k = true;
+    cfg.causal = c.causal;
+    cfg.position_offset = attrs.position_offset;
+
+    DtypeArm arm;
+    arm.note = route_note(cpu::get_attention_plan(cfg, descs, out_descs,
+                                                  thread_list().back(), true));
+    arm.run = [op, ins = std::move(ins), output, q_buf, kv_buf, pkv_buf, out_buf]
+              (const ComputeContext& ctx) mutable {
+        op->compute(output, ins, ctx, nullptr);
+    };
+    return arm;
+}
+
+/// Time both arms at each thread count, interleaved A B A B, and report the
+/// ratio against the A2/A1 null. `iters` per timing, `rounds` rounds, median
+/// across rounds and the min of the two A (and two B) timings per round.
+void print_dtype_ab(const char* name, const DtypeArm& a, const char* la,
+                    const DtypeArm& b, const char* lb, double flops,
+                    int iters, int rounds) {
+    const auto threads = thread_list();
+    std::printf("  %s\n    %s\n", name, a.note.c_str());
+    for (int nt : threads) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        for (int i = 0; i < 2; ++i) { a.run(use_ctx); b.run(use_ctx); }   // warm-up
+
+        std::vector<double> a_ms, b_ms, drift;
+        for (int r = 0; r < rounds; ++r) {
+            const double a1 = time_ms([&] { a.run(use_ctx); }, iters);
+            const double b1 = time_ms([&] { b.run(use_ctx); }, iters);
+            const double a2 = time_ms([&] { a.run(use_ctx); }, iters);   // null control
+            const double b2 = time_ms([&] { b.run(use_ctx); }, iters);
+            a_ms.push_back(std::min(a1, a2));
+            b_ms.push_back(std::min(b1, b2));
+            drift.push_back(std::fabs(a2 - a1) / std::min(a1, a2) * 100.0);
+        }
+        const double am = median_of(a_ms), bm = median_of(b_ms);
+        const double nf = median_of(drift);
+        char ratio[32];
+        std::snprintf(ratio, sizeof ratio, "%.2fx%s", am / bm,
+                      std::fabs(am / bm - 1.0) * 100.0 > nf ? "" : " (within noise)");
+        std::printf("    %2dT  %s %7.1f GFLOPS (%7.3f ms) | %s %7.1f GFLOPS (%7.3f ms)"
+                    " | ratio %s | null %.1f%%\n",
+                    nt, la, flops / am / 1e6, am, lb, flops / bm / 1e6, bm,
+                    ratio, nf);
+    }
+}
+
+void bench_mha_ab(const MhaCase& c) {
+    double flops = 0.0;
+    const DtypeArm a = make_mha_arm<half>(c, flops);
+    const DtypeArm b = make_mha_arm<bfloat16>(c, flops);
+    print_dtype_ab(c.name, a, "f16", b, "bf16", flops, /*iters=*/20, /*rounds=*/4);
+}
+
+void bench_gqa_ab(const GqaCase& c) {
+    double flops = 0.0;
+    const DtypeArm a = make_gqa_arm<half>(c, flops);
+    const DtypeArm b = make_gqa_arm<bfloat16>(c, flops);
+    print_dtype_ab(c.name, a, "f16", b, "bf16", flops, /*iters=*/20, /*rounds=*/4);
+}
+
+void bench_mla_ab(const MlaCase& c) {
+    double flops = 0.0;
+    const DtypeArm a = make_mla_arm<half>(c, flops);
+    const DtypeArm b = make_mla_arm<bfloat16>(c, flops);
+    print_dtype_ab(c.name, a, "f16", b, "bf16", flops, /*iters=*/20, /*rounds=*/4);
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -572,4 +885,43 @@ NNOPS_BENCH(mla_f32_step_decode) {
 NNOPS_BENCH(mla_f16_prefill) {
     bench_mla({"mla f16 prefill B1 S128 H32 Hkv1 rank512 rope64 v512",
                1, 128, 32, 1, 512, 64, 512, /*Sk=*/0, /*causal=*/true, /*f16=*/true});
+}
+
+// ============================================================
+// f16 vs bf16 — same case, both arms interleaved (A B A B)
+// ============================================================
+//
+// bf16 shares every plan decision with f16 and only swaps the GEMM kernels, so
+// the ratio below is the bf16 MMA's throughput against the f16 one's, measured
+// with the drift null next to it. On M4 that is the BFMMLA unit (k=4 groups),
+// not a widening fallback; on x86 the op refuses bf16 outright.
+
+NNOPS_BENCH(attention_f16_vs_bf16_standard) {
+    bench_mha_ab({"attn standard f16/bf16 B2 S128 H8 D64", 2, 128, 8, 64});
+}
+
+NNOPS_BENCH(attention_f16_vs_bf16_standard_d256) {
+    bench_mha_ab({"attn standard D256 f16/bf16 B2 S128 H8 D256", 2, 128, 8, 256});
+}
+
+NNOPS_BENCH(attention_f16_vs_bf16_flash) {
+    bench_mha_ab({"attn flash f16/bf16 B1 S512 H8 D64", 1, 512, 8, 64});
+}
+
+NNOPS_BENCH(attention_f16_vs_bf16_flash_d128) {
+    bench_mha_ab({"attn flash D128 f16/bf16 B1 S512 H16 D128", 1, 512, 16, 128});
+}
+
+NNOPS_BENCH(gqa_f16_vs_bf16_prefill) {
+    bench_gqa_ab({"gqa prefill f16/bf16 B1 S512 H32 Hkv8 D128", 1, 512, 32, 8, 128});
+}
+
+NNOPS_BENCH(gqa_f16_vs_bf16_decode) {
+    bench_gqa_ab({"gqa decode f16/bf16 B1 S1 H32 Hkv8 D128", 1, 1, 32, 8, 128,
+                  /*Sk=*/2048});
+}
+
+NNOPS_BENCH(mla_f16_vs_bf16_prefill) {
+    bench_mla_ab({"mla prefill f16/bf16 B1 S128 H32 Hkv1 rank512 rope64 v512",
+                  1, 128, 32, 1, 512, 64, 512});
 }

@@ -89,6 +89,7 @@
 
 using namespace nnops;
 using half = nnops::backend::cpu::half;
+using bfloat16 = nnops::backend::cpu::bfloat16;
 namespace cpu = nnops::backend::cpu;
 
 namespace {
@@ -149,7 +150,9 @@ make_tensor(int64_t rows, int64_t cols, int64_t pitch_elems, uint64_t seed) {
             simd::s_store(&buf[i], f32[i]);
         }
     }
-    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    constexpr DataType dt = std::is_same_v<T, float> ? DataType::f32
+                          : std::is_same_v<T, half>  ? DataType::f16
+                                                     : DataType::bf16;
     const int64_t shape[] = {rows, cols};
     TensorView tv(shape, dt, buf.data(),
                   pitch_elems * static_cast<int64_t>(sizeof(T)));
@@ -518,10 +521,10 @@ struct RouteAB {
         pack_a = cpu::get_matmul_plan(attrs, a.desc(), b.desc(), 1).pack_a;
     }
 
-    double time(int iters) {
-        for (int i = 0; i < 2; ++i) { op->compute(out, ins, {}, nullptr); }
+    double time(int iters, const ComputeContext& ctx = {}) {
+        for (int i = 0; i < 2; ++i) { op->compute(out, ins, ctx, nullptr); }
         const auto t0 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iters; ++i) { op->compute(out, ins, {}, nullptr); }
+        for (int i = 0; i < iters; ++i) { op->compute(out, ins, ctx, nullptr); }
         const auto t1 = std::chrono::high_resolution_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         return 2.0 * static_cast<double>(M) * static_cast<double>(N)
@@ -563,6 +566,44 @@ void bench_route_ab(const char* tag, const char* la, const char* lb,
     std::printf("    median:   %s=%7.1f  %s=%7.1f   %s/%s=%.3f\n",
                 la, ma, lb, mb, la, lb, ma / mb);
 }
+
+#ifdef NNOPS_ARCH_AARCH64
+/// f16 vs bf16 through the public MatMul, interleaved round by round at 1T and
+/// 4T. bf16 carries a different B panel (the BFMMLA layout) and its own tile
+/// geometry, so the micro-kernel gap is only part of the story; this is the
+/// number a caller actually sees.
+void bench_f16_vs_bf16_ab(int64_t M, int64_t K, int64_t N,
+                          int rounds = 5, int iters = 10) {
+    RouteAB<half> r16(M, K, N, /*transpose_a=*/false, 1);
+    RouteAB<bfloat16> rbf(M, K, N, /*transpose_a=*/false, 1);
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    std::printf("  f16 vs bf16  %lldx%lldx%lld  rounds=%d iters=%d\n",
+                static_cast<long long>(M), static_cast<long long>(K),
+                static_cast<long long>(N), rounds, iters);
+    for (int nt : {1, 4}) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext use = (nt > 1) ? ctx : ComputeContext{};
+
+        std::vector<double> v16, vbf;
+        for (int r = 0; r < rounds; ++r) {
+            v16.push_back(r16.time(iters, use));
+            vbf.push_back(rbf.time(iters, use));
+            std::printf("    %dT round %d:  f16=%7.1f  bf16=%7.1f   bf16/f16=%.3f\n",
+                        nt, r, v16.back(), vbf.back(), vbf.back() / v16.back());
+        }
+        const double m16 = median(v16), mbf = median(vbf);
+        std::printf("    %dT median:   f16=%7.1f  bf16=%7.1f   bf16/f16=%.3f\n",
+                    nt, m16, mbf, mbf / m16);
+    }
+}
+#endif  // NNOPS_ARCH_AARCH64
 
 // ---- size / shape sweeps ---------------------------------------------------
 //
@@ -1322,6 +1363,28 @@ NNOPS_BENCH(matmul_f16_pack_k_flip) {
     std::printf("    median:   direct=%7.1f  packed=%7.1f   d/p=%.3f\n",
                 median(vd), median(vp), median(vd) / median(vp));
 }
+
+// ============================================================
+// bf16 — aarch64 only; the x86 build has no bf16 kernel to measure
+// ============================================================
+
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(matmul_bf16_nn) {
+    // Only 1T and 4T: the kernel owns 1T, and 4T is about the split.
+    std::vector<int> threads{1, 4};
+    print_report(run_geMM<bfloat16>({"bf16 nn 512x512x256", 512, 512, 256},
+                                    threads, 20));
+}
+
+NNOPS_BENCH(matmul_bf16_route_ab) {
+    bench_route_ab<bfloat16>("bf16", "nn", "ta", 512, 512, 256,
+                             /*ta_a=*/false, /*pad_a=*/0,
+                             /*ta_b=*/true,  /*pad_b=*/0);
+}
+
+NNOPS_BENCH(matmul_f16_vs_bf16) { bench_f16_vs_bf16_ab(512, 512, 256); }
+NNOPS_BENCH(matmul_f16_vs_bf16_large) { bench_f16_vs_bf16_ab(1024, 1024, 1024, 3, 6); }
+#endif
 
 // Below GEMM_FAST_PATH_THRESHOLD the per-arch naive SIMD kernel replaces the
 // scalar reference. ns/call, because at these sizes the call overhead and not

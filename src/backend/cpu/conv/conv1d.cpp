@@ -34,7 +34,8 @@ namespace {
 
 bool is_fp(DataType dtype) noexcept
 {
-    return dtype == DataType::f32 || dtype == DataType::f16;
+    return dtype == DataType::f32 || dtype == DataType::f16 ||
+           dtype == DataType::bf16;
 }
 
 /// The lifted filter is the 2D order, so this is Conv2D's predicate verbatim.

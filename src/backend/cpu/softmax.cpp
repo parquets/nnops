@@ -269,9 +269,9 @@ Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
     NNOPS_ASSERT(rank >= 1);   // Softmax::validate
 
     const DataType in_dtype  = X.data_type();             // s8 or u8
-    const DataType out_dtype = output.data_type();        // f32 or f16
+    const DataType out_dtype = output.data_type();        // the fp output type
     NNOPS_ASSERT(is_quantized_dtype(in_dtype));
-    NNOPS_ASSERT(out_dtype == DataType::f32 || out_dtype == DataType::f16);
+    NNOPS_ASSERT(is_float_dtype(out_dtype));
 
     // Quantized softmax is only defined over channel-first layouts (Softmax::validate).
     NNOPS_ASSERT(is_channel_first_spatial(X.layout()));
@@ -324,14 +324,16 @@ Status softmax_quant_input_impl(const SoftmaxAttributes& attrs,
     if (out_dtype == DataType::f32) {
         softmax_impl<float>(attrs, output, ins, ctx);
     } else {
-        // f32 staging, downcast to f16 on store (probabilities are not re-quantized).
+        // f32 staging, downcast to f16/bf16 on store (probabilities are not
+        // re-quantized).
         float* y_f32 = zero + M;
         TensorView y_view(X.shape_span(), DataType::f32, y_f32, TensorLayout::NCHW);
         softmax_impl<float>(attrs, y_view, ins, ctx);
-        half* out = output.ptr<half>();
-        for (int64_t i = 0; i < numel; ++i) {
-            s_store(&out[i], y_f32[i]);
-        }
+        dispatch_f32_f16(out_dtype, "softmax_cpu", [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            T* out = output.ptr<T>();
+            for (int64_t i = 0; i < numel; ++i) { s_store(&out[i], y_f32[i]); }
+        });
     }
     return Status::ok;
 }
@@ -355,7 +357,7 @@ Status softmax_cpu(const SoftmaxAttributes& attrs,
         const int64_t M        = numel / last_dim;
         size_t ws = static_cast<size_t>(numel) * sizeof(float)          // x_f32
                   + 2 * static_cast<size_t>(M) * sizeof(float);         // scale + zero
-        if (output.data_type() == DataType::f16) {
+        if (output.data_type() != DataType::f32) {
             ws += static_cast<size_t>(numel) * sizeof(float);           // y_f32 staging
         }
         PoolPtr scratch(ws);

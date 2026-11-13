@@ -532,6 +532,11 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
         case DataType::f16:
             dwconv_last_impl<half>(attrs, output, inputs, ctx);
             return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+        case DataType::bf16:
+            dwconv_last_impl<bfloat16>(attrs, output, inputs, ctx);
+            return Status::ok;
+#endif
         case DataType::s8:
             if (odtype == DataType::s8) {
                 return dwconv_last_impl_quant<int8_t, int8_t>(attrs, output, inputs, ctx);
@@ -560,6 +565,11 @@ Status depthwise_conv_cpu(const DepthwiseConvAttributes& attrs,
     case DataType::f16:
         dwconv_impl<half>(attrs, output, inputs, ctx);
         return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16:
+        dwconv_impl<bfloat16>(attrs, output, inputs, ctx);
+        return Status::ok;
+#endif
     default:
         return Status::unsupported;   // Channel-first has no quantized route
     }

@@ -1225,6 +1225,28 @@ Status depthwise_transpose_conv_int8_cpu(const DepthwiseTransposeConv2DAttribute
     }
 }
 
+/// The fp kernels' layout choice: the per-tap form for the channel-last lane,
+/// the scalar form when the filter outruns the unrolled tap count.
+template <class T>
+void dwtconv_fp(const DwtConvGeom& gm, TensorView& output,
+                std::span<const TensorView> inputs, const ComputeContext& ctx,
+                bool last)
+{
+    if (last) {
+        if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
+            dwtconv_scalar_last<T>(gm, output, inputs, ctx);
+        } else {
+            dwtconv_channel_last<T>(gm, output, inputs, ctx);
+        }
+    } else {
+        if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
+            dwtconv_scalar_first<T>(gm, output, inputs, ctx);
+        } else {
+            dwtconv_channel_first<T>(gm, output, inputs, ctx);
+        }
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================
@@ -1314,36 +1336,11 @@ Status depthwise_transpose_conv_cpu(const DepthwiseTransposeConv2DAttributes& at
     }
 
     switch (input.data_type()) {
-    case DataType::f32:
-        if (last) {
-            if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
-                dwtconv_scalar_last<float>(gm, output, inputs, ctx);
-            } else {
-                dwtconv_channel_last<float>(gm, output, inputs, ctx);
-            }
-        } else {
-            if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
-                dwtconv_scalar_first<float>(gm, output, inputs, ctx);
-            } else {
-                dwtconv_channel_first<float>(gm, output, inputs, ctx);
-            }
-        }
-        return Status::ok;
-    case DataType::f16:
-        if (last) {
-            if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
-                dwtconv_scalar_last<half>(gm, output, inputs, ctx);
-            } else {
-                dwtconv_channel_last<half>(gm, output, inputs, ctx);
-            }
-        } else {
-            if (gm.KH > kMaxTaps || gm.KW > kMaxTaps) {
-                dwtconv_scalar_first<half>(gm, output, inputs, ctx);
-            } else {
-                dwtconv_channel_first<half>(gm, output, inputs, ctx);
-            }
-        }
-        return Status::ok;
+    case DataType::f32: dwtconv_fp<float>(gm, output, inputs, ctx, last); return Status::ok;
+    case DataType::f16: dwtconv_fp<half>(gm, output, inputs, ctx, last);  return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: dwtconv_fp<bfloat16>(gm, output, inputs, ctx, last); return Status::ok;
+#endif
     default:
         return Status::unsupported;
     }

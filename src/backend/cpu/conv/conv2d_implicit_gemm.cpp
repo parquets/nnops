@@ -104,6 +104,18 @@
 
 namespace nnops::backend::cpu {
 
+/// The activations the fp plan admits: f32 and f16 on every arch, bf16 only
+/// where its kernels exist. The quantized route's (narrower) activation list
+/// stays in the plan functions, since quantizing a bf16 activation is not wired.
+constexpr bool is_fp_activation_dtype(DataType d) noexcept
+{
+    return d == DataType::f32 || d == DataType::f16
+#ifdef NNOPS_ARCH_AARCH64
+        || d == DataType::bf16
+#endif
+        ;
+}
+
 // =========================================================================
 //  Channel-first route — im2col into packed B, raw weight as direct A
 // =========================================================================
@@ -347,8 +359,11 @@ void conv2d_channel_first_impl(const Conv2DAttributes& attrs,
                 // B = [K=icnc*karea][N=roi_area], packed once per ic-block into
                 // uniform nr_max-wide panels; every oc-block below reuses it.
                 const int kdim = static_cast<int>(icnc * karea);
-                const int ldd_b = static_cast<int>(
-                    mma_pack_align(nr_max * kdim * esz) / esz);
+                // The pack's panel stride, from the one rule the plan sizes
+                // with: bf16's BFMMLA panel rounds k up to its k-group, so a
+                // dense NR*kdim stride is wrong whenever kdim % 4 != 0.
+                const int ldd_b = static_cast<int>(gemm_panel_slot(
+                    kdim, nr_max, esz, false, std::is_same_v<T, bfloat16>));
 
                 if (!plan.pointwise) {
                     // Gather straight into the panels: materializing the col
@@ -936,7 +951,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
             return plan;
         }
     } else {
-        if (dt != DataType::f32 && dt != DataType::f16) {
+        if (!is_fp_activation_dtype(dt)) {
             return plan;
         }
         if (wt.dtype != dt || out.dtype != dt) {
@@ -1013,8 +1028,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     // idle (at 8 threads the same split is a loss: 397→349 GFLOPS), flooring at
     // two n-panels where the weight panel re-read stops paying. col_size shrinks
     // with the block; the expansion loop below grows it back.
-    const int64_t nr_max = quant ? NR_MAX_I8
-                                 : ((dt == DataType::f16) ? NR_MAX_F16 : NR_MAX_F32);
+    const int64_t nr_max = quant ? NR_MAX_I8 : nr_max_dt(dt);
     for (;;) {
         const int64_t blocks = (OH + plan.oh_block - 1) / plan.oh_block;
         if (2 * NG * blocks >= nt || plan.oh_block <= 1) { break; }
@@ -1096,7 +1110,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
         // Two M-panels per task is the floor, mirroring the oh-block's two
         // N-panels: below it the per-task overheads (bias seed, epilogue, the
         // re-gathered B panel) stop being amortized.
-        const int64_t mr = (dt == DataType::f16) ? MR_MAX_F16 : MR_MAX_F32;
+        const int64_t mr = mr_max_dt(dt);
         const int64_t plane_tasks = NG * plan.oh_chunks;
         if (2 * plane_tasks < nt) {
             const int64_t max_chunks = std::max<int64_t>(1, oc_per_group / (2 * mr));
@@ -1119,7 +1133,8 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
     const int64_t esz      = quant ? 1 : static_cast<int64_t>(data_type_size(dt));
     const int64_t kdim_max = plan.icn_block * karea;
     plan.pack_size = ((plan.oh_block * OW + nr_max - 1) / nr_max)
-                   * gemm_panel_slot(kdim_max, nr_max, esz, quant);
+                   * gemm_panel_slot(kdim_max, nr_max, esz, quant,
+                                     dt == DataType::bf16);
 
     // One slot per worker when the backend reports ids and there are fewer of
     // them than tasks; else one per task.
@@ -1225,7 +1240,7 @@ void tile_zero(T* NNOPS_RESTRICT tile, int ld, int mc, int nc) noexcept
 {
     for (int m = 0; m < mc; ++m) {
         T* row = tile + static_cast<int64_t>(m) * ld;
-        for (int i = 0; i < nc; ++i) { row[i] = T(0); }
+        for (int i = 0; i < nc; ++i) { row[i] = T{}; }
     }
 }
 
@@ -1566,8 +1581,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
             // MR block for one row. Re-split only a *short* tail, and keep the
             // step a multiple of MR: 24 + 24 + 12 costs the same MR blocks as
             // three even 16s, where a step of 23 would pay a fourth block for 5.
-            constexpr int64_t mr_step =
-                std::is_same_v<T, float> ? MR_MAX_F32 : MR_MAX_F16;
+            constexpr int64_t mr_step = mr_max_flt<T>();
             const int64_t p_span = std::max<int64_t>(p_last - p_first, 1);
             const int64_t p_tail = p_span % m_block;
             const int64_t p_step =
@@ -1593,7 +1607,9 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                     b_panel = w_g + ocn + icn * w_ic_stride;
                     b_ld = static_cast<int>(w_ic_stride);
                 } else {
-                    pack_block<T>(pack_buf, gemm_panel_slot(kdim, nr_max, esz, false),
+                    pack_block<T>(pack_buf,
+                                  gemm_panel_slot(kdim, nr_max, esz, false,
+                                                  std::is_same_v<T, bfloat16>),
                                   stage, w_g + ocn + icn * w_ic_stride,
                                   w_ic_stride, w_tap_stride, ocnc, icnc, karea,
                                   nr_max, kdim);
@@ -1620,7 +1636,7 @@ void conv2d_channel_last_impl(const Conv2DAttributes& attrs,
                         lda = static_cast<int>(IC);
                     } else {
                         tiled_im2col_channel_last<T>(a_buf, kdim, in_g + icn, in_row_stride, IC,
-                                       T(0), p, static_cast<int>(OW), flat, mc,
+                                       T{}, p, static_cast<int>(OW), flat, mc,
                                        static_cast<int>(IH), static_cast<int>(IW),
                                        KH, KW, SH, SW, DH, DW, PH, PW,
                                        static_cast<int>(icnc), karea);
@@ -2271,7 +2287,7 @@ Conv2DGemmPlan make_plan(const Conv2DAttributes& attrs,
             return plan;
         }
     } else {
-        if (dt != DataType::f32 && dt != DataType::f16) {
+        if (!is_fp_activation_dtype(dt)) {
             return plan;
         }
         if (wt.dtype != dt || out.dtype != dt) {
@@ -2580,6 +2596,11 @@ Status conv2d_fp_run(const Conv2DAttributes& attrs, TensorView& output,
     case DataType::f16:
         TRoute::template fp_impl<half>(attrs, output, inputs, ctx, plan, workspace);
         return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16:
+        TRoute::template fp_impl<bfloat16>(attrs, output, inputs, ctx, plan, workspace);
+        return Status::ok;
+#endif
     default:
         return Status::unsupported;
     }
@@ -2744,8 +2765,7 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
     // stride runs K over the whole channel count in one pass; padding is not
     // consulted (no input shape), and a padded 1x1 gathers with the same wide K.
     const bool unit_1x1 = karea == 1 && attrs.stride[0] == 1 && attrs.stride[1] == 1;
-    g.nr = quant ? NR_MAX_I8
-                 : (weight_dtype == DataType::f16 ? NR_MAX_F16 : NR_MAX_F32);
+    g.nr = quant ? NR_MAX_I8 : nr_max_dt(weight_dtype);
     g.icn_block = unit_1x1
         ? ic_per_group
         : std::min<int64_t>(channel_last::get_ic_block_channel_last(karea, ic_per_group),
@@ -2761,11 +2781,12 @@ ConvPackedWeightLast conv_packed_weight_last(const Conv2DAttributes& attrs,
         oc_per_group, ((per_block + g.nr - 1) / g.nr) * g.nr);
 
     g.kdim_max    = g.icn_block * karea;
-    g.slot_full   = gemm_panel_slot(g.kdim_max, g.nr, esz, quant);
+    const bool bf16 = weight_dtype == DataType::bf16;
+    g.slot_full   = gemm_panel_slot(g.kdim_max, g.nr, esz, quant, bf16);
     g.nfull_ic    = ic_per_group / g.icn_block;
     g.tail_ic     = ic_per_group - g.nfull_ic * g.icn_block;
     g.slot_tail   = g.tail_ic
-        ? gemm_panel_slot(g.tail_ic * karea, g.nr, esz, quant) : 0;
+        ? gemm_panel_slot(g.tail_ic * karea, g.nr, esz, quant, bf16) : 0;
     g.col_elems   = g.nfull_ic * g.slot_full + (g.tail_ic ? g.slot_tail : 0);
     // ⌈⌉, not ÷: a lone oc block is the group's own width, which need not be a
     // multiple of nr (24 channels is two panels, one of them half live).
@@ -2949,7 +2970,8 @@ void pack_weight_last(const TensorView& weight, TensorView& packed,
         const int64_t icn  = ib * g.icn_block;
         const int64_t icnc = std::min(g.icn_block, ic_per_group - icn);
         const int64_t kdim = icnc * karea;
-        const int64_t slot = gemm_panel_slot(kdim, g.nr, sizeof(T), false);
+        const int64_t slot = gemm_panel_slot(kdim, g.nr, sizeof(T), false,
+                                             std::is_same_v<T, bfloat16>);
         const int64_t oc0  = ob * g.ocn_block;
         const int64_t oc1  = std::min(oc0 + g.ocn_block, oc_per_group);
 
@@ -3109,6 +3131,11 @@ void conv_packed_weight_pack(const Conv2DAttributes& attrs,
         case DataType::f16:
             pack_weight_last<half>(weight, packed, g, ICG, OCG, G, ctx);
             break;
+#ifdef NNOPS_ARCH_AARCH64
+        case DataType::bf16:
+            pack_weight_last<bfloat16>(weight, packed, g, ICG, OCG, G, ctx);
+            break;
+#endif
         case DataType::s8:
             pack_weight_last_i8(weight, packed, g, ICG, OCG, G, ctx);
             break;

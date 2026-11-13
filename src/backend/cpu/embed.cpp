@@ -15,6 +15,8 @@
 
 #include "nnops/ops/embed.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/simd/simd.hpp"
+#include "backend/cpu/common/dtype_dispatch.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/cpu_features.hpp"
 
@@ -132,6 +134,18 @@ void embed_int8_dequant_impl(const EmbedAttributes& /*attrs*/,
             half* dst = output.ptr<half>() + n * out_row_stride;
             quant_kernel::dequantization<T>(1, dim_i, dst, dim_i,
                                             w_row, dim_i, &s_val, &zp_val);
+        } else if (output.data_type() == DataType::bf16) {
+            // The arch kernel has f32 and f16 stores only, so a bf16 row
+            // dequantizes through a stack chunk and narrows on the way out.
+            bfloat16* dst = output.ptr<bfloat16>() + n * out_row_stride;
+            constexpr int kChunk = 256;
+            float tmp[kChunk];
+            for (int64_t off = 0; off < dim; off += kChunk) {
+                const int c = static_cast<int>(std::min<int64_t>(kChunk, dim - off));
+                quant_kernel::dequantization<T>(1, c, tmp, c, w_row + off, c,
+                                                &s_val, &zp_val);
+                for (int i = 0; i < c; ++i) { simd::s_store(&dst[off + i], tmp[i]); }
+            }
         } else {
             float* dst = output.ptr<float>() + n * out_row_stride;
             quant_kernel::dequantization<T>(1, dim_i, dst, dim_i,
@@ -161,8 +175,14 @@ Status embed_cpu(const EmbedAttributes& attrs,
         embed_direct_impl<half>(attrs, output, inputs, ctx);
         return Status::ok;
     }
+#ifdef NNOPS_ARCH_AARCH64
+    if (w_dtype == DataType::bf16) {
+        embed_direct_impl<bfloat16>(attrs, output, inputs, ctx);
+        return Status::ok;
+    }
+#endif
 
-    NNOPS_ASSERT(o_dtype == DataType::f32 || o_dtype == DataType::f16);
+    NNOPS_ASSERT(is_float_dtype(o_dtype));
     if (w_dtype == DataType::s8) {
         embed_int8_dequant_impl<int8_t>(attrs, output, inputs, ctx);
     } else if (w_dtype == DataType::u8) {

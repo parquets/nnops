@@ -74,7 +74,8 @@ bool is_depthwise_geometry(const Conv2DAttributes& attrs, const TensorView& weig
 
 bool is_fp(DataType dtype) noexcept
 {
-    return dtype == DataType::f32 || dtype == DataType::f16;
+    return dtype == DataType::f32 || dtype == DataType::f16 ||
+           dtype == DataType::bf16;
 }
 
 auto resolve_conv2d_kernel(Backend backend, ConvAlgorithm algorithm)
@@ -340,13 +341,19 @@ void Conv2D::prepackWeights(std::span<const TensorView> inputs,
     // Two products live behind this one call. Auto keeps producing U exactly
     // where the transform exists — the k3s1 fp geometry its asserts demand —
     // because that is what an Auto caller will feed back into compute().
+    // The U exists for f32 and f16 only: the Winograd kernel refuses every
+    // other dtype (its U panels are the dense fp pack), so neither an Auto nor
+    // an explicit Winograd pack may hand back a U the same call would decline.
+    const bool wino_dtype = weight.data_type() == DataType::f32 ||
+                            weight.data_type() == DataType::f16;
     const bool wino_product =
-        attrs_.algorithm == ConvAlgorithm::Winograd ||
-        (attrs_.algorithm == ConvAlgorithm::Auto &&
-         !is_quantized_conv2d(weight.data_type()) &&
-         attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
-         attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
-         attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1);
+        wino_dtype &&
+        (attrs_.algorithm == ConvAlgorithm::Winograd ||
+         (attrs_.algorithm == ConvAlgorithm::Auto &&
+          !is_quantized_conv2d(weight.data_type()) &&
+          attrs_.kernel_size[0] == 3 && attrs_.kernel_size[1] == 3 &&
+          attrs_.stride[0] == 1 && attrs_.stride[1] == 1 &&
+          attrs_.dilation[0] == 1 && attrs_.dilation[1] == 1));
 
     if (!wino_product) {
         // A square 3x3/5x5/7x7 over at most four channels has no packed form on
