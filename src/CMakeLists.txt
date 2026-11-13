@@ -193,6 +193,8 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/gemm/matmul.cu
         backend/cuda/gemm/linear.cu
         backend/cuda/conv/conv2d.cu
+        backend/cuda/conv/transpose_conv2d.cu
+        backend/cuda/conv/depthwise_transpose_conv.cu
         backend/cuda/conv/depthwise_conv.cu
         backend/cuda/conv/pooling.cu
         # Unsupported operators' entry points, so the CUDA library resolves every

@@ -18,6 +18,7 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(TransposeConv2DAttributes, transpose_conv2d_cpu)
 NNOPS_DECLARE_CPU(DepthwiseTransposeConv2DAttributes, depthwise_transpose_conv_cpu)
+NNOPS_DECLARE_CUDA(TransposeConv2DAttributes, transpose_conv2d_cuda)
 
 namespace {
 
@@ -38,7 +39,8 @@ bool is_depthwise_geometry(const TransposeConv2DAttributes& attrs, const TensorV
 }  // namespace
 
 NNOPS_OP_BOILERPLATE(TransposeConv2D, TransposeConv2DAttributes,
-        backend::cpu::transpose_conv2d_cpu, nullptr, nullptr)
+        backend::cpu::transpose_conv2d_cpu,
+        NNOPS_IF_CUDA(backend::cuda::transpose_conv2d_cuda), nullptr)
 
 std::vector<TensorDesc> TransposeConv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
