@@ -1,5 +1,5 @@
 /// @file bench_rnn.cpp
-/// @brief Recurrent-family benchmark — RNN, LSTM and GRU, f32 and f16.
+/// @brief Recurrent-family benchmark — RNN, LSTM and GRU, f32, f16 and bf16.
 ///
 /// Two numbers matter for a recurrent op and they pull in opposite directions:
 ///
@@ -38,6 +38,7 @@
 using namespace nnops;
 using nnops::simd::s_load;
 using nnops::simd::s_store;
+using nnops::backend::cpu::bfloat16;
 namespace cpu = nnops::backend::cpu;
 using cpu::half;
 
@@ -78,10 +79,35 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
+/// The element type a run_recurrent<T> instantiation runs in.
+template <typename T>
+constexpr DataType dt_of() noexcept {
+    if constexpr (std::is_same_v<T, float>) {
+        return DataType::f32;
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return DataType::bf16;
+    } else {
+        return DataType::f16;
+    }
+}
+
+template <typename T>
+constexpr const char* dt_name() noexcept {
+    if constexpr (std::is_same_v<T, float>) {
+        return "f32";
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return "bf16";
+    } else {
+        return "f16";
+    }
+}
+
 template <typename T>
 auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     if constexpr (std::is_same_v<T, float>) {
         return test::make_random_tensor(shape, -1.0f, 1.0f, seed);
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return test::make_random_bf16_tensor(shape, -1.0f, 1.0f, seed);
     } else {
         return test::make_random_f16_tensor(shape, -1.0f, 1.0f, seed);
     }
@@ -125,6 +151,10 @@ struct RecurrentCase {
     /// s8 W and R with one symmetric scale per gate row; X stays floating, so
     /// the kernel quantizes every activation row (the W8A8 route).
     bool q8 = false;
+    /// bf16 arm: the BFMMLA route, distinct from f16's (both are 16-bit, and
+    /// on aarch64 each has its own packed-B layout). Last so the positional
+    /// initializers above keep their meaning.
+    bool bf16 = false;
 };
 
 /// W or R as a real quantization would leave it: each row rounded to s8 against
@@ -198,7 +228,7 @@ void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int 
     std::vector<T> y_buf(static_cast<size_t>(c.T * D * c.B * c.H));
     std::vector<T> yh_buf(static_cast<size_t>(D * c.B * c.H));
     std::vector<T> yc_buf(static_cast<size_t>(D * c.B * c.H));
-    const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    const DataType dt = dt_of<T>();
     std::vector<TensorView> outs = {
         TensorView(std::span<const int64_t>(yshape, 4), dt, y_buf.data()),
         TensorView(std::span<const int64_t>(hshape, 3), dt, yh_buf.data()),
@@ -236,7 +266,7 @@ void run_recurrent(const RecurrentCase& c, const std::vector<int>& threads, int 
     std::printf("  %s\n", c.name);
     std::printf("    T=%lld B=%lld I=%lld H=%lld  G=%lld D=%lld  %s%s\n",
                 (long long)c.T, (long long)c.B, (long long)c.I, (long long)c.H,
-                (long long)G, (long long)D, c.f16 ? "f16" : "f32",
+                (long long)G, (long long)D, c.bf16 ? "bf16" : c.f16 ? "f16" : "f32",
                 c.q8 ? " W8A8" : "");
 
     auto compute = [&](const ComputeContext& ctx) { op->compute(outs, ins, ctx, nullptr); };
@@ -277,8 +307,9 @@ void bench_case(const RecurrentCase& c) {
     if (hw > 1 && std::find(threads.begin(), threads.end(), hw) == threads.end()) {
         threads.push_back(hw);
     }
-    if (c.f16) { run_recurrent<half>(c, threads, iters); }
-    else       { run_recurrent<float>(c, threads, iters); }
+    if (c.bf16)     { run_recurrent<bfloat16>(c, threads, iters); }
+    else if (c.f16) { run_recurrent<half>(c, threads, iters); }
+    else            { run_recurrent<float>(c, threads, iters); }
 }
 
 }  // namespace
@@ -323,6 +354,22 @@ NNOPS_BENCH(lstm_f16_wide) {
                 RnnDirection::Forward, /*f16=*/true});
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(lstm_bf16_small) {
+    RecurrentCase c{"lstm bf16 T32 B1 I128 H128", RecurrentMode::Lstm, 32, 1, 128, 128};
+    c.bf16 = true;
+    bench_case(c);
+}
+#endif  // NNOPS_ARCH_AARCH64
+
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(lstm_bf16_wide) {
+    RecurrentCase c{"lstm bf16 T16 B2 I256 H256", RecurrentMode::Lstm, 16, 2, 256, 256};
+    c.bf16 = true;
+    bench_case(c);
+}
+#endif  // NNOPS_ARCH_AARCH64
+
 // ============================================================
 // GRU — two phases per step, 3·H columns each
 // ============================================================
@@ -357,7 +404,7 @@ void ab_gru_lbr(int64_t steps, int64_t B, int64_t I, int64_t H,
 
     std::vector<T> y_buf(static_cast<size_t>(steps * D * B * H));
     std::vector<T> yh_buf(static_cast<size_t>(D * B * H));
-    const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    const DataType dt = dt_of<T>();
     std::vector<TensorView> outs = {
         TensorView(std::span<const int64_t>(yshape, 4), dt, y_buf.data()),
         TensorView(std::span<const int64_t>(hshape, 3), dt, yh_buf.data()),
@@ -430,6 +477,14 @@ NNOPS_BENCH(gru_f16_small) {
                 RnnDirection::Forward, /*f16=*/true});
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(gru_bf16_small) {
+    RecurrentCase c{"gru bf16 T32 B1 I128 H128", RecurrentMode::Gru, 32, 1, 128, 128};
+    c.bf16 = true;
+    bench_case(c);
+}
+#endif  // NNOPS_ARCH_AARCH64
+
 // ============================================================
 // RNN — one gate, the cheapest epilogue
 // ============================================================
@@ -446,6 +501,14 @@ NNOPS_BENCH(rnn_f16_small) {
     bench_case({"rnn f16 T32 B1 I128 H128", RecurrentMode::Rnn, 32, 1, 128, 128,
                 RnnDirection::Forward, /*f16=*/true});
 }
+
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(rnn_bf16_small) {
+    RecurrentCase c{"rnn bf16 T32 B1 I128 H128", RecurrentMode::Rnn, 32, 1, 128, 128};
+    c.bf16 = true;
+    bench_case(c);
+}
+#endif  // NNOPS_ARCH_AARCH64
 
 // ============================================================
 // Prepacked weights — the same call, with the pack hoisted out
@@ -478,7 +541,7 @@ void ab_rnn_prepack(RecurrentMode mode, int64_t steps, int64_t B, int64_t I,
     std::vector<T> y_buf(static_cast<size_t>(steps * D * B * H));
     std::vector<T> yh_buf(static_cast<size_t>(D * B * H));
     std::vector<T> yc_buf(static_cast<size_t>(D * B * H));
-    const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    const DataType dt = dt_of<T>();
     std::vector<TensorView> ins = {x, w, r, b, TensorView{}, h0};
     std::vector<TensorView> outs = {
         TensorView(std::span<const int64_t>(yshape, 4), dt, y_buf.data()),
@@ -520,7 +583,7 @@ void ab_rnn_prepack(RecurrentMode mode, int64_t steps, int64_t B, int64_t I,
     std::printf("  %s prepack  T=%lld B=%lld I=%lld H=%lld  %s (blob %lld elems)\n",
                 name, (long long)steps, (long long)B,
                 (long long)I, (long long)H,
-                std::is_same_v<T, float> ? "f32" : "f16", (long long)q.numel());
+                dt_name<T>(), (long long)q.numel());
 
     auto median = [](std::vector<double> v) {
         std::sort(v.begin(), v.end());
@@ -608,6 +671,15 @@ NNOPS_BENCH(q8_lstm_f16_compute) {
                 RnnDirection::Forward, /*f16=*/true, false, /*q8=*/true});
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(q8_lstm_bf16_compute) {
+    RecurrentCase c{"lstm bf16 T32 B8 I128 H128 W8A8", RecurrentMode::Lstm, 32, 8, 128, 128};
+    c.q8 = true;
+    c.bf16 = true;
+    bench_case(c);
+}
+#endif  // NNOPS_ARCH_AARCH64
+
 /// The fp arm against the W8A8 arm, interleaved in one process on the same
 /// weights. The only difference is the two products' arithmetic, so the ratio is
 /// what quantizing the layer buys end to end — including the per-step
@@ -649,7 +721,7 @@ void ab_rnn_q8(RecurrentMode mode, int64_t steps, int64_t B, int64_t I, int64_t 
     std::vector<T> y_buf(static_cast<size_t>(steps * D * B * H));
     std::vector<T> yh_buf(static_cast<size_t>(D * B * H));
     std::vector<T> yc_buf(static_cast<size_t>(D * B * H));
-    const DataType dt = std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    const DataType dt = dt_of<T>();
     std::vector<TensorView> outs = {
         TensorView(std::span<const int64_t>(yshape, 4), dt, y_buf.data()),
         TensorView(std::span<const int64_t>(hshape, 3), dt, yh_buf.data()),

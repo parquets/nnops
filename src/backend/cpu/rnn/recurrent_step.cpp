@@ -207,6 +207,20 @@ template void epilogue_tile<half, PhaseKind::GruZr>(
     const StepCtx<half>&, int64_t, int64_t, int64_t, int64_t);
 template void epilogue_tile<half, PhaseKind::GruH>(
     const StepCtx<half>&, int64_t, int64_t, int64_t, int64_t);
+// bf16 exists only on aarch64: x86 refuses it at validate(), and the MMA
+// kernel it needs is not built there.
+#ifdef NNOPS_ARCH_AARCH64
+template void epilogue_tile<bfloat16, PhaseKind::Rnn>(
+    const StepCtx<bfloat16>&, int64_t, int64_t, int64_t, int64_t);
+template void epilogue_tile<bfloat16, PhaseKind::Lstm>(
+    const StepCtx<bfloat16>&, int64_t, int64_t, int64_t, int64_t);
+template void epilogue_tile<bfloat16, PhaseKind::GruAll>(
+    const StepCtx<bfloat16>&, int64_t, int64_t, int64_t, int64_t);
+template void epilogue_tile<bfloat16, PhaseKind::GruZr>(
+    const StepCtx<bfloat16>&, int64_t, int64_t, int64_t, int64_t);
+template void epilogue_tile<bfloat16, PhaseKind::GruH>(
+    const StepCtx<bfloat16>&, int64_t, int64_t, int64_t, int64_t);
+#endif
 
 namespace {
 
@@ -279,6 +293,18 @@ void run_phase(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& ctx
     }
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+void run_phase(const StepCtx<bfloat16>& s, PhaseKind kind, const ComputeContext& ctx) {
+    switch (kind) {
+    case PhaseKind::Rnn:    run_phase_kernel<bfloat16, PhaseKind::Rnn>(s, ctx); break;
+    case PhaseKind::Lstm:   run_phase_kernel<bfloat16, PhaseKind::Lstm>(s, ctx); break;
+    case PhaseKind::GruAll: run_phase_kernel<bfloat16, PhaseKind::GruAll>(s, ctx); break;
+    case PhaseKind::GruZr:  run_phase_kernel<bfloat16, PhaseKind::GruZr>(s, ctx); break;
+    case PhaseKind::GruH:   run_phase_kernel<bfloat16, PhaseKind::GruH>(s, ctx); break;
+    }
+}
+#endif
+
 /// The input projection over one chunk — the same tile kernel the recurrent
 /// product uses, only with `rows·B` rows in m instead of B. That is what makes a
 /// recurrent layer's projection cost a GEMM's rather than a GEMV's: every
@@ -340,5 +366,11 @@ template void project_chunk<half>(const half*, int64_t, half*, int64_t,
                                   const half*, int64_t, int64_t, int64_t,
                                   int64_t, int64_t, int64_t, int64_t,
                                   const ComputeContext&);
+#ifdef NNOPS_ARCH_AARCH64
+template void project_chunk<bfloat16>(const bfloat16*, int64_t, bfloat16*, int64_t,
+                                      const bfloat16*, int64_t, int64_t, int64_t,
+                                      int64_t, int64_t, int64_t, int64_t,
+                                      const ComputeContext&);
+#endif
 
 }  // namespace nnops::backend::cpu

@@ -70,7 +70,9 @@ inline bool recurrent_is_quantized(DataType wdtype) noexcept {
 
 inline DataType recurrent_compute_dtype(DataType xdtype, DataType wdtype) noexcept {
     if (!recurrent_is_quantized(wdtype)) { return xdtype; }
-    return (xdtype == DataType::f16) ? DataType::f16 : DataType::f32;
+    return (xdtype == DataType::f16)  ? DataType::f16
+         : (xdtype == DataType::bf16) ? DataType::bf16
+                                      : DataType::f32;
 }
 
 /// The quantized route's activation requirement. A floating activation is
@@ -137,12 +139,6 @@ inline Status recurrent_check(const RecurrentSpec& s,
 
     if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(x.dtype) ||
         !dtype_in<DataType::f32, DataType::f16, DataType::s8>(w.dtype)) {
-        return Status::unsupported;
-    }
-    // The recurrence kernels are instantiated for f32 and f16 only, and
-    // dtype_in admits bf16 wherever f16 is admitted; reject it here rather than
-    // let validate() pass a call compute() must refuse.
-    if (x.dtype == DataType::bf16 || w.dtype == DataType::bf16) {
         return Status::unsupported;
     }
     const int64_t G = recurrent_gates(s.mode);
@@ -287,9 +283,6 @@ inline void recurrent_prepack(Backend backend, const RecurrentSpec& s,
     if (w.is_empty() || r.is_empty() || is_packed_recurrent(w.layout())) { return; }
     const DataType dt = w.data_type();
     if (!dtype_in<DataType::f32, DataType::f16, DataType::s8>(dt)) { return; }
-    // dtype_in admits bf16 wherever f16 is admitted, but the recurrent kernels
-    // and the blob's header are f32/f16 only — no packed form for bf16.
-    if (dt == DataType::bf16) { return; }
     if (w.rank() != 3 || r.rank() != 3 ||
         r.data_type() != (recurrent_is_quantized(dt) ? DataType::s8 : dt)) {
         return;

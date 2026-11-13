@@ -318,6 +318,15 @@ inline void bf16_block8(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
                                              acc, lo, hi, bias);
 }
 
+/// Step from one packed panel to the next. Below -1 a negative ldb is how far
+/// apart the caller's panels sit, which is the stride of the blob they were
+/// packed into — for bf16 that is the whole-K slot, so it differs from this
+/// call's own pack on a short k block. `-1` (and a non-negative ldb, which only
+/// the in-place route sees) means the panels are this call's.
+inline int64_t bf16_panel_step(int64_t ldb, int64_t kc) noexcept {
+    return (ldb < -1) ? -ldb : bf16_b_panel_stride(kc);
+}
+
 /// The leftover columns of a tile: 8-column blocks from @p n, starting at the
 /// panel @p b already points at. One panel is 16 columns, so an in-place B
 /// (Strided) steps 16 elements to the next one, not 16 k-rows.
@@ -326,7 +335,7 @@ __attribute__((target("bf16")))
 inline void bf16_tail(int mr, int n, int nc, int kc, bfloat16* c, int ldc,
                       const bfloat16* a, int lda, const bfloat16* b, int64_t ldb,
                       float lo, float hi, const bfloat16* bias) noexcept {
-    const int64_t advance = Strided ? 16 : bf16_b_panel_stride(kc);
+    const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
     for (; n < nc; n += 8) {
         bf16_block8<PAIRS, Strided, zero_mode, seed>(mr, n, nc, kc, c, ldc, a, lda,
                                                      b, ldb, lo, hi, bias);
@@ -364,7 +373,7 @@ inline void bf16_kernel_mr8(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
 
     const int kgroups = kc >> 2;
     const int ktail = kc & 3;
-    const int64_t advance = Strided ? 16 : bf16_b_panel_stride(kc);
+    const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
     const sims::v_f32x8 vmin = sims::v_set1_f32x8(lo);
     const sims::v_f32x8 vmax = sims::v_set1_f32x8(hi);
 
@@ -545,7 +554,7 @@ inline void bf16_kernel_wide(int mr, int nc, int kc, bfloat16* NNOPS_RESTRICT C,
 
     const int kgroups = kc >> 2;
     const int ktail = kc & 3;
-    const int64_t advance = Strided ? 16 : bf16_b_panel_stride(kc);
+    const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
     const sims::v_f32x8 vmin = sims::v_set1_f32x8(lo);
     const sims::v_f32x8 vmax = sims::v_set1_f32x8(hi);
 
@@ -734,7 +743,7 @@ inline void bf16_gemm_wide(int mr, int nc, int kc, bfloat16* c, int ldc,
     bfloat16* c_rows[2 * PAIRS];
     bf16_rows<PAIRS>(a, lda, mr, c, ldc, a_rows, c_rows);
 
-    const int64_t advance = Strided ? 16 : bf16_b_panel_stride(kc);
+    const int64_t advance = Strided ? 16 : bf16_panel_step(ldb, kc);
 
     for (int n = 0; n < nc; n += 8) {
         const int rem = std::min(8, nc - n);

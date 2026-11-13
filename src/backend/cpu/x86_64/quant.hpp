@@ -36,10 +36,13 @@
 #include <type_traits>
 
 #include "backend/cpu/common/common_utils.hpp"
+#include "nnops/detail/bf16.hpp"
 #include "nnops/detail/half.hpp"
 
 namespace nnops::backend::cpu::x86_64 {
 
+using nnops::backend::cpu::bfloat16;
+using nnops::backend::cpu::bfloat16_to_float;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
@@ -212,6 +215,36 @@ inline void quantization(int M, int N,
         }
         for (; n < N; ++n) {
             const float q = half_to_float(src_ptr[n]) * inv_scale + zero_val;
+            int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
+            qi = std::min(std::max(qi, qmin), qmax);
+            dst_ptr[n] = static_cast<T>(qi);
+        }
+    }
+}
+
+/// bf16 input variant of `quantization<T>`. Scalar by design: no x86 backend
+/// carries bf16 kernels (validation rejects the dtype), so this exists only so
+/// the element type is complete across the arch kernels; the arithmetic is the
+/// f32 kernel's, with bf16 widened by its shift.
+template <typename T>
+inline void quantization(int M, int N,
+                         T* NNOPS_RESTRICT dst, int dr_step,
+                         const bfloat16* NNOPS_RESTRICT src, int sr_step,
+                         const float* NNOPS_RESTRICT scale,
+                         const float* NNOPS_RESTRICT zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "quantization: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+    constexpr int32_t qmin = Q_U8 ? 0 : -128;
+    constexpr int32_t qmax = Q_U8 ? 255 : 127;
+
+    for (int m = 0; m < M; ++m) {
+        const float inv_scale = 1.0f / scale[m];
+        const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+        T* dst_ptr = dst + m * dr_step;
+        const bfloat16* src_ptr = src + m * sr_step;
+        for (int n = 0; n < N; ++n) {
+            const float q = bfloat16_to_float(src_ptr[n]) * inv_scale + zero_val;
             int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
             qi = std::min(std::max(qi, qmin), qmax);
             dst_ptr[n] = static_cast<T>(qi);

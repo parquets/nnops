@@ -51,7 +51,7 @@ PackedWeightOffsets packed_weight_offsets(const RecurrentPackedHeader& h) noexce
     };
     // A panel region is np·ldd, which is k rounded up to nr — not k, so the
     // geometry call, not the raw extent, is what sizes it.
-    const DataType dt = h.elem_size == 4 ? DataType::f32 : DataType::f16;
+    const DataType dt = static_cast<DataType>(h.dtype);
     const MatMulPackedB wg = matmul_packed_b_geom(h.total_cols, h.input, dt);
     o.w = take(packed_b_numel(h.total_cols, wg.total));
     for (int64_t ph = 0; ph < h.nphases; ++ph) {
@@ -71,6 +71,7 @@ RecurrentPackedHeader packed_header(const RecurrentParams& p) noexcept
     h.version = kRecurrentPackedVersion;
     h.q8 = p.weight_dtype == DataType::s8 ? 1 : 0;
     h.elem_size = h.q8 != 0 ? 1 : static_cast<int64_t>(data_type_size(p.dtype));
+    h.dtype = static_cast<int64_t>(h.q8 != 0 ? DataType::f32 : p.dtype);
     h.input = p.input;
     h.hidden = p.hidden;
     h.directions = p.directions;
@@ -247,7 +248,8 @@ Status recurrent_pack_weights(const RecurrentParams& p, const TensorView& w,
                               const TensorView& r, const TensorView* bias,
                               TensorView& dst, const ComputeContext& ctx)
 {
-    if (p.dtype != DataType::f32 && p.dtype != DataType::f16) {
+    if (p.dtype != DataType::f32 && p.dtype != DataType::f16 &&
+        p.dtype != DataType::bf16) {
         return Status::unsupported;
     }
     if (p.input <= 0 || p.hidden <= 0 || p.directions <= 0) {
@@ -256,9 +258,17 @@ Status recurrent_pack_weights(const RecurrentParams& p, const TensorView& w,
     if (p.weight_dtype == DataType::s8) {
         return pack_weights_q8(p, w, r, bias, dst, ctx);
     }
-    return p.dtype == DataType::f32
-               ? pack_weights_impl<float>(p, w, r, bias, dst, ctx)
-               : pack_weights_impl<half>(p, w, r, bias, dst, ctx);
+    if (p.dtype == DataType::f32) {
+        return pack_weights_impl<float>(p, w, r, bias, dst, ctx);
+    }
+    if (p.dtype == DataType::f16) {
+        return pack_weights_impl<half>(p, w, r, bias, dst, ctx);
+    }
+#ifdef NNOPS_ARCH_AARCH64
+    return pack_weights_impl<bfloat16>(p, w, r, bias, dst, ctx);
+#else
+    return Status::unsupported;  // bf16 is aarch64-only (validate() refuses it)
+#endif
 }
 
 }  // namespace nnops::backend::cpu

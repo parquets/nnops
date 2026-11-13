@@ -213,6 +213,7 @@ Status prepare_run(const RecurrentParams& p, std::span<TensorView> outputs,
         const auto* h = reinterpret_cast<const RecurrentPackedHeader*>(blob);
         if (h->magic != kRecurrentPackedMagic || h->version != kRecurrentPackedVersion ||
             h->elem_size != (run.q8 ? int64_t{1} : esz) ||
+            h->dtype != static_cast<int64_t>(run.q8 ? DataType::f32 : dtype_of<T>()) ||
             h->q8 != (run.q8 ? int64_t{1} : int64_t{0}) ||
             h->input != run.I || h->hidden != run.H ||
             h->directions != run.D || h->gates != run.G ||
@@ -676,12 +677,18 @@ Status recurrent_cpu(const RecurrentParams& p,
                      std::span<const TensorView> inputs,
                      const ComputeContext& ctx)
 {
-    if (p.dtype != DataType::f32 && p.dtype != DataType::f16) {
-        return Status::unsupported;
+    if (p.dtype == DataType::f32) {
+        return recurrent_impl<float>(p, outputs, inputs, ctx);
     }
-    return p.dtype == DataType::f32
-               ? recurrent_impl<float>(p, outputs, inputs, ctx)
-               : recurrent_impl<half>(p, outputs, inputs, ctx);
+    if (p.dtype == DataType::f16) {
+        return recurrent_impl<half>(p, outputs, inputs, ctx);
+    }
+#ifdef NNOPS_ARCH_AARCH64
+    if (p.dtype == DataType::bf16) {
+        return recurrent_impl<bfloat16>(p, outputs, inputs, ctx);
+    }
+#endif
+    return Status::unsupported;
 }
 
 }  // namespace nnops::backend::cpu

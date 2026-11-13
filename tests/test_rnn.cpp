@@ -55,6 +55,7 @@ namespace ref = nnops::backend::cpu::reference;
 
 namespace {
 
+using nnops::backend::cpu::bfloat16;
 using nnops::backend::cpu::half;
 using nnops::simd::s_load;
 using nnops::simd::s_store;
@@ -65,7 +66,9 @@ using nnops::simd::s_store;
 constexpr float kF32Tol = 2e-4f;
 
 template <typename T> constexpr DataType dt_of() {
-    return std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    if constexpr (std::is_same_v<T, float>) { return DataType::f32; }
+    else if constexpr (std::is_same_v<T, bfloat16>) { return DataType::bf16; }
+    else { return DataType::f16; }
 }
 
 template <typename T>
@@ -630,6 +633,70 @@ NNOPS_TEST(gru_f16_matches_reference) {
     }
 }
 
+#if defined(NNOPS_ARCH_AARCH64)
+// bf16 is a compute dtype only on aarch64 — validate() refuses it where no
+// kernel exists — so its cases live behind the arch gate. The gate buffer is
+// bf16, exactly as the f16 route's is half, and the bar is the shared
+// kBF16AccumTol.
+
+NNOPS_TEST(rnn_bf16_matches_reference) {
+    RnnAttributes a;
+    a.hidden_size = 10;
+    a.direction = RnnDirection::Bidirectional;
+    Geo g;
+    g.T = 3; g.B = 2; g.I = 6; g.H = 10; g.dir = RnnDirection::Bidirectional;
+    g.h0 = true;
+    check_rnn<bfloat16>(g, a, test::kBF16AccumTol);
+}
+
+NNOPS_TEST(rnn_bf16_hidden_past_k_block_cap) {
+    // H past the 128-column cap splits the recurrent product in k, and B = 1
+    // puts it on the one-row rung, whose kernel call takes two of the blob's
+    // packed bf16 panels at a time. Those panels sit a whole-K slot apart, which
+    // on a short final k block is not this call's own packing stride — reading
+    // one panel per slot is an O(1) error rather than noise.
+    RnnAttributes a;
+    a.hidden_size = 130;
+    Geo g;
+    g.T = 2; g.B = 1; g.I = 5; g.H = 130; g.h0 = true;
+    check_rnn<bfloat16>(g, a, test::kBF16AccumTol);
+}
+
+NNOPS_TEST(lstm_bf16_matches_reference) {
+    LstmAttributes a;
+    a.hidden_size = 9;
+    a.direction = RnnDirection::Bidirectional;
+    Geo g;
+    g.T = 3; g.B = 2; g.I = 5; g.H = 9; g.dir = RnnDirection::Bidirectional;
+    g.seq = true; g.h0 = true; g.c0 = true;
+    check_lstm<bfloat16>(g, a, test::kBF16AccumTol);
+}
+
+NNOPS_TEST(gru_bf16_matches_reference) {
+    for (bool lbr : {false, true}) {
+        GruAttributes a;
+        a.hidden_size = 7;
+        a.linear_before_reset = lbr;
+        Geo g;
+        g.T = 3; g.B = 3; g.I = 5; g.H = 7; g.h0 = true;
+        check_gru<bfloat16>(g, a, test::kBF16AccumTol);
+    }
+}
+
+NNOPS_TEST(bf16_prepacked_matches_raw) {
+    // The blob's bf16 panels come from the same packer compute() would call, so
+    // the prepacked run must stay bit-identical.
+    for (bool lbr : {false, true}) {
+        GruAttributes a;
+        a.hidden_size = 6;
+        a.linear_before_reset = lbr;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 4; g.H = 6; g.h0 = true;
+        check_prepacked<bfloat16, Gru>(RecurrentMode::Gru, g, a);
+    }
+}
+#endif  // NNOPS_ARCH_AARCH64
+
 NNOPS_TEST(single_step_geometries) {
     // T = 1 is the decoder's per-token call: one step, no loop, so whatever the
     // driver does before and after the loop is all there is. B = 1 and I = 1
@@ -763,6 +830,29 @@ NNOPS_TEST(q8_s8_activation_and_f16_compute) {
         check_rnn<float>(g, a, kQ8Tol);
     }
 }
+
+#if defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(q8_bf16_compute_matches_reference) {
+    // s8 weights with a bf16 activation: the compute dtype follows X, so the
+    // int32 accumulator is dequantized into a bf16 gate buffer and the bias the
+    // blob stores as f32 is converted to bf16 by the driver.
+    {
+        RnnAttributes a;
+        a.hidden_size = 10;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 5; g.H = 10; g.h0 = true; g.q8 = true;
+        check_rnn<bfloat16>(g, a, test::kBF16AccumTol + kQ8Tol);
+    }
+    {
+        LstmAttributes a;
+        a.hidden_size = 8;
+        Geo g;
+        g.T = 3; g.B = 2; g.I = 6; g.H = 8; g.h0 = true; g.c0 = true;
+        g.q8 = true;
+        check_lstm<bfloat16>(g, a, test::kBF16AccumTol + kQ8Tol);
+    }
+}
+#endif  // NNOPS_ARCH_AARCH64
 
 NNOPS_TEST(q8_prepacked_matches_raw) {
     // The blob's panels and scales go through the same writer compute() uses, so
@@ -1323,14 +1413,19 @@ NNOPS_TEST(unsupported_backend_and_dtype) {
     auto op = Lstm::create(a, Backend::CUDA);
     NNOPS_EXPECT_EQ(op->getBackend(), Backend::CUDA);
 
-    // bf16 has no kernel: the descriptor check rejects it up front.
+    // bf16 is a compute dtype where the CPU kernel has one and is refused up
+    // front everywhere else — the descriptor check, not a failed call.
     std::vector<TensorDesc> in(3);
     in[0].rank = 3; in[0].dims = {2, 2, 3}; in[0].dtype = DataType::bf16;
     in[1].rank = 3; in[1].dims = {1, 16, 3}; in[1].dtype = DataType::bf16;
     in[2].rank = 3; in[2].dims = {1, 16, 4}; in[2].dtype = DataType::bf16;
     std::vector<TensorDesc> out(2);
     auto op2 = Lstm::create(a);
+#if defined(NNOPS_ARCH_AARCH64)
+    NNOPS_EXPECT_EQ(op2->validate(in, out), Status::ok);
+#else
     NNOPS_EXPECT_EQ(op2->validate(in, out), Status::unsupported);
+#endif
 }
 
 }  // namespace
