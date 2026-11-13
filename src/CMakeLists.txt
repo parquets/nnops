@@ -187,6 +187,7 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/eltwise.cu
         backend/cuda/unary.cu
         backend/cuda/reduce.cu
+        backend/cuda/resize.cu
         # Convolutions and the pooling that goes with them, one file an
         # operator family: Conv2D (both memory orders via the CuTe GEMM),
         # depthwise, and spatial pooling.

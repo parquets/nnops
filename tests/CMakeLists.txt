@@ -121,6 +121,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_transpose_conv2d.cpp
         test_cuda_depthwise_conv.cpp
         test_cuda_pooling.cpp
+        test_cuda_resize.cpp
     )
 endif()
 
@@ -184,6 +185,7 @@ if(NNOPS_BUILD_BENCHMARKS)
             bench_cuda_conv2d.cpp
             bench_cuda_transpose_conv2d.cpp
             bench_cuda_pooling.cpp
+            bench_cuda_resize.cpp
         )
     endif()
 

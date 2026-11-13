@@ -9,9 +9,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(ResizeAttributes, resize_cpu)
+NNOPS_DECLARE_CUDA(ResizeAttributes, resize_cuda)
 
 NNOPS_OP_BOILERPLATE(Resize, ResizeAttributes,
-        backend::cpu::resize_cpu, nullptr, nullptr)
+        backend::cpu::resize_cpu, NNOPS_IF_CUDA(backend::cuda::resize_cuda), nullptr)
 
 std::vector<TensorDesc> Resize::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const
