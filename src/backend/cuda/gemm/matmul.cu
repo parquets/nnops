@@ -1,4 +1,4 @@
-/// @file matmul_cuda.cu
+/// @file matmul.cu
 /// @brief CUDA MatMul — the dense CuTe GEMM behind the batched, transposable
 ///        operator front end.
 ///

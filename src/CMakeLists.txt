@@ -190,11 +190,11 @@ if(NNOPS_BUILD_CUDA)
         # Convolutions and the pooling that goes with them, one file an
         # operator family: Conv2D (both memory orders via the CuTe GEMM),
         # depthwise, and spatial pooling.
-        backend/cuda/gemm/matmul_cuda.cu
-        backend/cuda/gemm/linear_cuda.cu
-        backend/cuda/conv/conv2d_cuda.cu
-        backend/cuda/conv/depthwise_conv_cuda.cu
-        backend/cuda/conv/pooling_cuda.cu
+        backend/cuda/gemm/matmul.cu
+        backend/cuda/gemm/linear.cu
+        backend/cuda/conv/conv2d.cu
+        backend/cuda/conv/depthwise_conv.cu
+        backend/cuda/conv/pooling.cu
         # Unsupported operators' entry points, so the CUDA library resolves every
         # dispatch site the CPU backend references.
         backend/cuda/not_implemented.cu

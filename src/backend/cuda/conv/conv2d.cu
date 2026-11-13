@@ -1,4 +1,4 @@
-/// @file conv2d_cuda.cu
+/// @file conv2d.cu
 /// @brief CUDA Conv2D — one implicit-GEMM kernel for both memory orders.
 ///
 /// The convolution is posed the same way for channel-first and channel-last: M is

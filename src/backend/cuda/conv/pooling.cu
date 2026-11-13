@@ -1,4 +1,4 @@
-/// @file pooling_cuda.cu
+/// @file pooling.cu
 /// @brief CUDA implementation of 2D/3D spatial pooling — Max and Average — on a
 ///        Channel-first or a channel-last tensor.
 ///

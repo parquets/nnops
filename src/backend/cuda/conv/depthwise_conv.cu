@@ -1,4 +1,4 @@
-/// @file depthwise_conv_cuda.cu
+/// @file depthwise_conv.cu
 /// @brief CUDA implementation of 2D/3D depthwise convolution on a channel-first
 ///        or a channel-last tensor.
 ///

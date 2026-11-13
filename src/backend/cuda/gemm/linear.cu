@@ -1,4 +1,4 @@
-/// @file linear_cuda.cu
+/// @file linear.cu
 /// @brief CUDA Linear — the same dense GEMM as MatMul, with a [N, K] weight, a
 ///        [N] bias and the residual applied after the activation.
 ///
