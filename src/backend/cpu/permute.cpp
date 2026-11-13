@@ -11,7 +11,9 @@
 ///      whose innermost output dim maps to input stride 1 is a memcpy.
 ///
 /// The batch stride between slices is M*K: channel-first data makes dims rank-2 and
-/// rank-1 the innermost and contiguous.
+/// rank-1 the innermost and contiguous. A pitched row or a channel-last view
+/// breaks that, so the tiled route is gated on both operands being compact and
+/// such a call falls through to the stride-driven walk.
 
 #include "nnops/ops/permute.hpp"
 #include "simd_kernel/simd_permute.hpp"
@@ -20,6 +22,22 @@
 #include <cstring>
 
 namespace nnops::backend::cpu {
+
+namespace {
+
+/// Dense storage (no row pitch padding): the tiled transpose indexes a slice as
+/// `m * k`, which only holds when the rows sit back to back.
+bool is_compact(const TensorView& v)
+{
+    int64_t want = 1;
+    for (int64_t d = v.rank() - 1; d >= 0; --d) {
+        if (v.shape(d) != 1 && v.stride_elems(d) != want) { return false; }
+        want *= v.shape(d);
+    }
+    return true;
+}
+
+}  // anonymous namespace
 
 template <typename T>
 void permute_last_two_swap_impl(TensorView& output,
@@ -75,11 +93,10 @@ void permute_impl(const PermuteAttributes& attrs,
     const int64_t total = output.numel();
     if (total == 0) { return; }
 
+    // The view's own strides, so a pitched row (pitch > shape[rank-1]) and a
+    // channel-last view both read what the buffer actually holds.
     int64_t in_strides[TensorDesc::kMaxRank];
-    in_strides[rank - 1] = 1;
-    for (int64_t i = rank - 2; i >= 0; --i) {
-        in_strides[i] = in_strides[i + 1] * input.shape(i + 1);
-    }
+    for (int64_t i = 0; i < rank; ++i) { in_strides[i] = input.stride_elems(i); }
 
     // Strides over dims 0..rank-2 only: outer_idx has the inner dim divided out.
     int64_t outer_strides[TensorDesc::kMaxRank];
@@ -143,7 +160,8 @@ Status permute_cpu(const PermuteAttributes& attrs,
         if (is_last_two_swap) {
             is_last_two_swap =
                 (attrs.perm[static_cast<size_t>(rank - 2)] == rank - 1 &&
-                 attrs.perm[static_cast<size_t>(rank - 1)] == rank - 2);
+                 attrs.perm[static_cast<size_t>(rank - 1)] == rank - 2) &&
+                is_compact(inputs[0]) && is_compact(output);
         }
     }
 

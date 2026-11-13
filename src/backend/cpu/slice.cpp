@@ -13,6 +13,7 @@
 #include "nnops/ops/slice.hpp"
 #include "common/dtype_dispatch.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace nnops::backend::cpu {
@@ -46,17 +47,22 @@ void slice_impl(const SliceAttributes& attrs,
         if (ax < 0) {
             ax += rank;
         }
-        eff_start[static_cast<size_t>(ax)] = attrs.starts[a];
+        // ONNX-style: a negative start wraps before the clamp, the same rule
+        // slice_output_shape applies to the extent.
+        const int64_t dim = input.shape(ax);
+        int64_t s = attrs.starts[a];
+        if (s < 0) {
+            s += dim;
+        }
+        eff_start[static_cast<size_t>(ax)] = std::clamp<int64_t>(s, 0, dim);
         eff_step[static_cast<size_t>(ax)]  =
             (a < attrs.steps.size()) ? attrs.steps[a] : int64_t(1);
     }
 
-    // Input strides in elements (channel-first → contiguous innermost)
+    // The view's own strides, so a pitched row and a channel-last view both read
+    // what the buffer actually holds.
     int64_t in_strides[TensorDesc::kMaxRank];
-    in_strides[rank - 1] = 1;
-    for (int64_t i = rank - 2; i >= 0; --i) {
-        in_strides[i] = in_strides[i + 1] * input.shape(i + 1);
-    }
+    for (int64_t d = 0; d < rank; ++d) { in_strides[d] = input.stride_elems(d); }
 
     // Outer-only strides (for decomposing outer_idx over dims 0..rank-2)
     int64_t outer_strides[TensorDesc::kMaxRank];
@@ -74,7 +80,8 @@ void slice_impl(const SliceAttributes& attrs,
     const int64_t outer_total = total / inner_dim;
 
     // Input stride delta when innermost output dim increments by 1
-    const int64_t in_inner_step = eff_step[static_cast<size_t>(rank - 1)];
+    const int64_t in_inner_step =
+        eff_step[static_cast<size_t>(rank - 1)] * in_strides[rank - 1];
 
     auto body = [&](int64_t outer_idx) {
         // Decompose outer_idx into multi-index for dims 0..rank-2
@@ -88,7 +95,7 @@ void slice_impl(const SliceAttributes& attrs,
             in_base += in_coord * in_strides[d];
         }
 
-        in_base += eff_start[static_cast<size_t>(rank - 1)];
+        in_base += eff_start[static_cast<size_t>(rank - 1)] * in_strides[rank - 1];
 
         T* out_row = out_ptr + outer_idx * inner_dim;
 
