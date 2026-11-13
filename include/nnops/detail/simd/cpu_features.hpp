@@ -57,6 +57,7 @@ enum class CpuIsa : uint32_t {
     NEON_FP16  = 1 << 17,  ///< ARM NEON FP16 vector arithmetic
     NEON_DOT   = 1 << 18,  ///< ARMv8.2 dot-product
     NEON_BF16  = 1 << 19,  ///< Armv8.6 bfloat16 (BFMMLA, BFCVT), FEAT_BF16
+    NEON_I8MM  = 1 << 20,  ///< Armv8.6 int8 matrix multiply (SMMLA), FEAT_I8MM
 };
 
 /// Runtime CPU feature detector (process-wide singleton).
@@ -112,6 +113,8 @@ inline bool cpu_has_avx512f() { return CpuFeatures::get().has(CpuIsa::AVX512F); 
 inline bool cpu_has_neon()    { return CpuFeatures::get().has(CpuIsa::NEON); }
 /// FEAT_BF16: the BFMMLA bf16 matrix-multiply instruction is available.
 inline bool cpu_has_bf16()    { return CpuFeatures::get().has(CpuIsa::NEON_BF16); }
+/// FEAT_I8MM: the SMMLA int8 matrix-multiply instruction is available.
+inline bool cpu_has_i8mm()    { return CpuFeatures::get().has(CpuIsa::NEON_I8MM); }
 
 } // namespace simd
 } // namespace nnops

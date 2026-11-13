@@ -16,6 +16,7 @@
 
 #include "nnops/detail/simd/cpu_features.hpp"
 
+#include <cstdlib>
 #include <vector>
 
 #if defined(NNOPS_ARCH_X86_64)
@@ -275,6 +276,13 @@ void CpuFeatures::detect() {
     if (hwcap2 & HWCAP2_BF16) {
         features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
     }
+    // FEAT_I8MM: HWCAP2 bit 13, spelled numerically for the same reason.
+    #ifndef HWCAP2_I8MM
+    #define HWCAP2_I8MM (1L << 13)
+    #endif
+    if (hwcap2 & HWCAP2_I8MM) {
+        features_ |= static_cast<uint32_t>(CpuIsa::NEON_I8MM);
+    }
 
 #elif defined(_WIN32)
     // NEON (ASIMD) is always available. 43 is
@@ -299,7 +307,25 @@ void CpuFeatures::detect() {
             features_ |= static_cast<uint32_t>(CpuIsa::NEON_BF16);
         }
     }
+    {
+        int32_t has_i8mm = 0;
+        size_t len = sizeof(has_i8mm);
+        if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &has_i8mm, &len,
+                         nullptr, 0) == 0 && has_i8mm != 0) {
+            features_ |= static_cast<uint32_t>(CpuIsa::NEON_I8MM);
+        }
+    }
 #endif
+
+    // NNOPS_I8MM=0 forces the SDOT route even when the hardware has SMMLA:
+    // the escape hatch for a measured regression, and the arm the int8
+    // benchmarks compare against. Only the disabling direction is honoured —
+    // forcing it on would hand SMMLA to a core that cannot execute it.
+    if (const char* env = std::getenv("NNOPS_I8MM")) {
+        if (env[0] == '0' && env[1] == '\0') {
+            features_ &= ~static_cast<uint32_t>(CpuIsa::NEON_I8MM);
+        }
+    }
 
     // The macOS L1D is read in its own sysctl block below.
 #if defined(__linux__)

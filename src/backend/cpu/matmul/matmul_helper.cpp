@@ -759,9 +759,10 @@ void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
     const MatMulPackedB g = matmul_packed_b_geom(N, K, DataType::s8);
     NNOPS_ASSERT(g.ok() && r_b != nullptr);
 
-    // The panel is [k group][nr][4] bytes, so column c of a group is the four
-    // bytes at c*4 — the same shape on both arches, only nr differs. A short
-    // final group and the columns past N are what the packer zero-filled.
+    // The panel is [k group][nr][group] bytes: four on SDOT (x86 too), eight on
+    // i8mm. Column c of a group is that many contiguous bytes at c*group. A
+    // short final group and the columns past N are what the packer zero-filled.
+    const int group = i8mm_enabled() ? 8 : 4;
     const int cols = static_cast<int>(g.nr);
     const int64_t nb = (K + g.seg - 1) / g.seg;
     const int8_t* const blob = packed.ptr<int8_t>();
@@ -775,12 +776,13 @@ void matmul_packed_b_i8_col_sums(const TensorView& packed, int64_t K,
             const int live = static_cast<int>(std::min(g.nr, N - p * g.nr));
             for (int c = 0; c < live; ++c) { out[c] = 0; }
             for (int64_t b = 0; b < nb; ++b) {
-                const int kg = static_cast<int>((std::min(g.seg, K - b * g.seg) + 3) / 4);
+                const int kseg = static_cast<int>(std::min(g.seg, K - b * g.seg));
+                const int kg = (kseg + group - 1) / group;
                 const int8_t* panel = blob + (b * g.np + p) * g.ldd;
-                for (int grp = 0; grp < kg; ++grp, panel += cols * 4) {
+                for (int grp = 0; grp < kg; ++grp, panel += cols * group) {
                     for (int c = 0; c < live; ++c) {
-                        const int8_t* q = panel + c * 4;
-                        out[c] += q[0] + q[1] + q[2] + q[3];
+                        const int8_t* q = panel + c * group;
+                        for (int i = 0; i < group; ++i) { out[c] += q[i]; }
                     }
                 }
             }
@@ -818,6 +820,17 @@ constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs = {{
 #endif
 }};
 
+#ifdef NNOPS_ARCH_AARCH64
+// The SMMLA route's LHS ladder: same rungs, eight-k groups, one 16-byte
+// fragment per row pair.
+constexpr std::array<PackI8Fn, 3> pack_trans_i8_lhs_i8mm = {{
+    pack_trans_n8_i8mm, pack_trans_n4_i8mm, pack_trans_n1_i8mm,
+}};
+constexpr std::array<PackI8Fn, 3> pack_copy_i8_lhs_i8mm = {{
+    pack_copy_n8_i8mm, pack_copy_n4_i8mm, pack_copy_n1_i8mm,
+}};
+#endif
+
 #ifdef NNOPS_ARCH_X86_64
 constexpr PackI8WideFn pack_i8_rhs_trans = pack_trans_n16_dp4a_i8;
 constexpr PackI8WideFn pack_i8_rhs_copy  = pack_copy_n16_dp4a_i8;
@@ -851,9 +864,17 @@ void xor0x80_i8(int8_t* p, int nbytes) {
 void tile_pack_lhs_i8(bool trans, int mc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased) {
     // transposed source is a plain copy; row-major needs the transposing kernel.
+#ifdef NNOPS_ARCH_AARCH64
+    const bool i8mm = i8mm_enabled();
+    const PackI8Fn* fns = i8mm
+        ? (trans ? pack_copy_i8_lhs_i8mm.data() : pack_trans_i8_lhs_i8mm.data())
+        : (trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data());
+    const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
+#else
     const PackI8Fn* fns = trans ? pack_copy_i8_lhs.data() : pack_trans_i8_lhs.data();
-    const int pack_lds = trans ? 1 : lds;
     const int kbytes   = (kc + 3) & ~3;  // pack writes ceil(kc/4)*4 bytes per row
+#endif
+    const int pack_lds = trans ? 1 : lds;
 
     int i = 0;
     walk_levels_exact(i, mc, MR_I8, [&](int level, int s) {
@@ -874,9 +895,17 @@ void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
                             float scale_scalar, int32_t zero_scalar,
                             bool a_biased) {
     NNOPS_ASSERT(kc <= KC_CAP_I8);
+#ifdef NNOPS_ARCH_AARCH64
+    const bool i8mm = i8mm_enabled();
+    const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
+    const PackI8Fn* const packers = i8mm ? pack_trans_i8_lhs_i8mm.data()
+                                         : pack_trans_i8_lhs.data();
+#else
     const int kbytes = (kc + 3) & ~3;
+    const PackI8Fn* const packers = pack_trans_i8_lhs.data();
+#endif
     // One level at a time: at most MR_MAX_I8 rows of at most kbytes elements.
-    QT tmp[MR_MAX_I8 * (static_cast<int>(KC_CAP_I8) + 3)];
+    QT tmp[MR_MAX_I8 * (static_cast<int>(KC_CAP_I8) + 8)];
 
     int i = 0;
     walk_levels_exact(i, mc, MR_I8, [&](int level, int s) {
@@ -890,7 +919,7 @@ void pack_quant_lhs_i8_impl(int mc, int kc, int8_t* dst, int ldd,
             kernel::quant_kernel::quantization<QT>(
                 1, kc, tmp + r * kbytes, kbytes, src + (i + r) * lds, lds, &sc, zp);
         }
-        pack_trans_i8_lhs[level](dst, tmp, kbytes, kc, 0.0f);
+        packers[level](dst, tmp, kbytes, kc, 0.0f);
         if (a_biased) { xor0x80_i8(dst, s * kbytes); }
         dst += ldd;
     });
@@ -945,10 +974,19 @@ void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
                       const int8_t* src, int lds, bool a_biased,
                       bool src_shift) {
     constexpr int nr_max = NR_MAX_I8;
+#ifdef NNOPS_ARCH_AARCH64
+    // 8-k groups on the SMMLA route, 4-k on SDOT; the panel width is the same.
+    const bool i8mm = i8mm_enabled();
+    const PackI8WideFn fn = i8mm
+        ? (trans ? pack_trans_n12_i8mm : pack_copy_n12_i8mm)
+        : (trans ? pack_i8_rhs_trans : pack_i8_rhs_copy);
+    const int kbytes = i8mm ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
+#else
     const PackI8WideFn fn = trans ? pack_i8_rhs_trans : pack_i8_rhs_copy;
+    const int kbytes = (kc + 3) & ~3;
+#endif
     // transposed source: a panel is nr_max rows of K; row-major: nr_max columns.
     const int step   = trans ? lds : 1;
-    const int kbytes = (kc + 3) & ~3;
 
     for_each_n_panel(nc, nr_max, [&](int w) {
         fn(dst, src, lds, kc, 0.0f, w);
@@ -961,18 +999,45 @@ void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,
     });
 }
 
+using MmaPackI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*,
+                             const int8_t*, int, int32_t, int32_t);
+using MmaDirectI8Fn = void (*)(int, int, int, int32_t*, int, const int8_t*, int,
+                               const int8_t*, int, int32_t, int32_t);
+
+/// The rung's kernel for the route this process runs. Both routes share the MR
+/// ladder and the panel width; only the bytes inside a B panel differ.
+inline MmaPackI8Fn mma_pack_i8_fn(int level, bool zero_mode) {
+#ifdef NNOPS_ARCH_AARCH64
+    if (i8mm_enabled()) {
+        return zero_mode ? mma_pack_fns_i8mm<true>[level]
+                         : mma_pack_fns_i8mm<false>[level];
+    }
+#endif
+    return zero_mode ? mma_pack_fns_i8<true>[level] : mma_pack_fns_i8<false>[level];
+}
+
+inline MmaDirectI8Fn mma_direct_i8_fn(int level, bool zero_mode) {
+#ifdef NNOPS_ARCH_AARCH64
+    if (i8mm_enabled()) {
+        return zero_mode ? mma_direct_fns_i8mm<true>[level]
+                         : mma_direct_fns_i8mm<false>[level];
+    }
+#endif
+    return zero_mode ? mma_direct_fns_i8<true>[level]
+                     : mma_direct_fns_i8<false>[level];
+}
+
 /// One MMA call per M panel; the kernel walks the N side itself.
 void tile_mma_pack_i8(int mc, int nc, int kc,
                       int32_t* c, int ldc,
                       const int8_t* packed_a, const int8_t* packed_b, int ldb,
                       int32_t clamp_min, int32_t clamp_max, bool zero_mode) {
     const int ldd_a = static_cast<int>(GEOM_I8.ldd_a(kc));
-    const auto& fns = zero_mode ? mma_pack_fns_i8<true> : mma_pack_fns_i8<false>;
 
     int m = 0;
     walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
-        fns[level](s, nc, kc, c + m * ldc, ldc, packed_a, packed_b, ldb,
-                   clamp_min, clamp_max);
+        mma_pack_i8_fn(level, zero_mode)(s, nc, kc, c + m * ldc, ldc, packed_a,
+                                         packed_b, ldb, clamp_min, clamp_max);
         packed_a += ldd_a;
     });
 }
@@ -981,14 +1046,12 @@ void tile_mma_direct_i8(int mc, int nc, int kc,
                         int32_t* c, int ldc,
                         const int8_t* a, int lda, const int8_t* packed_b, int ldb,
                         int32_t clamp_min, int32_t clamp_max, bool zero_mode) {
-    const auto& fns = zero_mode ? mma_direct_fns_i8<true>
-                                : mma_direct_fns_i8<false>;
-
     // Same MR cascade as the packed route; only the A operand moves.
     int m = 0;
     walk_levels_exact(m, mc, MR_I8, [&](int level, int s) {
-        fns[level](s, nc, kc, c + m * ldc, ldc, a + m * lda, lda, packed_b, ldb,
-                   clamp_min, clamp_max);
+        mma_direct_i8_fn(level, zero_mode)(s, nc, kc, c + m * ldc, ldc,
+                                           a + m * lda, lda, packed_b, ldb,
+                                           clamp_min, clamp_max);
     });
 }
 
