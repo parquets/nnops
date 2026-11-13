@@ -6,8 +6,8 @@
 /// output rows to amortise that round trip, so this route skips it: no packed
 /// B, no workspace, no k-blocking — each kernel sweeps K once and decodes B in
 /// registers. The kernels are per-arch (mma_qblock.hpp: AVX2+FMA on x86_64,
-/// NEON on aarch64); everywhere else the packed route handles the block
-/// formats.
+/// NEON on aarch64; f32/f16 everywhere, plus bf16 on aarch64); a format or
+/// dtype with no kernel falls through to the packed route.
 ///
 /// The walk: one flat task list over (batch, n tile), a tile being two
 /// 32-value blocks; inside a tile the rows go out one panel at a time, the
@@ -190,6 +190,9 @@ bool matmul_qblock_fused(const MatMulAttributes& attrs,
     switch (inputs[0].data_type()) {
     case DataType::f32: return qblock_fused_try<arch::Q4Block, float>(attrs, output, inputs, ctx, M, N, K);
     case DataType::f16: return qblock_fused_try<arch::Q4Block, half>(attrs, output, inputs, ctx, M, N, K);
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: return qblock_fused_try<arch::Q4Block, bfloat16>(attrs, output, inputs, ctx, M, N, K);
+#endif
     default:            return false;
     }
 }

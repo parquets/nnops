@@ -1384,6 +1384,21 @@ NNOPS_BENCH(matmul_bf16_route_ab) {
 
 NNOPS_BENCH(matmul_f16_vs_bf16) { bench_f16_vs_bf16_ab(512, 512, 256); }
 NNOPS_BENCH(matmul_f16_vs_bf16_large) { bench_f16_vs_bf16_ab(1024, 1024, 1024, 3, 6); }
+
+NNOPS_BENCH(matmul_q4_bf16_nn) {
+    bench_q4_case<bfloat16>({"q4/bf16 nn 1024x512x1024", 1024, 512, 1024});
+}
+
+NNOPS_BENCH(matmul_q4_bf16_tb) {
+    bench_q4_case<bfloat16>({"q4/bf16 tb 1024x512x1024", 1024, 512, 1024,
+                             /*ta=*/false, /*tb=*/true});
+}
+
+NNOPS_BENCH(matmul_q4_bf16_decode) {
+    // The VLA decode shape: one token, the weight stream's bandwidth limit.
+    bench_q4_case<bfloat16>({"q4/bf16 decode 1x4096x4096", 1, 4096, 4096,
+                             /*ta=*/false, /*tb=*/true});
+}
 #endif
 
 // Below GEMM_FAST_PATH_THRESHOLD the per-arch naive SIMD kernel replaces the

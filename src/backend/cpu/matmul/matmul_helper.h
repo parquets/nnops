@@ -579,7 +579,8 @@ void tile_pack_rhs(bool trans, int nc, int kc, bfloat16* dst, int ldd, const bfl
 // ---- Q4_1 (llama.cpp block format) RHS ----------------------------------
 //
 // A Q4_1 B is a 20-byte-block stream; the pack fuses unpack + dequantize into
-// the uniform panels above, so the MMA side is unchanged. Tile origin and
+// the uniform panels above (or, on aarch64, bf16's BFMMLA layout), so the MMA
+// side is unchanged. Tile origin and
 // `src_row_blocks` (row pitch) are in blocks — a panel can start mid-block —
 // and `scale` (alpha) multiplies every decoded weight. data_type_stride_unit()
 // names the block unit, so batch offsets are blocks too.
@@ -589,6 +590,12 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
 void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
                         half* dst, int ldd, const void* src, int64_t src_row_blocks,
                         float scale);
+#ifdef NNOPS_ARCH_AARCH64
+// bf16's panels are the BFMMLA operand layout, not the [k][nr] rectangle.
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        bfloat16* dst, int ldd, const void* src,
+                        int64_t src_row_blocks, float scale);
+#endif
 
 // Two axes. `pack` / `direct` describe A: `pack` takes an already-packed A
 // panel, `direct` reads A row-major in place through `lda`. `ldb` describes B:
@@ -781,8 +788,8 @@ struct MatMulPlan {
 };
 
 /// Resolve the tile sizes, the split direction and the packed-A/B scratch layout.
-/// Covers f32, f16, s8|u8 A × s8 B, and a f32/f16 A with a Q4_1 B; all-zero for
-/// any other dtype.
+/// Covers f32, f16, s8|u8 A × s8 B, and a f32/f16 A with a Q4_1 B — plus a bf16
+/// A with a Q4_1 B on aarch64; all-zero for any other dtype.
 ///
 /// @p use_thread_slots: when the backend reports worker ids, one scratch slot
 /// per worker thread instead of one per block (a thread has one block live).

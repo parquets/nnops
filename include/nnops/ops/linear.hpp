@@ -6,6 +6,7 @@
 ///   f32 : q4_1, f16 : q4_1           → the same, with a block-packed weight
 ///                                      (32 values per 20-byte block, decoded
 ///                                      inside the RHS pack or the fused kernel)
+///   bf16 × bf16, bf16 : q4_1         → aarch64 only, same output rule
 ///   u8 × s8, s8 × s8 (quantized)     → output follows `output_dtype`:
 ///                                      f32/f16 dequantizes, s32/s8/u8 stays
 ///                                      integral
