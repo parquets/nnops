@@ -10,12 +10,14 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(ArgMinMaxAttributes, argmax_cpu)
 NNOPS_DECLARE_CPU(ArgMinMaxAttributes, argmin_cpu)
+NNOPS_DECLARE_CUDA(ArgMinMaxAttributes, argmax_cuda)
+NNOPS_DECLARE_CUDA(ArgMinMaxAttributes, argmin_cuda)
 
 NNOPS_OP_BOILERPLATE(ArgMax, ArgMinMaxAttributes,
-        backend::cpu::argmax_cpu, nullptr, nullptr)
+        backend::cpu::argmax_cpu, NNOPS_IF_CUDA(backend::cuda::argmax_cuda), nullptr)
 
 NNOPS_OP_BOILERPLATE(ArgMin, ArgMinMaxAttributes,
-        backend::cpu::argmin_cpu, nullptr, nullptr)
+        backend::cpu::argmin_cpu, NNOPS_IF_CUDA(backend::cuda::argmin_cuda), nullptr)
 
 std::vector<TensorDesc> ArgMax::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

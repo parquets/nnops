@@ -122,6 +122,7 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_depthwise_conv.cpp
         test_cuda_pooling.cpp
         test_cuda_resize.cpp
+        test_cuda_argminmax.cpp
     )
 endif()
 

@@ -256,6 +256,124 @@ NNOPS_TEST(argmin_random_vs_ref) {
     }
 }
 
+// ============================================================
+// The walk follows the strides, not the shape
+// ============================================================
+
+/// A 5-element row stored in an 8-element pitch, reduced along the channel axis
+/// so the dims after it (H, W) are the ones the pitch breaks. The padding cells
+/// hold a value that would win, so a walk that reads them answers with the wrong
+/// index rather than settling for a tie.
+NNOPS_TEST(argmax_pitched_row) {
+    constexpr int64_t N = 2, C = 4, H = 3, W = 5;
+    constexpr int64_t pitch = 8;
+    constexpr float pad_val = 100.0f;
+
+    std::vector<float> logical(N * C * H * W);
+    for (size_t i = 0; i < logical.size(); ++i) {
+        logical[i] = static_cast<float>((i * 37) % 23) * 0.5f;
+    }
+    auto at = [&](int64_t n, int64_t c, int64_t h, int64_t w) -> float {
+        return logical[((n * C + c) * H + h) * W + w];
+    };
+
+    std::vector<float> storage(N * C * H * pitch, pad_val);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t w = 0; w < W; ++w) {
+                    storage[((n * C + c) * H + h) * pitch + w] = at(n, c, h, w);
+                }
+            }
+        }
+    }
+
+    const int64_t shape[] = {N, C, H, W};
+    TensorView in(shape, DataType::f32, storage.data(), pitch * 4);
+
+    ArgMinMaxAttributes attrs;
+    attrs.type = ArgMinMaxType::Max;
+    attrs.axis = 1;
+    auto op = ArgMax::create(attrs, Backend::CPU);
+    const TensorDesc d_in = in.desc();
+    const TensorDesc desc_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    std::vector<int64_t> out_data(N * H * W, -1);
+    auto output = test::make_channel_first(descs[0], out_data.data());
+    const TensorView ins[] = {in};
+    op->compute(output, ins);
+
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t w = 0; w < W; ++w) {
+                int64_t best_idx = 0;
+                float best_val = at(n, 0, h, w);
+                for (int64_t c = 1; c < C; ++c) {
+                    if (at(n, c, h, w) > best_val) {
+                        best_val = at(n, c, h, w);
+                        best_idx = c;
+                    }
+                }
+                NNOPS_EXPECT_EQ(out_data[(n * H + h) * W + w], best_idx);
+            }
+        }
+    }
+}
+
+/// Channel-last memory: (n, h, w, c) with the channel innermost, reduced over
+/// the channel — the dims after the axis are interleaved, so the flat inner
+/// index has to be decoded, not added.
+NNOPS_TEST(argmax_channel_last) {
+    constexpr int64_t N = 2, C = 4, H = 3, W = 5;
+
+    // Memory order (n, h, w, c).
+    std::vector<float> storage(N * H * W * C);
+    for (size_t i = 0; i < storage.size(); ++i) {
+        storage[i] = static_cast<float>((i * 29) % 17) * 0.25f;
+    }
+    auto at = [&](int64_t n, int64_t c, int64_t h, int64_t w) -> float {
+        return storage[((n * H + h) * W + w) * C + c];
+    };
+
+    const int64_t shape[] = {N, C, H, W};
+    TensorView in(shape, DataType::f32, storage.data(), TensorLayout::NHWC);
+
+    ArgMinMaxAttributes attrs;
+    attrs.type = ArgMinMaxType::Max;
+    attrs.axis = 1;
+    auto op = ArgMax::create(attrs, Backend::CPU);
+    const TensorDesc d_in = in.desc();
+    const TensorDesc desc_arr[] = {d_in};
+    auto descs = op->getOutputTensorDesc(desc_arr);
+
+    // The output inherits the input layout, so it is channel-last too: the
+    // values are read back through its own strides.
+    std::vector<int64_t> out_data(N * H * W, -1);
+    auto output = test::make_channel_first(descs[0], out_data.data());
+    const TensorView ins[] = {in};
+    op->compute(output, ins);
+
+    const int64_t o_n = output.stride_elems(0);
+    const int64_t o_h = output.stride_elems(1);
+    const int64_t o_w = output.stride_elems(2);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t w = 0; w < W; ++w) {
+                int64_t best_idx = 0;
+                float best_val = at(n, 0, h, w);
+                for (int64_t c = 1; c < C; ++c) {
+                    if (at(n, c, h, w) > best_val) {
+                        best_val = at(n, c, h, w);
+                        best_idx = c;
+                    }
+                }
+                NNOPS_EXPECT_EQ(out_data[n * o_n + h * o_h + w * o_w], best_idx);
+            }
+        }
+    }
+}
+
 NNOPS_TEST(argmax_class_1d) {
     const int64_t shape[] = {4};
     float data[] = {1.0f, 8.0f, 3.0f, 6.0f};

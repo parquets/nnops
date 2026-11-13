@@ -3,14 +3,21 @@
 ///
 /// Supports both f32 and f16 via templated implementation.
 /// Uses scalar reduction (argminmax is inherently sequential along the axis).
+///
+/// The walk is described by strides alone — an outer group, the axis, an inner
+/// group — so the layout never enters the loop: a padded row, a channel-last
+/// view and a dense planar tensor all reduce to the same two groups.
 
 #include "nnops/ops/argminmax.hpp"
 #include "nnops/detail/simd/simd.hpp"
+#include "nnops/detail/axis_walk.hpp"
 #include "common/dtype_dispatch.hpp"
 
 namespace nnops::backend::cpu {
 
 using nnops::simd::s_load;
+using detail::AxisWalk;
+using detail::axis_group_offset;
 
 template <typename T>
 void argminmax_impl(const ArgMinMaxAttributes& attrs,
@@ -20,51 +27,35 @@ void argminmax_impl(const ArgMinMaxAttributes& attrs,
     const auto& in = inputs[0];
     const int64_t rank = in.rank();
     const int64_t ax = (attrs.axis < 0) ? attrs.axis + rank : attrs.axis;
-    const int64_t axis_dim = in.shape(ax);
     const bool is_max = (attrs.type == ArgMinMaxType::Max);
+    const AxisWalk w = detail::make_axis_walk(in, output, ax, attrs.keepdims);
 
-    int64_t outer_dims = 1;
-    for (int64_t d = 0; d < ax; ++d) {
-        outer_dims *= in.shape(d);
-    }
-    int64_t inner_size = 1;
-    for (int64_t d = ax + 1; d < rank; ++d) {
-        inner_size *= in.shape(d);
+    if (w.axis_dim == 0 || w.outer == 0 || w.inner == 0) {
+        return;
     }
 
-    const int64_t axis_stride = in.stride_elems(ax);
     const auto* i_ptr = in.ptr<T>();
     auto* o_ptr = output.ptr<int64_t>();
 
-    int64_t o_outer_stride;
-    if (attrs.keepdims) {
-        o_outer_stride = output.stride_elems(ax);
-    } else {
-        o_outer_stride = inner_size;
-    }
+    for (int64_t outer = 0; outer < w.outer; ++outer) {
+        const int64_t i_base = axis_group_offset(outer, w.pre);
+        const int64_t o_base = axis_group_offset(outer, w.out_pre);
+        for (int64_t inner = 0; inner < w.inner; ++inner) {
+            const int64_t base = i_base + axis_group_offset(inner, w.post);
 
-    const int64_t total = outer_dims * inner_size;
+            int64_t best_idx = 0;
+            float   best_val = s_load(i_ptr + base);
 
-    if (total > 0) {
-        for (int64_t outer = 0; outer < outer_dims; ++outer) {
-            for (int64_t inner = 0; inner < inner_size; ++inner) {
-                const int64_t i_base = outer * axis_stride * axis_dim + inner;
-
-                int64_t best_idx = 0;
-                float   best_val = s_load(i_ptr + i_base);
-
-                for (int64_t k = 1; k < axis_dim; ++k) {
-                    float val = s_load(i_ptr + i_base + k * axis_stride);
-                    bool better = is_max ? (val > best_val) : (val < best_val);
-                    if (better) {
-                        best_val = val;
-                        best_idx = k;
-                    }
+            for (int64_t k = 1; k < w.axis_dim; ++k) {
+                float val = s_load(i_ptr + base + k * w.axis_stride);
+                bool better = is_max ? (val > best_val) : (val < best_val);
+                if (better) {
+                    best_val = val;
+                    best_idx = k;
                 }
-
-                int64_t o_pos = outer * o_outer_stride + inner;
-                o_ptr[o_pos] = best_idx;
             }
+
+            o_ptr[o_base + axis_group_offset(inner, w.out_post)] = best_idx;
         }
     }
 }

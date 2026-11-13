@@ -2,8 +2,9 @@
 /// @file argminmax.hpp
 /// @brief ArgMax / ArgMin — index of the max/min along one axis.
 ///
-/// Returns the index as int64, with optional keepdims. Walks any strided
-/// layout via stride_elems; f32 and f16.
+/// Returns the index as int64, with optional keepdims. The walk reads the axis
+/// stride and the strides of the dims around it, so any layout works — planar,
+/// channel-last, or a padded pitch. f32 and f16.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
