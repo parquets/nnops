@@ -9,9 +9,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(SliceAttributes, slice_cpu)
+NNOPS_DECLARE_CUDA(SliceAttributes, slice_cuda)
 
 NNOPS_OP_BOILERPLATE(Slice, SliceAttributes,
-        backend::cpu::slice_cpu, nullptr, nullptr)
+        backend::cpu::slice_cpu, NNOPS_IF_CUDA(backend::cuda::slice_cuda),
+        nullptr)
 
 std::vector<TensorDesc> Slice::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

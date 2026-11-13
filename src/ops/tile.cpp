@@ -12,11 +12,14 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(TileAttributes, tile_cpu)
 NNOPS_DECLARE_CPU(ExpandAttributes, expand_cpu)
+NNOPS_DECLARE_CUDA(TileAttributes, tile_cuda)
+NNOPS_DECLARE_CUDA(ExpandAttributes, expand_cuda)
 
 NNOPS_OP_BOILERPLATE(Tile, TileAttributes,
-        backend::cpu::tile_cpu, nullptr, nullptr)
+        backend::cpu::tile_cpu, NNOPS_IF_CUDA(backend::cuda::tile_cuda), nullptr)
 NNOPS_OP_BOILERPLATE(Expand, ExpandAttributes,
-        backend::cpu::expand_cpu, nullptr, nullptr)
+        backend::cpu::expand_cpu, NNOPS_IF_CUDA(backend::cuda::expand_cuda),
+        nullptr)
 
 namespace {
 

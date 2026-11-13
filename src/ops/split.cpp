@@ -16,6 +16,14 @@ Status split_cpu(const SplitAttributes& attrs,
                  void* workspace);
 }
 
+namespace backend::cuda {
+Status split_cuda(const SplitAttributes& attrs,
+                  std::span<TensorView> outputs,
+                  std::span<const TensorView> inputs,
+                  const ComputeContext& ctx,
+                  void* workspace);
+}
+
 struct Split::Impl {
     using KernelFn = Status (*)(const SplitAttributes&,
                                 std::span<TensorView>,
@@ -31,8 +39,9 @@ NNOPS_OP_CREATE(Split, SplitAttributes)
 Split::Split(const SplitAttributes& attrs, Backend backend)
     : impl_(std::make_unique<Impl>()), attrs_(attrs), backend_(backend)
 {
-    impl_->kernel_fn = (backend == Backend::CPU) ? backend::cpu::split_cpu
-                                                 : nullptr;
+    impl_->kernel_fn = (backend == Backend::CPU)    ? backend::cpu::split_cpu
+                     : (backend == Backend::CUDA) ? NNOPS_IF_CUDA(backend::cuda::split_cuda)
+                                                  : nullptr;
 }
 
 std::vector<TensorDesc> Split::getOutputTensorDesc(

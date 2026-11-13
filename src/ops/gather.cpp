@@ -11,13 +11,19 @@ namespace nnops {
 NNOPS_DECLARE_CPU(GatherAttributes, gather_cpu)
 NNOPS_DECLARE_CPU(GatherElementsAttributes, gather_elements_cpu)
 NNOPS_DECLARE_CPU(GatherNDAttributes, gather_nd_cpu)
+NNOPS_DECLARE_CUDA(GatherAttributes, gather_cuda)
+NNOPS_DECLARE_CUDA(GatherElementsAttributes, gather_elements_cuda)
+NNOPS_DECLARE_CUDA(GatherNDAttributes, gather_nd_cuda)
 
 NNOPS_OP_BOILERPLATE(Gather, GatherAttributes,
-        backend::cpu::gather_cpu, nullptr, nullptr)
+        backend::cpu::gather_cpu, NNOPS_IF_CUDA(backend::cuda::gather_cuda),
+        nullptr)
 NNOPS_OP_BOILERPLATE(GatherElements, GatherElementsAttributes,
-        backend::cpu::gather_elements_cpu, nullptr, nullptr)
+        backend::cpu::gather_elements_cpu,
+        NNOPS_IF_CUDA(backend::cuda::gather_elements_cuda), nullptr)
 NNOPS_OP_BOILERPLATE(GatherND, GatherNDAttributes,
-        backend::cpu::gather_nd_cpu, nullptr, nullptr)
+        backend::cpu::gather_nd_cpu, NNOPS_IF_CUDA(backend::cuda::gather_nd_cuda),
+        nullptr)
 
 namespace {
 

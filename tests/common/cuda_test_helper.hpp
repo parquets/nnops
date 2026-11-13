@@ -359,6 +359,116 @@ inline void expect_same(const HostTensor& got, const HostTensor& want,
     expect_close(flat_g, flat_w, tol_abs, tol_rel, what);
 }
 
+/// Byte-wise comparison of the live elements, skipping the row padding (which
+/// neither backend writes). The movement and index operators never touch a
+/// value, so they are held to identity rather than to a tolerance — which also
+/// covers f16 and the integer dtypes without widening them to float.
+inline void expect_same_bytes(const HostTensor& got, const HostTensor& want,
+                              const char* what)
+{
+    const TensorView& g = got.view;
+    const TensorView& w = want.view;
+    const int64_t esz = data_type_size(g.data_type());
+    const int64_t rows = g.rank() >= 2 ? g.total_rows() : 1;
+    const int64_t cols = rows > 0 ? g.numel() / rows : 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        const std::byte* gp = got.bytes.data() + static_cast<size_t>(r * g.pitch());
+        const std::byte* wp = want.bytes.data() + static_cast<size_t>(r * w.pitch());
+        if (std::memcmp(gp, wp, static_cast<size_t>(cols * esz)) == 0) { continue; }
+        int64_t c = 0;
+        for (; c < cols; ++c) {
+            if (std::memcmp(gp + c * esz, wp + c * esz, static_cast<size_t>(esz)) != 0) {
+                break;
+            }
+        }
+        char msg[320];
+        if (esz == 4) {
+            float gv, wv;
+            std::memcpy(&gv, gp + c * esz, 4);
+            std::memcpy(&wv, wp + c * esz, 4);
+            std::snprintf(msg, sizeof(msg),
+                          "%s: row %lld of %lld, element %lld differs (%g vs %g)",
+                          what, static_cast<long long>(r), static_cast<long long>(rows),
+                          static_cast<long long>(c), double(gv), double(wv));
+        } else {
+            std::snprintf(msg, sizeof(msg),
+                          "%s: row %lld of %lld, element %lld differs (%d vs %d)",
+                          what, static_cast<long long>(r), static_cast<long long>(rows),
+                          static_cast<long long>(c),
+                          int(reinterpret_cast<const unsigned char*>(gp)[c * esz]),
+                          int(reinterpret_cast<const unsigned char*>(wp)[c * esz]));
+        }
+        throw std::runtime_error(msg);
+    }
+}
+
+/// Run `make(backend)` on both backends over the same bytes and compare every
+/// output byte for byte. The factory keeps a case down to one line — the
+/// operator, its attributes and its input list are the whole test — and the CPU
+/// route is the oracle.
+template <class Factory>
+void run_op_both(Factory make, std::span<const HostTensor> ins, const char* what)
+{
+    std::vector<TensorDesc> descs;
+    std::vector<TensorView> views;
+    descs.reserve(ins.size());
+    views.reserve(ins.size());
+    for (const HostTensor& t : ins) {
+        descs.push_back(t.view.desc());
+        views.push_back(t.view);
+    }
+
+    auto op_cpu = make(Backend::CPU);
+    const std::vector<TensorDesc> odescs = op_cpu->getOutputTensorDesc(descs);
+    if (odescs.empty()) { throw std::runtime_error(std::string(what) + ": no output desc"); }
+
+    std::vector<HostTensor> ref;
+    std::vector<HostTensor> got;
+    ref.reserve(odescs.size());
+    got.reserve(odescs.size());
+    for (const TensorDesc& d : odescs) {
+        ref.push_back(make_host_zeroed(d.dims, d.dtype, false, d.layout));
+        got.push_back(make_host_zeroed(d.dims, d.dtype, false, d.layout));
+    }
+
+    std::vector<TensorView> rv, gv;
+    for (HostTensor& t : ref) { rv.push_back(t.view); }
+    for (HostTensor& t : got) { gv.push_back(t.view); }
+
+    if (op_cpu->compute(rv, views, cpu_context(), nullptr) != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cpu compute failed");
+    }
+
+    std::vector<DeviceTensor> dins;
+    dins.reserve(ins.size());
+    for (const HostTensor& t : ins) { dins.push_back(to_device(t)); }
+    std::vector<TensorView> dviews;
+    dviews.reserve(dins.size());
+    for (DeviceTensor& d : dins) { dviews.push_back(d.view); }
+
+    std::vector<DeviceTensor> douts;
+    douts.reserve(odescs.size());
+    for (size_t i = 0; i < odescs.size(); ++i) {
+        douts.push_back(alloc_like(gv[i], got[i]));
+    }
+    std::vector<TensorView> dv;
+    dv.reserve(douts.size());
+    for (DeviceTensor& d : douts) { dv.push_back(d.view); }
+
+    auto op_dev = make(Backend::CUDA);
+    const Status st = op_dev->compute(dv, dviews, cuda_context(), nullptr);
+    if (st != Status::ok) {
+        throw std::runtime_error(std::string(what) + ": cuda compute returned " +
+                                 to_string(st));
+    }
+    CudaBuffer::sync();
+
+    for (size_t i = 0; i < douts.size(); ++i) {
+        from_device(douts[i], got[i]);
+        expect_same_bytes(got[i], ref[i], what);
+    }
+}
+
 }  // namespace nnops::test
 
 #endif  // NNOPS_HAS_CUDA

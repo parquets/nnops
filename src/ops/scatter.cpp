@@ -10,11 +10,15 @@ namespace nnops {
 
 NNOPS_DECLARE_CPU(ScatterElementsAttributes, scatter_elements_cpu)
 NNOPS_DECLARE_CPU(ScatterNDAttributes, scatter_nd_cpu)
+NNOPS_DECLARE_CUDA(ScatterElementsAttributes, scatter_elements_cuda)
+NNOPS_DECLARE_CUDA(ScatterNDAttributes, scatter_nd_cuda)
 
 NNOPS_OP_BOILERPLATE(ScatterElements, ScatterElementsAttributes,
-        backend::cpu::scatter_elements_cpu, nullptr, nullptr)
+        backend::cpu::scatter_elements_cpu,
+        NNOPS_IF_CUDA(backend::cuda::scatter_elements_cuda), nullptr)
 NNOPS_OP_BOILERPLATE(ScatterND, ScatterNDAttributes,
-        backend::cpu::scatter_nd_cpu, nullptr, nullptr)
+        backend::cpu::scatter_nd_cpu, NNOPS_IF_CUDA(backend::cuda::scatter_nd_cuda),
+        nullptr)
 
 namespace {
 

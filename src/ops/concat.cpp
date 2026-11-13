@@ -9,9 +9,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(ConcatAttributes, concat_cpu)
+NNOPS_DECLARE_CUDA(ConcatAttributes, concat_cuda)
 
 NNOPS_OP_BOILERPLATE(Concat, ConcatAttributes,
-        backend::cpu::concat_cpu, nullptr, nullptr)
+        backend::cpu::concat_cpu, NNOPS_IF_CUDA(backend::cuda::concat_cuda),
+        nullptr)
 
 std::vector<TensorDesc> Concat::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

@@ -9,8 +9,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(PadAttributes, pad_cpu)
+NNOPS_DECLARE_CUDA(PadAttributes, pad_cuda)
 
-NNOPS_OP_BOILERPLATE(Pad, PadAttributes, backend::cpu::pad_cpu, nullptr, nullptr)
+NNOPS_OP_BOILERPLATE(Pad, PadAttributes, backend::cpu::pad_cpu,
+        NNOPS_IF_CUDA(backend::cuda::pad_cuda), nullptr)
 
 std::vector<TensorDesc> Pad::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

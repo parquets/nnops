@@ -9,9 +9,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(PermuteAttributes, permute_cpu)
+NNOPS_DECLARE_CUDA(PermuteAttributes, permute_cuda)
 
 NNOPS_OP_BOILERPLATE(Permute, PermuteAttributes,
-        backend::cpu::permute_cpu, nullptr, nullptr)
+        backend::cpu::permute_cpu, NNOPS_IF_CUDA(backend::cuda::permute_cuda),
+        nullptr)
 
 std::vector<TensorDesc> Permute::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

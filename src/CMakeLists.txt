@@ -187,6 +187,18 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/resize.cu
         backend/cuda/norm.cu
         backend/cuda/topk.cu
+        # The pure-movement family: an index walk with no arithmetic in it, one
+        # file per operator over the layout copy engine in move_common.cuh.
+        backend/cuda/permute.cu
+        backend/cuda/slice.cu
+        backend/cuda/tile.cu
+        backend/cuda/concat.cu
+        backend/cuda/split.cu
+        backend/cuda/pad.cu
+        # Index-driven movement, where a layout cannot describe the mapping:
+        # one index lookup per row or per element.
+        backend/cuda/gather.cu
+        backend/cuda/scatter.cu
         # Convolutions and the pooling that goes with them, one file an
         # operator family: Conv2D (both memory orders via the CuTe GEMM),
         # depthwise, and spatial pooling.
