@@ -9,9 +9,10 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(NormAttributes, norm_cpu)
+NNOPS_DECLARE_CUDA(NormAttributes, norm_cuda)
 
 NNOPS_OP_BOILERPLATE(Norm, NormAttributes,
-        backend::cpu::norm_cpu, nullptr, nullptr)
+        backend::cpu::norm_cpu, NNOPS_IF_CUDA(backend::cuda::norm_cuda), nullptr)
 
 namespace {
 

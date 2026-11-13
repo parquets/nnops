@@ -15,7 +15,6 @@
 #include "nnops/core/status.hpp"
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/ops/quant_linear.hpp"
-#include "nnops/ops/topk.hpp"
 
 namespace nnops::backend::cuda {
 
@@ -38,12 +37,6 @@ Status quantize_linear_cuda(const QuantLinearAttributes&, TensorView&,
 Status dequantize_linear_cuda(const QuantLinearAttributes&, TensorView&,
                               std::span<const TensorView>, const ComputeContext&,
                               void*)
-{
-    return Status::unsupported;
-}
-
-Status topk_cuda(const TopKAttributes&, TensorView&, TensorView&,
-                 std::span<const TensorView>, const ComputeContext&, void*)
 {
     return Status::unsupported;
 }

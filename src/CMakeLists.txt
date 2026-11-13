@@ -176,10 +176,6 @@ if(NNOPS_BUILD_CUDA)
         set(CMAKE_CUDA_ARCHITECTURES 80)
     endif()
 
-    # layer_norm.cu, rms_norm.cu and batch_norm.cu are left out: they were
-    # written against the per-op headers (LayerNormAttributes, ...) that the
-    # Norm merge replaced, so they do not compile, and no dispatch site
-    # references their entry points. Nothing here is lost by excluding them.
     set(NNOPS_CUDA_SOURCES
         backend/cuda/softmax.cu
         backend/cuda/activation.cu
@@ -189,6 +185,8 @@ if(NNOPS_BUILD_CUDA)
         backend/cuda/reduce.cu
         backend/cuda/argminmax.cu
         backend/cuda/resize.cu
+        backend/cuda/norm.cu
+        backend/cuda/topk.cu
         # Convolutions and the pooling that goes with them, one file an
         # operator family: Conv2D (both memory orders via the CuTe GEMM),
         # depthwise, and spatial pooling.

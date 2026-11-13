@@ -126,11 +126,13 @@ inline void norm_apply_row_add(const T* x, const T* r, T* y, int64_t n,
         }
         rv = v_mul(rv, v_inv_std);
         if constexpr (HasScale) {
-            auto vs = v_load(scale + (scale_is_scalar ? 0 : i));
+            // A scalar scale is one element of storage: broadcast it instead
+            // of loading a full lane from past the end of the buffer.
+            auto vs = scale_is_scalar ? v_set1(x, s_load(scale)) : v_load(scale + i);
             rv = v_mul(rv, vs);
         }
         if constexpr (HasBias) {
-            auto vb = v_load(bias + (scale_is_scalar ? 0 : i));
+            auto vb = scale_is_scalar ? v_set1(x, s_load(bias)) : v_load(bias + i);
             rv = v_add(rv, vb);
         }
         v_store_add(y + i, rv, add_to);
@@ -175,11 +177,13 @@ inline void norm_apply_row(const T* x, T* y, int64_t n,
         }
         rv = v_mul(rv, v_inv_std);
         if constexpr (HasScale) {
-            auto vs = v_load(scale + (scale_is_scalar ? 0 : i));
+            // A scalar scale is one element of storage: broadcast it instead
+            // of loading a full lane from past the end of the buffer.
+            auto vs = scale_is_scalar ? v_set1(x, s_load(scale)) : v_load(scale + i);
             rv = v_mul(rv, vs);
         }
         if constexpr (HasBias) {
-            auto vb = v_load(bias + (scale_is_scalar ? 0 : i));
+            auto vb = scale_is_scalar ? v_set1(x, s_load(bias)) : v_load(bias + i);
             rv = v_add(rv, vb);
         }
         v_store_add(y + i, rv, add_to);

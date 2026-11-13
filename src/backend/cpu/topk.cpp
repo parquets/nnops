@@ -4,10 +4,14 @@
 /// Supports both f32 and f16 via templated implementation.
 /// Uses scalar selection (top-k is inherently sequential along the axis).
 ///
-/// Supports the channel-first layouts, 2D and 3D. Not for packed layouts.
+/// Supports the channel-first layouts, 2D and 3D. Not for packed layouts. The
+/// input is read through its own strides, so a padded pitch is the same walk
+/// with a different offset group (see axis_walk.hpp); the outputs are dense,
+/// which is what their descriptors specify.
 
 #include "nnops/ops/topk.hpp"
 #include "nnops/detail/assert.hpp"
+#include "nnops/detail/axis_walk.hpp"
 #include "nnops/core/parallel_for.hpp"
 #include "nnops/detail/simd/simd.hpp"
 #include "common/dtype_dispatch.hpp"
@@ -58,6 +62,17 @@ void topk_impl(const TopKAttributes& attrs,
     const int64_t v_outer_stride = k * inner_size;
     const int64_t v_inner_stride = k;
 
+    // The dims on either side of the axis, so a pitched input addresses its
+    // rows and its inner tail instead of flattening them.
+    detail::AxisGroup pre;
+    detail::AxisGroup post;
+    if (ax > 0) {
+        detail::axis_fill_group(pre, in, 0, ax, in.stride_elems(ax - 1));
+    } else {
+        detail::axis_fill_group(pre, in, 0, 0, 0);
+    }
+    detail::axis_fill_group_unit(post, in, ax + 1, rank);
+
     struct Pair {
         float value;
         int64_t index;
@@ -74,7 +89,8 @@ void topk_impl(const TopKAttributes& attrs,
         PoolArray<Pair> heap(static_cast<size_t>(k));
 
         for (int64_t inner = 0; inner < inner_size; ++inner) {
-            int64_t i_base = outer * axis_stride * axis_dim + inner;
+            const int64_t i_base = detail::axis_group_offset(outer, pre) +
+                                   detail::axis_group_offset(inner, post);
 
             for (int64_t j = 0; j < k; ++j) {
                 heap[static_cast<size_t>(j)] = {

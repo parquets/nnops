@@ -123,6 +123,8 @@ if(NNOPS_BUILD_CUDA)
         test_cuda_pooling.cpp
         test_cuda_resize.cpp
         test_cuda_argminmax.cpp
+        test_cuda_norm.cpp
+        test_cuda_topk.cpp
     )
 endif()
 
