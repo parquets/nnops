@@ -27,10 +27,13 @@
 #include <type_traits>
 
 #include "backend/cpu/common/common_utils.hpp"
+#include "nnops/detail/bf16.hpp"
 #include "nnops/detail/half.hpp"
 
 namespace nnops::backend::cpu::aarch64 {
 
+using nnops::backend::cpu::bfloat16;
+using nnops::backend::cpu::bfloat16_to_float;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
@@ -215,6 +218,73 @@ inline void quantization(int M, int N,
         }
         for (; n < N; ++n) {
             const float q = half_to_float(src_ptr[n]) * inv_scale + zero_val;
+            int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
+            qi = std::min(std::max(qi, qmin), qmax);
+            dst_ptr[n] = static_cast<T>(qi);
+        }
+    }
+}
+
+// =========================================================================
+//  Top-level per-token quantize with bfloat16 input
+// =========================================================================
+
+/// bf16 input variant of `quantization<T>`: bf16 is the top half of an f32, so
+/// widening a lane pair is one 16-bit shift, and the arithmetic, rounding and
+/// clamping are the f32 kernel's.
+template <typename T>
+inline void quantization(int M, int N,
+                         T* NNOPS_RESTRICT dst, int dr_step,
+                         const bfloat16* NNOPS_RESTRICT src, int sr_step,
+                         const float* NNOPS_RESTRICT scale,
+                         const float* NNOPS_RESTRICT zero) noexcept {
+    static_assert(std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>,
+                  "quantization: T must be int8_t or uint8_t");
+    constexpr bool Q_U8 = std::is_same_v<T, uint8_t>;
+    constexpr int32_t qmin = Q_U8 ? 0 : -128;
+    constexpr int32_t qmax = Q_U8 ? 255 : 127;
+
+    for (int m = 0; m < M; ++m) {
+        const float inv_scale = 1.0f / scale[m];
+        const float zero_val = (zero == nullptr) ? 0.0f : zero[m];
+
+        const float32x4_t v_inv_scale = vdupq_n_f32(inv_scale);
+        const float32x4_t v_zero = vdupq_n_f32(zero_val);
+
+        T* dst_ptr = dst + m * dr_step;
+        const bfloat16* src_ptr = src + m * sr_step;
+
+        int n = 0;
+        for (; n + 32 <= N; n += 32) {
+            const uint16x8_t h0 = vld1q_u16(reinterpret_cast<const uint16_t*>(src_ptr + n + 0));
+            const uint16x8_t h1 = vld1q_u16(reinterpret_cast<const uint16_t*>(src_ptr + n + 8));
+            const uint16x8_t h2 = vld1q_u16(reinterpret_cast<const uint16_t*>(src_ptr + n + 16));
+            const uint16x8_t h3 = vld1q_u16(reinterpret_cast<const uint16_t*>(src_ptr + n + 24));
+            const float32x4_t d0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16));
+            const float32x4_t d1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16));
+            const float32x4_t d2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
+            const float32x4_t d3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
+            const float32x4_t d4 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h2), 16));
+            const float32x4_t d5 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h2), 16));
+            const float32x4_t d6 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h3), 16));
+            const float32x4_t d7 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h3), 16));
+            const int8x16_t q0 = quant_block16_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale, v_zero);
+            const int8x16_t q1 = quant_block16_f32_i8<Q_U8>(d4, d5, d6, d7, v_inv_scale, v_zero);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 0), q0);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n + 16), q1);
+        }
+        for (; n + 16 <= N; n += 16) {
+            const uint16x8_t h0 = vld1q_u16(reinterpret_cast<const uint16_t*>(src_ptr + n + 0));
+            const uint16x8_t h1 = vld1q_u16(reinterpret_cast<const uint16_t*>(src_ptr + n + 8));
+            const float32x4_t d0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16));
+            const float32x4_t d1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16));
+            const float32x4_t d2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
+            const float32x4_t d3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
+            const int8x16_t q = quant_block16_f32_i8<Q_U8>(d0, d1, d2, d3, v_inv_scale, v_zero);
+            vst1q_s8(reinterpret_cast<int8_t*>(dst_ptr + n), q);
+        }
+        for (; n < N; ++n) {
+            const float q = bfloat16_to_float(src_ptr[n]) * inv_scale + zero_val;
             int32_t qi = static_cast<int32_t>(std::nearbyintf(q));
             qi = std::min(std::max(qi, qmin), qmax);
             dst_ptr[n] = static_cast<T>(qi);

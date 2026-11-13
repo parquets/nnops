@@ -44,14 +44,18 @@ using namespace nnops::simd;
 // =========================================================================
 
 template <typename T> constexpr DataType dtype_of() noexcept {
-    return std::is_same_v<T, float> ? DataType::f32 : DataType::f16;
+    if constexpr (std::is_same_v<T, float>) { return DataType::f32; }
+    else if constexpr (std::is_same_v<T, bfloat16>) { return DataType::bf16; }
+    else { return DataType::f16; }
 }
 
 inline v_f32x8 vload8(const float* p) { return v_load(p); }
 inline v_f32x8 vload8(const half* p)  { return v_cvt_f16_to_f32(p); }
+inline v_f32x8 vload8(const bfloat16* p) { return v_load(p); }
 
 inline void vstore8(float* p, const v_f32x8& v) { v_store(p, v); }
 inline void vstore8(half* p, const v_f32x8& v)  { v_store(p, v_cvt_f32_to_f16(v)); }
+inline void vstore8(bfloat16* p, const v_f32x8& v) { v_store(p, v); }
 
 // =========================================================================
 //  Phases — which gates one pass covers
@@ -148,6 +152,7 @@ struct RecurrentPackedHeader {
     uint32_t magic;
     uint32_t version;
     int64_t elem_size;   ///< 1 for quantized panels, else the fp element size
+    int64_t dtype;       ///< the fp element's DataType: f16 and bf16 share a size
     int64_t q8;          ///< W and R are s8: int8 panels and f32 scales
     int64_t input;
     int64_t hidden;
@@ -161,7 +166,7 @@ struct RecurrentPackedHeader {
 };
 
 inline constexpr uint32_t kRecurrentPackedMagic = 0x5043524e;  // 'NRCP'
-inline constexpr uint32_t kRecurrentPackedVersion = 2;
+inline constexpr uint32_t kRecurrentPackedVersion = 3;
 /// Both the header and every region start on this, which is also the packing
 /// alignment the panels need.
 inline constexpr int64_t kPackedAlign = 64;
@@ -383,7 +388,7 @@ struct StepCtx {
 Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& plan);
 
 /// The fused epilogue over one tile: gate math, state update, Y store.
-/// Instantiated for f32/half × the five phases in recurrent_step.cpp.
+/// Instantiated for f32/half/bf16 × the five phases in recurrent_step.cpp.
 template <typename T, PhaseKind Kind>
 void epilogue_tile(const StepCtx<T>& s, int64_t m0, int64_t mcnt,
                    int64_t n0, int64_t ncnt);
@@ -391,20 +396,22 @@ void epilogue_tile(const StepCtx<T>& s, int64_t m0, int64_t mcnt,
 /// The recurrent product for one timestep, then the epilogue, over the tile grid.
 void run_phase(const StepCtx<float>& s, PhaseKind kind, const ComputeContext& ctx);
 void run_phase(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& ctx);
+void run_phase(const StepCtx<bfloat16>& s, PhaseKind kind, const ComputeContext& ctx);
 
 /// The int8 twin of run_phase.
 void run_phase_q8(const StepCtx<float>& s, PhaseKind kind, const ComputeContext& ctx);
 void run_phase_q8(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& ctx);
+void run_phase_q8(const StepCtx<bfloat16>& s, PhaseKind kind, const ComputeContext& ctx);
 
-/// The input projection over one chunk on the fp MMA. Instantiated for f32 and
-/// half in recurrent_step.cpp.
+/// The input projection over one chunk on the fp MMA. Instantiated for f32,
+/// half and bf16 in recurrent_step.cpp.
 template <typename T>
 void project_chunk(const T* x, int64_t x_ld, T* c, int64_t ldc, const T* packed_w,
                    int64_t w_ldd, int64_t w_nr, int64_t rows, int64_t cols,
                    int64_t input, int64_t kc, int64_t nc, const ComputeContext& ctx);
 
-/// The input projection over one chunk on the int8 MMA. Instantiated for f32
-/// and half in recurrent_q8.cpp.
+/// The input projection over one chunk on the int8 MMA. Instantiated for f32,
+/// half and bf16 in recurrent_q8.cpp.
 template <typename T>
 void project_chunk_q8(const TensorView& x, int64_t x_row0, T* c, int64_t ldc,
                       const int8_t* packed_w, const float* sw, int64_t cols,

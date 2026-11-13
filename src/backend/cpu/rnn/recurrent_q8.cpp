@@ -129,9 +129,10 @@ void prepare_q8_direction(const RecurrentParams& p, const RecurrentPackedHeader&
     for (int64_t gi = 0; gi < 2 * G * H; ++gi) {
         float v = 0.0f;
         if (bias != nullptr) {
-            v = (bdt == DataType::f16)
-                    ? s_load(bias->ptr<half>(static_cast<size_t>(d)) + gi)
-                    : bias->ptr<float>(static_cast<size_t>(d))[gi];
+            const size_t at = static_cast<size_t>(d);
+            v = (bdt == DataType::f16)  ? s_load(bias->ptr<half>(at) + gi)
+              : (bdt == DataType::bf16) ? s_load(bias->ptr<bfloat16>(at) + gi)
+                                        : bias->ptr<float>(at)[gi];
         }
         bias_f32[gi] = v;
     }
@@ -282,6 +283,19 @@ void run_phase_q8(const StepCtx<half>& s, PhaseKind kind, const ComputeContext& 
     }
 }
 
+#ifdef NNOPS_ARCH_AARCH64
+void run_phase_q8(const StepCtx<bfloat16>& s, PhaseKind kind,
+                  const ComputeContext& ctx) {
+    switch (kind) {
+    case PhaseKind::Rnn:    run_phase_q8_kernel<bfloat16, PhaseKind::Rnn>(s, ctx); break;
+    case PhaseKind::Lstm:   run_phase_q8_kernel<bfloat16, PhaseKind::Lstm>(s, ctx); break;
+    case PhaseKind::GruAll: run_phase_q8_kernel<bfloat16, PhaseKind::GruAll>(s, ctx); break;
+    case PhaseKind::GruZr:  run_phase_q8_kernel<bfloat16, PhaseKind::GruZr>(s, ctx); break;
+    case PhaseKind::GruH:   run_phase_q8_kernel<bfloat16, PhaseKind::GruH>(s, ctx); break;
+    }
+}
+#endif
+
 /// The input projection on the int8 MMA. A is the chunk's X rows — floating and
 /// dynamically quantized per row, or s8 with the tensor's own per-row table — and
 /// B is W's per-k-block slabs; the dequant writes the fp chunk buffer.
@@ -382,5 +396,12 @@ template void project_chunk_q8<half>(const TensorView&, int64_t, half*, int64_t,
                                      const int8_t*, const float*, int64_t, int64_t,
                                      int64_t, int64_t, int64_t, const RowScales&,
                                      const Q8Scratch&, const ComputeContext&);
+#ifdef NNOPS_ARCH_AARCH64
+template void project_chunk_q8<bfloat16>(const TensorView&, int64_t, bfloat16*,
+                                         int64_t, const int8_t*, const float*,
+                                         int64_t, int64_t, int64_t, int64_t,
+                                         int64_t, const RowScales&,
+                                         const Q8Scratch&, const ComputeContext&);
+#endif
 
 }  // namespace nnops::backend::cpu

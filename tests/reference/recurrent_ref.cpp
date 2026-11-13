@@ -244,8 +244,14 @@ void recurrent_ref_impl(const RefCfg& cfg, std::span<TensorView> outputs,
 void run(const RefCfg& cfg, std::span<TensorView> outputs,
          std::span<const TensorView> inputs)
 {
-    if (inputs[0].data_type() == DataType::f32) {
+    // X's element type is the whole call's: every operand and output is that
+    // dtype. bf16 has to be told apart from half — the two share a size, and
+    // reading one as the other is a completely different number.
+    const DataType dt = inputs[0].data_type();
+    if (dt == DataType::f32) {
         recurrent_ref_impl<float>(cfg, outputs, inputs);
+    } else if (dt == DataType::bf16) {
+        recurrent_ref_impl<bfloat16>(cfg, outputs, inputs);
     } else {
         recurrent_ref_impl<half>(cfg, outputs, inputs);
     }

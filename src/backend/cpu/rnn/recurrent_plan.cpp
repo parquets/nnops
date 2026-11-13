@@ -85,10 +85,12 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     const int64_t esz = static_cast<int64_t>(data_type_size(p.dtype));
     const int64_t H = p.hidden;
     plan.q8 = p.weight_dtype == DataType::s8;
-    const int64_t nr = plan.q8 ? NR_MAX_I8
-                               : ((esz == 4) ? NR_MAX_F32 : NR_MAX_F16);
-    const int64_t kc_cap = plan.q8 ? kQ8Kc
-                                   : ((esz == 4) ? KC_CAP_F32 : KC_CAP_F16);
+    const int64_t nr = plan.q8 ? NR_MAX_I8 : nr_max_dt(p.dtype);
+    const int64_t kc_cap =
+        plan.q8 ? kQ8Kc
+                : (p.dtype == DataType::f16  ? KC_CAP_F16
+                 : p.dtype == DataType::bf16 ? KC_CAP_BF16
+                                             : KC_CAP_F32);
 
     const bool lbr = p.mode == RecurrentMode::Gru && p.linear_before_reset;
     plan.nphases = num_phases(p.mode, lbr);
@@ -117,6 +119,13 @@ Status build_plan(const RecurrentParams& p, const ComputeContext& ctx, RecPlan& 
     }
 
     plan.kc = std::max<int64_t>(1, std::min<int64_t>(H, kc_cap));
+    // bf16's B panels are k-group major (four k rows per 64-element group) and
+    // a k block is addressed at its first group, so every block but the last has
+    // to start on one. The caps are multiples of four already; this rounds a
+    // short H, whose single block then starts at zero anyway.
+    if (p.dtype == DataType::bf16) {
+        plan.kc = (plan.kc + 3) & ~int64_t{3};
+    }
 
     // Chunk the input projection so its buffer stays inside a shared L3.
     const int64_t budget = int64_t{8} << 20;

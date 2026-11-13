@@ -930,6 +930,15 @@ void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
                             scale_scalar, zero_scalar, u8, a_biased);
 }
 
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                            const bfloat16* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool u8, bool a_biased) {
+    pack_quant_lhs_i8<bfloat16>(mc, kc, dst, ldd, src, lds, scale, zero,
+                                scale_scalar, zero_scalar, u8, a_biased);
+}
+
 /// B into uniform panels. On x86 each panel's column sums are appended after
 /// its data (zeroed when @p a_biased is false); the MMA seeds from them.
 void tile_pack_rhs_i8(bool trans, int nc, int kc, int8_t* dst, int ldd,

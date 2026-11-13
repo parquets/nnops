@@ -633,6 +633,11 @@ void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
                             const float* scale, const int32_t* zero,
                             float scale_scalar, int32_t zero_scalar,
                             bool u8, bool a_biased);
+void tile_pack_quant_lhs_i8(int mc, int kc, int8_t* dst, int ldd,
+                            const bfloat16* src, int lds,
+                            const float* scale, const int32_t* zero,
+                            float scale_scalar, int32_t zero_scalar,
+                            bool u8, bool a_biased);
 
 // `src_shift` treats the source bytes as unsigned and XORs 0x80 into the signed
 // range as they are packed — the u8 activation of the quantized Conv2D route. On
