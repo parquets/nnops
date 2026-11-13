@@ -21,9 +21,11 @@
 namespace nnops {
 
 NNOPS_DECLARE_CPU(DepthwiseTransposeConv2DAttributes, depthwise_transpose_conv_cpu)
+NNOPS_DECLARE_CUDA(DepthwiseTransposeConv2DAttributes, depthwise_transpose_conv_cuda)
 
 NNOPS_OP_BOILERPLATE(DepthwiseTransposeConv2D, DepthwiseTransposeConv2DAttributes,
-        backend::cpu::depthwise_transpose_conv_cpu, nullptr, nullptr)
+        backend::cpu::depthwise_transpose_conv_cpu,
+        NNOPS_IF_CUDA(backend::cuda::depthwise_transpose_conv_cuda), nullptr)
 
 std::vector<TensorDesc> DepthwiseTransposeConv2D::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

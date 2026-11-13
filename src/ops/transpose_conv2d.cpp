@@ -88,7 +88,9 @@ Status TransposeConv2D::compute(std::span<TensorView> outputs,
     // A depthwise geometry reads the filter this operator was handed, so it
     // costs nothing to hand the call over. The col GEMM degenerates there — one
     // channel per group is a single-column product, re-dispatched per group —
-    // while the depthwise kernels accumulate the pixels directly.
+    // while the depthwise kernels accumulate the pixels directly. CUDA needs no
+    // hand-over: its TransposeConv2D entry declines the GEMM on this geometry
+    // and reaches the same kernel file from its own dispatch.
     if (backend_ == Backend::CPU && inputs.size() >= 2 &&
         is_fp(inputs[0].data_type()) &&
         inputs[1].data_type() == inputs[0].data_type() &&

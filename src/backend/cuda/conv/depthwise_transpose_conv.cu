@@ -29,9 +29,18 @@
 /// [KH][KW][C] repack plus its launch does not pay for itself on kernels this
 /// short.
 ///
-/// f32 and f16.
+/// A channel-last geometry the 16 B lane cannot take — a channel count the
+/// vector does not divide, or a row it cannot align to — falls to a third
+/// script, one output element per thread with the channel innermost (which is
+/// the coalesced order on that layout) and the tap search written out the way
+/// the CPU's is. It is a fallback, not a route: nothing picks it on a shape the
+/// lane can already do.
+///
+/// f32 and f16. The operator entry at the bottom of the file is what wires all
+/// of this to DepthwiseTransposeConv2D.
 
 #include "transpose_conv_common.cuh"
+#include "nnops/ops/depthwise_transpose_conv.hpp"
 
 namespace nnops::backend::cuda::tconv {
 namespace {
@@ -284,6 +293,64 @@ bool run_last(const ConvParams& p, int th_max, int tw_max, cudaStream_t stream)
     return true;
 }
 
+// ============================================================
+// Channel-last fallback
+// ============================================================
+
+/// One output element per thread with the channel innermost, for a channel-last
+/// geometry the 16 B lane declines. The tap search is the CPU's: a tap counts
+/// when (o + P − k·D) divides by S and the pixel it names exists.
+template <class Elem>
+__global__ void dw_last_scalar_kernel(ConvParams p)
+{
+    const int64_t total = int64_t(p.batch) * p.oc * p.oh * p.ow;
+    const int64_t step = int64_t(blockDim.x) * gridDim.x;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += step) {
+        int64_t r = i;
+        const int c = int(r % p.oc); r /= p.oc;
+        const int ow = int(r % p.ow); r /= p.ow;
+        const int oh = int(r % p.oh); r /= p.oh;
+        const int n = int(r);
+
+        // The channel step is one element on this layout, as in the lane kernel.
+        const Elem* in = static_cast<const Elem*>(p.input) +
+                         int64_t(n) * p.in_batch + c;
+        const Elem* w = static_cast<const Elem*>(p.weight) + int64_t(c) * p.w_ic;
+
+        float acc = 0.0f;
+        for (int kh = 0; kh < p.kh; ++kh) {
+            const int nh = oh + p.ph - kh * p.dh;
+            if (nh < 0 || nh % p.sh != 0) { continue; }
+            const int ih = nh / p.sh;
+            if (ih >= p.ih) { continue; }
+            const Elem* row = in + int64_t(ih) * p.in_h;
+            const Elem* tap = w + int64_t(kh) * p.w_kh;
+            for (int kw = 0; kw < p.kw; ++kw) {
+                const int nw = ow + p.pw - kw * p.dw;
+                if (nw < 0 || nw % p.sw != 0) { continue; }
+                const int iw = nw / p.sw;
+                if (iw >= p.iw) { continue; }
+                acc = fmaf(float(row[int64_t(iw) * p.in_w]),
+                           float(tap[int64_t(kw) * p.w_kw]), acc);
+            }
+        }
+
+        Elem* dst = static_cast<Elem*>(p.output) + int64_t(n) * p.out_batch + c +
+                    int64_t(oh) * p.out_h + int64_t(ow) * p.out_w;
+        tconv_store<Elem>(p, dst, acc, c, static_cast<const Elem*>(p.bias));
+    }
+}
+
+template <class Elem>
+void launch_last_scalar(const ConvParams& p, cudaStream_t stream)
+{
+    const int64_t total = int64_t(p.batch) * p.oc * p.oh * p.ow;
+    const int64_t blocks = (total + kCudaBlockSize - 1) / kCudaBlockSize;
+    const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
+    dw_last_scalar_kernel<Elem><<<grid, kCudaBlockSize, 0, stream>>>(p);
+}
+
 }  // namespace
 
 bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max,
@@ -301,3 +368,110 @@ bool transpose_conv2d_depthwise_cuda(const ConvParams& p, int th_max, int tw_max
 }
 
 }  // namespace nnops::backend::cuda::tconv
+
+namespace nnops::backend::cuda {
+
+Status depthwise_transpose_conv_cuda(const DepthwiseTransposeConv2DAttributes& attrs,
+                                     TensorView& output,
+                                     std::span<const TensorView> inputs,
+                                     const ComputeContext& ctx,
+                                     void* /*workspace*/)
+{
+    const TensorView& act = inputs[0];
+    const TensorView& wgt = inputs[1];
+    const TensorView* bias = inputs.size() > 2 ? &inputs[2] : nullptr;
+
+    const DataType dt = act.data_type();
+    if ((dt != DataType::f32 && dt != DataType::f16) || wgt.data_type() != dt ||
+        output.data_type() != dt) {
+        return Status::unsupported;   // the quantized route is CPU-only
+    }
+    if (output.numel() == 0) { return Status::ok; }
+
+    const bool last = is_channel_last(act.layout());
+    if (last != is_channel_last(output.layout())) { return Status::unsupported; }
+    if (!last && !is_channel_first_spatial(act.layout())) {
+        return Status::unsupported;
+    }
+    const int64_t ch = act.shape(1);
+    if (ch <= 0 || output.shape(1) != ch) { return Status::unsupported; }
+
+    tconv::ConvParams p;
+    p.batch = int(act.shape(0));
+    p.ic = int(ch);
+    p.ih = int(act.shape(2));
+    p.iw = int(act.shape(3));
+    p.oc = p.ic;
+    p.oh = int(output.shape(2));
+    p.ow = int(output.shape(3));
+    p.groups = p.ic;
+    p.icg = 1;
+    p.ocg = 1;
+
+    p.kh = int(attrs.kernel_size[0]);
+    p.kw = int(attrs.kernel_size[1]);
+    p.sh = int(attrs.stride[0]);
+    p.sw = int(attrs.stride[1]);
+    p.dh = int(attrs.dilation[0]);
+    p.dw = int(attrs.dilation[1]);
+    p.ph = int(attrs.padding[0]);
+    p.pw = int(attrs.padding[1]);
+
+    p.in_batch = act.stride_elems(0);
+    p.in_c = act.stride_elems(1);
+    p.in_h = act.stride_elems(2);
+    p.in_w = act.stride_elems(3);
+    p.out_batch = output.stride_elems(0);
+    p.out_c = output.stride_elems(1);
+    p.out_h = output.stride_elems(2);
+    p.out_w = output.stride_elems(3);
+
+    p.input = act.ptr<void>();
+    p.weight = wgt.ptr<void>();
+    p.output = output.ptr<void>();
+    p.bias = bias != nullptr ? bias->ptr<void>() : nullptr;
+
+    // The kernels address the filter by these three strides alone, so both
+    // accepted forms are read in place — [C][1][KH][KW] on either activation
+    // order, and the per-tap [KH][KW][C] a channel-last activation may carry.
+    if (wgt.rank() == 3) {
+        p.w_kh = wgt.stride_elems(0);
+        p.w_kw = wgt.stride_elems(1);
+        p.w_ic = wgt.stride_elems(2);
+    } else {
+        p.w_ic = wgt.stride_elems(0);
+        p.w_kh = wgt.stride_elems(2);
+        p.w_kw = wgt.stride_elems(3);
+    }
+
+    p.epilogue = attrs.epilogue.type;
+    p.ep_alpha = attrs.epilogue.alpha;
+    p.ep_beta = attrs.epilogue.beta;
+    p.min_clip = attrs.epilogue.min_clip;
+    p.max_clip = attrs.epilogue.max_clip;
+    p.add_to = attrs.add_to;
+    p.pre_act = attrs.add_to && attrs.residual_pre_activation;
+    p.channels_last = last;
+    p.classes = p.sh * p.sw;
+
+    const int th_max = (p.oh + p.sh - 1) / p.sh;
+    const int tw_max = (p.ow + p.sw - 1) / p.sw;
+    const bool half_elem = (dt == DataType::f16);
+    const cudaStream_t stream = static_cast<cudaStream_t>(ctx.cuda_stream);
+
+    if (!tconv::transpose_conv2d_depthwise_cuda(p, th_max, tw_max, last,
+                                                half_elem, stream)) {
+        // The class view declines a geometry or a grid it cannot hold; on the
+        // channel-last side the scalar script still covers it, and channel-first
+        // has no such residue.
+        if (!last) { return Status::unsupported; }
+        if (half_elem) {
+            tconv::launch_last_scalar<cute::half_t>(p, stream);
+        } else {
+            tconv::launch_last_scalar<float>(p, stream);
+        }
+    }
+    return cudaGetLastError() == cudaSuccess ? Status::ok : Status::internal;
+}
+
+}  // namespace nnops::backend::cuda
