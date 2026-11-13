@@ -22,7 +22,7 @@ A self-contained, **zero-dependency** C++23 operator library for neural-network 
 | CUDA | ⚙️ optional | `-DNNOPS_BUILD_CUDA=ON` |
 | Vulkan | ⚙️ optional | `-DNNOPS_BUILD_VULKAN=ON` (eltwise + unary) |
 
-`DataType` covers `f32`, `f16`, `bf16`, `s8`, `u8`, `s32`, `s64`, `f8_e4m3`, `f8_e5m2`, `s4`, `u4`. The optimized SIMD kernels target `f32` and `f16`; `s8×s8 → s32/s8` integer GEMM is available for `MatMul` / `QuantLinear`.
+`DataType` covers `f32`, `f16`, `bf16`, `s8`, `u8`, `s32`, `s64`, `f8_e4m3`, `f8_e5m2`, `s4`, `u4`. The optimized SIMD kernels target `f32` and `f16`; on aarch64 `bf16` is a first-class activation type across the GEMM/conv/attention/norm routes. `s8×s8 → s32/s8` integer GEMM is available for `MatMul` / `QuantLinear`, and a llama.cpp Q4_1 weight decodes into an f32, f16 or (aarch64) bf16 GEMM.
 
 ## Requirements
 

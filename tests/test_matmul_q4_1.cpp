@@ -18,16 +18,21 @@
 
 #include "nnops/ops/matmul.hpp"
 #include "nnops/detail/q4_1.hpp"
+#include "backend/cpu/matmul/matmul_helper.h"
 #include "common/test_harness.hpp"
 #include "common/test_helpers.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 using namespace nnops;
+using nnops::backend::cpu::bfloat16;
+using nnops::test::bf16_to_f32;
+using nnops::test::f32_to_bf16;
 
 namespace {
 
@@ -134,13 +139,21 @@ std::vector<float> reference_matmul(const T* a, const Q4Matrix& b,
                     transpose_b ? (n * b.cols + k) : (k * b.cols + n))];
                 if constexpr (std::is_same_v<T, float>) {
                     acc += a[m * K + k] * bv;
-                } else {
+                } else if constexpr (std::is_same_v<T, half>) {
                     acc += half_to_float(a[m * K + k]) *
                            half_to_float(float_to_half(bv));
+                } else {
+                    // bf16: the decode rounds each weight once, then the MMA
+                    // accumulates those widths in f32. static_cast goes through
+                    // bfloat16's float conversion; bf16_to_float takes raw bits.
+                    acc += static_cast<float>(a[m * K + k]) *
+                           bf16_to_float(float_to_bf16(bv));
                 }
             }
             if constexpr (std::is_same_v<T, half>) {
                 c[static_cast<size_t>(m * N + n)] = half_to_float(float_to_half(acc));
+            } else if constexpr (std::is_same_v<T, bfloat16>) {
+                c[static_cast<size_t>(m * N + n)] = bf16_to_float(float_to_bf16(acc));
             } else {
                 c[static_cast<size_t>(m * N + n)] = acc;
             }
@@ -170,6 +183,7 @@ struct Case {
     float alpha = 1.0f;                        ///< scales the product only
     EpilogueActivateType ep = EpilogueActivateType::None;
     bool bias = false;                         ///< adds a per-column [N] input
+    bool bf16 = false;                         ///< aarch64 only; excludes f16
 };
 
 /// Deterministic prior C contents, so beta != 0 has something to act on.
@@ -196,6 +210,8 @@ void run_case(const Case& c) {
             a_f16_logical[i] = float_to_half(a_f32[i]);
         }
     }
+    std::vector<bfloat16> a_bf16_logical;
+    if (c.bf16) { a_bf16_logical = f32_to_bf16(a_f32); }
 
     std::vector<float> a_f32_phys = c.transpose_a ? transpose_a_storage(a_f32, M, K)
                                                   : a_f32;
@@ -203,6 +219,11 @@ void run_case(const Case& c) {
     if (c.f16) {
         a_f16_phys = c.transpose_a ? transpose_a_storage(a_f16_logical, M, K)
                                    : a_f16_logical;
+    }
+    std::vector<bfloat16> a_bf16_phys;
+    if (c.bf16) {
+        a_bf16_phys = c.transpose_a ? transpose_a_storage(a_bf16_logical, M, K)
+                                    : a_bf16_logical;
     }
 
     // Physical B: [N][K] when transposed, [K][N] otherwise.
@@ -218,10 +239,13 @@ void run_case(const Case& c) {
         : std::span<const int64_t>(ashape_mk, 2);
     const int64_t bshape[] = {brows, bcols};
 
-    const bool a16 = c.f16;
-    TensorView a(ashape, a16 ? DataType::f16 : DataType::f32,
-                 a16 ? static_cast<void*>(a_f16_phys.data())
-                     : static_cast<void*>(a_f32_phys.data()));
+    const bool a16 = c.f16 || c.bf16;
+    const DataType a_dt = c.bf16 ? DataType::bf16
+                                 : (c.f16 ? DataType::f16 : DataType::f32);
+    void* const a_ptr = c.bf16 ? static_cast<void*>(a_bf16_phys.data())
+                       : c.f16 ? static_cast<void*>(a_f16_phys.data())
+                               : static_cast<void*>(a_f32_phys.data());
+    TensorView a(ashape, a_dt, a_ptr);
     TensorView bv(bshape, DataType::q4_1, const_cast<uint8_t*>(b.bytes.data()));
 
     MatMulAttributes attrs{};
@@ -235,14 +259,23 @@ void run_case(const Case& c) {
     const TensorDesc arr[] = {a.desc(), bv.desc()};
     auto descs = op->getOutputTensorDesc(arr);
     NNOPS_EXPECT_EQ(descs.size(), 1u);
-    NNOPS_EXPECT_EQ(descs[0].dtype, a16 ? DataType::f16 : DataType::f32);
+    NNOPS_EXPECT_EQ(descs[0].dtype, a_dt);
     NNOPS_EXPECT_EQ(descs[0].dims[0], M);
     NNOPS_EXPECT_EQ(descs[0].dims[1], N);
 
-    std::vector<float> out_f32;
-    std::vector<half>  out_f16;
+    std::vector<float>    out_f32;
+    std::vector<half>     out_f16;
+    std::vector<bfloat16> out_bf16;
     TensorView output = [&]() {
-        if (a16) {
+        if (c.bf16) {
+            out_bf16.resize(static_cast<size_t>(M * N));
+            for (int64_t i = 0; i < M * N; ++i) {
+                out_bf16[static_cast<size_t>(i)] =
+                    backend::cpu::float_to_bfloat16(ramp_value(i));
+            }
+            return nnops::test::make_channel_first(descs[0], out_bf16.data());
+        }
+        if (c.f16) {
             out_f16.resize(static_cast<size_t>(M * N));
             for (int64_t i = 0; i < M * N; ++i) {
                 out_f16[static_cast<size_t>(i)] = float_to_half(ramp_value(i));
@@ -256,32 +289,39 @@ void run_case(const Case& c) {
         return nnops::test::make_channel_first(descs[0], out_f32.data());
     }();
 
-    // Optional [N] bias in the output dtype, exactly representable in f16.
-    std::vector<float> bias_f32;
-    std::vector<half>  bias_f16;
+    // Optional [N] bias in the output dtype, exactly representable in each fp
+    // type at these values.
+    std::vector<float>    bias_f32;
+    std::vector<half>     bias_f16;
+    std::vector<bfloat16> bias_bf16;
     const int64_t bias_shape[] = {N};
     if (c.bias) {
         bias_f32.resize(static_cast<size_t>(N));
         bias_f16.resize(static_cast<size_t>(N));
+        bias_bf16.resize(static_cast<size_t>(N));
         for (int64_t n = 0; n < N; ++n) {
             const float v = 0.125f * static_cast<float>(n % 9) - 0.5f;
             bias_f32[static_cast<size_t>(n)] = v;
             bias_f16[static_cast<size_t>(n)] = float_to_half(v);
+            bias_bf16[static_cast<size_t>(n)] =
+                backend::cpu::float_to_bfloat16(v);
         }
     }
-    const TensorView bias_view(
-        bias_shape, a16 ? DataType::f16 : DataType::f32,
-        a16 ? static_cast<void*>(bias_f16.data())
-            : static_cast<void*>(bias_f32.data()));
+    void* const bias_ptr = c.bf16 ? static_cast<void*>(bias_bf16.data())
+                         : c.f16 ? static_cast<void*>(bias_f16.data())
+                                 : static_cast<void*>(bias_f32.data());
+    const TensorView bias_view(bias_shape, a_dt, bias_ptr);
 
     const TensorView ins2[] = {a, bv};
     const TensorView ins3[] = {a, bv, bias_view};
     op->compute(output, c.bias ? std::span<const TensorView>(ins3, 3)
                                : std::span<const TensorView>(ins2, 2));
 
-    std::vector<float> want = a16
-        ? reference_matmul<half>(a_f16_logical.data(), b, M, N, K, c.transpose_b)
-        : reference_matmul<float>(a_f32.data(), b, M, N, K, c.transpose_b);
+    std::vector<float> want = c.bf16
+        ? reference_matmul<bfloat16>(a_bf16_logical.data(), b, M, N, K, c.transpose_b)
+        : c.f16
+            ? reference_matmul<half>(a_f16_logical.data(), b, M, N, K, c.transpose_b)
+            : reference_matmul<float>(a_f32.data(), b, M, N, K, c.transpose_b);
 
     // Every route shares these post-accumulation semantics: C = alpha·(A×B)
     // + beta·C_old, then the bias and the clamp/epilogue.
@@ -291,15 +331,19 @@ void run_case(const Case& c) {
             v *= c.alpha;
         }
         if (c.beta != 0.0f) {
-            const float old = a16
-                ? half_to_float(float_to_half(ramp_value(i))) : ramp_value(i);
+            const float old = c.bf16
+                ? backend::cpu::bfloat16_to_float(backend::cpu::float_to_bfloat16(ramp_value(i)))
+                : c.f16 ? half_to_float(float_to_half(ramp_value(i)))
+                        : ramp_value(i);
             v += c.beta * old;
         }
         if (c.bias) {
             // Unscaled by alpha, added before the clamp/epilogue.
             const int64_t n = i % N;
-            v += a16 ? half_to_float(float_to_half(bias_f32[static_cast<size_t>(n)]))
-                     : bias_f32[static_cast<size_t>(n)];
+            const float bvn = bias_f32[static_cast<size_t>(n)];
+            v += c.bf16
+                ? backend::cpu::bfloat16_to_float(backend::cpu::float_to_bfloat16(bvn))
+                : c.f16 ? half_to_float(float_to_half(bvn)) : bvn;
         }
         want[static_cast<size_t>(i)] = apply_expected_epilogue(v, c.ep);
     }
@@ -307,15 +351,31 @@ void run_case(const Case& c) {
     // The f16 route accumulates in the arch's native precision (fp32 on x86,
     // fp16 on aarch64), so use the shared arch-aware tolerance, not a fixed
     // one: near-zero cancelling sums are where the wider aarch64 error shows.
-    const float rtol = a16 ? nnops::test::kF16AccumTol : 1e-4f;
-    const float atol = a16 ? nnops::test::kF16AccumTol : 1e-3f;
+    // bf16 carries its partial sums through a bf16 C between k-blocks, so its
+    // tolerance is wider still (test_helpers.hpp).
+    const float accum_tol = c.bf16 ? nnops::test::kBF16AccumTol
+                          : a16     ? nnops::test::kF16AccumTol
+                                    : 0.0f;
+    const float rtol = a16 ? accum_tol : 1e-4f;
+    const float atol = a16 ? accum_tol : 1e-3f;
     float worst = 0.0f;
     for (int64_t i = 0; i < M * N; ++i) {
-        const float got = a16
-            ? half_to_float(out_f16[static_cast<size_t>(i)])
-            : out_f32[static_cast<size_t>(i)];
+        const float got = c.bf16
+            ? backend::cpu::bfloat16_to_float(out_bf16[static_cast<size_t>(i)])
+            : c.f16 ? half_to_float(out_f16[static_cast<size_t>(i)])
+                    : out_f32[static_cast<size_t>(i)];
         const float diff = std::abs(got - want[static_cast<size_t>(i)]);
         worst = std::max(worst, diff);
+        if (!(diff <= atol + rtol * std::abs(want[static_cast<size_t>(i)]))) {
+            std::printf("  mismatch i=%lld (m=%lld n=%lld) got=%g want=%g diff=%g tol=%g\n",
+                        static_cast<long long>(i),
+                        static_cast<long long>(i / N),
+                        static_cast<long long>(i % N),
+                        static_cast<double>(got),
+                        static_cast<double>(want[static_cast<size_t>(i)]),
+                        static_cast<double>(diff),
+                        static_cast<double>(atol + rtol * std::abs(want[static_cast<size_t>(i)])));
+        }
         NNOPS_EXPECT_TRUE(diff <= atol + rtol * std::abs(want[static_cast<size_t>(i)]));
     }
     (void)worst;
@@ -508,3 +568,121 @@ NNOPS_TEST(matmul_q4_1_f16) {
     run_case({37, 5, 70, /*transpose_b=*/true,  /*f16=*/true, /*transpose_a=*/false,
               0.5f, 1.0f, EpilogueActivateType::None, /*bias=*/true});
 }
+
+#if defined(NNOPS_ARCH_AARCH64)
+/// The bf16 Q4_1 pack must be byte-identical to decoding to a dense bf16 matrix
+/// and running the ordinary bf16 RHS pack: the GEMM only knows the panel layout,
+/// so a difference here is a layout bug no tolerance should hide.
+NNOPS_TEST(pack_q4_1_bf16_matches_dense_pack) {
+    constexpr int64_t N = 37;   // panels 16 + 16 + 5
+    constexpr int kc = 70;      // kc off a multiple of 4
+    const int ldd = static_cast<int>(backend::cpu::aarch64::bf16_b_panel_stride(kc));
+    const int panels = static_cast<int>((N + 15) / 16);
+
+    // Both physical B layouts, and a k window that starts mid-block (koff = 6)
+    // as well as at the row origin.
+    for (bool trans : {false, true}) {
+        for (int k_start : {0, 70}) {
+            const int64_t k_total = k_start + kc;
+            const Q4Matrix b = trans ? build_q4_matrix(N, k_total, 0x77u)
+                                     : build_q4_matrix(k_total, N, 0x77u);
+            const int64_t rows = trans ? N : k_total;
+            const int64_t cols = trans ? k_total : N;
+
+            std::vector<bfloat16> dense(static_cast<size_t>(rows * cols));
+            for (int64_t r = 0; r < rows; ++r) {
+                for (int64_t c = 0; c < cols; ++c) {
+                    dense[static_cast<size_t>(r * cols + c)] =
+                        backend::cpu::float_to_bfloat16(
+                            b.decoded[static_cast<size_t>(r * cols + c)]);
+                }
+            }
+
+            // The dense pack has no k_start: shift its source to the window.
+            const bfloat16* dense_base = trans
+                ? dense.data() + k_start
+                : dense.data() + static_cast<int64_t>(k_start) * cols;
+
+            std::vector<bfloat16> want(static_cast<size_t>(panels * ldd), bfloat16{});
+            std::vector<bfloat16> got(static_cast<size_t>(panels * ldd), bfloat16{});
+            backend::cpu::tile_pack_rhs(trans, static_cast<int>(N), kc,
+                                        want.data(), ldd, dense_base,
+                                        static_cast<int>(cols), 1.0f);
+            backend::cpu::tile_pack_rhs_q4_1(
+                trans, 0, static_cast<int>(N), k_start, kc, got.data(), ldd,
+                b.bytes.data(), b.blocks_per_row, 1.0f);
+
+            for (size_t i = 0; i < want.size(); ++i) {
+                if (want[i].bits != got[i].bits) {
+                    std::printf("  pack mismatch trans=%d k_start=%d i=%zu "
+                                "want=%04x got=%04x\n",
+                                static_cast<int>(trans), k_start, i,
+                                static_cast<unsigned>(want[i].bits),
+                                static_cast<unsigned>(got[i].bits));
+                }
+                NNOPS_EXPECT_EQ(want[i].bits, got[i].bits);
+            }
+        }
+    }
+}
+
+/// bf16 activations × a Q4_1 weight. The bf16 B pack writes the BFMMLA operand
+/// layout rather than the [k][nr] panels, so both physical B layouts, the
+/// 16-column panel tail, the 4-value k-group tail and the k-block tail are all
+/// exercised against the f32 decode.
+void run_bf16(int64_t M, int64_t N, int64_t K, bool transpose_b,
+              bool transpose_a = false, float beta = 0.0f, float alpha = 1.0f,
+              EpilogueActivateType ep = EpilogueActivateType::None,
+              bool bias = false) {
+    Case c{};
+    c.M = M;
+    c.N = N;
+    c.K = K;
+    c.transpose_b = transpose_b;
+    c.transpose_a = transpose_a;
+    c.beta = beta;
+    c.alpha = alpha;
+    c.ep = ep;
+    c.bias = bias;
+    c.bf16 = true;
+    run_case(c);
+}
+
+NNOPS_TEST(matmul_q4_1_bf16) {
+    // Both B layouts; N off the 16-column panel; K off both 32 and 4.
+    run_bf16(5, 37, 70, /*transpose_b=*/false);
+    run_bf16(37, 5, 70, /*transpose_b=*/true);
+    run_bf16(24, 71, 160, /*transpose_b=*/true);
+    run_bf16(17, 23, 70, /*transpose_b=*/true, /*transpose_a=*/true);
+    run_bf16(3, 33, 95, /*transpose_b=*/false);   // short final k-group
+    run_bf16(1, 16, 32, /*transpose_b=*/true);    // a full panel, no padding
+    run_bf16(9, 31, 129, /*transpose_b=*/true);   // past one k-block
+
+    // The post-accumulation semantics the f32/f16 cases cover.
+    run_bf16(8, 71, 160, /*transpose_b=*/true, false, /*beta=*/0.0f,
+             /*alpha=*/0.5f, EpilogueActivateType::Relu6, /*bias=*/true);
+    run_bf16(16, 37, 33, /*transpose_b=*/true, false, /*beta=*/1.0f);
+}
+
+NNOPS_TEST(matmul_q4_1_fused_small_m_bf16) {
+    // The f32/f16 boundary sweep, now that the fused small-M kernels take bf16.
+    // At each per-layout M limit the fused kernel runs; one row past it the
+    // packed plan takes the call, and both must land on the same decoded product.
+    run_bf16(1, 71, 160, /*transpose_b=*/true);
+    run_bf16(3, 41, 33, /*transpose_b=*/true);
+    run_bf16(16, 71, 95, /*transpose_b=*/true);   // at the trans limit
+    run_bf16(17, 71, 95, /*transpose_b=*/true);   // past it
+    run_bf16(1, 37, 70, /*transpose_b=*/false);
+    run_bf16(5, 37, 70, /*transpose_b=*/false);   // copy-limit band
+    run_bf16(8, 37, 70, /*transpose_b=*/false);   // at the copy limit
+    run_bf16(9, 37, 70, /*transpose_b=*/false);   // past it
+    run_bf16(16, 37, 33, /*transpose_b=*/true, false, 0.0f, 0.5f);
+    run_bf16(2, 37, 70, /*transpose_b=*/false, false, 0.0f, -0.5f);
+    run_bf16(2, 37, 70, /*transpose_b=*/false, false, 0.0f, 1.0f,
+             EpilogueActivateType::Relu6);
+    run_bf16(8, 71, 160, /*transpose_b=*/true, false, 0.0f, 2.0f,
+             EpilogueActivateType::None, /*bias=*/true);
+    run_bf16(16, 37, 33, /*transpose_b=*/true, false, 0.5f, 1.5f,
+             EpilogueActivateType::Relu, /*bias=*/true);
+}
+#endif

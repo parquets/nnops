@@ -173,11 +173,11 @@ Status linear_cpu(const LinearAttributes& attrs,
 
     const bool quant = is_int8_matmul(x_dt, w_dt);
     // A block-packed weight (q4_1) is self-describing and decodes to X's type
-    // inside MatMul, so it pairs with a float activation only.
-    // A block stream decodes into f32/f16 only (MatMul's packs are typed), so a
-    // bf16 activation pairs with a raw fp weight.
+    // inside MatMul, so it pairs with a float activation only. f32/f16 decode
+    // into the uniform panels; on aarch64 bf16 decodes into the BFMMLA layout.
     const bool block_rhs = is_block_packed_dtype(w_dt) &&
-                           (x_dt == DataType::f32 || x_dt == DataType::f16);
+                           (x_dt == DataType::f32 || x_dt == DataType::f16 ||
+                            (nnops::detail::bf16_enabled && x_dt == DataType::bf16));
     NNOPS_ASSERT(quant || block_rhs || (x_dt == w_dt && is_float_dtype(x_dt)));
     // Integer output -> int32 bias (MatMul's rule).
     const bool int_out = out_dt == DataType::s32 || out_dt == DataType::s8 ||

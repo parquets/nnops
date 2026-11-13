@@ -447,7 +447,8 @@ void tile_pack_rhs(bool trans, int nc, int kc,
 #endif
 
 // ---- Block-packed RHS (q4_1) --------------------------------------------
-// The panel layout matches tile_pack_rhs; the MMA route never sees the blocks.
+// The f32/f16 panel layout matches tile_pack_rhs; bf16 uses the BFMMLA layout
+// pack_bf16.hpp defines. The MMA route never sees the blocks either way.
 
 static_assert(q4_1_block_elems == 32,
               "the block RHS packers assume 32-value blocks");
@@ -467,6 +468,15 @@ void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
     arch::pack_q4_1_rhs<half>(trans, n_start, nc, k_start, kc, dst, ldd, src,
                               src_row_blocks, scale);
 }
+
+#ifdef NNOPS_ARCH_AARCH64
+void tile_pack_rhs_q4_1(bool trans, int n_start, int nc, int k_start, int kc,
+                        bfloat16* dst, int ldd, const void* src,
+                        int64_t src_row_blocks, float scale) {
+    arch::pack_q4_1_rhs(trans, n_start, nc, k_start, kc, dst, ldd, src,
+                        src_row_blocks, scale);
+}
+#endif
 
 #else
 
@@ -1141,9 +1151,11 @@ MatMulPlan get_matmul_plan(const MatMulAttributes& attrs,
     const auto dt_a = a_desc.dtype;
     const auto dt_b = b_desc.dtype;
 
-    // A block-packed B (q4_1) is self-describing, so A only has to be a float type.
+    // A block-packed B (q4_1) is self-describing, so A only has to be a float
+    // type. bf16 joins on aarch64, where it decodes into the BFMMLA layout.
     const bool block_rhs = is_block_packed_dtype(dt_b) &&
-                           (dt_a == DataType::f32 || dt_a == DataType::f16);
+                           (dt_a == DataType::f32 || dt_a == DataType::f16 ||
+                            (nnops::detail::bf16_enabled && dt_a == DataType::bf16));
     const bool int8_pair = is_int8_matmul(dt_a, dt_b);
     if (dt_a != dt_b && !block_rhs && !int8_pair) {
         return plan;

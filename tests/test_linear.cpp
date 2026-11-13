@@ -46,6 +46,9 @@ using namespace nnops;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::half_to_float;
 using nnops::backend::cpu::float_to_half;
+using nnops::backend::cpu::bfloat16;
+using nnops::backend::cpu::bfloat16_to_float;
+using nnops::backend::cpu::float_to_bfloat16;
 
 namespace nnops::backend::cpu::reference {
 void linear_ref(const LinearAttributes& attrs,
@@ -59,6 +62,7 @@ namespace {
 
 float to_f(float v) { return v; }
 float to_f(half v) { return half_to_float(v); }
+float to_f(bfloat16 v) { return bfloat16_to_float(v); }
 
 TensorDesc make_desc(std::initializer_list<int64_t> dims,
                      DataType dtype = DataType::f32) {
@@ -972,7 +976,20 @@ Q4Weight make_q4_weight(int64_t rows, int64_t cols, uint32_t seed) {
 template <class T>
 T from_f32(float f) {
     if constexpr (std::is_same_v<T, half>) { return float_to_half(f); }
+    else if constexpr (std::is_same_v<T, bfloat16>) { return float_to_bfloat16(f); }
     else { return f; }
+}
+
+/// The bf16 q4_1 pack narrows each decoded weight once; the reference does the
+/// same so the comparison is against the operand the GEMM actually reads.
+/// (f32/f16 keep the historical f32-decoded reference.)
+template <class T>
+float q4_weight_value(float decoded) {
+    if constexpr (std::is_same_v<T, bfloat16>) {
+        return bfloat16_to_float(float_to_bfloat16(decoded));
+    } else {
+        return decoded;
+    }
 }
 
 /// Linear with a q4_1 weight against C = A × Wᵀ from the decoded values, then
@@ -997,11 +1014,12 @@ void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
     const int64_t ashape[] = {M, K};
     const int64_t wshape[] = {N, K};
     const int64_t bshape[] = {N};
-    TensorView a(ashape, std::is_same_v<T, half> ? DataType::f16 : DataType::f32,
-                 a_buf.data());
+    constexpr DataType fp_dt = std::is_same_v<T, half>     ? DataType::f16
+                             : std::is_same_v<T, bfloat16> ? DataType::bf16
+                                                           : DataType::f32;
+    TensorView a(ashape, fp_dt, a_buf.data());
     TensorView wv(wshape, DataType::q4_1, w.bytes.data());
-    TensorView bv(bshape, std::is_same_v<T, half> ? DataType::f16 : DataType::f32,
-                  b_buf.data());
+    TensorView bv(bshape, fp_dt, b_buf.data());
 
     LinearAttributes attrs;
     attrs.epilogue.type = act;
@@ -1034,7 +1052,7 @@ void check_linear_q4(int64_t M, int64_t K, int64_t N, bool with_bias,
             float acc = 0.0f;
             for (int64_t k = 0; k < K; ++k) {
                 acc += to_f(a_buf[static_cast<size_t>(m * K + k)]) *
-                       w.decoded[static_cast<size_t>(n * K + k)];
+                       q4_weight_value<T>(w.decoded[static_cast<size_t>(n * K + k)]);
             }
             if (with_bias) { acc += to_f(b_buf[static_cast<size_t>(n)]); }
             if (pre_act) {
@@ -1078,6 +1096,21 @@ NNOPS_TEST(linear_q4_1_weight_f16) {
     check_linear_q4<half>(33, 71, 33, true, EpilogueActivateType::Relu6, tol, 43);
     check_linear_q4<half>(8, 37, 70, true, EpilogueActivateType::None, tol, 44);
 }
+
+#if defined(NNOPS_ARCH_AARCH64)
+NNOPS_TEST(linear_q4_1_weight_bf16) {
+    // The aarch64 bf16 route: the Q4_1 weight decodes into the BFMMLA operand
+    // layout, so the same w4a16 shapes are checked against the narrowed decode.
+    const float tol = test::kBF16AccumTol;
+    check_linear_q4<bfloat16>(1, 71, 33, false, EpilogueActivateType::None, tol, 61);
+    check_linear_q4<bfloat16>(32, 71, 33, true, EpilogueActivateType::None, tol, 62);
+    check_linear_q4<bfloat16>(33, 71, 33, true, EpilogueActivateType::Relu6, tol, 63);
+    check_linear_q4<bfloat16>(8, 37, 70, true, EpilogueActivateType::None, tol, 64);
+    // The pre-activation residual rides the same fold as the fp routes.
+    check_linear_q4<bfloat16>(17, 70, 37, true, EpilogueActivateType::Relu, tol, 65,
+                              /*pre_act=*/true);
+}
+#endif
 
 NNOPS_TEST(linear_q4_1_rank1_and_batch) {
     // A rank-1 X rides the same buffers as one row; a batched X takes MatMul's

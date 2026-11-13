@@ -155,12 +155,11 @@ struct FpRoute {
         // k and n_start are element indices even for a block-packed B; only
         // its row stride counts blocks.
         if (b.blocked()) {
-            // bf16 has no block stream (matmul_dispatch_fp rejects that pair),
-            // but the route still has to compile for it.
-            if constexpr (!std::is_same_v<T, bfloat16>) {
-                tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
-                                   b.ptr, b.row_blocks, attrs.alpha);
-            }
+            // The destination type picks the panel layout: f32/f16 the uniform
+            // [k][nr] rectangle, bf16 the BFMMLA operand layout (see
+            // pack_q4_1_rhs).
+            tile_pack_rhs_q4_1(attrs.transpose_b, n_start, nc, k, kc, dst, ldd,
+                               b.ptr, b.row_blocks, attrs.alpha);
             return;
         }
         const Elem* base = static_cast<const Elem*>(b.ptr);
@@ -1215,8 +1214,10 @@ Status matmul_dispatch_quant(const MatMulAttributes& attrs, TensorView& output,
 }
 
 /// The float family: a dense f32/f16 product, with B the same type or a Q4_1
-/// block stream that decodes to it in the RHS pack. Two routes here never build
-/// a plan — the fused Q4_1 decode and the small-product sweep.
+/// block stream that decodes to it in the RHS pack. On aarch64 bf16 joins
+/// both: a dense bf16 product, or a Q4_1 B decoded into the BFMMLA layout.
+/// Two routes here never build a plan — the fused Q4_1 decode and the
+/// small-product sweep.
 Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
                           std::span<const TensorView> inputs,
                           const ComputeContext& ctx)
@@ -1229,8 +1230,11 @@ Status matmul_dispatch_fp(const MatMulAttributes& attrs, TensorView& output,
                          (nnops::detail::bf16_enabled && dt_a == DataType::bf16);
     const bool block_b = is_block_packed_dtype(dt_b);
     const bool same_type = dt_b == dt_a;
-    // A bf16 B has one packed form and no block stream: no Q4_1 cross-pair.
-    if (dt_a == DataType::bf16 && !same_type) { return Status::unsupported; }
+    // A bf16 B has one packed form, but a Q4_1 B decodes into bf16 on aarch64
+    // (tile_pack_rhs_q4_1's bf16 overload); anything else is not a pair.
+    if (dt_a == DataType::bf16 && !same_type && !block_b) {
+        return Status::unsupported;
+    }
 
 #if defined(NNOPS_ARCH_X86_64) || defined(NNOPS_ARCH_AARCH64)
     // Small-M block quant (Q4_1): decode straight into the product, before the

@@ -45,6 +45,7 @@
 
 #include "backend/cpu/common/common_utils.hpp"
 #include "nnops/core/data_type.hpp"
+#include "nnops/detail/bf16.hpp"
 #include "nnops/detail/q4_1.hpp"
 
 namespace nnops::backend::cpu::aarch64 {
@@ -107,15 +108,18 @@ struct Q4Block {
     /// values, so the vector path above never sees it.
     template <class T>
     static inline void decode(const uint8_t* p, T* out) noexcept {
-        static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>,
-                      "decode: T must be float or half");
+        static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> ||
+                          std::is_same_v<T, bfloat16>,
+                      "decode: T must be float, half or bfloat16");
         float vals[q4_1_block_elems];
         q4_1_unpack_block(p, vals);
         for (int i = 0; i < q4_1_block_elems; ++i) {
             if constexpr (std::is_same_v<T, float>) {
                 out[i] = vals[i];
-            } else {
+            } else if constexpr (std::is_same_v<T, half>) {
                 out[i] = float_to_half(vals[i]);
+            } else {
+                out[i] = float_to_bfloat16(vals[i]);
             }
         }
     }
@@ -126,28 +130,44 @@ static_assert(Q4Block::block_elems == 32,
               "copy layout");
 
 // =========================================================================
-//  Activation access — f32 reads through, f16 converts on the fly
+//  Activation access — f32 reads through, f16/bf16 convert on the fly
 // =========================================================================
 //
 /// The product accumulates in f32 registers either way; only the operand load
-/// and the final store differ, so an f16 activation costs one convert per
+/// and the final store differ, so a narrow activation costs one convert per
 /// vector instead of a dense f32 copy of A.
 
 inline float32x4_t qblock_load4(const float* p) noexcept { return vld1q_f32(p); }
 inline float32x4_t qblock_load4(const half* p) noexcept {
     return vcvt_f32_f16(vld1_f16(reinterpret_cast<const float16_t*>(p)));
 }
+/// bf16 is the top half of f32: widening is a left shift.
+inline float32x4_t qblock_load4(const bfloat16* p) noexcept {
+    const uint16x4_t u = vld1_u16(reinterpret_cast<const uint16_t*>(p));
+    return vreinterpretq_f32_u32(vshll_n_u16(u, 16));
+}
 
 inline void qblock_store4(float* p, float32x4_t v) noexcept { vst1q_f32(p, v); }
 inline void qblock_store4(half* p, float32x4_t v) noexcept {
     vst1_f16(reinterpret_cast<float16_t*>(p), vcvt_f16_f32(v));
 }
+/// Round-to-nearest-even, the same narrowing `pack_bf16.hpp` uses.
+inline void qblock_store4(bfloat16* p, float32x4_t v) noexcept {
+    uint32x4_t u = vreinterpretq_u32_f32(v);
+    u = vaddq_u32(u, vaddq_u32(vdupq_n_u32(0x7FFFu),
+                               vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1u))));
+    vst1_u16(reinterpret_cast<uint16_t*>(p), vshrn_n_u32(u, 16));
+}
 
 inline float qblock_load1(const float* p) noexcept { return *p; }
 inline float qblock_load1(const half* p) noexcept { return half_to_float(*p); }
+inline float qblock_load1(const bfloat16* p) noexcept { return *p; }
 
 inline void qblock_store1(float* p, float v) noexcept { *p = v; }
 inline void qblock_store1(half* p, float v) noexcept { *p = float_to_half(v); }
+inline void qblock_store1(bfloat16* p, float v) noexcept {
+    *p = float_to_bfloat16(v);
+}
 
 /// One trans row's k step: its eight A vectors against the eight decoded ones,
 /// folded into four interleaved chains.
