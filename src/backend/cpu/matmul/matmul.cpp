@@ -235,7 +235,7 @@ struct I8Route {
 
     using EpilogueParams = Int8EpilogueParams;
 
-    static constexpr const MatmulGeom& geom() { return GEOM_I8; }
+    static const MatmulGeom& geom() { return GEOM_I8; }
 
     struct B { const int8_t* ptr; int ldb; };
 

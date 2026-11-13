@@ -10,9 +10,12 @@
 ///  - A packs down the arch's MR cascade ({6,4,1} on x86, {8,4,1} on aarch64;
 ///    int8 uses the same levels). B packs into uniform nr_max-wide panels with
 ///    the columns past nc zero-filled, one mma_pack_align (64-byte) slot apart.
-///  - int8 always takes the hardware dot product (VNNI u8×s8 on x86, SDOT
-///    s8×s8 on aarch64); only the pack layout and the A-side signedness shift
-///    differ by arch — see int8_a_pack_bias.
+///  - int8 always takes a hardware integer MMA (VNNI u8×s8 on x86, SDOT
+///    s8×s8 on aarch64, SMMLA on aarch64 when FEAT_I8MM is present and not
+///    disabled). Only the pack layout and the A-side signedness shift differ by
+///    arch — see int8_a_pack_bias — and the i8mm switch is runtime, inside this
+///    layer: every plan above it sees the same MR ladder, panel width and
+///    DataTypes.
 ///  - kc is capped per dtype. The fp 128 is a precision limit on f16 (that
 ///    kernel accumulates in f16; kc 256 at K=4096 moved the worst deviation
 ///    0.183 -> 0.230), f32 keeping the same cap. int8's 512 is a tuning
@@ -50,6 +53,8 @@
 #include "backend/cpu/aarch64/mma_qblock.hpp"
 #include "backend/cpu/aarch64/pack_dp4a_i8.hpp"
 #include "backend/cpu/aarch64/mma_i8.hpp"
+#include "backend/cpu/aarch64/pack_i8mm.hpp"
+#include "backend/cpu/aarch64/mma_i8mm.hpp"
 #include "backend/cpu/aarch64/matmul_naive.hpp"
 #include "backend/cpu/aarch64/pack_bf16.hpp"
 #include "backend/cpu/aarch64/mma_bf16.hpp"
@@ -114,6 +119,27 @@ constexpr int MR_I8[4] = {8, 4, 1, 0};
 constexpr int MR_MAX_I8 = MR_I8[0];
 constexpr int NR_MAX_I8 = arch::mma_i8_nr_max;
 
+/// FEAT_I8MM on aarch64: the int8 path runs on SMMLA instead of SDOT. Both
+/// routes share the MR ladder and the 12-wide B panel, so nothing above this
+/// header forks — only the pack bytes inside a B panel and the kernel that
+/// reads them (see aarch64/pack_i8mm.hpp).
+inline bool i8mm_enabled() noexcept {
+#ifdef NNOPS_ARCH_AARCH64
+    return simd::cpu_has_i8mm();
+#else
+    return false;
+#endif
+}
+
+/// k rounded up to the int8 pack's group: eight on the i8mm route (an SMMLA
+/// operand is two 8-k fragments), four on SDOT (one vdot lane group).
+inline int i8_k_round(int kc) noexcept {
+    return i8mm_enabled() ? ((kc + 7) & ~7) : ((kc + 3) & ~3);
+}
+inline int64_t i8_k_round64(int64_t kc) noexcept {
+    return i8mm_enabled() ? ((kc + 7) & ~int64_t{7}) : ((kc + 3) & ~int64_t{3});
+}
+
 #ifdef NNOPS_ARCH_X86_64
 static_assert(arch::mma_i8_b_panel_tail == 16 * 4, "x86 int8 B panel must be 16 wide");
 static_assert(arch::mma_i8_folds_a_bias, "x86 int8 kernels fold the A bias per panel");
@@ -142,12 +168,14 @@ constexpr int int8_epilogue_offset(DataType dt_a) noexcept {
     return arch::mma_i8_folds_a_bias ? 0 : int8_a_pack_bias(dt_a);
 }
 
-/// Bytes of one int8 packed-B panel slot: nr_max columns x ceil(kc/4) k groups,
-/// plus x86's correction block, 64-byte aligned.
-constexpr int64_t int8_panel_stride(int64_t kc) noexcept {
-    const int64_t kbytes = (kc + 3) & ~int64_t{3};
+/// Bytes of one int8 packed-B panel slot: nr_max columns x ceil(kc/group) k
+/// groups, plus x86's correction block, 64-byte aligned. The group is four on
+/// SDOT and eight on i8mm, so the slot can be up to one group wider there —
+/// every size and stride is computed through this one function, which is what
+/// keeps the packed blobs and the workspaces consistent with the kernels.
+inline int64_t int8_panel_stride(int64_t kc) noexcept {
     return static_cast<int64_t>(mma_pack_align(
-        static_cast<size_t>(NR_MAX_I8) * static_cast<size_t>(kbytes)
+        static_cast<size_t>(NR_MAX_I8) * static_cast<size_t>(i8_k_round64(kc))
         + static_cast<size_t>(arch::mma_i8_b_panel_tail)));
 }
 
@@ -275,10 +303,12 @@ constexpr int64_t geom_ldd_bf16_b(int64_t kc) noexcept { return arch::bf16_b_pan
 constexpr int64_t geom_ldd_bf16_a(int64_t kc) noexcept { return geom_ldd_flt<bfloat16>(MR_MAX_BF16, kc); }
 #endif
 
-constexpr int64_t geom_ldd_i8_a(int64_t kc) noexcept {
-    const int64_t kbytes = (kc + 3) & ~int64_t{3};
+/// A panel slot. The A layout is k-grouped like B's, but the group is 4 bytes
+/// on SDOT and 8 on i8mm, so this rounds with the same rule (i8_k_round64).
+inline int64_t geom_ldd_i8_a(int64_t kc) noexcept {
     return static_cast<int64_t>(
-        mma_pack_align(static_cast<size_t>(MR_MAX_I8) * static_cast<size_t>(kbytes)));
+        mma_pack_align(static_cast<size_t>(MR_MAX_I8) *
+                       static_cast<size_t>(i8_k_round64(kc))));
 }
 constexpr int64_t geom_ldd_i8_b(int64_t kc) noexcept { return int8_panel_stride(kc); }
 
@@ -304,7 +334,8 @@ inline constexpr MatmulGeom GEOM_BF16 = {
 };
 #endif
 
-inline constexpr MatmulGeom GEOM_I8 = {
+// Not constexpr: the panel slot depends on the runtime i8mm choice.
+inline const MatmulGeom GEOM_I8 = {
     MR_MAX_I8, NR_MAX_I8, 1, KC_CAP_I8,
     /*packs_a_always=*/true, /*hoists_b_m_split=*/true, MR_I8,
     geom_ldd_i8_b, geom_ldd_i8_a,
