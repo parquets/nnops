@@ -51,9 +51,12 @@
 #include "backend/cpu/aarch64/pack_dp4a_i8.hpp"
 #include "backend/cpu/aarch64/mma_i8.hpp"
 #include "backend/cpu/aarch64/matmul_naive.hpp"
+#include "backend/cpu/aarch64/pack_bf16.hpp"
+#include "backend/cpu/aarch64/mma_bf16.hpp"
 #endif
 
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/bf16.hpp"
 
 namespace nnops::backend::cpu {
 
@@ -77,6 +80,17 @@ constexpr int MR_MAX_F32 = arch::mr_f32[0];
 constexpr int NR_MAX_F32 = arch::nr_f32[0];
 constexpr int MR_MAX_F16 = arch::mr_f16[0];
 constexpr int NR_MAX_F16 = arch::nr_f16[0];
+
+// bf16 (aarch64 only): the same {8,4,1} rungs and 16-wide panels as f16, so the
+// plan's splitting and panel grid carry over unchanged.
+#ifdef NNOPS_ARCH_AARCH64
+constexpr int MR_BF16[4] = {arch::mr_bf16[0], arch::mr_bf16[1],
+                            arch::mr_bf16[2], arch::mr_bf16[3]};
+constexpr int NR_BF16[3] = {arch::nr_bf16[0], arch::nr_bf16[1], arch::nr_bf16[2]};
+constexpr int MR_MAX_BF16 = MR_BF16[0];
+constexpr int NR_MAX_BF16 = NR_BF16[0];
+static_assert(arch::bf16_nr_max == NR_MAX_BF16, "the bf16 B panel is the pack's");
+#endif
 
 #ifdef NNOPS_ARCH_X86_64
 // The Q4_1 RHS writes the float packers' uniform panels, so its hard-coded
@@ -144,6 +158,10 @@ constexpr int mr_max_flt() {
         return MR_MAX_F32;
     } else if constexpr (std::is_same_v<T, half>) {
         return MR_MAX_F16;
+#ifdef NNOPS_ARCH_AARCH64
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return MR_MAX_BF16;
+#endif
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>, "Unsupported type");
     }
@@ -155,9 +173,31 @@ constexpr int nr_max_flt() {
         return NR_MAX_F32;
     } else if constexpr (std::is_same_v<T, half>) {
         return NR_MAX_F16;
+#ifdef NNOPS_ARCH_AARCH64
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return NR_MAX_BF16;
+#endif
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, half>, "Unsupported type");
     }
+}
+
+/// Runtime-dtype forms of the pair above, for the plans that hold a DataType
+/// (conv, attention) rather than a T. bf16 answers with its own geometry —
+/// same rungs and panel width as f16 today, but not by construction — so a
+/// `dt == f16 ? … : f32` ternary must not be used to pick it.
+constexpr int mr_max_dt(DataType dt) noexcept {
+#ifdef NNOPS_ARCH_AARCH64
+    if (dt == DataType::bf16) { return MR_MAX_BF16; }
+#endif
+    return dt == DataType::f16 ? MR_MAX_F16 : MR_MAX_F32;
+}
+
+constexpr int nr_max_dt(DataType dt) noexcept {
+#ifdef NNOPS_ARCH_AARCH64
+    if (dt == DataType::bf16) { return NR_MAX_BF16; }
+#endif
+    return dt == DataType::f16 ? NR_MAX_F16 : NR_MAX_F32;
 }
 
 // =========================================================================
@@ -192,6 +232,7 @@ constexpr int64_t KC_ALIGN = 32;
 
 constexpr int64_t KC_CAP_F32 = 128;
 constexpr int64_t KC_CAP_F16 = 128;
+constexpr int64_t KC_CAP_BF16 = 128;  // the f16 limit; the kernel accumulates in f32
 constexpr int64_t KC_CAP_I8  = 512;
 
 // =========================================================================
@@ -226,6 +267,14 @@ constexpr int64_t geom_ldd_f32_a(int64_t kc) noexcept { return geom_ldd_flt<floa
 constexpr int64_t geom_ldd_f16_b(int64_t kc) noexcept { return geom_ldd_flt<half>(NR_MAX_F16, kc); }
 constexpr int64_t geom_ldd_f16_a(int64_t kc) noexcept { return geom_ldd_flt<half>(MR_MAX_F16, kc); }
 
+#ifdef NNOPS_ARCH_AARCH64
+/// bf16's B panel is BFMMLA's operand layout — ⌈kc/4⌉ k-groups of 64 elements
+/// — not the plain nr_max × kc rectangle, so its stride is the pack's, not the
+/// aligned product.
+constexpr int64_t geom_ldd_bf16_b(int64_t kc) noexcept { return arch::bf16_b_panel_stride(kc); }
+constexpr int64_t geom_ldd_bf16_a(int64_t kc) noexcept { return geom_ldd_flt<bfloat16>(MR_MAX_BF16, kc); }
+#endif
+
 constexpr int64_t geom_ldd_i8_a(int64_t kc) noexcept {
     const int64_t kbytes = (kc + 3) & ~int64_t{3};
     return static_cast<int64_t>(
@@ -244,6 +293,16 @@ inline constexpr MatmulGeom GEOM_F16 = {
     /*packs_a_always=*/false, /*hoists_b_m_split=*/false, MR_F16,
     geom_ldd_f16_b, geom_ldd_f16_a,
 };
+
+#ifdef NNOPS_ARCH_AARCH64
+// No direct-A route: the A operand is a row pair read from a dense panel, and
+// every consumer already has the buffer, so A is always packed.
+inline constexpr MatmulGeom GEOM_BF16 = {
+    MR_MAX_BF16, NR_MAX_BF16, static_cast<int>(sizeof(bfloat16)), KC_CAP_BF16,
+    /*packs_a_always=*/true, /*hoists_b_m_split=*/false, MR_BF16,
+    geom_ldd_bf16_b, geom_ldd_bf16_a,
+};
+#endif
 
 inline constexpr MatmulGeom GEOM_I8 = {
     MR_MAX_I8, NR_MAX_I8, 1, KC_CAP_I8,
@@ -477,12 +536,14 @@ constexpr int num_panels_max(int n, const int* nr, int levels = 4) noexcept {
 // ---- public API: packers and MMA kernels, `ldd` from the actual k-block ----
 void tile_pack_lhs(bool trans, int mc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_lhs(bool trans, int mc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
+void tile_pack_lhs(bool trans, int mc, int kc, bfloat16* dst, int ldd, const bfloat16* src, int lds, float scale);
 
 // ---- uniform-width RHS panels — the only B/MMA route ---------------------
 //
 // `zero_mode` picks the kernel: true overwrites C, false accumulates.
 void tile_pack_rhs(bool trans, int nc, int kc, float* dst, int ldd, const float* src, int lds, float scale);
 void tile_pack_rhs(bool trans, int nc, int kc, half* dst, int ldd, const half* src, int lds, float scale);
+void tile_pack_rhs(bool trans, int nc, int kc, bfloat16* dst, int ldd, const bfloat16* src, int lds, float scale);
 
 // ---- Q4_1 (llama.cpp block format) RHS ----------------------------------
 //
@@ -527,10 +588,13 @@ void tile_mma_pack(int mc, int nc, int kc, float* c, int ldc, const float* packe
 void tile_mma_direct(int mc, int nc, int kc, float* c, int ldc, const float* a, int lda, const float* b, int64_t ldb, float* stage, float clamp_min, float clamp_max, bool zero_mode, const float* bias = nullptr, const float* col_bias = nullptr);
 void tile_mma_pack(int mc, int nc, int kc, half* c, int ldc, const half* packed_a, const half* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
 void tile_mma_direct(int mc, int nc, int kc, half* c, int ldc, const half* a, int lda, const half* b, int64_t ldb, half* stage, float clamp_min, float clamp_max, bool zero_mode, const half* bias = nullptr, const half* col_bias = nullptr);
+void tile_mma_pack(int mc, int nc, int kc, bfloat16* c, int ldc, const bfloat16* packed_a, const bfloat16* b, int64_t ldb, float clamp_min, float clamp_max, bool zero_mode, const bfloat16* bias = nullptr, const bfloat16* col_bias = nullptr);
+void tile_mma_direct(int mc, int nc, int kc, bfloat16* c, int ldc, const bfloat16* a, int lda, const bfloat16* b, int64_t ldb, bfloat16* stage, float clamp_min, float clamp_max, bool zero_mode, const bfloat16* bias = nullptr, const bfloat16* col_bias = nullptr);
 
 // SIMD-accelerated in-place scale: C[i] *= scale
 void tile_scale(float* c, int ldc, float scale, int M, int N);
 void tile_scale(half* c, int ldc, float scale, int M, int N);
+void tile_scale(bfloat16* c, int ldc, float scale, int M, int N);
 
 // Prime an fp output tile before its first k-block: C = scale * C + bias, with
 // one bias row covering the tile's columns. This is where MatMul's beta and its
@@ -538,6 +602,8 @@ void tile_scale(half* c, int ldc, float scale, int M, int N);
 void tile_scale_add_bias(float* c, int ldc, float scale, const float* bias,
                          int M, int N);
 void tile_scale_add_bias(half* c, int ldc, float scale, const half* bias,
+                         int M, int N);
+void tile_scale_add_bias(bfloat16* c, int ldc, float scale, const bfloat16* bias,
                          int M, int N);
 
 // ---- int8 (s8×s8) pack + MMA --------------------------------------------

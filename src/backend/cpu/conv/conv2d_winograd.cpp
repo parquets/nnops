@@ -991,7 +991,11 @@ Status conv2d_winograd_kernel(const Conv2DAttributes& attrs,
                            inputs[1].data_type() == dt &&
                            output.data_type() == dt &&
                            (inputs.size() <= 2 || inputs[2].data_type() == dt);
-    NNOPS_ASSERT(dtypes_ok && "conv2d_winograd_kernel: dtype mismatch");
+    // bf16 is refused rather than asserted on: the U blob's panels are the
+    // dense fp pack layout, and a BFMMLA panel would need its own transform —
+    // on top of a transform whose fp16 form is already at the precision limit.
+    // The implicit-GEMM route carries bf16.
+    if (!dtypes_ok) { return Status::unsupported; }
     NNOPS_ASSERT(is_wino_weight(inputs[1].layout()) &&
                  "conv2d_winograd_kernel: inputs[1] must be prepacked U "
                  "(run prepackWeights first)");

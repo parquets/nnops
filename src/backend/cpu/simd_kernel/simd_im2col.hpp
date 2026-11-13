@@ -39,6 +39,8 @@
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
 
+#include <type_traits>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -54,7 +56,7 @@ namespace detail {
 template <class T>
 inline void im2col_fill_pad(T* d, int n, T pad) noexcept {
     if constexpr (std::is_integral_v<T>) {
-        if (pad == T(0)) {
+        if (pad == T{}) {
             std::memset(d, 0, sizeof(T) * static_cast<size_t>(n));
         } else {
             std::fill(d, d + n, pad);
@@ -219,6 +221,39 @@ private:
     }
 };
 
+/// The BFMMLA B-panel scatter — the same gather, into the bf16 layout the
+/// micro-kernels read: k groups of four, and inside a 16-column panel the
+/// column pair interleaves, so column c of k row k lands at
+/// `4·(c mod 16) + (k mod 4)` of the group's 64 elements. Consecutive columns
+/// are therefore eight bytes apart, which rules out the panel-row vector
+/// stores the uniform layout takes; the gather is scalar here and the panel
+/// bytes are still written exactly once.
+template <class T, int NR>
+struct Im2colPackBf16 {
+    static_assert(NR == 16, "the BFMMLA B panel is 16 columns wide");
+
+    using src_t = T;
+    using dst_t = T;
+
+    T* dst;   ///< panel 0
+    int ldd;  ///< panel stride (elements) — bf16_b_panel_stride(kdim)
+    T pad;
+
+    /// Element offset of column @p col of k row @p k.
+    int64_t at(int k, int col) const noexcept {
+        return static_cast<int64_t>(col >> 4) * ldd + static_cast<int64_t>(k >> 2) * 64 +
+               4 * (col & 15) + (k & 3);
+    }
+
+    void fill(int k, int n0, int n) const noexcept {
+        for (int i = 0; i < n; ++i) { dst[at(k, n0 + i)] = pad; }
+    }
+
+    void emit(int k, int n0, const T* s, int n, int step) const noexcept {
+        for (int i = 0; i < n; ++i) { dst[at(k, n0 + i)] = s[i * step]; }
+    }
+};
+
 /// The shared walk over (channel, tap, roi row): fills the padded faces, hands
 /// each valid run to the Store policy.
 template <class Store>
@@ -291,7 +326,7 @@ inline void tiled_im2col_2d(
     int kernel_h, int kernel_w,
     int stride_h, int stride_w,
     int dilate_h, int dilate_w,
-    T pad_value = T(0)) noexcept
+    T pad_value = T{}) noexcept
 {
     detail::im2col_2d_walk(input, roi_x, roi_y, roi_w, roi_h,
                            pad_top_local, pad_left_local,
@@ -303,9 +338,10 @@ inline void tiled_im2col_2d(
 }
 
 /// The same gather into the packed-B panels, so the col matrix never exists.
-/// @p ldd is the panel stride in elements (mma_pack_align(NR*kdim*esz)/esz);
-/// @p NR is nr_max_flt<T>(). Columns past roi_area in the last panel are
-/// zero-filled, since the MMA loads all NR lanes of every panel row.
+/// @p ldd is the panel stride in elements — `gemm_panel_slot(...)`, which for
+/// bf16 is `bf16_b_panel_stride` rather than a dense NR*kdim; @p NR is
+/// nr_max_flt<T>(). Columns past roi_area in the last panel are zero-filled,
+/// since the MMA loads all NR lanes of every panel row.
 template <class T, int NR>
 inline void tiled_im2col_2d_packed(
     T* packed, int ldd, const T* input,
@@ -317,25 +353,31 @@ inline void tiled_im2col_2d_packed(
     int kernel_h, int kernel_w,
     int stride_h, int stride_w,
     int dilate_h, int dilate_w,
-    T pad_value = T(0)) noexcept
+    T pad_value = T{}) noexcept
 {
-    const detail::Im2colPack<T, NR> store{packed, ldd, pad_value};
-    detail::im2col_2d_walk(input, roi_x, roi_y, roi_w, roi_h,
-                           pad_top_local, pad_left_local,
-                           pad_top_global, pad_left_global,
-                           in_channel, in_h, in_w, icn_step, ih_step,
-                           kernel_h, kernel_w, stride_h, stride_w,
-                           dilate_h, dilate_w, store);
+    const auto walk = [&](const auto& store) {
+        detail::im2col_2d_walk(input, roi_x, roi_y, roi_w, roi_h,
+                               pad_top_local, pad_left_local,
+                               pad_top_global, pad_left_global,
+                               in_channel, in_h, in_w, icn_step, ih_step,
+                               kernel_h, kernel_w, stride_h, stride_w,
+                               dilate_h, dilate_w, store);
 
-    // Tail of the last panel: columns past the ROI, which the walk never
-    // reaches — NR - (roi_area % NR) per k row.
-    const int roi_area = roi_w * roi_h;
-    const int tail = roi_area % NR;
-    if (tail != 0) {
-        const int kdim = in_channel * kernel_h * kernel_w;
-        for (int k = 0; k < kdim; ++k) {
-            store.fill(k, roi_area, NR - tail);
+        // Tail of the last panel: columns past the ROI, which the walk never
+        // reaches — NR - (roi_area % NR) per k row.
+        const int roi_area = roi_w * roi_h;
+        const int tail = roi_area % NR;
+        if (tail != 0) {
+            const int kdim = in_channel * kernel_h * kernel_w;
+            for (int k = 0; k < kdim; ++k) {
+                store.fill(k, roi_area, NR - tail);
+            }
         }
+    };
+    if constexpr (std::is_same_v<T, ::nnops::backend::cpu::bfloat16>) {
+        walk(detail::Im2colPackBf16<T, NR>{packed, ldd, pad_value});
+    } else {
+        walk(detail::Im2colPack<T, NR>{packed, ldd, pad_value});
     }
 }
 

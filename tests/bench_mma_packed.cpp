@@ -41,14 +41,17 @@
 #else
   #include "backend/cpu/aarch64/pack_f32.hpp"
   #include "backend/cpu/aarch64/pack_f16.hpp"
+  #include "backend/cpu/aarch64/pack_bf16.hpp"
   #include "backend/cpu/aarch64/mma_f32.hpp"
   #include "backend/cpu/aarch64/mma_f16.hpp"
+  #include "backend/cpu/aarch64/mma_bf16.hpp"
   namespace bench_arch = nnops::backend::cpu::aarch64;
 #endif
 
 namespace {
 
 using namespace bench_arch;
+using nnops::backend::cpu::bfloat16;
 using nnops::backend::cpu::half;
 using nnops::backend::cpu::float_to_half;
 using nnops::backend::cpu::half_to_float;
@@ -57,6 +60,8 @@ using nnops::backend::cpu::mma_pack_align;
 constexpr int REPS = 100000;
 
 /// RHS panel width of the active arch: x86 16 for both dtypes; aarch64 16 f16, 12 f32.
+/// bf16 rides the f16 branch on aarch64 (nr_bf16[0] == nr_f16[0] == 16, and its
+/// mr menu {8, 4, 1} is the f16 one), so no extra arm is needed.
 template <typename T>
 constexpr int nr_of() noexcept {
     if constexpr (std::is_same_v<T, float>) { return bench_arch::nr_f32[0]; }
@@ -83,11 +88,15 @@ constexpr int C_TILES = 64;
 template <typename T> T as_type(float v) noexcept;
 template <> float as_type<float>(float v) noexcept { return v; }
 template <> half  as_type<half>(float v) noexcept { return float_to_half(v); }
+template <> bfloat16 as_type<bfloat16>(float v) noexcept { return bfloat16(v); }
 
 template <typename T> double as_double(T v) noexcept;
 template <> double as_double<float>(float v) noexcept { return static_cast<double>(v); }
 template <> double as_double<half>(half v) noexcept {
     return static_cast<double>(half_to_float(v));
+}
+template <> double as_double<bfloat16>(bfloat16 v) noexcept {
+    return static_cast<double>(static_cast<float>(v));
 }
 
 /// Address-seeded so the data is runtime-opaque (constant data would fold the
@@ -103,7 +112,10 @@ void fill_random(T* p, size_t n, uint64_t seed) {
     }
 }
 
-/// Kernel signatures, per dtype (mr first, as in XNNPACK).
+/// Kernel signatures, per dtype (mr first, as in XNNPACK). The bf16 direct
+/// kernel takes a 64-bit B pitch where the others take an int, so the bench
+/// narrows through the wrapper below rather than widening this signature for
+/// every dtype.
 template <typename T>
 using AbKernel = void (*)(int, int, int, T*, int, const T*, const T*, float, float,
                           const T*);
@@ -136,15 +148,37 @@ AbKernel<T> ab_fn(int level) {
         case 4: return mma_pack_mr4_nr12_mrxncxkc_f32<false>;
         default: return mma_pack_mr1_nr12_mrxncxkc_f32<false>;
         }
-    } else {
+    } else if constexpr (std::is_same_v<T, half>) {
         switch (level) {
         case 8: return mma_pack_mr8_nr16_mrxncxkc_f16<false>;
         case 4: return mma_pack_mr4_nr16_mrxncxkc_f16<false>;
         default: return mma_pack_mr1_nr16_mrxncxkc_f16<false>;
         }
+    } else {
+        // bf16: the template argument is the row-pair count, so the {8, 4}
+        // rungs are <4> and <2>.
+        switch (level) {
+        case 8: return mma_pack_mrxncxkc_bf16<4, false>;
+        case 4: return mma_pack_mrxncxkc_bf16<2, false>;
+        default: return mma_pack_mrxncxkc_bf16<1, false>;
+        }
     }
 #endif
 }
+
+#ifdef NNOPS_ARCH_AARCH64
+/// BKernel-shaped forwarder onto the bf16 direct entry point, whose B pitch is
+/// int64_t (`ldb` is a packed-panel sentinel at <= -1, a row pitch otherwise).
+/// The bench passes -1 or a small int, so the narrowing cannot lose anything.
+template <int PAIRS>
+inline void bf16_direct_b(int mr, int nc, int kc, bfloat16* C, int ldc,
+                          const bfloat16* A, int lda,
+                          const bfloat16* B, int ldb,
+                          float lo, float hi, const bfloat16* bias) noexcept {
+    mma_direct_mrxncxkc_bf16<PAIRS, false>(
+        mr, nc, kc, C, ldc, A, lda, B, static_cast<int64_t>(ldb), lo, hi, bias);
+}
+#endif
 
 template <typename T>
 BKernel<T> b_fn(int level) {
@@ -171,11 +205,17 @@ BKernel<T> b_fn(int level) {
         case 4: return mma_direct_mr4_nr12_mrxncxkc_f32<false, false>;
         default: return mma_direct_mr1_nr12_mrxncxkc_f32<false, false>;
         }
-    } else {
+    } else if constexpr (std::is_same_v<T, half>) {
         switch (level) {
         case 8: return mma_direct_mr8_nr16_mrxncxkc_f16<false, false>;
         case 4: return mma_direct_mr4_nr16_mrxncxkc_f16<false, false>;
         default: return mma_direct_mr1_nr16_mrxncxkc_f16<false, false>;
+        }
+    } else {
+        switch (level) {
+        case 8: return &bf16_direct_b<4>;
+        case 4: return &bf16_direct_b<2>;
+        default: return &bf16_direct_b<1>;
         }
     }
 #endif
@@ -449,6 +489,72 @@ void bench_dtype(const char* dtype, int kc) {
 void bench_f32(int kc) { bench_dtype<float>("f32", kc); }
 void bench_f16(int kc) { bench_dtype<half>("f16", kc); }
 
+#ifdef NNOPS_ARCH_AARCH64
+void bench_bf16(int kc) { bench_dtype<bfloat16>("bf16", kc); }
+
+/// One packed-AB tile held resident, so an interleaved loop re-measures the
+/// kernel and not the random fill.
+template <typename T>
+struct AbTile {
+    static constexpr int NR = nr_of<T>();
+    static constexpr int MR = mr_head<T>();
+
+    std::vector<T> A, B;
+    AbKernel<T> fn;
+    int kc;
+
+    AbTile(int kc_, uint64_t seed) : kc(kc_) {
+        const int ldb = static_cast<int>(mma_pack_align(NR * kc * sizeof(T)) / sizeof(T));
+        A.resize(static_cast<size_t>(kc) * MR);
+        B.resize(static_cast<size_t>(ldb));
+        fill_random<T>(A.data(), A.size(), seed);
+        fill_random<T>(B.data(), B.size(), seed ^ 2);
+        fn = ab_fn<T>(MR);
+    }
+
+    double run(int reps) {
+        return time_kernel<T>(
+            [&](T* c) { fn(MR, NR, kc, c, NR, A.data(), B.data(), -1e30f, 1e30f, nullptr); },
+            MR, MR, NR, NR, kc, reps);
+    }
+};
+
+/// f16 vs bf16 on the same tile, plus bf16's widening fallback
+/// (`bf16_force_wide`, the same blocking without BFMMLA). Rounds interleave the
+/// three arms: on a fanless host the arm measured second inherits the first
+/// one's thermal state, so the ratio is only meaningful when both are re-drawn
+/// every round.
+void bench_bf16_vs_f16(int kc = 512, int rounds = 7, int reps = 50000) {
+    AbTile<half> a_f16(kc, 0xF16F16ull);
+    AbTile<bfloat16> a_bf(kc, 0xBF16BF16ull);
+
+    std::printf("  mma_packed_ab  f16 vs bf16  level=8 nr=16 kc=%d  rounds=%d reps=%d\n",
+                kc, rounds, reps);
+    std::vector<double> g_f16, g_bf, g_wide;
+    for (int r = 0; r < rounds; ++r) {
+        const double f = a_f16.run(reps);
+        bench_arch::bf16_force_wide = false;
+        const double b = a_bf.run(reps);
+        bench_arch::bf16_force_wide = true;
+        const double w = a_bf.run(reps);
+        g_f16.push_back(f);
+        g_bf.push_back(b);
+        g_wide.push_back(w);
+        std::printf("    round %d:  f16=%7.1f  bf16(BFMMLA)=%7.1f  bf16(wide)=%7.1f"
+                    "   bf16/f16=%.3f\n", r, f, b, w, b / f);
+    }
+    bench_arch::bf16_force_wide = false;
+
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double mf = median(g_f16), mb = median(g_bf), mw = median(g_wide);
+    std::printf("    median:   f16=%7.1f  bf16(BFMMLA)=%7.1f  bf16(wide)=%7.1f"
+                "   bf16/f16=%.3f\n", mf, mb, mw, mb / mf);
+}
+#endif  // NNOPS_ARCH_AARCH64
+
 }  // namespace
 
 NNOPS_BENCH(mma_packed_f32_k128) { bench_f32(128); }
@@ -459,5 +565,11 @@ NNOPS_BENCH(mma_packed_nc_f32) { bench_nc_dtype<float>("f32"); }
 NNOPS_BENCH(mma_packed_nc_f16) { bench_nc_dtype<half>("f16"); }
 NNOPS_BENCH(mma_packed_tail_f32) { bench_large_nc_dtype<float>("f32"); }
 NNOPS_BENCH(mma_packed_tail_f16) { bench_large_nc_dtype<half>("f16"); }
+#ifdef NNOPS_ARCH_AARCH64
+NNOPS_BENCH(mma_packed_bf16_k128) { bench_bf16(128); }
+NNOPS_BENCH(mma_packed_bf16_k512) { bench_bf16(512); }
+NNOPS_BENCH(mma_packed_nc_bf16) { bench_nc_dtype<bfloat16>("bf16"); }
+NNOPS_BENCH(mma_packed_bf16_vs_f16) { bench_bf16_vs_f16(); }
+#endif
 
 #endif  // NNOPS_ARCH_X86_64 || NNOPS_ARCH_AARCH64

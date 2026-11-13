@@ -13,6 +13,7 @@
 
 #include "nnops/core/status.hpp"
 #include "nnops/core/tensor_view.hpp"
+#include "nnops/detail/bf16.hpp"  // bf16_enabled (arch gate)
 
 #include <cstddef>
 #include <span>
@@ -47,7 +48,12 @@ constexpr Status check_counts(size_t n_in, size_t n_out,
     return Status::ok;
 }
 
-/// Counts, plus every participating view must hold data.
+/// Counts, plus every participating view must hold data and carry a dtype this
+/// build implements. bf16 exists on AArch64 only; elsewhere a bf16 view is
+/// refused here — the one call every operator's compute() makes — so the call
+/// returns Status::unsupported instead of reaching a dispatch that has no bf16
+/// case. An operator that lists no dtype in validate() (the movement ops) is
+/// covered by the same gate.
 inline Status check_views(std::span<TensorView> outputs,
                           std::span<const TensorView> inputs,
                           size_t n_in_min, size_t n_in_max = size_t(-1),
@@ -56,16 +62,34 @@ inline Status check_views(std::span<TensorView> outputs,
     NNOPS_TRY(check_counts(inputs.size(), outputs.size(), n_in_min, n_in_max, n_out));
     for (size_t i = 0; i < inputs.size(); ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
+        if constexpr (!bf16_enabled) {
+            if (inputs[i].data_type() == DataType::bf16) {
+                return Status::unsupported;
+            }
+        }
     }
     for (size_t i = 0; i < n_out; ++i) {
         if (outputs[i].is_empty()) { return Status::invalid_argument; }
+        if constexpr (!bf16_enabled) {
+            if (outputs[i].data_type() == DataType::bf16) {
+                return Status::unsupported;
+            }
+        }
     }
     return Status::ok;
 }
 
+/// bf16 is a float type: it is admitted wherever f16 is admitted. Every CPU
+/// kernel that takes f16 takes it through the same f32-widening SIMD surface, so
+/// one list covers both; a gate that lists only the integer types still
+/// rejects it. The `bf16_enabled` half keeps an x86-64 build — where no bf16
+/// kernel exists — returning Status::unsupported from validate().
 template <DataType... Ds>
 constexpr bool dtype_in(DataType d) noexcept
 {
+    if (d == DataType::bf16) {
+        return bf16_enabled && ((Ds == DataType::f16) || ...);
+    }
     return ((d == Ds) || ...);
 }
 

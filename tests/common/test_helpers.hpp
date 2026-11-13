@@ -84,5 +84,62 @@ make_random_f16_tensor(std::initializer_list<int64_t> shape,
                                    min, max, seed);
 }
 
+// ============================================================
+// bf16 accumulation tolerance
+// ============================================================
+// The aarch64 bf16 GEMM accumulates in f32 inside a tile (BFMMLA) but the
+// kc-blocked loop carries partial sums through C, which is bf16, so the error
+// grows with K the same way the f16 kernels' does — only against a 8-bit
+// mantissa instead of 10, so the same shapes land ~1-3x further out (measured:
+// 0.014 vs f16's 0.013 at K = 40). x86 has no bf16 route at all; the value is
+// only there to keep the helper compiling where the dtype is refused.
+#if defined(NNOPS_ARCH_AARCH64)
+inline constexpr float kBF16AccumTol = 4e-1f;
+#else
+inline constexpr float kBF16AccumTol = 5e-2f;
+#endif
+
+// ============================================================
+// bf16 test helpers
+// ============================================================
+
+inline std::vector<nnops::backend::cpu::bfloat16> f32_to_bf16(const std::vector<float>& src) {
+    std::vector<nnops::backend::cpu::bfloat16> dst(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        simd::s_store(&dst[i], src[i]);
+    }
+    return dst;
+}
+
+inline std::vector<float> bf16_to_f32(const std::vector<nnops::backend::cpu::bfloat16>& src) {
+    std::vector<float> dst(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        dst[i] = simd::s_load(&src[i]);
+    }
+    return dst;
+}
+
+/// Returns (buffer, view); the buffer owns the data.
+inline std::pair<std::vector<nnops::backend::cpu::bfloat16>, TensorView>
+make_random_bf16_tensor(std::span<const int64_t> shape,
+                        float min = -1.0f, float max = 1.0f,
+                        uint64_t seed = 12345)
+{
+    auto [f32_buf, f32_view] = make_random_tensor(shape, min, max, seed);
+    auto bf16_buf = f32_to_bf16(f32_buf);
+    TensorView view(shape, DataType::bf16, bf16_buf.data(), f32_view.layout());
+    return {std::move(bf16_buf), view};
+}
+
+/// Overload for initializer_list convenience.
+inline std::pair<std::vector<nnops::backend::cpu::bfloat16>, TensorView>
+make_random_bf16_tensor(std::initializer_list<int64_t> shape,
+                        float min = -1.0f, float max = 1.0f,
+                        uint64_t seed = 12345)
+{
+    return make_random_bf16_tensor(std::span<const int64_t>(shape.begin(), shape.size()),
+                                   min, max, seed);
+}
+
 }  // namespace test
 }  // namespace nnops

@@ -109,6 +109,9 @@ void convert_channel_first_to_channel_last(const TensorView& src, TensorView& ds
     switch (src.data_type()) {
     case DataType::f32: channel_first_to_cl_impl<float>(src, dst, ctx); return;
     case DataType::f16: channel_first_to_cl_impl<half>(src, dst, ctx);  return;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: channel_first_to_cl_impl<bfloat16>(src, dst, ctx); return;
+#endif
     case DataType::s8:  channel_first_to_cl_impl<int8_t>(src, dst, ctx); return;
     case DataType::u8:  channel_first_to_cl_impl<uint8_t>(src, dst, ctx); return;
     default: NNOPS_ASSERT(!"convert_channel_first_to_channel_last: unsupported data type");
@@ -121,6 +124,9 @@ void convert_channel_last_to_channel_first(const TensorView& src, TensorView& ds
     switch (src.data_type()) {
     case DataType::f32: cl_to_channel_first_impl<float>(src, dst, ctx); return;
     case DataType::f16: cl_to_channel_first_impl<half>(src, dst, ctx);  return;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: cl_to_channel_first_impl<bfloat16>(src, dst, ctx); return;
+#endif
     case DataType::s8:  cl_to_channel_first_impl<int8_t>(src, dst, ctx); return;
     case DataType::u8:  cl_to_channel_first_impl<uint8_t>(src, dst, ctx); return;
     default: NNOPS_ASSERT(!"convert_channel_last_to_channel_first: unsupported data type");

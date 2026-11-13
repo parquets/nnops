@@ -295,7 +295,9 @@ inline void dwconv_channel_first_rows(T* out, const T* in, const T* w, float bia
                                const DwChannelFirstEdges& edges)
 {
     constexpr int64_t L = simd_lane_for<T>;
-    const T zero = static_cast<T>(0);
+    // T{}, not static_cast<T>(0): bf16's float and uint16-bit constructors make
+    // an int cast ambiguous, and the value-initialised bits are zero either way.
+    const T zero = T{};
     const auto v_bias = v_set1(out, bias);
 
     const int64_t sw = (SW != 0) ? SW : p.SW;

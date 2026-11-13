@@ -69,7 +69,7 @@ Status Linear::validate(std::span<const TensorDesc> inputs,
 
     const TensorDesc& x = inputs[0];
     const TensorDesc& w = inputs[1];
-    if ((x.dtype != DataType::f32 && x.dtype != DataType::f16) || w.dtype != x.dtype) {
+    if (!detail::dtype_in<DataType::f32, DataType::f16>(x.dtype) || w.dtype != x.dtype) {
         return Status::unsupported;
     }
     if (w.rank != 2 || w.dims[0] <= 0 || (w.dims[0] % 2) != 0) {

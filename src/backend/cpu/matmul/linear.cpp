@@ -30,6 +30,7 @@
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "backend/cpu/matmul/matmul.h"
+#include "backend/cpu/common/dtype_dispatch.hpp"
 #include "backend/cpu/common/memory_pool.hpp"
 #include "backend/cpu/simd_kernel/simd_epilogue.hpp"
 #include "backend/cpu/simd_kernel/tiled_map.hpp"
@@ -48,7 +49,7 @@ namespace {
 
 /// fp keeps X's dtype; the quantized path follows attrs.output_dtype, else f32.
 DataType linear_output_dtype(const LinearAttributes& attrs, DataType x_dt) noexcept {
-    if (x_dt == DataType::f32 || x_dt == DataType::f16) { return x_dt; }
+    if (is_float_dtype(x_dt)) { return x_dt; }
     switch (attrs.output_dtype) {
     case DataType::f16:
     case DataType::s32:
@@ -80,7 +81,7 @@ Status linear_gated_impl(const LinearAttributes& attrs, TensorView& output,
     if (!tmp) { return Status::out_of_memory; }
     int64_t tshape[2] = {rows, n2};
     TensorView mt(std::span<const int64_t>(tshape, 2),
-                  std::is_same_v<T, float> ? DataType::f32 : DataType::f16,
+                  flt_data_type<T>(),
                   tmp.get(), n2 * static_cast<int64_t>(sizeof(T)));
 
     MatMulAttributes ma;
@@ -173,10 +174,11 @@ Status linear_cpu(const LinearAttributes& attrs,
     const bool quant = is_int8_matmul(x_dt, w_dt);
     // A block-packed weight (q4_1) is self-describing and decodes to X's type
     // inside MatMul, so it pairs with a float activation only.
+    // A block stream decodes into f32/f16 only (MatMul's packs are typed), so a
+    // bf16 activation pairs with a raw fp weight.
     const bool block_rhs = is_block_packed_dtype(w_dt) &&
                            (x_dt == DataType::f32 || x_dt == DataType::f16);
-    NNOPS_ASSERT(quant || block_rhs ||
-                 (x_dt == w_dt && (x_dt == DataType::f32 || x_dt == DataType::f16)));
+    NNOPS_ASSERT(quant || block_rhs || (x_dt == w_dt && is_float_dtype(x_dt)));
     // Integer output -> int32 bias (MatMul's rule).
     const bool int_out = out_dt == DataType::s32 || out_dt == DataType::s8 ||
                          out_dt == DataType::u8;
@@ -212,6 +214,14 @@ Status linear_cpu(const LinearAttributes& attrs,
         minputs, has_bias ? size_t{3} : size_t{2});
 
     if (attrs.gated) {
+        if (x_dt == DataType::bf16) {
+#ifdef NNOPS_ARCH_AARCH64
+            return linear_gated_impl<bfloat16>(attrs, ov, min, ov.total_rows(),
+                                               w.shape(0), ctx, workspace);
+#else
+            return Status::unsupported;
+#endif
+        }
         return x_dt == DataType::f32
                    ? linear_gated_impl<float>(attrs, ov, min, ov.total_rows(),
                                               w.shape(0), ctx, workspace)
@@ -243,6 +253,12 @@ Status linear_cpu(const LinearAttributes& attrs,
 
         if (out_dt == DataType::f32) {
             residual_add<float>(ov, mt, ctx);
+        } else if (out_dt == DataType::bf16) {
+#ifdef NNOPS_ARCH_AARCH64
+            residual_add<bfloat16>(ov, mt, ctx);
+#else
+            return Status::unsupported;
+#endif
         } else {
             residual_add<half>(ov, mt, ctx);
         }

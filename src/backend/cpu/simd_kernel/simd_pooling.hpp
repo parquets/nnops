@@ -204,9 +204,15 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
 template <typename T>
 inline T pooling_fill(bool is_max) noexcept
 {
-    if (!is_max) { return static_cast<T>(0); }
+    if (!is_max) { return T{}; }
     if constexpr (std::is_same_v<T, half>) {
         return ::nnops::backend::cpu::float_to_half(-65504.0f);
+#ifdef NNOPS_ARCH_AARCH64
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        // bf16 also has no numeric_limits specialization; 0xFF7F is its most
+        // negative finite value (rounding FLT_MAX to bf16 would give -inf).
+        return ::nnops::backend::cpu::bfloat16_from_bits(0xFF7Fu);
+#endif
     } else {
         return std::numeric_limits<T>::lowest();
     }

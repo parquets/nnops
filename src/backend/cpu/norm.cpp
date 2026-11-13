@@ -721,7 +721,7 @@ void norm_quant_rows(const NormAttributes& attrs,
     const DataType x_dtype = X.data_type();
     const DataType y_dtype = output.data_type();
     const bool out_is_f32  = (y_dtype == DataType::f32);
-    const bool out_is_f16  = (y_dtype == DataType::f16);
+    const bool out_is_f16  = (y_dtype == DataType::f16);   // or bf16, narrowed below
     const bool is_i8       = (x_dtype == DataType::s8);
 
     const QuantParams& x_qp = X.quant_params();
@@ -787,11 +787,12 @@ void norm_quant_rows(const NormAttributes& attrs,
 
         if (out_is_f32) { return; }
 
-        if (out_is_f16) {
-            half* y_row = output.ptr<half>(row_idx);
-            for (int64_t i = 0; i < n; ++i) {
-                s_store(&y_row[i], rowbuf[i]);
-            }
+        if (out_is_f16 || y_dtype == DataType::bf16) {
+            dispatch_f32_f16(y_dtype, "norm_cpu", [&](auto tag) {
+                using U = typename decltype(tag)::type;
+                U* y_row = output.ptr<U>(row_idx);
+                for (int64_t i = 0; i < n; ++i) { s_store(&y_row[i], rowbuf[i]); }
+            });
             return;
         }
 
@@ -861,8 +862,7 @@ Status norm_quant_impl(const NormAttributes& attrs,
     }
 
     const DataType y_dtype = output.data_type();
-    if (y_dtype != DataType::f32 && y_dtype != DataType::f16 &&
-        !is_quantized_dtype(y_dtype)) {
+    if (!is_float_dtype(y_dtype) && !is_quantized_dtype(y_dtype)) {
         return Status::unsupported;
     }
     if (is_quantized_dtype(y_dtype)) {

@@ -29,8 +29,10 @@ inline T constant_of(float v)
 {
     if constexpr (std::is_same_v<T, float>) {
         return v;
-    } else if constexpr (std::is_same_v<T, half>) {
-        half h;
+    } else if constexpr (std::is_same_v<T, half> || std::is_same_v<T, bfloat16>) {
+        // The fp store form covers both 16-bit floats; the integer branch
+        // below would read numeric_limits, which neither of them specializes.
+        T h;
         simd::s_store(&h, v);
         return h;
     } else {
@@ -150,6 +152,9 @@ Status pad_cpu(const PadAttributes& attrs,
     switch (inputs[0].data_type()) {
     case DataType::f32: pad_impl<float>(attrs, output, inputs, ctx); return Status::ok;
     case DataType::f16: pad_impl<half>(attrs, output, inputs, ctx); return Status::ok;
+#ifdef NNOPS_ARCH_AARCH64
+    case DataType::bf16: pad_impl<bfloat16>(attrs, output, inputs, ctx); return Status::ok;
+#endif
     case DataType::s8:  pad_impl<int8_t>(attrs, output, inputs, ctx); return Status::ok;
     case DataType::u8:  pad_impl<uint8_t>(attrs, output, inputs, ctx); return Status::ok;
     case DataType::s32: pad_impl<int32_t>(attrs, output, inputs, ctx); return Status::ok;

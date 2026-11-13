@@ -128,10 +128,23 @@ constexpr int64_t gemm_align64(int64_t v) noexcept { return (v + 63) & ~int64_t{
 /// Elements of one packed-B panel at k-length @p kc. The MMA derives this
 /// stride itself from kc (mma_pack_align(nr_max·kc·esz), plus the int8
 /// correction block on x86), so every pack must agree with it exactly.
+///
+/// bf16's panel is BFMMLA's k-group layout rather than a dense nr_max×kc
+/// rectangle: ⌈kc/4⌉ groups of [colpair][8] for a 16-wide panel. Its k rounds
+/// up to the group, so the panel is wider than nr_max·kc when kc % 4 ≠ 0 —
+/// passing @p bf16 is what keeps the packer and the kernel's own advance equal.
 inline int64_t gemm_panel_slot(int64_t kc, int64_t nr_max, int64_t esz,
-                               bool quant) noexcept
+                               bool quant, bool bf16 = false) noexcept
 {
     if (quant) { return int8_panel_stride(kc); }
+#ifdef NNOPS_ARCH_AARCH64
+    if (bf16) {
+        (void)nr_max; (void)esz;
+        return arch::bf16_b_panel_stride(kc);
+    }
+#else
+    (void)bf16;
+#endif
     return static_cast<int64_t>(mma_pack_align(
         static_cast<size_t>(nr_max * kc) * static_cast<size_t>(esz))) / esz;
 }
@@ -140,9 +153,10 @@ inline int64_t gemm_panel_slot(int64_t kc, int64_t nr_max, int64_t esz,
 /// the channel-first route's whole oh-block, or the channel-last route's one
 /// (ic block, oc block) at the whole filter's kdim.
 inline int64_t gemm_set_elems(int64_t panels_per_oc, int64_t kdim,
-                              int64_t nr_max, int64_t esz, bool quant) noexcept
+                              int64_t nr_max, int64_t esz, bool quant,
+                              bool bf16 = false) noexcept
 {
-    return panels_per_oc * gemm_panel_slot(kdim, nr_max, esz, quant);
+    return panels_per_oc * gemm_panel_slot(kdim, nr_max, esz, quant, bf16);
 }
 
 /// Geometry of the channel-last prepacked filter (PackedHWIO): the blob is

@@ -105,6 +105,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -113,6 +114,7 @@
 
 using namespace nnops;
 using half = nnops::backend::cpu::half;
+using bfloat16 = nnops::backend::cpu::bfloat16;
 using nnops::backend::cpu::float_to_half;
 namespace cpu = nnops::backend::cpu;
 
@@ -154,11 +156,13 @@ struct BenchPool {
     inline static thread_local int current_thread_id_ = 0;
 };
 
-/// float -> f32, half -> f16.
+/// float -> f32, half -> f16, bfloat16 -> bf16.
 template <typename T>
 auto make_random(std::span<const int64_t> shape, uint64_t seed) {
     if constexpr (std::is_same_v<T, float>) {
         return test::make_random_tensor(shape, -1.0f, 1.0f, seed);
+    } else if constexpr (std::is_same_v<T, bfloat16>) {
+        return test::make_random_bf16_tensor(shape, -1.0f, 1.0f, seed);
     } else {
         return test::make_random_f16_tensor(shape, -1.0f, 1.0f, seed);
     }
@@ -518,6 +522,181 @@ void bench_wino_case(const WinoCase& c) {
     const std::vector<int> threads = conv_bench_threads();
     if (c.f16) { run_wino_ab<half>(c, threads, iters, rounds); }
     else       { run_wino_ab<float>(c, threads, iters, rounds); }
+}
+
+// ============================================================
+// f16 vs bf16 — the same case twice, interleaved (A B A B)
+// ============================================================
+//
+// The arms differ in nothing but the tensor dtype: same op, same attributes,
+// same buffers. bf16 has no route of its own — im2col and depthwise instantiate
+// their kernels for it and the packed B panel takes BFMMLA's k-group layout
+// (gemm_panel_slot(..., bf16) is what the packer and the kernel both advance by),
+// so the ratio is the bf16 MMA's rate against the f16 one's. Winograd has no bf16
+// row: its plan refuses the dtype, and Conv2D falls back to im2col.
+
+// std::span has no initializer_list constructor; give the single-output form a
+// helper so `run` stays a one-liner.
+template <typename Op>
+void run_single(Op& op, TensorView output, std::span<const TensorView> ins,
+                const ComputeContext& ctx) {
+    TensorView outs[] = {output};
+    op.compute(outs, ins, ctx, nullptr);
+}
+
+template <typename T>
+struct ConvArm {
+    std::vector<T> in_vec, w_vec, b_vec, out_vec;
+    std::vector<TensorView> ins;
+    TensorView output;
+    std::shared_ptr<Conv2D> op;
+    void run(const ComputeContext& ctx) const { run_single(*op, output, ins, ctx); }
+};
+
+template <typename T>
+ConvArm<T> make_conv_arm(const Conv2DCase& c, double& flops) {
+    ConvArm<T> a;
+    const int64_t ishape[] = {c.N, c.IC, c.IH, c.IW};
+    const int64_t wshape[] = {c.OC, c.IC / c.groups, c.KH, c.KW};
+
+    {
+        auto [v, view] = make_random<T>(ishape, 1);
+        a.in_vec = std::move(v);
+        a.ins.push_back(TensorView(view.shape_span(), view.data_type(),
+                                   a.in_vec.data(), view.layout()));
+    }
+    {
+        auto [v, view] = make_random<T>(wshape, 2);
+        a.w_vec = std::move(v);
+        a.ins.push_back(TensorView(view.shape_span(), view.data_type(),
+                                   a.w_vec.data(), view.layout()));
+    }
+    if (c.bias) {
+        const int64_t bshape[] = {c.OC};
+        auto [v, view] = make_random<T>(bshape, 3);
+        a.b_vec = std::move(v);
+        a.ins.push_back(TensorView(view.shape_span(), view.data_type(),
+                                   a.b_vec.data(), view.layout()));
+    }
+
+    Conv2DAttributes attrs{};
+    attrs.kernel_size = {c.KH, c.KW};
+    attrs.stride      = {c.SH, c.SW};
+    attrs.dilation    = {c.DH, c.DW};
+    attrs.padding     = {c.PH, c.PW};
+    attrs.groups      = c.groups;
+    a.op = std::shared_ptr<Conv2D>(Conv2D::create(attrs, Backend::CPU));
+
+    std::vector<TensorDesc> descs;
+    for (const auto& v : a.ins) { descs.push_back(v.desc()); }
+    const auto out_descs = a.op->getOutputTensorDesc(descs);
+
+    a.out_vec.assign(static_cast<size_t>(out_descs[0].numel()), T{});
+    a.output = test::make_channel_first(out_descs[0], a.out_vec.data());
+
+    const int64_t OH = out_descs[0].dims[2];
+    const int64_t OW = out_descs[0].dims[3];
+    flops = 2.0 * static_cast<double>(c.N) * c.OC * OH * OW *
+            static_cast<double>(c.IC / c.groups) * c.KH * c.KW;
+    return a;
+}
+
+template <typename T>
+struct DepthwiseArm {
+    std::vector<T> in_vec, w_vec, out_vec;
+    std::vector<TensorView> ins;
+    TensorView output;
+    std::shared_ptr<DepthwiseConv> op;
+    void run(const ComputeContext& ctx) const { run_single(*op, output, ins, ctx); }
+};
+
+template <typename T>
+DepthwiseArm<T> make_depthwise_arm(const DepthwiseCase& c, double& flops) {
+    DepthwiseArm<T> a;
+    const int64_t ishape[] = {c.N, c.C, c.IH, c.IW};
+    const int64_t wshape[] = {c.C, 1, c.KH, c.KW};
+
+    {
+        auto [v, view] = make_random<T>(ishape, 21);
+        a.in_vec = std::move(v);
+        a.ins.push_back(TensorView(view.shape_span(), view.data_type(),
+                                   a.in_vec.data(), view.layout()));
+    }
+    {
+        auto [v, view] = make_random<T>(wshape, 22);
+        a.w_vec = std::move(v);
+        a.ins.push_back(TensorView(view.shape_span(), view.data_type(),
+                                   a.w_vec.data(), view.layout()));
+    }
+
+    DepthwiseConvAttributes attrs{};
+    attrs.kernel_size = {1, c.KH, c.KW};
+    attrs.stride      = {1, c.SH, c.SW};
+    attrs.dilation    = {1, 1, 1};
+    attrs.padding     = {0, c.PH, c.PW};
+    a.op = std::shared_ptr<DepthwiseConv>(DepthwiseConv::create(attrs, Backend::CPU));
+
+    std::vector<TensorDesc> descs;
+    for (const auto& v : a.ins) { descs.push_back(v.desc()); }
+    const auto out_descs = a.op->getOutputTensorDesc(descs);
+
+    a.out_vec.assign(static_cast<size_t>(out_descs[0].numel()), T{});
+    a.output = test::make_channel_first(out_descs[0], a.out_vec.data());
+
+    const int64_t OH = out_descs[0].dims[2];
+    const int64_t OW = out_descs[0].dims[3];
+    flops = 2.0 * static_cast<double>(c.N) * c.C * OH * OW * c.KH * c.KW;
+    return a;
+}
+
+/// Time both arms at each thread count, A B A B per round; the second A is the
+/// null control. Median across rounds, min of each pair within a round.
+template <typename A, typename B>
+void print_dtype_ab(const char* name, const A& a, const B& b, double flops,
+                    int iters = 20, int rounds = 4) {
+    const std::vector<int> threads = conv_bench_threads();
+    std::printf("  %s\n", name);
+    for (int nt : threads) {
+        BenchPool pool(nt);
+        ComputeContext ctx;
+        ctx.cpu = pool.cpu;
+        const ComputeContext& use_ctx = (nt > 1) ? ctx : ComputeContext{};
+
+        for (int i = 0; i < 2; ++i) { a.run(use_ctx); b.run(use_ctx); }   // warm-up
+
+        std::vector<double> a_ms, b_ms, drift;
+        for (int r = 0; r < rounds; ++r) {
+            const double a1 = time_ms([&] { a.run(use_ctx); }, iters);
+            const double b1 = time_ms([&] { b.run(use_ctx); }, iters);
+            const double a2 = time_ms([&] { a.run(use_ctx); }, iters);   // null control
+            const double b2 = time_ms([&] { b.run(use_ctx); }, iters);
+            a_ms.push_back(std::min(a1, a2));
+            b_ms.push_back(std::min(b1, b2));
+            drift.push_back(std::fabs(a2 - a1) / std::min(a1, a2) * 100.0);
+        }
+        const double am = median_of(a_ms), bm = median_of(b_ms);
+        const double nf = median_of(drift);
+        char ratio[32];
+        std::snprintf(ratio, sizeof ratio, "%.2fx%s", am / bm,
+                      std::fabs(am / bm - 1.0) * 100.0 > nf ? "" : " (within noise)");
+        std::printf("    %2dT  f16 %7.1f GFLOPS (%7.3f ms) | bf16 %7.1f GFLOPS (%7.3f ms)"
+                    " | ratio %s | null %.1f%%\n",
+                    nt, flops / am / 1e6, am, flops / bm / 1e6, bm, ratio, nf);
+    }
+}
+
+void bench_conv_ab(const Conv2DCase& c) {
+    double fa = 0.0, fb = 0.0;
+    const auto a = make_conv_arm<half>(c, fa);
+    const auto b = make_conv_arm<bfloat16>(c, fb);
+    print_dtype_ab(c.name, a, b, fa);
+}
+
+void bench_depthwise_ab(const DepthwiseCase& c) {
+    double fa = 0.0, fb = 0.0;
+    const auto a = make_depthwise_arm<half>(c, fa);
+    const auto b = make_depthwise_arm<bfloat16>(c, fb);
+    print_dtype_ab(c.name, a, b, fa);
 }
 
 // ============================================================
@@ -1288,6 +1467,51 @@ NNOPS_BENCH(conv2d_f16_7x7) {
     bench_conv2d_case({"f16 7x7 1x64x56x56 -> 64 x 7x7 s1 p3", 1, 64, 56, 56, 64, 7, 7,
                        /*SH=*/1, /*SW=*/1, /*PH=*/3, /*PW=*/3, /*DH=*/1, /*DW=*/1, /*groups=*/1,
                        /*bias=*/false, /*f16=*/true});
+}
+
+// ============================================================
+// f16 vs bf16 — the f16 rows above, with both dtypes interleaved
+// ============================================================
+
+NNOPS_BENCH(conv2d_f16_vs_bf16_resnet_3x3) {
+    bench_conv_ab({"conv f16/bf16 resnet-block 1x64x56x56 -> 64 x 3x3 s1 p1",
+                   1, 64, 56, 56, 64, 3, 3, /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
+}
+
+NNOPS_BENCH(conv2d_f16_vs_bf16_resnet_first_7x7) {
+    bench_conv_ab({"conv f16/bf16 resnet-first 1x3x224x224 -> 64 x 7x7 s2 p3",
+                   1, 3, 224, 224, 64, 7, 7, /*SH=*/2, /*SW=*/2, /*PH=*/3, /*PW=*/3});
+}
+
+NNOPS_BENCH(conv2d_f16_vs_bf16_pointwise_1x1) {
+    bench_conv_ab({"conv f16/bf16 pointwise 1x256x28x28 -> 512 x 1x1 s1",
+                   1, 256, 28, 28, 512, 1, 1, /*SH=*/1, /*SW=*/1, /*PH=*/0, /*PW=*/0});
+}
+
+NNOPS_BENCH(conv2d_f16_vs_bf16_5x5) {
+    bench_conv_ab({"conv f16/bf16 5x5 1x64x56x56 -> 64 x 5x5 s1 p2",
+                   1, 64, 56, 56, 64, 5, 5, /*SH=*/1, /*SW=*/1, /*PH=*/2, /*PW=*/2});
+}
+
+NNOPS_BENCH(conv2d_f16_vs_bf16_256ch_3x3) {
+    bench_conv_ab({"conv f16/bf16 1x256x28x28 -> 256 x 3x3 s1 p1",
+                   1, 256, 28, 28, 256, 3, 3, /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
+}
+
+NNOPS_BENCH(conv2d_f16_vs_bf16_grouped_3x3) {
+    bench_conv_ab({"conv f16/bf16 grouped 1x256x28x28 -> 256 x 3x3 g256 s1 p1",
+                   1, 256, 28, 28, 256, 3, 3, /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1,
+                   /*DH=*/1, /*DW=*/1, /*groups=*/256});
+}
+
+NNOPS_BENCH(dwconv_f16_vs_bf16_3x3) {
+    bench_depthwise_ab({"dwconv f16/bf16 1x256x28x28 -> 3x3 s1 p1", 1, 256, 28, 28, 3, 3,
+                        /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
+}
+
+NNOPS_BENCH(dwconv_f16_vs_bf16_3x3_large) {
+    bench_depthwise_ab({"dwconv f16/bf16 1x256x56x56 -> 3x3 s1 p1", 1, 256, 56, 56, 3, 3,
+                        /*SH=*/1, /*SW=*/1, /*PH=*/1, /*PW=*/1});
 }
 
 NNOPS_BENCH(dwconv_f32_3x3) {

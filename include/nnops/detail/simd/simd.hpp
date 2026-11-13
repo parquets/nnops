@@ -28,6 +28,7 @@
 #include "nnops/detail/simd/vec_s8x16.hpp"
 #include "nnops/detail/simd/vec_u8x16.hpp"
 #include "nnops/detail/half.hpp"
+#include "nnops/detail/bf16.hpp"
 
 #include <type_traits>
 
@@ -97,6 +98,61 @@ inline void s_store(half* p, float v) {
     *p = ::nnops::backend::cpu::float_to_half(v);
 }
 
+// ---- bf16 ----
+//
+// bf16 *is* the top half of an f32, so the widening load is a shift and the
+// narrowing store is a round-to-nearest-even add plus a shift — no table, no
+// FEAT_BF16 needed. Only the matrix kernels' BFMMLA path uses the extension.
+// v_load returns and v_store takes v_f32x8, so every generic kernel (which
+// derives its vector type from v_load) computes in f32 and rounds once per
+// store, exactly like a half kernel on the widening routes.
+
+using ::nnops::backend::cpu::bfloat16;
+
+#if defined(NNOPS_ARCH_AARCH64)
+inline v_f32x8 v_cvt_bf16_to_f32(const uint16_t* p) {
+    const uint16x8_t u = vld1q_u16(p);
+    return v_f32x8(vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(u), 16)),
+                   vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(u), 16)));
+}
+inline void v_cvt_f32_to_bf16(uint16_t* p, const v_f32x8& a) {
+    const auto narrow = [](float32x4_t x) {
+        uint32x4_t u = vreinterpretq_u32_f32(x);
+        u = vaddq_u32(u, vaddq_u32(vdupq_n_u32(0x7FFFu),
+                                   vandq_u32(vshrq_n_u32(u, 16),
+                                             vdupq_n_u32(1u))));
+        return vshrn_n_u32(u, 16);
+    };
+    vst1q_u16(p, vcombine_u16(narrow(a.lo), narrow(a.hi)));
+}
+#else
+inline v_f32x8 v_cvt_bf16_to_f32(const uint16_t* p) {
+    float buf[8];
+    for (int i = 0; i < 8; ++i) { buf[i] = ::nnops::bf16_to_float(p[i]); }
+    return v_load(buf);
+}
+inline void v_cvt_f32_to_bf16(uint16_t* p, const v_f32x8& v) {
+    float buf[8];
+    v_store(buf, v);
+    for (int i = 0; i < 8; ++i) { p[i] = ::nnops::float_to_bf16(buf[i]); }
+}
+#endif
+
+inline v_f32x8 v_load(const bfloat16* p) {
+    return v_cvt_bf16_to_f32(reinterpret_cast<const uint16_t*>(p));
+}
+inline void v_store(bfloat16* p, const v_f32x8& v) {
+    v_cvt_f32_to_bf16(reinterpret_cast<uint16_t*>(p), v);
+}
+inline v_f32x8 v_set1(const bfloat16*, float s) { return v_set1_f32x8(s); }
+inline v_f32x8 v_zero(const bfloat16*) { return v_zero_f32x8(); }
+inline float s_load(const bfloat16* p) {
+    return ::nnops::backend::cpu::bfloat16_to_float(*p);
+}
+inline void s_store(bfloat16* p, float v) {
+    *p = ::nnops::backend::cpu::float_to_bfloat16(v);
+}
+
 // ---- Store-with-accumulate helpers (*ptr += val) ----
 template <typename Ptr, typename Vec>
 inline void v_store_add(Ptr ptr, const Vec& val, bool add_to) {
@@ -154,6 +210,29 @@ inline v_f16x8 v_load_stride2_even(const half* p) {
 inline v_f16x8 v_load_stride2_odd(const half* p) {
     return v_load_stride2_odd_f16x8(reinterpret_cast<const uint16_t*>(p));
 }
+
+// bf16 has no native deinterleave load; the stride-2 gathers widen scalar-wise.
+// Only the stride-2 channel-first pooling path takes them.
+inline v_f32x8x2_t v_deinterleave(const bfloat16* p) {
+    float even[8], odd[8];
+    for (int i = 0; i < 8; ++i) {
+        even[i] = s_load(p + 2 * i);
+        odd[i] = s_load(p + 2 * i + 1);
+    }
+    return {v_load(even), v_load(odd)};
+}
+inline v_f32x8 v_load_even(const bfloat16* p) {
+    float even[8];
+    for (int i = 0; i < 8; ++i) { even[i] = s_load(p + 2 * i); }
+    return v_load(even);
+}
+inline v_f32x8 v_load_odd(const bfloat16* p) {
+    float odd[8];
+    for (int i = 0; i < 8; ++i) { odd[i] = s_load(p + 2 * i + 1); }
+    return v_load(odd);
+}
+inline v_f32x8 v_load_stride2_even(const bfloat16* p) { return v_load_even(p); }
+inline v_f32x8 v_load_stride2_odd(const bfloat16* p) { return v_load_odd(p); }
 
 // ---- int8 / uint8 → f32 (8 lanes) ----
 
