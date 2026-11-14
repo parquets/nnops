@@ -59,7 +59,18 @@ struct PoolingKernelParams {
 
 // --- The channel driver: R output rows per call, IsMax picks the accumulate ---
 
-template <int R, int NV, bool IsMax, typename Src, typename Dst>
+/// Whether a window can hold no tap at all. Max needs a per-window count only
+/// then; a padding that reaches past the kernel on an axis, or a trailing
+/// window that starts beyond the plane, is the only way it happens.
+inline bool pooling_counts_taps(const PoolingKernelParams& p, bool is_max)
+{
+    if (!is_max) { return p.exclude_pad; }
+    return p.PH > (p.KH - 1) * p.DH || p.PW > (p.KW - 1) * p.DW ||
+           (p.OH > 0 && (p.OH - 1) * p.SH - p.PH >= p.IH) ||
+           (p.OW > 0 && (p.OW - 1) * p.SW - p.PW >= p.IW);
+}
+
+template <int R, int NV, bool IsMax, bool COUNT, typename Src, typename Dst>
 inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
                       const Src (&srcs)[NV], const Dst (&dsts)[NV])
 {
@@ -76,6 +87,8 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
     } else {
         vinit = vzero;
     }
+
+    constexpr bool count = COUNT;
 
     const int64_t nrow = p.KD * p.KH;
     InPtr row_base[kMaxTapRows];
@@ -146,7 +159,9 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
                         }
                     }
                     // Counted even for max: an all-pad window stores zero, not -inf.
-                    for (int r = 0; r < R; ++r) { cnt[r] += p.KW; }
+                    if constexpr (COUNT) {
+                        for (int r = 0; r < R; ++r) { cnt[r] += p.KW; }
+                    }
                     continue;
                 }
 
@@ -170,7 +185,9 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
                     }
                 }
                 for (int r = 0; r < R; ++r) {
-                    if (row[r] != nullptr) { cnt[r] += valid_kw; }
+                    if constexpr (COUNT) {
+                        if (row[r] != nullptr) { cnt[r] += valid_kw; }
+                    }
                 }
             }
         }
@@ -182,10 +199,14 @@ inline void pool_rows(const PoolingKernelParams& p, float avg_scale,
             for (int k = 0; k < NV; ++k) {
                 V v = acc[r][k];
                 if constexpr (IsMax) {
-                    if (cnt[r] == 0) { v = vzero; }
+                    if constexpr (COUNT) {
+                        if (cnt[r] == 0) { v = vzero; }
+                    }
                 } else if (p.exclude_pad) {
-                    if (cnt[r] > 0) {
-                        v = v_mul(v, srcs[k].set1(1.0f / static_cast<float>(cnt[r])));
+                    if constexpr (COUNT) {
+                        if (cnt[r] > 0) {
+                            v = v_mul(v, srcs[k].set1(1.0f / static_cast<float>(cnt[r])));
+                        }
                     }
                 } else {
                     v = v_mul(v, srcs[k].set1(avg_scale));
@@ -257,8 +278,11 @@ inline void pool_channel_first(T* out, const T* in, const PoolingKernelParams& p
     // Max: an all-pad window is 0 (the channel kernel zeroes it too).
     // Avg: exclude_pad divides by the tap count; with no padding the count is
     // uniform and this is a single scale.
-    const bool count_taps = IsMax ? (p.PD != 0 || p.PH != 0 || p.PW != 0)
-                                  : p.exclude_pad;
+    const bool count_taps = IsMax
+        ? (p.PH > (p.KH - 1) * p.DH || p.PW > (p.KW - 1) * p.DW ||
+           (p.OH > 0 && (p.OH - 1) * p.SH - p.PH >= p.IH) ||
+           (p.OW > 0 && (p.OW - 1) * p.SW - p.PW >= p.IW))
+        : p.exclude_pad;
 
     for (int64_t ow = 0; ow < p.OW; ow += L) {
         auto acc = IsMax ? v_set1(out, -std::numeric_limits<float>::infinity())
@@ -597,19 +621,142 @@ inline void pool_last(T* output, const T* input, const PoolingKernelParams& p,
                            kChannelLanes},
             FpDst<T, true>{output + kChannelLanes, p.out_row_stride, add_to,
                            p.pix_stride, kChannelLanes}};
-        pool_rows<4, 2, IsMax>(p, scale, src, dst);
+        pool_rows_counted<2, IsMax>(p, scale, src, dst);
         return;
     }
     if (lanes == kChannelLanes) {
         const FpSrc<T, true> src[1] = {FpSrc<T, true>{input, lanes}};
         const FpDst<T, true> dst[1] = {
             FpDst<T, true>{output, p.out_row_stride, add_to, p.pix_stride, lanes}};
-        pool_rows<4, 1, IsMax>(p, scale, src, dst);
+        pool_rows_counted<1, IsMax>(p, scale, src, dst);
     } else {
         const FpSrc<T, false> src[1] = {FpSrc<T, false>{input, lanes}};
         const FpDst<T, false> dst[1] = {
             FpDst<T, false>{output, p.out_row_stride, add_to, p.pix_stride, lanes}};
-        pool_rows<4, 1, IsMax>(p, scale, src, dst);
+        pool_rows_counted<1, IsMax>(p, scale, src, dst);
+    }
+}
+
+/// Straight-line 3x3 window on the channel lane: KD=1, DH=DW=1 and square
+/// strides, folds the nine taps into literal offsets and walks the column
+/// offsets, so the body carries no tap counter and no per-tap address
+/// multiply. Only the count-free case; a window that can be all padding keeps
+/// the rolled kernel that counts taps.
+template <int R, int NV, bool IsMax, int S, typename Src, typename Dst>
+inline void pool_rows_3x3(const PoolingKernelParams& p, float avg_scale,
+                          const Src (&srcs)[NV], const Dst (&dsts)[NV])
+{
+    using V = decltype(srcs[0].zero());
+    using InPtr = const typename Src::elem*;
+    constexpr int64_t kL = kChannelLanes;
+    constexpr int64_t kRows = (R - 1) * S + 3;
+    const V vzero = srcs[0].zero();
+    const V vinit = IsMax ? srcs[0].set1(-std::numeric_limits<float>::infinity())
+                          : vzero;
+    const int64_t pix = p.pix_stride;
+
+    const InPtr img = srcs[0].ptr_at(0);
+    InPtr row[kRows];
+    bool all_rows = true;
+    for (int64_t i = 0; i < kRows; ++i) {
+        const int64_t ih = p.oh * S + i - p.PH;
+        const bool ok = ih >= 0 && ih < p.IH;
+        row[i] = ok ? img + ih * p.in_row_stride : nullptr;
+        all_rows = all_rows && ok;
+    }
+
+    const int64_t ow_lo = (p.PW + S - 1) / S;
+    const int64_t last_hi = p.IW - 1 + p.PW - 2;
+    const int64_t ow_hi = (last_hi >= 0) ? last_hi / S : -1;
+    const int64_t off_lo = 0;
+    const int64_t off_hi = p.IW;
+    const int64_t ow_end = (p.ow_end >= 0) ? p.ow_end : p.OW;
+
+    for (int64_t ow = p.ow0; ow < ow_end; ++ow) {
+        V acc[R][NV];
+        for (int r = 0; r < R; ++r) {
+            for (int k = 0; k < NV; ++k) { acc[r][k] = vinit; }
+        }
+
+        if (all_rows && ow >= ow_lo && ow <= ow_hi) {
+            const int64_t o0 = (ow * S - p.PW) * pix;
+            const int64_t o1 = o0 + pix;
+            const int64_t o2 = o1 + pix;
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int r = 0; r < R; ++r) {
+                    const InPtr rp = row[r * S + kh];
+                    for (int k = 0; k < NV; ++k) {
+                        const InPtr q = rp + k * kL;
+                        const V a = srcs[k].load_ptr(q + o0);
+                        const V b = srcs[k].load_ptr(q + o1);
+                        const V c = srcs[k].load_ptr(q + o2);
+                        if constexpr (IsMax) {
+                            acc[r][k] = v_max(v_max(v_max(acc[r][k], a), b), c);
+                        } else {
+                            acc[r][k] = v_add(v_add(v_add(acc[r][k], a), b), c);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int kh = 0; kh < 3; ++kh) {
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int64_t off = ow * S + kw - p.PW;
+                    if (off < off_lo || off >= off_hi) { continue; }
+                    const int64_t at = off * pix;
+                    for (int r = 0; r < R; ++r) {
+                        const InPtr rp = row[r * S + kh];
+                        if (rp == nullptr) { continue; }
+                        for (int k = 0; k < NV; ++k) {
+                            const V a = srcs[k].load_ptr(rp + at + k * kL);
+                            if constexpr (IsMax) { acc[r][k] = v_max(acc[r][k], a); }
+                            else { acc[r][k] = v_add(acc[r][k], a); }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int r = 0; r < R; ++r) {
+            if (p.oh + r >= p.OH) { continue; }
+            for (int k = 0; k < NV; ++k) {
+                V v = acc[r][k];
+                if constexpr (!IsMax) { v = v_mul(v, srcs[k].set1(avg_scale)); }
+                dsts[k].store(r, ow, v);
+            }
+        }
+    }
+}
+
+template <int NV, bool IsMax, typename Src, typename Dst>
+inline bool pool_try_3x3(const PoolingKernelParams& p, float scale,
+                         const Src (&srcs)[NV], const Dst (&dsts)[NV])
+{
+    if constexpr (!Src::full) { return false; }
+    if (p.KD != 1 || p.KH != 3 || p.KW != 3 || p.DH != 1 || p.DW != 1 ||
+        p.SH != p.SW || pooling_counts_taps(p, IsMax)) {
+        return false;
+    }
+    if (p.SH == 1) {
+        pool_rows_3x3<4, NV, IsMax, 1>(p, scale, srcs, dsts);
+        return true;
+    }
+    if (p.SH == 2) {
+        pool_rows_3x3<4, NV, IsMax, 2>(p, scale, srcs, dsts);
+        return true;
+    }
+    return false;
+}
+
+template <int NV, bool IsMax, typename Src, typename Dst>
+inline void pool_rows_counted(const PoolingKernelParams& p, float scale,
+                              const Src (&srcs)[NV], const Dst (&dsts)[NV])
+{
+    if (pool_try_3x3<NV, IsMax>(p, scale, srcs, dsts)) { return; }
+    if (pooling_counts_taps(p, IsMax)) {
+        pool_rows<4, NV, IsMax, true>(p, scale, srcs, dsts);
+    } else {
+        pool_rows<4, NV, IsMax, false>(p, scale, srcs, dsts);
     }
 }
 
@@ -631,7 +778,7 @@ inline void pool_last_quant(OutT* output, const InT* input,
             QuantDst<OutT, true>{output + kChannelLanes, p.out_row_stride,
                                  out_scale, out_zero, add_to, p.pix_stride,
                                  kChannelLanes}};
-        pool_rows<4, 2, IsMax>(p, scale, src, dst);
+        pool_rows_counted<2, IsMax>(p, scale, src, dst);
         return;
     }
     if (lanes == kChannelLanes) {
@@ -640,14 +787,14 @@ inline void pool_last_quant(OutT* output, const InT* input,
         const QuantDst<OutT, true> dst[1] = {
             QuantDst<OutT, true>{output, p.out_row_stride, out_scale, out_zero,
                                  add_to, p.pix_stride, lanes}};
-        pool_rows<4, 1, IsMax>(p, scale, src, dst);
+        pool_rows_counted<1, IsMax>(p, scale, src, dst);
     } else {
         const QuantSrc<InT, false> src[1] = {
             QuantSrc<InT, false>{input, in_scale, in_zero, lanes}};
         const QuantDst<OutT, false> dst[1] = {
             QuantDst<OutT, false>{output, p.out_row_stride, out_scale, out_zero,
                                   add_to, p.pix_stride, lanes}};
-        pool_rows<4, 1, IsMax>(p, scale, src, dst);
+        pool_rows_counted<1, IsMax>(p, scale, src, dst);
     }
 }
 
