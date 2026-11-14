@@ -703,6 +703,7 @@ void run_misc_ops()
     }
 }
 
+#if defined(NNOPS_ARCH_AARCH64)
 NNOPS_TEST(bf16_elementwise) { run_elementwise(); }
 NNOPS_TEST(bf16_normalization) { run_normalization(); }
 NNOPS_TEST(bf16_conv) { run_conv(); }
@@ -710,6 +711,7 @@ NNOPS_TEST(bf16_matmul_family) { run_matmul_family(); }
 NNOPS_TEST(bf16_attention) { run_attention(); }
 NNOPS_TEST(bf16_pooling_and_movement) { run_pooling_and_movement(); }
 NNOPS_TEST(bf16_misc_ops) { run_misc_ops(); }
+#endif
 
 #if defined(NNOPS_ARCH_AARCH64)
 namespace {
@@ -817,7 +819,9 @@ NNOPS_TEST(bf16_mma_routes) {
 
 #if !defined(NNOPS_ARCH_AARCH64)
 NNOPS_TEST(bf16_unsupported_on_x86) {
-    // bf16 has no x86 kernel: validate() must refuse it rather than dispatch.
+    // bf16 has no x86 kernel, and the refusal lives in the shared view check
+    // that compute() runs — validate() is the descriptor-only twin and never
+    // dispatches, so it lists no dtype here either.
     LinearAttributes a;
     auto op = Linear::create(a, Backend::CPU);
     std::vector<float> x(4 * 16), w(8 * 16), b(8);
@@ -829,11 +833,17 @@ NNOPS_TEST(bf16_unsupported_on_x86) {
     TensorView bv(bs_shape, DataType::bf16, b.data());
     const TensorDesc ins[] = {xv.desc(), wv.desc(), bv.desc()};
     const auto od = op->getOutputTensorDesc(ins);
-    NNOPS_EXPECT_EQ(op->validate(ins, od), Status::unsupported);
+    NNOPS_EXPECT_EQ(od[0].dtype, DataType::bf16);
+    std::vector<uint8_t> y(4 * 8 * 2 + 64);
+    const int64_t ys_shape[] = {4, 8};
+    TensorView yv(ys_shape, od[0].dtype, y.data());
+    TensorView outs[] = {yv};
+    const TensorView lins[] = {xv, wv, bv};
+    NNOPS_EXPECT_EQ(op->compute(outs, lins), Status::unsupported);
 
-    // An operator that lists no dtype in validate() is caught by the shared
-    // view check instead, so compute() refuses rather than dispatching into a
-    // kernel that has no bf16 case.
+    // An operator that lists no dtype in validate() is caught by the same
+    // view check, so compute() refuses rather than dispatching into a kernel
+    // that has no bf16 case.
     TopKAttributes ta;
     ta.k = 2;
     auto topk = TopK::create(ta, Backend::CPU);

@@ -74,23 +74,22 @@ inline Status check_views(Backend be,
                           size_t n_out = 1) noexcept
 {
     NNOPS_TRY(check_counts(inputs.size(), outputs.size(), n_in_min, n_in_max, n_out));
-    // A build with no bf16 anywhere compiles the dtype scan out entirely, and
-    // with it this flag.
-    [[maybe_unused]] const bool bf16_ok = backend_has_bf16(be);
+    // The scan is unconditional even when the build carries bf16 on no backend
+    // at all: a bf16 view is still a bf16 view, and dispatching one into a
+    // kernel that has no bf16 case mis-runs the bytes. `backend_has_bf16` folds
+    // to a constant per backend, so the check is one dtype compare on every
+    // other build.
+    const bool bf16_ok = backend_has_bf16(be);
     for (size_t i = 0; i < inputs.size(); ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
-        if constexpr (bf16_enabled) {
-            if (!bf16_ok && inputs[i].data_type() == DataType::bf16) {
-                return Status::unsupported;
-            }
+        if (!bf16_ok && inputs[i].data_type() == DataType::bf16) {
+            return Status::unsupported;
         }
     }
     for (size_t i = 0; i < n_out; ++i) {
         if (outputs[i].is_empty()) { return Status::invalid_argument; }
-        if constexpr (bf16_enabled) {
-            if (!bf16_ok && outputs[i].data_type() == DataType::bf16) {
-                return Status::unsupported;
-            }
+        if (!bf16_ok && outputs[i].data_type() == DataType::bf16) {
+            return Status::unsupported;
         }
     }
     return Status::ok;
