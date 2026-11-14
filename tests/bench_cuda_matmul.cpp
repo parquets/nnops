@@ -38,7 +38,9 @@
 #include "common/cuda_test_helper.hpp"
 #include "common/cuda_bench_helper.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -131,6 +133,152 @@ void cublas_dense(cublasHandle_t h, int64_t m, int64_t n, int64_t k, DataType dt
     }
 }
 
+/// The transposed-B twin: `C = A·Bᵀ` with B stored `[n][k]`. cuBLAS reaches it
+/// as the column-major product `Cᵀ = B·Aᵀ`, which needs no copy — the operand
+/// row lengths and `n` for C are the leading dimensions either way.
+void cublas_dense_nt(cublasHandle_t h, int64_t m, int64_t n, int64_t k, DataType dt,
+                     const void* a, const void* b, void* c)
+{
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const int ni = int(n), mi = int(m), ki = int(k);
+    if (dt == DataType::f16) {
+        NNOPS_CUBLAS_CHECK(cublasGemmEx(
+            h, CUBLAS_OP_T, CUBLAS_OP_N, ni, mi, ki, &alpha, b, CUDA_R_16F, ki, a,
+            CUDA_R_16F, ki, &beta, c, CUDA_R_16F, ni, CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else {
+        NNOPS_CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, ni, mi, ki,
+                                       &alpha, static_cast<const float*>(b), ki,
+                                       static_cast<const float*>(a), ki, &beta,
+                                       static_cast<float*>(c), ni));
+    }
+}
+
+/// Both arms of one geometry, prepared once and then run alternately: a clock
+/// excursion moves the two together, and the ratio survives it. Running one arm
+/// to completion and then the other does not — the same kernel measured 10-13%
+/// apart across two processes, and back-to-back arms drift by as much.
+struct DenseArms {
+    HostTensor ha, hb, hc;      ///< nnops operands (host side, uploads once)
+    DeviceTensor da, db, dc;
+    std::unique_ptr<MatMul> op;
+    TensorView out;
+    std::vector<TensorView> ins;
+
+    HostTensor ga, gb, gc;      ///< the same geometry for cuBLAS
+    DeviceTensor gda, gdb, gdc;
+    cublasHandle_t handle = nullptr;
+
+    int64_t m = 0, n = 0, k = 0;
+    DataType dt = DataType::f32;
+
+    ~DenseArms()
+    {
+        if (handle != nullptr) { cublasDestroy(handle); }
+    }
+};
+
+/// One launch, bracketed by a pair of events. The caller reuses the events so
+/// the loop does not pay a create/destroy a sample.
+template <class F>
+double timed_launch(F&& launch, cudaEvent_t begin, cudaEvent_t end)
+{
+    NNOPS_CUDA_CHECK(cudaEventRecord(begin));
+    launch();
+    NNOPS_CUDA_CHECK(cudaEventRecord(end));
+    NNOPS_CUDA_CHECK(cudaEventSynchronize(end));
+    float elapsed = 0.0f;
+    NNOPS_CUDA_CHECK(cudaEventElapsedTime(&elapsed, begin, end));
+    return double(elapsed);
+}
+
+double median_of(std::vector<double> ms)
+{
+    const size_t mid = ms.size() / 2;
+    std::nth_element(ms.begin(), ms.begin() + std::ptrdiff_t(mid), ms.end());
+    return ms[mid];
+}
+
+void bench_vs_cublas(int64_t m, int64_t n, int64_t k, DataType dt, bool tb = false)
+{
+    DenseArms a;
+    a.m = m;
+    a.n = n;
+    a.k = k;
+    a.dt = dt;
+    const char* tag = dt == DataType::f32 ? "f32 nnops" : "f16 nnops";
+    const char* ctag = dt == DataType::f32 ? "f32 cublas" : "f16 cublas";
+
+    const std::vector<int64_t> b_shape = tb ? std::vector<int64_t>{n, k}
+                                            : std::vector<int64_t>{k, n};
+    a.ha = make_host_random(std::vector<int64_t>{m, k}, dt, false, 17, -0.5f, 0.5f);
+    a.hb = make_host_random(b_shape, dt, false, 29, -0.5f, 0.5f);
+    a.hc = make_host_zeroed(std::vector<int64_t>{m, n}, dt, false);
+    a.da = to_device(a.ha);
+    a.db = to_device(a.hb);
+    a.dc = to_device(a.hc);
+    MatMulAttributes attrs;
+    attrs.transpose_b = tb;
+    a.op = MatMul::create(attrs, Backend::CUDA);
+    a.ins = {a.da.view, a.db.view};
+    a.out = a.dc.view;
+
+    a.ga = make_host_random(std::vector<int64_t>{m, k}, dt, false, 17, -0.5f, 0.5f);
+    a.gb = make_host_random(b_shape, dt, false, 29, -0.5f, 0.5f);
+    a.gc = make_host_zeroed(std::vector<int64_t>{m, n}, dt, false);
+    a.gda = to_device(a.ga);
+    a.gdb = to_device(a.gb);
+    a.gdc = to_device(a.gc);
+    NNOPS_CUBLAS_CHECK(cublasCreate(&a.handle));
+
+    auto ours = [&] { cuda_launch(*a.op, a.out, a.ins); };
+    auto theirs = [&] {
+        if (tb) {
+            cublas_dense_nt(a.handle, m, n, k, dt, a.gda.buf.data(),
+                            a.gdb.buf.data(), a.gdc.buf.data());
+        } else {
+            cublas_dense(a.handle, m, n, k, dt, a.gda.buf.data(), a.gdb.buf.data(),
+                         a.gdc.buf.data());
+        }
+    };
+
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end = nullptr;
+    NNOPS_CUDA_CHECK(cudaEventCreate(&begin));
+    NNOPS_CUDA_CHECK(cudaEventCreate(&end));
+
+    CudaBuffer::sync();
+    ours();
+    theirs();
+    CudaBuffer::sync();
+
+    // Twelve samples each, alternating which arm leads, so neither side always
+    // runs into the same cache and clock state.
+    std::vector<double> ms_ours;
+    std::vector<double> ms_theirs;
+    for (int i = 0; i < 12; ++i) {
+        if (i % 2 == 0) {
+            ms_ours.push_back(timed_launch(ours, begin, end));
+            ms_theirs.push_back(timed_launch(theirs, begin, end));
+        } else {
+            ms_theirs.push_back(timed_launch(theirs, begin, end));
+            ms_ours.push_back(timed_launch(ours, begin, end));
+        }
+    }
+    NNOPS_CUDA_CHECK(cudaEventDestroy(begin));
+    NNOPS_CUDA_CHECK(cudaEventDestroy(end));
+
+    const double om = median_of(ms_ours);
+    const double tm = median_of(ms_theirs);
+    const double flops = 2.0 * double(m) * double(n) * double(k);
+    const std::string geo = matmul_geometry(m, n, k, false, tb);
+    print_cuda_row(tag, geo, om, cuda_gflops(om, flops));
+    print_cuda_row(ctag, geo, tm, cuda_gflops(tm, flops));
+    std::printf("  %-18s %-34s %9.4f x   nnops / cublas\n", "ratio", geo.c_str(),
+                om / tm);
+}
+
 /// cuBLAS on freshly allocated bytes — the reference arm of `run_dense`. Same
 /// timing helper, same warm-up, so the two rows are directly comparable.
 double run_cublas(int64_t m, int64_t n, int64_t k, DataType dt, const char* tag)
@@ -220,18 +368,32 @@ NNOPS_BENCH(cuda_matmul_transposes) {
 
 NNOPS_BENCH(cuda_matmul_cublas) {
     print_cuda_header("CUDA MatMul vs cuBLAS");
-    const int64_t sizes[] = {512, 1024, 2048, 4096};
-    for (int64_t s : sizes) {
+    // The squares, then the two oblongs a graph actually asks for: a prefill
+    // product (a few hundred rows against a deep k) and the decode one.
+    const int64_t shapes[][3] = {{512, 512, 512},   {1024, 1024, 1024},
+                                 {2048, 2048, 2048}, {4096, 4096, 4096},
+                                 {512, 4096, 4096}, {16, 4096, 4096}};
+    for (const auto& s : shapes) {
         for (DataType dt : {DataType::f32, DataType::f16}) {
-            const char* tag = dt == DataType::f32 ? "f32 nnops" : "f16 nnops";
-            const char* ctag = dt == DataType::f32 ? "f32 cublas" : "f16 cublas";
-            const double ours =
-                run_dense(s, s, s, dt, false, false, Epilogue{}, false, tag);
-            const double theirs = run_cublas(s, s, s, dt, ctag);
-            std::printf("  %-18s %-34s %9.4f x   nnops / cublas\n", "ratio",
-                        matmul_geometry(s, s, s, false, false).c_str(),
-                        ours / theirs);
+            bench_vs_cublas(s[0], s[1], s[2], dt);
         }
+    }
+}
+
+/// The decode product alone, so `NNOPS_CUDA_SPLITK` can sweep its narrow-m
+/// split count without the squares in the same run also seeing the knob. The
+/// `tb` rows are the same products as `Linear` asks for them, with the weight
+/// stored `[n][k]`.
+NNOPS_BENCH(cuda_matmul_decode) {
+    print_cuda_header("CUDA MatMul decode shapes vs cuBLAS");
+    for (DataType dt : {DataType::f32, DataType::f16}) {
+        bench_vs_cublas(16, 4096, 4096, dt);
+        bench_vs_cublas(16, 8192, 2048, dt);
+        bench_vs_cublas(16, 2048, 8192, dt);
+        bench_vs_cublas(16, 4096, 4096, dt, true);
+        bench_vs_cublas(16, 8192, 2048, dt, true);
+        bench_vs_cublas(16, 2048, 8192, dt, true);
+        bench_vs_cublas(1, 4096, 4096, dt, true);
     }
 }
 

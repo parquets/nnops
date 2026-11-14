@@ -164,12 +164,14 @@ NNOPS_TEST(cuda_matmul_f16_shapes) {
     }
 }
 
-NNOPS_TEST(cuda_matmul_f16_wide_tile) {
-    // The f16 launcher takes the 64x128 tile only on a deep grid *and* a long k
-    // loop, so this is the smallest pair of geometries that reaches it: one that
-    // divides both tile axes, one where both overhang (the N tail is the wide
-    // tile's own risk — its masked fill and its 128-wide B panel). The oracle is
-    // the CPU route, which is why these two cases cost seconds, not milliseconds.
+NNOPS_TEST(cuda_matmul_f16_paired_tile) {
+    // The f16 launcher pairs two 64-wide tiles into one 256-thread block only on
+    // a grid of at least one full wave *and* a long k loop, so this is the
+    // smallest pair of geometries that reaches it: one that divides both tile
+    // axes, one where both overhang (the N tail is the paired CTA's own risk —
+    // its odd group has no tile at all, and the second B panel is masked). The
+    // oracle is the CPU route, which is why these two cases cost seconds, not
+    // milliseconds.
     const int64_t shapes[][2] = {{2048, 4096}, {2057, 4103}};
     bool transpose_b = false;
     for (const auto& s : shapes) {
@@ -179,7 +181,7 @@ NNOPS_TEST(cuda_matmul_f16_wide_tile) {
         c.a_shape = {s[0], 4096};
         c.b_shape = c.transpose_b ? std::vector<int64_t>{s[1], 4096}
                                   : std::vector<int64_t>{4096, s[1]};
-        run_case(c, "cuda_matmul_f16_wide_tile");
+        run_case(c, "cuda_matmul_f16_paired_tile");
         transpose_b = true;  // the second B layout, on the tail geometry
     }
 }
