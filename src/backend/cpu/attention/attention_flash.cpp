@@ -41,6 +41,9 @@ void attention_flash_impl(const AttentionConfig& cfg,
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
     const bool has_mask = has_mask_input(cfg, inputs);
+    const bool has_bias = mask_is_head_bias(cfg, inputs);
+    const int64_t bias_rs = has_mask
+        ? inputs[mask_slot(cfg)].row_stride_elems() : 0;
     const bool split = has_past_view(cfg, inputs);
     const auto& Kp = split ? inputs[past_slot(cfg)] : K;
     const auto& Vp = split ? inputs[past_slot(cfg) + (cfg.v_is_k ? 0 : 1)] : V;
@@ -154,12 +157,15 @@ void attention_flash_impl(const AttentionConfig& cfg,
         const int64_t kv_end = cfg.causal
             ? causal_limit(cfg, i0 + actual_br - 1, Sq, run_len)
             : run_len;
+        // The window's lower bound grows with the query row, so the block's
+        // first row has the smallest one: KV tiles below it are fully masked
+        // for every row and the stream can start there.
+        int64_t j0 = key_lo(cfg, i0, Sq, run_len);
 
         // o_acc is written by the first KV block (zero_mode) — no pre-zeroing
         // pass. The exp_diff rescale may touch it first on the first block;
         // that garbage is fully overwritten by the first MMA.
         bool first_tile = true;
-        int64_t j0 = 0;
         while (j0 < kv_end) {
             const int seg = (j0 < seg_lo[1]) ? 0 : 1;
             const int64_t seg_end = std::min(seg_hi[seg], kv_end);
@@ -190,27 +196,47 @@ void attention_flash_impl(const AttentionConfig& cfg,
                                         pack_b, /*ldb=*/-1, /*stage=*/nullptr, kNegInf, kPosInf, k0 == 0);
             }
 
-            // ---- additive mask (flat [Sq, Sk]) and/or the causal tail ----
-            // Both are per-row, so one pass does both: add the mask over the
-            // row's valid prefix, then fill the out-of-range tail with -inf.
-            if (mask_ptr || cfg.causal) {
+            // ---- softcap, additive mask and the out-of-range lanes ----
+            // The cap is part of the logit, so it runs before the mask. The
+            // mask, the causal tail and the window prefix are all per-row, so
+            // one pass covers them: add the mask over the row's valid range
+            // [n0, n1), then fill the rest of the tile with -inf.
+            if (cfg.softcap > 0.0f) {
                 for (int i = 0; i < actual_br; ++i) {
-                    const int64_t lim = causal_limit(cfg, i0 + i, Sq, run_len);
-                    int64_t n = lim - j0;
-                    if (n < 0) { n = 0; }
-                    if (n > actual_bc) { n = actual_bc; }
+                    row_softcap(s + i * actual_bc, actual_bc, 1.0f, cfg.softcap);
+                }
+            }
+            if (mask_ptr || cfg.causal || cfg.window > 0) {
+                for (int i = 0; i < actual_br; ++i) {
+                    const int64_t row_i = i0 + i;
+                    const int64_t lo_i = key_lo(cfg, row_i, Sq, run_len);
+                    const int64_t lim = causal_limit(cfg, row_i, Sq, run_len);
+                    int64_t n0 = lo_i - j0;
+                    int64_t n1 = lim - j0;
+                    if (n0 < 0) { n0 = 0; }
+                    if (n0 > actual_bc) { n0 = actual_bc; }
+                    if (n1 < n0) { n1 = n0; }
+                    if (n1 > actual_bc) { n1 = actual_bc; }
+                    const int64_t n = n1 - n0;
                     T* srow = s + i * actual_bc;
                     if (mask_ptr) {
-                        const T* mrow = mask_ptr + (i0 + i) * Sk + j0;
+                        const T* mrow = has_bias
+                            ? mask_ptr + head_bias_row_offset(b, h, row_i, H, Sq, bias_rs)
+                                       + j0 + n0
+                            : mask_ptr + row_i * Sk + j0 + n0;
                         int64_t j = 0;
                         for (; j + L <= n; j += L) {
-                            simd::v_store(srow + j, simd::v_add(simd::v_load(srow + j), simd::v_load(mrow + j)));
+                            simd::v_store(srow + n0 + j,
+                                simd::v_add(simd::v_load(srow + n0 + j), simd::v_load(mrow + j)));
                         }
                         for (; j < n; ++j) {
-                            simd::s_store(&srow[j], simd::s_load(&srow[j]) + simd::s_load(&mrow[j]));
+                            simd::s_store(&srow[n0 + j],
+                                simd::s_load(&srow[n0 + j]) + simd::s_load(&mrow[j]));
                         }
                     }
-                    row_fill(srow + n, actual_bc - n, -std::numeric_limits<float>::infinity());
+                    row_fill(srow, n0, -std::numeric_limits<float>::infinity());
+                    row_fill(srow + n1, actual_bc - n1,
+                             -std::numeric_limits<float>::infinity());
                 }
             }
 

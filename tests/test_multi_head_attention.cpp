@@ -749,3 +749,60 @@ NNOPS_TEST(attention_f16_flash_matches_ref) {
                                  std::to_string(worst) + " > tol " + std::to_string(tol));
     }
 }
+
+// ============================================================
+// Output gate (Qwen3-Next / 3.5 / 4)
+// ============================================================
+
+NNOPS_TEST(attention_output_gate_hand) {
+    // output_gate maps onto the shared core's gate pass: the gated output is
+    // the plain one times act(gate), element for element.
+    auto [q_vec, q] = test::make_random_tensor({2, 3, 2 * 8}, -1.0f, 1.0f, 400);
+    auto [k_vec, k] = test::make_random_tensor({2, 5, 2 * 8}, -1.0f, 1.0f, 401);
+    auto [v_vec, v] = test::make_random_tensor({2, 5, 2 * 8}, -1.0f, 1.0f, 402);
+    auto [g_vec, g] = test::make_random_tensor({2, 3, 2 * 8}, -4.0f, 4.0f, 403);
+
+    MultiHeadAttentionAttributes attrs;
+    attrs.num_heads = 2;
+    attrs.causal = true;
+
+    const TensorDesc descs[] = {q.desc(), k.desc(), v.desc()};
+    auto op = MultiHeadAttention::create(attrs, Backend::CPU);
+    const auto out_descs = op->getOutputTensorDesc(descs);
+    const int64_t n = out_descs[0].numel();
+
+    std::vector<float> plain(static_cast<size_t>(n));
+    auto plain_out = test::make_channel_first(out_descs[0], plain.data());
+    const TensorView in_plain[] = {q, k, v};
+    NNOPS_EXPECT_TRUE(op->compute(plain_out, in_plain) == Status::ok);
+
+    MultiHeadAttentionAttributes gated = attrs;
+    gated.output_gate = EpilogueActivateType::Sigmoid;
+    auto gop = MultiHeadAttention::create(gated, Backend::CPU);
+    std::vector<float> got(static_cast<size_t>(n));
+    auto got_out = test::make_channel_first(out_descs[0], got.data());
+    const TensorView empty;
+    const TensorView in_gated[] = {q, k, v, empty, empty, empty, empty,
+                                   empty, empty, g};
+    NNOPS_EXPECT_TRUE(gop->compute(got_out, in_gated) == Status::ok);
+
+    for (int64_t i = 0; i < n; ++i) {
+        const float want = plain[static_cast<size_t>(i)] /
+                           (1.0f + std::exp(-g_vec[static_cast<size_t>(i)]));
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)], want, 1e-5f);
+    }
+
+    // The slot is required when the attribute is set, and refused when it is
+    // not — an unused trailing gate would be dead weight in the call.
+    const TensorDesc out_desc[] = {out_descs[0]};
+    {
+        const TensorDesc ins[] = {q.desc(), k.desc(), v.desc()};
+        NNOPS_EXPECT_TRUE(gop->validate(ins, out_desc) == Status::invalid_argument);
+    }
+    {
+        const TensorDesc none;
+        const TensorDesc ins[] = {q.desc(), k.desc(), v.desc(), none, none, none,
+                                  none, none, none, g.desc()};
+        NNOPS_EXPECT_TRUE(op->validate(ins, out_desc) == Status::invalid_argument);
+    }
+}

@@ -12,9 +12,13 @@
 ///   [0] Q [B, Sq, H·D]    or [B, H,   Sq, D]
 ///   [1] K [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
 ///   [2] V [B, Sk, H_kv·D] or [B, H_kv, Sk, D]
-///   [3] optional additive mask, flat [Sq, Sk], shared by every batch and head.
+///   [3] optional additive mask, flat [Sq, Sk] shared by every batch and head,
+///       or a per-head bias [B, H, Sq, Sk].
 ///   [4] optional past K, [5] optional past V — same layout as K/V, past rows.
 ///   [6] optional per-batch key-run length, int32 [B] (see below).
+///   [7]/[8] optional cu_seqlens_q / cu_seqlens_k, int32 [segments + 1] (see
+///           Varlen below).
+///   [9] optional output gate, shaped like the output (see output_gate).
 /// The output follows Q's shape. scale = 0 means 1/sqrt(D).
 ///
 /// `causal` (default true, as in onnxruntime's GroupQueryAttention) masks query
@@ -43,11 +47,26 @@
 /// bottom-right q0 = seqlens_k[b] - Sq unless position_offset is given (a
 /// scalar, so it applies to every batch). Absent, each batch runs to the full
 /// Sk. The mask, if any, remains a single flat [Sq, Sk] shared by all batches.
+///
+/// `softcap` and `window` are the Gemma-style logit cap and sliding window; see
+/// the attributes. The window lowers each row's first visible key to
+/// pos_i - window + 1, and the cap rewrites the scaled score before the mask.
+///
+/// Varlen (inputs[7]/[8]): `cu_seqlens_q` and `cu_seqlens_k` are the int32
+/// [segments + 1] prefix offsets of a packed batch — Q is [1, total_q, H·D],
+/// K/V are [1, total_kv, ...], and segment s owns query rows
+/// [cu_q[s], cu_q[s+1]) and key rows [cu_k[s], cu_k[s+1]). No query attends
+/// across a segment boundary, and each segment is bottom-right aligned on its
+/// own key run (cu_k[s+1] - cu_k[s] >= its query count). The pair is exclusive
+/// with the mask, the past pair, seqlens_k and position_offset — one packed call
+/// carries many independent documents, so a shared mask or a global position
+/// has no meaning.
 
 #include "nnops/core/op_base.hpp"
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
+#include "nnops/core/epilogue.hpp"
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -71,6 +90,22 @@ struct GroupQueryAttentionAttributes {
     /// consulted when causal. With a past segment, the chunked-prefill value is
     /// the past length.
     int64_t position_offset = -1;
+
+    /// Logit softcap (Gemma2/3): s = softcap·tanh(s/softcap), applied to the
+    /// scaled score and before the mask. 0 disables.
+    float softcap = 0.0f;
+
+    /// Sliding-window attention (Gemma2/3 local layers, Mistral): query row i
+    /// also skips keys older than its position minus window + 1. 0 disables.
+    int64_t window = 0;
+
+    /// Output gate (Qwen3-Next / 3.5 / 4): multiply the attention output by
+    /// `act(gate)`, where the gate is a trailing input shaped exactly like Q
+    /// (the output). Sigmoid is the Qwen form; None disables. One elementwise
+    /// pass after the route wrote the output, in place — the two kernels
+    /// (activation, multiply) the caller would otherwise run over the hidden,
+    /// folded into one.
+    EpilogueActivateType output_gate = EpilogueActivateType::None;
 };
 
 class GroupQueryAttention : public OpBase {

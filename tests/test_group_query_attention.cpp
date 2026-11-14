@@ -65,6 +65,10 @@ struct Case {
     int64_t position_offset = -1;  // absolute position of query row 0
     int route = -1;                // 0 standard, 1 flash, 2 decode; -1 unchecked
     std::vector<int32_t> seqlens;  // per-batch key-run lengths; empty = absent
+    float softcap = 0.0f;          // logit cap; 0 = off
+    int64_t window = 0;            // sliding window; 0 = off
+    bool head_bias = false;        // mask as [B, H, Sq, Sk] instead of [Sq, Sk]
+    EpilogueActivateType gate = EpilogueActivateType::None;  // output gate
 };
 
 /// @p past_shape with the sequence dim replaced by @p past.
@@ -137,7 +141,11 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     TensorView mask;
     if (c.mask) {
         const int64_t sq = c.qshape.size() == 3 ? c.qshape[1] : c.qshape[2];
-        auto [mv, m] = test::make_random_tensor({sq, sk_all}, -2.0f, 2.0f, 103);
+        // A head bias carries the batch and head axes; the flat mask does not.
+        const std::vector<int64_t> mshape = c.head_bias
+            ? std::vector<int64_t>{c.qshape[0], c.heads, sq, sk_all}
+            : std::vector<int64_t>{sq, sk_all};
+        auto [mv, m] = test::make_random_tensor(mshape, -2.0f, 2.0f, 103);
         m_vec = std::move(mv);
         mask  = m;
     }
@@ -148,6 +156,9 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     attrs.scale        = c.scale;
     attrs.causal       = c.causal;
     attrs.position_offset = c.position_offset;
+    attrs.softcap      = c.softcap;
+    attrs.window       = c.window;
+    attrs.output_gate  = c.gate;
 
     auto op = GroupQueryAttention::create(attrs, Backend::CPU);
 
@@ -160,6 +171,7 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
         sl_view = TensorView(sl_shape, DataType::s32, sl_vec.data());
     }
 
+    std::vector<float> gate_vec;
     const bool has_seqlens = !sl_vec.empty();
     std::vector<TensorDesc> descs = {q.desc(), k.desc(), v.desc()};
     std::vector<TensorView> ins   = {q, k, v};
@@ -187,6 +199,18 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
         descs.push_back(sl_view.desc());
         ins.push_back(sl_view);
     }
+    if (c.gate != EpilogueActivateType::None) {
+        // The gate is the last slot and is shaped like the output, so the
+        // absent metadata slots before it must still be filled positionally.
+        auto [gv, gt] = test::make_random_tensor(c.qshape, -3.0f, 3.0f, 106);
+        while (ins.size() < 9) {
+            descs.push_back(TensorDesc{});
+            ins.push_back(TensorView{});
+        }
+        descs.push_back(gt.desc());
+        ins.push_back(gt);
+        gate_vec = std::move(gv);
+    }
     auto out_descs = op->getOutputTensorDesc(descs);
     const int64_t out_numel = out_descs[0].numel();
 
@@ -195,6 +219,8 @@ bool gqa_fast_vs_ref(const Case& c, bool& used_flash, cpu::AttentionPlan* plan_o
     pcfg.num_kv_heads = c.kv_heads;
     pcfg.causal = c.causal;
     pcfg.position_offset = c.position_offset;
+    pcfg.softcap = c.softcap;
+    pcfg.window = c.window;
     const cpu::AttentionPlan plan = cpu::get_attention_plan(
         pcfg, descs, out_descs,
         pool != nullptr ? pool->worker_count() : 1,
@@ -718,5 +744,603 @@ NNOPS_TEST(gqa_f16_decode_split_matches_ref) {
     if (worst > test::kF16AccumTol) {
         throw std::runtime_error("gqa f16 decode deviation " + std::to_string(worst) +
                                  " > tol " + std::to_string(test::kF16AccumTol));
+    }
+}
+
+// ============================================================
+// Logit softcap (Gemma2/3)
+// ============================================================
+
+NNOPS_TEST(gqa_softcap_matches_ref) {
+    // s = cap·tanh(s/cap) on the *scaled* logit and before the mask, so the cap
+    // sees q·k alone and the bias is added to the already-capped score. Every
+    // route has its own spelling of that order: the standard row pass, the
+    // flash tile pass, and the decode route, where the cap absorbs the scale
+    // and the exponential runs unscaled.
+    const Case cases[] = {
+        // Standard route.
+        {{1, 6, 4 * 8},   {1, 9, 2 * 8},   4, 2, 0.0f, true,  false, 0, -1, 0,
+         {}, 2.0f},
+        // Cap + mask: capping the biased logit instead would move the result.
+        {{1, 6, 4 * 8},   {1, 9, 2 * 8},   4, 2, 0.0f, true,  true,  0, -1, 0,
+         {}, 1.0f},
+        // Non-causal: every key enters the cap.
+        {{1, 5, 2 * 16},  {1, 7, 1 * 16},  2, 1, 0.0f, false, false, 0, -1, 0,
+         {}, 0.75f},
+        // Flash route.
+        {{1, 256, 2 * 64}, {1, 300, 1 * 64}, 2, 1, 0.0f, true, false, 0, -1, 1,
+         {}, 1.5f},
+        // Flash + head bias.
+        {{1, 256, 2 * 64}, {1, 300, 1 * 64}, 2, 1, 0.0f, true, true,  0, -1, 1,
+         {}, 1.5f, 0, true},
+        // Decode: the scale folds into the cap pass.
+        {{2, 1, 8 * 8},   {2, 300, 2 * 8}, 8, 2, 0.0f, true,  false, 0, -1, 2,
+         {}, 3.0f},
+        // Split [past | new] run down the flash route.
+        {{1, 4, 4 * 16},  {1, 4, 2 * 16},  4, 2, 0.0f, true,  false, 61, 61, 1,
+         {}, 2.0f},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
+    }
+}
+
+NNOPS_TEST(gqa_softcap_decode_split_matches_ref) {
+    // A KV-sliced decode with a softcap: each slice caps its own raw dots and
+    // leads with an unscaled max, and the merge reweights by
+    // exp((m - M)·1) — the cap already owns the scale.
+    SimplePool pool(8);
+    const Case cases[] = {
+        {{2, 1, 8 * 32}, {2, 1, 2 * 32}, 8, 2, 0.0f, true, false, 1000, -1, 2,
+         {}, 2.0f},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        cpu::AttentionPlan plan;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash, &plan, &pool.cpu));
+        NNOPS_EXPECT_TRUE(plan.use_decode);
+        NNOPS_EXPECT_TRUE(plan.decode_splits > 1);
+    }
+}
+
+// ============================================================
+// Sliding-window attention
+// ============================================================
+
+NNOPS_TEST(gqa_window_matches_ref) {
+    // Row i's valid range is [pos_i - window + 1, causal limit): the window
+    // raises the lower bound instead of lowering the upper one, and both clamp
+    // to the batch's run.
+    const Case cases[] = {
+        // Causal square: row i sees [i - 2, i].
+        {{1, 8, 4 * 8},   {1, 8, 2 * 8},   4, 2, 0.0f, true,  false, 0, -1, 0,
+         {}, 0.0f, 3},
+        // Non-causal: the upper bound stays the run, only the start moves.
+        {{1, 8, 4 * 8},   {1, 12, 2 * 8},  4, 2, 0.0f, false, false, 0, -1, 0,
+         {}, 0.0f, 4},
+        // A window wider than the run is a no-op.
+        {{1, 5, 4 * 8},   {1, 9, 2 * 8},   4, 2, 0.0f, true,  false, 0, -1, 0,
+         {}, 0.0f, 64},
+        // Sliding decode.
+        {{1, 1, 8 * 8},   {1, 500, 1 * 8}, 8, 1, 0.0f, true,  false, 0, -1, 2,
+         {}, 0.0f, 16},
+        // Split [past | new] whose window reaches across the boundary.
+        {{1, 4, 4 * 16},  {1, 4, 2 * 16},  4, 2, 0.0f, true,  false, 61, 61, 1,
+         {}, 0.0f, 8},
+        // Flash: the tile skip starts at the window's lower bound.
+        {{1, 256, 2 * 64}, {1, 512, 1 * 64}, 2, 1, 0.0f, true, false, 0, -1, 1,
+         {}, 0.0f, 100},
+        // Window + mask.
+        {{1, 8, 4 * 8},   {1, 9, 2 * 8},   4, 2, 0.0f, true,  true,  0, -1, 0,
+         {}, 0.0f, 4},
+        // Window + per-batch runs: the window clamps to each batch's run.
+        {{2, 6, 4 * 8},   {2, 9, 1 * 8},   4, 1, 0.0f, true,  false, 0, -1, 0,
+         {9, 5}, 0.0f, 3},
+        // Window + softcap together.
+        {{1, 8, 4 * 8},   {1, 10, 2 * 8},  4, 2, 0.0f, true,  false, 0, -1, 0,
+         {}, 2.0f, 5},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
+    }
+}
+
+// ============================================================
+// Per-(batch, head) additive bias, carried as a rank-4 mask
+// ============================================================
+
+NNOPS_TEST(gqa_head_bias_matches_ref) {
+    // A rank-4 [B, H, Sq, Sk] mask is an additive bias with its own entry per
+    // query head; a rank-2 one is shared by every head. Both add after the cap
+    // and before the softmax.
+    const Case cases[] = {
+        // Standard route, causal.
+        {{2, 5, 4 * 8},   {2, 9, 2 * 8},   4, 2, 0.0f, true,  true,  0, -1, 0,
+         {}, 0.0f, 0, true},
+        // Non-causal: every bias entry is read.
+        {{1, 6, 2 * 8},   {1, 6, 1 * 8},   2, 1, 0.0f, false, true,  0, -1, 0,
+         {}, 0.0f, 0, true},
+        // Explicit [B, H, S, D] value layout, merged bias.
+        {{2, 4, 3, 8},    {2, 2, 5, 8},    4, 2, 0.0f, true,  true,  0, -1, 0,
+         {}, 0.0f, 0, true},
+        // Flash route.
+        {{1, 256, 2 * 64}, {1, 256, 1 * 64}, 2, 1, 0.0f, true, true,  0, -1, 1,
+         {}, 0.0f, 0, true},
+        // Past segment: the bias spans [past | new].
+        {{1, 4, 4 * 16},  {1, 4, 2 * 16},  4, 2, 0.0f, true,  true,  32, 32, 1,
+         {}, 0.0f, 0, true},
+    };
+
+    for (const auto& c : cases) {
+        bool flash = false;
+        NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
+    }
+}
+
+// ============================================================
+// Packed varlen (cu_seqlens)
+// ============================================================
+
+namespace {
+
+/// One packed varlen call: [Q, K, V, {}, {}, {}, {}, cu_q, cu_k] over
+/// [1, total, W] tensors, each segment run as its own [1, len, W] problem.
+struct VarlenCase {
+    std::vector<int32_t> cu_q;
+    std::vector<int32_t> cu_k;
+    int64_t heads = 4;
+    int64_t kv_heads = 2;
+    int64_t dim = 8;
+    bool causal = true;
+    int route = -1;        // per segment; -1 unchecked
+    float softcap = 0.0f;
+    int64_t window = 0;
+    EpilogueActivateType gate = EpilogueActivateType::None;
+};
+
+bool varlen_vs_ref(const VarlenCase& c)
+{
+    const int64_t total_q = c.cu_q.back();
+    const int64_t total_k = c.cu_k.back();
+    auto [q_vec, q] = test::make_random_tensor({1, total_q, c.heads * c.dim},
+                                               -1.0f, 1.0f, 700);
+    auto [k_vec, k] = test::make_random_tensor({1, total_k, c.kv_heads * c.dim},
+                                               -1.0f, 1.0f, 701);
+    auto [v_vec, v] = test::make_random_tensor({1, total_k, c.kv_heads * c.dim},
+                                               -1.0f, 1.0f, 702);
+    (void)q_vec; (void)k_vec; (void)v_vec;
+
+    std::vector<int32_t> qo(c.cu_q), ko(c.cu_k);
+    const int64_t nseg[1] = {static_cast<int64_t>(qo.size())};
+    TensorView cu_q_view(nseg, DataType::s32, qo.data());
+    TensorView cu_k_view(nseg, DataType::s32, ko.data());
+
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = c.heads;
+    attrs.kv_num_heads = c.kv_heads;
+    attrs.causal = c.causal;
+    attrs.softcap = c.softcap;
+    attrs.window = c.window;
+    attrs.output_gate = c.gate;
+
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    const TensorView none;
+    std::vector<TensorView> ins = {q, k, v, none, none, none, none,
+                                   cu_q_view, cu_k_view};
+    std::vector<float> g_vec;
+    if (c.gate != EpilogueActivateType::None) {
+        // The gate is the parent's, shaped like the whole packed output.
+        auto [gv, gt] = test::make_random_tensor(
+            {1, total_q, c.heads * c.dim}, -3.0f, 3.0f, 703);
+        g_vec = std::move(gv);
+        ins.push_back(gt);
+    }
+    std::vector<TensorDesc> descs;
+    descs.reserve(ins.size());
+    for (const auto& t : ins) { descs.push_back(t.desc()); }
+
+    const TensorDesc out_desc = td({1, total_q, c.heads * c.dim});
+    const TensorDesc out_descs[] = {out_desc};
+    if (op->validate(descs, out_descs) != Status::ok) {
+        std::printf("        varlen validate rejected the call\n");
+        return false;
+    }
+
+    // Every segment must take the route the case asked for; each packed slice
+    // is planned on its own [1, len, W] shape.
+    if (c.route >= 0) {
+        for (size_t s = 0; s + 1 < qo.size(); ++s) {
+            const int64_t lq = qo[s + 1] - qo[s];
+            if (lq == 0) { continue; }
+            const int64_t lk = ko[s + 1] - ko[s];
+            cpu::AttentionConfig pcfg;
+            pcfg.num_heads = c.heads;
+            pcfg.num_kv_heads = c.kv_heads;
+            pcfg.causal = c.causal;
+            pcfg.softcap = c.softcap;
+            pcfg.window = c.window;
+            const TensorDesc sd[] = {td({1, lq, c.heads * c.dim}),
+                                     td({1, lk, c.kv_heads * c.dim}),
+                                     td({1, lk, c.kv_heads * c.dim})};
+            const TensorDesc so[] = {td({1, lq, c.heads * c.dim})};
+            const cpu::AttentionPlan plan =
+                cpu::get_attention_plan(pcfg, sd, so, 1, false);
+            const int got = plan.use_decode ? 2 : (plan.use_flash ? 1 : 0);
+            if (got != c.route) {
+                std::printf("        segment %zu route mismatch: want %d, got %d\n",
+                            s, c.route, got);
+                return false;
+            }
+        }
+    }
+
+    const int64_t n = out_desc.numel();
+    std::vector<float> fast_buf(static_cast<size_t>(n));
+    auto fast_out = test::make_channel_first(out_desc, fast_buf.data());
+    ComputeContext ctx;
+    if (op->compute(fast_out, ins, ctx) != Status::ok) {
+        std::printf("        varlen compute failed\n");
+        return false;
+    }
+
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_channel_first(out_desc, ref_buf.data());
+    nnops::backend::cpu::reference::group_query_attention_ref(attrs, ref_out, ins,
+                                                              {}, nullptr);
+
+    for (int64_t i = 0; i < n; ++i) {
+        const float diff = std::abs(fast_buf[static_cast<size_t>(i)] -
+                                    ref_buf[static_cast<size_t>(i)]);
+        const float thr  = 1e-4f + 1e-3f * std::max(std::abs(fast_buf[static_cast<size_t>(i)]),
+                                                    std::abs(ref_buf[static_cast<size_t>(i)]));
+        if (diff > thr) {
+            std::printf("        varlen mismatch at %lld: fast %.6f vs ref %.6f\n",
+                        (long long)i, (double)fast_buf[static_cast<size_t>(i)],
+                        (double)ref_buf[static_cast<size_t>(i)]);
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(gqa_varlen_matches_ref) {
+    // Packed segments restart the causal diagonal at each cu offset and see no
+    // key from a neighbouring document. The segments differ in both lengths, so
+    // the bottom-right alignment has to move the query window per segment.
+    const VarlenCase cases[] = {
+        // Three segments whose middle one is a single row: the routes are
+        // chosen per segment, so this call mixes standard and decode.
+        {{0, 5, 6, 10}, {0, 6, 7, 15}, 4, 2, 8, true,  -1},
+        // MQA and a non-causal packing.
+        {{0, 4, 9},     {0, 4, 12},    4, 1, 16, false, 0},
+        // An empty leading segment, which must be skipped.
+        {{0, 0, 3},     {0, 4, 7},     4, 2, 8, true,  0},
+        // Two long segments on the flash route.
+        {{0, 256, 512}, {0, 300, 600}, 4, 2, 64, true, 1},
+        // Two single-row segments down the decode route.
+        {{0, 1, 2},     {0, 300, 500}, 8, 1, 8, true,  2},
+        // Softcap + window on packed segments.
+        {{0, 6, 9},     {0, 6, 12},    4, 2, 8, true,  0, 2.0f, 3},
+        // Explicitly non-multiple head dim (D = 24).
+        {{0, 3, 7},     {0, 3, 9},     2, 1, 24, true, 0},
+        // Output gate over a packed batch: one pass over the parent output,
+        // after every segment already ran.
+        {{0, 5, 6, 10}, {0, 6, 7, 15}, 4, 2, 8, true,  -1, 0.0f, 0,
+         EpilogueActivateType::Sigmoid},
+    };
+
+    for (const auto& c : cases) {
+        NNOPS_EXPECT_TRUE(varlen_vs_ref(c));
+    }
+}
+
+NNOPS_TEST(gqa_varlen_validation) {
+    // The two cu vectors arrive together, are int32 [segments + 1], and a
+    // packed batch rules out the shared mask, the past pair, seqlens_k and a
+    // global position_offset.
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = 4;
+    attrs.kv_num_heads = 2;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    const TensorDesc q = td({1, 10, 4 * 8});
+    const TensorDesc k = td({1, 15, 2 * 8});
+    const TensorDesc v = td({1, 15, 2 * 8});
+    const TensorDesc out = td({1, 10, 4 * 8});
+    TensorDesc cu;
+    cu.rank = 1;
+    cu.dims = {4};
+    cu.dtype = DataType::s32;
+
+    const TensorDesc none;
+    {
+        const TensorDesc ins[] = {q, k, v, none, none, none, none, cu, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+    }
+    {
+        // cu_k missing: the offsets are a pair.
+        const TensorDesc ins[] = {q, k, v, none, none, none, none, cu, none};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // Different segment counts.
+        TensorDesc cu_k = cu;
+        cu_k.dims = {3};
+        const TensorDesc ins[] = {q, k, v, none, none, none, none, cu, cu_k};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // A single entry cannot describe one segment.
+        TensorDesc one = cu;
+        one.dims = {1};
+        const TensorDesc ins[] = {q, k, v, none, none, none, none, one, one};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // The offsets are int32 metadata.
+        TensorDesc wrong_dtype = cu;
+        wrong_dtype.dtype = DataType::f32;
+        const TensorDesc ins[] = {q, k, v, none, none, none, none, wrong_dtype, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // A shared mask does not apply across documents.
+        const TensorDesc mask = td({10, 15});
+        const TensorDesc ins[] = {q, k, v, mask, none, none, none, cu, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // Nor does a past segment or seqlens_k.
+        const TensorDesc past = td({1, 3, 2 * 8});
+        const TensorDesc ins[] = {q, k, v, none, past, past, none, cu, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        TensorDesc sl;
+        sl.rank = 1;
+        sl.dims = {1};
+        sl.dtype = DataType::s32;
+        const TensorDesc ins[] = {q, k, v, none, none, none, sl, cu, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // The packing is merged: an explicit [B, H, S, D] batch has no packed
+        // rows to slice.
+        const TensorDesc q4 = td({1, 4, 10, 8});
+        const TensorDesc k4 = td({1, 2, 15, 8});
+        const TensorDesc ins[] = {q4, k4, k4, none, none, none, none, cu, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+
+    // A global position_offset cannot be expressed for a packed batch.
+    GroupQueryAttentionAttributes offset;
+    offset.num_heads = 4;
+    offset.kv_num_heads = 2;
+    offset.position_offset = 2;
+    auto offset_op = GroupQueryAttention::create(offset, Backend::CPU);
+    {
+        const TensorDesc ins[] = {q, k, v, none, none, none, none, cu, cu};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(offset_op->validate(ins, outs) == Status::invalid_argument);
+    }
+}
+
+// ============================================================
+// Output gate (Qwen3-Next / 3.5 / 4)
+// ============================================================
+
+NNOPS_TEST(gqa_output_gate_hand) {
+    // The gate is one pass over the finished output, so the gated call is
+    // exactly plain * act(gate) element for element — Sigmoid is the Qwen form.
+    const std::vector<int64_t> qshape = {2, 3, 2 * 8};
+    const std::vector<int64_t> kshape = {2, 5, 1 * 8};
+    auto [q_vec, q] = test::make_random_tensor(qshape, -1.0f, 1.0f, 200);
+    auto [k_vec, k] = test::make_random_tensor(kshape, -1.0f, 1.0f, 201);
+    auto [v_vec, v] = test::make_random_tensor(kshape, -1.0f, 1.0f, 202);
+    auto [g_vec, g] = test::make_random_tensor(qshape, -4.0f, 4.0f, 203);
+
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = 2;
+    attrs.kv_num_heads = 1;
+    attrs.causal = true;
+
+    const TensorDesc descs[] = {q.desc(), k.desc(), v.desc()};
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+    const auto out_descs = op->getOutputTensorDesc(descs);
+    const int64_t n = out_descs[0].numel();
+
+    std::vector<float> plain(static_cast<size_t>(n));
+    auto plain_out = test::make_channel_first(out_descs[0], plain.data());
+    const TensorView ins_plain[] = {q, k, v};
+    NNOPS_EXPECT_TRUE(op->compute(plain_out, ins_plain) == Status::ok);
+
+    GroupQueryAttentionAttributes gated = attrs;
+    gated.output_gate = EpilogueActivateType::Sigmoid;
+    auto gop = GroupQueryAttention::create(gated, Backend::CPU);
+    std::vector<float> got(static_cast<size_t>(n));
+    auto got_out = test::make_channel_first(out_descs[0], got.data());
+    const TensorView empty;
+    const TensorView ins_gated[] = {q, k, v, empty, empty, empty, empty,
+                                    empty, empty, g};
+    NNOPS_EXPECT_TRUE(gop->compute(got_out, ins_gated) == Status::ok);
+
+    for (int64_t i = 0; i < n; ++i) {
+        const float want = plain[static_cast<size_t>(i)] /
+                           (1.0f + std::exp(-g_vec[static_cast<size_t>(i)]));
+        NNOPS_EXPECT_NEAR(got[static_cast<size_t>(i)], want, 1e-5f);
+    }
+}
+
+NNOPS_TEST(gqa_output_gate_matches_ref) {
+    // Every activation the gated forms implement, across the routes: the
+    // standard path, the decode path (Sq == 1), the flash path, the explicit
+    // [B, H, S, D] layout, and a [past | new] run.
+    const EpilogueActivateType acts[] = {
+        EpilogueActivateType::Sigmoid,
+        EpilogueActivateType::Silu,
+        EpilogueActivateType::Gelu,
+        EpilogueActivateType::Tanh,
+        EpilogueActivateType::Relu,
+    };
+    for (const auto act : acts) {
+        const Case cases[] = {
+            // Standard route, causal.
+            {{2, 4, 4 * 8},   {2, 7, 2 * 8},  4, 2, 0.0f, true,  false, 0, -1, 0,
+             {}, 0.0f, 0, false, act},
+            // Non-causal: every key contributes.
+            {{1, 5, 2 * 8},   {1, 9, 1 * 8},  2, 1, 0.0f, false, false, 0, -1, 0,
+             {}, 0.0f, 0, false, act},
+            // Decode: one query row against the run.
+            {{1, 1, 4 * 8},   {1, 12, 2 * 8}, 4, 2, 0.0f, true,  false, 0, -1, 2,
+             {}, 0.0f, 0, false, act},
+            // Flash route.
+            {{1, 256, 2 * 64}, {1, 256, 1 * 64}, 2, 1, 0.0f, true, false, 0, -1, 1,
+             {}, 0.0f, 0, false, act},
+            // Explicit [B, H, S, D] layout.
+            {{2, 4, 3, 8},    {2, 2, 5, 8},   4, 2, 0.0f, true,  false, 0, -1, 0,
+             {}, 0.0f, 0, false, act},
+            // [past | new]: the gate spans the query rows only.
+            {{1, 4, 4 * 16},  {1, 4, 2 * 16}, 4, 2, 0.0f, true,  false, 32, 32, 1,
+             {}, 0.0f, 0, false, act},
+        };
+        for (const auto& c : cases) {
+            bool flash = false;
+            NNOPS_EXPECT_TRUE(gqa_fast_vs_ref(c, flash));
+        }
+    }
+}
+
+NNOPS_TEST(gqa_output_gate_f16) {
+    // f16 down the fast path: the gate pass is dtype-templated like the routes.
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = 4;
+    attrs.kv_num_heads = 2;
+    attrs.causal = true;
+    attrs.output_gate = EpilogueActivateType::Sigmoid;
+
+    const std::vector<int64_t> qshape = {1, 4, 4 * 16};
+    const std::vector<int64_t> kshape = {1, 6, 2 * 16};
+    auto [q32v, q32] = test::make_random_tensor(qshape, -1.0f, 1.0f, 210);
+    auto [k32v, k32] = test::make_random_tensor(kshape, -1.0f, 1.0f, 211);
+    auto [v32v, v32] = test::make_random_tensor(kshape, -1.0f, 1.0f, 212);
+    auto [g32v, g32] = test::make_random_tensor(qshape, -3.0f, 3.0f, 213);
+
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+    const TensorDesc descs32[] = {q32.desc(), k32.desc(), v32.desc()};
+    const auto out_descs = op->getOutputTensorDesc(descs32);
+    const int64_t n = out_descs[0].numel();
+
+    std::vector<float> ref_buf(static_cast<size_t>(n));
+    auto ref_out = test::make_channel_first(out_descs[0], ref_buf.data());
+    const TensorView empty;
+    const TensorView ins32[] = {q32, k32, v32, empty, empty, empty, empty,
+                                empty, empty, g32};
+    nnops::backend::cpu::reference::group_query_attention_ref(
+        attrs, ref_out, ins32, {}, nullptr);
+
+    auto q16v = test::f32_to_f16(q32v);
+    auto k16v = test::f32_to_f16(k32v);
+    auto v16v = test::f32_to_f16(v32v);
+    auto g16v = test::f32_to_f16(g32v);
+    TensorView q16(std::span<const int64_t>(qshape), DataType::f16, q16v.data());
+    TensorView k16(std::span<const int64_t>(kshape), DataType::f16, k16v.data());
+    TensorView v16(std::span<const int64_t>(kshape), DataType::f16, v16v.data());
+    TensorView g16(std::span<const int64_t>(qshape), DataType::f16, g16v.data());
+
+    std::vector<cpu::half> got_buf(static_cast<size_t>(n));
+    TensorDesc out16 = out_descs[0];
+    out16.dtype = DataType::f16;
+    auto got_out = test::make_channel_first(out16, got_buf.data());
+    const TensorView ins16[] = {q16, k16, v16, empty, empty, empty, empty,
+                                empty, empty, g16};
+    NNOPS_EXPECT_TRUE(op->compute(got_out, ins16) == Status::ok);
+
+    const auto got_f32 = test::f16_to_f32(got_buf);
+    for (int64_t i = 0; i < n; ++i) {
+        const float diff = std::abs(got_f32[static_cast<size_t>(i)] -
+                                    ref_buf[static_cast<size_t>(i)]);
+        if (diff > 2e-3f) {
+            std::printf("        gate f16 deviation %f at %lld\n",
+                        (double)diff, (long long)i);
+            NNOPS_EXPECT_TRUE(false);
+            break;
+        }
+    }
+}
+
+NNOPS_TEST(gqa_output_gate_validation) {
+    // The gate is slot 9, present exactly when the attribute names an
+    // activation, and shaped like Q (the output).
+    GroupQueryAttentionAttributes attrs;
+    attrs.num_heads = 4;
+    attrs.kv_num_heads = 2;
+    attrs.output_gate = EpilogueActivateType::Sigmoid;
+    auto op = GroupQueryAttention::create(attrs, Backend::CPU);
+
+    const TensorDesc q = td({1, 5, 4 * 8});
+    const TensorDesc k = td({1, 9, 2 * 8});
+    const TensorDesc out = td({1, 5, 4 * 8});
+    const TensorDesc none;
+    {
+        const TensorDesc ins[] = {q, k, k, none, none, none, none, none, none, q};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+    }
+    {
+        // The attribute is set but the gate is absent.
+        const TensorDesc ins[] = {q, k, k};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // A gate of the wrong width cannot multiply the output.
+        const TensorDesc narrow = td({1, 5, 4 * 7});
+        const TensorDesc ins[] = {q, k, k, none, none, none, none, none, none, narrow};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // Nor can one of another dtype.
+        TensorDesc g = q;
+        g.dtype = DataType::f16;
+        const TensorDesc ins[] = {q, k, k, none, none, none, none, none, none, g};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // A gate with no attribute to activate it is ambiguous.
+        GroupQueryAttentionAttributes plain;
+        plain.num_heads = 4;
+        plain.kv_num_heads = 2;
+        auto plain_op = GroupQueryAttention::create(plain, Backend::CPU);
+        const TensorDesc ins[] = {q, k, k, none, none, none, none, none, none, q};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(plain_op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // Only the activations the gated forms implement.
+        GroupQueryAttentionAttributes bad = attrs;
+        bad.output_gate = EpilogueActivateType::LeakyRelu;
+        auto bad_op = GroupQueryAttention::create(bad, Backend::CPU);
+        const TensorDesc ins[] = {q, k, k, none, none, none, none, none, none, q};
+        const TensorDesc outs[] = {out};
+        NNOPS_EXPECT_TRUE(bad_op->validate(ins, outs) == Status::unsupported);
     }
 }

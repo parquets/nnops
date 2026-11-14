@@ -12,6 +12,8 @@
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/attention/attention.h"
 
+#include <cmath>
+
 namespace nnops {
 
 namespace {
@@ -43,8 +45,13 @@ size_t GroupQueryAttention::getWorkspaceSize(std::span<const TensorDesc> inputs,
 Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
                                      std::span<const TensorDesc> outputs) const
 {
-    // Q, K, V [, mask [, past K, past V [, seqlens_k]]]
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 7, 1));
+    // Q, K, V [, mask [, past K, past V [, seqlens_k [,
+    //        cu_seqlens_q, cu_seqlens_k [, gate]]]]
+    if (attrs_.output_gate != EpilogueActivateType::None &&
+        !is_gate_activation(attrs_.output_gate)) {
+        return Status::unsupported;
+    }
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
@@ -57,10 +64,11 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
         if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
     if (outputs[0].dtype != dt) { return Status::invalid_argument; }
-    // Slot 6 is the int32 [B] run-length vector, not an activation.
+    // Slot 6 onwards is int32 metadata — run lengths, then the two varlen
+    // offset vectors — not activations.
     constexpr size_t kSeqlensSlot = 6;
     for (size_t i = 3; i < inputs.size(); ++i) {
-        if (i == kSeqlensSlot || inputs[i].rank == 0) { continue; }
+        if (i >= kSeqlensSlot || inputs[i].rank == 0) { continue; }
         if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
     const auto& q = inputs[0];
@@ -78,6 +86,10 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
     const int64_t h = attrs_.num_heads;
     const int64_t hkv = kv_heads_of(attrs_);
     if (h <= 0 || hkv <= 0 || h % hkv != 0) { return Status::invalid_argument; }
+    if (!(attrs_.softcap >= 0.0f) || !std::isfinite(attrs_.softcap) ||
+        attrs_.window < 0) {
+        return Status::invalid_argument;
+    }
 
     int64_t d, sq, sk;
     if (q.rank == 3) {
@@ -136,10 +148,64 @@ Status GroupQueryAttention::validate(std::span<const TensorDesc> inputs,
     const int64_t sk_all = sk + sk_past;
     if (inputs.size() > 3 && inputs[3].rank != 0) {
         const auto& m = inputs[3];
-        if (m.rank != 2 || m.dims[0] != sq || m.dims[1] != sk_all) {
+        // Rank 2 is the flat [Sq, Sk] every head shares; rank 4 is a per-head
+        // additive bias [B, H, Sq, Sk].
+        if (m.rank == 2) {
+            if (m.dims[0] != sq || m.dims[1] != sk_all) {
+                return Status::invalid_argument;
+            }
+        } else if (m.rank == 4) {
+            if (m.dims[0] != q.dims[0] || m.dims[1] != h ||
+                m.dims[2] != sq || m.dims[3] != sk_all) {
+                return Status::invalid_argument;
+            }
+        } else {
             return Status::invalid_argument;
         }
     }
+
+    // Varlen: the int32 [segments + 1] prefix offsets of a packed batch, after
+    // seqlens_k. The segments are independent documents, so a shared mask or
+    // bias, the past pair, seqlens_k and a global position_offset do not apply.
+    const bool has_seqlens =
+        inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0;
+    const bool has_cu_q = inputs.size() > 7 && inputs[7].rank != 0;
+    const bool has_cu_k = inputs.size() > 8 && inputs[8].rank != 0;
+    if (has_cu_q != has_cu_k) { return Status::invalid_argument; }
+    if (has_cu_q) {
+        const auto& cq = inputs[7];
+        const auto& ck = inputs[8];
+        if (cq.dtype != DataType::s32 || ck.dtype != DataType::s32 ||
+            cq.rank != 1 || ck.rank != 1 || cq.dims[0] != ck.dims[0] ||
+            cq.dims[0] < 2) {
+            return Status::invalid_argument;
+        }
+        if (q.rank != 3 || q.dims[0] != 1) { return Status::invalid_argument; }
+        if (has_past_k || has_seqlens || attrs_.position_offset >= 0) {
+            return Status::invalid_argument;
+        }
+        if (inputs.size() > 3 && inputs[3].rank != 0) {
+            return Status::invalid_argument;
+        }
+    }
+
+    // The output gate multiplies the output element-wise, so it is exactly as
+    // wide as Q; the slot is required when the attribute is set and refused
+    // when it is not (an unused trailing slot makes the call ambiguous).
+    constexpr size_t kGateSlot = 9;
+    const bool has_gate = inputs.size() > kGateSlot && inputs[kGateSlot].rank != 0;
+    if (attrs_.output_gate != EpilogueActivateType::None) {
+        if (!has_gate) { return Status::invalid_argument; }
+        const auto& g = inputs[kGateSlot];
+        if (g.dtype != dt) { return Status::invalid_argument; }
+        if (g.rank != q.rank) { return Status::invalid_argument; }
+        for (int64_t i = 0; i < q.rank; ++i) {
+            if (g.dims[i] != q.dims[i]) { return Status::invalid_argument; }
+        }
+    } else if (has_gate) {
+        return Status::invalid_argument;
+    }
+
     // Every query row must sit inside the run it attends to.
     if (attrs_.causal && attrs_.position_offset >= 0 &&
         attrs_.position_offset + sq > sk_all) {
@@ -153,7 +219,7 @@ Status GroupQueryAttention::compute(std::span<TensorView> outputs,
                                     const ComputeContext& ctx,
                                     void* workspace)
 {
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 7, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
     for (size_t i = 0; i < 3; ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }

@@ -17,7 +17,8 @@ void multi_head_attention_ref(const MultiHeadAttentionAttributes& attrs,
 {
     detail::attention_ref_generic(attrs.num_heads, attrs.num_heads, 0,
                                   attrs.scale, attrs.causal, /*v_is_k=*/false,
-                                  attrs.position_offset, output, inputs, ctx);
+                                  attrs.position_offset, output, inputs, ctx,
+                                  attrs.softcap, attrs.window, attrs.output_gate);
 }
 
 }  // namespace nnops::backend::cpu::reference

@@ -6,8 +6,8 @@
 /// scores = Q·Kᵀ·scale (+ mask, if given); output = softmax(scores, last dim)·V.
 /// Q/K/V arrive as [B, S, H·D] (reshaped internally to [B, H, S, D]) or already
 /// as [B, H, S, D]; inputs[0..2] = Q, K, V and inputs[3] = optional additive
-/// mask, flat [Sq, Sk] and shared by every batch and head. scale = 0 means
-/// 1/sqrt(head_dim). Channel-first layouts only.
+/// mask, flat [Sq, Sk] shared by every batch and head or a per-head bias
+/// [B, H, Sq, Sk]. scale = 0 means 1/sqrt(head_dim). Channel-first layouts only.
 ///
 /// Chunked input: inputs[4] and inputs[5] are an optional past K and past V —
 /// the same layout as K/V, with Sk_past rows instead of Sk_new. The key run
@@ -28,6 +28,19 @@
 /// position_offset (a scalar for every batch) is given. Absent, every batch
 /// runs to the full Sk.
 ///
+/// `softcap` caps the scaled logit as softcap·tanh(s/softcap) before the mask;
+/// `window` raises each row's first visible key to pos_i - window + 1. Both are
+/// off at 0.
+///
+/// inputs[7]/[8] are the optional int32 [segments + 1] `cu_seqlens_q` /
+/// `cu_seqlens_k` of a packed varlen batch: Q is [1, total_q, H·D], K/V are
+/// [1, total_kv, ...], and each segment attends only inside its own cu range,
+/// bottom-right aligned. Exclusive with the mask, the past pair, seqlens_k and
+/// position_offset.
+///
+/// inputs[9] is the optional output gate of `output_gate`: the output is
+/// multiplied in place by `act(gate)`, the gate shaped like the output.
+///
 /// Grouped-query attention — several query heads per key/value head — is
 /// GroupQueryAttention, and the absorbed DeepSeek-style latent form is
 /// MultiLatentAttention; this operator is the H == Hkv case and does not
@@ -37,6 +50,7 @@
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/backend.hpp"
 #include "nnops/core/compute_context.hpp"
+#include "nnops/core/epilogue.hpp"
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -58,6 +72,20 @@ struct MultiHeadAttentionAttributes {
     /// consulted when causal. With a past segment the run is [past | new] and
     /// the chunked-prefill value is the past length.
     int64_t position_offset = -1;
+
+    /// Logit softcap (Gemma2/3): s = softcap·tanh(s/softcap), applied to the
+    /// scaled score and before the mask. 0 disables.
+    float softcap = 0.0f;
+
+    /// Sliding-window attention (Gemma2/3 local layers, Mistral): query row i
+    /// also skips keys older than its position minus window + 1. 0 disables.
+    int64_t window = 0;
+
+    /// Output gate (Qwen3-Next / 3.5 / 4): multiply the attention output by
+    /// `act(gate)`, a trailing input shaped like the output. Sigmoid is the
+    /// Qwen form; None disables. Applied in place in one pass after the route
+    /// wrote the output, replacing the caller's Activation + Eltwise pair.
+    EpilogueActivateType output_gate = EpilogueActivateType::None;
 };
 
 class MultiHeadAttention : public OpBase {

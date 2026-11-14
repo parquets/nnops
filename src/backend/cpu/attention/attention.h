@@ -56,6 +56,17 @@
 /// whole S tile is out of range contributes nothing: the standard path softmaxes
 /// only its valid prefix and zeroes the tail, the flash path skips the tile.
 ///
+/// The valid key range of query row i is the intersection of three bounds: the
+/// causal limit [0, hi), the sliding window [lo, run) with
+/// lo = max(0, pos_i - window + 1), and the batch's run length. Both bound
+/// functions come from attention_internal.h (causal_limit / key_lo) so the plan
+/// and every route agree on them.
+///
+/// Softcap, when set, rewrites every score as cap·tanh(s/cap) after the scale
+/// and before the mask — the order Gemma2/3 use. It is a per-row pass on the
+/// score tile in each route, and the decode route applies scale and cap
+/// together before its online-softmax update.
+///
 /// Scratch sizing counts uniform nr_max-wide panels, not a width cascade: the
 /// widest n-block in a loop bounds the count (a greedy per-width decomposition
 /// is not monotonic in n and undersized the slot). The packed-B stride takes
@@ -64,15 +75,28 @@
 ///
 /// Q/K/V/O head slices are M×K / N×K / K×N / M×N submatrices of the channel-first
 /// tensors, for both merged [B, S, H*D] and explicit [B, H, S, D] layouts (a
-/// head's D columns are contiguous within each row). The mask is flat
-/// [Sq, Sk_total] over the whole run; its index carries no batch or head.
+/// head's D columns are contiguous within each row). The optional mask arrives
+/// in one of two shapes, told apart by rank: a flat [Sq, Sk_total] shared by
+/// every batch and head, or a per-(batch, head) additive bias [B, H, Sq, Sk].
 ///
 /// Input slots are positional and an omitted optional input is an empty view:
-/// Q, K, V, [mask], [past K], [past V], [seqlens_k] — or Q, KV, [mask],
-/// [past KV], [seqlens_k] when v_is_k. The past tensors carry the same layout
-/// as their new counterpart, with Sk_past rows instead of Sk_new; the run is
-/// [past | new]. seqlens_k is an int32 [B] vector of per-batch valid key-run
-/// lengths (the run's prefix), read by every route through run_length.
+/// Q, K, V, [mask], [past K], [past V], [seqlens_k], [cu_seqlens_q],
+/// [cu_seqlens_k], [gate] — or Q, KV, [mask], [past KV], [seqlens_k],
+/// [cu_seqlens_q], [cu_seqlens_k], [gate] when v_is_k. The past tensors carry
+/// the same layout as their new counterpart, with Sk_past rows instead of
+/// Sk_new; the run is [past | new]. seqlens_k is an int32 [B] vector of
+/// per-batch valid key-run lengths (the run's prefix), read by every route
+/// through run_length. The gate (cfg.output_gate) is shaped like the output and
+/// multiplies it in place after the route finished; it is outside every route,
+/// so decode, standard, flash and varlen all share the one pass.
+///
+/// Varlen (cu_seqlens_q / cu_seqlens_k): the two int32 [segments + 1] offsets of
+/// HuggingFace's packed batches. Q is [1, total_q, H*D] and K/V are
+/// [1, total_kv, ...], segment s owning query rows [cu_q[s], cu_q[s+1]) and key
+/// rows [cu_k[s], cu_k[s+1]); no position crosses a segment boundary. The pair
+/// is exclusive with the mask, a past segment, seqlens_k and a
+/// position_offset — each segment is bottom-right aligned on its own key run.
+/// The core runs one sub-call per segment over the parent's storage.
 ///
 /// Implementation is one file per route (attention_standard.cpp,
 /// attention_flash.cpp, attention_decode.cpp) over the shared machinery in
@@ -82,6 +106,7 @@
 #include "nnops/core/tensor_view.hpp"
 #include "nnops/core/compute_context.hpp"
 #include "nnops/core/status.hpp"
+#include "nnops/core/epilogue.hpp"
 
 #include <cstddef>
 #include <span>
@@ -99,6 +124,15 @@ struct AttentionConfig {
     /// Absolute position of query row 0; negative (the default) means
     /// bottom-right, q0 = run - Sq. Only consulted when causal.
     int64_t position_offset = -1;
+    /// Logit cap (Gemma2/3 softcapping): s = cap·tanh(s/cap), applied after the
+    /// scale and before the additive mask. 0 disables.
+    float   softcap = 0.0f;
+    /// Sliding window: query row i also skips keys older than its position
+    /// minus window + 1 (Gemma2/3 local layers). 0 disables.
+    int64_t window = 0;
+    /// Output gate (Qwen3-Next/3.5): the finished output is multiplied in place
+    /// by act(gate) of the trailing input slot. None disables.
+    EpilogueActivateType output_gate = EpilogueActivateType::None;
 
     int64_t kv_heads() const noexcept {
         return num_kv_heads > 0 ? num_kv_heads : num_heads;
@@ -137,12 +171,13 @@ AttentionPlan get_attention_plan(const AttentionConfig& cfg,
                                  bool use_thread_slots = false);
 
 /// Tiled attention kernel (f32 / f16), routed standard, flash or decode by the
-/// plan. Inputs are Q, K, V [, mask [, past K, past V]] — or Q, KV [, mask
-/// [, past KV]] when cfg.v_is_k, in which case the value is read from the key
-/// tensor's leading columns. Scratch comes
+/// plan. Inputs are Q, K, V [, mask [, past K, past V ... [, gate]]] — or
+/// Q, KV [, mask [, past KV]] when cfg.v_is_k, in which case the value is read
+/// from the key tensor's leading columns. Scratch comes
 /// from the internal pool, sized by get_attention_plan; @p workspace is unused.
 /// Returns Status::unsupported unless every input, the output and the optional
-/// mask share one f32 or f16 dtype.
+/// mask share one f32 or f16 dtype; a named cfg.output_gate whose slot is not
+/// exactly the output's geometry returns Status::invalid_argument.
 Status attention_cpu(const AttentionConfig& cfg,
                      TensorView& output,
                      std::span<const TensorView> inputs,

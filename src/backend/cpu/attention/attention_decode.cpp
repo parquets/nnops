@@ -99,6 +99,10 @@ void attention_decode_impl(const AttentionConfig& cfg,
     const float scale = (cfg.scale == 0.0f)
         ? (1.0f / std::sqrt(static_cast<float>(Dqk)))
         : cfg.scale;
+    // The scale normally rides through the softmax exponential. A softcap is
+    // applied to the scaled logit itself, so in that case it is folded into the
+    // cap pass and the exponential runs unscaled.
+    const float exp_scale = cfg.softcap > 0.0f ? 1.0f : scale;
 
     const T* q_ptr = Q.ptr<T>();
     const T* k_ptr = K.ptr<T>();
@@ -142,10 +146,14 @@ void attention_decode_impl(const AttentionConfig& cfg,
 
         // The batch's valid key run and this row's limit over it: bottom-right
         // alignment reads every valid key, a shorter run or an explicit
-        // position_offset cuts it shorter.
-        const int64_t n_valid = causal_limit(cfg, 0, Sq, run_length(seqlens, b, Sk));
-        const int64_t lo = (n_valid * si) / splits;
-        const int64_t hi = (n_valid * (si + 1)) / splits;
+        // position_offset cuts it shorter, and the sliding window raises the
+        // start. A slice is a sub-range of that band.
+        const int64_t run_b = run_length(seqlens, b, Sk);
+        const int64_t n_valid = causal_limit(cfg, 0, Sq, run_b);
+        const int64_t k_lo = std::min(key_lo(cfg, 0, Sq, run_b), n_valid);
+        const int64_t span = n_valid - k_lo;
+        const int64_t lo = k_lo + (span * si) / splits;
+        const int64_t hi = k_lo + (span * (si + 1)) / splits;
 
         const T* k_head;
         const T* v_head;
@@ -209,8 +217,8 @@ void attention_decode_impl(const AttentionConfig& cfg,
             // ---- scores = q · K^T ------------------------------------
             // The key block is streamed once and every head of the group dots
             // against it: what was one full pass over the run per query head
-            // is now one per group. The scale rides through the softmax
-            // exponential, so this stays a pure dot product.
+            // is now one per group. Without a softcap the scale rides through
+            // the softmax exponential, so this stays a pure dot product.
             for (int64_t j = 0; j < nh; ++j) {
                 const T* q_row = q_base + j * q_step;
                 float* sj = scores + j * kDecodeChunk;
@@ -231,6 +239,15 @@ void attention_decode_impl(const AttentionConfig& cfg,
                 }
             }
 
+            // ---- softcap ----------------------------------------------
+            // The cap owns the scale, so it runs on the raw dots before the
+            // online-softmax update reads the row.
+            if (cfg.softcap > 0.0f) {
+                for (int64_t j = 0; j < nh; ++j) {
+                    row_softcap(scores + j * kDecodeChunk, nc, scale, cfg.softcap);
+                }
+            }
+
             // ---- online-softmax update --------------------------------
             for (int64_t j = 0; j < nh; ++j) {
                 float* sj = scores + j * kDecodeChunk;
@@ -243,7 +260,7 @@ void attention_decode_impl(const AttentionConfig& cfg,
                 const float exp_diff = (old_m == kNegInf) ? 0.0f : std::exp(old_m - new_m);
                 mrow[j] = new_m;
                 lrow[j] = exp_diff * lrow[j]
-                        + kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, scale);
+                        + kernel::softmax_row_exp_sum<float>(sj, sj, nc, new_m, exp_scale);
                 if (exp_diff != 1.0f) {
                     float* oa = o_acc + j * Dv;
                     auto v_ed = simd::v_set1(oa, exp_diff);
@@ -383,7 +400,7 @@ void attention_decode_impl(const AttentionConfig& cfg,
             const float* p = pj + s * pstep;
             const float ms = p[Dv];
             if (ms == kNegInf) { continue; }
-            const float w = std::exp((ms - M) * scale);
+            const float w = std::exp((ms - M) * exp_scale);
             denom += w * p[Dv + 1];
             auto vw = simd::v_set1(p, w);
             int64_t d = 0;

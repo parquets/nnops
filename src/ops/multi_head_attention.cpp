@@ -12,6 +12,8 @@
 #include "nnops/detail/shape_inference.hpp"
 #include "backend/cpu/attention/attention.h"
 
+#include <cmath>
+
 namespace nnops {
 
 NNOPS_DECLARE_CPU(MultiHeadAttentionAttributes, multi_head_attention_cpu)
@@ -37,8 +39,13 @@ size_t MultiHeadAttention::getWorkspaceSize(std::span<const TensorDesc> inputs,
 Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
                                     std::span<const TensorDesc> outputs) const
 {
-    // Q, K, V [, mask [, past K, past V [, seqlens_k]]]
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 7, 1));
+    // Q, K, V [, mask [, past K, past V [, seqlens_k [,
+    //        cu_seqlens_q, cu_seqlens_k [, gate]]]]
+    if (attrs_.output_gate != EpilogueActivateType::None &&
+        !is_gate_activation(attrs_.output_gate)) {
+        return Status::unsupported;
+    }
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
     if (!is_layout_supported(inputs[0].layout, LayoutSupport::ChannelFirstOnly)) {
         return Status::unsupported;
     }
@@ -51,10 +58,11 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
         if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
     if (outputs[0].dtype != dt) { return Status::invalid_argument; }
-    // Slot 6 is the int32 [B] run-length vector, not an activation.
+    // Slot 6 onwards is int32 metadata — run lengths, then the two varlen
+    // offset vectors — not activations.
     constexpr size_t kSeqlensSlot = 6;
     for (size_t i = 3; i < inputs.size(); ++i) {
-        if (i == kSeqlensSlot || inputs[i].rank == 0) { continue; }
+        if (i >= kSeqlensSlot || inputs[i].rank == 0) { continue; }
         if (inputs[i].dtype != dt) { return Status::invalid_argument; }
     }
     const auto& q = inputs[0];
@@ -63,6 +71,10 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     if (q.rank != 3 && q.rank != 4) { return Status::invalid_argument; }
     if (k.rank != q.rank || v.rank != q.rank) { return Status::invalid_argument; }
     if (attrs_.num_heads <= 0) { return Status::invalid_argument; }
+    if (!(attrs_.softcap >= 0.0f) || !std::isfinite(attrs_.softcap) ||
+        attrs_.window < 0) {
+        return Status::invalid_argument;
+    }
     if (inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0) {
         const auto& s = inputs[kSeqlensSlot];
         if (s.dtype != DataType::s32 || s.rank != 1 || s.dims[0] != q.dims[0]) {
@@ -122,10 +134,63 @@ Status MultiHeadAttention::validate(std::span<const TensorDesc> inputs,
     const int64_t sk_all = sk + sk_past;
     if (inputs.size() > 3 && inputs[3].rank != 0) {
         const auto& m = inputs[3];
-        if (m.rank != 2 || m.dims[0] != sq || m.dims[1] != sk_all) {
+        // Rank 2 is the flat [Sq, Sk] every head shares; rank 4 is a per-head
+        // additive bias [B, H, Sq, Sk].
+        if (m.rank == 2) {
+            if (m.dims[0] != sq || m.dims[1] != sk_all) {
+                return Status::invalid_argument;
+            }
+        } else if (m.rank == 4) {
+            if (m.dims[0] != q.dims[0] || m.dims[1] != attrs_.num_heads ||
+                m.dims[2] != sq || m.dims[3] != sk_all) {
+                return Status::invalid_argument;
+            }
+        } else {
             return Status::invalid_argument;
         }
     }
+
+    // Varlen: the int32 [segments + 1] prefix offsets of a packed batch, after
+    // seqlens_k. Exclusive with the mask, the past pair, seqlens_k and a global
+    // position_offset — the segments are independent documents.
+    const bool has_seqlens =
+        inputs.size() > kSeqlensSlot && inputs[kSeqlensSlot].rank != 0;
+    const bool has_cu_q = inputs.size() > 7 && inputs[7].rank != 0;
+    const bool has_cu_k = inputs.size() > 8 && inputs[8].rank != 0;
+    if (has_cu_q != has_cu_k) { return Status::invalid_argument; }
+    if (has_cu_q) {
+        const auto& cq = inputs[7];
+        const auto& ck = inputs[8];
+        if (cq.dtype != DataType::s32 || ck.dtype != DataType::s32 ||
+            cq.rank != 1 || ck.rank != 1 || cq.dims[0] != ck.dims[0] ||
+            cq.dims[0] < 2) {
+            return Status::invalid_argument;
+        }
+        if (q.rank != 3 || q.dims[0] != 1) { return Status::invalid_argument; }
+        if (has_past_k || has_seqlens || attrs_.position_offset >= 0) {
+            return Status::invalid_argument;
+        }
+        if (inputs.size() > 3 && inputs[3].rank != 0) {
+            return Status::invalid_argument;
+        }
+    }
+
+    // The output gate is one element per output element, so it is shaped like
+    // Q (the output); present exactly when the attribute is set.
+    constexpr size_t kGateSlot = 9;
+    const bool has_gate = inputs.size() > kGateSlot && inputs[kGateSlot].rank != 0;
+    if (attrs_.output_gate != EpilogueActivateType::None) {
+        if (!has_gate) { return Status::invalid_argument; }
+        const auto& g = inputs[kGateSlot];
+        if (g.dtype != dt) { return Status::invalid_argument; }
+        if (g.rank != q.rank) { return Status::invalid_argument; }
+        for (int64_t i = 0; i < q.rank; ++i) {
+            if (g.dims[i] != q.dims[i]) { return Status::invalid_argument; }
+        }
+    } else if (has_gate) {
+        return Status::invalid_argument;
+    }
+
     // Every query row must sit inside the run it attends to.
     if (attrs_.causal && attrs_.position_offset >= 0 &&
         attrs_.position_offset + sq > sk_all) {
@@ -141,7 +206,7 @@ Status MultiHeadAttention::compute(std::span<TensorView> outputs,
 {
     // The optional mask and past segments are allowed to arrive as empty views
     // (meaning absent), so only the three required inputs are checked for data.
-    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 7, 1));
+    NNOPS_TRY(detail::check_counts(inputs.size(), outputs.size(), 3, 10, 1));
     for (size_t i = 0; i < 3; ++i) {
         if (inputs[i].is_empty()) { return Status::invalid_argument; }
     }

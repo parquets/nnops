@@ -35,6 +35,25 @@ enum class EpilogueActivateType : uint8_t {
     Relu6      = 9,   ///< f(x) = min(max(0, x), 6)
 };
 
+/// The activations the *gated* fusion points implement — Linear's gated form,
+/// MoE's experts, Norm's RMSNormGated and attention's output gate. All of them
+/// are applied to a gate row and multiplied into a value, so they need the same
+/// cheap elementwise set; the remaining activations (LeakyRelu, Elu, Relu6,
+/// HardSwish) carry parameters the gated kernels have no slot for.
+constexpr bool is_gate_activation(EpilogueActivateType t) noexcept {
+    switch (t) {
+    case EpilogueActivateType::None:
+    case EpilogueActivateType::Silu:
+    case EpilogueActivateType::Gelu:
+    case EpilogueActivateType::Relu:
+    case EpilogueActivateType::Sigmoid:
+    case EpilogueActivateType::Tanh:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// A quantization stage applied after the activation — the fusion point for a
 /// QuantizeLinear/DequantizeLinear that follows a GEMM.
 ///

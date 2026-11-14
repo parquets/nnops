@@ -13,8 +13,11 @@
 ///
 /// The mask folds into the softmax 3-pass (max → exp+sum → normalize), so
 /// scores is never rewritten before normalization — one full-buffer pass
-/// cheaper than an explicit `scores += mask`. A causal row only softmaxes its
-/// valid prefix; the masked tail is zeroed so GEMM2 reads nothing from it.
+/// cheaper than an explicit `scores += mask`. A head-bias mask is indexed per
+/// (batch, head) row; the flat one per row. A row only softmaxes its valid
+/// range — the causal limit and the sliding window — and the lanes outside it
+/// are zeroed so GEMM2 reads nothing from them. The softcap, when set, is a
+/// per-row pass before the mask.
 
 #include "attention_internal.h"
 
@@ -34,6 +37,9 @@ void attention_standard_impl(const AttentionConfig& cfg,
     const auto& K = inputs[1];
     const auto& V = cfg.v_is_k ? inputs[1] : inputs[2];
     const bool has_mask = has_mask_input(cfg, inputs);
+    const bool has_bias = mask_is_head_bias(cfg, inputs);
+    const int64_t bias_rs = has_mask
+        ? inputs[mask_slot(cfg)].row_stride_elems() : 0;
     const int32_t* seqlens = has_seqlens_input(cfg, inputs)
         ? inputs[seqlens_slot(cfg)].ptr<int32_t>() : nullptr;
 
@@ -133,27 +139,37 @@ void attention_standard_impl(const AttentionConfig& cfg,
             }
         }
 
-        // ---- mask + softmax over the last dim, per row, in-place ------
-        // The mask folds into the softmax 3-pass (max → exp+sum → normalize),
-        // so scores is never rewritten before normalization — one full-buffer
-        // pass cheaper than an explicit `scores += mask`. A causal row only
-        // softmaxes its valid prefix; the masked tail is zeroed so GEMM2 reads
-        // nothing from it.
+        // ---- softcap + mask + softmax over the last dim, per row ------
+        // The softcap is part of the logit, so it runs first; the mask then
+        // folds into the softmax 3-pass (max → exp+sum → normalize), so scores
+        // is never rewritten before normalization — one full-buffer pass
+        // cheaper than an explicit `scores += mask`. Only the row's valid range
+        // [lo, hi) is softmaxed; the lanes outside it are zeroed so GEMM2 reads
+        // nothing from them. A per-head bias is indexed by (batch, head, row),
+        // the flat mask by row alone.
         for (int64_t i = 0; i < Sq; ++i) {
             T* row = scores + i * Sk;
-            const int64_t n = causal_limit(cfg, i, Sq, run);
-            if (n == 0) {
+            const int64_t hi = causal_limit(cfg, i, Sq, run);
+            const int64_t lo = key_lo(cfg, i, Sq, run);
+            if (hi <= lo) {
                 row_fill(row, Sk, 0.0f);
                 continue;
             }
+            if (cfg.softcap > 0.0f) {
+                row_softcap(row + lo, hi - lo, 1.0f, cfg.softcap);
+            }
+            if (lo > 0) { row_fill(row, lo, 0.0f); }
             if (mask_ptr) {
+                const T* mrow = has_bias
+                    ? mask_ptr + head_bias_row_offset(b, h, i, H, Sq, bias_rs) + lo
+                    : mask_ptr + i * Sk + lo;
                 kernel::mask_softmax_process_standard_row<T>(
-                    row, mask_ptr + i * Sk, row, n, /*log_softmax=*/false, 1.0f);
+                    row + lo, mrow, row + lo, hi - lo, /*log_softmax=*/false, 1.0f);
             } else {
                 kernel::softmax_process_standard_row<T>(
-                    row, row, n, /*log_softmax=*/false, 1.0f);
+                    row + lo, row + lo, hi - lo, /*log_softmax=*/false, 1.0f);
             }
-            if (n < Sk) { row_fill(row + n, Sk - n, 0.0f); }
+            if (hi < Sk) { row_fill(row + hi, Sk - hi, 0.0f); }
         }
 
         // ---- GEMM2: output = attn @ V ---------------------------------

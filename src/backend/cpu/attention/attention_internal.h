@@ -18,8 +18,11 @@
 /// the route geometry both the plan and the kernels size themselves from.
 
 #include "attention.h"
+#include "backend/cpu/common/gate_combine.hpp"         // gate_scale_row, the output gate
 #include "backend/cpu/matmul/matmul_helper.h"           // tile_mma_direct / tile_pack_rhs + panel constants
+#include "backend/cpu/simd_kernel/activation_kernels.hpp"  // v_tanh, for softcapping
 #include "backend/cpu/simd_kernel/simd_softmax.hpp"     // softmax + FlashAttention row kernels
+#include "backend/cpu/simd_kernel/tiled_map.hpp"        // simd_vec_t
 #include "nnops/detail/assert.hpp"
 #include "nnops/detail/half.hpp"
 #include "nnops/detail/simd/simd.hpp"
@@ -102,8 +105,9 @@ inline HeadShape resolve_head_shape(const AttentionConfig& cfg,
         s.Sv = V.shape(2);
         s.Dqk = Q.shape(3);
     }
-    // The value head is Dqk wide unless MLA's latent says otherwise.
-    s.Dv = cfg.v_is_k ? cfg.v_head_dim : s.Dqk;
+    // The value head is Dqk wide unless the config names its own width — MLA's
+    // latent, or the non-absorbed form's v_head_dim.
+    s.Dv = cfg.v_head_dim > 0 ? cfg.v_head_dim : s.Dqk;
     if (has_past_view(cfg, inputs)) {
         s.Sk_past = inputs[past_slot(cfg)].shape(s.merged ? 1 : 2);
     }
@@ -123,6 +127,23 @@ inline bool has_mask_input(const AttentionConfig& cfg, std::span<const TensorVie
 {
     const size_t m = mask_slot(cfg);
     return inputs.size() > m && !inputs[m].is_empty();
+}
+
+/// A mask view of rank 4 is a per-(batch, head) additive bias [B, H, Sq, Sk];
+/// rank 2 is the flat [Sq, Sk] every head shares. Both occupy the mask slot, so
+/// they are mutually exclusive by construction.
+inline bool mask_is_head_bias(const AttentionConfig& cfg,
+                              std::span<const TensorView> inputs)
+{
+    return has_mask_input(cfg, inputs) && inputs[mask_slot(cfg)].rank() == 4;
+}
+
+/// First element of query row @p i's bias row for (batch @p b, head @p h). The
+/// bias is stored densely over [B][H][Sq], each row one pitch long.
+inline int64_t head_bias_row_offset(int64_t b, int64_t h, int64_t i,
+                                    int64_t H, int64_t Sq, int64_t row_stride)
+{
+    return ((b * H + h) * Sq + i) * row_stride;
 }
 
 // ---- per-batch key-run length (seqlens_k) --------------------------------
@@ -149,6 +170,28 @@ inline int64_t run_length(const int32_t* seqlens, int64_t b, int64_t Sk)
     if (v <= 0) { return 0; }
     return v < Sk ? v : Sk;
 }
+
+// ---- varlen (packed segments) --------------------------------------------
+
+/// cu_seqlens_q / cu_seqlens_k follow seqlens_k: int32 [segments + 1] prefix
+/// offsets into the packed query and key rows. Both or neither, and exclusive
+/// with the mask, the past pair, seqlens_k and position_offset.
+inline size_t cu_q_slot(const AttentionConfig& cfg) { return seqlens_slot(cfg) + 1; }
+inline size_t cu_k_slot(const AttentionConfig& cfg) { return seqlens_slot(cfg) + 2; }
+
+inline bool has_varlen(const AttentionConfig& cfg, std::span<const TensorView> inputs)
+{
+    const size_t s = cu_q_slot(cfg);
+    return inputs.size() > s && !inputs[s].is_empty();
+}
+
+// ---- output gate (Qwen3-Next/3.5) ---------------------------------------
+//
+// The gate follows the varlen pair, so it never disturbs an existing slot. It
+// is shaped like the output and applied to it in place after the route wrote
+// it, which is the one place every route (and the varlen recursion) ends.
+
+inline size_t gate_slot(const AttentionConfig& cfg) { return cu_k_slot(cfg) + 1; }
 
 // ---- scratch slots -------------------------------------------------------
 //
@@ -189,10 +232,44 @@ inline int64_t causal_limit(const AttentionConfig& cfg, int64_t i,
     return lim > run ? run : lim;
 }
 
+/// Inclusive start of query row @p i's window: the first key position it may
+/// still read. 0 without a window, so the valid range stays [0, causal_limit).
+/// The window counts back from the row's own absolute position, the same q0 the
+/// causal limit uses, which makes it a band around the diagonal.
+inline int64_t key_lo(const AttentionConfig& cfg, int64_t i,
+                      int64_t Sq, int64_t run)
+{
+    if (cfg.window <= 0) { return 0; }
+    const int64_t q0 = cfg.position_offset >= 0 ? cfg.position_offset : (run - Sq);
+    const int64_t lo = q0 + i - cfg.window + 1;
+    if (lo <= 0) { return 0; }
+    return lo > run ? run : lo;
+}
+
 template <class T>
 inline void row_fill(T* row, int64_t n, float val)
 {
     for (int64_t i = 0; i < n; ++i) { simd::s_store(&row[i], val); }
+}
+
+/// s' = cap·tanh(s·scale/cap), in place over one row. The softcap rides with
+/// the scale because the standard and flash routes fuse scale into the GEMM1
+/// RHS pack, while the decode route applies both here.
+template <class T>
+inline void row_softcap(T* row, int64_t n, float scale, float cap)
+{
+    using V = kernel::simd_vec_t<T>;
+    constexpr int L = simd::simd_lane_for<T>;
+    const V vinv = simd::v_set1(row, scale / cap);
+    const V vcap = simd::v_set1(row, cap);
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        const V x = simd::v_load(row + i);
+        simd::v_store(row + i, simd::v_mul(vcap, kernel::v_tanh(simd::v_mul(x, vinv))));
+    }
+    for (; i < n; ++i) {
+        simd::s_store(&row[i], cap * std::tanh(simd::s_load(&row[i]) * scale / cap));
+    }
 }
 
 // ---- flash route geometry ------------------------------------------------

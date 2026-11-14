@@ -53,7 +53,7 @@ AttentionPlan attention_plan_for(const AttentionConfig& cfg,
         Sk_new = k.dims[2];
         Dqk = q.dims[3];
     }
-    const int64_t Dv = cfg.v_is_k ? cfg.v_head_dim : Dqk;
+    const int64_t Dv = cfg.v_head_dim > 0 ? cfg.v_head_dim : Dqk;
 
     // A past segment makes the run [past | new]; every route is sized by the
     // whole run, and the standard route — which packs B from one base pointer
