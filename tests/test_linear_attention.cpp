@@ -115,20 +115,29 @@ inline TensorView f16_view(std::vector<half>& buf, const std::vector<int64_t>& s
 }
 
 /// Attributes, input buffers and initial state for one problem; shapes derive
-/// from (B, H, H_kv, S, D).
+/// from (B, H_q, H_k, H_v, S, Dk, Dv). H_v / Dv of 0 mean "same as H_kv / Dk",
+/// which is the plain Gated Delta Net.
 struct Problem {
     LinearAttentionAttributes attrs;
     int64_t B = 1, H = 1, H_kv = 1, S = 4, D = 8;
+    int64_t H_v = 0;         // value heads; 0 -> H_kv
+    int64_t D_v = 0;         // value width; 0 -> D
     int64_t CK = 0;          // convolution taps; 0 => the conv weights are absent
     bool has_beta = false;
 
     std::vector<float> q, k, v, gate, conv_w, beta, state0;
 
+    int64_t hv() const { return H_v > 0 ? H_v : H_kv; }
+    int64_t dv() const { return D_v > 0 ? D_v : D; }
+
     std::vector<int64_t> sh_q()  const { return {B, H, S, D}; }
-    std::vector<int64_t> sh_kv() const { return {B, H_kv, S, D}; }
-    std::vector<int64_t> sh_st() const { return {B, H_kv, D, D}; }
-    std::vector<int64_t> sh_cw() const { return {(H + 2 * H_kv) * D, 1, CK}; }
-    std::vector<int64_t> sh_bt() const { return {B, H_kv, S}; }
+    std::vector<int64_t> sh_o()  const { return {B, H, S, dv()}; }
+    std::vector<int64_t> sh_k()  const { return {B, H_kv, S, D}; }
+    std::vector<int64_t> sh_v()  const { return {B, hv(), S, dv()}; }
+    std::vector<int64_t> sh_g()  const { return {B, hv(), S, D}; }
+    std::vector<int64_t> sh_st() const { return {B, hv(), D, dv()}; }
+    std::vector<int64_t> sh_cw() const { return {(H + H_kv) * D + hv() * dv(), 1, CK}; }
+    std::vector<int64_t> sh_bt() const { return {B, hv(), S}; }
 };
 
 void fill(std::vector<float>& buf, int64_t n, float lo, float hi, uint64_t seed) {
@@ -141,23 +150,26 @@ void fill(std::vector<float>& buf, int64_t n, float lo, float hi, uint64_t seed)
 /// [-2, 0] gives decay factors around [0.14, 1].
 Problem make_problem(LinearAttentionAttributes attrs, int64_t B, int64_t H, int64_t H_kv,
                      int64_t S, int64_t D, int64_t CK = 0, bool has_beta = false,
-                     float gate_lo = -2.0f, float gate_hi = 0.0f, uint64_t seed = 7)
+                     float gate_lo = -2.0f, float gate_hi = 0.0f, uint64_t seed = 7,
+                     int64_t H_v = 0, int64_t D_v = 0)
 {
     Problem p;
     p.attrs = attrs;
     p.B = B; p.H = H; p.H_kv = H_kv; p.S = S; p.D = D;
+    p.H_v = H_v; p.D_v = D_v;
     p.CK = CK; p.has_beta = has_beta;
 
+    const int64_t hv = p.hv(), dv = p.dv();
     fill(p.q, B * H * S * D, -1.0f, 1.0f, seed + 1);
     fill(p.k, B * H_kv * S * D, -1.0f, 1.0f, seed + 2);
-    fill(p.v, B * H_kv * S * D, -1.0f, 1.0f, seed + 3);
-    fill(p.gate, B * H_kv * S * D, gate_lo, gate_hi, seed + 4);
-    fill(p.state0, B * H_kv * D * D, -1.0f, 1.0f, seed + 5);
+    fill(p.v, B * hv * S * dv, -1.0f, 1.0f, seed + 3);
+    fill(p.gate, B * hv * S * D, gate_lo, gate_hi, seed + 4);
+    fill(p.state0, B * hv * D * dv, -1.0f, 1.0f, seed + 5);
     if (CK > 0) {
-        fill(p.conv_w, (H + 2 * H_kv) * D * CK, -0.5f, 0.5f, seed + 6);
+        fill(p.conv_w, ((H + H_kv) * D + hv * dv) * CK, -0.5f, 0.5f, seed + 6);
     }
     if (has_beta) {
-        fill(p.beta, B * H_kv * S, 0.0f, 1.0f, seed + 7);
+        fill(p.beta, B * hv * S, 0.0f, 1.0f, seed + 7);
     }
     return p;
 }
@@ -169,17 +181,18 @@ struct Result {
 /// Run the problem through either the optimized kernel or the reference.
 Result run(Problem& p, bool use_reference, const ComputeContext& ctx = {})
 {
-    const auto sq = p.sh_q(), skv = p.sh_kv(), sst = p.sh_st();
+    const auto sq = p.sh_q(), so = p.sh_o(), sk = p.sh_k(),
+               sv = p.sh_v(), sg = p.sh_g(), sst = p.sh_st();
 
     Result r;
-    r.out.assign(static_cast<size_t>(p.B * p.H * p.S * p.D), 0.0f);
+    r.out.assign(static_cast<size_t>(p.B * p.H * p.S * p.dv()), 0.0f);
     r.state = p.state0;   // State is read, then overwritten in place
 
     TensorView q  = f32_view(p.q, sq);
-    TensorView k  = f32_view(p.k, skv);
-    TensorView v  = f32_view(p.v, skv);
-    TensorView g  = f32_view(p.gate, skv);
-    TensorView o  = f32_view(r.out, sq);
+    TensorView k  = f32_view(p.k, sk);
+    TensorView v  = f32_view(p.v, sv);
+    TensorView g  = f32_view(p.gate, sg);
+    TensorView o  = f32_view(r.out, so);
     TensorView st = f32_view(r.state, sst);
 
     std::vector<TensorView> outputs = {o, st};
@@ -212,10 +225,10 @@ void expect_kernel_matches_reference(Problem& p, const ComputeContext& ctx = {},
     Result want = run(p, /*use_reference=*/true);
     Result got  = run(p, /*use_reference=*/false, ctx);
 
-    const auto sq = p.sh_q(), sst = p.sh_st();
+    const auto so = p.sh_o(), sst = p.sh_st();
     {
-        TensorView gv = f32_view(got.out, sq);
-        TensorView wv = f32_view(want.out, sq);
+        TensorView gv = f32_view(got.out, so);
+        TensorView wv = f32_view(want.out, so);
         if (!test::allclose(gv, wv, 1e-4f, atol)) {
             std::cerr << "  [" << what << "] output max_abs_diff = "
                       << test::max_diff(gv, wv) << "\n";
@@ -679,16 +692,395 @@ NNOPS_TEST(linear_attention_conv_is_causal) {
 
 NNOPS_TEST(linear_attention_f16_matches_reference) {
     LinearAttentionAttributes a;
-    a.head_dim = 8; a.num_heads = 2; a.num_kv_heads = 2;
+    a.num_kv_heads = 2;
     a.conv_kernel_size = 3;
 
-    const int64_t B = 1, H = 2, H_kv = 2, S = 3, D = 8, CK = 3;
+    // [B, H_q, H_k, H_v, S, Dk, Dv, CK, beta]
+    struct G {
+        int64_t B, H, H_kv, H_v, S, D, D_v, CK;
+        bool beta;
+    };
+    const G cases[] = {
+        {1, 2, 2, 0, 3, 8, 0, 3, true},   // plain: Dk == Dv, H_v == H_k
+        {1, 4, 2, 4, 3, 8, 0, 0, false},  // Qwen3-Next head ratio
+        {1, 4, 2, 4, 3, 8, 0, 3, true},   // ... with the conv over all three
+        {1, 2, 2, 2, 3, 8, 4, 0, false},  // narrower value
+    };
 
-    Problem p32 = make_problem(a, B, H, H_kv, S, D, CK, /*has_beta=*/true,
-                               /*gate_lo=*/-1.0f, /*gate_hi=*/0.0f);
+    int64_t ci = 0;
+    for (const auto& c : cases) {
+        const int64_t case_idx = ci++;
+        Problem p32 = make_problem(a, c.B, c.H, c.H_kv, c.S, c.D, c.CK, c.beta,
+                                   /*gate_lo=*/-1.0f, /*gate_hi=*/0.0f,
+                                   /*seed=*/7, c.H_v, c.D_v);
 
-    // Round every input through f16, then use the *rounded* values as the f32
-    // reference input.
+        // Round every input through f16, then use the *rounded* values as the
+        // f32 reference input.
+        Problem p = p32;
+        p.q      = test::f16_to_f32(test::f32_to_f16(p32.q));
+        p.k      = test::f16_to_f32(test::f32_to_f16(p32.k));
+        p.v      = test::f16_to_f32(test::f32_to_f16(p32.v));
+        p.gate   = test::f16_to_f32(test::f32_to_f16(p32.gate));
+        p.conv_w = test::f16_to_f32(test::f32_to_f16(p32.conv_w));
+        p.beta   = test::f16_to_f32(test::f32_to_f16(p32.beta));
+        p.state0 = test::f16_to_f32(test::f32_to_f16(p32.state0));
+
+        Result want = run(p, /*use_reference=*/true);
+
+        // Now the same problem in f16, through the optimized kernel.
+        const auto sq = p.sh_q(), so = p.sh_o(), sk = p.sh_k(), sv = p.sh_v(),
+                   sg = p.sh_g(), sst = p.sh_st(), scw = p.sh_cw(), sbt = p.sh_bt();
+
+        auto q16 = test::f32_to_f16(p.q);
+        auto k16 = test::f32_to_f16(p.k);
+        auto v16 = test::f32_to_f16(p.v);
+        auto g16 = test::f32_to_f16(p.gate);
+        auto w16 = test::f32_to_f16(p.conv_w);
+        auto b16 = test::f32_to_f16(p.beta);
+
+        std::vector<half> out16(static_cast<size_t>(c.B * c.H * c.S * p.dv()));
+        std::vector<half> st16 = test::f32_to_f16(p.state0);
+
+        TensorView q  = f16_view(q16, sq);
+        TensorView k  = f16_view(k16, sk);
+        TensorView v  = f16_view(v16, sv);
+        TensorView g  = f16_view(g16, sg);
+        TensorView o  = f16_view(out16, so);
+        TensorView st = f16_view(st16, sst);
+
+        // Optional slots are positional; an absent one is a default TensorView
+        // (rank 0), not a shaped view over an empty buffer.
+        std::vector<TensorView> ins = {q, k, v, g};
+        TensorView cw, bt;
+        if (c.CK > 0) { cw = f16_view(w16, scw); }
+        if (c.CK > 0 || c.beta) { ins.push_back(cw); }
+        if (c.beta) {
+            bt = f16_view(b16, sbt);
+            ins.push_back(bt);
+        }
+
+        std::vector<TensorView> outputs = {o, st};
+
+        auto op = LinearAttention::create(a, Backend::CPU);
+        const Status sts = op->compute(outputs, ins, {}, nullptr);
+        NNOPS_EXPECT_TRUE(sts == Status::ok);
+
+        float worst_out = 0.0f, worst_st = 0.0f;
+        for (size_t i = 0; i < want.out.size(); ++i) {
+            worst_out = std::max(worst_out,
+                                 std::abs(simd::s_load(&out16[i]) - want.out[i]));
+        }
+        for (size_t i = 0; i < want.state.size(); ++i) {
+            worst_st = std::max(worst_st,
+                                std::abs(simd::s_load(&st16[i]) - want.state[i]));
+        }
+        if (worst_out > test::kF16AccumTol || worst_st > test::kF16AccumTol) {
+            std::cerr << "  [f16 case " << case_idx << "] max_abs_diff = "
+                      << worst_out << " / " << worst_st
+                      << " (tol " << test::kF16AccumTol << ")\n";
+        }
+        NNOPS_EXPECT_TRUE(worst_out <= test::kF16AccumTol);
+        NNOPS_EXPECT_TRUE(worst_st <= test::kF16AccumTol);
+    }
+}
+
+// ============================================================
+// Value geometry: H_v != H_k and D_v != D_k
+// ============================================================
+
+NNOPS_TEST(linear_attention_matches_reference_more_value_heads) {
+    // H_v = 2·H_k (the Qwen3-Next ratio) with the query heads expanded over the
+    // value heads: each key head feeds two independent states, and its K row is
+    // read once per state.
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 4; a.num_kv_heads = 2;
+    Problem p = make_problem(a, /*B=*/2, /*H=*/4, /*H_kv=*/2, /*S=*/5, /*D=*/16,
+                             /*CK=*/0, /*has_beta=*/false,
+                             /*gate_lo=*/-2.0f, /*gate_hi=*/0.0f, /*seed=*/7,
+                             /*H_v=*/4, /*D_v=*/0);
+    expect_kernel_matches_reference(p, {}, "more_value_heads");
+}
+
+NNOPS_TEST(linear_attention_matches_reference_narrow_value) {
+    // D_v < D_k: the state is [Dk, Dv], the decay and the rank-1 update run one
+    // row per key channel but only Dv columns, and the readout is Dv wide.
+    LinearAttentionAttributes a;
+    a.head_dim = 32; a.num_heads = 2; a.num_kv_heads = 2;
+    Problem p = make_problem(a, /*B=*/2, /*H=*/2, /*H_kv=*/2, /*S=*/5, /*D=*/32,
+                             /*CK=*/0, /*has_beta=*/false,
+                             /*gate_lo=*/-2.0f, /*gate_hi=*/0.0f, /*seed=*/7,
+                             /*H_v=*/2, /*D_v=*/16);
+    expect_kernel_matches_reference(p, {}, "narrow_value");
+}
+
+NNOPS_TEST(linear_attention_matches_reference_both_unequal) {
+    // Both axes differ, with the conv and beta: the packed conv channels are
+    // [H_q*Dk Q | H_k*Dk K | H_v*Dv V] and each row convolves at its own width.
+    LinearAttentionAttributes a;
+    a.head_dim = 24; a.num_heads = 4; a.num_kv_heads = 2;
+    a.conv_kernel_size = 3;
+    Problem p = make_problem(a, /*B=*/2, /*H=*/4, /*H_kv=*/2, /*S=*/6, /*D=*/24,
+                             /*CK=*/3, /*has_beta=*/true,
+                             /*gate_lo=*/-2.0f, /*gate_hi=*/0.0f, /*seed=*/7,
+                             /*H_v=*/4, /*D_v=*/16);
+    expect_kernel_matches_reference(p, {}, "both_unequal");
+}
+
+NNOPS_TEST(linear_attention_matches_reference_grouped_narrow) {
+    // Two query heads over one value head (H_q = 2·H_v) *and* a narrower value:
+    // both query heads read one state, at Dv columns each.
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 1;
+    Problem p = make_problem(a, /*B=*/2, /*H=*/2, /*H_kv=*/1, /*S=*/5, /*D=*/16,
+                             /*CK=*/0, /*has_beta=*/false,
+                             /*gate_lo=*/-2.0f, /*gate_hi=*/0.0f, /*seed=*/7,
+                             /*H_v=*/1, /*D_v=*/8);
+    expect_kernel_matches_reference(p, {}, "grouped_narrow");
+}
+
+// One state, two query heads: the two output rows are two different reads of the
+// same state, so zeroing one query row must not move the other.
+NNOPS_TEST(linear_attention_query_heads_read_shared_state) {
+    LinearAttentionAttributes a;
+    a.head_dim = 8; a.num_heads = 2; a.num_kv_heads = 1;
+
+    Problem p = make_problem(a, /*B=*/1, /*H=*/2, /*H_kv=*/1, /*S=*/3, /*D=*/8);
+    const int64_t dv = p.dv(), S = p.S;
+    Result before = run(p, /*use_reference=*/false);
+
+    Problem zero_q1 = p;
+    for (int64_t t = 0; t < S; ++t) {
+        for (int64_t d = 0; d < p.D; ++d) {
+            zero_q1.q[static_cast<size_t>((1 * S + t) * p.D + d)] = 0.0f;
+        }
+    }
+    Result after = run(zero_q1, /*use_reference=*/false);
+
+    // Head 0 is untouched...
+    for (int64_t t = 0; t < S; ++t) {
+        for (int64_t d = 0; d < dv; ++d) {
+            NNOPS_EXPECT_NEAR(after.out[static_cast<size_t>(t * dv + d)],
+                              before.out[static_cast<size_t>(t * dv + d)], 0.0f);
+        }
+    }
+    // ... and head 1 is now zero, so its readout contributes nothing.
+    for (int64_t t = 0; t < S; ++t) {
+        for (int64_t d = 0; d < dv; ++d) {
+            NNOPS_EXPECT_NEAR(after.out[static_cast<size_t>((1 * S + t) * dv + d)],
+                              0.0f, 0.0f);
+        }
+    }
+    // The state itself is shared, so it did not move either.
+    for (size_t i = 0; i < before.state.size(); ++i) {
+        NNOPS_EXPECT_NEAR(after.state[i], before.state[i], 0.0f);
+    }
+}
+
+// ============================================================
+// Validation
+// ============================================================
+
+static TensorDesc td(std::initializer_list<int64_t> dims) {
+    TensorDesc d;
+    d.rank = static_cast<int64_t>(dims.size());
+    for (int64_t v : dims) { d.dims.push_back(v); }
+    d.dtype  = DataType::f32;
+    d.layout = TensorLayout::NCHW;
+    return d;
+}
+
+NNOPS_TEST(linear_attention_validate_value_geometry) {
+    // H_q = 4, H_k = 2, H_v = 4, Dk = 16, Dv = 8: the value head owns the state
+    // and the output columns.
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 4; a.num_kv_heads = 2;
+    a.conv_kernel_size = 3;
+    auto op = LinearAttention::create(a, Backend::CPU);
+
+    const TensorDesc q  = td({1, 4, 5, 16});
+    const TensorDesc k  = td({1, 2, 5, 16});
+    const TensorDesc v  = td({1, 4, 5, 8});
+    const TensorDesc g  = td({1, 4, 5, 16});
+    const TensorDesc o  = td({1, 4, 5, 8});
+    const TensorDesc st = td({1, 4, 16, 8});
+
+    {
+        const TensorDesc ins[] = {q, k, v, g};
+        const TensorDesc outs[] = {o, st};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+    }
+    {
+        // The inferred descriptors agree with the ones validate accepts.
+        const TensorDesc ins[] = {q, k, v, g};
+        auto descs = op->getOutputTensorDesc(ins);
+        NNOPS_EXPECT_EQ(descs.size(), size_t(2));
+        NNOPS_EXPECT_EQ(descs[0].dims[3], int64_t(8));
+        NNOPS_EXPECT_EQ(descs[1].dims[1], int64_t(4));
+        NNOPS_EXPECT_EQ(descs[1].dims[2], int64_t(16));
+        NNOPS_EXPECT_EQ(descs[1].dims[3], int64_t(8));
+    }
+    {
+        // The gate decays one state row per key channel: per value head, Dk wide.
+        const TensorDesc g_bad = td({1, 4, 5, 8});
+        const TensorDesc ins[] = {q, k, v, g_bad};
+        const TensorDesc outs[] = {o, st};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // V's head count must be a multiple of the key heads'.
+        const TensorDesc v_bad = td({1, 3, 5, 8});
+        const TensorDesc ins[] = {q, k, v_bad, g};
+        const TensorDesc outs[] = {o, st};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // 6 query heads over 4 value heads neither expand nor follow the keys.
+        const TensorDesc q_bad = td({1, 6, 5, 16});
+        const TensorDesc o_bad = td({1, 6, 5, 8});
+        const TensorDesc ins[] = {q_bad, k, v, g};
+        const TensorDesc outs[] = {o_bad, st};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // The state is [B, H_v, Dk, Dv]; the last two axes cannot be swapped.
+        const TensorDesc st_bad = td({1, 4, 8, 16});
+        const TensorDesc ins[] = {q, k, v, g};
+        const TensorDesc outs[] = {o, st_bad};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::invalid_argument);
+    }
+    {
+        // Conv channels pack Q | K | V at their own widths: 4*16 + 2*16 + 4*8 = 128.
+        const TensorDesc w     = td({128, 1, 3});
+        const TensorDesc ins[] = {q, k, v, g, w};
+        const TensorDesc outs[] = {o, st};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+
+        const TensorDesc w_bad = td({120, 1, 3});   // Dv taken for Dk
+        const TensorDesc ins_bad[] = {q, k, v, g, w_bad};
+        NNOPS_EXPECT_TRUE(op->validate(ins_bad, outs) == Status::invalid_argument);
+    }
+    {
+        // beta: [B, H_v, S].
+        const TensorDesc w     = td({128, 1, 3});
+        const TensorDesc beta  = td({1, 4, 5});
+        const TensorDesc ins[] = {q, k, v, g, w, beta};
+        const TensorDesc outs[] = {o, st};
+        NNOPS_EXPECT_TRUE(op->validate(ins, outs) == Status::ok);
+
+        const TensorDesc b_bad = td({1, 2, 5});   // key heads, not value heads
+        const TensorDesc ins_bad[] = {q, k, v, g, w, b_bad};
+        NNOPS_EXPECT_TRUE(op->validate(ins_bad, outs) == Status::invalid_argument);
+    }
+}
+
+// ============================================================
+// Chunked prefill
+// ============================================================
+//
+// From kChunkMinSeq tokens up the kernel runs the chunked ("WY") route. It is
+// not bit-identical to the per-token loop — it reassociates the state's
+// contributions into a per-chunk sum — so it is held to the same naive
+// reference as everything else. NNOPS_LINEAR_ATTENTION_ROUTE forces one route
+// or the other, which is how the two are compared on one problem: the automatic
+// choice against the explicit arms, and the arms against each other.
+
+namespace {
+
+void set_route(const char* value) {
+#ifdef _WIN32
+    _putenv_s("NNOPS_LINEAR_ATTENTION_ROUTE", value ? value : "");
+#else
+    if (value) { setenv("NNOPS_LINEAR_ATTENTION_ROUTE", value, 1); }
+    else { unsetenv("NNOPS_LINEAR_ATTENTION_ROUTE"); }
+#endif
+}
+
+/// The kernel under a forced route; `nullptr` restores the automatic choice.
+Result run_route(Problem& p, const char* route, const ComputeContext& ctx = {}) {
+    set_route(route);
+    Result r = run(p, /*use_reference=*/false, ctx);
+    set_route(nullptr);
+    return r;
+}
+
+/// Max |a - b| over the output and the state, as one number.
+float result_diff(const Problem& p, Result a, Result b) {
+    const auto so = p.sh_o(), sst = p.sh_st();
+    TensorView av_o = f32_view(a.out, so), bv_o = f32_view(b.out, so);
+    TensorView av_s = f32_view(a.state, sst), bv_s = f32_view(b.state, sst);
+    return std::max(test::max_diff(av_o, bv_o), test::max_diff(av_s, bv_s));
+}
+
+}  // anonymous namespace
+
+NNOPS_TEST(linear_attention_chunked_matches_reference) {
+    // 128 tokens = four full chunks, with the head grouping, the convolution
+    // and beta all live at once.
+    LinearAttentionAttributes a;
+    a.head_dim = 32; a.num_heads = 4; a.num_kv_heads = 2; a.conv_kernel_size = 3;
+    Problem p = make_problem(a, /*B=*/2, /*H=*/4, /*H_kv=*/2, /*S=*/128, /*D=*/32,
+                             /*CK=*/3, /*has_beta=*/true, /*gate_lo=*/-1.0f,
+                             /*gate_hi=*/0.0f, /*seed=*/7, /*H_v=*/2, /*D_v=*/16);
+    expect_kernel_matches_reference(p, {}, "chunked gqa conv beta", 1e-5f);
+    // ... and that really was the chunked route.
+    NNOPS_EXPECT_TRUE(result_diff(p, run_route(p, nullptr), run_route(p, "chunk")) == 0.0f);
+}
+
+NNOPS_TEST(linear_attention_chunked_tail_matches_reference) {
+    // 100 tokens = three chunks and a 4-token tail: the tail chunk is where a
+    // chunk shorter than kChunk has to behave.
+    LinearAttentionAttributes a;
+    a.head_dim = 24; a.num_heads = 2; a.num_kv_heads = 2; a.conv_kernel_size = 3;
+    Problem p = make_problem(a, /*B=*/1, /*H=*/2, /*H_kv=*/2, /*S=*/100, /*D=*/24,
+                             /*CK=*/3, /*has_beta=*/true);
+    expect_kernel_matches_reference(p, {}, "chunked tail", 1e-5f);
+}
+
+NNOPS_TEST(linear_attention_chunked_matches_token_route) {
+    // Both routes over one problem, at a key width that is not a multiple of
+    // the SIMD lane count and a value width that is neither.
+    LinearAttentionAttributes a;
+    a.head_dim = 20; a.num_heads = 3; a.num_kv_heads = 1; a.conv_kernel_size = 2;
+    Problem p = make_problem(a, /*B=*/1, /*H=*/3, /*H_kv=*/1, /*S=*/77, /*D=*/20,
+                             /*CK=*/2, /*has_beta=*/true, /*gate_lo=*/-1.0f,
+                             /*gate_hi=*/0.0f, /*seed=*/11, /*H_v=*/3, /*D_v=*/12);
+    NNOPS_EXPECT_TRUE(result_diff(p, run_route(p, "chunk"), run_route(p, "token")) < 1e-5f);
+
+    // Forcing the chunked route below kChunkMinSeq is legal: the whole sequence
+    // is one short chunk.
+    LinearAttentionAttributes b;
+    b.head_dim = 16; b.num_heads = 1; b.num_kv_heads = 1;
+    Problem s = make_problem(b, /*B=*/1, /*H=*/1, /*H_kv=*/1, /*S=*/5, /*D=*/16,
+                             /*CK=*/0, /*has_beta=*/false);
+    NNOPS_EXPECT_TRUE(result_diff(s, run_route(s, "chunk"), run_route(s, "token")) < 1e-6f);
+}
+
+NNOPS_TEST(linear_attention_chunked_long_sequence) {
+    // Enough chunks that the state's error has room to accumulate.
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 2;
+    Problem p = make_problem(a, /*B=*/1, /*H=*/2, /*H_kv=*/2, /*S=*/1024, /*D=*/16,
+                             /*CK=*/0, /*has_beta=*/false, /*gate_lo=*/-1.0f);
+    expect_kernel_matches_reference(p, {}, "chunked 1024", 1e-5f);
+}
+
+NNOPS_TEST(linear_attention_chunked_threaded) {
+    SimplePool pool(4);
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 1; a.conv_kernel_size = 3;
+    Problem p = make_problem(a, /*B=*/2, /*H=*/2, /*H_kv=*/1, /*S=*/192, /*D=*/16,
+                             /*CK=*/3, /*has_beta=*/true);
+    expect_kernel_matches_reference(p, pool.context(), "chunked threaded", 1e-5f);
+}
+
+NNOPS_TEST(linear_attention_chunked_f16) {
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 2; a.conv_kernel_size = 3;
+    Problem p32 = make_problem(a, /*B=*/1, /*H=*/2, /*H_kv=*/2, /*S=*/96, /*D=*/16,
+                               /*CK=*/3, /*has_beta=*/true, /*gate_lo=*/-1.0f);
+
+    // The reference reads the f16-rounded inputs, so the compare is about the
+    // route and not about the input precision.
     Problem p = p32;
     p.q      = test::f16_to_f32(test::f32_to_f16(p32.q));
     p.k      = test::f16_to_f32(test::f32_to_f16(p32.k));
@@ -696,49 +1088,60 @@ NNOPS_TEST(linear_attention_f16_matches_reference) {
     p.gate   = test::f16_to_f32(test::f32_to_f16(p32.gate));
     p.conv_w = test::f16_to_f32(test::f32_to_f16(p32.conv_w));
     p.beta   = test::f16_to_f32(test::f32_to_f16(p32.beta));
+    p.state0 = test::f16_to_f32(test::f32_to_f16(p32.state0));
+    const Result want = run(p, /*use_reference=*/true);
 
-    Result want = run(p, /*use_reference=*/true);
-
-    // Now the same problem in f16, through the optimized kernel.
-    const auto sq = p.sh_q(), skv = p.sh_kv(), sst = p.sh_st(),
-               scw = p.sh_cw(), sbt = p.sh_bt();
-
+    const auto sq = p.sh_q(), so = p.sh_o(), sk = p.sh_k(), sv = p.sh_v(),
+               sg = p.sh_g(), sst = p.sh_st(), scw = p.sh_cw(), sbt = p.sh_bt();
     auto q16 = test::f32_to_f16(p.q);
     auto k16 = test::f32_to_f16(p.k);
     auto v16 = test::f32_to_f16(p.v);
     auto g16 = test::f32_to_f16(p.gate);
     auto w16 = test::f32_to_f16(p.conv_w);
     auto b16 = test::f32_to_f16(p.beta);
-
-    std::vector<half> out16(static_cast<size_t>(B * H * S * D));
+    std::vector<half> out16(static_cast<size_t>(p.B * p.H * p.S * p.dv()));
     std::vector<half> st16 = test::f32_to_f16(p.state0);
 
-    TensorView q  = f16_view(q16, sq);
-    TensorView k  = f16_view(k16, skv);
-    TensorView v  = f16_view(v16, skv);
-    TensorView g  = f16_view(g16, skv);
-    TensorView cw = f16_view(w16, scw);
-    TensorView bt = f16_view(b16, sbt);
-    TensorView o  = f16_view(out16, sq);
-    TensorView st = f16_view(st16, sst);
+    TensorView q = f16_view(q16, sq), k = f16_view(k16, sk),
+               v = f16_view(v16, sv), g = f16_view(g16, sg);
+    TensorView o = f16_view(out16, so), st = f16_view(st16, sst);
+    TensorView cw = f16_view(w16, scw), bt = f16_view(b16, sbt);
 
-    std::vector<TensorView> outputs = {o, st};
-    std::vector<TensorView> ins = {q, k, v, g, cw, bt};
+    std::vector<TensorView> outs = {o, st};
+    const TensorView ins[] = {q, k, v, g, cw, bt};
+    auto op = LinearAttention::create(p.attrs, Backend::CPU);
+    NNOPS_EXPECT_TRUE(op->compute(outs, ins) == Status::ok);
 
-    auto op = LinearAttention::create(a, Backend::CPU);
-    op->compute(outputs, ins, {}, nullptr);
-
-    auto expect_f16 = [&](std::vector<half>& got, std::vector<float>& ref,
-                          const char* what) {
-        float worst = 0.0f;
-        for (size_t i = 0; i < ref.size(); ++i) {
-            worst = std::max(worst, std::abs(simd::s_load(&got[i]) - ref[i]));
-        }
-        std::cerr << "  [f16 " << what << "] max_abs_diff = " << worst
-                  << " (tol " << test::kF16AccumTol << ")\n";
-        NNOPS_EXPECT_TRUE(worst <= test::kF16AccumTol);
-    };
-
-    expect_f16(out16, want.out, "output");
-    expect_f16(st16, want.state, "state");
+    const auto got_o = test::f16_to_f32(out16);
+    const auto got_s = test::f16_to_f32(st16);
+    float worst = 0.0f;
+    for (size_t i = 0; i < got_o.size(); ++i) {
+        worst = std::max(worst, std::fabs(got_o[i] - want.out[i]));
+    }
+    for (size_t i = 0; i < got_s.size(); ++i) {
+        worst = std::max(worst, std::fabs(got_s[i] - want.state[i]));
+    }
+    NNOPS_EXPECT_TRUE(worst < 2e-3f);
 }
+
+NNOPS_TEST(linear_attention_chunked_falls_back_when_decay_overflows) {
+    // A gate this negative pushes one chunk's cumulative log decay past what
+    // its +- scaling can hold (kChunk * 6 > 80), so the route must hand the
+    // sequence back to the per-token loop before computing anything — which
+    // makes the result bit-identical to the forced per-token run. A guard that
+    // did not fire would scale by inf and come back with NaNs.
+    LinearAttentionAttributes a;
+    a.head_dim = 16; a.num_heads = 2; a.num_kv_heads = 2;
+    Problem p = make_problem(a, /*B=*/1, /*H=*/2, /*H_kv=*/2, /*S=*/96, /*D=*/16,
+                             /*CK=*/0, /*has_beta=*/false,
+                             /*gate_lo=*/-7.0f, /*gate_hi=*/-6.0f);
+    const Result auto_r = run_route(p, nullptr);
+    // The first tokens still carry the initial state, so the outputs are not
+    // all zeros and the compare below is not vacuous.
+    float peak = 0.0f;
+    for (float v : auto_r.out) { peak = std::max(peak, std::fabs(v)); }
+    NNOPS_EXPECT_TRUE(peak > 1e-6f);
+    NNOPS_EXPECT_TRUE(result_diff(p, auto_r, run_route(p, "token")) == 0.0f);
+    expect_kernel_matches_reference(p, {}, "fallback", 1e-6f);
+}
+

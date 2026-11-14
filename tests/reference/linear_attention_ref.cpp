@@ -8,8 +8,8 @@
 /// computed in f32 with naive triple-nested loops; only the I/O is rounded
 /// through T.
 ///
-/// Semantics (see linear_attention.hpp for the full contract). Per (batch, kv
-/// head), carrying S[D, D] over the sequence, every token t runs:
+/// Semantics (see linear_attention.hpp for the full contract). Per (batch,
+/// value head), carrying S[Dk, Dv] over the sequence, every token t runs:
 ///
 ///   q, k, v = causal_conv(Q/K/V rows at t)      (when conv weights are given)
 ///   S[i][:] *= exp(Gate[t, i])                  decay the state
@@ -18,9 +18,10 @@
 ///   S[i][j] += k[i] * d[j]                      rank-1 update
 ///   o[j]     = scale * sum_i q[i] * S[i][j]     readout, once per query head
 ///
-/// The conv weights pack Q | K | V along the channel axis (C = (H + 2*H_kv)*D)
-/// and run causally with zeros left of t = 0. The state is carried in f32 and
-/// overwritten in place; beta is one scalar per (batch, kv head, token).
+/// The conv weights pack Q | K | V along the channel axis
+/// (C = (H_q + H_k)*Dk + H_v*Dv) and run causally with zeros left of t = 0. The
+/// state is carried in f32 and overwritten in place; beta is one scalar per
+/// (batch, value head, token).
 
 #include "nnops/ops/linear_attention.hpp"
 #include "nnops/detail/assert.hpp"
@@ -53,12 +54,18 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
     TensorView& O  = outputs[0];
     TensorView& St = outputs[1];
 
-    const int64_t B    = Q.shape(0);
-    const int64_t H    = Q.shape(1);
-    const int64_t S    = Q.shape(2);
-    const int64_t D    = Q.shape(3);
-    const int64_t H_kv = attrs.num_kv_heads > 0 ? attrs.num_kv_heads : H;
-    const int64_t Gq   = H / H_kv;   // query heads sharing one kv head
+    const int64_t B  = Q.shape(0);
+    const int64_t Hq = Q.shape(1);
+    const int64_t S  = Q.shape(2);
+    const int64_t Dk = Q.shape(3);
+    const int64_t Hk = attrs.num_kv_heads > 0 ? attrs.num_kv_heads : Hq;
+    const int64_t Hv = V.shape(1);   // the value head owns the state
+    const int64_t Dv = V.shape(3);
+
+    // The state belongs to the value head, so Q is indexed by the value head —
+    // a caller with Q at the key width repeats it first.
+    const int64_t Gqq = Hq / Hv;
+    const int64_t Gvk = Hv / Hk;
 
     const bool has_conv = inputs.size() > 4 && !inputs[4].is_empty();
     const bool has_beta = inputs.size() > 5 && !inputs[5].is_empty();
@@ -66,7 +73,7 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
 
     const float scale = attrs.scale != 0.0f
         ? attrs.scale
-        : 1.0f / std::sqrt(static_cast<float>(D));
+        : 1.0f / std::sqrt(static_cast<float>(Dk));
 
     // Element strides; the trailing dim is contiguous.
     const int64_t qs0 = Q.stride_elems(0), qs1 = Q.stride_elems(1), qs2 = Q.stride_elems(2);
@@ -82,28 +89,29 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
     const int64_t bs1  = has_beta ? inputs[5].stride_elems(1) : 0;
     const int64_t bs2  = has_beta ? inputs[5].stride_elems(2) : 0;
 
-    // Conv channel bases: Q is H*D wide, then K and V, H_kv*D each.
-    const int64_t k_ch_base = H * D;
-    const int64_t v_ch_base = H * D + H_kv * D;
+    // Conv channel bases: Q over its expanded heads (Hq*Dk), then K (Hk*Dk),
+    // then V (Hv*Dv).
+    const int64_t k_ch_base = Hq * Dk;
+    const int64_t v_ch_base = Hq * Dk + Hk * Dk;
 
-    std::vector<float> Sf(static_cast<size_t>(D) * static_cast<size_t>(D));
-    std::vector<float> kc(static_cast<size_t>(D));
-    std::vector<float> vc(static_cast<size_t>(D));
-    std::vector<float> qc(static_cast<size_t>(D));
-    std::vector<float> d(static_cast<size_t>(D));
-    std::vector<float> acc(static_cast<size_t>(D));
+    std::vector<float> Sf(static_cast<size_t>(Dk) * static_cast<size_t>(Dv));
+    std::vector<float> kc(static_cast<size_t>(Dk));
+    std::vector<float> vc(static_cast<size_t>(Dv));
+    std::vector<float> qc(static_cast<size_t>(Dk));
+    std::vector<float> d(static_cast<size_t>(Dv));
+    std::vector<float> acc(static_cast<size_t>(Dv));
 
     // Row t of `src`, causally convolved when conv weights are present.
     const T* cw = has_conv ? inputs[4].ptr<T>() : nullptr;
     auto fetch_row = [&](const T* src, int64_t src_ts, int64_t ch_base,
-                         int64_t t, float* dst) {
+                         int64_t W, int64_t t, float* dst) {
         if (!has_conv) {
             const T* row = src + t * src_ts;
-            for (int64_t i = 0; i < D; ++i) { dst[i] = load_f(row + i); }
+            for (int64_t i = 0; i < W; ++i) { dst[i] = load_f(row + i); }
             return;
         }
         // y[t] = sum_k w[:, k] * x[t - (K-1) + k], with x = 0 for t < 0.
-        for (int64_t i = 0; i < D; ++i) {
+        for (int64_t i = 0; i < W; ++i) {
             const T* w = cw + (ch_base + i) * cws0;
             float acc_v = 0.0f;
             for (int64_t ck = 0; ck < CK; ++ck) {
@@ -123,74 +131,75 @@ void linear_attention_ref_impl(const LinearAttentionAttributes& attrs,
     T*       sp = St.ptr<T>();
 
     for (int64_t b = 0; b < B; ++b) {
-        for (int64_t hkv = 0; hkv < H_kv; ++hkv) {
-            const int64_t hq0 = hkv * Gq;
+        for (int64_t hv = 0; hv < Hv; ++hv) {
+            const int64_t hk  = hv / Gvk;
+            const int64_t hq0 = hv * Gqq;
 
-            for (int64_t i = 0; i < D; ++i) {
-                for (int64_t j = 0; j < D; ++j) {
-                    Sf[static_cast<size_t>(i * D + j)] =
-                        load_f(sp + b * ts0 + hkv * ts1 + i * ts2 + j * ts3);
+            for (int64_t i = 0; i < Dk; ++i) {
+                for (int64_t j = 0; j < Dv; ++j) {
+                    Sf[static_cast<size_t>(i * Dv + j)] =
+                        load_f(sp + b * ts0 + hv * ts1 + i * ts2 + j * ts3);
                 }
             }
 
-            const T* k_base = kp + b * ks0 + hkv * ks1;
-            const T* v_base = vp + b * vs0 + hkv * vs1;
-            const T* g_base = gp + b * gs0 + hkv * gs1;
+            const T* k_base = kp + b * ks0 + hk * ks1;
+            const T* v_base = vp + b * vs0 + hv * vs1;
+            const T* g_base = gp + b * gs0 + hv * gs1;
 
             for (int64_t t = 0; t < S; ++t) {
-                fetch_row(k_base, ks2, k_ch_base + hkv * D, t, kc.data());
-                fetch_row(v_base, vs2, v_ch_base + hkv * D, t, vc.data());
+                fetch_row(k_base, ks2, k_ch_base + hk * Dk, Dk, t, kc.data());
+                fetch_row(v_base, vs2, v_ch_base + hv * Dv, Dv, t, vc.data());
 
-                for (int64_t i = 0; i < D; ++i) {
+                for (int64_t i = 0; i < Dk; ++i) {
                     const float g = std::exp(load_f(g_base + t * gs2 + i));
-                    float* row = Sf.data() + i * D;
-                    for (int64_t j = 0; j < D; ++j) { row[j] *= g; }
+                    float* row = Sf.data() + i * Dv;
+                    for (int64_t j = 0; j < Dv; ++j) { row[j] *= g; }
                 }
 
                 std::fill(d.begin(), d.end(), 0.0f);
-                for (int64_t i = 0; i < D; ++i) {
+                for (int64_t i = 0; i < Dk; ++i) {
                     const float ki = kc[static_cast<size_t>(i)];
-                    const float* row = Sf.data() + i * D;
-                    for (int64_t j = 0; j < D; ++j) { d[static_cast<size_t>(j)] += row[j] * ki; }
+                    const float* row = Sf.data() + i * Dv;
+                    for (int64_t j = 0; j < Dv; ++j) { d[static_cast<size_t>(j)] += row[j] * ki; }
                 }
 
                 const float beta = has_beta
-                    ? load_f(inputs[5].ptr<T>() + b * bs0 + hkv * bs1 + t * bs2)
+                    ? load_f(inputs[5].ptr<T>() + b * bs0 + hv * bs1 + t * bs2)
                     : 1.0f;
-                for (int64_t j = 0; j < D; ++j) {
+                for (int64_t j = 0; j < Dv; ++j) {
                     d[static_cast<size_t>(j)] =
                         beta * (vc[static_cast<size_t>(j)] - d[static_cast<size_t>(j)]);
                 }
 
-                for (int64_t i = 0; i < D; ++i) {
+                for (int64_t i = 0; i < Dk; ++i) {
                     const float ki = kc[static_cast<size_t>(i)];
-                    float* row = Sf.data() + i * D;
-                    for (int64_t j = 0; j < D; ++j) { row[j] += ki * d[static_cast<size_t>(j)]; }
+                    float* row = Sf.data() + i * Dv;
+                    for (int64_t j = 0; j < Dv; ++j) { row[j] += ki * d[static_cast<size_t>(j)]; }
                 }
 
-                for (int64_t g = 0; g < Gq; ++g) {
+                for (int64_t g = 0; g < Gqq; ++g) {
                     const int64_t hq = hq0 + g;
-                    fetch_row(qp + b * qs0 + hq * qs1, qs2, hq * D, t, qc.data());
+                    fetch_row(qp + b * qs0 + hq * qs1, qs2, hq * Dk, Dk, t, qc.data());
 
                     std::fill(acc.begin(), acc.end(), 0.0f);
-                    for (int64_t i = 0; i < D; ++i) {
+                    for (int64_t i = 0; i < Dk; ++i) {
                         const float qi = qc[static_cast<size_t>(i)];
-                        const float* row = Sf.data() + i * D;
-                        for (int64_t j = 0; j < D; ++j) {
+                        const float* row = Sf.data() + i * Dv;
+                        for (int64_t j = 0; j < Dv; ++j) {
                             acc[static_cast<size_t>(j)] += row[j] * qi;
                         }
                     }
                     T* o_row = op + b * os0 + hq * os1 + t * os2;
-                    for (int64_t j = 0; j < D; ++j) {
+                    for (int64_t j = 0; j < Dv; ++j) {
                         store_f(o_row + j, scale * acc[static_cast<size_t>(j)]);
                     }
                 }
             }
 
-            for (int64_t i = 0; i < D; ++i) {
-                for (int64_t j = 0; j < D; ++j) {
-                    store_f(sp + b * ts0 + hkv * ts1 + i * ts2 + j * ts3,
-                            Sf[static_cast<size_t>(i * D + j)]);
+            for (int64_t i = 0; i < Dk; ++i) {
+                for (int64_t j = 0; j < Dv; ++j) {
+                    store_f(sp + b * ts0 + hv * ts1 + i * ts2 + j * ts3,
+                            Sf[static_cast<size_t>(i * Dv + j)]);
                 }
             }
         }
