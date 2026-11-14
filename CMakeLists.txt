@@ -11,7 +11,15 @@ option(NNOPS_BUILD_BENCHMARKS "Build benchmarks"           ON)
 option(NNOPS_BUILD_MODELS     "Build the end-to-end model tests" ON)
 option(NNOPS_BUILD_CUDA       "Build CUDA backend"         OFF)
 option(NNOPS_BUILD_VULKAN     "Build Vulkan backend"       OFF)
+option(NNOPS_BUILD_METAL      "Build Metal backend (Apple only)" OFF)
 option(NNOPS_OPENMP           "Build the OpenMP CpuBackend adapter" OFF)
+
+if(NNOPS_BUILD_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "NNOPS_BUILD_METAL is only supported on Apple platforms")
+    endif()
+    enable_language(OBJCXX)
+endif()
 
 # ---- C++ Standard ----
 set(CMAKE_CXX_STANDARD 23)
@@ -75,12 +83,20 @@ endif()
 if(NNOPS_BUILD_VULKAN)
     list(APPEND NNOPS_INSTALL_TARGETS nnops_vulkan)
 endif()
+if(NNOPS_BUILD_METAL)
+    list(APPEND NNOPS_INSTALL_TARGETS nnops_metal)
+endif()
 install(TARGETS ${NNOPS_INSTALL_TARGETS} EXPORT nnopsTargets)
 install(EXPORT nnopsTargets
     NAMESPACE nnops::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nnops
 )
 install(DIRECTORY include/nnops DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# ---- Examples (Metal demo) ----
+if(NNOPS_BUILD_METAL)
+    add_subdirectory(examples)
+endif()
 
 # ---- Tests ----
 if(NNOPS_BUILD_TESTS)

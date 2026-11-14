@@ -37,6 +37,11 @@ struct ComputeContext {
     const void* vulkan_buffers = nullptr;  ///< VkBuffer handles, inputs first; see header.
 
     int vulkan_buffers_count = 0;  ///< Entries in vulkan_buffers.
+
+    /// Metal buffers (id<MTLBuffer> bridged to void*), inputs first,
+    /// output last; the backend owns the device, queue and pipelines.
+    const void* metal_buffers = nullptr;
+    int metal_buffers_count = 0;
 };
 
 }  // namespace nnops

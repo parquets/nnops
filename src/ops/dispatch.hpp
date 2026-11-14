@@ -32,6 +32,11 @@
 #else
 #define NNOPS_IF_VULKAN(x) nullptr
 #endif
+#if defined(NNOPS_HAS_METAL)
+#define NNOPS_IF_METAL(x) x
+#else
+#define NNOPS_IF_METAL(x) nullptr
+#endif
 
 /// Default kernel signature: one output view, N input views.
 #define NNOPS_KERNEL_ARGS(Attrs)                                       \
@@ -44,6 +49,8 @@
     namespace backend::cuda { Status fn NNOPS_KERNEL_ARGS(Attrs); }
 #define NNOPS_DECLARE_VULKAN(Attrs, fn)                                \
     namespace backend::vulkan { Status fn NNOPS_KERNEL_ARGS(Attrs); }
+#define NNOPS_DECLARE_METAL(Attrs, fn)                                 \
+    namespace backend::metal { Status fn NNOPS_KERNEL_ARGS(Attrs); }
 
 /// The op's Impl (one function pointer) and its out-of-line destructor.
 #define NNOPS_KERNEL_IMPL(Op, Attrs)                                   \
@@ -82,3 +89,20 @@
 /// instead of aborting the host process at create() time.
 #define NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan)                   \
     NNOPS_PICK_KERNEL(Fn, be, cpu, cuda, vulkan)
+
+/// Boilerplate for ops that also have a Metal kernel; the rest keep
+/// NNOPS_OP_BOILERPLATE and resolve Metal to nullptr.
+#define NNOPS_OP_BOILERPLATE_METAL(Op, Attrs, cpu, cuda, vulkan, metal) \
+    NNOPS_KERNEL_IMPL(Op, Attrs)                                       \
+    NNOPS_OP_CREATE(Op, Attrs)                                         \
+    Op::Op(const Attrs& attrs, Backend backend)                        \
+        : impl_(std::make_unique<Impl>()), attrs_(attrs),               \
+          backend_(backend)                                            \
+    {                                                                  \
+        impl_->kernel_fn = NNOPS_RESOLVE_METAL(Op, Op::Impl::KernelFn, \
+                                               backend, cpu, cuda, vulkan, metal); \
+    }
+
+#define NNOPS_RESOLVE_METAL(Op, Fn, be, cpu, cuda, vulkan, metal)      \
+    ((be) == Backend::Metal ? static_cast<Fn>(metal)                   \
+                            : NNOPS_RESOLVE(Op, Fn, be, cpu, cuda, vulkan))

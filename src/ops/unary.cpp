@@ -11,9 +11,12 @@ namespace nnops {
 NNOPS_DECLARE_CPU(UnaryAttributes, unary_cpu)
 NNOPS_DECLARE_CUDA(UnaryAttributes, unary_cuda)
 NNOPS_DECLARE_VULKAN(UnaryAttributes, unary_vulkan)
+NNOPS_DECLARE_METAL(UnaryAttributes, unary_metal)
 
-NNOPS_OP_BOILERPLATE(Unary, UnaryAttributes,
-        backend::cpu::unary_cpu, NNOPS_IF_CUDA(backend::cuda::unary_cuda), NNOPS_IF_VULKAN(backend::vulkan::unary_vulkan))
+NNOPS_OP_BOILERPLATE_METAL(Unary, UnaryAttributes,
+        backend::cpu::unary_cpu, NNOPS_IF_CUDA(backend::cuda::unary_cuda),
+        NNOPS_IF_VULKAN(backend::vulkan::unary_vulkan),
+        NNOPS_IF_METAL(backend::metal::unary_metal))
 
 std::vector<TensorDesc> Unary::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

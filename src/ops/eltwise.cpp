@@ -11,9 +11,12 @@ namespace nnops {
 NNOPS_DECLARE_CPU(EltwiseAttributes, eltwise_cpu)
 NNOPS_DECLARE_CUDA(EltwiseAttributes, eltwise_cuda)
 NNOPS_DECLARE_VULKAN(EltwiseAttributes, eltwise_vulkan)
+NNOPS_DECLARE_METAL(EltwiseAttributes, eltwise_metal)
 
-NNOPS_OP_BOILERPLATE(Eltwise, EltwiseAttributes,
-        backend::cpu::eltwise_cpu, NNOPS_IF_CUDA(backend::cuda::eltwise_cuda), NNOPS_IF_VULKAN(backend::vulkan::eltwise_vulkan))
+NNOPS_OP_BOILERPLATE_METAL(Eltwise, EltwiseAttributes,
+        backend::cpu::eltwise_cpu, NNOPS_IF_CUDA(backend::cuda::eltwise_cuda),
+        NNOPS_IF_VULKAN(backend::vulkan::eltwise_vulkan),
+        NNOPS_IF_METAL(backend::metal::eltwise_metal))
 
 std::vector<TensorDesc> Eltwise::getOutputTensorDesc(
     std::span<const TensorDesc> inputs) const

@@ -17,6 +17,7 @@ enum class Backend : uint8_t {
     CPU    = 0,  ///< CPU reference or optimized implementation
     CUDA   = 1,  ///< NVIDIA CUDA GPU backend
     Vulkan = 2,  ///< Vulkan GPU backend
+    Metal  = 3,  ///< Apple Metal GPU backend (unary and eltwise so far)
 };
 
 /// Force-release pooled operator scratch back to the OS.

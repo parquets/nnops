@@ -304,6 +304,33 @@ if(NNOPS_BUILD_VULKAN)
     target_link_libraries(nnops_cpu PUBLIC nnops_vulkan)
 endif()
 
+# ---- Metal backend (Apple only) ----
+if(NNOPS_BUILD_METAL)
+    find_library(METAL_FRAMEWORK Metal REQUIRED)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+
+    set(NNOPS_METAL_SOURCES
+        backend/metal/metal_common.mm
+        backend/metal/unary.mm
+        backend/metal/eltwise.mm
+    )
+    add_library(nnops_metal STATIC ${NNOPS_METAL_SOURCES})
+    target_link_libraries(nnops_metal PUBLIC nnops
+        ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+    target_include_directories(nnops_metal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_compile_options(nnops_metal PRIVATE
+        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+
+    # The op dispatch layer lives in nnops_cpu and resolves the Metal entry
+    # points; the definition is PUBLIC so the dispatch table is compiled with
+    # them and consumers inherit the link.
+    target_compile_definitions(nnops_cpu PUBLIC NNOPS_HAS_METAL)
+    target_link_libraries(nnops_cpu PUBLIC nnops_metal)
+endif()
+
 # ---- Alias targets for unified consumption ----
 add_library(nnops::nnops ALIAS nnops)
 add_library(nnops::cpu   ALIAS nnops_cpu)
