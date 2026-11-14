@@ -1115,3 +1115,262 @@ NNOPS_TEST(rope_random_interleaved_f16) {
         NNOPS_EXPECT_NEAR(result, ref[i], 5e-2f);
     }
 }
+
+// ============================================================
+// Caller-supplied cos/sin tables
+// ============================================================
+
+/// Rotation driven by an explicit table pair: the same pairs the computed
+/// route uses — (2p, 2p+1) interleaved, (p, p+half) split-half — with the
+/// angles whatever the caller encoded. Lanes past rotary_dim copy through.
+static void rotate_with_tables(const float* x, float* y,
+                               int64_t seq_len, int64_t outer,
+                               int64_t head_dim, int64_t rotary_dim,
+                               bool interleaved,
+                               const std::vector<float>& cos_t,
+                               const std::vector<float>& sin_t,
+                               const float* gamma = nullptr,
+                               const float* beta = nullptr,
+                               float eps = 1e-5f) {
+    const int64_t half = rotary_dim / 2;
+    std::vector<float> row_buf(static_cast<size_t>(head_dim));
+
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t pos = 0; pos < seq_len; ++pos) {
+            const int64_t r = o * seq_len + pos;
+            const float* src = x + r * head_dim;
+            float* dst = y + r * head_dim;
+
+            if (gamma) {
+                // The fused pre-norm the operator applies before the rotation.
+                float sum_sq = 0.0f;
+                for (int64_t d = 0; d < head_dim; ++d) { sum_sq += src[d] * src[d]; }
+                const float inv = 1.0f / std::sqrt(
+                    sum_sq / static_cast<float>(head_dim) + eps);
+                for (int64_t d = 0; d < head_dim; ++d) {
+                    row_buf[static_cast<size_t>(d)] =
+                        src[d] * inv * gamma[d] + (beta ? beta[d] : 0.0f);
+                }
+                src = row_buf.data();
+            }
+
+            for (int64_t d = 0; d < head_dim; ++d) { dst[d] = src[d]; }
+            for (int64_t p = 0; p < half; ++p) {
+                const float c = cos_t[static_cast<size_t>(pos * half + p)];
+                const float s = sin_t[static_cast<size_t>(pos * half + p)];
+                const int64_t i0 = interleaved ? 2 * p : p;
+                const int64_t i1 = interleaved ? 2 * p + 1 : p + half;
+                dst[i0] = src[i0] * c - src[i1] * s;
+                dst[i1] = src[i1] * c + src[i0] * s;
+            }
+        }
+    }
+}
+
+/// The tables themselves: an axial 2D-style schedule, deliberately unlike any
+/// base/factor formula the computed route can produce.
+static void build_axial_tables(int64_t seq_len, int64_t half,
+                               std::vector<float>& cos_t,
+                               std::vector<float>& sin_t) {
+    cos_t.resize(static_cast<size_t>(seq_len * half));
+    sin_t.resize(static_cast<size_t>(seq_len * half));
+    for (int64_t pos = 0; pos < seq_len; ++pos) {
+        for (int64_t p = 0; p < half; ++p) {
+            const float theta = 0.37f * static_cast<float>(pos)
+                              * (1.0f + 0.25f * static_cast<float>(p))
+                              + 0.11f * static_cast<float>(p % 3);
+            cos_t[static_cast<size_t>(pos * half + p)] = std::cos(theta);
+            sin_t[static_cast<size_t>(pos * half + p)] = std::sin(theta);
+        }
+    }
+}
+
+// A caller-supplied pair replaces the angle computation: every table row is
+// consumed in order, so base, position_offset and the scaling types are dead
+// settings on this route. The slots after the activation may be left empty, so
+// the pair does not force a dummy scale and bias.
+NNOPS_TEST(rope_precomputed_tables) {
+    const int64_t outer = 2, seq_len = 5, head_dim = 16, rotary_dim = 12;
+    const int64_t half = rotary_dim / 2;
+    const int64_t shape[] = {outer, seq_len, head_dim};
+    auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, 501);
+
+    std::vector<float> cos_t, sin_t;
+    build_axial_tables(seq_len, half, cos_t, sin_t);
+    const int64_t t_shape[] = {seq_len, half};
+    TensorView cosv(t_shape, DataType::f32, cos_t.data());
+    TensorView sinv(t_shape, DataType::f32, sin_t.data());
+
+    for (int interleaved = 0; interleaved < 2; ++interleaved) {
+        RoPEAttributes attrs;
+        attrs.interleaved = interleaved != 0;
+        attrs.rotary_dim = rotary_dim;
+        // Ignored on the table route — set to a value that would change the
+        // computed angles if it were read.
+        attrs.base = 3.0f;
+        attrs.position_offset = 97;
+        attrs.scaling_type = RoPEScalingType::Linear;
+        attrs.scaling_factor = 8.0f;
+
+        auto op = RoPE::create(attrs, Backend::CPU);
+        const TensorDesc da[] = {in_view.desc()};
+        auto descs = op->getOutputTensorDesc(da);
+
+        std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
+        auto y = test::make_channel_first(descs[0], out_buf.data());
+        const TensorView ins[] = {in_view, TensorView{}, TensorView{}, cosv, sinv};
+        NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+        std::vector<float> ref(out_buf.size(), 0.0f);
+        rotate_with_tables(in_vec.data(), ref.data(), seq_len, outer,
+                           head_dim, rotary_dim, attrs.interleaved, cos_t, sin_t);
+        for (size_t i = 0; i < out_buf.size(); ++i) {
+            NNOPS_EXPECT_NEAR(out_buf[i], ref[i], 1e-5f);
+        }
+    }
+}
+
+// The table route still runs the fused pre-norm before rotating.
+NNOPS_TEST(rope_precomputed_tables_with_norm) {
+    const int64_t seq_len = 4, head_dim = 16;
+    const int64_t shape[] = {seq_len, head_dim};
+    auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, 502);
+
+    const int64_t half = head_dim / 2;
+    std::vector<float> cos_t, sin_t;
+    build_axial_tables(seq_len, half, cos_t, sin_t);
+    const int64_t t_shape[] = {seq_len, half};
+    TensorView cosv(t_shape, DataType::f32, cos_t.data());
+    TensorView sinv(t_shape, DataType::f32, sin_t.data());
+
+    std::vector<float> gamma(static_cast<size_t>(head_dim));
+    std::vector<float> beta(static_cast<size_t>(head_dim));
+    for (int64_t d = 0; d < head_dim; ++d) {
+        gamma[static_cast<size_t>(d)] = 0.5f + 0.05f * static_cast<float>(d % 7);
+        beta[static_cast<size_t>(d)]  = -0.1f + 0.01f * static_cast<float>(d % 5);
+    }
+    const int64_t g_shape[] = {head_dim};
+    TensorView gammav(g_shape, DataType::f32, gamma.data());
+    TensorView betav(g_shape, DataType::f32, beta.data());
+
+    RoPEAttributes attrs;
+    attrs.interleaved = false;
+    attrs.norm_epsilon = 1e-6f;
+
+    auto op = RoPE::create(attrs, Backend::CPU);
+    const TensorDesc da[] = {in_view.desc()};
+    auto descs = op->getOutputTensorDesc(da);
+    std::vector<float> out_buf(static_cast<size_t>(descs[0].numel()), 0.0f);
+    auto y = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {in_view, gammav, betav, cosv, sinv};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    std::vector<float> ref(out_buf.size(), 0.0f);
+    rotate_with_tables(in_vec.data(), ref.data(), seq_len, 1, head_dim,
+                       head_dim, attrs.interleaved, cos_t, sin_t,
+                       gamma.data(), beta.data(), attrs.norm_epsilon);
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(out_buf[i], ref[i], 1e-4f);
+    }
+}
+
+// Everything in f16 — activation, norm vectors and the tables. The table is
+// widened once per call, so the reference rotates the f16-rounded operands.
+NNOPS_TEST(rope_precomputed_tables_f16) {
+    const int64_t seq_len = 4, head_dim = 16;
+    const int64_t shape[] = {seq_len, head_dim};
+    auto [in_vec, in_view] = test::make_random_tensor(shape, -2.0f, 2.0f, 503);
+
+    const int64_t half = head_dim / 2;
+    std::vector<float> cos_t, sin_t;
+    build_axial_tables(seq_len, half, cos_t, sin_t);
+
+    std::vector<float> gamma(static_cast<size_t>(head_dim));
+    std::vector<float> beta(static_cast<size_t>(head_dim));
+    for (int64_t d = 0; d < head_dim; ++d) {
+        gamma[static_cast<size_t>(d)] = 0.5f + 0.05f * static_cast<float>(d % 7);
+        beta[static_cast<size_t>(d)]  = -0.1f + 0.01f * static_cast<float>(d % 5);
+    }
+
+    auto x16  = test::f32_to_f16(in_vec);
+    auto c16  = test::f32_to_f16(cos_t);
+    auto s16  = test::f32_to_f16(sin_t);
+    auto g16  = test::f32_to_f16(gamma);
+    auto b16  = test::f32_to_f16(beta);
+
+    const int64_t t_shape[] = {seq_len, half};
+    const int64_t g_shape[] = {head_dim};
+    TensorView xv(shape, DataType::f16, x16.data());
+    TensorView cosv(t_shape, DataType::f16, c16.data());
+    TensorView sinv(t_shape, DataType::f16, s16.data());
+    TensorView gammav(g_shape, DataType::f16, g16.data());
+    TensorView betav(g_shape, DataType::f16, b16.data());
+
+    RoPEAttributes attrs;
+    attrs.interleaved = true;
+    attrs.norm_epsilon = 1e-6f;
+
+    auto op = RoPE::create(attrs, Backend::CPU);
+    const TensorDesc da[] = {xv.desc()};
+    auto descs = op->getOutputTensorDesc(da);
+    NNOPS_EXPECT_EQ(descs[0].dtype, DataType::f16);
+    std::vector<nnops::backend::cpu::half> out_buf(
+        static_cast<size_t>(descs[0].numel()));
+    auto y = test::make_channel_first(descs[0], out_buf.data());
+    const TensorView ins[] = {xv, gammav, betav, cosv, sinv};
+    NNOPS_EXPECT_TRUE(op->compute(y, ins) == Status::ok);
+
+    const auto x_r = test::f16_to_f32(x16);
+    const auto c_r = test::f16_to_f32(c16);
+    const auto s_r = test::f16_to_f32(s16);
+    const auto g_r = test::f16_to_f32(g16);
+    const auto b_r = test::f16_to_f32(b16);
+
+    std::vector<float> ref(out_buf.size(), 0.0f);
+    rotate_with_tables(x_r.data(), ref.data(), seq_len, 1, head_dim,
+                       head_dim, attrs.interleaved, c_r, s_r,
+                       g_r.data(), b_r.data(), attrs.norm_epsilon);
+    for (size_t i = 0; i < out_buf.size(); ++i) {
+        NNOPS_EXPECT_NEAR(simd::s_load(&out_buf[i]), ref[i], 5e-2f);
+    }
+}
+
+// The pair is all-or-nothing and must be [S, rotary_dim/2].
+NNOPS_TEST(rope_precomputed_tables_reject) {
+    const int64_t seq_len = 3, head_dim = 8;
+    const int64_t shape[] = {seq_len, head_dim};
+    std::vector<float> xd(static_cast<size_t>(seq_len * head_dim), 0.5f);
+    std::vector<float> cosd(static_cast<size_t>(seq_len * 4), 1.0f);
+    std::vector<float> sind(static_cast<size_t>(seq_len * 4), 0.0f);
+    TensorView x(shape, DataType::f32, xd.data());
+    const int64_t t_shape[] = {seq_len, 4};
+    TensorView cosv(t_shape, DataType::f32, cosd.data());
+    TensorView sinv(t_shape, DataType::f32, sind.data());
+    std::vector<float> out(static_cast<size_t>(seq_len * head_dim), 0.0f);
+    TensorView y(shape, DataType::f32, out.data());
+
+    auto op = RoPE::create(RoPEAttributes{}, Backend::CPU);
+
+    // cos without sin.
+    {
+        const TensorView ins[] = {x, TensorView{}, TensorView{}, cosv};
+        TensorView outs[] = {y};
+        NNOPS_EXPECT_TRUE(op->compute(outs, ins) == Status::invalid_argument);
+    }
+    // Wrong table width.
+    {
+        const int64_t bad_shape[] = {seq_len, 3};
+        TensorView bad_cos(bad_shape, DataType::f32, cosd.data());
+        const TensorView ins[] = {x, TensorView{}, TensorView{}, bad_cos, sinv};
+        TensorView outs[] = {y};
+        NNOPS_EXPECT_TRUE(op->compute(outs, ins) == Status::invalid_argument);
+    }
+    // Wrong row count.
+    {
+        const int64_t bad_shape[] = {seq_len + 1, 4};
+        TensorView bad_cos(bad_shape, DataType::f32, cosd.data());
+        const TensorView ins[] = {x, TensorView{}, TensorView{}, bad_cos, sinv};
+        TensorView outs[] = {y};
+        NNOPS_EXPECT_TRUE(op->compute(outs, ins) == Status::invalid_argument);
+    }
+}

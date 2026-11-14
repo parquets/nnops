@@ -18,6 +18,11 @@
 ///
 /// Position offset: row s is at absolute position position_offset + s.
 ///
+/// A caller-supplied cos/sin pair (inputs [3]/[4]) replaces the table build
+/// outright — no section planning, no scaling — and is read in row order. The
+/// pair may be f32 or the activation dtype; the latter is widened into an f32
+/// copy once per call.
+///
 /// Scaling: Linear divides the angle by the factor; Dynamic NTK grows the
 /// section's base with the run's end position past original_max_position; YaRN
 /// mixes interpolated and extrapolated angles over a correction ramp and
@@ -236,10 +241,50 @@ void rope_impl(const RoPEAttributes& attrs,
         outer_count *= X.shape(i);
     }
 
-    auto sections = build_sections(attrs, rotary_dim);
+    // A supplied cos/sin pair replaces the angle computation: its rows are
+    // already the absolute positions the caller wants, so position_offset, the
+    // bases, the mRoPE sections and the scaling types do not apply. A table in
+    // the activation dtype is widened once into f32, the same layout the
+    // computed tables use.
+    const bool  has_table = inputs.size() > 3 && !inputs[3].is_empty();
+    const float* cos_src = nullptr;
+    const float* sin_src = nullptr;
+    int64_t      tbl_stride = half;
     PoolArray<float> cos_table;
     PoolArray<float> sin_table;
-    compute_cos_sin_tables(cos_table, sin_table, seq_len, rotary_dim, sections, attrs);
+
+    if (has_table) {
+        const auto& ct = inputs[3];
+        const auto& st = inputs[4];
+        if (ct.data_type() == DataType::f32) {
+            cos_src = ct.ptr<float>();
+            sin_src = st.ptr<float>();
+            tbl_stride = ct.row_stride_elems();
+        } else {
+            const size_t total = static_cast<size_t>(seq_len) * static_cast<size_t>(half);
+            cos_table.reset(total);
+            sin_table.reset(total);
+            const T* cs = ct.ptr<T>();
+            const T* ss = st.ptr<T>();
+            const int64_t cs_stride = ct.row_stride_elems();
+            const int64_t ss_stride = st.row_stride_elems();
+            for (int64_t i = 0; i < seq_len; ++i) {
+                for (int64_t p = 0; p < half; ++p) {
+                    cos_table[static_cast<size_t>(i * half + p)] =
+                        simd::s_load(cs + i * cs_stride + p);
+                    sin_table[static_cast<size_t>(i * half + p)] =
+                        simd::s_load(ss + i * ss_stride + p);
+                }
+            }
+            cos_src = cos_table.data();
+            sin_src = sin_table.data();
+        }
+    } else {
+        auto sections = build_sections(attrs, rotary_dim);
+        compute_cos_sin_tables(cos_table, sin_table, seq_len, rotary_dim, sections, attrs);
+        cos_src = cos_table.data();
+        sin_src = sin_table.data();
+    }
 
     const T* x_ptr   = X.ptr<T>();
     T*       y_ptr   = output.ptr<T>();
@@ -247,8 +292,10 @@ void rope_impl(const RoPEAttributes& attrs,
     const int64_t out_row_stride = output.row_stride_elems();
     const bool    interleaved = attrs.interleaved;
 
-    const T* gamma = inputs.size() > 1 ? inputs[1].ptr<T>() : nullptr;
-    const T* beta  = inputs.size() > 2 ? inputs[2].ptr<T>() : nullptr;
+    const T* gamma = inputs.size() > 1 && !inputs[1].is_empty()
+                         ? inputs[1].ptr<T>() : nullptr;
+    const T* beta  = inputs.size() > 2 && !inputs[2].is_empty()
+                         ? inputs[2].ptr<T>() : nullptr;
     const float norm_eps = attrs.norm_epsilon;
 
     const auto process_outer = [&](int64_t outer) {
@@ -258,8 +305,8 @@ void rope_impl(const RoPEAttributes& attrs,
         for (int64_t pos = 0; pos < seq_len; ++pos) {
             const T* x_row = x_outer + pos * row_stride;
             T*       y_row = y_outer + pos * out_row_stride;
-            const float* cos_row = cos_table.data() + pos * half;
-            const float* sin_row = sin_table.data() + pos * half;
+            const float* cos_row = cos_src + pos * tbl_stride;
+            const float* sin_row = sin_src + pos * tbl_stride;
 
             if (gamma) {
                 // Normalize the whole head into the output, then rotate the

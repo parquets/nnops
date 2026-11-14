@@ -23,6 +23,15 @@
 /// Row s sits at absolute position position_offset + s, so a decode step can
 /// rotate its new token where it really belongs instead of at 0.
 ///
+/// Precomputed cos/sin tables: inputs [3]/[4] carry a [S, rotary_dim/2] pair
+/// that replaces the angle computation outright — every table row is used
+/// as-is, in row order, so position_offset, base, mRoPE sections and the
+/// scaling types are all ignored. This is the route for models whose rotary
+/// embedding does not fit the formulas above: the axial 2D vision RoPE of
+/// Qwen2-VL (and MiniCPM-V's mRoPE), TMRoPE, and any table built by the
+/// caller's own frequency schedule. Both tables are required together, and
+/// their element type is f32 or the activation dtype.
+///
 /// Long-context scaling follows the HuggingFace `rope_scaling` conventions and
 /// rewrites the same angle:
 ///   Linear   every inverse frequency is divided by scaling_factor.
