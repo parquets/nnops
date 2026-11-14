@@ -398,10 +398,44 @@ inline float v_reduce_min(const v_f16x8& a) {
     return static_cast<float>(vget_lane_f16(min4, 0));
 }
 
+/// Native f16 exp: range reduction by ln2 with a baked-in magic bias, a degree-2
+/// polynomial, and the 2^n scale assembled by shifting the biased exponent into
+/// the f16 exponent field. Everything stays in the eight f16 lanes; widening to
+/// f32 doubles the instruction count for no precision the output can hold.
+/// Denormal results (x < -0x1.368p+3) flush to zero, as the f16 exp kernels do.
 inline v_f16x8 v_exp(const v_f16x8& a) {
-    v_f32x8 fa = v_cvt_f16_to_f32(a);
-    v_f32x8 fr = v_f32x8(exp_ps(fa.lo), exp_ps(fa.hi));
-    return v_cvt_f32_to_f16(fr);
+    const float16x8_t x = a.val;
+    const float16x8_t vlog2e = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0x3DC5)));
+    const float16x8_t vmagic_bias = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0x660F)));
+    const float16x8_t vminus_ln2_hi = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0xB98C)));
+    const float16x8_t vminus_ln2_lo = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0x0AF4)));
+    const float16x8_t vone = vdupq_n_f16(1.0f);
+    const float16x8_t vhalf = vdupq_n_f16(0.5f);
+    const float16x8_t vsixth = vdupq_n_f16(1.0f / 6.0f);
+    const float16x8_t vdenorm_cutoff = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0xC8DA)));
+    // exp(x) overflows f16 near x = 11.09; the magic-bias reduction only holds
+    // while x*log2e stays inside the bias mantissa, so clamp and select inf.
+    const float16x8_t voverflow = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0x4C8A)));  // 11.08
+    const float16x8_t vinf = vreinterpretq_f16_u16(vmovq_n_u16(UINT16_C(0x7C00)));
+
+    const float16x8_t xc = vminq_f16(x, voverflow);
+    float16x8_t vn = vfmaq_f16(vmagic_bias, xc, vlog2e);
+    const float16x8_t vs = vreinterpretq_f16_s16(vshlq_n_s16(vreinterpretq_s16_f16(vn), 10));
+    vn = vsubq_f16(vn, vmagic_bias);
+    float16x8_t vt = vfmaq_f16(xc, vn, vminus_ln2_hi);
+    vt = vfmaq_f16(vt, vn, vminus_ln2_lo);
+    // 1 + t + t^2/2 + t^3/6 over |t| <= ln2/2: the cubic turns the 0.1% the
+    // degree-2 fit leaves into 6e-4, still four f16 lanes' worth of headroom.
+    float16x8_t vp = vfmaq_f16(vhalf, vsixth, vt);
+    vp = vfmaq_f16(vone, vp, vt);
+    const float16x8_t vts = vmulq_f16(vt, vs);
+    float16x8_t vf = vfmaq_f16(vs, vp, vts);
+
+    const uint16x8_t vm_denorm = vcltq_f16(x, vdenorm_cutoff);
+    const uint16x8_t vm_inf = vcgtq_f16(x, voverflow);
+    uint16x8_t bits = vbicq_u16(vreinterpretq_u16_f16(vf), vm_denorm);
+    bits = vbslq_u16(vm_inf, vreinterpretq_u16_f16(vinf), bits);
+    return v_f16x8(vreinterpretq_f16_u16(bits));
 }
 inline v_f16x8 v_log(const v_f16x8& a) {
     v_f32x8 fa = v_cvt_f16_to_f32(a);

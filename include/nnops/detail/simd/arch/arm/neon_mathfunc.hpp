@@ -94,19 +94,19 @@ static inline float32x4_t log_ps(float32x4_t x)
 
 static inline float32x4_t exp_ps(float32x4_t x)
 {
-    float32x4_t tmp, fx;
+    float32x4_t fx;
     float32x4_t one = vdupq_n_f32(1);
     x = vminq_f32(x, vdupq_n_f32(c_exp_hi));
     x = vmaxq_f32(x, vdupq_n_f32(c_exp_lo));
     /* express exp(x) as exp(g + n*log(2)) */
-    fx = vmlaq_f32(vdupq_n_f32(0.5f), x, vdupq_n_f32(c_cephes_LOG2EF));
-    tmp = vcvtq_f32_s32(vcvtq_s32_f32(fx));
-    uint32x4_t mask = vcgtq_f32(tmp, fx);
-    mask = vandq_u32(mask, vreinterpretq_u32_f32(one));
-    fx = vsubq_f32(tmp, vreinterpretq_f32_u32(mask));
-    tmp = vmulq_f32(fx, vdupq_n_f32(c_cephes_exp_C1));
-    float32x4_t z = vmulq_f32(fx, vdupq_n_f32(c_cephes_exp_C2));
-    x = vsubq_f32(x, tmp);
+    /* NEON rounds to nearest in one instruction; the Cephes truncate-then-fix
+       pair only existed because x86 lacked it, and the tie case (exactly .5)
+       is the one spot where the two differ, by under an ulp of the result. */
+    int32x4_t n = vcvtnq_s32_f32(vmulq_f32(x, vdupq_n_f32(c_cephes_LOG2EF)));
+    fx = vcvtq_f32_s32(n);
+    float32x4_t z = vmulq_f32(fx, vdupq_n_f32(c_cephes_exp_C1));
+    x = vsubq_f32(x, z);
+    z = vmulq_f32(fx, vdupq_n_f32(c_cephes_exp_C2));
     x = vsubq_f32(x, z);
     z = vmulq_f32(x, x);
     float32x4_t y = vdupq_n_f32(c_cephes_exp_p0);
@@ -118,9 +118,7 @@ static inline float32x4_t exp_ps(float32x4_t x)
     y = vmlaq_f32(x, y, z);
     y = vaddq_f32(y, one);
     /* build 2^n */
-    int32x4_t mm;
-    mm = vcvtq_s32_f32(fx);
-    mm = vaddq_s32(mm, vdupq_n_s32(0x7f));
+    int32x4_t mm = vaddq_s32(n, vdupq_n_s32(0x7f));
     mm = vshlq_n_s32(mm, 23);
     float32x4_t pow2n = vreinterpretq_f32_s32(mm);
     y = vmulq_f32(y, pow2n);
