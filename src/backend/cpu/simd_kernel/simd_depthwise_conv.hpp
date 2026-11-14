@@ -730,9 +730,17 @@ inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
 #define NNOPS_DW16X4_STORE_AT(R, DST)                                          \
     if ((R) < rows_left) {                                                     \
         T* dst = (DST);                                                         \
-        if constexpr (SIMPLE) {                                                 \
+        if constexpr (ACT == 0) {                                               \
             v_store(dst, a##R##0);                                              \
             v_store(dst + kL, a##R##1);                                         \
+        } else if constexpr (ACT == 1) {                                        \
+            v_store(dst, v_relu(a##R##0, v_zero(in_img)));                      \
+            v_store(dst + kL, v_relu(a##R##1, v_zero(in_img)));                 \
+        } else if constexpr (ACT == 2) {                                        \
+            const V v0 = v_zero(in_img);                                        \
+            const V v6 = v_set1(in_img, 6.0f);                                  \
+            v_store(dst, v_min(v_max(a##R##0, v0), v6));                        \
+            v_store(dst + kL, v_min(v_max(a##R##1, v0), v6));                   \
         } else {                                                                \
             V x0 = a##R##0;                                                     \
             V x1 = a##R##1;                                                     \
@@ -760,12 +768,17 @@ inline void dwconv_last3x3_16_masked(T* out_rows, const T* in_img,
 /// live epilogue need enough registers of their own that the allocator spills the
 /// eight accumulators to stack. A store-only body leaves eleven live vectors and the
 /// interior loop compiles clean.
-template <int SH, bool TOP_OK, bool BOT_OK, bool SIMPLE, typename T>
+/// `ACT` folds a plain activation into the store: 0 store-only (the SIMPLE
+/// body), 1 Relu, 2 Relu6, 3 the generic epilogue. A generic epilogue costs the
+/// allocator the eight accumulators; the two plain arms keep the store
+/// straight-line, so the register file the store-only path had survives.
+template <int SH, bool TOP_OK, bool BOT_OK, int ACT, typename T>
 inline void dwconv_last3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
                                 const T* bias_vec, const DwConvParams& p,
                                 const Epilogue& epilogue, bool add_to, bool pre_act)
 {
-    if constexpr (SIMPLE) {
+    constexpr bool SIMPLE = (ACT == 0);
+    if constexpr (ACT != 3) {
         (void)epilogue; (void)add_to; (void)pre_act;
     }
     using V = decltype(v_load(in_img));
@@ -795,7 +808,15 @@ inline void dwconv_last3x3_16x4(T* out_rows, const T* in_img, const T* w_tap0,
         v_store(wpack + k * 2 * kL, v_load(w_tap0 + k * wtap));
         v_store(wpack + k * 2 * kL + kL, v_load(w_tap0 + k * wtap + kL));
     }
+#if defined(NNOPS_ARCH_AARCH64)
+    // AArch64 has 32 vector registers: the eighteen taps and the eight
+    // accumulators coexist, so the taps stay resident across the width sweep.
+    // The volatile bar below is a 16-ymm remedy, and it costs this target a
+    // third of the load ports on data that is already in registers.
+    const T* const wsrc = wpack;
+#else
     const T* const volatile wsrc = wpack;
+#endif
 
     const int64_t ow_lo = (p.PW + p.SW - 1) / p.SW;
     const int64_t last_hi = p.IW - 1 + p.PW - 2 * p.DW;
@@ -905,47 +926,45 @@ inline void dwconv_last3x3_16(T* out_rows, const T* in_img, const T* w_tap0,
         const bool top_ok = ih0 >= 0;
         const bool bot_ok = ih_max < p.IH;
         if (R == 4) {
-            const bool simple = !add_to && !pre_act &&
-                                !nnops::epilogue_is_active(epilogue);
-            if (simple) {
-                if (top_ok) {
-                    if (bot_ok) {
-                        dwconv_last3x3_16x4<SH, true, true, true>(
-                            out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                            pre_act);
-                    } else {
-                        dwconv_last3x3_16x4<SH, true, false, true>(
-                            out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                            pre_act);
-                    }
-                } else if (bot_ok) {
-                    dwconv_last3x3_16x4<SH, false, true, true>(
-                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                        pre_act);
-                } else {
-                    dwconv_last3x3_16x4<SH, false, false, true>(
-                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                        pre_act);
-                }
-                return;
+            const bool plain =
+                !add_to && !pre_act &&
+                epilogue.quant == EpilogueQuantType::None &&
+                epilogue.min_clip == -std::numeric_limits<float>::infinity() &&
+                epilogue.max_clip ==  std::numeric_limits<float>::infinity();
+            const int act =
+                !nnops::epilogue_is_active(epilogue) ? 0
+                : (plain && epilogue.type == EpilogueActivateType::Relu)  ? 1
+                : (plain && epilogue.type == EpilogueActivateType::Relu6) ? 2
+                                                                          : 3;
+#define NNOPS_DW16X4_DISPATCH(A)                                               \
+            do {                                                               \
+                if (top_ok) {                                                  \
+                    if (bot_ok) {                                              \
+                        dwconv_last3x3_16x4<SH, true, true, A>(                \
+                            out_rows, in_img, w_tap0, bias_vec, p, epilogue,   \
+                            add_to, pre_act);                                  \
+                    } else {                                                   \
+                        dwconv_last3x3_16x4<SH, true, false, A>(               \
+                            out_rows, in_img, w_tap0, bias_vec, p, epilogue,   \
+                            add_to, pre_act);                                  \
+                    }                                                          \
+                } else if (bot_ok) {                                           \
+                    dwconv_last3x3_16x4<SH, false, true, A>(                   \
+                        out_rows, in_img, w_tap0, bias_vec, p, epilogue,       \
+                        add_to, pre_act);                                      \
+                } else {                                                       \
+                    dwconv_last3x3_16x4<SH, false, false, A>(                  \
+                        out_rows, in_img, w_tap0, bias_vec, p, epilogue,       \
+                        add_to, pre_act);                                      \
+                }                                                              \
+            } while (0)
+            switch (act) {
+            case 0: NNOPS_DW16X4_DISPATCH(0); break;
+            case 1: NNOPS_DW16X4_DISPATCH(1); break;
+            case 2: NNOPS_DW16X4_DISPATCH(2); break;
+            default: NNOPS_DW16X4_DISPATCH(3); break;
             }
-            if (top_ok) {
-                if (bot_ok) {
-                    dwconv_last3x3_16x4<SH, true, true, false>(
-                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                        pre_act);
-                } else {
-                    dwconv_last3x3_16x4<SH, true, false, false>(
-                        out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to,
-                        pre_act);
-                }
-            } else if (bot_ok) {
-                dwconv_last3x3_16x4<SH, false, true, false>(
-                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
-            } else {
-                dwconv_last3x3_16x4<SH, false, false, false>(
-                    out_rows, in_img, w_tap0, bias_vec, p, epilogue, add_to, pre_act);
-            }
+#undef NNOPS_DW16X4_DISPATCH
             return;
         }
         if (top_ok) {
